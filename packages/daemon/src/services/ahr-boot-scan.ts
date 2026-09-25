@@ -4,8 +4,10 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
+import { cachedVgNames, recoverFailedAhrCache } from './ahr-cache.js'
 import { resumeExpansion } from './ahr-expand-resume.js'
 import { defaultAhrIntentDir, listIntents, writeIntent } from './ahr-intent.js'
+import { ahrLvPath } from './ahr-paths.js'
 import { readAhrPools } from './ahr-topology.js'
 import { pveNotify } from './pve-notify.js'
 
@@ -14,7 +16,7 @@ import { pveNotify } from './pve-notify.js'
  * runs ONCE after the daemon starts listening. Non-blocking and fail-soft:
  * every failure is logged (journald via the unit), none is fatal to the daemon.
  *
- * Three branches, each deliberately minimal:
+ * Four branches, each deliberately minimal:
  *
  *  (a) INACTIVE all-spares AHR arrays — the GT-8 post-power-loss state (udev
  *      assembles a degraded mid-reshape array inactive, every member listed as
@@ -48,11 +50,23 @@ import { pveNotify } from './pve-notify.js'
  *
  *  (c) Arrays reshaping healthily — logged as a re-attached observation only.
  *      The kernel owns a running reshape (§5.1); ANAS re-issues NOTHING.
+ *
+ *  (d) A pool whose READ CACHE device is missing (story ahrcache.1 slice 2,
+ *      §13). LVM refuses to activate a partial cached LV, so such a pool comes
+ *      up with its volume inactive and its fstab mount failed — and if it did
+ *      come up, every read would return EIO, because dm-cache does not fall
+ *      through to the origin (GT-19). The same recovery the udev rung runs
+ *      (`lvconvert --uncache` → guarded `vgreduce --removemissing` →
+ *      notification) happens here, then `vgchange -ay` and the fstab mount, so
+ *      the pool comes up UNCACHED rather than serving errors. It runs after
+ *      (a) on purpose: the `--removemissing` guard needs the band arrays
+ *      present to tell a dead cache from an unassembled band.
  */
 
 const CAT = '/usr/bin/cat'
 const MDADM = '/usr/sbin/mdadm'
 const VGCHANGE = '/usr/sbin/vgchange'
+const MOUNT = '/usr/bin/mount'
 
 /** Synthetic identity for a boot-time re-attach's driving job (audit-traceable). */
 const BOOT_IDENTITY = { user: 'system:boot-reattach', uid: 0 } as const
@@ -75,6 +89,8 @@ export interface BootScanOptions {
 export interface BootScanReport {
   /** Arrays the GT-8 ladder was driven for, as `<pool>-r<band>`. */
   recovered: string[]
+  /** Pools whose failed/missing read cache was dropped before mount (§13). */
+  cacheRecovered: string[]
   /** Pools whose 'running' intent was flipped to 'halted'. */
   haltedIntents: string[]
   /** Pools whose in-flight expansion was re-attached and driven on after the restart. */
@@ -101,7 +117,7 @@ function haltBody(pool: string, reason?: string): string {
 export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptions = {}): Promise<BootScanReport> {
   const intentDir = opts.intentDir ?? defaultAhrIntentDir()
   const log = opts.log ?? ((line: string) => process.stdout.write(`${line}\n`))
-  const report: BootScanReport = { recovered: [], haltedIntents: [], reattached: [], observedReshapes: [] }
+  const report: BootScanReport = { recovered: [], cacheRecovered: [], haltedIntents: [], reattached: [], observedReshapes: [] }
 
   // Per-pool array health, folded across every AHR array seen in the md view.
   // A pool is re-attach-eligible only if it was SEEN and EVERY one of its
@@ -180,6 +196,79 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
     if (!poolsByName)
       poolsByName = new Map((await readAhrPools(executor)).map(p => [p.name, p]))
     return poolsByName
+  }
+
+  // ---- (d): a pool whose cache PV is MISSING, recovered BEFORE the mount ---
+  // Story ahrcache.1 slice 2, AHR-DESIGN §13. LVM REFUSES to activate a pool LV
+  // whose cache metadata is gone — "Refusing activation of partial LV", in
+  // normal mode AND under `--activationmode degraded` (GT §18) — so a node that
+  // boots with the cache SSD dead comes up with the volume inactive, the fstab
+  // mount failed and the pool serving nothing. And if it did activate, every
+  // read would return EIO: dm-cache does not fall through to the origin
+  // (GT-19). A pool must never come up serving EIO, so the same recovery the
+  // udev rung runs happens here, before anything tries to use the filesystem.
+  //
+  // It runs AFTER the md pass above, and that order is load-bearing: the
+  // `vgreduce --removemissing` guard requires every band to be present as its
+  // own named md PV, because an unassembled band reads `[unknown]` in `pvs`
+  // exactly as a dead cache device does (GT-19). Driving the GT-8 ladder first
+  // gives the guard the band arrays it needs to tell the two apart; a pool
+  // whose bands are still down fails the guard and is left alone, loudly.
+  //
+  // A HEALTHY cached pool is untouched — `cache.state` comes from
+  // `dmsetup status`, the one signal that can tell a working cache from a dead
+  // one (`lvs` counters go stale rather than absent, GT-23).
+  //
+  // ONE `lvs` call gates the whole rung: most daemon starts have no cache on
+  // the node at all, and the topology read this needs is a dozen commands.
+  const cachedVgs = await cachedVgNames(executor)
+  const cacheCandidates: AhrPool[] = cachedVgs.size === 0
+    ? []
+    : [...(await loadPools().catch((err: unknown) => {
+        log(`ahr.boot cache-rung=skipped reason=topology-unreadable detail=${err instanceof Error ? err.message : String(err)}`)
+        return new Map<string, AhrPool>()
+      })).values()].filter(p => cachedVgs.has(p.name))
+  for (const pool of cacheCandidates) {
+    if (pool.cache?.state !== 'failed')
+      continue
+    log(`ahr.boot pool=${pool.name} cache=failed action=recover-before-mount`)
+    try {
+      const outcome = await recoverFailedAhrCache(
+        executor,
+        { pool, reason: 'missing' },
+        message => log(`ahr.boot pool=${pool.name} rung=cache-recover progress=${message}`),
+        { log },
+      )
+      // The volume could not activate while the cache metadata was missing, so
+      // the pool is almost certainly down: activate it, then let fstab supply
+      // the spec and every option the pool's own line carries.
+      if (!pool.mounted) {
+        const vg = await executor.exec(VGCHANGE, ['-ay', pool.name])
+        log(`ahr.boot pool=${pool.name} rung=vgchange-ay result=${vg.exitCode === 0 ? 'ok' : `failed detail=${vg.stderr.trim()}`}`)
+        const mp = ahrLvPath(pool.name)
+        const mounted = await executor.exec(MOUNT, ['--', mp])
+        log(`ahr.boot pool=${pool.name} rung=mount result=${mounted.exitCode === 0 ? 'ok' : `failed detail=${mounted.stderr.trim()}`}`)
+      }
+      log(`ahr.boot pool=${pool.name} rung=cache-recover uncached=${outcome.uncached} vgreduced=${outcome.vgReduced}`)
+      report.cacheRecovered.push(pool.name)
+    }
+    catch (err) {
+      // The guard refusing (bands still down) lands here, and so does any LVM
+      // failure. Never fatal to the daemon; loud, because the pool is serving
+      // nothing until someone acts.
+      const message = err instanceof Error ? err.message : String(err)
+      log(`ahr.boot pool=${pool.name} rung=cache-recover result=failed detail=${message}`)
+      await pveNotify(
+        executor,
+        'error',
+        `AHR read cache recovery FAILED: ${pool.name}`,
+        `Pool '${pool.name}' has a read cache whose device is missing, and ANAS could not drop it automatically at start-up: ${message} `
+        + `The pool cannot serve reads until the cache is removed — every read through a dead dm-cache returns an I/O error. `
+        + `Detach the cache from the Hybrid RAID view once the reason above is dealt with.`,
+      )
+    }
+    // Whatever happened, this pool's record is stale now.
+    poolsByName = null
   }
 
   const halt = async (pool: string, intent: Awaited<ReturnType<typeof listIntents>>[number]['intent'], reason?: string) => {

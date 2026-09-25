@@ -35,6 +35,7 @@ export {
   AhrArrayMember,
   AhrArraySync,
   AhrCache,
+  AhrCacheEventRequest,
   AhrCacheState,
   AhrCapacity,
   AhrCreateRequest,

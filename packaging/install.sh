@@ -321,6 +321,8 @@ phase0_preflight() {
     || FATAL+=("release incomplete: systemd/ unit files not found")
   [ -f "${SCRIPT_DIR}/anas-md-event.sh" ] \
     || FATAL+=("release incomplete: anas-md-event.sh not found next to install.sh")
+  [ -f "${SCRIPT_DIR}/anas-cache-event.sh" ] && [ -f "${SCRIPT_DIR}/anas-cache.rules" ] \
+    || FATAL+=("release incomplete: anas-cache-event.sh / anas-cache.rules not found next to install.sh")
   [ -f "${UNIT_SRC}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}" ] \
     || FATAL+=("release incomplete: systemd/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE} not found next to install.sh")
   [ -f "${UNIT_SRC}/${RECYCLE_TIMER}" ] && [ -f "${UNIT_SRC}/${RECYCLE_SERVICE}" ] \
@@ -627,6 +629,8 @@ PREFIX_INSTALLED=0
 HOOK_INSTALLED=0
 ENV_FILE_FRESH=0        # set iff we CREATED ${ANAS_ENV_FILE} (removed on rollback)
 ISCSI_DROPIN_FRESH=0    # set iff we CREATED the iSCSI ordering drop-in (removed on rollback)
+CACHE_HOOK_INSTALLED=0  # set iff we CREATED the AHR cache-event hook (removed on rollback)
+CACHE_RULE_INSTALLED=0  # set iff we CREATED the AHR cache udev rule (removed on rollback)
 UNITS_INSTALLED=0
 SERVICES_STARTED=0
 UI_INSTALLED=0
@@ -634,6 +638,15 @@ INSTALL_DONE=0
 
 # mdadm --monitor PROGRAM hook (AHR md events -> journald). Overridable for tests.
 HOOK_DEST="${HOOK_DEST:-/usr/local/bin/anas-md-event}"
+
+# AHR read-cache removal hook + its udev rule (ahrcache.1 slice 2, AHR §13).
+# The rule is INERT until a pool actually has a cache: nothing on a node carries
+# a `<pool>-cacheN` GPT partition name until POST /v1/ahr/<pool>/cache writes
+# one. Both paths are overridable so the packaging tests can install to a temp
+# tree instead of the node's own /etc/udev.
+CACHE_HOOK_DEST="${CACHE_HOOK_DEST:-/usr/local/bin/anas-cache-event}"
+UDEV_RULES_DIR="${UDEV_RULES_DIR:-/etc/udev/rules.d}"
+CACHE_RULE_DEST="${CACHE_RULE_DEST:-${UDEV_RULES_DIR}/99-anas-cache.rules}"
 
 rollback() {
   set +e
@@ -659,6 +672,13 @@ rollback() {
   if [ "${HOOK_INSTALLED}" -eq 1 ]; then
     info "removing md-event hook"
     rm -f "${HOOK_DEST}"
+  fi
+
+  if [ "${CACHE_HOOK_INSTALLED}" -eq 1 ] || [ "${CACHE_RULE_INSTALLED}" -eq 1 ]; then
+    info "removing AHR cache-event hook"
+    [ "${CACHE_HOOK_INSTALLED}" -eq 1 ] && rm -f "${CACHE_HOOK_DEST}"
+    [ "${CACHE_RULE_INSTALLED}" -eq 1 ] && rm -f "${CACHE_RULE_DEST}"
+    udevadm control --reload-rules >/dev/null 2>&1 || true
   fi
 
   # Only a drop-in THIS run created is withdrawn; an upgrade over an existing
@@ -791,6 +811,23 @@ phase1_install() {
   info "installing md-event hook -> ${HOOK_DEST}"
   [ -e "${HOOK_DEST}" ] || HOOK_INSTALLED=1
   install -m 0755 "${SCRIPT_DIR}/anas-md-event.sh" "${HOOK_DEST}"
+
+  # 2b2. Install the AHR read-cache removal hook and its udev rule (ahrcache.1
+  # slice 2, AHR §13). Unlike the md hook this one needs no wiring at pool-create
+  # time: the rule matches the `<pool>-cacheN` GPT partition name the cache
+  # attach writes, so it arms itself the moment a cache exists and matches
+  # nothing until then. A band member's slice is labelled `<pool>-dN-bM` and can
+  # never match it — those stay mdadm's business.
+  info "installing AHR cache-event hook -> ${CACHE_HOOK_DEST}"
+  [ -e "${CACHE_HOOK_DEST}" ] || CACHE_HOOK_INSTALLED=1
+  install -m 0755 "${SCRIPT_DIR}/anas-cache-event.sh" "${CACHE_HOOK_DEST}"
+  install -d "${UDEV_RULES_DIR}"
+  [ -e "${CACHE_RULE_DEST}" ] || CACHE_RULE_INSTALLED=1
+  install -m 0644 "${SCRIPT_DIR}/anas-cache.rules" "${CACHE_RULE_DEST}"
+  # udev reads its rules from disk on the next reload; a failure here is not
+  # fatal (the rule is live after the next boot either way, and the boot rung
+  # runs the same recovery at daemon start).
+  udevadm control --reload-rules >/dev/null 2>&1 || true
 
   # 2c. Install the ANAS notification templates (AHR §7.2, GT-17). They live
   # in pve-manager's template dir, so a pve-manager upgrade can wipe them —

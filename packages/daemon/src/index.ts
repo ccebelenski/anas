@@ -65,8 +65,8 @@ async function main() {
         jobQueue: decorated.jobQueue,
         diskCache: decorated.diskIdentityCache,
       }).then((report) => {
-        if (report.recovered.length || report.haltedIntents.length || report.reattached.length || report.observedReshapes.length)
-          server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] reattached=[${report.reattached.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)
+        if (report.recovered.length || report.cacheRecovered.length || report.haltedIntents.length || report.reattached.length || report.observedReshapes.length)
+          server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] cacheRecovered=[${report.cacheRecovered.join(',')}] reattached=[${report.reattached.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)
       }).catch((err) => {
         server.log.warn(`ahr boot scan failed: ${err instanceof Error ? err.message : String(err)}`)
       }).then(() => reconcileSelfhealState(decorated.executor, {

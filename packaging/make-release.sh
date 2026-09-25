@@ -96,6 +96,11 @@ install -m 0755 "${SCRIPT_DIR}/install.sh"   "${REL_ROOT}/install.sh"
 install -m 0755 "${SCRIPT_DIR}/uninstall.sh" "${REL_ROOT}/uninstall.sh"
 # mdadm --monitor PROGRAM hook — install.sh preflight requires it (AHR §7.2).
 install -m 0755 "${SCRIPT_DIR}/anas-md-event.sh" "${REL_ROOT}/anas-md-event.sh"
+# AHR read-cache removal hook + its udev rule (ahrcache.1 slice 2, AHR §13).
+# The pair is what makes a dead cache device repair itself instead of leaving
+# every read on the pool returning EIO; install.sh's preflight requires both.
+install -m 0755 "${SCRIPT_DIR}/anas-cache-event.sh" "${REL_ROOT}/anas-cache-event.sh"
+install -m 0644 "${SCRIPT_DIR}/anas-cache.rules"    "${REL_ROOT}/anas-cache.rules"
 # PVE notification templates — one subject/body pair per event type (anas-ahr
 # array/pool events, anas-backup run results, anas-snapshot schedule-run and
 # anas-replication run failures). install.sh's preflight requires every one of

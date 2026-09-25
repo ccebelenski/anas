@@ -1600,9 +1600,17 @@
                 ? t('This pool has no read cache to detach')
                 : '');
         }
-        // ahrcache.1 slice 2 adds the Remount verb here — POST /v1/ahr/:name/remount,
-        // offered when the btrfs filesystem was forced read-only (unmount +
-        // mount, confirm-coded); not in this slice.
+        // The Remount verb goes HERE. Its daemon side shipped with ahrcache.1
+        // slice 2 — POST /v1/ahr/:name/remount, confirm-coded (unmount + mount:
+        // btrfs refuses `remount,rw` after an I/O error, so open share handles
+        // break and the operator has to say so). Gate the button on the pool
+        // record's `mountedReadOnly`, NOT on `state === 'readonly'`: the state
+        // ladder lets `failed`/`offline` outrank `readonly`, which would hide
+        // the verb exactly when a pool is read-only AND something else. The
+        // route also 409s while `cache.state === 'failed'` (detach first), so
+        // that case wants the tooltip rather than a live button. A daemon that
+        // omits `mountedReadOnly` is an older one — no field, no button.
+        // Not built in slice 2; this is the follow-up's marker.
         var readdBtn = grid.down('#readd');
         if (readdBtn) {
             readdBtn.setHidden(!has || readdCandidates(sel[0]).length === 0);

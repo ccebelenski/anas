@@ -205,6 +205,29 @@ if [ -f "${HOOK_DEST}" ]; then
   info "removed md-event hook ${HOOK_DEST}"
 fi
 
+# 3c2. Remove the AHR read-cache removal hook and its udev rule (ahrcache.1
+# slice 2). Both are ANAS's own files, named by ANAS, in the drop-in directory
+# udev provides for exactly this — nothing else in /etc/udev/rules.d is read or
+# touched (guest philosophy). Any `<pool>-cacheN` slice still on a disk stays
+# where it is: that is the operator's data layout, and Detach cache is the verb
+# that removes it.
+CACHE_HOOK_DEST="${CACHE_HOOK_DEST:-/usr/local/bin/anas-cache-event}"
+UDEV_RULES_DIR="${UDEV_RULES_DIR:-/etc/udev/rules.d}"
+CACHE_RULE_DEST="${CACHE_RULE_DEST:-${UDEV_RULES_DIR}/99-anas-cache.rules}"
+removed_cache_hook=0
+if [ -f "${CACHE_HOOK_DEST}" ]; then
+  rm -f "${CACHE_HOOK_DEST}"
+  removed_cache_hook=1
+fi
+if [ -f "${CACHE_RULE_DEST}" ]; then
+  rm -f "${CACHE_RULE_DEST}"
+  removed_cache_hook=1
+fi
+if [ "${removed_cache_hook}" -eq 1 ]; then
+  udevadm control --reload-rules >/dev/null 2>&1 || true
+  info "removed AHR cache-event hook ${CACHE_HOOK_DEST} and ${CACHE_RULE_DEST}"
+fi
+
 # 3d. Remove the ANAS notification templates install.sh drops into pve-manager's
 # template dir. Only our own anas-named files are touched — never any other
 # template in that shared directory (guest philosophy).

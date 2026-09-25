@@ -161,8 +161,12 @@ New resource `/v1/ahr` (parallel to `/v1/pools`; md/AHR is a distinct backend pe
 | `POST` | `/v1/ahr/:name/parity-rewrite` | **Rewrite parity** (selfheal.10): body `{ band }` — recompute ONE band's parity from the data it holds. Refused unless the pool's last COMPLETED scrub — or its last completed REPAIR, whichever is newer — counted a parity mismatch on that band AND left no data unrepaired anywhere (`reason` codes `no-parity-mismatch` / `data-findings-present`), the band is a parity band (`not-a-parity-band`), no member of it carries recorded md bad blocks (`bad-blocks-present`), the band is idle and complete with its sync window at the default (`array-busy`), and no scrub/repair/rewrite is in flight (`job-active`). A guest's LUN live on the pool is DISCLOSED in the confirm gate, never refused — this verb writes parity, never a file. The job runs a FRESH btrfs scrub first and aborts on any finding | 202 job / **409 confirm** |
 | `POST` | `/v1/ahr/:name/mirror-reconcile` | **Reconcile mirror** (selfheal.11): body `{ band }` — make ONE RAID1 band's two legs agree again. Refused unless the pool's last COMPLETED scrub — or its last completed REPAIR, whichever is newer — counted a mismatch on that band, recorded it as `raid1`, and left no data unrepaired anywhere (`reason` codes `no-mirror-mismatch` / `not-a-mirror-band` / `data-findings-present`), no leg of it carries recorded md bad blocks (`bad-blocks-present`), the band is idle and complete with its sync window at the default (`array-busy`), and no scrub/repair/rewrite/reconcile is in flight (`job-active`). A guest's LUN live on the pool is DISCLOSED in the confirm gate, never refused — every row this verb writes already matches its stored checksum. No leg is ever failed, removed or re-added, so there is no degraded window | 202 job / **409 confirm** |
 | `DELETE` | `/v1/ahr/:name` | Destroy pool | 202 job / **409 confirm** |
+| `POST` | `/v1/ahr/:name/cache` | **Attach a read cache** (`ahrcache.1`, §13): body `{disks[]}` — one GPT slice per disk, linear `<pool>-cache` LV, `lvconvert --type cache --cachemode writethrough`. Not confirm-gated (a writethrough cache never holds an only copy). Refuses an offline/failed pool, an already-cached pool, a non-composable disk and a duplicated disk; a rotating pick is LEGAL and earns one advisory sentence on the job result | 202 job |
+| `DELETE` | `/v1/ahr/:name/cache` | **Detach the read cache** (§13): `lvconvert --uncache` → `vgreduce` → `pvremove` → `wipefs` → `sgdisk -d`, so the disk reads `available` again (GT-22). Also the operator's RECOVERY verb for a failed cache, and the reclaim verb for a leftover `<pool>-cache<n>` slice a died-and-returned device carries back. Refuses an offline pool with a live cache (uncache needs an active volume) | 202 job |
+| `POST` | `/v1/ahr/:name/cache/event` | **The udev auto-uncache rung** (`ahrcache.1` slice 2, §13): body `{event: 'device-removed', slice?, kernel?}`, posted by `/usr/local/bin/anas-cache-event` when a disk carrying a `<pool>-cache<n>` slice is removed. A REPORT, not a command — the verdict is the daemon's own `dmsetup status` read, so the body can never uncache a healthy pool. Runs `lvconvert --uncache` → guarded `vgreduce --removemissing` → `anas-ahr` notification as a job; the leftover slice is deliberately left alone. Idempotent: a second event on an already-uncached pool answers 200 and runs nothing | 202 job / 200 no-op |
+| `POST` | `/v1/ahr/:name/remount` | **Remount** (`ahrcache.1` slice 2, §13): `umount` then `mount`, for a filesystem btrfs forced READ-ONLY after an I/O error — `mount -o remount,rw` is refused after an error (GT-20), so this pair is the only recovery. 409 unless `mountedReadOnly`, 409 while the read cache is still `failed` (uncache first), hard 409 while an iSCSI LUN holds the pool, then confirm-gated on the open-handle break. The job VERIFIES the mount came back read-write and fails if it did not | 202 job / **409 confirm** |
 
-**Confirm-gated (Principle 14, the 409 + X-Anas-Confirm-Code flow):** create (wipes disks — lists every disk that will be erased in the warnings), expand/replace (announces reshape duration estimate + the pending-capacity reality), abandon (leaves the pool at reachable-but-not-target layout — states exactly what that layout is), destroy, repair-from-parity (names the snapshot taken, the md knobs turned aside and restored, and what is written), parity-rewrite (names what parity is recomputed from, the fresh scrub that aborts the run, the files it cannot protect, and how long the band will be read), mirror-reconcile (names both arms and their cost, the rows it leaves exactly as they are, that the pool stays online and undegraded throughout, and that md's own repair is neither used nor to be run by hand). The confirm warnings carry the *concrete* consequence (which disks, how long, how much data at risk), not a generic "are you sure".
+**Confirm-gated (Principle 14, the 409 + X-Anas-Confirm-Code flow):** create (wipes disks — lists every disk that will be erased in the warnings), expand/replace (announces reshape duration estimate + the pending-capacity reality), abandon (leaves the pool at reachable-but-not-target layout — states exactly what that layout is), destroy, repair-from-parity (names the snapshot taken, the md knobs turned aside and restored, and what is written), parity-rewrite (names what parity is recomputed from, the fresh scrub that aborts the run, the files it cannot protect, and how long the band will be read), mirror-reconcile (names both arms and their cost, the rows it leaves exactly as they are, that the pool stays online and undegraded throughout, and that md's own repair is neither used nor to be run by hand), and remount (names the open share handles that break, that btrfs refuses `remount,rw` after an error so umount+mount is the only way back, and that a pool read-only again afterwards still has the fault that caused it). The cache verbs are deliberately NOT gated — a writethrough cache holds no only copy, so there is nothing a confirm code could protect. The confirm warnings carry the *concrete* consequence (which disks, how long, how much data at risk), not a generic "are you sure".
 
 **Repair from parity (selfheal.6).** The operator-triggered half of the self-heal epic: `services/selfheal-repair.ts` reconstructs one 4 KiB block from the other members of its stripe, the btrfs checksum arbitrates the candidate, and only a candidate that matches is written back through md. The job runs the picked blocks strictly one at a time — two runs at once would fight over the same `rmw_level`, `sync_min`/`sync_max` and `stripe_cache_size` — and reports every block in one of FIVE honest buckets: `repaired`, `unrepairable` (no source of truth left below the checksum tree — restore the file from backup), `aboveMd` (parity already agreed with the bad data, so nothing was written — the wording implicates something other than the disks, never certainly), `mappingAbort` (the bytes at the mapped location were READ and still pass their stored csum — nothing was written and nothing needs restoring), and `notExamined` (the block was never looked at: an inline extent, a hole, a truncated owner scan, a band whose geometry went unreadable, a read-back guard that says the mapping and the array disagree, or a path whose inode is not the one the scrub examined — its `reasonCode` says which, and the advice is "re-scrub after &lt;what would change&gt;", never a restore and never a clean bill). The five always sum to the blocks attempted. A block whose engine run throws is that block's verdict, never the job's. A block that is repaired and PROVEN while md still counts mismatching stripes on its band leaves a `parityResidual`, reported in `parityResiduals` in the same row shape a scrub's `parityMismatches` uses — the data is right and the parity is what disagrees, so the operator is pointed at Rewrite parity for that band rather than at a restore, and without waiting for a fresh two-phase scrub to rediscover a number this run already measured. A path backing an iSCSI LUN with a LIVE initiator session is refused at the route (`lun-session-active`, no confirm bypass): the block is proven and copy-on-write leaves the old extent alone, but the initiator holds its own cache and has no idea the bytes moved. A member carrying recorded md bad blocks over the target row counts as ABSENT for the reconstruction, exactly as a kicked one does. One PVE notification at the end carries the counts and the per-file outcomes: `warning` when anything is unrepairable or above md, `info` when everything was repaired. The two standing boundaries of the epic hold here: the repair is **never automatic** (an operator asks for it, on named files, with named blocks, through the confirm gate) and it is **never a read-path heal** (nothing repairs a block because someone read it). The UI surface is the Scrubs findings window and nowhere else.
 
@@ -612,6 +616,51 @@ died-and-returned cache device carries back — keeps its disk attributed to the
 pool, so both verbs accept it: attach reuses and re-wipes the slice, detach
 deletes it and hands the disk back. Slices 2 (the udev auto-uncache rung, the
 boot rung, Remount) and 3 (the UI) are the rest of the story.
+
+**Built 2026-09-24 — slice 2 (the failure path).** Four rungs, all at UNIT
+level; the live-proof spec is WRITTEN and its first run is the story's proof.
+(1) **udev auto-uncache.** `packaging/anas-cache.rules` →
+`/etc/udev/rules.d/99-anas-cache.rules` fires on the REMOVE of a block
+partition whose `ID_PART_ENTRY_NAME` matches `?*-cache[0-9]` (and the
+two-digit form) — the GPT label attach itself writes. A band member's slice is
+`<pool>-d<n>-b<m>` and can never match it, so a pulled pool disk stays mdadm's
+event and reaches ANAS through `anas-md-event` as before. The rule runs
+`/usr/local/bin/anas-cache-event` (the `anas-md-event.sh` pattern one level up:
+md's hook only logs and notifies, this one has a repair to run), which derives
+the pool from the label, journals under the `anas-ahr` tag and POSTs to
+**`/v1/ahr/:name/cache/event`** over the root-only socket with the
+`x-anas-user: system:udev-cache-event` identity headers — the socket is the
+trust boundary, exactly as for the systemd task runners. The script decides
+NOTHING and runs no storage command: the verdict is the daemon's own `dmsetup
+status` read, so the body cannot uncache a healthy pool, and a daemon that is
+not running costs a DELAYED repair rather than a lost one (the boot rung runs
+the same recovery at the next start, and the journal says so). The endpoint
+runs `recoverFailedAhrCache` as a job — `lvconvert --uncache` → guarded
+`vgreduce --removemissing` → one `anas-ahr` notification — and is idempotent: a
+second event on an already-uncached pool answers 200 and runs nothing, which
+matters because udev re-runs rules. The recovery is deliberately NARROWER than
+detach: it never wipes or deletes the `<pool>-cache<n>` slice, because that
+slice is what keeps a died-and-returned disk attributed to its pool and
+Reclaim reachable. (2) **Boot rung** — `ahrBootScan` branch (d), gated on ONE
+`lvs` call (most starts have no cache at all, and the topology read is a dozen
+commands): a pool whose `cache.state` reads `failed` gets the same recovery,
+then `vgchange -ay` and the fstab `mount`, in that order, so a pool never comes
+up serving EIO. It runs AFTER the (a) md ladder on purpose — the
+`--removemissing` guard needs the band arrays present to tell a dead cache from
+an unassembled band. A healthy cached pool is untouched; a guard refusal
+notifies `error` and never takes the daemon down. (3) **`POST
+/v1/ahr/:name/remount`** — `umount` then `mount`, never `remount,rw` (GT-20:
+btrfs refuses it after an error). 409 unless `mountedReadOnly`, 409 while the
+cache still reads `failed` (remounting over a dead cache lands a filesystem
+that cannot serve a byte), hard 409 under a LUN, then the confirm gate naming
+the open-handle break. The job verifies the mount came back read-write and
+FAILS if it did not. (4) **`mountedReadOnly`** on the pool payload, separate
+from `state: 'readonly'` because the state ladder lets `failed`/`offline`
+outrank it and a UI gating Remount on the badge would hide the verb exactly
+when it is needed; the read-only advisory and the dashboard card now share ONE
+clause that names Remount and says writes are stopped until the pool is
+remounted. The UI verb itself is a small follow-up (the `39-ahr.js` comment
+marks where it goes).
 
 **Fix batch (review, 2026-09-24).** DESTROY must uncache before `lvremove`: a
 cached pool's LV is a dm-cache target and `lvremove` refuses one, which stopped

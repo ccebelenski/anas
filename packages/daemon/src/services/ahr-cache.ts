@@ -5,6 +5,7 @@ import { parseDiskByIdListing } from '../parsers/disk-by-id.js'
 import { lvIsCacheTarget, parseLvsReport, parsePvsReport, PVS_ARGS } from '../parsers/lvm-report.js'
 import {
   cacheLvName,
+  cacheRecoveryNotification,
   isMdPvName,
   matchCachePartitionLabel,
   rotatingCacheAdvisory,
@@ -13,6 +14,8 @@ import {
 } from './ahr-cache-state.js'
 import { LVM_MIXED_BLOCK_ARGS, run } from './ahr-exec.js'
 import { readDiskTree } from './ahr-expand-exec.js'
+import { isAhrMountReadOnly } from './ahr-topology.js'
+import { pveNotify } from './pve-notify.js'
 
 /**
  * AHR read cache — the attach/detach executor (story ahrcache.1,
@@ -411,6 +414,51 @@ export async function uncacheAhrLv(executor: CommandExecutor, vg: string, lvName
   await run(executor, LVCONVERT, [...LVM_MIXED_BLOCK_ARGS, '-y', '--uncache', `${vg}/${lvName}`])
 }
 
+/**
+ * `vgreduce --removemissing <vg>` — behind the ONE guard that makes it safe.
+ *
+ * `--removemissing` drops EVERY absent PV, not the one we mean. A stopped band
+ * md array reads `[unknown]` in `pvs` exactly as a dead cache device does
+ * (GT-19), so without this test the recovery for a failed cache would quietly
+ * evict a band's PV from a pool that was merely not assembled. The
+ * discriminator is the same one `buildAhrCacheState` uses: every band must
+ * already be accounted for by its own named md PV.
+ *
+ * Extracted because detach is no longer its only caller — the udev auto-uncache
+ * rung and the boot rung (slice 2) run the same drop, and a second copy of this
+ * guard is a copy that can be forgotten in exactly the case it exists for.
+ *
+ * Throws with the operator's next move; never runs `vgreduce` on a doubt.
+ */
+export async function dropMissingCachePv(
+  executor: CommandExecutor,
+  ctx: {
+    pool: AhrPool
+    /** The PVs `pvs` reports in this pool's VG, already filtered. */
+    inVg: LvmPv[]
+    updateProgress: (message: string) => void
+    log: (line: string) => void
+  },
+): Promise<void> {
+  const { pool, inVg, updateProgress, log } = ctx
+  const missing = inVg.filter(p => p.name === UNKNOWN_PV_NAME)
+  if (missing.length === 0)
+    return
+  const bandPvCount = inVg.filter(p => isMdPvName(p.name)).length
+  const bandCount = pool.arrays.length
+  if (bandPvCount < bandCount) {
+    throw new Error(
+      `volume group '${pool.name}' is missing ${missing.length} physical volume${missing.length === 1 ? '' : 's'} `
+      + `while only ${bandPvCount} of ${bandCount} band arrays are present — a stopped band array is indistinguishable `
+      + `from a failed cache device here, and 'vgreduce --removemissing' would drop the band's physical volume with the cache's. `
+      + `Bring the band arrays up first (see the Hybrid RAID view), then detach the cache`,
+    )
+  }
+  updateProgress(`Dropping the missing cache device from volume group '${pool.name}'`)
+  await run(executor, VGREDUCE, [...LVM_MIXED_BLOCK_ARGS, '--removemissing', pool.name])
+  log(`ahr.cache pool=${pool.name} status=vg-reduced-missing`)
+}
+
 export interface CacheDetachResult {
   pool: string
   /** The disks handed back to the inventory (their slices are gone). */
@@ -480,27 +528,8 @@ export async function detachAhrCache(
   // including one an operator had added to the VG by hand, which detach has no
   // business touching (guest philosophy: we own what we labelled, nothing else).
   const namedCache = inVg.filter(p => sliceDevices.has(p.name))
-  if (missing.length > 0) {
-    // `--removemissing` drops EVERY absent PV, not the one we mean. A stopped
-    // band md array reads `[unknown]` exactly as a dead cache device does
-    // (GT-19), so without this test the recovery for a failed cache would
-    // quietly evict a band's PV from a pool that was merely not assembled.
-    // The discriminator is the same one `buildAhrCacheState` uses: every band
-    // must already be accounted for by its own named md PV.
-    const bandPvCount = inVg.filter(p => isMdPvName(p.name)).length
-    const bandCount = pool.arrays.length
-    if (bandPvCount < bandCount) {
-      throw new Error(
-        `volume group '${pool.name}' is missing ${missing.length} physical volume${missing.length === 1 ? '' : 's'} `
-        + `while only ${bandPvCount} of ${bandCount} band arrays are present — a stopped band array is indistinguishable `
-        + `from a failed cache device here, and 'vgreduce --removemissing' would drop the band's physical volume with the cache's. `
-        + `Bring the band arrays up first (see the Hybrid RAID view), then detach the cache`,
-      )
-    }
-    updateProgress(`Dropping the missing cache device from volume group '${pool.name}'`)
-    await run(executor, VGREDUCE, [...LVM_MIXED_BLOCK_ARGS, '--removemissing', pool.name])
-    log(`ahr.cache pool=${pool.name} status=vg-reduced-missing`)
-  }
+  if (missing.length > 0)
+    await dropMissingCachePv(executor, { pool, inVg, updateProgress, log })
   if (namedCache.length > 0) {
     updateProgress(`Removing ${namedCache.length} cache device${namedCache.length === 1 ? '' : 's'} from volume group '${pool.name}'`)
     await run(executor, VGREDUCE, [...LVM_MIXED_BLOCK_ARGS, pool.name, ...namedCache.map(p => p.name)])
@@ -530,4 +559,122 @@ export async function detachAhrCache(
     await run(executor, UDEVADM, ['settle'])
 
   return { pool: pool.name, released: [...new Set(released)] }
+}
+
+// ---- The automatic recovery (slice 2) ---------------------------------------
+
+/**
+ * The VG names whose pool LV is a dm-cache TARGET right now — ONE `lvs` call.
+ *
+ * The boot rung's cheap pre-check. A full `readAhrPools()` is a dozen commands
+ * (mdstat, a `mdadm --detail` per array, two lsblk trees, the by-id listing,
+ * vgs/lvs/pvs, findmnt, a btrfs usage read per pool), and the overwhelming
+ * majority of daemon starts have no cache on the node at all, let alone a
+ * broken one. This answers "is there anything here that could possibly need the
+ * cache rung?" for the price of one command, and the expensive read happens
+ * only when the answer is yes.
+ *
+ * Fail-open with an EMPTY list: an unreadable `lvs` at daemon start is not
+ * evidence of a failed cache, and the rung it gates is a repair, not an alarm —
+ * the udev event and the next start both get another chance.
+ */
+export async function cachedVgNames(executor: CommandExecutor): Promise<Set<string>> {
+  const res = await executor.exec(LVS, LVS_STATE_ARGS)
+  if (res.exitCode !== 0)
+    return new Set()
+  return new Set(parseLvsReport(res.stdout).filter(l => lvIsCacheTarget(l.attr)).map(l => l.vgName))
+}
+
+export interface CacheRecoveryResult {
+  pool: string
+  /** Whether `lvconvert --uncache` actually ran (false = already uncached). */
+  uncached: boolean
+  /** Whether the ghost PV was dropped from the VG. */
+  vgReduced: boolean
+  /** The filesystem is btrfs-forced-readonly and needs the Remount verb. */
+  readOnly: boolean
+  /** How the device was named in the notification (by-id, slice label, null). */
+  device: string | null
+}
+
+/**
+ * The automatic recovery from a failed/missing cache device (ahrcache.1
+ * slice 2, §13 "Resolved 2026-09-24") — the body of BOTH rungs: the udev
+ * auto-uncache on a cache disk's removal, and the boot rung at activation.
+ *
+ *   `lvconvert --uncache` → `vgreduce --removemissing` (guarded) → notify
+ *
+ * It runs UNATTENDED, which every line of GT-20 licenses: `--uncache` needs no
+ * `--force`, no unmount and under a third of a second; a writethrough cache
+ * holds no dirty block by construction, so there is nothing to flush and
+ * nothing to lose; and read service resumes on the very next I/O. Leaving the
+ * pool returning EIO on every read while a human finds a button is strictly
+ * worse.
+ *
+ * Deliberately NARROWER than {@link detachAhrCache}: it does NOT wipe or delete
+ * the `<pool>-cache<n>` slice. A device that died and comes back carries that
+ * slice, and it is what keeps the disk attributed to its pool so the UI can
+ * offer Reclaim (Detach cache) rather than showing an unexplained foreign disk.
+ * With the device absent there is no slice to find anyway; with the device
+ * present-but-broken, deleting it would be a destructive step taken by a
+ * machine, which this rung is not licensed for.
+ *
+ * IDEMPOTENT: a second event on an already-uncached pool finds no cache target
+ * and no missing PV, runs no command, and reports `uncached: false`.
+ */
+export async function recoverFailedAhrCache(
+  executor: CommandExecutor,
+  input: {
+    pool: AhrPool
+    /** How the device was named by whoever raised the event (a GPT label). */
+    sliceLabel?: string | null
+    /** `missing` at activation (boot rung), `failed` under a live pool. */
+    reason?: 'failed' | 'missing'
+  },
+  updateProgress: (message: string) => void,
+  opts: CacheOptions = {},
+): Promise<CacheRecoveryResult> {
+  const { pool } = input
+  const reason = input.reason ?? 'failed'
+  const log = opts.log ?? ((line: string) => process.stdout.write(`${line}\n`))
+  const lvName = pool.lv.name
+
+  // The device's name, as honestly as it can still be given: the by-id the
+  // topology resolved while the disk was there, else the GPT label udev
+  // reported, else nothing. A disk that is gone cannot be asked what it was.
+  const device = pool.cache?.devices[0] ?? input.sliceLabel ?? null
+
+  // 1. Uncache. The pool LV's own attribute is the completion marker (a live
+  //    cache volume is the HIDDEN `_cvol`, which `lvs` without `-a` never
+  //    lists), so this is the test a re-run re-asks and answers "done".
+  const poolLv = (await readVgLvs(executor, pool.name)).find(l => l.name === lvName)
+  let uncached = false
+  if (poolLv && lvIsCacheTarget(poolLv.attr)) {
+    updateProgress(`Removing the failed cache from ${pool.name}/${lvName}`)
+    await uncacheAhrLv(executor, pool.name, lvName)
+    log(`ahr.cache pool=${pool.name} rung=recover status=uncached device=${device ?? 'unknown'}`)
+    uncached = true
+  }
+  else {
+    log(`ahr.cache pool=${pool.name} rung=recover status=already-uncached`)
+  }
+
+  // 2. Drop the ghost PV — behind the band guard, which is the whole reason
+  //    this is a shared helper (an unassembled band reads `[unknown]` too).
+  const inVg = (await readPvs(executor)).filter(p => p.vgName === pool.name)
+  const vgReduced = inVg.some(p => p.name === UNKNOWN_PV_NAME)
+  if (vgReduced)
+    await dropMissingCachePv(executor, { pool, inVg, updateProgress, log })
+
+  // 3. The fact that decides what the operator is told. Read AFTER the
+  //    uncache: the write that trips btrfs can land during the failure window.
+  const readOnly = pool.mounted ? await isAhrMountReadOnly(executor, pool.mountpoint) : false
+
+  // 4. One notification, best-effort — a broken mail target must never fail a
+  //    recovery that already restored service (the standing AHR posture).
+  const note = cacheRecoveryNotification({ pool: pool.name, device, readOnly, reason })
+  await pveNotify(executor, 'warning', note.title, note.body)
+  log(`ahr.cache pool=${pool.name} rung=recover readonly=${readOnly} notified=1`)
+
+  return { pool: pool.name, uncached, vgReduced, readOnly, device }
 }

@@ -3,8 +3,8 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
-import { AttachAhrCacheRequest, isComposableDisk, PoolName } from '@anas/shared'
-import { attachAhrCache, detachAhrCache } from '../services/ahr-cache.js'
+import { AhrCacheEventRequest, AttachAhrCacheRequest, isComposableDisk, PoolName } from '@anas/shared'
+import { attachAhrCache, detachAhrCache, recoverFailedAhrCache } from '../services/ahr-cache.js'
 import { readIntent } from '../services/ahr-intent.js'
 import { fmtBytes } from '../services/ahr-layout.js'
 import { readAhrPools } from '../services/ahr-topology.js'
@@ -25,8 +25,12 @@ const CACHE_EXCLUSIVE_OPERATIONS = ['ahr.cache.attach', 'ahr.cache.detach'] as c
 /**
  * AHR read-cache routes (story ahrcache.1, docs/AHR-DESIGN.md §13/§4):
  *
- *   POST   /v1/ahr/:name/cache  — attach a writethrough read cache (202 job)
- *   DELETE /v1/ahr/:name/cache  — detach it (202 job)
+ *   POST   /v1/ahr/:name/cache        — attach a writethrough read cache (202)
+ *   DELETE /v1/ahr/:name/cache        — detach it (202 job)
+ *   POST   /v1/ahr/:name/cache/event  — the udev hook reporting that a cache
+ *                                       disk was removed; runs the automatic
+ *                                       recovery as a job (202), or answers
+ *                                       200 when there is nothing to recover
  *
  * NEITHER IS CONFIRM-GATED, and that is a decision, not an omission
  * (Principle 14 draws the line at destroying something). A writethrough cache
@@ -243,6 +247,91 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
       'ahr.cache.detach',
       { ...identity, params: { pool: pool.name } },
       async updateProgress => detachAhrCache(executor, { pool }, updateProgress),
+    )
+    reply.code(202)
+    return { job }
+  })
+
+  // ---- POST /ahr/:name/cache/event — the udev auto-uncache rung -------------
+  /**
+   * A disk carrying one of this pool's `<pool>-cache<n>` slices was REMOVED —
+   * reported by `/usr/local/bin/anas-cache-event`, which a udev rule runs on
+   * the slice's removal (slice 2, §13 "Resolved 2026-09-24"; the
+   * `anas-md-event.sh` pattern, one level up: md's hook only logs and notifies,
+   * this one has a repair to run and so has to reach the daemon).
+   *
+   * AN EVENT, NEVER A POLLER. dm-cache does not fall through to the origin
+   * (GT-19): the instant the cache device goes, EVERY read on the pool returns
+   * EIO within the second, promoted or not. A poller's interval would be the
+   * length of the outage. udev knows in the same second the kernel does.
+   *
+   * AUTHENTICATION is the socket, exactly as for every other mutation
+   * (Principle 9): `/run/anas/anasd.sock` is mode 0600 and owned by root, so a
+   * caller that reached this handler is local root, and the X-Anas-* identity
+   * headers are trusted BECAUSE of that. The event script sends the same
+   * headers the systemd task runners send, under its own user string, so the
+   * job's audit record names the rung that raised it rather than a person.
+   *
+   * THE BODY IS A REPORT, NOT A COMMAND. Nothing in it can make the daemon
+   * uncache a healthy pool: the verdict comes from this node's own
+   * `dmsetup status` read (`cache.state`), the one honest health signal there
+   * is — `lvs` counters go stale rather than absent on a dead cache (GT-23).
+   * The body only supplies the slice LABEL, which is used to NAME the device in
+   * the notification once the disk is gone and its by-id can no longer be
+   * resolved.
+   *
+   * IDEMPOTENT by construction: a second event on an already-uncached pool
+   * finds `cache.state: 'absent'`, answers 200 with `recovered: false`, and
+   * runs nothing. udev re-runs rules and a disk can generate several removal
+   * events; neither may cost the pool a second job.
+   */
+  server.post<{ Params: { name: string } }>('/ahr/:name/cache/event', async (request, reply) => {
+    const bodyParsed = AhrCacheEventRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid cache event: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+    const pool = await loadPool(request.params.name, reply)
+    if (!pool)
+      return
+
+    // A cache job already in flight IS the recovery (a detach submitted by the
+    // operator a second earlier does the same three commands). Answering 409
+    // rather than queueing a second one is the same rule both verbs follow, and
+    // here it also absorbs the duplicate-event case the queue would otherwise
+    // see as two distinct requests.
+    if (refuseCacheJobInFlight(pool.name, reply))
+      return
+
+    // The verdict, from this node's own read. `failed` covers both shapes the
+    // rung must catch: a dm-cache target reporting a failure word, and a cache
+    // target whose `dmsetup status` cannot be read at all (the deliberate
+    // asymmetry in `buildAhrCacheState` — an unreadable health signal is not
+    // "there is no cache").
+    if (pool.cache?.state !== 'failed') {
+      reply.code(200)
+      return { data: {
+        pool: pool.name,
+        recovered: false,
+        cacheState: pool.cache?.state ?? 'absent',
+        detail: `the read cache on AHR pool '${pool.name}' reads '${pool.cache?.state ?? 'absent'}' — nothing to recover`,
+      } }
+    }
+
+    const job = jobQueue.submit(
+      // The DETACH operation on purpose, not a third one: it is the same work,
+      // and the in-flight guard above is keyed on the operation pair. A new
+      // name would make an event and an operator detach invisible to each other.
+      'ahr.cache.detach',
+      { ...identity, params: { pool: pool.name, trigger: 'udev-device-removed' } },
+      async updateProgress => recoverFailedAhrCache(
+        executor,
+        { pool, sliceLabel: bodyParsed.data.slice ?? null, reason: 'failed' },
+        updateProgress,
+      ),
     )
     reply.code(202)
     return { job }

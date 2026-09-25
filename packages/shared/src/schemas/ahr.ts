@@ -388,6 +388,36 @@ export const AttachAhrCacheRequest = z.object({
 })
 export type AttachAhrCacheRequest = z.infer<typeof AttachAhrCacheRequest>
 
+/**
+ * `POST /v1/ahr/:name/cache/event` request body — the udev hook reporting that
+ * a disk carrying one of this pool's `<pool>-cache<n>` slices was REMOVED
+ * (ahrcache.1 slice 2, AHR-DESIGN §13 "Resolved 2026-09-24").
+ *
+ * The endpoint is a REPORT, not a command: the daemon decides for itself,
+ * from `dmsetup status`, whether the cache is actually failed and whether
+ * there is any recovery to run. Everything in this body is context for the
+ * journal and the notification — the body can never make the daemon uncache a
+ * healthy pool, which is what keeps a local event script from being a lever.
+ */
+export const AhrCacheEventRequest = z.object({
+  /**
+   * What happened. One value today; the field exists so a later event kind is
+   * an additive value rather than a second endpoint.
+   */
+  event: z.literal('device-removed'),
+  /**
+   * The GPT label of the slice that went away (`<pool>-cache<n>`), as udev
+   * reports it in `ID_PART_ENTRY_NAME`. Used only to NAME the device in the
+   * notification when the disk is gone and its by-id can no longer be
+   * resolved — a disk that is not there cannot be asked what it was called,
+   * and inventing an id would be worse than naming the slice.
+   */
+  slice: z.string().min(1).max(128).optional(),
+  /** The kernel device name udev saw (`sdd1`) — journal context only. */
+  kernel: z.string().min(1).max(64).optional(),
+})
+export type AhrCacheEventRequest = z.infer<typeof AhrCacheEventRequest>
+
 /** An AHR pool (GET /v1/ahr/:name — the full §3 structure). */
 export const AhrPool = z.object({
   /** Pool name — also the VG name and the md-name prefix. */
@@ -401,6 +431,23 @@ export const AhrPool = z.object({
   mountpoint: AbsolutePath,
   /** Whether the filesystem is currently mounted. */
   mounted: z.boolean(),
+  /**
+   * The filesystem is mounted READ-ONLY (ahrcache.1 slice 2). btrfs forces
+   * this on itself after an I/O error aborts a metadata transaction — the
+   * aftermath of a cache device dying under a write (GT-19). The pool is still
+   * readable; nothing can be written to it until it is remounted.
+   *
+   * This is a SEPARATE field from `state: 'readonly'` on purpose. `state` is a
+   * fused verdict with a precedence ladder (`failed` and `offline` outrank
+   * `readonly`), so a pool can be read-only AND report some other state — and
+   * a UI that gated the Remount verb on the badge would hide the one verb that
+   * fixes it. This answers the narrow question the verb asks, and nothing else.
+   *
+   * Optional for the version-skew ruling: a daemon that predates slice 2 omits
+   * it, and a consumer that sees no field must read "this daemon cannot tell
+   * me", never "the pool is writable".
+   */
+  mountedReadOnly: z.boolean().optional(),
   disks: z.array(AhrDisk),
   arrays: z.array(AhrArray),
   /** The one VG per pool (PVs are the md devices in band order). */

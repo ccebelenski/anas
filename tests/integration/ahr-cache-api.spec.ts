@@ -39,8 +39,12 @@ const execFileAsync = promisify(execFile)
  * step's own `lvconvert --uncache` first, and the whole stack — LV, VG, arrays,
  * fstab line — goes, with all three disks selectable again.
  *
- * The cache-device FAILURE path (yank the disk live) belongs to slice 2, which
- * adds the udev rung that makes the recovery automatic.
+ * SLICE 2 adds two more tests at the bottom of this file — the cache device
+ * failing under a live pool (udev auto-uncache, the warning card, the
+ * notification, the btrfs read-only aftermath and Remount) and the boot rung.
+ * Both are WRITTEN, NOT YET RUN: slice 2 was built at unit level while the
+ * stunt node was held by another job, so their first run IS the story's live
+ * proof and nothing here claims they have passed.
  */
 
 const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
@@ -138,6 +142,8 @@ interface CacheBlock {
 interface PoolDetail {
   state: string
   mounted: boolean
+  /** slice 2 — the narrow question the Remount verb asks. */
+  mountedReadOnly?: boolean
   cache?: CacheBlock
   lv: { name: string, sizeBytes: number }
   disks: { id: string, role: string }[]
@@ -170,6 +176,55 @@ async function diskRow(ctx: APIRequestContext, id: string): Promise<DiskRow> {
 /** A file's presence on the node — `test -e` that never throws. */
 async function fileExists(path: string): Promise<boolean> {
   return (await sshExec(`test -e '${path}' && echo yes || echo no`)) === 'yes'
+}
+
+// ---- slice 2 helpers --------------------------------------------------------
+
+/** A journald cursor for the daemon's own unit — the "before" of a comparison. */
+async function anasdCursor(): Promise<string> {
+  const out = await sshExec('journalctl -u anasd -n 0 --no-pager --show-cursor')
+  const cursor = out.split('-- cursor:').pop()?.trim() ?? ''
+  expect(cursor, 'journalctl printed a cursor').not.toBe('')
+  return cursor
+}
+
+/**
+ * How many PVE notifications the daemon emitted since `cursor`.
+ *
+ * `PVE::Notify` logs its own outcome line ("notified via target `<target>`")
+ * from the perl child, which runs inside anasd's cgroup, so journald files it
+ * under `anasd.service`. That line is the PROOF an emission happened; a missing
+ * `anas-ahr-*.hbs` pair logs "could not notify via target … failed to render
+ * notification template" instead, which the assertions require to be absent.
+ */
+async function notificationsSince(cursor: string): Promise<{ sent: number, renderFailures: number }> {
+  const journal = await sshExec(`journalctl -u anasd --after-cursor='${cursor}' --no-pager -o short-iso`)
+  const lines = journal.split('\n')
+  return {
+    sent: lines.filter(l => l.includes('notified via target')).length,
+    renderFailures: lines.filter(l => l.includes('could not notify')).length,
+  }
+}
+
+/** The dashboard's `ahr` warning cards, as GET /v1/status reports them. */
+async function ahrWarnings(ctx: APIRequestContext): Promise<{ level: string, message: string, ref: string }[]> {
+  const res = await ctx.get(`${V1}/status`)
+  expect(res.status(), await res.text()).toBe(200)
+  const warnings = (await res.json()).data.warnings as { level: string, category: string, message: string, ref: string }[]
+  return warnings.filter(w => w.category === 'ahr')
+}
+
+/** Poll a predicate against the live API. Returns the first value that passes. */
+async function until<T>(read: () => Promise<T>, pass: (v: T) => boolean, timeout: number, what: string): Promise<T> {
+  const deadline = Date.now() + timeout
+  let last: T = await read()
+  while (!pass(last)) {
+    if (Date.now() > deadline)
+      throw new Error(`${what} did not happen within ${timeout}ms; last: ${JSON.stringify(last)}`)
+    await new Promise(resolve => setTimeout(resolve, 500))
+    last = await read()
+  }
+  return last
 }
 
 test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
@@ -369,6 +424,246 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
         expect(disk.status, `${serial} available again`).toBe('available')
         expect(disk.partitions).toEqual([])
       }
+    }
+    finally {
+      await ctx.dispose()
+    }
+  })
+
+  /**
+   * SLICE 2 — THE FAILURE PATH, end to end, as GT §18(a)'s procedure.
+   *
+   * WRITTEN, NOT YET RUN: slice 2 was built at unit level with the stunt node
+   * held by another job. Everything below is the procedure the ground truth
+   * already walked by hand, expressed as a spec; the first run of it is the
+   * story's live proof and no claim is made here that it has passed.
+   *
+   * The sequence, and why each step is in it:
+   *   1. attach a cache, warm it, and start a reader loop — the cache must be
+   *      LIVE and hot when it dies, or the failure proves nothing
+   *   2. yank disk 9 live (`ahrcache-fixture.sh pull-cache`) — a real virsh
+   *      detach, the shape GT-19 measured: every read returns EIO within the
+   *      second, promoted or not, because dm-cache does not fall through to
+   *      the origin
+   *   3. the udev rung uncaches WITHIN SECONDS, with nobody at a keyboard;
+   *      the reader loop recovers on its next pass (GT-20: `--uncache` is live
+   *      with the device absent and takes under a third of a second)
+   *   4. the warning card and the notification appear, and the notification
+   *      really went out (journald cursor window: `notified via target`, zero
+   *      `could not notify`)
+   *   5. `GET /v1/ahr/<p>` reports `cache.state: absent` with the leftover
+   *      device still named — the died-and-returned disk's mark, which is what
+   *      keeps Detach cache reachable as the reclaim verb
+   *   6. a WRITE takes btrfs read-only (GT-19), `mountedReadOnly` says so, and
+   *      Remount is refused without a confirm code, then restores writes
+   *   7. the returned disk is detached, which deletes the slice and hands it
+   *      back as `available` (GT-22)
+   */
+  test('slice 2: the cache device dies live, ANAS uncaches itself, Remount restores writes', async ({ playwright, pveTicket }) => {
+    const cacheId = BY_ID(CACHE_SERIAL)
+    await execFileAsync(FIXTURE_SH, ['up'])
+    for (const serial of [...BAND_SERIALS, CACHE_SERIAL])
+      expect(await fileExists(`/dev/disk/by-id/${BY_ID(serial)}`), `${serial} attached`).toBe(true)
+
+    const ctx = await authedContext(playwright, pveTicket)
+    try {
+      // --- 0. A pool with a LIVE, WARM cache -------------------------------
+      const inventory = await ctx.get(`${V1}/disks`)
+      const disks = (await inventory.json()).data as DiskRow[]
+      const bandIds = BAND_SERIALS.map(serial => disks.find(d => d.id.includes(serial))!.id)
+
+      await runConfirmedJob(ctx, 'post', `${V1}/ahr`, { name: POOL, tier: 'ahr1', disks: bandIds })
+      await runJob(ctx, 'post', `${V1}/ahr/${POOL}/cache`, { disks: [cacheId] })
+
+      // Data to read, and enough passes to promote it: a cache that never
+      // held a block would make the "reads fail anyway" finding meaningless.
+      await sshExec(`cd ${MOUNT} && for i in $(seq 1 32); do dd if=/dev/urandom of=f$i.bin bs=1M count=4 status=none; done && sync`)
+      for (let pass = 0; pass < 4; pass++)
+        await sshExec(`echo 3 > /proc/sys/vm/drop_caches && cat ${MOUNT}/f*.bin > /dev/null`)
+      const warm = await poolDetail(ctx)
+      expect(warm.cache?.state).toBe('healthy')
+      expect(warm.cache!.usedBlocks!).toBeGreaterThan(0)
+      expect(warm.cache?.dirtyBlocks).toBe(0)
+      expect(warm.mountedReadOnly).toBe(false)
+
+      // A reader loop against the pool, direct I/O so every pass really
+      // reaches the block layer. It records a timestamped rc per file, which
+      // is how "recovered on its next pass" is measured rather than asserted.
+      const READER_LOG = '/tmp/anas-cache-reader.log'
+      await sshExec(
+        `rm -f ${READER_LOG}; setsid bash -c 'for p in $(seq 1 600); do for f in ${MOUNT}/f*.bin; do `
+        + `dd if=$f of=/dev/null bs=4k count=16 iflag=direct status=none 2>/dev/null; `
+        + `echo "$(date -Is) pass=$p rc=$?" >> ${READER_LOG}; done; sleep 0.2; done' >/dev/null 2>&1 &`,
+      )
+
+      const cursor = await anasdCursor()
+
+      // --- 1. Yank the cache disk, live ------------------------------------
+      await execFileAsync(FIXTURE_SH, ['pull-cache'])
+
+      // --- 2. The udev rung uncaches, unattended, within seconds -----------
+      // 30 s is a generous ceiling on "within seconds": GT-20 measured the
+      // uncache itself at 0.224 s, and the udev event is raised in the same
+      // second the kernel removes the device.
+      const recovered = await until(
+        () => poolDetail(ctx),
+        p => p.cache?.state === 'absent',
+        30_000,
+        'the udev rung uncached the pool',
+      )
+      // The LEFTOVER device is still named: the disk carries its
+      // `<pool>-cache1` slice, and that is what keeps Detach cache reachable
+      // as the reclaim verb instead of the disk reading as a foreign one.
+      expect(recovered.cache?.devices).toEqual([cacheId])
+      expect(recovered.state).toBe('healthy')
+      // The node's own view: a plain linear volume, and no ghost PV left in
+      // the VG (`vgreduce --removemissing` ran behind the band guard).
+      expect(await sshExec(`dmsetup status ${DM_NAME}`)).toContain('linear')
+      expect(await sshExec(`pvs --noheadings -o pv_name ${POOL} | tr -d ' '`)).not.toContain('[unknown]')
+
+      // --- 3. The reader loop recovered on its next pass -------------------
+      const reader = await sshExec(`tail -40 ${READER_LOG}`)
+      expect(reader, 'the reader loop met the EIO window').toContain('rc=1')
+      expect(reader.trim().split('\n').at(-1), 'and came back after it').toContain('rc=0')
+
+      // --- 4. The notification really went out -----------------------------
+      const notified = await notificationsSince(cursor)
+      expect(notified.sent, 'a PVE notification was emitted').toBeGreaterThan(0)
+      expect(notified.renderFailures, 'the anas-ahr template pair rendered').toBe(0)
+      const journal = await sshExec(`journalctl -u anasd --after-cursor='${cursor}' --no-pager -o cat`)
+      expect(journal).toContain('rung=recover')
+      // The udev hook's own record, under the AHR tag.
+      const udevJournal = await sshExec(`journalctl -t anas-ahr --after-cursor='${cursor}' --no-pager -o cat`)
+      expect(udevJournal).toContain(`EVENT=CacheDeviceRemoved POOL=${POOL} SLICE=${POOL}-cache1`)
+
+      // --- 5. A write takes btrfs read-only, and the card says so ----------
+      await sshExec(`dd if=/dev/urandom of=${MOUNT}/after.bin bs=1M count=1 status=none; sync; true`)
+      const ro = await until(
+        () => poolDetail(ctx),
+        p => p.mountedReadOnly === true,
+        30_000,
+        'btrfs forced the filesystem read-only after the write',
+      )
+      expect(ro.state).toBe('readonly')
+      expect(ro.advisories.some(a => a.includes('writes are stopped until the pool is remounted'))).toBe(true)
+      const cards = await ahrWarnings(ctx)
+      expect(cards.some(c => c.ref === POOL && c.level === 'critical' && c.message.includes('remounted'))).toBe(true)
+
+      // --- 6. Remount: 409 with a code, then writes are back ---------------
+      const challenge = await ctx.post(`${V1}/ahr/${POOL}/remount`)
+      expect(challenge.status(), await challenge.text()).toBe(409)
+      const warnings = (await challenge.json()).error.warnings as string[]
+      expect(warnings.some(w => w.includes('Open share handles break'))).toBe(true)
+      const code = challenge.headers()['x-anas-confirm-code']
+      expect(code).toBeTruthy()
+      await sshExec(`pkill -f 'dd if=${MOUNT}' || true; pkill -f 'seq 1 600' || true`)
+      await runJob(ctx, 'post', `${V1}/ahr/${POOL}/remount`, undefined, { 'x-anas-confirm': code })
+
+      const writable = await poolDetail(ctx)
+      expect(writable.mountedReadOnly).toBe(false)
+      expect(writable.state).toBe('healthy')
+      // GT-20's negative, proven from the other side: only umount+mount could
+      // have done this — `remount,rw` is refused after an error.
+      expect(await sshExec(`dd if=/dev/urandom of=${MOUNT}/proof.bin bs=1M count=1 status=none && echo ok`)).toBe('ok')
+
+      // --- 7. The disk comes back and Detach reclaims it -------------------
+      await execFileAsync(FIXTURE_SH, ['return-cache'])
+      const returned = await poolDetail(ctx)
+      // Still attributed to the pool, by the slice the recovery deliberately
+      // did NOT delete — the operator has a product path back to the disk.
+      expect(returned.cache?.state).toBe('absent')
+      expect(returned.cache?.devices).toEqual([cacheId])
+
+      const detachJob = await runJob(ctx, 'delete', `${V1}/ahr/${POOL}/cache`)
+      expect((detachJob.result as { released: string[] }).released).toEqual([cacheId])
+      const released = await diskRow(ctx, cacheId)
+      expect(released.status).toBe('available')
+      expect(released.partitions).toEqual([])
+
+      await runConfirmedJob(ctx, 'delete', `${V1}/ahr/${POOL}`)
+    }
+    finally {
+      await sshExec(`pkill -f 'seq 1 600' || true`).catch(() => {})
+      await ctx.dispose()
+    }
+  })
+
+  /**
+   * SLICE 2 — THE BOOT RUNG. WRITTEN, NOT YET RUN (see above).
+   *
+   * LVM refuses to activate a pool LV whose cache metadata is missing —
+   * "Refusing activation of partial LV", in normal mode AND under
+   * `--activationmode degraded` (GT §18) — so a node that boots with the cache
+   * SSD dead comes up with the volume inactive and the fstab mount failed.
+   * Restarting anasd with the cache disk already pulled reproduces exactly
+   * that, without rebooting the node.
+   *
+   * What must hold afterwards: the pool is MOUNTED and UNCACHED, and it got
+   * there by the recovery running BEFORE the mount — never by coming up with a
+   * dm-cache target in front of a device that is not there.
+   */
+  test('slice 2: the boot rung recovers a cached pool whose cache PV is missing', async ({ playwright, pveTicket }) => {
+    const cacheId = BY_ID(CACHE_SERIAL)
+    await execFileAsync(FIXTURE_SH, ['up'])
+    const ctx = await authedContext(playwright, pveTicket)
+    try {
+      const inventory = await ctx.get(`${V1}/disks`)
+      const disks = (await inventory.json()).data as DiskRow[]
+      const bandIds = BAND_SERIALS.map(serial => disks.find(d => d.id.includes(serial))!.id)
+      await runConfirmedJob(ctx, 'post', `${V1}/ahr`, { name: POOL, tier: 'ahr1', disks: bandIds })
+      await runJob(ctx, 'post', `${V1}/ahr/${POOL}/cache`, { disks: [cacheId] })
+      await sshExec(`cd ${MOUNT} && dd if=/dev/urandom of=b1.bin bs=1M count=8 status=none && sha256sum b1.bin > /tmp/anas-b1.sha && sync`)
+      expect((await poolDetail(ctx)).cache?.state).toBe('healthy')
+
+      // Stop the daemon FIRST, so the pull cannot be answered by the udev rung
+      // — the boot rung is what is under proof here, and it must be the only
+      // thing that could have repaired the pool.
+      await sshExec('systemctl stop anasd')
+      await execFileAsync(FIXTURE_SH, ['pull-cache'])
+      // The pool is now exactly what a node boots into after losing its cache
+      // SSD: a partial cached LV. Unmount and deactivate it so the restart
+      // meets the activation refusal rather than a still-running volume.
+      await sshExec(`umount ${MOUNT} || true; vgchange -an ${POOL} || true`)
+      expect(await sshExec(`vgchange -ay ${POOL} 2>&1 || true`)).toMatch(/partial|Refusing/i)
+
+      const cursor = await anasdCursor()
+      await execFileAsync(FIXTURE_SH, ['restart-daemon'])
+
+      // The rung runs once, right after the socket comes up.
+      const up = await until(
+        () => poolDetail(ctx),
+        p => p.mounted && p.cache?.state === 'absent',
+        120_000,
+        'the boot rung recovered and mounted the pool',
+      )
+      expect(up.state).toBe('healthy')
+      // Mounted read-WRITE: nothing was written through the dead cache, so
+      // btrfs never aborted a transaction and Remount is not needed.
+      expect(up.mountedReadOnly).toBe(false)
+      expect(await sshExec(`dmsetup status ${DM_NAME}`)).toContain('linear')
+
+      // The order that matters: the recovery came BEFORE the mount. The
+      // journal is where that is legible — a pool that mounted first would
+      // have served EIO to whatever touched it in between.
+      const journal = await sshExec(`journalctl -u anasd --after-cursor='${cursor}' --no-pager -o cat`)
+      const uncachedAt = journal.indexOf('rung=recover status=uncached')
+      const mountedAt = journal.indexOf('rung=mount result=ok')
+      expect(uncachedAt, 'the recovery is journalled').toBeGreaterThan(-1)
+      expect(mountedAt, 'the mount is journalled').toBeGreaterThan(-1)
+      expect(uncachedAt).toBeLessThan(mountedAt)
+
+      const notified = await notificationsSince(cursor)
+      expect(notified.sent).toBeGreaterThan(0)
+      expect(notified.renderFailures).toBe(0)
+
+      // The data is intact — a writethrough cache held no only copy.
+      expect(await sshExec(`cd ${MOUNT} && sha256sum -c /tmp/anas-b1.sha && echo ok`)).toContain('ok')
+
+      // And the returned disk is reclaimable, exactly as in the live path.
+      await execFileAsync(FIXTURE_SH, ['return-cache'])
+      await runJob(ctx, 'delete', `${V1}/ahr/${POOL}/cache`)
+      expect((await diskRow(ctx, cacheId)).status).toBe('available')
+      await runConfirmedJob(ctx, 'delete', `${V1}/ahr/${POOL}`)
     }
     finally {
       await ctx.dispose()

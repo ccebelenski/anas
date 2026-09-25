@@ -1,0 +1,32 @@
+# ANAS — AHR read-cache device removal (story ahrcache.1, AHR-DESIGN §13).
+#
+# Installed by the ANAS installer as /etc/udev/rules.d/99-anas-cache.rules.
+# Inert on a node with no AHR read cache: nothing on the system carries a
+# `<pool>-cacheN` GPT partition name until `POST /v1/ahr/<pool>/cache` writes
+# one.
+#
+# WHY AN EVENT AND NOT A POLLER. dm-cache does not fall through to the origin
+# (GT-19): the instant the cache device goes, EVERY read on the pool returns
+# EIO within the second, promoted or not — files that were never promoted fail
+# identically to cached ones, and a raw read of the LV itself fails. A poller's
+# interval would be the length of the outage. udev knows in the same second the
+# kernel does, and the recovery it triggers (`lvconvert --uncache`) restores
+# read service on the very next I/O, in under a third of a second (GT-20).
+#
+# WHAT IT MATCHES. The partition NAME ANAS itself wrote into the GPT when the
+# cache was attached — `<pool>-cache<n>`, which udev exposes as
+# ID_PART_ENTRY_NAME. That label is the on-disk record of what the slice is
+# for, and it is the same string `findCacheSlices()` reads back.
+#
+# WHAT IT MUST NOT MATCH, and cannot: an AHR BAND member slice is labelled
+# `<pool>-d<n>-b<band>`, which carries no `-cache` segment, so a pulled pool
+# disk never enters this rung. Band members are mdadm's business and reach ANAS
+# through /usr/local/bin/anas-md-event (the --monitor PROGRAM hook) instead —
+# md owns failover, this rung owns a layer md cannot see.
+#
+# The RUN program posts a one-line report to anasd over its root-only Unix
+# socket and exits; the daemon answers 202 immediately and does the work in a
+# job, so nothing here runs long enough to meet udev's event timeout.
+
+ACTION=="remove", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_PART_ENTRY_NAME}=="?*-cache[0-9]", RUN+="/usr/local/bin/anas-cache-event %E{ID_PART_ENTRY_NAME} %k"
+ACTION=="remove", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_PART_ENTRY_NAME}=="?*-cache[0-9][0-9]", RUN+="/usr/local/bin/anas-cache-event %E{ID_PART_ENTRY_NAME} %k"

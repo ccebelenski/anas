@@ -75,6 +75,35 @@ export const AHR_LSBLK_ARGS = ['-Jb', '-o', 'NAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,PA
 /** findmnt args: real filesystems only (drops kernel pseudo-fs). */
 export const AHR_FINDMNT_ARGS = ['--json', '--real']
 
+/**
+ * Is ONE pool's filesystem mounted READ-ONLY right now (ahrcache.1 slice 2)?
+ *
+ * The SAME reader the full topology read uses, asked about one mountpoint:
+ * `findmnt --json` reads `/proc/self/mountinfo`, so it never touches the
+ * mountpoint and never hangs. The effective options string it returns is the
+ * same comma list `/proc/mounts` prints in its fourth field — after a btrfs
+ * abort on a pool with the §12 subvolume layout, verbatim in shape:
+ *
+ *   /dev/mapper/gtcache-gtcache--vol /mnt/anas-ahr/gtcache btrfs \
+ *     ro,relatime,space_cache=v2,subvolid=256,subvol=/@data 0 0
+ *
+ * It exists as its own function because the recovery rung and the Remount verb
+ * both need the answer at a moment a full `readAhrPools()` has already passed:
+ * btrfs flips to forced-readonly on the first WRITE after the cache dies
+ * (GT-19), so the flag can arrive between loading the pool and finishing the
+ * uncache, and it is the fact that decides what the operator is told.
+ *
+ * Fail-open: an unreadable mount table answers `false`. The alternative is a
+ * notification claiming writes are stopped when they are not.
+ */
+export async function isAhrMountReadOnly(executor: CommandExecutor, mountpoint: string): Promise<boolean> {
+  const res = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
+  if (res.exitCode !== 0)
+    return false
+  const mount = parseFindmnt(res.stdout).find(m => m.target === mountpoint)
+  return mount ? optionsReadOnly(mount.options) : false
+}
+
 // ---- lsblk tree (raw) ------------------------------------------------------
 
 interface LsblkNode {
@@ -243,6 +272,23 @@ function advisorySubject(pool: string): string {
  * the two altitudes share one string instead of two that can drift.
  */
 const OFFLINE_VERDICT = 'is OFFLINE — '
+
+/**
+ * The read-only clause, in ONE place — the pool advisory and the dashboard
+ * card both say it, and two copies of a sentence are two sentences that drift
+ * (they already had, by a full clause, before ahrcache.1 slice 2 named the
+ * recovery verb).
+ *
+ * It names Remount because a read-only btrfs cannot be talked out of it:
+ * `mount -o remount,rw` is REFUSED after an error ("remounting read-write
+ * after error is not allowed", GT-20) and only umount + mount restores writes.
+ * Saying "diagnose before any remount" and stopping there left the operator at
+ * a screen with no way forward.
+ */
+export const AHR_READONLY_CLAUSE
+  = 'is mounted READ-ONLY — btrfs is protecting itself after an I/O error; '
+    + 'writes are stopped until the pool is remounted (Remount, in the Hybrid RAID view). '
+    + 'Diagnose the cause first — a read-only pool is a symptom, not the fault'
 
 /** The evidence behind an `offline` verdict, as {@link readAhrPools} found it. */
 interface OfflineDetail {
@@ -888,7 +934,7 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     if (state === 'offline')
       advisories.unshift(offlineAdvisory(poolName, { cannotStart, arrayCount: arrayEntries.length, lvName, lvInactive }))
     if (readonly)
-      advisories.push(`pool '${poolName}' is mounted READ-ONLY — btrfs is protecting itself; diagnose before any remount`)
+      advisories.push(`${advisorySubject(poolName)}${AHR_READONLY_CLAUSE}`)
 
     pools.push(AhrPool.parse({
       name: poolName,
@@ -897,6 +943,11 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
       // the honest "where the filesystem lives" answer (never fabricated).
       mountpoint: mount?.target ?? `/dev/${poolName}/${lvName}`,
       mounted: mount != null,
+      // The narrow question the Remount verb asks (slice 2). Separate from
+      // `state`, whose precedence ladder lets `failed`/`offline` outrank
+      // `readonly` — a UI gating the verb on the badge would hide it exactly
+      // when a pool is read-only AND something else.
+      mountedReadOnly: readonly,
       disks,
       arrays,
       vg: {
@@ -1020,7 +1071,7 @@ export function buildAhrWarnings(pools: AhrPool[]): DashboardWarning[] {
     }
     else if (pool.state === 'readonly') {
       level = 'critical'
-      clauses.push('is mounted READ-ONLY — btrfs is protecting itself; diagnose before any remount')
+      clauses.push(AHR_READONLY_CLAUSE)
     }
     else if (pool.state === 'degraded' && pool.arrays.some(a => a.state === 'degraded')) {
       clauses.push(`is degraded — ${degradedDetail(pool)}; replace the failed disk before a second failure`)

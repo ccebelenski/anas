@@ -15,6 +15,7 @@ import { floorToGranularity, planFreshLayout } from './ahr-layout.js'
 import { installProgramHook, pinArrays } from './ahr-mdadm-conf.js'
 import { ahrLvPath, ahrMountBase } from './ahr-paths.js'
 import { SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-snapshots.js'
+import { isAhrMountReadOnly } from './ahr-topology.js'
 import { editConfig } from './config-writer.js'
 import { pveNotify } from './pve-notify.js'
 
@@ -589,6 +590,55 @@ export async function createAhrPool(
       throw new Error(`${original}${ROLLED_BACK_MARKER}`)
     throw new Error(`${original} — the automatic rollback ALSO FAILED: ${rollbackError}; the partial pool is still on the disks and must be destroyed manually before retrying`)
   }
+}
+
+/**
+ * Remount a btrfs-forced-readonly pool read-write (story ahrcache.1 slice 2,
+ * AHR-DESIGN §13 "Resolved 2026-09-24"): `umount` then `mount`, nothing else.
+ *
+ * UMOUNT + MOUNT, not `mount -o remount,rw`, and that is measured rather than
+ * chosen (GT-20). After an I/O error aborts a metadata transaction btrfs sets a
+ * flag that a remount cannot clear:
+ *
+ *   # mount -o remount,rw /mnt/anas-ahr/gtcache
+ *   mount: /mnt/anas-ahr/gtcache: mount point not mounted or bad option.
+ *   BTRFS error (device dm-0 state EMA): remounting read-write after error is
+ *   not allowed
+ *
+ * `umount` + `mount` restored rw cleanly on the same pool and reset
+ * `btrfs device stats` to zero. So the cheap-looking call is the one that does
+ * not work, and the expensive one — which breaks every open handle on the
+ * filesystem — is the only recovery there is. That cost is what the route's
+ * confirm gate is for.
+ *
+ * The mount is by MOUNTPOINT, so fstab supplies the spec and every option the
+ * pool's line carries (`subvol=@data`, `nofail`, the iSCSI ordering pair) —
+ * this verb never invents a mount, it re-runs the one the node already has.
+ *
+ * The result is VERIFIED, never assumed: `mount` can succeed and land read-only
+ * again when the underlying cause is still there, and reporting that as success
+ * would send the operator away from the one screen that could tell them.
+ */
+export async function remountAhrPool(
+  executor: CommandExecutor,
+  pool: { name: string, mountpoint: string },
+  updateProgress: (message: string) => void,
+): Promise<{ mountpoint: string, readOnly: boolean }> {
+  updateProgress(`Unmounting ${pool.mountpoint}`)
+  await run(executor, UMOUNT, ['--', pool.mountpoint], { busyPath: pool.mountpoint })
+
+  updateProgress(`Mounting ${pool.mountpoint}`)
+  await run(executor, MOUNT, ['--', pool.mountpoint])
+
+  const readOnly = await isAhrMountReadOnly(executor, pool.mountpoint)
+  if (readOnly) {
+    throw new Error(
+      `pool '${pool.name}' mounted again but is STILL read-only. btrfs re-applies the flag when the fault that caused it `
+      + `is still present — check the pool's read cache and its band arrays in the Hybrid RAID view, and \`dmesg\` for the `
+      + `BTRFS error that names the device`,
+    )
+  }
+  return { mountpoint: pool.mountpoint, readOnly: false }
 }
 
 /**

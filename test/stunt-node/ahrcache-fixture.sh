@@ -35,10 +35,13 @@ by_id() { echo "scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT$1"; }
 image_of() { echo "${STORAGE_PATH}/${VM_NAME}-hot$1.qcow2"; }
 
 usage() {
-  echo "Usage: ahrcache-fixture.sh <up|down|status>"
-  echo "  up      Attach hot${BAND_DISKS[0]}+hot${BAND_DISKS[1]} (${BAND_SIZE_MB} MB) and hot${CACHE_DISK} (${CACHE_SIZE_MB} MB), blank, and wait for their by-id links"
-  echo "  down    Best-effort ${POOL} teardown (cache, mounts, fstab, LVM/md, GPTs) + detach all three disks"
-  echo "  status  What the node currently has"
+  echo "Usage: ahrcache-fixture.sh <up|down|status|pull-cache|return-cache|restart-daemon>"
+  echo "  up             Attach hot${BAND_DISKS[0]}+hot${BAND_DISKS[1]} (${BAND_SIZE_MB} MB) and hot${CACHE_DISK} (${CACHE_SIZE_MB} MB), blank, and wait for their by-id links"
+  echo "  down           Best-effort ${POOL} teardown (cache, mounts, fstab, LVM/md, GPTs) + detach all three disks"
+  echo "  status         What the node currently has"
+  echo "  pull-cache     Yank hot${CACHE_DISK} LIVE, keeping its image (the slice-2 failure path)"
+  echo "  return-cache   Re-attach the SAME hot${CACHE_DISK} image, stale PV label and all"
+  echo "  restart-daemon Restart anasd on the node and wait for its socket (the boot rung)"
   exit 1
 }
 
@@ -138,6 +141,50 @@ case "$1" in
     echo "=== ahrcache.1 fixture — down ==="
     teardown_pool
     detach_disks
+    ;;
+
+  # ---- slice 2: the failure path -----------------------------------------
+  # The cache device dies UNDER A LIVE POOL. `remove-disk.sh` is a live virsh
+  # detach and the image is left exactly as it is — which is the point: the
+  # disk comes back later carrying an outdated PV label ("WARNING: outdated PV
+  # … seqno"), the state a real returning SSD is in, and the attach/repair path
+  # has to wipe it rather than trip over it.
+  pull-cache)
+    echo "=== ahrcache.1 fixture — pull the cache disk LIVE ==="
+    if attached "$CACHE_DISK"; then
+      "$SCRIPT_DIR/remove-disk.sh" "$CACHE_DISK"
+      # No settle to wait for: the point of the rung under proof is that udev
+      # raises the removal event in the same second the kernel does.
+      echo "✓ hot${CACHE_DISK} detached live (image kept at $(image_of "$CACHE_DISK"))"
+    else
+      echo "✓ hot${CACHE_DISK} not attached (nothing to pull)"
+    fi
+    ;;
+
+  return-cache)
+    echo "=== ahrcache.1 fixture — the cache disk comes back ==="
+    # add-disk.sh reuses an existing image, so this is the SAME disk with the
+    # SAME serial and the SAME stale label — never a fresh one.
+    "$SCRIPT_DIR/add-disk.sh" --size "$CACHE_SIZE_MB" "$CACHE_DISK"
+    wait_for_by_id "$(by_id "$CACHE_DISK")"
+    ;;
+
+  # ---- slice 2: the boot rung --------------------------------------------
+  # The daemon-start scan is what recovers a pool whose cache PV is missing at
+  # activation. Restarting anasd with the cache disk already pulled reproduces
+  # exactly that, without rebooting the node.
+  restart-daemon)
+    echo "=== ahrcache.1 fixture — restart anasd ==="
+    $SSH_CMD "systemctl restart anasd" || { echo "ERROR: could not restart anasd" >&2; exit 1; }
+    for n in $(seq 1 30); do
+      if $SSH_CMD "test -S /run/anas/anasd.sock"; then
+        echo "✓ anasd listening again (after ${n}s)"
+        exit 0
+      fi
+      sleep 1
+    done
+    echo "ERROR: anasd socket never came back" >&2
+    exit 1
     ;;
 
   status)

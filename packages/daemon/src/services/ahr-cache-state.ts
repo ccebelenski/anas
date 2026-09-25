@@ -225,8 +225,72 @@ export function cacheFailedAdvisory(pool: string): string {
   return `cache device failed on '${pool}'; reads fail until the cache is detached (Detach cache — no data is lost, writethrough holds nothing)`
 }
 
+/**
+ * The sentence the auto-uncache rung says — in the notification body, in the
+ * job progress and in the journal (ahrcache.1 slice 2, §13 "Resolved").
+ *
+ * PURE string math, one home, because the three surfaces must agree word for
+ * word: an operator reading the mail and then the pool detail is reading the
+ * same event, and two phrasings of it read as two events.
+ *
+ * `device` is what the daemon can still HONESTLY call the cache disk. When the
+ * disk is gone its by-id cannot be recovered — a disk that is not there cannot
+ * be asked what it was called — so the caller falls back to the GPT label udev
+ * reported, and to nothing at all when even that is unknown.
+ *
+ * `readOnly` is the second fact and the one that costs the operator something:
+ * `--uncache` restores READS in the same second (GT-20), but it cannot undo
+ * btrfs's forced-readonly flag, and `mount -o remount,rw` is refused after an
+ * error (GT-20 again). Only umount + mount — the Remount verb — brings writes
+ * back, so the notification says so rather than leaving the pool looking fixed.
+ */
+export function cacheRecoveryNotification(input: {
+  pool: string
+  device: string | null
+  readOnly: boolean
+  /** `missing` at activation (the boot rung), `failed` under a live pool. */
+  reason: 'failed' | 'missing'
+}): { title: string, body: string } {
+  const { pool, device, readOnly, reason } = input
+  const subject = device === null ? 'The cache device' : `Cache device ${device}`
+  const verb = reason === 'failed'
+    ? `failed on pool '${pool}'`
+    : `was missing when pool '${pool}' was activated`
+  const body = `${subject} ${verb}. ANAS removed the cache automatically (lvconvert --uncache); `
+    + `reads are restored uncached and no data was lost — a writethrough cache never holds the only copy of a byte.${
+      readOnly
+        ? ' The filesystem was forced READ-ONLY by the I/O error, so writes are stopped until the pool is remounted:'
+        + ' use Remount in the Hybrid RAID view (it unmounts and mounts the pool, which breaks open share handles).'
+        : ''
+    } The cache disk stays out of the pool until it is attached again.`
+  return {
+    title: reason === 'failed' ? `AHR read cache failed: ${pool}` : `AHR read cache missing: ${pool}`,
+    body,
+  }
+}
+
 /** The one advisory a rotating cache disk earns. Stated once, then dropped. */
 export function rotatingCacheAdvisory(diskIds: string[]): string {
   return `${diskIds.join(', ')} ${diskIds.length === 1 ? 'is a rotating disk' : 'are rotating disks'}: `
     + `a rotating cache adds a seek, not speed`
+}
+
+/**
+ * The pool a `<pool>-cache<n>` GPT label belongs to, or null when the label is
+ * not one of ours. The inverse of {@link cachePartitionLabel} from the other
+ * side than {@link matchCachePartitionLabel}: that one asks "is this label pool
+ * P's?", this one asks "whose is it?" — the question the udev hook has, holding
+ * a label and no pool name.
+ *
+ * Deliberately strict about the tail: a band-member slice (`<pool>-d<n>-b<m>`)
+ * must never resolve to a pool here, or a member disk's removal would enter the
+ * cache recovery rung instead of md's own. The shipped udev rule already cannot
+ * match one; this is the second door.
+ */
+export function poolOfCacheLabel(label: string): string | null {
+  const at = label.lastIndexOf('-cache')
+  if (at <= 0)
+    return null
+  const pool = label.slice(0, at)
+  return matchCachePartitionLabel(pool, label) === null ? null : pool
 }

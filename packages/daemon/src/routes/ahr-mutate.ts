@@ -14,7 +14,7 @@ import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
 import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
 import { confirmGate } from '../safety/gate.js'
-import { changeAhrMountpoint, createAhrPool } from '../services/ahr-create.js'
+import { changeAhrMountpoint, createAhrPool, remountAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
 import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
 import { mirrorReconcileArray, mirrorReconcileArrayRefusal, mirrorReconcileEvidence, mirrorReconcileWarnings, reconcileMirrorBand } from '../services/ahr-mirror-reconcile.js'
@@ -595,6 +595,95 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         updateProgress,
         { fstabPath },
       ),
+    )
+    reply.code(202)
+    return { job }
+  })
+
+  // --- POST /ahr/:name/remount — the read-only aftermath ---------------------
+  /**
+   * Bring a btrfs-forced-readonly pool back read-write (story ahrcache.1
+   * slice 2, AHR-DESIGN §13 "Resolved 2026-09-24").
+   *
+   * The aftermath the automatic uncache CANNOT fix. `lvconvert --uncache`
+   * restores reads in the same second with the cache device gone (GT-20), but
+   * if the pool took a WRITE during the failure window, the I/O error aborted a
+   * btrfs metadata transaction and btrfs set a flag that survives the repair:
+   * `mount -o remount,rw` is refused ("remounting read-write after error is not
+   * allowed"), and only umount + mount restores writes.
+   *
+   * That is why this is an OPERATOR verb and not a fourth line in the recovery
+   * job: an unmount breaks every open handle on the filesystem — SMB and NFS
+   * clients, a backup mid-run, a job reading a file — and a machine does not get
+   * to decide that on someone's behalf. The confirm gate says exactly that.
+   *
+   * Three doors before the gate, cheapest first:
+   *  - not mounted read-only ⇒ 409. There is nothing to remount, and running an
+   *    unmount/mount cycle "just in case" would cost the handles for nothing.
+   *  - the read cache is still FAILED ⇒ 409. Every read on the pool returns EIO
+   *    while the dead cache is in front of it (GT-19), so a remount would land
+   *    a filesystem that cannot serve a byte and btrfs would force it read-only
+   *    again on the first error. Uncache first — the message says so.
+   *  - a LUN holds the pool ⇒ hard 409, no confirm bypass. The unmount pulls the
+   *    image file out from under a live LIO backstore, which is the same rule
+   *    destroy and change-mount already apply (iscsi.6).
+   */
+  server.post<{ Params: { name: string } }>('/ahr/:name/remount', async (request, reply) => {
+    const name = parsePoolName(request.params.name, reply)
+    if (!name)
+      return
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const pool = (await readAhrPools(executor)).find(p => p.name === name)
+    if (!pool) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
+    }
+
+    if (!pool.mountedReadOnly) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: pool.mounted
+        ? `AHR pool '${name}' is mounted read-write — there is nothing to remount. Remount exists to clear a btrfs forced-readonly filesystem, which is what an I/O error leaves behind`
+        : `AHR pool '${name}' is not mounted, so there is nothing to remount. Bring the pool online first — see the Hybrid RAID view` } }
+    }
+
+    // The dead cache must go FIRST. Remounting over it lands a filesystem that
+    // returns EIO on every read, and btrfs forces it read-only again on the
+    // first error — the operator would have broken every open handle to arrive
+    // exactly where they started.
+    if (pool.cache?.state === 'failed') {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message:
+        `AHR pool '${name}' still has a FAILED read cache in front of its volume: every read returns an I/O error until the cache is removed, `
+        + `and a remount would be forced read-only again by the first one. Detach the cache first (no data is lost — a writethrough cache holds no only copy), then Remount` } }
+    }
+
+    const remountHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool)
+    if (remountHeld) {
+      reply.code(409)
+      return ahrHeldByLunConflict(`AHR pool '${name}'`, 'Remounting', remountHeld)
+    }
+
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'ahr.remount',
+      params: { name },
+      message: `Remounting pool '${name}' unmounts and mounts its filesystem`,
+      warnings: [
+        `Open share handles break: '${pool.mountpoint}' is unmounted and mounted again, and anything holding a file open on it — SMB and NFS clients, a backup mid-run, a running job — loses it`,
+        'This is the only way back: btrfs refuses `mount -o remount,rw` after an I/O error, so a plain remount cannot clear the read-only flag',
+        'Fix the cause first if you have not: a pool that is read-only again after this has an error it is still meeting',
+      ],
+    })) {
+      return reply
+    }
+
+    const job = jobQueue.submit(
+      'ahr.remount',
+      { ...identity, params: { name } },
+      async updateProgress => remountAhrPool(executor, { name: pool.name, mountpoint: pool.mountpoint }, updateProgress),
     )
     reply.code(202)
     return { job }
