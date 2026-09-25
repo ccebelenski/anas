@@ -256,6 +256,17 @@ case "$1" in
     done
     $SSH_CMD "systemctl daemon-reload"
 
+    # …and their FAILED STATE. A spec that deletes its task through the API
+    # leaves no unit file here for the loop above to find, but systemd keeps a
+    # `not-found failed` entry for any of them whose last run failed on purpose
+    # (the empty-source sync refusal, the stand-in-rclone exit 7) — so
+    # `systemctl --failed` still lists an anas-cloud ghost on an otherwise
+    # clean node. Unconditional and quiet: a name systemd has never heard of
+    # is not an error worth printing.
+    for t in "${TASKS[@]}"; do
+      $SSH_CMD "systemctl reset-failed anas-cloud-${t}.service anas-cloud-${t}.timer >/dev/null 2>&1 || true"
+    done
+
     # The fstab entries + their mountpoints (rmdir only — a populated directory
     # is not ours to delete). The tmpfs one is released FIRST: the spec mounts
     # it, and an fstab line removed under a live mount leaves a stray tmpfs

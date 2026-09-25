@@ -24,12 +24,14 @@ export { GATEWAY_URL, NODE_NAME, PVE_URL, STUNT_HOST }
 export async function loginToPve(page: Page): Promise<void> {
   await page.goto(`${PVE_URL}/`)
   const username = page.locator('input[name="username"]')
-  await username.waitFor({ state: 'visible', timeout: 20_000 })
+  // 30 s rather than 20: this is every UI spec's first wait, so it absorbs
+  // whatever the node is still busy with when a spec starts.
+  await username.waitFor({ state: 'visible', timeout: 30_000 })
   await username.fill('root')
   await page.locator('input[name="password"]').fill('anas-test')
   await page.getByRole('button', { name: 'Login' }).click()
   // Workspace loaded once the login dialog is gone.
-  await expect(page.locator('input[name="username"]')).not.toBeVisible({ timeout: 20_000 })
+  await expect(page.locator('input[name="username"]')).not.toBeVisible({ timeout: 30_000 })
 
   // Unsubscribed nodes always show the subscription nag after login; its modal
   // mask intercepts every click until dismissed. Wait for it deterministically,

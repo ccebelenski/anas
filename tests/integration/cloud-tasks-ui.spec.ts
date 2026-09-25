@@ -68,6 +68,24 @@ const SOURCE = '/gtbackup/cloudsrc'
 const NESTED = `${SOURCE}/raw`
 const TASK = 'pictures-offsite'
 
+/**
+ * The schedule every task this spec creates carries.
+ *
+ * SCHEDULES-GT-17/GT-18/GT-21: deleting a task removes its units but LEAVES
+ * `/var/lib/systemd/timers/stamp-anas-cloud-<name>.timer` behind, and this spec
+ * re-uses `pictures-offsite` and `sync-empty` on every run — so on the second
+ * run onwards the stamp is already there, carrying the previous run's trigger
+ * time. `Persistent=true` then fires the timer the instant it is enabled if ANY
+ * calendar point lies between that stamp and now, which a `daily` (or any
+ * time-of-day) expression always has. An absolute FUTURE DATE has no occurrence
+ * between the stamp and now however stale the stamp is, so the task sits
+ * enabled and runs only when this spec runs it (GT-21, proven on the node).
+ *
+ * This is a spec-side workaround, deliberately: the stamp remedy is an open
+ * product ruling, and a live proof must not change the product to suit itself.
+ */
+const SCHEDULE = '2030-01-01 00:00:00'
+
 /** Absolute path of the fixture script, relative to this spec file. */
 const FIXTURE_SH = new URL('../../test/stunt-node/cloud-tasks-fixture.sh', import.meta.url).pathname
 
@@ -80,7 +98,9 @@ const TASK_BODY: Record<string, unknown> = {
   mode: 'copy',
   excludes: [],
   notify: 'on-failure',
-  cadence: { kind: 'weekly', days: ['Mon'], time: '02:00' },
+  // A raw OnCalendar, NOT a `cadence`: a cadence generates a weekly time-of-day
+  // expression, which the leftover stamp turns into an immediate self-run.
+  schedule: SCHEDULE,
   enabled: true,
 }
 
@@ -241,6 +261,59 @@ async function remoteTreeListing(): Promise<string> {
   return sshExec(`ls -1 /home/${REMOTE_USER}/pictures 2>/dev/null || true`)
 }
 
+/**
+ * The NODE's wall clock in epoch ms. `lastRunAt` is a systemd timestamp off the
+ * node, so the "this run, not the last one" comparison has to be made against
+ * the node's own clock — the test host's may sit either side of it.
+ */
+async function nodeNowMs(): Promise<number> {
+  return Number.parseInt((await sshExec('date -u +%s%3N')).trim(), 10)
+}
+
+/** The stored task's grid row, straight from the API the grid itself loads. */
+async function taskViewViaApi(
+  ctx: APIRequestContext,
+  name: string,
+): Promise<{ lastRunResult: string, lastRunAt: string | null }> {
+  const res = await ctx.get(`${V1}/cloud/tasks`)
+  expect(res.status(), await res.text()).toBe(200)
+  const rows = (await res.json()).data as Array<{ name: string, lastRunResult: string, lastRunAt: string | null }>
+  const row = rows.find(r => r.name === name)
+  expect(row, `task ${name} present in GET /v1/cloud/tasks`).toBeTruthy()
+  return row as { lastRunResult: string, lastRunAt: string | null }
+}
+
+/**
+ * The Last run the grid shows is THE RUN THIS TEST STARTED — not "the last
+ * run", whoever made it. The result alone cannot say that: a task whose timer
+ * fired on its own (SCHEDULES-GT-17, which is why SCHEDULE above is an
+ * absolute future date) leaves exactly the same word in the cell. So the
+ * timestamp is checked against the node's clock reading taken immediately
+ * before this test pressed Run.
+ */
+async function expectRunOfThisTest(
+  playwright: PlaywrightWorkerArgs['playwright'],
+  name: string,
+  result: string,
+  startedAtMs: number,
+): Promise<void> {
+  const ctx = await apiCtx(playwright)
+  try {
+    const row = await taskViewViaApi(ctx, name)
+    expect(row.lastRunResult, `${name} lastRunResult`).toBe(result)
+    expect(row.lastRunAt, `${name} lastRunAt`).toBeTruthy()
+    const at = Date.parse(row.lastRunAt as string)
+    expect(
+      at,
+      `${name} lastRunAt ${row.lastRunAt} is at/after this test's run start `
+      + `(${new Date(startedAtMs).toISOString()}, node clock)`,
+    ).toBeGreaterThanOrEqual(startedAtMs)
+  }
+  finally {
+    await ctx.dispose()
+  }
+}
+
 // ---- UI helpers --------------------------------------------------------------
 
 /** Select the node, open the Cloud Sync menu, wait for the tasks grid. */
@@ -323,15 +396,21 @@ async function setRadio(scope: Locator, cls: string, value: string): Promise<voi
   }, value)
 }
 
-/** The job-failure alert ANAS.runJob raises. */
+/**
+ * The job-failure alert ANAS.runJob raises. ExtJS 7's message box carries
+ * `.x-message-box` (hyphenated) — the class every other UI spec here matches
+ * on; `:visible`, because the dismissed PVE subscription nag stays in the DOM
+ * as a hidden one.
+ */
 function failureAlert(page: Page): Locator {
-  return page.locator('.x-messagebox', { hasText: /failed|refused/i })
+  return page.locator('.x-message-box:visible').filter({ hasText: /failed|refused/i })
 }
 
-/** Dismiss whatever Ext messagebox is up. */
+/** Dismiss the alert that is up (the OK-only box). */
 async function dismissMessageBox(page: Page): Promise<void> {
-  await page.locator('.x-messagebox .x-btn:visible').first().click()
-  await expect(page.locator('.x-messagebox')).toBeHidden({ timeout: 15_000 })
+  const alert = failureAlert(page)
+  await alert.first().getByRole('button', { name: 'OK' }).click()
+  await expect(alert).toHaveCount(0, { timeout: 15_000 })
 }
 
 /**
@@ -467,15 +546,20 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     await pickRemote(page, dlg, REMOTE)
     await dlg.locator('.anas-fld-cloud-remote-path input').fill('pictures')
     // A NEW task opens on the Custom tab with an empty OnCalendar field, and
-    // the wizard refuses to save without one ("Enter a schedule.").
-    await dlg.locator('.anas-fld-cloud-schedule input').fill('daily')
+    // the wizard refuses to save without one ("Enter a schedule."). The
+    // absolute future date is the stamp-immune one (see SCHEDULE above).
+    await dlg.locator('.anas-fld-cloud-schedule input').fill(SCHEDULE)
     await dlg.locator('.anas-btn-cloud-task-submit').click()
     await expect(dlg).toBeHidden({ timeout: 120_000 })
 
     // The new row lands SELECTED with its destination whole and untruncated.
+    // ExtJS 7 puts the selected marker on the row's own ITEM table, not on the
+    // `<tr>` (which only carries `aria-selected`) — the same read pvepool-ui
+    // makes of a freshly created pool row.
     const row = taskRow(page, grid, TASK)
     await expect(row).toBeVisible({ timeout: 45_000 })
-    await expect(row).toHaveClass(/x-grid-row-selected/, { timeout: 15_000 })
+    await expect(row.locator('xpath=ancestor::table[1]'))
+      .toHaveClass(/x-grid-item-selected/, { timeout: 15_000 })
     await expect(row).toContainText('gt:pictures')
 
     // The stored side of the contract: the task's unit pair exists and
@@ -494,6 +578,7 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     const before = await rowText(row)
 
     await row.click()
+    const startedAt = await nodeNowMs()
     await grid.locator('.anas-btn-cloud-task-run').click()
 
     // The finished-run toast names the task and rclone's own counters; the
@@ -506,6 +591,8 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     expect(before, 'the row had not already succeeded before this run').not.toContain('success')
     await expect(row).toContainText('success', { timeout: 45_000 })
     await expect(row).not.toContainText('never run')
+    // …and that success is THIS run's, by the node's clock.
+    await expectRunOfThisTest(playwright, TASK, 'success', startedAt)
 
     // The copy actually landed at the remote (the fixture user's home).
     const listing = await remoteTreeListing()
@@ -524,7 +611,7 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
       mode: 'sync',
       excludes: [],
       notify: 'on-failure',
-      schedule: 'daily',
+      schedule: SCHEDULE,
       enabled: true,
     })
 
@@ -532,6 +619,7 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     const row = taskRow(page, grid, 'sync-empty')
     await expect(row).toBeVisible({ timeout: 45_000 })
     await row.click()
+    const startedAt = await nodeNowMs()
     await grid.locator('.anas-btn-cloud-task-run').click()
 
     const alert = failureAlert(page)
@@ -540,23 +628,31 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     await expect(alert).toContainText('would delete everything')
     await dismissMessageBox(page)
 
-    // The grid reloaded after the failed run; the Last run cell is red.
+    // The grid reloaded after the failed run; the Last run cell is red, and the
+    // failure is THIS run's.
     await expect(row).toContainText('failure', { timeout: 45_000 })
+    await expectRunOfThisTest(playwright, 'sync-empty', 'failure', startedAt)
   })
 
   test('4 — a stand-in rclone exiting 7: the failure surfaces, the grid still reloads', async ({ page, playwright }) => {
     await setupViaApi(playwright, TASK_BODY)
+    let startedAt = 0
+
+    // The grid is opened ONCE and kept: `openTasksView` logs in, and a second
+    // login on an already-authenticated page waits for a form PVE will never
+    // show again — so the recovery half below refreshes this same grid.
+    const grid = await openTasksView(page)
 
     // The stand-in: the real binary aside, a shim that exits 7 — rclone's own
     // "retries exhausted" code. Restored the moment this test has proven its
     // point (and in afterAll if the test dies mid-way).
     await sshExec(`mv ${RCLONE_BIN} ${RCLONE_BAK} && printf '#!/bin/sh\\nexit 7\\n' > ${RCLONE_BIN} && chmod 755 ${RCLONE_BIN}`)
     try {
-      const grid = await openTasksView(page)
       const row = taskRow(page, grid, TASK)
       await expect(row).toBeVisible({ timeout: 45_000 })
       const before = await rowText(row)
       await row.click()
+      startedAt = await nodeNowMs()
       await grid.locator('.anas-btn-cloud-task-run').click()
 
       const alert = failureAlert(page)
@@ -575,6 +671,7 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
         .first()
         .getAttribute('title')
       expect(cellTip).toContain('exit 7')
+      await expectRunOfThisTest(playwright, TASK, 'failure', startedAt)
     }
     finally {
       // Put the real rclone back BEFORE anything else runs.
@@ -582,6 +679,7 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     }
 
     // The real binary is back: one more run succeeds, the row recovers.
+    const recoveryStartedAt = await nodeNowMs()
     const ctx = await apiCtx(playwright)
     try {
       await runJob(ctx, 'post', `${V1}/cloud/tasks/${TASK}/run`, {})
@@ -589,8 +687,9 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     finally {
       await ctx.dispose()
     }
-    const grid = await openTasksView(page)
+    await grid.locator('.anas-btn-cloud-refresh').click()
     await expect(taskRow(page, grid, TASK)).toContainText('success', { timeout: 120_000 })
+    await expectRunOfThisTest(playwright, TASK, 'success', recoveryStartedAt)
   })
 
   test('5 — Remotes… opens the rclone.1 window', async ({ page }) => {
@@ -620,10 +719,10 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     await row.click()
     await win.locator('.anas-btn-cloud-remote-remove').click()
 
-    // Confirm the removal…
-    const confirm = page.locator('.x-messagebox', { hasText: 'Remove the remote' })
+    // Confirm the removal… (ExtJS 7's message box is `.x-message-box`.)
+    const confirm = page.locator('.x-message-box:visible').filter({ hasText: 'Remove the remote' })
     await expect(confirm).toBeVisible({ timeout: 20_000 })
-    await confirm.locator('.x-btn', { hasText: 'Yes' }).click()
+    await confirm.getByRole('button', { name: 'Yes' }).click()
 
     // …and the daemon's 409 names the referencing task, not just a code.
     const alert = failureAlert(page)
