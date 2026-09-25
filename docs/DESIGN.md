@@ -316,7 +316,7 @@ The fd cap (default 1024, per-task override) binds pbc via `prlimit --nofile=N:N
 
 **Run notifications (16.12).** A task carries `notify: always | on-failure` in the same unit JSON, **defaulting to `always`** — vzdump's own default, and the behaviour the six cron jobs this epic replaced had (they mailed every run's full output). Absent = `always`, so no task migrates. Emission is at the daemon's run job — the ONE point every real run reaches, scheduled fire and UI Run Now alike (both arrive through the task's own unit) — and maps: success → `info` (only in `always`), completed-with-warnings → `warning` (both modes), failure → `error` (both modes), **off-week skip → nothing, in either mode** (the cadence gate produced no run, and no cron mail either). The body is the point: task, `repo:datastore / namespace`, backup-id, the per-archive stats lines pbc printed, duration, prune counts when retention ran, warnings verbatim, and the error text on a failure. Delivery is PVE's (`PVE::Notify::notify`) through ANAS-shipped `anas-backup-{subject,body}.txt.hbs` templates, with `type=anas-backup` so operators can match backup events specifically; a notification failure **never** fails the run job (the AHR posture, unchanged). No poller, no PBS contact, and no overdue push — an overdue task has no run to notify from, so overdue stays exactly where it is: the dashboard warning category.
 
-**Task cadence (16.10).** A task may carry a structured `cadence` alongside its `schedule`: `{ kind: weekly|biweekly|monthly|custom, days[] (Mon..Sun), time (HH:MM), parity? (even|odd) }`. When present the daemon **generates** `OnCalendar=` from it (the cadence is authoritative, and the generated expression is validated with `systemd-analyze calendar` like any other); when absent the raw `schedule` stands — which is what every pre-16.10 task carries, so nothing migrates. Weekly/monthly/custom are pure OnCalendar with `Persistent=true` as their missed-run heal; **biweekly** is the one case systemd's calendar cannot express, so it runs on a WEEKLY timer and the daemon gates each SCHEDULED fire on ISO-week parity (`date +%V` semantics, parity explicit config — never derived). An off-week fire completes as a first-class **skipped** run (the runner's `SuccessExitStatus=75`: systemd records success, `ExecMainStatus` says no backup was taken); a Run Now is never gated; and an off-week fire runs anyway when the last successful run is older than one full period (the heal — at most one shortened interval, the phase never flips). Overdue is measured against the cadence's own period, so a healthy off-week skip never reads as overdue.
+**Task cadence (16.10).** A task may carry a structured `cadence` alongside its `schedule`: `{ kind: weekly|biweekly|monthly|custom, days[] (Mon..Sun), time (HH:MM), parity? (even|odd) }`. When present the daemon **generates** `OnCalendar=` from it (the cadence is authoritative, and the generated expression is validated with `systemd-analyze calendar` like any other); when absent the raw `schedule` stands — which is what every pre-16.10 task carries, so nothing migrates. Weekly/monthly/custom are pure OnCalendar with `Persistent=true` as their missed-run heal; **biweekly** is the one case systemd's calendar cannot express, so it runs on a WEEKLY timer and the daemon gates each SCHEDULED fire on ISO-week parity (`date +%V` semantics, parity explicit config — never derived). An off-week fire completes as a first-class **skipped** run (the runner's `SuccessExitStatus=75`: systemd records success, `ExecMainStatus` says no backup was taken); a Run Now is never gated; and an off-week fire runs anyway when the last successful run is older than one full period (the heal — at most one shortened interval, the phase never flips). Overdue is measured against the cadence's own period, so a healthy off-week skip never reads as overdue. **Cancelled runs (rclone.5):** a runner whose daemon job ended `cancelled` prints its result line and exits `130`; the unit does not declare 130 a success (systemd records `Result=exit-code`), and the status derivation maps `ExecMainStatus=130` to the additive run result `cancelled` (on `Result=success` too, should a unit ever declare it), so the row reads cancelled — never failed — and the dashboard never warns on it.
 
 
 
@@ -369,7 +369,7 @@ One-way `copy` or `sync` of a local path (a dataset mountpoint, a share path, an
 | `POST` | `/v1/cloud/tasks` | Create (`CloudSyncTask`; remote must exist; schedule or cadence validated with `systemd-analyze calendar`) | `202` with job |
 | `PUT` | `/v1/cloud/tasks/:name` | Update / enable / disable | `202` with job |
 | `DELETE` | `/v1/cloud/tasks/:name` | Remove the units; nothing on the remote is touched | `202` |
-| `POST` | `/v1/cloud/tasks/:name/run` | Run now (`direct` = the unit's own execution); guards → snapshot → rclone with JSON progress → classification → notification | `202` with job / `400`/`409` guard |
+| `POST` | `/v1/cloud/tasks/:name/run` | Run now (`direct` = the unit's own execution); guards → snapshot → rclone with JSON progress → classification → notification. The direct run is cancellable (rclone.5, `POST /v1/jobs/:id/cancel`): SIGINT ladder to rclone, the transient snapshot still destroyed, the job ends `cancelled`, NO notification (one journald line instead); the runner exits `130` and the task status reads `cancelled` (the grid/detail carry the running job's `runningJobId` and a cancelled run's `lastRunNote` "cancelled by <user> at <time>" from the runner's journal line). Backup's direct run is the same (SIGINT to proxmox-backup-client; no prune after a cancel) | `202` with job / `400`/`409` guard |
 | `POST` | `/v1/cloud/tasks/preview` | **Dry run (added 2026-09-24).** Body = the task inline (the wizard's unsaved form) or `{name}`. Runs `rclone <mode> --dry-run --use-json-log` against the LIVE source (no snapshot — a preview is a look, not a run), bounded by a 120 s ceiling; answers `{ transfers, bytes, checks, deletes, deletedFiles[] (first 200 + total), errors, truncated }`. The unmounted-mount guard refuses (nothing to look at); the empty-source guard does NOT — showing that a sync would delete everything is the point. A user-initiated read: no job, no notification, rclone writes nothing under `--dry-run` (GT 2026-09-23: every would-be delete is a `skipped: delete` object) | `200` / `400` |
 
 #### Filesystem browse (read-only UI support; designed 2026-07-20)
@@ -402,6 +402,7 @@ One generic endpoint backing directory pickers and gentle path validation across
 |--------|------|-------------|----------|
 | `GET` | `/v1/jobs` | List jobs (filterable by status) | `200` |
 | `GET` | `/v1/jobs/:id` | Job detail & status | `200` |
+| `POST` | `/v1/jobs/:id/cancel` | **Cancel a running job (rclone.5), confirm-gated.** The first call answers `409` + `X-Anas-Confirm-Code` with the headline "<subject> has been running for <elapsed> — <progress>; cancelling stops it here" (the subject is the job's own, e.g. "Cloud sync task 'photos'"; any other cancellable job is named by its operation) and the job's consequence sentence as `warnings`; the replay with the code submits a `job.cancel` CONTROL job (runs at once, outside the concurrency limit) that runs the target's cancel hook once. A job that registered no hook answers `409 NOT_CANCELLABLE`, a finished one `409` naming its final state — both before any code is minted. A hook that cannot stop the work fails the cancel job with the reason and the job runs on. Registered today by the cloud sync and backup DIRECT run jobs (SIGINT to rclone / proxmox-backup-client, a second SIGINT after 10 s, fail after 10 s more — never SIGKILL) | `202` with job / `404` / `409` |
 
 #### Status (singleton, read-only)
 
@@ -461,6 +462,7 @@ Operations that are valid but have consequences. Requires acknowledgment.
 - Export pool with active shares
 - Rollback snapshot (destroys newer data)
 - Repair an AHR file's named blocks from parity (writes reconstructed data through md; `AHR-DESIGN.md` §4)
+- Cancel a running cloud sync or backup run (`POST /v1/jobs/:id/cancel`, rclone.5 — the headline names the run, how long it has gone and how far it got; the consequence sentence says what the stop leaves behind)
 
 ```
 DELETE /v1/pools/tank → 409 Conflict
@@ -535,7 +537,7 @@ All mutating operations return `202 Accepted` with a job reference:
 {
   "job": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
-    "status": "running", // queued | running | completed | failed
+    "status": "running", // queued | running | completed | failed | cancelled
     "operation": "pool.create",
     "progress": "creating mirror-0...",
     "createdAt": "2026-03-14T10:00:00Z",
@@ -573,19 +575,21 @@ All mutating operations return `202 Accepted` with a job reference:
 // With X-Anas-Confirm-Code header → Level 2, resend with code to proceed
 ```
 
-**Executor primitives:** `exec` (argv, captured output), `pipeline`, and — since backup2.7 — `execToStream` (spawn with stdout written to a caller-owned fd, `fsync` on finish): the PBS client refuses every existing restore target, so a block image can only be restored by streaming its stdout into a device the daemon opened itself.
+**Executor primitives:** `exec` (argv, captured output; since rclone.5 an optional `onSpawn` hands the caller a `SpawnedChild` — pid, `kill(signal)`, `exited()`, an `exit` promise — so a job's cancel hook can signal the tool it is running), `pipeline`, and — since backup2.7 — `execToStream` (spawn with stdout written to a caller-owned fd, `fsync` on finish): the PBS client refuses every existing restore target, so a block image can only be restored by streaming its stdout into a device the daemon opened itself.
 
 ### Job Lifecycle
 
 ```
 QUEUED → RUNNING → COMPLETED
                  → FAILED
+                 → CANCELLED
 ```
 
 - **QUEUED** — Accepted, waiting for execution slot
 - **RUNNING** — Currently executing, may have progress updates
 - **COMPLETED** — Finished successfully, `result` field populated
 - **FAILED** — Finished with error, `error` field populated
+- **CANCELLED** (rclone.5, additive on the shared `JobStatus` enum) — stopped on purpose: either its own cancel hook ran on a confirmed `POST /v1/jobs/:id/cancel`, or its body reported that the work it watched was cancelled (a UI Run-Now supervisor whose unit ended with the runner's cancel exit). `result` = `{ status: 'cancelled', reason: 'cancelled by <user> at <time>' }`, `error` stays null; audited as `job.cancelled` naming the user who cancelled and the submitter. A job body registers its hook through the context the queue passes beside `updateProgress` (`ctx.onCancel(hook, { subject, consequence })`); a job that never registers one is not cancellable.
 
 ### Fast vs. slow operations
 

@@ -259,6 +259,9 @@
                 + '.anas-dash-job-run{color:var(--anas-accent,#3468c0)}'
                 + '.anas-dash-job-ok{color:var(--anas-ok,#1f9c56)}'
                 + '.anas-dash-job-bad{color:var(--anas-danger,#c23b2c)}'
+                // rclone.5: a cancelled job is what the operator asked for —
+                // neutral, never the failure colour.
+                + '.anas-dash-job-cancel{color:var(--anas-muted,#6b7280)}'
                 // Pool → VDEV → Device composite hierarchy.
                 + '.anas-dash-pool{padding:14px;border-radius:12px;margin-bottom:14px;box-sizing:border-box;'
                 + 'background:linear-gradient(var(--anas-card-top,#fff),var(--anas-card-bot,#eef1f5));'
@@ -749,8 +752,11 @@
                     durPart = t('elapsed') + ' ' + fmtDur(Date.now() - started);
                 }
             } else {
-                if (st === 'failed' || st === 'error' || st === 'cancelled' || st === 'canceled') {
+                if (st === 'failed' || st === 'error') {
                     outCls = 'anas-dash-job-bad';
+                } else if (st === 'cancelled' || st === 'canceled') {
+                    outCls = 'anas-dash-job-cancel';
+                    outTxt = t('cancelled');
                 }
                 when = !isNaN(finished) ? relAgo(finished) : (!isNaN(started) ? relAgo(started) : '');
                 var dur = j.durationMs;
@@ -2173,4 +2179,7 @@
     // icon, so a new category renders named, not bare).
     ANAS.dash = ANAS.dash || {};
     ANAS.dash.warnIcon = warnIcon;
+    // rclone.5 pins the strip's `cancelled` rendering (neutral, never the
+    // failure colour) on the same seam.
+    ANAS.dash.jobsStrip = jobsStrip;
 })();

@@ -538,7 +538,8 @@ export function createServer(opts?: ServerOptions) {
       : {}),
   }
   server.register(fsRoutes, { prefix: '/v1' })
-  server.register(jobRoutes, { prefix: '/v1', jobQueue })
+  // rclone.5: POST /jobs/:id/cancel is confirm-gated, so the job routes take the store.
+  server.register(jobRoutes, { prefix: '/v1', jobQueue, confirmStore })
   // fstabPath + pveStoragePath feed the story 3.27 mountpoint flow: fstab
   // collision checks and the story 3.25 PVE-managed hands-off guard. Both
   // default inside the route to the real host paths; the env overrides make the

@@ -35,6 +35,7 @@ import {
   readTaskUnit,
   readUnitTexts as readUnitTextsGeneric,
   removeTaskUnits as removeTaskUnitsGeneric,
+  runningDirectJobFields as runningDirectJobFieldsGeneric,
   runningDirectJobProgress as runningDirectJobProgressGeneric,
   runningRunConflictMessage as runningRunConflictMessageGeneric,
   serviceUnitName as serviceUnitNameGeneric,
@@ -274,6 +275,8 @@ export interface CloudTaskStatus {
   lastSuccessAt: string | null
   /** The unit's service is still running right now (task-units.ts — free off the same `systemctl show`). */
   runActive: boolean
+  /** "cancelled by <user> at <time>" for a cancelled last run, from the journal (rclone.5). */
+  lastRunNote?: string
 }
 
 /**
@@ -340,6 +343,14 @@ export async function readRunActive(executor: CommandExecutor, name: string): Pr
  */
 export function runningDirectJobProgress(jobQueue: JobQueue, name: string): string | null {
   return runningDirectJobProgressGeneric(jobQueue, 'cloud.task.run', name)
+}
+
+/**
+ * The status payload's running-run fields — `runningProgress` and the direct
+ * job's `runningJobId` (rclone.5: what Cancel run targets) — from ONE lookup.
+ */
+export function runningDirectJobFields(jobQueue: JobQueue, name: string): { runningProgress?: string, runningJobId?: string } {
+  return runningDirectJobFieldsGeneric(jobQueue, 'cloud.task.run', name)
 }
 
 /** The Run-Now refusal sentence for a run already in flight (kind baked in). */

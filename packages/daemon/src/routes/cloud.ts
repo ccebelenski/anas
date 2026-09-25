@@ -25,6 +25,7 @@ import {
   CloudSyncRunRequest,
   CloudSyncTaskRequest,
 } from '@anas/shared'
+import { ChildCancel } from '../jobs/child-cancel.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyCloudRun } from '../services/cloud-notify.js'
@@ -42,6 +43,7 @@ import {
   readTask,
   readUnitTexts,
   removeTaskUnits,
+  runningDirectJobFields,
   runningDirectJobProgress,
   runningRunConflictMessage,
   superviseRun,
@@ -94,6 +96,13 @@ import { requireIdentity } from './identity.js'
 /** The one "no rclone on this node" sentence — names the fix in one verb. */
 export const RCLONE_NOT_INSTALLED
   = 'rclone is not installed on this node — re-run install.sh, which installs it'
+
+/**
+ * What cancelling a cloud sync run leaves behind — the confirm dialog's
+ * consequence sentence, verbatim from the rclone.5 story.
+ */
+export const CLOUD_CANCEL_CONSEQUENCE = 'Files already copied stay at the destination. A sync run stopped '
+  + 'part-way leaves the destination between two states until the next run completes.'
 
 /** The encrypted-config refusal (DESIGN: ANAS neither prompts nor stores the passphrase). */
 const CONFIG_ENCRYPTED_ERROR = 'rclone\'s configuration file is password-protected; ANAS manages it only unencrypted'
@@ -547,14 +556,16 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
           // the running DIRECT job's rclone stats text rides on the row — the
           // run outliving the Run-Now supervisor's ceiling keeps reading as
           // alive instead of a bare running pill. Absent otherwise.
-          const progress = st.runActive ? runningDirectJobProgress(jobQueue, task.name) : null
+          // rclone.5: the same lookup hands over the job's id, which is what
+          // the toolbar's Cancel run targets.
           return {
             ...task,
             lastRunResult: st.lastRunResult,
             lastRunAt: st.lastRunAt,
             nextRunAt: st.nextRunAt,
             overdue: st.overdue,
-            ...(progress ? { runningProgress: progress } : {}),
+            ...(st.runActive ? runningDirectJobFields(jobQueue, task.name) : {}),
+            ...(st.lastRunNote ? { lastRunNote: st.lastRunNote } : {}),
           }
         }),
       )
@@ -696,7 +707,6 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
         .catch(() => [] as string[]),
     ])
 
-    const detailProgress = st.runActive ? runningDirectJobProgress(jobQueue, name) : null
     const detail: CloudSyncTaskDetail = {
       task: {
         ...task,
@@ -704,7 +714,8 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
         lastRunAt: st.lastRunAt,
         nextRunAt: st.nextRunAt,
         overdue: st.overdue,
-        ...(detailProgress ? { runningProgress: detailProgress } : {}),
+        ...(st.runActive ? runningDirectJobFields(jobQueue, name) : {}),
+        ...(st.lastRunNote ? { lastRunNote: st.lastRunNote } : {}),
       },
       ...(consistency ? { consistency } : {}),
       ...(nested.length ? { nested } : {}),
@@ -838,11 +849,18 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     const job = jobQueue.submit(
       'cloud.task.run',
       { ...identity, params: { task: name, ...(direct ? { direct: true } : {}) } },
-      async (updateProgress) => {
+      async (updateProgress, ctx) => {
         if (!direct) {
           // The manual/UI path: run through the task's own unit and supervise it.
           return superviseRun(executor, name, { onProgress: updateProgress })
         }
+        // rclone.5: the direct run is cancellable from its first line — the
+        // hook SIGINTs the rclone child (the shared ladder in child-cancel.ts);
+        // the transient snapshot is still destroyed in runCloudSync's finally.
+        const cancel = new ChildCancel(ctx, 'rclone', {
+          subject: `Cloud sync task '${name}'`,
+          consequence: CLOUD_CANCEL_CONSEQUENCE,
+        })
         const task = await readTask(systemdDir, name)
         if (!task)
           throw new Error(`Cloud sync task '${name}' not found`)
@@ -871,15 +889,22 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
               paths,
               fstabPath,
               ...(opts.storagePath ? { consistencyOptions: { pveStorageCfg: opts.storagePath } } : {}),
+              onSpawn: cancel.onSpawn,
             },
             updateProgress,
           )
+          // A cancel never notifies (rclone.5): the operator stopped it and the
+          // row says so. One journald line records that nothing was sent.
+          if (cancel.requested())
+            return logCancelledRun(name)
           // Best-effort by contract: notifyCloudRun never throws, so a broken
           // mail target cannot turn a good sync into a failed job.
           await notifyCloudRun(executor, { task, result, elapsedMs: Date.now() - startedAt })
           return result
         }
         catch (err) {
+          if (cancel.requested())
+            return logCancelledRun(name)
           const message = err instanceof Error ? err.message : String(err)
           await notifyCloudRun(executor, { task, error: message, elapsedMs: Date.now() - startedAt })
           throw err
@@ -889,6 +914,16 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     reply.code(202)
     return { job }
   })
+
+  /**
+   * The one journald line a cancelled run leaves instead of a notification
+   * (rclone.5). The queue ends the job `cancelled` whatever the body returns
+   * once the cancel was accepted, so the value is only a placeholder.
+   */
+  function logCancelledRun(name: string): null {
+    server.log.info(`cloud sync task '${name}' cancelled — no notification sent`)
+    return null
+  }
 
   /**
    * Fire-and-forget audit job for a Test (journald record — the same shape

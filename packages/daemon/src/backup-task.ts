@@ -1,7 +1,7 @@
 import type { Job, JobRef } from '@anas/shared'
 import type { Requester, RunLoopOptions } from './runner-poll.js'
 import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK } from '@anas/shared'
-import { defaultSocket, errorMessage, identityHeaders, pollJobToTerminal, socketRequester } from './runner-poll.js'
+import { cancelledRunnerExit, defaultSocket, errorMessage, identityHeaders, pollJobToTerminal, socketRequester } from './runner-poll.js'
 
 /**
  * Backup task RUNNER (Epic 16) — the entrypoint each `anas-backup-<name>` timer
@@ -96,9 +96,14 @@ export function exitCodeForResult(result: unknown): number {
 /**
  * CLI entrypoint. Exits 0 on completed, {@link BACKUP_SKIP_EXIT_CODE} on a
  * deliberate off-week skip (a success as far as systemd is concerned — the unit
- * declares it), 1 on job failure, 2 on bad args/transport.
+ * declares it), 130 (`TASK_CANCELLED_EXIT_CODE`) when the job was
+ * cancelled (rclone.5), 1 on job failure, 2 on bad args/transport.
  */
-export async function main(argv: string[]): Promise<number> {
+export async function main(
+  argv: string[],
+  /** The transport, from the parsed `--socket` (tests hand a scripted one). */
+  requesterFor: (socket: string) => Requester = socketRequester,
+): Promise<number> {
   let opts: RunnerOptions
   try {
     opts = parseRunnerArgs(argv)
@@ -109,11 +114,15 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   try {
-    const job = await runBackupTask(socketRequester(opts.socket), opts.name)
+    const job = await runBackupTask(requesterFor(opts.socket), opts.name)
     if (job.status === 'completed') {
       process.stdout.write(`${JSON.stringify({ task: opts.name, result: job.result })}\n`)
       return exitCodeForResult(job.result)
     }
+    // rclone.5: an operator cancelled the run — exit with the cancel code the
+    // status derivation reads as `cancelled`, never as a failure.
+    if (job.status === 'cancelled')
+      return cancelledRunnerExit(job, opts.name)
     process.stderr.write(`${job.error?.message ?? 'backup job failed'}\n`)
     return 1
   }

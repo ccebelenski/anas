@@ -47,6 +47,7 @@ import {
   lunBackupId,
   UpsertBackupRepoRequest,
 } from '@anas/shared'
+import { ChildCancel } from '../jobs/child-cancel.js'
 import { readPbsStorages, readPveMountPaths } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
 import { readAhrPools } from '../services/ahr-topology.js'
@@ -112,6 +113,7 @@ import {
   readTask,
   readUnitTexts,
   removeTaskUnits,
+  runningDirectJobFields,
   runningDirectJobProgress,
   runningRunConflictMessage,
   superviseRun,
@@ -203,6 +205,13 @@ export interface BackupRouteOptions {
 
 /** Trailing slashes on a restore target (the root survives as `/`). */
 const RESTORE_TRAILING_SLASHES_RE = /\/+$/
+
+/**
+ * What cancelling a backup run leaves behind — the confirm dialog's
+ * consequence sentence, verbatim from the rclone.5 story (backup parity).
+ */
+export const BACKUP_CANCEL_CONSEQUENCE
+  = 'The unfinished snapshot is discarded by the backup server; earlier snapshots are untouched.'
 
 function CONFLICT(version: number) {
   return {
@@ -620,6 +629,16 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   //  Tasks
   // ==========================================================================
 
+  /**
+   * The one journald line a cancelled run leaves instead of a notification
+   * (rclone.5, backup parity). The queue ends the job `cancelled` whatever the
+   * body returns once the cancel was accepted — the value is a placeholder.
+   */
+  function logCancelledRun(name: string): null {
+    server.log.info(`backup task '${name}' cancelled — no notification sent`)
+    return null
+  }
+
   /** The datastore for a task's repository (joined so the UI need not). */
   function datastoreOf(task: BackupTask, repos: BackupRepo[]): string | undefined {
     return repos.find(r => r.name === task.repository)?.datastore
@@ -752,14 +771,15 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         // rclone.3 human-pass finding 2 (backup parity): while the run actually
         // executes, the running DIRECT job's progress text rides on the row —
         // same rule, same helper, as the Cloud Sync grid.
-        const progress = st.runActive ? runningDirectJobProgress(jobQueue, task.name) : null
+        // rclone.5: the same lookup hands over the job's id (Cancel run's target).
         const entry: BackupTaskEntry = {
           task: toTaskView(task, joinRepos),
           lastRunResult: st.lastRunResult,
           lastRunAt: st.lastRunAt,
           nextRunAt: st.nextRunAt,
           overdue: st.overdue,
-          ...(progress ? { runningProgress: progress } : {}),
+          ...(st.runActive ? runningDirectJobFields(jobQueue, task.name) : {}),
+          ...(st.lastRunNote ? { lastRunNote: st.lastRunNote } : {}),
         }
         // backup2.9 — a block task's LUN NAME is read live: the unit stores the
         // record and the serial-derived id, never the display name (it can
@@ -969,14 +989,14 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const lastRunNotices = Array.isArray(lastRunResult?.notices)
       ? lastRunResult.notices.filter((n): n is string => typeof n === 'string')
       : undefined
-    const detailProgress = st.runActive ? runningDirectJobProgress(jobQueue, name) : null
     const detail: BackupTaskDetail = {
       task: toTaskView(task, joinRepos),
       lastRunResult: st.lastRunResult,
       lastRunAt: st.lastRunAt,
       nextRunAt: st.nextRunAt,
       overdue: st.overdue,
-      ...(detailProgress ? { runningProgress: detailProgress } : {}),
+      ...(st.runActive ? runningDirectJobFields(jobQueue, name) : {}),
+      ...(st.lastRunNote ? { lastRunNote: st.lastRunNote } : {}),
       unit: units.unit,
       timer: units.timer,
       ...(journal ? { journal } : {}),
@@ -1149,11 +1169,19 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const job = jobQueue.submit(
       'backup.task.run',
       { ...identity, params: { task: name, ...(direct ? { direct: true } : {}) } },
-      async (updateProgress) => {
+      async (updateProgress, ctx) => {
         if (!direct) {
           // The manual/UI path: run through the task's own unit and supervise it.
           return superviseRun(executor, name, { onProgress: updateProgress })
         }
+        // rclone.5 (backup parity): the direct run is cancellable from its first
+        // line — the SAME hook shape the cloud run registers (child-cancel.ts),
+        // SIGINT to proxmox-backup-client; the transient snapshots are still
+        // destroyed in runBackup's finally.
+        const cancel = new ChildCancel(ctx, 'proxmox-backup-client', {
+          subject: `Backup task '${name}'`,
+          consequence: BACKUP_CANCEL_CONSEQUENCE,
+        })
         // The unit's own execution: run pbc in the daemon (NEVER systemctl).
         const task = await readTask(systemdDir, name)
         if (!task)
@@ -1205,9 +1233,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
             // the backup routes do (the zvol branch's PVE hands-off guard), and
             // the source guard (backup2.11) reads the SAME fstab the Mounts
             // routes and `preview-nested` do.
-            { task, repo, secret, fstabPath, consistencyOptions: { pveStorageCfg: paths.pveStorageCfg } },
+            { task, repo, secret, fstabPath, consistencyOptions: { pveStorageCfg: paths.pveStorageCfg }, onSpawn: cancel.onSpawn },
             updateProgress,
           )
+          // A cancel never prunes and never notifies (rclone.5): the operator
+          // stopped it and the row says so; one journald line records it.
+          if (cancel.requested())
+            return logCancelledRun(name)
           // Retention (16.11): prune ONLY after a run that actually backed up. A
           // 'skipped' run (the benign too-soon collision — and any future cadence
           // skip) never prunes, and a FAILED run threw long before this line. A
@@ -1238,6 +1270,8 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           return final
         }
         catch (err) {
+          if (cancel.requested())
+            return logCancelledRun(name)
           const message = err instanceof Error ? err.message : String(err)
           await notifyBackupRun(executor, { task, repo, namespace, error: message, elapsedMs: Date.now() - startedAt })
           throw err

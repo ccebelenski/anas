@@ -14,6 +14,15 @@ export interface AuditResult {
   error?: string
 }
 
+/** What a cancelled job's audit line carries (rclone.5). */
+export interface AuditCancel {
+  durationMs: number
+  /** "cancelled by <user> at <time>", or what the job body reported. */
+  reason: string
+  /** The user who confirmed the cancel — absent when the body reported it. */
+  cancelledBy?: string
+}
+
 /**
  * Audit logger for mutating operations.
  *
@@ -60,6 +69,28 @@ export class AuditLogger {
         ...(result.error ? { error: result.error } : {}),
       },
       `audit: ${entry.operation} ${result.status} (${result.durationMs}ms)`,
+    )
+  }
+
+  /**
+   * Log a job that ended `cancelled` (rclone.5). `user` is the one who
+   * cancelled it when a person did; the submitter rides as `submittedBy` so
+   * the line answers both "who started it" and "who stopped it".
+   */
+  cancelled(entry: AuditEntry, cancel: AuditCancel): void {
+    this.log.info(
+      {
+        event: 'job.cancelled',
+        user: cancel.cancelledBy ?? entry.user,
+        submittedBy: entry.user,
+        uid: entry.uid,
+        operation: entry.operation,
+        params: entry.params,
+        requestId: entry.requestId,
+        durationMs: cancel.durationMs,
+        reason: cancel.reason,
+      },
+      `audit: ${entry.operation} cancelled (${cancel.reason})`,
     )
   }
 }

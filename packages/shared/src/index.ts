@@ -198,6 +198,7 @@ export {
   restorePatternFor,
   restorePatternsFor,
   snapshotTimeIso,
+  TASK_CANCELLED_EXIT_CODE,
   UnmountedMount,
   UpsertBackupRepoRequest,
 } from './schemas/backup.js'

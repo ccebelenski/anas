@@ -86,6 +86,27 @@ export interface ExecStreamResult {
  */
 export type ExecStreamOptions = Omit<ExecOptions, 'stdin'>
 
+/**
+ * A running child, as {@link ExecOptions.onSpawn} hands it over (rclone.5).
+ *
+ * The one thing the executor never exposed before: a way to SIGNAL a command
+ * that is still running. A cancelled cloud sync or backup run has to reach the
+ * rclone / proxmox-backup-client process the daemon itself spawned (the unit
+ * only supervises the runner, so `systemctl stop` would kill the runner and
+ * leave the tool running). Deliberately small: a pid for the record, `kill`,
+ * and a promise that settles once the process has exited.
+ */
+export interface SpawnedChild {
+  /** The OS pid of the process. */
+  readonly pid: number
+  /** Send a signal. False when the process is already gone (nothing was sent). */
+  kill: (signal: NodeJS.Signals) => boolean
+  /** Has the process exited? */
+  readonly exited: () => boolean
+  /** Settles when the process has exited (never rejects). */
+  readonly exit: Promise<void>
+}
+
 /** Optional execution options. */
 export interface ExecOptions {
   /**
@@ -130,6 +151,14 @@ export interface ExecOptions {
    * omits `onStderr` and keeps the old behavior untouched.
    */
   onStderr?: (chunk: string) => void
+  /**
+   * Called once, right after the child is spawned, with a handle that can
+   * signal it (rclone.5 — cancelling a running run). Not called when the
+   * process never started (ENOENT/EACCES): there is nothing to signal. The
+   * result contract is unchanged — a child stopped by a signal still resolves
+   * with its exit code, or `exitCode: 1` plus `signal` when it died of one.
+   */
+  onSpawn?: (child: SpawnedChild) => void
 }
 
 /**

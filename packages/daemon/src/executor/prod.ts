@@ -1,3 +1,4 @@
+import type { ChildProcess } from 'node:child_process'
 import type {
   CommandExecutor,
   ExecOptions,
@@ -6,6 +7,7 @@ import type {
   ExecStreamResult,
   ExecStreamTarget,
   PipelineResult,
+  SpawnedChild,
 } from './types.js'
 import { execFile, spawn } from 'node:child_process'
 import { close, fsync, open, readFileSync } from 'node:fs'
@@ -35,6 +37,33 @@ function closeFd(fd: number): void {
  * An `onStderr` caller takes a different road (`execTeeingStderr` below): one
  * that does not retain the child's stderr at all.
  */
+
+/**
+ * Hand a freshly spawned child to an `onSpawn` caller (rclone.5). Only a child
+ * that actually got a pid is handed over — a spawn failure has nothing to
+ * signal, and its rejection is the caller's answer. `exit` settles on the
+ * process's own `exit` (not stdio `close`): what a canceller waits for is the
+ * process being gone.
+ */
+export function announceSpawn(child: ChildProcess, onSpawn: ((child: SpawnedChild) => void) | undefined): void {
+  if (!onSpawn || child.pid === undefined)
+    return
+  let gone = false
+  const exit = new Promise<void>((resolve) => {
+    const done = (): void => {
+      gone = true
+      resolve()
+    }
+    child.once('exit', done)
+    child.once('error', done)
+  })
+  onSpawn({
+    pid: child.pid,
+    kill: signal => (gone ? false : child.kill(signal)),
+    exited: () => gone,
+    exit,
+  })
+}
 
 /** The historical default, kept for every caller that does not ask for more. */
 const DEFAULT_MAX_BUFFER = 10 * 1024 * 1024
@@ -142,6 +171,8 @@ export class ProdExecutor implements CommandExecutor {
         },
       )
 
+      announceSpawn(child, opts?.onSpawn)
+
       // Feed stdin for secrets (e.g. smbpasswd -s reads the password here, so
       // it never lands in argv / the process list), then close the stream.
       if (opts?.stdin !== undefined && child.stdin) {
@@ -185,6 +216,8 @@ export class ProdExecutor implements CommandExecutor {
         // daemon's own environment for the child only — never on argv.
         ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
       })
+
+      announceSpawn(child, opts.onSpawn)
 
       const tee = new StderrTee(opts.onStderr)
 

@@ -1696,6 +1696,10 @@
     //   DELETE /v1/cloud/tasks/:name   → 202 { job } (units only — nothing on
     //                                    the remote is touched)
     //   POST   /v1/cloud/tasks/:name/run → 202 { job } (Run now)
+    //   POST   /v1/jobs/:id/cancel     → 409 + confirm code (the headline and
+    //                                    what a stop leaves behind), then 202
+    //                                    { job } (Cancel run — rclone.5; the
+    //                                    shared ANAS.sched.cancelRun door)
     //   POST   /v1/cloud/tasks/preview → { data: CloudSyncPreviewResult } (the
     //                                    dry run — the unsaved form inline or
     //                                    {name}; a 400 guard refusal carries the
@@ -1816,6 +1820,10 @@
             nextRunAt: entry.nextRunAt,
             overdue: entry.overdue === true,
             runningProgress: entry.runningProgress || '',
+            // rclone.5: the running direct job Cancel run targets, and a
+            // cancelled run's "cancelled by <user> at <time>".
+            runningJobId: entry.runningJobId || '',
+            lastRunNote: entry.lastRunNote || '',
             raw: task,
         };
     }
@@ -1923,6 +1931,10 @@
                 + 'color:#fff;background:var(--anas-accent,#3468c0);">'
                 + '<i class="fa fa-refresh fa-spin" aria-hidden="true" style="margin-right:4px;"></i>'
                 + enc(t('running')) + '</span>' + rp.html;
+        } else if (result === 'cancelled' && !overdue) {
+            // rclone.5: stopped from the toolbar — the shared neutral pill,
+            // who and when in the tooltip.
+            pill = ANAS.sched.cancelledPill(rec);
         } else if (result === 'disabled') {
             // A disabled task's run history is garbage-collected by systemd;
             // say there is none (the sentence the detail repeats).
@@ -1997,6 +2009,9 @@
         // at the API; the button is the display, never the safety).
         var running = has && rec.get('lastRunResult') === 'running';
         setDisabled(grid, 'cloudTaskRun', !has || running);
+        // rclone.5: Cancel run is the running row's verb — and only while the
+        // daemon names the direct job to stop (the API gate still decides).
+        setDisabled(grid, 'cloudTaskCancel', !ANAS.sched.cancellable(rec));
         setDisabled(grid, 'cloudTaskPreview', !has);
         setDisabled(grid, 'cloudTaskDetails', !has);
         setDisabled(grid, 'cloudTaskEdit', !has);
@@ -2169,6 +2184,11 @@
                     var store = grid && grid.getStore();
                     ANAS.sched.runErrors.set(store, name, message, lastRunAtOf(store, name));
                 }
+                loadTasks(view, node);
+            },
+            // rclone.5: the run this Run Now watched was cancelled — neither
+            // a failure nor a finish; the row says cancelled after the reload.
+            onCancelled: function () {
                 loadTasks(view, node);
             },
         });
@@ -2381,6 +2401,7 @@
                         : k === 'lastRunAt' ? task.lastRunAt
                         : k === 'overdue' ? task.overdue
                         : k === 'runningProgress' ? task.runningProgress
+                        : k === 'lastRunNote' ? task.lastRunNote
                         : k === 'name' ? task.name
                         : undefined;
                 } }));
@@ -3337,7 +3358,7 @@
             fields: [
                 'name', 'source', 'remote', 'path', 'destination', 'mode',
                 'notify', 'bwlimit', 'schedule', 'lastRunResult', 'lastRunAt',
-                'nextRunAt', 'runningProgress',
+                'nextRunAt', 'runningProgress', 'runningJobId', 'lastRunNote',
                 { name: 'excludes', type: 'auto' },
                 { name: 'cadence', type: 'auto' },
                 { name: 'enabled', type: 'auto' },
@@ -3386,6 +3407,30 @@
                     if (rec) {
                         runTaskNow(view, node, rec.get('name'));
                     }
+                },
+            },
+            {
+                // rclone.5: stop the running run, behind the daemon's confirm
+                // (elapsed time, progress, what the stop leaves behind).
+                text: t('Cancel run'),
+                itemId: 'cloudTaskCancel',
+                cls: 'anas-btn-cloud-task-cancel',
+                iconCls: 'fa fa-stop-circle',
+                disabled: true,
+                handler: function (btn) {
+                    var view = btn.up('#cloudView');
+                    var grid = gridOf(view);
+                    var rec = selectedTask(grid);
+                    if (!rec) {
+                        return;
+                    }
+                    ANAS.sched.cancelRun({
+                        node: node,
+                        jobId: rec.get('runningJobId'),
+                        name: rec.get('name'),
+                        view: grid,
+                        reload: function () { loadTasks(view, node, true); },
+                    });
                 },
             },
             {

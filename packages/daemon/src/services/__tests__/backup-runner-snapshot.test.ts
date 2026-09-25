@@ -1,8 +1,11 @@
 import type { BackupRepo, BackupTask } from '@anas/shared'
+import type { MockLiveChild } from '../../executor/mock.js'
 import type { CommandExecutor, ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
+import { ChildCancel } from '../../jobs/child-cancel.js'
+import { JobQueue } from '../../jobs/queue.js'
 import { buildBackupArgs, distinctAhrTargets, distinctZfsTargets, runBackup } from '../backup-runner.js'
 import { formatTransientBackupSnapshot } from '../snapshot-naming.js'
 import { ZFS } from '../zfs-snapshot.js'
@@ -95,8 +98,8 @@ const PBC_OK = [
 /** The stale-sweep list argv for the dataset under test. */
 const SWEEP_LIST = ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', 'tank/media']
 
-/** A mock wired for one snapshot-mode run of `/tank/media`. */
-function wire(pbc: ExecResult = { stdout: '', stderr: PBC_OK, exitCode: 0 }): MockExecutor {
+/** A mock wired for one snapshot-mode run of `/tank/media` (`live`: pbc runs until signalled — rclone.5). */
+function wire(pbc: ExecResult = { stdout: '', stderr: PBC_OK, exitCode: 0 }, live?: MockLiveChild): MockExecutor {
   const mock = new MockExecutor()
   mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: TABLE, stderr: '', exitCode: 0 } })
   mock.addFixture({
@@ -122,7 +125,7 @@ function wire(pbc: ExecResult = { stdout: '', stderr: PBC_OK, exitCode: 0 }): Mo
     },
   })
   mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
-  mock.addFixture({ command: PRLIMIT, result: pbc })
+  mock.addFixture({ command: PRLIMIT, result: pbc, ...(live ? { live } : {}) })
   return mock
 }
 
@@ -181,6 +184,33 @@ describe('snapshot-consistent run — lifecycle (backup2.3)', () => {
   it('FAILURE: the transient is still destroyed, and the pbc error is what escapes', async () => {
     const mock = wire({ stdout: '', stderr: 'Error: unable to open chunk store \'store1\'\n', exitCode: 255 })
     await assert.rejects(() => run(mock), /unable to open chunk store/)
+    assert.ok(
+      zfsArgs(mock, 'destroy').some(a => a[2] === `tank/media@${LABEL}`),
+      JSON.stringify(zfsArgs(mock, 'destroy')),
+    )
+  })
+
+  it('CANCEL (rclone.5): SIGINT reaches pbc, the job ends `cancelled`, and the transient is STILL destroyed', async () => {
+    const mock = wire({ stdout: '', stderr: '', exitCode: 0 }, { onSignal: { stdout: '', stderr: 'interrupted\n', exitCode: 1, signal: 'SIGINT' } })
+    const queue = new JobQueue()
+    const ref = queue.submit('backup.task.run', { user: 'root@pam', uid: 0, params: { task: TASK_NAME, direct: true } }, async (progress, ctx) => {
+      const cancel = new ChildCancel(ctx, 'proxmox-backup-client', { subject: `Backup task '${TASK_NAME}'` }, { waitMs: 50 })
+      return runBackup(
+        mock,
+        { task: task(), repo: REPO, secret: 's3cret', now: NOW, fstabPath: '/nonexistent/anas-test/fstab', onSpawn: cancel.onSpawn },
+        progress,
+      )
+    })
+    for (let i = 0; i < 200 && !mock.calls.some(c => c.command === PRLIMIT); i++)
+      await new Promise(r => setTimeout(r, 5))
+    await queue.cancel(ref.id, 'alice@pve')
+    for (let i = 0; i < 200 && queue.get(ref.id)?.status === 'running'; i++)
+      await new Promise(r => setTimeout(r, 5))
+
+    assert.deepEqual(mock.signals.map(s => s.signal), ['SIGINT'], 'the signal reached the prlimit-exec\'d pbc')
+    const job = queue.get(ref.id)!
+    assert.equal(job.status, 'cancelled')
+    assert.match((job.result as { reason: string }).reason, /^cancelled by alice@pve at /)
     assert.ok(
       zfsArgs(mock, 'destroy').some(a => a[2] === `tank/media@${LABEL}`),
       JSON.stringify(zfsArgs(mock, 'destroy')),

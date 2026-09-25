@@ -2,7 +2,14 @@ import { z } from 'zod'
 
 // --- Job lifecycle ---
 
-export const JobStatus = z.enum(['queued', 'running', 'completed', 'failed'])
+/**
+ * `cancelled` (rclone.5, ADDITIVE): a running job whose own cancel hook ran on
+ * a confirmed `POST /v1/jobs/:id/cancel` — or whose body reported that the work
+ * it watched was cancelled. Its `result` carries `{ status: 'cancelled',
+ * reason: 'cancelled by <user> at <time>' }` and `error` stays null: a cancel is
+ * what the operator asked for, not a failure.
+ */
+export const JobStatus = z.enum(['queued', 'running', 'completed', 'failed', 'cancelled'])
 export type JobStatus = z.infer<typeof JobStatus>
 
 /** Job summary returned in 202 Accepted responses */

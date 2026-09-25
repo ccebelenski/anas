@@ -6,7 +6,8 @@ import type { CadenceGateDecision, TaskTrigger } from './backup-cadence.js'
 import type { SystemdRunResult } from './systemd-status.js'
 import { readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK, cadenceToOnCalendar } from '@anas/shared'
+import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK, cadenceToOnCalendar, TASK_CANCELLED_EXIT_CODE } from '@anas/shared'
+import { JobCancelledError } from '../jobs/queue.js'
 import { decideCadenceRun, isTaskOverdue, overdueWindowMs } from './backup-cadence.js'
 import { deriveRunResult as deriveSystemdRunResult, parseShow, parseSystemdTimestamp } from './systemd-status.js'
 import { listServiceUnits, parseMarkedJson, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
@@ -435,8 +436,8 @@ export function effectiveSchedule(task: ScheduledTask): string {
 // schedules / cloud). This layer adds the one thing those cannot know: a run
 // that exited with the runner's deliberate-skip code.
 
-/** A run's outcome: systemd's map plus the runners' deliberate skip. */
-export type TaskRunResult = SystemdRunResult | 'skipped'
+/** A run's outcome: systemd's map plus the runners' deliberate skip and cancel exits. */
+export type TaskRunResult = SystemdRunResult | 'skipped' | 'cancelled'
 
 /**
  * Map a service's systemd state to a task run result — the shared oneshot map
@@ -458,7 +459,20 @@ export function deriveTaskRunResult(
   const base = deriveSystemdRunResult(props, ctx)
   if (base === 'success' && props.ExecMainStatus === String(BACKUP_SKIP_EXIT_CODE))
     return 'skipped'
+  // rclone.5: the runner exits TASK_CANCELLED_EXIT_CODE when the daemon job it
+  // polled ended `cancelled`. The unit does not declare that code a success, so
+  // systemd reads the run as failed (ActiveState=failed, Result=exit-code) —
+  // but a cancel is what the operator asked for, and the row must never read
+  // failed. A unit that DOES declare it (a future unit revision) reads
+  // Result=success; both land here.
+  if ((base === 'failure' || base === 'success') && isCancelledExit(props))
+    return 'cancelled'
   return base
+}
+
+/** Did the last run exit with the runners' cancel code? (`ExecMainStatus`, one `systemctl show`). */
+export function isCancelledExit(props: Record<string, string>): boolean {
+  return props.ExecMainStatus === String(TASK_CANCELLED_EXIT_CODE)
 }
 
 /** The minimum a status derivation needs to know about a task. */
@@ -486,6 +500,13 @@ export interface TaskStatus {
    * payload (rclone.3 human-pass finding 2).
    */
   runActive: boolean
+  /**
+   * The last run's own one-line account when its result needs one — today only
+   * `cancelled`: "cancelled by <user> at <time>", from the runner's result line
+   * in the unit journal (one journal read, only for a cancelled row). Absent
+   * when the journal no longer holds it (rclone.5).
+   */
+  lastRunNote?: string
 }
 
 /**
@@ -530,7 +551,21 @@ export async function deriveTaskStatus(
     now,
   })
 
-  return { lastRunResult, lastRunAt, nextRunAt, overdue, lastSuccessAt, runActive: isRunActive(serviceProps) }
+  // A cancelled row's tooltip says who and when; the runner printed exactly
+  // that sentence as its result's `reason`, so the journal is where it is.
+  const lastRunNote = lastRunResult === 'cancelled'
+    ? parseHelperResult(await readRecentJournal(kind, executor, task.name))?.reason
+    : undefined
+
+  return {
+    lastRunResult,
+    lastRunAt,
+    nextRunAt,
+    overdue,
+    lastSuccessAt,
+    runActive: isRunActive(serviceProps),
+    ...(lastRunNote ? { lastRunNote } : {}),
+  }
 }
 
 async function showService(
@@ -838,6 +873,24 @@ export function runningDirectJob(
   return jobQueue.findActive(operation, name, 'task', { direct: true })
 }
 
+/**
+ * The status payload's two running-run fields from ONE lookup (rclone.5): the
+ * direct job's live progress text (rclone.3's `runningProgress`) and its id
+ * (`runningJobId` — what the toolbar's Cancel run targets). Empty when no
+ * direct job is in flight; each field is present only when it has a value.
+ */
+export function runningDirectJobFields(
+  jobQueue: JobQueue,
+  operation: string,
+  name: string,
+): { runningProgress?: string, runningJobId?: string } {
+  const job = runningDirectJob(jobQueue, operation, name)
+  if (!job)
+    return {}
+  const progress = typeof job.progress === 'string' && job.progress.length > 0 ? job.progress : null
+  return { ...(progress ? { runningProgress: progress } : {}), runningJobId: job.id }
+}
+
 /** The running direct job's progress text, or null (no job, or nothing yet). */
 export function runningDirectJobProgress(
   jobQueue: JobQueue,
@@ -1013,6 +1066,14 @@ async function classifyTerminalRun<H extends TaskHelperResult>(
   alreadyRunning: boolean,
 ): Promise<SupervisedRun<H>> {
   const journal = await readRecentJournal(kind, executor, name)
+  // rclone.5: the run this Run-Now was watching was CANCELLED (the runner's
+  // cancel exit). The supervising job ends `cancelled` too, carrying the
+  // runner's own "cancelled by <user> at <time>" — never a failure.
+  if (isCancelledExit(props)) {
+    throw new JobCancelledError(
+      parseHelperResult(journal)?.reason ?? `${kind.label} task '${name}' was cancelled`,
+    )
+  }
   if (runFailed(props)) {
     throw new Error(
       failureDetailFromJournal(kind, journal) ?? `${kind.label} task '${name}' failed (see the recent journal)`,

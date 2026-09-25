@@ -1742,6 +1742,64 @@ describe('backup routes (Epic 16)', () => {
     }
   })
 
+  it('rclone.5 (backup parity): Cancel run SIGINTs pbc, the run ends `cancelled`, no prune, no notification; the grid names the job', async () => {
+    await createRepo()
+    await createTaskPayload({ ...RETAINED_TASK, notify: 'always' })
+    const mock = allowNotify()
+    // pbc as a LIVE child: it runs until a SIGINT stops it.
+    mock.addFixture({
+      command: '/usr/bin/prlimit',
+      args: RETAINED_BACKUP_ARGS,
+      live: { onSignal: { stdout: '', stderr: 'Starting backup: host/anas-pve/2026-09-25T12:00:00Z\ninterrupted\n', exitCode: 1, signal: 'SIGINT' } },
+    })
+    // The unit is mid-run, so the grid carries the running job's id.
+    mock.addFixture({
+      command: '/usr/bin/systemctl',
+      args: ['show', 'anas-backup-retained.service', '-p', 'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp'],
+      result: { stdout: 'ActiveState=active\n', stderr: '', exitCode: 0 },
+    })
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const runId = await jobIdFrom(res)
+    // Wait until pbc is actually running (the prlimit exec was issued).
+    for (let i = 0; i < 100 && !mock.calls.some(c => c.command === '/usr/bin/prlimit'); i++)
+      await new Promise(r => setTimeout(r, 5))
+
+    const list = await server.inject({ method: 'GET', url: '/v1/backup/tasks', headers: IDENTITY })
+    const row = (list.json() as { data: BackupTaskEntry[] }).data.find(e => e.task.name === 'retained')
+    assert.equal(row?.runningJobId, runId, 'the grid names the direct job Cancel run targets')
+
+    const first = await server.inject({ method: 'POST', url: `/v1/jobs/${runId}/cancel`, headers: IDENTITY })
+    assert.equal(first.statusCode, 409)
+    const warnings = (first.json() as { error: { warnings: string[] } }).error.warnings
+    assert.match(warnings[0], /^Backup task 'retained' has been running for \d+ s — .*; cancelling stops it here$/)
+    assert.equal(warnings[1], 'The unfinished snapshot is discarded by the backup server; earlier snapshots are untouched.')
+    const confirm = await server.inject({
+      method: 'POST',
+      url: `/v1/jobs/${runId}/cancel`,
+      headers: { ...IDENTITY, 'x-anas-request-id': randomUUID(), 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) },
+    })
+    assert.equal(confirm.statusCode, 202, confirm.body)
+    assert.equal((await waitForJob(server, await jobIdFrom(confirm))).status, 'completed')
+
+    let run: Job | undefined
+    for (let i = 0; i < 100; i++) {
+      run = (await server.inject({ method: 'GET', url: `/v1/jobs/${runId}`, headers: IDENTITY }).then(r => r.json() as { job: Job })).job
+      if (run.status !== 'running')
+        break
+      await new Promise(r => setTimeout(r, 5))
+    }
+    assert.equal(run?.status, 'cancelled')
+    assert.match((run?.result as { reason: string }).reason, /^cancelled by root@pam at /)
+    assert.deepEqual(mock.signals.map(s => s.signal), ['SIGINT'])
+    assert.deepEqual(notifications(mock), [], 'a cancel never notifies')
+    assert.equal(
+      mock.calls.filter(c => c.command === PBC_CMD && c.args.includes('prune')).length,
+      0,
+      'a cancelled run never prunes',
+    )
+  })
+
   it('a FAILED run notifies `error` in BOTH modes, carrying the real error', async () => {
     await createRepo()
     for (const notify of ['always', 'on-failure'] as const) {

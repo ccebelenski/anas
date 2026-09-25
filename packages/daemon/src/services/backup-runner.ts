@@ -11,7 +11,7 @@ import type {
   UnmountedMount,
 } from '@anas/shared'
 import type { PeerCertificate } from 'node:tls'
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, SpawnedChild } from '../executor/types.js'
 import type { BackupSnapshotOptions, TakenSnapshot } from './backup-snapshots.js'
 import type { ZvolSnapdevOptions } from './backup-zvol.js'
 import { lookup } from 'node:dns/promises'
@@ -473,6 +473,13 @@ export interface BackupRunDeps {
    * `/etc/pve/storage.cfg`, fail-open when it is not there.
    */
   consistencyOptions?: { pveStorageCfg?: string }
+  /**
+   * rclone.5 (backup parity) — handed the proxmox-backup-client child the
+   * moment the BACKUP exec spawns it, so the job's cancel hook can signal it.
+   * Absent = not cancellable. The post-success prune is not wired: a cancel
+   * then finds the backup's child already gone and says the run is finishing.
+   */
+  onSpawn?: (child: SpawnedChild) => void
 }
 
 export interface BackupRunResult {
@@ -675,8 +682,11 @@ export async function runBackup(
   // it or throws (the `finally` re-raises after destroying the snapshots).
   let r!: { exitCode: number, stderr: string }
 
+  // `prlimit -- cmd` EXECS the command in place (it sets the limit on itself
+  // and then execvp's), so the pid `onSpawn` hands over IS pbc's — the cancel
+  // hook's SIGINT reaches the client, not a wrapper (rclone.5).
   const exec = async (args: string[]): Promise<{ exitCode: number, stderr: string }> =>
-    executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], { env })
+    executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], { env, ...(deps.onSpawn ? { onSpawn: deps.onSpawn } : {}) })
 
   if (!snapshotMode) {
     r = await exec(buildBackupArgs(task, namespace, liveIncludes))

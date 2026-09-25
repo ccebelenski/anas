@@ -10076,6 +10076,58 @@ async function backupRunningGatingChecks() {
   void view
 }
 
+/**
+ * rclone.5 backup parity — the same Cancel run door on the Backup toolbar:
+ * gating on a running row with its job named, the cancelled cell, and the
+ * confirm window carrying the daemon's headline + the backup consequence.
+ */
+async function backupCancelRunChecks() {
+  const PROGRESS = "archive 'data': snapshot - ZFS dataset tank/pictures"
+  const routes = {
+    ...BACKUP_ROUTES,
+    'GET /backup/tasks': { data: [
+      { task: TASK, lastRunResult: 'success', enabled: true },
+      { task: { ...TASK, name: 'nightly-running' }, lastRunResult: 'running', runningProgress: PROGRESS, runningJobId: 'job-77' },
+      { task: { ...TASK, name: 'nightly-attaching' }, lastRunResult: 'running' },
+      { task: { ...TASK, name: 'nightly-stopped' }, lastRunResult: 'cancelled', lastRunAt: '2026-09-25T14:02:20Z',
+        lastRunNote: 'cancelled by root@pam at 2026-09-25T14:02:11.000Z' },
+    ] },
+  }
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], routes)
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+  ok('backup cancel: the grid loaded the four tasks', grid && grid.getStore().getCount() === 4)
+  const cancelBtn = grid.down('#backupCancel')
+  ok('backup cancel: the toolbar carries Cancel run', !!cancelBtn && cancelBtn.text === 'Cancel run')
+  const rowOf = name => grid.getStore().findExact('name', name)
+  grid.selectRow(rowOf('nightly-running'))
+  ok('backup cancel: a running row with its job named ENABLES Cancel run', cancelBtn.disabled === false)
+  ok('backup cancel: …while Run now stays disabled there', grid.down('#backupRun').disabled === true)
+  grid.selectRow(rowOf('nightly-attaching'))
+  ok('backup cancel: a running row the daemon names no job for keeps it disabled', cancelBtn.disabled === true)
+  grid.selectRow(rowOf(TASK.name))
+  ok('backup cancel: an idle (success) row keeps it disabled', cancelBtn.disabled === true)
+  grid.selectRow(rowOf('nightly-stopped'))
+  ok('backup cancel: a cancelled row keeps it disabled — and Run now is back',
+    cancelBtn.disabled === true && grid.down('#backupRun').disabled === false)
+
+  cancelledCellChecks('backup cancel', grid)
+
+  await cancelDoorChecks('backup cancel', {
+    ANAS,
+    grid,
+    btnId: 'backupCancel',
+    row: rowOf('nightly-running'),
+    jobId: 'job-77',
+    headline: `Backup task 'nightly-running' has been running for 41 m 3 s — ${PROGRESS}; cancelling stops it here`,
+    consequence: BACKUP_CANCEL_CONSEQUENCE,
+    listGets: () => apiGets.filter(g => g === '/backup/tasks').length,
+  })
+  ok('backup cancel: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
 await backupChecks()
 warnings.length = 0
 await backupWeeklyToggleChecks()
@@ -12614,6 +12666,199 @@ function dashboardCloudIconChecks() {
   ok('dashboard: an unknown category still renders no icon', ANAS.dash.warnIcon('nope') === '')
 }
 
+// ============================================================================
+//  rclone.5 — Cancel a running run (Cloud Sync + Backup, one shared door)
+// ============================================================================
+
+/** The consequence sentences the daemon's 409 carries, verbatim from the story. */
+const CLOUD_CANCEL_CONSEQUENCE = 'Files already copied stay at the destination. A sync run stopped '
+  + 'part-way leaves the destination between two states until the next run completes.'
+const BACKUP_CANCEL_CONSEQUENCE
+  = 'The unfinished snapshot is discarded by the backup server; earlier snapshots are untouched.'
+
+/**
+ * The REAL ANAS.confirmAndRun from 10-api.js, loaded into its own sandbox and
+ * wired to a scripted runJob that answers the first call with the daemon's
+ * 409 (confirm code + warnings) and the resend with a 202 — so a check sees
+ * the window the operator would, built by the one shared helper, not a
+ * re-stub of it. `sent` records every attempt.
+ */
+function realConfirmAndRun(wire) {
+  const win = {}
+  win.ANAS = {
+    t: s => s,
+    enc: s => String(s == null ? '' : s),
+    warn(m) { warnings.push(m) },
+    errText: e => String((e && e.message) || e),
+    toast(m) { toasts.push(m) },
+  }
+  const sandbox = { window: win, console, Promise, Ext, setTimeout: (fn) => { fn(); return 1 }, clearTimeout: () => {} }
+  vm.runInNewContext(readFileSync(join(SRC, '10-api.js'), 'utf8'), sandbox, { filename: '10-api.js' })
+  const sent = []
+  win.ANAS.runJob = (cfg) => {
+    sent.push({ method: cfg.method, path: cfg.path, confirmCode: cfg.confirmCode, maxMs: cfg.maxMs })
+    if (!cfg.confirmCode) {
+      const e = new Error(wire.warnings[0])
+      e.status = 409
+      e.confirmCode = 'GT-CANCEL-1'
+      e.body = { error: { code: 'CONFIRMATION_REQUIRED', message: wire.warnings[0], warnings: wire.warnings } }
+      cfg.onConfirm(e)
+      return
+    }
+    if (wire.fail) {
+      if (cfg.onFailed) { cfg.onFailed({ status: 'failed', error: { message: wire.fail } }) }
+      return
+    }
+    if (cfg.onComplete) { cfg.onComplete({ id: 'cancel-job', status: 'completed' }) }
+  }
+  return { confirmAndRun: win.ANAS.confirmAndRun, sent }
+}
+
+/**
+ * The cancel door as the operator meets it, for either grid: the button opens
+ * the confirm WINDOW (not a plain Yes/No) whose body is the daemon's headline
+ * — elapsed time and progress — plus the consequence sentence, "Keep running"
+ * is the default (Enter = the safe choice), and "Cancel run" resends to
+ * `POST /jobs/<id>/cancel` with the code, then the grid reloads.
+ */
+async function cancelDoorChecks(tag, { ANAS, grid, btnId, row, jobId, headline, consequence, listGets }) {
+  const real = realConfirmAndRun({ warnings: [headline, consequence] })
+  ANAS.confirmAndRun = real.confirmAndRun
+  created.windows.length = 0
+  toasts.length = 0
+  grid.selectRow(row)
+  const btn = grid.down(`#${btnId}`)
+  btn.handler(btn)
+  await settle()
+  const win = openWindow()
+  ok(`${tag}: Cancel run opens the confirm WINDOW, not a plain Yes/No`,
+    !!win && win.cls === 'anas-win-cancel-run', win && win.cls)
+  const body = win ? String((win.items.getAt(0) || {}).html || '') : ''
+  ok(`${tag}: the dialog carries the daemon's headline — elapsed time and progress`,
+    body.includes(headline), body)
+  ok(`${tag}: …and the consequence sentence, verbatim`, body.includes(consequence), body)
+  ok(`${tag}: the first attempt is the unconfirmed POST /jobs/${jobId}/cancel`,
+    real.sent.length === 1 && real.sent[0].method === 'post'
+    && real.sent[0].path === `/jobs/${jobId}/cancel` && real.sent[0].confirmCode === undefined,
+    JSON.stringify(real.sent))
+  const texts = win ? win.buttonCmps.map(b => b.text) : []
+  eq(`${tag}: the buttons read "Keep running" and "Cancel run"`, texts, ['Keep running', 'Cancel run'])
+  eq(`${tag}: "Keep running" is the default (Enter never stops a run)`,
+    win && win.defaultButton, 'anasConfirmCancelBtn')
+
+  // "Keep running" sends nothing more.
+  const keep = win.buttonCmps[0]
+  keep.handler(keep)
+  await settle()
+  eq(`${tag}: "Keep running" sends nothing`, real.sent.length, 1)
+
+  // Again, and confirm this time.
+  btn.handler(btn)
+  await settle()
+  const win2 = openWindow()
+  const before = listGets()
+  const go = win2.buttonCmps[1]
+  go.handler(go)
+  await settle()
+  ok(`${tag}: "Cancel run" resends WITH the daemon's code`,
+    real.sent.length === 3 && real.sent[2].confirmCode === 'GT-CANCEL-1'
+    && real.sent[2].path === `/jobs/${jobId}/cancel`, JSON.stringify(real.sent))
+  ok(`${tag}: the cancel job is polled past the two-signal worst case`,
+    (real.sent[2] || {}).maxMs >= 30000, String((real.sent[2] || {}).maxMs))
+  ok(`${tag}: the grid reloads after the cancel — now and once the runner has exited`,
+    listGets() - before >= 2, String(listGets() - before))
+  ok(`${tag}: a toast says the run was cancelled`, toasts.some(m => /Run cancelled/.test(m)), toasts.join(' | '))
+
+  // A cancel the daemon could not carry out: the grid reloads on failure too.
+  const failing = realConfirmAndRun({ warnings: [headline, consequence], fail: 'rclone (pid 4000) did not stop after two SIGINTs 10 s apart — the run continues' })
+  ANAS.confirmAndRun = failing.confirmAndRun
+  btn.handler(btn)
+  await settle()
+  const win3 = openWindow()
+  const beforeFail = listGets()
+  win3.buttonCmps[1].handler(win3.buttonCmps[1])
+  await settle()
+  ok(`${tag}: a failed cancel reloads the grid as well`, listGets() > beforeFail, String(listGets() - beforeFail))
+}
+
+/** The Last run cell of a cancelled row, for either grid. */
+function cancelledCellChecks(tag, grid) {
+  const lastRunCol = (grid.columns || []).find(c => c.dataIndex === 'lastRunResult')
+  const NOTE = 'cancelled by root@pam at 2026-09-25T14:02:11.000Z'
+  const cell = lastRunCol.renderer('cancelled', {}, {
+    get: k => ({ lastRunResult: 'cancelled', lastRunAt: '2026-09-25T14:02:20Z', lastRunNote: NOTE }[k]),
+  })
+  ok(`${tag}: a cancelled run reads "cancelled"`, />cancelled</.test(cell), cell)
+  ok(`${tag}: …with who and when in the tooltip`, cell.includes(`title="${NOTE}"`), cell)
+  ok(`${tag}: …never in the failure colour`, !/anas-danger/.test(cell), cell)
+  const noNote = lastRunCol.renderer('cancelled', {}, {
+    get: k => ({ lastRunResult: 'cancelled', lastRunAt: '2026-09-25T14:02:20Z' }[k]),
+  })
+  ok(`${tag}: once the journal has rotated past the line, the tooltip still says when`,
+    /title="cancelled /.test(noNote) && />cancelled</.test(noNote), noNote)
+}
+
+const CLOUD_RUNNING_PROGRESS = 'copy: 1527851 of 17283186 bytes, 363 transferred, 0 checked, 0 deleted, 0 errors, ETA 62685s'
+
+async function cloudCancelRunChecks() {
+  const routes = cloudTaskRoutes()
+  routes['GET /cloud/tasks'] = {
+    data: [
+      CLOUD_TASK_VIEW,
+      { ...CLOUD_TASK_VIEW, name: 'drive-hours', lastRunResult: 'running',
+        runningProgress: CLOUD_RUNNING_PROGRESS, runningJobId: 'job-42' },
+      { ...CLOUD_TASK_VIEW, name: 'drive-attaching', lastRunResult: 'running' },
+      { ...CLOUD_TASK_VIEW, name: 'drive-stopped', lastRunResult: 'cancelled', lastRunAt: '2026-09-25T14:02:20Z',
+        lastRunNote: 'cancelled by root@pam at 2026-09-25T14:02:11.000Z' },
+    ],
+  }
+  const { ANAS, view, grid } = await openCloudTasks(routes)
+  ok('cloud cancel: the grid loaded the four tasks', grid && grid.getStore().getCount() === 4)
+  const cancelBtn = grid.down('#cloudTaskCancel')
+  ok('cloud cancel: the toolbar carries Cancel run', !!cancelBtn && cancelBtn.text === 'Cancel run')
+  ok('cloud cancel: nothing selected ⇒ Cancel run disabled', cancelBtn.disabled === true)
+  // Store order is the harness's load order (the stub does not sort).
+  const rowOf = name => grid.getStore().findExact('name', name)
+  grid.selectRow(rowOf('drive-hours'))
+  ok('cloud cancel: a running row with its job named ENABLES Cancel run', cancelBtn.disabled === false)
+  ok('cloud cancel: …while Run now stays disabled there', grid.down('#cloudTaskRun').disabled === true)
+  grid.selectRow(rowOf('drive-attaching'))
+  ok('cloud cancel: a running row the daemon names no job for keeps it disabled', cancelBtn.disabled === true)
+  grid.selectRow(rowOf('pictures-offsite'))
+  ok('cloud cancel: an idle (never-run) row keeps it disabled', cancelBtn.disabled === true)
+  grid.selectRow(rowOf('drive-stopped'))
+  ok('cloud cancel: a cancelled row keeps it disabled — and Run now is back',
+    cancelBtn.disabled === true && grid.down('#cloudTaskRun').disabled === false)
+
+  cancelledCellChecks('cloud cancel', grid)
+
+  await cancelDoorChecks('cloud cancel', {
+    ANAS,
+    grid,
+    btnId: 'cloudTaskCancel',
+    row: rowOf('drive-hours'),
+    jobId: 'job-42',
+    headline: `Cloud sync task 'drive-hours' has been running for 2 h 14 m — ${CLOUD_RUNNING_PROGRESS}; cancelling stops it here`,
+    consequence: CLOUD_CANCEL_CONSEQUENCE,
+    listGets: () => apiGets.filter(g => g === '/cloud/tasks').length,
+  })
+  ok('cloud cancel: nothing warned', warnings.length === 0, warnings.join(' | '))
+  void view
+}
+
+/** The dashboard strip renders `cancelled` — neutral, never the failure colour. */
+function dashboardCancelledStripChecks() {
+  const ANAS = loadSources(['50-dashboard.js'], {})
+  const html = ANAS.dash.jobsStrip({ jobs: [
+    { id: 'j1', kind: 'cloud.task.run', status: 'cancelled', startedAt: '2026-09-25T12:00:00Z', finishedAt: '2026-09-25T14:02:20Z' },
+    { id: 'j2', kind: 'backup.task.run', status: 'failed', startedAt: '2026-09-25T12:00:00Z', finishedAt: '2026-09-25T12:10:00Z' },
+  ] })
+  const cancelRow = (html.split('anas-dash-job"').find(r => r.includes('cloud.task.run')) || '')
+  ok('dashboard strip: a cancelled job reads "cancelled"', /anas-dash-job-cancel">cancelled</.test(cancelRow), cancelRow)
+  ok('dashboard strip: …not in the failure class', !/anas-dash-job-bad/.test(cancelRow), cancelRow)
+  ok('dashboard strip: a failed job keeps the failure class', /anas-dash-job-bad">failed</.test(html), html)
+}
+
 warnings.length = 0
 created.windows.length = 0
 await cloudTaskChecks()
@@ -12625,6 +12870,18 @@ await cloudRunningGatingChecks()
 warnings.length = 0
 created.windows.length = 0
 await dashboardCloudIconChecks()
+
+warnings.length = 0
+created.windows.length = 0
+await cloudCancelRunChecks()
+
+// The backup twin runs here, after the shared cancel fixtures above exist.
+warnings.length = 0
+created.windows.length = 0
+await backupCancelRunChecks()
+
+warnings.length = 0
+dashboardCancelledStripChecks()
 
 // ============================================================================
 //  Story vdevs.1 (GitHub #66) — consumer audit: every vdev CLASS is reachable
@@ -13418,24 +13675,37 @@ function confirmDoorGuardChecks() {
     .split('+')
     .map(s => s.trim().replace(/^'/, '').replace(/'$/, ''))
     .join('')
-  const verbs = []
   const CALL = 'ANAS.confirmAndRun({'
-  for (let at = ahrSrc.indexOf(CALL); at >= 0; at = ahrSrc.indexOf(CALL, at + 1)) {
-    const rest = ahrSrc.slice(at + CALL.length)
-    const nextCall = Math.min(
-      ...[rest.indexOf(CALL), rest.indexOf('ANAS.runJob({')].filter(i => i >= 0).concat([rest.length]),
-    )
-    const body = rest.slice(0, nextCall)
-    const method = (body.match(/method:\s*'([a-z]+)'/) || [])[1]
-    // A path expression may wrap over several lines — take it up to the first
-    // line that CLOSES it with a comma, then flatten it.
-    const rawPath = (body.match(/^\s*path:\s*([\s\S]*?),\s*$/m) || [])[1]
-    if (!method || !rawPath) { continue }
-    // The UI names the verb 'del'; Fastify registers it as `delete`.
-    verbs.push({ method: method === 'del' ? 'delete' : method, path: norm(rawPath.replace(/\s+/g, ' ')) })
+  const verbsOf = (src) => {
+    const found = []
+    for (let at = src.indexOf(CALL); at >= 0; at = src.indexOf(CALL, at + 1)) {
+      const rest = src.slice(at + CALL.length)
+      const nextCall = Math.min(
+        ...[rest.indexOf(CALL), rest.indexOf('ANAS.runJob({')].filter(i => i >= 0).concat([rest.length]),
+      )
+      const body = rest.slice(0, nextCall)
+      const method = (body.match(/method:\s*'([a-z]+)'/) || [])[1]
+      // A path expression may wrap over several lines — take it up to the first
+      // line that CLOSES it with a comma, then flatten it.
+      const rawPath = (body.match(/^\s*path:\s*([\s\S]*?),\s*$/m) || [])[1]
+      if (!method || !rawPath) { continue }
+      // The UI names the verb 'del'; Fastify registers it as `delete`.
+      found.push({ method: method === 'del' ? 'delete' : method, path: norm(rawPath.replace(/\s+/g, ' ')) })
+    }
+    return found
   }
+  const verbs = verbsOf(ahrSrc)
   ok('confirm-door: the AHR view\'s confirmAndRun verbs were parsed', verbs.length >= 4,
     JSON.stringify(verbs))
+  // rclone.5: the shared Cancel run door (Cloud Sync + Backup) lives in the
+  // schedules common module — its verb is held to the same rule.
+  const cancelVerbs = verbsOf(readFileSync(join(SRC, '69-schedules-common.js'), 'utf8'))
+  ok('confirm-door: the shared Cancel run door was parsed',
+    cancelVerbs.some(v => v.method === 'post' && v.path === '/jobs/:p/cancel'), JSON.stringify(cancelVerbs))
+  const cancelRoute = gatedByPath.get('post /jobs/:p/cancel')
+  ok('confirm-door: POST /jobs/:id/cancel exists and IS confirm-gated',
+    !!cancelRoute && cancelRoute.gated === true, JSON.stringify(cancelRoute))
+  verbs.push(...cancelVerbs)
   // Every one must RESOLVE to a daemon route, or the gate check below would
   // pass by looking up nothing.
   const unresolved = verbs.filter(v => !gatedByPath.get(`${v.method} ${v.path}`))
@@ -13445,7 +13715,7 @@ function confirmDoorGuardChecks() {
     const hit = gatedByPath.get(`${v.method} ${v.path}`)
     return hit && hit.gated === false
   })
-  ok('confirm-door: no AHR verb is driven through confirmAndRun against an UN-GATED route',
+  ok('confirm-door: no AHR (or shared Cancel run) verb is driven through confirmAndRun against an UN-GATED route',
     ungated.length === 0, JSON.stringify(ungated))
   ok('confirm-door: …and the cache verbs are not in that path at all',
     !verbs.some(v => /\/cache$/.test(v.path)), JSON.stringify(verbs.map(v => v.path)))

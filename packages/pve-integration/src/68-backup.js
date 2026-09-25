@@ -751,6 +751,10 @@
             nextRunAt: first(entry.nextRunAt, entry.nextRun),
             overdue: entry.overdue === true,
             runningProgress: entry.runningProgress || '',
+            // rclone.5 (backup parity): the running direct job Cancel run
+            // targets, and a cancelled run's "cancelled by <user> at <time>".
+            runningJobId: entry.runningJobId || '',
+            lastRunNote: entry.lastRunNote || '',
             raw: task,
         };
     }
@@ -948,6 +952,10 @@
                 + 'color:#fff;background:var(--anas-accent,#3468c0);">'
                 + '<i class="fa fa-refresh fa-spin" aria-hidden="true" style="margin-right:4px;"></i>'
                 + enc(t('running')) + '</span>' + rp.html;
+        } else if (result === 'cancelled' && !overdue) {
+            // rclone.5 (parallel construction with Cloud Sync): stopped from
+            // the toolbar — the shared neutral pill, who and when in the tooltip.
+            pill = ANAS.sched.cancelledPill(rec);
         } else if (result === 'disabled') {
             // Live-proof F9: a DISABLED task has no timer referencing its unit,
             // so systemd unloads it and garbage-collects the run history. The
@@ -1808,6 +1816,9 @@
         // never the safety).
         var running = has && rec.get('lastRunResult') === 'running';
         setDisabled(grid, 'backupRun', !has || running);
+        // rclone.5: Cancel run is the running row's verb — and only while the
+        // daemon names the direct job to stop (the API gate still decides).
+        setDisabled(grid, 'backupCancel', !ANAS.sched.cancellable(rec));
         // A restore is allowed for a DISABLED task too — disabling the backups
         // must not take the restore path away with it.
         setDisabled(grid, 'backupRestore', !has);
@@ -4274,6 +4285,11 @@
                 }
                 loadTasks(view, node);
             },
+            // rclone.5: the run this Run Now watched was cancelled — neither
+            // a failure nor a finish; the row says cancelled after the reload.
+            onCancelled: function () {
+                loadTasks(view, node);
+            },
         });
         ANAS.toast(t('Backup started') + ': ' + name);
     }
@@ -5246,6 +5262,7 @@
                 { name: 'storedKind', type: 'auto' },
                 { name: 'lunName', type: 'auto' },
                 'schedule', 'mode', 'notify', 'lastRunResult', 'lastRunAt', 'nextRunAt', 'runningProgress',
+                'runningJobId', 'lastRunNote',
                 { name: 'archiveCount', type: 'auto' },
                 { name: 'cadence', type: 'auto' },
                 { name: 'limitNofile', type: 'auto' },
@@ -5326,6 +5343,30 @@
                 handler: function (btn) {
                     var view = btn.up('#backupView');
                     runTask(view, node, selectedTask(gridOf(view)));
+                },
+            },
+            {
+                // rclone.5 (backup parity): stop the running run, behind the
+                // daemon's confirm — the same shared door as Cloud Sync.
+                text: t('Cancel run'),
+                itemId: 'backupCancel',
+                cls: 'anas-btn-backup-cancel',
+                iconCls: 'fa fa-stop-circle',
+                disabled: true,
+                handler: function (btn) {
+                    var view = btn.up('#backupView');
+                    var grid = gridOf(view);
+                    var rec = selectedTask(grid);
+                    if (!rec) {
+                        return;
+                    }
+                    ANAS.sched.cancelRun({
+                        node: node,
+                        jobId: rec.get('runningJobId'),
+                        name: rec.get('name'),
+                        view: grid,
+                        reload: function () { loadTasks(view, node, true); },
+                    });
                 },
             },
             {

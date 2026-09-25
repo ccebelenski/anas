@@ -166,6 +166,8 @@
     //   successMsg — toast on completion
     //   failTitle  — alert title on failure (default 'Operation failed')
     //   onComplete(job) / onFailed(job) / onConfirm(err) — callbacks
+    //   onCancelled(job) — the job ended `cancelled` (rclone.5); without it a
+    //                toast carries the daemon's reason
     // onConfirm receives the rejected 409 Error (with .confirmCode) so callers
     // can prompt and retry with { confirmCode }. If absent, ANAS.confirmAndRun
     // wraps this for the standard prompt flow.
@@ -224,6 +226,19 @@
                 if (status === 'completed') {
                     if (opts.successMsg) { ANAS.toast(opts.successMsg); }
                     if (opts.onComplete) { opts.onComplete(job); }
+                    return;
+                }
+                // rclone.5: a job an operator cancelled. Not a failure (no
+                // modal) and not a completion (no success toast) — its own
+                // callback when the caller has one, else one toast carrying
+                // the daemon's "cancelled by <user> at <time>".
+                if (status === 'cancelled') {
+                    if (opts.onCancelled) {
+                        opts.onCancelled(job);
+                    } else {
+                        var why = job && job.result && job.result.reason;
+                        ANAS.toast(ANAS.t('Cancelled') + (why ? ': ' + why : ''));
+                    }
                     return;
                 }
                 if (status === 'failed') {
@@ -314,7 +329,10 @@
             items: items,
             defaultButton: 'anasConfirmCancelBtn',
             buttons: [{
-                text: ANAS.t('Cancel'),
+                // `cancelButtonText` renames the safe choice where "Cancel"
+                // would read as the verb itself (rclone.5: "Keep running"
+                // beside "Cancel run").
+                text: ANAS.t(opts.cancelButtonText || 'Cancel'),
                 itemId: 'anasConfirmCancelBtn',
                 handler: function () { win.close(); },
             }, {
@@ -341,7 +359,8 @@
     //   * widget window — set confirmWindow:true to render an Ext.window.Window
     //     that can host extraItems:[checkboxCfg,…]; mapConfirm(win) → optional
     //     { pathSuffix, bodyPatch } folds the widget values into the resend. Also
-    //     honours confirmCls / confirmButtonText / confirmButtonCls / confirmWidth.
+    //     honours confirmCls / confirmButtonText / confirmButtonCls / confirmWidth
+    //     / cancelButtonText.
     ANAS.confirmAndRun = function (opts) {
         var base = shallowCopy(opts);
         base.onConfirm = function (err) {

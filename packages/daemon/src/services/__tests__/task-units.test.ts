@@ -6,9 +6,9 @@ import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promise
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
-import { BACKUP_SKIP_EXIT_CODE } from '@anas/shared'
+import { BACKUP_SKIP_EXIT_CODE, TASK_CANCELLED_EXIT_CODE } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
-import { JobQueue } from '../../jobs/queue.js'
+import { JobCancelledError, JobQueue } from '../../jobs/queue.js'
 import { BACKUP_UNIT_KIND } from '../backup-units.js'
 import { CLOUD_UNIT_KIND } from '../cloud-units.js'
 import {
@@ -30,6 +30,7 @@ import {
   readUnitTexts,
   removeTaskUnits,
   runFailed,
+  runningDirectJobFields,
   runningDirectJobProgress,
   runningRunConflictMessage,
   serviceUnitName,
@@ -717,6 +718,78 @@ describe('task units — the Run-Now gate inputs (rclone.3 human-pass findings)'
     mock.addFixture({ command: SYSTEMCTL, args: ['show', TIMER, '-p', 'NextElapseUSecRealtime'], result: ok('NextElapseUSecRealtime=n/a\n') })
     const st = await deriveTaskStatus(CLOUD_UNIT_KIND, mock, task())
     assert.equal(st.runActive, true)
+  })
+})
+
+describe('task units — a cancelled run (rclone.5)', () => {
+  const CANCELLED_JOURNAL = [
+    '2026-09-25T14:02:20+0000 anas-pve anas-cloud-offsite[1200]: {"task":"offsite","result":{"status":"cancelled","reason":"cancelled by alice@pve at 2026-09-25T14:02:11.000Z","cancelledBy":"alice@pve","cancelledAt":"2026-09-25T14:02:11.000Z"}}',
+    '2026-09-25T14:02:20+0000 anas-pve systemd[1]: anas-cloud-offsite.service: Main process exited, code=exited, status=130/n/a',
+    '2026-09-25T14:02:20+0000 anas-pve systemd[1]: anas-cloud-offsite.service: Failed with result \'exit-code\'.',
+  ].join('\n')
+
+  it('the runner\'s cancel exit (130) reads `cancelled` — never failure — whichever way systemd recorded it', () => {
+    assert.equal(TASK_CANCELLED_EXIT_CODE, 130)
+    // The unit as rendered today: 130 is not a declared success → systemd says failed.
+    assert.equal(deriveTaskRunResult({ ActiveState: 'failed', Result: 'exit-code', ExecMainStatus: '130' }), 'cancelled')
+    // A unit that declared it a success would read Result=success — still cancelled.
+    assert.equal(deriveTaskRunResult({ ActiveState: 'inactive', Result: 'success', ExecMainStatus: '130' }), 'cancelled')
+    // Any other failure stays a failure; a RUNNING unit is running, whatever the last exit was.
+    assert.equal(deriveTaskRunResult({ ActiveState: 'failed', Result: 'exit-code', ExecMainStatus: '1' }), 'failure')
+    assert.equal(deriveTaskRunResult({ ActiveState: 'active', Result: 'success', ExecMainStatus: '130' }), 'running')
+  })
+
+  it('the status carries "cancelled by <user> at <time>" from the runner\'s result line, and never warns', async () => {
+    const st = await deriveTaskStatus(
+      CLOUD_UNIT_KIND,
+      statusMock({ active: 'failed', result: 'exit-code', execStatus: '130', exitTs: 'Thu 2026-09-25 14:02:20 UTC', journal: CANCELLED_JOURNAL }),
+      task(),
+    )
+    assert.equal(st.lastRunResult, 'cancelled')
+    assert.equal(st.lastRunNote, 'cancelled by alice@pve at 2026-09-25T14:02:11.000Z')
+    assert.equal(st.lastRunAt, '2026-09-25T14:02:20.000Z')
+    assert.deepEqual(buildTaskWarnings(CLOUD_UNIT_KIND, [{ name: TASK, enabled: true, lastRunResult: 'cancelled', overdue: false }]), [])
+  })
+
+  it('no note once the journal has rotated past the line — and none for any other result', async () => {
+    const rotated = await deriveTaskStatus(
+      CLOUD_UNIT_KIND,
+      statusMock({ active: 'failed', result: 'exit-code', execStatus: '130', exitTs: 'Thu 2026-09-25 14:02:20 UTC', journal: '' }),
+      task(),
+    )
+    assert.equal(rotated.lastRunResult, 'cancelled')
+    assert.equal(rotated.lastRunNote, undefined)
+    const ok = await deriveTaskStatus(CLOUD_UNIT_KIND, statusMock({ exitTs: 'Sun 2026-09-20 02:00:07 UTC', journal: CANCELLED_JOURNAL }), task())
+    assert.equal(ok.lastRunNote, undefined)
+  })
+
+  it('a Run-Now whose watched run was cancelled ends its OWN job `cancelled` with the runner\'s sentence', async () => {
+    const mock = superviseMock({
+      shows: [
+        { ActiveState: 'inactive', Result: 'success', InvocationID: 'OLD' },
+        { ActiveState: 'activating', InvocationID: 'NEW' },
+        { ActiveState: 'failed', Result: 'exit-code', ExecMainStatus: '130', InvocationID: 'NEW' },
+      ],
+      journal: CANCELLED_JOURNAL,
+    })
+    await assert.rejects(
+      superviseTaskRun(CLOUD_UNIT_KIND, mock, TASK, FAST),
+      (err: unknown) => err instanceof JobCancelledError && err.message === 'cancelled by alice@pve at 2026-09-25T14:02:11.000Z',
+    )
+  })
+
+  it('runningDirectJobFields: the progress AND the id of the one in-flight direct job', () => {
+    const queue = new JobQueue()
+    assert.deepEqual(runningDirectJobFields(queue, 'cloud.task.run', TASK), {})
+    const direct = queue.submit('cloud.task.run', { user: 'root@pam', uid: 0, params: { task: TASK, direct: true } }, () => new Promise<void>(() => {}))
+    // No progress yet: the id alone (the run is still cancellable).
+    assert.deepEqual(runningDirectJobFields(queue, 'cloud.task.run', TASK), { runningJobId: direct.id })
+    queue.get(direct.id)!.progress = 'copy: 1 of 2 bytes'
+    assert.deepEqual(runningDirectJobFields(queue, 'cloud.task.run', TASK), { runningProgress: 'copy: 1 of 2 bytes', runningJobId: direct.id })
+    // The supervising job is never the one to cancel.
+    const q2 = new JobQueue()
+    q2.submit('cloud.task.run', { user: 'root@pam', uid: 0, params: { task: TASK } }, () => new Promise<void>(() => {}))
+    assert.deepEqual(runningDirectJobFields(q2, 'cloud.task.run', TASK), {})
   })
 })
 

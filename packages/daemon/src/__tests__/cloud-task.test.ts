@@ -1,8 +1,9 @@
 import type { Requester, RunnerResponse } from '../cloud-task.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK } from '@anas/shared'
-import { exitCodeForResult, parseRunnerArgs, runCloudTask } from '../cloud-task.js'
+import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK, TASK_CANCELLED_EXIT_CODE } from '@anas/shared'
+import { exitCodeForResult, main, parseRunnerArgs, runCloudTask } from '../cloud-task.js'
+import { cancelledRunnerExit } from '../runner-poll.js'
 
 /**
  * The cloud sync timer entrypoint (rclone.2) — the backup runner's twin on the
@@ -105,5 +106,64 @@ describe('cloud-task runner (rclone.2 — timer entrypoint)', () => {
       assert.equal(exitCodeForResult(undefined), 0)
       assert.equal(exitCodeForResult({}), 0)
     })
+  })
+})
+
+/**
+ * rclone.5 — a run an operator cancelled. The runner polls the job to its
+ * terminal state (`cancelled` is one), prints the result line — the journal is
+ * where the status derivation reads "cancelled by <user> at <time>" back from —
+ * and exits 130, which the derivation maps to `cancelled`, never failed.
+ */
+describe('cloud-task runner — a cancelled job (rclone.5)', () => {
+  const CANCELLED = {
+    id: 'j',
+    status: 'cancelled',
+    operation: 'cloud.task.run',
+    result: { status: 'cancelled', reason: 'cancelled by alice@pve at 2026-09-25T14:02:11.000Z' },
+    error: null,
+  }
+
+  it('the poll stops at `cancelled` (a terminal state)', async () => {
+    let polls = 0
+    const requester: Requester = async (req) => {
+      if (req.method === 'POST')
+        return { statusCode: 202, body: { job: { id: 'j', status: 'queued' } } }
+      polls++
+      return { statusCode: 200, body: { job: polls < 2 ? { id: 'j', status: 'running' } : CANCELLED } }
+    }
+    const job = await runCloudTask(requester, 'offsite', { sleep: async () => {}, intervalMs: 0 })
+    assert.equal(job.status, 'cancelled')
+    assert.equal(polls, 2)
+  })
+
+  it('main() exits 130 and prints the result line', async () => {
+    const requester: Requester = async req => (req.method === 'POST'
+      ? { statusCode: 202, body: { job: { id: 'j', status: 'queued' } } }
+      : { statusCode: 200, body: { job: CANCELLED } })
+    const out: string[] = []
+    const write = process.stdout.write
+    process.stdout.write = ((chunk: string) => {
+      out.push(String(chunk))
+      return true
+    }) as typeof process.stdout.write
+    let code: number
+    try {
+      code = await main(['--name', 'offsite'], () => requester)
+    }
+    finally {
+      process.stdout.write = write
+    }
+    assert.equal(code, TASK_CANCELLED_EXIT_CODE)
+    assert.equal(code, 130)
+    assert.deepEqual(JSON.parse(out.join('').trim()), { task: 'offsite', result: CANCELLED.result })
+  })
+
+  it('cancelledRunnerExit writes { task, result } and answers the cancel code', () => {
+    const lines: string[] = []
+    const code = cancelledRunnerExit(CANCELLED as never, 'offsite', l => lines.push(l))
+    assert.equal(code, 130)
+    assert.equal(lines.length, 1)
+    assert.match(lines[0], /"reason":"cancelled by alice@pve at 2026-09-25T14:02:11\.000Z"/)
   })
 })

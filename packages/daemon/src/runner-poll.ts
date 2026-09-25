@@ -1,6 +1,7 @@
 import type { Job, JobRef } from '@anas/shared'
 import { randomUUID } from 'node:crypto'
 import { request as httpRequest } from 'node:http'
+import { TASK_CANCELLED_EXIT_CODE } from '@anas/shared'
 
 /**
  * Shared plumbing for the systemd task RUNNERS (backup-task / snapshot-task /
@@ -85,12 +86,32 @@ export async function pollJobToTerminal(
     })
     if (poll.statusCode === 200) {
       const job = (poll.body as { job?: Job }).job
-      if (job && (job.status === 'completed' || job.status === 'failed'))
+      if (job && isTerminalJob(job))
         return job
     }
     await sleep(intervalMs)
   }
   throw new Error(`${kind} job ${jobRef.id} did not reach a terminal state after ${maxAttempts} polls`)
+}
+
+/** Has the job ended? `cancelled` (rclone.5) is as terminal as completed/failed. */
+export function isTerminalJob(job: Pick<Job, 'status'>): boolean {
+  return job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled'
+}
+
+/**
+ * A runner whose job ended `cancelled` (rclone.5): print the result line
+ * (`{ task, result }` — the result says who cancelled and when, and the status
+ * derivation's `lastRunNote` reads it back from the journal) and answer the
+ * cancel exit code, which the task status maps to `cancelled`, never failed.
+ */
+export function cancelledRunnerExit(
+  job: Job,
+  task: string,
+  write: (line: string) => void = line => process.stdout.write(line),
+): number {
+  write(`${JSON.stringify({ task, result: job.result })}\n`)
+  return TASK_CANCELLED_EXIT_CODE
 }
 
 /** Pull an error message out of a `{ error: { message } }` body if present. */

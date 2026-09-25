@@ -325,6 +325,20 @@ export const CloudSyncTaskView = CloudSyncTask.extend({
    * pill. ADDITIVE/optional: an older daemon (or a finished run) omits it.
    */
   runningProgress: z.string().optional(),
+  /**
+   * rclone.5 — the id of that same running direct job (the one lookup that
+   * fills `runningProgress`), so the toolbar's Cancel run knows which job
+   * `POST /v1/jobs/:id/cancel` stops. ADDITIVE/optional: absent whenever
+   * `runningProgress`'s job is absent.
+   */
+  runningJobId: z.string().optional(),
+  /**
+   * rclone.5 — the last run's own one-line account when its result needs one:
+   * today only a `cancelled` run, "cancelled by <user> at <time>", read from
+   * the runner's result line in the unit journal (recent-only: absent once the
+   * journal has rotated past it). ADDITIVE/optional.
+   */
+  lastRunNote: z.string().optional(),
 })
 export type CloudSyncTaskView = z.infer<typeof CloudSyncTaskView>
 

@@ -1,6 +1,8 @@
+import type { AuditLogger } from '../../audit/logger.js'
+import type { CancelHook, JobContext } from '../queue.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { JobQueue } from '../queue.js'
+import { JobCancelledError, JobQueue } from '../queue.js'
 
 /**
  * The job queue's correlation queries.
@@ -75,5 +77,180 @@ describe('JobQueue.findActive', () => {
     const first = queue.submit('ahr.repair', { user: 'u', uid: 0, params: { name: 'tank' } }, forever)
     queue.submit('ahr.scrub', { user: 'u', uid: 0, params: { name: 'tank' } }, forever)
     assert.equal(queue.findActive(['ahr.scrub', 'ahr.repair'], 'tank')?.id, first.id)
+  })
+})
+
+/**
+ * rclone.5 — cancellation. A running job may register ONE hook from inside its
+ * body; `cancel` runs it once, and when it reports the work stopped the job
+ * ends `cancelled` whatever the body does next. A job with no hook, or one that
+ * already ended, is refused with its sentence.
+ */
+describe('JobQueue.cancel (rclone.5)', () => {
+  /** A body that registers `hook`, then waits until `release` is called. */
+  function cancellable(hook: CancelHook): { handler: (p: (m: string) => void, ctx: JobContext) => Promise<unknown>, release: (err?: Error) => void, seen: () => JobContext | undefined } {
+    let release: (err?: Error) => void = () => {}
+    let ctxSeen: JobContext | undefined
+    return {
+      handler: async (_p, ctx) => {
+        ctxSeen = ctx
+        ctx.onCancel(hook, { subject: 'Cloud sync task \'photos\'' })
+        await new Promise<void>((resolve, reject) => {
+          release = err => (err ? reject(err) : resolve())
+        })
+        return { status: 'success' }
+      },
+      release: err => release(err),
+      seen: () => ctxSeen,
+    }
+  }
+
+  it('runs the hook ONCE and the job ends `cancelled` with who and when', async () => {
+    const queue = new JobQueue()
+    let calls = 0
+    const body: ReturnType<typeof cancellable> = cancellable(async () => {
+      calls++
+      // The signal stops the child — the body's exec then ends (here: throws).
+      body.release(new Error('rclone exited 130'))
+    })
+    const ref = queue.submit('cloud.task.run', { user: 'root@pam', uid: 0, params: { task: 'photos', direct: true } }, body.handler)
+    await settle()
+    const by = await queue.cancel(ref.id, 'alice@pve')
+    await settle()
+    assert.equal(calls, 1)
+    assert.equal(by.user, 'alice@pve')
+    const job = queue.get(ref.id)!
+    assert.equal(job.status, 'cancelled')
+    assert.equal(job.error, null, 'a cancel is not a failure')
+    const result = job.result as { status: string, reason: string, cancelledBy: string }
+    assert.equal(result.status, 'cancelled')
+    assert.equal(result.cancelledBy, 'alice@pve')
+    assert.match(result.reason, /^cancelled by alice@pve at \d{4}-\d{2}-\d{2}T/)
+    assert.ok(job.completedAt)
+  })
+
+  it('the body sees the cancellation while it unwinds (so it can skip its notification)', async () => {
+    const queue = new JobQueue()
+    let seenDuring: unknown = 'unset'
+    const body: ReturnType<typeof cancellable> = cancellable(async () => {
+      seenDuring = body.seen()?.cancellation()
+      body.release()
+    })
+    const ref = queue.submit('cloud.task.run', { user: 'root@pam', uid: 0 }, body.handler)
+    await settle()
+    assert.equal(body.seen()?.cancellation(), null, 'no cancel yet')
+    await queue.cancel(ref.id, 'alice@pve')
+    await settle()
+    assert.equal((seenDuring as { user: string }).user, 'alice@pve')
+    // A body that even COMPLETED after the accepted cancel still ends cancelled.
+    assert.equal(queue.get(ref.id)?.status, 'cancelled')
+  })
+
+  it('a job with no hook is refused as not cancellable — and keeps running', async () => {
+    const queue = new JobQueue()
+    const ref = queue.submit('pool.scrub', { user: 'u', uid: 0 }, forever)
+    await settle()
+    const target = queue.cancelTarget(ref.id)
+    assert.ok('reason' in target && target.reason === 'not-cancellable')
+    await assert.rejects(queue.cancel(ref.id, 'alice@pve'), /cannot be cancelled — it registers no way to stop its work/)
+    assert.equal(queue.get(ref.id)?.status, 'running')
+  })
+
+  it('a finished job is refused with its final state in the sentence', async () => {
+    const queue = new JobQueue()
+    const ok = queue.submit('cloud.task.run', { user: 'u', uid: 0 }, noop)
+    const bad = queue.submit('cloud.task.run', { user: 'u', uid: 0 }, async () => {
+      throw new Error('boom')
+    })
+    await settle()
+    await assert.rejects(queue.cancel(ok.id, 'alice@pve'), /is not running — it already ended completed/)
+    await assert.rejects(queue.cancel(bad.id, 'alice@pve'), /is not running — it already ended failed/)
+    const t = queue.cancelTarget(ok.id)
+    assert.ok('reason' in t && t.reason === 'finished')
+  })
+
+  it('an unknown job is not-found', async () => {
+    const queue = new JobQueue()
+    const t = queue.cancelTarget('nope')
+    assert.ok('reason' in t && t.reason === 'not-found')
+    await assert.rejects(queue.cancel('nope', 'u'), /Job 'nope' not found/)
+  })
+
+  it('a hook that cannot stop the work fails the cancel and the job carries on', async () => {
+    const queue = new JobQueue()
+    const body = cancellable(async () => {
+      throw new Error('rclone (pid 4000) did not stop after two SIGINTs 10 s apart — the run continues')
+    })
+    const ref = queue.submit('cloud.task.run', { user: 'u', uid: 0 }, body.handler)
+    await settle()
+    await assert.rejects(queue.cancel(ref.id, 'alice@pve'), /did not stop after two SIGINTs/)
+    await settle()
+    assert.equal(queue.get(ref.id)?.status, 'running')
+    assert.equal(body.seen()?.cancellation(), null, 'the cancellation is withdrawn')
+    // …and when the run later finishes on its own, it is a normal completion.
+    body.release()
+    await settle()
+    assert.equal(queue.get(ref.id)?.status, 'completed')
+  })
+
+  it('a second cancel while the first is in flight is refused as in progress', async () => {
+    const queue = new JobQueue()
+    let finish: () => void = () => {}
+    const body = cancellable(() => new Promise<void>((resolve) => {
+      finish = resolve
+    }))
+    const ref = queue.submit('cloud.task.run', { user: 'u', uid: 0 }, body.handler)
+    await settle()
+    const first = queue.cancel(ref.id, 'alice@pve')
+    await assert.rejects(queue.cancel(ref.id, 'bob@pve'), /is already being cancelled \(cancelled by alice@pve at /)
+    finish()
+    body.release()
+    await first
+    await settle()
+    assert.equal(queue.get(ref.id)?.status, 'cancelled')
+  })
+
+  it('a body that reports its WATCHED work was cancelled ends `cancelled`, not failed', async () => {
+    const queue = new JobQueue()
+    const ref = queue.submit('cloud.task.run', { user: 'u', uid: 0 }, async () => {
+      throw new JobCancelledError('cancelled by alice@pve at 2026-09-25T14:02:11.000Z')
+    })
+    await settle()
+    const job = queue.get(ref.id)!
+    assert.equal(job.status, 'cancelled')
+    assert.equal(job.error, null)
+    assert.equal((job.result as { reason: string }).reason, 'cancelled by alice@pve at 2026-09-25T14:02:11.000Z')
+  })
+
+  it('audits `job.cancelled` naming the user who cancelled and the submitter', async () => {
+    const lines: { event: string, user: string, submittedBy?: string, reason?: string }[] = []
+    const audit = {
+      submitted() {},
+      finished() {},
+      cancelled(entry: { user: string }, c: { cancelledBy?: string, reason: string }) {
+        lines.push({ event: 'job.cancelled', user: c.cancelledBy ?? entry.user, submittedBy: entry.user, reason: c.reason })
+      },
+    } as unknown as AuditLogger
+    const queue = new JobQueue({ audit })
+    const body: ReturnType<typeof cancellable> = cancellable(async () => body.release())
+    const ref = queue.submit('cloud.task.run', { user: 'root@pam', uid: 0 }, body.handler)
+    await settle()
+    await queue.cancel(ref.id, 'alice@pve')
+    await settle()
+    assert.equal(lines.length, 1)
+    assert.equal(lines[0].user, 'alice@pve')
+    assert.equal(lines[0].submittedBy, 'root@pam')
+    assert.match(lines[0].reason ?? '', /^cancelled by alice@pve at /)
+  })
+
+  it('a CONTROL job runs at once, even with every slot held', async () => {
+    const queue = new JobQueue({ concurrency: 1 })
+    queue.submit('cloud.task.run', { user: 'u', uid: 0 }, forever)
+    const queued = queue.submit('cloud.task.run', { user: 'u', uid: 0 }, forever)
+    const control = queue.submit('job.cancel', { user: 'u', uid: 0 }, noop, { control: true })
+    await settle()
+    assert.equal(queue.get(queued.id)?.status, 'queued', 'the ordinary job still waits for the slot')
+    assert.equal(queue.get(control.id)?.status, 'completed', 'the control job did not')
+    assert.equal(queue.get(queued.id)?.status, 'queued', 'and it never consumed the slot')
   })
 })

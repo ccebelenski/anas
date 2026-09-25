@@ -6,6 +6,7 @@ import type {
   ExecStreamResult,
   ExecStreamTarget,
   PipelineResult,
+  SpawnedChild,
 } from './types.js'
 
 /** A canned response for a specific command + args pattern. */
@@ -30,6 +31,25 @@ export interface MockFixture {
    * can only reach it by suppressing the tee here.
    */
   teeStderr?: boolean
+  /**
+   * rclone.5 — a LIVE child: the call does not resolve until the child is
+   * stopped by a signal (or {@link MockExecutor.finishLive}), and a caller that
+   * passed `onSpawn` gets a handle whose `kill` the mock records in
+   * {@link MockExecutor.signals}. This is how a cancel test drives the SIGINT
+   * ladder without a real process.
+   */
+  live?: MockLiveChild
+}
+
+/** How a {@link MockFixture.live} child answers signals. */
+export interface MockLiveChild {
+  /**
+   * How many signals it takes to stop the child (default 1). `Infinity` = a
+   * child that ignores every signal — the "run continues" case.
+   */
+  signalsToExit?: number
+  /** What the call resolves with once a signal stops it (default: SIGINT death). */
+  onSignal?: ExecResult
 }
 
 /** A canned response for a specific pipeline (cmd1 | cmd2) pattern. */
@@ -92,6 +112,13 @@ export class MockExecutor implements CommandExecutor {
   /** Every execToStream() call, in order — argv AND the target descriptor. */
   readonly streamCalls: MockStreamCall[] = []
 
+  /** Every signal sent to a live child through its `onSpawn` handle, in order. */
+  readonly signals: { pid: number, signal: string }[] = []
+
+  /** Live children still running, by pid — {@link finishLive} ends them. */
+  private readonly liveChildren = new Map<number, (result: ExecResult) => void>()
+  private nextPid = 4000
+
   /** Register a fixture. More specific matches (with args) take priority. */
   addFixture(fixture: MockFixture): this {
     this.fixtures.push(fixture)
@@ -118,6 +145,65 @@ export class MockExecutor implements CommandExecutor {
     this.calls.length = 0
     this.pipelineCalls.length = 0
     this.streamCalls.length = 0
+    this.signals.length = 0
+  }
+
+  /**
+   * End every live child still running with `result` (default exit 0) — the
+   * "it finished on its own" branch of a cancel test.
+   */
+  finishLive(result: ExecResult = { stdout: '', stderr: '', exitCode: 0 }): void {
+    for (const [pid, end] of [...this.liveChildren]) {
+      this.liveChildren.delete(pid)
+      end(result)
+    }
+  }
+
+  /**
+   * A live child: replay the fixture's stderr (the progress so far), hand the
+   * caller a signal handle, and resolve only when enough signals arrived or
+   * the test finishes it.
+   */
+  private liveExec(fixture: MockFixture & { live: MockLiveChild }, opts?: ExecOptions): Promise<ExecResult> {
+    const pid = this.nextPid++
+    const needed = fixture.live.signalsToExit ?? 1
+    const stopped: ExecResult = fixture.live.onSignal
+      ?? { stdout: '', stderr: '', exitCode: 1, signal: 'SIGINT' }
+    return new Promise<ExecResult>((resolve) => {
+      let gone = false
+      let received = 0
+      let markExit: () => void = () => {}
+      const exit = new Promise<void>((r) => {
+        markExit = r
+      })
+      const end = (result: ExecResult): void => {
+        if (gone)
+          return
+        gone = true
+        this.liveChildren.delete(pid)
+        markExit()
+        resolve(result)
+      }
+      this.liveChildren.set(pid, end)
+      const initial = this.resultOf(fixture)
+      if (initial.stderr && opts?.onStderr && fixture.teeStderr !== false)
+        opts.onStderr(initial.stderr)
+      const child: SpawnedChild = {
+        pid,
+        kill: (signal) => {
+          if (gone)
+            return false
+          this.signals.push({ pid, signal })
+          received++
+          if (received >= needed)
+            end(stopped)
+          return true
+        },
+        exited: () => gone,
+        exit,
+      }
+      opts?.onSpawn?.(child)
+    })
   }
 
   async exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
@@ -134,14 +220,13 @@ export class MockExecutor implements CommandExecutor {
         && f.args.length === args.length
         && f.args.every((a, i) => a === args[i]),
     )
-    if (exactMatch)
-      return this.tee(this.resultOf(exactMatch), exactMatch, opts)
-
-    const commandMatch = this.fixtures.find(
+    const match = exactMatch ?? this.fixtures.find(
       f => f.command === command && f.args === undefined,
     )
-    if (commandMatch)
-      return this.tee(this.resultOf(commandMatch), commandMatch, opts)
+    if (match?.live)
+      return this.liveExec({ ...match, live: match.live }, opts)
+    if (match)
+      return this.tee(this.resultOf(match), match, opts)
 
     return {
       stdout: '',

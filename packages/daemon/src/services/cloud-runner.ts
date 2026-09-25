@@ -1,5 +1,5 @@
 import type { AhrPool, BackupArchiveConsistency, CloudSyncRunResult, CloudSyncTask } from '@anas/shared'
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, SpawnedChild } from '../executor/types.js'
 import type { BackupSnapshotOptions, TakenSnapshot } from './backup-snapshots.js'
 import type { RcloneConfigPaths } from './rclone-config.js'
 import { readdir, stat } from 'node:fs/promises'
@@ -427,6 +427,11 @@ export interface CloudRunDeps {
    * structural backstop that would fire if that ever stopped being true.
    */
   secrets?: string[]
+  /**
+   * rclone.5 — handed the rclone child the moment it spawns, so the job's
+   * cancel hook ({@link ChildCancel}) can signal it. Absent = not cancellable.
+   */
+  onSpawn?: (child: SpawnedChild) => void
 }
 
 /**
@@ -515,8 +520,8 @@ export async function runCloudSync(
 
     updateProgress(`rclone ${task.mode} ${plan.source} -> ${destination}`)
     const run = plan.pool
-      ? await withTopLevelMounts(executor, [plan.pool], async () => execRclone(executor, args, task.mode, updateProgress), deps.snapshotOptions)
-      : await execRclone(executor, args, task.mode, updateProgress)
+      ? await withTopLevelMounts(executor, [plan.pool], async () => execRclone(executor, args, task.mode, updateProgress, deps.onSpawn), deps.snapshotOptions)
+      : await execRclone(executor, args, task.mode, updateProgress, deps.onSpawn)
 
     if (!rcloneRunCompleted(run.exitCode))
       throw new Error(rcloneFailureMessage(task.mode, run.exitCode, run.log))
@@ -639,8 +644,9 @@ async function execRclone(
   args: string[],
   mode: string,
   updateProgress: (message: string) => void,
+  onSpawn?: (child: SpawnedChild) => void,
 ): Promise<{ exitCode: number, log: RcloneLogState }> {
-  return execRcloneLog(executor, RCLONE, args, stats => updateProgress(statsProgressLine(mode, stats)))
+  return execRcloneLog(executor, RCLONE, args, stats => updateProgress(statsProgressLine(mode, stats)), onSpawn)
 }
 
 /**
@@ -655,9 +661,11 @@ export async function execRcloneLog(
   command: string,
   args: string[],
   onStats?: (stats: RcloneStats) => void,
+  onSpawn?: (child: SpawnedChild) => void,
 ): Promise<{ exitCode: number, log: RcloneLogState }> {
   const reader = new RcloneLogReader()
   const r = await executor.exec(command, args, {
+    ...(onSpawn ? { onSpawn } : {}),
     // See RCLONE_MAX_BUFFER for the arithmetic. The tee means stderr is NOT
     // retained beyond the executor's bounded tail — a 15-day run's stats log
     // never accumulates in the daemon.

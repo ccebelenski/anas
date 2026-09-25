@@ -7,6 +7,8 @@ import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { CloudSyncTask as CloudSyncTaskSchema } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
+import { ChildCancel } from '../../jobs/child-cancel.js'
+import { JobQueue } from '../../jobs/queue.js'
 import {
   buildRcloneArgs,
   emptySourceRefusal,
@@ -536,6 +538,35 @@ describe('runCloudSync — the transient snapshot', () => {
       await assert.rejects(runCloudSync(h.mock, deps(h), () => {}), /exit 7/)
       const zfsArgs = h.mock.calls.filter(c => c.command === ZFS).map(c => c.args.join(' '))
       assert.ok(zfsArgs.includes(`destroy -r tank/pictures@${LABEL}`), 'the finally runs on a failure too')
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('rclone.5: a CANCEL stops rclone with SIGINT, the job ends `cancelled`, and the transient is STILL destroyed', async () => {
+    const h = await zfsHarness()
+    try {
+      h.mock.addFixture({ command: RCLONE, result: { stdout: '', stderr: `${statsLine()}\n`, exitCode: 0 }, live: {} })
+      const queue = new JobQueue()
+      const ref = queue.submit('cloud.task.run', { user: 'root@pam', uid: 0, params: { task: 'offsite', direct: true } }, async (progress, ctx) => {
+        const cancel = new ChildCancel(ctx, 'rclone', { subject: 'Cloud sync task \'offsite\'' }, { waitMs: 50 })
+        return runCloudSync(h.mock, deps(h, { onSpawn: cancel.onSpawn }), progress)
+      })
+      for (let i = 0; i < 200 && !h.mock.calls.some(c => c.command === RCLONE); i++)
+        await new Promise(r => setTimeout(r, 5))
+      assert.match(queue.get(ref.id)?.progress ?? '', /1048576 of 4194304 bytes/, 'progress from the live stats')
+
+      await queue.cancel(ref.id, 'alice@pve')
+      for (let i = 0; i < 200 && queue.get(ref.id)?.status === 'running'; i++)
+        await new Promise(r => setTimeout(r, 5))
+
+      assert.deepEqual(h.mock.signals.map(s => s.signal), ['SIGINT'])
+      const job = queue.get(ref.id)!
+      assert.equal(job.status, 'cancelled')
+      assert.match((job.result as { reason: string }).reason, /^cancelled by alice@pve at /)
+      const zfsArgs = h.mock.calls.filter(c => c.command === ZFS).map(c => c.args.join(' '))
+      assert.ok(zfsArgs.includes(`destroy -r tank/pictures@${LABEL}`), 'the finally runs on a cancel too')
     }
     finally {
       await h.cleanup()

@@ -188,6 +188,74 @@
         return (abs ? abs + ' — ' : '') + t('open Details for the recent runs');
     };
 
+    // ---- Cancel run (rclone.5 — the Cloud Sync and Backup grids) -----------
+    //
+    // ONE door for both grids (parallel construction). The daemon owns every
+    // word of the dialog: its 409 carries the headline (task, elapsed time,
+    // progress) and the consequence sentence as `warnings`, which the standard
+    // confirmAndRun window shows under the intro. The window form — not a plain
+    // Yes/No — puts "Keep running" on Enter, so a mis-click on a long run is
+    // caught by the dialog. The runner exits within one poll (10 s) after the
+    // job ends, so the grid reloads once on completion and once more after
+    // that window for the row's cancelled pill.
+    sched.CANCEL_RELOAD_MS = 12000;
+
+    // A running row is cancellable only while the daemon names its direct job.
+    sched.cancellable = function (rec) {
+        return !!rec && rec.get('lastRunResult') === 'running' && !!rec.get('runningJobId');
+    };
+
+    // opts: node, jobId, name (task), view (the grid — polls stop if it is
+    //       destroyed), reload()
+    sched.cancelRun = function (opts) {
+        if (!opts || !opts.jobId) {
+            return;
+        }
+        var reload = typeof opts.reload === 'function' ? opts.reload : function () {};
+        function reloadTwice() {
+            reload();
+            setTimeout(reload, sched.CANCEL_RELOAD_MS);
+        }
+        ANAS.confirmAndRun({
+            node: opts.node,
+            method: 'post',
+            path: '/jobs/' + encodeURIComponent(opts.jobId) + '/cancel',
+            body: {},
+            view: opts.view,
+            // Two SIGINTs 10 s apart is the daemon's worst case before it
+            // answers; the poll must outlast it.
+            maxMs: 45000,
+            confirmWindow: true,
+            confirmTitle: t('Cancel run'),
+            confirmCls: 'anas-win-cancel-run',
+            confirmIntro: enc(t('Stop this run where it is?')),
+            confirmButtonText: t('Cancel run'),
+            confirmButtonCls: 'anas-btn-cancel-run-confirm',
+            cancelButtonText: t('Keep running'),
+            confirmWidth: 520,
+            failTitle: t('Cancel failed'),
+            onComplete: function () {
+                ANAS.toast(t('Run cancelled') + ': ' + (opts.name || ''));
+                reloadTwice();
+            },
+            onFailed: function () {
+                reload();
+            },
+        });
+    };
+
+    // The Last run cell of a cancelled run: a neutral pill (a cancel is what
+    // the operator asked for — never the failure colour), the daemon's
+    // "cancelled by <user> at <time>" as the tooltip, or the time alone once
+    // the journal no longer holds the line.
+    sched.cancelledPill = function (rec) {
+        var at = rec ? rec.get('lastRunAt') : null;
+        var note = rec ? ('' + (rec.get('lastRunNote') || '')) : '';
+        var abs = sched.absTime(at);
+        var tip = note || (t('cancelled') + (abs ? ' ' + abs : ''));
+        return sched.pillHtml(t('cancelled'), 'var(--anas-muted,gray)', tip);
+    };
+
     // ---- Visibility-gated poll loop (no leaked intervals) ------------------
     // Each view supplies its own `refresh(quiet)` closure (which grids to reload);
     // this owns the interval + the visibilitychange handler, stored on the view so

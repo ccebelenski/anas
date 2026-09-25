@@ -113,6 +113,17 @@ export type BackupCadence = TaskCadence
 export const BACKUP_SKIP_EXIT_CODE = 75
 
 /**
+ * Exit status a task runner uses when the daemon job it polled ended
+ * `cancelled` (rclone.5) — 128 + SIGINT, the shell's own spelling of "stopped
+ * by an interrupt". The unit does NOT declare it as `SuccessExitStatus=`, so
+ * systemd records the run as failed (`Result=exit-code`); the task status
+ * derivation reads `ExecMainStatus` and reports `cancelled`, never `failure`,
+ * and the dashboard never warns on it. Shared by every task runner so the
+ * runner and the derivation cannot disagree about the number.
+ */
+export const TASK_CANCELLED_EXIT_CODE = 130
+
+/**
  * The run-result `status` a gated (off-week) fire reports. It travels daemon job
  * → runner stdout → journald → the Run-Now supervisor, which is why the three of
  * them share this one spelling rather than three string literals.
@@ -1269,9 +1280,13 @@ export type BackupRunRequest = z.infer<typeof BackupRunRequest>
  * never fired — yet the same default-valued `Result=success` still reads as a
  * successful run that never happened. Also ADDITIVE (version skew: an older
  * daemon that predates it never sends the value).
+ *
+ * `cancelled` (rclone.5, ADDITIVE) is a run an operator stopped from the
+ * toolbar: the runner exits {@link TASK_CANCELLED_EXIT_CODE} and the
+ * derivation maps that exit here, so the row reads cancelled and never failed.
  */
 export const BackupRunResult
-  = z.enum(['success', 'failure', 'running', 'skipped', 'unknown', 'disabled', 'never-run'])
+  = z.enum(['success', 'failure', 'running', 'skipped', 'unknown', 'disabled', 'never-run', 'cancelled'])
 export type BackupRunResult = z.infer<typeof BackupRunResult>
 
 /** A task grid entry: the task + its LOCAL-ONLY runtime status. */
@@ -1288,6 +1303,10 @@ export const BackupTaskEntry = z.object({
    * executes (see CloudSyncTaskView.runningProgress). ADDITIVE/optional.
    */
   runningProgress: z.string().optional(),
+  /** rclone.5 — the running direct job's id (see CloudSyncTaskView.runningJobId). ADDITIVE/optional. */
+  runningJobId: z.string().optional(),
+  /** rclone.5 — "cancelled by <user> at <time>" for a cancelled last run (see CloudSyncTaskView.lastRunNote). */
+  lastRunNote: z.string().optional(),
   /**
    * backup2.9 — for a BLOCK task: the LUN's human NAME, resolved LIVE from the
    * iSCSI read layer. The stored task carries only the `{ targetIqn, index }`
@@ -1318,6 +1337,10 @@ export const BackupTaskDetail = z.object({
   overdue: z.boolean(),
   /** The running direct run's live progress text while one executes (ADDITIVE/optional). */
   runningProgress: z.string().optional(),
+  /** rclone.5 — the running direct job's id (ADDITIVE/optional). */
+  runningJobId: z.string().optional(),
+  /** rclone.5 — "cancelled by <user> at <time>" for a cancelled last run (ADDITIVE/optional). */
+  lastRunNote: z.string().optional(),
   /** The .service unit file, verbatim. */
   unit: z.string(),
   /** The .timer unit file, verbatim. */

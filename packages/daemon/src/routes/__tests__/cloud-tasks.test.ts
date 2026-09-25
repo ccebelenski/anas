@@ -408,6 +408,63 @@ describe('cloud sync task routes (rclone.2)', () => {
       )
     })
 
+    it('rclone.5: Cancel run through the API — 409 headline, SIGINT on the replay, the run ends `cancelled`, no notification', async () => {
+      await writeFile(join(srcDir, 'a.jpg'), 'x', 'utf-8')
+      await createTask({ source: srcDir, notify: 'always' })
+      const mock = mockOf(server)
+      mock.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
+      // rclone as a LIVE child: its progress so far, then it runs until SIGINT.
+      mock.addFixture({
+        command: RCLONE,
+        result: { stdout: '', stderr: `${JSON.stringify({ level: 'info', msg: 'stats', stats: { bytes: 1203, totalBytes: 9800, transfers: 3, checks: 0, deletes: 0, errors: 0, elapsedTime: 30, eta: 60 } })}\n`, exitCode: 0 },
+        live: { onSignal: { stdout: '', stderr: '', exitCode: 1, signal: 'SIGINT' } },
+      })
+      // The unit is mid-run, so the grid names the job to cancel.
+      mock.addFixture({
+        command: SYSTEMCTL,
+        args: ['show', 'anas-cloud-offsite.service', '-p', 'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp'],
+        result: { stdout: 'ActiveState=active\n', stderr: '', exitCode: 0 },
+      })
+      mock.calls.length = 0
+
+      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: { direct: true } })
+      const runId = (res.json() as JobAccepted).job.id
+      for (let i = 0; i < 200 && !mock.calls.some(c => c.command === RCLONE && (c.args[0] === 'copy' || c.args[0] === 'sync')); i++)
+        await new Promise(r => setTimeout(r, 5))
+
+      const list = await server.inject({ method: 'GET', url: '/v1/cloud/tasks', headers: IDENTITY })
+      const row = (list.json() as { data: CloudSyncTaskView[] }).data.find(t => t.name === 'offsite')
+      assert.equal(row?.runningJobId, runId, 'the grid names the direct job Cancel run targets')
+      assert.match(row?.runningProgress ?? '', /1203 of 9800 bytes/)
+
+      const first = await server.inject({ method: 'POST', url: `/v1/jobs/${runId}/cancel`, headers: IDENTITY })
+      assert.equal(first.statusCode, 409)
+      const err = (first.json() as { error: { message: string, warnings: string[] } }).error
+      assert.match(err.message, /^Cloud sync task 'offsite' has been running for \d+ s — copy: 1203 of 9800 bytes, 3 transferred, 0 checked, 0 deleted, 0 errors, ETA 60s; cancelling stops it here$/)
+      assert.equal(err.warnings[1], 'Files already copied stay at the destination. A sync run stopped part-way leaves the destination between two states until the next run completes.')
+      assert.equal(mock.signals.length, 0, 'nothing signalled before the confirmation')
+
+      const confirm = await server.inject({
+        method: 'POST',
+        url: `/v1/jobs/${runId}/cancel`,
+        headers: { ...IDENTITY, 'x-anas-request-id': randomUUID(), 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) },
+      })
+      assert.equal(confirm.statusCode, 202, confirm.body)
+      assert.equal((await waitForJob(server, (confirm.json() as JobAccepted).job.id)).status, 'completed')
+
+      let run: Job | undefined
+      for (let i = 0; i < 100; i++) {
+        run = ((await server.inject({ method: 'GET', url: `/v1/jobs/${runId}`, headers: IDENTITY })).json() as { job: Job }).job
+        if (run.status !== 'running')
+          break
+        await new Promise(r => setTimeout(r, 5))
+      }
+      assert.equal(run?.status, 'cancelled')
+      assert.match((run?.result as { reason: string }).reason, /^cancelled by root@pam at /)
+      assert.deepEqual(mock.signals.map(s => s.signal), ['SIGINT'])
+      assert.equal(mock.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'a cancel never notifies')
+    })
+
     it('a DIRECT run never re-enters systemctl — the recursion guard', async () => {
       await createTask({ source: '/nonexistent/source' })
       const before = mockOf(server).calls.filter(c => c.command === SYSTEMCTL).length
