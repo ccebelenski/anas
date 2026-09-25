@@ -1000,6 +1000,11 @@ function makeAnas(routes) {
         confirmWindow: !!cfg.confirmWindow,
         extraItems: cfg.extraItems,
         mapConfirm: cfg.mapConfirm,
+        // The titles 10-api.js puts on the failure modal and the success
+        // toast (same contract as the runJob stub) — a confirm-gated verb left
+        // on the bare "Operation failed" default would lose its identity.
+        failTitle: cfg.failTitle,
+        successMsg: cfg.successMsg,
         onComplete: cfg.onComplete,
         onFailed: cfg.onFailed,
       })
@@ -13166,6 +13171,129 @@ async function ahrCacheDetachChecks() {
   ok('cache(detach failed): nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
+/**
+ * ahrcache.1 slice 2 — the Remount verb: the read-only aftermath the
+ * automatic uncache CANNOT fix (a write during the failure window makes btrfs
+ * refuse `remount,rw`; only umount + mount restores writes).
+ *
+ * Gated on the pool record's `mountedReadOnly` FIELD, never the state badge —
+ * the ladder lets failed/offline outrank readonly, so a badge gate would hide
+ * the verb exactly when it is needed (gtrofail below is degraded AND
+ * read-only, and still offers it). Confirm-coded against
+ * POST /ahr/:name/remount, whose 409 gate names the open-handle cost; a
+ * FAILED cache in front of the volume is not offered at all (the route 409s
+ * until it is detached); the grid AND the open detail reload on success AND
+ * failure.
+ *
+ * The verb's RESOLUTION — method post, path /ahr/:name/remount, the route
+ * confirm-gated — is pinned by confirmDoorGuardChecks' source-level
+ * "every confirmAndRun verb resolves to a real daemon route" and "no verb
+ * against an UN-GATED route" checks (they would fail by themselves if the
+ * verb drifted off-route or onto an un-gated one).
+ */
+// The daemon's shared clause (AHR_READONLY_CLAUSE) under its advisory subject
+// — what GET /ahr carries exactly when a pool is mounted read-only
+// (ahr-topology.ts), quoted so the detail check reads the daemon's own
+// sentence, not a paraphrase.
+const READONLY_ADVISORY = "pool 'gtro' is mounted READ-ONLY — btrfs is protecting itself after an I/O error; writes are stopped until the pool is remounted (Remount, in the Hybrid RAID view). Diagnose the cause first — a read-only pool is a symptom, not the fault"
+const RO_CLAUSE = 'writes are stopped until the pool is remounted'
+
+async function ahrRemountChecks() {
+  const rows = [
+    ahrCacheRow('gtold'), // older daemon — no mountedReadOnly field
+    ahrCacheRow('gtclean', { cache: CACHE_ABSENT }), // read-write
+    ahrCacheRow('gtro', { state: 'readonly', mountedReadOnly: true, cache: CACHE_HEALTHY, advisories: [READONLY_ADVISORY] }),
+    ahrCacheRow('gtroabsent', { state: 'readonly', mountedReadOnly: true, cache: CACHE_ABSENT }),
+    // read-only AND degraded — the badge says something else, the FIELD says
+    // read-only, and the verb is offered (the whole point of the field).
+    ahrCacheRow('gtrofail', { state: 'degraded', mountedReadOnly: true, cache: CACHE_FAILED }),
+  ]
+  const routes = { 'GET /ahr': { data: rows } }
+  for (const r of rows) { routes['GET /ahr/' + r.name] = { data: r } }
+  const { grid } = await openAhrCacheView(rows, routes)
+  if (!grid) { return }
+
+  const rowOf = name => grid.getStore().findExact('name', name)
+  const remount = () => grid.down('#remount')
+  ok('remount: the toolbar carries the verb', !!remount())
+
+  // ---- visibility / enablement matrix --------------------------------------
+  grid.selectRow(rowOf('gtold'))
+  ok('remount: an older daemon (no mountedReadOnly field) hides the verb',
+    remount().hidden === true)
+  grid.selectRow(rowOf('gtclean'))
+  ok('remount: a read-write pool hides the verb', remount().hidden === true)
+  grid.selectRow(rowOf('gtro'))
+  let st = toolbar(grid, ['remount'])
+  ok('remount: a read-only pool with a healthy cache offers it',
+    remount().hidden === false && st.remount.disabled === false)
+  ok('remount: …with no leftover reason', st.remount.tip === '', st.remount.tip)
+  grid.selectRow(rowOf('gtroabsent'))
+  st = toolbar(grid, ['remount'])
+  ok('remount: a read-only pool with an ABSENT cache offers it too',
+    remount().hidden === false && st.remount.disabled === false)
+  grid.selectRow(rowOf('gtrofail'))
+  st = toolbar(grid, ['remount'])
+  ok('remount: a read-only + FAILED-cache pool is NOT offered — the route 409s until the cache is detached',
+    remount().hidden === false && st.remount.disabled === true)
+  ok('remount: …the reason rides the button, not a silent grey-out',
+    /Detach the failed cache first/.test(st.remount.tip), st.remount.tip)
+  ok('remount: a degraded badge does not hide the verb — the FIELD gates it',
+    remount().hidden === false)
+
+  // ---- the verb itself: confirm-coded, POSTing the remount route -----------
+  grid.selectRow(rowOf('gtro'))
+  await detailHtmlOf(grid, 'gtro') // the open detail must reload too
+  const before = ahrListGets()
+  const beforeDetail = ahrDetailGets('gtro')
+  jobs.length = 0
+  remount().handler(remount())
+  await settle()
+  // jobs[0].view is the grid (circular) — evidence is a flat subset.
+  ok('remount: it POSTs /ahr/gtro/remount through the job queue',
+    jobs.length === 1 && jobs[0].method === 'post' && jobs[0].path === '/ahr/gtro/remount',
+    JSON.stringify({ method: jobs[0] && jobs[0].method, path: jobs[0] && jobs[0].path }))
+  ok('remount: …under its own fail title', (jobs[0] || {}).failTitle === 'Remount failed',
+    (jobs[0] || {}).failTitle)
+  ok('remount: a completed job reloads the grid', ahrListGets() > before,
+    String(ahrListGets() - before))
+  ok('remount: …and the open detail', ahrDetailGets('gtro') > beforeDetail,
+    String(ahrDetailGets('gtro') - beforeDetail))
+
+  const beforeFail = ahrListGets()
+  const beforeFailDetail = ahrDetailGets('gtro')
+  if (jobs[0] && jobs[0].onFailed) {
+    jobs[0].onFailed({ error: { message:
+      `AHR pool 'gtro' still has a FAILED read cache in front of its volume: every read returns an I/O error until the cache is removed, and a remount would be forced read-only again by the first one. Detach the cache first (no data is lost — a writethrough cache holds no only copy), then Remount` } })
+    await settle()
+    ok('remount: a FAILED job reloads the grid too', ahrListGets() > beforeFail)
+    ok('remount: …and the open detail', ahrDetailGets('gtro') > beforeFailDetail)
+  } else {
+    ok('remount: onFailed reaches the poll', false, 'no onFailed recorded')
+  }
+
+  // ---- the detail's state line ---------------------------------------------
+  const ro = await detailHtmlOf(grid, 'gtro')
+  ok('remount(detail): the state line says writes are stopped until the pool is remounted',
+    ro.includes(RO_CLAUSE), ro.slice(0, 500))
+  ok('remount(detail): …exactly ONCE — the payload\'s own clause, no second copy',
+    (ro.match(new RegExp(RO_CLAUSE, 'g')) || []).length === 1,
+    String((ro.match(new RegExp(RO_CLAUSE, 'g')) || []).length))
+  ok('remount(detail): it reuses the daemon\'s shared clause, which names the verb and the diagnosis',
+    /Diagnose the cause first/.test(ro) && /Remount/.test(ro))
+
+  const roAbsent = await detailHtmlOf(grid, 'gtroabsent')
+  ok('remount(detail): a payload WITHOUT the clause gets the short line, still exactly once',
+    (roAbsent.match(new RegExp(RO_CLAUSE, 'g')) || []).length === 1,
+    roAbsent.slice(0, 500))
+
+  const rw = await detailHtmlOf(grid, 'gtclean')
+  ok('remount(detail): a read-write pool says nothing', !rw.includes(RO_CLAUSE),
+    rw.slice(0, 400))
+
+  ok('remount: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
 /** The Disks grid's usage cell for a cache disk (GT-22: "<pool> / cache"). */
 function ahrCacheDisksChecks() {
   const ANAS = loadSource('40-disks.js', { 'GET /disks': { data: [] } })
@@ -13199,6 +13327,11 @@ jobs.length = 0
 confirmDoorGuardChecks()
 await ahrCacheDetachChecks()
 confirmAnswer = 'yes'
+
+warnings.length = 0
+created.windows.length = 0
+jobs.length = 0
+await ahrRemountChecks()
 
 warnings.length = 0
 created.windows.length = 0

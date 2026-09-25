@@ -17,6 +17,9 @@
  *   POST   /ahr/:name/scrub            → 202 { job }
  *   POST   /ahr/:name/cache            → 202 { job }   (attach read cache, ahrcache.1)
  *   DELETE /ahr/:name/cache            → 202 { job }   (detach read cache)
+ *   POST   /ahr/:name/remount          → 409 confirm → 202 { job }
+ *                                         (clear a btrfs forced-readonly mount,
+ *                                          ahrcache.1 slice 2)
  *   DELETE /ahr/:name                  → 409 confirm → 202 { job }
  *
  * Mutation handlers degrade to a clear "not available in this build" message
@@ -1032,10 +1035,33 @@
             : '';
     }
 
+    // ahrcache.1 slice 2 — the read-only aftermath as the detail's state
+    // line. The daemon already carries the shared clause in `advisories`
+    // (AHR_READONLY_CLAUSE, pushed exactly when the pool is mounted read-only)
+    // and the advisories block above renders it — so when the payload has it,
+    // this adds NOTHING: one sentence, once, in the daemon's own words. Only
+    // a payload that says read-only WITHOUT the advisory gets the short line
+    // here; the two never print together.
+    function readOnlyLineHtml(d) {
+        if (d.mountedReadOnly !== true) {
+            return '';
+        }
+        var adv = d.advisories || [];
+        for (var i = 0; i < adv.length; i++) {
+            if (adv[i].indexOf('writes are stopped until the pool is remounted') !== -1) {
+                return '';
+            }
+        }
+        return '<div style="font-size:12.5px;font-weight:700;color:var(--anas-warn);margin:2px 0 10px">'
+            + enc(t('read-only — writes are stopped until the pool is remounted (Remount)'))
+            + '</div>';
+    }
+
     function detailHtml(d) {
         return '<div class="anas-ahr-detail-body" style="padding:12px 14px;color:var(--anas-ink);'
             + 'font:12.5px/1.45 -apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif">'
             + headerHtml(d)
+            + readOnlyLineHtml(d)
             + advisoriesHtml(d)
             + pendingHtml(d)
             + bandBarsSection(d)
@@ -1693,17 +1719,23 @@
                     ? t('The pool\'s volume is not assembled — bring it online first, the cache is released by uncache')
                     : (!detachable ? t('This pool has no read cache to detach') : '')));
         }
-        // The Remount verb goes HERE. Its daemon side shipped with ahrcache.1
-        // slice 2 — POST /v1/ahr/:name/remount, confirm-coded (unmount + mount:
-        // btrfs refuses `remount,rw` after an I/O error, so open share handles
-        // break and the operator has to say so). Gate the button on the pool
-        // record's `mountedReadOnly`, NOT on `state === 'readonly'`: the state
-        // ladder lets `failed`/`offline` outrank `readonly`, which would hide
-        // the verb exactly when a pool is read-only AND something else. The
-        // route also 409s while `cache.state === 'failed'` (detach first), so
-        // that case wants the tooltip rather than a live button. A daemon that
-        // omits `mountedReadOnly` is an older one — no field, no button.
-        // Not built in slice 2; this is the follow-up's marker.
+        // Remount (ahrcache.1 slice 2): offered only for a selected pool whose
+        // record carries `mountedReadOnly === true` — the FIELD, not the state
+        // badge (the ladder lets failed/offline outrank readonly, which would
+        // hide the verb exactly when it is needed). A daemon that omits the
+        // field is an older one — no field, no button. A FAILED cache in front
+        // of the volume 409s at the route (detach first), so that shape is
+        // disabled with the reason on the button rather than offered.
+        var remountBtn = grid.down('#remount');
+        if (remountBtn) {
+            var readOnly = has && sel[0].get('mountedReadOnly') === true;
+            var cacheFailed = !!(cache && cache.state === 'failed');
+            remountBtn.setHidden(!readOnly);
+            remountBtn.setDisabled(!readOnly || cacheFailed);
+            remountBtn.setTooltip(readOnly && cacheFailed
+                ? t('Detach the failed cache first — the route refuses until then')
+                : '');
+        }
         // Re-add appears only when a member is faulty/missing (11.9).
         var readdBtn = grid.down('#readd');
         if (readdBtn) {
@@ -2382,6 +2414,54 @@
         } catch (e) {
             ANAS.warn('ahr cache detach confirm failed: ' + ANAS.errText(e));
         }
+    }
+
+    // Remount (ahrcache.1 slice 2, AHR-DESIGN §13): the read-only aftermath
+    // the automatic uncache CANNOT fix — a pool that took a WRITE during the
+    // failure window is btrfs-forced read-only, `mount -o remount,rw` is
+    // refused after an error, and only umount + mount restores writes.
+    //
+    // Confirm-coded on purpose, unlike the cache verbs: the unmount breaks
+    // every open handle on the filesystem — SMB and NFS clients, a backup
+    // mid-run, a job reading a file — and the daemon's confirm gate says
+    // exactly that. Its 409 warnings (the open-handle sentence, the
+    // only-way-back sentence, the diagnose-first sentence) ride the confirm
+    // window like every other confirm-gated verb. A FAILED cache is not
+    // offered at all — the route 409s until it is detached (the button is
+    // disabled with the reason instead). Reloads grid AND the open detail on
+    // success AND failure, like the cache verbs (the pool's state changes
+    // under both outcomes).
+    function openRemount(grid, node) {
+        var pool = selectedPool(grid);
+        if (!pool) {
+            return;
+        }
+        var sel = grid.getSelection();
+        var c = (sel && sel.length) ? (sel[0].get('cache') || {}) : {};
+        if (c.state === 'failed') {
+            return; // disabled at the button too — the route 409s until the cache is detached
+        }
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'post',
+            path: '/ahr/' + encodeURIComponent(pool) + '/remount',
+            body: {},
+            view: grid,
+            confirmTitle: 'Remount pool',
+            confirmIntro: t('Remounting') + ' <b>' + enc(pool) + '</b> '
+                + t('unmounts and mounts its filesystem — open share handles break:'),
+            failTitle: 'Remount failed',
+            successMsg: t('Remount started on') + ' ' + pool,
+            onSubmitted: function () {
+                reloadAfterCacheJob(grid, node, pool);
+            },
+            onFailed: function () {
+                reloadAfterCacheJob(grid, node, pool);
+            },
+            onComplete: function () {
+                reloadAfterCacheJob(grid, node, pool);
+            },
+        });
     }
 
     function resumeExpansion(grid, node) {
@@ -3370,6 +3450,23 @@
                                 openDetachCache(btn.up('grid'), node);
                             },
                         },
+                        // ahrcache.1 slice 2 — the read-only aftermath (§13): a
+                        // pool that took a write during the failure window is
+                        // btrfs-forced read-only, cleared only by umount +
+                        // mount. Hidden unless the selected pool's record
+                        // carries `mountedReadOnly === true` (the field, never
+                        // the state badge); an older daemon omits the field,
+                        // and no field is no verb (gated in updateButtons).
+                        {
+                            text: t('Remount'),
+                            itemId: 'remount',
+                            cls: 'anas-btn-ahr-remount',
+                            iconCls: 'fa fa-sync',
+                            hidden: true,
+                            handler: function (btn) {
+                                openRemount(btn.up('grid'), node);
+                            },
+                        },
                         // 11.12: the snapshot manager — a grid verb like every
                         // other pool action. Live only for a §12 subvolume-
                         // layout pool; a flat pool keeps it disabled with the
@@ -3387,7 +3484,7 @@
                         {
                             text: t('Change mount…'),
                             itemId: 'changeMount',
-                            cls: 'anas-btn-ahr-remount',
+                            cls: 'anas-btn-ahr-change-mount',
                             iconCls: 'fa fa-folder-open-o',
                             disabled: true,
                             handler: function (btn) {
