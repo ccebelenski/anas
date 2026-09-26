@@ -110,7 +110,12 @@ async function createTaskViaApi(ctx: Awaited<ReturnType<typeof apiCtx>>): Promis
   }
 }
 
-/** POST the unsaved-dialog test door; the status is the assertion's business. */
+/**
+ * POST the unsaved-dialog test door and NORMALISE its two answer shapes: a
+ * 200 wraps the probe verdict in `data` ({ data: { verdict, message } }), a
+ * refusal carries `error.message` — reading one field across both shapes once
+ * read `undefined` on every success and made the assertion below vacuous.
+ */
 async function postRemoteTest(
   ctx: Awaited<ReturnType<typeof apiCtx>>,
   options: Record<string, string>,
@@ -121,7 +126,7 @@ async function postRemoteTest(
   const body = await res.json().catch(() => ({}))
   return {
     status: res.status(),
-    message: body?.error?.message,
+    message: body?.data?.message ?? body?.error?.message,
     verdict: body?.data?.verdict,
   }
 }
@@ -185,9 +190,12 @@ async function tokenInvalidText(dlg: Locator): Promise<string> {
 
 test.beforeAll(async () => {
   // ONCE per worker: down first (a crashed earlier run leaves units, a
-  // dataset and a user behind), then up. Neither touches the rclone store.
+  // dataset and a user behind) — best-effort, a wedged down must not mask the
+  // up failure — then up, which MUST succeed: a missing fixture means every
+  // test below would skip and the suite would read green while proving
+  // nothing, so an up failure fails the suite here.
   await execFileAsync(FIXTURE_SH, ['down']).catch(() => {})
-  await execFileAsync(FIXTURE_SH, ['up']).catch(() => {})
+  await execFileAsync(FIXTURE_SH, ['up'])
 })
 
 test.beforeEach(async () => {
@@ -212,6 +220,13 @@ test.describe.serial('cloud review-fix live proofs — token paste (rclone.1) + 
     try {
       if (ctx) {
         await ctx.delete(`${V1}/cloud/tasks/${TASK}`).catch(() => {})
+        // The task delete is a JOB — the remote delete refuses while the task
+        // still references it, so wait until it is really gone (the remote
+        // used to survive teardown as a leftover the next run inherited).
+        await expect.poll(async () => (await taskNames(ctx)).includes(TASK), {
+          timeout: 20_000,
+          message: 'the gtgate task is gone before the remote delete',
+        }).toBe(false)
         await ctx.delete(`${V1}/cloud/remotes/${REMOTE}`).catch(() => {})
         await ctx.dispose()
       }
@@ -287,14 +302,19 @@ test.describe.serial('cloud review-fix live proofs — token paste (rclone.1) + 
       expect(refused.message).toBe(OAUTH_TOKEN_ERROR)
 
       // The marker-wrapped paste is NOT a 400 — normalisation ran and the
-      // probe was served the bare object. Against Google with fake credentials
-      // the probe answers a (bounded) verdict; whatever it is, it is not the
-      // Go unmarshal error the verbatim paste produced.
+      // probe was served the bare object. Against Google with fake
+      // credentials the probe answers a VERDICT (ground truth 2026-09-26:
+      // verdict `auth`, message `Reason: authError, Message: Invalid
+      // Credentials`) — an auth-shaped sentence, never the Go unmarshal error
+      // the verbatim paste produced. The verdict is asserted DEFINED: this
+      // assertion used to sit behind `if (verdict !== undefined)` and read an
+      // always-undefined message, checking an empty string.
       const normalised = await postRemoteTest(ctx, { token: MARKER_PASTE })
-      expect(normalised.status, JSON.stringify(normalised)).not.toBe(400)
-      if (normalised.verdict !== undefined) {
-        expect(normalised.message ?? '').not.toContain('cannot unmarshal')
-      }
+      expect(normalised.status, JSON.stringify(normalised)).toBe(200)
+      expect(normalised.verdict, `verdict: ${JSON.stringify(normalised)}`).toBe('auth')
+      expect(normalised.message ?? '', `message: ${JSON.stringify(normalised)}`)
+        .toMatch(/Invalid Credentials|authError/)
+      expect(normalised.message ?? '').not.toContain('cannot unmarshal')
     }
     finally {
       await ctx.dispose()
