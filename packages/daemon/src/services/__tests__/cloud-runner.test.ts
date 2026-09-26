@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { CloudSyncTask as CloudSyncTaskSchema, stalledFor } from '@anas/shared'
+import { CLOUD_STATS_INTERVAL_SECS, CloudSyncTask as CloudSyncTaskSchema, stalledFor } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import { assertRunNotCancelled, ChildCancel } from '../../jobs/child-cancel.js'
 import { JobCancelledError, JobQueue } from '../../jobs/queue.js'
@@ -489,6 +489,82 @@ describe('cloud sync runner — the live run detail (rclone.6)', () => {
     assert.ok(expected)
     assert.equal(stalledFor(detail), expected.stalledSeconds)
   })
+
+  // --- The silence watch (2026-09-26 ground truth: a FROZEN rclone emits no
+  // stats objects at all, so the deltas alone never see it hang) ------------
+
+  it('the silence watch runs at the stats cadence, and ticks with stats between them append nothing', () => {
+    const tracker = new CloudRunDetailTracker(new Date('2026-09-25T07:00:00.000Z'))
+    const fake = new FakeTimer()
+    const published: import('@anas/shared').CloudRunDetail[] = []
+    tracker.start(() => published.push(tracker.detail()), fake)
+    assert.equal(fake.ms, CLOUD_STATS_INTERVAL_SECS * 1000, 'the watch ticks at the stats cadence, not its own')
+    const base = RUN_STATS[0]
+    tracker.onStats({ ...base, bytes: 0, elapsedTime: 0 }, new Date('2026-09-25T07:00:01.000Z'))
+    fake.tick()
+    tracker.onStats({ ...base, bytes: 1000000, elapsedTime: 5 }, new Date('2026-09-25T07:00:06.000Z'))
+    fake.tick()
+    tracker.onStats({ ...base, bytes: 2000000, elapsedTime: 10 }, new Date('2026-09-25T07:00:11.000Z'))
+    fake.tick()
+    const detail = tracker.detail()
+    assert.deepEqual(detail.speedSamples, [200000, 200000], 'the derived samples only — no extra zeros')
+    assert.equal(detail.speed, 200000)
+    assert.equal(published.length, 0, 'a heard tick publishes nothing — the stats object already did')
+  })
+
+  it('a 20 s silence after the last stats object appends three zero samples and reads stalled', () => {
+    const tracker = new CloudRunDetailTracker(new Date('2026-09-25T07:00:00.000Z'))
+    const fake = new FakeTimer()
+    tracker.start(undefined, fake)
+    const base = RUN_STATS[0]
+    tracker.onStats({ ...base, bytes: 1000000, elapsedTime: 5 }, new Date('2026-09-25T07:00:05.000Z'))
+    fake.tick() // the interval the stats object arrived in — heard, nothing appended
+    fake.tick() // 10 s of silence
+    fake.tick() // 15 s
+    fake.tick() // 20 s
+    const detail = tracker.detail()
+    assert.deepEqual(detail.speedSamples, [0, 0, 0], 'one zero sample per silent interval')
+    assert.equal(detail.speed, 0, 'the silence reads as zero throughput, not the last number forever')
+    assert.equal(detail.bytes, 1000000, 'the counters stand as the stats object left them')
+    assert.equal(detail.transferring.length, base.transferring.length, 'so does the in-flight set')
+    assert.equal(detail.lastStatsAt, '2026-09-25T07:00:05.000Z', 'a silent tick does not touch lastStatsAt')
+    assert.equal(stalledFor(detail), 15, 'three silent intervals fire the same stalled rule')
+  })
+
+  it('a stats object arriving 2 s after a tick yields one sample for that interval, not two', () => {
+    const tracker = new CloudRunDetailTracker(new Date('2026-09-25T07:00:00.000Z'))
+    const fake = new FakeTimer()
+    tracker.start(undefined, fake)
+    const base = RUN_STATS[0]
+    tracker.onStats({ ...base, bytes: 0, elapsedTime: 0 }, new Date('2026-09-25T07:00:00.000Z'))
+    fake.tick() // heard — the tick appends nothing
+    tracker.onStats({ ...base, bytes: 1000000, elapsedTime: 7 }, new Date('2026-09-25T07:00:07.000Z'))
+    fake.tick() // heard again — the stats object's own sample covers the interval
+    const detail = tracker.detail()
+    assert.equal(detail.speedSamples.length, 1, 'one sample for one interval of time')
+    assert.equal(detail.speedSamples[0], 1000000 / 7)
+  })
+
+  it('lastStatsAt rides the detail: absent before the first stats object, the last one after', () => {
+    const tracker = new CloudRunDetailTracker()
+    assert.equal('lastStatsAt' in tracker.detail(), false, 'nothing has arrived yet')
+    tracker.onStats({ ...RUN_STATS[0] }, new Date('2026-09-25T07:00:01.000Z'))
+    tracker.onStats({ ...RUN_STATS[1] }, new Date('2026-09-25T07:00:06.000Z'))
+    assert.equal(tracker.detail().lastStatsAt, '2026-09-25T07:00:06.000Z')
+  })
+
+  it('stop() ends the watch: a tick after it neither publishes nor appends', () => {
+    const tracker = new CloudRunDetailTracker()
+    const fake = new FakeTimer()
+    const published: import('@anas/shared').CloudRunDetail[] = []
+    tracker.start(() => published.push(tracker.detail()), fake)
+    tracker.onStats({ ...RUN_STATS[0], bytes: 0, elapsedTime: 0 })
+    tracker.stop()
+    assert.ok(fake.cleared, 'clearInterval was called')
+    fake.tick()
+    assert.equal(published.length, 0, 'no publish after the run ended')
+    assert.deepEqual(tracker.detail().speedSamples, [], 'no sample after the run ended either')
+  })
 })
 
 describe('cloud sync runner — the exit-code policy', () => {
@@ -762,6 +838,42 @@ describe('runCloudSync — a live run', () => {
     }
   })
 
+  it('a silent interval during the run publishes a zeroed detail, and the watch dies with the run', async () => {
+    const h = await liveHarness()
+    try {
+      // A live child that never finishes on its own — the hung-rclone shape.
+      h.mock.addFixture({ command: RCLONE, result: { stdout: '', stderr: `${statsLine()}\n`, exitCode: 0 }, live: {} })
+      const fake = new FakeTimer()
+      const details: import('@anas/shared').CloudRunDetail[] = []
+      const run = runCloudSync(h.mock, deps(h, { onDetail: d => details.push(d), timer: fake }), () => {})
+      for (let i = 0; i < 200 && !h.mock.calls.some(c => c.command === RCLONE); i++)
+        await new Promise(r => setTimeout(r, 5))
+      assert.equal(details.length, 1, 'the stats object the child printed at spawn published one detail')
+
+      fake.tick() // the interval the stats object arrived in — heard
+      fake.tick() // 10 s: rclone has said nothing
+      fake.tick() // 15 s
+      fake.tick() // 20 s
+      assert.equal(details.length, 4, 'one publication per silent tick')
+      const stalled = details.at(-1)!
+      assert.deepEqual(stalled.speedSamples, [0, 0, 0], 'the silent intervals read as zero samples')
+      assert.equal(stalled.speed, 0)
+      assert.equal(stalledFor(stalled), 15, 'the viewer\'s stalled rule fires off the silence too')
+      assert.ok(!Number.isNaN(Date.parse(stalled.lastStatsAt ?? '')), 'lastStatsAt rides the live detail')
+
+      h.mock.finishLive({ stdout: '', stderr: '', exitCode: 0 })
+      const result = await run
+      assert.equal(result.status, 'success')
+      assert.ok(fake.cleared, 'the watch was cleared when the run ended')
+      const after = details.length
+      fake.tick()
+      assert.equal(details.length, after, 'no tick publishes anything after the exit')
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
   it('carries rclone\'s error lines on a completed-with-errors run', async () => {
     const h = await liveHarness()
     try {
@@ -991,6 +1103,30 @@ class OptsRecorder extends MockExecutor {
   override exec(command: string, args: string[], opts?: ExecOptions) {
     this.lastExecOpts = opts
     return super.exec(command, args, opts)
+  }
+}
+
+/**
+ * The silence watch's timer, hand-fired — a CloudRunDetailTimer whose tick()
+ * stands in for the wall clock, so the tests never wait out real 5 s rounds.
+ */
+class FakeTimer {
+  fn: (() => void) | null = null
+  ms = 0
+  cleared = false
+  setInterval(fn: () => void, ms: number): unknown {
+    this.fn = fn
+    this.ms = ms
+    return this
+  }
+
+  clearInterval(id: unknown): void {
+    if (id === this)
+      this.cleared = true
+  }
+
+  tick(): void {
+    this.fn?.()
   }
 }
 

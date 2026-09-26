@@ -516,6 +516,21 @@ export const RECENT_RING_CAP = 50
 export const SPEED_RING_CAP = 60
 
 /**
+ * The two timer faces the tracker's wall-clock watch needs, injectable so
+ * the tests fire ticks by hand instead of waiting out real 5 s intervals.
+ * The default is node's own timers.
+ */
+export interface CloudRunDetailTimer {
+  setInterval: (fn: () => void, ms: number) => unknown
+  clearInterval: (id: unknown) => void
+}
+
+const NODE_TIMER: CloudRunDetailTimer = {
+  setInterval: (fn, ms) => setInterval(fn, ms),
+  clearInterval: id => clearInterval(id as ReturnType<typeof setInterval>),
+}
+
+/**
  * Builds the {@link CloudRunDetail} a direct run job publishes on itself,
  * fed by the same log stream that drives the progress text: one
  * {@link onStats} per completed stats object, one {@link onEvent} per
@@ -526,6 +541,17 @@ export const SPEED_RING_CAP = 60
  * it on a stall, and its averaging loop stops 60 s after the transferring
  * set empties and never restarts (review batch A, 2026-09-25). The rings
  * are capped so a multi-day run's daemon heap stays flat.
+ *
+ * The sample stream has one blind spot, closed 2026-09-26: the deltas are
+ * per stats OBJECT, so a hung or frozen rclone — SIGSTOP'd, wedged on a
+ * dead socket — emits no objects at all, no samples arrive, and the
+ * trailing-zero count never grows. So the tracker also keeps a wall-clock
+ * timer at the stats cadence ({@link start}, called when the run's exec
+ * starts): a tick with no stats object since the previous one appends a 0
+ * sample and republishes the detail, so three silent intervals read stalled
+ * exactly like three unchanged stats objects. A tick that follows a stats
+ * object within the interval appends nothing — the object's own derived
+ * sample already stands for it.
  */
 export class CloudRunDetailTracker {
   private startedMs: number
@@ -539,6 +565,13 @@ export class CloudRunDetailTracker {
    */
   private readonly speedSamples: number[] = []
   private lastError: string | undefined
+  /** Wall-clock ms the last stats object arrived — `lastStatsAt`'s source. */
+  private lastStatsMs: number | null = null
+  private timerId: unknown = null
+  private timer: CloudRunDetailTimer | null = null
+  private publish: (() => void) | null = null
+  /** Whether a stats object arrived in the interval now closing. */
+  private heardSinceTick = false
 
   constructor(startedAt: Date = new Date()) {
     this.startedMs = startedAt.getTime()
@@ -549,10 +582,56 @@ export class CloudRunDetailTracker {
     return new Date(this.startedMs).toISOString()
   }
 
+  /**
+   * Start the silence watch at the stats cadence, handing it the publish
+   * callback so a silent tick can push the zeroed detail out. Called when
+   * the run's exec starts; idempotent-safe to call once.
+   */
+  start(publish?: () => void, timer: CloudRunDetailTimer = NODE_TIMER): void {
+    this.stop()
+    this.publish = publish ?? null
+    this.timer = timer
+    this.heardSinceTick = false
+    this.timerId = timer.setInterval(() => this.onTick(), CLOUD_STATS_INTERVAL_SECS * 1000)
+  }
+
+  /** Stop the watch — the run's `finally`, success, failure or throw alike. */
+  stop(): void {
+    if (this.timerId !== null)
+      this.timer?.clearInterval(this.timerId)
+    this.timerId = null
+    this.timer = null
+    this.publish = null
+  }
+
+  /**
+   * One wall-clock tick: no stats object since the previous tick means
+   * rclone said nothing for a whole interval — a silent process reads the
+   * same as a network stall, so a 0 sample stands for it and the detail is
+   * republished (counters and `transferring` stand as they were). A tick
+   * that follows a stats object within the interval appends nothing: the
+   * object's derived sample already covers it, and appending again would
+   * double-count one interval of time.
+   */
+  private onTick(): void {
+    if (this.timerId === null)
+      return // the watch is stopped — no tick may move a finished run's rings
+    const heard = this.heardSinceTick
+    this.heardSinceTick = false
+    if (heard)
+      return
+    this.speedSamples.push(0)
+    while (this.speedSamples.length > SPEED_RING_CAP)
+      this.speedSamples.shift()
+    this.publish?.()
+  }
+
   /** Feed one completed stats object (the counters + the sample ring). */
-  onStats(stats: RcloneStats): void {
+  onStats(stats: RcloneStats, at: Date = new Date()): void {
     const prev = this.latest
     this.latest = stats
+    this.lastStatsMs = at.getTime()
+    this.heardSinceTick = true
     if (prev) {
       const dElapsed = stats.elapsedTime - prev.elapsedTime
       const dBytes = stats.bytes - prev.bytes
@@ -619,6 +698,7 @@ export class CloudRunDetailTracker {
       transferring: s.transferring.map(f => ({ ...f })),
       recent: [...this.recent],
       speedSamples: [...this.speedSamples],
+      ...(this.lastStatsMs !== null ? { lastStatsAt: new Date(this.lastStatsMs).toISOString() } : {}),
     }
   }
 }
@@ -710,6 +790,11 @@ export interface CloudRunDeps {
    * built (the preview).
    */
   onDetail?: (detail: CloudRunDetail) => void
+  /**
+   * The silence watch's timer, injectable for the tests (which fire the
+   * ticks by hand). Absent = node's own timers.
+   */
+  timer?: CloudRunDetailTimer
 }
 
 /**
@@ -790,6 +875,11 @@ export async function runCloudSync(
   deps.checkCancel?.('the transient snapshot')
 
   const taken: TakenSnapshot[] = []
+  // rclone.6 — the live detail the run publishes on its job, fed by the same
+  // stream the progress text is. Built only when someone is listening; the
+  // silence watch lives and dies with the run (started at the exec, stopped
+  // in the `finally` below), so no tick can fire outside it.
+  let tracker: CloudRunDetailTracker | null = null
   let result: CloudSyncRunResult
 
   try {
@@ -807,13 +897,16 @@ export async function runCloudSync(
 
     // rclone.6 — the live detail the run publishes on its job, fed by the same
     // stream the progress text is. Built only when someone is listening.
-    const tracker = deps.onDetail ? new CloudRunDetailTracker(now) : null
+    tracker = deps.onDetail ? new CloudRunDetailTracker(now) : null
     const publish = () => {
       if (tracker)
         deps.onDetail?.(tracker.detail())
     }
 
     updateProgress(`rclone ${task.mode} ${plan.source} -> ${destination}`)
+    // The wall-clock silence watch rides the rclone invocation itself: a hung
+    // process emits no stats objects, so the zeros have to come from a clock.
+    tracker?.start(publish, deps.timer)
     const exec = () => execRclone(executor, args, task.mode, updateProgress, deps.onSpawn, tracker ?? undefined, publish)
     const run = plan.pool
       ? await withTopLevelMounts(executor, [plan.pool], exec, deps.snapshotOptions)
@@ -846,6 +939,9 @@ export async function runCloudSync(
     }
   }
   finally {
+    // The silence watch dies with the run — no tick may fire after the exit,
+    // whichever way it went.
+    tracker?.stop()
     // Success, failure or refusal alike. A destroy that fails is a WARNING on
     // an otherwise-good run, never a reason to call a finished sync failed.
     // The noun says what kind of transient it was — this is a cloud sync run,

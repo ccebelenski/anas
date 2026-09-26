@@ -505,6 +505,13 @@ export const CloudRunDetail = z.object({
    * grow. The stalled rule (`stalledFor` in `@anas/shared`) reads these.
    */
   speedSamples: z.array(z.number().nonnegative()),
+  /**
+   * When rclone's LAST stats object arrived (wall clock, ISO). Additive and
+   * optional: a hung rclone emits no stats at all, so the tracker's own 5 s
+   * clock appends the silence zeros — this field is how a display can say
+   * "no report from rclone for N s" from the detail alone.
+   */
+  lastStatsAt: ISODateTime.optional(),
 })
 export type CloudRunDetail = z.infer<typeof CloudRunDetail>
 
