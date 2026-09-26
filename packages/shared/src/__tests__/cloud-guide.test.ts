@@ -26,11 +26,25 @@ describe('cloud-guide: the curation table (rclone.4)', () => {
     }
   })
 
-  it('every backend guides ONE plain sentence', () => {
+  it('every backend that carries a guide carries ONE plain sentence', () => {
     for (const [backend, guide] of Object.entries(CLOUD_BACKEND_GUIDES)) {
       assert.ok(guide.essential.length > 0, `${backend} names at least one essential field`)
+      if (guide.guide === undefined) { continue }
       assert.match(guide.guide, /\.$/, `${backend}'s guide ends the sentence`)
       assert.equal(guide.guide.includes('. '), false, `${backend}'s guide is one sentence`)
+    }
+  })
+
+  it('the OAuth backends carry NO guide — the token sentence is their only instruction (rclone.6 batch B)', () => {
+    for (const backend of ['drive', 'onedrive', 'dropbox', 'box', 'pcloud']) {
+      const guide = CLOUD_BACKEND_GUIDES[backend]
+      assert.ok(guide, `${backend} is curated`)
+      assert.equal(guide.guide, undefined, `${backend} has no guide sentence`)
+      assert.deepEqual(guide.essential, ['token'], `${backend} keeps its essential list`)
+    }
+    // The non-OAuth curated backends keep theirs.
+    for (const backend of ['s3', 'b2', 'sftp', 'ftp', 'webdav', 'smb', 'azureblob']) {
+      assert.ok(CLOUD_BACKEND_GUIDES[backend].guide, `'${backend}' keeps its guide sentence`)
     }
   })
 })

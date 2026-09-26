@@ -196,15 +196,18 @@ describe('rclone-config: trimProviders on the 1.60.1 fixture (rclone.1)', () => 
 })
 
 describe('rclone-config: trimProviders curation (rclone.4)', () => {
-  it('a curated backend carries the guide sentence and the own-client list', () => {
+  it('a curated backend carries the curated marker and the own-client list', () => {
     const drive = provider('drive')
-    assert.ok(drive.guide && drive.guide.length > 0, 'drive has a guide sentence')
-    assert.match(drive.guide!, /rclone authorize/)
-    assert.match(drive.guide!, /drive/, 'the sentence names its own backend')
+    // rclone.6 review batch B: the OAuth backends' guide sentence is GONE —
+    // their one instruction is the token sentence the dialog renders with the
+    // token field — but they stay curated (marker, essential list, own client).
+    assert.equal(drive.curated, true)
+    assert.equal(drive.guide, undefined, 'drive has no guide sentence')
     assert.deepEqual(drive.ownClient, ['client_id', 'client_secret'])
     // dropbox/box have no own-client fields: the field stays ABSENT, never [].
     assert.equal(provider('dropbox').ownClient, undefined)
-    assert.ok(provider('dropbox').guide, 'dropbox has a guide sentence')
+    assert.equal(provider('dropbox').curated, true)
+    assert.equal(provider('dropbox').guide, undefined)
   })
 
   it('curated ⇒ essential is the table\'s list, on the real capture', () => {
@@ -231,9 +234,13 @@ describe('rclone-config: trimProviders curation (rclone.4)', () => {
     assert.equal(sftp.options.find(o => o.name === 'key_pem')!.essential, false)
   })
 
-  it('curated backends of the capture all carry a guide', () => {
+  it('every curated backend of the capture is marked, the non-OAuth ones with a guide', () => {
     for (const name of ['drive', 'onedrive', 'dropbox', 'box', 'pcloud', 's3', 'b2', 'sftp', 'ftp', 'webdav', 'smb', 'azureblob'])
+      assert.equal(provider(name).curated, true, `'${name}' is marked curated`)
+    for (const name of ['s3', 'b2', 'sftp', 'ftp', 'webdav', 'smb', 'azureblob'])
       assert.ok(provider(name).guide, `'${name}' has a guide sentence`)
+    for (const name of ['drive', 'onedrive', 'dropbox', 'box', 'pcloud'])
+      assert.equal(provider(name).guide, undefined, `'${name}' has no guide sentence`)
   })
 
   it('an uncurated backend mirrors !advanced and adds nothing', () => {

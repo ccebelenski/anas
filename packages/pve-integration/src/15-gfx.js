@@ -816,21 +816,38 @@
     };
 
     // stalledFor(detail) → seconds a cloud run has been stalled for, or null.
-    // "Stalled" (rclone.6): the last 3 speed samples are all zero while the run
-    // still has transfers outstanding (transfers < totalTransfers). rclone
-    // publishes a stats object every 5s (--stats 5s, pinned in the daemon), so
-    // trailing zero samples convert to seconds at that cadence.
-    var STALLED_SAMPLES = 3;
-    var STATS_INTERVAL_SECS = 5;
+    // A LITERAL ES5 port of `stalledFor()` in `@anas/shared` `cloud-run.ts`
+    // (rclone.6 review batch B): same constants, same witnesses, same answer —
+    // the shared module cannot be imported into PVE's compiled ExtJS bundle,
+    // so the port is kept honest by the ONE test-vector file both iterate
+    // (`packages/shared/test-vectors/stalled-samples.json`, asserted in the
+    // dialog-contracts harness against THIS copy).
+    //
+    // "Stalled" (rclone.6): the last STALLED_SAMPLES speed samples are all zero
+    // while the run still has work outstanding — `transfers < totalTransfers`,
+    // or files in flight right now (`transferring` non-empty; rclone counts a
+    // finished batch into `transfers` only at the stats tick, so the in-flight
+    // set is the second witness). The samples are the daemon's byte-delta
+    // samples at the pinned stats cadence (--stats 5s, derived from the shared
+    // constant), so trailing zero samples convert to seconds at that cadence.
+    // A run with no samples at all is never stalled.
+    gfx.STALLED_SAMPLES = 3;
+    gfx.CLOUD_STATS_INTERVAL_SECS = 5;
     gfx.stalledFor = function (detail) {
-        if (!detail || !detail.speedSamples || !detail.speedSamples.length) { return null; }
-        if (!(Number(detail.transfers) < Number(detail.totalTransfers))) { return null; }
-        var s = detail.speedSamples;
+        var samples = detail && detail.speedSamples && detail.speedSamples.length
+            ? detail.speedSamples : [];
+        if (!samples.length) { return null; }
+        var transfers = Number(detail.transfers) || 0;
+        var totalTransfers = Number(detail.totalTransfers) || 0;
+        var transferring = detail.transferring && detail.transferring.length
+            ? detail.transferring.length : 0;
+        if (!(transfers < totalTransfers) && transferring === 0) { return null; }
         var zeros = 0;
-        for (var i = s.length - 1; i >= 0 && Number(s[i]) === 0; i--) {
+        for (var i = samples.length - 1; i >= 0 && Number(samples[i]) === 0; i--) {
             zeros++;
         }
-        return zeros >= STALLED_SAMPLES ? zeros * STATS_INTERVAL_SECS : null;
+        return zeros >= gfx.STALLED_SAMPLES
+            ? zeros * gfx.CLOUD_STATS_INTERVAL_SECS : null;
     };
 
     // stalledHtml(detail) → the danger "stalled for Ns" label, or ''. ONE

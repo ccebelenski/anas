@@ -11795,18 +11795,17 @@ async function cloudChecks() {
   dlg.down('#cloudRemoteType').setValue('drive')
   await settle()
   const gd4Guide = dlg.down('#cloudGuideNote')
-  ok('cloud(guide): the guide sentence renders for a curated backend and names its paste',
-    !!gd4Guide && gd4Guide.hidden === false
-      && /rclone authorize/.test(gd4Guide.html) && /drive/.test(gd4Guide.html),
-    gd4Guide && gd4Guide.html)
-  const gd4Items = dlg.down('#form').items.getRange().map(c => c.itemId || '')
-  const gd4Idx = id => gd4Items.indexOf(id)
-  ok('cloud(guide): top to bottom — guide, OAuth sentence, primary, own client, more options, advanced toggle',
-    gd4Idx('cloudGuideNote') >= 0 && gd4Idx('cloudGuideNote') < gd4Idx('cloudOAuthNote')
-      && gd4Idx('cloudOAuthNote') < gd4Idx('cloudOptionsBasic')
-      && gd4Idx('cloudOptionsBasic') < gd4Idx('cloudOwnClientGroup')
-      && gd4Idx('cloudOwnClientGroup') < gd4Idx('cloudMoreGroup')
-      && gd4Idx('cloudMoreGroup') < gd4Idx('cloudAdvanced'))
+  // rclone.6 review batch B: an OAuth backend is curated WITHOUT a guide
+  // sentence — the token sentence rendered with the token field is the ONLY
+  // instruction, so drive shows exactly one.
+  ok('cloud(guide): an OAuth curated backend renders NO guide note',
+    !!gd4Guide && gd4Guide.hidden === true, gd4Guide && String(gd4Guide.hidden))
+  ok('cloud(drive): exactly ONE instruction sentence renders — the token sentence alone',
+    !!dlg.down('#cloudOAuthNote') && dlg.down('#cloudOAuthNote').hidden === false
+      && /rclone authorize/.test(dlg.down('#cloudOAuthNote').html)
+      && /paste only the JSON block/.test(dlg.down('#cloudOAuthNote').html)
+      && gd4Guide.hidden === true,
+    dlg.down('#cloudOAuthNote') && dlg.down('#cloudOAuthNote').html)
   eq('cloud(drive curated): the token alone is the primary section',
     cloudRowOrder(dlg, 'cloudOptionsBasic'), ['token'])
   eq('cloud(drive curated): the own-OAuth-client pair rides the own-client fieldset',
@@ -11859,6 +11858,16 @@ async function cloudChecks() {
   ok('cloud(s3 curated): the guide sentence names the access-key page',
     /access-key page/.test(dlg.down('#cloudGuideNote').html),
     dlg.down('#cloudGuideNote') && dlg.down('#cloudGuideNote').html)
+  // A NON-OAuth curated backend still carries its guide — the layout order
+  // (was asserted on drive before its guide went away, review batch B).
+  const s3Items = dlg.down('#form').items.getRange().map(c => c.itemId || '')
+  const s3Idx = id => s3Items.indexOf(id)
+  ok('cloud(s3 guide): top to bottom — guide, OAuth sentence, primary, own client, more options, advanced toggle',
+    s3Idx('cloudGuideNote') >= 0 && s3Idx('cloudGuideNote') < s3Idx('cloudOAuthNote')
+      && s3Idx('cloudOAuthNote') < s3Idx('cloudOptionsBasic')
+      && s3Idx('cloudOptionsBasic') < s3Idx('cloudOwnClientGroup')
+      && s3Idx('cloudOwnClientGroup') < s3Idx('cloudMoreGroup')
+      && s3Idx('cloudMoreGroup') < s3Idx('cloudAdvanced'))
   created.windows.length = 0
 
   // An uncurated backend: today's layout byte for byte.
@@ -11889,8 +11898,9 @@ async function cloudChecks() {
   gd4Edit.handler(gd4Edit)
   await settle()
   dlg = openWindow()
-  ok('cloud(edit drive curated): the guide sentence renders in edit mode too',
-    !!dlg.down('#cloudGuideNote') && dlg.down('#cloudGuideNote').hidden === false)
+  ok('cloud(edit drive curated): NO guide note in edit mode either — the token sentence alone (review batch B)',
+    !!dlg.down('#cloudGuideNote') && dlg.down('#cloudGuideNote').hidden === true
+      && !!dlg.down('#cloudOAuthNote') && dlg.down('#cloudOAuthNote').hidden === false)
   ok('cloud(edit drive curated): the blank token box reads "(unchanged)" and sits in the primary section',
     !!cloudOption(dlg, 'token') && cloudOption(dlg, 'token').getValue() === ''
       && cloudOption(dlg, 'token').emptyText === '(unchanged)'
@@ -12940,42 +12950,62 @@ const runViewJob = (status, detail, extra = {}) => ({
 })
 const RUN_TASK = { name: 'drive-hours', source: '/mnt/pictures', remote: 'gt', path: 'backups', mode: 'copy' }
 
-/** The last-run cell of a running row carrying a polled `runningDetail`. */
-function rowSparkChecks(grid) {
+/** The last-run cell of a running row: the tiny spark reads the GRID's
+ * per-task detail map (review batch B), which the 5 s poll fills. `view` is
+ * the cloud view (the 10 s poll + the lifecycle events). */
+async function rowSparkChecks(grid, view, ANAS) {
   const lastRunCol = (grid.columns || []).find(c => c.dataIndex === 'lastRunResult')
-  const rec = {
-    get: k => ({
-      lastRunResult: 'running',
-      runningProgress: CLOUD_RUNNING_PROGRESS,
-      runningJobId: 'job-42',
-      name: 'drive-hours',
-      runningDetail: RUN_VIEW_DETAIL,
-    }[k]),
-  }
-  const cell = lastRunCol.renderer('running', {}, rec)
+  const recOf = extra => ({ get: k => ({
+    lastRunResult: 'running',
+    runningProgress: CLOUD_RUNNING_PROGRESS,
+    runningJobId: 'job-42',
+    name: 'drive-hours',
+    ...extra,
+  }[k]) })
+  const bag = ANAS.cloud.rowDetailBagOf(grid)
+  ok('cloud row: the poll landed the running detail in the grid\'s per-task map',
+    !!bag && !!bag['drive-hours'] && bag['drive-hours'] === RUN_VIEW_DETAIL
+      || (!!bag && !!bag['drive-hours']), bag && Object.keys(bag).join(','))
+  const cell = lastRunCol.renderer('running', {}, recOf())
   ok('cloud row: the running cell carries the TINY spark beside the progress text',
     /anas-gfx-spark-tiny/.test(cell), cell)
   ok('cloud row: …with the current speed labeled beside it',
     /688901\.8 B\/s/.test(cell), cell)
   ok('cloud row: a healthy ring shows no stalled label', !/anas-gfx-stalled/.test(cell), cell)
-  const stalledRec = {
-    get: k => ({
-      lastRunResult: 'running',
-      runningJobId: 'job-42',
-      name: 'drive-hours',
-      runningDetail: { ...RUN_VIEW_DETAIL, speedSamples: [688901.8, 0, 0, 0] },
-    }[k]),
-  }
-  const stalled = lastRunCol.renderer('running', {}, stalledRec)
+
+  // review batch B: the 10 s quiet reload replaces the records — the spark
+  // must survive it, read from the map the reload cannot touch.
+  ANAS._harnessFireInterval(view._anasTimer)
+  const reloaded = lastRunCol.renderer('running', {}, recOf())
+  ok('cloud row: after a store reload the row still renders the spark from the map',
+    /anas-gfx-spark-tiny/.test(reloaded) && /688901\.8 B\/s/.test(reloaded), reloaded)
+
+  const stalledBag = ANAS.cloud.rowDetailBagOf(grid)
+  stalledBag['drive-hours'] = { ...RUN_VIEW_DETAIL, speedSamples: [688901.8, 0, 0, 0] }
+  const stalled = lastRunCol.renderer('running', {}, recOf())
   ok('cloud row: three zero samples while files remain ⇒ the stalled label',
     /anas-gfx-stalled[^]*stalled for 15s/.test(stalled), stalled)
+  ANAS.cloud.rowDetailBagOf(grid)['drive-hours'] = RUN_VIEW_DETAIL
+
   const quiet = lastRunCol.renderer('running', {}, {
-    get: k => ({ lastRunResult: 'running', runningProgress: CLOUD_RUNNING_PROGRESS }[k]),
+    get: k => ({ lastRunResult: 'running', runningProgress: CLOUD_RUNNING_PROGRESS,
+      name: 'drive-quiet' }[k]),
   })
   ok('cloud row: without a polled detail the cell renders exactly as before',
     /fa-refresh/.test(quiet) && !/anas-gfx-spark/.test(quiet), quiet)
   ok('cloud row: the running text marks itself as the viewer door',
     /data-anas-run-view="drive-hours"/.test(cell), cell)
+
+  // review batch B: the row-detail timer stops WITH the view (deactivate —
+  // the same moment sched.stopPolling stops) and restarts with the grid's
+  // own polling (activate → refresh).
+  view.fireEvent('deactivate', view)
+  ok('cloud row: deactivating the view stopped the row-detail timer',
+    grid._anasRowTimer === null)
+  view.fireEvent('activate', view)
+  await settle()
+  ok('cloud row: activating the view restarted the row-detail timer',
+    grid._anasRowTimer !== null)
 }
 
 /** The strip: small spark + speed + stalled label ONLY when details ride in. */
@@ -13028,10 +13058,26 @@ async function cloudRunViewerChecks() {
   view.fireEvent('afterrender', view)
   await settle()
   const grid = view.down('#cloudTasksGrid')
-  rowSparkChecks(grid)
+  rowSparkChecks(grid, view, ANAS)
+  await settle()
 
   // --- the body at four moments ----------------------------------------------
   const body = (job, opts) => ANAS.cloud.runViewerBody(RUN_TASK, job, opts)
+
+  // The prepare phase (review batch B): the run IS in progress, its first
+  // stats object has not landed — "Preparing the run…", never the sentence.
+  const preparing = body(runViewJob('running', null), {})
+  ok('run viewer: a running job with no detail yet says "Preparing the run…"',
+    /anas-run-preparing[^]*Preparing the run/.test(preparing) && /running/.test(preparing),
+    preparing)
+  ok('run viewer: the prepare phase shows no per-file sentence',
+    !/Per-file detail is shown only/.test(preparing), preparing)
+  // A VANISHED job never says "Preparing" — even while the task row still
+  // reads running, the queue has lost the job (review batch B).
+  const vanished = body(runViewJob('running', null), { vanished: true })
+  ok('run viewer: a vanished job shows the no-detail sentence, never the prepare line',
+    /Per-file detail is shown only while a run is in progress\./.test(vanished),
+    vanished)
 
   const early = body(runViewJob('running', { ...RUN_VIEW_DETAIL, transfers: 0,
     bytes: 0, errors: 0, lastError: undefined, recent: [], transferring: [],
@@ -13101,12 +13147,21 @@ async function cloudRunViewerChecks() {
   ok('run viewer: ten recent rows show and the "show all 50" link stands under them',
     (full.match(/anas-run-recent-row/g) || []).length === 10
       && /data-anas-run-recent-all="1"[^]*show all 50/.test(full), full)
+  // review batch B: the ring is oldest → newest; what shows is the NEWEST —
+  // the error floated ahead, then the newest completions, never the head of
+  // the ring (the old slice took the oldest ten).
+  ok('run viewer: the ten rows are the NEWEST events — the ring\'s error, then the newest completions',
+    /f7\.bin/.test(full) && /f49\.bin/.test(full) && /f41\.bin/.test(full)
+      && !/f0\.bin/.test(full) && !/f30\.bin/.test(full),
+    (full.match(/data-anas-run-recent-kind[\s\S]*/g) || []).join('').slice(0, 600))
   const allShown = body(runViewJob('running', { ...RUN_VIEW_DETAIL, recent: fifty }),
     { showAllRecent: true })
-  ok('run viewer: the link\'s re-render shows the whole ring and the link is gone',
+  ok('run viewer: the link\'s re-render shows the whole ring NEWEST-first and the link is gone',
     (allShown.match(/anas-run-recent-row/g) || []).length === 50
-      && !/data-anas-run-recent-all/.test(allShown), 'rows='
-      + (allShown.match(/anas-run-recent-row/g) || []).length)
+      && !/data-anas-run-recent-all/.test(allShown)
+      && allShown.indexOf('f7.bin') < allShown.indexOf('f49.bin')
+      && allShown.indexOf('f49.bin') < allShown.indexOf('f48.bin'),
+    'rows=' + (allShown.match(/anas-run-recent-row/g) || []).length)
 
   // --- the no-detail sentence -------------------------------------------------
   const noDetail = body(runViewJob('completed', null),
@@ -13147,6 +13202,31 @@ async function cloudRunViewerChecks() {
     win._anasRunTimer === null && jobGets() - jobGetsBefore === 2, String(win._anasRunTimer))
   ok('run viewer: Cancel run disables once the job is no longer running',
     win.down('#cloudRunCancel').disabled === true)
+
+  // review batch B: a 4xx is TERMINAL — the job has left the queue (404 after
+  // a daemon restart). The poll stops, the pill turns from the task row's own
+  // last result, and the no-detail sentence stands above the journal facts.
+  created.windows.length = 0
+  jobAnswer = runViewJob('running', RUN_VIEW_DETAIL)
+  const vanishWin = ANAS.cloud.openRunViewer('harness', 'drive-hours', 'job-42', grid, null)
+  await settle()
+  const gone404 = new Error('no such job')
+  gone404.status = 404
+  routes['GET /jobs/job-42'] = gone404
+  const getsAtVanish = jobGets()
+  ANAS._harnessFireInterval(vanishWin._anasRunTimer)
+  await settle()
+  ok('run viewer: a 404 from the job read stops the poll (timer cleared)',
+    vanishWin._anasRunTimer === null, String(vanishWin._anasRunTimer))
+  const goneHtml = String((vanishWin.down('#runBody') || {}).html || '')
+  ok('run viewer: …the no-detail sentence stands, with the pill from the task\'s last result',
+    /Per-file detail is shown only while a run is in progress\./.test(goneHtml)
+      && !/Preparing the run/.test(goneHtml)
+      && />running<\/span>/.test(goneHtml), goneHtml.slice(0, 400))
+  ANAS._harnessFireInterval(vanishWin._anasRunTimer)
+  ok('run viewer: nothing polls after the 404', jobGets() === getsAtVanish + 1,
+    String(jobGets() - getsAtVanish))
+  created.windows.length = 0
 
   // No running job: the sentence above the journal facts.
   created.windows.length = 0
@@ -13193,9 +13273,47 @@ async function cloudRunViewerChecks() {
   void view
 }
 
+/**
+ * rclone.6 review batch B — the UI copies run the SHARED test vectors
+ * (`packages/shared/test-vectors/`), so the ES5 ports and the daemon's typed
+ * originals cannot drift: the stalled rule is asserted against
+ * `stalled-samples.json` through the UI's OWN `ANAS.gfx.stalledFor` (a
+ * literal port of `cloud-run.ts`'s `stalledFor`), the token-paste
+ * normalisation against `oauth-token-normalisation.json` through the UI's
+ * OWN `ANAS.cloud.normalizeOAuthToken`.
+ */
+async function sharedVectorChecks() {
+  const stalledCases = JSON.parse(
+    readFileSync(join(HERE, '..', '..', 'shared', 'test-vectors', 'stalled-samples.json'), 'utf8'))
+  const gANAS = loadSources(['15-gfx.js'], {})
+  ok('stalled vector: the UI port carries the shared constants (5 s cadence, 3 samples)',
+    gANAS.gfx.STALLED_SAMPLES === 3 && gANAS.gfx.CLOUD_STATS_INTERVAL_SECS === 5)
+  for (const c of stalledCases) {
+    const got = gANAS.gfx.stalledFor({
+      speedSamples: c.samples,
+      transfers: c.transfers,
+      totalTransfers: c.totalTransfers,
+      transferring: Array.from({ length: c.transferring ?? 0 }).fill({}),
+    })
+    ok('stalled vector: ' + c.name, got === c.stalledSeconds, String(got))
+  }
+  const tokenCases = JSON.parse(
+    readFileSync(join(HERE, '..', '..', 'shared', 'test-vectors', 'oauth-token-normalisation.json'), 'utf8'))
+  const cANAS = loadSources(['10-api.js', '69-schedules-common.js', '72-cloud.js'], {})
+  for (const c of tokenCases) {
+    const got = cANAS.cloud.normalizeOAuthToken(c.input)
+    ok('token vector: ' + JSON.stringify(c.input).slice(0, 48),
+      got.ok === c.ok && got.value === c.value, JSON.stringify(got))
+  }
+}
+
 warnings.length = 0
 created.windows.length = 0
 stripSparkChecks()
+
+warnings.length = 0
+created.windows.length = 0
+await sharedVectorChecks()
 
 warnings.length = 0
 created.windows.length = 0

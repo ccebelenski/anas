@@ -1895,8 +1895,12 @@
     // rclone.6 — the strip's sparks read the running runs' job detail, which
     // the /status brief does not carry: ONE extra GET per RUNNING cloud run,
     // on the dashboard's own /status cadence, none when idle. The details live
-    // on the view and the fleet section re-renders as each lands.
+    // on the view and the fleet section re-renders as each lands. Each batch
+    // takes a sequence number (review batch B): a slower earlier batch — its
+    // GETs still in flight when the next tick fired — must never overwrite a
+    // newer one's answer.
     function loadJobDetails(view, node, st) {
+        var seq = view._anasJobDetailSeq = (view._anasJobDetailSeq || 0) + 1;
         var jobs = (st && st.jobs) || [];
         var running = [];
         for (var i = 0; i < jobs.length; i++) {
@@ -1914,6 +1918,7 @@
         var done = 0;
         var finish = function () {
             if (view.destroyed || view.destroying) { return; }
+            if (seq !== view._anasJobDetailSeq) { return; } // a newer batch owns the view
             view._anasJobDetails = details;
             setSection(view, 'anasDashFleet', renderFleet(view._anasStatus, details));
         };

@@ -904,24 +904,10 @@
     }
 
     // rclone.3 human-pass finding 2 (backup parity with the Cloud Sync grid) —
-    // a run can outlive the Run-Now supervisor's 10-minute ceiling, and the
-    // daemon keeps the row fed with the running direct job's progress text.
-    // THE one render of it in this file: the running pill stays, the progress
-    // follows after an em-dash, and the tooltip reads the same. Empty html and
-    // the bare tooltip when the daemon sent no text (a finished run, an older
-    // daemon, no direct job yet).
-    function runningProgressHtml(rec) {
-        var prog = '' + ((rec && rec.get('runningProgress')) || '');
-        if (!prog) {
-            return { tip: t('running'), html: '' };
-        }
-        var tip = t('running') + ' — ' + prog;
-        return {
-            tip: tip,
-            html: ' <span title="' + enc(tip) + '"'
-                + ' style="color:var(--anas-muted,gray);font-size:0.9em;">— ' + enc(prog) + '</span>',
-        };
-    }
+    // the running direct job's progress text is rendered by THE one helper,
+    // `ANAS.sched.runningProgressHtml` in 69-schedules-common.js (rclone.6
+    // review batch B: this file's copy and the Cloud Sync grid's could only
+    // drift; both grids delegate now).
 
     // Last run: a result pill + the relative time. An overdue task is flagged
     // (silently-overdue counts as failed — the replication policy).
@@ -946,7 +932,7 @@
             pill = pillHtml(t('failure'), 'var(--anas-danger,#c23b2c)',
                 ANAS.sched.runErrorTip(rec.store, rec.get('name'), at));
         } else if (result === 'running') {
-            var rp = runningProgressHtml(rec);
+            var rp = ANAS.sched.runningProgressHtml(rec);
             pill = '<span title="' + enc(rp.tip) + '"'
                 + ' style="display:inline-block;padding:1px 9px;border-radius:9px;font-size:0.85em;'
                 + 'color:#fff;background:var(--anas-accent,#3468c0);">'

@@ -199,7 +199,8 @@
         "essential": false
       }
     ],
-    "guide": "The account ID and application key come from the Backblaze B2 application-keys page."
+    "guide": "The account ID and application key come from the Backblaze B2 application-keys page.",
+    "curated": true
   },
   {
     "name": "sftp",
@@ -608,7 +609,8 @@
         "essential": false
       }
     ],
-    "guide": "The host, port, user and password are the SSH login of the server; a key file can replace the password."
+    "guide": "The host, port, user and password are the SSH login of the server; a key file can replace the password.",
+    "curated": true
   },
   {
     "name": "s3",
@@ -2404,7 +2406,8 @@
         "essential": false
       }
     ],
-    "guide": "The access key id, secret access key, region and endpoint come from your storage provider's access-key page; the provider row selects which S3-compatible service this remote is."
+    "guide": "The access key id, secret access key, region and endpoint come from your storage provider's access-key page; the provider row selects which S3-compatible service this remote is.",
+    "curated": true
   },
   {
     "name": "drive",
@@ -2900,11 +2903,11 @@
         "essential": false
       }
     ],
-    "guide": "The token comes from the `rclone authorize \"drive\"` paste \u2014 run it on a machine with a browser; every other field is optional.",
     "ownClient": [
       "client_id",
       "client_secret"
-    ]
+    ],
+    "curated": true
   },
   {
     "name": "koofr",

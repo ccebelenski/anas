@@ -244,6 +244,26 @@
         });
     };
 
+    // rclone.3 human-pass finding 2 — a run can outlive the Run-Now
+    // supervisor's 10-minute ceiling, and the daemon keeps the row fed with
+    // the running direct job's live stats line (bytes of total, files, ETA).
+    // THE one render of it (rclone.6 review batch B: was a copy in each grid):
+    // the running pill stays, the progress follows after an em-dash, and the
+    // tooltip reads the same. Empty html and the bare tooltip when the daemon
+    // sent no text (a finished run, an older daemon, no direct job yet).
+    sched.runningProgressHtml = function (rec) {
+        var prog = '' + ((rec && rec.get('runningProgress')) || '');
+        if (!prog) {
+            return { tip: t('running'), html: '' };
+        }
+        var tip = t('running') + ' — ' + prog;
+        return {
+            tip: tip,
+            html: ' <span title="' + enc(tip) + '"'
+                + ' style="color:var(--anas-muted,gray);font-size:0.9em;">— ' + enc(prog) + '</span>',
+        };
+    };
+
     // The Last run cell of a cancelled run: a neutral pill (a cancel is what
     // the operator asked for — never the failure colour), the daemon's
     // "cancelled by <user> at <time>" as the tooltip, or the time alone once
@@ -261,7 +281,10 @@
     // this owns the interval + the visibilitychange handler, stored on the view so
     // stop/cleanup can tear both down. Idempotent: starting twice never doubles up.
 
-    sched.stopPolling = function (view) {
+    // `soft` marks the idempotent clear `startPolling` does on its way in —
+    // not a real hide/deactivate/tab-hide, so the view's row-detail timer
+    // (rclone.6) is left alone: the refresh that follows restarts it.
+    sched.stopPolling = function (view, soft) {
         try {
             if (view && view._anasTimer) {
                 clearInterval(view._anasTimer);
@@ -269,6 +292,17 @@
             }
         } catch (e) {
             // non-fatal
+        }
+        // rclone.6 review batch B — a view's extra pollers (the cloud grid's
+        // per-row detail timer) stop WITH the view: the same hide, deactivate,
+        // tab-hidden and destroy moments that stop `_anasTimer` stop them. A
+        // view registers its stopper as `_anasRowTimerStop`.
+        if (!soft && view && typeof view._anasRowTimerStop === 'function') {
+            try {
+                view._anasRowTimerStop();
+            } catch (e2) {
+                // non-fatal
+            }
         }
     };
 
@@ -279,7 +313,7 @@
         if (refresh) {
             view._anasRefresh = refresh;
         }
-        sched.stopPolling(view);
+        sched.stopPolling(view, true);
         try {
             view._anasTimer = setInterval(function () {
                 try {

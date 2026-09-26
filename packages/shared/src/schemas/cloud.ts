@@ -84,9 +84,19 @@ export const CloudProvider = z
     description: z.string(),
     options: z.array(CloudProviderOption),
     /**
+     * rclone.6 review batch B — the backend is in the curation table
+     * (`@anas/shared` `cloud-guide.ts`), whatever its display details: the
+     * dialog's grouping is decided by THIS marker, not by the presence of a
+     * `guide` (an OAuth backend's guide was dropped — its one instruction is
+     * the token sentence — and absence of a sentence is not absence of
+     * curation). Additive/optional so an older payload still validates.
+     */
+    curated: z.boolean().optional(),
+    /**
      * rclone.4 — the curated backend's one sentence naming where the
-     * essential values come from. Absent on an uncurated backend (the
-     * curation table, `@anas/shared` `cloud-guide.ts`, decides).
+     * essential values come from. Absent on an uncurated backend AND on the
+     * OAuth backends (review batch B — the token sentence is their only
+     * instruction); the curation table decides.
      */
     guide: z.string().optional(),
     /**

@@ -1033,7 +1033,11 @@
             return;
         }
 
-        var curated = !!(prov && prov.guide);
+        // Curation is what the daemon's trim MARKS (`curated: true`, review
+        // batch B — an OAuth backend's guide sentence was dropped so the token
+        // sentence stands alone, and `guide` can no longer be the marker);
+        // `guide` stays in the check only for an older daemon's payload.
+        var curated = !!(prov && (prov.curated || prov.guide));
         var isOwnClient = {};
         var ownClientList = (curated && prov.ownClient) || [];
         var iOwn;
@@ -1157,8 +1161,11 @@
         }
 
         if (guideNote) {
-            guideNote.setHidden(!curated);
-            if (curated) {
+            // Only a curated backend WITH a sentence renders one (review batch
+            // B: the OAuth backends are curated without a `guide` — the token
+            // sentence below is their only instruction).
+            guideNote.setHidden(!(curated && prov.guide));
+            if (curated && prov.guide) {
                 guideNote.setHtml('<div style="color:var(--anas-muted,gray);font-size:11px;margin:2px 0 8px 0;">'
                     + enc(prov.guide) + '</div>');
             }
@@ -1883,32 +1890,20 @@
         return '<span style="color:var(--anas-muted,gray);">' + enc(t('copy')) + '</span>';
     }
 
-    // rclone.3 human-pass finding 2 — a run can outlive the Run-Now
-    // supervisor's 10-minute ceiling, and the daemon keeps the row fed with
-    // the running direct job's live stats line (bytes of total, files, ETA).
-    // THE one render of it in this file: the running pill stays, the progress
-    // follows after an em-dash, and the tooltip reads the same. Empty html and
-    // the bare tooltip when the daemon sent no text (a finished run, an older
-    // daemon, no direct job yet).
-    function runningProgressHtml(rec) {
-        var prog = '' + ((rec && rec.get('runningProgress')) || '');
-        if (!prog) {
-            return { tip: t('running'), html: '' };
-        }
-        var tip = t('running') + ' — ' + prog;
-        return {
-            tip: tip,
-            html: ' <span title="' + enc(tip) + '"'
-                + ' style="color:var(--anas-muted,gray);font-size:0.9em;">— ' + enc(prog) + '</span>',
-        };
-    }
+    // rclone.3 human-pass finding 2 — the running direct job's live stats line
+    // is rendered by THE one helper, `ANAS.sched.runningProgressHtml` in
+    // 69-schedules-common.js (rclone.6 review batch B: the Backup grid's copy
+    // and this one could only drift; both grids delegate now).
 
     // rclone.6 — the row's tiny spark: beside the running progress text, from
     // the running job's detail the grid polls every 5 s while a running row is
-    // on screen (one interval per grid). The same stalled label the viewer and
-    // the jobs strip show — one helper everywhere.
-    function runningDetailSparkHtml(rec) {
-        var d = (rec && rec.get && rec.get('runningDetail')) || null;
+    // on screen (one interval per grid). The detail is read from the GRID's
+    // per-task map (`rowDetails`, review batch B) — NOT from the record: the
+    // 10 s quiet reload replaces records and would blink the spark away. The
+    // same stalled label the viewer and the jobs strip show — one helper
+    // everywhere.
+    function runningDetailSparkHtml(rec, rowDetails) {
+        var d = (rowDetails && rec && rec.get) ? rowDetails[rec.get('name')] : null;
         if (!d || !d.speedSamples || !d.speedSamples.length) {
             return '';
         }
@@ -1926,8 +1921,9 @@
     // line, so the tooltip reads the run this user started from this grid
     // (runTaskNow records it through the shared session store, keyed to the
     // run); a run started by the timer, or a later run than the one that
-    // failed, shows the time and where the history is instead.
-    function renderLastRun(v, meta, rec) {
+    // failed, shows the time and where the history is instead. `rowDetails` is
+    // the grid's per-task map of polled run detail (rclone.6 review batch B).
+    function renderLastRun(v, meta, rec, rowDetails) {
         var result = '' + (rec.get('lastRunResult') || 'unknown');
         var at = rec.get('lastRunAt');
         var overdue = rec.get('overdue') === true;
@@ -1942,7 +1938,7 @@
             pill = pillHtml(t('failure'), 'var(--anas-danger,#c23b2c)',
                 ANAS.sched.runErrorTip(rec.store, rec.get('name'), at));
         } else if (result === 'running') {
-            var rp = runningProgressHtml(rec);
+            var rp = ANAS.sched.runningProgressHtml(rec);
             // rclone.6: the running text IS the viewer door — the pill carries
             // the task name so the grid's cellclick can open the run viewer.
             var runView = rec.get('runningJobId')
@@ -1952,7 +1948,7 @@
                 + ' style="display:inline-block;padding:1px 9px;border-radius:9px;font-size:0.85em;'
                 + 'color:#fff;background:var(--anas-accent,#3468c0);cursor:pointer;">'
                 + '<i class="fa fa-refresh fa-spin" aria-hidden="true" style="margin-right:4px;"></i>'
-                + enc(t('running')) + '</span>' + rp.html + runningDetailSparkHtml(rec);
+                + enc(t('running')) + '</span>' + rp.html + runningDetailSparkHtml(rec, rowDetails);
         } else if (result === 'cancelled' && !overdue) {
             // rclone.5: stopped from the toolbar — the shared neutral pill,
             // who and when in the tooltip.
@@ -2114,7 +2110,21 @@
             }
             grid.anasReloading = false;
             updateTaskButtons(grid);
-            scheduleRowDetailPoll(grid, node);
+            // The row-detail poll reads the grid's per-task map (rclone.6
+            // review batch B) — the view hands its own bag over on the first
+            // load, so every reload path lands detail in the SAME object the
+            // row renderer reads.
+            grid._anasRowDetailBag = grid._anasRowDetailBag
+                || (view && view._anasRowDetailBag) || {};
+            // The row-detail timer stops with the view (hide, deactivate, tab
+            // hidden — wherever sched.stopPolling stops) and restarts with the
+            // grid's own polling, which this load is (review batch B).
+            if (view && !view._anasRowTimerStop) {
+                view._anasRowTimerStop = function () {
+                    stopRowDetailPoll(gridOf(view));
+                };
+            }
+            scheduleRowDetailPoll(grid, node, grid._anasRowDetailBag);
         }, function (err) {
             if (grid.destroyed || grid.destroying) {
                 return;
@@ -2151,13 +2161,25 @@
 
     var ROW_DETAIL_POLL_MS = 5000;
 
+    // The polled detail lives on the GRID's per-task map (`rowDetails`: task
+    // name → run detail), never on the store record — the 10 s quiet reload
+    // replaces records and a record-held detail would blink the tiny spark
+    // away on every one (review batch B). ONE bag per grid, in memory only.
+    function stopRowDetailPoll(grid) {
+        if (grid && grid._anasRowTimer) {
+            clearInterval(grid._anasRowTimer);
+            grid._anasRowTimer = null;
+        }
+    }
+
     // ONE interval per grid, started when a running row with a known job is on
-    // screen and stopped the moment there is none (or the grid dies): each tick
-    // polls the running rows' jobs and lands the detail on the record, where
-    // the row renderer reads its tiny spark and the stalled label. A row that
-    // stops running keeps its last detail until the next loadTasks overwrites
-    // the row — the renderer only draws it while the pill says running.
-    function scheduleRowDetailPoll(grid, node) {
+    // screen and stopped the moment there is none (or the grid dies, or the
+    // view hides/deactivates — sched.stopPolling's `_anasRowTimerStop` hook):
+    // each tick polls the running rows' jobs and lands the detail in the map,
+    // where the row renderer reads its tiny spark and the stalled label. A row
+    // that stops running has its map entry DROPPED at the next tick — the
+    // renderer only draws a spark while the pill says running.
+    function scheduleRowDetailPoll(grid, node, rowDetails) {
         if (!grid || grid.destroyed || grid.destroying) {
             return;
         }
@@ -2173,31 +2195,27 @@
             return;
         }
         if (!running.length) {
-            if (grid._anasRowTimer) {
-                clearInterval(grid._anasRowTimer);
-                grid._anasRowTimer = null;
-            }
+            stopRowDetailPoll(grid);
             return;
         }
         var started = !grid._anasRowTimer;
         if (started) {
             grid._anasRowTimer = setInterval(function () {
                 if (grid.destroyed || grid.destroying) {
-                    clearInterval(grid._anasRowTimer);
-                    grid._anasRowTimer = null;
+                    stopRowDetailPoll(grid);
                     return;
                 }
-                tickRowDetail(grid, node);
+                tickRowDetail(grid, node, rowDetails);
             }, ROW_DETAIL_POLL_MS);
         }
         // An immediate first tick, but ONLY when the interval is newly started
         // — a routine reload must not double-poll rows it just refreshed.
         if (started) {
-            tickRowDetail(grid, node);
+            tickRowDetail(grid, node, rowDetails);
         }
     }
 
-    function tickRowDetail(grid, node) {
+    function tickRowDetail(grid, node, rowDetails) {
         var store = grid.getStore();
         var jobs = [];
         try {
@@ -2209,6 +2227,26 @@
         } catch (e) {
             return;
         }
+        // A row that stopped running (the run ended while we watched) loses its
+        // map entry — the map never outlives the running rows it feeds.
+        try {
+            for (var name in rowDetails) {
+                if (Object.prototype.hasOwnProperty.call(rowDetails, name)) {
+                    var still = false;
+                    for (var j = 0; j < jobs.length; j++) {
+                        if (jobs[j].get('name') === name) {
+                            still = true;
+                            break;
+                        }
+                    }
+                    if (!still) {
+                        delete rowDetails[name];
+                    }
+                }
+            }
+        } catch (ePrune) {
+            // a stale entry is cosmetic; never break the tick for it
+        }
         for (var i = 0; i < jobs.length; i++) {
             (function (rec) {
                 ANAS.api.get(node, '/jobs/' + encodeURIComponent(rec.get('runningJobId')))
@@ -2217,8 +2255,8 @@
                             return;
                         }
                         var job = (res && res.job) || null;
-                        if (job && job.detail) {
-                            rec.set('runningDetail', job.detail);
+                        if (job && job.detail && rowDetails) {
+                            rowDetails[rec.get('name')] = job.detail;
                         }
                     }, function () {
                         // transient — the next tick retries
@@ -2698,7 +2736,10 @@
     // The viewer body — PURE, so the harness can assert every section from a
     // fixture job. `task` is the row's shape ({name, source, remote, path,
     // mode}); `job` the polled Job (status + detail + result/error). opts:
-    // { consistency:{consistency,reason}, showAllRecent:bool }.
+    // { consistency:{consistency,reason}, showAllRecent:bool,
+    //   vanished:bool } — `vanished` marks a job that answered 4xx and left
+    // the queue, so a task row still reading `running` gets the no-detail
+    // sentence, never the prepare line (review batch B).
     function runViewerBody(task, job, opts) {
         task = task || {};
         opts = opts || {};
@@ -2717,6 +2758,17 @@
             + '</div></div>';
 
         if (!detail) {
+            if (running && !opts.vanished) {
+                // The run IS in progress but its first stats object has not
+                // landed yet — the first seconds and the snapshot prepare
+                // phase (review batch B). Say so; the no-detail sentence
+                // below is only for a job that has ended or vanished.
+                return header
+                    + '<div class="anas-run-preparing" style="padding:10px 12px;border-radius:8px;'
+                    + 'background:rgba(127,127,127,0.10);">'
+                    + '<i class="fa fa-refresh fa-spin" aria-hidden="true" style="margin-right:6px;"></i>'
+                    + enc(t('Preparing the run…')) + '</div>';
+            }
             // The job has left the queue (or an older daemon): per-file detail
             // is gone with it — the stateless rule. The sentence stands above
             // the journal summary the task already shows (the recent-runs
@@ -2818,9 +2870,15 @@
                 + runResultBannerHtml(job) + '</div>';
         }
 
-        // (6) Recent — the last 10 finished or failed files, errors first in
-        // danger with the message; a "show all 50" link when the ring holds more.
+        // (6) Recent — newest events first, errors first in danger with the
+        // message; a "show all 50" link when the ring holds more. The daemon's
+        // ring is oldest → newest, and the errors-first sort put its HEAD in
+        // view — the OLDEST completions (review batch B). The window is:
+        // newest-first, errors floated ahead of the newest completions, so
+        // what shows is what happened last. "Show all" renders the whole ring
+        // under the same rule.
         var recent = (detail.recent || []).slice();
+        recent.reverse(); // newest → oldest
         recent.sort(function (a, b) {
             return kindSortKey(a && a.kind) - kindSortKey(b && b.kind);
         });
@@ -2830,8 +2888,11 @@
             recentHtml += recentEventHtml(shown[r]);
         }
         if (!opts.showAllRecent && recent.length > RECENT_SHOWN) {
+            // The count is substituted into a TRANSLATED template, never the
+            // other way round (review batch B) — a dynamic string through the
+            // translator would freeze one language's word order.
             recentHtml += '<a href="#" data-anas-run-recent-all="1" class="anas-run-recent-all">'
-                + enc(t('show all ' + detail.recent.length)) + '</a>';
+                + enc(t('show all {n}').replace('{n}', '' + detail.recent.length)) + '</a>';
         }
         html += '<div class="anas-run-recent" style="margin-bottom:10px;">'
             + '<div style="color:var(--anas-muted,gray);font-size:0.85em;margin-bottom:3px;">'
@@ -2888,6 +2949,20 @@
         var task = rowTask || null;
         var job = null;
         var showAllRecent = false;
+
+        // The task row's current last result — the pill a VANISHED job is
+        // turned to (review batch B): the queue no longer holds the job, the
+        // task's row is the state the user can still see.
+        function taskResultOf() {
+            try {
+                var store = win._anasCloudGrid && win._anasCloudGrid.getStore();
+                var idx = store ? store.findExact('name', name) : -1;
+                var rec = idx >= 0 ? store.getAt(idx) : null;
+                return rec ? ('' + (rec.get('lastRunResult') || 'unknown')) : 'unknown';
+            } catch (e) {
+                return 'unknown';
+            }
+        }
 
         var win;
         try {
@@ -2965,6 +3040,10 @@
                     consistency: win._anasConsistency,
                     showAllRecent: showAllRecent,
                     journal: win._anasJournal || null,
+                    // The job answered 4xx — it has left the queue; the body
+                    // reads the no-detail sentence even while the task's own
+                    // row still says running (review batch B).
+                    vanished: win._anasVanished === true,
                 }));
             } catch (e) {
                 ANAS.warn('cloud run viewer render failed: ' + ANAS.errText(e));
@@ -2999,6 +3078,23 @@
                 }
             }, function (err) {
                 if (win.destroyed || win.destroying) {
+                    return;
+                }
+                // A 4xx is TERMINAL (review batch B): the job has left the
+                // queue — a 404 after a daemon restart — and no tick will ever
+                // bring it back. Stop the poll, turn the pill from the task's
+                // own last result, and let the no-detail sentence stand above
+                // the journal summary. Anything else is transient — keep the
+                // last good body, warn, keep polling.
+                var status = err && err.status;
+                if (status >= 400 && status < 500) {
+                    if (win._anasRunTimer) {
+                        clearInterval(win._anasRunTimer);
+                        win._anasRunTimer = null;
+                    }
+                    win._anasVanished = true;
+                    job = { id: jobId, status: taskResultOf() };
+                    render();
                     return;
                 }
                 // Transient failure — keep the last good body, warn, keep
@@ -3906,14 +4002,20 @@
                 { name: 'cadence', type: 'auto' },
                 { name: 'enabled', type: 'auto' },
                 { name: 'overdue', type: 'auto' },
-                // rclone.6: the running job's detail, polled by the grid while
-                // a running row is on screen — never from the tasks payload.
-                { name: 'runningDetail', type: 'auto' },
                 { name: 'raw', type: 'auto' },
             ],
             data: [],
             sorters: [{ property: 'name', direction: 'ASC' }],
         });
+
+        // rclone.6 review batch B — THIS grid's per-task map of polled run
+        // detail (task name → detail), in memory here and nowhere else: the
+        // row renderer reads its tiny spark from it, the 5 s poll writes it,
+        // and a 10 s quiet reload — which replaces the records — cannot blink
+        // the spark away. Kept off the store: the run-errors bag rides the
+        // store because it must survive the tab; a run detail is live display
+        // state that dies with the view.
+        var rowDetails = {};
 
         var tbar = [
             {
@@ -4110,7 +4212,12 @@
                         },
                         {
                             text: t('Last run'), dataIndex: 'lastRunResult', width: 170,
-                            sortable: false, menuDisabled: true, renderer: renderLastRun,
+                            sortable: false, menuDisabled: true,
+                            // THIS grid's detail map rides along to the renderer
+                            // (rclone.6 review batch B) — one closure per view.
+                            renderer: function (v, meta, rec) {
+                                return renderLastRun(v, meta, rec, rowDetails);
+                            },
                         },
                         {
                             text: t('Next run'), dataIndex: 'nextRunAt', width: 110,
@@ -4166,6 +4273,10 @@
                 },
             ],
             listeners: ANAS.sched.viewListeners(function (v, quiet) {
+                // The view carries THIS grid's detail map so every loadTasks
+                // path — refresh, Run now, toggle — lands detail in the same
+                // object the row renderer reads (rclone.6 review batch B).
+                v._anasRowDetailBag = rowDetails;
                 loadTasks(v, node, quiet);
             }),
         };
@@ -4178,6 +4289,17 @@
         // the latter so the harness asserts every section from a fixture job.
         openRunViewer: openRunViewer,
         runViewerBody: runViewerBody,
+        // rclone.6 review batch B: `normalizeOAuthToken` is exported so the
+        // dialog-contracts harness can run the shared test-vector file
+        // (`packages/shared/test-vectors/oauth-token-normalisation.json`)
+        // through the UI's OWN copy — the daemon's parser is pinned by the
+        // same vectors, so the two cannot drift.
+        normalizeOAuthToken: normalizeOAuthToken,
+        // The grid's per-task run-detail map (rclone.6 review batch B) —
+        // exposed for the harness to seed and assert against.
+        rowDetailBagOf: function (grid) {
+            return (grid && grid._anasRowDetailBag) || null;
+        },
         // The management keys the preview body never carries — exported so the
         // harness pins the body against the list instead of against a copy.
         taskManagementKeys: CLOUD_TASK_MANAGEMENT_KEYS,
