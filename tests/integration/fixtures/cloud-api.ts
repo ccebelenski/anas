@@ -59,7 +59,7 @@ export async function apiCtx(
   return authedContext(playwright, ticket as string)
 }
 
-/** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
+/** Poll a 202 job through GET /v1/jobs/:id until it reaches a terminal state. */
 export async function awaitJob(
   ctx: APIRequestContext,
   jobId: string,
@@ -70,7 +70,8 @@ export async function awaitJob(
     const res = await ctx.get(`${V1}/jobs/${jobId}`)
     expect(res.status()).toBe(200)
     const job = (await res.json()).job
-    if (job.status === 'completed' || job.status === 'failed')
+    // `cancelled` (rclone.5) is as terminal as completed/failed.
+    if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled')
       return job
     if (Date.now() > deadline)
       throw new Error(`job ${jobId} still '${job.status}' after ${timeout}ms: ${job.error ?? job.progress ?? ''}`)
@@ -84,14 +85,26 @@ export async function runJob(
   verb: 'post' | 'put' | 'delete',
   url: string,
   data?: unknown,
+  opts: { headers?: Record<string, string>, timeout?: number } = {},
 ): Promise<void> {
   const res = await ctx[verb](url, {
     ...(data !== undefined ? { data } : {}),
+    ...(opts.headers ? { headers: opts.headers } : {}),
   })
   expect(res.status(), await res.text()).toBe(202)
   const { id } = (await res.json()).job
-  const job = await awaitJob(ctx, id)
+  const job = await awaitJob(ctx, id, opts.timeout)
   expect(job.status, job.error).toBe('completed')
+}
+
+/** One GET /v1/jobs/:id, verbatim — the caller asserts on the shape. */
+export async function getJob(
+  ctx: APIRequestContext,
+  jobId: string,
+): Promise<{ status: number, job?: any, body?: any }> {
+  const res = await ctx.get(`${V1}/jobs/${jobId}`)
+  const body = await res.json().catch(() => ({}))
+  return { status: res.status(), job: body?.job, body }
 }
 
 /** Remote names the node's rclone store carries right now. */
