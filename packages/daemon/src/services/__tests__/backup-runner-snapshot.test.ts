@@ -4,7 +4,7 @@ import type { CommandExecutor, ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
-import { ChildCancel } from '../../jobs/child-cancel.js'
+import { assertRunNotCancelled, ChildCancel } from '../../jobs/child-cancel.js'
 import { JobQueue } from '../../jobs/queue.js'
 import { buildBackupArgs, distinctAhrTargets, distinctZfsTargets, runBackup } from '../backup-runner.js'
 import { formatTransientBackupSnapshot } from '../snapshot-naming.js'
@@ -341,5 +341,60 @@ describe('buildBackupArgs under expansion (backup2.3)', () => {
     )
     assert.ok(!args.includes('--include-dev'), args.join(' '))
     assert.ok(!args.includes('--all-file-systems'))
+  })
+})
+
+/**
+ * rclone.5 review — an accepted cancel ends the run at the NEXT pre-flight
+ * boundary, with `checkCancel` wired exactly as the route wires it. The
+ * snapshot fixtures are all in place and must stay untouched.
+ */
+describe('runBackup — an accepted cancel ends the pre-flight (rclone.5 review)', () => {
+  it('a cancel accepted before the run ends it at the FIRST boundary — nothing runs, nothing is taken', async () => {
+    const mock = wire()
+    const queue = new JobQueue()
+    let release: () => void = () => {}
+    const gated = new Promise<void>((r) => {
+      release = r
+    })
+    let up: () => void = () => {}
+    const hookIsUp = new Promise<void>((r) => {
+      up = r
+    })
+    const ref = queue.submit(
+      'backup.task.run',
+      { user: 'root@pam', uid: 0, params: { task: TASK_NAME, direct: true } },
+      async (progress, ctx) => {
+        const cancel = new ChildCancel(ctx, 'proxmox-backup-client', { subject: `Backup task '${TASK_NAME}'` }, { waitMs: 50 })
+        up()
+        await gated
+        return runBackup(
+          mock,
+          {
+            task: task(),
+            repo: REPO,
+            secret: 's3cret',
+            now: NOW,
+            fstabPath: '/nonexistent/anas-test/fstab',
+            onSpawn: cancel.onSpawn,
+            checkCancel: next => assertRunNotCancelled(cancel, next),
+          },
+          progress,
+        )
+      },
+    )
+    await hookIsUp
+    await queue.cancel(ref.id, 'alice@pve') // accepted at once: the child does not exist yet
+    release()
+    for (let i = 0; i < 200 && queue.get(ref.id)?.status === 'running'; i++)
+      await new Promise(r => setTimeout(r, 5))
+
+    const job = queue.get(ref.id)!
+    assert.equal(job.status, 'cancelled', JSON.stringify(job.error))
+    assert.match((job.result as { reason: string }).reason, /^cancelled by alice@pve at /)
+    assert.equal(mock.calls.length, 0, 'not even the source guard ran')
+    assert.equal(zfsArgs(mock, 'snapshot').length, 0, 'no snapshot was taken')
+    assert.equal(mock.calls.some(c => c.command === PRLIMIT), false, 'pbc never ran')
+    assert.equal(mock.signals.length, 0, 'nothing was ever signalled')
   })
 })

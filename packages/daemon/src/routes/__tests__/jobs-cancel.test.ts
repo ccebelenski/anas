@@ -28,7 +28,7 @@ function headers(user = 'alice@pve'): Record<string, string> {
 
 interface AuditLine { event: string, user: string, operation: string, submittedBy?: string }
 
-async function build() {
+async function build(queueOpts: { concurrency?: number } = {}) {
   const lines: AuditLine[] = []
   const audit = {
     submitted(e: { user: string, operation: string }) {
@@ -41,7 +41,7 @@ async function build() {
       lines.push({ event: 'job.cancelled', user: c.cancelledBy ?? e.user, submittedBy: e.user, operation: e.operation })
     },
   } as unknown as AuditLogger
-  const jobQueue = new JobQueue({ audit })
+  const jobQueue = new JobQueue({ audit, ...queueOpts })
   const server = Fastify({ logger: false })
   await server.register(jobRoutes, { prefix: '/v1', jobQueue, confirmStore: new ConfirmStore() })
   return { server, jobQueue, lines }
@@ -118,6 +118,24 @@ describe('formatElapsed / cancelHeadline (rclone.5)', () => {
       cancelHeadline({ ...job, progress: null }, {}, now),
       'Job \'cloud.task.run\' has been running for 2 h 14 m; cancelling stops it here',
     )
+  })
+
+  it('never says "has been running" for a job that has not started (rclone.5 review)', () => {
+    const job = {
+      id: 'x',
+      status: 'queued',
+      operation: 'cloud.task.run',
+      progress: null,
+      createdAt: '2026-09-25T10:00:00.000Z',
+      createdBy: 'root@pam',
+      startedAt: null,
+      completedAt: null,
+      result: null,
+      error: null,
+    } as Job
+    const headline = cancelHeadline(job, { subject: 'Cloud sync task \'photos\'' })
+    assert.equal(headline, 'Cloud sync task \'photos\' is queued and has not started; it can be cancelled once it starts')
+    assert.doesNotMatch(headline, /has been running/)
   })
 })
 
@@ -202,6 +220,25 @@ describe('POST /v1/jobs/:id/cancel (rclone.5)', () => {
     const err = (res.json() as { error: { code: string, message: string } }).error
     assert.equal(err.code, 'NOT_CANCELLABLE')
     assert.match(err.message, /\(pool\.scrub\) cannot be cancelled — it registers no way to stop its work; wait for it to finish/)
+    await server.close()
+  })
+
+  it('a QUEUED job: 409 with the not-started sentence, no confirm code, nothing removed (rclone.5 review)', async () => {
+    // One slot, filled: the second job stays queued, and a queued body has
+    // registered no hook — the story keeps queued jobs uncancellable.
+    const { server, jobQueue } = await build({ concurrency: 1 })
+    jobQueue.submit('pool.scrub', { user: 'u', uid: 0 }, () => new Promise(() => {}))
+    const queued = jobQueue.submit('cloud.task.run', { user: 'u', uid: 0, params: { task: 'photos' } }, () => new Promise(() => {}))
+    await settle()
+    assert.equal(jobQueue.get(queued.id)?.status, 'queued')
+    const res = await server.inject({ method: 'POST', url: `/v1/jobs/${queued.id}/cancel`, headers: headers() })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    const err = (res.json() as { error: { code: string, message: string } }).error
+    assert.equal(err.code, 'NOT_CANCELLABLE')
+    assert.equal(err.message, `Job '${queued.id}' (cloud.task.run) is queued and has not started — it can be cancelled once it starts`)
+    assert.doesNotMatch(err.message, /has been running/)
+    assert.equal(jobQueue.get(queued.id)?.status, 'queued', 'the job is still queued, untouched')
     await server.close()
   })
 

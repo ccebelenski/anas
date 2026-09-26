@@ -47,7 +47,8 @@ import {
   lunBackupId,
   UpsertBackupRepoRequest,
 } from '@anas/shared'
-import { ChildCancel } from '../jobs/child-cancel.js'
+import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
+import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
 import { readPbsStorages, readPveMountPaths } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
 import { readAhrPools } from '../services/ahr-topology.js'
@@ -1182,6 +1183,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           subject: `Backup task '${name}'`,
           consequence: BACKUP_CANCEL_CONSEQUENCE,
         })
+        // rclone.5 review (backup parity): an accepted cancel ends the run at
+        // the NEXT pre-flight boundary, not after it — the guard, the repo
+        // lookup, the transient snapshots and the exec each get one (the
+        // service takes its own through `checkCancel`;
+        // `assertRunNotCancelled` is the one shared check).
         // The unit's own execution: run pbc in the daemon (NEVER systemctl).
         const task = await readTask(systemdDir, name)
         if (!task)
@@ -1197,6 +1203,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         let repo: BackupRepo | undefined
         let namespace: string | undefined
         try {
+          assertRunNotCancelled(cancel, 'the cadence gate')
           // Cadence gate (16.10): a biweekly task runs on a WEEKLY timer because
           // OnCalendar cannot say "every other week", so an off-week SCHEDULED fire
           // stops here. It completes as a first-class, visible skip — a journal
@@ -1213,6 +1220,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           if (gate.reason === 'heal' || gate.reason === 'no-record')
             updateProgress(`backup task '${name}': ${gate.detail}`)
 
+          assertRunNotCancelled(cancel, 'the repository lookup')
           // Resolve tier-2 (registry) or tier-1 (pve:<id>) repo + secret FRESH.
           // A tier-1 secret is read from /etc/pve/priv/storage/<id>.pw here, at
           // exec time — never copied, never cached (PVE rotation is instant).
@@ -1233,7 +1241,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
             // the backup routes do (the zvol branch's PVE hands-off guard), and
             // the source guard (backup2.11) reads the SAME fstab the Mounts
             // routes and `preview-nested` do.
-            { task, repo, secret, fstabPath, consistencyOptions: { pveStorageCfg: paths.pveStorageCfg }, onSpawn: cancel.onSpawn },
+            { task, repo, secret, fstabPath, consistencyOptions: { pveStorageCfg: paths.pveStorageCfg }, onSpawn: cancel.onSpawn, checkCancel: next => assertRunNotCancelled(cancel, next) },
             updateProgress,
           )
           // A cancel never prunes and never notifies (rclone.5): the operator
@@ -1270,10 +1278,20 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           return final
         }
         catch (err) {
-          if (cancel.requested())
+          // The boundary check's throw IS the cancellation, and so is a run
+          // that had a child to be stopped (rclone.5 review, backup parity):
+          // the queue's own settle awaits the hook, so the verdict is
+          // `cancelled` whatever microtask order the child's death arrived in.
+          if (err instanceof JobCancelledError || (cancel.requested() && cancel.stoppedOnPurpose()))
             return logCancelledRun(name)
           const message = err instanceof Error ? err.message : String(err)
           await notifyBackupRun(executor, { task, repo, namespace, error: message, elapsedMs: Date.now() - startedAt })
+          // An accepted cancel with nothing that could take a signal (rclone.5
+          // review): the child never spawned — the exec rejected before
+          // anything ran — so the honest verdict is this failure, marked for
+          // the queue to end the job `failed` with the cancel in the reason.
+          if (cancel.requested())
+            throw new JobFailedDespiteCancelError(message)
           throw err
         }
       },

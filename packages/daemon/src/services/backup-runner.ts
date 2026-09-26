@@ -480,6 +480,15 @@ export interface BackupRunDeps {
    * then finds the backup's child already gone and says the run is finishing.
    */
   onSpawn?: (child: SpawnedChild) => void
+  /**
+   * rclone.5 review (backup parity) — the pre-flight boundary check, called at
+   * each one (before the source guard, before the transient snapshots, before
+   * the pbc exec) with what the next step would have done. Throws
+   * {@link JobCancelledError} when a cancel was already accepted, so the run
+   * ends `cancelled` there — its own `finally` still destroys anything taken.
+   * Absent = no boundary checks.
+   */
+  checkCancel?: (next: string) => void
 }
 
 export interface BackupRunResult {
@@ -597,6 +606,7 @@ export async function runBackup(
   // Fail-open is the helper's own contract: an unreadable fstab or mount table
   // yields no refusals, because a guard that cannot see the system must not
   // claim a mount is missing.
+  deps.checkCancel?.('the source guard')
   const guardFacts = await readSourceGuardFacts(executor, deps.fstabPath)
   const refusals: string[] = []
   for (const archive of task.archives) {
@@ -689,6 +699,8 @@ export async function runBackup(
     executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], { env, ...(deps.onSpawn ? { onSpawn: deps.onSpawn } : {}) })
 
   if (!snapshotMode) {
+    // The last boundary before anything runs (rclone.5 review).
+    deps.checkCancel?.('the proxmox-backup-client run')
     r = await exec(buildBackupArgs(task, namespace, liveIncludes))
   }
   else {
@@ -701,6 +713,9 @@ export async function runBackup(
     //   3. plan the expansion and build the argv from it;
     //   4. hold every AHR pool's top-level mount open across the ONE pbc call;
     //   5. destroy everything in a `finally`, mounts already released.
+    // The boundary between the read-only probes and the first mutation: past
+    // here a cancel leaves nothing taken (rclone.5 review).
+    deps.checkCancel?.('the transient snapshots')
     const zfsTargets = distinctZfsTargets(consistency)
     const ahrTargets = distinctAhrTargets(consistency, facts.ahrPools)
 
@@ -760,6 +775,9 @@ export async function runBackup(
       for (const c of consistency.filter(isZvolConsistency))
         byVolume.set(c.target as string, { volume: c.target as string, device: c.zvolDevice as string, label })
       const zvolSources = [...byVolume.values()]
+      // The last boundary before anything runs (rclone.5 review): the `finally`
+      // below still destroys every snapshot this branch took.
+      deps.checkCancel?.('the proxmox-backup-client run')
       const runPbc = async (): Promise<{ exitCode: number, stderr: string }> =>
         ahrTargets.length
           ? withTopLevelMounts(executor, ahrTargets, async () => exec(args), snapshotOptions)

@@ -465,6 +465,51 @@ describe('cloud sync task routes (rclone.2)', () => {
       assert.equal(mock.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'a cancel never notifies')
     })
 
+    it('rclone.5 review: a cancel accepted MID-PRE-FLIGHT ends the run cancelled at the next boundary — no snapshot, no exec', async () => {
+      await writeFile(join(srcDir, 'a.jpg'), 'x', 'utf-8')
+      await createTask({ source: srcDir, notify: 'always' })
+      const mock = mockOf(server)
+      mock.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
+      // The boundary scan as a live child: the body BLOCKS in its pre-flight
+      // (the guard, the stat and the listing are behind it), so the test can
+      // accept a cancel before the run's first mutation.
+      mock.addFixture({ command: TIMEOUT, live: { signalsToExit: Number.POSITIVE_INFINITY } })
+      mock.calls.length = 0
+
+      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: { direct: true } })
+      const runId = (res.json() as JobAccepted).job.id
+      for (let i = 0; i < 200 && !mock.calls.some(c => c.command === TIMEOUT); i++)
+        await new Promise(r => setTimeout(r, 5))
+
+      const first = await server.inject({ method: 'POST', url: `/v1/jobs/${runId}/cancel`, headers: IDENTITY })
+      assert.equal(first.statusCode, 409)
+      const confirm = await server.inject({
+        method: 'POST',
+        url: `/v1/jobs/${runId}/cancel`,
+        headers: { ...IDENTITY, 'x-anas-request-id': randomUUID(), 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) },
+      })
+      assert.equal(confirm.statusCode, 202, confirm.body)
+      assert.equal(
+        (await waitForJob(server, (confirm.json() as JobAccepted).job.id)).status,
+        'completed',
+        'the cancel is accepted at once: the run has no child to signal',
+      )
+
+      mock.finishLive() // release the blocked scan; the body walks into the next boundary
+      let run: Job | undefined
+      for (let i = 0; i < 200; i++) {
+        run = (await server.inject({ method: 'GET', url: `/v1/jobs/${runId}`, headers: IDENTITY }).then(r => r.json() as { job: Job })).job
+        if (run.status !== 'running')
+          break
+        await new Promise(r => setTimeout(r, 5))
+      }
+      assert.equal(run?.status, 'cancelled', JSON.stringify(run?.error))
+      assert.match((run.result as { reason: string }).reason, /^cancelled by root@pam at /)
+      assert.equal(mock.signals.length, 0, 'nothing was ever signalled')
+      assert.equal(mock.calls.filter(c => c.command === RCLONE).length, 0, 'the exec never happened')
+      assert.equal(mock.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'a cancel never notifies')
+    })
+
     it('a DIRECT run never re-enters systemctl — the recursion guard', async () => {
       await createTask({ source: '/nonexistent/source' })
       const before = mockOf(server).calls.filter(c => c.command === SYSTEMCTL).length

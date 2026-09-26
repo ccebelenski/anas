@@ -1,8 +1,11 @@
+import type { Job } from '@anas/shared'
 import type { AuditLogger } from '../../audit/logger.js'
 import type { CancelHook, JobContext } from '../queue.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { JobCancelledError, JobQueue } from '../queue.js'
+import { MockExecutor } from '../../executor/mock.js'
+import { assertRunNotCancelled, ChildCancel } from '../child-cancel.js'
+import { JobCancelledError, JobFailedDespiteCancelError, JobQueue } from '../queue.js'
 
 /**
  * The job queue's correlation queries.
@@ -252,5 +255,110 @@ describe('JobQueue.cancel (rclone.5)', () => {
     assert.equal(queue.get(queued.id)?.status, 'queued', 'the ordinary job still waits for the slot')
     assert.equal(queue.get(control.id)?.status, 'completed', 'the control job did not')
     assert.equal(queue.get(queued.id)?.status, 'queued', 'and it never consumed the slot')
+  })
+})
+
+/**
+ * rclone.5 review — the verdict an ACCEPTED cancel leads to. The route bodies'
+ * catch appears here in its exact shape (child-cancel.ts and the queue are the
+ * units under test): a cancel with no signal delivered never swallows a
+ * failure, and a body whose watched work was cancelled ends `cancelled`.
+ */
+describe('an accepted cancel and the job verdict (rclone.5 review)', () => {
+  const TOOL = '/usr/bin/tool'
+
+  async function terminal(queue: JobQueue, id: string): Promise<Job> {
+    for (let i = 0; i < 200; i++) {
+      const job = queue.get(id)
+      if (job && job.status !== 'queued' && job.status !== 'running')
+        return job
+      await new Promise(r => setTimeout(r, 5))
+    }
+    throw new Error(`job ${id} did not finish`)
+  }
+
+  /** A run body shaped like the route bodies': hook at once, then a gated pre-flight. */
+  function runBody(
+    work: (cancel: ChildCancel) => Promise<unknown>,
+    ready: () => void,
+    gated: Promise<void>,
+  ) {
+    return async (_progress: (m: string) => void, ctx: JobContext): Promise<unknown> => {
+      const cancel = new ChildCancel(ctx, 'rclone', {}, { waitMs: 20 })
+      ready()
+      await gated
+      return work(cancel)
+    }
+  }
+
+  it('a run that fails to spawn (ENOENT) after an accepted cancel ends FAILED, with the cancel in the reason', async () => {
+    const mock = new MockExecutor().addFixture({
+      command: TOOL,
+      throws: Object.assign(new Error('spawn /usr/bin/tool ENOENT'), { code: 'ENOENT' }),
+    })
+    const queue = new JobQueue()
+    let release: () => void = () => {}
+    const gated = new Promise<void>((r) => {
+      release = r
+    })
+    let up: () => void = () => {}
+    const hookIsUp = new Promise<void>((r) => {
+      up = r
+    })
+    const ref = queue.submit(
+      'cloud.task.run',
+      { user: 'root@pam', uid: 0, params: { task: 'photos', direct: true } },
+      runBody(async (cancel) => {
+        try {
+          return await mock.exec(TOOL, [], { onSpawn: cancel.onSpawn })
+        }
+        catch (err) {
+          if (err instanceof JobCancelledError || (cancel.requested() && cancel.stoppedOnPurpose()))
+            return null
+          const message = err instanceof Error ? err.message : String(err)
+          if (cancel.requested())
+            throw new JobFailedDespiteCancelError(message)
+          throw err
+        }
+      }, () => up(), gated),
+    )
+    await hookIsUp
+    await queue.cancel(ref.id, 'alice@pve') // accepted at once: there is no child yet
+    release()
+    const job = await terminal(queue, ref.id)
+    assert.equal(job.status, 'failed')
+    assert.match(
+      job.error?.message ?? '',
+      /^spawn \/usr\/bin\/tool ENOENT \(a cancel was requested at .+ but the run failed before it could be stopped\)$/,
+    )
+  })
+
+  it('a cancel accepted before the child spawns ends the run CANCELLED at the next boundary — no exec, no signal', async () => {
+    const mock = new MockExecutor().addFixture({ command: TOOL, live: {} })
+    const queue = new JobQueue()
+    let release: () => void = () => {}
+    const gated = new Promise<void>((r) => {
+      release = r
+    })
+    let up: () => void = () => {}
+    const hookIsUp = new Promise<void>((r) => {
+      up = r
+    })
+    const ref = queue.submit(
+      'cloud.task.run',
+      { user: 'root@pam', uid: 0, params: { task: 'photos', direct: true } },
+      runBody(async (cancel) => {
+        assertRunNotCancelled(cancel, 'the rclone run') // the pre-flight boundary, as the route wires it
+        return mock.exec(TOOL, [], { onSpawn: cancel.onSpawn })
+      }, () => up(), gated),
+    )
+    await hookIsUp
+    await queue.cancel(ref.id, 'alice@pve') // accepted while the body is still in its pre-flight
+    release()
+    const job = await terminal(queue, ref.id)
+    assert.equal(job.status, 'cancelled')
+    assert.match((job.result as { reason: string }).reason, /^cancelled by alice@pve at /)
+    assert.equal(mock.calls.length, 0, 'the exec never happened')
+    assert.equal(mock.signals.length, 0, 'nothing was ever signalled')
   })
 })

@@ -1,5 +1,6 @@
 import type { CloudSyncTask } from '@anas/shared'
 import type { ExecOptions, ExecResult } from '../../executor/types.js'
+import type { JobCancellation, JobContext } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -9,8 +10,8 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { CloudSyncTask as CloudSyncTaskSchema, stalledFor } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
-import { ChildCancel } from '../../jobs/child-cancel.js'
-import { JobQueue } from '../../jobs/queue.js'
+import { assertRunNotCancelled, ChildCancel } from '../../jobs/child-cancel.js'
+import { JobCancelledError, JobQueue } from '../../jobs/queue.js'
 import {
   buildRcloneArgs,
   CloudRunDetailTracker,
@@ -1043,6 +1044,72 @@ describe('execRclone — executor options (fix batch)', () => {
       assert.equal(result.bytes, 4194304, 'the counters came from re-reading r.stderr')
       assert.equal(result.countersReported, true)
       assert.deepEqual(h.progress.filter(p => p.startsWith('copy: ')), [], 'no live progress — the tee never fired')
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+})
+
+/**
+ * rclone.5 review — an accepted cancel ends the run at the NEXT pre-flight
+ * boundary, with `checkCancel` wired exactly as the route wires it
+ * (`assertRunNotCancelled` over the job's `ChildCancel`).
+ */
+describe('runCloudSync — an accepted cancel ends the pre-flight (rclone.5 review)', () => {
+  /** A minimal JobContext with a settable cancellation. */
+  function fakeCtx(): { ctx: JobContext, set: (c: JobCancellation | null) => void } {
+    let cancellation: JobCancellation | null = null
+    return {
+      ctx: { onCancel: () => {}, cancellation: () => cancellation, updateDetail: () => {} },
+      set: (c) => {
+        cancellation = c
+      },
+    }
+  }
+
+  it('a cancel accepted before the run ends it at the FIRST boundary — not even the guard runs', async () => {
+    const h = await harness()
+    try {
+      const f = fakeCtx()
+      const cancel = new ChildCancel(f.ctx, 'rclone', {}, { waitMs: 20 })
+      f.set({ user: 'alice@pve', at: '2026-09-25T14:02:11.000Z' })
+      await assert.rejects(
+        runCloudSync(h.mock, deps(h, { checkCancel: next => assertRunNotCancelled(cancel, next) }), () => {}),
+        JobCancelledError,
+      )
+      assert.equal(h.mock.calls.length, 0, 'nothing executed — the guard included')
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('a cancel accepted after the guard ends it before the snapshot and the exec', async () => {
+    const h = await harness()
+    try {
+      await mkdir(h.source, { recursive: true })
+      await writeFile(join(h.source, 'a.jpg'), 'x', 'utf-8')
+      const f = fakeCtx()
+      const cancel = new ChildCancel(f.ctx, 'rclone', {}, { waitMs: 20 })
+      const boundaries: string[] = []
+      await assert.rejects(
+        runCloudSync(h.mock, deps(h, {
+          checkCancel: (next) => {
+            boundaries.push(next)
+            if (next === 'the transient snapshot')
+              f.set({ user: 'alice@pve', at: '2026-09-25T14:02:11.000Z' }) // the cancel lands between the guard and the snapshot
+            assertRunNotCancelled(cancel, next)
+          },
+        }), () => {}),
+        JobCancelledError,
+      )
+      assert.deepEqual(boundaries, ['the source guard', 'the transient snapshot'], 'the exec boundary is never reached')
+      assert.ok(!h.mock.calls.some(c => c.command === RCLONE), 'rclone never ran')
+      assert.ok(
+        !h.mock.calls.some(c => c.command === ZFS && c.args[0] === 'snapshot'),
+        'no snapshot was taken',
+      )
     }
     finally {
       await h.cleanup()

@@ -4,7 +4,8 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { ProdExecutor } from '../../executor/prod.js'
-import { CANCEL_SIGNAL_WAIT_MS, ChildCancel, stopChild } from '../child-cancel.js'
+import { assertRunNotCancelled, CANCEL_SIGNAL_WAIT_MS, ChildCancel, stopChild } from '../child-cancel.js'
+import { JobCancelledError } from '../queue.js'
 
 /**
  * rclone.5 — the ONE cancel hook the cloud and backup direct runs register:
@@ -86,12 +87,15 @@ describe('stopChild — the SIGINT ladder (rclone.5)', () => {
     mock.finishLive()
   })
 
-  it('a child that already exited is not "cancelled" — the run is finishing on its own', async () => {
+  it('a child that cannot be signalled fails the cancel — the run continues on its own (rclone.5 review)', async () => {
     const mock = new MockExecutor().addFixture({ command: TOOL, live: {} })
     const { child } = await liveChild(mock)
     mock.finishLive()
     await new Promise(r => setImmediate(r))
-    await assert.rejects(stopChild(child, 'rclone', FAST), /has already exited — the run is finishing on its own/)
+    await assert.rejects(
+      stopChild(child, 'rclone', FAST),
+      /rclone \(pid \d+\) could not be signalled \(it may have already exited\); the run continues on its own/,
+    )
     assert.equal(mock.signals.length, 0)
   })
 
@@ -147,5 +151,66 @@ describe('ChildCancel — wiring the hook to the job (rclone.5)', () => {
   it('no job context (a caller outside the queue) = nothing registered, nothing requested', () => {
     const cancel = new ChildCancel(undefined, 'rclone')
     assert.equal(cancel.requested(), false)
+  })
+
+  it('signalled() is false until a SIGINT actually went out, and true after one did (rclone.5 review)', async () => {
+    const f = fakeCtx()
+    const cancel = new ChildCancel(f.ctx, 'rclone', {}, FAST)
+    assert.equal(cancel.signalled(), false, 'nothing delivered before anything ran')
+    const mock = new MockExecutor().addFixture({ command: TOOL, live: {} })
+    const done = mock.exec(TOOL, [], { onSpawn: cancel.onSpawn })
+    await new Promise(r => setImmediate(r))
+    const by = { user: 'alice@pve', at: '2026-09-25T14:02:11.000Z' }
+    f.set(by)
+    await f.hook()!(by)
+    assert.equal(cancel.signalled(), true, 'the hook delivered the SIGINT')
+    await done
+  })
+
+  it('signalled() stays FALSE when the hook failed — a run that ended on its own was not stopped on purpose', async () => {
+    const f = fakeCtx()
+    const cancel = new ChildCancel(f.ctx, 'rclone', {}, FAST)
+    const mock = new MockExecutor().addFixture({ command: TOOL, live: {} })
+    const done = mock.exec(TOOL, [], { onSpawn: cancel.onSpawn })
+    await new Promise(r => setImmediate(r))
+    mock.finishLive()
+    await new Promise(r => setImmediate(r))
+    f.set({ user: 'alice@pve', at: '2026-09-25T14:02:11.000Z' })
+    await assert.rejects(
+      f.hook()!({ user: 'alice@pve', at: '2026-09-25T14:02:11.000Z' }),
+      /could not be signalled/,
+    )
+    assert.equal(cancel.signalled(), false, 'no signal was ever delivered')
+    assert.equal(cancel.requested(), true, 'the cancellation is still recorded as requested')
+    await done
+  })
+
+  it('signalled() stays FALSE when the hook resolved with no child at all (accepted before the spawn)', async () => {
+    const f = fakeCtx()
+    const cancel = new ChildCancel(f.ctx, 'rclone', {}, FAST)
+    f.set({ user: 'alice@pve', at: '2026-09-25T14:02:11.000Z' })
+    await f.hook()!({ user: 'alice@pve', at: '2026-09-25T14:02:11.000Z' })
+    assert.equal(cancel.signalled(), false, 'there was nothing to signal')
+    assert.equal(cancel.requested(), true)
+  })
+})
+
+describe('assertRunNotCancelled — the pre-flight boundary (rclone.5 review)', () => {
+  it('passes when no cancel is pending or accepted', () => {
+    const f = fakeCtx()
+    const cancel = new ChildCancel(f.ctx, 'rclone', {}, FAST)
+    assert.doesNotThrow(() => assertRunNotCancelled(cancel, 'the rclone run'))
+  })
+
+  it('throws the cancellation with the step it skipped when one was accepted', () => {
+    const f = fakeCtx()
+    const cancel = new ChildCancel(f.ctx, 'rclone', {}, FAST)
+    const by = { user: 'alice@pve', at: '2026-09-25T14:02:11.000Z' }
+    f.set(by)
+    assert.throws(
+      () => assertRunNotCancelled(cancel, 'the transient snapshot'),
+      (err: unknown) => err instanceof JobCancelledError
+        && err.message === 'cancelled by alice@pve at 2026-09-25T14:02:11.000Z before the transient snapshot',
+    )
   })
 })

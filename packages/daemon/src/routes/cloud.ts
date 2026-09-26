@@ -25,7 +25,8 @@ import {
   CloudSyncRunRequest,
   CloudSyncTaskRequest,
 } from '@anas/shared'
-import { ChildCancel } from '../jobs/child-cancel.js'
+import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
+import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyCloudRun } from '../services/cloud-notify.js'
@@ -861,6 +862,10 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
           subject: `Cloud sync task '${name}'`,
           consequence: CLOUD_CANCEL_CONSEQUENCE,
         })
+        // rclone.5 review: an accepted cancel ends the run at the NEXT
+        // pre-flight boundary, not after it — the guard, the transient
+        // snapshot and the exec each get one (the service takes them through
+        // `checkCancel`; `assertRunNotCancelled` is the one shared check).
         const task = await readTask(systemdDir, name)
         if (!task)
           throw new Error(`Cloud sync task '${name}' not found`)
@@ -870,6 +875,7 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
         // is also the one place a run notification is emitted.
         const startedAt = Date.now()
         try {
+          assertRunNotCancelled(cancel, 'the cadence gate')
           // Cadence gate: a biweekly task runs on a WEEKLY timer because
           // OnCalendar cannot say "every other week", so an off-week SCHEDULED
           // fire stops here as a first-class, visible skip. A Run Now is never
@@ -890,6 +896,7 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
               fstabPath,
               ...(opts.storagePath ? { consistencyOptions: { pveStorageCfg: opts.storagePath } } : {}),
               onSpawn: cancel.onSpawn,
+              checkCancel: next => assertRunNotCancelled(cancel, next),
               // rclone.6: the run's live detail rides on the job itself, beside
               // the text progress — `GET /v1/jobs/:id` carries both.
               onDetail: ctx.updateDetail,
@@ -906,10 +913,20 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
           return result
         }
         catch (err) {
-          if (cancel.requested())
+          // The boundary check's throw IS the cancellation, and so is a run
+          // that had a child to be stopped (rclone.5 review): the queue's own
+          // settle awaits the hook, so the verdict is `cancelled` whatever
+          // microtask order the child's death arrived in.
+          if (err instanceof JobCancelledError || (cancel.requested() && cancel.stoppedOnPurpose()))
             return logCancelledRun(name)
           const message = err instanceof Error ? err.message : String(err)
           await notifyCloudRun(executor, { task, error: message, elapsedMs: Date.now() - startedAt })
+          // An accepted cancel with nothing that could take a signal (rclone.5
+          // review): the child never spawned — the exec rejected before
+          // anything ran — so the honest verdict is this failure, marked for
+          // the queue to end the job `failed` with the cancel in the reason.
+          if (cancel.requested())
+            throw new JobFailedDespiteCancelError(message)
           throw err
         }
       },

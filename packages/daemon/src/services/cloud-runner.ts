@@ -694,6 +694,14 @@ export interface CloudRunDeps {
    */
   onSpawn?: (child: SpawnedChild) => void
   /**
+   * rclone.5 review — the pre-flight boundary check, called at each one (before
+   * the source guard, before the transient snapshot, before the exec) with what
+   * the next step would have done. Throws {@link JobCancelledError} when a
+   * cancel was already accepted, so the run ends `cancelled` there — its own
+   * `finally` still destroys anything taken. Absent = no boundary checks.
+   */
+  checkCancel?: (next: string) => void
+  /**
    * rclone.6 — handed the run's live {@link CloudRunDetail} after every stats
    * object, for the job to publish through the queue's `updateDetail`.
    * Per-file events update the tracker's rings and are carried out by the
@@ -734,6 +742,7 @@ export async function runCloudSync(
   // ---- 1. Source guards --------------------------------------------------
   // The unmounted-mount check runs FIRST: it is the one that explains an empty
   // directory, and it is the only one that can answer without touching the path.
+  deps.checkCancel?.('the source guard')
   const guardFacts = await readSourceGuardFacts(executor, deps.fstabPath)
   const refusal = guardSourcePath(task.source, guardFacts)
   if (refusal)
@@ -776,6 +785,9 @@ export async function runCloudSync(
   const facts = await readConsistencyFacts(executor, readAhrPools, deps.consistencyOptions ?? {})
   const consistency = deriveConsistency(task.source, facts)
   updateProgress(`source consistency: ${consistency.consistency} - ${consistency.reason}`)
+  // The boundary between the read-only probes and the first mutation: past
+  // here a cancel leaves nothing taken — the snapshot below never happens.
+  deps.checkCancel?.('the transient snapshot')
 
   const taken: TakenSnapshot[] = []
   let result: CloudSyncRunResult
@@ -787,6 +799,11 @@ export async function runCloudSync(
     // ANAS makes. Nothing secret is in scope here (see `deps.secrets`), so it
     // normally has nothing to check — which is the point of a backstop.
     assertNoSecretValues(args, deps.secrets ?? [])
+
+    // The last boundary before anything runs (rclone.5 review): a cancel
+    // accepted by now ends the run here — the `finally` below still destroys
+    // the snapshot the plan may have taken.
+    deps.checkCancel?.('the rclone run')
 
     // rclone.6 — the live detail the run publishes on its job, fed by the same
     // stream the progress text is. Built only when someone is listening.

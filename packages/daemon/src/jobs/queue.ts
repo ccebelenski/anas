@@ -68,6 +68,21 @@ export class JobCancelledError extends Error {
   }
 }
 
+/**
+ * Thrown by a job body whose run FAILED even though a cancel had already been
+ * accepted for it (rclone.5 review): the child the cancel was accepted to stop
+ * never existed — a missing binary rejects the exec before anything spawned —
+ * so there was nothing to stop and the honest verdict is the failure. The
+ * queue ends the job `failed` with the body's error and remembers the accepted
+ * cancel in the reason, instead of the `cancelled` row a mask would give.
+ */
+export class JobFailedDespiteCancelError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'JobFailedDespiteCancelError'
+  }
+}
+
 /** The sentence a cancelled job's result carries: "cancelled by <user> at <time>". */
 export function cancelledReason(by: JobCancellation): string {
   return `cancelled by ${by.user} at ${by.at}`
@@ -416,6 +431,13 @@ export class JobQueue {
       await record.cancelRun
 
     try {
+      // A body that failed BEFORE the child an accepted cancel was waiting for
+      // ever existed marks its error (rclone.5 review): the verdict is that
+      // failure — with the cancel remembered in the reason — never a cancelled
+      // row for a run that never got going. Checked BEFORE the cancelled
+      // verdict below, which is why the marker exists at all.
+      if (!outcome.ok && outcome.err instanceof JobFailedDespiteCancelError)
+        throw outcome.err
       if (record.cancelled && record.cancelling) {
         this.finishCancelled(record, cancelledReason(record.cancelling), startTime, record.cancelling)
         return
@@ -443,7 +465,14 @@ export class JobQueue {
     }
     catch (err) {
       job.status = 'failed'
-      const message = err instanceof Error ? err.message : String(err)
+      const base = err instanceof Error ? err.message : String(err)
+      // The marker's suffix (rclone.5 review): the accepted cancel is part of
+      // the run's story, so the reason tells it — a cancel that was asked for
+      // and then had nothing to stop. `cancelling` is still set here (it is
+      // only cleared when the hook itself fails, which is not this path).
+      const message = err instanceof JobFailedDespiteCancelError && record.cancelling
+        ? `${base} (a cancel was requested at ${record.cancelling.at} but the run failed before it could be stopped)`
+        : base
       job.error = { code: 'JOB_FAILED', message }
 
       this.audit?.finished(
@@ -501,6 +530,11 @@ export function cancelRefusalMessage(refusal: CancelRefusal, id: string): string
     case 'finished':
       return `Job '${id}' (${refusal.job.operation}) is not running — it already ended ${refusal.job.status}`
     case 'not-cancellable':
+      // A QUEUED job has no hook yet — the body registers one when it starts —
+      // so it is refused, but with its own sentence (rclone.5 review): "has
+      // been running" would be a lie about a run that has not started.
+      if (refusal.job.status === 'queued' && refusal.job.startedAt === null)
+        return `Job '${id}' (${refusal.job.operation}) is queued and has not started — it can be cancelled once it starts`
       return `Job '${id}' (${refusal.job.operation}) cannot be cancelled — it registers no way to stop its work; wait for it to finish`
     case 'in-progress':
       return `Job '${id}' (${refusal.job.operation}) is already being cancelled (${cancelledReason(refusal.by)})`

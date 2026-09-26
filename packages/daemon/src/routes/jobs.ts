@@ -35,8 +35,13 @@ export function formatElapsed(ms: number): string {
  */
 export function cancelHeadline(job: Job, meta: CancelMeta, now: number = Date.now()): string {
   const subject = meta.subject ?? `Job '${job.operation}'`
-  const started = job.startedAt ? Date.parse(job.startedAt) : Number.NaN
-  const elapsed = Number.isNaN(started) ? '' : ` for ${formatElapsed(now - started)}`
+  // A job with no startedAt has not started (rclone.5 review): "has been
+  // running" would be a lie. The route refuses such a job before any code is
+  // minted — a queued body registers no hook — so this arm is the headline
+  // never claiming a run that does not exist, whatever the queue does later.
+  if (job.startedAt === null)
+    return `${subject} is queued and has not started; it can be cancelled once it starts`
+  const elapsed = ` for ${formatElapsed(now - Date.parse(job.startedAt))}`
   const progress = typeof job.progress === 'string' && job.progress.trim() ? ` — ${job.progress.trim()}` : ''
   return `${subject} has been running${elapsed}${progress}; cancelling stops it here`
 }

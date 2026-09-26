@@ -39,6 +39,13 @@ export interface MockFixture {
    * ladder without a real process.
    */
   live?: MockLiveChild
+  /**
+   * The exec REJECTS with this error instead of resolving — a process that
+   * could not start (ENOENT/EACCES), the contract `execFile` has. A live child
+   * and a throwing fixture are mutually exclusive: a throw means nothing ever
+   * spawned, so no `onSpawn` runs either.
+   */
+  throws?: Error
 }
 
 /** How a {@link MockFixture.live} child answers signals. */
@@ -225,6 +232,8 @@ export class MockExecutor implements CommandExecutor {
     )
     if (match?.live)
       return this.liveExec({ ...match, live: match.live }, opts)
+    if (match?.throws)
+      throw match.throws
     if (match)
       return this.tee(this.resultOf(match), match, opts)
 
