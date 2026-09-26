@@ -23,6 +23,13 @@ import { cloudRoutes, RCLONE_NOT_INSTALLED } from '../cloud.js'
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone/providers-1.60.1.json')
 const PROVIDERS_STDOUT = await readFile(FIXTURE, 'utf-8')
 
+// The shared own-client vectors, read straight from the shared package — the
+// three consumers (this suite, the shared unit test, the dialog-contracts
+// harness) cannot drift.
+const OWN_CLIENT_CASES: { name: string, backend: string, options: Record<string, string>, ok: boolean, message?: string }[] = JSON.parse(
+  await readFile(join(dirname(fileURLToPath(import.meta.url)), '../../../../shared/test-vectors/own-client.json'), 'utf-8'),
+)
+
 const IDENTITY = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
@@ -468,6 +475,94 @@ describe('cloud remotes routes (rclone.1)', () => {
       // The env-defined remote carries the NORMALISED text — the same bytes a
       // save would write.
       assert.equal(env.RCLONE_CONFIG_ANASTEST_TOKEN, TOKEN)
+    })
+  })
+
+  // --- The own-OAuth-client fields (rclone.4 rider, human-pass finding) -------
+  // A made-up `client_id` (the operator's remote carried the word `gdrive`)
+  // silently overrides rclone's built-in client, and a refresh token issued
+  // by the built-in one can never be refreshed under it — the Test verdict
+  // cannot catch that. Every door that accepts remote options therefore runs
+  // the SHARED rule (`validateOwnClient`), over the SAME vectors the UI port
+  // is pinned to, answering 400 with the sentence before anything is written
+  // or probed.
+  describe('the own-OAuth-client fields are validated at every door', () => {
+    /** The config file's text ('' when it was never written). */
+    async function fileText(): Promise<string> {
+      try {
+        return await readFile(configFile, 'utf-8')
+      }
+      catch {
+        return ''
+      }
+    }
+
+    it('POST /cloud/remotes: a refusal vector → 400 with the sentence, nothing written; a valid vector → 202', async () => {
+      for (const [i, c] of OWN_CLIENT_CASES.entries()) {
+        const name = `oc${i}`
+        const res = await server.inject({
+          method: 'POST',
+          url: '/v1/cloud/remotes',
+          headers: JSON_HEADERS,
+          payload: JSON.stringify({ name, type: c.backend, options: c.options }),
+        })
+        if (!c.ok) {
+          assert.equal(res.statusCode, 400, c.name)
+          assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+          assert.equal(res.json().error.message, c.message, c.name)
+          // Earlier valid vectors may have written their own sections — THIS
+          // one must not be among them.
+          assert.ok(!(await fileText()).includes(`[${name}]`), `the refusal wrote nothing (${c.name})`)
+        }
+        else {
+          assert.equal(res.statusCode, 202, c.name)
+        }
+      }
+    })
+
+    it('PUT /cloud/remotes/:name: a refusal vector → 400 with the sentence, nothing written; a valid vector → 202', async () => {
+      for (const [i, c] of OWN_CLIENT_CASES.entries()) {
+        const name = `pu${i}`
+        await writeFile(configFile, `[${name}]\ntype = ${c.backend}\n`, 'utf-8')
+        const res = await server.inject({
+          method: 'PUT',
+          url: `/v1/cloud/remotes/${name}`,
+          headers: JSON_HEADERS,
+          payload: JSON.stringify({ options: c.options }),
+        })
+        if (!c.ok) {
+          assert.equal(res.statusCode, 400, c.name)
+          assert.equal(res.json().error.message, c.message, c.name)
+          assert.ok(!(await fileText()).includes(`client_id =`), `the refusal wrote nothing (${c.name})`)
+        }
+        else {
+          assert.equal(res.statusCode, 202, c.name)
+        }
+      }
+    })
+
+    it('POST /cloud/remotes/test: a refusal vector → 400 with the sentence, the probe never runs; a valid vector → 200', async () => {
+      mockOf(server).addFixture({ command: '/usr/bin/timeout', result: { stdout: '[]', stderr: '', exitCode: 0 } })
+      for (const c of OWN_CLIENT_CASES) {
+        const res = await server.inject({
+          method: 'POST',
+          url: '/v1/cloud/remotes/test',
+          headers: JSON_HEADERS,
+          payload: JSON.stringify({ remote: { name: 'draft', type: c.backend, options: c.options } }),
+        })
+        if (!c.ok) {
+          assert.equal(res.statusCode, 400, c.name)
+          assert.equal(res.json().error.message, c.message, c.name)
+        }
+        else {
+          assert.equal(res.statusCode, 200, c.name)
+        }
+      }
+      // The refusals never reached the probe: one probe call per VALID vector.
+      assert.equal(
+        mockOf(server).calls.filter(c => c.command === '/usr/bin/timeout').length,
+        OWN_CLIENT_CASES.filter(c => c.ok).length,
+      )
     })
   })
 

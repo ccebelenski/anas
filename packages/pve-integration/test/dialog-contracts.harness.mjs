@@ -11826,8 +11826,11 @@ async function cloudChecks() {
     !!cloudOption(dlg, 'root_folder_id')
       && cloudRowOrder(dlg, 'cloudOptionsAdvanced').indexOf('root_folder_id') >= 0)
   cloudOption(dlg, 'token').setValue(TOKEN_OBJ)
+  // A WELL-FORMED PAIR — the rider's gate refuses a made-up id and a lone
+  // id alike before Save.
   ok('cloud(drive curated): a typed own-client value rides the create body with the fieldset collapsed',
-    cloudOption(dlg, 'client_id').setValue('my-client')
+    cloudOption(dlg, 'client_id').setValue('1234567890-abc123def456.apps.googleusercontent.com')
+      && cloudOption(dlg, 'client_secret').setValue('GOCSPX-real')
       && dlg.down('#cloudAdvanced').setValue(false))
   await settle()
   jobs.length = 0
@@ -11835,7 +11838,7 @@ async function cloudChecks() {
   await settle()
   eq('cloud(drive curated): the create body carries the collapsed group\'s typed value',
     jobs[0] && jobs[0].body,
-    { name: 'gd4', type: 'drive', options: { client_id: 'my-client', token: TOKEN_OBJ } })
+    { name: 'gd4', type: 'drive', options: { client_id: '1234567890-abc123def456.apps.googleusercontent.com', client_secret: 'GOCSPX-real', token: TOKEN_OBJ } })
   created.windows.length = 0
 
   // s3: exactly the five primary fields; the guide names the access-key page.
@@ -13304,6 +13307,16 @@ async function sharedVectorChecks() {
     const got = cANAS.cloud.normalizeOAuthToken(c.input)
     ok('token vector: ' + JSON.stringify(c.input).slice(0, 48),
       got.ok === c.ok && got.value === c.value, JSON.stringify(got))
+  }
+  // The own-OAuth-client guard (rclone.4 rider): the dialog's ES5 port of
+  // `validateOwnClient` over the shared vectors — the daemon's doors run the
+  // typed original, pinned by the same file.
+  const ownClientCases = JSON.parse(
+    readFileSync(join(HERE, '..', '..', 'shared', 'test-vectors', 'own-client.json'), 'utf8'))
+  for (const c of ownClientCases) {
+    const got = cANAS.cloud.validateOwnClient(c.backend, c.options)
+    ok('own-client vector: ' + c.name,
+      got.ok === c.ok && (c.message === undefined || got.message === c.message), JSON.stringify(got))
   }
 }
 

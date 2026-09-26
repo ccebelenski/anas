@@ -24,6 +24,7 @@ import {
   CloudSyncPreviewTask as CloudSyncPreviewTaskSchema,
   CloudSyncRunRequest,
   CloudSyncTaskRequest,
+  validateOwnClient,
 } from '@anas/shared'
 import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
@@ -245,6 +246,19 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
   }
 
   /**
+   * The save-time own-OAuth-client guard (rclone.4 rider, human-pass finding
+   * 2026-09-26): a non-empty `client_id` silently overrides rclone's built-in
+   * client, and a refresh token issued by the built-in one can never be
+   * refreshed under a made-up one — the Test verdict cannot catch it (it does
+   * not refresh). The shared rule answers the sentence; the door answers 400
+   * with it, before anything is written or probed.
+   */
+  function ownClientRefusal(backend: string, options: Record<string, string>): string | null {
+    const verdict = validateOwnClient(backend, options)
+    return verdict.ok ? null : verdict.message
+  }
+
+  /**
    * The encrypted-file refusal, the same sentence on every mutation door.
    * Sends and voids: a precheck that refuses has already replied, and the
    * `null` it returns is the "already refused" sentinel the handlers check —
@@ -293,6 +307,11 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       return { error: { code: 'VALIDATION_ERROR', message: OAUTH_TOKEN_ERROR } }
     }
     input.options = normalized
+    const ownClient = ownClientRefusal(input.type, input.options)
+    if (ownClient !== null) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: ownClient } }
+    }
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -373,6 +392,12 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       const existing = current.remotes.find(r => r.name === name)
       if (!existing) {
         reply.code(404).send({ error: { code: 'NOT_FOUND', message: `remote '${name}' does not exist` } })
+        return null
+      }
+      // The update door judges the fields against the STORED backend's type.
+      const ownClient = ownClientRefusal(existing.type, input.options)
+      if (ownClient !== null) {
+        reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: ownClient } })
         return null
       }
       return { catalog, type: existing.type }
@@ -456,6 +481,11 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
         return { error: { code: 'VALIDATION_ERROR', message: OAUTH_TOKEN_ERROR } }
       }
       req.remote.options = normalized
+      const ownClient = ownClientRefusal(req.remote.type, req.remote.options)
+      if (ownClient !== null) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: ownClient } }
+      }
     }
 
     const identity = requireIdentity(request, reply)

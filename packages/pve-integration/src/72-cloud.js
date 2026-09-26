@@ -694,6 +694,120 @@
         return oauthTokenBlur(cmp).ok;
     }
 
+    // ======================================================================
+    //  The own-OAuth-client guard (rclone.4 rider, human-pass finding
+    //  2026-09-26): a non-empty client_id silently overrides rclone's
+    //  built-in client, and a refresh token issued by the built-in one can
+    //  never be refreshed under a made-up one — the Test verdict cannot
+    //  catch it (it does not refresh). The fields are validated HERE, on
+    //  blur and before Test/Save, and the daemon re-checks at its doors.
+    //  ES5 port of `validateOwnClient` in packages/shared/src/cloud-guide.ts
+    //  — pinned to the shared vectors by the dialog-contracts harness.
+    // ======================================================================
+
+    // The pair refusal — the two fields are one decision, never either alone.
+    var OWN_CLIENT_PAIR_ERROR = 'Client ID and client secret must be set together.';
+
+    // The provider label a shape refusal names.
+    var OWN_CLIENT_PROVIDERS = {
+        drive: 'Google',
+        onedrive: 'Microsoft',
+        dropbox: 'Dropbox',
+        box: 'Box',
+        pcloud: 'pCloud',
+    };
+
+    // The client-id shape per provider; Dropbox, Box and pCloud publish no
+    // stricter shape than this.
+    function ownClientIdShape(backend, id) {
+        if (backend === 'drive') {
+            return /^\d+-[a-z0-9]+\.apps\.googleusercontent\.com$/.test(id);
+        }
+        if (backend === 'onedrive') {
+            return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(id);
+        }
+        return /^\S+$/.test(id);
+    }
+
+    function ownClientIdSentence(value, provider) {
+        return t('The client ID \'' + value + '\' is not a ' + provider
+            + ' OAuth client ID; leave both client fields empty to use rclone\'s '
+            + 'built-in client, or paste the ID and secret of a client you created.');
+    }
+
+    // The shared rule: the fields must be empty (rclone's built-in client) or
+    // name a real client of the provider — the id matches the provider's own
+    // shape, and id and secret are set together. Returns { ok, message? }.
+    function validateOwnClient(backend, options) {
+        var provider = OWN_CLIENT_PROVIDERS[backend];
+        if (!provider) {
+            return { ok: true };
+        }
+        var id = trim((options && options.client_id == null) ? '' : '' + options.client_id);
+        var secret = trim((options && options.client_secret == null) ? '' : '' + options.client_secret);
+        if (id && !ownClientIdShape(backend, id)) {
+            return { ok: false, message: ownClientIdSentence(id, provider) };
+        }
+        if (!!id !== !!secret) {
+            return { ok: false, message: t(OWN_CLIENT_PAIR_ERROR) };
+        }
+        return { ok: true };
+    }
+
+    // The own-client values the dialog HOLDS (the stash + the rendered fields,
+    // exactly what the wire body would carry) — the input the rule judges.
+    function ownClientValues(win) {
+        var vals = dialogValues(win);
+        return { client_id: vals.client_id, client_secret: vals.client_secret };
+    }
+
+    // Mark (or clear) one option field's inline error. Fail-open on the mark:
+    // the gate and the send guards re-check the values regardless of whether
+    // the field carries the mark API.
+    function markOptionField(win, name, message) {
+        var cmp = null;
+        try { cmp = win.down('#cloudOpt_' + name); } catch (e) { cmp = null; }
+        if (!cmp) {
+            return;
+        }
+        try {
+            if (message) {
+                cmp.markInvalid(message);
+            } else {
+                cmp.clearInvalid();
+            }
+        } catch (eMark) { /* non-fatal */ }
+    }
+
+    // Validate what the dialog holds against the chosen backend and mark the
+    // offending field: the id on a shape refusal, the field that CARRIES the
+    // value on a pair refusal. Returns the verdict.
+    function ownClientMark(win) {
+        var type = trim(valOf(win, '#cloudRemoteType') || '');
+        var vals = ownClientValues(win);
+        var res = validateOwnClient(type, vals);
+        var idMsg = '';
+        var secretMsg = '';
+        if (!res.ok) {
+            if (trim(vals.client_id || '')) {
+                idMsg = res.message;
+            } else {
+                secretMsg = res.message;
+            }
+        }
+        markOptionField(win, 'client_id', idMsg);
+        markOptionField(win, 'client_secret', secretMsg);
+        return res.ok;
+    }
+
+    // The inline error for the current own-client values, '' when valid. The
+    // button gate reads it, so Test and Save wait for a well-formed pair.
+    function ownClientProblem(win) {
+        var type = trim(valOf(win, '#cloudRemoteType') || '');
+        var res = validateOwnClient(type, ownClientValues(win));
+        return res.ok ? '' : res.message;
+    }
+
     // Snapshot every rendered option field's EFFECTIVE value (a string, or
     // '' when the field represents "nothing set"), so a rebuild on a
     // type/provider/advanced change keeps what was typed. Effective rules:
@@ -886,6 +1000,19 @@
         if (opt.name === 'token') {
             l.blur = function () { oauthTokenBlur(this); };
         }
+        // The own-client pair (rclone.4 rider): the blur re-checks BOTH fields
+        // and marks (or clears) the offender — the fields are one decision.
+        if (opt.name === 'client_id' || opt.name === 'client_secret') {
+            l.blur = function () {
+                var w = this.up('window');
+                if (w) {
+                    ownClientMark(w);
+                    if (w._cloudRefresh) {
+                        w._cloudRefresh();
+                    }
+                }
+            };
+        }
         return l;
     }
 
@@ -983,15 +1110,17 @@
 
     // Live gate: Test and Save stay disabled until the name is a valid remote
     // name, a type is chosen, every REQUIRED rendered field carries a value,
-    // and the token field (an OAuth backend) is not sitting on a paste that
-    // never becomes a JSON object. A hidden (provider-filtered) required field
-    // cannot block — it is not part of this form.
+    // the token field (an OAuth backend) is not sitting on a paste that never
+    // becomes a JSON object, and the own-client pair is well formed (rclone.4
+    // rider). A hidden (provider-filtered) required field cannot block — it is
+    // not part of this form.
     function refreshDialogButtons(win) {
         var name = trim(valOf(win, '#cloudRemoteName') || '');
         var type = trim(valOf(win, '#cloudRemoteType') || '');
         var missing = requiredMissing(win);
         var tokenErr = oauthTokenProblem(win);
-        var ok = REMOTE_NAME_RE.test(name) && !!type && !missing && !tokenErr;
+        var ownClientErr = ownClientProblem(win);
+        var ok = REMOTE_NAME_RE.test(name) && !!type && !missing && !tokenErr && !ownClientErr;
         try {
             var testBtn = win.down('#cloudTestBtn');
             if (testBtn) { testBtn.setDisabled(!ok); }
@@ -1386,6 +1515,9 @@
         if (!normalizeTokenField(win)) {
             return;
         }
+        if (!ownClientMark(win)) {
+            return;
+        }
         var area = win.down('#cloudTestResult');
         if (area) {
             try {
@@ -1435,6 +1567,9 @@
             return;
         }
         if (!normalizeTokenField(win)) {
+            return;
+        }
+        if (!ownClientMark(win)) {
             return;
         }
         var body;
@@ -4295,6 +4430,10 @@
         // through the UI's OWN copy — the daemon's parser is pinned by the
         // same vectors, so the two cannot drift.
         normalizeOAuthToken: normalizeOAuthToken,
+        // rclone.4 rider: `validateOwnClient` is exported for the same
+        // harness pattern, over `packages/shared/test-vectors/own-client.json`
+        // — the daemon's doors run the shared rule the port literalises.
+        validateOwnClient: validateOwnClient,
         // The grid's per-task run-detail map (rclone.6 review batch B) —
         // exposed for the harness to seed and assert against.
         rowDetailBagOf: function (grid) {

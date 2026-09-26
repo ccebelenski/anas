@@ -3,11 +3,15 @@
 export const VERSION = '0.3.5'
 
 // Cloud remote-form curation table (rclone.4) — the ONE display-side guide
-// the daemon's catalogue trim consumes; the UI renders from the trim.
+// the daemon's catalogue trim consumes; the UI renders from the trim. The
+// rider adds the save-time own-OAuth-client guard, run at both boundaries
+// (the daemon's doors and the dialog's ES5 port) over
+// `test-vectors/own-client.json`.
 export {
   CLOUD_BACKEND_GUIDES,
+  validateOwnClient,
 } from './cloud-guide.js'
-export type { CloudBackendGuide } from './cloud-guide.js'
+export type { CloudBackendGuide, OwnClientVerdict } from './cloud-guide.js'
 
 // Cloud run display helpers (rclone.6) — the ONE stalled rule and the pinned
 // stats cadence, shared by the daemon's run detail and the UI's label, with

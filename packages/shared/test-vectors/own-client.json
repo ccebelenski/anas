@@ -1,0 +1,85 @@
+[
+  {
+    "name": "a real Google client id and its secret",
+    "backend": "drive",
+    "options": { "client_id": "1234567890-abc123def456.apps.googleusercontent.com", "client_secret": "GOCSPX-real" },
+    "ok": true
+  },
+  {
+    "name": "the word typed into the field (the 2026-09-26 finding)",
+    "backend": "drive",
+    "options": { "client_id": "gdrive", "client_secret": "GOCSPX-real" },
+    "ok": false,
+    "message": "The client ID 'gdrive' is not a Google OAuth client ID; leave both client fields empty to use rclone's built-in client, or paste the ID and secret of a client you created."
+  },
+  {
+    "name": "both fields empty — rclone's built-in client",
+    "backend": "drive",
+    "options": { "client_id": "", "client_secret": "" },
+    "ok": true
+  },
+  {
+    "name": "a lone id",
+    "backend": "drive",
+    "options": { "client_id": "1234567890-abc123def456.apps.googleusercontent.com" },
+    "ok": false,
+    "message": "Client ID and client secret must be set together."
+  },
+  {
+    "name": "a lone secret",
+    "backend": "drive",
+    "options": { "client_secret": "GOCSPX-real" },
+    "ok": false,
+    "message": "Client ID and client secret must be set together."
+  },
+  {
+    "name": "no client fields at all",
+    "backend": "drive",
+    "options": { "token": "{\"access_token\":\"ya29.a0Af\"}" },
+    "ok": true
+  },
+  {
+    "name": "a Microsoft client id (a UUID)",
+    "backend": "onedrive",
+    "options": { "client_id": "11111111-2222-3333-4444-555555555555", "client_secret": "GOCSPX-real" },
+    "ok": true
+  },
+  {
+    "name": "a Microsoft client id that is not a UUID",
+    "backend": "onedrive",
+    "options": { "client_id": "not-a-uuid", "client_secret": "GOCSPX-real" },
+    "ok": false,
+    "message": "The client ID 'not-a-uuid' is not a Microsoft OAuth client ID; leave both client fields empty to use rclone's built-in client, or paste the ID and secret of a client you created."
+  },
+  {
+    "name": "a Dropbox app key",
+    "backend": "dropbox",
+    "options": { "client_id": "abc123def456", "client_secret": "GOCSPX-real" },
+    "ok": true
+  },
+  {
+    "name": "a Dropbox app key with whitespace",
+    "backend": "dropbox",
+    "options": { "client_id": "ab cd", "client_secret": "GOCSPX-real" },
+    "ok": false,
+    "message": "The client ID 'ab cd' is not a Dropbox OAuth client ID; leave both client fields empty to use rclone's built-in client, or paste the ID and secret of a client you created."
+  },
+  {
+    "name": "a pCloud app id",
+    "backend": "pcloud",
+    "options": { "client_id": "pcloud-app-id", "client_secret": "GOCSPX-real" },
+    "ok": true
+  },
+  {
+    "name": "a Box client id",
+    "backend": "box",
+    "options": { "client_id": "boxappkey123", "client_secret": "GOCSPX-real" },
+    "ok": true
+  },
+  {
+    "name": "client fields on a non-OAuth backend are not this rule's business",
+    "backend": "sftp",
+    "options": { "client_id": "gdrive" },
+    "ok": true
+  }
+]
