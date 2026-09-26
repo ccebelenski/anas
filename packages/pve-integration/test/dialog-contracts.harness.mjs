@@ -13118,6 +13118,42 @@ async function cloudRunViewerChecks() {
     /data-anas-run-figure="errors"[^]*anas-danger/.test(mid), mid)
   ok('run viewer: a healthy ring shows no stalled label', !/anas-gfx-stalled/.test(mid), mid)
 
+  // --- the table layout (rclone.6 viewer layout fix) ---------------------------
+  // The in-flight and recent rows are real tables: fixed numeric columns, a
+  // file column that takes what is left and middle-ellipsizes long paths with
+  // the full path on hover, headers once above the rows, the spark bound to
+  // its container.
+  const longName = 'app/package/src/dist/service/s/a/deep/very-long-file-name.bin'
+  const longRow = body(runViewJob('running', { ...RUN_VIEW_DETAIL,
+    transferring: [{ name: longName, size: 3000000, percentage: 22, speed: 688901.8, eta: 3 }] }), {})
+  ok('run viewer: a long in-flight path collapses its middle — the full path rides in the title',
+    (longRow.split(longName).length - 1) === 1
+    && />app\/package\/src\/dist…\/very-long-file-name\.bin</.test(longRow),
+    longRow)
+  const trRow = (longRow.match(/<tr class="anas-run-transferring-row">[\s\S]*?<\/tr>/) || [''])[0]
+  const cells = (trRow.match(/data-anas-run-cell="([^"]+)"/g) || [])
+    .map(a => a.slice('data-anas-run-cell="'.length, -1))
+  ok('run viewer: the transferring row is a five-cell table row — file, size, progress, speed, eta',
+    JSON.stringify(cells) === JSON.stringify(['file', 'size', 'progress', 'speed', 'eta']),
+    trRow)
+  const trTable = (longRow.match(/<div class="anas-run-transferring"[\s\S]*?<\/table>/) || [''])[0]
+  ok('run viewer: the Transferring table carries its five column headers once, muted like the figure labels',
+    (trTable.match(/<th /g) || []).length === 5
+      && /class="anas-run-label">Transferring now</.test(trTable),
+    trTable)
+  ok('run viewer: the Recent table carries File/Kind/When headers and the dash keeps the row text "name — what"',
+    /<thead><tr><th class="anas-run-col-file">File<\/th><th class="anas-run-col-kind">Kind<\/th>/
+      .test(mid)
+    && />f3\.bin<\/span><\/td><td class="anas-run-col-kind"><span class="anas-run-recent-dash">—<\/span> copied</
+      .test(mid), mid)
+  ok('run viewer: the full spark is width 100% with preserveAspectRatio none — bound to its container',
+    /anas-run-spark-graph[^]*anas-gfx-spark-full" viewBox="0 0 100 24" preserveAspectRatio="none" style="width:100%/
+      .test(early), early)
+  ok('run viewer: the bars carry one-line captions — bytes-of-total · pct, then files',
+    (early.match(/anas-run-bar-caption/g) || []).length === 2
+    && /anas-run-bar-caption">0 B of 3000000 B · 0%</.test(early)
+    && /anas-run-bar-caption">0 of 5 files</.test(early), early)
+
   const stalled = body(runViewJob('running', { ...RUN_VIEW_DETAIL,
     speedSamples: [688901.8, 0, 0, 0] }), {})
   ok('run viewer: three zero samples while files remain ⇒ "stalled for 15s" in danger',

@@ -373,6 +373,47 @@
         css.push('.anas-gfx-drophover{outline:2px dashed var(--anas-accent);outline-offset:2px;'
             + 'background:var(--anas-accent-soft)}');
 
+        // Cloud run viewer (rclone.6). The `.anas-run-*` homes share THIS
+        // stylesheet — it is injected by the first gfx call the body makes
+        // (the gauge, bar or spark), and every styled section sits after one,
+        // so the viewer body stays a pure class string. Rhythm: 8 px between
+        // sections; the file columns take what is left of their row, every
+        // other column is fixed so a long path can never squeeze the numbers.
+        css.push('.anas-run-progress{margin-bottom:8px}');
+        css.push('.anas-run-progress .anas-gfx-gauge{max-width:100%}');
+        css.push('.anas-run-bar-caption{margin-top:3px;font-size:11px;color:var(--anas-muted);'
+            + 'font-variant-numeric:tabular-nums}');
+        css.push('.anas-run-files-bar{margin-top:6px}');
+        css.push('.anas-run-spark{display:flex;align-items:center;gap:8px;margin-bottom:8px}');
+        css.push('.anas-run-spark-graph{flex:1 1 auto;min-width:0;line-height:0}');
+        css.push('.anas-run-spark-graph .anas-gfx-spark{display:block}');
+        css.push('.anas-run-speed{flex:0 0 auto;white-space:nowrap}');
+        css.push('.anas-run-spark .anas-gfx-stalled{flex:0 0 auto}');
+        css.push('.anas-run-figures{margin-bottom:8px}');
+        css.push('.anas-run-figure{display:inline-block;margin-right:18px}');
+        css.push('.anas-run-figure-label{display:block;color:var(--anas-muted);font-size:0.82em}');
+        css.push('.anas-run-figure-value{font-size:1.1em}');
+        css.push('.anas-run-label{color:var(--anas-muted);font-size:0.85em;margin-bottom:3px}');
+        css.push('.anas-run-empty{color:var(--anas-muted)}');
+        css.push('.anas-run-table{width:100%;border-collapse:collapse;table-layout:fixed;text-align:left}');
+        css.push('.anas-run-table th{color:var(--anas-muted);font-weight:400;font-size:0.85em;'
+            + 'padding:2px 8px 2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}');
+        css.push('.anas-run-table td{padding:2px 8px 2px 0;vertical-align:middle;'
+            + 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap}');
+        css.push('.anas-run-table .anas-gfx-bar{vertical-align:middle}');
+        css.push('.anas-run-col-size,.anas-run-col-speed,.anas-run-col-eta,.anas-run-col-when{text-align:right}');
+        css.push('.anas-run-col-size{width:78px}');
+        css.push('.anas-run-col-progress{width:204px}');
+        css.push('.anas-run-col-speed{width:100px}');
+        css.push('.anas-run-col-eta{width:70px}');
+        css.push('.anas-run-col-when{width:96px}');
+        css.push('.anas-run-recent-table .anas-run-col-file{width:55%}');
+        css.push('.anas-run-recent-table .anas-run-col-kind{width:34%}');
+        css.push('.anas-run-path{display:inline-block;max-width:100%;overflow:hidden;'
+            + 'text-overflow:ellipsis;vertical-align:bottom}');
+        css.push('.anas-run-recent-dash{color:var(--anas-muted)}');
+        css.push('.anas-run-recent-msg{color:var(--anas-danger,#c23b2c)}');
+
         return css.join('\n');
     }
 

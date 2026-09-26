@@ -2825,11 +2825,35 @@
     // One labeled figure — every number carries its label and unit (UI rule:
     // numbers need labeled context; no unlabeled tiles).
     function runFigure(label, value) {
-        return '<span class="anas-run-figure" data-anas-run-figure="' + enc(label) + '"'
-            + ' style="display:inline-block;margin-right:18px;">'
-            + '<span style="display:block;color:var(--anas-muted,gray);font-size:0.82em;">'
-            + enc(label) + '</span>'
-            + '<span style="font-size:1.1em;">' + value + '</span></span>';
+        return '<span class="anas-run-figure" data-anas-run-figure="' + enc(label) + '">'
+            + '<span class="anas-run-figure-label">' + enc(label) + '</span>'
+            + '<span class="anas-run-figure-value">' + value + '</span></span>';
+    }
+
+    // runPathDisplay(name) → { text, full } — a path that never wraps. Past
+    // MAX characters the middle collapses: the leading directories that fit,
+    // then `…/`, then the last TAIL characters so the file name stays
+    // readable (an end ellipsis would hide it). The full path always rides
+    // along for the title tooltip.
+    function runPathDisplay(name) {
+        var s = String(name == null ? '' : name);
+        var MAX = 48;
+        var TAIL = 24;
+        if (s.length <= MAX) {
+            return { text: s, full: s };
+        }
+        var cut = MAX - TAIL;
+        var sep = '…';
+        var slash = s.lastIndexOf('/', cut);
+        if (slash > 0) {
+            cut = slash; // the seam lands on a directory boundary
+            sep = '…/';
+        }
+        var tail = s.slice(-TAIL);
+        if (sep === '…/') {
+            tail = tail.replace(/^\/+/, '');
+        }
+        return { text: s.slice(0, cut) + sep + tail, full: s };
     }
 
     function speedHtml(bytesPerSec) {
@@ -2848,20 +2872,27 @@
         return enc(ANAS.formatDuration(n * 1000));
     }
 
-    // Recent event → one row. Errors first and in danger, with the message;
-    // everything else reads "name — what happened, how long ago".
+    // Recent event → one table row: the file (middle-ellipsized, full path on
+    // hover), what happened (the message itself when it is an error), when.
+    // The row's tooltip carries the message. The muted "—" before the kind
+    // keeps the row's text reading "name — what" — the live proof splits a
+    // recent row's text on the dash to read the file name back.
     function recentEventHtml(ev) {
         ev = ev || {};
         var isErr = ev.kind === 'error';
         var what = isErr
-            ? '<span style="color:var(--anas-danger,#c23b2c);">' + enc(ev.message || t('error')) + '</span>'
+            ? '<span class="anas-run-recent-msg">' + enc(ev.message || t('error')) + '</span>'
             : enc(t(ev.kind || 'copied'));
-        var ago = ev.at ? ' <span style="color:var(--anas-muted,gray);font-size:0.9em;">'
-            + enc(ANAS.ago(ev.at)) + '</span>' : '';
-        return '<div class="anas-run-recent-row" data-anas-run-recent-kind="' + enc(ev.kind || '') + '"'
-            + ' style="padding:1px 0;">'
-            + '<span style="font-family:monospace;font-size:0.92em;word-break:break-all;">'
-            + enc(ev.name || '') + '</span> — ' + what + ago + '</div>';
+        var p = runPathDisplay(ev.name);
+        return '<tr class="anas-run-recent-row" data-anas-run-recent-kind="' + enc(ev.kind || '') + '"'
+            + (ev.message ? ' title="' + enc(ev.message) + '"' : '')
+            + '><td class="anas-run-col-file" title="' + enc(p.full) + '">'
+            + '<span class="anas-run-path">' + enc(p.text) + '</span></td>'
+            + '<td class="anas-run-col-kind"><span class="anas-run-recent-dash">—</span> '
+            + what + '</td>'
+            + '<td class="anas-run-col-when">'
+            + (ev.at ? enc(ANAS.ago(ev.at)) : '<span class="anas-run-empty">—</span>')
+            + '</td></tr>';
     }
 
     function kindSortKey(kind) {
@@ -2883,7 +2914,7 @@
         var running = status === 'running';
 
         // (1) header — task, source → remote:path, mode, live/snapshot, status.
-        var header = '<div class="anas-run-header" style="margin-bottom:10px;">'
+        var header = '<div class="anas-run-header" style="margin-bottom:8px;">'
             + '<span style="font-weight:600;font-size:1.05em;">' + enc(task.name || '') + '</span> '
             + runStatusPillHtml(status)
             + '<div style="color:var(--anas-muted,gray);margin-top:2px;">'
@@ -2932,33 +2963,37 @@
             ? detail.transfers / detail.totalTransfers : 0;
         var stalled = ANAS.gfx.stalledHtml(detail);
 
-        // (2) overall progress — bytes bar with the percentage beside it, thin
-        // files bar under it.
-        var progress = '<div class="anas-run-progress" style="margin-bottom:10px;">'
-            + ANAS.gfx.gauge(frac, {
-                label: ANAS.formatBytes(detail.bytes) + ' ' + t('of') + ' '
-                    + ANAS.formatBytes(detail.totalBytes),
-                pct: true,
-                title: t('bytes copied of the total'),
-            })
-            + '<div style="margin-top:4px;">'
+        // (2) overall progress — the bytes bar full width with its caption on
+        // one line beneath, the thin files bar directly under with its own.
+        var pct = Math.round(frac * 100);
+        var progress = '<div class="anas-run-progress">'
+            + ANAS.gfx.gauge(frac, { pct: false, title: t('bytes copied of the total') })
+            + '<div class="anas-run-bar-caption">'
+            + enc(ANAS.formatBytes(detail.bytes) + ' ' + t('of') + ' '
+                + ANAS.formatBytes(detail.totalBytes)) + ' · ' + pct + '%</div>'
+            + '<div class="anas-run-files-bar">'
             + ANAS.gfx.bar(fileFrac, { pct: false, color: 'var(--anas-series-1,#3468c0)',
                 title: t('files transferred of the total') })
-            + ' <span style="color:var(--anas-muted,gray);font-size:0.9em;">'
+            + '</div><div class="anas-run-bar-caption">'
             + enc(detail.transfers + ' ' + t('of') + ' ' + detail.totalTransfers + ' '
-                + t('files')) + '</span></div></div>';
+                + t('files')) + '</div></div>';
 
-        // (3) throughput spark + current speed + the stalled label.
-        var spark = '<div class="anas-run-spark" style="margin-bottom:10px;">'
+        // (3) throughput spark + current speed + the stalled label. The spark
+        // graph takes what is left of the row (flex, min-width 0) — the SVG is
+        // width:100% of THAT, so the speed label can never push it past the
+        // window edge.
+        var spark = '<div class="anas-run-spark">'
+            + '<span class="anas-run-spark-graph">'
             + ANAS.gfx.sparkFromSamples(detail.speedSamples || [], {
                 size: 'full',
                 title: t('throughput, last 5 minutes'),
             })
-            + ' <span class="anas-run-speed" style="white-space:nowrap;">'
-            + speedHtml(detail.speed) + '</span> ' + stalled + '</div>';
+            + '</span>'
+            + '<span class="anas-run-speed">' + speedHtml(detail.speed) + '</span> '
+            + stalled + '</div>';
 
         // (4) labeled figures — every number with its label and unit.
-        var figures = '<div class="anas-run-figures" style="margin-bottom:12px;">'
+        var figures = '<div class="anas-run-figures">'
             + runFigure(t('speed'), speedHtml(detail.speed))
             + runFigure(t('ETA'), etaHtml(detail.eta))
             + runFigure(t('elapsed'), enc(ANAS.formatDuration(detail.elapsedMs)))
@@ -2973,29 +3008,42 @@
         var html = header + progress + spark + figures;
 
         if (running) {
-            // (5) Transferring now — at most a handful of rows (rclone's
-            // --transfers default is 4).
+            // (5) Transferring now — a real table, at most a handful of rows
+            // (rclone's --transfers default is 4): the file column takes what
+            // is left (middle-ellipsized, the full path on hover), size,
+            // progress, speed and ETA fixed columns, headers once above the
+            // rows. The cells carry data-anas-run-cell in column order.
             var tr = (detail.transferring || []);
             var rows = '';
             for (var i = 0; i < tr.length; i++) {
                 var f = tr[i] || {};
-                rows += '<div class="anas-run-transferring-row" style="padding:2px 0;'
-                    + 'display:flex;align-items:center;gap:8px;">'
-                    + '<span style="flex:1;font-family:monospace;font-size:0.92em;'
-                    + 'word-break:break-all;">' + enc(f.name || '') + '</span>'
-                    + '<span style="white-space:nowrap;color:var(--anas-muted,gray);">'
-                    + enc(ANAS.formatBytes(Number(f.size) || 0)) + '</span>'
+                var p = runPathDisplay(f.name);
+                rows += '<tr class="anas-run-transferring-row">'
+                    + '<td class="anas-run-col-file" data-anas-run-cell="file" title="'
+                    + enc(p.full) + '"><span class="anas-run-path">' + enc(p.text)
+                    + '</span></td>'
+                    + '<td class="anas-run-col-size" data-anas-run-cell="size">'
+                    + enc(ANAS.formatBytes(Number(f.size) || 0)) + '</td>'
+                    + '<td class="anas-run-col-progress" data-anas-run-cell="progress">'
                     + ANAS.gfx.bar((Number(f.percentage) || 0) / 100,
                         { pct: true, color: 'var(--anas-series-1,#3468c0)' })
-                    + '<span style="white-space:nowrap;">' + speedHtml(f.speed) + '</span>'
-                    + '<span style="white-space:nowrap;color:var(--anas-muted,gray);">'
-                    + etaHtml(f.eta) + '</span></div>';
+                    + '</td>'
+                    + '<td class="anas-run-col-speed" data-anas-run-cell="speed">'
+                    + speedHtml(f.speed) + '</td>'
+                    + '<td class="anas-run-col-eta" data-anas-run-cell="eta">'
+                    + etaHtml(f.eta) + '</td></tr>';
             }
-            html += '<div class="anas-run-transferring" style="margin-bottom:12px;">'
-                + '<div style="color:var(--anas-muted,gray);font-size:0.85em;margin-bottom:3px;">'
-                + enc(t('Transferring now')) + '</div>'
-                + (rows || '<div style="color:var(--anas-muted,gray);">'
-                    + enc(t('nothing in flight')) + '</div>')
+            html += '<div class="anas-run-transferring" style="margin-bottom:8px;">'
+                + '<div class="anas-run-label">' + enc(t('Transferring now')) + '</div>'
+                + (rows
+                    ? '<table class="anas-run-table anas-run-transferring-table"><thead><tr>'
+                        + '<th class="anas-run-col-file">' + enc(t('File')) + '</th>'
+                        + '<th class="anas-run-col-size">' + enc(t('Size')) + '</th>'
+                        + '<th class="anas-run-col-progress">' + enc(t('Progress')) + '</th>'
+                        + '<th class="anas-run-col-speed">' + enc(t('Speed')) + '</th>'
+                        + '<th class="anas-run-col-eta">' + enc(t('ETA')) + '</th>'
+                        + '</tr></thead><tbody>' + rows + '</tbody></table>'
+                    : '<div class="anas-run-empty">' + enc(t('nothing in flight')) + '</div>')
                 + '</div>';
         } else {
             // The result banner stands where the in-flight section was; the
@@ -3018,9 +3066,17 @@
             return kindSortKey(a && a.kind) - kindSortKey(b && b.kind);
         });
         var shown = opts.showAllRecent ? recent : recent.slice(0, RECENT_SHOWN);
-        var recentHtml = '';
+        var recentRows = '';
         for (var r = 0; r < shown.length; r++) {
-            recentHtml += recentEventHtml(shown[r]);
+            recentRows += recentEventHtml(shown[r]);
+        }
+        var recentHtml = '';
+        if (recentRows) {
+            recentHtml = '<table class="anas-run-table anas-run-recent-table"><thead><tr>'
+                + '<th class="anas-run-col-file">' + enc(t('File')) + '</th>'
+                + '<th class="anas-run-col-kind">' + enc(t('Kind')) + '</th>'
+                + '<th class="anas-run-col-when">' + enc(t('When')) + '</th>'
+                + '</tr></thead><tbody>' + recentRows + '</tbody></table>';
         }
         if (!opts.showAllRecent && recent.length > RECENT_SHOWN) {
             // The count is substituted into a TRANSLATED template, never the
@@ -3029,10 +3085,9 @@
             recentHtml += '<a href="#" data-anas-run-recent-all="1" class="anas-run-recent-all">'
                 + enc(t('show all {n}').replace('{n}', '' + detail.recent.length)) + '</a>';
         }
-        html += '<div class="anas-run-recent" style="margin-bottom:10px;">'
-            + '<div style="color:var(--anas-muted,gray);font-size:0.85em;margin-bottom:3px;">'
-            + enc(t('Recent')) + '</div>'
-            + (recentHtml || '<div style="color:var(--anas-muted,gray);">'
+        html += '<div class="anas-run-recent" style="margin-bottom:8px;">'
+            + '<div class="anas-run-label">' + enc(t('Recent')) + '</div>'
+            + (recentHtml || '<div class="anas-run-empty">'
                 + enc(t('nothing finished yet')) + '</div>')
             + '</div>';
 
