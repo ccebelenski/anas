@@ -49,11 +49,16 @@ source "${SCRIPT_DIR}/config.sh"
 #           --bwlimit 200k roughly a minute, so the rclone.5 cancel proofs
 #           land while the run is still copying and the destination ends
 #           PARTIAL). cloud-cancel.spec.ts uses this profile.
+#   view    gtview    gtbackup/gtviewsrc   6 x 2 MiB (~12 MiB — at
+#           --bwlimit 200k a little over a minute, so the rclone.6 run-viewer
+#           proof has a whole run to watch: bars climbing, per-file events
+#           landing, a SIGSTOP stall in the middle, then the result banner).
+#           cloud-guided-viewer.spec.ts uses this profile.
 #
 # The sftp USER is shared between the profiles (one loopback target), so `down`
-# removes it only when the OTHER profile has nothing on the node — a down that
-# ran while the sibling spec left state behind would strand it otherwise.
-# Neither profile ever touches the operator's gtest/testoff task or remote.
+# removes it only when NO OTHER profile has anything on the node — a down that
+# ran while a sibling spec left state behind would strand it otherwise.
+# No profile ever touches the operator's gtest/testoff task or remote.
 
 RCLONE_USER="rclonegt"
 RCLONE_PASS="gtpass"
@@ -61,6 +66,10 @@ SSHD_DROPIN="/etc/ssh/sshd_config.d/60-anas-rclonegt.conf"
 
 # The unit names each profile's spec creates (`down` removes exactly these,
 # plus their stamp and failed state — the sched.stamps lesson).
+# Every profile's task name → source dataset pair. `down` keeps the shared
+# sftp user while ANY other profile still has task units or a dataset here.
+ALL_PROFILES="gate:gtbackup/gtgatesrc cancel:gtbackup/gtcancelsrc view:gtbackup/gtviewsrc"
+
 select_profile() {
   case "${2:-gate}" in
     gate)
@@ -75,28 +84,34 @@ select_profile() {
       SRC_FILES=6
       SRC_FILE_MIB=2
       ;;
+    view)
+      TASK_NAME="gtview"
+      SRC_DS="gtbackup/gtviewsrc"
+      SRC_FILES=6
+      SRC_FILE_MIB=2
+      ;;
     *) usage ;;
   esac
   SRC_PATH="/${SRC_DS}"
   DST_DIR="/home/${RCLONE_USER}/${TASK_NAME}-dst"
 }
 
-# Does the OTHER profile still have anything on the node (its task units or its
+# Does any OTHER profile still have anything on the node (its task units or its
 # source dataset)? True → the shared sftp user stays on a `down`.
 other_profile_present() {
-  local other_task other_ds
-  if [ "${TASK_NAME}" = "gtgate" ]; then
-    other_task="gtcancel"; other_ds="gtbackup/gtcancelsrc"
-  else
-    other_task="gtgate"; other_ds="gtbackup/gtgatesrc"
-  fi
-  $SSH_CMD "test -f /etc/systemd/system/anas-cloud-${other_task}.service -o -f /etc/systemd/system/anas-cloud-${other_task}.timer" >/dev/null 2>&1 && return 0
-  $SSH_CMD "zfs list -H ${other_ds}" >/dev/null 2>&1 && return 0
+  local entry task ds
+  for entry in ${ALL_PROFILES}; do
+    task="${entry%%:*}"
+    ds="${entry##*:}"
+    [ "${task}" = "${TASK_NAME}" ] && continue
+    $SSH_CMD "test -f /etc/systemd/system/anas-cloud-${task}.service -o -f /etc/systemd/system/anas-cloud-${task}.timer" >/dev/null 2>&1 && return 0
+    $SSH_CMD "zfs list -H ${ds}" >/dev/null 2>&1 && return 0
+  done
   return 1
 }
 
 usage() {
-  echo "Usage: cloud-review-fixture.sh <up|down|sigint|status> [gate|cancel]"
+  echo "Usage: cloud-review-fixture.sh <up|down|sigint|status> [gate|cancel|view]"
   echo "  up      rclonegt/gtpass with ~/dst/hello.txt (sshd drop-in only if needed), the <profile> source dataset, an empty landing dir"
   echo "  down    Remove the profile's units + stamp, its dataset, its landing areas, and the user + drop-in when the OTHER profile is absent — NEVER the rclone store"
   echo "  sigint  SIGINT the rclone child copying to the profile's landing dir (ends the run early)"
@@ -226,6 +241,10 @@ case "$1" in
     # wrapper (found live in cloud-cancel.spec.ts test 4, where the fresh run's
     # rclone had not spawned yet and the wrapper was the only match).
     if $SSH_CMD "pgrep -f 'rclone cop[y] .*${TASK_NAME}' >/dev/null 2>&1"; then
+      # CONT first: a SIGSTOP'd child (the run-viewer stall proof) never sees
+      # the SIGINT — the signal sits pending and the process lives on to haunt
+      # the next run (found live: attempt N's zombie froze attempt N+1's row).
+      $SSH_CMD "pkill -CONT -f 'rclone cop[y] .*${TASK_NAME}' >/dev/null 2>&1; true"
       $SSH_CMD "pkill -INT -f 'rclone cop[y] .*${TASK_NAME}'"
       echo "✓ SIGINT sent to the rclone child copying to ${TASK_NAME}"
     else
@@ -238,7 +257,9 @@ case "$1" in
 
     # End any run this fixture's spec may have left, then the unit pair (the
     # fixture's OWN task names only — a foreign anas-cloud unit is not ours).
-    # `cop[y]`: the same self-match guard the sigint verb carries.
+    # `cop[y]`: the same self-match guard the sigint verb carries; CONT first
+    # so a SIGSTOP'd child (the stall proof) actually receives the INT.
+    $SSH_CMD "pkill -CONT -f 'rclone cop[y] .*${TASK_NAME}' >/dev/null 2>&1; true"
     $SSH_CMD "pkill -INT -f 'rclone cop[y] .*${TASK_NAME}' >/dev/null 2>&1; true"
     if $SSH_CMD "test -f /etc/systemd/system/anas-cloud-${TASK_NAME}.service -o -f /etc/systemd/system/anas-cloud-${TASK_NAME}.timer"; then
       $SSH_CMD "systemctl disable --now anas-cloud-${TASK_NAME}.timer >/dev/null 2>&1; rm -f /etc/systemd/system/anas-cloud-${TASK_NAME}.service /etc/systemd/system/anas-cloud-${TASK_NAME}.timer"
