@@ -891,14 +891,17 @@ export function runningDirectJobFields(
   return { ...(progress ? { runningProgress: progress } : {}), runningJobId: job.id }
 }
 
-/** The running direct job's progress text, or null (no job, or nothing yet). */
+/**
+ * The running direct job's progress text, or null (no job, or nothing yet).
+ * The non-empty-progress rule lives ONCE, in {@link runningDirectJobFields} —
+ * this is its progress-only projection.
+ */
 export function runningDirectJobProgress(
   jobQueue: JobQueue,
   operation: string,
   name: string,
 ): string | null {
-  const progress = runningDirectJob(jobQueue, operation, name)?.progress
-  return typeof progress === 'string' && progress.length > 0 ? progress : null
+  return runningDirectJobFields(jobQueue, operation, name).runningProgress ?? null
 }
 
 /**

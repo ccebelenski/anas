@@ -1,11 +1,13 @@
 import type { CloudSyncTask } from '@anas/shared'
 import type { ExecOptions, ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
-import { CloudSyncTask as CloudSyncTaskSchema } from '@anas/shared'
+import { fileURLToPath } from 'node:url'
+import { CloudSyncTask as CloudSyncTaskSchema, stalledFor } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import { ChildCancel } from '../../jobs/child-cancel.js'
 import { JobQueue } from '../../jobs/queue.js'
@@ -34,10 +36,11 @@ import { RCLONE } from '../rclone-config.js'
  * The cloud sync RUN (rclone.2): the argv, rclone's JSON log, the exit-code
  * policy, the three guards and the transient-snapshot path.
  *
- * The JSON-log fixtures below are the shapes DESIGN's 2026-09-23 ground truth
- * records for rclone 1.60.1 — one object per line on stderr, a `stats` object
- * at every `--stats` interval, error-level lines naming the object they failed
- * on.
+ * The PARSER tests read CAPTURED logs (fixtures/rclone/run-*.log, rclone
+ * 1.60.1 on the stunt node, 2026-09-25 — see that directory's NOTES.md), never
+ * hand-shaped lines. The `statsLine()` helper below stays for the run
+ * MACHINERY (progress lines, exit codes, mock runs), where only the counters'
+ * presence matters and no display fact rides on the exact bytes.
  */
 
 const FINDMNT = '/usr/bin/findmnt'
@@ -45,6 +48,42 @@ const ZFS = '/usr/sbin/zfs'
 const CONFIG = '/etc/anas/rclone.conf'
 const NOW = new Date(1_700_000_000_000)
 const LABEL = 'anas-cloud-offsite-1700000000'
+const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone')
+
+/** A captured log's JSON entries, in order (non-JSON lines are not entries). */
+function logEntries(text: string): Record<string, unknown>[] {
+  return text.split('\n')
+    .map(l => l.trim())
+    .filter(l => l.startsWith('{'))
+    .map(l => JSON.parse(l) as Record<string, unknown>)
+}
+
+/**
+ * The captured copy run: 4 files over a `--bwlimit 400k` loopback — one
+ * `stats` object per 5s tick (4 mid-run with `transferring[]`, one final),
+ * one `Copied (new)` event per file.
+ */
+const RUN_COPY_LOG = readFileSync(join(FIXTURES, 'run-copy-1.60.1.log'), 'utf-8')
+const RUN_STATS = logEntries(RUN_COPY_LOG)
+  .map(e => statsOf(e))
+  .filter((s): s is NonNullable<typeof s> => s !== null)
+const RUN_EVENTS = logEntries(RUN_COPY_LOG)
+  .map(e => fileEventOf(e))
+  .filter((e): e is NonNullable<typeof e> => e !== null)
+
+/**
+ * The captured failing run: an unreadable source subdirectory — JSON
+ * `level: error` objects WITH an object (the file), and the "Attempt n/m
+ * failed" retry summaries WITHOUT one.
+ */
+const RUN_ERROR_LOG = readFileSync(join(FIXTURES, 'run-error-objectless-1.60.1.log'), 'utf-8')
+const RUN_ERROR_ENTRIES = logEntries(RUN_ERROR_LOG)
+const OBJECTLESS_ERROR_LINE = JSON.stringify(
+  RUN_ERROR_ENTRIES.find(e => typeof e.msg === 'string' && String(e.msg).startsWith('Attempt 1/2')),
+)
+const OBJECT_ERROR_LINE = JSON.stringify(
+  RUN_ERROR_ENTRIES.find(e => e.object === 'locked'),
+)
 
 function task(over: Partial<CloudSyncTask> = {}): CloudSyncTask {
   return CloudSyncTaskSchema.parse({
@@ -94,45 +133,6 @@ const ERROR_LINE = JSON.stringify({
   time: '2026-09-24T02:00:12.000+00:00',
 })
 
-// rclone.6 — the shapes captured on the node today (rclone 1.60.1, 2026-09-25):
-// one stats object per `--stats 5s` tick (with `transferring[]`) and one `-v`
-// JSON event per finished file.
-const CAPTURED_STATS_LINE = JSON.stringify({
-  level: 'info',
-  msg: '\nTransferred:   \t 668 KiB / 8.6 MiB, 8%',
-  source: 'accounting/stats.go:479',
-  time: '2026-09-25T09:00:05.000000+02:00',
-  stats: {
-    bytes: 684032,
-    checks: 0,
-    deletedDirs: 0,
-    deletes: 0,
-    elapsedTime: 1.0,
-    errors: 0,
-    eta: 3,
-    fatalError: false,
-    renames: 0,
-    retryError: false,
-    speed: 688901.8,
-    totalBytes: 9000000,
-    totalChecks: 0,
-    totalTransfers: 3,
-    transferTime: 1.0,
-    transfers: 0,
-    transferring: [
-      { bytes: 684032, eta: null, group: 'global_stats', name: 'f1.bin', percentage: 22, size: 3000000, speed: 688901.8, speedAvg: 0 },
-    ],
-  },
-})
-const CAPTURED_EVENT_LINE = JSON.stringify({
-  level: 'info',
-  msg: 'Copied (new)',
-  object: 'f3.bin',
-  objectType: '*local.Object',
-  source: 'operations/operations.go:566',
-  time: '2026-09-25T09:00:06.000000+02:00',
-})
-
 /** The final stats object of a clean run: everything transferred. */
 const FINAL_STATS = statsLine({ bytes: 4194304, totalBytes: 4194304, transfers: 5, eta: 0, elapsedTime: 61.2 })
 
@@ -178,29 +178,44 @@ describe('cloud sync runner — argv (rclone.2)', () => {
 })
 
 describe('cloud sync runner — rclone\'s JSON log', () => {
-  it('reads a stats object, and the LAST one wins', () => {
-    const log = readRcloneLog([statsLine(), FINAL_STATS].join('\n'))
+  it('reads the captured run: one stats object per tick, and the LAST one wins', () => {
+    const log = readRcloneLog(RUN_COPY_LOG)
+    // The final stats object of the captured copy: everything transferred.
     assert.deepEqual(log.stats, {
-      bytes: 4194304,
-      totalBytes: 4194304,
-      transfers: 5,
-      totalTransfers: 5,
-      checks: 12,
-      totalChecks: 12,
+      bytes: 10000000,
+      totalBytes: 10000000,
+      transfers: 4,
+      totalTransfers: 4,
+      checks: 0,
+      totalChecks: 0,
       deletes: 0,
       errors: 0,
-      elapsedTime: 61.2,
+      elapsedTime: 24.421977558,
       eta: 0,
       fatalError: false,
-      speed: 34952.5,
+      speed: 413664.71814161836,
       transferring: [],
     })
   })
 
-  it('collects error-level lines verbatim, naming the object', () => {
-    const log = readRcloneLog([statsLine(), ERROR_LINE, FINAL_STATS].join('\n'))
+  it('the captured run carries 5 stats objects and 4 Copied events, nothing raw', () => {
+    const log = readRcloneLog(RUN_COPY_LOG)
+    const reader = new RcloneLogReader()
+    assert.equal(reader.push(RUN_COPY_LOG).length, 5, 'every stats object is published, in order')
+    reader.flush()
+    assert.equal(log.errorLines.length, 0)
+    assert.deepEqual(log.rawLines, [])
+  })
+
+  it('collects the captured error lines verbatim — named when rclone names one', () => {
+    const log = readRcloneLog(RUN_ERROR_LOG)
     assert.deepEqual(log.errorLines, [
-      'a.jpg: Failed to copy: failed to open source object: open /tank/pictures/a.jpg: permission denied',
+      'locked: failed to open directory "locked": open /tmp/anas-fixcap2-3189298/src/locked: permission denied',
+      'ok/a.bin: Failed to copy: mkdir /tmp/anas-fixcap2-3189298/dst/ok: permission denied',
+      'Attempt 1/2 failed with 2 errors and: mkdir /tmp/anas-fixcap2-3189298/dst/ok: permission denied',
+      'locked: failed to open directory "locked": open /tmp/anas-fixcap2-3189298/src/locked: permission denied',
+      'ok/a.bin: Failed to copy: mkdir /tmp/anas-fixcap2-3189298/dst/ok: permission denied',
+      'Attempt 2/2 failed with 2 errors and: failed to open directory "locked": open /tmp/anas-fixcap2-3189298/src/locked: permission denied',
     ])
   })
 
@@ -287,32 +302,40 @@ describe('cloud sync runner — rclone\'s JSON log', () => {
 })
 
 describe('cloud sync runner — the live run detail (rclone.6)', () => {
-  it('parses the captured stats object: counters, speed and the in-flight file', () => {
-    const stats = readRcloneLog(CAPTURED_STATS_LINE).stats!
-    assert.deepEqual(stats, {
-      bytes: 684032,
-      totalBytes: 9000000,
-      transfers: 0,
-      totalTransfers: 3,
-      checks: 0,
-      totalChecks: 0,
-      deletes: 0,
-      errors: 0,
-      elapsedTime: 1.0,
-      eta: 3,
-      fatalError: false,
-      speed: 688901.8,
-      transferring: [
-        { name: 'f1.bin', size: 3000000, bytes: 684032, percentage: 22, speed: 688901.8, eta: null },
-      ],
-    })
+  it('parses the captured stats objects: counters, rclone\'s speed and the in-flight files', () => {
+    assert.equal(RUN_STATS.length, 5)
+    const first = RUN_STATS[0]
+    assert.equal(first.bytes, 2179072)
+    assert.equal(first.totalBytes, 10000000)
+    assert.equal(first.elapsedTime, 5.00817145)
+    assert.equal(first.transfers, 0)
+    assert.equal(first.totalTransfers, 4)
+    assert.equal(first.eta, 17)
+    assert.equal(first.speed, 438275.31105320586, 'rclone\'s own EWMA speed is parsed verbatim')
+    assert.deepEqual(first.transferring, [
+      { name: 'f1.bin', size: 2500000, bytes: 552960, percentage: 22, speed: 110647.46923604007, eta: 17 },
+      { name: 'f2.bin', size: 2500000, bytes: 552960, percentage: 22, speed: 110682.52675162704, eta: 17 },
+      { name: 'f3.bin', size: 2500000, bytes: 552960, percentage: 22, speed: 110683.95064772702, eta: 17 },
+      { name: 'f4.bin', size: 2500000, bytes: 520192, percentage: 20, speed: 104143.00252310744, eta: 18 },
+    ])
   })
 
   it('maps the captured -v file events onto the viewer kinds', () => {
-    assert.deepEqual(fileEventOf(JSON.parse(CAPTURED_EVENT_LINE)), { name: 'f3.bin', kind: 'copied' })
-    assert.deepEqual(fileEventOf({ level: 'info', msg: 'Copied (replaced existing)', object: 'f1.bin' }), { name: 'f1.bin', kind: 'updated' })
-    assert.deepEqual(fileEventOf({ level: 'info', msg: 'Updated', object: 'f2.bin' }), { name: 'f2.bin', kind: 'updated' })
+    // The capture: one "Copied (new)" per file, in completion order.
+    assert.deepEqual(
+      RUN_EVENTS.map(e => [e.name, e.kind]),
+      [['f3.bin', 'copied'], ['f2.bin', 'copied'], ['f1.bin', 'copied'], ['f4.bin', 'copied']],
+    )
+    // rclone 1.60's real message shapes (review batch A, 2026-09-25): every
+    // Copied shape is a `copied`; a modtime touch is NOT a file transfer.
+    assert.deepEqual(fileEventOf({ level: 'info', msg: 'Copied (replaced existing)', object: 'f1.bin' }), { name: 'f1.bin', kind: 'copied' })
+    assert.deepEqual(fileEventOf({ level: 'info', msg: 'Copied (server-side copy)', object: 'f2.bin' }), { name: 'f2.bin', kind: 'copied' })
+    assert.deepEqual(fileEventOf({ level: 'info', msg: 'Multi-thread Copied (replaced existing)', object: 'f3.bin' }), { name: 'f3.bin', kind: 'copied' })
     assert.deepEqual(fileEventOf({ level: 'info', msg: 'Deleted', object: 'old.bin' }), { name: 'old.bin', kind: 'deleted' })
+    assert.equal(fileEventOf({ level: 'info', msg: 'Updated modification time in destination', object: 'f4.bin' }), null)
+    // `updated` stays in the schema for forward compatibility, but 1.60 never
+    // produces a message that maps to it.
+    assert.equal(fileEventOf({ level: 'info', msg: 'Updated', object: 'f2.bin' }), null)
   })
 
   it('an error-level event is BOTH an error line and a recent error', () => {
@@ -321,13 +344,30 @@ describe('cloud sync runner — the live run detail (rclone.6)', () => {
     reader.onFileEvent = (e) => {
       events.push(e)
     }
-    reader.push(`${ERROR_LINE}\n`)
+    reader.push(`${OBJECT_ERROR_LINE}\n`)
     assert.equal(reader.errorLines.length, 1)
     assert.deepEqual(events, [{
-      name: 'a.jpg',
+      name: 'locked',
       kind: 'error',
-      message: 'Failed to copy: failed to open source object: open /tank/pictures/a.jpg: permission denied',
+      message: 'failed to open directory "locked": open /tmp/anas-fixcap2-3189298/src/locked: permission denied',
     }])
+  })
+
+  it('an error line with NO object still reaches recent and lastError (the retry summaries)', () => {
+    const events: ReturnType<typeof fileEventOf>[] = []
+    const reader = new RcloneLogReader()
+    reader.onFileEvent = (e) => {
+      events.push(e)
+    }
+    reader.push(`${OBJECTLESS_ERROR_LINE}\n`)
+    const msg = (JSON.parse(OBJECTLESS_ERROR_LINE) as { msg: string }).msg
+    assert.equal(reader.errorLines.length, 1, 'it is still an error line')
+    assert.deepEqual(events, [{ name: '', kind: 'error', message: msg }])
+    const tracker = new CloudRunDetailTracker()
+    tracker.onEvent(events[0]!)
+    const detail = tracker.detail()
+    assert.equal(detail.lastError, msg, 'the message alone — there is no file to name')
+    assert.deepEqual(detail.recent, [{ name: '', kind: 'error', at: detail.recent[0]!.at, message: msg }])
   })
 
   it('an info line that is not one of the viewer\'s messages is no event', () => {
@@ -336,9 +376,49 @@ describe('cloud sync runner — the live run detail (rclone.6)', () => {
     assert.equal(fileEventOf({ level: 'notice', msg: 'Copied (new)', object: 'f9.bin' }), null)
   })
 
+  it('the samples are DAEMON-derived byte deltas, and the detail reads them', () => {
+    const tracker = new CloudRunDetailTracker(new Date('2026-09-25T07:00:00.000Z'))
+    const base = RUN_STATS[0]
+    // First tick: no previous stats object, so no sample at all.
+    tracker.onStats({ ...base, bytes: 0, elapsedTime: 0, speed: 999999 })
+    tracker.onStats({ ...base, bytes: 1000000, elapsedTime: 5, speed: 999999 })
+    tracker.onStats({ ...base, bytes: 2000000, elapsedTime: 10, speed: 999999 })
+    // rclone's own `speed` above decays toward zero but never reaches it —
+    // the samples must not care.
+    tracker.onStats({ ...base, bytes: 2000000, elapsedTime: 15, speed: 120000 })
+    tracker.onStats({ ...base, bytes: 2000000, elapsedTime: 20, speed: 45000 })
+    tracker.onStats({ ...base, bytes: 2000000, elapsedTime: 25, speed: 16000 })
+    const detail = tracker.detail(Date.parse('2026-09-25T07:00:30.000Z'))
+    assert.equal(detail.startedAt, '2026-09-25T07:00:00.000Z')
+    assert.equal(detail.elapsedMs, 30000)
+    assert.deepEqual(detail.speedSamples, [200000, 200000, 0, 0, 0], 'one byte-delta sample per tick after the first')
+    assert.equal(detail.speed, 0, 'the latest sample — not rclone\'s decaying EWMA')
+    // bytes stopped: the stalled rule (the shared one, over the shared
+    // vectors) fires on three zero samples with files outstanding.
+    assert.equal(stalledFor(detail), 15)
+  })
+
+  it('the detail eta comes from the last 12 samples, never from rclone', () => {
+    const tracker = new CloudRunDetailTracker(new Date('2026-09-25T07:00:00.000Z'))
+    const base = RUN_STATS[0]
+    tracker.onStats({ ...base, bytes: 0, elapsedTime: 0, eta: 999 })
+    tracker.onStats({ ...base, bytes: 1000000, elapsedTime: 5, eta: 999 })
+    tracker.onStats({ ...base, bytes: 2000000, elapsedTime: 10, eta: 999 })
+    assert.equal(tracker.detail().eta, null, 'two samples is too few to answer')
+    tracker.onStats({ ...base, bytes: 3000000, elapsedTime: 15, eta: 999 })
+    const detail = tracker.detail()
+    assert.equal(detail.eta, (10000000 - 3000000) / 200000, 'remaining bytes over the sample mean')
+    // A LONG stall zeroes the whole 12-sample mean, and then there is no eta
+    // to give — rclone's own eta (999 above) is never consulted instead.
+    for (let i = 1; i <= 12; i++)
+      tracker.onStats({ ...base, bytes: 3000000, elapsedTime: 15 + i * 5, eta: 999 })
+    assert.equal(tracker.detail().eta, null)
+  })
+
   it('the detail is the counters plus both rings, with an error naming lastError', () => {
     const tracker = new CloudRunDetailTracker(new Date('2026-09-25T07:00:00.000Z'))
-    tracker.onStats(statsOf(JSON.parse(CAPTURED_STATS_LINE))!)
+    tracker.onStats(RUN_STATS[0])
+    tracker.onStats(RUN_STATS[1])
     tracker.onEvent({ name: 'f3.bin', kind: 'copied' }, '2026-09-25T07:00:06.000Z')
     tracker.onEvent({
       name: 'a.jpg',
@@ -348,15 +428,14 @@ describe('cloud sync runner — the live run detail (rclone.6)', () => {
     const detail = tracker.detail(Date.parse('2026-09-25T07:00:10.000Z'))
     assert.equal(detail.startedAt, '2026-09-25T07:00:00.000Z')
     assert.equal(detail.elapsedMs, 10000)
-    assert.equal(detail.speed, 688901.8)
-    assert.equal(detail.eta, 3)
-    assert.equal(detail.bytes, 684032)
-    assert.equal(detail.totalBytes, 9000000)
-    assert.equal(detail.totalTransfers, 3)
-    assert.deepEqual(detail.speedSamples, [688901.8])
-    assert.deepEqual(detail.transferring, [
-      { name: 'f1.bin', size: 3000000, bytes: 684032, percentage: 22, speed: 688901.8, eta: null },
-    ])
+    const sample = (RUN_STATS[1].bytes - RUN_STATS[0].bytes) / (RUN_STATS[1].elapsedTime - RUN_STATS[0].elapsedTime)
+    assert.equal(detail.speed, sample)
+    assert.equal(detail.eta, null, 'one sample only — no average yet')
+    assert.equal(detail.bytes, RUN_STATS[1].bytes)
+    assert.equal(detail.totalBytes, RUN_STATS[1].totalBytes)
+    assert.equal(detail.totalTransfers, RUN_STATS[1].totalTransfers)
+    assert.deepEqual(detail.speedSamples, [sample])
+    assert.deepEqual(detail.transferring, RUN_STATS[1].transferring)
     assert.deepEqual(detail.recent, [
       { name: 'f3.bin', kind: 'copied', at: '2026-09-25T07:00:06.000Z' },
       { name: 'a.jpg', kind: 'error', at: '2026-09-25T07:00:07.000Z', message: 'Failed to copy: permission denied' },
@@ -366,26 +445,48 @@ describe('cloud sync runner — the live run detail (rclone.6)', () => {
 
   it('both rings are capped: 60 speed samples, 50 recent events, oldest dropped', () => {
     const tracker = new CloudRunDetailTracker(new Date('2026-09-25T07:00:00.000Z'))
-    const base = statsOf(JSON.parse(CAPTURED_STATS_LINE))!
+    const base = RUN_STATS[0]
     for (let i = 0; i < SPEED_RING_CAP + 5; i++) {
-      tracker.onStats({ ...base, speed: i + 1 })
+      tracker.onStats({ ...base, bytes: (i + 1) * 1000, elapsedTime: (i + 1) * 5 })
       tracker.onEvent({ name: `f${i}.bin`, kind: 'copied' }, '2026-09-25T07:00:06.000Z')
     }
     const detail = tracker.detail()
     assert.equal(detail.speedSamples.length, SPEED_RING_CAP)
-    assert.deepEqual(detail.speedSamples[0], 6)
-    assert.deepEqual(detail.speedSamples.at(-1), SPEED_RING_CAP + 5)
+    assert.equal(detail.speedSamples[0], 200)
+    assert.equal(detail.speedSamples.at(-1), 200)
     assert.equal(detail.recent.length, RECENT_RING_CAP)
     assert.equal(detail.recent[0].name, `f${SPEED_RING_CAP + 5 - RECENT_RING_CAP}.bin`)
   })
 
   it('a clean run has no lastError, and the detail is a snapshot, not live arrays', () => {
     const tracker = new CloudRunDetailTracker(new Date('2026-09-25T07:00:00.000Z'))
-    tracker.onStats(statsOf(JSON.parse(CAPTURED_STATS_LINE))!)
+    const base = RUN_STATS[0]
+    tracker.onStats({ ...base, bytes: 1000, elapsedTime: 5 })
     const first = tracker.detail()
-    tracker.onStats({ ...statsOf(JSON.parse(CAPTURED_STATS_LINE))!, speed: 1 })
-    assert.equal(first.speed, 688901.8, 'an older published detail does not change under a later tick')
+    assert.equal(first.speed, 0, 'the first tick has no previous stats object to delta against')
+    tracker.onStats({ ...base, bytes: 2000, elapsedTime: 10 })
+    assert.equal(first.speed, 0, 'an older published detail does not change under a later tick')
+    assert.equal(tracker.detail().speed, 200)
     assert.equal('lastError' in tracker.detail(), false)
+  })
+
+  it('the shared stalled rule answers the shared vectors from a tracker-built detail', () => {
+    const vectors: { name: string, samples: number[], transfers?: number, totalTransfers?: number, transferring?: number, stalledSeconds: number | null }[]
+      = JSON.parse(readFileSync(join(FIXTURES, '../../../../shared/test-vectors/stalled-samples.json'), 'utf-8'))
+    const tracker = new CloudRunDetailTracker()
+    const base = RUN_STATS[0]
+    // Build a stalled detail the tracker's own way: growing bytes, then three
+    // ticks where bytes stop.
+    tracker.onStats({ ...base, bytes: 0, elapsedTime: 0 })
+    tracker.onStats({ ...base, bytes: 2000000, elapsedTime: 5 })
+    tracker.onStats({ ...base, bytes: 4000000, elapsedTime: 10 })
+    tracker.onStats({ ...base, bytes: 4000000, elapsedTime: 15 })
+    tracker.onStats({ ...base, bytes: 4000000, elapsedTime: 20 })
+    tracker.onStats({ ...base, bytes: 4000000, elapsedTime: 25 })
+    const detail = tracker.detail()
+    const expected = vectors.find(v => v.name === 'three zero samples with files remaining — stalled')
+    assert.ok(expected)
+    assert.equal(stalledFor(detail), expected.stalledSeconds)
   })
 })
 
@@ -615,30 +716,45 @@ describe('runCloudSync — a live run', () => {
     }
   })
 
-  it('publishes the live run detail on every stats object and file event (rclone.6)', async () => {
+  it('publishes the live run detail per STATS tick — file events only fill the rings (rclone.6, batch A)', async () => {
     const h = await liveHarness()
     try {
+      // The whole captured copy run — 5 stats objects and 4 Copied events —
+      // replays through the tee like a real child's stderr.
       h.mock.addFixture({
         command: RCLONE,
-        result: { stdout: '', stderr: `${[CAPTURED_STATS_LINE, CAPTURED_EVENT_LINE, FINAL_STATS].join('\n')}\n`, exitCode: 0 },
+        result: { stdout: '', stderr: RUN_COPY_LOG, exitCode: 0 },
       })
       const details: import('@anas/shared').CloudRunDetail[] = []
-      await runCloudSync(h.mock, deps(h, { onDetail: d => details.push(d) }), () => {})
-      // One publication per stats object and per file event — the tracker's
-      // detail grows monotonically, so the last one is the run's final state.
-      assert.ok(details.length >= 3, `expected a detail per stats object + file event, got ${details.length}`)
-      const last = details.at(-1)!
-      assert.equal(last.bytes, 4194304)
-      assert.equal(last.transfers, 5)
-      assert.deepEqual(last.speedSamples, [688901.8, 34952.5], 'one sample per stats object')
-      assert.deepEqual(last.recent.map(e => [e.name, e.kind]), [['f3.bin', 'copied']])
-      // The published details are snapshots. Within ONE delivered chunk the
-      // file events fire as their lines complete and the stats callbacks once
-      // the chunk's lines are done, so the first publication here is the file
-      // event's — and it keeps its own state as later ticks arrive.
+      const result = await runCloudSync(h.mock, deps(h, { onDetail: d => details.push(d) }), () => {})
+      assert.equal(result.status, 'success')
+      assert.equal(result.bytes, 10000000)
+      // One publication per stats object ONLY — the 4 file events updated the
+      // rings and the next tick carried them out, so a many-small-files run
+      // builds no detail snapshot per file.
+      assert.equal(details.length, 5, `a detail per stats tick, got ${details.length}`)
+      // The first tick carries no sample (nothing to delta against). The
+      // rings DO carry the Copied events here: the mock delivers the whole
+      // log as ONE chunk, and the reader fires file events as their lines
+      // complete — before the stats callbacks run. A live run's chunks
+      // interleave; this replay just publishes the events early.
       assert.deepEqual(details[0].speedSamples, [])
-      assert.deepEqual(details[0].recent.map(e => [e.name, e.kind]), [['f3.bin', 'copied']])
-      assert.deepEqual(details[1].speedSamples, [688901.8])
+      assert.deepEqual(
+        details[0].recent.map(e => [e.name, e.kind]),
+        [['f3.bin', 'copied'], ['f2.bin', 'copied'], ['f1.bin', 'copied'], ['f4.bin', 'copied']],
+      )
+      // The last detail is the run's final state, over the captured bytes.
+      const last = details.at(-1)!
+      assert.equal(last.bytes, 10000000)
+      assert.equal(last.transfers, 4)
+      assert.equal(last.speedSamples.length, 4)
+      assert.ok(last.speedSamples.every(s => s > 0), 'every captured interval moved bytes')
+      assert.equal(last.speed, last.speedSamples.at(-1)!)
+      assert.equal(last.eta, 0, 'everything transferred — no seconds remaining')
+      assert.deepEqual(
+        last.recent.map(e => [e.name, e.kind]),
+        [['f3.bin', 'copied'], ['f2.bin', 'copied'], ['f1.bin', 'copied'], ['f4.bin', 'copied']],
+      )
     }
     finally {
       await h.cleanup()

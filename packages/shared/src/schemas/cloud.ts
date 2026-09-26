@@ -430,10 +430,15 @@ export type CloudRunTransferringFile = z.infer<typeof CloudRunTransferringFile>
 
 /**
  * One finished (or failed) per-file event, from the `-v` log stream: an
- * info-level object whose `msg` says what happened ("Copied (new)",
- * "Copied (replaced existing)", "Updated", "Deleted") and whose `object` names
- * the file — or an error-level object naming the file it failed on. `at` is
- * the moment the daemon read the line.
+ * info-level object whose `msg` says what happened — rclone 1.60's real
+ * messages, "Copied (new)", "Copied (replaced existing)", "Deleted" — and
+ * whose `object` names the file — or an error-level object, which names the
+ * file it failed on when rclone says one and carries `name: ''` when it does
+ * not (the "Attempt 1/3 failed with ..." retry summaries carry no object).
+ * `updated` stays in the enum for forward compatibility, but rclone 1.60
+ * never emits a message that maps to it: a modtime touch reads "Updated
+ * modification time in destination" and is not a file transfer. `at` is the
+ * moment the daemon read the line.
  */
 export const CloudRunRecentEvent = z.object({
   name: z.string(),
@@ -452,15 +457,24 @@ export type CloudRunRecentEvent = z.infer<typeof CloudRunRecentEvent>
  * Every counter is rclone's own, from the most recent `stats` object; the two
  * rings are in-memory on the job like every other job field, never written
  * anywhere (Principle 11 — a finished run's history is the journal, not this).
- * `speedSamples` holds the last 60 `speed` readings, one per stats object —
- * the last 5 minutes at the pinned `--stats 5s`.
+ * The THROUGHPUT figures are not: rclone 1.60's `stats.speed` is an
+ * exponentially weighted average that decays toward zero but never reaches it
+ * on a stall, and its averaging loop stops 60 s after the transferring set
+ * empties and never restarts, so `speed` and `eta` can freeze mid-run. The
+ * daemon therefore derives its own samples — per stats object after the
+ * first, the byte delta over the elapsed delta — and `speedSamples` holds the
+ * last 60 of those, the last 5 minutes at the pinned `--stats 5s`.
  */
 export const CloudRunDetail = z.object({
   startedAt: ISODateTime,
   elapsedMs: z.number().nonnegative(),
-  /** Bytes/second, from the latest stats object. */
+  /** Bytes/second — the latest DAEMON-DERIVED byte-delta sample, not rclone's `speed`. */
   speed: z.number().nonnegative(),
-  /** Seconds remaining, when rclone could estimate them; null otherwise. */
+  /**
+   * Seconds remaining, derived from the byte-delta samples (remaining bytes
+   * over the mean of the last 12) — never rclone's `eta`. Null until 3
+   * samples exist and that mean is positive.
+   */
   eta: z.number().nullable(),
   bytes: z.number().nonnegative(),
   totalBytes: z.number().nonnegative(),
@@ -475,7 +489,11 @@ export const CloudRunDetail = z.object({
   transferring: z.array(CloudRunTransferringFile),
   /** The last 50 per-file events, oldest → newest. */
   recent: z.array(CloudRunRecentEvent),
-  /** The last 60 `speed` readings, oldest → newest. */
+  /**
+   * The last 60 DAEMON-DERIVED byte-delta samples (bytes/s), oldest → newest
+   * — one per stats object after the first, 0 on a tick where bytes did not
+   * grow. The stalled rule (`stalledFor` in `@anas/shared`) reads these.
+   */
   speedSamples: z.array(z.number().nonnegative()),
 })
 export type CloudRunDetail = z.infer<typeof CloudRunDetail>

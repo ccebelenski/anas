@@ -1,0 +1,47 @@
+[
+  {
+    "input": "{\"access_token\":\"ya29.a0Af\",\"token_type\":\"Bearer\",\"expiry\":\"2026-09-25T23:59:59Z\"}",
+    "ok": true,
+    "value": "{\"access_token\":\"ya29.a0Af\",\"token_type\":\"Bearer\",\"expiry\":\"2026-09-25T23:59:59Z\"}"
+  },
+  {
+    "input": "Paste the following into your remote --->\n{\"access_token\":\"ya29.a0Af\"}\n<---End paste---",
+    "ok": true,
+    "value": "{\"access_token\":\"ya29.a0Af\"}"
+  },
+  {
+    "input": "\"{\\\"access_token\\\":\\\"ya29.a0Af\\\"}\"",
+    "ok": true,
+    "value": "{\"access_token\":\"ya29.a0Af\"}"
+  },
+  {
+    "input": "\"{\"access_token\":\"ya29.a0Af\"}\"",
+    "ok": false,
+    "value": "\"{\"access_token\":\"ya29.a0Af\"}\""
+  },
+  {
+    "input": "hello",
+    "ok": false,
+    "value": "hello"
+  },
+  {
+    "input": "",
+    "ok": true,
+    "value": ""
+  },
+  {
+    "input": "{\"access_token\":\"ya29.a0Af\"}\n",
+    "ok": true,
+    "value": "{\"access_token\":\"ya29.a0Af\"}"
+  },
+  {
+    "input": "Paste the following into your remote --->\r\n{\"access_token\":\"ya29.a0Af\"}\r\n<---End paste---\r\n",
+    "ok": true,
+    "value": "{\"access_token\":\"ya29.a0Af\"}"
+  },
+  {
+    "input": "[\"not an object\"]",
+    "ok": false,
+    "value": "[\"not an object\"]"
+  }
+]

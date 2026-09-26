@@ -1,0 +1,77 @@
+[
+  {
+    "name": "three zero samples with files remaining — stalled",
+    "samples": [500000, 400000, 0, 0, 0],
+    "transfers": 1,
+    "totalTransfers": 4,
+    "transferring": 1,
+    "stalledSeconds": 15
+  },
+  {
+    "name": "two zero samples is not yet stalled",
+    "samples": [500000, 0, 0],
+    "transfers": 1,
+    "totalTransfers": 4,
+    "transferring": 0,
+    "stalledSeconds": null
+  },
+  {
+    "name": "zeros but everything transferred and nothing in flight",
+    "samples": [400000, 0, 0, 0],
+    "transfers": 4,
+    "totalTransfers": 4,
+    "transferring": 0,
+    "stalledSeconds": null
+  },
+  {
+    "name": "transfers already counted but files still in flight — stalled",
+    "samples": [400000, 0, 0, 0],
+    "transfers": 4,
+    "totalTransfers": 4,
+    "transferring": 2,
+    "stalledSeconds": 15
+  },
+  {
+    "name": "healthy samples",
+    "samples": [400000, 410000, 395000],
+    "transfers": 1,
+    "totalTransfers": 4,
+    "transferring": 1,
+    "stalledSeconds": null
+  },
+  {
+    "name": "recovered — the latest sample is non-zero again",
+    "samples": [0, 0, 0, 320000],
+    "transfers": 1,
+    "totalTransfers": 4,
+    "transferring": 1,
+    "stalledSeconds": null
+  },
+  {
+    "name": "no samples yet — one stats object printed has no delta to read",
+    "samples": [],
+    "transfers": 0,
+    "totalTransfers": 4,
+    "transferring": 1,
+    "stalledSeconds": null
+  },
+  {
+    "name": "all zero but no outstanding work",
+    "samples": [0, 0, 0, 0],
+    "transfers": 3,
+    "totalTransfers": 3,
+    "transferring": 0,
+    "stalledSeconds": null
+  },
+  {
+    "name": "absent counter fields degrade to not-stalled unless files are in flight",
+    "samples": [0, 0, 0],
+    "transferring": 1,
+    "stalledSeconds": 15
+  },
+  {
+    "name": "absent counter fields and nothing in flight",
+    "samples": [0, 0, 0],
+    "stalledSeconds": null
+  }
+]

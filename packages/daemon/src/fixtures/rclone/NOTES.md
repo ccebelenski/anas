@@ -27,6 +27,21 @@ both go to stderr; stdout is empty for all of them). The remote in the sftp capt
 | `dry-run-copy-1.60.1.log` | same argv with `copy`, against a complete destination | 2026-09-24 (`71c7624`) | 1.60.1-DEV | Nothing to do — and rclone **still prints its final stats object** (checks 2, transfers 0). This is why a preview that did nothing is never confused with one that failed. |
 | `dry-run-auth-fail-1.60.1.log` | `timeout 120 rclone copy /gtbackup/cloudsrc gtbad:dst/fail --config /etc/anas/rclone.conf --ask-password=false --use-json-log --stats 30s --stats-log-level NOTICE --dry-run` (sftp remote with a wrong password), exit **1** | 2026-09-25, by the run that first executed `cloud-tasks-api.spec.ts`'s failing-preview block | 1.60.1-DEV | rclone's **pre-logger** failure: one plain timestamped line, no JSON, no stats object. See below — this capture overturned the shape it replaced. |
 | `dry-run-read-error-1.60.1.log` | same base argv, `copy` of a local tree with an **unreadable subdirectory**, run as `nobody`, exit **6** | 2026-09-25, same session | 1.60.1-DEV | rclone's **post-logger** error path: JSON `level: error` objects, a final stats object carrying `errors: 1` and `lastError`, then a plain `Failed to copy:` fatal. |
+| `run-copy-1.60.1.log` | `rclone copy <tmp>/src <tmp>/dst --use-json-log --stats 5s --stats-log-level NOTICE -v --bwlimit 400k` (local → local, four 2.5 MB random files, in a `mktemp -d`), exit **0** | 2026-09-25, stunt node `anas-pve`, review fix batch A (rclone.6) | 1.60.1-DEV | A real RUN's log at the pinned rclone.6 cadence: five `stats` objects — four mid-run at `level: warning` **with** `transferring[]` (which also carries `speedAvg`, ignored by the parser) and the final one at `level: info` with `transfers: 4`, `eta: 0` — plus one `Copied (new)` event per file, and an info line with neither `stats` nor `object` (the bandwidth-limiter banner) that parses to nothing. This is the parser and run-detail tests' source, replacing hand-typed shapes (which had `elapsedTime: 1.0`, `level: info` on mid-run stats, and an invented `Updated` event). |
+| `run-error-objectless-1.60.1.log` | `runuser -u nobody -- rclone copy <tmp>/src <tmp>/dst --use-json-log --stats 5s --stats-log-level NOTICE -v --retries 2`, source with an **unreadable subdirectory** (`chmod 000`), in a `mktemp -d`, exit **6** | 2026-09-25, same node/session | 1.60.1-DEV | The **object-less error line**: rclone's per-retry summary — `Attempt 1/2 failed with 2 errors and: …` (`cmd/cmd.go:283`) — is a `level: error` JSON object **without an `object` field**, beside the per-file errors that name theirs. The final stats object carries `lastError` and `retryError: true`, and one plain `Failed to copy with 2 errors:` line closes the run. This is why `fileEventOf` answers `{ name: '', kind: 'error' }` for such lines instead of dropping them. |
+
+These two `run-*` captures back the review-batch-A ruling that the daemon derives its
+own speed samples: across the copy run's ticks rclone's `stats.speed` only ever decays
+(438k → 413k bytes/s over an ever-slower tail), and on a stalled destination it would
+approach zero without reaching it — while the byte-delta samples (`bytes`/`elapsedTime`
+differences between consecutive objects) read exactly 0.
+
+## Secrets
+
+The `run-*` captures involve no remote at all (local → local through a `mktemp -d`,
+the error run as `nobody`), so no credential, obscured or otherwise, appears in them;
+the only paths are the throwaway temp directories. Checked at capture time, as for the
+dry-run logs above.
 
 ## What the auth-fail capture overturned
 

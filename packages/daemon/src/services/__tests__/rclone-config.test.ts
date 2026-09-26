@@ -1,6 +1,7 @@
 import type { CloudProvider, CloudProviderOption } from '@anas/shared'
 import type { CommandExecutor } from '../../executor/types.js'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -916,5 +917,18 @@ describe('rclone-config: normalizeOAuthToken (the OAuth paste, human-pass findin
     // the empty field is the "(unchanged)" marker — nothing to validate
     assert.deepEqual(normalizeOAuthToken(''), { ok: true, value: '' })
     assert.equal(OAUTH_TOKEN_ERROR.includes('JSON block'), true)
+  })
+
+  it('answers EVERY case in the shared test vector (the UI\'s copy iterates the same file)', () => {
+    const cases: { input: string, ok: boolean, value?: string }[] = JSON.parse(
+      readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../../../shared/test-vectors/oauth-token-normalisation.json'), 'utf-8'),
+    )
+    assert.ok(cases.length >= 7, 'the vector covers the shapes the human pass found')
+    for (const c of cases) {
+      const res = normalizeOAuthToken(c.input)
+      assert.equal(res.ok, c.ok, `ok for ${JSON.stringify(c.input)}`)
+      if (c.value !== undefined)
+        assert.equal(res.value, c.value, `value for ${JSON.stringify(c.input)}`)
+    }
   })
 })

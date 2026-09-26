@@ -9,6 +9,15 @@ export {
 } from './cloud-guide.js'
 export type { CloudBackendGuide } from './cloud-guide.js'
 
+// Cloud run display helpers (rclone.6) — the ONE stalled rule and the pinned
+// stats cadence, shared by the daemon's run detail and the UI's label, with
+// the test vectors in `test-vectors/stalled-samples.json`.
+export {
+  CLOUD_STATS_INTERVAL_SECS,
+  STALLED_SAMPLES,
+  stalledFor,
+} from './cloud-run.js'
+
 // Mount target normalisation (Epic 18): the pure server/share normaliser the
 // daemon (buildSpec, create/test routes) and the UI port both build from,
 // plus its result type.
