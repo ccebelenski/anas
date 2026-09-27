@@ -1,6 +1,6 @@
 // @anas/shared — shared types, schemas, and validators
 
-export const VERSION = '0.3.5'
+export const VERSION = '0.4.0'
 
 // Cloud remote-form curation table (rclone.4) — the ONE display-side guide
 // the daemon's catalogue trim consumes; the UI renders from the trim. The
