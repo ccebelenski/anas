@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
 # Live-proof fixture for cloudproof.1 (tests/integration/cloud-backends.spec.ts)
-# — the four NON-OAuth curated backends exercised against real loopback
-# servers, none of them needing a cloud account:
+# and cloudproof.2 (tests/integration/cloud-backends-2.spec.ts) — real loopback
+# servers for seven backends, none of them needing a cloud account:
 #
 #   s3      versitygw (Apache-2, one static binary, /opt/anas-test/versitygw)
 #           as transient unit anas-gt-s3 on 127.0.0.1:7070, posix backend,
@@ -27,17 +27,48 @@ source "${SCRIPT_DIR}/config.sh"
 #           pass gtftppass. The rclone FTP REMOTE (the client the product
 #           drives) is exercised all the same.
 #
-# Shared by all four profiles: the copy-task source directory
+# cloudproof.2 adds three profiles against emulated stores / an encrypted
+# wrapper:
+#
+#   azure   Azurite (Microsoft's emulator, an npm package) installed under
+#           /opt/anas-test/azurite, run as anas-gt-azure on 127.0.0.1:10000
+#           with the well-known dev account devstoreaccount1; the container
+#           gtcontainer is created through rclone. rclone 1.60.1 reaches an
+#           http emulator ONLY with use_emulator=true AND endpoint set to the
+#           full emulator URL — either alone fails (endpoint alone builds
+#           https://<account>.<endpoint>, and 1.60.1 defaults endpoint to
+#           blob.core.windows.net BEFORE the use_emulator branch reads it) —
+#           and the use_emulator branch then IGNORES account/key, hardcoding
+#           the dev credentials. The node's rclone is Debian's
+#           1.60.1+dfsg-4; both facts captured live 2026-09-27.
+#   gcs     fake-gcs-server v1.56.1 (single Go binary from its GitHub
+#           releases, kept at /opt/anas-test/fake-gcs-server) as anas-gt-gcs
+#           on 127.0.0.1:4443, http scheme, filesystem backend under
+#           /opt/anas-test/gcs-data; the bucket gtbucket is a DIRECTORY
+#           created before the unit starts and the emulator lists it.
+#           rclone's google cloud storage backend with anonymous true needs
+#           project_number too (1.60 refuses a bucket listing without one).
+#   crypt   NO server of its own: the node's sshd with the fixture user
+#           gtcryptsftp (home /var/tmp/anas-gtcrypt, an sshd drop-in ONLY
+#           when the effective config refuses password auth — the
+#           cloud-review-fixture.sh pattern). The spec creates the sftp
+#           remote and the crypt remote over it through the API; the
+#           encrypted directory crypt-base is created BY THE RUN (it must
+#           not exist root-owned, or the sftp user cannot write it).
+#
+# Shared by all seven profiles: the copy-task source directory
 # /var/tmp/anas-gtcloud-src — 12 small files plus scratch.tmp, the file the
 # task's `*.tmp` exclude must keep off every destination.
 #
 # `down` reverses ALL of it and SAYS SO: each check prints a ✓ line (unit
-# gone, directory gone, no leftover server process, and on smb the user and
-# share gone). The s3 profile's down keeps the binaries; everything else goes.
+# gone, directory gone, no leftover server process, and on smb/crypt the user
+# and share/drop-in gone). The s3/azure/gcs profiles' downs keep the binaries
+# (versitygw, the azurite npm tree, fake-gcs-server); everything else goes.
 # Nothing here touches the operator's remote gtest, their task testoff, the
 # existing shares/users, or the gtbackup/gtiscsi pools — every name this
-# fixture creates starts with gtcloud-, gtsmb, gtdav, gtftp or gtaccess/
-# gtsecret123 (the latter only inside the fixture's own S3 server).
+# fixture creates starts with gtcloud-, gtsmb, gtdav, gtftp, gtaccess/
+# gtsecret123 (the latter only inside the fixture's own S3 server) or
+# gtcryptsftp/gtcrypt*.
 
 S3_BIN="/opt/anas-test/versitygw"
 S3_UNIT="anas-gt-s3"
@@ -65,25 +96,56 @@ FTP_USER="gtftp"
 FTP_PASS="gtftppass"
 FTP_DIR="/var/tmp/anas-gtftp"
 
+# Azurite: the npm tree lives under AZ_DIR, its data under AZ_DATA. The well
+# known Azurite development-account key (published by Microsoft for the
+# emulator; worth nothing outside 127.0.0.1).
+AZ_UNIT="anas-gt-azure"
+AZ_PORT="10000"
+AZ_DIR="/opt/anas-test/azurite"
+AZ_BIN="$AZ_DIR/node_modules/.bin/azurite-blob"
+AZ_DATA="/opt/anas-test/azurite-data"
+AZ_ACCOUNT="devstoreaccount1"
+AZ_KEY="Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+AZ_CONTAINER="gtcontainer"
+
+GCS_UNIT="anas-gt-gcs"
+GCS_PORT="4443"
+GCS_BIN="/opt/anas-test/fake-gcs-server/fake-gcs-server"
+GCS_DATA="/opt/anas-test/gcs-data"
+GCS_BUCKET="gtbucket"
+GCS_PROJECT_NUMBER="123456"
+
+CRYPT_USER="gtcryptsftp"
+CRYPT_PASS="gtcryptpass"
+CRYPT_HOME="/var/tmp/anas-gtcrypt"
+CRYPT_SSHD_DROPIN="/etc/ssh/sshd_config.d/61-anas-gtcryptsftp.conf"
+
 SRC_DIR="/var/tmp/anas-gtcloud-src"
 SRC_FILES=12
 
 usage() {
-  echo "Usage: cloud-backends-fixture.sh <up|down|status> [s3|smb|webdav|ftp]"
+  echo "Usage: cloud-backends-fixture.sh <up|down|status> [s3|smb|webdav|ftp|azure|gcs|crypt]..."
   echo "  up      (re)create the profile's loopback server + the shared source dir"
   echo "  down    Remove the profile's unit, dirs, and server process — verifying each"
   echo "  status  What of the profile is on the node right now"
-  echo "  No profile argument = all four."
+  echo "  No profile argument = all seven. Several profiles may be named."
   exit 1
 }
 
-[ $# -ge 1 ] && [ $# -le 2 ] || usage
+[ $# -ge 1 ] || usage
 VERB="$1"
-case "${2:-all}" in
-  all)    PROFILES="s3 smb webdav ftp" ;;
-  s3|smb|webdav|ftp) PROFILES="$2" ;;
-  *)      usage ;;
-esac
+shift
+PROFILES=""
+if [ $# -eq 0 ]; then
+  PROFILES="s3 smb webdav ftp azure gcs crypt"
+else
+  for p in "$@"; do
+    case "$p" in
+      s3|smb|webdav|ftp|azure|gcs|crypt) PROFILES="$PROFILES $p" ;;
+      *) usage ;;
+    esac
+  done
+fi
 
 # --- the ANAS API over the node's loopback (the fixture's smb half) ----------
 # The daemon is reached through pveproxy's /anas forward with a PVE ticket —
@@ -372,7 +434,206 @@ status_ftp() {
   $SSH_CMD "ls -ld $FTP_DIR 2>/dev/null || echo 'no $FTP_DIR'"
 }
 
+# --- cloudproof.2: azure (Azurite), gcs (fake-gcs-server), crypt (sshd) -----
+
+# The rclone env-config the node's own rclone needs to reach Azurite. BOTH
+# use_emulator AND endpoint are required on 1.60.1 (see the header) — and the
+# account/key ride along unused: the use_emulator branch hardcodes the dev
+# credentials. Not a password probe — azureblob.key is not IsPassword in
+# rclone's catalogue, so the value rides plain (an obscured one fails
+# base64-decoding inside rclone).
+azure_probe_cmd() {
+  echo "tmp=\$(mktemp -d) && RCLONE_CONFIG_GTPROBE_TYPE=azureblob \
+RCLONE_CONFIG_GTPROBE_ACCOUNT=$AZ_ACCOUNT RCLONE_CONFIG_GTPROBE_KEY='$AZ_KEY' \
+RCLONE_CONFIG_GTPROBE_USE_EMULATOR=true \
+RCLONE_CONFIG_GTPROBE_ENDPOINT=http://127.0.0.1:$AZ_PORT/$AZ_ACCOUNT \
+rclone --config \$tmp/rclone.conf lsd gtprobe: >/dev/null 2>&1; rc=\$?; rm -rf \$tmp; exit \$rc"
+}
+
+up_azure() {
+  # The npm tree: install on demand, never re-install when present. The
+  # registry was proven reachable (curl -sI https://registry.npmjs.org).
+  if ! $SSH_CMD "test -x $AZ_BIN"; then
+    echo "  installing azurite under $AZ_DIR (was absent)"
+    $SSH_CMD "mkdir -p $AZ_DIR && npm install --prefix $AZ_DIR azurite --no-fund --no-audit" \
+      >/dev/null || { echo "ERROR: azurite npm install failed" >&2; return 1; }
+  fi
+  unit_down "$AZ_UNIT" || return 1
+  $SSH_CMD "rm -rf $AZ_DATA && mkdir -p $AZ_DATA"
+  unit_up "$AZ_UNIT" \
+    "$AZ_BIN --blobHost 127.0.0.1 --blobPort $AZ_PORT --location $AZ_DATA --skipApiVersionCheck --silent" \
+    "$(azure_probe_cmd)" \
+    || return 1
+  # The container, created through rclone (the product's own client), then
+  # proven listed — the emulator really holds it.
+  $SSH_CMD "tmp=\$(mktemp -d) && export RCLONE_CONFIG_GTPROBE_TYPE=azureblob \
+RCLONE_CONFIG_GTPROBE_USE_EMULATOR=true \
+RCLONE_CONFIG_GTPROBE_ENDPOINT=http://127.0.0.1:$AZ_PORT/$AZ_ACCOUNT \
+&& rclone --config \$tmp/rclone.conf mkdir gtprobe:$AZ_CONTAINER \
+&& rclone --config \$tmp/rclone.conf lsd gtprobe: | grep -q $AZ_CONTAINER; rc=\$?; rm -rf \$tmp; exit \$rc" \
+    || { echo "ERROR: could not create/see container $AZ_CONTAINER" >&2; return 1; }
+  echo "✓ container $AZ_CONTAINER created through rclone and listed"
+  src_up
+}
+
+down_azure() {
+  unit_down "$AZ_UNIT" || return 1
+  $SSH_CMD "rm -rf $AZ_DATA"
+  if $SSH_CMD "test -e $AZ_DATA"; then echo "✗ $AZ_DATA still present"; return 1; fi
+  echo "✓ $AZ_DATA removed (the npm tree $AZ_DIR stays)"
+  if $SSH_CMD "pgrep -f 'azurite-blo[b]' >/dev/null 2>&1"; then
+    echo "✗ an azurite process survived"; return 1
+  fi
+  echo "✓ no leftover azurite process"
+  src_down
+}
+
+status_azure() {
+  echo "--- azure ---"
+  if $SSH_CMD "test -x $AZ_BIN"; then
+    echo "server: azurite under $AZ_DIR"
+  else
+    echo "server: NONE"
+  fi
+  $SSH_CMD "systemctl is-active $AZ_UNIT 2>/dev/null || echo 'unit inactive'"
+  $SSH_CMD "ls $AZ_DATA 2>/dev/null || echo 'no $AZ_DATA'"
+}
+
+# The rclone env-config for the emulator's GCS API: anonymous access, a made
+# up project number (1.60 refuses a bucket listing without one), the
+# emulator's storage/v1 endpoint.
+gcs_probe_cmd() {
+  echo "tmp=\$(mktemp -d) && RCLONE_CONFIG_GTPROBE_TYPE=gcs \
+RCLONE_CONFIG_GTPROBE_ANONYMOUS=true RCLONE_CONFIG_GTPROBE_PROJECT_NUMBER=$GCS_PROJECT_NUMBER \
+RCLONE_CONFIG_GTPROBE_ENDPOINT=http://127.0.0.1:$GCS_PORT/storage/v1/ \
+rclone --config \$tmp/rclone.conf lsd gtprobe: | grep -q $GCS_BUCKET; rc=\$?; rm -rf \$tmp; exit \$rc"
+}
+
+up_gcs() {
+  if ! $SSH_CMD "test -x $GCS_BIN"; then
+    echo "  installing fake-gcs-server under /opt/anas-test/fake-gcs-server (was absent)"
+    $SSH_CMD "mkdir -p /opt/anas-test/fake-gcs-server /tmp/anas-fgcs && cd /tmp/anas-fgcs \
+      && curl -fsSL -o fgcs.tgz https://github.com/fsouza/fake-gcs-server/releases/download/v1.56.1/fake-gcs-server_1.56.1_Linux_amd64.tar.gz \
+      && tar xzf fgcs.tgz && cp fake-gcs-server $GCS_BIN && chmod +x $GCS_BIN && cd / && rm -rf /tmp/anas-fgcs" \
+      || { echo "ERROR: fake-gcs-server install failed" >&2; return 1; }
+  fi
+  unit_down "$GCS_UNIT" || return 1
+  # The bucket is a DIRECTORY under the filesystem root — created BEFORE the
+  # unit starts (the emulator lists the root directory live, nothing to
+  # register).
+  $SSH_CMD "rm -rf $GCS_DATA && mkdir -p $GCS_DATA/$GCS_BUCKET"
+  unit_up "$GCS_UNIT" \
+    "$GCS_BIN -scheme http -host 127.0.0.1 -port $GCS_PORT -public-host 127.0.0.1:$GCS_PORT -backend filesystem -filesystem-root $GCS_DATA" \
+    "$(gcs_probe_cmd)" \
+    || return 1
+  echo "✓ bucket $GCS_BUCKET present (a directory under $GCS_DATA) and listed through rclone"
+  src_up
+}
+
+down_gcs() {
+  unit_down "$GCS_UNIT" || return 1
+  $SSH_CMD "rm -rf $GCS_DATA"
+  if $SSH_CMD "test -e $GCS_DATA"; then echo "✗ $GCS_DATA still present"; return 1; fi
+  echo "✓ $GCS_DATA removed (the binary $GCS_BIN stays)"
+  if $SSH_CMD "pgrep -f 'fake-gcs-serve[r]' >/dev/null 2>&1"; then
+    echo "✗ a fake-gcs-server process survived"; return 1
+  fi
+  echo "✓ no leftover fake-gcs-server process"
+  src_down
+}
+
+status_gcs() {
+  echo "--- gcs ---"
+  if $SSH_CMD "test -x $GCS_BIN"; then
+    echo "server binary: $GCS_BIN"
+  else
+    echo "server binary: NONE"
+  fi
+  $SSH_CMD "systemctl is-active $GCS_UNIT 2>/dev/null || echo 'unit inactive'"
+  $SSH_CMD "ls $GCS_DATA 2>/dev/null || echo 'no $GCS_DATA'"
+}
+
+crypt_user_exists() { $SSH_CMD "getent passwd $CRYPT_USER" >/dev/null 2>&1; }
+
+up_crypt() {
+  # The user: created when absent, RESET when present (deterministic creds).
+  if crypt_user_exists; then
+    echo "✓ $CRYPT_USER already exists (resetting credentials — tolerating a repeat run)"
+  else
+    $SSH_CMD "useradd -m -d $CRYPT_HOME -s /bin/bash $CRYPT_USER" \
+      || { echo "ERROR: useradd $CRYPT_USER failed" >&2; return 1; }
+    echo "✓ $CRYPT_USER created"
+  fi
+  $SSH_CMD "echo '$CRYPT_USER:$CRYPT_PASS' | chpasswd"
+  # The crypt BASE directory: owned by the user (a root-created one is
+  # unwritable and the copy fails — found live during the ground-truth
+  # probes). Pre-created so a Test of the saved crypt remote answers `ok`
+  # before the first run (an absent base is sftp's `directory not found`).
+  $SSH_CMD "install -d -o $CRYPT_USER -g $CRYPT_USER $CRYPT_HOME/crypt-base"
+  echo "✓ $CRYPT_HOME/crypt-base created (owned by $CRYPT_USER)"
+  # The drop-in, ONLY when the effective config refuses password auth.
+  auth="$($SSH_CMD "sshd -T -C user=$CRYPT_USER,host=localhost,addr=127.0.0.1 2>/dev/null | grep -i '^passwordauthentication' | awk '{print \$2}'")"
+  if [ "$auth" = "no" ]; then
+    $SSH_CMD "install -d -m 0755 /etc/ssh/sshd_config.d && printf 'Match User $CRYPT_USER\n    PasswordAuthentication yes\n' > $CRYPT_SSHD_DROPIN && systemctl reload ssh"
+    echo "✓ sshd refuses password auth for $CRYPT_USER — drop-in written and ssh reloaded"
+  else
+    echo "✓ password auth already effective for $CRYPT_USER (no drop-in)"
+  fi
+  # Ready only when the user actually answers sftp with its password (a
+  # reload drops the listener for a moment). THROWAWAY config: rclone
+  # persists its sftp shell detection into whatever --config it is handed.
+  ok="no"
+  for _ in $(seq 1 10); do
+    if $SSH_CMD "tmp=\$(mktemp -d) && RCLONE_CONFIG_GTPROBE_TYPE=sftp \
+RCLONE_CONFIG_GTPROBE_HOST=127.0.0.1 RCLONE_CONFIG_GTPROBE_USER=$CRYPT_USER \
+RCLONE_CONFIG_GTPROBE_PASS=\$(printf %s '$CRYPT_PASS' | rclone obscure -) \
+rclone --config \$tmp/rclone.conf lsjson gtprobe: --max-depth 1 >/dev/null 2>&1; rc=\$?; rm -rf \$tmp; exit \$rc" >/dev/null 2>&1; then
+      ok="yes"; break
+    fi
+    sleep 1
+  done
+  [ "$ok" = "yes" ] || { echo "ERROR: $CRYPT_USER cannot authenticate over sftp" >&2; return 1; }
+  echo "✓ $CRYPT_USER answers sftp on 127.0.0.1"
+  src_up
+}
+
+down_crypt() {
+  if $SSH_CMD "test -f $CRYPT_SSHD_DROPIN"; then
+    $SSH_CMD "rm -f $CRYPT_SSHD_DROPIN && systemctl reload ssh"
+    echo "✓ sshd drop-in removed and ssh reloaded"
+  fi
+  if crypt_user_exists; then
+    removed="no"
+    for attempt in 1 2 3 4 5; do
+      if $SSH_CMD "userdel -r $CRYPT_USER" 2>/dev/null; then removed="yes"; break; fi
+      # TERM, never KILL — same reason as cloud-review-fixture.sh.
+      $SSH_CMD "pkill -TERM -u $CRYPT_USER >/dev/null 2>&1; true"
+      sleep 2
+    done
+    [ "$removed" = "yes" ] || { echo "ERROR: $CRYPT_USER could not be removed (still in use)" >&2; return 1; }
+    echo "✓ $CRYPT_USER removed (with its home)"
+  else
+    echo "✓ $CRYPT_USER not present (skipping)"
+  fi
+  $SSH_CMD "rm -rf $CRYPT_HOME"
+  if $SSH_CMD "test -e $CRYPT_HOME"; then echo "✗ $CRYPT_HOME still present"; return 1; fi
+  echo "✓ $CRYPT_HOME removed"
+  src_down
+}
+
+status_crypt() {
+  echo "--- crypt ---"
+  if crypt_user_exists; then
+    $SSH_CMD "getent passwd $CRYPT_USER"
+    $SSH_CMD "ls -la $CRYPT_HOME 2>/dev/null || true"
+  else
+    echo "no $CRYPT_USER"
+  fi
+  $SSH_CMD "test -f $CRYPT_SSHD_DROPIN && cat $CRYPT_SSHD_DROPIN || echo 'no drop-in'"
+}
+
 case "$VERB" in
+
   up)
     for p in $PROFILES; do
       echo "=== cloud backends fixture — up $p ==="
