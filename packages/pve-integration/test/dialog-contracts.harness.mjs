@@ -13102,14 +13102,29 @@ async function cloudRunViewerChecks() {
   ok('run viewer: an empty ring of events says so',
     /nothing finished yet/.test(early), early)
 
+  // The very first detail: an EMPTY samples ring. sparkFromSamples returns ''
+  // for it — the placeholder spark (same height, muted baseline) must stand
+  // in the flex graph span so the speed and stalled labels keep their place
+  // instead of sliding to the far right of an empty row.
+  const initial = body(runViewJob('running', { ...RUN_VIEW_DETAIL, transfers: 0,
+    bytes: 0, errors: 0, lastError: undefined, recent: [], transferring: [],
+    speedSamples: [], eta: null }), {})
+  ok('run viewer: an empty samples ring renders the placeholder spark — full height, baseline, no data',
+    /anas-run-spark-graph"><svg class="anas-run-spark-empty" viewBox="0 0 100 24"[^]*height:28px[^]*<line x1="0" y1="23" x2="100" y2="23"/
+      .test(initial) && !/<polyline/.test(initial), initial)
+  ok('run viewer: the placeholder keeps the speed label in place',
+    /anas-run-speed/.test(initial), initial)
+
   const mid = body(runViewJob('running', RUN_VIEW_DETAIL), {})
   ok('run viewer: Transferring now shows the in-flight file with its size, inline bar, %, speed and ETA',
     (mid.match(/anas-run-transferring-row/g) || []).length === 1
     && /f5\.bin/.test(mid) && /3000000 B/.test(mid) && /22%/.test(mid)
     && /688901\.8 B\/s/.test(mid), mid)
-  ok('run viewer: Recent lists errors FIRST, in danger, with the message',
+  ok('run viewer: Recent lists errors FIRST, in danger, with the message on its own full-width line',
     (mid.match(/anas-run-recent-row/g) || []).length === 2
-    && /anas-run-recent-row" data-anas-run-recent-kind="error"[^]*read error/.test(mid)
+    && /anas-run-recent-row" data-anas-run-recent-kind="error"/.test(mid)
+    && /<tr class="anas-run-recent-msg"><td colspan="3">read error: connection reset by peer<\/td><\/tr>/
+      .test(mid)
     && mid.indexOf('data-anas-run-recent-kind="error"') < mid.indexOf('data-anas-run-recent-kind="copied"'),
     mid)
   ok('run viewer: the last error line stands under the grids',
@@ -13141,11 +13156,12 @@ async function cloudRunViewerChecks() {
     (trTable.match(/<th /g) || []).length === 5
       && /class="anas-run-label">Transferring now</.test(trTable),
     trTable)
-  ok('run viewer: the Recent table carries File/Kind/When headers and the dash keeps the row text "name — what"',
+  ok('run viewer: the Recent table carries File/Kind/When headers and a completion reads "file · kind" plain',
     /<thead><tr><th class="anas-run-col-file">File<\/th><th class="anas-run-col-kind">Kind<\/th>/
       .test(mid)
-    && />f3\.bin<\/span><\/td><td class="anas-run-col-kind"><span class="anas-run-recent-dash">—<\/span> copied</
-      .test(mid), mid)
+    && />f3\.bin<\/span><\/td><td class="anas-run-col-kind">copied<\/td>/.test(mid), mid)
+  ok('run viewer: the error message row carries no file cell of its own (it spans the row)',
+    !/anas-run-recent-msg"[^]*data-anas-run-cell/.test(mid), mid)
   ok('run viewer: the full spark is width 100% with preserveAspectRatio none — bound to its container',
     /anas-run-spark-graph[^]*anas-gfx-spark-full" viewBox="0 0 100 24" preserveAspectRatio="none" style="width:100%/
       .test(early), early)
@@ -13153,6 +13169,12 @@ async function cloudRunViewerChecks() {
     (early.match(/anas-run-bar-caption/g) || []).length === 2
     && /anas-run-bar-caption">0 B of 3000000 B · 0%</.test(early)
     && /anas-run-bar-caption">0 of 5 files</.test(early), early)
+  // rclone's totalBytes is a RUNNING estimate — it can dip under the bytes
+  // already moved. One clamped fraction feeds both gauge and caption, so the
+  // caption reads 100%, never 103%.
+  const overfull = body(runViewJob('running', { ...RUN_VIEW_DETAIL, bytes: 3100000 }), {})
+  ok('run viewer: bytes past the running total clamp the caption to 100%',
+    /anas-run-bar-caption">3100000 B of 3000000 B · 100%</.test(overfull), overfull)
 
   const stalled = body(runViewJob('running', { ...RUN_VIEW_DETAIL,
     speedSamples: [688901.8, 0, 0, 0] }), {})
@@ -13217,6 +13239,10 @@ async function cloudRunViewerChecks() {
     { name: 'drive-hours', source: '/mnt/pictures', remote: 'gt', path: 'backups', mode: 'copy' })
   await settle()
   ok('run viewer: View run opens anas-win-cloud-run', !!win && win.cls === 'anas-win-cloud-run', win && win.cls)
+  ok('run viewer: the window cannot shrink under 600 px — the tables\' own floor',
+    win.minWidth === 600, String(win && win.minWidth))
+  ok('gfx: ensureInjected is exposed for bodies that carry no gfx call of their own',
+    typeof ANAS.gfx.ensureInjected === 'function')
   ok('run viewer: opening polled the job (and only once — the recorded interval stands in for the 2 s timer)',
     jobGets() - jobGetsBefore === 1, String(jobGets() - jobGetsBefore))
   ok('run viewer: …and fetched the task for the live/snapshot label',

@@ -615,7 +615,7 @@ test.describe.serial('cloud guided form (rclone.4) + run viewer (rclone.6) live 
       const rows = await viewer.locator('.anas-run-recent-row').all()
       const names: string[] = []
       for (const r of rows)
-        names.push((((await r.textContent()) ?? '').split('—')[0] ?? '').trim())
+        names.push((((await r.locator('.anas-run-col-file .anas-run-path').textContent()) ?? '').trim()))
       return names
     }
     const recentHead1 = (await recentNames())[0]

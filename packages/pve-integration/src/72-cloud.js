@@ -2872,27 +2872,46 @@
         return enc(ANAS.formatDuration(n * 1000));
     }
 
+    // runSparkHtml(samples) → the viewer's full spark, or — while the samples
+    // ring is still empty — a placeholder SVG of the same height: a muted
+    // axis baseline, no data. The graph span is flex:1, so without it the
+    // empty first render would collapse the span and shove the speed and
+    // stalled labels to the far right.
+    function runSparkHtml(samples) {
+        var title = t('throughput, last 5 minutes');
+        var svg = ANAS.gfx.sparkFromSamples(samples, { size: 'full', title: title });
+        if (svg) {
+            return svg;
+        }
+        return '<svg class="anas-run-spark-empty" viewBox="0 0 100 24" preserveAspectRatio="none"'
+            + ' style="width:100%;height:28px;vertical-align:middle;display:inline-block"'
+            + ' title="' + enc(title) + '">'
+            + '<line x1="0" y1="23" x2="100" y2="23" stroke="var(--anas-muted,gray)"'
+            + ' stroke-width="1" opacity="0.5" vector-effect="non-scaling-stroke"/></svg>';
+    }
+
     // Recent event → one table row: the file (middle-ellipsized, full path on
-    // hover), what happened (the message itself when it is an error), when.
-    // The row's tooltip carries the message. The muted "—" before the kind
-    // keeps the row's text reading "name — what" — the live proof splits a
-    // recent row's text on the dash to read the file name back.
+    // hover), what happened, when — the row's tooltip carries the message.
+    // An error renders its message on its OWN full-width line under the file
+    // row (danger, wrapping): a message in a nowrap Kind cell was clipped to
+    // a hover-only tooltip, and the story wants errors shown WITH the message.
     function recentEventHtml(ev) {
         ev = ev || {};
         var isErr = ev.kind === 'error';
-        var what = isErr
-            ? '<span class="anas-run-recent-msg">' + enc(ev.message || t('error')) + '</span>'
-            : enc(t(ev.kind || 'copied'));
         var p = runPathDisplay(ev.name);
-        return '<tr class="anas-run-recent-row" data-anas-run-recent-kind="' + enc(ev.kind || '') + '"'
+        var html = '<tr class="anas-run-recent-row" data-anas-run-recent-kind="' + enc(ev.kind || '') + '"'
             + (ev.message ? ' title="' + enc(ev.message) + '"' : '')
             + '><td class="anas-run-col-file" title="' + enc(p.full) + '">'
             + '<span class="anas-run-path">' + enc(p.text) + '</span></td>'
-            + '<td class="anas-run-col-kind"><span class="anas-run-recent-dash">—</span> '
-            + what + '</td>'
+            + '<td class="anas-run-col-kind">' + enc(t(ev.kind || 'copied')) + '</td>'
             + '<td class="anas-run-col-when">'
             + (ev.at ? enc(ANAS.ago(ev.at)) : '<span class="anas-run-empty">—</span>')
             + '</td></tr>';
+        if (isErr && ev.message) {
+            html += '<tr class="anas-run-recent-msg"><td colspan="3">'
+                + enc(ev.message) + '</td></tr>';
+        }
+        return html;
     }
 
     function kindSortKey(kind) {
@@ -2914,7 +2933,7 @@
         var running = status === 'running';
 
         // (1) header — task, source → remote:path, mode, live/snapshot, status.
-        var header = '<div class="anas-run-header" style="margin-bottom:8px;">'
+        var header = '<div class="anas-run-header">'
             + '<span style="font-weight:600;font-size:1.05em;">' + enc(task.name || '') + '</span> '
             + runStatusPillHtml(status)
             + '<div style="color:var(--anas-muted,gray);margin-top:2px;">'
@@ -2958,7 +2977,11 @@
                 + '</div>';
         }
 
-        var frac = detail.totalBytes > 0 ? detail.bytes / detail.totalBytes : 0;
+        // One clamped fraction feeds BOTH the gauge and the caption: rclone's
+        // totalBytes is a running estimate, so unclamped the caption could
+        // read 103% while the bar sits pinned at full.
+        var frac = detail.totalBytes > 0
+            ? Math.min(1, Math.max(0, detail.bytes / detail.totalBytes)) : 0;
         var fileFrac = detail.totalTransfers > 0
             ? detail.transfers / detail.totalTransfers : 0;
         var stalled = ANAS.gfx.stalledHtml(detail);
@@ -2981,13 +3004,12 @@
         // (3) throughput spark + current speed + the stalled label. The spark
         // graph takes what is left of the row (flex, min-width 0) — the SVG is
         // width:100% of THAT, so the speed label can never push it past the
-        // window edge.
+        // window edge. Until the first samples land sparkFromSamples returns
+        // '' — a placeholder SVG of the SAME height keeps the graph span from
+        // collapsing, so the speed and stalled labels hold their place.
         var spark = '<div class="anas-run-spark">'
             + '<span class="anas-run-spark-graph">'
-            + ANAS.gfx.sparkFromSamples(detail.speedSamples || [], {
-                size: 'full',
-                title: t('throughput, last 5 minutes'),
-            })
+            + runSparkHtml(detail.speedSamples || [])
             + '</span>'
             + '<span class="anas-run-speed">' + speedHtml(detail.speed) + '</span> '
             + stalled + '</div>';
@@ -3033,7 +3055,7 @@
                     + '<td class="anas-run-col-eta" data-anas-run-cell="eta">'
                     + etaHtml(f.eta) + '</td></tr>';
             }
-            html += '<div class="anas-run-transferring" style="margin-bottom:8px;">'
+            html += '<div class="anas-run-transferring">'
                 + '<div class="anas-run-label">' + enc(t('Transferring now')) + '</div>'
                 + (rows
                     ? '<table class="anas-run-table anas-run-transferring-table"><thead><tr>'
@@ -3048,8 +3070,7 @@
         } else {
             // The result banner stands where the in-flight section was; the
             // bars above hold their final values.
-            html += '<div class="anas-run-result-banner" style="padding:8px 12px;'
-                + 'border-radius:8px;background:rgba(127,127,127,0.10);margin-bottom:12px;">'
+            html += '<div class="anas-run-result-banner">'
                 + runResultBannerHtml(job) + '</div>';
         }
 
@@ -3085,7 +3106,7 @@
             recentHtml += '<a href="#" data-anas-run-recent-all="1" class="anas-run-recent-all">'
                 + enc(t('show all {n}').replace('{n}', '' + detail.recent.length)) + '</a>';
         }
-        html += '<div class="anas-run-recent" style="margin-bottom:8px;">'
+        html += '<div class="anas-run-recent">'
             + '<div class="anas-run-label">' + enc(t('Recent')) + '</div>'
             + (recentHtml || '<div class="anas-run-empty">'
                 + enc(t('nothing finished yet')) + '</div>')
@@ -3161,6 +3182,7 @@
                 title: t('Run viewer') + ': ' + name,
                 modal: false,
                 width: 760,
+                minWidth: 600,
                 height: 560,
                 resizable: true,
                 layout: 'fit',
@@ -3294,6 +3316,9 @@
         }
 
         win._anasCloudGrid = grid || null;
+        // The `.anas-run-*` homes share the gfx stylesheet — inject it HERE,
+        // at open, never relying on some earlier gfx call having done it.
+        ANAS.gfx.ensureInjected();
         win.show();
         render();
         if (jobId) {

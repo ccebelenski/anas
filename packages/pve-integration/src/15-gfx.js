@@ -374,11 +374,13 @@
             + 'background:var(--anas-accent-soft)}');
 
         // Cloud run viewer (rclone.6). The `.anas-run-*` homes share THIS
-        // stylesheet — it is injected by the first gfx call the body makes
-        // (the gauge, bar or spark), and every styled section sits after one,
-        // so the viewer body stays a pure class string. Rhythm: 8 px between
-        // sections; the file columns take what is left of their row, every
-        // other column is fixed so a long path can never squeeze the numbers.
+        // stylesheet — the viewer injects it at open via ANAS.gfx.ensureInjected(),
+        // so its body stays a pure class string with no inline stand-ins.
+        // Rhythm: 8 px between sections; the tables hold a 620 px floor (the
+        // window's own minWidth is 600) so the fixed columns — 484 px in the
+        // content-box worst case — can never squeeze the file column under
+        // 120 px; the scrollable body scrolls instead.
+        css.push('.anas-run-header{margin-bottom:8px}');
         css.push('.anas-run-progress{margin-bottom:8px}');
         css.push('.anas-run-progress .anas-gfx-gauge{max-width:100%}');
         css.push('.anas-run-bar-caption{margin-top:3px;font-size:11px;color:var(--anas-muted);'
@@ -386,7 +388,6 @@
         css.push('.anas-run-files-bar{margin-top:6px}');
         css.push('.anas-run-spark{display:flex;align-items:center;gap:8px;margin-bottom:8px}');
         css.push('.anas-run-spark-graph{flex:1 1 auto;min-width:0;line-height:0}');
-        css.push('.anas-run-spark-graph .anas-gfx-spark{display:block}');
         css.push('.anas-run-speed{flex:0 0 auto;white-space:nowrap}');
         css.push('.anas-run-spark .anas-gfx-stalled{flex:0 0 auto}');
         css.push('.anas-run-figures{margin-bottom:8px}');
@@ -395,7 +396,8 @@
         css.push('.anas-run-figure-value{font-size:1.1em}');
         css.push('.anas-run-label{color:var(--anas-muted);font-size:0.85em;margin-bottom:3px}');
         css.push('.anas-run-empty{color:var(--anas-muted)}');
-        css.push('.anas-run-table{width:100%;border-collapse:collapse;table-layout:fixed;text-align:left}');
+        css.push('.anas-run-table{width:100%;min-width:620px;border-collapse:collapse;'
+            + 'table-layout:fixed;text-align:left}');
         css.push('.anas-run-table th{color:var(--anas-muted);font-weight:400;font-size:0.85em;'
             + 'padding:2px 8px 2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}');
         css.push('.anas-run-table td{padding:2px 8px 2px 0;vertical-align:middle;'
@@ -409,10 +411,12 @@
         css.push('.anas-run-col-when{width:96px}');
         css.push('.anas-run-recent-table .anas-run-col-file{width:55%}');
         css.push('.anas-run-recent-table .anas-run-col-kind{width:34%}');
-        css.push('.anas-run-path{display:inline-block;max-width:100%;overflow:hidden;'
-            + 'text-overflow:ellipsis;vertical-align:bottom}');
-        css.push('.anas-run-recent-dash{color:var(--anas-muted)}');
+        css.push('.anas-run-path{display:inline-block;max-width:100%;vertical-align:bottom;'
+            + 'font-family:monospace;font-size:0.92em}');
+        css.push('.anas-run-recent-msg td{white-space:normal}');
         css.push('.anas-run-recent-msg{color:var(--anas-danger,#c23b2c)}');
+        css.push('.anas-run-result-banner{padding:8px 12px;border-radius:8px;'
+            + 'background:rgba(127,127,127,0.10);margin-bottom:12px}');
 
         return css.join('\n');
     }
@@ -1931,6 +1935,12 @@
     // ---- publish + prime injection ----------------------------------------
 
     gfx.fillColorVar = fillColorVar; // exposed so views can colour-match custom bits
+
+    // Idempotent stylesheet/defs injection, exposed for the bodies that carry
+    // gfx-styled markup WITHOUT making a gfx call of their own (the cloud run
+    // viewer's `.anas-run-*` homes) — they call this at open instead of
+    // relying on some earlier view having injected the sheet.
+    gfx.ensureInjected = ensureInjected;
 
     // Capability check: gfx is present AND its core builders are wired up.
     // Views gate their gfx retrofit on this and degrade to plain rendering.
