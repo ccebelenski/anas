@@ -1,0 +1,3 @@
+2026/09/27 02:48:15 NOTICE: Config file "/tmp/tmp.1Q7EzGZtsw/rclone.conf" not found - using defaults
+2026/09/27 02:48:15 ERROR : : error listing: couldn't connect SMB: response error: The attempted logon is invalid. This is either due to a bad username or authentication information.
+2026/09/27 02:48:15 Failed to lsjson with 2 errors: last error was: error in ListJSON: couldn't connect SMB: response error: The attempted logon is invalid. This is either due to a bad username or authentication information.

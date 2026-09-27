@@ -3774,6 +3774,23 @@
         return out;
     }
 
+    // The type of the remote the wizard's combo currently names ('' when none
+    // or unknown — the types map came from the same /cloud/remotes read the
+    // combo's store did).
+    function selectedRemoteType(win) {
+        var f = win && win.down && win.down('#cloudRemote');
+        return (f && (win._cloudRemoteTypes || {})[f.getValue()]) || '';
+    }
+
+    // The SMB path hint follows the selected remote's type (finding 4 of
+    // cloudproof.1): visible while an smb remote is selected, never otherwise.
+    function syncSmbPathHint(win) {
+        var hint = win && win.down && win.down('#cloudSmbPathHint');
+        if (hint) {
+            hint.setVisible(selectedRemoteType(win) === 'smb');
+        }
+    }
+
     function openTaskWizard(view, node, existing) {
         var isEdit = !!existing;
         var task = existing || {};
@@ -3781,11 +3798,16 @@
             // The fetched names are what the combo offers — the read was
             // always made, and throwing the list away left the Remote field
             // with an empty store and nothing to pick.
-            var names = ((res && res.data) && res.data.remotes || []).map(function (r) {
-                return r && r.name;
-            }).filter(function (n) {
-                return !!n;
-            });
+            var names = [];
+            var types = {};
+            var remotes = ((res && res.data) && res.data.remotes) || [];
+            for (var i = 0; i < remotes.length; i++) {
+                var r = remotes[i];
+                if (r && r.name) {
+                    names.push(r.name);
+                    types[r.name] = r.type || '';
+                }
+            }
             // The combo is the wizard's one precondition: with no remote saved
             // there is nothing to send to (the backup precedent — the toast
             // names the button that fixes it).
@@ -3793,7 +3815,7 @@
                 ANAS.toast(t(EMPTY_REMOTES_TOAST));
                 return;
             }
-            buildTaskWizard(view, node, isEdit, task, names);
+            buildTaskWizard(view, node, isEdit, task, names, types);
         }, function (err) {
             ANAS.warn('cloud task wizard load failed: ' + ANAS.errText(err));
             ANAS.alertMsg('Load failed',
@@ -3801,7 +3823,7 @@
         });
     }
 
-    function buildTaskWizard(view, node, isEdit, task, remoteNames) {
+    function buildTaskWizard(view, node, isEdit, task, remoteNames, remoteTypes) {
         var win;
         try {
             win = Ext.create('Ext.window.Window', {
@@ -3901,6 +3923,7 @@
                             listeners: {
                                 change: function () {
                                     var w = this.up('window');
+                                    syncSmbPathHint(w);
                                     if (w && w._cloudRefreshGate) {
                                         w._cloudRefreshGate();
                                     }
@@ -3929,6 +3952,21 @@
                             html: enc(t('The path under the remote. Leave it empty to send to the '
                                 + 'remote\'s own root; on some backends (sftp) a leading / '
                                 + 'starts at the remote\'s absolute root.')),
+                        },
+                        {
+                            // Finding 4 of cloudproof.1: rclone's smb backend
+                            // names the SHARE as the first path component, and
+                            // the Test door (remote root = the share list)
+                            // cannot catch a bare-subpath mistake. Visible only
+                            // while an smb remote is selected.
+                            xtype: 'component',
+                            itemId: 'cloudSmbPathHint',
+                            cls: 'anas-cloud-smb-path-hint',
+                            hidden: true,
+                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
+                            html: enc(t('For an SMB remote the first path component is the '
+                                + 'share name, e.g. '))
+                                + '<span style="font-family:monospace;">share/folder</span>.',
                         },
                         {
                             xtype: 'radiogroup',
@@ -4101,7 +4139,9 @@
             // summary have one place to go (the save re-checks every gate).
             refreshCloudPreview(win);
         };
+        win._cloudRemoteTypes = remoteTypes || {};
         win.show();
+        syncSmbPathHint(win); // the opening remote's type decides the SMB hint
         ANAS.sched.cadence.syncFields(win); // show only the fields the opening cadence uses
         scheduleSourceScan(win, node); // the consistency + nested note for the opening source
         refreshCloudPreview(win); // the Preview gate follows the opening form (an edit opens enabled)

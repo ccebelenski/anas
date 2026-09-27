@@ -156,6 +156,75 @@ describe('cloud sync task routes (rclone.2)', () => {
       assert.match((res.json() as { error: { message: string } }).error.message, /remote 'nosuch' is not configured — add it under Remotes first/)
     })
 
+    it('400s on an EMPTY path under an smb remote — the first path component is the share name (cloudproof.1 finding 4)', async () => {
+      // An smb remote takes gt's place: the mock is cleared and re-registered
+      // (the gt dump fixture would otherwise win the exact match).
+      await writeFile(configFile, '[gtsmb]\ntype = smb\nhost = 127.0.0.1\nuser = gtuser\npass = obscured\n', 'utf-8')
+      const mock = mockOf(server)
+      mock.clearFixtures()
+      const base = rcloneBaseArgs(configFile)
+      mock.addFixture({
+        command: RCLONE,
+        args: [...base, 'config', 'dump'],
+        result: {
+          stdout: JSON.stringify({ gtsmb: { type: 'smb', host: '127.0.0.1', user: 'gtuser', pass: 'obscured' } }),
+          stderr: '',
+          exitCode: 0,
+        },
+      })
+      mock.addFixture({ command: RCLONE, args: ['version'], result: { stdout: 'rclone v1.60.1\n', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: SYSTEMD_ANALYZE, result: { stdout: 'Normalized form: Tue *-*-* 02:00:00\n', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+      // An explicit empty path AND an absent one (the schema's default) both
+      // refuse with the share-name sentence; a real path sails through.
+      for (const payload of [taskBody({ remote: 'gtsmb', path: '' }), taskBody({ remote: 'gtsmb', path: undefined })]) {
+        const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks', headers: JSON_HEADERS, payload })
+        assert.equal(res.statusCode, 400, res.body)
+        assert.match(
+          (res.json() as { error: { message: string } }).error.message,
+          /An SMB remote needs a path that starts with the share name \(share\/folder\)\./,
+        )
+      }
+      const ok = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/tasks',
+        headers: JSON_HEADERS,
+        payload: taskBody({ remote: 'gtsmb', path: 'share/folder' }),
+      })
+      assert.equal(ok.statusCode, 202, ok.body)
+      assert.equal((await waitForJob(server, (ok.json() as JobAccepted).job.id)).status, 'completed')
+    })
+
+    it('the smb empty-path refusal rides the UPDATE door too', async () => {
+      await writeFile(configFile, '[gtsmb]\ntype = smb\nhost = 127.0.0.1\nuser = gtuser\npass = obscured\n', 'utf-8')
+      const mock = mockOf(server)
+      mock.clearFixtures()
+      const base = rcloneBaseArgs(configFile)
+      mock.addFixture({
+        command: RCLONE,
+        args: [...base, 'config', 'dump'],
+        result: {
+          stdout: JSON.stringify({ gtsmb: { type: 'smb', host: '127.0.0.1', user: 'gtuser', pass: 'obscured' } }),
+          stderr: '',
+          exitCode: 0,
+        },
+      })
+      mock.addFixture({ command: RCLONE, args: ['version'], result: { stdout: 'rclone v1.60.1\n', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: SYSTEMD_ANALYZE, result: { stdout: 'Normalized form: Tue *-*-* 02:00:00\n', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+      await createTask({ remote: 'gtsmb', path: 'share/folder' })
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/cloud/tasks/offsite',
+        headers: JSON_HEADERS,
+        payload: taskBody({ remote: 'gtsmb', path: '' }),
+      })
+      assert.equal(res.statusCode, 400, res.body)
+      assert.match((res.json() as { error: { message: string } }).error.message, /An SMB remote needs a path/)
+    })
+
     it('400s on a schedule systemd refuses, quoting systemd', async () => {
       mockOf(server).addFixture({
         command: SYSTEMD_ANALYZE,

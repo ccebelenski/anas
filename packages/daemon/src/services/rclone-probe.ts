@@ -53,6 +53,15 @@
  *   auth         `Failed to create file system for "anastest:": NewFs: couldn't connect SSH: ssh: handshake failed: ssh: unable to authenticate, attempted methods [none password], no supported methods remain`
  *   unreachable  `Failed to create file system for "anastest:": NewFs: couldn't connect SSH: dial tcp 192.0.2.1:22: i/o timeout`
  *   unknown      `Failed to create file system for "nosuchremote:": didn't find section in config file`
+ *
+ * GROUND TRUTH 2026-09-27 (cloudproof.1, same node) — two more credential
+ * failures the original set missed (they fell into `error`, a real credential
+ * failure below the verdict it deserves); both fixtures in
+ * `fixtures/rclone/`, verbatim:
+ *   smb (Samba; a Windows server says `NT_STATUS_LOGON_FAILURE`)
+ *     `Failed to lsjson with 2 errors: last error was: error in ListJSON: couldn't connect SMB: response error: The attempted logon is invalid. This is either due to a bad username or authentication information.`
+ *   ftp (pyftpdlib; vsftpd/proftpd say `530 Login incorrect.`)
+ *     `Failed to create file system for "gtprobe:": NewFs: failed to make FTP connection to "127.0.0.1:2121": 530 Authentication failed.`
  */
 
 import type { CloudProvider, CloudRemoteTestResult, CloudRemoteWrite } from '@anas/shared'
@@ -108,8 +117,16 @@ export const PROBE_TMP_PREFIX = 'anas-rclone-probe-'
 
 /** Network-level failures (a host that does not answer). */
 const UNREACHABLE_RE = /i\/o timeout|connection refused|no such host|no route to host|network is unreachable/
-/** Credential / permission failures (a host that answers "no"). */
-const AUTH_RE = /unable to authenticate|handshake failed|401|403|AccessDenied|InvalidAccessKeyId|SignatureDoesNotMatch|permission denied|Unauthorized/
+/**
+ * Credential / permission failures (a host that answers "no"). The SMB and
+ * FTP arms are the cloudproof.1 captures (2026-09-27, fixtures
+ * `probe-smb-auth-fail-1.60.1.log` / `probe-ftp-auth-fail-1.60.1.log`): Samba
+ * answers a wrong credential with "The attempted logon is invalid. This is
+ * either due to a bad username or authentication information." (Windows
+ * servers say `NT_STATUS_LOGON_FAILURE` instead), and an FTP server's `530`
+ * rides `530 Authentication failed.` / `530 Login incorrect.`.
+ */
+const AUTH_RE = /unable to authenticate|handshake failed|401|403|AccessDenied|InvalidAccessKeyId|SignatureDoesNotMatch|permission denied|Unauthorized|NT_STATUS_LOGON_FAILURE|logon is invalid|bad username or authentication|530 [Aa]uthentication failed|530 [Ll]ogin incorrect/
 /** A remote-side path that does not exist (also exit 3 on its own). */
 const NOT_FOUND_RE = /directory not found/
 /** A remote name the config file does not carry — a LOCAL fault, not a verdict. */

@@ -11159,6 +11159,15 @@ const CLOUD_SFTP_REMOTE = {
   secretsSet: ['pass'],
 }
 
+// A saved SMB remote: the task wizard's path hint rides its type
+// (cloudproof.1 finding 4 — the share is the first path component).
+const CLOUD_SMB_REMOTE = {
+  name: 'gtsmb',
+  type: 'smb',
+  options: { host: '127.0.0.1', user: 'gtuser' },
+  secretsSet: ['pass'],
+}
+
 // A saved b2 remote: its REQUIRED option `key` is a SECRET, so the edit box is
 // blank "(unchanged)" and only `secretsSet` says it is set. The gate must read
 // that blank as PRESENT — otherwise Save and Test are dead on every edit of a
@@ -12295,6 +12304,42 @@ async function cloudTaskChecks() {
     })
   validates('cloud tasks(edit): the payload validates against CloudSyncTaskRequest',
     CloudSyncTaskRequest, jobs[0] && jobs[0].body)
+  created.windows.length = 0
+
+  // --- the SMB path hint (cloudproof.1 finding 4, 0.4.1) ---------------------
+  // rclone's smb backend names the SHARE as the first path component; the
+  // hint follows the SELECTED remote's type (the daemon refuses an empty path
+  // under an smb remote with the same fact).
+  const smbRoutes = cloudTaskRoutes()
+  smbRoutes['GET /cloud/remotes'] = {
+    data: {
+      rclone: { version: '1.60.1', configFile: '/etc/anas/rclone.conf', encrypted: false },
+      remotes: [CLOUD_SFTP_REMOTE, CLOUD_SMB_REMOTE],
+    },
+  }
+  const smbAnas = loadSources(['10-api.js', '12-picker.js', '69-schedules-common.js', '72-cloud.js'], smbRoutes)
+  const smbView = makeComponent(smbAnas.views.cloud.factory('harness'), null)
+  smbView.fireEvent('afterrender', smbView)
+  await settle()
+  created.windows.length = 0
+  const smbCreate = findCmp(smbView, 'anas-btn-cloud-task-create')
+  smbCreate.handler(smbCreate)
+  await settle()
+  const smbDlg = openWindow()
+  const smbHint = smbDlg && smbDlg.down('#cloudSmbPathHint')
+  ok('cloud tasks(smb): the wizard carries the SMB path hint, hidden while the sftp remote is selected',
+    !!smbHint && smbHint.hidden === true, String(smbHint && smbHint.hidden))
+  smbDlg.down('#cloudRemote').setValue('gtsmb')
+  await settle()
+  ok('cloud tasks(smb): selecting the smb remote shows the share-name sentence',
+    !!smbHint && smbHint.hidden === false
+      && /For an SMB remote the first path component is the share name/.test(smbHint.html || '')
+      && /share\/folder/.test(smbHint.html || ''),
+    JSON.stringify(smbHint && smbHint.html))
+  smbDlg.down('#cloudRemote').setValue('gt')
+  await settle()
+  ok('cloud tasks(smb): switching back to a non-smb remote hides the hint again',
+    !!smbHint && smbHint.hidden === true)
   created.windows.length = 0
 
   // --- Preview (the rider): the dry run of the UNSAVED form ------------------

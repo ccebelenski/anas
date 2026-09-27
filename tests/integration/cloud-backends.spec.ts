@@ -36,11 +36,14 @@ const execFileAsync = promisify(execFile)
  * FINDINGS recorded along the way (honest assertions, not papered over):
  *   1. The curated sets suffice everywhere — versitygw (provider `Other`)
  *      needs NO `force_path_style` on rclone 1.60, and smb needs no `domain`.
- *   2. The test verdict classifier (rclone-probe.ts AUTH_RE) answers `auth`
- *      for s3 (403) and webdav (401) but only `error` for SMB's NT logon
- *      failure and FTP's 530 — real credential failures below the generic
- *      verdict. The auth step below asserts the verdicts the daemon ACTUALLY
- *      answers; widening AUTH_RE is a 0.4.1 candidate.
+ *   2. The test verdict classifier (rclone-probe.ts AUTH_RE) answered
+ *      `auth` for s3 (403) and webdav (401) but only `error` for SMB's NT
+ *      logon failure and FTP's 530 — real credential failures below the
+ *      generic verdict. FIXED in 0.4.1: the captured lines live in the
+ *      daemon's fixtures (`probe-smb-auth-fail-1.60.1.log`,
+ *      `probe-ftp-auth-fail-1.60.1.log`) and AUTH_RE reads them; this spec
+ *      asserts `auth` for all four and needs one run on the node after the
+ *      0.4.1 deploy to re-prove it.
  *   3. `s3` region: the curated set carries `region`; versitygw (default
  *      region us-east-1) accepts it — nothing outside the set was needed.
  *   4. rclone's smb backend names the SHARE as the first path component, so
@@ -125,7 +128,7 @@ const BACKENDS: Backend[] = [
     type: 'smb',
     options: { host: '127.0.0.1', user: 'gtsmbuser', pass: 'gtsmbpass' },
     wrongOptions: { host: '127.0.0.1', user: 'gtsmbuser', pass: 'gtwrong-pass' },
-    authVerdict: 'error',
+    authVerdict: 'auth',
     nonSecretKeys: ['host', 'user'],
     secretKeys: ['pass'],
     task: 'gtcloud-smb',
@@ -156,7 +159,7 @@ const BACKENDS: Backend[] = [
     type: 'ftp',
     options: { host: '127.0.0.1', port: '2121', user: 'gtftp', pass: 'gtftppass' },
     wrongOptions: { host: '127.0.0.1', port: '2121', user: 'gtftp', pass: 'gtwrong-pass' },
-    authVerdict: 'error',
+    authVerdict: 'auth',
     nonSecretKeys: ['host', 'port', 'user'],
     secretKeys: ['pass'],
     task: 'gtcloud-ftp',
@@ -351,7 +354,7 @@ test.describe.serial('cloud sync live proofs over real backends (cloudproof.1)',
       }
 
       // (e) a wrong credential → the backend's verdict with a sentence, never
-      // Go internals (finding 2: smb/ftp classify as error, not auth).
+      // Go internals (finding 2, fixed in 0.4.1: all four classify `auth`).
       const ctx2 = await apiCtx(playwright)
       try {
         const wrong = await probeRemote(ctx2, b.type, b.wrongOptions)

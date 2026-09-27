@@ -139,6 +139,52 @@ describe('rclone-probe: classifyProbe over the captured messages (rclone.1)', ()
   })
 })
 
+// ── The cloudproof.1 captures: SMB and FTP credential failures ──────────────
+
+/**
+ * The two wrong-credential probe captures the cloudproof.1 live proof brought
+ * home (GT 2026-09-27, fixtures `probe-*-auth-fail-1.60.1.log`) — both were
+ * classified `error` until 0.4.1 widened AUTH_RE with their arms. The tests
+ * run over the FIXTURE FILES, so the classifier is pinned to what the node
+ * actually said, byte for byte.
+ */
+const PROBE_CAPTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone')
+const SMB_AUTH_FAIL = await readFile(join(PROBE_CAPTURE_DIR, 'probe-smb-auth-fail-1.60.1.log'), 'utf-8')
+const FTP_AUTH_FAIL = await readFile(join(PROBE_CAPTURE_DIR, 'probe-ftp-auth-fail-1.60.1.log'), 'utf-8')
+
+describe('rclone-probe: classifyProbe over the cloudproof.1 captures (0.4.1)', () => {
+  it('the captured SMB wrong-credential probe (exit 1) → auth with Samba\'s own sentence', () => {
+    const r = classifyProbe(1, SMB_AUTH_FAIL)
+    assert.equal(r.verdict, 'auth')
+    assert.match(r.message, /The attempted logon is invalid\. This is either due to a bad username or authentication information\./)
+    assert.ok(!r.message.includes('\n'), 'the message is rclone\'s LAST line, not a dump')
+  })
+
+  it('the captured FTP wrong-credential probe (exit 1) → auth with the server\'s 530', () => {
+    const r = classifyProbe(1, FTP_AUTH_FAIL)
+    assert.equal(r.verdict, 'auth')
+    assert.match(r.message, /530 Authentication failed\./)
+  })
+
+  it('the SMB and FTP auth patterns on their own (exit 1)', () => {
+    for (const line of [
+      // The captured Samba sentence, bare.
+      'couldn\'t connect SMB: response error: The attempted logon is invalid. This is either due to a bad username or authentication information.',
+      // What a Windows SMB server answers instead (rclone surfaces the NT status).
+      'NewFs: couldn\'t connect SMB: NT_STATUS_LOGON_FAILURE',
+      // The other FTP servers' 530 (vsftpd/proftpd).
+      'NewFs: failed to make FTP connection to "10.0.0.9:21": 530 Login incorrect.',
+    ]) {
+      assert.equal(classifyProbe(1, line).verdict, 'auth', line)
+    }
+  })
+
+  it('an SMB failure the server did NOT call a credential problem still falls to `error`', () => {
+    const r = classifyProbe(1, 'Failed to lsjson with 2 errors: last error was: error in ListJSON: couldn\'t connect SMB: response error: Network Name Not Found.')
+    assert.equal(r.verdict, 'error')
+  })
+})
+
 // ── testRemote: the argv, the env-defined remote, the guard ────────────────
 
 /** A canned `timeout … rclone …` answer for one fs argument. */

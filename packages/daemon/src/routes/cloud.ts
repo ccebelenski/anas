@@ -106,6 +106,16 @@ export const RCLONE_NOT_INSTALLED
 export const CLOUD_CANCEL_CONSEQUENCE = 'Files already copied stay at the destination. A sync run stopped '
   + 'part-way leaves the destination between two states until the next run completes.'
 
+/**
+ * The empty-path refusal for an SMB remote (cloudproof.1 finding 4, 0.4.1):
+ * rclone's smb backend names the SHARE as the first path component, so an
+ * empty path addresses the share LIST — and the Test door probes the remote
+ * root, which cannot catch it. Only a real run would fail. The wizard carries
+ * the same fact as a hint; the save refuses it outright.
+ */
+export const SMB_PATH_REQUIRED_ERROR
+  = 'An SMB remote needs a path that starts with the share name (share/folder).'
+
 /** The encrypted-config refusal (DESIGN: ANAS neither prompts nor stores the passphrase). */
 const CONFIG_ENCRYPTED_ERROR = 'rclone\'s configuration file is password-protected; ANAS manages it only unencrypted'
 
@@ -534,28 +544,41 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
   /**
    * The save-time checks a task must pass, in the order that makes the
    * refusal most useful: the remote has to exist (a task naming a remote the
-   * file does not carry can only ever fail at run time), then the schedule has
-   * to be one systemd will accept — `systemd-analyze calendar` is the
-   * authority, never a regex of ours. Replies itself and returns false on a
-   * refusal.
+   * file does not carry can only ever fail at run time), then the path has to
+   * suit that remote's backend, then the schedule has to be one systemd will
+   * accept — `systemd-analyze calendar` is the authority, never a regex of
+   * ours. Replies itself and returns false on a refusal.
    */
   async function guardTask(task: CloudSyncTask, reply: FastifyReply): Promise<boolean> {
-    const known = await guard503(reply, async () => {
+    const stored = await guard503(reply, async () => {
       await requireRclone()
       const current = await readConfig(paths, executor)
       if (current.encrypted) {
         refuseEncrypted(reply)
         return null
       }
-      return current.remotes.map(r => r.name)
+      return current.remotes
     })
-    if (known === undefined || known === null)
+    if (stored === undefined || stored === null)
       return false
-    if (!known.includes(task.remote)) {
+    const remote = stored.find(r => r.name === task.remote)
+    if (!remote) {
       reply.code(400).send({
         error: {
           code: 'VALIDATION_ERROR',
           message: `remote '${task.remote}' is not configured — add it under Remotes first`,
+        },
+      })
+      return false
+    }
+    // An SMB remote's path IS the share name first (cloudproof.1 finding 4):
+    // the empty remote root is the share list, and the Test door cannot see
+    // the mistake. Refused at the save, with the share-name shape named.
+    if (remote.type === 'smb' && task.path === '') {
+      reply.code(400).send({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: SMB_PATH_REQUIRED_ERROR,
         },
       })
       return false

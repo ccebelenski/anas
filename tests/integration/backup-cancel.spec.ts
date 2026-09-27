@@ -353,10 +353,12 @@ test.describe.serial('backup cancel live proof — the rclone.5 backup half', ()
       expect(challenge.warnings ?? [], `warnings: ${JSON.stringify(challenge.warnings)}`).toContain(CONSEQUENCE)
 
       // The replay with the code submits the job.cancel CONTROL job — it
-      // completes once the hook has stopped the run.
+      // completes once the hook has stopped the run. The header was proven
+      // present just above; the assertion does not narrow, so the field rides
+      // with its type's own honesty.
       const replayRes = await ctx.post(`${V1}/jobs/${directId}/cancel`, {
         data: {},
-        headers: { 'x-anas-confirm': challenge.codeHeader },
+        headers: { 'x-anas-confirm': challenge.codeHeader! },
       })
       expect(replayRes.status(), await replayRes.text()).toBe(202)
       const cancelJobId = (await replayRes.json()).job.id
