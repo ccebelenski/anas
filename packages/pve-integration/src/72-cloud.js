@@ -223,7 +223,11 @@
     function verdictSentence(verdict, message) {
         verdict = '' + (verdict == null ? '' : verdict);
         if (verdict === 'ok') {
-            return t('Reachable');
+            // A crypt remote with nothing stored yet tests ok carrying the
+            // sentence that the password could not be checked — shown, not
+            // swallowed.
+            var okMsg = trim(message);
+            return okMsg ? (t('Reachable') + ' — ' + okMsg) : t('Reachable');
         }
         var label = verdict === 'unreachable' ? t('Unreachable')
             : verdict === 'auth' ? t('Authentication failed')

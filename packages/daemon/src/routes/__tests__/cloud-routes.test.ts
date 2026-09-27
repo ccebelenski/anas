@@ -52,7 +52,7 @@ function mockOf(server: ReturnType<typeof createServer>): MockExecutor {
   return (server as unknown as { executor: MockExecutor }).executor
 }
 
-async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
+async function waitForJob(server: ReturnType<typeof createServer> | FastifyInstance, id: string): Promise<Job> {
   for (let i = 0; i < 50; i++) {
     const res = await server.inject({ method: 'GET', url: `/v1/jobs/${id}`, headers: IDENTITY })
     const { job } = res.json() as { job: Job }
@@ -361,6 +361,30 @@ describe('cloud remotes routes (rclone.1)', () => {
     it('a missing remote → 404', async () => {
       const res = await server.inject({ method: 'DELETE', url: '/v1/cloud/remotes/nosuch', headers: IDENTITY })
       assert.equal(res.statusCode, 404)
+    })
+
+    it('a remote another remote wraps → 409 until the wrapper is removed first (cloudproof.2 finding 4)', async () => {
+      await writeFile(configFile, `${GT_SECTION}
+[gtcrypt]
+type = crypt
+remote = gt:crypt-base
+password = mock-obscured
+`, 'utf-8')
+      const refused = await server.inject({ method: 'DELETE', url: '/v1/cloud/remotes/gt', headers: IDENTITY })
+      assert.equal(refused.statusCode, 409)
+      assert.match(refused.json().error.message, /referenced by remote\(s\): gtcrypt/)
+
+      // The wrapper removed first, the wrapped remote then deletes cleanly.
+      const first = await server.inject({ method: 'DELETE', url: '/v1/cloud/remotes/gtcrypt', headers: IDENTITY })
+      assert.equal(first.statusCode, 202)
+      const doneFirst = await waitForJob(server, (first.json() as JobAccepted).job.id)
+      assert.equal(doneFirst.status, 'completed', doneFirst.error?.message)
+      const second = await server.inject({ method: 'DELETE', url: '/v1/cloud/remotes/gt', headers: IDENTITY })
+      assert.equal(second.statusCode, 202)
+      const doneSecond = await waitForJob(server, (second.json() as JobAccepted).job.id)
+      assert.equal(doneSecond.status, 'completed', doneSecond.error?.message)
+      const text = await readFile(configFile, 'utf-8')
+      assert.ok(!text.includes('[gt]') && !text.includes('[gtcrypt]'))
     })
   })
 
@@ -823,6 +847,21 @@ describe('cloud remotes routes (rclone.1)', () => {
       assert.equal(res.statusCode, 409)
       assert.equal(res.json().error.code, 'CONFLICT')
       assert.match(res.json().error.message, /nightly/)
+    })
+
+    it('deleting a remote another remote wraps → 409 naming the referencing remotes (cloudproof.2 finding 4)', async () => {
+      await bare()
+      await writeFile(bareFile, `${GT_SECTION}
+[gtcrypt]
+type = crypt
+remote = gt:crypt-base
+password = mock-obscured
+`, 'utf-8')
+      const res = await app.inject({ method: 'DELETE', url: '/v1/cloud/remotes/gt', headers: IDENTITY })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.json().error.code, 'CONFLICT')
+      assert.match(res.json().error.message, /referenced by remote\(s\): gtcrypt/)
+      assert.match(res.json().error.message, /Remove them first\. This refusal has no confirm bypass\./)
     })
   })
 })

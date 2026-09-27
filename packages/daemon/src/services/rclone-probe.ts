@@ -62,6 +62,24 @@
  *     `Failed to lsjson with 2 errors: last error was: error in ListJSON: couldn't connect SMB: response error: The attempted logon is invalid. This is either due to a bad username or authentication information.`
  *   ftp (pyftpdlib; vsftpd/proftpd say `530 Login incorrect.`)
  *     `Failed to create file system for "gtprobe:": NewFs: failed to make FTP connection to "127.0.0.1:2121": 530 Authentication failed.`
+ *
+ * GROUND TRUTH 2026-09-27 (cloudproof.2, same node) — a wrong CRYPT password
+ * fails NONE of the buckets above: the listing SUCCEEDS (exit 0) with an
+ * EMPTY payload, because rclone 1.60 SKIPS every name it cannot decrypt and
+ * logs the skip only at DEBUG. The captured lines (fixtures
+ * `probe-crypt-wrong-debug-1.60.1.log`, the probe argv with `-vv`):
+ *   `DEBUG : 8rtb1ufkgr2fl5ctns6naatgfg: Skipping undecryptable dir name: bad PKCS#7 padding - too long`
+ *   `DEBUG : dje2saqulsplhuofsjk8mqs18g: Skipping undecryptable file name: bad PKCS#7 padding - too long`
+ * So for a crypt remote the probe runs with `-vv` (debug logging on) and the
+ * classifier reads those lines: present ⇒ `auth` with a fixed sentence —
+ * never rclone's own debug text, which echoes option values in their
+ * OBSCURED form but is still rclone's stream, not a message of ours. The
+ * same capture pins the two honest `ok`s: the correct password at the same
+ * argv lists the stored names decrypted (`probe-crypt-good-debug-1.60.1.*`)
+ * and an empty base lists `[]` with no debug line
+ * (`probe-crypt-empty-debug-1.60.1.*`) — an empty listing WITHOUT the debug
+ * lines is the only state where the password could not be checked, and that
+ * caveat rides the ok verdict's message (the shape carries one).
  */
 
 import type { CloudProvider, CloudRemoteTestResult, CloudRemoteWrite } from '@anas/shared'
@@ -71,6 +89,7 @@ import type { RcloneConfigPaths } from './rclone-config.js'
 import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { listSections, parseRcloneConf } from '../parsers/rclone-conf.js'
 import {
   isSecretKey,
   obscure,
@@ -135,6 +154,33 @@ const UNKNOWN_REMOTE_RE = /didn't find section in config file/
 const FS_NAME_RE = /Failed to create file system for "([^"]+)":/
 /** The trailing colon of an fs reference (`name:`) — stripped from the name. */
 const TRAILING_COLON_RE = /:$/
+
+/**
+ * The crypt debug line a WRONG password leaves in the listing's stderr
+ * (cloudproof.2 capture, rclone 1.60.1): `Skipping undecryptable file name`
+ * / `Skipping undecryptable dir name`, at DEBUG only — the listing itself
+ * succeeds. Never matched on a non-zero exit: there the usual buckets stand.
+ */
+export const CRYPT_UNDECRYPTABLE_RE = /Skipping undecryptable (?:file|dir) name/
+
+/**
+ * The fixed `auth` sentence for a crypt remote whose stored names do not
+ * decrypt under the tested password. `<fs>` is the remote the dialog/probe
+ * addresses (`name:path`) — never rclone's debug output, which this verdict
+ * replaces wholesale.
+ */
+export function cryptWrongPasswordMessage(fs: string): string {
+  return `The password does not decrypt the names already stored at ${fs}; check the password (and the second password, if one was set).`
+}
+
+/**
+ * The caveat an `ok` on an EMPTY crypt listing carries: with nothing stored
+ * there was nothing to try the password against. The verdict shape carries a
+ * message on every verdict (shared `CloudRemoteTestResult`), so it rides the
+ * ok; the UI appends it after "Reachable".
+ */
+export const CRYPT_NOTHING_STORED_MESSAGE
+  = 'Nothing is stored there yet, so the password could not be checked against existing data.'
 
 /**
  * The verdict of a probe result. `exitCode` is the `timeout` wrapper's (124 =
@@ -269,6 +315,24 @@ export async function sweepStaleProbeDirs(base: string = PROBE_TMP_BASE): Promis
 }
 
 /**
+ * The stored section's `type`, read from the config FILE's text (the type is
+ * never a secret — the INI parser reads it where `config dump` would spend a
+ * round trip). `undefined` when the file is absent or carries no such section.
+ */
+async function storedRemoteType(configFile: string, name: string): Promise<string | undefined> {
+  let text: string
+  try {
+    text = await readFile(configFile, 'utf-8')
+  }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+      throw err
+    return undefined
+  }
+  return listSections(parseRcloneConf(text)).find(s => s.name === name)?.values.type
+}
+
+/**
  * Run the bounded `lsjson` probe and classify it.
  *
  *  - a SAVED target probes `<name>:<path>` straight from ANAS's own file (the
@@ -284,6 +348,14 @@ export async function sweepStaleProbeDirs(base: string = PROBE_TMP_BASE): Promis
  *    secret-VALUES guard: a value in scope that would ride it is refused, and
  *    the error names nothing (secret-argv).
  *
+ * A CRYPT remote (the stored section's type for a saved target, the dialog's
+ * for an unsaved one) is probed with debug logging on (cloudproof.2 GT): a
+ * wrong password SUCCEEDS the listing (rclone skips undecryptable names at
+ * DEBUG), so the verdict is corrected over the captured debug lines — any
+ * undecryptable-name line turns the ok into `auth` with a fixed sentence
+ * naming the remote, and a genuinely empty listing keeps ok with the
+ * nothing-stored caveat on its message.
+ *
  * Throws `RemoteNotFoundError` when the config file does not carry the name
  * (the route's 404) and a plain `SecretOnArgvError` when the guard fires.
  */
@@ -298,6 +370,9 @@ export async function testRemote(
 
   const path = opts.path ?? ''
   let fs: string
+  // The fs the VERDICT sentence names: the saved remote's own name, or the
+  // dialog's draft name — never the internal env-remote sentinel.
+  let namedFs: string
   let env: Record<string, string> | undefined
   const secretValues: string[] = []
   // The `--config` the PROBE runs against: ANAS's own file for a saved
@@ -307,12 +382,14 @@ export async function testRemote(
 
   if (target.name !== undefined) {
     fs = `${target.name}:${path}`
+    namedFs = fs
   }
   else {
     const remote = target.remote!
     if (!opts.providers)
       throw new Error('testing an unsaved remote needs the provider catalogue (which options are password-typed)')
     fs = `${PROBE_REMOTE_NAME}:${path}`
+    namedFs = `${remote.name}:${path}`
     env = { [`${PROBE_ENV_PREFIX}TYPE`]: remote.type }
     const passwordKeys = passwordKeysFor(opts.providers, remote.type)
     for (const [key, value] of Object.entries(remote.options)) {
@@ -329,8 +406,13 @@ export async function testRemote(
     probeConfig = tmp.configFile
   }
 
+  const remoteType = target.name !== undefined
+    ? await storedRemoteType(paths.configFile, target.name)
+    : target.remote!.type
+  const isCrypt = remoteType === 'crypt'
+
   try {
-    const args = probeArgs(probeConfig, fs)
+    const args = probeArgs(probeConfig, fs, { debug: isCrypt })
     // The dynamic tail (the fs argument — a path a user typed — and the flags
     // after it) must not carry a plain secret value. The skip count is the
     // static prefix's own length (timeout + rclone + the --config base +
@@ -340,13 +422,36 @@ export async function testRemote(
     assertNoSecretValues(args, secretValues, probeStaticPrefix(probeConfig).length)
 
     const result = await executor.exec(TIMEOUT, args, env ? { env } : undefined)
-    return classifyProbe(result.exitCode, result.stderr)
+    const verdict = classifyProbe(result.exitCode, result.stderr)
+    if (isCrypt && verdict.verdict === 'ok') {
+      if (CRYPT_UNDECRYPTABLE_RE.test(result.stderr))
+        return { verdict: 'auth', message: cryptWrongPasswordMessage(namedFs) }
+      if (isEmptyListing(result.stdout))
+        return { verdict: 'ok', message: CRYPT_NOTHING_STORED_MESSAGE }
+    }
+    return verdict
   }
   finally {
     // The copy must not outlive the probe — and a cleanup failure must not
     // mask the probe's own error.
     if (tmpDir !== undefined)
       await rm(tmpDir, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+/**
+ * Is this lsjson payload an EMPTY listing? The probe's stdout — `[]` (pretty
+ * printed on the wire, so parsed, not string-matched). A payload that does
+ * not parse is treated as NOT empty: the caveat only rides a listing rclone
+ * really answered with nothing.
+ */
+function isEmptyListing(stdout: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(stdout.trim())
+    return Array.isArray(parsed) && parsed.length === 0
+  }
+  catch {
+    return false
   }
 }
 
@@ -367,11 +472,14 @@ export function probeStaticPrefix(configFile: string): string[] {
 /**
  * The full probe argv — `timeout 45 rclone --config <file>
  * --ask-password=false lsjson <fs> --max-depth 1 --contimeout 10s --timeout
- * 30s --retries 1 --low-level-retries 1`. The timeout shape and the flag
- * spelling are the design's; exported so the tests assert the exact argv the
- * executor sees (a drift in either silently changes what is bounded).
+ * 30s --retries 1 --low-level-retries 1`, plus `-vv` (the exact tail the
+ * crypt capture ran) when `debug` is set — today only a crypt remote, where
+ * the undecryptable-name verdict reads the DEBUG stream. The timeout shape
+ * and the flag spelling are the design's; exported so the tests assert the
+ * exact argv the executor sees (a drift in either silently changes what is
+ * bounded).
  */
-export function probeArgs(configFile: string, fs: string): string[] {
+export function probeArgs(configFile: string, fs: string, opts: { debug?: boolean } = {}): string[] {
   return [
     ...probeStaticPrefix(configFile),
     fs,
@@ -385,5 +493,6 @@ export function probeArgs(configFile: string, fs: string): string[] {
     '1',
     '--low-level-retries',
     '1',
+    ...(opts.debug ? ['-vv'] : []),
   ]
 }

@@ -53,12 +53,17 @@ const execFileAsync = promisify(execFile)
  *      reports undecryptable names at Debug level, and the probe lists the
  *      remote root, so no error surfaces (a deeper `path` answers
  *      `not-found`: the encrypted directory name does not decrypt). The
- *      Test door cannot catch a wrong crypt password.
+ *      Test door cannot catch a wrong crypt password. FIXED in 0.4.1
+ *      (captured -vv lines): the crypt remote is probed with debug logging
+ *      and the undecryptable-name lines answer `auth` with a fixed
+ *      sentence; an empty base (nothing stored) stays `ok` with the
+ *      nothing-stored caveat on its message.
  *   4. The remote delete door checks TASK references only: DELETE
  *      gtcryptsftp while gtcrypt (a crypt remote whose `remote` names it)
  *      still exists answers 202 and strands the crypt remote (its next use
- *      fails with "didn't find section in config file"). Recorded as a
- *      finding; the spec asserts the observed 202.
+ *      fails with "didn't find section in config file"). FIXED in 0.4.1:
+ *      the delete refuses with 409 naming the referencing remotes, and the
+ *      removal order is wrapper first.
  *
  * FIXTURE: cloud-backends-fixture.sh profiles azure/gcs/crypt, up in
  * beforeAll (idempotent), down in afterAll with every ✓ verified. The
@@ -217,12 +222,13 @@ const BACKENDS: CloudBackendCase[] = [
         // The SAVED crypt remote: the stored obscured password decrypts.
         { label: 'saved crypt remote', name: 'gtcrypt' },
       ],
-      // Finding 3: the root listing tolerates undecryptable names (rclone
-      // logs them at Debug), so a wrong password still tests `ok`.
-      wrong: [{ label: 'wrong crypt password (undecryptable names are Debug-level)', type: 'crypt', options: {
+      // Finding 3, FIXED in 0.4.1: the crypt remote is probed with debug
+      // logging and the undecryptable-name lines answer `auth` with the
+      // fixed sentence (the listing succeeds but holds nothing).
+      wrong: [{ label: 'wrong crypt password (undecryptable names read as auth)', type: 'crypt', options: {
         remote: 'gtcryptsftp:crypt-base',
         password: 'gtwrongsecret',
-      }, verdict: 'ok' }],
+      }, verdict: 'auth', messageRe: /does not decrypt the names already stored at gtdraft:/ }],
     },
     extraCopyChecks: async () => {
       // The underlying sftp tree: encrypted names only — none equal to a
@@ -243,13 +249,15 @@ const BACKENDS: CloudBackendCase[] = [
       expect(cat.trim(), 'rclone cat through the crypt remote yields the original bytes').toBe(src.trim())
     },
     beforeRemoval: async (ctx) => {
-      // Finding 4: the delete door checks TASK references only. Removing
-      // the sftp remote while the crypt remote still names it answers 202 —
-      // asserted as observed (the crypt remote is removed right after).
+      // Finding 4, FIXED in 0.4.1: the delete door refuses while another
+      // remote still names this one — 409 naming gtcrypt. The crypt remote
+      // is removed first (removalOrder), then the sftp remote deletes
+      // cleanly.
       const res = await ctx.delete(`${V1}/cloud/remotes/gtcryptsftp`)
-      expect(res.status(), `DELETE gtcryptsftp while gtcrypt references it: ${await res.text()}`).toBe(202)
+      expect(res.status(), `DELETE gtcryptsftp while gtcrypt references it: ${await res.text()}`).toBe(409)
+      expect((await res.json()).error.message, 'the refusal names the referencing remote').toContain('gtcrypt')
     },
-    removalOrder: ['gtcrypt'],
+    removalOrder: ['gtcrypt', 'gtcryptsftp'],
   },
 ]
 

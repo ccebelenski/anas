@@ -1,4 +1,4 @@
-import type { CloudProvider, CloudProviderOption } from '@anas/shared'
+import type { CloudProvider, CloudProviderOption, CloudRemote } from '@anas/shared'
 import type { CommandExecutor } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -24,6 +24,7 @@ import {
   readConfig,
   RemoteExistsError,
   RemoteNotFoundError,
+  remotesReferencing,
   removeRemote,
   trimProviders,
   writeConfigFileAtomic,
@@ -885,6 +886,55 @@ describe('rclone-config: removeRemote (rclone.1)', () => {
     })
     await assert.rejects(removeRemote(paths, mock, 'homelab'), RcloneConfigGateError)
     assert.equal(await readFile(cfg, 'utf-8'), seed)
+  })
+})
+
+// ── remotesReferencing (cloudproof.2 finding 4, 0.4.1) ─────────────────────
+
+describe('rclone-config: remotesReferencing (cloudproof.2 finding 4)', () => {
+  function mkRemote(name: string, options: Record<string, string>, type = 'sftp'): CloudRemote {
+    return { name, type, options, secretsSet: [] }
+  }
+
+  it('names the crypt/alias/union/combine wrappers of a remote, sorted and unique', () => {
+    const remotes = [
+      mkRemote('gtcrypt', { remote: 'gtsftp:crypt-base', password: '***' }, 'crypt'),
+      mkRemote('alias-a', { remote: 'gtsftp:' }, 'alias'),
+      mkRemote('uni', { upstreams: 'gtsftp:data gtother:' }, 'union'),
+      mkRemote('combi', { upstreams: 'root=gtsftp:sub root2=gtother:' }, 'combine'),
+      mkRemote('chunky', { remote: 'gtsftp:big' }, 'chunker'),
+      mkRemote('squeezy', { remote: 'gtsftp:' }, 'compress'),
+      mkRemote('gtother', { host: 'h' }),
+      mkRemote('gtsftp', { host: '127.0.0.1', user: 'u' }),
+    ]
+    assert.deepEqual(remotesReferencing(remotes, 'gtsftp'), [
+      'alias-a',
+      'chunky',
+      'combi',
+      'gtcrypt',
+      'squeezy',
+      'uni',
+    ])
+  })
+
+  it('a name-adjacent remote or a mere path containing the name is NOT a reference', () => {
+    const remotes = [
+      // A DIFFERENT remote whose name merely extends the deleted one, and
+      // which references ITSELF.
+      mkRemote('gtsftp2', { remote: 'gtsftp2:bucket' }),
+      // Local paths that happen to contain the name.
+      mkRemote('mnt', { remote: '/mnt/gtsftp/data' }),
+      mkRemote('nested', { remote: 'gtother:/backups/gtsftp/old' }),
+      // A non-reference option that happens to hold the bare name.
+      mkRemote('misc', { host: 'gtsftp', user: 'gtsftp' }),
+    ]
+    assert.deepEqual(remotesReferencing(remotes, 'gtsftp'), [])
+  })
+
+  it('the deleted remote never names itself, and an empty config references nothing', () => {
+    const remotes = [mkRemote('selfwrap', { remote: 'selfwrap:loop' })]
+    assert.deepEqual(remotesReferencing(remotes, 'selfwrap'), [])
+    assert.deepEqual(remotesReferencing([], 'anything'), [])
   })
 })
 

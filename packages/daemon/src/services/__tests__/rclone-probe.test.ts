@@ -1,15 +1,18 @@
-import type { CloudProvider } from '@anas/shared'
+import type { CloudProvider, CloudRemoteTestResult } from '@anas/shared'
 import type { CommandExecutor, ExecOptions, ExecResult, ExecStreamResult, PipelineResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { after, describe, it } from 'node:test'
+import { after, afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { RCLONE, trimProviders } from '../rclone-config.js'
 import {
   classifyProbe,
+  CRYPT_NOTHING_STORED_MESSAGE,
+  CRYPT_UNDECRYPTABLE_RE,
+  cryptWrongPasswordMessage,
   PROBE_ENV_PREFIX,
   PROBE_REMOTE_NAME,
   probeArgs,
@@ -151,6 +154,29 @@ describe('rclone-probe: classifyProbe over the captured messages (rclone.1)', ()
 const PROBE_CAPTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone')
 const SMB_AUTH_FAIL = await readFile(join(PROBE_CAPTURE_DIR, 'probe-smb-auth-fail-1.60.1.log'), 'utf-8')
 const FTP_AUTH_FAIL = await readFile(join(PROBE_CAPTURE_DIR, 'probe-ftp-auth-fail-1.60.1.log'), 'utf-8')
+
+// ── The cloudproof.2 captures: the wrong crypt password (0.4.1) ────────────
+
+/**
+ * The wrong-CRYPT-password probe captures the cloudproof.2 live proof brought
+ * home (GT 2026-09-27, fixtures `probe-crypt-*-debug-1.60.1.*`): the probe's
+ * exact argv with `-vv` against an env-defined crypt remote over the node's
+ * own sshd. Three states, all exit **0** — a wrong password SUCCEEDS the
+ * listing (rclone skips undecryptable names at DEBUG), so the verdict is
+ * corrected over the debug lines, never over the listing's emptiness:
+ *
+ *   empty  nothing stored yet → `[]`, no debug line → ok (with the caveat)
+ *   good   correct password   → the names decrypted, no debug line → plain ok
+ *   wrong  wrong password     → `[]` AND two `Skipping undecryptable` lines
+ *          → auth with the fixed sentence (the listing is empty TOO — the
+ *          lines, not the emptiness, are the discriminator)
+ */
+const WRONG_STDERR = await readFile(join(PROBE_CAPTURE_DIR, 'probe-crypt-wrong-debug-1.60.1.log'), 'utf-8')
+const WRONG_STDOUT = await readFile(join(PROBE_CAPTURE_DIR, 'probe-crypt-wrong-debug-1.60.1.stdout'), 'utf-8')
+const GOOD_STDERR = await readFile(join(PROBE_CAPTURE_DIR, 'probe-crypt-good-debug-1.60.1.log'), 'utf-8')
+const GOOD_STDOUT = await readFile(join(PROBE_CAPTURE_DIR, 'probe-crypt-good-debug-1.60.1.stdout'), 'utf-8')
+const EMPTY_STDERR = await readFile(join(PROBE_CAPTURE_DIR, 'probe-crypt-empty-debug-1.60.1.log'), 'utf-8')
+const EMPTY_STDOUT = await readFile(join(PROBE_CAPTURE_DIR, 'probe-crypt-empty-debug-1.60.1.stdout'), 'utf-8')
 
 describe('rclone-probe: classifyProbe over the cloudproof.1 captures (0.4.1)', () => {
   it('the captured SMB wrong-credential probe (exit 1) → auth with Samba\'s own sentence', () => {
@@ -472,5 +498,89 @@ describe('rclone-probe: sweepStaleProbeDirs (rclone.1)', () => {
 
   it('a missing base directory is not an error — nothing stale can live in a directory that does not exist', async () => {
     assert.deepEqual(await sweepStaleProbeDirs(join(tmpdir(), 'anas-sweep-missing-zz')), [])
+  })
+})
+
+describe('rclone-probe: the crypt captures (cloudproof.2, 0.4.1)', () => {
+  let dir: string
+  let configFile: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(TMP_BASE, 'crypt-store-'))
+    configFile = join(dir, 'rclone.conf')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  /** A SAVED crypt remote's section, and a stub answering one canned probe. */
+  async function cryptProbe(result: ExecResult, section = '[gtcrypt]\ntype = crypt\nremote = gtsftp:crypt-base\n'): Promise<{ calls: { command: string, args: string[], opts?: ExecOptions }[], probe: Promise<CloudRemoteTestResult> }> {
+    await writeFile(configFile, section, 'utf-8')
+    const calls: { command: string, args: string[], opts?: ExecOptions }[] = []
+    const exec = async (command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> => {
+      calls.push({ command, args, opts })
+      if (command === '/usr/bin/timeout')
+        return result
+      throw new Error(`unexpected call: ${command} ${args.join(' ')}`)
+    }
+    return { calls, probe: testRemote(stubExecutor(exec), { configFile }, { name: 'gtcrypt' }) }
+  }
+
+  it('the captured WRONG password (exit 0, empty listing, debug lines) → auth with the fixed sentence, exactly', async () => {
+    const { calls, probe } = await cryptProbe({ stdout: WRONG_STDOUT, stderr: WRONG_STDERR, exitCode: 0 })
+    assert.deepEqual(await probe, { verdict: 'auth', message: cryptWrongPasswordMessage('gtcrypt:') })
+    // The probe ran with debug logging — the exact argv the capture ran.
+    assert.deepEqual(calls[0]!.args, probeArgs(configFile, 'gtcrypt:', { debug: true }))
+    assert.equal(calls[0]!.args.at(-1), '-vv')
+  })
+
+  it('the captured CORRECT password (exit 0, names decrypted) → plain ok, no caveat', async () => {
+    const { probe } = await cryptProbe({ stdout: GOOD_STDOUT, stderr: GOOD_STDERR, exitCode: 0 })
+    assert.deepEqual(await probe, { verdict: 'ok', message: '' })
+  })
+
+  it('the captured EMPTY base (exit 0, `[]`, no debug line) → ok carrying the nothing-stored sentence', async () => {
+    const { probe } = await cryptProbe({ stdout: EMPTY_STDOUT, stderr: EMPTY_STDERR, exitCode: 0 })
+    assert.deepEqual(await probe, { verdict: 'ok', message: CRYPT_NOTHING_STORED_MESSAGE })
+  })
+
+  it('the auth sentence names NOTHING from the capture — no debug text, no obscured password', async () => {
+    const { probe } = await cryptProbe({ stdout: WRONG_STDOUT, stderr: WRONG_STDERR, exitCode: 0 })
+    const { message } = await probe
+    for (const leak of ['PKCS', '8rtb1ufkgr2fl5ctns6naatgfg', '9VIsr1kjQIg84TxBoSV', 'DEBUG', 'Skipping']) {
+      assert.ok(!message.includes(leak), `the sentence must not carry '${leak}' from the capture`)
+    }
+  })
+
+  it('an UNSAVED crypt dialog: the same verdict, the sentence naming the dialog\'s draft name', async () => {
+    const { exec, calls } = lsjsonResult(`${PROBE_REMOTE_NAME}:`, { stdout: WRONG_STDOUT, stderr: WRONG_STDERR, exitCode: 0 })
+    const r = await testRemote(stubExecutor(exec), PATHS, {
+      remote: { name: 'gtdraft', type: 'crypt', options: { remote: 'gtsftp:crypt-base', password: 'gtwrongsecret' } },
+    }, { providers, tmpBase: TMP_BASE })
+    assert.deepEqual(r, { verdict: 'auth', message: cryptWrongPasswordMessage('gtdraft:') })
+    const ls = calls.find(c => c.command === '/usr/bin/timeout')!
+    assert.equal(ls.args.at(-1), '-vv', 'the unsaved crypt dialog is probed with debug logging too')
+  })
+
+  it('a NON-crypt remote is never probed with -vv and never corrected', async () => {
+    const { exec, calls } = lsjsonResult('gtsftp:', { stdout: GOOD_STDOUT, stderr: GOOD_STDERR, exitCode: 0 })
+    const r = await testRemote(stubExecutor(exec), { configFile }, { name: 'gtsftp' })
+    assert.deepEqual(r, { verdict: 'ok', message: '' })
+    assert.notEqual(calls[0]!.args.at(-1), '-vv', 'debug logging rides crypt remotes only')
+  })
+
+  it('the debug lines decide ONLY on a succeeded listing — the usual buckets stand on a failure', () => {
+    // exit 124 (the timeout wrapper fired) with a debug line in the stream.
+    const r = classifyProbe(124, `${WRONG_STDERR}\n`)
+    assert.equal(r.verdict, 'unreachable')
+    // exit 1 with the captured unreachable line: the undecryptable text alone
+    // never turns a failure into auth.
+    assert.equal(classifyProbe(1, `${CAPTURED.unreachable.stderr}\n${WRONG_STDERR}`).verdict, 'unreachable')
+  })
+
+  it('the captured debug lines match the regex; the good and empty captures do not', () => {
+    assert.ok(CRYPT_UNDECRYPTABLE_RE.test(WRONG_STDERR), 'the wrong-password capture carries the lines')
+    assert.ok(!CRYPT_UNDECRYPTABLE_RE.test(GOOD_STDERR), 'the correct-password capture does not')
+    assert.ok(!CRYPT_UNDECRYPTABLE_RE.test(EMPTY_STDERR), 'the empty-base capture does not')
   })
 })

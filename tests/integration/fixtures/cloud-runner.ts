@@ -66,6 +66,8 @@ export interface CloudProbeCase {
   /** The verdict the daemon ACTUALLY answers — captured, not assumed.
    *  Optional: an ok probe (step b) answers `ok` by definition. */
   verdict?: string
+  /** A sentence the verdict's message must carry (a fixed classifier sentence). */
+  messageRe?: RegExp
 }
 
 export interface CloudBackendCase {
@@ -243,6 +245,8 @@ export async function runCloudBackendProof(
       expect(wrong.verdict, `${c.key} ${p.label}: ${JSON.stringify(wrong)}`).toBe(p.verdict ?? 'ok')
       if ((p.verdict ?? 'ok') !== 'ok')
         expect(wrong.message ?? '', `${c.key} ${p.label}: a failure names itself in a sentence`).not.toBe('')
+      if (p.messageRe)
+        expect(wrong.message ?? '', `${c.key} ${p.label}: message ${JSON.stringify(wrong.message)}`).toMatch(p.messageRe)
       expect(`${wrong.verdict} ${wrong.message}`).not.toContain('goroutine')
       expect(`${wrong.verdict} ${wrong.message}`).not.toContain('cannot unmarshal')
     }

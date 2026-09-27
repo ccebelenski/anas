@@ -1,0 +1,28 @@
+2026/09/27 22:46:51 DEBUG : rclone: Version "v1.60.1-DEV" starting with parameters ["rclone" "--config" "/tmp/tmp.4UASu3J5zb/rclone.conf" "--ask-password=false" "lsjson" "anastest:" "--max-depth" "1" "--contimeout" "10s" "--timeout" "30s" "--retries" "1" "--low-level-retries" "1" "-vv"]
+2026/09/27 22:46:51 DEBUG : Creating backend with remote "anastest:"
+2026/09/27 22:46:51 DEBUG : Using config file from "/tmp/tmp.4UASu3J5zb/rclone.conf"
+2026/09/27 22:46:51 DEBUG : Setting type="crypt" for "anastest" from environment variable RCLONE_CONFIG_ANASTEST_TYPE
+2026/09/27 22:46:51 DEBUG : Setting remote="gtsftp:crypt-base" for "anastest" from environment variable RCLONE_CONFIG_ANASTEST_REMOTE
+2026/09/27 22:46:51 DEBUG : Setting password="9VIsr1kjQIg84TxBoSV-uYhfF43s15hzQxG4Ef4" for "anastest" from environment variable RCLONE_CONFIG_ANASTEST_PASSWORD
+2026/09/27 22:46:51 DEBUG : anastest: detected overridden config - adding "{jfEn9}" suffix to name
+2026/09/27 22:46:51 DEBUG : Setting remote="gtsftp:crypt-base" for "anastest" from environment variable RCLONE_CONFIG_ANASTEST_REMOTE
+2026/09/27 22:46:51 DEBUG : Setting password="9VIsr1kjQIg84TxBoSV-uYhfF43s15hzQxG4Ef4" for "anastest" from environment variable RCLONE_CONFIG_ANASTEST_PASSWORD
+2026/09/27 22:46:51 DEBUG : Creating backend with remote "gtsftp:crypt-base"
+2026/09/27 22:46:51 DEBUG : Setting type="sftp" for "gtsftp" from environment variable RCLONE_CONFIG_GTSFTP_TYPE
+2026/09/27 22:46:51 DEBUG : Setting host="127.0.0.1" for "gtsftp" from environment variable RCLONE_CONFIG_GTSFTP_HOST
+2026/09/27 22:46:51 DEBUG : Setting user="gtcryptsftp" for "gtsftp" from environment variable RCLONE_CONFIG_GTSFTP_USER
+2026/09/27 22:46:51 DEBUG : Setting pass="q5gI_KnVim-kntrhUlNJ2kQB4oyhrixj86Yi" for "gtsftp" from environment variable RCLONE_CONFIG_GTSFTP_PASS
+2026/09/27 22:46:51 DEBUG : gtsftp: detected overridden config - adding "{I3_YZ}" suffix to name
+2026/09/27 22:46:51 DEBUG : Setting host="127.0.0.1" for "gtsftp" from environment variable RCLONE_CONFIG_GTSFTP_HOST
+2026/09/27 22:46:51 DEBUG : Setting user="gtcryptsftp" for "gtsftp" from environment variable RCLONE_CONFIG_GTSFTP_USER
+2026/09/27 22:46:51 DEBUG : Setting pass="q5gI_KnVim-kntrhUlNJ2kQB4oyhrixj86Yi" for "gtsftp" from environment variable RCLONE_CONFIG_GTSFTP_PASS
+2026/09/27 22:46:51 DEBUG : sftp://gtcryptsftp@127.0.0.1:22/crypt-base: New connection 127.0.0.1:49500->127.0.0.1:22 to "SSH-2.0-OpenSSH_10.0p2 Debian-7+deb13u4"
+2026/09/27 22:46:51 DEBUG : sftp://gtcryptsftp@127.0.0.1:22/crypt-base: Shell type "unix" from config
+2026/09/27 22:46:51 DEBUG : sftp://gtcryptsftp@127.0.0.1:22/crypt-base: Relative path resolved to "/var/tmp/anas-gtcrypt/crypt-base"
+2026/09/27 22:46:51 DEBUG : sftp://gtcryptsftp@127.0.0.1:22/crypt-base: Using root directory "/var/tmp/anas-gtcrypt/crypt-base"
+2026/09/27 22:46:51 DEBUG : fs cache: renaming cache item "gtsftp:crypt-base" to be canonical "gtsftp{I3_YZ}:crypt-base"
+2026/09/27 22:46:51 DEBUG : fs cache: renaming cache item "anastest:" to be canonical "anastest{jfEn9}:"
+2026/09/27 22:46:51 DEBUG : 8rtb1ufkgr2fl5ctns6naatgfg: Skipping undecryptable dir name: bad PKCS#7 padding - too long
+2026/09/27 22:46:51 DEBUG : dje2saqulsplhuofsjk8mqs18g: Skipping undecryptable file name: bad PKCS#7 padding - too long
+2026/09/27 22:46:51 DEBUG : 11 go routines active
+2026/09/27 22:46:51 DEBUG : sftp://gtcryptsftp@127.0.0.1:22/crypt-base: Closing 1 unused connections

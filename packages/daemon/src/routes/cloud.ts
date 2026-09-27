@@ -55,7 +55,7 @@ import {
   writeTaskUnits,
 } from '../services/cloud-units.js'
 import { scanNestedFilesystems } from '../services/nested-filesystems.js'
-import { normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, RemoteNotFoundError, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
+import { normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, RemoteNotFoundError, remotesReferencing, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
 import { testRemote } from '../services/rclone-probe.js'
 import { zodIssue } from '../validation.js'
 import { requireIdentity } from './identity.js'
@@ -457,6 +457,17 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       if (refs.length > 0) {
         reply.code(409).send({
           error: { code: 'CONFLICT', message: `remote '${name}' is used by cloud sync task(s): ${refs.join(', ')} — remove or retarget them first` },
+        })
+        return null
+      }
+      // The same refusal for remote-to-remote references (cloudproof.2
+      // finding 4): deleting the remote a crypt/alias/union/… wrapper still
+      // names strands the wrapper — every later use fails with rclone's
+      // "didn't find section in config file".
+      const wrappedBy = remotesReferencing(current.remotes, name)
+      if (wrappedBy.length > 0) {
+        reply.code(409).send({
+          error: { code: 'CONFLICT', message: `remote '${name}' is referenced by remote(s): ${wrappedBy.join(', ')}. Remove them first. This refusal has no confirm bypass.` },
         })
         return null
       }

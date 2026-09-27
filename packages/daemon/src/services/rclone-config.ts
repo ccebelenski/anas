@@ -410,6 +410,62 @@ function dumpToRemotes(dump: Record<string, unknown>, providers?: CloudProvider[
   return remotes
 }
 
+// ── Remote-to-remote references (cloudproof.2 finding 4) ───────────────────
+
+/**
+ * The option names that hold a REFERENCE to another remote (rclone 1.60
+ * providers, captured `providers-1.60.1.json`): `remote` (crypt, alias,
+ * cache, chunker, compress, hasher), `upstreams` (union, combine — space
+ * separated, each entry optionally `dir=remote:path`). The name rule is the
+ * OPTION name, not the backend list — any backend whose reference rides one
+ * of these names is covered, and one rclone renames or adds such an option
+ * the capture says so.
+ */
+const REMOTE_REFERENCE_OPTIONS = ['remote', 'upstreams', 'remotes']
+
+/** The token split of a reference value: whitespace or commas. */
+const REFERENCE_TOKEN_SPLIT_RE = /[\s,]+/
+
+/** Does one option VALUE reference remote `name`? `myremote:path` shape. */
+function valueReferencesRemote(value: string, name: string): boolean {
+  const prefix = `${name}:`
+  for (const token of value.split(REFERENCE_TOKEN_SPLIT_RE)) {
+    // combine's `dir=remote:path` and union's quoted entries: the reference
+    // is what follows the `=`, when there is one.
+    const target = token.includes('=') ? token.slice(token.lastIndexOf('=') + 1) : token
+    if (target.startsWith(prefix))
+      return true
+  }
+  return false
+}
+
+/**
+ * The remotes whose config references `name` — the wrapper remotes a delete
+ * would strand (cloudproof.2 finding 4: DELETE of the sftp remote under a
+ * crypt remote answered 202 and left the crypt remote pointing at a section
+ * that no longer exists, every later use failing `didn't find section in
+ * config file`). A reference is an option value in the `<name>:…` shape;
+ * a mere PATH that contains the name (`/mnt/<name>/data`, `<name>2:bucket`)
+ * is not a reference. Reference options are never secret, so the values are
+ * present in the secret-stripped remotes. Sorted, unique.
+ */
+export function remotesReferencing(remotes: CloudRemote[], name: string): string[] {
+  const refs = new Set<string>()
+  for (const remote of remotes) {
+    if (remote.name === name)
+      continue
+    for (const key of REMOTE_REFERENCE_OPTIONS) {
+      const value = remote.options[key]
+      if (value !== undefined && valueReferencesRemote(value, name)) {
+        refs.add(remote.name)
+        break
+      }
+    }
+  }
+  // eslint-disable-next-line e18e/prefer-array-to-sorted -- Set → sorted list
+  return [...refs].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+}
+
 // ── Mutation errors ────────────────────────────────────────────────────────
 
 /** The section already exists (create). */

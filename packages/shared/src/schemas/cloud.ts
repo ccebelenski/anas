@@ -181,7 +181,12 @@ export const CloudRemoteTestVerdict = z
   .enum(['ok', 'unreachable', 'auth', 'not-found', 'error'])
 export type CloudRemoteTestVerdict = z.infer<typeof CloudRemoteTestVerdict>
 
-/** A Test result: the verdict bucket + rclone's line, verbatim on `error`. */
+/**
+ * A Test result: the verdict bucket + rclone's line, verbatim on `error`.
+ * An `ok` normally carries an empty message — except a crypt remote probed
+ * against a base with nothing stored, where the message carries the
+ * nothing-stored caveat (the password could not be checked against data).
+ */
 export const CloudRemoteTestResult = z
   .object({
     verdict: CloudRemoteTestVerdict,
