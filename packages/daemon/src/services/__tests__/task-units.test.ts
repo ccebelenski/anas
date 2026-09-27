@@ -1203,6 +1203,13 @@ describe('task units — both descriptors, identical inputs, identical answers',
   })
 
   it('the gate decides the same way off either prefix — only the NOUN differs', async () => {
+    // The gate's `now` is a fixed UTC instant, not a local-time `new Date(...)`,
+    // and the expected "N.N days ago" is derived from the same fixed values —
+    // a local-time construction made the sentence depend on the runner's
+    // timezone (CI run 36285643453: 7.2 days on a UTC-5 box, 7.0 on UTC).
+    const nowMs = Date.UTC(2026, 8, 22, 2, 0, 0)
+    const lastMs = Date.parse('2026-09-15T02:00:07Z')
+    const days = ((nowMs - lastMs) / 3_600_000 / 24).toFixed(1)
     const forKind = async (kind: TaskUnitKind) => {
       // An OFF week (39, odd), so the decision pays for the journal read too.
       const mock = triggerFixtures(
@@ -1210,7 +1217,7 @@ describe('task units — both descriptors, identical inputs, identical answers',
         'Tue 2026-09-22 02:00:00 UTC',
         kind,
       )
-      return gateRun(kind, mock, task({ cadence: BIWEEKLY }), new Date(2026, 8, 22, 2, 0))
+      return gateRun(kind, mock, task({ cadence: BIWEEKLY }), new Date(nowMs))
     }
     const cloud = await forKind(CLOUD_UNIT_KIND)
     const backup = await forKind(BACKUP_UNIT_KIND)
@@ -1224,7 +1231,7 @@ describe('task units — both descriptors, identical inputs, identical answers',
     // must not change because cloud exists.
     assert.equal(
       backup.detail,
-      'ISO week 39 is odd, this task runs even weeks — skipped (off week); last successful backup 7.2 days ago',
+      `ISO week 39 is odd, this task runs even weeks — skipped (off week); last successful backup ${days} days ago`,
     )
     assert.equal(cloud.detail, backup.detail.replace('successful backup', 'successful cloud sync'))
   })
