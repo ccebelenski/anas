@@ -9809,6 +9809,9 @@ async function disksReadAgeChecks() {
 const USER_ROWS = [
   { name: 'Alice', uid: 1000, fullName: 'Alice Example', primaryGroup: 'users', groups: ['users', 'smbusers'], smbEnabled: true, locked: false, local: true },
   { name: 'aduser', uid: 6000, fullName: null, primaryGroup: null, groups: [], smbEnabled: false, locked: false, local: false },
+  // identity.3 (#68): the passdb holds this account's entry stored lowercase
+  // (an orphan) — the daemon says so instead of reporting smbEnabled.
+  { name: 'Name', uid: 1001, fullName: null, primaryGroup: 'users', groups: ['users'], smbEnabled: false, smbEntryMismatch: 'name', locked: false, local: true },
 ]
 const GROUP_ROWS = [
   // A pre-existing user-private group (identity.1c): the same name as user
@@ -9904,6 +9907,22 @@ async function shareUsersChecks() {
   ok('groups: a private group is labelled as one', /private group of\s*Alice/.test(privCell), privCell)
   const plainCell = nameCol.renderer('smbusers', {}, makeRecord(GROUP_ROWS[1]))
   ok('groups: a plain group renders bare', plainCell === 'smbusers', plainCell)
+
+  // --- (e) identity.3: a mismatched passdb entry replaces the SMB tick -------
+  ok('users: the store carries smbEntryMismatch', usersGrid.getStore().fields.includes('smbEntryMismatch'),
+    JSON.stringify(usersGrid.getStore().fields))
+  const smbCol = usersGrid.columns.find(c => c.dataIndex === 'smbEnabled')
+  ok('users: the SMB column has a record-aware renderer', !!smbCol && typeof smbCol.renderer === 'function')
+  const mismatchCell = smbCol.renderer(false, {}, usersGrid.getStore().getAt(2))
+  ok('users: a mismatched entry shows the stored name and the repair, in place of the tick',
+    mismatchCell.includes("SMB entry stored as 'name' \u2014 set the password again to repair")
+      && !mismatchCell.includes('&#10003;') && !mismatchCell.includes('&#10007;'),
+    mismatchCell)
+  ok('users: the mismatch sentence wraps in the cell (never cut off)', smbCol.cellWrap === true)
+  const tickCell = smbCol.renderer(true, {}, usersGrid.getStore().getAt(0))
+  ok('users: an exact entry keeps the green tick', tickCell.includes('&#10003;') && !/stored as/.test(tickCell), tickCell)
+  const noneCell = smbCol.renderer(false, {}, usersGrid.getStore().getAt(1))
+  ok('users: no entry keeps the cross', noneCell.includes('&#10007;') && !/stored as/.test(noneCell), noneCell)
 
   // --- (d) delete: need-gated, confirm-code flow, refresh --------------------
   // No selection: both Delete doors are dead.

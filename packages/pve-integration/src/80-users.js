@@ -128,7 +128,19 @@
             + enc(t('private group of') + ' ') + enc(priv) + '</span>';
     }
 
-    function renderSmb(v) {
+    function renderSmb(v, metaData, record) {
+        // identity.3 (#68): the passdb holds an entry Samba uses for this
+        // account but stored under another name (case) — it can never log in
+        // as this user. Say what is stored and how to repair it, in place of
+        // the tick. Absent field = no such entry (or an older daemon).
+        var stored = record && record.get('smbEntryMismatch');
+        if (stored) {
+            var text = t('SMB entry stored as') + " '" + stored + "' \u2014 "
+                + t('set the password again to repair');
+            return '<span class="anas-smb-mismatch" title="' + enc(text) + '"'
+                + ' style="color:#c0392b;">'
+                + '<i class="fa fa-exclamation-triangle"></i> ' + enc(text) + '</span>';
+        }
         if (v) {
             return '<span title="' + enc(t('SMB password set')) + '"'
                 + ' style="color:#21BF4B;font-weight:bold;">&#10003;</span>';
@@ -1182,6 +1194,9 @@
                 'fullName', 'primaryGroup',
                 { name: 'groups', type: 'auto' },
                 { name: 'smbEnabled', type: 'bool' },
+                // identity.3: the stored name of a passdb entry that does not
+                // match this account exactly; absent when there is none.
+                'smbEntryMismatch',
                 { name: 'locked', type: 'bool' },
                 { name: 'local', type: 'bool' },
             ],
@@ -1249,8 +1264,11 @@
                         {
                             text: t('SMB'),
                             dataIndex: 'smbEnabled',
-                            width: 70,
+                            width: 120,
                             align: 'center',
+                            // The identity.3 mismatch sentence wraps in the
+                            // cell rather than hiding the stored name.
+                            cellWrap: true,
                             renderer: renderSmb,
                         },
                         {

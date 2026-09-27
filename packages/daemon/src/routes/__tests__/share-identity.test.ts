@@ -192,19 +192,9 @@ describe('share-identity routes', () => {
       assert.equal(job.status, 'completed')
     })
 
-    it('creates a user with an SMB password (smbpasswd) and completes', async () => {
-      server = createServer({ mock: true, logger: false })
-      const res = await server.inject({
-        method: 'POST',
-        url: '/v1/identity/users',
-        headers: JSON_HEADERS,
-        payload: JSON.stringify({ name: 'bob', smbPassword: 'hunter2' }),
-      })
-      assert.equal(res.statusCode, 202)
-      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
-      assert.equal(job.status, 'completed')
-      assert.deepEqual(job.result, { created: 'bob', smbEnabled: true })
-    })
+    // Create WITH an SMB password is covered in the identity.3 section below,
+    // on a mock whose passdb and getent answers follow the create (the dev
+    // mock's static fixtures cannot show a new user's entry).
 
     it('returns 409 when the user already exists', async () => {
       server = createServer({ mock: true, logger: false })
@@ -654,6 +644,8 @@ describe('share-identity routes', () => {
       executor.addFixture({ command: '/usr/sbin/userdel', result: { stdout: '', stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/sbin/groupdel', result: { stdout: '', stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/smbpasswd', result: { stdout: '', stderr: '', exitCode: 0 } })
+      // pdbedit -x -u <stored> (identity.3) — any other pdbedit argv succeeds.
+      executor.addFixture({ command: '/usr/bin/pdbedit', result: { stdout: '', stderr: '', exitCode: 0 } })
 
       app = Fastify({ logger: false })
       await app.register(shareIdentityRoutes, {
@@ -737,16 +729,16 @@ describe('share-identity routes', () => {
       assert.equal(job.status, 'completed')
       assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: true })
 
-      // Exact argv, in order: smbpasswd -x FIRST (it resolves the passdb entry
-      // through the Unix account, so it must run while the account exists —
-      // and only because the passdb has the entry, stored as ALICE, matched
-      // case-folded), then userdel.
-      assert.deepEqual(find(executor.calls, '/usr/bin/smbpasswd', () => true), ['-x', 'Alice'])
+      // Exact argv, in order (identity.2 order, identity.3 verb): the SMB
+      // entry is dropped FIRST, by its STORED name (ALICE — found case-folded)
+      // with pdbedit -x -u, never smbpasswd -x; then userdel.
+      assert.deepEqual(find(executor.calls, '/usr/bin/pdbedit', a => a[0] === '-x'), ['-x', '-u', 'ALICE'])
+      assert.equal(executor.calls.some(c => c.command === '/usr/bin/smbpasswd'), false)
       assert.deepEqual(find(executor.calls, '/usr/sbin/userdel', () => true), ['Alice'])
       assert.equal(find(executor.calls, '/usr/sbin/userdel', a => a.includes('-r')), undefined)
-      const smbIdx = executor.calls.findIndex(c => c.command === '/usr/bin/smbpasswd')
+      const smbIdx = executor.calls.findIndex(c => c.command === '/usr/bin/pdbedit' && c.args[0] === '-x')
       const delIdx = executor.calls.findIndex(c => c.command === '/usr/sbin/userdel')
-      assert.ok(smbIdx !== -1 && delIdx !== -1 && smbIdx < delIdx, 'smbpasswd -x must run before userdel')
+      assert.ok(smbIdx !== -1 && delIdx !== -1 && smbIdx < delIdx, 'pdbedit -x must run before userdel')
 
       // The consumed code cannot open the gate a second time.
       const reuse = await del('/v1/identity/users/Alice', code)
@@ -754,14 +746,12 @@ describe('share-identity routes', () => {
       assert.equal((reuse.json() as { error: { code: string } }).error.code, 'CONFIRMATION_REQUIRED')
     })
 
-    it('fails the job on a failed smbpasswd -x and never runs userdel', async () => {
+    it('fails the job on a failed pdbedit -x and never runs userdel', async () => {
       await bootNode({ smbConf: CLEAN_SMB_CONF })
-      // smbpasswd cannot resolve the entry — the historical order bug (#60)
-      // produced exactly this after userdel had already run.
       executor.addFixture({
-        command: '/usr/bin/smbpasswd',
-        args: ['-x', 'Alice'],
-        result: { stdout: '', stderr: 'Failed to find a Unix account for Alice\n', exitCode: 1 },
+        command: '/usr/bin/pdbedit',
+        args: ['-x', '-u', 'ALICE'],
+        result: { stdout: '', stderr: 'Failed to delete entry for user ALICE.\n', exitCode: 255 },
       })
       const first = await del('/v1/identity/users/Alice')
       assert.equal(first.statusCode, 409)
@@ -771,12 +761,12 @@ describe('share-identity routes', () => {
       assert.equal(ok.statusCode, 202)
       const job = await waitForQueueJob((ok.json() as JobAccepted).job.id)
       assert.equal(job.status, 'failed')
-      assert.match(job.error?.message ?? '', /Failed to find a Unix account/)
+      assert.match(job.error?.message ?? '', /Failed to delete entry for user ALICE/)
       // Nothing destroyed: the account is still there, only the SMB step failed.
       assert.equal(executor.calls.some(c => c.command === '/usr/sbin/userdel'), false)
     })
 
-    it('skips smbpasswd -x when the passdb has no entry for the user', async () => {
+    it('skips the SMB step when the passdb has no entry for the user (absent is not an error)', async () => {
       await bootNode({ smbConf: CLEAN_SMB_CONF, pdbedit: '' })
       const first = await del('/v1/identity/users/Alice')
       assert.equal(first.statusCode, 409)
@@ -791,6 +781,44 @@ describe('share-identity routes', () => {
       assert.equal(job.status, 'completed')
       assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: false })
       assert.equal(executor.calls.some(c => c.command === '/usr/bin/smbpasswd'), false)
+      assert.equal(find(executor.calls, '/usr/bin/pdbedit', a => a[0] === '-x'), undefined)
+    })
+
+    it('drops a case-mismatched ORPHAN entry by its stored name (identity.3: smbpasswd -x failed here)', async () => {
+      // The #68 shape: the entry is stored lowercase and maps to no account.
+      await bootNode({ smbConf: CLEAN_SMB_CONF, pdbedit: 'alice:4294967295:\n' })
+      const first = await del('/v1/identity/users/Alice')
+      const challenged = first.json() as { error: { warnings: string[] } }
+      assert.equal(challenged.error.warnings.length, 3)
+      assert.match(challenged.error.warnings[2], /SMB password entry will be removed/)
+      const code = first.headers['x-anas-confirm-code'] as string
+
+      const ok = await del('/v1/identity/users/Alice', code)
+      const job = await waitForQueueJob((ok.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: true })
+      const seq = executor.calls
+        .filter(c => (c.command === '/usr/bin/pdbedit' && c.args[0] === '-x') || c.command === '/usr/sbin/userdel')
+        .map(c => [c.command, ...c.args])
+      assert.deepEqual(seq, [
+        ['/usr/bin/pdbedit', '-x', '-u', 'alice'],
+        ['/usr/sbin/userdel', 'Alice'],
+      ])
+    })
+
+    it('leaves an entry that belongs to ANOTHER live account alone', async () => {
+      // `alice` (uid 1005) is a different account that owns the entry Samba
+      // finds for `Alice` case-folded — dropping it would break that account.
+      await bootNode({ smbConf: CLEAN_SMB_CONF, pdbedit: 'alice:1005:\n' })
+      const first = await del('/v1/identity/users/Alice')
+      const challenged = first.json() as { error: { warnings: string[] } }
+      assert.equal(challenged.error.warnings.length, 2)
+      const code = first.headers['x-anas-confirm-code'] as string
+      const ok = await del('/v1/identity/users/Alice', code)
+      const job = await waitForQueueJob((ok.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: false })
+      assert.equal(find(executor.calls, '/usr/bin/pdbedit', a => a[0] === '-x'), undefined)
     })
 
     it('returns 404 for an unknown user, 409 for a directory user, 400 for an invalid name', async () => {
@@ -858,6 +886,297 @@ describe('share-identity routes', () => {
     })
   })
 
+  // --- identity.3 (#68) — the passdb entry must match the account exactly ----
+  //
+  // tdbsam keys entries by the lowercased name but stores the name as first
+  // written; `smbpasswd -a Name` over an orphan stored as `name` exits 0 and
+  // leaves `name:4294967295:` behind — Samba accepts the password, cannot map
+  // the stored name to an account, and the session becomes a guest. The
+  // `pdbedit -L` fixtures below are that shape (stunt-node reproduction,
+  // 2026-09-25). Wired to a mock with full fixture control: the `results`
+  // sequences script the passdb and getent answers moving as the job runs.
+  describe('passdb exact-case (identity.3)', () => {
+    let app: FastifyInstance | undefined
+    let executor: MockExecutor
+    let queue: JobQueue
+    let tmpDir: string
+    let logLines: string[]
+
+    const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
+    const NOT_FOUND: ExecResult = { stdout: '', stderr: '', exitCode: 2 }
+    const NAME_LINE = 'Name:x:1001:100::/home/Name:/usr/sbin/nologin\n'
+    const PASSWD = [
+      'root:x:0:0:root:/root:/bin/bash',
+      'smbtest:x:1000:100::/home/smbtest:/usr/sbin/nologin',
+      'Name:x:1001:100::/home/Name:/usr/sbin/nologin',
+      'Orphan:x:1002:100::/home/Orphan:/usr/sbin/nologin',
+      'Absent:x:1003:100::/home/Absent:/usr/sbin/nologin',
+      'Unmapped:x:1004:100::/home/Unmapped:/usr/sbin/nologin',
+      'pat:x:1005:100::/home/pat:/usr/sbin/nologin',
+      'Pat:x:1006:100::/home/Pat:/usr/sbin/nologin',
+      '',
+    ].join('\n')
+    const GROUPS = 'root:x:0:\nusers:x:100:\n'
+
+    /** An exact entry, a case-mismatched orphan, an unmapped uid, and one owned by another account. */
+    const LISTING = [
+      'smbtest:1000:',
+      'Name:1001:',
+      'orphan:4294967295:',
+      'Unmapped:4294967295:',
+      'pat:1005:',
+      '',
+    ].join('\n')
+
+    /**
+     * Boot the identity routes. `pdbedit` is the `pdbedit -L` answer sequence
+     * (route-time read first, then each verify read); `namePasswd` the
+     * `getent passwd Name` sequence (the create route sees it absent, the job
+     * after useradd sees it).
+     */
+    async function boot(opts: { pdbedit: string[], namePasswd?: ExecResult[] }) {
+      tmpDir = await mkdtemp(join(tmpdir(), 'anas-identity-passdb-'))
+      const smbConfPath = join(tmpDir, 'smb.conf')
+      writeFileSync(smbConfPath, '[global]\nworkgroup = WORKGROUP\n')
+      executor = new MockExecutor()
+      queue = new JobQueue()
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: ok(PASSWD) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: ok(GROUPS) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd'], result: ok(PASSWD) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group'], result: ok(GROUPS) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['shadow'], result: ok('') })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'Name'], results: opts.namePasswd ?? [ok(NAME_LINE)] })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd', 'Name'], result: ok(NAME_LINE) })
+      executor.addFixture({ command: '/usr/bin/pdbedit', args: ['-L'], results: opts.pdbedit.map(ok) })
+      executor.addFixture({ command: '/usr/bin/pdbedit', result: ok('') })
+      executor.addFixture({ command: '/usr/bin/smbpasswd', result: ok('') })
+      executor.addFixture({ command: '/usr/sbin/useradd', result: ok('') })
+
+      logLines = []
+      app = Fastify({
+        logger: {
+          level: 'info',
+          stream: {
+            write: (line: string) => {
+              logLines.push(line)
+            },
+          },
+        },
+      })
+      await app.register(shareIdentityRoutes, {
+        prefix: '/v1',
+        executor,
+        jobQueue: queue,
+        confirmStore: new ConfirmStore(),
+        smbConfPath,
+        smbpasswdAvailable: async () => true,
+      })
+      return app
+    }
+
+    async function waitForQueueJob(id: string): Promise<Job> {
+      for (let i = 0; i < 50; i++) {
+        const job = queue.get(id)
+        if (job && (job.status === 'completed' || job.status === 'failed'))
+          return job
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      throw new Error(`Job ${id} did not finish`)
+    }
+
+    /** The argv sequence from the first call matching `from` onward. */
+    function sequenceFrom(from: (c: Call) => boolean): string[][] {
+      const start = executor.calls.findIndex(from)
+      assert.ok(start !== -1, 'expected the job to start')
+      return executor.calls.slice(start).map(c => [c.command, ...c.args])
+    }
+
+    function post(url: string, body: unknown) {
+      return app!.inject({ method: 'POST', url, headers: JSON_HEADERS, payload: JSON.stringify(body) })
+    }
+
+    afterEach(async () => {
+      await app?.close()
+      app = undefined
+      await rm(tmpDir, { recursive: true, force: true })
+    })
+
+    const USERADD_NAME = ['/usr/sbin/useradd', '-N', '-M', '-s', '/usr/sbin/nologin', 'Name']
+    const SMBPASSWD_NAME = ['/usr/bin/smbpasswd', '-a', '-s', 'Name']
+    const GETENT_NAME = ['/usr/bin/getent', 'passwd', 'Name']
+    const PDBEDIT_LIST = ['/usr/bin/pdbedit', '-L']
+    const PDBEDIT_DROP_ORPHAN = ['/usr/bin/pdbedit', '-x', '-u', 'name']
+    const ORPHAN = 'name:4294967295:\n'
+    const FIXED = 'smbtest:1000:\nName:1001:\n'
+
+    // --- (4) smbEnabled / smbEntryMismatch on the list ---------------------
+    it('list: smbEnabled only for an exact-case entry with the account uid; the stored name on a mismatch', async () => {
+      const a = await boot({ pdbedit: [LISTING] })
+      const res = await a.inject({ method: 'GET', url: '/v1/identity/users' })
+      assert.equal(res.statusCode, 200)
+      const byName = new Map((res.json() as { data: ShareUser[] }).data.map(u => [u.name, u]))
+      const facts = (n: string) => {
+        const u = byName.get(n)!
+        return { smbEnabled: u.smbEnabled, mismatch: 'smbEntryMismatch' in u ? u.smbEntryMismatch : '(absent)' }
+      }
+      // exact match
+      assert.deepEqual(facts('smbtest'), { smbEnabled: true, mismatch: '(absent)' })
+      assert.deepEqual(facts('Name'), { smbEnabled: true, mismatch: '(absent)' })
+      // case-mismatched orphan (the #68 state)
+      assert.deepEqual(facts('Orphan'), { smbEnabled: false, mismatch: 'orphan' })
+      // unmapped uid under the exact name
+      assert.deepEqual(facts('Unmapped'), { smbEnabled: false, mismatch: 'Unmapped' })
+      // absent
+      assert.deepEqual(facts('Absent'), { smbEnabled: false, mismatch: '(absent)' })
+      // `pat` owns the entry; `Pat` finds it case-folded but it is not Pat's
+      assert.deepEqual(facts('pat'), { smbEnabled: true, mismatch: '(absent)' })
+      assert.deepEqual(facts('Pat'), { smbEnabled: false, mismatch: '(absent)' })
+    })
+
+    // --- (1)+(2) create --------------------------------------------------
+    it('create, clean path: useradd → smbpasswd -a -s → verify read (pinned byte-for-byte)', async () => {
+      await boot({ pdbedit: ['smbtest:1000:\n', FIXED], namePasswd: [NOT_FOUND, ok(NAME_LINE)] })
+      const res = await post('/v1/identity/users', { name: 'Name', smbPassword: 'hunter2' })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      assert.deepEqual(job.result, { created: 'Name', smbEnabled: true })
+      assert.deepEqual(sequenceFrom(c => c.command === '/usr/sbin/useradd'), [
+        USERADD_NAME,
+        SMBPASSWD_NAME,
+        GETENT_NAME,
+        PDBEDIT_LIST,
+      ])
+      // The password rides stdin only.
+      assert.equal(executor.calls.some(c => c.args.includes('hunter2')), false)
+    })
+
+    it('create over a case-mismatched orphan: repairs it (pdbedit -x → smbpasswd -a → verify) and logs one line', async () => {
+      await boot({ pdbedit: [ORPHAN, ORPHAN, FIXED], namePasswd: [NOT_FOUND, ok(NAME_LINE)] })
+      const res = await post('/v1/identity/users', { name: 'Name', smbPassword: 'hunter2' })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      assert.deepEqual(job.result, { created: 'Name', smbEnabled: true, smbEntryReplaced: 'name' })
+      assert.deepEqual(sequenceFrom(c => c.command === '/usr/sbin/useradd'), [
+        USERADD_NAME,
+        SMBPASSWD_NAME,
+        GETENT_NAME,
+        PDBEDIT_LIST,
+        PDBEDIT_DROP_ORPHAN,
+        SMBPASSWD_NAME,
+        PDBEDIT_LIST,
+      ])
+      assert.equal(executor.calls.some(c => c.args.includes('hunter2')), false)
+      const replacedLines = logLines.filter(l => l.includes('replaced it'))
+      assert.equal(replacedLines.length, 1)
+      assert.match(replacedLines[0], /stored as 'name' did not match account 'Name'/)
+    })
+
+    it('create: a repair that still does not verify fails the job naming the stored entry', async () => {
+      await boot({ pdbedit: [ORPHAN, ORPHAN, ORPHAN], namePasswd: [NOT_FOUND, ok(NAME_LINE)] })
+      const res = await post('/v1/identity/users', { name: 'Name', smbPassword: 'hunter2' })
+      const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      const message = job.error?.message ?? ''
+      assert.match(message, /User 'Name' was created, but setting the SMB password failed/)
+      assert.match(message, /still does not hold 'Name' exactly/)
+      assert.match(message, /'name' \(uid unmapped\)/)
+      assert.match(message, /pdbedit -x -u name/)
+    })
+
+    it('create WITHOUT a password over a case-mismatched orphan: 409 naming the entry and the fix, no useradd', async () => {
+      await boot({ pdbedit: [ORPHAN], namePasswd: [NOT_FOUND] })
+      const res = await post('/v1/identity/users', { name: 'Name' })
+      assert.equal(res.statusCode, 409)
+      const { error } = res.json() as { error: { code: string, reason: string, message: string } }
+      assert.equal(error.code, 'CONFLICT')
+      assert.equal(error.reason, 'passdb-orphan')
+      assert.match(error.message, /orphan entry stored as 'name'/)
+      assert.match(error.message, /pdbedit -x -u name/)
+      assert.match(error.message, /NOT created/)
+      assert.equal(executor.calls.some(c => c.command === '/usr/sbin/useradd'), false)
+      assert.equal(queue.list().length, 0)
+    })
+
+    it('create when the case-folded entry belongs to ANOTHER live account: 409, with or without a password', async () => {
+      for (const body of [{ name: 'Name', smbPassword: 'hunter2' }, { name: 'Name' }]) {
+        await boot({ pdbedit: ['name:1005:\n'], namePasswd: [NOT_FOUND] })
+        const res = await post('/v1/identity/users', body)
+        assert.equal(res.statusCode, 409)
+        const { error } = res.json() as { error: { reason: string, message: string } }
+        assert.equal(error.reason, 'passdb-entry-owned')
+        assert.match(error.message, /stored as 'name', which belongs to another account \(uid 1005\)/)
+        assert.equal(executor.calls.some(c => c.command === '/usr/sbin/useradd' || c.command === '/usr/bin/smbpasswd'), false)
+        await app!.close()
+        app = undefined
+        await rm(tmpDir, { recursive: true, force: true })
+      }
+    })
+
+    // --- (1) set password ------------------------------------------------
+    it('set password, clean path: smbpasswd -a -s → verify read (pinned byte-for-byte)', async () => {
+      await boot({ pdbedit: [FIXED, FIXED] })
+      const res = await post('/v1/identity/users/Name/smb-password', { password: 's3cret' })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      assert.deepEqual(job.result, { user: 'Name', smbEnabled: true })
+      assert.deepEqual(sequenceFrom(c => c.command === '/usr/bin/smbpasswd'), [
+        SMBPASSWD_NAME,
+        GETENT_NAME,
+        PDBEDIT_LIST,
+      ])
+      assert.equal(executor.calls.some(c => c.args.includes('s3cret')), false)
+    })
+
+    it('set password over a mismatched entry repairs it: pdbedit -x → smbpasswd -a → verify', async () => {
+      await boot({ pdbedit: [ORPHAN, ORPHAN, FIXED] })
+      const res = await post('/v1/identity/users/Name/smb-password', { password: 's3cret' })
+      const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      assert.deepEqual(job.result, { user: 'Name', smbEnabled: true, smbEntryReplaced: 'name' })
+      assert.deepEqual(sequenceFrom(c => c.command === '/usr/bin/smbpasswd'), [
+        SMBPASSWD_NAME,
+        GETENT_NAME,
+        PDBEDIT_LIST,
+        PDBEDIT_DROP_ORPHAN,
+        SMBPASSWD_NAME,
+        PDBEDIT_LIST,
+      ])
+      assert.equal(logLines.filter(l => l.includes('replaced it')).length, 1)
+    })
+
+    it('set password: a failed pdbedit -x fails the job naming the stored entry, no second smbpasswd', async () => {
+      await boot({ pdbedit: [ORPHAN, ORPHAN] })
+      executor.addFixture({ command: '/usr/bin/pdbedit', args: ['-x', '-u', 'name'], result: { stdout: '', stderr: 'Failed to delete entry for user name.\n', exitCode: 255 } })
+      const res = await post('/v1/identity/users/Name/smb-password', { password: 's3cret' })
+      const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error?.message ?? '', /stores the entry for 'Name' as 'name', and removing it failed: Failed to delete entry/)
+      assert.equal(executor.calls.filter(c => c.command === '/usr/bin/smbpasswd').length, 1)
+    })
+
+    it('set password: smbpasswd exit 0 but no entry at all fails the job', async () => {
+      await boot({ pdbedit: ['', ''] })
+      const res = await post('/v1/identity/users/Name/smb-password', { password: 's3cret' })
+      const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error?.message ?? '', /no entry for 'Name'/)
+    })
+
+    it('set password when the case-folded entry belongs to ANOTHER live account: 409, smbpasswd never runs', async () => {
+      await boot({ pdbedit: ['name:1005:\n'] })
+      const res = await post('/v1/identity/users/Name/smb-password', { password: 's3cret' })
+      assert.equal(res.statusCode, 409)
+      const { error } = res.json() as { error: { reason: string, message: string } }
+      assert.equal(error.reason, 'passdb-entry-owned')
+      assert.match(error.message, /NOT changed/)
+      assert.equal(executor.calls.some(c => c.command === '/usr/bin/smbpasswd'), false)
+      assert.equal(queue.list().length, 0)
+    })
+  })
+
   // --- identity.1b + 1c — case-folded SMB presence, private groups ----------
   describe('case-folded SMB presence and private groups (identity.1b/1c)', () => {
     let app: FastifyInstance | undefined
@@ -908,20 +1227,26 @@ describe('share-identity routes', () => {
       await rm(tmpDir, { recursive: true, force: true })
     })
 
-    it('marks a user smbEnabled when the passdb holds a different case', async () => {
+    // identity.3 (#68) reverses the identity.1b reading: a passdb entry under
+    // a different case is FOUND case-folded (it is the one Samba uses) but it
+    // does not make the account SMB-enabled — the list reports the stored name.
+    it('a passdb entry under a different case is a mismatch, not smbEnabled (identity.3)', async () => {
       const a = await boot()
       const res = await a.inject({ method: 'GET', url: '/v1/identity/users' })
       assert.equal(res.statusCode, 200)
       const { data } = res.json() as { data: ShareUser[] }
       const alice = data.find(u => u.name === 'Alice')!
-      assert.equal(alice.smbEnabled, true)
+      assert.equal(alice.smbEnabled, false)
+      assert.equal(alice.smbEntryMismatch, 'alice')
     })
 
-    it('single-user detail folds case too', async () => {
+    it('single-user detail reports the same mismatch', async () => {
       const a = await boot()
       const res = await a.inject({ method: 'GET', url: '/v1/identity/users/Alice' })
       assert.equal(res.statusCode, 200)
-      assert.equal((res.json() as { data: ShareUser }).data.smbEnabled, true)
+      const { data } = res.json() as { data: ShareUser }
+      assert.equal(data.smbEnabled, false)
+      assert.equal(data.smbEntryMismatch, 'alice')
     })
 
     it('marks an existing user-private group with privateGroupOf; a plain group has no key', async () => {

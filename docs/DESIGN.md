@@ -700,15 +700,15 @@ Users/groups are read **only** via `getent`/nsswitch (source-agnostic — local,
 | `identity.users` | `getent passwd` (pickers + list; filtered to real accounts) |
 | `identity.groups` | `getent group` |
 | `identity.user.local` | `getent -s files passwd <name>` (manageable vs directory) |
-| `identity.smb.list` | `pdbedit -L` (which users have an SMB passdb entry) |
+| `identity.smb.list` | `pdbedit -L` (which users have an SMB passdb entry — `smbEnabled` only for an exact-case entry mapped to the account's uid, `smbEntryMismatch` names a stale one) |
 | `identity.user.add` | `useradd -N -M -s /usr/sbin/nologin [-c <gecos>] [-G <groups>] <name>` (`-N`: no user-private group) |
 | `identity.user.disable` | `usermod --lock --expiredate 1 <name>` + `smbpasswd -d <name>` |
 | `identity.user.enable` | `usermod --unlock --expiredate '' <name>` + `smbpasswd -e <name>` |
-| `identity.user.delete` | `userdel <name>` (no `-r` — its files keep their uid) + `smbpasswd -x <name>` (only if a passdb entry exists) |
+| `identity.user.delete` | `pdbedit -x -u <stored name>` FIRST (only if a passdb entry Samba would use for the account exists — found case-folded, dropped by the name it is stored under, so an orphan or case-mismatched entry never blocks the delete; identity.3), then `userdel <name>` (no `-r` — its files keep their uid) |
 | `identity.group.add` | `groupadd <name>` |
 | `identity.group.members` | `gpasswd -a` / `gpasswd -d <user> <group>` |
 | `identity.group.delete` | `groupdel <name>` |
-| `identity.smbpasswd.set` | `smbpasswd -a -s <name>` (password on stdin, never argv) |
+| `identity.smbpasswd.set` | `smbpasswd -a -s <name>` (password on stdin, never argv), then `pdbedit -L` must show `<name>` EXACTLY with `getent`'s uid; a mismatched entry is replaced (`pdbedit -x -u <stored>` + `smbpasswd -a -s` again, re-verified) — identity.3 |
 | `identity.smbpasswd.clear` | `smbpasswd -x <name>` |
 
 > **Permissions editor (Epic 4.7 → 4.7.1):** the layered access UI is backed by **POSIX ACLs** (`getfacl`/`setfacl`, `acltype=posixacl`) — owner/group/mode for the base rows, named-user/group ACL entries for extra principals, and a default ACL + setgid for inheritance. NFSv4 ACLs are **deferred to Epic 14** (they earn their complexity only for Windows-file-server parity, which pairs with an AD join). No `passwd`/`chpasswd` — ANAS never sets a Unix login password.

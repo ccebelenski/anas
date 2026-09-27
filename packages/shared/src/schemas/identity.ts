@@ -33,9 +33,10 @@ export type SystemGroup = z.infer<typeof SystemGroup>
 
 /**
  * A share user with the extra facts the management panel needs. `smbEnabled`
- * is a live passdb check (pdbedit); `locked` is a disabled account; `local`
- * distinguishes a user ANAS can manage from a directory-provided one (which is
- * read-only here — provisioned in AD/LDAP, Epic 14).
+ * is a live, exact-case passdb check (pdbedit); `locked` is a disabled
+ * account; `local` distinguishes a user ANAS can manage from a
+ * directory-provided one (which is read-only here — provisioned in AD/LDAP,
+ * Epic 14).
  */
 export const ShareUser = z.object({
   name: z.string(),
@@ -46,8 +47,20 @@ export const ShareUser = z.object({
   primaryGroup: z.string().nullable(),
   /** All groups the user belongs to (primary + supplementary) */
   groups: z.array(z.string()),
-  /** Has a Samba passdb entry (can authenticate to SMB) */
+  /**
+   * Has a Samba passdb entry that really serves this account (can authenticate
+   * to SMB): stored under EXACTLY this name, with the uid Samba resolves equal
+   * to the account's (identity.3, #68). A case-different entry does not count.
+   */
   smbEnabled: z.boolean(),
+  /**
+   * Present only when the passdb holds an entry Samba would use for this
+   * account but stored under a different case (or unmapped) — the stored name,
+   * so the panel can say what to repair; `smbEnabled` is false then. Setting
+   * the SMB password again replaces the entry (identity.3). Absent = no such
+   * entry, exactly as an older daemon would send it.
+   */
+  smbEntryMismatch: z.string().optional(),
   /** Account disabled (login + SMB revoked) without deletion */
   locked: z.boolean(),
   /** Resolvable from the local files DB → ANAS can manage it (vs directory) */

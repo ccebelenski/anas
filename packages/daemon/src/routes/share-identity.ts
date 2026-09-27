@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor, ExecOptions, ExecResult } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { GroupEntry, PasswdEntry } from '../parsers/getent.js'
+import type { PassdbEntry } from '../parsers/pdbedit.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import { constants } from 'node:fs'
 import { access } from 'node:fs/promises'
@@ -24,7 +25,13 @@ import {
   toSystemGroup,
   userGroups,
 } from '../parsers/getent.js'
-import { parsePdbeditNames, passdbHas, sameIdentityName } from '../parsers/pdbedit.js'
+import {
+  parsePdbeditEntries,
+  passdbEntry,
+  passdbOwnedByOther,
+  passdbServes,
+  sameIdentityName,
+} from '../parsers/pdbedit.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
 import { confirmGate } from '../safety/gate.js'
 import { readConfig } from '../services/config-writer.js'
@@ -137,24 +144,94 @@ export async function shareIdentityRoutes(
   }
 
   /**
-   * Usernames with a Samba passdb entry (pdbedit -L).
-   *
-   * FAIL-OPEN, never throws: pdbedit ships in the `samba` package, and execFile
-   * REJECTS (rather than returning an exit code) when the binary is missing, so
-   * on a node without samba this would otherwise 500 the whole Share Users list
-   * (issue #6). No passdb means nobody holds an SMB password, and
-   * `smbEnabled: false` for everyone is the honest answer.
+   * The Samba passdb entries (pdbedit -L), STRICT: throws a sentence when the
+   * passdb cannot be read. The post-smbpasswd verify (identity.3) uses this —
+   * an unreadable passdb must not pass for "no entry" there.
    */
-  async function smbNames(): Promise<Set<string>> {
+  async function readPassdb(): Promise<PassdbEntry[]> {
+    let r: ExecResult
     try {
-      const r = await executor.exec(PDBEDIT, ['-L'])
-      if (r.exitCode !== 0 && !r.stdout.trim())
-        return new Set()
-      return parsePdbeditNames(r.stdout)
+      r = await executor.exec(PDBEDIT, ['-L'])
+    }
+    catch (err) {
+      throw new Error(`Could not read Samba's password database (pdbedit -L): ${err instanceof Error ? err.message : String(err)}`)
+    }
+    if (r.exitCode !== 0 && !r.stdout.trim())
+      throw new Error(`Could not read Samba's password database (pdbedit -L): ${r.stderr.trim() || `exit code ${r.exitCode}`}`)
+    return parsePdbeditEntries(r.stdout)
+  }
+
+  /**
+   * The Samba passdb entries (pdbedit -L), FAIL-OPEN: never throws. pdbedit
+   * ships in the `samba` package, and execFile REJECTS (rather than returning
+   * an exit code) when the binary is missing, so on a node without samba this
+   * would otherwise 500 the whole Share Users list (issue #6). No passdb means
+   * nobody holds an SMB password, and `smbEnabled: false` for everyone is the
+   * honest answer.
+   */
+  async function smbEntries(): Promise<PassdbEntry[]> {
+    try {
+      return await readPassdb()
     }
     catch {
-      return new Set()
+      return []
     }
+  }
+
+  /**
+   * Run `smbpasswd -a -s <name>` with the password on stdin (never argv —
+   * never logged). Throws the smbpasswd message on a non-zero exit.
+   */
+  async function smbpasswdAdd(name: string, password: string): Promise<void> {
+    const r = await execSmbpasswd(['-a', '-s', name], { stdin: `${password}\n${password}\n` })
+    if (r.exitCode !== 0)
+      throw new Error(r.stderr.trim() || `smbpasswd exited with code ${r.exitCode}`)
+  }
+
+  /**
+   * Set an SMB password and PROVE it landed on an entry that serves the account
+   * (identity.3, #68). tdbsam keys entries by the lowercased name but stores the
+   * name as first written, and `smbpasswd -a Alice` on an orphan stored as
+   * `alice` exits 0 while leaving the stored name — and so the logon mapping —
+   * broken: Samba accepts the password, `getpwnam(alice)` fails, the session
+   * becomes a guest. So after smbpasswd, `pdbedit -L` must show the name
+   * EXACTLY, with the uid `getent passwd <name>` gives. On a mismatch the
+   * stale entry is dropped (`pdbedit -x -u <stored>` — the fix an operator
+   * does by hand) and the password set again, then re-verified. An entry that
+   * belongs to ANOTHER live account is never removed (the routes refuse that
+   * case before the job runs). Returns the replaced stored name, if any.
+   */
+  async function setSmbPasswordVerified(
+    name: string,
+    password: string,
+    updateProgress: (message: string) => void,
+  ): Promise<string | undefined> {
+    await smbpasswdAdd(name, password)
+    const account = await resolveUser(name)
+    if (!account)
+      throw new Error(`User '${name}' does not resolve (getent passwd), so its SMB entry cannot be checked against it`)
+    const entry = passdbEntry(await readPassdb(), name)
+    if (passdbServes(entry, name, account.uid))
+      return undefined
+    if (!entry)
+      throw new Error(`smbpasswd reported success, but Samba's password database has no entry for '${name}'`)
+    if (passdbOwnedByOther(entry, account.uid))
+      throw new Error(`Samba's password database entry for '${name}' is stored as '${entry.stored}', which belongs to another account (uid ${entry.uid}); Samba matches user names case-insensitively, so '${name}' cannot hold its own SMB password. ANAS did not remove that entry.`)
+
+    const stale = entry.stored
+    updateProgress(`Replacing the SMB entry stored as '${stale}' for '${name}'`)
+    const dropped = await executor.exec(PDBEDIT, ['-x', '-u', stale])
+    if (dropped.exitCode !== 0)
+      throw new Error(`Samba's password database stores the entry for '${name}' as '${stale}', and removing it failed: ${dropped.stderr.trim() || `pdbedit exited with code ${dropped.exitCode}`}`)
+    server.log.info(`identity: SMB passdb entry stored as '${stale}' did not match account '${name}' (uid ${account.uid}); replaced it (pdbedit -x -u ${stale}, then smbpasswd -a ${name})`)
+
+    await smbpasswdAdd(name, password)
+    const again = passdbEntry(await readPassdb(), name)
+    if (!passdbServes(again, name, account.uid)) {
+      const shown = again ? `'${again.stored}' (uid ${again.uid ?? 'unmapped'})` : 'no entry at all'
+      throw new Error(`Samba's password database still does not hold '${name}' exactly after replacing the entry stored as '${stale}': it shows ${shown}. Remove it with 'pdbedit -x -u ${again?.stored ?? name}' and set the SMB password again.`)
+    }
+    return stale
   }
 
   /** Names present in the LOCAL files DB → ANAS can manage them. */
@@ -213,19 +290,26 @@ export async function shareIdentityRoutes(
   function toShareUser(
     entry: PasswdEntry,
     groups: GroupEntry[],
-    smb: Set<string>,
+    passdb: PassdbEntry[],
     local: boolean,
     expire: string,
   ): ShareUser {
+    // identity.3: the entry Samba would use is found case-folded, but only an
+    // exact-case entry mapped to this account's uid lets it log in. A folded
+    // match that is nobody's (an orphan) is reported by its stored name so the
+    // panel can say what to repair; one that belongs to another live account
+    // is that account's, not a mismatch of this one.
+    const smb = passdbEntry(passdb, entry.name)
+    const serves = passdbServes(smb, entry.name, entry.uid)
+    const mismatch = smb && !serves && !passdbOwnedByOther(smb, entry.uid) ? smb.stored : undefined
     return {
       name: entry.name,
       uid: entry.uid,
       fullName: entry.gecos || null,
       primaryGroup: primaryGroupName(entry, groups),
       groups: userGroups(entry, groups),
-      // Case-FOLDED (identity.1b): Samba matches names case-insensitively and
-      // may hold the passdb entry under a different case than passwd.
-      smbEnabled: passdbHas(smb, entry.name),
+      smbEnabled: serves,
+      ...(mismatch !== undefined ? { smbEntryMismatch: mismatch } : {}),
       locked: isExpired(expire),
       local,
     }
@@ -288,7 +372,7 @@ export async function shareIdentityRoutes(
     const [users, groups, smb, local, shadow] = await Promise.all([
       allUsers(),
       allGroups(),
-      smbNames(),
+      smbEntries(),
       localUserNames(),
       shadowExpiry(),
     ])
@@ -335,7 +419,7 @@ export async function shareIdentityRoutes(
 
     const [groups, smb, local, shadow] = await Promise.all([
       allGroups(),
-      smbNames(),
+      smbEntries(),
       isLocalUser(name),
       shadowExpiry(),
     ])
@@ -394,6 +478,34 @@ export async function shareIdentityRoutes(
       args.push('-G', req.groups.join(','))
     args.push(req.name)
 
+    // identity.3 (#68): Samba looks passdb entries up case-FOLDED, so an entry
+    // left under another case would be the one this account logs in with —
+    // and it can never map to it. An orphan (its account gone) is replaced by
+    // the job when this create sets an SMB password; without one there is
+    // nothing to replace it with, and an entry that belongs to another live
+    // account is never touched. Checked before the job runs useradd.
+    const existing = passdbEntry(await smbEntries(), req.name)
+    if (existing && passdbOwnedByOther(existing, null)) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'passdb-entry-owned',
+          message: `Samba's password database already holds an entry stored as '${existing.stored}', which belongs to another account (uid ${existing.uid}). Samba matches user names case-insensitively, so '${req.name}' could never hold its own SMB password. Pick a different name. The user was NOT created.`,
+        },
+      }
+    }
+    if (existing && existing.stored !== req.name && req.smbPassword === undefined) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'passdb-orphan',
+          message: `Samba's password database holds an orphan entry stored as '${existing.stored}' (its account no longer exists), which Samba would match to '${req.name}' and turn into a guest session. Set an SMB password in this dialog to replace it, or remove it first with: pdbedit -x -u ${existing.stored}. The user was NOT created.`,
+        },
+      }
+    }
+
     const smbPassword = req.smbPassword
 
     const job = jobQueue.submit(
@@ -405,24 +517,26 @@ export async function shareIdentityRoutes(
         if (created.exitCode !== 0)
           throw new Error(created.stderr.trim() || `useradd exited with code ${created.exitCode}`)
 
+        let replaced: string | undefined
         if (smbPassword !== undefined) {
           updateProgress(`Setting SMB password for '${req.name}'`)
-          // Password on stdin (smbpasswd -s), never argv — never logged.
-          let smb: ExecResult
           try {
-            smb = await execSmbpasswd(['-a', '-s', req.name], {
-              stdin: `${smbPassword}\n${smbPassword}\n`,
-            })
+            // Password on stdin (smbpasswd -s), never argv — never logged;
+            // verified exact-case afterwards, a stale entry replaced.
+            replaced = await setSmbPasswordVerified(req.name, smbPassword, updateProgress)
           }
           catch (err) {
-            // Spawn failure (samba removed since the route preflight) — say so
-            // in the same "the account exists, the password doesn't" wording.
+            // Any failure here (a spawn failure because samba went away since
+            // the route preflight, a passdb that will not verify) leaves the
+            // account without a working password — say so in one wording.
             throw new Error(halfCreated(req.name, err instanceof Error ? err.message : String(err)))
           }
-          if (smb.exitCode !== 0)
-            throw new Error(halfCreated(req.name, smb.stderr.trim() || `smbpasswd exited with code ${smb.exitCode}`))
         }
-        return { created: req.name, smbEnabled: smbPassword !== undefined }
+        return {
+          created: req.name,
+          smbEnabled: smbPassword !== undefined,
+          ...(replaced !== undefined ? { smbEntryReplaced: replaced } : {}),
+        }
       },
     )
 
@@ -450,7 +564,8 @@ export async function shareIdentityRoutes(
     if (!identity)
       return
 
-    if (!(await resolveUser(name))) {
+    const account = await resolveUser(name)
+    if (!account) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `User '${name}' not found` } }
     }
@@ -463,17 +578,29 @@ export async function shareIdentityRoutes(
       return { error: { code: 'VALIDATION_ERROR', message: `${SMB_NOT_INSTALLED}. The password was NOT changed.` } }
     }
 
+    // identity.3: smbpasswd lands on the entry Samba finds case-folded — when
+    // that entry is ANOTHER live account's, setting this password would change
+    // that account's. Refuse before anything runs.
+    const existing = passdbEntry(await smbEntries(), name)
+    if (existing && passdbOwnedByOther(existing, account.uid)) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'passdb-entry-owned',
+          message: `Samba's password database entry for '${name}' is stored as '${existing.stored}', which belongs to another account (uid ${existing.uid}). Samba matches user names case-insensitively, so '${name}' cannot hold its own SMB password. The password was NOT changed.`,
+        },
+      }
+    }
+
     const job = jobQueue.submit(
       'identity.smbpasswd.set',
       { ...identity, params: { user: name } },
-      async () => {
-        // Password on stdin (smbpasswd -s), never argv — never logged.
-        const r = await execSmbpasswd(['-a', '-s', name], {
-          stdin: `${password}\n${password}\n`,
-        })
-        if (r.exitCode !== 0)
-          throw new Error(r.stderr.trim() || `smbpasswd exited with code ${r.exitCode}`)
-        return { user: name, smbEnabled: true }
+      async (updateProgress) => {
+        // Password on stdin (smbpasswd -s), never argv — never logged;
+        // verified exact-case afterwards, a stale entry replaced (identity.3).
+        const replaced = await setSmbPasswordVerified(name, password, updateProgress)
+        return { user: name, smbEnabled: true, ...(replaced !== undefined ? { smbEntryReplaced: replaced } : {}) }
       },
     )
 
@@ -501,7 +628,8 @@ export async function shareIdentityRoutes(
     if (!identity)
       return
 
-    if (!(await resolveUser(name))) {
+    const account = await resolveUser(name)
+    if (!account) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `User '${name}' not found` } }
     }
@@ -529,10 +657,12 @@ export async function shareIdentityRoutes(
         // Toggle the SMB side only if the user actually has a passdb entry —
         // smbpasswd -d/-e errors on users with no entry, which is normal for a
         // share user that never had an SMB password. On a node without samba
-        // smbNames() fails open to empty, so this is skipped entirely.
-        // Case-FOLDED (identity.1b): the passdb may hold a different case.
-        const hasSmb = passdbHas(await smbNames(), name)
-        if (hasSmb) {
+        // smbEntries() fails open to empty, so this is skipped entirely.
+        // Found case-FOLDED (identity.1b) the way smbpasswd finds it — but an
+        // entry that belongs to another live account is that account's to
+        // toggle, never this one's (identity.3).
+        const smb = passdbEntry(await smbEntries(), name)
+        if (smb && !passdbOwnedByOther(smb, account.uid)) {
           updateProgress(`${enabled ? 'Enabling' : 'Disabling'} SMB access for '${name}'`)
           const smb = await execSmbpasswd([enabled ? '-e' : '-d', name])
           if (smb.exitCode !== 0)
@@ -677,9 +807,10 @@ export async function shareIdentityRoutes(
     }
 
     // The passdb check is route-time for the WARNING (it describes what will
-    // happen); the job re-checks live so the `smbpasswd -x` side stays honest
+    // happen); the job re-checks live so the `pdbedit -x` side stays honest
     // if the passdb moves between the two.
-    const hasSmb = passdbHas(await smbNames(), name)
+    const routeSmb = passdbEntry(await smbEntries(), name)
+    const hasSmb = routeSmb !== null && !passdbOwnedByOther(routeSmb, entry.uid)
     const warnings = [
       `User '${name}' (uid ${entry.uid}) will be removed from the system`,
       `Files owned by the user keep their uid (${entry.uid}) — ownership is not changed, and a later user with the same uid would own them`,
@@ -702,20 +833,21 @@ export async function shareIdentityRoutes(
       'identity.user.delete',
       { ...identity, params: { user: name } },
       async (updateProgress) => {
-        // Order matters: smbpasswd resolves the passdb entry through the Unix
-        // account, so the SMB entry is dropped FIRST, while the account still
-        // exists. A failed SMB step at this point destroys nothing — after
-        // userdel it would fail ("Failed to find a Unix account") and leave
-        // the passdb entry orphaned behind a deleted account. Drop the entry
-        // only if one exists (smbpasswd -x errors on a user with none),
-        // case-folded like every other passdb comparison; on a node without
-        // samba smbNames() fails open to empty, so this is skipped entirely.
+        // Order kept from identity.2: the SMB entry is dropped FIRST, so a
+        // failed SMB step destroys nothing. identity.3: by its STORED name
+        // with `pdbedit -x -u` — `smbpasswd -x` resolves the entry through a
+        // Unix account and fails on an orphan or case-mismatched entry, which
+        // then blocked the delete. The entry is found case-folded (the one
+        // Samba would use for this account); an absent one is skipped, and one
+        // that belongs to another live account is left alone. On a node
+        // without samba smbEntries() fails open to empty, so this is skipped.
         let smbEntryRemoved = false
-        if (passdbHas(await smbNames(), name)) {
-          updateProgress(`Removing SMB password entry for '${name}'`)
-          const smb = await execSmbpasswd(['-x', name])
-          if (smb.exitCode !== 0)
-            throw new Error(smb.stderr.trim() || `smbpasswd exited with code ${smb.exitCode}`)
+        const smb = passdbEntry(await smbEntries(), name)
+        if (smb && !passdbOwnedByOther(smb, entry.uid)) {
+          updateProgress(`Removing SMB password entry for '${name}' (stored as '${smb.stored}')`)
+          const dropped = await executor.exec(PDBEDIT, ['-x', '-u', smb.stored])
+          if (dropped.exitCode !== 0)
+            throw new Error(dropped.stderr.trim() || `pdbedit exited with code ${dropped.exitCode}`)
           smbEntryRemoved = true
         }
 
