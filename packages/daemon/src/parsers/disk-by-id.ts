@@ -17,6 +17,8 @@ const SYMLINK_RE = /(\S+)\s+->\s+(?:\.\.\/)*(\S+)$/
 const PARTITION_RE = /-part\d+$/
 const RELATIVE_PREFIX_RE = /^(?:\.\.\/)*/
 const NVME_PART_RE = /^(nvme\d+n\d+)p\d+$/
+/** A `/dev/` device-path prefix, stripped before a leaf name is resolved. */
+const DEV_PREFIX_RE = /^\/dev\//
 /**
  * eMMC/SD names carry their disk NUMBER before the `pN` partition suffix
  * (`mmcblk0p1`), so the generic non-digits-then-digits rule below cannot reduce
@@ -148,4 +150,33 @@ export function parseDiskByIdListing(output: string): ByIdMap {
     result.set(kernelName, id)
   }
   return result
+}
+
+/**
+ * The whole-disk by-id a ZFS leaf name resolves to, or the leaf VERBATIM when
+ * nothing resolves it (0.4.1 kernel-named-leaf fix).
+ *
+ * `zpool status`/`iostat` name a leaf added by its kernel device under that
+ * name — a bare whole disk (`sdb`) or a partition (`sdb5`), the latter spelled
+ * with or without its `/dev/` prefix depending on which command printed it.
+ * The whole-disk case is the by-id map's own lookup; the partition case is the
+ * same lookup after {@link wholeDiskKernel} reduces the name to its parent
+ * disk, so the leaf lands on the SAME stable identity the Disks view carries
+ * and cross-references like a by-id leaf. A by-id leaf (whole or `-partN`)
+ * resolves to itself untouched — the map is keyed by kernel name, so it was
+ * never a lookup candidate — and an unresolvable kernel name (a disk the
+ * listing does not know) keeps today's verbatim behaviour.
+ */
+export function leafDiskId(leaf: string, byIdMap: ByIdMap): string {
+  const bare = leaf.replace(DEV_PREFIX_RE, '')
+  const direct = byIdMap.get(bare)
+  if (direct)
+    return direct
+  const whole = wholeDiskKernel(bare)
+  if (whole !== bare) {
+    const parent = byIdMap.get(whole)
+    if (parent)
+      return parent
+  }
+  return leaf
 }

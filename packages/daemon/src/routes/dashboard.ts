@@ -28,7 +28,7 @@ import { hostname } from 'node:os'
 import { basename } from 'node:path'
 import { GROUPING_VDEV_TYPES } from '@anas/shared'
 import { computeArcTelemetry, parseArcstats } from '../parsers/arcstats.js'
-import { parseDiskByIdListing } from '../parsers/disk-by-id.js'
+import { leafDiskId, parseDiskByIdListing } from '../parsers/disk-by-id.js'
 import { parseExports } from '../parsers/exports.js'
 import { computeNetTelemetry, parseProcNetDev } from '../parsers/net-dev.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
@@ -441,8 +441,12 @@ export async function dashboardRoutes(
     // identity) and the topology map (vdev → type/role/state).
     const [byIdMap, topology] = await Promise.all([loadByIdMap(), fetchVdevTopology()])
 
+    // Leaf → disk id through {@link leafDiskId}: a kernel-named leaf — whole
+    // disk or partition, the device-named-pool shape (0.4.1) — resolves to the
+    // SAME whole-disk by-id the Disks view carries, so it cross-references
+    // like a by-id leaf; anything unresolvable keeps its own name.
     const disk = (name: string, node: (typeof sample)[number]): DiskTelemetry => ({
-      id: byIdMap.get(name) ?? name,
+      id: leafDiskId(name, byIdMap),
       ...nodeToIoStats(node),
     })
 

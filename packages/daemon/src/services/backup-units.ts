@@ -14,6 +14,7 @@ import { DISABLED_HISTORY_NOTE, parseSystemdTimestamp } from './systemd-status.j
 // imported.
 import {
   buildTaskWarnings,
+  clearCancelledRunFailedState as clearCancelledRunFailedStateGeneric,
   collectTaskWarnings,
   deriveTaskRunResult,
   deriveTaskStatus as deriveTaskStatusGeneric,
@@ -350,6 +351,17 @@ export function runningDirectJobFields(jobQueue: JobQueue, name: string): { runn
 /** The Run-Now refusal sentence for a run already in flight (kind baked in). */
 export function runningRunConflictMessage(name: string, run: RunActiveState, progress?: string | null): string {
   return runningRunConflictMessageGeneric(BACKUP_UNIT_KIND, name, run, progress)
+}
+
+/**
+ * Settle systemd's failed state after a CANCELLED run (task-units.ts, kind
+ * baked in, backup parity): the runner's cancel exit leaves the unit in
+ * `systemctl --failed` until the next run — one `reset-failed` after it goes
+ * terminal clears it. The direct run body's cancelled branch calls this
+ * DETACHED (never awaited).
+ */
+export function clearCancelledRunFailedState(executor: CommandExecutor, name: string): Promise<boolean> {
+  return clearCancelledRunFailedStateGeneric(BACKUP_UNIT_KIND, executor, name)
 }
 
 export type { SuperviseRunOptions }

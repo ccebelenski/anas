@@ -34,6 +34,7 @@ import { notifyCloudRun } from '../services/cloud-notify.js'
 import { previewCloudSync, PreviewRefusal } from '../services/cloud-preview.js'
 import { runCloudSync } from '../services/cloud-runner.js'
 import {
+  clearCancelledRunFailedState,
   DEFAULT_SYSTEMD_DIR,
   deriveTaskStatus,
   DISABLED_HISTORY_NOTE,
@@ -48,6 +49,7 @@ import {
   runningDirectJobFields,
   runningDirectJobProgress,
   runningRunConflictMessage,
+  serviceUnitName,
   superviseRun,
   taskFileExists,
   tasksReferencingRemote,
@@ -1003,9 +1005,24 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
    * The one journald line a cancelled run leaves instead of a notification
    * (rclone.5). The queue ends the job `cancelled` whatever the body returns
    * once the cancel was accepted, so the value is only a placeholder.
+   *
+   * This is also the one place that knows both the task's unit name and that
+   * the run ended cancelled, so it settles systemd's failed state here
+   * (0.4.1): the runner exits 130 at its next poll, the unit does not declare
+   * that a success, and without a `reset-failed` the unit sits in
+   * `systemctl --failed` until the task's next run. DETACHED on purpose: the
+   * unit cannot go terminal until THIS body returns — the runner learns of
+   * the cancel by polling the job — so awaiting it would hold the job for the
+   * whole settle ceiling.
    */
   function logCancelledRun(name: string): null {
     server.log.info(`cloud sync task '${name}' cancelled — no notification sent`)
+    void clearCancelledRunFailedState(executor, name)
+      .then((reset) => {
+        if (reset)
+          server.log.info(`cloud sync task '${name}': ${serviceUnitName(name)} left systemd's failed list after its cancelled run`)
+      })
+      .catch(() => undefined)
     return null
   }
 

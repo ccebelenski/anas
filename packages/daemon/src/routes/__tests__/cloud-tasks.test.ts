@@ -494,6 +494,17 @@ describe('cloud sync task routes (rclone.2)', () => {
         args: ['show', 'anas-cloud-offsite.service', '-p', 'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp'],
         result: { stdout: 'ActiveState=active\n', stderr: '', exitCode: 0 },
       })
+      // The settle after the cancel (0.4.1): the runner exits 130 at its next
+      // poll, the unit goes terminal failed, and the daemon reset-faileds it
+      // so it never sits in `systemctl --failed`.
+      mock.addFixture({
+        command: SYSTEMCTL,
+        args: ['show', 'anas-cloud-offsite.service', '-p', 'ActiveState,Result,ExecMainStatus,InvocationID'],
+        results: [
+          { stdout: 'ActiveState=activating\nResult=success\n', stderr: '', exitCode: 0 },
+          { stdout: 'ActiveState=failed\nResult=exit-code\nExecMainStatus=130\n', stderr: '', exitCode: 0 },
+        ],
+      })
       mock.calls.length = 0
 
       const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: { direct: true } })
@@ -532,6 +543,16 @@ describe('cloud sync task routes (rclone.2)', () => {
       assert.match((run?.result as { reason: string }).reason, /^cancelled by root@pam at /)
       assert.deepEqual(mock.signals.map(s => s.signal), ['SIGINT'])
       assert.equal(mock.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'a cancel never notifies')
+      // The settle (0.4.1): once the unit read terminal-failed with the cancel
+      // exit, exactly one reset-failed of the task's unit was issued — the
+      // unit leaves systemd's failed list while the row keeps reading
+      // cancelled.
+      for (let i = 0; i < 1000 && !mock.calls.some(c => c.command === SYSTEMCTL && c.args[0] === 'reset-failed'); i++)
+        await new Promise(r => setTimeout(r, 5))
+      assert.deepEqual(
+        mock.calls.filter(c => c.command === SYSTEMCTL && c.args[0] === 'reset-failed').map(c => c.args.join(' ')),
+        ['reset-failed anas-cloud-offsite.service'],
+      )
     })
 
     it('rclone.5 review: a cancel accepted MID-PRE-FLIGHT ends the run cancelled at the next boundary — no snapshot, no exec', async () => {

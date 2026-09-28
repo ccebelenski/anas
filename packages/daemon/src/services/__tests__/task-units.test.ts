@@ -14,6 +14,7 @@ import { CLOUD_UNIT_KIND } from '../cloud-units.js'
 import {
   buildTaskWarnings,
   classifyTrigger,
+  clearCancelledRunFailedState,
   collectTaskWarnings,
   deriveTaskRunResult,
   deriveTaskStatus,
@@ -790,6 +791,63 @@ describe('task units — a cancelled run (rclone.5)', () => {
     const q2 = new JobQueue()
     q2.submit('cloud.task.run', { user: 'root@pam', uid: 0, params: { task: TASK } }, () => new Promise<void>(() => {}))
     assert.deepEqual(runningDirectJobFields(q2, 'cloud.task.run', TASK), {})
+  })
+})
+
+describe('task units — the failed-state settle after a cancelled run (0.4.1)', () => {
+  function settleMock(shows: Record<string, string>[], service = SERVICE): MockExecutor {
+    const mock = new MockExecutor()
+    mock.addFixture({ command: SYSTEMCTL, args: ['show', service, '-p', SHOW_RUN_PROPS], results: shows.map(s => ok(showBlob(s))) })
+    return mock
+  }
+
+  it('waits for the unit to go terminal, then reset-faileds it when the exit was the cancel code', async () => {
+    // The runner still polls (activating) at the first read, then exits 130.
+    const mock = settleMock([
+      { ActiveState: 'activating', Result: 'success' },
+      { ActiveState: 'failed', Result: 'exit-code', ExecMainStatus: '130' },
+    ])
+    const reset = await clearCancelledRunFailedState(CLOUD_UNIT_KIND, mock, TASK, { pollIntervalMs: 0, timeoutMs: 60_000, sleep: noopSleep })
+    assert.equal(reset, true)
+    const argv = mock.calls.filter(c => c.command === SYSTEMCTL).map(c => c.args.join(' '))
+    assert.ok(argv.includes('reset-failed anas-cloud-offsite.service'), argv.join(' | '))
+  })
+
+  it('the row still reads cancelled after the reset — Result=success + ExecMainStatus=130', () => {
+    // What systemd reports once reset-failed has cleared the failed flag: the
+    // Result resets to success, the exit code stays. The derivation answers
+    // from the exit code — the same pin rclone.5 polish made, now the state a
+    // settled unit actually carries.
+    assert.equal(deriveTaskRunResult({ ActiveState: 'inactive', Result: 'success', ExecMainStatus: '130' }), 'cancelled')
+  })
+
+  it('a unit that failed for a REAL reason is left in the failed list', async () => {
+    const mock = settleMock([{ ActiveState: 'failed', Result: 'exit-code', ExecMainStatus: '1' }])
+    const reset = await clearCancelledRunFailedState(CLOUD_UNIT_KIND, mock, TASK, { pollIntervalMs: 0, timeoutMs: 60_000, sleep: noopSleep })
+    assert.equal(reset, false)
+    assert.deepEqual(mock.calls.filter(c => c.args[0] === 'reset-failed'), [])
+  })
+
+  it('a unit still activating at the ceiling gets no reset — a state we cannot see is not ours to clear', async () => {
+    const mock = settleMock([{ ActiveState: 'activating', Result: 'success' }])
+    const reset = await clearCancelledRunFailedState(CLOUD_UNIT_KIND, mock, TASK, { pollIntervalMs: 0, timeoutMs: 10, sleep: noopSleep })
+    assert.equal(reset, false)
+    assert.deepEqual(mock.calls.filter(c => c.args[0] === 'reset-failed'), [])
+  })
+
+  it('a systemd read that fails open to nothing resets nothing', async () => {
+    const mock = new MockExecutor() // no fixtures: show answers 127 → {}
+    const reset = await clearCancelledRunFailedState(CLOUD_UNIT_KIND, mock, TASK, { pollIntervalMs: 0, timeoutMs: 60_000, sleep: noopSleep })
+    assert.equal(reset, false)
+    assert.deepEqual(mock.calls.filter(c => c.args[0] === 'reset-failed'), [])
+  })
+
+  it('the settle works off the BACKUP unit name too — one helper, both kinds', async () => {
+    const mock = settleMock([{ ActiveState: 'failed', Result: 'exit-code', ExecMainStatus: '130' }], 'anas-backup-offsite.service')
+    const reset = await clearCancelledRunFailedState(BACKUP_UNIT_KIND, mock, TASK, { pollIntervalMs: 0, timeoutMs: 60_000, sleep: noopSleep })
+    assert.equal(reset, true)
+    const argv = mock.calls.filter(c => c.command === SYSTEMCTL).map(c => c.args.join(' '))
+    assert.ok(argv.includes('reset-failed anas-backup-offsite.service'), argv.join(' | '))
   })
 })
 

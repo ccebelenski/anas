@@ -475,6 +475,89 @@ export function isCancelledExit(props: Record<string, string>): boolean {
   return props.ExecMainStatus === String(TASK_CANCELLED_EXIT_CODE)
 }
 
+/**
+ * How long {@link clearCancelledRunFailedState} waits for the unit to go
+ * terminal. The runner learns of the cancel by polling its job (10 s cadence,
+ * runner-poll.ts) and systemd needs its own moment, so the unit can hold
+ * `activating` for one runner poll plus shutdown — 40 s is four polls with
+ * slack, and far below anything a real run needs.
+ */
+const CANCEL_SETTLE_TIMEOUT_MS = 40_000
+/** Settle poll cadence — short, because the wait is bounded and cheap (`systemctl show`). */
+const CANCEL_SETTLE_POLL_MS = 2000
+
+/** Options for {@link clearCancelledRunFailedState} (tests inject all three). */
+export interface CancelledRunSettleOptions {
+  /** Poll interval in ms (default 2000). */
+  pollIntervalMs?: number
+  /** Ceiling in ms before giving up without a reset (default 40000). */
+  timeoutMs?: number
+  /** Injectable sleep (tests pass a no-op). */
+  sleep?: (ms: number) => Promise<void>
+}
+
+/**
+ * After a CANCELLED run, keep the task's unit out of systemd's failed list
+ * (0.4.1 known issue, both task kinds).
+ *
+ * The runner ends a cancelled run with the cancel exit (130,
+ * {@link TASK_CANCELLED_EXIT_CODE}), which the unit does not declare a success
+ * — so systemd records `Result=exit-code` and the unit sits in
+ * `systemctl --failed` until the task's next run, while every ANAS surface
+ * already calls the run cancelled (rclone.5). This settles systemd's own
+ * bookkeeping at the source: wait (bounded) for the unit to go terminal, and
+ * when its exit was the cancel code, `systemctl reset-failed` it. A run that
+ * ended any other way — a real failure, or the no-child-to-stop cancel that
+ * fails honestly (`JobFailedDespiteCancelError`) — is left alone: its failed
+ * state is true.
+ *
+ * The reset does not disturb the row: `reset-failed` clears the failed flag
+ * and resets `Result` to `success` but leaves `ExecMainStatus` at 130, and
+ * {@link deriveTaskRunResult} answers `cancelled` from the exit code whatever
+ * `Result` says (pinned in task-units.test.ts). One journald line is logged by
+ * the CALLER when this returns true.
+ *
+ * **Detached by contract.** The natural caller is the direct run body's
+ * cancelled branch — the one place that knows both the unit name and that the
+ * run ended cancelled — and it MUST NOT await this: the unit cannot go
+ * terminal until the job's `cancelled` verdict is visible to the runner, and
+ * the body returning is what makes it visible. Awaiting here would hold the
+ * job `running` for the whole ceiling while the runner waits for the verdict.
+ * Best-effort throughout: an unreadable unit or a failed reset returns false
+ * and leaves the state systemd has.
+ */
+export async function clearCancelledRunFailedState(
+  kind: TaskUnitKind,
+  executor: CommandExecutor,
+  name: string,
+  opts: CancelledRunSettleOptions = {},
+): Promise<boolean> {
+  const pollIntervalMs = opts.pollIntervalMs ?? CANCEL_SETTLE_POLL_MS
+  const timeoutMs = opts.timeoutMs ?? CANCEL_SETTLE_TIMEOUT_MS
+  const sleep = opts.sleep ?? (ms => new Promise<void>(r => setTimeout(r, ms)))
+  const deadline = Date.now() + timeoutMs
+  let props: Record<string, string> = {}
+  while (Date.now() < deadline) {
+    props = await showRunProps(kind, executor, name)
+    if (!isRunActive(props))
+      break
+    await sleep(pollIntervalMs)
+  }
+  // Never terminal within the budget (still running, or systemd unreadable):
+  // no reset — a failed state we cannot see is not ours to clear.
+  if (isRunActive(props) || !isCancelledExit(props))
+    return false
+  // Best-effort: not failed / already gone is exactly the goal state
+  // (removeTaskUnits' pattern — a reset of nothing must not throw).
+  try {
+    await executor.exec(SYSTEMCTL, ['reset-failed', serviceUnitName(kind, name)])
+    return true
+  }
+  catch {
+    return false
+  }
+}
+
 /** The minimum a status derivation needs to know about a task. */
 export interface TaskStatusSubject extends ScheduledTask {
   name: string

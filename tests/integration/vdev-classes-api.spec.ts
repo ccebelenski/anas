@@ -127,6 +127,40 @@ test.describe('vdevs.1 — pool-level vdev classes (stunt node fixture)', () => 
   })
 
   // -----------------------------------------------------------------------
+  // 1b — telemetry: the kernel-named leaves land on the disk id (0.4.1)
+  // -----------------------------------------------------------------------
+  test('GET /v1/telemetry resolves the kernel-named partition leaves to the disk id the Disks list carries', async ({ playwright, pveTicket }) => {
+    const ctx = await authedContext(playwright, pveTicket)
+    try {
+      const res = await ctx.get(`${V1}/telemetry`)
+      expect(res.status()).toBe(200)
+      const t = (await res.json()).data as {
+        pools: Array<{ name: string, vdevs: Array<{ name: string, disks: Array<{ id: string }> }> }>
+      }
+      const pool = t.pools.find(p => p.name === POOL)
+      expect(pool, 'gtvdev in the telemetry sample').toBeTruthy()
+
+      // Every leaf the sample carries is a partition of the one hot disk,
+      // named by its kernel name (the device-named pool, built by CLI from
+      // /dev/sdk1-6): each resolves to the WHOLE-disk by-id — the identity
+      // the Disks view carries — instead of staying under its kernel name.
+      const ids = pool!.vdevs.flatMap(v => v.disks.map(d => d.id))
+      expect(ids.length, `leaf rows: ${JSON.stringify(ids)}`).toBeGreaterThan(0)
+      for (const id of ids)
+        expect(id, `leaf row id ${id}`).toBe(BY_ID)
+
+      // ...and that identity is a disk GET /v1/disks lists — the link holds.
+      const disksRes = await ctx.get(`${V1}/disks`)
+      expect(disksRes.status()).toBe(200)
+      const disks = (await disksRes.json()).data as Array<{ id: string }>
+      expect(disks.some(d => d.id === BY_ID), `GET /v1/disks lists ${BY_ID}`).toBe(true)
+    }
+    finally {
+      await ctx.dispose()
+    }
+  })
+
+  // -----------------------------------------------------------------------
   // 3 — the Pools detail topology shows the class nodes
   // -----------------------------------------------------------------------
   test.describe('UI', () => {

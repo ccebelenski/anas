@@ -386,15 +386,26 @@ test.describe.serial('backup cancel live proof — the rclone.5 backup half', ()
 
       // The unit ends failed / exit-code / 130 — within 20 s (the runner
       // prints its result line and exits the cancel code at its next poll).
-      await expect.poll(async () => sshExec(`systemctl show -p ActiveState --value ${UNIT}`), {
+      // The unit ends its cancelled run with the runner's cancel exit —
+      // within 20 s (the runner prints its result line and exits 130 at its
+      // next poll). ExecMainStatus SURVIVES the failed-state settle below;
+      // ActiveState and Result do not (the reset clears the failed flag and
+      // resets Result), so the exit code is the stable read.
+      await expect.poll(async () => sshExec(`systemctl show -p ExecMainStatus --value ${UNIT}`), {
         timeout: 20_000,
         intervals: [1_000],
-        message: 'the unit leaves activating/active and reads failed within 20 s',
-      }).toBe('failed')
-      const props = await sshExec(`systemctl show ${UNIT} -p ActiveState,Result,ExecMainStatus`)
-      expect(props).toContain('ActiveState=failed')
-      expect(props).toContain('Result=exit-code')
-      expect(props).toContain('ExecMainStatus=130')
+        message: 'the unit reads the runner\'s cancel exit 130 within 20 s',
+      }).toBe('130')
+
+      // 0.4.1: the failed state is settled — within 45 s of the cancel the
+      // unit is GONE from `systemctl --failed` (the daemon reset-faileds it
+      // once it reads the unit terminal with the cancel exit), while the row
+      // keeps reading cancelled below.
+      await expect.poll(async () => sshExec('systemctl --failed --no-legend || true'), {
+        timeout: 45_000,
+        intervals: [2_000],
+        message: 'the task unit leaves systemd\'s failed list within 45 s of the cancel',
+      }).not.toContain(UNIT)
 
       // The row reads cancelled — never failure — with the "cancelled by …"
       // note read back from the unit journal.
@@ -433,6 +444,8 @@ test.describe.serial('backup cancel live proof — the rclone.5 backup half', ()
       const journal = await sshExec(`journalctl -u anasd --since '${runStart}' --no-pager`)
       expect(journal, `anasd journal since ${runStart}`).toContain(`backup task '${TASK}' cancelled — no notification sent`)
       expect(journal).toContain('job.cancelled')
+      // The settle's one journald line (0.4.1): the unit left the failed list.
+      expect(journal).toContain(`${UNIT} left systemd's failed list`)
       expect(journal).not.toContain('notified via target')
       expect(journal).not.toContain('could not notify')
       expect(journal).not.toContain('pve-notify')

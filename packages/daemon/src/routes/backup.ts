@@ -104,6 +104,7 @@ import {
   tcpReachable,
 } from '../services/backup-runner.js'
 import {
+  clearCancelledRunFailedState,
   deriveTaskStatus,
   DISABLED_HISTORY_NOTE,
   effectiveSchedule,
@@ -117,6 +118,7 @@ import {
   runningDirectJobFields,
   runningDirectJobProgress,
   runningRunConflictMessage,
+  serviceUnitName,
   superviseRun,
   taskFileExists,
   validateSchedule,
@@ -634,9 +636,24 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
    * The one journald line a cancelled run leaves instead of a notification
    * (rclone.5, backup parity). The queue ends the job `cancelled` whatever the
    * body returns once the cancel was accepted — the value is a placeholder.
+   *
+   * This is also the one place that knows both the task's unit name and that
+   * the run ended cancelled, so it settles systemd's failed state here
+   * (0.4.1, backup parity): the runner exits 130 at its next poll, the unit
+   * does not declare that a success, and without a `reset-failed` the unit
+   * sits in `systemctl --failed` until the task's next run. DETACHED on
+   * purpose: the unit cannot go terminal until THIS body returns — the runner
+   * learns of the cancel by polling the job — so awaiting it would hold the
+   * job for the whole settle ceiling.
    */
   function logCancelledRun(name: string): null {
     server.log.info(`backup task '${name}' cancelled — no notification sent`)
+    void clearCancelledRunFailedState(executor, name)
+      .then((reset) => {
+        if (reset)
+          server.log.info(`backup task '${name}': ${serviceUnitName(name)} left systemd's failed list after its cancelled run`)
+      })
+      .catch(() => undefined)
     return null
   }
 

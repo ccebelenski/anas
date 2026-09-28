@@ -1758,6 +1758,17 @@ describe('backup routes (Epic 16)', () => {
       args: ['show', 'anas-backup-retained.service', '-p', 'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp'],
       result: { stdout: 'ActiveState=active\n', stderr: '', exitCode: 0 },
     })
+    // The settle after the cancel (0.4.1): the runner exits 130 at its next
+    // poll, the unit goes terminal failed, and the daemon reset-faileds it so
+    // it never sits in `systemctl --failed`.
+    mock.addFixture({
+      command: '/usr/bin/systemctl',
+      args: ['show', 'anas-backup-retained.service', '-p', 'ActiveState,Result,ExecMainStatus,InvocationID'],
+      results: [
+        { stdout: 'ActiveState=activating\nResult=success\n', stderr: '', exitCode: 0 },
+        { stdout: 'ActiveState=failed\nResult=exit-code\nExecMainStatus=130\n', stderr: '', exitCode: 0 },
+      ],
+    })
     mock.calls.length = 0
     const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
     const runId = await jobIdFrom(res)
@@ -1797,6 +1808,15 @@ describe('backup routes (Epic 16)', () => {
       mock.calls.filter(c => c.command === PBC_CMD && c.args.includes('prune')).length,
       0,
       'a cancelled run never prunes',
+    )
+    // The settle (0.4.1): once the unit read terminal-failed with the cancel
+    // exit, exactly one reset-failed of the task's unit was issued — the unit
+    // leaves systemd's failed list while the row keeps reading cancelled.
+    for (let i = 0; i < 1000 && !mock.calls.some(c => c.command === '/usr/bin/systemctl' && c.args[0] === 'reset-failed'); i++)
+      await new Promise(r => setTimeout(r, 5))
+    assert.deepEqual(
+      mock.calls.filter(c => c.command === '/usr/bin/systemctl' && c.args[0] === 'reset-failed').map(c => c.args.join(' ')),
+      ['reset-failed anas-backup-retained.service'],
     )
   })
 

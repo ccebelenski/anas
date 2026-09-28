@@ -109,11 +109,20 @@ describe('GET /v1/telemetry — every vdev class joins with its own role (vdevs.
     assert.equal(special.type, 'disk')
     // A bare leaf is both vdev and disk — it carries its single disk.
     assert.equal(special.disks.length, 1)
-    // KNOWN LIMIT, recorded rather than fixed: the by-id map is whole-disk
-    // only, so a PARTITION leaf is shown under its kernel name and does not
-    // cross-reference to the Disks list. Partition-backed vdevs are displayed,
-    // never managed (vdevs.1), so the tree stays honest about what ZFS named.
-    assert.equal(special.disks[0].id, 'sdb5')
+    // 0.4.1: the kernel-named PARTITION leaf resolves through the by-id
+    // listing (wholeDiskKernel: sdb5 → sdb) to the disk's stable by-id — the
+    // identity the Disks view carries — instead of staying under its kernel
+    // name. The vdev row keeps the name ZFS printed; only the disk id links.
+    assert.equal(special.disks[0].id, 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9')
+  })
+
+  it('every kernel-named leaf of the device-named pool carries the disk id (0.4.1)', async () => {
+    const t = await telemetry()
+    const pool = t.pools.find(p => p.name === POOL)!
+    // All five iostat rows are partitions of the one kernel disk (sdb1-6,
+    // spare sdb4 has no row): every one lands on the whole-disk by-id.
+    const ids = pool.vdevs.flatMap(v => v.disks.map(d => d.id))
+    assert.deepEqual([...new Set(ids)], ['scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9'])
   })
 
   it('a spare has no iostat row at all — the tree simply omits it', async () => {
