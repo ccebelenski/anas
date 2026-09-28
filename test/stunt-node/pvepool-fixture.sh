@@ -91,7 +91,9 @@ ensure_pool() {
   local loop
   loop=$($SSH_CMD "losetup -f --show ${img}")
   $SSH_CMD "echo ${loop} > ${marker}"
-  $SSH_CMD "zpool create -o cachefile=none -O mountpoint=/${pool} ${pool} ${loop}"
+  # autotrim=on: the image is sparse, and every write the guest does grows it;
+  # trim holes the backing file back out (0.4.1 retrospective fixture gap).
+  $SSH_CMD "zpool create -o cachefile=none -o autotrim=on -O mountpoint=/${pool} ${pool} ${loop}"
   echo "✓ pool ${pool} created on ${loop}"
 }
 

@@ -21,6 +21,12 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run test:unit
+      # 0.4.0/0.4.1 retrospective ruling (c): tests build instants in UTC, and
+      # the daemon suite runs a second time under a large-offset non-UTC zone
+      # so a local-time construction fails in the pipeline, not on a user's
+      # clock. One extra step (a tz matrix would rerun build + every other
+      # suite with it); the daemon suite alone is a few minutes.
+      - run: TZ=Pacific/Kiritimati npm run test:unit:daemon
 
   # Blocking since 0 findings repo-wide (2026-08-17) — red lint means something.
   lint:

@@ -171,7 +171,7 @@ truncate -s 1G   ${FILES_DIR}/data0.img
 truncate -s 256M ${FILES_DIR}/log0.img
 truncate -s 256M ${FILES_DIR}/cache0.img
 truncate -s 256M ${FILES_DIR}/spare0.img
-zpool create -f ${POOL} \\
+zpool create -f -o autotrim=on ${POOL} \\
   "${FILES_DIR}/data0.img" \\
   log "${FILES_DIR}/log0.img" \\
   cache "${FILES_DIR}/cache0.img" \\
@@ -209,7 +209,7 @@ sgdisk -Z "\$D"
 sgdisk -n1:0:+200M -n2:0:+200M -n3:0:+400M "\$D"
 udevadm settle
 P="/dev/disk/by-id/${BY_ID}"
-zpool create -f ${POOL} "${FILES_DIR}/data0.img" log mirror "\${P}-part1" "\${P}-part2" cache "\${P}-part3"
+zpool create -f -o autotrim=on ${POOL} "${FILES_DIR}/data0.img" log mirror "\${P}-part1" "\${P}-part2" cache "\${P}-part3"
 REMOTE
   echo "✓ ${POOL} created (file data root + mirrored log on two partitions of ${BY_ID} + a disk cache)"
 }
@@ -270,7 +270,7 @@ dmsetup create ${DM_NAME} --table "0 \${SIZE} linear \${LOOP} 0"
 # — a reboot must still be able to restore the pool's I/O.
 echo "0 \${SIZE} linear \${LOOP} 0" > ${FILES_DIR}/${DM_NAME}.table
 echo "0 \${SIZE} error" > ${FILES_DIR}/${DM_NAME}.error-table
-zpool create -f ${POOL} /dev/mapper/${DM_NAME}
+zpool create -f -o autotrim=on ${POOL} /dev/mapper/${DM_NAME}
 zfs create ${POOL}/fs
 # Swap the table to error and force reads: every I/O now fails and the pool
 # suspends exactly the way a yanked disk does (story 3.16). Suspend before the

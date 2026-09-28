@@ -113,6 +113,13 @@ Restores the baseline snapshot, deploys current code, and runs Playwright.
 
 ## Cleanup
 
+### File-backed pool images
+
+The baseline pools `gtbackup`/`gtiscsi` live on sparse images under /var/tmp that grow with
+every write and never shrink on their own — after heavy specs (backup-cancel writes 3 GiB
+per run), reclaim with `./test/stunt-node/cloud-tasks-fixture.sh trim` (its `down` does the
+same).
+
 ```bash
 # Delete VM and all disk images
 ./test/stunt-node/destroy-vm.sh

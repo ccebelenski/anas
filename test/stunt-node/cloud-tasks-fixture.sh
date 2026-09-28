@@ -65,10 +65,12 @@ source "${SCRIPT_DIR}/config.sh"
 #                       server, no credentials and no network at all.
 #
 # `down` reverses all of it — the units the spec may have leaked included (only
-# the fixture's OWN task names, never a foreign anas-cloud unit) — and then runs
+# the fixture's OWN task names, never a foreign anas-cloud unit) — and then
+# trims the file-backed pools (see trim_pools below) and runs
 # `cloud-fixture.sh down`, which restores the store's pre-state and removes the
 # user. Idempotent in both directions; the pool `gtbackup` itself, its siblings
-# and `gtiscsi` are never touched.
+# and `gtiscsi` are never DESTROYED — their sparse backing images are only
+# trimmed back down (a `trim` verb does the same on demand).
 
 POOL="gtbackup"
 SRC_DS="${POOL}/cloudsrc"
@@ -103,7 +105,8 @@ TASKS=(gtcopy gtsync gtempty gtemptycopy gtunmounted gtfail pictures-offsite syn
 usage() {
   echo "Usage: cloud-tasks-fixture.sh <up|down|status>"
   echo "  up      cloud-fixture.sh up + ${SRC_DS} (a.bin/b.bin/sub/c.txt) with the empty child ${NESTED_DS}, ${EMPTY_DS}, a clean ${DST_DIR} and ${UI_DST_DIR}, and the unmounted ${UNMOUNTED_DIR} / ${GUARDOK_DIR} fstab entries"
-  echo "  down    Remove the fixture's task units, the fstab entries and mountpoints, both datasets, then cloud-fixture.sh down"
+  echo "  down    Remove the fixture's task units, the fstab entries and mountpoints, both datasets, trim the file-backed pools, then cloud-fixture.sh down"
+  echo "  trim    zpool trim (waited) + autotrim=on on the file-backed pools gtbackup/gtiscsi — their sparse images grow with every write"
   echo "  status  Datasets and their content, the sftp-side tree, the fstab entries, any anas-cloud units"
   exit 1
 }
@@ -111,6 +114,28 @@ usage() {
 [ $# -eq 1 ] || usage
 
 ds_exists() { $SSH_CMD "zfs list -H $1" >/dev/null 2>&1; }
+
+# The file-backed pools' sparse backing images (gtbackup.img, gtiscsi.img under
+# /var/tmp) grow with every write and never shrink on their own — they filled
+# the node's root filesystem twice in the 0.4 cycle, a manual zpool trim
+# reclaiming 5.5 G (0.4.1 retrospective fixture gap). autotrim=on is set first
+# so later writes reclaim as they go, then `zpool trim -w` holes the freed
+# blocks back out of the images and WAITS. The heavy writer is
+# backup-cancel.spec.ts (3 GiB of fresh urandom into gtbackup/gtbackcancel per
+# run), which is why down runs this too — but never fails the teardown on it.
+trim_pools() {
+  for p in gtbackup gtiscsi; do
+    if ! $SSH_CMD "zpool list -H ${p}" >/dev/null 2>&1; then
+      echo "✓ pool ${p} not present (skipping)"
+      continue
+    fi
+    if $SSH_CMD "zpool set autotrim=on ${p} && zpool trim -w ${p}"; then
+      echo "✓ ${p} trimmed (autotrim=on set; zpool trim -w waited for it)"
+    else
+      echo "⚠ ${p} trim failed — the sparse image keeps its size" >&2
+    fi
+  done
+}
 
 status() {
   echo "--- source dataset ---"
@@ -300,8 +325,17 @@ case "$1" in
       fi
     done
 
+    # The destroyed datasets left freed blocks behind in gtbackup's sparse
+    # image; hole it (and gtiscsi) back out before anything else runs.
+    trim_pools
+
     echo
     "${SCRIPT_DIR}/cloud-fixture.sh" down
+    ;;
+
+  trim)
+    echo "=== cloud tasks fixture — trim (file-backed pools) ==="
+    trim_pools
     ;;
 
   status)
