@@ -243,8 +243,9 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       // per dataset. The other schedules come from the unit files (the store)
       // so a dataset another enabled schedule covers is judged by its policy
       // too. The read says whether it is COMPLETE: a partial list (unlistable
-      // dir, unreadable or unparseable unit) destroys nothing on excluded
-      // datasets. A refused destroy on a PVE-owned excluded dataset is noted.
+      // dir, unreadable or unparseable unit) prunes the target only — nothing
+      // is destroyed on swept children or excluded datasets that run. A
+      // refused destroy on a PVE-owned excluded dataset is noted.
       const footprint = pve
       const target = schedule.target.dataset
       const prune = await pruneRecursiveSchedule(executor, schedule, {

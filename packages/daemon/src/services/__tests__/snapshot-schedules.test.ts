@@ -565,7 +565,7 @@ describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
     assert.deepEqual(byDs(flat, 'tank/projects/a')!.prune.map(s => s.name).sort(), [H1, H2, H3])
   })
 
-  it('an INCOMPLETE schedule list destroys nothing on excluded datasets; the target and sweep still prune', () => {
+  it('an INCOMPLETE schedule list destroys nothing on excluded datasets; the target still prunes', () => {
     // tank/backup also carries a held one: nothing is destroyed or reported held there.
     const stdout = tree(['tank', 'tank/media', 'tank/backup', 'tank/backup/pc1'], [row('tank/backup', 'anas-hourly-2026-07-26T090000Z', 777, 1)])
     const plans = plan(stdout, sched({ exclude: ['tank/backup'] }), [], [], false)
@@ -577,13 +577,29 @@ describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
     assert.deepEqual(pc1.prune, [])
     assert.equal(pc1.note, '3 left: schedule list unreadable')
     assert.deepEqual(byDs(plans, 'tank')!.prune.map(s => s.name).sort(), [H1, H2])
-    assert.deepEqual(byDs(plans, 'tank/media')!.prune.map(s => s.name).sort(), [H1, H2])
     // Even when the readable part of the list names a covering schedule, the
     // excluded dataset gets the same fail-safe note.
     const covering = sched({ id: 'hourly-backup', target: { kind: 'zfs', dataset: 'tank/backup' }, recursive: false })
     const partial = plan(stdout, sched({ exclude: ['tank/backup'] }), [covering], [], false)
     assert.equal(byDs(partial, 'tank/backup')!.note, '4 left: schedule list unreadable')
     assert.deepEqual(byDs(partial, 'tank/backup/pc1')!.prune, [])
+  })
+
+  it('an INCOMPLETE schedule list leaves swept children unpruned for the run; the target still prunes', () => {
+    // tank/media is over retention (3 vs hourly:1) and a held one sits on tank/media/raw.
+    const stdout = tree(['tank', 'tank/media'], [row('tank/media/raw', H1, 100, 1), row('tank/media/raw', H2, 200), row('tank/media/raw', H3, 300)])
+    const plans = plan(stdout, sched(), [], [], false)
+    for (const ds of ['tank/media', 'tank/media/raw']) {
+      const p = byDs(plans, ds)!
+      assert.equal(p.scope, 'sweep', ds)
+      assert.deepEqual(p.prune, [], ds)
+      assert.deepEqual(p.skippedHeld, [], ds)
+      assert.equal(p.note, '3 left: schedule list unreadable', ds)
+    }
+    assert.deepEqual(byDs(plans, 'tank')!.prune.map(s => s.name).sort(), [H1, H2])
+    // The same tree on a complete list converges the children.
+    const whole = plan(stdout, sched(), [], [], true)
+    assert.deepEqual(byDs(whole, 'tank/media')!.prune.map(s => s.name).sort(), [H1, H2])
   })
 
   it('a creation-time mismatch leaves the snapshot (same name and txg is not enough)', () => {

@@ -273,7 +273,9 @@ export async function pruneSnapshots(
 //                schedule must never prune), keeping the MOST GENEROUS count
 //                any enabled schedule covering that dataset with the same
 //                bucket asks for — never more aggressive than any of them,
-//                whichever fires first.
+//                whichever fires first. That count cannot be known from a
+//                partial schedule list, so when the list could not be read
+//                whole, swept children are not pruned on that run (noted).
 //   - excluded — a dataset under the target outside the sweep: snapshots this
 //                schedule took before the exclude are out of its scope and
 //                are destroyed outright — but only those it provably took
@@ -360,8 +362,9 @@ export interface RecursivePruneInput {
   inventory: Map<string, TreeSnapshot[]>
   /**
    * Every schedule on the node (read from the unit files; the fired one is
-   * skipped by id), and whether that read was COMPLETE. When it was not, no
-   * snapshot on an excluded dataset is destroyed.
+   * skipped by id), and whether that read was COMPLETE. When it was not, only
+   * the target is pruned: no snapshot on a swept child or an excluded dataset
+   * is destroyed.
    */
   others: ScheduleListRead
   /** PVE ownership of a dataset — marks the plan so a refused destroy is non-fatal. */
@@ -429,6 +432,12 @@ export function planRecursivePrune(input: RecursivePruneInput): DatasetPrunePlan
       continue
 
     if (inSweep(schedule, dataset)) {
+      // The most generous count below is unknowable on a partial list (the
+      // unread unit may ask for more): leave the child for this run.
+      if (!listComplete) {
+        plans.push({ dataset, scope: 'sweep', prune: [], skippedHeld: [], note: `${mine.length} left: schedule list unreadable` })
+        continue
+      }
       // The most generous same-bucket count among the enabled schedules
       // covering this dataset (this one included).
       let keep = schedule.retention[bucket] ?? 0

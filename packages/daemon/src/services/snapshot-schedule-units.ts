@@ -167,8 +167,9 @@ export interface ScheduleListRead {
 
 /**
  * Read every schedule and say whether the list is whole (snapprune.1 review).
- * A destroy decision that rests on "no other schedule covers this dataset"
- * must not be made on a partial list — the recursive prune checks `complete`.
+ * A destroy decision that rests on what other schedules say (who covers a
+ * dataset, the most generous count) must not be made on a partial list — the
+ * recursive prune checks `complete` and prunes only the target when it is false.
  * The skipped files still get their stderr note.
  */
 export async function readScheduleList(dir: string): Promise<ScheduleListRead> {

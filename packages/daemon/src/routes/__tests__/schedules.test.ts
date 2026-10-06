@@ -907,7 +907,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       }
     })
 
-    it('snapprune.1 review: an unreadable schedule unit makes the list incomplete — excluded datasets are left untouched, with the note', async () => {
+    it('snapprune.1 review: an unreadable schedule unit makes the list incomplete — swept and excluded datasets are left untouched, with the note', async () => {
       const { restore } = await storageCfg(null)
       try {
         armTree('testpool/x\ntestpool/x/data\ntestpool/x/media\n')
@@ -935,10 +935,11 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
         assert.equal(done.status, 'completed', JSON.stringify(done.error))
         const result = done.result as { pruned: string[], datasets: { dataset: string, scope: string, pruned: number, held: number, note?: string }[] }
         assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x/media'), { dataset: 'testpool/x/media', scope: 'excluded', pruned: 0, held: 0, note: '2 left: schedule list unreadable' })
-        // The target and the swept child are pruned as before.
-        assert.deepEqual(result.pruned.sort(), [D1, `testpool/x/data@${D1}`].sort())
+        assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x/data'), { dataset: 'testpool/x/data', scope: 'sweep', pruned: 0, held: 0, note: '2 left: schedule list unreadable' })
+        // Only the target is pruned that run.
+        assert.deepEqual(result.pruned, [D1])
         const destroys = mock.calls.filter(c => c.command === ZFS && c.args[0] === 'destroy').map(c => c.args.join(' '))
-        assert.deepEqual(destroys.sort(), [`destroy testpool/x/data@${D1}`, `destroy testpool/x@${D1}`].sort())
+        assert.deepEqual(destroys, [`destroy testpool/x@${D1}`])
       }
       finally {
         await restore()
