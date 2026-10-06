@@ -128,7 +128,9 @@ describe('cloud remotes routes (rclone.1)', () => {
 
   afterEach(async () => {
     await server.close()
-    await rm(dir, { recursive: true, force: true })
+    // A route's job can still be writing into the dir when the test resolves
+    // (seen as ENOTEMPTY on CI and locally); rm retries on ENOTEMPTY/EBUSY.
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined)
         delete process.env[k]
@@ -540,6 +542,9 @@ password = mock-obscured
         }
         else {
           assert.equal(res.statusCode, 202, c.name)
+          // The accepted write runs as a job; let it finish before the next
+          // vector (and before afterEach removes the dir under it).
+          await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
         }
       }
     })
@@ -561,6 +566,7 @@ password = mock-obscured
         }
         else {
           assert.equal(res.statusCode, 202, c.name)
+          await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
         }
       }
     })
@@ -793,7 +799,7 @@ password = mock-obscured
     afterEach(async () => {
       await app.close()
       if (bareDir)
-        await rm(bareDir, { recursive: true, force: true })
+        await rm(bareDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
     })
 
     it('the mutation, test and PREVIEW doors consult the availability probe → 503 with the install sentence', async () => {
