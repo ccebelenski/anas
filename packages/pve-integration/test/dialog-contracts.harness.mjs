@@ -14559,6 +14559,123 @@ warnings.length = 0
 created.windows.length = 0
 ahrCacheDisksChecks()
 
+// ============================================================================
+//  The REAL ANAS.confirmAndRun (10-api.js): a confirmed resend that answers 409
+//  with a FRESH code — IDENTITY_MISMATCH (ident.1: the object changed between
+//  the challenge and the resend) or a stale CONFIRMATION_REQUIRED — re-prompts
+//  with the daemon's new message instead of failing, at most twice.
+// ============================================================================
+
+async function confirmRepromptChecks() {
+  /** Load 10-api.js into its own sandbox; the daemon answers from `answers` in order. */
+  function load(answers) {
+    const sent = []
+    const completed = []
+    const failed = []
+    const win = {}
+    win.ANAS = {
+      t: s => s,
+      enc: s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+      warn() {},
+      toast() {},
+      errText: e => String((e && e.message) || e),
+    }
+    const sandbox = { window: win, Ext, console, Promise, setTimeout: (fn) => { fn(); return 1 }, clearTimeout: () => {} }
+    vm.runInNewContext(readFileSync(join(SRC, '10-api.js'), 'utf8'), sandbox, { filename: '10-api.js' })
+    const A = win.ANAS
+    A.api.del = (_node, path, opts) => {
+      sent.push({ path, confirmCode: (opts && opts.confirmCode) || null })
+      const next = answers.shift()
+      if (!next) { return Promise.resolve({ job: { id: 'job-1' } }) }
+      const e = new Error(next.message)
+      e.status = 409
+      e.confirmCode = next.code || null
+      e.body = { error: { code: next.errCode, message: next.message, warnings: next.warnings || [] } }
+      return Promise.reject(e)
+    }
+    A.api.get = () => Promise.resolve({ job: { id: 'job-1', status: 'completed' } })
+    const run = () => A.confirmAndRun({
+      node: 'pve',
+      method: 'del',
+      path: '/pools/tank',
+      confirmTitle: 'Destroy pool',
+      confirmIntro: 'Destroy pool tank?',
+      onComplete: (job) => { completed.push(job) },
+      onFailed: (job) => { failed.push(job) },
+    })
+    return { sent, completed, failed, run }
+  }
+  const MISMATCH = "Pool 'tank' changed since you confirmed (guid 111 then, guid 222 now)"
+
+  // 1. challenge → yes → IDENTITY_MISMATCH with a fresh code → re-prompt naming both ids → yes → accepted.
+  confirms.length = 0
+  alerts.length = 0
+  confirmAnswer = 'yes'
+  let h = load([
+    { errCode: 'CONFIRMATION_REQUIRED', code: 'C1', message: 'Destroy?', warnings: ['All data on tank is lost.'] },
+    { errCode: 'IDENTITY_MISMATCH', code: 'C2', message: MISMATCH, warnings: [`${MISMATCH}. Confirm again only if this is the one you mean.`] },
+  ])
+  h.run()
+  await settle()
+  eq('confirm re-prompt: the resends carry the first code, then the FRESH one', h.sent.map(x => x.confirmCode), [null, 'C1', 'C2'])
+  ok('confirm re-prompt: two prompts — the challenge, then the identity mismatch', confirms.length === 2, JSON.stringify(confirms))
+  ok('confirm re-prompt: the first prompt leads with the caller\'s intro', confirms[0] && confirms[0].msg.startsWith('Destroy pool tank?'))
+  ok('confirm re-prompt: the re-prompt leads with the daemon\'s sentence naming both ids', confirms[1] && confirms[1].msg.startsWith(MISMATCH) && /guid 111/.test(confirms[1].msg) && /guid 222/.test(confirms[1].msg), confirms[1] && confirms[1].msg)
+  ok('confirm re-prompt: no failure alert, the job completes', alerts.length === 0 && h.completed.length === 1 && h.failed.length === 0, JSON.stringify(alerts))
+
+  // 2. "No" on the re-prompt: nothing more is sent, no alert.
+  confirms.length = 0
+  alerts.length = 0
+  h = load([
+    { errCode: 'CONFIRMATION_REQUIRED', code: 'C1', message: 'Destroy?' },
+    { errCode: 'IDENTITY_MISMATCH', code: 'C2', message: MISMATCH },
+  ])
+  let answersGiven = 0
+  const realConfirm = Ext.Msg.confirm
+  Ext.Msg.confirm = (title, msg, fn) => { confirms.push({ title, msg }); answersGiven++; fn(answersGiven === 1 ? 'yes' : 'no') }
+  try {
+    h.run()
+    await settle()
+  }
+  finally {
+    Ext.Msg.confirm = realConfirm
+  }
+  eq('confirm re-prompt: "No" on the re-prompt sends nothing more', h.sent.map(x => x.confirmCode), [null, 'C1'])
+  ok('confirm re-prompt: "No" raises no alert', alerts.length === 0)
+
+  // 3. A daemon that keeps answering with fresh codes: capped at 2 re-prompts, then the failure alert.
+  confirms.length = 0
+  alerts.length = 0
+  h = load([
+    { errCode: 'CONFIRMATION_REQUIRED', code: 'C1', message: 'Destroy?' },
+    { errCode: 'IDENTITY_MISMATCH', code: 'C2', message: MISMATCH },
+    { errCode: 'IDENTITY_MISMATCH', code: 'C3', message: MISMATCH },
+    { errCode: 'IDENTITY_MISMATCH', code: 'C4', message: MISMATCH },
+    { errCode: 'IDENTITY_MISMATCH', code: 'C5', message: MISMATCH },
+  ])
+  h.run()
+  await settle()
+  ok('confirm re-prompt: capped — the challenge plus two re-prompts', confirms.length === 3, String(confirms.length))
+  eq('confirm re-prompt: capped — four requests, never a fifth', h.sent.map(x => x.confirmCode), [null, 'C1', 'C2', 'C3'])
+  ok('confirm re-prompt: past the cap the failure alert shows the daemon\'s sentence', alerts.length === 1 && alerts[0].msg === MISMATCH && h.failed.length === 1, JSON.stringify(alerts))
+
+  // 4. A resend refused for another reason (no fresh-code question): the failure alert, no re-prompt.
+  confirms.length = 0
+  alerts.length = 0
+  h = load([
+    { errCode: 'CONFIRMATION_REQUIRED', code: 'C1', message: 'Destroy?' },
+    { errCode: 'IN_USE', code: 'C9', message: 'Pool tank is in use by share media' },
+  ])
+  h.run()
+  await settle()
+  ok('confirm re-prompt: another 409 on the resend is a failure, not a question', confirms.length === 1 && alerts.length === 1 && /in use/.test(alerts[0].msg), JSON.stringify({ confirms, alerts }))
+  confirms.length = 0
+  alerts.length = 0
+}
+
+warnings.length = 0
+await confirmRepromptChecks()
+
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)
   for (const f of failures) { console.error(`  • ${f}`) }

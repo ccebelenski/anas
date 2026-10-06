@@ -406,6 +406,34 @@ describe('destroy cleanup: labelclear + ownership-guarded GPT zap (story 3.14)',
     assert.equal(again.statusCode, 202)
   })
 
+  it('ident.1 (l) the pool guid cannot be read at the gate → 409 CONFLICT, no confirm code, nothing destroyed', async () => {
+    const status = statusJson('blindpool', [{ name: 'ata-B-part1', path: `${BY_ID}ata-B-part1` }])
+    const ex = baseExecutor('blindpool', status, byIdListing([]), [{ stdout: '', stderr: 'cannot open \'blindpool\': I/O error', exitCode: 1 }])
+    const built = await build(ex)
+    server = built.server
+    const res = await server.inject({ method: 'DELETE', url: '/v1/pools/blindpool', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 409)
+    const body = res.json() as { error: { code: string, message: string } }
+    assert.equal(body.error.code, 'CONFLICT')
+    assert.match(body.error.message, /Could not read the guid of pool 'blindpool' — refusing a destroy that cannot be bound to it/)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no code: nothing to confirm against')
+    assert.equal(ex.calls.find(c => c.args[0] === 'destroy'), undefined)
+  })
+
+  it('ident.1 (m) the guid cannot be read when the job runs → the job fails IDENTITY_MISMATCH (unreadable) and destroys nothing', async () => {
+    const status = statusJson('fadepool', [{ name: 'ata-F-part1', path: `${BY_ID}ata-F-part1` }])
+    const ex = baseExecutor('fadepool', status, byIdListing([]), [
+      { stdout: '555\n', stderr: '', exitCode: 0 },
+      { stdout: '555\n', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'cannot open \'fadepool\': no such pool', exitCode: 1 },
+    ])
+    const job = await run(ex, 'fadepool')
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'IDENTITY_MISMATCH')
+    assert.match(job.error?.message ?? '', /\(guid 555 at the confirmation, unreadable now\)/)
+    assert.equal(ex.calls.find(c => c.args[0] === 'destroy' || c.args[0] === 'labelclear'), undefined)
+  })
+
   it('ident.1 (k) the guid changed while the job was queued → the job fails IDENTITY_MISMATCH and destroys nothing', async () => {
     const status = statusJson('queuedpool', [{ name: 'ata-Q-part1', path: `${BY_ID}ata-Q-part1` }])
     const ex = baseExecutor('queuedpool', status, byIdListing([]), [

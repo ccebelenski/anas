@@ -249,7 +249,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       // the run is what refuses. Fail-open comes from the helper itself.
       const guard = await readSourceGuardFacts(executor, fstabPath)
       return scans.map((scan) => {
-        const unmounted = unmountedMountFor(scan.path, guard)
+        // A "ZFS facts could not be read" verdict is a transient read failure,
+        // not a fact about this path: the save-time warning stays silent on it
+        // and the run (which reads the facts again) is the gate.
+        const verdict = unmountedMountFor(scan.path, guard)
+        const unmounted = verdict?.zfsFactsUnavailable ? null : verdict
         return {
           ...scan,
           consistency: deriveConsistency(scan.path, facts),

@@ -47,6 +47,21 @@ interface BaseLevels {
 /** Whitespace splitter for `stat` output (owner group mode). */
 const WHITESPACE_RE = /\s+/
 
+/** `zfs list` stderr when the named dataset (or its pool) is not there. */
+const DATASET_ABSENT_RE = /dataset does not exist/i
+
+/**
+ * A wildcard path whose reading (dataset or snapshot sub-route) could not be
+ * decided because the `zfs list` that decides it failed for a reason other
+ * than "does not exist" (story ident.1 review, audit #12).
+ */
+class PathUnresolvedError extends Error {
+  constructor(full: string, detail: string) {
+    super(`Could not resolve the path '${full}': reading it from ZFS failed (${detail}). Nothing was done; retry once ZFS answers.`)
+    this.name = 'PathUnresolvedError'
+  }
+}
+
 /**
  * Build the `zfs create` argument array from a validated request — for a
  * filesystem OR a volume. A volume is a dataset of another type, not another
@@ -527,6 +542,11 @@ export async function datasetRoutes(
    * filesystem or volume? Asked only when the path carries a reserved
    * sub-resource segment (`snapshots`, `access`, `permissions`) unless
    * `always` — elsewhere there is nothing ambiguous to resolve.
+   *
+   * "No" is only ever ZFS's own answer (`dataset does not exist`). Any other
+   * failed read throws {@link PathUnresolvedError}: reading a failed lookup as
+   * "not a dataset" would route DELETE `tank/snapshots/old` to the snapshot
+   * destroy of `tank@old`, unconfirmed.
    */
   async function namesExistingDataset(poolName: string, path: string, always = false): Promise<boolean> {
     if (!path || (!always && reservedDatasetSegment(path) === null))
@@ -535,7 +555,27 @@ export async function datasetRoutes(
       return false
     const full = `${poolName}/${path}`
     const r = await executor.exec(ZFS, ['list', '-H', '-o', 'name', '-t', 'filesystem,volume', full])
-    return r.exitCode === 0 && r.stdout.trim() === full
+    if (r.exitCode === 0)
+      return r.stdout.trim() === full
+    if (DATASET_ABSENT_RE.test(r.stderr))
+      return false
+    throw new PathUnresolvedError(full, r.stderr.trim() || `exit ${r.exitCode}`)
+  }
+
+  /**
+   * Run a path resolution; a {@link PathUnresolvedError} answers 503 and the
+   * request goes no further (never a guess at which resource the path names).
+   */
+  async function resolveOrRefuse<T>(reply: FastifyReply, fn: () => Promise<T>): Promise<{ ok: true, value: T } | { ok: false, body: { error: { code: string, message: string } } }> {
+    try {
+      return { ok: true, value: await fn() }
+    }
+    catch (err) {
+      if (!(err instanceof PathUnresolvedError))
+        throw err
+      reply.code(503)
+      return { ok: false, body: { error: { code: 'UNAVAILABLE', message: err.message } } }
+    }
   }
 
   /**
@@ -945,7 +985,10 @@ export async function datasetRoutes(
 
     // ident.1: a path naming an existing dataset is that dataset, whatever
     // reserved segment it carries.
-    const isDataset = await namesExistingDataset(poolName, path)
+    const isDatasetRead = await resolveOrRefuse(reply, () => namesExistingDataset(poolName, path))
+    if (!isDatasetRead.ok)
+      return isDatasetRead.body
+    const isDataset = isDatasetRead.value
 
     // Access sub-resource: `<dataset>/access` (layered permissions editor).
     if (!isDataset && (path === 'access' || path.endsWith(ACCESS_SUFFIX))) {
@@ -954,7 +997,10 @@ export async function datasetRoutes(
     }
 
     // Snapshot sub-resource: `<dataset>/snapshots[/<snap>]`.
-    const tail = isDataset ? null : await resolveSnapshotTail(poolName, path)
+    const tailRead = isDataset ? { ok: true as const, value: null } : await resolveOrRefuse(reply, () => resolveSnapshotTail(poolName, path))
+    if (!tailRead.ok)
+      return tailRead.body
+    const tail = tailRead.value
     if (tail) {
       if (tail.extra) {
         reply.code(404)
@@ -1106,7 +1152,10 @@ export async function datasetRoutes(
       return replication.runReplication(poolName, dpath, request, reply)
     }
 
-    const tail = await resolveSnapshotTail(poolName, wildcard)
+    const tailRead = await resolveOrRefuse(reply, () => resolveSnapshotTail(poolName, wildcard))
+    if (!tailRead.ok)
+      return tailRead.body
+    const tail = tailRead.value
     if (!tail || tail.extra || (tail.snap && !tail.rollback && !tail.clone)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Unknown resource '${wildcard}'` } }
@@ -1138,11 +1187,17 @@ export async function datasetRoutes(
 
     // ident.1: a path naming an existing dataset is a property update of that
     // dataset, whatever reserved segment it carries.
-    if (await namesExistingDataset(poolName, wildcard))
+    const isDatasetRead = await resolveOrRefuse(reply, () => namesExistingDataset(poolName, wildcard))
+    if (!isDatasetRead.ok)
+      return isDatasetRead.body
+    if (isDatasetRead.value)
       return updateProperties(poolName, wildcard, request, reply)
 
     // Snapshot rename: `<dataset>/snapshots/<snap>`.
-    const tail = await resolveSnapshotTail(poolName, wildcard)
+    const tailRead = await resolveOrRefuse(reply, () => resolveSnapshotTail(poolName, wildcard))
+    if (!tailRead.ok)
+      return tailRead.body
+    const tail = tailRead.value
     if (tail) {
       if (!tail.snap || tail.rollback || tail.clone || tail.extra) {
         reply.code(404)
@@ -1748,7 +1803,10 @@ export async function datasetRoutes(
     // Snapshot destroy: `<dataset>/snapshots/<snap>` (plain 202, no confirm).
     // ident.1: unless the path names an existing dataset — then it is that
     // dataset's (confirm-gated) destroy, never a snapshot's.
-    const tail = await resolveSnapshotTail(poolName, request.params['*'])
+    const tailRead = await resolveOrRefuse(reply, () => resolveSnapshotTail(poolName, request.params['*']))
+    if (!tailRead.ok)
+      return tailRead.body
+    const tail = tailRead.value
     if (tail) {
       if (!tail.snap || tail.rollback || tail.clone || tail.extra) {
         reply.code(404)

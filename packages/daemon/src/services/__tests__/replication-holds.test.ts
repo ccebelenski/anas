@@ -155,11 +155,78 @@ describe('settleReplicationHolds', () => {
       target: { dataset: TGT_A, snapshotNames: ['s2', 's3'] },
       releaseLegacyOnSource: true,
     })
-    assert.equal(warnings.length, 1)
+    assert.equal(warnings.length, 2)
     assert.match(warnings[0], /Could not place .* hold on tank\/media@s3/)
+    assert.match(warnings[1], /Kept every hold on tank\/media/)
     assert.ok(!verbs(mock, 'release').includes(`${LEGACY_REPLICATION_HOLD_TAG} ${SRC}@s2`), 'source legacy hold kept')
     // The target's own hold succeeded, so the target migrates.
     assert.ok(verbs(mock, 'release').includes(`${LEGACY_REPLICATION_HOLD_TAG} ${TGT_A}@s2`))
+  })
+
+  it('a failed own hold on the new source base releases NOTHING on the source — the old base keeps this chain\'s tag', async () => {
+    const mock = wire({ failHold: `${TAG_A} ${SRC}@s3` })
+    // The previous base carries this chain's OWN tag (and the legacy one).
+    holdsFixture(mock, srcFulls, { [`${SRC}@s2`]: [TAG_A, LEGACY_REPLICATION_HOLD_TAG] })
+    holdsFixture(mock, [`${TGT_A}@s2`, `${TGT_A}@s3`], { [`${TGT_A}@s2`]: [TAG_A] })
+    okZfs(mock)
+    const warnings = await settleReplicationHolds({ executor: mock, transport: NO_TRANSPORT }, {
+      tag: TAG_A,
+      snapName: 's3',
+      baseSnapshot: 's2',
+      source: { dataset: SRC, snapshotNames: srcNames },
+      target: { dataset: TGT_A, snapshotNames: ['s2', 's3'] },
+      releaseLegacyOnSource: true,
+    })
+    assert.deepEqual(verbs(mock, 'release').filter(v => v.endsWith(`${SRC}@s2`)), [], 'no release of any tag on the source')
+    assert.ok(warnings.some(w => /Kept every hold on tank\/media:/.test(w)), 'the run says why')
+    // The target side held its new base, so it moves on as usual.
+    assert.deepEqual(verbs(mock, 'release'), [`${TAG_A} ${TGT_A}@s2`])
+  })
+
+  it('a failed own hold on the new target base releases NOTHING on the target', async () => {
+    const mock = wire({ failHold: `${TAG_A} ${TGT_A}@s3` })
+    holdsFixture(mock, srcFulls, { [`${SRC}@s2`]: [TAG_A] })
+    holdsFixture(mock, [`${TGT_A}@s2`, `${TGT_A}@s3`], { [`${TGT_A}@s2`]: [TAG_A, LEGACY_REPLICATION_HOLD_TAG] })
+    okZfs(mock)
+    const warnings = await settleReplicationHolds({ executor: mock, transport: NO_TRANSPORT }, {
+      tag: TAG_A,
+      snapName: 's3',
+      baseSnapshot: 's2',
+      source: { dataset: SRC, snapshotNames: srcNames },
+      target: { dataset: TGT_A, snapshotNames: ['s2', 's3'] },
+      releaseLegacyOnSource: true,
+    })
+    assert.deepEqual(verbs(mock, 'release'), [`${TAG_A} ${SRC}@s2`], 'only the source (held) side releases')
+    assert.ok(warnings.some(w => /Kept every hold on backup\/media-a:/.test(w)))
+  })
+
+  it('a failed remote target hold releases nothing over the transport', async () => {
+    const mock = wire()
+    holdsFixture(mock, srcFulls, {})
+    okZfs(mock)
+    const remoteCalls: string[] = []
+    const transport = {
+      remoteHold: async (_r: ResolvedLocation, snap: string, tag: string) => {
+        remoteCalls.push(`hold ${tag} ${snap}`)
+        return { stdout: '', stderr: 'ssh: connection reset', exitCode: 255 }
+      },
+      remoteRelease: async (_r: ResolvedLocation, snap: string, tag: string) => {
+        remoteCalls.push(`release ${tag} ${snap}`)
+        return { stdout: '', stderr: '', exitCode: 0 }
+      },
+      remoteHeldTags: async () => [TAG_A, LEGACY_REPLICATION_HOLD_TAG],
+    } as unknown as Transport
+    const warnings = await settleReplicationHolds({ executor: mock, transport }, {
+      tag: TAG_A,
+      snapName: 's3',
+      baseSnapshot: 's2',
+      source: { dataset: SRC, snapshotNames: srcNames },
+      target: { dataset: TGT_A, snapshotNames: ['s2', 's3'] },
+      remote: {} as ResolvedLocation,
+      releaseLegacyOnSource: true,
+    })
+    assert.deepEqual(remoteCalls, [`hold ${TAG_A} ${TGT_A}@s3`])
+    assert.ok(warnings.some(w => /Kept every hold on backup\/media-a:/.test(w)))
   })
 
   it('a remote target settles over the transport with the same rules', async () => {
@@ -221,7 +288,23 @@ describe('legacyReleasableOnSource', () => {
   it('true when no other task replicates this source', async () => {
     await task('a', 'media-a')
     const mock = new MockExecutor()
-    assert.equal(await legacyReleasableOnSource(mock, { sourceFull: SRC, ownTag: TAG_A, sourceSnapshotNames: ['s1'], systemdDir: dir }), true)
+    assert.deepEqual(await legacyReleasableOnSource(mock, { sourceFull: SRC, ownTag: TAG_A, sourceSnapshotNames: ['s1'], systemdDir: dir }), { releasable: true })
+  })
+
+  it('an unreadable task store is never "no other tasks": keep the legacy hold, say why', async () => {
+    const mock = new MockExecutor()
+    const verdict = await legacyReleasableOnSource(mock, { sourceFull: SRC, ownTag: TAG_A, sourceSnapshotNames: ['s1'], systemdDir: join(dir, 'missing') })
+    assert.equal(verdict.releasable, false)
+    assert.match(verdict.warning ?? '', /Kept the legacy anas-repl hold on tank\/media: the replication task list could not be read in full/)
+    assert.equal(mock.calls.length, 0, 'no holds read — the verdict is already "keep"')
+  })
+
+  it('an unparseable task file makes the list incomplete: keep the legacy hold', async () => {
+    await task('a', 'media-a')
+    await writeFile(join(dir, 'anas-repl-b.service'), '[Unit]\nX-ANAS-Task=not json\n', 'utf-8')
+    const verdict = await legacyReleasableOnSource(new MockExecutor(), { sourceFull: SRC, ownTag: TAG_A, sourceSnapshotNames: ['s1'], systemdDir: dir })
+    assert.equal(verdict.releasable, false)
+    assert.ok(verdict.warning)
   })
 
   it('false while another task of the same source has not placed its own tag; true once it has', async () => {
@@ -229,10 +312,10 @@ describe('legacyReleasableOnSource', () => {
     await task('b', 'media-b')
     const mock = new MockExecutor()
     holdsFixture(mock, [`${SRC}@s1`, `${SRC}@s2`], { [`${SRC}@s1`]: [LEGACY_REPLICATION_HOLD_TAG] })
-    assert.equal(await legacyReleasableOnSource(mock, { sourceFull: SRC, ownTag: TAG_A, sourceSnapshotNames: ['s1', 's2'], systemdDir: dir }), false)
+    assert.deepEqual(await legacyReleasableOnSource(mock, { sourceFull: SRC, ownTag: TAG_A, sourceSnapshotNames: ['s1', 's2'], systemdDir: dir }), { releasable: false })
 
     const migrated = new MockExecutor()
     holdsFixture(migrated, [`${SRC}@s1`, `${SRC}@s2`], { [`${SRC}@s1`]: [LEGACY_REPLICATION_HOLD_TAG, TAG_B] })
-    assert.equal(await legacyReleasableOnSource(migrated, { sourceFull: SRC, ownTag: TAG_A, sourceSnapshotNames: ['s1', 's2'], systemdDir: dir }), true)
+    assert.deepEqual(await legacyReleasableOnSource(migrated, { sourceFull: SRC, ownTag: TAG_A, sourceSnapshotNames: ['s1', 's2'], systemdDir: dir }), { releasable: true })
   })
 })

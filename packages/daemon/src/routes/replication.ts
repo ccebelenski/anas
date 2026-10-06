@@ -434,21 +434,22 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           const targetNames = loc.isRemote
             ? await transport.remoteSnapshotNames(loc.resolved, targetFull)
             : (await listSnapshotsDetail(targetFull)).map(s => s.snapshotName)
-          const releaseLegacyOnSource = await legacyReleasableOnSource(executor, {
+          const legacy = await legacyReleasableOnSource(executor, {
             sourceFull: source,
             ownTag: holdTag,
             sourceSnapshotNames: sourceNames,
             ...(deps.systemdDir ? { systemdDir: deps.systemdDir } : {}),
           })
-          const warnings = await settleReplicationHolds({ executor, transport }, {
+          const holdWarnings = await settleReplicationHolds({ executor, transport }, {
             tag: holdTag,
             snapName,
             ...(d.baseSnapshot ? { baseSnapshot: d.baseSnapshot } : {}),
             source: { dataset: source, snapshotNames: sourceNames },
             target: { dataset: targetFull, snapshotNames: targetNames },
             ...(loc.isRemote ? { remote: loc.resolved } : {}),
-            releaseLegacyOnSource,
+            releaseLegacyOnSource: legacy.releasable,
           })
+          const warnings = legacy.warning ? [...holdWarnings, legacy.warning] : holdWarnings
 
           const result = {
             mode: d.mode,

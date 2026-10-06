@@ -1302,6 +1302,63 @@ describe('ident.1 — reserved segments, the router\'s dataset-first reading, an
     assert.equal(calls.find(c => c.args[0] === 'rollback'), undefined)
   })
 
+  it('DELETE <pool>/snapshots/old: ZFS says the dataset does not exist → the snapshot route (destroys <pool>@old)', async () => {
+    answers.set('list -H -o name -t filesystem,volume testpool/snapshots/old', [{ stdout: '', stderr: 'cannot open \'testpool/snapshots/old\': dataset does not exist\n', exitCode: 1 }])
+    const res = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/old', headers: IDENTITY_HEADERS })
+    // The snapshot route answered (the mock pool has no such snapshot).
+    assert.equal(res.statusCode, 404, res.body)
+    assert.match(res.json().error.message, /Snapshot 'testpool@old' not found/)
+  })
+
+  it('DELETE <pool>/snapshots/old: a FAILED lookup (not "does not exist") → 503, never the snapshot route', async () => {
+    answers.set('list -H -o name -t filesystem,volume testpool/snapshots/old', [{ stdout: '', stderr: 'internal error: Input/output error\n', exitCode: 1 }])
+    const res = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/old', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 503)
+    assert.equal(res.json().error.code, 'UNAVAILABLE')
+    assert.match(res.json().error.message, /Could not resolve the path 'testpool\/snapshots\/old'.*Input\/output error/)
+    assert.equal(calls.find(c => c.args[0] === 'destroy'), undefined, 'nothing destroyed')
+  })
+
+  it('GET/PUT/POST on a path whose lookup fails → 503, no fall-through', async () => {
+    const suspended: ExecResult = { stdout: '', stderr: 'pool I/O is currently suspended\n', exitCode: 1 }
+    answers.set('list -H -o name -t filesystem,volume testpool/snapshots/old', [suspended])
+    answers.set('list -H -o name -t filesystem,volume testpool/snapshots/old/rollback', [suspended])
+    const get = await server!.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/snapshots/old', headers: IDENTITY_HEADERS })
+    assert.equal(get.statusCode, 503, get.body)
+    const put = await server!.inject({
+      method: 'PUT',
+      url: '/v1/pools/testpool/datasets/snapshots/old',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'renamed' }),
+    })
+    assert.equal(put.statusCode, 503, put.body)
+    const post = await server!.inject({ method: 'POST', url: '/v1/pools/testpool/datasets/snapshots/old/rollback', headers: IDENTITY_HEADERS })
+    assert.equal(post.statusCode, 503, post.body)
+    assert.equal(calls.find(c => c.args[0] === 'rename' || c.args[0] === 'rollback'), undefined)
+  })
+
+  it('dataset destroy: the guid cannot be read at the gate → 409 CONFLICT, no confirm code, nothing destroyed', async () => {
+    answers.set(`get -H -o value guid ${LEGACY}`, [{ stdout: '', stderr: 'internal error: Input/output error', exitCode: 1 }])
+    const res = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.match(res.json().error.message, /Could not read the guid of dataset 'testpool\/snapshots\/x' — refusing a destroy that cannot be bound to it/)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    assert.equal(calls.find(c => c.args[0] === 'destroy'), undefined)
+  })
+
+  it('dataset destroy: the guid cannot be read when the job runs → job fails IDENTITY_MISMATCH (unreadable), nothing destroyed', async () => {
+    answers.set(`get -H -o value guid ${LEGACY}`, [ok('7\n'), ok('7\n'), { stdout: '', stderr: 'cannot open: dataset does not exist', exitCode: 1 }])
+    const first = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: IDENTITY_HEADERS })
+    const res = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'IDENTITY_MISMATCH')
+    assert.match(job.error?.message ?? '', /guid 7 at the confirmation, unreadable now/)
+    assert.equal(calls.find(c => c.args[0] === 'destroy'), undefined)
+  })
+
   it('dataset destroy: the guid changed while the job was queued → job fails IDENTITY_MISMATCH, nothing destroyed', async () => {
     answers.set(`get -H -o value guid ${LEGACY}`, [ok('1\n'), ok('1\n'), ok('2\n')])
     const first = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: IDENTITY_HEADERS })

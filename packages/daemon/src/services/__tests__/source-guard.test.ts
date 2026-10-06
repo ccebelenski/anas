@@ -217,6 +217,42 @@ describe('source guard — configured but unmounted (rclone.2)', () => {
       assert.deepEqual(buildSourceGuardFacts('', findmnt(['/']), zfs).configured, [])
     })
 
+    it('ZFS facts unavailable: a path BELOW a live ZFS mount is not provably mounted → refused, disclosed', () => {
+      const live = findmnt(['/', '/tank'], { '/': { source: '/dev/sda1', fstype: 'ext4' }, '/tank': { source: 'tank', fstype: 'zfs' } })
+      const facts = buildSourceGuardFacts('', live, null)
+      assert.equal(facts.zfsFactsUnavailable, true)
+      assert.deepEqual(unmountedMountFor('/tank/media/2026', facts), {
+        mountpoint: '/tank',
+        source: 'tank',
+        fstype: 'zfs',
+        origin: 'zfs',
+        zfsFactsUnavailable: true,
+      })
+      const msg = guardSourcePath('/tank/media', facts) ?? ''
+      assert.match(msg, /ZFS mount facts could not be read \(zfs list failed\)/)
+      assert.match(msg, /cannot be proved/)
+      // eslint-disable-next-line no-control-regex
+      assert.ok(!/[^\x00-\x7F]/.test(msg), 'ASCII only')
+      // AT the live ZFS mount: that dataset is mounted, provably.
+      assert.equal(unmountedMountFor('/tank', facts), null)
+      // Not on ZFS at all: judged as before.
+      assert.equal(unmountedMountFor('/srv/data', facts), null)
+      // A symlink into the ZFS mount is judged where it leads.
+      const linked = buildSourceGuardFacts('', live, null, new Map([['/srv/link', '/tank/media']]))
+      assert.equal(unmountedMountFor('/srv/link', linked)?.zfsFactsUnavailable, true)
+    })
+
+    it('ZFS facts READ (even empty) are not "unavailable": a plain path under a ZFS mount passes', () => {
+      const facts = buildSourceGuardFacts('', findmnt(['/', '/tank'], { '/tank': { source: 'tank', fstype: 'zfs' } }), '')
+      assert.equal(facts.zfsFactsUnavailable, false)
+      assert.equal(unmountedMountFor('/tank/media', facts), null)
+    })
+
+    it('an fstab refusal still names the fstab mount when ZFS facts are also unavailable', () => {
+      const facts = buildSourceGuardFacts(FSTAB, PICTURES_MISSING, null)
+      assert.deepEqual(unmountedMountFor('/mnt/pictures', facts), PICTURES_MOUNT)
+    })
+
     it('a symlinked source is judged where it leads, too', () => {
       const facts = buildSourceGuardFacts(FSTAB, PICTURES_MISSING, '', new Map([['/srv/pics', '/mnt/pictures/2026']]))
       assert.deepEqual(unmountedMountFor('/srv/pics', facts), PICTURES_MOUNT)
@@ -260,6 +296,15 @@ describe('source guard — configured but unmounted (rclone.2)', () => {
       const facts = await readSourceGuardFacts(mock, '/nonexistent/fstab', ['/srv/link'])
       assert.equal(facts.realpaths.get('/srv/link'), '/tank/media/x')
       assert.equal(unmountedMountFor('/srv/link', facts)?.source, 'tank/media')
+    })
+
+    it('a failed `zfs list` sets zfsFactsUnavailable (never a silent "no ZFS facts")', async () => {
+      const mock = new MockExecutor()
+      mock.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: findmnt(['/', '/tank'], { '/tank': { source: 'tank', fstype: 'zfs' } }), stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-p', '-t', 'filesystem', '-o', 'name,mountpoint,canmount,mounted'], result: { stdout: '', stderr: 'internal error: Input/output error', exitCode: 1 } })
+      const facts = await readSourceGuardFacts(mock, '/nonexistent/fstab', ['/tank/media'])
+      assert.equal(facts.zfsFactsUnavailable, true)
+      assert.match(guardSourcePath('/tank/media', facts) ?? '', /ZFS mount facts could not be read/)
     })
 
     it('a path that does not resolve (or a timeout) is judged as written', async () => {

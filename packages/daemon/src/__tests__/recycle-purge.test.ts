@@ -1,5 +1,7 @@
+import type { Stats } from 'node:fs'
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { lstat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
@@ -62,7 +64,7 @@ describe('purgeBin — the equivalent of find <bin> -type f -ctime +N -delete', 
     ageFile(join(bin, 'docs/deep/old.txt'), 40 * DAY)
     ageFile(join(bin, 'top-old.txt'), 40 * DAY)
 
-    const { removed, prunedDirs } = await purgeBin(bin, 30, { now: () => NOW, ageOf: mtimeAge })
+    const { removed, prunedDirs } = await purgeBin(dir, '#recycle', 30, { now: () => NOW, ageOf: mtimeAge })
     assert.equal(removed, 2)
     // Only `deep` emptied out: `docs` still holds the young file,
     // `young-stuff` never held an aged one — both stay.
@@ -200,6 +202,54 @@ describe('runRecyclePurge — the sweep over smb.conf', () => {
     assert.ok(logLines.some(l => /^anas-recycle: share=linked skipped \(#recycle is a symbolic link - not followed\)$/.test(l)), logLines.join('\n'))
   })
 
+  /**
+   * The bin swapped for a symlink to `victim` right AFTER the `nth` lstat of
+   * the bin path returns (1 = the runner's own check, 2 = purgeBin's re-check
+   * before the unlink loop). Real filesystem; only the lstat seam is wrapped.
+   */
+  function swapAfterBinLstat(mediaBin: string, victim: string, nth: number): { lstat: (p: string) => Promise<Stats> } {
+    let seen = 0
+    return {
+      lstat: async (p: string) => {
+        const stats = await lstat(p)
+        if (p === mediaBin && ++seen === nth) {
+          renameSync(mediaBin, `${mediaBin}.moved`)
+          symlinkSync(victim, mediaBin)
+        }
+        return stats
+      },
+    }
+  }
+
+  function victimTree(root: string): string {
+    const victim = join(root, 'victim')
+    mkdirSync(join(victim, 'sub'), { recursive: true })
+    writeFileSync(join(victim, 'precious.txt'), 'x')
+    writeFileSync(join(victim, 'sub/old.txt'), 'x')
+    ageFile(join(victim, 'precious.txt'), 400 * DAY)
+    ageFile(join(victim, 'sub/old.txt'), 400 * DAY)
+    return victim
+  }
+
+  it('a bin swapped for a symlink AFTER the runner\'s check is caught by the re-check before any unlink', async () => {
+    const { mediaBin } = setup('')
+    const victim = victimTree(dir)
+    const result = await runRecyclePurge({ ...opts, smbConfPath: confPath, fs: swapAfterBinLstat(mediaBin, victim, 1) })
+    assert.deepEqual(result, { purged: 0, skipped: 1, failed: 0 }, logLines.join('\n'))
+    assert.ok(existsSync(join(victim, 'precious.txt')) && existsSync(join(victim, 'sub/old.txt')), 'nothing behind the link touched')
+    assert.ok(logLines.some(l => /^anas-recycle: share=media skipped \(#recycle is a symbolic link - not followed\)$/.test(l)), logLines.join('\n'))
+  })
+
+  it('a bin swapped AFTER the re-check: containment is anchored at the share, so every file through the link is refused', async () => {
+    const { mediaBin } = setup('')
+    const victim = victimTree(dir)
+    const result = await runRecyclePurge({ ...opts, smbConfPath: confPath, fs: swapAfterBinLstat(mediaBin, victim, 2) })
+    assert.equal(result.purged, 1, logLines.join('\n'))
+    assert.ok(existsSync(join(victim, 'precious.txt')), 'past the re-check, the share anchor is what refuses the link')
+    assert.ok(existsSync(join(victim, 'sub/old.txt')))
+    assert.ok(logLines.some(l => /share=media removed=0 .*refused=/.test(l)), logLines.join('\n'))
+  })
+
   it('a repository that is not one directory name inside the share is skipped', async () => {
     setup('[escape]\n\tpath = /srv/x\n\trecycle:repository = ../../etc\n\t# anas:recycle-purge-days = 30\n')
     const result = await runRecyclePurge({ ...opts, smbConfPath: confPath })
@@ -235,13 +285,13 @@ describe('runRecyclePurge — the sweep over smb.conf', () => {
   it('purgeBin never walks a symlinked directory nested deep in the bin', async () => {
     // (The per-file realpath containment check is the backstop for a swap
     // between listing and unlink; the listing itself never descends a link.)
-    const { mediaBin } = setup('')
+    const { mediaBin, mediaPath } = setup('')
     const outside = join(dir, 'outside')
     mkdirSync(outside, { recursive: true })
     writeFileSync(join(outside, 'precious.txt'), 'x')
     ageFile(join(outside, 'precious.txt'), 400 * DAY)
     symlinkSync(outside, join(mediaBin, 'sub', 'escape'))
-    const r = await purgeBin(mediaBin, 30, { now: () => NOW, ageOf: mtimeAge })
+    const r = await purgeBin(mediaPath, '#recycle', 30, { now: () => NOW, ageOf: mtimeAge })
     assert.ok(existsSync(join(outside, 'precious.txt')))
     assert.equal(r.removed, 1, 'only the real aged file inside the bin')
   })

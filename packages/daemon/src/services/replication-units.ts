@@ -8,7 +8,7 @@ import { isTransientRunSnapshot } from './snapshot-naming.js'
 // The unit-store plumbing (marker regex, unlink, systemctl, unit-dir listing)
 // is the ONE shared copy in systemd-unit-store.ts — this store was its fourth
 // hand-copy and its last private leftovers (third pass).
-import { listServiceUnits, markerRegex, readUnitFile, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
+import { listServiceUnitsChecked, markerRegex, readUnitFile, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
 import { deriveUnitRunStatus, toSystemdRunResult } from './unit-run-status.js'
 
 /**
@@ -217,19 +217,33 @@ export function parseServiceUnit(content: string): ReplicationTask | null {
  *  dir yields an empty list.
  */
 export async function readAllTasks(dir: string): Promise<ReplicationTask[]> {
-  const services = await listServiceUnits(dir, UNIT_PREFIX)
+  return (await readAllTasksChecked(dir)).tasks
+}
+
+/**
+ * Every task, plus whether the store was read IN FULL (`complete: false` = the
+ * unit dir could not be listed, or a task file could not be read or parsed).
+ * A caller whose release decision depends on what the OTHER tasks are — the
+ * legacy hold migration — must not mistake "unreadable" for "no other task".
+ */
+export async function readAllTasksChecked(dir: string): Promise<{ tasks: ReplicationTask[], complete: boolean }> {
+  const listed = await listServiceUnitsChecked(dir, UNIT_PREFIX)
   const tasks: ReplicationTask[] = []
-  for (const file of services) {
+  let complete = listed.complete
+  for (const file of listed.files) {
     // Fail-open per file: an unreadable file skips with the same warning as an
     // unparseable one — never a broken read for the whole store.
     const content = await readUnitFile(dir, file)
     const task = content === null ? null : parseServiceUnit(content)
-    if (task)
+    if (task) {
       tasks.push(task)
-    else
+    }
+    else {
+      complete = false
       process.stderr.write(`[replication] skipping ${file}: no parseable X-ANAS-Task JSON\n`)
+    }
   }
-  return tasks
+  return { tasks, complete }
 }
 
 /** One task by name, or null if its service file is absent/invalid. */

@@ -141,15 +141,20 @@ describe('ident.1 — pool export binds the pool guid', () => {
     server = undefined
   })
 
-  function serveWithGuids(guids: string[]): { calls: string[][] } {
+  /** Successive guid reads; `null` = the read fails (`zpool get` exits 1). */
+  function serveWithGuids(guids: (string | null)[]): { calls: string[][] } {
     server = createServer({ mock: true, logger: false })
     const mock = (server as unknown as { executor: MockExecutor }).executor
     const orig = mock.exec.bind(mock)
     const calls: string[][] = []
     mock.exec = async (command: string, args: string[]) => {
       calls.push(args)
-      if (command === '/usr/sbin/zpool' && args.join(' ') === 'get -H -o value guid testpool')
-        return { stdout: `${guids.length > 1 ? guids.shift() : guids[0]}\n`, stderr: '', exitCode: 0 }
+      if (command === '/usr/sbin/zpool' && args.join(' ') === 'get -H -o value guid testpool') {
+        const guid = guids.length > 1 ? guids.shift() : guids[0]
+        return guid === null
+          ? { stdout: '', stderr: 'cannot open \'testpool\': I/O error', exitCode: 1 }
+          : { stdout: `${guid}\n`, stderr: '', exitCode: 0 }
+      }
       return orig(command, args)
     }
     return { calls }
@@ -170,6 +175,28 @@ describe('ident.1 — pool export binds the pool guid', () => {
     assert.equal(res.statusCode, 409)
     assert.equal(res.json().error.code, 'IDENTITY_MISMATCH')
     assert.match(res.json().error.message, /guid 10 at the confirmation, guid 20 now/)
+    assert.equal(calls.find(a => a[0] === 'export'), undefined)
+  })
+
+  it('the guid cannot be read at the gate → 409 CONFLICT, no confirm code, nothing exported', async () => {
+    const { calls } = serveWithGuids([null])
+    const res = await exportReq()
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.match(res.json().error.message, /Could not read the guid of pool 'testpool' — refusing an export that cannot be bound to it/)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    assert.equal(calls.find(a => a[0] === 'export'), undefined)
+  })
+
+  it('the guid cannot be read when the job runs → the job fails IDENTITY_MISMATCH and exports nothing', async () => {
+    const { calls } = serveWithGuids(['10', '10', null])
+    const first = await exportReq()
+    const res = await exportReq(first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'IDENTITY_MISMATCH')
+    assert.match(job.error?.message ?? '', /guid 10 at the confirmation, unreadable now/)
     assert.equal(calls.find(a => a[0] === 'export'), undefined)
   })
 

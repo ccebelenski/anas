@@ -200,14 +200,20 @@
                 opts.onConfirm(err);
                 return;
             }
-            if (opts.onFailed) { opts.onFailed(null); }
-            try {
-                Ext.Msg.alert(ANAS.t(opts.failTitle || 'Operation failed'), ANAS.errText(err));
-            } catch (e) {
-                ANAS.warn(ANAS.errText(err));
-            }
+            jobRejected(opts, err);
         });
     };
+
+    // A mutation the daemon refused outright: onFailed, then the failure alert
+    // carrying the daemon's own sentence.
+    function jobRejected(opts, err) {
+        if (opts.onFailed) { opts.onFailed(null); }
+        try {
+            Ext.Msg.alert(ANAS.t(opts.failTitle || 'Operation failed'), ANAS.errText(err));
+        } catch (e) {
+            ANAS.warn(ANAS.errText(err));
+        }
+    }
 
     ANAS.pollJob = function (node, jobId, opts) {
         var interval = 500;
@@ -310,8 +316,8 @@
     // primary button, and Cancel as the default (Enter = the safe choice for a
     // destructive op). On confirm, mapConfirm(win) may return
     // { pathSuffix, bodyPatch } folded into the resend.
-    function confirmWindow(opts, err) {
-        var intro = opts.confirmIntro || ANAS.t('This operation requires confirmation:');
+    function confirmWindow(opts, err, depth) {
+        var intro = confirmIntroFor(opts, err, depth);
         var items = [{
             xtype: 'component',
             html: intro + ANAS.warningsHtml((err.body && err.body.error && err.body.error.warnings) || []),
@@ -342,7 +348,7 @@
                     var extraOut = (typeof opts.mapConfirm === 'function')
                         ? (opts.mapConfirm(win) || {}) : {};
                     win.close();
-                    ANAS.runJob(buildRetry(opts, err, extraOut));
+                    ANAS.runJob(withReprompt(buildRetry(opts, err, extraOut), opts, depth));
                 },
             }],
         });
@@ -363,26 +369,62 @@
     //     / cancelButtonText.
     ANAS.confirmAndRun = function (opts) {
         var base = shallowCopy(opts);
-        base.onConfirm = function (err) {
-            try {
-                if (opts.confirmWindow) {
-                    confirmWindow(opts, err);
-                    return;
-                }
-                var warnings = (err.body && err.body.error && err.body.error.warnings) || [];
-                var intro = opts.confirmIntro || ANAS.t('This operation requires confirmation:');
-                var msg = intro + ANAS.warningsHtml(warnings);
-                Ext.Msg.confirm(ANAS.t(opts.confirmTitle || 'Confirm'), msg, function (btn) {
-                    if (btn === 'yes') {
-                        ANAS.runJob(buildRetry(opts, err));
-                    }
-                });
-            } catch (e) {
-                ANAS.warn('confirm dialog failed: ' + ANAS.errText(e));
-            }
-        };
+        base.onConfirm = function (err) { promptConfirm(opts, err, 0); };
         ANAS.runJob(base);
     };
+
+    // A confirmed resend can itself answer 409 with a FRESH code: the object
+    // changed between the challenge and the resend (IDENTITY_MISMATCH — the
+    // message names both ids, story ident.1), or the code was stale
+    // (CONFIRMATION_REQUIRED again). That is a new question for the user, not a
+    // failure: prompt again with the daemon's new message. Capped so a daemon
+    // that keeps answering 409 can never loop the user.
+    var MAX_REPROMPTS = 2;
+    var REPROMPT_CODES = { CONFIRMATION_REQUIRED: true, IDENTITY_MISMATCH: true };
+
+    function repromptable(err) {
+        var code = err && err.body && err.body.error && err.body.error.code;
+        return !!(err && err.status === 409 && err.confirmCode && REPROMPT_CODES[code]);
+    }
+
+    // The resend's runJob opts: a fresh-code 409 re-prompts while under the
+    // cap; anything else is the ordinary failure alert.
+    function withReprompt(retry, opts, depth) {
+        retry.onConfirm = function (err) {
+            if (depth < MAX_REPROMPTS && repromptable(err)) {
+                promptConfirm(opts, err, depth + 1);
+                return;
+            }
+            jobRejected(retry, err);
+        };
+        return retry;
+    }
+
+    // The first prompt leads with the caller's intro; a re-prompt leads with
+    // the daemon's own sentence (it says what changed), then the warnings.
+    function confirmIntroFor(opts, err, depth) {
+        var msg = err && err.body && err.body.error && err.body.error.message;
+        if (depth > 0 && msg) { return ANAS.enc(msg); }
+        return opts.confirmIntro || ANAS.t('This operation requires confirmation:');
+    }
+
+    function promptConfirm(opts, err, depth) {
+        try {
+            if (opts.confirmWindow) {
+                confirmWindow(opts, err, depth);
+                return;
+            }
+            var warnings = (err.body && err.body.error && err.body.error.warnings) || [];
+            var msg = confirmIntroFor(opts, err, depth) + ANAS.warningsHtml(warnings);
+            Ext.Msg.confirm(ANAS.t(opts.confirmTitle || 'Confirm'), msg, function (btn) {
+                if (btn === 'yes') {
+                    ANAS.runJob(withReprompt(buildRetry(opts, err), opts, depth));
+                }
+            });
+        } catch (e) {
+            ANAS.warn('confirm dialog failed: ' + ANAS.errText(e));
+        }
+    }
 
     // CAS-aware mutation: POST/PUT/DELETE returning a 202 job. Success polls the
     // job; a 409 whose error code is 'CONFLICT' (the registry moved under us) is

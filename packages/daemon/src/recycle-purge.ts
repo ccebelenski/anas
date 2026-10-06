@@ -52,8 +52,21 @@ export interface RecyclePurgeOutcome {
   prunedDirs: number
 }
 
+/**
+ * The filesystem calls the containment checks make — injectable so a test can
+ * swap the bin for a symlink BETWEEN two checks (the race ident.4 (f) closes).
+ */
+export interface PurgeFs {
+  lstat: (path: string) => Promise<Stats>
+  realpath: (path: string) => Promise<string>
+}
+
+const NODE_FS: PurgeFs = { lstat: p => lstat(p), realpath: p => realpath(p) }
+
 export interface RecyclePurgeOptions {
   smbConfPath?: string
+  /** Injectable filesystem checks (tests). */
+  fs?: Partial<PurgeFs>
   /** Injectable clock (tests). */
   now?: () => number
   /**
@@ -116,39 +129,69 @@ function isInside(root: string, p: string): boolean {
  * acting on it; the resolved path is the only honest answer (story ident.4
  * (f), audit #19). An unresolvable path is not inside.
  */
-async function resolvesInside(realBin: string, p: string): Promise<boolean> {
+async function resolvesInside(fs: PurgeFs, realBin: string, p: string): Promise<boolean> {
   try {
-    return isInside(realBin, await realpath(p))
+    return isInside(realBin, await fs.realpath(p))
   }
   catch {
     return false
   }
 }
 
+/** Why a bin is not a plain directory (a reason to skip the share), or null. */
+function binSkipReason(stats: Stats, repository: string): string | null {
+  if (stats.isSymbolicLink())
+    return `${repository} is a symbolic link - not followed`
+  if (!stats.isDirectory())
+    return `${repository} is not a directory`
+  return null
+}
+
+/** The bin stopped being a plain directory between two checks: skip the share. */
+export class BinNotPlainError extends Error {
+  constructor(readonly reason: string) {
+    super(reason)
+    this.name = 'BinNotPlainError'
+  }
+}
+
 /**
- * Purge one bin: remove the files past their purge age, then prune the empty
- * directories under it (never `bin` itself — `rmdir` on the only-just-emptied
- * parents succeeds, a still-populated one fails with ENOTEMPTY and stays).
+ * Purge one share's bin (`<share>/<repository>`): remove the files past their
+ * purge age, then prune the empty directories under it (never the bin itself
+ * — `rmdir` on the only-just-emptied parents succeeds, a still-populated one
+ * fails with ENOTEMPTY and stays).
  *
- * Every file and directory is acted on only while its resolved path stays
- * inside the bin's resolved path and it is what it was listed as (`lstat`: a
- * regular file, a real directory) — never through a symlink (ident.4 (f)).
- * `refused` counts what was left for failing that check.
+ * Containment is anchored at the SHARE: the bin's resolved path is the share's
+ * realpath (read once) joined with the single-segment repository — never the
+ * realpath of the bin itself, which a user who swapped the bin for a symlink
+ * would choose. The bin is lstat'ed again after the walk and before anything
+ * is unlinked (a bin that became a link or a non-directory throws
+ * {@link BinNotPlainError}); every file and directory is then acted on only
+ * while its resolved path stays inside that anchored bin and it is what it was
+ * listed as (`lstat`: a regular file, a real directory) — never through a
+ * symlink (ident.4 (f)). `refused` counts what was left for failing that check.
  */
 export async function purgeBin(
-  bin: string,
+  sharePath: string,
+  repository: string,
   days: number,
-  opts: { now?: () => number, ageOf?: (stats: Stats) => number } = {},
+  opts: { now?: () => number, ageOf?: (stats: Stats) => number, fs?: Partial<PurgeFs> } = {},
 ): Promise<{ removed: number, prunedDirs: number, refused: number }> {
+  const fs: PurgeFs = { ...NODE_FS, ...opts.fs }
   const now = opts.now ?? Date.now
   const ageOf = opts.ageOf ?? ((stats: Stats) => now() - stats.ctimeMs)
-  const realBin = await realpath(bin)
+  const bin = join(sharePath, repository)
+  const realBin = join(await fs.realpath(sharePath), repository)
+  const files = await listFiles(bin)
+  const reason = binSkipReason(await fs.lstat(bin), repository)
+  if (reason)
+    throw new BinNotPlainError(reason)
   let removed = 0
   let refused = 0
-  for (const file of await listFiles(bin)) {
+  for (const file of files) {
     try {
-      const stats = await lstat(file)
-      if (!stats.isFile() || !(await resolvesInside(realBin, file))) {
+      const stats = await fs.lstat(file)
+      if (!stats.isFile() || !(await resolvesInside(fs, realBin, file))) {
         refused++
         continue
       }
@@ -167,8 +210,8 @@ export async function purgeBin(
   let prunedDirs = 0
   for (const dir of await listDirsDeepestFirst(bin)) {
     try {
-      const stats = await lstat(dir)
-      if (!stats.isDirectory() || !(await resolvesInside(realBin, dir))) {
+      const stats = await fs.lstat(dir)
+      if (!stats.isDirectory() || !(await resolvesInside(fs, realBin, dir))) {
         refused++
         continue
       }
@@ -230,18 +273,15 @@ export async function runRecyclePurge(opts: RecyclePurgeOptions = {}): Promise<R
       continue
     }
     const bin = join(target.path, target.repository)
+    const fs: PurgeFs = { ...NODE_FS, ...opts.fs }
     try {
       // lstat, never stat: a share user can replace the bin with a symlink to
       // anywhere, and a purge that followed it would delete files the user
-      // could never have recycled (ident.4 (f), audit #19).
-      const stats = await lstat(bin)
-      if (stats.isSymbolicLink()) {
-        log(`anas-recycle: share=${target.share} skipped (${target.repository} is a symbolic link - not followed)`)
-        result.skipped++
-        continue
-      }
-      if (!stats.isDirectory()) {
-        log(`anas-recycle: share=${target.share} skipped (${target.repository} is not a directory)`)
+      // could never have recycled (ident.4 (f), audit #19). purgeBin checks
+      // again before it unlinks anything.
+      const reason = binSkipReason(await fs.lstat(bin), target.repository)
+      if (reason) {
+        log(`anas-recycle: share=${target.share} skipped (${reason})`)
         result.skipped++
         continue
       }
@@ -254,12 +294,17 @@ export async function runRecyclePurge(opts: RecyclePurgeOptions = {}): Promise<R
       continue
     }
     try {
-      const { removed, prunedDirs, refused } = await purgeBin(bin, target.days, { now: opts.now, ageOf: opts.ageOf })
+      const { removed, prunedDirs, refused } = await purgeBin(target.path, target.repository, target.days, { now: opts.now, ageOf: opts.ageOf, fs: opts.fs })
       const note = refused > 0 ? ` refused=${refused} (left in place - not a plain file or directory inside ${target.repository})` : ''
       log(`anas-recycle: share=${target.share} removed=${removed} pruned_dirs=${prunedDirs}${note}`)
       result.purged++
     }
     catch (err) {
+      if (err instanceof BinNotPlainError) {
+        log(`anas-recycle: share=${target.share} skipped (${err.reason})`)
+        result.skipped++
+        continue
+      }
       const message = err instanceof Error ? err.message : String(err)
       log(`anas-recycle: share=${target.share} failed (${message})`)
       result.failed++

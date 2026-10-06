@@ -2,7 +2,7 @@ import type { ReplicationLocation } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { ResolvedLocation, Transport } from './replication-transport.js'
 import { createHash } from 'node:crypto'
-import { DEFAULT_SYSTEMD_DIR, readAllTasks, resolveTaskDatasets } from './replication-units.js'
+import { DEFAULT_SYSTEMD_DIR, readAllTasksChecked, resolveTaskDatasets } from './replication-units.js'
 
 /**
  * Replication hold tags (story ident.4 (a), audit #13).
@@ -123,9 +123,12 @@ function failText(r: { exitCode: number, stderr: string }): string {
  * tag on every older snapshot, and migrate the legacy global tag. Fail-open: a
  * hiccup is a warning, never a job failure (the data is already replicated).
  *
- * ORDER IS THE SAFETY: the own hold goes on first, and the legacy hold comes
- * off a side only after the own hold on that side succeeded — so the chain's
- * base is never unheld between the two. The legacy hold comes off:
+ * ORDER IS THE SAFETY: the own hold goes on first, and NOTHING comes off a
+ * side unless the own hold on that side succeeded — neither this chain's tag on
+ * older snapshots nor the legacy tag. A side whose new base could not be held
+ * keeps every hold it had (the previous base stays pinned, so retention cannot
+ * sever the chain) and the run carries a warning saying so. The legacy hold
+ * comes off a held side:
  *   - TARGET: every snapshot carrying it (the target dataset is this chain's);
  *   - SOURCE: only this chain's own base (the snapshot just sent and the base
  *     it was sent from), and only when `releaseLegacyOnSource` — another chain
@@ -142,60 +145,67 @@ export async function settleReplicationHolds(deps: HoldDeps, input: SettleHoldsI
   // 1) The own holds — new base, both sides.
   const srcHold = await executor.exec('/usr/sbin/zfs', ['hold', tag, srcSnapFull])
   const srcHeld = srcHold.exitCode === 0 || alreadyHeld(srcHold.stderr)
-  if (!srcHeld)
+  if (!srcHeld) {
     warnings.push(`Could not place ${tag} hold on ${srcSnapFull}: ${failText(srcHold)}`)
+    warnings.push(`Kept every hold on ${source.dataset}: its new base is not held, so the previous base stays pinned`)
+  }
   const tgtHold = remote
     ? await transport.remoteHold(remote, tgtSnapFull, tag)
     : await executor.exec('/usr/sbin/zfs', ['hold', tag, tgtSnapFull])
   const tgtHeld = tgtHold.exitCode === 0 || alreadyHeld(tgtHold.stderr)
-  if (!tgtHeld)
+  if (!tgtHeld) {
     warnings.push(`Could not place ${tag} hold on ${tgtSnapFull}: ${failText(tgtHold)}`)
-
-  // 2) Source: release this chain's tag on older snapshots; migrate legacy.
-  const srcFulls = source.snapshotNames.map(n => `${source.dataset}@${n}`)
-  const srcHolds = await readLocalHolds(executor, srcFulls)
-  const ownBase = new Set([snapName, ...(input.baseSnapshot ? [input.baseSnapshot] : [])])
-  for (const name of source.snapshotNames) {
-    const full = `${source.dataset}@${name}`
-    const tags = srcHolds.get(full) ?? []
-    if (name !== snapName && tags.includes(tag))
-      await releaseLocal(executor, tag, full, warnings)
-    if (srcHeld && input.releaseLegacyOnSource && ownBase.has(name) && tags.includes(LEGACY_REPLICATION_HOLD_TAG))
-      await releaseLocal(executor, LEGACY_REPLICATION_HOLD_TAG, full, warnings)
+    warnings.push(`Kept every hold on ${target.dataset}: its new base is not held, so the previous base stays pinned`)
   }
 
-  // 3) Target: the same, local or over ssh. The target dataset is this
-  //    chain's, so the legacy hold comes off wherever it sits — once the own
-  //    hold is in place.
-  if (remote) {
+  // 2) Source: release this chain's tag on older snapshots; migrate legacy —
+  //    only once the new base is held here.
+  if (srcHeld) {
+    const srcFulls = source.snapshotNames.map(n => `${source.dataset}@${n}`)
+    const srcHolds = await readLocalHolds(executor, srcFulls)
+    const ownBase = new Set([snapName, ...(input.baseSnapshot ? [input.baseSnapshot] : [])])
+    for (const name of source.snapshotNames) {
+      const full = `${source.dataset}@${name}`
+      const tags = srcHolds.get(full) ?? []
+      if (name !== snapName && tags.includes(tag))
+        await releaseLocal(executor, tag, full, warnings)
+      if (input.releaseLegacyOnSource && ownBase.has(name) && tags.includes(LEGACY_REPLICATION_HOLD_TAG))
+        await releaseLocal(executor, LEGACY_REPLICATION_HOLD_TAG, full, warnings)
+    }
+  }
+
+  // 3) Target: the same, local or over ssh, and again only once the new base
+  //    is held there. The target dataset is this chain's, so the legacy hold
+  //    comes off wherever it sits.
+  if (tgtHeld && remote) {
     for (const name of target.snapshotNames) {
       const full = `${target.dataset}@${name}`
       const tags = await transport.remoteHeldTags(remote, full)
-      for (const t of releasableTargetTags(tags, name, snapName, tag, tgtHeld)) {
+      for (const t of releasableTargetTags(tags, name, snapName, tag)) {
         const rel = await transport.remoteRelease(remote, full, t)
         if (rel.exitCode !== 0)
           warnings.push(`Could not release ${t} hold on ${full}: ${failText(rel)}`)
       }
     }
   }
-  else {
+  else if (tgtHeld) {
     const tgtFulls = target.snapshotNames.map(n => `${target.dataset}@${n}`)
     const tgtHolds = await readLocalHolds(executor, tgtFulls)
     for (const name of target.snapshotNames) {
       const full = `${target.dataset}@${name}`
-      for (const t of releasableTargetTags(tgtHolds.get(full) ?? [], name, snapName, tag, tgtHeld))
+      for (const t of releasableTargetTags(tgtHolds.get(full) ?? [], name, snapName, tag))
         await releaseLocal(executor, t, full, warnings)
     }
   }
   return warnings
 }
 
-/** The tags to release on one target snapshot. */
-function releasableTargetTags(tags: string[], name: string, snapName: string, tag: string, ownHeld: boolean): string[] {
+/** The tags to release on one target snapshot (the new base is held there). */
+function releasableTargetTags(tags: string[], name: string, snapName: string, tag: string): string[] {
   const out: string[] = []
   if (name !== snapName && tags.includes(tag))
     out.push(tag)
-  if (ownHeld && tags.includes(LEGACY_REPLICATION_HOLD_TAG))
+  if (tags.includes(LEGACY_REPLICATION_HOLD_TAG))
     out.push(LEGACY_REPLICATION_HOLD_TAG)
   return out
 }
@@ -211,18 +221,34 @@ async function releaseLocal(executor: CommandExecutor, tag: string, full: string
     warnings.push(`Could not release ${tag} hold on ${full}: ${failText(rel)}`)
 }
 
+/** Whether the legacy hold may come off this source, and why not when it may not. */
+export interface LegacyReleaseVerdict {
+  releasable: boolean
+  /** Set when the verdict is "keep" for a reason the run should report. */
+  warning?: string
+}
+
 /**
  * May the legacy hold come off THIS source's base? Only when every OTHER
  * replication task of the same source dataset has already placed its own tag
  * somewhere on the source — a task that has not run since the upgrade may be
  * relying on the legacy hold for its base. Tasks are read from their units
- * (the store is the units); an unreadable store reads as "no other tasks".
+ * (the store is the units). A store that cannot be read IN FULL (unit dir
+ * unreadable, a task file unreadable or unparseable) is not "no other tasks":
+ * the legacy hold stays and the run says why.
  */
 export async function legacyReleasableOnSource(
   executor: CommandExecutor,
   input: { sourceFull: string, ownTag: string, sourceSnapshotNames: string[], systemdDir?: string },
-): Promise<boolean> {
-  const tasks = await readAllTasks(input.systemdDir ?? DEFAULT_SYSTEMD_DIR).catch(() => [])
+): Promise<LegacyReleaseVerdict> {
+  const { tasks, complete } = await readAllTasksChecked(input.systemdDir ?? DEFAULT_SYSTEMD_DIR)
+    .catch(() => ({ tasks: [], complete: false }))
+  if (!complete) {
+    return {
+      releasable: false,
+      warning: `Kept the legacy ${LEGACY_REPLICATION_HOLD_TAG} hold on ${input.sourceFull}: the replication task list could not be read in full, so another task may still rely on it`,
+    }
+  }
   const otherTags = new Set<string>()
   for (const task of tasks) {
     const { sourceFull, targetFull } = resolveTaskDatasets(task)
@@ -233,12 +259,12 @@ export async function legacyReleasableOnSource(
       otherTags.add(t)
   }
   if (otherTags.size === 0)
-    return true
+    return { releasable: true }
   const holds = await readLocalHolds(executor, input.sourceSnapshotNames.map(n => `${input.sourceFull}@${n}`))
   const present = new Set<string>()
   for (const tags of holds.values()) {
     for (const t of tags)
       present.add(t)
   }
-  return [...otherTags].every(t => present.has(t))
+  return { releasable: [...otherTags].every(t => present.has(t)) }
 }

@@ -162,6 +162,27 @@ describe('ahr-boot-scan (GT-8 recovery + orphaned intents + reshape observation)
     assert.ok(!executor.calls.some(c => c.command === '/usr/bin/perl'), 'no "expansion interrupted" warning')
   })
 
+  it('(b) an identity read that FAILS never reads as stale: the intent is halted and warned, not ignored (ident.3)', async () => {
+    // The pool identity cannot be read (pvs throws): "stale" cannot be proved,
+    // so the intent is not skipped as another pool's — it takes the ordinary
+    // fail-closed path (halted, operator warned), never a silent ignore.
+    const executor = new MockExecutor()
+    mdstatFixture(executor, 'unused devices: <none>\n')
+    executor.addFixture({ command: '/usr/sbin/pvs', throws: new Error('spawn /usr/sbin/pvs EIO') })
+    executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    const recorded = { ...mkIntent('running'), arrayUuids: ['77777777:77777777:77777777:77777777'] }
+    await writeIntent('tank', recorded, { dir })
+    const lines: string[] = []
+
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.ok(executor.calls.some(c => c.command === '/usr/sbin/pvs'), 'the identity read was attempted')
+    assert.deepEqual(report.staleIntents, [], 'not proved stale')
+    assert.deepEqual(report.haltedIntents, ['tank'])
+    assert.equal((await readIntent('tank', dir))?.state, 'halted')
+    assert.ok(!lines.some(l => /reason=stale-identity/.test(l)), lines.join('\n'))
+    assert.equal(executor.calls.filter(c => c.command === '/usr/bin/perl' && c.args[2] === 'warning').length, 1, 'the operator is warned')
+  })
+
   it('(b) flips a running intent to halted and notifies that Resume is needed', async () => {
     const executor = new MockExecutor()
     mdstatFixture(executor, 'unused devices: <none>\n')

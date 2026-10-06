@@ -843,6 +843,13 @@ export const UnmountedMount = z.object({
    */
   mountedSource: z.string().optional(),
   mountedFstype: z.string().optional(),
+  /**
+   * ZFS only (ident.4 review): the ZFS mount facts could not be read, and the
+   * path sits below the live ZFS mount named here (not at it) — so whether the
+   * path is the mountpoint of a dataset that is not mounted cannot be proved.
+   * The run is refused on this, never passed blind.
+   */
+  zfsFactsUnavailable: z.boolean().optional(),
 })
 export type UnmountedMount = z.infer<typeof UnmountedMount>
 

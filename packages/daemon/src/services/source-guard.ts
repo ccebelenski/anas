@@ -52,10 +52,18 @@ const REALPATH_TIMEOUT_S = '5'
  *     somebody mounted by hand and then unmounted is indistinguishable from a
  *     path that was always a plain directory — nothing on the system records
  *     the intent. An absent path is the caller's own existence check.
- *   - FAIL OPEN. An unreadable mount table (or an unreadable fstab) means the
- *     guard cannot see the system, and a guard that cannot see must not claim
- *     a mount is missing: it passes, exactly as every other derivation in this
- *     daemon fails open rather than blocking on its own blindness.
+ *   - FAIL OPEN on the mount table. An unreadable mount table (or an
+ *     unreadable fstab) means the guard cannot see the system, and a guard
+ *     that cannot see must not claim a mount is missing: it passes, exactly as
+ *     every other derivation in this daemon fails open rather than blocking on
+ *     its own blindness.
+ *   - NOT fail-open on the ZFS facts (ident.4 review). An unmounted dataset's
+ *     mountpoint is an ordinary empty directory on its mounted parent, so
+ *     without `zfs list` a path below a live ZFS mount cannot be told apart
+ *     from one. While the ZFS facts are unavailable, a path that sits BELOW a
+ *     live ZFS mount (not at it) is refused with that reason stated
+ *     (`zfsFactsUnavailable`); a path at a live ZFS mount, or on no ZFS at
+ *     all, is judged as before.
  */
 
 /** The facts one guard pass needs — read once, reusable for several paths. */
@@ -84,6 +92,11 @@ export interface SourceGuardFacts {
    * — it has no evidence that anything is missing (fail open).
    */
   mountTableUnavailable: boolean
+  /**
+   * The ZFS mount facts could not be read (`zfs list` failed). While true a
+   * path below a live ZFS mount is not provably mounted and is refused.
+   */
+  zfsFactsUnavailable: boolean
 }
 
 /** One row of `zfs list -H -p -t filesystem -o name,mountpoint,canmount,mounted`. */
@@ -125,7 +138,8 @@ export function parseZfsMountFacts(text: string): ZfsMountRow[] {
 export function buildSourceGuardFacts(
   fstabText: string,
   findmntText: string,
-  zfsText = '',
+  /** `zfs list` output; null = the read FAILED (not "no datasets"). */
+  zfsText: string | null = '',
   realpaths: Map<string, string> = new Map(),
 ): SourceGuardFacts {
   const nodes = parseFindmnt(findmntText)
@@ -141,7 +155,7 @@ export function buildSourceGuardFacts(
       fstype: e.fstype,
       disabled: e.disabled === true,
     }))
-  const zfs: UnmountedMount[] = parseZfsMountFacts(zfsText).map(r => ({
+  const zfs: UnmountedMount[] = parseZfsMountFacts(zfsText ?? '').map(r => ({
     mountpoint: r.mountpoint,
     source: r.name,
     fstype: 'zfs',
@@ -157,17 +171,23 @@ export function buildSourceGuardFacts(
     // at least `/` mounted, so zero rows can only mean the read failed — and
     // without it EVERY path would look like it sits on an unmounted `/`.
     mountTableUnavailable: nodes.length === 0,
+    zfsFactsUnavailable: zfsText === null,
   }
 }
 
-/** `zfs list` for the mount facts. Fail-open to '' (no ZFS, or unreadable). */
-async function readZfsMountText(executor: CommandExecutor): Promise<string> {
+/**
+ * `zfs list` for the mount facts; null when the read failed. A node without a
+ * single pool answers exit 0 with nothing, which is "no datasets", not a
+ * failure. (A node without ZFS at all has no live ZFS mount either, so the
+ * unavailable verdict never fires there.)
+ */
+async function readZfsMountText(executor: CommandExecutor): Promise<string | null> {
   try {
     const r = await executor.exec(ZFS, ['list', '-H', '-p', '-t', 'filesystem', '-o', 'name,mountpoint,canmount,mounted'])
-    return r.exitCode === 0 ? r.stdout : ''
+    return r.exitCode === 0 ? r.stdout : null
   }
   catch {
-    return ''
+    return null
   }
 }
 
@@ -279,11 +299,32 @@ function unmountedFor(path: string, facts: SourceGuardFacts): UnmountedMount | n
 export function unmountedMountFor(path: string, facts: SourceGuardFacts): UnmountedMount | null {
   if (facts.mountTableUnavailable)
     return null
-  const written = unmountedFor(path, facts)
-  if (written)
-    return written
   const real = facts.realpaths.get(path)
-  return real ? unmountedFor(real, facts) : null
+  const configured = unmountedFor(path, facts) ?? (real ? unmountedFor(real, facts) : null)
+  if (configured)
+    return configured
+  if (!facts.zfsFactsUnavailable)
+    return null
+  return belowLiveZfs(path, facts) ?? (real ? belowLiveZfs(real, facts) : null)
+}
+
+/**
+ * ZFS facts unavailable: the live ZFS mount `path` sits BELOW (not at), as the
+ * not-provably-mounted verdict, or null. The deepest live mount containing the
+ * path is the filesystem it is on; a later row at the same target is stacked
+ * on top.
+ */
+function belowLiveZfs(path: string, facts: SourceGuardFacts): UnmountedMount | null {
+  let best: FindmntNode | undefined
+  for (const n of facts.live) {
+    if (n.fstype === 'autofs' || !isPathWithin(n.target, path))
+      continue
+    if (!best || n.target.length >= best.target.length)
+      best = n
+  }
+  if (!best || best.fstype !== 'zfs' || best.target === path)
+    return null
+  return { mountpoint: best.target, source: best.source, fstype: 'zfs', origin: 'zfs', zfsFactsUnavailable: true }
 }
 
 /**
@@ -294,6 +335,11 @@ export function unmountedMountFor(path: string, facts: SourceGuardFacts): Unmoun
  */
 export function unmountedSourceRefusal(path: string, mount: UnmountedMount): string {
   const where = path === mount.mountpoint ? `${path} is` : `${path} is under ${mount.mountpoint}, which is`
+  if (mount.zfsFactsUnavailable) {
+    return `${path} is under ${mount.mountpoint} (ZFS dataset ${mount.source}), and the ZFS mount facts could not be read (zfs list failed) - `
+      + `whether ${path} is the mountpoint of a dataset that is not mounted right now cannot be proved, so the run is refused instead of reading through it. `
+      + `Run it again once zfs list answers.`
+  }
   if (mount.origin === 'zfs') {
     const why = mount.canmount === 'off'
       ? ` (canmount=off - it is never mounted)`
@@ -323,6 +369,8 @@ export function unmountedSourceRefusal(path: string, mount: UnmountedMount): str
  */
 export function notThereClause(mount: UnmountedMount): string {
   const instead = mount.mountedSource ? ` but has ${mount.mountedSource} (${mount.mountedFstype ?? 'unknown type'}) mounted instead` : ''
+  if (mount.zfsFactsUnavailable)
+    return 'a ZFS dataset whose mount facts could not be read (zfs list failed), so the path cannot be proved to be mounted'
   if (mount.origin === 'zfs') {
     const off = mount.canmount === 'off' ? ' (canmount=off)' : ''
     return instead
