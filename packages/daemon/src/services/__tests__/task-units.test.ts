@@ -22,9 +22,6 @@ import {
   effectiveSchedule,
   failureDetailFromJournal,
   gateRun,
-  isRunActive,
-  messageFromJournalLine,
-  parseHelperResult,
   readLastSuccessAt,
   readRecentJournal,
   readRunActive,
@@ -42,6 +39,7 @@ import {
   timerUnitName,
   validateSchedule,
 } from '../task-units.js'
+import { isRunActive, messageFromJournalLine, parseHelperResult, TIMER_STATUS_PROPS } from '../unit-run-status.js'
 import { withStampDir } from './stamp-dir.js'
 
 /**
@@ -92,6 +90,7 @@ function statusMock(opts: {
   execStatus?: string
   exitTs?: string
   nextTs?: string
+  lastTrigger?: string
   journal?: string
 }): MockExecutor {
   const kind = opts.kind ?? CLOUD_UNIT_KIND
@@ -109,8 +108,8 @@ function statusMock(opts: {
   })
   mock.addFixture({
     command: SYSTEMCTL,
-    args: ['show', timerUnitName(kind, TASK), '-p', 'NextElapseUSecRealtime'],
-    result: ok(`NextElapseUSecRealtime=${opts.nextTs ?? '0'}\n`),
+    args: ['show', timerUnitName(kind, TASK), '-p', TIMER_STATUS_PROPS],
+    result: ok(`NextElapseUSecRealtime=${opts.nextTs ?? '0'}\nLastTriggerUSec=${opts.lastTrigger ?? ''}\n`),
   })
   if (opts.journal !== undefined) {
     mock.addFixture({
@@ -341,8 +340,29 @@ describe('task units — the last run survives a reboot (taskstatus.1 wiring)', 
     }
   })
 
+  it('one journal read per row: the derivation\'s rung and the cadence last-success lookup share it', async () => {
+    // After a reboot the newest line is an off-week skip, so the derivation
+    // reads the journal AND the weekly cadence asks for the last success.
+    const skip = `2026-10-05T02:00:09+0000 anas-pve anas-cloud-${TASK}[901]: {"task":"${TASK}","result":{"status":"skipped-off-week"}}`
+    const mock = statusMock({ journal: successJournal('2026-09-28T02:00:07+0000', [skip]), lastTrigger: 'Mon 2026-10-05 02:00:00 UTC' })
+    const st = await deriveTaskStatus(CLOUD_UNIT_KIND, mock, task({ cadence: { kind: 'weekly', days: ['Mon'], time: '02:00' } }), Date.UTC(2026, 9, 6))
+    assert.equal(st.lastRunResult, 'skipped')
+    assert.equal(st.lastSuccessAt, '2026-09-28T02:00:07.000Z')
+    assert.equal(mock.calls.filter(c => c.command === JOURNALCTL).length, 1)
+    // …and one timer show, whichever rung answered.
+    assert.equal(mock.calls.filter(c => c.args.includes(timerUnitName(CLOUD_UNIT_KIND, TASK))).length, 1)
+  })
+
+  it('a disabled task with no live record reads disabled without touching the journal', async () => {
+    const mock = statusMock({ journal: successJournal('2026-10-05T02:00:07+0000') })
+    const st = await deriveTaskStatus(CLOUD_UNIT_KIND, mock, task({ enabled: false }))
+    assert.equal(st.lastRunResult, 'disabled')
+    assert.equal(st.lastRunAt, null)
+    assert.equal(mock.calls.some(c => c.command === JOURNALCTL), false)
+  })
+
   it('empty post-reboot props + no result line + the timer stamp → unknown with the note', async () => {
-    const mock = triggerFixtures(statusMock({ journal: '' }), 'Mon 2026-10-05 02:00:00 UTC')
+    const mock = statusMock({ journal: '', lastTrigger: 'Mon 2026-10-05 02:00:00 UTC' })
     const st = await deriveTaskStatus(CLOUD_UNIT_KIND, mock, task())
     assert.equal(st.lastRunResult, 'unknown')
     assert.equal(st.lastRunAt, '2026-10-05T02:00:00.000Z')
@@ -739,7 +759,7 @@ describe('task units — the Run-Now gate inputs (rclone.3 human-pass findings)'
       args: ['show', SERVICE, '-p', SHOW_STATUS_PROPS],
       result: ok(showBlob({ ActiveState: 'active', Result: 'success' })),
     })
-    mock.addFixture({ command: SYSTEMCTL, args: ['show', TIMER, '-p', 'NextElapseUSecRealtime'], result: ok('NextElapseUSecRealtime=n/a\n') })
+    mock.addFixture({ command: SYSTEMCTL, args: ['show', TIMER, '-p', TIMER_STATUS_PROPS], result: ok('NextElapseUSecRealtime=n/a\n') })
     const st = await deriveTaskStatus(CLOUD_UNIT_KIND, mock, task())
     assert.equal(st.runActive, true)
   })
@@ -1275,7 +1295,7 @@ describe('task units — both descriptors, identical inputs, identical answers',
       })
       mock.addFixture({
         command: SYSTEMCTL,
-        args: ['show', timerUnitName(kind, TASK), '-p', 'NextElapseUSecRealtime'],
+        args: ['show', timerUnitName(kind, TASK), '-p', TIMER_STATUS_PROPS],
         result: ok(`NextElapseUSecRealtime=${nextTs}\n`),
       })
       return deriveTaskStatus(kind, mock, task(), Date.UTC(2026, 8, 22, 2, 0, 0))

@@ -8,13 +8,18 @@
  * on returned data. capSegments bounds the Datasets hero's legend height —
  * the pinned contract:
  *
- *   - the `max` largest positive non-free segments survive, value-descending
- *   - everything else (the remainder AND zero-value segments) folds into ONE
- *     "{n} more" roll-up whose value is the remaining sum and whose `names`
- *     lists the folded labels
+ *   - over `max` named segments, the `max` largest positive ones survive,
+ *     value-descending, and everything else (the remainder AND zero-value
+ *     segments) folds into ONE "{n} more" roll-up whose value is the
+ *     remaining sum and whose `names` lists the folded labels
+ *   - at or under max there is no roll-up and the named rows keep the
+ *     caller's order (a small pool's legend is byte-identical to the uncapped
+ *     one); a missing/NaN/negative value reads 0 there, in place
+ *   - pinned:true segments ("Proxmox storage") always keep their own row,
+ *     after the named rows and before Free, never folded; each takes one of
+ *     the max row slots, so the legend never exceeds max + 2 rows
  *   - free:true segments pass through last, unchanged, never counted toward
  *     max
- *   - at or under max there is no roll-up
  *   - the legend renders the roll-up's names as the row's tooltip, so donut
  *     and legend drawn from the SAME capped array agree
  *
@@ -155,12 +160,22 @@ function synthetic(n) {
   const capped = gfx.capSegments(synthetic(5))
   eq('5 in (under max) → 6 out', capped.length, 6)
   ok('no roll-up under max', capped.every(s => !s.more))
-  eq('under max: sorted value-descending, Free last',
-    capped.map(s => s.label).join(','), 'vm-5-disk-0,vm-4-disk-0,vm-3-disk-0,vm-2-disk-0,vm-1-disk-0,Free')
+  eq('under max: the caller\'s order is kept, Free last',
+    capped.map(s => s.label).join(','), 'vm-1-disk-0,vm-2-disk-0,vm-3-disk-0,vm-4-disk-0,vm-5-disk-0,Free')
+  const input = synthetic(5)
+  ok('under max: the same segment objects come back', gfx.capSegments(input).every((s, i) => s === input[i]))
+  eq('under max: the legend is byte-identical to the uncapped one',
+    gfx.legend(gfx.capSegments(input), { format: v => gfx.rungLabel(v) }),
+    gfx.legend(input, { format: v => gfx.rungLabel(v) }))
 
   const exact = gfx.capSegments(synthetic(6))
   eq('exactly max → 7 out (6 + Free)', exact.length, 7)
   ok('no roll-up at exactly max', exact.every(s => !s.more))
+  eq('exactly max: caller order kept', exact[0].label, 'vm-1-disk-0')
+
+  const over = gfx.capSegments(synthetic(7))
+  eq('one over max → sorted, 6 + roll-up + Free', over.map(s => s.label).join(','),
+    'vm-7-disk-0,vm-6-disk-0,vm-5-disk-0,vm-4-disk-0,vm-3-disk-0,vm-2-disk-0,1 [more],Free')
 }
 
 // --- 3. Free is never counted toward max --------------------------------------
@@ -175,25 +190,69 @@ function synthetic(n) {
     capped[6].free === true && capped[7].free === true && capped[7].label === 'Free (2nd)')
 }
 
-// --- 4. Zero-value segments always count as "the rest" ------------------------
+// --- 4. Zero-value segments: in place under the cap, "the rest" over it ------
 
 {
   const segs = [
     { label: 'a', value: 3 * GiB },
-    { label: 'b', value: 2 * GiB },
-    { label: 'c', value: 1 * GiB },
     { label: 'empty-1', value: 0 },
+    { label: 'b', value: 2 * GiB },
     { label: 'empty-2', value: undefined },
+    { label: 'c', value: 1 * GiB },
     { label: 'Free', value: 9 * GiB, free: true },
   ]
   const capped = gfx.capSegments(segs)
-  eq('zeros fold even when there is room', capped.length, 5)
-  const roll = capped[3]
+  eq('under the cap zeros keep their place, no roll-up', capped.map(s => s.label).join(','),
+    'a,empty-1,b,empty-2,c,Free')
+  ok('under the cap: no roll-up', capped.every(s => !s.more))
+  ok('a real 0 is returned as is', capped[1] === segs[1])
+  eq('a missing value reads 0', capped[3].value, 0)
+  eq('NaN reads 0', gfx.capSegments([{ label: 'n', value: Number.NaN }])[0].value, 0)
+  ok('the input segment is not mutated', segs[3].value === undefined)
+
+  const many = synthetic(6)
+  many.splice(2, 0, { label: 'empty-1', value: 0 }, { label: 'empty-2', value: undefined })
+  const folded = gfx.capSegments(many)
+  eq('over the cap: 6 + roll-up + Free', folded.length, 8)
+  const roll = folded[6]
   ok('zero roll-up is flagged', !!roll.more)
-  eq('zero roll-up label', roll.label, '2 [more]')
+  eq('over the cap zeros fold', roll.label, '2 [more]')
   eq('zero roll-up value', roll.value, 0)
   eq('zero roll-up names', roll.names.join(','), 'empty-1,empty-2')
-  ok('Free still last', capped[4].free === true)
+  ok('Free still last', folded[7].free === true)
+}
+
+// --- 4b. Pinned ("Proxmox storage") is never folded, and takes a row slot ----
+
+{
+  const pve = { label: 'Proxmox storage', value: 2 * GiB, pinned: true }
+  const big = synthetic(60)
+  big.splice(30, 0, pve)
+  const capped = gfx.capSegments(big)
+  eq('60 named + pinned → 8 out (5 + roll-up + pinned + Free = max + 2)', capped.length, 8)
+  ok('pinned keeps its own row after the roll-up', capped[5].more === true && capped[6] === pve)
+  ok('pinned is not among the folded names', !capped[5].names.includes('Proxmox storage'))
+  eq('the roll-up folds 55', capped[5].label, '55 [more]')
+  eq('largest kept is #60', capped[0].label, 'vm-60-disk-0')
+  ok('Free last', capped[7].free === true)
+
+  const small = [{ label: 'media', value: GiB }, pve, { label: 'Free', value: GiB, free: true }]
+  eq('under the cap: named, pinned, Free', gfx.capSegments(small).map(s => s.label).join(','),
+    'media,Proxmox storage,Free')
+  const five = synthetic(5)
+  five.splice(0, 0, pve)
+  eq('5 named + pinned fit in 6 slots: no roll-up, caller order',
+    gfx.capSegments(five).map(s => s.label).join(','),
+    'vm-1-disk-0,vm-2-disk-0,vm-3-disk-0,vm-4-disk-0,vm-5-disk-0,Proxmox storage,Free')
+  const six = synthetic(6)
+  six.splice(0, 0, pve)
+  const sixCapped = gfx.capSegments(six)
+  eq('6 named + pinned overflow: 5 kept + roll-up + pinned + Free', sixCapped.length, 8)
+  ok('…and the pinned row is still its own', sixCapped[6] === pve && sixCapped[5].names.join(',') === 'vm-1-disk-0')
+  ok('pinned rows never squeeze the named rows to zero',
+    gfx.capSegments(synthetic(3).concat([pve, pve]), { max: 2 }).filter(s => !s.more && !s.free && !s.pinned).length === 1)
+  const zero = gfx.capSegments([{ label: 'Proxmox storage', value: 0, pinned: true }])
+  ok('a zero pinned segment still keeps its row', zero.length === 1 && zero[0].label === 'Proxmox storage')
 }
 
 // --- 5. Degenerate inputs stay pure and total ---------------------------------
@@ -220,10 +279,7 @@ ok('bogus max falls back to 6', gfx.capSegments(synthetic(10), { max: -1 }).leng
   } catch (e) { threw = e }
   ok('a null entry does not throw', threw === null, threw && threw.message)
   if (capped) {
-    eq('null entry → a + roll-up + Free', capped.length, 3)
-    ok('null entry rolls up with value 0', capped[1].more === true && capped[1].value === 0,
-      JSON.stringify(capped[1]))
-    eq('null entry folds as an empty name', capped[1].names.join('|'), '')
+    eq('a null entry is not a segment → a + Free', capped.map(s => s.label).join(','), 'a,Free')
   }
 
   const neg = gfx.capSegments([
@@ -231,11 +287,17 @@ ok('bogus max falls back to 6', gfx.capSegments(synthetic(10), { max: -1 }).leng
     { label: 'b', value: -3 * GiB },
     { label: 'c', value: 0 },
   ])
-  eq('negative entry → a + roll-up', neg.length, 2)
-  eq('negative value counts as 0 in the roll-up', neg[1].value, 0)
-  eq('negative entry still named in the roll-up', neg[1].names.join(','), 'b,c')
+  eq('under the cap a negative entry keeps its row', neg.map(s => s.label).join(','), 'a,b,c')
+  eq('…reading 0', neg[1].value, 0)
   const ring = gfx.donut(neg, { total: 10 * GiB })
   ok('no negative arc in the ring', !/stroke-dasharray="-/.test(ring))
+
+  const negOver = synthetic(6)
+  negOver.push({ label: 'neg', value: -3 * GiB })
+  const foldedNeg = gfx.capSegments(negOver)
+  eq('over the cap a negative folds, counting 0', foldedNeg[6].value, 0)
+  eq('…still named in the roll-up', foldedNeg[6].names.join(','), 'neg')
+  ok('no negative arc over the cap either', !/stroke-dasharray="-/.test(gfx.donut(foldedNeg, { total: 100 * GiB })))
 }
 
 // --- 7. The roll-up word goes through ANAS.t ----------------------------------

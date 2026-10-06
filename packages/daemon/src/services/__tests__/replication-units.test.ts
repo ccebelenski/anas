@@ -297,11 +297,9 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
       // unloaded it and is answering from defaults" (live-proof F9).
       const exitStamp = opts.exitStamp ?? 'Wed 2026-07-15 03:00:12 UTC'
       mock.addFixture({ command: SYSTEMCTL, args: ['show', serviceUnitName('nightly-media'), '-p', 'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp'], result: { stdout: `ActiveState=${opts.active ?? 'inactive'}\nResult=${opts.result ?? 'success'}\nExecMainStatus=0\nExecMainExitTimestamp=${exitStamp}\nInactiveEnterTimestamp=${exitStamp}\n`, stderr: '', exitCode: 0 } })
-      mock.addFixture({ command: SYSTEMCTL, args: ['show', timerUnitName('nightly-media'), '-p', 'NextElapseUSecRealtime'], result: { stdout: `NextElapseUSecRealtime=${opts.nextUsec ?? '0'}\n`, stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: SYSTEMCTL, args: ['show', timerUnitName('nightly-media'), '-p', 'NextElapseUSecRealtime,LastTriggerUSec'], result: { stdout: `NextElapseUSecRealtime=${opts.nextUsec ?? '0'}\nLastTriggerUSec=${opts.lastTrigger ?? ''}\n`, stderr: '', exitCode: 0 } })
       if (opts.journal !== undefined)
         mock.addFixture({ command: '/usr/bin/journalctl', args: ['-u', serviceUnitName('nightly-media'), '-n', '200', '-o', 'short-iso', '--no-pager'], result: { stdout: opts.journal, stderr: '', exitCode: 0 } })
-      if (opts.lastTrigger !== undefined)
-        mock.addFixture({ command: SYSTEMCTL, args: ['show', timerUnitName('nightly-media'), '-p', 'LastTriggerUSec'], result: { stdout: `LastTriggerUSec=${opts.lastTrigger}\n`, stderr: '', exitCode: 0 } })
       return mock
     }
 

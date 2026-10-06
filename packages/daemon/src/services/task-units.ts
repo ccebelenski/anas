@@ -14,18 +14,14 @@ import { listServiceUnits, parseMarkedJson, runSystemctl, systemdTimersStampDir,
 import {
   deriveUnitRunStatus,
   isRunActive,
+  lastSuccessFromJournal,
   messageFromJournalLine,
   parseHelperResult,
-  parseJournalTimestamp,
+  readOnce,
   readUnitJournal,
   showUnitProps,
   TRIGGER_SLACK_MS,
 } from './unit-run-status.js'
-
-// The run-status primitives moved to unit-run-status.ts (taskstatus.1); the
-// task stores and their tests keep importing them from here.
-export { isRunActive, messageFromJournalLine, parseHelperResult } from './unit-run-status.js'
-export type { TaskHelperResult } from './unit-run-status.js'
 
 /**
  * The scheduled-TASK generics — everything a units-are-the-store task kind does
@@ -42,9 +38,8 @@ export type { TaskHelperResult } from './unit-run-status.js'
  *
  * **Shape: a descriptor as the first argument, not a curried factory.** Every
  * entry point takes `kind` explicitly (the pure ones — {@link classifyTrigger},
- * {@link isRunActive}, {@link runFailed}, {@link messageFromJournalLine},
- * {@link parseHelperResult}, {@link validateSchedule}, {@link effectiveSchedule}
- * — take none at all). A store's wrapper is then a one-line delegation with the
+ * {@link runFailed}, {@link validateSchedule}, {@link effectiveSchedule} — take
+ * none at all; the journal/systemd primitives are unit-run-status.ts's). A store's wrapper is then a one-line delegation with the
  * SAME signature it always had, a stack trace names the real function, and
  * nothing is captured in a closure. A factory would only have moved that same
  * one line into the factory call.
@@ -615,19 +610,23 @@ export async function deriveTaskStatus(
   // taskstatus.1: the shared run-status derivation (unit-run-status.ts) —
   // live service props, else the journal's last result line, else the timer's
   // last trigger. The task map (skip code, cancel exit) is this kind's own.
+  // ONE journal read per row, shared by the derivation's rungs and the
+  // last-success lookup below (whichever needs it first pays for it).
+  const readJournal = readOnce(() => readRecentJournal(kind, executor, task.name))
   const { lastRunResult, lastRunAt, lastRunNote, nextRunAt, runActive } = await deriveUnitRunStatus(executor, {
     serviceUnit: serviceUnitName(kind, task.name),
     timerUnit: timerUnitName(kind, task.name),
     enabled: task.enabled,
     mapLive: deriveTaskRunResult,
+    readJournal,
   })
 
   // A successful last run IS the last success — systemd already told us when.
-  // Only when it wasn't (a skip, a failure, nothing yet) do we pay for a journal
-  // read, and only when a cadence period makes the answer matter at all.
+  // Only when it wasn't (a skip, a failure, nothing yet) do we need the journal,
+  // and only when a cadence period makes the answer matter at all.
   let lastSuccessAt = lastRunResult === 'success' ? lastRunAt : null
   if (lastSuccessAt === null && overdueWindowMs(task.cadence) !== undefined)
-    lastSuccessAt = await readLastSuccessAt(kind, executor, task.name)
+    lastSuccessAt = await readLastSuccessAt(kind, executor, task.name, readJournal)
 
   const overdue = isTaskOverdue({
     enabled: task.enabled,
@@ -674,30 +673,18 @@ export async function readRecentJournal(
  * remote) when it last received data. The journal rotates, so null genuinely
  * means "no record" — and every caller treats that as "fail toward running / do
  * not cry overdue", never as evidence of a missed run. Fail-open to null.
+ *
+ * The line scan is unit-run-status.ts's ONE scanner and status rule
+ * ({@link lastSuccessFromJournal}). `readJournal` lets a status derivation that
+ * already read (or will read) the unit journal share that one read.
  */
 export async function readLastSuccessAt(
   kind: TaskUnitKind,
   executor: CommandExecutor,
   name: string,
+  readJournal: () => Promise<string> = () => readRecentJournal(kind, executor, name),
 ): Promise<string | null> {
-  const journal = await readRecentJournal(kind, executor, name)
-  if (!journal)
-    return null
-  const lines = journal.split('\n')
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const msg = messageFromJournalLine(lines[i])
-    if (!msg.startsWith('{'))
-      continue
-    try {
-      const obj = JSON.parse(msg) as { result?: TaskHelperResult }
-      if (obj?.result?.status === 'success')
-        return parseJournalTimestamp(lines[i])
-    }
-    catch {
-      // Not the JSON result line — keep scanning.
-    }
-  }
-  return null
+  return lastSuccessFromJournal(await readJournal())
 }
 
 /**

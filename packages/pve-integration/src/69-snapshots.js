@@ -967,7 +967,8 @@
                             style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
                             hidden: !(startKind === 'zfs' && sched.recursive),
                             html: enc(t('Each excluded dataset is skipped together with everything beneath it. '
-                                + 'Datasets PVE owns are listed so they can be excluded.'))
+                                + 'Datasets PVE owns are listed so they can be excluded.')
+                                + ' ' + t('This schedule\'s own snapshots already on an excluded dataset are removed on its next run.'))
                         },
                         // --- Retention: presets + advanced per-bucket expander --
                         {
@@ -1341,7 +1342,12 @@
                         if (result.taken) {
                             msg = t('Took') + ' ' + result.taken;
                         }
-                        var pruned = (result.pruned || []).length;
+                        // `pruned` lists at most 50 names per dataset; the
+                        // real total is `prunedCount` (absent from an older
+                        // daemon — then the list is the count).
+                        var pruned = (typeof result.prunedCount === 'number')
+                            ? result.prunedCount
+                            : (result.pruned || []).length;
                         var held = (result.skippedHeld || []).length;
                         var extra = [];
                         if (pruned) { extra.push(pruned + ' ' + t('pruned')); }
@@ -1353,6 +1359,12 @@
                         if (touched > 1) { extra.push(t('across') + ' ' + touched + ' ' + t('datasets')); }
                         // Held snapshots are intentionally retained, NOT a failure (GT-7).
                         if (held) { extra.push(held + ' ' + t('held (kept)')); }
+                        // Destroys ZFS refused (a clone depends on the
+                        // snapshot) are noted per dataset, never a failure.
+                        var refused = (result.datasets || []).reduce(function (sum, d) {
+                            return sum + ((d && typeof d.refused === 'number') ? d.refused : 0);
+                        }, 0);
+                        if (refused) { extra.push(refused + ' ' + t('could not be destroyed')); }
                         if (extra.length) { msg += ' — ' + extra.join(', '); }
                     }
                 } catch (e) {

@@ -7,6 +7,7 @@ import { parseSystemdTimestamp } from './systemd-status.js'
 // The unit-store plumbing (marker parse, unlink, systemctl) is the ONE shared
 // copy in systemd-unit-store.ts — this store was its fourth hand-copy.
 import { parseMarkedJson, readUnitFile, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
+import { readTimerNextRaw } from './unit-run-status.js'
 
 /**
  * The node-level AHR periodic-scrub UNITS (story selfheal.4) — the
@@ -191,16 +192,7 @@ export async function readScrubSchedule(dir: string): Promise<AhrScrubSchedule |
  * screen, never the row.
  */
 export async function readScrubTimerNext(executor: CommandExecutor): Promise<string | null> {
-  try {
-    const r = await executor.exec(SYSTEMCTL, ['show', SCRUB_TIMER_NAME, '-p', 'NextElapseUSecRealtime'])
-    if (r.exitCode !== 0 && !r.stdout.trim())
-      return null
-    const raw = r.stdout.split('=').slice(1).join('=').trim()
-    return raw ? parseSystemdTimestamp(raw) : null
-  }
-  catch {
-    return null
-  }
+  return parseSystemdTimestamp(await readTimerNextRaw(executor, SCRUB_TIMER_NAME))
 }
 
 // --- Store: write + remove --------------------------------------------------

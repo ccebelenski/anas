@@ -4520,8 +4520,10 @@
         // children, while ANAS datasets
         // stay individually named. capSegments then bounds the list to the
         // largest max named segments + one roll-up, so the hero's height is
-        // bounded whatever the dataset count. Free rides the cap too (it
-        // passes out last and is never counted toward max).
+        // bounded whatever the dataset count; at or under max nothing folds
+        // and the rows keep the tree's order. The Proxmox storage segment is
+        // `pinned` (its own row always, one of the max slots, never folded
+        // into "n more") and Free is `free` (its own row, last, uncounted).
         var segs = [];
         var pveUsed = 0;
         var pveKids = 0;
@@ -4540,7 +4542,7 @@
             }
         }
         if (pveKids) {
-            segs.push({ label: t('Proxmox storage'), value: pveUsed });
+            segs.push({ label: t('Proxmox storage'), value: pveUsed, pinned: true });
         }
         segs.push({ label: t('Free'), value: free, free: true });
         if (typeof ANAS.gfx.capSegments === 'function') {

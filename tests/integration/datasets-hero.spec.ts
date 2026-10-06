@@ -15,8 +15,8 @@ import { poolExists, sshExec } from './fixtures/stunt-node'
  * component at natural height above the flex:1 tree) pushed the tree to zero
  * height. The fix folds PVE-owned children into ONE "Proxmox storage"
  * segment (the same ownership verdict the Name-column badge uses) and caps
- * the legend to the largest 6 named segments + one "n more" roll-up, Free
- * last — so the invariant is hero height bounded regardless of dataset count,
+ * the legend to 6 rows + one "n more" roll-up + Free; the Proxmox storage
+ * row takes one of the 6 but is never folded, Free last — so the invariant is hero height bounded regardless of dataset count,
  * NOT a scrollable legend.
  *
  * Fixture pools on screen: pvfix (PVE zfspool storage carrying vm-100-disk-0,
@@ -37,7 +37,7 @@ import { poolExists, sshExec } from './fixtures/stunt-node'
  */
 
 const PVE_POOL = 'pvfix'
-// N = 6 named + 1 roll-up + Free = 8 rows maximum by construction.
+// N = 6 rows (Proxmox storage included) + 1 roll-up + Free = 8 rows maximum by construction.
 const MAX_LEGEND_ROWS = 8
 
 test.beforeEach(async () => {
@@ -158,6 +158,10 @@ test.describe('dshero.1 — the cap on a pool with many datasets (#70)', () => {
     const labels = await names.allTextContents()
     expect(labels.length).toBeLessThanOrEqual(MAX_LEGEND_ROWS)
     expect(labels.filter(l => /\d+ more/.test(l))).toHaveLength(1)
+    // The Proxmox storage row is never folded into "n more": its own row, and
+    // the last two rows are it and Free.
+    expect(labels.filter(l => l === 'Proxmox storage')).toHaveLength(1)
+    expect(labels.slice(-2)).toEqual(['Proxmox storage', 'Free'])
 
     await expectTreeKeepsHalf(page, grid)
   })

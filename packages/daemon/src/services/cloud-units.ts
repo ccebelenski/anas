@@ -5,10 +5,10 @@ import type { CadenceGateDecision, TaskTrigger } from './backup-cadence.js'
 import type {
   RunActiveState,
   SuperviseRunOptions,
-  TaskHelperResult,
   TaskRunResult,
   TaskUnitKind,
 } from './task-units.js'
+import type { TaskHelperResult } from './unit-run-status.js'
 import { BACKUP_SKIP_EXIT_CODE, CloudSyncTask as CloudSyncTaskSchema } from '@anas/shared'
 import { DISABLED_HISTORY_NOTE, parseSystemdTimestamp } from './systemd-status.js'
 // Everything generic lives in task-units.ts and is handed CLOUD_UNIT_KIND: the
@@ -27,7 +27,6 @@ import {
   effectiveSchedule as effectiveScheduleGeneric,
   failureDetailFromJournal as failureDetailFromJournalGeneric,
   gateRun as gateRunGeneric,
-  parseHelperResult as parseHelperResultGeneric,
   parseTaskUnit,
   readAllTaskUnits,
   readLastSuccessAt as readLastSuccessAtGeneric,
@@ -45,6 +44,7 @@ import {
   timerUnitName as timerUnitNameGeneric,
   writeTaskUnitFiles,
 } from './task-units.js'
+import { parseHelperResult as parseHelperResultGeneric } from './unit-run-status.js'
 
 /**
  * Cloud sync TASKS (story rclone.2) — the fifth unit store, built on the ONE
@@ -101,7 +101,7 @@ export const CLOUD_UNIT_KIND: TaskUnitKind = {
   causeHints: [RCLONE_FAILURE_MSG_RE],
 }
 
-export { DEFAULT_SYSTEMD_DIR, isRunActive, messageFromJournalLine, runFailed, validateSchedule } from './task-units.js'
+export { DEFAULT_SYSTEMD_DIR, runFailed, validateSchedule } from './task-units.js'
 
 export function serviceUnitName(name: string): string {
   return serviceUnitNameGeneric(CLOUD_UNIT_KIND, name)

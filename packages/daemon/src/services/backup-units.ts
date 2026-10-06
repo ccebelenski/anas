@@ -2,7 +2,8 @@ import type { BackupArchiveConsistency, BackupExpandedArchive, BackupPruneResult
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { BackupTrigger, CadenceGateDecision } from './backup-cadence.js'
-import type { RunActiveState, SuperviseRunOptions, TaskHelperResult, TaskUnitKind } from './task-units.js'
+import type { RunActiveState, SuperviseRunOptions, TaskUnitKind } from './task-units.js'
+import type { TaskHelperResult } from './unit-run-status.js'
 import { BACKUP_SKIP_EXIT_CODE, BackupTask as BackupTaskSchema } from '@anas/shared'
 import { DISABLED_HISTORY_NOTE, parseSystemdTimestamp } from './systemd-status.js'
 // The systemd/journald half — status derivation, journal reads, the cadence
@@ -22,7 +23,6 @@ import {
   effectiveSchedule as effectiveScheduleGeneric,
   failureDetailFromJournal as failureDetailFromJournalGeneric,
   gateRun as gateRunGeneric,
-  parseHelperResult as parseHelperResultGeneric,
   parseTaskUnit,
   readAllTaskUnits,
   readLastSuccessAt as readLastSuccessAtGeneric,
@@ -40,6 +40,7 @@ import {
   timerUnitName as timerUnitNameGeneric,
   writeTaskUnitFiles,
 } from './task-units.js'
+import { parseHelperResult as parseHelperResultGeneric } from './unit-run-status.js'
 
 /**
  * Backup TASKS (Epic 16.3) — the systemd units ARE the store, exactly the
@@ -92,7 +93,7 @@ export const BACKUP_UNIT_KIND: TaskUnitKind = {
   causeHints: [OWNER_MISMATCH_MSG_RE],
 }
 
-export { DEFAULT_SYSTEMD_DIR, isRunActive, messageFromJournalLine, runFailed, validateSchedule } from './task-units.js'
+export { DEFAULT_SYSTEMD_DIR, runFailed, validateSchedule } from './task-units.js'
 
 export function serviceUnitName(name: string): string {
   return serviceUnitNameGeneric(BACKUP_UNIT_KIND, name)

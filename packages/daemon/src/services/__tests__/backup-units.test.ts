@@ -18,8 +18,6 @@ import {
   effectiveSchedule,
   failureDetailFromJournal,
   gateRun,
-  isRunActive,
-  messageFromJournalLine,
   parseHelperResult,
   parseServiceUnit,
   parseSystemdTimestamp,
@@ -36,6 +34,7 @@ import {
   validateSchedule,
   writeTaskUnits,
 } from '../backup-units.js'
+import { isRunActive, messageFromJournalLine } from '../unit-run-status.js'
 import { withStampDir } from './stamp-dir.js'
 
 const SYSTEMCTL = '/usr/bin/systemctl'
@@ -468,7 +467,7 @@ describe('backup units — LOCAL-ONLY status derivation', () => {
     })
     mock.addFixture({
       command: SYSTEMCTL,
-      args: ['show', timerUnitName('nightly-etc'), '-p', 'NextElapseUSecRealtime'],
+      args: ['show', timerUnitName('nightly-etc'), '-p', 'NextElapseUSecRealtime,LastTriggerUSec'],
       result: { stdout: `NextElapseUSecRealtime=${opts.nextTs ?? '0'}\n`, stderr: '', exitCode: 0 },
     })
     return mock
@@ -603,7 +602,7 @@ describe('backup units — a DISABLED task has no run history to report (F9)', (
     })
     mock.addFixture({
       command: SYSTEMCTL,
-      args: ['show', timerUnitName('nightly-etc'), '-p', 'NextElapseUSecRealtime'],
+      args: ['show', timerUnitName('nightly-etc'), '-p', 'NextElapseUSecRealtime,LastTriggerUSec'],
       result: { stdout: 'NextElapseUSecRealtime=n/a\n', stderr: '', exitCode: 0 },
     })
     const st = await deriveTaskStatus(mock, makeTask({ enabled: false }))
@@ -731,7 +730,7 @@ describe('backup cadence — overdue measured against the cadence, not the timer
     })
     mock.addFixture({
       command: SYSTEMCTL,
-      args: ['show', timerUnitName('nightly-etc'), '-p', 'NextElapseUSecRealtime'],
+      args: ['show', timerUnitName('nightly-etc'), '-p', 'NextElapseUSecRealtime,LastTriggerUSec'],
       result: { stdout: `NextElapseUSecRealtime=${nextTs}\n`, stderr: '', exitCode: 0 },
     })
     return mock

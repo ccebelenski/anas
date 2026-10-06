@@ -1,14 +1,24 @@
-import type { ExecResult } from '../../executor/types.js'
+import type { CommandExecutor, ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
+import { mkdtemp, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import {
   deriveLastRun,
   deriveUnitRunStatus,
   lastRunFromJournal,
+  lastSuccessFromJournal,
+  parseHelperResult,
+  readOnce,
+  readUnitFileBirth,
+  readUnitJournal,
   resultNotRetainedNote,
   SERVICE_STATUS_PROPS,
+  TIMER_STATUS_PROPS,
   toSystemdRunResult,
+  unitFileBirthMs,
 } from '../unit-run-status.js'
 
 /**
@@ -60,8 +70,7 @@ function unitMock(opts: {
 }): MockExecutor {
   const mock = new MockExecutor()
   mock.addFixture({ command: SYSTEMCTL, args: ['show', SERVICE, '-p', SERVICE_STATUS_PROPS], result: ok(blob(opts.service)) })
-  mock.addFixture({ command: SYSTEMCTL, args: ['show', TIMER, '-p', 'NextElapseUSecRealtime'], result: ok(`NextElapseUSecRealtime=${opts.nextRaw ?? ''}\n`) })
-  mock.addFixture({ command: SYSTEMCTL, args: ['show', TIMER, '-p', 'LastTriggerUSec'], result: ok(`LastTriggerUSec=${opts.lastTrigger ?? ''}\n`) })
+  mock.addFixture({ command: SYSTEMCTL, args: ['show', TIMER, '-p', TIMER_STATUS_PROPS], result: ok(`NextElapseUSecRealtime=${opts.nextRaw ?? ''}\nLastTriggerUSec=${opts.lastTrigger ?? ''}\n`) })
   mock.addFixture({ command: JOURNALCTL, args: ['-u', SERVICE, '-n', '200', '-o', 'short-iso', '--no-pager'], result: ok(opts.journal ?? '') })
   return mock
 }
@@ -86,7 +95,8 @@ describe('unit run status — shape 1: live service properties win', () => {
     assert.equal(st.lastRunNote, undefined)
     assert.equal(st.runActive, false)
     assert.equal(mock.calls.some(c => c.command === JOURNALCTL), false)
-    assert.equal(mock.calls.some(c => c.args.includes('LastTriggerUSec')), false)
+    // One timer show answers both the next elapse and the last trigger.
+    assert.equal(mock.calls.filter(c => c.args.includes(TIMER)).length, 1)
   })
 
   it('a unit running right now is live (running), whatever the journal holds', async () => {
@@ -101,7 +111,7 @@ describe('unit run status — shape 1: live service properties win', () => {
       serviceProps: { ...REBOOTED, ActiveState: 'failed', Result: 'exit-code', ExecMainStatus: '130', ExecMainExitTimestamp: 'Mon 2026-10-05 02:03:20 UTC' },
       liveResult: 'cancelled',
       readJournal: async () => CANCELLED_LINE,
-      readLastTrigger: async () => undefined,
+      lastTriggerRaw: undefined,
     })
     assert.equal(st.source, 'live')
     assert.equal(st.lastRunNote, 'cancelled by alice@pve at 2026-10-05T02:03:11.000Z')
@@ -136,8 +146,19 @@ describe('unit run status — shape 2: empty props, the journal\'s last result l
     assert.equal(st.lastRunResult, 'cancelled')
   })
 
-  it('a DISABLED unit with a result in its journal reports it rather than `disabled`', async () => {
-    const st = await derive(unitMock({ service: REBOOTED, journal: SUCCESS_LINE }), false)
+  it('a DISABLED unit with no live record reads `disabled` — the journal and timer rungs are not consulted', async () => {
+    const mock = unitMock({ service: REBOOTED, lastTrigger: 'Mon 2026-10-05 02:00:00 UTC', journal: SUCCESS_LINE })
+    const st = await derive(mock, false)
+    assert.equal(st.lastRunResult, 'disabled')
+    assert.equal(st.lastRunAt, null)
+    assert.equal(st.source, 'none')
+    assert.equal(st.lastRunNote, undefined)
+    assert.equal(mock.calls.some(c => c.command === JOURNALCTL), false)
+  })
+
+  it('a DISABLED unit that ran since boot still reports that run (live wins)', async () => {
+    const st = await derive(unitMock({ service: { ...REBOOTED, ExecMainExitTimestamp: 'Mon 2026-10-05 14:00:09 UTC' } }), false)
+    assert.equal(st.source, 'live')
     assert.equal(st.lastRunResult, 'success')
   })
 
@@ -181,10 +202,144 @@ describe('unit run status — pure pieces', () => {
     assert.equal(lastRunFromJournal(`${SYSTEMD_TRAILER}\n2026-10-05T02:00:09+0000 pve x[1]: {"progress":1}`), null)
   })
 
+  it('ONE scanner, ONE status rule: an absent status is a success for the last run AND the last success', () => {
+    assert.equal(lastSuccessFromJournal(SCHEDULE_LINE), '2026-10-05T02:00:04.000Z')
+    assert.equal(lastSuccessFromJournal([SUCCESS_LINE, SKIPPED_LINE, FAILURE_LINE, CANCELLED_LINE].join('\n')), '2026-10-05T02:00:07.000Z')
+    assert.equal(lastSuccessFromJournal([SKIPPED_LINE, FAILURE_LINE].join('\n')), null)
+    assert.equal(lastSuccessFromJournal(''), null)
+    // parseHelperResult finds the same newest line the derivation reads.
+    assert.equal(parseHelperResult<{ status?: string }>([SUCCESS_LINE, FAILURE_LINE, SYSTEMD_TRAILER].join('\n'))?.status, 'failure')
+    assert.equal(parseHelperResult(SYSTEMD_TRAILER), null)
+  })
+
+  it('readOnce makes one read however many callers ask', async () => {
+    let reads = 0
+    const read = readOnce(async () => {
+      reads++
+      return 'x'
+    })
+    assert.deepEqual(await Promise.all([read(), read(), read()]), ['x', 'x', 'x'])
+    assert.equal(reads, 1)
+  })
+
   it('toSystemdRunResult narrows skipped/cancelled to unknown for the systemd-vocabulary rows', () => {
     assert.equal(toSystemdRunResult('skipped'), 'unknown')
     assert.equal(toSystemdRunResult('cancelled'), 'unknown')
     assert.equal(toSystemdRunResult('success'), 'success')
     assert.equal(toSystemdRunResult('never-run'), 'never-run')
+  })
+})
+
+// --- B1: the journal is bounded by the unit file's birth ---------------------
+
+/** short-iso stamp (UTC) for an epoch-ms instant, the format journalctl prints. */
+function journalStamp(ms: number): string {
+  return `${new Date(ms).toISOString().slice(0, 19)}+0000`
+}
+
+/**
+ * A systemctl/journalctl double whose journalctl honours `--since @<s>` the way
+ * the real one does (verified on PVE 9 / systemd 257), over a canned journal.
+ */
+function sinceAwareExecutor(service: Record<string, string>, journalLines: string[]): CommandExecutor & { journalArgs: string[][] } {
+  const mock = unitMock({ service })
+  const journalArgs: string[][] = []
+  const exec: CommandExecutor['exec'] = async (command, args) => {
+    if (command !== JOURNALCTL)
+      return mock.exec(command, args)
+    journalArgs.push(args)
+    const i = args.indexOf('--since')
+    const sinceMs = i >= 0 ? Number(args[i + 1].slice(1)) * 1000 : Number.NEGATIVE_INFINITY
+    return ok(journalLines.filter(l => Date.parse(l.split(' ')[0].replace(/([+-]\d{2})(\d{2})$/, '$1:$2')) >= sinceMs).join('\n'))
+  }
+  return Object.assign(Object.create(mock) as CommandExecutor, { exec, journalArgs })
+}
+
+describe('unit run status — a unit\'s journal starts at its unit file\'s birth', () => {
+  it('birth time when the filesystem reports one, else ctime', () => {
+    assert.equal(unitFileBirthMs({ birthtimeMs: 1000, ctimeMs: 5000 }), 1000)
+    assert.equal(unitFileBirthMs({ birthtimeMs: 0, ctimeMs: 5000 }), 5000)
+  })
+
+  it('an in-place rewrite (the stores\' writeFile) keeps the birth time; delete + create gets a new one', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-unit-birth-'))
+    try {
+      const path = join(dir, SERVICE)
+      await writeFile(path, '[Service]\n', 'utf-8')
+      const born = await readUnitFileBirth(SERVICE, dir)
+      assert.notEqual(born, null)
+      if ((await stat(path)).birthtimeMs === 0)
+        return // No birth time on this filesystem — the ctime fallback is pinned above.
+      await new Promise(r => setTimeout(r, 20))
+      await writeFile(path, '[Service]\nDescription=edited\n', 'utf-8')
+      assert.equal(await readUnitFileBirth(SERVICE, dir), born)
+      await unlink(path)
+      await new Promise(r => setTimeout(r, 20))
+      await writeFile(path, '[Service]\n', 'utf-8')
+      assert.ok((await readUnitFileBirth(SERVICE, dir))! > born!)
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('no unit file → unbounded read (fail-open), same argv as before', async () => {
+    const mock = unitMock({ service: REBOOTED, journal: SUCCESS_LINE })
+    assert.equal(await readUnitJournal(mock, SERVICE, '/nonexistent-anas-dir'), SUCCESS_LINE)
+  })
+
+  it('a RE-CREATED unit with a predecessor\'s result lines in the journal reads never-run', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-unit-birth-'))
+    try {
+      // The predecessor ran and printed its result; then the task was deleted
+      // (timer stamp unlinked) and re-created under the same name.
+      await writeFile(join(dir, SERVICE), '[Service]\n', 'utf-8')
+      const born = (await readUnitFileBirth(SERVICE, dir))!
+      const before = journalStamp(born - 3600_000)
+      const executor = sinceAwareExecutor(REBOOTED, [
+        `${before} pve anas-x-demo[900]: {"task":"demo","result":{"status":"success"}}`,
+        `${before} pve systemd[1]: anas-x-demo.service: Deactivated successfully.`,
+      ])
+      const st = await deriveUnitRunStatus(executor, {
+        serviceUnit: SERVICE,
+        timerUnit: TIMER,
+        enabled: true,
+        readJournal: () => readUnitJournal(executor, SERVICE, dir),
+      })
+      assert.equal(st.lastRunResult, 'never-run')
+      assert.equal(st.lastRunAt, null)
+      assert.equal(st.source, 'none')
+      assert.deepEqual(executor.journalArgs[0].slice(0, 4), ['-u', SERVICE, '--since', `@${Math.floor(born / 1000)}`])
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('an EDITED-in-place unit keeps its history: the run after creation still answers', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-unit-birth-'))
+    try {
+      await writeFile(join(dir, SERVICE), '[Service]\n', 'utf-8')
+      const born = (await readUnitFileBirth(SERVICE, dir))!
+      const ran = journalStamp(born + 2000)
+      const executor = sinceAwareExecutor(REBOOTED, [
+        `${ran} pve anas-x-demo[900]: {"task":"demo","result":{"status":"failure"}}`,
+      ])
+      // The edit: the store's in-place writeFile of the same unit.
+      await writeFile(join(dir, SERVICE), '[Service]\nDescription=edited\n', 'utf-8')
+      const st = await deriveUnitRunStatus(executor, {
+        serviceUnit: SERVICE,
+        timerUnit: TIMER,
+        enabled: true,
+        readJournal: () => readUnitJournal(executor, SERVICE, dir),
+      })
+      assert.equal(st.source, 'journal')
+      assert.equal(st.lastRunResult, 'failure')
+      assert.equal(st.lastRunAt, new Date(Math.floor((born + 2000) / 1000) * 1000).toISOString())
+      assert.equal(executor.journalArgs[0][3], `@${Math.floor(born / 1000)}`)
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

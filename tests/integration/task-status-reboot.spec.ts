@@ -14,8 +14,10 @@ const execFileAsync = promisify(execFile)
  * every scheduled row read "never run" after the node rebooted. Proven here on
  * the stunt node by REBOOTING it:
  *
- *   - a snapshot schedule on the baseline `gtbackup` pool (hourly,
- *     retention hourly:1, disabled — its timer never fires on its own) is run
+ *   - a snapshot schedule on the baseline `gtbackup` pool (monthly,
+ *     retention monthly:1, ENABLED — a disabled row with no live record reads
+ *     `disabled` by design; the monthly timer's next elapse is the 1st, so it
+ *     does not fire on its own during the spec) is run
  *     THROUGH ITS UNIT (`systemctl start anas-snap-<id>.service`, exactly what
  *     its timer does — `POST /schedules/:id/run` runs the take in the daemon
  *     and leaves no unit history, so it cannot be the run a reboot is asked
@@ -160,7 +162,7 @@ test.describe('taskstatus.1 — last run and verdict survive a reboot (stunt nod
       await removeQuietly(ctx, `${V1}/cloud/tasks/${TASK}`)
       await removeQuietly(ctx, `${V1}/cloud/remotes/${REMOTE}`)
       await removeQuietly(ctx, `${V1}/schedules/${SCHED_ID}`)
-      await sshExec(`zfs list -H -o name -t snapshot -d 1 ${POOL} | grep '@anas-hourly-' | xargs -r -n1 zfs destroy || true`).catch(() => undefined)
+      await sshExec(`zfs list -H -o name -t snapshot -d 1 ${POOL} | grep '@anas-monthly-' | xargs -r -n1 zfs destroy || true`).catch(() => undefined)
       await ctx.dispose()
     }
     await execFileAsync(FIXTURE_SH, ['down'], { timeout: 300_000 }).catch((err) => {
@@ -173,9 +175,9 @@ test.describe('taskstatus.1 — last run and verdict survive a reboot (stunt nod
       id: SCHED_ID,
       name: 'taskstatus reboot proof',
       target: { kind: 'zfs', dataset: POOL },
-      cadence: 'hourly',
-      retention: { hourly: 1 },
-      enabled: false,
+      cadence: 'monthly',
+      retention: { monthly: 1 },
+      enabled: true,
     })
     // What the timer does: start the oneshot (blocks until it exits).
     await sshExec(`systemctl start anas-snap-${SCHED_ID}.service`)

@@ -1003,69 +1003,120 @@
     // GitHub #70: one legend row per guest volume blew the Datasets hero up
     // past the panel). Pure over the data — no DOM, no gfx state — so the
     // donut and the legend can draw the SAME returned array and never
-    // disagree. Keeps the `max` largest non-free segments with a positive
-    // value, in descending order; everything else (the remainder AND
-    // zero-value segments) folds into ONE roll-up row "{n} more" whose
-    // `names` array lists the folded labels (the legend renders that as the
-    // row's tooltip); every free:true segment passes through last, unchanged
-    // and uncounted toward `max`.
-    //   segments : [{ label, value, color?, free? }]
+    // disagree. The segments split three ways:
+    //   - free:true   → passed through LAST, unchanged, never counted;
+    //   - pinned:true → its own row always (the hero's "Proxmox storage"),
+    //                   after the named rows and before Free, never folded;
+    //                   it does take one of the `max` row slots, so the
+    //                   legend stays at most max + 2 rows (the rows, the
+    //                   roll-up, Free) — at max + 3 the Datasets tree fell
+    //                   just under half the panel on the 18-dataset case;
+    //   - the rest are the NAMED segments the cap applies to.
+    // When named + pinned fit in `max` nothing folds and the named rows keep
+    // the CALLER'S order (a small pool's legend reads exactly as it did before
+    // the cap existed); a missing/NaN/negative value reads as 0 there, in
+    // place. Over it, the largest positive values survive (`max` less the
+    // pinned rows, at least one) in
+    // descending order and everything else (the remainder AND zero-value
+    // segments) folds into ONE roll-up row "{n} more" whose `names` array
+    // lists the folded labels (the legend renders that as the row's tooltip).
+    // A null / non-object entry is not a segment and is skipped.
+    //   segments : [{ label, value, color?, free?, pinned? }]
     //   opts     : { max:Number (default 6 — on a full legend the Datasets
     //              tree must keep half the panel; 8 measured 47% at 1080p) }
     gfx.capSegments = function (segments, opts) {
         var max = (opts && typeof opts.max === 'number' && opts.max > 0) ? opts.max : 6;
         segments = segments || [];
         var named = [];
-        var rest = [];
+        var pinned = [];
         var free = [];
         for (var i = 0; i < segments.length; i++) {
             var seg = segments[i];
-            if (seg && seg.free) {
-                free.push(seg);
+            if (!seg || typeof seg !== 'object') {
                 continue;
             }
-            var val = Number(seg && seg.value) || 0;
-            if (val > 0) {
-                named.push({ seg: seg, value: val });
+            if (seg.free) {
+                free.push(seg);
+            } else if (seg.pinned) {
+                pinned.push(seg);
             } else {
-                // Zero-value (or malformed) segments never take a legend row
-                // of their own — they always count as "the rest".
-                rest.push(seg);
+                named.push(seg);
             }
         }
-        named.sort(function (a, b) { return b.value - a.value; });
         var out = [];
-        var kept = named.slice(0, max);
-        for (var k = 0; k < kept.length; k++) {
-            out.push(kept[k].seg);
-        }
-        var tail = named.slice(max);
-        for (var r = 0; r < tail.length; r++) {
-            rest.push(tail[r].seg);
-        }
-        if (rest.length) {
-            var sum = 0;
-            var names = [];
-            for (var j = 0; j < rest.length; j++) {
-                // A null entry or a negative value adds nothing — the
-                // roll-up never shrinks the ring or draws a negative arc.
-                var rv = Number(rest[j] && rest[j].value) || 0;
-                sum += rv > 0 ? rv : 0;
-                names.push((rest[j] && rest[j].label) || '');
+        var slots = Math.max(1, max - pinned.length);
+        if (named.length + pinned.length <= max) {
+            for (var u = 0; u < named.length; u++) {
+                out.push(withValidValue(named[u]));
             }
-            var moreWord = (typeof ANAS.t === 'function') ? ANAS.t('more') : 'more';
-            out.push({
-                label: rest.length + ' ' + moreWord,
-                value: sum,
-                names: names,
-                more: true,
-            });
+        } else {
+            var positive = [];
+            var rest = [];
+            for (var n = 0; n < named.length; n++) {
+                var val = Number(named[n].value) || 0;
+                if (val > 0) {
+                    positive.push({ seg: named[n], value: val });
+                } else {
+                    // Zero-value (or malformed) segments never take a legend
+                    // row of their own once the cap folds — "the rest".
+                    rest.push(named[n]);
+                }
+            }
+            positive.sort(function (a, b) { return b.value - a.value; });
+            for (var k = 0; k < positive.length; k++) {
+                if (k < slots) {
+                    out.push(positive[k].seg);
+                } else {
+                    rest.push(positive[k].seg);
+                }
+            }
+            if (rest.length) {
+                var sum = 0;
+                var names = [];
+                for (var j = 0; j < rest.length; j++) {
+                    // A negative value adds nothing — the roll-up never
+                    // shrinks the ring or draws a negative arc.
+                    var rv = Number(rest[j].value) || 0;
+                    sum += rv > 0 ? rv : 0;
+                    names.push(rest[j].label || '');
+                }
+                var moreWord = (typeof ANAS.t === 'function') ? ANAS.t('more') : 'more';
+                out.push({
+                    label: rest.length + ' ' + moreWord,
+                    value: sum,
+                    names: names,
+                    more: true,
+                });
+            }
+        }
+        for (var p = 0; p < pinned.length; p++) {
+            out.push(withValidValue(pinned[p]));
         }
         for (var f = 0; f < free.length; f++) {
             out.push(free[f]);
         }
         return out;
     };
+
+    // A segment whose value is a finite number ≥ 0 is returned AS IS (same
+    // object — a small pool's legend is byte-identical to the uncapped one);
+    // any other value reads as 0 on a shallow copy, so no row or arc ever
+    // draws NaN or a negative.
+    function withValidValue(seg) {
+        var v = seg.value;
+        if (typeof v === 'number' && isFinite(v) && v >= 0) {
+            return seg;
+        }
+        var copy = {};
+        for (var key in seg) {
+            if (Object.prototype.hasOwnProperty.call(seg, key)) {
+                copy[key] = seg[key];
+            }
+        }
+        var num = Number(v);
+        copy.value = (isFinite(num) && num > 0) ? num : 0;
+        return copy;
+    }
 
     // ---- The 1-2-5 scale ladder (operator design review, 2026-08-19) --------
     //

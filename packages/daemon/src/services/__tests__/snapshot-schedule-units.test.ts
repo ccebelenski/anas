@@ -203,21 +203,14 @@ describe('snapshot schedule units — status derivation + dashboard warnings', (
     })
     mock.addFixture({
       command: SYSTEMCTL,
-      args: ['show', timerUnitName('nightly-tank-media'), '-p', 'NextElapseUSecRealtime'],
-      result: { stdout: `NextElapseUSecRealtime=${opts.nextTs ?? '0'}\n`, stderr: '', exitCode: 0 },
+      args: ['show', timerUnitName('nightly-tank-media'), '-p', 'NextElapseUSecRealtime,LastTriggerUSec'],
+      result: { stdout: `NextElapseUSecRealtime=${opts.nextTs ?? '0'}\nLastTriggerUSec=${opts.lastTrigger ?? ''}\n`, stderr: '', exitCode: 0 },
     })
     if (opts.journal !== undefined) {
       mock.addFixture({
         command: '/usr/bin/journalctl',
         args: ['-u', serviceUnitName('nightly-tank-media'), '-n', '200', '-o', 'short-iso', '--no-pager'],
         result: { stdout: opts.journal, stderr: '', exitCode: 0 },
-      })
-    }
-    if (opts.lastTrigger !== undefined) {
-      mock.addFixture({
-        command: SYSTEMCTL,
-        args: ['show', timerUnitName('nightly-tank-media'), '-p', 'LastTriggerUSec'],
-        result: { stdout: `LastTriggerUSec=${opts.lastTrigger}\n`, stderr: '', exitCode: 0 },
       })
     }
     return mock
