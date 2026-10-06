@@ -1348,7 +1348,11 @@
                         var pruned = (typeof result.prunedCount === 'number')
                             ? result.prunedCount
                             : (result.pruned || []).length;
-                        var held = (result.skippedHeld || []).length;
+                        // `skippedHeld` is capped like `pruned`; the real
+                        // total is `heldCount` (fallback: the list).
+                        var held = (typeof result.heldCount === 'number')
+                            ? result.heldCount
+                            : (result.skippedHeld || []).length;
                         var extra = [];
                         if (pruned) { extra.push(pruned + ' ' + t('pruned')); }
                         // snapprune.1: a recursive schedule prunes across its
