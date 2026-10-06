@@ -4544,7 +4544,7 @@
         }
         segs.push({ label: t('Free'), value: free, free: true });
         if (typeof ANAS.gfx.capSegments === 'function') {
-            segs = ANAS.gfx.capSegments(segs, { max: 8 });
+            segs = ANAS.gfx.capSegments(segs, { max: 6 });
         }
         var donut = ANAS.gfx.donut(segs, {
             total: size,

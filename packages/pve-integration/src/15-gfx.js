@@ -1010,9 +1010,10 @@
     // row's tooltip); every free:true segment passes through last, unchanged
     // and uncounted toward `max`.
     //   segments : [{ label, value, color?, free? }]
-    //   opts     : { max:Number (default 8) }
+    //   opts     : { max:Number (default 6 — on a full legend the Datasets
+    //              tree must keep half the panel; 8 measured 47% at 1080p) }
     gfx.capSegments = function (segments, opts) {
-        var max = (opts && typeof opts.max === 'number' && opts.max > 0) ? opts.max : 8;
+        var max = (opts && typeof opts.max === 'number' && opts.max > 0) ? opts.max : 6;
         segments = segments || [];
         var named = [];
         var rest = [];

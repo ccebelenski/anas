@@ -15,7 +15,7 @@ import { poolExists, sshExec } from './fixtures/stunt-node'
  * component at natural height above the flex:1 tree) pushed the tree to zero
  * height. The fix folds PVE-owned children into ONE "Proxmox storage"
  * segment (the same ownership verdict the Name-column badge uses) and caps
- * the legend to the largest 8 named segments + one "n more" roll-up, Free
+ * the legend to the largest 6 named segments + one "n more" roll-up, Free
  * last — so the invariant is hero height bounded regardless of dataset count,
  * NOT a scrollable legend.
  *
@@ -31,14 +31,14 @@ import { poolExists, sshExec } from './fixtures/stunt-node'
  *
  * The cap itself needs more named segments than pvfix carries, so the last
  * test adds pvfix/hero-01 … hero-12 (distinct sizes) for an 18-dataset pool —
- * 13 ANAS datasets + the folded segment = 14 named, more than the 8 kept —
+ * 13 ANAS datasets + the folded segment = 14 named, more than the 6 kept —
  * and destroys them again in afterAll (with a pre-clean in beforeAll so a
  * failed run never leaves them behind).
  */
 
 const PVE_POOL = 'pvfix'
-// N = 8 named + 1 roll-up + Free = 10 rows maximum by construction.
-const MAX_LEGEND_ROWS = 10
+// N = 6 named + 1 roll-up + Free = 8 rows maximum by construction.
+const MAX_LEGEND_ROWS = 8
 
 test.beforeEach(async () => {
   test.skip(
@@ -113,6 +113,7 @@ async function expectTreeKeepsHalf(page: Page, grid: Locator): Promise<void> {
   const bodyBox = await grid.locator('.x-tree-view').boundingBox()
   expect(panelBox).not.toBeNull()
   expect(bodyBox).not.toBeNull()
+  console.warn(`dshero.1 tree body ${bodyBox!.height.toFixed(0)}px of panel ${panelBox!.height.toFixed(0)}px = ${(100 * bodyBox!.height / panelBox!.height).toFixed(1)}%`)
   expect(bodyBox!.height).toBeGreaterThanOrEqual(panelBox!.height * 0.5)
 }
 
@@ -148,8 +149,8 @@ test.describe('dshero.1 — the cap on a pool with many datasets (#70)', () => {
     await destroyHeroDatasets()
   })
 
-  test('18 datasets: the legend rolls up past 8 into one "n more" row', async ({ page }) => {
-    const { hero } = await openDatasetsOnPvfix(page)
+  test('18 datasets: the legend rolls up past 6 into one "n more" row and the tree keeps half', async ({ page }) => {
+    const { grid, hero } = await openDatasetsOnPvfix(page)
 
     const names = hero.locator('.anas-gfx-legend .anas-gfx-legend-nm')
     await expect(names.first()).toBeVisible({ timeout: 20_000 })
@@ -157,5 +158,7 @@ test.describe('dshero.1 — the cap on a pool with many datasets (#70)', () => {
     const labels = await names.allTextContents()
     expect(labels.length).toBeLessThanOrEqual(MAX_LEGEND_ROWS)
     expect(labels.filter(l => /\d+ more/.test(l))).toHaveLength(1)
+
+    await expectTreeKeepsHalf(page, grid)
   })
 })

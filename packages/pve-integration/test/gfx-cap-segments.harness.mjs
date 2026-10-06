@@ -109,31 +109,31 @@ function synthetic(n) {
   return out
 }
 
-// --- 1. The 60-segment case: max 8 named + one roll-up + Free last -----------
+// --- 1. The 60-segment case: max 6 named + one roll-up + Free last -----------
 
 {
   const capped = gfx.capSegments(synthetic(60))
-  eq('60 in → 10 out (8 + roll-up + Free)', capped.length, 10)
+  eq('60 in → 8 out (6 + roll-up + Free)', capped.length, 8)
 
-  const named = capped.slice(0, 8)
-  ok('the 8 largest survive', named.every(s => !s.free && !s.more))
+  const named = capped.slice(0, 6)
+  ok('the 6 largest survive', named.every(s => !s.free && !s.more))
   eq('largest is #60', named[0].label, 'vm-60-disk-0')
-  eq('8th largest is #53', named[7].label, 'vm-53-disk-0')
+  eq('6th largest is #55', named[5].label, 'vm-55-disk-0')
   for (let i = 1; i < named.length; i++) {
     ok(`descending order at ${i}`, named[i - 1].value > named[i].value,
       `${named[i - 1].value} then ${named[i].value}`)
   }
 
-  const roll = capped[8]
+  const roll = capped[6]
   ok('roll-up is flagged', !!roll.more)
-  eq('roll-up label', roll.label, '52 [more]')
+  eq('roll-up label', roll.label, '54 [more]')
   eq('roll-up value is the remaining sum',
-    roll.value, [...Array(52).keys()].map(i => (i + 1) * GiB).reduce((a, b) => a + b))
-  eq('roll-up names carry every folded label', roll.names.length, 52)
-  ok('roll-up names start just below the cap', roll.names[0] === 'vm-52-disk-0')
-  ok('roll-up names end at the smallest', roll.names[51] === 'vm-1-disk-0')
+    roll.value, [...Array(54).keys()].map(i => (i + 1) * GiB).reduce((a, b) => a + b))
+  eq('roll-up names carry every folded label', roll.names.length, 54)
+  ok('roll-up names start just below the cap', roll.names[0] === 'vm-54-disk-0')
+  ok('roll-up names end at the smallest', roll.names[53] === 'vm-1-disk-0')
 
-  const free = capped[9]
+  const free = capped[7]
   ok('Free passes through last, unchanged', free.free === true && free.label === 'Free'
     && free.value === 500 * GiB)
 
@@ -141,11 +141,11 @@ function synthetic(n) {
   // counts must agree (the #70 invariant: ring and list never disagree).
   const legend = gfx.legend(capped, { format: v => gfx.rungLabel(v) })
   const donut = gfx.donut(capped, { total: 1000 * GiB })
-  eq('legend rows match segments', (legend.match(/anas-gfx-legend-row/g) || []).length, 10)
-  eq('donut arcs match segments', (donut.match(/<circle/g) || []).length, 10)
+  eq('legend rows match segments', (legend.match(/anas-gfx-legend-row/g) || []).length, 8)
+  eq('donut arcs match segments', (donut.match(/<circle/g) || []).length, 8)
   // The roll-up row carries the folded names as its tooltip.
   ok('roll-up row tooltip lists the folded names',
-    legend.includes('title="vm-52-disk-0, vm-51-disk-0'))
+    legend.includes('title="vm-54-disk-0, vm-53-disk-0'))
   ok('named rows carry no tooltip', !legend.includes('title="vm-60-disk-0'))
 }
 
@@ -158,21 +158,21 @@ function synthetic(n) {
   eq('under max: sorted value-descending, Free last',
     capped.map(s => s.label).join(','), 'vm-5-disk-0,vm-4-disk-0,vm-3-disk-0,vm-2-disk-0,vm-1-disk-0,Free')
 
-  const exact = gfx.capSegments(synthetic(8))
-  eq('exactly max → 9 out (8 + Free)', exact.length, 9)
+  const exact = gfx.capSegments(synthetic(6))
+  eq('exactly max → 7 out (6 + Free)', exact.length, 7)
   ok('no roll-up at exactly max', exact.every(s => !s.more))
 }
 
 // --- 3. Free is never counted toward max --------------------------------------
 
 {
-  // 8 positive segments AND two free-shaped rows: all 8 named survive.
-  const segs = synthetic(8)
+  // 6 positive segments AND two free-shaped rows: all 6 named survive.
+  const segs = synthetic(6)
   segs.push({ label: 'Free (2nd)', value: 1 * GiB, free: true })
   const capped = gfx.capSegments(segs)
-  eq('free rows never crowd out named ones', capped.length, 10)
+  eq('free rows never crowd out named ones', capped.length, 8)
   ok('both free rows pass through at the tail',
-    capped[8].free === true && capped[9].free === true && capped[9].label === 'Free (2nd)')
+    capped[6].free === true && capped[7].free === true && capped[7].label === 'Free (2nd)')
 }
 
 // --- 4. Zero-value segments always count as "the rest" ------------------------
@@ -208,7 +208,7 @@ ok('input array is never mutated', (() => {
   return segs.map(s => s.label).join(',') === before
 })())
 ok('custom max honoured', gfx.capSegments(synthetic(10), { max: 3 }).length === 5)
-ok('bogus max falls back to 8', gfx.capSegments(synthetic(10), { max: -1 }).length === 10)
+ok('bogus max falls back to 6', gfx.capSegments(synthetic(10), { max: -1 }).length === 8)
 
 // --- 6. Malformed entries: null never throws, negatives never shrink ---------
 
@@ -240,7 +240,7 @@ ok('bogus max falls back to 8', gfx.capSegments(synthetic(10), { max: -1 }).leng
 
 // --- 7. The roll-up word goes through ANAS.t ----------------------------------
 
-eq('roll-up word translated', gfx.capSegments(synthetic(10))[8].label, '2 [more]')
+eq('roll-up word translated', gfx.capSegments(synthetic(10))[6].label, '4 [more]')
 
 // ---- Report -----------------------------------------------------------------
 
