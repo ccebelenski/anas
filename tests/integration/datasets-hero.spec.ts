@@ -50,6 +50,11 @@ test.beforeEach(async () => {
 /** Select the pvfix pool row so the hero focuses on it. */
 async function openDatasetsOnPvfix(page: Page): Promise<{ grid: Locator, hero: Locator }> {
   await loginToPve(page)
+  return showPvfixHero(page)
+}
+
+/** On a logged-in page: open Datasets and focus the hero on pvfix. */
+async function showPvfixHero(page: Page): Promise<{ grid: Locator, hero: Locator }> {
   await openAnasItem(page, 'Datasets')
   const grid = page.locator('.anas-grid-datasets')
   await expect(grid).toBeVisible({ timeout: 45_000 })
@@ -167,26 +172,59 @@ test.describe('dshero.1 — the cap on a pool with many datasets (#70)', () => {
     await expectTreeKeepsHalf(page, grid)
   })
 
-  // A common laptop screen: the same bound at a second size (0.4.2 test
-  // review C8) — the 2560x1080 case alone could hide a cap that only holds
-  // on a tall screen.
+  // A common laptop screen (0.4.2 test review C8): PVE's own task log takes
+  // the bottom third of a 768px screen, so the full hero left the tree 19.7%
+  // of the panel. Under 600px of panel body the hero is compact (110px donut,
+  // max 3 named rows → legend <= 5 rows), and a "Hide chart" link collapses it
+  // to its title line, remembered per browser.
   test.describe('at 1366x768', () => {
     test.use({ viewport: { width: 1366, height: 768 } })
 
-    test('18 datasets at 1366x768: the legend stays capped and the tree keeps half', async ({ page }) => {
-      // KNOWN FAILING, cap decision pending with the operator (0.4.2 test
-      // review C8): measured on the stunt node, the tree body is 88px of a
-      // 446px panel (19.7%) at 1366x768 with the legend at its 8-row cap —
-      // PVE's own task log takes the lower third of a 768px screen. Expected
-      // to fail until the cap (or the bound) is decided; Playwright flags it
-      // the moment it starts passing.
-      test.fail(true, 'tree body 19.7% of the panel at 1366x768 — cap decision pending')
+    test('18 datasets at 1366x768: the compact legend (<= 5 rows) and the tree keeps half', async ({ page }) => {
       const { grid, hero } = await openDatasetsOnPvfix(page)
       const names = hero.locator('.anas-gfx-legend .anas-gfx-legend-nm')
       await expect(names.first()).toBeVisible({ timeout: 20_000 })
-      expect((await names.allTextContents()).length).toBeLessThanOrEqual(MAX_LEGEND_ROWS)
+      const labels = await names.allTextContents()
+      console.warn(`dshero.1 @1366x768 legend rows: ${labels.join(' | ')}`)
+      expect(labels.length).toBeLessThanOrEqual(5)
+      expect(labels.filter(l => /\d+ more/.test(l))).toHaveLength(1)
+      expect(labels.slice(-2)).toEqual(['Proxmox storage', 'Free'])
 
       await expectTreeKeepsHalf(page, grid)
+    })
+
+    test('Hide chart collapses the hero to its title, the tree grows, and a reload keeps it', async ({ page }) => {
+      const { grid, hero } = await openDatasetsOnPvfix(page)
+      const legend = hero.locator('.anas-gfx-legend')
+      await expect(legend).toBeVisible({ timeout: 20_000 })
+      const before = (await grid.locator('.x-tree-view').boundingBox())!.height
+
+      await hero.locator('.anas-ds-hero-toggle', { hasText: 'Hide chart' }).click()
+      await expect(legend).toHaveCount(0)
+      await expect(hero.locator('.anas-ds-hero-toggle')).toHaveText('Show chart')
+      await expect(hero.locator('.anas-ds-hero-t')).toContainText(PVE_POOL)
+      await expect.poll(async () => (await grid.locator('.x-tree-view').boundingBox())!.height).toBeGreaterThan(before)
+      const after = (await grid.locator('.x-tree-view').boundingBox())!.height
+      console.warn(`dshero.1 @1366x768 Hide chart: tree body ${before.toFixed(0)}px -> ${after.toFixed(0)}px`)
+
+      // A reload (same browser, same origin storage) keeps it collapsed.
+      await page.reload()
+      await page.waitForFunction(
+        () => ![...document.querySelectorAll('.x-mask')].some(el => (el as HTMLElement).offsetParent !== null),
+        undefined,
+        { timeout: 30_000 },
+      ).catch(() => undefined)
+      const nag = page.getByText('No valid subscription')
+      if (await nag.isVisible({ timeout: 10_000 }).catch(() => false))
+        await page.getByRole('button', { name: 'OK' }).click()
+      const again = await showPvfixHero(page)
+      await expect(again.hero.locator('.anas-ds-hero-toggle')).toHaveText('Show chart', { timeout: 20_000 })
+      await expect(again.hero.locator('.anas-gfx-legend')).toHaveCount(0)
+
+      // Show chart brings it back (and leaves the browser in the default state).
+      await again.hero.locator('.anas-ds-hero-toggle').click()
+      await expect(again.hero.locator('.anas-gfx-legend')).toBeVisible()
+      await expect(again.hero.locator('.anas-ds-hero-toggle')).toHaveText('Hide chart')
     })
   })
 })

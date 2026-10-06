@@ -4491,7 +4491,56 @@
         return null;
     }
 
-    function buildHeroHtml(tree, poolName) {
+    // ---- Short screens (dshero.1, 0.4.2 test review C8) --------------------
+    //
+    // On a short Datasets panel (a 1366x768 laptop: PVE's own task log takes
+    // the bottom third) the full hero left the tree a fifth of the panel. Two
+    // answers: under HERO_COMPACT_BELOW px of panel body the hero draws a
+    // smaller donut and keeps at most 3 named legend rows (legend <= 5 rows
+    // with the roll-up and Free), re-evaluated when the panel resizes; and a
+    // "Hide chart" link collapses the hero to its title line, remembered per
+    // browser (a per-viewer convenience — localStorage, fail-open to shown).
+
+    var HERO_COMPACT_BELOW = 600;
+    var HERO_COLLAPSED_KEY = 'anas.datasets.heroCollapsed';
+
+    function heroCollapsed() {
+        try {
+            return window.localStorage.getItem(HERO_COLLAPSED_KEY) === '1';
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function setHeroCollapsed(collapsed) {
+        try {
+            if (collapsed) {
+                window.localStorage.setItem(HERO_COLLAPSED_KEY, '1');
+            } else {
+                window.localStorage.removeItem(HERO_COLLAPSED_KEY);
+            }
+        } catch (e) {
+            // storage unavailable — the toggle still works for this render
+        }
+    }
+
+    // Is the Datasets panel body short enough for the compact hero?
+    function heroCompact(view) {
+        try {
+            var h = (view.body && view.body.getHeight) ? view.body.getHeight() : view.getHeight();
+            return h > 0 && h < HERO_COMPACT_BELOW;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function heroToggleHtml(collapsed) {
+        return '<a class="anas-ds-hero-toggle" role="button" tabindex="0">'
+            + enc(collapsed ? t('Show chart') : t('Hide chart')) + '</a>';
+    }
+
+    function buildHeroHtml(tree, poolName, opts) {
+        opts = opts || {};
         if (!gfxReady() || typeof ANAS.gfx.donut !== 'function') {
             return '';
         }
@@ -4503,6 +4552,12 @@
         var size = Number(ps.size) || 0;
         if (!size) {
             return '';
+        }
+        var title = '<div class="anas-ds-hero-t">' + enc(t('Pool space') + ' — ') + '<b>' + enc(poolName) + '</b>'
+            + heroToggleHtml(!!opts.collapsed) + '</div>';
+        if (opts.collapsed) {
+            return '<div class="anas-ds-hero-wrap anas-ds-hero-collapsed">'
+                + '<div class="anas-ds-hero-main">' + title + '</div></div>';
         }
         var allocated = Number(ps.allocated) || 0;
         var free = Number(ps.free);
@@ -4546,18 +4601,18 @@
         }
         segs.push({ label: t('Free'), value: free, free: true });
         if (typeof ANAS.gfx.capSegments === 'function') {
-            segs = ANAS.gfx.capSegments(segs, { max: 6 });
+            segs = ANAS.gfx.capSegments(segs, { max: opts.compact ? 3 : 6 });
         }
         var donut = ANAS.gfx.donut(segs, {
             total: size,
-            size: 150,
+            size: opts.compact ? 110 : 150,
             center: { big: fmtBytes(allocated), sm: t('of') + ' ' + fmtBytes(size) },
         });
         var legend = ANAS.gfx.legend(segs, { total: size, format: fmtBytes });
         return '<div class="anas-ds-hero-wrap">'
             + '<div class="anas-ds-hero-donut">' + donut + '</div>'
             + '<div class="anas-ds-hero-main">'
-            + '<div class="anas-ds-hero-t">' + enc(t('Pool space') + ' — ') + '<b>' + enc(poolName) + '</b></div>'
+            + title
             + '<div class="anas-ds-hero-s">'
             + enc(t('How the used space breaks down across top-level datasets.')) + '</div>'
             + legend + '</div></div>';
@@ -4577,7 +4632,11 @@
                 return;
             }
             var poolName = tree.anasHeroPool || firstPoolName(tree);
-            var html = poolName ? buildHeroHtml(tree, poolName) : '';
+            // Re-evaluated on every refresh and on the panel's resize (below).
+            tree.anasHeroCompact = heroCompact(view);
+            var html = poolName
+                ? buildHeroHtml(tree, poolName, { compact: tree.anasHeroCompact, collapsed: heroCollapsed() })
+                : '';
             if (html) {
                 hero.update(html);
                 hero.setHidden(false);
@@ -4665,6 +4724,10 @@
             css.push('.anas-ds-hero-main{flex:1;min-width:240px}');
             css.push('.anas-ds-hero-t{font-weight:650;margin:0 0 3px;color:var(--anas-ink)}');
             css.push('.anas-ds-hero-s{color:var(--anas-muted);font-size:12px;margin-bottom:10px}');
+            css.push('.anas-ds-hero-toggle{margin-left:12px;font-weight:400;font-size:12px;cursor:pointer;'
+                + 'color:var(--anas-accent);text-decoration:none}');
+            css.push('.anas-ds-hero-toggle:hover,.anas-ds-hero-toggle:focus{text-decoration:underline}');
+            css.push('.anas-ds-hero-collapsed .anas-ds-hero-t{margin:0}');
 
             var style = document.createElement('style');
             style.id = STYLE_ID;
@@ -4892,6 +4955,25 @@
             title: t('Datasets'),
             layout: { type: 'vbox', align: 'stretch' },
             border: false,
+            listeners: {
+                // dshero.1: a panel that crosses the compact threshold
+                // re-renders the hero (debounced — a drag resizes many times).
+                resize: function (panel) {
+                    clearTimeout(panel.anasHeroResizeTimer);
+                    panel.anasHeroResizeTimer = setTimeout(function () {
+                        if (panel.destroyed || panel.destroying) {
+                            return;
+                        }
+                        var tree = panel.down('#dsTree');
+                        if (tree && heroCompact(panel) !== tree.anasHeroCompact) {
+                            refreshHero(tree);
+                        }
+                    }, 150);
+                },
+                destroy: function (panel) {
+                    clearTimeout(panel.anasHeroResizeTimer);
+                },
+            },
             items: [{
                 // Epic 15.4 pool-space donut hero — sits above the tree, hidden
                 // until data arrives (refreshHero populates + reveals it).
@@ -4900,6 +4982,30 @@
                 cls: 'anas-ds-hero',
                 hidden: true,
                 html: '',
+                listeners: {
+                    // The "Hide chart" / "Show chart" link in the title row
+                    // (click or Enter): flip the remembered state, re-render.
+                    afterrender: function (hero) {
+                        var flip = function (e) {
+                            if (!e.getTarget('.anas-ds-hero-toggle')) {
+                                return;
+                            }
+                            if (e.type === 'keydown' && e.getKey() !== e.ENTER && e.getKey() !== e.SPACE) {
+                                return;
+                            }
+                            e.stopEvent();
+                            setHeroCollapsed(!heroCollapsed());
+                            // The hero is a direct child of the view.
+                            var view = hero.ownerCt;
+                            var tree = view && view.down('#dsTree');
+                            if (tree) {
+                                refreshHero(tree);
+                            }
+                        };
+                        hero.el.on('click', flip);
+                        hero.el.on('keydown', flip);
+                    },
+                },
             }, {
                 xtype: 'treepanel',
                 itemId: 'dsTree',

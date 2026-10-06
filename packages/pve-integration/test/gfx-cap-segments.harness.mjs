@@ -304,6 +304,29 @@ ok('bogus max falls back to 6', gfx.capSegments(synthetic(10), { max: -1 }).leng
 
 eq('roll-up word translated', gfx.capSegments(synthetic(10))[6].label, '4 [more]')
 
+// --- 8. The compact hero (dshero.1 short screens): max 3 → legend <= 5 rows ---
+
+{
+  const capped = gfx.capSegments(synthetic(60), { max: 3 })
+  eq('max 3: 60 in → 5 out (3 + roll-up + Free)', capped.length, 5)
+  eq('max 3: largest kept', capped[0].label, 'vm-60-disk-0')
+  ok('max 3: the roll-up is 4th', !!capped[3].more)
+  eq('max 3: it folds the other 57', capped[3].names.length, 57)
+  ok('max 3: Free is last', !!capped[4].free)
+
+  // The Proxmox storage segment is pinned: one of the 3, never folded.
+  const withPinned = synthetic(18)
+  withPinned.splice(withPinned.length - 1, 0, { label: 'Proxmox storage', value: 0.5 * GiB, pinned: true })
+  const pinned = gfx.capSegments(withPinned, { max: 3 })
+  eq('max 3 + pinned: still 5 rows', pinned.length, 5)
+  ok('max 3 + pinned: the pinned row survives', pinned.some(s => s.label === 'Proxmox storage' && !s.more))
+  eq('max 3 + pinned: two named + pinned before the roll-up', pinned.filter(s => !s.more && !s.free).length, 3)
+  ok('max 3 + pinned: Free last', !!pinned[pinned.length - 1].free)
+
+  // At or under 3 named nothing folds.
+  eq('max 3: three named + Free fold nothing', gfx.capSegments(synthetic(3), { max: 3 }).length, 4)
+}
+
 // ---- Report -----------------------------------------------------------------
 
 if (failures.length) {
