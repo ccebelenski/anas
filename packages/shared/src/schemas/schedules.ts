@@ -298,10 +298,33 @@ export const SnapshotScheduleRunResult = z.object({
   schedule: ScheduleId,
   /** The label of the snapshot just taken (`anas-<bucket>-<utc>`). */
   taken: z.string(),
-  /** Labels of the snapshots pruned by retention. */
+  /**
+   * Snapshots pruned by retention: the bare label for the schedule's target,
+   * `<dataset>@<label>` for any other dataset (a recursive schedule prunes its
+   * whole sweep — snapprune.1).
+   */
   pruned: z.array(z.string()),
-  /** Labels of held snapshots retained despite policy (surfaced as intentional). */
+  /** Held snapshots retained despite policy (surfaced as intentional), named as `pruned`. */
   skippedHeld: z.array(z.string()),
+  /**
+   * snapprune.1: what prune did PER DATASET on a recursive ZFS schedule, in
+   * counts. Absent for a non-recursive or AHR schedule (one dataset, the
+   * totals above say it all) and from an older daemon (additive).
+   */
+  datasets: z.array(z.object({
+    dataset: z.string(),
+    /**
+     * `target` — the schedule's own dataset (its full policy, as always);
+     * `sweep` — a child the recursive take covers (this schedule's bucket);
+     * `excluded` — a child outside the sweep that still carried snapshots
+     * this schedule took before it was excluded.
+     */
+    scope: z.enum(['target', 'sweep', 'excluded']),
+    pruned: z.number().int().nonnegative(),
+    held: z.number().int().nonnegative(),
+    /** Why snapshots on this dataset were left in place, when some were. */
+    note: z.string().optional(),
+  })).optional(),
 })
 export type SnapshotScheduleRunResult = z.infer<typeof SnapshotScheduleRunResult>
 

@@ -41,7 +41,9 @@
  *                                  kind/pool that inventory failed to list.
  *   DELETE /schedules/:id        → removes the units only (never the snapshots)
  *   POST   /schedules/:id/run    → fire now: take + prune (202 job; result carries
- *                                  { taken, pruned[], skippedHeld[] })
+ *                                  { taken, pruned[], skippedHeld[], datasets?[] } —
+ *                                  datasets = per-dataset counts of a recursive
+ *                                  schedule's prune, snapprune.1)
  *
  * Target pickers reuse GET /pools (ANAS-managed ZFS pools + their datasets) and
  * GET /ahr (AHR pools; only subvolLayout:true pools can be snapshotted).
@@ -1338,6 +1340,12 @@
                         var held = (result.skippedHeld || []).length;
                         var extra = [];
                         if (pruned) { extra.push(pruned + ' ' + t('pruned')); }
+                        // snapprune.1: a recursive schedule prunes across its
+                        // sweep; say over how many datasets.
+                        var touched = (result.datasets || []).filter(function (d) {
+                            return d && (d.pruned || d.held);
+                        }).length;
+                        if (touched > 1) { extra.push(t('across') + ' ' + touched + ' ' + t('datasets')); }
                         // Held snapshots are intentionally retained, NOT a failure (GT-7).
                         if (held) { extra.push(held + ' ' + t('held (kept)')); }
                         if (extra.length) { msg += ' — ' + extra.join(', '); }

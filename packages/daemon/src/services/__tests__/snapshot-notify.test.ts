@@ -140,6 +140,26 @@ describe('snapshot schedule notifications — the body (9.4)', () => {
     assert.ok(body.includes('Read-only file system'))
   })
 
+  it('a recursive prune reports per dataset (snapprune.1)', () => {
+    const body = buildSnapshotNotifyBody({
+      schedule: makeSchedule({ recursive: true, exclude: ['testpool/media/scratch'] }),
+      result: {
+        ...CLEAN_RUN,
+        pruned: ['anas-daily-2026-08-12T020000Z', 'testpool/media/a@anas-daily-2026-08-12T020000Z'],
+        datasets: [
+          { dataset: 'testpool/media', scope: 'target', pruned: 1, held: 0 },
+          { dataset: 'testpool/media/a', scope: 'sweep', pruned: 1, held: 1 },
+          { dataset: 'testpool/media/b', scope: 'sweep', pruned: 0, held: 0 },
+          { dataset: 'testpool/media/scratch', scope: 'excluded', pruned: 0, held: 0, note: '2 left: not taken by this schedule' },
+        ],
+      },
+      elapsedMs: 1000,
+    })
+    assert.match(body, /Per dataset:\n {2}testpool\/media \(target\): 1 destroyed\n {2}testpool\/media\/a \(sweep\): 1 destroyed, 1 held\n {2}testpool\/media\/scratch \(excluded\): 0 destroyed, 2 left: not taken by this schedule/)
+    assert.doesNotMatch(body, /testpool\/media\/b/)
+    assert.match(body, ASCII_ONLY)
+  })
+
   it('a recursive schedule with excludes counts and names them (snapx.1)', () => {
     const body = buildSnapshotNotifyBody({
       schedule: makeSchedule({ recursive: true, exclude: ['testpool/media/scratch', 'testpool/media/vm-100-disk-0'] }),

@@ -1,4 +1,4 @@
-import type { AhrPool, SnapshotTarget } from '@anas/shared'
+import type { AhrPool, SnapshotSchedule, SnapshotTarget } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -8,6 +8,9 @@ import { MockExecutor } from '../../executor/mock.js'
 import {
   listScheduledSnapshots,
   parseZfsScheduledSnapshots,
+  parseZfsTreeSnapshots,
+  planRecursivePrune,
+  pruneRecursiveSchedule,
   pruneSnapshots,
   takeSnapshot,
 } from '../snapshot-schedules.js'
@@ -305,5 +308,219 @@ describe('pruneSnapshots — AHR', () => {
     finally {
       await rm(runtimeDir, { recursive: true, force: true })
     }
+  })
+})
+
+// =============================================================================
+//  snapprune.1 — retention across a recursive schedule's sweep, per dataset
+// =============================================================================
+
+describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
+  const H1 = 'anas-hourly-2026-07-26T100000Z'
+  const H2 = 'anas-hourly-2026-07-26T110000Z'
+  const H3 = 'anas-hourly-2026-07-26T120000Z'
+  const D1 = 'anas-daily-2026-07-25T000000Z'
+  const PRUNE_NOW = new Date('2026-07-26T13:00:00.000Z')
+
+  function sched(over: Partial<SnapshotSchedule> = {}): SnapshotSchedule {
+    return {
+      id: 'hourly-tank',
+      name: 'Hourly tank',
+      target: { kind: 'zfs', dataset: 'tank' },
+      cadence: 'hourly',
+      retention: { hourly: 1 },
+      recursive: true,
+      enabled: true,
+      notify: 'on-failure',
+      ...over,
+    }
+  }
+
+  /** `ds@label<TAB>creation<TAB>userrefs<TAB>createtxg` rows; txg = the take. */
+  function row(ds: string, label: string, txg: number, userrefs = 0): string {
+    return [`${ds}@${label}`, '1769385600', String(userrefs), String(txg)].join('\t')
+  }
+
+  /** The three takes of a plain `-r` on tank (txg 100/200/300) across a tree. */
+  function tree(datasets: string[], extra: string[] = []): string {
+    const lines: string[] = []
+    for (const ds of datasets) {
+      lines.push(row(ds, H1, 100), row(ds, H2, 200), row(ds, H3, 300))
+    }
+    return [...lines, ...extra].join('\n')
+  }
+
+  function plan(stdout: string, schedule = sched(), others: SnapshotSchedule[] = [], owned: string[] = []) {
+    return planRecursivePrune({
+      schedule,
+      inventory: parseZfsTreeSnapshots(stdout),
+      others,
+      isOwned: ds => owned.includes(ds),
+      now: PRUNE_NOW,
+    })
+  }
+
+  const byDs = (plans: ReturnType<typeof plan>, ds: string) => plans.find(p => p.dataset === ds)
+
+  it('a child of a plain recursive schedule converges to the policy count', () => {
+    const plans = plan(tree(['tank', 'tank/media', 'tank/media/raw']))
+    for (const ds of ['tank', 'tank/media', 'tank/media/raw']) {
+      const p = byDs(plans, ds)!
+      assert.deepEqual(p.prune.map(s => s.name).sort(), [H1, H2], ds)
+    }
+    assert.equal(byDs(plans, 'tank')!.scope, 'target')
+    assert.equal(byDs(plans, 'tank/media')!.scope, 'sweep')
+    assert.equal(plans[0].dataset, 'tank', 'the target comes first')
+  })
+
+  it('a held child snapshot is skipped and reported, never planned for destroy', () => {
+    const plans = plan(tree(['tank'], [row('tank/media', H1, 100, 1), row('tank/media', H2, 200), row('tank/media', H3, 300)]))
+    const media = byDs(plans, 'tank/media')!
+    assert.deepEqual(media.prune.map(s => s.name), [H2])
+    assert.deepEqual(media.skippedHeld.map(s => s.name), [H1])
+  })
+
+  it('a child keeps the snapshots of OTHER buckets (its own daily schedule\'s)', () => {
+    const plans = plan(tree(['tank', 'tank/media'], [row('tank/media', D1, 50)]))
+    assert.ok(!byDs(plans, 'tank/media')!.prune.some(s => s.name === D1))
+  })
+
+  it('a child another enabled same-bucket schedule covers keeps the MOST generous count', () => {
+    const other = sched({ id: 'hourly-media', target: { kind: 'zfs', dataset: 'tank/media' }, recursive: false, retention: { hourly: 2 } })
+    const plans = plan(tree(['tank', 'tank/media']), sched(), [other])
+    assert.deepEqual(byDs(plans, 'tank/media')!.prune.map(s => s.name), [H1])
+    // A DISABLED one does not count.
+    const off = plan(tree(['tank', 'tank/media']), sched(), [{ ...other, enabled: false }])
+    assert.deepEqual(byDs(off, 'tank/media')!.prune.map(s => s.name).sort(), [H1, H2])
+  })
+
+  it('an excluded dataset and its subtree are cleared of this schedule\'s snapshots outright', () => {
+    const plans = plan(tree(['tank', 'tank/media', 'tank/backup', 'tank/backup/pc1']), sched({ exclude: ['tank/backup'] }))
+    for (const ds of ['tank/backup', 'tank/backup/pc1']) {
+      const p = byDs(plans, ds)!
+      assert.equal(p.scope, 'excluded')
+      assert.deepEqual(p.prune.map(s => s.name).sort(), [H1, H2, H3], ds)
+      assert.equal(p.note, undefined)
+    }
+  })
+
+  it('an excluded dataset\'s held snapshot is skipped and reported', () => {
+    const plans = plan(
+      tree(['tank'], [row('tank/backup', H1, 100, 1), row('tank/backup', H2, 200)]),
+      sched({ exclude: ['tank/backup'] }),
+    )
+    const p = byDs(plans, 'tank/backup')!
+    assert.deepEqual(p.prune.map(s => s.name), [H2])
+    assert.deepEqual(p.skippedHeld.map(s => s.name), [H1])
+  })
+
+  it('an excluded dataset another enabled same-bucket schedule covers is left to it', () => {
+    const other = sched({ id: 'hourly-backup', target: { kind: 'zfs', dataset: 'tank/backup' }, recursive: false, retention: { hourly: 48 } })
+    const plans = plan(tree(['tank', 'tank/backup']), sched({ exclude: ['tank/backup'] }), [other])
+    const p = byDs(plans, 'tank/backup')!
+    assert.deepEqual(p.prune, [])
+    assert.match(p.note ?? '', /left to schedule 'hourly-backup'/)
+    // A DAILY schedule there does not own hourly snapshots — they are cleared.
+    const daily = plan(tree(['tank', 'tank/backup']), sched({ exclude: ['tank/backup'] }), [{ ...other, cadence: 'daily' }])
+    assert.equal(byDs(daily, 'tank/backup')!.prune.length, 3)
+  })
+
+  it('snapshots on an excluded dataset this schedule did not take (received) are left, and said so', () => {
+    // Same names, DIFFERENT txg: replicated in, not taken by our -r.
+    const plans = plan(
+      tree(['tank'], [row('tank/backup', H1, 901), row('tank/backup', H2, 200)]),
+      sched({ exclude: ['tank/backup'] }),
+    )
+    const p = byDs(plans, 'tank/backup')!
+    assert.deepEqual(p.prune.map(s => s.name), [H2])
+    assert.equal(p.note, '1 left: not taken by this schedule')
+  })
+
+  it('a PVE-owned excluded dataset: provably-own snapshots destroyed, others left', () => {
+    const plans = plan(
+      tree(['tank', 'tank/guests'], [row('tank/guests', 'anas-hourly-2026-07-26T090000Z', 777)]),
+      sched({ exclude: ['tank/guests'] }),
+      [],
+      ['tank/guests'],
+    )
+    const p = byDs(plans, 'tank/guests')!
+    assert.equal(p.scope, 'excluded')
+    assert.equal(p.owned, true)
+    assert.deepEqual(p.prune.map(s => s.name).sort(), [H1, H2, H3])
+    assert.equal(p.note, '1 left: not taken by this schedule')
+  })
+
+  it('a refused destroy on a PVE-owned dataset is noted and the run goes on; elsewhere it fails', async () => {
+    const stdout = tree(['tank', 'tank/guests'])
+    const arm = () => {
+      const executor = new MockExecutor()
+      executor.addFixture({
+        command: ZFS,
+        args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg', '-r', 'tank'],
+        result: { stdout, stderr: '', exitCode: 0 },
+      })
+      executor.addFixture({
+        command: ZFS,
+        args: ['destroy', `tank/guests@${H1}`],
+        result: { stdout: '', stderr: `cannot destroy 'tank/guests@${H1}': snapshot has dependent clones\nuse '-R' to destroy the following datasets:`, exitCode: 1 },
+      })
+      executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
+      return executor
+    }
+    const owned = await pruneRecursiveSchedule(arm(), sched({ exclude: ['tank/guests'] }), {
+      others: [],
+      isOwned: ds => ds === 'tank/guests',
+      now: PRUNE_NOW,
+    })
+    const guests = owned.datasets.find(d => d.dataset === 'tank/guests')!
+    assert.deepEqual(guests.pruned.map(s => s.name).sort(), [H2, H3])
+    assert.equal(guests.note, `1 left: destroy refused: cannot destroy 'tank/guests@${H1}': snapshot has dependent clones`)
+
+    await assert.rejects(
+      () => pruneRecursiveSchedule(arm(), sched({ exclude: ['tank/guests'] }), { others: [], isOwned: () => false, now: PRUNE_NOW }),
+      /dependent clones/,
+    )
+  })
+
+  it('the target keeps its full-policy plan (unchanged)', () => {
+    const plans = plan(tree(['tank'], [row('tank', D1, 50)]), sched({ retention: { hourly: 1, daily: 0 } }))
+    // daily:0 prunes the daily on the TARGET exactly as a non-recursive schedule would.
+    assert.deepEqual(byDs(plans, 'tank')!.prune.map(s => s.name).sort(), [D1, H1, H2].sort())
+  })
+
+  it('pruneRecursiveSchedule: one tree read, a held re-check before each destroy, per-dataset results', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: ZFS,
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg', '-r', 'tank'],
+      result: { stdout: tree(['tank', 'tank/media']), stderr: '', exitCode: 0 },
+    })
+    // tank/media@H1 got held between the read and the destroy.
+    executor.addFixture({
+      command: ZFS,
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'userrefs', `tank/media@${H1}`],
+      result: { stdout: '1\n', stderr: '', exitCode: 0 },
+    })
+    executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
+    const progress: string[] = []
+    const res = await pruneRecursiveSchedule(executor, sched(), {
+      others: [],
+      isOwned: () => false,
+      now: PRUNE_NOW,
+      updateProgress: m => progress.push(m),
+    })
+    const destroys = executor.calls.filter(c => c.args[0] === 'destroy').map(c => c.args)
+    assert.deepEqual(destroys.map(d => d.join(' ')).sort(), [
+      `destroy tank/media@${H2}`,
+      `destroy tank@${H1}`,
+      `destroy tank@${H2}`,
+    ])
+    assert.equal(destroys.length, 3)
+    assert.ok(destroys.every(d => d.length === 2), 'one snapshot per destroy, never -r')
+    const media = res.datasets.find(d => d.dataset === 'tank/media')!
+    assert.equal(media.pruned.length, 1)
+    assert.deepEqual(media.skippedHeld.map(s => s.name), [H1])
+    assert.equal(res.pruned.length, 3)
+    assert.ok(progress.includes('Pruned tank/media (sweep): 1 destroyed, 1 held'), progress.join(' | '))
   })
 })

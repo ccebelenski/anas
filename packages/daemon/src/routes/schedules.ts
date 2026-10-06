@@ -1,4 +1,4 @@
-import type { AhrPool, SnapshotSchedule as SnapshotScheduleT, SnapshotTarget } from '@anas/shared'
+import type { AhrPool, SnapshotScheduleRunResult, SnapshotSchedule as SnapshotScheduleT, SnapshotTarget } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
@@ -10,13 +10,14 @@ import { notifyScheduleRun } from '../services/snapshot-notify.js'
 import {
   collectScheduleStatuses,
   deriveScheduleDetail,
+  readAllSchedules,
   readSchedule,
   removeScheduleUnits,
   scheduleFileExists,
   writeScheduleUnits,
 } from '../services/snapshot-schedule-units.js'
-import { pruneSnapshots, takeSnapshot } from '../services/snapshot-schedules.js'
-import { expandSnapshotTargets } from '../services/zfs-snapshot.js'
+import { pruneRecursiveSchedule, pruneSnapshots, takeSnapshot } from '../services/snapshot-schedules.js'
+import { sweepSet } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
 const ZFS = '/usr/sbin/zfs'
@@ -166,7 +167,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
             return false
           }
         }
-        const swept = expandSnapshotTargets(descendants, target.dataset, exclude)
+        const swept = sweepSet({ target, recursive: true, exclude }, descendants)
         const descendant = pve.ownedDescendant(swept, target.dataset)
         if (descendant) {
           reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: ownedDescendantRefusal('Snapshot schedule', target.dataset, descendant) } })
@@ -201,7 +202,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
   async function fireSchedule(
     schedule: SnapshotScheduleT,
     updateProgress: (message: string) => void,
-  ): Promise<{ schedule: string, taken: string, pruned: string[], skippedHeld: string[] }> {
+  ): Promise<SnapshotScheduleRunResult> {
     // pvepool.1 review fixes — the RUN-TIME re-check. Ownership was asked when
     // the schedule was created/updated, but storage.cfg is LIVE: PVE can claim
     // a dataset after the schedule exists. The timer's runner
@@ -212,8 +213,9 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     // Reads/footprint may fail closed (unreadable storage.cfg = everything
     // owned) exactly like the create guard. An AHR target is not PVE-footprint
     // territory.
+    let pve: Awaited<ReturnType<typeof pveFootprint>> | null = null
     if (schedule.target.kind === 'zfs') {
-      const pve = await pveFootprint()
+      pve = await pveFootprint()
       const owned = pve.ownershipOf(schedule.target.dataset)
       if (owned)
         throw new Error(`Snapshot run refused: '${schedule.target.dataset}' is PVE-owned — ${owned.reason}`)
@@ -225,7 +227,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
           throw new Error(pveDescendantsUnlistedMessage('snapshot run', schedule.target.dataset))
         // snapx.1: the same tree the take covers — excluded subtrees are not
         // swept, so an owned dataset inside one does not fail the run.
-        const swept = expandSnapshotTargets(descendants, schedule.target.dataset, schedule.exclude ?? [])
+        const swept = sweepSet(schedule, descendants)
         const descendant = pve.ownedDescendant(swept, schedule.target.dataset)
         if (descendant)
           throw new Error(ownedDescendantRefusal('Snapshot run', schedule.target.dataset, descendant))
@@ -236,6 +238,34 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       : { recursive: schedule.recursive, exclude: schedule.exclude, updateProgress, runtimeDir: subvolRuntimeDir }
     const take = await takeSnapshot(executor, schedule.target, schedule.cadence, svcOpts)
     updateProgress(`Took ${take.name}; pruning per retention`)
+    if (schedule.target.kind === 'zfs' && schedule.recursive === true && pve) {
+      // snapprune.1: retention reaches every dataset the schedule snapshots,
+      // per dataset. The other schedules come from the unit files (the store)
+      // so a dataset another enabled schedule covers is judged by its policy
+      // too; PVE-owned datasets outside the sweep are never touched.
+      const footprint = pve
+      const target = schedule.target.dataset
+      const prune = await pruneRecursiveSchedule(executor, schedule, {
+        others: await readAllSchedules(systemdDir),
+        isOwned: dataset => footprint.ownershipOf(dataset) !== null,
+        updateProgress,
+      })
+      const named = (s: { name: string, target: SnapshotTarget }) =>
+        s.target.kind === 'zfs' && s.target.dataset !== target ? `${s.target.dataset}@${s.name}` : s.name
+      return {
+        schedule: schedule.id,
+        taken: take.name,
+        pruned: prune.pruned.map(named),
+        skippedHeld: prune.skippedHeld.map(named),
+        datasets: prune.datasets.map(d => ({
+          dataset: d.dataset,
+          scope: d.scope,
+          pruned: d.pruned.length,
+          held: d.skippedHeld.length,
+          ...(d.note ? { note: d.note } : {}),
+        })),
+      }
+    }
     const prune = await pruneSnapshots(executor, schedule.target, schedule.retention, svcOpts)
     return {
       schedule: schedule.id,

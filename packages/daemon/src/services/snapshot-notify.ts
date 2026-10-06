@@ -36,6 +36,8 @@ export interface SnapshotNotifyResult {
   taken: string
   pruned: string[]
   skippedHeld: string[]
+  /** snapprune.1: a recursive schedule's per-dataset prune counts. */
+  datasets?: { dataset: string, scope: string, pruned: number, held: number, note?: string }[]
 }
 
 export interface SnapshotNotifyContext extends UnattendedNotifyBase {
@@ -121,6 +123,20 @@ export function buildSnapshotNotifyBody(ctx: SnapshotNotifyContext): string {
     lines.push(`Snapshot:    ${result.taken}`)
   if (result)
     lines.push(`Pruned:      ${pruneSummaryLine(result)}`)
+  // snapprune.1: a recursive schedule prunes per dataset — say what each did.
+  const perDataset = (result?.datasets ?? []).filter(d => d.pruned || d.held || d.note)
+  if (perDataset.length) {
+    lines.push('')
+    lines.push('Per dataset:')
+    for (const d of perDataset) {
+      const parts = [`${d.pruned} destroyed`]
+      if (d.held)
+        parts.push(`${d.held} held`)
+      if (d.note)
+        parts.push(d.note)
+      lines.push(`  ${d.dataset} (${d.scope}): ${parts.join(', ')}`)
+    }
+  }
   if (result?.pruned.length) {
     lines.push('')
     lines.push('Destroyed:')

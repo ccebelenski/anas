@@ -869,6 +869,62 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       }
     })
 
+    it('snapprune.1: a recursive fire prunes per dataset and leaves an excluded dataset to the schedule that covers it', async () => {
+      const { restore } = await storageCfg(null)
+      try {
+        armTree('testpool/x\ntestpool/x/data\ntestpool/x/media\n')
+        const D1 = 'anas-daily-2026-07-20T000000Z'
+        const D2 = 'anas-daily-2026-07-21T000000Z'
+        const rows: string[] = []
+        for (const ds of ['testpool/x', 'testpool/x/data', 'testpool/x/media'])
+          rows.push(`${ds}@${D1}\t1769385600\t0\t100`, `${ds}@${D2}\t1769472000\t0\t200`)
+        const mock = mockOf(server)
+        mock.addFixture({
+          command: ZFS,
+          args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg', '-r', 'testpool/x'],
+          result: { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 },
+        })
+        mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'], result: { stdout: 'testpool/x\ntestpool/x/data\ntestpool/x/media\n', stderr: '', exitCode: 0 } })
+        // The schedule that owns testpool/x/media's daily snapshots.
+        const media = await create({ ...SCHEDULE, id: 'daily-media', target: { kind: 'zfs', dataset: 'testpool/x/media' }, retention: { daily: 30 } })
+        await waitForJob(server, media.json().job.id)
+        const created = await create({ ...X, id: 'daily-x', cadence: 'daily', retention: { daily: 1 }, exclude: ['testpool/x/media'] })
+        assert.equal(created.statusCode, 202, created.body)
+        await waitForJob(server, created.json().job.id)
+
+        const run = await server.inject({ method: 'POST', url: '/v1/schedules/daily-x/run', headers: JSON_HEADERS, payload: '{}' })
+        const done = await waitForJob(server, run.json().job.id)
+        assert.equal(done.status, 'completed', JSON.stringify(done.error))
+        const result = done.result as { pruned: string[], datasets: { dataset: string, scope: string, pruned: number, held: number, note?: string }[] }
+        assert.deepEqual(result.pruned.sort(), [D1, `testpool/x/data@${D1}`].sort())
+        assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x/data'), { dataset: 'testpool/x/data', scope: 'sweep', pruned: 1, held: 0 })
+        assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x/media'), { dataset: 'testpool/x/media', scope: 'excluded', pruned: 0, held: 0, note: '2 left to schedule \'daily-media\'' })
+        const destroys = mock.calls.filter(c => c.command === ZFS && c.args[0] === 'destroy').map(c => c.args.join(' '))
+        assert.deepEqual(destroys.sort(), [`destroy testpool/x/data@${D1}`, `destroy testpool/x@${D1}`].sort())
+      }
+      finally {
+        await restore()
+      }
+    })
+
+    it('snapprune.1: a NON-recursive fire still lists and prunes the target alone', async () => {
+      const { restore } = await storageCfg(null)
+      try {
+        const created = await create({ ...SCHEDULE, id: 'flat-media' })
+        await waitForJob(server, created.json().job.id)
+        const run = await server.inject({ method: 'POST', url: '/v1/schedules/flat-media/run', headers: JSON_HEADERS, payload: '{}' })
+        const done = await waitForJob(server, run.json().job.id)
+        assert.equal(done.status, 'completed', JSON.stringify(done.error))
+        assert.equal((done.result as { datasets?: unknown }).datasets, undefined)
+        const lists = mockOf(server).calls.filter(c => c.command === ZFS && c.args.includes('snapshot') && c.args[0] === 'list')
+        assert.ok(lists.length > 0)
+        assert.ok(lists.every(c => !c.args.includes('-r')), JSON.stringify(lists.map(c => c.args)))
+      }
+      finally {
+        await restore()
+      }
+    })
+
     it('a PUT keeps a stored exclude whose dataset has since gone, but refuses a NEW missing one', async () => {
       const { restore } = await storageCfg(null)
       try {

@@ -1,3 +1,4 @@
+import type { SnapshotSchedule } from '@anas/shared'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
 
 /**
@@ -84,6 +85,41 @@ export function expandSnapshotTargets(descendants: string[], target: string, exc
     out.push(name)
   }
   return out
+}
+
+/** What a schedule's sweep depends on — its target, `recursive` and `exclude`. */
+export type SweepSchedule = Pick<SnapshotSchedule, 'target' | 'recursive' | 'exclude'>
+
+/**
+ * Does `schedule` snapshot `dataset`? (snapprune.1) The schedule's SWEEP, as a
+ * predicate: a ZFS schedule covers its target; a recursive one also covers
+ * every descendant that is not inside an excluded subtree. An AHR schedule
+ * covers no ZFS dataset. Pure — no listing is needed to answer it, which is
+ * what lets prune ask it of OTHER schedules' sweeps.
+ */
+export function inSweep(schedule: SweepSchedule, dataset: string): boolean {
+  if (schedule.target.kind !== 'zfs')
+    return false
+  const target = schedule.target.dataset
+  if (dataset === target)
+    return true
+  if (schedule.recursive !== true || !dataset.startsWith(`${target}/`))
+    return false
+  return !(schedule.exclude ?? []).some(ex => isAtOrUnder(dataset, ex))
+}
+
+/**
+ * The datasets a schedule snapshots, given its target's listed tree — the ONE
+ * definition the take, the create/run guard and the prune share (snapprune.1).
+ * Non-recursive: the target alone. Recursive: {@link expandSnapshotTargets}
+ * (target first, excluded subtrees dropped). AHR: none.
+ */
+export function sweepSet(schedule: SweepSchedule, descendants: string[]): string[] {
+  if (schedule.target.kind !== 'zfs')
+    return []
+  if (schedule.recursive !== true)
+    return [schedule.target.dataset]
+  return expandSnapshotTargets(descendants, schedule.target.dataset, schedule.exclude ?? [])
 }
 
 /** The `zfs destroy [-r] <dataset>@<name>` argv. */

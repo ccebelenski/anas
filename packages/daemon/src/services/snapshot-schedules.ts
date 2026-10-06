@@ -3,15 +3,16 @@ import type {
   RetentionBucket,
   RetentionPolicy,
   ScheduledSnapshot,
+  SnapshotSchedule,
   SnapshotTarget,
 } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { AhrSnapshotOptions } from './ahr-snapshots.js'
 import { run } from './ahr-exec.js'
 import { createAhrSnapshot, deleteAhrSnapshot, listAhrSnapshots } from './ahr-snapshots.js'
-import { formatScheduledName, parseScheduledName } from './snapshot-naming.js'
+import { formatScheduledName, isTransientRunSnapshot, parseScheduledName } from './snapshot-naming.js'
 import { planRetention } from './snapshot-retention.js'
-import { createZfsSnapshot, createZfsSnapshotExcluding, destroyZfsSnapshot, zfsSnapshotFullName } from './zfs-snapshot.js'
+import { createZfsSnapshot, createZfsSnapshotExcluding, destroyZfsSnapshot, inSweep, zfsSnapshotFullName } from './zfs-snapshot.js'
 
 /**
  * Uniform snapshot take/prune/list (Epic 17, stage 1). ONE service surface that
@@ -24,6 +25,7 @@ import { createZfsSnapshot, createZfsSnapshotExcluding, destroyZfsSnapshot, zfsS
  *   |       | (snapx.1 exclude: one call, many names) |                                        |
  *   | list  | `zfs list -t snapshot -Hp -o …`        | `listAhrSnapshots` over `@snapshots/*`  |
  *   | prune | `zfs destroy` the plan's prune-set     | `btrfs subvolume delete` the prune-set  |
+ *   |       | (snapprune.1 recursive: per dataset)   |                                        |
  *
  * The retention decision is the SAME `planRetention` engine for both; only the
  * take/list/destroy primitives are backend-specific. Every function shares one
@@ -250,4 +252,282 @@ export async function pruneSnapshots(
   }
 
   return { pruned, skippedHeld }
+}
+
+// ---- Prune across a recursive schedule's sweep (snapprune.1) ------------------
+//
+// A recursive schedule takes `-r` (or the snapx.1 expansion) across a subtree,
+// so retention must reach every dataset it snapshots — before snapprune.1 only
+// the target was pruned and every child kept every snapshot ever taken. The
+// prune below reads the whole tree ONCE, plans PER DATASET, and destroys one
+// snapshot at a time with the live `userrefs` re-check (never `destroy -r`:
+// one held child snapshot would fail the whole verb).
+//
+//   - target   — exactly the plan a non-recursive schedule gets (the
+//                schedule's full policy over the target's ANAS snapshots);
+//                unchanged by snapprune.1.
+//   - sweep    — every other dataset the schedule snapshots: only THIS
+//                schedule's bucket is planned (a child can be the target of
+//                its own daily/monthly schedule, whose snapshots this
+//                schedule must never prune), keeping the MOST GENEROUS count
+//                any enabled schedule covering that dataset with the same
+//                bucket asks for — never more aggressive than any of them,
+//                whichever fires first.
+//   - excluded — a dataset under the target outside the sweep: snapshots this
+//                schedule took before the exclude are out of its scope and
+//                are destroyed outright — but only those it provably took
+//                (same name AND same `createtxg` as a snapshot still in the
+//                sweep: one `zfs snapshot -r`/multi-name call is one txg),
+//                so a replication target's received `anas-*` snapshots are
+//                never touched. Left alone entirely when another enabled
+//                schedule covers the dataset with the same bucket (its
+//                retention owns them). A PVE-owned dataset is treated the
+//                same way (a provably-own snapshot is ANAS's leftover, not
+//                PVE's data), except that a destroy ZFS refuses there (a
+//                clone depends on it) is noted and skipped, never fatal.
+
+/** `zfs list` argv for every snapshot in a tree, with the provenance column. */
+export function zfsTreeSnapshotListArgs(dataset: string): string[] {
+  // -r: the whole subtree in ONE read; createtxg ties a snapshot to the take
+  // that made it (every snapshot of one atomic take shares the txg).
+  return ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg', '-r', dataset]
+}
+
+/** One snapshot in a tree inventory: the uniform shape plus its `createtxg`. */
+export interface TreeSnapshot extends ScheduledSnapshot {
+  /** The txg the snapshot was created in (string, as ZFS prints it); '' when unread. */
+  createtxg: string
+}
+
+/**
+ * Parse {@link zfsTreeSnapshotListArgs} output into per-dataset inventories,
+ * keyed by dataset in listing order. Each snapshot's `target` names ITS OWN
+ * dataset, so a plan over it reads exactly like a single-dataset plan.
+ */
+export function parseZfsTreeSnapshots(stdout: string): Map<string, TreeSnapshot[]> {
+  const byDataset = new Map<string, TreeSnapshot[]>()
+  for (const raw of stdout.split('\n')) {
+    const line = raw.trimEnd()
+    if (!line)
+      continue
+    const [full, creation, userrefs, createtxg] = line.split('\t')
+    const at = full.indexOf('@')
+    if (at === -1)
+      continue
+    const dataset = full.slice(0, at)
+    const [snap] = parseZfsScheduledSnapshots({ kind: 'zfs', dataset }, [full, creation ?? '', userrefs ?? ''].join('\t'))
+    if (!snap)
+      continue
+    const list = byDataset.get(dataset) ?? []
+    list.push({ ...snap, createtxg: (createtxg ?? '').trim() })
+    byDataset.set(dataset, list)
+  }
+  return byDataset
+}
+
+/** One dataset's slice of a recursive prune plan. */
+export interface DatasetPrunePlan {
+  dataset: string
+  scope: 'target' | 'sweep' | 'excluded'
+  /** Snapshots to destroy, in plan order. */
+  prune: TreeSnapshot[]
+  /** Held snapshots the plan sets aside (retained, reported). */
+  skippedHeld: TreeSnapshot[]
+  /** Why snapshots of this schedule's bucket were left in place, when some were. */
+  note?: string
+  /** PVE owns the dataset: a refused destroy is noted, never fatal. */
+  owned?: boolean
+}
+
+/** What {@link planRecursivePrune} needs to know about the world. */
+export interface RecursivePruneInput {
+  /** The recursive ZFS schedule being fired. */
+  schedule: SnapshotSchedule
+  /** The target tree's snapshots, per dataset ({@link parseZfsTreeSnapshots}). */
+  inventory: Map<string, TreeSnapshot[]>
+  /** Every OTHER schedule on the node (read from the unit files). */
+  others: SnapshotSchedule[]
+  /** PVE ownership of a dataset — marks the plan so a refused destroy is non-fatal. */
+  isOwned: (dataset: string) => boolean
+  now: Date
+}
+
+/** This schedule's bucket snapshots on one dataset (ANAS-named, never transient). */
+function bucketSnapshots(snaps: TreeSnapshot[], bucket: RetentionBucket): TreeSnapshot[] {
+  return snaps.filter(s => s.source === 'anas' && s.bucket === bucket && !isTransientRunSnapshot(s.name))
+}
+
+/**
+ * The per-dataset prune plan of a recursive ZFS schedule (snapprune.1) —
+ * pure. See the section note above for the three scopes. Datasets with
+ * nothing to report are left out; the target always comes first.
+ */
+export function planRecursivePrune(input: RecursivePruneInput): DatasetPrunePlan[] {
+  const { schedule, inventory, now } = input
+  if (schedule.target.kind !== 'zfs')
+    return []
+  const target = schedule.target.dataset
+  const bucket = schedule.cadence
+  const others = input.others.filter(o => o.enabled && o.id !== schedule.id && o.cadence === bucket && o.target.kind === 'zfs')
+  const plans: DatasetPrunePlan[] = []
+
+  // Provenance: every (label, createtxg) still present in the sweep, read
+  // before anything is destroyed.
+  const taken = new Set<string>()
+  for (const [dataset, snaps] of inventory) {
+    if (!inSweep(schedule, dataset))
+      continue
+    for (const s of snaps) {
+      if (s.createtxg)
+        taken.add(`${s.name}\u0000${s.createtxg}`)
+    }
+  }
+
+  const targetSnaps = inventory.get(target) ?? []
+  const targetPlan = planRetention(targetSnaps, schedule.retention, now)
+  plans.push({
+    dataset: target,
+    scope: 'target',
+    prune: targetPlan.prune as TreeSnapshot[],
+    skippedHeld: targetPlan.skippedHeld as TreeSnapshot[],
+  })
+
+  for (const [dataset, snaps] of inventory) {
+    if (dataset === target || !dataset.startsWith(`${target}/`))
+      continue
+    const mine = bucketSnapshots(snaps, bucket)
+    if (mine.length === 0)
+      continue
+
+    if (inSweep(schedule, dataset)) {
+      // The most generous same-bucket count among the enabled schedules
+      // covering this dataset (this one included).
+      let keep = schedule.retention[bucket] ?? 0
+      for (const o of others) {
+        if (inSweep(o, dataset))
+          keep = Math.max(keep, o.retention[bucket] ?? 0)
+      }
+      const plan = planRetention(mine, { [bucket]: keep }, now)
+      if (plan.prune.length || plan.skippedHeld.length) {
+        plans.push({
+          dataset,
+          scope: 'sweep',
+          prune: plan.prune as TreeSnapshot[],
+          skippedHeld: plan.skippedHeld as TreeSnapshot[],
+        })
+      }
+      continue
+    }
+
+    // Outside the sweep: an excluded dataset or something beneath one.
+    const coveredBy = others.find(o => inSweep(o, dataset))
+    if (coveredBy) {
+      plans.push({ dataset, scope: 'excluded', prune: [], skippedHeld: [], note: `${mine.length} left to schedule '${coveredBy.id}'` })
+      continue
+    }
+    const ours = mine.filter(s => taken.has(`${s.name}\u0000${s.createtxg}`))
+    const foreign = mine.length - ours.length
+    const plan: DatasetPrunePlan = {
+      dataset,
+      scope: 'excluded',
+      prune: ours.filter(s => s.held !== true),
+      skippedHeld: ours.filter(s => s.held === true),
+    }
+    if (foreign > 0)
+      plan.note = `${foreign} left: not taken by this schedule`
+    if (input.isOwned(dataset))
+      plan.owned = true
+    plans.push(plan)
+  }
+  return plans
+}
+
+/** One dataset's prune outcome (the run result's per-dataset counts). */
+export interface DatasetPruneResult {
+  dataset: string
+  scope: 'target' | 'sweep' | 'excluded'
+  pruned: ScheduledSnapshot[]
+  skippedHeld: ScheduledSnapshot[]
+  note?: string
+}
+
+/** A recursive prune's outcome: the flat lists plus the per-dataset breakdown. */
+export interface RecursivePruneResult extends PruneResult {
+  datasets: DatasetPruneResult[]
+}
+
+/**
+ * Prune a recursive ZFS schedule across its sweep (snapprune.1): read the
+ * tree's snapshots once, plan per dataset ({@link planRecursivePrune}), then
+ * destroy one snapshot at a time, re-checking `userrefs` immediately before
+ * each destroy — a snapshot held since the read is reported in
+ * `skippedHeld`, never a failed destroy. Progress names each dataset.
+ */
+export async function pruneRecursiveSchedule(
+  executor: CommandExecutor,
+  schedule: SnapshotSchedule,
+  opts: {
+    others: SnapshotSchedule[]
+    isOwned: (dataset: string) => boolean
+    now?: Date
+    updateProgress?: (message: string) => void
+  },
+): Promise<RecursivePruneResult> {
+  if (schedule.target.kind !== 'zfs')
+    throw new Error('pruneRecursiveSchedule: ZFS schedules only')
+  const progress = opts.updateProgress ?? noop
+  const r = await run(executor, ZFS, zfsTreeSnapshotListArgs(schedule.target.dataset))
+  const plans = planRecursivePrune({
+    schedule,
+    inventory: parseZfsTreeSnapshots(r.stdout),
+    others: opts.others,
+    isOwned: opts.isOwned,
+    now: opts.now ?? new Date(),
+  })
+
+  const datasets: DatasetPruneResult[] = []
+  for (const plan of plans) {
+    const pruned: ScheduledSnapshot[] = []
+    const skippedHeld: ScheduledSnapshot[] = [...plan.skippedHeld]
+    let refused = 0
+    let refusedWhy = ''
+    for (const snap of plan.prune) {
+      const full = zfsSnapshotFullName(plan.dataset, snap.name)
+      if (await zfsIsHeld(executor, full)) {
+        skippedHeld.push({ ...snap, held: true })
+        continue
+      }
+      progress(`Destroying ${full}`)
+      try {
+        await destroyZfsSnapshot(executor, { dataset: plan.dataset, name: snap.name })
+      }
+      catch (err) {
+        // On a PVE-owned dataset a refusal (a clone depends on the snapshot)
+        // is noted and the run goes on; anywhere else it fails the run, as
+        // a failed prune always has.
+        if (!plan.owned)
+          throw err
+        refused++
+        refusedWhy ||= (err instanceof Error ? err.message : String(err)).split('\n')[0].trim()
+        continue
+      }
+      pruned.push(snap)
+    }
+    const notes = [plan.note, refused ? `${refused} left: destroy refused: ${refusedWhy}` : undefined].filter(Boolean)
+    const note = notes.length ? notes.join('; ') : undefined
+    if (pruned.length || skippedHeld.length || note) {
+      const parts = [`${pruned.length} destroyed`]
+      if (skippedHeld.length)
+        parts.push(`${skippedHeld.length} held`)
+      if (note)
+        parts.push(note)
+      progress(`Pruned ${plan.dataset} (${plan.scope}): ${parts.join(', ')}`)
+    }
+    datasets.push({ dataset: plan.dataset, scope: plan.scope, pruned, skippedHeld, ...(note ? { note } : {}) })
+  }
+  return {
+    pruned: datasets.flatMap(d => d.pruned),
+    skippedHeld: datasets.flatMap(d => d.skippedHeld),
+    datasets,
+  }
 }
