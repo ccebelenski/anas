@@ -40,6 +40,61 @@ export function pruneGroup(backupId: string): string {
   return `host/${backupId}`
 }
 
+/**
+ * The default backup-id of a NEW task: `<host>-<task>` (story `ident.2`, audit
+ * #14). The bare hostname — the old default — is also what a plain
+ * `proxmox-backup-client` host backup of this node writes, and what every other
+ * task left at the default wrote, so two tasks shared one group and each one's
+ * retention pruned the other's snapshots. Existing tasks keep the id they have:
+ * changing it would orphan their history in a new group.
+ */
+export function defaultBackupId(host: string, taskName: string): string {
+  const short = host.trim().toLowerCase().split('.')[0] || 'node'
+  return `${short}-${taskName}`
+}
+
+/**
+ * The PBS group a task writes and prunes, as one comparable key: repository,
+ * EFFECTIVE namespace (the task's, else the repository's) and backup-id. Two
+ * tasks with the same key share `host/<backupId>` in the same namespace of the
+ * same datastore, and each one's prune acts on the other's snapshots.
+ */
+export function groupKey(task: Pick<BackupTask, 'repository' | 'namespace' | 'backupId'>, repoNamespace?: string): string {
+  const ns = (task.namespace ?? repoNamespace ?? '').trim()
+  return `${task.repository}\u0000${ns}\u0000${task.backupId}`
+}
+
+/**
+ * The other task already writing the group `task` would write, or null. `nsOf`
+ * answers a repository's own namespace (undefined when it has none or is not
+ * known). The task itself (same name) is never its own collision.
+ */
+export function taskSharingGroup(
+  task: BackupTask,
+  others: BackupTask[],
+  nsOf: (repository: string) => string | undefined,
+): BackupTask | null {
+  const key = groupKey(task, nsOf(task.repository))
+  return others.find(o => o.name !== task.name && groupKey(o, nsOf(o.repository)) === key) ?? null
+}
+
+/** Did an edit leave the task's group exactly where it was? */
+export function groupKeyUnchanged(
+  before: BackupTask,
+  after: BackupTask,
+  nsOf: (repository: string) => string | undefined,
+): boolean {
+  return groupKey(before, nsOf(before.repository)) === groupKey(after, nsOf(after.repository))
+}
+
+/** The refusal sentence for a shared group — one phrasing, create and edit. */
+export function sharedGroupMessage(task: BackupTask, other: BackupTask, namespace: string | undefined): string {
+  const where = `repository '${task.repository}'${namespace ? ` namespace '${namespace}'` : ''}`
+  return `Backup task '${other.name}' already writes the group ${pruneGroup(task.backupId)} in ${where}. Two tasks in one `
+    + `group prune each other's snapshots and their histories mix — give this task its own backup ID `
+    + `(the default is '<host>-<task name>').`
+}
+
 /** The retention flags in a stable order, as pbc `--keep-*` argv pairs. */
 const KEEP_FLAGS: { key: keyof BackupRetention, flag: string }[] = [
   { key: 'keepLast', flag: '--keep-last' },

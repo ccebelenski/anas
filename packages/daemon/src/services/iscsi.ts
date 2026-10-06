@@ -34,6 +34,7 @@ import type { LioSaveconfig, SaveconfigStorageObject } from '../parsers/lio-save
 import type { ZfsMountpoint } from '../parsers/pve-storage.js'
 import type { ConfigfsAcl, ConfigfsBackstore, ConfigfsPortal, LioLiveState } from './iscsi-configfs.js'
 import type { OwnershipInputs, OwnershipLun } from './iscsi-ownership.js'
+import type { StatDevice } from './iscsi-served.js'
 import type { StubVerdict } from './iscsi-stub.js'
 import { stat } from 'node:fs/promises'
 import { anasTargetName } from '@anas/shared'
@@ -109,6 +110,14 @@ export interface IscsiPaths {
    * mount-mismatch signal can never be exercised end to end.
    */
   zfsMountpoints?: () => Promise<ZfsMountpoint[]>
+  /**
+   * One `stat` of a backing path for the served-device comparison (story
+   * `ident.2`): its rdev for a zvol, its dev/ino for an image. Defaults to the
+   * real `stat`; a TEST SEAM for the same reason `backingExists` is one — no
+   * test host has a `/dev/zvol/...` node whose device number could match a
+   * fixture's configfs `Major:`/`Minor:`.
+   */
+  deviceStat?: StatDevice
 }
 
 /** Everything one iSCSI read needs, gathered once and shared by all four routes. */

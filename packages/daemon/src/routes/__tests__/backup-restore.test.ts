@@ -219,6 +219,8 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
     snapshotExit?: number
     snapshotStderr?: string
     storageCfg?: string
+    /** ident.2: what the LUN's path names, as the stat seam's env form. */
+    deviceStat?: string
   } = {}) {
     if (opts.manifest) {
       const root = join(dir, 'target')
@@ -246,6 +248,9 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       setEnv('ANAS_STORAGE_CFG', join(dir, 'absent-storage.cfg'))
     }
     setEnv('ANAS_ISCSI_BACKING_PRESENT', opts.present === false ? '' : ZVOL_PATH)
+    // ident.2: by default the path names the device the LUN serves (configfs
+    // Major 230 Minor 16) — the healthy case every other gate test runs on.
+    setEnv('ANAS_ISCSI_DEVICE_STAT', opts.deviceStat ?? `${ZVOL_PATH}=230:16`)
 
     server = createServer({ mock: true, logger: false })
     const mock = mockOf()
@@ -654,6 +659,98 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1 enable`,
         `${TARGETCLI} saveconfig`,
       ])
+    })
+  })
+
+  // --- ident.2 (audit #10): the served device is the identity ---------------
+
+  describe('ident.2 — the restore acts only on the LUN and device it was accepted for', () => {
+    const vmdisk = () => join(dir, 'target', 'core', 'iblock_0', 'vmdisk1')
+
+    /** Park the iSCSI mutex so a confirmed job waits exactly where it re-reads. */
+    async function parkLock(): Promise<{ release: () => void, held: Promise<void> }> {
+      let release!: () => void
+      let locked!: () => void
+      const isLocked = new Promise<void>((r) => {
+        locked = r
+      })
+      const held = withIscsiLock(() => new Promise<void>((r) => {
+        release = r
+        locked()
+      }))
+      await isLocked
+      return { release, held }
+    }
+
+    it('a path that names a different device than the LUN serves is refused before PBS is asked', async () => {
+      // The volume was renamed away and a new one created at the old name: the
+      // path is device 230:32 now, LIO still serves 230:16.
+      await serveAnas({ deviceStat: `${ZVOL_PATH}=230:32` })
+      const res = await restore()
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'served-device-mismatch')
+      assert.match(res.body.error!.message, /LUN serves a different device than its path names/)
+      assert.match(res.body.error!.message, /230:16/)
+      assert.match(res.body.error!.message, /230:32/)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
+      assert.equal(mockOf().calls.some(c => c.command === PBC), false, 'no PBS contact')
+      assertNothingDestructive()
+    })
+
+    it('the code binds the serial: a LUN re-created at the index inside the TTL gets a NEW challenge', async () => {
+      await serveAnas()
+      const first = await restore()
+      const code = String(first.headers['x-anas-confirm-code'])
+      // Delete + add within the TTL: same index, same path, a fresh serial.
+      await writeFile(join(vmdisk(), 'wwn', 'vpd_unit_serial'), 'T10 VPD Unit Serial Number: 11111111-2222-3333-4444-555555555555\n')
+      const res = await restore(body(), { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.code, 'CONFIRMATION_REQUIRED')
+      assert.ok(res.headers['x-anas-confirm-code'])
+      assert.notEqual(res.headers['x-anas-confirm-code'], code)
+      assertNothingDestructive()
+    })
+
+    it('the code binds the snapshot and the archive: a different archive is a new challenge', async () => {
+      await serveAnas()
+      const first = await restore()
+      const code = String(first.headers['x-anas-confirm-code'])
+      const res = await restore(body({ archive: 'lun.img' }), { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.code, 'CONFIRMATION_REQUIRED')
+      assertNothingDestructive()
+    })
+
+    it('a LUN re-created at the index while the job is QUEUED fails the job — nothing disabled, nothing written', async () => {
+      await serveAnas()
+      const code = String((await restore()).headers['x-anas-confirm-code'])
+      const lock = await parkLock()
+      const res = await restore(body(), { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      await writeFile(join(vmdisk(), 'wwn', 'vpd_unit_serial'), 'T10 VPD Unit Serial Number: 11111111-2222-3333-4444-555555555555\n')
+      lock.release()
+      await lock.held
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /no longer the LUN this request was accepted for/)
+      assert.match(job.error!.message, /unit serial is now 11111111-2222-3333-4444-555555555555/)
+      assertNothingDestructive()
+    })
+
+    it('a served device that changed while the job is QUEUED fails the job — nothing disabled, nothing written', async () => {
+      await serveAnas()
+      const code = String((await restore()).headers['x-anas-confirm-code'])
+      const lock = await parkLock()
+      const res = await restore(body(), { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      // LIO now serves another device under the same backstore name.
+      await writeFile(join(vmdisk(), 'info'), `Status: ACTIVATED  Max Queue Depth: 128  SectorSize: 512  HwMaxSectors: 32768\n        iBlock device: zd32  UDEV PATH: ${ZVOL_PATH}  readonly: 0\n        Major: 230 Minor: 32  CLAIMED: IBLOCK\n`)
+      lock.release()
+      await lock.held
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /LUN serves a different device than its path names/)
+      assertNothingDestructive()
     })
   })
 

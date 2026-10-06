@@ -50,7 +50,9 @@
 
 import type { IscsiHealth, IscsiLunAttributes, IscsiMissingLun, IscsiTargetDetail } from '@anas/shared'
 import type { SaveconfigStorageObject } from '../parsers/lio-saveconfig.js'
+import type { LioLiveState } from './iscsi-configfs.js'
 import type { IscsiBackstoreAttributes, IscsiMutateOptions, IscsiRefusal } from './iscsi-mutate.js'
+import type { StatDevice } from './iscsi-served.js'
 import type { IscsiReadContext } from './iscsi.js'
 import { storageObjectsByName } from '../parsers/lio-saveconfig.js'
 import {
@@ -63,6 +65,7 @@ import {
   saveIscsiConfig,
   tpgPath,
 } from './iscsi-mutate.js'
+import { servedElsewhere } from './iscsi-served.js'
 import { attributesFromPersisted, normalizePlugin } from './iscsi.js'
 
 /** One hole, with everything the replay needs, read off the PERSISTED config. */
@@ -103,6 +106,11 @@ export interface IscsiRepairItem {
    * over with a default.
    */
   blockedReason?: string
+  /**
+   * The hole's path names a device LIO already serves through another
+   * backstore (ident.2). Blocked, with `blockedReason` saying which.
+   */
+  deviceServed?: boolean
   /** The persisted write-cache posture, replayed on the fileio create line. */
   writeBack: boolean
   /** The attribute set to replay after create, before the map. */
@@ -181,6 +189,43 @@ export function planIscsiRepair(
   return { repairable, blocked }
 }
 
+/**
+ * The served-device guard on a repair plan (story `ident.2`, audit #8).
+ *
+ * A hole has no live backstore, so there is no served device of its own to
+ * compare with its path; what CAN be proven is that the path does not name a
+ * device LIO is already serving through another backstore — a volume renamed
+ * into the hole's old name while it is exported elsewhere. Recreating the hole
+ * over it would serve one device under two serials (and iblock's exclusive
+ * claim would fail the create half-way through the repair). Such a hole moves
+ * to `blocked` with the reason; everything else passes through unchanged.
+ */
+export async function guardRepairPlan(
+  plan: IscsiRepairPlan,
+  live: LioLiveState,
+  statFn: StatDevice,
+): Promise<IscsiRepairPlan> {
+  const repairable: IscsiRepairItem[] = []
+  const blocked = [...plan.blocked]
+  for (const item of plan.repairable) {
+    const holder = item.plugin === 'block'
+      ? servedElsewhere(live, await statFn(item.backingPath))
+      : null
+    if (holder) {
+      blocked.push({
+        ...item,
+        deviceServed: true,
+        blockedReason: `${item.backingPath} names device ${holder.device}, which LIO already serves as backstore `
+          + `'${holder.name}' — the path no longer names the volume this LUN was created on, and recreating it would `
+          + `serve one device under two serials`,
+      })
+      continue
+    }
+    repairable.push(item)
+  }
+  return { repairable, blocked }
+}
+
 /** The initiators whose PERSISTED ACL maps this LUN index. */
 function persistedAclsMapping(ctx: IscsiReadContext, missing: IscsiMissingLun): string[] {
   const target = (ctx.persisted?.targets ?? []).find(t => t.iqn === missing.targetIqn)
@@ -214,11 +259,22 @@ export function assertRepairable(plan: IscsiRepairPlan): IscsiRefusal | null {
     // replay cannot be built from (C3 — nothing the operator does to the
     // storage will help, so "import the pool" would be a wrong instruction).
     const absent = plan.blocked.filter(b => b.blockedReason === undefined)
-    const incomplete = plan.blocked.filter(b => b.blockedReason !== undefined)
-    const incompleteClause = incomplete.length === 0
+    const incomplete = plan.blocked.filter(b => b.blockedReason !== undefined && !b.deviceServed)
+    const served = plan.blocked.filter(b => b.deviceServed)
+    const incompleteClause = (incomplete.length === 0
       ? ''
       : ` ${incomplete.length === 1 ? 'One hole' : `${incomplete.length} holes`} cannot be repaired from the saved `
-        + `configuration at all: ${incomplete.map(b => `LUN ${b.lunIndex} of ${b.targetIqn} — ${b.blockedReason}`).join('; ')}.`
+        + `configuration at all: ${incomplete.map(b => `LUN ${b.lunIndex} of ${b.targetIqn} — ${b.blockedReason}`).join('; ')}.`)
+      + (served.length === 0
+        ? ''
+        : ` ${served.length === 1 ? 'One hole is' : `${served.length} holes are`} refused because the path names a `
+          + `different device: ${served.map(b => `LUN ${b.lunIndex} of ${b.targetIqn} — ${b.blockedReason}`).join('; ')}.`)
+    if (absent.length === 0 && incomplete.length === 0) {
+      return {
+        reason: 'served-device-mismatch',
+        message: `None of the missing LUNs can be repaired.${incompleteClause}`,
+      }
+    }
     if (absent.length === 0) {
       return {
         reason: 'record-incomplete',

@@ -417,6 +417,38 @@
     }
 
     /**
+     * The backup-id a new FILES task gets: `<host>-<task name>` (ident.2 —
+     * mirrors the daemon's defaultBackupId). The bare hostname was the old
+     * default, and it is the group a plain host backup of this node writes, so
+     * tasks left at it pruned each other. Empty until the task has a name.
+     */
+    function defaultFilesBackupId(node, name) {
+        var short = String(node || '').toLowerCase().split('.')[0] || 'node';
+        return name ? short + '-' + name : '';
+    }
+
+    /**
+     * Keep a new files task's backup-id tracking its name until the operator
+     * types an id of their own (then it is theirs and is never overwritten).
+     */
+    function syncAutoBackupId(win, node, name) {
+        try {
+            if (!win || win.destroyed || win.anasIdManual || win.anasTaskKind === 'block') {
+                return;
+            }
+            var f = win.down('#backupId');
+            if (!f) {
+                return;
+            }
+            win.anasIdSetting = true;
+            f.setValue(defaultFilesBackupId(node, trim(name)));
+            win.anasIdSetting = false;
+        } catch (e) {
+            // the field stays as it was
+        }
+    }
+
+    /**
      * The archive name a row gets when it is CREATED (mirrors the shared
      * deriveArchiveName): the source path's last segment, sanitised to the
      * archive-name charset, auto-suffixed `-2`, `-3`, … against the names the
@@ -3410,7 +3442,9 @@
         if (!defaultRepo && repoOpts.length) {
             defaultRepo = repoOpts[0].name;
         }
-        var defaultId = backupIdOf(task) || node; // hostname is the default backup-id
+        // ident.2: an edit shows the stored id (existing tasks keep theirs); a
+        // new task defaults to `<host>-<task name>`, tracking the name.
+        var defaultId = isEdit ? (backupIdOf(task) || node) : (backupIdOf(task) || defaultFilesBackupId(node, task.name || ''));
         var mode = modeOf(task);
         // No cadence = a raw-OnCalendar task (everything created before 16.10):
         // it opens on Custom with its expression prefilled and round-trips as-is.
@@ -3470,6 +3504,13 @@
                             regex: NAME_RE,
                             maxLength: 64,
                             regexText: t('Lowercase letters, digits and hyphens; must start with a letter or digit.'),
+                            listeners: {
+                                change: function (f, v) {
+                                    if (!isEdit) {
+                                        syncAutoBackupId(win, node, v);
+                                    }
+                                },
+                            },
                         },
                         {
                             // backup2.9 — chosen FIRST: a task is files or block,
@@ -3534,12 +3575,23 @@
                             fieldLabel: t('Backup ID'),
                             allowBlank: false,
                             value: defaultId,
+                            emptyText: isEdit ? '' : (String(node || '').toLowerCase().split('.')[0] + '-<task name>'),
+                            listeners: {
+                                change: function () {
+                                    // A value the operator typed is theirs; a
+                                    // value set by the name tracking or the
+                                    // block pick is not a choice.
+                                    if (win && !win.anasIdSetting && win.anasTaskKind !== 'block') {
+                                        win.anasIdManual = true;
+                                    }
+                                },
+                            },
                         },
                         {
                             xtype: 'component',
                             style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
-                            html: enc(t('the PBS group identity — host/<id>. Defaults to this node\'s '
-                                + 'hostname; give it a logical name (pictures, storage…) to disambiguate.')),
+                            html: enc(t('the PBS group identity — host/<id>. Defaults to <node>-<task name>; '
+                                + 'each task needs its own (two tasks in one group prune each other).')),
                         },
                         {
                             // backup2.9 — the FILES panel: today's archive list.

@@ -16,7 +16,7 @@ import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { zfsSnapshotListArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
-import { TARGETCLI, ZFS } from '../../services/iscsi-mutate.js'
+import { TARGETCLI, withIscsiLock, ZFS } from '../../services/iscsi-mutate.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/iscsi')
@@ -60,6 +60,9 @@ const NODE_NAME = 'nas'
 const ANAS_IQN = anasIqn('vmstore', { nodeName: NODE_NAME })
 const INITIATOR = 'iqn.1993-08.org.debian:01:ae3d2ec18ad'
 const GT_IQN = 'iqn.2026-08.dev.anas.gtiscsi:target1'
+/** The zvol LUN's path and the image path the file-LUN tests use (ident.2 stat seam). */
+const SERVED_ZVOL = '/dev/zvol/tank/vol1'
+const SERVED_IMAGE = '/tank/images/imgdisk.raw'
 
 /** SYNTHETIC (not a capture): the smallest tree the mutation gates need. */
 function anasManifest(opts: {
@@ -332,6 +335,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
     nodename: process.env.ANAS_NODENAME,
     initiator: process.env.ANAS_ISCSI_INITIATOR_NAME,
     fstab: process.env.ANAS_FSTAB_PATH,
+    deviceStat: process.env.ANAS_ISCSI_DEVICE_STAT,
   }
 
   async function serve(opts: { manifest?: string, saveconfigText?: string, saveconfigFixture?: string, storageCfg?: string } = {}) {
@@ -423,6 +427,10 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
     await writeFile(join(dir, 'block', 'zd16', 'size'), '4194304\n')
     // Pin the node name so a generated IQN matches the synthetic fixture's.
     process.env.ANAS_NODENAME = NODE_NAME
+    // ident.2: the path the fixture's zvol LUN names IS the device it serves
+    // (configfs says Major 230 Minor 16), and the image is a regular file. A
+    // test that re-creates a volume under the LUN overrides this.
+    process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:16;${SERVED_IMAGE}=file:2049:77`
   })
 
   afterEach(async () => {
@@ -437,6 +445,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       ['ANAS_NODENAME', savedEnv.nodename],
       ['ANAS_ISCSI_INITIATOR_NAME', savedEnv.initiator],
       ['ANAS_FSTAB_PATH', savedEnv.fstab],
+      ['ANAS_ISCSI_DEVICE_STAT', savedEnv.deviceStat],
     ] as const) {
       if (saved === undefined)
         delete process.env[key]
@@ -1459,6 +1468,152 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
   // --- the iscsi.6 seam ----------------------------------------------------
 
   // --- the repair door (story iscsi.5) -------------------------------------
+
+  // --- ident.2 (audit #8 #9): the served device and the serial are the identity ---
+
+  describe('ident.2 — LUN verbs act only on the device and the LUN they were accepted for', () => {
+    const vmdisk = () => join(dir, 'target', 'core', 'iblock_0', 'vmdisk1')
+    const NEW_SERIAL = 'T10 VPD Unit Serial Number: 11111111-2222-3333-4444-555555555555\n'
+
+    /** Park the iSCSI mutex so a submitted job waits exactly where it re-reads. */
+    async function parkLock(): Promise<{ release: () => void, held: Promise<void> }> {
+      let release!: () => void
+      let locked!: () => void
+      const isLocked = new Promise<void>((r) => {
+        locked = r
+      })
+      const held = withIscsiLock(() => new Promise<void>((r) => {
+        release = r
+        locked()
+      }))
+      await isLocked
+      return { release, held }
+    }
+
+    const argv = () => mockOf().calls.map(c => `${c.command} ${c.args.join(' ')}`)
+
+    it('a grow is refused when the path names a different device than the LUN serves (rename + re-create)', async () => {
+      process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:32`
+      await serveAnas()
+      const res = await call('PUT', `${targetUrl()}/luns/0`, { size: 4294967296 })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'served-device-mismatch')
+      assert.match(res.body.error!.message, /LUN serves a different device than its path names/)
+      assert.match(res.body.error!.message, /serves device 230:16 \(zd16\), but \/dev\/zvol\/tank\/vol1 is device 230:32/)
+      assert.equal(argv().some(a => a.includes('volsize=')), false)
+    })
+
+    it('a grow is refused when the path no longer resolves at all', async () => {
+      process.env.ANAS_ISCSI_DEVICE_STAT = '/elsewhere=1:1'
+      await serveAnas()
+      const res = await call('PUT', `${targetUrl()}/luns/0`, { size: 4294967296 })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'served-device-mismatch')
+      assert.match(res.body.error!.message, /no longer resolves/)
+    })
+
+    it('a write-cache change alone does not need the backing — it is not refused on a mismatch', async () => {
+      process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:32`
+      await serveAnas()
+      const res = await call('PUT', `${targetUrl()}/luns/0`, { writeBack: false })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+    })
+
+    it('delete with destroyBacking is refused on a mismatch — no code, before the confirm gate', async () => {
+      process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:32`
+      await serveAnas()
+      const res = await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`)
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'served-device-mismatch')
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
+      // A plain delete only unmaps — the right way to drop that LUN — so it
+      // still reaches its confirm.
+      const plain = await call('DELETE', `${targetUrl()}/luns/0`)
+      assert.equal(plain.statusCode, 409)
+      assert.equal(plain.body.error!.code, 'CONFIRMATION_REQUIRED')
+    })
+
+    it('the delete code binds serial + backstore: a LUN re-created at the index inside the TTL gets a NEW challenge', async () => {
+      await serveAnas()
+      const first = await call('DELETE', `${targetUrl()}/luns/0`)
+      const code = String(first.headers['x-anas-confirm-code'])
+      await writeFile(join(vmdisk(), 'wwn', 'vpd_unit_serial'), NEW_SERIAL)
+      const res = await call('DELETE', `${targetUrl()}/luns/0`, undefined, { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.code, 'CONFIRMATION_REQUIRED')
+      assert.notEqual(res.headers['x-anas-confirm-code'], code)
+      assert.equal(argv().some(a => a.startsWith(TARGETCLI)), false)
+    })
+
+    it('a queued delete whose index now holds a different LUN fails — nothing unmapped', async () => {
+      await serveAnas()
+      mockOf().addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const code = String((await call('DELETE', `${targetUrl()}/luns/0`)).headers['x-anas-confirm-code'])
+      const lock = await parkLock()
+      const res = await call('DELETE', `${targetUrl()}/luns/0`, undefined, { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      await writeFile(join(vmdisk(), 'wwn', 'vpd_unit_serial'), NEW_SERIAL)
+      lock.release()
+      await lock.held
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /no longer the LUN this request was accepted for/)
+      assert.equal(argv().some(a => a.startsWith(TARGETCLI)), false)
+    })
+
+    it('a queued destroyBacking whose served device changed fails — no zfs destroy', async () => {
+      await serveAnas()
+      mockOf().addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const code = String((await call('DELETE', `${targetUrl()}/luns/0`)).headers['x-anas-confirm-code'])
+      const lock = await parkLock()
+      const res = await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`, undefined, { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      await writeFile(join(vmdisk(), 'info'), 'Status: ACTIVATED  Max Queue Depth: 128  SectorSize: 512  HwMaxSectors: 32768\n        iBlock device: zd32  UDEV PATH: /dev/zvol/tank/vol1  readonly: 0\n        Major: 230 Minor: 32  CLAIMED: IBLOCK\n')
+      lock.release()
+      await lock.held
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /LUN serves a different device than its path names/)
+      assert.equal(argv().some(a => a.startsWith(`${ZFS} destroy`)), false)
+      assert.equal(argv().some(a => a.startsWith(TARGETCLI)), false)
+    })
+
+    it('a queued grow re-reads the served size: one that would now SHRINK fails — no zfs set', async () => {
+      await serveAnas()
+      mockOf().addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const lock = await parkLock()
+      const res = await call('PUT', `${targetUrl()}/luns/0`, { size: 4294967296 })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      // The volume grew to 8 GiB while the job waited; 4 GiB is a shrink now.
+      await writeFile(join(dir, 'block', 'zd16', 'size'), '16777216\n')
+      lock.release()
+      await lock.held
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /would SHRINK it/)
+      assert.equal(argv().some(a => a.includes('volsize=')), false)
+    })
+
+    it('repair blocks a hole whose path names a device another backstore already serves', async () => {
+      const savedPresent = process.env.ANAS_ISCSI_BACKING_PRESENT
+      process.env.ANAS_ISCSI_BACKING_PRESENT = '/dev/zvol/tank/gone'
+      process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:16;/dev/zvol/tank/gone=230:16`
+      try {
+        await serveAnas({ hole: true })
+        const res = await call('POST', '/v1/iscsi/health/repair')
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.body.error!.reason, 'served-device-mismatch')
+        assert.match(res.body.error!.message, /already serves as backstore 'vmdisk1'/)
+        assert.ok(!res.headers['x-anas-confirm-code'])
+      }
+      finally {
+        if (savedPresent === undefined)
+          delete process.env.ANAS_ISCSI_BACKING_PRESENT
+        else
+          process.env.ANAS_ISCSI_BACKING_PRESENT = savedPresent
+      }
+    })
+  })
 
   describe('POST /v1/iscsi/health/repair — the way OUT of a degraded restore', () => {
     it('is the one mutation NOT blocked by the degraded gate', async () => {

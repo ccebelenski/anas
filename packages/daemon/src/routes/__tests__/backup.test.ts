@@ -989,6 +989,10 @@ describe('backup routes (Epic 16)', () => {
     })
     assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
     const liveArgs = pbcArgs(mock)
+    // ident.2: one PBS group per task — the live task goes before the snapshot
+    // task takes the same backup-id (the identity across modes is the point).
+    const del = await server.inject({ method: 'DELETE', url: '/v1/backup/tasks/ident-live', headers: IDENTITY })
+    assert.equal((await waitForJob(server, await jobIdFrom(del))).status, 'completed')
 
     // SNAPSHOT run: the same archive NAME and the same backup-id, on ZFS.
     await createTaskPayload({
@@ -1740,7 +1744,10 @@ describe('backup routes (Epic 16)', () => {
       assert.match(sent[0].body, /Backup succeeded, but the retention prune did not run/)
       // The backup itself still reports its archives — the operator sees both.
       assert.ok(sent[0].body.includes('etc.pxar: had to backup 82.957 KiB'))
-      await server.inject({ method: 'DELETE', url: `/v1/backup/tasks/${name}`, headers: JSON_HEADERS })
+      // ident.2: one PBS group per task — the next mode's task reuses this
+      // backup-id, so this one is gone before it is created.
+      const del = await server.inject({ method: 'DELETE', url: `/v1/backup/tasks/${name}`, headers: IDENTITY })
+      assert.equal((await waitForJob(server, await jobIdFrom(del))).status, 'completed')
     }
   })
 
@@ -1838,7 +1845,10 @@ describe('backup routes (Epic 16)', () => {
       assert.equal(sent[0].severity, 'error', notify)
       assert.match(sent[0].title, /FAILED/)
       assert.ok(sent[0].body.includes('Error: no such datastore \'store1\''))
-      await server.inject({ method: 'DELETE', url: `/v1/backup/tasks/${name}`, headers: JSON_HEADERS })
+      // ident.2: one PBS group per task — the next mode's task reuses this
+      // backup-id, so this one is gone before it is created.
+      const del = await server.inject({ method: 'DELETE', url: `/v1/backup/tasks/${name}`, headers: IDENTITY })
+      assert.equal((await waitForJob(server, await jobIdFrom(del))).status, 'completed')
     }
   })
 
@@ -1869,6 +1879,9 @@ describe('backup routes (Epic 16)', () => {
       const job = await waitForJob(server, await jobIdFrom(res))
       assert.equal((job.result as { status: string }).status, 'skipped-off-week', notify)
       assert.deepEqual(notifications(mock), [], notify)
+      // ident.2: one PBS group per task — the next mode's task reuses this id.
+      const del = await server.inject({ method: 'DELETE', url: `/v1/backup/tasks/${name}`, headers: IDENTITY })
+      assert.equal((await waitForJob(server, await jobIdFrom(del))).status, 'completed')
     }
   })
 

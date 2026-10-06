@@ -23,6 +23,7 @@ import { parseSnapshotNames, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { confirmGate } from '../safety/gate.js'
 import { ensureAhrTargetOrdering } from '../services/ahr-create.js'
 import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
+import { computeIscsiHealth } from '../services/iscsi-health.js'
 import {
   addIscsiLun,
   assertInstalled,
@@ -50,7 +51,8 @@ import {
   zvolDataset,
 } from '../services/iscsi-mutate.js'
 import { readIscsiHealthWithQuarantine } from '../services/iscsi-quarantine.js'
-import { assertRepairable, planIscsiRepair, repairIscsiHoles } from '../services/iscsi-repair.js'
+import { assertRepairable, guardRepairPlan, planIscsiRepair, repairIscsiHoles } from '../services/iscsi-repair.js'
+import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
 import { iscsiAvailability } from '../services/iscsi.js'
 import { requireIdentity } from './identity.js'
 
@@ -770,6 +772,16 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       }
     }
 
+    // ident.2 (audit #8): a size change acts on the backing object — a `zfs set
+    // volsize=` on the volume the PATH names, or a grow of the file at it — so
+    // the object at the path must be the one LIO is serving. After a rename +
+    // re-create under the live LUN the size read above is the SERVED device's,
+    // and a "grow" computed from it would shrink the new volume.
+    const served = await checkServedDevice(state.ctx.live, lun, statDeviceFrom(paths))
+    if (req.size !== undefined && served.refusal)
+      return sendRefusal(reply, served.refusal)
+    const bound = servedLunIdentity(iqn, lun, served.device)
+
     // GT-42: LIO offers NO protection here, so every session gate is ANAS's own.
     //
     // ONE exception, and it is not a softening: **growing a zvol is live**
@@ -845,20 +857,30 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
 
     const job = jobQueue.submit(
       'iscsi.lun.update',
-      { ...identity, params: { target: iqn, lun: index, ...(req.size !== undefined ? { size: req.size } : {}), ...(req.writeBack !== undefined ? { writeBack: req.writeBack } : {}) } },
+      { ...identity, params: { target: iqn, lun: index, serial: lun.serial, backstore: lun.name, ...(req.size !== undefined ? { size: req.size } : {}), ...(req.writeBack !== undefined ? { writeBack: req.writeBack } : {}) } },
       async updateProgress => withIscsiLock(async () => {
+        // ident.2 (audit #8/#9): the job may run long after the request. Under
+        // the lock, the LUN at this index must still be the same serial, the
+        // same backstore, the same path and — for a size change — the same
+        // served device; and the size is re-read from what is served NOW, so a
+        // grow can never become a shrink in the queue.
+        const fresh = await reverifyServedLun(executor, paths, bound, { requireDevice: req.size !== undefined })
+        const now = fresh.lun
+        if (req.size !== undefined) {
+          if (now.size === null)
+            throw new Error(`LUN ${index}'s current size could not be re-read inside the job, so the change to ${req.size} bytes cannot be proven a grow. Nothing was changed.`)
+          if (req.size < now.size)
+            throw new Error(`LUN ${index} is now ${now.size} bytes; ${req.size} bytes would SHRINK it. Nothing was changed.`)
+        }
         // O1: a zvol grow rounds the requested size up to a volblocksize
         // multiple (the create door does the same silently). The applied size
         // may therefore exceed `req.size`, so the result reports what actually
         // landed on the volume rather than what was asked for.
         let appliedSize = req.size
-        // The `lun.size === null` arm is unreachable for a size change since M2
-        // (#53) — it is 409'd before the job is ever submitted — but the type
-        // cannot narrow across this closure, so the arm stays.
-        if (req.size !== undefined && (lun.size === null || req.size > lun.size)) {
+        if (req.size !== undefined && now.size !== null && req.size > now.size) {
           if (lun.kind === 'zvol') {
             // A zvol grow is live end to end — no LIO action at all (GT-28).
-            appliedSize = await growZvolLun(mutateOptions(updateProgress), lun.dataset ?? zvolDataset(lun.backingPath), req.size)
+            appliedSize = await growZvolLun(mutateOptions(updateProgress), now.dataset ?? zvolDataset(now.backingPath), req.size)
             // M1: a combined {size, writeBack} must do BOTH. The fileio branch
             // carries writeBack inside the replay (the create's `write_back=`
             // plus its attribute token), but growZvolLun is a bare
@@ -872,8 +894,8 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
             // — same serial, same attributes, same LUN index (GT-18/GT-29).
             await resizeFileLun(
               mutateOptions(updateProgress),
-              target,
-              { index: lun.index, name: lun.name, backingPath: lun.backingPath, serial: lun.serial, attributes },
+              fresh.target,
+              { index: now.index, name: now.name, backingPath: now.backingPath, serial: now.serial, attributes },
               req.size,
             )
           }
@@ -945,6 +967,16 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       }
     }
 
+    // ident.2 (audit #8): destroyBacking runs `zfs destroy` on the volume the
+    // PATH names (or unlinks the file at it), so that object must be the one
+    // LIO serves. A plain delete only unmaps, which is the right way to drop a
+    // LUN whose volume was renamed away, so it is not refused — but the device
+    // it verified (if any) is still bound for the job's re-read.
+    const served = await checkServedDevice(state.ctx.live, lun, statDeviceFrom(paths))
+    if (destroyBacking && served.refusal)
+      return sendRefusal(reply, served.refusal)
+    const bound = servedLunIdentity(iqn, lun, served.device)
+
     // M5: the job destroys a zvol with a PLAIN `zfs destroy` — never `-r`,
     // because sweeping somebody's snapshots away as a side effect of deleting a
     // LUN is not a decision this door gets to make. `zfs destroy` refuses a
@@ -979,9 +1011,15 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     // mismatch the minted code and 409 again. The warnings therefore describe
     // BOTH outcomes: the backing is kept unless the box is ticked, and what
     // ticking it destroys.
+    //
+    // ident.2 (audit #9): the code binds the LUN's SERIAL and BACKSTORE, never
+    // its index. Indexes are reused lowest-free, so a code minted for LUN 1
+    // must not delete a different LUN that took index 1 inside the TTL — the
+    // resend recomputes these from what is there now and the code no longer
+    // matches.
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'iscsi.lun.delete',
-      params: { target: iqn, lun: index },
+      params: { target: iqn, serial: lun.serial, backstore: lun.name },
       message: `Deleting LUN ${index} of '${iqn}' is irreversible — the unit serial goes with it; the backing object is kept unless the resend sets destroyBacking`,
       warnings: [
         `The unit serial ${lun.serial ?? '(unknown)'} goes with it — any PVE volid or initiator configuration built on it breaks`,
@@ -1000,20 +1038,27 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
 
     const job = jobQueue.submit(
       'iscsi.lun.delete',
-      { ...identity, params: { target: iqn, lun: index, destroyBacking } },
-      async updateProgress => withIscsiLock(async () => deleteIscsiLun(
-        mutateOptions(updateProgress),
-        target,
-        {
-          index: lun.index,
-          name: lun.name,
-          plugin: lun.plugin,
-          kind: lun.kind,
-          backingPath: lun.backingPath,
-          ...(lun.dataset ? { dataset: lun.dataset } : {}),
-        },
-        destroyBacking,
-      )),
+      { ...identity, params: { target: iqn, lun: index, serial: lun.serial, backstore: lun.name, destroyBacking } },
+      async updateProgress => withIscsiLock(async () => {
+        // ident.2: re-read under the lock — same serial, backstore, path, and
+        // (when the backing is destroyed) the same served device — then act on
+        // what was just re-read, never on the request-time snapshot.
+        const fresh = await reverifyServedLun(executor, paths, bound, { requireDevice: destroyBacking })
+        const now = fresh.lun
+        return deleteIscsiLun(
+          mutateOptions(updateProgress),
+          fresh.target,
+          {
+            index: now.index,
+            name: now.name,
+            plugin: now.plugin,
+            kind: now.kind,
+            backingPath: now.backingPath,
+            ...(now.dataset ? { dataset: now.dataset } : {}),
+          },
+          destroyBacking,
+        )
+      }),
     )
 
     reply.code(202)
@@ -1049,7 +1094,11 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (notInstalled)
       return sendRefusal(reply, notInstalled)
 
-    const plan = planIscsiRepair(state.ctx, state.health, state.targets)
+    const plan = await guardRepairPlan(
+      planIscsiRepair(state.ctx, state.health, state.targets),
+      state.ctx.live,
+      statDeviceFrom(paths),
+    )
     const refusal = assertRepairable(plan)
     if (refusal)
       return sendRefusal(reply, refusal)
@@ -1064,7 +1113,19 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
           targets: [...new Set(plan.repairable.map(r => r.targetIqn))].join(', '),
         },
       },
-      async updateProgress => withIscsiLock(async () => repairIscsiHoles(mutateOptions(updateProgress), plan)),
+      async updateProgress => withIscsiLock(async () => {
+        // ident.2: the plan above is the request's; the job may run later. It
+        // is rebuilt from a fresh read under the lock, and a hole whose path
+        // now names a device LIO already serves through another backstore is
+        // blocked rather than given a second identity.
+        const fresh = await readIscsiState(executor, paths)
+        const freshPlan = await guardRepairPlan(
+          planIscsiRepair(fresh.ctx, computeIscsiHealth(fresh.ctx, fresh.targets), fresh.targets),
+          fresh.ctx.live,
+          statDeviceFrom(paths),
+        )
+        return repairIscsiHoles(mutateOptions(updateProgress), freshPlan)
+      }),
     )
 
     reply.code(202)

@@ -55,9 +55,10 @@ import { readAhrPools } from '../services/ahr-topology.js'
 import { browseArchiveLevel } from '../services/backup-catalog.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyBackupRun } from '../services/backup-notify.js'
-import { pruneAfterBackup, pruneGroup, runPrune } from '../services/backup-prune.js'
+import { defaultBackupId, groupKeyUnchanged, pruneAfterBackup, pruneGroup, runPrune, sharedGroupMessage, taskSharingGroup } from '../services/backup-prune.js'
 import { listGroups, listSnapshots } from '../services/backup-reads.js'
 import {
+  backupNodename,
   isPveRepoName,
   pbsDefToRepo,
   pveRepoName,
@@ -135,6 +136,7 @@ import {
   resolveZvolBacking,
 } from '../services/iscsi-mutate.js'
 import { classifyBacking } from '../services/iscsi-ownership.js'
+import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from '../services/iscsi.js'
 import { imageArchiveScan, NESTED_SCAN_PREVIEW_TIMEOUT_S, scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
 import { readSourceGuardFacts, unmountedMountFor } from '../services/source-guard.js'
@@ -778,6 +780,41 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     return true
   }
 
+  /**
+   * ident.2 (audit #14): refuse a task whose PBS group — (repository,
+   * effective namespace, backup-id) — another task already writes. Two tasks
+   * in one group prune each other's snapshots. `previous` is the stored task on
+   * an edit: a task whose group did not change is never refused, so tasks that
+   * already share a group from before this rule keep working (and keep their
+   * history) until someone changes one of them. Sends the 409 and returns
+   * false on a collision.
+   */
+  async function guardGroupUnique(task: BackupTask, reply: FastifyReply, previous?: BackupTask | null): Promise<boolean> {
+    const [all, reg, pbs] = await Promise.all([
+      readAllTasks(systemdDir),
+      readBackupRepos(paths),
+      readPbsStorages(paths.pveStorageCfg),
+    ])
+    const nsByRepo = new Map<string, string | undefined>(reg.repos.map(r => [r.name, r.namespace]))
+    for (const def of pbs)
+      nsByRepo.set(pveRepoName(def.id), def.namespace)
+    const nsOf = (repository: string): string | undefined => nsByRepo.get(repository)
+    if (previous && groupKeyUnchanged(previous, task, nsOf))
+      return true
+    const other = taskSharingGroup(task, all, nsOf)
+    if (!other)
+      return true
+    reply.code(409)
+    reply.send({
+      error: {
+        code: 'CONFLICT',
+        reason: 'backup-group-in-use',
+        message: sharedGroupMessage(task, other, task.namespace ?? nsOf(task.repository)),
+      },
+    })
+    return false
+  }
+
   // --- GET /backup/tasks — grid (LOCAL-ONLY status) -------------------------
   server.get('/backup/tasks', async () => {
     const [tasks, reg] = await Promise.all([readAllTasks(systemdDir), readBackupRepos(paths)])
@@ -1029,7 +1066,18 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
 
   // --- POST /backup/tasks — create -----------------------------------------
   server.post('/backup/tasks', async (request, reply) => {
-    const bodyParsed = BackupTaskRequest.safeParse(request.body ?? {})
+    // ident.2 (audit #14): a NEW task with no backup-id gets `<host>-<task>`,
+    // never the bare hostname a plain host backup of this node also writes.
+    const body = request.body && typeof request.body === 'object' && !Array.isArray(request.body)
+      ? { ...(request.body as Record<string, unknown>) }
+      : request.body
+    if (body && typeof body === 'object' && !Array.isArray(body)) {
+      const o = body as Record<string, unknown>
+      const id = o.backupId
+      if (typeof o.name === 'string' && (id === undefined || id === null || (typeof id === 'string' && id.trim() === '')))
+        o.backupId = defaultBackupId(backupNodename(), o.name)
+    }
+    const bodyParsed = BackupTaskRequest.safeParse(body ?? {})
     if (!bodyParsed.success) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid backup task: ${bodyParsed.error.issues[0]?.message}` } }
@@ -1045,6 +1093,8 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return { error: { code: 'CONFLICT', message: `Backup task '${task.name}' already exists` } }
     }
     if (!(await guardTask(task, reply)))
+      return reply
+    if (!(await guardGroupUnique(task, reply)))
       return reply
 
     const job = jobQueue.submit(
@@ -1088,6 +1138,8 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return { error: { code: 'NOT_FOUND', message: `Backup task '${name}' not found` } }
     }
     if (!(await guardTask(task, reply)))
+      return reply
+    if (!(await guardGroupUnique(task, reply, await readTask(systemdDir, name))))
       return reply
 
     const job = jobQueue.submit(
@@ -1730,6 +1782,16 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       }
     }
 
+    // (3b) ident.2 (audit #10): the object at the path must be the one LIO
+    // serves. After a rename + re-create under the live LUN the path names a
+    // DIFFERENT volume than the initiator sees, and the image would land in it.
+    const served = await checkServedDevice(state.ctx.live, lun, statDeviceFrom(iscsiPaths))
+    if (served.refusal) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: served.refusal.reason, message: served.refusal.message } }
+    }
+    const bound = servedLunIdentity(target.iqn, lun, served.device)
+
     // (4) The snapshot, and the archive inside it — the FIRST PBS contact, and
     // it is backup2.5's own read. Not a second parser: the restore resolves the
     // manifest through exactly the call the picker used, so what is written back
@@ -1818,9 +1880,12 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // choice the operator is allowed to make, and the warnings say exactly what
     // it costs.
     const otherLuns = target.luns.filter(l => l.index !== lun.index).length
+    // ident.2 (audit #10): the code binds the LUN's SERIAL and the exact
+    // snapshot + archive, never the index — a LUN re-created at the index, or
+    // a different point in time picked inside the TTL, mints a new challenge.
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'backup.restore.image',
-      params: { target: target.iqn, lun: lun.index },
+      params: { target: target.iqn, serial: lun.serial, repo: req.repo, snapshot: req.snapshot, archive: req.archive },
       message: `Restoring ${req.archive} from ${req.snapshot} over LUN ${lun.index} of ${target.iqn}`,
       warnings: [
         `This OVERWRITES ${lun.backingPath} completely — every byte currently on LUN ${lun.index} is replaced `
@@ -1898,6 +1963,14 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           readSessions: async (iqn) => {
             const now = await readIscsiState(executor, iscsiPaths)
             return now.targets.find(t => t.iqn === iqn)?.sessions ?? []
+          },
+          // ident.2: called under the lock by runImageRestore — same serial,
+          // backstore, path and served device (throws otherwise), and the
+          // backing object's size as read NOW.
+          reverify: async () => {
+            const fresh = await reverifyServedLun(executor, iscsiPaths, bound, { requireDevice: true })
+            const size = await readTargetSize(executor, fresh.lun)
+            return { target: fresh.target, lun: fresh.lun, size: 'error' in size ? null : size.size }
           },
           mutate: {
             executor,

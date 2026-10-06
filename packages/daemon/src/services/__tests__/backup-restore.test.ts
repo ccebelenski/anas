@@ -167,6 +167,9 @@ function deps(mock: MockExecutor, lun: IscsiLun, tgt: IscsiTargetDetail, over: R
     // case — nobody logged back in while the job waited in the queue — so every
     // test that is about something else keeps reading as it did.
     readSessions: async () => [],
+    // ident.2: the run-time LUN re-read. The default is the healthy case —
+    // the same LUN, at the size the restore was accepted for.
+    reverify: async () => ({ target: tgt, lun, size: (over.imageSize as number | undefined) ?? IMAGE_SIZE }),
     mutate: { executor: mock },
     ...over,
   }
@@ -597,6 +600,51 @@ describe('runImageRestore — the happy sequence, as an exact call log', () => {
     assert.equal(mock.calls.some(c => c.args.includes('enable')), false)
     assert.equal(result.targetDisabled, false)
     assert.equal(result.targetReEnabled, false)
+  })
+})
+
+describe('runImageRestore — the run-time LUN re-read (ident.2, audit #10)', () => {
+  it('a LUN that is no longer the one accepted fails the job — nothing disabled, nothing written', async () => {
+    const mock = successMock()
+    const lun = zvolLun()
+    const tgt = target([lun])
+    await assert.rejects(
+      runImageRestore(mock, deps(mock, lun, tgt, {
+        reverify: async () => {
+          throw new Error('LUN 0 of x is no longer the LUN this request was accepted for: a different LUN took the index.')
+        },
+      }), noop),
+      /no longer the LUN this request was accepted for/,
+    )
+    assert.deepEqual(mock.calls, [])
+    assert.deepEqual(mock.streamCalls, [])
+  })
+
+  it('a backing whose size changed while the job waited fails it — both numbers named, nothing touched', async () => {
+    const mock = successMock()
+    const lun = zvolLun()
+    const tgt = target([lun])
+    await assert.rejects(
+      runImageRestore(mock, deps(mock, lun, tgt, { reverify: async () => ({ target: tgt, lun, size: IMAGE_SIZE * 2 }) }), noop),
+      (err: Error) => {
+        assert.match(err.message, new RegExp(`is ${IMAGE_SIZE * 2} bytes now, not the ${IMAGE_SIZE} bytes`))
+        assert.match(err.message, /Nothing was disabled and nothing was written/)
+        return true
+      },
+    )
+    assert.deepEqual(mock.calls, [])
+    assert.deepEqual(mock.streamCalls, [])
+  })
+
+  it('an unreadable size at run time refuses too', async () => {
+    const mock = successMock()
+    const lun = zvolLun()
+    const tgt = target([lun])
+    await assert.rejects(
+      runImageRestore(mock, deps(mock, lun, tgt, { reverify: async () => ({ target: tgt, lun, size: null }) }), noop),
+      /of unknown size now/,
+    )
+    assert.deepEqual(mock.calls, [])
   })
 })
 

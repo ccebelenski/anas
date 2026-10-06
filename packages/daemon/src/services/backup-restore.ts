@@ -541,6 +541,15 @@ export interface ImageRestoreDeps {
    * optional: a caller that forgot it would silently lose the gate.
    */
   readSessions: (iqn: string) => Promise<IscsiSession[]>
+  /**
+   * Re-read the LUN NOW, under the iSCSI lock (story `ident.2`, audit #10):
+   * the caller's reader proves the LUN at the index still has the same
+   * serial, backstore, backing path and served device (`reverifyServedLun`)
+   * and throws if not, then reports the backing object's size as read now.
+   * Required, never optional: without it the job writes to whatever the
+   * request-time path names by the time it runs.
+   */
+  reverify: () => Promise<{ target: IscsiTargetDetail, lun: IscsiLun, size: number | null }>
   /** The mutate context the enable/disable pair runs in. */
   mutate: IscsiMutateOptions
 }
@@ -610,6 +619,17 @@ export async function runImageRestore(
   // `try`, so a job that stops here has disabled nothing and has no `finally`
   // to unwind — the target is bit-for-bit as the job found it.
   await withIscsiLock(async () => {
+    // ident.2 (audit #10): the LUN itself, not just its sessions. The request
+    // proved serial, path, served device and size; a queued job re-proves all
+    // four before it disables anything, so a LUN re-created at the index or a
+    // volume re-created at the path is refused with nothing touched.
+    updateProgress(`re-reading LUN ${lun.index} of ${target.iqn} - serial, backing path, served device and size must be unchanged`)
+    const now = await deps.reverify()
+    if (now.size === null || now.size !== deps.imageSize) {
+      throw new Error(`${lun.backingPath} is ${now.size === null ? 'of unknown size' : `${now.size} bytes`} now, not the `
+        + `${deps.imageSize} bytes the restore was accepted for - the backing object changed while the job waited. `
+        + 'Nothing was disabled and nothing was written.')
+    }
     updateProgress(`re-reading the live sessions on ${target.iqn} - the request-time check is not the run-time one`)
     const sessions = await deps.readSessions(target.iqn)
     if (sessions.length > 0)

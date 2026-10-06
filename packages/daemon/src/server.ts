@@ -46,6 +46,7 @@ import { ConfirmStore } from './safety/confirm.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from './services/ahr-topology.js'
 import { defaultBackupReposPaths } from './services/backup-repos.js'
 import { DiskIdentityCache } from './services/disk-identity-cache.js'
+import { deviceStatSeamFromEnv } from './services/iscsi-served.js'
 import { defaultRcloneConfigPaths, RCLONE, rcloneBaseArgs } from './services/rclone-config.js'
 import { defaultRemotesPaths } from './services/replication-remotes.js'
 import { createTransport, defaultMembersFile } from './services/replication-transport.js'
@@ -524,6 +525,7 @@ export function createServer(opts?: ServerOptions) {
   const backingPresent = (process.env.ANAS_ISCSI_BACKING_PRESENT ?? '')
     .split(':')
     .filter(p => p.startsWith('/'))
+  const iscsiDeviceStat = deviceStatSeamFromEnv(process.env.ANAS_ISCSI_DEVICE_STAT)
   const iscsiPaths = {
     configfsRoot: process.env.ANAS_ISCSI_CONFIGFS,
     blockRoot: process.env.ANAS_ISCSI_SYS_BLOCK,
@@ -536,6 +538,8 @@ export function createServer(opts?: ServerOptions) {
     ...(backingPresent.length > 0
       ? { backingExists: async (path: string): Promise<boolean | null> => (backingPresent.includes(path) ? true : null) }
       : {}),
+    // ident.2: the served-device comparison's stat, seamed the same way.
+    ...(iscsiDeviceStat ? { deviceStat: iscsiDeviceStat } : {}),
   }
   server.register(fsRoutes, { prefix: '/v1' })
   // rclone.5: POST /jobs/:id/cancel is confirm-gated, so the job routes take the store.

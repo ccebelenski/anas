@@ -2068,6 +2068,21 @@ async function backupTaskKindChecks() {
       [body.changeDetectionMode, body.mode], ['default', 'default'])
   }
 
+  // --- 1b. ident.2: a new files task's backup-id is `<node>-<task name>` ---
+  // The bare hostname was the old default — and the group a plain host backup
+  // of the node writes — so tasks left at it pruned each other. The id tracks
+  // the name until the operator types one of their own.
+  created.windows.length = 0
+  ANAS.backup.openNewTask(view, 'harness', null)
+  await settle()
+  wiz = openWindow()
+  eq('ident.2: a new task with no name yet has no backup-id', wiz.down('#backupId').getValue(), '')
+  wiz.down('#name').setValue('pics')
+  eq('ident.2: …naming it defaults the id to <node>-<task>', wiz.down('#backupId').getValue(), 'harness-pics')
+  wiz.down('#backupId').setValue('photos-main')
+  wiz.down('#name').setValue('pics2')
+  eq('ident.2: …and an id the operator typed is never overwritten', wiz.down('#backupId').getValue(), 'photos-main')
+
   // --- 2. Files names: derived from the path at creation, shown not editable ---
   created.windows.length = 0
   ANAS.backup.openNewTask(view, 'harness', null)

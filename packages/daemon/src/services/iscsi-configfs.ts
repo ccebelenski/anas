@@ -98,6 +98,9 @@ const INFO_SIZE_RE = /\bSize:\s*(\d+)/
 /** `Status: ACTIVATED` — a backstore that is mapped and serving. */
 const INFO_STATUS_RE = /Status:\s*(\S+)/
 
+/** `Major: 230 Minor: 16` from a block backstore's `info` — the device LIO opened (ident.2). */
+const INFO_MAJOR_MINOR_RE = /\bMajor:\s*(\d+)\s+Minor:\s*(\d+)/
+
 /** `LIO Session ID: 7   ISID: … TSIH: 24  SessionType: Normal` (GT-38). */
 const SESSION_ID_RE = /LIO Session ID:\s*(\d+)/
 
@@ -195,6 +198,16 @@ export interface ConfigfsBackstore {
   kernelDevice: string | null
   /** Size in bytes. fileio: from `info`. block: from `/sys/class/block`. */
   size: number | null
+  /**
+   * The device number of the block device LIO actually opened (`Major: 230
+   * Minor: 16` in `info`), block backstores only; null for fileio or when the
+   * line is absent. This is the SERVED device: `udev_path` is only the string
+   * the backstore was created with, and a `zfs rename` + re-create under a
+   * live LUN makes the two name different devices (ident.2, audit #8). Like
+   * `kernelDevice` it is compared at point of use and never stored.
+   */
+  devMajor: number | null
+  devMinor: number | null
   /** The attribute subset ANAS surfaces, raw (`1`/`0` still numbers). */
   attributes: Record<string, number>
 }
@@ -361,6 +374,9 @@ export interface BackstoreInfo {
   path: string | null
   /** `Size: 1073741824` — fileio only; block backstores do not report a size. */
   size: number | null
+  /** `Major: 230 Minor: 16` — the opened device's number. Block only. */
+  major: number | null
+  minor: number | null
 }
 
 /**
@@ -384,12 +400,15 @@ export function parseBackstoreInfo(text: string): BackstoreInfo {
   const udev = INFO_UDEV_PATH_RE.exec(text)?.[1] ?? null
   const file = INFO_FILE_RE.exec(text)?.[1] ?? null
   const sizeMatch = INFO_SIZE_RE.exec(text)?.[1]
+  const devNumber = INFO_MAJOR_MINOR_RE.exec(text)
   return {
     status,
     claimed,
     kernelDevice,
     path: udev ?? file,
     size: sizeMatch !== undefined ? Number(sizeMatch) : null,
+    major: devNumber ? Number(devNumber[1]) : null,
+    minor: devNumber ? Number(devNumber[2]) : null,
   }
 }
 
@@ -555,6 +574,8 @@ async function readBackstore(
     claimed: info?.claimed ?? null,
     kernelDevice: info?.kernelDevice ?? null,
     size,
+    devMajor: info?.major ?? null,
+    devMinor: info?.minor ?? null,
     attributes,
   }
 }

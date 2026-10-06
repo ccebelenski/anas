@@ -8,12 +8,16 @@ import { MockExecutor } from '../../executor/mock.js'
 import {
   buildPruneArgs,
   classifyPruneVerdict,
+  defaultBackupId,
+  groupKeyUnchanged,
   parsePruneOutput,
   pruneAfterBackup,
   pruneGroup,
   pruneSummaryLine,
   runPrune,
+  sharedGroupMessage,
   summarizePrune,
+  taskSharingGroup,
 } from '../backup-prune.js'
 
 const PBC = '/usr/bin/proxmox-backup-client'
@@ -291,5 +295,60 @@ describe('backup prune — pruneAfterBackup (the post-success step)', () => {
     assert.equal(out.warnings!.length, 1)
     assert.match(out.warnings![0], /Backup succeeded/)
     assert.match(out.warnings![0], /Datastore\.Prune/)
+  })
+})
+
+describe('ident.2 (audit #14) — one PBS group per task', () => {
+  function task(over: Partial<BackupTask>): BackupTask {
+    return {
+      name: 'pictures',
+      repository: 'pbs-main',
+      backupId: 'pictures',
+      archives: [{ name: 'root', path: '/tank/pictures', excludes: [] }],
+      changeDetectionMode: 'default',
+      notify: 'always',
+      schedule: 'daily',
+      enabled: true,
+      limitNofile: 1024,
+      ...over,
+    } as BackupTask
+  }
+  const noNs = (): string | undefined => undefined
+
+  it('a new task defaults to <host>-<task>, short host, never the bare hostname', () => {
+    assert.equal(defaultBackupId('nas', 'pictures'), 'nas-pictures')
+    assert.equal(defaultBackupId('NAS.example.com', 'pictures'), 'nas-pictures')
+  })
+
+  it('finds the other task writing the same (repo, namespace, backup-id)', () => {
+    const other = task({ name: 'old', backupId: 'nas' })
+    assert.equal(taskSharingGroup(task({ backupId: 'nas' }), [other], noNs)?.name, 'old')
+    // Never its own collision.
+    assert.equal(taskSharingGroup(task({ name: 'old', backupId: 'nas' }), [other], noNs), null)
+  })
+
+  it('a different repository, namespace or id is a different group', () => {
+    const other = task({ name: 'old', backupId: 'nas' })
+    assert.equal(taskSharingGroup(task({ backupId: 'nas', repository: 'pbs-2' }), [other], noNs), null)
+    assert.equal(taskSharingGroup(task({ backupId: 'nas', namespace: 'x' }), [other], noNs), null)
+    assert.equal(taskSharingGroup(task({ backupId: 'nas-pictures' }), [other], noNs), null)
+  })
+
+  it('the namespace compared is the EFFECTIVE one: the repo\'s own counts when the task sets none', () => {
+    const other = task({ name: 'old', backupId: 'nas' })
+    const repoNs = (): string | undefined => 'site'
+    assert.equal(taskSharingGroup(task({ backupId: 'nas', namespace: 'site' }), [other], repoNs)?.name, 'old')
+  })
+
+  it('an edit that keeps the group is unchanged; moving the id is not', () => {
+    const before = task({ backupId: 'nas' })
+    assert.equal(groupKeyUnchanged(before, task({ backupId: 'nas', schedule: 'weekly' }), noNs), true)
+    assert.equal(groupKeyUnchanged(before, task({ backupId: 'nas-pictures' }), noNs), false)
+  })
+
+  it('the refusal names the other task and the group', () => {
+    const msg = sharedGroupMessage(task({ backupId: 'nas' }), task({ name: 'old', backupId: 'nas' }), 'site')
+    assert.match(msg, /Backup task 'old' already writes the group host\/nas in repository 'pbs-main' namespace 'site'/)
+    assert.match(msg, /prune each other's snapshots/)
   })
 })
