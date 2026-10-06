@@ -53,6 +53,24 @@ const SCHEDULE = {
   enabled: true,
 }
 
+/**
+ * ident.1 follow-up: every ZFS prune also reads the stamp WITH its source
+ * (`zfs get -Hp -t snapshot … -o name,value,source anas:schedule`). Answer it
+ * from the same rows: the 5th column is the stamp (`-` = unset), source local.
+ */
+function stampSources(mock: MockExecutor, dataset: string, recursive: boolean, listStdout: string): void {
+  const stdout = listStdout.split('\n').filter(l => l.trim()).map((l) => {
+    const c = l.split('\t')
+    const v = (c[4] ?? '-').trim()
+    return v === '-' ? `${c[0]}\t-\t-` : `${c[0]}\t${v}\tlocal`
+  }).join('\n')
+  mock.addFixture({
+    command: ZFS,
+    args: ['get', '-Hp', '-t', 'snapshot', ...(recursive ? ['-r'] : ['-d', '1']), '-o', 'name,value,source', 'anas:schedule', dataset],
+    result: { stdout, stderr: '', exitCode: 0 },
+  })
+}
+
 describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
   let server: ReturnType<typeof createServer>
   let dir: string
@@ -907,6 +925,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
           args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg,anas:schedule', '-r', 'testpool/x'],
           result: { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 },
         })
+        stampSources(mock, 'testpool/x', true, `${rows.join('\n')}\n`)
         mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'], result: { stdout: 'testpool/x\ntestpool/x/data\ntestpool/x/media\n', stderr: '', exitCode: 0 } })
         const media = await create({ ...SCHEDULE, id: 'daily-media', target: { kind: 'zfs', dataset: 'testpool/x/media' }, retention: { daily: 30 } })
         await waitForJob(server, media.json().job.id)
@@ -948,6 +967,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
           args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg,anas:schedule', '-r', 'testpool/x'],
           result: { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 },
         })
+        stampSources(mock, 'testpool/x', true, `${rows.join('\n')}\n`)
         mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'], result: { stdout: 'testpool/x\ntestpool/x/data\ntestpool/x/media\n', stderr: '', exitCode: 0 } })
         const created = await create({ ...X, id: 'daily-x', cadence: 'daily', retention: { daily: 1 }, exclude: ['testpool/x/media'] })
         assert.equal(created.statusCode, 202, created.body)
@@ -1078,6 +1098,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
           args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg,anas:schedule', '-r', 'testpool/x'],
           result: { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 },
         })
+        stampSources(mock, 'testpool/x', true, `${rows.join('\n')}\n`)
         const GONE = { stdout: '', stderr: 'could not find any snapshots to destroy; check snapshot names.\n', exitCode: 1 }
         mock.addFixture({ command: ZFS, args: ['destroy', `testpool/x@${D1}`], result: GONE })
         mock.addFixture({ command: ZFS, args: ['destroy', `testpool/x/data@${D1}`], result: GONE })
@@ -1109,6 +1130,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
           args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg,anas:schedule', 'testpool/media'],
           result: { stdout: `testpool/media@${D1}\t1769385600\t0\t1\tflat-media\ntestpool/media@${D2}\t1769472000\t0\t2\tflat-media\n`, stderr: '', exitCode: 0 },
         })
+        stampSources(mock, 'testpool/media', false, `testpool/media@${D1}\t1769385600\t0\t1\tflat-media\ntestpool/media@${D2}\t1769472000\t0\t2\tflat-media\n`)
         mock.addFixture({ command: ZFS, args: ['destroy', `testpool/media@${D1}`], result: { stdout: '', stderr: 'could not find any snapshots to destroy; check snapshot names.\n', exitCode: 1 } })
         const created = await create({ ...SCHEDULE, id: 'flat-media', retention: { daily: 1 } })
         await waitForJob(server, created.json().job.id)

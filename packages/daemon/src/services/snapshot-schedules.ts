@@ -269,9 +269,11 @@ export async function pruneSnapshots(
 // `destroy -r`: one held child snapshot would fail the whole verb).
 //
 // Ownership is the `anas:schedule` stamp the take sets (ident.1, audit #1):
-// a snapshot is this schedule's iff it carries this schedule's id. A snapshot
-// stamped with any other id (another schedule, a deleted one, a sender's on a
-// received snapshot) is never a candidate. An UNSTAMPED `anas-<bucket>-*`
+// a snapshot is this schedule's iff it carries this schedule's id as a LOCAL
+// property (`zfs get … source` — a received snapshot carries its sender's
+// stamp with source `received`, and the sender's schedule may share this id;
+// such a snapshot is noted `N left: received`). A snapshot stamped with any
+// other id (another schedule, a deleted one) is never a candidate. An UNSTAMPED `anas-<bucket>-*`
 // snapshot (taken before 0.4.2, or by hand) is a candidate only where this
 // schedule is the ONLY enabled schedule covering the dataset — the legacy
 // convergence case; anywhere else it is left with a per-dataset note. That
@@ -317,6 +319,13 @@ export const SCHEDULE_LIST_UNREADABLE = 'schedule list unreadable'
 /** The note for unstamped snapshots on a dataset another enabled schedule also covers. */
 export const UNSTAMPED_SHARED = 'unstamped, more than one schedule here'
 
+/**
+ * The note for snapshots carrying this schedule's id with a property source
+ * other than `local` — received from a sender (or inherited): not this
+ * schedule's, never pruned by it.
+ */
+export const STAMP_RECEIVED = 'received'
+
 /** The note for unstamped snapshots on a dataset outside this schedule's sweep. */
 export const UNSTAMPED_OUTSIDE = 'unstamped, outside this schedule\'s sweep'
 
@@ -330,14 +339,50 @@ export function zfsTreeSnapshotListArgs(dataset: string, recursive = true): stri
 export interface TreeSnapshot extends ScheduledSnapshot {
   /** The txg the snapshot was created in (string, as ZFS prints it); '' when unread. */
   createtxg: string
+  /**
+   * A stamp whose property source is NOT `local` — `received` (a `zfs send -p`
+   * / `-R` stream carried the sender's stamp) or inherited. Never this
+   * schedule's, never unstamped either; `schedule` is unset when this is set.
+   */
+  foreignStamp?: { value: string, source: string }
+}
+
+/**
+ * `zfs get` argv for the stamp WITH its property source (the follow-up to
+ * ident.1): `zfs list` prints a value but not where it came from, and a
+ * received snapshot carries the sender's `anas:schedule` — which may well be
+ * the same id as a schedule here. Only a `local` stamp is ours.
+ */
+export function zfsStampSourceArgs(dataset: string, recursive = true): string[] {
+  return ['get', '-Hp', '-t', 'snapshot', ...(recursive ? ['-r'] : ['-d', '1']), '-o', 'name,value,source', SCHEDULE_STAMP_PROPERTY, dataset]
+}
+
+/** Parse {@link zfsStampSourceArgs} output: full snapshot name → its stamp and source (unset stamps omitted). */
+export function parseZfsStampSources(stdout: string): Map<string, { value: string, source: string }> {
+  const out = new Map<string, { value: string, source: string }>()
+  for (const raw of stdout.split('\n')) {
+    const [name, value, source] = raw.trimEnd().split('\t')
+    if (!name || !name.includes('@') || value === undefined || source === undefined)
+      continue
+    if (value === '-' || value === '')
+      continue
+    out.set(name, { value, source: source.trim() })
+  }
+  return out
 }
 
 /**
  * Parse {@link zfsTreeSnapshotListArgs} output into per-dataset inventories,
  * keyed by dataset in listing order. Each snapshot's `target` names ITS OWN
  * dataset, so a plan over it reads exactly like a single-dataset plan.
+ *
+ * `stamps` ({@link parseZfsStampSources}) decides ownership when given — the
+ * prune always passes it: a stamp counts only when its source is `local`; any
+ * other source moves it to `foreignStamp`, and a snapshot the read did not
+ * list as stamped is unstamped whatever the list column said. Without it the
+ * list's own stamp column is taken as local (pure planning tests).
  */
-export function parseZfsTreeSnapshots(stdout: string): Map<string, TreeSnapshot[]> {
+export function parseZfsTreeSnapshots(stdout: string, stamps?: Map<string, { value: string, source: string }>): Map<string, TreeSnapshot[]> {
   const byDataset = new Map<string, TreeSnapshot[]>()
   for (const raw of stdout.split('\n')) {
     const line = raw.trimEnd()
@@ -352,8 +397,17 @@ export function parseZfsTreeSnapshots(stdout: string): Map<string, TreeSnapshot[
     const [snap] = parseZfsScheduledSnapshots({ kind: 'zfs', dataset }, line)
     if (!snap)
       continue
+    const entry: TreeSnapshot = { ...snap, createtxg: (cols[3] ?? '').trim() }
+    if (stamps) {
+      delete entry.schedule
+      const stamp = stamps.get(full)
+      if (stamp?.source === 'local')
+        entry.schedule = stamp.value
+      else if (stamp)
+        entry.foreignStamp = stamp
+    }
     const list = byDataset.get(dataset) ?? []
-    list.push({ ...snap, createtxg: (cols[3] ?? '').trim() })
+    list.push(entry)
     byDataset.set(dataset, list)
   }
   return byDataset
@@ -406,7 +460,10 @@ export function planZfsSchedulePrune(input: ZfsSchedulePruneInput): DatasetPrune
   for (const dataset of datasets) {
     const anas = (inventory.get(dataset) ?? []).filter(s => s.source === 'anas' && !isTransientRunSnapshot(s.name))
     const stamped = anas.filter(s => s.schedule === schedule.id)
-    const unstamped = anas.filter(s => s.schedule === undefined)
+    const unstamped = anas.filter(s => s.schedule === undefined && !s.foreignStamp)
+    // Carries THIS schedule's id but not as a local property (received or
+    // inherited): never a candidate, said so.
+    const received = anas.filter(s => s.foreignStamp?.value === schedule.id).length
     // The unstamped snapshots this schedule's policy would plan — the ones a
     // note about leaving them is about (an absent bucket is never planned).
     const unstampedPlanned = unstamped.filter(s => s.bucket !== null && policy[s.bucket] !== undefined).length
@@ -439,6 +496,8 @@ export function planZfsSchedulePrune(input: ZfsSchedulePruneInput): DatasetPrune
       if (!legacy && unstampedPlanned > 0)
         plan.note = `${unstampedPlanned} left: ${listComplete ? UNSTAMPED_SHARED : SCHEDULE_LIST_UNREADABLE}`
     }
+    if (received > 0)
+      plan.note = [plan.note, `${received} left: ${STAMP_RECEIVED}`].filter(Boolean).join('; ')
     if (scope === 'target' || plan.prune.length || plan.skippedHeld.length || plan.note)
       plans.push(plan)
   }
@@ -510,10 +569,14 @@ export async function pruneZfsSchedule(
   if (schedule.target.kind !== 'zfs')
     throw new Error('pruneZfsSchedule: ZFS schedules only')
   const progress = opts.updateProgress ?? noop
-  const r = await run(executor, ZFS, zfsTreeSnapshotListArgs(schedule.target.dataset, schedule.recursive === true))
+  const recursive = schedule.recursive === true
+  const r = await run(executor, ZFS, zfsTreeSnapshotListArgs(schedule.target.dataset, recursive))
+  // The stamp's SOURCE decides ownership: a received copy of a snapshot some
+  // sender's schedule stamped is never this schedule's, even with the same id.
+  const stamps = await run(executor, ZFS, zfsStampSourceArgs(schedule.target.dataset, recursive))
   const plans = planZfsSchedulePrune({
     schedule,
-    inventory: parseZfsTreeSnapshots(r.stdout),
+    inventory: parseZfsTreeSnapshots(r.stdout, parseZfsStampSources(stamps.stdout)),
     others: opts.others,
     now: opts.now ?? new Date(),
   })

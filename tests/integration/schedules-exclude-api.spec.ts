@@ -271,13 +271,14 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
 
   test('provenance: a RECEIVED snapshot carrying the schedule\'s name on an excluded dataset survives, noted', async () => {
     // A replica of the kept sibling, received under the excluded child: its
-    // snapshot has this schedule's name, but a plain `zfs send` carries no
-    // user properties — it arrives without the `anas:schedule` stamp, so it
-    // is not this schedule's (ident.1: the stamp replaced the txg witness).
+    // snapshot has this schedule's name, and `zfs send -p` carries the
+    // `anas:schedule` stamp with it — this schedule's own id, but with property
+    // source `received`. Only a LOCAL stamp is ours (ident.1 follow-up), so it
+    // is left and noted as received.
     const sibling = (await anasSnapshots(SIBLING)).filter(n => !n.startsWith('anas-hourly-2026-01-01T')).sort()
     const snap = sibling.at(-1)
     expect(snap, 'the sibling carries a snapshot this schedule took').toBeTruthy()
-    await sshExec(`zfs send ${SIBLING}@${snap} | zfs recv ${REPLICA}`)
+    await sshExec(`zfs send -p ${SIBLING}@${snap} | zfs recv ${REPLICA}`)
     try {
       const props = async (full: string) => (await sshExec(`zfs get -Hp -o value createtxg,creation ${full}`)).split('\n')
       const [srcTxg, srcCreation] = await props(`${SIBLING}@${snap}`)
@@ -295,8 +296,10 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
       expect(await anasSnapshots(REPLICA)).toEqual([snap])
       const entry = (done.result?.datasets ?? []).find(d => d.dataset === REPLICA)
       expect(entry, JSON.stringify(done.result?.datasets)).toMatchObject({ scope: 'excluded', pruned: 0, held: 0 })
-      expect(entry?.note).toMatch(/1 left: unstamped, outside this schedule's sweep/)
-      expect((await sshExec(`zfs get -H -o value anas:schedule ${REPLICA}@${snap}`)).trim()).toBe('-')
+      expect(entry?.note).toMatch(/1 left: received/)
+      const [value, source] = (await sshExec(`zfs get -H -o value,source anas:schedule ${REPLICA}@${snap}`)).split('\t')
+      expect(value).toBe(SCHED_ID)
+      expect(source.trim()).toBe('received')
     }
     finally {
       if (await datasetExists(REPLICA))
