@@ -114,17 +114,31 @@ describe('planRetention — held snapshots (holds-vs-prune)', () => {
     assert.deepEqual(names(plan.skippedHeld), [snaps[2].name])
   })
 
-  it('a held snapshot does not consume a bucket keep slot', () => {
+  it('a held snapshot the policy keeps is kept and NOT reported (no warning every run)', () => {
+    // Replication holds its newest sent snapshot; hourly/daily retention keeps
+    // it anyway. Reporting it would make every run a warning.
     const snaps = [
       anas('daily', '2026-07-26T00:00:00Z', { held: true }),
       anas('daily', '2026-07-25T00:00:00Z'),
       anas('daily', '2026-07-24T00:00:00Z'),
     ]
     const plan = planRetention(snaps, { daily: 1 }, NOW)
-    // held one is aside; among the 2 eligible, keep 1 (25), prune 24.
-    assert.deepEqual(names(plan.skippedHeld), [snaps[0].name])
-    assert.deepEqual(names(plan.keep), [snaps[1].name])
+    assert.deepEqual(plan.skippedHeld, [])
+    assert.deepEqual(names(plan.keep), [snaps[0].name])
+    assert.deepEqual(names(plan.prune), names([snaps[1], snaps[2]]))
+  })
+
+  it('held inside policy → not in skippedHeld; held outside policy → skippedHeld', () => {
+    const snaps = [
+      anas('daily', '2026-07-26T00:00:00Z'),
+      anas('daily', '2026-07-25T00:00:00Z', { held: true }), // inside daily:2
+      anas('daily', '2026-07-24T00:00:00Z'),
+      anas('daily', '2026-07-23T00:00:00Z', { held: true }), // outside daily:2
+    ]
+    const plan = planRetention(snaps, { daily: 2 }, NOW)
+    assert.deepEqual(names(plan.keep), names([snaps[0], snaps[1]]))
     assert.deepEqual(names(plan.prune), [snaps[2].name])
+    assert.deepEqual(names(plan.skippedHeld), [snaps[3].name])
   })
 })
 

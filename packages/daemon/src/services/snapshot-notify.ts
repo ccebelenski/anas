@@ -1,4 +1,4 @@
-import type { RetentionBucket, RetentionPolicy, SnapshotSchedule, SnapshotTarget } from '@anas/shared'
+import type { RetentionBucket, RetentionPolicy, SnapshotSchedule, SnapshotScheduleRunResult, SnapshotTarget } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { NotifyOutcome, UnattendedNotifyBase } from './unattended-notify.js'
 import { ANAS_SNAPSHOT_NOTIFY_TEMPLATE, pveNotify } from './pve-notify.js'
@@ -31,13 +31,14 @@ import {
 const BUCKETS: RetentionBucket[] = ['frequently', 'hourly', 'daily', 'weekly', 'monthly', 'yearly']
 
 /** What a finished take+prune hands back (the fire result), when it completed. */
-export interface SnapshotNotifyResult {
-  schedule: string
-  taken: string
-  pruned: string[]
-  skippedHeld: string[]
-  /** snapprune.1: a recursive schedule's per-dataset prune counts. */
-  datasets?: { dataset: string, scope: string, pruned: number, held: number, note?: string }[]
+export type SnapshotNotifyResult = SnapshotScheduleRunResult
+
+/** At most this many destroyed names in the body's "Destroyed:" section. */
+export const NOTIFY_DESTROYED_NAMES = 20
+
+/** How many snapshots the run destroyed (`pruned` may list fewer — capped). */
+function prunedTotal(result: SnapshotNotifyResult): number {
+  return result.prunedCount ?? result.pruned.length
 }
 
 export interface SnapshotNotifyContext extends UnattendedNotifyBase {
@@ -50,11 +51,16 @@ export interface SnapshotNotifyContext extends UnattendedNotifyBase {
  * Did this fire complete with something worth flagging? A prune that SKIPPED
  * held snapshots is exactly that (the 17.6 `skippedHeld` surface, GT-7): the
  * snapshot itself was taken, but retention could not do what policy asked, so
- * the target keeps growing until the hold is released. That is a warning, not a
- * failure — and it is precisely what an `on-failure` operator asked to hear.
+ * the target keeps growing until the hold is released. So is a destroy ZFS
+ * refused on a swept or excluded dataset (snapprune.1: a clone depends on the
+ * snapshot). Both are warnings, not failures — and precisely what an
+ * `on-failure` operator asked to hear.
  */
 function fireHasWarnings(ctx: SnapshotNotifyContext): boolean {
-  return (ctx.result?.skippedHeld.length ?? 0) > 0
+  const result = ctx.result
+  if (!result)
+    return false
+  return result.skippedHeld.length > 0 || (result.datasets ?? []).some(d => (d.refused ?? 0) > 0)
 }
 
 /** Classify a finished schedule fire into the shared four-outcome vocabulary. */
@@ -88,7 +94,7 @@ export function retentionSummaryLine(retention: RetentionPolicy): string {
  * retained, never as failed destroys.
  */
 export function pruneSummaryLine(result: SnapshotNotifyResult): string {
-  const parts = [`${result.pruned.length} destroyed`]
+  const parts = [`${prunedTotal(result)} destroyed`]
   if (result.skippedHeld.length)
     parts.push(`${result.skippedHeld.length} held (kept despite policy)`)
   return parts.join(', ')
@@ -124,7 +130,11 @@ export function buildSnapshotNotifyBody(ctx: SnapshotNotifyContext): string {
   if (result)
     lines.push(`Pruned:      ${pruneSummaryLine(result)}`)
   // snapprune.1: a recursive schedule prunes per dataset — say what each did.
-  const perDataset = (result?.datasets ?? []).filter(d => d.pruned || d.held || d.note)
+  // A leaf (only the target in `datasets`) says nothing the Pruned line has not.
+  const datasets = result?.datasets ?? []
+  const perDataset = datasets.some(d => d.scope !== 'target')
+    ? datasets.filter(d => d.pruned || d.held || d.note)
+    : []
   if (perDataset.length) {
     lines.push('')
     lines.push('Per dataset:')
@@ -137,11 +147,17 @@ export function buildSnapshotNotifyBody(ctx: SnapshotNotifyContext): string {
       lines.push(`  ${d.dataset} (${d.scope}): ${parts.join(', ')}`)
     }
   }
-  if (result?.pruned.length) {
+  // Names are a sample (the per-dataset counts above are the record): a first
+  // run after an upgrade can destroy thousands.
+  if (result && prunedTotal(result) > 0) {
     lines.push('')
     lines.push('Destroyed:')
-    for (const name of result.pruned)
+    const shown = result.pruned.slice(0, NOTIFY_DESTROYED_NAMES)
+    for (const name of shown)
       lines.push(`  ${name}`)
+    const more = prunedTotal(result) - shown.length
+    if (more > 0)
+      lines.push(`  ... and ${more} more`)
   }
   if (result?.skippedHeld.length) {
     lines.push('')

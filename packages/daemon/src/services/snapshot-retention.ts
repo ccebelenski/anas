@@ -12,9 +12,12 @@ import { isTransientRunSnapshot, parseScheduledName } from './snapshot-naming.js
  *      bases, manual ZFS snapshots, AHR-manual snapshots — are NEVER pruned and
  *      appear in NONE of the plan's sets (outside ANAS retention entirely).
  *   2. HELD snapshots (`held: true` — a ZFS `zfs hold`, e.g. a replication base)
- *      are set aside into `skippedHeld`, retained regardless of policy and
- *      surfaced as intentionally kept. They do not count toward any bucket
- *      budget (the holds-vs-prune trap, GT-7). btrfs snapshots are never held.
+ *      are planned like any other, then a held one the plan would PRUNE is
+ *      moved into `skippedHeld`: retained and surfaced as intentionally kept
+ *      (the holds-vs-prune trap, GT-7). A held snapshot the policy keeps anyway
+ *      is simply kept and not reported — replication holds its newest sent
+ *      snapshot, which an hourly policy keeps, and that must not make every
+ *      run a warning (snapprune.1 full review). btrfs snapshots are never held.
  *   3. Each remaining snapshot is bucketed by the period encoded in its NAME.
  *      Within a bucket, the N newest (by the name's UTC timestamp) are kept;
  *      the rest are pruned. An absent bucket count is `0` (keep none).
@@ -39,9 +42,8 @@ export function planRetention(
   now: Date = new Date(),
 ): RetentionPlan {
   const durable = snapshots.filter(s => !isTransientRunSnapshot(s.name))
-  const anas = durable.filter(s => s.source === 'anas')
-  const skippedHeld = anas.filter(s => s.held === true)
-  const eligible = anas.filter(s => s.held !== true)
+  // Plan as if nothing were held; holds are applied to the prune set below.
+  const eligible = durable.filter(s => s.source === 'anas')
 
   // Decode each eligible snapshot's period + timestamp from its name.
   const decoded = eligible.map(snap => ({ snap, parsed: parseScheduledName(snap.name) }))
@@ -83,5 +85,10 @@ export function planRetention(
     }
   }
 
-  return { keep, prune, skippedHeld }
+  // Only a held snapshot the policy would have destroyed is worth reporting.
+  return {
+    keep,
+    prune: prune.filter(s => s.held !== true),
+    skippedHeld: prune.filter(s => s.held === true),
+  }
 }

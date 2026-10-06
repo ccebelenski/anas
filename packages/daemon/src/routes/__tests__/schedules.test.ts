@@ -280,6 +280,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     assert.equal(result.schedule, 'nightly-media')
     assert.match(result.taken, /^anas-daily-\d{4}-\d{2}-\d{2}T\d{6}Z$/)
     assert.deepEqual(result.pruned, [])
+    assert.equal((result as { prunedCount?: number }).prunedCount, 0)
     assert.deepEqual(result.skippedHeld, [])
     // The take issued a `zfs snapshot testpool/media@anas-daily-…`.
     const snapCall = mockOf(server).calls.find(c => c.args[0] === 'snapshot')
@@ -372,7 +373,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       const mock = mockOf(server)
       mock.addFixture({
         command: ZFS,
-        args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+        args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'],
         result: { stdout: 'testpool/x\ntestpool/x/data\ntestpool/x/data/vm-100-disk-0\n', stderr: '', exitCode: 0 },
       })
 
@@ -574,7 +575,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       // The subtree `zfs list -r` answers for the descendant scan.
       mockOf(server).addFixture({
         command: ZFS,
-        args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+        args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'],
         result: { stdout: 'testpool/x\ntestpool/x/data\ntestpool/x/data/vm-100-disk-0\ntestpool/x/media\n', stderr: '', exitCode: 0 },
       })
       try {
@@ -645,7 +646,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       process.env.ANAS_STORAGE_CFG = join(dir, 'absent-storage.cfg')
       mockOf(server).addFixture({
         command: ZFS,
-        args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+        args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'],
         result: { stdout: '', stderr: 'zfs list: cannot open pool', exitCode: 1 },
       })
       try {
@@ -670,7 +671,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       // re-check — the sequence models the subtree going dark in between.
       mockOf(server).addFixture({
         command: ZFS,
-        args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+        args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'],
         results: [
           { stdout: 'testpool/x\ntestpool/x/media\n', stderr: '', exitCode: 0 },
           { stdout: '', stderr: 'zfs list: cannot open pool', exitCode: 1 },
@@ -703,7 +704,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       process.env.ANAS_STORAGE_CFG = join(dir, 'absent-storage.cfg')
       mockOf(server).addFixture({
         command: ZFS,
-        args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+        args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'],
         result: { stdout: '', stderr: 'probe broken', exitCode: 1 },
       })
       try {
@@ -729,10 +730,26 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     function armTree(stdout = TREE) {
       mockOf(server).addFixture({
         command: ZFS,
-        args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+        args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'],
         result: { stdout, stderr: '', exitCode: 0 },
       })
     }
+
+    it('the guard lists filesystems and volumes only — a listsnapshots=on pool does not feed it snapshots', async () => {
+      const { restore } = await storageCfg(null)
+      try {
+        armTree()
+        const res = await create({ ...X, exclude: ['testpool/x/media'] })
+        assert.equal(res.statusCode, 202, res.body)
+        const probes = mockOf(server).calls.filter(c => c.command === ZFS && c.args[0] === 'list' && c.args.includes('-r') && !c.args.includes('snapshot'))
+        assert.ok(probes.length > 0)
+        for (const c of probes)
+          assert.deepEqual(c.args, ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'])
+      }
+      finally {
+        await restore()
+      }
+    })
 
     it('exclude on a NON-recursive schedule → 400', async () => {
       const { restore } = await storageCfg(null)
@@ -897,6 +914,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
         assert.equal(done.status, 'completed', JSON.stringify(done.error))
         const result = done.result as { pruned: string[], datasets: { dataset: string, scope: string, pruned: number, held: number, note?: string }[] }
         assert.deepEqual(result.pruned.sort(), [D1, `testpool/x/data@${D1}`].sort())
+        assert.equal((result as { prunedCount?: number }).prunedCount, 2)
         assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x/data'), { dataset: 'testpool/x/data', scope: 'sweep', pruned: 1, held: 0 })
         assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x/media'), { dataset: 'testpool/x/media', scope: 'excluded', pruned: 0, held: 0, note: '2 left to schedule \'daily-media\'' })
         const destroys = mock.calls.filter(c => c.command === ZFS && c.args[0] === 'destroy').map(c => c.args.join(' '))
@@ -969,7 +987,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       try {
         mockOf(server).addFixture({
           command: ZFS,
-          args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+          args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'],
           results: [
             { stdout: TREE, stderr: '', exitCode: 0 },
             // testpool/x/media was destroyed after the schedule was saved.

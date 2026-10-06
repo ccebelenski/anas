@@ -2,7 +2,7 @@ import type { AhrPool, SnapshotScheduleRunResult, SnapshotSchedule as SnapshotSc
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
-import { ScheduleId, SnapshotSchedule } from '@anas/shared'
+import { PRUNED_NAMES_PER_DATASET, ScheduleId, SnapshotSchedule } from '@anas/shared'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { loadPveFootprint, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
@@ -16,8 +16,8 @@ import {
   scheduleFileExists,
   writeScheduleUnits,
 } from '../services/snapshot-schedule-units.js'
-import { pruneRecursiveSchedule, pruneSnapshots, takeSnapshot } from '../services/snapshot-schedules.js'
-import { sweepSet } from '../services/zfs-snapshot.js'
+import { pruneRecursiveSchedule, pruneSnapshots, recursiveRunResult, takeSnapshot } from '../services/snapshot-schedules.js'
+import { sweepSet, zfsTreeListArgs } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
 const ZFS = '/usr/sbin/zfs'
@@ -68,16 +68,18 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
   }
 
   /**
-   * The dataset and everything beneath it (`zfs list -r -H -o name`) — the
-   * candidate list for the recursive-schedule descendant guard (pvepool.1
-   * review fix 2). `null` when the probe FAILED (pvepool.1 review fix 4): a
+   * The dataset and every filesystem/volume beneath it (the take's own
+   * `zfs list -H -o name -r -t filesystem,volume`; without `-t` a pool with
+   * `listsnapshots=on` lists snapshots too) — the candidate list for the
+   * recursive-schedule descendant guard (pvepool.1 review fix 2). `null`
+   * when the probe FAILED (pvepool.1 review fix 4): a
    * failed probe must never read as "no descendants" — the guard refuses the
    * recursive verb with {@link pveDescendantsUnlistedMessage} instead of
    * letting a sweep it cannot see through. A successful read with no rows is
    * a genuine "no descendants" (`[]`).
    */
   async function descendantDatasetNames(dataset: string): Promise<string[] | null> {
-    const r = await executor.exec(ZFS, ['list', '-H', '-o', 'name', '-r', dataset])
+    const r = await executor.exec(ZFS, zfsTreeListArgs(dataset))
     if (r.exitCode !== 0)
       return null
     return r.stdout.split('\n').map(l => l.trim()).filter(Boolean)
@@ -245,35 +247,21 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       // too. The read says whether it is COMPLETE: a partial list (unlistable
       // dir, unreadable or unparseable unit) prunes the target only — nothing
       // is destroyed on swept children or excluded datasets that run. A
-      // refused destroy on a PVE-owned excluded dataset is noted.
-      const footprint = pve
-      const target = schedule.target.dataset
+      // destroy ZFS refuses on a swept or excluded dataset is noted there
+      // and the run completes with warnings. The result names at most
+      // PRUNED_NAMES_PER_DATASET destroyed snapshots per dataset.
       const prune = await pruneRecursiveSchedule(executor, schedule, {
         others: await readScheduleList(systemdDir),
-        isOwned: dataset => footprint.ownershipOf(dataset) !== null,
         updateProgress,
       })
-      const named = (s: { name: string, target: SnapshotTarget }) =>
-        s.target.kind === 'zfs' && s.target.dataset !== target ? `${s.target.dataset}@${s.name}` : s.name
-      return {
-        schedule: schedule.id,
-        taken: take.name,
-        pruned: prune.pruned.map(named),
-        skippedHeld: prune.skippedHeld.map(named),
-        datasets: prune.datasets.map(d => ({
-          dataset: d.dataset,
-          scope: d.scope,
-          pruned: d.pruned.length,
-          held: d.skippedHeld.length,
-          ...(d.note ? { note: d.note } : {}),
-        })),
-      }
+      return recursiveRunResult(schedule, take.name, prune)
     }
     const prune = await pruneSnapshots(executor, schedule.target, schedule.retention, svcOpts)
     return {
       schedule: schedule.id,
       taken: take.name,
-      pruned: prune.pruned.map(s => s.name),
+      pruned: prune.pruned.slice(0, PRUNED_NAMES_PER_DATASET).map(s => s.name),
+      prunedCount: prune.pruned.length,
       skippedHeld: prune.skippedHeld.map(s => s.name),
     }
   }

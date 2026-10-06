@@ -1,14 +1,17 @@
 import type {
   AhrPool,
+  PruneScope,
   RetentionBucket,
   RetentionPolicy,
   ScheduledSnapshot,
   SnapshotSchedule,
+  SnapshotScheduleRunResult,
   SnapshotTarget,
 } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { AhrSnapshotOptions } from './ahr-snapshots.js'
 import type { ScheduleListRead } from './snapshot-schedule-units.js'
+import { PRUNED_NAMES_PER_DATASET } from '@anas/shared'
 import { run } from './ahr-exec.js'
 import { createAhrSnapshot, deleteAhrSnapshot, listAhrSnapshots } from './ahr-snapshots.js'
 import { formatScheduledName, isTransientRunSnapshot, parseScheduledName } from './snapshot-naming.js'
@@ -287,9 +290,13 @@ export async function pruneSnapshots(
 //                whole (an unreadable/unparseable unit may be exactly that
 //                covering schedule: fail safe, destroy nothing there). A
 //                PVE-owned dataset is treated the same way (a provably-own
-//                snapshot is ANAS's leftover, not PVE's data), except that a
-//                destroy ZFS refuses there (a clone depends on it) is noted
-//                and skipped, never fatal.
+//                snapshot is ANAS's leftover, not PVE's data).
+//
+// Refused destroys: on a swept or excluded dataset a destroy ZFS refuses (a
+// clone made from the snapshot depends on it) is noted on that dataset and
+// the prune goes on — a clone would otherwise fail every run forever; the
+// run completes with warnings. On the TARGET a refusal fails the run, as a
+// failed prune always has.
 //
 // Provenance (excluded scope only): a snapshot on an excluded dataset is this
 // schedule's iff an ANAS-named WITNESS still in the sweep has the same name,
@@ -343,15 +350,13 @@ export function parseZfsTreeSnapshots(stdout: string): Map<string, TreeSnapshot[
 /** One dataset's slice of a recursive prune plan. */
 export interface DatasetPrunePlan {
   dataset: string
-  scope: 'target' | 'sweep' | 'excluded'
+  scope: PruneScope
   /** Snapshots to destroy, in plan order. */
   prune: TreeSnapshot[]
   /** Held snapshots the plan sets aside (retained, reported). */
   skippedHeld: TreeSnapshot[]
   /** Why snapshots of this schedule's bucket were left in place, when some were. */
   note?: string
-  /** PVE owns the dataset: a refused destroy is noted, never fatal. */
-  owned?: boolean
 }
 
 /** What {@link planRecursivePrune} needs to know about the world. */
@@ -367,8 +372,6 @@ export interface RecursivePruneInput {
    * is destroyed.
    */
   others: ScheduleListRead
-  /** PVE ownership of a dataset — marks the plan so a refused destroy is non-fatal. */
-  isOwned: (dataset: string) => boolean
   now: Date
 }
 
@@ -480,8 +483,6 @@ export function planRecursivePrune(input: RecursivePruneInput): DatasetPrunePlan
     }
     if (foreign > 0)
       plan.note = `${foreign} left: not taken by this schedule`
-    if (input.isOwned(dataset))
-      plan.owned = true
     plans.push(plan)
   }
   return plans
@@ -490,9 +491,11 @@ export function planRecursivePrune(input: RecursivePruneInput): DatasetPrunePlan
 /** One dataset's prune outcome (the run result's per-dataset counts). */
 export interface DatasetPruneResult {
   dataset: string
-  scope: 'target' | 'sweep' | 'excluded'
+  scope: PruneScope
   pruned: ScheduledSnapshot[]
   skippedHeld: ScheduledSnapshot[]
+  /** Destroys ZFS refused here (swept/excluded only — on the target one fails the run). */
+  refused: number
   note?: string
 }
 
@@ -506,14 +509,16 @@ export interface RecursivePruneResult extends PruneResult {
  * tree's snapshots once, plan per dataset ({@link planRecursivePrune}), then
  * destroy one snapshot at a time, re-checking `userrefs` immediately before
  * each destroy — a snapshot held since the read is reported in
- * `skippedHeld`, never a failed destroy. Progress names each dataset.
+ * `skippedHeld`, never a failed destroy. A refused destroy on a swept or
+ * excluded dataset is counted and noted there and the prune goes on; on the
+ * target it throws. Progress is one line per dataset (a first run after an
+ * upgrade can destroy thousands of snapshots).
  */
 export async function pruneRecursiveSchedule(
   executor: CommandExecutor,
   schedule: SnapshotSchedule,
   opts: {
     others: ScheduleListRead
-    isOwned: (dataset: string) => boolean
     now?: Date
     updateProgress?: (message: string) => void
   },
@@ -526,7 +531,6 @@ export async function pruneRecursiveSchedule(
     schedule,
     inventory: parseZfsTreeSnapshots(r.stdout),
     others: opts.others,
-    isOwned: opts.isOwned,
     now: opts.now ?? new Date(),
   })
 
@@ -542,15 +546,14 @@ export async function pruneRecursiveSchedule(
         skippedHeld.push({ ...snap, held: true })
         continue
       }
-      progress(`Destroying ${full}`)
       try {
         await destroyZfsSnapshot(executor, { dataset: plan.dataset, name: snap.name })
       }
       catch (err) {
-        // On a PVE-owned dataset a refusal (a clone depends on the snapshot)
-        // is noted and the run goes on; anywhere else it fails the run, as
-        // a failed prune always has.
-        if (!plan.owned)
+        // Off the target a refusal (a clone depends on the snapshot) is noted
+        // and the prune goes on; on the target it fails the run, as a failed
+        // prune always has.
+        if (plan.scope === 'target')
           throw err
         refused++
         refusedWhy ||= (err instanceof Error ? err.message : String(err)).split('\n')[0].trim()
@@ -568,11 +571,44 @@ export async function pruneRecursiveSchedule(
         parts.push(note)
       progress(`Pruned ${plan.dataset} (${plan.scope}): ${parts.join(', ')}`)
     }
-    datasets.push({ dataset: plan.dataset, scope: plan.scope, pruned, skippedHeld, ...(note ? { note } : {}) })
+    datasets.push({ dataset: plan.dataset, scope: plan.scope, pruned, skippedHeld, refused, ...(note ? { note } : {}) })
   }
   return {
     pruned: datasets.flatMap(d => d.pruned),
     skippedHeld: datasets.flatMap(d => d.skippedHeld),
     datasets,
+  }
+}
+
+/**
+ * The fire result of a recursive ZFS schedule: per-dataset counts, and the
+ * destroyed names capped at {@link PRUNED_NAMES_PER_DATASET} per dataset
+ * (`prunedCount` carries the real total). The first run after snapprune.1
+ * can destroy thousands of child snapshots; this result is the job result,
+ * the runner's journald line (LineMax 48 KiB) and the notification's input,
+ * so it must stay small. A snapshot off the target is named
+ * `<dataset>@<label>`, the target's by its bare label.
+ */
+export function recursiveRunResult(
+  schedule: SnapshotSchedule,
+  taken: string,
+  prune: RecursivePruneResult,
+): SnapshotScheduleRunResult {
+  const target = schedule.target.kind === 'zfs' ? schedule.target.dataset : ''
+  const named = (dataset: string, s: ScheduledSnapshot) => dataset === target ? s.name : `${dataset}@${s.name}`
+  return {
+    schedule: schedule.id,
+    taken,
+    pruned: prune.datasets.flatMap(d => d.pruned.slice(0, PRUNED_NAMES_PER_DATASET).map(s => named(d.dataset, s))),
+    prunedCount: prune.pruned.length,
+    skippedHeld: prune.datasets.flatMap(d => d.skippedHeld.map(s => named(d.dataset, s))),
+    datasets: prune.datasets.map(d => ({
+      dataset: d.dataset,
+      scope: d.scope,
+      pruned: d.pruned.length,
+      held: d.skippedHeld.length,
+      ...(d.refused ? { refused: d.refused } : {}),
+      ...(d.note ? { note: d.note } : {}),
+    })),
   }
 }

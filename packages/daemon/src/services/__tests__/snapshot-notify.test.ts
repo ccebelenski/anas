@@ -160,6 +160,51 @@ describe('snapshot schedule notifications — the body (9.4)', () => {
     assert.match(body, ASCII_ONLY)
   })
 
+  it('a LEAF recursive schedule (only the target in datasets) has no Per dataset section', () => {
+    const body = buildSnapshotNotifyBody({
+      schedule: makeSchedule({ recursive: true }),
+      result: { ...CLEAN_RUN, datasets: [{ dataset: 'testpool/media', scope: 'target', pruned: 1, held: 0 }] },
+    })
+    assert.doesNotMatch(body, /Per dataset:/)
+    assert.match(body, /Pruned:\s+1 destroyed/)
+  })
+
+  it('a first run that destroyed thousands names at most 20, counts the rest, and per dataset', () => {
+    const names = Array.from({ length: 100 }, (_, i) => `testpool/media/a@anas-hourly-x${i}`)
+    const body = buildSnapshotNotifyBody({
+      schedule: makeSchedule({ recursive: true }),
+      result: {
+        ...CLEAN_RUN,
+        pruned: names,
+        prunedCount: 4321,
+        datasets: [
+          { dataset: 'testpool/media', scope: 'target', pruned: 21, held: 0 },
+          { dataset: 'testpool/media/a', scope: 'sweep', pruned: 4300, held: 0 },
+        ],
+      },
+    })
+    assert.match(body, /Pruned:\s+4321 destroyed/)
+    assert.match(body, /Per dataset:\n {2}testpool\/media \(target\): 21 destroyed\n {2}testpool\/media\/a \(sweep\): 4300 destroyed/)
+    const destroyed = body.slice(body.indexOf('Destroyed:'))
+    assert.equal((destroyed.match(/anas-hourly-x/g) ?? []).length, 20)
+    assert.ok(destroyed.includes('  ... and 4301 more'))
+    assert.match(body, ASCII_ONLY)
+  })
+
+  it('a destroy refused on a swept or excluded dataset makes the run a warning (snapprune.1)', () => {
+    const result = {
+      ...CLEAN_RUN,
+      datasets: [
+        { dataset: 'testpool/media', scope: 'target' as const, pruned: 1, held: 0 },
+        { dataset: 'testpool/media/a', scope: 'sweep' as const, pruned: 0, held: 0, refused: 1, note: '1 left: destroy refused: cannot destroy' },
+      ],
+    }
+    assert.equal(snapshotNotifyOutcome({ schedule: makeSchedule({ recursive: true }), result }), 'warning')
+    const body = buildSnapshotNotifyBody({ schedule: makeSchedule({ recursive: true }), result })
+    assert.match(body, /Result:\s+completed with warnings/)
+    assert.match(body, /testpool\/media\/a \(sweep\): 0 destroyed, 1 left: destroy refused/)
+  })
+
   it('a recursive schedule with excludes counts and names them (snapx.1)', () => {
     const body = buildSnapshotNotifyBody({
       schedule: makeSchedule({ recursive: true, exclude: ['testpool/media/scratch', 'testpool/media/vm-100-disk-0'] }),
