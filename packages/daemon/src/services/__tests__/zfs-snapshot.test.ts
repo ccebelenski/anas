@@ -4,10 +4,14 @@ import { MockExecutor } from '../../executor/mock.js'
 import {
   createZfsSnapshot,
   createZfsSnapshotArgs,
+  createZfsSnapshotExcluding,
+  createZfsSnapshotsArgs,
   destroyZfsSnapshot,
   destroyZfsSnapshotArgs,
+  expandSnapshotTargets,
   ZFS,
   zfsSnapshotFullName,
+  zfsTreeListArgs,
 } from '../zfs-snapshot.js'
 
 /**
@@ -81,5 +85,110 @@ describe('zfs-snapshot — the single snapshot/destroy helper (backup2.3)', () =
       () => destroyZfsSnapshot(mock, { dataset: 'tank', name: 's1' }),
       /zfs destroy exited with code 2/,
     )
+  })
+})
+
+/**
+ * snapx.1 (#71) — a recursive snapshot minus excluded subtrees. The expansion
+ * is pure; the take is ONE `zfs snapshot` naming every remaining dataset (ZFS
+ * takes all snapshots named in one call atomically), and an empty exclude list
+ * is the literal `-r`, byte-identical to every existing schedule.
+ */
+describe('expandSnapshotTargets (snapx.1)', () => {
+  const TREE = [
+    'tank',
+    'tank/backup',
+    'tank/backup/pc1',
+    'tank/backup/pc1/old',
+    'tank/home',
+    'tank/media',
+    'tank/media2',
+    'tank/vm-100-disk-0',
+  ]
+
+  it('drops an excluded dataset and its whole subtree, grandchildren included', () => {
+    assert.deepEqual(
+      expandSnapshotTargets(TREE, 'tank', ['tank/backup']),
+      ['tank', 'tank/home', 'tank/media', 'tank/media2', 'tank/vm-100-disk-0'],
+    )
+  })
+
+  it('a name prefix is not a subtree: excluding tank/media keeps tank/media2', () => {
+    assert.deepEqual(
+      expandSnapshotTargets(TREE, 'tank', ['tank/media', 'tank/vm-100-disk-0']),
+      ['tank', 'tank/backup', 'tank/backup/pc1', 'tank/backup/pc1/old', 'tank/home', 'tank/media2'],
+    )
+  })
+
+  it('excluding a grandchild keeps its parent', () => {
+    assert.deepEqual(
+      expandSnapshotTargets(TREE, 'tank/backup', ['tank/backup/pc1/old']),
+      ['tank/backup', 'tank/backup/pc1'],
+    )
+  })
+
+  it('the target is always first, even when the listing order differs', () => {
+    assert.deepEqual(
+      expandSnapshotTargets(['tank/home', 'tank'], 'tank', []),
+      ['tank', 'tank/home'],
+    )
+  })
+
+  it('an unknown exclude entry is inert (rejection is the route\'s job)', () => {
+    assert.deepEqual(
+      expandSnapshotTargets(['tank', 'tank/home'], 'tank', ['tank/gone']),
+      ['tank', 'tank/home'],
+    )
+  })
+
+  it('ignores listed names outside the target tree', () => {
+    assert.deepEqual(
+      expandSnapshotTargets(['tank', 'tank/home', 'tankx', 'other/a'], 'tank', []),
+      ['tank', 'tank/home'],
+    )
+  })
+})
+
+describe('createZfsSnapshotsArgs / createZfsSnapshotExcluding (snapx.1)', () => {
+  it('one snapshot verb, every name after it, no -r', () => {
+    assert.deepEqual(
+      createZfsSnapshotsArgs(['tank', 'tank/home'], 'anas-hourly-x'),
+      ['snapshot', 'tank@anas-hourly-x', 'tank/home@anas-hourly-x'],
+    )
+  })
+
+  it('the tree listing is name-only, recursive, filesystems and volumes', () => {
+    assert.deepEqual(zfsTreeListArgs('tank'), ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'tank'])
+  })
+
+  it('lists the tree then takes the remaining snapshots in ONE call', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: ZFS,
+      args: zfsTreeListArgs('tank'),
+      result: { stdout: 'tank\ntank/media\ntank/media/raw\ntank/home\n', stderr: '', exitCode: 0 },
+    })
+    executor.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+    const res = await createZfsSnapshotExcluding(executor, { dataset: 'tank', name: 'n', exclude: ['tank/media'] })
+    assert.equal(executor.calls.length, 2)
+    assert.deepEqual(executor.calls[1], { command: ZFS, args: ['snapshot', 'tank@n', 'tank/home@n'] })
+    assert.deepEqual(res.snapshots, ['tank@n', 'tank/home@n'])
+  })
+
+  it('an empty exclude is the literal zfs snapshot -r (no listing)', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+    await createZfsSnapshotExcluding(executor, { dataset: 'tank', name: 'n', exclude: [] })
+    assert.deepEqual(executor.calls, [{ command: ZFS, args: ['snapshot', '-r', 'tank@n'] }])
+  })
+
+  it('a failed tree listing throws its stderr and takes nothing', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: ZFS, result: { stdout: '', stderr: 'cannot open \'tank\': dataset does not exist', exitCode: 1 } })
+    await assert.rejects(
+      () => createZfsSnapshotExcluding(executor, { dataset: 'tank', name: 'n', exclude: ['tank/media'] }),
+      /dataset does not exist/,
+    )
+    assert.equal(executor.calls.length, 1)
   })
 })

@@ -89,6 +89,18 @@ describe('snapshot schedule units — the systemd units ARE the store', () => {
     assert.equal(parseServiceUnit(legacy)?.notify, 'on-failure')
   })
 
+  it('snapx.1: exclude round-trips through X-ANAS-Schedule; a unit without it is unchanged', () => {
+    const excluding = makeSchedule({ recursive: true, exclude: ['tank/media/scratch', 'tank/media/vm-100-disk-0'] })
+    const unit = renderServiceUnit(excluding)
+    assert.match(unit, /"exclude":\["tank\/media\/scratch","tank\/media\/vm-100-disk-0"\]/)
+    assert.deepEqual(parseServiceUnit(unit), excluding)
+    // Every existing schedule renders byte-identically: no `exclude` key appears.
+    assert.doesNotMatch(renderServiceUnit(makeSchedule({ recursive: true })), /exclude/)
+    // A hand-edited unit whose exclude breaks the shared rules does not parse.
+    const bad = renderServiceUnit(excluding).replace('"recursive":true', '"recursive":false')
+    assert.equal(parseServiceUnit(bad), null)
+  })
+
   it('parseServiceUnit returns null for a unit without the marker or with bad JSON', () => {
     assert.equal(parseServiceUnit('[Unit]\nDescription=x\n'), null)
     assert.equal(parseServiceUnit('# X-ANAS-Schedule={not json\n'), null)

@@ -720,4 +720,184 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       }
     })
   })
+
+  // --- Exclude datasets from a recursive schedule (story snapx.1, #71) -----
+  describe('exclude on a recursive schedule (snapx.1)', () => {
+    const TREE = 'testpool/x\ntestpool/x/data\ntestpool/x/data/vm-100-disk-0\ntestpool/x/media\ntestpool/x/media/raw\n'
+    const X = { ...SCHEDULE, id: 'hourly-x', target: { kind: 'zfs' as const, dataset: 'testpool/x' }, recursive: true }
+
+    function armTree(stdout = TREE) {
+      mockOf(server).addFixture({
+        command: ZFS,
+        args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+        result: { stdout, stderr: '', exitCode: 0 },
+      })
+    }
+
+    it('exclude on a NON-recursive schedule → 400', async () => {
+      const { restore } = await storageCfg(null)
+      try {
+        const res = await create({ ...X, recursive: false, exclude: ['testpool/x/media'] })
+        assert.equal(res.statusCode, 400)
+        assert.match(res.json().error.message, /Exclude requires a recursive schedule/)
+      }
+      finally {
+        await restore()
+      }
+    })
+
+    it('an exclude that is not a descendant of the target → 400 naming it', async () => {
+      const { restore } = await storageCfg(null)
+      try {
+        armTree()
+        const res = await create({ ...X, exclude: ['testpool/other'] })
+        assert.equal(res.statusCode, 400)
+        assert.match(res.json().error.message, /Exclude 'testpool\/other' is not a child dataset of 'testpool\/x'/)
+      }
+      finally {
+        await restore()
+      }
+    })
+
+    it('an exclude naming a descendant that does not exist → 400 naming it', async () => {
+      const { restore } = await storageCfg(null)
+      try {
+        armTree()
+        const res = await create({ ...X, exclude: ['testpool/x/ghost'] })
+        assert.equal(res.statusCode, 400)
+        assert.match(res.json().error.message, /Exclude 'testpool\/x\/ghost' does not exist under 'testpool\/x'/)
+      }
+      finally {
+        await restore()
+      }
+    })
+
+    it('excluding the only PVE-owned subtree is ACCEPTED, and the unit carries the list', async () => {
+      const { restore } = await storageCfg(CLAIM_NESTED)
+      try {
+        armTree()
+        const res = await create({ ...X, exclude: ['testpool/x/data'] })
+        assert.equal(res.statusCode, 202, res.body)
+        const done = await waitForJob(server, res.json().job.id)
+        assert.equal(done.status, 'completed', JSON.stringify(done.error))
+        const stored = parseServiceUnit(await readFile(join(dir, 'anas-snap-hourly-x.service'), 'utf-8'))
+        assert.deepEqual(stored?.exclude, ['testpool/x/data'])
+      }
+      finally {
+        await restore()
+      }
+    })
+
+    it('a PVE-owned descendant NOT excluded is still refused, and the message says it can be excluded', async () => {
+      const { restore } = await storageCfg(CLAIM_NESTED)
+      try {
+        armTree()
+        const res = await create({ ...X, exclude: ['testpool/x/media'] })
+        assert.equal(res.statusCode, 400)
+        const msg = res.json().error.message as string
+        assert.match(msg, /Snapshot schedule of 'testpool\/x' would include testpool\/x\/data/)
+        assert.match(msg, /local-zfs/)
+        assert.match(msg, /Exclude 'testpool\/x\/data' from the schedule to snapshot the rest of 'testpool\/x'/)
+      }
+      finally {
+        await restore()
+      }
+    })
+
+    it('excluding only the guest volume (not its storage root) still refuses on the storage root', async () => {
+      const { restore } = await storageCfg(CLAIM_NESTED)
+      try {
+        armTree()
+        const res = await create({ ...X, exclude: ['testpool/x/data/vm-100-disk-0'] })
+        assert.equal(res.statusCode, 400)
+        assert.match(res.json().error.message, /would include testpool\/x\/data /)
+      }
+      finally {
+        await restore()
+      }
+    })
+
+    it('a fire lists the tree and takes ONE atomic snapshot of everything but the excluded subtree', async () => {
+      const { restore } = await storageCfg(CLAIM_NESTED)
+      try {
+        armTree()
+        const mock = mockOf(server)
+        mock.addFixture({
+          command: ZFS,
+          args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'],
+          result: { stdout: TREE, stderr: '', exitCode: 0 },
+        })
+        const created = await create({ ...X, exclude: ['testpool/x/data'] })
+        assert.equal(created.statusCode, 202, created.body)
+        await waitForJob(server, created.json().job.id)
+
+        const run = await server.inject({ method: 'POST', url: '/v1/schedules/hourly-x/run', headers: JSON_HEADERS, payload: '{}' })
+        assert.equal(run.statusCode, 202)
+        const done = await waitForJob(server, run.json().job.id)
+        // The owned subtree is excluded, so the run-time re-check passes too.
+        assert.equal(done.status, 'completed', JSON.stringify(done.error))
+        const taken = (done.result as { taken: string }).taken
+        const snaps = mock.calls.filter(c => c.command === ZFS && c.args[0] === 'snapshot')
+        assert.equal(snaps.length, 1)
+        assert.deepEqual(snaps[0].args, [
+          'snapshot',
+          `testpool/x@${taken}`,
+          `testpool/x/media@${taken}`,
+          `testpool/x/media/raw@${taken}`,
+        ])
+      }
+      finally {
+        await restore()
+      }
+    })
+
+    it('a recursive schedule WITHOUT exclude still fires the literal -r', async () => {
+      const { restore } = await storageCfg(null)
+      try {
+        armTree('testpool/x\ntestpool/x/media\n')
+        const created = await create(X)
+        await waitForJob(server, created.json().job.id)
+        const run = await server.inject({ method: 'POST', url: '/v1/schedules/hourly-x/run', headers: JSON_HEADERS, payload: '{}' })
+        const done = await waitForJob(server, run.json().job.id)
+        assert.equal(done.status, 'completed', JSON.stringify(done.error))
+        const taken = (done.result as { taken: string }).taken
+        const snaps = mockOf(server).calls.filter(c => c.command === ZFS && c.args[0] === 'snapshot')
+        assert.deepEqual(snaps.map(c => c.args), [['snapshot', '-r', `testpool/x@${taken}`]])
+      }
+      finally {
+        await restore()
+      }
+    })
+
+    it('a PUT keeps a stored exclude whose dataset has since gone, but refuses a NEW missing one', async () => {
+      const { restore } = await storageCfg(null)
+      try {
+        mockOf(server).addFixture({
+          command: ZFS,
+          args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+          results: [
+            { stdout: TREE, stderr: '', exitCode: 0 },
+            // testpool/x/media was destroyed after the schedule was saved.
+            { stdout: 'testpool/x\ntestpool/x/data\n', stderr: '', exitCode: 0 },
+          ],
+        })
+        const created = await create({ ...X, exclude: ['testpool/x/media'] })
+        assert.equal(created.statusCode, 202, created.body)
+        await waitForJob(server, created.json().job.id)
+
+        const put = (payload: unknown) => server.inject({ method: 'PUT', url: '/v1/schedules/hourly-x', headers: JSON_HEADERS, payload: JSON.stringify(payload) })
+        // The enable toggle round-trips the stored list — not a 400.
+        const toggled = await put({ ...X, enabled: false, exclude: ['testpool/x/media'] })
+        assert.equal(toggled.statusCode, 202, toggled.body)
+        await waitForJob(server, toggled.json().job.id)
+        // A newly added entry must exist.
+        const added = await put({ ...X, exclude: ['testpool/x/media', 'testpool/x/ghost'] })
+        assert.equal(added.statusCode, 400)
+        assert.match(added.json().error.message, /Exclude 'testpool\/x\/ghost' does not exist/)
+      }
+      finally {
+        await restore()
+      }
+    })
+  })
 })

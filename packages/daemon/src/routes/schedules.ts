@@ -16,6 +16,7 @@ import {
   writeScheduleUnits,
 } from '../services/snapshot-schedule-units.js'
 import { pruneSnapshots, takeSnapshot } from '../services/snapshot-schedules.js'
+import { expandSnapshotTargets } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
 const ZFS = '/usr/sbin/zfs'
@@ -100,15 +101,38 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
   }
 
   /**
+   * The recursive-schedule refusal for a PVE-owned descendant (pvepool.1
+   * review fix 2) with the snapx.1 way out appended: the owned dataset can be
+   * excluded from the schedule, which snapshots the rest of the tree.
+   */
+  function ownedDescendantRefusal(verb: string, dataset: string, hit: Parameters<typeof pveRecursiveRefusalMessage>[2]): string {
+    return `${pveRecursiveRefusalMessage(verb, dataset, hit)}. Exclude '${hit.name}' from the schedule to snapshot the rest of '${dataset}'`
+  }
+
+  /**
    * Validate that a schedule's target exists and is ANAS-manageable (SCHEDULES-
    * DESIGN: ANAS-managed pools/datasets only; PVE-OWNED DATASETS stay hands-off —
    * pvepool.1). `recursive` schedules are additionally refused when any STRICT
    * descendant of the target is PVE-owned (pvepool.1 review fix 2): a recursive
    * schedule sweeps the subtree, and a storage registered on a nested path
    * leaves the tree above it unowned.
+   *
+   * snapx.1: the descendant guard runs on the tree MINUS the `exclude`
+   * subtrees — what the schedule actually snapshots — so "hourly on the pool,
+   * guest volumes excluded" is accepted. Each exclude entry must exist in the
+   * live tree (its shape — strict descendant, recursive only — the shared
+   * schema already holds), except an entry `priorExclude` already carried: a
+   * child destroyed after the schedule was saved must not turn an enable
+   * toggle into a 400 (the runner treats a vanished entry as inert).
    * Sends the appropriate 4xx and returns false on the first failure.
    */
-  async function guardTarget(target: SnapshotTarget, recursive: boolean, reply: FastifyReply): Promise<boolean> {
+  async function guardTarget(
+    target: SnapshotTarget,
+    recursive: boolean,
+    reply: FastifyReply,
+    exclude: string[] = [],
+    priorExclude: string[] = [],
+  ): Promise<boolean> {
     if (target.kind === 'zfs') {
       const pool = target.dataset.split('/')[0]
       if (!(await zpoolExists(pool))) {
@@ -136,9 +160,16 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
           reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: pveDescendantsUnlistedMessage('snapshot schedule', target.dataset) } })
           return false
         }
-        const descendant = pve.ownedDescendant(descendants, target.dataset)
+        for (const name of exclude) {
+          if (!priorExclude.includes(name) && !descendants.includes(name)) {
+            reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `Exclude '${name}' does not exist under '${target.dataset}'` } })
+            return false
+          }
+        }
+        const swept = expandSnapshotTargets(descendants, target.dataset, exclude)
+        const descendant = pve.ownedDescendant(swept, target.dataset)
         if (descendant) {
-          reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: pveRecursiveRefusalMessage('Snapshot schedule', target.dataset, descendant) } })
+          reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: ownedDescendantRefusal('Snapshot schedule', target.dataset, descendant) } })
           return false
         }
       }
@@ -192,14 +223,17 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
         const descendants = await descendantDatasetNames(schedule.target.dataset)
         if (descendants === null)
           throw new Error(pveDescendantsUnlistedMessage('snapshot run', schedule.target.dataset))
-        const descendant = pve.ownedDescendant(descendants, schedule.target.dataset)
+        // snapx.1: the same tree the take covers — excluded subtrees are not
+        // swept, so an owned dataset inside one does not fail the run.
+        const swept = expandSnapshotTargets(descendants, schedule.target.dataset, schedule.exclude ?? [])
+        const descendant = pve.ownedDescendant(swept, schedule.target.dataset)
         if (descendant)
-          throw new Error(pveRecursiveRefusalMessage('Snapshot run', schedule.target.dataset, descendant))
+          throw new Error(ownedDescendantRefusal('Snapshot run', schedule.target.dataset, descendant))
       }
     }
     const svcOpts = schedule.target.kind === 'ahr'
       ? { pool: (await resolveAhrPool(schedule.target.pool)) ?? undefined, runtimeDir: subvolRuntimeDir, updateProgress }
-      : { recursive: schedule.recursive, updateProgress, runtimeDir: subvolRuntimeDir }
+      : { recursive: schedule.recursive, exclude: schedule.exclude, updateProgress, runtimeDir: subvolRuntimeDir }
     const take = await takeSnapshot(executor, schedule.target, schedule.cadence, svcOpts)
     updateProgress(`Took ${take.name}; pruning per retention`)
     const prune = await pruneSnapshots(executor, schedule.target, schedule.retention, svcOpts)
@@ -234,7 +268,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `Snapshot schedule '${schedule.id}' already exists` } }
     }
-    if (!(await guardTarget(schedule.target, schedule.recursive === true, reply)))
+    if (!(await guardTarget(schedule.target, schedule.recursive === true, reply, schedule.exclude)))
       return reply
 
     const job = jobQueue.submit(
@@ -317,7 +351,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
         },
       }
     }
-    if (!(await guardTarget(schedule.target, schedule.recursive === true, reply)))
+    if (!(await guardTarget(schedule.target, schedule.recursive === true, reply, schedule.exclude, stored?.exclude)))
       return reply
 
     const job = jobQueue.submit(

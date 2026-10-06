@@ -106,6 +106,16 @@ export const SnapshotSchedule = z.object({
   retention: RetentionPolicy,
   /** ZFS: `zfs snapshot -r` (recurse into children). AHR: n/a (whole @data). */
   recursive: z.boolean().optional(),
+  /**
+   * ZFS + `recursive` only (story snapx.1, #71): child datasets the recursive
+   * schedule skips, each with its whole subtree. Every entry is a full dataset
+   * path and a STRICT descendant of `target.dataset`. Absent or empty = the
+   * plain `zfs snapshot -r` (unchanged). Non-empty = the runner expands the
+   * target's tree, drops these subtrees, and takes the rest in ONE
+   * `zfs snapshot a@n b@n …` call — atomic, the same consistency as `-r`.
+   * Additive: a schedule stored before the field parses back without it.
+   */
+  exclude: z.array(DatasetPath).optional(),
   /** Whether the schedule is active (a disabled schedule keeps but never takes). */
   enabled: z.boolean(),
   /**
@@ -119,6 +129,32 @@ export const SnapshotSchedule = z.object({
    * i.e. the upgrade changes nothing until someone opts in.
    */
   notify: NotifyMode.default('on-failure'),
+}).superRefine((s, ctx) => {
+  // snapx.1: the exclude list's shape rules, stated once so both boundaries
+  // (the request body and the stored unit JSON) hold them. Whether each entry
+  // EXISTS is the daemon route's question (it reads the live tree).
+  const exclude = s.exclude ?? []
+  if (exclude.length === 0)
+    return
+  if (s.target.kind !== 'zfs') {
+    ctx.addIssue({ code: 'custom', path: ['exclude'], message: 'Exclude applies to ZFS dataset schedules only' })
+    return
+  }
+  if (s.recursive !== true) {
+    ctx.addIssue({ code: 'custom', path: ['exclude'], message: 'Exclude requires a recursive schedule' })
+    return
+  }
+  const prefix = `${s.target.dataset}/`
+  for (const name of exclude) {
+    if (!name.startsWith(prefix)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['exclude'],
+        message: `Exclude '${name}' is not a child dataset of '${s.target.dataset}'`,
+      })
+      return
+    }
+  }
 })
 export type SnapshotSchedule = z.infer<typeof SnapshotSchedule>
 

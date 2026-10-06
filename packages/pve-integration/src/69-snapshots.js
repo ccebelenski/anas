@@ -19,7 +19,9 @@
  *   GET    /schedules            → { data: [ { schedule, lastRunResult, lastRunAt,
  *                                     nextRunAt, overdue } ] }
  *     schedule = { id, name, target:{kind:'zfs',dataset}|{kind:'ahr',pool},
- *                  cadence, retention:{frequently?..yearly?}, recursive?, enabled,
+ *                  cadence, retention:{frequently?..yearly?}, recursive?,
+ *                  exclude? (snapx.1: full dataset paths a recursive ZFS
+ *                  schedule skips, each with its subtree), enabled,
  *                  notify ('always'|'on-failure' — when a finished fire notifies
  *                  through PVE; 9.4. ABSENT = 'on-failure', the quiet default a
  *                  schedule stored before the field reads back as) }
@@ -207,10 +209,19 @@
         var kind = rec.get('targetKind');
         var path = rec.get('targetPath');
         var tag = sched.fsTag(kind, kind === 'ahr' ? t('AHR pool') : t('ZFS dataset'));
-        var rec2 = rec.get('recursive')
-            ? ' <span title="' + enc(t('recursive (-r): includes child datasets')) + '"'
-                + ' style="color:var(--anas-muted,gray);font-size:0.85em;">(-r)</span>'
-            : '';
+        var rec2 = '';
+        if (rec.get('recursive')) {
+            // snapx.1: "(-r, N excluded)" with the excluded names in the tooltip.
+            var excl = rec.get('exclude') || [];
+            var tip = t('recursive (-r): includes child datasets');
+            var label = '(-r)';
+            if (excl.length) {
+                tip += '; ' + t('excluded') + ': ' + excl.join(', ');
+                label = '(-r, ' + excl.length + ' ' + t('excluded') + ')';
+            }
+            rec2 = ' <span class="anas-sched-recursive" title="' + enc(tip) + '"'
+                + ' style="color:var(--anas-muted,gray);font-size:0.85em;">' + enc(label) + '</span>';
+        }
         return tag + '<span style="font-family:monospace;font-size:0.92em;">' + enc(path) + '</span>' + rec2;
     }
 
@@ -384,6 +395,7 @@
             cadence: sched.cadence,
             retention: sched.retention || {},
             recursive: !!sched.recursive,
+            exclude: (sched.exclude || []).slice(),
             notify: notifyOf(sched),
             enabled: sched.enabled !== false,
             lastRunResult: status.lastRunResult || 'unknown',
@@ -400,6 +412,12 @@
     // (test/edit-retarget.harness.mjs) can open a real edit against stubbed
     // inventory. The view's own toolbar calls the local function directly.
     ANAS.schedules.openDialog = openScheduleDialog;
+    // The Enable/Disable toggle and the grid's row renderer, exposed for the
+    // same harness (snapx.1: a toggle must round-trip the exclude list, and
+    // the row must say how many datasets are excluded).
+    ANAS.schedules.toggle = toggleSchedule;
+    ANAS.schedules.scheduleRow = scheduleRow;
+    ANAS.schedules.renderTarget = renderTarget;
 
     // ---- Selection + toolbar state -----------------------------------------
 
@@ -484,11 +502,14 @@
     // Dataset options for a ZFS pool: the pool root '(pool root)' first, then each
     // ANAS-managed dataset's relative path — owned rows (any kind, ANAS.pve) are
     // omitted, siblings stay. `rel` '' is the pool root. `poolSummary` carries
-    // the pool's pveStorages for the skew fallback. Never rejects.
+    // the pool's pveStorages for the skew fallback. Never rejects. Resolves
+    // { opts, rows }: `opts` feed the target picker; `rows` are every dataset
+    // below the pool root as { name, own } (own = the PVE ownership or null)
+    // for the Exclude picker (snapx.1).
     function loadDatasetOptions(node, pool, poolSummary) {
         var rootOpt = [{ rel: '', label: t('(pool root)') }];
         if (!pool) {
-            return Promise.resolve(rootOpt);
+            return Promise.resolve({ opts: rootOpt, rows: [] });
         }
         return ANAS.api.get(node, '/pools/' + encodeURIComponent(pool) + '/datasets').then(
             function (res) {
@@ -507,11 +528,18 @@
                 var opts = [];
                 var rootOwned = false;
                 var rels = [];
+                // snapx.1: EVERY row below the pool root, owned ones included
+                // (with their ownership, for the badge) — the Exclude picker
+                // lists them, because excluding guest volumes from a recursive
+                // schedule is exactly what it is for.
+                var rows = [];
                 for (var i = 0; i < list.length; i++) {
                     var ds = list[i] || {};
                     var owned;
+                    var own = null;
                     try {
-                        owned = ANAS.pve.isOwned(ds, poolSummary, perNode);
+                        own = ANAS.pve.ownership(ds, poolSummary, perNode);
+                        owned = !!own;
                     } catch (eRow) {
                         // A throw in the helper would REJECT this promise
                         // silently (no catch further down the chain). Degrade
@@ -522,6 +550,9 @@
                         // cannot be read must never be offered.
                         owned = perNode
                             || ANAS.pve.storagesOf(poolSummary).length > 0;
+                    }
+                    if (ds.name && ds.name !== pool) {
+                        rows.push({ name: ds.name, own: owned ? (own || { reason: '' }) : null });
                     }
                     if (owned) {
                         if (ds.name === pool) {
@@ -544,7 +575,7 @@
                 for (var j = 0; j < rels.length; j++) {
                     opts.push({ rel: rels[j], label: rels[j] });
                 }
-                return opts;
+                return { opts: opts, rows: rows };
             },
             function (err) {
                 ANAS.warn('schedules datasets load failed for ' + pool + ': ' + ANAS.errText(err));
@@ -559,7 +590,7 @@
                     // a malformed summary cannot be classified — the old
                     // behaviour (offer the root) stands; the daemon refuses
                 }
-                return rootOwned ? [] : rootOpt;
+                return { opts: rootOwned ? [] : rootOpt, rows: [] };
             }
         );
     }
@@ -732,6 +763,8 @@
         var zfsPoolStore = poolComboStore(zfsPools);
         var ahrPoolStore = poolComboStore(ahrPools);
         var zfsDsStore = Ext.create('Ext.data.Store', { fields: ['rel', 'label'], data: [] });
+        // snapx.1: the target's strict descendants, owned ones badged.
+        var excludeStore = Ext.create('Ext.data.Store', { fields: ['name', 'label', 'badge'], data: [] });
 
         // Kind options limited to filesystems that actually have a target.
         var kindData = [];
@@ -895,6 +928,40 @@
                             hidden: startKind !== 'zfs',
                             checked: !!sched.recursive
                         },
+                        // snapx.1: child datasets a recursive schedule skips,
+                        // each with everything beneath it. Shown only for a
+                        // recursive ZFS schedule; lists the target's strict
+                        // descendants, PVE-owned ones badged and selectable.
+                        {
+                            xtype: 'tagfield',
+                            itemId: 'exclude',
+                            cls: 'anas-fld-sched-exclude',
+                            fieldLabel: t('Exclude datasets'),
+                            store: excludeStore,
+                            valueField: 'name',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            anyMatch: true,
+                            filterPickList: true,
+                            forceSelection: true,
+                            createNewOnEnter: false,
+                            createNewOnBlur: false,
+                            emptyText: t('(none)'),
+                            listConfig: {
+                                tpl: '<tpl for="."><div class="x-boundlist-item">'
+                                    + '{label:htmlEncode}{badge}</div></tpl>'
+                            },
+                            hidden: !(startKind === 'zfs' && sched.recursive),
+                            value: []
+                        },
+                        {
+                            xtype: 'component',
+                            itemId: 'excludeHint',
+                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
+                            hidden: !(startKind === 'zfs' && sched.recursive),
+                            html: enc(t('Each excluded dataset is skipped together with everything beneath it. '
+                                + 'Datasets PVE owns are listed so they can be excluded.'))
+                        },
                         // --- Retention: presets + advanced per-bucket expander --
                         {
                             xtype: 'combobox',
@@ -973,17 +1040,86 @@
             return;
         }
 
+        var setVis = function (sel, vis) {
+            var f = win.down(sel);
+            if (f) { f.setHidden(!vis); }
+        };
+
+        // snapx.1: the Exclude picker shows for a recursive ZFS schedule only.
+        var applyExcludeVis = function () {
+            var vis = valOf(win, '#targetKind') === 'zfs' && !!valOf(win, '#recursive');
+            setVis('#exclude', vis);
+            setVis('#excludeHint', vis);
+        };
+
         // Reveal the ZFS or AHR target fields as the filesystem kind changes.
         var applyKind = function (kind) {
             var zfs = kind === 'zfs';
-            var setVis = function (sel, vis) {
-                var f = win.down(sel);
-                if (f) { f.setHidden(!vis); }
-            };
             setVis('#zfsPool', zfs);
             setVis('#zfsDataset', zfs);
             setVis('#recursive', zfs);
             setVis('#ahrPool', !zfs);
+            applyExcludeVis();
+        };
+
+        // snapx.1: the Exclude picker's options are the strict descendants of
+        // the dataset picked right now, taken from the same dataset listing the
+        // target picker reads (owned rows kept, badged). A picked dataset that
+        // is no longer a descendant (the target changed) is dropped. On edit
+        // the stored list seeds the selection once the listing has answered;
+        // a stored entry the listing did not return stays selected and marked
+        // (preserve and mark, as for a stored pool; the daemon accepts an
+        // entry the schedule already carried).
+        var dsRows = [];
+        var dsLoaded = false;
+        var excludeSeed = (isEdit && sched.recursive && sched.exclude) ? sched.exclude.slice() : [];
+        var excludeSeeded = false;
+        var refreshExclude = function () {
+            var fld = win.down('#exclude');
+            if (!fld || !dsLoaded) {
+                return;
+            }
+            var pool = valOf(win, '#zfsPool') || '';
+            var rel = ('' + (valOf(win, '#zfsDataset') || '')).replace(/^\/+|\/+$/g, '');
+            var targetFull = pool ? (rel ? (pool + '/' + rel) : pool) : '';
+            var prefix = targetFull + '/';
+            var data = [];
+            var have = {};
+            if (targetFull) {
+                for (var i = 0; i < dsRows.length; i++) {
+                    var row = dsRows[i];
+                    if (row.name.indexOf(prefix) !== 0 || have[row.name]) {
+                        continue;
+                    }
+                    var badge = '';
+                    if (row.own) {
+                        try {
+                            badge = ' <span class="anas-sched-exclude-pve">'
+                                + (ANAS.pve.badge(row.own).html || '') + '</span>';
+                        } catch (eBadge) {
+                            badge = '';
+                        }
+                    }
+                    data.push({ name: row.name, label: relOfFull(row.name, pool), badge: badge });
+                    have[row.name] = true;
+                }
+            }
+            var keep = excludeSeeded ? (fld.getValue() || []) : excludeSeed;
+            // A kept name the listing does not return can only be a stored
+            // entry (every pick comes from this store): keep it, marked.
+            if (targetFull) {
+                for (var k = 0; k < keep.length; k++) {
+                    var name = keep[k];
+                    if (!have[name] && name.indexOf(prefix) === 0) {
+                        data.push({ name: name, label: relOfFull(name, pool) + ' ' + UNAVAILABLE, badge: '' });
+                        have[name] = true;
+                    }
+                }
+            }
+            excludeSeeded = true;
+            data.sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+            excludeStore.loadData(data);
+            fld.setValue(keep.filter(function (n) { return have[n]; }));
         };
 
         // Reload the ZFS dataset combo when the ZFS pool changes. The pool's
@@ -997,10 +1133,13 @@
                     break;
                 }
             }
-            loadDatasetOptions(node, pool, summary).then(function (opts) {
+            loadDatasetOptions(node, pool, summary).then(function (res) {
                 if (win.destroyed || win.destroying) {
                     return;
                 }
+                var opts = res.opts;
+                dsRows = res.rows;
+                dsLoaded = true;
                 zfsDsStore.loadData(opts);
                 var fld = win.down('#zfsDataset');
                 if (fld) {
@@ -1008,12 +1147,15 @@
                         : (opts.length ? opts[0].rel : '');
                     fld.setValue(want);
                 }
+                refreshExclude();
             });
         };
 
         try {
             win.down('#targetKind').on('change', function (f) { applyKind(f.getValue()); });
             win.down('#zfsPool').on('change', function (f) { loadZfsDatasets(f.getValue(), undefined); });
+            win.down('#zfsDataset').on('change', function () { refreshExclude(); });
+            win.down('#recursive').on('change', function () { applyExcludeVis(); });
             // Preset → fill the advanced fields; expand advanced only for Custom.
             win.down('#preset').on('change', function (f) {
                 var val = f.getValue();
@@ -1143,6 +1285,12 @@
         };
         if (kind === 'zfs' && valOf(win, '#recursive')) {
             body.recursive = true;
+            // snapx.1: sent only when something is excluded; an empty list is
+            // the plain `-r` and keeps the stored unit byte-identical.
+            var exclude = valOf(win, '#exclude') || [];
+            if (exclude.length) {
+                body.exclude = exclude.slice();
+            }
         }
 
         ANAS.runJob({
@@ -1227,6 +1375,11 @@
         };
         if (raw.recursive || (raw.target === undefined && rec.get('recursive'))) {
             body.recursive = true;
+            // snapx.1: carry the exclude list, or a toggle silently drops it.
+            var exclude = raw.exclude || rec.get('exclude') || [];
+            if (exclude.length) {
+                body.exclude = exclude.slice();
+            }
         }
         ANAS.runJob({
             node: node,
@@ -1502,6 +1655,7 @@
                 'lastRunResult', 'lastRunAt', 'nextRunAt',
                 { name: 'retention', type: 'auto' },
                 { name: 'recursive', type: 'auto' },
+                { name: 'exclude', type: 'auto' },
                 { name: 'enabled', type: 'auto' },
                 { name: 'overdue', type: 'auto' },
                 { name: 'raw', type: 'auto' }
@@ -1706,6 +1860,10 @@
         };
         if (rec.get('recursive')) {
             out.recursive = true;
+            var exclude = rec.get('exclude') || [];
+            if (exclude.length) {
+                out.exclude = exclude.slice();
+            }
         }
         return out;
     }

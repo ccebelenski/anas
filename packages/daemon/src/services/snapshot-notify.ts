@@ -141,8 +141,13 @@ export function buildSnapshotNotifyBody(ctx: SnapshotNotifyContext): string {
   }
 
   lines.push('')
+  // snapx.1: the grid's "recursive, N excluded" wording, then the names.
+  const excluded = schedule.recursive ? (schedule.exclude ?? []) : []
   lines.push(`Cadence:     ${schedule.cadence}${schedule.recursive ? ', recursive' : ''}`
+    + `${excluded.length ? `, ${excluded.length} excluded` : ''}`
     + `${schedule.enabled ? '' : ' (schedule disabled)'}`)
+  if (excluded.length)
+    lines.push(`Excluded:    ${excluded.join(', ')}`)
   lines.push(`Retention:   ${retentionSummaryLine(schedule.retention)}`)
   // The body ends on the facts (backup's rule) - no closing pointer to the UI.
   return lines.join('\n')

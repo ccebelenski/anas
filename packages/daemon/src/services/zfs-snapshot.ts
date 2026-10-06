@@ -46,6 +46,46 @@ export function createZfsSnapshotArgs(opts: ZfsSnapshotOptions): string[] {
   return ['snapshot', ...(opts.recursive ? ['-r'] : []), zfsSnapshotFullName(opts.dataset, opts.name)]
 }
 
+/**
+ * The `zfs snapshot <a>@<name> <b>@<name> …` argv (story snapx.1): several
+ * snapshots named in ONE invocation. ZFS takes every snapshot named in one
+ * call atomically (one transaction group), so a recursive schedule with an
+ * exclude list keeps the same consistency guarantee as `-r`.
+ */
+export function createZfsSnapshotsArgs(datasets: string[], name: string): string[] {
+  return ['snapshot', ...datasets.map(ds => zfsSnapshotFullName(ds, name))]
+}
+
+/** `zfs list -H -o name -r -t filesystem,volume <dataset>` — the tree a recursive snapshot covers. */
+export function zfsTreeListArgs(dataset: string): string[] {
+  return ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', dataset]
+}
+
+/** Is `name` the dataset `root` itself or anywhere beneath it? */
+export function isAtOrUnder(name: string, root: string): boolean {
+  return name === root || name.startsWith(`${root}/`)
+}
+
+/**
+ * The datasets a recursive snapshot of `target` covers once `exclude` is
+ * applied (story snapx.1): `target` first, then every listed strict
+ * descendant in listing order, minus each excluded dataset AND its whole
+ * subtree. Pure: an exclude entry that names nothing in the list is simply
+ * inert (rejecting it is the route's job), and anything in `descendants`
+ * outside `target`'s tree is ignored.
+ */
+export function expandSnapshotTargets(descendants: string[], target: string, exclude: string[]): string[] {
+  const out = [target]
+  for (const name of descendants) {
+    if (name === target || !name.startsWith(`${target}/`))
+      continue
+    if (exclude.some(ex => isAtOrUnder(name, ex)))
+      continue
+    out.push(name)
+  }
+  return out
+}
+
 /** The `zfs destroy [-r] <dataset>@<name>` argv. */
 export function destroyZfsSnapshotArgs(opts: ZfsSnapshotOptions): string[] {
   return ['destroy', ...(opts.recursive ? ['-r'] : []), zfsSnapshotFullName(opts.dataset, opts.name)]
@@ -70,6 +110,34 @@ export async function createZfsSnapshot(
   if (r.exitCode !== 0)
     throw failure('snapshot', r)
   return { snapshot: zfsSnapshotFullName(opts.dataset, opts.name) }
+}
+
+/**
+ * Take a recursive snapshot of `dataset` that skips the `exclude` subtrees
+ * (story snapx.1). With no exclusions this IS {@link createZfsSnapshot} with
+ * `recursive: true` — the literal `zfs snapshot -r`, byte-identical argv.
+ * Otherwise: list the tree (`zfs list -H -o name -r -t filesystem,volume`),
+ * drop the excluded subtrees ({@link expandSnapshotTargets}), and take every
+ * remaining snapshot in ONE atomic `zfs snapshot` call. Returns the full
+ * snapshot names taken (`-r` reports just the target's, as before).
+ */
+export async function createZfsSnapshotExcluding(
+  executor: CommandExecutor,
+  opts: { dataset: string, name: string, exclude: string[] },
+): Promise<{ snapshots: string[] }> {
+  if (opts.exclude.length === 0) {
+    const r = await createZfsSnapshot(executor, { dataset: opts.dataset, name: opts.name, recursive: true })
+    return { snapshots: [r.snapshot] }
+  }
+  const listed = await executor.exec(ZFS, zfsTreeListArgs(opts.dataset))
+  if (listed.exitCode !== 0)
+    throw failure('list', listed)
+  const descendants = listed.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+  const datasets = expandSnapshotTargets(descendants, opts.dataset, opts.exclude)
+  const r = await executor.exec(ZFS, createZfsSnapshotsArgs(datasets, opts.name))
+  if (r.exitCode !== 0)
+    throw failure('snapshot', r)
+  return { snapshots: datasets.map(ds => zfsSnapshotFullName(ds, opts.name)) }
 }
 
 /** Destroy one snapshot. Throws the command's stderr on failure. */

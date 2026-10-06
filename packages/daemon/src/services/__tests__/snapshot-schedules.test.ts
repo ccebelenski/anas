@@ -65,6 +65,42 @@ describe('takeSnapshot — uniform, dispatches by target.kind', () => {
     assert.deepEqual(executor.calls[0], { command: ZFS, args: ['snapshot', '-r', `tank/media@anas-hourly-${STAMP}`] })
   })
 
+  it('ZFS recursive with exclude (snapx.1): zfs list the tree, then ONE zfs snapshot of the rest', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: ZFS,
+      args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'tank/media'],
+      result: {
+        stdout: ['tank/media', 'tank/media/movies', 'tank/media/scratch', 'tank/media/scratch/tmp', 'tank/media/tv'].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      },
+    })
+    executor.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+    const res = await takeSnapshot(executor, ZFS_TARGET, 'hourly', { now: NOW, recursive: true, exclude: ['tank/media/scratch'] })
+    assert.equal(res.name, `anas-hourly-${STAMP}`)
+    assert.equal(executor.calls.length, 2)
+    assert.deepEqual(executor.calls[0], { command: ZFS, args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'tank/media'] })
+    assert.deepEqual(executor.calls[1], {
+      command: ZFS,
+      args: ['snapshot', `tank/media@anas-hourly-${STAMP}`, `tank/media/movies@anas-hourly-${STAMP}`, `tank/media/tv@anas-hourly-${STAMP}`],
+    })
+  })
+
+  it('ZFS recursive with an EMPTY exclude stays the unchanged -r argv (snapx.1)', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+    await takeSnapshot(executor, ZFS_TARGET, 'hourly', { now: NOW, recursive: true, exclude: [] })
+    assert.deepEqual(executor.calls, [{ command: ZFS, args: ['snapshot', '-r', `tank/media@anas-hourly-${STAMP}`] }])
+  })
+
+  it('ZFS exclude without recursive is ignored by the service (the schema refuses it upstream)', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+    await takeSnapshot(executor, ZFS_TARGET, 'hourly', { now: NOW, exclude: ['tank/media/scratch'] })
+    assert.deepEqual(executor.calls, [{ command: ZFS, args: ['snapshot', `tank/media@anas-hourly-${STAMP}`] }])
+  })
+
   it('AHR: read-only btrfs snapshot @data → @snapshots/anas-<bucket>-<utc> (reuses 11.12)', async () => {
     const runtimeDir = await mkdtemp(join(tmpdir(), 'anas-sched-'))
     try {

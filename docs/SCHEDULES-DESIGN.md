@@ -11,13 +11,14 @@
 - **Scope:** ANAS-managed pools/datasets only. PVE-managed pools stay hands-off / display-only (3.25).
 
 ## Uniform snapshot model (AHR btrfs AND ZFS — one policy, one screen, one mechanism)
-A **snapshot schedule** = `{ target, cadence, retention, recursive? }` where target is a ZFS dataset or an AHR pool. On timer fire ANAS runs the filesystem-appropriate command behind one uniform policy:
+A **snapshot schedule** = `{ target, cadence, retention, recursive?, exclude? }` where target is a ZFS dataset or an AHR pool. On timer fire ANAS runs the filesystem-appropriate command behind one uniform policy:
 
 | | Take | Prune (over-retention) | Hold-safety |
 |---|---|---|---|
 | **ZFS** | `zfs snapshot [-r] <ds>@anas-<bucket>-<utc>` | `zfs destroy` the excess | SKIP `userrefs>0` (held, e.g. a replication base); surface as "retained (held)" — never a failed-destroy |
 | **AHR** | ro btrfs snapshot `@data → @snapshots/anas-<bucket>-<utc>` (reuse 11.12 primitives) | `btrfs subvolume delete` the excess | n/a (btrfs snapshots aren't ZFS-held; AHR replication is separate) |
 
+- **Exclude (snapx.1, #71).** A recursive ZFS schedule may name child datasets to skip (`exclude`: full paths, each a strict descendant of the target; skipped with its whole subtree). With an exclude list the take lists the tree (`zfs list -H -o name -r -t filesystem,volume`), drops the excluded subtrees and takes the rest in ONE `zfs snapshot a@n b@n …` call, which ZFS performs atomically, so the consistency of `-r` is kept; without one it stays the literal `-r`. The PVE-owned-descendant guard (create, update and every run) runs on the tree minus the excluded subtrees, and its refusal says the owned dataset can be excluded. Exclude on a non-recursive or AHR schedule is a 400.
 - **Naming convention** (`anas-<bucket>-<utc>`) marks ANAS-scheduled snapshots; pruning touches ONLY those — never replication bases, manual snapshots, or AHR-manual snapshots (mirrors sanoid pruning only its own).
 - Three snapshot lifecycles stay independent and coexist: **scheduled** (this feature), **replication** (Epic 5.5), **AHR-manual** (11.12). The dataset/pool view shows the inventory of all three; Schedules owns only the scheduled policy.
 

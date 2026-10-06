@@ -252,7 +252,7 @@ function loadUi() {
     tbar: items => ({ xtype: 'toolbar', items }), // real 00-core.js helper
     pollJob: () => Promise.resolve({}),
     gfx: { ready: () => false },
-    sched: { absTime: v => String(v || '') },
+    sched: { absTime: v => String(v || ''), fsTag: kind => `[${kind}] ` },
     notifyMode: {
       field: cfg => Object.assign({ xtype: 'combobox' }, cfg),
       of: (v, d) => v || d,
@@ -818,6 +818,144 @@ const PVE_DS_SKEW = { data: [
   await settle()
   eq('pve2(sched skew): EVERY dataset of the PVE pool is omitted',
     win.down('#zfsDataset').getStore().rows().length, 0)
+}
+
+// =============================================================================
+//  snapx.1 (#71) — exclude datasets from a recursive snapshot schedule
+// =============================================================================
+//
+// The Exclude picker shows only for a recursive ZFS schedule, lists the
+// target's STRICT descendants from the same dataset listing the target picker
+// reads (PVE-owned rows kept and badged: excluding guest volumes is the use
+// case), follows the target, and its picks ride the body only when non-empty.
+// Edit seeds the stored list, keeping a stored entry the listing lost (marked);
+// a toggle and the grid row carry the list too.
+
+const SNAPX_DS = { data: [
+  { name: 'tank' },
+  { name: 'tank/media' },
+  { name: 'tank/media/raw' },
+  { name: 'tank/pve', pve: OWNER('storage-root', 'tank/pve') },
+  { name: 'tank/pve/vm-100-disk-0', pve: OWNER('guest-volume', 'tank/pve/vm-100-disk-0') },
+] }
+
+function snapxGets() {
+  return schedGets({ '/pools': { data: [{ name: 'tank' }] }, '/pools/tank/datasets': SNAPX_DS })
+}
+
+// --- 20. Create: hidden until Recursive; lists descendants; picks are sent ------
+{
+  reset()
+  state.get = snapxGets()
+  const win = await openSchedule(null)
+  const excl = win.down('#exclude')
+  ok('snapx: the Exclude picker exists', !!excl)
+  eq('snapx: hidden while Recursive is off', excl && excl.hidden, true)
+  win.down('#recursive').setValue(true)
+  eq('snapx: shown once Recursive is ticked', excl && excl.hidden, false)
+  eq('snapx: its hint shows with it', win.down('#excludeHint').hidden, false)
+  const rows = excl ? excl.getStore().rows() : []
+  eq('snapx: lists every strict descendant of the pool root, owned ones included',
+    JSON.stringify(rows.map(r => r.name)),
+    JSON.stringify(['tank/media', 'tank/media/raw', 'tank/pve', 'tank/pve/vm-100-disk-0']))
+  const pveRow = rows.find(r => r.name === 'tank/pve/vm-100-disk-0') || {}
+  ok('snapx: an owned row carries the PVE badge', /anas-gfx-badge/.test(pveRow.badge || ''), JSON.stringify(pveRow))
+  eq('snapx: an unowned row carries none', (rows.find(r => r.name === 'tank/media') || {}).badge, '')
+
+  win.down('#name').setValue('Hourly tank')
+  win.down('#id').setValue('hourly-tank')
+  excl.setValue(['tank/pve'])
+  pressSave(win)
+  const post = state.requests[0] || { body: {} }
+  eq('snapx: create POSTs', post.method, 'post')
+  eq('snapx: recursive is sent', post.body.recursive, true)
+  eq('snapx: the picked dataset is sent as exclude', JSON.stringify(post.body.exclude), JSON.stringify(['tank/pve']))
+
+  // Retarget to tank/media: only ITS descendants remain, the stale pick drops.
+  win.down('#zfsDataset').setValue('media')
+  eq('snapx: the options follow the picked target',
+    JSON.stringify(excl.getStore().rows().map(r => r.name)), JSON.stringify(['tank/media/raw']))
+  eq('snapx: a pick that is no longer a descendant is dropped', JSON.stringify(excl.getValue()), JSON.stringify([]))
+
+  // Unticking Recursive hides the picker and sends no exclude at all.
+  win.down('#zfsDataset').setValue('')
+  excl.setValue(['tank/media'])
+  win.down('#recursive').setValue(false)
+  eq('snapx: hidden again when Recursive is unticked', excl.hidden, true)
+  pressSave(win)
+  const second = state.requests[1] || { body: {} }
+  ok('snapx: a non-recursive save sends no exclude key', !('exclude' in second.body), JSON.stringify(second.body))
+  ok('snapx: …and no recursive key', !('recursive' in second.body), JSON.stringify(second.body))
+}
+
+// --- 21. Recursive with nothing excluded sends no exclude key -------------------
+{
+  reset()
+  state.get = snapxGets()
+  const win = await openSchedule(null)
+  win.down('#name').setValue('Hourly tank')
+  win.down('#id').setValue('hourly-tank')
+  win.down('#recursive').setValue(true)
+  pressSave(win)
+  const body = (state.requests[0] || { body: {} }).body
+  eq('snapx: recursive alone is the plain -r body', body.recursive, true)
+  ok('snapx: with no exclude key (the stored unit stays byte-identical)', !('exclude' in body), JSON.stringify(body))
+}
+
+// --- 22. Edit: the stored list seeds the picker; a lost entry stays, marked -----
+{
+  reset()
+  state.get = snapxGets()
+  const stored = {
+    id: 'hourly-tank',
+    name: 'Hourly tank',
+    target: { kind: 'zfs', dataset: 'tank' },
+    cadence: 'hourly',
+    retention: { hourly: 24 },
+    recursive: true,
+    exclude: ['tank/gone', 'tank/pve'],
+    notify: 'on-failure',
+    enabled: true,
+  }
+  const win = await openSchedule(stored)
+  const excl = win.down('#exclude')
+  eq('snapx(edit): the picker is shown for a stored recursive schedule', excl.hidden, false)
+  eq('snapx(edit): the stored picks are selected',
+    JSON.stringify(excl.getValue()), JSON.stringify(['tank/gone', 'tank/pve']))
+  const gone = excl.getStore().rows().find(r => r.name === 'tank/gone') || {}
+  ok('snapx(edit): a stored entry the listing lost is kept and marked', /unavailable/.test(gone.label || ''), JSON.stringify(gone))
+  pressSave(win)
+  const put = state.requests[0] || { body: {} }
+  eq('snapx(edit): saved as a PUT', put.method, 'put')
+  eq('snapx(edit): the stored list round-trips', JSON.stringify(put.body.exclude), JSON.stringify(['tank/gone', 'tank/pve']))
+}
+
+// --- 23. The toggle and the grid row carry the list -----------------------------
+{
+  reset()
+  const sched = {
+    id: 'hourly-tank',
+    name: 'Hourly tank',
+    target: { kind: 'zfs', dataset: 'tank' },
+    cadence: 'hourly',
+    retention: { hourly: 24 },
+    recursive: true,
+    exclude: ['tank/pve'],
+    notify: 'on-failure',
+    enabled: true,
+  }
+  const row = ANAS.schedules.scheduleRow({ schedule: sched, lastRunResult: 'success' })
+  const rec = { get: k => row[k] }
+  ANAS.schedules.toggle('n1', fakeGrid(), rec)
+  const put = state.requests[0] || { body: {} }
+  eq('snapx(toggle): flips enabled', put.body.enabled, false)
+  eq('snapx(toggle): keeps the exclude list', JSON.stringify(put.body.exclude), JSON.stringify(['tank/pve']))
+  const html = ANAS.schedules.renderTarget(null, {}, rec)
+  ok('snapx(grid): the row says "1 excluded"', /\(-r, 1 excluded\)/.test(html), html)
+  ok('snapx(grid): the tooltip names the dataset', /excluded: tank\/pve/.test(html), html)
+  const plain = Object.assign({}, row, { exclude: [] })
+  const plainHtml = ANAS.schedules.renderTarget(null, {}, { get: k => plain[k] })
+  ok('snapx(grid): a plain recursive row still reads (-r)', />\(-r\)</.test(plainHtml), plainHtml)
 }
 
 // ---- Report -----------------------------------------------------------------

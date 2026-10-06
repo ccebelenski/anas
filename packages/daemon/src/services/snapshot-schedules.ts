@@ -11,7 +11,7 @@ import { run } from './ahr-exec.js'
 import { createAhrSnapshot, deleteAhrSnapshot, listAhrSnapshots } from './ahr-snapshots.js'
 import { formatScheduledName, parseScheduledName } from './snapshot-naming.js'
 import { planRetention } from './snapshot-retention.js'
-import { createZfsSnapshot, destroyZfsSnapshot, zfsSnapshotFullName } from './zfs-snapshot.js'
+import { createZfsSnapshot, createZfsSnapshotExcluding, destroyZfsSnapshot, zfsSnapshotFullName } from './zfs-snapshot.js'
 
 /**
  * Uniform snapshot take/prune/list (Epic 17, stage 1). ONE service surface that
@@ -21,6 +21,7 @@ import { createZfsSnapshot, destroyZfsSnapshot, zfsSnapshotFullName } from './zf
  *   | verb  | ZFS                                    | AHR (reuses 11.12 primitives)          |
  *   |-------|----------------------------------------|----------------------------------------|
  *   | take  | `zfs snapshot [-r] <ds>@anas-<b>-<utc>` | ro btrfs snapshot `@data → @snapshots/…`|
+ *   |       | (snapx.1 exclude: one call, many names) |                                        |
  *   | list  | `zfs list -t snapshot -Hp -o …`        | `listAhrSnapshots` over `@snapshots/*`  |
  *   | prune | `zfs destroy` the plan's prune-set     | `btrfs subvolume delete` the prune-set  |
  *
@@ -47,6 +48,12 @@ export interface SnapshotServiceOptions extends AhrSnapshotOptions {
   pool?: AhrPool
   /** ZFS only: recurse into child datasets (`zfs snapshot -r`). */
   recursive?: boolean
+  /**
+   * ZFS + `recursive` only (story snapx.1): child datasets skipped with their
+   * subtrees. Empty/absent = the literal `zfs snapshot -r`; non-empty = the
+   * expanded tree taken in ONE atomic `zfs snapshot` call.
+   */
+  exclude?: string[]
   /** Progress sink (default no-op) — mirrors the AHR snapshot verbs. */
   updateProgress?: (message: string) => void
   /** Clock for the name's UTC stamp and retention `now` (default: real time). */
@@ -94,7 +101,13 @@ export async function takeSnapshot(
   if (target.kind === 'zfs') {
     // The ONE zfs-snapshot verb (backup2.3's extraction): identical argv, shared
     // with the datasets route, replication's snapshot-first and the backup runner.
-    await createZfsSnapshot(executor, { dataset: target.dataset, name, recursive: opts?.recursive === true })
+    // snapx.1: a recursive schedule with an exclude list expands the tree and
+    // takes the rest in one atomic call; without one it stays the literal `-r`.
+    const exclude = opts?.exclude ?? []
+    if (opts?.recursive === true && exclude.length > 0)
+      await createZfsSnapshotExcluding(executor, { dataset: target.dataset, name, exclude })
+    else
+      await createZfsSnapshot(executor, { dataset: target.dataset, name, recursive: opts?.recursive === true })
   }
   else {
     const pool = requirePool(target, opts)

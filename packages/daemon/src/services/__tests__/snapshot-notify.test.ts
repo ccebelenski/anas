@@ -140,6 +140,17 @@ describe('snapshot schedule notifications — the body (9.4)', () => {
     assert.ok(body.includes('Read-only file system'))
   })
 
+  it('a recursive schedule with excludes counts and names them (snapx.1)', () => {
+    const body = buildSnapshotNotifyBody({
+      schedule: makeSchedule({ recursive: true, exclude: ['testpool/media/scratch', 'testpool/media/vm-100-disk-0'] }),
+      result: CLEAN_RUN,
+      elapsedMs: 1000,
+    })
+    assert.match(body, /Cadence:\s+daily, recursive, 2 excluded/)
+    assert.match(body, /Excluded:\s+testpool\/media\/scratch, testpool\/media\/vm-100-disk-0/)
+    assert.match(body, ASCII_ONLY)
+  })
+
   it('a SUCCESS body is a full receipt: snapshot taken, what prune did, duration', () => {
     const body = buildSnapshotNotifyBody({
       schedule: makeSchedule(),
