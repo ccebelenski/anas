@@ -3,14 +3,18 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { MdadmArrayPin } from '../parsers/mdadm-conf.js'
 import type { AhrBandSlice } from './ahr-geometry.js'
 import type { AhrLayoutDisk } from './ahr-layout.js'
+import type { DiskIdentityCache } from './disk-identity-cache.js'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { addMount, addMountOption, hasMount, parseFstab, removeMount } from '../parsers/fstab.js'
 import { mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { ROLLED_BACK_MARKER } from './ahr-create-status.js'
 import { destroyAhrPool } from './ahr-destroy.js'
+import { requireComposableNow } from './ahr-disk-recheck.js'
 import { LVM_MIXED_BLOCK_ARGS, run } from './ahr-exec.js'
 import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
+import { ahrNameOccupancy } from './ahr-identity.js'
+import { clearIntent } from './ahr-intent.js'
 import { floorToGranularity, planFreshLayout } from './ahr-layout.js'
 import { installProgramHook, pinArrays } from './ahr-mdadm-conf.js'
 import { ahrLvPath, ahrMountBase } from './ahr-paths.js'
@@ -85,6 +89,19 @@ export interface AhrCreateOptions {
   mdadmConfPath?: string
   /** Mount-base override (else ANAS_AHR_MOUNT_BASE / /mnt/anas-ahr). */
   mountBase?: string
+  /**
+   * The disk inventory's identity cache. When given (the route always gives
+   * it), the job re-checks that every selected disk is STILL available before
+   * the first wipe (story ident.3 (a)) — the request may have queued for hours.
+   */
+  diskCache?: DiskIdentityCache
+  /**
+   * The expansion-intent directory. When given, an intent file left under the
+   * new pool's name — an earlier pool's, since the name passed the occupancy
+   * check — is removed before anything is built, so the new pool never reads
+   * as carrying someone else's halted expansion (story ident.3 (d)).
+   */
+  intentDir?: string
 }
 
 /**
@@ -290,8 +307,14 @@ interface CreateLedger {
   destructive: boolean
   /** The pool mountpoint, resolved up front so rollback has it at every stage. */
   mountpoint: string
-  /** Disks recorded as the plan reaches them — including a half-partitioned one. */
+  /**
+   * Disks recorded once THEIR OWN wipe succeeded — including a
+   * half-partitioned one (story ident.3 (a)). A disk whose wipe never ran, or
+   * failed, is not this attempt's and the rollback never touches it.
+   */
   planned: PlannedDisk[]
+  /** md UUIDs of the arrays this attempt created — its own before they are pinned. */
+  createdArrayUuids: string[]
 }
 
 /**
@@ -311,6 +334,18 @@ async function executeCreate(
   const protectedBands = layout.bands.filter(b => b.protected)
   if (protectedBands.length === 0)
     throw new Error(`no protected band is possible with the selected disks — an ${tier === 'ahr1' ? 'AHR-1' : 'AHR-2'} pool needs ${tier === 'ahr1' ? 2 : 4} disks reaching a common boundary`)
+
+  // --- Job-time re-checks (story ident.3): the request may have waited in the
+  // queue for hours. The name must still be free, and every disk must still
+  // be available, BEFORE the first destructive command — a failure here has
+  // touched nothing (ledger.destructive is still false).
+  const occupied = await ahrNameOccupancy(executor, name, { mdadmConfPath: opts.mdadmConfPath })
+  if (occupied.length > 0)
+    throw new Error(`the pool name '${name}' is already in use on this node — nothing was touched: ${occupied.join('; ')}`)
+  if (opts.diskCache)
+    await requireComposableNow(executor, opts.diskCache, spec.disks.map(d => d.id))
+  if (opts.intentDir !== undefined)
+    await clearIntent(name, opts.intentDir)
 
   // Deterministic disk ordinals (the `d<n>` of partition labels): ascending
   // rounded size, id as tie-break — the same order §2.1 sorts by.
@@ -336,20 +371,22 @@ async function executeCreate(
       slices,
     })
 
-    // Recorded BEFORE the disk is touched: rollback must know about a disk
-    // whose wipe or partitioning failed HALFWAY, not just the finished ones.
-    planned.push({
-      id: disk.id,
-      devPath,
-      partNumberByBand: new Map(specs.map(s => [s.band, s.number])),
-    })
-
     updateProgress(`Wiping ${disk.id} (${i + 1}/${disks.length})`)
     // THE POINT OF NO RETURN. Everything before this is planning; from here on
     // the selected disks carry only what THIS attempt put there, which is what
     // makes an automatic rollback safe (issue #11).
     ledger.destructive = true
     await run(executor, WIPEFS, ['-a', devPath])
+    // Recorded once ITS OWN wipe succeeded (story ident.3 (a)): from here the
+    // disk carries only this attempt's work, so the rollback may scrub it even
+    // if the zap or the partitioning below fails halfway. A disk whose wipe
+    // failed — busy, held, someone else's after all — never enters the list,
+    // and the rollback never touches it.
+    planned.push({
+      id: disk.id,
+      devPath,
+      partNumberByBand: new Map(specs.map(s => [s.band, s.number])),
+    })
     await run(executor, SGDISK, ['--zap-all', devPath])
     updateProgress(`Partitioning ${disk.id} (${specs.length} band slice${specs.length === 1 ? '' : 's'})`)
     await run(executor, SGDISK, [...specs.flatMap(s => s.sgdiskArgs), devPath])
@@ -400,6 +437,15 @@ async function executeCreate(
       '--run',
       ...members,
     ])
+    // The array's identity, read from the device just created and recorded at
+    // once (story ident.3): until the pin below lands, nothing on the system
+    // says this array is the pool's, and a failed create's rollback needs to
+    // know which arrays to stop — by UUID, never by a name another array could
+    // share.
+    const uuid = parseMdadmDetailExport((await run(executor, MDADM, mdadmDetailExportArgs(mdDev))).stdout).uuid
+    if (!uuid)
+      throw new Error(`could not read the md UUID of ${mdDev} — refusing to pin without an identity`)
+    ledger.createdArrayUuids.push(uuid)
     // Wipe the fresh array's signatures IMMEDIATELY, unconditionally: a device
     // ANAS created one command ago can hold nothing but residue. That residue is
     // real, and NOTHING ELSE REACHES IT — an LVM PV label + VG metadata live at
@@ -419,14 +465,7 @@ async function executeCreate(
 
   // --- Pin names + monitor hook, then refresh the initramfs -------------------
   updateProgress('Pinning arrays in mdadm.conf')
-  const pins: MdadmArrayPin[] = []
-  for (const [i, arrayName] of arrayNames.entries()) {
-    const res = await run(executor, MDADM, mdadmDetailExportArgs(mdDevices[i]))
-    const uuid = parseMdadmDetailExport(res.stdout).uuid
-    if (!uuid)
-      throw new Error(`could not read the md UUID of ${mdDevices[i]} — refusing to pin without an identity`)
-    pins.push({ name: arrayName, uuid })
-  }
+  const pins: MdadmArrayPin[] = arrayNames.map((arrayName, i) => ({ name: arrayName, uuid: ledger.createdArrayUuids[i] }))
   await pinArrays(pins, opts.mdadmConfPath)
   await installProgramHook(undefined, opts.mdadmConfPath)
   // Early-boot assembly reads the conf baked into the initramfs
@@ -534,6 +573,7 @@ export async function createAhrPool(
     destructive: false,
     mountpoint: spec.mountpoint ?? join(ahrMountBase(opts.mountBase), spec.name),
     planned: [],
+    createdArrayUuids: [],
   }
 
   try {
@@ -563,6 +603,11 @@ export async function createAhrPool(
             id: d.id,
             partitions: Array.from(d.partNumberByBand.values(), n => ({ device: `/dev/disk/by-id/${d.id}-part${n}` })),
           })),
+          // Identity by construction (story ident.3): the arrays this attempt
+          // created, pinned or not, and the disks it wiped itself — nothing
+          // else on the node is reachable from this teardown.
+          createdArrayUuids: ledger.createdArrayUuids,
+          disksWipedByCaller: true,
         },
         m => updateProgress(`Rollback: ${m}`),
         { fstabPath: opts.fstabPath, mdadmConfPath: opts.mdadmConfPath },

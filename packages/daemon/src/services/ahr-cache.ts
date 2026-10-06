@@ -541,7 +541,25 @@ export async function detachAhrCache(
   // unreadable one must stop the detach here (findCacheSlices throws), with
   // nothing yet changed — not after the uncache, where "no slices" would have
   // skipped every cleanup step and reported success.
-  const slices = await findCacheSlices(executor, pool.name)
+  //
+  // A label is a NAME, though, and names are not identity (story ident.3,
+  // identity audit #4): a `<pool>-cache<n>` slice that LVM counts in ANOTHER
+  // volume group is that VG's — a pool of the same name moved in from another
+  // node — and detach never touches it. What detach acts on is a slice that is
+  // a PV of THIS pool's VG, or a slice that is a PV of no VG at all: the
+  // leftover a died-and-returned cache device carries back (§13), which only
+  // a partition delete reaches, never a whole-disk zap.
+  const pvsBefore = await readPvs(executor)
+  const labelled = await findCacheSlices(executor, pool.name)
+  const slices = labelled.filter((slice) => {
+    const pv = pvsBefore.find(p => p.name === slice.kernelPath || p.name === slice.path)
+    if (pv && pv.vgName !== null && pv.vgName !== pool.name) {
+      updateProgress(`Leaving ${slice.diskId} alone: its '${pool.name}-cache${slice.ordinal}' slice belongs to volume group '${pv.vgName}', not this pool`)
+      log(`ahr.cache pool=${pool.name} disk=${slice.diskId} status=skipped reason=pv-of-vg-${pv.vgName}`)
+      return false
+    }
+    return true
+  })
   const sliceDevices = new Set(slices.flatMap(s => [s.kernelPath, s.path]))
 
   // 1. Uncache — drops the cache volume and restores direct service.

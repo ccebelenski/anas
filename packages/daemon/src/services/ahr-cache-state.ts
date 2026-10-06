@@ -208,10 +208,22 @@ export function buildAhrCacheState(input: CacheStateInput): CacheFacts {
   // Slices LVM has forgotten (or has not adopted yet) still belong to the pool:
   // the GPT label is the on-disk truth, and it survives `pvremove` and
   // `wipefs` — only `sgdisk -d` ends it (GT-22).
+  //
+  // Except a slice LVM counts in ANOTHER volume group (story ident.3, identity
+  // audit #4): the label is a name, the VG membership is identity, and a
+  // `<pool>-cache<n>` slice of some other VG is a same-named pool's — never
+  // this pool's disk, never on its destroy list.
+  const otherVgParts = new Set(
+    pvs.filter(p => p.vgName !== null && p.vgName !== poolName)
+      .map(p => pvPartition(p.name, partsByKernel, byIdMap))
+      .filter((part): part is CachePartInfo => part !== null),
+  )
   const fromLabels: string[] = []
   let labeledBytes = 0
   for (const part of partsByKernel.values()) {
     if (part.partlabel === null || matchCachePartitionLabel(poolName, part.partlabel) === null)
+      continue
+    if (otherVgParts.has(part))
       continue
     const id = byIdMap.get(part.disk.name)
     if (id !== undefined && !fromLabels.includes(id))

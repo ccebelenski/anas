@@ -18,6 +18,19 @@ export function mdadmDetailExportArgs(device: string): string[] {
   return ['--detail', '--export', device]
 }
 
+/**
+ * Args for `mdadm` to export one MEMBER's superblock as KEY=VALUE (story
+ * ident.3). `--examine --export` prints the same `MD_UUID`/`MD_NAME` keys
+ * `--detail --export` does — the array identity recorded INSIDE the partition —
+ * so {@link parseMdadmDetailExport} reads both. It answers for a member whose
+ * array is stopped or was never assembled, which is exactly when destroy must
+ * ask "whose partition is this?". A partition with no md superblock exits
+ * non-zero and prints no MD_UUID.
+ */
+export function mdadmExamineExportArgs(device: string): string[] {
+  return ['--examine', '--export', device]
+}
+
 /** One member from the MD_DEVICE_<token>_ROLE/_DEV key pairs. */
 export interface MdadmExportMember {
   /** Member device path, e.g. "/dev/sdc1". */

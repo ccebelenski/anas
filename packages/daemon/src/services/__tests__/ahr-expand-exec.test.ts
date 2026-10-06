@@ -2,7 +2,7 @@ import type { AhrCapacity, AhrExpansionIntent, AhrExpansionStep, AhrPool, AhrPre
 import type { AhrExpansionPlan } from '../ahr-layout.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -166,8 +166,22 @@ const DISK_PARTS: Record<string, { kernel: string, size: number, parts: PartSpec
   ] },
 }
 
+/**
+ * Pin tank's arrays in an mdadm.conf the daemon reads (ANAS_MDADM_CONF) —
+ * story ident.3: a pool's arrays are its own by their PINNED UUIDs, so the
+ * resolver only sees the bands the conf names. Appends to a conf a test
+ * already pointed the env at, else creates a fresh one.
+ */
+function pinConf(pins: [string, string][]): void {
+  const path = process.env.ANAS_MDADM_CONF ?? join(mkdtempSync(join(tmpdir(), 'anas-ahr-pins-')), 'mdadm.conf')
+  const existing = existsSync(path) ? readFileSync(path, 'utf-8') : ''
+  writeFileSync(path, existing + pins.map(([name, uuid]) => `ARRAY /dev/md/${name} metadata=1.2 UUID=${uuid}\n`).join(''))
+  process.env.ANAS_MDADM_CONF = path
+}
+
 /** Register the baseline tank world on a fresh MockExecutor. */
-function world(opts: { mdstat?: string | string[], r2Export?: string } = {}): MockExecutor {
+function world(opts: { mdstat?: string | string[], r2Export?: string, pins?: [string, string][] } = {}): MockExecutor {
+  pinConf(opts.pins ?? [['tank-r1', R1_UUID], ['tank-r2', R2_UUID], ['tank-r3', R3_UUID]])
   const executor = new MockExecutor()
   const mdstat = opts.mdstat ?? MDSTAT_BASE
   if (Array.isArray(mdstat))
@@ -564,6 +578,8 @@ unused devices: <none>
       executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${W}`), result: { stdout: diskJson('sdt', SIZE_4G, parts4('sdt', 4)), stderr: '', exitCode: 0 } })
       executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${V}`), result: { stdout: diskJson('sdu', SIZE_4G, parts4('sdu', 5)), stderr: '', exitCode: 0 } })
       executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md125'], result: { stdout: exportFor('tank-r3', 'raid1', 2, R3_UUID), stderr: '', exitCode: 0 } })
+      // ident.3: the new array's UUID is read from the device just created.
+      executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md/tank-r3'], result: { stdout: exportFor('tank-r3', 'raid1', 2, R3_UUID), stderr: '', exitCode: 0 } })
       executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/sbin/update-initramfs', result: { stdout: '', stderr: '', exitCode: 0 } })
 

@@ -5,7 +5,7 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { AhrCacheEventRequest, AttachAhrCacheRequest, isComposableDisk, PoolName } from '@anas/shared'
 import { attachAhrCache, detachAhrCache, findCacheSlices, notifyCacheRecoveryFailed, recoverFailedAhrCache } from '../services/ahr-cache.js'
-import { readIntent } from '../services/ahr-intent.js'
+import { readPoolIntent } from '../services/ahr-intent.js'
 import { fmtBytes } from '../services/ahr-layout.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { collectDisks } from './disks.js'
@@ -97,12 +97,14 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
    * and detach can wait for the expansion, while the event route skips the
    * recovery and the rung comes round again on its own.
    */
-  async function refuseExistingIntent(pool: string, reply: FastifyReply, consequence?: string): Promise<boolean> {
-    const existing = await readIntent(pool, intentDir)
+  async function refuseExistingIntent(pool: AhrPool, reply: FastifyReply, consequence?: string): Promise<boolean> {
+    // This pool's intent only: one an earlier pool of the same name left
+    // behind is stale and refuses nothing (story ident.3).
+    const existing = (await readPoolIntent(pool, intentDir)).intent
     if (existing) {
       reply.code(409).send({ error: {
         code: 'CONFLICT',
-        message: `Pool '${pool}' has an expansion intent (state '${existing.state}') — ${consequence ?? 'the cache can be changed once it completes or is abandoned'}.`,
+        message: `Pool '${pool.name}' has an expansion intent (state '${existing.state}') — ${consequence ?? 'the cache can be changed once it completes or is abandoned'}.`,
       } })
       return true
     }
@@ -123,7 +125,7 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
     const pool = await loadPool(request.params.name, reply)
     if (!pool)
       return
-    if (await refuseExistingIntent(pool.name, reply))
+    if (await refuseExistingIntent(pool, reply))
       return
     if (refuseCacheJobInFlight(pool.name, reply))
       return
@@ -217,7 +219,7 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
     const pool = await loadPool(request.params.name, reply)
     if (!pool)
       return
-    if (await refuseExistingIntent(pool.name, reply))
+    if (await refuseExistingIntent(pool, reply))
       return
     if (refuseCacheJobInFlight(pool.name, reply))
       return
@@ -308,7 +310,7 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
     // run under it. The rung loses nothing by skipping — udev re-raises the
     // event (a removal can generate several) and the boot rung re-runs the
     // recovery at the next daemon start.
-    if (await refuseExistingIntent(pool.name, reply, 'the automatic cache recovery is skipped; it re-runs on the next event or at the next daemon start'))
+    if (await refuseExistingIntent(pool, reply, 'the automatic cache recovery is skipped; it re-runs on the next event or at the next daemon start'))
       return
 
     // A cache job already in flight IS the recovery (a detach submitted by the

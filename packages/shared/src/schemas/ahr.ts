@@ -191,6 +191,15 @@ export const AhrArraySync = z.object({
 export type AhrArraySync = z.infer<typeof AhrArraySync>
 
 /**
+ * An md array UUID as mdadm prints it (`MD_UUID=`, mdadm.conf `UUID=`): four
+ * colon-separated groups of eight hex digits. THE identity of a band array —
+ * names (`<pool>-r<N>`) are a convention anyone can reuse; the UUID is what
+ * mdadm.conf pins and what an expansion intent records (story ident.3).
+ */
+export const MdUuid = z.string().regex(/^[0-9a-f]{8}(?::[0-9a-f]{8}){3}$/i, 'Invalid md array UUID')
+export type MdUuid = z.infer<typeof MdUuid>
+
+/**
  * One band array (one mdadm array per band). Arrays are named deterministically
  * `md/<pool>-r<band>` and are never renumbered, shrunk, or re-sliced — band
  * indices strictly append across the pool's life (§2.6 naming invariant).
@@ -213,6 +222,11 @@ export const AhrArray = z.object({
    * it (GT-2: kernel names reshuffle across operations and reboots).
    */
   kernelName: z.string().optional(),
+  /**
+   * The array's md UUID (story ident.3) — the identity the pool is matched on.
+   * Optional for the version-skew ruling: an older daemon omits it.
+   */
+  uuid: MdUuid.optional(),
 })
 export type AhrArray = z.infer<typeof AhrArray>
 
@@ -287,6 +301,16 @@ export const AhrExpansionIntent = z.object({
   /** Reachable capacity after the expansion (never fresh-ideal capacity). */
   after: AhrCapacity,
   state: AhrExpansionState,
+  /**
+   * The md UUIDs of the pool's band arrays when the intent was written (story
+   * ident.3). The intent file is keyed by pool NAME, and a name outlives its
+   * pool: an intent whose recorded arrays share no UUID with the live pool
+   * belongs to an earlier pool of the same name and reads as STALE — never as
+   * this pool's halted expansion. Absent on intents written before ident.3.
+   */
+  arrayUuids: z.array(MdUuid).optional(),
+  /** The pool VG's LVM UUID when the intent was written (same purpose). */
+  vgUuid: z.string().min(1).optional(),
 })
 export type AhrExpansionIntent = z.infer<typeof AhrExpansionIntent>
 
@@ -477,6 +501,8 @@ export const AhrPool = z.object({
     name: PoolName,
     sizeBytes: z.number().int().nonnegative(),
     freeBytes: z.number().int().nonnegative(),
+    /** LVM's VG UUID (story ident.3); absent when the VG is not present or on an older daemon. */
+    uuid: z.string().min(1).optional(),
   }),
   /** The one LV (`<pool>-vol`) carrying the btrfs filesystem. */
   lv: z.object({

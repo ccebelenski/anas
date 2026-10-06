@@ -466,6 +466,25 @@ describe('cache-detach — the step sequence (ahrcache.1, §13/GT-20/GT-22)', ()
     assert.deepEqual(result.released, [CACHE_DISK])
   })
 
+  it('a same-named slice that LVM counts in ANOTHER volume group is never touched (ident.3, audit #4)', async () => {
+    // A `<pool>-cache1` slice that is a PV of `media` — a pool of the same
+    // name moved in from another node. The label is a name; the VG is identity.
+    const world = new CacheWorld()
+    world.slice = true
+    world.pvsOverride = JSON.stringify({ report: [{ pv: [
+      { pv_name: '/dev/md127', vg_name: POOL, pv_size: '1065353216', pv_free: '0', dev_size: '1068433408' },
+      { pv_name: '/dev/sdd1', vg_name: 'media', pv_size: String(CACHE_PV_BYTES), pv_free: '0', dev_size: String(SLICE_BYTES) },
+    ] }] })
+    const progress: string[] = []
+
+    const result = await detachAhrCache(world, { pool: pool() }, m => progress.push(m))
+
+    for (const command of [VGREDUCE, PVREMOVE, WIPEFS, SGDISK])
+      assert.deepEqual(callsTo(world, command), [], `${command} must not run`)
+    assert.deepEqual(result.released, [])
+    assert.ok(progress.some(m => m.includes(CACHE_DISK) && m.includes(`volume group 'media'`)), progress.join(' | '))
+  })
+
   it('missing PV with every band PRESENT: --removemissing is taken (the live fixture shape)', async () => {
     const world = new CacheWorld()
     world.cached = true

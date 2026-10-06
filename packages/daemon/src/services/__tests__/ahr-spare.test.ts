@@ -1,6 +1,7 @@
 import type { AhrCapacity, AhrDisk, AhrPool, AhrPreviewBand, ArrayLevel } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -114,7 +115,20 @@ const DISK_PARTS: Record<string, { kernel: string, size: number, parts: PartSpec
   ] },
 }
 
+/**
+ * Pin tank's arrays in the mdadm.conf the daemon reads (story ident.3: a
+ * pool's arrays are its own by their PINNED UUIDs). Appends to a conf a test
+ * already pointed ANAS_MDADM_CONF at, else creates a fresh one.
+ */
+function pinConf(pins: [string, string][]): void {
+  const path = process.env.ANAS_MDADM_CONF ?? join(mkdtempSync(join(tmpdir(), 'anas-ahr-pins-')), 'mdadm.conf')
+  const existing = existsSync(path) ? readFileSync(path, 'utf-8') : ''
+  writeFileSync(path, existing + pins.map(([name, uuid]) => `ARRAY /dev/md/${name} metadata=1.2 UUID=${uuid}\n`).join(''))
+  process.env.ANAS_MDADM_CONF = path
+}
+
 function world(opts: { mdstat?: string | string[] } = {}): MockExecutor {
+  pinConf([['tank-r1', R1_UUID], ['tank-r2', R2_UUID], ['tank-r3', R3_UUID]])
   const executor = new MockExecutor()
   const mdstat = opts.mdstat ?? MDSTAT_BASE
   if (Array.isArray(mdstat))
@@ -407,6 +421,51 @@ describe('removeSpare (§11)', () => {
     ])
   })
 
+  it('REFUSES (touching nothing) when md has put a slice to work — a spare that took over a rebuild is a member (ident.3 (c))', async () => {
+    // X's band-1 member failed; md rebuilt onto the spare's slice (sdv1 lost
+    // its (S)), while the band-2 slice is still a spare. Removing "the spare"
+    // now would fail a data-bearing slot out of tank-r1.
+    const TOOK_OVER = `Personalities : [raid1] [raid5]
+md126 : active raid1 sdv2[2](S) sds2[1] sdr2[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+md127 : active raid5 sdv1[3] sds1[2] sdr1[1] sdq1[0](F)
+      4190208 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [_UU]
+      [=>...................]  recovery =  5.0% (104755/2095104) finish=3.0min speed=10240K/sec
+
+unused devices: <none>
+`
+    const executor = world({ mdstat: TOOK_OVER })
+    executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${SP}`), result: { stdout: diskJson('sdv', SIZE_3G, [
+      { name: 'sdv1', size: B1_INTERIOR, label: 'tank-d4-b1' },
+      { name: 'sdv2', size: B2_INTERIOR, label: 'tank-d4-b2' },
+    ]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+    await assert.rejects(
+      removeSpare(executor, { pool: mkPool({ spare: spareDisk }), diskId: SP }, noop, { log: () => {} }),
+      /no longer a hot spare: its slice is an active member of tank-r1/,
+    )
+    assert.deepEqual(executor.calls.filter(c => c.command === MDADM && c.args[0] !== '--detail'), [], 'no --remove, no --fail, no --zero-superblock')
+    assert.equal(executor.calls.filter(c => c.command === SGDISK).length, 0, 'no zap')
+  })
+
+  it('never --fails a slot that stopped being a spare between the check and the remove', async () => {
+    // The job's read sees sdv1 as (S); md's answer to --remove, and the re-read
+    // right before the --fail, see it put to work.
+    const executor = world({ mdstat: [MDSTAT_WITH_SPARE, MDSTAT_WITH_SPARE.replace('sdv1[3](S)', 'sdv1[3]')] })
+    executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${SP}`), result: { stdout: diskJson('sdv', SIZE_3G, [
+      { name: 'sdv1', size: B1_INTERIOR, label: 'tank-d4-b1' },
+      { name: 'sdv2', size: B2_INTERIOR, label: 'tank-d4-b2' },
+    ]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, args: ['/dev/md127', '--remove', `/dev/disk/by-id/${SP}-part1`], result: { stdout: '', stderr: 'mdadm: hot remove failed', exitCode: 1 } })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+    await assert.rejects(
+      removeSpare(executor, { pool: mkPool({ spare: spareDisk }), diskId: SP }, noop, { log: () => {} }),
+      /no longer a spare — refusing to fail it/,
+    )
+    assert.ok(!executor.calls.some(c => c.command === MDADM && c.args[1] === '--fail'))
+  })
+
   it('clears stale (S) slots with --remove detached when the spare device itself is absent', async () => {
     const executor = world({ mdstat: MDSTAT_WITH_SPARE })
     // No lsblk fixture for SP → readDiskTree returns null (device gone).
@@ -472,6 +531,8 @@ describe('expansion coupling (§11 — array-create extends every covering spare
     executor.addFixture({ command: LSBLK, args: diskLsblkArgs('/dev/disk/by-id/ata-TANK_W'), result: { stdout: diskJson('sdt', SIZE_4G, parts4('sdt', 5)), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: LSBLK, args: diskLsblkArgs('/dev/disk/by-id/ata-TANK_V'), result: { stdout: diskJson('sdu', SIZE_4G, parts4('sdu', 6)), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md125'], result: { stdout: exportFor('tank-r3', 'raid1', 2, R3_UUID), stderr: '', exitCode: 0 } })
+    // ident.3: the new array's UUID is read from the device just created.
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md/tank-r3'], result: { stdout: exportFor('tank-r3', 'raid1', 2, R3_UUID), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/update-initramfs', result: { stdout: '', stderr: '', exitCode: 0 } })
     // The attached spare: bands 1+2 carved, band 3 missing → carved on demand.

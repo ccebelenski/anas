@@ -7,7 +7,7 @@ import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { AhrLayoutPreviewRequest, isComposableDisk, PoolName } from '@anas/shared'
 import { withAhrCreateStatus } from '../services/ahr-create-status.js'
-import { readIntent } from '../services/ahr-intent.js'
+import { readPoolIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, planFreshLayout } from '../services/ahr-layout.js'
 import { readAhrPools, withExpansionIntent } from '../services/ahr-topology.js'
 import { createIscsiClaimCache, heldByLun } from '../services/iscsi-held.js'
@@ -74,7 +74,9 @@ export async function ahrRoutes(
   // surface it properly on use.
   const withIntent = async (pool: AhrPool): Promise<AhrPool> => {
     try {
-      const intent = await readIntent(pool.name, intentDir)
+      // Only THIS pool's intent is attached: one an earlier pool of the same
+      // name left behind reads as stale, never as a halted expansion (ident.3).
+      const { intent } = await readPoolIntent(pool, intentDir)
       return withAhrCreateStatus(withExpansionIntent(pool, intent), jobQueue)
     }
     catch {

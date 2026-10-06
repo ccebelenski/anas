@@ -1,11 +1,14 @@
 import type { AhrPool } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { LvmPv } from '../parsers/lvm-report.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
+import { parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { cachedVgNames, notifyCacheRecoveryFailed, recoverFailedAhrCache } from './ahr-cache.js'
 import { resumeExpansion } from './ahr-expand-resume.js'
+import { isIntentStale, isOwnedArray, normalizeMdUuid, pinnedUuids, poolPvNames, readAhrPoolIdentity, readMdadmConfDoc } from './ahr-identity.js'
 import { defaultAhrIntentDir, listIntents, writeIntent } from './ahr-intent.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { readAhrPools } from './ahr-topology.js'
@@ -70,6 +73,8 @@ const CAT = '/usr/bin/cat'
 const MDADM = '/usr/sbin/mdadm'
 const VGCHANGE = '/usr/sbin/vgchange'
 const MOUNT = '/usr/bin/mount'
+const PVS = '/usr/sbin/pvs'
+const VGS = '/usr/sbin/vgs'
 
 /** Synthetic identity for a boot-time re-attach's driving job (audit-traceable). */
 const BOOT_IDENTITY = { user: 'system:boot-reattach', uid: 0 } as const
@@ -87,6 +92,8 @@ export interface BootScanOptions {
   jobQueue?: JobQueue
   /** Disk-identity cache the shared resume core needs to resolve NEW disks. */
   diskCache?: DiskIdentityCache
+  /** mdadm.conf override (else ANAS_MDADM_CONF / the Debian default) — the pins the ladder is gated on. */
+  mdadmConfPath?: string
 }
 
 export interface BootScanReport {
@@ -100,6 +107,11 @@ export interface BootScanReport {
   reattached: string[]
   /** Healthy in-flight reshapes observed (re-attached, nothing issued). */
   observedReshapes: string[]
+  /**
+   * Pools whose intent recorded a DIFFERENT pool's identity (story ident.3) —
+   * an earlier pool of the same name. Left alone: never halted, never driven.
+   */
+  staleIntents: string[]
 }
 
 /**
@@ -120,7 +132,7 @@ function haltBody(pool: string, reason?: string): string {
 export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptions = {}): Promise<BootScanReport> {
   const intentDir = opts.intentDir ?? defaultAhrIntentDir()
   const log = opts.log ?? ((line: string) => process.stdout.write(`${line}\n`))
-  const report: BootScanReport = { recovered: [], cacheRecovered: [], haltedIntents: [], reattached: [], observedReshapes: [] }
+  const report: BootScanReport = { recovered: [], cacheRecovered: [], haltedIntents: [], reattached: [], observedReshapes: [], staleIntents: [] }
 
   // Per-pool array health, folded across every AHR array seen in the md view.
   // A pool is re-attach-eligible only if it was SEEN and EVERY one of its
@@ -133,16 +145,46 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
   }
 
   // ---- (a) + (c): the md view ---------------------------------------------
+  // Identity first (story ident.3, identity audit #5): a `<pool>-r<N>` NAME
+  // proves nothing — a hand-built `media-r1` mirror, or an ANAS pool moved in
+  // from another node, carries the same name. The ladder FORCE-STARTS an array
+  // (`mdadm --run` drops whatever member is missing), so it runs only on an
+  // array whose UUID is pinned for its pool in mdadm.conf. Health accounting
+  // for the (b) re-attach gate counts only the pool's own arrays too (pinned,
+  // or a PV of its VG — the shared rule). Both reads fail closed: an
+  // unreadable conf pins nothing, an unreadable `pvs` claims nothing.
+  // LVM is asked only for an array the pins do not already vouch for (most
+  // boots: none), and at most once.
+  const confDoc = await readMdadmConfDoc(opts.mdadmConfPath)
+  let lvm: { pvs: LvmPv[], vgNames: Set<string> } | null = null
+  const lvmFacts = async (): Promise<{ pvs: LvmPv[], vgNames: Set<string> }> => {
+    if (!lvm) {
+      const pvsRes = await executor.exec(PVS, PVS_ARGS)
+      const vgsRes = await executor.exec(VGS, VGS_ARGS)
+      lvm = {
+        pvs: pvsRes.exitCode === 0 ? parsePvsReport(pvsRes.stdout) : [],
+        vgNames: new Set(vgsRes.exitCode === 0 ? parseVgsReport(vgsRes.stdout).map(v => v.name) : []),
+      }
+    }
+    return lvm
+  }
   const mdstatRes = await executor.exec(CAT, MDSTAT_CAT_ARGS)
   if (mdstatRes.exitCode === 0) {
     const vgActivated = new Set<string>()
     for (const md of parseMdstat(mdstatRes.stdout)) {
-      const detailRes = await executor.exec(MDADM, mdadmDetailExportArgs(`/dev/${md.kernelName}`))
-      const named = matchAhrArrayName(parseMdadmDetailExport(detailRes.stdout).name
-        ?? parseMdadmDetailExport(detailRes.stdout).devName ?? '')
+      const detail = parseMdadmDetailExport((await executor.exec(MDADM, mdadmDetailExportArgs(`/dev/${md.kernelName}`))).stdout)
+      const named = matchAhrArrayName(detail.name ?? detail.devName ?? '')
       if (!named)
         continue // foreign array — not ours to touch (guest philosophy)
       const label = `${named.pool}-r${named.band}`
+      const pinned = pinnedUuids(confDoc, named.pool)
+      const facts = { pool: named.pool, band: named.band, uuid: detail.uuid, kernelName: md.kernelName }
+      const vouched = detail.uuid !== null && pinned.has(normalizeMdUuid(detail.uuid))
+      const owned = vouched || await lvmFacts().then(f => isOwnedArray(facts, pinned, poolPvNames(f.pvs, named.pool), f.vgNames.has(named.pool)))
+      if (!owned) {
+        log(`ahr.boot array=${label} kernel=${md.kernelName} uuid=${detail.uuid ?? 'unknown'} action=ignored reason=not-pinned-not-in-vg`)
+        continue
+      }
 
       // Classify this array's health for the (b) re-attach gate. Inactive OR
       // count-degraded (activeDevices < raidDevices) OR any faulted member ⇒
@@ -152,7 +194,13 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
       noteArrayHealth(named.pool, md.active && !countDegraded && !faulted)
 
       if (!md.active && md.members.length > 0 && md.members.every(m => m.spare)) {
-        // (a) GT-8: inactive, all-spares. Drive the verified ladder.
+        // (a) GT-8: inactive, all-spares. Drive the verified ladder — but only
+        // on a PINNED array: a PV-of-VG proof needs the array active, and an
+        // unpinned inactive array is exactly the shape a foreign one has.
+        if (detail.uuid === null || !pinned.has(normalizeMdUuid(detail.uuid))) {
+          log(`ahr.boot array=${label} state=inactive-all-spares action=skipped reason=not-pinned`)
+          continue
+        }
         log(`ahr.boot array=${label} state=inactive-all-spares action=recovery-ladder`)
         const run = await executor.exec(MDADM, ['--run', `/dev/${md.kernelName}`])
         if (run.exitCode !== 0) {
@@ -286,6 +334,18 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
   for (const { pool, intent } of await listIntents(intentDir)) {
     if (intent.state !== 'running')
       continue
+
+    // An intent that recorded another pool's identity is that pool's — a
+    // destroy-then-recreate under the same name (story ident.3). It is never
+    // this pool's halted expansion and never drives this pool's disks.
+    if (intent.arrayUuids?.length || intent.vgUuid) {
+      const identity = await readAhrPoolIdentity(executor, pool, { mdadmConfPath: opts.mdadmConfPath, withVgUuid: true }).catch(() => null)
+      if (identity && isIntentStale(intent, identity)) {
+        log(`ahr.boot pool=${pool} intent=${intent.id} state=running action=ignored reason=stale-identity`)
+        report.staleIntents.push(pool)
+        continue
+      }
+    }
 
     const eligible = poolHealthy.get(pool) === true && !!opts.jobQueue && !!opts.diskCache
     if (!eligible) {

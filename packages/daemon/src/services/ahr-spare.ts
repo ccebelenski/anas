@@ -1,6 +1,8 @@
 import type { AhrPool, AhrPreviewBand } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { DiskIdentityCache } from './disk-identity-cache.js'
 import { clearGhostMdSignatures } from './ahr-create.js'
+import { requireComposableNow } from './ahr-disk-recheck.js'
 import { run } from './ahr-exec.js'
 import { addSpareSlice, ensureDiskPartitions, projectExistingBands, readDiskTree, removeDetachedFaultySlots, resolveAhrArrays } from './ahr-expand-exec.js'
 import { floorToGranularity, fmtBytes } from './ahr-layout.js'
@@ -126,6 +128,12 @@ export interface SpareAttachInput {
 export interface SpareOptions {
   /** Structured log sink (default console — journald, §7.1). */
   log?: (line: string) => void
+  /**
+   * The disk inventory's identity cache. When given (the route always gives
+   * it), attach re-checks that the disk is STILL available inside the job,
+   * before the first wipe (story ident.3 (a)).
+   */
+  diskCache?: DiskIdentityCache
 }
 
 /**
@@ -156,6 +164,11 @@ export async function attachSpare(
   const coverage = spareCoverage(bands.at(-1)!.range.endBytes, input.diskSizeBytes)
   if (!coverage.ok)
     throw new Error(spareShortfallMessage(diskId, coverage))
+
+  // Job-time availability re-check (story ident.3 (a)): the request may have
+  // queued for hours, and the disk may have become someone else's since.
+  if (opts.diskCache)
+    await requireComposableNow(executor, opts.diskCache, [diskId])
 
   const arrays = await resolveAhrArrays(executor, pool.name)
   for (const band of bands) {
@@ -211,11 +224,39 @@ export async function attachSpare(
 // ---- Remove (DELETE /v1/ahr/:name/spare/:id) ---------------------------------
 
 /**
+ * The bands in which `diskId`'s slice is an ACTIVE member right now — not a
+ * spare. mdstat's `(S)` flag is the only truth, and only on an ACTIVE array:
+ * an inactive array lists EVERY member `(S)` (GT-8), real members included.
+ * A spare that md has already used for a rebuild has no `(S)` any more; it IS
+ * a member, and removing it would fail a data-bearing slot (identity audit #7).
+ */
+export function activeMemberBands(
+  arrays: Map<number, { md: { active: boolean, members: { device: string, spare: boolean, faulty: boolean }[] } }>,
+  partKernels: Set<string>,
+): number[] {
+  const out: number[] = []
+  for (const [band, arr] of arrays) {
+    const member = arr.md.members.find(m => partKernels.has(m.device))
+    // A FAULTY slot is not an active member either: md already dropped it
+    // from the stripe, and only `--remove` (never `--fail`) touches it below.
+    if (member && (!arr.md.active || (!member.spare && !member.faulty)))
+      out.push(band)
+  }
+  return out.sort((a, b) => a - b)
+}
+
+/**
  * Remove a hot spare (§11): detach its slice from every band array
  * (`--remove`, with a `--fail` first when md insists), zero its md
  * superblocks, and zap its GPT — the disk returns to the available pool.
  * When the spare device itself is ABSENT (died/pulled), its stale `(S)`
  * slots are cleared with `--remove detached` and there is nothing to zap.
+ *
+ * Acts ONLY on slices mdstat flags `(S)` on an active array AT JOB TIME (story
+ * ident.3 (c)). The route refused an active member when the request arrived;
+ * a member can fail and the spare take over the rebuild while the job waits,
+ * so the job asks md again and refuses — touching nothing — when any slice of
+ * the disk is no longer a spare.
  */
 export async function removeSpare(
   executor: CommandExecutor,
@@ -248,16 +289,33 @@ export async function removeSpare(
   }
 
   const partNumbers = new Map(tree.parts.filter(p => p.number !== null).map(p => [p.name, p.number!]))
+  const active = activeMemberBands(arrays, new Set(partNumbers.keys()))
+  if (active.length > 0) {
+    throw new Error(
+      `disk '${diskId}' is no longer a hot spare: its slice is an active member of ${active.map(b => `${pool.name}-r${b}`).join(', ')} `
+      + `(md used it for a rebuild). Nothing was removed — a member leaves the pool only through Replace`,
+    )
+  }
   // eslint-disable-next-line e18e/prefer-array-to-sorted -- toSorted() is ES2023; this package targets ES2022 (no such lib member)
   for (const [band, arr] of [...arrays.entries()].sort((a, b) => a[0] - b[0])) {
     const member = arr.md.members.find(m => partNumbers.has(m.device))
-    if (!member)
+    if (!member || (!member.spare && !member.faulty))
       continue
     const partPath = `${byIdPath(diskId)}-part${partNumbers.get(member.device)}`
     updateProgress(`Removing spare slice from ${pool.name}-r${band}`)
     const removed = await executor.exec(MDADM, [arr.dev, '--remove', partPath])
+    if (removed.exitCode !== 0 && member.faulty) {
+      // Already failed: --remove is the only verb a faulty slot takes.
+      throw new Error(`could not remove the failed slot ${partPath} from ${pool.name}-r${band}: ${removed.stderr.trim() || `mdadm exited ${removed.exitCode}`}`)
+    }
     if (removed.exitCode !== 0) {
       // md wants the slot failed first (§11: --remove after --fail as needed).
+      // `--fail` is the one verb here that can hurt: on a slot that stopped
+      // being a spare a moment ago it fails a data-bearing member. So md is
+      // asked once more, right before it, and anything but `(S)` refuses.
+      const now = (await resolveAhrArrays(executor, pool.name)).get(band)
+      if (!now || activeMemberBands(new Map([[band, now]]), new Set([member.device])).length > 0)
+        throw new Error(`the slice of '${diskId}' in ${pool.name}-r${band} is no longer a spare — refusing to fail it; nothing more was removed`)
       await executor.exec(MDADM, [arr.dev, '--fail', partPath])
       await run(executor, MDADM, [arr.dev, '--remove', partPath])
     }

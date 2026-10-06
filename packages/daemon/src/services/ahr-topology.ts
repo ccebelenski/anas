@@ -22,16 +22,14 @@ import { parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { dmsetupStatusArgs, parseDmsetupStatus } from '../parsers/dmsetup.js'
 import { optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { lvIsActive, lvIsCacheTarget, LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
-import { hasArray, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { buildAhrCacheState, cacheFailedAdvisory, foreignVgPvAdvisory } from './ahr-cache-state.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
-import { readIntent } from './ahr-intent.js'
+import { canonicalMdUuid, isOwnedArray, pinnedUuids, poolPvNames, readMdadmConfDoc } from './ahr-identity.js'
+import { readPoolIntent } from './ahr-intent.js'
 import { AHR_MIN_DISKS, floorToGranularity, isPvUnderSized } from './ahr-layout.js'
-import { DEFAULT_MDADM_CONF } from './ahr-mdadm-conf.js'
 import { isSubvolLayoutMount } from './ahr-snapshots.js'
-import { readConfig } from './config-writer.js'
 
 /**
  * AHR pool topology reader (Epic 11 + AHR, docs/AHR-DESIGN.md §3/§5.3).
@@ -129,6 +127,8 @@ export interface PartInfo {
   name: string
   size: number
   partlabel: string | null
+  /** udev's signature verdict (`linux_raid_member`, `LVM2_member`, …), null when it saw none. */
+  fstype: string | null
   disk: DiskInfo
   partNumber: number | null
 }
@@ -178,6 +178,7 @@ export function indexLsblk(json: string): LsblkIndex {
         name: node.name,
         size: node.size ?? 0,
         partlabel: node.partlabel ?? null,
+        fstype: node.fstype || null,
         disk,
         partNumber: num ? Number.parseInt(num[1], 10) : null,
       })
@@ -501,9 +502,7 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
   // ownership marker (§2.6, config-is-the-API). Read fail-open: an unreadable
   // conf means "no pins", which only ever makes ownership STRICTER (a pool
   // then needs its VG to be claimed) — never looser.
-  const mdadmConfDoc = parseMdadmConfDoc(
-    await readConfig(mdadmConfPath ?? process.env.ANAS_MDADM_CONF ?? DEFAULT_MDADM_CONF).catch(() => ''),
-  )
+  const mdadmConfDoc = await readMdadmConfDoc(mdadmConfPath)
 
   // Group arrays by pool, bands ascending.
   const byPool = new Map<string, DiscoveredArray[]>()
@@ -532,14 +531,33 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     //       genuinely FAILED ANAS pool (VG gone) still visible/reportable.
     // A name-collision array with NEITHER is foreign: ignored (a log line at
     // most), never reported.
+    //
+    // And the evidence is per ARRAY, not per name (story ident.3, identity
+    // audit #4): a same-named array from another pool — a foreign `media-r1`
+    // beside an ANAS pool `media`, or a disk moved in from another node — used
+    // to MERGE into this pool as a second band 1, and every verb downstream
+    // then acted on its members. Only arrays whose UUID is pinned for the pool,
+    // or that are PVs of its VG, are the pool's ({@link isOwnedArray}, the ONE
+    // rule destroy, the boot ladder and the expansion executor also use).
     const vg = vgs.find(v => v.name === poolName)
-    const pinned = arrayEntries.some(e => e.detail.uuid !== null && hasArray(mdadmConfDoc, e.detail.uuid))
-    if (!vg && !pinned) {
+    const pinnedSet = pinnedUuids(mdadmConfDoc, poolName)
+    const vgPvs = poolPvNames(pvs, poolName)
+    const ownedEntries = arrayEntries.filter(e => isOwnedArray(
+      { pool: poolName, band: e.band, uuid: e.detail.uuid, kernelName: e.mdstat.kernelName },
+      pinnedSet,
+      vgPvs,
+      vg !== undefined,
+    ))
+    const foreignCount = arrayEntries.length - ownedEntries.length
+    if (foreignCount > 0) {
       process.stderr.write(
-        `ahr.topology: ignoring foreign md array(s) named '${poolName}-r*' — no LVM VG and not pinned in mdadm.conf; not an ANAS pool\n`,
+        `ahr.topology: ignoring ${foreignCount} md array(s) named '${poolName}-r*' — not pinned for the pool in mdadm.conf and not a PV of its VG; not this pool's\n`,
       )
-      continue
     }
+    if (ownedEntries.length === 0)
+      continue
+    arrayEntries.length = 0
+    arrayEntries.push(...ownedEntries)
 
     const advisories: string[] = []
 
@@ -651,6 +669,9 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
         ...(sync ? { sync } : {}),
         // Transient convenience only — never persisted or keyed on (GT-2).
         kernelName: entry.mdstat.kernelName,
+        // The identity the pool is matched on (story ident.3) — what an
+        // expansion intent records and a destroy confirm is bound to.
+        ...(canonicalMdUuid(entry.detail.uuid) ? { uuid: canonicalMdUuid(entry.detail.uuid)! } : {}),
       }
     })
 
@@ -964,6 +985,7 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
         name: poolName,
         sizeBytes: vg?.sizeBytes ?? 0,
         freeBytes: vg?.freeBytes ?? 0,
+        ...(vg?.uuid ? { uuid: vg.uuid } : {}),
       },
       lv: {
         name: lvName,
@@ -1128,7 +1150,7 @@ export async function collectAhrWarnings(
     const pools = await readAhrPools(executor)
     const withIntents = await Promise.all(pools.map(async (pool): Promise<AhrPool> => {
       try {
-        const intent = await readIntent(pool.name, intentDir)
+        const { intent } = await readPoolIntent(pool, intentDir)
         return decorate(withExpansionIntent(pool, intent))
       }
       catch {

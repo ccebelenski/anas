@@ -335,11 +335,14 @@ describe('AHR hot-spare routes (story 11.11)', () => {
       assert.equal(res.statusCode, 404)
     })
 
-    it('400 when the disk is a MEMBER, not a spare', async () => {
+    it('409 when the disk is an active MEMBER, not a spare — no confirm code is minted (ident.3 (c))', async () => {
       await build({ spareAttached: true })
       const res = await server.inject({ method: 'DELETE', url: `/v1/ahr/tank/spare/${X}`, headers: IDENTITY_HEADERS })
-      assert.equal(res.statusCode, 400)
-      assert.match(res.json().error.message, /is a MEMBER/)
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.json().error.code, 'CONFLICT')
+      assert.match(res.json().error.message, /active MEMBER/)
+      assert.match(res.json().error.message, /tank-r1/)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
     })
 
     it('409 confirm (headroom drops), then 202 and a completing remove job', async () => {

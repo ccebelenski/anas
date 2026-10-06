@@ -5,7 +5,9 @@ import type { AhrExpansionPlan, AhrLayoutDisk, AhrReplacement } from './ahr-layo
 import type { DiskIdentityCache } from './disk-identity-cache.js'
 import { isComposableDisk } from '@anas/shared'
 import { collectDisks } from '../routes/disks.js'
-import { executeExpansion, executeReplace, projectExistingBands, pvCatchUpSteps, syncCompletionSteps, syncingAhrBands, underSizedPvBands } from './ahr-expand-exec.js'
+import { executeExpansion, executeReplace, projectExistingBands, pvCatchUpSteps, readDiskTree, syncCompletionSteps, syncingAhrBands, underSizedPvBands } from './ahr-expand-exec.js'
+import { matchPartitionLabel } from './ahr-geometry.js'
+import { classifyPartition, readAhrPoolIdentity } from './ahr-identity.js'
 import { AhrIntentConflictError, writeIntent } from './ahr-intent.js'
 import { AhrPlanError, existingLayoutUsableBytes, planExpansion } from './ahr-layout.js'
 import { spareCoverageWarnings } from './ahr-spare.js'
@@ -45,11 +47,39 @@ export interface PlanBundle {
 }
 
 /**
+ * Why a disk that is NOT available may still be driven by a resume, or the
+ * problem when it may not (story ident.3 (d), identity audit #6).
+ *
+ * A resume legitimately meets a disk that is no longer `available`: the
+ * expansion it continues may already have partitioned it (`<pool>-d<n>-b<band>`
+ * slices) or added a slice to a band. What it must never meet is a disk that
+ * became something else while the expansion sat halted — a Ceph OSD, a ZFS
+ * vdev, another pool's member — because the next pass writes a GPT over it. So
+ * the disk passes only when it carries at least one partition, every partition
+ * carries THIS pool's member label, and every md superblock inside them is one
+ * of the pool's own arrays (or there is none yet).
+ */
+async function halfJoinedProblem(executor: CommandExecutor, pool: AhrPool, id: string, status: string): Promise<string | null> {
+  const refused = `disk '${id}' is no longer available (status: ${status}) and does not carry only this expansion's own '${pool.name}' slices — it may have been reused while the expansion was halted`
+  const tree = await readDiskTree(executor, `/dev/disk/by-id/${id}`)
+  if (!tree || tree.parts.length === 0)
+    return refused
+  if (tree.parts.some(p => p.partlabel === null || matchPartitionLabel(pool.name, p.partlabel) === null || p.number === null))
+    return refused
+  const identity = await readAhrPoolIdentity(executor, pool.name)
+  for (const part of tree.parts) {
+    if (await classifyPartition(executor, identity, `/dev/disk/by-id/${id}-part${part.number}`) === 'foreign')
+      return refused
+  }
+  return null
+}
+
+/**
  * Assemble the approved disk set with sizes: current members resolve from the
  * pool itself; disks NEW to the pool resolve from the live inventory.
  * `requireAvailable` enforces the GT-12 safety exclusions for disks being
- * brought in fresh; resume relaxes it (a half-joined disk is no longer
- * 'available' but is still the operator's approved disk).
+ * brought in fresh; resume relaxes it ONLY for a disk the expansion itself
+ * half-joined — see {@link halfJoinedProblem} (story ident.3 (d)).
  */
 export async function resolveApproved(
   executor: CommandExecutor,
@@ -82,6 +112,16 @@ export async function resolveApproved(
         ? `disk '${id}' is hands-off: ${inv.handsOffReason ?? inv.handsOff}`
         : `disk '${id}' is not available (status: ${inv.status}${inv.poolName ? `, pool '${inv.poolName}'` : ''})`)
       continue
+    }
+    if (!requireAvailable && !isComposableDisk(inv)) {
+      // Resume: re-check that the disk is still the one the expansion took.
+      const problem = inv.handsOff
+        ? `disk '${id}' is hands-off: ${inv.handsOffReason ?? inv.handsOff}`
+        : await halfJoinedProblem(executor, pool, id, `${inv.status}${inv.poolName ? `, pool '${inv.poolName}'` : ''}`)
+      if (problem !== null) {
+        problems.push(problem)
+        continue
+      }
     }
     approved.push({ id, usableBytes: inv.size, logicalSectorSize: inv.logicalSectorSize })
   }

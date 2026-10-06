@@ -1,7 +1,8 @@
-import type { AhrExpansionState } from '@anas/shared'
+import type { AhrExpansionState, AhrPool } from '@anas/shared'
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { AhrExpansionIntent, PoolName } from '@anas/shared'
+import { isIntentStaleForPool } from './ahr-identity.js'
 import { withFileLock } from './file-lock.js'
 
 /**
@@ -68,6 +69,32 @@ export async function readIntent(pool: string, dir: string = defaultAhrIntentDir
   if (!parsed.success)
     throw new Error(`AHR intent file for pool '${pool}' is invalid: ${parsed.error.issues[0]?.message}`)
   return parsed.data
+}
+
+/** A pool's intent, split by whose it is (story ident.3). */
+export interface PoolIntent {
+  /** The intent of THIS pool, or null. */
+  intent: AhrExpansionIntent | null
+  /**
+   * An intent filed under this pool's NAME that recorded a different pool's
+   * identity (an earlier pool, destroyed and recreated under the same name).
+   * Never this pool's expansion: never halted, never resumed, never a reason
+   * to refuse a verb. Overwritten by the next expansion, removed by destroy.
+   */
+  stale: AhrExpansionIntent | null
+}
+
+/**
+ * Read the intent filed under `pool.name` and decide whose it is — the ONE
+ * place a consumer asks "does this pool have an expansion?" (story ident.3).
+ * The file is keyed by name, and a name outlives its pool; the UUIDs the
+ * intent recorded are what tell the two apart ({@link isIntentStaleForPool}).
+ */
+export async function readPoolIntent(pool: Pick<AhrPool, 'name' | 'arrays' | 'vg'>, dir: string = defaultAhrIntentDir()): Promise<PoolIntent> {
+  const intent = await readIntent(pool.name, dir)
+  if (intent && isIntentStaleForPool(intent, pool))
+    return { intent: null, stale: intent }
+  return { intent, stale: null }
 }
 
 /**

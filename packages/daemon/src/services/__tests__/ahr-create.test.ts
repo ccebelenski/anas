@@ -102,6 +102,10 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
 
     assert.deepEqual(result, { created: 't2', mountpoint: join(mountBase, 't2'), arrays: ['t2-r1'] })
     assert.deepEqual(executor.calls, [
+      // Job-time name re-check (ident.3): no live `t2-r<N>` array, no pin, no
+      // `t2-*` partition label — read before the first destructive command.
+      { command: '/usr/bin/cat', args: ['/proc/mdstat'] },
+      { command: '/usr/bin/lsblk', args: ['-J', '-o', 'NAME,PARTLABEL'] },
       // wipe + partition, ascending size order (§2.1); only the protected
       // band gets a slice (§2.6) — BIG's 2–3 GiB region stays raw.
       { command: '/usr/sbin/wipefs', args: ['-a', `/dev/disk/by-id/${SMALL}`] },
@@ -137,11 +141,13 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
         `/dev/disk/by-id/${SMALL}-part1`,
         `/dev/disk/by-id/${BIG}-part1`,
       ] },
-      // The fresh array is wiped before ANYTHING reads it (issue #17): stale
-      // LVM PV labels sit at the md data offset, INSIDE the member partitions.
-      { command: '/usr/sbin/wipefs', args: ['-a', '/dev/md/t2-r1'] },
-      // Pin (UUID read) THEN initramfs (ARRAY_PIN_REQUIRES_INITRAMFS).
+      // The array's identity, read at once from the device just created
+      // (ident.3) — a rollback before the pin still knows which array is ours.
       { command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/t2-r1'] },
+      // The fresh array is wiped before ANYTHING ELSE reads it (issue #17):
+      // stale LVM PV labels sit at the md data offset, INSIDE the members.
+      { command: '/usr/sbin/wipefs', args: ['-a', '/dev/md/t2-r1'] },
+      // Pin THEN initramfs (ARRAY_PIN_REQUIRES_INITRAMFS).
       { command: '/usr/sbin/update-initramfs', args: ['-u'] },
       // Every LVM call carries allow_mixed_block_sizes (issue #8): AHR bands
       // legitimately differ in logical block size on mixed media, and LVM

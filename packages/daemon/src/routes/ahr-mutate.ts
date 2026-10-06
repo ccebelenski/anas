@@ -16,6 +16,8 @@ import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
 import { confirmGate } from '../safety/gate.js'
 import { changeAhrMountpoint, createAhrPool, remountAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
+import { ahrNameOccupancy, isIntentStaleForPool } from '../services/ahr-identity.js'
+import { defaultAhrIntentDir, readIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
 import { mirrorReconcileArray, mirrorReconcileArrayRefusal, mirrorReconcileEvidence, mirrorReconcileWarnings, reconcileMirrorBand } from '../services/ahr-mirror-reconcile.js'
 import { parityRewriteArray, parityRewriteArrayRefusal, parityRewriteEvidence, parityRewriteWarnings, rewriteBandParity } from '../services/ahr-parity-rewrite.js'
@@ -328,6 +330,46 @@ export interface AhrMutationRouteOptions {
    * default; overridable so a test never reads the kernel.
    */
   iscsiPaths?: IscsiPaths
+  /**
+   * AhrExpansionIntent store directory (else ANAS_AHR_INTENT_DIR /
+   * /etc/anas/ahr). Destroy refuses while an intent is running and clears it
+   * with the pool; create clears an orphan left under the new name (ident.3).
+   */
+  intentDir?: string
+}
+
+/**
+ * Every AHR job operation (story ident.3 (d)). Destroy refuses while ANY of
+ * them is queued or running on the pool: a scrub, a spare add, an expansion or
+ * a snapshot that is dequeued after the pool is gone acts on whatever carries
+ * the name by then. Each family names its pool under `name` or `pool`.
+ */
+const AHR_JOB_OPERATIONS = [
+  'ahr.create',
+  'ahr.destroy',
+  'ahr.mountpoint',
+  'ahr.remount',
+  'ahr.scrub',
+  'ahr.repair',
+  'ahr.parity-rewrite',
+  'ahr.mirror-reconcile',
+  'ahr.expand',
+  'ahr.expand.resume',
+  'ahr.expand.abandon',
+  'ahr.replace',
+  'ahr.readd',
+  'ahr.spare.add',
+  'ahr.spare.remove',
+  'ahr.cache.attach',
+  'ahr.cache.detach',
+  'ahr.snapshot.create',
+  'ahr.snapshot.delete',
+  'ahr.snapshot.rollback',
+] as const
+
+/** The pool's array UUIDs, sorted — what a destroy confirm is bound to and the job re-checks. */
+function poolArrayUuids(pool: AhrPool): string[] {
+  return pool.arrays.map(a => a.uuid ?? `unknown:${a.band}`).sort()
 }
 
 /**
@@ -348,6 +390,7 @@ export interface AhrMutationRouteOptions {
 export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutationRouteOptions) {
   const { executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase, kernelRelease } = opts
   const iscsiPaths = opts.iscsiPaths ?? {}
+  const intentDir = opts.intentDir ?? defaultAhrIntentDir()
 
   /**
    * A scrub or a repair already in flight on this pool, or null.
@@ -419,6 +462,17 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (existingVgs.some(v => v.name === req.name)) {
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `an LVM volume group named '${req.name}' already exists. The pool name becomes its VG name, so vgcreate would fail after the disks were wiped. Choose another name` } }
+    }
+
+    // Name occupancy (story ident.3, identity audit #4): a live md array named
+    // `<name>-r<N>` (anyone's), an mdadm.conf pin, or a partition labelled for
+    // the name would make the new pool's identity ambiguous from its first
+    // minute — the merge the topology read and destroy now refuse. 409 before
+    // the confirm; the job asks again before the first wipe.
+    const occupied = await ahrNameOccupancy(executor, req.name, { mdadmConfPath })
+    if (occupied.length > 0) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `the name '${req.name}' is already in use on this node: ${occupied.join('; ')}. Choose another name` } }
     }
 
     // Mountpoint override (§2.6): never in PVE's namespace, never a path that
@@ -516,7 +570,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         executor,
         { name: req.name, tier: req.tier, disks: selected, mountpoint: req.mountpoint },
         updateProgress,
-        { fstabPath, mdadmConfPath, mountBase },
+        // diskCache: the job re-checks every disk is STILL available before
+        // the first wipe (ident.3 (a)); intentDir: an orphan intent under the
+        // new name is cleared before anything is built (ident.3 (d)).
+        { fstabPath, mdadmConfPath, mountBase, diskCache: diskIdentityCache, intentDir },
       ),
     )
     reply.code(202)
@@ -705,6 +762,21 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
     }
 
+    // Story ident.3 (d): nothing may still be working on the pool. A queued or
+    // running AHR job would be dequeued against whatever carries the name once
+    // this pool is gone — a recreated pool, or nothing at all — and a running
+    // expansion is mid-reshape on these very arrays. Hard 409, no confirm.
+    const busy = jobQueue.findActive(AHR_JOB_OPERATIONS, name, 'name') ?? jobQueue.findActive(AHR_JOB_OPERATIONS, name, 'pool')
+    if (busy) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' has a ${busy.operation} job in flight (job ${busy.id}). Wait for it to finish (or cancel it) before destroying the pool` } }
+    }
+    const liveIntent = await readIntent(name, intentDir).catch(() => null)
+    if (liveIntent?.state === 'running' && !isIntentStaleForPool(liveIntent, pool)) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' has an expansion being driven right now. Wait for it to finish or halt before destroying the pool` } }
+    }
+
     // Story iscsi.6: a LUN's image file on this pool makes the destroy unsafe
     // NOW — every array, partition and byte goes, including the file LIO is
     // serving, and nothing in ZFS/btrfs/md is going to refuse it. Hard 409, no
@@ -748,9 +820,13 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       warnings.push('ANAS could not check whether an iSCSI LUN is served from this pool. The LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
     }
 
+    // The confirm is bound to the pool's IDENTITY (its array UUIDs), not just
+    // its name (identity audit P1): a code minted for this pool cannot destroy
+    // a different pool that carries the name by the time it is replayed.
+    const confirmedUuids = poolArrayUuids(pool)
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'ahr.destroy',
-      params: { name },
+      params: { name, arrays: confirmedUuids },
       message: `Destroying AHR pool '${name}' erases all of its data`,
       warnings,
     })) {
@@ -760,7 +836,16 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const job = jobQueue.submit(
       'ahr.destroy',
       { ...identity, params: { name } },
-      async updateProgress => destroyAhrPool(executor, pool, updateProgress, { fstabPath, mdadmConfPath }),
+      async (updateProgress) => {
+        // Job-time re-read (ident.3): the job may have waited in the queue.
+        // The pool it tears down must still be the one that was confirmed.
+        const live = (await readAhrPools(executor)).find(p => p.name === name)
+        if (!live)
+          throw new Error(`AHR pool '${name}' no longer exists — nothing was destroyed`)
+        if (poolArrayUuids(live).join(',') !== confirmedUuids.join(','))
+          throw new Error(`AHR pool '${name}' is not the pool that was confirmed (its arrays changed since) — nothing was destroyed. Review the pool and destroy it again`)
+        return destroyAhrPool(executor, live, updateProgress, { fstabPath, mdadmConfPath, intentDir })
+      },
     )
     reply.code(202)
     return { job }

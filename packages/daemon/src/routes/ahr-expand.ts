@@ -12,7 +12,8 @@ import { executeReadd } from '../services/ahr-expand-exec.js'
 // The §5.3 recompute-and-continue core is shared with the daemon boot scan
 // (services/ahr-boot-scan.ts) — ONE implementation, no drift (single source).
 import { computePlan, resolveApproved, resumeExpansion, submitExpansion } from '../services/ahr-expand-resume.js'
-import { AhrIntentConflictError, clearIntent, readIntent, writeIntent } from '../services/ahr-intent.js'
+import { poolIntentIdentity } from '../services/ahr-identity.js'
+import { AhrIntentConflictError, clearIntent, readPoolIntent, writeIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, expansionGain, fmtBytes } from '../services/ahr-layout.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { requireIdentity } from './identity.js'
@@ -158,16 +159,32 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
   }
 
   /** 409 when an expansion intent already exists for the pool. */
-  async function refuseExistingIntent(pool: string, reply: FastifyReply): Promise<boolean> {
-    const existing = await readIntent(pool, intentDir)
+  async function refuseExistingIntent(pool: AhrPool, reply: FastifyReply): Promise<boolean> {
+    // This pool's intent only (story ident.3): one an earlier pool of the same
+    // name left behind is stale — it refuses nothing, and the new intent
+    // replaces it ({@link persistNewIntent}).
+    const existing = (await readPoolIntent(pool, intentDir)).intent
     if (existing) {
       reply.code(409).send({ error: {
         code: 'CONFLICT',
-        message: `Pool '${pool}' already has an expansion intent (state '${existing.state}') — Resume or Abandon it first.`,
+        message: `Pool '${pool.name}' already has an expansion intent (state '${existing.state}') — Resume or Abandon it first.`,
       } })
       return true
     }
     return false
+  }
+
+  /**
+   * Write a NEW intent for the pool (expand / replace). A stale intent filed
+   * under the name — an earlier pool's — is removed first, so the
+   * expectation-guarded write ('absent') still refuses a genuine double-expand
+   * race and only that.
+   */
+  async function persistNewIntent(pool: AhrPool, intent: AhrExpansionIntent): Promise<void> {
+    const { stale } = await readPoolIntent(pool, intentDir)
+    if (stale)
+      await clearIntent(pool.name, intentDir)
+    await writeIntent(pool.name, intent, { dir: intentDir, expect: 'absent' })
   }
 
   /**
@@ -205,7 +222,7 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     ]
   }
 
-  function buildIntent(bundle: PlanBundle, approvedIds: string[], replace?: AhrReplacePair): AhrExpansionIntent {
+  function buildIntent(pool: AhrPool, bundle: PlanBundle, approvedIds: string[], replace?: AhrReplacePair): AhrExpansionIntent {
     return {
       id: randomUUID(),
       trigger: replace ? 'replace-disk' : 'add-disk',
@@ -214,6 +231,9 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       before: bundle.before,
       after: bundle.after,
       state: 'running',
+      // WHOSE intent this is (story ident.3): the file is keyed by name, and a
+      // later pool of the same name must read it as stale, never as its own.
+      ...poolIntentIdentity(pool),
     }
   }
 
@@ -268,7 +288,7 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       return
     if (refuseDegraded(pool, reply))
       return
-    if (await refuseExistingIntent(pool.name, reply))
+    if (await refuseExistingIntent(pool, reply))
       return
     // The plan is ALWAYS recomputed server-side — a client-side plan is a
     // preview, never an input.
@@ -295,9 +315,9 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       return reply
     }
 
-    const intent = buildIntent(bundle, approvedIds, replace)
+    const intent = buildIntent(pool, bundle, approvedIds, replace)
     try {
-      await writeIntent(pool.name, intent, { dir: intentDir, expect: 'absent' })
+      await persistNewIntent(pool, intent)
     }
     catch (err) {
       if (err instanceof AhrIntentConflictError) {
@@ -327,12 +347,37 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     const pool = await loadPool(request.params.name, reply)
     if (!pool)
       return
-    const intent = await readIntent(pool.name, intentDir)
+    const intent = (await readPoolIntent(pool, intentDir)).intent
     if (!intent || intent.state !== 'halted') {
       reply.code(409)
       return { error: { code: 'CONFLICT', message: intent
         ? `Pool '${pool.name}' has an expansion intent in state '${intent.state}' — only a halted expansion can be resumed.`
         : `Pool '${pool.name}' has no halted expansion to resume.` } }
+    }
+
+    // Story ident.3 (d): resume drives disks the operator approved when the
+    // expansion STARTED — possibly days ago. Every one of them is re-checked
+    // now (a disk new to the pool must still be available, or carry nothing
+    // but this pool's own half-joined slices), and the operator confirms the
+    // disks it is about to partition, before anything is written.
+    const { problems } = await resolveApproved(executor, diskIdentityCache, pool, intent.approvedDisks, false)
+    if (problems.length > 0) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `${problems.join('; ')} — a missing disk is never treated as intent (§5.3); reattach it or Abandon the expansion.` } }
+    }
+    const joining = intent.approvedDisks.filter(id => !pool.disks.some(d => d.id === id))
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'ahr.expand.resume',
+      params: { pool: pool.name, intent: intent.id, approvedDisks: intent.approvedDisks },
+      message: `Resume the halted expansion of pool '${pool.name}'`,
+      warnings: [
+        ...joining.map(id => `${id} joins the pool: it is partitioned with the pool's band slices, and anything else on it is lost`),
+        'The plan is recomputed from the pool as it is now; steps that already completed are skipped.',
+        'The pool stays ONLINE during the reshape, but performance is reduced; on large arrays a reshape takes hours to DAYS.',
+        'Do NOT remove disks while the expansion runs.',
+      ],
+    })) {
+      return reply
     }
 
     // §5.3 recompute-and-continue via the SHARED resume core (identical to the
@@ -365,7 +410,7 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     const pool = await loadPool(request.params.name, reply)
     if (!pool)
       return
-    const intent = await readIntent(pool.name, intentDir)
+    const intent = (await readPoolIntent(pool, intentDir)).intent
     if (!intent) {
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `Pool '${pool.name}' has no expansion intent to abandon.` } }
@@ -417,7 +462,7 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     const pool = await loadPool(request.params.name, reply)
     if (!pool)
       return
-    if (await refuseExistingIntent(pool.name, reply))
+    if (await refuseExistingIntent(pool, reply))
       return
 
     const replace: AhrReplacePair = { oldDiskId: oldParsed.data, newDiskId: bodyParsed.data.newDiskId }
@@ -449,9 +494,9 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       return reply
     }
 
-    const intent = buildIntent(bundle, approvedIds, replace)
+    const intent = buildIntent(pool, bundle, approvedIds, replace)
     try {
-      await writeIntent(pool.name, intent, { dir: intentDir, expect: 'absent' })
+      await persistNewIntent(pool, intent)
     }
     catch (err) {
       if (err instanceof AhrIntentConflictError) {
@@ -487,7 +532,7 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     if (!pool)
       return
     // Never interleave a member rejoin with a running/halted expansion.
-    if (await refuseExistingIntent(pool.name, reply))
+    if (await refuseExistingIntent(pool, reply))
       return
     if (pool.arrays.some(a => a.sync?.action === 'reshape')) {
       reply.code(409)

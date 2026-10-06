@@ -1,4 +1,4 @@
-import type { Job } from '@anas/shared'
+import type { AhrExpansionIntent, Job } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -13,11 +13,12 @@ import { mockFixtures } from '../../fixtures/loader.js'
 import { JobQueue } from '../../jobs/queue.js'
 import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
 import { LSBLK_ARGS } from '../../parsers/lsblk.js'
-import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
-import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
+import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
+import { mdadmDetailExportArgs, mdadmExamineExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { ConfirmStore } from '../../safety/confirm.js'
 import { createServer } from '../../server.js'
+import { readIntent, writeIntent } from '../../services/ahr-intent.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
 import { ahrMutationRoutes, reconcileLunWarnings, rewriteLunWarnings } from '../ahr-mutate.js'
@@ -182,11 +183,9 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
   let executor: MockExecutor
   let dir: string
 
-  beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-create-route-'))
-    await writeFile(join(dir, 'fstab'), '# empty\n')
-
-    executor = new MockExecutor()
+  /** The controlled-inventory executor; `lsblkInventory` overrides the inventory read(s). */
+  function controlledExecutor(lsblkInventory?: object[]): MockExecutor {
+    const ex = new MockExecutor()
     // Inventory: two genuinely blank disks (status 'available').
     const lsblk = {
       blockdevices: [
@@ -197,8 +196,10 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
         { 'name': 'sdz', 'type': 'disk', 'size': 1 * GIB, 'model': 'BLANK 4KN', 'serial': 'C', 'tran': 'sata', 'fstype': null, 'mountpoint': null, 'rota': true, 'phy-sec': 4096, 'log-sec': 4096 },
       ],
     }
-    executor.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: { stdout: JSON.stringify(lsblk), stderr: '', exitCode: 0 } })
-    executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: {
+    if (lsblkInventory)
+      ex.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, results: lsblkInventory.map(tree => ({ stdout: JSON.stringify(tree), stderr: '', exitCode: 0 })) })
+    ex.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: { stdout: JSON.stringify(lsblk), stderr: '', exitCode: 0 } })
+    ex.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: {
       stdout: [
         `lrwxrwxrwx 1 root root 9 Jul 23 10:00 ${BLANK_SMALL} -> ../../sdx`,
         `lrwxrwxrwx 1 root root 9 Jul 23 10:00 ${BLANK_BIG} -> ../../sdy`,
@@ -208,21 +209,24 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
       stderr: '',
       exitCode: 0,
     } })
-    executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    ex.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: '', exitCode: 0 } })
     // The create job's commands.
     for (const command of ['/usr/sbin/wipefs', '/usr/sbin/sgdisk', '/usr/bin/udevadm', '/usr/sbin/pvcreate', '/usr/sbin/vgcreate', '/usr/sbin/lvcreate', '/usr/sbin/mkfs.btrfs', '/usr/bin/btrfs', '/usr/sbin/update-initramfs', '/usr/bin/systemctl', '/usr/bin/mount', '/usr/bin/umount', '/usr/bin/perl', '/usr/sbin/mdadm'])
-      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
-    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/tpool-r1'], result: { stdout: `MD_NAME=tpool-r1\nMD_UUID=${UUID_R1}\n`, stderr: '', exitCode: 0 } })
+      ex.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+    ex.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/tpool-r1'], result: { stdout: `MD_NAME=tpool-r1\nMD_UUID=${UUID_R1}\n`, stderr: '', exitCode: 0 } })
+    return ex
+  }
 
+  async function buildServer(exec: MockExecutor): Promise<TestServer> {
     const app = Fastify({ logger: false })
     const jobQueue = new JobQueue()
     await app.register(jobRoutes, { prefix: '/v1', jobQueue })
     await app.register(ahrMutationRoutes, {
       prefix: '/v1',
-      executor,
+      executor: exec,
       jobQueue,
       confirmStore: new ConfirmStore(),
-      diskIdentityCache: new DiskIdentityCache(executor),
+      diskIdentityCache: new DiskIdentityCache(exec),
       fstabPath: join(dir, 'fstab'),
       mdadmConfPath: join(dir, 'mdadm.conf'),
       mountBase: join(dir, 'mnt'),
@@ -232,7 +236,14 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
       // 6.x runner while dev machines pass on 7.x).
       kernelRelease: '7.0.14-8-pve',
     })
-    server = app as unknown as TestServer
+    return app as unknown as TestServer
+  }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-create-route-'))
+    await writeFile(join(dir, 'fstab'), '# empty\n')
+    executor = controlledExecutor()
+    server = await buildServer(executor)
   })
   afterEach(async () => {
     await server.close()
@@ -417,6 +428,53 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     assert.ok(res.json().error.message.includes('volume group'))
     assert.ok(!res.headers['x-anas-confirm-code'], 'refused before the confirm gate')
     assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/wipefs'), 'no disk was wiped')
+  })
+
+  // ---- story ident.3: the name must be free, the disks still available -----
+
+  it('refuses (409) a name mdadm.conf already pins — before the confirm', async () => {
+    await writeFile(join(dir, 'mdadm.conf'), `ARRAY /dev/md/tpool-r1 metadata=1.2 UUID=${UUID_R1}\n`)
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] }) })
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.match(res.json().error.message, /already in use on this node/)
+    assert.match(res.json().error.message, /mdadm\.conf already pins/)
+    assert.ok(!res.headers['x-anas-confirm-code'])
+  })
+
+  it('refuses (409) a name a LIVE foreign array already carries, and one partition labels carry', async () => {
+    // A hand-built `tpool-r1` (no VG, not pinned) is still an occupied name.
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: 'Personalities : [raid1]\nmd9 : active raid1 sdq1[1] sdp1[0]\n      1047552 blocks super 1.2 [2/2] [UU]\n\nunused devices: <none>\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md9'), result: { stdout: 'MD_LEVEL=raid1\nMD_UUID=99999999:99999999:99999999:99999999\nMD_NAME=otherbox:tpool-r1\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/lsblk', args: ['-J', '-o', 'NAME,PARTLABEL'], result: { stdout: JSON.stringify({ blockdevices: [{ name: 'sdw', children: [{ name: 'sdw1', partlabel: 'tpool-cache1' }] }] }), stderr: '', exitCode: 0 } })
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] }) })
+    assert.equal(res.statusCode, 409, res.body)
+    const { message } = res.json().error
+    assert.match(message, /tpool-r1 \(\/dev\/md9\)/)
+    assert.match(message, /tpool-cache1/)
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/wipefs'), 'no disk was wiped')
+  })
+
+  it('the JOB re-checks every disk: one that stopped being available while queued fails the job with nothing wiped', async () => {
+    const blank = (name: string, size: number, serial: string) => ({ 'name': name, 'type': 'disk', 'size': size, 'model': 'BLANK', 'serial': serial, 'tran': 'sata', 'fstype': null, 'mountpoint': null, 'rota': true, 'phy-sec': 4096, 'log-sec': 512 })
+    const before = { blockdevices: [blank('sdx', 2 * GIB, 'A'), blank('sdy', 3 * GIB, 'B')] }
+    // By the time the job runs, sdy carries a filesystem (someone else's now).
+    const after = { blockdevices: [blank('sdx', 2 * GIB, 'A'), { ...blank('sdy', 3 * GIB, 'B'), children: [{ name: 'sdy1', type: 'part', size: 3 * GIB, fstype: 'ext4', mountpoint: null }] }] }
+    const exec = controlledExecutor([before, before, after])
+    await server.close()
+    server = await buildServer(exec)
+
+    const payload = JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] })
+    const first = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload })
+    assert.equal(first.statusCode, 409)
+    const code = first.headers['x-anas-confirm-code'] as string
+    const second = await server.inject({ method: 'POST', url: '/v1/ahr', headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload })
+    assert.equal(second.statusCode, 202, second.body)
+    const job = await waitForJob(server, second.json().job.id)
+    assert.equal(job.status, 'failed')
+    assert.match(JSON.stringify(job.error), /changed since it was confirmed — nothing was touched/)
+    assert.match(JSON.stringify(job.error), new RegExp(BLANK_BIG))
+    assert.ok(!exec.calls.some(c => c.command === '/usr/sbin/wipefs' || c.command === '/usr/sbin/sgdisk'), 'no disk was wiped')
   })
 })
 
@@ -1182,5 +1240,163 @@ describe('POST /v1/ahr/:name/mirror-reconcile', () => {
     const blocked = await post({ band: 2 })
     assert.equal(blocked.statusCode, 409)
     assert.equal(blocked.json().error.reason, 'job-active')
+  })
+})
+
+/**
+ * Story ident.3 — the destroy doors. A destroy that is queued behind other
+ * work, or replayed against a pool recreated under the same name, must act on
+ * the pool that was confirmed or not at all; and the expansion intent (keyed
+ * by NAME) goes with the pool.
+ */
+describe('DELETE /v1/ahr/:name — identity doors (ident.3)', () => {
+  let dir: string
+  let intentDir: string
+  let confirmStore: ConfirmStore
+
+  const AHR0_PARTS: [string, 'r1' | 'r2' | null][] = [
+    ['ata-WDC_WD2003FZEX-00SRLA0_WD-12345678-part1', 'r1'],
+    ['ata-WDC_WD2003FZEX-00SRLA0_WD-23456789-part1', 'r1'],
+    ['ata-WDC_WD2003FZEX-00SRLA0_WD-34567890-part1', 'r1'],
+    ['ata-WDC_WD2003FZEX-00SRLA0_WD-23456789-part2', 'r2'],
+    ['ata-WDC_WD2003FZEX-00SRLA0_WD-34567890-part2', 'r2'],
+    ['ata-WDC_WD2003FZEX-00SRLA0_WD-34567890-part3', null],
+  ]
+
+  /**
+   * The ahr0 world, with band 1's UUID overridable (a recreated pool). With
+   * `r1Sequence`, successive `--detail` reads of band 1 answer in turn (the
+   * last repeats) — a pool that changes between the confirm and the job.
+   */
+  function ahr0World(r1Uuid?: string, r1Sequence?: string[]): MockExecutor {
+    const executor = new MockExecutor()
+    const r1 = mockFixtures.ahrMdadmExportR1()
+    const withUuid = (uuid: string) => ({ ...r1, stdout: r1.stdout.replace(/MD_UUID=.*/, `MD_UUID=${uuid}`) })
+    const r1Export = r1Uuid ? withUuid(r1Uuid) : r1
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+    if (r1Sequence)
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), results: r1Sequence.map(withUuid) })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: r1Export })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+    for (const [part, band] of AHR0_PARTS) {
+      executor.addFixture({
+        command: '/usr/sbin/mdadm',
+        args: mdadmExamineExportArgs(`/dev/disk/by-id/${part}`),
+        result: band === 'r1' ? r1Export : band === 'r2' ? mockFixtures.ahrMdadmExportR2() : { stdout: '', stderr: 'no superblock', exitCode: 1 },
+      })
+    }
+    executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+    executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+    executor.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: mockFixtures.ahrPvs() })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+    for (const command of ['/usr/bin/umount', '/usr/bin/systemctl', '/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs', '/usr/sbin/mdadm'])
+      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+    return executor
+  }
+
+  async function build(executor: MockExecutor, jobQueue = new JobQueue()): Promise<{ server: TestServer, jobQueue: JobQueue }> {
+    const app = Fastify({ logger: false })
+    await app.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await app.register(ahrMutationRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      confirmStore,
+      diskIdentityCache: new DiskIdentityCache(executor),
+      fstabPath: join(dir, 'fstab'),
+      mdadmConfPath: join(dir, 'mdadm.conf'),
+      mountBase: join(dir, 'mnt'),
+      intentDir,
+    })
+    return { server: app as unknown as TestServer, jobQueue }
+  }
+
+  function intent(state: AhrExpansionIntent['state']): AhrExpansionIntent {
+    const cap = { rawBytes: 0, usableBytes: 0, usedBytes: 0, freeBytes: 0, redundancyOverheadBytes: 0, unprotectedWastedBytes: 0, pendingBytes: 0 }
+    return { id: randomUUID(), trigger: 'add-disk', approvedDisks: ['ata-x'], before: cap, after: cap, state }
+  }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-destroy-doors-'))
+    intentDir = join(dir, 'intent')
+    confirmStore = new ConfirmStore()
+    await writeFile(join(dir, 'fstab'), '# empty\n')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('409 (no confirm code) while ANY ahr.* job is in flight on the pool — `name`- and `pool`-keyed alike', async () => {
+    for (const [operation, params] of [['ahr.scrub', { name: 'ahr0' }], ['ahr.spare.add', { pool: 'ahr0', diskId: 'ata-x' }]] as const) {
+      const { server, jobQueue } = await build(ahr0World())
+      const running = jobQueue.submit(operation, { user: 'u', uid: 0, params }, async () => new Promise(() => {})).id
+      const res = await server.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 409, res.body)
+      assert.equal(res.json().error.code, 'CONFLICT')
+      assert.ok(res.json().error.message.includes(running), res.json().error.message)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
+      await server.close()
+    }
+  })
+
+  it('409 while an expansion is being driven (intent running)', async () => {
+    await writeIntent('ahr0', intent('running'), { dir: intentDir })
+    const { server } = await build(ahr0World())
+    const res = await server.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 409)
+    assert.match(res.json().error.message, /expansion being driven/)
+    await server.close()
+  })
+
+  it('a HALTED intent does not block the destroy — and the destroy clears it with the pool', async () => {
+    await writeIntent('ahr0', intent('halted'), { dir: intentDir })
+    const { server } = await build(ahr0World())
+    const first = await server.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: IDENTITY_HEADERS })
+    assert.equal(first.statusCode, 409)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    const code = first.headers['x-anas-confirm-code'] as string
+    const second = await server.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code } })
+    assert.equal(second.statusCode, 202, second.body)
+    const job = await waitForJob(server, second.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal(await readIntent('ahr0', intentDir), null, 'the intent went with the pool')
+    await server.close()
+  })
+
+  it('the JOB re-reads the pool: one whose arrays changed while the job was queued is not destroyed', async () => {
+    const ORIGINAL = '8f425218:8811d919:db5d4baa:f414bbac'
+    const RECREATED = '11111111:22222222:33333333:44444444'
+    // Two route reads see the original pool; the job's read sees another.
+    const executor = ahr0World(undefined, [ORIGINAL, ORIGINAL, RECREATED])
+    const { server } = await build(executor)
+    const first = await server.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: IDENTITY_HEADERS })
+    const code = first.headers['x-anas-confirm-code'] as string
+    const second = await server.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code } })
+    assert.equal(second.statusCode, 202, second.body)
+    const job = await waitForJob(server, second.json().job.id)
+    assert.equal(job.status, 'failed')
+    assert.match(JSON.stringify(job.error), /not the pool that was confirmed/)
+    for (const destructive of ['/usr/bin/umount', '/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/sgdisk'])
+      assert.ok(!executor.calls.some(c => c.command === destructive), `${destructive} must not run`)
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && (c.args[0] === '--stop' || c.args[0] === '--zero-superblock')))
+    await server.close()
+  })
+
+  it('a confirm code is bound to the pool\'s array UUIDs — it cannot destroy a recreated pool of the same name', async () => {
+    const before = await build(ahr0World())
+    const first = await before.server.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: IDENTITY_HEADERS })
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    const code = first.headers['x-anas-confirm-code'] as string
+    await before.server.close()
+
+    // Same name, same store — but band 1 is a different array now.
+    const after = await build(ahr0World('11111111:22222222:33333333:44444444'))
+    const replay = await after.server.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code } })
+    assert.equal(replay.statusCode, 409, replay.body)
+    assert.equal(replay.json().error.code, 'CONFIRMATION_REQUIRED', 'a fresh confirm, never a 202')
+    await after.server.close()
   })
 })

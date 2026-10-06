@@ -210,6 +210,24 @@ describe('buildAhrCacheState — the pool `cache` block (ahrcache.1, §13)', () 
     assert.equal(facts.cache.sizeBytes, 532676608)
   })
 
+  it('a `<pool>-cache<n>` slice LVM counts in ANOTHER volume group is not this pool\'s disk (ident.3)', () => {
+    // The label says `POOL`; LVM says the slice belongs to `media`. Identity
+    // wins: never a pool disk, never on destroy's wipe list.
+    const pvs = parsePvsReport(loadFixture('lvm-pvs.json'))
+    pvs.push({ name: '/dev/sdd1', vgName: 'media', sizeBytes: 1, freeBytes: 0, devSizeBytes: 1 })
+    const facts = buildAhrCacheState({
+      poolName: POOL,
+      lv: parseLvsReport(loadFixture('lvm-lvs.json'))[0],
+      pvs,
+      bandCount: 2,
+      partsByKernel: partsByKernel(),
+      byIdMap: BY_ID,
+      dmStatus: null,
+    })
+    assert.deepEqual(facts.diskIds, [])
+    assert.deepEqual(facts.cache.devices, [])
+  })
+
   it('an `[unknown]` PV is NOT read as a cache when a band PV is the missing one', () => {
     // Two bands, only one named md PV: the nameless PV could be either, so it
     // is not claimed for the cache. Inventing a failed cache from a missing

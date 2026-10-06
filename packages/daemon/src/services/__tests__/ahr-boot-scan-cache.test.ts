@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -242,8 +242,13 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-ahr-boot-cache-'))
+    // tank-r1 is ANAS-pinned (story ident.3 — a pool's arrays are its own by
+    // their pinned UUIDs).
+    process.env.ANAS_MDADM_CONF = join(dir, 'mdadm.conf')
+    await writeFile(process.env.ANAS_MDADM_CONF, 'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa\n')
   })
   afterEach(async () => {
+    delete process.env.ANAS_MDADM_CONF
     await rm(dir, { recursive: true, force: true })
   })
 

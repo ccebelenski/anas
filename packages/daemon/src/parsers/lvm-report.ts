@@ -21,7 +21,13 @@ const LVM_REPORT_FLAGS = ['--reportformat', 'json', '--units', 'b', '--nosuffix'
  * default column, so existing consumers and fixtures are unaffected.
  */
 export const PVS_ARGS = [...LVM_REPORT_FLAGS, '-o', '+dev_size']
-export const VGS_ARGS = [...LVM_REPORT_FLAGS]
+/**
+ * `-o +vg_uuid` APPENDS the VG's LVM UUID (story ident.3): a VG NAME is reused
+ * by a destroy-then-recreate, its UUID is not, so it is what an AHR expansion
+ * intent records to tell its own pool from a later one of the same name.
+ * Appending keeps every default column, exactly as `+dev_size` does for pvs.
+ */
+export const VGS_ARGS = [...LVM_REPORT_FLAGS, '-o', '+vg_uuid']
 
 /**
  * The lvmcache columns, APPENDED the same way `+dev_size` is (story
@@ -62,6 +68,7 @@ interface RawPv {
 
 interface RawVg {
   vg_name?: string
+  vg_uuid?: string
   pv_count?: string
   lv_count?: string
   vg_size?: string
@@ -109,6 +116,8 @@ export interface LvmPv {
 /** One volume group (one per AHR pool, named after it). */
 export interface LvmVg {
   name: string
+  /** LVM's VG UUID, or null when the report did not carry the column (older captures). */
+  uuid: string | null
   pvCount: number
   lvCount: number
   sizeBytes: number
@@ -223,6 +232,7 @@ export function parseVgsReport(json: string): LvmVg[] {
     .filter(r => typeof r.vg_name === 'string')
     .map(r => ({
       name: r.vg_name!,
+      uuid: r.vg_uuid ? r.vg_uuid : null,
       pvCount: Number.parseInt(r.pv_count ?? '0', 10) || 0,
       lvCount: Number.parseInt(r.lv_count ?? '0', 10) || 0,
       sizeBytes: parseLvmSize(r.vg_size),

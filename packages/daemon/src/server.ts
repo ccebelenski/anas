@@ -13,7 +13,7 @@ import { JobQueue } from './jobs/queue.js'
 import { btrfsUsageArgs } from './parsers/btrfs-usage.js'
 import { LSBLK_ARGS } from './parsers/lsblk.js'
 import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from './parsers/lvm-report.js'
-import { mdadmDetailExportArgs } from './parsers/mdadm-detail.js'
+import { mdadmDetailExportArgs, mdadmExamineExportArgs } from './parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from './parsers/mdstat.js'
 import { listSections, parseRcloneConf } from './parsers/rclone-conf.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from './parsers/zfs-list.js'
@@ -459,6 +459,22 @@ export function createServer(opts?: ServerOptions) {
     }
     mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
     mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+    // ident.3: the md identity INSIDE each ahr0 member partition — what destroy
+    // reads before it zeroes or zaps anything (band 1 = r1's UUID, band 2 = r2's).
+    for (const [part, exp] of [
+      ['ata-WDC_WD2003FZEX-00SRLA0_WD-12345678-part1', mockFixtures.ahrMdadmExportR1()],
+      ['ata-WDC_WD2003FZEX-00SRLA0_WD-23456789-part1', mockFixtures.ahrMdadmExportR1()],
+      ['ata-WDC_WD2003FZEX-00SRLA0_WD-34567890-part1', mockFixtures.ahrMdadmExportR1()],
+      ['ata-WDC_WD2003FZEX-00SRLA0_WD-23456789-part2', mockFixtures.ahrMdadmExportR2()],
+      ['ata-WDC_WD2003FZEX-00SRLA0_WD-34567890-part2', mockFixtures.ahrMdadmExportR2()],
+    ] as const)
+      mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs(`/dev/disk/by-id/${part}`), result: exp })
+    // sdd3 is the unprotected band-3 slice: labelled, empty, no superblock.
+    mock.addFixture({
+      command: '/usr/sbin/mdadm',
+      args: mdadmExamineExportArgs('/dev/disk/by-id/ata-WDC_WD2003FZEX-00SRLA0_WD-34567890-part3'),
+      result: { stdout: '', stderr: 'mdadm: No md superblock detected', exitCode: 1 },
+    })
     mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
     mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
     mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
@@ -675,7 +691,7 @@ export function createServer(opts?: ServerOptions) {
   // READ layer (list/detail/preview) — detail carries the live intent (§6.2).
   server.register(ahrRoutes, { prefix: '/v1', executor, diskIdentityCache, intentDir: ahrIntentDir, jobQueue, iscsiPaths })
   // AHR mutations: create/destroy/scrub (routes/ahr-mutate.ts).
-  server.register(ahrMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase: ahrMountBase, iscsiPaths })
+  server.register(ahrMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase: ahrMountBase, iscsiPaths, intentDir: ahrIntentDir })
   // AHR expansion engine (Epic 11.6, AHR-DESIGN §5) — plan/expand/resume/
   // abandon + guided replace.
   server.register(ahrExpansionRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, intentDir: ahrIntentDir })

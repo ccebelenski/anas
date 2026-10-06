@@ -2,7 +2,7 @@ import type { AhrCapacity, AhrExpansionIntent, AhrPool, JobRef } from '@anas/sha
 import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -144,8 +144,17 @@ describe('resumeExpansion — the shared §5.3 recompute-and-continue core', () 
   let dir: string
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-ahr-resume-'))
+    // tank's arrays are ANAS-pinned (story ident.3 — the resolver admits a
+    // pool's arrays by their pinned UUIDs).
+    process.env.ANAS_MDADM_CONF = join(dir, 'mdadm.conf')
+    await writeFile(process.env.ANAS_MDADM_CONF, [
+      'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa',
+      'ARRAY /dev/md/tank-r2 metadata=1.2 UUID=bbbbbbbb:bbbbbbbb:bbbbbbbb:bbbbbbbb',
+      '',
+    ].join('\n'))
   })
   afterEach(async () => {
+    delete process.env.ANAS_MDADM_CONF
     await rm(dir, { recursive: true, force: true })
   })
 

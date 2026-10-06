@@ -10,6 +10,7 @@ import {
   clearIntent,
   listIntents,
   readIntent,
+  readPoolIntent,
   writeIntent,
 } from '../ahr-intent.js'
 
@@ -106,5 +107,24 @@ describe('ahr-intent (§5.3 — the ONLY persisted expansion state)', () => {
     await writeIntent('vault', mkIntent({ state: 'halted' }), { dir })
     const all = await listIntents(dir)
     assert.deepEqual(all.map(i => i.pool).sort(), ['tank', 'vault'])
+  })
+
+  it('readPoolIntent: the intent filed under a NAME is this pool\'s only when its recorded identity matches (ident.3)', async () => {
+    const OLD = '77777777:77777777:77777777:77777777'
+    const NOW = 'aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa'
+    const pool = (uuid: string) => ({
+      name: 'tank',
+      arrays: [{ device: '/dev/md/tank-r1' as const, band: 1, level: 'raid1' as const, heightBytes: 1, members: [], state: 'clean' as const, uuid }],
+      vg: { name: 'tank', sizeBytes: 0, freeBytes: 0 },
+    })
+    await writeIntent('tank', mkIntent({ state: 'halted', arrayUuids: [OLD] }), { dir })
+    // A recreated `tank`: the record is stale, never this pool's halted expansion.
+    const recreated = await readPoolIntent(pool(NOW), dir)
+    assert.equal(recreated.intent, null)
+    assert.equal(recreated.stale?.state, 'halted')
+    // The pool it was written for: its own.
+    const own = await readPoolIntent(pool(OLD), dir)
+    assert.equal(own.intent?.state, 'halted')
+    assert.equal(own.stale, null)
   })
 })

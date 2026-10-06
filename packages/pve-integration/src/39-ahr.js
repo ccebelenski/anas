@@ -2488,19 +2488,26 @@
         if (!pool) {
             return;
         }
-        // Resume is recompute-and-continue (§5.3) — plain 202, no confirm.
-        ANAS.api.post(node, '/ahr/' + encodeURIComponent(pool) + '/expand/resume', {}).then(function (res) {
-            var job = res && res.job;
-            ANAS.toast(t('Expansion resumed on') + ' ' + pool);
-            if (job && job.id) {
-                ANAS.pollJob(node, job.id, {
-                    onDone: function () { loadPools(grid, node); },
-                });
-            }
-        }, function (err) {
-            if (!apiMissing(err, t('Expansion resume'))) {
-                ANAS.alertMsg('Resume expansion', ANAS.errText(err));
-            }
+        // Resume is recompute-and-continue (§5.3), behind a confirm (ident.3):
+        // the daemon re-checks every approved disk and names the ones it is
+        // about to partition before anything is written.
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'post',
+            path: '/ahr/' + encodeURIComponent(pool) + '/expand/resume',
+            body: {},
+            view: grid,
+            confirmTitle: 'Resume expansion',
+            confirmIntro: t('Resuming the halted expansion of') + ' <b>' + enc(pool) + '</b> '
+                + t('recomputes the plan from the pool as it is now and continues it:'),
+            failTitle: 'Resume failed',
+            successMsg: t('Expansion resumed on') + ' ' + pool,
+            onComplete: function () {
+                loadPools(grid, node);
+            },
+            onFailed: function () {
+                loadPools(grid, node);
+            },
         });
     }
 

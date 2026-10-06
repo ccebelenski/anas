@@ -7,7 +7,7 @@ import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { AhrSpareRequest, DiskId, isComposableDisk, PoolName } from '@anas/shared'
 import { confirmGate } from '../safety/gate.js'
 import { projectExistingBands } from '../services/ahr-expand-exec.js'
-import { readIntent } from '../services/ahr-intent.js'
+import { readPoolIntent } from '../services/ahr-intent.js'
 import { fmtBytes } from '../services/ahr-layout.js'
 import { attachSpare, removeSpare, spareCoverage, spareShortfallMessage } from '../services/ahr-spare.js'
 import { readAhrPools } from '../services/ahr-topology.js'
@@ -55,12 +55,14 @@ export async function ahrSpareRoutes(server: FastifyInstance, opts: AhrSpareRout
   }
 
   /** 409 while an expansion intent exists — band geometry is in flight. */
-  async function refuseExistingIntent(pool: string, reply: FastifyReply): Promise<boolean> {
-    const existing = await readIntent(pool, intentDir)
+  async function refuseExistingIntent(pool: AhrPool, reply: FastifyReply): Promise<boolean> {
+    // This pool's intent only: one an earlier pool of the same name left
+    // behind is stale and refuses nothing (story ident.3).
+    const existing = (await readPoolIntent(pool, intentDir)).intent
     if (existing) {
       reply.code(409).send({ error: {
         code: 'CONFLICT',
-        message: `Pool '${pool}' has an expansion intent (state '${existing.state}') — spares can be changed once it completes or is abandoned.`,
+        message: `Pool '${pool.name}' has an expansion intent (state '${existing.state}') — spares can be changed once it completes or is abandoned.`,
       } })
       return true
     }
@@ -81,7 +83,7 @@ export async function ahrSpareRoutes(server: FastifyInstance, opts: AhrSpareRout
     const pool = await loadPool(request.params.name, reply)
     if (!pool)
       return
-    if (await refuseExistingIntent(pool.name, reply))
+    if (await refuseExistingIntent(pool, reply))
       return
 
     const already = pool.disks.find(d => d.id === diskId)
@@ -146,7 +148,9 @@ export async function ahrSpareRoutes(server: FastifyInstance, opts: AhrSpareRout
     const job = jobQueue.submit(
       'ahr.spare.add',
       { ...identity, params: { pool: pool.name, diskId } },
-      async updateProgress => attachSpare(executor, { pool, diskId, diskSizeBytes: disk.size }, updateProgress),
+      // diskCache: the job re-checks the disk is STILL available before it
+      // wipes it (ident.3 (a)).
+      async updateProgress => attachSpare(executor, { pool, diskId, diskSizeBytes: disk.size }, updateProgress, { diskCache: diskIdentityCache }),
     )
     reply.code(202)
     return { job }
@@ -166,7 +170,7 @@ export async function ahrSpareRoutes(server: FastifyInstance, opts: AhrSpareRout
     const pool = await loadPool(request.params.name, reply)
     if (!pool)
       return
-    if (await refuseExistingIntent(pool.name, reply))
+    if (await refuseExistingIntent(pool, reply))
       return
 
     const disk = pool.disks.find(d => d.id === diskId)
@@ -174,9 +178,18 @@ export async function ahrSpareRoutes(server: FastifyInstance, opts: AhrSpareRout
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `disk '${diskId}' is not part of pool '${pool.name}'` } }
     }
-    if (disk.role !== 'spare') {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `disk '${diskId}' is a MEMBER of pool '${pool.name}', not a spare — members leave only through Replace` } }
+    // Story ident.3 (c): a slice md has put to work is a MEMBER, whatever the
+    // disk was attached as — a spare that took over a rebuild carries data now,
+    // and "removing the spare" would fail a live member out of its band. The
+    // (S) flag on an active array is the only truth (the role is fused from it,
+    // so a half-consumed spare reads `member` too). 409: the request is
+    // well-formed, the pool's state refuses it. The job asks md again.
+    const activeIn = pool.arrays
+      .filter(a => a.state !== 'inactive' && a.members.some(m => m.disk === diskId && m.memberState !== 'spare' && m.memberState !== 'faulty'))
+      .map(a => `${pool.name}-r${a.band}`)
+    if (disk.role !== 'spare' || activeIn.length > 0) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `disk '${diskId}' is an active MEMBER of pool '${pool.name}'${activeIn.length > 0 ? ` (${activeIn.join(', ')})` : ''}, not a spare: a spare that took over a rebuild carries data. Members leave only through Replace` } }
     }
 
     const remaining = pool.disks.filter(d => d.role === 'spare' && d.id !== diskId).length

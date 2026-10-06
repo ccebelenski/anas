@@ -1,6 +1,7 @@
 import type { AhrDestroyTarget } from '../ahr-destroy.js'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -120,8 +121,13 @@ function byIdListing(disks: { id: string, kernel: string, parts: number }[]): st
   return `${lines.join('\n')}\n`
 }
 
-/** An `lsblk AHR_LSBLK_ARGS` tree of plain partitioned disks (no md/LVM nodes). */
-function lsblkTree(disks: { kernel: string, parts: (string | null)[] }[]): string {
+/**
+ * An `lsblk AHR_LSBLK_ARGS` tree of plain partitioned disks (no md/LVM nodes).
+ * A labelled slice reads `linux_raid_member` (a cache slice `LVM2_member`), an
+ * unlabelled one `ext4` — or every slice reads blank with `blank: true`, the
+ * state a re-run finds after an earlier pass zeroed the superblocks.
+ */
+function lsblkTree(disks: { kernel: string, parts: (string | null)[] }[], opts: { blank?: boolean } = {}): string {
   return JSON.stringify({
     blockdevices: disks.map(disk => ({
       name: disk.kernel,
@@ -134,13 +140,35 @@ function lsblkTree(disks: { kernel: string, parts: (string | null)[] }[]): strin
         name: `${disk.kernel}${i + 1}`,
         size: GIB,
         type: 'part',
-        fstype: partlabel === null ? 'ext4' : 'linux_raid_member',
+        fstype: opts.blank ? null : partlabel === null ? 'ext4' : partlabel.includes('-cache') ? 'LVM2_member' : 'linux_raid_member',
         mountpoint: null,
         partlabel,
       })),
     })),
   })
 }
+
+/**
+ * `mdadm --examine --export <partition>` answers (story ident.3): the md UUID
+ * INSIDE each partition is what destroy acts on. `null` = no superblock.
+ */
+function addExamine(executor: MockExecutor, entries: [string, string | null][]): void {
+  for (const [device, uuid] of entries) {
+    executor.addFixture({
+      command: '/usr/sbin/mdadm',
+      args: ['--examine', '--export', device],
+      result: uuid === null
+        ? { stdout: '', stderr: `mdadm: No md superblock detected on ${device}.`, exitCode: 1 }
+        : { stdout: `MD_LEVEL=raid1\nMD_DEVICES=2\nMD_NAME=t2-r1\nMD_UUID=${uuid}\n`, stderr: '', exitCode: 0 },
+    })
+  }
+}
+
+/** The pool's own two member partitions, carrying the pool's superblock. */
+const T2_MEMBER_EXAMINE: [string, string][] = [
+  [`/dev/disk/by-id/${SMALL}-part1`, UUID_T2],
+  [`/dev/disk/by-id/${BIG}-part1`, UUID_T2],
+]
 
 /** The pool's own two member disks, exactly as the live system reports them. */
 const T2_BY_ID = byIdListing([
@@ -161,6 +189,7 @@ function addDiskReads(executor: MockExecutor, byId: string, lsblk: string): void
 /** The live-array world of `pool()`: t2-r1 on md127, LVM stack present. */
 function liveStackExecutor(): MockExecutor {
   const executor = new MockExecutor()
+  addExamine(executor, T2_MEMBER_EXAMINE)
   executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_LIVE, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_T2_R1, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
@@ -175,7 +204,7 @@ function acts(executor: MockExecutor): { command: string, args: string[] }[] {
   return executor.calls.filter(c =>
     !(c.command === '/usr/bin/cat' || c.command === '/usr/bin/findmnt' || c.command === '/usr/bin/lsblk'
       || c.command === '/usr/bin/ls' || c.command === '/usr/sbin/lvs' || c.command === '/usr/sbin/vgs'
-      || c.command === '/usr/sbin/pvs' || (c.command === '/usr/sbin/mdadm' && c.args[0] === '--detail')),
+      || c.command === '/usr/sbin/pvs' || (c.command === '/usr/sbin/mdadm' && (c.args[0] === '--detail' || c.args[0] === '--examine'))),
   )
 }
 
@@ -211,8 +240,9 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
     executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', [{ vg_name: 't2', pv_count: '1', lv_count: '1', vg_size: String(2 * GIB), vg_free: '0' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', [{ pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' }]), stderr: '', exitCode: 0 } })
     // The live disk truth the scrub phase reads: both member disks attached,
-    // every partition on them labeled for this pool.
+    // every partition on them labeled for this pool and carrying its superblock.
     addDiskReads(executor, T2_BY_ID, T2_LSBLK)
+    addExamine(executor, T2_MEMBER_EXAMINE)
     for (const command of ['/usr/bin/umount', '/usr/bin/systemctl', '/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs'])
       executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
 
@@ -289,6 +319,7 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
         { kernel: 'sde', parts: ['t2-cache1'] },
       ]),
     )
+    addExamine(executor, T2_MEMBER_EXAMINE)
     for (const command of ['/usr/bin/umount', '/usr/bin/systemctl', '/usr/sbin/lvconvert', '/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs'])
       executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
 
@@ -311,7 +342,8 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
       { command: '/usr/sbin/sgdisk', args: ['--zap-all', `/dev/disk/by-id/${SMALL}`] },
       { command: '/usr/sbin/sgdisk', args: ['--zap-all', `/dev/disk/by-id/${BIG}`] },
       // The cache slice needs no step of its own: the cache disk is in the
-      // pool's disk set with role 'cache', so the zap list already had it.
+      // pool's disk set with role 'cache', and its slice was a PV of THIS
+      // pool's VG when destroy started (ident.3) — so it is zapped with the rest.
       { command: '/usr/sbin/sgdisk', args: ['--zap-all', `/dev/disk/by-id/${CACHE}`] },
       { command: '/usr/sbin/update-initramfs', args: ['-u'] },
     ])
@@ -350,7 +382,12 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
     executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', []), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', []), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', []), stderr: '', exitCode: 0 } })
-    // zero-superblock now fails (nothing there) — tolerated by design.
+    // The earlier pass zeroed every superblock: the slices are empty and
+    // carry only this pool's labels — the state that must still be finished.
+    addDiskReads(executor, T2_BY_ID, lsblkTree([
+      { kernel: 'sdc', parts: ['t2-d1-b1'] },
+      { kernel: 'sdd', parts: ['t2-d2-b1'] },
+    ], { blank: true }))
     executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: 'Unrecognised md component device', exitCode: 1 } })
     executor.addFixture({ command: '/usr/sbin/sgdisk', result: { stdout: '', stderr: '', exitCode: 0 } })
 
@@ -361,8 +398,10 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
     for (const never of ['/usr/bin/umount', '/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/bin/systemctl', '/usr/sbin/update-initramfs'])
       assert.ok(!commands.includes(never), `${never} must not run on a half-destroyed pool`)
     assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
-    // The always-safe scrubbing still happens.
-    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--zero-superblock').length, 2)
+    // Nothing proves a superblock is there to zero (ident.3: only the pool's
+    // own are zeroed) — but the empty, pool-labelled tables are still dropped,
+    // so the re-run finishes what the first pass started.
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--zero-superblock').length, 0)
     assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/sgdisk' && c.args[0] === '--zap-all').length, 2)
     // The foreign pin and the fstab were untouched.
     assert.equal(await readFile(confPath, 'utf8'), `ARRAY /dev/md/foreign metadata=1.2 UUID=${UUID_FOREIGN}\n`)
@@ -516,6 +555,9 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
           { kernel: 'sde', parts: ['t2-d3-b1', 't2-d3-b2'] },
         ]),
       )
+      // Its superblocks still name THIS pool's array (the UUID pinned in the
+      // conf) — what makes them the pool's to zero, not the labels.
+      addExamine(executor, [[`/dev/disk/by-id/${DETACHED}-part1`, UUID_T2], [`/dev/disk/by-id/${DETACHED}-part2`, UUID_T2]])
       executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: '', exitCode: 0 } })
       for (const command of ['/usr/sbin/sgdisk', '/usr/sbin/update-initramfs'])
         executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -562,6 +604,7 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
           { kernel: 'sde', parts: ['t2-d3-b1', null] },
         ]),
       )
+      addExamine(executor, [[`/dev/disk/by-id/${DETACHED}-part1`, UUID_T2], [`/dev/disk/by-id/${DETACHED}-part2`, null]])
       executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: '', exitCode: 0 } })
       for (const command of ['/usr/sbin/sgdisk', '/usr/sbin/update-initramfs'])
         executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -606,5 +649,166 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
       assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--zero-superblock').length, 2)
       assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/sgdisk' && c.args[0] === '--zap-all').length, 2)
     })
+  })
+})
+
+/**
+ * Story ident.3 — destroy acts on identity, never on a name. A foreign
+ * `media-r1` beside a pool `media` (hand-built, or moved in from another node)
+ * carries every name destroy used to match on.
+ */
+describe('destroyAhrPool — identity, not names (ident.3)', () => {
+  let dir: string
+  let fstabPath: string
+  let confPath: string
+  const progress: string[] = []
+  const FOREIGN_DISK = 'ata-FOREIGN_MEDIA'
+
+  const MDSTAT_OURS_AND_FOREIGN = [
+    'Personalities : [raid1] ',
+    'md127 : active raid1 sdd1[1] sdc1[0]',
+    '      2086912 blocks super 1.2 [2/2] [UU]',
+    '      ',
+    'md9 : active raid1 sdf1[1] sde1[0]',
+    '      2086912 blocks super 1.2 [2/2] [UU]',
+    '      ',
+    'unused devices: <none>',
+    '',
+  ].join('\n')
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-destroy-ident-'))
+    fstabPath = join(dir, 'fstab')
+    confPath = join(dir, 'mdadm.conf')
+    progress.length = 0
+    await writeFile(fstabPath, '# empty\n')
+    await writeFile(confPath, CONF_SEED)
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  function world(): MockExecutor {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_OURS_AND_FOREIGN, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_T2_R1, stderr: '', exitCode: 0 } })
+    // The foreign one is named EXACTLY like our band 1 — only its UUID differs.
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md9'], result: { stdout: `MD_LEVEL=raid1\nMD_UUID=${UUID_FOREIGN}\nMD_NAME=otherbox:t2-r1\n`, stderr: '', exitCode: 0 } })
+    addExamine(executor, [
+      ...T2_MEMBER_EXAMINE,
+      [`/dev/disk/by-id/${FOREIGN_DISK}-part1`, UUID_FOREIGN],
+    ])
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', []), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', []), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', [
+      { pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' },
+      // The foreign array is a PV of ITS OWN volume group.
+      { pv_name: '/dev/md9', vg_name: 'media', pv_size: String(2 * GIB), pv_free: '0' },
+    ]), stderr: '', exitCode: 0 } })
+    addDiskReads(
+      executor,
+      byIdListing([
+        { id: SMALL, kernel: 'sdc', parts: 1 },
+        { id: BIG, kernel: 'sdd', parts: 1 },
+        { id: FOREIGN_DISK, kernel: 'sde', parts: 1 },
+      ]),
+      // The foreign member even carries a `t2-*` LABEL (a pool of the same
+      // name, built on another node) — still not ours: its superblock says so.
+      lsblkTree([
+        { kernel: 'sdc', parts: ['t2-d1-b1'] },
+        { kernel: 'sdd', parts: ['t2-d2-b1'] },
+        { kernel: 'sde', parts: ['t2-d1-b1'] },
+      ]),
+    )
+    for (const command of ['/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs', '/usr/sbin/mdadm'])
+      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+    return executor
+  }
+
+  it('a same-named FOREIGN array is never stopped, its partitions never zeroed, its disk never zapped', async () => {
+    const executor = world()
+    const result = await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+
+    assert.deepEqual(acts(executor), [
+      { command: '/usr/sbin/pvremove', args: ['-y', '/dev/md127'] },
+      { command: '/usr/sbin/mdadm', args: ['--stop', '/dev/md127'] },
+      { command: '/usr/sbin/mdadm', args: ['--zero-superblock', `/dev/disk/by-id/${SMALL}-part1`] },
+      { command: '/usr/sbin/mdadm', args: ['--zero-superblock', `/dev/disk/by-id/${BIG}-part1`] },
+      { command: '/usr/sbin/sgdisk', args: ['--zap-all', `/dev/disk/by-id/${SMALL}`] },
+      { command: '/usr/sbin/sgdisk', args: ['--zap-all', `/dev/disk/by-id/${BIG}`] },
+      { command: '/usr/sbin/update-initramfs', args: ['-u'] },
+    ])
+    assert.ok(!executor.calls.some(c => c.args.includes('/dev/md9') && c.command !== '/usr/sbin/mdadm'), 'no LVM act on the foreign PV')
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop' && c.args[1] === '/dev/md9'))
+    assert.ok(!executor.calls.some(c => c.args.some(a => a.includes(FOREIGN_DISK)) && c.args[0] !== '--examine'))
+    assert.deepEqual(result, { destroyed: 't2', preservedDisks: [FOREIGN_DISK], foreignArrays: ['/dev/md9'] })
+    assert.ok(progress.some(m => m.includes('/dev/md9') && m.includes('not this pool')))
+    // Only OUR pin left the conf.
+    const conf = await readFile(confPath, 'utf8')
+    assert.ok(!conf.includes(UUID_T2))
+    assert.ok(conf.includes(UUID_FOREIGN))
+  })
+
+  it('the expansion intent goes with the pool when the caller names its directory', async () => {
+    const intentDir = join(dir, 'intent')
+    await mkdir(intentDir)
+    await writeFile(join(intentDir, 't2.json'), '{}')
+    await destroyAhrPool(world(), pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath, intentDir })
+    assert.equal(existsSync(join(intentDir, 't2.json')), false)
+  })
+
+  it('a cache slice that is a PV of ANOTHER volume group is not this pool\'s to zap', async () => {
+    // pool() with a cache disk whose `t2-cache1` slice LVM counts in `media`.
+    const target: AhrDestroyTarget = { ...pool(), disks: [...pool().disks, { id: CACHE, partitions: [] }] }
+    const ex = new MockExecutor()
+    ex.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_LIVE, stderr: '', exitCode: 0 } })
+    ex.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_T2_R1, stderr: '', exitCode: 0 } })
+    addExamine(ex, T2_MEMBER_EXAMINE)
+    ex.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
+    ex.addFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', []), stderr: '', exitCode: 0 } })
+    ex.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', []), stderr: '', exitCode: 0 } })
+    ex.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', [
+      { pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' },
+      { pv_name: '/dev/sde1', vg_name: 'media', pv_size: String(GIB), pv_free: '0' },
+    ]), stderr: '', exitCode: 0 } })
+    addDiskReads(
+      ex,
+      byIdListing([{ id: SMALL, kernel: 'sdc', parts: 1 }, { id: BIG, kernel: 'sdd', parts: 1 }, { id: CACHE, kernel: 'sde', parts: 1 }]),
+      lsblkTree([{ kernel: 'sdc', parts: ['t2-d1-b1'] }, { kernel: 'sdd', parts: ['t2-d2-b1'] }, { kernel: 'sde', parts: ['t2-cache1'] }]),
+    )
+    addExamine(ex, [[`/dev/disk/by-id/${CACHE}-part1`, null]])
+    for (const command of ['/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs', '/usr/sbin/mdadm'])
+      ex.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    const result = await destroyAhrPool(ex, target, m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.ok(!ex.calls.some(c => c.command === '/usr/sbin/sgdisk' && c.args.includes(`/dev/disk/by-id/${CACHE}`)), 'the other VG\'s cache disk keeps its GPT')
+    assert.ok(!ex.calls.some(c => c.command === '/usr/sbin/pvremove' && c.args.includes('/dev/sde1')))
+    assert.deepEqual(result.preservedDisks, [CACHE])
+  })
+
+  it('the failed-create rollback stops the arrays IT created, though nothing pins them yet', async () => {
+    await writeFile(confPath, '') // the create died before its pin step
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_LIVE, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_T2_R1, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
+    for (const command of ['/usr/sbin/lvs', '/usr/sbin/vgs'])
+      executor.addFixture({ command, result: { stdout: report(command.endsWith('lvs') ? 'lv' : 'vg', []), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', []), stderr: '', exitCode: 0 } })
+    addDiskReads(executor, T2_BY_ID, T2_LSBLK)
+    for (const command of ['/usr/sbin/sgdisk', '/usr/sbin/mdadm'])
+      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    // Without the UUIDs it created, nothing proves md127 is the rollback's…
+    const blind = await destroyAhrPool(executor, { ...pool(), disksWipedByCaller: true }, m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.ok(!executor.calls.some(c => c.args[0] === '--stop'))
+    assert.deepEqual(blind.foreignArrays, ['/dev/md127'])
+    // …with them, it is stopped, and its own wiped disks are scrubbed.
+    executor.calls.length = 0
+    await destroyAhrPool(executor, { ...pool(), disksWipedByCaller: true, createdArrayUuids: [UUID_T2] }, m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.ok(executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop' && c.args[1] === '/dev/md127'))
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--zero-superblock').length, 2)
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/sgdisk' && c.args[0] === '--zap-all').length, 2)
   })
 })

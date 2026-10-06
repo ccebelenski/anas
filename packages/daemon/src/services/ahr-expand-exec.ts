@@ -15,6 +15,7 @@ import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { LVM_MIXED_BLOCK_ARGS } from './ahr-exec.js'
 import { ahrDataOffsetArg, ahrDataOffsetBytes, planDiskPartitions } from './ahr-geometry.js'
+import { examineMember, readAhrPoolIdentity } from './ahr-identity.js'
 import { clearIntent, defaultAhrIntentDir, writeIntent } from './ahr-intent.js'
 import { AHR_SIZE_GRANULARITY_BYTES, floorToGranularity, fmtBytes, isPvUnderSized } from './ahr-layout.js'
 import { pinArrays } from './ahr-mdadm-conf.js'
@@ -254,20 +255,22 @@ export interface ResolvedArray {
 }
 
 /**
- * Resolve a pool's live arrays by superblock name (GT-2/GT-3 discipline):
- * /proc/mdstat discovers, `--detail --export` identifies. Keyed by band.
+ * Resolve a pool's live arrays (GT-2/GT-3 discipline): /proc/mdstat discovers,
+ * `--detail --export` identifies. Keyed by band.
+ *
+ * Only the pool's OWN arrays (story ident.3, identity audit #4): a same-named
+ * array whose UUID is not pinned for the pool and that is not a PV of its VG
+ * is someone else's, and used to win the band slot here — after which every
+ * grow, spare add, re-add and spare removal acted on its members. The rule is
+ * the shared one ({@link readAhrPoolIdentity}). An unreadable mdstat still
+ * throws: "no arrays" must never be concluded from a read that failed.
  */
 export async function resolveAhrArrays(executor: CommandExecutor, poolName: string): Promise<Map<number, ResolvedArray>> {
-  const out = new Map<number, ResolvedArray>()
   const mdstatText = await execChecked(executor, CAT, MDSTAT_CAT_ARGS)
-  for (const md of parseMdstat(mdstatText)) {
-    const res = await executor.exec(MDADM, mdadmDetailExportArgs(`/dev/${md.kernelName}`))
-    const detail = parseMdadmDetailExport(res.stdout)
-    const named = matchAhrArrayName(detail.name ?? detail.devName ?? '')
-    if (!named || named.pool !== poolName)
-      continue
-    out.set(named.band, { band: named.band, kernelName: md.kernelName, dev: `/dev/${md.kernelName}`, md, detail })
-  }
+  const out = new Map<number, ResolvedArray>()
+  const identity = await readAhrPoolIdentity(executor, poolName, { mdstatText })
+  for (const a of identity.arrays)
+    out.set(a.band, { band: a.band, kernelName: a.kernelName, dev: a.dev, md: a.mdstat, detail: a.detail })
   return out
 }
 
@@ -951,11 +954,32 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
         throw new Error(`plan preview band ${band} has no level for array-create (planner bug)`)
       const before = await resolveAhrArrays(executor, pool.name)
       let resolved = before.get(band)
-      const created = !resolved
+      let created = false
+      let members: BandMember[] = []
       if (!resolved) {
-        const members = await expectedBandMembers(executor, pool.name, pb, ctx.intent.approvedDisks)
+        members = await expectedBandMembers(executor, pool.name, pb, ctx.intent.approvedDisks)
         if (members.length !== pb.memberCount)
           throw new Error(`band ${band} expects ${pb.memberCount} member slices but ${members.length} are present`)
+        const name = `${pool.name}-r${band}`
+        // A previous pass may have CREATED this array and died before the pin
+        // landed (story ident.3): unpinned and not yet a PV, it is invisible to
+        // the ownership rule, and a second --create would fail on busy members.
+        // The members are this expansion's own labelled slices on approved
+        // disks, so a superblock naming THIS band inside the first of them is
+        // the array this step made — pin it and carry on.
+        const inside = await examineMember(executor, members[0].partByIdPath)
+        const insideName = inside.name ? matchAhrArrayName(inside.name) : null
+        if (inside.uuid !== null && insideName?.pool === pool.name && insideName.band === band) {
+          await pinArrays([{ name, uuid: inside.uuid }])
+          const r = await executor.exec(UPDATE_INITRAMFS, ['-u'])
+          if (r.exitCode !== 0)
+            ctx.log(`ahr.expand pool=${pool.name} warn=update-initramfs-failed detail=${r.stderr.trim()}`)
+          ctx.log(`ahr.expand pool=${pool.name} step=array-create target=${step.target} pin=recovered uuid=${inside.uuid}`)
+          resolved = (await resolveAhrArrays(executor, pool.name)).get(band)
+        }
+      }
+      if (!resolved) {
+        created = true
         const name = `${pool.name}-r${band}`
         await execChecked(executor, MDADM, [
           '--create',
@@ -972,26 +996,22 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
           '--bitmap=internal',
           ...members.map(m => m.partByIdPath),
         ])
-        // Pin the new array + refresh the initramfs copy (§2.6). Best-effort:
-        // pinning is boot-name determinism, not data safety — a failure is
-        // logged loudly but never halts a data-layer-complete step.
-        try {
-          const after = await resolveAhrArrays(executor, pool.name)
-          resolved = after.get(band)
-          const uuid = resolved?.detail.uuid
-          if (uuid) {
-            await pinArrays([{ name, uuid }])
-            const r = await executor.exec(UPDATE_INITRAMFS, ['-u'])
-            if (r.exitCode !== 0)
-              ctx.log(`ahr.expand pool=${pool.name} warn=update-initramfs-failed detail=${r.stderr.trim()}`)
-          }
-          else {
-            ctx.log(`ahr.expand pool=${pool.name} warn=pin-skipped detail=no-uuid-for-${name}`)
-          }
-        }
-        catch (err) {
-          ctx.log(`ahr.expand pool=${pool.name} warn=pin-failed detail=${err instanceof Error ? err.message : String(err)}`)
-        }
+        // Pin the new array + refresh the initramfs copy (§2.6). The pin is
+        // the array's IDENTITY now (story ident.3), not only its boot name:
+        // until it lands, the array is neither pinned nor a PV of the VG, and
+        // the ownership rule would not count it as this pool's. So the UUID
+        // is read from the device this step just created — never by a name
+        // lookup, which a same-named foreign array could answer — and a pin
+        // that cannot be written fails the step (the intent halts; a resume
+        // recovers the pin from the member superblock above).
+        const uuid = parseMdadmDetailExport(await execChecked(executor, MDADM, mdadmDetailExportArgs(`/dev/md/${name}`))).uuid
+        if (!uuid)
+          throw new Error(`could not read the md UUID of the new array ${name} — refusing to continue without its identity`)
+        await pinArrays([{ name, uuid }])
+        const r = await executor.exec(UPDATE_INITRAMFS, ['-u'])
+        if (r.exitCode !== 0)
+          ctx.log(`ahr.expand pool=${pool.name} warn=update-initramfs-failed detail=${r.stderr.trim()}`)
+        resolved = (await resolveAhrArrays(executor, pool.name)).get(band)
       }
 
       // §11 expansion coupling: a new band extends every attached spare that

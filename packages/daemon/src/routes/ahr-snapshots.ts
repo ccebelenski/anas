@@ -6,7 +6,7 @@ import type { ConfirmStore } from '../safety/confirm.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { AhrCreateSnapshotRequest, AhrSnapshotName, PoolName } from '@anas/shared'
 import { confirmGate } from '../safety/gate.js'
-import { readIntent } from '../services/ahr-intent.js'
+import { readPoolIntent } from '../services/ahr-intent.js'
 import {
   createAhrSnapshot,
   defaultSnapshotName,
@@ -98,7 +98,8 @@ export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapsh
       } })
       return true
     }
-    const intent = await readIntent(pool.name, intentDir)
+    // This pool's intent only — a stale one refuses nothing (story ident.3).
+    const intent = (await readPoolIntent(pool, intentDir)).intent
     if (intent) {
       reply.code(409).send({ error: {
         code: 'CONFLICT',

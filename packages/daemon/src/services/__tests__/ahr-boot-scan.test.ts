@@ -3,7 +3,7 @@ import type { JobHandler, JobQueue, JobSubmitter } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -61,13 +61,32 @@ function mdstatFixture(executor: MockExecutor, text: string): void {
 
 const MDADM = '/usr/sbin/mdadm'
 
+/**
+ * The ANAS-pinned arrays of this file's pools (story ident.3): the recovery
+ * ladder force-starts only an array whose UUID is pinned for its pool, and
+ * health counts only the pool's own arrays.
+ */
+const PINNED_CONF = [
+  'ARRAY /dev/md/ahr0-r1 metadata=1.2 UUID=aaaaaaaa:bbbbbbbb:cccccccc:dddddddd',
+  'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa',
+  'ARRAY /dev/md/tank-r2 metadata=1.2 UUID=bbbbbbbb:bbbbbbbb:bbbbbbbb:bbbbbbbb',
+  '',
+].join('\n')
+
+async function pinConf(dir: string, text: string = PINNED_CONF): Promise<void> {
+  process.env.ANAS_MDADM_CONF = join(dir, 'mdadm.conf')
+  await writeFile(process.env.ANAS_MDADM_CONF, text)
+}
+
 describe('ahr-boot-scan (GT-8 recovery + orphaned intents + reshape observation)', () => {
   let dir: string
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-ahr-boot-'))
+    await pinConf(dir)
   })
   afterEach(async () => {
+    delete process.env.ANAS_MDADM_CONF
     await rm(dir, { recursive: true, force: true })
   })
 
@@ -96,6 +115,51 @@ describe('ahr-boot-scan (GT-8 recovery + orphaned intents + reshape observation)
     assert.equal(warnings.length, 1)
     assert.match(warnings[0].args[4], /mdadm --run/)
     assert.match(warnings[0].args[4], /vgchange -ay ahr0/)
+  })
+
+  it('(a) never force-starts an UNPINNED array — a foreign `media-r1` survives the boot ladder (ident.3)', async () => {
+    // A hand-built mirror that happens to be named like an AHR band, inactive
+    // after the same power loss: no pin, no VG. Not ANAS's to `--run`.
+    await pinConf(dir, '# nothing pinned for media\n')
+    const executor = new MockExecutor()
+    mdstatFixture(executor, MDSTAT_INACTIVE_SPARES)
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md127'], result: { stdout: 'MD_LEVEL=raid5\nMD_UUID=99999999:99999999:99999999:99999999\nMD_NAME=otherbox:media-r1\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+    const lines: string[] = []
+
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.deepEqual(report.recovered, [])
+    assert.ok(!executor.calls.some(c => c.command === MDADM && (c.args[0] === '--run' || c.args[0] === '--readwrite')))
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/vgchange'))
+    assert.ok(lines.some(l => l.includes('array=media-r1') && l.includes('action=ignored')), lines.join('\n'))
+  })
+
+  it('(a) an array pinned for its pool but unpinned for THIS UUID (a recreated name) is not laddered either', async () => {
+    // ahr0 IS pinned — with another array's UUID. This inactive `ahr0-r1` is
+    // not the pinned one, and it is not a PV of any VG while inactive.
+    const executor = new MockExecutor()
+    mdstatFixture(executor, MDSTAT_INACTIVE_SPARES)
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_R1.replace('aaaaaaaa:bbbbbbbb:cccccccc:dddddddd', '12345678:12345678:12345678:12345678'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+    const report = await ahrBootScan(executor, { intentDir: dir, log: () => {} })
+    assert.deepEqual(report.recovered, [])
+    assert.ok(!executor.calls.some(c => c.command === MDADM && c.args[0] === '--run'))
+  })
+
+  it('(b) a running intent that recorded ANOTHER pool\'s arrays is stale — ignored, never halted (ident.3)', async () => {
+    // `tank` was destroyed and recreated under the same name; the old intent
+    // recorded the old pool's array UUID, which nothing on the node carries.
+    const executor = new MockExecutor()
+    mdstatFixture(executor, 'unused devices: <none>\n')
+    executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    const stale = { ...mkIntent('running'), arrayUuids: ['77777777:77777777:77777777:77777777'] }
+    await writeIntent('tank', stale, { dir })
+
+    const report = await ahrBootScan(executor, { intentDir: dir, log: () => {} })
+    assert.deepEqual(report.staleIntents, ['tank'])
+    assert.deepEqual(report.haltedIntents, [])
+    assert.equal((await readIntent('tank', dir))?.state, 'running', 'left exactly as it was — never flipped to halted')
+    assert.ok(!executor.calls.some(c => c.command === '/usr/bin/perl'), 'no "expansion interrupted" warning')
   })
 
   it('(b) flips a running intent to halted and notifies that Resume is needed', async () => {
@@ -324,8 +388,10 @@ describe('ahr-boot-scan re-attach (issue #1 — healthy interrupted reshape)', (
   let dir: string
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-ahr-boot-resume-'))
+    await pinConf(dir)
   })
   afterEach(async () => {
+    delete process.env.ANAS_MDADM_CONF
     await rm(dir, { recursive: true, force: true })
   })
 

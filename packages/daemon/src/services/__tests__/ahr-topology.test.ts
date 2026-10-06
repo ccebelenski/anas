@@ -471,6 +471,36 @@ unused devices: <none>
       assert.equal(pools[0].name, 'media')
       assert.equal(pools[0].state, 'failed', 'pinned-but-VG-gone reports as failed, not hidden')
     })
+
+    it('a PINNED pool never absorbs a same-named foreign array — no second band 1 (ident.3, audit #4)', async () => {
+      // Two live `media-r1` arrays: ours (pinned, md40) and a foreign one
+      // moved in from another node (md41, its own UUID, nothing pins it).
+      const FOREIGN_UUID = 'eeeeeeee:eeeeeeee:eeeeeeee:eeeeeeee'
+      const mock = new MockExecutor()
+      mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: ok(`Personalities : [raid1]
+md40 : active raid1 sdy1[1] sdx1[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+md41 : active raid1 sdw1[1] sdv1[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+unused devices: <none>
+`) })
+      mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md40'), result: ok(MEDIA_EXPORT) })
+      mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md41'), result: ok(MEDIA_EXPORT.replace(MEDIA_UUID, FOREIGN_UUID).replace('anas-pve:', 'otherbox:')) })
+      mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok('{"blockdevices":[]}') })
+      mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok('') })
+      mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(loadFixture('lvm-vgs.json')) })
+      mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(loadFixture('lvm-lvs.json')) })
+      mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok('') })
+      const confPath = join(confDir, 'mdadm.conf')
+      await writeFile(confPath, `ARRAY /dev/md/media-r1 metadata=1.2 UUID=${MEDIA_UUID}\n`)
+
+      const pools = await readAhrPools(mock, confPath)
+      assert.equal(pools.length, 1)
+      assert.deepEqual(pools[0].arrays.map(a => [a.kernelName, a.uuid]), [['md40', MEDIA_UUID]])
+      assert.ok(!pools[0].disks.some(d => d.id === 'sdv' || d.id === 'sdw'), 'the foreign members are not pool disks (not destroy\'s to zap)')
+    })
   })
 
   // --- What the UI pill tone leans on --------------------------------------

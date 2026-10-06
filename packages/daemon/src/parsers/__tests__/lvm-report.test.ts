@@ -140,6 +140,15 @@ describe('report ARGS', () => {
     assert.deepEqual(PVS_ARGS.slice(5), ['-o', '+dev_size'])
   })
 
+  // vgs additionally asks for the VG UUID (story ident.3) — the identity an
+  // expansion intent records, since a recreated pool reuses the VG NAME.
+  it('vgs appends vg_uuid WITHOUT dropping the default columns', () => {
+    assert.deepEqual(VGS_ARGS.slice(5), ['-o', '+vg_uuid'])
+    const json = JSON.stringify({ report: [{ vg: [{ vg_name: 't2', vg_uuid: 'AbCd-1234', pv_count: '1', lv_count: '1', vg_size: '1', vg_free: '0' }] }] })
+    assert.equal(parseVgsReport(json)[0].uuid, 'AbCd-1234')
+    assert.equal(parseVgsReport(JSON.stringify({ report: [{ vg: [{ vg_name: 't2' }] }] }))[0].uuid, null)
+  })
+
   it('a report without dev_size reads 0 — never a spurious resize', () => {
     const json = JSON.stringify({ report: [{ pv: [{ pv_name: '/dev/md127', vg_name: 'ahr0', pv_size: '100', pv_free: '0' }] }] })
     assert.equal(parsePvsReport(json)[0].devSizeBytes, 0)

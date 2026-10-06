@@ -450,11 +450,70 @@ describe('AHR expansion routes (Epic 11.6)', () => {
     it('recomputes from current topology + approved set and re-drives (202)', async () => {
       await build()
       await writeIntent('tank', mkIntent('halted'), { dir })
-      const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand/resume', headers: IDENTITY_HEADERS })
+      // ident.3 (d): resume goes through a confirm naming the disks it is about
+      // to partition — the approved set may be days old.
+      const first = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand/resume', headers: IDENTITY_HEADERS })
+      assert.equal(first.statusCode, 409, first.body)
+      assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+      const code = first.headers['x-anas-confirm-code'] as string
+      assert.ok(code)
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand/resume', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code } })
       assert.equal(res.statusCode, 202, res.body)
       const job = await waitForJob(jobQueue, res.json().job.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
       assert.equal(await readIntent('tank', dir), null)
+    })
+  })
+
+  describe('the intent is keyed by NAME — identity decides whose it is (ident.3)', () => {
+    /** An intent written for an EARLIER pool named `tank` (its array is gone). */
+    function staleIntent(state: AhrExpansionIntent['state']): AhrExpansionIntent {
+      return { ...mkIntent(state), arrayUuids: ['77777777:77777777:77777777:77777777'] }
+    }
+
+    it('a stale HALTED intent is not this pool\'s: resume has nothing to resume, abandon nothing to abandon', async () => {
+      await build()
+      await writeIntent('tank', staleIntent('halted'), { dir })
+      const resume = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand/resume', headers: IDENTITY_HEADERS })
+      assert.equal(resume.statusCode, 409)
+      assert.match(resume.json().error.message, /no halted expansion/)
+      const abandon = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand/abandon', headers: IDENTITY_HEADERS })
+      assert.equal(abandon.statusCode, 409)
+      assert.match(abandon.json().error.message, /no expansion intent/)
+    })
+
+    it('a stale intent refuses nothing: a new expand proceeds and its intent REPLACES the stale one, recording this pool', async () => {
+      await build()
+      await writeIntent('tank', staleIntent('running'), { dir })
+      const first = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand', headers: IDENTITY_HEADERS, payload: { addDisks: [S] } })
+      assert.equal(first.statusCode, 409, first.body)
+      assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED', 'the stale intent did not block the expand')
+      const code = first.headers['x-anas-confirm-code'] as string
+      // Hold the job so the freshly written intent can be read back.
+      const submit = jobQueue.submit.bind(jobQueue)
+      const written: (AhrExpansionIntent | null)[] = []
+      jobQueue.submit = (...[op, who, handler, opts]: Parameters<JobQueue['submit']>) => submit(op, who, async (...args: Parameters<typeof handler>) => {
+        written.push(await readIntent('tank', dir))
+        return handler(...args)
+      }, opts)
+      const second = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code }, payload: { addDisks: [S] } })
+      assert.equal(second.statusCode, 202, second.body)
+      await waitForJob(jobQueue, second.json().job.id)
+      assert.equal(written.length, 1, 'an intent was written for the new expansion')
+      assert.deepEqual(written[0]?.arrayUuids?.sort(), ['aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa', 'bbbbbbbb:bbbbbbbb:bbbbbbbb:bbbbbbbb'])
+    })
+
+    it('resume RE-CHECKS every approved disk: one that became something else while halted is refused, nothing driven', async () => {
+      await build()
+      // The halted expansion approved D1 — which is now a member of pool `quad`.
+      await writeIntent('tank', { ...mkIntent('halted'), approvedDisks: [X, Y, Z, D1] }, { dir })
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand/resume', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 409, res.body)
+      assert.equal(res.json().error.code, 'CONFLICT')
+      assert.match(res.json().error.message, new RegExp(`disk '${D1}' is no longer available .*may have been reused`))
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
+      assert.deepEqual(mutatingCalls(executor), [])
+      assert.equal((await readIntent('tank', dir))?.state, 'halted')
     })
   })
 
