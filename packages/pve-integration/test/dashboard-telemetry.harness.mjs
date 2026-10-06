@@ -328,8 +328,6 @@ function makeView() {
         cmps[id] = {
           itemId: id,
           html: '',
-          // The version line ships `hidden: true` and is shown only once it
-          // has a version (disks.1 fix batch) — the stub models both.
           hidden: false,
           setHtml(h) { this.html = h },
           setHidden(v) { this.hidden = !!v },
@@ -513,14 +511,18 @@ ok('charts carry the average overlay', html.includes('anas-gfx-tc-avg'))
   }
 }
 
-// --- 6. The header version label (disks.1 rider 2) ----------------------------
+// --- 6. The header version label (disks.1 rider 2, dash.r1) ------------------
 
 {
-  const ver = view.down('#anasDashVersion')
-  ok('the dashboard has a version line under the header', !!ver)
-  eq('the version line reads "ANAS <version>" off the stashed version',
-    ver.html, 'ANAS 9.9.9-harness')
-  ok('the version line is shown once it has a version', ver.hidden === false)
+  // dash.r1: the label shares the header's muted Node line — no line of its own.
+  const head = view.down('#anasDashHead').html
+  const line = (head.match(/<div class="anas-dash-muted">([\s\S]*?)<\/div>/) || [])[1] || ''
+  ok('the version label sits on the Node line',
+    line.startsWith('Node: harness') && line.includes('class="anas-dash-version"'), line)
+  eq('the version label reads "ANAS <version>" off the stashed version',
+    (line.match(/<span class="anas-dash-version">([^<]*)<\/span>/) || [])[1], 'ANAS 9.9.9-harness')
+  ok('a muted separator stands between Node and the version', line.includes(' &middot; <span'), line)
+  ok('there is no separate version line any more', !('anasDashVersion' in view._cmps))
 
   // ONE call, ONE source (fix batch): the install check every view is wrapped
   // in already probed /health, so the dashboard issues no health GET at all —
@@ -531,15 +533,16 @@ ok('charts carry the average overlay', html.includes('anas-gfx-tc-avg'))
   eq('telemetry ticks do not poll /health', state.healthCalls || 0, 0)
 
   // Fail-open: nothing stashed (an old gateway, a failed probe, a daemon that
-  // answered without a version) leaves the line empty AND hidden — an empty
-  // component still costs its 14 px margin.
+  // answered without a version) leaves the label AND its separator out — the
+  // Node line reads as it did before there was a version to show.
   state.daemonVersion = undefined
   const bare = makeView()
   ANAS.views.dashboard.factory('harness').listeners.afterrender(bare)
   await new Promise(r => setImmediate(r))
-  const bareVer = bare.down('#anasDashVersion')
-  eq('with no version stashed the label stays empty', bareVer.html, '')
-  ok('...and hidden, so it reserves no space', bareVer.hidden === true)
+  const bareHead = bare.down('#anasDashHead').html
+  ok('with no version stashed the label is absent', !bareHead.includes('anas-dash-version'), bareHead)
+  ok('...and so is its separator', !bareHead.includes('&middot;'), bareHead)
+  ok('...and the Node line is intact', bareHead.includes('<div class="anas-dash-muted">Node: harness</div>'), bareHead)
   eq('...and still no /health call was made', state.healthCalls || 0, 0)
   state.daemonVersion = '9.9.9-harness'
 }

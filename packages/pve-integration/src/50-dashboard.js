@@ -78,8 +78,9 @@
  * / 'anas-dash-net' / 'anas-dash-status'; Refresh button 'anas-btn-dash-refresh';
  * latency readout 'anas-dash-lat' (pool head, vdev line, device tile);
  * collapsed sole vdev/band 'anas-dash-vdev-solo'; header version label
- * 'anas-dash-version' (itemId anasDashVersion, read from the version the
- * install check's /health probe stashed — this view makes no health call).
+ * 'anas-dash-version' (a span on the Node line of itemId anasDashHead, read
+ * from the version the install check's /health probe stashed — this view
+ * makes no health call).
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  */
@@ -2034,8 +2035,9 @@
 
     // ---- Factory + registration --------------------------------------------
 
-    // ANAS version label (disks.1 rider 2): a plain "ANAS <version>" line under
-    // the header, saying at a glance which ANAS the node is running. The skew
+    // ANAS version label (disks.1 rider 2): a plain "ANAS <version>" on the
+    // header's Node line (dash.r1 — it once sat on a line of its own), saying
+    // at a glance which ANAS the node is running. The skew
     // banner (12.1) keeps its job of warning about a mismatch; this is only
     // the label.
     //
@@ -2044,7 +2046,7 @@
     // so the label reads that: one call, one source. A second GET for the same
     // body was the whole finding. Fail-open — nothing stashed (an old gateway,
     // a failed probe, a daemon that answered without a version) leaves the
-    // line hidden rather than reserving 14 px of empty space.
+    // label and its separator out, so the Node line reads as it always did.
     function loadVersion(view, node) {
         var v;
         try {
@@ -2052,21 +2054,17 @@
         } catch (e) {
             v = null;
         }
-        setSection(view, 'anasDashVersion',
-            v ? enc(t('ANAS') + ' ' + v) : '');
-        try {
-            var cmp = view.down('#anasDashVersion');
-            if (cmp && cmp.setHidden) {
-                cmp.setHidden(!v);
-            }
-        } catch (e2) {
-            // non-fatal — the label is a courtesy, never a surface of its own
-        }
+        setSection(view, 'anasDashHead', headHtml(node, v || null));
     }
 
-    function headHtml(node) {
+    // Header: the title, then ONE muted line — "Node: <name> · ANAS <version>"
+    // once the version is known, "Node: <name>" until then.
+    function headHtml(node, version) {
+        var ver = version
+            ? ' &middot; <span class="anas-dash-version">' + enc(t('ANAS') + ' ' + version) + '</span>'
+            : '';
         return '<h2 style="margin:0 0 2px 0">' + enc(t('ANAS Dashboard')) + '</h2>'
-            + '<div class="anas-dash-muted">' + enc(t('Node') + ': ' + node) + '</div>';
+            + '<div class="anas-dash-muted">' + enc(t('Node') + ': ' + node) + ver + '</div>';
     }
 
     function section(itemId, cls, initialHtml) {
@@ -2127,18 +2125,6 @@
                         itemId: 'anasDashHead',
                         style: { 'margin-bottom': '14px' },
                         html: headHtml(node)
-                    },
-                    // ANAS <version> (disks.1 rider 2) — filled from the
-                    // version the install check already stashed. Hidden until
-                    // it is: an empty line still costs its 14 px margin, and
-                    // an old gateway would leave that gap for ever.
-                    {
-                        xtype: 'component',
-                        itemId: 'anasDashVersion',
-                        cls: 'anas-dash-muted anas-dash-version',
-                        style: { 'margin-bottom': '14px' },
-                        hidden: true,
-                        html: ''
                     },
                     // 2.5 warnings — no heading, callouts speak for themselves.
                     {
