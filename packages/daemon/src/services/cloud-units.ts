@@ -276,7 +276,7 @@ export interface CloudTaskStatus {
   lastSuccessAt: string | null
   /** The unit's service is still running right now (task-units.ts — free off the same `systemctl show`). */
   runActive: boolean
-  /** "cancelled by <user> at <time>" for a cancelled last run, from the journal (rclone.5). */
+  /** "cancelled by <user> at <time>" for a cancelled last run (rclone.5), or the not-retained note for an `unknown` one (taskstatus.1). */
   lastRunNote?: string
 }
 

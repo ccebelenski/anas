@@ -286,6 +286,8 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
       nextUsec?: string
       /** Empty = systemd retains no run history for this unit (the F9 shape). */
       exitStamp?: string
+      journal?: string
+      lastTrigger?: string
     }): MockExecutor {
       const mock = new MockExecutor()
       mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/media'), result: { stdout: opts.source ? snapshotListJson('testpool/media', opts.source) : '', stderr: '', exitCode: 0 } })
@@ -296,8 +298,26 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
       const exitStamp = opts.exitStamp ?? 'Wed 2026-07-15 03:00:12 UTC'
       mock.addFixture({ command: SYSTEMCTL, args: ['show', serviceUnitName('nightly-media'), '-p', 'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp'], result: { stdout: `ActiveState=${opts.active ?? 'inactive'}\nResult=${opts.result ?? 'success'}\nExecMainStatus=0\nExecMainExitTimestamp=${exitStamp}\nInactiveEnterTimestamp=${exitStamp}\n`, stderr: '', exitCode: 0 } })
       mock.addFixture({ command: SYSTEMCTL, args: ['show', timerUnitName('nightly-media'), '-p', 'NextElapseUSecRealtime'], result: { stdout: `NextElapseUSecRealtime=${opts.nextUsec ?? '0'}\n`, stderr: '', exitCode: 0 } })
+      if (opts.journal !== undefined)
+        mock.addFixture({ command: '/usr/bin/journalctl', args: ['-u', serviceUnitName('nightly-media'), '-n', '200', '-o', 'short-iso', '--no-pager'], result: { stdout: opts.journal, stderr: '', exitCode: 0 } })
+      if (opts.lastTrigger !== undefined)
+        mock.addFixture({ command: SYSTEMCTL, args: ['show', timerUnitName('nightly-media'), '-p', 'LastTriggerUSec'], result: { stdout: `LastTriggerUSec=${opts.lastTrigger}\n`, stderr: '', exitCode: 0 } })
       return mock
     }
+
+    // taskstatus.1 wiring — the precedence is proven in unit-run-status.test.ts.
+    it('after a reboot the runner\'s journal line answers the verdict', async () => {
+      const journal = '2026-10-05T03:00:12+0000 pve anas-repl-nightly-media[910]: {"task":"testpool/media","result":{"sent":["s2"]}}'
+      const st = await deriveTaskStatus(statusMock({ exitStamp: '', journal }), makeTask())
+      assert.equal(st.lastRunResult, 'success')
+      assert.equal(st.lastRunNote, undefined)
+    })
+
+    it('after a reboot with only the timer stamp left → unknown with the note', async () => {
+      const st = await deriveTaskStatus(statusMock({ exitStamp: '', journal: '', lastTrigger: 'Mon 2026-10-05 03:00:00 UTC' }), makeTask())
+      assert.equal(st.lastRunResult, 'unknown')
+      assert.equal(st.lastRunNote, 'ran at 2026-10-05 03:00 UTC; result not retained across the reboot')
+    })
 
     it('current: newest source snapshot is on the target → 0 behind', async () => {
       const mock = statusMock({

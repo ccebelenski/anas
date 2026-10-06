@@ -2100,6 +2100,9 @@
         } else if (result === 'never-run') {
             pill = softPill(t('never run'), 'var(--anas-muted,gray)',
                 t('this task has not run yet'));
+        } else if (result === 'unknown' && !overdue && rec.get('lastRunNote')) {
+            // taskstatus.1: ran, verdict not retained across the reboot.
+            pill = ANAS.sched.notRetainedPill(rec.get('lastRunNote'));
         } else if (overdue) {
             pill = pillHtml(t('overdue'), 'var(--anas-danger,#c23b2c)',
                 t('Past its schedule without a successful run — treated as failed.'));

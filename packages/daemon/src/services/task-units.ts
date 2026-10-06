@@ -3,7 +3,7 @@ import type { ZodType } from 'zod'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { CadenceGateDecision, TaskTrigger } from './backup-cadence.js'
-import type { SystemdRunResult } from './systemd-status.js'
+import type { TaskHelperResult, UnitRunResult } from './unit-run-status.js'
 import { readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK, cadenceToOnCalendar, TASK_CANCELLED_EXIT_CODE } from '@anas/shared'
@@ -11,6 +11,21 @@ import { JobCancelledError } from '../jobs/queue.js'
 import { decideCadenceRun, isTaskOverdue, overdueWindowMs } from './backup-cadence.js'
 import { deriveRunResult as deriveSystemdRunResult, parseShow, parseSystemdTimestamp } from './systemd-status.js'
 import { listServiceUnits, parseMarkedJson, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
+import {
+  deriveUnitRunStatus,
+  isRunActive,
+  messageFromJournalLine,
+  parseHelperResult,
+  parseJournalTimestamp,
+  readUnitJournal,
+  showUnitProps,
+  TRIGGER_SLACK_MS,
+} from './unit-run-status.js'
+
+// The run-status primitives moved to unit-run-status.ts (taskstatus.1); the
+// task stores and their tests keep importing them from here.
+export { isRunActive, messageFromJournalLine, parseHelperResult } from './unit-run-status.js'
+export type { TaskHelperResult } from './unit-run-status.js'
 
 /**
  * The scheduled-TASK generics — everything a units-are-the-store task kind does
@@ -41,25 +56,10 @@ import { listServiceUnits, parseMarkedJson, runSystemctl, systemdTimersStampDir,
 
 const SYSTEMCTL = '/usr/bin/systemctl'
 const SYSTEMD_ANALYZE = '/usr/bin/systemd-analyze'
-const JOURNALCTL = '/usr/bin/journalctl'
-/** How many recent journald lines the detail view surfaces. */
-const JOURNAL_TAIL = 200
-/**
- * Slack when deciding whether a timer (rather than a hand) started this run.
- * systemd prints these timestamps at 1-second resolution, and the trigger always
- * precedes the start; 5s covers the granularity without spanning anything real.
- */
-const TRIGGER_SLACK_MS = 5000
 /** Trailing `=` of a marker token — trimmed for the skip warning's prose. */
 const MARKER_EQUALS_RE = /=$/
-/** journalctl `short-iso` numeric zone (`+0000`) → the ISO form Date.parse wants. */
-const JOURNAL_TZ_RE = /([+-]\d{2})(\d{2})$/
-/** journalctl syslog prefix without a `[pid]` bracket: `<ts> <host> <ident>: <msg>`. */
-const JOURNAL_PREFIX_RE = /^\S+\s+\S+\s+\S+?:\s(.*)$/
 /** A failure-ish message line. */
 const FAILED_MSG_RE = /failed/i
-/** ActiveState values that mean the oneshot service is still running. */
-const RUN_ACTIVE_STATES = new Set(['activating', 'active', 'reloading'])
 /** Supervision poll cadence. */
 const SUPERVISE_POLL_MS = 2000
 /** Generous ceiling — a real run can run long; mirrors the UI's 600s budget. */
@@ -437,7 +437,7 @@ export function effectiveSchedule(task: ScheduledTask): string {
 // that exited with the runner's deliberate-skip code.
 
 /** A run's outcome: systemd's map plus the runners' deliberate skip and cancel exits. */
-export type TaskRunResult = SystemdRunResult | 'skipped' | 'cancelled'
+export type TaskRunResult = UnitRunResult
 
 /**
  * Map a service's systemd state to a task run result — the shared oneshot map
@@ -584,18 +584,21 @@ export interface TaskStatus {
    */
   runActive: boolean
   /**
-   * The last run's own one-line account when its result needs one — today only
-   * `cancelled`: "cancelled by <user> at <time>", from the runner's result line
-   * in the unit journal (one journal read, only for a cancelled row). Absent
-   * when the journal no longer holds it (rclone.5).
+   * The last run's own one-line account when its result needs one:
+   * `cancelled` → "cancelled by <user> at <time>", from the runner's result
+   * line in the unit journal (absent when the journal no longer holds it,
+   * rclone.5); `unknown` after a reboot with only the timer's stamp left →
+   * "ran at <time>; result not retained across the reboot" (taskstatus.1).
    */
   lastRunNote?: string
 }
 
 /**
- * Derive one task's LOCAL-ONLY status from persistent systemd state: the
- * service's last result + last-run time, and the timer's next elapse. Fail-open
- * to unknown/nulls per source.
+ * Derive one task's LOCAL-ONLY status: the last run, verdict and next run from
+ * the shared derivation (unit-run-status.ts — live service props, else the
+ * journal's result line, else the timer's stamp), with the task kinds' own
+ * result map (skip code, cancel exit) and cadence-aware overdue layered on.
+ * Fail-open to unknown/nulls per source.
  *
  * Overdue is CADENCE-AWARE (16.10): the timer-never-caught-up rule still applies
  * to every task, and a task with a structured cadence is additionally overdue
@@ -609,15 +612,15 @@ export async function deriveTaskStatus(
   task: TaskStatusSubject,
   now: number = Date.now(),
 ): Promise<TaskStatus> {
-  const [serviceProps, nextRaw] = await Promise.all([
-    showService(kind, executor, task.name),
-    showTimerNext(kind, executor, task.name),
-  ])
-
-  const lastRunResult = deriveTaskRunResult(serviceProps, { enabled: task.enabled })
-  const lastRunAt = parseSystemdTimestamp(serviceProps.ExecMainExitTimestamp)
-    ?? parseSystemdTimestamp(serviceProps.InactiveEnterTimestamp)
-  const nextRunAt = parseSystemdTimestamp(nextRaw)
+  // taskstatus.1: the shared run-status derivation (unit-run-status.ts) —
+  // live service props, else the journal's last result line, else the timer's
+  // last trigger. The task map (skip code, cancel exit) is this kind's own.
+  const { lastRunResult, lastRunAt, lastRunNote, nextRunAt, runActive } = await deriveUnitRunStatus(executor, {
+    serviceUnit: serviceUnitName(kind, task.name),
+    timerUnit: timerUnitName(kind, task.name),
+    enabled: task.enabled,
+    mapLive: deriveTaskRunResult,
+  })
 
   // A successful last run IS the last success — systemd already told us when.
   // Only when it wasn't (a skip, a failure, nothing yet) do we pay for a journal
@@ -634,57 +637,14 @@ export async function deriveTaskStatus(
     now,
   })
 
-  // A cancelled row's tooltip says who and when; the runner printed exactly
-  // that sentence as its result's `reason`, so the journal is where it is.
-  const lastRunNote = lastRunResult === 'cancelled'
-    ? parseHelperResult(await readRecentJournal(kind, executor, task.name))?.reason
-    : undefined
-
   return {
     lastRunResult,
     lastRunAt,
     nextRunAt,
     overdue,
     lastSuccessAt,
-    runActive: isRunActive(serviceProps),
+    runActive,
     ...(lastRunNote ? { lastRunNote } : {}),
-  }
-}
-
-async function showService(
-  kind: TaskUnitKind,
-  executor: CommandExecutor,
-  name: string,
-): Promise<Record<string, string>> {
-  try {
-    const r = await executor.exec(SYSTEMCTL, [
-      'show',
-      serviceUnitName(kind, name),
-      '-p',
-      'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp',
-    ])
-    if (r.exitCode !== 0 && !r.stdout.trim())
-      return {}
-    return parseShow(r.stdout)
-  }
-  catch {
-    return {}
-  }
-}
-
-async function showTimerNext(
-  kind: TaskUnitKind,
-  executor: CommandExecutor,
-  name: string,
-): Promise<string | undefined> {
-  try {
-    const r = await executor.exec(SYSTEMCTL, ['show', timerUnitName(kind, name), '-p', 'NextElapseUSecRealtime'])
-    if (r.exitCode !== 0 && !r.stdout.trim())
-      return undefined
-    return parseShow(r.stdout).NextElapseUSecRealtime
-  }
-  catch {
-    return undefined
   }
 }
 
@@ -699,33 +659,10 @@ export async function readRecentJournal(
   executor: CommandExecutor,
   name: string,
 ): Promise<string> {
-  try {
-    const r = await executor.exec(JOURNALCTL, [
-      '-u',
-      serviceUnitName(kind, name),
-      '-n',
-      String(JOURNAL_TAIL),
-      '-o',
-      'short-iso',
-      '--no-pager',
-    ])
-    return r.exitCode === 0 ? r.stdout.trim() : ''
-  }
-  catch {
-    return ''
-  }
+  return readUnitJournal(executor, serviceUnitName(kind, name))
 }
 
 // --- Cadence gate inputs: last success + who triggered this run (16.10) ------
-
-/** journalctl `short-iso` stamps its zone as `+0000`; Date.parse wants `+00:00`. */
-function parseJournalTimestamp(line: string): string | null {
-  const stamp = line.split(' ')[0]
-  if (!stamp)
-    return null
-  const ms = Date.parse(stamp.replace(JOURNAL_TZ_RE, '$1:$2'))
-  return Number.isNaN(ms) ? null : new Date(ms).toISOString()
-}
 
 /**
  * When the task last completed REAL work, from the unit's own journal — the only
@@ -795,23 +732,10 @@ export async function deriveTriggerSource(
   name: string,
 ): Promise<TaskTrigger> {
   const [timerProps, serviceProps] = await Promise.all([
-    showProps(executor, timerUnitName(kind, name), 'LastTriggerUSec'),
-    showProps(executor, serviceUnitName(kind, name), 'InactiveExitTimestamp'),
+    showUnitProps(executor, timerUnitName(kind, name), 'LastTriggerUSec'),
+    showUnitProps(executor, serviceUnitName(kind, name), 'InactiveExitTimestamp'),
   ])
   return classifyTrigger(timerProps, serviceProps)
-}
-
-/** `systemctl show <unit> -p <props>` → a prop map (fail-open to {}). */
-async function showProps(executor: CommandExecutor, unit: string, props: string): Promise<Record<string, string>> {
-  try {
-    const r = await executor.exec(SYSTEMCTL, ['show', unit, '-p', props])
-    if (r.exitCode !== 0 && !r.stdout.trim())
-      return {}
-    return parseShow(r.stdout)
-  }
-  catch {
-    return {}
-  }
 }
 
 /**
@@ -877,11 +801,6 @@ export interface SuperviseRunOptions {
 }
 
 /** The fields every task runner's result JSON carries. Each kind adds its own. */
-export interface TaskHelperResult {
-  status?: string
-  reason?: string
-}
-
 /**
  * A supervised run's KIND-INDEPENDENT outcome. The store maps it to its own
  * result shape: `helper` is the runner's result JSON exactly as the journal
@@ -896,11 +815,6 @@ export interface SupervisedRun<H extends TaskHelperResult = TaskHelperResult> {
   reason?: string
   /** The runner's own result JSON from the journal (null when there is none). */
   helper: H | null
-}
-
-/** Is a `systemctl show` snapshot in a still-running state? */
-export function isRunActive(props: Record<string, string>): boolean {
-  return RUN_ACTIVE_STATES.has(props.ActiveState ?? '')
 }
 
 /** The answer {@link readRunActive} gives the Run-Now doors. */
@@ -929,7 +843,7 @@ export async function readRunActive(
   kind: TaskUnitKind,
   name: string,
 ): Promise<RunActiveState> {
-  const props = await showProps(executor, serviceUnitName(kind, name), 'ActiveState,InactiveExitTimestamp')
+  const props = await showUnitProps(executor, serviceUnitName(kind, name), 'ActiveState,InactiveExitTimestamp')
   const active = isRunActive(props)
   return { active, since: active ? parseSystemdTimestamp(props.InactiveExitTimestamp) : null }
 }
@@ -1024,41 +938,6 @@ export function runFailed(props: Record<string, string>): boolean {
   if (props.ExecMainStatus && props.ExecMainStatus !== '0')
     return true
   return false
-}
-
-/** Strip journalctl's syslog prefix (`… unit[pid]: `) to the bare message. */
-export function messageFromJournalLine(line: string): string {
-  const idx = line.indexOf(']: ')
-  if (idx >= 0)
-    return line.slice(idx + 3).trim()
-  // Fallback for a prefix without a pid bracket: "<ts> <host> <ident>: <msg>".
-  const m = line.match(JOURNAL_PREFIX_RE)
-  return (m ? m[1] : line).trim()
-}
-
-/**
- * Recover the runner's result JSON from the unit journal — every ANAS task
- * runner prints `{ task, result }` to stdout on completion, so the skip
- * classification (and the per-kind stats) survive into the manual supervisor.
- * Returns null when no result line is present (e.g. a failure, which logs
- * stderr). The caller names the shape it expects; this only finds the line.
- */
-export function parseHelperResult<H extends TaskHelperResult = TaskHelperResult>(journal: string): H | null {
-  const lines = journal.split('\n')
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const msg = messageFromJournalLine(lines[i])
-    if (!msg.startsWith('{'))
-      continue
-    try {
-      const obj = JSON.parse(msg) as { result?: H }
-      if (obj && typeof obj === 'object' && obj.result)
-        return obj.result
-    }
-    catch {
-      // Not the JSON result line — keep scanning.
-    }
-  }
-  return null
 }
 
 /**

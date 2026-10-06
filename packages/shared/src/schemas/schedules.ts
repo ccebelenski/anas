@@ -253,6 +253,13 @@ export const SnapshotScheduleStatus = z.object({
   lastRunAt: z.string().nullable(),
   nextRunAt: z.string().nullable(),
   overdue: z.boolean(),
+  /**
+   * taskstatus.1 — one line when the last run needs it: today "ran at <time>;
+   * result not retained across the reboot" beside `lastRunResult: 'unknown'`,
+   * when the timer's stamp is the only record of a run left after a reboot.
+   * ADDITIVE/optional.
+   */
+  lastRunNote: z.string().optional(),
 })
 export type SnapshotScheduleStatus = z.infer<typeof SnapshotScheduleStatus>
 
@@ -270,6 +277,13 @@ export const SnapshotScheduleDetail = z.object({
   lastRunAt: z.string().nullable(),
   nextRunAt: z.string().nullable(),
   overdue: z.boolean(),
+  /**
+   * taskstatus.1 — one line when the last run needs it: today "ran at <time>;
+   * result not retained across the reboot" beside `lastRunResult: 'unknown'`,
+   * when the timer's stamp is the only record of a run left after a reboot.
+   * ADDITIVE/optional.
+   */
+  lastRunNote: z.string().optional(),
   /** The last run's exit code (systemd `ExecMainStatus`); null when never run. */
   lastRunExitCode: z.number().int().nullable(),
   /** The `.service` unit file, verbatim (config-is-the-API transparency). */

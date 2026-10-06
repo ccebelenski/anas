@@ -1305,7 +1305,7 @@ export const BackupTaskEntry = z.object({
   runningProgress: z.string().optional(),
   /** rclone.5 — the running direct job's id (see CloudSyncTaskView.runningJobId). ADDITIVE/optional. */
   runningJobId: z.string().optional(),
-  /** rclone.5 — "cancelled by <user> at <time>" for a cancelled last run (see CloudSyncTaskView.lastRunNote). */
+  /** rclone.5 — "cancelled by <user> at <time>" for a cancelled last run; taskstatus.1 — the not-retained note for an `unknown` one (see CloudSyncTaskView.lastRunNote). */
   lastRunNote: z.string().optional(),
   /**
    * backup2.9 — for a BLOCK task: the LUN's human NAME, resolved LIVE from the
@@ -1339,7 +1339,7 @@ export const BackupTaskDetail = z.object({
   runningProgress: z.string().optional(),
   /** rclone.5 — the running direct job's id (ADDITIVE/optional). */
   runningJobId: z.string().optional(),
-  /** rclone.5 — "cancelled by <user> at <time>" for a cancelled last run (ADDITIVE/optional). */
+  /** rclone.5 — "cancelled by <user> at <time>" for a cancelled last run; taskstatus.1 — the not-retained note for an `unknown` one (ADDITIVE/optional). */
   lastRunNote: z.string().optional(),
   /** The .service unit file, verbatim. */
   unit: z.string(),

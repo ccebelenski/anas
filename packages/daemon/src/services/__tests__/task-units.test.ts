@@ -312,7 +312,9 @@ describe('task units — status derivation under the cloud prefix', () => {
   })
 
   it('a raw-schedule task never pays for the journal read (no period to measure)', async () => {
-    const mock = statusMock({ execStatus: String(BACKUP_SKIP_EXIT_CODE), journal: '' })
+    // A live skipped run (this boot's exit timestamp): with no record at all the
+    // reboot fallback reads the journal by design (taskstatus.1).
+    const mock = statusMock({ execStatus: String(BACKUP_SKIP_EXIT_CODE), exitTs: 'Tue 2026-09-22 02:00:01 UTC', journal: '' })
     const st = await deriveTaskStatus(CLOUD_UNIT_KIND, mock, task(), Date.now())
     assert.equal(st.lastSuccessAt, null)
     assert.equal(mock.calls.some(c => c.command === JOURNALCTL), false)
@@ -324,6 +326,27 @@ describe('task units — status derivation under the cloud prefix', () => {
     assert.equal(st.lastRunAt, null)
     assert.equal(st.nextRunAt, null)
     assert.equal(st.overdue, false)
+  })
+})
+
+describe('task units — the last run survives a reboot (taskstatus.1 wiring)', () => {
+  // The precedence itself is proven once in unit-run-status.test.ts; this
+  // proves the task kinds reach it with their own units and result map.
+  it('empty post-reboot props + the runner\'s result line → that verdict and time (backup and cloud)', async () => {
+    for (const kind of [BACKUP_UNIT_KIND, CLOUD_UNIT_KIND]) {
+      const st = await deriveTaskStatus(kind, statusMock({ kind, journal: successJournal('2026-10-05T02:00:07+0000', [], kind) }), task())
+      assert.equal(st.lastRunResult, 'success')
+      assert.equal(st.lastRunAt, '2026-10-05T02:00:07.000Z')
+      assert.equal(st.lastRunNote, undefined)
+    }
+  })
+
+  it('empty post-reboot props + no result line + the timer stamp → unknown with the note', async () => {
+    const mock = triggerFixtures(statusMock({ journal: '' }), 'Mon 2026-10-05 02:00:00 UTC')
+    const st = await deriveTaskStatus(CLOUD_UNIT_KIND, mock, task())
+    assert.equal(st.lastRunResult, 'unknown')
+    assert.equal(st.lastRunAt, '2026-10-05T02:00:00.000Z')
+    assert.equal(st.lastRunNote, 'ran at 2026-10-05 02:00 UTC; result not retained across the reboot')
   })
 })
 

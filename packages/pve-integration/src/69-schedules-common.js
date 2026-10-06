@@ -276,6 +276,20 @@
         return sched.pillHtml(t('cancelled'), 'var(--anas-muted,gray)', tip);
     };
 
+    // taskstatus.1 — the Last run cell of a run whose verdict systemd did not
+    // keep across a reboot: the timer's stamp says it ran, nothing says how it
+    // ended. A muted pill (an absence of a result, never an outcome's colour)
+    // with the daemon's "ran at <time>; result not retained across the
+    // reboot" as the tooltip. Every grid (backup, cloud sync, replication,
+    // snapshots) renders it through this one helper. Returns '' when there is
+    // no note, so the caller keeps its plain `unknown`.
+    sched.notRetainedPill = function (note) {
+        if (!note) {
+            return '';
+        }
+        return sched.softPill(t('result not retained'), 'var(--anas-muted,gray)', '' + note);
+    };
+
     // ---- Visibility-gated poll loop (no leaked intervals) ------------------
     // Each view supplies its own `refresh(quiet)` closure (which grids to reload);
     // this owns the interval + the visibilitychange handler, stored on the view so

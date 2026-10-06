@@ -954,6 +954,10 @@
             // can only mean it has never fired, and the default-valued
             // Result=success was a fabricated success. Say so.
             pill = softPill(t('never run'), 'var(--anas-muted,gray)', t(NEVER_RUN_TIP));
+        } else if (result === 'unknown' && !overdue && rec.get('lastRunNote')) {
+            // taskstatus.1: it ran (the timer's stamp says when), its verdict
+            // did not survive the reboot — the shared muted pill, note as tip.
+            pill = ANAS.sched.notRetainedPill(rec.get('lastRunNote'));
         } else if (overdue) {
             pill = pillHtml(t('overdue'), 'var(--anas-danger,#c23b2c)',
                 t('Past its schedule without a successful run — treated as failed.'));

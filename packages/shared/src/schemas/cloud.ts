@@ -349,9 +349,11 @@ export const CloudSyncTaskView = CloudSyncTask.extend({
   runningJobId: z.string().optional(),
   /**
    * rclone.5 — the last run's own one-line account when its result needs one:
-   * today only a `cancelled` run, "cancelled by <user> at <time>", read from
-   * the runner's result line in the unit journal (recent-only: absent once the
-   * journal has rotated past it). ADDITIVE/optional.
+   * a `cancelled` run, "cancelled by <user> at <time>", read from the
+   * runner's result line in the unit journal (recent-only: absent once the
+   * journal has rotated past it); and (taskstatus.1) an `unknown` run known
+   * only from the timer's stamp after a reboot, "ran at <time>; result not
+   * retained across the reboot". ADDITIVE/optional.
    */
   lastRunNote: z.string().optional(),
 })

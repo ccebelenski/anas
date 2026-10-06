@@ -179,7 +179,7 @@ describe('snapshot schedule units — CRUD lifecycle (temp dir + mocked systemct
 })
 
 describe('snapshot schedule units — status derivation + dashboard warnings', () => {
-  function statusMock(opts: { active?: string, result?: string, exitTs?: string, nextTs?: string }): MockExecutor {
+  function statusMock(opts: { active?: string, result?: string, exitTs?: string, nextTs?: string, journal?: string, lastTrigger?: string }): MockExecutor {
     const mock = new MockExecutor()
     mock.addFixture({
       command: SYSTEMCTL,
@@ -191,8 +191,41 @@ describe('snapshot schedule units — status derivation + dashboard warnings', (
       args: ['show', timerUnitName('nightly-tank-media'), '-p', 'NextElapseUSecRealtime'],
       result: { stdout: `NextElapseUSecRealtime=${opts.nextTs ?? '0'}\n`, stderr: '', exitCode: 0 },
     })
+    if (opts.journal !== undefined) {
+      mock.addFixture({
+        command: '/usr/bin/journalctl',
+        args: ['-u', serviceUnitName('nightly-tank-media'), '-n', '200', '-o', 'short-iso', '--no-pager'],
+        result: { stdout: opts.journal, stderr: '', exitCode: 0 },
+      })
+    }
+    if (opts.lastTrigger !== undefined) {
+      mock.addFixture({
+        command: SYSTEMCTL,
+        args: ['show', timerUnitName('nightly-tank-media'), '-p', 'LastTriggerUSec'],
+        result: { stdout: `LastTriggerUSec=${opts.lastTrigger}\n`, stderr: '', exitCode: 0 },
+      })
+    }
     return mock
   }
+
+  // taskstatus.1 wiring — the precedence is proven in unit-run-status.test.ts.
+  it('after a reboot the runner\'s journal line answers, and no default exit code is shown', async () => {
+    const journal = '2026-10-05T02:00:04+0000 pve anas-snap-nightly-tank-media[904]: {"schedule":"nightly-tank-media","result":{"schedule":"nightly-tank-media","taken":"anas-daily-20261005T020000Z","pruned":[],"skippedHeld":[]}}'
+    const st = await deriveScheduleStatus(statusMock({ result: 'success', exitTs: '', journal }), makeSchedule({ enabled: true }))
+    assert.equal(st.lastRunResult, 'success')
+    assert.equal(st.lastRunAt, '2026-10-05T02:00:04.000Z')
+    const detail = await deriveScheduleDetail(statusMock({ result: 'success', exitTs: '', journal }), join(tmpdir(), 'anas-no-such-unit-dir'), makeSchedule({ enabled: true }))
+    assert.equal(detail.lastRunResult, 'success')
+    assert.equal(detail.lastRunExitCode, null)
+    assert.equal(detail.journal, journal)
+  })
+
+  it('after a reboot with only the timer stamp left → unknown with the note', async () => {
+    const st = await deriveScheduleStatus(statusMock({ result: 'success', exitTs: '', journal: '', lastTrigger: 'Mon 2026-10-05 02:00:00 UTC' }), makeSchedule({ enabled: true }))
+    assert.equal(st.lastRunResult, 'unknown')
+    assert.equal(st.lastRunAt, '2026-10-05T02:00:00.000Z')
+    assert.equal(st.lastRunNote, 'ran at 2026-10-05 02:00 UTC; result not retained across the reboot')
+  })
 
   it('derives last result + next run; a past next-elapse on an enabled schedule is overdue', async () => {
     const past = 'Mon 2020-01-01 00:00:00 UTC'

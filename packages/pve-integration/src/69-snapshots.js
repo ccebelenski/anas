@@ -282,6 +282,10 @@
             // timer, so empty run timestamps mean it has never fired — the
             // default-valued Result=success was a fabricated success.
             pill = softPill(t('never run'), 'var(--anas-muted,gray)', t(NEVER_RUN_TIP));
+        } else if (result === 'unknown' && rec.get('lastRunNote')) {
+            // taskstatus.1: it ran (the timer's stamp says when), its verdict
+            // did not survive the reboot — the shared muted pill, note as tip.
+            pill = sched.notRetainedPill(rec.get('lastRunNote'));
         } else {
             pill = softPill(t('never run'), 'var(--anas-muted,gray)', t('no run recorded yet'));
         }
@@ -402,6 +406,7 @@
             enabled: sched.enabled !== false,
             lastRunResult: status.lastRunResult || 'unknown',
             lastRunAt: status.lastRunAt,
+            lastRunNote: status.lastRunNote || '',
             nextRunAt: status.nextRunAt,
             overdue: !!status.overdue,
             raw: sched
@@ -1505,6 +1510,8 @@
         } else if (result === 'never-run') {
             // The enabled twin of F9 — no run to date, timer on (see the grid).
             pill = softPill(t('never run'), 'var(--anas-muted,gray)', t(NEVER_RUN_TIP));
+        } else if (result === 'unknown' && d.lastRunNote) {
+            pill = sched.notRetainedPill(d.lastRunNote);
         } else {
             pill = softPill(t('never run'), 'var(--anas-muted,gray)', '');
         }
@@ -1515,9 +1522,11 @@
             ? ' <span style="color:var(--anas-muted,gray);">('
                 + enc(t('exit code') + ' ' + d.lastRunExitCode) + ')</span>'
             : '';
-        // The daemon's one-line reason there is nothing to show (F9).
-        var note = d.statusNote
-            ? ' <span style="color:var(--anas-muted,gray);">' + enc('\u2014 ' + d.statusNote) + '</span>'
+        // The daemon's one-line reason there is nothing to show (F9), or why
+        // a run's verdict is missing after a reboot (taskstatus.1).
+        var noteText = d.statusNote || (result === 'unknown' ? (d.lastRunNote || '') : '');
+        var note = noteText
+            ? ' <span style="color:var(--anas-muted,gray);">' + enc('\u2014 ' + noteText) + '</span>'
             : '';
         return pill + code + when + note;
     }
@@ -1660,7 +1669,7 @@
         var store = Ext.create('Ext.data.Store', {
             fields: [
                 'id', 'name', 'targetKind', 'targetPath', 'cadence', 'notify',
-                'lastRunResult', 'lastRunAt', 'nextRunAt',
+                'lastRunResult', 'lastRunAt', 'nextRunAt', 'lastRunNote',
                 { name: 'retention', type: 'auto' },
                 { name: 'recursive', type: 'auto' },
                 { name: 'exclude', type: 'auto' },

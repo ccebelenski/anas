@@ -5,11 +5,11 @@ import { join } from 'node:path'
 import { LenientReplicationTask as LenientReplicationTaskSchema, ReplicationTask as ReplicationTaskSchema } from '@anas/shared'
 import { parseSnapshotList, zfsSnapshotDetailArgs } from '../parsers/zfs-list.js'
 import { isTransientRunSnapshot } from './snapshot-naming.js'
-import { deriveRunResult, parseShow, parseSystemdTimestamp } from './systemd-status.js'
 // The unit-store plumbing (marker regex, unlink, systemctl, unit-dir listing)
 // is the ONE shared copy in systemd-unit-store.ts — this store was its fourth
 // hand-copy and its last private leftovers (third pass).
 import { listServiceUnits, markerRegex, readUnitFile, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
+import { deriveUnitRunStatus, toSystemdRunResult } from './unit-run-status.js'
 
 /**
  * Recurring replication TASKS (Epic 5.5.3) — the systemd units ARE the store.
@@ -356,57 +356,6 @@ async function listSnapshots(executor: CommandExecutor, fullDataset: string): Pr
 }
 
 /**
- * `systemctl show <service>` → run result.
- *
- * The `key=value` parse, systemd's two timestamp forms and the oneshot
- * ActiveState/Result map all live in `systemd-status.ts` — ONE implementation
- * shared with backup and snapshot schedules (single-source-of-truth). This
- * module used to carry byte-identical private copies, which is exactly how the
- * disabled-task hole below could have been fixed in two places and missed here.
- *
- * The timestamps are requested because they are what distinguishes "systemd
- * still holds this unit's history" from "systemd unloaded it and is answering
- * from property defaults" — the DISABLED case (live-proof F9).
- */
-async function serviceRunResult(
-  executor: CommandExecutor,
-  name: string,
-  enabled: boolean,
-): Promise<ReplicationTaskStatus['lastRunResult']> {
-  try {
-    const r = await executor.exec(SYSTEMCTL, [
-      'show',
-      serviceUnitName(name),
-      '-p',
-      'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp',
-    ])
-    if (r.exitCode !== 0 && !r.stdout.trim())
-      return 'unknown'
-    return deriveRunResult(parseShow(r.stdout), { enabled })
-  }
-  catch {
-    return 'unknown'
-  }
-}
-
-/** `systemctl show <timer> -p NextElapseUSecRealtime` → ISO time or null. */
-async function timerNextRun(executor: CommandExecutor, name: string): Promise<string | null> {
-  try {
-    const r = await executor.exec(SYSTEMCTL, ['show', timerUnitName(name), '-p', 'NextElapseUSecRealtime'])
-    if (r.exitCode !== 0 && !r.stdout.trim())
-      return null
-    // Despite the property's name, `systemctl show` prints a HUMAN date string
-    // ("Fri 2026-07-17 00:00:00 UTC"), not microseconds (verified live on
-    // PVE 9 / systemd 257). The shared parser handles both forms and systemd's
-    // n/a / infinity sentinels.
-    return parseSystemdTimestamp(parseShow(r.stdout).NextElapseUSecRealtime)
-  }
-  catch {
-    return null
-  }
-}
-
-/**
  * Derive one task's live status. lastReplicated* and snapshotsBehind come from
  * ZFS (the newest source snapshot also on the target); lastRunResult from
  * systemd; nextRunAt from the timer. Source with no snapshots (or gone) → nulls.
@@ -469,12 +418,25 @@ export async function deriveTaskStatus(
     }
   }
 
-  const [lastRunResult, nextRunAt] = await Promise.all([
-    serviceRunResult(executor, task.name, task.enabled),
-    timerNextRun(executor, task.name),
-  ])
+  // taskstatus.1: the shared run-status derivation (unit-run-status.ts) —
+  // live service props, else the runner's journal result line, else the
+  // timer's last trigger. Replication's row carries the verdict and the next
+  // run; its "when" is the ZFS-derived lastReplicatedAt above, not the unit's.
+  const run = await deriveUnitRunStatus(executor, {
+    serviceUnit: serviceUnitName(task.name),
+    timerUnit: timerUnitName(task.name),
+    enabled: task.enabled,
+  })
 
-  return { task, lastReplicatedSnapshot, lastReplicatedAt, snapshotsBehind, lastRunResult, nextRunAt }
+  return {
+    task,
+    lastReplicatedSnapshot,
+    lastReplicatedAt,
+    snapshotsBehind,
+    lastRunResult: toSystemdRunResult(run.lastRunResult),
+    nextRunAt: run.nextRunAt,
+    ...(run.lastRunNote ? { lastRunNote: run.lastRunNote } : {}),
+  }
 }
 
 /** Derive statuses for every task in the store (fail-open per task). */

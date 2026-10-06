@@ -313,6 +313,12 @@
                 + ' style="display:inline-block;padding:0 8px;border-radius:9px;font-size:0.85em;'
                 + 'color:var(--anas-muted,gray);border:1px solid var(--anas-muted,gray);">'
                 + enc(t('never run')) + '</span>';
+        } else if (result === 'unknown' && rec.get('lastRunNote')
+            && ANAS.sched && typeof ANAS.sched.notRetainedPill === 'function') {
+            // taskstatus.1: it ran (the timer's stamp says when), its verdict
+            // did not survive the reboot — the shared muted pill, note as tip.
+            // ZFS still answers what actually replicated, beside this.
+            pill = ANAS.sched.notRetainedPill(rec.get('lastRunNote'));
         } else {
             pill = pillHtml(t('unknown'), 'var(--anas-muted,gray)', '');
         }
@@ -445,6 +451,7 @@
             lastReplicatedAt: entry.lastReplicatedAt,
             snapshotsBehind: entry.snapshotsBehind,
             lastRunResult: entry.lastRunResult || 'unknown',
+            lastRunNote: entry.lastRunNote || '',
             nextRunAt: entry.nextRunAt,
             raw: task,
         };
@@ -2699,7 +2706,7 @@
             fields: [
                 'name', 'sourcePool', 'sourceDataset', 'targetPool', 'targetDataset',
                 'targetLocationKind', 'targetLocationName',
-                'schedule', 'notify', 'lastReplicatedSnapshot', 'lastReplicatedAt', 'lastRunResult', 'nextRunAt',
+                'schedule', 'notify', 'lastReplicatedSnapshot', 'lastReplicatedAt', 'lastRunResult', 'lastRunNote', 'nextRunAt',
                 { name: 'snapshotFirst', type: 'auto' },
                 { name: 'enabled', type: 'auto' },
                 { name: 'snapshotsBehind', type: 'auto' },

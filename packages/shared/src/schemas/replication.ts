@@ -209,6 +209,13 @@ export const ReplicationTaskStatus = z.object({
   lastRunResult: z.enum(['success', 'failure', 'running', 'unknown', 'disabled', 'never-run']),
   /** systemd timer: next scheduled trigger. */
   nextRunAt: ISODateTime.nullable(),
+  /**
+   * taskstatus.1 — one line when the last run needs it: today "ran at <time>;
+   * result not retained across the reboot" beside `lastRunResult: 'unknown'`,
+   * when the timer's stamp is the only record of a run left after a reboot.
+   * ADDITIVE/optional.
+   */
+  lastRunNote: z.string().optional(),
 })
 export type ReplicationTaskStatus = z.infer<typeof ReplicationTaskStatus>
 
