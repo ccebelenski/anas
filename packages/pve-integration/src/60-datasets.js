@@ -4494,33 +4494,40 @@
     // ---- Short screens (dshero.1, 0.4.2 test review C8) --------------------
     //
     // On a short Datasets panel (a 1366x768 laptop: PVE's own task log takes
-    // the bottom third) the full hero left the tree a fifth of the panel. Two
-    // answers: under HERO_COMPACT_BELOW px of panel body the hero draws a
-    // smaller donut and keeps at most 3 named legend rows (legend <= 5 rows
-    // with the roll-up and Free), re-evaluated when the panel resizes; and a
-    // "Hide chart" link collapses the hero to its title line, remembered per
-    // browser (a per-viewer convenience — localStorage, fail-open to shown).
+    // the bottom third) the full hero left the tree a fifth of the panel. So
+    // under HERO_COMPACT_BELOW px of panel body the hero STARTS collapsed to
+    // its title line ("Show chart"), and shown on a short panel it is compact:
+    // a smaller donut and at most 3 named legend rows (legend <= 5 rows with
+    // the roll-up and Free). Re-evaluated when the panel resizes. A tall panel
+    // starts shown. The "Hide chart" / "Show chart" link records the USER's
+    // choice per browser (a per-viewer convenience — localStorage, fail-open),
+    // and only a click records it: the short-panel default is never stored,
+    // so it follows the screen until the user says otherwise.
 
     var HERO_COMPACT_BELOW = 600;
     var HERO_COLLAPSED_KEY = 'anas.datasets.heroCollapsed';
 
-    function heroCollapsed() {
+    // The stored choice: true = hidden, false = shown, null = none made.
+    function heroChoice() {
         try {
-            return window.localStorage.getItem(HERO_COLLAPSED_KEY) === '1';
+            var v = window.localStorage.getItem(HERO_COLLAPSED_KEY);
+            return v === '1' ? true : (v === '0' ? false : null);
         } catch (e) {
-            return false;
+            return null;
         }
+    }
+
+    // Collapsed when the user hid it, or — no choice made — on a short panel.
+    function heroCollapsed(compact) {
+        var choice = heroChoice();
+        return choice === null ? !!compact : choice;
     }
 
     function setHeroCollapsed(collapsed) {
         try {
-            if (collapsed) {
-                window.localStorage.setItem(HERO_COLLAPSED_KEY, '1');
-            } else {
-                window.localStorage.removeItem(HERO_COLLAPSED_KEY);
-            }
+            window.localStorage.setItem(HERO_COLLAPSED_KEY, collapsed ? '1' : '0');
         } catch (e) {
-            // storage unavailable — the toggle still works for this render
+            // storage unavailable — nothing is remembered; the default stands
         }
     }
 
@@ -4635,7 +4642,7 @@
             // Re-evaluated on every refresh and on the panel's resize (below).
             tree.anasHeroCompact = heroCompact(view);
             var html = poolName
-                ? buildHeroHtml(tree, poolName, { compact: tree.anasHeroCompact, collapsed: heroCollapsed() })
+                ? buildHeroHtml(tree, poolName, { compact: tree.anasHeroCompact, collapsed: heroCollapsed(tree.anasHeroCompact) })
                 : '';
             if (html) {
                 hero.update(html);
@@ -4994,10 +5001,12 @@
                                 return;
                             }
                             e.stopEvent();
-                            setHeroCollapsed(!heroCollapsed());
                             // The hero is a direct child of the view.
                             var view = hero.ownerCt;
                             var tree = view && view.down('#dsTree');
+                            // Record the opposite of what is on screen now —
+                            // the user's choice, stored only on a click.
+                            setHeroCollapsed(!heroCollapsed(view ? heroCompact(view) : false));
                             if (tree) {
                                 refreshHero(tree);
                             }

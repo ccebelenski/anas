@@ -174,40 +174,14 @@ test.describe('dshero.1 — the cap on a pool with many datasets (#70)', () => {
 
   // A common laptop screen (0.4.2 test review C8): PVE's own task log takes
   // the bottom third of a 768px screen, so the full hero left the tree 19.7%
-  // of the panel. Under 600px of panel body the hero is compact (110px donut,
-  // max 3 named rows → legend <= 5 rows), and a "Hide chart" link collapses it
-  // to its title line, remembered per browser.
+  // of the panel. Under 600px of panel body the hero STARTS collapsed to its
+  // title line ("Show chart"); shown there it is compact (110px donut, max 3
+  // named rows → legend <= 5 rows). The link records the user's choice per
+  // browser, and only a click records it.
   test.describe('at 1366x768', () => {
     test.use({ viewport: { width: 1366, height: 768 } })
 
-    test('18 datasets at 1366x768: the compact legend (<= 5 rows) and the tree keeps half', async ({ page }) => {
-      const { grid, hero } = await openDatasetsOnPvfix(page)
-      const names = hero.locator('.anas-gfx-legend .anas-gfx-legend-nm')
-      await expect(names.first()).toBeVisible({ timeout: 20_000 })
-      const labels = await names.allTextContents()
-      console.warn(`dshero.1 @1366x768 legend rows: ${labels.join(' | ')}`)
-      expect(labels.length).toBeLessThanOrEqual(5)
-      expect(labels.filter(l => /\d+ more/.test(l))).toHaveLength(1)
-      expect(labels.slice(-2)).toEqual(['Proxmox storage', 'Free'])
-
-      await expectTreeKeepsHalf(page, grid)
-    })
-
-    test('Hide chart collapses the hero to its title, the tree grows, and a reload keeps it', async ({ page }) => {
-      const { grid, hero } = await openDatasetsOnPvfix(page)
-      const legend = hero.locator('.anas-gfx-legend')
-      await expect(legend).toBeVisible({ timeout: 20_000 })
-      const before = (await grid.locator('.x-tree-view').boundingBox())!.height
-
-      await hero.locator('.anas-ds-hero-toggle', { hasText: 'Hide chart' }).click()
-      await expect(legend).toHaveCount(0)
-      await expect(hero.locator('.anas-ds-hero-toggle')).toHaveText('Show chart')
-      await expect(hero.locator('.anas-ds-hero-t')).toContainText(PVE_POOL)
-      await expect.poll(async () => (await grid.locator('.x-tree-view').boundingBox())!.height).toBeGreaterThan(before)
-      const after = (await grid.locator('.x-tree-view').boundingBox())!.height
-      console.warn(`dshero.1 @1366x768 Hide chart: tree body ${before.toFixed(0)}px -> ${after.toFixed(0)}px`)
-
-      // A reload (same browser, same origin storage) keeps it collapsed.
+    async function reloadAndReopen(page: Page): Promise<{ grid: Locator, hero: Locator }> {
       await page.reload()
       await page.waitForFunction(
         () => ![...document.querySelectorAll('.x-mask')].some(el => (el as HTMLElement).offsetParent !== null),
@@ -217,14 +191,50 @@ test.describe('dshero.1 — the cap on a pool with many datasets (#70)', () => {
       const nag = page.getByText('No valid subscription')
       if (await nag.isVisible({ timeout: 10_000 }).catch(() => false))
         await page.getByRole('button', { name: 'OK' }).click()
-      const again = await showPvfixHero(page)
-      await expect(again.hero.locator('.anas-ds-hero-toggle')).toHaveText('Show chart', { timeout: 20_000 })
-      await expect(again.hero.locator('.anas-gfx-legend')).toHaveCount(0)
+      return showPvfixHero(page)
+    }
 
-      // Show chart brings it back (and leaves the browser in the default state).
-      await again.hero.locator('.anas-ds-hero-toggle').click()
-      await expect(again.hero.locator('.anas-gfx-legend')).toBeVisible()
-      await expect(again.hero.locator('.anas-ds-hero-toggle')).toHaveText('Hide chart')
+    const treeHeight = async (grid: Locator): Promise<number> => (await grid.locator('.x-tree-view').boundingBox())!.height
+
+    test('18 datasets at 1366x768: the hero starts collapsed and the tree keeps half; Show chart reveals the compact legend', async ({ page }) => {
+      const { grid, hero } = await openDatasetsOnPvfix(page)
+      const toggle = hero.locator('.anas-ds-hero-toggle')
+      await expect(toggle).toHaveText('Show chart', { timeout: 20_000 })
+      await expect(hero.locator('.anas-gfx-legend')).toHaveCount(0)
+      await expectTreeKeepsHalf(page, grid)
+
+      await toggle.click()
+      const names = hero.locator('.anas-gfx-legend .anas-gfx-legend-nm')
+      await expect(names.first()).toBeVisible({ timeout: 20_000 })
+      const labels = await names.allTextContents()
+      console.warn(`dshero.1 @1366x768 shown: legend rows ${labels.join(' | ')}; tree body ${(await treeHeight(grid)).toFixed(0)}px`)
+      expect(labels.length).toBeLessThanOrEqual(5)
+      expect(labels.filter(l => /\d+ more/.test(l))).toHaveLength(1)
+      expect(labels.slice(-2)).toEqual(['Proxmox storage', 'Free'])
+    })
+
+    test('the choice is the user\'s: Show chart and Hide chart each survive a reload', async ({ page }) => {
+      const { grid, hero } = await openDatasetsOnPvfix(page)
+      await expect(hero.locator('.anas-ds-hero-toggle')).toHaveText('Show chart', { timeout: 20_000 })
+      const collapsed = await treeHeight(grid)
+
+      // Show it: the legend appears, the tree gives up room, and a reload keeps it shown.
+      await hero.locator('.anas-ds-hero-toggle').click()
+      await expect(hero.locator('.anas-gfx-legend')).toBeVisible({ timeout: 20_000 })
+      await expect.poll(() => treeHeight(grid)).toBeLessThan(collapsed)
+      const shown = await reloadAndReopen(page)
+      await expect(shown.hero.locator('.anas-ds-hero-toggle')).toHaveText('Hide chart', { timeout: 20_000 })
+      await expect(shown.hero.locator('.anas-gfx-legend')).toBeVisible()
+      const shownHeight = await treeHeight(shown.grid)
+
+      // Hide it: the legend goes, the tree grows, and a reload keeps it hidden.
+      await shown.hero.locator('.anas-ds-hero-toggle').click()
+      await expect(shown.hero.locator('.anas-gfx-legend')).toHaveCount(0)
+      await expect.poll(() => treeHeight(shown.grid)).toBeGreaterThan(shownHeight)
+      console.warn(`dshero.1 @1366x768 toggle: tree body ${shownHeight.toFixed(0)}px shown -> ${(await treeHeight(shown.grid)).toFixed(0)}px hidden`)
+      const hidden = await reloadAndReopen(page)
+      await expect(hidden.hero.locator('.anas-ds-hero-toggle')).toHaveText('Show chart', { timeout: 20_000 })
+      await expect(hidden.hero.locator('.anas-gfx-legend')).toHaveCount(0)
     })
   })
 })
