@@ -68,19 +68,29 @@ export async function readUnitFile(dir: string, name: string): Promise<string | 
 }
 
 /**
- * All `<prefix>*.service` file NAMES in a unit dir (fail-open to [] — an
- * unreadable unit dir means an empty store, which is exactly how a node with
- * no schedules of this kind reads).
+ * All `<prefix>*.service` file NAMES in a unit dir, plus whether the dir could
+ * be read at all (`complete: false` = readdir failed, `files` is []). A caller
+ * that must not mistake "unreadable" for "empty" — a destroy decision that
+ * depends on what other units say — checks `complete`.
  */
-export async function listServiceUnits(dir: string, prefix: string): Promise<string[]> {
+export async function listServiceUnitsChecked(dir: string, prefix: string): Promise<{ files: string[], complete: boolean }> {
   let files: string[]
   try {
     files = await readdir(dir)
   }
   catch {
-    return []
+    return { files: [], complete: false }
   }
-  return files.filter(f => f.startsWith(prefix) && f.endsWith('.service'))
+  return { files: files.filter(f => f.startsWith(prefix) && f.endsWith('.service')), complete: true }
+}
+
+/**
+ * All `<prefix>*.service` file NAMES in a unit dir (fail-open to [] — an
+ * unreadable unit dir means an empty store, which is exactly how a node with
+ * no schedules of this kind reads).
+ */
+export async function listServiceUnits(dir: string, prefix: string): Promise<string[]> {
+  return (await listServiceUnitsChecked(dir, prefix)).files
 }
 
 /**

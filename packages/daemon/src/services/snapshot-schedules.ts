@@ -8,6 +8,7 @@ import type {
 } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { AhrSnapshotOptions } from './ahr-snapshots.js'
+import type { ScheduleListRead } from './snapshot-schedule-units.js'
 import { run } from './ahr-exec.js'
 import { createAhrSnapshot, deleteAhrSnapshot, listAhrSnapshots } from './ahr-snapshots.js'
 import { formatScheduledName, isTransientRunSnapshot, parseScheduledName } from './snapshot-naming.js'
@@ -276,15 +277,27 @@ export async function pruneSnapshots(
 //   - excluded — a dataset under the target outside the sweep: snapshots this
 //                schedule took before the exclude are out of its scope and
 //                are destroyed outright — but only those it provably took
-//                (same name AND same `createtxg` as a snapshot still in the
-//                sweep: one `zfs snapshot -r`/multi-name call is one txg),
-//                so a replication target's received `anas-*` snapshots are
-//                never touched. Left alone entirely when another enabled
-//                schedule covers the dataset with the same bucket (its
-//                retention owns them). A PVE-owned dataset is treated the
-//                same way (a provably-own snapshot is ANAS's leftover, not
-//                PVE's data), except that a destroy ZFS refuses there (a
-//                clone depends on it) is noted and skipped, never fatal.
+//                (see "Provenance" below), so a replication target's
+//                received `anas-*` snapshots are never touched. Left alone
+//                entirely when another enabled schedule covers the dataset
+//                with the same bucket (its retention owns them) — and left
+//                alone entirely when the schedule list could not be read
+//                whole (an unreadable/unparseable unit may be exactly that
+//                covering schedule: fail safe, destroy nothing there). A
+//                PVE-owned dataset is treated the same way (a provably-own
+//                snapshot is ANAS's leftover, not PVE's data), except that a
+//                destroy ZFS refuses there (a clone depends on it) is noted
+//                and skipped, never fatal.
+//
+// Provenance (excluded scope only): a snapshot on an excluded dataset is this
+// schedule's iff an ANAS-named WITNESS still in the sweep has the same name,
+// the same `createtxg` AND the same `creation` second — one `zfs snapshot
+// -r`/multi-name call is one txg and one creation time across the tree. Only
+// `source === 'anas'` snapshots act as witnesses. Name + txg alone is weaker:
+// two takes inside one txg window share a txg, and a `zfs receive` could land
+// in the txg of a take. Residual: a snapshot with the same name created in the
+// same txg AND the same second as our take (a receive or a hand-made snapshot
+// timed exactly onto it) still matches — accepted; nothing finer is on disk.
 
 /** `zfs list` argv for every snapshot in a tree, with the provenance column. */
 export function zfsTreeSnapshotListArgs(dataset: string): string[] {
@@ -345,8 +358,12 @@ export interface RecursivePruneInput {
   schedule: SnapshotSchedule
   /** The target tree's snapshots, per dataset ({@link parseZfsTreeSnapshots}). */
   inventory: Map<string, TreeSnapshot[]>
-  /** Every OTHER schedule on the node (read from the unit files). */
-  others: SnapshotSchedule[]
+  /**
+   * Every schedule on the node (read from the unit files; the fired one is
+   * skipped by id), and whether that read was COMPLETE. When it was not, no
+   * snapshot on an excluded dataset is destroyed.
+   */
+  others: ScheduleListRead
   /** PVE ownership of a dataset — marks the plan so a refused destroy is non-fatal. */
   isOwned: (dataset: string) => boolean
   now: Date
@@ -355,6 +372,16 @@ export interface RecursivePruneInput {
 /** This schedule's bucket snapshots on one dataset (ANAS-named, never transient). */
 function bucketSnapshots(snaps: TreeSnapshot[], bucket: RetentionBucket): TreeSnapshot[] {
   return snaps.filter(s => s.source === 'anas' && s.bucket === bucket && !isTransientRunSnapshot(s.name))
+}
+
+/**
+ * A snapshot's provenance key — name + `createtxg` + `creation` (seconds, as
+ * `createdAt`) — or null when either column was unread (never matches).
+ */
+function provenanceKey(s: TreeSnapshot): string | null {
+  if (!s.createtxg || !s.createdAt)
+    return null
+  return `${s.name}\u0000${s.createtxg}\u0000${s.createdAt}`
 }
 
 /**
@@ -368,18 +395,20 @@ export function planRecursivePrune(input: RecursivePruneInput): DatasetPrunePlan
     return []
   const target = schedule.target.dataset
   const bucket = schedule.cadence
-  const others = input.others.filter(o => o.enabled && o.id !== schedule.id && o.cadence === bucket && o.target.kind === 'zfs')
+  const others = input.others.schedules.filter(o => o.enabled && o.id !== schedule.id && o.cadence === bucket && o.target.kind === 'zfs')
+  const listComplete = input.others.complete
   const plans: DatasetPrunePlan[] = []
 
-  // Provenance: every (label, createtxg) still present in the sweep, read
-  // before anything is destroyed.
+  // Provenance: every (label, createtxg, creation) of an ANAS snapshot still
+  // present in the sweep, read before anything is destroyed.
   const taken = new Set<string>()
   for (const [dataset, snaps] of inventory) {
     if (!inSweep(schedule, dataset))
       continue
     for (const s of snaps) {
-      if (s.createtxg)
-        taken.add(`${s.name}\u0000${s.createtxg}`)
+      const key = provenanceKey(s)
+      if (s.source === 'anas' && key)
+        taken.add(key)
     }
   }
 
@@ -420,12 +449,19 @@ export function planRecursivePrune(input: RecursivePruneInput): DatasetPrunePlan
     }
 
     // Outside the sweep: an excluded dataset or something beneath one.
+    if (!listComplete) {
+      plans.push({ dataset, scope: 'excluded', prune: [], skippedHeld: [], note: `${mine.length} left: schedule list unreadable` })
+      continue
+    }
     const coveredBy = others.find(o => inSweep(o, dataset))
     if (coveredBy) {
       plans.push({ dataset, scope: 'excluded', prune: [], skippedHeld: [], note: `${mine.length} left to schedule '${coveredBy.id}'` })
       continue
     }
-    const ours = mine.filter(s => taken.has(`${s.name}\u0000${s.createtxg}`))
+    const ours = mine.filter((s) => {
+      const key = provenanceKey(s)
+      return key !== null && taken.has(key)
+    })
     const foreign = mine.length - ours.length
     const plan: DatasetPrunePlan = {
       dataset,
@@ -467,7 +503,7 @@ export async function pruneRecursiveSchedule(
   executor: CommandExecutor,
   schedule: SnapshotSchedule,
   opts: {
-    others: SnapshotSchedule[]
+    others: ScheduleListRead
     isOwned: (dataset: string) => boolean
     now?: Date
     updateProgress?: (message: string) => void

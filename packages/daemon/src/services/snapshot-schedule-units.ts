@@ -7,7 +7,7 @@ import { DISABLED_HISTORY_NOTE } from './systemd-status.js'
 // The unit-store plumbing (marker parse, dir listing, unlink/systemctl) is the
 // ONE shared copy in systemd-unit-store.ts — snapshot was its second hand-copy.
 import {
-  listServiceUnits,
+  listServiceUnitsChecked,
   parseMarkedJson,
   runSystemctl,
   systemdTimersStampDir,
@@ -155,24 +155,49 @@ export function parseServiceUnit(content: string): SnapshotSchedule | null {
 
 // --- Store: read ------------------------------------------------------------
 
-/** All valid schedules parsed from `anas-snap-*.service` files (invalid → skipped). */
-export async function readAllSchedules(dir: string): Promise<SnapshotSchedule[]> {
-  const services = await listServiceUnits(dir, UNIT_PREFIX)
+/**
+ * The schedule store as read, with whether the read was COMPLETE: false when
+ * the unit dir could not be listed or any `anas-snap-*.service` file could not
+ * be read or parsed. `schedules` holds every valid one either way.
+ */
+export interface ScheduleListRead {
+  schedules: SnapshotSchedule[]
+  complete: boolean
+}
+
+/**
+ * Read every schedule and say whether the list is whole (snapprune.1 review).
+ * A destroy decision that rests on "no other schedule covers this dataset"
+ * must not be made on a partial list — the recursive prune checks `complete`.
+ * The skipped files still get their stderr note.
+ */
+export async function readScheduleList(dir: string): Promise<ScheduleListRead> {
+  const listed = await listServiceUnitsChecked(dir, UNIT_PREFIX)
+  let complete = listed.complete
   const schedules: SnapshotSchedule[] = []
-  for (const file of services) {
+  for (const file of listed.files) {
     try {
       const content = await readFile(join(dir, file), 'utf-8')
       const schedule = parseServiceUnit(content)
-      if (schedule)
+      if (schedule) {
         schedules.push(schedule)
-      else
+      }
+      else {
+        complete = false
         process.stderr.write(`[schedules] skipping ${file}: no valid X-ANAS-Schedule JSON\n`)
+      }
     }
     catch (err) {
+      complete = false
       process.stderr.write(`[schedules] skipping ${file}: ${err instanceof Error ? err.message : String(err)}\n`)
     }
   }
-  return schedules
+  return { schedules, complete }
+}
+
+/** All valid schedules parsed from `anas-snap-*.service` files (invalid → skipped). */
+export async function readAllSchedules(dir: string): Promise<SnapshotSchedule[]> {
+  return (await readScheduleList(dir)).schedules
 }
 
 /** One schedule by id, or null if its service file is absent/invalid. */

@@ -10,8 +10,8 @@ import { notifyScheduleRun } from '../services/snapshot-notify.js'
 import {
   collectScheduleStatuses,
   deriveScheduleDetail,
-  readAllSchedules,
   readSchedule,
+  readScheduleList,
   removeScheduleUnits,
   scheduleFileExists,
   writeScheduleUnits,
@@ -242,11 +242,13 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       // snapprune.1: retention reaches every dataset the schedule snapshots,
       // per dataset. The other schedules come from the unit files (the store)
       // so a dataset another enabled schedule covers is judged by its policy
-      // too; PVE-owned datasets outside the sweep are never touched.
+      // too. The read says whether it is COMPLETE: a partial list (unlistable
+      // dir, unreadable or unparseable unit) destroys nothing on excluded
+      // datasets. A refused destroy on a PVE-owned excluded dataset is noted.
       const footprint = pve
       const target = schedule.target.dataset
       const prune = await pruneRecursiveSchedule(executor, schedule, {
-        others: await readAllSchedules(systemdDir),
+        others: await readScheduleList(systemdDir),
         isOwned: dataset => footprint.ownershipOf(dataset) !== null,
         updateProgress,
       })

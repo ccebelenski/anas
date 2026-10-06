@@ -13,6 +13,7 @@ import {
   parseServiceUnit,
   readAllSchedules,
   readSchedule,
+  readScheduleList,
   removeScheduleUnits,
   renderServiceUnit,
   renderTimerUnit,
@@ -175,6 +176,20 @@ describe('snapshot schedule units — CRUD lifecycle (temp dir + mocked systemct
 
   it('readAllSchedules on a missing dir yields [] (fail-open)', async () => {
     assert.deepEqual(await readAllSchedules(join(dir, 'does-not-exist')), [])
+  })
+
+  it('readScheduleList says whether the list is COMPLETE (snapprune.1 review)', async () => {
+    await writeScheduleUnits(mock, dir, makeSchedule({ id: 'one' }))
+    const whole = await readScheduleList(dir)
+    assert.equal(whole.complete, true)
+    assert.deepEqual(whole.schedules.map(s => s.id), ['one'])
+    // An unparseable unit: the valid ones are kept, the list is not whole.
+    await writeFile(join(dir, serviceUnitName('broken')), '[Unit]\nDescription=broken\n')
+    const partial = await readScheduleList(dir)
+    assert.equal(partial.complete, false)
+    assert.deepEqual(partial.schedules.map(s => s.id), ['one'])
+    // An unlistable dir is not an empty store.
+    assert.deepEqual(await readScheduleList(join(dir, 'does-not-exist')), { schedules: [], complete: false })
   })
 })
 

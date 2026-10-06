@@ -337,8 +337,8 @@ describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
   }
 
   /** `ds@label<TAB>creation<TAB>userrefs<TAB>createtxg` rows; txg = the take. */
-  function row(ds: string, label: string, txg: number, userrefs = 0): string {
-    return [`${ds}@${label}`, '1769385600', String(userrefs), String(txg)].join('\t')
+  function row(ds: string, label: string, txg: number, userrefs = 0, creation = 1769385600): string {
+    return [`${ds}@${label}`, String(creation), String(userrefs), String(txg)].join('\t')
   }
 
   /** The three takes of a plain `-r` on tank (txg 100/200/300) across a tree. */
@@ -350,11 +350,11 @@ describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
     return [...lines, ...extra].join('\n')
   }
 
-  function plan(stdout: string, schedule = sched(), others: SnapshotSchedule[] = [], owned: string[] = []) {
+  function plan(stdout: string, schedule = sched(), others: SnapshotSchedule[] = [], owned: string[] = [], complete = true) {
     return planRecursivePrune({
       schedule,
       inventory: parseZfsTreeSnapshots(stdout),
-      others,
+      others: { schedules: others, complete },
       isOwned: ds => owned.includes(ds),
       now: PRUNE_NOW,
     })
@@ -468,7 +468,7 @@ describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
       return executor
     }
     const owned = await pruneRecursiveSchedule(arm(), sched({ exclude: ['tank/guests'] }), {
-      others: [],
+      others: { schedules: [], complete: true },
       isOwned: ds => ds === 'tank/guests',
       now: PRUNE_NOW,
     })
@@ -477,7 +477,7 @@ describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
     assert.equal(guests.note, `1 left: destroy refused: cannot destroy 'tank/guests@${H1}': snapshot has dependent clones`)
 
     await assert.rejects(
-      () => pruneRecursiveSchedule(arm(), sched({ exclude: ['tank/guests'] }), { others: [], isOwned: () => false, now: PRUNE_NOW }),
+      () => pruneRecursiveSchedule(arm(), sched({ exclude: ['tank/guests'] }), { others: { schedules: [], complete: true }, isOwned: () => false, now: PRUNE_NOW }),
       /dependent clones/,
     )
   })
@@ -504,7 +504,7 @@ describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
     executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
     const progress: string[] = []
     const res = await pruneRecursiveSchedule(executor, sched(), {
-      others: [],
+      others: { schedules: [], complete: true },
       isOwned: () => false,
       now: PRUNE_NOW,
       updateProgress: m => progress.push(m),
@@ -522,5 +522,122 @@ describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
     assert.deepEqual(media.skippedHeld.map(s => s.name), [H1])
     assert.equal(res.pruned.length, 3)
     assert.ok(progress.includes('Pruned tank/media (sweep): 1 destroyed, 1 held'), progress.join(' | '))
+  })
+
+  // ---- snapprune.1 review: gap tests ---------------------------------------
+
+  it('an excluded ONLY child is cleared of this schedule\'s snapshots (the target is the witness)', () => {
+    const plans = plan(tree(['tank', 'tank/backup']), sched({ exclude: ['tank/backup'] }))
+    assert.equal(plans.length, 2)
+    const p = byDs(plans, 'tank/backup')!
+    assert.equal(p.scope, 'excluded')
+    assert.deepEqual(p.prune.map(s => s.name).sort(), [H1, H2, H3])
+    assert.equal(p.note, undefined)
+  })
+
+  it('known gap: an excluded only child whose names the target already pruned keeps them, with the note', () => {
+    // The target pruned H1/H2 on an earlier run; only H3 is left as a witness.
+    const plans = plan(
+      [row('tank', H3, 300), row('tank/backup', H1, 100), row('tank/backup', H2, 200), row('tank/backup', H3, 300)].join('\n'),
+      sched({ exclude: ['tank/backup'] }),
+    )
+    const p = byDs(plans, 'tank/backup')!
+    assert.deepEqual(p.prune.map(s => s.name), [H3])
+    assert.equal(p.note, '2 left: not taken by this schedule')
+  })
+
+  it('a covering schedule protects an excluded dataset through its OWN recursion, not only as direct target', () => {
+    const projects = sched({ id: 'hourly-projects', target: { kind: 'zfs', dataset: 'tank/projects' }, recursive: true, retention: { hourly: 48 } })
+    const stdout = tree(['tank', 'tank/projects', 'tank/projects/a'])
+    const plans = plan(stdout, sched({ exclude: ['tank/projects'] }), [projects])
+    for (const ds of ['tank/projects', 'tank/projects/a']) {
+      const p = byDs(plans, ds)!
+      assert.deepEqual(p.prune, [], ds)
+      assert.equal(p.note, '3 left to schedule \'hourly-projects\'', ds)
+    }
+    // The covering schedule's OWN exclude takes the child out of its cover:
+    // the child is cleared, the dataset it still covers is left to it.
+    const narrowed = plan(stdout, sched({ exclude: ['tank/projects'] }), [{ ...projects, exclude: ['tank/projects/a'] }])
+    assert.deepEqual(byDs(narrowed, 'tank/projects')!.prune, [])
+    assert.deepEqual(byDs(narrowed, 'tank/projects/a')!.prune.map(s => s.name).sort(), [H1, H2, H3])
+    // A NON-recursive schedule on tank/projects does not cover its child.
+    const flat = plan(stdout, sched({ exclude: ['tank/projects'] }), [{ ...projects, recursive: false }])
+    assert.deepEqual(byDs(flat, 'tank/projects/a')!.prune.map(s => s.name).sort(), [H1, H2, H3])
+  })
+
+  it('an INCOMPLETE schedule list destroys nothing on excluded datasets; the target and sweep still prune', () => {
+    // tank/backup also carries a held one: nothing is destroyed or reported held there.
+    const stdout = tree(['tank', 'tank/media', 'tank/backup', 'tank/backup/pc1'], [row('tank/backup', 'anas-hourly-2026-07-26T090000Z', 777, 1)])
+    const plans = plan(stdout, sched({ exclude: ['tank/backup'] }), [], [], false)
+    const backup = byDs(plans, 'tank/backup')!
+    assert.deepEqual(backup.prune, [])
+    assert.deepEqual(backup.skippedHeld, [])
+    assert.equal(backup.note, '4 left: schedule list unreadable')
+    const pc1 = byDs(plans, 'tank/backup/pc1')!
+    assert.deepEqual(pc1.prune, [])
+    assert.equal(pc1.note, '3 left: schedule list unreadable')
+    assert.deepEqual(byDs(plans, 'tank')!.prune.map(s => s.name).sort(), [H1, H2])
+    assert.deepEqual(byDs(plans, 'tank/media')!.prune.map(s => s.name).sort(), [H1, H2])
+    // Even when the readable part of the list names a covering schedule, the
+    // excluded dataset gets the same fail-safe note.
+    const covering = sched({ id: 'hourly-backup', target: { kind: 'zfs', dataset: 'tank/backup' }, recursive: false })
+    const partial = plan(stdout, sched({ exclude: ['tank/backup'] }), [covering], [], false)
+    assert.equal(byDs(partial, 'tank/backup')!.note, '4 left: schedule list unreadable')
+    assert.deepEqual(byDs(partial, 'tank/backup/pc1')!.prune, [])
+  })
+
+  it('a creation-time mismatch leaves the snapshot (same name and txg is not enough)', () => {
+    const plans = plan(
+      tree(['tank'], [row('tank/backup', H1, 100, 0, 1769385601), row('tank/backup', H2, 200)]),
+      sched({ exclude: ['tank/backup'] }),
+    )
+    const p = byDs(plans, 'tank/backup')!
+    assert.deepEqual(p.prune.map(s => s.name), [H2])
+    assert.equal(p.note, '1 left: not taken by this schedule')
+  })
+
+  it('a non-ANAS snapshot in the sweep is never a witness', () => {
+    // `source` follows the name today, so this guards the invariant should the
+    // classification ever change: the witness side requires source 'anas'.
+    const inventory = parseZfsTreeSnapshots(tree(['tank'], [row('tank/backup', H1, 100), row('tank/backup', H2, 200)]))
+    for (const s of inventory.get('tank')!) {
+      if (s.name === H1)
+        s.source = 'other'
+    }
+    const plans = planRecursivePrune({
+      schedule: sched({ exclude: ['tank/backup'] }),
+      inventory,
+      others: { schedules: [], complete: true },
+      isOwned: () => false,
+      now: PRUNE_NOW,
+    })
+    const p = byDs(plans, 'tank/backup')!
+    assert.deepEqual(p.prune.map(s => s.name), [H2])
+    assert.equal(p.note, '1 left: not taken by this schedule')
+  })
+
+  it('several refused destroys on a PVE-owned dataset are counted in one note', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: ZFS,
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg', '-r', 'tank'],
+      result: { stdout: tree(['tank', 'tank/guests']), stderr: '', exitCode: 0 },
+    })
+    for (const label of [H1, H2]) {
+      executor.addFixture({
+        command: ZFS,
+        args: ['destroy', `tank/guests@${label}`],
+        result: { stdout: '', stderr: `cannot destroy 'tank/guests@${label}': snapshot has dependent clones`, exitCode: 1 },
+      })
+    }
+    executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
+    const res = await pruneRecursiveSchedule(executor, sched({ exclude: ['tank/guests'] }), {
+      others: { schedules: [], complete: true },
+      isOwned: ds => ds === 'tank/guests',
+      now: PRUNE_NOW,
+    })
+    const guests = res.datasets.find(d => d.dataset === 'tank/guests')!
+    assert.deepEqual(guests.pruned.map(s => s.name), [H3])
+    assert.equal(guests.note, `2 left: destroy refused: cannot destroy 'tank/guests@${H1}': snapshot has dependent clones`)
   })
 })
