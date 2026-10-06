@@ -243,15 +243,29 @@ dd if="$R/pattern" of="$FOREIGN_MD" bs=1M count=4 oflag=direct status=none
 sha256sum < "$R/pattern" | cut -d' ' -f1 > "$R/foreign.sha"
 # GT-8 shape: stop it and assemble ONE member — inactive, every member (S).
 stop_md "$FOREIGN_MD"
-mdadm --assemble "$FOREIGN_MD" "$L0" </dev/null >"$R/assemble.log" 2>&1
-check "the foreign array sits INACTIVE (GT-8 shape)" test "$(array_state "$FOREIGN_MD")" = inactive
+# GT-8 ghost: one member present, the other gone, parked by INCREMENTAL
+# assembly ("not enough to start safely") — an explicit `--assemble
+# --no-degraded` of a lone member creates no array at all, and a plain
+# assemble starts a RAID1 member degraded. Proven by hand 2026-10-06: the
+# incremental ghost stays inactive for 40 s and across an anasd restart.
+losetup -d "$L1"
+mdadm --incremental "$L0" </dev/null >"$R/assemble.log" 2>&1
+# Incremental assembly picks its own device (the ANAS pool's own media-r1
+# holds /dev/md/media-r1, so the ghost lands beside it): read it from the log.
+# Address the ghost by its KERNEL device (the md/ link mdadm names is not
+# reliably created for an inactive array): the mdstat line holding L0.
+GHOST=/dev/$(grep -E "^md[0-9]+ : .*$(basename "$L0")\[" /proc/mdstat | cut -d' ' -f1 | head -1)
+echo "$GHOST" > "$R/ghost.dev"
+GSTATE=$(array_state "${GHOST:-/nonexistent}"); echo "      ghost=$GHOST state=$GSTATE mdstat: $(grep -A1 "^md" /proc/mdstat | tr "\n" " ")"
+check "the foreign array sits INACTIVE (GT-8 shape) at ${GHOST:-<none>} (state $GSTATE)" test -n "$GHOST" -a "$GSTATE" = inactive
 EOF
 
 step "P1 — the boot recovery ladder (anasd restart) leaves the foreign array alone"
 SINCE="$($SSH_CMD "date '+%Y-%m-%d %H:%M:%S'")"
 restart_daemon
 run_remote <<EOF
-check "the foreign array is STILL inactive — never --run" test "\$(array_state "\$FOREIGN_MD")" = inactive
+GHOST=\$(cat "\$R/ghost.dev")
+check "the foreign array is STILL inactive — never --run" test "\$(array_state "\$GHOST")" = inactive
 journalctl -u anasd --since "${SINCE}" --no-pager -o cat > "\$R/boot.log" 2>/dev/null
 if grep -E 'ahr\.boot array=media-r1 .*rung=mdadm-run' "\$R/boot.log" >/dev/null; then
   fail "the ladder ran on a media-r1: \$(grep 'ahr.boot' "\$R/boot.log")"
@@ -260,10 +274,12 @@ else
 fi
 grep -E 'ahr\.boot array=media-r1 .*(action=ignored|reason=not-pinned)' "\$R/boot.log" \
   && pass "the scan said why it left it alone" || echo "      (no ignore line — the inactive array exported no name; the state check above is the proof)"
-# Bring the foreign array back fully for the destroy proof.
-stop_md "\$FOREIGN_MD"
-mdadm --assemble "\$FOREIGN_MD" \$(loops) </dev/null >/dev/null 2>&1
-check "the foreign array is active again" sh -c "case \$(array_state \$FOREIGN_MD) in clean|active|active-idle) true;; *) false;; esac"
+# Bring the foreign array back fully for the destroy proof (re-attach L1).
+stop_md "\$GHOST"
+losetup -f "\$R/l1" 2>/dev/null
+mdadm --assemble "\$FOREIGN_MD" \$(loops) </dev/null >"\$R/reassemble.log" 2>&1
+echo "      reassemble: \$(cat "\$R/reassemble.log" | tr "\\n" " ") loops: \$(loops | tr "\\n" " ") md: \$(ls /dev/md/ 2>/dev/null | tr "\\n" " ")"
+st=\$(array_state "\$FOREIGN_MD"); check "the foreign array is active again (state \$st)" test "\$st" != inactive -a "\$st" != absent
 EOF
 
 # ---- P3 setup + P1: destroy with a HALTED intent and the foreign array ------
@@ -290,7 +306,7 @@ check "the job reported the foreign array as left alone" sh -c "python3 -c \"imp
 check "the ANAS pool is gone" test "$(api GET /ahr/media)" = 404
 check "its pins left mdadm.conf" sh -c "! grep -q '^ARRAY /dev/md/media-r' /etc/mdadm/mdadm.conf"
 check "its intent went with it" test ! -e /etc/anas/ahr/media.json
-check "the foreign array is still running" sh -c "case \$(array_state $FOREIGN_MD) in clean|active|active-idle) true;; *) false;; esac"
+st=$(array_state "$FOREIGN_MD"); check "the foreign array is still running (state $st)" test "$st" != inactive -a "$st" != absent
 check "…with the same UUID" test "$(uuid_of_md "$FOREIGN_MD")" = "$FU"
 for lo in $(loops); do
   check "…and its member $lo still carries the foreign superblock" test "$(uuid_in "$lo")" = "$FU"

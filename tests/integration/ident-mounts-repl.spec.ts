@@ -95,20 +95,25 @@ async function newestCommon(target: string): Promise<string> {
  * `--no-block`) and wait for that invocation to end; it must succeed.
  */
 async function runReplicationTask(ctx: APIRequestContext, name: string): Promise<void> {
+  // Run-now starts the unit with `systemctl start --no-block` and answers
+  // `{ started: true }`; the run is systemd's. Completion is the runner's
+  // result line in the unit's journal, newer than the request (node clock).
   const unit = `anas-repl-${name}.service`
-  const before = (await sshExec(`systemctl show -p InvocationID --value ${unit}`)).trim()
+  const since = (await sshExec('date +%s')).trim()
   const res = await ctx.post(`${V1}/replication/tasks/${name}/run`, { data: {} })
   expect(res.status(), await res.text()).toBe(202)
   const deadline = Date.now() + 180_000
   for (;;) {
-    const [id, state, result] = (await sshExec(`systemctl show -p InvocationID,ActiveState,Result --value ${unit}`)).split('\n').map(s => s.trim())
-    if (id && id !== before && (state === 'inactive' || state === 'failed')) {
-      expect(result, `${unit} run result (journalctl -u ${unit})`).toBe('success')
+    const lines = await sshExec(`journalctl -u ${unit} --since @${since} -o cat --no-pager 2>/dev/null || true`)
+    const done = lines.split('\n').find(l => l.startsWith('{') && l.includes('"result"'))
+    const failed = lines.split('\n').find(l => /Failed with result|failed/i.test(l))
+    if (done)
       return
-    }
+    if (failed)
+      throw new Error(`${unit} failed: ${failed}`)
     if (Date.now() > deadline)
-      throw new Error(`${unit} did not finish a new run within 180s (state ${state})`)
-    await new Promise(resolve => setTimeout(resolve, 1000))
+      throw new Error(`${unit} did not finish a new run within 180s`)
+    await new Promise(r => setTimeout(r, 1000))
   }
 }
 
