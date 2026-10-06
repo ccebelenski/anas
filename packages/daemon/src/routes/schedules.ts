@@ -262,7 +262,8 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       taken: take.name,
       pruned: prune.pruned.slice(0, PRUNED_NAMES_PER_DATASET).map(s => s.name),
       prunedCount: prune.pruned.length,
-      skippedHeld: prune.skippedHeld.map(s => s.name),
+      skippedHeld: prune.skippedHeld.slice(0, PRUNED_NAMES_PER_DATASET).map(s => s.name),
+      heldCount: prune.skippedHeld.length,
     }
   }
 

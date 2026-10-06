@@ -561,7 +561,10 @@ export async function pruneRecursiveSchedule(
       }
       pruned.push(snap)
     }
-    const notes = [plan.note, refused ? `${refused} left: destroy refused: ${refusedWhy}` : undefined].filter(Boolean)
+    const refusedNote = refused
+      ? `${refused} left: destroy refused: ${refusedWhy}${refused > 1 ? ` (and ${refused - 1} more)` : ''}`
+      : undefined
+    const notes = [plan.note, refusedNote].filter(Boolean)
     const note = notes.length ? notes.join('; ') : undefined
     if (pruned.length || skippedHeld.length || note) {
       const parts = [`${pruned.length} destroyed`]
@@ -582,8 +585,8 @@ export async function pruneRecursiveSchedule(
 
 /**
  * The fire result of a recursive ZFS schedule: per-dataset counts, and the
- * destroyed names capped at {@link PRUNED_NAMES_PER_DATASET} per dataset
- * (`prunedCount` carries the real total). The first run after snapprune.1
+ * destroyed and held names capped at {@link PRUNED_NAMES_PER_DATASET} per
+ * dataset (`prunedCount`/`heldCount` carry the real totals). The first run after snapprune.1
  * can destroy thousands of child snapshots; this result is the job result,
  * the runner's journald line (LineMax 48 KiB) and the notification's input,
  * so it must stay small. A snapshot off the target is named
@@ -601,7 +604,8 @@ export function recursiveRunResult(
     taken,
     pruned: prune.datasets.flatMap(d => d.pruned.slice(0, PRUNED_NAMES_PER_DATASET).map(s => named(d.dataset, s))),
     prunedCount: prune.pruned.length,
-    skippedHeld: prune.datasets.flatMap(d => d.skippedHeld.map(s => named(d.dataset, s))),
+    skippedHeld: prune.datasets.flatMap(d => d.skippedHeld.slice(0, PRUNED_NAMES_PER_DATASET).map(s => named(d.dataset, s))),
+    heldCount: prune.skippedHeld.length,
     datasets: prune.datasets.map(d => ({
       dataset: d.dataset,
       scope: d.scope,

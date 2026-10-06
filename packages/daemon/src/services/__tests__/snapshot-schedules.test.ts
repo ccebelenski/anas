@@ -511,15 +511,36 @@ describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
   })
 
   it('a held child snapshot the policy keeps (replication\'s newest) is not reported, and the run is no warning', async () => {
-    // tank/a@H3 is held by replication; hourly:1 keeps it anyway.
+    // tank/a@H3 is held by replication; hourly:1 as-if-unheld keeps it anyway.
+    // It takes no slot (GT-7): the newest UNHELD (H2) is kept too.
     const stdout = tree(['tank'], [row('tank/a', H1, 100), row('tank/a', H2, 200), row('tank/a', H3, 300, 1)])
     const plans = plan(stdout)
     const a = byDs(plans, 'tank/a')!
     assert.deepEqual(a.skippedHeld, [])
-    assert.deepEqual(a.prune.map(s => s.name).sort(), [H1, H2])
+    assert.deepEqual(a.prune.map(s => s.name), [H1])
     const res = await pruneRecursiveSchedule(armRefusing(stdout, []), sched(), { others: { schedules: [], complete: true }, now: PRUNE_NOW })
     assert.deepEqual(res.skippedHeld, [])
     assert.equal(snapshotNotifyOutcome({ schedule: sched(), result: recursiveRunResult(sched(), H3, res) }), 'success')
+  })
+
+  it('held names are capped per dataset like pruned, with heldCount carrying the total', () => {
+    const held = Array.from({ length: 120 }, (_, i) => ({
+      name: formatScheduledName('hourly', new Date(Date.UTC(2026, 3, 1) + i * 3600_000)),
+      target: { kind: 'zfs' as const, dataset: 'tank/a' },
+      bucket: 'hourly' as const,
+      createdAt: null,
+      held: true,
+      source: 'anas' as const,
+    }))
+    const result = recursiveRunResult(sched(), H3, {
+      pruned: [],
+      skippedHeld: held,
+      datasets: [{ dataset: 'tank/a', scope: 'sweep', pruned: [], skippedHeld: held, refused: 0 }],
+    })
+    assert.equal(result.skippedHeld.length, 50)
+    assert.ok(result.skippedHeld.every(n => n.startsWith('tank/a@')))
+    assert.equal(result.heldCount, 120)
+    assert.equal(result.datasets![0].held, 120)
   })
 
   it('a 5000-snapshot first run: the result names at most 50 per dataset, carries the count, and serialises under 32 KiB', async () => {
@@ -541,6 +562,7 @@ describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
     assert.equal(result.prunedCount, 4998)
     assert.equal(result.pruned.length, 100)
     assert.deepEqual(result.datasets!.map(d => d.pruned), [2499, 2499])
+    assert.equal(result.heldCount, 0)
     // What the runner prints to journald (snapshot-task.ts): one line, well under LineMax.
     const line = JSON.stringify({ schedule: 'hourly-tank', result })
     assert.ok(Buffer.byteLength(line) < 32 * 1024, `${Buffer.byteLength(line)} bytes`)
@@ -717,7 +739,8 @@ describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
     })
     const guests = res.datasets.find(d => d.dataset === 'tank/guests')!
     assert.deepEqual(guests.pruned.map(s => s.name), [H3])
-    assert.equal(guests.note, `2 left: destroy refused: cannot destroy 'tank/guests@${H1}': snapshot has dependent clones`)
+    // The first reason, then how many more were refused.
+    assert.equal(guests.note, `2 left: destroy refused: cannot destroy 'tank/guests@${H1}': snapshot has dependent clones (and 1 more)`)
     assert.equal(guests.refused, 2)
   })
 })

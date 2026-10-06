@@ -199,9 +199,11 @@ export type ScheduledSnapshot = z.infer<typeof ScheduledSnapshot>
  * The outcome of applying a retention policy to an inventory:
  * - `keep` — ANAS snapshots retained by the policy (incl. the always-kept newest).
  * - `prune` — ANAS snapshots to destroy (never a held one; never an `other` one).
- * - `skippedHeld` — held ANAS snapshots the policy WOULD have pruned, retained
- *   and surfaced as intentionally kept (the holds-vs-prune trap, GT-7). A held
- *   snapshot the policy keeps anyway is in `keep` and not reported.
+ * - `skippedHeld` — held ANAS snapshots an as-if-unheld plan WOULD have pruned,
+ *   retained and surfaced as intentionally kept (the holds-vs-prune trap,
+ *   GT-7). A held snapshot that plan keeps is in `keep` and not reported.
+ *   Held snapshots never take a bucket slot: keep/prune is decided over the
+ *   unheld ones.
  *
  * `other`-source snapshots appear in NONE of these sets — they are outside ANAS
  * retention entirely.
@@ -313,7 +315,7 @@ export type SnapshotScheduleDetail = z.infer<typeof SnapshotScheduleDetail>
 export const PruneScope = z.enum(['target', 'sweep', 'excluded'])
 export type PruneScope = z.infer<typeof PruneScope>
 
-/** At most this many destroyed names per dataset ride in a run result's `pruned`. */
+/** At most this many names per dataset ride in a run result's `pruned` and `skippedHeld`. */
 export const PRUNED_NAMES_PER_DATASET = 50
 
 /** One dataset's line in a recursive run result (snapprune.1), in counts. */
@@ -356,8 +358,16 @@ export const SnapshotScheduleRunResult = z.object({
    * Absent from an older daemon (additive): then `pruned.length` is the count.
    */
   prunedCount: z.number().int().nonnegative().optional(),
-  /** Held snapshots retained despite policy (surfaced as intentional), named as `pruned`. */
+  /**
+   * Held snapshots retained despite policy (surfaced as intentional), named
+   * and capped per dataset as `pruned`; the real total is `heldCount`.
+   */
   skippedHeld: z.array(z.string()),
+  /**
+   * How many held snapshots were retained in all — `skippedHeld` may list
+   * fewer. Absent from an older daemon (additive): then `skippedHeld.length`.
+   */
+  heldCount: z.number().int().nonnegative().optional(),
   /**
    * snapprune.1: what prune did PER DATASET on a recursive ZFS schedule, in
    * counts. Absent for a non-recursive or AHR schedule (one dataset, the

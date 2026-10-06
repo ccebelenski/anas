@@ -33,12 +33,28 @@ const BUCKETS: RetentionBucket[] = ['frequently', 'hourly', 'daily', 'weekly', '
 /** What a finished take+prune hands back (the fire result), when it completed. */
 export type SnapshotNotifyResult = SnapshotScheduleRunResult
 
-/** At most this many destroyed names in the body's "Destroyed:" section. */
-export const NOTIFY_DESTROYED_NAMES = 20
+/** At most this many names in the body's "Destroyed:" and "Held" sections. */
+export const NOTIFY_SECTION_NAMES = 20
 
 /** How many snapshots the run destroyed (`pruned` may list fewer — capped). */
 function prunedTotal(result: SnapshotNotifyResult): number {
   return result.prunedCount ?? result.pruned.length
+}
+
+/** How many held snapshots the run retained (`skippedHeld` may list fewer — capped). */
+function heldTotal(result: SnapshotNotifyResult): number {
+  return result.heldCount ?? result.skippedHeld.length
+}
+
+/** A body section: at most {@link NOTIFY_SECTION_NAMES} names, then the rest counted. */
+function namedSection(lines: string[], title: string, names: string[], total: number): void {
+  lines.push('')
+  lines.push(title)
+  const shown = names.slice(0, NOTIFY_SECTION_NAMES)
+  for (const name of shown)
+    lines.push(`  ${name}`)
+  if (total > shown.length)
+    lines.push(`  ... and ${total - shown.length} more`)
 }
 
 export interface SnapshotNotifyContext extends UnattendedNotifyBase {
@@ -60,7 +76,7 @@ function fireHasWarnings(ctx: SnapshotNotifyContext): boolean {
   const result = ctx.result
   if (!result)
     return false
-  return result.skippedHeld.length > 0 || (result.datasets ?? []).some(d => (d.refused ?? 0) > 0)
+  return heldTotal(result) > 0 || (result.datasets ?? []).some(d => (d.refused ?? 0) > 0)
 }
 
 /** Classify a finished schedule fire into the shared four-outcome vocabulary. */
@@ -95,8 +111,8 @@ export function retentionSummaryLine(retention: RetentionPolicy): string {
  */
 export function pruneSummaryLine(result: SnapshotNotifyResult): string {
   const parts = [`${prunedTotal(result)} destroyed`]
-  if (result.skippedHeld.length)
-    parts.push(`${result.skippedHeld.length} held (kept despite policy)`)
+  if (heldTotal(result))
+    parts.push(`${heldTotal(result)} held (kept despite policy)`)
   return parts.join(', ')
 }
 
@@ -149,22 +165,10 @@ export function buildSnapshotNotifyBody(ctx: SnapshotNotifyContext): string {
   }
   // Names are a sample (the per-dataset counts above are the record): a first
   // run after an upgrade can destroy thousands.
-  if (result && prunedTotal(result) > 0) {
-    lines.push('')
-    lines.push('Destroyed:')
-    const shown = result.pruned.slice(0, NOTIFY_DESTROYED_NAMES)
-    for (const name of shown)
-      lines.push(`  ${name}`)
-    const more = prunedTotal(result) - shown.length
-    if (more > 0)
-      lines.push(`  ... and ${more} more`)
-  }
-  if (result?.skippedHeld.length) {
-    lines.push('')
-    lines.push('Held (retained, never pruned):')
-    for (const name of result.skippedHeld)
-      lines.push(`  ${name}`)
-  }
+  if (result && prunedTotal(result) > 0)
+    namedSection(lines, 'Destroyed:', result.pruned, prunedTotal(result))
+  if (result && heldTotal(result) > 0)
+    namedSection(lines, 'Held (retained, never pruned):', result.skippedHeld, heldTotal(result))
 
   if (ctx.error !== undefined) {
     lines.push('')

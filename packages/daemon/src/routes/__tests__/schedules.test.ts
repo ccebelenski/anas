@@ -281,6 +281,7 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     assert.match(result.taken, /^anas-daily-\d{4}-\d{2}-\d{2}T\d{6}Z$/)
     assert.deepEqual(result.pruned, [])
     assert.equal((result as { prunedCount?: number }).prunedCount, 0)
+    assert.equal((result as { heldCount?: number }).heldCount, 0)
     assert.deepEqual(result.skippedHeld, [])
     // The take issued a `zfs snapshot testpool/media@anas-daily-…`.
     const snapCall = mockOf(server).calls.find(c => c.args[0] === 'snapshot')

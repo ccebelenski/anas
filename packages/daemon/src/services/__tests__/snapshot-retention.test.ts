@@ -114,31 +114,44 @@ describe('planRetention — held snapshots (holds-vs-prune)', () => {
     assert.deepEqual(names(plan.skippedHeld), [snaps[2].name])
   })
 
-  it('a held snapshot the policy keeps is kept and NOT reported (no warning every run)', () => {
-    // Replication holds its newest sent snapshot; hourly/daily retention keeps
-    // it anyway. Reporting it would make every run a warning.
+  it('a held snapshot does not consume a bucket keep slot (GT-7)', () => {
     const snaps = [
       anas('daily', '2026-07-26T00:00:00Z', { held: true }),
       anas('daily', '2026-07-25T00:00:00Z'),
       anas('daily', '2026-07-24T00:00:00Z'),
     ]
     const plan = planRetention(snaps, { daily: 1 }, NOW)
+    // Among the 2 UNHELD, keep 1 (25), prune 24 — the held 26 took no slot.
+    // An as-if-unheld plan would keep 26, so it is retained silently.
+    assert.deepEqual(names(plan.prune), [snaps[2].name])
+    assert.deepEqual(names(plan.keep), names([snaps[0], snaps[1]]))
     assert.deepEqual(plan.skippedHeld, [])
-    assert.deepEqual(names(plan.keep), [snaps[0].name])
-    assert.deepEqual(names(plan.prune), names([snaps[1], snaps[2]]))
   })
 
-  it('held inside policy → not in skippedHeld; held outside policy → skippedHeld', () => {
+  it('held inside policy → not reported; held outside policy → skippedHeld; neither takes a slot', () => {
     const snaps = [
       anas('daily', '2026-07-26T00:00:00Z'),
-      anas('daily', '2026-07-25T00:00:00Z', { held: true }), // inside daily:2
+      anas('daily', '2026-07-25T00:00:00Z', { held: true }), // inside daily:2 as-if-unheld
       anas('daily', '2026-07-24T00:00:00Z'),
-      anas('daily', '2026-07-23T00:00:00Z', { held: true }), // outside daily:2
+      anas('daily', '2026-07-23T00:00:00Z', { held: true }), // outside daily:2 as-if-unheld
     ]
     const plan = planRetention(snaps, { daily: 2 }, NOW)
-    assert.deepEqual(names(plan.keep), names([snaps[0], snaps[1]]))
-    assert.deepEqual(names(plan.prune), [snaps[2].name])
+    // The two unheld fill daily:2 by themselves — nothing is destroyed.
+    assert.deepEqual(plan.prune, [])
+    assert.deepEqual(names(plan.keep), names([snaps[0], snaps[1], snaps[2]]))
     assert.deepEqual(names(plan.skippedHeld), [snaps[3].name])
+  })
+
+  it('hourly:2 with the NEWEST held (replication base): all three kept, nothing destroyed, nothing reported', () => {
+    const snaps = [
+      anas('hourly', '2026-07-26T12:00:00Z', { held: true }), // H_a
+      anas('hourly', '2026-07-26T11:00:00Z'), // H_b
+      anas('hourly', '2026-07-26T10:00:00Z'), // H_c
+    ]
+    const plan = planRetention(snaps, { hourly: 2 }, NOW)
+    assert.deepEqual(plan.prune, [])
+    assert.deepEqual(plan.skippedHeld, [])
+    assert.deepEqual(names(plan.keep), names(snaps))
   })
 })
 

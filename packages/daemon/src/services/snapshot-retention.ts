@@ -12,12 +12,14 @@ import { isTransientRunSnapshot, parseScheduledName } from './snapshot-naming.js
  *      bases, manual ZFS snapshots, AHR-manual snapshots — are NEVER pruned and
  *      appear in NONE of the plan's sets (outside ANAS retention entirely).
  *   2. HELD snapshots (`held: true` — a ZFS `zfs hold`, e.g. a replication base)
- *      are planned like any other, then a held one the plan would PRUNE is
- *      moved into `skippedHeld`: retained and surfaced as intentionally kept
- *      (the holds-vs-prune trap, GT-7). A held snapshot the policy keeps anyway
- *      is simply kept and not reported — replication holds its newest sent
- *      snapshot, which an hourly policy keeps, and that must not make every
- *      run a warning (snapprune.1 full review). btrfs snapshots are never held.
+ *      never take a bucket slot: the keep/prune decision is made over the
+ *      UNHELD snapshots only, so a hold never shrinks retention depth (the
+ *      holds-vs-prune trap, GT-7). Which held snapshots to REPORT is a second,
+ *      as-if-unheld plan over all of them: a held snapshot that plan would
+ *      prune goes to `skippedHeld` (retained, surfaced as intentionally kept);
+ *      one it would keep is kept silently — replication holds its newest sent
+ *      snapshot, which the policy keeps anyway, and that must not make every
+ *      run a warning. btrfs snapshots are never held.
  *   3. Each remaining snapshot is bucketed by the period encoded in its NAME.
  *      Within a bucket, the N newest (by the name's UTC timestamp) are kept;
  *      the rest are pruned. An absent bucket count is `0` (keep none).
@@ -42,9 +44,30 @@ export function planRetention(
   now: Date = new Date(),
 ): RetentionPlan {
   const durable = snapshots.filter(s => !isTransientRunSnapshot(s.name))
-  // Plan as if nothing were held; holds are applied to the prune set below.
-  const eligible = durable.filter(s => s.source === 'anas')
+  const anas = durable.filter(s => s.source === 'anas')
+  const held = anas.filter(s => s.held === true)
 
+  // (1) The decision: unheld snapshots only — a held one never takes a slot.
+  const decision = keepOrPrune(anas.filter(s => s.held !== true), policy, now)
+  if (held.length === 0)
+    return { ...decision, skippedHeld: [] }
+
+  // (2) The report: which held snapshots an as-if-unheld plan would prune.
+  const asIfUnheld = keepOrPrune(anas, policy, now)
+  const skippedHeld = asIfUnheld.prune.filter(s => s.held === true)
+  const silent = held.filter(s => !skippedHeld.includes(s))
+  return { keep: [...decision.keep, ...silent], prune: decision.prune, skippedHeld }
+}
+
+/**
+ * Rules 3 and 4 over `eligible` (ANAS-sourced, durable): the N newest per
+ * name-encoded bucket, plus the always-kept newest overall.
+ */
+function keepOrPrune(
+  eligible: ScheduledSnapshot[],
+  policy: RetentionPolicy,
+  now: Date,
+): { keep: ScheduledSnapshot[], prune: ScheduledSnapshot[] } {
   // Decode each eligible snapshot's period + timestamp from its name.
   const decoded = eligible.map(snap => ({ snap, parsed: parseScheduledName(snap.name) }))
 
@@ -85,10 +108,5 @@ export function planRetention(
     }
   }
 
-  // Only a held snapshot the policy would have destroyed is worth reporting.
-  return {
-    keep,
-    prune: prune.filter(s => s.held !== true),
-    skippedHeld: prune.filter(s => s.held === true),
-  }
+  return { keep, prune }
 }

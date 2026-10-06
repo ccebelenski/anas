@@ -191,6 +191,21 @@ describe('snapshot schedule notifications — the body (9.4)', () => {
     assert.match(body, ASCII_ONLY)
   })
 
+  it('held names are capped at 20 in the body, the rest counted from heldCount', () => {
+    const held = Array.from({ length: 50 }, (_, i) => `testpool/media/a@anas-hourly-h${i}`)
+    const ctx = {
+      schedule: makeSchedule({ recursive: true }),
+      result: { ...CLEAN_RUN, skippedHeld: held, heldCount: 75 },
+    }
+    assert.equal(snapshotNotifyOutcome(ctx), 'warning')
+    const body = buildSnapshotNotifyBody(ctx)
+    assert.match(body, /Pruned:\s+1 destroyed, 75 held \(kept despite policy\)/)
+    const section = body.slice(body.indexOf('Held (retained, never pruned):'))
+    assert.equal((section.match(/anas-hourly-h/g) ?? []).length, 20)
+    assert.ok(section.includes('  ... and 55 more'))
+    assert.match(body, ASCII_ONLY)
+  })
+
   it('a destroy refused on a swept or excluded dataset makes the run a warning (snapprune.1)', () => {
     const result = {
       ...CLEAN_RUN,
