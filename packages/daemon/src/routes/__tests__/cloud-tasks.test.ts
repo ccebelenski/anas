@@ -24,6 +24,14 @@ const SYSTEMD_ANALYZE = '/usr/bin/systemd-analyze'
 const FINDMNT = '/usr/bin/findmnt'
 const TIMEOUT = '/usr/bin/timeout'
 
+/**
+ * A `timeout`-wrapped rclone / boundary-scan child — not the source guard's
+ * bounded `realpath` (ident.4 (c)), which is a `timeout` child too.
+ */
+function isRcloneOrScan(c: { command: string, args: string[] }): boolean {
+  return c.command === TIMEOUT && !c.args.includes('/usr/bin/realpath')
+}
+
 /** The captured sync-after-deletion dry-run log — one would-be delete (b.bin). */
 const DRY_RUN_DELETE_LOG
   = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone/dry-run-sync-delete-1.60.1.log')
@@ -564,11 +572,14 @@ describe('cloud sync task routes (rclone.2)', () => {
       // (the guard, the stat and the listing are behind it), so the test can
       // accept a cancel before the run's first mutation.
       mock.addFixture({ command: TIMEOUT, live: { signalsToExit: Number.POSITIVE_INFINITY } })
+      // The source guard's bounded `realpath` (ident.4 (c)) is a `timeout`
+      // child too — answered at once, so the scan is still the blocker.
+      mock.addFixture({ command: TIMEOUT, args: ['-s', 'KILL', '5', '/usr/bin/realpath', '-e', '--', srcDir], result: { stdout: `${srcDir}\n`, stderr: '', exitCode: 0 } })
       mock.calls.length = 0
 
       const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: { direct: true } })
       const runId = (res.json() as JobAccepted).job.id
-      for (let i = 0; i < 200 && !mock.calls.some(c => c.command === TIMEOUT); i++)
+      for (let i = 0; i < 200 && !mock.calls.some(c => isRcloneOrScan(c)); i++)
         await new Promise(r => setTimeout(r, 5))
 
       const first = await server.inject({ method: 'POST', url: `/v1/jobs/${runId}/cancel`, headers: IDENTITY })
@@ -684,12 +695,12 @@ describe('cloud sync task routes (rclone.2)', () => {
       assert.deepEqual((res.json() as { data: { deletedFiles: string[] } }).data.deletedFiles, ['b.bin'])
 
       // The argv is the run's command, the live source, --dry-run.
-      const call = mockOf(server).calls.find(c => c.command === TIMEOUT)
+      const call = mockOf(server).calls.find(c => isRcloneOrScan(c))
       assert.ok(call, 'the preview runs through the timeout ceiling')
       assert.deepEqual(call!.args.slice(0, 5), ['120', RCLONE, 'sync', srcDir, 'gt:dst/preview'])
       assert.equal(call!.args.at(-1), '--dry-run')
       // And it read the LIVE tree: no snapshot machinery ran at all.
-      assert.ok(!mockOf(server).calls.some(c => c.command === '/usr/sbin/zfs'), 'no zfs call — a preview takes no snapshot')
+      assert.ok(!mockOf(server).calls.some(c => c.command === '/usr/sbin/zfs' && !c.args.includes('name,mountpoint,canmount,mounted')), 'no zfs call but the guard\'s read-only mount facts — a preview takes no snapshot')
     })
 
     it('404s for an unknown task name', async () => {
@@ -740,7 +751,7 @@ describe('cloud sync task routes (rclone.2)', () => {
       const message = (res.json() as { error: { message: string } }).error.message
       assert.match(message, /\/mnt\/pictures is a mount defined in \/etc\/fstab but not mounted right now/)
       assert.match(message, /Mount \/mnt\/pictures and run it again\./)
-      assert.ok(!mockOf(server).calls.some(c => c.command === TIMEOUT), 'the dry run is never issued')
+      assert.ok(!mockOf(server).calls.some(c => isRcloneOrScan(c)), 'the dry run is never issued')
     })
 
     it('401s without identity', async () => {
@@ -776,7 +787,7 @@ describe('cloud sync task routes (rclone.2)', () => {
         payload: { name: 'offsite', source: srcDir, remote: 'gt', path: 'dst/inline', mode: 'sync' },
       })
       assert.equal(res.statusCode, 200, res.body)
-      const call = mockOf(server).calls.find(c => c.command === TIMEOUT)
+      const call = mockOf(server).calls.find(c => isRcloneOrScan(c))
       assert.ok(call, 'the dry run was issued')
       assert.deepEqual(call!.args.slice(2, 5), ['sync', srcDir, 'gt:dst/inline'], 'the INLINE destination and mode, not the saved task\'s')
 

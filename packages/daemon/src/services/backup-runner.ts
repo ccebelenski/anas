@@ -34,7 +34,7 @@ import {
 import { withZvolSnapshotDevices } from './backup-zvol.js'
 import { nestedRunNotices, nestedRunWarnings, resolveNestedIncludes, scanArchives } from './nested-filesystems.js'
 import { formatTransientBackupSnapshot } from './snapshot-naming.js'
-import { readSourceGuardFacts, unmountedMountFor } from './source-guard.js'
+import { notThereClause, readSourceGuardFacts, unmountedMountFor } from './source-guard.js'
 
 /**
  * Backup RUNNER logic (Epic 16.7) — assembles the pbc environment + argv,
@@ -570,7 +570,7 @@ export interface BackupRunResult {
  */
 export function unmountedArchiveRefusal(archive: string, path: string, mount: UnmountedMount): string {
   return `archive '${archive}': ${path} is on ${mount.mountpoint} (${mount.source}), `
-    + `which is configured in /etc/fstab but not mounted`
+    + `which is ${notThereClause(mount)}`
 }
 
 /**
@@ -607,7 +607,7 @@ export async function runBackup(
   // yields no refusals, because a guard that cannot see the system must not
   // claim a mount is missing.
   deps.checkCancel?.('the source guard')
-  const guardFacts = await readSourceGuardFacts(executor, deps.fstabPath)
+  const guardFacts = await readSourceGuardFacts(executor, deps.fstabPath, task.archives.map(a => a.path))
   const refusals: string[] = []
   for (const archive of task.archives) {
     const mount = unmountedMountFor(archive.path, guardFacts)

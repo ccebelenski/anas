@@ -7,6 +7,7 @@ import type { ReplicationNotifyContext } from '../services/replication-notify.js
 import type { TargetPlacement } from '../services/replication-target.js'
 import type { Transport } from '../services/replication-transport.js'
 import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
+import { legacyReleasableOnSource, replicationHoldTag, settleReplicationHolds } from '../services/replication-holds.js'
 import { notifyReplicationRun } from '../services/replication-notify.js'
 import { guardReplicationTarget } from '../services/replication-target.js'
 import { isTransientRunSnapshot } from '../services/snapshot-naming.js'
@@ -25,9 +26,12 @@ import { requireIdentity } from './identity.js'
  *
  * Stateless (Principle): the incremental base is DISCOVERED at run time as the
  * newest snapshot common to source and target (never bookkept). The destination
- * is created `readonly=on`. A `zfs hold` (tag `anas-repl`) pins the replicated
- * base on BOTH sides so cleanup cannot sever the chain, and older holds are
- * released so exactly the newest base stays held. journald is forensics.
+ * is created `readonly=on`. A `zfs hold` pins the replicated base on BOTH sides
+ * so cleanup cannot sever the chain; the tag is per chain
+ * (`anas-repl-<hash(location, target)>`, story ident.4) and a run releases only
+ * its own tag on older snapshots, so exactly this chain's newest base stays
+ * held and another target of the same source is never unpinned. journald is
+ * forensics.
  */
 
 const ZFS = '/usr/sbin/zfs'
@@ -36,7 +40,6 @@ const ZFS = '/usr/sbin/zfs'
  *  own the remote and can't assume /usr/sbin). Used inside `ssh … zfs …`.
  */
 const ZFS_REMOTE = 'zfs'
-const HOLD_TAG = 'anas-repl'
 
 /**
  * Dependencies handed in from datasetRoutes — its executor, queue, and the
@@ -62,6 +65,12 @@ export interface ReplicationDeps {
   pveFootprint: () => Promise<PveFootprint>
   /** Stage-3 remote/peer SSH transport (location resolution + remote zfs ops). */
   transport: Transport
+  /**
+   * Where the `anas-repl-*` task units live — read by the legacy hold
+   * migration to learn the source's other chains (ident.4). Defaults to the
+   * ANAS_SYSTEMD_DIR / `/etc/systemd/system` every unit store uses.
+   */
+  systemdDir?: string
 }
 
 /**
@@ -157,15 +166,6 @@ const ISO_PUNCT_RE = /[:.]/g
 /** Sortable, ZFS-legal default snapshot name for the snapshot-first convenience. */
 function defaultSnapName(): string {
   return `snapshot-${new Date().toISOString().replace(ISO_PUNCT_RE, '-')}`
-}
-
-/** `zfs holds -H <snap>` → the set of tag names currently held (fail-open). */
-async function heldTags(executor: CommandExecutor, snapFull: string): Promise<string[]> {
-  const r = await executor.exec(ZFS, ['holds', '-H', snapFull])
-  if (r.exitCode !== 0 || !r.stdout.trim())
-    return []
-  // Tab-separated: <snapshot>\t<tag>\t<timestamp>.
-  return r.stdout.split('\n').filter(Boolean).map(l => l.split('\t')[1]).filter(Boolean)
 }
 
 export function createReplicationHandlers(deps: ReplicationDeps) {
@@ -422,56 +422,33 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             throw new Error(`Replication failed — ${detail}`)
           }
 
-          // 5) Hold the newest replicated base on BOTH sides, then release the
-          //    older anas-repl holds so exactly the newest base stays pinned. The
-          //    SOURCE is always local; the TARGET hold/release goes over ssh for a
-          //    peer/remote. Fail-open: hiccups are warnings, not job failures.
-          const warnings: string[] = []
-          const targetSnapFull = `${targetFull}@${snapName}`
-
-          const srcHold = await executor.exec(ZFS, ['hold', HOLD_TAG, srcSnapFull])
-          if (srcHold.exitCode !== 0)
-            warnings.push(`Could not place ${HOLD_TAG} hold on ${srcSnapFull}: ${srcHold.stderr.trim() || `exit ${srcHold.exitCode}`}`)
-
-          const tgtHold = loc.isRemote
-            ? await transport.remoteHold(loc.resolved, targetSnapFull, HOLD_TAG)
-            : await executor.exec(ZFS, ['hold', HOLD_TAG, targetSnapFull])
-          if (tgtHold.exitCode !== 0)
-            warnings.push(`Could not place ${HOLD_TAG} hold on ${targetSnapFull}: ${tgtHold.stderr.trim() || `exit ${tgtHold.exitCode}`}`)
-
-          // Release stale holds on OLDER source snapshots (keep only snapName).
-          const releaseOlderLocal = async (datasetFull: string, snaps: Snapshot[]): Promise<void> => {
-            for (const s of snaps) {
-              if (s.snapshotName === snapName)
-                continue
-              const full = `${datasetFull}@${s.snapshotName}`
-              if (!(await heldTags(executor, full)).includes(HOLD_TAG))
-                continue
-              const rel = await executor.exec(ZFS, ['release', HOLD_TAG, full])
-              if (rel.exitCode !== 0)
-                warnings.push(`Could not release ${HOLD_TAG} hold on ${full}: ${rel.stderr.trim() || `exit ${rel.exitCode}`}`)
-            }
-          }
-          await releaseOlderLocal(source, sourceSnaps)
-
-          // Release stale holds on OLDER target snapshots — local or over ssh.
-          if (loc.isRemote) {
-            const resolved = loc.resolved
-            for (const name of await transport.remoteSnapshotNames(resolved, targetFull)) {
-              if (name === snapName)
-                continue
-              const full = `${targetFull}@${name}`
-              if (!(await transport.remoteHeldTags(resolved, full)).includes(HOLD_TAG))
-                continue
-              const rel = await transport.remoteRelease(resolved, full, HOLD_TAG)
-              if (rel.exitCode !== 0)
-                warnings.push(`Could not release ${HOLD_TAG} hold on ${full}: ${rel.stderr.trim() || `exit ${rel.exitCode}`}`)
-            }
-          }
-          else {
-            // Re-read the target's snapshots — the recv just added snapName there.
-            await releaseOlderLocal(targetFull, await listSnapshotsDetail(targetFull))
-          }
+          // 5) Hold the new base on BOTH sides under THIS chain's tag, release
+          //    this chain's tag on older snapshots, and migrate the legacy
+          //    global tag (story ident.4 (a), audit #13 — services/
+          //    replication-holds.ts). The SOURCE is always local; the TARGET
+          //    side goes over ssh for a peer/remote. Fail-open: hiccups are
+          //    warnings, not job failures.
+          const holdTag = replicationHoldTag(target.location, targetFull)
+          const sourceNames = sourceSnaps.map(s => s.snapshotName)
+          // Re-read the target's snapshots — the recv just added snapName there.
+          const targetNames = loc.isRemote
+            ? await transport.remoteSnapshotNames(loc.resolved, targetFull)
+            : (await listSnapshotsDetail(targetFull)).map(s => s.snapshotName)
+          const releaseLegacyOnSource = await legacyReleasableOnSource(executor, {
+            sourceFull: source,
+            ownTag: holdTag,
+            sourceSnapshotNames: sourceNames,
+            ...(deps.systemdDir ? { systemdDir: deps.systemdDir } : {}),
+          })
+          const warnings = await settleReplicationHolds({ executor, transport }, {
+            tag: holdTag,
+            snapName,
+            ...(d.baseSnapshot ? { baseSnapshot: d.baseSnapshot } : {}),
+            source: { dataset: source, snapshotNames: sourceNames },
+            target: { dataset: targetFull, snapshotNames: targetNames },
+            ...(loc.isRemote ? { remote: loc.resolved } : {}),
+            releaseLegacyOnSource,
+          })
 
           const result = {
             mode: d.mode,
@@ -479,6 +456,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             ...(d.baseSnapshot ? { baseSnapshot: d.baseSnapshot } : {}),
             bytesEstimated,
             target: targetFull,
+            holdTag,
             ...(warnings.length ? { warnings } : {}),
           }
           await notifyReplicationRun(executor, { ...notify, result, elapsedMs: Date.now() - startedAt })

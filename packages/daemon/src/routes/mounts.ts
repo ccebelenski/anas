@@ -7,13 +7,14 @@ import type { IscsiPaths } from '../services/iscsi.js'
 import type { MountTestStages } from '../services/mounts.js'
 import { mkdir, readdir } from 'node:fs/promises'
 import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, UpdateMountRequest } from '@anas/shared'
-import { classifyKind } from '../parsers/findmnt.js'
+import { classifyKind, parseFindmnt } from '../parsers/findmnt.js'
 import { addMount, cifsAuthToken, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
 import { readPveMountPaths, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
 import { diagnoseBusyPath, enrichBusyError, formatHolders } from '../services/busy-diagnosis.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
+import { describeLive, liveAtTarget, specMatchesLive } from '../services/mount-match.js'
 import {
   ahrPinnedSpecs,
   applyOption,
@@ -33,7 +34,7 @@ import {
   readEffectiveOptions,
   readFindmnt,
   readMdadmConfText,
-  removeCredentialsFile,
+  removeCredentialsFileIfUnreferenced,
   removeEmptyMountpointDir,
   rotateCredentialsFile,
   runMountTest,
@@ -115,6 +116,51 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     reply.code(409)
     reply.send({ error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } })
     return true
+  }
+
+  /**
+   * What is mounted at `mountpoint` when it is NOT what the fstab line names
+   * (story ident.4 (e), audit #18), or undefined. A local disk mounted by hand
+   * where a failed CIFS line points is the case: before ident.4 a Remove,
+   * Unmount, Disable or Edit of the CIFS line unmounted the disk, and a Mount
+   * stacked the share on top of it. Nothing mounted (or only an armed
+   * automount placeholder) is not a mismatch.
+   */
+  async function foreignAt(mountpoint: string, entry: { spec: string, fstype: string } | undefined): Promise<string | undefined> {
+    if (!entry)
+      return undefined
+    const live = liveAtTarget(parseFindmnt(await readFindmnt(executor)), mountpoint)
+    if (!live.real || specMatchesLive(entry, live.real))
+      return undefined
+    return describeLive(live.real)
+  }
+
+  /** The refusal sentence for a foreign mount at the target — the 409 and the in-job re-check share it. */
+  function foreignMountMessage(mountpoint: string, entry: { spec: string, fstype: string }, live: string, action: string): string {
+    return `${action} refused: '${mountpoint}' has ${live} mounted on it, not ${entry.spec} (${entry.fstype}) that its /etc/fstab line names. `
+      + `ANAS unmounts or mounts over only the filesystem the line configures. Unmount ${mountpoint} on the node yourself (umount ${mountpoint}), then try again.`
+  }
+
+  /** 409 (no confirm — unsafe now) when a foreign filesystem sits at the target. Returns true when sent. */
+  async function foreignMountRefused(
+    mountpoint: string,
+    entry: { spec: string, fstype: string } | undefined,
+    action: string,
+    reply: FastifyReply,
+  ): Promise<boolean> {
+    const live = await foreignAt(mountpoint, entry)
+    if (!live || !entry)
+      return false
+    reply.code(409)
+    reply.send({ error: { code: 'CONFLICT', reason: 'mount-mismatch', message: foreignMountMessage(mountpoint, entry, live, action) } })
+    return true
+  }
+
+  /** The in-job re-check right before `umount`/`mount`: the table may have changed since the request. */
+  async function assertNotForeign(mountpoint: string, entry: { spec: string, fstype: string } | undefined, action: string): Promise<void> {
+    const live = await foreignAt(mountpoint, entry)
+    if (live && entry)
+      throw new Error(foreignMountMessage(mountpoint, entry, live, action))
   }
 
   /** Stamp `heldByLun` onto every mount a LUN's image sits under. */
@@ -304,6 +350,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (rejectedLocal)
       return rejectedLocal
 
+    // ident.4 (e): the edit remounts — never another filesystem at the target.
+    if (await foreignMountRefused(mp, existing, 'Editing', reply))
+      return reply
+
     const merged = mergeEntry(existing, body.options, body.automount, body.extraOptions)
     // SECURITY (BUG-1): a hand-written entry with inline plaintext credentials is
     // MIGRATED on this operator-initiated save — the secret moves to the protected
@@ -317,6 +367,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       // completed but nothing changed" (issue #25) had only the mountpoint to go on.
       { ...identity, params: { mountpoint: mp, ...(body.options ? { options: body.options } : {}) } },
       async (updateProgress) => {
+        await assertNotForeign(mp, existing, 'Editing')
         // VALIDATE-THEN-COMMIT (issue #24): the new secret is proven against the
         // server BEFORE anything is written. Nothing below this point runs on a
         // rejected password, so the live creds file and fstab stay untouched.
@@ -350,11 +401,20 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
             throw new Error(`Mount '${mp}' is not in /etc/fstab`)
           return replaceMount(current, mp, merged)
         })
+        // A rotation writes the hashed name (ident.4 (d)); the file the line
+        // named before (a pre-ident.4 flattened name) goes once nothing
+        // references it — and only from the ANAS creds directory.
+        const editWarnings: string[] = []
+        if (existing.credentialsFile && merged.credentialsFile && existing.credentialsFile !== merged.credentialsFile) {
+          const left = await removeCredentialsFileIfUnreferenced(credsDir, existing.credentialsFile, await readConfig(fstabPath))
+          if (left)
+            editWarnings.push(left)
+        }
         updateProgress('Reloading systemd (daemon-reload)')
         await daemonReload(executor)
         updateProgress(`Remounting ${mp}`)
         await remountEntry(executor, merged)
-        return { updated: mp }
+        return { updated: mp, ...(editWarnings.length > 0 ? { warnings: editWarnings } : {}) }
       },
     )
 
@@ -395,6 +455,12 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (rejectedLocal)
       return rejectedLocal
 
+    // ident.4 (e): mount, unmount and disable act on the target only while
+    // what is there is what the line names (enable touches fstab alone).
+    const verb = action === 'mount' ? 'Mounting' : action === 'unmount' ? 'Unmounting' : action === 'disable' ? 'Disabling' : undefined
+    if (verb && await foreignMountRefused(mp, entry, verb, reply))
+      return reply
+
     // --- mount: bring it up (keep the fstab entry) ---
     if (action === 'mount') {
       if (!entry && !mounted) {
@@ -409,6 +475,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         'mount.mount',
         { ...identity, params: { mountpoint: mp } },
         async (updateProgress) => {
+          await assertNotForeign(mp, entry, 'Mounting')
           updateProgress(`Mounting ${mp}`)
           await doMount(executor, entry && !fstabHasMount(fstabText, mp) ? entry : undefined, mp)
           return { mounted: mp }
@@ -474,6 +541,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       { ...identity, params: { mountpoint: mp } },
       async (updateProgress) => {
         if (mounted) {
+          await assertNotForeign(mp, entry, disabling ? 'Disabling' : 'Unmounting')
           updateProgress(`Unmounting ${mp}${lazy ? ' (lazy)' : ''}`)
           const r = await executor.exec(UMOUNT, lazy ? ['-l', mp] : [mp])
           if (r.exitCode !== 0 && !lazy)
@@ -533,6 +601,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (rejectedLocal)
       return rejectedLocal
 
+    // ident.4 (e), audit #18: a failed CIFS line whose target now carries a
+    // local filesystem must not take that filesystem down with it.
+    if (await foreignMountRefused(mp, entry ?? undefined, 'Removing', reply))
+      return reply
+
     // Story iscsi.6 — same hard refusal as unmount, and for the same reason:
     // remove unmounts first, and a LUN under the mountpoint must not be handed a
     // lazy unmount behind a confirm code.
@@ -547,6 +620,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       lazy = gate.lazy
     }
 
+    // ident.4 (d): the file the line names, or (a line naming none) this
+    // mountpoint's own hashed name — never the flattened pre-ident.4 name,
+    // which two mountpoints could share. Removed only from the creds dir and
+    // only when no other line references it (decided in the job, on the
+    // fstab as it is after the line is gone).
     const kind = entry ? classifyKind(entry.fstype, entry.spec) : undefined
     const credentialsFile = entry?.credentialsFile ?? (kind === 'cifs' ? credsFilePath(credsDir, mp) : undefined)
 
@@ -556,6 +634,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       async (updateProgress) => {
         const warnings: string[] = []
         if (mounted) {
+          await assertNotForeign(mp, entry ?? undefined, 'Removing')
           updateProgress(`Unmounting ${mp}${lazy ? ' (lazy)' : ''}`)
           const r = await executor.exec(UMOUNT, lazy ? ['-l', mp] : [mp])
           if (r.exitCode !== 0 && !lazy)
@@ -569,7 +648,9 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         }
         if (credentialsFile) {
           updateProgress('Removing credentials file')
-          await removeCredentialsFile(credentialsFile)
+          const kept = await removeCredentialsFileIfUnreferenced(credsDir, credentialsFile, await readConfig(fstabPath))
+          if (kept)
+            warnings.push(kept)
         }
         if (removeMountpointDir) {
           // rmdir semantics only, and only once the mount is really gone. A

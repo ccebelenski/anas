@@ -849,6 +849,91 @@ password = mock-obscured
       assert.match(res.json().error.message, /nightly/)
     })
 
+    // ident.4 (b), audit #15: a PUT that changes where the remote points
+    // re-points every task syncing through it — 409 + confirm naming them.
+    describe('PUT that re-points tasks (ident.4 (b))', () => {
+      /** The bare app has no job routes: the job is done once the file carries `text`. */
+      async function untilFileHas(text: string): Promise<void> {
+        for (let i = 0; i < 200; i++) {
+          if ((await readFile(bareFile, 'utf-8')).includes(text))
+            return
+          await new Promise(resolve => setTimeout(resolve, 10))
+        }
+        throw new Error(`rclone.conf never gained '${text}'`)
+      }
+
+      async function put(options: Record<string, string>, confirm?: string) {
+        return app.inject({
+          method: 'PUT',
+          url: '/v1/cloud/remotes/gt',
+          headers: { ...JSON_HEADERS, ...(confirm ? { 'x-anas-confirm': confirm } : {}) },
+          payload: JSON.stringify({ options }),
+        })
+      }
+
+      it('a host change on a remote a task uses → 409 + confirm code naming the task and the change; the code goes through', async () => {
+        await bare({ referencingTasks: async name => (name === 'gt' ? ['nightly'] : []) })
+        await writeFile(bareFile, GT_SECTION, 'utf-8')
+        const res = await put({ host: '10.0.0.99' })
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
+        assert.match(res.json().error.message, /re-points cloud sync task\(s\): nightly/)
+        assert.ok(res.json().error.warnings.includes('host: 127.0.0.1 -> 10.0.0.99'), JSON.stringify(res.json().error.warnings))
+        const code = res.headers['x-anas-confirm-code'] as string
+        assert.ok(code)
+        // The file is untouched until the confirmed resend.
+        assert.ok((await readFile(bareFile, 'utf-8')).includes('host = 127.0.0.1'))
+
+        // The confirmed resend is accepted as the update job (this bare app
+        // has no job routes to poll; the write itself is the update path the
+        // tests above already prove).
+        const ok = await put({ host: '10.0.0.99' }, code)
+        assert.equal(ok.statusCode, 202, ok.payload)
+        assert.equal((ok.json() as JobAccepted).job.operation, 'cloud.remote.update')
+        await untilFileHas('host = 10.0.0.99')
+      })
+
+      it('the code is bound to the exact change: it cannot carry a different destination through', async () => {
+        await bare({ referencingTasks: async name => (name === 'gt' ? ['nightly'] : []) })
+        await writeFile(bareFile, GT_SECTION, 'utf-8')
+        const code = (await put({ host: '10.0.0.99' })).headers['x-anas-confirm-code'] as string
+        assert.ok(code)
+        const other = await put({ host: '10.0.0.77' }, code)
+        assert.equal(other.statusCode, 409)
+        assert.equal(other.json().error.code, 'CONFIRMATION_REQUIRED')
+      })
+
+      it('a task reaching the remote THROUGH a wrapper is named, with the wrapper', async () => {
+        await bare({ referencingTasks: async name => (name === 'gtcrypt' ? ['offsite'] : []) })
+        await writeFile(bareFile, `${GT_SECTION}
+[gtcrypt]
+type = crypt
+remote = gt:crypt-base
+password = mock-obscured
+`, 'utf-8')
+        const res = await put({ host: '10.0.0.99' })
+        assert.equal(res.statusCode, 409)
+        assert.match(res.json().error.message, /offsite \(through gtcrypt\)/)
+      })
+
+      it('no confirm when nothing re-points: an unchanged value, a non-destination option, or no task', async () => {
+        await bare({ referencingTasks: async name => (name === 'gt' ? ['nightly'] : []) })
+        await writeFile(bareFile, GT_SECTION, 'utf-8')
+        // The same host (the dialog sends rendered fields) and a non-destination option.
+        const res = await put({ host: '127.0.0.1', user: 'rclonegt2' })
+        assert.equal(res.statusCode, 202, res.payload)
+        await untilFileHas('user = rclonegt2')
+      })
+
+      it('a destination change on a remote NO task uses → 202 straight away', async () => {
+        await bare({ referencingTasks: async () => [] })
+        await writeFile(bareFile, GT_SECTION, 'utf-8')
+        const res = await put({ host: '10.0.0.99' })
+        assert.equal(res.statusCode, 202, res.payload)
+        await untilFileHas('host = 10.0.0.99')
+      })
+    })
+
     it('deleting a remote another remote wraps → 409 naming the referencing remotes (cloudproof.2 finding 4)', async () => {
       await bare()
       await writeFile(bareFile, `${GT_SECTION}

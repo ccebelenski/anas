@@ -828,7 +828,7 @@ export async function runCloudSync(
   // The unmounted-mount check runs FIRST: it is the one that explains an empty
   // directory, and it is the only one that can answer without touching the path.
   deps.checkCancel?.('the source guard')
-  const guardFacts = await readSourceGuardFacts(executor, deps.fstabPath)
+  const guardFacts = await readSourceGuardFacts(executor, deps.fstabPath, [task.source])
   const refusal = guardSourcePath(task.source, guardFacts)
   if (refusal)
     throw new Error(refusal)

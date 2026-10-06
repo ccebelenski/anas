@@ -139,6 +139,13 @@ function zfsArgs(mock: MockExecutor): string[][] {
     .filter(c => c.command === ZFS)
     .map(c => c.args)
     .filter(a => !(a[0] === 'list' && a[1] === '-H' && a[2] === '-o' && a[3] === 'name,mountpoint'))
+    // …and the source guard's ZFS mount facts (ident.4 (c)) — a read, not the run's argv.
+    .filter(a => !a.includes('name,mountpoint,canmount,mounted'))
+}
+
+/** The `timeout` children that are NOT the source guard's bounded `realpath` (ident.4 (c)). */
+function timeoutCalls(mock: MockExecutor): { command: string, args: string[] }[] {
+  return mock.calls.filter(c => c.command === TIMEOUT && !c.args.includes('/usr/bin/realpath'))
 }
 
 function pbcArgs(mock: MockExecutor): string[] {
@@ -298,7 +305,7 @@ describe('img archives — the zvol snapshot device inside a run (backup2.4)', (
   it('an image source is never WALKED — no boundary scan runs for it', async () => {
     const mock = wire()
     await run(mock)
-    assert.deepEqual(mock.calls.filter(c => c.command === TIMEOUT), [])
+    assert.deepEqual(timeoutCalls(mock), [])
     // Sanity: the same run DOES walk a pxar sibling.
     const mixed = wire()
     await run(mixed, {
@@ -308,7 +315,7 @@ describe('img archives — the zvol snapshot device inside a run (backup2.4)', (
       ],
     })
     assert.deepEqual(
-      mixed.calls.filter(c => c.command === TIMEOUT).map(c => c.args),
+      timeoutCalls(mixed).map(c => c.args),
       [walkCall('/etc')],
     )
   })

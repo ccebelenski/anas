@@ -38,7 +38,10 @@ const JSON_HEADERS = { ...IDENTITY, 'content-type': 'application/json' }
 const FSTAB = [
   '# /etc/fstab: static file system information.',
   'UUID=deadbeef   /               ext4  errors=remount-ro  0  1',
-  'tank/mnttest    /mnttest        zfs   defaults  0  0',
+  // The dataset the capture really has at /mnttest (findmnt-full.json):
+  // since ident.4 (c) a target counts as mounted only when its live source
+  // is the configured one.
+  'mnttest         /mnttest        zfs   defaults  0  0',
   '//nas/gtabsent  /mnt/gt-absent  cifs  credentials=/etc/anas/creds/gt,nofail  0  0',
   '',
 ].join('\n')

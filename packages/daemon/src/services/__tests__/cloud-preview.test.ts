@@ -46,6 +46,14 @@ const ZFS = '/usr/sbin/zfs'
 const CONFIG = '/etc/anas/rclone.conf'
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone')
 
+/**
+ * The rclone dry run — a `timeout`-wrapped child. The source guard's bounded
+ * `realpath` (ident.4 (c)) is a `timeout` child too, and is not rclone.
+ */
+function isRcloneCall(c: { command: string, args: string[] }): boolean {
+  return c.command === TIMEOUT && !c.args.includes('/usr/bin/realpath')
+}
+
 function task(over: Partial<CloudSyncTask> = {}): CloudSyncTask {
   return CloudSyncTaskSchema.parse({
     name: 'offsite',
@@ -524,7 +532,7 @@ describe('previewCloudSync — the argv', () => {
       replayRclone(h.mock, await fixtureText('dry-run-sync-fresh-1.60.1.log'))
       await previewCloudSync(h.mock, deps(h, { task: task({ source: h.source, mode: 'sync', bwlimit: '8M', excludes: ['*.tmp'] }) }))
 
-      const call = h.mock.calls.find(c => c.command === TIMEOUT)
+      const call = h.mock.calls.find(c => isRcloneCall(c))
       assert.ok(call, 'the preview runs through the timeout wrapper')
       assert.deepEqual(call!.args, [
         String(PREVIEW_TIMEOUT_S),
@@ -558,9 +566,9 @@ describe('previewCloudSync — the argv', () => {
       replayRclone(h.mock, await fixtureText('dry-run-sync-fresh-1.60.1.log'))
       await previewCloudSync(h.mock, deps(h, { task: task({ source: h.source, mode: 'sync' }) }))
 
-      const rcloneSource = h.mock.calls.find(c => c.command === TIMEOUT)!.args
+      const rcloneSource = h.mock.calls.find(c => isRcloneCall(c))!.args
       assert.equal(rcloneSource[3], h.source, 'rclone is pointed at the LIVE tree, not a snapshot path')
-      assert.ok(!h.mock.calls.some(c => c.command === ZFS), 'no zfs call at all — no snapshot, no sweep')
+      assert.ok(!h.mock.calls.some(c => c.command === ZFS && !c.args.includes('name,mountpoint,canmount,mounted')), 'no zfs call but the guard\'s read-only mount facts — no snapshot, no sweep')
     }
     finally {
       await h.cleanup()
@@ -575,7 +583,7 @@ describe('previewCloudSync — the argv', () => {
         previewCloudSync(h.mock, deps(h, { task: task({ source: h.source, path: 'hunter2/preview' }), secrets: ['hunter2'] })),
         /a secret must never ride argv/,
       )
-      assert.ok(!h.mock.calls.some(c => c.command === TIMEOUT), 'rclone is never reached')
+      assert.ok(!h.mock.calls.some(c => isRcloneCall(c)), 'rclone is never reached')
     }
     finally {
       await h.cleanup()
@@ -599,7 +607,7 @@ describe('previewCloudSync — the guards', () => {
         // the path and the mount it sits on.
         /\/mnt\/pictures\/2026 is under \/mnt\/pictures, which is a mount defined in \/etc\/fstab but not mounted right now/,
       )
-      assert.ok(!h.mock.calls.some(c => c.command === TIMEOUT), 'rclone is never reached')
+      assert.ok(!h.mock.calls.some(c => isRcloneCall(c)), 'rclone is never reached')
     }
     finally {
       await h.cleanup()
@@ -613,7 +621,7 @@ describe('previewCloudSync — the guards', () => {
         previewCloudSync(h.mock, deps(h)),
         /does not exist or is not a directory/,
       )
-      assert.ok(!h.mock.calls.some(c => c.command === TIMEOUT))
+      assert.ok(!h.mock.calls.some(c => isRcloneCall(c)))
     }
     finally {
       await h.cleanup()
@@ -646,7 +654,7 @@ describe('previewCloudSync — the guards', () => {
       const result = await previewCloudSync(h.mock, deps(h, { task: task({ source: h.source, mode: 'sync' }) }))
       assert.equal(result.deletes, 4, 'the look ran and reported what a run would do')
       assert.equal(result.truncated, false)
-      assert.ok(h.mock.calls.some(c => c.command === TIMEOUT && c.args.includes('--dry-run')), 'the dry run was issued over the empty source')
+      assert.ok(h.mock.calls.some(c => isRcloneCall(c) && c.args.includes('--dry-run')), 'the dry run was issued over the empty source')
     }
     finally {
       await h.cleanup()

@@ -15,6 +15,7 @@ import { MockExecutor } from '../../executor/mock.js'
 import { JobQueue } from '../../jobs/queue.js'
 import { ConfirmStore } from '../../safety/confirm.js'
 import { createServer } from '../../server.js'
+import { credsFileName } from '../../services/mounts.js'
 import { jobRoutes } from '../jobs.js'
 import { mountsRoutes } from '../mounts.js'
 
@@ -576,7 +577,8 @@ describe('mount routes (Epic 18)', () => {
       assert.ok(!line.includes(PASSWORD), 'plaintext gone from fstab')
 
       // The creds file holds the EXACT original password, including the `#`.
-      const credsPath = join(dir, 'creds', 'chiapools-chiap2.cred')
+      // ident.4 (d): the migrated secret lands under the HASHED name.
+      const credsPath = join(dir, 'creds', credsFileName(INLINE_MP))
       const creds = await readFile(credsPath, 'utf8')
       assert.ok(creds.includes(`password=${PASSWORD}`), 'exact special-char password migrated')
       assert.ok(creds.includes('username=ccebelenski'))
@@ -1048,7 +1050,7 @@ describe('PUT /v1/mounts — credentials are proven before anything is committed
     assert.deepEqual(await readdir(h!.credsDir), ['mnt-edit-cifs.cred'])
     // The probe authenticated from the CANDIDATE file, never the live one.
     const probe = h!.executor.calls.find(c => c.command === TIMEOUT)!
-    assert.match(probe.args.join(' '), /credentials=.*\.mnt-edit-cifs\.cred\.validating/)
+    assert.match(probe.args.join(' '), new RegExp(`credentials=.*\\.${credsFileName(CIFS_MP).replace('.', '\\.')}\\.validating`))
     // No fstab rewrite means no reload and no remount attempt either.
     assert.ok(!called(h!.executor, SYSTEMCTL, ['daemon-reload']))
     assert.ok(!called(h!.executor, UMOUNT, [CIFS_MP]))
@@ -1060,11 +1062,13 @@ describe('PUT /v1/mounts — credentials are proven before anything is committed
     const job = await putCredentials('n3wp@ss')
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
 
-    const credsPath = join(h!.credsDir, 'mnt-edit-cifs.cred')
+    // ident.4 (d): a rotation writes the HASHED name, and the old
+    // flattened-name file the line used to name goes once nothing references it.
+    const credsPath = join(h!.credsDir, credsFileName(CIFS_MP))
     const creds = await readFile(credsPath, 'utf8')
     assert.ok(creds.includes('password=n3wp@ss'), creds)
     assert.equal((await stat(credsPath)).mode & 0o777, 0o600)
-    assert.deepEqual(await readdir(h!.credsDir), ['mnt-edit-cifs.cred'])
+    assert.deepEqual(await readdir(h!.credsDir), [credsFileName(CIFS_MP)])
 
     const line = (await readFile(h!.fstabPath, 'utf8')).split('\n').find(l => l.includes(CIFS_MP))!
     assert.ok(line.includes(`credentials=${credsPath}`), line)
@@ -1107,8 +1111,9 @@ describe('PUT /v1/mounts — a completed edit means the new options are LIVE (is
   }
 
   it('a refused unmount falls back to `mount -o remount` and succeeds once the options land', async () => {
-    // Mount table: still rw after the refused unmount, ro after the remount.
-    h = await createEditServer(nfsFstab, [nfsTable(RW), nfsTable(RO)])
+    // Mount table: the two ident.4 (e) live-match reads (request, job start),
+    // still rw after the refused unmount, ro after the remount.
+    h = await createEditServer(nfsFstab, [nfsTable(RW), nfsTable(RW), nfsTable(RW), nfsTable(RO)])
     refuseUnmount(h.executor)
 
     const job = await putReadOnly()
@@ -1177,5 +1182,150 @@ describe('DeleteMountQuery — the mountpoint-directory flag (18.5 refinement)',
   it('rejects anything else rather than guessing', () => {
     assert.equal(DeleteMountQuery.safeParse({ removeMountpointDir: 'yes' }).success, false)
     assert.equal(DeleteMountQuery.safeParse({ removeMountpointDir: 2 }).success, false)
+  })
+})
+
+// ============================================================================
+// ident.4 (e) — act on the target only while what is mounted there is what
+// the fstab line names (audit #18); (d) — a credentials file goes only from
+// the ANAS creds dir and only when no other line references it (audit #17)
+// ============================================================================
+
+describe('mount mutations act only on what is actually there (ident.4 (e))', () => {
+  let h: EditHarness | undefined
+
+  /** A CIFS line whose mount failed, and a local disk the operator mounted at its target. */
+  const cifsFstab = (credsDir: string): string =>
+    `//10.0.0.9/media ${CIFS_MP} cifs credentials=${join(credsDir, credsFileName(CIFS_MP))},vers=3.1.1,nofail 0 0\n`
+  const LOCAL_DISK = findmntJson([{ target: CIFS_MP, source: '/dev/loop3', fstype: 'ext4', options: 'rw,relatime' }])
+  const THE_SHARE = findmntJson([{ target: CIFS_MP, source: '//10.0.0.9/media', fstype: 'cifs', options: 'rw,vers=3.1.1' }])
+
+  afterEach(async () => {
+    await h?.app.close()
+    await rm(h!.dir, { recursive: true, force: true })
+    h = undefined
+  })
+
+  function assertMismatch(res: { statusCode: number, json: () => any }, verb: string): void {
+    assert.equal(res.statusCode, 409)
+    const err = res.json().error
+    assert.equal(err.code, 'CONFLICT')
+    assert.equal(err.reason, 'mount-mismatch')
+    assert.match(err.message, new RegExp(`^${verb} refused`))
+    // The 409 names what is there AND what the line names.
+    assert.ok(err.message.includes('/dev/loop3 (ext4)'), err.message)
+    assert.ok(err.message.includes('//10.0.0.9/media (cifs)'), err.message)
+  }
+
+  it('Remove → 409 naming the local filesystem; nothing is unmounted, fstab untouched', async () => {
+    h = await createEditServer(cifsFstab, [LOCAL_DISK])
+    const before = await readFile(h.fstabPath, 'utf8')
+    const res = await h.app.inject({ method: 'DELETE', url: `/v1/mounts/${enc(CIFS_MP)}`, headers: IDENTITY_HEADERS })
+    assertMismatch(res, 'Removing')
+    assert.ok(!h.executor.calls.some(c => c.command === UMOUNT), 'umount never ran')
+    assert.equal(await readFile(h.fstabPath, 'utf8'), before)
+  })
+
+  it('Unmount, Disable and Mount → 409; Enable (fstab only) is not gated', async () => {
+    h = await createEditServer(cifsFstab, [LOCAL_DISK])
+    for (const [action, verb] of [['unmount', 'Unmounting'], ['disable', 'Disabling'], ['mount', 'Mounting']]) {
+      const res = await h.app.inject({
+        method: 'POST',
+        url: `/v1/mounts/${enc(CIFS_MP)}/state`,
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ action }),
+      })
+      assertMismatch(res, verb)
+    }
+    assert.ok(!h.executor.calls.some(c => c.command === UMOUNT || c.command === MOUNT), 'neither umount nor mount ran')
+  })
+
+  it('Edit → 409 before anything is written', async () => {
+    h = await createEditServer(cifsFstab, [LOCAL_DISK])
+    const before = await readFile(h.fstabPath, 'utf8')
+    const res = await h.app.inject({
+      method: 'PUT',
+      url: `/v1/mounts/${enc(CIFS_MP)}`,
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ options: { ro: true } }),
+    })
+    assertMismatch(res, 'Editing')
+    assert.equal(await readFile(h.fstabPath, 'utf8'), before)
+  })
+
+  it('the job re-checks: a local disk mounted after the request fails the job, not the disk', async () => {
+    // Request time: the share is there. Job time: a local disk sits there instead.
+    h = await createEditServer(cifsFstab, [THE_SHARE, THE_SHARE, LOCAL_DISK])
+    const res = await h.app.inject({ method: 'DELETE', url: `/v1/mounts/${enc(CIFS_MP)}`, headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(h.app, res.json().job.id)
+    assert.equal(job.status, 'failed')
+    assert.match(job.error!.message, /\/dev\/loop3 \(ext4\)/)
+    assert.ok(!h.executor.calls.some(c => c.command === UMOUNT), 'umount never ran')
+  })
+
+  it('the configured share itself unmounts and removes as before', async () => {
+    h = await createEditServer(cifsFstab, [THE_SHARE, THE_SHARE, THE_SHARE, findmntJson([])])
+    const res = await h.app.inject({ method: 'DELETE', url: `/v1/mounts/${enc(CIFS_MP)}`, headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(h.app, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(called(h.executor, UMOUNT, [CIFS_MP]))
+    assert.ok(!(await readFile(h.fstabPath, 'utf8')).includes(CIFS_MP))
+  })
+})
+
+describe('mount Remove — the credentials file (ident.4 (d))', () => {
+  let h: EditHarness | undefined
+
+  afterEach(async () => {
+    await h?.app.close()
+    await rm(h!.dir, { recursive: true, force: true })
+    h = undefined
+  })
+
+  async function remove(mp: string): Promise<Job> {
+    const res = await h!.app.inject({ method: 'DELETE', url: `/v1/mounts/${enc(mp)}`, headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 202, res.payload)
+    return waitForJob(h!.app, res.json().job.id)
+  }
+
+  it('a file another line still names is kept (the flattened pre-ident.4 name two mounts shared)', async () => {
+    // Audit #17: `/mnt/nas-media` and `/mnt/nas/media` both flattened to one name.
+    const shared = (credsDir: string): string => join(credsDir, 'mnt-nas-media.cred')
+    h = await createEditServer(credsDir => [
+      `//nas/a /mnt/nas-media cifs credentials=${shared(credsDir)},nofail 0 0`,
+      `//nas/b /mnt/nas/media cifs credentials=${shared(credsDir)},nofail 0 0`,
+      '',
+    ].join('\n'), [findmntJson([])])
+    await mkdir(h.credsDir, { recursive: true })
+    await writeFile(shared(h.credsDir), OLD_CREDS, { mode: 0o600 })
+
+    const job = await remove('/mnt/nas/media')
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal(await readFile(shared(h.credsDir), 'utf8'), OLD_CREDS, 'the other mount keeps its secret')
+    assert.match((job.result as { warnings?: string[] }).warnings?.join(' ') ?? '', /another \/etc\/fstab line still references it/)
+  })
+
+  it('an unreferenced file in the creds dir is removed', async () => {
+    h = await createEditServer(credsDir => `//nas/a ${CIFS_MP} cifs credentials=${join(credsDir, credsFileName(CIFS_MP))},nofail 0 0\n`, [findmntJson([])])
+    await mkdir(h.credsDir, { recursive: true })
+    await writeFile(join(h.credsDir, credsFileName(CIFS_MP)), OLD_CREDS, { mode: 0o600 })
+    const job = await remove(CIFS_MP)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(await readdir(h.credsDir), [])
+  })
+
+  it('a file outside the creds dir is never deleted', async () => {
+    let outside = ''
+    h = await createEditServer((credsDir) => {
+      outside = join(dirname(credsDir), 'operator-own.cred')
+      return `//nas/a ${CIFS_MP} cifs credentials=${outside},nofail 0 0\n`
+    }, [findmntJson([])])
+    await writeFile(outside, OLD_CREDS, { mode: 0o600 })
+    const job = await remove(CIFS_MP)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal(await readFile(outside, 'utf8'), OLD_CREDS)
+    assert.match((job.result as { warnings?: string[] }).warnings?.join(' ') ?? '', /not in the ANAS credentials directory/)
   })
 })

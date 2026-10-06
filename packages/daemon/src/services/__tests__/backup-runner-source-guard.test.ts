@@ -44,6 +44,24 @@ const FSTAB = [
   '',
 ].join('\n')
 
+/** What the kernel reports at each target when the configured thing is mounted. */
+const LIVE: Record<string, { source: string, fstype: string }> = {
+  '/mnt/pictures': { source: '//nas/pictures', fstype: 'cifs' },
+  '/mnt/archive': { source: 'server:/export', fstype: 'nfs4' },
+  '/mnt/images': { source: '/dev/sdb1', fstype: 'ext4' },
+}
+
+/**
+ * The guard's own reads (ident.4 (c)): the mount table, the ZFS mount facts,
+ * and the bounded `realpath` of each source. A refused run makes these and
+ * nothing else.
+ */
+function isGuardRead(c: { command: string, args: string[] }): boolean {
+  return c.command === FINDMNT
+    || (c.command === ZFS && c.args.includes('name,mountpoint,canmount,mounted'))
+    || (c.command === TIMEOUT && c.args.includes('/usr/bin/realpath'))
+}
+
 /** What the kernel actually has. Only `/` — the three shares never came up. */
 function findmntTable(targets: string[]): string {
   return JSON.stringify({
@@ -52,10 +70,11 @@ function findmntTable(targets: string[]): string {
       source: '/dev/sda1',
       fstype: 'ext4',
       options: 'rw',
+      // ident.4 (c): a target counts as mounted only when the CONFIGURED
+      // source and fstype are what the kernel has there.
       children: targets.filter(t => t !== '/').map(target => ({
         target,
-        source: '//nas/share',
-        fstype: 'cifs',
+        ...LIVE[target],
         options: 'rw',
       })),
     }],
@@ -151,7 +170,7 @@ describe('backup source guard — the run\'s step 0 (backup2.11)', () => {
     // The proof that the guard is STEP 0: the only thing that ran is the
     // guard's own mount-table read. No boundary walk, no `zfs snapshot`, no
     // `proxmox-backup-client` — the refused run touched nothing.
-    assert.deepEqual(mock.calls.map(c => c.command), [FINDMNT])
+    assert.ok(mock.calls.every(isGuardRead), `only the guard's own reads ran: ${JSON.stringify(mock.calls)}`)
     assert.ok(!mock.calls.some(c => c.command === PRLIMIT), 'pbc was never invoked')
     assert.ok(!mock.calls.some(c => c.command === ZFS && c.args[0] === 'snapshot'), 'nothing was snapshotted')
   })
@@ -179,7 +198,7 @@ describe('backup source guard — the run\'s step 0 (backup2.11)', () => {
         return true
       },
     )
-    assert.deepEqual(mock.calls.map(c => c.command), [FINDMNT])
+    assert.ok(mock.calls.every(isGuardRead), `only the guard's own reads ran: ${JSON.stringify(mock.calls)}`)
   })
 
   it('an `img` archive on an unmounted mount is refused too — the same lie in block form', async () => {
@@ -195,7 +214,30 @@ describe('backup source guard — the run\'s step 0 (backup2.11)', () => {
         return true
       },
     )
-    assert.deepEqual(mock.calls.map(c => c.command), [FINDMNT])
+    assert.ok(mock.calls.every(isGuardRead), `only the guard's own reads ran: ${JSON.stringify(mock.calls)}`)
+  })
+
+  it('ident.4 (c): an archive on an UNMOUNTED ZFS dataset is refused, naming the dataset', async () => {
+    // Audit #16: a dataset whose key is not loaded (or canmount=off) leaves an
+    // empty directory at its mountpoint, which used to back up as an empty
+    // "good" snapshot.
+    const mock = new Mock()
+    mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: findmntTable(['/']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['list', '-H', '-p', '-t', 'filesystem', '-o', 'name,mountpoint,canmount,mounted'], result: { stdout: 'tank/vault\t/tank/vault\ton\tno\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: '', exitCode: 1 } })
+    mock.addFixture({ command: PRLIMIT, result: { stdout: '', stderr: PBC_OK, exitCode: 0 } })
+    await assert.rejects(
+      run(mock, [{ name: 'vault', path: '/tank/vault/docs', excludes: [] }]),
+      (err: Error) => {
+        assert.equal(
+          err.message,
+          'archive \'vault\': /tank/vault/docs is on /tank/vault (tank/vault), '
+          + 'which is the mountpoint of ZFS dataset tank/vault but not mounted',
+        )
+        return true
+      },
+    )
+    assert.ok(!mock.calls.some(c => c.command === PRLIMIT), 'pbc was never invoked')
   })
 
   it('FAIL OPEN: an unreadable mount table lets the run proceed', async () => {

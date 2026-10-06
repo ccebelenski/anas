@@ -1,7 +1,7 @@
 import type { MountEntry, MountSummary, MountType } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -19,12 +19,14 @@ import {
   entryForResponse,
   formatCredentials,
   hasInlineCredentials,
+  legacyCredsFileName,
   mapCifsFailure,
   mapNfsFailure,
   parseSpec,
   parseStatCapacity,
   probeInventoryHealth,
   redactFstabLine,
+  removeCredentialsFileIfUnreferenced,
   removeEmptyMountpointDir,
   runMountTest,
   writeCredentialsFile,
@@ -566,7 +568,7 @@ describe('writeCredentialsFile', () => {
   it('writes the exact accepted format at 0600 (never the secret on argv)', async () => {
     const credsDir = join(dir, 'creds')
     const path = await writeCredentialsFile(credsDir, '/mnt/anas-cifs', { username: 'smbtest', password: 'Passw0rd123', domain: 'WORKGROUP' })
-    assert.equal(path, join(credsDir, 'mnt-anas-cifs.cred'))
+    assert.equal(path, join(credsDir, credsFileName('/mnt/anas-cifs')))
     const content = await readFile(path, 'utf8')
     assert.equal(content, 'username=smbtest\npassword=Passw0rd123\ndomain=WORKGROUP\n')
     // Matches the ground-truth fixture format exactly.
@@ -581,15 +583,80 @@ describe('writeCredentialsFile', () => {
     assert.equal(formatCredentials({ username: 'u', password: 'p' }), 'username=u\npassword=p\n')
   })
 
-  it('derives a deterministic per-mount filename', () => {
-    assert.equal(credsFileName('/mnt/anas-cifs'), 'mnt-anas-cifs.cred')
-    assert.equal(credsFileName('/srv/data/share'), 'srv-data-share.cred')
+  it('derives a deterministic per-mount filename hashed from the FULL mountpoint (ident.4 (d))', () => {
+    // sha256('/mnt/anas-cifs') = 9109a8c515cd…
+    assert.equal(credsFileName('/mnt/anas-cifs'), 'mnt-9109a8c515cd.cred')
+    assert.equal(credsFileName('/mnt/anas-cifs'), credsFileName('/mnt/anas-cifs'))
+    // Audit #17: the flattened name made these two share one file.
+    assert.equal(legacyCredsFileName('/mnt/nas-media'), legacyCredsFileName('/mnt/nas/media'))
+    assert.notEqual(credsFileName('/mnt/nas-media'), credsFileName('/mnt/nas/media'))
+    assert.match(credsFileName('/srv/data/share'), /^mnt-[0-9a-f]{12}\.cred$/)
+    // The legacy name is still derivable (the read fallback).
+    assert.equal(legacyCredsFileName('/srv/data/share'), 'srv-data-share.cred')
   })
 
   it('a comma-bearing password lands in the line-based creds file intact', async () => {
     const credsDir = join(dir, 'creds')
     const path = await writeCredentialsFile(credsDir, '/mnt/x', { username: 'u', password: 'a,b#c$d' })
     assert.equal(await readFile(path, 'utf8'), 'username=u\npassword=a,b#c$d\n')
+  })
+})
+
+describe('removeCredentialsFileIfUnreferenced (ident.4 (d))', () => {
+  let dir: string
+  let credsDir: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-creds-rm-'))
+    credsDir = join(dir, 'creds')
+    await mkdir(credsDir, { recursive: true })
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('removes an unreferenced file inside the creds dir', async () => {
+    const f = join(credsDir, 'mnt-aaaaaaaaaaaa.cred')
+    await writeFile(f, 'x')
+    assert.equal(await removeCredentialsFileIfUnreferenced(credsDir, f, 'UUID=x / ext4 defaults 0 1\n'), undefined)
+    await assert.rejects(stat(f))
+  })
+
+  it('keeps a file another fstab line still references', async () => {
+    const f = join(credsDir, 'mnt-nas-media.cred')
+    await writeFile(f, 'x')
+    const fstab = `//nas/media /mnt/nas-media cifs credentials=${f},nofail 0 0\n`
+    assert.match(await removeCredentialsFileIfUnreferenced(credsDir, f, fstab) ?? '', /another \/etc\/fstab line still references it/)
+    assert.equal(await readFile(f, 'utf8'), 'x')
+  })
+
+  it('never deletes a file outside the creds dir', async () => {
+    const outside = join(dir, 'operator.cred')
+    await writeFile(outside, 'x')
+    assert.match(await removeCredentialsFileIfUnreferenced(credsDir, outside, '') ?? '', /not in the ANAS credentials directory/)
+    assert.equal(await readFile(outside, 'utf8'), 'x')
+  })
+
+  it('a path that walks out through a symlinked directory is outside', async () => {
+    const outsideDir = join(dir, 'elsewhere')
+    await mkdir(outsideDir)
+    await writeFile(join(outsideDir, 'victim.cred'), 'x')
+    await symlink(outsideDir, join(credsDir, 'link'))
+    const viaLink = join(credsDir, 'link', 'victim.cred')
+    assert.match(await removeCredentialsFileIfUnreferenced(credsDir, viaLink, '') ?? '', /not in the ANAS credentials directory/)
+    assert.equal(await readFile(join(outsideDir, 'victim.cred'), 'utf8'), 'x')
+  })
+
+  it('a symlink in the creds dir is not removed as if it were the file', async () => {
+    const target = join(dir, 'target.cred')
+    await writeFile(target, 'x')
+    const link = join(credsDir, 'mnt-bbbbbbbbbbbb.cred')
+    await symlink(target, link)
+    assert.match(await removeCredentialsFileIfUnreferenced(credsDir, link, '') ?? '', /not a regular file/)
+    assert.equal(await readFile(target, 'utf8'), 'x')
+  })
+
+  it('an absent file is simply gone', async () => {
+    assert.equal(await removeCredentialsFileIfUnreferenced(credsDir, join(credsDir, 'mnt-cccccccccccc.cred'), ''), undefined)
   })
 })
 

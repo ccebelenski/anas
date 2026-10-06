@@ -129,7 +129,7 @@ export async function previewCloudSync(
   // ---- The guards (the run's own, minus the empty-source one) ------------
   // The unmounted-mount check first: the one that explains an empty
   // directory, and the only one that can answer without touching the path.
-  const guardFacts = await readSourceGuardFacts(executor, deps.fstabPath)
+  const guardFacts = await readSourceGuardFacts(executor, deps.fstabPath, [task.source])
   const refusal = guardSourcePath(task.source, guardFacts)
   if (refusal)
     throw new PreviewRefusal(refusal)

@@ -827,6 +827,22 @@ export const UnmountedMount = z.object({
    * older daemon's answer parses.
    */
   disabled: z.boolean().optional(),
+  /**
+   * Where the configuration comes from (story ident.4 (c)): an `/etc/fstab`
+   * line, or a ZFS dataset whose `mountpoint` is the path (then `source` is the
+   * dataset name, `fstype` is `zfs`, and `canmount` is its property). Optional
+   * so an older daemon's answer parses (absent = fstab).
+   */
+  origin: z.enum(['fstab', 'zfs']).optional(),
+  /** ZFS only: the dataset's `canmount` (`on` / `off` / `noauto`). */
+  canmount: z.string().optional(),
+  /**
+   * Something ELSE is mounted at the mountpoint (ident.4 (c)): the kernel's
+   * source and fstype there, which do not match the configuration. Absent
+   * when nothing is mounted at all.
+   */
+  mountedSource: z.string().optional(),
+  mountedFstype: z.string().optional(),
 })
 export type UnmountedMount = z.infer<typeof UnmountedMount>
 

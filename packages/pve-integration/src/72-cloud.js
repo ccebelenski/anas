@@ -1582,12 +1582,17 @@
         } else {
             body = { name: name, type: type, options: wireOptions(win, true, {}) };
         }
-        ANAS.runJob({
+        // ident.4 (b): an edit that changes where the remote points answers
+        // 409 + confirm naming the tasks it re-points — confirmAndRun shows the
+        // daemon's warnings and resends with the code on Yes.
+        (isEdit ? ANAS.confirmAndRun : ANAS.runJob)({
             node: node,
             method: isEdit ? 'put' : 'post',
             path: isEdit ? ('/cloud/remotes/' + encodeURIComponent(name)) : '/cloud/remotes',
             body: body,
             view: win,
+            confirmTitle: 'Re-point remote',
+            confirmIntro: t('This change re-points the cloud sync tasks that use this remote:'),
             failTitle: isEdit ? 'Save failed' : 'Add failed',
             successMsg: isEdit ? (t('Remote saved') + ': ' + enc(name))
                 : (t('Remote added') + ': ' + enc(name)),

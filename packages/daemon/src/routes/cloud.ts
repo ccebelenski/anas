@@ -28,10 +28,13 @@ import {
 } from '@anas/shared'
 import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
+import { ConfirmStore } from '../safety/confirm.js'
+import { confirmGate } from '../safety/gate.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyCloudRun } from '../services/cloud-notify.js'
 import { previewCloudSync, PreviewRefusal } from '../services/cloud-preview.js'
+import { describeChange, describeTasks, destinationChanges, tasksReachingRemote } from '../services/cloud-retarget.js'
 import { runCloudSync } from '../services/cloud-runner.js'
 import {
   clearCancelledRunFailedState,
@@ -69,7 +72,7 @@ import { requireIdentity } from './identity.js'
  *   GET    /v1/cloud/providers        → rclone's backend catalogue, trimmed
  *   GET    /v1/cloud/remotes          → { rclone: {version, configFile, encrypted}, remotes }
  *   POST   /v1/cloud/remotes          → 202 job (surgical INI write + gate)
- *   PUT    /v1/cloud/remotes/:name    → 202 job (type immutable)
+ *   PUT    /v1/cloud/remotes/:name    → 202 job (type immutable; 409 + confirm when it re-points tasks)
  *   DELETE /v1/cloud/remotes/:name    → 202 job (409 while a task references it)
  *   POST   /v1/cloud/remotes/test     → 200 { verdict, message } (bounded lsjson, no job)
  *   GET    /v1/cloud/tasks            → the grid: task + LOCAL-ONLY systemd status
@@ -168,6 +171,12 @@ export interface CloudRouteOptions {
    * override it to `false` to prove the 503 door.
    */
   rcloneAvailable?: () => Promise<boolean>
+  /**
+   * The daemon's ONE confirm store (story ident.4 (b): a remote PUT that
+   * re-points tasks is a 409 + confirm). Optional so a test that registers the
+   * plugin alone still works; absent, the plugin keeps its own store.
+   */
+  confirmStore?: ConfirmStore
 }
 
 export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptions) {
@@ -178,6 +187,7 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
   // The real store answers the remotes DELETE refusal now that it exists
   // (rclone.1 shipped the hook against an empty store).
   const referencingTasks = opts.referencingTasks ?? (name => tasksReferencingRemote(systemdDir, name))
+  const confirmStore = opts.confirmStore ?? new ConfirmStore()
 
   /** Refuse before the call: the availability probe (no binary → the sentinel). */
   async function requireRclone(): Promise<void> {
@@ -411,6 +421,27 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       if (ownClient !== null) {
         reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: ownClient } })
         return null
+      }
+      // Story ident.4 (b), audit #15: an update that changes WHERE the remote
+      // points re-points every task syncing through it — directly or through
+      // a wrapper — so it is a 409 + confirm naming them. The code is bound
+      // to the remote AND the exact changes, so it cannot carry a different
+      // retarget through.
+      const changes = destinationChanges(existing, input.options, catalog)
+      if (changes.length > 0) {
+        const tasks = await tasksReachingRemote(current.remotes, name, referencingTasks)
+        if (tasks.length > 0 && !confirmGate(confirmStore, request, reply, {
+          operation: 'cloud.remote.retarget',
+          params: { remote: name, changes: changes.map(c => [c.key, c.to]) },
+          message: `Changing where remote '${name}' points re-points cloud sync task(s): ${describeTasks(tasks)}`,
+          warnings: [
+            `Tasks that sync through it: ${describeTasks(tasks)}`,
+            ...changes.map(describeChange),
+            `Every listed task will sync to the new destination on its next run; a sync task makes that destination match its source, deleting what is there and not in the source.`,
+          ],
+        })) {
+          return null
+        }
       }
       return { catalog, type: existing.type }
     })

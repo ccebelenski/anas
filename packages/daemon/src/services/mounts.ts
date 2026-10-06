@@ -16,11 +16,12 @@ import type {
 } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
+import { createHash } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, rmdir, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { MountCifsSec, MountNfsSec, normalizeMountTarget } from '@anas/shared'
 import { classifyKind, isIgnoredMount, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { cifsAuthToken, getMount, inlineCommentIndex, parseFstab } from '../parsers/fstab.js'
@@ -726,8 +727,23 @@ export function applyMountDefaults(
 // Credentials (per-mount 0600 root-only files, NOTES §7)
 // ============================================================================
 
-/** Deterministic credentials filename for a mountpoint (e.g. `mnt-anas-cifs.cred`). */
+/**
+ * Deterministic credentials filename for a mountpoint: `mnt-<12 hex of
+ * sha256(mountpoint)>.cred` (story ident.4 (d), audit #17). The name before
+ * ident.4 flattened the path (`/mnt/nas-media` and `/mnt/nas/media` both became
+ * `mnt-nas-media.cred`), so two mounts could share — and one Remove delete —
+ * the other's secret. The hash of the FULL mountpoint is injective for every
+ * practical purpose. New files are written under this name; a file written
+ * under the old one keeps working, because the fstab line names its file and
+ * that is what is read ({@link legacyCredsFileName} is the fallback for a line
+ * that names none).
+ */
 export function credsFileName(mountpoint: string): string {
+  return `mnt-${createHash('sha256').update(mountpoint).digest('hex').slice(0, 12)}.cred`
+}
+
+/** The pre-ident.4 flattened name — read as a fallback only, never written. */
+export function legacyCredsFileName(mountpoint: string): string {
   const base = mountpoint.replace(LEADING_SLASHES_RE, '').replace(SLASH_RE, '-').replace(UNSAFE_CHARS_RE, '_')
   return `${base || 'root'}.cred`
 }
@@ -735,6 +751,51 @@ export function credsFileName(mountpoint: string): string {
 /** Full credentials-file path for a mountpoint under `dir`. */
 export function credsFilePath(dir: string, mountpoint: string): string {
   return join(dir, credsFileName(mountpoint))
+}
+
+/**
+ * Remove a credentials file ANAS no longer needs — ONLY when it is a regular
+ * file directly inside the ANAS creds directory (both sides resolved, so a
+ * symlinked path cannot lead outside) and nothing in `fstabText` (the fstab
+ * AFTER the edit) still references it (ident.4 (d)). Never throws. Returns
+ * undefined when the file is gone (or was never there), else the sentence
+ * naming why it stayed.
+ */
+export async function removeCredentialsFileIfUnreferenced(
+  credsDir: string,
+  path: string,
+  fstabText: string,
+): Promise<string | undefined> {
+  const target = resolve(path)
+  let realDir: string
+  let realParent: string
+  try {
+    realDir = await realpath(credsDir)
+    realParent = await realpath(dirname(target))
+  }
+  catch {
+    return dirname(target) === resolve(credsDir)
+      ? undefined // the creds dir itself is absent — nothing to remove
+      : `Credentials file '${path}' was left in place — it is not in the ANAS credentials directory ${credsDir}.`
+  }
+  if (realParent !== realDir)
+    return `Credentials file '${path}' was left in place — it is not in the ANAS credentials directory ${credsDir}.`
+  const referenced = fstabText.includes(target) || fstabText.includes(path)
+    || parseFstab(fstabText).some(e => e.credentialsFile !== undefined && resolve(e.credentialsFile) === target)
+  if (referenced)
+    return `Credentials file '${path}' was left in place — another /etc/fstab line still references it.`
+  try {
+    const st = await lstat(target)
+    if (!st.isFile())
+      return `Credentials file '${path}' was left in place — it is not a regular file.`
+    await rm(target, { force: true })
+    return undefined
+  }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return undefined
+    return `Could not remove credentials file '${path}' (${(err as NodeJS.ErrnoException).code ?? (err as Error).message}).`
+  }
 }
 
 /** Render a credentials file exactly as `mount.cifs` accepts (NOTES §7). */
@@ -865,11 +926,6 @@ export async function readCredentialsMeta(
   catch {
     return { set: false }
   }
-}
-
-/** Remove a per-mount credentials file (best-effort). */
-export async function removeCredentialsFile(path: string): Promise<void> {
-  await rm(path, { force: true })
 }
 
 /**
@@ -1245,8 +1301,11 @@ export async function buildMountDetail(
       detail.warnings.push(INLINE_CREDS_WARNING)
     }
     else {
-      const credPath = entry?.credentialsFile ?? credsFilePath(opts.credsDir, mountpoint)
-      const meta = await readCredentialsMeta(credPath)
+      // The fstab line names its file; a line that names none falls back to
+      // the hashed name, then the pre-ident.4 flattened one (read both, write new).
+      let meta = await readCredentialsMeta(entry?.credentialsFile ?? credsFilePath(opts.credsDir, mountpoint))
+      if (!meta.set && !entry?.credentialsFile)
+        meta = await readCredentialsMeta(join(opts.credsDir, legacyCredsFileName(mountpoint)))
       detail.credentials = {
         set: meta.set,
         ...(meta.username ? { username: meta.username } : {}),

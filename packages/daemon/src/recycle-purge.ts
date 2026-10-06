@@ -1,6 +1,6 @@
 import type { Stats } from 'node:fs'
-import { readdir, readFile, rmdir, stat, unlink } from 'node:fs/promises'
-import { join } from 'node:path'
+import { lstat, readdir, readFile, realpath, rmdir, unlink } from 'node:fs/promises'
+import { join, sep } from 'node:path'
 import { recyclePurgeTargets } from './parsers/smb-conf.js'
 
 /**
@@ -105,22 +105,53 @@ async function listDirsDeepestFirst(dir: string): Promise<string[]> {
   return dirs.reverse()
 }
 
+/** Is `p` strictly inside `root` (both already resolved)? */
+function isInside(root: string, p: string): boolean {
+  return p.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)
+}
+
+/**
+ * Does `p` still resolve inside the bin? A share user can swap a directory
+ * under the bin for a symlink between the walk listing it and the purge
+ * acting on it; the resolved path is the only honest answer (story ident.4
+ * (f), audit #19). An unresolvable path is not inside.
+ */
+async function resolvesInside(realBin: string, p: string): Promise<boolean> {
+  try {
+    return isInside(realBin, await realpath(p))
+  }
+  catch {
+    return false
+  }
+}
+
 /**
  * Purge one bin: remove the files past their purge age, then prune the empty
  * directories under it (never `bin` itself — `rmdir` on the only-just-emptied
  * parents succeeds, a still-populated one fails with ENOTEMPTY and stays).
+ *
+ * Every file and directory is acted on only while its resolved path stays
+ * inside the bin's resolved path and it is what it was listed as (`lstat`: a
+ * regular file, a real directory) — never through a symlink (ident.4 (f)).
+ * `refused` counts what was left for failing that check.
  */
 export async function purgeBin(
   bin: string,
   days: number,
   opts: { now?: () => number, ageOf?: (stats: Stats) => number } = {},
-): Promise<{ removed: number, prunedDirs: number }> {
+): Promise<{ removed: number, prunedDirs: number, refused: number }> {
   const now = opts.now ?? Date.now
   const ageOf = opts.ageOf ?? ((stats: Stats) => now() - stats.ctimeMs)
+  const realBin = await realpath(bin)
   let removed = 0
+  let refused = 0
   for (const file of await listFiles(bin)) {
     try {
-      const stats = await stat(file)
+      const stats = await lstat(file)
+      if (!stats.isFile() || !(await resolvesInside(realBin, file))) {
+        refused++
+        continue
+      }
       if (isPurgeable(ageOf(stats), days)) {
         await unlink(file)
         removed++
@@ -136,6 +167,11 @@ export async function purgeBin(
   let prunedDirs = 0
   for (const dir of await listDirsDeepestFirst(bin)) {
     try {
+      const stats = await lstat(dir)
+      if (!stats.isDirectory() || !(await resolvesInside(realBin, dir))) {
+        refused++
+        continue
+      }
       await rmdir(dir)
       prunedDirs++
     }
@@ -145,7 +181,17 @@ export async function purgeBin(
         throw err
     }
   }
-  return { removed, prunedDirs }
+  return { removed, prunedDirs, refused }
+}
+
+/**
+ * Is the repository one plain path segment? A `recycle:repository` such as
+ * `../x` or `a/b` points the purge somewhere other than a directory inside
+ * the share, so it is skipped (ident.4 (f)).
+ */
+export function isSingleSegment(repository: string): boolean {
+  return repository !== '' && repository !== '.' && repository !== '..'
+    && !repository.includes('/') && !repository.includes('\\') && !repository.includes('\0')
 }
 
 /** One run over the whole config. */
@@ -178,9 +224,22 @@ export async function runRecyclePurge(opts: RecyclePurgeOptions = {}): Promise<R
       result.skipped++
       continue
     }
+    if (!isSingleSegment(target.repository)) {
+      log(`anas-recycle: share=${target.share} skipped (repository '${target.repository}' is not a single directory name inside the share - not followed)`)
+      result.skipped++
+      continue
+    }
     const bin = join(target.path, target.repository)
     try {
-      const stats = await stat(bin)
+      // lstat, never stat: a share user can replace the bin with a symlink to
+      // anywhere, and a purge that followed it would delete files the user
+      // could never have recycled (ident.4 (f), audit #19).
+      const stats = await lstat(bin)
+      if (stats.isSymbolicLink()) {
+        log(`anas-recycle: share=${target.share} skipped (${target.repository} is a symbolic link - not followed)`)
+        result.skipped++
+        continue
+      }
       if (!stats.isDirectory()) {
         log(`anas-recycle: share=${target.share} skipped (${target.repository} is not a directory)`)
         result.skipped++
@@ -195,8 +254,9 @@ export async function runRecyclePurge(opts: RecyclePurgeOptions = {}): Promise<R
       continue
     }
     try {
-      const { removed, prunedDirs } = await purgeBin(bin, target.days, { now: opts.now, ageOf: opts.ageOf })
-      log(`anas-recycle: share=${target.share} removed=${removed} pruned_dirs=${prunedDirs}`)
+      const { removed, prunedDirs, refused } = await purgeBin(bin, target.days, { now: opts.now, ageOf: opts.ageOf })
+      const note = refused > 0 ? ` refused=${refused} (left in place - not a plain file or directory inside ${target.repository})` : ''
+      log(`anas-recycle: share=${target.share} removed=${removed} pruned_dirs=${prunedDirs}${note}`)
       result.purged++
     }
     catch (err) {

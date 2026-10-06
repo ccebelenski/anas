@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { zfsListArgs, zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
+import { replicationHoldTag } from '../../services/replication-holds.js'
 import { buildSshArgv, resolvedRemoteFields } from '../../services/replication-transport.js'
 
 const ZFS = '/usr/sbin/zfs'
@@ -25,6 +26,8 @@ const TARGET = 'backup/media'
 const SNAP = 'repl-base'
 const REMOTE = { name: 'nas1', host: '10.0.0.9', port: 22, user: 'root' }
 const FULL_DRYRUN = `full\t${SOURCE}@${SNAP}\t13424\nsize\t13424\n`
+/** The chain's own hold tag (ident.4 (a)) — derived from where the target lives and its dataset. */
+const TAG = replicationHoldTag({ kind: 'remote', name: 'nas1' }, TARGET)
 
 function zfsListJson(names: string[]): string {
   const datasets: Record<string, unknown> = {}
@@ -100,11 +103,11 @@ describe('replication to a REMOTE target (Epic 5.5.2)', () => {
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson([SOURCE]), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs(SOURCE), result: { stdout: snapshotListJson(SOURCE, [SNAP]), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: ['send', '-nvP', `${SOURCE}@${SNAP}`], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['hold', 'anas-repl', `${SOURCE}@${SNAP}`], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['hold', TAG, `${SOURCE}@${SNAP}`], result: { stdout: '', stderr: '', exitCode: 0 } })
     // Remote (ssh) state: pool exists, target dataset absent (→ full), holds ok.
     sshFix(mock, ['zpool', 'list', '-H', '-o', 'name'], { stdout: 'backup\n', stderr: '', exitCode: 0 })
     sshFix(mock, ['zfs', 'list', '-H', '-o', 'name', TARGET], { stdout: '', stderr: 'dataset does not exist', exitCode: 1 })
-    sshFix(mock, ['zfs', 'hold', 'anas-repl', `${TARGET}@${SNAP}`], { stdout: '', stderr: '', exitCode: 0 })
+    sshFix(mock, ['zfs', 'hold', TAG, `${TARGET}@${SNAP}`], { stdout: '', stderr: '', exitCode: 0 })
     sshFix(mock, ['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name,creation', TARGET], { stdout: '', stderr: '', exitCode: 0 })
   })
 
@@ -172,5 +175,9 @@ describe('replication to a REMOTE target (Epic 5.5.2)', () => {
     const heldOverSsh = mock.calls.some(c =>
       c.command === '/usr/bin/ssh' && c.args.includes('zfs') && c.args.includes('hold') && c.args.includes(`${TARGET}@${SNAP}`))
     assert.ok(heldOverSsh, 'expected a remote `ssh … zfs hold` on the target base snapshot')
+    // …under this chain's own tag, on both sides, with no hold warning.
+    const result = done.result as { holdTag?: string, warnings?: string[] }
+    assert.equal(result.holdTag, TAG)
+    assert.equal(result.warnings, undefined, JSON.stringify(result.warnings))
   })
 })

@@ -618,6 +618,8 @@ export function createServer(opts?: ServerOptions) {
     paths: rclonePaths,
     systemdDir,
     fstabPath,
+    // ident.4 (b): a remote PUT that re-points tasks is a 409 + confirm.
+    confirmStore,
     ...(mountsStoragePath ? { storagePath: mountsStoragePath } : {}),
     // The dev mock never spawns anything, so probing the real /usr/bin/rclone
     // would make the cloud paths untestable on a machine without rclone.

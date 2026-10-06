@@ -13,6 +13,7 @@ import { JobQueue } from '../../jobs/queue.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
 import { loadPveFootprint } from '../../services/pve-footprint.js'
+import { replicationHoldTag } from '../../services/replication-holds.js'
 import { createReplicationHandlers } from '../replication.js'
 
 const ZFS = '/usr/sbin/zfs'
@@ -307,11 +308,15 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     })
 
     // Holds placed on BOTH sides after success.
+    // ident.4 (a): the hold tag is this CHAIN's own (location + target).
+    const tag = replicationHoldTag(undefined, 'testpool2/share1')
+    assert.match(tag, /^anas-repl-[0-9a-f]{12}$/)
     const holds = mock.calls.filter(c => c.command === ZFS && c.args[0] === 'hold')
     assert.deepEqual(holds.map(h => h.args), [
-      ['hold', 'anas-repl', 'testpool/share1@repl-base'],
-      ['hold', 'anas-repl', 'testpool2/share1@repl-base'],
+      ['hold', tag, 'testpool/share1@repl-base'],
+      ['hold', tag, 'testpool2/share1@repl-base'],
     ])
+    assert.equal((job.result as { holdTag?: string }).holdTag, tag)
   })
 
   // --- replicate: incremental happy path — exact send/recv argv ----------

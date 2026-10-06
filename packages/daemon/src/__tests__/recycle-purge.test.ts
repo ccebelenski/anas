@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
-import { isPurgeable, main, parseRunnerArgs, purgeBin, runRecyclePurge } from '../recycle-purge.js'
+import { isPurgeable, isSingleSegment, main, parseRunnerArgs, purgeBin, runRecyclePurge } from '../recycle-purge.js'
 
 const DAY = 86_400_000
 /**
@@ -179,6 +179,71 @@ describe('runRecyclePurge — the sweep over smb.conf', () => {
     const result = await runRecyclePurge({ ...opts, smbConfPath: confPath })
     assert.deepEqual(result, { purged: 1, skipped: 1, failed: 0 }, logLines.join('\n'))
     assert.ok(logLines.some(l => /share=odd skipped/.test(l)), logLines.join('\n'))
+  })
+
+  // ident.4 (f), audit #19: a share user can replace the bin with a symlink.
+  it('a #recycle replaced by a symlink is SKIPPED with a note — nothing behind it is touched', async () => {
+    let victim = ''
+    setup((paths) => {
+      victim = join(paths.root, 'victim')
+      mkdirSync(victim, { recursive: true })
+      writeFileSync(join(victim, 'precious.txt'), 'x')
+      ageFile(join(victim, 'precious.txt'), 400 * DAY)
+      const other = join(paths.root, 'srv/linked')
+      mkdirSync(other, { recursive: true })
+      symlinkSync(victim, join(other, '#recycle'))
+      return `[linked]\n\tpath = ${other}\n\trecycle:repository = #recycle\n\t# anas:recycle-purge-days = 30\n`
+    })
+    const result = await runRecyclePurge({ ...opts, smbConfPath: confPath })
+    assert.deepEqual(result, { purged: 1, skipped: 1, failed: 0 }, logLines.join('\n'))
+    assert.ok(existsSync(join(victim, 'precious.txt')), 'the symlink was not followed')
+    assert.ok(logLines.some(l => /^anas-recycle: share=linked skipped \(#recycle is a symbolic link - not followed\)$/.test(l)), logLines.join('\n'))
+  })
+
+  it('a repository that is not one directory name inside the share is skipped', async () => {
+    setup('[escape]\n\tpath = /srv/x\n\trecycle:repository = ../../etc\n\t# anas:recycle-purge-days = 30\n')
+    const result = await runRecyclePurge({ ...opts, smbConfPath: confPath })
+    assert.deepEqual(result, { purged: 1, skipped: 1, failed: 0 }, logLines.join('\n'))
+    assert.ok(logLines.some(l => /share=escape skipped \(repository '\.\.\/\.\.\/etc' is not a single directory name/.test(l)), logLines.join('\n'))
+  })
+
+  it('isSingleSegment', () => {
+    for (const ok of ['#recycle', '.recycle', 'Recycle Bin'])
+      assert.ok(isSingleSegment(ok), ok)
+    for (const bad of ['', '.', '..', 'a/b', '../x', '/abs', 'a\\b'])
+      assert.ok(!isSingleSegment(bad), bad)
+  })
+
+  it('a symlinked directory or file INSIDE the bin is left in place and counted, never followed', async () => {
+    let victim = ''
+    const { mediaBin } = setup((paths) => {
+      victim = join(paths.root, 'victim')
+      mkdirSync(victim, { recursive: true })
+      writeFileSync(join(victim, 'precious.txt'), 'x')
+      ageFile(join(victim, 'precious.txt'), 400 * DAY)
+      return ''
+    })
+    symlinkSync(victim, join(mediaBin, 'link-dir'))
+    symlinkSync(join(victim, 'precious.txt'), join(mediaBin, 'link-file'))
+    const result = await runRecyclePurge({ ...opts, smbConfPath: confPath })
+    assert.equal(result.purged, 1)
+    assert.ok(existsSync(join(victim, 'precious.txt')))
+    assert.ok(existsSync(join(mediaBin, 'link-dir')), 'the link itself is left alone')
+    assert.ok(!existsSync(join(mediaBin, 'sub/old.txt')), 'the real aged file still goes')
+  })
+
+  it('purgeBin never walks a symlinked directory nested deep in the bin', async () => {
+    // (The per-file realpath containment check is the backstop for a swap
+    // between listing and unlink; the listing itself never descends a link.)
+    const { mediaBin } = setup('')
+    const outside = join(dir, 'outside')
+    mkdirSync(outside, { recursive: true })
+    writeFileSync(join(outside, 'precious.txt'), 'x')
+    ageFile(join(outside, 'precious.txt'), 400 * DAY)
+    symlinkSync(outside, join(mediaBin, 'sub', 'escape'))
+    const r = await purgeBin(mediaBin, 30, { now: () => NOW, ageOf: mtimeAge })
+    assert.ok(existsSync(join(outside, 'precious.txt')))
+    assert.equal(r.removed, 1, 'only the real aged file inside the bin')
   })
 
   it('an unreadable smb.conf fails the run (the timer\'s unit result stays truthful)', async () => {
