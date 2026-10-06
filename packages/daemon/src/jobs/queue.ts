@@ -473,7 +473,11 @@ export class JobQueue {
       const message = err instanceof JobFailedDespiteCancelError && record.cancelling
         ? `${base} (a cancel was requested at ${record.cancelling.at} but the run failed before it could be stopped)`
         : base
-      job.error = { code: 'JOB_FAILED', message }
+      // A body may name its failure (ident.1: `IDENTITY_MISMATCH` when the
+      // object under the confirmed name changed while the job was queued).
+      const jobErrorCode = err instanceof Error ? (err as Error & { jobErrorCode?: unknown }).jobErrorCode : undefined
+      const named = typeof jobErrorCode === 'string' ? jobErrorCode : 'JOB_FAILED'
+      job.error = { code: named, message }
 
       this.audit?.finished(
         {

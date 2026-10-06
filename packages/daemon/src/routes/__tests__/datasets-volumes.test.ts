@@ -136,6 +136,11 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       // listing must stay empty so the create-snapshot collision check passes.
       if (command === '/usr/sbin/zfs' && sameArgs(args, zfsSnapshotDetailArgs(VOL)))
         return { stdout: VOL_SNAPSHOTS, stderr: '', exitCode: 0 }
+      // ident.1: the guid a destroy confirm binds, the txgs a rollback binds.
+      if (command === '/usr/sbin/zfs' && sameArgs(args, ['get', '-H', '-o', 'value', 'guid', VOL]))
+        return { stdout: '8812\n', stderr: '', exitCode: 0 }
+      if (command === '/usr/sbin/zfs' && sameArgs(args, ['list', '-t', 'snapshot', '-Hp', '-o', 'name,createtxg', '-d', '1', VOL]))
+        return { stdout: `${VOL}@before-grow\t11\n`, stderr: '', exitCode: 0 }
       return orig(command, args)
     }
     return server

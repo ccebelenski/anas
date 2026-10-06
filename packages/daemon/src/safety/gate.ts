@@ -1,5 +1,5 @@
 import type { FastifyReply, FastifyRequest } from 'fastify'
-import type { ConfirmStore } from './confirm.js'
+import type { BoundId, ConfirmStore } from './confirm.js'
 
 /**
  * Confirmation gate for a dangerous operation (Principle 14, Level 2).
@@ -21,15 +21,17 @@ export function confirmGate(
   opts: {
     operation: string
     params: Record<string, unknown>
+    /** Story ident.1: a stable id bound into the signature (see stable-id.ts). */
+    bound?: BoundId
     message: string
     warnings: string[]
   },
 ): boolean {
   const provided = request.headers['x-anas-confirm']
-  if (typeof provided === 'string' && store.verifyCode(provided, opts.operation, opts.params))
+  if (typeof provided === 'string' && store.verifyCode(provided, opts.operation, opts.params, opts.bound))
     return true
 
-  const { code, expiresAt } = store.generateCode(opts.operation, opts.params)
+  const { code, expiresAt } = store.generateCode(opts.operation, opts.params, opts.bound)
   reply.code(409)
   reply.header('X-Anas-Confirm-Code', code)
   reply.header('X-Anas-Confirm-Expires', expiresAt)

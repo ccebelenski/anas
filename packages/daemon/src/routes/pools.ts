@@ -16,6 +16,7 @@ import { parsePoolBusyState, parseZpoolStatus, parseZpoolStatusPool } from '../p
 import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
 import { confirmGate } from '../safety/gate.js'
 import { isRootPool } from '../safety/root-pool.js'
+import { confirmGateBound, readPoolGuid, requireStableId } from '../safety/stable-id.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
@@ -33,6 +34,7 @@ const ZPOOL = '/usr/sbin/zpool'
 const WIPEFS = '/usr/sbin/wipefs'
 const SGDISK = '/usr/sbin/sgdisk'
 const LSBLK = '/usr/bin/lsblk'
+const BLKID = '/usr/sbin/blkid'
 const FINDMNT = '/usr/bin/findmnt'
 /** findmnt args for live-mount collision checks (matches the AHR precedent). */
 const FINDMNT_ARGS = ['--json', '--real']
@@ -67,10 +69,17 @@ interface PoolLeaf {
   leafId: string
   /** The leaf's REAL device path — labelclear + wipefs target. */
   leafPath: string
-  /** Identity of the WHOLE disk (leafId minus its partition suffix). */
-  wholeDiskId: string
+  /**
+   * Identity of the WHOLE disk (leafId minus its partition suffix). Absent for
+   * a leaf ZFS names by any other path (by-partuuid, by-path, by-vdev, …):
+   * that string cannot be reduced to a disk, so the job asks `lsblk`
+   * (ident.1, audit #2 — never the stripped by-id whole disk).
+   */
+  wholeDiskId?: string
   /** The WHOLE disk's REAL device path — the GPT-zap and ownership-probe target. */
-  wholeDiskPath: string
+  wholeDiskPath?: string
+  /** The leaf's vdev state from `zpool status` (ident.1: only ONLINE leaves are cleaned). */
+  state?: string
   /**
    * The leaf's KERNEL partition name when ZFS named the device directly
    * (`/dev/sdb1`) rather than through by-id. The ownership guard resolves our
@@ -95,7 +104,7 @@ export function allVdevLeaves(pool: ParsedPoolStatus): LeafRef[] {
   for (const group of pool.vdevGroups) {
     for (const vdev of group.vdevs) {
       for (const disk of vdev.disks)
-        leaves.push({ id: disk.id, path: disk.path })
+        leaves.push({ id: disk.id, path: disk.path, state: disk.state })
     }
   }
   return leaves
@@ -115,10 +124,18 @@ export function allVdevLeaves(pool: ParsedPoolStatus): LeafRef[] {
  * Those leaves are addressed by their kernel device instead, whole disk
  * included, through the same partition-suffix reduction the disk join uses.
  *
+ * Any OTHER leaf path (by-partuuid, by-path, by-vdev, a mapper node) is used
+ * exactly as ZFS reports it (story ident.1, audit #2). The old fallback read
+ * the parser's id — already stripped of `-partN` — as a by-id name, so a
+ * by-partuuid partition leaf resolved to the WHOLE disk and `wipefs -a`
+ * erased its partition table. Such a leaf carries no whole disk here; the job
+ * resolves it with `lsblk` before the zap guard.
+ *
  * Exported for the consumer-audit tests.
  */
 export function leavesFromStatus(pool: ParsedPoolStatus): PoolLeaf[] {
-  return allVdevLeaves(pool).map(({ id, path }) => {
+  return allVdevLeaves(pool).map(({ path, state }) => {
+    const st = state ? { state } : {}
     if (path.startsWith(BY_ID_PREFIX)) {
       const leafId = path.slice(BY_ID_PREFIX.length)
       const wholeDiskId = leafId.replace(PART_BY_ID_RE, '')
@@ -127,6 +144,7 @@ export function leavesFromStatus(pool: ParsedPoolStatus): PoolLeaf[] {
         leafPath: `${BY_ID_PREFIX}${leafId}`,
         wholeDiskId,
         wholeDiskPath: `${BY_ID_PREFIX}${wholeDiskId}`,
+        ...st,
       }
     }
     const kernel = KERNEL_DEV_PATH_RE.exec(path)?.[1]
@@ -138,17 +156,35 @@ export function leavesFromStatus(pool: ParsedPoolStatus): PoolLeaf[] {
         wholeDiskId,
         wholeDiskPath: `/dev/${wholeDiskId}`,
         leafKernel: kernel,
+        ...st,
       }
     }
-    // Neither form: fall back to reading the id as a by-id name, as before.
-    const wholeDiskId = id.replace(PART_BY_ID_RE, '')
-    return {
-      leafId: id,
-      leafPath: `${BY_ID_PREFIX}${id}`,
-      wholeDiskId,
-      wholeDiskPath: `${BY_ID_PREFIX}${wholeDiskId}`,
-    }
+    // Any other path: as given — never reduced to a guessed whole disk.
+    return { leafId: path, leafPath: path, ...st }
   })
+}
+
+interface LsblkLeafRaw { name?: string, pkname?: string | null, type?: string }
+
+/**
+ * Resolve a leaf ZFS names by a path that is neither by-id nor a kernel name
+ * (ident.1): `lsblk -J -o NAME,PKNAME,TYPE <path>` follows the symlink to the
+ * kernel device. A partition's whole disk is its PKNAME; a whole-disk leaf is
+ * its own. Null when lsblk cannot say — the disk is then never zapped.
+ */
+export function parseLsblkLeaf(json: string): { kernel: string, wholeKernel: string } | null {
+  let dev: LsblkLeafRaw | undefined
+  try {
+    dev = (JSON.parse(json) as { blockdevices?: LsblkLeafRaw[] }).blockdevices?.[0]
+  }
+  catch {
+    return null
+  }
+  if (!dev?.name)
+    return null
+  if (dev.type === 'part')
+    return dev.pkname ? { kernel: dev.name, wholeKernel: dev.pkname } : null
+  return { kernel: dev.name, wholeKernel: dev.name }
 }
 
 /** Whole-disk ownership verdict for the destroy-cleanup GPT-zap guard. */
@@ -297,6 +333,8 @@ export const LSBLK_DISCARD_ARGS = ['-Jbno', 'NAME,DISC-GRAN']
 interface LeafRef {
   id: string
   path: string
+  /** The leaf's vdev state (ONLINE, DEGRADED, UNAVAIL, …). */
+  state?: string
 }
 
 interface LsblkDiscardRaw {
@@ -696,6 +734,28 @@ export async function poolRoutes(
     if (!pool)
       return []
     return leavesFromStatus(pool)
+  }
+
+  /**
+   * ident.1: give every leaf that names no whole disk (a by-partuuid, by-path
+   * or by-vdev path) its kernel device and whole disk from `lsblk`, read
+   * while the pool still exists. Unresolvable leaves keep no whole disk and
+   * are never zapped.
+   */
+  async function resolveLeafDisks(leaves: PoolLeaf[]): Promise<PoolLeaf[]> {
+    const out: PoolLeaf[] = []
+    for (const leaf of leaves) {
+      if (leaf.wholeDiskId) {
+        out.push(leaf)
+        continue
+      }
+      const r = await executor.exec(LSBLK, ['-J', '-o', 'NAME,PKNAME,TYPE', leaf.leafPath])
+      const dev = r.exitCode === 0 ? parseLsblkLeaf(r.stdout) : null
+      out.push(dev
+        ? { ...leaf, leafKernel: dev.kernel, wholeDiskId: dev.wholeKernel, wholeDiskPath: `/dev/${dev.wholeKernel}` }
+        : leaf)
+    }
+    return out
   }
 
   server.get('/pools', async (_request, _reply) => {
@@ -1904,9 +1964,19 @@ export async function poolRoutes(
       warnings.push('ANAS could not check whether an iSCSI LUN is served from this pool — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
     }
 
-    if (!confirmGate(confirmStore, request, reply, {
+    // Story ident.1: the confirm is bound to the pool's guid, so a resend after
+    // an export/import swap under the same name is a 409 naming both guids,
+    // and the job re-reads it before it acts.
+    const exportGuid = await readPoolGuid(executor, poolName)
+    if (!exportGuid) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `Could not read the guid of pool '${poolName}' — refusing an export that cannot be bound to it` } }
+    }
+    if (!confirmGateBound(confirmStore, request, reply, {
       operation: 'zpool.export',
       params: { pool: poolName },
+      bound: exportGuid,
+      what: `Pool '${poolName}'`,
       message: `Exporting pool '${poolName}' has consequences`,
       warnings,
     })) {
@@ -1917,8 +1987,9 @@ export async function poolRoutes(
 
     const job = jobQueue.submit(
       'zpool.export',
-      { ...identity, params: { pool: poolName, force } },
+      { ...identity, params: { pool: poolName, force, guid: exportGuid.guid } },
       async () => {
+        await requireStableId(`Pool '${poolName}'`, exportGuid, () => readPoolGuid(executor, poolName))
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {
           // A LUN added between the pre-flight refusal above and this exec still
@@ -2009,9 +2080,20 @@ export async function poolRoutes(
     // the signature. The checkbox is chosen after the challenge is issued, so
     // binding cleanup here would make the confirmed request (cleanup=true)
     // mismatch the code minted for the challenge (cleanup=false) and 409 again.
-    if (!confirmGate(confirmStore, request, reply, {
+    //
+    // Story ident.1: bound to the pool's guid — a pool exported and another
+    // imported under the same name answers the resend 409 IDENTITY_MISMATCH,
+    // and the job re-reads the guid before it destroys anything.
+    const destroyGuid = await readPoolGuid(executor, poolName)
+    if (!destroyGuid) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `Could not read the guid of pool '${poolName}' — refusing a destroy that cannot be bound to it` } }
+    }
+    if (!confirmGateBound(confirmStore, request, reply, {
       operation: 'zpool.destroy',
       params: { pool: poolName },
+      bound: destroyGuid,
+      what: `Pool '${poolName}'`,
       message: `Destroying pool '${poolName}' permanently erases all its data`,
       warnings,
     })) {
@@ -2020,11 +2102,12 @@ export async function poolRoutes(
 
     const job = jobQueue.submit(
       'zpool.destroy',
-      { ...identity, params: { pool: poolName, cleanup } },
+      { ...identity, params: { pool: poolName, cleanup, guid: destroyGuid.guid } },
       async (updateProgress) => {
-        // Capture the member leaves by stable by-id BEFORE destroy — the pool
-        // must still exist to enumerate them.
-        const leaves = cleanup ? await poolMemberLeaves(poolName) : []
+        await requireStableId(`Pool '${poolName}'`, destroyGuid, () => readPoolGuid(executor, poolName))
+        // Capture the member leaves BEFORE destroy — the pool must still exist
+        // to enumerate them — and resolve every leaf that names no disk.
+        const leaves = cleanup ? await resolveLeafDisks(await poolMemberLeaves(poolName)) : []
 
         const result = await executor.exec(ZPOOL, ['destroy', poolName])
         if (result.exitCode !== 0) {
@@ -2063,9 +2146,34 @@ export async function poolRoutes(
           ? parseByIdToKernelFull(byIdListing.stdout)
           : new Map<string, string>()
 
+        // Story ident.1 (audit #2): a leaf is cleaned only when it is ONLINE
+        // (a stale path on a faulted or missing leaf can name another disk
+        // after a reshuffle) and its on-disk ZFS label says it belongs to the
+        // pool just destroyed — `blkid -p` reports a zfs_member's pool guid as
+        // UUID (the vdev's own as UUID_SUB). Anything else is skipped with a
+        // note: never fail open.
         const wiped: string[] = []
         const wipedFailed: string[] = []
+        const skipped: { leaf: string, reason: string }[] = []
+        /** Leaves proven this pool's by their label — the only ones a zap may follow. */
+        const matched: PoolLeaf[] = []
         for (const leaf of leaves) {
+          if (leaf.state && leaf.state !== 'ONLINE') {
+            skipped.push({ leaf: leaf.leafId, reason: `not cleaned: the leaf was ${leaf.state}` })
+            continue
+          }
+          const label = await executor.exec(BLKID, ['-p', '-s', 'UUID', '-o', 'value', leaf.leafPath])
+          const labelGuid = label.exitCode === 0 ? label.stdout.trim() : ''
+          if (labelGuid !== destroyGuid.guid) {
+            skipped.push({
+              leaf: leaf.leafId,
+              reason: labelGuid
+                ? `not cleaned: its ZFS label names pool guid ${labelGuid}, not ${destroyGuid.guid}`
+                : `not cleaned: no ZFS label of pool guid ${destroyGuid.guid} found on it`,
+            })
+            continue
+          }
+          matched.push(leaf)
           updateProgress(`Clearing ZFS labels on ${leaf.leafId}`)
           const labelclear = await executor.exec(ZPOOL, ['labelclear', '-f', leaf.leafPath])
           const wipe = await executor.exec(WIPEFS, ['-a', '--force', leaf.leafPath])
@@ -2075,9 +2183,16 @@ export async function poolRoutes(
             wipedFailed.push(leaf.leafId)
         }
 
-        // Group leaves by whole disk (dedup: many leaves on one disk ⇒ one zap).
+        // Group the MATCHED leaves by whole disk (dedup: many leaves on one
+        // disk ⇒ one zap). A leaf whose disk could not be resolved is never
+        // zapped; a disk with a skipped leaf still reads as in use (its label
+        // is intact) to the ownership probe and is preserved.
         const byWholeDisk = new Map<string, PoolLeaf[]>()
-        for (const leaf of leaves) {
+        for (const leaf of matched) {
+          if (!leaf.wholeDiskId || !leaf.wholeDiskPath) {
+            skipped.push({ leaf: leaf.leafId, reason: 'disk not zapped: its whole disk could not be resolved' })
+            continue
+          }
           const list = byWholeDisk.get(leaf.wholeDiskId) ?? []
           list.push(leaf)
           byWholeDisk.set(leaf.wholeDiskId, list)
@@ -2086,7 +2201,7 @@ export async function poolRoutes(
         const zapped: string[] = []
         const preserved: { disk: string, reason: 'shared' | 'uncertain' }[] = []
         for (const [wholeDiskId, diskLeaves] of byWholeDisk) {
-          const wholeDiskPath = diskLeaves[0].wholeDiskPath
+          const wholeDiskPath = diskLeaves[0].wholeDiskPath!
           const ownership = await evaluateDiskOwnership(executor, wholeDiskPath, diskLeaves, byIdToKernel)
           if (ownership !== 'exclusive') {
             preserved.push({ disk: wholeDiskId, reason: ownership })
@@ -2104,10 +2219,14 @@ export async function poolRoutes(
           wipedFailed?: string[]
           zapped?: string[]
           preserved?: { disk: string, reason: 'shared' | 'uncertain' }[]
+          skipped?: { leaf: string, reason: string }[]
           warnings?: string[]
         } = { destroyed: poolName }
-        if (unitWarnings.length > 0)
-          cleanupResult.warnings = unitWarnings
+        const warningsOut = [...unitWarnings, ...skipped.map(k => `${k.leaf}: ${k.reason}`)]
+        if (warningsOut.length > 0)
+          cleanupResult.warnings = warningsOut
+        if (skipped.length > 0)
+          cleanupResult.skipped = skipped
         if (wiped.length > 0)
           cleanupResult.wiped = wiped
         if (wipedFailed.length > 0)

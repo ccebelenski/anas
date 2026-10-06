@@ -22,13 +22,18 @@ import { isTransientRunSnapshot, parseScheduledName } from './snapshot-naming.js
  *      run a warning. btrfs snapshots are never held.
  *   3. Each remaining snapshot is bucketed by the period encoded in its NAME.
  *      Within a bucket, the N newest (by the name's UTC timestamp) are kept;
- *      the rest are pruned. An absent bucket count is `0` (keep none).
+ *      the rest are pruned. A bucket ABSENT from the policy is left alone
+ *      (story ident.1, audit #1): its snapshots are kept and take no part in
+ *      the plan — a "minimal" policy never erases a sibling schedule's
+ *      hourlies. (`0` is still "keep none"; a schedule's own cadence bucket is
+ *      made present by the caller — {@link effectiveRetention}.)
  *   4. The most recent snapshot overall is ALWAYS kept, even if its bucket's
  *      count is `0` — sanoid's absolute always-keep-newest guarantee. "Most
  *      recent" is the newest snapshot at-or-before `now` (a future-dated,
  *      clock-skewed snapshot cannot claim the guarantee); if every eligible
  *      snapshot is future-dated, the newest overall is protected instead, so at
- *      least one snapshot always survives.
+ *      least one snapshot always survives. Snapshots of absent buckets are not
+ *      eligible, so the guarantee is over the planned buckets.
  *
  * ⚠ TRANSIENT BACKUP SNAPSHOTS ARE OUTSIDE RETENTION ENTIRELY (backup2.3). A
  * snapshot-consistent backup run takes `anas-backup-<task>-<ts>`, backs up from
@@ -45,18 +50,48 @@ export function planRetention(
 ): RetentionPlan {
   const durable = snapshots.filter(s => !isTransientRunSnapshot(s.name))
   const anas = durable.filter(s => s.source === 'anas')
-  const held = anas.filter(s => s.held === true)
+  // Rule 3's absent-bucket half: a snapshot of a bucket the policy does not
+  // name is kept, outside the plan (an unparseable `anas` name is kept by
+  // keepOrPrune, so it stays in the planned set to land there).
+  const absent = anas.filter(s => !inPolicy(s, policy))
+  const planned = anas.filter(s => inPolicy(s, policy))
+  const held = planned.filter(s => s.held === true)
 
   // (1) The decision: unheld snapshots only — a held one never takes a slot.
-  const decision = keepOrPrune(anas.filter(s => s.held !== true), policy, now)
+  const decision = keepOrPrune(planned.filter(s => s.held !== true), policy, now)
   if (held.length === 0)
-    return { ...decision, skippedHeld: [] }
+    return { keep: [...decision.keep, ...absent], prune: decision.prune, skippedHeld: [] }
 
   // (2) The report: which held snapshots an as-if-unheld plan would prune.
-  const asIfUnheld = keepOrPrune(anas, policy, now)
+  const asIfUnheld = keepOrPrune(planned, policy, now)
   const skippedHeld = asIfUnheld.prune.filter(s => s.held === true)
   const silent = held.filter(s => !skippedHeld.includes(s))
-  return { keep: [...decision.keep, ...silent], prune: decision.prune, skippedHeld }
+  return { keep: [...decision.keep, ...silent, ...absent], prune: decision.prune, skippedHeld }
+}
+
+/**
+ * Is `snap`'s name-encoded bucket one the policy names (any count, `0`
+ * included)? A name that does not parse counts as planned — keepOrPrune keeps
+ * it defensively.
+ */
+function inPolicy(snap: ScheduledSnapshot, policy: RetentionPolicy): boolean {
+  const parsed = parseScheduledName(snap.name)
+  return !parsed || policy[parsed.bucket] !== undefined
+}
+
+/**
+ * The policy a schedule prunes its own snapshots with (story ident.1): its
+ * retention, with its OWN cadence bucket made present (`0` when absent). The
+ * absent-bucket rule leaves a bucket the policy does not name alone — right for
+ * a sibling's snapshots, wrong for the ones this schedule takes, which would
+ * then grow without bound (an hourly schedule on the "minimal" daily/weekly
+ * preset). With the cadence bucket at `0` such a schedule keeps its newest, as
+ * before.
+ */
+export function effectiveRetention(schedule: { cadence: RetentionBucket, retention: RetentionPolicy }): RetentionPolicy {
+  if (schedule.retention[schedule.cadence] !== undefined)
+    return schedule.retention
+  return { ...schedule.retention, [schedule.cadence]: 0 }
 }
 
 /**
@@ -90,7 +125,7 @@ function keepOrPrune(
 
   for (const [bucket, group] of byBucket) {
     group.sort((a, b) => b.ts.getTime() - a.ts.getTime()) // newest first
-    const n = policy[bucket] ?? 0
+    const n = policy[bucket] ?? 0 // present by construction (planRetention filtered absent buckets)
     group.forEach((e, i) => (i < n ? keep : prune).push(e.snap))
   }
 

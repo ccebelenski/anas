@@ -921,6 +921,9 @@ describe('recursive verbs over a NESTED PVE storage (review fix 2)', () => {
     mock.exec = async (command: string, args: string[]) => {
       if (command === '/usr/sbin/zfs' && args.join(' ') === listArgs)
         return { stdout: NESTED_LIST, stderr: '', exitCode: 0 }
+      // ident.1: every dataset here has a guid (the destroy confirm binds it).
+      if (command === '/usr/sbin/zfs' && args.slice(0, 5).join(' ') === 'get -H -o value guid')
+        return { stdout: `${guidOf(args[5])}\n`, stderr: '', exitCode: 0 }
       return orig(command, args)
     }
   })
@@ -1129,5 +1132,184 @@ describe('unreadable storage.cfg fails closed (review fix 1)', () => {
       // Nothing can be judged, so no node's children are manageable either.
       assert.equal(d.pve?.childrenManageable, false, d.name)
     }
+  })
+})
+
+/** A stable fake guid per dataset name (ident.1 harnesses). */
+function guidOf(name: string): string {
+  let h = 7n
+  for (const ch of name)
+    h = (h * 131n + BigInt(ch.charCodeAt(0))) % 18446744073709551557n
+  return h.toString()
+}
+
+describe('ident.1 — recursive permission changes stop at PVE descendants (audit #20)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string
+  let prevCfg: string | undefined
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ds-ident1-'))
+    prevCfg = process.env.ANAS_STORAGE_CFG
+    await writeFile(join(dir, 'storage.cfg'), 'zfspool: local-zfs\n\tpool testpool/x/data\n\tcontent images,rootdir\n\n', 'utf8')
+    process.env.ANAS_STORAGE_CFG = join(dir, 'storage.cfg')
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    const listArgs = zfsListArgs('testpool').join(' ')
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command: string, args: string[]) => {
+      if (command === '/usr/sbin/zfs' && args.join(' ') === listArgs)
+        return { stdout: NESTED_LIST, stderr: '', exitCode: 0 }
+      return orig(command, args)
+    }
+  })
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    await rm(dir, { recursive: true, force: true })
+    if (prevCfg === undefined)
+      delete process.env.ANAS_STORAGE_CFG
+    else
+      process.env.ANAS_STORAGE_CFG = prevCfg
+  })
+
+  const put = (url: string, body: unknown) => server!.inject({
+    method: 'PUT',
+    url,
+    headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+    payload: JSON.stringify(body),
+  })
+
+  it('a recursive chown/chmod over a tree holding a PVE storage root → 400 naming it', async () => {
+    const res = await put('/v1/pools/testpool/datasets/x/permissions', { owner: 'root', mode: '755', recursive: true })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /Recursive permission change of 'testpool\/x' would include testpool\/x\/data/)
+    assert.match(res.json().error.message, /local-zfs/)
+  })
+
+  it('a recursive access change (applyToExisting) over the same tree → 400 naming it', async () => {
+    const res = await put('/v1/pools/testpool/datasets/x/access', { owner: 'root', applyToExisting: true })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /would include testpool\/x\/data/)
+  })
+
+  it('the NON-recursive change, and a recursive one on a clean sibling, are not refused by this rule', async () => {
+    const flat = await put('/v1/pools/testpool/datasets/x/permissions', { owner: 'root', recursive: false })
+    assert.doesNotMatch(flat.body, /would include/)
+    const sibling = await put('/v1/pools/testpool/datasets/x/media/permissions', { owner: 'root', recursive: true })
+    assert.doesNotMatch(sibling.body, /would include/)
+  })
+})
+
+describe('ident.1 — reserved segments, the router\'s dataset-first reading, and stable-id confirms', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let calls: { command: string, args: string[] }[] = []
+  /** Per-test overrides: argv (space-joined) → a sequence of results (the last repeats). */
+  let answers: Map<string, ExecResult[]>
+
+  const LEGACY = 'testpool/snapshots/x'
+  const LEGACY_LIST = JSON.stringify({
+    output_version: { command: 'zfs list', vers_major: 0, vers_minor: 1 },
+    datasets: Object.fromEntries([
+      datasetRow('testpool', 'FILESYSTEM'),
+      datasetRow('testpool/media', 'FILESYSTEM'),
+      datasetRow('testpool/snapshots', 'FILESYSTEM'),
+      datasetRow(LEGACY, 'FILESYSTEM'),
+    ]),
+  })
+  const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
+
+  beforeEach(() => {
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    const orig = mock.exec.bind(mock)
+    calls = []
+    answers = new Map([
+      [zfsListArgs('testpool').join(' '), [ok(LEGACY_LIST)]],
+      [`list -H -o name -t filesystem,volume ${LEGACY}`, [ok(`${LEGACY}\n`)]],
+      [`list -H -o name -t filesystem,volume testpool/snapshots`, [ok('testpool/snapshots\n')]],
+      [`get -H -o value guid ${LEGACY}`, [ok('31337\n')]],
+    ])
+    mock.exec = async (command: string, args: string[]) => {
+      calls.push({ command, args })
+      const seq = command === '/usr/sbin/zfs' ? answers.get(args.join(' ')) : undefined
+      if (seq)
+        return seq.length > 1 ? seq.shift()! : seq[0]
+      return orig(command, args)
+    }
+  })
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  it('DELETE of an EXISTING dataset named <pool>/snapshots/x destroys the dataset (confirm-gated), never a snapshot', async () => {
+    const first = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: IDENTITY_HEADERS })
+    assert.equal(first.statusCode, 409)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    const res = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const destroys = calls.filter(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'destroy').map(c => c.args.join(' '))
+    assert.deepEqual(destroys, [`destroy ${LEGACY}`])
+    assert.ok(!destroys.some(d => d.includes('@')), 'no snapshot destroyed')
+  })
+
+  it('GET of that dataset reads the dataset; a path naming NO dataset is still the snapshot route', async () => {
+    const detail = await server!.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/snapshots/x', headers: IDENTITY_HEADERS })
+    assert.ok(calls.some(c => c.args.join(' ') === `get -j all ${LEGACY}`), 'read as the dataset')
+    assert.notEqual(detail.statusCode, 500)
+    calls = []
+    await server!.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/media/snapshots', headers: IDENTITY_HEADERS })
+    assert.ok(calls.some(c => c.args.join(' ') === zfsSnapshotDetailArgs('testpool/media').join(' ')), 'the snapshot list of testpool/media')
+  })
+
+  it('a snapshot route on a legacy dataset resolves to the split whose dataset exists', async () => {
+    answers.set(zfsSnapshotDetailArgs(LEGACY).join(' '), [ok(JSON.stringify({ output_version: { command: 'zfs list', vers_major: 0, vers_minor: 1 }, datasets: {} }))])
+    const res = await server!.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/snapshots/x/snapshots', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 200, res.body)
+    assert.ok(calls.some(c => c.args.join(' ') === zfsSnapshotDetailArgs(LEGACY).join(' ')))
+  })
+
+  it('create refuses a reserved segment (400), names it', async () => {
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ path: 'media/snapshots' }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /'snapshots' is reserved/)
+  })
+
+  it('rollback: a snapshot taken after the challenge → the resend is 409 IDENTITY_MISMATCH and nothing rolls back', async () => {
+    const ids = 'list -t snapshot -Hp -o name,createtxg -d 1 testpool/media'
+    answers.set(ids, [
+      ok('testpool/media@snap1\t120\ntestpool/media@snap2\t240\n'),
+      ok('testpool/media@snap1\t120\ntestpool/media@snap2\t240\ntestpool/media@late\t300\n'),
+    ])
+    const url = '/v1/pools/testpool/datasets/media/snapshots/snap1/rollback'
+    const first = await server!.inject({ method: 'POST', url, headers: IDENTITY_HEADERS })
+    assert.equal(first.statusCode, 409)
+    const res = await server!.inject({ method: 'POST', url, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'IDENTITY_MISMATCH')
+    assert.match(res.json().error.message, /snapshot createtxg 120, newest snapshot createtxg 240 at the confirmation, snapshot createtxg 120, newest snapshot createtxg 300 now/)
+    assert.ok(res.headers['x-anas-confirm-code'])
+    assert.equal(calls.find(c => c.args[0] === 'rollback'), undefined)
+  })
+
+  it('dataset destroy: the guid changed while the job was queued → job fails IDENTITY_MISMATCH, nothing destroyed', async () => {
+    answers.set(`get -H -o value guid ${LEGACY}`, [ok('1\n'), ok('1\n'), ok('2\n')])
+    const first = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: IDENTITY_HEADERS })
+    const res = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'IDENTITY_MISMATCH')
+    assert.equal(calls.find(c => c.args[0] === 'destroy'), undefined)
   })
 })

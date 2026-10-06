@@ -859,6 +859,8 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
         assert.equal(snaps.length, 1)
         assert.deepEqual(snaps[0].args, [
           'snapshot',
+          '-o',
+          'anas:schedule=hourly-x',
           `testpool/x@${taken}`,
           `testpool/x/media@${taken}`,
           `testpool/x/media/raw@${taken}`,
@@ -880,30 +882,32 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
         assert.equal(done.status, 'completed', JSON.stringify(done.error))
         const taken = (done.result as { taken: string }).taken
         const snaps = mockOf(server).calls.filter(c => c.command === ZFS && c.args[0] === 'snapshot')
-        assert.deepEqual(snaps.map(c => c.args), [['snapshot', '-r', `testpool/x@${taken}`]])
+        // ident.1: the same literal -r, stamped with the schedule's id.
+        assert.deepEqual(snaps.map(c => c.args), [['snapshot', '-r', '-o', 'anas:schedule=hourly-x', `testpool/x@${taken}`]])
       }
       finally {
         await restore()
       }
     })
 
-    it('snapprune.1: a recursive fire prunes per dataset and leaves an excluded dataset to the schedule that covers it', async () => {
+    it('ident.1: a recursive fire prunes its own stamped snapshots per dataset; another schedule\'s stamped ones are left', async () => {
       const { restore } = await storageCfg(null)
       try {
         armTree('testpool/x\ntestpool/x/data\ntestpool/x/media\n')
         const D1 = 'anas-daily-2026-07-20T000000Z'
         const D2 = 'anas-daily-2026-07-21T000000Z'
         const rows: string[] = []
-        for (const ds of ['testpool/x', 'testpool/x/data', 'testpool/x/media'])
-          rows.push(`${ds}@${D1}\t1769385600\t0\t100`, `${ds}@${D2}\t1769472000\t0\t200`)
+        for (const ds of ['testpool/x', 'testpool/x/data'])
+          rows.push(`${ds}@${D1}\t1769385600\t0\t100\tdaily-x`, `${ds}@${D2}\t1769472000\t0\t200\tdaily-x`)
+        // testpool/x/media's dailies were taken by its own schedule.
+        rows.push(`testpool/x/media@${D1}\t1769385600\t0\t100\tdaily-media`, `testpool/x/media@${D2}\t1769472000\t0\t200\tdaily-media`)
         const mock = mockOf(server)
         mock.addFixture({
           command: ZFS,
-          args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg', '-r', 'testpool/x'],
+          args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg,anas:schedule', '-r', 'testpool/x'],
           result: { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 },
         })
         mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'], result: { stdout: 'testpool/x\ntestpool/x/data\ntestpool/x/media\n', stderr: '', exitCode: 0 } })
-        // The schedule that owns testpool/x/media's daily snapshots.
         const media = await create({ ...SCHEDULE, id: 'daily-media', target: { kind: 'zfs', dataset: 'testpool/x/media' }, retention: { daily: 30 } })
         await waitForJob(server, media.json().job.id)
         const created = await create({ ...X, id: 'daily-x', cadence: 'daily', retention: { daily: 1 }, exclude: ['testpool/x/media'] })
@@ -917,7 +921,8 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
         assert.deepEqual(result.pruned.sort(), [D1, `testpool/x/data@${D1}`].sort())
         assert.equal((result as { prunedCount?: number }).prunedCount, 2)
         assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x/data'), { dataset: 'testpool/x/data', scope: 'sweep', pruned: 1, held: 0 })
-        assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x/media'), { dataset: 'testpool/x/media', scope: 'excluded', pruned: 0, held: 0, note: '2 left to schedule \'daily-media\'' })
+        // Nothing of this schedule's on the excluded media dataset: nothing to report.
+        assert.equal(result.datasets.find(d => d.dataset === 'testpool/x/media'), undefined)
         const destroys = mock.calls.filter(c => c.command === ZFS && c.args[0] === 'destroy').map(c => c.args.join(' '))
         assert.deepEqual(destroys.sort(), [`destroy testpool/x/data@${D1}`, `destroy testpool/x@${D1}`].sort())
       }
@@ -926,36 +931,38 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       }
     })
 
-    it('snapprune.1 review: an unreadable schedule unit makes the list incomplete — swept and excluded datasets are left untouched, with the note', async () => {
+    it('snapprune.1 review + ident.1: an unreadable schedule unit makes the list incomplete — no UNSTAMPED snapshot is destroyed, with the note; stamped ones still go', async () => {
       const { restore } = await storageCfg(null)
       try {
         armTree('testpool/x\ntestpool/x/data\ntestpool/x/media\n')
         const D1 = 'anas-daily-2026-07-20T000000Z'
         const D2 = 'anas-daily-2026-07-21T000000Z'
         const rows: string[] = []
-        for (const ds of ['testpool/x', 'testpool/x/data', 'testpool/x/media'])
-          rows.push(`${ds}@${D1}\t1769385600\t0\t100`, `${ds}@${D2}\t1769472000\t0\t200`)
+        rows.push(`testpool/x@${D1}\t1769385600\t0\t100\tdaily-x`, `testpool/x@${D2}\t1769472000\t0\t200\tdaily-x`)
+        // Pre-0.4.2 (unstamped) snapshots on the swept and the excluded child.
+        for (const ds of ['testpool/x/data', 'testpool/x/media'])
+          rows.push(`${ds}@${D1}\t1769385600\t0\t100\t-`, `${ds}@${D2}\t1769472000\t0\t200\t-`)
         const mock = mockOf(server)
         mock.addFixture({
           command: ZFS,
-          args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg', '-r', 'testpool/x'],
+          args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg,anas:schedule', '-r', 'testpool/x'],
           result: { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 },
         })
         mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'testpool/x'], result: { stdout: 'testpool/x\ntestpool/x/data\ntestpool/x/media\n', stderr: '', exitCode: 0 } })
         const created = await create({ ...X, id: 'daily-x', cadence: 'daily', retention: { daily: 1 }, exclude: ['testpool/x/media'] })
         assert.equal(created.statusCode, 202, created.body)
         await waitForJob(server, created.json().job.id)
-        // A unit whose schedule JSON cannot be parsed — it may be the very
-        // schedule that covers testpool/x/media.
+        // A unit whose schedule JSON cannot be parsed — it may be a schedule
+        // that also covers testpool/x/data.
         await writeFile(join(dir, 'anas-snap-broken.service'), '[Unit]\n# X-ANAS-Schedule={not json\n')
 
         const run = await server.inject({ method: 'POST', url: '/v1/schedules/daily-x/run', headers: JSON_HEADERS, payload: '{}' })
         const done = await waitForJob(server, run.json().job.id)
         assert.equal(done.status, 'completed', JSON.stringify(done.error))
         const result = done.result as { pruned: string[], datasets: { dataset: string, scope: string, pruned: number, held: number, note?: string }[] }
-        assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x/media'), { dataset: 'testpool/x/media', scope: 'excluded', pruned: 0, held: 0, note: '2 left: schedule list unreadable' })
         assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x/data'), { dataset: 'testpool/x/data', scope: 'sweep', pruned: 0, held: 0, note: '2 left: schedule list unreadable' })
-        // Only the target is pruned that run.
+        assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x/media'), { dataset: 'testpool/x/media', scope: 'excluded', pruned: 0, held: 0, note: '2 left: unstamped, outside this schedule\'s sweep' })
+        // Only the target's stamped snapshot is pruned that run.
         assert.deepEqual(result.pruned, [D1])
         const destroys = mock.calls.filter(c => c.command === ZFS && c.args[0] === 'destroy').map(c => c.args.join(' '))
         assert.deepEqual(destroys, [`destroy testpool/x@${D1}`])
@@ -1064,11 +1071,11 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
         const D2 = 'anas-daily-2026-07-21T000000Z'
         const rows: string[] = []
         for (const ds of ['testpool/x', 'testpool/x/data'])
-          rows.push(`${ds}@${D1}\t1769385600\t0\t100`, `${ds}@${D2}\t1769472000\t0\t200`)
+          rows.push(`${ds}@${D1}\t1769385600\t0\t100\tdaily-x`, `${ds}@${D2}\t1769472000\t0\t200\tdaily-x`)
         const mock = mockOf(server)
         mock.addFixture({
           command: ZFS,
-          args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg', '-r', 'testpool/x'],
+          args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg,anas:schedule', '-r', 'testpool/x'],
           result: { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 },
         })
         const GONE = { stdout: '', stderr: 'could not find any snapshots to destroy; check snapshot names.\n', exitCode: 1 }
@@ -1099,8 +1106,8 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
         const mock = mockOf(server)
         mock.addFixture({
           command: ZFS,
-          args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs', 'testpool/media'],
-          result: { stdout: `testpool/media@${D1}\t1769385600\t0\ntestpool/media@${D2}\t1769472000\t0\n`, stderr: '', exitCode: 0 },
+          args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg,anas:schedule', 'testpool/media'],
+          result: { stdout: `testpool/media@${D1}\t1769385600\t0\t1\tflat-media\ntestpool/media@${D2}\t1769472000\t0\t2\tflat-media\n`, stderr: '', exitCode: 0 },
         })
         mock.addFixture({ command: ZFS, args: ['destroy', `testpool/media@${D1}`], result: { stdout: '', stderr: 'could not find any snapshots to destroy; check snapshot names.\n', exitCode: 1 } })
         const created = await create({ ...SCHEDULE, id: 'flat-media', retention: { daily: 1 } })

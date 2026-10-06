@@ -232,6 +232,7 @@ describe('boot-import unit: destroy disables the unit', () => {
   it('disables the unit after a successful destroy', async () => {
     const ex = new MockExecutor()
     ex.addFixture({ command: ZPOOL, args: ['list', '-j'], result: listResult('tank') })
+    ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', 'tank'], result: { stdout: '77\n', stderr: '', exitCode: 0 } }) // ident.1
     ex.addFixture({ command: ZPOOL, args: ['destroy', 'tank'], result: OK })
     ex.addFixture({ command: SYSTEMCTL, args: ['disable', 'zfs-import@tank.service'], result: OK })
 
@@ -245,6 +246,7 @@ describe('boot-import unit: destroy disables the unit', () => {
   it('attaches a warning to the result when the disable fails', async () => {
     const ex = new MockExecutor()
     ex.addFixture({ command: ZPOOL, args: ['list', '-j'], result: listResult('tank') })
+    ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', 'tank'], result: { stdout: '77\n', stderr: '', exitCode: 0 } }) // ident.1
     ex.addFixture({ command: ZPOOL, args: ['destroy', 'tank'], result: OK })
     // No systemctl fixture — 127.
 

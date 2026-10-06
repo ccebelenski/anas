@@ -58,6 +58,43 @@ export const DatasetPath = z
     'Invalid dataset path',
   )
 
+/**
+ * The sub-resource names the datasets router reads out of a dataset path
+ * (`<dataset>/snapshots[/<snap>]`, `<dataset>/access`, `<dataset>/permissions`).
+ * A dataset whose path has one of these as a SEGMENT reads, to the router, like
+ * a sub-route of its parent (audit #12: destroying `tank/snapshots/old` once
+ * destroyed `tank@old`). New names may not carry them (story ident.1); an
+ * existing dataset with such a segment stays readable and addressable — the
+ * router asks whether the full path names an existing dataset first.
+ */
+export const RESERVED_DATASET_SEGMENTS = ['snapshots', 'access', 'permissions'] as const
+
+/** The first reserved sub-resource segment of `path` (`/`-separated), or null. */
+export function reservedDatasetSegment(path: string): string | null {
+  for (const seg of path.split('/')) {
+    if ((RESERVED_DATASET_SEGMENTS as readonly string[]).includes(seg))
+      return seg
+  }
+  return null
+}
+
+/** The refusal text for a reserved segment (create, clone, rename). */
+export function reservedDatasetSegmentMessage(seg: string): string {
+  return `'${seg}' is reserved (it names a dataset sub-resource) and cannot be a dataset name segment`
+}
+
+/**
+ * A NEW dataset's path (create, clone, rename — story ident.1): a
+ * {@link DatasetPath} with no segment equal to a reserved sub-resource name.
+ * Reads keep {@link DatasetPath}, so an existing dataset with such a segment
+ * remains addressable.
+ */
+export const NewDatasetPath = DatasetPath.superRefine((path, ctx) => {
+  const seg = reservedDatasetSegment(path)
+  if (seg)
+    ctx.addIssue({ code: 'custom', message: reservedDatasetSegmentMessage(seg) })
+})
+
 /** Snapshot name */
 export const SnapshotName = z
   .string()

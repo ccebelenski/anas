@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { AbsolutePath, DatasetPath, PoolName } from './common.js'
+import { AbsolutePath, NewDatasetPath, PoolName } from './common.js'
 import { IscsiHeldByLun } from './iscsi.js'
 import { PveOwnership } from './zfs.js'
 
@@ -210,7 +210,8 @@ export type DatasetListDefaults = z.infer<typeof DatasetListDefaults>
  */
 export const CreateDatasetRequest = z
   .object({
-    path: DatasetPath,
+    /** ident.1: a reserved sub-resource segment (`snapshots`, `access`, `permissions`) is refused. */
+    path: NewDatasetPath,
     /** `volume` creates a zvol; absent/`filesystem` is the pre-iscsi.3 behaviour. */
     type: DatasetType.optional(),
     /** Volumes only, REQUIRED for one: the exported size in bytes. */

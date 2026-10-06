@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { ISODateTime, PoolName, SnapshotName } from './common.js'
+import { ISODateTime, PoolName, reservedDatasetSegment, reservedDatasetSegmentMessage, SnapshotName } from './common.js'
 
 // --- Read model ---
 
@@ -51,7 +51,14 @@ export const CloneSnapshotRequest = z.object({
   target: z.string()
     .min(1)
     .max(255)
-    .regex(/^\w[\w.:-]*(?:\/[\w.:-]+)*$/, 'must be a valid ZFS dataset name (pool/path)'),
+    .regex(/^\w[\w.:-]*(?:\/[\w.:-]+)*$/, 'must be a valid ZFS dataset name (pool/path)')
+    // ident.1: the clone is a NEW dataset — no reserved sub-resource segment
+    // below the pool (the pool name itself is the router's, never a segment).
+    .superRefine((target, ctx) => {
+      const seg = reservedDatasetSegment(target.split('/').slice(1).join('/'))
+      if (seg)
+        ctx.addIssue({ code: 'custom', message: reservedDatasetSegmentMessage(seg) })
+    }),
 })
 export type CloneSnapshotRequest = z.infer<typeof CloneSnapshotRequest>
 

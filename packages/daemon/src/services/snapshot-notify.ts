@@ -154,9 +154,10 @@ export function buildSnapshotNotifyBody(ctx: SnapshotNotifyContext): string {
   if (result)
     lines.push(`Pruned:      ${pruneSummaryLine(result)}`)
   // snapprune.1: a recursive schedule prunes per dataset — say what each did.
-  // A leaf (only the target in `datasets`) says nothing the Pruned line has not.
+  // A leaf (only the target in `datasets`) says nothing the Pruned line has
+  // not — unless it carries a note (ident.1: unstamped snapshots left).
   const datasets = result?.datasets ?? []
-  const perDataset = datasets.some(d => d.scope !== 'target')
+  const perDataset = datasets.some(d => d.scope !== 'target' || d.note)
     ? datasets.filter(d => d.pruned || d.held || d.note)
     : []
   if (perDataset.length) {

@@ -1,4 +1,5 @@
 import type { Job, JobAccepted } from '@anas/shared'
+import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
@@ -130,5 +131,56 @@ describe('export endpoint: POST /v1/pools/:name/export', () => {
 
     assert.equal(res.statusCode, 404)
     assert.equal(res.json().error.code, 'NOT_FOUND')
+  })
+})
+
+describe('ident.1 — pool export binds the pool guid', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  function serveWithGuids(guids: string[]): { calls: string[][] } {
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    const orig = mock.exec.bind(mock)
+    const calls: string[][] = []
+    mock.exec = async (command: string, args: string[]) => {
+      calls.push(args)
+      if (command === '/usr/sbin/zpool' && args.join(' ') === 'get -H -o value guid testpool')
+        return { stdout: `${guids.length > 1 ? guids.shift() : guids[0]}\n`, stderr: '', exitCode: 0 }
+      return orig(command, args)
+    }
+    return { calls }
+  }
+
+  const exportReq = (code?: string) => server!.inject({
+    method: 'POST',
+    url: '/v1/pools/testpool/export',
+    headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json', ...(code ? { 'x-anas-confirm': code } : {}) },
+    payload: '{}',
+  })
+
+  it('a pool swapped under the same name between challenge and resend → 409 IDENTITY_MISMATCH', async () => {
+    const { calls } = serveWithGuids(['10', '20'])
+    const first = await exportReq()
+    assert.equal(first.statusCode, 409)
+    const res = await exportReq(first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'IDENTITY_MISMATCH')
+    assert.match(res.json().error.message, /guid 10 at the confirmation, guid 20 now/)
+    assert.equal(calls.find(a => a[0] === 'export'), undefined)
+  })
+
+  it('a swap while the job is queued → the job fails IDENTITY_MISMATCH and exports nothing', async () => {
+    const { calls } = serveWithGuids(['10', '10', '30'])
+    const first = await exportReq()
+    const res = await exportReq(first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'IDENTITY_MISMATCH')
+    assert.equal(calls.find(a => a[0] === 'export'), undefined)
   })
 })

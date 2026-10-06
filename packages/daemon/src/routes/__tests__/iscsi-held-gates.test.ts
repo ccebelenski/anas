@@ -19,6 +19,7 @@ import { zfsListArgs, zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
 import { ConfirmStore } from '../../safety/confirm.js'
 import { createServer } from '../../server.js'
 import { AHR_FINDMNT_ARGS } from '../../services/ahr-topology.js'
+import { SERVED_DEVICE_MISMATCH } from '../../services/iscsi-served.js'
 import { datasetRoutes } from '../datasets.js'
 import { poolRoutes } from '../pools.js'
 
@@ -138,6 +139,14 @@ function snapshotListJson(dataset: string, snap: string): string {
   })
 }
 
+/** Put an env var back the way a test found it. */
+function restoreEnv(key: string, value: string | undefined): void {
+  if (value === undefined)
+    delete process.env[key]
+  else
+    process.env[key] = value
+}
+
 function fixtureText(dir: string, name: string): string {
   return readFileSync(join(dir, name), 'utf-8')
 }
@@ -194,6 +203,11 @@ describe('iscsi.6 — the rest of ANAS knows a LUN is there (route gates)', () =
         return { stdout: snapshotListJson(ZVOL, 'before-grow'), stderr: '', exitCode: 0 }
       if (command === ZFS && same(args, zfsSnapshotDetailArgs(IMAGES_DATASET)))
         return { stdout: snapshotListJson(IMAGES_DATASET, 'nightly'), stderr: '', exitCode: 0 }
+      // ident.1: every pool/dataset has a guid, every dataset a snapshot txg list.
+      if ((command === ZPOOL || command === ZFS) && same(args.slice(0, 5), ['get', '-H', '-o', 'value', 'guid']))
+        return { stdout: '4242\n', stderr: '', exitCode: 0 }
+      if (command === ZFS && same(args.slice(0, 6), ['list', '-t', 'snapshot', '-Hp', '-o', 'name,createtxg']))
+        return { stdout: `${args.at(-1)}@before-grow\t10\n${args.at(-1)}@nightly\t11\n`, stderr: '', exitCode: 0 }
       return orig(command, args)
     }
     await server.ready()
@@ -341,7 +355,15 @@ describe('iscsi.6 — the rest of ANAS knows a LUN is there (route gates)', () =
       // iscsi.8: the grow is the supported live path — allowed, not refused.
       // What the operator then has to do on the guest side is the daemon's job
       // to say: lunGrowGuidance, the ONE sentence both doors share.
-      await serve()
+      // ident.1: the path names the device the LUN serves (230:16, the capture's).
+      const prevStat = process.env.ANAS_ISCSI_DEVICE_STAT
+      process.env.ANAS_ISCSI_DEVICE_STAT = `/dev/zvol/${ZVOL}=230:16`
+      try {
+        await serve()
+      }
+      finally {
+        restoreEnv('ANAS_ISCSI_DEVICE_STAT', prevStat)
+      }
       const mock = (server as unknown as { executor: MockExecutor }).executor
       const wrapped = mock.exec.bind(mock)
       const same = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i])
@@ -364,6 +386,33 @@ describe('iscsi.6 — the rest of ANAS knows a LUN is there (route gates)', () =
         result.warnings?.includes(lunGrowGuidance(4294967296)),
         JSON.stringify(result.warnings),
       )
+    })
+
+    it('ident.1: a volsize GROW of a served volume whose path now names ANOTHER device → 409 served-device-mismatch, no zfs set', async () => {
+      // The volume was renamed and re-created under the live LUN: LIO serves
+      // 230:16, /dev/zvol/gtiscsi/vol1 is now 230:32.
+      const prevStat = process.env.ANAS_ISCSI_DEVICE_STAT
+      process.env.ANAS_ISCSI_DEVICE_STAT = `/dev/zvol/${ZVOL}=230:32`
+      try {
+        await serve()
+      }
+      finally {
+        restoreEnv('ANAS_ISCSI_DEVICE_STAT', prevStat)
+      }
+      const res = await server!.inject({
+        method: 'PUT',
+        url: `/v1/pools/${POOL}/datasets/vol1`,
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ properties: { volsize: 4294967296 } }),
+      })
+      assert.equal(res.statusCode, 409)
+      const body = res.json() as ErrorBody
+      assert.equal(body.error.code, 'CONFLICT')
+      assert.equal(body.error.reason, 'served-device-mismatch')
+      assert.ok(body.error.message.startsWith(SERVED_DEVICE_MISMATCH), body.error.message)
+      assert.match(body.error.message, /serves device 230:16/)
+      assert.match(body.error.message, /is device 230:32/)
+      assert.equal(ran(ZFS, 'set'), false)
     })
 
     it('DELETE a filesystem dataset holding a LUN\'s IMAGE FILE — refused before `zfs destroy`', async () => {
@@ -591,6 +640,8 @@ describe('iscsi.6 — the rest of ANAS knows a LUN is there (route gates)', () =
           return { stdout: ZPOOL_LIST, stderr: '', exitCode: 0 }
         if (command === ZFS && same(args, zfsListArgs(POOL)))
           return { stdout: fixtureText(ZFS_FIXTURES, 'zfs-list-volumes.json'), stderr: '', exitCode: 0 }
+        if (command === ZPOOL && same(args, ['get', '-H', '-o', 'value', 'guid', POOL]))
+          return { stdout: '4242\n', stderr: '', exitCode: 0 } // ident.1: the guid the confirm binds
         return orig(command, args)
       }
       await server.ready()
@@ -661,6 +712,10 @@ describe('the disclosure — a failed claims read is named at the confirm doors 
     const executor = new MockExecutor()
     executor.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: ZPOOL_LIST, stderr: '', exitCode: 0 } })
     executor.addFixture({ command: ZFS, args: zfsListArgs(POOL), result: { stdout: fixtureText(ZFS_FIXTURES, 'zfs-list-volumes.json'), stderr: '', exitCode: 0 } })
+    // ident.1: the guids the destroy/export confirms bind.
+    for (const pool of [POOL, UNSERVED_POOL])
+      executor.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', pool], result: { stdout: '4242\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: ZFS, args: ['get', '-H', '-o', 'value', 'guid', ZVOL], result: { stdout: '4343\n', stderr: '', exitCode: 0 } })
     const iscsiPaths = {
       configfsRoot: root,
       saveconfigPath: join(dir, 'absent-saveconfig.json'),

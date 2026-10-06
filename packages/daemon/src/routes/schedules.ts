@@ -7,6 +7,7 @@ import { parseZpoolList } from '../parsers/zpool-list.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { loadPveFootprint, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { notifyScheduleRun } from '../services/snapshot-notify.js'
+import { effectiveRetention } from '../services/snapshot-retention.js'
 import {
   collectScheduleStatuses,
   deriveScheduleDetail,
@@ -16,7 +17,7 @@ import {
   scheduleFileExists,
   writeScheduleUnits,
 } from '../services/snapshot-schedule-units.js'
-import { pruneRecursiveSchedule, pruneSnapshots, recursiveRunResult, takeSnapshot } from '../services/snapshot-schedules.js'
+import { pruneSnapshots, pruneZfsSchedule, takeSnapshot, zfsRunResult } from '../services/snapshot-schedules.js'
 import { sweepSet, zfsTreeListArgs } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
@@ -215,9 +216,8 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     // Reads/footprint may fail closed (unreadable storage.cfg = everything
     // owned) exactly like the create guard. An AHR target is not PVE-footprint
     // territory.
-    let pve: Awaited<ReturnType<typeof pveFootprint>> | null = null
     if (schedule.target.kind === 'zfs') {
-      pve = await pveFootprint()
+      const pve = await pveFootprint()
       const owned = pve.ownershipOf(schedule.target.dataset)
       if (owned)
         throw new Error(`Snapshot run refused: '${schedule.target.dataset}' is PVE-owned — ${owned.reason}`)
@@ -237,26 +237,32 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     }
     const svcOpts = schedule.target.kind === 'ahr'
       ? { pool: (await resolveAhrPool(schedule.target.pool)) ?? undefined, runtimeDir: subvolRuntimeDir, updateProgress }
-      : { recursive: schedule.recursive, exclude: schedule.exclude, updateProgress, runtimeDir: subvolRuntimeDir }
+      : { recursive: schedule.recursive, exclude: schedule.exclude, updateProgress, runtimeDir: subvolRuntimeDir, scheduleId: schedule.id }
+    // ident.1: a ZFS take stamps `anas:schedule=<id>` on every snapshot it
+    // creates (the same atomic verb), which is what the prune below keys on.
     const take = await takeSnapshot(executor, schedule.target, schedule.cadence, svcOpts)
     updateProgress(`Took ${take.name}; pruning per retention`)
-    if (schedule.target.kind === 'zfs' && schedule.recursive === true && pve) {
-      // snapprune.1: retention reaches every dataset the schedule snapshots,
-      // per dataset. The other schedules come from the unit files (the store)
-      // so a dataset another enabled schedule covers is judged by its policy
-      // too. The read says whether it is COMPLETE: a partial list (unlistable
-      // dir, unreadable or unparseable unit) prunes the target only — nothing
-      // is destroyed on swept children or excluded datasets that run. A
+    if (schedule.target.kind === 'zfs') {
+      // ident.1 over snapprune.1: retention destroys only snapshots stamped
+      // with THIS schedule's id, per dataset across everything it snapshots
+      // (the whole sweep for a recursive schedule). An unstamped (pre-0.4.2)
+      // snapshot is a candidate only where this is the one enabled schedule
+      // covering the dataset — which the other schedules decide, read from
+      // the unit files (the store). The read says whether it is COMPLETE: on
+      // a partial list (unlistable dir, unreadable or unparseable unit) no
+      // unstamped snapshot is destroyed that run (noted, a warning). A
       // destroy ZFS refuses on a swept or excluded dataset is noted there
       // and the run completes with warnings. The result names at most
       // PRUNED_NAMES_PER_DATASET destroyed snapshots per dataset.
-      const prune = await pruneRecursiveSchedule(executor, schedule, {
+      const prune = await pruneZfsSchedule(executor, schedule, {
         others: await readScheduleList(systemdDir),
         updateProgress,
       })
-      return recursiveRunResult(schedule, take.name, prune)
+      return zfsRunResult(schedule, take.name, prune)
     }
-    const prune = await pruneSnapshots(executor, schedule.target, schedule.retention, svcOpts)
+    // AHR: whole @data, no stamp (btrfs has no user properties); the policy's
+    // absent buckets are left alone, its own cadence bucket always planned.
+    const prune = await pruneSnapshots(executor, schedule.target, effectiveRetention(schedule), svcOpts)
     return {
       schedule: schedule.id,
       taken: take.name,

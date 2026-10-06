@@ -2,7 +2,7 @@ import type { ScheduledSnapshot, SnapshotTarget } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { formatScheduledName } from '../snapshot-naming.js'
-import { planRetention } from '../snapshot-retention.js'
+import { effectiveRetention, planRetention } from '../snapshot-retention.js'
 
 const TARGET: SnapshotTarget = { kind: 'zfs', dataset: 'tank/media' }
 
@@ -83,9 +83,35 @@ describe('planRetention — always keep the most recent overall', () => {
       anas('weekly', '2026-07-19T00:00:00Z'),
       anas('weekly', '2026-07-12T00:00:00Z'),
     ]
-    const plan = planRetention(snaps, {}, NOW) // no counts at all → all 0
+    const plan = planRetention(snaps, { weekly: 0 }, NOW)
     assert.deepEqual(names(plan.keep), [snaps[0].name])
     assert.equal(plan.prune.length, 2)
+  })
+
+  it('ident.1: a bucket ABSENT from the policy is left alone (no longer "keep 0")', () => {
+    const snaps = [
+      anas('hourly', '2026-07-26T10:00:00Z'), // newest overall, hourly absent
+      anas('hourly', '2026-07-26T09:00:00Z'),
+      anas('daily', '2026-07-25T00:00:00Z'),
+      anas('daily', '2026-07-24T00:00:00Z'),
+      anas('weekly', '2026-07-19T00:00:00Z'), // absent too
+    ]
+    // The "minimal" preset's buckets: daily + weekly. Hourly is not named.
+    const plan = planRetention(snaps, { daily: 1 }, NOW)
+    assert.deepEqual(names(plan.prune), [snaps[3].name])
+    assert.deepEqual(names(plan.keep).sort(), names([snaps[0], snaps[1], snaps[2], snaps[4]]).sort())
+    // No counts at all: nothing is a candidate.
+    assert.deepEqual(planRetention(snaps, {}, NOW).prune, [])
+  })
+
+  it('ident.1: effectiveRetention makes the schedule\'s own cadence bucket present (0) when absent', () => {
+    assert.deepEqual(effectiveRetention({ cadence: 'hourly', retention: { daily: 7, weekly: 4 } }), { daily: 7, weekly: 4, hourly: 0 })
+    const kept = { hourly: 36, daily: 30 }
+    assert.equal(effectiveRetention({ cadence: 'hourly', retention: kept }), kept)
+    // An hourly schedule on the minimal preset still bounds its own hourlies.
+    const snaps = [anas('hourly', '2026-07-26T10:00:00Z'), anas('hourly', '2026-07-26T09:00:00Z'), anas('daily', '2026-07-25T00:00:00Z')]
+    const plan = planRetention(snaps, effectiveRetention({ cadence: 'hourly', retention: { daily: 7, weekly: 4 } }), NOW)
+    assert.deepEqual(names(plan.prune), [snaps[1].name])
   })
 
   it('the newest overall may live in a different bucket than the largest count', () => {

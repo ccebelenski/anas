@@ -19,10 +19,11 @@ import { datasetExists, poolExists, releaseHolds, skipIfFixtureMissing, sshExec 
  *   - snapprune.1: retention reaches every dataset the schedule snapshots —
  *     the kept sibling converges to the policy count like the target, and
  *     hand-seeded droppings (older `anas-hourly-*` taken with `-r` across the
- *     whole tree) are cleared from the excluded child and its grandchild,
- *     while a held sibling snapshot survives and is reported; the excluded
- *     PVE-owned storage root is cleared of them too (they are ANAS's own
- *     leftovers, proven by name + createtxg).
+ *     whole tree, stamped `anas:schedule=<this id>` as the schedule's own
+ *     takes are since ident.1) are cleared from the excluded child and its
+ *     grandchild, while a held sibling snapshot survives and is reported; the
+ *     excluded PVE-owned storage root is cleared of them too (they are ANAS's
+ *     own leftovers, proven by the stamp).
  *
  * The nested storage root (`pvfix/media/guests`, registered with pvesm for the
  * duration of the spec) is the #71 shape: a pool carrying ANAS datasets and
@@ -222,9 +223,10 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
   test('snapprune.1: one run clears droppings on excluded datasets, converges the sibling, keeps a held snapshot', async () => {
     // Droppings: what a recursive schedule left before the exclude (and before
     // snapprune.1) — one `zfs snapshot -r` per stamp across the WHOLE tree,
-    // excluded child, grandchild and the nested storage root included.
-    await sshExec(`zfs snapshot -r ${TARGET}@${OLD_A}`)
-    await sshExec(`zfs snapshot -r ${TARGET}@${OLD_B}`)
+    // excluded child, grandchild and the nested storage root included, each
+    // stamped with this schedule's id as its own takes are (ident.1).
+    await sshExec(`zfs snapshot -r -o anas:schedule=${SCHED_ID} ${TARGET}@${OLD_A}`)
+    await sshExec(`zfs snapshot -r -o anas:schedule=${SCHED_ID} ${TARGET}@${OLD_B}`)
     await sshExec(`zfs hold ${HOLD_TAG} ${SIBLING}@${OLD_A}`)
     // What the earlier runs left (retention hourly:1) plus the two droppings.
     const targetBefore = (await anasSnapshots(TARGET)).length
@@ -246,7 +248,7 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
       // Excluded child and its grandchild: cleared.
       expect(await anasSnapshots(CHILD)).toEqual([])
       expect(await anasSnapshots(GRANDCHILD)).toEqual([])
-      // The PVE-owned excluded storage root: our own leftovers are cleared too.
+      // The PVE-owned excluded storage root: our own (stamped) leftovers are cleared too.
       expect(await anasSnapshots(NESTED_ROOT)).toEqual([])
 
       // The result reports it per dataset; the held one is named.
@@ -269,8 +271,9 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
 
   test('provenance: a RECEIVED snapshot carrying the schedule\'s name on an excluded dataset survives, noted', async () => {
     // A replica of the kept sibling, received under the excluded child: its
-    // snapshot has this schedule's name and the sibling's creation time, but
-    // its own createtxg — it was not taken by this schedule.
+    // snapshot has this schedule's name, but a plain `zfs send` carries no
+    // user properties — it arrives without the `anas:schedule` stamp, so it
+    // is not this schedule's (ident.1: the stamp replaced the txg witness).
     const sibling = (await anasSnapshots(SIBLING)).filter(n => !n.startsWith('anas-hourly-2026-01-01T')).sort()
     const snap = sibling.at(-1)
     expect(snap, 'the sibling carries a snapshot this schedule took').toBeTruthy()
@@ -292,7 +295,8 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
       expect(await anasSnapshots(REPLICA)).toEqual([snap])
       const entry = (done.result?.datasets ?? []).find(d => d.dataset === REPLICA)
       expect(entry, JSON.stringify(done.result?.datasets)).toMatchObject({ scope: 'excluded', pruned: 0, held: 0 })
-      expect(entry?.note).toMatch(/1 left: not taken by this schedule/)
+      expect(entry?.note).toMatch(/1 left: unstamped, outside this schedule's sweep/)
+      expect((await sshExec(`zfs get -H -o value anas:schedule ${REPLICA}@${snap}`)).trim()).toBe('-')
     }
     finally {
       if (await datasetExists(REPLICA))

@@ -48,10 +48,13 @@ export type SnapshotCadence = z.infer<typeof SnapshotCadence>
 
 /**
  * Keep-N per period bucket (learned from sanoid). Each value is the number of
- * that bucket's snapshots to retain; an absent bucket is treated as `0` (keep
- * none of that period — the newest overall is still always kept). `0` means
- * "prune this period down to nothing" (sanoid's off/prune semantic, GT-7),
- * subject to the always-keep-most-recent-overall guarantee.
+ * that bucket's snapshots to retain. `0` means "prune this period down to
+ * nothing" (sanoid's off/prune semantic, GT-7), subject to the
+ * always-keep-most-recent-overall guarantee. An ABSENT bucket is left alone
+ * (story ident.1, audit #1): its snapshots are not candidates at all, so a
+ * "minimal" policy never erases a sibling schedule's hourlies. The one
+ * exception is the schedule's OWN cadence bucket, which counts as `0` when
+ * absent — a schedule always bounds the snapshots it takes.
  */
 export const RetentionPolicy = z.object({
   frequently: z.number().int().nonnegative().optional(),
@@ -192,8 +195,24 @@ export const ScheduledSnapshot = z.object({
    */
   held: z.boolean().optional(),
   source: SnapshotSource,
+  /**
+   * ZFS only (story ident.1): the `anas:schedule` user property the take set
+   * on the snapshot — the id of the schedule that took it. Absent when the
+   * property is unset (a pre-0.4.2 take, a hand-made or received snapshot
+   * without it) and on AHR. Retention prunes only snapshots carrying the
+   * fired schedule's own id (an unstamped one only where that schedule is the
+   * only one covering the dataset).
+   */
+  schedule: z.string().optional(),
 })
 export type ScheduledSnapshot = z.infer<typeof ScheduledSnapshot>
+
+/**
+ * The ZFS user property a scheduled take stamps on every snapshot it creates
+ * (`zfs snapshot -o anas:schedule=<id>`, story ident.1): ownership is a fact on
+ * the snapshot itself, not a name pattern and not shadow state.
+ */
+export const SCHEDULE_STAMP_PROPERTY = 'anas:schedule'
 
 /**
  * The outcome of applying a retention policy to an inventory:
@@ -307,10 +326,10 @@ export type SnapshotScheduleDetail = z.infer<typeof SnapshotScheduleDetail>
 
 /**
  * Where a dataset sits in a recursive schedule's prune (snapprune.1):
- * `target` — the schedule's own dataset (its full policy, as always);
- * `sweep` — a child the recursive take covers (this schedule's bucket);
+ * `target` — the schedule's own dataset; `sweep` — a child the recursive take
+ * covers (both get the schedule's policy over the snapshots it stamped);
  * `excluded` — a child outside the sweep that still carried snapshots this
- * schedule took before it was excluded.
+ * schedule stamped before it was excluded (destroyed outright).
  */
 export const PruneScope = z.enum(['target', 'sweep', 'excluded'])
 export type PruneScope = z.infer<typeof PruneScope>

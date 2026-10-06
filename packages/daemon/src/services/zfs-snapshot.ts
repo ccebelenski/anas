@@ -35,6 +35,20 @@ export interface ZfsSnapshotOptions {
    * `.zfs/snapshot/<name>` would simply not exist.
    */
   recursive?: boolean
+  /**
+   * `-o <prop>=<value>` set on every snapshot the call creates (story ident.1:
+   * a scheduled take stamps `anas:schedule=<id>`). ZFS applies the `-o` list
+   * to each snapshot of the one atomic verb, `-r` children and every name of
+   * a multi-name call included. Snapshot-only: a destroy ignores it.
+   */
+  properties?: Record<string, string>
+}
+
+/** `-o k=v` pairs for a create, in key order (stable argv). */
+function propertyArgs(properties?: Record<string, string>): string[] {
+  if (!properties)
+    return []
+  return Object.keys(properties).sort().flatMap(k => ['-o', `${k}=${properties[k]}`])
 }
 
 /** `<dataset>@<name>` — the full ZFS snapshot identifier. */
@@ -42,9 +56,9 @@ export function zfsSnapshotFullName(dataset: string, name: string): string {
   return `${dataset}@${name}`
 }
 
-/** The `zfs snapshot [-r] <dataset>@<name>` argv. */
+/** The `zfs snapshot [-r] [-o k=v]… <dataset>@<name>` argv. */
 export function createZfsSnapshotArgs(opts: ZfsSnapshotOptions): string[] {
-  return ['snapshot', ...(opts.recursive ? ['-r'] : []), zfsSnapshotFullName(opts.dataset, opts.name)]
+  return ['snapshot', ...(opts.recursive ? ['-r'] : []), ...propertyArgs(opts.properties), zfsSnapshotFullName(opts.dataset, opts.name)]
 }
 
 /**
@@ -53,8 +67,8 @@ export function createZfsSnapshotArgs(opts: ZfsSnapshotOptions): string[] {
  * call atomically (one transaction group), so a recursive schedule with an
  * exclude list keeps the same consistency guarantee as `-r`.
  */
-export function createZfsSnapshotsArgs(datasets: string[], name: string): string[] {
-  return ['snapshot', ...datasets.map(ds => zfsSnapshotFullName(ds, name))]
+export function createZfsSnapshotsArgs(datasets: string[], name: string, properties?: Record<string, string>): string[] {
+  return ['snapshot', ...propertyArgs(properties), ...datasets.map(ds => zfsSnapshotFullName(ds, name))]
 }
 
 /** `zfs list -H -o name -r -t filesystem,volume <dataset>` — the tree a recursive snapshot covers. */
@@ -174,10 +188,10 @@ export async function createZfsSnapshot(
  */
 export async function createZfsSnapshotExcluding(
   executor: CommandExecutor,
-  opts: { dataset: string, name: string, exclude: string[] },
+  opts: { dataset: string, name: string, exclude: string[], properties?: Record<string, string> },
 ): Promise<{ snapshots: string[] }> {
   if (opts.exclude.length === 0) {
-    const r = await createZfsSnapshot(executor, { dataset: opts.dataset, name: opts.name, recursive: true })
+    const r = await createZfsSnapshot(executor, { dataset: opts.dataset, name: opts.name, recursive: true, properties: opts.properties })
     return { snapshots: [r.snapshot] }
   }
   const listed = await executor.exec(ZFS, zfsTreeListArgs(opts.dataset))
@@ -185,7 +199,7 @@ export async function createZfsSnapshotExcluding(
     throw failure('list', listed)
   const descendants = listed.stdout.split('\n').map(l => l.trim()).filter(Boolean)
   const datasets = expandSnapshotTargets(descendants, opts.dataset, opts.exclude)
-  const r = await executor.exec(ZFS, createZfsSnapshotsArgs(datasets, opts.name))
+  const r = await executor.exec(ZFS, createZfsSnapshotsArgs(datasets, opts.name, opts.properties))
   if (r.exitCode !== 0)
     throw failure('snapshot', r)
   return { snapshots: datasets.map(ds => zfsSnapshotFullName(ds, opts.name)) }

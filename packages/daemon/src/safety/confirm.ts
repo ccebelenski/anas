@@ -28,11 +28,21 @@ export interface ConfirmStoreOptions {
 }
 
 interface ConfirmEntry {
-  /** Operation signature this code authorizes. */
+  /** Operation signature this code authorizes (operation + params + bound id). */
   signature: string
+  /** The signature WITHOUT the bound id — what a name-only match compares. */
+  base: string
+  /**
+   * The stable id the code was minted under (story ident.1: a pool or dataset
+   * guid, a snapshot's createtxg), when the gate bound one.
+   */
+  bound?: Record<string, string>
   /** Absolute expiry, epoch ms. */
   expiresAt: number
 }
+
+/** The stable id a confirm is bound to: a few named string facts (`{ guid }`). */
+export type BoundId = Record<string, string>
 
 /** A generated code plus its ISO-8601 expiry (for the X-Anas-Confirm-Expires header). */
 export interface GeneratedConfirm {
@@ -63,9 +73,10 @@ export class ConfirmStore {
     this.now = opts?.now ?? (() => Date.now())
   }
 
-  /** Canonical signature for an operation + its resource params. */
-  private signature(operation: string, params: Record<string, unknown>): string {
-    return `${operation} ${stableStringify(params)}`
+  /** Canonical signature for an operation + its resource params (+ the bound id). */
+  private signature(operation: string, params: Record<string, unknown>, bound?: BoundId): string {
+    const base = `${operation} ${stableStringify(params)}`
+    return bound ? `${base} ${stableStringify(bound)}` : base
   }
 
   /** Drop expired entries so the map doesn't grow unbounded. */
@@ -81,11 +92,16 @@ export class ConfirmStore {
    * Generate and store a code for an operation. Returns the code and its ISO
    * expiry. The code is crypto-random (hyphen-stripped UUID, first 12 chars).
    */
-  generateCode(operation: string, params: Record<string, unknown>): GeneratedConfirm {
+  generateCode(operation: string, params: Record<string, unknown>, bound?: BoundId): GeneratedConfirm {
     this.prune()
     const code = randomUUID().replace(HYPHENS, '').slice(0, 12)
     const expiresAt = this.now() + this.ttlMs
-    this.entries.set(code, { signature: this.signature(operation, params), expiresAt })
+    this.entries.set(code, {
+      signature: this.signature(operation, params, bound),
+      base: this.signature(operation, params),
+      ...(bound ? { bound: { ...bound } } : {}),
+      expiresAt,
+    })
     return { code, expiresAt: new Date(expiresAt).toISOString() }
   }
 
@@ -94,7 +110,7 @@ export class ConfirmStore {
    * (single-use). Returns false for unknown, expired, or mismatched codes; an
    * expired code is also evicted.
    */
-  verifyCode(code: string, operation: string, params: Record<string, unknown>): boolean {
+  verifyCode(code: string, operation: string, params: Record<string, unknown>, bound?: BoundId): boolean {
     const entry = this.entries.get(code)
     if (!entry)
       return false
@@ -102,9 +118,29 @@ export class ConfirmStore {
       this.entries.delete(code)
       return false
     }
-    if (entry.signature !== this.signature(operation, params))
+    if (entry.signature !== this.signature(operation, params, bound))
       return false
     this.entries.delete(code)
     return true
+  }
+
+  /**
+   * Story ident.1: was `code` minted for this exact operation and params but
+   * under a DIFFERENT bound id? Returns the id it was minted under (and
+   * consumes the code — it can never verify again), or null when the code is
+   * unknown, expired, for another operation/params, or for the same id. This
+   * is how a gate tells "the object under that name changed since you
+   * confirmed" apart from a plain missing or stale code.
+   */
+  takeBoundMismatch(code: string, operation: string, params: Record<string, unknown>, bound: BoundId): BoundId | null {
+    const entry = this.entries.get(code)
+    if (!entry || entry.expiresAt <= this.now() || !entry.bound)
+      return null
+    if (entry.base !== this.signature(operation, params))
+      return null
+    if (entry.signature === this.signature(operation, params, bound))
+      return null
+    this.entries.delete(code)
+    return entry.bound
   }
 }

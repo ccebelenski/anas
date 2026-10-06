@@ -7,16 +7,18 @@ import type { ConfirmStore } from '../safety/confirm.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
 import type { Transport } from '../services/replication-transport.js'
-import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, lunGrowGuidance, PoolName, RenameSnapshotRequest, SetAccessRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
+import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, lunGrowGuidance, PoolName, RenameSnapshotRequest, reservedDatasetSegment, SetAccessRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
 import { parseExports } from '../parsers/exports.js'
 import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
 import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
-import { confirmGate } from '../safety/gate.js'
+import { confirmGateBound, readDatasetGuid, readRollbackIds, requireStableId } from '../safety/stable-id.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
+import { readIscsiState, withIscsiLock } from '../services/iscsi-mutate.js'
+import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
 import { loadPveFootprint, pveDescendantsUnlistedMessage, pveNamingGuardMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { createZfsSnapshot, destroyZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
@@ -356,16 +358,18 @@ function buildAclSpec(base: BaseLevels, named: NamedEntry[], recursive: boolean)
  * The snapshot sub-resource of a dataset wildcard, or null if the wildcard is a
  * plain dataset path. find-my-way only allows a terminal wildcard, so the whole
  * `<datasetpath>/snapshots/<snap>/<action>` tail arrives as one `*` capture.
- * Split on the `snapshots` path segment: everything before it is the dataset
+ * Split on a `snapshots` path segment: everything before it is the dataset
  * path (may contain '/'), everything after is the snapshot sub-resource.
- * Snapshot names never contain '/', so this is unambiguous.
+ * Snapshot names never contain '/'; a DATASET named `…/snapshots/…` (one made
+ * before ident.1 reserved the segment) is what makes it ambiguous, and the
+ * router resolves that by what exists ({@link snapshotTails}).
  *
  *   media/snapshots                 → { datasetPath: 'media' }                       (collection)
  *   media/movies/snapshots/snap1    → { datasetPath: 'media/movies', snap: 'snap1' } (item)
  *   media/snapshots/snap1/rollback  → { datasetPath: 'media', snap: 'snap1', rollback }
  *   snapshots                       → { datasetPath: '' }                            (pool-root dataset)
  */
-interface SnapshotTail {
+export interface SnapshotTail {
   datasetPath: string
   snap?: string
   rollback: boolean
@@ -375,19 +379,30 @@ interface SnapshotTail {
   extra: boolean
 }
 
-function parseSnapshotTail(wildcard: string): SnapshotTail | null {
+/**
+ * Every reading of `wildcard` as a snapshot sub-route — one per `snapshots`
+ * segment, leftmost first (story ident.1). A dataset created before the
+ * segment was reserved may itself be named `…/snapshots/…`, so the leftmost
+ * split is not always the right one; the router picks among these by what
+ * exists ({@link datasetRoutes}' `resolveSnapshotTail`).
+ *
+ * Exported for tests.
+ */
+export function snapshotTails(wildcard: string): SnapshotTail[] {
   const parts = wildcard.split('/')
-  const idx = parts.indexOf('snapshots')
-  if (idx === -1)
-    return null
-
-  const datasetPath = parts.slice(0, idx).join('/')
-  const rest = parts.slice(idx + 1)
-  const snap = rest[0]
-  const rollback = rest.length === 2 && rest[1] === 'rollback'
-  const clone = rest.length === 2 && rest[1] === 'clone'
-  const known = rest.length === 0 || rest.length === 1 || rollback || clone
-  return { datasetPath, snap, rollback, clone, extra: !known }
+  const tails: SnapshotTail[] = []
+  parts.forEach((seg, idx) => {
+    if (seg !== 'snapshots')
+      return
+    const datasetPath = parts.slice(0, idx).join('/')
+    const rest = parts.slice(idx + 1)
+    const snap = rest[0]
+    const rollback = rest.length === 2 && rest[1] === 'rollback'
+    const clone = rest.length === 2 && rest[1] === 'clone'
+    const known = rest.length === 0 || rest.length === 1 || rollback || clone
+    tails.push({ datasetPath, snap, rollback, clone, extra: !known })
+  })
+  return tails
 }
 
 export async function datasetRoutes(
@@ -507,6 +522,45 @@ export async function datasetRoutes(
     return parseSnapshotNames(r.stdout)
   }
 
+  /**
+   * Story ident.1 (audit #12): does `<pool>/<path>` name an existing
+   * filesystem or volume? Asked only when the path carries a reserved
+   * sub-resource segment (`snapshots`, `access`, `permissions`) unless
+   * `always` — elsewhere there is nothing ambiguous to resolve.
+   */
+  async function namesExistingDataset(poolName: string, path: string, always = false): Promise<boolean> {
+    if (!path || (!always && reservedDatasetSegment(path) === null))
+      return false
+    if (!PoolName.safeParse(poolName).success || !DatasetPath.safeParse(path).success)
+      return false
+    const full = `${poolName}/${path}`
+    const r = await executor.exec(ZFS, ['list', '-H', '-o', 'name', '-t', 'filesystem,volume', full])
+    return r.exitCode === 0 && r.stdout.trim() === full
+  }
+
+  /**
+   * The snapshot sub-route `wildcard` names, or null when it names a dataset
+   * (story ident.1, audit #12). A path that names an EXISTING dataset is that
+   * dataset — never a snapshot route: destroying `tank/snapshots/old` once
+   * destroyed `tank@old`. Otherwise, when several `snapshots` segments could
+   * split it, the rightmost split whose dataset exists wins (the pool root
+   * always does); with none, the leftmost (the old reading — the handler then
+   * 404s the missing dataset).
+   */
+  async function resolveSnapshotTail(poolName: string, wildcard: string): Promise<SnapshotTail | null> {
+    if (await namesExistingDataset(poolName, wildcard))
+      return null
+    const tails = snapshotTails(wildcard)
+    if (tails.length <= 1)
+      return tails[0] ?? null
+    for (let i = tails.length - 1; i >= 0; i--) {
+      const t = tails[i]
+      if (!t.extra && (t.datasetPath === '' || await namesExistingDataset(poolName, t.datasetPath, true)))
+        return t
+    }
+    return tails[0]
+  }
+
   /** Does the named dataset (or pool-root dataset) exist? */
   async function datasetExists(poolName: string, fullName: string): Promise<boolean> {
     const datasets = await listDatasets(poolName)
@@ -543,6 +597,47 @@ export async function datasetRoutes(
     if (row?.mountpoint && row.mountpoint.startsWith('/'))
       subject.path = row.mountpoint
     return heldByLun(cache, subject)
+  }
+
+  /**
+   * Story ident.1 (audit #20): the refusal for a RECURSIVE permission change
+   * (chown/chmod/setfacl `-R`) whose tree holds a PVE-owned descendant — the
+   * same `ownedDescendant` question a recursive destroy or snapshot asks —
+   * or null when there is none. An unreadable dataset list refuses (a walk the
+   * daemon cannot see through is never allowed).
+   */
+  async function recursiveOwnedRefusal(poolName: string, fullName: string): Promise<string | null> {
+    const datasets = await listDatasetsOrNull(poolName)
+    if (!datasets)
+      return pveDescendantsUnlistedMessage('permission change', fullName)
+    const descendant = (await pveFootprint()).ownedDescendant(datasets, fullName)
+    return descendant ? pveRecursiveRefusalMessage('Recursive permission change', fullName, descendant) : null
+  }
+
+  /**
+   * Story ident.1: the destroy job's re-run of the route's pre-flight gates —
+   * the PVE footprint (the dataset itself, and every descendant a `-r` would
+   * sweep: `ownedDescendant`) and the held-by-LUN check, against the pool as
+   * it is when the job runs. Throws the refusal; fail-closed on an unreadable
+   * dataset list.
+   */
+  async function recheckDestroyGates(poolName: string, fullName: string, recursive: boolean): Promise<void> {
+    const datasets = await listDatasetsOrNull(poolName)
+    const row = datasets?.find(d => d.name === fullName)
+    if (!datasets || !row)
+      throw new Error(recursive ? pveDescendantsUnlistedMessage('destroy', fullName) : `Dataset '${fullName}' could not be read again before the destroy`)
+    const pve = await pveFootprint()
+    const owned = pve.ownershipOf(fullName)
+    if (owned)
+      throw new Error(owned.reason)
+    if (recursive) {
+      const descendant = pve.ownedDescendant(datasets, fullName)
+      if (descendant)
+        throw new Error(pveRecursiveRefusalMessage('Destroy', fullName, descendant))
+    }
+    const held = await datasetHeldByLun(row, fullName)
+    if (held)
+      throw new Error(heldByLunRefusal(`dataset '${fullName}'${recursive ? ' (recursive)' : ''}`, 'Destroying', held).message)
   }
 
   /**
@@ -848,14 +943,18 @@ export async function datasetRoutes(
     const poolName = request.params.name
     const path = request.params['*']
 
+    // ident.1: a path naming an existing dataset is that dataset, whatever
+    // reserved segment it carries.
+    const isDataset = await namesExistingDataset(poolName, path)
+
     // Access sub-resource: `<dataset>/access` (layered permissions editor).
-    if (path === 'access' || path.endsWith(ACCESS_SUFFIX)) {
+    if (!isDataset && (path === 'access' || path.endsWith(ACCESS_SUFFIX))) {
       const dpath = path === 'access' ? '' : path.slice(0, -ACCESS_SUFFIX.length)
       return getAccess(poolName, dpath, reply)
     }
 
     // Snapshot sub-resource: `<dataset>/snapshots[/<snap>]`.
-    const tail = parseSnapshotTail(path)
+    const tail = isDataset ? null : await resolveSnapshotTail(poolName, path)
     if (tail) {
       if (tail.extra) {
         reply.code(404)
@@ -1007,7 +1106,7 @@ export async function datasetRoutes(
       return replication.runReplication(poolName, dpath, request, reply)
     }
 
-    const tail = parseSnapshotTail(wildcard)
+    const tail = await resolveSnapshotTail(poolName, wildcard)
     if (!tail || tail.extra || (tail.snap && !tail.rollback && !tail.clone)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Unknown resource '${wildcard}'` } }
@@ -1037,8 +1136,13 @@ export async function datasetRoutes(
     const poolName = nameParsed.data
     const wildcard = request.params['*']
 
+    // ident.1: a path naming an existing dataset is a property update of that
+    // dataset, whatever reserved segment it carries.
+    if (await namesExistingDataset(poolName, wildcard))
+      return updateProperties(poolName, wildcard, request, reply)
+
     // Snapshot rename: `<dataset>/snapshots/<snap>`.
-    const tail = parseSnapshotTail(wildcard)
+    const tail = await resolveSnapshotTail(poolName, wildcard)
     if (tail) {
       if (!tail.snap || tail.rollback || tail.clone || tail.extra) {
         reply.code(404)
@@ -1106,6 +1210,8 @@ export async function datasetRoutes(
     // Job-result warnings. The one a property edit can earn today is the LUN
     // grow guidance (below) — a filesystem edit never does.
     const warnings: string[] = []
+    /** ident.1: the served LUN a volsize grow was verified against (re-read in the job). */
+    let servedGrow: ReturnType<typeof servedLunIdentity> | null = null
 
     if (target.type === 'volume') {
       const notOnVolume = (['recordsize', 'quota', 'refquota', 'atime'] as const)
@@ -1151,6 +1257,25 @@ export async function datasetRoutes(
       // no warning.
       if (held !== null && props.volsize !== undefined)
         warnings.push(lunGrowGuidance(props.volsize))
+
+      // ident.1 + ident.2 (audit #8): a grow of a zvol a live LUN serves runs
+      // `zfs set volsize=` on the volume the PATH names, so that volume must be
+      // the device LIO serves (`stat(/dev/zvol/<ds>).rdev` = the backstore's
+      // major:minor) — after a rename + re-create under the live LUN it is not,
+      // and the size the gate compared was the served device's. Refused 409
+      // `served-device-mismatch` with ident.2's sentence; re-verified in the job.
+      if (held !== null && props.volsize !== undefined) {
+        const { ctx, targets } = await readIscsiState(executor, iscsiPaths)
+        const lun = targets.find(t => t.iqn === held.targetIqn)?.luns.find(l => l.index === held.index)
+        if (lun) {
+          const verdict = await checkServedDevice(ctx.live, lun, statDeviceFrom(iscsiPaths))
+          if (verdict.refusal) {
+            reply.code(409)
+            return { error: { code: 'CONFLICT', reason: verdict.refusal.reason, message: verdict.refusal.message } }
+          }
+          servedGrow = servedLunIdentity(held.targetIqn, lun, verdict.device)
+        }
+      }
     }
     else if (props.volsize !== undefined) {
       reply.code(400)
@@ -1172,11 +1297,22 @@ export async function datasetRoutes(
         // not merely unlikely. (Values are also validated at the API boundary
         // by the shared schema, so a bad one rarely reaches ZFS at all.)
         const spec = pairs.join(' ')
-        updateProgress(`Setting ${spec} on ${fullName}`)
-        const result = await executor.exec(ZFS, ['set', ...pairs, fullName])
-        if (result.exitCode !== 0)
-          throw new Error(result.stderr.trim() || `zfs set ${spec} exited with code ${result.exitCode}`)
-        return { dataset: fullName, applied: pairs, warnings }
+        const apply = async () => {
+          updateProgress(`Setting ${spec} on ${fullName}`)
+          const result = await executor.exec(ZFS, ['set', ...pairs, fullName])
+          if (result.exitCode !== 0)
+            throw new Error(result.stderr.trim() || `zfs set ${spec} exited with code ${result.exitCode}`)
+          return { dataset: fullName, applied: pairs, warnings }
+        }
+        // A grow of a served zvol: the LUN and its served device are re-read
+        // under the iSCSI lock, immediately before the `zfs set`.
+        const served = servedGrow
+        if (!served)
+          return apply()
+        return withIscsiLock(async () => {
+          await reverifyServedLun(executor, iscsiPaths, served, { requireDevice: true })
+          return apply()
+        })
       },
     )
 
@@ -1221,6 +1357,15 @@ export async function datasetRoutes(
     if (owned) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
+    }
+    // Story ident.1 (audit #20): `chown -R`/`chmod -R` walks into every child
+    // dataset mounted beneath this one — refused when any descendant is PVE's.
+    if (recursive) {
+      const refusal = await recursiveOwnedRefusal(poolName, fullName)
+      if (refusal) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: refusal } }
+      }
     }
 
     // Resolve the mountpoint from the dataset — permissions apply to the path.
@@ -1371,6 +1516,16 @@ export async function datasetRoutes(
     if (owned) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
+    }
+    // Story ident.1 (audit #20): `setfacl -R`/`chmod -R` (applyToExisting)
+    // walks into every child dataset mounted beneath this one — refused when
+    // any descendant is PVE's, before the target is even resolved.
+    if (req.applyToExisting === true) {
+      const refusal = await recursiveOwnedRefusal(poolName, fullName)
+      if (refusal) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: refusal } }
+      }
     }
 
     const target = await resolveAccessTarget(poolName, path, reply)
@@ -1591,7 +1746,9 @@ export async function datasetRoutes(
     const poolName = nameParsed.data
 
     // Snapshot destroy: `<dataset>/snapshots/<snap>` (plain 202, no confirm).
-    const tail = parseSnapshotTail(request.params['*'])
+    // ident.1: unless the path names an existing dataset — then it is that
+    // dataset's (confirm-gated) destroy, never a snapshot's.
+    const tail = await resolveSnapshotTail(poolName, request.params['*'])
     if (tail) {
       if (!tail.snap || tail.rollback || tail.clone || tail.extra) {
         reply.code(404)
@@ -1719,9 +1876,19 @@ export async function datasetRoutes(
     // of the signature. The flag is chosen after the challenge is issued (like
     // the pool-destroy cleanup bug), so binding it here would make the confirmed
     // request mismatch the minted code and 409 again.
-    if (!confirmGate(confirmStore, request, reply, {
+    //
+    // Story ident.1: bound to the dataset's guid — a dataset destroyed and
+    // recreated under the same name answers the resend 409 IDENTITY_MISMATCH.
+    const destroyGuid = await readDatasetGuid(executor, fullName)
+    if (!destroyGuid) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `Could not read the guid of dataset '${fullName}' — refusing a destroy that cannot be bound to it` } }
+    }
+    if (!confirmGateBound(confirmStore, request, reply, {
       operation: 'zfs.destroy',
       params: { dataset: fullName },
+      bound: destroyGuid,
+      what: `Dataset '${fullName}'`,
       message: `Destroying dataset '${fullName}' permanently erases its data`,
       warnings,
     })) {
@@ -1732,8 +1899,14 @@ export async function datasetRoutes(
 
     const job = jobQueue.submit(
       'zfs.destroy',
-      { ...identity, params: { dataset: fullName, recursive } },
+      { ...identity, params: { dataset: fullName, recursive, guid: destroyGuid.guid } },
       async () => {
+        // ident.1: the job may have waited behind scrubs and backups. Same
+        // object (guid), and the PVE-footprint and LUN gates asked again of
+        // the tree as it is NOW — a child PVE claimed or a LUN added since the
+        // challenge refuses the destroy here, before `zfs destroy` runs.
+        await requireStableId(`Dataset '${fullName}'`, destroyGuid, () => readDatasetGuid(executor, fullName))
+        await recheckDestroyGates(poolName, fullName, recursive)
         const result = await executor.exec(ZFS, args)
         if (result.exitCode !== 0) {
           // A busy dataset can't be unmounted for destroy — name the holders
@@ -1769,7 +1942,7 @@ export async function datasetRoutes(
 
   // --- Snapshot sub-resource handlers (Epic 5) ---------------------------
   // All reached via the dataset `*` wildcard; the tail is parsed by
-  // parseSnapshotTail. Full ZFS snapshot name is `<dataset>@<snap>`.
+  // resolveSnapshotTail. Full ZFS snapshot name is `<dataset>@<snap>`.
 
   async function listSnapshots(poolName: string, datasetPath: string, reply: FastifyReply) {
     const fullName = resolveDatasetName(poolName, datasetPath, reply)
@@ -2050,9 +2223,19 @@ export async function datasetRoutes(
       warnings.push(`${laterSnapshots.length} more recent snapshot(s) exist (${laterSnapshots.join(', ')}); rollback requires force to destroy them, and doing so is irreversible.`)
     }
 
-    if (!confirmGate(confirmStore, request, reply, {
+    // Story ident.1: bound to the target snapshot's createtxg AND the newest
+    // snapshot's — a snapshot taken after this challenge listed the newer
+    // ones (which `rollback -r` destroys) is a mismatch: refuse, re-challenge.
+    const rollbackIds = await readRollbackIds(executor, fullName, snapName)
+    if (!rollbackIds) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `Could not read the snapshots of '${fullName}' — refusing a rollback that cannot be bound to them` } }
+    }
+    if (!confirmGateBound(confirmStore, request, reply, {
       operation: 'zfs.rollback',
       params: { snapshot: snapName },
+      bound: rollbackIds,
+      what: `Snapshot '${snapName}'`,
       message: `Rolling back '${fullName}' to snapshot '${snap}' discards newer data`,
       warnings,
     })) {
@@ -2063,8 +2246,9 @@ export async function datasetRoutes(
 
     const job = jobQueue.submit(
       'zfs.rollback',
-      { ...identity, params: { snapshot: snapName, force } },
+      { ...identity, params: { snapshot: snapName, force, ...rollbackIds } },
       async () => {
+        await requireStableId(`Snapshot '${snapName}'`, rollbackIds, () => readRollbackIds(executor, fullName, snapName))
         const result = await executor.exec(ZFS, args)
         if (result.exitCode !== 0)
           throw new Error(result.stderr.trim() || `zfs rollback exited with code ${result.exitCode}`)
