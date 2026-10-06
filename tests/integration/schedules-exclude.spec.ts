@@ -1,7 +1,7 @@
 import type { Locator, PlaywrightWorkerArgs } from '@playwright/test'
 import { expect, pveAuthState, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
-import { datasetExists, poolExists } from './fixtures/stunt-node'
+import { datasetExists, poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
 
 /**
  * Story snapx.1 (GitHub #71) — the schedule dialog's Exclude datasets picker,
@@ -71,7 +71,7 @@ async function setCheckbox(win: Locator, cls: string, check: boolean): Promise<v
 }
 
 test.beforeEach(async ({ playwright, pveTicket }) => {
-  test.skip(
+  skipIfFixtureMissing(
     !(await poolExists(PVE_POOL)) || !(await datasetExists(CHILD)),
     'pvepool fixture not present — run test/stunt-node/pvepool-fixture.sh up',
   )

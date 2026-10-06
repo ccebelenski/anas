@@ -1,7 +1,7 @@
 import type { Page } from '@playwright/test'
 import { expect, test } from '@playwright/test'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
-import { destroyPool, listSpareDisks, poolExists } from './fixtures/stunt-node'
+import { destroyPool, listSpareDisks, poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
 
 /**
  * Epic 15.2 / story 3.23 — the graphical Pool Composer, verified inside the REAL
@@ -48,7 +48,7 @@ async function dragDiskIntoBay(page: Page, diskSel: string, baySel: string): Pro
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off) — poolExists swallows SSH failures and returns false.
 test.beforeEach(async () => {
-  test.skip(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 })
 
 test.describe('ANAS Pool Composer (stunt node)', () => {
@@ -56,7 +56,7 @@ test.describe('ANAS Pool Composer (stunt node)', () => {
 
   test('launches from the Pools grid and gates Create on draft validity', async ({ page }) => {
     const spares = await listSpareDisks()
-    test.skip(spares.length < 2, 'need >= 2 spare disks — attach with add-disk.sh')
+    skipIfFixtureMissing(spares.length < 2, 'need >= 2 spare disks — attach with add-disk.sh')
 
     await loginToPve(page)
     await openAnasItem(page, 'Pools')
@@ -119,7 +119,7 @@ test.describe.serial('ANAS Pool Composer create (throwaway pool)', () => {
 
   test('builds a mirror in the composer and creates the pool for real', async ({ page }) => {
     const spares = await listSpareDisks()
-    test.skip(spares.length < 2, 'need >= 2 spare disks — attach with add-disk.sh')
+    skipIfFixtureMissing(spares.length < 2, 'need >= 2 spare disks — attach with add-disk.sh')
 
     await loginToPve(page)
     await openAnasItem(page, 'Pools')
@@ -142,7 +142,7 @@ test.describe.serial('ANAS Pool Composer create (throwaway pool)', () => {
     const counts: Record<string, number> = {}
     for (const s of sizes) counts[s] = (counts[s] ?? 0) + 1
     const size = Object.keys(counts).find(s => s && counts[s] >= 2)
-    test.skip(!size, 'need >= 2 same-size spare disks for a mirror')
+    skipIfFixtureMissing(!size, 'need >= 2 same-size spare disks for a mirror')
     const sameSize = `#anasc-avail .anas-composer-disk[data-size="${size}"]`
 
     // Add a mirror data vdev and drag two same-size disks in.

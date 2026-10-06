@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK, cadenceToOnCalendar, TASK_CANCELLED_EXIT_CODE } from '@anas/shared'
 import { JobCancelledError } from '../jobs/queue.js'
 import { decideCadenceRun, isTaskOverdue, overdueWindowMs } from './backup-cadence.js'
-import { deriveRunResult as deriveSystemdRunResult, parseShow, parseSystemdTimestamp } from './systemd-status.js'
+import { deriveRunResult as deriveSystemdRunResult, parseSystemdTimestamp } from './systemd-status.js'
 import { listServiceUnits, parseMarkedJson, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
 import {
   deriveUnitRunStatus,
@@ -985,23 +985,12 @@ export function failureDetailFromJournal(kind: TaskUnitKind, journal: string): s
 }
 
 /** `systemctl show` the run props supervision keys on (fail-open to {}). */
-async function showRunProps(
+function showRunProps(
   kind: TaskUnitKind,
   executor: CommandExecutor,
   name: string,
 ): Promise<Record<string, string>> {
-  try {
-    const r = await executor.exec(SYSTEMCTL, [
-      'show',
-      serviceUnitName(kind, name),
-      '-p',
-      'ActiveState,Result,ExecMainStatus,InvocationID',
-    ])
-    return parseShow(r.stdout)
-  }
-  catch {
-    return {}
-  }
+  return showUnitProps(executor, serviceUnitName(kind, name), 'ActiveState,Result,ExecMainStatus,InvocationID')
 }
 
 /**

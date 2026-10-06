@@ -29,6 +29,7 @@ import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
 import { readPveMountPaths } from '../parsers/pve-storage.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { readConfig } from './config-writer.js'
+import { execSystemctlShow } from './unit-run-status.js'
 
 /** `timeout` binary — wraps the probe so a dead NFS server can never hang us. */
 const TIMEOUT = '/usr/bin/timeout'
@@ -38,7 +39,6 @@ const MOUNT = '/usr/bin/mount'
 const UMOUNT = '/usr/bin/umount'
 const FINDMNT = '/usr/bin/findmnt'
 const SYSTEMD_ESCAPE = '/usr/bin/systemd-escape'
-const SYSTEMCTL = '/usr/bin/systemctl'
 
 /** Default credentials directory (per-mount 0600 root-only files, 18.5). */
 export const DEFAULT_CREDS_DIR = '/etc/anas/creds'
@@ -1095,7 +1095,7 @@ export async function readUnitState(executor: CommandExecutor, mountpoint: strin
     const name = esc.stdout.trim()
     if (esc.exitCode !== 0 || !name)
       return undefined
-    const show = await executor.exec(SYSTEMCTL, ['show', name, '--property=LoadState,ActiveState,SubState,Result'])
+    const show = await execSystemctlShow(executor, name, 'LoadState,ActiveState,SubState,Result')
     if (show.exitCode !== 0 && !show.stdout.trim())
       return { name }
     const props = new Map<string, string>()

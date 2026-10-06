@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { expect, test } from '@playwright/test'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
-import { sshExec } from './fixtures/stunt-node'
+import { skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
 const execFileAsync = promisify(execFile)
 
@@ -446,7 +446,7 @@ test.beforeAll(async () => {
 test.beforeEach(async () => {
   // The fixture user is the "fixture present" signal (the same posture the
   // rclone.1 spec uses — NOT the store, which `up` restores to its pre-state).
-  test.skip(
+  skipIfFixtureMissing(
     !(await sshExec(`id -u ${REMOTE_USER}`)
       .then(() => true)
       .catch(() => false)),

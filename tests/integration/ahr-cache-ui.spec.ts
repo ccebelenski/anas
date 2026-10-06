@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { expect, pveAuthState, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
-import { sshExec } from './fixtures/stunt-node'
+import { skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
 const execFileAsync = promisify(execFile)
 
@@ -68,7 +68,7 @@ async function disksPresent(): Promise<boolean> {
 }
 
 test.beforeEach(async () => {
-  test.skip(!(await disksPresent()), 'ahrcache fixture not present — run test/stunt-node/ahrcache-fixture.sh up')
+  skipIfFixtureMissing(!(await disksPresent()), 'ahrcache fixture not present — run test/stunt-node/ahrcache-fixture.sh up')
 })
 
 // Wide viewport: the AHR toolbar carries ~15 labelled buttons and at the

@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
+import { HELD_NAMES_TOTAL, PRUNED_NAMES_TOTAL } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import { formatScheduledName } from '../snapshot-naming.js'
 import { snapshotNotifyOutcome } from '../snapshot-notify.js'
@@ -742,5 +743,139 @@ describe('planRecursivePrune / pruneRecursiveSchedule (snapprune.1)', () => {
     // The first reason, then how many more were refused.
     assert.equal(guests.note, `2 left: destroy refused: cannot destroy 'tank/guests@${H1}': snapshot has dependent clones (and 1 more)`)
     assert.equal(guests.refused, 2)
+  })
+
+  // ---- 0.4.2 test-review fixes ----------------------------------------------
+
+  /** A tree read where each `<ds>@<label>` named is already gone; the rest succeed. */
+  function armGone(stdout: string, gone: string[]) {
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: ZFS,
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg', '-r', 'tank'],
+      result: { stdout, stderr: '', exitCode: 0 },
+    })
+    for (const full of gone) {
+      // The re-check of a vanished snapshot fails (not held) …
+      executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', 'userrefs', full], result: { stdout: '', stderr: `cannot open '${full}': dataset does not exist`, exitCode: 1 } })
+      // … and the destroy answers the way OpenZFS 2.4 does (verified on the stunt node).
+      executor.addFixture({ command: ZFS, args: ['destroy', full], result: { stdout: '', stderr: 'could not find any snapshots to destroy; check snapshot names.\n', exitCode: 1 } })
+    }
+    executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
+    return executor
+  }
+
+  it('C3: an already-gone destroy is pruned in EVERY scope — target, swept, excluded — no error, no note, no warning', async () => {
+    const gone = [`tank@${H1}`, `tank/a@${H1}`, `tank/backup@${H1}`]
+    const res = await pruneRecursiveSchedule(armGone(tree(['tank', 'tank/a', 'tank/backup']), gone), sched({ exclude: ['tank/backup'] }), {
+      others: { schedules: [], complete: true },
+      now: PRUNE_NOW,
+    })
+    const by = (ds: string) => res.datasets.find(d => d.dataset === ds)!
+    assert.deepEqual(by('tank').pruned.map(s => s.name).sort(), [H1, H2])
+    assert.deepEqual(by('tank/a').pruned.map(s => s.name).sort(), [H1, H2])
+    assert.deepEqual(by('tank/backup').pruned.map(s => s.name).sort(), [H1, H2, H3])
+    for (const d of res.datasets) {
+      assert.equal(d.refused, 0, d.dataset)
+      assert.equal(d.note, undefined, d.dataset)
+    }
+    const result = recursiveRunResult(sched({ exclude: ['tank/backup'] }), H3, res)
+    assert.equal(snapshotNotifyOutcome({ schedule: sched({ exclude: ['tank/backup'] }), result }), 'success')
+  })
+
+  it('C3: an already-gone destroy on a NON-recursive prune counts as pruned', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs', 'tank/media'], result: {
+      stdout: [`tank/media@${H1}\t1769385600\t0`, `tank/media@${H2}\t1769389200\t0`].join('\n'),
+      stderr: '',
+      exitCode: 0,
+    } })
+    executor.addFixture({ command: ZFS, args: ['destroy', `tank/media@${H1}`], result: { stdout: '', stderr: 'could not find any snapshots to destroy; check snapshot names.\n', exitCode: 1 } })
+    executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
+    const res = await pruneSnapshots(executor, ZFS_TARGET, { hourly: 1 }, { now: PRUNE_NOW })
+    assert.deepEqual(res.pruned.map(s => s.name), [H1])
+  })
+
+  it('C3: any OTHER destroy failure on the target still fails the run', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs', 'tank/media'], result: {
+      stdout: [`tank/media@${H1}\t1769385600\t0`, `tank/media@${H2}\t1769389200\t0`].join('\n'),
+      stderr: '',
+      exitCode: 0,
+    } })
+    executor.addFixture({ command: ZFS, args: ['destroy', `tank/media@${H1}`], result: { stdout: '', stderr: 'cannot destroy snapshot: dataset is busy', exitCode: 1 } })
+    executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
+    await assert.rejects(() => pruneSnapshots(executor, ZFS_TARGET, { hourly: 1 }, { now: PRUNE_NOW }), /dataset is busy/)
+  })
+
+  it('C2: a first run over 40 children x 100 snapshots keeps the runner line under 40 KiB (total name caps)', async () => {
+    const labels: string[] = []
+    for (let i = 0; i < 100; i++)
+      labels.push(formatScheduledName('hourly', new Date(Date.UTC(2026, 3, 1) + i * 3600_000)))
+    const datasets = ['tank', ...Array.from({ length: 40 }, (_, i) => `tank/a-child-dataset-with-a-realistic-name-${String(i).padStart(2, '0')}`)]
+    const lines: string[] = []
+    for (const ds of datasets)
+      labels.forEach((l, i) => lines.push(row(ds, l, 1000 + i)))
+    const res = await pruneRecursiveSchedule(armRefusing(lines.join('\n'), []), sched(), {
+      others: { schedules: [], complete: true },
+      now: PRUNE_NOW,
+    })
+    assert.equal(res.pruned.length, 41 * 99)
+    const result = recursiveRunResult(sched(), labels.at(-1)!, res)
+    assert.equal(result.pruned.length, PRUNED_NAMES_TOTAL)
+    assert.equal(result.prunedCount, 41 * 99)
+    assert.equal(result.datasets!.length, 41)
+    assert.ok(result.datasets!.every(d => d.pruned === 99), 'per-dataset entries keep their counts')
+    // What the runner prints to journald (snapshot-task.ts) — LineMax is 48 KiB.
+    const line = JSON.stringify({ schedule: 'hourly-tank', result })
+    assert.ok(Buffer.byteLength(line) < 40 * 1024, `${Buffer.byteLength(line)} bytes`)
+  })
+
+  it('C2: held names are capped at 100 in all across datasets; heldCount and the per-dataset counts stay whole', () => {
+    const datasets = Array.from({ length: 40 }, (_, d) => {
+      const held = Array.from({ length: 60 }, (_, i) => ({
+        name: formatScheduledName('hourly', new Date(Date.UTC(2026, 3, 1) + i * 3600_000)),
+        target: { kind: 'zfs' as const, dataset: `tank/c${d}` },
+        bucket: 'hourly' as const,
+        createdAt: null,
+        held: true,
+        source: 'anas' as const,
+      }))
+      return { dataset: `tank/c${d}`, scope: 'sweep' as const, pruned: [], skippedHeld: held, refused: 0 }
+    })
+    const result = recursiveRunResult(sched(), H3, { pruned: [], skippedHeld: datasets.flatMap(d => d.skippedHeld), datasets })
+    assert.equal(result.skippedHeld.length, HELD_NAMES_TOTAL)
+    assert.equal(result.heldCount, 40 * 60)
+    assert.ok(result.datasets!.every(d => d.held === 60))
+  })
+
+  it('PINNED ruling (C10a): a child\'s own NON-recursive hourly schedule destroys a parent recursive DAILY schedule\'s daily snapshots on that child (absent bucket = keep 0)', async () => {
+    // tank (daily, recursive) took D1/D2 on tank/media; tank/media's own
+    // hourly schedule ({ hourly: 24 }, no daily count) prunes with its FULL
+    // policy, which keeps 0 dailies. The newest-overall guarantee protects an
+    // hourly here, not a daily. Pinned as current behaviour, not endorsed.
+    const D2 = 'anas-daily-2026-07-26T000000Z'
+    const executor = new MockExecutor()
+    executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs', 'tank/media'], result: {
+      stdout: [D1, D2, H1, H2, H3].map(l => `tank/media@${l}\t1769385600\t0`).join('\n'),
+      stderr: '',
+      exitCode: 0,
+    } })
+    executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
+    const res = await pruneSnapshots(executor, ZFS_TARGET, { hourly: 24 }, { now: PRUNE_NOW })
+    assert.deepEqual(res.pruned.map(s => s.name).sort(), [D1, D2].sort())
+    const destroys = executor.calls.filter(c => c.args[0] === 'destroy').map(c => c.args[1]).sort()
+    assert.deepEqual(destroys, [`tank/media@${D1}`, `tank/media@${D2}`].sort())
+  })
+
+  it('PINNED ruling (C10b): an UNHELD replication base on a swept child is pruned by policy — the hold is what protects it', () => {
+    // tank/a@H1 was the replication base; its hold is gone (userrefs 0), so
+    // nothing marks it — the schedule's hourly:1 prunes it like any other.
+    const plans = plan(tree(['tank', 'tank/a']))
+    assert.deepEqual(byDs(plans, 'tank/a')!.prune.map(s => s.name).sort(), [H1, H2])
+    // With the hold in place the same snapshot is set aside (and reported).
+    const held = plan(tree(['tank'], [row('tank/a', H1, 100, 1), row('tank/a', H2, 200), row('tank/a', H3, 300)]))
+    assert.deepEqual(byDs(held, 'tank/a')!.prune.map(s => s.name), [H2])
+    assert.deepEqual(byDs(held, 'tank/a')!.skippedHeld.map(s => s.name), [H1])
   })
 })

@@ -1,7 +1,7 @@
 import type { Page } from '@playwright/test'
 import { expect, test } from '@playwright/test'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
-import { createSnapshot, destroySnapshot, listSnapshots, poolExists } from './fixtures/stunt-node'
+import { createSnapshot, destroySnapshot, listSnapshots, poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
 
 /**
  * Epic 5 (ZFS Snapshots), stories 5.1–5.6 — full-chain ExtJS specs driven through
@@ -33,7 +33,7 @@ const SNAP_NAMES = ['uisnap1', 'uisnap2']
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off) — poolExists swallows SSH failures and returns false.
 test.beforeEach(async () => {
-  test.skip(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 })
 
 /**

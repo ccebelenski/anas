@@ -888,7 +888,11 @@ function snapxGets() {
   ok('snapx: …and no recursive key', !('recursive' in second.body), JSON.stringify(second.body))
 }
 
-// --- 21. Recursive with nothing excluded sends no exclude key -------------------
+// --- 21. Recursive with nothing excluded sends `exclude: []` --------------------
+// 0.4.2 test-review C5: the daemon keeps the STORED list when a PUT body has
+// no `exclude` key (a 0.4.1 UI's toggle/edit), so this UI always sends the key
+// on a recursive ZFS schedule — `[]` when nothing is excluded — or clearing
+// the list in the dialog would be ignored. (The daemon stores `[]` as no list.)
 {
   reset()
   state.get = snapxGets()
@@ -899,7 +903,48 @@ function snapxGets() {
   pressSave(win)
   const body = (state.requests[0] || { body: {} }).body
   eq('snapx: recursive alone is the plain -r body', body.recursive, true)
-  ok('snapx: with no exclude key (the stored unit stays byte-identical)', !('exclude' in body), JSON.stringify(body))
+  eq('snapx: with an explicit empty exclude list', JSON.stringify(body.exclude), '[]')
+}
+
+// --- 21b. Edit: clearing every pick sends `exclude: []` (not an absent key) -----
+{
+  reset()
+  state.get = snapxGets()
+  const win = await openSchedule({
+    id: 'hourly-tank',
+    name: 'Hourly tank',
+    target: { kind: 'zfs', dataset: 'tank' },
+    cadence: 'hourly',
+    retention: { hourly: 24 },
+    recursive: true,
+    exclude: ['tank/pve'],
+    notify: 'on-failure',
+    enabled: true,
+  })
+  win.down('#exclude').setValue([])
+  pressSave(win)
+  const put = state.requests[0] || { body: {} }
+  eq('snapx(edit): a cleared list is saved as a PUT', put.method, 'put')
+  eq('snapx(edit): …carrying exclude: []', JSON.stringify(put.body.exclude), '[]')
+}
+
+// --- 21c. Toggle of a recursive schedule with no list sends `exclude: []` ------
+{
+  reset()
+  const sched = {
+    id: 'hourly-tank',
+    name: 'Hourly tank',
+    target: { kind: 'zfs', dataset: 'tank' },
+    cadence: 'hourly',
+    retention: { hourly: 24 },
+    recursive: true,
+    notify: 'on-failure',
+    enabled: true,
+  }
+  const row = ANAS.schedules.scheduleRow({ schedule: sched, lastRunResult: 'success' })
+  ANAS.schedules.toggle('n1', fakeGrid(), { get: k => row[k] })
+  const put = state.requests[0] || { body: {} }
+  eq('snapx(toggle): a recursive ZFS toggle always sends the key', JSON.stringify(put.body.exclude), '[]')
 }
 
 // --- 22. Edit: the stored list seeds the picker; a lost entry stays, marked -----

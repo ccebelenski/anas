@@ -1013,5 +1013,106 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
         await restore()
       }
     })
+
+    // 0.4.2 test-review C5 — mixed-version safety: a 0.4.1 UI's PUT rebuilds
+    // the body without `exclude`; on a full replace that dropped the list.
+    it('a PUT with NO exclude key keeps the stored list; `exclude: []` clears it', async () => {
+      const { restore } = await storageCfg(null)
+      try {
+        armTree()
+        const created = await create({ ...X, exclude: ['testpool/x/media'] })
+        assert.equal(created.statusCode, 202, created.body)
+        await waitForJob(server, created.json().job.id)
+        const unit = async () => parseServiceUnit(await readFile(join(dir, 'anas-snap-hourly-x.service'), 'utf-8'))
+        const put = (payload: unknown) => server.inject({ method: 'PUT', url: '/v1/schedules/hourly-x', headers: JSON_HEADERS, payload: JSON.stringify(payload) })
+
+        // A 0.4.1 toggle: the key is absent.
+        const toggled = await put({ ...X, enabled: false })
+        assert.equal(toggled.statusCode, 202, toggled.body)
+        assert.equal((await waitForJob(server, toggled.json().job.id)).status, 'completed')
+        assert.equal((await unit())?.enabled, false)
+        assert.deepEqual((await unit())?.exclude, ['testpool/x/media'], 'absent key keeps the stored list')
+
+        // The 0.4.2 UI clearing the list: the key is present and empty.
+        const cleared = await put({ ...X, enabled: false, exclude: [] })
+        assert.equal(cleared.statusCode, 202, cleared.body)
+        assert.equal((await waitForJob(server, cleared.json().job.id)).status, 'completed')
+        const after = await unit()
+        assert.equal(after?.exclude, undefined, 'present-and-empty clears it')
+        // An empty list is stored as no list: the unit is the plain -r one.
+        assert.doesNotMatch(await readFile(join(dir, 'anas-snap-hourly-x.service'), 'utf-8'), /"exclude"/)
+
+        // Absent again on a schedule with no stored list: nothing appears.
+        const again = await put({ ...X })
+        assert.equal(again.statusCode, 202, again.body)
+        await waitForJob(server, again.json().job.id)
+        assert.equal((await unit())?.exclude, undefined)
+      }
+      finally {
+        await restore()
+      }
+    })
+
+    // 0.4.2 test-review C3 — two same-bucket schedules firing in one minute
+    // race: the other run already destroyed the snapshot. Already gone is
+    // pruned, in every scope, with no error and no note.
+    it('a destroy ZFS answers "could not find any snapshots to destroy" counts as pruned (target and swept child)', async () => {
+      const { restore } = await storageCfg(null)
+      try {
+        armTree('testpool/x\ntestpool/x/data\n')
+        const D1 = 'anas-daily-2026-07-20T000000Z'
+        const D2 = 'anas-daily-2026-07-21T000000Z'
+        const rows: string[] = []
+        for (const ds of ['testpool/x', 'testpool/x/data'])
+          rows.push(`${ds}@${D1}\t1769385600\t0\t100`, `${ds}@${D2}\t1769472000\t0\t200`)
+        const mock = mockOf(server)
+        mock.addFixture({
+          command: ZFS,
+          args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg', '-r', 'testpool/x'],
+          result: { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 },
+        })
+        const GONE = { stdout: '', stderr: 'could not find any snapshots to destroy; check snapshot names.\n', exitCode: 1 }
+        mock.addFixture({ command: ZFS, args: ['destroy', `testpool/x@${D1}`], result: GONE })
+        mock.addFixture({ command: ZFS, args: ['destroy', `testpool/x/data@${D1}`], result: GONE })
+        const created = await create({ ...X, id: 'daily-x', cadence: 'daily', retention: { daily: 1 } })
+        assert.equal(created.statusCode, 202, created.body)
+        await waitForJob(server, created.json().job.id)
+
+        const run = await server.inject({ method: 'POST', url: '/v1/schedules/daily-x/run', headers: JSON_HEADERS, payload: '{}' })
+        const done = await waitForJob(server, run.json().job.id)
+        assert.equal(done.status, 'completed', JSON.stringify(done.error))
+        const result = done.result as { pruned: string[], prunedCount: number, datasets: { dataset: string, scope: string, pruned: number, held: number, refused?: number, note?: string }[] }
+        assert.equal(result.prunedCount, 2)
+        assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x'), { dataset: 'testpool/x', scope: 'target', pruned: 1, held: 0 })
+        assert.deepEqual(result.datasets.find(d => d.dataset === 'testpool/x/data'), { dataset: 'testpool/x/data', scope: 'sweep', pruned: 1, held: 0 })
+      }
+      finally {
+        await restore()
+      }
+    })
+
+    it('an already-gone destroy on a NON-recursive fire counts as pruned too', async () => {
+      const { restore } = await storageCfg(null)
+      try {
+        const D1 = 'anas-daily-2026-07-20T000000Z'
+        const D2 = 'anas-daily-2026-07-21T000000Z'
+        const mock = mockOf(server)
+        mock.addFixture({
+          command: ZFS,
+          args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs', 'testpool/media'],
+          result: { stdout: `testpool/media@${D1}\t1769385600\t0\ntestpool/media@${D2}\t1769472000\t0\n`, stderr: '', exitCode: 0 },
+        })
+        mock.addFixture({ command: ZFS, args: ['destroy', `testpool/media@${D1}`], result: { stdout: '', stderr: 'could not find any snapshots to destroy; check snapshot names.\n', exitCode: 1 } })
+        const created = await create({ ...SCHEDULE, id: 'flat-media', retention: { daily: 1 } })
+        await waitForJob(server, created.json().job.id)
+        const run = await server.inject({ method: 'POST', url: '/v1/schedules/flat-media/run', headers: JSON_HEADERS, payload: '{}' })
+        const done = await waitForJob(server, run.json().job.id)
+        assert.equal(done.status, 'completed', JSON.stringify(done.error))
+        assert.deepEqual((done.result as { pruned: string[] }).pruned, [D1])
+      }
+      finally {
+        await restore()
+      }
+    })
   })
 })

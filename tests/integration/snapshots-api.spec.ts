@@ -5,6 +5,7 @@ import {
   getDatasetMountpoint,
   listSnapshots,
   poolExists,
+  skipIfFixtureMissing,
   snapshotExists,
   sshExec,
 } from './fixtures/stunt-node'
@@ -66,7 +67,7 @@ async function authedContext(
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off). poolExists swallows SSH failures → skips when the node is off.
 test.beforeEach(async () => {
-  test.skip(!(await poolExists(POOL)), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists(POOL)), 'testpool not present — run setup-test-data.sh')
 })
 
 // Tear down every snapshot we might have created + the rollback marker file,

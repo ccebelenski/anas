@@ -5,6 +5,7 @@ import {
   destroyPool,
   listSpareDisks,
   poolExists,
+  skipIfFixtureMissing,
   sshExec,
 } from './fixtures/stunt-node'
 
@@ -33,7 +34,7 @@ import {
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off) — poolExists swallows SSH failures and returns false.
 test.beforeEach(async () => {
-  test.skip(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 })
 
 const SELECTION_ACTIONS = [
@@ -162,7 +163,7 @@ test.describe.serial('ANAS pool export safety (throwaway pool)', () => {
     // Pre-clean BEFORE counting spares so a leftover throwaway frees its disk.
     await destroyPool(THROW)
     spares = await listSpareDisks()
-    test.skip(spares.length < 1, 'no spare disks — attach one with add-disk.sh')
+    skipIfFixtureMissing(spares.length < 1, 'no spare disks — attach one with add-disk.sh')
     await createTestPool(THROW, [spares[0]])
     // A child dataset makes export a genuine (consequential) confirmation.
     await sshExec(`zfs create ${THROW}/child`).catch(() => {})

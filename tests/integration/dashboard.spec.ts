@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
-import { poolExists } from './fixtures/stunt-node'
+import { poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
 
 /**
  * Epic 2 (stories 2.1–2.7) + gfx retrofit 15.5 — the ANAS Dashboard. Full-chain
@@ -27,7 +27,7 @@ import { poolExists } from './fixtures/stunt-node'
  */
 
 test.beforeEach(async () => {
-  test.skip(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 })
 
 test.describe('ANAS dashboard (stunt node)', () => {

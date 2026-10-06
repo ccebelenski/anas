@@ -7,6 +7,7 @@ import {
   getRootPool,
   listSpareDisks,
   poolExists,
+  skipIfFixtureMissing,
   sshExec,
 } from './fixtures/stunt-node'
 
@@ -60,7 +61,7 @@ async function authedContext(
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off). Mirrors pve-native-ui.spec.ts and scrub-era specs.
 test.beforeEach(async () => {
-  test.skip(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 })
 
 test.describe('Pool safety confirmation — challenge (no mutation)', () => {
@@ -188,7 +189,7 @@ test.describe('Pool create / destroy / export / import (spare disks)', () => {
   })
 
   test('creates a pool via the API, then destroys it through the confirmation flow (3.8, 3.14)', async ({ playwright, pveTicket }) => {
-    test.skip(spares.length < 1, 'no spare disks — attach one with add-disk.sh')
+    skipIfFixtureMissing(spares.length < 1, 'no spare disks — attach one with add-disk.sh')
     const ctx = await authedContext(playwright, pveTicket)
     try {
       // Create — 202 job, then the pool really appears (async job).
@@ -235,7 +236,7 @@ test.describe('Pool create / destroy / export / import (spare disks)', () => {
   })
 
   test('exports a pool through the confirmation flow (3.13)', async ({ playwright, pveTicket }) => {
-    test.skip(spares.length < 1, 'no spare disks — attach one with add-disk.sh')
+    skipIfFixtureMissing(spares.length < 1, 'no spare disks — attach one with add-disk.sh')
     const ctx = await authedContext(playwright, pveTicket)
     try {
       // Stage a disposable, consequential pool directly (not the create path).
@@ -264,7 +265,7 @@ test.describe('Pool create / destroy / export / import (spare disks)', () => {
   })
 
   test('imports a known (exported) pool (3.7)', async ({ playwright, pveTicket }) => {
-    test.skip(spares.length < 1, 'no spare disks — attach one with add-disk.sh')
+    skipIfFixtureMissing(spares.length < 1, 'no spare disks — attach one with add-disk.sh')
     const ctx = await authedContext(playwright, pveTicket)
     try {
       // Stage a pool, then export it so it becomes importable but absent.
@@ -286,7 +287,7 @@ test.describe('Pool create / destroy / export / import (spare disks)', () => {
   })
 
   test('adds a vdev to a pool (3.11)', async ({ playwright, pveTicket }) => {
-    test.skip(spares.length < 2, 'need 2 spare disks — attach more with add-disk.sh')
+    skipIfFixtureMissing(spares.length < 2, 'need 2 spare disks — attach more with add-disk.sh')
     const ctx = await authedContext(playwright, pveTicket)
     try {
       // Stage a single-disk stripe, then add a second stripe vdev via the API.

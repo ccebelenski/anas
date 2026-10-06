@@ -1761,6 +1761,8 @@
 
     ANAS.backup = ANAS.backup || {};
     ANAS.backup.reload = loadTasks;
+    // The grid's Last run cell, exposed for the pill harness (lastrun-pill.harness.mjs).
+    ANAS.backup.renderLastRun = renderLastRun;
     // The second doors (a door opens the EXISTING dialog, never a second
     // implementation): the iSCSI LUN toolbar (75-iscsi.js) reaches in here.
     // runTaskNow is the Backup menu's Run Now on a task name; openEditTask is

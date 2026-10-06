@@ -1492,7 +1492,9 @@ describe('backup routes (Epic 16)', () => {
 
   /** Make the daemon see this run as a TIMER fire (see classifyTrigger). */
   function scheduleTrigger(name: string, when: Date): void {
-    const stamp = when.toUTCString()
+    // systemd's own form under TZ=UTC (every show runs so): `Tue 2026-10-06 02:00:00 UTC`.
+    const iso = when.toISOString()
+    const stamp = `${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][when.getUTCDay()]} ${iso.slice(0, 10)} ${iso.slice(11, 19)} UTC`
     const mock = mockOf(server)
     mock.addFixture({ command: '/usr/bin/systemctl', args: ['show', `anas-backup-${name}.timer`, '-p', 'LastTriggerUSec'], result: { stdout: `LastTriggerUSec=${stamp}\n`, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/systemctl', args: ['show', `anas-backup-${name}.service`, '-p', 'InactiveExitTimestamp'], result: { stdout: `InactiveExitTimestamp=${stamp}\n`, stderr: '', exitCode: 0 } })

@@ -7,6 +7,7 @@ import {
   getDatasetMountpoint,
   getDatasetProp,
   poolExists,
+  skipIfFixtureMissing,
   sshExec,
   statOwnership,
 } from './fixtures/stunt-node'
@@ -62,7 +63,7 @@ async function authedContext(
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off). Mirrors the pool specs.
 test.beforeEach(async () => {
-  test.skip(!(await poolExists(POOL)), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists(POOL)), 'testpool not present — run setup-test-data.sh')
 })
 
 // Always tear the throwaway dataset (and any children) down, even on failure, so

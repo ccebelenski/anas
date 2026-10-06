@@ -11,6 +11,7 @@ import {
   poolExists,
   removeShareUser,
   resetDatasetAccess,
+  skipIfFixtureMissing,
   sshExec,
 } from './fixtures/stunt-node'
 
@@ -55,7 +56,7 @@ const PU = 'itest_pu'
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off) — poolExists swallows SSH failures and returns false.
 test.beforeEach(async () => {
-  test.skip(!(await poolExists(POOL)), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists(POOL)), 'testpool not present — run setup-test-data.sh')
 })
 
 // ---------------------------------------------------------------------------

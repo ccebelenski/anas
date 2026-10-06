@@ -1,7 +1,7 @@
 import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
 import { expect, pveAuthState, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
-import { datasetExists, poolExists, releaseHolds, sshExec } from './fixtures/stunt-node'
+import { datasetExists, poolExists, releaseHolds, skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
 /**
  * snapx.1 (GitHub #71) — the exclude list on a recursive schedule, proven at
@@ -42,6 +42,8 @@ const SCHED_ID = 'snapx-api-proof'
 const OLD_A = 'anas-hourly-2026-01-01T000000Z'
 const OLD_B = 'anas-hourly-2026-01-01T010000Z'
 const HOLD_TAG = 'snapprune-proof'
+/** A replication target under the excluded child (C11 provenance proof). */
+const REPLICA = `${CHILD}/replica`
 const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
 
 interface RunDatasetCounts { dataset: string, scope: string, pruned: number, held: number, note?: string }
@@ -109,12 +111,23 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
   let ctx: APIRequestContext
 
   test.beforeAll(async ({ playwright, pveTicket }) => {
-    test.skip(
+    skipIfFixtureMissing(
       !(await poolExists(PVE_POOL)) || !(await datasetExists(CHILD)),
       'pvepool fixture not present — run test/stunt-node/pvepool-fixture.sh up',
     )
     ctx = await authed(playwright, pveTicket)
     await deleteSchedule(ctx)
+    // Another ENABLED schedule on the node changes what this spec proves
+    // (snapprune.1 judges swept and excluded datasets by every enabled
+    // same-bucket schedule, and a timer firing mid-spec takes and prunes on
+    // its own) — refuse to run on such a node rather than prove something else.
+    const list = await ctx.get(`${V1}/schedules`)
+    expect(list.status()).toBe(200)
+    const rows = ((await list.json()) as { data: { schedule: { id: string, enabled: boolean } }[] }).data
+    const others = rows.filter(r => r.schedule.enabled && r.schedule.id !== SCHED_ID).map(r => r.schedule.id)
+    expect(others, `other enabled snapshot schedules on the node: ${others.join(', ')}`).toEqual([])
+    if (await datasetExists(REPLICA))
+      await sshExec(`zfs destroy -r ${REPLICA}`)
     for (const ds of [GRANDCHILD, SIBLING, NESTED_ROOT]) {
       if (!(await datasetExists(ds)))
         await sshExec(`zfs create ${ds}`)
@@ -133,7 +146,7 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
     if (await storageRegistered(NESTED_STORAGE))
       await sshExec(`pvesm remove ${NESTED_STORAGE}`)
     await destroyAnasSnapshotsUnder(TARGET)
-    for (const ds of [GRANDCHILD, SIBLING, NESTED_ROOT]) {
+    for (const ds of [REPLICA, GRANDCHILD, SIBLING, NESTED_ROOT]) {
       if (await datasetExists(ds))
         await sshExec(`zfs destroy -r ${ds}`)
     }
@@ -251,6 +264,39 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
     finally {
       await releaseHolds(SIBLING)
       await sshExec(`zfs list -H -o name -t snapshot -r ${NESTED_ROOT} 2>/dev/null | grep '@anas-hourly-2026-01-01T' | xargs -r -n1 zfs destroy || true`)
+    }
+  })
+
+  test('provenance: a RECEIVED snapshot carrying the schedule\'s name on an excluded dataset survives, noted', async () => {
+    // A replica of the kept sibling, received under the excluded child: its
+    // snapshot has this schedule's name and the sibling's creation time, but
+    // its own createtxg — it was not taken by this schedule.
+    const sibling = (await anasSnapshots(SIBLING)).filter(n => !n.startsWith('anas-hourly-2026-01-01T')).sort()
+    const snap = sibling.at(-1)
+    expect(snap, 'the sibling carries a snapshot this schedule took').toBeTruthy()
+    await sshExec(`zfs send ${SIBLING}@${snap} | zfs recv ${REPLICA}`)
+    try {
+      const props = async (full: string) => (await sshExec(`zfs get -Hp -o value createtxg,creation ${full}`)).split('\n')
+      const [srcTxg, srcCreation] = await props(`${SIBLING}@${snap}`)
+      const [rcvTxg, rcvCreation] = await props(`${REPLICA}@${snap}`)
+      console.warn(`provenance: ${SIBLING}@${snap} createtxg=${srcTxg} creation=${srcCreation}; ${REPLICA}@${snap} createtxg=${rcvTxg} creation=${rcvCreation}`)
+      expect(rcvTxg).not.toBe(srcTxg)
+
+      await new Promise(r => setTimeout(r, 1500))
+      const res = await ctx.post(`${V1}/schedules/${SCHED_ID}/run`)
+      expect(res.status()).toBe(202)
+      const { job } = await res.json() as JobRes
+      const done = await waitJob(ctx, job.id)
+      expect(done.status, JSON.stringify(done.error ?? '')).toBe('completed')
+
+      expect(await anasSnapshots(REPLICA)).toEqual([snap])
+      const entry = (done.result?.datasets ?? []).find(d => d.dataset === REPLICA)
+      expect(entry, JSON.stringify(done.result?.datasets)).toMatchObject({ scope: 'excluded', pruned: 0, held: 0 })
+      expect(entry?.note).toMatch(/1 left: not taken by this schedule/)
+    }
+    finally {
+      if (await datasetExists(REPLICA))
+        await sshExec(`zfs destroy -r ${REPLICA}`)
     }
   })
 })

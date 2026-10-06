@@ -8,6 +8,7 @@ import {
   removeDir,
   removeNfsExport,
   removeSmbShare,
+  skipIfFixtureMissing,
   smbShareExists,
   sshExec,
 } from './fixtures/stunt-node'
@@ -50,7 +51,7 @@ const NFS_ITEST_DIR = '/testpool/itest_nfs'
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off) — poolExists swallows SSH failures and returns false.
 test.beforeEach(async () => {
-  test.skip(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 })
 
 /**

@@ -337,7 +337,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid snapshot schedule: ${bodyParsed.error.issues[0]?.message}` } }
     }
-    const schedule = bodyParsed.data
+    let schedule = bodyParsed.data
     // The URL is the identity; a body renaming the id is rejected (rename =
     // delete + create, not an in-place edit).
     if (schedule.id !== id) {
@@ -373,6 +373,17 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
         },
       }
     }
+    // Mixed-version safety (0.4.2): a 0.4.1 UI knows nothing of `exclude`, and
+    // its toggle/edit PUT rebuilds the body without the key — on a full
+    // replace that silently dropped the stored list. An ABSENT key therefore
+    // keeps the stored list (a recursive ZFS schedule only — the only kind
+    // that can carry one); a PRESENT key, `[]` included, is the new list. The
+    // 0.4.2 UI always sends the key on a recursive ZFS schedule.
+    const body = request.body as Record<string, unknown> | null | undefined
+    const excludeAbsent = !body || typeof body !== 'object' || !Object.hasOwn(body, 'exclude')
+    if (excludeAbsent && schedule.recursive === true && schedule.target.kind === 'zfs' && stored?.exclude?.length)
+      schedule = { ...schedule, exclude: stored.exclude }
+
     if (!(await guardTarget(schedule.target, schedule.recursive === true, reply, schedule.exclude, stored?.exclude)))
       return reply
 

@@ -318,6 +318,18 @@ export type PruneScope = z.infer<typeof PruneScope>
 /** At most this many names per dataset ride in a run result's `pruned` and `skippedHeld`. */
 export const PRUNED_NAMES_PER_DATASET = 50
 
+/**
+ * At most this many names in a run result's `pruned` IN ALL, across every
+ * dataset. The result is also the runner's journald line, and journald splits
+ * a line past `LineMax` (48 KiB) — a first run over 20+ children capped only
+ * per dataset outgrew it, and the status rung could no longer parse the line.
+ * The per-dataset counts (`datasets[]`) and `prunedCount` keep the record.
+ */
+export const PRUNED_NAMES_TOTAL = 200
+
+/** At most this many names in a run result's `skippedHeld` in all ({@link PRUNED_NAMES_TOTAL}). */
+export const HELD_NAMES_TOTAL = 100
+
 /** One dataset's line in a recursive run result (snapprune.1), in counts. */
 export const SnapshotScheduleRunDataset = z.object({
   dataset: z.string(),
@@ -349,8 +361,8 @@ export const SnapshotScheduleRunResult = z.object({
    * Snapshots pruned by retention: the bare label for the schedule's target,
    * `<dataset>@<label>` for any other dataset (a recursive schedule prunes its
    * whole sweep — snapprune.1). At most {@link PRUNED_NAMES_PER_DATASET} names
-   * per dataset (a first run after an upgrade can destroy thousands); the
-   * real total is `prunedCount`.
+   * per dataset and {@link PRUNED_NAMES_TOTAL} in all (a first run after an
+   * upgrade can destroy thousands); the real total is `prunedCount`.
    */
   pruned: z.array(z.string()),
   /**
@@ -360,7 +372,8 @@ export const SnapshotScheduleRunResult = z.object({
   prunedCount: z.number().int().nonnegative().optional(),
   /**
    * Held snapshots retained despite policy (surfaced as intentional), named
-   * and capped per dataset as `pruned`; the real total is `heldCount`.
+   * and capped per dataset as `pruned`, and {@link HELD_NAMES_TOTAL} in all;
+   * the real total is `heldCount`.
    */
   skippedHeld: z.array(z.string()),
   /**

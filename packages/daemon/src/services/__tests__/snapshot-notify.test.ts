@@ -320,3 +320,47 @@ describe('snapshot schedule notifications — emission (9.4)', () => {
     await assert.doesNotReject(notifyScheduleRun(executor, { schedule: makeSchedule(), error: 'boom' }))
   })
 })
+
+describe('snapshot schedule notifications — 0.4.2 test-review fixes', () => {
+  // C4: the "schedule list unreadable" fail-safe left swept children unpruned
+  // that run; a quiet success would hide it until they piled up.
+  it('the schedule-list fail-safe engaged makes the run a warning — mailed even on `on-failure`', async () => {
+    const result = {
+      ...CLEAN_RUN,
+      datasets: [
+        { dataset: 'testpool/media', scope: 'target' as const, pruned: 1, held: 0 },
+        { dataset: 'testpool/media/a', scope: 'sweep' as const, pruned: 0, held: 0, note: '3 left: schedule list unreadable' },
+      ],
+    }
+    const schedule = makeSchedule({ recursive: true, notify: 'on-failure' })
+    assert.equal(snapshotNotifyOutcome({ schedule, result }), 'warning')
+    assert.match(buildSnapshotNotifyBody({ schedule, result }), /Result:\s+completed with warnings/)
+    const executor = new MockExecutor()
+    executor.addFixture({ command: PERL, result: { stdout: '', stderr: '', exitCode: 0 } })
+    await notifyScheduleRun(executor, { schedule, result })
+    assert.equal(executor.calls.length, 1)
+    assert.equal(executor.calls[0].args[2], 'warning')
+    // An excluded dataset carrying the note is the same fail-safe.
+    const excluded = { ...CLEAN_RUN, datasets: [{ dataset: 'testpool/media/b', scope: 'excluded' as const, pruned: 0, held: 0, note: '2 left: schedule list unreadable' }] }
+    assert.equal(snapshotNotifyOutcome({ schedule, result: excluded }), 'warning')
+    // Other notes (left to a covering schedule, not taken by this one) stay quiet.
+    const covered = { ...CLEAN_RUN, datasets: [{ dataset: 'testpool/media/b', scope: 'excluded' as const, pruned: 0, held: 0, note: '2 left to schedule \'daily-b\'' }] }
+    assert.equal(snapshotNotifyOutcome({ schedule, result: covered }), 'success')
+  })
+
+  // C2: the "Per dataset:" section is capped too.
+  it('a 2000-dataset run: at most 100 per-dataset lines plus a count, body under 100 KiB', () => {
+    const datasets = Array.from({ length: 2000 }, (_, i) => ({
+      dataset: `testpool/media/child-dataset-with-a-long-name-${String(i).padStart(4, '0')}`,
+      scope: (i === 0 ? 'target' : 'sweep') as 'target' | 'sweep',
+      pruned: 99,
+      held: 0,
+    }))
+    const result = { ...CLEAN_RUN, pruned: CLEAN_RUN.pruned, prunedCount: 2000 * 99, datasets }
+    const body = buildSnapshotNotifyBody({ schedule: makeSchedule({ recursive: true }), result })
+    const section = body.split('Per dataset:\n')[1].split('\n\n')[0].split('\n')
+    assert.equal(section.length, 101)
+    assert.equal(section.at(-1), '  ... and 1900 more datasets')
+    assert.ok(Buffer.byteLength(body) < 100 * 1024, `${Buffer.byteLength(body)} bytes`)
+  })
+})

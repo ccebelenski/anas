@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
-import { poolExists } from './fixtures/stunt-node'
+import { poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
 
 /**
  * Epic 15.4 — enriched Datasets tree (gfx retrofit) driven through the real PVE
@@ -26,7 +26,7 @@ import { poolExists } from './fixtures/stunt-node'
  */
 
 test.beforeEach(async () => {
-  test.skip(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 })
 
 test.describe('ANAS Datasets enriched tree — Epic 15.4 gfx retrofit', () => {

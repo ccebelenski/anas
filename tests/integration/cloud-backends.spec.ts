@@ -4,7 +4,7 @@ import { promisify } from 'node:util'
 import { expect, test } from '@playwright/test'
 import { apiCtx, taskNames, V1 } from './fixtures/cloud-api'
 import { runCloudBackendProof } from './fixtures/cloud-runner'
-import { sshExec } from './fixtures/stunt-node'
+import { skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
 const execFileAsync = promisify(execFile)
 
@@ -181,7 +181,7 @@ test.beforeAll(async () => {
 test.beforeEach(async () => {
   // The fixture's source directory is the "fixture present" signal (all four
   // ups rebuild it; s3 is up first but smb/webdav/ftp rebuild it too).
-  test.skip(
+  skipIfFixtureMissing(
     !(await sshExec(`test -d /var/tmp/anas-gtcloud-src && echo yes`).then(() => true).catch(() => false)),
     `cloud backends fixture not present — run ${FIXTURE_SH} up all`,
   )

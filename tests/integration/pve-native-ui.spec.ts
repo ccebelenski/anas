@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { anasGroup, loginToPve, NODE_NAME, openAnasItem, selectNode } from './fixtures/pve-ui'
-import { getZpoolStatus, poolExists, sshExec } from './fixtures/stunt-node'
+import { getZpoolStatus, poolExists, skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
 /**
  * Stories 13.9–13.14 — the native ExtJS panels, verified end-to-end through the
@@ -25,7 +25,7 @@ import { getZpoolStatus, poolExists, sshExec } from './fixtures/stunt-node'
 // via the poolExists helper. This also covers the stunt node being off:
 // poolExists swallows SSH failures and returns false → the file skips cleanly.
 test.beforeEach(async () => {
-  test.skip(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 })
 
 test.describe('ANAS native panels (stunt node)', () => {

@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { test } from '@playwright/test'
 import { STUNT_HOST } from './target'
 
 const execFileAsync = promisify(execFile)
@@ -26,6 +27,30 @@ export async function sshExec(command: string): Promise<string> {
     { timeout: 30_000 },
   )
   return stdout.trim()
+}
+
+/**
+ * Is this a proof run, where a missing fixture must FAIL rather than skip?
+ * `test/stunt-node/run-tests.sh` sets `ANAS_REQUIRE_FIXTURES=1`.
+ */
+export function fixturesRequired(): boolean {
+  return process.env.ANAS_REQUIRE_FIXTURES === '1'
+}
+
+/**
+ * THE "fixture not present" guard — same arguments as `test.skip(condition,
+ * reason)`. Ad hoc it skips; in a proof run (`ANAS_REQUIRE_FIXTURES=1`) it
+ * THROWS, so a fixture that fell over can never turn a red proof into a quiet
+ * skip. Use it for every guard whose cause a fixture script (or `add-disk.sh`)
+ * provides; a node property no script provides (e.g. a ZFS root) stays a
+ * plain `test.skip`.
+ */
+export function skipIfFixtureMissing(missing: boolean, reason: string): void {
+  if (!missing)
+    return
+  if (fixturesRequired())
+    throw new Error(`fixture required (ANAS_REQUIRE_FIXTURES=1): ${reason}`)
+  test.skip(true, reason)
 }
 
 /**

@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
-import { poolExists } from './fixtures/stunt-node'
+import { poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
 
 /**
  * Stories 3.25 / 3.26 — ANAS recognizes pools PVE already manages (read from
@@ -17,8 +17,8 @@ import { poolExists } from './fixtures/stunt-node'
 const DISABLED = /x-item-disabled|x-btn-disabled/
 
 test.beforeEach(async () => {
-  test.skip(!(await poolExists('datapool')), 'datapool (PVE-managed) not present — add a zfspool storage')
-  test.skip(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists('datapool')), 'datapool (PVE-managed) not present — add a zfspool storage')
+  skipIfFixtureMissing(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 })
 
 test.describe('ANAS PVE-managed pools (stunt node)', () => {

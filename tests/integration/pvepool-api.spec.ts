@@ -5,6 +5,7 @@ import {
   datasetExists,
   destroyDataset,
   poolExists,
+  skipIfFixtureMissing,
   sshExec,
 } from './fixtures/stunt-node'
 
@@ -108,7 +109,7 @@ async function destroyViaApi(
 
 // Skip the whole file when the fixture is absent (fixture not built / node off).
 test.beforeEach(async () => {
-  test.skip(!(await poolExists(PVE_POOL)) || !(await poolExists(SYS_POOL)), 'pvepool fixture not present — run test/stunt-node/pvepool-fixture.sh up')
+  skipIfFixtureMissing(!(await poolExists(PVE_POOL)) || !(await poolExists(SYS_POOL)), 'pvepool fixture not present — run test/stunt-node/pvepool-fixture.sh up')
 })
 
 // ---------------------------------------------------------------------------

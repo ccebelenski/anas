@@ -4,7 +4,7 @@ import { promisify } from 'node:util'
 import { expect, test } from '@playwright/test'
 import { apiCtx, awaitJob, getJob, remoteNames, runJob, taskNames, taskRowByName, V1 } from './fixtures/cloud-api'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
-import { sshExec } from './fixtures/stunt-node'
+import { skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
 const execFileAsync = promisify(execFile)
 
@@ -212,7 +212,7 @@ test.beforeEach(async () => {
   // The fixture user is the "fixture present" signal (as in the other cloud
   // specs). The rclone STORE is deliberately absent from that check: on this
   // node it is never the fixture's business.
-  test.skip(
+  skipIfFixtureMissing(
     !(await sshExec('id -u rclonegt').then(() => true).catch(() => false)),
     `cloud cancel fixture not present — run ${FIXTURE_SH} up cancel`,
   )

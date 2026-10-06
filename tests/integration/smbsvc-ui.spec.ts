@@ -7,6 +7,7 @@ import {
   datasetExists,
   removeShareUser,
   removeSmbShare,
+  skipIfFixtureMissing,
   sshExec,
 } from './fixtures/stunt-node'
 
@@ -213,7 +214,7 @@ test.beforeEach(async () => {
   // afterAll tears the fixture down; the next worker re-ups it here.
   if (!(await datasetExists(DATASET)))
     await execFileAsync(FIXTURE_SH, ['up']).catch(() => {})
-  test.skip(!(await datasetExists(DATASET)), 'smbsvc fixture not present — run test/stunt-node/smbsvc-fixture.sh up')
+  skipIfFixtureMissing(!(await datasetExists(DATASET)), 'smbsvc fixture not present — run test/stunt-node/smbsvc-fixture.sh up')
 })
 
 test.describe('smbsvc.1 — Self-service on SMB shares (stunt node UI)', () => {

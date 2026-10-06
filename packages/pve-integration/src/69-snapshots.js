@@ -425,6 +425,8 @@
     ANAS.schedules.toggle = toggleSchedule;
     ANAS.schedules.scheduleRow = scheduleRow;
     ANAS.schedules.renderTarget = renderTarget;
+    // The grid's Last run cell, exposed for the pill harness (lastrun-pill.harness.mjs).
+    ANAS.schedules.renderLastRun = renderLastRun;
 
     // ---- Selection + toolbar state -----------------------------------------
 
@@ -1293,12 +1295,11 @@
         };
         if (kind === 'zfs' && valOf(win, '#recursive')) {
             body.recursive = true;
-            // snapx.1: sent only when something is excluded; an empty list is
-            // the plain `-r` and keeps the stored unit byte-identical.
-            var exclude = valOf(win, '#exclude') || [];
-            if (exclude.length) {
-                body.exclude = exclude.slice();
-            }
+            // The key is ALWAYS sent on a recursive ZFS schedule (`[]` when
+            // none): the daemon keeps the stored list when the key is ABSENT
+            // (a 0.4.1 UI's PUT), so clearing the list must say so. An empty
+            // list is stored as no list (the plain `-r`, unit byte-identical).
+            body.exclude = (valOf(win, '#exclude') || []).slice();
         }
 
         ANAS.runJob({
@@ -1404,10 +1405,10 @@
         };
         if (raw.recursive || (raw.target === undefined && rec.get('recursive'))) {
             body.recursive = true;
-            // snapx.1: carry the exclude list, or a toggle silently drops it.
-            var exclude = raw.exclude || rec.get('exclude') || [];
-            if (exclude.length) {
-                body.exclude = exclude.slice();
+            // snapx.1: carry the exclude list, or a toggle silently drops it —
+            // always as a key (`[]` when none), see the dialog's save.
+            if ((raw.target || targetFromRecord(rec)).kind === 'zfs') {
+                body.exclude = (raw.exclude || rec.get('exclude') || []).slice();
             }
         }
         ANAS.runJob({

@@ -1,7 +1,7 @@
 import type { Locator, Page } from '@playwright/test'
 import { expect, test } from '@playwright/test'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
-import { poolExists, sshExec } from './fixtures/stunt-node'
+import { poolExists, skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
 /**
  * Story dshero.1 (GitHub #70, UI leg) — the Pool space hero on the Datasets
@@ -41,7 +41,7 @@ const PVE_POOL = 'pvfix'
 const MAX_LEGEND_ROWS = 8
 
 test.beforeEach(async () => {
-  test.skip(
+  skipIfFixtureMissing(
     !(await poolExists(PVE_POOL)),
     'pvepool fixture not present — run test/stunt-node/pvepool-fixture.sh up',
   )
@@ -113,7 +113,8 @@ async function expectTreeKeepsHalf(page: Page, grid: Locator): Promise<void> {
   const bodyBox = await grid.locator('.x-tree-view').boundingBox()
   expect(panelBox).not.toBeNull()
   expect(bodyBox).not.toBeNull()
-  console.warn(`dshero.1 tree body ${bodyBox!.height.toFixed(0)}px of panel ${panelBox!.height.toFixed(0)}px = ${(100 * bodyBox!.height / panelBox!.height).toFixed(1)}%`)
+  const vp = page.viewportSize()
+  console.warn(`dshero.1 @${vp?.width}x${vp?.height} tree body ${bodyBox!.height.toFixed(0)}px of panel ${panelBox!.height.toFixed(0)}px = ${(100 * bodyBox!.height / panelBox!.height).toFixed(1)}%`)
   expect(bodyBox!.height).toBeGreaterThanOrEqual(panelBox!.height * 0.5)
 }
 
@@ -134,7 +135,7 @@ test.describe('dshero.1 — the cap on a pool with many datasets (#70)', () => {
   test.setTimeout(150_000)
 
   test.beforeAll(async () => {
-    test.skip(
+    skipIfFixtureMissing(
       !(await poolExists(PVE_POOL)),
       'pvepool fixture not present — run test/stunt-node/pvepool-fixture.sh up',
     )
@@ -164,5 +165,28 @@ test.describe('dshero.1 — the cap on a pool with many datasets (#70)', () => {
     expect(labels.slice(-2)).toEqual(['Proxmox storage', 'Free'])
 
     await expectTreeKeepsHalf(page, grid)
+  })
+
+  // A common laptop screen: the same bound at a second size (0.4.2 test
+  // review C8) — the 2560x1080 case alone could hide a cap that only holds
+  // on a tall screen.
+  test.describe('at 1366x768', () => {
+    test.use({ viewport: { width: 1366, height: 768 } })
+
+    test('18 datasets at 1366x768: the legend stays capped and the tree keeps half', async ({ page }) => {
+      // KNOWN FAILING, cap decision pending with the operator (0.4.2 test
+      // review C8): measured on the stunt node, the tree body is 88px of a
+      // 446px panel (19.7%) at 1366x768 with the legend at its 8-row cap —
+      // PVE's own task log takes the lower third of a 768px screen. Expected
+      // to fail until the cap (or the bound) is decided; Playwright flags it
+      // the moment it starts passing.
+      test.fail(true, 'tree body 19.7% of the panel at 1366x768 — cap decision pending')
+      const { grid, hero } = await openDatasetsOnPvfix(page)
+      const names = hero.locator('.anas-gfx-legend .anas-gfx-legend-nm')
+      await expect(names.first()).toBeVisible({ timeout: 20_000 })
+      expect((await names.allTextContents()).length).toBeLessThanOrEqual(MAX_LEGEND_ROWS)
+
+      await expectTreeKeepsHalf(page, grid)
+    })
   })
 })

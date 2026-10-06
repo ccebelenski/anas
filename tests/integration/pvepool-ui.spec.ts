@@ -1,7 +1,7 @@
 import type { Locator, Page } from '@playwright/test'
 import { expect, test } from '@playwright/test'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
-import { datasetExists, destroyDataset, poolExists } from './fixtures/stunt-node'
+import { datasetExists, destroyDataset, poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
 
 /**
  * Story pvepool.2 (GitHub #61, UI leg) — the Datasets screen on per-dataset PVE
@@ -45,7 +45,7 @@ const UI_DS = 'pvfix/ui-proof'
 const DISABLED = /x-item-disabled|x-btn-disabled/
 
 test.beforeEach(async () => {
-  test.skip(
+  skipIfFixtureMissing(
     !(await poolExists(PVE_POOL)) || !(await poolExists(SYS_POOL)),
     'pvepool fixture not present — run test/stunt-node/pvepool-fixture.sh up',
   )

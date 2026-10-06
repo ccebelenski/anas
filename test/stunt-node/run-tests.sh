@@ -19,10 +19,12 @@ echo "Deploying current ANAS build..."
 "${SCRIPT_DIR}/deploy-anas.sh"
 echo
 
-# Run Playwright tests
+# Run Playwright tests. A proof run: a spec whose fixture is not present
+# FAILS instead of skipping (tests/integration/fixtures/stunt-node.ts,
+# skipIfFixtureMissing) — a fixture that fell over never reads as green.
 echo "Running integration tests..."
 cd "$PROJECT_ROOT"
-npx playwright test --project=integration
+ANAS_REQUIRE_FIXTURES=1 npx playwright test --project=integration
 
 echo
 echo "=== Integration tests complete ==="

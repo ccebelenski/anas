@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { expect, test } from '@playwright/test'
 import { loginToPve, NODE_NAME, PVE_URL } from './fixtures/pve-ui'
-import { sshExec } from './fixtures/stunt-node'
+import { skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
 const execFileAsync = promisify(execFile)
 
@@ -247,7 +247,7 @@ test.beforeEach(async () => {
   // The fixture user is the "fixture present" signal — NOT the store, which
   // `up` deliberately removes after capturing the pre-state (every run starts
   // with no store). Mirrors the script's user_exists(): getent/id on the user.
-  test.skip(
+  skipIfFixtureMissing(
     !(await sshExec('id -u rclonegt')
       .then(() => true)
       .catch(() => false)),

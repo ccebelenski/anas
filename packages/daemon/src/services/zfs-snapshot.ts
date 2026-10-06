@@ -137,6 +137,21 @@ function failure(verb: string, r: ExecResult): Error {
   return new Error(r.stderr.trim() || `zfs ${verb} exited with code ${r.exitCode}`)
 }
 
+/**
+ * What `zfs destroy <ds>@<snap>` prints when the snapshot is not there
+ * (OpenZFS 2.4, verified on the stunt node: "could not find any snapshots to
+ * destroy; check snapshot names.").
+ */
+const SNAPSHOT_GONE_RE = /could not find any snapshots to destroy/i
+
+/**
+ * Did a destroy fail only because the snapshot is already gone? Takes the
+ * error {@link destroyZfsSnapshot} threw (its message is the stderr).
+ */
+export function isSnapshotAlreadyGone(err: unknown): boolean {
+  return SNAPSHOT_GONE_RE.test(err instanceof Error ? err.message : String(err))
+}
+
 /** Create one snapshot. Throws the command's stderr on failure. */
 export async function createZfsSnapshot(
   executor: CommandExecutor,

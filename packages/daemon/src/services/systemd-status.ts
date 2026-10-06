@@ -29,10 +29,19 @@ export type SystemdRunResult
 export const DISABLED_HISTORY_NOTE
   = 'run history is not retained while a task is disabled'
 
-/** systemd 'n/a' sentinel + a leading weekday name on a human timestamp. */
+/** systemd 'n/a' sentinel. */
 const NA_RE = /^n\/a$/i
 const INFINITY_RE = /infinity/i
-const WEEKDAY_PREFIX_RE = /^[A-Z][a-z]{2}\s+/
+/**
+ * systemd's human timestamp in a zone a parser can resolve without guessing:
+ * optional weekday, date, time (optional fraction), then `UTC`/`GMT`/`Z` or a
+ * numeric offset. Groups: date, time, fraction, zone.
+ */
+const SYSTEMD_HUMAN_TS_RE = /^(?:[A-Z][a-z]{2}\s+)?(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})(\.\d+)?\s+(UTC|GMT|Z|[+-]\d{2}:?\d{2})$/
+/** A numeric offset without its colon (`+0200`) → the ISO form (`+02:00`). */
+const OFFSET_NO_COLON_RE = /^([+-]\d{2})(\d{2})$/
+/** Microseconds since the epoch — digits only. */
+const USEC_RE = /^\d+$/
 
 /** Parse `systemctl show` `key=value` lines into a map. */
 export function parseShow(stdout: string): Record<string, string> {
@@ -50,20 +59,32 @@ export function parseShow(stdout: string): Record<string, string> {
  * these print a HUMAN date string ("Sun 2026-07-19 02:00:00 UTC"), NOT
  * microseconds (verified live) — handle both the µs form and the
  * day-name-prefixed date.
+ *
+ * **Zone-strict.** The human form carries the zone as an ABBREVIATION of the
+ * printing process's local zone, and an abbreviation cannot be resolved
+ * without guessing (Node's `Date.parse` knows UTC/GMT and the US zones only,
+ * and returns NaN for CEST, JST, AEST and the rest). Every `systemctl show`
+ * the daemon issues runs with `TZ=UTC` (`execSystemctlShow`), so the zone is
+ * always `UTC`; a value in any zone this cannot resolve exactly — UTC, GMT, Z
+ * or a numeric offset — is REJECTED (null), never guessed and never NaN.
  */
 export function parseSystemdTimestamp(raw: string | undefined): string | null {
-  if (!raw || raw === '0' || NA_RE.test(raw) || INFINITY_RE.test(raw))
+  const text = raw?.trim()
+  if (!text || text === '0' || NA_RE.test(text) || INFINITY_RE.test(text))
     return null
-  const usec = Number(raw)
-  if (Number.isFinite(usec) && usec > 0) {
-    const d = new Date(Math.floor(usec / 1000))
+  if (USEC_RE.test(text)) {
+    const d = new Date(Math.floor(Number(text) / 1000))
     return Number.isNaN(d.getTime()) ? null : d.toISOString()
   }
-  // Strip a leading weekday name ("Sun ") — Date.parse dislikes it combined with
-  // the "UTC" suffix on some engines; the rest parses cleanly.
-  const cleaned = raw.replace(WEEKDAY_PREFIX_RE, '')
-  const parsed = Date.parse(cleaned)
-  return Number.isNaN(parsed) ? null : new Date(parsed).toISOString()
+  const m = SYSTEMD_HUMAN_TS_RE.exec(text)
+  if (!m)
+    return null
+  const [, date, time, frac = '', zone] = m
+  const offset = zone === 'UTC' || zone === 'GMT' || zone === 'Z'
+    ? 'Z'
+    : zone.replace(OFFSET_NO_COLON_RE, '$1:$2')
+  const ms = Date.parse(`${date}T${time}${frac.slice(0, 4)}${offset}`)
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString()
 }
 
 /**

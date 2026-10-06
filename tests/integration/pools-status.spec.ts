@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
-import { poolExists } from './fixtures/stunt-node'
+import { poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
 
 /**
  * Epic 15.3 — Pools status view retrofit. Full-chain ExtJS specs driven through
@@ -21,7 +21,7 @@ import { poolExists } from './fixtures/stunt-node'
  */
 
 test.beforeEach(async () => {
-  test.skip(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 })
 
 test.describe('ANAS pools status graphics (stunt node)', () => {

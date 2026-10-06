@@ -1,4 +1,4 @@
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { RunResultContext, SystemdRunResult } from './systemd-status.js'
 import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -80,10 +80,34 @@ export interface TaskHelperResult {
 
 // --- Reads -------------------------------------------------------------------
 
+/**
+ * The environment every `systemctl show` the daemon issues runs under.
+ *
+ * `systemctl show` prints its timestamp properties in the HOST's local zone
+ * with a zone ABBREVIATION (`Mon 2026-10-05 04:00:00 CEST`), and an
+ * abbreviation is not something a date parser can resolve: Node's `Date.parse`
+ * knows UTC/GMT and the US zones, and returns NaN for CEST, CET, BST, JST,
+ * AEST and the rest — so on most of the world's nodes every last run, next run
+ * and overdue verdict went blank. `--timestamp=utc` does not apply to `show`
+ * on systemd 257 (verified on PVE 9 nodes: still prints the local zone); `TZ`
+ * in the child's environment does. Set for the `show` child only — the
+ * daemon's own environment, and every other command's output, is untouched.
+ */
+export const SYSTEMCTL_SHOW_ENV: Readonly<Record<string, string>> = Object.freeze({ TZ: 'UTC' })
+
+/**
+ * THE `systemctl show` invocation — every show the daemon issues goes through
+ * here, so every timestamp it prints is in UTC regardless of the node's zone
+ * ({@link SYSTEMCTL_SHOW_ENV}). Throws only when systemctl cannot start.
+ */
+export function execSystemctlShow(executor: CommandExecutor, unit: string, props: string): Promise<ExecResult> {
+  return executor.exec(SYSTEMCTL, ['show', unit, '-p', props], { env: { ...SYSTEMCTL_SHOW_ENV } })
+}
+
 /** `systemctl show <unit> -p <props>` → a prop map (fail-open to {}). */
 export async function showUnitProps(executor: CommandExecutor, unit: string, props: string): Promise<Record<string, string>> {
   try {
-    const r = await executor.exec(SYSTEMCTL, ['show', unit, '-p', props])
+    const r = await execSystemctlShow(executor, unit, props)
     if (r.exitCode !== 0 && !r.stdout.trim())
       return {}
     return parseShow(r.stdout)
@@ -283,7 +307,7 @@ export function lastSuccessFromJournal(journal: string): string | null {
 
 /** The note a last run known only from the timer's stamp carries. */
 export function resultNotRetainedNote(at: string): string {
-  // The daemon runs TZ=UTC; minute resolution is what the grids show.
+  // `at` is ISO UTC (every show runs TZ=UTC); minute resolution is what the grids show.
   return `ran at ${at.slice(0, 16).replace('T', ' ')} UTC; result not retained across the reboot`
 }
 

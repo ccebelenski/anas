@@ -8,6 +8,7 @@ import {
   makeDir,
   removeShareUser,
   removeSmbShare,
+  skipIfFixtureMissing,
   sshExec,
 } from './fixtures/stunt-node'
 
@@ -231,7 +232,7 @@ const FIXTURE_SH = new URL('../../test/stunt-node/smbsvc-fixture.sh', import.met
 test.beforeEach(async () => {
   if (!(await datasetExists(DATASET)))
     await execFileAsync(FIXTURE_SH, ['up']).catch(() => {})
-  test.skip(!(await datasetExists(DATASET)), 'smbsvc fixture not present — run test/stunt-node/smbsvc-fixture.sh up')
+  skipIfFixtureMissing(!(await datasetExists(DATASET)), 'smbsvc fixture not present — run test/stunt-node/smbsvc-fixture.sh up')
 })
 
 test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {

@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
-import { datasetExists, destroyDataset, poolExists } from './fixtures/stunt-node'
+import { datasetExists, destroyDataset, poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
 
 /**
  * Epic 4 (ZFS Datasets), stories 4.1–4.8 — full-chain ExtJS specs driven through
@@ -26,7 +26,7 @@ const DS_CREATE_UI = 'testpool/itestui'
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off) — poolExists swallows SSH failures and returns false.
 test.beforeEach(async () => {
-  test.skip(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
+  skipIfFixtureMissing(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 })
 
 test.describe('ANAS Datasets panel (stunt node)', () => {

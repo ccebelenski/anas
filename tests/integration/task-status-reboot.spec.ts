@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { expect, pveAuthState, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
-import { poolExists, sshExec } from './fixtures/stunt-node'
+import { poolExists, skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
 const execFileAsync = promisify(execFile)
 
@@ -34,8 +34,9 @@ const execFileAsync = promisify(execFile)
  * the backup half is covered by the shared derivation's unit tests (backup and
  * cloud share deriveTaskStatus) and by this spec's cloud half.
  *
- * The reboot drops the pvepool fixture's loop devices — run
- * `test/stunt-node/pvepool-fixture.sh up` after this spec.
+ * The reboot drops the pvepool fixture's loop devices; when the fixture was
+ * up before the reboot, afterAll runs `test/stunt-node/pvepool-fixture.sh up`
+ * again (one retry on a stale non-empty mountpoint).
  */
 
 const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
@@ -44,6 +45,9 @@ const SCHED_ID = 'taskstatus-reboot'
 const REMOTE = 'tsreboot'
 const TASK = 'tsreboot'
 const FIXTURE_SH = new URL('../../test/stunt-node/cloud-tasks-fixture.sh', import.meta.url).pathname
+const PVEPOOL_FIXTURE_SH = new URL('../../test/stunt-node/pvepool-fixture.sh', import.meta.url).pathname
+/** The pvepool fixture's pool — its loop devices do not survive the reboot. */
+const PVEPOOL = 'pvfix'
 /** A future absolute date — the timer has nothing to catch up on (SCHEDULES-GT-21). */
 const FAR_SCHEDULE = '2030-01-01 00:00:00'
 
@@ -110,6 +114,24 @@ async function ticketFor(playwright: PlaywrightWorkerArgs['playwright']): Promis
   return ticket
 }
 
+/**
+ * Rebuild the pvepool fixture the reboot dropped. A stale mountpoint left by
+ * the vanished pool can make the first `up` fail on a non-empty mountpoint;
+ * the script clears it on the way out, so one retry is the cure.
+ */
+async function restorePvepoolFixture(): Promise<void> {
+  try {
+    await execFileAsync(PVEPOOL_FIXTURE_SH, ['up'], { timeout: 300_000 })
+  }
+  catch (err) {
+    const text = err instanceof Error ? `${err.message} ${(err as { stderr?: string }).stderr ?? ''}` : String(err)
+    if (!/not empty|non-empty|mountpoint/i.test(text))
+      throw err
+    console.warn(`pvepool fixture up failed on a mountpoint, retrying once: ${text.split('\n')[0]}`)
+    await execFileAsync(PVEPOOL_FIXTURE_SH, ['up'], { timeout: 300_000 })
+  }
+}
+
 /** Reboot the node and wait until ssh answers again and the daemon serves through the gateway. */
 async function rebootAndWait(ctx: APIRequestContext): Promise<void> {
   const bootBefore = await sshExec('cat /proc/sys/kernel/random/boot_id')
@@ -146,9 +168,12 @@ test.describe('taskstatus.1 — last run and verdict survive a reboot (stunt nod
 
   let ctx: APIRequestContext
   const before: { schedule?: Row, cloud?: Row } = {}
+  /** Was the pvepool fixture up before the reboot? Then afterAll rebuilds it. */
+  let pvepoolWasUp = false
 
   test.beforeAll(async ({ playwright }) => {
-    test.skip(!(await poolExists(POOL)), `baseline pool ${POOL} not present`)
+    skipIfFixtureMissing(!(await poolExists(POOL)), `baseline pool ${POOL} not present`)
+    pvepoolWasUp = await poolExists(PVEPOOL)
     await execFileAsync(FIXTURE_SH, ['down'], { timeout: 300_000 })
     await execFileAsync(FIXTURE_SH, ['up'], { timeout: 300_000 })
     ctx = await authed(playwright, await ticketFor(playwright))
@@ -168,6 +193,10 @@ test.describe('taskstatus.1 — last run and verdict survive a reboot (stunt nod
     await execFileAsync(FIXTURE_SH, ['down'], { timeout: 300_000 }).catch((err) => {
       console.error(`cloud tasks fixture down failed: ${err instanceof Error ? err.message : err}`)
     })
+    // The reboot dropped the pvepool fixture's loop devices: put back what
+    // was there, so the next spec does not meet a missing fixture.
+    if (pvepoolWasUp && !(await poolExists(PVEPOOL)))
+      await restorePvepoolFixture()
   })
 
   test('a snapshot schedule and a cloud task each run once through their units', async () => {

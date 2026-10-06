@@ -2,6 +2,7 @@ import type { RetentionBucket, RetentionPolicy, SnapshotSchedule, SnapshotSchedu
 import type { CommandExecutor } from '../executor/types.js'
 import type { NotifyOutcome, UnattendedNotifyBase } from './unattended-notify.js'
 import { ANAS_SNAPSHOT_NOTIFY_TEMPLATE, pveNotify } from './pve-notify.js'
+import { SCHEDULE_LIST_UNREADABLE } from './snapshot-schedules.js'
 import {
   elapsedLine,
   notifySeverity,
@@ -36,6 +37,9 @@ export type SnapshotNotifyResult = SnapshotScheduleRunResult
 /** At most this many names in the body's "Destroyed:" and "Held" sections. */
 export const NOTIFY_SECTION_NAMES = 20
 
+/** At most this many lines in the body's "Per dataset:" section, then the rest counted. */
+export const NOTIFY_DATASET_LINES = 100
+
 /** How many snapshots the run destroyed (`pruned` may list fewer — capped). */
 function prunedTotal(result: SnapshotNotifyResult): number {
   return result.prunedCount ?? result.pruned.length
@@ -69,14 +73,18 @@ export interface SnapshotNotifyContext extends UnattendedNotifyBase {
  * snapshot itself was taken, but retention could not do what policy asked, so
  * the target keeps growing until the hold is released. So is a destroy ZFS
  * refused on a swept or excluded dataset (snapprune.1: a clone depends on the
- * snapshot). Both are warnings, not failures — and precisely what an
- * `on-failure` operator asked to hear.
+ * snapshot). So is the schedule-list fail-safe (any dataset noted
+ * {@link SCHEDULE_LIST_UNREADABLE}): retention was not applied to the swept
+ * children that run, and a quiet success would hide it until they piled up.
+ * All are warnings, not failures — and precisely what an `on-failure`
+ * operator asked to hear.
  */
 function fireHasWarnings(ctx: SnapshotNotifyContext): boolean {
   const result = ctx.result
   if (!result)
     return false
-  return heldTotal(result) > 0 || (result.datasets ?? []).some(d => (d.refused ?? 0) > 0)
+  return heldTotal(result) > 0
+    || (result.datasets ?? []).some(d => (d.refused ?? 0) > 0 || (d.note ?? '').includes(SCHEDULE_LIST_UNREADABLE))
 }
 
 /** Classify a finished schedule fire into the shared four-outcome vocabulary. */
@@ -154,7 +162,7 @@ export function buildSnapshotNotifyBody(ctx: SnapshotNotifyContext): string {
   if (perDataset.length) {
     lines.push('')
     lines.push('Per dataset:')
-    for (const d of perDataset) {
+    for (const d of perDataset.slice(0, NOTIFY_DATASET_LINES)) {
       const parts = [`${d.pruned} destroyed`]
       if (d.held)
         parts.push(`${d.held} held`)
@@ -162,6 +170,8 @@ export function buildSnapshotNotifyBody(ctx: SnapshotNotifyContext): string {
         parts.push(d.note)
       lines.push(`  ${d.dataset} (${d.scope}): ${parts.join(', ')}`)
     }
+    if (perDataset.length > NOTIFY_DATASET_LINES)
+      lines.push(`  ... and ${perDataset.length - NOTIFY_DATASET_LINES} more datasets`)
   }
   // Names are a sample (the per-dataset counts above are the record): a first
   // run after an upgrade can destroy thousands.

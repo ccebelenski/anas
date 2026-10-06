@@ -4551,6 +4551,8 @@
         // the latter so the harness asserts every section from a fixture job.
         openRunViewer: openRunViewer,
         runViewerBody: runViewerBody,
+        // The grid's Last run cell, exposed for the pill harness (lastrun-pill.harness.mjs).
+        renderLastRun: renderLastRun,
         // rclone.6 review batch B: `normalizeOAuthToken` is exported so the
         // dialog-contracts harness can run the shared test-vector file
         // (`packages/shared/test-vectors/oauth-token-normalisation.json`)

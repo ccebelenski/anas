@@ -114,10 +114,15 @@ export function runnerArgs(schedule: SnapshotSchedule): string[] {
  */
 export function renderServiceUnit(schedule: SnapshotSchedule): string {
   const execStart = [RUNNER_NODE, RUNNER_SCRIPT, ...runnerArgs(schedule)].join(' ')
+  // An EMPTY exclude list is the plain `-r` and is stored as no list at all, so
+  // a recursive schedule saved by a UI that always sends the key (`[]` when
+  // none) keeps a unit byte-identical to one that never had the field.
+  const { exclude, ...withoutExclude } = schedule
+  const stored = exclude && exclude.length > 0 ? schedule : withoutExclude
   return [
     '[Unit]',
     `Description=ANAS snapshot schedule ${schedule.name}`,
-    `# ${SCHEDULE_MARKER}${JSON.stringify(schedule)}`,
+    `# ${SCHEDULE_MARKER}${JSON.stringify(stored)}`,
     '',
     '[Service]',
     'Type=oneshot',

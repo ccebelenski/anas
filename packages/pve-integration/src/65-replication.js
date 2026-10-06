@@ -459,6 +459,8 @@
 
     ANAS.replication = ANAS.replication || {};
     ANAS.replication.reload = loadTasks;
+    // The grid's Last run cell, exposed for the pill harness (lastrun-pill.harness.mjs).
+    ANAS.replication.renderLastRun = renderLastRun;
 
     // ---- Selection + toolbar state -----------------------------------------
 

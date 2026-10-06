@@ -8,6 +8,7 @@ import {
   makeDir,
   removeShareUser,
   removeSmbShare,
+  skipIfFixtureMissing,
   sshExec,
 } from './fixtures/stunt-node'
 
@@ -197,7 +198,7 @@ async function runPurgeRunner(): Promise<string> {
 test.beforeEach(async () => {
   if (!(await datasetExists('gtbackup/pvshare')))
     await execFileAsync(FIXTURE_SH, ['up']).catch(() => {})
-  test.skip(!(await datasetExists('gtbackup/pvshare')), 'smbsvc fixture not present — run test/stunt-node/smbsvc-fixture.sh up')
+  skipIfFixtureMissing(!(await datasetExists('gtbackup/pvshare')), 'smbsvc fixture not present — run test/stunt-node/smbsvc-fixture.sh up')
   await sshExec(
     `install -m 0644 /opt/anas/packaging/systemd/${RECYCLE_SERVICE} /etc/systemd/system/${RECYCLE_SERVICE}`
     + ` && install -m 0644 /opt/anas/packaging/systemd/${RECYCLE_TIMER} /etc/systemd/system/${RECYCLE_TIMER}`
