@@ -4514,7 +4514,10 @@
         // the panel and squeezed the tree to nothing. The breakdown now reads
         // the way the Name column already does: the SAME ownership verdict the
         // badge uses (recPveOwnership) folds PVE's footprint into ONE segment
-        // whose value is the sum of the owned children, while ANAS datasets
+        // ("Proxmox storage" — the verdict also covers dir storage, storage
+        // roots, system datasets and the config-unreadable fallback, so the
+        // label names no single kind) whose value is the sum of the owned
+        // children, while ANAS datasets
         // stay individually named. capSegments then bounds the list to the
         // largest max named segments + one roll-up, so the hero's height is
         // bounded whatever the dataset count. Free rides the cap too (it
@@ -4537,7 +4540,7 @@
             }
         }
         if (pveKids) {
-            segs.push({ label: t('Proxmox guest volumes'), value: pveUsed });
+            segs.push({ label: t('Proxmox storage'), value: pveUsed });
         }
         segs.push({ label: t('Free'), value: free, free: true });
         if (typeof ANAS.gfx.capSegments === 'function') {

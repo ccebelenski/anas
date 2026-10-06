@@ -1,7 +1,7 @@
 import type { Locator, Page } from '@playwright/test'
 import { expect, test } from '@playwright/test'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
-import { poolExists } from './fixtures/stunt-node'
+import { poolExists, sshExec } from './fixtures/stunt-node'
 
 /**
  * Story dshero.1 (GitHub #70, UI leg) — the Pool space hero on the Datasets
@@ -13,7 +13,7 @@ import { poolExists } from './fixtures/stunt-node'
  * The bug: buildHeroHtml emitted one legend row per top-level dataset with no
  * cap — on a PVE-storage pool that is every guest volume, the hero (a plain
  * component at natural height above the flex:1 tree) pushed the tree to zero
- * height. The fix folds PVE-owned children into ONE "Proxmox guest volumes"
+ * height. The fix folds PVE-owned children into ONE "Proxmox storage"
  * segment (the same ownership verdict the Name-column badge uses) and caps
  * the legend to the largest 8 named segments + one "n more" roll-up, Free
  * last — so the invariant is hero height bounded regardless of dataset count,
@@ -28,6 +28,12 @@ import { poolExists } from './fixtures/stunt-node'
  *
  * Legend rows are asserted through 15-gfx.js's own markup: each row is
  * .anas-gfx-legend-row holding .anas-gfx-legend-nm (the label span).
+ *
+ * The cap itself needs more named segments than pvfix carries, so the last
+ * test adds pvfix/hero-01 … hero-12 (distinct sizes) for an 18-dataset pool —
+ * 13 ANAS datasets + the folded segment = 14 named, more than the 8 kept —
+ * and destroys them again in afterAll (with a pre-clean in beforeAll so a
+ * failed run never leaves them behind).
  */
 
 const PVE_POOL = 'pvfix'
@@ -74,7 +80,7 @@ test.describe('dshero.1 — Pool space hero bounded on a PVE-storage pool (#70)'
     await expect(names.first()).toBeVisible({ timeout: 20_000 })
 
     // (a) The PVE footprint reads as ONE folded segment — exactly one row.
-    const folded = names.filter({ hasText: /^Proxmox guest volumes/ })
+    const folded = names.filter({ hasText: /^Proxmox storage$/ })
     await expect(folded).toHaveCount(1)
 
     // (b) No guest volume keeps a named legend row of its own.
@@ -91,12 +97,65 @@ test.describe('dshero.1 — Pool space hero bounded on a PVE-storage pool (#70)'
     const { grid, hero } = await openDatasetsOnPvfix(page)
     await expect(hero.locator('.anas-gfx-legend')).toBeVisible({ timeout: 20_000 })
 
-    // The #70 invariant: the hero (natural height in the vbox) may never
-    // squeeze the flex:1 tree below usable — half the panel is generous.
-    const panelBox = await page.locator('.anas-view-datasets').boundingBox()
-    const treeBox = await grid.boundingBox()
-    expect(panelBox).not.toBeNull()
-    expect(treeBox).not.toBeNull()
-    expect(treeBox!.height).toBeGreaterThanOrEqual((panelBox!.height) * 0.5)
+    await expectTreeKeepsHalf(page, grid)
+  })
+})
+
+/**
+ * The #70 invariant: the hero (natural height in the vbox) may never squeeze
+ * the flex:1 tree below usable — half the panel is generous. Measured on the
+ * tree BODY (the tree view — a treepanel's view carries x-tree-view, never
+ * x-grid-view), not the treepanel box, so the docked toolbar and column
+ * header never count as usable tree.
+ */
+async function expectTreeKeepsHalf(page: Page, grid: Locator): Promise<void> {
+  const panelBox = await page.locator('.anas-view-datasets').boundingBox()
+  const bodyBox = await grid.locator('.x-tree-view').boundingBox()
+  expect(panelBox).not.toBeNull()
+  expect(bodyBox).not.toBeNull()
+  expect(bodyBox!.height).toBeGreaterThanOrEqual(panelBox!.height * 0.5)
+}
+
+const HERO_COUNT = 12
+const HERO_DATASETS = Array.from({ length: HERO_COUNT }, (_, i) =>
+  `${PVE_POOL}/hero-${String(i + 1).padStart(2, '0')}`)
+
+/** Best-effort removal of the hero-NN datasets (never throws). */
+async function destroyHeroDatasets(): Promise<void> {
+  const cmd = HERO_DATASETS
+    .map(ds => `zfs list -H -o name ${ds} >/dev/null 2>&1 && zfs destroy -r ${ds}`)
+    .join('; ')
+  await sshExec(`${cmd}; true`).catch(() => {})
+}
+
+test.describe('dshero.1 — the cap on a pool with many datasets (#70)', () => {
+  test.use({ viewport: { width: 2560, height: 1080 } })
+  test.setTimeout(150_000)
+
+  test.beforeAll(async () => {
+    test.skip(
+      !(await poolExists(PVE_POOL)),
+      'pvepool fixture not present — run test/stunt-node/pvepool-fixture.sh up',
+    )
+    await destroyHeroDatasets()
+    // Each hero-NN gets NN × 64 KiB of data so every `used` differs.
+    const make = HERO_DATASETS.map((ds, i) =>
+      `zfs create ${ds} && dd if=/dev/urandom of=/${ds}/f bs=64k count=${i + 1} status=none`)
+    await sshExec(`set -e; ${make.join('; ')}; zpool sync ${PVE_POOL}`)
+  })
+
+  test.afterAll(async () => {
+    await destroyHeroDatasets()
+  })
+
+  test('18 datasets: the legend rolls up past 8 into one "n more" row', async ({ page }) => {
+    const { hero } = await openDatasetsOnPvfix(page)
+
+    const names = hero.locator('.anas-gfx-legend .anas-gfx-legend-nm')
+    await expect(names.first()).toBeVisible({ timeout: 20_000 })
+
+    const labels = await names.allTextContents()
+    expect(labels.length).toBeLessThanOrEqual(MAX_LEGEND_ROWS)
+    expect(labels.filter(l => /\d+ more/.test(l))).toHaveLength(1)
   })
 })

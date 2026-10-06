@@ -1046,11 +1046,15 @@
             var sum = 0;
             var names = [];
             for (var j = 0; j < rest.length; j++) {
-                sum += Number(rest[j].value) || 0;
+                // A null entry or a negative value adds nothing — the
+                // roll-up never shrinks the ring or draws a negative arc.
+                var rv = Number(rest[j] && rest[j].value) || 0;
+                sum += rv > 0 ? rv : 0;
                 names.push((rest[j] && rest[j].label) || '');
             }
+            var moreWord = (typeof ANAS.t === 'function') ? ANAS.t('more') : 'more';
             out.push({
-                label: rest.length + ' more',
+                label: rest.length + ' ' + moreWord,
                 value: sum,
                 names: names,
                 more: true,

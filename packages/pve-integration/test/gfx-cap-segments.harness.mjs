@@ -74,6 +74,8 @@ function loadGfx() {
       return `${size.toFixed(order === 0 ? 0 : 2)} ${units[order]}`
     },
     warn(m) { throw new Error(`gfx warned: ${m}`) },
+    // Marks translated strings so the harness can see they went through t().
+    t: s => (s === 'more' ? '[more]' : s),
   }
   const sandbox = { window: win, document: doc, console }
   vm.runInNewContext(readFileSync(GFX, 'utf8'), sandbox, { filename: '15-gfx.js' })
@@ -124,7 +126,7 @@ function synthetic(n) {
 
   const roll = capped[8]
   ok('roll-up is flagged', !!roll.more)
-  eq('roll-up label', roll.label, '52 more')
+  eq('roll-up label', roll.label, '52 [more]')
   eq('roll-up value is the remaining sum',
     roll.value, [...Array(52).keys()].map(i => (i + 1) * GiB).reduce((a, b) => a + b))
   eq('roll-up names carry every folded label', roll.names.length, 52)
@@ -153,7 +155,7 @@ function synthetic(n) {
   const capped = gfx.capSegments(synthetic(5))
   eq('5 in (under max) → 6 out', capped.length, 6)
   ok('no roll-up under max', capped.every(s => !s.more))
-  eq('under max keeps input order free-last',
+  eq('under max: sorted value-descending, Free last',
     capped.map(s => s.label).join(','), 'vm-5-disk-0,vm-4-disk-0,vm-3-disk-0,vm-2-disk-0,vm-1-disk-0,Free')
 
   const exact = gfx.capSegments(synthetic(8))
@@ -188,7 +190,7 @@ function synthetic(n) {
   eq('zeros fold even when there is room', capped.length, 5)
   const roll = capped[3]
   ok('zero roll-up is flagged', !!roll.more)
-  eq('zero roll-up label', roll.label, '2 more')
+  eq('zero roll-up label', roll.label, '2 [more]')
   eq('zero roll-up value', roll.value, 0)
   eq('zero roll-up names', roll.names.join(','), 'empty-1,empty-2')
   ok('Free still last', capped[4].free === true)
@@ -207,6 +209,38 @@ ok('input array is never mutated', (() => {
 })())
 ok('custom max honoured', gfx.capSegments(synthetic(10), { max: 3 }).length === 5)
 ok('bogus max falls back to 8', gfx.capSegments(synthetic(10), { max: -1 }).length === 10)
+
+// --- 6. Malformed entries: null never throws, negatives never shrink ---------
+
+{
+  let capped
+  let threw = null
+  try {
+    capped = gfx.capSegments([{ label: 'a', value: 2 * GiB }, null, { label: 'Free', value: GiB, free: true }])
+  } catch (e) { threw = e }
+  ok('a null entry does not throw', threw === null, threw && threw.message)
+  if (capped) {
+    eq('null entry → a + roll-up + Free', capped.length, 3)
+    ok('null entry rolls up with value 0', capped[1].more === true && capped[1].value === 0,
+      JSON.stringify(capped[1]))
+    eq('null entry folds as an empty name', capped[1].names.join('|'), '')
+  }
+
+  const neg = gfx.capSegments([
+    { label: 'a', value: 5 * GiB },
+    { label: 'b', value: -3 * GiB },
+    { label: 'c', value: 0 },
+  ])
+  eq('negative entry → a + roll-up', neg.length, 2)
+  eq('negative value counts as 0 in the roll-up', neg[1].value, 0)
+  eq('negative entry still named in the roll-up', neg[1].names.join(','), 'b,c')
+  const ring = gfx.donut(neg, { total: 10 * GiB })
+  ok('no negative arc in the ring', !/stroke-dasharray="-/.test(ring))
+}
+
+// --- 7. The roll-up word goes through ANAS.t ----------------------------------
+
+eq('roll-up word translated', gfx.capSegments(synthetic(10))[8].label, '2 [more]')
 
 // ---- Report -----------------------------------------------------------------
 
