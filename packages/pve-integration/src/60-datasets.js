@@ -4509,17 +4509,40 @@
         if (isNaN(free)) {
             free = Math.max(0, size - allocated);
         }
+        // dshero.1 (#70): on a pool that is also PVE storage, most top-level
+        // children are guest volumes — one legend row each grew the hero past
+        // the panel and squeezed the tree to nothing. The breakdown now reads
+        // the way the Name column already does: the SAME ownership verdict the
+        // badge uses (recPveOwnership) folds PVE's footprint into ONE segment
+        // whose value is the sum of the owned children, while ANAS datasets
+        // stay individually named. capSegments then bounds the list to the
+        // largest max named segments + one roll-up, so the hero's height is
+        // bounded whatever the dataset count. Free rides the cap too (it
+        // passes out last and is never counted toward max).
         var segs = [];
+        var pveUsed = 0;
+        var pveKids = 0;
         var poolNode = poolNodeByName(tree, poolName);
         if (poolNode && poolNode.childNodes) {
             for (var i = 0; i < poolNode.childNodes.length; i++) {
                 var c = poolNode.childNodes[i];
                 if (c.get('kind') === 'dataset') {
-                    segs.push({ label: c.get('name'), value: Number(c.get('used')) || 0 });
+                    if (recPveOwnership(c)) {
+                        pveUsed += Number(c.get('used')) || 0;
+                        pveKids++;
+                    } else {
+                        segs.push({ label: c.get('name'), value: Number(c.get('used')) || 0 });
+                    }
                 }
             }
         }
+        if (pveKids) {
+            segs.push({ label: t('Proxmox guest volumes'), value: pveUsed });
+        }
         segs.push({ label: t('Free'), value: free, free: true });
+        if (typeof ANAS.gfx.capSegments === 'function') {
+            segs = ANAS.gfx.capSegments(segs, { max: 8 });
+        }
         var donut = ANAS.gfx.donut(segs, {
             total: size,
             size: 150,

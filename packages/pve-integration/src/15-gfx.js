@@ -980,7 +980,12 @@
                 var seg = segments[i];
                 var val = Number(seg.value) || 0;
                 var pct = Math.round((val / total) * 100);
-                rows += '<div class="anas-gfx-legend-row">'
+                // dshero.1: a roll-up row (capSegments) carries the folded
+                // labels as its tooltip — the row itself reads "n more".
+                var tip = (seg.names && seg.names.length)
+                    ? ' title="' + enc(seg.names.join(', ')) + '"'
+                    : '';
+                rows += '<div class="anas-gfx-legend-row"' + tip + '>'
                     + '<span class="anas-gfx-legend-sw" style="background:' + segColor(seg, i) + '"></span>'
                     + '<span class="anas-gfx-legend-nm">' + enc(seg.label || '') + '</span>'
                     + '<span class="anas-gfx-legend-sz">' + enc(fmt(val)) + '</span>'
@@ -991,6 +996,70 @@
             warn('legend failed: ' + (e && e.message));
             return '';
         }
+    };
+
+    // capSegments(segments, opts) → a new segment list whose legend height is
+    // BOUNDED regardless of how many entries the caller starts from (dshero.1,
+    // GitHub #70: one legend row per guest volume blew the Datasets hero up
+    // past the panel). Pure over the data — no DOM, no gfx state — so the
+    // donut and the legend can draw the SAME returned array and never
+    // disagree. Keeps the `max` largest non-free segments with a positive
+    // value, in descending order; everything else (the remainder AND
+    // zero-value segments) folds into ONE roll-up row "{n} more" whose
+    // `names` array lists the folded labels (the legend renders that as the
+    // row's tooltip); every free:true segment passes through last, unchanged
+    // and uncounted toward `max`.
+    //   segments : [{ label, value, color?, free? }]
+    //   opts     : { max:Number (default 8) }
+    gfx.capSegments = function (segments, opts) {
+        var max = (opts && typeof opts.max === 'number' && opts.max > 0) ? opts.max : 8;
+        segments = segments || [];
+        var named = [];
+        var rest = [];
+        var free = [];
+        for (var i = 0; i < segments.length; i++) {
+            var seg = segments[i];
+            if (seg && seg.free) {
+                free.push(seg);
+                continue;
+            }
+            var val = Number(seg && seg.value) || 0;
+            if (val > 0) {
+                named.push({ seg: seg, value: val });
+            } else {
+                // Zero-value (or malformed) segments never take a legend row
+                // of their own — they always count as "the rest".
+                rest.push(seg);
+            }
+        }
+        named.sort(function (a, b) { return b.value - a.value; });
+        var out = [];
+        var kept = named.slice(0, max);
+        for (var k = 0; k < kept.length; k++) {
+            out.push(kept[k].seg);
+        }
+        var tail = named.slice(max);
+        for (var r = 0; r < tail.length; r++) {
+            rest.push(tail[r].seg);
+        }
+        if (rest.length) {
+            var sum = 0;
+            var names = [];
+            for (var j = 0; j < rest.length; j++) {
+                sum += Number(rest[j].value) || 0;
+                names.push((rest[j] && rest[j].label) || '');
+            }
+            out.push({
+                label: rest.length + ' more',
+                value: sum,
+                names: names,
+                more: true,
+            });
+        }
+        for (var f = 0; f < free.length; f++) {
+            out.push(free[f]);
+        }
+        return out;
     };
 
     // ---- The 1-2-5 scale ladder (operator design review, 2026-08-19) --------
