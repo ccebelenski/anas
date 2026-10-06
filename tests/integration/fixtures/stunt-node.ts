@@ -32,26 +32,26 @@ export async function sshExec(command: string): Promise<string> {
  * Check if a ZFS pool exists.
  */
 export async function poolExists(pool: string): Promise<boolean> {
-  try {
-    await sshExec(`zpool list ${pool}`)
-    return true
-  }
-  catch {
-    return false
-  }
+  return existsOnNode(`zpool list ${pool}`)
+}
+
+/**
+ * Run a probe on the node and read its verdict from stdout, so an ssh failure
+ * (timeout, refused connection mid-reboot) THROWS instead of reading as
+ * "absent" — a fixture guard that skipped on a dead ssh hid a real failure.
+ */
+async function existsOnNode(probe: string): Promise<boolean> {
+  const out = await sshExec(`if ${probe} >/dev/null 2>&1; then echo yes; else echo no; fi`)
+  if (out !== 'yes' && out !== 'no')
+    throw new Error(`stunt-node probe answered '${out}' for: ${probe}`)
+  return out === 'yes'
 }
 
 /**
  * Check if a ZFS dataset exists.
  */
 export async function datasetExists(dataset: string): Promise<boolean> {
-  try {
-    await sshExec(`zfs list ${dataset}`)
-    return true
-  }
-  catch {
-    return false
-  }
+  return existsOnNode(`zfs list ${dataset}`)
 }
 
 /**
