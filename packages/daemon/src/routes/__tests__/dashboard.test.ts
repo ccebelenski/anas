@@ -12,6 +12,7 @@ import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js
 import { mockFixtures } from '../../fixtures/loader.js'
 import { JobQueue } from '../../jobs/queue.js'
 import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
+import { LSBLK_ARGS } from '../../parsers/lsblk.js'
 import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
@@ -485,6 +486,155 @@ describe('GET /v1/status — ahrPools briefs (story 11.13, AHR-DESIGN §10 revis
 
     // A healthy pool still cards NOTHING (warnings stay failure-only, 11.10).
     assert.equal(summary.warnings.filter(w => w.category === 'ahr').length, 0)
+  })
+})
+
+describe('GET /v1/status — disk counts honour AHR member state (disks.2)', () => {
+  const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/ahr')
+  const loadFixture = (name: string): string => readFileSync(join(fixturesDir, name), 'utf-8')
+  const ok = (stdout: string) => ({ stdout, stderr: '', exitCode: 0 })
+
+  let server: ReturnType<typeof createServer> | Awaited<ReturnType<typeof bareDashboardServer>> | undefined
+  let dir: string | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true })
+      dir = undefined
+    }
+  })
+
+  // The DISKS-VIEW flat lsblk (LSBLK_ARGS) — physical disks only. The three AHR
+  // members carry raid-member partitions, sde is a ZFS pool member, sdf blank.
+  function flatPart(name: string, fstype: string | null) {
+    return { name, type: 'part', size: 1072676352, fstype, mountpoint: null }
+  }
+  function flatDisk(name: string, serial: string, parts: object[]) {
+    return {
+      'name': name,
+      'type': 'disk',
+      'size': 1073741824,
+      'model': 'QEMU HARDDISK',
+      'serial': serial,
+      'tran': 'sata',
+      'fstype': null,
+      'mountpoint': null,
+      'rota': true,
+      'phy-sec': 512,
+      'log-sec': 512,
+      'wwn': null,
+      'vendor': 'QEMU',
+      'rev': '2.5+',
+      'children': parts,
+    }
+  }
+
+  const FLAT_LSBLK = JSON.stringify({
+    blockdevices: [
+      flatDisk('sdb', 'ANAS_HOT1', [flatPart('sdb1', 'linux_raid_member')]),
+      flatDisk('sdc', 'ANAS_HOT2', [flatPart('sdc1', 'linux_raid_member'), flatPart('sdc2', 'linux_raid_member')]),
+      flatDisk('sdd', 'ANAS_HOT3', [flatPart('sdd1', 'linux_raid_member'), flatPart('sdd2', 'linux_raid_member')]),
+      // A ZFS pool member — must still classify 'pool_member', healthy.
+      flatDisk('sde', 'ZFS_MEMBER', [flatPart('sde1', 'zfs_member')]),
+      // A genuinely blank disk — stays 'available', SMART-only health.
+      flatDisk('sdf', 'BLANK', []),
+    ],
+  })
+
+  // by-id: the ahr0 fixture's three disks + sde/sdf, one listing for BOTH the
+  // disks view and the AHR topology reader.
+  const BY_ID = `${loadFixture('disk-by-id-ahr.txt').trimEnd()}
+lrwxrwxrwx 1 root root   9 Jul 22 22:43 scsi-0QEMU_QEMU_HARDDISK_ZFS_MEMBER -> ../../sde
+lrwxrwxrwx 1 root root  10 Jul 22 22:44 scsi-0QEMU_QEMU_HARDDISK_ZFS_MEMBER-part1 -> ../../sde1
+lrwxrwxrwx 1 root root   9 Jul 22 22:43 scsi-0QEMU_QEMU_HARDDISK_BLANK -> ../../sdf
+`
+
+  // A single-disk (stripe) ZFS pool 'tank' whose leaf is sde (kernel path).
+  const ZPOOL_STATUS = JSON.stringify({
+    pools: {
+      tank: {
+        name: 'tank',
+        state: 'ONLINE',
+        pool_guid: '9',
+        error_count: '0',
+        vdevs: {
+          tank: {
+            name: 'tank',
+            vdev_type: 'root',
+            state: 'ONLINE',
+            read_errors: '0',
+            write_errors: '0',
+            checksum_errors: '0',
+            vdevs: {
+              'sde-leaf': {
+                name: 'sde',
+                vdev_type: 'disk',
+                state: 'ONLINE',
+                path: '/dev/sde1',
+                read_errors: '0',
+                write_errors: '0',
+                checksum_errors: '0',
+                slow_ios: '0',
+              },
+            },
+          },
+        },
+      },
+    },
+  })
+
+  /** The disks-view + AHR topology world, sharing one mdstat variant. */
+  function addDiskWorld(mock: MockExecutor, mdstat: string): void {
+    mock.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: ok(FLAT_LSBLK) })
+    mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok(BY_ID) })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: ok(ZPOOL_STATUS) })
+    mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: ok(mdstat) })
+    mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: ok(loadFixture('mdadm-export-r1.txt')) })
+    mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: ok(loadFixture('mdadm-export-r2.txt')) })
+    mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok(loadFixture('lsblk-ahr0.json')) })
+    mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(loadFixture('lvm-vgs.json')) })
+    mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(loadFixture('lvm-lvs.json')) })
+    mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok(loadFixture('findmnt-ahr0.json')) })
+    mock.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: ok(loadFixture('btrfs-usage.txt')) })
+  }
+
+  /** A bare Fastify server with ONLY dashboardRoutes and a controlled executor. */
+  async function bareDashboardServer(executor: MockExecutor, tmp: string) {
+    const srv = Fastify({ logger: false })
+    await srv.register(dashboardRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue: new JobQueue(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      smbConfPath: join(tmp, 'smb.conf'),
+      exportsPath: join(tmp, 'exports'),
+      systemdDir: join(tmp, 'systemd'),
+      fstabPath: join(tmp, 'fstab'),
+    })
+    return srv
+  }
+
+  async function fetchStatus(srv: NonNullable<typeof server>): Promise<StatusSummary> {
+    const res = await srv.inject({ method: 'GET', url: '/v1/status', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 200)
+    return (res.json() as { data: StatusSummary }).data
+  }
+
+  it('an AHR-faulty band member lands in the critical count, not the healthy bin', async () => {
+    // sdc is faulty on band r1, in_sync on r2 (same ahr0 world, mdstat variant).
+    dir = mkdtempSync(join(tmpdir(), 'anas-dash-disks2-'))
+    const mock = new MockExecutor()
+    addDiskWorld(mock, loadFixture('mdstat-disks2-faulty.txt'))
+    server = await bareDashboardServer(mock, dir)
+    const summary = await fetchStatus(server)
+
+    assert.equal(summary.disks.critical, 1, 'the AHR-faulty sdc is critical')
+    assert.equal(summary.disks.healthy, 1, 'the ZFS member sde is healthy')
+    assert.equal(summary.disks.warning, 0)
+    assert.equal(summary.disks.unknown, 3, 'AHR in_sync (sdb, sdd) + blank sdf stay unknown')
+    assert.equal(summary.disks.total, 5)
   })
 })
 

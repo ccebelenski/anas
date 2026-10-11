@@ -135,7 +135,7 @@ const ZPOOL_STATUS = JSON.stringify({
   },
 })
 
-function makeExecutor(opts: { breakAhr?: boolean } = {}): MockExecutor {
+function makeExecutor(opts: { breakAhr?: boolean, mdstat?: string } = {}): MockExecutor {
   const mock = new MockExecutor()
   // --- disks-view reads ---
   mock.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: ok(FLAT_LSBLK) })
@@ -146,7 +146,7 @@ function makeExecutor(opts: { breakAhr?: boolean } = {}): MockExecutor {
   mock.addFixture({
     command: '/usr/bin/cat',
     args: MDSTAT_CAT_ARGS,
-    result: opts.breakAhr ? { stdout: '', stderr: 'boom', exitCode: 1 } : ok(ahrFixture('mdstat-clean.txt')),
+    result: opts.breakAhr ? { stdout: '', stderr: 'boom', exitCode: 1 } : ok(ahrFixture(opts.mdstat ?? 'mdstat-clean.txt')),
   })
   mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: ok(ahrFixture('mdadm-export-r1.txt')) })
   mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: ok(ahrFixture('mdadm-export-r2.txt')) })
@@ -223,5 +223,47 @@ describe('collectDisks — AHR members classify as ahr_member (issue #3)', () =>
     // ZFS + free classification are unaffected by the AHR failure.
     assert.equal(byName.get('sde')!.status, 'pool_member')
     assert.equal(byName.get('sdf')!.status, 'available')
+  })
+})
+
+/**
+ * disks.2 — the Health badge must honour AHR member state, not just SMART +
+ * ZFS. The ahr0 world is reused verbatim with mdstat variants that drive a
+ * member `(F)` (faulty in band r1) and a member `(R)` (rebuilding in band r1);
+ * every other fixture stays the stage-0 clean world. The md variants are
+ * synthetic in their slot math but carry exactly the flag the topology reader
+ * turns into a memberState — the shape that shape is derived from.
+ */
+describe('collectDisks — healthStatus honours AHR member state (disks.2)', () => {
+  it('a multi-band disk faulty in one band, in_sync in the rest, reads critical', async () => {
+    // sdc slices r1 + r2; md127-r1 marks sdc1 faulty while md126-r2 keeps sdc2
+    // in_sync — the WORST band must win the single badge.
+    const mock = makeExecutor({ mdstat: 'mdstat-disks2-faulty.txt' })
+    const disks = await collectDisks(mock, new DiskIdentityCache(mock))
+    const byName = new Map(disks.map(d => [d.name, d]))
+
+    const sdc = byName.get('sdc')!
+    assert.equal(sdc.status, 'ahr_member')
+    assert.equal(sdc.ahrArray, 'r1-r2')
+    assert.equal(sdc.healthStatus, 'critical')
+
+    // A sibling member md is happy with changes nothing: SMART is unmeasurable
+    // here (no identity), so it stays the same 'unknown' a clean member gets.
+    const sdb = byName.get('sdb')!
+    assert.equal(sdb.status, 'ahr_member')
+    assert.equal(sdb.healthStatus, 'unknown')
+  })
+
+  it('a band rebuilding onto a replacement reads warning, not critical', async () => {
+    // sdd slices r1–r3; md127-r1 is mid-recovery with sdd1 the (R) target while
+    // md126-r2 keeps sdd2 in_sync — warning, never a faulted badge.
+    const mock = makeExecutor({ mdstat: 'mdstat-disks2-rebuilding.txt' })
+    const disks = await collectDisks(mock, new DiskIdentityCache(mock))
+    const byName = new Map(disks.map(d => [d.name, d]))
+
+    const sdd = byName.get('sdd')!
+    assert.equal(sdd.status, 'ahr_member')
+    assert.equal(sdd.ahrArray, 'r1-r3')
+    assert.equal(sdd.healthStatus, 'warning')
   })
 })

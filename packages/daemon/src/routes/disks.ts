@@ -1,4 +1,4 @@
-import type { AhrDiskRole, Disk, DiskHealthStatus, VdevRole, VdevState } from '@anas/shared'
+import type { AhrDiskRole, AhrMemberState, Disk, DiskHealthStatus, VdevRole, VdevState } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
@@ -68,6 +68,14 @@ interface AhrDiskInfo {
   pool: string
   /** Band-array label — the AHR parallel to a ZFS vdev name (see Disk.ahrArray). */
   array: string
+  /**
+   * The md state of EVERY array membership on this disk, one entry per band it
+   * slices (the `memberState` the topology reader derives per AhrArrayMember).
+   * A disk in bands r1–r3 carries three; a cache disk, which slices no band, or
+   * a disk whose extra slice is not yet arrayed, none. computeHealth takes the
+   * worst band (disks.2) — one disk, one badge.
+   */
+  memberStates: AhrMemberState[]
 }
 
 /**
@@ -149,6 +157,7 @@ function contextWeight(info: PoolDiskInfo): number {
 export function computeHealth(
   smartHealthy: boolean | null,
   info: PoolDiskInfo | undefined,
+  ahrStates?: readonly AhrMemberState[],
 ): DiskHealthStatus {
   if (smartHealthy === false)
     return 'critical'
@@ -162,6 +171,15 @@ export function computeHealth(
     // In a pool, ONLINE, no errors — ZFS and SMART agree it's fine.
     return 'healthy'
   }
+  // AHR member state mirrors the ZFS mapping (disks.2): a disk md marked
+  // faulty — or whose slice is gone entirely — is critical, a band rebuilding
+  // onto a spare is a warning, and in_sync/spare change nothing (SMART keeps
+  // its say). A disk slicing several bands is as sick as its WORST band. No
+  // SMART-attribute interpretation here — smartd already does that.
+  if (ahrStates?.some(s => s === 'faulty' || s === 'missing'))
+    return 'critical'
+  if (ahrStates?.includes('rebuilding'))
+    return 'warning'
   // Not in a pool: only SMART tells us anything.
   return smartHealthy === true ? 'healthy' : 'unknown'
 }
@@ -275,10 +293,27 @@ export async function collectDisks(
   // slices — we read the bands straight off it, no partition re-parsing.
   const ahrInfo = new Map<string, AhrDiskInfo>()
   for (const pool of ahrPools) {
+    // md member state per disk, collated across every band array — a disk
+    // slicing several bands appears once per band. Keyed by the same by-id
+    // the AhrDisk.ids below carry, so the two never disagree on a disk.
+    const statesByDisk = new Map<string, AhrMemberState[]>()
+    for (const array of pool.arrays) {
+      for (const member of array.members) {
+        const list = statesByDisk.get(member.disk) ?? []
+        list.push(member.memberState)
+        statesByDisk.set(member.disk, list)
+      }
+    }
     for (const disk of pool.disks) {
       const kernel = byIdToKernel.get(disk.id) ?? disk.id
       const bands = disk.partitions.map(p => p.band)
-      ahrInfo.set(kernel, { pool: pool.name, array: ahrBandLabel(bands, disk.role) })
+      ahrInfo.set(kernel, {
+        pool: pool.name,
+        array: ahrBandLabel(bands, disk.role),
+        // Only LIVE array memberships carry a state; a cache disk or a sliced
+        // band not yet arrayed contributes none ([] → no md opinion on health).
+        memberStates: statesByDisk.get(disk.id) ?? [],
+      })
     }
   }
 
@@ -341,9 +376,10 @@ export async function collectDisks(
       : { vdevName: null, vdevRole: null, zfsErrors: null }
     // AHR membership (never a ZFS pool member at the same time — ZFS wins if,
     // impossibly, both claim a disk). An AHR member is 'ahr_member' + its pool
-    // + band label, parallel to how a ZFS member becomes 'pool_member'. Fusing
-    // AHR array error state into healthStatus is OUT of scope here (a separate
-    // parity item), so healthStatus stays SMART-derived for AHR members.
+    // + band label, parallel to how a ZFS member becomes 'pool_member'. Its md
+    // member state flows into the SAME health fusion ZFS vdev state does
+    // (disks.2), so a disk md marked faulty reads critical here exactly as it
+    // does in the AHR pool view.
     const ahr = info ? undefined : ahrInfo.get(d.name)
     const ahrContext = ahr
       ? { status: 'ahr_member' as const, poolName: ahr.pool, ahrArray: ahr.array }
@@ -361,7 +397,7 @@ export async function collectDisks(
       ...zfsContext,
       ...ahrContext,
       ...handsOffContext(d, servedSerials),
-      healthStatus: computeHealth(smartHealthy, info),
+      healthStatus: computeHealth(smartHealthy, info, ahr?.memberStates),
     }
   })
 }
