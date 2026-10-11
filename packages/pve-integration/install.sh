@@ -8,8 +8,10 @@
 #   2. Inserts exactly one <script> line into index.html.tpl, immediately after
 #      the pvemanagerlib.js line, ONLY if it is not already present. No marker
 #      comments, no whole-file overwrite — surgical, idempotent.
-#   3. Installs an apt DPkg::Post-Invoke hook that re-runs this installer, so a
-#      pve-manager upgrade (which overwrites the template) re-applies the line.
+#   3. Installs an apt DPkg::Post-Invoke hook that re-runs this installer
+#      through apt-reapply.sh, so a pve-manager upgrade (which overwrites the
+#      template) re-applies the line, with every run logged to journald and a
+#      failed one raised as a PVE notification (installer.1, GitHub #74).
 #
 # The single fragile point is step 2: pve-manager upgrades overwrite
 # index.html.tpl. See README.md.
@@ -256,6 +258,13 @@ if [ ! -d "${SRC_DIR}" ]; then
   echo "anas: ERROR: source dir ${SRC_DIR} not found" >&2
   exit 1
 fi
+# The apt hook's body (step 4, installer.1). Checked up front so an incomplete
+# tree is refused before the template or the PVE module is touched.
+APT_REAPPLY="${SCRIPT_DIR}/apt-reapply.sh"
+if [ ! -f "${APT_REAPPLY}" ]; then
+  echo "anas: ERROR: apt hook wrapper ${APT_REAPPLY} not found; refusing to install a hook that would run nothing" >&2
+  exit 1
+fi
 # Resolve the ANAS version to stamp into the bundle (12.1 version-skew checks:
 # the UI compares its own build against the gateway/daemon versions). Release
 # layout has VERSION two levels up (/opt/anas/VERSION); a dev tree has the root
@@ -402,7 +411,17 @@ fi
 #    the installer is idempotent, so a pve-manager upgrade (which overwrites
 #    index.html.tpl) or a libpve-http-server-perl upgrade (which clobbers
 #    AnyEvent.pm, dropping the proxy hook) triggers a re-splice with the same
-#    perl-c gate. `|| true` keeps a failed re-apply from breaking the apt run.
+#    perl-c gate.
+#
+#    The hook runs apt-reapply.sh (shipped beside this script), not this script
+#    directly (installer.1, GitHub #74): the wrapper logs start, output and exit
+#    status to journald under the tag anas-pve-integration and, on a failure,
+#    sends one PVE notification naming the manual fix. A wrapper rather than an
+#    inline conf string because an apt.conf value cannot carry a double quote
+#    and the notify call needs perl with quoted arguments; a script is also
+#    testable on its own. `[ -x … ]` keeps the hook a silent no-op once ANAS is
+#    gone, and `|| true` stays as the belt over the wrapper's own exit 0: a
+#    failed re-apply must never fail the apt run.
 if [ -d "$(dirname "${APT_HOOK}")" ]; then
   cat > "${APT_HOOK}" <<EOF
 // Re-apply the ANAS PVE integration after package changes: pve-manager upgrades
@@ -410,7 +429,9 @@ if [ -d "$(dirname "${APT_HOOK}")" ]; then
 // upgrades overwrite /usr/share/perl5/PVE/APIServer/AnyEvent.pm (dropping the
 // ANAS proxy hook). Installed by ANAS packages/pve-integration/install.sh.
 // Idempotent; the re-splice is perl-c-gated so a bad patch never breaks :8006.
-DPkg::Post-Invoke { "if [ -x ${SCRIPT_DIR}/install.sh ]; then ${SCRIPT_DIR}/install.sh || true; fi"; };
+// Every run is logged (journalctl -t anas-pve-integration); a failed re-apply
+// also raises a PVE notification. It never fails the apt run.
+DPkg::Post-Invoke { "if [ -x ${APT_REAPPLY} ]; then ${APT_REAPPLY} || true; fi"; };
 EOF
   echo "anas: installed apt hook ${APT_HOOK}"
 else

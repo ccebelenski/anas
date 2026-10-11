@@ -54,7 +54,9 @@ dist-release/anas-<version>.tar.gz
 ```
 
 The tarball untars to `anas-<version>/` containing `install.sh`, `uninstall.sh`,
-`VERSION`, `systemd/`, and `app/` (which becomes `/opt/anas`).
+`VERSION`, `anas-md-event.sh`, `anas-cache-event.sh`, `anas-cache.rules`,
+`app/` (which becomes `/opt/anas`), `systemd/`, and `templates/` (the PVE
+notification templates). `install.sh` must run from inside that directory.
 
 ## Install (on the target Proxmox VE node, as root)
 
@@ -87,7 +89,11 @@ separate app.
 
 1. **Preflight (mutates nothing, aborts early):** reports the version transition
    (fresh / reinstall / `upgrade X -> Y`; a **downgrade** warns and asks for
-   confirmation); then root, PVE node, Node.js ≥ 20, ZFS ≥ 2.2, and the hard
+   confirmation); checks the release is whole — a directory missing any file the
+   release ships (`VERSION` included) is refused with the directory checked, every
+   missing file, the expected layout, and the fix (re-extract the asset into a
+   fresh directory and run `./install.sh` from inside it; installer.1, GitHub
+   #74); then root, PVE node, Node.js ≥ 20, ZFS ≥ 2.2, and the hard
    dependencies (`acl`, `mdadm`, `btrfs-progs`, `samba`, `nfs-kernel-server`,
    `targetcli-fb` + `python3-rtslib-fb`) — each missing one is marked for
    install; warns on a busy `:3000`.

@@ -409,6 +409,62 @@ check "warning tells the operator how to finish by hand" \
   "grep -qi 'by hand' '${WORK}/uninstall.log'"
 rm -rf "${WORK}"
 
+echo "== 12. apt hook line: runs the logging wrapper, never fails apt (installer.1) =="
+# The hook's BODY (journald lines, the notification) is apt-reapply.test.sh's
+# job; this pins the LINE the real installer writes, and runs it the way apt
+# does (`sh -c <string>`) against a staged copy of the directory, so a failing
+# wrapper and an absent one are both proven to leave the apt run successful.
+setup_env
+make_anyevent "${PVE_PM}"
+PERL_BIN_OVERRIDE="" run_install; rc=$?
+HOOK="${HOOK_DIR}/hook"
+check "install exits 0" "[ ${rc} -eq 0 ]"
+check "exactly one DPkg::Post-Invoke line" "[ \"\$(grep -c 'DPkg::Post-Invoke' '${HOOK}')\" = '1' ]"
+HOOK_CMD="$(sed -n 's/^DPkg::Post-Invoke { "\(.*\)"; };$/\1/p' "${HOOK}")"
+check "the line is one quoted apt string (no inner double quote)" \
+  "[ -n \"\${HOOK_CMD}\" ] && [ \"\${HOOK_CMD}\" = \"\${HOOK_CMD//\\\"/}\" ]"
+check "the line is exactly the [ -x ] gate, the wrapper and || true" \
+  "[ \"\${HOOK_CMD}\" = 'if [ -x ${PKG}/apt-reapply.sh ]; then ${PKG}/apt-reapply.sh || true; fi' ]"
+check "the wrapper it names ships executable beside install.sh" "[ -x '${PKG}/apt-reapply.sh' ]"
+check "the hook comment points at the journald tag" "grep -qF 'journalctl -t anas-pve-integration' '${HOOK}'"
+if command -v apt-config >/dev/null 2>&1; then
+  check "apt-config parses the hook file" \
+    "apt-config -c '${HOOK}' dump 2>/dev/null | grep -qF 'DPkg::Post-Invoke'"
+fi
+# Run the line as apt would, retargeted at a staged directory.
+STAGE="${WORK}/stage"
+mkdir -p "${STAGE}"
+STAGED_CMD="${HOOK_CMD//${PKG}/${STAGE}}"
+printf '#!/bin/sh\ntouch "%s/wrapper-ran"\nexit 7\n' "${WORK}" > "${STAGE}/apt-reapply.sh"
+chmod +x "${STAGE}/apt-reapply.sh"
+sh -c "${STAGED_CMD}" >/dev/null 2>&1; rc=$?
+check "a wrapper exiting 7 still leaves the hook at exit 0" "[ ${rc} -eq 0 ]"
+check "the wrapper did run" "[ -f '${WORK}/wrapper-ran' ]"
+rm -f "${STAGE}/apt-reapply.sh" "${WORK}/wrapper-ran"
+sh -c "${STAGED_CMD}" >"${WORK}/hook.out" 2>&1; rc=$?
+check "ANAS gone (no wrapper): the hook is a silent no-op at exit 0" \
+  "[ ${rc} -eq 0 ] && [ ! -s '${WORK}/hook.out' ]"
+rm -rf "${WORK}"
+
+echo "== 13. no wrapper beside install.sh: refused before anything is touched =="
+setup_env
+make_anyevent "${PVE_PM}"
+cp "${PVE_PM}" "${PRISTINE}"
+cp "${TPL}" "${WORK}/tpl.pristine"
+NOWRAP="${WORK}/pkg-nowrap"
+mkdir -p "${NOWRAP}"
+cp -a "${PKG}/install.sh" "${PKG}/src" "${PKG}/perl" "${NOWRAP}/"
+PVE_TPL="${TPL}" PVE_JS_DIR="${JS_DIR}" APT_HOOK="${HOOK_DIR}/hook" \
+PVE_HTTP_SERVER_PM="${PVE_PM}" ANAS_PERL_DIR="${PERL_DIR}" \
+PVEPROXY_RESTART_CMD="touch '${RESTART_MARK}'" PERL_BIN=perl \
+  bash "${NOWRAP}/install.sh" >"${WORK}/install.log" 2>&1; rc=$?
+check "install exits non-zero" "[ ${rc} -ne 0 ]"
+check "error names the missing wrapper" "grep -qF 'apt-reapply.sh not found' '${WORK}/install.log'"
+check "no apt hook written" "[ ! -e '${HOOK_DIR}/hook' ]"
+check "template untouched" "cmp -s '${TPL}' '${WORK}/tpl.pristine'"
+check "PVE module untouched" "cmp -s '${PVE_PM}' '${PRISTINE}'"
+rm -rf "${WORK}"
+
 echo
 echo "proxy-install tests: ${PASS} passed, ${FAIL} failed"
 [ "${FAIL}" -eq 0 ]

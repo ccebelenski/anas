@@ -52,9 +52,10 @@ MIN_ZFS="2.2"
 # TYPE, so operators can match on the kind of event): anas-ahr = array/pool
 # events (AHR §7.2), anas-backup = backup-run results (16.12), anas-snapshot =
 # snapshot-schedule run failures and anas-replication = replication run
-# failures (9.4), anas-cloud = cloud sync run results (rclone.2). Listed once —
-# the preflight check and the install step both read this list, and
-# uninstall.sh removes exactly the same names.
+# failures (9.4), anas-cloud = cloud sync run results (rclone.2),
+# anas-integration = a failed re-apply of the PVE UI integration by the apt
+# hook (installer.1). Listed once — the preflight check and the install step
+# both read this list, and uninstall.sh removes exactly the same names.
 NOTIFY_TEMPLATES=(
   anas-ahr-subject.txt.hbs
   anas-ahr-body.txt.hbs
@@ -66,6 +67,8 @@ NOTIFY_TEMPLATES=(
   anas-replication-body.txt.hbs
   anas-cloud-subject.txt.hbs
   anas-cloud-body.txt.hbs
+  anas-integration-subject.txt.hbs
+  anas-integration-body.txt.hbs
 )
 
 # The iSCSI boot-ordering drop-in (story iscsi.5). rtslib-fb-targetctl.service
@@ -278,6 +281,59 @@ EOF
 }
 
 # =============================================================================
+# Release completeness (GitHub #74) — read-only, unit-testable.
+# =============================================================================
+
+# What the release tarball unpacks to (make-release.sh), in one line. Printed in
+# the refusal so an operator can compare it with what is actually there.
+RELEASE_LAYOUT="install.sh uninstall.sh VERSION anas-md-event.sh anas-cache-event.sh anas-cache.rules app/ systemd/ templates/"
+
+# Record a missing release path once (a directory carries its trailing slash).
+release_missing() {
+  local m
+  for m in "${RELEASE_MISSING[@]}"; do [ "${m}" = "$1" ] && return 0; done
+  RELEASE_MISSING+=("$1")
+}
+
+# release_need <path relative to SCRIPT_DIR> — a trailing slash means a
+# directory, anything else a regular file. When the path's top-level directory
+# is missing altogether, that directory is recorded once instead of every file
+# under it (a missing app/ is one finding, not four).
+release_need() {
+  local rel="$1" top
+  case "${rel}" in
+    */*)
+      top="${rel%%/*}"
+      if [ ! -d "${SCRIPT_DIR}/${top}" ]; then
+        release_missing "${top}/"
+        return 0
+      fi
+      ;;
+  esac
+  case "${rel}" in
+    */) [ -d "${SCRIPT_DIR}/${rel%/}" ] || release_missing "${rel}" ;;
+    *)  [ -f "${SCRIPT_DIR}/${rel}" ]   || release_missing "${rel}" ;;
+  esac
+}
+
+# The refusal's "release incomplete" entry: the directory checked, every missing
+# path by name, the expected layout, and the fix. Continuation lines carry the
+# six-space indent the other multi-line preflight entries use.
+release_incomplete_message() {
+  local ver="<version>" missing
+  [ -n "${NEW_VERSION:-}" ] && [ "${NEW_VERSION}" != "unknown" ] && ver="${NEW_VERSION}"
+  missing="$(printf '%s, ' "${RELEASE_MISSING[@]}")"
+  missing="${missing%, }"
+  printf 'release incomplete: the directory install.sh runs from is not a whole ANAS release.\n'
+  printf '      checked:  %s\n' "${SCRIPT_DIR}"
+  printf '      missing:  %s\n' "${missing}"
+  printf '      expected: %s\n' "${RELEASE_LAYOUT}"
+  printf '      fix:      re-extract the release asset into a fresh, empty directory and run ./install.sh from inside it:\n'
+  printf '                mkdir anas-fresh && tar xzf anas-%s.tar.gz -C anas-fresh\n' "${ver}"
+  printf '                cd anas-fresh/anas-%s && sudo ./install.sh' "${ver}"
+}
+
+# =============================================================================
 # PHASE 0 — preflight (read-only; mutate nothing; abort early)
 # =============================================================================
 NEED_NODE_INSTALL=0
@@ -289,6 +345,7 @@ NEED_NFS_INSTALL=0
 NEED_TARGETCLI_INSTALL=0
 NEED_RCLONE_INSTALL=0
 FATAL=()
+RELEASE_MISSING=()
 
 phase0_preflight() {
   log "Preflight checks (no changes will be made)..."
@@ -315,28 +372,30 @@ phase0_preflight() {
     info "upgrade: ANAS ${OLD_VERSION} -> ${NEW_VERSION}"
   fi
 
-  # Layout sanity — the release must be intact.
-  [ -d "${APP_SRC}" ]  || FATAL+=("release incomplete: app/ not found next to install.sh")
-  [ -f "${UNIT_SRC}/anasd.service" ] && [ -f "${UNIT_SRC}/anas.service" ] \
-    || FATAL+=("release incomplete: systemd/ unit files not found")
-  [ -f "${SCRIPT_DIR}/anas-md-event.sh" ] \
-    || FATAL+=("release incomplete: anas-md-event.sh not found next to install.sh")
-  [ -f "${SCRIPT_DIR}/anas-cache-event.sh" ] && [ -f "${SCRIPT_DIR}/anas-cache.rules" ] \
-    || FATAL+=("release incomplete: anas-cache-event.sh / anas-cache.rules not found next to install.sh")
-  [ -f "${UNIT_SRC}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}" ] \
-    || FATAL+=("release incomplete: systemd/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE} not found next to install.sh")
-  [ -f "${UNIT_SRC}/${RECYCLE_TIMER}" ] && [ -f "${UNIT_SRC}/${RECYCLE_SERVICE}" ] \
-    || FATAL+=("release incomplete: systemd/${RECYCLE_TIMER} / ${RECYCLE_SERVICE} not found next to install.sh")
-  [ -f "${APP_SRC}/packages/daemon/dist/recycle-purge.js" ] \
-    || FATAL+=("release incomplete: app/packages/daemon/dist/recycle-purge.js not found (recycle purge runner)")
-  [ -f "${APP_SRC}/packages/daemon/dist/backup-task.js" ] \
-    || FATAL+=("release incomplete: app/packages/daemon/dist/backup-task.js not found (backup runner)")
-  [ -f "${APP_SRC}/packages/daemon/dist/cloud-task.js" ] \
-    || FATAL+=("release incomplete: app/packages/daemon/dist/cloud-task.js not found (cloud sync runner)")
+  # Layout sanity — the release must be intact. Every path is relative to the
+  # directory this install.sh runs from; a miss is collected by name and the
+  # refusal names that directory, the files, the layout and the fix (GitHub #74:
+  # the old one-line-per-file refusal named neither the directory nor the fix).
+  RELEASE_MISSING=()
+  release_need app/
+  release_need VERSION
+  release_need systemd/anasd.service
+  release_need systemd/anas.service
+  release_need anas-md-event.sh                                  # mdadm PROGRAM hook (AHR §7.2)
+  release_need anas-cache-event.sh                               # AHR cache removal hook
+  release_need anas-cache.rules
+  release_need "systemd/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}"
+  release_need "systemd/${RECYCLE_TIMER}"
+  release_need "systemd/${RECYCLE_SERVICE}"
+  release_need app/packages/daemon/dist/recycle-purge.js         # recycle purge runner
+  release_need app/packages/daemon/dist/backup-task.js           # backup runner
+  release_need app/packages/daemon/dist/cloud-task.js            # cloud sync runner
   for tpl in "${NOTIFY_TEMPLATES[@]}"; do
-    [ -f "${SCRIPT_DIR}/templates/${tpl}" ] \
-      || FATAL+=("release incomplete: templates/${tpl} not found next to install.sh")
+    release_need "templates/${tpl}"
   done
+  if [ "${#RELEASE_MISSING[@]}" -gt 0 ]; then
+    FATAL+=("$(release_incomplete_message)")
+  fi
 
   # Root.
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -803,7 +862,8 @@ phase1_install() {
     install -m 0644 "${SCRIPT_DIR}/VERSION" "${PREFIX}/VERSION"
   fi
   chmod +x "${PREFIX}/packages/pve-integration/install.sh" \
-           "${PREFIX}/packages/pve-integration/uninstall.sh" 2>/dev/null || true
+           "${PREFIX}/packages/pve-integration/uninstall.sh" \
+           "${PREFIX}/packages/pve-integration/apt-reapply.sh" 2>/dev/null || true
 
   # 2b. Install the mdadm md-event hook (AHR §7.2). Inert until the daemon
   # wires a PROGRAM line in mdadm.conf at pool-create time. Idempotent
@@ -830,9 +890,12 @@ phase1_install() {
   udevadm control --reload-rules >/dev/null 2>&1 || true
 
   # 2c. Install the ANAS notification templates (AHR §7.2, GT-17). They live
-  # in pve-manager's template dir, so a pve-manager upgrade can wipe them —
-  # the DPkg::Post-Invoke apt hook re-runs this installer (same protection as
-  # index.html.tpl). Overridable for tests.
+  # in pve-manager's template dir but dpkg does not own them, so a pve-manager
+  # upgrade leaves them in place (seen across repeated `apt-get install
+  # --reinstall pve-manager` runs in installer.1's live proof). The apt hook
+  # re-runs packages/pve-integration/install.sh, NOT this installer, so nothing
+  # re-installs them if they are ever removed; re-running this installer does.
+  # Overridable for tests.
   PVE_TEMPLATE_DIR="${PVE_TEMPLATE_DIR:-/usr/share/pve-manager/templates/default}"
   if [ -d "$(dirname "${PVE_TEMPLATE_DIR}")" ]; then
     info "installing PVE notification templates -> ${PVE_TEMPLATE_DIR}"

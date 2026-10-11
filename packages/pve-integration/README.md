@@ -48,6 +48,7 @@ joined verbatim.
 | `src/90-register.js`   | Wires `ANAS.views` into the node menu in a fixed order.          |
 | `install.sh`           | Idempotent installer — concatenates `src/*.js` → `/usr/share/pve-manager/js/anas.js` (served at `/pve2/js/anas.js`), inserts the tpl line, installs the apt hook. |
 | `uninstall.sh`         | Surgical uninstaller — removes only our tpl line and only our proxy-hook block. |
+| `apt-reapply.sh`       | The apt hook's body — re-runs `install.sh`, logs start, output and exit status to journald (`-t anas-pve-integration`), and on a failure sends one PVE notification (warning, type `anas-integration`) naming the manual fix. Always exits 0. |
 
 ## Mechanism
 
@@ -82,8 +83,14 @@ the one fragile point in the whole integration. Mitigations:
   `src="/pve2/js/anas.js"`, with **no marker comments** (PRINCIPLES #12: we
   don't tag the host's files).
 - An **apt hook** at `/etc/apt/apt.conf.d/80anas-pve-integration` adds a
-  `DPkg::Post-Invoke` command that re-runs `install.sh` after every dpkg
-  transaction, re-applying the line after a pve-manager upgrade.
+  `DPkg::Post-Invoke` command that runs `apt-reapply.sh` after every dpkg
+  transaction, which re-runs `install.sh` and so re-applies the line after a
+  pve-manager upgrade (installer.1, GitHub #74). Every run is logged to
+  journald under the tag `anas-pve-integration` (start line, the installer's
+  output, a result line with the exit status); a failed run also sends one PVE
+  notification, severity warning, template/type `anas-integration`, naming the
+  fix (`install.sh` as root). The line keeps `[ -x … ] … || true`, and the
+  wrapper always exits 0, so a failed re-apply never fails the apt run.
 - `uninstall.sh` removes **only** our line (matched by its exact `src`),
   leaving the rest of the template byte-for-byte pristine.
 

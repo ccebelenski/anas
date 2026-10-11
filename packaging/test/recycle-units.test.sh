@@ -71,8 +71,11 @@ else
 fi
 
 echo "== 3. install.sh wires the pair =="
-check "preflight requires the timer" "grep -qF 'release incomplete: systemd/\${RECYCLE_TIMER}' '${INSTALL}'"
-check "preflight requires the runner in app/dist" "grep -qF 'release incomplete: app/packages/daemon/dist/recycle-purge.js' '${INSTALL}'"
+# installer.1 moved the completeness checks onto release_need (one collected
+# refusal naming the directory and the fix); the requirement is unchanged and is
+# also proven behaviourally in preflight-refusal.test.sh section 6.
+check "preflight requires the timer" "grep -qF 'release_need \"systemd/\${RECYCLE_TIMER}\"' '${INSTALL}'"
+check "preflight requires the runner in app/dist" "grep -qF 'release_need app/packages/daemon/dist/recycle-purge.js' '${INSTALL}'"
 check "install_units installs both unit files" "grep -qF 'for u in \"\${RECYCLE_SERVICE}\" \"\${RECYCLE_TIMER}\"' '${INSTALL}'"
 check "the timer is enabled --now at install" "grep -qF 'systemctl enable --now anas-recycle.timer' '${INSTALL}'"
 check "rollback disables and removes the pair" \

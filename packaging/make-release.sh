@@ -167,6 +167,9 @@ mkdir -p "${PVE_DST}/perl"
 install -m 0644 "${PVE_SRC}/perl/AnasProxy.pm" "${PVE_DST}/perl/AnasProxy.pm"
 install -m 0755 "${PVE_SRC}/install.sh"   "${PVE_DST}/install.sh"
 install -m 0755 "${PVE_SRC}/uninstall.sh" "${PVE_DST}/uninstall.sh"
+# The apt hook's body (installer.1): the DPkg::Post-Invoke line runs it, and it
+# runs install.sh with journald logging + a PVE notification on failure.
+install -m 0755 "${PVE_SRC}/apt-reapply.sh" "${PVE_DST}/apt-reapply.sh"
 # Ship the README too if present (operator docs for the fragile tpl step).
 [ -f "${PVE_SRC}/README.md" ] && cp "${PVE_SRC}/README.md" "${PVE_DST}/README.md"
 
