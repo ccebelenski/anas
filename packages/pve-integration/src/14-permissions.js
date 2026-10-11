@@ -29,7 +29,11 @@
  *     the degraded lock, the explicit clear — is identical.
  *
  * Applying to existing files is always the user's explicit choice and is
- * confirmed before the job is sent (access.1 design ruling).
+ * confirmed (access.1 design ruling). The confirm is the daemon's (ruling
+ * 2026-10-11): a recursive PUT answers 409 + X-Anas-Confirm-Code, and
+ * ANAS.confirmAndRun shows the 409's headline and warnings — on ZFS the
+ * child datasets the walk crosses and those whose ACLs it switches on first,
+ * on a Hybrid RAID pool the subvolume sweep — then resends with the code.
  *
  * Base three principals (owner / owning-group / everyone) map to POSIX mode
  * bits; extra named users/groups map to POSIX ACL entries. Data contract:
@@ -110,16 +114,6 @@
                 + 'pool\'s data as one tree; its snapshots are never touched.');
         }
         return base;
-    }
-
-    // The confirm shown before a recursive apply is sent.
-    function recursiveConfirmText(backing, title) {
-        var msg = t('This also rewrites the owner, mode and access entries of every file '
-            + 'and folder already under') + ' ' + title + '.';
-        if (backing === 'ahr') {
-            msg += ' ' + t('It walks every subvolume under the pool\'s data; snapshots are not touched.');
-        }
-        return msg + ' ' + t('Continue?');
     }
 
     // Plain-language level dropdown options (label ↔ schema value).
@@ -881,46 +875,40 @@
         }
 
         var title = '' + (opts.title || '');
-        function send() {
-            ANAS.runJob({
-                node: opts.node,
-                method: 'put',
-                path: opts.accessPath,
-                body: body,
-                view: win,
-                failTitle: 'Set permissions failed',
-                successMsg: t('Permissions updated') + ': ' + title,
-                onComplete: function (job) {
-                    if (!win.destroyed && !win.destroying) {
-                        win.close();
-                    }
-                    if (opts.onDone) { opts.onDone(job); }
-                },
-                onFailed: function (job) {
-                    if (opts.onFailed) { opts.onFailed(job); }
-                },
-            });
-        }
-
         // Rewriting the files already there is the user's explicit choice —
-        // ticked here AND confirmed before anything is sent.
-        if (applyToExisting) {
-            Ext.Msg.confirm(t('Apply to existing files'),
-                enc(recursiveConfirmText(win._backing, title)),
-                function (btn) {
-                    if (btn === 'yes') { send(); }
-                });
-            return;
-        }
-        send();
+        // ticked here AND confirmed. The daemon owns the confirm (ruling
+        // 2026-10-11): a recursive PUT answers 409 + X-Anas-Confirm-Code, and
+        // the standard flow shows its headline and warnings (the child
+        // datasets it crosses, the subvolume sweep, a LUN image under the
+        // path) and resends with the code on OK.
+        ANAS.confirmAndRun({
+            node: opts.node,
+            method: 'put',
+            path: opts.accessPath,
+            body: body,
+            view: win,
+            confirmTitle: t('Apply to existing files'),
+            confirmHeadline: true,
+            failTitle: 'Set permissions failed',
+            successMsg: t('Permissions updated') + ': ' + title,
+            onComplete: function (job) {
+                if (!win.destroyed && !win.destroying) {
+                    win.close();
+                }
+                // ZFS: the child datasets whose POSIX ACLs the walk switched on.
+                var kids = job && job.result && job.result.childAclEnabled;
+                if (kids && kids.length) {
+                    ANAS.toast(enc(t('POSIX ACLs switched on for child datasets') + ': ' + kids.join(', ')));
+                }
+                if (opts.onDone) { opts.onDone(job); }
+            },
+            onFailed: function (job) {
+                if (opts.onFailed) { opts.onFailed(job); }
+            },
+        });
     }
 
     ANAS.permissions = {
         open: open,
-        // Exposed for the share dialogs' "apply to existing files" confirm:
-        // the same sentence, so the two doors say the same thing.
-        recursiveConfirmText: function (backing, title) {
-            return recursiveConfirmText(normBacking(backing), title);
-        },
     };
 })();

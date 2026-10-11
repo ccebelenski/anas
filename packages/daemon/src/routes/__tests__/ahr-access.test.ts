@@ -122,6 +122,20 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
 
   const put = (body: unknown) => server!.inject({ method: 'PUT', url: URL, headers: JSON_HEADERS, payload: JSON.stringify(body) })
 
+  /**
+   * Operator ruling 2026-10-11: a recursive apply answers 409 +
+   * X-Anas-Confirm-Code first (asserted here); the resend with the code is
+   * the response returned.
+   */
+  async function putConfirmed(body: unknown) {
+    const first = await put(body)
+    assert.equal(first.statusCode, 409, first.body)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    const code = first.headers['x-anas-confirm-code']
+    assert.ok(typeof code === 'string' && code.length > 0, 'the 409 carries X-Anas-Confirm-Code')
+    return server!.inject({ method: 'PUT', url: URL, headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload: JSON.stringify(body) })
+  }
+
   // --- GET ------------------------------------------------------------------
   describe('GET', () => {
     it('ahr GET maps a live POSIX ACL into base + named entries, with no acltype read', async () => {
@@ -218,7 +232,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
     it('ahr recursive base-only chmod uses symbolic X, not a blanket numeric +x', async () => {
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server)
-      const res = await put({
+      const res = await putConfirmed({
         entries: [
           { kind: 'owner', level: 'read-write' },
           { kind: 'owning-group', level: 'read' },
@@ -303,7 +317,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
     it('ahr recursive clear folds the setgid drop into a single chmod -R', async () => {
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server, [{ command: '/usr/bin/getfacl', args: ['-pcE', MP], result: ok(GETFACL_WITH_ALICE) }])
-      const res = await put({ clearNamed: true, applyToExisting: true, entries: [
+      const res = await putConfirmed({ clearNamed: true, applyToExisting: true, entries: [
         { kind: 'owner', level: 'read-write' },
         { kind: 'owning-group', level: 'read' },
         { kind: 'everyone', level: 'read' },
@@ -348,7 +362,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
     it('ahr applyToExisting adds -R to chown, setfacl (access + default) and chmod g+s — the whole @data tree', async () => {
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server)
-      const res = await put({
+      const res = await putConfirmed({
         owner: 'media',
         entries: [
           { kind: 'owner', level: 'read-write' },
@@ -369,6 +383,30 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       // outside it, so no command ever names a snapshot path.
       assert.equal(calls.some(c => c.args.some(a => a.includes('@snapshots'))), false)
       assertNoAcltypeStep(calls)
+    })
+
+    it('ahr applyToExisting answers 409 + X-Anas-Confirm-Code with the rewrite headline and the subvolume sweep; nothing runs until the resend', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server)
+      const res = await put({ owner: 'media', applyToExisting: true })
+      assert.equal(res.statusCode, 409)
+      assert.ok(res.headers['x-anas-confirm-code'], 'confirm code header')
+      const err = res.json().error as { code: string, message: string, warnings: string[] }
+      assert.equal(err.code, 'CONFIRMATION_REQUIRED')
+      assert.equal(err.message, `Applying to existing files rewrites the permissions of every file and directory under '${MP}'`)
+      assert.ok(err.warnings.some(w => /sweeps every subvolume under the pool's data as one tree; the pool's snapshots are not touched/.test(w)), JSON.stringify(err.warnings))
+      assert.ok(err.warnings.some(w => /cannot be undone/.test(w)), JSON.stringify(err.warnings))
+      assert.equal(err.warnings.some(w => /iSCSI/.test(w)), false, 'no LUN on this pool, no LUN sentence')
+      assert.equal(calls.some(c => ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl'].includes(c.command)), false, 'nothing ran')
+      assertNoAcltypeStep(calls)
+      // A wrong code is a fresh challenge, never a pass.
+      const wrong = await server.inject({ method: 'PUT', url: URL, headers: { ...JSON_HEADERS, 'x-anas-confirm': 'nope' }, payload: JSON.stringify({ owner: 'media', applyToExisting: true }) })
+      assert.equal(wrong.statusCode, 409)
+      const ok2 = await server.inject({ method: 'PUT', url: URL, headers: { ...JSON_HEADERS, 'x-anas-confirm': wrong.headers['x-anas-confirm-code'] as string }, payload: JSON.stringify({ owner: 'media', applyToExisting: true }) })
+      assert.equal(ok2.statusCode, 202)
+      const job = await waitForJob(server, (ok2.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['-R', 'media', MP])
     })
 
     it('ahr applyToExisting is refused when a PVE storage path sits inside the tree; the flat change is not', async () => {
@@ -413,8 +451,8 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       }
     })
 
-    it('ahr access change on a pool a LUN image lives on → 409 held-by-lun, nothing runs', async () => {
-      // The real LIO capture, with its fileio LUN's image moved onto ahr0.
+    /** The real LIO capture, with its fileio LUN's image moved onto ahr0. */
+    async function lunOnAhr0(): Promise<void> {
       const manifest = readFileSync(join(ISCSI_FIXTURES, 'configfs-live.manifest'), 'utf-8')
         .split('/gtiscsi/images/lun2.raw')
         .join(`${MP}/images/block1.raw`)
@@ -423,20 +461,35 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       process.env.ANAS_ISCSI_CONFIGFS = root
       process.env.ANAS_ISCSI_SAVECONFIG = join(dir, 'absent-saveconfig.json')
       process.env.ANAS_ISCSI_SYS_BLOCK = join(dir, 'absent-block')
+    }
 
+    it('ahr access change on a pool a LUN image lives on is NOT refused (ruling 2026-10-11): the change runs, the row still discloses the LUN', async () => {
+      await lunOnAhr0()
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server)
       const res = await put({ entries: [{ kind: 'everyone', level: 'read' }] })
-      assert.equal(res.statusCode, 409)
-      assert.equal(res.json().error.reason, 'held-by-lun')
-      assert.match(res.json().error.message, /permissions of AHR pool 'ahr0'/)
-      assert.match(res.json().error.message, /no confirm bypass/)
-      assert.equal(res.headers['x-anas-confirm-code'], undefined)
-      assert.equal(find(calls, '/usr/bin/chmod', () => true), undefined)
-      assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.ok(find(calls, '/usr/bin/chmod', () => true), 'the mode change ran')
       // The read is never gated — the editor opens and shows the state.
       const read = await server.inject({ method: 'GET', url: URL, headers: IDENTITY_HEADERS })
       assert.equal(read.statusCode, 200)
+      // The disclosure stays on the pool's read payload.
+      const pools = await server.inject({ method: 'GET', url: '/v1/ahr', headers: IDENTITY_HEADERS })
+      const row = (pools.json() as { data: { name: string, heldByLun?: { targetIqn: string } }[] }).data.find(p => p.name === POOL)
+      assert.ok(row?.heldByLun?.targetIqn, JSON.stringify(row))
+    })
+
+    it('ahr recursive apply on a LUN-holding pool: the confirm names the LUN image the walk includes', async () => {
+      await lunOnAhr0()
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server)
+      const res = await put({ owner: 'media', applyToExisting: true })
+      assert.equal(res.statusCode, 409, res.body)
+      const warnings = res.json().error.warnings as string[]
+      assert.ok(warnings.some(w => /iSCSI LUN \d+ '[^']+' of target \S+ \(\/mnt\/anas-ahr\/ahr0\/images\/block1\.raw\)/.test(w) && /its contents do not/.test(w)), JSON.stringify(warnings))
+      assert.equal(find(calls, '/usr/bin/chown', () => true), undefined, 'nothing ran before the confirm')
     })
   })
 

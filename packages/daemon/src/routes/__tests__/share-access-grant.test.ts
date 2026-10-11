@@ -5,8 +5,10 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
+import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { zfsListArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
 import { sharePrincipals } from '../../services/access.js'
@@ -29,6 +31,9 @@ const IDENTITY_HEADERS = {
 const JSON_HEADERS = { ...IDENTITY_HEADERS, 'content-type': 'application/json' }
 
 const MP = '/testpool/media'
+/** The dev mock's AHR pool mount (a fresh btrfs directory). */
+const AHR_MP = '/mnt/anas-ahr/ahr0'
+const ISCSI_FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/iscsi')
 const ACLTYPE_MEDIA = ['get', '-Hp', '-o', 'value', 'acltype', 'testpool/media']
 /** The mountpoint table the path resolver reads (the default mock has none). */
 const MOUNTPOINTS = 'testpool\t/testpool\ntestpool/media\t/testpool/media\ntestpool/x\t/testpool/x\ntestpool/x/data\t/testpool/x/data\n'
@@ -132,6 +137,27 @@ describe('access.1 — the share-path grant', () => {
     return waitForJob((res.json() as JobAccepted).job.id)
   }
 
+  /**
+   * Operator ruling 2026-10-11: "apply to existing files" is the editor's
+   * recursive apply and answers 409 + X-Anas-Confirm-Code first (asserted
+   * here, nothing written yet); the resend with the code runs the job.
+   */
+  async function confirmedJob(method: 'POST' | 'PUT', url: string, body: Record<string, unknown>): Promise<Job> {
+    const before = readFileSync(confPath, 'utf8')
+    const first = await server!.inject({ method, url, headers: JSON_HEADERS, payload: JSON.stringify(body) })
+    assert.equal(first.statusCode, 409, first.body)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    const code = first.headers['x-anas-confirm-code']
+    assert.ok(typeof code === 'string' && code.length > 0, 'the 409 carries X-Anas-Confirm-Code')
+    assert.equal(readFileSync(confPath, 'utf8'), before, 'nothing written before the confirm')
+    const res = await server!.inject({ method, url, headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload: JSON.stringify(body) })
+    assert.equal(res.statusCode, 202, res.body)
+    return waitForJob((res.json() as JobAccepted).job.id)
+  }
+
+  const createConfirmed = (body: Record<string, unknown>) => confirmedJob('POST', '/v1/shares/smb', body)
+  const updateConfirmed = (name: string, body: Record<string, unknown>) => confirmedJob('PUT', `/v1/shares/smb/${name}`, body)
+
   const grantOf = (job: Job) => (job.result as { grant?: ShareAccessGrantResult }).grant
 
   // --- create ------------------------------------------------------------------
@@ -189,11 +215,26 @@ describe('access.1 — the share-path grant', () => {
 
   it('share grant with applyToExisting runs the editor\'s recursive job (-R, capital X)', async () => {
     const { calls } = start()
-    const job = await create({ name: 'media', path: MP, readOnly: true, validUsers: ['media'], grantAccess: { applyToExisting: true } })
+    const job = await createConfirmed({ name: 'media', path: MP, readOnly: true, validUsers: ['media'], grantAccess: { applyToExisting: true } })
     assert.equal(grantOf(job)!.status, 'applied')
     const spec = 'u::rwx,g::r-X,o::r-X,u:media:r-X,m::rwx'
     assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '--set'), ['-R', '--set', spec, MP])
     assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-d'), ['-R', '-d', '--set', spec, MP])
+  })
+
+  it('share grant applyToExisting on ZFS switches ACLs on for a child dataset under the path first, and lists it (ruling 2026-10-11)', async () => {
+    const { calls } = start([{
+      command: '/usr/sbin/zfs',
+      args: ['list', '-r', '-H', '-o', 'name,mountpoint,acltype', 'testpool/media'],
+      result: ok('testpool/media\t/testpool/media\toff\ntestpool/media/kids\t/testpool/media/kids\toff\n'),
+    }])
+    const job = await createConfirmed({ name: 'media', path: MP, validUsers: ['media'], grantAccess: { applyToExisting: true } })
+    const grant = grantOf(job)!
+    assert.equal(grant.status, 'applied', grant.message)
+    assert.deepEqual(grant.childAclEnabled, ['testpool/media/kids'])
+    const enable = calls.findIndex(c => c.command === '/usr/sbin/zfs' && c.args.join(' ') === 'set acltype=posixacl xattr=sa testpool/media/kids')
+    const walk = calls.findIndex(c => c.command === '/usr/bin/setfacl' && c.args[0] === '-R')
+    assert.ok(enable >= 0 && walk > enable, `child enabled (#${enable}) before the walk (#${walk})`)
   })
 
   it('share create without grantAccess runs no permission command and the result is unchanged', async () => {
@@ -226,6 +267,51 @@ describe('access.1 — the share-path grant', () => {
     assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
   })
 
+  it('share grant on an AHR pool that holds an iSCSI LUN image is applied (ruling 2026-10-11: no held-by-LUN refusal)', async () => {
+    const saved = {
+      configfs: process.env.ANAS_ISCSI_CONFIGFS,
+      block: process.env.ANAS_ISCSI_SYS_BLOCK,
+      saveconfig: process.env.ANAS_ISCSI_SAVECONFIG,
+    }
+    // The iSCSI paths are read when the server is built, so the LIO tree
+    // goes in its own temp dir before start().
+    const lio = mkdtempSync(join(tmpdir(), 'anas-share-grant-lio-'))
+    try {
+      // The real LIO capture, with its fileio LUN's image moved onto ahr0.
+      const manifest = readFileSync(join(ISCSI_FIXTURES, 'configfs-live.manifest'), 'utf-8')
+        .split('/gtiscsi/images/lun2.raw')
+        .join(`${AHR_MP}/images/block1.raw`)
+      const root = join(lio, 'target')
+      await materializeConfigfsManifest(manifest, root)
+      process.env.ANAS_ISCSI_CONFIGFS = root
+      process.env.ANAS_ISCSI_SAVECONFIG = join(lio, 'absent-saveconfig.json')
+      process.env.ANAS_ISCSI_SYS_BLOCK = join(lio, 'absent-block')
+      const { calls } = start()
+      // The pool really is held: its row says so.
+      const pools = await server!.inject({ method: 'GET', url: '/v1/ahr', headers: IDENTITY_HEADERS })
+      const row = (pools.json() as { data: { name: string, heldByLun?: { targetIqn: string } }[] }).data.find(p => p.name === 'ahr0')
+      assert.ok(row?.heldByLun?.targetIqn, JSON.stringify(row))
+
+      const job = await create({ name: 'ahrshare', path: AHR_MP, validUsers: ['media'], grantAccess: {} })
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const grant = grantOf(job)!
+      assert.equal(grant.status, 'applied', grant.message)
+      assert.deepEqual(grant.granted, [{ kind: 'user', name: 'media', level: 'read-write' }])
+      // btrfs: native ACLs — the grant is written with no acltype step.
+      assert.ok(find(calls, '/usr/bin/setfacl', a => a[0] === '--set' && a[2] === AHR_MP), 'the ACL was written on the pool mount')
+      assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined)
+    }
+    finally {
+      for (const [key, value] of [['ANAS_ISCSI_CONFIGFS', saved.configfs], ['ANAS_ISCSI_SYS_BLOCK', saved.block], ['ANAS_ISCSI_SAVECONFIG', saved.saveconfig]] as const) {
+        if (value === undefined)
+          delete process.env[key]
+        else
+          process.env[key] = value
+      }
+      rmSync(lio, { recursive: true, force: true })
+    }
+  })
+
   it('share grant applyToExisting over a PVE-owned descendant → share created, grant refused naming it', async () => {
     const nested = JSON.stringify({
       output_version: { command: 'zfs list', vers_major: 0, vers_minor: 1 },
@@ -240,7 +326,7 @@ describe('access.1 — the share-path grant', () => {
       BASE_CONF,
       'zfspool: local-zfs\n\tpool testpool/x/data\n\tcontent images,rootdir\n',
     )
-    const job = await create({ name: 'x', path: '/testpool/x', validUsers: ['media'], grantAccess: { applyToExisting: true } })
+    const job = await createConfirmed({ name: 'x', path: '/testpool/x', validUsers: ['media'], grantAccess: { applyToExisting: true } })
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.ok(readFileSync(confPath, 'utf8').includes('[x]'))
     const grant = grantOf(job)!
@@ -261,7 +347,7 @@ describe('access.1 — the share-path grant', () => {
 
   it('share edit with no principal change but an explicit applyToExisting runs the recursive grant', async () => {
     const { calls } = start([], MEDIA_SHARE)
-    const job = await update('media', { grantAccess: { applyToExisting: true } })
+    const job = await updateConfirmed('media', { grantAccess: { applyToExisting: true } })
     assert.equal(grantOf(job)!.status, 'applied')
     assert.ok(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '--set'), 'the -R walk ran')
   })
@@ -296,6 +382,44 @@ describe('access.1 — the share-path grant', () => {
     assert.equal(data.entries.length, 3)
     const missing = await server!.inject({ method: 'GET', url: '/v1/shares/smb/nope/access', headers: IDENTITY_HEADERS })
     assert.equal(missing.statusCode, 404)
+  })
+
+  it('every share door that can carry applyToExisting answers 409 + X-Anas-Confirm-Code with the rewrite headline (ruling 2026-10-11)', async () => {
+    const savedExports = process.env.ANAS_EXPORTS_PATH
+    const exportsDir = mkdtempSync(join(tmpdir(), 'anas-share-grant-nfs-'))
+    const exportsPath = join(exportsDir, 'exports')
+    writeFileSync(exportsPath, `${MP} 10.0.0.0/24(rw,sync,no_subtree_check)\n`, 'utf8')
+    process.env.ANAS_EXPORTS_PATH = exportsPath
+    try {
+      const { calls } = start([], MEDIA_SHARE)
+      const headline = `Applying to existing files rewrites the permissions of every file and directory under '${MP}'`
+      const doors: { method: 'POST' | 'PUT', url: string, body: Record<string, unknown> }[] = [
+        { method: 'POST', url: '/v1/shares/smb', body: { name: 'media2', path: MP, validUsers: ['media'], grantAccess: { applyToExisting: true } } },
+        { method: 'PUT', url: '/v1/shares/smb/media', body: { grantAccess: { applyToExisting: true } } },
+        { method: 'PUT', url: '/v1/shares/smb/media/access', body: { owner: 'media', applyToExisting: true } },
+        { method: 'PUT', url: `/v1/shares/nfs/${encodeURIComponent(MP)}/access`, body: { owner: 'media', applyToExisting: true } },
+      ]
+      for (const door of doors) {
+        const res = await server!.inject({ method: door.method, url: door.url, headers: JSON_HEADERS, payload: JSON.stringify(door.body) })
+        assert.equal(res.statusCode, 409, `${door.method} ${door.url}: ${res.body}`)
+        assert.ok(res.headers['x-anas-confirm-code'], `${door.method} ${door.url}: confirm code`)
+        assert.equal(res.json().error.message, headline, `${door.method} ${door.url}`)
+        assert.ok((res.json().error.warnings as string[]).some(w => /cannot be undone/.test(w)))
+      }
+      // Nothing was written or run behind any 409.
+      assert.ok(!readFileSync(confPath, 'utf8').includes('[media2]'), 'the create did not happen')
+      assert.equal(calls.some(c => ['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown'].includes(c.command)), false)
+      // The same doors without applyToExisting are not gated.
+      const flat = await server!.inject({ method: 'PUT', url: '/v1/shares/smb/media/access', headers: JSON_HEADERS, payload: JSON.stringify({ owner: 'media' }) })
+      assert.equal(flat.statusCode, 202)
+    }
+    finally {
+      if (savedExports === undefined)
+        delete process.env.ANAS_EXPORTS_PATH
+      else
+        process.env.ANAS_EXPORTS_PATH = savedExports
+      rmSync(exportsDir, { recursive: true, force: true })
+    }
   })
 
   it('share access PUT runs fs.setAccess on the share path', async () => {

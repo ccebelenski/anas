@@ -724,7 +724,7 @@ export function createServer(opts?: ServerOptions) {
   server.register(ahrSnapshotRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, intentDir: ahrIntentDir })
   // AHR permissions editor (story access.2) — the datasets editor's writer on
   // the pool's mount, through the shared access service.
-  server.register(ahrAccessRoutes, { prefix: '/v1', executor, jobQueue, iscsiPaths, accessService })
+  server.register(ahrAccessRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, iscsiPaths, accessService })
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
   // disk, share, job, and AHR (11.10) sources above, plus on-demand
   // ARC/iostat/net sampling.

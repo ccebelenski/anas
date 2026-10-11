@@ -1687,15 +1687,15 @@
             }
         }
         // access.2: Permissions acts on the mounted directory — an unmounted
-        // pool has none (the daemon 404s it), and a LUN's image on the pool
-        // makes the PUT a hard 409, so it greys with the same sentence.
+        // pool has none (the daemon 404s it). A LUN's image on the pool does
+        // NOT grey it (operator ruling 2026-10-11): a permission change leaves
+        // the image's contents alone, and a recursive apply's confirm names
+        // the LUN.
         var permBtn = grid.down('#permissions');
         if (permBtn) {
             var mounted = has && sel[0].get('mounted') === true;
-            permBtn.setDisabled(!mounted || !!lunHeld);
-            if (lunHeld) {
-                setLunTip(permBtn, lunHeld);
-            } else if (typeof permBtn.setTooltip === 'function') {
+            permBtn.setDisabled(!mounted);
+            if (typeof permBtn.setTooltip === 'function') {
                 permBtn.setTooltip(has && !mounted ? t('The pool is not mounted') : '');
             }
         }
@@ -3559,8 +3559,8 @@
                             },
                         },
                         // access.2: the shared Permissions dialog on the
-                        // pool's mount. Live only while the pool is mounted;
-                        // a LUN on the pool greys it with the daemon's reason.
+                        // pool's mount. Live only while the pool is mounted
+                        // (a LUN image on the pool does not grey it).
                         {
                             text: t('Permissions'),
                             itemId: 'permissions',

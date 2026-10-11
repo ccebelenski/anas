@@ -12,6 +12,7 @@ import { parseExports } from '../parsers/exports.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
 import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
+import { confirmGate } from '../safety/gate.js'
 import { confirmGateBound, readDatasetGuid, readRollbackIds, requireStableId } from '../safety/stable-id.js'
 import { createAccessService } from '../services/access.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
@@ -1361,6 +1362,12 @@ export async function datasetRoutes(
       return planned.failure.body
     }
     const plan = planned.value
+
+    // Operator ruling 2026-10-11: rewriting every existing file is a Level 2
+    // dangerous operation — 409 + X-Anas-Confirm-Code, asked LAST so a
+    // refused request never offers a confirm.
+    if (plan.recursive && !confirmGate(confirmStore, request, reply, await access.recursiveConfirm(plan.target, { named: plan.hasNamed })))
+      return reply
 
     const job = jobQueue.submit(
       'fs.setAccess',

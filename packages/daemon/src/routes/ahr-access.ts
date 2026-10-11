@@ -1,9 +1,11 @@
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { ConfirmStore } from '../safety/confirm.js'
 import type { AccessService, AhrAccessTarget } from '../services/access.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { PoolName, SetAccessRequest } from '@anas/shared'
+import { confirmGate } from '../safety/gate.js'
 import { createAccessService } from '../services/access.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { requireIdentity } from './identity.js'
@@ -19,19 +21,23 @@ import { requireIdentity } from './identity.js'
  * btrfs carries POSIX ACLs natively, so there is no `acltype` step (never a
  * `zfs set` here), and a recursive apply sweeps the subvolumes under `@data`
  * as one tree — `@snapshots` is a sibling outside the mountpoint (AHR-DESIGN
- * §12), so it is never entered. The held-by-LUN gate applies as on the other
- * AHR mutations; PVE territory is the storage paths storage.cfg names.
+ * §12), so it is never entered. PVE territory is the storage paths
+ * storage.cfg names. A pool holding an iSCSI LUN image is NOT refused
+ * (operator ruling 2026-10-11): a permission change leaves the image's
+ * contents alone, and the recursive apply's confirm names the LUN.
  */
 export async function ahrAccessRoutes(
   server: FastifyInstance,
   opts: {
     executor: CommandExecutor
     jobQueue: JobQueue
+    /** The recursive apply's 409 + X-Anas-Confirm-Code (ruling 2026-10-11). */
+    confirmStore: ConfirmStore
     iscsiPaths?: IscsiPaths
     accessService?: AccessService
   },
 ) {
-  const { executor, jobQueue } = opts
+  const { executor, jobQueue, confirmStore } = opts
   const access = opts.accessService ?? createAccessService({ executor, iscsiPaths: opts.iscsiPaths ?? {} })
 
   /**
@@ -96,9 +102,9 @@ export async function ahrAccessRoutes(
     if (!target)
       return reply
 
-    // Held-by-LUN (409), PVE storage path at or above the mount (400), and —
-    // for applyToExisting — a PVE storage path inside the tree (400), before
-    // any command runs.
+    // PVE storage path at or above the mount (400), and — for
+    // applyToExisting — a PVE storage path inside the tree (400), before any
+    // command runs.
     const refused = await access.guardPathTarget(target, req)
     if (refused) {
       reply.code(refused.status)
@@ -111,6 +117,10 @@ export async function ahrAccessRoutes(
       return planned.failure.body
     }
     const plan = planned.value
+
+    // A recursive apply is confirm-gated (ruling 2026-10-11), asked last.
+    if (plan.recursive && !confirmGate(confirmStore, request, reply, await access.recursiveConfirm(plan.target, { named: plan.hasNamed })))
+      return reply
 
     const job = jobQueue.submit(
       'fs.setAccess',

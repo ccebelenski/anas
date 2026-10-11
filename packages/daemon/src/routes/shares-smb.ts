@@ -1,5 +1,5 @@
 import type { ShareAccessGrantRequest, ShareAccessGrantResult, SmbConnection, SmbShare, SmbShareDetail } from '@anas/shared'
-import type { FastifyInstance, FastifyReply } from 'fastify'
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { SelfServiceKeys } from '../parsers/smb-conf.js'
@@ -11,7 +11,7 @@ import { CreateSmbShareRequest, ShareName, UpdateSmbGlobalConfigRequest, UpdateS
 import { addShare, customVfsRefusal, getShare, hasCustomVfsObjects, hasShare, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
 import { parseSmbStatusJson, parseSmbStatusText } from '../parsers/smbstatus.js'
 import { confirmGate } from '../safety/gate.js'
-import { createAccessService } from '../services/access.js'
+import { createAccessService, sharePrincipals } from '../services/access.js'
 import { ConfigConflictError, editConfig, readConfig } from '../services/config-writer.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
 import { enablingSelfService, ensureAhrSnapshotsMount, resolveSelfService, shareAvailableBytes, touchesSelfService } from '../services/share-selfservice.js'
@@ -79,7 +79,7 @@ export async function smbShareRoutes(
 ) {
   const { executor, jobQueue, confirmStore, smbConfPath, fstabPath, systemdDir } = opts
   const access = opts.accessService ?? createAccessService({ executor })
-  const shareAccess = shareAccessHandlers({ access, jobQueue })
+  const shareAccess = shareAccessHandlers({ access, jobQueue, confirmStore })
 
   /**
    * The share-path grant inside a share job (access.1): the editor with the
@@ -89,6 +89,18 @@ export async function smbShareRoutes(
    */
   async function grantFor(share: SmbShare, grant: ShareAccessGrantRequest, updateProgress: (msg: string) => void): Promise<ShareAccessGrantResult> {
     return access.grantOnSharePath(share.path, share, grant.applyToExisting === true, updateProgress)
+  }
+
+  /**
+   * The grant's "apply to existing files" is the editor's recursive apply and
+   * carries the same 409 + X-Anas-Confirm-Code (ruling 2026-10-11), with the
+   * same headline and warnings for the share's path. True = confirmed (or
+   * nothing to confirm); false = the 409 was sent.
+   */
+  async function confirmRecursiveGrant(path: string, validUsers: string[], request: FastifyRequest, reply: FastifyReply): Promise<boolean> {
+    const target = await access.resolveShareTarget(path)
+    const named = sharePrincipals(validUsers).principals.length > 0
+    return confirmGate(confirmStore, request, reply, await access.recursiveConfirm(target, { named }))
   }
 
   /** Read smb.conf fresh every time — the file is the source of truth (P.11). */
@@ -450,6 +462,9 @@ export async function smbShareRoutes(
       return { error: { code: 'CONFLICT', message: `SMB share '${req.name}' already exists` } }
     }
 
+    if (req.grantAccess?.applyToExisting === true && !(await confirmRecursiveGrant(req.path, req.validUsers ?? [], request, reply)))
+      return reply
+
     const job = jobQueue.submit(
       'smb.share.add',
       { ...identity, params: { share: req.name, path: req.path } },
@@ -520,6 +535,11 @@ export async function smbShareRoutes(
     const currentShare = getShare(text, name)
     if (currentShare && await refuseSelfService(name, req.path ?? currentShare.path, req, reply))
       return reply
+
+    if (req.grantAccess?.applyToExisting === true && currentShare
+      && !(await confirmRecursiveGrant(req.path ?? currentShare.path, req.validUsers ?? currentShare.validUsers, request, reply))) {
+      return reply
+    }
 
     const job = jobQueue.submit(
       'smb.config.set',

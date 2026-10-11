@@ -1,7 +1,9 @@
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import type { JobQueue } from '../jobs/queue.js'
+import type { ConfirmStore } from '../safety/confirm.js'
 import type { AccessService } from '../services/access.js'
 import { SetAccessRequest } from '@anas/shared'
+import { confirmGate } from '../safety/gate.js'
 import { targetBacking } from '../services/access.js'
 import { requireIdentity } from './identity.js'
 
@@ -13,8 +15,8 @@ import { requireIdentity } from './identity.js'
  * or neither) and every gate and difference follows from that home, exactly
  * as for the datasets and AHR editors.
  */
-export function shareAccessHandlers(opts: { access: AccessService, jobQueue: JobQueue }) {
-  const { access, jobQueue } = opts
+export function shareAccessHandlers(opts: { access: AccessService, jobQueue: JobQueue, confirmStore: ConfirmStore }) {
+  const { access, jobQueue, confirmStore } = opts
 
   /** GET …/access on a share path. */
   async function get(path: string, reply: FastifyReply) {
@@ -52,6 +54,9 @@ export function shareAccessHandlers(opts: { access: AccessService, jobQueue: Job
       return planned.failure.body
     }
     const plan = planned.value
+    // A recursive apply is confirm-gated (ruling 2026-10-11), asked last.
+    if (plan.recursive && !confirmGate(confirmStore, request, reply, await access.recursiveConfirm(plan.target, { named: plan.hasNamed })))
+      return reply
     const job = jobQueue.submit(
       'fs.setAccess',
       { ...identity, params: { ...audit, ...access.jobParams(plan) } },

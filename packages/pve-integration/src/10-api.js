@@ -358,7 +358,8 @@
     // Dangerous-operation wrapper (Principle 14): run a mutation; on a 409 with a
     // confirm code, show the server's warnings and, if the user confirms, resend
     // with the code. `opts` is a runJob opts object; `confirmTitle`/`confirmIntro`
-    // customise the dialog.
+    // customise the dialog, and `confirmHeadline: true` leads it with the
+    // 409's own `error.message` instead of an intro.
     //
     // Two presentations:
     //   * default — Ext.Msg.confirm (Yes/No) for a plain confirmation.
@@ -402,9 +403,13 @@
 
     // The first prompt leads with the caller's intro; a re-prompt leads with
     // the daemon's own sentence (it says what changed), then the warnings.
+    // `confirmHeadline: true` makes the FIRST prompt lead with the daemon's
+    // sentence too — the 409's headline, verbatim, in bold — for a flow whose
+    // every word the daemon owns (the recursive permissions apply).
     function confirmIntroFor(opts, err, depth) {
         var msg = err && err.body && err.body.error && err.body.error.message;
         if (depth > 0 && msg) { return ANAS.enc(msg); }
+        if (opts.confirmHeadline && msg) { return '<b>' + ANAS.enc(msg) + '</b>'; }
         return opts.confirmIntro || ANAS.t('This operation requires confirmation:');
     }
 

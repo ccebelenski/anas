@@ -30,7 +30,7 @@ export async function nfsExportRoutes(
   opts: { executor: CommandExecutor, jobQueue: JobQueue, confirmStore: ConfirmStore, exportsPath: string, accessService?: AccessService },
 ) {
   const { executor, jobQueue, confirmStore, exportsPath } = opts
-  const shareAccess = shareAccessHandlers({ access: opts.accessService ?? createAccessService({ executor }), jobQueue })
+  const shareAccess = shareAccessHandlers({ access: opts.accessService ?? createAccessService({ executor }), jobQueue, confirmStore: opts.confirmStore })
 
   /** Reload the kernel export table; throws on failure (fails the job). */
   async function reloadExports(): Promise<void> {

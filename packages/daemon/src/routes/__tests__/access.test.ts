@@ -3,8 +3,12 @@ import type { MockExecutor } from '../../executor/mock.js'
 import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { SetAccessRequest } from '@anas/shared'
+import { zfsListArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
 
 const IDENTITY_HEADERS = {
@@ -62,6 +66,22 @@ function ok(stdout = ''): ExecResult {
 
 function find(calls: Call[], command: string, pred: (a: string[]) => boolean): string[] | undefined {
   return calls.find(c => c.command === command && pred(c.args))?.args
+}
+
+interface Put { method: 'PUT', url: string, headers: Record<string, string>, payload: string }
+
+/**
+ * Operator ruling 2026-10-11: a recursive apply (`applyToExisting`) is a
+ * Level 2 dangerous operation. The first PUT answers 409 + X-Anas-Confirm-Code
+ * (asserted here); the resend with the code is the response returned.
+ */
+async function injectConfirmed(server: ReturnType<typeof createServer>, opts: Put) {
+  const first = await server.inject(opts)
+  assert.equal(first.statusCode, 409, first.body)
+  assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+  const code = first.headers['x-anas-confirm-code']
+  assert.ok(typeof code === 'string' && code.length > 0, 'the 409 carries X-Anas-Confirm-Code')
+  return server.inject({ ...opts, headers: { ...opts.headers, 'x-anas-confirm': code } })
 }
 
 describe('access routes', () => {
@@ -182,7 +202,7 @@ describe('access routes', () => {
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server) // acltype 'off' → base-only path
 
-      const res = await server.inject({
+      const res = await injectConfirmed(server, {
         method: 'PUT',
         url: '/v1/pools/testpool/datasets/media/access',
         headers: JSON_HEADERS,
@@ -336,7 +356,7 @@ describe('access routes', () => {
       // chmod (one `-R` traversal), not be a second independent recursive walk.
       const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') }])
 
-      const res = await server.inject({
+      const res = await injectConfirmed(server, {
         method: 'PUT',
         url: '/v1/pools/testpool/datasets/media/access',
         headers: JSON_HEADERS,
@@ -460,7 +480,7 @@ describe('access routes', () => {
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server) // acltype 'off'
 
-      const res = await server.inject({
+      const res = await injectConfirmed(server, {
         method: 'PUT',
         url: '/v1/pools/testpool/datasets/media/access',
         headers: JSON_HEADERS,
@@ -486,5 +506,208 @@ describe('access routes', () => {
       assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-d'), ['-R', '-d', '--set', spec, MP])
       assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), ['-R', 'g+s', MP])
     })
+  })
+})
+
+// ============================================================================
+// Operator rulings 2026-10-11 on the recursive apply (access.1/access.2):
+//   ruling 1 — `applyToExisting` is confirm-gated at the daemon (409 +
+//              X-Anas-Confirm-Code), asked after every refusal;
+//   ruling 3 — on ZFS, `setfacl -R` crosses child datasets mounted under the
+//              path; a recursive NAMED grant switches POSIX ACLs on for each
+//              child that has them off BEFORE any permission is touched.
+// ============================================================================
+
+/** `zfs list -r -H -o name,mountpoint,acltype testpool/media` — the walk's children. */
+const CHILDREN_ARGS = ['list', '-r', '-H', '-o', 'name,mountpoint,acltype', 'testpool/media']
+/**
+ * a: mounted under the path, ACLs off (enabled first);
+ * b: mounted under the path, already posixacl (untouched);
+ * c: mounted elsewhere, d: legacy, e: none (not reached by -R, ignored).
+ */
+const CHILDREN = [
+  'testpool/media\t/testpool/media\toff',
+  'testpool/media/a\t/testpool/media/a\toff',
+  'testpool/media/b\t/testpool/media/b\tposixacl',
+  'testpool/media/c\t/srv/c\toff',
+  'testpool/media/d\tlegacy\toff',
+  'testpool/media/e\tnone\toff',
+  '',
+].join('\n')
+
+const NAMED_RECURSIVE = {
+  entries: [
+    { kind: 'owner', level: 'read-write' },
+    { kind: 'owning-group', level: 'read' },
+    { kind: 'everyone', level: 'none' },
+    { kind: 'user', name: 'alice', level: 'read' },
+  ],
+  applyToExisting: true,
+}
+
+function putMedia(body: unknown): Put {
+  return {
+    method: 'PUT',
+    url: '/v1/pools/testpool/datasets/media/access',
+    headers: JSON_HEADERS,
+    payload: JSON.stringify(body),
+  }
+}
+
+/** Every permission-changing command (the ACL switch is `zfs set`, asserted separately). */
+const PERMISSION_COMMANDS = ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl']
+
+function datasetRow(name: string): [string, unknown] {
+  return [name, {
+    name,
+    type: 'FILESYSTEM',
+    pool: 'testpool',
+    properties: {
+      used: { value: '1M', source: { type: 'NONE', data: '-' } },
+      available: { value: '1G', source: { type: 'NONE', data: '-' } },
+      referenced: { value: '1M', source: { type: 'NONE', data: '-' } },
+      mountpoint: { value: `/${name}`, source: { type: 'DEFAULT', data: '-' } },
+      type: { value: 'filesystem', source: { type: 'NONE', data: '-' } },
+    },
+  }]
+}
+
+describe('recursive apply — the confirm gate and child datasets (rulings 2026-10-11)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  it('recursive: the first PUT is a 409 + X-Anas-Confirm-Code whose headline says what happens; nothing runs', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: CHILDREN_ARGS, result: ok(CHILDREN) }])
+    const res = await server.inject(putMedia(NAMED_RECURSIVE))
+    assert.equal(res.statusCode, 409)
+    assert.ok(res.headers['x-anas-confirm-code'], 'X-Anas-Confirm-Code')
+    assert.ok(res.headers['x-anas-confirm-expires'], 'X-Anas-Confirm-Expires')
+    const err = res.json().error as { code: string, message: string, warnings: string[] }
+    assert.equal(err.code, 'CONFIRMATION_REQUIRED')
+    assert.equal(err.message, `Applying to existing files rewrites the permissions of every file and directory under '${MP}'`)
+    // The walk's reach on THIS target: the children it crosses (a, b — never
+    // c, d, e) and the one whose ACLs are switched on first (a).
+    assert.ok(err.warnings.includes(`It crosses the child datasets mounted under '${MP}': testpool/media/a (/testpool/media/a), testpool/media/b (/testpool/media/b).`), JSON.stringify(err.warnings))
+    assert.ok(err.warnings.includes('POSIX ACLs (acltype=posixacl) are switched on first for testpool/media/a, as for \'testpool/media\' itself.'), JSON.stringify(err.warnings))
+    assert.ok(err.warnings.some(w => /cannot be undone/.test(w)))
+    assert.equal(err.warnings.some(w => /subvolume/.test(w)), false, 'no AHR sentence on ZFS')
+    assert.equal(calls.some(c => PERMISSION_COMMANDS.includes(c.command)), false, 'nothing ran')
+    assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined, 'no ACL switch flipped')
+  })
+
+  it('recursive: a non-recursive PUT is not gated', async () => {
+    server = createServer({ mock: true, logger: false })
+    installExecutor(server)
+    const res = await server.inject(putMedia({ ...NAMED_RECURSIVE, applyToExisting: false }))
+    assert.equal(res.statusCode, 202)
+  })
+
+  it('child dataset with ACLs off → enabled first, then the walk applies; the result lists it', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: CHILDREN_ARGS, result: ok(CHILDREN) }])
+    const res = await injectConfirmed(server, putMedia(NAMED_RECURSIVE))
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const enableA = calls.findIndex(c => c.command === '/usr/sbin/zfs' && c.args.join(' ') === 'set acltype=posixacl xattr=sa testpool/media/a')
+    assert.ok(enableA >= 0, 'acltype switched on for the child')
+    const firstPermission = calls.findIndex(c => PERMISSION_COMMANDS.includes(c.command))
+    assert.ok(firstPermission > enableA, `the child is enabled before any permission changes (enable #${enableA}, first permission #${firstPermission})`)
+    assert.ok(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '--set'), 'the -R walk ran')
+    assert.deepEqual((job.result as { childAclEnabled?: string[] }).childAclEnabled, ['testpool/media/a'])
+  })
+
+  it('child dataset already posixacl → untouched', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: CHILDREN_ARGS, result: ok(CHILDREN) }])
+    const res = await injectConfirmed(server, putMedia(NAMED_RECURSIVE))
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed')
+    assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set' && a.includes('testpool/media/b')), undefined)
+  })
+
+  it('child dataset mounted elsewhere (or legacy / none) → ignored', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: CHILDREN_ARGS, result: ok(CHILDREN) }])
+    const res = await injectConfirmed(server, putMedia(NAMED_RECURSIVE))
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed')
+    for (const child of ['testpool/media/c', 'testpool/media/d', 'testpool/media/e'])
+      assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set' && a.includes(child)), undefined, child)
+    // The switches flipped are exactly the child under the path and the target itself.
+    assert.deepEqual(calls.filter(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'set').map(c => c.args[3]), ['testpool/media/a', 'testpool/media'])
+  })
+
+  it('a recursive change with NO named entry needs no ACLs: no child is switched on', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: CHILDREN_ARGS, result: ok(CHILDREN) }])
+    const res = await injectConfirmed(server, putMedia({ owner: 'media', applyToExisting: true }))
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed')
+    assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined)
+    assert.equal((job.result as { childAclEnabled?: string[] }).childAclEnabled, undefined)
+  })
+
+  it('child enable fails → nothing applied, the child is named', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = installExecutor(server, [
+      { command: '/usr/sbin/zfs', args: CHILDREN_ARGS, result: ok(CHILDREN) },
+      { command: '/usr/sbin/zfs', args: ['set', 'acltype=posixacl', 'xattr=sa', 'testpool/media/a'], result: { stdout: '', stderr: 'cannot set property for \'testpool/media/a\': permission denied', exitCode: 1 } },
+    ])
+    const res = await injectConfirmed(server, putMedia({ ...NAMED_RECURSIVE, owner: 'media' }))
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.match(job.error!.message, /child dataset 'testpool\/media\/a' \(mounted at \/testpool\/media\/a\) — no permissions were changed/)
+    assert.match(job.error!.message, /permission denied/)
+    assert.equal(calls.some(c => PERMISSION_COMMANDS.includes(c.command)), false, 'no chown, chmod or setfacl ran')
+    assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set' && a[3] === 'testpool/media'), undefined, 'the target\'s own switch was not flipped either')
+  })
+
+  it('the child list cannot be read → the named recursive grant stops before changing anything', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: CHILDREN_ARGS, result: { stdout: '', stderr: 'boom', exitCode: 1 } }])
+    const res = await injectConfirmed(server, putMedia(NAMED_RECURSIVE))
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.match(job.error!.message, /Could not list the child datasets of 'testpool\/media' — no permissions were changed/)
+    assert.equal(calls.some(c => PERMISSION_COMMANDS.includes(c.command)), false)
+    assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined)
+  })
+
+  it('a PVE-owned descendant → refused before anything (no confirm, no child list, no switch)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'anas-access-pve-'))
+    const saved = process.env.ANAS_STORAGE_CFG
+    writeFileSync(join(dir, 'storage.cfg'), 'zfspool: local-zfs\n\tpool testpool/media/vm\n\tcontent images,rootdir\n', 'utf8')
+    process.env.ANAS_STORAGE_CFG = join(dir, 'storage.cfg')
+    try {
+      server = createServer({ mock: true, logger: false })
+      const nested = JSON.stringify({
+        output_version: { command: 'zfs list', vers_major: 0, vers_minor: 1 },
+        datasets: Object.fromEntries([datasetRow('testpool'), datasetRow('testpool/media'), datasetRow('testpool/media/vm')]),
+      })
+      const calls = installExecutor(server, [
+        { command: '/usr/sbin/zfs', args: zfsListArgs('testpool'), result: ok(nested) },
+        { command: '/usr/sbin/zfs', args: CHILDREN_ARGS, result: ok(`${CHILDREN}testpool/media/vm\t/testpool/media/vm\toff\n`) },
+      ])
+      const res = await server.inject(putMedia(NAMED_RECURSIVE))
+      assert.equal(res.statusCode, 400, res.body)
+      assert.match(res.json().error.message, /Recursive permission change of 'testpool\/media' would include testpool\/media\/vm/)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined, 'a refusal never offers a confirm')
+      assert.equal(find(calls, '/usr/sbin/zfs', a => a.join(' ') === CHILDREN_ARGS.join(' ')), undefined, 'the child list was never read')
+      assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined)
+      assert.equal(calls.some(c => PERMISSION_COMMANDS.includes(c.command)), false)
+    }
+    finally {
+      if (saved === undefined)
+        delete process.env.ANAS_STORAGE_CFG
+      else
+        process.env.ANAS_STORAGE_CFG = saved
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

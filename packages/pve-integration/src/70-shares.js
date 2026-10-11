@@ -664,8 +664,15 @@
             } catch (e) {
                 ANAS.warn('grant: ' + (grant.message || ''));
             }
-        } else if (skipped) {
-            ANAS.toast(enc(skipped.replace(/^ /, '')));
+        } else {
+            // A recursive grant on ZFS switches POSIX ACLs on for the child
+            // datasets it crosses (ruling 2026-10-11) — say which.
+            var children = (grant.childAclEnabled && grant.childAclEnabled.length)
+                ? ' ' + t('POSIX ACLs switched on for child datasets') + ': ' + grant.childAclEnabled.join(', ') + '.'
+                : '';
+            if (skipped || children) {
+                ANAS.toast(enc((skipped + children).replace(/^ /, '')));
+            }
         }
     }
 
@@ -1176,13 +1183,23 @@
             label = name;
         }
 
+        // Rewriting the files already under the path is the user's explicit
+        // choice — ticked AND confirmed. The daemon owns the confirm (ruling
+        // 2026-10-11): a grant with applyToExisting answers 409 +
+        // X-Anas-Confirm-Code with the same headline and warnings the
+        // Permissions dialog shows, and the standard flow resends with the
+        // code on OK. Without the flag the daemon never asks, so this is the
+        // plain submit.
+        var grantRecursive = !!(body.grantAccess && body.grantAccess.applyToExisting);
         function send() {
-            ANAS.runJob({
+            (grantRecursive ? ANAS.confirmAndRun : ANAS.runJob)({
                 node: node,
                 method: method,
                 path: url,
                 body: body,
                 view: win,
+                confirmTitle: t('Apply to existing files'),
+                confirmHeadline: true,
                 failTitle: isEdit ? 'Update failed' : 'Create failed',
                 successMsg: (isEdit ? t('SMB share updated') : t('SMB share created')) + ': ' + label,
                 onComplete: function (job) {
@@ -1205,18 +1222,6 @@
             });
         }
 
-        // Rewriting the files already under the path is the user's explicit
-        // choice — ticked AND confirmed, in the same words the Permissions
-        // dialog uses (14-permissions.js).
-        if (body.grantAccess && body.grantAccess.applyToExisting) {
-            var confirmText = (ANAS.permissions && ANAS.permissions.recursiveConfirmText)
-                ? ANAS.permissions.recursiveConfirmText('other', path)
-                : t('This also rewrites the permissions of every file already under') + ' ' + path + '. ' + t('Continue?');
-            Ext.Msg.confirm(t('Apply to existing files'), enc(confirmText), function (btn) {
-                if (btn === 'yes') { send(); }
-            });
-            return;
-        }
         send();
     }
 

@@ -7,8 +7,7 @@ import { DatasetPath, isPathWithin } from '@anas/shared'
 import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
 import { parsePveMountPaths, PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
 import { parseDatasetGet, parseZfsList, zfsListArgs } from '../parsers/zfs-list.js'
-import { ahrPoolHeldByLun } from '../routes/ahr-mutate.js'
-import { heldByLunRefusal } from './iscsi-held.js'
+import { heldByLunOnce } from './iscsi-held.js'
 import { loadPveFootprint, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from './pve-footprint.js'
 import { resolveSelfServiceTarget } from './share-selfservice.js'
 
@@ -28,7 +27,8 @@ import { resolveSelfServiceTarget } from './share-selfservice.js'
 //     ACLs natively, so there is no switch and never a `zfs set`;
 //   - the recursive walk: `setfacl -R`/`chown -R`/`chmod -R` walk the directory
 //     tree. On ZFS that includes child datasets mounted beneath (the
-//     PVE-descendant refusal guards it); on AHR it sweeps every subvolume
+//     PVE-descendant refusal guards it, and a named grant switches their
+//     ACLs on first — {@link enableChildAcls}); on AHR it sweeps every subvolume
 //     under `@data` as one tree, and `@snapshots` is a sibling OUTSIDE the
 //     mountpoint (AHR-DESIGN §12), so it is never entered;
 //   - PVE territory: a ZFS dataset asks the footprint service; a non-ZFS
@@ -74,6 +74,9 @@ export interface AhrAccessTarget { kind: 'ahr', pool: string, mountpoint: string
 export interface ShareAccessTarget { kind: 'share', path: string, home: ShareHome }
 
 export type AccessTarget = ZfsAccessTarget | AhrAccessTarget | ShareAccessTarget
+
+/** A descendant dataset mounted under a recursive walk's directory. */
+interface ChildDataset { name: string, mountpoint: string, acltype: string }
 
 /** The directory the writer acts on. */
 export function targetDir(t: AccessTarget): string {
@@ -455,30 +458,21 @@ export function createAccessService(opts: AccessServiceOptions) {
     return null
   }
 
-  /** The held-by-LUN gate for an AHR pool — the 409 every AHR mutation sends. */
-  async function ahrHeldFailure(record: { name: string, mountpoint: string, mounted: boolean }): Promise<AccessFailure | null> {
-    const held = await ahrPoolHeldByLun(executor, iscsiPaths, record)
-    if (!held)
-      return null
-    const refusal = heldByLunRefusal(`the permissions of AHR pool '${record.name}'`, 'Changing', held)
-    return { status: 409, body: { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } } }
-  }
-
   /**
    * The gates for an AHR or share target, in the order the ZFS route asks
-   * them: held-by-LUN (AHR homes, 409), PVE ownership of the directory (400),
-   * then — only for `applyToExisting` — PVE territory beneath it (400). The
-   * ZFS route keeps its own pre-lift ordering ({@link zfsRecursiveRefusal} +
-   * the footprint's `ownershipOf`); this is the same question asked of a path.
+   * them: PVE ownership of the directory (400), then — only for
+   * `applyToExisting` — PVE territory beneath it (400). The ZFS route keeps
+   * its own pre-lift ordering ({@link zfsRecursiveRefusal} + the footprint's
+   * `ownershipOf`); this is the same question asked of a path.
+   *
+   * No held-by-LUN refusal (operator ruling 2026-10-11): a permission change
+   * does not touch a LUN image's contents, the ZFS editor never gated a
+   * dataset holding an image file, and the gate left an AHR pool that holds a
+   * LUN without any writable share. The LUN is disclosed in the recursive
+   * apply's confirm instead ({@link recursiveConfirm}).
    */
   async function guardPathTarget(t: AhrAccessTarget | ShareAccessTarget, req: SetAccessRequest): Promise<AccessFailure | null> {
     const dir = targetDir(t)
-    const ahrRecord = t.kind === 'ahr' ? t.record : t.home?.kind === 'ahr' ? t.home.record : null
-    if (ahrRecord) {
-      const held = await ahrHeldFailure(ahrRecord)
-      if (held)
-        return held
-    }
     const bad = (message: string): AccessFailure => ({ status: 400, body: { error: { code: 'VALIDATION_ERROR', message } } })
 
     if (t.kind === 'share' && t.home?.kind === 'zfs') {
@@ -506,6 +500,104 @@ export function createAccessService(opts: AccessServiceOptions) {
         return bad(refusal)
     }
     return null
+  }
+
+  // --- The recursive walk on ZFS: child datasets ------------------------------------
+
+  /**
+   * The child datasets a recursive walk from `dir` enters (operator ruling
+   * 2026-10-11): `setfacl -R`/`chown -R`/`chmod -R` cross into every
+   * descendant of `dataset` MOUNTED under `dir`. A descendant whose mountpoint
+   * is `legacy`, `none`, or somewhere outside `dir` is not reached by the walk
+   * and is left out. Null when the list cannot be read.
+   */
+  async function childDatasetsUnder(dataset: string, dir: string): Promise<ChildDataset[] | null> {
+    const r = await executor.exec(ZFS, ['list', '-r', '-H', '-o', 'name,mountpoint,acltype', dataset])
+    if (r.exitCode !== 0)
+      return null
+    const children: ChildDataset[] = []
+    for (const line of r.stdout.split('\n')) {
+      const [name, mountpoint, acltype] = line.split('\t')
+      if (!name || !mountpoint || name === dataset || !name.startsWith(`${dataset}/`))
+        continue
+      if (!mountpoint.startsWith('/') || mountpoint === dir || !isPathWithin(dir, mountpoint))
+        continue
+      children.push({ name, mountpoint, acltype: (acltype ?? '').trim() })
+    }
+    return children
+  }
+
+  /**
+   * Before a recursive apply with named entries on a ZFS target: switch POSIX
+   * ACLs on for every child dataset the walk enters that has them off — the
+   * SAME rule the target gets on its first named grant — BEFORE any permission
+   * is touched. A child with `acltype=off` would otherwise make `setfacl -R`
+   * fail part-way, after the parent (and every child before it) was already
+   * rewritten. Returns the children it enabled; throws, naming the child,
+   * when the list cannot be read or an enable fails (nothing else has run).
+   */
+  async function enableChildAcls(dataset: string, dir: string, updateProgress: (msg: string) => void): Promise<string[]> {
+    const children = await childDatasetsUnder(dataset, dir)
+    if (!children)
+      throw new Error(`Could not list the child datasets of '${dataset}' — no permissions were changed. A recursive grant crosses every child dataset mounted under '${dir}', and each needs POSIX ACLs on first`)
+    const enabled: string[] = []
+    for (const child of children) {
+      if (isPosixAcl(child.acltype))
+        continue
+      updateProgress(`zfs set acltype=posixacl xattr=sa ${child.name}`)
+      const r = await executor.exec(ZFS, ['set', 'acltype=posixacl', 'xattr=sa', child.name])
+      if (r.exitCode !== 0) {
+        const already = enabled.length > 0 ? ` POSIX ACLs were already switched on for ${enabled.join(', ')}.` : ''
+        throw new Error(`Could not switch POSIX ACLs on for child dataset '${child.name}' (mounted at ${child.mountpoint}) — no permissions were changed.${already} ${r.stderr.trim() || `zfs set exited with code ${r.exitCode}`}`)
+      }
+      enabled.push(child.name)
+    }
+    return enabled
+  }
+
+  // --- The recursive apply's confirm (Principle 14, Level 2) ---------------------
+
+  /**
+   * The confirm a recursive apply (`applyToExisting`) carries on every door —
+   * the editor's PUT on a dataset, an AHR pool or a share path, and the SMB
+   * share create/edit grant (operator ruling 2026-10-11). The headline says
+   * what will happen; the warnings say what the walk reaches on THIS target:
+   * the child datasets it crosses on ZFS (and which get ACLs switched on
+   * first), the subvolume sweep on AHR, and any iSCSI LUN image under the
+   * path. The signature is the resource only (`fs.setAccess.recursive` + the
+   * target), like every other confirm.
+   */
+  async function recursiveConfirm(t: AccessTarget, opts: { named: boolean }): Promise<{ operation: string, params: Record<string, unknown>, message: string, warnings: string[] }> {
+    const dir = targetDir(t)
+    const warnings: string[] = []
+    const ds = aclDatasetOf(t)
+    if (ds !== null) {
+      const children = await childDatasetsUnder(ds, dir)
+      if (!children) {
+        warnings.push(`ANAS could not list the child datasets under '${dir}'; the walk crosses any that are mounted there${opts.named ? ', and the grant will stop before changing anything until they can be listed' : ''}.`)
+      }
+      else if (children.length > 0) {
+        warnings.push(`It crosses the child datasets mounted under '${dir}': ${children.map(c => `${c.name} (${c.mountpoint})`).join(', ')}.`)
+        const off = children.filter(c => !isPosixAcl(c.acltype)).map(c => c.name)
+        if (opts.named && off.length > 0)
+          warnings.push(`POSIX ACLs (acltype=posixacl) are switched on first for ${off.join(', ')}, as for '${ds}' itself.`)
+      }
+    }
+    if (targetBacking(t) === 'ahr')
+      warnings.push('On a Hybrid RAID pool it sweeps every subvolume under the pool\'s data as one tree; the pool\'s snapshots are not touched.')
+    const held = await heldByLunOnce(executor, { path: dir }, iscsiPaths)
+    if (held)
+      warnings.push(`The walk includes the image of iSCSI LUN ${held.index} '${held.name}' of target ${held.targetIqn} (${held.backingPath}): its owner, mode and ACL change, its contents do not.`)
+    warnings.push('The current permissions are not recorded anywhere, so this cannot be undone.')
+    const params: Record<string, unknown> = t.kind === 'zfs'
+      ? { dataset: t.dataset }
+      : t.kind === 'ahr' ? { pool: t.pool } : { path: t.path }
+    return {
+      operation: 'fs.setAccess.recursive',
+      params,
+      message: `Applying to existing files rewrites the permissions of every file and directory under '${dir}'`,
+      warnings,
+    }
   }
 
   // --- Read ---------------------------------------------------------------------
@@ -703,6 +795,14 @@ export function createAccessService(opts: AccessServiceOptions) {
     if (hasNamed && !supported)
       throw new Error('The acl package (setfacl) is not installed; named user/group grants require it. Install it (apt install acl), or grant owner/group/everyone only.')
 
+    // 0) A recursive named grant on ZFS crosses every child dataset mounted
+    // under the directory; one with ACLs off would fail `setfacl -R` part-way.
+    // Switch them on first, before any permission changes (ruling 2026-10-11).
+    const aclDataset = aclDatasetOf(plan.target)
+    const childAclEnabled = recursive && hasNamed && aclDataset !== null
+      ? await enableChildAcls(aclDataset, mountpoint, updateProgress)
+      : null
+
     // 1) Ownership.
     if (plan.ownerChanged || plan.groupChanged) {
       const spec = plan.ownerChanged && plan.groupChanged
@@ -720,7 +820,6 @@ export function createAccessService(opts: AccessServiceOptions) {
     if (hasNamed) {
       // 2) Enable POSIX ACLs on the dataset if not already (side effect). ZFS
       // only: a filesystem with native ACLs is always `enabled`.
-      const aclDataset = aclDatasetOf(plan.target)
       if (!enabled && aclDataset !== null) {
         updateProgress(`zfs set acltype=posixacl xattr=sa ${aclDataset}`)
         const r = await executor.exec(ZFS, ['set', 'acltype=posixacl', 'xattr=sa', aclDataset])
@@ -757,7 +856,12 @@ export function createAccessService(opts: AccessServiceOptions) {
       if (gidR.exitCode !== 0)
         throw new Error(gidR.stderr.trim() || `chmod g+s exited with code ${gidR.exitCode}`)
 
-      return { ...ident, aclEnabled: true, aclAutoEnabled, namedCount: named.length }
+      const result: Record<string, unknown> = { ...ident, aclEnabled: true, aclAutoEnabled, namedCount: named.length }
+      // The child datasets whose ACLs were switched on (present whenever the
+      // walk was checked for them — an empty list says none needed it).
+      if (childAclEnabled)
+        result.childAclEnabled = childAclEnabled
+      return result
     }
 
     // No named entries to apply → mode bits, plus an EXPLICIT ACL clear.
@@ -907,8 +1011,9 @@ export function createAccessService(opts: AccessServiceOptions) {
       if (!planned.ok)
         return outcome('refused', { message: planned.failure.body.error.message, skipped })
       updateProgress(`granting access on ${path}`)
-      await runSetAccess(planned.value, updateProgress)
-      return outcome('applied', { granted: composed.granted, skipped })
+      const ran = await runSetAccess(planned.value, updateProgress)
+      const children = Array.isArray(ran.childAclEnabled) ? { childAclEnabled: ran.childAclEnabled as string[] } : {}
+      return outcome('applied', { granted: composed.granted, skipped, ...children })
     }
     catch (err) {
       return outcome('failed', { message: err instanceof Error ? err.message : String(err) })
@@ -924,6 +1029,7 @@ export function createAccessService(opts: AccessServiceOptions) {
     resolveShareTarget,
     zfsRecursiveRefusal,
     guardPathTarget,
+    recursiveConfirm,
     readAccess,
     planSetAccess,
     jobParams,

@@ -985,6 +985,7 @@ function makeAnas(routes) {
         onComplete: cfg.onComplete,
         onFailed: cfg.onFailed,
         onSubmitted: cfg.onSubmitted,
+        door: 'runJob',
       })
       // 10-api.js fires onSubmitted the moment the daemon ACCEPTS the job
       // (202), BEFORE the poll — that is where a long-job dialog closes itself
@@ -1012,6 +1013,12 @@ function makeAnas(routes) {
         confirmWindow: !!cfg.confirmWindow,
         extraItems: cfg.extraItems,
         mapConfirm: cfg.mapConfirm,
+        // Which door, and whether the prompt leads with the daemon's 409
+        // headline (access rulings 2026-10-11: the recursive apply's confirm
+        // is the daemon's, its headline carried verbatim).
+        door: 'confirmAndRun',
+        confirmTitle: cfg.confirmTitle,
+        confirmHeadline: !!cfg.confirmHeadline,
         // The titles 10-api.js puts on the failure modal and the success
         // toast (same contract as the runJob stub) — a confirm-gated verb left
         // on the bare "Operation failed" default would lose its identity.
@@ -14833,30 +14840,30 @@ async function accessDialogParityChecks() {
     group: 'root',
   })
 
-  // --- a recursive apply is confirmed first, and "No" sends nothing -------------
+  // --- a recursive apply goes through the daemon's 409 confirm (ruling 2026-10-11) ---
+  // No dialog-side question any more: the PUT carries applyToExisting, the
+  // daemon answers 409 + X-Anas-Confirm-Code, and the standard confirm flow
+  // leads with the 409's headline (the real flow is proven against 10-api.js
+  // in accessConfirmFlowChecks below; the words are the daemon's tests').
   ANAS = loadSources(SOURCES, ACCESS_ROUTES)
   const again = await openAhrPermissions(ANAS)
   again.win.down('#recursive').setValue(true)
   confirms.length = 0
   jobs.length = 0
-  confirmAnswer = 'no'
   again.win.down('#applyBtn').handler()
   await settle()
-  confirmAnswer = 'yes'
-  ok('access(recursive): the apply is confirmed before anything is sent', confirms.length === 1 && jobs.length === 0, JSON.stringify({ confirms, jobs: jobs.length }))
-  ok('access(recursive): the AHR confirm names the subvolume walk', confirms[0] && /every subvolume/.test(confirms[0].msg), confirms[0] && confirms[0].msg)
-  confirms.length = 0
-  again.win.down('#applyBtn').handler()
-  await settle()
-  ok('access(recursive): "Yes" sends applyToExisting: true', jobs.length === 1 && jobs[0].body.applyToExisting === true, JSON.stringify(jobs[0] && jobs[0].body))
+  ok('access(recursive): no dialog-side confirm — the apply goes to the 409 confirm flow', confirms.length === 0 && jobs.length === 1 && jobs[0].door === 'confirmAndRun', JSON.stringify({ confirms, door: jobs[0] && jobs[0].door }))
+  ok('access(recursive): the confirm leads with the daemon\'s 409 headline, titled "Apply to existing files"', !!jobs[0] && jobs[0].confirmHeadline === true && jobs[0].confirmTitle === 'Apply to existing files', JSON.stringify(jobs[0] && { h: jobs[0].confirmHeadline, t: jobs[0].confirmTitle }))
+  ok('access(recursive): the body sends applyToExisting: true (the daemon asks)', jobs.length === 1 && jobs[0].body.applyToExisting === true, JSON.stringify(jobs[0] && jobs[0].body))
+  const ahrRecursiveJob = jobs[0]
   const ds2 = await openDatasetPermissions(loadSources(SOURCES, ACCESS_ROUTES))
   ds2.win.down('#recursive').setValue(true)
   confirms.length = 0
   jobs.length = 0
   ds2.win.down('#applyBtn').handler()
   await settle()
-  ok('access(recursive): the Datasets apply is confirmed the same way', confirms.length === 1 && jobs.length === 1 && jobs[0].body.applyToExisting === true)
-  ok('access(recursive): the ZFS confirm does not talk about subvolumes', confirms[0] && !/subvolume/.test(confirms[0].msg), confirms[0] && confirms[0].msg)
+  ok('access(recursive): the Datasets apply goes through the same door', confirms.length === 0 && jobs.length === 1 && jobs[0].door === 'confirmAndRun' && jobs[0].body.applyToExisting === true)
+  eq('access(recursive): the same confirm options on both targets', jobs[0] && { h: jobs[0].confirmHeadline, t: jobs[0].confirmTitle }, ahrRecursiveJob && { h: ahrRecursiveJob.confirmHeadline, t: ahrRecursiveJob.confirmTitle })
 
   // --- the acl-package hint is identical on both ------------------------------------
   const noAcl = {
@@ -14876,11 +14883,16 @@ async function accessDialogParityChecks() {
   ok('access(degraded): Apply and Add are disabled on AHR', ahrDeg.win.down('#applyBtn').disabled === true && ahrDeg.win.down('#addBtn').disabled === true)
   ok('access(degraded): the AHR note does not call the pool a dataset', !/dataset/.test(ahrDeg.win.down('#aclNote').html), ahrDeg.win.down('#aclNote').html)
 
-  // --- the AHR toolbar gate: unmounted and LUN-held pools grey the verb ------------------
+  // --- the AHR toolbar gate: an unmounted pool greys the verb; a LUN-held one does not ---
+  // Operator ruling 2026-10-11: a permission change is not destructive to a
+  // LUN image, so the held-by-LUN refusal is gone and Permissions stays live;
+  // the verbs that ARE refused (Destroy) still grey with the LUN's sentence.
   const gated = loadSources(SOURCES, { ...ACCESS_ROUTES, 'GET /ahr': { data: [ahrPoolRow('ahr0', { heldByLun: AHR_HELD }), ahrPoolRow('ahr1', { mounted: false })] } })
   const held = await openAhrPermissions(gated, 'ahr0')
-  ok('access(ahr gate): a LUN-held pool greys Permissions', held.btn.disabled === true)
-  ok('access(ahr gate): naming the LUN', /LUN 0 'ahrblock1'/.test(held.btn.tooltip || ''), held.btn.tooltip)
+  ok('access(ahr gate): a LUN-held pool keeps Permissions live (ruling 2026-10-11)', held.btn.disabled === false && !!held.win, JSON.stringify({ disabled: held.btn.disabled }))
+  ok('access(ahr gate): with no LUN tooltip on Permissions', !/LUN/.test(held.btn.tooltip || ''), held.btn.tooltip)
+  const heldDestroy = held.grid.down('#destroy')
+  ok('access(ahr gate): the LUN is still disclosed where it refuses (Destroy greys naming it)', !!heldDestroy && heldDestroy.disabled === true && /LUN 0 'ahrblock1'/.test(heldDestroy.tooltip || ''), heldDestroy && heldDestroy.tooltip)
   held.grid.selectRow(held.grid.getStore().findExact('name', 'ahr1'))
   const permBtn = held.grid.down('#permissions')
   ok('access(ahr gate): an unmounted pool greys Permissions with the reason', permBtn.disabled === true && /not mounted/.test(permBtn.tooltip || ''), permBtn.tooltip)
@@ -14930,6 +14942,7 @@ async function smbGrantChecks() {
   dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
   await settle()
   eq('smb-grant: a create sends grantAccess {} (the grant, not applied to existing files)', jobs[0] && jobs[0].body.grantAccess, {})
+  ok('smb-grant: without apply-to-existing the create is a plain submit (the daemon never asks)', !!jobs[0] && jobs[0].door === 'runJob', jobs[0] && jobs[0].door)
   validates('smb-grant: the create body is a valid CreateSmbShareRequest', CreateSmbShareRequest, jobs[0] && jobs[0].body)
 
   // Untick the grant → no key, and the existing-files box goes dead.
@@ -14947,7 +14960,9 @@ async function smbGrantChecks() {
   await settle()
   ok('smb-grant: an unticked grant sends no grantAccess key', !!jobs[0] && !('grantAccess' in jobs[0].body), JSON.stringify(jobs[0] && jobs[0].body))
 
-  // "Apply to existing files": confirmed; No sends nothing; Yes sends the flag.
+  // "Apply to existing files": the daemon's 409 confirm (ruling 2026-10-11) —
+  // no dialog-side question; the submit takes the confirm door, whose prompt
+  // leads with the 409 headline (which names the path, daemon-tested).
   created.windows.length = 0
   clickTbar(grid, 'anas-btn-smb-add')
   await settle()
@@ -14957,15 +14972,12 @@ async function smbGrantChecks() {
   dlg.down('#grantExisting').setValue(true)
   jobs.length = 0
   confirms.length = 0
-  confirmAnswer = 'no'
   dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
   await settle()
-  confirmAnswer = 'yes'
-  ok('smb-grant: apply-to-existing asks first, and "No" sends nothing', confirms.length === 1 && jobs.length === 0, JSON.stringify(confirms))
-  ok('smb-grant: the confirm names the path', confirms[0] && /\/tank\/videos/.test(confirms[0].msg), confirms[0] && confirms[0].msg)
-  dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
-  await settle()
-  eq('smb-grant: "Yes" sends grantAccess { applyToExisting: true }', jobs[0] && jobs[0].body.grantAccess, { applyToExisting: true })
+  ok('smb-grant: apply-to-existing asks no dialog-side question; the submit takes the 409 confirm door', confirms.length === 0 && jobs.length === 1 && jobs[0].door === 'confirmAndRun', JSON.stringify({ confirms, door: jobs[0] && jobs[0].door }))
+  ok('smb-grant: the confirm leads with the daemon\'s 409 headline, titled "Apply to existing files"', !!jobs[0] && jobs[0].confirmHeadline === true && jobs[0].confirmTitle === 'Apply to existing files')
+  eq('smb-grant: the body sends grantAccess { applyToExisting: true }', jobs[0] && jobs[0].body.grantAccess, { applyToExisting: true })
+  validates('smb-grant: the confirmed create body is a valid CreateSmbShareRequest', CreateSmbShareRequest, jobs[0] && jobs[0].body)
 
   // --- edit: untouched stays byte-identical; a principal change grants ---------
   created.windows.length = 0
@@ -15004,6 +15016,9 @@ async function smbGrantChecks() {
   toasts.length = 0
   jobs[0].onComplete({ result: { updated: 'media', grant: { status: 'applied', path: '/tank/media', granted: [], skipped: ['ghost'], applyToExisting: false } } })
   ok('smb-grant: an applied grant with skipped names toasts them, no modal', alerts.length === 0 && toasts.some(m => /ghost/.test(m)), JSON.stringify(toasts))
+  toasts.length = 0
+  jobs[0].onComplete({ result: { updated: 'media', grant: { status: 'applied', path: '/tank/media', granted: [], skipped: [], applyToExisting: true, childAclEnabled: ['tank/media/kids'] } } })
+  ok('smb-grant: a recursive grant that switched ACLs on for a child dataset toasts its name (ruling 2026-10-11)', alerts.length === 0 && toasts.some(m => /POSIX ACLs switched on for child datasets: tank\/media\/kids/.test(m)), JSON.stringify(toasts))
 
   // --- the share row's Permissions button opens the SAME dialog on the share path ----
   created.windows.length = 0
@@ -15035,6 +15050,75 @@ warnings.length = 0
 created.windows.length = 0
 jobs.length = 0
 await smbGrantChecks()
+confirmAnswer = 'yes'
+
+// ============================================================================
+//  The recursive apply's confirm, end to end through the REAL ANAS.confirmAndRun
+//  (10-api.js) — access rulings 2026-10-11. The daemon answers the recursive
+//  PUT with 409 + X-Anas-Confirm-Code; with `confirmHeadline` the prompt leads
+//  with the 409's headline VERBATIM (the project rule: every confirm dialog
+//  carries the 409 headline), then its warnings; "No" sends nothing more, "Yes"
+//  resends the same body with the code.
+// ============================================================================
+
+async function accessConfirmFlowChecks() {
+  const HEADLINE = "Applying to existing files rewrites the permissions of every file and directory under '/tank/media'"
+  const WARN = "It crosses the child datasets mounted under '/tank/media': tank/media/kids (/tank/media/kids)."
+  function load() {
+    const sent = []
+    const win = {}
+    win.ANAS = {
+      t: s => s,
+      enc: s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+      warn() {},
+      toast() {},
+      errText: e => String((e && e.message) || e),
+    }
+    const sandbox = { window: win, Ext, console, Promise, setTimeout: (fn) => { fn(); return 1 }, clearTimeout: () => {} }
+    vm.runInNewContext(readFileSync(join(SRC, '10-api.js'), 'utf8'), sandbox, { filename: '10-api.js' })
+    const A = win.ANAS
+    A.api.put = (_node, path, body, opts) => {
+      sent.push({ path, body, confirmCode: (opts && opts.confirmCode) || null })
+      if (opts && opts.confirmCode === 'A1') { return Promise.resolve({ job: { id: 'job-1' } }) }
+      const e = new Error(HEADLINE)
+      e.status = 409
+      e.confirmCode = 'A1'
+      e.body = { error: { code: 'CONFIRMATION_REQUIRED', message: HEADLINE, warnings: [WARN, 'The current permissions are not recorded anywhere, so this cannot be undone.'] } }
+      return Promise.reject(e)
+    }
+    A.api.get = () => Promise.resolve({ job: { id: 'job-1', status: 'completed' } })
+    const body = { entries: [{ kind: 'user', name: 'alice', level: 'read' }], applyToExisting: true }
+    const run = () => A.confirmAndRun({ node: 'pve', method: 'put', path: '/pools/tank/datasets/media/access', body, confirmTitle: 'Apply to existing files', confirmHeadline: true })
+    return { sent, run, body }
+  }
+  confirms.length = 0
+  alerts.length = 0
+  confirmAnswer = 'no'
+  let h = load()
+  h.run()
+  await settle()
+  confirmAnswer = 'yes'
+  ok('access confirm flow: the recursive PUT prompts once, titled "Apply to existing files"', confirms.length === 1 && confirms[0].title === 'Apply to existing files', JSON.stringify(confirms))
+  ok('access confirm flow: the prompt leads with the 409 headline verbatim', !!confirms[0] && confirms[0].msg.startsWith(`<b>${HEADLINE}</b>`), confirms[0] && confirms[0].msg)
+  ok('access confirm flow: and carries the daemon\'s warnings (the child datasets crossed)', !!confirms[0] && confirms[0].msg.includes(WARN) && /cannot be undone/.test(confirms[0].msg), confirms[0] && confirms[0].msg)
+  eq('access confirm flow: "No" sends nothing more', h.sent.map(x => x.confirmCode), [null])
+  confirms.length = 0
+  h = load()
+  h.run()
+  await settle()
+  eq('access confirm flow: "Yes" resends with the code', h.sent.map(x => x.confirmCode), [null, 'A1'])
+  eq('access confirm flow: the resend carries the same body', h.sent[1] && h.sent[1].body, h.body)
+  ok('access confirm flow: no failure alert', alerts.length === 0, JSON.stringify(alerts))
+  // A flow without confirmHeadline keeps its caller's intro: proven above by
+  // confirmRepromptChecks ("the first prompt leads with the caller's intro").
+  confirms.length = 0
+  alerts.length = 0
+}
+
+warnings.length = 0
+created.windows.length = 0
+jobs.length = 0
+await accessConfirmFlowChecks()
 confirmAnswer = 'yes'
 
 if (failures.length) {

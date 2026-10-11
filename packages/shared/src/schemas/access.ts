@@ -101,6 +101,12 @@ export const ShareAccessGrantResult = z.object({
   /** `valid users` entries that were not granted (unresolvable names, `%` macros). */
   skipped: z.array(z.string()),
   applyToExisting: z.boolean(),
+  /**
+   * A recursive grant on a ZFS path (ruling 2026-10-11): the child datasets
+   * mounted under the path whose POSIX ACLs were switched on before the walk.
+   * Present when the walk was checked for them (empty = none needed it).
+   */
+  childAclEnabled: z.array(z.string()).optional(),
 })
 export type ShareAccessGrantResult = z.infer<typeof ShareAccessGrantResult>
 
