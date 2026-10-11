@@ -219,6 +219,10 @@ URLs identify resources (nouns). HTTP methods are the verbs. URL hierarchy impli
 | `GET` | `/v1/shares/smb/:name` | Share detail (config + active connections) | `200` |
 | `PUT` | `/v1/shares/smb/:name` | Update share config | `202` with job |
 | `DELETE` | `/v1/shares/smb/:name` | Remove a share | `202`/`409` |
+| `GET` | `/v1/shares/smb/:name/access` | The Permissions editor on the share's path (access.1) — `DatasetAccess` + `backing` | `200` |
+| `PUT` | `/v1/shares/smb/:name/access` | Set it — `SetAccessRequest`, the same `fs.setAccess` job | `202` with job / `400`/`409` |
+
+**Share-path grant (access.1, GitHub #75).** `POST`/`PUT /v1/shares/smb` take an optional `grantAccess: {applyToExisting?}`; present, the share job — after the `smb.conf` write and reload — runs the Permissions editor's writer on the share path with the form pre-filled: each `valid users` principal (`@`/`+`/`&` = group; `%` macros and names `getent` cannot resolve are skipped and listed) gets a named entry at Read-Write, Read on a read-only share; guest access gives Everyone the same level; owner/group untouched; every existing named entry kept and never lowered; access + default ACL. On an edit it runs only when the principal set, guest flag, read-only flag or path changed. The share is created or updated whatever the grant answers: its outcome (`ShareAccessGrantResult`: applied / refused with the gate's sentence / failed / nothing) rides on the job result as `grant`. Nothing is ever revoked — removing a principal or deleting the share leaves the path's ACL as it is (the filesystem carries no record of who wrote an entry).
 
 #### NFS Exports
 
@@ -229,6 +233,8 @@ URLs identify resources (nouns). HTTP methods are the verbs. URL hierarchy impli
 | `GET` | `/v1/shares/nfs/:path` | Export detail (path is URL-encoded) | `200` |
 | `PUT` | `/v1/shares/nfs/:path` | Update export config | `202` with job |
 | `DELETE` | `/v1/shares/nfs/:path` | Remove an export | `202`/`409` |
+| `GET` | `/v1/shares/nfs/:path/access` | The Permissions editor on the export's path (access.1). An export has no principal list, so there is no automatic grant — this is the after-the-fact editor | `200` |
+| `PUT` | `/v1/shares/nfs/:path/access` | Set it — `SetAccessRequest`, the same `fs.setAccess` job | `202` with job / `400`/`409` |
 
 #### Mounts (Epic 18 — external & local storage; designed 2026-07-18)
 
@@ -657,6 +663,8 @@ The base three principals (owner / owning-group / everyone) are **mode bits** (`
 | `fs.acl.clear` | `setfacl [-R] -b -k <mountpoint>` (remove access + default ACLs) — **explicit `clearNamed: true` only** |
 | `fs.acltype.enable` | `zfs set acltype=posixacl xattr=sa <dataset>` (first named grant only) |
 | `fs.acltype.get` | `zfs get -Hp -o value acltype <dataset>` |
+
+**One writer, three targets (access.1/access.2, 2026-10-11).** The editor lives in `services/access.ts`; the datasets routes, `GET/PUT /v1/ahr/:name/access` and the share routes' `…/access` all call it, and the share-path grant is the same writer with the form pre-filled. A target resolver names the directory — ZFS dataset or pool root (its mountpoint), AHR pool (the mounted `@data`), or a share path (resolved onto its home by the self-service resolver: ZFS dataset, AHR pool, or neither) — and is the one place the filesystems differ: **the ACL switch** — `acltype` exists only on ZFS (`fs.acltype.*` run only for a ZFS home; btrfs and other Linux filesystems have POSIX ACLs natively, so `aclEnabled` needs no switch and nothing is ever `zfs set` on a non-ZFS target); **the recursive walk** — `setfacl -R`/`chown -R`/`chmod -R` on ZFS walk into child datasets mounted beneath (the PVE-descendant refusal guards it), on AHR they sweep every subvolume under `@data` as one tree and never `@snapshots`, a sibling outside the mount; **PVE territory** — a ZFS target asks the footprint service, a non-ZFS directory asks storage.cfg's `path`/`mountpoint` keys (refused when the directory sits at or under one; a recursive apply refused when one sits inside the tree; an unreadable storage.cfg refuses); **iSCSI** — an AHR home takes the held-by-LUN 409. The GET payload gains an optional `backing: zfs | ahr | other` on the AHR and share routes (the datasets payload is unchanged; absent reads as `zfs`).
 
 ### SMB Operations
 | Operation | Command |

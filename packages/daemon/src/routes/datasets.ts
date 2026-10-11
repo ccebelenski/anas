@@ -1,19 +1,19 @@
-import type { AccessEntry, AssociatedShare, CreateDatasetRequest, Dataset, DatasetAccess, DatasetDetail, DatasetListDefaults, IscsiHeldByLun, MountpointPermissions, Snapshot, UpdateDatasetPropertiesRequest } from '@anas/shared'
+import type { AssociatedShare, CreateDatasetRequest, Dataset, DatasetDetail, DatasetListDefaults, IscsiHeldByLun, Snapshot, UpdateDatasetPropertiesRequest } from '@anas/shared'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
-import type { ParsedAcl } from '../parsers/getfacl.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { AccessService } from '../services/access.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
 import type { Transport } from '../services/replication-transport.js'
 import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, lunGrowGuidance, PoolName, RenameSnapshotRequest, reservedDatasetSegment, SetAccessRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
 import { parseExports } from '../parsers/exports.js'
-import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
 import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { confirmGateBound, readDatasetGuid, readRollbackIds, requireStableId } from '../safety/stable-id.js'
+import { createAccessService } from '../services/access.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
@@ -25,27 +25,11 @@ import { requireIdentity } from './identity.js'
 import { createReplicationHandlers } from './replication.js'
 
 const ZFS = '/usr/sbin/zfs'
-const STAT = '/usr/bin/stat'
 const CHOWN = '/usr/bin/chown'
 const CHMOD = '/usr/bin/chmod'
-const GETFACL = '/usr/bin/getfacl'
-const SETFACL = '/usr/bin/setfacl'
 
 /** Terminal sub-action of the dataset wildcard for the access editor. */
 const ACCESS_SUFFIX = '/access'
-
-/** The base-three access kinds (mode bits), in owner/group/everyone order. */
-type BaseKind = 'owner' | 'owning-group' | 'everyone'
-
-/** Levels for the base three principals, resolved from mode bits or a request. */
-interface BaseLevels {
-  'owner': AccessEntry['level']
-  'owning-group': AccessEntry['level']
-  'everyone': AccessEntry['level']
-}
-
-/** Whitespace splitter for `stat` output (owner group mode). */
-const WHITESPACE_RE = /\s+/
 
 /** `zfs list` stderr when the named dataset (or its pool) is not there. */
 const DATASET_ABSENT_RE = /dataset does not exist/i
@@ -278,97 +262,6 @@ export function assertVolumeMutable(
   return { reason: refusal.reason, message: refusal.message }
 }
 
-// ============================================================================
-// Layered access / ACLs (Epic 4.7.2). The base three principals (owner /
-// owning-group / everyone) are POSIX mode bits; extra named principals are
-// POSIX ACL entries. See parsers/getfacl.ts for the level ↔ perms mapping.
-// ============================================================================
-
-/** Split a stat mode (e.g. `755`, `2770`) into its owner/group/other levels. */
-function baseLevelsFromMode(mode: string): BaseLevels {
-  // Keep the low three digits; a leading setuid/setgid/sticky digit is ignored
-  // for level reporting (setgid is managed separately for ACL inheritance).
-  const digits = mode.slice(-3).padStart(3, '0')
-  const digit = (i: number) => Number.parseInt(digits[i], 10) || 0
-  return {
-    'owner': modeDigitToLevel(digit(0)),
-    'owning-group': modeDigitToLevel(digit(1)),
-    'everyone': modeDigitToLevel(digit(2)),
-  }
-}
-
-const NUMERIC_ID_RE = /^\d+$/
-/** A bare-numeric principal token means the uid/gid did not resolve to a name. */
-function isNumericId(name: string): boolean {
-  return NUMERIC_ID_RE.test(name)
-}
-
-/** Tag an entry as an orphan (unresolved uid/gid) when `orphan` is true. */
-function orphanFlag(entry: AccessEntry, orphan: boolean): AccessEntry {
-  return orphan ? { ...entry, unresolved: true } : entry
-}
-
-/** The base-three AccessEntry list derived from mode bits (mode-only datasets). */
-function baseEntriesFromMode(mode: string, ownerOrphan = false, groupOrphan = false): AccessEntry[] {
-  const levels = baseLevelsFromMode(mode)
-  return [
-    orphanFlag({ kind: 'owner', level: levels.owner }, ownerOrphan),
-    orphanFlag({ kind: 'owning-group', level: levels['owning-group'] }, groupOrphan),
-    { kind: 'everyone', level: levels.everyone },
-  ]
-}
-
-/** Base three levels → 3-digit octal mode string (e.g. `750`). */
-function levelsToMode(levels: BaseLevels): string {
-  return `${levelToOctalDigit(levels.owner)}${levelToOctalDigit(levels['owning-group'])}${levelToOctalDigit(levels.everyone)}`
-}
-
-/**
- * One principal's symbolic perms for a RECURSIVE chmod. Uses capital `X` so
- * execute lands only on directories (and files that already have it) — a
- * blanket numeric octal (`levelsToMode`) would sprinkle +x onto every plain
- * data file on a recursive Read grant. none → `` (empty), read → `rX`,
- * read-write → `rwX`.
- */
-function levelToSymbolicPerms(level: AccessEntry['level']): string {
-  switch (level) {
-    case 'none': return ''
-    case 'read': return 'rX'
-    case 'read-write': return 'rwX'
-  }
-}
-
-/** Base three levels → a symbolic chmod mode (`u=rwX,g=rX,o=`) for a recursive apply. */
-function levelsToSymbolic(levels: BaseLevels): string {
-  return `u=${levelToSymbolicPerms(levels.owner)},g=${levelToSymbolicPerms(levels['owning-group'])},o=${levelToSymbolicPerms(levels.everyone)}`
-}
-
-/** A named (user/group) AccessEntry — kind narrowed, name guaranteed present. */
-type NamedEntry = AccessEntry & { kind: 'user' | 'group', name: string }
-
-function isNamed(e: AccessEntry): e is NamedEntry {
-  return (e.kind === 'user' || e.kind === 'group') && e.name !== undefined
-}
-
-/**
- * Build a `setfacl --set` spec declaratively from the base three levels plus the
- * named entries. The mask is pinned to `rwx` (union) so no principal is masked
- * below its stated level — the reported level stays truthful. The same spec is
- * used for the access ACL and, with `-d`, the default (inheritance) ACL.
- */
-function buildAclSpec(base: BaseLevels, named: NamedEntry[], recursive: boolean): string {
-  const p = (level: AccessEntry['level']) => levelToAclPerms(level, recursive)
-  const specs = [
-    `u::${p(base.owner)}`,
-    `g::${p(base['owning-group'])}`,
-    `o::${p(base.everyone)}`,
-  ]
-  for (const n of named)
-    specs.push(`${n.kind === 'user' ? 'u' : 'g'}:${n.name}:${p(n.level)}`)
-  specs.push('m::rwx')
-  return specs.join(',')
-}
-
 /**
  * The snapshot sub-resource of a dataset wildcard, or null if the wildcard is a
  * plain dataset path. find-my-way only allows a terminal wildcard, so the whole
@@ -438,10 +331,17 @@ export async function datasetRoutes(
      * overridable so a test (and a dev box with no LIO) never reads the kernel.
      */
     iscsiPaths?: IscsiPaths
+    /**
+     * The ONE permissions writer (access.1) — shared with the AHR and share
+     * routes so the acl-package probe is made once per server. Built here
+     * when a caller (a test) registers the routes on their own.
+     */
+    accessService?: AccessService
   },
 ) {
   const { executor, jobQueue, confirmStore, transport } = opts
   const iscsiPaths = opts.iscsiPaths ?? {}
+  const access = opts.accessService ?? createAccessService({ executor, iscsiPaths })
 
   // Replication (Epic 5.5.1) shares this file's dataset `*` wildcard (find-my-way
   // permits only one wildcard route per method+path). The send/recv logic lives
@@ -644,14 +544,11 @@ export async function datasetRoutes(
    * (chown/chmod/setfacl `-R`) whose tree holds a PVE-owned descendant — the
    * same `ownedDescendant` question a recursive destroy or snapshot asks —
    * or null when there is none. An unreadable dataset list refuses (a walk the
-   * daemon cannot see through is never allowed).
+   * daemon cannot see through is never allowed). The question lives in the
+   * access service (access.1) so the share grant asks the same one.
    */
   async function recursiveOwnedRefusal(poolName: string, fullName: string): Promise<string | null> {
-    const datasets = await listDatasetsOrNull(poolName)
-    if (!datasets)
-      return pveDescendantsUnlistedMessage('permission change', fullName)
-    const descendant = (await pveFootprint()).ownedDescendant(datasets, fullName)
-    return descendant ? pveRecursiveRefusalMessage('Recursive permission change', fullName, descendant) : null
+    return access.zfsRecursiveRefusal(poolName, fullName)
   }
 
   /**
@@ -832,78 +729,6 @@ export async function datasetRoutes(
     return `${poolName}/${parsed.data}`
   }
 
-  /** Stat a mountpoint for owner/group/mode, or null if it can't be read. */
-  async function statMountpoint(mountpoint: string): Promise<MountpointPermissions | null> {
-    const r = await executor.exec(STAT, ['-c', '%U %G %a', mountpoint])
-    if (r.exitCode !== 0 || !r.stdout.trim())
-      return null
-    const [owner, group, mode] = r.stdout.trim().split(WHITESPACE_RE)
-    if (!owner || !group || !mode)
-      return null
-    return { owner, group, mode }
-  }
-
-  /**
-   * Is `getfacl`/`setfacl` present (the `acl` package)? Feature-detect, then
-   * memoize: whether the package is installed does not change at runtime, so we
-   * probe `getfacl --version` once per process instead of on every access
-   * request. The cache is a closure variable, so a fresh server (each
-   * `createServer()` re-invokes `datasetRoutes`) starts with a fresh cache. A
-   * cached Promise avoids a concurrent double-probe.
-   */
-  let aclSupportedCache: Promise<boolean> | null = null
-  function aclSupported(): Promise<boolean> {
-    aclSupportedCache ??= executor.exec(GETFACL, ['--version']).then(r => r.exitCode === 0)
-    return aclSupportedCache
-  }
-
-  /** The dataset's `acltype` value (`off`, `posixacl`, …); '' if unreadable. */
-  async function getAcltype(dataset: string): Promise<string> {
-    const r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'value', 'acltype', dataset])
-    return r.exitCode === 0 ? r.stdout.trim() : ''
-  }
-
-  /** True when the dataset has POSIX ACLs in effect (ZFS may print `posix`). */
-  function isPosixAcl(acltype: string): boolean {
-    return acltype === 'posixacl' || acltype === 'posix'
-  }
-
-  /**
-   * Resolve the pool + wildcard tail to a mounted-filesystem mountpoint for the
-   * access editor. Sends a 404 (and returns null) for an unknown dataset, a
-   * volume, or an unmounted filesystem — access applies to a real directory.
-   */
-  async function resolveAccessTarget(
-    poolName: string,
-    path: string,
-    reply: FastifyReply,
-  ): Promise<{ fullName: string, mountpoint: string } | null> {
-    let fullName = poolName
-    if (path) {
-      const pathParsed = DatasetPath.safeParse(path)
-      if (!pathParsed.success) {
-        reply.code(400)
-        reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid dataset path: ${pathParsed.error.issues[0]?.message}` } })
-        return null
-      }
-      fullName = `${poolName}/${pathParsed.data}`
-    }
-
-    const r = await executor.exec(ZFS, ['get', '-j', 'all', fullName])
-    const parsed = r.exitCode === 0 && r.stdout.trim() ? parseDatasetGet(r.stdout, fullName) : null
-    if (!parsed) {
-      reply.code(404)
-      reply.send({ error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } })
-      return null
-    }
-    if (parsed.base.type !== 'filesystem' || !parsed.base.mountpoint) {
-      reply.code(404)
-      reply.send({ error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' is not a mounted filesystem` } })
-      return null
-    }
-    return { fullName, mountpoint: parsed.base.mountpoint }
-  }
-
   // --- GET /pools/:name/datasets — flat list (UI builds the tree) ----------
   server.get<{ Params: { name: string } }>('/pools/:name/datasets', async (request, reply) => {
     const nameParsed = PoolName.safeParse(request.params.name)
@@ -1027,7 +852,7 @@ export async function datasetRoutes(
 
     // POSIX permissions from the mountpoint (filesystems only, when mounted).
     const permissions = parsed.base.type === 'filesystem' && parsed.base.mountpoint
-      ? await statMountpoint(parsed.base.mountpoint)
+      ? await access.statMountpoint(parsed.base.mountpoint)
       : null
 
     // Shares serving this dataset's mountpoint (filesystems with a mountpoint
@@ -1468,75 +1293,20 @@ export async function datasetRoutes(
   }
 
   // --- GET access — the layered access state of a dataset mountpoint -------
+  // The writer itself lives in services/access.ts (access.1): this route only
+  // names the ZFS target and sends what the service answers.
   async function getAccess(poolName: string, path: string, reply: FastifyReply) {
-    const target = await resolveAccessTarget(poolName, path, reply)
-    if (!target)
-      return reply
-    const { fullName, mountpoint } = target
-
-    const perm = await statMountpoint(mountpoint)
-    if (!perm) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Mountpoint '${mountpoint}' could not be read` } }
+    const target = await access.resolveZfsTarget(poolName, path)
+    if (!target.ok) {
+      reply.code(target.failure.status)
+      return target.failure.body
     }
-
-    const supported = await aclSupported()
-    const enabled = isPosixAcl(await getAcltype(fullName))
-
-    let entries: AccessEntry[]
-    let aclText: string | null = null
-    /** acltype says posixacl, but the ACL itself could not be read (#37). */
-    let aclDegraded = false
-
-    // A principal whose uid/gid no longer resolves shows as a bare number
-    // (getfacl/stat print the numeric id) — an orphan from a delete outside
-    // ANAS. Flag it so the UI can render "unknown (uid N)".
-    const ownerOrphan = isNumericId(perm.owner)
-    const groupOrphan = isNumericId(perm.group)
-
-    if (enabled && supported) {
-      // ACLs are live: read the full ACL and map it to entries.
-      const r = await executor.exec(GETFACL, ['-pcE', mountpoint])
-      if (r.exitCode === 0 && r.stdout.trim()) {
-        const acl = parseGetfacl(r.stdout)
-        entries = [
-          orphanFlag({ kind: 'owner', level: permsToLevel(acl.owner) }, ownerOrphan),
-          orphanFlag({ kind: 'owning-group', level: permsToLevel(acl.owningGroup) }, groupOrphan),
-          { kind: 'everyone', level: permsToLevel(acl.everyone) },
-          // Named entries; mask + default entries are managed, not shown.
-          ...acl.named.map((n): AccessEntry =>
-            orphanFlag({ kind: n.type, name: n.name, level: permsToLevel(n.perms) }, isNumericId(n.name))),
-        ]
-      }
-      else {
-        // ACLs enabled but unreadable. The mode bits are all we have, so the
-        // entries below are an APPROXIMATION and any named grants are missing
-        // from them. Say so (aclDegraded) and stop claiming healthy ACLs —
-        // a client that believed `aclEnabled: true` here would present an empty
-        // named list as the truth and let the operator "apply" it (#37).
-        aclDegraded = true
-        entries = baseEntriesFromMode(perm.mode, ownerOrphan, groupOrphan)
-      }
-      // Raw ACL text (with header, no effective comments) for the Advanced panel.
-      const raw = await executor.exec(GETFACL, ['-pE', mountpoint])
-      aclText = raw.exitCode === 0 ? raw.stdout : null
+    const read = await access.readAccess(target.value)
+    if (!read.ok) {
+      reply.code(read.failure.status)
+      return read.failure.body
     }
-    else {
-      // No ACLs: the base three come straight from the mode bits.
-      entries = baseEntriesFromMode(perm.mode, ownerOrphan, groupOrphan)
-    }
-
-    const data: DatasetAccess = {
-      owner: perm.owner,
-      group: perm.group,
-      aclSupported: supported,
-      aclEnabled: enabled && !aclDegraded,
-      entries,
-      aclText,
-    }
-    if (aclDegraded)
-      data.aclDegraded = true
-    return { data }
+    return { data: read.value }
   }
 
   // --- PUT access — set the layered access state (chown + chmod / ACLs) ----
@@ -1556,17 +1326,14 @@ export async function datasetRoutes(
     // its mountpoint (let alone -R) is PVE's territory to change. Asked BEFORE
     // the target resolution so an owned VOLUME is refused 400 with the reason
     // (the resolution would 404 it as "not a mounted filesystem") and before
-    // any command runs. The plain path parse is repeated from
-    // resolveAccessTarget; the 400 it can send is identical.
-    let fullName = poolName
-    if (path) {
-      const pathParsed = DatasetPath.safeParse(path)
-      if (!pathParsed.success) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `Invalid dataset path: ${pathParsed.error.issues[0]?.message}` } }
-      }
-      fullName = `${poolName}/${pathParsed.data}`
+    // any command runs. The plain path parse is the one the resolution repeats;
+    // the 400 it can send is identical.
+    const name = access.zfsFullName(poolName, path)
+    if (!name.ok) {
+      reply.code(name.failure.status)
+      return name.failure.body
     }
+    const fullName = name.value
     const owned = (await pveFootprint()).ownershipOf(fullName)
     if (owned) {
       reply.code(400)
@@ -1583,208 +1350,22 @@ export async function datasetRoutes(
       }
     }
 
-    const target = await resolveAccessTarget(poolName, path, reply)
-    if (!target)
-      return reply
-    // `fullName` is the one this function computed above — resolveAccessTarget
-    // re-parses the same path to the same name; only its mountpoint is new.
-    const { mountpoint } = target
-
-    const perm = await statMountpoint(mountpoint)
-    if (!perm) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Mountpoint '${mountpoint}' could not be read` } }
+    const target = await access.resolveZfsTarget(poolName, path)
+    if (!target.ok) {
+      reply.code(target.failure.status)
+      return target.failure.body
     }
-
-    const recursive = req.applyToExisting === true
-
-    const requestedNamed = (req.entries ?? []).filter(isNamed)
-    const baseChanged = req.entries !== undefined
-    /** Named grants are stripped ONLY on an explicit request (#37). */
-    const clearNamed = req.clearNamed === true
-
-    // owner/group only when actually changing (respect the current identity).
-    const ownerChanged = req.owner !== undefined && req.owner !== perm.owner
-    const groupChanged = req.group !== undefined && req.group !== perm.group
-
-    // Plan reads (feature-detect + current ACL state) outside the job, like the
-    // permissions path resolves the mountpoint outside the job.
-    const supported = await aclSupported()
-    const enabled = isPosixAcl(await getAcltype(fullName))
-
-    // When ACLs are live, read the ACL once up front and reuse it for BOTH the
-    // base-level fallback and the named grants we must preserve — one getfacl.
-    let liveAcl: ParsedAcl | null = null
-    if (enabled && supported) {
-      const r = await executor.exec(GETFACL, ['-pcE', mountpoint])
-      if (r.exitCode === 0 && r.stdout.trim())
-        liveAcl = parseGetfacl(r.stdout)
+    const planned = await access.planSetAccess(target.value, req)
+    if (!planned.ok) {
+      reply.code(planned.failure.status)
+      return planned.failure.body
     }
-
-    // Desired base three: a supplied entry overrides the current level, so a
-    // partial request never silently drops an unmentioned base principal. The
-    // fallback "current" level must be the REAL current level: when ACLs are
-    // live, take it from the actual ACL (`group::` etc.) — the mode's group
-    // digit is the ACL MASK (rwx), not the owning-group level, so reading it as
-    // the group level would silently escalate an omitted owning-group to
-    // read-write. With no ACLs, the mode bits ARE the truth.
-    const current: BaseLevels = liveAcl
-      ? {
-          'owner': permsToLevel(liveAcl.owner),
-          'owning-group': permsToLevel(liveAcl.owningGroup),
-          'everyone': permsToLevel(liveAcl.everyone),
-        }
-      : baseLevelsFromMode(perm.mode)
-    const levelOf = (kind: BaseKind) => req.entries?.find(e => e.kind === kind)?.level ?? current[kind]
-    const base: BaseLevels = {
-      'owner': levelOf('owner'),
-      'owning-group': levelOf('owning-group'),
-      'everyone': levelOf('everyone'),
-    }
-
-    // A base-only edit PRESERVES the live named grants — it never deletes them
-    // by omission (#37). Restating them in the declarative `setfacl --set` is
-    // also the only correct way to move the base levels on an ACL'd directory:
-    // a plain chmod would write the ACL MASK, not `group::`. When there is
-    // nothing to preserve (no live ACL, or the caller asked to clear) this list
-    // is empty and the mode-bit path below runs as before.
-    const preservedNamed: NamedEntry[] = (baseChanged && requestedNamed.length === 0 && !clearNamed)
-      ? (liveAcl?.named ?? []).map(n => ({ kind: n.type, name: n.name, level: permsToLevel(n.perms) }))
-      : []
-    const named = requestedNamed.length > 0 ? requestedNamed : preservedNamed
-    const hasNamed = named.length > 0
-    const aclAutoEnabled = hasNamed && supported && !enabled
-
-    // Strip the named ACL entries only when the caller explicitly said so. The
-    // acltype check (rather than "we saw named entries") means an explicit
-    // clear still runs when the ACL could not be read — the operator asked.
-    const clearAcls = clearNamed && supported && enabled
+    const plan = planned.value
 
     const job = jobQueue.submit(
       'fs.setAccess',
-      {
-        ...identity,
-        params: {
-          dataset: fullName,
-          mountpoint,
-          ownerChanged,
-          groupChanged,
-          baseChanged,
-          namedCount: named.length,
-          preservedNamedCount: preservedNamed.length,
-          clearNamed,
-          applyToExisting: recursive,
-          aclAutoEnabled,
-        },
-      },
-      async (updateProgress) => {
-        // Named grants need the acl package. Gate BEFORE any mutation so a
-        // missing tool never leaves a half-applied state. (Only a REQUESTED
-        // grant can hit this — preserved entries imply a readable live ACL.)
-        if (hasNamed && !supported)
-          throw new Error('The acl package (setfacl) is not installed; named user/group grants require it. Install it (apt install acl), or grant owner/group/everyone only.')
-
-        // 1) Ownership.
-        if (ownerChanged || groupChanged) {
-          const spec = ownerChanged && groupChanged
-            ? `${req.owner}:${req.group}`
-            : ownerChanged
-              ? `${req.owner}`
-              : `:${req.group}`
-          const args = recursive ? ['-R', spec, mountpoint] : [spec, mountpoint]
-          updateProgress(`chown ${spec} ${mountpoint}`)
-          const r = await executor.exec(CHOWN, args)
-          if (r.exitCode !== 0)
-            throw new Error(r.stderr.trim() || `chown exited with code ${r.exitCode}`)
-        }
-
-        if (hasNamed) {
-          // 2) Enable POSIX ACLs on the dataset if not already (side effect).
-          if (!enabled) {
-            updateProgress(`zfs set acltype=posixacl xattr=sa ${fullName}`)
-            const r = await executor.exec(ZFS, ['set', 'acltype=posixacl', 'xattr=sa', fullName])
-            if (r.exitCode !== 0)
-              throw new Error(r.stderr.trim() || `zfs set acltype=posixacl exited with code ${r.exitCode}`)
-          }
-
-          // 3) Set the access ACL DECLARATIVELY so dropped principals disappear.
-          const spec = buildAclSpec(base, named, recursive)
-          const setArgs = recursive ? ['-R', '--set', spec, mountpoint] : ['--set', spec, mountpoint]
-          updateProgress(`setfacl --set ${spec} ${mountpoint}`)
-          const setR = await executor.exec(SETFACL, setArgs)
-          if (setR.exitCode !== 0)
-            throw new Error(setR.stderr.trim() || `setfacl --set exited with code ${setR.exitCode}`)
-
-          // 4) Matching DEFAULT ACL so new files inherit the grants.
-          // ASSUMPTION (verify live): `setfacl -R -d --set` applies default
-          // entries only to directories and does NOT error on regular files
-          // during the recursive walk (GNU acl skips default-on-file). If it
-          // errors live, switch step 4 to a `find <mp> -type d`-scoped set.
-          const defArgs = recursive ? ['-R', '-d', '--set', spec, mountpoint] : ['-d', '--set', spec, mountpoint]
-          updateProgress(`setfacl -d --set ${spec} ${mountpoint}`)
-          const defR = await executor.exec(SETFACL, defArgs)
-          if (defR.exitCode !== 0)
-            throw new Error(defR.stderr.trim() || `setfacl -d --set exited with code ${defR.exitCode}`)
-
-          // 5) setgid on the directory so new files take the group, completing
-          // inheritance. ASSUMPTION (verify live): recursive `chmod -R g+s`
-          // also sets setgid on plain files, which is inert for data files; if
-          // the orchestrator prefers dirs-only, scope with `find -type d`.
-          const gidArgs = recursive ? ['-R', 'g+s', mountpoint] : ['g+s', mountpoint]
-          updateProgress(`chmod g+s ${mountpoint}`)
-          const gidR = await executor.exec(CHMOD, gidArgs)
-          if (gidR.exitCode !== 0)
-            throw new Error(gidR.stderr.trim() || `chmod g+s exited with code ${gidR.exitCode}`)
-
-          return { dataset: fullName, mountpoint, aclEnabled: true, aclAutoEnabled, namedCount: named.length }
-        }
-
-        // No named entries to apply → mode bits, plus an EXPLICIT ACL clear.
-        // Strip the requested-away ACLs first so the mode bits are the whole
-        // truth. This runs only for `clearNamed: true` — never inferred.
-        if (clearAcls) {
-          const clearArgs = recursive ? ['-R', '-b', '-k', mountpoint] : ['-b', '-k', mountpoint]
-          updateProgress(`setfacl -b -k ${mountpoint}`)
-          const clearR = await executor.exec(SETFACL, clearArgs)
-          if (clearR.exitCode !== 0)
-            throw new Error(clearR.stderr.trim() || `setfacl -b -k exited with code ${clearR.exitCode}`)
-          // Also drop the setgid bit we set for ACL inheritance — with the
-          // named grants gone there is nothing to inherit, and a leftover
-          // setgid would make the reported mode (e.g. 2775 vs 775) misleading.
-          // A recursive clear that ALSO sets the base levels folds `g-s` into
-          // that one mode chmod below (one `-R` walk instead of two); every
-          // other shape needs its own call.
-          if (!recursive || !baseChanged) {
-            const gsArgs = recursive ? ['-R', 'g-s', mountpoint] : ['g-s', mountpoint]
-            updateProgress(`chmod g-s ${mountpoint}`)
-            const unsetR = await executor.exec(CHMOD, gsArgs)
-            if (unsetR.exitCode !== 0)
-              throw new Error(unsetR.stderr.trim() || `chmod g-s exited with code ${unsetR.exitCode}`)
-          }
-        }
-        if (baseChanged) {
-          // Recursive: symbolic perms with capital `X` so execute is applied only
-          // to directories (and already-executable files), never sprinkled onto
-          // plain data files. When we cleared ACLs, append `,g-s` so the setgid
-          // bit is removed in the SAME recursive walk (the `=` clauses set the
-          // base perms, `g-s` strips setgid). Non-recursive: numeric octal is
-          // correct — the mountpoint is always a directory — and the setgid-clear
-          // above stays its own cheap call.
-          // ASSUMPTION (verify live): `chmod -R 'u=rwX,g=rX,o=,g-s' <mp>` is
-          // accepted by GNU coreutils chmod (symbolic mode with X, comma-separated
-          // clauses mixing `=` and `-` operators).
-          const mode = recursive
-            ? (clearAcls ? `${levelsToSymbolic(base)},g-s` : levelsToSymbolic(base))
-            : levelsToMode(base)
-          const modeArgs = recursive ? ['-R', mode, mountpoint] : [mode, mountpoint]
-          updateProgress(`chmod ${mode} ${mountpoint}`)
-          const modeR = await executor.exec(CHMOD, modeArgs)
-          if (modeR.exitCode !== 0)
-            throw new Error(modeR.stderr.trim() || `chmod ${mode} exited with code ${modeR.exitCode}`)
-        }
-
-        return { dataset: fullName, mountpoint, aclEnabled: enabled, aclAutoEnabled: false, namedCount: 0, clearedNamed: clearAcls }
-      },
+      { ...identity, params: access.jobParams(plan) },
+      async updateProgress => access.runSetAccess(plan, updateProgress),
     )
 
     reply.code(202)

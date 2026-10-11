@@ -153,6 +153,28 @@ export const SmbGlobalConfig = z.object({
 })
 export type SmbGlobalConfig = z.infer<typeof SmbGlobalConfig>
 
+/**
+ * The share-path grant (access.1, GitHub #75) — the Permissions editor with
+ * its form pre-filled, run inside the share job. PRESENT = grant: each
+ * `valid users` principal gets a named ACL entry on the share path at
+ * Read-Write (Read on a read-only share), guest access gives Everyone the same
+ * level, owner/group and every existing named entry are kept, nobody is
+ * lowered, and access AND default entries are written so new files inherit.
+ * ABSENT = no grant (a client that does not know the field changes nothing).
+ * On an edit the grant runs only when the principals, guest flag, read-only
+ * flag or path actually changed, or `applyToExisting` asks for it explicitly.
+ * Nothing is ever revoked: removing a principal
+ * or deleting the share leaves the path's ACL as it is.
+ */
+export const ShareAccessGrantRequest = z.object({
+  /**
+   * Also rewrite the files already under the path (`setfacl -R`/`chmod -R`) —
+   * the editor's "apply to existing files", the user's explicit choice only.
+   */
+  applyToExisting: z.boolean().optional(),
+})
+export type ShareAccessGrantRequest = z.infer<typeof ShareAccessGrantRequest>
+
 /** Create an SMB share (POST /v1/shares/smb). */
 export const CreateSmbShareRequest = z.object({
   name: ShareName,
@@ -172,6 +194,8 @@ export const CreateSmbShareRequest = z.object({
   previousVersions: PreviousVersionsRequest.optional(),
   recycle: RecycleRequest.optional(),
   timeMachine: TimeMachineRequest.optional(),
+  /** Grant the selected principals access on the share path (access.1). */
+  grantAccess: ShareAccessGrantRequest.optional(),
 })
 export type CreateSmbShareRequest = z.infer<typeof CreateSmbShareRequest>
 

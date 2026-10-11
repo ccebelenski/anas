@@ -1,13 +1,16 @@
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { AccessService } from '../services/access.js'
 import { AbsolutePath, CreateNfsExportRequest, UpdateNfsExportRequest } from '@anas/shared'
 import { addExport, hasExport, parseExports, removeExport, replaceExport } from '../parsers/exports.js'
 import { confirmGate } from '../safety/gate.js'
+import { createAccessService } from '../services/access.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
 import { requireIdentity } from './identity.js'
+import { shareAccessHandlers } from './share-access.js'
 import { pathExists } from './shares-smb.js'
 
 /** `exportfs -ra` re-reads /etc/exports and syncs the kernel export table. */
@@ -24,9 +27,10 @@ const EXPORTFS = '/usr/sbin/exportfs'
  */
 export async function nfsExportRoutes(
   server: FastifyInstance,
-  opts: { executor: CommandExecutor, jobQueue: JobQueue, confirmStore: ConfirmStore, exportsPath: string },
+  opts: { executor: CommandExecutor, jobQueue: JobQueue, confirmStore: ConfirmStore, exportsPath: string, accessService?: AccessService },
 ) {
   const { executor, jobQueue, confirmStore, exportsPath } = opts
+  const shareAccess = shareAccessHandlers({ access: opts.accessService ?? createAccessService({ executor }), jobQueue })
 
   /** Reload the kernel export table; throws on failure (fails the job). */
   async function reloadExports(): Promise<void> {
@@ -119,6 +123,39 @@ export async function nfsExportRoutes(
 
     reply.code(202)
     return { job }
+  })
+
+  // --- GET/PUT /shares/nfs/:path/access — the export row's Permissions ----
+  // (access.1) An export carries no principal list, so there is no automatic
+  // grant; this is the shared editor opened on the export's path, after the
+  // fact. The export must exist in /etc/exports (the file is the truth).
+  async function exportPathOr404(raw: string, reply: FastifyReply): Promise<string | null> {
+    const pathParsed = AbsolutePath.safeParse(raw)
+    if (!pathParsed.success) {
+      reply.code(400)
+      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid export path: ${pathParsed.error.issues[0]?.message}` } })
+      return null
+    }
+    if (!hasExport(await readConfig(exportsPath), pathParsed.data)) {
+      reply.code(404)
+      reply.send({ error: { code: 'NOT_FOUND', message: `Export '${pathParsed.data}' not found` } })
+      return null
+    }
+    return pathParsed.data
+  }
+
+  server.get<{ Params: { path: string } }>('/shares/nfs/:path/access', async (request, reply) => {
+    const path = await exportPathOr404(request.params.path, reply)
+    if (!path)
+      return reply
+    return shareAccess.get(path, reply)
+  })
+
+  server.put<{ Params: { path: string } }>('/shares/nfs/:path/access', async (request, reply) => {
+    const path = await exportPathOr404(request.params.path, reply)
+    if (!path)
+      return reply
+    return shareAccess.put(path, { export: path }, request, reply)
   })
 
   // --- PUT /shares/nfs/:path — replace the client list -------------------

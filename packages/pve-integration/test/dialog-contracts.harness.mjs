@@ -183,7 +183,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { AttachAhrCacheRequest, BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncPreviewRequest, CloudSyncTaskRequest, deriveArchiveName, lunBackupId } from '@anas/shared'
+import { AttachAhrCacheRequest, BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncPreviewRequest, CloudSyncTaskRequest, CreateSmbShareRequest, deriveArchiveName, lunBackupId, SetAccessRequest } from '@anas/shared'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = join(HERE, '..', 'src')
@@ -14675,6 +14675,367 @@ async function confirmRepromptChecks() {
 
 warnings.length = 0
 await confirmRepromptChecks()
+
+
+// ============================================================================
+//  13. access.1/access.2 — ONE Permissions dialog (14-permissions.js) for
+//  every target, and the SMB share dialog's grant. The dialog opened from a
+//  Datasets row and from a Hybrid RAID row must render the SAME rows, levels
+//  and options and send the SAME body, differing ONLY where the filesystem
+//  differs, each difference stated: the acltype note (ZFS only) and the
+//  subvolume sentence under "Apply to existing files too" (AHR only). A
+//  recursive apply is confirmed before anything is sent. The share dialog
+//  carries the grant checkbox (default on), "apply to existing files"
+//  (default off, confirmed) and the one sentence about existing files; an
+//  untouched edit stays byte-identical; the grant's refusal reaches the user.
+// ============================================================================
+
+/** The same live state on both targets: owner rw, group r, everyone none, alice rw. */
+function accessPayload(extra) {
+  return {
+    owner: 'root',
+    group: 'root',
+    aclSupported: true,
+    aclEnabled: false,
+    entries: [
+      { kind: 'owner', level: 'read-write' },
+      { kind: 'owning-group', level: 'read' },
+      { kind: 'everyone', level: 'none' },
+      { kind: 'user', name: 'alice', level: 'read-write' },
+    ],
+    aclText: null,
+    ...extra,
+  }
+}
+
+const ACCESS_ROUTES = {
+  ...DATASET_ROUTES,
+  'GET /identity/users': { data: [{ name: 'root' }, { name: 'alice' }, { name: 'media' }] },
+  'GET /identity/groups': { data: [{ name: 'root' }, { name: 'staff' }] },
+  'GET /ahr': { data: [ahrPoolRow('ahr0'), ahrPoolRow('ahr1', { mounted: false })] },
+  // ZFS: acltype off (aclEnabled false) — the acltype note applies.
+  'GET /pools/tank/datasets/media/access': { data: accessPayload() },
+  // AHR: btrfs, POSIX ACLs native — enabled, no switch.
+  'GET /ahr/ahr0/access': { data: accessPayload({ aclEnabled: true, backing: 'ahr' }) },
+  'PUT /pools/tank/datasets/media/access': { job: { id: 'j1' } },
+  'PUT /ahr/ahr0/access': { job: { id: 'j2' } },
+}
+
+/** What a rendered Permissions window offers, independent of the target. */
+function accessDialogShape(win) {
+  const comboLevels = id => (win.down(`#${id}`) && win.down(`#${id}`).getStore()
+    ? win.down(`#${id}`).getStore().getRange().map(r => `${r.get('level')}=${r.get('label')}`)
+    : null)
+  const named = win.down('#named')
+  return {
+    cls: win.cls,
+    rows: ['owner', 'ownerLevel', 'group', 'groupLevel', 'everyoneLevel', 'named', 'addBtn', 'recursive', 'aclText', 'applyBtn'].map(id => [id, !!win.down(`#${id}`)]),
+    levels: ['ownerLevel', 'groupLevel', 'everyoneLevel'].map(comboLevels),
+    values: ['owner', 'ownerLevel', 'group', 'groupLevel', 'everyoneLevel'].map(id => win.down(`#${id}`) && win.down(`#${id}`).getValue()),
+    namedRows: named ? named.getStore().getRange().map(r => `${r.get('kind')}:${r.get('name')}:${r.get('level')}`) : null,
+    recursiveLabel: win.down('#recursive') && win.down('#recursive').boxLabel,
+    recursiveTicked: win.down('#recursive') && win.down('#recursive').getValue(),
+    advanced: !!findCmp(win, 'anas-panel-access-advanced'),
+    addDisabled: !!(win.down('#addBtn') && win.down('#addBtn').disabled),
+    applyDisabled: !!(win.down('#applyBtn') && win.down('#applyBtn').disabled),
+  }
+}
+
+async function openDatasetPermissions(ANAS, routes) {
+  const view = makeComponent(ANAS.views.datasets.factory('harness'), null)
+  const tree = view.down('#dsTree')
+  tree.fireEvent('afterrender', tree)
+  await settle()
+  tree.selectNode(findNode(tree, 'tank/media'))
+  created.windows.length = 0
+  const btn = tree.down('#dsPerms')
+  btn.handler(btn)
+  await settle()
+  return { tree, win: openWindow() }
+}
+
+async function openAhrPermissions(ANAS, pool) {
+  const view = makeComponent(ANAS.views.ahr.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.itemId === 'ahrGrid' ? view : view.down('#ahrGrid')
+  grid.selectRow(grid.getStore().findExact('name', pool || 'ahr0'))
+  created.windows.length = 0
+  const btn = grid.down('#permissions')
+  if (!btn.disabled) { btn.handler(btn) }
+  await settle()
+  return { grid, btn, win: openWindow() }
+}
+
+async function accessDialogParityChecks() {
+  const SOURCES = ['10-api.js', '14-permissions.js', '15-gfx.js', '39-ahr.js', '60-datasets.js']
+  let ANAS = loadSources(SOURCES, ACCESS_ROUTES)
+  ok('access: the shared dialog is registered (ANAS.permissions.open)', !!(ANAS.permissions && typeof ANAS.permissions.open === 'function'))
+
+  const ds = await openDatasetPermissions(ANAS)
+  ok('access(ds): the Datasets row opens the Permissions window', !!ds.win, JSON.stringify(warnings))
+  ANAS = loadSources(SOURCES, ACCESS_ROUTES)
+  const ahr = await openAhrPermissions(ANAS)
+  ok('access(ahr): the Hybrid RAID row opens the Permissions window', !!ahr.win, JSON.stringify(warnings))
+  if (!ds.win || !ahr.win) { return }
+
+  ok('access(ds): the window reads the dataset access path', apiGets.includes('/pools/tank/datasets/media/access'))
+  ok('access(ahr): the window reads the AHR access path', apiGets.includes('/ahr/ahr0/access'))
+  ok('access(ds): titled with the dataset', /Permissions: tank\/media/.test(ds.win.title), ds.win.title)
+  ok('access(ahr): titled with the pool', /Permissions: ahr0/.test(ahr.win.title), ahr.win.title)
+
+  // --- the same rows, levels, options and pre-fill --------------------------
+  const dsShape = accessDialogShape(ds.win)
+  const ahrShape = accessDialogShape(ahr.win)
+  eq('access parity: the same rows/levels/options/pre-fill on a dataset and an AHR pool', ahrShape, dsShape)
+  eq('access parity: the level options are No access / Read / Read-Write', dsShape.levels[0], ['none=No access', 'read=Read', 'read-write=Read-Write'])
+  eq('access parity: the named grid is pre-filled from the payload', dsShape.namedRows, ['user:alice:read-write'])
+
+  // --- the stated differences ---------------------------------------------------
+  const dsNote = ds.win.down('#aclNote')
+  const ahrNote = ahr.win.down('#aclNote')
+  ok('access diff(ds): the acltype note shows on ZFS with ACLs off', dsNote.hidden === false && /acltype=posixacl/.test(dsNote.html), dsNote.html)
+  ok('access diff(ahr): NO acltype note on AHR', ahrNote.hidden === true || !/acltype/.test(ahrNote.html || ''), ahrNote.html)
+  const dsRec = ds.win.down('#recursiveNote').html
+  const ahrRec = ahr.win.down('#recursiveNote').html
+  ok('access diff(ds): the recursive help is the Datasets sentence, unchanged', dsRec === 'New files always inherit these settings; tick this to also update files already in the folder.', dsRec)
+  ok('access diff(ahr): the recursive help states the subvolume sweep', /walks every subvolume under the pool's data as one tree/.test(ahrRec) && /snapshots are never touched/.test(ahrRec), ahrRec)
+  ok('access diff(ahr): and still carries the shared sentence', ahrRec.startsWith(dsRec), ahrRec)
+
+  // The add-principal window: its acltype note is ZFS-only too.
+  created.windows.length = 0
+  ds.win.down('#addBtn').handler()
+  const dsAdd = openWindow()
+  ok('access diff(ds): the add window states the acltype enable', !!dsAdd && dsAdd.down('#acltypeNote').hidden === false)
+  created.windows.length = 0
+  ahr.win.down('#addBtn').handler()
+  const ahrAdd = openWindow()
+  ok('access diff(ahr): the add window states nothing about acltype', !!ahrAdd && ahrAdd.down('#acltypeNote').hidden === true)
+
+  // --- the same body, a different path ----------------------------------------
+  for (const w of [ds.win, ahr.win]) { w.down('#everyoneLevel').setValue('read') }
+  jobs.length = 0
+  ds.win.down('#applyBtn').handler()
+  ahr.win.down('#applyBtn').handler()
+  await settle()
+  eq('access parity: both targets PUT to their own path', jobs.map(j => `${j.method} ${j.path}`), ['put /pools/tank/datasets/media/access', 'put /ahr/ahr0/access'])
+  eq('access parity: the two bodies are identical', jobs[1] && jobs[1].body, jobs[0] && jobs[0].body)
+  validates('access parity: the body is a valid SetAccessRequest', SetAccessRequest, jobs[0] && jobs[0].body)
+  eq('access parity: the body restates the base three and the named grant', jobs[0] && jobs[0].body, {
+    entries: [
+      { kind: 'owner', level: 'read-write' },
+      { kind: 'owning-group', level: 'read' },
+      { kind: 'everyone', level: 'read' },
+      { kind: 'user', name: 'alice', level: 'read-write' },
+    ],
+    applyToExisting: false,
+    owner: 'root',
+    group: 'root',
+  })
+
+  // --- a recursive apply is confirmed first, and "No" sends nothing -------------
+  ANAS = loadSources(SOURCES, ACCESS_ROUTES)
+  const again = await openAhrPermissions(ANAS)
+  again.win.down('#recursive').setValue(true)
+  confirms.length = 0
+  jobs.length = 0
+  confirmAnswer = 'no'
+  again.win.down('#applyBtn').handler()
+  await settle()
+  confirmAnswer = 'yes'
+  ok('access(recursive): the apply is confirmed before anything is sent', confirms.length === 1 && jobs.length === 0, JSON.stringify({ confirms, jobs: jobs.length }))
+  ok('access(recursive): the AHR confirm names the subvolume walk', confirms[0] && /every subvolume/.test(confirms[0].msg), confirms[0] && confirms[0].msg)
+  confirms.length = 0
+  again.win.down('#applyBtn').handler()
+  await settle()
+  ok('access(recursive): "Yes" sends applyToExisting: true', jobs.length === 1 && jobs[0].body.applyToExisting === true, JSON.stringify(jobs[0] && jobs[0].body))
+  const ds2 = await openDatasetPermissions(loadSources(SOURCES, ACCESS_ROUTES))
+  ds2.win.down('#recursive').setValue(true)
+  confirms.length = 0
+  jobs.length = 0
+  ds2.win.down('#applyBtn').handler()
+  await settle()
+  ok('access(recursive): the Datasets apply is confirmed the same way', confirms.length === 1 && jobs.length === 1 && jobs[0].body.applyToExisting === true)
+  ok('access(recursive): the ZFS confirm does not talk about subvolumes', confirms[0] && !/subvolume/.test(confirms[0].msg), confirms[0] && confirms[0].msg)
+
+  // --- the acl-package hint is identical on both ------------------------------------
+  const noAcl = {
+    ...ACCESS_ROUTES,
+    'GET /pools/tank/datasets/media/access': { data: accessPayload({ aclSupported: false }) },
+    'GET /ahr/ahr0/access': { data: accessPayload({ aclSupported: false, aclEnabled: true, backing: 'ahr' }) },
+  }
+  const dsNo = await openDatasetPermissions(loadSources(SOURCES, noAcl))
+  const ahrNo = await openAhrPermissions(loadSources(SOURCES, noAcl))
+  ok('access(no acl): the hint shows on ZFS', dsNo.win.down('#aclNote').hidden === false && /acl package/.test(dsNo.win.down('#aclNote').html))
+  eq('access(no acl): the SAME hint on AHR', ahrNo.win.down('#aclNote').html, dsNo.win.down('#aclNote').html)
+  ok('access(no acl): Add is disabled on both', dsNo.win.down('#addBtn').disabled === true && ahrNo.win.down('#addBtn').disabled === true)
+
+  // --- a degraded ACL locks the window on AHR as on ZFS --------------------------------
+  const degraded = { ...ACCESS_ROUTES, 'GET /ahr/ahr0/access': { data: accessPayload({ aclEnabled: false, aclDegraded: true, backing: 'ahr' }) } }
+  const ahrDeg = await openAhrPermissions(loadSources(SOURCES, degraded))
+  ok('access(degraded): Apply and Add are disabled on AHR', ahrDeg.win.down('#applyBtn').disabled === true && ahrDeg.win.down('#addBtn').disabled === true)
+  ok('access(degraded): the AHR note does not call the pool a dataset', !/dataset/.test(ahrDeg.win.down('#aclNote').html), ahrDeg.win.down('#aclNote').html)
+
+  // --- the AHR toolbar gate: unmounted and LUN-held pools grey the verb ------------------
+  const gated = loadSources(SOURCES, { ...ACCESS_ROUTES, 'GET /ahr': { data: [ahrPoolRow('ahr0', { heldByLun: AHR_HELD }), ahrPoolRow('ahr1', { mounted: false })] } })
+  const held = await openAhrPermissions(gated, 'ahr0')
+  ok('access(ahr gate): a LUN-held pool greys Permissions', held.btn.disabled === true)
+  ok('access(ahr gate): naming the LUN', /LUN 0 'ahrblock1'/.test(held.btn.tooltip || ''), held.btn.tooltip)
+  held.grid.selectRow(held.grid.getStore().findExact('name', 'ahr1'))
+  const permBtn = held.grid.down('#permissions')
+  ok('access(ahr gate): an unmounted pool greys Permissions with the reason', permBtn.disabled === true && /not mounted/.test(permBtn.tooltip || ''), permBtn.tooltip)
+
+  // --- the job refreshes its opener on success and on failure --------------------------
+  const reload = loadSources(SOURCES, ACCESS_ROUTES)
+  const r = await openAhrPermissions(reload)
+  jobs.length = 0
+  r.win.down('#applyBtn').handler()
+  await settle()
+  const gets = apiGets.filter(p => p === '/ahr').length
+  jobs[0].onFailed({})
+  await settle()
+  ok('access(ahr): a failed job reloads the pool grid', apiGets.filter(p => p === '/ahr').length === gets + 1)
+}
+
+async function smbGrantChecks() {
+  const routes = {
+    ...smbSelfServiceRoutes([SMB_SHARE]),
+    'GET /shares/nfs': { data: [{ path: '/tank/media', clients: [{ spec: '*', options: ['rw'] }] }] },
+    'GET /shares/smb/media/access': { data: accessPayload({ aclEnabled: true, backing: 'ahr' }) },
+    'GET /shares/nfs/%2Ftank%2Fmedia/access': { data: accessPayload({ backing: 'zfs' }) },
+  }
+  const ANAS = loadSources(['10-api.js', '14-permissions.js', '70-shares.js'], routes)
+  const view = makeComponent(ANAS.views.shares.factory('harness'), null)
+  const grid = view.down('#sharesGrid')
+  grid.fireEvent('afterrender', grid)
+  await settle()
+
+  // --- create: the fields and their defaults ---------------------------------
+  clickTbar(grid, 'anas-btn-smb-add')
+  await settle()
+  let dlg = openWindow()
+  const grant = dlg && dlg.down('#grantAccess')
+  const existing = dlg && dlg.down('#grantExisting')
+  const note = dlg && dlg.down('#grantNote')
+  ok('smb-grant: the grant checkbox exists and is ON by default', !!grant && grant.checked === true)
+  ok('smb-grant: its label', !!grant && grant.boxLabel === 'Grant the selected users access on the share path', grant && grant.boxLabel)
+  ok('smb-grant: "Apply to existing files" exists and is OFF by default', !!existing && existing.checked === false && existing.boxLabel === 'Apply to existing files')
+  ok('smb-grant: the one sentence about existing files (and that nothing is revoked)',
+    !!note && /Existing files keep their permissions unless applied\./.test(note.html) && /never takes access away/.test(note.html), note && note.html)
+
+  dlg.down('#name').setValue('videos')
+  dlg.down('#path').setValue('/tank/videos')
+  dlg.down('#validUsers').setValue(['media', '@staff'])
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+  await settle()
+  eq('smb-grant: a create sends grantAccess {} (the grant, not applied to existing files)', jobs[0] && jobs[0].body.grantAccess, {})
+  validates('smb-grant: the create body is a valid CreateSmbShareRequest', CreateSmbShareRequest, jobs[0] && jobs[0].body)
+
+  // Untick the grant → no key, and the existing-files box goes dead.
+  created.windows.length = 0
+  clickTbar(grid, 'anas-btn-smb-add')
+  await settle()
+  dlg = openWindow()
+  dlg.down('#name').setValue('videos')
+  dlg.down('#path').setValue('/tank/videos')
+  dlg.down('#grantExisting').setValue(true)
+  dlg.down('#grantAccess').setValue(false)
+  ok('smb-grant: unticking the grant unticks and disables "apply to existing"', dlg.down('#grantExisting').checked === false && dlg.down('#grantExisting').disabled === true)
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+  await settle()
+  ok('smb-grant: an unticked grant sends no grantAccess key', !!jobs[0] && !('grantAccess' in jobs[0].body), JSON.stringify(jobs[0] && jobs[0].body))
+
+  // "Apply to existing files": confirmed; No sends nothing; Yes sends the flag.
+  created.windows.length = 0
+  clickTbar(grid, 'anas-btn-smb-add')
+  await settle()
+  dlg = openWindow()
+  dlg.down('#name').setValue('videos')
+  dlg.down('#path').setValue('/tank/videos')
+  dlg.down('#grantExisting').setValue(true)
+  jobs.length = 0
+  confirms.length = 0
+  confirmAnswer = 'no'
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+  await settle()
+  confirmAnswer = 'yes'
+  ok('smb-grant: apply-to-existing asks first, and "No" sends nothing', confirms.length === 1 && jobs.length === 0, JSON.stringify(confirms))
+  ok('smb-grant: the confirm names the path', confirms[0] && /\/tank\/videos/.test(confirms[0].msg), confirms[0] && confirms[0].msg)
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+  await settle()
+  eq('smb-grant: "Yes" sends grantAccess { applyToExisting: true }', jobs[0] && jobs[0].body.grantAccess, { applyToExisting: true })
+
+  // --- edit: untouched stays byte-identical; a principal change grants ---------
+  created.windows.length = 0
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+  await settle()
+  ok('smb-grant: an untouched edit sends no grantAccess key', !!jobs[0] && !('grantAccess' in jobs[0].body), JSON.stringify(jobs[0] && jobs[0].body))
+  created.windows.length = 0
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  dlg.down('#validUsers').setValue(['media'])
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+  await settle()
+  eq('smb-grant: an edit that adds a user sends grantAccess {}', jobs[0] && jobs[0].body.grantAccess, {})
+  created.windows.length = 0
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  dlg.down('#guestOk').setValue(true)
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+  await settle()
+  eq('smb-grant: an edit that turns on guest access sends grantAccess {}', jobs[0] && jobs[0].body.grantAccess, {})
+
+  // --- the grant's outcome reaches the user ----------------------------------------
+  alerts.length = 0
+  jobs[0].onComplete({ result: { updated: 'media', grant: { status: 'refused', message: "'/tank/media' is inside '/tank', the path of PVE storage 'tankdir' — its permissions are PVE's to manage", path: '/tank/media', granted: [], skipped: [], applyToExisting: false } } })
+  ok('smb-grant: a refused grant raises an alert saying the share was saved', alerts.length === 1 && alerts[0].title === 'Share saved; access not granted' && /PVE storage 'tankdir'/.test(alerts[0].msg), JSON.stringify(alerts))
+  alerts.length = 0
+  toasts.length = 0
+  jobs[0].onComplete({ result: { updated: 'media', grant: { status: 'applied', path: '/tank/media', granted: [], skipped: ['ghost'], applyToExisting: false } } })
+  ok('smb-grant: an applied grant with skipped names toasts them, no modal', alerts.length === 0 && toasts.some(m => /ghost/.test(m)), JSON.stringify(toasts))
+
+  // --- the share row's Permissions button opens the SAME dialog on the share path ----
+  created.windows.length = 0
+  grid.selectRow(0)
+  const smbPerms = grid.down('#sharePerms')
+  ok('smb-grant: the share row has a Permissions button, live with a selection', !!smbPerms && smbPerms.disabled === false)
+  smbPerms.handler(smbPerms)
+  await settle()
+  let pw = openWindow()
+  ok('share perms(smb): opens the Permissions window on the share path', !!pw && pw.cls === 'anas-win-dataset-access' && apiGets.includes('/shares/smb/media/access'))
+  ok('share perms(smb): the payload\'s backing (ahr) states the subvolume sweep', !!pw && /every subvolume/.test(pw.down('#recursiveNote').html), pw && pw.down('#recursiveNote').html)
+  ok('share perms(smb): and no acltype note', !!pw && pw.down('#aclNote').hidden === true)
+  const nfsRow = grid.getStore().getRange().findIndex(r => r.get('protocol') === 'nfs')
+  created.windows.length = 0
+  grid.selectRow(nfsRow)
+  smbPerms.handler(smbPerms)
+  await settle()
+  pw = openWindow()
+  ok('share perms(nfs): the export row opens the same window on the export path', !!pw && apiGets.includes('/shares/nfs/%2Ftank%2Fmedia/access'), JSON.stringify(apiGets.slice(-3)))
+  ok('share perms(nfs): a ZFS-backed export keeps the Datasets sentence', !!pw && !/subvolume/.test(pw.down('#recursiveNote').html))
+}
+
+warnings.length = 0
+created.windows.length = 0
+jobs.length = 0
+await accessDialogParityChecks()
+
+warnings.length = 0
+created.windows.length = 0
+jobs.length = 0
+await smbGrantChecks()
+confirmAnswer = 'yes'
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

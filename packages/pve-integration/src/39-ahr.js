@@ -1149,6 +1149,34 @@
         });
     }
 
+    // access.2: the SHARED Permissions dialog (14-permissions.js) on the
+    // pool's mount — the same window the Datasets view opens, stating the
+    // Hybrid RAID differences itself (no acltype step; a recursive apply
+    // sweeps the subvolumes under the pool's data, never its snapshots).
+    function openPermissions(grid, node) {
+        var name = selectedPool(grid);
+        if (!name) {
+            return;
+        }
+        if (!ANAS.permissions || typeof ANAS.permissions.open !== 'function') {
+            ANAS.warn('the shared Permissions dialog is not loaded');
+            return;
+        }
+        var reload = function () {
+            if (grid && !grid.destroyed && !grid.destroying) {
+                loadPools(grid, node);
+            }
+        };
+        ANAS.permissions.open({
+            node: node,
+            accessPath: '/ahr/' + encodeURIComponent(name) + '/access',
+            title: name,
+            backing: 'ahr',
+            onDone: reload,
+            onFailed: reload,
+        });
+    }
+
     // 11.12: snapshots exist only for the §12 @data/@snapshots subvolume
     // layout. A pre-§12 flat pool has no @snapshots — the verb is disabled
     // with this advisory (there is no in-place migration). ONE wording, shared
@@ -1656,6 +1684,19 @@
                 var lunBlock = !!(lunHeld && LUN_BLOCKED[ids[i]]);
                 btn.setDisabled(!has || lunBlock);
                 setLunTip(btn, lunBlock ? lunHeld : null);
+            }
+        }
+        // access.2: Permissions acts on the mounted directory — an unmounted
+        // pool has none (the daemon 404s it), and a LUN's image on the pool
+        // makes the PUT a hard 409, so it greys with the same sentence.
+        var permBtn = grid.down('#permissions');
+        if (permBtn) {
+            var mounted = has && sel[0].get('mounted') === true;
+            permBtn.setDisabled(!mounted || !!lunHeld);
+            if (lunHeld) {
+                setLunTip(permBtn, lunHeld);
+            } else if (typeof permBtn.setTooltip === 'function') {
+                permBtn.setTooltip(has && !mounted ? t('The pool is not mounted') : '');
             }
         }
         // 11.12: Snapshots needs the §12 @data/@snapshots layout — a flat pool
@@ -3515,6 +3556,19 @@
                             disabled: true,
                             handler: function (btn) {
                                 changeMountpoint(btn.up('grid'), node);
+                            },
+                        },
+                        // access.2: the shared Permissions dialog on the
+                        // pool's mount. Live only while the pool is mounted;
+                        // a LUN on the pool greys it with the daemon's reason.
+                        {
+                            text: t('Permissions'),
+                            itemId: 'permissions',
+                            cls: 'anas-btn-ahr-permissions',
+                            iconCls: 'fa fa-lock',
+                            disabled: true,
+                            handler: function (btn) {
+                                openPermissions(btn.up('grid'), node);
                             },
                         },
                         {

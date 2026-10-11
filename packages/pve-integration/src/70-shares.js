@@ -385,6 +385,7 @@
         setDisabled(grid, 'shareDetails', !has);
         setDisabled(grid, 'shareEdit', !has);
         setDisabled(grid, 'shareRemove', !has);
+        setDisabled(grid, 'sharePerms', !has);
     }
 
     // ---- Load --------------------------------------------------------------
@@ -609,6 +610,65 @@
 
     // ---- SMB share create / edit ------------------------------------------
 
+    // ---- access.1: the share-path grant (GitHub #75) -----------------------
+    //
+    // The ONE sentence the dialog states about the grant: what happens to the
+    // files already there, and that nothing is ever taken away.
+    var SMB_GRANT_NOTE = 'Existing files keep their permissions unless applied. '
+        + 'Removing a user or deleting the share never takes access away; '
+        + 'use Permissions on the share for that.';
+
+    // Same members, any order (a reorder of `valid users` is not a change).
+    function sameMembers(a, b) {
+        a = a || [];
+        b = b || [];
+        var seen = {};
+        var i;
+        for (i = 0; i < a.length; i++) { seen['$' + a[i]] = true; }
+        var bSet = {};
+        for (i = 0; i < b.length; i++) {
+            if (!seen['$' + b[i]]) { return false; }
+            bSet['$' + b[i]] = true;
+        }
+        for (i = 0; i < a.length; i++) {
+            if (!bSet['$' + a[i]]) { return false; }
+        }
+        return true;
+    }
+
+    // Does an edit change anything the grant answers to? The daemon asks the
+    // same question of the stanza; asking it here keeps an untouched edit's
+    // body byte-identical (no grantAccess key).
+    function grantRelevantEdit(existing, body) {
+        return !sameMembers(existing.validUsers, body.validUsers)
+            || !!existing.guestOk !== !!body.guestOk
+            || !!existing.readOnly !== !!body.readOnly
+            || (existing.path || '') !== (body.path || '');
+    }
+
+    // The grant's outcome rides on the job result (ShareAccessGrantResult).
+    // The share itself is saved either way, so a refusal or a failure is an
+    // alert that says so — never a silent success.
+    function reportGrant(job) {
+        var grant = job && job.result && job.result.grant;
+        if (!grant) {
+            return;
+        }
+        var skipped = (grant.skipped && grant.skipped.length)
+            ? ' ' + t('Not granted (no such user or group)') + ': ' + grant.skipped.join(', ') + '.'
+            : '';
+        if (grant.status === 'refused' || grant.status === 'failed') {
+            try {
+                Ext.Msg.alert(t('Share saved; access not granted'),
+                    enc((grant.message || t('The grant did not run.')) + skipped));
+            } catch (e) {
+                ANAS.warn('grant: ' + (grant.message || ''));
+            }
+        } else if (skipped) {
+            ANAS.toast(enc(skipped.replace(/^ /, '')));
+        }
+    }
+
     function openSmbShareWindow(node, existing, preset, onDone) {
         var isEdit = !!existing;
         preset = preset || {};
@@ -724,6 +784,41 @@
                             createNewOnBlur: true,
                             emptyText: t('(any authenticated user; @group for a group)'),
                             value: isEdit ? (existing.validUsers || []) : [],
+                        },
+                        {
+                            // access.1 (GitHub #75): the share-path grant —
+                            // the Permissions editor with its form pre-filled
+                            // from the users above (Read-Write, Read on a
+                            // read-only share; guest access → Everyone).
+                            xtype: 'fieldset',
+                            itemId: 'grantSet',
+                            cls: 'anas-fld-smb-grant-set',
+                            title: t('Access on the share path'),
+                            defaults: { anchor: '100%' },
+                            items: [
+                                {
+                                    xtype: 'checkboxfield',
+                                    itemId: 'grantAccess',
+                                    cls: 'anas-fld-smb-grant',
+                                    boxLabel: t('Grant the selected users access on the share path'),
+                                    checked: true,
+                                },
+                                {
+                                    xtype: 'checkboxfield',
+                                    itemId: 'grantExisting',
+                                    cls: 'anas-fld-smb-grant-existing',
+                                    boxLabel: t('Apply to existing files'),
+                                    margin: '0 0 0 18',
+                                    checked: false,
+                                },
+                                {
+                                    xtype: 'component',
+                                    itemId: 'grantNote',
+                                    cls: 'anas-note-smb-grant',
+                                    style: 'color:#888;font-size:11px;margin:2px 0 6px 18px;',
+                                    html: enc(SMB_GRANT_NOTE),
+                                },
+                            ],
                         },
                         {
                             xtype: 'textfield',
@@ -914,6 +1009,17 @@
             return;
         }
         win.show();
+        // access.1: "apply to existing files" belongs to the grant — live only
+        // while the grant is ticked (an unticked grant sends nothing at all).
+        var grantBox = win.down('#grantAccess');
+        var grantExisting = win.down('#grantExisting');
+        if (grantBox && grantExisting) {
+            grantBox.on('change', function () {
+                var on = !!grantBox.getValue();
+                if (!on) { grantExisting.setValue(false); }
+                grantExisting.setDisabled(!on);
+            });
+        }
         var pvBox = win.down('#previousVersions');
         if (pvBox) {
             pvBox.on('change', function () {
@@ -1044,6 +1150,18 @@
             body.timeMachine = null;
         }
 
+        // access.1: the share-path grant. A create sends it while the box is
+        // ticked (the default); an edit sends it only when something the grant
+        // answers to changed, or "apply to existing files" asks for it — an
+        // untouched edit stays byte-identical.
+        var grantBox = win.down('#grantAccess');
+        var grantOn = grantBox ? !!grantBox.getValue() : false;
+        var grantExistingBox = win.down('#grantExisting');
+        var grantExisting = grantOn && grantExistingBox ? !!grantExistingBox.getValue() : false;
+        if (grantOn && (!isEdit || grantExisting || grantRelevantEdit(existing, body))) {
+            body.grantAccess = grantExisting ? { applyToExisting: true } : {};
+        }
+
         var method;
         var url;
         var label;
@@ -1058,31 +1176,48 @@
             label = name;
         }
 
-        ANAS.runJob({
-            node: node,
-            method: method,
-            path: url,
-            body: body,
-            view: win,
-            failTitle: isEdit ? 'Update failed' : 'Create failed',
-            successMsg: (isEdit ? t('SMB share updated') : t('SMB share created')) + ': ' + label,
-            onComplete: function () {
-                if (!win.destroyed && !win.destroying) {
-                    win.close();
-                }
-                if (onDone) {
-                    onDone();
-                }
-            },
-            // Timeliness (smbsvc.1): the grid reflects the share's real state
-            // even when the job fails — the daemon's refusal sentence itself
-            // rides the failure alert above. The dialog stays open for a retry.
-            onFailed: function () {
-                if (onDone) {
-                    onDone();
-                }
-            },
-        });
+        function send() {
+            ANAS.runJob({
+                node: node,
+                method: method,
+                path: url,
+                body: body,
+                view: win,
+                failTitle: isEdit ? 'Update failed' : 'Create failed',
+                successMsg: (isEdit ? t('SMB share updated') : t('SMB share created')) + ': ' + label,
+                onComplete: function (job) {
+                    if (!win.destroyed && !win.destroying) {
+                        win.close();
+                    }
+                    reportGrant(job);
+                    if (onDone) {
+                        onDone();
+                    }
+                },
+                // Timeliness (smbsvc.1): the grid reflects the share's real state
+                // even when the job fails — the daemon's refusal sentence itself
+                // rides the failure alert above. The dialog stays open for a retry.
+                onFailed: function () {
+                    if (onDone) {
+                        onDone();
+                    }
+                },
+            });
+        }
+
+        // Rewriting the files already under the path is the user's explicit
+        // choice — ticked AND confirmed, in the same words the Permissions
+        // dialog uses (14-permissions.js).
+        if (body.grantAccess && body.grantAccess.applyToExisting) {
+            var confirmText = (ANAS.permissions && ANAS.permissions.recursiveConfirmText)
+                ? ANAS.permissions.recursiveConfirmText('other', path)
+                : t('This also rewrites the permissions of every file already under') + ' ' + path + '. ' + t('Continue?');
+            Ext.Msg.confirm(t('Apply to existing files'), enc(confirmText), function (btn) {
+                if (btn === 'yes') { send(); }
+            });
+            return;
+        }
+        send();
     }
 
     // ---- NFS export create / edit -----------------------------------------
@@ -1434,6 +1569,33 @@
             return '/shares/smb/' + encodeURIComponent(id);
         }
         return '/shares/nfs/' + encodeURIComponent(id);
+    }
+
+    // access.1: the shared Permissions dialog (14-permissions.js) on a share's
+    // path. The daemon resolves the share from its config and the path onto
+    // its home, and the GET's `backing` tells the dialog which filesystem
+    // differences to state.
+    function openSharePermissions(node, grid, rec) {
+        if (!rec) {
+            return;
+        }
+        if (!ANAS.permissions || typeof ANAS.permissions.open !== 'function') {
+            ANAS.warn('the shared Permissions dialog is not loaded');
+            return;
+        }
+        var proto = rec.get('protocol');
+        var id = rec.get('name');
+        var path = rec.get('path') || '';
+        var reload = function () {
+            loadShares(grid, node);
+        };
+        ANAS.permissions.open({
+            node: node,
+            accessPath: sharePath(proto, id) + '/access',
+            title: proto === 'smb' ? id + ' (' + path + ')' : path,
+            onDone: reload,
+            onFailed: reload,
+        });
     }
 
     function openRemove(node, grid, rec) {
@@ -1882,6 +2044,20 @@
                         handler: function (btn) {
                             var grid = btn.up('grid');
                             openEdit(node, grid, selectedShare(grid));
+                        },
+                    },
+                    {
+                        // access.1: the shared Permissions dialog on the
+                        // share's path (SMB and NFS alike — an export has no
+                        // principal list, so this is its only grant door).
+                        text: t('Permissions'),
+                        itemId: 'sharePerms',
+                        cls: 'anas-btn-share-perms',
+                        iconCls: 'fa fa-lock',
+                        disabled: true,
+                        handler: function (btn) {
+                            var grid = btn.up('grid');
+                            openSharePermissions(node, grid, selectedShare(grid));
                         },
                     },
                     {

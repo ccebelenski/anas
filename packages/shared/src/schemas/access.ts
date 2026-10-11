@@ -65,11 +65,48 @@ export const DatasetAccess = z.object({
   entries: z.array(AccessEntry),
   /** Raw `getfacl` text for the Advanced panel, or null when no/unsupported ACLs */
   aclText: z.string().nullable(),
+  /**
+   * Which filesystem family the directory sits on (access.1/access.2) — the
+   * one input the shared Permissions dialog needs to state where the targets
+   * differ: `zfs` has the `acltype` switch and a recursive apply walks into
+   * child datasets; `ahr` (btrfs) has POSIX ACLs natively and a recursive
+   * apply sweeps the subvolumes under `@data` as one tree; `other` is any
+   * other Linux filesystem a share path may sit on. Additive and optional: the
+   * datasets route leaves it out (its payload is unchanged), and a client
+   * reads absence as `zfs`.
+   */
+  backing: z.enum(['zfs', 'ahr', 'other']).optional(),
 })
 export type DatasetAccess = z.infer<typeof DatasetAccess>
 
 /**
- * Set access (PUT /v1/pools/:name/datasets/*path/access). `entries` is the
+ * What the share-path grant did (access.1) — the `grant` field of an SMB
+ * share create/update job's result, present only when the request asked for
+ * it. The share is created or updated whatever this says:
+ *   applied — the entries below were written (`skipped` names principals
+ *             that did not resolve and were left out);
+ *   refused — a gate said no (PVE territory, a LUN-held AHR pool, an
+ *             unreadable ACL); `message` is the gate's own sentence;
+ *   failed  — a command failed mid-way; `message` is its error;
+ *   nothing — no principal and no guest access, or nothing that grants
+ *             access changed on an edit.
+ */
+export const ShareAccessGrantResult = z.object({
+  status: z.enum(['applied', 'refused', 'failed', 'nothing']),
+  message: z.string().optional(),
+  /** The path the grant targeted. */
+  path: z.string(),
+  /** The rows granted (named principals and/or everyone) at the share's level. */
+  granted: z.array(AccessEntry),
+  /** `valid users` entries that were not granted (unresolvable names, `%` macros). */
+  skipped: z.array(z.string()),
+  applyToExisting: z.boolean(),
+})
+export type ShareAccessGrantResult = z.infer<typeof ShareAccessGrantResult>
+
+/**
+ * Set access (PUT /v1/pools/:name/datasets/*path/access, and since access.1/
+ * access.2 PUT /v1/ahr/:name/access and the share routes' …/access). `entries` is the
  * desired set of the principals it mentions. Naming a user/group entry enables
  * POSIX ACLs on the dataset (acltype=posixacl) as a side effect, with a default
  * ACL so new files inherit. `applyToExisting` recurses over current descendants.

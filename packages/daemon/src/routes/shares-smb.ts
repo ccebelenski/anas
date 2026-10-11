@@ -1,19 +1,22 @@
-import type { SmbConnection, SmbShareDetail } from '@anas/shared'
+import type { ShareAccessGrantRequest, ShareAccessGrantResult, SmbConnection, SmbShare, SmbShareDetail } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { SelfServiceKeys } from '../parsers/smb-conf.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { AccessService } from '../services/access.js'
 import { statSync } from 'node:fs'
 import { rm, writeFile } from 'node:fs/promises'
 import { CreateSmbShareRequest, ShareName, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
 import { addShare, customVfsRefusal, getShare, hasCustomVfsObjects, hasShare, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
 import { parseSmbStatusJson, parseSmbStatusText } from '../parsers/smbstatus.js'
 import { confirmGate } from '../safety/gate.js'
+import { createAccessService } from '../services/access.js'
 import { ConfigConflictError, editConfig, readConfig } from '../services/config-writer.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
 import { enablingSelfService, ensureAhrSnapshotsMount, resolveSelfService, shareAvailableBytes, touchesSelfService } from '../services/share-selfservice.js'
 import { requireIdentity } from './identity.js'
+import { shareAccessHandlers } from './share-access.js'
 
 const SMBSTATUS = '/usr/bin/smbstatus'
 const SYSTEMCTL = '/usr/bin/systemctl'
@@ -51,6 +54,23 @@ export interface SmbShareRouteOptions {
   fstabPath: string
   /** systemd unit dir — the snapshot schedule store the bucket is picked from. */
   systemdDir: string
+  /** The ONE permissions writer (access.1) — the share-path grant and the row's editor. */
+  accessService?: AccessService
+}
+
+/**
+ * Did an edit change anything the share-path grant answers to (access.1)?
+ * The principal SET (order is not a change), the guest flag, the read-only
+ * flag (it sets the level), or the path itself.
+ */
+export function grantRelevantChange(before: SmbShare, after: SmbShare): boolean {
+  const a = new Set(before.validUsers)
+  const b = new Set(after.validUsers)
+  const samePrincipals = a.size === b.size && [...a].every(v => b.has(v))
+  return !samePrincipals
+    || before.guestOk !== after.guestOk
+    || before.readOnly !== after.readOnly
+    || before.path !== after.path
 }
 
 export async function smbShareRoutes(
@@ -58,6 +78,18 @@ export async function smbShareRoutes(
   opts: SmbShareRouteOptions,
 ) {
   const { executor, jobQueue, confirmStore, smbConfPath, fstabPath, systemdDir } = opts
+  const access = opts.accessService ?? createAccessService({ executor })
+  const shareAccess = shareAccessHandlers({ access, jobQueue })
+
+  /**
+   * The share-path grant inside a share job (access.1): the editor with the
+   * form pre-filled from the share's EFFECTIVE stanza (read back after the
+   * write, so defaults are what smb.conf says, not what the request omitted).
+   * Never fails the job — the outcome rides on the result.
+   */
+  async function grantFor(share: SmbShare, grant: ShareAccessGrantRequest, updateProgress: (msg: string) => void): Promise<ShareAccessGrantResult> {
+    return access.grantOnSharePath(share.path, share, grant.applyToExisting === true, updateProgress)
+  }
 
   /** Read smb.conf fresh every time — the file is the source of truth (P.11). */
   async function readSmbConf(): Promise<string> {
@@ -358,6 +390,38 @@ export async function smbShareRoutes(
     return { data: detail }
   })
 
+  // --- GET/PUT /shares/smb/:name/access — the share row's Permissions -------
+  // (access.1) The shared editor on the share's path, resolved from smb.conf.
+  async function sharePathOr404(raw: string, reply: FastifyReply): Promise<{ name: string, path: string } | null> {
+    const nameParsed = ShareName.safeParse(raw)
+    if (!nameParsed.success) {
+      reply.code(400)
+      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid share name: ${nameParsed.error.issues[0]?.message}` } })
+      return null
+    }
+    const share = getShare(await readSmbConf(), nameParsed.data)
+    if (!share) {
+      reply.code(404)
+      reply.send({ error: { code: 'NOT_FOUND', message: `SMB share '${nameParsed.data}' not found` } })
+      return null
+    }
+    return { name: share.name, path: share.path }
+  }
+
+  server.get<{ Params: { name: string } }>('/shares/smb/:name/access', async (request, reply) => {
+    const share = await sharePathOr404(request.params.name, reply)
+    if (!share)
+      return reply
+    return shareAccess.get(share.path, reply)
+  })
+
+  server.put<{ Params: { name: string } }>('/shares/smb/:name/access', async (request, reply) => {
+    const share = await sharePathOr404(request.params.name, reply)
+    if (!share)
+      return reply
+    return shareAccess.put(share.path, { share: share.name }, request, reply)
+  })
+
   // --- POST /shares/smb — create a share ------------------------------------
   server.post('/shares/smb', async (request, reply) => {
     const bodyParsed = CreateSmbShareRequest.safeParse(request.body ?? {})
@@ -389,7 +453,7 @@ export async function smbShareRoutes(
     const job = jobQueue.submit(
       'smb.share.add',
       { ...identity, params: { share: req.name, path: req.path } },
-      async () => {
+      async (updateProgress) => {
         try {
           await applySelfServiceAndEdit(
             req.name,
@@ -402,6 +466,15 @@ export async function smbShareRoutes(
           throw asJobError(err)
         }
         await reloadSmbd()
+        // access.1: the share exists now; the grant (when asked for) runs on
+        // the stanza as written and reports its own outcome.
+        if (req.grantAccess) {
+          const created = getShare(await readSmbConf(), req.name)
+          const grant = created
+            ? await grantFor(created, req.grantAccess, updateProgress)
+            : { status: 'failed' as const, message: `SMB share '${req.name}' could not be read back after the write`, path: req.path, granted: [], skipped: [], applyToExisting: req.grantAccess.applyToExisting === true }
+          return { created: req.name, grant }
+        }
         return { created: req.name }
       },
     )
@@ -451,7 +524,10 @@ export async function smbShareRoutes(
     const job = jobQueue.submit(
       'smb.config.set',
       { ...identity, params: { share: name, config: req } },
-      async () => {
+      async (updateProgress) => {
+        // access.1: the stanza BEFORE the edit, so the grant runs only when
+        // something it answers to actually changed.
+        const before = req.grantAccess ? getShare(await readSmbConf(), name) : null
         try {
           await applySelfServiceAndEdit(
             name,
@@ -465,6 +541,15 @@ export async function smbShareRoutes(
           throw asJobError(err)
         }
         await reloadSmbd()
+        if (req.grantAccess) {
+          const after = getShare(await readSmbConf(), name)
+          if (!after)
+            return { updated: name, grant: { status: 'failed' as const, message: `SMB share '${name}' could not be read back after the write`, path: req.path ?? '', granted: [], skipped: [], applyToExisting: req.grantAccess.applyToExisting === true } }
+          // An explicit "apply to existing files" is its own reason to run.
+          if (before && !grantRelevantChange(before, after) && req.grantAccess.applyToExisting !== true)
+            return { updated: name, grant: { status: 'nothing' as const, path: after.path, granted: [], skipped: [], applyToExisting: false } }
+          return { updated: name, grant: await grantFor(after, req.grantAccess, updateProgress) }
+        }
         return { updated: name }
       },
     )

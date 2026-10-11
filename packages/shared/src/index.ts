@@ -48,6 +48,7 @@ export {
   AccessLevel,
   DatasetAccess,
   SetAccessRequest,
+  ShareAccessGrantResult,
 } from './schemas/access.js'
 
 // AHR schemas (Epic 11 + AHR — ANAS Hybrid RAID)
@@ -558,6 +559,7 @@ export {
   RecyclePurgeDays,
   RecycleRequest,
   RecycleState,
+  ShareAccessGrantRequest,
   ShareEntry,
   SmbConnection,
   SmbGlobalConfig,

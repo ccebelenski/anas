@@ -17,6 +17,7 @@ import { mdadmDetailExportArgs, mdadmExamineExportArgs } from './parsers/mdadm-d
 import { MDSTAT_CAT_ARGS } from './parsers/mdstat.js'
 import { listSections, parseRcloneConf } from './parsers/rclone-conf.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from './parsers/zfs-list.js'
+import { ahrAccessRoutes } from './routes/ahr-access.js'
 import { ahrCacheRoutes } from './routes/ahr-cache.js'
 import { ahrExpansionRoutes } from './routes/ahr-expand.js'
 import { ahrMutationRoutes } from './routes/ahr-mutate.js'
@@ -43,6 +44,7 @@ import { shareIdentityRoutes } from './routes/share-identity.js'
 import { nfsExportRoutes } from './routes/shares-nfs.js'
 import { smbShareRoutes } from './routes/shares-smb.js'
 import { ConfirmStore } from './safety/confirm.js'
+import { createAccessService } from './services/access.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from './services/ahr-topology.js'
 import { defaultBackupReposPaths } from './services/backup-repos.js'
 import { DiskIdentityCache } from './services/disk-identity-cache.js'
@@ -283,6 +285,17 @@ export function createServer(opts?: ServerOptions) {
         '# group: root',
         getfaclMedia,
       ].join('\n'),
+      stderr: '',
+      exitCode: 0,
+    } })
+    // access.2: the dev mock's AHR pool `ahr0` is a fresh btrfs mount — mode
+    // 755, root-owned, POSIX ACLs native (no acltype switch) and no extended
+    // entries yet, which is exactly what getfacl prints for such a directory.
+    const getfaclAhr0 = 'user::rwx\ngroup::r-x\nother::r-x\n'
+    mock.addFixture({ command: '/usr/bin/stat', args: ['-c', '%U %G %a', '/mnt/anas-ahr/ahr0'], result: { stdout: 'root root 755\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/getfacl', args: ['-pcE', '/mnt/anas-ahr/ahr0'], result: { stdout: getfaclAhr0, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/getfacl', args: ['-pE', '/mnt/anas-ahr/ahr0'], result: {
+      stdout: `# file: /mnt/anas-ahr/ahr0\n# owner: root\n# group: root\n${getfaclAhr0}`,
       stderr: '',
       exitCode: 0,
     } })
@@ -600,11 +613,14 @@ export function createServer(opts?: ServerOptions) {
     diskIdentityCache,
     ...(Number.isFinite(vdevRemoveSettleMs) && vdevRemoveSettleMs >= 0 ? { vdevRemoveSettleMs } : {}),
   })
+  // The ONE permissions writer (access.1/access.2): the datasets editor, the
+  // AHR editor and the share grant all run through this instance.
+  const accessService = createAccessService({ executor, iscsiPaths })
   // datasetRoutes also reads the share configs to report associated shares
   // (Epic 4.4) and warn on destroy — same paths the share routes edit.
-  server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport, iscsiPaths })
-  server.register(smbShareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, fstabPath, systemdDir })
-  server.register(nfsExportRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, exportsPath })
+  server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport, iscsiPaths, accessService })
+  server.register(smbShareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, fstabPath, systemdDir, accessService })
+  server.register(nfsExportRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, exportsPath, accessService })
   server.register(shareIdentityRoutes, {
     prefix: '/v1',
     executor,
@@ -706,6 +722,9 @@ export function createServer(opts?: ServerOptions) {
   // rollback over the @data/@snapshots subvolume layout; delete/rollback
   // confirm-gated. Refused on flat-layout pools (no migration verb).
   server.register(ahrSnapshotRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, intentDir: ahrIntentDir })
+  // AHR permissions editor (story access.2) — the datasets editor's writer on
+  // the pool's mount, through the shared access service.
+  server.register(ahrAccessRoutes, { prefix: '/v1', executor, jobQueue, iscsiPaths, accessService })
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
   // disk, share, job, and AHR (11.10) sources above, plus on-demand
   // ARC/iostat/net sampling.
