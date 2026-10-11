@@ -134,7 +134,7 @@ describe('install.sh ships and installs the drop-in and the two packages', () =>
   })
 
   it('fails preflight when the release does not carry the drop-in', () => {
-    assert.match(installSh, /release incomplete: systemd\/\$\{ISCSI_DROPIN_DIR\}\/\$\{ISCSI_DROPIN_FILE\}/)
+    assert.match(installSh, /release_need "systemd\/\$\{ISCSI_DROPIN_DIR\}\/\$\{ISCSI_DROPIN_FILE\}"/)
   })
 
   it('make-release.sh copies it into the tarball', () => {

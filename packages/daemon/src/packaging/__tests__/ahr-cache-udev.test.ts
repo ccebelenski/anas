@@ -219,7 +219,8 @@ describe('packaging wires the cache hook in and back out', () => {
   })
 
   it('install.sh refuses a release that is missing either half', () => {
-    assert.match(installSh, /release incomplete: anas-cache-event\.sh \/ anas-cache\.rules/)
+    assert.match(installSh, /release_need anas-cache-event\.sh/)
+    assert.match(installSh, /release_need anas-cache\.rules/)
   })
 
   it('install.sh installs the hook executable and the rule world-readable', () => {
