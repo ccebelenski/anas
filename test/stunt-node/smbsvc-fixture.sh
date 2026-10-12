@@ -32,8 +32,8 @@ source "${SCRIPT_DIR}/config.sh"
 # beforeEach self-heal for EVERY test, and the AHR disks are only the AHR
 # test's business.
 #
-# The fixture assumes a running node: after a reboot gtbackup is not
-# auto-imported — restore the baseline snapshot instead. `down` also removes a
+# The fixture assumes gtbackup is present (`gtpools-fixture.sh up` after a
+# rebuild or a baseline restore). `down` also removes a
 # [pvshare] stanza a crashed spec run may have leaked into smb.conf.
 
 FIXDIR="/var/tmp/smbsvc-fixture"
@@ -164,7 +164,7 @@ case "$1" in
     echo "=== smbsvc.1 fixture — up ==="
 
     $SSH_CMD "zpool list -H gtbackup" >/dev/null 2>&1 \
-      || { echo "ERROR: pool gtbackup not present — restore the baseline snapshot" >&2; exit 1; }
+      || { echo "ERROR: pool gtbackup not present — run gtpools-fixture.sh up" >&2; exit 1; }
 
     if ds_exists; then
       echo "✓ ${DS} already exists (skipping — 'down' first for a rebuild)"

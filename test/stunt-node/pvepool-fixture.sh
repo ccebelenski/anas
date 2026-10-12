@@ -16,7 +16,7 @@ source "${SCRIPT_DIR}/config.sh"
 #          ANAS sibling (media) — the system-pool ground truth
 #
 # The fixture assumes a running node: after a reboot the loop devices vanish
-# and the pools are not auto-imported — restore the baseline snapshot instead.
+# and the pools are not auto-imported — run `up` again instead.
 
 FIXDIR="/var/tmp/pvepool-fixture"
 

@@ -202,7 +202,7 @@ case "$1" in
     echo
 
     $SSH_CMD "zpool list -H ${POOL}" >/dev/null 2>&1 \
-      || { echo "ERROR: pool ${POOL} not present — restore the baseline snapshot" >&2; exit 1; }
+      || { echo "ERROR: pool ${POOL} not present — run gtpools-fixture.sh up" >&2; exit 1; }
 
     # --- the source dataset ------------------------------------------------
     # Rebuilt from scratch every `up`: the sync test DELETES b.bin, so a

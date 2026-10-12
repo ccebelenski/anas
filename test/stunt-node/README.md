@@ -74,6 +74,7 @@ The VM runs on an isolated NAT network (`anas-test`, 192.168.200.0/24).
 | `deploy-anas.sh` | Build + rsync + restart services |
 | `setup-test-data.sh` | Attach disks + create test pool and shares |
 | `run-tests.sh` | Full workflow: restore → deploy → test |
+| `gtpools-fixture.sh <up\|down\|status>` | The standing `gtbackup`/`gtiscsi` file-backed pools (not in `baseline`; `up` once after a rebuild or restore) |
 | `destroy-vm.sh` | Delete VM + all disk images |
 
 ## Snapshots
@@ -115,7 +116,9 @@ Restores the baseline snapshot, deploys current code, and runs Playwright.
 
 ### File-backed pool images
 
-The baseline pools `gtbackup`/`gtiscsi` live on sparse images under /var/tmp that grow with
+The standing pools `gtbackup`/`gtiscsi` (not in the `baseline` snapshot — bring them up once
+with `./test/stunt-node/gtpools-fixture.sh up` after a rebuild or restore) live on sparse
+images under /var/tmp that grow with
 every write and never shrink on their own — after heavy specs (backup-cancel writes 3 GiB
 per run), reclaim with `./test/stunt-node/cloud-tasks-fixture.sh trim` (its `down` does the
 same).
