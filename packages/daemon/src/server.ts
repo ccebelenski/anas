@@ -241,6 +241,8 @@ export function createServer(opts?: ServerOptions) {
     // chown / chmod succeed for any target in dev mock.
     mock.addFixture({ command: '/usr/bin/chown', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/chmod', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // The access writer's recursive setgid walk (`find <dir> -type d -exec chmod g+s {} +`).
+    mock.addFixture({ command: '/usr/bin/find', result: { stdout: '', stderr: '', exitCode: 0 } })
 
     // --- Epic 4.7.2: layered access / POSIX ACLs -------------------------
     // Feature-detect: the acl package is present (getfacl/setfacl available).

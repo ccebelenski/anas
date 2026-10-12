@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { zfsListArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
-import { sharePrincipals } from '../../services/access.js'
+import { createAccessService, sharePrincipals } from '../../services/access.js'
 import { grantRelevantChange } from '../shares-smb.js'
 
 /**
@@ -206,20 +206,44 @@ describe('access.1 — the share-path grant', () => {
     assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined)
   })
 
+  it('share grant result reports the level each principal ends with, not the requested one (live proof 0.4.3 F5)', async () => {
+    const { calls } = start([{ command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') }])
+    // Live ACL (server fixture): u:alice:rwx. A read-only share asks Read for
+    // alice and media; alice keeps read-write (never lowered) and says so.
+    const job = await create({ name: 'media', path: MP, readOnly: true, validUsers: ['alice', 'media'], grantAccess: {} })
+    const grant = grantOf(job)!
+    assert.equal(grant.status, 'applied')
+    assert.deepEqual(grant.granted, [
+      { kind: 'user', name: 'alice', level: 'read-write' },
+      { kind: 'user', name: 'media', level: 'read' },
+    ])
+    assert.ok(find(calls, '/usr/bin/setfacl', a => a[0] === '--set' && a[1].includes('u:alice:rwx')), 'alice kept rwx on disk')
+  })
+
+  it('a read-only guest share keeps Everyone at read-write when the path already gives it, and reports read-write', async () => {
+    const { calls } = start([{ command: '/usr/bin/stat', args: ['-c', '%U %G %a', MP], result: ok('root root 757\n') }])
+    const job = await create({ name: 'pub', path: MP, readOnly: true, guestOk: true, grantAccess: {} })
+    const grant = grantOf(job)!
+    assert.equal(grant.status, 'applied')
+    assert.deepEqual(grant.granted, [{ kind: 'everyone', level: 'read-write' }])
+    assert.equal(find(calls, '/usr/bin/chmod', a => a.includes('755')), undefined, 'everyone was not lowered')
+  })
+
   it('share grant applyToExisting is off by default: no command carries -R', async () => {
     const { calls } = start()
     const job = await create({ name: 'media', path: MP, validUsers: ['media'], grantAccess: {} })
     assert.equal(grantOf(job)!.applyToExisting, false)
-    assert.equal(calls.some(c => ['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown'].includes(c.command) && c.args.includes('-R')), false)
+    assert.equal(calls.some(c => ['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown', '/usr/bin/find'].includes(c.command) && c.args.includes('-R')), false)
   })
 
   it('share grant with applyToExisting runs the editor\'s recursive job (-R, capital X)', async () => {
     const { calls } = start()
     const job = await createConfirmed({ name: 'media', path: MP, readOnly: true, validUsers: ['media'], grantAccess: { applyToExisting: true } })
     assert.equal(grantOf(job)!.status, 'applied')
-    const spec = 'u::rwx,g::r-X,o::r-X,u:media:r-X,m::rwx'
-    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '--set'), ['-R', '--set', spec, MP])
-    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-d'), ['-R', '-d', '--set', spec, MP])
+    const spec = 'u::rwX,g::r-X,o::r-X,u:media:r-X,m::rwX'
+    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-b'), ['-R', '-b', '-m', spec, MP])
+    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-d'), ['-R', '-d', '--set', 'u::rwx,g::r-x,o::r-x,u:media:r-x,m::rwx', MP])
+    assert.deepEqual(find(calls, '/usr/bin/find', () => true), [MP, '-type', 'd', '-exec', '/usr/bin/chmod', 'g+s', '{}', '+'])
   })
 
   it('share grant applyToExisting on ZFS switches ACLs on for a child dataset under the path first, and lists it (ruling 2026-10-11)', async () => {
@@ -312,7 +336,7 @@ describe('access.1 — the share-path grant', () => {
     }
   })
 
-  it('share grant applyToExisting over a PVE-owned descendant → share created, grant refused naming it', async () => {
+  it('share grant applyToExisting over a PVE-owned descendant → no confirm asked, share created, grant refused naming it (live proof 0.4.3 F3)', async () => {
     const nested = JSON.stringify({
       output_version: { command: 'zfs list', vers_major: 0, vers_minor: 1 },
       datasets: Object.fromEntries([
@@ -326,13 +350,63 @@ describe('access.1 — the share-path grant', () => {
       BASE_CONF,
       'zfspool: local-zfs\n\tpool testpool/x/data\n\tcontent images,rootdir\n',
     )
-    const job = await createConfirmed({ name: 'x', path: '/testpool/x', validUsers: ['media'], grantAccess: { applyToExisting: true } })
+    // The refusal is evaluated before the confirm: a plain create, no 409.
+    const job = await create({ name: 'x', path: '/testpool/x', validUsers: ['media'], grantAccess: { applyToExisting: true } })
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.ok(readFileSync(confPath, 'utf8').includes('[x]'))
     const grant = grantOf(job)!
     assert.equal(grant.status, 'refused')
     assert.match(grant.message!, /Recursive permission change of 'testpool\/x' would include testpool\/x\/data/)
-    assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
+    assert.equal(calls.some(c => ['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown', '/usr/bin/find'].includes(c.command)), false)
+  })
+
+  it('share create with applyToExisting on a path holding PVE storage gets no 409; the job reports the grant refused with the gate\'s sentence (live proof 0.4.3 F3)', async () => {
+    // The §6c shape: a non-ZFS directory with a `dir` storage inside it.
+    const { calls } = start([], BASE_CONF, 'dir: inner\n\tpath /mnt/anas-ahr/ahr0/store\n\tcontent backup\n')
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ name: 'bk', path: '/mnt/anas-ahr/ahr0', validUsers: ['media'], grantAccess: { applyToExisting: true } }),
+    })
+    assert.equal(res.statusCode, 202, res.body)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no confirm code')
+    const job = await waitForJob((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(readFileSync(confPath, 'utf8').includes('[bk]'), 'the share is created')
+    const grant = grantOf(job)!
+    assert.equal(grant.status, 'refused')
+    assert.equal(grant.message, 'Recursive permission change of \'/mnt/anas-ahr/ahr0\' would include /mnt/anas-ahr/ahr0/store — the path of PVE storage \'inner\'')
+    assert.equal(calls.some(c => ['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown', '/usr/bin/find'].includes(c.command)), false, 'nothing written')
+  })
+
+  it('share edit with applyToExisting on a path holding PVE storage gets no 409; the edit is saved and the grant refused (live proof 0.4.3 F3)', async () => {
+    const conf = `${BASE_CONF}\n[bk]\n\tpath = /mnt/anas-ahr/ahr0\n\tread only = no\n\tvalid users = media\n`
+    const { calls } = start([], conf, 'dir: inner\n\tpath /mnt/anas-ahr/ahr0/store\n\tcontent backup\n')
+    const res = await server!.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/bk',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ comment: 'Backups', grantAccess: { applyToExisting: true } }),
+    })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(readFileSync(confPath, 'utf8').includes('comment = Backups'), 'the edit is saved')
+    const grant = grantOf(job)!
+    assert.equal(grant.status, 'refused')
+    assert.match(grant.message!, /would include \/mnt\/anas-ahr\/ahr0\/store/)
+    assert.equal(calls.some(c => ['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown', '/usr/bin/find'].includes(c.command)), false, 'nothing written')
+  })
+
+  it('a share job never runs a recursive apply the request did not confirm (the path changed after the check)', async () => {
+    const { calls } = start()
+    const access = createAccessService({ executor: (server as any).executor })
+    const grant = await access.grantOnSharePath(MP, { validUsers: ['media'], guestOk: false, readOnly: false }, true, () => {}, { recursiveConfirmed: false })
+    assert.equal(grant.status, 'refused')
+    assert.match(grant.message!, /was not confirmed/)
+    assert.equal(calls.some(c => ['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown', '/usr/bin/find'].includes(c.command)), false, 'nothing written')
+    assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined, 'no ACL switch flipped')
   })
 
   // --- edit: grant on change, nothing revoked ---------------------------------------
@@ -349,7 +423,7 @@ describe('access.1 — the share-path grant', () => {
     const { calls } = start([], MEDIA_SHARE)
     const job = await updateConfirmed('media', { grantAccess: { applyToExisting: true } })
     assert.equal(grantOf(job)!.status, 'applied')
-    assert.ok(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '--set'), 'the -R walk ran')
+    assert.ok(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-b'), 'the -R walk ran')
   })
 
   it('share edit that removes a principal revokes nothing: the live entry is restated, never stripped', async () => {
@@ -369,7 +443,7 @@ describe('access.1 — the share-path grant', () => {
     assert.equal(res.statusCode, 202)
     const job = await waitForJob((res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed')
-    assert.equal(calls.some(c => ['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown'].includes(c.command)), false)
+    assert.equal(calls.some(c => ['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown', '/usr/bin/find'].includes(c.command)), false)
   })
 
   // --- the share row's Permissions editor ----------------------------------------------
@@ -408,7 +482,7 @@ describe('access.1 — the share-path grant', () => {
       }
       // Nothing was written or run behind any 409.
       assert.ok(!readFileSync(confPath, 'utf8').includes('[media2]'), 'the create did not happen')
-      assert.equal(calls.some(c => ['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown'].includes(c.command)), false)
+      assert.equal(calls.some(c => ['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown', '/usr/bin/find'].includes(c.command)), false)
       // The same doors without applyToExisting are not gated.
       const flat = await server!.inject({ method: 'PUT', url: '/v1/shares/smb/media/access', headers: JSON_HEADERS, payload: JSON.stringify({ owner: 'media' }) })
       assert.equal(flat.statusCode, 202)
@@ -473,6 +547,50 @@ describe('access.1 — the share-path grant', () => {
       ],
       skipped: ['%U'],
     })
+  })
+
+  // --- inherit acls (live proof 0.4.3 F2) ----------------------------------------
+  const stanzaOf = (name: string): string[] => {
+    const lines = readFileSync(confPath, 'utf8').split('\n')
+    const at = lines.indexOf(`[${name}]`)
+    const end = lines.findIndex((l, i) => i > at && l.startsWith('['))
+    return lines.slice(at, end === -1 ? undefined : end)
+  }
+
+  it('inherit acls: a share create writes inherit acls = yes', async () => {
+    start()
+    const job = await create({ name: 'media', path: MP, validUsers: ['media'], grantAccess: {} })
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(stanzaOf('media').includes('\tinherit acls = yes'), stanzaOf('media').join('\n'))
+  })
+
+  it('inherit acls: an edit that runs a grant adds it to a stanza that lacks it', async () => {
+    start([], MEDIA_SHARE)
+    const job = await update('media', { validUsers: ['alice', 'media', 'bob'], grantAccess: {} })
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.notEqual(grantOf(job)!.status, 'nothing')
+    assert.ok(stanzaOf('media').includes('\tinherit acls = yes'), stanzaOf('media').join('\n'))
+  })
+
+  it('inherit acls: an edit that runs a grant leaves an explicit inherit acls = no alone', async () => {
+    start([], `${MEDIA_SHARE}\tinherit acls = no\n`)
+    const job = await update('media', { validUsers: ['alice', 'media', 'bob'], grantAccess: {} })
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const stanza = stanzaOf('media')
+    assert.ok(stanza.includes('\tinherit acls = no'), stanza.join('\n'))
+    assert.equal(stanza.filter(l => /inherit acls/i.test(l)).length, 1, 'no second line')
+  })
+
+  it('inherit acls: an edit with no grant, or a grant that does not run, leaves the stanza byte-identical', async () => {
+    start([], MEDIA_SHARE)
+    // No grantAccess at all: an untouched save.
+    let job = await update('media', { path: MP, readOnly: false, guestOk: false, validUsers: ['alice', 'media'] })
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal(readFileSync(confPath, 'utf8'), MEDIA_SHARE)
+    // grantAccess on an untouched save: the grant does not run ("nothing"), so no line either.
+    job = await update('media', { path: MP, readOnly: false, guestOk: false, validUsers: ['alice', 'media'], grantAccess: {} })
+    assert.equal(grantOf(job)!.status, 'nothing')
+    assert.equal(readFileSync(confPath, 'utf8'), MEDIA_SHARE)
   })
 
   it('grantRelevantChange: principal set, guest, read-only and path count; order and comment do not', () => {

@@ -4,14 +4,14 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { SelfServiceKeys } from '../parsers/smb-conf.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { AccessService } from '../services/access.js'
+import type { AccessService, GrantShare } from '../services/access.js'
 import { statSync } from 'node:fs'
 import { rm, writeFile } from 'node:fs/promises'
 import { CreateSmbShareRequest, ShareName, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
-import { addShare, customVfsRefusal, getShare, hasCustomVfsObjects, hasShare, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
+import { addShare, customVfsRefusal, ensureInheritAcls, getShare, hasCustomVfsObjects, hasShare, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
 import { parseSmbStatusJson, parseSmbStatusText } from '../parsers/smbstatus.js'
 import { confirmGate } from '../safety/gate.js'
-import { createAccessService, sharePrincipals } from '../services/access.js'
+import { createAccessService } from '../services/access.js'
 import { ConfigConflictError, editConfig, readConfig } from '../services/config-writer.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
 import { enablingSelfService, ensureAhrSnapshotsMount, resolveSelfService, shareAvailableBytes, touchesSelfService } from '../services/share-selfservice.js'
@@ -73,6 +73,21 @@ export function grantRelevantChange(before: SmbShare, after: SmbShare): boolean 
     || before.path !== after.path
 }
 
+/**
+ * Does an edit run the share-path grant? Only when it asks for one, and then
+ * only when something the grant answers to changed or "apply to existing
+ * files" was asked for (an unreadable stanza before the write runs it). The
+ * same rule decides the `inherit acls` companion edit, so a stanza gains that
+ * line exactly when a grant runs on it.
+ */
+export function editRunsGrant(grant: ShareAccessGrantRequest | undefined, before: SmbShare | null, after: SmbShare | null): boolean {
+  if (!grant)
+    return false
+  if (grant.applyToExisting === true || !before || !after)
+    return true
+  return grantRelevantChange(before, after)
+}
+
 export async function smbShareRoutes(
   server: FastifyInstance,
   opts: SmbShareRouteOptions,
@@ -87,20 +102,29 @@ export async function smbShareRoutes(
    * write, so defaults are what smb.conf says, not what the request omitted).
    * Never fails the job — the outcome rides on the result.
    */
-  async function grantFor(share: SmbShare, grant: ShareAccessGrantRequest, updateProgress: (msg: string) => void): Promise<ShareAccessGrantResult> {
-    return access.grantOnSharePath(share.path, share, grant.applyToExisting === true, updateProgress)
+  async function grantFor(share: SmbShare, grant: ShareAccessGrantRequest, updateProgress: (msg: string) => void, recursiveConfirmed: boolean): Promise<ShareAccessGrantResult> {
+    return access.grantOnSharePath(share.path, share, grant.applyToExisting === true, updateProgress, { recursiveConfirmed })
   }
 
   /**
    * The grant's "apply to existing files" is the editor's recursive apply and
    * carries the same 409 + X-Anas-Confirm-Code (ruling 2026-10-11), with the
-   * same headline and warnings for the share's path. True = confirmed (or
-   * nothing to confirm); false = the 409 was sent.
+   * same headline and warnings for the share's path — asked AFTER every
+   * refusal, as on the editor's door: the grant is prepared first (the same
+   * gates, composition and plan the job runs), and when it would be refused or
+   * would do nothing there is nothing to confirm. The share is then created or
+   * updated as asked and the job result's `grant` carries the refusal sentence
+   * (the share-door contract: a grant refusal never refuses the share).
+   * `sent` = the 409 went out; otherwise `confirmed` says whether the recursive
+   * apply was confirmed (false when the grant will not run).
    */
-  async function confirmRecursiveGrant(path: string, validUsers: string[], request: FastifyRequest, reply: FastifyReply): Promise<boolean> {
-    const target = await access.resolveShareTarget(path)
-    const named = sharePrincipals(validUsers).principals.length > 0
-    return confirmGate(confirmStore, request, reply, await access.recursiveConfirm(target, { named }))
+  async function confirmRecursiveGrant(path: string, share: GrantShare, request: FastifyRequest, reply: FastifyReply): Promise<{ sent: true } | { sent: false, confirmed: boolean }> {
+    const prepared = await access.prepareShareGrant(path, share, true)
+    if ('done' in prepared)
+      return { sent: false, confirmed: false }
+    if (!confirmGate(confirmStore, request, reply, await access.recursiveConfirm(prepared.plan.target, { named: prepared.plan.hasNamed })))
+      return { sent: true }
+    return { sent: false, confirmed: true }
   }
 
   /** Read smb.conf fresh every time — the file is the source of truth (P.11). */
@@ -462,8 +486,14 @@ export async function smbShareRoutes(
       return { error: { code: 'CONFLICT', message: `SMB share '${req.name}' already exists` } }
     }
 
-    if (req.grantAccess?.applyToExisting === true && !(await confirmRecursiveGrant(req.path, req.validUsers ?? [], request, reply)))
-      return reply
+    // The stanza's defaults are the ones `addShare` writes (DESIGN 5d).
+    let recursiveConfirmed = false
+    if (req.grantAccess?.applyToExisting === true) {
+      const gate = await confirmRecursiveGrant(req.path, { validUsers: req.validUsers ?? [], guestOk: req.guestOk ?? false, readOnly: req.readOnly ?? false }, request, reply)
+      if (gate.sent)
+        return reply
+      recursiveConfirmed = gate.confirmed
+    }
 
     const job = jobQueue.submit(
       'smb.share.add',
@@ -486,7 +516,7 @@ export async function smbShareRoutes(
         if (req.grantAccess) {
           const created = getShare(await readSmbConf(), req.name)
           const grant = created
-            ? await grantFor(created, req.grantAccess, updateProgress)
+            ? await grantFor(created, req.grantAccess, updateProgress, recursiveConfirmed)
             : { status: 'failed' as const, message: `SMB share '${req.name}' could not be read back after the write`, path: req.path, granted: [], skipped: [], applyToExisting: req.grantAccess.applyToExisting === true }
           return { created: req.name, grant }
         }
@@ -536,9 +566,17 @@ export async function smbShareRoutes(
     if (currentShare && await refuseSelfService(name, req.path ?? currentShare.path, req, reply))
       return reply
 
-    if (req.grantAccess?.applyToExisting === true && currentShare
-      && !(await confirmRecursiveGrant(req.path ?? currentShare.path, req.validUsers ?? currentShare.validUsers, request, reply))) {
-      return reply
+    // The edit's fields laid over the stanza: what the grant will answer to.
+    let recursiveConfirmed = false
+    if (req.grantAccess?.applyToExisting === true && currentShare) {
+      const gate = await confirmRecursiveGrant(req.path ?? currentShare.path, {
+        validUsers: req.validUsers ?? currentShare.validUsers,
+        guestOk: req.guestOk ?? currentShare.guestOk,
+        readOnly: req.readOnly ?? currentShare.readOnly,
+      }, request, reply)
+      if (gate.sent)
+        return reply
+      recursiveConfirmed = gate.confirmed
     }
 
     const job = jobQueue.submit(
@@ -554,7 +592,15 @@ export async function smbShareRoutes(
             // The effective path AGAIN, resolved in the job from fresh state.
             req.path ?? getShare(await readSmbConf(), name)?.path ?? '',
             req,
-            (current, keys) => updateShare(current, name, req, keys),
+            (current, keys) => {
+              const next = updateShare(current, name, req, keys)
+              // live proof 0.4.3 F2: an edit that runs a grant also makes
+              // Samba honour its default ACL — added only when the stanza does
+              // not set `inherit acls` at all (an operator's value stands).
+              return editRunsGrant(req.grantAccess, getShare(current, name), getShare(next, name))
+                ? ensureInheritAcls(next, name)
+                : next
+            },
           )
         }
         catch (err) {
@@ -564,11 +610,11 @@ export async function smbShareRoutes(
         if (req.grantAccess) {
           const after = getShare(await readSmbConf(), name)
           if (!after)
-            return { updated: name, grant: { status: 'failed' as const, message: `SMB share '${name}' could not be read back after the write`, path: req.path ?? '', granted: [], skipped: [], applyToExisting: req.grantAccess.applyToExisting === true } }
+            return { updated: name, grant: { status: 'failed' as const, message: `SMB share '${name}' could not be read back after the write`, path: req.path ?? before?.path ?? '', granted: [], skipped: [], applyToExisting: req.grantAccess.applyToExisting === true } }
           // An explicit "apply to existing files" is its own reason to run.
-          if (before && !grantRelevantChange(before, after) && req.grantAccess.applyToExisting !== true)
+          if (!editRunsGrant(req.grantAccess, before, after))
             return { updated: name, grant: { status: 'nothing' as const, path: after.path, granted: [], skipped: [], applyToExisting: false } }
-          return { updated: name, grant: await grantFor(after, req.grantAccess, updateProgress) }
+          return { updated: name, grant: await grantFor(after, req.grantAccess, updateProgress, recursiveConfirmed) }
         }
         return { updated: name }
       },

@@ -5,6 +5,7 @@ import {
   addShare,
   composeVfsObjects,
   customVfsRefusal,
+  ensureInheritAcls,
   formatMaxSize,
   getShare,
   hasCustomVfsObjects,
@@ -142,6 +143,7 @@ describe('addShare — appends only, existing bytes untouched', () => {
       '\tbrowseable = yes',
       '\tread only = no',
       '\tguest ok = no',
+      '\tinherit acls = yes',
       '',
     ].join('\n'))
     // And the new share round-trips through the typed model.
@@ -163,6 +165,45 @@ describe('addShare — appends only, existing bytes untouched', () => {
     assert.equal(share.readOnly, true)
     assert.deepEqual(share.validUsers, ['alice', '@admins'])
     assert.deepEqual(share.hostsAllow, ['10.0.0.0/8'])
+  })
+})
+
+describe('inherit acls — files saved over SMB inherit the grant (live proof 0.4.3 F2)', () => {
+  it('a created stanza always carries inherit acls = yes', () => {
+    for (const req of [
+      { name: 'plain', path: '/tank/plain' },
+      { name: 'ro', path: '/tank/ro', readOnly: true, validUsers: ['alice'] },
+      { name: 'pub', path: '/tank/pub', guestOk: true },
+    ]) {
+      const next = addShare('', req)
+      assert.ok(next.split('\n').includes('\tinherit acls = yes'), `${req.name}: ${next}`)
+    }
+  })
+
+  it('an edit with a grant adds inherit acls = yes when the stanza lacks it, touching nothing else', () => {
+    const text = ['[global]', '\tworkgroup = WG', '', '[media]', '\tpath = /tank/media', '\tvalid users = alice', '', '[next]', '\tpath = /tank/next', ''].join('\n')
+    const next = ensureInheritAcls(text, 'media')
+    assert.equal(next, ['[global]', '\tworkgroup = WG', '', '[media]', '\tpath = /tank/media', '\tvalid users = alice', '\tinherit acls = yes', '', '[next]', '\tpath = /tank/next', ''].join('\n'))
+  })
+
+  it('an edit with a grant leaves an explicit inherit acls = no alone (any spelling)', () => {
+    for (const line of ['\tinherit acls = no', '\tInherit ACLs = No', '\tinheritacls = false']) {
+      const text = ['[media]', '\tpath = /tank/media', line, '\tvalid users = alice', ''].join('\n')
+      assert.equal(ensureInheritAcls(text, 'media'), text, line)
+    }
+  })
+
+  it('an edit without a grant leaves a stanza lacking inherit acls byte-identical', () => {
+    const text = ['[media]', '\tpath = /tank/media', '\tread only = no', '\tvalid users = alice', ''].join('\n')
+    // updateShare is the whole of a grant-less edit: it never adds the key.
+    assert.equal(updateShare(text, 'media', { readOnly: false, validUsers: ['alice'] }), text)
+    assert.equal(updateShare(text, 'media', { comment: 'Media' }).includes('inherit acls'), false)
+  })
+
+  it('ensureInheritAcls never conjures a share or edits [global]', () => {
+    const text = ['[global]', '\tworkgroup = WG', ''].join('\n')
+    assert.equal(ensureInheritAcls(text, 'missing'), text)
+    assert.equal(ensureInheritAcls(text, 'global'), text)
   })
 })
 
@@ -913,6 +954,7 @@ describe('managed self-service keys (smbsvc.1)', () => {
       '\tbrowseable = yes',
       '\tread only = no',
       '\tguest ok = no',
+      '\tinherit acls = yes',
       '\tvfs objects = shadow_copy2',
       '\tshadow:format = anas-hourly-%Y-%m-%dT%H%M%SZ',
       '\tshadow:snapdir = .zfs/snapshot',
@@ -1120,6 +1162,7 @@ describe('fruit max-size unit choice + round-trip (smbsvc.3)', () => {
       '\tbrowseable = yes',
       '\tread only = no',
       '\tguest ok = no',
+      '\tinherit acls = yes',
       '\tvfs objects = catia fruit streams_xattr',
       '\tfruit:time machine = yes',
       '\tfruit:time machine max size = 500G',

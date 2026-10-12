@@ -141,10 +141,14 @@ describe('level ↔ perms round-trips', () => {
     }
   })
 
-  it('uses capital X for read only when recursive (no spurious execute on files)', () => {
+  it('uses capital X for every level when recursive (no spurious execute on files)', () => {
     assert.equal(levelToAclPerms('read', false), 'r-x')
+    assert.equal(levelToAclPerms('read-write', false), 'rwx')
     assert.equal(levelToAclPerms('read', true), 'r-X')
-    assert.equal(levelToAclPerms('read-write', true), 'rwx')
+    // One literal x in a recursive spec turns every X into x (live proof 0.4.3 §3x).
+    assert.equal(levelToAclPerms('read-write', true), 'rwX')
     assert.equal(levelToAclPerms('none', true), '---')
+    for (const level of ['none', 'read', 'read-write'] as const)
+      assert.ok(!levelToAclPerms(level, true).includes('x'), `recursive ${level} carries no lowercase x`)
   })
 })

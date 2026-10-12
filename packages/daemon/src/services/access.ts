@@ -25,7 +25,8 @@ import { resolveSelfServiceTarget } from './share-selfservice.js'
 //   - the ACL switch: ZFS has `acltype` (auto-enabled with `zfs set` on the
 //     first named grant); btrfs (AHR) and other Linux filesystems carry POSIX
 //     ACLs natively, so there is no switch and never a `zfs set`;
-//   - the recursive walk: `setfacl -R`/`chown -R`/`chmod -R` walk the directory
+//   - the recursive walk: `setfacl -R`/`chown -R`/`chmod -R` (and
+//     `find -type d` for the directories' setgid) walk the directory
 //     tree. On ZFS that includes child datasets mounted beneath (the
 //     PVE-descendant refusal guards it, and a named grant switches their
 //     ACLs on first — {@link enableChildAcls}); on AHR it sweeps every subvolume
@@ -41,6 +42,7 @@ const CHOWN = '/usr/bin/chown'
 const CHMOD = '/usr/bin/chmod'
 const GETFACL = '/usr/bin/getfacl'
 const SETFACL = '/usr/bin/setfacl'
+const FIND = '/usr/bin/find'
 const GETENT = '/usr/bin/getent'
 
 /** The base-three access kinds (mode bits), in owner/group/everyone order. */
@@ -195,10 +197,23 @@ function isNamed(e: AccessEntry): e is NamedEntry {
 }
 
 /**
- * Build a `setfacl --set` spec declaratively from the base three levels plus the
- * named entries. The mask is pinned to `rwx` (union) so no principal is masked
- * below its stated level — the reported level stays truthful. The same spec is
- * used for the access ACL and, with `-d`, the default (inheritance) ACL.
+ * Build a `setfacl` spec declaratively from the base three levels plus the
+ * named entries. The mask is the union (`rwx`) so no principal is masked below
+ * its stated level — the reported level stays truthful.
+ *
+ * `recursive` is the spec for the walk over existing files: every execute bit
+ * is the capital `X`, the mask included (`m::rwX`). setfacl resolves `X`
+ * against the ACL it is building, so one literal `x` anywhere in the spec
+ * makes every `X` resolve to `x` — the 0.4.3 live proof (§3, §3x) saw a
+ * recursive apply leave every plain file `-rwxrwsr-x`. With `X` throughout a
+ * plain file gets `rw-`/`r--` and a mask of `rw-`, a directory gets `rwx`/`r-x`.
+ *
+ * The DEFAULT (inheritance) ACL always takes the non-recursive form: default
+ * entries exist only on directories, where `X` resolves to `x` anyway, so the
+ * lowercase spec states exactly what is stored and is the same on a recursive
+ * and a mountpoint-only apply. A file created with an ordinary `open()` does
+ * not inherit execute from it: the kernel masks the inherited entries with
+ * the creating call's mode (0666 for an ordinary file).
  */
 function buildAclSpec(base: BaseLevels, named: NamedEntry[], recursive: boolean): string {
   const p = (level: AccessEntry['level']) => levelToAclPerms(level, recursive)
@@ -209,7 +224,7 @@ function buildAclSpec(base: BaseLevels, named: NamedEntry[], recursive: boolean)
   ]
   for (const n of named)
     specs.push(`${n.kind === 'user' ? 'u' : 'g'}:${n.name}:${p(n.level)}`)
-  specs.push('m::rwx')
+  specs.push(recursive ? 'm::rwX' : 'm::rwx')
   return specs.join(',')
 }
 
@@ -217,6 +232,9 @@ function buildAclSpec(base: BaseLevels, named: NamedEntry[], recursive: boolean)
 function isPosixAcl(acltype: string): boolean {
   return acltype === 'posixacl' || acltype === 'posix'
 }
+
+/** The share fields a grant answers to (the stanza, or a request laid over it). */
+export interface GrantShare { validUsers: string[], guestOk: boolean, readOnly: boolean }
 
 /** Samba `valid users` group prefixes: `@` (NIS netgroup, then Unix group), `+` (Unix group), `&` (NIS). */
 const GROUP_PREFIX_RE = /^[@+&]+/
@@ -811,7 +829,7 @@ export function createAccessService(opts: AccessServiceOptions) {
           ? `${req.owner}`
           : `:${req.group}`
       const args = recursive ? ['-R', spec, mountpoint] : [spec, mountpoint]
-      updateProgress(`chown ${spec} ${mountpoint}`)
+      updateProgress(`chown ${args.join(' ')}`)
       const r = await executor.exec(CHOWN, args)
       if (r.exitCode !== 0)
         throw new Error(r.stderr.trim() || `chown exited with code ${r.exitCode}`)
@@ -828,33 +846,47 @@ export function createAccessService(opts: AccessServiceOptions) {
       }
 
       // 3) Set the access ACL DECLARATIVELY so dropped principals disappear.
+      // The mountpoint alone: `--set` replaces the whole ACL. The recursive
+      // walk: `-b -m` is the same replacement (`-b` drops every extended
+      // entry, `-m` writes the spec), but setfacl resolves the spec's `X`
+      // against each file's own permissions after `-b` instead of against an
+      // empty ACL — so a file that already carries execute keeps it and a
+      // plain file gets none. `--set` with an all-`X` spec would strip
+      // execute from every file in the tree.
       const spec = buildAclSpec(base, named, recursive)
-      const setArgs = recursive ? ['-R', '--set', spec, mountpoint] : ['--set', spec, mountpoint]
-      updateProgress(`setfacl --set ${spec} ${mountpoint}`)
+      const setArgs = recursive ? ['-R', '-b', '-m', spec, mountpoint] : ['--set', spec, mountpoint]
+      updateProgress(`setfacl ${setArgs.join(' ')}`)
       const setR = await executor.exec(SETFACL, setArgs)
       if (setR.exitCode !== 0)
-        throw new Error(setR.stderr.trim() || `setfacl --set exited with code ${setR.exitCode}`)
+        throw new Error(setR.stderr.trim() || `setfacl ${recursive ? '-R -b -m' : '--set'} exited with code ${setR.exitCode}`)
 
-      // 4) Matching DEFAULT ACL so new files inherit the grants.
-      // ASSUMPTION (verify live): `setfacl -R -d --set` applies default
-      // entries only to directories and does NOT error on regular files
-      // during the recursive walk (GNU acl skips default-on-file). If it
-      // errors live, switch step 4 to a `find <mp> -type d`-scoped set.
-      const defArgs = recursive ? ['-R', '-d', '--set', spec, mountpoint] : ['-d', '--set', spec, mountpoint]
-      updateProgress(`setfacl -d --set ${spec} ${mountpoint}`)
+      // 4) Matching DEFAULT ACL so new files inherit the grants. `setfacl -R
+      // -d --set` writes the default entries on directories only and passes
+      // over regular files with exit 0 (0.4.3 live proof §3: the files carry
+      // no `default:` lines and the job completed). The spec is always the
+      // lowercase form — see {@link buildAclSpec}.
+      const defSpec = buildAclSpec(base, named, false)
+      const defArgs = recursive ? ['-R', '-d', '--set', defSpec, mountpoint] : ['-d', '--set', defSpec, mountpoint]
+      updateProgress(`setfacl ${defArgs.join(' ')}`)
       const defR = await executor.exec(SETFACL, defArgs)
       if (defR.exitCode !== 0)
         throw new Error(defR.stderr.trim() || `setfacl -d --set exited with code ${defR.exitCode}`)
 
-      // 5) setgid on the directory so new files take the group, completing
-      // inheritance. ASSUMPTION (verify live): recursive `chmod -R g+s`
-      // also sets setgid on plain files, which is inert for data files; if
-      // the orchestrator prefers dirs-only, scope with `find -type d`.
-      const gidArgs = recursive ? ['-R', 'g+s', mountpoint] : ['g+s', mountpoint]
-      updateProgress(`chmod g+s ${mountpoint}`)
-      const gidR = await executor.exec(CHMOD, gidArgs)
+      // 5) setgid on directories so new files take the directory's group,
+      // completing inheritance. Directories ONLY: `chmod -R g+s` marks every
+      // regular file setgid as well (0.4.3 live proof §3: a root-owned 0755
+      // binary ended `-rwxrwsr-x`, a setgid-root executable). The recursive
+      // form walks with `find -type d`, which crosses mounts like the
+      // `setfacl -R` walk above (no `-xdev`) and, like it, does not follow
+      // symbolic links.
+      const gidArgs = recursive
+        ? [mountpoint, '-type', 'd', '-exec', CHMOD, 'g+s', '{}', '+']
+        : ['g+s', mountpoint]
+      const gidBin = recursive ? FIND : CHMOD
+      updateProgress(recursive ? `find ${gidArgs.join(' ')}` : `chmod ${gidArgs.join(' ')}`)
+      const gidR = await executor.exec(gidBin, gidArgs)
       if (gidR.exitCode !== 0)
-        throw new Error(gidR.stderr.trim() || `chmod g+s exited with code ${gidR.exitCode}`)
+        throw new Error(gidR.stderr.trim() || `${recursive ? 'find -type d -exec chmod g+s' : 'chmod g+s'} exited with code ${gidR.exitCode}`)
 
       const result: Record<string, unknown> = { ...ident, aclEnabled: true, aclAutoEnabled, namedCount: named.length }
       // The child datasets whose ACLs were switched on (present whenever the
@@ -869,7 +901,7 @@ export function createAccessService(opts: AccessServiceOptions) {
     // truth. This runs only for `clearNamed: true` — never inferred.
     if (clearAcls) {
       const clearArgs = recursive ? ['-R', '-b', '-k', mountpoint] : ['-b', '-k', mountpoint]
-      updateProgress(`setfacl -b -k ${mountpoint}`)
+      updateProgress(`setfacl ${clearArgs.join(' ')}`)
       const clearR = await executor.exec(SETFACL, clearArgs)
       if (clearR.exitCode !== 0)
         throw new Error(clearR.stderr.trim() || `setfacl -b -k exited with code ${clearR.exitCode}`)
@@ -878,10 +910,12 @@ export function createAccessService(opts: AccessServiceOptions) {
       // setgid would make the reported mode (e.g. 2775 vs 775) misleading.
       // A recursive clear that ALSO sets the base levels folds `g-s` into
       // that one mode chmod below (one `-R` walk instead of two); every
-      // other shape needs its own call.
+      // other shape needs its own call. The recursive `g-s` reaches regular
+      // files on purpose: it repairs trees an earlier recursive grant marked
+      // setgid file by file (before 0.4.3 that step ran `chmod -R g+s`).
       if (!recursive || !baseChanged) {
         const gsArgs = recursive ? ['-R', 'g-s', mountpoint] : ['g-s', mountpoint]
-        updateProgress(`chmod g-s ${mountpoint}`)
+        updateProgress(`chmod ${gsArgs.join(' ')}`)
         const unsetR = await executor.exec(CHMOD, gsArgs)
         if (unsetR.exitCode !== 0)
           throw new Error(unsetR.stderr.trim() || `chmod g-s exited with code ${unsetR.exitCode}`)
@@ -894,15 +928,16 @@ export function createAccessService(opts: AccessServiceOptions) {
       // bit is removed in the SAME recursive walk (the `=` clauses set the
       // base perms, `g-s` strips setgid). Non-recursive: numeric octal is
       // correct — the mountpoint is always a directory — and the setgid-clear
-      // above stays its own cheap call.
-      // ASSUMPTION (verify live): `chmod -R 'u=rwX,g=rX,o=,g-s' <mp>` is
-      // accepted by GNU coreutils chmod (symbolic mode with X, comma-separated
-      // clauses mixing `=` and `-` operators).
+      // above stays its own cheap call. GNU chmod takes the comma-separated
+      // clauses mixing `=` and `-` (`u=rwX,g=rX,o=,g-s`), and its `X` is
+      // decided by each file's mode BEFORE the change, so an executable keeps
+      // execute and a plain file gets none (checked on scratch files with
+      // coreutils 9.10; the 0.4.3 live proof did not run this shape).
       const mode = recursive
         ? (clearAcls ? `${levelsToSymbolic(base)},g-s` : levelsToSymbolic(base))
         : levelsToMode(base)
       const modeArgs = recursive ? ['-R', mode, mountpoint] : [mode, mountpoint]
-      updateProgress(`chmod ${mode} ${mountpoint}`)
+      updateProgress(`chmod ${modeArgs.join(' ')}`)
       const modeR = await executor.exec(CHMOD, modeArgs)
       if (modeR.exitCode !== 0)
         throw new Error(modeR.stderr.trim() || `chmod ${mode} exited with code ${modeR.exitCode}`)
@@ -926,7 +961,8 @@ export function createAccessService(opts: AccessServiceOptions) {
    * owner and owning group are untouched, every existing named entry is kept,
    * and nobody is ever LOWERED (a principal already above `level` keeps what it
    * has — a grant adds access, it never revokes). Returns the request the
-   * editor would send, or a reason why nothing can be granted.
+   * editor would send and, per principal, the level it ends with (the kept one
+   * where that is higher than `level`), or a reason why nothing can be granted.
    */
   async function composeGrant(
     t: AccessTarget,
@@ -963,12 +999,18 @@ export function createAccessService(opts: AccessServiceOptions) {
         merged.push(w)
     }
 
-    const granted: AccessEntry[] = wanted.map(w => ({ kind: w.kind, name: w.name, level: w.level }))
+    // `granted` reports the level each principal ENDS with — the kept level
+    // when the never-lower rule kept a higher one (a read-only edit keeps an
+    // existing read-write entry), not the level the share asked for.
+    const granted: AccessEntry[] = wanted.map((w) => {
+      const kept = merged.find(e => e.kind === w.kind && e.name === w.name)
+      return { kind: w.kind, name: w.name, level: kept?.level ?? w.level }
+    })
     const entries: AccessEntry[] = []
     if (guest) {
-      const everyone = acc.entries.find(e => e.kind === 'everyone')?.level ?? 'none'
-      entries.push({ kind: 'everyone', level: maxLevel(everyone, level) })
-      granted.push({ kind: 'everyone', level })
+      const everyone = maxLevel(acc.entries.find(e => e.kind === 'everyone')?.level ?? 'none', level)
+      entries.push({ kind: 'everyone', level: everyone })
+      granted.push({ kind: 'everyone', level: everyone })
     }
     if (wanted.length === 0 && !guest)
       return { ok: true, request: null, granted: [], skipped }
@@ -980,22 +1022,23 @@ export function createAccessService(opts: AccessServiceOptions) {
   }
 
   /**
-   * Run the share-path grant inside a share job (access.1): resolve the path,
-   * ask the SAME gates the editor's PUT asks, compose the pre-filled request,
-   * then plan and execute it exactly as the editor's job would. Never throws —
-   * the share is created or updated whatever happens here, and the outcome
-   * (with the gate's or the command's own sentence) rides on the job result.
+   * Everything the share-path grant decides before it writes anything: resolve
+   * the path, ask the SAME gates the editor's PUT asks, compose the pre-filled
+   * request and plan it. Either a finished outcome (refused with the gate's
+   * sentence, nothing to do, a failed read) or a plan ready to run. The share
+   * routes ask this BEFORE raising the recursive confirm, so the confirm is
+   * asked after every refusal (operator ruling 2026-10-11, live proof F3), and
+   * the job asks it again on the stanza as written.
    */
-  async function grantOnSharePath(
+  async function prepareShareGrant(
     path: string,
-    share: { validUsers: string[], guestOk: boolean, readOnly: boolean },
+    share: GrantShare,
     applyToExisting: boolean,
-    updateProgress: (msg: string) => void,
-  ): Promise<ShareAccessGrantResult> {
+  ): Promise<{ done: ShareAccessGrantResult } | { plan: SetAccessPlan, granted: AccessEntry[], skipped: string[] }> {
     const level: AccessLevel = share.readOnly ? 'read' : 'read-write'
     const { principals, skipped: unparsed } = sharePrincipals(share.validUsers)
-    const outcome = (status: ShareAccessGrantResult['status'], extra: Partial<ShareAccessGrantResult> = {}): ShareAccessGrantResult =>
-      ({ status, path, granted: [], skipped: unparsed, applyToExisting, ...extra })
+    const outcome = (status: ShareAccessGrantResult['status'], extra: Partial<ShareAccessGrantResult> = {}): { done: ShareAccessGrantResult } =>
+      ({ done: { status, path, granted: [], skipped: unparsed, applyToExisting, ...extra } })
     try {
       const target = await resolveShareTarget(path)
       const refused = await guardPathTarget(target, { applyToExisting })
@@ -1010,10 +1053,45 @@ export function createAccessService(opts: AccessServiceOptions) {
       const planned = await planSetAccess(target, composed.request)
       if (!planned.ok)
         return outcome('refused', { message: planned.failure.body.error.message, skipped })
+      return { plan: planned.value, granted: composed.granted, skipped }
+    }
+    catch (err) {
+      return outcome('failed', { message: err instanceof Error ? err.message : String(err) })
+    }
+  }
+
+  /**
+   * Run the share-path grant inside a share job (access.1): prepare it (see
+   * {@link prepareShareGrant}) and execute the plan exactly as the editor's job
+   * would. Never throws — the share is created or updated whatever happens
+   * here, and the outcome (with the gate's or the command's own sentence) rides
+   * on the job result.
+   *
+   * `recursiveConfirmed` says whether the request took the recursive confirm.
+   * The route skips the confirm when the grant would be refused or would do
+   * nothing; if the job then finds a recursive apply that WOULD run (the path
+   * changed in between), it refuses rather than rewrite a tree nobody confirmed.
+   */
+  async function grantOnSharePath(
+    path: string,
+    share: GrantShare,
+    applyToExisting: boolean,
+    updateProgress: (msg: string) => void,
+    opts: { recursiveConfirmed: boolean },
+  ): Promise<ShareAccessGrantResult> {
+    const prepared = await prepareShareGrant(path, share, applyToExisting)
+    if ('done' in prepared)
+      return prepared.done
+    const { plan, granted, skipped } = prepared
+    const outcome = (status: ShareAccessGrantResult['status'], extra: Partial<ShareAccessGrantResult> = {}): ShareAccessGrantResult =>
+      ({ status, path, granted: [], skipped, applyToExisting, ...extra })
+    if (plan.recursive && !opts.recursiveConfirmed)
+      return outcome('refused', { message: `Applying to existing files under '${path}' was not confirmed: when the request was checked, the grant would not have run. Nothing was granted; use Permissions on the share to apply it` })
+    try {
       updateProgress(`granting access on ${path}`)
-      const ran = await runSetAccess(planned.value, updateProgress)
+      const ran = await runSetAccess(plan, updateProgress)
       const children = Array.isArray(ran.childAclEnabled) ? { childAclEnabled: ran.childAclEnabled as string[] } : {}
-      return outcome('applied', { granted: composed.granted, skipped, ...children })
+      return outcome('applied', { granted, ...children })
     }
     catch (err) {
       return outcome('failed', { message: err instanceof Error ? err.message : String(err) })
@@ -1023,6 +1101,7 @@ export function createAccessService(opts: AccessServiceOptions) {
   return {
     statMountpoint,
     aclSupported,
+    prepareShareGrant,
     grantOnSharePath,
     zfsFullName,
     resolveZfsTarget,

@@ -2,8 +2,9 @@ import type { AccessEntry, DatasetAccess, Job, JobAccepted } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
@@ -476,7 +477,7 @@ describe('access routes', () => {
 
   // --- PUT /access: applyToExisting recurses ------------------------------
   describe('PUT /v1/pools/:name/datasets/*path/access — applyToExisting', () => {
-    it('adds -R to chown, setfacl (access + default), and chmod g+s, using X for read', async () => {
+    it('adds -R to chown and setfacl (access + default) and walks directories for g+s, using X for read', async () => {
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server) // acltype 'off'
 
@@ -500,11 +501,75 @@ describe('access routes', () => {
       assert.equal(job.status, 'completed')
 
       assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['-R', 'media', MP])
-      // Recursive → read levels use capital X so files don't gain execute.
-      const spec = 'u::rwx,g::r-X,o::r-X,u:alice:r-X,m::rwx'
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '--set'), ['-R', '--set', spec, MP])
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-d'), ['-R', '-d', '--set', spec, MP])
-      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), ['-R', 'g+s', MP])
+      // Recursive → every execute bit is capital X, the mask too, so plain
+      // files gain no execute; `-b -m` resolves X per file against its own bits.
+      const spec = 'u::rwX,g::r-X,o::r-X,u:alice:r-X,m::rwX'
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-b'), ['-R', '-b', '-m', spec, MP])
+      // The default ACL sits on directories only: the lowercase form is what is stored.
+      const defSpec = 'u::rwx,g::r-x,o::r-x,u:alice:r-x,m::rwx'
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-d'), ['-R', '-d', '--set', defSpec, MP])
+      // setgid on directories only.
+      assert.deepEqual(find(calls, '/usr/bin/find', () => true), [MP, '-type', 'd', '-exec', '/usr/bin/chmod', 'g+s', '{}', '+'])
+      assert.equal(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), undefined, 'no chmod g+s over the whole tree')
+    })
+
+    it('a recursive read-write grant carries no lowercase x and never sets setgid on a regular file', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') }])
+
+      const res = await injectConfirmed(server, {
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({
+          entries: [
+            { kind: 'owner', level: 'read-write' },
+            { kind: 'owning-group', level: 'read-write' },
+            { kind: 'everyone', level: 'read' },
+            { kind: 'user', name: 'alice', level: 'read-write' },
+            { kind: 'group', name: 'media', level: 'read-write' },
+          ],
+          applyToExisting: true,
+        }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+
+      // (a) One literal x in the walk's spec turns every X into x (live proof
+      // 0.4.3 §3x): the access spec of the recursive walk has none.
+      const walk = find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-b')
+      assert.ok(walk, 'the recursive access ACL was written')
+      assert.equal(walk[3], 'u::rwX,g::rwX,o::r-X,u:alice:rwX,g:media:rwX,m::rwX')
+      assert.equal(walk[3].includes('x'), false, `no lowercase x in ${walk[3]}`)
+      assert.equal(calls.some(c => c.command === '/usr/bin/setfacl' && c.args[0] === '-R' && c.args[1] === '--set'), false, 'the walk never uses --set (it would strip execute from executables)')
+
+      // (b) The only setgid change is the directories-only walk: no chmod
+      // anywhere carries g+s, and the find selects -type d before -exec.
+      assert.equal(calls.some(c => c.command === '/usr/bin/chmod' && c.args.includes('g+s')), false, 'no chmod g+s over the tree')
+      const gid = find(calls, '/usr/bin/find', () => true)
+      assert.ok(gid, 'the setgid walk ran')
+      assert.deepEqual(gid, [MP, '-type', 'd', '-exec', '/usr/bin/chmod', 'g+s', '{}', '+'])
+
+      // (c) Run that exact argv against a real tree: the directories get
+      // setgid, the regular files (plain and executable) do not.
+      const root = mkdtempSync(join(tmpdir(), 'anas-setgid-'))
+      try {
+        mkdirSync(join(root, 'sub'))
+        writeFileSync(join(root, 'plain.txt'), 'data\n', { mode: 0o644 })
+        writeFileSync(join(root, 'tool'), '#!/bin/sh\n', { mode: 0o755 })
+        writeFileSync(join(root, 'sub', 'inner.txt'), 'data\n', { mode: 0o644 })
+        execFileSync('/usr/bin/find', gid.map(a => a === MP ? root : a))
+        const SETGID = 0o2000
+        assert.ok(statSync(root).mode & SETGID, 'the top directory is setgid')
+        assert.ok(statSync(join(root, 'sub')).mode & SETGID, 'a subdirectory is setgid')
+        for (const f of ['plain.txt', 'tool', join('sub', 'inner.txt')])
+          assert.equal(statSync(join(root, f)).mode & SETGID, 0, `${f} is not setgid`)
+        assert.equal(statSync(join(root, 'plain.txt')).mode & 0o7777, 0o644, 'a plain file keeps its mode')
+      }
+      finally {
+        rmSync(root, { recursive: true, force: true })
+      }
     })
   })
 })
@@ -555,7 +620,7 @@ function putMedia(body: unknown): Put {
 }
 
 /** Every permission-changing command (the ACL switch is `zfs set`, asserted separately). */
-const PERMISSION_COMMANDS = ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl']
+const PERMISSION_COMMANDS = ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl', '/usr/bin/find']
 
 function datasetRow(name: string): [string, unknown] {
   return [name, {
@@ -618,7 +683,7 @@ describe('recursive apply — the confirm gate and child datasets (rulings 2026-
     assert.ok(enableA >= 0, 'acltype switched on for the child')
     const firstPermission = calls.findIndex(c => PERMISSION_COMMANDS.includes(c.command))
     assert.ok(firstPermission > enableA, `the child is enabled before any permission changes (enable #${enableA}, first permission #${firstPermission})`)
-    assert.ok(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '--set'), 'the -R walk ran')
+    assert.ok(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-b'), 'the -R walk ran')
     assert.deepEqual((job.result as { childAclEnabled?: string[] }).childAclEnabled, ['testpool/media/a'])
   })
 

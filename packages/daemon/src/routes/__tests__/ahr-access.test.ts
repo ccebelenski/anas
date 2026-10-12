@@ -359,7 +359,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
 
   // --- PUT: applyToExisting -------------------------------------------------------
   describe('PUT — applyToExisting', () => {
-    it('ahr applyToExisting adds -R to chown, setfacl (access + default) and chmod g+s — the whole @data tree', async () => {
+    it('ahr applyToExisting adds -R to chown and setfacl (access + default) and walks directories for g+s — the whole @data tree', async () => {
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server)
       const res = await putConfirmed({
@@ -375,10 +375,11 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
       assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['-R', 'media', MP])
-      const spec = 'u::rwx,g::r-X,o::r-X,u:alice:r-X,m::rwx'
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '--set'), ['-R', '--set', spec, MP])
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-d'), ['-R', '-d', '--set', spec, MP])
-      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), ['-R', 'g+s', MP])
+      const spec = 'u::rwX,g::r-X,o::r-X,u:alice:r-X,m::rwX'
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-b'), ['-R', '-b', '-m', spec, MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-d'), ['-R', '-d', '--set', 'u::rwx,g::r-x,o::r-x,u:alice:r-x,m::rwx', MP])
+      assert.deepEqual(find(calls, '/usr/bin/find', () => true), [MP, '-type', 'd', '-exec', '/usr/bin/chmod', 'g+s', '{}', '+'])
+      assert.equal(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), undefined, 'no chmod g+s over the whole tree')
       // The walk starts at the mount (@data); @snapshots is a sibling subvolume
       // outside it, so no command ever names a snapshot path.
       assert.equal(calls.some(c => c.args.some(a => a.includes('@snapshots'))), false)
@@ -397,7 +398,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       assert.ok(err.warnings.some(w => /sweeps every subvolume under the pool's data as one tree; the pool's snapshots are not touched/.test(w)), JSON.stringify(err.warnings))
       assert.ok(err.warnings.some(w => /cannot be undone/.test(w)), JSON.stringify(err.warnings))
       assert.equal(err.warnings.some(w => /iSCSI/.test(w)), false, 'no LUN on this pool, no LUN sentence')
-      assert.equal(calls.some(c => ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl'].includes(c.command)), false, 'nothing ran')
+      assert.equal(calls.some(c => ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl', '/usr/bin/find'].includes(c.command)), false, 'nothing ran')
       assertNoAcltypeStep(calls)
       // A wrong code is a fresh challenge, never a pass.
       const wrong = await server.inject({ method: 'PUT', url: URL, headers: { ...JSON_HEADERS, 'x-anas-confirm': 'nope' }, payload: JSON.stringify({ owner: 'media', applyToExisting: true }) })

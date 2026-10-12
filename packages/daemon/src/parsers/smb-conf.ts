@@ -286,6 +286,11 @@ const PARAM = {
   serverString: { canonical: 'server string', norms: ['serverstring'] },
   interfaces: { canonical: 'interfaces', norms: ['interfaces'] },
   bindInterfacesOnly: { canonical: 'bind interfaces only', norms: ['bindinterfacesonly'], unset: 'no' },
+  // Samba honours the parent directory's default ACL on files and directories
+  // it creates only with this on (its default is no): without it a file one
+  // user saves is masked by `create mask` (0744) and the other granted users
+  // get read at most. No synonyms.
+  inheritAcls: { canonical: 'inherit acls', norms: ['inheritacls'], unset: 'no' },
   // ── Self-service features (smbsvc.1–3). The `vfs objects` line is COMPOSED
   // from the enabled feature set (composeVfsObjects below) — never hand-merged.
   // Keys are case- and space-insensitive like every parameter ("fruit:time
@@ -1055,6 +1060,10 @@ function renderStanza(req: CreateSmbShareRequest, indent: string, selfService?: 
   add(PARAM.browseable, boolStr(req.browseable ?? true))
   add(PARAM.readOnly, boolStr(req.readOnly ?? false))
   add(PARAM.guestOk, boolStr(req.guestOk ?? false))
+  // Files saved over SMB inherit the path's default ACL, so what one granted
+  // user writes the others can use (live proof 0.4.3 F2). Every ANAS-written
+  // stanza carries it; an edit adds it only with a grant ({@link ensureInheritAcls}).
+  add(PARAM.inheritAcls, 'yes')
   if (req.validUsers && req.validUsers.length)
     add(PARAM.validUsers, req.validUsers.join(' '))
   if (req.hostsAllow && req.hostsAllow.length)
@@ -1137,6 +1146,25 @@ export function updateShare(text: string, name: string, req: UpdateSmbShareReque
     return serializeDoc(doc)
   }
   applyEditsToSection(doc, name, edits, indent)
+  return serializeDoc(doc)
+}
+
+/**
+ * The share-path grant's companion edit (live proof 0.4.3 F2): add
+ * `inherit acls = yes` to a share stanza that does not set the parameter at
+ * all, so files written over SMB inherit the default ACL the grant writes. A
+ * stanza that sets it already — to either value, in any spelling — is the
+ * operator's choice and is returned unchanged, as is the text when the share
+ * is absent. The share routes call this only on an edit that runs a grant.
+ */
+export function ensureInheritAcls(text: string, name: string): string {
+  const doc = parseDoc(text)
+  const span = findSection(doc, name)
+  if (!span || span.key === 'global')
+    return text
+  if (paramHits(sectionDefs(doc, span), PARAM.inheritAcls).length > 0)
+    return text
+  applyEditsToSection(doc, name, [{ param: PARAM.inheritAcls, kind: 'bool', value: 'yes' }], sectionIndent(doc, span))
   return serializeDoc(doc)
 }
 

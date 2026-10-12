@@ -165,20 +165,20 @@ export function levelToOctalDigit(level: AccessLevel): number {
  * Level → a `setfacl` perms field.
  *   none        → `---`
  *   read        → `r-x` on the mountpoint dir; `r-X` when applying recursively
- *   read-write  → `rwx`
+ *   read-write  → `rwx` on the mountpoint dir; `rwX` when applying recursively
  *
- * The capital `X` grants execute only to directories (and files that already
- * have it), so a recursive grant does not sprinkle spurious execute onto plain
- * data files. On the mountpoint itself (always a directory) lowercase `x` is
- * fine. `setfacl` resolves `X` per file, so one `--set` spec is correct for the
- * whole tree. In a DEFAULT ACL, `X` resolves against the directory (→ x) and is
- * stored as `r-x`; the mask derived from a new file's create mode still clamps
- * inherited execute off data files, so inheritance stays clean either way.
+ * On the mountpoint itself (always a directory) lowercase `x` is right. In a
+ * recursive spec EVERY execute bit must be the capital `X`: setfacl resolves
+ * `X` against the ACL it is building for each file, so a single literal `x`
+ * anywhere in the spec (a `u::rwx`, or the mask) makes every `X` resolve to
+ * `x` and marks every plain file executable (live proof 0.4.3 §3, §3x). The
+ * recursive writer pairs this with `setfacl -b -m` so a file that already
+ * carries execute keeps it (see `runSetAccess` in services/access.ts).
  */
 export function levelToAclPerms(level: AccessLevel, recursive: boolean): string {
   switch (level) {
     case 'none': return '---'
     case 'read': return recursive ? 'r-X' : 'r-x'
-    case 'read-write': return 'rwx'
+    case 'read-write': return recursive ? 'rwX' : 'rwx'
   }
 }

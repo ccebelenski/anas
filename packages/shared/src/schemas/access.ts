@@ -85,8 +85,8 @@ export type DatasetAccess = z.infer<typeof DatasetAccess>
  * it. The share is created or updated whatever this says:
  *   applied — the entries below were written (`skipped` names principals
  *             that did not resolve and were left out);
- *   refused — a gate said no (PVE territory, a LUN-held AHR pool, an
- *             unreadable ACL); `message` is the gate's own sentence;
+ *   refused — a gate said no (PVE territory, an unreadable ACL); `message`
+ *             is the gate's own sentence;
  *   failed  — a command failed mid-way; `message` is its error;
  *   nothing — no principal and no guest access, or nothing that grants
  *             access changed on an edit.
@@ -96,7 +96,11 @@ export const ShareAccessGrantResult = z.object({
   message: z.string().optional(),
   /** The path the grant targeted. */
   path: z.string(),
-  /** The rows granted (named principals and/or everyone) at the share's level. */
+  /**
+   * The rows granted (named principals and/or everyone), each at the level it
+   * ends with: the share's level, or the higher one a principal already had
+   * (a grant never lowers).
+   */
   granted: z.array(AccessEntry),
   /** `valid users` entries that were not granted (unresolvable names, `%` macros). */
   skipped: z.array(z.string()),
