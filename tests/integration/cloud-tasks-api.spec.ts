@@ -30,7 +30,8 @@ const execFileAsync = promisify(execFile)
  *   4. `sync` from an EMPTY source is refused in DESIGN's own words; `copy`
  *      from the same empty source completes as the harmless no-op it is
  *   5. a source on a configured-but-unmounted fstab mount is refused, naming
- *      the mount
+ *      the mount (the fixture's CIFS line is a BOOT mount — `nofail`, no
+ *      `noauto`; the guard ignores `noauto` lines by design)
  *   6. a wrong-password remote fails the run with rclone's own error line, the
  *      notification is emitted (the daemon journal carries the PVE::Notify
  *      call), `GET /v1/status` gains a `cloud` warning — and a SUCCESSFUL run
@@ -516,7 +517,12 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
 
       // And the guard: a source on a configured-but-unmounted mount is a 400
       // naming the mount — never a 200 that would have read through the empty
-      // mountpoint and reported "nothing to do".
+      // mountpoint and reported "nothing to do". The fixture line must be a
+      // BOOT mount: the guard ignores a `noauto` line by design (it is not the
+      // boot race), and a `noauto` fixture line turned this 400 into a 200
+      // (0.4.3 bake).
+      const unmountedOpts = (await sshExec(`awk '$2 == "${UNMOUNTED}" { print $4 }' /etc/fstab`)).split(',')
+      expect(unmountedOpts, 'the CIFS fixture line is a boot mount (no noauto)').not.toContain('noauto')
       const refused = await ctx.post(`${V1}/cloud/tasks/preview`, { data: { source: UNMOUNTED, remote: REMOTE } })
       expect(refused.status(), await refused.text()).toBe(400)
       const err = await refused.json()
@@ -576,8 +582,9 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
   test('a source on a configured-but-unmounted mount is refused, naming the mount', async ({ playwright, pveTicket }) => {
     const ctx = await authedContext(playwright, pveTicket)
     try {
-      // The boot-race shape the guard exists for: an fstab CIFS entry that is
-      // not mounted, with an empty mountpoint directory sitting where a share
+      // The boot-race shape the guard exists for: an fstab CIFS entry
+      // configured to mount at boot (`nofail`, no `noauto`) that is not
+      // mounted, with an empty mountpoint directory sitting where a share
       // should be. Reading through it would copy (or, in sync mode, mirror)
       // nothing at all.
       expect(await sshExec(`grep -c ' ${UNMOUNTED} cifs ' /etc/fstab || true`), 'the fstab entry is there').toBe('1')

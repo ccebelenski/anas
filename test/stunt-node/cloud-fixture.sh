@@ -183,7 +183,10 @@ case "$1" in
       $SSH_CMD "cp -a ${RCLONE_CONF} ${RCLONE_BACKUP}"
       echo "✓ ${RCLONE_CONF} backed up to ${RCLONE_BACKUP}"
     else
-      $SSH_CMD "touch ${RCLONE_ABSENT}"
+      # A freshly built node has no /etc/anas at all until the daemon writes
+      # its first store; create it with the mode the daemon itself uses
+      # (rclone-config.ts: 0700) so the sentinel has somewhere to live.
+      $SSH_CMD "mkdir -p -m 0700 $(dirname "${RCLONE_CONF}") && touch ${RCLONE_ABSENT}"
       echo "✓ no existing ${RCLONE_CONF} (sentinel: the pre-state was absent)"
     fi
 

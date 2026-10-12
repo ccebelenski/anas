@@ -48,21 +48,35 @@ source "${SCRIPT_DIR}/config.sh"
 #                       run proves itself against an empty destination.
 #
 #   /mnt/gt-unmounted   an EMPTY MOUNTPOINT DIRECTORY plus an /etc/fstab line
-#                         //192.0.2.9/nope /mnt/gt-unmounted cifs noauto,guest,x-anas-fixture 0 0
-#                       that is NEVER mounted (192.0.2.9 is TEST-NET; `noauto`
-#                       keeps systemd from ever trying). This is the incident
-#                       shape the source guard exists for: configured in fstab,
-#                       absent from the mount table, an empty directory sitting
-#                       where a share should be.
+#                         //192.0.2.9/nope /mnt/gt-unmounted cifs _netdev,nofail,x-systemd.mount-timeout=5s,guest,x-anas-fixture 0 0
+#                       that can NEVER mount (192.0.2.9 is TEST-NET). This is
+#                       the incident shape the source guard exists for: a mount
+#                       the system is configured to have AT BOOT, absent from
+#                       the mount table, an empty directory sitting where a
+#                       share should be.
 #
 #   /mnt/gt-guardok     backup2.11's second half: the same shape, but MOUNTABLE.
-#                         tmpfs /mnt/gt-guardok tmpfs noauto,x-anas-fixture 0 0
+#                         tmpfs /mnt/gt-guardok tmpfs nofail,x-anas-fixture 0 0
 #                       It comes up UNMOUNTED (so the guard refuses a backup
 #                       rooted there), and `mount /mnt/gt-guardok` makes it real
 #                       — which is how the recovery half is proven: mount it,
 #                       drop a file in, Run now, and the backup completes. tmpfs
 #                       rather than a second CIFS share because it needs no
 #                       server, no credentials and no network at all.
+#
+#   Both lines are BOOT mounts — no `noauto`. The guard (since 0.4.0, source
+#   guard item E) ignores a `noauto` line: it is mounted on demand, not at boot,
+#   so it is not the boot race the guard exists for. A fixture line carrying
+#   `noauto` is therefore invisible to the guard and every refusal the specs
+#   assert turns into a pass (the 0.4.3 bake found exactly that; operator
+#   ruling 2026-10-12: the fixture changes, the product rule stands). Boot
+#   mounts on a VM that reboots need two cushions, and both lines carry them:
+#   `nofail`, so a failed mount never holds up local-fs/remote-fs.target, and on
+#   the CIFS line `x-systemd.mount-timeout=5s`, so systemd gives up on TEST-NET
+#   after five seconds instead of the kernel's CIFS connect timeout. A boot
+#   therefore leaves the CIFS unit FAILED (unmounted, as intended) and MOUNTS
+#   the tmpfs — which is why `up` releases a mounted gt-guardok and `down`
+#   resets the failed mount units.
 #
 # `down` reverses all of it — the units the spec may have leaked included (only
 # the fixture's OWN task names, never a foreign anas-cloud unit) — and then
@@ -88,13 +102,16 @@ DST_DIR="/home/${RCLONE_USER}/dst"
 UI_DST_DIR="/home/${RCLONE_USER}/pictures"
 
 UNMOUNTED_DIR="/mnt/gt-unmounted"
-FSTAB_LINE="//192.0.2.9/nope ${UNMOUNTED_DIR} cifs noauto,guest,x-anas-fixture 0 0"
+# A boot mount (no `noauto` — see the header): `nofail` + a 5 s systemd mount
+# timeout so a boot of the VM never waits on TEST-NET.
+FSTAB_LINE="//192.0.2.9/nope ${UNMOUNTED_DIR} cifs _netdev,nofail,x-systemd.mount-timeout=5s,guest,x-anas-fixture 0 0"
 FSTAB_MARK="x-anas-fixture"
 
 # backup2.11 — the MOUNTABLE counterpart. `x-` options are userspace-only, so
-# libmount strips the marker and `mount ${GUARDOK_DIR}` just works.
+# libmount strips the marker and `mount ${GUARDOK_DIR}` just works. A boot
+# mount too, so a boot MOUNTS it; `up` releases it to the unmounted start state.
 GUARDOK_DIR="/mnt/gt-guardok"
-GUARDOK_FSTAB_LINE="tmpfs ${GUARDOK_DIR} tmpfs noauto,x-anas-fixture 0 0"
+GUARDOK_FSTAB_LINE="tmpfs ${GUARDOK_DIR} tmpfs nofail,x-anas-fixture 0 0"
 
 # The task names the specs create — the API spec's first, then the rclone.3 UI
 # spec's. `down` removes exactly these units: a crashed run must not leave a
@@ -230,37 +247,33 @@ case "$1" in
     $SSH_CMD "rm -rf ${UI_DST_DIR}"
     echo "✓ ${UI_DST_DIR} swept"
 
-    # --- the configured-but-unmounted mount --------------------------------
-    # Never mounted: 192.0.2.9 is TEST-NET and `noauto` keeps systemd from
-    # trying. The DIRECTORY exists and is empty — exactly the boot-race shape
-    # the source guard refuses to read through.
-    $SSH_CMD "mkdir -p ${UNMOUNTED_DIR}"
-    if $SSH_CMD "grep -qF '${FSTAB_MARK}' /etc/fstab"; then
-      echo "✓ fstab entry already present"
-    else
-      $SSH_CMD "printf '%s\n' '${FSTAB_LINE}' >> /etc/fstab && systemctl daemon-reload"
-      echo "✓ fstab entry added for ${UNMOUNTED_DIR} (noauto — never mounted)"
+    # --- the two configured-but-unmounted mounts ---------------------------
+    # /mnt/gt-unmounted: never mounted — 192.0.2.9 is TEST-NET. The DIRECTORY
+    # exists and is empty: exactly the boot-race shape the source guard refuses
+    # to read through. /mnt/gt-guardok (backup2.11's recovery half): starts
+    # unmounted; the spec mounts it, proves the run then completes, and `down`
+    # unmounts it again.
+    #
+    # The marked lines are REWRITTEN on every `up`, never kept: a line left by
+    # an older fixture (the `noauto` shape the guard ignores) must not survive
+    # as "already present". The tmpfs is released first — a live mount whose
+    # fstab line is removed is a stray tmpfs nothing names.
+    $SSH_CMD "mkdir -p ${UNMOUNTED_DIR} ${GUARDOK_DIR}"
+    if $SSH_CMD "findmnt -n ${GUARDOK_DIR} >/dev/null 2>&1"; then
+      # A boot (both are boot mounts) or a crashed spec run mounted it; the
+      # guard test's "before" is absent from the mount table.
+      $SSH_CMD "umount ${GUARDOK_DIR}"
+      echo "✓ ${GUARDOK_DIR} mount released (a boot or an earlier run mounted it)"
     fi
+    $SSH_CMD "sed -i '/${FSTAB_MARK}/d' /etc/fstab && printf '%s\n%s\n' '${FSTAB_LINE}' '${GUARDOK_FSTAB_LINE}' >> /etc/fstab && systemctl daemon-reload"
+    echo "✓ fstab entries written for ${UNMOUNTED_DIR} (cifs, TEST-NET) and ${GUARDOK_DIR} (tmpfs) — boot mounts, nofail"
     if $SSH_CMD "findmnt -n ${UNMOUNTED_DIR} >/dev/null 2>&1"; then
       echo "ERROR: ${UNMOUNTED_DIR} is MOUNTED — the guard test needs it unmounted" >&2
       exit 1
     fi
-
-    # --- the configured-but-unmounted mount that CAN be mounted ------------
-    # backup2.11's recovery half. It starts unmounted (`noauto`); the spec
-    # mounts it, proves the run then completes, and `down` unmounts it again.
-    $SSH_CMD "mkdir -p ${GUARDOK_DIR}"
-    if $SSH_CMD "grep -qF ' ${GUARDOK_DIR} ' /etc/fstab"; then
-      echo "✓ fstab entry already present for ${GUARDOK_DIR}"
-    else
-      $SSH_CMD "printf '%s\n' '${GUARDOK_FSTAB_LINE}' >> /etc/fstab && systemctl daemon-reload"
-      echo "✓ fstab entry added for ${GUARDOK_DIR} (tmpfs, noauto — mountable on demand)"
-    fi
-    # A leftover mount from a crashed spec run is not the "before" the guard
-    # test reads: it must start absent from the mount table.
     if $SSH_CMD "findmnt -n ${GUARDOK_DIR} >/dev/null 2>&1"; then
-      $SSH_CMD "umount ${GUARDOK_DIR}"
-      echo "✓ stale ${GUARDOK_DIR} mount released"
+      echo "ERROR: ${GUARDOK_DIR} is MOUNTED after the rewrite — the guard test needs it unmounted" >&2
+      exit 1
     fi
 
     echo
@@ -292,6 +305,16 @@ case "$1" in
       $SSH_CMD "systemctl reset-failed anas-cloud-${t}.service anas-cloud-${t}.timer >/dev/null 2>&1 || true"
     done
 
+    # …and their Persistent= STAMPS. The product deletes a task's stamp with
+    # its units (sched.stamps), but the unit files removed above went by `rm`,
+    # not through the API, so a crashed run's stamps stay behind. The daemon's
+    # start sweep would remove them — inside sched-stamps.spec.ts's planted-
+    # orphan count, which then reads "too many went". Only the fixture's own
+    # names, as for the units.
+    for t in "${TASKS[@]}"; do
+      $SSH_CMD "rm -f /var/lib/systemd/timers/stamp-anas-cloud-${t}.timer"
+    done
+
     # The fstab entries + their mountpoints (rmdir only — a populated directory
     # is not ours to delete). The tmpfs one is released FIRST: the spec mounts
     # it, and an fstab line removed under a live mount leaves a stray tmpfs
@@ -305,6 +328,12 @@ case "$1" in
       $SSH_CMD "sed -i '/${FSTAB_MARK}/d' /etc/fstab && systemctl daemon-reload"
       echo "✓ fstab entries removed"
     fi
+    # Boot mounts leave unit state behind: a boot of the VM with the lines in
+    # place leaves the CIFS unit FAILED. Reset both (quiet — a unit systemd no
+    # longer knows is not an error) so `systemctl --failed` is clean.
+    for d in "${UNMOUNTED_DIR}" "${GUARDOK_DIR}"; do
+      $SSH_CMD "systemctl reset-failed \"\$(systemd-escape -p --suffix=mount ${d})\" >/dev/null 2>&1 || true"
+    done
     for d in "${UNMOUNTED_DIR}" "${GUARDOK_DIR}"; do
       if $SSH_CMD "test -d ${d}"; then
         $SSH_CMD "rmdir ${d} 2>/dev/null || true"

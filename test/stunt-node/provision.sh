@@ -238,6 +238,17 @@ echo -n "  Bridge: "
 $SSH_CMD "ip -br addr show vmbr0"
 echo
 
+# root@pam's e-mail. The ISO installer asks for one; a package install never
+# sets it, and PVE's default `mail-to-root` target then refuses every
+# notification ("no recipients provided for the mail, cannot send it"). The
+# backup/cloud/replication specs assert that a failed run notifies
+# (`notified via target` in anasd's journal), so the node needs a recipient.
+# Local delivery is enough: postfix drops it in /var/mail/root.
+echo "Setting root@pam e-mail (notification recipient)..."
+$SSH_CMD "pveum user modify root@pam --email root@localhost"
+echo "✓ root@pam e-mail set (root@localhost)"
+echo
+
 # Stop VM for bare snapshot
 echo "Stopping VM for bare snapshot..."
 "${SCRIPT_DIR}/stop.sh"

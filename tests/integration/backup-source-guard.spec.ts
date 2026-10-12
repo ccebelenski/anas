@@ -14,8 +14,16 @@ const execFileAsync = promisify(execFile)
  * owns both fstab shapes this story needs:
  *
  *   /mnt/gt-unmounted  a CIFS share on TEST-NET that can NEVER be mounted
- *   /mnt/gt-guardok    a `tmpfs … noauto` line that starts unmounted and CAN be
+ *   /mnt/gt-guardok    a `tmpfs … nofail` line that starts unmounted and CAN be
  *                      mounted — the recovery half
+ *
+ * Both are BOOT mounts (no `noauto`): since 0.4.0 the guard ignores a `noauto`
+ * line — it mounts on demand, not at boot, so it is not the boot race the
+ * guard exists for — and a `noauto` fixture line made every refusal below a
+ * pass (0.4.3 bake; operator ruling 2026-10-12: the fixture changed, the
+ * product rule stands). `nofail` (+ a 5 s mount timeout on the CIFS line)
+ * keeps a reboot of the VM from waiting on them; the fixture's `up` releases
+ * the tmpfs a boot mounts.
  *
  * and a real PBS on the second VM (repo `pbsgt`, datastore `gtstore`), so a run
  * that gets past the guard really does write a snapshot.
@@ -345,6 +353,11 @@ test.describe('Backup source guard (backup2.11)', () => {
     try {
       // The fixture's starting state, read from the node itself.
       expect(await sshExec(`grep -c ' ${GUARDOK} ' /etc/fstab || true`), 'the tmpfs fstab line is there').toBe('1')
+      // …as a BOOT mount: a `noauto` line is invisible to the guard by design,
+      // and this whole spec would then prove nothing.
+      const guardokOpts = (await sshExec(`awk '$2 == "${GUARDOK}" { print $4 }' /etc/fstab`)).split(',')
+      expect(guardokOpts, 'the tmpfs line is a boot mount (no noauto)').not.toContain('noauto')
+      expect(guardokOpts, 'the tmpfs line is nofail').toContain('nofail')
       expect(await sshExec(`findmnt -n ${GUARDOK} >/dev/null 2>&1 && echo mounted || echo unmounted`)).toBe('unmounted')
 
       const unmounted = await previewUnmounted(ctx, GUARDOK_SRC)

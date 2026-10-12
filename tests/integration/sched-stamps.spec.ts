@@ -57,7 +57,12 @@ const REPO = 'pbsgt'
 const REMOTE = 'gt'
 const RCLONE_USER = 'rclonegt'
 const RCLONE_PASS = 'gtpass'
-/** A source that exists — the task must be creatable; the RUN is what fails. */
+/**
+ * A source that exists — the task must be creatable; the RUN is what fails,
+ * refused by the source guard. That needs the fixture's CIFS line to be a BOOT
+ * mount (`nofail`, no `noauto`): the guard ignores `noauto` lines by design, and
+ * against one the run read the empty directory and COMPLETED (0.4.3 bake).
+ */
 const CLOUD_SRC = '/mnt/gt-unmounted'
 
 /** The task names this spec owns. Deleted in afterAll whatever happens. */

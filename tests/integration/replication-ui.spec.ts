@@ -67,13 +67,27 @@ async function openDatasets(page: Page): Promise<void> {
  * Pick a value in an ExtJS readonly combobox by its display label — click the
  * field to drop its boundlist, then click the matching item. An exact-match
  * regex avoids selecting a label that is a prefix of another.
+ *
+ * RETRIED, because the source-dataset combo is loaded asynchronously from the
+ * source pool. Both dialogs open on the FIRST pool of the inventory, so on a
+ * node with any pool that sorts before `testpool` (gtbackup, datapool, …)
+ * picking testpool reloads the dataset list (GET /pools/testpool/datasets).
+ * Opened inside that window, the dropdown shows the PREVIOUS pool's options and
+ * then COLLAPSES when the new list lands (measured on the stunt node,
+ * 2026-10-12: open at +10 ms with ["(pool root)"], closed by +270 ms; a second
+ * click shows ["(pool root)", "share1"]). A single click-then-wait therefore
+ * waited for an item in a dropdown that was no longer open, for the whole test
+ * timeout — the 0.4.3 bake's four failures. Re-open until the item is offered.
  */
 async function pickCombo(page: Page, field: Locator, label: string): Promise<void> {
-  await field.click()
-  await page
+  const item = page
     .locator('.x-boundlist:visible .x-boundlist-item', { hasText: new RegExp(`^${label}$`) })
     .first()
-    .click()
+  await expect(async () => {
+    if (await page.locator('.x-boundlist:visible').count() === 0)
+      await field.click()
+    await item.click({ timeout: 2_000 })
+  }).toPass({ timeout: 30_000, intervals: [250, 500, 1_000] })
 }
 
 /**
@@ -82,17 +96,17 @@ async function pickCombo(page: Page, field: Locator, label: string): Promise<voi
  * matching boundlist item; if it isn't offered, type the value into the input.
  */
 async function setPool(page: Page, field: Locator, value: string): Promise<void> {
-  await field.click()
-  const item = page
-    .locator('.x-boundlist:visible .x-boundlist-item', { hasText: new RegExp(`^${value}$`) })
-    .first()
-  if (await item.count().then(n => n > 0).catch(() => false)) {
-    await item.click().catch(async () => {
-      await field.locator('input').fill(value)
-    })
-    return
-  }
-  await field.locator('input').fill(value)
+  const input = field.locator('input')
+  // The pick-list is read-only (ExtJS renders `readonly` on the input); the
+  // free-text fallback is editable. Retried like pickCombo, and checked by the
+  // value it leaves behind rather than by the click.
+  await expect(async () => {
+    if (await input.getAttribute('readonly') === null)
+      await input.fill(value)
+    else
+      await pickCombo(page, field, value)
+    expect(await input.inputValue()).toBe(value)
+  }).toPass({ timeout: 30_000, intervals: [250, 500, 1_000] })
 }
 
 test.describe('ANAS replication view — grid, toolbar, once dialog (stunt node)', () => {
@@ -189,7 +203,10 @@ test.describe('ANAS Replicate Once runs a send | recv job (stunt node)', () => {
     await pickCombo(page, win.locator('.anas-fld-repl-src-pool'), POOL)
     await pickCombo(page, win.locator('.anas-fld-repl-src-dataset'), 'share1')
 
-    // Retarget the destination dataset (target pool defaults to the source pool).
+    // Retarget the destination. The target pool does NOT follow the source:
+    // it defaults to the inventory's first pool (gtbackup on the stunt node),
+    // and the poll below looks for the dataset on testpool — so pick it.
+    await pickCombo(page, win.locator('.anas-fld-repl-pool'), POOL)
     const dsField = win.locator('.anas-fld-repl-dataset input')
     await dsField.fill(TARGET_DS)
 
@@ -197,6 +214,10 @@ test.describe('ANAS Replicate Once runs a send | recv job (stunt node)', () => {
     // target is a clean full send — still runnable).
     const plan = win.locator('.anas-repl-plan')
     await expect(plan).toHaveText(/Incremental|FULL send|plan unavailable/, { timeout: 30_000 })
+
+    // What is about to be sent is what the poll below looks for.
+    await expect(win.locator('.anas-fld-repl-pool input')).toHaveValue(POOL)
+    await expect(dsField).toHaveValue(TARGET_DS)
 
     const submit = win.locator('.anas-btn-replicate-submit')
     await expect(submit).toBeEnabled({ timeout: 20_000 })
@@ -460,12 +481,24 @@ test.describe('ANAS self-remote replication E2E (stunt node)', () => {
 
     // Point the target at the registered remote; the target-pool combo then
     // repopulates from the remote's pools (or free-texts if it can't list).
+    // That repopulation is ASYNCHRONOUS and ends by selecting the remote's
+    // FIRST pool — so a pool picked from the stale local list before it lands
+    // is silently replaced (gtbackup on the stunt node: the job then wrote
+    // gtbackup/replremote and the poll below for testpool/replremote timed out,
+    // 2026-10-12). Wait for the remote's pool list before choosing.
+    const remotePools = page.waitForResponse(r =>
+      r.url().includes(`/replication/remotes/${REMOTE}/pools`) && r.request().method() === 'GET')
     await pickCombo(page, once.locator('.anas-fld-repl-location'), `remote: ${REMOTE}`)
+    await remotePools
     await setPool(page, once.locator('.anas-fld-repl-pool'), POOL)
     await once.locator('.anas-fld-repl-dataset input').fill(TARGET_DS)
 
     const plan = once.locator('.anas-repl-plan')
     await expect(plan).toHaveText(/Incremental|FULL send|plan unavailable/, { timeout: 40_000 })
+
+    // What is about to be sent is what the poll below looks for.
+    await expect(once.locator('.anas-fld-repl-pool input')).toHaveValue(POOL)
+    await expect(once.locator('.anas-fld-repl-dataset input')).toHaveValue(TARGET_DS)
 
     const submit = once.locator('.anas-btn-replicate-submit')
     await expect(submit).toBeEnabled({ timeout: 20_000 })
