@@ -657,10 +657,14 @@
         var skipped = (grant.skipped && grant.skipped.length)
             ? ' ' + t('Not granted (no such user or group)') + ': ' + grant.skipped.join(', ') + '.'
             : '';
+        // A guest share that lists valid users admits no guest (Samba checks
+        // the list against the guest account too), so Everyone was not
+        // granted — the daemon's own sentence rides on every outcome.
+        var guestNote = grant.guestNote ? ' ' + grant.guestNote : '';
         if (grant.status === 'refused' || grant.status === 'failed') {
             try {
                 Ext.Msg.alert(t('Share saved; access not granted'),
-                    enc((grant.message || t('The grant did not run.')) + skipped));
+                    enc((grant.message || t('The grant did not run.')) + skipped + guestNote));
             } catch (e) {
                 ANAS.warn('grant: ' + (grant.message || ''));
             }
@@ -670,8 +674,8 @@
             var children = (grant.childAclEnabled && grant.childAclEnabled.length)
                 ? ' ' + t('POSIX ACLs switched on for child datasets') + ': ' + grant.childAclEnabled.join(', ') + '.'
                 : '';
-            if (skipped || children) {
-                ANAS.toast(enc((skipped + children).replace(/^ /, '')));
+            if (skipped || children || guestNote) {
+                ANAS.toast(enc((skipped + children + guestNote).replace(/^ /, '')));
             }
         }
     }

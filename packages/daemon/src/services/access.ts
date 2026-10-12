@@ -1022,6 +1022,19 @@ export function createAccessService(opts: AccessServiceOptions) {
   }
 
   /**
+   * The disclosure sentence for a share that asks for guest access but lists
+   * valid users: Samba checks the guest account against `valid users` too and
+   * admits no guest on such a share (proven on the test node: every anonymous
+   * connection refused at tree connect), so the grant did not raise Everyone.
+   * Rides on EVERY outcome of that grant — applied, nothing, refused, failed —
+   * so the user is told whoever the gate was that spoke.
+   */
+  const GUEST_NOTE = 'Guest access was not granted on the folder: the share lists valid users, so no guest can connect to it.'
+  function guestNoteFor(share: GrantShare): { guestNote?: string } {
+    return share.guestOk && share.validUsers.length > 0 ? { guestNote: GUEST_NOTE } : {}
+  }
+
+  /**
    * Everything the share-path grant decides before it writes anything: resolve
    * the path, ask the SAME gates the editor's PUT asks, compose the pre-filled
    * request and plan it. Either a finished outcome (refused with the gate's
@@ -1037,14 +1050,22 @@ export function createAccessService(opts: AccessServiceOptions) {
   ): Promise<{ done: ShareAccessGrantResult } | { plan: SetAccessPlan, granted: AccessEntry[], skipped: string[] }> {
     const level: AccessLevel = share.readOnly ? 'read' : 'read-write'
     const { principals, skipped: unparsed } = sharePrincipals(share.validUsers)
+    // Operator ruling 2026-10-11: Samba admits NO guest on a share whose
+    // `valid users` list is non-empty (it checks the guest account against
+    // the list too), so there the Everyone grant serves no guest and only
+    // opens the folder to every local account. Guest access counts only when
+    // the RAW list is empty — a `%` macro or an unresolvable name is still an
+    // entry Samba checks — so this is judged before `sharePrincipals` parses.
+    const guest = share.guestOk && share.validUsers.length === 0
+    const guestNote = guestNoteFor(share)
     const outcome = (status: ShareAccessGrantResult['status'], extra: Partial<ShareAccessGrantResult> = {}): { done: ShareAccessGrantResult } =>
-      ({ done: { status, path, granted: [], skipped: unparsed, applyToExisting, ...extra } })
+      ({ done: { status, path, granted: [], skipped: unparsed, applyToExisting, ...extra, ...guestNote } })
     try {
       const target = await resolveShareTarget(path)
       const refused = await guardPathTarget(target, { applyToExisting })
       if (refused)
         return outcome('refused', { message: refused.body.error.message })
-      const composed = await composeGrant(target, principals, share.guestOk, level, applyToExisting)
+      const composed = await composeGrant(target, principals, guest, level, applyToExisting)
       if (!composed.ok)
         return outcome('refused', { message: composed.message })
       const skipped = [...unparsed, ...composed.skipped]
@@ -1083,8 +1104,9 @@ export function createAccessService(opts: AccessServiceOptions) {
     if ('done' in prepared)
       return prepared.done
     const { plan, granted, skipped } = prepared
+    const guestNote = guestNoteFor(share)
     const outcome = (status: ShareAccessGrantResult['status'], extra: Partial<ShareAccessGrantResult> = {}): ShareAccessGrantResult =>
-      ({ status, path, granted: [], skipped, applyToExisting, ...extra })
+      ({ status, path, granted: [], skipped, applyToExisting, ...extra, ...guestNote })
     if (plan.recursive && !opts.recursiveConfirmed)
       return outcome('refused', { message: `Applying to existing files under '${path}' was not confirmed: when the request was checked, the grant would not have run. Nothing was granted; use Permissions on the share to apply it` })
     try {

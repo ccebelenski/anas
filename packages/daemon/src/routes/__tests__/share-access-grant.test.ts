@@ -196,6 +196,35 @@ describe('access.1 — the share-path grant', () => {
     assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
   })
 
+  // Operator ruling 2026-10-11: Samba admits NO guest on a share whose
+  // `valid users` list is non-empty (the list is checked against the guest
+  // account too), so there Everyone is not granted and the result says so.
+  const GUEST_NOTE = 'Guest access was not granted on the folder: the share lists valid users, so no guest can connect to it.'
+
+  it('share create with guest access AND a valid users list: Everyone is not granted, the named user is, and the note says why', async () => {
+    const { calls } = start()
+    const job = await create({ name: 'pub', path: MP, guestOk: true, validUsers: ['alice'], grantAccess: {} })
+    const grant = grantOf(job)!
+    assert.equal(grant.status, 'applied', grant.message)
+    // The spec is the plain named grant: alice at rwx, and `o::` stays at the
+    // level the folder had (755 → r-x) — compare the guest-only test, where
+    // Everyone goes to rwx via chmod 757.
+    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::r-x,u:alice:rwx,m::rwx', MP])
+    assert.equal(find(calls, '/usr/bin/chmod', a => a[0] === '757'), undefined, 'Everyone was not raised (no 757 chmod)')
+    assert.deepEqual(grant.granted, [{ kind: 'user', name: 'alice', level: 'read-write' }])
+    assert.equal(grant.guestNote, GUEST_NOTE)
+  })
+
+  it('share create with guest access and NO valid users still grants Everyone and carries no note (pin)', async () => {
+    const { calls } = start()
+    const job = await create({ name: 'pub', path: MP, guestOk: true, validUsers: [], grantAccess: {} })
+    const grant = grantOf(job)!
+    assert.equal(grant.status, 'applied')
+    assert.deepEqual(grant.granted, [{ kind: 'everyone', level: 'read-write' }])
+    assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['757', MP])
+    assert.equal(grant.guestNote, undefined)
+  })
+
   it('share grant keeps existing named entries and never lowers one (alice stays rwx on a read-only share)', async () => {
     const { calls } = start([{ command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') }])
     const job = await create({ name: 'media', path: MP, readOnly: true, validUsers: ['alice', 'media'], grantAccess: {} })
@@ -289,6 +318,16 @@ describe('access.1 — the share-path grant', () => {
     assert.equal(grant.status, 'refused')
     assert.match(grant.message!, /PVE storage 'ahrstore'/)
     assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
+  })
+
+  it('a refused grant on a guest share with valid users still carries the note (the disclosure rides every outcome)', async () => {
+    start([], BASE_CONF, 'dir: ahrstore\n\tpath /mnt/anas-ahr/ahr0\n\tcontent backup\n')
+    const job = await create({ name: 'bk', path: '/mnt/anas-ahr/ahr0', guestOk: true, validUsers: ['media'], grantAccess: {} })
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const grant = grantOf(job)!
+    assert.equal(grant.status, 'refused')
+    assert.match(grant.message!, /PVE storage 'ahrstore'/)
+    assert.equal(grant.guestNote, GUEST_NOTE)
   })
 
   it('share grant on an AHR pool that holds an iSCSI LUN image is applied (ruling 2026-10-11: no held-by-LUN refusal)', async () => {
@@ -411,6 +450,18 @@ describe('access.1 — the share-path grant', () => {
 
   // --- edit: grant on change, nothing revoked ---------------------------------------
   const MEDIA_SHARE = `${BASE_CONF}\n[media]\n\tpath = ${MP}\n\tread only = no\n\tguest ok = no\n\tvalid users = alice media\n`
+  const GUEST_SHARE = `${BASE_CONF}\n[pub]\n\tpath = ${MP}\n\tread only = no\n\tguest ok = yes\n`
+
+  it('share edit that adds the first valid user to a guest share runs the grant without raising Everyone, and carries the note (ruling 2026-10-11)', async () => {
+    const { calls } = start([], GUEST_SHARE)
+    const job = await update('pub', { validUsers: ['alice'], grantAccess: {} })
+    const grant = grantOf(job)!
+    // The grant RUNS (the principal set changed) — but as a plain named grant.
+    assert.equal(grant.status, 'applied', grant.message)
+    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::r-x,u:alice:rwx,m::rwx', MP])
+    assert.ok(!grant.granted.some(e => e.kind === 'everyone'), JSON.stringify(grant.granted))
+    assert.equal(grant.guestNote, GUEST_NOTE)
+  })
 
   it('share edit that changes no principal runs no grant ("nothing")', async () => {
     const { calls } = start([], MEDIA_SHARE)

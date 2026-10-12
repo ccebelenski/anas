@@ -15019,6 +15019,9 @@ async function smbGrantChecks() {
   toasts.length = 0
   jobs[0].onComplete({ result: { updated: 'media', grant: { status: 'applied', path: '/tank/media', granted: [], skipped: [], applyToExisting: true, childAclEnabled: ['tank/media/kids'] } } })
   ok('smb-grant: a recursive grant that switched ACLs on for a child dataset toasts its name (ruling 2026-10-11)', alerts.length === 0 && toasts.some(m => /POSIX ACLs switched on for child datasets: tank\/media\/kids/.test(m)), JSON.stringify(toasts))
+  toasts.length = 0
+  jobs[0].onComplete({ result: { updated: 'media', grant: { status: 'applied', path: '/tank/media', granted: [{ kind: 'user', name: 'alice', level: 'read-write' }], skipped: [], applyToExisting: false, guestNote: 'Guest access was not granted on the folder: the share lists valid users, so no guest can connect to it.' } } })
+  ok('smb-grant: a grant result with a guest note toasts the sentence (ruling 2026-10-11: Samba admits no guest on a share listing valid users)', alerts.length === 0 && toasts.some(m => /Guest access was not granted on the folder: the share lists valid users, so no guest can connect to it\./.test(m)), JSON.stringify(toasts))
 
   // --- the share row's Permissions button opens the SAME dialog on the share path ----
   created.windows.length = 0

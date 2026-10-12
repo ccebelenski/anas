@@ -111,6 +111,8 @@ export const ShareAccessGrantResult = z.object({
    * Present when the walk was checked for them (empty = none needed it).
    */
   childAclEnabled: z.array(z.string()).optional(),
+  /** Present when the share has guest access and a valid-users list: Samba admits no guest on such a share, so Everyone was not granted. */
+  guestNote: z.string().optional(),
 })
 export type ShareAccessGrantResult = z.infer<typeof ShareAccessGrantResult>
 
