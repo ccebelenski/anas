@@ -269,7 +269,11 @@ OUT_DIR="${REPO_ROOT}/dist-release"
 mkdir -p "${OUT_DIR}"
 TARBALL="${OUT_DIR}/${RELEASE_NAME}.tar.gz"
 rm -f "${TARBALL}"
-tar czf "${TARBALL}" -C "${STAGING}" "${RELEASE_NAME}"
+# --owner/--group/--numeric-owner: without them every entry carries the build
+# host user's uid/gid, and install.sh's `cp -a` would preserve them onto the
+# node — code root executes, owned by a regular account. The staged tree may
+# stay owned by the build user; only the tarball is rewritten.
+tar czf "${TARBALL}" --owner=0 --group=0 --numeric-owner -C "${STAGING}" "${RELEASE_NAME}"
 
 TAR_SIZE="$(du -h "${TARBALL}" | awk '{print $1}')"
 log "Release tarball: ${TARBALL} (${TAR_SIZE})"

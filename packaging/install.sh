@@ -855,6 +855,11 @@ phase1_install() {
   info "copying application files"
   mkdir -p "$(dirname "${PREFIX}")"
   cp -a "${APP_SRC}" "${PREFIX}"
+  # The tarball and this copy preserve the build host's uid/gid; everything
+  # under the prefix is read or executed by root (services, the apt hook) and
+  # must be root's. On an upgrade this also repairs an older install. Modes
+  # are untouched — only ownership.
+  chown -R root:root "${PREFIX}"
   PREFIX_INSTALLED=1
   # app/VERSION ships in the tarball since 10.10 and rides along in the copy;
   # fall back to the release-root copy so older tarball layouts still stamp it.
