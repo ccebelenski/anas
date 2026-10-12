@@ -51,7 +51,9 @@ test.describe('ANAS native panels (stunt node)', () => {
     // anas-grid-pools' on one element), so match the grid directly.
     const grid = page.locator('.anas-grid-pools')
     await expect(grid).toBeVisible({ timeout: 45_000 })
-    await expect(grid.getByText('testpool')).toBeVisible({ timeout: 45_000 })
+    // The name cell exactly — a bare getByText('testpool') also matches the
+    // Mountpoint cell ('/testpool') and fails strict mode.
+    await expect(grid.getByRole('gridcell', { name: 'testpool', exact: true })).toBeVisible({ timeout: 45_000 })
 
     // Native, not embedded: the retired iframe approach must be gone entirely.
     await expect(page.locator('.anas-view-pools iframe')).toHaveCount(0)
@@ -65,8 +67,10 @@ test.describe('ANAS native panels (stunt node)', () => {
     await expect(grid).toBeVisible({ timeout: 45_000 })
 
     // Select the testpool row (click the grid row, not the inner text span —
-    // ExtJS row selection binds to the row element).
-    await grid.locator('.x-grid-row', { hasText: 'testpool' }).click()
+    // ExtJS row selection binds to the row element). Keyed on the exact name
+    // cell: a substring match would also take any row whose text merely
+    // contains 'testpool' (another pool's name or mountpoint).
+    await grid.locator('.x-grid-row', { has: page.getByRole('gridcell', { name: 'testpool', exact: true }) }).click()
     const scrubBtn = page.locator('.anas-btn-scrub')
     await expect(scrubBtn).toBeVisible({ timeout: 20_000 })
     await expect(scrubBtn).toBeEnabled()
@@ -96,7 +100,10 @@ test.describe('ANAS native panels (stunt node)', () => {
 
     const view = page.locator('.anas-view-dashboard')
     await expect(view).toBeVisible({ timeout: 45_000 })
-    await expect(view.getByText('testpool')).toBeVisible({ timeout: 45_000 })
+    // The pool block's name span exactly (50-dashboard.js renders
+    // '.anas-dash-pool-name > span' per pool) — a bare getByText would also
+    // take any other dashboard text that contains 'testpool'.
+    await expect(view.locator('.anas-dash-pool-name > span', { hasText: /^testpool$/ })).toBeVisible({ timeout: 45_000 })
   })
 
   test('Disks lists disks and opens a SMART window', async ({ page }) => {

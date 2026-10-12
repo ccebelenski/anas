@@ -5,9 +5,12 @@ import { poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
 /**
  * Stories 3.25 / 3.26 — ANAS recognizes pools PVE already manages (read from
  * /etc/pve/storage.cfg → PoolSummary.pveStorages) and treats them as PVE's
- * territory: distinctly badged and hands-off, while ANAS-managed pools stay
- * fully manageable. Two-case bed on the stunt node: `datapool` (a PVE `zfspool`
- * storage) vs `testpool` (ANAS-managed).
+ * territory: distinctly badged, the pool's structure hands-off, while
+ * ANAS-managed pools stay fully manageable. Since pvepool.1/.2 ownership is
+ * per dataset: the storage root itself stays view-only but may take ANAS
+ * children (Create stays live on it). Two-case bed on the stunt node:
+ * `datapool` (a PVE `zfspool` storage on the pool root) vs `testpool`
+ * (ANAS-managed).
  *
  * Skip-guarded on both pools existing so the file no-ops on a box without the
  * PVE storage set up (`pvesm add zfspool datapool --pool datapool`).
@@ -56,21 +59,27 @@ test.describe('ANAS PVE-managed pools (stunt node)', () => {
     const grid = page.locator('.anas-grid-datasets')
     await expect(grid).toBeVisible({ timeout: 45_000 })
 
-    // datapool's row is PVE-banded and carries the PVE badge whose tooltip
-    // explains the hands-off rule. (Operator ruling 2026-08-19: the row-icon
-    // Actions column is gone — the badge tooltip is now the only home of that
-    // explanation, and the toolbar does the gating.)
+    // datapool's row is PVE-banded and carries the PVE badge whose tooltip is
+    // the ownership reason (shared pve-footprint.ts: the pool root is a
+    // storage root). (Operator ruling 2026-08-19: the row-icon Actions column
+    // is gone — the badge tooltip is now the only home of that explanation,
+    // and the toolbar does the gating.)
     const pveRow = grid.locator('.anas-ds-pve-row', { hasText: 'datapool' }).first()
     await expect(pveRow).toBeVisible({ timeout: 20_000 })
     const badge = pveRow.locator('.anas-ds-pve-badge').first()
     await expect(badge).toBeVisible({ timeout: 20_000 })
-    await expect(badge).toHaveAttribute('title', /hands-off/i)
+    await expect(badge).toHaveAttribute('title', 'PVE storage \'datapool\' owns datapool as a storage root')
 
-    // Selecting it gates the structural toolbar actions; read-only Detail stays.
+    // Selecting it gates the structural toolbar actions (Destroy, Edit,
+    // Permissions); read-only Detail stays. Create stays live: a storage root
+    // takes ANAS children outside PVE's guest-volume namespace (pvepool.2,
+    // createChildAllowed — the daemon answers childrenManageable true).
     await pveRow.click()
-    await expect(page.locator('.anas-btn-ds-create')).toHaveClass(DISABLED, { timeout: 20_000 })
-    await expect(page.locator('.anas-btn-ds-destroy')).toHaveClass(DISABLED)
+    await expect(page.locator('.anas-btn-ds-destroy')).toHaveClass(DISABLED, { timeout: 20_000 })
+    await expect(page.locator('.anas-btn-ds-edit')).toHaveClass(DISABLED)
+    await expect(page.locator('.anas-btn-ds-perms')).toHaveClass(DISABLED)
     await expect(page.locator('.anas-btn-ds-detail')).not.toHaveClass(DISABLED)
+    await expect(page.locator('.anas-btn-ds-create')).not.toHaveClass(DISABLED)
 
     // testpool (ANAS-managed) is never PVE-banded — the marker is specific.
     await expect(grid.locator('.anas-ds-pve-row', { hasText: 'testpool' })).toHaveCount(0)

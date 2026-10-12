@@ -28,7 +28,9 @@ import {
  *   without x-anas-confirm → 409 { error.code: 'CONFIRMATION_REQUIRED' } plus an
  *   `x-anas-confirm-code` response header; resend with `x-anas-confirm: <code>`
  *   → 202; a wrong code → 409 again. The boot/root pool is a Level-1 block:
- *   409 { error.code: 'PROTECTED_RESOURCE' } with NO code header (no override).
+ *   409 with NO code header (no override) — PROTECTED_RESOURCE for a ZFS `/`
+ *   or a well-known root name, CONFLICT reason 'system-pool' for a pool that
+ *   only carries bootfs (pvepool.1).
  *
  * These run against the REAL stunt node. Guarded on poolExists('testpool') so
  * the whole file skips cleanly when the box isn't set up (poolExists also
@@ -118,19 +120,34 @@ test.describe('Pool safety confirmation — challenge (no mutation)', () => {
     }
   })
 
-  test('destroying the boot/root pool → 409 PROTECTED_RESOURCE with NO code header', async ({ playwright, pveTicket }) => {
-    const rootPool = await getRootPool()
-    test.skip(!rootPool, 'system root is not on ZFS — no protected pool to exercise')
+  test('destroying the boot/root pool → 409 Level-1 refusal with NO code header', async ({ playwright, pveTicket }) => {
+    const root = await getRootPool()
+    test.skip(!root, 'no pool holds this node\'s root or carries bootfs — no protected pool to exercise')
+    const { pool: rootPool, via } = root!
 
     const ctx = await authedContext(playwright, pveTicket)
     try {
       const res = await ctx.delete(`${V1}/pools/${rootPool}`)
       expect(res.status()).toBe(409)
       const body = await res.json()
-      expect(body.error.code).toBe('PROTECTED_RESOURCE')
-      // Level-1 block: there is no override path, so no confirm code is offered.
+      // Two Level-1 doors, and the fixture state says which one answers.
+      // `/` on ZFS, or a well-known root name: the daemon's isRootPool
+      // (safety/root-pool.ts) refuses first with PROTECTED_RESOURCE. A pool
+      // that only carries bootfs (the stunt node's sysfix) is not a root pool
+      // by name or /proc/mounts, so the system-pool guard (pvepool.1) refuses
+      // it with CONFLICT, reason 'system-pool'.
+      if (via === 'mount' || rootPool === 'rpool' || rootPool === 'bpool') {
+        expect(body.error.code).toBe('PROTECTED_RESOURCE')
+      }
+      else {
+        expect(body.error.code).toBe('CONFLICT')
+        expect(body.error.reason).toBe('system-pool')
+        expect(body.error.message).toContain('holds this node\'s boot filesystem')
+      }
+      // Level-1 block: there is no override path, so no confirm code is
+      // offered on either door (both answer before the confirm gate).
       expect(res.headers()['x-anas-confirm-code']).toBeUndefined()
-      expect(await poolExists(rootPool!)).toBe(true)
+      expect(await poolExists(rootPool)).toBe(true)
     }
     finally {
       await ctx.dispose()

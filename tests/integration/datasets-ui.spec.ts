@@ -29,6 +29,11 @@ test.beforeEach(async () => {
   skipIfFixtureMissing(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 })
 
+// Wide viewport: the Datasets toolbar overflows at the default 1280px and the
+// tail buttons (destroy among them) collapse into ExtJS's overflow menu, where
+// they are aria-hidden and unclickable by the specs.
+test.use({ viewport: { width: 2560, height: 1080 } })
+
 test.describe('ANAS Datasets panel (stunt node)', () => {
   test.setTimeout(120_000)
 
@@ -126,8 +131,18 @@ test.describe.serial('ANAS dataset create via UI (throwaway dataset)', () => {
     const win = page.locator('.anas-win-dataset-create')
     await expect(win).toBeVisible({ timeout: 20_000 })
 
-    // The path field (the pool is a separate readonly combobox, pre-selected).
-    // Fill it with the throwaway leaf name; the window carries the pool context.
+    // The pool combo (itemId 'pool', editable:false, no CSS hook) defaults to the
+    // first pool in the tree, or the selected row's pool — on a node with the
+    // pvepool fixture that is pvfix, not testpool. Pick testpool explicitly.
+    // Located by its accessible name: ExtJS labels the input "Pool:".
+    const poolCombo = win.getByRole('combobox', { name: /^Pool:?$/ })
+    await poolCombo.click()
+    await page
+      .locator('.x-boundlist:visible .x-boundlist-item', { hasText: /^testpool$/ })
+      .click()
+    await expect(poolCombo).toHaveValue('testpool')
+
+    // The path field. Fill it with the throwaway leaf name; the window carries the pool context.
     const nameField = win.locator('.anas-fld-ds-path input[type="text"]')
     await expect(nameField).toBeVisible({ timeout: 20_000 })
     await nameField.fill('itestui')

@@ -75,6 +75,13 @@ test.describe('ANAS Pool Composer (stunt node)', () => {
     const createBtn = page.locator('.anas-btn-composer-create')
     await expect(createBtn).toHaveClass(DISABLED)
 
+    // The composer also requires a valid pool name (letter first; validate() in
+    // 38-pool-composer.js). Fill one now so every "still disabled" step below
+    // is the vdev rule's doing, not the empty name's. Nothing is created here
+    // (cancel below), so there is nothing to clean up.
+    await win.locator('.anas-fld-composer-poolname').fill(`anascomp-gate-${Date.now()}`)
+    await expect(createBtn).toHaveClass(DISABLED)
+
     // Add a data vdev (defaults to a mirror) → an empty bay appears; still invalid.
     await win.locator('.anas-btn-composer-addvdev').click()
     await expect(win.locator('.anas-composer-bay')).toHaveCount(1, { timeout: 20_000 })

@@ -30,6 +30,9 @@ const DS_FQ = 'testpool/share1'
 // Snapshots pre-staged for the display tests. Cleaned in afterEach.
 const SNAP_NAMES = ['uisnap1', 'uisnap2']
 
+// Wide viewport: the Snapshots toolbar overflows at 1280px and clicks in ExtJS's aria-hidden overflow menu fail.
+test.use({ viewport: { width: 2560, height: 1080 } })
+
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off) — poolExists swallows SSH failures and returns false.
 test.beforeEach(async () => {
@@ -174,7 +177,12 @@ test.describe('ANAS snapshot overflow node (many snapshots)', () => {
     // The overflow row is the single path to the full popup (the standalone
     // "Snapshots" button was removed as redundant — snapshots already render
     // inline with the same columns/formatters as the popup).
-    await page.locator('.anas-grid-datasets .anas-snap-more').click()
+    // Scroll it into the tree's visible area first: at 2560x1080 the expanded
+    // share1 rows can push it under PVE's bottom task panel, where a click at
+    // the row's centre lands on the task log instead (no itemclick fires).
+    const more = page.locator('.anas-grid-datasets .anas-snap-more')
+    await more.scrollIntoViewIfNeeded()
+    await more.click()
 
     const win = page.locator('.anas-win-snapshots')
     await expect(win).toBeVisible({ timeout: 30_000 })

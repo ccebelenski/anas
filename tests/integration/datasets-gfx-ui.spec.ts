@@ -67,15 +67,22 @@ test.describe('ANAS Datasets enriched tree — Epic 15.4 gfx retrofit', () => {
     await expect(grid.locator('.anas-ds-pool-row .anas-gfx-obj-pool').first()).toBeVisible()
   })
 
-  test('the pool-space donut hero appears above the tree', async ({ page }) => {
-    await loginToPve(page)
-    await openAnasItem(page, 'Datasets')
+  // The full hero needs a tall panel: under 600px of panel body it starts
+  // collapsed (dshero.1), so this assertion runs at 2560x1080 as in
+  // datasets-hero.spec.ts.
+  test.describe('full hero', () => {
+    test.use({ viewport: { width: 2560, height: 1080 } })
 
-    await expect(page.locator('.anas-grid-datasets')).toBeVisible({ timeout: 45_000 })
+    test('the pool-space donut hero appears above the tree', async ({ page }) => {
+      await loginToPve(page)
+      await openAnasItem(page, 'Datasets')
 
-    const hero = page.locator('.anas-ds-hero')
-    await expect(hero).toBeVisible({ timeout: 45_000 })
-    await expect(hero.locator('.anas-gfx-donut')).toBeVisible()
-    await expect(hero.locator('.anas-gfx-legend')).toBeVisible()
+      await expect(page.locator('.anas-grid-datasets')).toBeVisible({ timeout: 45_000 })
+
+      const hero = page.locator('.anas-ds-hero')
+      await expect(hero).toBeVisible({ timeout: 45_000 })
+      await expect(hero.locator('.anas-gfx-donut')).toBeVisible()
+      await expect(hero.locator('.anas-gfx-legend')).toBeVisible()
+    })
   })
 })

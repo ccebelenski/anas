@@ -513,29 +513,32 @@ export async function destroyPool(name: string): Promise<void> {
 }
 
 /**
- * Return the name of the pool holding the boot/root filesystem, or null when the
- * system root is not on ZFS (e.g. an ext4/LVM install). The PROTECTED_RESOURCE
- * destroy test skips when this is null — there is no protected pool to exercise.
+ * The pool holding this node's boot/root filesystem and HOW the fixture found
+ * it, or null when neither probe names a ZFS pool (e.g. an ext4/LVM install
+ * with no pool carrying bootfs).
+ *
+ *   via 'mount'  — `/` is a ZFS dataset (findmnt); the daemon's isRootPool
+ *                  (safety/root-pool.ts, /proc/mounts) refuses it as
+ *                  PROTECTED_RESOURCE.
+ *   via 'bootfs' — `/` is not on ZFS but a pool carries bootfs (on the stunt
+ *                  node: pvepool-fixture.sh's sysfix); isRootPool does not
+ *                  know it unless it is named rpool/bpool, and the
+ *                  system-pool guard (pvepool.1) refuses it as CONFLICT
+ *                  reason 'system-pool'.
+ *
+ * Fails loud (ruling (c)): an ssh failure throws instead of reading as "no
+ * ZFS root" and turning the destroy test into a skip.
  */
-export async function getRootPool(): Promise<string | null> {
-  try {
-    const src = (await sshExec('findmnt -n -o SOURCE / 2>/dev/null || true')).trim()
-    // ZFS root looks like 'rpool/ROOT/pve-1'; a block device starts with /dev/.
-    if (src && !src.startsWith('/dev/') && src.includes('/'))
-      return src.split('/')[0]
-  }
-  catch {
-    // Fall through to the bootfs probe.
-  }
-  try {
-    const bootfs = (await sshExec(
-      'zpool get -H -o value bootfs 2>/dev/null | grep -v \'^-$\' | head -n1 || true',
-    )).trim()
-    if (bootfs && bootfs.includes('/'))
-      return bootfs.split('/')[0]
-  }
-  catch {
-    // No ZFS boot pool.
-  }
+export async function getRootPool(): Promise<{ pool: string, via: 'mount' | 'bootfs' } | null> {
+  const src = (await sshExec('findmnt -n -o SOURCE,FSTYPE / 2>/dev/null || true')).trim()
+  const [source, fstype] = src.split(/\s+/)
+  // ZFS root looks like 'rpool/ROOT/pve-1 zfs'; a block device starts with /dev/.
+  if (fstype === 'zfs' && source)
+    return { pool: source.split('/')[0], via: 'mount' }
+  const bootfs = (await sshExec(
+    'zpool get -H -o value bootfs 2>/dev/null | grep -v \'^-$\' | head -n1 || true',
+  )).trim()
+  if (bootfs && bootfs.includes('/'))
+    return { pool: bootfs.split('/')[0], via: 'bootfs' }
   return null
 }

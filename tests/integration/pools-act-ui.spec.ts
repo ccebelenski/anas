@@ -31,6 +31,10 @@ import {
  * render is slow, so timeouts are generous.
  */
 
+// Wide viewport: the Pools toolbar overflows at 1280px into ExtJS's overflow
+// menu, whose buttons are aria-hidden, so the attach and export clicks miss.
+test.use({ viewport: { width: 2560, height: 1080 } })
+
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off) — poolExists swallows SSH failures and returns false.
 test.beforeEach(async () => {

@@ -10,9 +10,10 @@ import { GATEWAY_URL, NODE_NAME, PVE_URL } from './fixtures/pve-ui'
  *   - PVEAuthCookie auth: no cookie → 401; the cluster-valid ticket → 200.
  *   - Node-as-path routing: `/api/nodes/<node>/v1/*`. The local node forwards to
  *     the anasd socket; a bad node name is a 400; an unreachable node is a 502
- *     with error code NODE_UNREACHABLE.
- *   - CORS: preflight from the PVE UI origin is answered with credentials
- *     allowed, and ONLY for that origin.
+ *     with error code NODE_UNRESOLVED (not in the cluster membership); a
+ *     connection failure is 502 NODE_UNREACHABLE.
+ *   - No CORS: the gateway is same-origin behind pveproxy's :8006/anas, so it
+ *     emits no Access-Control-Allow-* headers for any origin, the PVE UI included.
  */
 
 const GATEWAY = GATEWAY_URL
@@ -62,22 +63,24 @@ test.describe('Gateway API', () => {
     await context.dispose()
   })
 
-  test('surfaces an unreachable node as 502 NODE_UNREACHABLE', async ({ playwright, pveTicket }) => {
+  test('surfaces a node outside the cluster membership as 502 NODE_UNRESOLVED', async ({ playwright, pveTicket }) => {
     const context = await playwright.request.newContext({
       ignoreHTTPSErrors: true,
       storageState: pveAuthState(pveTicket),
     })
-    // A syntactically valid node that isn't in the cluster / can't be reached:
-    // the gateway forwards, the hop fails, and it reports a gateway error.
+    // A syntactically valid node that is not in /etc/pve/.members: the gateway
+    // cannot resolve its address and reports a gateway error.
     const response = await context.get(`${GATEWAY}/api/nodes/ghost.example/v1/pools`)
     expect(response.status()).toBe(502)
     const body = await response.json()
-    expect(body.error.code).toBe('NODE_UNREACHABLE')
+    expect(body.error.code).toBe('NODE_UNRESOLVED')
     await context.dispose()
   })
 
-  test('answers CORS preflight for the PVE UI origin with credentials allowed', async ({ playwright }) => {
-    // Browsers send preflight without cookies — no auth needed here.
+  test('emits no CORS headers for a preflight from the PVE UI origin', async ({ playwright }) => {
+    // Browsers send preflight without cookies — no auth needed here. The
+    // gateway is same-origin (via pveproxy :8006/anas), so PVE's origin gets
+    // no allow headers either.
     const context = await playwright.request.newContext({ ignoreHTTPSErrors: true })
     const response = await context.fetch(`${GATEWAY}/api/nodes/${NODE}/v1/pools`, {
       method: 'OPTIONS',
@@ -87,9 +90,9 @@ test.describe('Gateway API', () => {
         'Access-Control-Request-Headers': 'content-type',
       },
     })
-    const headers = response.headers()
-    expect(headers['access-control-allow-origin']).toBe(PVE_ORIGIN)
-    expect(headers['access-control-allow-credentials']).toBe('true')
+    // No access-control-* header of any kind (the gateway unit suite's rule).
+    const cors = Object.keys(response.headers()).filter(h => h.startsWith('access-control-'))
+    expect(cors).toEqual([])
     await context.dispose()
   })
 
@@ -103,8 +106,8 @@ test.describe('Gateway API', () => {
         'Access-Control-Request-Headers': 'content-type',
       },
     })
-    // Only the PVE UI origin is allowed — anything else gets no allow header
-    // (and thus the browser blocks the response).
+    // No origin is allowed (no CORS at all) — a foreign origin gets no allow
+    // header, so the browser blocks the response.
     expect(response.headers()['access-control-allow-origin']).toBeUndefined()
     await context.dispose()
   })
