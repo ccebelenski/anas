@@ -30,14 +30,28 @@ const execFileAsync = promisify(execFile)
  *      `Copy #1 of a.txt` beside it, the bin is visible to the client,
  *      deleting FROM the bin is a real delete (no nested bin), `deltree
  *      "#recycle"` empties it, and the next delete recreates the bin
- *   3. the purge runner (path taken from the installed unit's ExecStart) on
- *      a young bin logs `removed=0`; with the marker aged down to 7 and the
- *      NODE'S CLOCK moved forward 8 days it logs `removed=1`, removes the
- *      file, prunes the emptied `docs` dir and keeps `#recycle` itself.
- *      STUNT-NODE-ONLY MANOEUVRE: ctime cannot be set from userspace, so the
- *      age path is proven with `timedatectl set-ntp false; date -s`, wrapped
- *      in try/finally that restores the clock and re-enables NTP — never
- *      against a real node
+ *   3. the purge, fired THROUGH THE INSTALLED UNIT (`systemctl start
+ *      anas-recycle.service`, its output read back from that invocation's
+ *      journal), on a young bin logs `removed=0`; with the marker aged down to
+ *      7 and a bin whose deleted file carries a ctime 8 days old it logs
+ *      `removed=1 pruned_dirs=1`, removes that file, prunes its emptied `docs`
+ *      dir, keeps a young file deleted beside it (and its dir), and keeps
+ *      `#recycle` itself.
+ *      THE NODE'S CLOCK IS NEVER MOVED. The runner's age is `now - ctime`, and
+ *      ctime cannot be set from userspace (any utimes stamps it back to now),
+ *      nor on ZFS by any tool. So the aged bin lives on a scratch ext4 image
+ *      mounted OVER the share path for the window: Samba deletes both files
+ *      through the real stanza (vfs_recycle renames them into the ext4 bin,
+ *      ctime = now), the image is unmounted, `debugfs` writes 8-days-ago into
+ *      the one file's on-disk ctime, the image is remounted, and the unit
+ *      sweeps it. The runner is filesystem-agnostic (lstat/readdir/unlink/
+ *      rmdir); what it measures — the inode's ctime against the real clock —
+ *      is exactly what a real 8-day-old deletion presents. A try/finally
+ *      unmounts the image (only while the visible filesystem is not ZFS) and
+ *      deletes it; the ZFS bin underneath is untouched. (Until 2026-10-12 this
+ *      test moved the node's clock 8 days with `date -s`: pvestatd rotated the
+ *      PVE auth key at the fake time, stranding UI logins until that date, and
+ *      the weekly cloud timer caught up and ran a real sync.)
  *   4. `purgeDays: null` → the marker reads `never` and the runner skips the
  *      share; `recycle: null` → the stanza is byte-identical to the pre-enable
  *      one and `#recycle` REMAINS on disk (a checkbox never deletes data)
@@ -50,8 +64,9 @@ const execFileAsync = promisify(execFile)
  * (units copied from the synced packaging/ copy at the default /opt/anas
  * prefix, daemon-reload, `enable --now`), and every test leaves the node as
  * found: the share user and shares are removed through their own API doors,
- * the clock is restored by the try/finally above, and the fixture teardown
- * (`down`) destroys the dataset WITH the `#recycle` directory.
+ * the scratch ext4 image is unmounted and deleted by the try/finally above
+ * (afterAll repeats it as a safety net), and the fixture teardown (`down`)
+ * destroys the dataset WITH the `#recycle` directory.
  */
 
 const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
@@ -69,6 +84,17 @@ const REFUSAL_DIR = '/var/tmp/rb-refusal'
 const RECYCLE_SERVICE = 'anas-recycle.service'
 const RECYCLE_TIMER = 'anas-recycle.timer'
 const RUNNER = '/opt/anas/packages/daemon/dist/recycle-purge.js'
+
+/** Scratch ext4 image mounted over SHARE_PATH while test 3 ages a bin file. */
+const AGED_IMG = '/var/tmp/rb-aged.ext4'
+
+/**
+ * Unmount the scratch image from SHARE_PATH — ONLY while the filesystem
+ * visible there is not ZFS, so a stray call can never unmount the dataset
+ * itself. Retries: a just-ended smbd child can hold the share root for a
+ * moment (EBUSY). Exits non-zero when ZFS is still not back on top.
+ */
+const UNMOUNT_AGED = `for i in $(seq 1 20); do [ "$(stat -f -c %T ${SHARE_PATH})" = zfs ] && break; umount ${SHARE_PATH} 2>/dev/null || sleep 0.5; done; [ "$(stat -f -c %T ${SHARE_PATH})" = zfs ]`
 
 /** The plain-share stanza, captured on the node before the feature goes on. */
 let stanzaBeforeRecycle = ''
@@ -181,9 +207,28 @@ async function installedRunnerCommand(): Promise<string> {
   return execStart!.split('=', 2)[1].trim()
 }
 
-/** Run the purge runner once via ssh and return its stdout. */
-async function runPurgeRunner(): Promise<string> {
-  return sshExec(await installedRunnerCommand())
+/**
+ * Fire the purge THROUGH THE INSTALLED UNIT and return what that one
+ * invocation wrote to journald. `systemctl start` on a oneshot returns when
+ * the run has ended and fails when the runner exits non-zero (the unit's
+ * recent journal is then printed to stderr, which sshExec's error carries),
+ * so exit 0 is still enforced. The output is selected by the invocation id
+ * and polled until the runner's closing `done` line has reached the journal.
+ */
+async function runPurgeUnit(): Promise<string> {
+  await sshExec(
+    `systemctl start ${RECYCLE_SERVICE} || { journalctl -u ${RECYCLE_SERVICE} -n 30 -o cat --no-pager >&2; exit 1; }`,
+  )
+  const id = await sshExec(`systemctl show -p InvocationID --value ${RECYCLE_SERVICE}`)
+  expect(id, `${RECYCLE_SERVICE} has an invocation id`).toMatch(/^[0-9a-f]{32}$/)
+  let out = ''
+  for (let i = 0; i < 40; i++) {
+    out = await sshExec(`journalctl --sync; journalctl -o cat --no-pager _SYSTEMD_INVOCATION_ID=${id}`)
+    if (out.includes('anas-recycle: done'))
+      return out
+    await new Promise(resolve => setTimeout(resolve, 250))
+  }
+  throw new Error(`${RECYCLE_SERVICE} invocation ${id} never logged its done line: ${out}`)
 }
 
 /**
@@ -248,6 +293,9 @@ test.describe('Recycle bin on SMB shares (smbsvc.2)', () => {
       await ctx.dispose()
       await removeShareUser(SHARE_USER).catch(() => {})
       await sshExec(`rm -rf ${REFUSAL_DIR} /var/tmp/rb-a.txt /var/tmp/rb-b.txt`).catch(() => {})
+      // Test 3's scratch image and the timer it stops, should its finally not
+      // have run to the end (a run killed hard between the stop and the finally).
+      await sshExec(`${UNMOUNT_AGED}; rm -f ${AGED_IMG}; systemctl start ${RECYCLE_TIMER}`).catch(() => {})
       await execFileAsync(FIXTURE_SH, ['down']).catch(() => {})
     }
   })
@@ -342,58 +390,85 @@ test.describe('Recycle bin on SMB shares (smbsvc.2)', () => {
     expect(await fileExists(`${BIN_PATH}/docs/a.txt`)).toBe(true)
   })
 
-  test('3 — purge: the runner keeps young files; with the age at 7 and the clock 8 days forward it removes the aged file, prunes the emptied dir, keeps the bin', async ({ playwright, pveTicket }) => {
+  test('3 — purge through the unit: young files are kept; with the age at 7 a file whose ctime is 8 days old is removed, its emptied dir pruned, a young file beside it kept, the bin kept — the node clock never moves', async ({ playwright, pveTicket }) => {
     const ctx = await authedContext(playwright, pveTicket)
 
-    // The timer pair as installed: the timer is enabled (list-timers shows it)
-    // and the runner path in the unit's ExecStart exists on the node.
+    // The timer pair as installed: the timer is enabled (list-timers shows it),
+    // the unit's ExecStart names the runner, and the runner exists on the node.
     expect(await sshExec(`systemctl is-enabled ${RECYCLE_TIMER}`)).toBe('enabled')
     expect(await sshExec(`systemctl list-timers --no-legend ${RECYCLE_TIMER}`)).toContain(RECYCLE_TIMER)
+    await installedRunnerCommand()
     expect(await fileExists(RUNNER)).toBe(true)
 
     // First run at the default 30-day marker: the bin's files are young —
     // kept, nothing pruned. The verdict is the runner's own line (and exit 0,
-    // which sshExec enforces).
-    const young = await runPurgeRunner()
+    // which the unit start enforces).
+    const young = await runPurgeUnit()
     expect(young).toContain('share=rbshare removed=0')
 
-    // Age the marker down to 7 BEFORE the clock manoeuvre: all API work in
-    // this test happens while the node's clock still tells the truth.
+    // Age the marker down to 7 BEFORE the bin is swapped: all API work in
+    // this test happens against the share as the fixture built it.
     await runJob(ctx, 'put', `${V1}/shares/smb/${SHARE}`, { recycle: { purgeDays: 7 } })
     const detail = await ctx.get(`${V1}/shares/smb/${SHARE}`)
     expect((await detail.json()).data.recycle).toEqual({ purgeDays: 7 })
     expect(await shareStanza(SHARE)).toContain('# anas:recycle-purge-days = 7')
     await ctx.dispose()
 
-    // STUNT-NODE-ONLY MANOEUVRE (see file header): ctime cannot be set from
-    // userspace, so the age path is proven by moving the node's clock. The
-    // try/finally is the safety: the clock goes back, NTP comes back on, and
-    // the timer restarts even when an assertion inside fails. The API is NOT
-    // touched while the clock lies (PVE tickets are age-checked).
-    //
-    // The timer is STOPPED across the window: its Persistent=true catch-up
-    // fires anas-recycle.service the instant the clock jumps forward (the
-    // fake clock makes 8 daily runs look missed), which purges the bin a
-    // second BEFORE the explicit run below and turns its output into
-    // removed=0. That catch-up is systemd behaving exactly as designed —
-    // ground truth 2026-09-23 — so the explicit run gets a quiet clock by
-    // stopping the timer first; the enabled assertions above already stood.
-    await sshExec(`systemctl stop ${RECYCLE_TIMER} && timedatectl set-ntp false && date -s "+8 days" >/dev/null`)
+    // The aged bin (see the file header): a scratch ext4 image over the share
+    // path, two Samba deletes into it, one file's on-disk ctime set 8 days
+    // (plus an hour, clear of find's whole-day rounding) into the past with
+    // debugfs while unmounted, then remounted for the sweep. The node's clock
+    // is never touched. The timer is stopped across the window so a daily
+    // firing cannot sweep the aged file a moment before the explicit run (it
+    // would leave that run nothing to remove); the finally restarts it.
+    await sshExec(`printf 'rb proof young\\n' > /var/tmp/rb-b.txt && chmod 644 /var/tmp/rb-b.txt`)
+    await sshExec(`systemctl stop ${RECYCLE_TIMER}`)
     try {
-      const purged = await runPurgeRunner()
-      expect(purged).toContain('share=rbshare removed=1')
-      expect(purged).toContain('pruned_dirs=1')
-      // The aged file is gone WITH its emptied directory; the bin itself
-      // stays (only directories UNDER the bin are pruned).
+      await sshExec(
+        `rm -f ${AGED_IMG} && truncate -s 64M ${AGED_IMG} && mkfs.ext4 -q -F -I 256 ${AGED_IMG}`
+        + ` && mount -t ext4 -o loop ${AGED_IMG} ${SHARE_PATH} && chmod 777 ${SHARE_PATH}`,
+      )
+      expect(await sshExec(`stat -f -c %T ${SHARE_PATH}`)).not.toBe('zfs')
+
+      // Both files are deleted by the share user through the real stanza:
+      // vfs_recycle renames them into the (ext4) bin, tree kept.
+      await smbClientAs(SHARE, SHARE_USER, SHARE_PW, 'mkdir docs; put /var/tmp/rb-a.txt docs/a.txt; del docs/a.txt; mkdir keep; put /var/tmp/rb-b.txt keep/b.txt; del keep/b.txt')
+      expect(await fileExists(`${BIN_PATH}/docs/a.txt`)).toBe(true)
+      expect(await fileExists(`${BIN_PATH}/keep/b.txt`)).toBe(true)
+      const ino = await sshExec(`stat -c %i '${BIN_PATH}/docs/a.txt'`)
+      expect(ino).toMatch(/^\d+$/)
+
+      // Age ONE inode's ctime on disk (debugfs only on the unmounted image),
+      // remount, and read it back through the kernel the way the runner does.
+      const agedEpoch = Math.floor(Date.now() / 1000) - 8 * 86_400 - 3_600
+      await sshExec(UNMOUNT_AGED)
+      await sshExec(`debugfs -w -R 'set_inode_field <${ino}> ctime @${agedEpoch}' ${AGED_IMG}`)
+      await sshExec(`mount -t ext4 -o loop ${AGED_IMG} ${SHARE_PATH}`)
+      const nowOnNode = Number(await sshExec('date +%s'))
+      const agedCtime = Number(await sshExec(`stat -c %Z '${BIN_PATH}/docs/a.txt'`))
+      expect(nowOnNode - agedCtime).toBeGreaterThanOrEqual(8 * 86_400)
+      const youngCtime = Number(await sshExec(`stat -c %Z '${BIN_PATH}/keep/b.txt'`))
+      expect(nowOnNode - youngCtime).toBeLessThan(86_400)
+
+      const purged = await runPurgeUnit()
+      expect(purged).toContain('share=rbshare removed=1 pruned_dirs=1')
+      // The aged file is gone WITH its emptied directory; the young file and
+      // its directory stay; the bin itself stays (only directories UNDER the
+      // bin are pruned).
       expect(await fileExists(`${BIN_PATH}/docs/a.txt`)).toBe(false)
       expect(await fileExists(`${BIN_PATH}/docs`)).toBe(false)
+      expect(await fileExists(`${BIN_PATH}/keep/b.txt`)).toBe(true)
       expect(await fileExists(BIN_PATH)).toBe(true)
     }
     finally {
-      await sshExec(`date -s "-8 days" >/dev/null; timedatectl set-ntp true; systemctl start ${RECYCLE_TIMER}`)
+      await sshExec(`${UNMOUNT_AGED}; rc=$?; rm -f ${AGED_IMG}; systemctl start ${RECYCLE_TIMER}; exit $rc`)
     }
-    // The clock is genuinely back: node epoch within a couple of minutes of
-    // the test-runner host's (NTP then trims the remainder).
+    // The dataset is back on top and its own bin — test 2's young file — was
+    // never touched by the window.
+    expect(await sshExec(`stat -f -c %T ${SHARE_PATH}`)).toBe('zfs')
+    expect(await fileExists(`${BIN_PATH}/docs/a.txt`)).toBe(true)
+    // The node's clock tells the truth: epoch within a couple of minutes of
+    // the test-runner host's — nothing in this file moves it.
     const nodeNow = Number(await sshExec('date +%s'))
     expect(Math.abs(nodeNow - Date.now() / 1000)).toBeLessThan(300)
   })
@@ -414,7 +489,7 @@ test.describe('Recycle bin on SMB shares (smbsvc.2)', () => {
       const neverStanza = await shareStanza(SHARE)
       expect(neverStanza).toContain('# anas:recycle-purge-days = never')
       expect(neverStanza).toContain('vfs objects = recycle')
-      const skipped = await runPurgeRunner()
+      const skipped = await runPurgeUnit()
       expect(skipped).toMatch(/share=rbshare skipped/)
 
       // Off: the stanza loses the composed line, the keys and the marker — and

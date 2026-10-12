@@ -208,6 +208,10 @@ case "$1" in
     if $SSH_CMD "grep -q '^\\[${SHARE}\\]' /etc/samba/smb.conf" 2>/dev/null; then
       echo "⚠ [${SHARE}] stanza still in smb.conf — remove it by hand"
     fi
+    # The recycle spec's scratch ext4 image (test 3 mounts it OVER the share
+    # path for a few seconds), should a crashed run have left it stacked there:
+    # unmount only while the visible filesystem is not ZFS, then delete it.
+    $SSH_CMD "for i in \$(seq 1 20); do [ \"\$(stat -f -c %T ${DS_PATH} 2>/dev/null)\" = zfs ] && break; [ -d ${DS_PATH} ] || break; umount ${DS_PATH} 2>/dev/null || sleep 0.5; done; rm -f /var/tmp/rb-aged.ext4" || true
     if ds_exists; then
       $SSH_CMD "zfs destroy -r ${DS}"
       echo "✓ ${DS} destroyed (with its snapshots)"
