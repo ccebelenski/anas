@@ -549,39 +549,44 @@ describe('access.1 — the share-path grant', () => {
     })
   })
 
-  // --- inherit acls (live proof 0.4.3 F2) ----------------------------------------
+  // --- the grant parameters (live proof 0.4.3 F2, re-proof RF1) ----------------
   const stanzaOf = (name: string): string[] => {
     const lines = readFileSync(confPath, 'utf8').split('\n')
     const at = lines.indexOf(`[${name}]`)
     const end = lines.findIndex((l, i) => i > at && l.startsWith('['))
     return lines.slice(at, end === -1 ? undefined : end)
   }
+  const GRANT_LINES = ['\tinherit acls = yes', '\tcreate mask = 0664', '\tdirectory mask = 0775']
 
-  it('inherit acls: a share create writes inherit acls = yes', async () => {
+  it('grant parameters: a share create writes inherit acls, create mask and directory mask', async () => {
     start()
     const job = await create({ name: 'media', path: MP, validUsers: ['media'], grantAccess: {} })
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.ok(stanzaOf('media').includes('\tinherit acls = yes'), stanzaOf('media').join('\n'))
+    for (const line of GRANT_LINES)
+      assert.ok(stanzaOf('media').includes(line), `${line}: ${stanzaOf('media').join('\n')}`)
   })
 
-  it('inherit acls: an edit that runs a grant adds it to a stanza that lacks it', async () => {
+  it('grant parameters: an edit that runs a grant adds all three to a stanza that lacks them', async () => {
     start([], MEDIA_SHARE)
     const job = await update('media', { validUsers: ['alice', 'media', 'bob'], grantAccess: {} })
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.notEqual(grantOf(job)!.status, 'nothing')
-    assert.ok(stanzaOf('media').includes('\tinherit acls = yes'), stanzaOf('media').join('\n'))
+    assert.deepEqual(stanzaOf('media').slice(-4, -1), GRANT_LINES, stanzaOf('media').join('\n'))
   })
 
-  it('inherit acls: an edit that runs a grant leaves an explicit inherit acls = no alone', async () => {
-    start([], `${MEDIA_SHARE}\tinherit acls = no\n`)
+  it('grant parameters: an edit that runs a grant leaves inherit acls = no and create mode alone, adding only directory mask', async () => {
+    start([], `${MEDIA_SHARE}\tinherit acls = no\n\tcreate mode = 0700\n`)
     const job = await update('media', { validUsers: ['alice', 'media', 'bob'], grantAccess: {} })
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     const stanza = stanzaOf('media')
     assert.ok(stanza.includes('\tinherit acls = no'), stanza.join('\n'))
-    assert.equal(stanza.filter(l => /inherit acls/i.test(l)).length, 1, 'no second line')
+    assert.ok(stanza.includes('\tcreate mode = 0700'), stanza.join('\n'))
+    assert.ok(stanza.includes('\tdirectory mask = 0775'), stanza.join('\n'))
+    assert.equal(stanza.filter(l => /inherit acls/i.test(l)).length, 1, 'no second inherit acls line')
+    assert.equal(stanza.filter(l => /create (?:mask|mode)/i.test(l)).length, 1, 'no second create mask line')
   })
 
-  it('inherit acls: an edit with no grant, or a grant that does not run, leaves the stanza byte-identical', async () => {
+  it('grant parameters: an edit with no grant, or a grant that does not run, leaves the stanza byte-identical', async () => {
     start([], MEDIA_SHARE)
     // No grantAccess at all: an untouched save.
     let job = await update('media', { path: MP, readOnly: false, guestOk: false, validUsers: ['alice', 'media'] })

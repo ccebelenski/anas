@@ -2756,3 +2756,1487 @@ dcaf344ca50463eeb2094170d6b6631c  parsers/getfacl.js
 $ rm -rf /root/rpproof && ls -d /root/rpproof 2>&1
 ls: cannot access '/root/rpproof': No such file or directory
 ```
+
+## Addendum — R3 re-run on the commit that carries this addendum (RF1 fix)
+
+Driven 2026-10-12 (UTC, the node's clock) against the same stunt node `anas-pve`. Code under test: the
+RF1 fix (operator ruling 2026-10-11): ANAS-written SMB share stanzas carry `inherit acls = yes`,
+`create mask = 0664` and `directory mask = 0775`; an edit that runs a grant adds each of the three
+the stanza does not set under any spelling (`addMissingGrantParams` in `parsers/smb-conf.ts`), an
+operator's value stands, and an edit with no grant leaves the stanza byte-identical. The build was
+put on the node with `./test/stunt-node/deploy-anas.sh` from the worktree before its work commits
+were squashed into this one; the code did not change in the squash. §A0 shows the md5 of the two
+daemon files the change touches as the node runs them, the same as the host build; after the A4
+teardown a per-file comparison of every built file (`packages/{shared,daemon,gateway}/dist`, 1,856
+files, C-locale order) between the host build and the node was identical. The per-package sums in
+A4 use the node's own `sort` order and are a fingerprint of the node, not a host comparison. The
+version string stays `0.4.2`.
+
+**Method.** As above: every mutation went through the front door with a `root@pam` ticket
+(`api METHOD PATH [body] [confirm]`, jobs polled until they end); the shell observed (`testparm`,
+`getfacl`, `stat`, `smbclient`, `cmp`, `diff`, journald) and made what the API has no door for: the
+local test files, the hand-written 0.4.2-shape stanzas of A3, and in A1b a kernel SMB mount
+(`mount -t cifs`, as `rfuser2`, unmounted in the same run). Each fenced block is one run of a
+script on the node, printed verbatim (trailing blanks and repeated blank lines squeezed). The
+helpers lived in `/root/rfproof` and were removed at the end. Two share users, `rfuser` (A) and
+`rfuser2` (B), were made through the API; every dataset is new on `testpool` (`acltype=off`).
+
+### Verdicts
+
+| Scenario | Verdict |
+|---|---|
+| A1. Two valid users, grant on, not recursive | **PROVEN** (A1, A1b). `testparm` shows `create mask = 0664`, `directory mask = 0775`, `inherit acls = Yes` (and `force create mode`/`force directory mode` `0000`, `inherit permissions = No`). A's file lands `664 -rw-rw-r--` with `mask::rw-`, `user:rfuser2:rwx #effective:rw-`, `group::r-x #effective:r--`, `other::r--`. B's overwrite succeeds; B's `reput` changes the file (smbclient wrote at offset 0, see the notes), and B's append through a kernel SMB mount (A1b) succeeds (27 → 72 bytes, both lines present). B's directory lands `2775 drwxrwsr-x` with `mask::rwx`; A's file in it lands `664` and B overwrites that too. 0 SMB-created files carry an execute bit. |
+| A2. Guest access mixed with named users | **PROVEN as the designed residual** (A2b), with an observation (A2). A2b, a guest share whose named users sign in with their passwords: the named user's file lands `664 -rw-rw-r--`, `other::r--`; a guest (`smbclient -N`) reads it; a guest overwrite is `NT_STATUS_ACCESS_DENIED` (the residual); a guest's own file lands `nobody:nogroup 664` and the guest rewrites it. A2, a guest share that also lists valid users (the brief's shape): the grant gives both users and Everyone read-write, the named user's file lands `-rw-rw-r--` with `other::r--`, and every guest connection is refused at tree connect (`NT_STATUS_ACCESS_DENIED`): Samba checks `valid users` against the guest account too. |
+| A3. Pre-existing stanzas | **PROVEN** (A3). A no-grant edit resending the 0.4.2-shape stanza leaves smb.conf byte-identical (`cmp`); a no-grant comment edit is a one-line diff with none of the three. A granting edit adds exactly `inherit acls = yes`, `create mask = 0664`, `directory mask = 0775` after the stanza's last line, nothing moved; a second granting edit adds nothing (count 3). The stanza with `inherit acls = no` and `create mode = 0700`, edited with a grant, keeps both and gains only `directory mask = 0775`; `testparm` reads `inherit acls = No`, `create mask = 0700`, `directory mask = 0775`. |
+| A4. Teardown and node health | **PROVEN** (A4). Five shares, four datasets and both users removed through the API (each 409 then the confirmed resend, 11 jobs completed); smb.conf, `/etc/exports` and `/etc/fstab` have the md5 they had before the deploy (§A0); no CIFS mount; `testparm` clean; `anasd anas smbd` active, NRestarts 0, `/v1/health` ok on the socket and through the front door; 0 warning-or-worse lines from anasd or the gateway since the deploy; `/root/rfproof` removed. |
+
+RF1 is fixed: with the three parameters in place the second granted user writes what the first
+saved, in both directions, and no SMB-saved file is executable. The "SMB-saved files carry owner
+execute" note above is settled by the same masks (A1: `664`, 0 files with x).
+
+### Notes and decisions
+
+- **The append.** smbclient's `reput` (used for the append in R3 above) wrote the part of the local
+  file past the remote file's length at offset 0 instead of at the end (A1: the file afterwards
+  starts with B's appended line over the start of B's earlier text, same length). It is still a
+  write by B into A's file and it succeeded, but it is not an append, so A1b appended through a
+  kernel SMB mount as `rfuser2` (`>>`), which is.
+- **A2's share shape.** The brief's guest-plus-named share was made as the dialog makes it (guest
+  access on, both users in Valid users). Samba refuses every guest session on it at tree connect,
+  so no guest file operation could run there; A2b repeated the scenario on a guest share with no
+  valid users, where the named users sign in with their passwords and guests come in as `nobody`,
+  which is the shape where the stated residual applies. Both runs are kept.
+- **A2b's second user.** `rfuser2` overwrote `rfuser`'s file in the guest share through the owning
+  group: an Everyone-only grant runs `chmod 757` with no setgid, so a new file takes its creator's
+  primary group (`users`, which both test users share) and the 0664 mode gives that group write.
+  A user who shares no group with the author would get Everyone's read (not run).
+- **The helper's first job poll.** In §A0 the helper read the job's fields from the wrong level of
+  the response and printed nulls for the two user jobs; the corrected helper read both again in the
+  next block (completed). Every later block used the corrected helper.
+- **Redaction.** As above: the node is named, its address is not; the test users and their test
+  passwords are disposable and were removed.
+
+### Noticed (outside the scenarios)
+
+- A share with guest access that also lists valid users admits no guest at all over SMB (A2), yet
+  its grant gives Everyone read-write on the folder (`other::rwx` and `default:other::rwx`). On
+  that shape Everyone's write serves no SMB guest and opens the folder to every local account and
+  to any NFS export of it. Not changed here.
+- The release note now states the residual as "Everyone keeps read on what a signed-in user saves"
+  on a share with guest access; A2b is that sentence on the node.
+
+### §A0 — The build on the node; the share users
+
+```
+### 0. the build on the node; two share users through the API
+
+$ date -u "+%Y-%m-%d %H:%M:%S"
+2026-10-12 01:03:28
+
+$ systemctl is-active anasd anas smbd; systemctl show -p NRestarts --value anasd; systemctl show -p ActiveEnterTimestamp --value anasd
+active
+active
+active
+0
+Mon 2026-10-12 01:02:00 UTC
+
+$ curl -s --unix-socket /run/anas/anasd.sock http://localhost/v1/health; echo
+{"status":"ok","version":"0.4.2"}
+
+(the two daemon files this change touches, as running on the node; the host build gives the same two sums)
+
+$ cd /opt/anas/packages/daemon/dist && md5sum parsers/smb-conf.js routes/shares-smb.js
+4aaea3098a3af2868a39ec4d523f8eb9  parsers/smb-conf.js
+36cebbf42d055a8fa3bee37c52750ad8  routes/shares-smb.js
+
+$ grep -nE "PARAM\.(inheritAcls|createMask|directoryMask), .(yes|0664|0775).\]|^export function addMissingGrantParams" /opt/anas/packages/daemon/dist/parsers/smb-conf.js
+841:    [PARAM.inheritAcls, 'yes'],
+842:    [PARAM.createMask, '0664'],
+843:    [PARAM.directoryMask, '0775'],
+955:export function addMissingGrantParams(text, name) {
+
+$ smbd --version; md5sum /etc/samba/smb.conf /etc/exports /etc/fstab
+Version 4.22.11-Debian-4.22.11+dfsg-0+deb13u1
+5df9ad3c89d06fc0648d7a721f754f0e  /etc/samba/smb.conf
+6f30717e76279d63f4bea8820c99b71d  /etc/exports
+938b9f48c34c80d070c81f5c2f65ca08  /etc/fstab
+
+$ api POST /identity/users '{"name":"rfuser","smbPassword":"Rf-proof-1"}'
+HTTP 202
+{
+  "job": {
+    "id": "d1514e30-8141-4f1a-a6d7-c7fc523425ae",
+    "status": "running",
+    "operation": "identity.user.add",
+    "createdAt": "2026-10-12T01:03:29.188Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/d1514e30-8141-4f1a-a6d7-c7fc523425ae   (polled until done; status, operation, last progress, result, error)
+{
+  "status": null,
+  "operation": null,
+  "progress": null,
+  "result": null,
+  "error": null
+}
+
+$ api POST /identity/users '{"name":"rfuser2","smbPassword":"Rf-proof-2"}'
+HTTP 202
+{
+  "job": {
+    "id": "e73d195b-6817-41b0-9abf-5cd1d1021a61",
+    "status": "running",
+    "operation": "identity.user.add",
+    "createdAt": "2026-10-12T01:03:29.315Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/e73d195b-6817-41b0-9abf-5cd1d1021a61   (polled until done; status, operation, last progress, result, error)
+{
+  "status": null,
+  "operation": null,
+  "progress": null,
+  "result": null,
+  "error": null
+}
+
+$ id rfuser; id rfuser2; pdbedit -L | grep "^rfuser"
+uid=1004(rfuser) gid=100(users) groups=100(users)
+uid=1005(rfuser2) gid=100(users) groups=100(users)
+rfuser:1004:
+rfuser2:1005:
+```
+
+```
+(the two user jobs above, read again after correcting the field the helper polled; the first read printed nulls)
+
+$ api GET /jobs/d1514e30-8141-4f1a-a6d7-c7fc523425ae   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "identity.user.add",
+  "progress": "Setting SMB password for 'rfuser'",
+  "result": {
+    "created": "rfuser",
+    "smbEnabled": true
+  },
+  "error": null
+}
+
+$ api GET /jobs/e73d195b-6817-41b0-9abf-5cd1d1021a61   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "identity.user.add",
+  "progress": "Setting SMB password for 'rfuser2'",
+  "result": {
+    "created": "rfuser2",
+    "smbEnabled": true
+  },
+  "error": null
+}
+```
+
+### §A1 — Two valid users, grant on, not recursive
+
+**Pass criteria, stated before the run.** A fresh dataset `testpool/rf1` and an SMB share `rf1` to
+`rfuser` (A) and `rfuser2` (B), grant on, not recursive, made through the API. `testparm -s
+--section-name=rf1` shows `inherit acls = Yes`, `create mask = 0664`, `directory mask = 0775`. A
+`smbclient put`s a file: its mode is 0664-class with no execute bit, `getfacl` shows `mask::rw-`
+and B's entry `#effective:rw-`. B overwrites A's file and appends to it: both succeed. B makes a
+directory: `getfacl` shows `mask::rwx`, and A writes a file into it: succeeds. If A1's writes fail,
+stop and record `getfacl`, `stat` and `testparm` of the share.
+
+```
+### A1. a fresh dataset, an SMB share to two users, grant ON (not recursive); each user writes into what the other made
+
+$ api POST /pools/testpool/datasets '{"path":"rf1"}'
+HTTP 202
+{
+  "job": {
+    "id": "2fcc51ce-a1fe-445d-a932-5c2c8d3a664a",
+    "status": "running",
+    "operation": "zfs.create",
+    "createdAt": "2026-10-12T01:04:03.415Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/2fcc51ce-a1fe-445d-a932-5c2c8d3a664a   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "zfs.create",
+  "progress": null,
+  "result": {
+    "created": "testpool/rf1"
+  },
+  "error": null
+}
+
+$ api POST /shares/smb '{"name":"rf1","path":"/testpool/rf1","comment":"","browseable":true,"readOnly":false,"guestOk":false,"validUsers":["rfuser","rfuser2"],"hostsAllow":[],"hostsDeny":[],"grantAccess":{}}'
+HTTP 202
+{
+  "job": {
+    "id": "813e3c34-03f9-4cd9-a62e-179bd7cb3085",
+    "status": "running",
+    "operation": "smb.share.add",
+    "createdAt": "2026-10-12T01:04:04.062Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/813e3c34-03f9-4cd9-a62e-179bd7cb3085   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.share.add",
+  "progress": "chmod g+s /testpool/rf1",
+  "result": {
+    "created": "rf1",
+    "grant": {
+      "status": "applied",
+      "path": "/testpool/rf1",
+      "granted": [
+        {
+          "kind": "user",
+          "name": "rfuser",
+          "level": "read-write"
+        },
+        {
+          "kind": "user",
+          "name": "rfuser2",
+          "level": "read-write"
+        }
+      ],
+      "skipped": [],
+      "applyToExisting": false
+    }
+  },
+  "error": null
+}
+
+$ st rf1 | cat -A
+[rf1]$
+^Ipath = /testpool/rf1$
+^Ibrowseable = yes$
+^Iread only = no$
+^Iguest ok = no$
+^Iinherit acls = yes$
+^Icreate mask = 0664$
+^Idirectory mask = 0775$
+^Ivalid users = rfuser rfuser2$
+
+$ testparm -s --section-name=rf1 2>/dev/null
+
+[rf1]
+	create mask = 0664
+	directory mask = 0775
+	inherit acls = Yes
+	path = /testpool/rf1
+	read only = No
+	valid users = rfuser rfuser2
+
+$ for p in "inherit acls" "create mask" "directory mask" "force create mode" "force directory mode" "inherit permissions"; do printf "%s = " "$p"; testparm -s --section-name=rf1 --parameter-name="$p" 2>/dev/null; done
+inherit acls = Yes
+create mask = 0664
+directory mask = 0775
+force create mode = 0000
+force directory mode = 0000
+inherit permissions = No
+
+$ zfs get -H -o property,value,source acltype,xattr testpool/rf1; getfacl -p /testpool/rf1
+acltype	posix	local
+xattr	sa	local
+# file: /testpool/rf1
+# owner: root
+# group: root
+# flags: -s-
+user::rwx
+user:rfuser:rwx
+user:rfuser2:rwx
+group::r-x
+mask::rwx
+other::r-x
+default:user::rwx
+default:user:rfuser:rwx
+default:user:rfuser2:rwx
+default:group::r-x
+default:mask::rwx
+default:other::r-x
+
+--- A (rfuser) puts a file; B (rfuser2) overwrites it, then appends to it with reput
+
+$ echo "written by rfuser over SMB" > /root/rfproof/a.txt; echo "rfuser2 overwrote this over SMB, and this line is longer" > /root/rfproof/b.txt; cp /root/rfproof/b.txt /root/rfproof/b2.txt; echo "rfuser2 appended this line" >> /root/rfproof/b2.txt
+
+$ smbclient //localhost/rf1 -U "rfuser%Rf-proof-1" -c "put /root/rfproof/a.txt a.txt" 2>&1 | grep -v "^putting"; stat -c "%a %A %U:%G %n" /testpool/rf1/a.txt; getfacl -p /testpool/rf1/a.txt
+664 -rw-rw-r-- rfuser:root /testpool/rf1/a.txt
+# file: /testpool/rf1/a.txt
+# owner: rfuser
+# group: root
+user::rw-
+user:rfuser:rwx	#effective:rw-
+user:rfuser2:rwx	#effective:rw-
+group::r-x	#effective:r--
+mask::rw-
+other::r--
+
+$ smbclient //localhost/rf1 -U "rfuser2%Rf-proof-2" -c "put /root/rfproof/b.txt a.txt" 2>&1 | grep -v "^putting"; cat /testpool/rf1/a.txt
+rfuser2 overwrote this over SMB, and this line is longer
+
+$ smbclient //localhost/rf1 -U "rfuser2%Rf-proof-2" -c "reput /root/rfproof/b2.txt a.txt" 2>&1 | grep -v "^putting\|^reputting"; cat /testpool/rf1/a.txt; stat -c "%a %A %U:%G %n" /testpool/rf1/a.txt
+rfuser2 appended this line
+ SMB, and this line is longer
+664 -rw-rw-r-- rfuser:root /testpool/rf1/a.txt
+
+--- B makes a directory; A writes into it
+
+$ smbclient //localhost/rf1 -U "rfuser2%Rf-proof-2" -c "mkdir bdir" 2>&1; stat -c "%a %A %U:%G %n" /testpool/rf1/bdir; getfacl -p /testpool/rf1/bdir
+2775 drwxrwsr-x rfuser2:root /testpool/rf1/bdir
+# file: /testpool/rf1/bdir
+# owner: rfuser2
+# group: root
+# flags: -s-
+user::rwx
+user:rfuser:rwx
+user:rfuser2:rwx
+group::r-x
+mask::rwx
+other::r-x
+default:user::rwx
+default:user:rfuser:rwx
+default:user:rfuser2:rwx
+default:group::r-x
+default:mask::rwx
+default:other::r-x
+
+$ smbclient //localhost/rf1 -U "rfuser%Rf-proof-1" -c "cd bdir; put /root/rfproof/a.txt from-a.txt" 2>&1 | grep -v "^putting"; stat -c "%a %A %U:%G %n" /testpool/rf1/bdir/from-a.txt; getfacl -p /testpool/rf1/bdir/from-a.txt
+664 -rw-rw-r-- rfuser:root /testpool/rf1/bdir/from-a.txt
+# file: /testpool/rf1/bdir/from-a.txt
+# owner: rfuser
+# group: root
+user::rw-
+user:rfuser:rwx	#effective:rw-
+user:rfuser2:rwx	#effective:rw-
+group::r-x	#effective:r--
+mask::rw-
+other::r--
+
+$ smbclient //localhost/rf1 -U "rfuser2%Rf-proof-2" -c "cd bdir; put /root/rfproof/b.txt from-a.txt" 2>&1 | grep -v "^putting"; cat /testpool/rf1/bdir/from-a.txt
+rfuser2 overwrote this over SMB, and this line is longer
+
+--- no execute bit on any SMB-created file
+
+$ find /testpool/rf1 -type f -perm /111 | wc -l; find /testpool/rf1 -type f -printf "%m %u %p\n"
+0
+664 rfuser /testpool/rf1/a.txt
+664 rfuser /testpool/rf1/bdir/from-a.txt
+```
+
+```
+### A1b. B appends to A's file through a kernel SMB mount (smbclient's reput above wrote B's tail at offset 0 instead of appending)
+
+$ echo "written by rfuser over SMB" > /root/rfproof/a3.txt; smbclient //localhost/rf1 -U "rfuser%Rf-proof-1" -c "put /root/rfproof/a3.txt a3.txt" 2>&1 | grep -v "^putting"; stat -c "%a %A %U:%G %s %n" /testpool/rf1/a3.txt; getfacl -p /testpool/rf1/a3.txt | grep -E "^user:rfuser2|^mask"
+664 -rw-rw-r-- rfuser:root 27 /testpool/rf1/a3.txt
+user:rfuser2:rwx	#effective:rw-
+mask::rw-
+
+$ mkdir -p /root/rfproof/mnt && mount -t cifs //localhost/rf1 /root/rfproof/mnt -o username=rfuser2,password=Rf-proof-2,uid=0,gid=0,noperm,cache=none,vers=3.1.1 && echo mounted as rfuser2
+mounted as rfuser2
+
+$ echo "rfuser2 appended this line through the mount" >> /root/rfproof/mnt/a3.txt; echo "exit $?"; cat /testpool/rf1/a3.txt; stat -c "%a %A %U:%G %s %n" /testpool/rf1/a3.txt
+exit 0
+written by rfuser over SMB
+rfuser2 appended this line through the mount
+664 -rw-rw-r-- rfuser:root 72 /testpool/rf1/a3.txt
+
+$ umount /root/rfproof/mnt && rmdir /root/rfproof/mnt && echo unmounted
+unmounted
+```
+
+### §A2 — Guest access mixed with named users
+
+**Pass criteria, stated before the run.** A share with guest access and named users, grant on: a
+named user's file after `smbclient put` shows `other::r--`; a guest (`smbclient -N`) reads it; a
+guest overwrite fails, which is the designed residual (Everyone stays at read on files a named user
+saves), not a failure; a guest's own file is writable by the guest again. A2 is the shape the
+dialog makes with both boxes filled (guest access on, both users in Valid users); A2b is a guest
+share with no valid users, where the named users sign in with their passwords (added after A2
+refused every guest session, see the notes).
+
+```
+### A2. a share that mixes named users and guest access, grant ON (not recursive)
+
+$ api POST /pools/testpool/datasets '{"path":"rf2"}'
+HTTP 202
+{
+  "job": {
+    "id": "283d8281-39c9-4c0c-8bd1-4ae9f3d8b726",
+    "status": "running",
+    "operation": "zfs.create",
+    "createdAt": "2026-10-12T01:04:56.027Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/283d8281-39c9-4c0c-8bd1-4ae9f3d8b726   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "zfs.create",
+  "progress": null,
+  "result": {
+    "created": "testpool/rf2"
+  },
+  "error": null
+}
+
+$ api POST /shares/smb '{"name":"rf2","path":"/testpool/rf2","comment":"","browseable":true,"readOnly":false,"guestOk":true,"validUsers":["rfuser","rfuser2"],"hostsAllow":[],"hostsDeny":[],"grantAccess":{}}'
+HTTP 202
+{
+  "job": {
+    "id": "6890fcb9-d352-4ec3-ac0f-6f6e8c118494",
+    "status": "running",
+    "operation": "smb.share.add",
+    "createdAt": "2026-10-12T01:04:56.265Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/6890fcb9-d352-4ec3-ac0f-6f6e8c118494   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.share.add",
+  "progress": "chmod g+s /testpool/rf2",
+  "result": {
+    "created": "rf2",
+    "grant": {
+      "status": "applied",
+      "path": "/testpool/rf2",
+      "granted": [
+        {
+          "kind": "user",
+          "name": "rfuser",
+          "level": "read-write"
+        },
+        {
+          "kind": "user",
+          "name": "rfuser2",
+          "level": "read-write"
+        },
+        {
+          "kind": "everyone",
+          "level": "read-write"
+        }
+      ],
+      "skipped": [],
+      "applyToExisting": false
+    }
+  },
+  "error": null
+}
+
+$ st rf2 | cat -A
+[rf2]$
+^Ipath = /testpool/rf2$
+^Ibrowseable = yes$
+^Iread only = no$
+^Iguest ok = yes$
+^Iinherit acls = yes$
+^Icreate mask = 0664$
+^Idirectory mask = 0775$
+^Ivalid users = rfuser rfuser2$
+
+$ testparm -s --section-name=rf2 2>/dev/null; testparm -s --parameter-name="guest account" 2>/dev/null; testparm -s --parameter-name="map to guest" 2>/dev/null
+
+[rf2]
+	create mask = 0664
+	directory mask = 0775
+	guest ok = Yes
+	inherit acls = Yes
+	path = /testpool/rf2
+	read only = No
+	valid users = rfuser rfuser2
+nobody
+Bad User
+
+$ getfacl -p /testpool/rf2
+# file: /testpool/rf2
+# owner: root
+# group: root
+# flags: -s-
+user::rwx
+user:rfuser:rwx
+user:rfuser2:rwx
+group::r-x
+mask::rwx
+other::rwx
+default:user::rwx
+default:user:rfuser:rwx
+default:user:rfuser2:rwx
+default:group::r-x
+default:mask::rwx
+default:other::rwx
+
+--- a named user (rfuser) puts a file
+
+$ echo "written by rfuser over SMB" > /root/rfproof/a.txt; echo "a guest overwrote this" > /root/rfproof/g.txt; echo "a guest wrote this" > /root/rfproof/g1.txt; echo "a guest rewrote its own file" > /root/rfproof/g2.txt
+
+$ smbclient //localhost/rf2 -U "rfuser%Rf-proof-1" -c "put /root/rfproof/a.txt a.txt" 2>&1 | grep -v "^putting"; stat -c "%a %A %U:%G %n" /testpool/rf2/a.txt; getfacl -p /testpool/rf2/a.txt
+664 -rw-rw-r-- rfuser:root /testpool/rf2/a.txt
+# file: /testpool/rf2/a.txt
+# owner: rfuser
+# group: root
+user::rw-
+user:rfuser:rwx	#effective:rw-
+user:rfuser2:rwx	#effective:rw-
+group::r-x	#effective:r--
+mask::rw-
+other::r--
+
+--- a guest (smbclient -N) reads it, then tries to overwrite it
+
+$ smbclient //localhost/rf2 -N -c "get a.txt /root/rfproof/a.guest.txt" 2>&1 | grep -v "^getting"; cat /root/rfproof/a.guest.txt
+tree connect failed: NT_STATUS_ACCESS_DENIED
+cat: /root/rfproof/a.guest.txt: No such file or directory
+
+$ smbclient //localhost/rf2 -N -c "put /root/rfproof/g.txt a.txt" 2>&1 | grep -v "^putting"; cat /testpool/rf2/a.txt
+tree connect failed: NT_STATUS_ACCESS_DENIED
+written by rfuser over SMB
+
+--- a guest writes its own file, then writes it again
+
+$ smbclient //localhost/rf2 -N -c "put /root/rfproof/g1.txt g.txt" 2>&1 | grep -v "^putting"; stat -c "%a %A %U:%G %n" /testpool/rf2/g.txt; getfacl -p /testpool/rf2/g.txt
+tree connect failed: NT_STATUS_ACCESS_DENIED
+stat: cannot statx '/testpool/rf2/g.txt': No such file or directory
+getfacl: /testpool/rf2/g.txt: No such file or directory
+
+$ smbclient //localhost/rf2 -N -c "put /root/rfproof/g2.txt g.txt" 2>&1 | grep -v "^putting"; cat /testpool/rf2/g.txt
+tree connect failed: NT_STATUS_ACCESS_DENIED
+cat: /testpool/rf2/g.txt: No such file or directory
+
+--- the other named user (rfuser2) overwrites rfuser's file
+
+$ smbclient //localhost/rf2 -U "rfuser2%Rf-proof-2" -c "put /root/rfproof/b.txt a.txt" 2>&1 | grep -v "^putting"; cat /testpool/rf2/a.txt
+rfuser2 overwrote this over SMB, and this line is longer
+```
+
+```
+### A2b. a guest share with no valid users, where named users sign in with their passwords, grant ON (not recursive)
+
+$ api POST /pools/testpool/datasets '{"path":"rf2g"}'
+HTTP 202
+{
+  "job": {
+    "id": "2763aeda-e844-486b-8a6a-e83ec8758419",
+    "status": "running",
+    "operation": "zfs.create",
+    "createdAt": "2026-10-12T01:05:17.786Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/2763aeda-e844-486b-8a6a-e83ec8758419   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "zfs.create",
+  "progress": null,
+  "result": {
+    "created": "testpool/rf2g"
+  },
+  "error": null
+}
+
+$ api POST /shares/smb '{"name":"rf2g","path":"/testpool/rf2g","comment":"","browseable":true,"readOnly":false,"guestOk":true,"validUsers":[],"hostsAllow":[],"hostsDeny":[],"grantAccess":{}}'
+HTTP 202
+{
+  "job": {
+    "id": "947d6380-f166-402a-b870-cbfcecf97022",
+    "status": "running",
+    "operation": "smb.share.add",
+    "createdAt": "2026-10-12T01:05:17.924Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/947d6380-f166-402a-b870-cbfcecf97022   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.share.add",
+  "progress": "chmod 757 /testpool/rf2g",
+  "result": {
+    "created": "rf2g",
+    "grant": {
+      "status": "applied",
+      "path": "/testpool/rf2g",
+      "granted": [
+        {
+          "kind": "everyone",
+          "level": "read-write"
+        }
+      ],
+      "skipped": [],
+      "applyToExisting": false
+    }
+  },
+  "error": null
+}
+
+$ st rf2g | cat -A
+[rf2g]$
+^Ipath = /testpool/rf2g$
+^Ibrowseable = yes$
+^Iread only = no$
+^Iguest ok = yes$
+^Iinherit acls = yes$
+^Icreate mask = 0664$
+^Idirectory mask = 0775$
+
+$ testparm -s --section-name=rf2g 2>/dev/null
+
+[rf2g]
+	create mask = 0664
+	directory mask = 0775
+	guest ok = Yes
+	inherit acls = Yes
+	path = /testpool/rf2g
+	read only = No
+
+$ getfacl -p /testpool/rf2g
+# file: /testpool/rf2g
+# owner: root
+# group: root
+user::rwx
+group::r-x
+other::rwx
+
+--- a named user (rfuser, password) puts a file
+
+$ smbclient //localhost/rf2g -U "rfuser%Rf-proof-1" -c "put /root/rfproof/a.txt a.txt" 2>&1 | grep -v "^putting"; stat -c "%a %A %U:%G %n" /testpool/rf2g/a.txt; getfacl -p /testpool/rf2g/a.txt
+664 -rw-rw-r-- rfuser:users /testpool/rf2g/a.txt
+# file: /testpool/rf2g/a.txt
+# owner: rfuser
+# group: users
+user::rw-
+group::rw-
+other::r--
+
+--- a guest (smbclient -N) reads it, then tries to overwrite it
+
+$ rm -f /root/rfproof/a.guest.txt; smbclient //localhost/rf2g -N -c "get a.txt /root/rfproof/a.guest.txt" 2>&1 | grep -v "^getting"; cat /root/rfproof/a.guest.txt
+written by rfuser over SMB
+
+$ smbclient //localhost/rf2g -N -c "put /root/rfproof/g.txt a.txt" 2>&1 | grep -v "^putting"; cat /testpool/rf2g/a.txt
+NT_STATUS_ACCESS_DENIED opening remote file \a.txt
+written by rfuser over SMB
+
+--- a guest writes its own file, then writes it again
+
+$ smbclient //localhost/rf2g -N -c "put /root/rfproof/g1.txt g.txt" 2>&1 | grep -v "^putting"; stat -c "%a %A %U:%G %n" /testpool/rf2g/g.txt; getfacl -p /testpool/rf2g/g.txt
+664 -rw-rw-r-- nobody:nogroup /testpool/rf2g/g.txt
+# file: /testpool/rf2g/g.txt
+# owner: nobody
+# group: nogroup
+user::rw-
+group::rw-
+other::r--
+
+$ smbclient //localhost/rf2g -N -c "put /root/rfproof/g2.txt g.txt" 2>&1 | grep -v "^putting"; cat /testpool/rf2g/g.txt
+a guest rewrote its own file
+
+--- a second named user (rfuser2, password) tries to overwrite rfuser's file
+
+$ smbclient //localhost/rf2g -U "rfuser2%Rf-proof-2" -c "put /root/rfproof/b.txt a.txt" 2>&1 | grep -v "^putting"; cat /testpool/rf2g/a.txt
+rfuser2 overwrote this over SMB, and this line is longer
+```
+
+### §A3 — Pre-existing stanzas
+
+**Pass criteria, stated before the run.** Two stanzas written by hand into `/etc/samba/smb.conf` in
+the shape 0.4.2's `renderStanza` wrote (no `inherit acls`, no masks): `rf3`, and `rf3n` with
+`inherit acls = no` and `create mode = 0700` added. (a) An edit with no grant resending the
+stanza's own values leaves the file byte-identical (`cmp`); a comment change differs in that line
+only. (b) An edit that grants (valid users changed, `grantAccess` present) adds exactly the three
+missing lines and moves nothing; a second granting edit adds none again. (c) `rf3n` edited with a
+grant keeps `inherit acls = no` and `create mode = 0700` and gains only `directory mask = 0775`;
+`testparm` agrees.
+
+```
+### A3. stanzas written as 0.4.2 wrote them (none of the three lines), and one with inherit acls = no and create mode = 0700, then edited through the API
+
+$ api POST /pools/testpool/datasets '{"path":"rf3"}'
+HTTP 202
+{
+  "job": {
+    "id": "7e4598b8-c0f5-4efb-8b13-2c74c093bdff",
+    "status": "running",
+    "operation": "zfs.create",
+    "createdAt": "2026-10-12T01:05:43.269Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/7e4598b8-c0f5-4efb-8b13-2c74c093bdff   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "zfs.create",
+  "progress": null,
+  "result": {
+    "created": "testpool/rf3"
+  },
+  "error": null
+}
+
+$ mkdir /testpool/rf3/n && tail -c1 /etc/samba/smb.conf | od -An -c && printf "\n[rf3]\n\tpath = /testpool/rf3\n\tcomment = pre-existing\n\tbrowseable = yes\n\tread only = no\n\tguest ok = no\n\tvalid users = rfuser\n\n[rf3n]\n\tpath = /testpool/rf3/n\n\tbrowseable = yes\n\tread only = no\n\tguest ok = no\n\tinherit acls = no\n\tcreate mode = 0700\n\tvalid users = rfuser\n" >> /etc/samba/smb.conf && smbcontrol smbd reload-config && testparm -s 2>&1 >/dev/null | grep -ciE "error|unknown"
+  \n
+0
+
+$ st rf3 | cat -A; st rf3n | cat -A
+[rf3]$
+^Ipath = /testpool/rf3$
+^Icomment = pre-existing$
+^Ibrowseable = yes$
+^Iread only = no$
+^Iguest ok = no$
+^Ivalid users = rfuser$
+$
+[rf3n]$
+^Ipath = /testpool/rf3/n$
+^Ibrowseable = yes$
+^Iread only = no$
+^Iguest ok = no$
+^Iinherit acls = no$
+^Icreate mode = 0700$
+^Ivalid users = rfuser$
+
+--- A3a. an edit with no grant that resends the stanza as it is
+
+$ cp /etc/samba/smb.conf /root/rfproof/c0
+
+$ api PUT /shares/smb/rf3 '{"path":"/testpool/rf3","comment":"pre-existing","browseable":true,"readOnly":false,"guestOk":false,"validUsers":["rfuser"],"hostsAllow":[],"hostsDeny":[]}'
+HTTP 202
+{
+  "job": {
+    "id": "c68b61f9-9996-45d6-a84f-567ef272a9d2",
+    "status": "running",
+    "operation": "smb.config.set",
+    "createdAt": "2026-10-12T01:05:43.545Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/c68b61f9-9996-45d6-a84f-567ef272a9d2   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.config.set",
+  "progress": null,
+  "result": {
+    "updated": "rf3"
+  },
+  "error": null
+}
+
+$ cmp /root/rfproof/c0 /etc/samba/smb.conf && echo smb.conf byte-identical
+smb.conf byte-identical
+
+--- A3a-2. an edit with no grant that changes the comment: one line, none of the three
+
+$ api PUT /shares/smb/rf3 '{"path":"/testpool/rf3","comment":"pre-existing, edited","browseable":true,"readOnly":false,"guestOk":false,"validUsers":["rfuser"],"hostsAllow":[],"hostsDeny":[]}'
+HTTP 202
+{
+  "job": {
+    "id": "cfe069fa-428a-4623-8654-6118b4b16ec6",
+    "status": "running",
+    "operation": "smb.config.set",
+    "createdAt": "2026-10-12T01:05:44.228Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/cfe069fa-428a-4623-8654-6118b4b16ec6   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.config.set",
+  "progress": null,
+  "result": {
+    "updated": "rf3"
+  },
+  "error": null
+}
+
+$ diff /root/rfproof/c0 /etc/samba/smb.conf; st rf3 | cat -A
+315c315
+< 	comment = pre-existing
+---
+> 	comment = pre-existing, edited
+[rf3]$
+^Ipath = /testpool/rf3$
+^Icomment = pre-existing, edited$
+^Ibrowseable = yes$
+^Iread only = no$
+^Iguest ok = no$
+^Ivalid users = rfuser$
+$
+
+--- A3b. an edit that grants (valid users changed, grantAccess present)
+
+$ cp /etc/samba/smb.conf /root/rfproof/c1
+
+$ api PUT /shares/smb/rf3 '{"path":"/testpool/rf3","comment":"pre-existing, edited","browseable":true,"readOnly":false,"guestOk":false,"validUsers":["rfuser","rfuser2"],"hostsAllow":[],"hostsDeny":[],"grantAccess":{}}'
+HTTP 202
+{
+  "job": {
+    "id": "c6d874a0-71e9-4768-9fdf-1814b13d9a56",
+    "status": "running",
+    "operation": "smb.config.set",
+    "createdAt": "2026-10-12T01:05:44.903Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/c6d874a0-71e9-4768-9fdf-1814b13d9a56   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.config.set",
+  "progress": "chmod g+s /testpool/rf3",
+  "result": {
+    "updated": "rf3",
+    "grant": {
+      "status": "applied",
+      "path": "/testpool/rf3",
+      "granted": [
+        {
+          "kind": "user",
+          "name": "rfuser",
+          "level": "read-write"
+        },
+        {
+          "kind": "user",
+          "name": "rfuser2",
+          "level": "read-write"
+        }
+      ],
+      "skipped": [],
+      "applyToExisting": false
+    }
+  },
+  "error": null
+}
+
+$ diff /root/rfproof/c1 /etc/samba/smb.conf; st rf3 | cat -A
+319c319,322
+< 	valid users = rfuser
+---
+> 	valid users = rfuser rfuser2
+> 	inherit acls = yes
+> 	create mask = 0664
+> 	directory mask = 0775
+[rf3]$
+^Ipath = /testpool/rf3$
+^Icomment = pre-existing, edited$
+^Ibrowseable = yes$
+^Iread only = no$
+^Iguest ok = no$
+^Ivalid users = rfuser rfuser2$
+^Iinherit acls = yes$
+^Icreate mask = 0664$
+^Idirectory mask = 0775$
+$
+
+$ for p in "inherit acls" "create mask" "directory mask"; do printf "%s = " "$p"; testparm -s --section-name=rf3 --parameter-name="$p" 2>/dev/null; done
+inherit acls = Yes
+create mask = 0664
+directory mask = 0775
+
+--- A3b-2. a second granting edit: nothing added twice
+
+$ cp /etc/samba/smb.conf /root/rfproof/c2
+
+$ api PUT /shares/smb/rf3 '{"path":"/testpool/rf3","comment":"pre-existing, edited","browseable":true,"readOnly":false,"guestOk":false,"validUsers":["rfuser"],"hostsAllow":[],"hostsDeny":[],"grantAccess":{}}'
+HTTP 202
+{
+  "job": {
+    "id": "ea957e71-7ad3-4984-9998-9e2bd1f043c9",
+    "status": "running",
+    "operation": "smb.config.set",
+    "createdAt": "2026-10-12T01:05:45.750Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/ea957e71-7ad3-4984-9998-9e2bd1f043c9   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.config.set",
+  "progress": "chmod g+s /testpool/rf3",
+  "result": {
+    "updated": "rf3",
+    "grant": {
+      "status": "applied",
+      "path": "/testpool/rf3",
+      "granted": [
+        {
+          "kind": "user",
+          "name": "rfuser",
+          "level": "read-write"
+        }
+      ],
+      "skipped": [],
+      "applyToExisting": false
+    }
+  },
+  "error": null
+}
+
+$ diff /root/rfproof/c2 /etc/samba/smb.conf; st rf3 | grep -ciE "^\s*(inherit acls|create mask|directory mask) ="
+319c319
+< 	valid users = rfuser rfuser2
+---
+> 	valid users = rfuser
+3
+
+--- A3c. the inherit acls = no / create mode = 0700 stanza edited with a grant
+
+$ cp /etc/samba/smb.conf /root/rfproof/c3
+
+$ api PUT /shares/smb/rf3n '{"path":"/testpool/rf3/n","comment":"","browseable":true,"readOnly":false,"guestOk":false,"validUsers":["rfuser","rfuser2"],"hostsAllow":[],"hostsDeny":[],"grantAccess":{}}'
+HTTP 202
+{
+  "job": {
+    "id": "3f28f0a7-e041-4457-b790-60823b7dc51d",
+    "status": "running",
+    "operation": "smb.config.set",
+    "createdAt": "2026-10-12T01:05:46.436Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/3f28f0a7-e041-4457-b790-60823b7dc51d   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.config.set",
+  "progress": "chmod g+s /testpool/rf3/n",
+  "result": {
+    "updated": "rf3n",
+    "grant": {
+      "status": "applied",
+      "path": "/testpool/rf3/n",
+      "granted": [
+        {
+          "kind": "user",
+          "name": "rfuser",
+          "level": "read-write"
+        },
+        {
+          "kind": "user",
+          "name": "rfuser2",
+          "level": "read-write"
+        }
+      ],
+      "skipped": [],
+      "applyToExisting": false
+    }
+  },
+  "error": null
+}
+
+$ diff /root/rfproof/c3 /etc/samba/smb.conf; st rf3n | cat -A
+331c331,332
+< 	valid users = rfuser
+---
+> 	valid users = rfuser rfuser2
+> 	directory mask = 0775
+[rf3n]$
+^Ipath = /testpool/rf3/n$
+^Ibrowseable = yes$
+^Iread only = no$
+^Iguest ok = no$
+^Iinherit acls = no$
+^Icreate mode = 0700$
+^Ivalid users = rfuser rfuser2$
+^Idirectory mask = 0775$
+
+$ for p in "inherit acls" "create mask" "directory mask"; do printf "%s = " "$p"; testparm -s --section-name=rf3n --parameter-name="$p" 2>/dev/null; done
+inherit acls = No
+create mask = 0700
+directory mask = 0775
+
+$ testparm -s 2>&1 >/dev/null | grep -ciE "error|unknown"
+0
+```
+
+### §A4 — Teardown and node health
+
+**Pass criteria, stated before the run.** Every share, dataset and user this run made is removed
+through the API; smb.conf, `/etc/exports` and `/etc/fstab` have the md5 they had before the deploy
+(§A0); no CIFS mount is left; `testparm` is clean; `anasd anas smbd` active with NRestarts 0;
+`/v1/health` ok on the socket and through the front door; no warning-or-worse line from anasd or
+the gateway since the deploy (01:02:00 UTC); the node runs the build under test; the helpers'
+directory is removed.
+
+```
+### A4. teardown through the API; node health
+
+$ api DELETE /shares/smb/rf1
+HTTP 409
+X-Anas-Confirm-Code: 06db8ecefcf4
+{
+  "error": {
+    "code": "CONFIRMATION_REQUIRED",
+    "message": "Removing SMB share 'rf1' stops sharing '/testpool/rf1'",
+    "warnings": [
+      "Removing SMB share 'rf1' makes the shared path '/testpool/rf1' inaccessible over SMB."
+    ]
+  }
+}
+
+$ api DELETE /shares/smb/rf1   [X-Anas-Confirm: 06db8ecefcf4]
+HTTP 202
+{
+  "job": {
+    "id": "fdfaaee8-38e0-49a6-836a-f2717bfc70ab",
+    "status": "running",
+    "operation": "smb.share.remove",
+    "createdAt": "2026-10-12T01:06:23.860Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/fdfaaee8-38e0-49a6-836a-f2717bfc70ab   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.share.remove",
+  "progress": null,
+  "result": {
+    "removed": "rf1"
+  },
+  "error": null
+}
+
+$ api DELETE /shares/smb/rf2
+HTTP 409
+X-Anas-Confirm-Code: 6e88145801e8
+{
+  "error": {
+    "code": "CONFIRMATION_REQUIRED",
+    "message": "Removing SMB share 'rf2' stops sharing '/testpool/rf2'",
+    "warnings": [
+      "Removing SMB share 'rf2' makes the shared path '/testpool/rf2' inaccessible over SMB."
+    ]
+  }
+}
+
+$ api DELETE /shares/smb/rf2   [X-Anas-Confirm: 6e88145801e8]
+HTTP 202
+{
+  "job": {
+    "id": "4ad0f264-46e6-4d40-a0e7-f48a854fb09e",
+    "status": "running",
+    "operation": "smb.share.remove",
+    "createdAt": "2026-10-12T01:06:24.683Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/4ad0f264-46e6-4d40-a0e7-f48a854fb09e   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.share.remove",
+  "progress": null,
+  "result": {
+    "removed": "rf2"
+  },
+  "error": null
+}
+
+$ api DELETE /shares/smb/rf2g
+HTTP 409
+X-Anas-Confirm-Code: 3b311f19223c
+{
+  "error": {
+    "code": "CONFIRMATION_REQUIRED",
+    "message": "Removing SMB share 'rf2g' stops sharing '/testpool/rf2g'",
+    "warnings": [
+      "Removing SMB share 'rf2g' makes the shared path '/testpool/rf2g' inaccessible over SMB."
+    ]
+  }
+}
+
+$ api DELETE /shares/smb/rf2g   [X-Anas-Confirm: 3b311f19223c]
+HTTP 202
+{
+  "job": {
+    "id": "c9258d60-6f38-469d-b5c6-8ebc7d63dd09",
+    "status": "running",
+    "operation": "smb.share.remove",
+    "createdAt": "2026-10-12T01:06:25.465Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/c9258d60-6f38-469d-b5c6-8ebc7d63dd09   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.share.remove",
+  "progress": null,
+  "result": {
+    "removed": "rf2g"
+  },
+  "error": null
+}
+
+$ api DELETE /shares/smb/rf3
+HTTP 409
+X-Anas-Confirm-Code: 78d5a88cdb33
+{
+  "error": {
+    "code": "CONFIRMATION_REQUIRED",
+    "message": "Removing SMB share 'rf3' stops sharing '/testpool/rf3'",
+    "warnings": [
+      "Removing SMB share 'rf3' makes the shared path '/testpool/rf3' inaccessible over SMB."
+    ]
+  }
+}
+
+$ api DELETE /shares/smb/rf3   [X-Anas-Confirm: 78d5a88cdb33]
+HTTP 202
+{
+  "job": {
+    "id": "52390d45-57de-478e-9dfd-3db4cf74db4a",
+    "status": "running",
+    "operation": "smb.share.remove",
+    "createdAt": "2026-10-12T01:06:26.179Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/52390d45-57de-478e-9dfd-3db4cf74db4a   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.share.remove",
+  "progress": null,
+  "result": {
+    "removed": "rf3"
+  },
+  "error": null
+}
+
+$ api DELETE /shares/smb/rf3n
+HTTP 409
+X-Anas-Confirm-Code: 7e66a1c7b7bd
+{
+  "error": {
+    "code": "CONFIRMATION_REQUIRED",
+    "message": "Removing SMB share 'rf3n' stops sharing '/testpool/rf3/n'",
+    "warnings": [
+      "Removing SMB share 'rf3n' makes the shared path '/testpool/rf3/n' inaccessible over SMB."
+    ]
+  }
+}
+
+$ api DELETE /shares/smb/rf3n   [X-Anas-Confirm: 7e66a1c7b7bd]
+HTTP 202
+{
+  "job": {
+    "id": "b850ddb2-611c-450e-bbbb-0ec6f9ee271c",
+    "status": "running",
+    "operation": "smb.share.remove",
+    "createdAt": "2026-10-12T01:06:26.969Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/b850ddb2-611c-450e-bbbb-0ec6f9ee271c   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "smb.share.remove",
+  "progress": null,
+  "result": {
+    "removed": "rf3n"
+  },
+  "error": null
+}
+
+$ grep -cE "^\[(rf1|rf2|rf2g|rf3|rf3n)\]" /etc/samba/smb.conf
+0
+
+$ api DELETE /pools/testpool/datasets/rf1
+HTTP 409
+X-Anas-Confirm-Code: b473dd3f8fa4
+{
+  "error": {
+    "code": "CONFIRMATION_REQUIRED",
+    "message": "Destroying dataset 'testpool/rf1' permanently erases its data",
+    "warnings": [
+      "Destroying 'testpool/rf1' is irreversible — all data in the dataset is permanently lost."
+    ]
+  }
+}
+
+$ api DELETE /pools/testpool/datasets/rf1   [X-Anas-Confirm: b473dd3f8fa4]
+HTTP 202
+{
+  "job": {
+    "id": "8f36e1eb-eadb-4bcc-a07f-e0d06d327d9c",
+    "status": "running",
+    "operation": "zfs.destroy",
+    "createdAt": "2026-10-12T01:06:28.135Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/8f36e1eb-eadb-4bcc-a07f-e0d06d327d9c   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "zfs.destroy",
+  "progress": null,
+  "result": {
+    "destroyed": "testpool/rf1"
+  },
+  "error": null
+}
+
+$ api DELETE /pools/testpool/datasets/rf2
+HTTP 409
+X-Anas-Confirm-Code: 127a64179ffc
+{
+  "error": {
+    "code": "CONFIRMATION_REQUIRED",
+    "message": "Destroying dataset 'testpool/rf2' permanently erases its data",
+    "warnings": [
+      "Destroying 'testpool/rf2' is irreversible — all data in the dataset is permanently lost."
+    ]
+  }
+}
+
+$ api DELETE /pools/testpool/datasets/rf2   [X-Anas-Confirm: 127a64179ffc]
+HTTP 202
+{
+  "job": {
+    "id": "427b4c4a-a345-4421-a381-d9c149ce9546",
+    "status": "running",
+    "operation": "zfs.destroy",
+    "createdAt": "2026-10-12T01:06:29.311Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/427b4c4a-a345-4421-a381-d9c149ce9546   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "zfs.destroy",
+  "progress": null,
+  "result": {
+    "destroyed": "testpool/rf2"
+  },
+  "error": null
+}
+
+$ api DELETE /pools/testpool/datasets/rf2g
+HTTP 409
+X-Anas-Confirm-Code: 400c1180b6ad
+{
+  "error": {
+    "code": "CONFIRMATION_REQUIRED",
+    "message": "Destroying dataset 'testpool/rf2g' permanently erases its data",
+    "warnings": [
+      "Destroying 'testpool/rf2g' is irreversible — all data in the dataset is permanently lost."
+    ]
+  }
+}
+
+$ api DELETE /pools/testpool/datasets/rf2g   [X-Anas-Confirm: 400c1180b6ad]
+HTTP 202
+{
+  "job": {
+    "id": "35961265-4266-4ce8-9a02-fc1fff92e3a3",
+    "status": "running",
+    "operation": "zfs.destroy",
+    "createdAt": "2026-10-12T01:06:30.337Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/35961265-4266-4ce8-9a02-fc1fff92e3a3   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "zfs.destroy",
+  "progress": null,
+  "result": {
+    "destroyed": "testpool/rf2g"
+  },
+  "error": null
+}
+
+$ api DELETE /pools/testpool/datasets/rf3
+HTTP 409
+X-Anas-Confirm-Code: 8169bcb886ca
+{
+  "error": {
+    "code": "CONFIRMATION_REQUIRED",
+    "message": "Destroying dataset 'testpool/rf3' permanently erases its data",
+    "warnings": [
+      "Destroying 'testpool/rf3' is irreversible — all data in the dataset is permanently lost."
+    ]
+  }
+}
+
+$ api DELETE /pools/testpool/datasets/rf3   [X-Anas-Confirm: 8169bcb886ca]
+HTTP 202
+{
+  "job": {
+    "id": "70d5b291-7c6d-434f-9f7c-da87191daf75",
+    "status": "running",
+    "operation": "zfs.destroy",
+    "createdAt": "2026-10-12T01:06:31.528Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/70d5b291-7c6d-434f-9f7c-da87191daf75   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "zfs.destroy",
+  "progress": null,
+  "result": {
+    "destroyed": "testpool/rf3"
+  },
+  "error": null
+}
+
+$ api DELETE /identity/users/rfuser
+HTTP 409
+X-Anas-Confirm-Code: 46413dea0892
+{
+  "error": {
+    "code": "CONFIRMATION_REQUIRED",
+    "message": "Deleting share user 'rfuser' removes the account",
+    "warnings": [
+      "User 'rfuser' (uid 1004) will be removed from the system",
+      "Files owned by the user keep their uid (1004) — ownership is not changed, and a later user with the same uid would own them",
+      "Its SMB password entry will be removed"
+    ]
+  }
+}
+
+$ api DELETE /identity/users/rfuser   [X-Anas-Confirm: 46413dea0892]
+HTTP 202
+{
+  "job": {
+    "id": "2308a516-e8b1-4888-9b44-6ffe0d458e1d",
+    "status": "running",
+    "operation": "identity.user.delete",
+    "createdAt": "2026-10-12T01:06:32.326Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/2308a516-e8b1-4888-9b44-6ffe0d458e1d   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "identity.user.delete",
+  "progress": "Deleting share user 'rfuser'",
+  "result": {
+    "deleted": "rfuser",
+    "smbEntryRemoved": true
+  },
+  "error": null
+}
+
+$ api DELETE /identity/users/rfuser2
+HTTP 409
+X-Anas-Confirm-Code: 25799f119ed0
+{
+  "error": {
+    "code": "CONFIRMATION_REQUIRED",
+    "message": "Deleting share user 'rfuser2' removes the account",
+    "warnings": [
+      "User 'rfuser2' (uid 1005) will be removed from the system",
+      "Files owned by the user keep their uid (1005) — ownership is not changed, and a later user with the same uid would own them",
+      "Its SMB password entry will be removed"
+    ]
+  }
+}
+
+$ api DELETE /identity/users/rfuser2   [X-Anas-Confirm: 25799f119ed0]
+HTTP 202
+{
+  "job": {
+    "id": "8dec074f-4c21-4e55-9364-c2ced891d17e",
+    "status": "running",
+    "operation": "identity.user.delete",
+    "createdAt": "2026-10-12T01:06:33.220Z",
+    "createdBy": "root"
+  }
+}
+
+$ api GET /jobs/8dec074f-4c21-4e55-9364-c2ced891d17e   (polled until done; status, operation, last progress, result, error)
+{
+  "status": "completed",
+  "operation": "identity.user.delete",
+  "progress": "Deleting share user 'rfuser2'",
+  "result": {
+    "deleted": "rfuser2",
+    "smbEntryRemoved": true
+  },
+  "error": null
+}
+
+$ zfs list -r -H -o name testpool; ls -d /testpool/rf1 /testpool/rf2 /testpool/rf2g /testpool/rf3 2>&1
+testpool
+testpool/share1
+ls: cannot access '/testpool/rf1': No such file or directory
+ls: cannot access '/testpool/rf2': No such file or directory
+ls: cannot access '/testpool/rf2g': No such file or directory
+ls: cannot access '/testpool/rf3': No such file or directory
+
+$ id rfuser rfuser2 2>&1; pdbedit -L | grep -c "^rfuser"; mount | grep -c cifs
+id: ‘rfuser’: no such user
+id: ‘rfuser2’: no such user
+0
+0
+
+(the config files ANAS or this proof touched, against their sums taken before the deploy in §0)
+
+$ md5sum /etc/samba/smb.conf /etc/exports /etc/fstab
+5df9ad3c89d06fc0648d7a721f754f0e  /etc/samba/smb.conf
+6f30717e76279d63f4bea8820c99b71d  /etc/exports
+938b9f48c34c80d070c81f5c2f65ca08  /etc/fstab
+
+$ testparm -s 2>&1 >/dev/null | grep -iE "error|warn|unknown" | sort | uniq -c
+
+$ systemctl is-active anasd anas smbd; systemctl show -p NRestarts --value anasd; systemctl show -p ActiveEnterTimestamp --value anasd
+active
+active
+active
+0
+Mon 2026-10-12 01:02:00 UTC
+
+$ curl -s --unix-socket /run/anas/anasd.sock http://localhost/v1/health; echo
+{"status":"ok","version":"0.4.2"}
+
+$ api GET /health
+HTTP 200
+{
+  "status": "ok",
+  "version": "0.4.2"
+}
+
+$ journalctl -u anasd --since "2026-10-12 01:02:00" --no-pager -o cat | grep -cE "\"level\":(40|50|60)"
+0
+
+$ journalctl -u anas --since "2026-10-12 01:02:00" --no-pager -p warning -o cat | grep -v "\[auth\] Using pve auth provider" | wc -l
+0
+
+(the whole built tree the node runs, one sum per package: every dist file, sorted, md5 of the md5 list)
+
+$ cd /opt/anas/packages && for p in shared daemon gateway; do printf "%s " $p; (cd $p/dist && find . -type f | sort | xargs md5sum | md5sum); done
+shared 98a9aac66e0d57ea80911bfcc777eb45  -
+daemon b036c7d530b4004f3f46e05a3782762c  -
+gateway 35b8e1dc2116dfcefdb02ee2c14746e5  -
+
+$ cd /opt/anas/packages/daemon/dist && md5sum parsers/smb-conf.js routes/shares-smb.js
+4aaea3098a3af2868a39ec4d523f8eb9  parsers/smb-conf.js
+36cebbf42d055a8fa3bee37c52750ad8  routes/shares-smb.js
+
+$ rm -rf /root/rfproof && ls -d /root/rfproof 2>&1
+ls: cannot access '/root/rfproof': No such file or directory
+```

@@ -2,10 +2,10 @@ import type { SmbShare, UpdateSmbShareRequest } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  addMissingGrantParams,
   addShare,
   composeVfsObjects,
   customVfsRefusal,
-  ensureInheritAcls,
   formatMaxSize,
   getShare,
   hasCustomVfsObjects,
@@ -144,6 +144,8 @@ describe('addShare — appends only, existing bytes untouched', () => {
       '\tread only = no',
       '\tguest ok = no',
       '\tinherit acls = yes',
+      '\tcreate mask = 0664',
+      '\tdirectory mask = 0775',
       '',
     ].join('\n'))
     // And the new share round-trips through the typed model.
@@ -168,42 +170,66 @@ describe('addShare — appends only, existing bytes untouched', () => {
   })
 })
 
-describe('inherit acls — files saved over SMB inherit the grant (live proof 0.4.3 F2)', () => {
-  it('a created stanza always carries inherit acls = yes', () => {
+describe('the grant parameters — what one user saves over SMB the others can change (live proof 0.4.3 F2, re-proof RF1)', () => {
+  const GRANT_LINES = ['\tinherit acls = yes', '\tcreate mask = 0664', '\tdirectory mask = 0775']
+
+  it('a created stanza always carries inherit acls, create mask 0664 and directory mask 0775, in that order after guest ok', () => {
     for (const req of [
       { name: 'plain', path: '/tank/plain' },
       { name: 'ro', path: '/tank/ro', readOnly: true, validUsers: ['alice'] },
       { name: 'pub', path: '/tank/pub', guestOk: true },
     ]) {
-      const next = addShare('', req)
-      assert.ok(next.split('\n').includes('\tinherit acls = yes'), `${req.name}: ${next}`)
+      const lines = addShare('', req).split('\n')
+      const at = lines.findIndex(l => l.startsWith('\tguest ok = '))
+      assert.deepEqual(lines.slice(at + 1, at + 4), GRANT_LINES, `${req.name}: ${lines.join('\n')}`)
     }
   })
 
-  it('an edit with a grant adds inherit acls = yes when the stanza lacks it, touching nothing else', () => {
+  it('an edit with a grant adds all three to a stanza that lacks them, after its last line, touching nothing else', () => {
     const text = ['[global]', '\tworkgroup = WG', '', '[media]', '\tpath = /tank/media', '\tvalid users = alice', '', '[next]', '\tpath = /tank/next', ''].join('\n')
-    const next = ensureInheritAcls(text, 'media')
-    assert.equal(next, ['[global]', '\tworkgroup = WG', '', '[media]', '\tpath = /tank/media', '\tvalid users = alice', '\tinherit acls = yes', '', '[next]', '\tpath = /tank/next', ''].join('\n'))
+    const next = addMissingGrantParams(text, 'media')
+    assert.equal(next, ['[global]', '\tworkgroup = WG', '', '[media]', '\tpath = /tank/media', '\tvalid users = alice', ...GRANT_LINES, '', '[next]', '\tpath = /tank/next', ''].join('\n'))
   })
 
-  it('an edit with a grant leaves an explicit inherit acls = no alone (any spelling)', () => {
+  it('an edit with a grant leaves an explicit inherit acls = no alone (any spelling) and adds only the two masks', () => {
     for (const line of ['\tinherit acls = no', '\tInherit ACLs = No', '\tinheritacls = false']) {
       const text = ['[media]', '\tpath = /tank/media', line, '\tvalid users = alice', ''].join('\n')
-      assert.equal(ensureInheritAcls(text, 'media'), text, line)
+      assert.equal(addMissingGrantParams(text, 'media'), ['[media]', '\tpath = /tank/media', line, '\tvalid users = alice', '\tcreate mask = 0664', '\tdirectory mask = 0775', ''].join('\n'), line)
     }
   })
 
-  it('an edit without a grant leaves a stanza lacking inherit acls byte-identical', () => {
-    const text = ['[media]', '\tpath = /tank/media', '\tread only = no', '\tvalid users = alice', ''].join('\n')
-    // updateShare is the whole of a grant-less edit: it never adds the key.
-    assert.equal(updateShare(text, 'media', { readOnly: false, validUsers: ['alice'] }), text)
-    assert.equal(updateShare(text, 'media', { comment: 'Media' }).includes('inherit acls'), false)
+  it('an edit with a grant never touches a mask the operator set (any spelling) and adds only what is missing', () => {
+    // `create mode` is Samba's synonym of `create mask`: it stands, and only `directory mask` is added.
+    const createMode = ['[media]', '\tpath = /tank/media', '\tinherit acls = no', '\tcreate mode = 0700', '\tvalid users = alice', ''].join('\n')
+    assert.equal(addMissingGrantParams(createMode, 'media'), ['[media]', '\tpath = /tank/media', '\tinherit acls = no', '\tcreate mode = 0700', '\tvalid users = alice', '\tdirectory mask = 0775', ''].join('\n'))
+    // `directory mode` is the synonym of `directory mask`; spacing and case fold like every parameter.
+    const dirMode = ['[media]', '\tpath = /tank/media', '\tDirectory Mode = 0700', '\tcreatemask = 0600', ''].join('\n')
+    assert.equal(addMissingGrantParams(dirMode, 'media'), ['[media]', '\tpath = /tank/media', '\tDirectory Mode = 0700', '\tcreatemask = 0600', '\tinherit acls = yes', ''].join('\n'))
   })
 
-  it('ensureInheritAcls never conjures a share or edits [global]', () => {
+  it('a stanza that defines all three, whatever the values, is returned byte-identical', () => {
+    for (const body of [
+      ['\tinherit acls = yes', '\tcreate mask = 0664', '\tdirectory mask = 0775'],
+      ['\tinherit acls = no', '\tcreate mode = 0744', '\tdirectory mode = 0755'],
+    ]) {
+      const text = ['[media]', '\tpath = /tank/media', ...body, '\tvalid users = alice', '', '[next]', '\tpath = /tank/next', ''].join('\n')
+      assert.equal(addMissingGrantParams(text, 'media'), text, body.join(' | '))
+    }
+  })
+
+  it('an edit without a grant leaves a stanza lacking the three byte-identical', () => {
+    const text = ['[media]', '\tpath = /tank/media', '\tread only = no', '\tvalid users = alice', ''].join('\n')
+    // updateShare is the whole of a grant-less edit: it never adds the keys.
+    assert.equal(updateShare(text, 'media', { readOnly: false, validUsers: ['alice'] }), text)
+    const commented = updateShare(text, 'media', { comment: 'Media' })
+    for (const key of ['inherit acls', 'create mask', 'directory mask'])
+      assert.equal(commented.includes(key), false, key)
+  })
+
+  it('addMissingGrantParams never conjures a share or edits [global]', () => {
     const text = ['[global]', '\tworkgroup = WG', ''].join('\n')
-    assert.equal(ensureInheritAcls(text, 'missing'), text)
-    assert.equal(ensureInheritAcls(text, 'global'), text)
+    assert.equal(addMissingGrantParams(text, 'missing'), text)
+    assert.equal(addMissingGrantParams(text, 'global'), text)
   })
 })
 
@@ -955,6 +981,8 @@ describe('managed self-service keys (smbsvc.1)', () => {
       '\tread only = no',
       '\tguest ok = no',
       '\tinherit acls = yes',
+      '\tcreate mask = 0664',
+      '\tdirectory mask = 0775',
       '\tvfs objects = shadow_copy2',
       '\tshadow:format = anas-hourly-%Y-%m-%dT%H%M%SZ',
       '\tshadow:snapdir = .zfs/snapshot',
@@ -1163,6 +1191,8 @@ describe('fruit max-size unit choice + round-trip (smbsvc.3)', () => {
       '\tread only = no',
       '\tguest ok = no',
       '\tinherit acls = yes',
+      '\tcreate mask = 0664',
+      '\tdirectory mask = 0775',
       '\tvfs objects = catia fruit streams_xattr',
       '\tfruit:time machine = yes',
       '\tfruit:time machine max size = 500G',

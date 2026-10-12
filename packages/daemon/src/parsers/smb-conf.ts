@@ -286,11 +286,19 @@ const PARAM = {
   serverString: { canonical: 'server string', norms: ['serverstring'] },
   interfaces: { canonical: 'interfaces', norms: ['interfaces'] },
   bindInterfacesOnly: { canonical: 'bind interfaces only', norms: ['bindinterfacesonly'], unset: 'no' },
-  // Samba honours the parent directory's default ACL on files and directories
-  // it creates only with this on (its default is no): without it a file one
-  // user saves is masked by `create mask` (0744) and the other granted users
-  // get read at most. No synonyms.
+  // ── The share-path grant's parameters (access.r1, re-proof RF1). Samba
+  // creates a file with mode 0666 (plus owner execute from the DOS archive
+  // bit) AND `create mask`, a directory with 0777 AND `directory mask`, and
+  // the kernel clamps the inherited default ACL's mask entry with that mode's
+  // group bits. Samba's defaults (0744, 0755) clamp every named user to read
+  // on what another user saves, `inherit acls` or not. 0664/0775 are the masks
+  // both reference NAS products write; `inherit acls` is OpenMediaVault's
+  // default. No synonyms for `inherit acls` (Samba's default: no).
   inheritAcls: { canonical: 'inherit acls', norms: ['inheritacls'], unset: 'no' },
+  // `create mode` is a documented synonym of `create mask` (default 0744).
+  createMask: { canonical: 'create mask', norms: ['createmask', 'createmode'] },
+  // `directory mode` is a documented synonym of `directory mask` (default 0755).
+  directoryMask: { canonical: 'directory mask', norms: ['directorymask', 'directorymode'] },
   // ── Self-service features (smbsvc.1–3). The `vfs objects` line is COMPOSED
   // from the enabled feature set (composeVfsObjects below) — never hand-merged.
   // Keys are case- and space-insensitive like every parameter ("fruit:time
@@ -1044,6 +1052,21 @@ function shareEdits(req: UpdateSmbShareRequest | CreateSmbShareRequest): KeyEdit
 }
 
 /**
+ * The parameters an ANAS-written share stanza carries so the share-path grant
+ * holds for files saved over SMB, in the order they are written (access.r1 RF1,
+ * operator ruling 2026-10-11): `inherit acls = yes`, `create mask = 0664`,
+ * `directory mask = 0775`. A new file is 0666 AND 0664 = 0664, so the
+ * inherited ACL's mask is rw- (named users rw-, group and everyone r--, no
+ * execute); a new directory is 0775, mask rwx. No `force create mode` (a
+ * client's read-only attribute is honoured) and no `inherit permissions`.
+ */
+const GRANT_PARAMS: readonly (readonly [SmbParam, string])[] = [
+  [PARAM.inheritAcls, 'yes'],
+  [PARAM.createMask, '0664'],
+  [PARAM.directoryMask, '0775'],
+]
+
+/**
  * Render a brand-new share stanza (no surrounding blank lines). `selfService`
  * carries the RESOLVED features to enable at create time (value = set; a
  * `null`/omitted feature is simply not written).
@@ -1060,10 +1083,13 @@ function renderStanza(req: CreateSmbShareRequest, indent: string, selfService?: 
   add(PARAM.browseable, boolStr(req.browseable ?? true))
   add(PARAM.readOnly, boolStr(req.readOnly ?? false))
   add(PARAM.guestOk, boolStr(req.guestOk ?? false))
-  // Files saved over SMB inherit the path's default ACL, so what one granted
-  // user writes the others can use (live proof 0.4.3 F2). Every ANAS-written
-  // stanza carries it; an edit adds it only with a grant ({@link ensureInheritAcls}).
-  add(PARAM.inheritAcls, 'yes')
+  // What one granted user saves over SMB the others can change: the masks let
+  // the inherited default ACL keep write for the named users, and no execute
+  // bit lands on a saved file (re-proof RF1). Every ANAS-written stanza carries
+  // all three; an edit adds the missing ones only with a grant
+  // ({@link addMissingGrantParams}).
+  for (const [param, value] of GRANT_PARAMS)
+    add(param, value)
   if (req.validUsers && req.validUsers.length)
     add(PARAM.validUsers, req.validUsers.join(' '))
   if (req.hostsAllow && req.hostsAllow.length)
@@ -1150,21 +1176,25 @@ export function updateShare(text: string, name: string, req: UpdateSmbShareReque
 }
 
 /**
- * The share-path grant's companion edit (live proof 0.4.3 F2): add
- * `inherit acls = yes` to a share stanza that does not set the parameter at
- * all, so files written over SMB inherit the default ACL the grant writes. A
- * stanza that sets it already — to either value, in any spelling — is the
- * operator's choice and is returned unchanged, as is the text when the share
- * is absent. The share routes call this only on an edit that runs a grant.
+ * The share-path grant's companion edit: add each of {@link GRANT_PARAMS}
+ * the share stanza does not define under any spelling, in that order, after
+ * the stanza's last line. A parameter the stanza sets already — to any value,
+ * in any spelling — is the operator's choice and stays as it is; a stanza that
+ * defines all three, or an absent share, is returned unchanged. The share
+ * routes call this only on an edit that runs a grant.
  */
-export function ensureInheritAcls(text: string, name: string): string {
+export function addMissingGrantParams(text: string, name: string): string {
   const doc = parseDoc(text)
   const span = findSection(doc, name)
   if (!span || span.key === 'global')
     return text
-  if (paramHits(sectionDefs(doc, span), PARAM.inheritAcls).length > 0)
+  const defs = sectionDefs(doc, span)
+  const missing: KeyEdit[] = GRANT_PARAMS
+    .filter(([param]) => paramHits(defs, param).length === 0)
+    .map(([param, value]) => ({ param, kind: 'text' as const, value }))
+  if (missing.length === 0)
     return text
-  applyEditsToSection(doc, name, [{ param: PARAM.inheritAcls, kind: 'bool', value: 'yes' }], sectionIndent(doc, span))
+  applyEditsToSection(doc, name, missing, sectionIndent(doc, span))
   return serializeDoc(doc)
 }
 

@@ -8,7 +8,7 @@ import type { AccessService, GrantShare } from '../services/access.js'
 import { statSync } from 'node:fs'
 import { rm, writeFile } from 'node:fs/promises'
 import { CreateSmbShareRequest, ShareName, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
-import { addShare, customVfsRefusal, ensureInheritAcls, getShare, hasCustomVfsObjects, hasShare, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
+import { addMissingGrantParams, addShare, customVfsRefusal, getShare, hasCustomVfsObjects, hasShare, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
 import { parseSmbStatusJson, parseSmbStatusText } from '../parsers/smbstatus.js'
 import { confirmGate } from '../safety/gate.js'
 import { createAccessService } from '../services/access.js'
@@ -77,8 +77,9 @@ export function grantRelevantChange(before: SmbShare, after: SmbShare): boolean 
  * Does an edit run the share-path grant? Only when it asks for one, and then
  * only when something the grant answers to changed or "apply to existing
  * files" was asked for (an unreadable stanza before the write runs it). The
- * same rule decides the `inherit acls` companion edit, so a stanza gains that
- * line exactly when a grant runs on it.
+ * same rule decides the companion edit (`inherit acls`, `create mask`,
+ * `directory mask`), so a stanza gains those lines exactly when a grant runs
+ * on it.
  */
 export function editRunsGrant(grant: ShareAccessGrantRequest | undefined, before: SmbShare | null, after: SmbShare | null): boolean {
   if (!grant)
@@ -594,11 +595,12 @@ export async function smbShareRoutes(
             req,
             (current, keys) => {
               const next = updateShare(current, name, req, keys)
-              // live proof 0.4.3 F2: an edit that runs a grant also makes
-              // Samba honour its default ACL — added only when the stanza does
-              // not set `inherit acls` at all (an operator's value stands).
+              // live proof 0.4.3 F2, re-proof RF1: an edit that runs a grant
+              // also writes `inherit acls`, `create mask` and `directory mask`,
+              // each only when the stanza does not set it under any spelling
+              // (an operator's value stands).
               return editRunsGrant(req.grantAccess, getShare(current, name), getShare(next, name))
-                ? ensureInheritAcls(next, name)
+                ? addMissingGrantParams(next, name)
                 : next
             },
           )
