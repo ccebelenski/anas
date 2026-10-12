@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
-import { poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
+import { datasetExists, poolExists, skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
 /**
  * Stories 3.25 / 3.26 — ANAS recognizes pools PVE already manages (read from
@@ -83,5 +83,54 @@ test.describe('ANAS PVE-managed pools (stunt node)', () => {
 
     // testpool (ANAS-managed) is never PVE-banded — the marker is specific.
     await expect(grid.locator('.anas-ds-pve-row', { hasText: 'testpool' })).toHaveCount(0)
+  })
+
+  // Ruling #61's two halves on one storage root (operator, 2026-10-12: "to
+  // tell against regressions"): a sibling the operator creates under the PVE
+  // storage root is NOT owned (pve-footprint: children of a storage root that
+  // are not guest-named are unowned) and is fully manageable; a guest-named
+  // child (PVE's vm-<id>-disk-<n> namespace) IS owned and gated like the root.
+  test('Datasets: an ANAS sibling under the PVE storage root is manageable; a guest-named child is not', async ({ page }) => {
+    const sibling = 'datapool/anassibling'
+    const guest = 'datapool/vm-100-disk-0'
+    await sshExec(`zfs create ${sibling} && zfs create ${guest}`)
+    try {
+      expect(await datasetExists(sibling)).toBe(true)
+      expect(await datasetExists(guest)).toBe(true)
+      await loginToPve(page)
+      await openAnasItem(page, 'Datasets')
+      const grid = page.locator('.anas-grid-datasets')
+      await expect(grid).toBeVisible({ timeout: 45_000 })
+
+      // The sibling's row: not PVE-banded, no badge, and every structural
+      // action live once selected.
+      const siblingText = grid.locator('.x-tree-node-text', { hasText: /^anassibling$/ })
+      await expect(siblingText).toBeVisible({ timeout: 20_000 })
+      // (`has` is queried relative to the row, so the inner locator is page-rooted.)
+      const siblingRow = grid.locator('.x-grid-row', { has: page.locator('.x-tree-node-text', { hasText: /^anassibling$/ }) })
+      await expect(siblingRow).not.toHaveClass(/anas-ds-pve-row/)
+      await expect(siblingRow.locator('.anas-ds-pve-badge')).toHaveCount(0)
+      await siblingText.click()
+      await expect(page.locator('.anas-btn-ds-destroy')).not.toHaveClass(DISABLED, { timeout: 20_000 })
+      await expect(page.locator('.anas-btn-ds-edit')).not.toHaveClass(DISABLED)
+      await expect(page.locator('.anas-btn-ds-perms')).not.toHaveClass(DISABLED)
+      await expect(page.locator('.anas-btn-ds-create')).not.toHaveClass(DISABLED)
+
+      // The guest-named child: PVE-banded, badged as a guest volume, gated.
+      // Keyed on the badge title: the name cell carries the badge text beside
+      // the name, and the pvepool fixture's pvfix holds a vm-100-disk-0 too.
+      const guestTitle = 'PVE storage \'datapool\' owns datapool/vm-100-disk-0 as a guest volume'
+      const guestRow = grid.locator('.x-grid-row', { has: page.locator(`.anas-ds-pve-badge[title="${guestTitle}"]`) })
+      await expect(guestRow).toBeVisible({ timeout: 20_000 })
+      await expect(guestRow).toHaveClass(/anas-ds-pve-row/)
+      await expect(guestRow.locator('.x-tree-node-text')).toContainText('vm-100-disk-0')
+      await guestRow.locator('.x-tree-node-text').click()
+      await expect(page.locator('.anas-btn-ds-destroy')).toHaveClass(DISABLED, { timeout: 20_000 })
+      await expect(page.locator('.anas-btn-ds-edit')).toHaveClass(DISABLED)
+      await expect(page.locator('.anas-btn-ds-perms')).toHaveClass(DISABLED)
+    }
+    finally {
+      await sshExec(`zfs destroy -r ${guest}; zfs destroy -r ${sibling}`).catch(() => {})
+    }
   })
 })
