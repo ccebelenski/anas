@@ -4,7 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { RemotesPaths } from '../services/replication-remotes.js'
 import type { ResolvedRemote, Transport } from '../services/replication-transport.js'
-import { ReplicationTaskName, UpsertRemoteRequest } from '@anas/shared'
+import { ReplicationTaskName, TestRemoteRequest, UpsertRemoteRequest } from '@anas/shared'
 import {
   ensureKeypair,
   fingerprintOf,
@@ -357,27 +357,27 @@ export async function replicationRemotesRoutes(
   }
 
   // --- POST /replication/remotes/test — PRE-registration probe ---------------
+  // Body parsed by the shared TestRemoteRequest (C1, review 2026-10-14): the
+  // old hand-rolled typeof checks accepted a user of `-oProxyCommand=<cmd>`,
+  // which the ssh transport then handed to ssh as an OPTION — root command
+  // execution. RemoteUser/RemoteHost refuse it; buildSshArgv's `--` is the
+  // second line of defence.
   server.post<{ Querystring: { pin?: string, retrust?: string } }>('/replication/remotes/test', async (request, reply) => {
-    const body = (request.body ?? {}) as { host?: unknown, port?: unknown, user?: unknown }
-    if (typeof body.host !== 'string' || !body.host) {
+    const parsed = TestRemoteRequest.safeParse(request.body ?? {})
+    if (!parsed.success) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: 'host is required' } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid test request: ${parsed.error.issues[0]?.message}` } }
     }
-    const port = body.port === undefined ? 22 : Number(body.port)
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: 'port must be an integer 1–65535' } }
-    }
-    const user = typeof body.user === 'string' && body.user ? body.user : 'root'
+    const { host, port, user } = parsed.data
 
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
 
     const intent = pinIntent(request.query)
-    const resolved = resolvedRemoteFields(paths, body.host, port, user)
-    const result = await diagnose(body.host, port, resolved, intent)
-    auditTest(identity, { host: body.host, port, user, ...intent }, result)
+    const resolved = resolvedRemoteFields(paths, host, port, user)
+    const result = await diagnose(host, port, resolved, intent)
+    auditTest(identity, { host, port, user, ...intent }, result)
     return { data: result }
   })
 

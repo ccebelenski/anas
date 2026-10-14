@@ -12,6 +12,7 @@ import { fingerprintFromBlob } from '../../services/replication-remotes.js'
 import { buildSshArgv, resolvedRemoteFields } from '../../services/replication-transport.js'
 import { renderServiceUnit } from '../../services/replication-units.js'
 
+const SSH = '/usr/bin/ssh'
 const SSH_KEYSCAN = '/usr/bin/ssh-keyscan'
 
 const IDENTITY = {
@@ -233,6 +234,60 @@ describe('replication remotes routes (Epic 5.5.2)', () => {
     sshFix(mock, ['zfs', '--version'], { stdout: '', stderr: 'zfs: command not found', exitCode: 127 })
     const noZfsRes = await server.inject({ method: 'POST', url: '/v1/replication/remotes/test', headers: JSON_HEADERS, payload: JSON.stringify({ host: REMOTE.host }) })
     assert.equal(noZfsRes.json().data.stage, 'no-zfs')
+  })
+
+  // --- C1 (review 2026-10-14): ssh-option injection refused at both doors ----
+  // user/host = `-oProxyCommand=id` used to reach ssh AS AN OPTION (both on the
+  // pre-registration probe and, once stored, on every later sshExec) — root
+  // command execution. The schemas reject it before the executor ever runs.
+  const HOSTILE = '-oProxyCommand=id'
+
+  /** No ssh (or ssh-keyscan) invocation may have reached the executor. */
+  function assertNoSsh(mock: MockExecutor): void {
+    const sshCalls = mock.calls.filter(c => c.command === SSH || c.command === SSH_KEYSCAN)
+    assert.deepEqual(sshCalls, [], `expected no ssh calls, got ${JSON.stringify(sshCalls)}`)
+  }
+
+  it('test (pre-registration): hostile user rejected 400, ssh never executed', async () => {
+    const mock = mockOf(server)
+    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/test', headers: JSON_HEADERS, payload: JSON.stringify({ host: REMOTE.host, user: HOSTILE }) })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assertNoSsh(mock)
+  })
+
+  it('test (pre-registration): hostile host rejected 400, ssh never executed', async () => {
+    const mock = mockOf(server)
+    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/test', headers: JSON_HEADERS, payload: JSON.stringify({ host: HOSTILE }) })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assertNoSsh(mock)
+  })
+
+  it('create/update: hostile user rejected 400 at both doors, ssh never executed', async () => {
+    const mock = mockOf(server)
+    const create = await server.inject({ method: 'POST', url: '/v1/replication/remotes', headers: JSON_HEADERS, payload: JSON.stringify({ remote: { ...REMOTE, user: HOSTILE }, expectedVersion: 0 }) })
+    assert.equal(create.statusCode, 400)
+    assert.equal(create.json().error.code, 'VALIDATION_ERROR')
+
+    await createRemote(0)
+    const update = await server.inject({ method: 'PUT', url: '/v1/replication/remotes/nas1', headers: JSON_HEADERS, payload: JSON.stringify({ remote: { ...REMOTE, user: HOSTILE }, expectedVersion: 1 }) })
+    assert.equal(update.statusCode, 400)
+    assert.equal(update.json().error.code, 'VALIDATION_ERROR')
+    assertNoSsh(mock)
+  })
+
+  it('create/update: hostile host rejected 400 at both doors, ssh never executed', async () => {
+    const mock = mockOf(server)
+    const create = await server.inject({ method: 'POST', url: '/v1/replication/remotes', headers: JSON_HEADERS, payload: JSON.stringify({ remote: { ...REMOTE, host: HOSTILE }, expectedVersion: 0 }) })
+    assert.equal(create.statusCode, 400)
+    assert.equal(create.json().error.code, 'VALIDATION_ERROR')
+
+    await createRemote(0)
+    const update = await server.inject({ method: 'PUT', url: '/v1/replication/remotes/nas1', headers: JSON_HEADERS, payload: JSON.stringify({ remote: { ...REMOTE, host: HOSTILE }, expectedVersion: 1 }) })
+    assert.equal(update.statusCode, 400)
+    assert.equal(update.json().error.code, 'VALIDATION_ERROR')
+    assertNoSsh(mock)
   })
 
   it('named-remote test (:name/test) probes the registered remote → ok, and MIRRORS the pinned fingerprint', async () => {

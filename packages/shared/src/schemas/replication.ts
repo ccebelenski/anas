@@ -226,6 +226,43 @@ export type ReplicationTaskStatus = z.infer<typeof ReplicationTaskStatus>
 // cluster-wide keypair at /etc/pve/priv/anas/replication_key, pinned host keys
 // in /etc/pve/priv/anas/known_hosts. The remote itself needs sshd + ZFS only.
 
+/**
+ * SSH login user for a remote (C1, review 2026-10-14). A POSIX-style login
+ * name: letters, digits, '_', '.', '-', never a leading '-' (that would reach
+ * ssh as an option), 1–32 chars. WRITE-side only — buildSshArgv also passes
+ * `--`, and the registry READ schema stays lenient so stored values keep
+ * loading.
+ */
+export const RemoteUser = z
+  .string()
+  .min(1)
+  .max(32)
+  .regex(/^[\w.][\w.-]*$/, 'letters, digits, "_", ".", "-" — never a leading "-"')
+export type RemoteUser = z.infer<typeof RemoteUser>
+
+/**
+ * SSH destination host for a remote (C1, review 2026-10-14): a DNS name
+ * (incl. IPv4 dotted-quad) or a BARE IPv6 address (no brackets), never a
+ * leading '-' and never carrying whitespace or the characters that let the
+ * string be re-read as ssh/known_hosts syntax: '[', ']', ',', '@', '/'. The
+ * grammar is deliberately not checked deeper (octets ≤ 255, full IPv6 form) —
+ * anything malformed simply fails to connect; the security property is the
+ * charset. WRITE-side only, like {@link RemoteUser}.
+ */
+const HOST_NAME_RE = /^[\w.-]+$/
+const HOST_IPV6_RE = /^[0-9A-F:]+$/i
+export const RemoteHost = z
+  .string()
+  .min(1)
+  .max(253)
+  .refine(s => !hasControlChars(s), 'Control characters are not allowed')
+  .refine(s => s[0] !== '-', 'Host must not start with "-"')
+  .refine(
+    s => (s.includes(':') ? HOST_IPV6_RE.test(s) : HOST_NAME_RE.test(s)),
+    'Host must be a DNS name, IPv4 address, or bare IPv6 address',
+  )
+export type RemoteHost = z.infer<typeof RemoteHost>
+
 /** A registered external remote (TrueNAS, plain Linux+ZFS, …). */
 export const ReplicationRemote = z.object({
   /** Registry key; also shows in target pickers. */
@@ -263,13 +300,35 @@ export const RemotesFile = z.object({
 })
 export type RemotesFile = z.infer<typeof RemotesFile>
 
-/** Create/update a remote — carries the registry version the client read. */
+/**
+ * Create/update a remote — carries the registry version the client read.
+ * WRITE-side strictness (C1, review 2026-10-14): user/host go through
+ * {@link RemoteUser}/{@link RemoteHost}, NOT the lenient READ schema —
+ * ReplicationRemote must stay lenient so registries written before the
+ * narrowing keep loading (buildSshArgv's `--` makes stored values harmless).
+ */
 export const UpsertRemoteRequest = z.object({
-  remote: ReplicationRemote,
+  remote: ReplicationRemote.extend({
+    host: RemoteHost,
+    user: RemoteUser.default('root'),
+  }),
   /** CAS guard: the registry version this change was based on. */
   expectedVersion: z.number().int().nonnegative(),
 })
 export type UpsertRemoteRequest = z.infer<typeof UpsertRemoteRequest>
+
+/**
+ * Pre-registration test-connection probe body (the values typed in the dialog,
+ * nothing stored yet). Parsed by `POST /replication/remotes/test` in place of
+ * its old hand-rolled typeof checks — the second door a hostile user/host had
+ * (C1, review 2026-10-14).
+ */
+export const TestRemoteRequest = z.object({
+  host: RemoteHost,
+  port: z.number().int().min(1).max(65535).default(22),
+  user: RemoteUser.default('root'),
+})
+export type TestRemoteRequest = z.infer<typeof TestRemoteRequest>
 
 /** Diagnosing test-connection result — says WHAT failed, not just that it did. */
 export const RemoteTestResult = z.object({

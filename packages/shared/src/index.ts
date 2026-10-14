@@ -465,8 +465,10 @@ export {
 // Replication schemas (Epic 5.5)
 export {
   LenientReplicationTask,
+  RemoteHost,
   RemotesFile,
   RemoteTestResult,
+  RemoteUser,
   ReplicatePlan,
   ReplicatePlanRequest,
   ReplicateRequest,
@@ -476,6 +478,7 @@ export {
   ReplicationTask,
   ReplicationTaskName,
   ReplicationTaskStatus,
+  TestRemoteRequest,
   UpsertRemoteRequest,
 } from './schemas/replication.js'
 

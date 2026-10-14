@@ -58,6 +58,7 @@ describe('replication transport (Epic 5.5.2 — remote SSH)', () => {
       'UserKnownHostsFile=/etc/pve/priv/anas/known_hosts',
       '-o',
       'StrictHostKeyChecking=yes',
+      '--',
       'admin@10.0.0.9',
       'zfs',
       'recv',
@@ -70,6 +71,7 @@ describe('replication transport (Epic 5.5.2 — remote SSH)', () => {
       SSH,
       '-o',
       'BatchMode=yes',
+      '--',
       'root@node2',
       'zpool',
       'list',
@@ -77,6 +79,29 @@ describe('replication transport (Epic 5.5.2 — remote SSH)', () => {
       '-o',
       'name',
     ])
+  })
+
+  // C1 (review 2026-10-14): a hostile user reaching the transport — the READ
+  // schema stays lenient, so buildSshArgv is the LAST line of defence: the
+  // hostile string must land after `--`, where ssh reads it as the destination,
+  // never as an option (-oProxyCommand would run as root).
+  it('buildSshArgv: a hostile `-oProxyCommand=…` user appears only AFTER `--`', () => {
+    const hostile = '-oProxyCommand=touch x'
+    const resolved: ResolvedLocation = {
+      kind: 'remote',
+      host: '10.0.0.9',
+      port: 22,
+      user: hostile,
+      keyPath: '/etc/pve/priv/anas/replication_key',
+      knownHostsFile: '/etc/pve/priv/anas/known_hosts',
+    }
+    const argv = buildSshArgv(resolved, ['true'])
+    const dashdash = argv.indexOf('--')
+    assert.ok(dashdash > 0, 'argv carries the option terminator')
+    // The user lives inside the `<user>@<host>` destination element.
+    const hits = argv.map((a, i) => ({ a, i })).filter(({ a }) => a.includes(hostile))
+    assert.equal(hits.length, 1, 'the hostile string appears exactly once')
+    assert.ok(hits[0].i > dashdash, `destination (index ${hits[0].i}) must follow \`--\` (index ${dashdash})`)
   })
 
   // --- members + peer resolution --------------------------------------------

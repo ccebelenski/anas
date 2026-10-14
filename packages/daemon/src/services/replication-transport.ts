@@ -81,8 +81,13 @@ export async function readMembers(membersFile: string): Promise<PveMembers | nul
  * ssh binary; callers split for exec/pipeline). Pure — the unit tests assert it.
  */
 export function buildSshArgv(resolved: ResolvedLocation, remoteCmd: string[]): string[] {
+  // `--` ends ssh OPTION parsing (C1, review 2026-10-14): a hostile user/host
+  // (e.g. `-oProxyCommand=<cmd>`) can then never be read as an ssh flag —
+  // `ssh [options] -- destination command`. ssh-keyscan does the same
+  // (services/replication-remotes.ts); the shared schemas additionally narrow
+  // user/host on every write path.
   if (resolved.kind === 'peer')
-    return [SSH, '-o', 'BatchMode=yes', `root@${resolved.host}`, ...remoteCmd]
+    return [SSH, '-o', 'BatchMode=yes', '--', `root@${resolved.host}`, ...remoteCmd]
   return [
     SSH,
     '-o',
@@ -95,6 +100,7 @@ export function buildSshArgv(resolved: ResolvedLocation, remoteCmd: string[]): s
     `UserKnownHostsFile=${resolved.knownHostsFile}`,
     '-o',
     'StrictHostKeyChecking=yes',
+    '--',
     `${resolved.user}@${resolved.host}`,
     ...remoteCmd,
   ]
