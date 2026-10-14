@@ -546,7 +546,7 @@
             { text: t('Value'), dataIndex: 'value', width: 70, align: 'right' },
             { text: t('Worst'), dataIndex: 'worst', width: 70, align: 'right' },
             { text: t('Threshold'), dataIndex: 'threshold', width: 80, align: 'right' },
-            { text: t('Raw'), dataIndex: 'rawValue', width: 100, align: 'right', renderer: Ext.String.htmlEncode },
+            { text: t('Raw'), dataIndex: 'rawValue', width: 100, align: 'right', renderer: ANAS.enc },
             {
                 text: t('Failing'),
                 dataIndex: 'failing',

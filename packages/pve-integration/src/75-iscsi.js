@@ -2681,7 +2681,7 @@
                         emptyText: t('This target has no LUNs'),
                         columns: [
                             { text: t('LUN'), dataIndex: 'index', width: 70, align: 'right' },
-                            { text: t('Name (SCSI model)'), dataIndex: 'name', flex: 1, minWidth: 150 },
+                            { text: t('Name (SCSI model)'), dataIndex: 'name', flex: 1, minWidth: 150, renderer: ANAS.enc },
                             { text: t('Kind'), dataIndex: 'kind', width: 130, align: 'center', renderer: renderLunKind },
                             { text: t('Backing'), dataIndex: 'backingPath', flex: 2, minWidth: 220, sortable: false, renderer: renderBacking },
                             { text: t('Backed up by'), dataIndex: 'backupBy', width: 170, sortable: false, menuDisabled: true, renderer: renderBackupBy },
