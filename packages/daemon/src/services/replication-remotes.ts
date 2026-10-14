@@ -1,11 +1,12 @@
 import type { RemotesFile, ReplicationRemote } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname } from 'node:path'
 import { ReplicationRemote as ReplicationRemoteSchema } from '@anas/shared'
 import { z } from 'zod'
+import { writeFileAtomic } from './config-writer.js'
 import { withFileLock } from './file-lock.js'
 
 /**
@@ -164,16 +165,11 @@ export async function writeRemotes(
       remotes,
     }
     await mkdir(dirname(paths.registryFile), { recursive: true })
-    const tmp = join(dirname(paths.registryFile), `.${basename(paths.registryFile)}.anas.tmp`)
-    await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf-8', mode: 0o600 })
-    await rename(tmp, paths.registryFile)
+    // Registry lives under /etc/pve (pmxcfs) by default — the helper skips
+    // the chmod/chown there and tolerates fsync refusal.
+    await writeFileAtomic(paths.registryFile, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
     return next
   })
-}
-
-function basename(p: string): string {
-  const i = p.lastIndexOf('/')
-  return i >= 0 ? p.slice(i + 1) : p
 }
 
 // --- Keypair -----------------------------------------------------------------
@@ -323,9 +319,8 @@ export async function pinHostKey(
   if (additions.length || kept.length !== previous.length) {
     await mkdir(dirname(paths.knownHostsFile), { recursive: true })
     const body = `${[...kept, ...additions].join('\n')}\n`
-    const tmp = join(dirname(paths.knownHostsFile), `.${basename(paths.knownHostsFile)}.anas.tmp`)
-    await writeFile(tmp, body, { encoding: 'utf-8', mode: 0o600 })
-    await rename(tmp, paths.knownHostsFile)
+    // known_hosts lives under /etc/pve/priv (pmxcfs) by default.
+    await writeFileAtomic(paths.knownHostsFile, body, { mode: 0o600 })
   }
   return chosen.fingerprint
 }

@@ -1,8 +1,9 @@
 import type { AhrExpansionState, AhrPool } from '@anas/shared'
-import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { AhrExpansionIntent, PoolName } from '@anas/shared'
 import { isIntentStaleForPool } from './ahr-identity.js'
+import { writeFileAtomic } from './config-writer.js'
 import { withFileLock } from './file-lock.js'
 
 /**
@@ -121,9 +122,7 @@ export async function writeIntent(
         throw new AhrIntentConflictError(pool, current?.state ?? null)
     }
     await mkdir(dir, { recursive: true })
-    const tmp = join(dir, `.${pool}.json.anas.tmp`)
-    await writeFile(tmp, `${JSON.stringify(validated, null, 2)}\n`, { encoding: 'utf-8', mode: 0o600 })
-    await rename(tmp, path)
+    await writeFileAtomic(path, `${JSON.stringify(validated, null, 2)}\n`, { mode: 0o600 })
   })
 }
 

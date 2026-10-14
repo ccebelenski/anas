@@ -30,7 +30,7 @@ import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
 import { readPveMountPaths } from '../parsers/pve-storage.js'
 import { zodIssue } from '../validation.js'
 import { ahrLvPath } from './ahr-paths.js'
-import { readConfig } from './config-writer.js'
+import { readConfig, writeFileAtomic } from './config-writer.js'
 import { execSystemctlShow } from './unit-run-status.js'
 
 /** `timeout` binary — wraps the probe so a dead NFS server can never hang us. */
@@ -850,24 +850,34 @@ export function parseCredentialsMeta(text: string): { username?: string, domain?
 }
 
 /**
- * Write ONE credentials file: ensure `dir` (0700 root) and write `path` 0600.
- * The single place the creds-file format and permissions are applied — the
- * atomic write and the validate-then-commit rotation both go through it.
+ * Ensure the creds dir exists, 0700 root (an existing dir is only ever
+ * tightened, never created wider). Shared by the atomic write and the
+ * validate-then-commit rotation's candidate staging.
+ */
+async function ensureCredsDir(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true, mode: 0o700 })
+  await chmod(dir, 0o700).catch(() => {})
+}
+
+/**
+ * Stage a credentials file (the rotation's CANDIDATE): ensure `dir`, write
+ * `path` 0600. A plain write, NOT the atomic swap — the candidate is a fresh
+ * sibling file and its rename (after the probe passes) is the commit point.
  */
 async function writeCredsFileAt(
   dir: string,
   path: string,
   creds: { username: string, password: string, domain?: string },
 ): Promise<void> {
-  await mkdir(dir, { recursive: true, mode: 0o700 })
-  await chmod(dir, 0o700).catch(() => {})
+  await ensureCredsDir(dir)
   await writeFile(path, formatCredentials(creds), { encoding: 'utf8', mode: 0o600 })
 }
 
 /**
  * Write a per-mount credentials file atomically: ensure `dir` (0700 root), write
- * `<dir>/<name>.cred` 0600. The secret never touches argv/logs. Returns the file
- * path (referenced from fstab as `credentials=<path>`).
+ * `<dir>/<name>.cred` 0600 via the shared atomic helper (the secret never
+ * touches argv/logs; the temp is exclusive, unpredictable and fsynced).
+ * Returns the file path (referenced from fstab as `credentials=<path>`).
  */
 export async function writeCredentialsFile(
   dir: string,
@@ -875,9 +885,10 @@ export async function writeCredentialsFile(
   creds: { username: string, password: string, domain?: string },
 ): Promise<string> {
   const path = credsFilePath(dir, mountpoint)
-  const tmp = join(dirname(path), `.${credsFileName(mountpoint)}.anas.tmp`)
-  await writeCredsFileAt(dir, tmp, creds)
-  await rename(tmp, path)
+  await ensureCredsDir(dir)
+  await writeFileAtomic(path, formatCredentials(creds), { mode: 0o600 })
+  // Secrets are root-only (EPICS §2) — force 0600 even onto a pre-existing
+  // looser-mode target.
   await chmod(path, 0o600).catch(() => {})
   return path
 }

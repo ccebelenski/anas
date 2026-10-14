@@ -1,10 +1,11 @@
 import type { BackupRepo, BackupRepoRegistry } from '@anas/shared'
 import type { PbsStorageDef } from '../parsers/pve-storage.js'
-import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, rm } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 import { BackupRepoRegistry as BackupRepoRegistrySchema, PVE_REPO_PREFIX } from '@anas/shared'
 import { PVE_PRIV_STORAGE_DIR, PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
+import { writeFileAtomic } from './config-writer.js'
 import { withFileLock } from './file-lock.js'
 
 /**
@@ -132,16 +133,11 @@ export async function writeBackupRepos(
       repos,
     }
     await mkdir(dirname(paths.registryFile), { recursive: true })
-    const tmp = join(dirname(paths.registryFile), `.${basename(paths.registryFile)}.anas.tmp`)
-    await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf-8', mode: 0o600 })
-    await rename(tmp, paths.registryFile)
+    // Registry lives under /etc/pve (pmxcfs) by default — the helper skips
+    // the chmod/chown there and tolerates fsync refusal.
+    await writeFileAtomic(paths.registryFile, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
     return next
   })
-}
-
-function basename(p: string): string {
-  const i = p.lastIndexOf('/')
-  return i >= 0 ? p.slice(i + 1) : p
 }
 
 // --- Per-repo secret files (0600 root-only) ---------------------------------
@@ -166,9 +162,9 @@ export async function writeRepoSecret(dir: string, name: string, secret: string)
   await mkdir(dir, { recursive: true, mode: 0o700 })
   await chmod(dir, 0o700).catch(() => {})
   const path = repoSecretPath(dir, name)
-  const tmp = join(dirname(path), `.${repoSecretFileName(name)}.anas.tmp`)
-  await writeFile(tmp, secret, { encoding: 'utf-8', mode: 0o600 })
-  await rename(tmp, path)
+  await writeFileAtomic(path, secret, { mode: 0o600 })
+  // Secrets are root-only (EPICS §2) — force 0600 even onto a pre-existing
+  // looser-mode target.
   await chmod(path, 0o600).catch(() => {})
   return path
 }

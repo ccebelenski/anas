@@ -42,6 +42,47 @@ PVE_TPL="${PVE_TPL:-/usr/share/pve-manager/index.html.tpl}"
 PVE_JS_DIR="${PVE_JS_DIR:-/usr/share/pve-manager/js}"
 APT_HOOK="${APT_HOOK:-/etc/apt/apt.conf.d/80anas-pve-integration}"
 
+# --- tmp hygiene + atomic adoption (review M4) ---------------------------------
+# Every mktemp made here is tracked and removed on EXIT, so no failure branch
+# needs its own cleanup (the explicit rm -f's remain as early frees; rm -f on
+# an already-moved file is a no-op). Replacing a live file never truncates it
+# in place: `cat tmp > target` leaves a half-written module or template if we
+# die mid-write. adopt_file writes the temp INTO THE TARGET'S OWN DIRECTORY,
+# copies the target's mode and owner, and renames it into place (atomic,
+# same filesystem).
+ANAS_TMP_FILES=()
+cleanup_anas_tmp_files() {
+  local f
+  for f in "${ANAS_TMP_FILES[@]:-}"; do
+    [ -n "${f}" ] && rm -f "${f}"
+  done
+  return 0
+}
+trap cleanup_anas_tmp_files EXIT
+
+mktemp_tracked() {
+  local t
+  t="$(mktemp "$@")"
+  ANAS_TMP_FILES+=("${t}")
+  printf '%s\n' "${t}"
+}
+
+# adopt_file SRC TARGET — replace TARGET with SRC atomically. A new TARGET
+# (never the install/uninstall path — both targets are guarded to exist)
+# falls back to plain 0644.
+adopt_file() {
+  local src="$1" target="$2" tmp
+  tmp="$(mktemp_tracked "${target}.anas.XXXXXX")"
+  cat "${src}" > "${tmp}"
+  if [ -e "${target}" ]; then
+    chmod --reference="${target}" "${tmp}"
+    chown --reference="${target}" "${tmp}"
+  else
+    chmod 0644 "${tmp}"
+  fi
+  mv -f "${tmp}" "${target}"
+}
+
 # --- Reverse-proxy transport (story 12.2, docs/PROXY-TRANSPORT-DESIGN.md) ---
 # The :8006 → loopback-gateway bridge: AnasProxy.pm plus one additive hook block
 # spliced into PVE's HTTP server module. Paths are parameterised (production
@@ -190,8 +231,8 @@ install_anas_proxy() {
   fi
 
   local blockfile patched
-  blockfile="$(mktemp)"
-  patched="$(mktemp)"
+  blockfile="$(mktemp_tracked)"
+  patched="$(mktemp_tracked)"
   anas_hook_block > "${blockfile}"
   # Splice a COPY; the live PVE module is only overwritten once the patch passes
   # perl -c, so a bad splice can never leave :8006 with a non-compiling module.
@@ -230,7 +271,7 @@ install_anas_proxy() {
   fi
 
   # Gate passed — adopt the patched module and reload pveproxy.
-  cat "${patched}" > "${PVE_HTTP_SERVER_PM}"
+  adopt_file "${patched}" "${PVE_HTTP_SERVER_PM}"
   rm -f "${patched}"
   echo "anas: spliced ANAS proxy hook into ${PVE_HTTP_SERVER_PM}"
 
@@ -273,7 +314,7 @@ fi
 
 # A .js suffix lets `node --check` (below) infer the file is a plain script;
 # without an extension newer node refuses to pick a module format.
-gen="$(mktemp --suffix=.js)"
+gen="$(mktemp_tracked --suffix=.js)"
 {
   echo "/*"
   echo " * GENERATED FILE — do not edit."
@@ -349,14 +390,14 @@ elif grep -qF "${SCRIPT_SRC}" "${PVE_TPL}"; then
   # not regex-special) and replace the WHOLE line with the current versioned
   # tag, whatever ?v= it carried. The tag text is passed verbatim via -v to
   # preserve its leading whitespace; every other line passes through untouched.
-  tmp="$(mktemp)"
+  tmp="$(mktemp_tracked)"
   awk -v tag="${SCRIPT_TAG}" -v src="${SCRIPT_SRC}" '
     index($0, src) { print tag; next }
     { print }
   ' "${PVE_TPL}" > "${tmp}"
   # Defensive: only replace the real file if the tag still landed.
   if grep -qF "${SCRIPT_SRC}" "${tmp}"; then
-    cat "${tmp}" > "${PVE_TPL}"
+    adopt_file "${tmp}" "${PVE_TPL}"
     rm -f "${tmp}"
     echo "anas: re-stamped script line in ${PVE_TPL} (?v=${ANAS_JS_HASH:-none})"
   else
@@ -373,14 +414,14 @@ else
   # exactly one anas.js tag (a second insert would double-load the bundle and
   # run 00-core/90-register twice). The tag text is passed in verbatim via -v to
   # preserve its leading whitespace. Everything else is passed through untouched.
-  tmp="$(mktemp)"
+  tmp="$(mktemp_tracked)"
   awk -v tag="${SCRIPT_TAG}" '
     { print }
     !done && /pvemanagerlib\.js/ { print tag; done = 1 }
   ' "${PVE_TPL}" > "${tmp}"
   # Defensive: only replace the real file if the insert actually landed.
   if grep -qF "${SCRIPT_SRC}" "${tmp}"; then
-    cat "${tmp}" > "${PVE_TPL}"
+    adopt_file "${tmp}" "${PVE_TPL}"
     rm -f "${tmp}"
     echo "anas: inserted script line into ${PVE_TPL} (?v=${ANAS_JS_HASH:-none})"
   else

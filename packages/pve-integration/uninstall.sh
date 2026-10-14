@@ -31,6 +31,43 @@ PVE_TPL="${PVE_TPL:-/usr/share/pve-manager/index.html.tpl}"
 PVE_JS_DIR="${PVE_JS_DIR:-/usr/share/pve-manager/js}"
 APT_HOOK="${APT_HOOK:-/etc/apt/apt.conf.d/80anas-pve-integration}"
 
+# --- tmp hygiene + atomic adoption (review M4) ---------------------------------
+# Mirror of install.sh (the scripts stay standalone). Every mktemp is tracked
+# and removed on EXIT; a live file is replaced only via adopt_file — temp in
+# the target's own directory, target's mode/owner copied, rename. Never
+# `cat tmp > target`: in-place truncation leaves a half-written file on a
+# crash mid-write.
+ANAS_TMP_FILES=()
+cleanup_anas_tmp_files() {
+  local f
+  for f in "${ANAS_TMP_FILES[@]:-}"; do
+    [ -n "${f}" ] && rm -f "${f}"
+  done
+  return 0
+}
+trap cleanup_anas_tmp_files EXIT
+
+mktemp_tracked() {
+  local t
+  t="$(mktemp "$@")"
+  ANAS_TMP_FILES+=("${t}")
+  printf '%s\n' "${t}"
+}
+
+# adopt_file SRC TARGET — replace TARGET with SRC atomically.
+adopt_file() {
+  local src="$1" target="$2" tmp
+  tmp="$(mktemp_tracked "${target}.anas.XXXXXX")"
+  cat "${src}" > "${tmp}"
+  if [ -e "${target}" ]; then
+    chmod --reference="${target}" "${tmp}"
+    chown --reference="${target}" "${tmp}"
+  else
+    chmod 0644 "${tmp}"
+  fi
+  mv -f "${tmp}" "${target}"
+}
+
 # Reverse-proxy transport (story 12.2). Mirror install.sh's parameters.
 PERL_BIN="${PERL_BIN:-perl}"
 PVE_HTTP_SERVER_PM="${PVE_HTTP_SERVER_PM:-/usr/share/perl5/PVE/APIServer/AnyEvent.pm}"
@@ -81,12 +118,12 @@ SCRIPT_SRC="/pve2/js/anas.js"
 #    byte-identical to pristine. A sibling project's own <script> line carries a
 #    different src and is not matched (issue #20).
 if [ -f "${PVE_TPL}" ] && grep -qF "${SCRIPT_SRC}" "${PVE_TPL}"; then
-  tmp="$(mktemp)"
+  tmp="$(mktemp_tracked)"
   # \|...|d uses | as the delimiter so the /pve2/js/... slashes need no escaping.
   # The pattern is unanchored, so a trailing ?v=<hash> is inside the matched line
   # and deleted with it.
   sed "\|${SCRIPT_SRC}|d" "${PVE_TPL}" > "${tmp}"
-  cat "${tmp}" > "${PVE_TPL}"
+  adopt_file "${tmp}" "${PVE_TPL}"
   rm -f "${tmp}"
   echo "anas: removed script line from ${PVE_TPL}"
 else
@@ -117,7 +154,7 @@ if [ -f "${PVE_HTTP_SERVER_PM}" ] && grep -qF "${ANAS_HOOK_MARKER}" "${PVE_HTTP_
   # module as of install time, so after a libpve-http-server-perl upgrade the
   # backup is the OLD module and restoring it silently downgrades PVE's own
   # code — the perl -c gate cannot catch that, because old PVE code compiles.
-  candidate="$(mktemp)"
+  candidate="$(mktemp_tracked)"
   excise_our_hook_to "${PVE_HTTP_SERVER_PM}" "${candidate}"
   if has_foreign_hook "${PVE_HTTP_SERVER_PM}"; then
     removal_desc="excised the ANAS hook block from ${PVE_HTTP_SERVER_PM} (another project's hook is present and was preserved)"
@@ -139,9 +176,10 @@ if [ -f "${PVE_HTTP_SERVER_PM}" ] && grep -qF "${ANAS_HOOK_MARKER}" "${PVE_HTTP_
     echo "anas: WARNING: remove the block between '${ANAS_HOOK_MARKER}' and '${ANAS_HOOK_END}' by hand." >&2
     systemctl reset-failed pveproxy >/dev/null 2>&1 || true
   else
-    # Gate passed (or no perl to gate with) — adopt. Writing THROUGH the live
-    # file keeps its mode and ownership.
-    cat "${candidate}" > "${PVE_HTTP_SERVER_PM}"
+    # Gate passed (or no perl to gate with) — adopt. The move is atomic and
+    # copies the live file's mode and ownership (a truncate-in-place could
+    # leave a half-written module on a crash).
+    adopt_file "${candidate}" "${PVE_HTTP_SERVER_PM}"
     rm -f "${candidate}"
     echo "anas: ${removal_desc}"
     if restart_pveproxy; then

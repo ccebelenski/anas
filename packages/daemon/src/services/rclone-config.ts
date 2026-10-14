@@ -29,11 +29,12 @@
 
 import type { CloudProvider, CloudProviderOption, CloudRemote, CloudRemoteWrite } from '@anas/shared'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
-import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { basename, dirname, join } from 'node:path'
+import { chmod, mkdir, readFile, rm } from 'node:fs/promises'
+import { dirname } from 'node:path'
 import { CLOUD_BACKEND_GUIDES, CloudProvider as CloudProviderSchema } from '@anas/shared'
 import { z } from 'zod'
 import { listSections, parseRcloneConf, removeSection, upsertSection } from '../parsers/rclone-conf.js'
+import { writeFileAtomic } from './config-writer.js'
 import { withFileLock } from './file-lock.js'
 import { assertNoSecretValues } from './secret-argv.js'
 
@@ -535,30 +536,21 @@ export async function obscure(
 }
 
 /**
- * Write the config file atomically: write `<file>.tmp` with mode 0600, then
- * `rename` over the file (the rename is the atomic swap). The parent
- * directory is created 0700 when missing (an existing one is never chmodded
- * — we are a guest). A FAILED rename must not leave the `.tmp` behind — the
- * tmp is removed in a `finally` (`force` ignores the post-rename ENOENT).
+ * Write the config file atomically via the shared helper (writeFileAtomic:
+ * exclusive unpredictable temp in the same dir, fsync, mode/owner copy, no
+ * orphan on failure). The parent directory is created 0700 when missing (an
+ * existing one is never chmodded — we are a guest). rclone.conf holds remote
+ * secrets, so a rename onto a pre-existing looser-mode target is followed by
+ * a forced 0600.
  *
  * Test seam: the rename-failure path (a target that is a directory) is not
  * reachable through the public API — `readConfig` would refuse to read the
  * directory first — so the helper is exported for that one test.
  */
 export async function writeConfigFileAtomic(paths: RcloneConfigPaths, text: string): Promise<void> {
-  const dir = dirname(paths.configFile)
-  await mkdir(dir, { recursive: true, mode: 0o700 })
-  const tmp = join(dir, `${basename(paths.configFile)}.tmp`)
-  await writeFile(tmp, text, { encoding: 'utf-8', mode: 0o600 })
-  try {
-    await rename(tmp, paths.configFile)
-    await chmod(paths.configFile, 0o600).catch(() => {})
-  }
-  finally {
-    // The tmp must not outlive the write; a cleanup failure must not mask
-    // the write's own error.
-    await rm(tmp, { force: true }).catch(() => {})
-  }
+  await mkdir(dirname(paths.configFile), { recursive: true, mode: 0o700 })
+  await writeFileAtomic(paths.configFile, text, { mode: 0o600 })
+  await chmod(paths.configFile, 0o600).catch(() => {})
 }
 
 /**
