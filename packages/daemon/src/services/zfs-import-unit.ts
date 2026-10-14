@@ -59,9 +59,9 @@ export function zfsImportUnitName(pool: string): string {
 }
 
 /**
- * Enable (after create/import) or disable (after destroy) a pool's boot-import
- * unit — BEST-EFFORT: never throws, returns null on success and a one-line
- * warning otherwise.
+ * Enable (after create/import) or disable (after destroy/export) a pool's
+ * boot-import unit — BEST-EFFORT: never throws, returns null on success and a
+ * one-line warning otherwise.
  *
  * The rationale for not failing the job: the primary mutation (create, import,
  * destroy) has ALREADY succeeded by the time this runs, so a unit-management
@@ -88,9 +88,14 @@ export async function syncZfsImportUnit(
   }
 }
 
-/** The consequence half of the warning — what the operator actually cares about. */
+/**
+ * The consequence half of the warning — what the operator actually cares about.
+ * The disable half is worded for BOTH callers (destroy and export, pools.r1):
+ * what the two share is that the pool is no longer imported here, not whether
+ * it still exists.
+ */
 function failurePrefix(action: 'enable' | 'disable', unit: string, pool: string): string {
   return action === 'enable'
     ? `Could not enable ${unit} — '${pool}' may not be imported automatically after a reboot`
-    : `Could not disable ${unit} — a stale boot-import unit may remain for the destroyed pool '${pool}'`
+    : `Could not disable ${unit} — a stale boot-import unit may remain for '${pool}', which is no longer imported`
 }

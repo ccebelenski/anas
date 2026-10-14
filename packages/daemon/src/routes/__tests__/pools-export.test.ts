@@ -134,6 +134,110 @@ describe('export endpoint: POST /v1/pools/:name/export', () => {
   })
 })
 
+describe('pools.r1 — export disables the pool boot-import unit (review M6 #22)', () => {
+  const SYSTEMCTL = '/usr/bin/systemctl'
+  const OK = { stdout: '', stderr: '', exitCode: 0 }
+
+  let server: ReturnType<typeof createServer> | undefined
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  function attach(): MockExecutor {
+    server = createServer({ mock: true, logger: false })
+    return (server as unknown as { executor: MockExecutor }).executor
+  }
+
+  /** Challenge → confirm → 202, then wait for the job to finish. */
+  async function runExport(pool = 'testpool'): Promise<Job> {
+    const first = await server!.inject({
+      method: 'POST',
+      url: `/v1/pools/${pool}/export`,
+      headers: IDENTITY_HEADERS,
+    })
+    const res = await server!.inject({
+      method: 'POST',
+      url: `/v1/pools/${pool}/export`,
+      headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string },
+    })
+    assert.equal(res.statusCode, 202)
+    return waitForJob(server!, (res.json() as JobAccepted).job.id)
+  }
+
+  it('a successful export disables zfs-import@<pool>.service AFTER the pool is exported', async () => {
+    const mock = attach()
+    mock.addFixture({ command: SYSTEMCTL, args: ['disable', 'zfs-import@testpool.service'], result: OK })
+
+    const job = await runExport()
+    assert.equal(job.status, 'completed')
+    assert.equal(job.result, null, 'no warnings when the disable succeeded')
+
+    // The order is the point: disabling before the export would leave a pool
+    // that IS imported without its unit (the audit #22 bug in the other
+    // direction). An export failure returns early and must skip the disable.
+    const exportIdx = mock.calls.findIndex(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'export')
+    const disableIdx = mock.calls.findIndex(c => c.command === SYSTEMCTL && c.args.join(' ') === 'disable zfs-import@testpool.service')
+    assert.ok(exportIdx >= 0, 'zpool export ran')
+    assert.ok(disableIdx > exportIdx, 'systemctl disable runs strictly after zpool export')
+  })
+
+  it('a failed export disables nothing — no systemctl call at all', async () => {
+    const mock = attach()
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command: string, args: string[]) =>
+      command === '/usr/sbin/zpool' && args[0] === 'export'
+        ? { stdout: '', stderr: 'cannot export \'testpool\': pool is busy\n', exitCode: 1 }
+        : orig(command, args)
+
+    const job = await runExport()
+    assert.equal(job.status, 'failed')
+    assert.match(job.error?.message ?? '', /pool is busy/)
+    assert.equal(mock.calls.find(c => c.command === SYSTEMCTL), undefined, 'no systemctl after a failed export')
+  })
+
+  it('a failing disable leaves the job completed with the warning in its result', async () => {
+    const mock = attach()
+    mock.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: 'Failed to disable unit: Transaction check failed.\n', exitCode: 1 } })
+
+    const job = await runExport()
+    assert.equal(job.status, 'completed', 'the pool is exported — a unit hiccup never fails the job')
+    const result = job.result as { warnings?: string[] } | null
+    assert.ok(Array.isArray(result?.warnings) && result!.warnings.length === 1)
+    assert.match(result!.warnings[0], /Could not disable zfs-import@testpool\.service/)
+    assert.match(result!.warnings[0], /Failed to disable unit: Transaction check failed/)
+  })
+
+  it('a pool name needing systemd escaping uses zfsImportUnitName\'s escaped unit', async () => {
+    const mock = attach()
+    // Exact-args fixture: a wrong (unescaped) unit name would not match and
+    // the call would hit the default 127, warning the job — caught below.
+    mock.addFixture({ command: SYSTEMCTL, args: ['disable', 'zfs-import@my\\x2dpool.service'], result: OK })
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command: string, args: string[]) => {
+      // The mock inventory only knows testpool; give my-pool a listing and a
+      // stable guid so the ident.1 gate passes.
+      if (command === '/usr/sbin/zpool' && args.join(' ') === 'get -H -o value guid my-pool')
+        return { stdout: '17897551794000000001\n', stderr: '', exitCode: 0 }
+      if (command === '/usr/sbin/zpool' && args.join(' ') === 'list -j') {
+        const base = await orig(command, args)
+        const json = JSON.parse(base.stdout) as { pools: Record<string, unknown> }
+        json.pools['my-pool'] = { name: 'my-pool', state: 'ONLINE', properties: {} }
+        return { ...base, stdout: JSON.stringify(json) }
+      }
+      return orig(command, args)
+    }
+
+    const job = await runExport('my-pool')
+    assert.equal(job.status, 'completed')
+    assert.equal(job.result, null)
+    assert.deepEqual(
+      mock.calls.filter(c => c.command === SYSTEMCTL).map(c => c.args),
+      [['disable', 'zfs-import@my\\x2dpool.service']],
+    )
+  })
+})
+
 describe('ident.1 — pool export binds the pool guid', () => {
   let server: ReturnType<typeof createServer> | undefined
   afterEach(async () => {

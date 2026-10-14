@@ -1998,7 +1998,17 @@ export async function poolRoutes(
           const base = result.stderr.trim() || `zpool export exited with code ${result.exitCode}`
           throw new Error(await enrichBusyError(executor, base, undefined, configfsOptionsFrom(iscsiPaths)))
         }
-        return null
+
+        // pools.r1 (audit #22, review M6): create/import enable the pool's
+        // zfs-import@<pool>.service and destroy disables it; export must disable
+        // it too — an exported pool answers `zpool import <pool>` at boot with a
+        // plain failure, so the enabled unit fails every boot until the pool
+        // comes back (twelve such units found on one real node). Re-import
+        // re-enables. The root/boot pool can never get here: the system-pool
+        // guard 409s it before the job is submitted. Best-effort — the pool is
+        // already exported; a hiccup here is a warning, never a failed job.
+        const unitWarning = await syncZfsImportUnit(executor, poolName, 'disable')
+        return unitWarning ? { warnings: [unitWarning] } : null
       },
     )
 
