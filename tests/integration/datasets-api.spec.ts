@@ -23,7 +23,7 @@ import {
  *   - POST   /pools/:name/datasets            create (body { path, properties? }) → 202 { job }; 409 if exists
  *   - PUT    /pools/:name/datasets/<path>     modify (body { properties })        → 202 { job }
  *   - DELETE /pools/:name/datasets/<path>[?recursive=true]  destroy — DANGEROUS  → 409 / 202
- *   - PUT    /pools/:name/datasets/<path>/permissions  chown/chmod (owner/group/mode/recursive) → 202 { job }
+ *   - PUT    /pools/:name/datasets/<path>/access       owner/group + base entries (the access editor) → 202 { job }
  *   - GET    /identity/users                  owner/group picker source          → 200 { data: SystemUser[] }
  *   - GET    /identity/groups                                                    → 200 { data: SystemGroup[] }
  *
@@ -176,11 +176,22 @@ test.describe('Dataset lifecycle: create → detail → modify → permissions �
         .poll(() => getDatasetProp(DS_FQ, 'compression'), { timeout: 30_000 })
         .toBe('gzip')
 
-      // --- permissions (4.7) — chown/chmod the mountpoint. owner/group root:root
-      // are guaranteed to exist; mode 0770 is a clear change from the ZFS default
-      // (0755), so `stat` is a meaningful source-of-truth check.
-      const perms = await ctx.put(`${V1}/pools/${POOL}/datasets/${DS_PATH}/permissions`, {
-        data: { owner: 'root', group: 'root', mode: '0770' },
+      // --- permissions — the …/access editor (access.1; the legacy
+      // …/permissions route was removed by cr.4). owner/group root:root are
+      // guaranteed to exist; owner and owning group read-write with everyone
+      // none is a clear change from the ZFS default (0755), so `stat` is a
+      // meaningful source-of-truth check. The editor may also set the
+      // directory's setgid bit, so the mode reads 770 or 2770.
+      const perms = await ctx.put(`${V1}/pools/${POOL}/datasets/${DS_PATH}/access`, {
+        data: {
+          owner: 'root',
+          group: 'root',
+          entries: [
+            { kind: 'owner', level: 'read-write' },
+            { kind: 'owning-group', level: 'read-write' },
+            { kind: 'everyone', level: 'none' },
+          ],
+        },
       })
       expect(perms.status()).toBe(202)
       expect((await perms.json()).job).toBeDefined()
@@ -189,7 +200,7 @@ test.describe('Dataset lifecycle: create → detail → modify → permissions �
       expect(mountpoint.startsWith('/')).toBe(true)
       await expect
         .poll(() => statOwnership(mountpoint), { timeout: 30_000 })
-        .toBe('root root 770')
+        .toMatch(/^root root 2?770$/)
 
       // --- destroy through the confirmation flow (4.8).
       // Challenge — no confirm header → 409 + code.
