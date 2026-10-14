@@ -5,6 +5,13 @@
 evidence for the identity epic candidate in EPICS §4. Paths are relative to
 `packages/daemon/src` unless stated.
 
+**Progress (2026-10-14):** #1–#20 closed by ident.1–4, shipped in 0.4.2 — ident.1 `941b6ad`
+(follow-up `56f6505`), ident.2 `b633ce4`, ident.3 `baa6353`, ident.4 `0a32e87`; each closed
+finding carries its mark below. #21–#47 stay open except where marked: #22 is half-done — the
+export half shipped in pools.r1 (`79aaad7`), the boot-scan warn half is the open rider in
+EPICS §3. cr.3 (`022fab2`, system accounts not mutable through the identity API) closes no
+numbered finding in this audit.
+
 ## Cross-cutting patterns
 
 - **P1. Confirm codes and queued jobs are keyed by name, and the job never re-checks.**
@@ -36,86 +43,90 @@ evidence for the identity epic candidate in EPICS §4. Paths are relative to
    ownership at take time (`zfs snapshot -o anas:schedule=<id>`; a btrfs equivalent for AHR);
    prune only this schedule's stamped snapshots (legacy unstamped only where exactly one schedule
    targets the dataset); re-read the schedule in the job; store the target guid; reserve the
-   `anas-` prefix on manual create/rename.
+   `anas-` prefix on manual create/rename. **Closed — ident.1 (`941b6ad`; follow-up `56f6505`:
+   a received stamp is never this schedule's), shipped 0.4.2.**
 2. **Pool destroy with "Clean up disks" wipes the whole disk for any leaf path that is neither
    by-id nor `/dev/sdX`** (`routes/pools.ts:143-149, 2070`). by-partuuid / by-path / by-vdev leaves
    fall back to `/dev/disk/by-id/<disk.id>` with `-partN` stripped → `wipefs -a --force` on the
    whole disk before the shared-disk guard. A stale kernel path on a non-ONLINE leaf hits another
    disk after a reshuffle (labelclear, wipefs, `sgdisk --zap-all`). **Fix:** use `disk.path` for
    non-kernel paths; skip non-ONLINE leaves; capture the pool guid and require `blkid -p -s UUID`
-   on each leaf to match before wiping.
+   on each leaf to match before wiping. **Closed — ident.1 (`941b6ad`), shipped 0.4.2.**
 3. **AHR create and spare-attach check disk availability at request time; a failed create's
    rollback zaps a disk that was never ours** (`ahr-create.ts:341-351`, `ahr-destroy.ts:306`,
    `ahr-spare.ts:181`). **Fix:** re-run `collectDisks`/`isComposableDisk` in the job; add a disk
-   to `planned` only after its own wipe succeeds.
+   to `planned` only after its own wipe succeeds. **Closed — ident.3 (`baa6353`), shipped 0.4.2.**
 4. **AHR destroy, cache detach and cache attribution pick disks by GPT label pattern**
    (`ahr-destroy.ts`, `ahr-cache-state.ts`, `ahr-cache.ts`, `routes/ahr-cache.ts:163`); same-named
    md arrays from another pool merge into one (`parsers/mdadm-detail.ts`, `ahr-topology.ts`,
    `ahr-expand-exec.ts`); create does not refuse an occupied name. **Fix:** act only on partitions
    whose `mdadm --examine --export` UUID is pinned/live for this pool; a cache slice is ours only
-   as a PV of this VG's UUID; once pinned, admit only pinned UUIDs; create refuses an occupied name.
+   as a PV of this VG's UUID; once pinned, admit only pinned UUIDs; create refuses an occupied name. **Closed — ident.3 (`baa6353`), shipped 0.4.2.**
 5. **The boot recovery ladder force-starts any inactive `*-r<N>` array** (`ahr-boot-scan.ts:157-189`)
-   with no ownership gate. **Fix:** only pinned UUIDs or arrays whose VG exists with that md as PV.
+   with no ownership gate. **Fix:** only pinned UUIDs or arrays whose VG exists with that md as PV. **Closed — ident.3 (`baa6353`), shipped 0.4.2.**
 6. **The AHR expansion intent is keyed by pool name and survives destroy** (`ahr-intent.ts`);
    resume has no confirm and drives the predecessor's disks with `requireAvailable=false`;
    `ensureDiskPartitions` can write a GPT over a disk that became a Ceph OSD. **Fix:** destroy
    clears the intent (409 while running); the intent stores md/VG UUIDs; resume re-checks disks
-   and confirms.
+   and confirms. **Closed — ident.3 (`baa6353`), shipped 0.4.2.**
 7. **AHR spare removal can `--fail` an active member** (`ahr-spare.ts:252-263`, never checks
-   `m.spare`). **Fix:** act only on members mdstat flags `(S)` at job time.
+   `m.spare`). **Fix:** act only on members mdstat flags `(S)` at job time. **Closed — ident.3 (`baa6353`), shipped 0.4.2.**
 8. **An iSCSI zvol LUN is identified by its `udev_path` string** while the size check reads the
    served device (`iscsi-configfs.ts:534`, `iscsi.ts:594`). Rename + recreate under a live LUN →
    a "grow" shrinks the new zvol; delete with `destroyBacking` destroys the new zvol; repair
    recreates from the stale path. **Fix:** compare the served device's rdev with the path's rdev
-   before any zfs verb or repair; re-read volsize in the job.
+   before any zfs verb or repair; re-read volsize in the job. **Closed — ident.2 (`b633ce4`), shipped 0.4.2.**
 9. **LUN delete confirm is bound to `{target, lun index}`, indexes reused lowest-free**
-   (`iscsi-mutate.ts:1178`). **Fix:** bind serial + backstore; re-read under the lock.
+   (`iscsi-mutate.ts:1178`). **Fix:** bind serial + backstore; re-read under the lock. **Closed — ident.2 (`b633ce4`), shipped 0.4.2.**
 10. **Whole-image restore writes to the backing path captured at request time**
     (`backup-restore.ts:598`); only sessions are re-checked; confirm omits snapshot and archive.
-    **Fix:** under the lock require same serial, path and size; bind serial + snapshot + archive.
+    **Fix:** under the lock require same serial, path and size; bind serial + snapshot + archive. **Closed — ident.2 (`b633ce4`), shipped 0.4.2.**
 11. **Other name-keyed confirms and jobs:** `zfs rollback -r` destroys snapshots newer than the
     challenge listed; `zfs destroy -r` sweeps children created after the challenge; pool
     destroy/export by name after an export/import swap; LUN-held and system-pool checks not
     re-run in the job. **Fix:** bind the guid, re-read in the job, refuse on mismatch; for
-    rollback bind the newest snapshot's createtxg; re-run `ownedDescendant` and LUN-held checks.
+    rollback bind the newest snapshot's createtxg; re-run `ownedDescendant` and LUN-held checks. **Closed — ident.1 (`941b6ad`), shipped 0.4.2.**
 12. **A dataset path segment named `snapshots` is parsed as a snapshot route**
     (`routes/datasets.ts:378-391`): destroying `tank/snapshots/old` destroys `tank@old`, no
     confirm. `access`/`permissions` segments likewise misroute. **Fix:** address snapshots as
-    `<dataset>@<snap>`, or reserve the sub-resource names in `DatasetPath`.
+    `<dataset>@<snap>`, or reserve the sub-resource names in `DatasetPath`. **Closed — ident.1 (`941b6ad`), shipped 0.4.2.**
 13. **The replication hold tag `anas-repl` is one global tag** (`routes/replication.ts:39`); each
     run releases it on every older snapshot, so two tasks on one source unpin each other's base,
     retention destroys it, the other task fails "diverged". **Fix:** per-task tag; release only
-    your own.
+    your own. **Closed — ident.4 (`0a32e87`), shipped 0.4.2.**
 14. **PBS prune group `host/<backupId>` defaults to the hostname with no uniqueness check**
     (`backup-prune.ts`, `routes/backup.ts` guardTask); two tasks or a plain client host backup
     share the group and prune each other. **Fix:** refuse duplicate (repo, namespace, backupId);
-    default `<host>-<task>`.
+    default `<host>-<task>`. **Closed — ident.2 (`b633ce4`), shipped 0.4.2.**
 15. **A cloud remote PUT can re-point a sync destination with no task check**
     (`routes/cloud.ts:359-431`; DELETE has the check). **Fix:** 409 + confirm naming the tasks,
-    including through wrappers.
+    including through wrappers. **Closed — ident.4 (`0a32e87`), shipped 0.4.2.**
 16. **The source guard knows only fstab mounts and compares paths literally**
     (`source-guard.ts:129`): an unmounted ZFS dataset (key not loaded, canmount=off) backs up as
     an empty "good" snapshot; a symlinked source or a different fs at the target passes. **Fix:**
     realpath; add ZFS `mountpoint,canmount,mounted`; a target counts as mounted only when the
-    source matches the spec.
+    source matches the spec. **Closed — ident.4 (`0a32e87`), shipped 0.4.2.**
 17. **Mount delete `rm -f`s whatever credentials file the fstab line names; the generated name is
     not injective** (`mounts.ts:730`: `/mnt/nas-media` and `/mnt/nas/media` → the same `.cred`).
-    **Fix:** remove only a file under credsDir no other line references; hashed name.
+    **Fix:** remove only a file under credsDir no other line references; hashed name. **Closed — ident.4 (`0a32e87`), shipped 0.4.2.**
 18. **Mount mutations `umount` whatever is live at the target path** (`routes/mounts.ts`,
     `isMounted` by target only): a local filesystem at `/mnt/media` after a failed CIFS line gets
-    unmounted or mounted over. **Fix:** require live source + fstype to match the spec.
+    unmounted or mounted over. **Fix:** require live source + fstype to match the spec. **Closed — ident.4 (`0a32e87`), shipped 0.4.2.**
 19. **Recycle purge follows a symlinked bin** (`recycle-purge.ts:181`); share users can replace
     `#recycle` with a symlink. **Fix:** `lstat`, refuse symlinks, single-segment repository,
-    realpath containment per file.
+    realpath containment per file. **Closed — ident.4 (`0a32e87`), shipped 0.4.2.**
 20. **Recursive chown/chmod/setfacl cross into PVE-owned descendants**
     (`routes/datasets.ts:1220-1538` check only `ownershipOf(fullName)`). **Fix:** refuse when
-    `ownedDescendant` is non-null, or stop at filesystem boundaries.
+    `ownedDescendant` is non-null, or stop at filesystem boundaries. **Closed — ident.1 (`941b6ad`), shipped 0.4.2.**
 
 ### Wrong-object action (needs a precondition)
 
 21. PVE `dir` storage ownership matched lexically (`matchMountpoint`); a symlinked storage path
     leaves the real dataset unowned. Fix: realpath both sides, fall back to `findmnt -T`.
 22. Export leaves `zfs-import@<name>.service` enabled; next boot re-imports a same-named pool.
+    **Half-closed 2026-10-14: export half — pools.r1 (`79aaad7`): export now disables
+    `zfs-import@<pool>.service` as destroy does; the boot-scan warn half stays open (EPICS §3
+    pools.r1 rider).**
 23. SMB share named `global`/`homes`/`printers` accepted; POST appends a second `[global]` that
     Samba merges; ANAS can neither show nor delete it. Fix: reserve case-insensitively.
 24. #68 gap: an orphan passdb entry with the SAME case is inherited after `userdel` at the CLI.

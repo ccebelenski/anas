@@ -75,6 +75,15 @@ The VM runs on an isolated NAT network (`anas-test`, 192.168.200.0/24).
 | `setup-test-data.sh` | Attach disks + create test pool and shares |
 | `run-tests.sh` | Full workflow: restore → deploy → test |
 | `gtpools-fixture.sh <up\|down\|status>` | The standing `gtbackup`/`gtiscsi` file-backed pools (not in `baseline`; `up` once after a rebuild or restore) |
+| `ahrcache-fixture.sh <up\|down\|status\|pull-cache\|return-cache\|restart-daemon>` | ahrcache.1 live-proof fixture — the three virtual disks the AHR read-cache spec owns (`gtcache` pool + cache disk) |
+| `ahrexpand-fixture.sh <up\|down\|status>` | ahrexpand.1 live-proof fixture — the three disks the zero-gain expansion-guard spec owns (`gtexpand` pool + larger replacement disk) |
+| `cloud-backends-fixture.sh <up\|down\|status> [backend]...` | cloudproof.1/.2 live-proof fixture — real loopback servers for seven rclone backends, none needing a cloud account |
+| `cloud-fixture.sh <up\|down\|status>` | rclone.1 live-proof fixture — backs up and restores ANAS's own `/etc/anas/rclone.conf` remote state; disposable, never a new pool |
+| `cloud-review-fixture.sh <up\|down\|sigint\|status> [gate\|cancel\|view]` | 2026-09-25 cloud review-fix proofs — token-paste normalisation (rclone.1) + Run-now gate and live `runningProgress` (rclone.3) |
+| `cloud-tasks-fixture.sh <up\|down\|status>` | rclone.2/.3 live-proof fixture — disposable state for the cloud-sync TASKS specs (`trim` reclaims run residue) |
+| `pvepool-fixture.sh <up\|down\|status>` | pvepool.1 live-proof fixture — two loop-backed pools from 1 GiB sparse images under `/var/tmp`, one `pvesm`-managed like PVE's own (never the node's real disks) |
+| `smbsvc-fixture.sh <up\|down\|ahr-up\|ahr-down\|status>` | smbsvc.1 live-proof fixture — Previous Versions datasets under the existing `gtbackup` pool; disposable, siblings untouched |
+| `vdev-fixture.sh <up\|...\|down\|status>` | vdevs.1/.2 live-proof fixture (GitHub #66) — a throwaway pool carrying all six vdev classes on one hot disk |
 | `destroy-vm.sh` | Delete VM + all disk images |
 
 ## Snapshots

@@ -53,7 +53,10 @@ npm run build:daemon    # One workspace (also :shared, :gateway)
 npm run lint          # ESLint
 npm run lint:fix      # ESLint with auto-fix
 npm run typecheck     # Type-check all packages (shared, daemon, gateway)
-npm run test:unit     # Unit tests (daemon + gateway)
+npm run test:unit     # Unit tests — six suites: shared, daemon, gateway, pve-integration
+                      # UI harnesses (packages/pve-integration/test/*.harness.mjs), shell
+                      # (packaging/test/run-shell-tests.sh) and perl (prove over
+                      # packages/pve-integration/perl/t)
 ```
 
 ### Integration tests (stunt node)

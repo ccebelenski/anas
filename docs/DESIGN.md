@@ -22,8 +22,8 @@ It runs on the PVE node itself, presented as native ExtJS panels injected into t
 - Proxmox API integration
 - Multi-node / cluster management
 - Application management
-- SMART monitoring and alerting
-- Scheduled tasks (scrub scheduling, snapshot policies)
+- ~~SMART monitoring and alerting~~ — moved in scope since V1: SMART is displayed in the Disks tab (detail + dashboard warnings, disks.1); alerting stays PVE's (no alerting systems, per CLAUDE.md)
+- ~~Scheduled tasks (scrub scheduling, snapshot policies)~~ — moved in scope since V1: the schedule unit (`/v1/schedules`, scrub schedules in `/v1/scrub`) ships periodic scrub, snapshot and sync policies
 - SSE/WebSocket real-time updates (polling is fine for V1)
 
 ---
@@ -108,7 +108,7 @@ Both processes run as root (like Proxmox). The separation is architectural, not 
 
 - Slightly more complex deployment (two systemd units)
 - IPC overhead (negligible for this use case)
-- Mitigated by: single npm package installs both, single setup command configures both
+- Mitigated by: one release tarball carries both, and a single `./install.sh` configures both
 
 ---
 
@@ -118,7 +118,7 @@ Both processes run as root (like Proxmox). The separation is architectural, not 
 |-------|-----------|-----------|
 | UI | ExtJS panels injected into pve-manager (the Ceph model) | Native PVE look, theme, and interaction — no iframe, no style clash, users stay in the UI they know |
 | API gateway (anas) | Fastify (TypeScript) | Same stack as anasd; auth verification, validation, node forwarding. Plain HTTP on loopback, fronted by pveproxy at `:8006/anas` (no TLS/CORS of its own) |
-| Config format | YAML (`/etc/anas/config.yaml`) | Human-readable, supports comments |
+| Config format | none — environment (`/etc/default/anas`, systemd unit drop-ins) | No config file exists; defaults in code, overrides via env (EPICS §5 rejected a YAML layer) |
 | Auth | PVE ticket (verified locally against the replicated cluster authkey); Dev provider for testing | Proxmox owns the session; tickets are cluster-valid |
 | Daemon runtime | Node.js (TypeScript) | Same language as gateway, shared schemas, single npm package |
 | Daemon framework | Fastify | Lightweight, schema validation built-in, Unix socket support |
@@ -390,16 +390,15 @@ One generic endpoint backing directory pickers and gentle path validation across
 
 | Method | Path | Description | Response |
 |--------|------|-------------|----------|
-| `GET` | `/v1/users` | List users (UID >= UID_MIN, no service accounts) | `200` |
-| `POST` | `/v1/users` | Create a user | `202` with job |
-| `GET` | `/v1/users/:uid` | User detail | `200` |
-| `PUT` | `/v1/users/:uid` | Modify a user | `202` with job |
-| `PUT` | `/v1/users/:uid/smbpassword` | Set/update SMB password | `202` with job |
+| `GET` | `/v1/identity/users` | List users (UID >= UID_MIN, no service accounts) | `200` |
+| `POST` | `/v1/identity/users` | Create a user | `202` with job |
+| `GET` | `/v1/identity/users/:name` | User detail | `200` |
+| `PUT` | `/v1/identity/users/:name` | Modify a user | `202` with job |
+| `POST` | `/v1/identity/users/:name/smb-password` | Set/update SMB password | `202` with job |
 | `DELETE` | `/v1/identity/users/:name` | Remove a LOCAL share user (confirm-gated; a hard `409` when a share/ACL references it, or when it is directory-provided) — `userdel` without `-r`: its files keep their uid; the SMB passdb entry is removed if present | `202`/`409` with job |
-| `GET` | `/v1/groups` | List groups | `200` |
-| `POST` | `/v1/groups` | Create a group | `202` with job |
-| `GET` | `/v1/groups/:gid` | Group detail | `200` |
-| `PUT` | `/v1/groups/:gid` | Modify a group (members) | `202` with job |
+| `GET` | `/v1/identity/groups` | List groups | `200` |
+| `POST` | `/v1/identity/groups` | Create a group | `202` with job |
+| `PUT` | `/v1/identity/groups/:name/members` | Modify a group (members) | `202` with job |
 | `DELETE` | `/v1/identity/groups/:name` | Remove a LOCAL group (confirm-gated; hard `409`s: `primary-group-in-use` when it is a local user's primary group, and `referenced-by-share` when a share/ACL names it) | `202`/`409` with job |
 
 #### Jobs
@@ -415,6 +414,72 @@ One generic endpoint backing directory pickers and gentle path validation across
 | Method | Path | Description | Response |
 |--------|------|-------------|----------|
 | `GET` | `/v1/status` | System overview (pool health, share counts, disk warnings, active jobs) | `200` |
+
+#### Route index (generated 2026-10-14 from the route registrations)
+
+Routes not carried by the resource tables above, as a route registration exists. Paths are `/v1/...` as seen through the gateway; the daemon registers them without the `/v1` prefix. File names are under `packages/daemon/src/routes/`. Method + path + file only — no description invented here; the tables above stay the spec where they cover a route.
+
+| Method | Path | Registered in |
+|--------|------|---------------|
+| `GET` | `/v1/health` | health.ts |
+| `GET` | `/v1/telemetry` | dashboard.ts |
+| `GET` | `/v1/pools/import` | pools.ts |
+| `PUT` | `/v1/pools/:name/mountpoint` | pools.ts |
+| `POST` | `/v1/pools/:name/trim` | pools.ts |
+| `POST` | `/v1/pools/:name/upgrade` | pools.ts |
+| `GET` | `/v1/pools/:name/expansion` | pools.ts |
+| `POST` | `/v1/pools/:name/attach` | pools.ts |
+| `GET` | `/v1/ahr` | ahr.ts |
+| `GET` | `/v1/ahr/:name` | ahr.ts |
+| `POST` | `/v1/ahr/layout/preview` | ahr.ts |
+| `POST` | `/v1/ahr` | ahr-mutate.ts |
+| `PUT` | `/v1/ahr/:name/mountpoint` | ahr-mutate.ts |
+| `POST` | `/v1/ahr/:name/remount` | ahr-mutate.ts |
+| `DELETE` | `/v1/ahr/:name` | ahr-mutate.ts |
+| `POST` | `/v1/ahr/:name/scrub` | ahr-mutate.ts |
+| `POST` | `/v1/ahr/:name/repair` | ahr-mutate.ts |
+| `POST` | `/v1/ahr/:name/parity-rewrite` | ahr-mutate.ts |
+| `POST` | `/v1/ahr/:name/mirror-reconcile` | ahr-mutate.ts |
+| `POST` | `/v1/ahr/:name/expand/plan` | ahr-expand.ts |
+| `POST` | `/v1/ahr/:name/expand` | ahr-expand.ts |
+| `POST` | `/v1/ahr/:name/expand/resume` | ahr-expand.ts |
+| `POST` | `/v1/ahr/:name/expand/abandon` | ahr-expand.ts |
+| `POST` | `/v1/ahr/:name/disk/:oldId/replace` | ahr-expand.ts |
+| `POST` | `/v1/ahr/:name/disk/:id/readd` | ahr-expand.ts |
+| `GET` | `/v1/ahr/:name/snapshots` | ahr-snapshots.ts |
+| `POST` | `/v1/ahr/:name/snapshots` | ahr-snapshots.ts |
+| `DELETE` | `/v1/ahr/:name/snapshots/:snap` | ahr-snapshots.ts |
+| `POST` | `/v1/ahr/:name/snapshots/:snap/rollback` | ahr-snapshots.ts |
+| `POST` | `/v1/ahr/:name/spare` | ahr-spare.ts |
+| `DELETE` | `/v1/ahr/:name/spare/:id` | ahr-spare.ts |
+| `POST` | `/v1/ahr/:name/cache` | ahr-cache.ts |
+| `DELETE` | `/v1/ahr/:name/cache` | ahr-cache.ts |
+| `POST` | `/v1/ahr/:name/cache/event` | ahr-cache.ts |
+| `GET` | `/v1/ahr/:name/access` | ahr-access.ts |
+| `PUT` | `/v1/ahr/:name/access` | ahr-access.ts |
+| `GET` | `/v1/replication/remotes` | replication-remotes.ts |
+| `POST` | `/v1/replication/remotes` | replication-remotes.ts |
+| `PUT` | `/v1/replication/remotes/:name` | replication-remotes.ts |
+| `DELETE` | `/v1/replication/remotes/:name` | replication-remotes.ts |
+| `POST` | `/v1/replication/remotes/test` | replication-remotes.ts |
+| `POST` | `/v1/replication/remotes/:name/test` | replication-remotes.ts |
+| `GET` | `/v1/replication/locations` | replication-remotes.ts |
+| `GET` | `/v1/replication/remotes/:name/pools` | replication-remotes.ts |
+| `GET` | `/v1/replication/peers/:name/pools` | replication-remotes.ts |
+| `GET` | `/v1/replication/tasks` | replication-tasks.ts |
+| `POST` | `/v1/replication/tasks` | replication-tasks.ts |
+| `PUT` | `/v1/replication/tasks/:name` | replication-tasks.ts |
+| `DELETE` | `/v1/replication/tasks/:name` | replication-tasks.ts |
+| `POST` | `/v1/replication/tasks/:name/run` | replication-tasks.ts |
+| `GET` | `/v1/schedules` | schedules.ts |
+| `POST` | `/v1/schedules` | schedules.ts |
+| `GET` | `/v1/schedules/:id` | schedules.ts |
+| `PUT` | `/v1/schedules/:id` | schedules.ts |
+| `DELETE` | `/v1/schedules/:id` | schedules.ts |
+| `POST` | `/v1/schedules/:id/run` | schedules.ts |
+| `GET` | `/v1/scrub` | scrub.ts |
+| `PUT` | `/v1/scrub/zfs/:pool` | scrub.ts |
+| `PUT` | `/v1/scrub/ahr/:pool` | scrub.ts |
 
 ### Resource Identifiers
 
@@ -815,7 +880,7 @@ Node "pve1"
 
 **Interaction model:** PVE-native. Grids with toolbars for collection views; double-click / button → `Ext.window.Window` for details and actions; `Proxmox.window.Edit` subclasses for mutations (they already handle 4xx display, loading masks, and submit flow); confirmation flows use the 409 + `X-Anas-Confirm-Code` API contract. Long operations submit a job and surface progress the way PVE tasks do.
 
-**"Not installed" check (the Ceph pattern):** before rendering, panels probe the gateway (`GET /api/nodes/<node>/v1/health` through the local gateway). Connection refused / probe failure renders a friendly "ANAS is not installed on this node" panel with install instructions — we cannot auto-install like Ceph (we don't ship through PVE's packaging), so the panel shows the `npm install -g anas && anas setup` path instead of a wizard.
+**"Not installed" check (the Ceph pattern):** before rendering, panels probe the gateway (`GET /api/nodes/<node>/v1/health` through the local gateway). Connection refused / probe failure renders a friendly "ANAS is not installed on this node" panel with install instructions — we cannot auto-install like Ceph (we don't ship through PVE's packaging), so the panel shows the release-tarball path (`tar xzf anas-<version>.tar.gz && cd anas-<version> && ./install.sh`) instead of a wizard.
 
 **Code layout:** the panels live in `packages/pve-integration/` alongside the injection loader — plain ES5 ExtJS (matching PVE's bundle), split into per-view files concatenated to `anas.js` by the installer. No build step, no framework dependencies.
 
@@ -876,7 +941,7 @@ PVE 9 has **no official UI extension hook**. Verified facts (PVE 9.2, stunt node
 
 Integration consists of:
 1. **`/usr/share/pve-manager/js/anas.js`** — the ANAS ExtJS panels + loader (concatenated from `packages/pve-integration/`), served at `/pve2/js/anas.js`. Our file, upgrade-safe.
-2. **One `<script>` line inserted into `/usr/share/pve-manager/index.html.tpl`** (after `pvemanagerlib.js`). The single fragile point: pve-manager upgrades overwrite the template. Mitigations: idempotent presence-checked insert, an apt `DPkg::Post-Invoke` hook re-applies after upgrades, `anas doctor` detects and repairs, uninstall restores the pristine template.
+2. **One `<script>` line inserted into `/usr/share/pve-manager/index.html.tpl`** (after `pvemanagerlib.js`). The single fragile point: pve-manager upgrades overwrite the template. Mitigations: idempotent presence-checked insert, an apt `DPkg::Post-Invoke` hook re-applies after upgrades (`packages/pve-integration/apt-reapply.sh`, installed by `install.sh`), uninstall restores the pristine template. (`anas doctor` was never built — EPICS-HISTORY marks 10.6 OBE: install.sh's preflight is the doctor at install time.)
 3. **Menu injection**: a direct prototype patch of `PVE.node.Config.initComponent` (NOT `Ext.override` — `callParent` in a runtime override resolves against a missing hierarchy and crashes panel construction). The captured original runs first; our injection is try/catch-guarded.
 4. **Fail-open, always**: every ExtJS/PVE internal touched is feature-detected; worst-case failure is "no ANAS section appears" plus one `console.warn`. The PVE UI must never break because of ANAS.
 
@@ -890,6 +955,8 @@ Integration consists of:
 ## Deployment & Installation
 
 ### Target install experience
+
+> **Retired 2026-10-14:** neither `npm install -g anas` nor `anas setup` was ever built — EPICS §5 rejects the npm-global install path. The install path is the release tarball and `./install.sh` (`packaging/install.sh`), which writes the units, socket dir and proxy hook itself and enables both services. There is no `'anas'` user — both processes run as root — and no config file is generated. The plan below is kept as history.
 
 ```bash
 npm install -g anas
@@ -1048,6 +1115,8 @@ The UI is native ExtJS inside pve-manager (see "UI: Native PVE Panels"). Key com
 *(Original decision was PrimeVue/Lara Dark in a Nuxt app; retired with the ExtJS-native pivot.)*
 
 ### 2. Configuration File: `/etc/anas/config.yaml`
+
+> **Retired 2026-10-14:** no config file exists and none was ever generated — EPICS §5 rejected the YAML layer. Tunables are environment: `ANAS_PORT` in `/etc/default/anas` (shared with `AnasProxy.pm`) plus systemd unit drop-ins; everything else is a built-in default. The decision below is kept as history.
 
 YAML format (readable, supports comments, sysadmin-friendly). Generated by `anas setup` with sensible defaults.
 

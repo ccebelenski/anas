@@ -14,7 +14,7 @@ Communication between anas and anasd is REST over a Unix domain socket. Standard
 
 ## 3. Authentication propagates end-to-end
 
-Every request from anas to anasd carries the authenticated user's identity. anasd never executes an operation without knowing who requested it. This enables audit logging, traceability, and future authorization enforcement at the daemon layer. The auth chain is: browser → session cookie → Nuxt → identity headers → anasd → audit log.
+Every request from anas to anasd carries the authenticated user's identity. anasd never executes an operation without knowing who requested it. This enables audit logging, traceability, and future authorization enforcement at the daemon layer. The auth chain is: browser → session cookie → the anas gateway → identity headers → anasd → audit log.
 
 ## 4. All mutations are jobs
 
@@ -26,7 +26,7 @@ anasd does not accept arbitrary commands. It accepts structured operations with 
 
 ## 6. Shared schemas, validated at every boundary
 
-Request and response types are defined once (Zod) and shared between anas and anasd. Validation happens at both boundaries — Nuxt validates incoming user input, anasd validates before execution. This is defense in depth, not redundancy.
+Request and response types are defined once (Zod) and shared between anas and anasd. Validation happens at both boundaries — the anas gateway validates incoming user input, anasd validates before execution. This is defense in depth, not redundancy.
 
 ## 7. Lightweight by design
 
@@ -34,7 +34,7 @@ This runs on Proxmox hosts that are already doing real work. Minimal memory foot
 
 ## 8. Single-package deployment
 
-The entire system ships as one npm package. `npm install -g anas` gets you everything. `sudo anas setup` configures systemd units and permissions. The install experience is simple and repeatable. We do not introduce build steps, external binaries, platform-specific compilation, or dedicated service users into the deployment path.
+The entire system ships as one release tarball. Copy it to the node and run `./install.sh` — it installs the code, the systemd units, the permissions, and the PVE UI integration. The install experience is simple and repeatable. We do not introduce build steps, external binaries, platform-specific compilation, or dedicated service users into the deployment path.
 
 ## 9. Unix socket, not TCP, for internal IPC
 

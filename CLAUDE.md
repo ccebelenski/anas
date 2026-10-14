@@ -27,7 +27,7 @@
 - Check the API resource model in DESIGN.md for the correct endpoints
 - Use shared Zod schemas — do not define types inline
 - Use execFile, never exec — arguments as arrays
-- Validate at both boundaries (Nuxt and anasd)
+- Validate at both boundaries (the anas gateway and anasd)
 - Service reloads are side effects of mutations, not separate API calls
 
 ## Do not

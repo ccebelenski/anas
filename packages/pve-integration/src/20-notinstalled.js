@@ -4,7 +4,8 @@
  * Before rendering, every view probes the gateway health endpoint. On failure
  * (connection refused / gateway down / node has no ANAS), we render a friendly
  * install-hint panel instead — we cannot auto-install like Ceph (we don't ship
- * through PVE's packaging), so the hint shows the npm install path.
+ * through PVE's packaging), so the hint shows the release-tarball path: copy
+ * the tarball to the node and run ./install.sh (what the panel below prints).
  */
 (function () {
     'use strict';
