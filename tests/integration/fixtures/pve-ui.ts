@@ -1,6 +1,6 @@
 import type { Locator, Page } from '@playwright/test'
 import { expect } from '@playwright/test'
-import { GATEWAY_URL, NODE_NAME, PVE_URL, STUNT_HOST } from './target'
+import { GATEWAY_URL, NODE_NAME, PVE_ROOT_PASSWORD, PVE_URL, STUNT_HOST } from './target'
 
 /**
  * Shared helpers for driving the real PVE ExtJS UI on the stunt node.
@@ -28,7 +28,7 @@ export async function loginToPve(page: Page): Promise<void> {
   // whatever the node is still busy with when a spec starts.
   await username.waitFor({ state: 'visible', timeout: 30_000 })
   await username.fill('root')
-  await page.locator('input[name="password"]').fill('anas-test')
+  await page.locator('input[name="password"]').fill(PVE_ROOT_PASSWORD)
   await page.getByRole('button', { name: 'Login' }).click()
   // Workspace loaded once the login dialog is gone.
   await expect(page.locator('input[name="username"]')).not.toBeVisible({ timeout: 30_000 })

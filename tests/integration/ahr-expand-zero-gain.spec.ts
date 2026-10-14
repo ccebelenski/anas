@@ -4,6 +4,7 @@ import { promisify } from 'node:util'
 import { expect, pveAuthState, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
+import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -215,7 +216,7 @@ test.describe('AHR zero-gain expansion guard (ahrexpand.1)', () => {
     try {
       const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
       const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-        form: { username: 'root@pam', password: 'anas-test' },
+        form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
       })
       const ticket = (await ticketRes.json()).data.ticket as string
       await login.dispose()

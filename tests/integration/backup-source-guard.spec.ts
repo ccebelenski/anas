@@ -5,6 +5,7 @@ import { promisify } from 'node:util'
 import { expect, pveAuthState, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
+import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -276,7 +277,7 @@ test.describe('Backup source guard (backup2.11)', () => {
     // ticket is fetched here rather than taken from the test-scoped pveTicket.
     const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
     const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: 'anas-test' },
+      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
     })
     expect(ticketRes.ok()).toBeTruthy()
     const ticket = (await ticketRes.json()).data.ticket as string
@@ -325,7 +326,7 @@ test.describe('Backup source guard (backup2.11)', () => {
     try {
       const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
       const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-        form: { username: 'root@pam', password: 'anas-test' },
+        form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
       })
       const ticket = (await ticketRes.json()).data.ticket as string
       await login.dispose()

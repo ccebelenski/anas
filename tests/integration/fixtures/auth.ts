@@ -1,8 +1,9 @@
 import { test as base, expect } from '@playwright/test'
 import { PVE_URL, STUNT_HOST } from './pve-ui'
+import { PVE_ROOT_PASSWORD } from './target'
 
 const PVE_USER = 'root@pam'
-const PVE_PASS = 'anas-test'
+const PVE_PASS = PVE_ROOT_PASSWORD
 
 interface AuthFixtures {
   pveTicket: string

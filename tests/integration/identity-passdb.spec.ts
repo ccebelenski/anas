@@ -2,6 +2,7 @@ import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
 import { expect, pveAuthState, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { makeDir, removeSmbShare, sshExec } from './fixtures/stunt-node'
+import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 /**
  * Story identity.3 (GitHub #68) — LIVE PROOF that a share user's Samba passdb
@@ -166,7 +167,7 @@ test.describe('Passdb entry matches the account exactly (identity.3, #68)', () =
     try {
       const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
       const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-        form: { username: 'root@pam', password: 'anas-test' },
+        form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
       })
       const ticket = (await ticketRes.json()).data.ticket as string
       await login.dispose()

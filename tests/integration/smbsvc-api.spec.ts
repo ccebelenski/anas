@@ -11,6 +11,7 @@ import {
   skipIfFixtureMissing,
   sshExec,
 } from './fixtures/stunt-node'
+import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -248,7 +249,7 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
     // the same PVE login the auth fixture uses.
     const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
     const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: 'anas-test' },
+      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
     })
     const ticket = (await ticketRes.json()).data.ticket as string
     await login.dispose()

@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { GATEWAY_URL, PVE_URL } from './fixtures/pve-ui'
+import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 /**
  * The real user journey: log into the Proxmox web UI, then reach the ANAS
@@ -25,7 +26,7 @@ test.describe('PVE login flow', () => {
     const username = page.locator('input[name="username"]')
     await username.waitFor({ state: 'visible', timeout: 15_000 })
     await username.fill('root')
-    await page.locator('input[name="password"]').fill('anas-test')
+    await page.locator('input[name="password"]').fill(PVE_ROOT_PASSWORD)
     await page.getByRole('button', { name: 'Login' }).click()
 
     // Wait for the workspace to load (login dialog gone)

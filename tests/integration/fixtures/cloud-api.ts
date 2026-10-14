@@ -1,6 +1,6 @@
 import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
 import { expect } from '@playwright/test'
-import { NODE_NAME, PVE_URL } from './target'
+import { NODE_NAME, PVE_ROOT_PASSWORD, PVE_URL } from './target'
 
 /**
  * PVE-authenticated API access for the cloud specs — the ticket dance and the
@@ -40,7 +40,7 @@ async function pveTicket(playwright: PlaywrightWorkerArgs['playwright']): Promis
   const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
   try {
     const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: 'anas-test' },
+      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
     })
     const ok = ticketRes.ok()
     return ok ? ((await ticketRes.json()).data.ticket as string) : null

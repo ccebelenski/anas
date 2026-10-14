@@ -11,6 +11,12 @@ const HOST = process.env.ANAS_STUNT_HOST ?? '192.168.200.50'
 /** Bare host/IP of the stunt node (for SSH, cookie domains, etc.). */
 export const STUNT_HOST = HOST
 
+/**
+ * root@pam's password on the stunt node — `VM_PASS` in test/stunt-node/config.sh.
+ * Override with `ANAS_STUNT_PASS`; no other test file should contain the literal.
+ */
+export const PVE_ROOT_PASSWORD = process.env.ANAS_STUNT_PASS ?? 'anas-test'
+
 /** The stunt node's PVE node name (used in /api/nodes/<node>/… paths). */
 export const NODE_NAME = process.env.ANAS_STUNT_NODE ?? 'anas-pve'
 

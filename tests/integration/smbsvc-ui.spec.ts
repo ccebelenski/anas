@@ -10,6 +10,7 @@ import {
   skipIfFixtureMissing,
   sshExec,
 } from './fixtures/stunt-node'
+import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -230,7 +231,7 @@ test.describe('smbsvc.1 — Self-service on SMB shares (stunt node UI)', () => {
 
     const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
     const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: 'anas-test' },
+      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
     })
     expect(ticketRes.ok()).toBeTruthy()
     const ticket = (await ticketRes.json()).data.ticket as string
@@ -251,7 +252,7 @@ test.describe('smbsvc.1 — Self-service on SMB shares (stunt node UI)', () => {
     // must not mask the run's results.
     const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
     const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: 'anas-test' },
+      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
     })
     const ticket = ticketRes.ok() ? ((await ticketRes.json()).data.ticket as string) : null
     await login.dispose()

@@ -4,6 +4,7 @@ import { promisify } from 'node:util'
 import { expect, pveAuthState, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
+import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -349,7 +350,7 @@ test.describe('Scheduled-task timer stamps (sched.stamps)', () => {
 
     const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
     const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: 'anas-test' },
+      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
     })
     expect(ticketRes.ok()).toBeTruthy()
     const ticket = (await ticketRes.json()).data.ticket as string

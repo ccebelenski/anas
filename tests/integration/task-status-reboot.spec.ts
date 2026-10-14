@@ -4,6 +4,7 @@ import { promisify } from 'node:util'
 import { expect, pveAuthState, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { poolExists, skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
+import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -107,7 +108,7 @@ function within(a: string | null, b: string | null, ms: number): boolean {
 
 async function ticketFor(playwright: PlaywrightWorkerArgs['playwright']): Promise<string> {
   const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-  const res = await login.post(`${PVE_URL}/api2/json/access/ticket`, { form: { username: 'root@pam', password: 'anas-test' } })
+  const res = await login.post(`${PVE_URL}/api2/json/access/ticket`, { form: { username: 'root@pam', password: PVE_ROOT_PASSWORD } })
   expect(res.ok()).toBeTruthy()
   const ticket = (await res.json()).data.ticket as string
   await login.dispose()

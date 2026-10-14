@@ -1,7 +1,5 @@
 node_modules/
 dist/
-.nuxt/
-.output/
 *.sock
 .DS_Store
 
@@ -24,6 +22,8 @@ dist-release/
 # Credential material — never commit secrets, even test ones (belt-and-suspenders;
 # real secrets belong in root-only files on the node, never in the repo).
 *.pw
+# Test fixtures carry obviously fake secrets on purpose (review W4).
+!packages/daemon/src/fixtures/**/*.pw
 *.cred
 *.secret
 **/creds/
