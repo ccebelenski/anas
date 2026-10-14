@@ -110,6 +110,24 @@ export function isFstabOptionToken(t: string): boolean {
   return true
 }
 
+/**
+ * cr.6 — the disable-without-delete signaling (EPICS §2 "Mounts", rulings
+ * 2026-10-14). ANAS disables a line by appending tokens to its OPTIONS column,
+ * never a marker comment (Principle 12): a line WITHOUT `noauto` gains
+ * `noauto,x-anas.disabled`, a line that already carries the operator's `noauto`
+ * gains only `x-anas.disabled=kept-noauto`. Re-enable removes exactly the
+ * token(s) disable added, so the line comes back byte-identical.
+ *
+ * `x-` is fstab's documented application-option namespace — systemd and mount
+ * ignore the token; the `noauto` keeps the mount from coming up at boot, and a
+ * hand edit that removes the token leaves `noauto` behind. The token is thus
+ * NEVER an operator-set option: the request schemas refuse it as an extra
+ * option and the parser consumes it (never passthrough). Both spellings are
+ * valid {@link FstabOptionToken}s, so the OPTIONS column stays token-clean.
+ */
+export const X_ANAS_DISABLED_TOKEN = 'x-anas.disabled'
+export const X_ANAS_DISABLED_KEPT_TOKEN = 'x-anas.disabled=kept-noauto'
+
 /** One fstab option token (see {@link isFstabOptionToken}). */
 export const FstabOptionToken = z
   .string()

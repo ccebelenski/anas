@@ -1271,7 +1271,9 @@ export async function buildMountDetail(
   let health: MountDetail['health'] = { state: row.state }
   let capacity: MountCapacity | undefined
   if (row.disabled) {
-    health = { state: 'disabled', detail: 'Disabled in /etc/fstab (marker-commented) — will not mount.' }
+    // cr.6: a disabled line carries `noauto` (+ an `x-anas.disabled` token) or
+    // a legacy `#ANAS ` comment — either way it is not mounted at boot.
+    health = { state: 'disabled', detail: 'Disabled in /etc/fstab — will not mount at boot.' }
   }
   else if (row.mounted && row.state !== 'armed') {
     const probe = await probeMount(executor, mountpoint)

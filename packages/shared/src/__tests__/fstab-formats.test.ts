@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { escapeFstabField, FstabOptionList, FstabOptionToken, fstabOptionTokens, unescapeFstabField } from '../formats/fstab.js'
+import { escapeFstabField, FstabOptionList, FstabOptionToken, fstabOptionTokens, unescapeFstabField, X_ANAS_DISABLED_KEPT_TOKEN, X_ANAS_DISABLED_TOKEN } from '../formats/fstab.js'
 
 /**
  * The per-format /etc/fstab layer from cr.2 (review C2, ruling (i)): octal
@@ -106,5 +106,15 @@ describe('FstabOptionList', () => {
     assert.deepEqual(fstabOptionTokens(''), [])
     assert.deepEqual(fstabOptionTokens('nofail'), ['nofail'])
     assert.deepEqual(fstabOptionTokens('vers=4.2,x-systemd.requires=/opt'), ['vers=4.2', 'x-systemd.requires=/opt'])
+  })
+})
+
+describe('cr.6 — the disable tokens are valid fstab option tokens', () => {
+  it('both spellings ANAS writes stay inside the token grammar (a token-clean OPTIONS column)', () => {
+    assert.equal(FstabOptionToken.safeParse(X_ANAS_DISABLED_TOKEN).success, true)
+    assert.equal(FstabOptionToken.safeParse(X_ANAS_DISABLED_KEPT_TOKEN).success, true)
+    // …and the comma list exactly as the daemon writes it is a valid list.
+    assert.equal(FstabOptionList.safeParse(`noauto,${X_ANAS_DISABLED_TOKEN}`).success, true)
+    assert.equal(FstabOptionList.safeParse(`noauto,${X_ANAS_DISABLED_KEPT_TOKEN}`).success, true)
   })
 })

@@ -29,11 +29,12 @@ const REALPATH_TIMEOUT_S = '5'
  *
  * The facts are ones the daemon already reads for the Mounts view:
  *   1. `/etc/fstab` — what the system is configured to mount (the parser is
- *      Mounts' own, so a disabled `#ANAS ` line is still a configured mount and
- *      an entry with a non-absolute mountpoint — swap — is already dropped).
- *      A `noauto` line is NOT configured to be mounted at boot — it mounts on
- *      demand, when somebody runs `mount` for it — so it is not the boot race
- *      this guard exists for and does not count as configured.
+ *      Mounts' own, so a disabled line — an `x-anas.disabled` option token, or
+ *      a legacy `#ANAS ` comment — is still a configured mount and an entry
+ *      with a non-absolute mountpoint — swap — is already dropped). A `noauto`
+ *      line is NOT configured to be mounted at boot — it mounts on demand,
+ *      when somebody runs `mount` for it — so it is not the boot race this
+ *      guard exists for and does not count as configured.
  *   2. ZFS `mountpoint,canmount,mounted` (story ident.4 (c), audit #16) — a
  *      dataset whose key is not loaded, or with `canmount=off`/`noauto`, is
  *      not mounted and its mountpoint is an empty directory on the parent;
@@ -146,8 +147,9 @@ export function buildSourceGuardFacts(
   const fstab: UnmountedMount[] = parseFstab(fstabText)
     // The parser has already classified the option list (`MountCommonOptions`),
     // so `noauto` is read from its structured field — never re-parsed from
-    // the raw line. A disabled `#ANAS ` entry still counts: it is configured,
-    // just switched off.
+    // the raw line. On a disabled entry that field is the OPERATOR's value (a
+    // bare `x-anas.disabled` reads false — ANAS forced the noauto), so a
+    // disabled entry still counts here: it is configured, just switched off.
     .filter(e => !e.options.common.noauto)
     .map(e => ({
       mountpoint: e.mountpoint,

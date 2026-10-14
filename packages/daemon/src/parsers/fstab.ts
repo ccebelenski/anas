@@ -1,5 +1,5 @@
 import type { MountCifsOptions, MountCommonOptions, MountEntry, MountInlineCredentials, MountNfsOptions, MountOptions } from '@anas/shared'
-import { escapeFstabField, MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec, unescapeFstabField } from '@anas/shared'
+import { escapeFstabField, MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec, unescapeFstabField, X_ANAS_DISABLED_KEPT_TOKEN, X_ANAS_DISABLED_TOKEN } from '@anas/shared'
 
 /** Recognized enum-value sets, mirrored from the shared schema (never drift). */
 const CIFS_CACHE_VALUES = new Set<string>(MountCifsCache.options)
@@ -82,9 +82,14 @@ export function inlineCommentIndex(raw: string): number {
 }
 
 /**
- * Disable-without-delete marker (operator decision): a disabled ANAS entry is
- * its original line VERBATIM, prefixed with `#ANAS `. One prefix, byte-identical
- * remainder — enabling strips exactly this and restores the original bytes.
+ * LEGACY disable-without-delete marker: a disabled ANAS entry used to be its
+ * original line VERBATIM, prefixed with `#ANAS `. Since the 2026-10-14 ruling
+ * (§2 Mounts) disabling is the OPTION form — `noauto,x-anas.disabled`, or
+ * `x-anas.disabled=kept-noauto` when the operator's own `noauto` was already on
+ * the line — and the marker is only a marker comment (Principle 12), so it is
+ * still READ as disabled but never WRITTEN again: an `#ANAS ` line is converted
+ * to the option form when ANAS next changes that line (enable, edit, disable
+ * again). No bulk migration.
  */
 export const ANAS_MARKER = '#ANAS '
 
@@ -150,20 +155,78 @@ export function addMount(text: string, entry: MountEntry): string {
 /**
  * Replace ONLY the line for `mountpoint` with a freshly serialized line. Every
  * other line is emitted unchanged. The line's inline trailing comment (if any)
- * and its disabled marker are preserved. No-op if `mountpoint` is absent.
+ * is preserved, and a DISABLED line stays disabled — re-written in the option
+ * form (which is also how an `#ANAS ` line is converted to it: this is one of
+ * the three places ANAS writes that line). No-op if `mountpoint` is absent.
  */
 export function replaceMount(text: string, mountpoint: string, entry: MountEntry): string {
   const doc = parseFstabDoc(text)
   for (const line of doc) {
     if (line.kind === 'entry' && line.entry.mountpoint === mountpoint) {
       const comment = line.trailingComment ? `   ${line.trailingComment}` : ''
-      const base = serializeMountLine(entry) + comment
-      line.raw = line.disabled ? ANAS_MARKER + base : base
+      line.raw = line.disabled
+        ? disabledSerialization(entry, comment)
+        : serializeMountLine(entry) + comment
       line.entry = entry
       break
     }
   }
   return serializeFstabDoc(doc)
+}
+
+/**
+ * The OPTIONS column of one raw entry line, carved out byte-surgically: the
+ * bytes after any (legacy) `#ANAS ` marker, the fields before any inline `#`
+ * comment, and the markers/separators that keep the rest of the line
+ * byte-identical. Returns null when the line does not parse as a six-field
+ * fstab entry. Every surgical OPTIONS writer below goes through this ONE
+ * extraction, so the spec, the mountpoint, the column alignment a human chose,
+ * the dump/pass columns and the inline comment can never be disturbed.
+ */
+function entryOptionsOps(line: { disabled: boolean, raw: string }):
+  { marker: string, comment: string, head: string, opts: string, tail: string } | null {
+  // Work on the bytes AFTER the (legacy) disabled marker and BEFORE any inline
+  // comment, so neither is disturbed and neither can be mistaken for a field.
+  const marker = line.disabled && line.raw.startsWith(ANAS_MARKER) ? ANAS_MARKER : ''
+  const body = line.raw.slice(marker.length)
+  const hashIdx = inlineCommentIndex(body)
+  const fieldsPart = hashIdx === -1 ? body : body.slice(0, hashIdx)
+  const comment = hashIdx === -1 ? '' : body.slice(hashIdx)
+
+  // Leading whitespace, then four fields with their ORIGINAL separators. The
+  // fourth is the options column; everything after it is left untouched.
+  const m = fieldsPart.match(FSTAB_FOUR_FIELDS)
+  if (!m)
+    return null
+  const [, lead, spec, s1, mp, s2, fstype, s3, opts, tail] = m
+  return {
+    marker,
+    comment,
+    head: `${lead}${spec}${s1}${mp}${s2}${fstype}${s3}`,
+    opts,
+    tail,
+  }
+}
+
+/** Rewrite the OPTIONS column of one entry line, in place; every other byte stays. */
+function rewriteEntryOptions(
+  line: { disabled: boolean, raw: string },
+  rewrite: (opts: string) => string,
+): void {
+  const ops = entryOptionsOps(line)
+  if (!ops)
+    return
+  const rewritten = rewrite(ops.opts)
+  if (rewritten === ops.opts)
+    return // no change — leave the byte-identical line alone
+  line.raw = `${ops.marker}${ops.head}${rewritten}${ops.tail}${ops.comment}`
+}
+
+/** Reparse a mutated entry line's raw bytes back into its structured entry. */
+function refreshEntry(line: FstabDocLine & { kind: 'entry' }): void {
+  const reparsed = parseFstabDoc(line.raw)[0]
+  if (reparsed?.kind === 'entry')
+    line.entry = reparsed.entry
 }
 
 /**
@@ -189,32 +252,16 @@ export function addMountOption(text: string, mountpoint: string, token: string):
   for (const line of doc) {
     if (line.kind !== 'entry' || line.entry.mountpoint !== mountpoint)
       continue
-
-    // Work on the bytes AFTER the disabled marker and BEFORE any inline comment,
-    // so neither is disturbed and neither can be mistaken for a field.
-    const marker = line.disabled && line.raw.startsWith(ANAS_MARKER) ? ANAS_MARKER : ''
-    const body = line.raw.slice(marker.length)
-    const hashIdx = inlineCommentIndex(body)
-    const fieldsPart = hashIdx === -1 ? body : body.slice(0, hashIdx)
-    const comment = hashIdx === -1 ? '' : body.slice(hashIdx)
-
-    // Leading whitespace, then four fields with their ORIGINAL separators. The
-    // fourth is the options column; everything after it is left untouched.
-    const m = fieldsPart.match(FSTAB_FOUR_FIELDS)
-    if (!m)
+    const ops = entryOptionsOps(line)
+    if (!ops)
       return text
-    const [, lead, spec, s1, mp, s2, fstype, s3, opts, rest] = m
-    if (opts.split(',').map(o => o.trim()).includes(token))
+    if (ops.opts.split(',').map(o => o.trim()).includes(token))
       return text
-
-    const rewritten = `${lead}${spec}${s1}${mp}${s2}${fstype}${s3}${opts},${token}${rest}`
-    line.raw = marker + rewritten + comment
-    const reparsed = parseFstabDoc(line.raw)[0]
-    if (reparsed?.kind === 'entry')
-      line.entry = reparsed.entry
-    return serializeFstabDoc(doc)
+    rewriteEntryOptions(line, opts => (opts ? `${opts},${token}` : token))
+    refreshEntry(line)
+    break
   }
-  return text
+  return serializeFstabDoc(doc)
 }
 
 /** Remove ONLY the line for `mountpoint` (active or disabled). No-op if absent. */
@@ -227,34 +274,121 @@ export function removeMount(text: string, mountpoint: string): string {
 }
 
 /**
- * Disable ONLY the line for `mountpoint` without deleting it: prefix its raw
- * bytes with the `#ANAS ` marker (byte-identical remainder). No-op if absent or
- * already disabled. Enabling later restores the original bytes exactly.
+ * The disable token(s) for an entry, per the 2026-10-14 ruling (§2 Mounts): a
+ * line WITHOUT the operator's `noauto` gains `noauto,` + the token (the `noauto`
+ * IS the disable — it keeps the mount from coming up at boot); a line that
+ * already carries the operator's `noauto` gains only the kept-noauto token, so
+ * the operator's own "enabled, not at boot" choice survives a round trip.
+ */
+function disabledTokens(entry: MountEntry): string[] {
+  return entry.options.common.noauto ? [X_ANAS_DISABLED_KEPT_TOKEN] : ['noauto', X_ANAS_DISABLED_TOKEN]
+}
+
+/** Append option tokens to the OPTIONS column of a canonical serialized line. */
+function injectOptionTokens(serialized: string, tokens: string[]): string {
+  const m = serialized.match(FSTAB_FOUR_FIELDS)
+  if (!m)
+    return serialized // cannot happen for our own serialization — fail open
+  const [, lead, spec, s1, mp, s2, fstype, s3, opts, tail] = m
+  const added = tokens.join(',')
+  return `${lead}${spec}${s1}${mp}${s2}${fstype}${s3}${opts ? `${opts},` : ''}${added}${tail}`
+}
+
+/**
+ * The DISABLED (option-form) rendering of an entry: its canonical ACTIVE line
+ * plus exactly the disable token(s) the entry's own `noauto` calls for.
+ * `comment` is the inline trailing comment to re-attach (after the options,
+ * where it always was). This is the one writer for a disabled line — the
+ * convert-an-`#ANAS`-line and keep-a-disabled-line-stays-disabled paths share
+ * it, so the two produce identical bytes.
+ */
+function disabledSerialization(entry: MountEntry, comment: string): string {
+  return injectOptionTokens(serializeMountLine(entry), disabledTokens(entry)) + comment
+}
+
+/**
+ * Disable ONLY the line for `mountpoint` without deleting it. Since the
+ * 2026-10-14 ruling the disable is OPTION-form, not a marker comment
+ * (Principle 12): the options column gains `noauto,x-anas.disabled` (or only
+ * `x-anas.disabled=kept-noauto` when the operator's own `noauto` is already on
+ * the line), byte-surgically, so enabling later removes exactly these and the
+ * line returns BYTE-IDENTICAL. A line already disabled in the option form is a
+ * no-op; a legacy `#ANAS ` line is CONVERTED to the option form — this is one
+ * of the three places ANAS writes that line, and the ruling says such a line is
+ * rewritten to the new form when ANAS changes it.
  */
 export function disableMount(text: string, mountpoint: string): string {
   const doc = parseFstabDoc(text)
   for (const line of doc) {
-    if (line.kind === 'entry' && line.entry.mountpoint === mountpoint && !line.disabled) {
-      line.raw = ANAS_MARKER + line.raw
-      line.disabled = true
-      break
+    if (line.kind !== 'entry' || line.entry.mountpoint !== mountpoint)
+      continue
+    if (!line.disabled) {
+      appendOptionTokens(line, disabledTokens(line.entry))
+      refreshEntry(line)
     }
+    else if (line.raw.startsWith(ANAS_MARKER)) {
+      // Legacy marker — convert to the option form (writes THAT line).
+      const comment = line.trailingComment ? `   ${line.trailingComment}` : ''
+      line.raw = disabledSerialization(line.entry, comment)
+      refreshEntry(line)
+    }
+    // Already in the option form: nothing to do.
+    break
   }
   return serializeFstabDoc(doc)
 }
 
+/** Append one or more option tokens to an entry line's options column, byte-surgically. */
+function appendOptionTokens(line: FstabDocLine & { kind: 'entry' }, tokens: string[]): void {
+  rewriteEntryOptions(line, (opts) => {
+    const added = tokens.join(',')
+    return opts ? `${opts},${added}` : added
+  })
+}
+
 /**
- * Enable ONLY the disabled line for `mountpoint`: strip exactly the `#ANAS `
- * marker, restoring the original bytes. No-op if absent or not disabled.
+ * Enable ONLY the disabled line for `mountpoint`, removing exactly what disable
+ * added so the line comes back BYTE-IDENTICAL. A legacy `#ANAS ` line is
+ * un-marked as before (the marker comes off, the original active line returns).
+ * An option-form line loses its disable token — and, when the token is the bare
+ * `x-anas.disabled` (meaning disable also added the `noauto`), the `noauto`
+ * too. The kept-noauto form removes only its own token, leaving the operator's
+ * `noauto` alone.
  */
 export function enableMount(text: string, mountpoint: string): string {
   const doc = parseFstabDoc(text)
   for (const line of doc) {
-    if (line.kind === 'entry' && line.entry.mountpoint === mountpoint && line.disabled && line.raw.startsWith(ANAS_MARKER)) {
+    if (line.kind !== 'entry' || line.entry.mountpoint !== mountpoint || !line.disabled)
+      continue
+    if (line.raw.startsWith(ANAS_MARKER)) {
       line.raw = line.raw.slice(ANAS_MARKER.length)
-      line.disabled = false
-      break
     }
+    else {
+      const ops = entryOptionsOps(line)
+      if (!ops)
+        break
+      const hasBare = ops.opts.split(',').map(o => o.trim()).includes(X_ANAS_DISABLED_TOKEN)
+      // bare form ⇒ disable added `noauto` too; kept-noauto ⇒ the operator's own
+      // `noauto` stays. (Both tokens present is pathological — clear everything.)
+      const drop = new Set(hasBare
+        ? ['noauto', X_ANAS_DISABLED_TOKEN, X_ANAS_DISABLED_KEPT_TOKEN]
+        : [X_ANAS_DISABLED_KEPT_TOKEN])
+      // Removal matches the TRIMMED token so a hand-spaced token still goes, but
+      // every SURVIVING token keeps its exact bytes — a comma-separated
+      // `defaults, nofail` the operator wrote stays `defaults, nofail`, so the
+      // round trip is byte-identical even with hand spacing.
+      rewriteEntryOptions(line, (opts) => {
+        const out: string[] = []
+        for (const t of opts.split(',').filter(o => o !== '')) {
+          if (!drop.has(t.trim()))
+            out.push(t)
+        }
+        return out.join(',')
+      })
+    }
+    line.disabled = false
+    refreshEntry(line)
+    break
   }
   return serializeFstabDoc(doc)
 }
@@ -281,10 +415,12 @@ export function serializeMountLine(entry: MountEntry): string {
  * lines that are not recognizable as a manageable mount entry (preserved
  * verbatim as `other`).
  *
- * A line prefixed with the `#ANAS ` marker whose REMAINDER parses as a valid
- * entry is a DISABLED mount (disabled=true). If the remainder does not parse,
- * the line is an ordinary comment (fail-open — never mangle a human's prose
- * comment that happens to start with `#ANAS `).
+ * A line is a DISABLED mount (disabled=true) when it EITHER carries the legacy
+ * `#ANAS ` marker whose REMAINDER parses as a valid entry, OR (since cr.6) its
+ * options carry an `x-anas.disabled` token. In the marker case a remainder that
+ * does not parse makes the line an ordinary comment (fail-open — never mangle a
+ * human's prose comment that happens to start with `#ANAS `); in the option
+ * case the disable token is what says so, no matter what else the line carries.
  */
 function parseEntryLine(raw: string): { entry: MountEntry, trailingComment: string, disabled: boolean } | null {
   if (raw.startsWith(ANAS_MARKER)) {
@@ -300,7 +436,12 @@ function parseEntryLine(raw: string): { entry: MountEntry, trailingComment: stri
     return null // blank line or whole-line (incl. commented-out) entry
 
   const parsed = parseActiveEntry(raw)
-  return parsed ? { ...parsed, disabled: false } : null
+  if (!parsed)
+    return null
+  // The option-form disable is carried by the entry itself — the parser sets
+  // `disabled` when the options carry an `x-anas.disabled` token; the `#ANAS `
+  // form was set in the branch above. No other line is ever disabled.
+  return { ...parsed, disabled: parsed.entry.disabled === true }
 }
 
 /** Parse an ACTIVE (uncommented) fstab data line into an entry, or null. */
@@ -335,7 +476,7 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
     return null
 
   const tokens = optStr.split(',').map(o => o.trim()).filter(Boolean)
-  const { options, credentialsFile, inlineCredentials } = classifyOptions(fstype, tokens)
+  const { options, credentialsFile, inlineCredentials, disable } = classifyOptions(fstype, tokens)
 
   const entry: MountEntry = {
     spec,
@@ -349,6 +490,10 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
     entry.credentialsFile = credentialsFile
   if (inlineCredentials !== undefined)
     entry.inlineCredentials = inlineCredentials
+  // The option-form disable: carried by the line's own tokens, so a disabled
+  // entry is `disabled: true` exactly like a legacy `#ANAS ` one.
+  if (disable)
+    entry.disabled = true
 
   return { entry, trailingComment }
 }
@@ -373,7 +518,7 @@ function isNfs(fstype: string): boolean {
 export function classifyOptions(
   fstype: string,
   tokens: string[],
-): { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials } {
+): { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto' } {
   const common: MountCommonOptions = {
     readOnly: false,
     nofail: false,
@@ -392,11 +537,26 @@ export function classifyOptions(
   const inline: MountInlineCredentials = {}
   const nfsFs = isNfs(fstype)
   const cifsFs = fstype === 'cifs'
+  /** How (if at all) the line is disabled: the form of its `x-anas.disabled` token. */
+  let disable: 'bare' | 'kept-noauto' | undefined
 
   for (const token of tokens) {
     const eq = token.indexOf('=')
     const key = eq === -1 ? token : token.slice(0, eq)
     const value = eq === -1 ? '' : token.slice(eq + 1)
+
+    // --- ANAS disable token (cr.6, §2 Mounts ruling) ---
+    // CONSUMED — never passthrough, never shown to the UI as an extra option:
+    // it is ANAS disable bookkeeping, not an operator-set option. The bare
+    // form means ANAS FORCED the `noauto` (the operator's own value is FALSE);
+    // the kept-noauto form means the operator's `noauto` was already on the
+    // line (left TRUE). The noauto adjustment is applied after the whole list
+    // is seen, so a hand-edited token order cannot resurrect a bare form's
+    // forced `noauto`.
+    if (key.toLowerCase() === 'x-anas.disabled') {
+      disable = token.toLowerCase() === X_ANAS_DISABLED_KEPT_TOKEN ? 'kept-noauto' : 'bare'
+      continue
+    }
 
     // --- common (any fstype) ---
     if (applyCommonToken(common, token, key, value, passthrough))
@@ -452,11 +612,18 @@ export function classifyOptions(
   if (Object.keys(cifs).length > 0)
     options.cifs = cifs
 
-  const result: { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials } = { options }
+  // The bare disable form forced a `noauto` onto the line, so the operator's own
+  // `noauto` is FALSE — decided after the full pass (see the consume above).
+  if (disable === 'bare')
+    common.noauto = false
+
+  const result: { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto' } = { options }
   if (credentialsFile !== undefined)
     result.credentialsFile = credentialsFile
   if (Object.keys(inline).length > 0)
     result.inlineCredentials = inline
+  if (disable !== undefined)
+    result.disable = disable
   return result
 }
 

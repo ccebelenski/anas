@@ -40,6 +40,19 @@ describe('MountExtraOptions — token list + credential refusal', () => {
     for (const s of ['users', 'nouser', 'noexec,x-systemd.automount'])
       assert.equal(MountExtraOptions.safeParse(s).success, true, JSON.stringify(s))
   })
+
+  it('refuses the ANAS disable token, both forms, case-insensitively, naming Disable/Enable (cr.6)', () => {
+    for (const s of ['x-anas.disabled', 'noauto,x-anas.disabled', 'x-anas.disabled=kept-noauto', 'X-ANAS.DISABLED', 'noauto,X-Anas.Disabled=kept-noauto'])
+      assert.equal(MountExtraOptions.safeParse(s).success, false, JSON.stringify(s))
+    const bad = MountExtraOptions.safeParse('x-anas.disabled=kept-noauto')
+    assert.ok(!bad.success)
+    assert.match(bad.error.issues[0].message, /Disable\/Enable/)
+  })
+
+  it('still allows near-miss application-option names — only the exact disable key is refused', () => {
+    for (const s of ['x-anas-note=keep', 'x-systemd.automount', 'noauto', 'x-anas.disabled-clearing'])
+      assert.equal(MountExtraOptions.safeParse(s).success, true, JSON.stringify(s))
+  })
 })
 
 describe('the request schemas gate extraOptions at the boundary', () => {

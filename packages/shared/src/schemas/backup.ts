@@ -822,9 +822,10 @@ export const UnmountedMount = z.object({
   /** fstab fs_vfstype — cifs, nfs4, ext4, tmpfs, … */
   fstype: z.string(),
   /**
-   * Its fstab line is commented out with the `#ANAS ` marker (disabled, not
-   * deleted) — still a CONFIGURED mount, and still not mounted. Optional so an
-   * older daemon's answer parses.
+   * Its fstab entry is DISABLED-without-delete (cr.6): `noauto` + an
+   * `x-anas.disabled` option token, or the legacy `#ANAS ` marker comment —
+   * still a CONFIGURED mount, and still not mounted. Optional so an older
+   * daemon's answer parses.
    */
   disabled: z.boolean().optional(),
   /**

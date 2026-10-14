@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { FstabOptionList, fstabOptionTokens, isFstabOptionToken } from '../formats/fstab.js'
+import { FstabOptionList, fstabOptionTokens, isFstabOptionToken, X_ANAS_DISABLED_TOKEN } from '../formats/fstab.js'
 import { AbsolutePath, SingleLine } from './common.js'
 import { IscsiHeldByLun } from './iscsi.js'
 
@@ -304,7 +304,15 @@ export const MountEntry = z.object({
   inlineCredentials: MountInlineCredentials.optional(),
   dump: z.number().int().nonnegative(),
   pass: z.number().int().nonnegative(),
-  /** Disabled-without-delete: the line is commented with the `#ANAS ` marker. */
+  /**
+   * Disabled-without-delete (cr.6, ruling 2026-10-14): the line's options carry
+   * the `x-anas.disabled` token (`noauto,x-anas.disabled`, or
+   * `x-anas.disabled=kept-noauto` over the operator's own `noauto`) — or it
+   * still carries the LEGACY `#ANAS ` comment marker, which is read as disabled
+   * until ANAS next writes that line. On a disabled entry `common.noauto` is
+   * the OPERATOR's value (false for the bare form, where ANAS forced the
+   * `noauto` — see classifyOptions).
+   */
   disabled: z.boolean().optional(),
 })
 export type MountEntry = z.infer<typeof MountEntry>
@@ -342,7 +350,11 @@ export const MountSummary = z.object({
   remotePath: z.string().optional(),
   /** x-systemd.automount configured. */
   automount: z.boolean(),
-  /** Disabled-without-delete: fstab line marker-commented (`#ANAS `). Intentional. */
+  /**
+   * Disabled-without-delete (cr.6): the fstab line carries `noauto` +
+   * `x-anas.disabled` (or the legacy `#ANAS ` comment). Read as disabled in
+   * both forms; will not mount at boot. Intentional.
+   */
   disabled: z.boolean(),
   /** PVE-owned (read-only storage.cfg) — HANDS-OFF; every mutation is rejected. */
   pveManaged: z.boolean(),
@@ -460,6 +472,16 @@ export const MountExtraOptions = FstabOptionList.superRefine((s, ctx) => {
   for (const token of fstabOptionTokens(s)) {
     const eq = token.indexOf('=')
     const key = eq === -1 ? token : token.slice(0, eq)
+    // cr.6 (§2 Mounts ruling): `x-anas.disabled` is the disable-without-delete
+    // bookkeeping ANAS writes itself — not an operator-set option. Refused so
+    // an `extraOptions` payload can neither forge nor clear a disable.
+    if (key.toLowerCase() === X_ANAS_DISABLED_TOKEN) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `'${token}' is managed by Disable/Enable — it is ANAS's own disabled-marker option and cannot be set as an extra option`,
+      })
+      return
+    }
     if (CREDENTIAL_OPTION_KEYS.has(key.toLowerCase())) {
       ctx.addIssue({
         code: 'custom',

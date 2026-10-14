@@ -675,8 +675,8 @@ describe('mount routes (Epic 18)', () => {
     })
   })
 
-  describe('POST /v1/mounts/:mountpoint/state — disable / enable', () => {
-    it('disable comments the line with the marker; enable restores it byte-identically', async () => {
+  describe('POST /v1/mounts/:mountpoint/state — disable / enable (cr.6 option form)', () => {
+    it('disable writes noauto + x-anas.disabled; enable restores the file byte-identically', async () => {
       const before = await readFile(fstabPath, 'utf8')
       const origLine = before.split('\n').find(l => l.includes('/mnt/anas-nfs'))!
 
@@ -684,8 +684,14 @@ describe('mount routes (Epic 18)', () => {
       assert.equal(dres.statusCode, 202)
       const djob = await waitForJob(server!, dres.json().job.id)
       assert.equal(djob.status, 'completed', JSON.stringify(djob.error))
+
+      // The line is rewritten in the OPTION form — never a marker comment.
       const disabled = await readFile(fstabPath, 'utf8')
-      assert.ok(disabled.split('\n').includes(`#ANAS ${origLine}`))
+      const dLine = disabled.split('\n').find(l => l.includes('/mnt/anas-nfs'))!
+      assert.ok(!dLine.startsWith('#'), dLine)
+      // Disable appends both tokens after the options column (byte-surgical —
+      // the columns and spacing survive).
+      assert.equal(dLine, origLine.replace('nofail', 'nofail,noauto,x-anas.disabled'))
 
       // Inventory now shows it disabled.
       const inv = await server!.inject({ method: 'GET', url: '/v1/mounts' })
@@ -698,6 +704,33 @@ describe('mount routes (Epic 18)', () => {
       const ejob = await waitForJob(server!, eres.json().job.id)
       assert.equal(ejob.status, 'completed')
       assert.equal(await readFile(fstabPath, 'utf8'), before) // exact restore
+    })
+
+    it('mount is refused on a NEW-FORM disabled entry (400: enable it first)', async () => {
+      const dres = await server!.inject({ method: 'POST', url: `/v1/mounts/${enc('/mnt/anas-nfs')}/state`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ action: 'disable' }) })
+      assert.equal(dres.statusCode, 202)
+      await waitForJob(server!, dres.json().job.id)
+      const mres = await server!.inject({ method: 'POST', url: `/v1/mounts/${enc('/mnt/anas-nfs')}/state`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ action: 'mount' }) })
+      assert.equal(mres.statusCode, 400)
+      assert.match(mres.json().error.message, /disabled — enable it first/)
+    })
+
+    it('a hand-written noauto,x-anas.disabled line reads disabled in the inventory, state disabled', async () => {
+      const withDisabled = `${FSTAB_FIXTURE.replace('127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,nofail  0  0', '127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,nofail,noauto,x-anas.disabled  0  0')}`
+      await writeFile(fstabPath, withDisabled)
+      const inv = await server!.inject({ method: 'GET', url: '/v1/mounts' })
+      const row = (inv.json() as { data: MountSummary[] }).data.find(r => r.mountpoint === '/mnt/anas-nfs')!
+      assert.equal(row.disabled, true)
+      assert.equal(row.state, 'disabled')
+      assert.equal(row.mounted, true) // the mount table still has it — state reads disabled regardless
+      // And the mount verb is refused by the enclosed entry — not by the mock.
+      const mres = await server!.inject({ method: 'POST', url: `/v1/mounts/${enc('/mnt/anas-nfs')}/state`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ action: 'mount' }) })
+      assert.equal(mres.statusCode, 400)
+      // The DETAIL health reads disabled too — even though the mount table
+      // still has the entry, the fstab disable wins (never armed/unmounted).
+      const det = await server!.inject({ method: 'GET', url: `/v1/mounts/${enc('/mnt/anas-nfs')}`, headers: IDENTITY_HEADERS })
+      const detail = det.json() as { data: MountDetail }
+      assert.equal(detail.data.health.state, 'disabled')
     })
 
     it('disable on a non-persisted mount → 400', async () => {

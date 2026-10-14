@@ -513,7 +513,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       return { job }
     }
 
-    // --- enable: strip the marker only (config inverse of disable; no mount) ---
+    // --- enable: remove exactly what disable added (config inverse; no mount) ---
     if (action === 'enable') {
       if (!entry) {
         reply.code(400)
@@ -576,7 +576,8 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
             throw new Error(await enrichBusyError(executor, r.stderr.trim() || `umount exited ${r.exitCode}`, mp, configfsOptionsFrom(iscsiPaths)))
         }
         if (disabling) {
-          // Comment the fstab line with the marker; KEEP the credentials file.
+          // Append `noauto,x-anas.disabled` (or the kept-noauto token over the
+          // operator's own noauto) to the fstab line; KEEP the credentials file.
           updateProgress(`Disabling ${mp} in /etc/fstab`)
           await editConfig(fstabPath, current => disableMount(current, mp))
           updateProgress('Reloading systemd (daemon-reload)')

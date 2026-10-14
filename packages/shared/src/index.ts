@@ -33,6 +33,8 @@ export {
   fstabOptionTokens,
   isFstabOptionToken,
   unescapeFstabField,
+  X_ANAS_DISABLED_KEPT_TOKEN,
+  X_ANAS_DISABLED_TOKEN,
 } from './formats/fstab.js'
 
 // Mount target normalisation (Epic 18): the pure server/share normaliser the

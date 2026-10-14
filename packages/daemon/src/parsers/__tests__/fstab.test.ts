@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { X_ANAS_DISABLED_KEPT_TOKEN, X_ANAS_DISABLED_TOKEN } from '@anas/shared'
 import {
   addMount,
   addMountOption,
@@ -278,24 +279,24 @@ describe('fstab field escaping (cr.2, review C2)', () => {
     assert.deepEqual(again.options, first.options)
   })
 
-  it('the #ANAS path works on the UNESCAPED value and never rewrites the marker', () => {
+  it('the disable path works on the UNESCAPED value and never rewrites the escape', () => {
     const text = '//nas/My\\040Share /mnt/My\\040Share cifs guest,nofail 0 0\n'
     const disabled = disableMount(text, '/mnt/My Share')
-    assert.ok(disabled.startsWith(ANAS_MARKER))
+    assert.ok(disabled.includes('guest,nofail,noauto,x-anas.disabled'), disabled)
+    assert.ok(disabled.includes('\\040'), 'the escaped fields survive the surgical disable')
     // The disabled line still parses as one escaped entry → unescaped identity.
     const parsed = getMount(disabled, '/mnt/My Share')!
     assert.equal(parsed.mountpoint, '/mnt/My Share')
     assert.equal(parsed.disabled, true)
     // A surgical addMountOption targets it by the UNESCAPED mountpoint and
-    // leaves the marker + the escape spellings intact.
+    // leaves the disable tokens + the escape spellings intact.
     const once = addMountOption(disabled, '/mnt/My Share', 'x-anas-note=keep')
-    assert.ok(once.startsWith(ANAS_MARKER))
     assert.ok(once.includes('x-anas-note=keep'))
     assert.ok(once.includes('\\040'), 'the escaped field must not be re-escaped')
     assert.ok(!once.includes('My\\040Share /mnt/My Share'), 'no partial unescape')
-    // Enabling strips exactly the marker, keeping the escaped fields + the note.
+    // Enabling removes exactly what disable added, keeping escaped fields + the note.
     const enabled = enableMount(once, '/mnt/My Share')!
-    assert.ok(!enabled.startsWith(ANAS_MARKER))
+    assert.ok(!enabled.includes('x-anas.disabled'), enabled)
     assert.ok(enabled.includes('x-anas-note=keep') && enabled.includes('\\040'), enabled)
   })
 })
@@ -413,41 +414,174 @@ describe('addMountOption — one option, in place, byte-surgically (story iscsi.
     assert.equal(addMountOption(before, '/mnt/nothing-here', OPT), before)
   })
 
-  it('a DISABLED entry keeps its marker and still gains the option', () => {
+  it('a DISABLED entry (option form) still gains the option and stays disabled', () => {
     const before = loadFixture('fstab-anas-managed')
     const disabled = disableMount(before, '/mnt/anas-nfs')
     const after = addMountOption(disabled, '/mnt/anas-nfs', OPT)
     const line = after.split('\n').find(l => l.includes('/mnt/anas-nfs'))!
-    assert.ok(line.startsWith(ANAS_MARKER), line)
+    // The disable tokens survive the surgical add; the line is still disabled.
+    assert.ok(line.includes(`noauto,${X_ANAS_DISABLED_TOKEN}`), line)
     assert.ok(line.includes(OPT), line)
+    assert.equal(getMount(after, '/mnt/anas-nfs')!.disabled, true)
     // …and enabling it afterwards still yields a parseable, option-carrying line.
     const enabled = enableMount(after, '/mnt/anas-nfs')
-    assert.equal(getMount(enabled, '/mnt/anas-nfs')!.options.passthrough.includes(OPT), true)
+    const entry = getMount(enabled, '/mnt/anas-nfs')!
+    assert.equal(entry.options.passthrough.includes(OPT), true)
+    assert.notEqual(entry.disabled, true)
   })
 })
 
-describe('disable / enable marker (byte-identical both directions)', () => {
-  it('disable prefixes #ANAS  and enable restores the original bytes exactly', () => {
+describe('cr.6 — disable/enable via `noauto` + `x-anas.disabled` (option form)', () => {
+  const NFS = '127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,nofail  0  0\n'
+
+  it('disable appends noauto,x-anas.disabled and enable restores the EXACT bytes', () => {
+    const disabled = disableMount(NFS, '/mnt/anas-nfs')
+    assert.equal(disabled.trimEnd(), '127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,nofail,noauto,x-anas.disabled  0  0')
+    assert.equal(disabled, `127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,nofail,noauto,x-anas.disabled  0  0\n`)
+    assert.equal(enableMount(disabled, '/mnt/anas-nfs'), NFS)
+  })
+
+  it('a disabled line reads disabled, the operator\'s noauto is FALSE (ANAS forced it), token never in passthrough', () => {
+    const disabled = disableMount(NFS, '/mnt/anas-nfs')
+    const entry = getMount(disabled, '/mnt/anas-nfs')!
+    assert.equal(entry.disabled, true)
+    // The `noauto` on the line is DISABLE bookkeeping — the operator's own value
+    // is false, so the boot-warning and source-guard derivations treat it as a
+    // boot mount that is switched off, exactly like a legacy `#ANAS ` entry.
+    assert.equal(entry.options.common.noauto, false)
+    // …and the disable token is consumed, never passthrough.
+    assert.equal(entry.options.passthrough, 'defaults')
+    assert.ok(!entry.options.passthrough.includes('anas.disabled'))
+  })
+
+  it('pre-existing operator noauto → only x-anas.disabled=kept-noauto; enable keeps the noauto, byte-identical', () => {
+    const before = '127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,noauto,nofail  0  0\n'
+    const disabled = disableMount(before, '/mnt/anas-nfs')
+    assert.equal(disabled, '127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,noauto,nofail,x-anas.disabled=kept-noauto  0  0\n')
+    const entry = getMount(disabled, '/mnt/anas-nfs')!
+    assert.equal(entry.disabled, true)
+    assert.equal(entry.options.common.noauto, true) // the operator's OWN noauto survives
+    const enabled = enableMount(disabled, '/mnt/anas-nfs')
+    assert.equal(enabled, before) // byte-identical
+    assert.equal(getMount(enabled, '/mnt/anas-nfs')!.options.common.noauto, true)
+  })
+
+  it('an inline comment stays after the options through disable→enable (byte-identical)', () => {
+    const before = '192.168.1.50:/volume1/media     /mnt/media   nfs4   rw,nofail,_netdev   0 0   # media library, read-mostly\n'
+    const disabled = disableMount(before, '/mnt/media')
+    assert.ok(disabled.includes('_netdev,noauto,x-anas.disabled   0 0   # media library, read-mostly'))
+    assert.equal(enableMount(disabled, '/mnt/media'), before)
+  })
+
+  it('x-systemd.automount rides the disable and re-appears byte-identical on enable', () => {
+    const before = '127.0.0.1:/srv/nfs/export1  /mnt/anas-auto  nfs4  defaults,nofail,x-systemd.automount,x-systemd.idle-timeout=60  0  0\n'
+    const disabled = disableMount(before, '/mnt/anas-auto')
+    assert.ok(disabled.includes('x-systemd.automount,x-systemd.idle-timeout=60,noauto,x-anas.disabled'))
+    assert.equal(getMount(disabled, '/mnt/anas-auto')!.options.common.automount, true)
+    assert.equal(enableMount(disabled, '/mnt/anas-auto'), before)
+  })
+
+  it('a CIFS line keeps its credentials token and round-trips byte-identical', () => {
+    const before = '//10.0.0.114/anastest  /mnt/anas-cifs  cifs  credentials=/etc/anas/creds/anastest.cred,vers=3.1.1,uid=1002,gid=1002,nofail  0  0\n'
+    const disabled = disableMount(before, '/mnt/anas-cifs')
+    assert.ok(disabled.includes('credentials=/etc/anas/creds/anastest.cred,vers=3.1.1,uid=1002,gid=1002,nofail,noauto,x-anas.disabled'))
+    assert.equal(enableMount(disabled, '/mnt/anas-cifs'), before)
+  })
+
+  it('the managed fixture: disable→enable is byte-identical and only the one line changes', () => {
     const before = loadFixture('fstab-anas-managed')
     const disabled = disableMount(before, '/mnt/anas-nfs')
     assert.notEqual(disabled, before)
-    // The disabled line is `#ANAS ` + the original verbatim.
-    const origLine = before.split('\n').find(l => l.includes('/mnt/anas-nfs'))!
-    assert.ok(disabled.split('\n').includes(`${ANAS_MARKER}${origLine}`))
-    // Enabling restores the exact original file.
+    const beforeLines = before.split('\n')
+    for (const [i, l] of disabled.split('\n').entries()) {
+      if (l.includes('/mnt/anas-nfs'))
+        assert.ok(l.includes('noauto,x-anas.disabled'), l)
+      else
+        assert.equal(l, beforeLines[i], `line ${i} must be untouched`)
+    }
     assert.equal(enableMount(disabled, '/mnt/anas-nfs'), before)
   })
 
-  it('a disabled line parses as a disabled entry (round-trips byte-identical)', () => {
-    const text = `${ANAS_MARKER}127.0.0.1:/srv/nfs/export1  /mnt/z  nfs4  defaults,nofail  0  0\n`
-    const doc = parseFstabDoc(text)
-    assert.equal(serializeFstabDoc(doc), text) // byte identity
+  it('duplicate disable is a no-op; enable of an active line is a no-op', () => {
+    const once = disableMount(NFS, '/mnt/anas-nfs')
+    assert.equal(disableMount(once, '/mnt/anas-nfs'), once)
+    assert.equal(enableMount(NFS, '/mnt/anas-nfs'), NFS)
+  })
+})
+
+describe('cr.6 — classifyOptions consumes the disable token (operator noauto per form)', () => {
+  it('bare form → operator noauto FALSE, token consumed, never passthrough', () => {
+    const { options, disable } = classifyOptions('nfs4', 'defaults,nofail,noauto,x-anas.disabled'.split(','))
+    assert.equal(disable, 'bare')
+    assert.equal(options.common.noauto, false)
+    assert.equal(options.common.nofail, true)
+    assert.equal(options.passthrough, 'defaults')
+  })
+
+  it('kept-noauto form → operator noauto TRUE', () => {
+    const { options, disable } = classifyOptions('nfs4', `defaults,noauto,nofail,${X_ANAS_DISABLED_KEPT_TOKEN}`.split(','))
+    assert.equal(disable, 'kept-noauto')
+    assert.equal(options.common.noauto, true)
+    assert.equal(options.passthrough, 'defaults')
+  })
+
+  it('a reordered bare form cannot resurrect the ANAS-forced noauto (decided after the full list)', () => {
+    const { options } = classifyOptions('nfs4', `x-anas.disabled,nofail,noauto,defaults`.split(','))
+    assert.equal(options.common.noauto, false)
+  })
+
+  it('a hand-typed case-shifted token still reads disabled (fail-safe on the read side)', () => {
+    const { options, disable } = classifyOptions('nfs4', 'defaults,noauto,X-ANAS.DISABLED'.split(','))
+    assert.equal(disable, 'bare')
+    assert.equal(options.common.noauto, false)
+    assert.ok(!options.passthrough.includes('anas.disabled'))
+  })
+})
+
+describe('cr.6 — legacy `#ANAS ` lines: read disabled, convert only when ANAS writes that line', () => {
+  const MARKED = `${ANAS_MARKER}127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,nofail  0  0\n`
+
+  it('an #ANAS line still parses as a disabled entry (round-trips byte-identical)', () => {
+    const doc = parseFstabDoc(MARKED)
+    assert.equal(serializeFstabDoc(doc), MARKED)
     assert.equal(doc[0].kind, 'entry')
-    const entries = parseFstab(text)
-    assert.equal(entries.length, 1)
-    assert.equal(entries[0].mountpoint, '/mnt/z')
-    assert.equal(entries[0].disabled, true)
-    assert.ok(getMount(text, '/mnt/z'))
+    assert.equal(getMount(MARKED, '/mnt/anas-nfs')!.disabled, true)
+  })
+
+  it('enable of an #ANAS line un-marks it: the original ACTIVE line returns', () => {
+    assert.equal(enableMount(MARKED, '/mnt/anas-nfs'), '127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,nofail  0  0\n')
+  })
+
+  it('an unrelated edit of ANOTHER line leaves the #ANAS line byte-identical', () => {
+    const two = `${MARKED}//127.0.0.1/anastest  /mnt/anas-cifs  cifs  credentials=/etc/anas/creds/x.cred,nofail  0  0\n`
+    const after = addMountOption(two, '/mnt/anas-cifs', 'x-systemd.before=x.service')
+    const markedLine = after.split('\n').find(l => l.includes('/mnt/anas-nfs'))!
+    assert.equal(markedLine, `${ANAS_MARKER}127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,nofail  0  0`)
+  })
+
+  it('an edit of the #ANAS line itself converts it to the option form and still reads disabled', () => {
+    const entry = getMount(MARKED, '/mnt/anas-nfs')!
+    entry.options.common.readOnly = true
+    const after = replaceMount(MARKED, '/mnt/anas-nfs', entry)
+    const line = after.trimEnd()
+    assert.ok(line.includes('ro,nofail,defaults,noauto,x-anas.disabled'), line)
+    const reparsed = getMount(after, '/mnt/anas-nfs')!
+    assert.equal(reparsed.disabled, true)
+    assert.equal(reparsed.options.common.noauto, false)
+    assert.equal(reparsed.options.common.readOnly, true)
+  })
+
+  it('disable-again of an #ANAS line converts it to the option form (still disabled)', () => {
+    const after = disableMount(MARKED, '/mnt/anas-nfs')
+    const line = after.trimEnd()
+    assert.ok(!line.startsWith('#'), line)
+    assert.ok(line.includes('nofail,defaults,noauto,x-anas.disabled'), line)
+    assert.equal(getMount(after, '/mnt/anas-nfs')!.disabled, true)
+    // Enabling the converted line returns its ACTIVE serialization.
+    const active = getMount(enableMount(after, '/mnt/anas-nfs'), '/mnt/anas-nfs')!
+    assert.equal(active.mountpoint, '/mnt/anas-nfs')
+    assert.notEqual(active.disabled, true)
+    assert.equal(active.options.common.noauto, false)
   })
 
   it('fail-open: a prose comment starting with #ANAS is an ordinary comment', () => {
