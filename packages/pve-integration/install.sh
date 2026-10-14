@@ -25,9 +25,10 @@
 #     which is where a sibling puts its block too. Whichever installs second
 #     lands its block adjacent to — never inside, never instead of — the other's.
 #   * TOLERANT: a foreign hook block already present is detected and PRESERVED.
-#     We refuse to capture a "pristine" backup that already contains someone
-#     else's splice, and uninstall then removes our block SURGICALLY (by marker)
-#     rather than restoring a whole-file backup that would clobber the sibling.
+#     We never take a whole-file backup of PVE's module at all — uninstall always
+#     removes our block SURGICALLY (by marker), so neither a sibling's splice
+#     (issue #20) nor a newer upstream module (review H2) can ever be rolled
+#     back by us.
 #
 # Paths are parameterised (with production defaults) so the tpl logic can be
 # tested against a copy without a real PVE install:
@@ -49,8 +50,11 @@ PERL_BIN="${PERL_BIN:-perl}"
 PVE_HTTP_SERVER_PM="${PVE_HTTP_SERVER_PM:-/usr/share/perl5/PVE/APIServer/AnyEvent.pm}"
 ANAS_PERL_DIR="${ANAS_PERL_DIR:-/usr/share/anas/perl}"
 ANAS_PROXY_PM="${ANAS_PERL_DIR}/AnasProxy.pm"
-# Pristine backup of the PVE HTTP server module, captured once before we splice —
-# and ONLY when no foreign hook is present (see capture_pristine_backup).
+# Whole-file backup an OLDER ANAS used to capture before splicing. We stopped
+# taking these (review H2): it froze the module as of install time, so after a
+# libpve-http-server-perl upgrade it was the OLD module, and uninstall's restore
+# silently downgraded PVE's own code. Nothing is ever written here any more —
+# we only sweep up a leftover (see install_anas_proxy).
 PVE_HTTP_SERVER_PM_ORIG="${PVE_HTTP_SERVER_PM}.anas-orig"
 # Marks our additive block (idempotency check + surgical removal on uninstall).
 ANAS_HOOK_MARKER='# >>> ANAS proxy hook'
@@ -138,29 +142,20 @@ splice_proxy_hook() {
   ' "${src}" > "${out}"
 }
 
-# Back up the pristine PVE module ONCE — but only when it is genuinely pristine.
-# If a sibling project has already spliced it, a whole-file "restore" from this
-# backup would silently delete the sibling's hook (issue #20), so we do not take
-# one and say why. Uninstall handles that case surgically instead.
-capture_pristine_backup() {
-  if [ -f "${PVE_HTTP_SERVER_PM_ORIG}" ]; then
-    return 0
-  fi
-  if has_foreign_hook "${PVE_HTTP_SERVER_PM}"; then
-    echo "anas: note: ${PVE_HTTP_SERVER_PM} already carries another project's proxy hook (ADOCK?);"
-    echo "anas:       skipping the whole-file backup so an uninstall can never clobber it —"
-    echo "anas:       our block will be removed surgically by marker instead."
-    return 0
-  fi
-  cp -a "${PVE_HTTP_SERVER_PM}" "${PVE_HTTP_SERVER_PM_ORIG}"
-  echo "anas: saved pristine ${PVE_HTTP_SERVER_PM} -> ${PVE_HTTP_SERVER_PM_ORIG}"
-}
-
 # Install AnasProxy.pm and splice the additive proxy hook into the PVE HTTP
 # server module — perl-c-gated, idempotent, fail-open. Returns non-zero on a
 # real failure (missing/broken module, anchor mismatch, or a patch that fails
 # perl -c); the live PVE module is never left in a non-compiling state.
 install_anas_proxy() {
+  # Sweep up a .anas-orig left behind by an older ANAS. It may predate one or
+  # more libpve-http-server-perl upgrades (review H2); nothing is ever restored
+  # from it any more — uninstall always excises our block by marker — so delete
+  # the stale copy of PVE's module rather than leave it beside the live one.
+  if [ -f "${PVE_HTTP_SERVER_PM_ORIG}" ]; then
+    rm -f "${PVE_HTTP_SERVER_PM_ORIG}"
+    echo "anas: removed stale ${PVE_HTTP_SERVER_PM_ORIG} from an older install (whole-file backups can go stale; removal is by marker now)"
+  fi
+
   # 1. Ship AnasProxy.pm (ANAS-owned, upgrade-safe — dpkg doesn't own it).
   if [ ! -f "${PROXY_SRC}" ]; then
     echo "anas: ERROR: proxy module ${PROXY_SRC} not found" >&2
@@ -193,7 +188,6 @@ install_anas_proxy() {
   if has_foreign_hook "${PVE_HTTP_SERVER_PM}"; then
     echo "anas: another project's proxy hook is present — splicing ADDITIVELY alongside it"
   fi
-  capture_pristine_backup
 
   local blockfile patched
   blockfile="$(mktemp)"

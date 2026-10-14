@@ -11,13 +11,16 @@
 # in the same template. Nothing here may touch either.
 #
 #   * The template edit deletes only lines carrying OUR src (/pve2/js/anas.js).
-#   * The module edit prefers SURGICAL marker excision whenever a foreign hook is
-#     present, and only falls back to the whole-file .anas-orig restore when the
-#     live module carries no other project's block — because a whole-file restore
-#     of a file that has since gained a sibling's splice would silently delete it.
-#   * Either route builds a CANDIDATE that must pass perl -c before it is adopted,
-#     exactly as install.sh gates its patch — removal is not intrinsically safer
-#     than addition, and a non-compiling AnyEvent.pm means :8006 is down.
+#   * The module edit is ALWAYS surgical marker excision (review H2). We never
+#     restore the module from a whole-file copy: an `.anas-orig` backup captured
+#     at install time goes stale the moment libpve-http-server-perl upgrades the
+#     module (the apt hook re-splices the NEW file, the backup stays the OLD
+#     one), and restoring it would silently downgrade PVE's own module — or
+#     delete a sibling's splice if the backup predates it.
+#   * The excision builds a CANDIDATE that must pass perl -c before it is
+#     adopted, exactly as install.sh gates its patch — removal is not
+#     intrinsically safer than addition, and a non-compiling AnyEvent.pm means
+#     :8006 is down.
 #
 # Paths are parameterised (with production defaults) for testing:
 #   PVE_TPL=/tmp/x/index.html.tpl PVE_JS_DIR=/tmp/x/js APT_HOOK=/tmp/x/hook ./uninstall.sh
@@ -33,6 +36,8 @@ PERL_BIN="${PERL_BIN:-perl}"
 PVE_HTTP_SERVER_PM="${PVE_HTTP_SERVER_PM:-/usr/share/perl5/PVE/APIServer/AnyEvent.pm}"
 ANAS_PERL_DIR="${ANAS_PERL_DIR:-/usr/share/anas/perl}"
 ANAS_PROXY_PM="${ANAS_PERL_DIR}/AnasProxy.pm"
+# Whole-file backup an older ANAS used to capture before splicing. Nothing is
+# ever restored from it — it is only ever deleted here (see step 4, review H2).
 PVE_HTTP_SERVER_PM_ORIG="${PVE_HTTP_SERVER_PM}.anas-orig"
 ANAS_HOOK_MARKER='# >>> ANAS proxy hook'
 ANAS_HOOK_END='# <<< ANAS proxy hook'
@@ -104,28 +109,25 @@ fi
 #    HTTP server module and remove AnasProxy.pm. We only touch AnyEvent.pm if WE
 #    patched it (our marker is present) — a file we never modified is left alone.
 if [ -f "${PVE_HTTP_SERVER_PM}" ] && grep -qF "${ANAS_HOOK_MARKER}" "${PVE_HTTP_SERVER_PM}"; then
-  # Build the post-removal module as a CANDIDATE first. Which of the three routes
-  # produced it does not change the gate that follows.
+  # Build the post-removal module as a CANDIDATE: surgically excise our
+  # marker-delimited block, leaving every other byte of the module intact —
+  # including a sibling project's block (issue #20). There used to be a second
+  # route here that restored the whole file from the .anas-orig backup when no
+  # foreign hook was present; it is gone (review H2): the backup freezes the
+  # module as of install time, so after a libpve-http-server-perl upgrade the
+  # backup is the OLD module and restoring it silently downgrades PVE's own
+  # code — the perl -c gate cannot catch that, because old PVE code compiles.
   candidate="$(mktemp)"
+  excise_our_hook_to "${PVE_HTTP_SERVER_PM}" "${candidate}"
   if has_foreign_hook "${PVE_HTTP_SERVER_PM}"; then
-    # Another project's hook is live in this file. A whole-file restore from our
-    # backup would delete it (issue #20) — the backup may well predate the
-    # sibling's splice — so excise ONLY our marker block.
-    excise_our_hook_to "${PVE_HTTP_SERVER_PM}" "${candidate}"
     removal_desc="excised the ANAS hook block from ${PVE_HTTP_SERVER_PM} (another project's hook is present and was preserved)"
-  elif [ -f "${PVE_HTTP_SERVER_PM_ORIG}" ]; then
-    cat "${PVE_HTTP_SERVER_PM_ORIG}" > "${candidate}"
-    removal_desc="restored pristine ${PVE_HTTP_SERVER_PM} (from backup)"
   else
-    # No backup — surgically excise our additive block by its markers, leaving
-    # every other byte of the module intact.
-    excise_our_hook_to "${PVE_HTTP_SERVER_PM}" "${candidate}"
     removal_desc="restored ${PVE_HTTP_SERVER_PM} (excised the hook block)"
   fi
 
   # perl -c GATE, mirroring install.sh: adopt ONLY on pass. Removing our block is
-  # not intrinsically safer than adding it — a stale whole-file backup or an
-  # excision against an unexpected file shape can yield a module that will not
+  # not intrinsically safer than adding it — an excision against an unexpected
+  # file shape can yield a module that will not
   # compile, and pveproxy would then fail to start on the NEXT boot or package
   # upgrade even though we never restarted it here (=> :8006 DOWN, long after the
   # uninstall). So leave the live module alone and keep our block in place: the
@@ -137,8 +139,8 @@ if [ -f "${PVE_HTTP_SERVER_PM}" ] && grep -qF "${ANAS_HOOK_MARKER}" "${PVE_HTTP_
     echo "anas: WARNING: remove the block between '${ANAS_HOOK_MARKER}' and '${ANAS_HOOK_END}' by hand." >&2
     systemctl reset-failed pveproxy >/dev/null 2>&1 || true
   else
-    # Gate passed (or no perl to gate with) — adopt. Writing THROUGH the live file
-    # keeps its mode and ownership, whichever route built the candidate.
+    # Gate passed (or no perl to gate with) — adopt. Writing THROUGH the live
+    # file keeps its mode and ownership.
     cat "${candidate}" > "${PVE_HTTP_SERVER_PM}"
     rm -f "${candidate}"
     echo "anas: ${removal_desc}"
@@ -148,12 +150,16 @@ if [ -f "${PVE_HTTP_SERVER_PM}" ] && grep -qF "${ANAS_HOOK_MARKER}" "${PVE_HTTP_
       echo "anas: WARNING: pveproxy restart failed" >&2
       systemctl reset-failed pveproxy >/dev/null 2>&1 || true
     fi
-    # Our block is gone; drop the backup.
-    rm -f "${PVE_HTTP_SERVER_PM_ORIG}"
   fi
 else
   echo "anas: no ANAS proxy hook in ${PVE_HTTP_SERVER_PM} (nothing to restore)"
 fi
+
+# Drop any .anas-orig left behind by an older install. Nothing is ever restored
+# from it any more (removal is always marker excision — see above) and a stale
+# copy is exactly the liability review H2 describes, so it goes on every
+# uninstall path, whether or not we found our hook this time.
+rm -f "${PVE_HTTP_SERVER_PM_ORIG}"
 
 # 5. Remove the ANAS-owned proxy module (and the dir if we left it empty).
 if [ -f "${ANAS_PROXY_PM}" ]; then

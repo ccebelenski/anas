@@ -39,7 +39,7 @@ The `require` is at **request time**, inside `eval` — pveproxy never compiles 
 - ANAS module throws / has a syntax error / is missing → `/anas` 500s, **`:8006` unaffected**.
 - Loopback gateway down → synthetic 5xx on `/anas`, **`:8006` unaffected**.
 - Hook absent (PVE upgrade clobbered `AnyEvent.pm` before the apt-hook re-applies) → `/anas` 404s, **`:8006` unaffected**.
-- **The one hazard:** a malformed patch block in `AnyEvent.pm` (PVE-owned, compiled at startup) → pveproxy won't start → `:8006` DOWN. **Guard:** installer runs `perl -c` on the patched file and only restarts pveproxy on pass; on fail it restores pristine and aborts. Proven to catch it deterministically.
+- **The one hazard:** a malformed patch block in `AnyEvent.pm` (PVE-owned, compiled at startup) → pveproxy won't start → `:8006` DOWN. **Guard:** installer runs `perl -c` on the patched file and only restarts pveproxy on pass; on fail the live module is left untouched (it was never overwritten) and the install aborts. Proven to catch it deterministically.
 
 ## Gateway changes (packages/gateway)
 - Bind **`127.0.0.1:3000`, plain HTTP, no TLS** — pveproxy terminates TLS. Remove the `0.0.0.0` bind, the PVE-cert auto-detection, and the HTTPS server. No public origin.
@@ -61,10 +61,10 @@ Every gateway URL gains the `/anas` base prefix (one constant); routes reach the
 
 ## Installer / uninstaller (packaging)
 This makes ANAS's PVE integration **three** surgical, apt-hook-reapplied, fail-open patches: the menu `<script>` in `index.html.tpl`, `anas.js` in `js/`, and now the proxy hook in `AnyEvent.pm` + `AnasProxy.pm`.
-- **Install:** ship `AnasProxy.pm` → `/usr/share/anas/perl/`; back up pristine `AnyEvent.pm`; splice the hook **only on an exact anchor match** (never force); `perl -c` the patched file → restart pveproxy only on pass, else restore pristine + abort with a clear error; `systemctl reset-failed pveproxy` defensively.
+- **Install:** ship `AnasProxy.pm` → `/usr/share/anas/perl/`; splice the hook **only on an exact anchor match** (never force); `perl -c` the patched file → restart pveproxy only on pass, else leave the live module pristine + abort with a clear error; `systemctl reset-failed pveproxy` defensively. No whole-file backup of the module is taken (review H2).
 - **apt-hook re-apply:** extend the existing `DPkg::Post-Invoke` hook that already re-applies the menu injection — after a PVE upgrade clobbers `AnyEvent.pm`, re-splice (same perl-c gate). Fail-open in the gap: `/anas` 404s until re-applied (which is the same dpkg transaction, so effectively no window).
-- **Uninstall:** take our block back out of `AnyEvent.pm`, remove `/usr/share/anas/perl/AnasProxy.pm`, restart pveproxy.
-- **Coexistence (issue #20):** a sibling project (ADOCK) splices the same file by the same convention. So the whole-file backup is **skipped** when a foreign `# >>> … proxy hook` block is already present (it would enshrine their block as "pristine"), and uninstall prefers **marker excision**, falling back to the whole-file restore only when no foreign block exists — a backup that predates a sibling's splice (or a `libpve-http-server-perl` upgrade) would otherwise silently delete their hook. Either removal route is `perl -c`-gated before adoption, like the install's patch. See `packages/pve-integration/README.md`.
+- **Uninstall:** take our block back out of `AnyEvent.pm` — always by **marker excision**, never by restoring a whole-file copy (review H2) — remove `/usr/share/anas/perl/AnasProxy.pm`, restart pveproxy.
+- **Coexistence (issue #20):** a sibling project (ADOCK) splices the same file by the same convention. Removal is therefore **always surgical marker excision**: ANAS keeps no whole-file copy of PVE's module to restore, because a snapshot taken at install time would silently delete a sibling's splice that postdates it, and would silently downgrade PVE's own code after a `libpve-http-server-perl` upgrade rewrites the module (the stale-copy bug fixed in review H2). A `.anas-orig` left by an older ANAS is swept on install and on uninstall, never used. The excised candidate is `perl -c`-gated before adoption, like the install's patch. See `packages/pve-integration/README.md`.
 
 ## Removed / retired
 Public `:3000` HTTPS origin; gateway PVE-cert auto-detection + HTTPS server; CORS code; the README/installer "trust the :3000 cert" first-run note (the cert exception no longer exists).

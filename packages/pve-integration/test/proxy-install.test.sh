@@ -7,10 +7,13 @@
 #
 # Covers: AnasProxy.pm ships, the additive hook is spliced only on an exact
 # anchor match, idempotency, the perl-c gate aborts (leaving the live module
-# pristine) on a bad patch, uninstall restores the byte-pristine module — and the
+# pristine) on a bad patch, uninstall restores the byte-pristine module by
+# MARKER EXCISION (never from a whole-file copy, review H2) — and the
 # SIBLING-PROJECT COEXISTENCE requirement (issue #20) in both install orders: a
-# foreign hook block in the same module survives our install and our uninstall,
-# and a whole-file backup is never taken over someone else's splice.
+# foreign hook block in the same module survives our install and our uninstall.
+# Review H2 specifically: after a package upgrade swaps in a new module and the
+# apt hook re-splices it, the uninstall must restore the NEW module byte-for-
+# byte, and a stale .anas-orig left by an older install is swept, never used.
 #
 #   bash packages/pve-integration/test/proxy-install.test.sh
 #
@@ -189,7 +192,7 @@ run_uninstall() {
 }
 
 # =============================================================================
-echo "== 1. happy path: ships module, splices hook, backs up, restarts =="
+echo "== 1. happy path: ships module, splices hook, takes no backup, restarts =="
 setup_env
 make_anyevent "${PVE_PM}"
 cp "${PVE_PM}" "${PRISTINE}"
@@ -197,8 +200,7 @@ PERL_BIN_OVERRIDE="" run_install; rc=$?
 check "install exits 0" "[ ${rc} -eq 0 ]"
 check "AnasProxy.pm installed" "[ -f '${PERL_DIR}/AnasProxy.pm' ]"
 check "hook marker spliced in" "grep -qF '${MARKER}' '${PVE_PM}'"
-check "pristine backup captured" "[ -f '${PVE_PM}.anas-orig' ]"
-check "backup is byte-pristine" "cmp -s '${PVE_PM}.anas-orig' '${PRISTINE}'"
+check "no whole-file backup captured (review H2)" "[ ! -f '${PVE_PM}.anas-orig' ]"
 check "patched module compiles" "perl -c '${PVE_PM}' >/dev/null 2>&1"
 check "pveproxy restart invoked" "[ -f '${RESTART_MARK}' ]"
 check "AnasProxy require path points at ANAS_PERL_DIR" \
@@ -266,7 +268,7 @@ run_uninstall; rc=$?
 check "uninstall exits 0" "[ ${rc} -eq 0 ]"
 check "module restored byte-pristine" "cmp -s '${PVE_PM}' '${PRISTINE}'"
 check "AnasProxy.pm removed" "[ ! -f '${PERL_DIR}/AnasProxy.pm' ]"
-check "backup removed after restore" "[ ! -f '${PVE_PM}.anas-orig' ]"
+check "no .anas-orig after uninstall (none captured, none left)" "[ ! -f '${PVE_PM}.anas-orig' ]"
 check "pveproxy restart invoked on uninstall" "[ -f '${RESTART_MARK}' ]"
 rm -rf "${WORK}"
 
@@ -283,9 +285,9 @@ rm -rf "${WORK}"
 # =============================================================================
 # SIBLING-PROJECT COEXISTENCE (issue #20). A second project (ADOCK) splices its
 # own hook block into the same PVE module using the same additive convention.
-# Neither install order may cost the other its hook — and the whole-file
-# .anas-orig restore is the specific trap: our backup can predate the sibling's
-# splice, so restoring it would silently delete their block.
+# Neither install order may cost the other its hook — which is one of the two
+# reasons removal is ALWAYS surgical marker excision and we never keep a
+# whole-file copy of PVE's module to restore (issue #20, review H2).
 # =============================================================================
 
 echo "== 7. SIBLING FIRST: ANAS splices additively, preserving the foreign hook =="
@@ -305,9 +307,9 @@ check "both path guards live in the module" \
 check "foreign require line untouched" \
   "grep -qF \"require '/usr/share/adock/perl/AdockProxy.pm'\" '${PVE_PM}'"
 check "dual-spliced module compiles" "perl -c '${PVE_PM}' >/dev/null 2>&1"
-check "NO whole-file backup taken (would clobber the sibling on restore)" \
+check "NO whole-file backup taken (nothing is ever restored from a copy)" \
   "[ ! -f '${PVE_PM}.anas-orig' ]"
-check "install log says why the backup was skipped" \
+check "install log notes the ADDITIVE splice alongside the foreign hook" \
   "grep -qi \"another project's proxy hook\" '${WORK}/install.log'"
 check "foreign script tag preserved in the template" \
   "grep -qF '/pve2/js/adock.js' '${TPL}'"
@@ -359,17 +361,18 @@ check "still exactly one foreign block" "[ \"\$(grep -cF '${ADOCK_MARKER}' '${PV
 check "no restart on the idempotent re-run" "[ ! -f '${RESTART_MARK}' ]"
 rm -rf "${WORK}"
 
-echo "== 10. ANAS FIRST then sibling: uninstall must not use the stale backup =="
+echo "== 10. ANAS FIRST then sibling: uninstall must not use a stale backup =="
 setup_env
 make_anyevent "${PVE_PM}"
 PERL_BIN_OVERRIDE="" run_install >/dev/null 2>&1
-# ANAS took a legitimate pristine backup here (no foreign hook at the time).
-check "backup was taken on the pristine install" "[ -f '${PVE_PM}.anas-orig' ]"
+check "install takes no whole-file backup" "[ ! -f '${PVE_PM}.anas-orig' ]"
 make_adock_block "${WORK}/adock-block"
 splice_as_sibling "${PVE_PM}" "${WORK}/adock-block"
-# THE TRAP: our .anas-orig backup predates the sibling's splice. A whole-file
-# restore would silently delete their hook. Uninstall must detect the foreign
-# hook and excise surgically instead.
+# THE TRAP (review H2 shape): a .anas-orig from an older ANAS predates both
+# the sibling's splice and any module change. A whole-file restore would
+# silently delete the sibling's hook. Uninstall excises surgically by marker
+# regardless, and removes the stale copy instead of using it.
+printf 'STALE BACKUP CONTENTS\n' > "${PVE_PM}.anas-orig"
 run_uninstall; rc=$?
 check "uninstall exits 0" "[ ${rc} -eq 0 ]"
 check "ANAS hook gone" "! grep -qF '${MARKER}' '${PVE_PM}'"
@@ -377,12 +380,13 @@ check "foreign hook NOT clobbered by the stale whole-file backup" \
   "grep -qF '${ADOCK_MARKER}' '${PVE_PM}'"
 check "module still compiles" "perl -c '${PVE_PM}' >/dev/null 2>&1"
 check "stale backup dropped" "[ ! -f '${PVE_PM}.anas-orig' ]"
+check "module is the excision, not the stale contents" \
+  "! grep -qF 'STALE BACKUP CONTENTS' '${PVE_PM}'"
 rm -rf "${WORK}"
 
 echo "== 11. uninstall perl-c gate: a non-compiling removal is NOT adopted =="
-# Removal is not intrinsically safer than addition: a stale whole-file backup or
-# an excision against an unexpected file shape can yield a module pveproxy cannot
-# load — and it would fail on the NEXT boot, long after the uninstall. So the
+# Removal is not intrinsically safer than addition: an excision against an
+# unexpected file shape can yield a module pveproxy cannot — and it would fail on the NEXT boot, long after the uninstall. So the
 # uninstall gates its candidate exactly as the install gates its patch: adopt
 # only on pass, otherwise leave the live module (and our block) alone.
 setup_env
@@ -463,6 +467,71 @@ check "error names the missing wrapper" "grep -qF 'apt-reapply.sh not found' '${
 check "no apt hook written" "[ ! -e '${HOOK_DIR}/hook' ]"
 check "template untouched" "cmp -s '${TPL}' '${WORK}/tpl.pristine'"
 check "PVE module untouched" "cmp -s '${PVE_PM}' '${PRISTINE}'"
+rm -rf "${WORK}"
+
+# =============================================================================
+# REVIEW H2: uninstall must never roll PVE's module back to a stale copy.
+# Removal is always marker excision, so what comes out the far side is whatever
+# the package installed — never a snapshot ANAS took at install time.
+# =============================================================================
+
+echo "== 14. package upgrade: uninstall restores the NEW module, not the old one =="
+setup_env
+make_anyevent "${PVE_PM}"                       # module v1 (pre-upgrade)
+V1="${WORK}/AnyEvent.v1.pm"
+V2="${WORK}/AnyEvent.v2.pm"
+cp "${PVE_PM}" "${V1}"
+# v2 = the module after a libpve-http-server-perl upgrade: upstream added a
+# line. It compiles fine, which is exactly why the perl -c gate alone could
+# never detect the silent downgrade.
+sed '2i # upstream: libpve-http-server-perl 8.4.0 changelog note' "${V1}" > "${V2}"
+PERL_BIN_OVERRIDE="" run_install >/dev/null 2>&1
+check "hook spliced into v1" "grep -qF '${MARKER}' '${PVE_PM}'"
+check "no backup captured on the v1 install" "[ ! -f '${PVE_PM}.anas-orig' ]"
+# The upgrade: dpkg rewrites the module — our hook is gone, v2 is live.
+cp "${V2}" "${PVE_PM}"
+# The apt hook re-runs install.sh, which re-splices the NEW module.
+PERL_BIN_OVERRIDE="" run_install; rc=$?
+check "re-install onto the upgraded module exits 0" "[ ${rc} -eq 0 ]"
+check "hook re-spliced into v2" "grep -qF '${MARKER}' '${PVE_PM}'"
+check "v2's upstream line present" "grep -qF 'libpve-http-server-perl 8.4.0' '${PVE_PM}'"
+check "still exactly one hook block after the re-splice" \
+  "[ \"\$(grep -cF '${MARKER}' '${PVE_PM}')\" = '1' ]"
+run_uninstall; rc=$?
+check "uninstall exits 0" "[ ${rc} -eq 0 ]"
+check "module is byte-identical to v2 (NOT downgraded to v1)" "cmp -s '${PVE_PM}' '${V2}'"
+check "module does NOT equal v1" "! cmp -s '${PVE_PM}' '${V1}'"
+check "upgraded module compiles after uninstall" "perl -c '${PVE_PM}' >/dev/null 2>&1"
+check "no .anas-orig created or left across the upgrade cycle" "[ ! -f '${PVE_PM}.anas-orig' ]"
+rm -rf "${WORK}"
+
+echo "== 15. stale .anas-orig present before install: install removes it =="
+setup_env
+make_anyevent "${PVE_PM}"
+cp "${PVE_PM}" "${PRISTINE}"
+printf 'STALE FROM AN OLDER INSTALL\n' > "${PVE_PM}.anas-orig"
+PERL_BIN_OVERRIDE="" run_install; rc=$?
+check "install exits 0 with a stale backup present" "[ ${rc} -eq 0 ]"
+check "install removed the stale backup" "[ ! -f '${PVE_PM}.anas-orig' ]"
+check "install log says why" "grep -qi 'stale' '${WORK}/install.log'"
+check "hook spliced despite the stale backup" "grep -qF '${MARKER}' '${PVE_PM}'"
+check "live module is the splice, not the stale contents" \
+  "! grep -qF 'STALE FROM AN OLDER INSTALL' '${PVE_PM}'"
+rm -rf "${WORK}"
+
+echo "== 16. stale .anas-orig present before uninstall: removed, never used =="
+setup_env
+make_anyevent "${PVE_PM}"
+cp "${PVE_PM}" "${PRISTINE}"
+PERL_BIN_OVERRIDE="" run_install >/dev/null 2>&1
+# Contents that would be unmistakable if the uninstall ever adopted them.
+printf 'package PVE::APIServer::AnyEvent; # STALE-MUST-NOT-BE-USED\n1;\n' > "${PVE_PM}.anas-orig"
+run_uninstall; rc=$?
+check "uninstall exits 0 with a stale backup present" "[ ${rc} -eq 0 ]"
+check "uninstall removed the stale backup" "[ ! -f '${PVE_PM}.anas-orig' ]"
+check "module restored byte-pristine by excision (not by restore)" "cmp -s '${PVE_PM}' '${PRISTINE}'"
+check "stale contents never reached the module" \
+  "! grep -qF 'STALE-MUST-NOT-BE-USED' '${PVE_PM}'"
 rm -rf "${WORK}"
 
 echo

@@ -109,13 +109,13 @@ hook**:
   double-insert, whatever else is in the file. Both projects anchor on the
   `/api2` dispatch's closing brace, so the second block lands *beside* the
   first, never inside or instead of it.
-- The one-time whole-file `.anas-orig` backup is **not taken** when a foreign
-  hook is already present — it would enshrine the sibling's block as "pristine".
-- Uninstall therefore prefers **marker excision** and only falls back to the
-  whole-file restore when no foreign block exists. Restoring a backup that
-  predates a sibling's splice would silently delete their hook — and the same
-  staleness bites after a `libpve-http-server-perl` upgrade rewrites the module.
-- Either removal route must pass **`perl -c` before it is adopted**, exactly as
+- Removal is **always surgical marker excision** — ANAS never keeps a whole-file
+  copy of the module to restore (review H2). A snapshot taken at install time
+  would silently delete a sibling's splice that postdates it, and silently
+  downgrade PVE's own code after a `libpve-http-server-perl` upgrade rewrites
+  the module. A `.anas-orig` left behind by an older ANAS is removed on the
+  next install or uninstall, never used.
+- The excised candidate must pass **`perl -c` before it is adopted**, exactly as
   the install gates its patch. A module that won't compile means `:8006` is
   down, so on a gate failure the live file and our block are left untouched with
   a warning naming the block to remove by hand.
