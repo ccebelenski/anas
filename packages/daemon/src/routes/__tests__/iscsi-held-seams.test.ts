@@ -152,6 +152,7 @@ describe('iscsi.6 — the backing-file-removal seam (no such path exists)', () =
     'iscsi-mutate.ts',
     'iscsi-quarantine.ts',
     'backup-restore.ts',
+    'backup-restore-files.ts',
   ])
 
   it('nothing else in services/ deletes a file', async () => {

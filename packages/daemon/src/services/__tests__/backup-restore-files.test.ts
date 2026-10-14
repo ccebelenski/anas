@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { symlink as fsSymlink, lstat, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
@@ -863,6 +863,22 @@ describe('backup2.6 — local pre-flight probes', () => {
     assert.deepEqual(mock.calls.find(c => c.args[1] === '/usr/bin/rm')!.args, ['10', '/usr/bin/rm', '-f', '/gtbackup/data/.probe'])
   })
 
+  it('writeTestDirectory default probe name is random and not predictable', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/stat', '-c', '%F', '/t'],
+      result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
+    })
+    // Mock accepts any touch path starting with the prefix
+    mock.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: '', exitCode: 0 } })
+    const out = await writeTestDirectory(mock, '/t')
+    assert.equal(out.ok, true)
+    const touch = mock.calls.find(c => c.args[1] === '/usr/bin/touch')!
+    assert.ok(touch.args[2].startsWith('/t/.anas-restore-write-test-'), 'probe name has random suffix')
+    assert.notEqual(touch.args[2], `/t/.anas-restore-write-test-${process.pid}`, 'probe name is not PID-based')
+  })
+
   it('a newLocation whose parent chain is NOT built yet probes the nearest EXISTING ancestor (GT-15)', async () => {
     // pbc creates the whole missing chain (GT-15), so the probe directory is
     // the nearest ancestor that EXISTS — not the missing parent, whose ENOENT
@@ -883,15 +899,16 @@ describe('backup2.6 — local pre-flight probes', () => {
       args: ['10', '/usr/bin/stat', '-c', '%F', '/gtbackup'],
       result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
     })
+    const probeName = `.anas-restore-write-test-${process.pid}`
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/touch', `/gtbackup/.anas-restore-write-test-${process.pid}`],
+      args: ['10', '/usr/bin/touch', `/gtbackup/${probeName}`],
       result: { stdout: '', stderr: '', exitCode: 0 },
     })
-    const out = await writeTestDirectory(mock, '/gtbackup/deep/newdir')
+    const out = await writeTestDirectory(mock, '/gtbackup/deep/newdir', probeName)
     assert.equal(out.ok, true)
     const touch = mock.calls.find(c => c.args[1] === '/usr/bin/touch')!
-    assert.equal(touch.args[2], `/gtbackup/.anas-restore-write-test-${process.pid}`)
+    assert.equal(touch.args[2], `/gtbackup/${probeName}`)
   })
 
   it('the ancestor walk STOPS at a mountpoint a dead mount cannot answer about', async () => {
@@ -904,12 +921,13 @@ describe('backup2.6 — local pre-flight probes', () => {
       args: ['10', '/usr/bin/stat', '-c', '%F', '/mnt/pbs/deep/newdir'],
       result: { stdout: '', stderr: '', exitCode: 124 },
     })
+    const probeName = `.anas-restore-write-test-${process.pid}`
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/touch', `/mnt/pbs/deep/newdir/.anas-restore-write-test-${process.pid}`],
+      args: ['10', '/usr/bin/touch', `/mnt/pbs/deep/newdir/${probeName}`],
       result: { stdout: '', stderr: '', exitCode: 124 },
     })
-    const out = await writeTestDirectory(mock, '/mnt/pbs/deep/newdir')
+    const out = await writeTestDirectory(mock, '/mnt/pbs/deep/newdir', probeName)
     assert.equal(out.ok, false)
     assert.match(out.ok === false ? out.detail : '', /not responding/)
     assert.ok(!mock.calls.some(c => c.args[1] === '/usr/bin/stat' && c.args[2] === '/mnt'))
@@ -1286,5 +1304,28 @@ describe('backup2.6 — runFileRestore', () => {
 
   it('writePartialMarker is best-effort and never masks the real failure', async () => {
     assert.equal(await writePartialMarker('/nonexistent-anas-dir-xyz', 'text'), null)
+  })
+
+  it('writePartialMarker does not follow a planted symlink and cleans up temp files', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-partial-symlink-'))
+    try {
+      const realTarget = join(dir, 'real')
+      await writeFile(realTarget, 'real\n', 'utf8')
+      const markerPath = join(dir, PARTIAL_MARKER_NAME)
+      // Plant a symlink where the marker would go
+      await fsSymlink(realTarget, markerPath)
+      // Now writePartialMarker should not follow the symlink when creating the temp file
+      const result = await writePartialMarker(dir, 'test')
+      assert.equal(result, markerPath, 'the marker was written')
+      // The planted link was REPLACED, never followed: its target is untouched.
+      assert.equal(await readFile(realTarget, 'utf8'), 'real\n')
+      assert.equal((await lstat(markerPath)).isSymbolicLink(), false, 'the marker is a regular file now')
+      assert.equal(await readFile(markerPath, 'utf8'), 'test\n')
+      const tmpFiles = (await readdir(dir)).filter(e => e.startsWith('.anas-restore-partial-') && e.endsWith('.tmp'))
+      assert.equal(tmpFiles.length, 0, 'no temp files left behind')
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

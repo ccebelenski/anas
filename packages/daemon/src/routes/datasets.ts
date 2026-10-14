@@ -7,7 +7,7 @@ import type { AccessService } from '../services/access.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
 import type { Transport } from '../services/replication-transport.js'
-import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, lunGrowGuidance, PoolName, RenameSnapshotRequest, reservedDatasetSegment, SetAccessRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
+import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, lunGrowGuidance, PoolName, RenameSnapshotRequest, reservedDatasetSegment, SetAccessRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
 import { parseExports } from '../parsers/exports.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
 import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
@@ -26,8 +26,6 @@ import { requireIdentity } from './identity.js'
 import { createReplicationHandlers } from './replication.js'
 
 const ZFS = '/usr/sbin/zfs'
-const CHOWN = '/usr/bin/chown'
-const CHMOD = '/usr/bin/chmod'
 
 /** Terminal sub-action of the dataset wildcard for the access editor. */
 const ACCESS_SUFFIX = '/access'
@@ -1032,12 +1030,6 @@ export async function datasetRoutes(
       return renameSnapshot(poolName, tail.datasetPath, tail.snap, request, reply)
     }
 
-    const PERM_SUFFIX = '/permissions'
-    if (wildcard === 'permissions' || wildcard.endsWith(PERM_SUFFIX)) {
-      const path = wildcard === 'permissions' ? '' : wildcard.slice(0, -PERM_SUFFIX.length)
-      return setPermissions(poolName, path, request, reply)
-    }
-
     if (wildcard === 'access' || wildcard.endsWith(ACCESS_SUFFIX)) {
       const path = wildcard === 'access' ? '' : wildcard.slice(0, -ACCESS_SUFFIX.length)
       return setAccess(poolName, path, request, reply)
@@ -1200,99 +1192,6 @@ export async function datasetRoutes(
     reply.code(202)
     return { job }
   }
-
-  async function setPermissions(
-    poolName: string,
-    path: string,
-    request: FastifyRequest,
-    reply: FastifyReply,
-  ) {
-    // Empty path targets the pool root dataset; otherwise validate the path.
-    let fullName = poolName
-    if (path) {
-      const pathParsed = DatasetPath.safeParse(path)
-      if (!pathParsed.success) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `Invalid dataset path: ${pathParsed.error.issues[0]?.message}` } }
-      }
-      fullName = `${poolName}/${pathParsed.data}`
-    }
-
-    const bodyParsed = SetPermissionsRequest.safeParse(request.body ?? {})
-    if (!bodyParsed.success) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid permissions request: ${bodyParsed.error.issues[0]?.message}` } }
-    }
-    const { owner, group, mode, recursive } = bodyParsed.data
-
-    const identity = requireIdentity(request, reply)
-    if (!identity)
-      return
-
-    // pvepool.1 review fixes: an OWNED dataset is view-only — chown/chmod -R
-    // must never touch PVE's territory. Asked BEFORE the dataset read so an
-    // owned VOLUME is refused 400 with the reason (the read would 409 it as
-    // "no mountpoint") and before any command runs. The reason names the
-    // storage AND the dataset.
-    const owned = (await pveFootprint()).ownershipOf(fullName)
-    if (owned) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
-    }
-    // Story ident.1 (audit #20): `chown -R`/`chmod -R` walks into every child
-    // dataset mounted beneath this one — refused when any descendant is PVE's.
-    if (recursive) {
-      const refusal = await recursiveOwnedRefusal(poolName, fullName)
-      if (refusal) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: refusal } }
-      }
-    }
-
-    // Resolve the mountpoint from the dataset — permissions apply to the path.
-    const r = await executor.exec(ZFS, ['get', '-j', 'all', fullName])
-    if (r.exitCode !== 0 || !r.stdout.trim()) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
-    }
-    const parsed = parseDatasetGet(r.stdout, fullName)
-    if (!parsed) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
-    }
-    const mountpoint = parsed.base.mountpoint
-    if (!mountpoint) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Dataset '${fullName}' has no mountpoint (volume or unmounted)` } }
-    }
-
-    const job = jobQueue.submit(
-      'fs.setPermissions',
-      { ...identity, params: { dataset: fullName, mountpoint, owner, group, mode, recursive } },
-      async (updateProgress) => {
-        if (owner !== undefined || group !== undefined) {
-          const spec = group !== undefined ? `${owner ?? ''}:${group}` : `${owner}`
-          const args = recursive ? ['-R', spec, mountpoint] : [spec, mountpoint]
-          updateProgress(`chown ${spec} ${mountpoint}`)
-          const result = await executor.exec(CHOWN, args)
-          if (result.exitCode !== 0)
-            throw new Error(result.stderr.trim() || `chown exited with code ${result.exitCode}`)
-        }
-        if (mode !== undefined) {
-          const args = recursive ? ['-R', mode, mountpoint] : [mode, mountpoint]
-          updateProgress(`chmod ${mode} ${mountpoint}`)
-          const result = await executor.exec(CHMOD, args)
-          if (result.exitCode !== 0)
-            throw new Error(result.stderr.trim() || `chmod exited with code ${result.exitCode}`)
-        }
-        return { dataset: fullName, mountpoint }
-      },
-    )
-
-    reply.code(202)
-    return { job }
-  }
-
   // --- GET access — the layered access state of a dataset mountpoint -------
   // The writer itself lives in services/access.ts (access.1): this route only
   // names the ZFS target and sends what the service answers.

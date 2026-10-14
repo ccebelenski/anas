@@ -391,38 +391,6 @@ describe('datasets routes', () => {
       assert.equal(res.statusCode, 400)
     })
   })
-
-  // --- PUT permissions ---------------------------------------------------
-  describe('PUT /v1/pools/:name/datasets/*path/permissions', () => {
-    it('returns 202 and runs chown/chmod on the mountpoint', async () => {
-      server = createServer({ mock: true, logger: false })
-      const res = await server.inject({
-        method: 'PUT',
-        url: '/v1/pools/testpool/datasets/media/permissions',
-        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
-        payload: JSON.stringify({ owner: 'media', group: 'media', mode: '2770', recursive: true }),
-      })
-      assert.equal(res.statusCode, 202)
-      const body = res.json() as JobAccepted
-      assert.equal(body.job.operation, 'fs.setPermissions')
-      const job = await waitForJob(server, body.job.id)
-      assert.equal(job.status, 'completed')
-      const result = job.result as { mountpoint: string }
-      assert.equal(result.mountpoint, '/testpool/media')
-    })
-
-    it('rejects an invalid mode', async () => {
-      server = createServer({ mock: true, logger: false })
-      const res = await server.inject({
-        method: 'PUT',
-        url: '/v1/pools/testpool/datasets/media/permissions',
-        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
-        payload: JSON.stringify({ mode: '9999' }),
-      })
-      assert.equal(res.statusCode, 400)
-    })
-  })
-
   // --- DELETE destroy ----------------------------------------------------
   describe('DELETE /v1/pools/:name/datasets/*path', () => {
     it('returns 409 CONFIRMATION_REQUIRED with a confirm code when unconfirmed', async () => {
@@ -671,36 +639,9 @@ describe('PVE footprint ownership (pvepool.1)', () => {
   // permissions and access writers too. Asked BEFORE the dataset read (an
   // owned VOLUME would otherwise come back 409 "no mountpoint" / 404 "not a
   // mounted filesystem", not the ownership reason).
-  it('setPermissions on an OWNED dataset is refused with the ownership reason', async () => {
-    server = createServer({ mock: true, logger: false })
-    const res = await server.inject({
-      method: 'PUT',
-      url: '/v1/pools/testpool/datasets/vm-100-disk-0/permissions',
-      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
-      payload: JSON.stringify({ mode: '750' }),
-    })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
-    // The sentence names the storage AND the dataset.
-    assert.match(res.json().error.message, /local-zfs/)
-    assert.match(res.json().error.message, /testpool\/vm-100-disk-0/)
-    assert.match(res.json().error.message, /guest volume/)
-  })
-
-  it('setPermissions on the sibling proceeds past the guard', async () => {
-    server = createServer({ mock: true, logger: false })
-    const res = await server.inject({
-      method: 'PUT',
-      url: '/v1/pools/testpool/datasets/media/permissions',
-      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
-      payload: JSON.stringify({ mode: '750' }),
-    })
-    // Past the ownership guard: the mountpoint read resolves and the job is
-    // accepted (the dev-mock chown/chmod succeed, so it completes).
-    assert.equal(res.statusCode, 202)
-    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
-    assert.equal(job.status, 'completed', JSON.stringify(job.error))
-  })
+  // Ownership-guard tests for setPermissions are covered by the equivalent
+  // setAccess tests below; see 'setAccess on an OWNED dataset is refused…' and
+  // 'setAccess on the sibling proceeds past the guard'.
 
   it('setAccess on an OWNED dataset is refused with the ownership reason', async () => {
     server = createServer({ mock: true, logger: false })
@@ -1181,24 +1122,10 @@ describe('ident.1 — recursive permission changes stop at PVE descendants (audi
     payload: JSON.stringify(body),
   })
 
-  it('a recursive chown/chmod over a tree holding a PVE storage root → 400 naming it', async () => {
-    const res = await put('/v1/pools/testpool/datasets/x/permissions', { owner: 'root', mode: '755', recursive: true })
-    assert.equal(res.statusCode, 400)
-    assert.match(res.json().error.message, /Recursive permission change of 'testpool\/x' would include testpool\/x\/data/)
-    assert.match(res.json().error.message, /local-zfs/)
-  })
-
   it('a recursive access change (applyToExisting) over the same tree → 400 naming it', async () => {
     const res = await put('/v1/pools/testpool/datasets/x/access', { owner: 'root', applyToExisting: true })
     assert.equal(res.statusCode, 400)
     assert.match(res.json().error.message, /would include testpool\/x\/data/)
-  })
-
-  it('the NON-recursive change, and a recursive one on a clean sibling, are not refused by this rule', async () => {
-    const flat = await put('/v1/pools/testpool/datasets/x/permissions', { owner: 'root', recursive: false })
-    assert.doesNotMatch(flat.body, /would include/)
-    const sibling = await put('/v1/pools/testpool/datasets/x/media/permissions', { owner: 'root', recursive: true })
-    assert.doesNotMatch(sibling.body, /would include/)
   })
 })
 

@@ -289,23 +289,5 @@ export const UpdateDatasetPropertiesRequest = z.object({
 })
 export type UpdateDatasetPropertiesRequest = z.infer<typeof UpdateDatasetPropertiesRequest>
 
-/** Set POSIX permissions on a dataset mountpoint (Epic 4.7 — MVP, POSIX only). */
-export const SetPermissionsRequest = z
-  .object({
-    /** System user name (resolved via getent — local or directory) */
-    owner: z.string().optional(),
-    /** System group name (via getent) */
-    group: z.string().optional(),
-    /** Octal mode, 3 or 4 digits */
-    mode: z.string().regex(/^[0-7]{3,4}$/).optional(),
-    /** Apply recursively to descendants */
-    recursive: z.boolean().optional(),
-  })
-  .refine(
-    p => p.owner !== undefined || p.group !== undefined || p.mode !== undefined,
-    'set at least one of owner, group, mode',
-  )
-export type SetPermissionsRequest = z.infer<typeof SetPermissionsRequest>
-
 // Identity models (SystemUser/SystemGroup, ShareUser, …) live in identity.js —
 // they are shared by the getent pickers here and the Epic 8 management surface.

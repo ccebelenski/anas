@@ -302,7 +302,6 @@ export {
   DatasetType,
   MountpointPermissions,
   RecordSize,
-  SetPermissionsRequest,
   UpdateDatasetPropertiesRequest,
   VolBlockSize,
   VolSize,

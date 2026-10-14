@@ -15,6 +15,12 @@ export interface MockFixture {
   command: string
   /** Args pattern to match. If omitted, matches any args for this command. */
   args?: string[]
+  /**
+   * A predicate over the argv, for an argument the code makes unpredictable on
+   * purpose (a random probe name). Matched with the exact-args fixtures, ahead
+   * of command-only ones. exec() only.
+   */
+  argsMatch?: (args: string[]) => boolean
   /** The result to return. */
   result?: ExecResult
   /**
@@ -226,9 +232,9 @@ export class MockExecutor implements CommandExecutor {
         && f.args !== undefined
         && f.args.length === args.length
         && f.args.every((a, i) => a === args[i]),
-    )
+    ) ?? this.fixtures.find(f => f.command === command && f.argsMatch?.(args) === true)
     const match = exactMatch ?? this.fixtures.find(
-      f => f.command === command && f.args === undefined,
+      f => f.command === command && f.args === undefined && f.argsMatch === undefined,
     )
     if (match?.live)
       return this.liveExec({ ...match, live: match.live }, opts)

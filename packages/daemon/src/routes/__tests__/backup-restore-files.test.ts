@@ -549,13 +549,17 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
       args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
       result: { stdout: '', stderr: 'No such file', exitCode: 1 },
     })
+    // The probe name is random (review H7): match the touch by shape.
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/touch', `/gtbackup/.anas-restore-write-test-${process.pid}`],
+      argsMatch: args => args[1] === '/usr/bin/touch',
       result: { stdout: '', stderr: 'touch: cannot touch \'/gtbackup/x\': Read-only file system\n', exitCode: 1 },
     })
     const res = await post(body())
     assert.equal(res.statusCode, 409)
+    const probe = mock.calls.find(c => c.command === TIMEOUT && c.args[1] === '/usr/bin/touch')
+    assert.ok(probe, 'the write probe ran')
+    assert.match(probe.args[2], /^\/gtbackup\/\.anas-restore-write-test-[0-9a-f]{16}$/)
     assert.match((res.json() as { error: { message: string } }).error.message, /Read-only file system/)
     assert.equal(restoreRan(), false)
   })

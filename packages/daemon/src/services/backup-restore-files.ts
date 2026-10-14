@@ -7,7 +7,9 @@ import type {
 import type { CommandExecutor } from '../executor/types.js'
 import type { BrowseArchiveDeps } from './backup-catalog.js'
 import type { BackupReadDeps } from './backup-reads.js'
-import { writeFile } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
+import * as fs from 'node:fs'
+import { open, unlink } from 'node:fs/promises'
 import { isPathWithin, restorePatternsFor } from '@anas/shared'
 import { isHardlinkStat, statArchivePaths } from './backup-catalog.js'
 import { classifyBackupReadVerdict } from './backup-reads.js'
@@ -538,10 +540,13 @@ export async function nearestExistingDirectory(
 export async function writeTestDirectory(
   executor: CommandExecutor,
   directory: string,
-  probeName = `.anas-restore-write-test-${process.pid}`,
+  probeName?: string,
 ): Promise<WriteTestOutcome> {
+  // Random, never pid-based (review H7): a share user who can write the
+  // directory must not be able to pre-plant a symlink at the probe's name.
+  const name = probeName ?? `.anas-restore-write-test-${randomBytes(8).toString('hex')}`
   const probeDir = await nearestExistingDirectory(executor, directory)
-  const probe = targetPathFor(probeDir, probeName)
+  const probe = targetPathFor(probeDir, name)
   let r
   try {
     r = await executor.exec(TIMEOUT, [String(WRITE_TEST_TIMEOUT_S), TOUCH, probe])
@@ -662,12 +667,26 @@ export async function writePartialMarker(
   directory: string,
   text: string,
 ): Promise<string | null> {
-  const path = targetPathFor(directory, PARTIAL_MARKER_NAME)
+  const finalPath = targetPathFor(directory, PARTIAL_MARKER_NAME)
+  const tmpName = `.anas-restore-partial-${randomBytes(8).toString('hex')}.tmp`
+  const tmpPath = targetPathFor(directory, tmpName)
   try {
-    await writeFile(path, `${text}\n`, { encoding: 'utf8', mode: 0o600 })
-    return path
+    const handle = await open(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600)
+    try {
+      await handle.write(Buffer.from(`${text}\n`, 'utf8'))
+    }
+    finally {
+      await handle.close()
+    }
+    await fs.promises.rename(tmpPath, finalPath)
+    return finalPath
   }
   catch {
+    // Clean up temp file if it was created
+    try {
+      await unlink(tmpPath)
+    }
+    catch {}
     return null
   }
 }
