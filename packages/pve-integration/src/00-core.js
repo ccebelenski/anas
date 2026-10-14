@@ -332,7 +332,26 @@
     };
 
     // Brief success notification: Ext.toast when available, else a msgbox.
+    // Body is HTML-encoded by default; use ANAS.toastHtml for deliberate markup.
     ANAS.toast = function (msg) {
+        var enc = ANAS.enc(msg);
+        try {
+            if (typeof Ext !== 'undefined' && typeof Ext.toast === 'function') {
+                Ext.toast(enc);
+                return;
+            }
+        } catch (e) {
+            // fall through
+        }
+        try {
+            Ext.Msg.alert(ANAS.t('Success'), enc);
+        } catch (e2) {
+            ANAS.warn(msg);
+        }
+    };
+
+    // Toast with raw HTML body. Caller must encode every interpolated value.
+    ANAS.toastHtml = function (msg) {
         try {
             if (typeof Ext !== 'undefined' && typeof Ext.toast === 'function') {
                 Ext.toast(msg);
@@ -348,16 +367,25 @@
         }
     };
 
-    // Fail-open error alert: translate the TITLE, pass the body verbatim, and if
-    // Ext.Msg is unavailable fall back to a console warning rather than throw.
+    // Fail-open error alert: translate the TITLE, encode the body by default.
     // The single home for the `try { Ext.Msg.alert(t(title), msg) } catch`
-    // idiom that every view used to redefine locally. Bodies are raw (callers
-    // that want a translated body call ANAS.t themselves); only the title is t()'d.
+    // idiom that every view used to redefine locally. Bodies are encoded (callers
+    // that want HTML use ANAS.alertHtml); only the title is t()'d.
     ANAS.alertMsg = function (title, msg) {
+        var enc = ANAS.enc(msg);
         try {
-            Ext.Msg.alert(ANAS.t(title), msg);
+            Ext.Msg.alert(ANAS.t(title), enc);
         } catch (e) {
             ANAS.warn(msg);
+        }
+    };
+
+    // Alert with raw HTML body. Caller must encode every interpolated value.
+    ANAS.alertHtml = function (title, html) {
+        try {
+            Ext.Msg.alert(ANAS.t(title), html);
+        } catch (e) {
+            ANAS.warn(html);
         }
     };
 

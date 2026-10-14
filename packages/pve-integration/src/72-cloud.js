@@ -403,7 +403,7 @@
             var d = (res && res.data) || {};
             // The daemon's message is rclone's own text — encoded like the
             // in-dialog verdict (renderCloudTestResult), never raw markup.
-            ANAS.toast(enc(verdictSentence(d.verdict, d.message)));
+            ANAS.toast(verdictSentence(d.verdict, d.message));
         }, function (err) {
             try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
             if (grid.destroyed || grid.destroying) {
@@ -435,7 +435,7 @@
                         path: '/cloud/remotes/' + encodeURIComponent(name),
                         view: win,
                         failTitle: 'Remove failed',
-                        successMsg: t('Remote removed') + ': ' + enc(name),
+                        successMsg: t('Remote removed') + ': ' + name,
                         onComplete: function () { loadRemotes(win, node); },
                         // Timeliness: the grid reflects the file's real state
                         // even when the job fails — a referenced-remote refusal
@@ -951,8 +951,8 @@
                         store: { data: exRows, fields: ['value', 'help'] },
                         listConfig: {
                             tpl: '<tpl for="."><div class="x-boundlist-item">'
-                                + '<b>{value}</b>'
-                                + '<tpl if="help"> — {help}</tpl></div></tpl>',
+                                + '<b>{value:htmlEncode}</b>'
+                                + '<tpl if="help"> — {help:htmlEncode}</tpl></div></tpl>',
                         },
                         value: value || '',
                         emptyText: opt.default || '',
@@ -1594,8 +1594,8 @@
             confirmTitle: 'Re-point remote',
             confirmIntro: t('This change re-points the cloud sync tasks that use this remote:'),
             failTitle: isEdit ? 'Save failed' : 'Add failed',
-            successMsg: isEdit ? (t('Remote saved') + ': ' + enc(name))
-                : (t('Remote added') + ': ' + enc(name)),
+            successMsg: isEdit ? (t('Remote saved') + ': ' + name)
+                : (t('Remote added') + ': ' + name),
             onComplete: function () {
                 if (!win.destroyed && !win.destroying) {
                     win.close();
@@ -1678,7 +1678,7 @@
                             },
                             listConfig: {
                                 tpl: '<tpl for="."><div class="x-boundlist-item">'
-                                    + '<b>{name}</b> — {description}</div></tpl>',
+                                    + '<b>{name:htmlEncode}</b> — {description:htmlEncode}</div></tpl>',
                             },
                             value: r.type || '',
                             emptyText: t('choose a backend'),

@@ -1308,7 +1308,7 @@
                     },
                 },
                 columns: [
-                    { xtype: 'treecolumn', text: ANAS.t('Name'), dataIndex: 'name', flex: 1 },
+                    { xtype: 'treecolumn', text: ANAS.t('Name'), dataIndex: 'name', flex: 1, renderer: ANAS.enc },
                     {
                         text: ANAS.t('Health'),
                         dataIndex: 'health',

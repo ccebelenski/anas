@@ -209,7 +209,8 @@
     function jobRejected(opts, err) {
         if (opts.onFailed) { opts.onFailed(null); }
         try {
-            Ext.Msg.alert(ANAS.t(opts.failTitle || 'Operation failed'), ANAS.errText(err));
+            // Encoded: daemon text can carry remote-controlled stderr (review M5).
+            Ext.Msg.alert(ANAS.t(opts.failTitle || 'Operation failed'), ANAS.enc(ANAS.errText(err)));
         } catch (e) {
             ANAS.warn(ANAS.errText(err));
         }
@@ -250,7 +251,8 @@
                 if (status === 'failed') {
                     var msg = (job && job.error && job.error.message) || ANAS.t('unknown error');
                     try {
-                        Ext.Msg.alert(ANAS.t(opts.failTitle || 'Operation failed'), msg);
+                        // Encoded: the job's error is daemon text (review M5).
+                        Ext.Msg.alert(ANAS.t(opts.failTitle || 'Operation failed'), ANAS.enc(msg));
                     } catch (e) {
                         ANAS.warn(msg);
                     }

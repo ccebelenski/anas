@@ -116,7 +116,7 @@
                     }
                     if (errMsg) {
                         try {
-                            Ext.Msg.alert(ANAS.t('Error'), errMsg);
+                            ANAS.alertMsg('Error', errMsg);
                         } catch (e3) {
                             ANAS.warn(errMsg);
                         }

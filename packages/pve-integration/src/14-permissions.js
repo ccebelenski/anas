@@ -709,7 +709,7 @@
                 var msg = (acc && acc.error)
                     || t('The current permissions could not be read.');
                 try {
-                    Ext.Msg.alert(t('Error'), msg);
+                    ANAS.alertMsg('Error', msg);
                 } catch (e) {
                     ANAS.warn(msg);
                 }
@@ -721,7 +721,7 @@
             } catch (e) {
                 ANAS.warn('populate access failed: ' + ANAS.errText(e));
                 try {
-                    Ext.Msg.alert(t('Error'), t('The current permissions could not be read.'));
+                    ANAS.alertMsg('Error', t('The current permissions could not be read.'));
                 } catch (e2) {
                     ANAS.warn('populate access failed');
                 }
@@ -898,7 +898,7 @@
                 // ZFS: the child datasets whose POSIX ACLs the walk switched on.
                 var kids = job && job.result && job.result.childAclEnabled;
                 if (kids && kids.length) {
-                    ANAS.toast(enc(t('POSIX ACLs switched on for child datasets') + ': ' + kids.join(', ')));
+                    ANAS.toast(t('POSIX ACLs switched on for child datasets') + ': ' + kids.join(', '));
                 }
                 if (opts.onDone) { opts.onDone(job); }
             },

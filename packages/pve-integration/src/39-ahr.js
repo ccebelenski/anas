@@ -2593,7 +2593,7 @@
         if (err && err.status === 404) {
             try {
                 ANAS.alertMsg('Not available',
-                    enc(what) + ' ' + t('is not available in this build of the ANAS daemon yet.'));
+                    what + ' ' + t('is not available in this build of the ANAS daemon yet.'));
             } catch (e) {
                 ANAS.warn(what + ' unavailable (404)');
             }
@@ -3365,6 +3365,7 @@
                             dataIndex: 'name',
                             flex: 1,
                             minWidth: 140,
+                            renderer: enc,
                         },
                         {
                             text: t('Fault tolerance'),

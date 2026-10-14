@@ -675,7 +675,7 @@
                 ? ' ' + t('POSIX ACLs switched on for child datasets') + ': ' + grant.childAclEnabled.join(', ') + '.'
                 : '';
             if (skipped || children || guestNote) {
-                ANAS.toast(enc((skipped + children + guestNote).replace(/^ /, '')));
+                ANAS.toast((skipped + children + guestNote).replace(/^ /, ''));
             }
         }
     }

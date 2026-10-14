@@ -11351,9 +11351,12 @@ async function cloudChecks() {
   gridTestBtn.handler(gridTestBtn)
   await settle()
   cloudAnas.enc = realEnc
-  eq('cloud(toolbar test): the toast encodes the whole verdict sentence, daemon message included',
+  // cr.11: ANAS.toast encodes its body (proved against the real 00-core.js in
+  // alert-encoding.harness.mjs), so the caller hands it the RAW sentence —
+  // encoding here too would show `&lt;` to the operator.
+  eq('cloud(toolbar test): the whole verdict sentence, daemon message included, reaches ANAS.toast raw (it encodes)',
     toasts[toasts.length - 1],
-    'ENC(Authentication failed \u2014 <b>ssh: handshake failed</b>)')
+    'Authentication failed \u2014 <b>ssh: handshake failed</b>')
   testReply = { verdict: 'ok', message: '' }
 
   // --- (c) Add dialog: the live gate, then the create body -----------------
@@ -11553,8 +11556,9 @@ async function cloudChecks() {
   await settle()
   eq('cloud(edit b2): a changed non-secret saves alone — the untouched stored secret never rides',
     jobs[0] && jobs[0].body, { options: { account: 'x' } })
-  ok('cloud(edit b2): the success toast encodes the remote name (Ext.toast renders HTML)',
-    /ENC\(b2gt\)/.test(String((jobs[0] || {}).successMsg || '')), String((jobs[0] || {}).successMsg))
+  // cr.11: successMsg goes to ANAS.toast, which encodes; the caller passes the raw name.
+  ok('cloud(edit b2): the success toast names the remote raw (ANAS.toast encodes)',
+    /Remote saved: b2gt$/.test(String((jobs[0] || {}).successMsg || '')), String((jobs[0] || {}).successMsg))
   ok('cloud(edit b2): the PUT went to the named remote',
     jobs[0] && jobs[0].path === '/cloud/remotes/b2gt', jobs[0] && jobs[0].path)
   created.windows.length = 0

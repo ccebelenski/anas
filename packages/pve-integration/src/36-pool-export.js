@@ -34,7 +34,7 @@
                     body: {},
                     view: grid,
                     confirmTitle: 'Export pool',
-                    confirmIntro: ANAS.t('Export') + ' ' + poolName + '?',
+                    confirmIntro: ANAS.t('Export') + ' ' + ANAS.enc(poolName) + '?',
                     successMsg: ANAS.t('Exported') + ' ' + poolName,
                     failTitle: 'Export failed',
                     onComplete: function () {
