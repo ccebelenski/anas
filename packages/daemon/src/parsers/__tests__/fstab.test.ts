@@ -255,7 +255,7 @@ describe('fstab field escaping (cr.2, review C2)', () => {
     }
     const line = serializeMountLine(entry)
     // `guest` is the structural CIFS auth token (no creds file here).
-    assert.equal(line, '//10.0.0.5/public /usr\\040nfs4\\040rw\\0400\\0400\\040\\043 cifs guest,nofail 0 0')
+    assert.equal(line, '//10.0.0.5/public /usr\\040nfs4\\040rw\\0400\\0400\\040# cifs guest,nofail 0 0')
     assert.ok(!line.includes('\n'), 'no forged extra line')
     assert.equal(line.split(/\s+/).length, 6, 'one six-field entry, not a shifted one')
     // Every field the hostile string wanted to forge (`nfs4`, `rw`, `0 0`)

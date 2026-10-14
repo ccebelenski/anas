@@ -25,8 +25,8 @@ const CHARSET_RE = /^[\w.-]+$/
  *
  * Fields are related to the real world through the per-format layer in
  * `shared/` (review C2, ruling (i)): the spec and mountpoint are escaped on
- * WRITE — space `\040`, tab `\011`, newline `\012`, backslash `\134`, `#`
- * `\043` — and unescaped on READ exactly as getmntent(3) does. The parser sees
+ * WRITE — space `\040`, tab `\011`, newline `\012`, backslash `\134`, and a
+ * field-leading `#` as `\043` — and unescaped on READ as libmount does. The parser sees
  * the real paths; a `#`- or space-bearing mountpoint stays ONE field and can
  * neither shift the six-field shape nor drop the forced `nofail`. A line a
  * human wrote with an escape (a spaced CIFS share name `//nas/My\040Share`)
@@ -261,10 +261,10 @@ export function enableMount(text: string, mountpoint: string): string {
 
 /**
  * Serialize one entry to a canonical single /etc/fstab line (no inline
- * comment). The spec and mountpoint are octal-escaped exactly as getmntent(3)
- * reads them (shared per-format layer, review C2): space `\040`, tab `\011`,
- * newline `\012`, backslash `\134` and `#` `\043` — a `#` starts a comment
- * for some readers. Escaping keeps a field carrying one of those characters a
+ * comment). The spec and mountpoint are octal-escaped as libmount and
+ * getmntent(3) read them (shared per-format layer, review C2): space `\040`,
+ * tab `\011`, newline `\012`, backslash `\134`, and `\043` for a `#` that
+ * would start the field (a `#` inside a field is data to both readers). Escaping keeps a field carrying one of those characters a
  * single whitespace-delimited field, so a mountpoint like
  * `/usr nfs4 rw 0 0 #` cannot shift the six-field shape (or drop the forced
  * `nofail`) the way writing it raw would.

@@ -13,9 +13,12 @@ import { z } from 'zod'
  *
  *   space `\040`, tab `\011`, newline `\012`, backslash `\134`
  *
- * and `\043` for `#` — a `#` (column 0 or whitespace-preceded) starts a
- * comment for some readers, so a `#`-bearing spec or mountpoint must be
- * escaped rather than written raw. The parser escapes the SPEC and MOUNTPOINT
+ * and `\043` for a `#` that is a field's FIRST character. Both readers
+ * (util-linux libmount, used by mount and systemd's generator, and glibc
+ * getmntent) treat a `#` at column 0 or after whitespace as a comment and a
+ * `#` inside a field as data; glibc does NOT decode `\043` (libmount does).
+ * So only a leading `#` is escaped, and one inside a field is written raw,
+ * which both readers then read the same way (cr.2 review, 2026-10-14). The parser escapes the SPEC and MOUNTPOINT
  * on write and unescapes on read; those two are the fields an operator or a
  * share name can legitimately put spaces in (CIFS `//nas/My Share` is real).
  *
@@ -36,13 +39,12 @@ import { z } from 'zod'
 /** Octal escapes for the fstab field-breaking characters (getmntent(3) order). */
 const FSTAB_FIELD_ESCAPES: Record<string, string> = {
   '\\': '\\134', // backslash first — its escape must never be re-escaped
-  '#': '\\043',
   ' ': '\\040',
   '\t': '\\011',
   '\n': '\\012',
 }
 
-const FSTAB_FIELD_ESCAPE_RE = /[\\# \t\n]/g
+const FSTAB_FIELD_ESCAPE_RE = /[\\ \t\n]/g
 
 /** A `\` followed by exactly three octal digits — the escape getmntent(3) decodes. */
 const FSTAB_OCTAL_ESCAPE_RE = /\\([0-7]{3})/g
@@ -50,14 +52,15 @@ const FSTAB_OCTAL_ESCAPE_RE = /\\([0-7]{3})/g
 /**
  * Escape one fstab field (fs_spec or fs_file) for writing.
  *
- * A single pass over the string: every `\`, `#`, space, tab and newline
- * becomes its three-digit octal escape. Ordering is safe because String
+ * A single pass over the string: every `\`, space, tab and newline becomes
+ * its three-digit octal escape, and a LEADING `#` becomes `\043`. Ordering is safe because String
  * .prototype.replace never rescans a replacement — the `\` of an emitted
  * `\134` is not re-escaped. A field carrying none of the five characters
  * comes back byte-identical.
  */
 export function escapeFstabField(s: string): string {
-  return s.replace(FSTAB_FIELD_ESCAPE_RE, c => FSTAB_FIELD_ESCAPES[c] ?? c)
+  const escaped = s.replace(FSTAB_FIELD_ESCAPE_RE, c => FSTAB_FIELD_ESCAPES[c] ?? c)
+  return escaped.startsWith('#') ? `\\043${escaped.slice(1)}` : escaped
 }
 
 /**

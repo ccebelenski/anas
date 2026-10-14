@@ -16,11 +16,13 @@ describe('escapeFstabField', () => {
     assert.equal(escapeFstabField('/mnt/a\tb'), '/mnt/a\\011b')
     assert.equal(escapeFstabField('/mnt/a\nb'), '/mnt/a\\012b')
     assert.equal(escapeFstabField('/mnt/a\\b'), '/mnt/a\\134b')
-    assert.equal(escapeFstabField('/mnt/a#b'), '/mnt/a\\043b')
+    // A `#` inside a field is data to both libmount and glibc; only a leading one is escaped.
+    assert.equal(escapeFstabField('/mnt/a#b'), '/mnt/a#b')
+    assert.equal(escapeFstabField('#spec'), '\\043spec')
   })
 
   it('escapes the review\'s hostile mountpoint into ONE field', () => {
-    assert.equal(escapeFstabField(HOSTILE_MOUNTPOINT), '/usr\\040nfs4\\040rw\\0400\\0400\\040\\043')
+    assert.equal(escapeFstabField(HOSTILE_MOUNTPOINT), '/usr\\040nfs4\\040rw\\0400\\0400\\040#')
   })
 
   it('backslash is escaped FIRST — an already-escaped token round-trips', () => {
