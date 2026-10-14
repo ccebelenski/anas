@@ -1260,4 +1260,235 @@ describe('share-identity routes', () => {
       assert.equal('privateGroupOf' in plain, false)
     })
   })
+
+  // --- cr.3 (review C3) — system accounts are not mutable --------------------
+  //
+  // A mutation may target only accounts in the share band [1000, 60000). root
+  // (uid 0), the 1..999 service range, nobody (65534) and system groups (sudo,
+  // gid 27) get a HARD 409 SYSTEM_ACCOUNT: no confirm code is minted, no job
+  // is submitted, and no mutating command ever runs. Band accounts pass every
+  // verb unchanged. Every account here is LOCAL — the band, not locality, is
+  // what refuses. The job-time test scripts the getent answer MOVING between
+  // the request and the job (MockExecutor `results` sequences).
+  describe('cr.3 — system accounts are not mutable (review C3)', () => {
+    let app: FastifyInstance | undefined
+    let executor: MockExecutor
+    let queue: JobQueue
+    let tmpDir: string
+
+    const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
+    const NOT_FOUND: ExecResult = { stdout: '', stderr: '', exitCode: 2 }
+
+    const rootLine = 'root:x:0:0:root:/root:/bin/bash\n'
+    const svcLine = 'svcbackup:x:100:100:svc:/nonexistent:/usr/sbin/nologin\n'
+    const nobodyLine = 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n'
+    const SHARE_LINE = 'shareuser:x:1001:100:Share User:/home/shareuser:/usr/sbin/nologin\n'
+    const PASSWD = [rootLine.trimEnd(), svcLine.trimEnd(), nobodyLine.trimEnd(), SHARE_LINE.trimEnd(), ''].join('\n')
+    const GROUPS = ['root:x:0:', 'sudo:x:27:', 'users:x:100:', 'sharegrp:x:1002:shareuser', ''].join('\n')
+
+    /** Every command that would change the system (pdbedit -x is the carve-out). */
+    const MUTATORS = ['/usr/sbin/usermod', '/usr/sbin/userdel', '/usr/sbin/groupdel', '/usr/bin/gpasswd', '/usr/bin/smbpasswd', '/usr/sbin/useradd']
+    function mutatorCalls(): Call[] {
+      return executor.calls.filter(c => MUTATORS.includes(c.command) || (c.command === '/usr/bin/pdbedit' && c.args[0] === '-x'))
+    }
+
+    async function boot(opts: { sharePasswd?: ExecResult[], pdblist?: ExecResult } = {}) {
+      tmpDir = await mkdtemp(join(tmpdir(), 'anas-identity-cr3-'))
+      const smbConfPath = join(tmpDir, 'smb.conf')
+      writeFileSync(smbConfPath, '[global]\nworkgroup = WORKGROUP\n')
+      executor = new MockExecutor()
+      queue = new JobQueue()
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: ok(PASSWD) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: ok(GROUPS) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd'], result: ok(PASSWD) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group'], result: ok(GROUPS) })
+      const userFixtures: Array<[string, string]> = [
+        ['root', rootLine],
+        ['svcbackup', svcLine],
+        ['nobody', nobodyLine],
+      ]
+      for (const [name, line] of userFixtures) {
+        executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', name], result: ok(line) })
+        executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd', name], result: ok(line) })
+      }
+      // `results` so the job-time test can script the uid moving out of band.
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'shareuser'], results: opts.sharePasswd ?? [ok(SHARE_LINE)] })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd', 'shareuser'], result: ok(SHARE_LINE) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'newbie'], result: NOT_FOUND })
+      const groupFixtures: Array<[string, string]> = [
+        ['root', 'root:x:0:\n'],
+        ['sudo', 'sudo:x:27:\n'],
+        ['users', 'users:x:100:\n'],
+        ['sharegrp', 'sharegrp:x:1002:shareuser\n'],
+      ]
+      for (const [name, line] of groupFixtures) {
+        executor.addFixture({ command: '/usr/bin/getent', args: ['group', name], result: ok(line) })
+        executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group', name], result: ok(line) })
+      }
+      executor.addFixture({ command: '/usr/bin/pdbedit', args: ['-L'], result: opts.pdblist ?? ok('') })
+      executor.addFixture({ command: '/usr/bin/pdbedit', result: ok('') })
+      executor.addFixture({ command: '/usr/bin/smbpasswd', result: ok('') })
+      executor.addFixture({ command: '/usr/sbin/usermod', result: ok('') })
+      executor.addFixture({ command: '/usr/sbin/useradd', result: ok('') })
+      executor.addFixture({ command: '/usr/sbin/userdel', result: ok('') })
+      executor.addFixture({ command: '/usr/sbin/groupdel', result: ok('') })
+      executor.addFixture({ command: '/usr/bin/gpasswd', result: ok('') })
+
+      app = Fastify({ logger: false })
+      await app.register(shareIdentityRoutes, {
+        prefix: '/v1',
+        executor,
+        jobQueue: queue,
+        confirmStore: new ConfirmStore(),
+        smbConfPath,
+        smbpasswdAvailable: async () => true,
+      })
+    }
+
+    function del(url: string, confirm?: string) {
+      const headers: Record<string, string> = { ...IDENTITY_HEADERS }
+      if (confirm !== undefined)
+        headers['x-anas-confirm'] = confirm
+      return app!.inject({ method: 'DELETE', url, headers })
+    }
+    function put(url: string, body: unknown) {
+      return app!.inject({ method: 'PUT', url, headers: JSON_HEADERS, payload: JSON.stringify(body) })
+    }
+    function post(url: string, body: unknown) {
+      return app!.inject({ method: 'POST', url, headers: JSON_HEADERS, payload: JSON.stringify(body) })
+    }
+
+    async function waitForQueueJob(id: string): Promise<Job> {
+      for (let i = 0; i < 50; i++) {
+        const job = queue.get(id)
+        if (job && (job.status === 'completed' || job.status === 'failed'))
+          return job
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      throw new Error(`Job ${id} did not finish`)
+    }
+
+    /** The shared shape of every cr.3 refusal: hard 409, no code, no job, no command. */
+    function assertRefusal(res: { statusCode: number, headers: Record<string, unknown>, json: () => { error: { code: string, message: string } } }, name: string) {
+      assert.equal(res.statusCode, 409)
+      const { error } = res.json()
+      assert.equal(error.code, 'SYSTEM_ACCOUNT')
+      assert.match(error.message, new RegExp(`'${name}'`))
+      assert.match(error.message, /managed outside ANAS/)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
+      assert.equal(queue.list().length, 0)
+      assert.deepEqual(mutatorCalls(), [])
+    }
+
+    afterEach(async () => {
+      await app?.close()
+      app = undefined
+      await rm(tmpDir, { recursive: true, force: true })
+    })
+
+    // The three out-of-band shapes: uid 0, the service range, the 60000+ range.
+    const OUT_OF_BAND: Array<[string, number]> = [['root', 0], ['svcbackup', 100], ['nobody', 65534]]
+
+    it('refuses to disable/enable root, a service account, and nobody (uid 0/100/65534)', async () => {
+      await boot()
+      for (const [name, uid] of OUT_OF_BAND) {
+        const res = await put(`/v1/identity/users/${name}`, { enabled: false })
+        assertRefusal(res, name)
+        assert.match((res.json() as { error: { message: string } }).error.message, new RegExp(`uid ${uid}`))
+      }
+    })
+
+    it('refuses an SMB password on root, a service account, and nobody', async () => {
+      await boot()
+      for (const [name] of OUT_OF_BAND) {
+        const res = await post(`/v1/identity/users/${name}/smb-password`, { password: 'hunter2' })
+        assertRefusal(res, name)
+      }
+    })
+
+    it('refuses deleting root, a service account, and nobody (userdel has no uid floor)', async () => {
+      await boot()
+      for (const [name] of OUT_OF_BAND) {
+        const res = await del(`/v1/identity/users/${name}`)
+        assertRefusal(res, name)
+      }
+    })
+
+    it('refuses a membership edit of the sudo group (gid 27)', async () => {
+      await boot()
+      const res = await put('/v1/identity/groups/sudo/members', { add: ['shareuser'] })
+      assertRefusal(res, 'sudo')
+      assert.match((res.json() as { error: { message: string } }).error.message, /gid 27/)
+    })
+
+    it('refuses deleting the sudo group (groupdel has no gid floor)', async () => {
+      await boot()
+      const res = await del('/v1/identity/groups/sudo')
+      assertRefusal(res, 'sudo')
+    })
+
+    it('create with a system group in `groups` refuses naming the group, no useradd', async () => {
+      await boot()
+      const res = await post('/v1/identity/users', { name: 'newbie', groups: ['sharegrp', 'sudo'] })
+      assert.equal(res.statusCode, 409)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'SYSTEM_ACCOUNT')
+      assert.match(error.message, /'sudo' \(gid 27\)/)
+      assert.match(error.message, /managed outside ANAS/)
+      assert.equal(queue.list().length, 0)
+      assert.equal(executor.calls.some(c => c.command === '/usr/sbin/useradd'), false)
+    })
+
+    it('a share-band user still passes every verb (disable, SMB password, delete)', async () => {
+      await boot({ pdblist: ok('shareuser:1001:\n') })
+
+      const disable = await put('/v1/identity/users/shareuser', { enabled: false })
+      assert.equal(disable.statusCode, 202)
+      assert.equal((await waitForQueueJob((disable.json() as JobAccepted).job.id)).status, 'completed')
+      assert.deepEqual(find(executor.calls, '/usr/sbin/usermod', () => true), ['--expiredate', '1', 'shareuser'])
+
+      const smb = await post('/v1/identity/users/shareuser/smb-password', { password: 'hunter2' })
+      assert.equal(smb.statusCode, 202)
+      assert.equal((await waitForQueueJob((smb.json() as JobAccepted).job.id)).status, 'completed')
+
+      const challenged = await del('/v1/identity/users/shareuser')
+      assert.equal(challenged.statusCode, 409)
+      assert.equal((challenged.json() as { error: { code: string } }).error.code, 'CONFIRMATION_REQUIRED')
+      const code = challenged.headers['x-anas-confirm-code'] as string
+      const confirmed = await del('/v1/identity/users/shareuser', code)
+      assert.equal(confirmed.statusCode, 202)
+      assert.equal((await waitForQueueJob((confirmed.json() as JobAccepted).job.id)).status, 'completed')
+    })
+
+    it('a share-band group still passes every verb (members, delete)', async () => {
+      await boot()
+      const members = await put('/v1/identity/groups/sharegrp/members', { add: ['shareuser'] })
+      assert.equal(members.statusCode, 202)
+      assert.equal((await waitForQueueJob((members.json() as JobAccepted).job.id)).status, 'completed')
+      assert.deepEqual(find(executor.calls, '/usr/bin/gpasswd', () => true), ['-a', 'shareuser', 'sharegrp'])
+
+      const challenged = await del('/v1/identity/groups/sharegrp')
+      assert.equal(challenged.statusCode, 409)
+      const code = challenged.headers['x-anas-confirm-code'] as string
+      const confirmed = await del('/v1/identity/groups/sharegrp', code)
+      assert.equal(confirmed.statusCode, 202)
+      const job = await waitForQueueJob((confirmed.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      assert.deepEqual(find(executor.calls, '/usr/sbin/groupdel', () => true), ['sharegrp'])
+    })
+
+    it('job re-gate (ruling (j)): in-band at request time, out-of-band when the job runs → failed, no command', async () => {
+      // The getent answer MOVES between the request and the job: uid 1001 at
+      // request time (the route admits the mutation), 999 by the time the job
+      // re-reads — the job must fail closed before its first usermod.
+      await boot({ sharePasswd: [ok(SHARE_LINE), ok(SHARE_LINE.replace(':1001:', ':999:'))] })
+      const res = await put('/v1/identity/users/shareuser', { enabled: false })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error?.message ?? '', /'shareuser' \(uid 999\) is a system account/)
+      assert.match(job.error?.message ?? '', /managed outside ANAS/)
+      assert.deepEqual(mutatorCalls(), [])
+    })
+  })
 })

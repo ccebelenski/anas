@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   isExpired,
+  isMutableShareId,
   isShareRelevant,
   parseGroups,
   parsePasswd,
@@ -74,6 +75,22 @@ describe('isShareRelevant', () => {
     // High dynamically-allocated system accounts are noise, not share users.
     assert.equal(isShareRelevant(64045), false) // ceph
     assert.equal(isShareRelevant(65534), false) // nobody
+  })
+})
+
+describe('isMutableShareId', () => {
+  it('is isShareRelevant without the uid-0 exception (cr.3)', () => {
+    // Same band on both ends...
+    assert.equal(isMutableShareId(1000), true)
+    assert.equal(isMutableShareId(59999), true)
+    // ...minus root, who stays LISTED (owners pickers) but is never mutable.
+    assert.equal(isMutableShareId(0), false)
+    assert.equal(isShareRelevant(0), true)
+    // Service and dynamic-system ranges: refused by both.
+    assert.equal(isMutableShareId(1), false)
+    assert.equal(isMutableShareId(999), false)
+    assert.equal(isMutableShareId(64045), false) // ceph
+    assert.equal(isMutableShareId(65534), false) // nobody
   })
 })
 

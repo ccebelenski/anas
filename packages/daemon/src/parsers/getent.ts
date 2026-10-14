@@ -39,6 +39,19 @@ export function isShareRelevant(id: number): boolean {
 }
 
 /**
+ * Mutable share ids: exactly the band {@link isShareRelevant} draws, WITHOUT
+ * its uid-0 exception. The two differ on purpose: root (and the group `root`)
+ * owns files, so lists and ownership pickers must keep showing it — but no
+ * ANAS mutation may ever TARGET an account outside [1000, 60000): disabling
+ * root would lock root@pam and sshd out of the whole node (PAM honours
+ * expiry), and the 1..999 service range plus the 60000+ dynamic-system range
+ * belong to the OS, not to shares (story cr.3, review C3).
+ */
+export function isMutableShareId(id: number): boolean {
+  return id >= 1000 && id < 60000
+}
+
+/**
  * Parse `getent passwd` into entries. Lines are
  * `name:passwd:uid:gid:gecos:home:shell`; blank lines and malformed lines
  * (missing name / non-numeric uid or gid) are skipped. The gecos field is kept

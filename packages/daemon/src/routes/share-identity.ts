@@ -17,6 +17,7 @@ import {
 } from '@anas/shared'
 import {
   isExpired,
+  isMutableShareId,
   isShareRelevant,
   parseGroups,
   parsePasswd,
@@ -367,6 +368,54 @@ export async function shareIdentityRoutes(
     }
   }
 
+  /**
+   * The cr.3 refusal sentence (review C3). `id` is null only on the job-time
+   * re-gate when the account stopped resolving between request and job — the
+   * gate fails closed, so the sentence says the id could not be read.
+   */
+  function systemAccountMessage(kind: 'user' | 'group', name: string, id: number | null): string {
+    const what = kind === 'user' ? 'User' : 'Group'
+    if (id === null)
+      return `${what} '${name}' could not be resolved (getent), so ANAS cannot confirm it is a share account and will not change it. System accounts (uid/gid below 1000 or from 60000) are managed outside ANAS.`
+    return `${what} '${name}' (${kind === 'user' ? 'uid' : 'gid'} ${id}) is a system account. System accounts (uid/gid below 1000 or from 60000) are managed outside ANAS.`
+  }
+
+  /**
+   * The cr.3 hard-409 (Principle 14 "blocked" — like `referencedConflict`, no
+   * confirm code is minted): the target's uid/gid is outside the share band,
+   * so it is a system account and ANAS never changes it.
+   */
+  function rejectSystemAccount(reply: FastifyReply, kind: 'user' | 'group', name: string, id: number) {
+    reply.code(409)
+    return {
+      error: {
+        code: 'SYSTEM_ACCOUNT',
+        message: systemAccountMessage(kind, name, id),
+      },
+    }
+  }
+
+  /**
+   * Resolve an existing user/group name to its uid/gid via the module's
+   * getent readers and refuse (throw) unless it is in the mutable share band
+   * — `isMutableShareId`, i.e. the list band without its uid-0 exception.
+   * FAIL CLOSED: a name whose id cannot be read (getent failure, or the
+   * account vanished) is not mutable. Used by every job body before its first
+   * mutating command (EPICS §2 ruling (j): jobs re-read and re-gate); the
+   * routes answer 409 first using the entry they already resolved.
+   */
+  async function gateMutableUser(name: string): Promise<void> {
+    const entry = await resolveUser(name)
+    if (!entry || !isMutableShareId(entry.uid))
+      throw new Error(systemAccountMessage('user', name, entry?.uid ?? null))
+  }
+
+  async function gateMutableGroup(name: string): Promise<void> {
+    const entry = await resolveGroup(name)
+    if (!entry || !isMutableShareId(entry.gid))
+      throw new Error(systemAccountMessage('group', name, entry?.gid ?? null))
+  }
+
   // --- GET /identity/users — enriched ShareUser list ------------------------
   server.get('/identity/users', async () => {
     const [users, groups, smb, local, shadow] = await Promise.all([
@@ -454,6 +503,23 @@ export async function shareIdentityRoutes(
       if (missing.length > 0) {
         reply.code(400)
         return { error: { code: 'VALIDATION_ERROR', message: `Unknown group(s): ${missing.join(', ')}` } }
+      }
+      // cr.3 (review C3): existing ≠ mutable. `useradd -G sudo` would hand the
+      // new account the sudo group; membership of anything outside the share
+      // band is system management, so name the group and refuse.
+      const byName = new Map(groups.map(g => [g.name, g]))
+      const systemGroups = req.groups.filter((g) => {
+        const entry = byName.get(g)
+        return entry !== undefined && !isMutableShareId(entry.gid)
+      })
+      if (systemGroups.length > 0) {
+        reply.code(409)
+        return {
+          error: {
+            code: 'SYSTEM_ACCOUNT',
+            message: `Group(s) ${systemGroups.map(g => `'${g}' (gid ${byName.get(g)?.gid})`).join(', ')} are system groups. System accounts (uid/gid below 1000 or from 60000) are managed outside ANAS.`,
+          },
+        }
       }
     }
 
@@ -571,6 +637,10 @@ export async function shareIdentityRoutes(
     }
     if (!(await isLocalUser(name)))
       return rejectDirectory(reply, 'user', name)
+    // cr.3: system accounts never take an SMB password (root's would ride the
+    // same PAM/ssh surface ANAS must not touch).
+    if (!isMutableShareId(account.uid))
+      return rejectSystemAccount(reply, 'user', name, account.uid)
 
     // Samba preflight (issue #6) — same reasoning as the create route above.
     if (!(await smbAvailable())) {
@@ -597,6 +667,9 @@ export async function shareIdentityRoutes(
       'identity.smbpasswd.set',
       { ...identity, params: { user: name } },
       async (updateProgress) => {
+        // cr.3 re-gate (ruling (j)): re-check the band before the first
+        // smbpasswd; a vanished/unreadable account fails the job closed.
+        await gateMutableUser(name)
         // Password on stdin (smbpasswd -s), never argv — never logged;
         // verified exact-case afterwards, a stale entry replaced (identity.3).
         const replaced = await setSmbPasswordVerified(name, password, updateProgress)
@@ -635,6 +708,10 @@ export async function shareIdentityRoutes(
     }
     if (!(await isLocalUser(name)))
       return rejectDirectory(reply, 'user', name)
+    // cr.3: `usermod --expiredate 1` on root or a service account locks the
+    // node (PVE @pam login and sshd honour expiry) — the band gate refuses.
+    if (!isMutableShareId(account.uid))
+      return rejectSystemAccount(reply, 'user', name, account.uid)
 
     // enable → clear expiry; disable → expire immediately. Share users have no
     // Unix password, so `--lock`/`--unlock` is redundant (it warns on a
@@ -649,6 +726,8 @@ export async function shareIdentityRoutes(
       enabled ? 'identity.user.enable' : 'identity.user.disable',
       { ...identity, params: { user: name, enabled } },
       async (updateProgress) => {
+        // cr.3 re-gate (ruling (j)) before the first usermod.
+        await gateMutableUser(name)
         updateProgress(`${enabled ? 'Enabling' : 'Disabling'} account '${name}'`)
         const r = await executor.exec(USERMOD, usermodArgs)
         if (r.exitCode !== 0)
@@ -731,12 +810,17 @@ export async function shareIdentityRoutes(
     if (!identity)
       return
 
-    if (!(await resolveGroup(name))) {
+    const target = await resolveGroup(name)
+    if (!target) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Group '${name}' not found` } }
     }
     if (!(await isLocalGroup(name)))
       return rejectDirectory(reply, 'group', name)
+    // cr.3: `gpasswd -a <u> sudo` hands `u` the sudo group — membership edits
+    // of system groups are system management, outside ANAS.
+    if (!isMutableShareId(target.gid))
+      return rejectSystemAccount(reply, 'group', name, target.gid)
 
     // Members being ADDED must resolve (getent); removals need not.
     if (add.length > 0) {
@@ -753,6 +837,8 @@ export async function shareIdentityRoutes(
       'identity.group.members',
       { ...identity, params: { group: name, add, remove } },
       async (updateProgress) => {
+        // cr.3 re-gate (ruling (j)) before the first gpasswd.
+        await gateMutableGroup(name)
         for (const user of add) {
           updateProgress(`Adding '${user}' to '${name}'`)
           const r = await executor.exec(GPASSWD, ['-a', user, name])
@@ -799,6 +885,10 @@ export async function shareIdentityRoutes(
     }
     if (!(await isLocalUser(name)))
       return rejectDirectory(reply, 'user', name)
+    // cr.3: userdel has no uid floor — without the band gate this route could
+    // delete root or any service account (review C3).
+    if (!isMutableShareId(entry.uid))
+      return rejectSystemAccount(reply, 'user', name, entry.uid)
 
     const refs = await sharesReferencing(name, false)
     if (refs.shares.length > 0) {
@@ -833,6 +923,9 @@ export async function shareIdentityRoutes(
       'identity.user.delete',
       { ...identity, params: { user: name } },
       async (updateProgress) => {
+        // cr.3 / ruling (j): re-read and re-gate before the first command —
+        // the account must still be a mutable share user when the job runs.
+        await gateMutableUser(name)
         // Order kept from identity.2: the SMB entry is dropped FIRST, so a
         // failed SMB step destroys nothing. identity.3: by its STORED name
         // with `pdbedit -x -u` — `smbpasswd -x` resolves the entry through a
@@ -889,6 +982,10 @@ export async function shareIdentityRoutes(
     }
     if (!(await isLocalGroup(name)))
       return rejectDirectory(reply, 'group', name)
+    // cr.3: groupdel has no gid floor — without the band gate this route could
+    // delete `sudo` (gid 27), `root`, or any system group (review C3).
+    if (!isMutableShareId(entry.gid))
+      return rejectSystemAccount(reply, 'group', name, entry.gid)
 
     // Every resolvable account is checked, not only local ones: a directory
     // user pinned to this gid would be broken the same way.
@@ -930,6 +1027,8 @@ export async function shareIdentityRoutes(
       'identity.group.delete',
       { ...identity, params: { group: name } },
       async (updateProgress) => {
+        // cr.3 / ruling (j): re-read and re-gate before groupdel runs.
+        await gateMutableGroup(name)
         updateProgress(`Deleting group '${name}'`)
         const r = await executor.exec(GROUPDEL, [name])
         if (r.exitCode !== 0)

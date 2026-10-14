@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { SingleLine } from './common.js'
 
 // ============================================================================
 // Identity — system users & groups for SHARE ACCESS ONLY (Epic 8).
@@ -130,9 +131,18 @@ export type LookupName = z.infer<typeof LookupName>
  */
 export const CreateShareUserRequest = z.object({
   name: IdentityName,
-  fullName: z.string().optional(),
-  /** Supplementary groups to add the user to */
-  groups: z.array(z.string()).optional(),
+  /**
+   * GECOS full name, written verbatim into the passwd `gecos` field by
+   * `useradd -c`. SingleLine (no control chars) plus no `:` — colon is the
+   * passwd field delimiter (story cr.3, review C3).
+   */
+  fullName: SingleLine.refine(s => !s.includes(':'), 'Full name must not contain a colon').optional(),
+  /**
+   * Supplementary groups to add the user to. Strict identity names only —
+   * these go to `useradd -G` verbatim (cr.3); whether each exists and sits in
+   * the share band is checked by the route.
+   */
+  groups: z.array(IdentityName).optional(),
   /** If set, also create the SMB passdb entry with this password */
   smbPassword: z.string().min(1).optional(),
 })
