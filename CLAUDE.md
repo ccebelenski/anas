@@ -12,7 +12,7 @@
 - REST over Unix socket, versioned /v1/
 - Shared Zod schemas in packages/shared/
 - UI is native ExtJS panels injected into the PVE web UI (Ceph model) — no separate web app, no iframe
-- PVE auth only (tickets are cluster-valid), Dev provider for testing
+- PVE auth only (tickets are cluster-valid), Dev provider for testing; authorization follows PVE: `Sys.Audit` to read, `Sys.Modify` to change (ruling 2026-10-14)
 - All mutations are jobs (202 Accepted)
 - Safety: 409 with X-Anas-Confirm-Code for dangerous ops
 - Config files are the API — surgical editing, never overwrite
@@ -38,5 +38,5 @@
 - Parse human-readable command output when structured output exists
 - Build notification/alerting systems (Proxmox handles this)
 - Build user management beyond what's needed for share access
-- Add roles, permissions, or authorization logic — auth is binary
+- Add ANAS roles or a permission matrix — the only authorization is PVE's own `Sys.Audit` / `Sys.Modify` check
 - Create custom log files — use journald

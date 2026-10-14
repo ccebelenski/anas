@@ -42,7 +42,7 @@ anasd listens on a Unix domain socket, not a TCP port. This means only local pro
 
 ## 10. Proxmox for authentication, system users for identity
 
-We do not maintain our own user database or session management. Users authenticate via Proxmox (PVEAuthCookie) — ANAS is always accessed through the Proxmox UI. If you're logged in, you can do everything — auth is binary, no roles or permission matrix. Share access requires real system users with real UIDs/GIDs. We manage users through standard system tools, not a parallel identity system.
+We do not maintain our own user database or session management. Users authenticate via Proxmox (PVEAuthCookie) — ANAS is always accessed through the Proxmox UI. ANAS asks PVE the question PVE asks for its own storage and disk operations: reading needs `Sys.Audit`, changing needs `Sys.Modify`, and a refusal is a 403 naming the privilege and the path. There are no ANAS roles and no permission matrix; PVE's privileges are the only ones that count (operator ruling 2026-10-14, replacing "auth is binary"). Share access requires real system users with real UIDs/GIDs. We manage users through standard system tools, not a parallel identity system.
 
 ## 11. Stateless — the system is the source of truth
 
