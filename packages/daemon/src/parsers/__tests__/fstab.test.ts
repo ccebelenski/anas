@@ -530,6 +530,16 @@ describe('cr.6 — classifyOptions consumes the disable token (operator noauto p
     assert.equal(options.common.noauto, false)
   })
 
+  it('enable clears a hand-typed case-shifted or odd-valued token the reader honours (cr.6 review)', () => {
+    for (const tok of ['X-ANAS.DISABLED', 'x-anas.disabled=whatever']) {
+      const text = `srv:/a /mnt/a nfs4 nofail,noauto,${tok} 0 0\n`
+      assert.equal(parseFstabDoc(text).some(l => l.kind === 'entry' && l.disabled), true, tok)
+      assert.equal(enableMount(text, '/mnt/a'), 'srv:/a /mnt/a nfs4 nofail 0 0\n', tok)
+    }
+    const kept = 'srv:/a /mnt/a nfs4 noauto,nofail,X-ANAS.DISABLED=KEPT-NOAUTO 0 0\n'
+    assert.equal(enableMount(kept, '/mnt/a'), 'srv:/a /mnt/a nfs4 noauto,nofail 0 0\n')
+  })
+
   it('a hand-typed case-shifted token still reads disabled (fail-safe on the read side)', () => {
     const { options, disable } = classifyOptions('nfs4', 'defaults,noauto,X-ANAS.DISABLED'.split(','))
     assert.equal(disable, 'bare')

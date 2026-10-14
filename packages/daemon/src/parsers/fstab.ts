@@ -367,12 +367,17 @@ export function enableMount(text: string, mountpoint: string): string {
       const ops = entryOptionsOps(line)
       if (!ops)
         break
-      const hasBare = ops.opts.split(',').map(o => o.trim()).includes(X_ANAS_DISABLED_TOKEN)
-      // bare form ⇒ disable added `noauto` too; kept-noauto ⇒ the operator's own
-      // `noauto` stays. (Both tokens present is pathological — clear everything.)
-      const drop = new Set(hasBare
-        ? ['noauto', X_ANAS_DISABLED_TOKEN, X_ANAS_DISABLED_KEPT_TOKEN]
-        : [X_ANAS_DISABLED_KEPT_TOKEN])
+      // The reader takes the token case-insensitively and by KEY (any
+      // `x-anas.disabled[=…]` reads disabled), so enable must clear exactly
+      // what the reader honours, or a hand-typed `X-ANAS.DISABLED` would read
+      // disabled forever (cr.6 review). bare form ⇒ disable added `noauto` too;
+      // kept-noauto ⇒ the operator's own `noauto` stays.
+      const tokens = ops.opts.split(',').filter(o => o !== '')
+      const isDisableToken = (t: string): boolean =>
+        t.trim().split('=')[0].toLowerCase() === X_ANAS_DISABLED_TOKEN
+      // Same rule as classifyOptions: any disable token that is not the
+      // kept-noauto form is the bare form.
+      const hasBare = tokens.some(t => isDisableToken(t) && t.trim().toLowerCase() !== X_ANAS_DISABLED_KEPT_TOKEN)
       // Removal matches the TRIMMED token so a hand-spaced token still goes, but
       // every SURVIVING token keeps its exact bytes — a comma-separated
       // `defaults, nofail` the operator wrote stays `defaults, nofail`, so the
@@ -380,7 +385,7 @@ export function enableMount(text: string, mountpoint: string): string {
       rewriteEntryOptions(line, (opts) => {
         const out: string[] = []
         for (const t of opts.split(',').filter(o => o !== '')) {
-          if (!drop.has(t.trim()))
+          if (!isDisableToken(t) && !(hasBare && t.trim() === 'noauto'))
             out.push(t)
         }
         return out.join(',')
