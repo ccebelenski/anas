@@ -22,12 +22,13 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, wr
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { MountCifsSec, MountNfsSec, normalizeMountTarget } from '@anas/shared'
+import { MountCifsSec, MountExtraOptions, MountNfsSec, normalizeMountTarget } from '@anas/shared'
 import { classifyKind, isIgnoredMount, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { cifsAuthToken, getMount, inlineCommentIndex, parseFstab } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
 import { readPveMountPaths } from '../parsers/pve-storage.js'
+import { zodIssue } from '../validation.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { readConfig } from './config-writer.js'
 import { execSystemctlShow } from './unit-run-status.js'
@@ -635,6 +636,30 @@ export function applySecOption<S extends string>(
 }
 
 /**
+ * The one writer-side re-check for a REQUEST-supplied `extraOptions` value
+ * (cr.2, review C2 — defence in depth, Principle 6): where the flat request
+ * turns into the verbatim passthrough a fstab line will carry, the value is
+ * re-validated with the SAME schema that gates the request boundary, so a
+ * caller that bypasses the route schema still cannot hand a raw option string
+ * (a newline forges an extra fstab line) to the writer. A refusal throws a
+ * 400-carrying message; the routes catch it. PRESERVED passthrough from an
+ * existing hand-written entry is NOT re-checked — the read side stays lenient
+ * (never refuse to read the system's own file), and an edit to an unrelated
+ * field keeps a human's exotic token byte-identical.
+ */
+/** Thrown by {@link validatedExtraOptions}; the routes turn it into a 400. */
+export class InvalidExtraOptionsError extends Error {}
+
+export function validatedExtraOptions(extraOptions: string | null | undefined): string {
+  if (extraOptions === undefined || extraOptions === null)
+    return ''
+  const parsed = MountExtraOptions.safeParse(extraOptions)
+  if (!parsed.success)
+    throw new InvalidExtraOptionsError(zodIssue(parsed.error))
+  return extraOptions
+}
+
+/**
  * Apply the server-enforced option defaults (18.5), returning the resolved
  * structured options + advisory warnings:
  *  - `nofail` FORCED on every ANAS-written entry.
@@ -673,7 +698,7 @@ export function applyMountDefaults(
   if (!automount)
     delete common.automountIdleTimeout
 
-  const options: MountOptions = { common, passthrough: extraOptions ?? '' }
+  const options: MountOptions = { common, passthrough: validatedExtraOptions(extraOptions) }
 
   if (type === 'nfs') {
     const nfs: NonNullable<MountOptions['nfs']> = {}

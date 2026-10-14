@@ -27,6 +27,7 @@ import {
   entryFromRequest,
   fstabHasMount,
   hasInlineCredentials,
+  InvalidExtraOptionsError,
   isRemoteKind,
   mountpointReservedByPve,
   probeInventoryHealth,
@@ -38,6 +39,7 @@ import {
   removeEmptyMountpointDir,
   rotateCredentialsFile,
   runMountTest,
+  validatedExtraOptions,
   writeCredentialsFile,
 } from '../services/mounts.js'
 import { zodIssue } from '../validation.js'
@@ -279,7 +281,21 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       }
     }
 
-    const { entry, warnings } = entryFromRequest(req, credsDir)
+    // The request schema already validated `extraOptions`; this re-check turns
+    // any wayward value at the daemon's write door into a 400 (cr.2 — defence
+    // in depth, Principle 6) rather than a fstab line.
+    let entry: MountEntry
+    let warnings: string[]
+    try {
+      ({ entry, warnings } = entryFromRequest(req, credsDir))
+    }
+    catch (err) {
+      if (err instanceof InvalidExtraOptionsError) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Invalid extra mount options: ${err.message}` } }
+      }
+      throw err
+    }
 
     const job = jobQueue.submit(
       'mount.create',
@@ -354,7 +370,19 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (await foreignMountRefused(mp, existing, 'Editing', reply))
       return reply
 
-    const merged = mergeEntry(existing, body.options, body.automount, body.extraOptions)
+    // `mergeEntry` re-validates a SUPPLIED `extraOptions` at this write door
+    // (cr.2 — defence in depth, Principle 6); a wayward value is a 400.
+    let merged: MountEntry
+    try {
+      merged = mergeEntry(existing, body.options, body.automount, body.extraOptions)
+    }
+    catch (err) {
+      if (err instanceof InvalidExtraOptionsError) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Invalid extra mount options: ${err.message}` } }
+      }
+      throw err
+    }
     // SECURITY (BUG-1): a hand-written entry with inline plaintext credentials is
     // MIGRATED on this operator-initiated save — the secret moves to the protected
     // 0600 creds file and the rewritten fstab line carries `credentials=<file>`
@@ -1032,8 +1060,10 @@ function mergeEntry(
   const options: MountOptions = {
     common,
     // An EMPTY (or null) extraOptions clears the passthrough — the operator
-    // blanked the field. Only an omitted field keeps what was there.
-    passthrough: extraOptions === undefined ? existing.options.passthrough : (extraOptions ?? ''),
+    // blanked the field. Only an omitted field keeps what was there. A
+    // SUPPLIED value is re-validated at this write door (cr.2 — defence in
+    // depth, Principle 6); PRESERVED hand-written passthrough is not.
+    passthrough: extraOptions === undefined ? existing.options.passthrough : validatedExtraOptions(extraOptions),
   }
   if (existing.fstype === 'nfs4' || existing.fstype === 'nfs') {
     const nfs = { ...existing.options.nfs }

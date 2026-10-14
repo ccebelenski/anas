@@ -199,6 +199,107 @@ describe('18.9 — common CIFS/NFS option tiers round-trip (parse → build → 
   })
 })
 
+describe('fstab field escaping (cr.2, review C2)', () => {
+  const NOFAIL_COMMON = {
+    readOnly: false,
+    nofail: true,
+    noauto: false,
+    automount: false,
+    noatime: false,
+    nosuid: false,
+    nodev: false,
+    noexec: false,
+    netdev: false,
+  }
+
+  it('a hand-written `\\040` line parses to the real path (getmntent semantics)', () => {
+    const text = '//nas/My\\040Share  /mnt/My\\040Share  cifs  credentials=/etc/anas/creds/x.cred,nofail  0  0\n'
+    const entry = getMount(text, '/mnt/My Share')!
+    assert.equal(entry.spec, '//nas/My Share')
+    assert.equal(entry.mountpoint, '/mnt/My Share')
+    assert.equal(entry.options.common.nofail, true)
+    // The document round-trip stays byte-identical: only the interpreted view
+    // unescapes; the raw line is untouched.
+    assert.equal(serializeFstabDoc(parseFstabDoc(text)), text)
+  })
+
+  it('adding an entry with a space in the mountpoint writes `\\040` and reads back the same entry', () => {
+    const before = loadFixture('fstab-anas-managed')
+    const entry = {
+      spec: '//nas/My Share',
+      mountpoint: '/mnt/My Share',
+      fstype: 'cifs',
+      options: { common: NOFAIL_COMMON, passthrough: '' },
+      dump: 0,
+      pass: 0,
+    }
+    const added = addMount(before, entry)
+    assert.ok(added.includes('//nas/My\\040Share /mnt/My\\040Share cifs guest,nofail 0 0'), added)
+    const reparsed = getMount(added, '/mnt/My Share')!
+    assert.equal(reparsed.mountpoint, '/mnt/My Share')
+    assert.equal(reparsed.spec, '//nas/My Share')
+    // The fixture's own lines are untouched.
+    for (const l of before.split('\n'))
+      assert.ok(added.includes(l), `fixture line must survive: ${l}`)
+  })
+
+  it('the review\'s hostile mountpoint becomes ONE line, right field count, nofail kept', () => {
+    const hostile = '/usr nfs4 rw 0 0 #' // C2: spaces + `#` shifting the fields
+    const entry = {
+      spec: '//10.0.0.5/public',
+      mountpoint: hostile,
+      fstype: 'cifs',
+      options: { common: NOFAIL_COMMON, passthrough: '' },
+      dump: 0,
+      pass: 0,
+    }
+    const line = serializeMountLine(entry)
+    // `guest` is the structural CIFS auth token (no creds file here).
+    assert.equal(line, '//10.0.0.5/public /usr\\040nfs4\\040rw\\0400\\0400\\040\\043 cifs guest,nofail 0 0')
+    assert.ok(!line.includes('\n'), 'no forged extra line')
+    assert.equal(line.split(/\s+/).length, 6, 'one six-field entry, not a shifted one')
+    // Every field the hostile string wanted to forge (`nfs4`, `rw`, `0 0`)
+    // is inside the escaped mountpoint, not a real column.
+    assert.ok(!line.split(/\s+/).includes('nfs4'), 'fstype is cifs — the hostile tokens are escaped into the mountpoint')
+    const parsed = getMount(`${line}\n`, hostile)!
+    assert.equal(parsed.mountpoint, hostile)
+    assert.equal(parsed.fstype, 'cifs')
+    assert.equal(parsed.options.common.nofail, true) // never dropped
+    // And a real re-serialize of the parsed entry reproduces the same text.
+    assert.equal(serializeMountLine(parsed), line)
+  })
+
+  it('re-serializing an escaped entry round-trips the escape (parse → build → parse)', () => {
+    const text = '//nas/My\\040Share /mnt/My\\040Share cifs nofail 0 0\n'
+    const first = getMount(text, '/mnt/My Share')!
+    const again = getMount(`${serializeMountLine(first)}\n`, '/mnt/My Share')!
+    assert.equal(again.spec, '//nas/My Share')
+    assert.equal(again.mountpoint, '/mnt/My Share')
+    assert.deepEqual(again.options, first.options)
+  })
+
+  it('the #ANAS path works on the UNESCAPED value and never rewrites the marker', () => {
+    const text = '//nas/My\\040Share /mnt/My\\040Share cifs guest,nofail 0 0\n'
+    const disabled = disableMount(text, '/mnt/My Share')
+    assert.ok(disabled.startsWith(ANAS_MARKER))
+    // The disabled line still parses as one escaped entry → unescaped identity.
+    const parsed = getMount(disabled, '/mnt/My Share')!
+    assert.equal(parsed.mountpoint, '/mnt/My Share')
+    assert.equal(parsed.disabled, true)
+    // A surgical addMountOption targets it by the UNESCAPED mountpoint and
+    // leaves the marker + the escape spellings intact.
+    const once = addMountOption(disabled, '/mnt/My Share', 'x-anas-note=keep')
+    assert.ok(once.startsWith(ANAS_MARKER))
+    assert.ok(once.includes('x-anas-note=keep'))
+    assert.ok(once.includes('\\040'), 'the escaped field must not be re-escaped')
+    assert.ok(!once.includes('My\\040Share /mnt/My Share'), 'no partial unescape')
+    // Enabling strips exactly the marker, keeping the escaped fields + the note.
+    const enabled = enableMount(once, '/mnt/My Share')!
+    assert.ok(!enabled.startsWith(ANAS_MARKER))
+    assert.ok(enabled.includes('x-anas-note=keep') && enabled.includes('\\040'), enabled)
+  })
+})
+
 describe('inlineCommentIndex — token-starting `#` only (BUG-2)', () => {
   it('finds a whitespace-preceded `#` (a genuine trailing comment)', () => {
     assert.equal(inlineCommentIndex('a b c 0 0   # note'), 12)

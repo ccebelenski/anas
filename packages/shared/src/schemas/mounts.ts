@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { FstabOptionList, fstabOptionTokens, isFstabOptionToken } from '../formats/fstab.js'
 import { AbsolutePath, SingleLine } from './common.js'
 import { IscsiHeldByLun } from './iscsi.js'
 
@@ -433,6 +434,43 @@ export type MountDetail = z.infer<typeof MountDetail>
 // ---- Requests ----------------------------------------------------------------
 
 /**
+ * Option keys that carry an authentication secret to mount.cifs(8) or a mount
+ * helper. The API routes ALL credentials through the write-only MountCredentials
+ * fields (written to the per-mount 0600 creds file, §2 Secrets); a secret
+ * smuggled in as an option token would land on the fstab line itself — visible
+ * to every reader and returned verbatim in `passthrough`. `user` is a documented
+ * mount.cifs(8) synonym for `username`; `pass` a synonym for `password`;
+ * `domain` is part of the credential set.
+ */
+const CREDENTIAL_OPTION_KEYS = new Set(['credentials', 'password', 'pass', 'username', 'user', 'domain'])
+
+/**
+ * The verbatim extra-options list a mounts request may carry (cr.2, review C2
+ * and 0.4.3 retrospective ruling (i)): a strict {@link FstabOptionList} —
+ * comma-separated TOKENS, a token being a name of letters/digits/`_ . -`
+ * optionally `=value` with no whitespace, `,`, `#`, `"`, `\` or control
+ * character — that ADDITIONALLY refuses credential-carrying token KEYS
+ * (`credentials`, `password`, `pass`, `username`, `user`, `domain`,
+ * case-insensitive, before the `=`): secrets live in the Credentials fields,
+ * never in a config line. The READ side stays lenient — a hand-written fstab
+ * line carrying one of these still parses (the parser lifts them into its
+ * structured credentials channel); this schema gates only what the API WRITES.
+ */
+export const MountExtraOptions = FstabOptionList.superRefine((s, ctx) => {
+  for (const token of fstabOptionTokens(s)) {
+    const eq = token.indexOf('=')
+    const key = eq === -1 ? token : token.slice(0, eq)
+    if (CREDENTIAL_OPTION_KEYS.has(key.toLowerCase())) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `'${token}' carries a credential — secrets go in the Credentials fields, never in the extra option list`,
+      })
+      return
+    }
+  }
+})
+
+/**
  * CIFS credentials — WRITE-ONLY. Never returned in any response. All three
  * fields are written verbatim as `key=value` lines into a per-mount 0600 creds
  * file, so each must be single-line: a control character (newline especially)
@@ -499,7 +537,18 @@ export const MountRequestOptions = z.object({
   /** authentication flavour — narrowed to the fstype's tier by the daemon. */
   sec: MountSec.nullable().optional(),
   // cifs
-  domain: SingleLine.nullable().optional(),
+  /**
+   * `domain=` — written VERBATIM as one fstab option token, so the value is
+   * the token shape too (cr.2 audit, ruling (i)): a workgroup/AD name has no
+   * space, `#`, `"`, `\` or comma, and one of those inside the value would
+   * split the line's OPTIONS column exactly like the review's `extraOptions`
+   * injection. The PERSISTENCE schema (`MountCifsOptions.domain`) stays the
+   * lenient single-line string so a hand-written fstab line keeps parsing.
+   */
+  domain: SingleLine.nullable().optional().refine(
+    d => d === null || d === undefined || isFstabOptionToken(d),
+    'domain must be a plain workgroup/DNS name — no spaces, `#`, `"`, `\\` or commas',
+  ),
   uid: z.number().int().nonnegative().nullable().optional(),
   gid: z.number().int().nonnegative().nullable().optional(),
   fileMode: MountMode.nullable().optional(),
@@ -532,8 +581,12 @@ export const CreateMountRequest = z.object({
   /** Run `mount` now (default true). */
   mountNow: z.boolean().default(true),
   options: MountRequestOptions.optional(),
-  /** Verbatim extra mount options (round-tripped in passthrough). Empty/`null` = none. */
-  extraOptions: z.string().nullable().optional(),
+  /**
+   * Verbatim extra mount options (round-tripped in passthrough) — a strict
+   * comma-separated TOKEN list (cr.2): credential-carrying tokens are refused.
+   * Empty/`null` = none.
+   */
+  extraOptions: MountExtraOptions.nullable().optional(),
   /** CIFS credentials (write-only) — required to authenticate a CIFS mount. */
   credentials: MountCredentials.optional(),
 })
@@ -555,10 +608,12 @@ export const UpdateMountRequest = z.object({
   automount: z.boolean().optional(),
   options: MountRequestOptions.optional(),
   /**
-   * Verbatim passthrough options. Under the clear contract (#34) an EMPTY string
-   * (or `null`) drops the stored passthrough; omitting the field keeps it.
+   * Verbatim passthrough options — a strict comma-separated TOKEN list (cr.2);
+   * credential-carrying tokens are refused. Under the clear contract (#34) an
+   * EMPTY string (or `null`) drops the stored passthrough; omitting the field
+   * keeps it.
    */
-  extraOptions: z.string().nullable().optional(),
+  extraOptions: MountExtraOptions.nullable().optional(),
   /** Rotate CIFS credentials (write-only). */
   credentials: MountCredentials.optional(),
 })

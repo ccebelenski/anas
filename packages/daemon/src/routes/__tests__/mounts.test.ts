@@ -245,6 +245,71 @@ describe('mount routes (Epic 18)', () => {
       assert.equal(error.code, 'VALIDATION_ERROR')
       assert.match(error.message, /share name is required/)
     })
+
+    // cr.2 (review C2): `extraOptions` is a strict option-TOKEN list, so a
+    // newline can never forge an extra fstab line and a credential token can
+    // never sneak onto one. The request schema refuses both with a 400 — a
+    // job is never submitted and fstab is untouched.
+    it('newline in extraOptions → 400, fstab untouched', async () => {
+      const before = await readFile(fstabPath, 'utf8')
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export1', mountpoint: join(dir, 'newline-inj'), extraOptions: 'nofail\nnofail' }),
+      })
+      assert.equal(res.statusCode, 400)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'VALIDATION_ERROR')
+      assert.match(error.message, /extraOptions/)
+      assert.equal(await readFile(fstabPath, 'utf8'), before)
+    })
+
+    it('a credential token in extraOptions → 400 (secrets go in the creds fields)', async () => {
+      const before = await readFile(fstabPath, 'utf8')
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ type: 'cifs', server: '127.0.0.1', remotePath: 'share', mountpoint: join(dir, 'cred-inj'), extraOptions: 'credentials=/etc/foo', credentials: { username: 'smbuser', password: 's3cret' } }),
+      })
+      assert.equal(res.statusCode, 400)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.match(error.message, /carries a credential/)
+      assert.equal(await readFile(fstabPath, 'utf8'), before)
+    })
+
+    it('accepted extraOptions are written verbatim as tokens', async () => {
+      const mountpoint = join(dir, 'tokmnt')
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({
+          type: 'nfs',
+          server: '127.0.0.1',
+          remotePath: '/srv/nfs/export1',
+          mountpoint,
+          persistent: true,
+          mountNow: false,
+          extraOptions: 'vers=4.2,x-systemd.requires=/opt',
+        }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(mountpoint))!
+      // Written VERBATIM — the passthrough token lands on the line and the file
+      // has no forged second line. (`vers=4.2` is a STRUCTURED tier, so it is
+      // written from the NFS tier, not from passthrough.)
+      assert.ok(line.includes('vers=4.2') && line.includes('x-systemd.requires=/opt'), line)
+      assert.ok(!line.includes('\n'))
+      // The read side round-trips the passthrough back exactly.
+      const detail = await server!.inject({ method: 'GET', url: `/v1/mounts/${enc(mountpoint)}`, headers: IDENTITY_HEADERS })
+      assert.equal(detail.statusCode, 200)
+      const { data } = detail.json() as { data: MountDetail }
+      assert.equal(data.configuredOptions?.passthrough, 'x-systemd.requires=/opt')
+    })
   })
 
   describe('PUT /v1/mounts/:mountpoint', () => {
@@ -256,6 +321,26 @@ describe('mount routes (Epic 18)', () => {
       const fstab = await readFile(fstabPath, 'utf8')
       const line = fstab.split('\n').find(l => l.includes('/mnt/anas-nfs'))!
       assert.ok(line.includes('ro'))
+    })
+
+    // cr.2 (review C2): the WRITE side re-checks a REQUEST-supplied option list,
+    // but the READ side stays lenient — a hand-written token that would NEVER
+    // pass the token schema (it needs an fstab escape for a space) parses, and
+    // an edit keeps it byte-identical rather than refusing the file's own line.
+    it('an edit keeps a hand-written passthrough that would fail the token schema', async () => {
+      await writeFile(fstabPath, `${FSTAB_FIXTURE}10.0.0.7:/hand /mnt/hand nfs4 nofail,x-systemd.requires=/opt/My\\040Share 0 0\n`)
+      const res = await server!.inject({
+        method: 'PUT',
+        url: `/v1/mounts/${enc('/mnt/hand')}`,
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ options: { noatime: true } }),
+      })
+      assert.equal(res.statusCode, 202, res.payload)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes('/mnt/hand'))!
+      assert.ok(line.includes('x-systemd.requires=/opt/My\\040Share'), line)
+      assert.ok(line.includes('noatime'), line)
     })
 
     it('rejects a PVE-owned mount', async () => {

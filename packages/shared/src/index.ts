@@ -22,6 +22,19 @@ export {
   stalledFor,
 } from './cloud-run.js'
 
+// Per-format validation and escaping layers (0.4.3 retrospective ruling (i)).
+// The FIRST layer lives here, for /etc/fstab (cr.2): octal field escaping as
+// getmntent(3) reads it, plus the option-token list the OPTIONS column is.
+// See docs/CODE-REVIEW-2026-10-14.md C2 and docs/EPICS.md §2 ruling (i).
+export {
+  escapeFstabField,
+  FstabOptionList,
+  FstabOptionToken,
+  fstabOptionTokens,
+  isFstabOptionToken,
+  unescapeFstabField,
+} from './formats/fstab.js'
+
 // Mount target normalisation (Epic 18): the pure server/share normaliser the
 // daemon (buildSpec, create/test routes) and the UI port both build from,
 // plus its result type.
@@ -437,6 +450,7 @@ export {
   MountCredentialsInfo,
   MountDetail,
   MountEntry,
+  MountExtraOptions,
   MountHealth,
   MountInlineCredentials,
   MountKind,

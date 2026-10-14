@@ -1,5 +1,5 @@
 import type { MountCifsOptions, MountCommonOptions, MountEntry, MountInlineCredentials, MountNfsOptions, MountOptions } from '@anas/shared'
-import { MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec } from '@anas/shared'
+import { escapeFstabField, MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec, unescapeFstabField } from '@anas/shared'
 
 /** Recognized enum-value sets, mirrored from the shared schema (never drift). */
 const CIFS_CACHE_VALUES = new Set<string>(MountCifsCache.options)
@@ -22,6 +22,16 @@ const CHARSET_RE = /^[\w.-]+$/
  * fs_file is the mountpoint (our IDENTITY), fs_vfstype is the fstype, and
  * fs_mntopts is a comma-separated option list. fs_freq/fs_passno default to 0.
  * A `#` begins a comment (whole-line when leading, inline otherwise).
+ *
+ * Fields are related to the real world through the per-format layer in
+ * `shared/` (review C2, ruling (i)): the spec and mountpoint are escaped on
+ * WRITE — space `\040`, tab `\011`, newline `\012`, backslash `\134`, `#`
+ * `\043` — and unescaped on READ exactly as getmntent(3) does. The parser sees
+ * the real paths; a `#`- or space-bearing mountpoint stays ONE field and can
+ * neither shift the six-field shape nor drop the forced `nofail`. A line a
+ * human wrote with an escape (a spaced CIFS share name `//nas/My\040Share`)
+ * therefore parses to the real `//nas/My Share`, and a re-serialized entry
+ * re-escapes the same way.
  *
  * ANAS is a guest on the system (Principle 12): it makes surgical, line-level
  * edits and preserves everything it does not touch — comments (whole-line AND
@@ -249,10 +259,19 @@ export function enableMount(text: string, mountpoint: string): string {
   return serializeFstabDoc(doc)
 }
 
-/** Serialize one entry to a canonical single /etc/fstab line (no inline comment). */
+/**
+ * Serialize one entry to a canonical single /etc/fstab line (no inline
+ * comment). The spec and mountpoint are octal-escaped exactly as getmntent(3)
+ * reads them (shared per-format layer, review C2): space `\040`, tab `\011`,
+ * newline `\012`, backslash `\134` and `#` `\043` — a `#` starts a comment
+ * for some readers. Escaping keeps a field carrying one of those characters a
+ * single whitespace-delimited field, so a mountpoint like
+ * `/usr nfs4 rw 0 0 #` cannot shift the six-field shape (or drop the forced
+ * `nofail`) the way writing it raw would.
+ */
 export function serializeMountLine(entry: MountEntry): string {
   const opts = buildOptionTokens(entry).join(',')
-  return `${entry.spec} ${entry.mountpoint} ${entry.fstype} ${opts} ${entry.dump} ${entry.pass}`
+  return `${escapeFstabField(entry.spec)} ${escapeFstabField(entry.mountpoint)} ${entry.fstype} ${opts} ${entry.dump} ${entry.pass}`
 }
 
 // --- Internals --------------------------------------------------------------
@@ -302,7 +321,15 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
   if (fields.length < 4)
     return null
 
-  const [spec, mountpoint, fstype, optStr, dumpStr, passStr] = fields
+  const [rawSpec, rawMountpoint, fstype, optStr, dumpStr, passStr] = fields
+  // Spec and mountpoint are unescaped EXACTLY as getmntent(3) reads them
+  // (`\040` → a real space, `\043` → `#`, …; shared per-format layer, review
+  // C2) — the parser sees the real paths, so identity, guards and mounts all
+  // run on what the line actually names. An untouched line still round-trips
+  // byte-identically: the document keeps the raw text; only THIS interpreted
+  // view unescapes, and serialization re-escapes.
+  const spec = unescapeFstabField(rawSpec)
+  const mountpoint = unescapeFstabField(rawMountpoint)
   // The mountpoint is our identity and must be an absolute path.
   if (!mountpoint.startsWith('/'))
     return null
