@@ -39,6 +39,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+      # Ruling (k): tests gate the release; repeat CI gates here so a tag cannot publish a commit whose CI is not green
+      - name: Install Perl dependencies for tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwww-perl liburi-perl
+      - run: npm run build
+      - run: npm run test:unit
+      - run: TZ=Pacific/Kiritimati npm run test:unit:daemon
+      - run: npm run lint
+
       - name: Build release (make-release.sh)
         run: ./packaging/make-release.sh
 

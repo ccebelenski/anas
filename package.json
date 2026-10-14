@@ -24,14 +24,16 @@
     "typecheck:daemon": "cd packages/daemon && npx tsc --noEmit",
     "typecheck:gateway": "cd packages/gateway && npx tsc --noEmit",
     "test": "npm run test:unit",
-    "test:unit": "npm run test:unit:shared && npm run test:unit:daemon && npm run test:unit:gateway && npm run test:unit:ui",
+    "test:unit": "npm run test:unit:shared && npm run test:unit:daemon && npm run test:unit:gateway && npm run test:unit:ui && npm run test:unit:shell && npm run test:unit:perl",
     "test:unit:daemon": "cd packages/daemon && npm test",
     "test:unit:gateway": "cd packages/gateway && npm test",
     "test:unit:ui": "node packages/pve-integration/test/dialog-contracts.harness.mjs && node packages/pve-integration/test/mounts-submit.harness.mjs && node packages/pve-integration/test/edit-retarget.harness.mjs && node packages/pve-integration/test/gfx-cap-segments.harness.mjs && node packages/pve-integration/test/gfx-timechart.harness.mjs && node packages/pve-integration/test/dashboard-telemetry.harness.mjs && node packages/pve-integration/test/pve-ownership.harness.mjs && node packages/pve-integration/test/lastrun-pill.harness.mjs",
     "test:integration": "npx playwright test --project=integration",
     "test:stunt-deploy": "./test/stunt-node/deploy-anas.sh",
     "test:stunt-run": "./test/stunt-node/run-tests.sh",
-    "test:unit:shared": "cd packages/shared && npm test"
+    "test:unit:shared": "cd packages/shared && npm test",
+    "test:unit:shell": "bash packaging/test/run-shell-tests.sh",
+    "test:unit:perl": "prove -I packages/pve-integration/perl packages/pve-integration/perl/t"
   },
   "devDependencies": {
     "@antfu/eslint-config": "^7.7.2",

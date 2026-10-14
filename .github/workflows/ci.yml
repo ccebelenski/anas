@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   # Build is the real gate: tsc emits AND type-fails (shared -> daemon ->
   # gateway, in dependency order), and the unit tests run against the built
@@ -20,6 +23,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - name: Install Perl dependencies for tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwww-perl liburi-perl
       - run: npm run test:unit
       # 0.4.0/0.4.1 retrospective ruling (c): tests build instants in UTC, and
       # the daemon suite runs a second time under a large-offset non-UTC zone
