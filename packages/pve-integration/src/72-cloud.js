@@ -650,7 +650,11 @@
         }
         var plain = obj !== null && typeof obj === 'object'
             && Object.prototype.toString.call(obj) !== '[object Array]';
-        return { ok: plain, value: s };
+        // cr.13 (review H3(c)): a paste that spans lines is collapsed to one
+        // line — an rclone.conf value runs to end of line, and JSON whitespace
+        // (newlines from a pretty-printed `rclone authorize` paste included)
+        // is insignificant. Idempotent on the already-compact token.
+        return { ok: plain, value: plain ? JSON.stringify(obj) : s };
     }
 
     // The token field's blur: normalise the paste IN PLACE — the field then

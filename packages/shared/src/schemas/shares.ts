@@ -1,4 +1,6 @@
 import { z } from 'zod'
+import { EXPORT_PATH_MSG, ExportClientSpec, ExportOption, isExportPath } from '../formats/exports.js'
+import { SmbConfListEntry, SmbConfValue } from '../formats/smb-conf.js'
 import { AbsolutePath, ShareName, SingleLine } from './common.js'
 
 // ============================================================================
@@ -175,17 +177,25 @@ export const ShareAccessGrantRequest = z.object({
 })
 export type ShareAccessGrantRequest = z.infer<typeof ShareAccessGrantRequest>
 
-/** Create an SMB share (POST /v1/shares/smb). */
+/**
+ * Create an SMB share (POST /v1/shares/smb). Every field that is written
+ * VERBATIM into smb.conf is gated by the per-format layer (ruling (i)): the
+ * values (`path`, `comment`) and each ENTRY of the space-joined lists
+ * (`validUsers`, `hostsAllow`, `hostsDeny`) must be a safe smb.conf value
+ * (no control characters, no trailing `\` — Samba's line continuation). The
+ * read-model {@link SmbShare} stays lenient (the parser never refuses to read
+ * a hand-written file).
+ */
 export const CreateSmbShareRequest = z.object({
   name: ShareName,
-  path: AbsolutePath,
-  comment: SingleLine.optional(),
+  path: AbsolutePath.and(SmbConfValue),
+  comment: SmbConfValue.optional(),
   browseable: z.boolean().optional(),
   readOnly: z.boolean().optional(),
   guestOk: z.boolean().optional(),
-  validUsers: z.array(SingleLine).optional(),
-  hostsAllow: z.array(SingleLine).optional(),
-  hostsDeny: z.array(SingleLine).optional(),
+  validUsers: z.array(SmbConfListEntry).optional(),
+  hostsAllow: z.array(SmbConfListEntry).optional(),
+  hostsDeny: z.array(SmbConfListEntry).optional(),
   /**
    * Self-service features (smbsvc.1–3): value = set, `null` = clear, omitted
    * = keep (the §2 dialog↔daemon contract). Enabling is refused on a share
@@ -205,32 +215,56 @@ export const UpdateSmbShareRequest = CreateSmbShareRequest
   .omit({ name: true })
 export type UpdateSmbShareRequest = z.infer<typeof UpdateSmbShareRequest>
 
-/** Update SMB global config (PUT /v1/shares/smb/global). */
-export const UpdateSmbGlobalConfigRequest = SmbGlobalConfig.partial()
+/**
+ * Update SMB global config (PUT /v1/shares/smb/global). Rebuilt field-by-field
+ * rather than `SmbGlobalConfig.partial()` because the read-model stays lenient
+ * (a hand-written [global] stanza parses even when it could not be written),
+ * while the request gates every value that reaches smb.conf through the
+ * per-format layer ({@link SmbConfValue} / {@link SmbConfListEntry}).
+ */
+export const UpdateSmbGlobalConfigRequest = z.object({
+  workgroup: SmbConfValue.optional(),
+  serverString: SmbConfValue.optional(),
+  interfaces: z.array(SmbConfListEntry).optional(),
+  bindInterfacesOnly: z.boolean().optional(),
+})
 export type UpdateSmbGlobalConfigRequest = z.infer<typeof UpdateSmbGlobalConfigRequest>
 
 // ============================================================================
 // NFS — exports are managed by surgical in-place edits to /etc/exports.
 // ============================================================================
 
-/** One client entry on an export: a host/subnet spec and its options. */
+/**
+ * One client entry on an export: a host/subnet spec and its options. Both
+ * fields are the per-format /etc/exports layer (cr.13, review H3(b)) — the
+ * schema gates the WRITE side: `spec` is one whitespace-delimited token (no
+ * `(`, `)`, `,`, `"`, `\`, `#` — each would add a client, start an option
+ * list, or break the line), and each option is a comma-free token. The daemon
+ * parser that reads the system's own file stays the lenient boundary (a
+ * hand-written line parses and round-trips; only what ANAS WRITES is gated).
+ */
 export const NfsClient = z.object({
   /**
-   * e.g. "10.0.0.0/24", "*", "host.example.com". Single-line — it is written
-   *  verbatim into an /etc/exports line; a control char would corrupt the file.
+   * e.g. "10.0.0.0/24", "*", "host.example.com", "@trusted", "*.lan".
    */
-  spec: SingleLine,
+  spec: ExportClientSpec,
   /**
    * e.g. ["rw", "sync", "no_subtree_check", "root_squash"]. Each option is
-   *  single-line (no control chars / exports line injection).
+   * one token (name of letters/digits/`_`, optionally `= value`).
    */
-  options: z.array(SingleLine),
+  options: z.array(ExportOption),
 })
 export type NfsClient = z.infer<typeof NfsClient>
 
 /** An NFS export (a line in /etc/exports): a path shared to ≥1 client. */
 export const NfsExport = z.object({
-  path: AbsolutePath,
+  /**
+   * The exported path — `AbsolutePath` plus the export write-safety rule
+   * (cr.13): no `"` (breaks the writer's quoting), `\` (line continuation),
+   * `#` or control characters. SPACES stay legal — the writer double-quotes
+   * a whitespace path and the reader parses it back.
+   */
+  path: AbsolutePath.refine(isExportPath, EXPORT_PATH_MSG),
   clients: z.array(NfsClient).min(1),
   /**
    * Whether `path` currently exists on disk — a READ-TIME observation, never
@@ -245,7 +279,8 @@ export type NfsExport = z.infer<typeof NfsExport>
 
 /** Create an NFS export (POST /v1/shares/nfs). */
 export const CreateNfsExportRequest = z.object({
-  path: AbsolutePath,
+  /** The exported path — `AbsolutePath` plus the export write-safety rule. */
+  path: AbsolutePath.refine(isExportPath, EXPORT_PATH_MSG),
   clients: z.array(NfsClient).min(1),
 })
 export type CreateNfsExportRequest = z.infer<typeof CreateNfsExportRequest>

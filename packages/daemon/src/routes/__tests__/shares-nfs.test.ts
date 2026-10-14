@@ -161,6 +161,47 @@ describe('nfs export routes', () => {
       })
       assert.equal(res.statusCode, 401)
     })
+
+    it('refuses a hostile client spec at the schema — a space would add a client (review H3b)', async () => {
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/shares/nfs',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ path: '/srv/nfs/x', clients: [{ spec: '10.0.0.0/24 rw', options: [] }] }),
+      })
+      assert.equal(res.statusCode, 400)
+      assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+      assert.ok(!(await readFile(exportsPath, 'utf8')).includes('/srv/nfs/x'))
+    })
+
+    it('a FAILED exportfs -ra rolls the file back byte-identically and fails the job (review H3b)', async () => {
+      const before = await readFile(exportsPath, 'utf8')
+      const mock = (server! as unknown as { executor: MockExecutor }).executor
+      const orig = mock.exec.bind(mock)
+      let exportfsCalls = 0
+      mock.exec = async (command: string, args: string[]) => {
+        if (command === '/usr/sbin/exportfs') {
+          exportfsCalls++
+          return { stdout: '', stderr: 'exportfs: bogus fs type', exitCode: 1 }
+        }
+        return orig(command, args)
+      }
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/shares/nfs',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ path: '/srv/nfs/rollback', clients: [{ spec: '*', options: ['rw', 'sync'] }] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /exportfs/)
+      // The write was applied and then rolled back — the file is the SAME bytes.
+      assert.equal(await readFile(exportsPath, 'utf8'), before, 'the failed write must not survive')
+      assert.ok(!(await readFile(exportsPath, 'utf8')).includes('/srv/nfs/rollback'))
+      // The restored file is reloaded so the kernel's table matches it again.
+      assert.equal(exportfsCalls, 2, 'exportfs -ra runs again after the restore')
+    })
   })
 
   // --- PUT update --------------------------------------------------------

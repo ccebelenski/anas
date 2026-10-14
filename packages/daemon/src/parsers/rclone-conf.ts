@@ -228,6 +228,17 @@ export function listSections(doc: RcloneConfDoc): RcloneConfSection[] {
  * into a CRLF-edited file emits CRLF lines only.
  */
 export function upsertSection(text: string, name: string, values: Record<string, string>): string {
+  // Defence in depth (cr.13, review H3(c)): a line is `${key} = ${value}`, so
+  // a newline or CR in either half forges an extra line (in a SECRET option —
+  // which the post-write gate never compares — a whole `[section]`). The
+  // request schemas already refuse control characters; this is the writer's
+  // own backstop for any other caller. A hand-written foreign KEY cannot carry
+  // a newline (the format is line-based), so the guard never refuses a value
+  // read back out of the file.
+  for (const [k, v] of Object.entries(values)) {
+    if (k.includes('\n') || k.includes('\r') || v.includes('\n') || v.includes('\r'))
+      throw new Error('cannot write an rclone.conf line containing a newline or carriage return (it would forge an extra line)')
+  }
   const eol = lineEnding(text)
   // The line-ending residue a new line carries inside the split `lines`
   // array (the array is joined with `\n`, so CRLF lines end in a bare `\r`).

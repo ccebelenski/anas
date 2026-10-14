@@ -170,6 +170,15 @@ describe('rclone.conf upsertSection (rclone.1)', () => {
     const [section] = listSections(parseRcloneConf(next))
     assert.equal(section!.values.k, value)
   })
+
+  it('REFUSES a value (or key) carrying a newline — the forged-`[section]` guard (review H3c)', () => {
+    // A newline in a SECRET option (gate-compared never) would forge a whole
+    // section: the writer itself must throw, defence in depth behind the
+    // request schema.
+    const forge = 'abc\n[evil]\ntype = s3'
+    assert.throws(() => upsertSection('[good]\ntype = s3\n', 'good', { secret_access_key: forge }), /newline/)
+    assert.throws(() => upsertSection('[good]\ntype = s3\n', 'good', { 'key\nendpoint': 'x' }), /newline/)
+  })
 })
 
 describe('rclone.conf CRLF (rclone.1)', () => {

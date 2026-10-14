@@ -1,6 +1,7 @@
 import { z } from 'zod'
+import { isRcloneOptionValue, RCLONE_OPTION_VALUE_MSG, RcloneOptionKey } from '../formats/rclone-conf.js'
 import { BackupArchiveConsistency, BackupName, BackupRunRequest, BackupRunResult } from './backup.js'
-import { AbsolutePath, ISODateTime, NotifyMode } from './common.js'
+import { AbsolutePath, hasControlChars, ISODateTime, NotifyMode } from './common.js'
 import { cadenceToOnCalendar, TaskCadence } from './task-cadence.js'
 
 /**
@@ -125,6 +126,31 @@ export const CloudRemote = z
 export type CloudRemote = z.infer<typeof CloudRemote>
 
 /**
+ * The option record of every remotes door. An option KEY is letters/digits/`_`
+ * and a VALUE is a single line (no control characters) — a newline in a value
+ * would forge an extra `key = value` line; in a SECRET option (which the
+ * post-write gate never compares) a whole `[section]` (review H3(c)).
+ *
+ * The `token` key is the ONE deliberate exception: the OAuth paste a user
+ * drops in is legitimately multi-line (`rclone authorize`'s marker block).
+ * It is refused/collapsed by `normalizeOAuthToken` at the daemon AND UI
+ * boundaries BEFORE anything is written — a valid JSON paste comes back on a
+ * single line (`JSON.stringify`), an invalid one is refused with the token
+ * sentence — so the WRITTEN value still never carries a control character
+ * (and the writer's own newline guard throws if one ever slipped through).
+ */
+export const CloudRemoteOptions = z
+  .record(RcloneOptionKey, z.string().max(65536))
+  .superRefine((options, ctx) => {
+    for (const [key, value] of Object.entries(options)) {
+      if (key === 'token')
+        continue // see the note above — its own gate collapses it pre-write
+      if (!isRcloneOptionValue(value))
+        ctx.addIssue({ code: 'custom', path: [key], message: RCLONE_OPTION_VALUE_MSG })
+    }
+  })
+
+/**
  * Create a remote. Secret values arrive here in plain text and are obscured
  * (via `rclone obscure -`) before they reach the file; the response never
  * returns them.
@@ -132,9 +158,10 @@ export type CloudRemote = z.infer<typeof CloudRemote>
 export const CloudRemoteWrite = z
   .object({
     name: CloudRemoteName,
-    type: z.string().min(1),
+    /** The backend name — written as the section's `type = ` value. */
+    type: z.string().min(1).max(128).refine(v => !hasControlChars(v), 'remote types are single-line'),
     /** Option values by key; secret values in plain text (write-only). */
-    options: z.record(z.string(), z.string()),
+    options: CloudRemoteOptions,
   })
 export type CloudRemoteWrite = z.infer<typeof CloudRemoteWrite>
 
@@ -142,11 +169,12 @@ export type CloudRemoteWrite = z.infer<typeof CloudRemoteWrite>
  * Update a remote. An ABSENT secret key means unchanged (secrets are
  * write-only — the dialog cannot read one back to send it); an EMPTY string
  * for a non-secret key means "remove the key". `type` is immutable — a retype
- * is a remove + create (rclone's own posture).
+ * is a remove + create (rclone's own posture). Same per-format key/value
+ * rules as {@link CloudRemoteWrite}.
  */
 export const CloudRemoteUpdate = z
   .object({
-    options: z.record(z.string(), z.string()),
+    options: CloudRemoteOptions,
   })
 export type CloudRemoteUpdate = z.infer<typeof CloudRemoteUpdate>
 

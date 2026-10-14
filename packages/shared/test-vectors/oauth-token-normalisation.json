@@ -43,5 +43,10 @@
     "input": "[\"not an object\"]",
     "ok": false,
     "value": "[\"not an object\"]"
+  },
+  {
+    "input": "{\n  \"access_token\": \"ya29.a0Af\",\n  \"token_type\": \"Bearer\",\n  \"expiry\": \"2026-09-25T23:59:59Z\"\n}",
+    "ok": true,
+    "value": "{\"access_token\":\"ya29.a0Af\",\"token_type\":\"Bearer\",\"expiry\":\"2026-09-25T23:59:59Z\"}"
   }
 ]

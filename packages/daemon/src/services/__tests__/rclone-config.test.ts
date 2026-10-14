@@ -951,6 +951,21 @@ describe('rclone-config: normalizeOAuthToken (the OAuth paste, human-pass findin
     assert.deepEqual(normalizeOAuthToken(`  ${TOKEN}  `), { ok: true, value: TOKEN })
   })
 
+  it('a paste whose JSON SPANS LINES is collapsed to one line (cr.13 review H3c)', () => {
+    // A pretty-printed `rclone authorize` block: JSON whitespace is
+    // insignificant, so the re-serialized object is exactly what rclone
+    // reads — and a one-line value cannot forge extra rclone.conf lines.
+    const pretty = '{\n  "access_token": "ya29.x",\n  "token_type": "Bearer",\n  "refresh_token": "1//rt",\n  "expiry": "2026-09-25T00:00:00Z"\n}'
+    assert.deepEqual(
+      normalizeOAuthToken(pretty),
+      { ok: true, value: '{"access_token":"ya29.x","token_type":"Bearer","refresh_token":"1//rt","expiry":"2026-09-25T00:00:00Z"}' },
+    )
+    // The collapsed value carries no newline — safe to write into the INI.
+    assert.equal(normalizeOAuthToken(pretty).value.includes('\n'), false)
+    // A multi-line paste that is NOT JSON is still refused.
+    assert.equal(normalizeOAuthToken('line one\nline two').ok, false)
+  })
+
   it('the marker lines are stripped — only what lies between them survives', () => {
     const pasted = `Paste the following into your remote machine --->\n${
       TOKEN}\n<---End paste`

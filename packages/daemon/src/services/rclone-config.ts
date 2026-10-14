@@ -168,8 +168,15 @@ export function normalizeOAuthToken(text: string): NormalizedOAuthToken {
   catch {
     return { ok: false, value: s }
   }
+  // A PASTE THAT SPANS LINES is collapsed to one line (cr.13, review H3(c)):
+  // an rclone.conf value runs to end of line, so a literal newline in a token
+  // value would forge extra lines — but JSON whitespace (including newlines,
+  // e.g. a pretty-printed `rclone authorize` paste) is insignificant, so the
+  // re-serialized object is EXACTLY what rclone reads. JSON.stringify is
+  // idempotent on the already-compact one-line token, so a verbatim paste
+  // round-trips byte-for-byte.
   const plain = typeof obj === 'object' && obj !== null && !Array.isArray(obj)
-  return { ok: plain, value: s }
+  return plain ? { ok: true, value: JSON.stringify(obj) } : { ok: false, value: s }
 }
 
 // ── The provider catalogue (rclone config providers) ───────────────────────

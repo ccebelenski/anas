@@ -22,6 +22,19 @@ export {
   stalledFor,
 } from './cloud-run.js'
 
+// /etc/exports (cr.13, review H3(b)): the client-spec, option-token and path
+// validators that gate every request field written into exportfs's file.
+export {
+  EXPORT_PATH_MSG,
+  ExportClientSpec,
+  ExportOption,
+  ExportOptionList,
+  exportOptionTokens,
+  isExportClientSpec,
+  isExportOption,
+  isExportPath,
+} from './formats/exports.js'
+
 // Per-format validation and escaping layers (0.4.3 retrospective ruling (i)).
 // The FIRST layer lives here, for /etc/fstab (cr.2): octal field escaping as
 // getmntent(3) reads it, plus the option-token list the OPTIONS column is.
@@ -36,6 +49,23 @@ export {
   X_ANAS_DISABLED_KEPT_TOKEN,
   X_ANAS_DISABLED_TOKEN,
 } from './formats/fstab.js'
+
+// rclone.conf (cr.13, review H3(c)): the option key/value validators that gate
+// every field written into ANAS's own rclone.conf.
+export {
+  isRcloneOptionKey,
+  isRcloneOptionValue,
+  RCLONE_OPTION_VALUE_MSG,
+  RcloneOptionKey,
+  RcloneOptionValue,
+} from './formats/rclone-conf.js'
+
+// smb.conf (cr.13, review H3(a)): the value and list-entry validators that
+// gate every request field written into Samba's config.
+export {
+  SmbConfListEntry,
+  SmbConfValue,
+} from './formats/smb-conf.js'
 
 // Mount target normalisation (Epic 18): the pure server/share normaliser the
 // daemon (buildSpec, create/test routes) and the UI port both build from,

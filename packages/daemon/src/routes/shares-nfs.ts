@@ -39,6 +39,50 @@ export async function nfsExportRoutes(
       throw new Error(r.stderr.trim() || `exportfs -ra exited with code ${r.exitCode}`)
   }
 
+  /**
+   * Edit /etc/exports under the config-writer's lock and reload, ROLLING THE
+   * FILE BACK when `exportfs -ra` rejects the result (review H3(b): a failed
+   * reload used to leave the bad file standing). The pre-edit bytes are captured
+   * inside the SAME `editConfig` transform (the truth the write started from),
+   * and the restore is a second `editConfig` call under the same
+   * change-detecting lock — so a hand-edit that lands between the write and the
+   * reload is left alone, never clobbered. The reload error is what fails the
+   * job, with the restore attempted as part of the rollback.
+   */
+  async function editExportsWithReload(transform: (current: string) => string, progress: (message: string) => void): Promise<void> {
+    let before: string | null = null
+    let written: string | null = null
+    await editConfig(exportsPath, (current) => {
+      before = current
+      written = transform(current)
+      return written
+    })
+    progress('Reloading NFS exports (exportfs -ra)')
+    try {
+      await reloadExports()
+    }
+    catch (err) {
+      // Roll the previous bytes back only when the file is still what we wrote
+      // (a hand-edit that landed between the write and the reload is left alone).
+      if (before !== null && written !== null) {
+        const previous = before
+        const writtenBytes = written
+        try {
+          await editConfig(exportsPath, current => (current === writtenBytes ? previous : current))
+          // A failed `exportfs -ra` may have applied part of the bad file to
+          // the kernel's export table; reload the restored file so the
+          // kernel matches it again. Best-effort: the reload error below is
+          // what the job reports.
+          await reloadExports()
+        }
+        catch (restoreErr) {
+          progress(`Could not restore /etc/exports after the failed reload: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`)
+        }
+      }
+      throw err
+    }
+  }
+
   // --- GET /shares/nfs — list ALL exports --------------------------------
   server.get('/shares/nfs', async () => {
     // Stat each export's path at read time to flag stale definitions whose
@@ -109,14 +153,12 @@ export async function nfsExportRoutes(
       { ...identity, params: { path: exp.path } },
       async (updateProgress) => {
         updateProgress(`Adding NFS export ${exp.path}`)
-        await editConfig(exportsPath, (current) => {
+        await editExportsWithReload((current) => {
           // Re-check under the file lock — another writer may have won the race.
           if (hasExport(current, exp.path))
             throw new Error(`Export '${exp.path}' already exists`)
           return addExport(current, exp)
-        })
-        updateProgress('Reloading NFS exports (exportfs -ra)')
-        await reloadExports()
+        }, updateProgress)
         return { created: exp.path }
       },
     )
@@ -188,13 +230,11 @@ export async function nfsExportRoutes(
       { ...identity, params: { path } },
       async (updateProgress) => {
         updateProgress(`Updating NFS export ${path}`)
-        await editConfig(exportsPath, (current) => {
+        await editExportsWithReload((current) => {
           if (!hasExport(current, path))
             throw new Error(`Export '${path}' not found`)
           return replaceExport(current, path, exp)
-        })
-        updateProgress('Reloading NFS exports (exportfs -ra)')
-        await reloadExports()
+        }, updateProgress)
         return { updated: path }
       },
     )
@@ -240,9 +280,7 @@ export async function nfsExportRoutes(
       { ...identity, params: { path } },
       async (updateProgress) => {
         updateProgress(`Removing NFS export ${path}`)
-        await editConfig(exportsPath, current => removeExport(current, path))
-        updateProgress('Reloading NFS exports (exportfs -ra)')
-        await reloadExports()
+        await editExportsWithReload(current => removeExport(current, path), updateProgress)
         return { removed: path }
       },
     )
