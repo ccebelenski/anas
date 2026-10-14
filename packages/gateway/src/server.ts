@@ -31,8 +31,15 @@ function readCookie(cookieHeader: string | undefined, name: string): string | un
     const eq = part.indexOf('=')
     if (eq < 0)
       continue
-    if (part.slice(0, eq).trim() === name)
-      return decodeURIComponent(part.slice(eq + 1).trim())
+    if (part.slice(0, eq).trim() === name) {
+      const raw = part.slice(eq + 1).trim()
+      try {
+        return decodeURIComponent(raw)
+      }
+      catch {
+        return undefined
+      }
+    }
   }
   return undefined
 }

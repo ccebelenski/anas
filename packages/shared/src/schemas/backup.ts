@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { AbsolutePath, DatasetPath, hasControlChars, ISODateTime, NotifyMode, PoolName } from './common.js'
+import { AbsolutePath, DatasetPath, hasControlChars, ISODateTime, NotifyMode, PoolName, SingleLine } from './common.js'
 import { IscsiIqn, IscsiLunName } from './iscsi.js'
 import { cadenceToOnCalendar, TASK_WEEKDAYS, TaskCadence, TaskCadenceKind, TaskTimeOfDay, TaskWeekday, TaskWeekParity } from './task-cadence.js'
 
@@ -1118,7 +1118,7 @@ export const BackupTask = z.object({
    * systemd OnCalendar expression. GENERATED from `cadence` when one is present
    * (the cadence is authoritative); hand-written otherwise.
    */
-  schedule: z.string().min(1),
+  schedule: SingleLine.min(1),
   /**
    * The structured schedule (16.10). Absent = the raw `schedule` above is the
    * whole story — which is exactly what every pre-16.10 task carries.

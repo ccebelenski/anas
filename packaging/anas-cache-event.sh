@@ -59,6 +59,32 @@ if [ -z "$POOL" ]; then
   exit 0
 fi
 
+# The label comes from a GPT whoever had the disk could write, and POOL goes
+# into a URL path sent with root identity (review M7). POOL must satisfy the
+# shared PoolName rule, ^[A-Za-z][A-Za-z0-9_-]*$ (packages/shared/src/schemas/
+# common.ts — keep the two in step): a leading letter, then no character
+# outside the set. In a case pattern `*` matches anything, so the set is
+# checked as "no forbidden character anywhere", not as a trailing glob.
+case "$POOL" in
+  [A-Za-z]*) POOL_OK=1 ;;
+  *) POOL_OK=0 ;;
+esac
+case "$POOL" in
+  *[!A-Za-z0-9_-]*) POOL_OK=0 ;;
+esac
+if [ "$POOL_OK" -ne 1 ]; then
+  logger -t "$TAG" -p daemon.info "EVENT=CacheEventIgnored LABEL=${LABEL} REASON=label-not-a-pool-name"
+  exit 0
+fi
+case "$LABEL" in
+  "${POOL}-cache"[0-9] | "${POOL}-cache"[0-9][0-9])
+    ;;
+  *)
+    logger -t "$TAG" -p daemon.info "EVENT=CacheEventIgnored LABEL=${LABEL} REASON=label-not-a-pool-name"
+    exit 0
+    ;;
+esac
+
 LOGLINE="EVENT=CacheDeviceRemoved POOL=${POOL} SLICE=${LABEL}"
 [ -n "$KERNEL" ] && LOGLINE="${LOGLINE} KERNEL=${KERNEL}"
 logger -t "$TAG" -p daemon.warning "$LOGLINE"

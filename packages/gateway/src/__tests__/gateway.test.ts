@@ -88,6 +88,22 @@ describe('auth hook', () => {
     assert.equal(res.statusCode, 200)
     await server.close()
   })
+
+  it('returns 401 for malformed percent-encoding in PVEAuthCookie (no 500)', async () => {
+    const server = createServer({
+      config: baseConfig(),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({
+      method: 'GET',
+      url: '/api/health',
+      headers: { cookie: 'PVEAuthCookie=%E0%A4%A' },
+    })
+    assert.equal(res.statusCode, 401)
+    assert.equal(res.json().error.code, 'UNAUTHORIZED')
+    await server.close()
+  })
 })
 
 describe('no CORS (same-origin via :8006/anas)', () => {
