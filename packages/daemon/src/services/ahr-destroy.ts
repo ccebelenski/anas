@@ -29,7 +29,8 @@ import { ahrSnapshotsMountpoint } from './share-selfservice.js'
  *       --removemissing (only when a PV is missing)/vgremove/pvremove
  *     → mdadm --stop per array → --zero-superblock per member partition
  *     → sgdisk --zap-all per member DISK → partlabel sweep for members no
- *       array still claims (issue #16) → unpin mdadm.conf ARRAY lines
+ *       array still claims (issue #16) → unpin mdadm.conf ARRAY lines (the
+ *       last AHR pin also retires ANAS's PROGRAM monitor hook, cr.31b)
  *     → update-initramfs -u → clear the expansion intent
  *
  * IDENTITY, NOT NAMES (story ident.3, identity audit #4). Before anything
@@ -310,8 +311,14 @@ export async function destroyAhrPool(
   // --- Every other read the acts consume, also before the first act ---------
   // The LVs of the pool's VG (one record per LV — parseLvsReport collapses the
   // per-segment rows LVS_ARGS produces, cr.31 D1). Unmounting changes no LV.
+  // An UNREADABLE `lvs` stops the destroy HERE (cr.31b, fail closed): reading
+  // it as "no LVs" sent the teardown past the uncache step straight to
+  // `vgremove -y`, which removes the LVs itself — a cached pool lost its cache
+  // without the release step, and the job claimed a teardown it never did.
   const lvsRes = await executor.exec(LVS, LVS_ARGS)
-  const lvs = lvsRes.exitCode === 0 ? parseLvsReport(lvsRes.stdout).filter(l => l.vgName === name) : []
+  if (lvsRes.exitCode !== 0)
+    throw new Error(`cannot read LVM logical volumes before destroying '${name}' (lvs: ${lvsRes.stderr.trim().split('\n')[0] || `exit ${lvsRes.exitCode}`}) — stopping before any change`)
+  const lvs = parseLvsReport(lvsRes.stdout).filter(l => l.vgName === name)
 
   const mountpoint = pool.mounted ? pool.mountpoint : null
   const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
@@ -520,6 +527,9 @@ export async function destroyAhrPool(
 
   // --- Unpin ARRAY lines (by the UUIDs recorded in the conf itself, so this
   // works even when the arrays are long stopped) + refresh the initramfs ------
+  // unpinArrays also retires ANAS's PROGRAM monitor hook when this unpin takes
+  // the last AHR-pinned array (cr.31b) — same edit, so the initramfs refresh
+  // below covers it too.
   const uuids = [...identity.pinned]
   if (uuids.length > 0) {
     updateProgress('Unpinning arrays from mdadm.conf')

@@ -85,6 +85,10 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       '/usr/sbin/mdadm', // --create / fallback
       '/usr/sbin/vgs', // the occupancy check (empty report = no VG)
       '/usr/sbin/pvs', // the rollback teardown's gate (empty report)
+      // The rollback teardown's LV read — a real `lvs` lists every LV on the
+      // host and answers 0 even with no VGs, and since cr.31b an unreadable
+      // one STOPS the destroy (fail closed) instead of reading as "no LVs".
+      '/usr/sbin/lvs',
     ])
     return executor
   }

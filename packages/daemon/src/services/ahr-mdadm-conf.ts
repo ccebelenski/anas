@@ -1,11 +1,14 @@
 import type { MdadmArrayPin } from '../parsers/mdadm-conf.js'
 import {
+  getArrays,
   parseMdadmConfDoc,
   removeArray,
+  removeProgram,
   serializeMdadmConfDoc,
   upsertArray,
   upsertProgram,
 } from '../parsers/mdadm-conf.js'
+import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
 import { editConfig } from './config-writer.js'
 
 /**
@@ -59,9 +62,34 @@ export async function pinArrays(arrays: MdadmArrayPin[], path?: string): Promise
   })
 }
 
+/** The device form of the ARRAY line ANAS writes: `ARRAY /dev/md/<pool>-r<N>`. */
+const PIN_DEVICE_RE = /^\/dev\/md\/(.+)$/
+
+/**
+ * The AHR pool an ARRAY line names — device `/dev/md/<pool>-r<N>` (the form
+ * ANAS pins), falling back to a `name=` token (homehost-tolerant) — or null
+ * when the line is not AHR-shaped at all. Purely a naming-convention test,
+ * which is deliberately conservative for the hook-retirement check below: any
+ * line still wearing an AHR array name — another pool's pin, a hand-built
+ * array that adopted the convention — keeps ANAS's monitor hook in place.
+ */
+export function ahrArrayLinePool(a: { device: string, name?: string }): string | null {
+  const byDevice = a.device.match(PIN_DEVICE_RE)
+  const named = (byDevice !== null ? matchAhrArrayName(byDevice[1]) : null) ?? (a.name !== undefined ? matchAhrArrayName(a.name) : null)
+  return named?.pool ?? null
+}
+
 /**
  * Remove the ARRAY lines for the given UUIDs (pool destroy). Foreign ARRAY
  * lines — any UUID not listed — are never touched. No-op for absent UUIDs.
+ *
+ * When the last AHR-shaped ARRAY line is gone (no other pool is still pinned),
+ * ANAS's own monitor hook retires with it (cr.31b): guest philosophy says ANAS
+ * leaves nothing behind that ANAS no longer needs, and an mdmonitor pointing
+ * at the hook for arrays that no longer exist is exactly that. Only the exact
+ * line ANAS wrote (`PROGRAM <ANAS_MD_EVENT_HOOK>`) is ever removed — an
+ * operator's own PROGRAM line survives every unpin. A later create re-installs
+ * the hook on demand (installProgramHook, called from ahr-create).
  */
 export async function unpinArrays(uuids: string[], path?: string): Promise<void> {
   if (uuids.length === 0)
@@ -70,6 +98,8 @@ export async function unpinArrays(uuids: string[], path?: string): Promise<void>
     const doc = parseMdadmConfDoc(current)
     for (const uuid of uuids)
       removeArray(doc, uuid)
+    if (!getArrays(doc).some(a => ahrArrayLinePool(a) !== null))
+      removeProgram(doc, ANAS_MD_EVENT_HOOK)
     return serializeMdadmConfDoc(doc)
   })
 }

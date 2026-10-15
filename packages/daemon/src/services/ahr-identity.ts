@@ -10,7 +10,7 @@ import { matchAhrArrayName, mdadmDetailExportArgs, mdadmExamineExportArgs, parse
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { isMdPvName, matchCachePartitionLabel, UNKNOWN_PV_NAME } from './ahr-cache-state.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
-import { DEFAULT_MDADM_CONF } from './ahr-mdadm-conf.js'
+import { ahrArrayLinePool, DEFAULT_MDADM_CONF } from './ahr-mdadm-conf.js'
 import { readConfig } from './config-writer.js'
 
 /**
@@ -55,9 +55,6 @@ const LSBLK = '/usr/bin/lsblk'
 /** Labels only — the occupancy check needs nothing else from the tree. */
 const LSBLK_LABEL_ARGS = ['-J', '-o', 'NAME,PARTLABEL']
 
-/** ARRAY-pin device path of one band array (`/dev/md/<pool>-r<N>`). */
-const PIN_DEVICE_RE = /^\/dev\/md\/(.+)$/
-
 /** mdadm UUID: four colon-separated groups of eight hex digits. */
 const MD_UUID_RE = /^[0-9a-f]{8}(?::[0-9a-f]{8}){3}$/i
 
@@ -94,9 +91,7 @@ export function pinnedUuids(doc: MdadmConfDoc, pool: string): Set<string> {
   for (const a of getArrays(doc)) {
     if (a.uuid === undefined)
       continue
-    const byDevice = a.device.match(PIN_DEVICE_RE)
-    const named = (byDevice ? matchAhrArrayName(byDevice[1]) : null) ?? (a.name ? matchAhrArrayName(a.name) : null)
-    if (named?.pool === pool)
+    if (ahrArrayLinePool(a) === pool)
       out.add(normalizeMdUuid(a.uuid))
   }
   return out

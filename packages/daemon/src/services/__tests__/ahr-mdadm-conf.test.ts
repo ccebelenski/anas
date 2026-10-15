@@ -74,6 +74,59 @@ describe('ahr-mdadm-conf service', () => {
     assert.equal(await readFile(conf, 'utf8'), STOCK)
   })
 
+  // cr.31b: ANAS's monitor hook retires with its last pinned array — guest
+  // philosophy, leave nothing behind that ANAS no longer needs.
+  describe('unpinArrays retires the ANAS PROGRAM hook with the last AHR pin', () => {
+    const R2POOL = { name: 'data-r1', uuid: 'deadbeef:00000000:00000000:00000001' }
+
+    it('the last AHR pin going removes the PROGRAM line; every other byte survives', async () => {
+      await writeFile(conf, STOCK)
+      await pinArrays([R1], conf)
+      await installProgramHook(undefined, conf)
+      await unpinArrays([R1.uuid], conf)
+      // Exactly STOCK again — the pin is gone, the hook is gone, and the
+      // non-AHR foreign ARRAY (name=oldbox:0) never counted as a reason to
+      // keep ANAS's monitor.
+      assert.equal(await readFile(conf, 'utf8'), STOCK)
+    })
+
+    it('the hook stays while ANOTHER pool is still pinned, and goes with the last of its own', async () => {
+      await writeFile(conf, STOCK)
+      await pinArrays([R1, R2POOL], conf)
+      await installProgramHook(undefined, conf)
+
+      await unpinArrays([R1.uuid], conf)
+      const mid = await readFile(conf, 'utf8')
+      assert.ok(!mid.includes(R1.uuid))
+      assert.ok(mid.includes(`ARRAY /dev/md/${R2POOL.name} metadata=1.2 UUID=${R2POOL.uuid}`))
+      assert.ok(mid.includes(`PROGRAM ${ANAS_MD_EVENT_HOOK}`), 'hook stays while another pool is pinned')
+
+      await unpinArrays([R2POOL.uuid], conf)
+      assert.equal(await readFile(conf, 'utf8'), STOCK)
+    })
+
+    it('an operator\'s own PROGRAM line is never touched, even by the last unpin', async () => {
+      const operatorHook = `${STOCK}PROGRAM /usr/sbin/handle-mdadm-events\n`
+      await writeFile(conf, operatorHook)
+      await pinArrays([R1], conf)
+      await unpinArrays([R1.uuid], conf)
+      assert.equal(await readFile(conf, 'utf8'), operatorHook)
+    })
+
+    it('a pinned array ANAS did not write (hand-built, AHR-shaped name) keeps the hook', async () => {
+      // Same naming convention, unknown to this pool's destroy: counting it
+      // conservatively means the monitor keeps reporting for it.
+      const handBuilt = `${STOCK}ARRAY /dev/md/handy-r1 metadata=1.2 UUID=cafe0000:00000000:00000000:00000001\n`
+      await writeFile(conf, handBuilt)
+      await pinArrays([R1], conf)
+      await installProgramHook(undefined, conf)
+      await unpinArrays([R1.uuid], conf)
+      const out = await readFile(conf, 'utf8')
+      assert.ok(out.includes(`PROGRAM ${ANAS_MD_EVENT_HOOK}`))
+      assert.ok(!out.includes(R1.uuid))
+    })
+  })
+
   it('installProgramHook appends the PROGRAM line and is idempotent', async () => {
     await writeFile(conf, STOCK)
     await installProgramHook(undefined, conf)

@@ -272,11 +272,13 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
     assert.ok(!fstab.includes('/dev/t2/t2-vol'))
     assert.ok(fstab.includes('UUID=abc / ext4'))
 
-    // mdadm.conf: our ARRAY unpinned; foreign ARRAY, PROGRAM, comment survive.
+    // mdadm.conf: our ARRAY unpinned, and because it was the last AHR-shaped
+    // pin, ANAS's own PROGRAM hook retires with it (cr.31b). The foreign
+    // ARRAY — which never was ANAS's — and the hand comment survive.
     const conf = await readFile(confPath, 'utf8')
     assert.ok(!conf.includes(UUID_T2))
     assert.ok(conf.includes(UUID_FOREIGN))
-    assert.ok(conf.includes('PROGRAM /usr/local/bin/anas-md-event'))
+    assert.ok(!conf.includes('PROGRAM /usr/local/bin/anas-md-event'))
     assert.ok(conf.includes('hand comment survives'))
   })
 
@@ -976,6 +978,33 @@ describe('destroyAhrPool — the LVM teardown gate (H6)', () => {
     for (const never of ['/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove'])
       assert.ok(!executor.calls.some(c => c.command === never), `${never} must not run on an unprovable VG`)
     assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
+  })
+
+  /**
+   * cr.31b (fail closed): an unreadable `lvs` was read as "no LVs", and the
+   * teardown went on — `vgremove -y` then removed the LVs itself, skipping the
+   * uncache step the LV loop owns, and the job claimed a teardown it never
+   * performed. Now the failing read stops the destroy before any act.
+   */
+  it('an unreadable `lvs` stops the destroy before any act (fail closed, cr.31b)', async () => {
+    const executor = world()
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', [{ vg_name: 't2', pv_count: '1', lv_count: '1', vg_size: String(2 * GIB), vg_free: '0' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', [{ pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: '', stderr: '  Can\'t get production state for volume group "t2"', exitCode: 5 } })
+    // Every act WOULD succeed — the only thing standing between the job and
+    // the teardown is the failed read.
+    for (const command of ['/usr/bin/umount', '/usr/sbin/lvconvert', '/usr/sbin/lvremove', '/usr/sbin/vgreduce', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/mdadm', '/usr/sbin/update-initramfs'])
+      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    await assert.rejects(
+      destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
+      /cannot read LVM logical volumes before destroying 't2' \(lvs: Can't get production state for volume group "t2"\) — stopping before any change/,
+    )
+    // Nothing but reads ran: no umount, no daemon-reload, no LVM/md/disk act.
+    assert.deepEqual(acts(executor), [])
+    assert.ok(!progress.some(p => /Unmounting|Removing \/etc\/fstab/.test(p)), progress.join(' | '))
+    assert.equal(await readFile(fstabPath, 'utf8'), FSTAB_SEED, 'fstab byte-identical')
+    assert.equal(await readFile(confPath, 'utf8'), CONF_SEED, 'mdadm.conf byte-identical')
   })
 
   it('a cached pool\'s PROVEN cache slice passes the gate, and the cached teardown still runs in order', async () => {
