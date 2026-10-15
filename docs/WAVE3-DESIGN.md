@@ -502,7 +502,7 @@ on every path) [C]; a daemon test per route pins "no code ⇒ 409 for every comb
 flags", so a later change that makes one of them conditional fails CI before the UI can act on a
 re-challenge. The window treats any answer other than a 409 with a code as an error shown in the window
 (OK stays disabled). The generic piece lives in `confirmWindow` (`10-api.js:337-374`): an `extraItems`
-entry carries `bind: { query: 'cleanup' }` (or `body`), and `mapConfirm` is no longer used for bound
+entry carries `confirmBind: { query: 'cleanup' }` (built as `confirmBind`, cr.44: `bind` is ExtJS's own ViewModel config) (or `body`), and `mapConfirm` is no longer used for bound
 options.
 
 Flows where the flag decides **whether** a confirm is needed (`force` on create and import) already send it

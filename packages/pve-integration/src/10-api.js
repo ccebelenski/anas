@@ -398,7 +398,13 @@
         var retry = shallowCopy(opts);
         retry.confirmCode = err.confirmCode;
         extra = extra || {};
-        if (extra.pathSuffix) { retry.path = opts.path + extra.pathSuffix; }
+        if (extra.pathSuffix) {
+            // A path that already carries a query (a bound option, cr.44)
+            // takes the suffix's parameters after `&`, never a second `?`.
+            var suffix = extra.pathSuffix;
+            if (suffix.charAt(0) === '?' && opts.path.indexOf('?') >= 0) { suffix = '&' + suffix.slice(1); }
+            retry.path = opts.path + suffix;
+        }
         if (extra.bodyPatch) {
             var body = shallowCopy(opts.body || {});
             var pk;

@@ -15445,6 +15445,26 @@ async function confirmBindChecks() {
   await settle()
   eq('unbound: mapConfirm still folds its flag into the resend', h.sent[1], { method: 'DELETE', path: '/iscsi/targets/t/luns/0?destroyBacking=true', body: undefined, confirmCode: 'C1' })
 
+  // A path that already carries a query takes the mapConfirm suffix after `&`.
+  created.windows.length = 0
+  h = loadConfirmApi((req) => {
+    if (req.confirmCode) { return Promise.resolve({ job: { id: 'job-1' } }) }
+    return Promise.reject(challenge409('C1', ['Unmapping LUN 0.']))
+  })
+  h.A.confirmAndRun({
+    node: 'pve',
+    method: 'del',
+    path: '/iscsi/targets/t/luns/0?x=1',
+    confirmWindow: true,
+    extraItems: [{ xtype: 'checkbox', itemId: 'destroyBacking', checked: true }],
+    mapConfirm: w => (w.down('#destroyBacking').getValue() ? { pathSuffix: '?destroyBacking=true' } : {}),
+  })
+  await settle()
+  const qw = openWindow()
+  qw.down('#anasConfirmOkBtn').handler(qw.down('#anasConfirmOkBtn'))
+  await settle()
+  eq('unbound: a suffix after an existing query joins with &', h.sent[1] && h.sent[1].path, '/iscsi/targets/t/luns/0?x=1&destroyBacking=true')
+
   // ---- 7. The three flows declare their option bound ------------------------
   /** Run a flow's OWN recorded cfg through the real helper; return its first request. */
   async function firstRequestOf(cfg) {
