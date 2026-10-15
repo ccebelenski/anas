@@ -3,18 +3,16 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { Advisory, Gate, GuardReads, GuardSpec, Refusal } from '../safety/guard.js'
+import type { Advisory, Gate, GuardReads, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { AhrLayoutDisk } from '../services/ahr-layout.js'
-import type { MirrorReconcileRefusal } from '../services/ahr-mirror-reconcile.js'
-import type { ParityRewriteRefusal } from '../services/ahr-parity-rewrite.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { relative, resolve as resolvePath } from 'node:path'
 import { AhrCreateRequest, AhrMirrorReconcileRequest, AhrMountpointRequest, AhrParityRewriteRequest, AhrRepairRequest, isComposableDisk, PoolName } from '@anas/shared'
+import { currentLane } from '../executor/deadline.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
 import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
-import { confirmGate } from '../safety/gate.js'
 import { ahrnameClaim, diskClaim, guardCheck, guardConfirm, guarded, mountClaim, sendRefusal } from '../safety/guard.js'
 import { changeAhrMountpoint, createAhrPool, remountAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
@@ -28,7 +26,7 @@ import { ahrLvPath } from '../services/ahr-paths.js'
 import { repairAhrFiles } from '../services/ahr-repair.js'
 import { attributeScrub, pathExists, runningAhrCheck, scrubAhrPool } from '../services/ahr-scrub.js'
 import { topLevelMountPath } from '../services/ahr-snapshots.js'
-import { AHR_FINDMNT_ARGS, readAhrPools } from '../services/ahr-topology.js'
+import { AHR_FINDMNT_ARGS } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
 import { createIscsiClaimCache, heldByLun } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
@@ -54,6 +52,10 @@ export const AHR_CREATE_PRESENTATION_ONLY: Record<string, string> = {}
 export const AHR_MOUNTPOINT_PRESENTATION_ONLY: Record<string, string> = {}
 export const AHR_REMOUNT_PRESENTATION_ONLY: Record<string, string> = {}
 export const AHR_DESTROY_PRESENTATION_ONLY: Record<string, string> = {}
+/** cr.38 session B: the long verbs' confirms sign their whole request too. */
+export const AHR_REPAIR_PRESENTATION_ONLY: Record<string, string> = {}
+export const AHR_PARITY_REWRITE_PRESENTATION_ONLY: Record<string, string> = {}
+export const AHR_MIRROR_RECONCILE_PRESENTATION_ONLY: Record<string, string> = {}
 
 // The LUN-held helpers live in ./ahr-guard.ts since cr.38 (the guard's LUN
 // gate is their caller too); re-exported so existing importers keep working.
@@ -428,12 +430,14 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
    * "nothing in flight" — the engine's own gates (`sync_action` not idle) are
    * the backstop, and no shadow state is introduced to paper over it.
    */
-  function conflictingAhrJob(name: string, exceptJobId?: string): { operation: string, id: string } | null {
-    const job = jobQueue.findActive(REPAIR_EXCLUSIVE_OPERATIONS, name)
-    // `exceptJobId` is the caller's OWN job: the parity rewrite re-asks this
-    // question from inside its handler, and a run that counts itself as a
-    // conflicting job refuses every time.
-    return job && job.id !== exceptJobId ? { operation: job.operation, id: job.id } : null
+  function conflictingAhrJob(name: string, selfJobId?: string): { operation: string, id: string } | null {
+    // `selfJobId` is the caller's OWN job (cr.38: the gate re-runs inside the
+    // job): only a job submitted BEFORE it counts. A run that counted itself
+    // would refuse every time, and one that counted a newer job — submitted
+    // after it passed its route, through the same race — would refuse a run
+    // the newer job's own re-check is about to refuse.
+    const job = jobQueue.findActive(REPAIR_EXCLUSIVE_OPERATIONS, name, 'name', undefined, selfJobId ? { before: selfJobId } : {})
+    return job ? { operation: job.operation, id: job.id } : null
   }
 
   /** Parse + validate a pool-name param, or 400 and return null. */
@@ -997,7 +1001,74 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     return { job }
   })
 
+  // -------------------------------------------------------------------------
+  // The long verbs' shared gates (story cr.38 session B, WAVE3-DESIGN §2.3
+  // rows "scrub", "repair", "parity rewrite / mirror reconcile"; ruling (j)).
+  // Each is ONE function the route runs and the job runs again — when it
+  // starts, and (parity rewrite, mirror reconcile) before every md act.
+  // -------------------------------------------------------------------------
+
+  /**
+   * The in-process half of the four verbs' mutual exclusion, as a gate. At the
+   * route every family job in flight on the pool refuses (as it always did);
+   * in the job only one submitted BEFORE it does: a job never counts itself,
+   * and two requests that both passed the route before either was submitted
+   * do not refuse each other — the older runs, the newer is refused by its own
+   * re-check.
+   */
+  function familyConflictGate(sentence: (active: { operation: string, id: string }) => string, reason?: string): Gate<AhrPool> {
+    return async (pool) => {
+      const active = conflictingAhrJob(pool.name, currentLane().jobId)
+      return active ? { status: 409, code: 'CONFLICT', ...(reason ? { reason } : {}), message: sentence(active) } : null
+    }
+  }
+
+  /** The node-wide half (N10): an md check no ANAS job of this daemon issued. */
+  function foreignCheckGate(reason?: string): Gate<AhrPool> {
+    return async (_pool, reads) => {
+      const foreign = await runningAhrCheck(executor, await guard.reads.pools(reads))
+      return foreign ? { status: 409, code: 'CONFLICT', ...(reason ? { reason } : {}), message: runningAhrCheckMessage(foreign.label) } : null
+    }
+  }
+
+  /** The pool-state roll-up the three writing verbs refuse on (`REPAIR_REFUSED_STATES`). */
+  function refusedStateGate(tail: string, reason?: string): Gate<AhrPool> {
+    return async (pool) => {
+      const stateRefusal = REPAIR_REFUSED_STATES[pool.state]
+      return stateRefusal ? { status: 409, code: 'CONFLICT', ...(reason ? { reason } : {}), message: `AHR pool '${pool.name}' ${stateRefusal}. ${tail}` } : null
+    }
+  }
+
+  /**
+   * A band verb's object (parity rewrite, mirror reconcile): the pool bound
+   * to its identity PLUS the band's own md array UUID (§3.3 "AHR band"), so a
+   * code minted for band r1 of this pool is no code for a band r1 that is
+   * another array, and a job that waited finds the array it was confirmed for
+   * or refuses IDENTITY_MISMATCH.
+   */
+  function bandView(name: string, band: number, noun: string): ObjectView<AhrPool> {
+    const base = guard.poolView(name, noun)
+    return {
+      ...base,
+      id: async (pool, reads) => {
+        const id = await base.id(pool, reads)
+        const array = pool.arrays.find(a => a.band === band)
+        return id && array ? { ...id, band: array.uuid ?? `unknown:${band}` } : null
+      },
+      unbound: part => part === 'id' ? `Could not read the identity of band r${band} of AHR pool '${name}' — refusing ${noun} that cannot be bound to it` : base.unbound(part),
+    }
+  }
+
   // --- POST /ahr/:name/scrub — btrfs scrub then md checks (no confirm) --------
+  //
+  // Story cr.38 session B (§2.3 "scrub": the job re-ran neither the job
+  // conflict nor the node-wide check). One gate list at both doors; the job
+  // holds the pool's key SHARED (§4.2) for the whole run — never given back
+  // around its polls: the scrub job IS the driver of each band's check and of
+  // the btrfs pass, and the verbs a shared key keeps out (mountpoint, remount,
+  // rollback, destroy, an expansion step) are exactly the ones that must not
+  // cycle or reshape the pool under it. The long lane leaves a slot for short
+  // verbs.
   server.post<{ Params: { name: string } }>('/ahr/:name/scrub', async (request, reply) => {
     const name = parsePoolName(request.params.name, reply)
     if (!name)
@@ -1007,67 +1078,52 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!identity)
       return
 
-    const pools = await readAhrPools(executor)
-    const pool = pools.find(p => p.name === name)
-    if (!pool) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
+    const spec: GuardSpec<AhrPool> = {
+      operation: 'ahr.scrub',
+      object: guard.poolView(name, 'a scrub'),
+      gates: [
+        // Unreachable before busy (issue #18): a scrub reads every byte
+        // through the btrfs filesystem and then checks each band array, and an
+        // offline pool has neither — the volume is not assembled. "is offline"
+        // names the condition where "is not mounted" only describes a symptom.
+        async pool => pool.state === 'offline'
+          ? { status: 409, code: 'CONFLICT', message: `AHR pool '${pool.name}' is offline: the volume is not assembled, so there is nothing to scrub. See the Hybrid RAID view for which band arrays cannot start` }
+          : null,
+        // Never concurrent (§4): a scrub and a resync/reshape are all
+        // full-device passes — refuse while one is already running.
+        async pool => (pool.state === 'scrubbing' || pool.state === 'building' || pool.state === 'rebuilding' || pool.state === 'expanding')
+          ? { status: 409, code: 'CONFLICT', message: `AHR pool '${pool.name}' is ${pool.state}: a scrub would thrash the running operation. Wait for it to finish` }
+          : null,
+        async pool => pool.mountpoint.startsWith('/dev/')
+          ? { status: 409, code: 'CONFLICT', message: `AHR pool '${pool.name}' is not mounted: btrfs scrub needs the filesystem online` }
+          : null,
+        // The other half of the selfheal.6 pair: a scrub cannot start
+        // mid-repair — the engine has md's knobs turned aside for the duration
+        // of each block and a check would re-read every stripe underneath it —
+        // and it cannot start on top of another scrub either, which would run a
+        // second `--action=check` over the same bands (§4: never concurrent).
+        familyConflictGate(active => active.operation === 'ahr.scrub'
+          ? `a scrub is already in flight on AHR pool '${name}' (job ${active.id}). Wait for it to finish`
+          : `${EXCLUSIVE_OPERATION_NAMES[active.operation] ?? 'another job'} job is in flight on AHR pool '${name}' (job ${active.id}). Wait for it to finish`),
+        // Both refusals above are IN-PROCESS: the pool state a topology read
+        // reports, and the job queue's own record. Neither survives a daemon
+        // restart — md's check on band r1 keeps running while the job that
+        // issued it is gone (S6). /proc/mdstat still knows, so it is read once
+        // and matched against EVERY AHR band on the node: another pool's bands
+        // are very often the same disks.
+        foreignCheckGate(),
+      ],
+      locks: async (pool, bound) => guard.claims(pool, bound, 'shared'),
     }
-    // Unreachable before busy (issue #18): a scrub reads every byte through the
-    // btrfs filesystem and then checks each band array, and an offline pool has
-    // neither — the volume is not assembled. This gate predates the `offline`
-    // state, so an unassembled pool used to arrive here reading `degraded` and
-    // pass; the mount check below would usually stop it, but a lingering mount
-    // entry is not a guarantee, and "is offline" names the condition where
-    // "is not mounted" only describes a symptom.
-    if (pool.state === 'offline') {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is offline: the volume is not assembled, so there is nothing to scrub. See the Hybrid RAID view for which band arrays cannot start` } }
-    }
-    // Never concurrent (§4): a scrub and a resync/reshape are all full-device
-    // passes — refuse while one is already running.
-    if (pool.state === 'scrubbing' || pool.state === 'building' || pool.state === 'rebuilding' || pool.state === 'expanding') {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is ${pool.state}: a scrub would thrash the running operation. Wait for it to finish` } }
-    }
-    if (pool.mountpoint.startsWith('/dev/')) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is not mounted: btrfs scrub needs the filesystem online` } }
-    }
-    // The other half of the selfheal.6 pair: a scrub cannot start mid-repair —
-    // the engine has md's knobs turned aside for the duration of each block and
-    // a check would re-read every stripe underneath it — and it cannot start on
-    // top of another scrub either, which would run a second `--action=check`
-    // over the same bands (§4: never concurrent).
-    const scrubBlocker = conflictingAhrJob(name)
-    if (scrubBlocker) {
-      reply.code(409)
-      return {
-        error: {
-          code: 'CONFLICT',
-          message: scrubBlocker.operation === 'ahr.scrub'
-            ? `a scrub is already in flight on AHR pool '${name}' (job ${scrubBlocker.id}). Wait for it to finish`
-            : `${EXCLUSIVE_OPERATION_NAMES[scrubBlocker.operation] ?? 'another job'} job is in flight on AHR pool '${name}' (job ${scrubBlocker.id}). Wait for it to finish`,
-        },
-      }
-    }
-    // Both refusals above are IN-PROCESS: the pool state a topology read
-    // reports, and the job queue's own record. Neither survives a daemon
-    // restart — md's check on band r1 keeps running while the job that issued
-    // it is gone (S6). A new scrub would then issue checks on bands sharing
-    // spindles with it, which is exactly what §4 forbids. /proc/mdstat still
-    // knows, so it is read once and matched against EVERY AHR band on the
-    // node: another pool's bands are very often the same disks.
-    const foreignCheck = await runningAhrCheck(executor, pools)
-    if (foreignCheck) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: runningAhrCheckMessage(foreignCheck.label) } }
-    }
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'ahr.scrub',
       { ...identity, params: { name } },
-      async updateProgress => scrubAhrPool(executor, pool, updateProgress, { pollIntervalMs: opts.scrubPollIntervalMs }),
+      guarded(spec, pre, async (live, ctx) => scrubAhrPool(executor, live, ctx.updateProgress, { pollIntervalMs: opts.scrubPollIntervalMs })),
+      { locks: pre.locks, lane: 'long' },
     )
     reply.code(202)
     return { job }
@@ -1079,6 +1135,15 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
   // the operator picked out of a scrub's findings — because this writes through
   // md, and what it writes over is named by the caller and nobody else. Never
   // automatic, never a read-path heal: those two boundaries are the epic's.
+  //
+  // Story cr.38 session B (§2.3 "repair": the job re-ran none of the job
+  // conflict, the running check, the path confinement or the LUN session).
+  // The object is the pool PLUS the request's files resolved against it now
+  // (`confineRepairFiles`); one gate list at both doors; the confirm signs the
+  // request and binds the canonical selection as the revision, so a path that
+  // resolves elsewhere by the time the job runs (a symlink swapped in) fails
+  // STATE_CHANGED and nothing is written. The pool's key is held shared for
+  // the run (§4.2 "repair block").
   server.post<{ Params: { name: string } }>('/ahr/:name/repair', async (request, reply) => {
     const name = parsePoolName(request.params.name, reply)
     if (!name)
@@ -1089,130 +1154,86 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid repair request: ${parsed.error.issues[0]?.message}. Repair takes absolute paths under the pool's mountpoint, each with at least one 4 KiB block. Findings inside a snapshot (@snapshots/…) are filesystem-relative and cannot be repaired` } }
     }
+    const requested = parsed.data.files
 
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
 
-    const pools = await readAhrPools(executor)
-    const pool = pools.find(p => p.name === name)
-    if (!pool) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
+    type RepairObject = AhrPool & { repair: { files: AhrRepairFile[] } | { refusal: Refusal } | null }
+    const view = guard.poolView(name, 'a repair')
+    const spec: GuardSpec<RepairObject> = {
+      operation: 'ahr.repair',
+      object: {
+        ...view,
+        read: async (reads) => {
+          const pool = await view.read(reads)
+          if (!pool)
+            return null
+          const mounted = pool.mounted && !pool.mountpoint.startsWith('/dev/')
+          return { ...pool, repair: mounted ? await confineRepairFiles(pool, requested) : null }
+        },
+        revision: async o => o.repair && 'files' in o.repair ? JSON.stringify(o.repair.files) : null,
+        unbound: part => part === 'revision'
+          ? `Could not resolve the files of this repair on AHR pool '${name}' — refusing a repair that cannot be bound to them`
+          : view.unbound(part),
+      },
+      gates: [
+        async pool => (!pool.mounted || pool.mountpoint.startsWith('/dev/'))
+          ? { status: 409, code: 'CONFLICT', message: `AHR pool '${pool.name}' is not mounted: a repair resolves the block through the live filesystem` }
+          : null,
+        // Hard refusals, all of them BEFORE a confirm code is minted
+        // (Principle 14, "unsafe now" has no bypass).
+        refusedStateGate('Repair when the pool is healthy and idle'),
+        familyConflictGate(active => `${active.operation === 'ahr.repair' ? 'another repair' : EXCLUSIVE_OPERATION_NAMES[active.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${active.id}). Wait for it to finish`),
+        // The node-wide half of the same exclusion (N10): a check from a
+        // previous daemon, or one mdcheck's timer started, survives the job
+        // queue's memory.
+        foreignCheckGate(),
+        // A backup (or any snapshot verb) holding the pool's on-demand
+        // top-level mount is the same refusal the engine makes at its gates —
+        // said here, at the door, rather than after the operator confirmed.
+        async (pool) => {
+          if (!pool.subvolLayout)
+            return null
+          const top = topLevelMountPath(pool)
+          return (await executor.exec(FINDMNT, ['--mountpoint', top])).exitCode === 0
+            ? { status: 409, code: 'CONFLICT', message: `the top-level mount for AHR pool '${pool.name}' is already held at ${top}. A backup or snapshot job is in flight, and the repair needs that mount to take its own read-only snapshot. Retry when the other job has finished` }
+            : null
+        },
+        // Confinement (D12): every path a live file under the pool's tree,
+        // resolved on the filesystem, on the pool's own LV.
+        async pool => pool.repair && 'refusal' in pool.repair ? pool.repair.refusal : null,
+        // LUN awareness (seventh pass, F10): a file that backs a LUN with a
+        // LIVE initiator session is refused — in the same tier as every other
+        // "unsafe now". ONE claims read per run, shared across every file.
+        async (pool) => {
+          if (!pool.repair || !('files' in pool.repair))
+            return null
+          const claims = createIscsiClaimCache(executor, iscsiPaths)
+          for (const file of pool.repair.files) {
+            const held = await heldByLun(claims, { path: file.path })
+            if (held && held.connectedInitiators.length > 0) {
+              const { error } = lunSessionRefusal(file.path, held)
+              return { status: 409, code: 'CONFLICT', reason: error.reason, message: error.message }
+            }
+          }
+          return null
+        },
+      ],
+      locks: async (pool, bound) => guard.claims(pool, bound, 'shared'),
     }
-    if (!pool.mounted || pool.mountpoint.startsWith('/dev/')) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is not mounted: a repair resolves the block through the live filesystem` } }
-    }
-
-    // Hard refusals, all of them BEFORE a confirm code is minted (Principle 14,
-    // "unsafe now" has no bypass).
-    const stateRefusal = REPAIR_REFUSED_STATES[pool.state]
-    if (stateRefusal) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' ${stateRefusal}. Repair when the pool is healthy and idle` } }
-    }
-    const blocker = conflictingAhrJob(name)
-    if (blocker) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `${blocker.operation === 'ahr.repair' ? 'another repair' : EXCLUSIVE_OPERATION_NAMES[blocker.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${blocker.id}). Wait for it to finish` } }
-    }
-    // The node-wide half of the same exclusion (N10): a check from a previous
-    // daemon, or one mdcheck's timer started, survives the job queue's memory.
-    const repairForeignCheck = await runningAhrCheck(executor, pools)
-    if (repairForeignCheck) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: runningAhrCheckMessage(repairForeignCheck.label) } }
-    }
-    // A backup (or any snapshot verb) holding the pool's on-demand top-level
-    // mount is the same refusal the engine makes at its gates — said here, at
-    // the door, rather than after the operator has confirmed.
-    if (pool.subvolLayout) {
-      const top = topLevelMountPath(pool)
-      if ((await executor.exec(FINDMNT, ['--mountpoint', top])).exitCode === 0) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', message: `the top-level mount for AHR pool '${name}' is already held at ${top}. A backup or snapshot job is in flight, and the repair needs that mount to take its own read-only snapshot. Retry when the other job has finished` } }
-      }
-    }
-
-    // Every path must be a live file under the pool's mountpoint. The two ways
-    // a scrub finding fails that are exactly the two flags it carries:
-    // `outsideMount` (a corrupt block inside `@snapshots/…` — real, expected,
-    // and not reachable through the mounted tree) and `missing` (deleted since
-    // the scrub). Both are refused by name, never quietly skipped.
-    //
-    // Confinement is NOT lexical only (design review 2026-09-14, D12): the
-    // string check below is followed by `realpath -e` (a symlink inside the
-    // tree passes the string test while pointing somewhere else), the
-    // containment check re-run on the canonical form, and a findmnt check that
-    // the path's filesystem is the pool's OWN LV (a bind mount laid over part
-    // of the tree fails the string test no better than it fails this one).
-    const lexicalRoot = resolvePath(pool.mountpoint)
-    const root = await repairRealPath(executor, lexicalRoot)
-    if (!root) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `the mountpoint '${pool.mountpoint}' of AHR pool '${name}' could not be resolved on the filesystem. Refusing to repair against an unresolvable root` } }
-    }
-    const lvDevice = await repairRealPath(executor, ahrLvPath(pool.name))
-    if (!lvDevice) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `the LV device '${ahrLvPath(pool.name)}' of AHR pool '${name}' could not be resolved. Refusing to repair against an unresolvable pool device` } }
-    }
-    const files: AhrRepairFile[] = []
-    for (const file of parsed.data.files) {
-      const abs = resolvePath(file.path)
-      if (abs === lexicalRoot || relative(lexicalRoot, abs).startsWith('..')) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `'${file.path}' is not a file under '${pool.mountpoint}'. Repair works on the live @data tree only. A finding outside the mounted tree (a snapshot) cannot be repaired` } }
-      }
-      if (!(await pathExists(executor, abs))) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', message: `'${file.path}' does not exist. The file was deleted since the scrub named it, and there is nothing to repair` } }
-      }
-      const real = await repairRealPath(executor, abs)
-      if (!real || real === root || relative(root, real).startsWith('..')) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: real
-          ? `'${file.path}' resolves to '${real}', which is not a file under '${pool.mountpoint}'. Repair works on the live @data tree only`
-          : `'${file.path}' could not be resolved on the filesystem (realpath -e failed). A repair path must be a real file under '${pool.mountpoint}'` } }
-      }
-      const source = await repairMountSource(executor, real)
-      const sourceReal = source ? await repairRealPath(executor, source) : null
-      if (!source || !sourceReal) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `the filesystem holding '${file.path}' could not be determined (findmnt failed). A repair is refused until the path's filesystem can be confirmed as the pool's own` } }
-      }
-      if (sourceReal !== lvDevice) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `'${file.path}' sits on ${sourceReal}, not on AHR pool '${name}'s own device (${lvDevice}). A mount inside the pool's tree is not pool data` } }
-      }
-      // One attempt per block, in ascending order: the same block twice would
-      // run the whole sequence twice and the second pass would abort on its own
-      // repair ("not corrupt here").
-      const unique = [...new Set(file.blocks)]
-      unique.sort((a, b) => a - b)
-      files.push({ path: real, blocks: unique, ...(file.inode !== undefined ? { inode: file.inode } : {}) })
-    }
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const pool = pre.object
+    const files = (pool.repair as { files: AhrRepairFile[] }).files
     const blocks = files.reduce((n, f) => n + f.blocks.length, 0)
 
-    // LUN awareness, UP FRONT (seventh pass, F10). `heldByLunOnce` was already
-    // called by the repair JOB, but only after the fact, to word the advice on
-    // a block that could not be repaired. A file that backs a LUN with a LIVE
-    // initiator session is refused here instead — before a confirm code is
-    // minted, in the same tier as every other "unsafe now" (Principle 14).
-    // ONE claims read for the whole request, shared across every file.
-    const repairClaims = createIscsiClaimCache(executor, iscsiPaths)
-    for (const file of files) {
-      const held = await heldByLun(repairClaims, { path: file.path })
-      if (held && held.connectedInitiators.length > 0) {
-        reply.code(409)
-        return lunSessionRefusal(file.path, held)
-      }
-    }
-
     // Confirm gate: what actually happens to the array, in the operator's terms.
-    // The signature carries the exact selection, so a confirm code cannot be
-    // replayed against a different set of files or blocks.
+    // The signature carries the exact selection (and the canonical form is
+    // bound as the revision), so a confirm code cannot be replayed against a
+    // different set of files or blocks — the files ADDRESS the repair.
     //
     // The per-block cost is stated CONCRETELY (design review 2026-09-14, D13):
     // the engine drops the node's page cache twice per block (probe + cold
@@ -1221,9 +1242,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // floor (17) for the whole run — on a busy node all of that is felt.
     const sweepMiB = await perBlockSweepMiB(executor, pool)
     const striped = pool.arrays.some(a => a.level !== 'raid1')
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'ahr.repair',
-      params: { name, files },
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { name, files: requested },
+      address: ['name', 'files'],
+      presentationOnly: AHR_REPAIR_PRESENTATION_ONLY,
       message: `Repairing ${blocks} block(s) in ${files.length} file(s) on AHR pool '${name}' writes reconstructed data through md`,
       warnings: [
         'A read-only snapshot of the file\'s subvolume is taken for the duration and removed afterwards',
@@ -1240,11 +1262,98 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const job = jobQueue.submit(
       'ahr.repair',
       { ...identity, params: { name, files: files.map(f => f.path), blocks } },
-      async updateProgress => repairAhrFiles(executor, pool, files, updateProgress),
+      guarded(spec, pre, async (live, ctx) => repairAhrFiles(executor, live, (live.repair as { files: AhrRepairFile[] }).files, ctx.updateProgress)),
+      { locks: pre.locks, lane: 'long' },
     )
     reply.code(202)
     return { job }
   })
+
+  /**
+   * The repair's path confinement (design review 2026-09-14, D12), ONE
+   * function for both doors (cr.38): every requested path must be a live file
+   * under the pool's mountpoint, resolved on the filesystem (`realpath -e` —
+   * a symlink inside the tree passes the string test while pointing somewhere
+   * else), contained on the canonical form, on the pool's OWN LV (a bind mount
+   * laid over part of the tree is not pool data). The two ways a scrub finding
+   * fails that are exactly the two flags it carries: `outsideMount` (a block
+   * inside `@snapshots/…`) and `missing` (deleted since the scrub) — both
+   * refused by name, never quietly skipped. Answers the canonical selection,
+   * each file's blocks deduplicated and ascending (the same block twice would
+   * run the whole sequence twice), or the refusal.
+   */
+  async function confineRepairFiles(pool: AhrPool, requested: AhrRepairFile[]): Promise<{ files: AhrRepairFile[] } | { refusal: Refusal }> {
+    const name = pool.name
+    const lexicalRoot = resolvePath(pool.mountpoint)
+    const root = await repairRealPath(executor, lexicalRoot)
+    if (!root)
+      return { refusal: { status: 409, code: 'CONFLICT', message: `the mountpoint '${pool.mountpoint}' of AHR pool '${name}' could not be resolved on the filesystem. Refusing to repair against an unresolvable root` } }
+    const lvDevice = await repairRealPath(executor, ahrLvPath(pool.name))
+    if (!lvDevice)
+      return { refusal: { status: 409, code: 'CONFLICT', message: `the LV device '${ahrLvPath(pool.name)}' of AHR pool '${name}' could not be resolved. Refusing to repair against an unresolvable pool device` } }
+    const files: AhrRepairFile[] = []
+    for (const file of requested) {
+      const abs = resolvePath(file.path)
+      if (abs === lexicalRoot || relative(lexicalRoot, abs).startsWith('..'))
+        return { refusal: { status: 400, code: 'VALIDATION_ERROR', message: `'${file.path}' is not a file under '${pool.mountpoint}'. Repair works on the live @data tree only. A finding outside the mounted tree (a snapshot) cannot be repaired` } }
+      if (!(await pathExists(executor, abs)))
+        return { refusal: { status: 409, code: 'CONFLICT', message: `'${file.path}' does not exist. The file was deleted since the scrub named it, and there is nothing to repair` } }
+      const real = await repairRealPath(executor, abs)
+      if (!real || real === root || relative(root, real).startsWith('..')) {
+        return { refusal: { status: 400, code: 'VALIDATION_ERROR', message: real
+          ? `'${file.path}' resolves to '${real}', which is not a file under '${pool.mountpoint}'. Repair works on the live @data tree only`
+          : `'${file.path}' could not be resolved on the filesystem (realpath -e failed). A repair path must be a real file under '${pool.mountpoint}'` } }
+      }
+      const source = await repairMountSource(executor, real)
+      const sourceReal = source ? await repairRealPath(executor, source) : null
+      if (!source || !sourceReal)
+        return { refusal: { status: 400, code: 'VALIDATION_ERROR', message: `the filesystem holding '${file.path}' could not be determined (findmnt failed). A repair is refused until the path's filesystem can be confirmed as the pool's own` } }
+      if (sourceReal !== lvDevice)
+        return { refusal: { status: 400, code: 'VALIDATION_ERROR', message: `'${file.path}' sits on ${sourceReal}, not on AHR pool '${name}'s own device (${lvDevice}). A mount inside the pool's tree is not pool data` } }
+      const unique = [...new Set(file.blocks)]
+      unique.sort((a, b) => a - b)
+      files.push({ path: real, blocks: unique, ...(file.inode !== undefined ? { inode: file.inode } : {}) })
+    }
+    return { files }
+  }
+
+  /**
+   * The band verbs' common gates (cr.38 session B), in the order the routes
+   * have always refused in: the band exists (400, a request about a band the
+   * pool does not have), the pool mounted, the proof (evidence), the state
+   * roll-up, the in-process exclusion, the node-wide check, the band's own md
+   * state read from md rather than from the pool rollup. Every one of them is
+   * re-run when the job starts and again before every md act (§3.2: "parity
+   * rewrite's … is this pattern; it becomes the helper's call").
+   */
+  function bandGates(args: {
+    band: number
+    evidence: () => { ok: true } | { ok: false, code: string, reason: string }
+    mountedSentence: string
+    stateTail: string
+    conflictSentence: (active: { operation: string, id: string }) => string
+    bandRefusal: (pool: AhrPool) => Promise<{ reason: string, code: string } | null>
+  }): Gate<AhrPool>[] {
+    return [
+      async pool => pool.arrays.some(a => a.band === args.band)
+        ? null
+        : { status: 400, code: 'VALIDATION_ERROR', message: `AHR pool '${pool.name}' has no band r${args.band}: its bands are ${pool.arrays.map(a => `r${a.band}`).join(', ') || 'none'}` },
+      async pool => (!pool.mounted || pool.mountpoint.startsWith('/dev/'))
+        ? { status: 409, code: 'CONFLICT', reason: 'pool-not-mounted', message: args.mountedSentence.replace('{pool}', pool.name) }
+        : null,
+      async () => {
+        const proof = args.evidence()
+        return proof.ok ? null : { status: 409, code: 'CONFLICT', reason: proof.code, message: proof.reason }
+      },
+      refusedStateGate(args.stateTail, 'array-busy'),
+      familyConflictGate(args.conflictSentence, 'job-active'),
+      foreignCheckGate('array-busy'),
+      async (pool) => {
+        const refusal = await args.bandRefusal(pool)
+        return refusal ? { status: 409, code: 'CONFLICT', reason: refusal.code, message: refusal.reason } : null
+      },
+    ]
+  }
 
   // --- POST /ahr/:name/parity-rewrite — rewrite one band's parity (confirm) --
   //
@@ -1254,6 +1363,11 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
   // preconditions below are that proof, taken here and taken AGAIN inside the
   // job immediately before the md write — a band that lost a member in between
   // is a band this must not touch.
+  //
+  // Story cr.38 session B: those preconditions are the guard's gate list
+  // (§2.3: the job never re-ran the running check or the state roll-up), the
+  // confirm binds the band's array UUID, the job holds the pool's key shared,
+  // gives it back while md repairs and checks, and re-guards before each.
   server.post<{ Params: { name: string } }>('/ahr/:name/parity-rewrite', async (request, reply) => {
     const name = parsePoolName(request.params.name, reply)
     if (!name)
@@ -1270,105 +1384,56 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!identity)
       return
 
-    const pools = await readAhrPools(executor)
-    const pool = pools.find(p => p.name === name)
-    if (!pool) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
-    }
-    const array = parityRewriteArray(pool, band)
-    if (!array) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `AHR pool '${name}' has no band r${band}: its bands are ${pool.arrays.map(a => `r${a.band}`).join(', ') || 'none'}` } }
-    }
-    if (!pool.mounted || pool.mountpoint.startsWith('/dev/')) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'pool-not-mounted', message: `AHR pool '${name}' is not mounted. The parity rewrite starts with a fresh btrfs scrub, which needs the filesystem online` } }
-    }
-
-    // Hard refusals, every one of them BEFORE a confirm code is minted
-    // (Principle 14: "unsafe now" has no bypass, and none of these is a risk
-    // the operator can accept — they are states in which the verb is wrong).
     // The proof may come from the pool's last completed SCRUB or from its last
-    // completed REPAIR, whichever is newer (seventh pass, F2): a repair that
-    // wrote a proven block and saw md still counting mismatches has measured
-    // the residual, and making the operator sit through a fresh multi-hour
-    // two-phase scrub to rediscover that number is the gap F2 names.
+    // completed REPAIR, whichever is newer (seventh pass, F2).
     const evidence = () => parityRewriteEvidence(name, [
       jobQueue.findLastCompleted('ahr.scrub', name),
       jobQueue.findLastCompleted('ahr.repair', name),
     ], band)
-    const proof = evidence()
-    if (!proof.ok) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: proof.code, message: proof.reason } }
+    const spec: GuardSpec<AhrPool> = {
+      operation: 'ahr.parity-rewrite',
+      object: bandView(name, band, 'a parity rewrite'),
+      gates: bandGates({
+        band,
+        evidence,
+        mountedSentence: `AHR pool '{pool}' is not mounted. The parity rewrite starts with a fresh btrfs scrub, which needs the filesystem online`,
+        stateTail: 'Rewrite parity when the pool is healthy and idle',
+        conflictSentence: active => `${EXCLUSIVE_OPERATION_NAMES[active.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${active.id}). A parity rewrite reads every member of a band twice. Wait for it to finish`,
+        // The band's own state, read from md rather than from the pool rollup:
+        // a pool can read `healthy` while THIS array is mid-check. A RAID1
+        // band is refused for good and not for now (N1).
+        bandRefusal: async (pool) => {
+          const array = parityRewriteArray(pool, band)!
+          try {
+            return await parityRewriteArrayRefusal(await readMdGeometry(executor, array.device))
+          }
+          catch (error) {
+            return { reason: `band r${band} of AHR pool '${name}' (${array.device}) could not be read: ${error instanceof Error ? error.message : String(error)}`, code: 'array-busy' }
+          }
+        },
+      }),
+      locks: async (pool, bound) => guard.claims(pool, bound, 'shared'),
     }
-    const stateRefusal = REPAIR_REFUSED_STATES[pool.state]
-    if (stateRefusal) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'array-busy', message: `AHR pool '${name}' ${stateRefusal}. Rewrite parity when the pool is healthy and idle` } }
-    }
-    // Set the moment the job exists, and read only from inside the handler —
-    // every call there happens in a later microtask than the assignment below,
-    // because `rewriteBandParity` awaits before it asks. A run must not count
-    // ITSELF as the job that blocks it.
-    let selfJobId: string | undefined
-    const jobConflict = () => {
-      const active = conflictingAhrJob(name, selfJobId)
-      return active
-        ? `${EXCLUSIVE_OPERATION_NAMES[active.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${active.id}). A parity rewrite reads every member of a band twice. Wait for it to finish`
-        : null
-    }
-    const conflict = jobConflict()
-    if (conflict) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'job-active', message: conflict } }
-    }
-    // The node-wide half of the same exclusion (N10): this verb hands md a
-    // whole-band `repair`, which is the last thing to issue onto a node where
-    // md is already running a check of its own.
-    const rewriteForeignCheck = await runningAhrCheck(executor, pools)
-    if (rewriteForeignCheck) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'array-busy', message: runningAhrCheckMessage(rewriteForeignCheck.label) } }
-    }
-    // The band's own state, read from md rather than from the pool rollup: a
-    // pool can read `healthy` while THIS array is mid-check, and the rewrite
-    // happens on the array. A RAID1 band is refused here for good and not for
-    // now (N1): `not-a-parity-band` never becomes true.
-    let bandRefusal: ParityRewriteRefusal | null
-    try {
-      bandRefusal = await parityRewriteArrayRefusal(await readMdGeometry(executor, array.device))
-    }
-    catch (error) {
-      bandRefusal = {
-        reason: `band r${band} of AHR pool '${name}' (${array.device}) could not be read: ${error instanceof Error ? error.message : String(error)}`,
-        code: 'array-busy',
-      }
-    }
-    if (bandRefusal) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: bandRefusal.code, message: bandRefusal.reason } }
-    }
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const pool = pre.object
+    const array = parityRewriteArray(pool, band)!
+    const proof = evidence() as { ok: true, mismatchCnt: number }
     // Is a guest's disk live on this pool (F10)? Disclosed, never refused.
     const rewriteHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool)
 
     // Confirm gate: what md is about to do, in the operator's terms. The
-    // signature carries the band, so a code minted for r1 cannot rewrite r2.
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'ahr.parity-rewrite',
-      params: { name, band },
+    // signature carries the band, and the bound identity its array UUID, so a
+    // code minted for r1 cannot rewrite r2 — or another array numbered r1.
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { name, band },
+      address: ['name', 'band'],
+      presentationOnly: AHR_PARITY_REWRITE_PRESENTATION_ONLY,
       message: `Rewriting parity on band r${band} of AHR pool '${name}' recomputes that band's parity from the data it holds now (md counted ${proof.mismatchCnt} mismatch(es) there, and the pool's last checksum scrub was clean)`,
-      // The estimate includes phase 1's full-pool checksum scrub (N8) — on a
-      // pool with real data in it that pass is usually the dominant term, and
-      // a gate that quoted only the two md passes understated the wait.
-      //
-      // The LUN disclosure (seventh pass, F10) is a WARNING here and a refusal
-      // on Repair, and the difference is what each verb writes. A rewrite reads
-      // every member of the band twice and writes parity: no guest-visible byte
-      // changes, so there is nothing for an initiator to be surprised by — but
-      // the operator is agreeing to hours of the array reading flat out under a
-      // guest's live disk, and that is theirs to weigh.
+      // The estimate includes phase 1's full-pool checksum scrub (N8). The LUN
+      // disclosure (seventh pass, F10) is a WARNING here and a refusal on
+      // Repair, and the difference is what each verb writes.
       warnings: [...parityRewriteWarnings(name, array, pool.capacity.usedBytes), ...rewriteLunWarnings(rewriteHeld)],
     })) {
       return reply
@@ -1377,15 +1442,18 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const job = jobQueue.submit(
       'ahr.parity-rewrite',
       { ...identity, params: { name, band } },
-      async updateProgress => rewriteBandParity(executor, pool, band, {
-        updateProgress,
+      guarded(spec, pre, async (live, ctx) => rewriteBandParity(executor, live, band, {
+        updateProgress: ctx.updateProgress,
         evidence,
-        jobConflict,
-        attributeFindings: async since => (await attributeScrub(executor, pool, since, updateProgress)).findings ?? [],
+        attributeFindings: async since => (await attributeScrub(executor, live, since, ctx.updateProgress)).findings ?? [],
         pollIntervalMs: opts.scrubPollIntervalMs,
-      }),
+        reguard: async () => {
+          await ctx.reguard()
+        },
+        release: ctx.release,
+      })),
+      { locks: pre.locks, lane: 'long' },
     )
-    selfJobId = job.id
     reply.code(202)
     return { job }
   })
@@ -1402,6 +1470,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
   // md's own `repair` is NOT the fallback and never will be on a mirror: it
   // copies the first in-sync leg over the other without arbitrating. The
   // service refuses to spawn it at all (`assertNoMdRepair`).
+  //
+  // Story cr.38 session B: as the parity rewrite — one gate list at both
+  // doors, the band's array UUID bound, the key shared, given back around each
+  // md check, the gates re-run before each act.
   server.post<{ Params: { name: string } }>('/ahr/:name/mirror-reconcile', async (request, reply) => {
     const name = parsePoolName(request.params.name, reply)
     if (!name)
@@ -1418,86 +1490,51 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!identity)
       return
 
-    const pools = await readAhrPools(executor)
-    const pool = pools.find(p => p.name === name)
-    if (!pool) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
-    }
-    const array = mirrorReconcileArray(pool, band)
-    if (!array) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `AHR pool '${name}' has no band r${band}: its bands are ${pool.arrays.map(a => `r${a.band}`).join(', ') || 'none'}` } }
-    }
-    if (!pool.mounted || pool.mountpoint.startsWith('/dev/')) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'pool-not-mounted', message: `AHR pool '${name}' is not mounted. Arm A is a btrfs scrub and arm B reads the checksum tree, and both need the filesystem online` } }
-    }
-
-    // Hard refusals, every one of them BEFORE a confirm code is minted
-    // (Principle 14). The proof may come from the pool's last completed SCRUB
-    // or from its last completed REPAIR, whichever is newer — the same
-    // shortcut the parity rewrite takes, and for the same reason.
+    // The proof may come from the pool's last completed SCRUB or from its last
+    // completed REPAIR, whichever is newer — the same shortcut the parity
+    // rewrite takes, and for the same reason.
     const evidence = () => mirrorReconcileEvidence(name, [
       jobQueue.findLastCompleted('ahr.scrub', name),
       jobQueue.findLastCompleted('ahr.repair', name),
     ], band)
-    const proof = evidence()
-    if (!proof.ok) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: proof.code, message: proof.reason } }
+    const spec: GuardSpec<AhrPool> = {
+      operation: 'ahr.mirror-reconcile',
+      object: bandView(name, band, 'a mirror reconcile'),
+      gates: bandGates({
+        band,
+        evidence,
+        mountedSentence: `AHR pool '{pool}' is not mounted. Arm A is a btrfs scrub and arm B reads the checksum tree, and both need the filesystem online`,
+        stateTail: 'Reconcile a mirror when the pool is healthy and idle',
+        conflictSentence: active => `${EXCLUSIVE_OPERATION_NAMES[active.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${active.id}). A mirror reconcile scrubs the pool and reads every row of both legs. Wait for it to finish`,
+        // The band's own state, read from md. A PARITY band is refused here
+        // for good and not for now — it has a verb of its own.
+        bandRefusal: async (pool) => {
+          const array = mirrorReconcileArray(pool, band)!
+          try {
+            return await mirrorReconcileArrayRefusal(await readMdGeometry(executor, array.device))
+          }
+          catch (error) {
+            return { reason: `band r${band} of AHR pool '${name}' (${array.device}) could not be read: ${error instanceof Error ? error.message : String(error)}`, code: 'array-busy' }
+          }
+        },
+      }),
+      locks: async (pool, bound) => guard.claims(pool, bound, 'shared'),
     }
-    const stateRefusal = REPAIR_REFUSED_STATES[pool.state]
-    if (stateRefusal) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'array-busy', message: `AHR pool '${name}' ${stateRefusal}. Reconcile a mirror when the pool is healthy and idle` } }
-    }
-    // Set the moment the job exists, and read only from inside the handler —
-    // a run must not count ITSELF as the job that blocks it.
-    let selfMirrorJobId: string | undefined
-    const jobConflict = () => {
-      const active = conflictingAhrJob(name, selfMirrorJobId)
-      return active
-        ? `${EXCLUSIVE_OPERATION_NAMES[active.operation] ?? 'another job'} is in flight on AHR pool '${name}' (job ${active.id}). A mirror reconcile scrubs the pool and reads every row of both legs. Wait for it to finish`
-        : null
-    }
-    const conflict = jobConflict()
-    if (conflict) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'job-active', message: conflict } }
-    }
-    // The node-wide half of the same exclusion (N10): this verb issues its own
-    // whole-band checks, and md runs one sync thread per array.
-    const mirrorForeignCheck = await runningAhrCheck(executor, pools)
-    if (mirrorForeignCheck) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'array-busy', message: runningAhrCheckMessage(mirrorForeignCheck.label) } }
-    }
-    // The band's own state, read from md rather than from the pool rollup. A
-    // PARITY band is refused here for good and not for now
-    // (`not-a-mirror-band` never becomes true) — it has a verb of its own.
-    let mirrorRefusal: MirrorReconcileRefusal | null
-    try {
-      mirrorRefusal = await mirrorReconcileArrayRefusal(await readMdGeometry(executor, array.device))
-    }
-    catch (error) {
-      mirrorRefusal = {
-        reason: `band r${band} of AHR pool '${name}' (${array.device}) could not be read: ${error instanceof Error ? error.message : String(error)}`,
-        code: 'array-busy',
-      }
-    }
-    if (mirrorRefusal) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: mirrorRefusal.code, message: mirrorRefusal.reason } }
-    }
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const pool = pre.object
+    const array = mirrorReconcileArray(pool, band)!
+    const proof = evidence() as { ok: true, mismatchCnt: number }
     // Is a guest's disk live on this pool? Disclosed, never refused: every row
     // this verb writes already matches its stored checksum, so nothing a guest
     // can read changes.
     const mirrorHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool)
 
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'ahr.mirror-reconcile',
-      params: { name, band },
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { name, band },
+      address: ['name', 'band'],
+      presentationOnly: AHR_MIRROR_RECONCILE_PRESENTATION_ONLY,
       message: `Reconciling mirror band r${band} of AHR pool '${name}' makes its two legs agree again (md counted ${proof.mismatchCnt} disagreeing unit(s) there, and the pool's last checksum scrub was clean)`,
       warnings: [...mirrorReconcileWarnings(name, array, pool.capacity.usedBytes), ...reconcileLunWarnings(mirrorHeld)],
     })) {
@@ -1507,15 +1544,18 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const job = jobQueue.submit(
       'ahr.mirror-reconcile',
       { ...identity, params: { name, band } },
-      async updateProgress => reconcileMirrorBand(executor, pool, band, {
-        updateProgress,
+      guarded(spec, pre, async (live, ctx) => reconcileMirrorBand(executor, live, band, {
+        updateProgress: ctx.updateProgress,
         evidence,
-        jobConflict,
-        attributeFindings: async since => (await attributeScrub(executor, pool, since, updateProgress)).findings ?? [],
+        attributeFindings: async since => (await attributeScrub(executor, live, since, ctx.updateProgress)).findings ?? [],
         pollIntervalMs: opts.scrubPollIntervalMs,
-      }),
+        reguard: async () => {
+          await ctx.reguard()
+        },
+        release: ctx.release,
+      })),
+      { locks: pre.locks, lane: 'long' },
     )
-    selfMirrorJobId = job.id
     reply.code(202)
     return { job }
   })

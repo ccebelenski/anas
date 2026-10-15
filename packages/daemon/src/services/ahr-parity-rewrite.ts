@@ -1,7 +1,7 @@
 import type { AhrParityRewriteReasonCode, AhrParityRewriteResult, AhrScrubFinding, Job } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { MdGeometry } from './selfheal-map.js'
-import { AhrParityRewriteResult as AhrParityRewriteResultSchema } from '@anas/shared'
+import { AhrParityRewriteReasonCode as AhrParityRewriteReasonCodeSchema, AhrParityRewriteResult as AhrParityRewriteResultSchema } from '@anas/shared'
 import { z } from 'zod'
 import {
   AHR_SCRUB_CHECK_FINISH_CEILING_MS,
@@ -146,6 +146,21 @@ export interface ParityRewriteOptions {
   startTimeoutMs?: number
   /** Absolute ceiling on one op's finish-wait. */
   finishCeilingMs?: number
+  /**
+   * The guard's seams (story cr.38 session B, WAVE3-DESIGN §3.2, §4.3). The
+   * route's job passes `ctx.reguard` — re-acquire the pool's key and re-run
+   * every gate of the verb (the proof, the state roll-up, the in-process and
+   * node-wide exclusions, the band's own md state, the pool and band
+   * identity) against the node NOW, throwing the refusal — and `ctx.release`,
+   * which gives the key back while md does the work. The engine calls
+   * `reguard` before each md act (the repair, the verifying check) and
+   * `release` before each md wait. A refusal is reported like the engine's
+   * own (one result, one notification) and then thrown, so the job carries
+   * the refusal's code. Absent (the selfheal rig, the dev entry): nothing to
+   * re-gate, nothing to give back.
+   */
+  reguard?: () => Promise<void>
+  release?: () => void
 }
 
 /** The band the request names, or null when the pool has no such band. */
@@ -604,6 +619,27 @@ export async function rewriteBandParity(
 
   const label = `${pool.name}-r${band}`
 
+  /**
+   * The guard's re-check before an md act (cr.38). A refusal ends the run
+   * with `outcome` and the refusal's sentence (and its reason code, when it
+   * is one of this verb's), then is rethrown for the job's error code.
+   */
+  const regate = async (outcome: 'refused' | 'still-mismatched', when: string): Promise<void> => {
+    if (!opts.reguard)
+      return
+    try {
+      await opts.reguard()
+    }
+    catch (error) {
+      const code = AhrParityRewriteReasonCodeSchema.safeParse((error as { refusal?: { reason?: unknown } }).refusal?.reason)
+      await finish(outcome, array.device, {
+        reason: `${error instanceof Error ? error.message : String(error)} (${when})`,
+        ...(code.success ? { reasonCode: code.data } : {}),
+      })
+      throw error
+    }
+  }
+
   // --- Preconditions, at submit ---------------------------------------------
   const evidence = opts.evidence ? await opts.evidence() : null
   if (evidence && !evidence.ok)
@@ -649,7 +685,9 @@ export async function rewriteBandParity(
   // --- The same preconditions, immediately before the md write --------------
   // A scrub takes hours on a real pool, and every one of these can have stopped
   // being true in that time: a member can fail, another job can be submitted,
-  // and the evidence scrub itself can be superseded.
+  // and the evidence scrub itself can be superseded. Under the guard (cr.38)
+  // the job's whole gate list runs first, against the node now.
+  await regate('refused', 're-checked immediately before the md write; nothing was written')
   const evidenceNow = opts.evidence ? await opts.evidence() : null
   if (evidenceNow && !evidenceNow.ok)
     return finish('refused', array.device, { reason: `${evidenceNow.reason} (re-checked immediately before the md write)`, reasonCode: evidenceNow.code })
@@ -684,6 +722,8 @@ export async function rewriteBandParity(
       reasonCode: 'array-busy',
     })
   }
+  // cr.38 (§4.3): md does the work from here; the job only watches it.
+  opts.release?.()
   const repaired = await waitForOwnSyncOp(executor, geo, label, 'repair', repairPrior, opts)
   state.repairMs = Date.now() - repairStart
   if (!repaired.ended) {
@@ -705,6 +745,7 @@ export async function rewriteBandParity(
   // more stripes than the cache holds, and the repair that preceded it wrote
   // through the same cache — so cache and disk agree by construction.
   progress(`phase 3/3: md check on ${label} (whole band). Proving the parity md just wrote`)
+  await regate('still-mismatched', 'the repair ran; the verifying check was not issued, so the rewrite is unproven')
   const checkPrior = await lastSyncAction(executor, geo.kernel)
   const checkStart = Date.now()
   const checkIssued = await executor.exec(MDADM, ['--action=check', array.device])
@@ -714,6 +755,8 @@ export async function rewriteBandParity(
     })
   }
   markCheckIssued(geo.kernel)
+  // cr.38 (§4.3): the check is md's; the job only watches it.
+  opts.release?.()
   let checked: WaitResult
   try {
     checked = await waitForOwnSyncOp(executor, geo, label, 'check', checkPrior, opts)

@@ -42,6 +42,8 @@ function fakeCtx(): { ctx: JobContext, hook: () => CancelHook | undefined, meta:
       },
       cancellation: () => cancellation,
       updateDetail: () => {},
+      release: () => {},
+      reacquire: async () => {},
     },
     hook: () => hook,
     meta: () => meta,

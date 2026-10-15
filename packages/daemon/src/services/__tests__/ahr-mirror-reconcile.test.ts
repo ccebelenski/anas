@@ -727,6 +727,55 @@ describe('reconcileMirrorBand — arm A', () => {
     assert.equal(result.arm, 'compare', 'and then it fell through to arm B')
   })
 
+  // --- cr.38 session B: the guard's seams (WAVE3-DESIGN §3.2, §4.3) --------
+
+  it('cr.38: re-guards before every whole-band check and every later pass, and gives the key back while md checks', async () => {
+    md.scrubSummary = 'csum=1'
+    md.scrubCorrected = 1
+    md.mismatchQueue = ['128', '0']
+    const trace: string[] = []
+    const actions = () => md.actions().length
+    const result = await reconcileMirrorBand(md, md.pool(), 2, {
+      ...FAST,
+      evidence: () => PROVEN,
+      context: md.context(),
+      scrubPasses: 2,
+      reguard: async () => {
+        trace.push(`reguard after ${actions()} md check(s)`)
+      },
+      release: () => {
+        trace.push(`release after ${actions()} md check(s)`)
+      },
+    })
+    assert.equal(result.outcome, 'reconciled')
+    assert.deepEqual(trace, [
+      'reguard after 0 md check(s)', // pass 1's whole-band check (its scrub ran on the job's entry check)
+      'release after 1 md check(s)', // md checks; the job watches
+      'reguard after 1 md check(s)', // pass 2's scrub
+      'reguard after 1 md check(s)', // pass 2's whole-band check
+      'release after 2 md check(s)',
+    ])
+  })
+
+  it('cr.38: a refusal at the reguard before arm B is the run\'s refusal — reported once, rethrown, no row written', async () => {
+    md.mismatchQueue = ['128']
+    const refusal = Object.assign(new Error('a repair is in flight on AHR pool \'tank\' (job j0)'), { jobErrorCode: 'CONFLICT', refusal: { reason: 'job-active' } })
+    let calls = 0
+    await assert.rejects(
+      reconcileMirrorBand(md, md.pool(), 2, {
+        ...FAST,
+        evidence: () => PROVEN,
+        context: md.context(),
+        reguard: async () => (++calls === 1 ? undefined : Promise.reject(refusal)),
+        release: () => {},
+      }),
+      (err: unknown) => err === refusal,
+    )
+    assert.deepEqual(md.actions(), ['--action=check'], 'arm A\'s one check, nothing after it')
+    assert.equal(md.notifications.length, 1)
+    assert.match(md.notifications[0][2], /re-checked before arm B; nothing was written/)
+  })
+
   it('a pass that corrects NOTHING while md still counts stops arm A at once', async () => {
     md.mismatchQueue = ['128']
     const result = await reconcileMirrorBand(md, md.pool(), 2, {

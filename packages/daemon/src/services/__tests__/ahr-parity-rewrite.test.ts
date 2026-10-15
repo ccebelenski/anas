@@ -232,6 +232,62 @@ describe('rewriteBandParity — the sequence', () => {
     assert.ok(message.includes('8 before, 0 after'), message)
   })
 
+  // --- cr.38 session B: the guard's seams (WAVE3-DESIGN §3.2, §4.3) --------
+
+  it('cr.38: re-guards before the repair and before the verifying check, and gives the key back while md runs each', async () => {
+    const trace: string[] = []
+    const actions = () => md.actions().length
+    const result = await rewriteBandParity(md, md.pool(), 1, {
+      ...FAST,
+      evidence: () => PROVEN,
+      reguard: async () => {
+        trace.push(`reguard after ${actions()} md action(s)`)
+      },
+      release: () => {
+        trace.push(`release after ${actions()} md action(s)`)
+      },
+    })
+    assert.equal(result.outcome, 'rewritten')
+    assert.deepEqual(trace, [
+      'reguard after 0 md action(s)', // before the md write
+      'release after 1 md action(s)', // md repairs; the job watches
+      'reguard after 1 md action(s)', // before the verifying check
+      'release after 2 md action(s)', // md checks; the job watches
+    ])
+  })
+
+  it('cr.38: a refusal at the reguard before the md write is the run\'s refusal — its reason code, ONE notification, rethrown; md never repairs', async () => {
+    const refusal = Object.assign(new Error('an md check is running on tank-r2 (started outside this job or by a previous daemon)'), { jobErrorCode: 'CONFLICT', refusal: { reason: 'array-busy' } })
+    await assert.rejects(
+      rewriteBandParity(md, md.pool(), 1, { ...FAST, evidence: () => PROVEN, reguard: async () => Promise.reject(refusal), release: () => {} }),
+      (err: unknown) => err === refusal,
+    )
+    assert.deepEqual(md.actions(), [], 'no repair, no check')
+    assert.equal(md.notifications.length, 1)
+    const [severity, title, message] = md.notifications[0]
+    assert.equal(severity, 'warning')
+    assert.match(title, /refused/)
+    assert.match(message, /re-checked immediately before the md write; nothing was written/)
+  })
+
+  it('cr.38: a refusal at the reguard before the verifying check leaves the rewrite unproven — still-mismatched, rethrown, no check issued', async () => {
+    const refusal = Object.assign(new Error('AHR pool \'tank\' is degraded'), { jobErrorCode: 'CONFLICT', refusal: { reason: 'array-busy' } })
+    let calls = 0
+    await assert.rejects(
+      rewriteBandParity(md, md.pool(), 1, {
+        ...FAST,
+        evidence: () => PROVEN,
+        reguard: async () => (++calls === 1 ? undefined : Promise.reject(refusal)),
+        release: () => {},
+      }),
+      (err: unknown) => err === refusal,
+    )
+    assert.deepEqual(md.actions(), ['--action=repair'], 'the repair ran; the check was never issued')
+    assert.equal(md.notifications.length, 1)
+    assert.match(md.notifications[0][1], /still-mismatched/)
+    assert.match(md.notifications[0][2], /the verifying check was not issued, so the rewrite is unproven/)
+  })
+
   it('the fresh btrfs scrub finding anything aborts before md is touched', async () => {
     md.scrubSummary = 'csum_errors=3'
     const result = await rewriteBandParity(md, md.pool(), 1, {

@@ -15,7 +15,7 @@ import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { LVM_MIXED_BLOCK_ARGS, UPDATE_INITRAMFS_BUDGET_MS } from './ahr-exec.js'
 import { ahrDataOffsetArg, ahrDataOffsetBytes, planDiskPartitions } from './ahr-geometry.js'
-import { examineMember, readAhrPoolIdentity } from './ahr-identity.js'
+import { examineMember, readAhrPoolIdentity, requirePoolVg } from './ahr-identity.js'
 import { clearIntent, defaultAhrIntentDir, writeIntent } from './ahr-intent.js'
 import { AHR_SIZE_GRANULARITY_BYTES, floorToGranularity, fmtBytes, isPvUnderSized } from './ahr-layout.js'
 import { pinArrays } from './ahr-mdadm-conf.js'
@@ -119,9 +119,37 @@ export interface ExpansionInput {
   plan: AhrExpansionPlan
 }
 
+/**
+ * The guard's seams into a long expansion job (story cr.38 session B,
+ * WAVE3-DESIGN §3.2, §4.3). The executor calls `release` before every md wait
+ * it only WATCHES (a reshape, a replace copy, a recovery) and `reguard` before
+ * every step that changes the pool, so the pool is not held for days by a job
+ * that is waiting on the kernel, and every act is gated against the pool as it
+ * is NOW — never the one the route read. Absent (the executor's own tests, the
+ * dev entry) = no locks to give back and nothing to re-gate.
+ */
+export interface ExpansionHooks {
+  /** Give the job's locks back before an md wait (`ctx.release()`). */
+  release: () => void
+  /**
+   * Re-acquire the locks, re-read the pool and re-run the guard's id, intent
+   * and gates (`ctx.reguard()`); resolves with the pool as it is now, throws
+   * the refusal.
+   */
+  reguard: () => Promise<AhrPool>
+  /**
+   * Re-acquire the locks only — for the guided replace's retire of the
+   * outgoing disk, which runs after the expansion cleared its intent, so there
+   * is no expansion left to re-gate (the step re-reads the disk itself).
+   */
+  reacquire: () => Promise<void>
+}
+
 export interface ExpansionOptions {
   /** Intent store directory (default ANAS_AHR_INTENT_DIR / /etc/anas/ahr). */
   intentDir?: string
+  /** The guard's release/reguard seams (cr.38); absent = none. */
+  hooks?: ExpansionHooks
   /** reshape-wait poll interval (default 3000 ms; tests shrink it). */
   pollIntervalMs?: number
   /** Structured step-transition log sink (default console — journald, §7.1). */
@@ -136,6 +164,12 @@ export interface ExpansionOutcome {
   failedStep?: AhrExpansionStep
   /** The failure message, when !ok. */
   error?: string
+  /**
+   * The error that halted the run, when it is the guard's (cr.38): a reguard
+   * refusal carries its own `jobErrorCode`, and the job rethrows it so the UI
+   * reads the refusal's code, not a generic failure.
+   */
+  cause?: unknown
 }
 
 // ---- Existing-band projection (planner input from a live pool) --------------
@@ -792,6 +826,7 @@ function plannedCapacityMarginBytes(plan: AhrExpansionPlan): number {
 
 interface StepContext {
   executor: CommandExecutor
+  /** The pool as last read — replaced by every `reguard` (cr.38: never the route's copy). */
   pool: AhrPool
   intent: AhrExpansionIntent
   plan: AhrExpansionPlan
@@ -799,6 +834,7 @@ interface StepContext {
   log: (line: string) => void
   pollIntervalMs: number
   degradedNotified: Set<string>
+  hooks?: ExpansionHooks
 }
 
 /** Parse a `md/<pool>-r<band>` step target, verifying the pool matches. */
@@ -1109,6 +1145,10 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       }
       if (toAdd.length === 0)
         return true
+      // cr.38: the VG named like the pool must be PROVABLY the pool's before
+      // it is extended — the same gate the cache attach runs before its
+      // `vgextend` (cr.22's `requirePoolVg`). Throws (fail closed) and halts.
+      await requirePoolVg(executor, pool.name, { arrays: pool.arrays.map(a => ({ pool: pool.name, band: a.band, ...(a.kernelName ? { kernelName: a.kernelName } : {}) })) })
       await execChecked(executor, VGEXTEND, [...LVM_MIXED_BLOCK_ARGS, pool.name, ...toAdd])
       return false
     }
@@ -1164,10 +1204,14 @@ function dmName(vg: string, lv: string): string {
   return `${vg.replaceAll('-', '--')}-${lv.replaceAll('-', '--')}`
 }
 
-/** Halt bookkeeping shared by the expansion and replace drivers. */
-async function haltWithFailure(
+/**
+ * Halt bookkeeping shared by the expansion and replace drivers — and, since
+ * cr.38, by a job the guard refused before its first step (the intent it was
+ * submitted for must not stay `running` with nothing driving it).
+ */
+export async function haltWithFailure(
   executor: CommandExecutor,
-  input: ExpansionInput,
+  input: Pick<ExpansionInput, 'intent'> & { pool: Pick<AhrPool, 'name'> },
   intentDir: string,
   layer: string,
   message: string,
@@ -1187,12 +1231,22 @@ async function haltWithFailure(
  * the message), or null when every step completed. The one execution path —
  * the plan's steps and the completion invariant's steps both go through it.
  */
-async function runStepList(ctx: StepContext, steps: AhrExpansionStep[]): Promise<AhrExpansionStep | null> {
+async function runStepList(ctx: StepContext, steps: AhrExpansionStep[]): Promise<{ step: AhrExpansionStep, cause: unknown } | null> {
   for (const step of steps) {
     step.status = 'running'
     ctx.log(`ahr.expand pool=${ctx.pool.name} step=${step.kind} target=${step.target} status=running`)
     ctx.updateProgress(`${step.kind}: ${step.target}`)
     try {
+      // cr.38 (§4.3): a reshape-wait only WATCHES md, so the job's locks go
+      // back first; every other step changes the pool, so it re-acquires them
+      // and re-gates against the pool as it is now. A refusal fails the step
+      // like any other error (the intent halts) and keeps its code.
+      if (ctx.hooks) {
+        if (step.kind === 'reshape-wait')
+          ctx.hooks.release()
+        else
+          ctx.pool = await ctx.hooks.reguard()
+      }
       const skipped = await runStep(ctx, step)
       step.status = 'done'
       ctx.log(`ahr.expand pool=${ctx.pool.name} step=${step.kind} target=${step.target} status=done${skipped ? ' (already done)' : ''}`)
@@ -1202,7 +1256,7 @@ async function runStepList(ctx: StepContext, steps: AhrExpansionStep[]): Promise
       step.status = 'failed'
       step.detail = message
       ctx.log(`ahr.expand pool=${ctx.pool.name} step=${step.kind} target=${step.target} status=failed error=${message}`)
-      return step
+      return { step, cause: err }
     }
   }
   return null
@@ -1253,17 +1307,18 @@ export async function executeExpansion(
     log,
     pollIntervalMs: opts.pollIntervalMs ?? 3000,
     degradedNotified: new Set(),
+    ...(opts.hooks ? { hooks: opts.hooks } : {}),
   }
 
   const steps = input.plan.steps.map(s => ({ ...s }))
-  const halt = async (layer: string, message: string, failedStep?: AhrExpansionStep): Promise<ExpansionOutcome> => {
+  const halt = async (layer: string, message: string, failedStep?: AhrExpansionStep, cause?: unknown): Promise<ExpansionOutcome> => {
     await haltWithFailure(executor, input, intentDir, layer, message)
-    return { ok: false, steps, failedStep, error: message }
+    return { ok: false, steps, failedStep, error: message, ...(cause !== undefined ? { cause } : {}) }
   }
 
   const failed = await runStepList(ctx, steps)
   if (failed)
-    return halt(`step '${failed.kind}' (${failed.target})`, failed.detail!, failed)
+    return halt(`step '${failed.step.kind}' (${failed.step.target})`, failed.step.detail!, failed.step, failed.cause)
 
   // ---- 1. The completion invariant (issue #4) -----------------------------
   let holdBands: number[]
@@ -1285,13 +1340,18 @@ export async function executeExpansion(
     // steps — run it against a plan that includes the appended ones.
     const holdCtx: StepContext = { ...ctx, plan: { ...input.plan, steps: [...input.plan.steps, ...extra] } }
     const failedHold = await runStepList(holdCtx, extra)
+    ctx.pool = holdCtx.pool
     if (failedHold)
-      return halt(`step '${failedHold.kind}' (${failedHold.target})`, failedHold.detail!, failedHold)
+      return halt(`step '${failedHold.step.kind}' (${failedHold.step.target})`, failedHold.step.detail!, failedHold.step, failedHold.cause)
   }
 
   // ---- 2. Honest completion report ----------------------------------------
+  // cr.38: the run may have ended on a wait with its locks given back; the
+  // verdict and the intent's clearing happen under them again.
+  if (ctx.hooks)
+    await ctx.hooks.reacquire()
   const { before, after } = input.intent
-  const delivered = await readDeliveredUsableBytes(executor, pool)
+  const delivered = await readDeliveredUsableBytes(executor, ctx.pool)
   if (delivered !== null && after.usableBytes - delivered > plannedCapacityMarginBytes(input.plan)) {
     const message
       = `the pool delivered ${fmtBytes(delivered)} of usable capacity but the plan projected `
@@ -1352,6 +1412,14 @@ export async function executeReplace(
   const log = opts.log ?? ((line: string) => process.stdout.write(`${line}\n`))
   const pollIntervalMs = opts.pollIntervalMs ?? 3000
   const { pool, oldDiskId, newDiskId } = input
+  const hooks = opts.hooks
+  /** The pool as the last reguard read it (cr.38) — phase 3 starts from it, never from the route's copy. */
+  let live = pool
+  /** cr.38: re-acquire, re-read and re-gate before an act step (no-op without the guard). */
+  const reguard = async (): Promise<void> => {
+    if (hooks)
+      live = await hooks.reguard()
+  }
 
   const oldBands = pool.arrays
     .filter(a => a.members.some(m => m.disk === oldDiskId))
@@ -1363,6 +1431,7 @@ export async function executeReplace(
 
   try {
     // Phase 1 — partition the incoming disk for every band it will serve.
+    await reguard()
     updateProgress(`partitioning ${newDiskId}`)
     log(`ahr.replace pool=${pool.name} phase=partition disk=${newDiskId}`)
     await ensureDiskPartitions(executor, pool.name, newDiskId, input.plan.preview.bands)
@@ -1372,6 +1441,8 @@ export async function executeReplace(
 
     // Phase 2 — swap band by band, sequentially (one spindle, GT-10).
     for (const band of oldBands) {
+      // cr.38: each band's swap is an act on the pool — under the locks, gated now.
+      await reguard()
       const arrays = await resolveAhrArrays(executor, pool.name)
       const resolved = arrays.get(band)
       if (!resolved)
@@ -1407,6 +1478,8 @@ export async function executeReplace(
         updateProgress(`rebuilding ${label} onto ${newDiskId}`)
       }
 
+      // cr.38 (§4.3): the copy is md's; the job only watches it.
+      hooks?.release()
       await waitForReplaceDone(executor, {
         kernelName: resolved.kernelName,
         label,
@@ -1419,6 +1492,7 @@ export async function executeReplace(
 
       // The outgoing member is marked faulty once the copy lands — detach it.
       if (oldPart) {
+        await reguard()
         const post = await resolveAhrArrays(executor, pool.name)
         const still = post.get(band)?.md.members.find(m => m.device === oldPart.name)
         if (still) {
@@ -1434,12 +1508,12 @@ export async function executeReplace(
     const message = err instanceof Error ? err.message : String(err)
     log(`ahr.replace pool=${pool.name} status=failed error=${message}`)
     await haltWithFailure(executor, input, intentDir, `disk replace (${oldDiskId} → ${newDiskId})`, message)
-    return { ok: false, steps: input.plan.steps.map(s => ({ ...s })), error: message }
+    return { ok: false, steps: input.plan.steps.map(s => ({ ...s })), error: message, cause: err }
   }
 
   // Phase 3 — residual expansion steps (new bands the replacement unlocked).
   // executeExpansion owns intent completion/halting and the final notification.
-  const outcome = await executeExpansion(executor, input, updateProgress, opts)
+  const outcome = await executeExpansion(executor, { ...input, pool: live }, updateProgress, opts)
   if (!outcome.ok)
     return outcome
 
@@ -1447,6 +1521,9 @@ export async function executeReplace(
   // Best-effort: the replace has fully succeeded; cleanup failure only logs.
   if (oldWasHealthy) {
     try {
+      // cr.38: the expansion cleared its intent, so there is nothing left to
+      // re-gate — but the zeroing and the zap still run under the locks.
+      await hooks?.reacquire()
       const oldDisk = await readDiskTree(executor, byIdPath(oldDiskId))
       if (oldDisk) {
         updateProgress(`retiring ${oldDiskId} (zero superblocks, zap GPT)`)
@@ -1519,6 +1596,12 @@ async function waitForReplaceDone(executor: CommandExecutor, ctx: ReplaceWaitCon
 
 // ---- Re-add (story 11.9: the returned-disk verb) ---------------------------
 
+/** The md array UUID a slice's superblock names (`mdadm --examine`), or null. */
+async function sliceArrayUuid(executor: CommandExecutor, partPath: string): Promise<string | null> {
+  const exam = await executor.exec(MDADM, ['--examine', '--export', partPath])
+  return exam.exitCode === 0 ? parseMdadmDetailExport(exam.stdout).uuid : null
+}
+
 export interface ReaddBandResult {
   band: number
   /** 'differential' = --re-add rode the write-intent bitmap; 'full' = rebuild. */
@@ -1543,9 +1626,10 @@ export async function executeReadd(
   executor: CommandExecutor,
   input: { pool: AhrPool, diskId: string },
   updateProgress: (message: string) => void,
-  opts: { pollIntervalMs?: number, log?: (line: string) => void } = {},
+  opts: { pollIntervalMs?: number, log?: (line: string) => void, hooks?: Pick<ExpansionHooks, 'release' | 'reguard'> } = {},
 ): Promise<{ bands: ReaddBandResult[] }> {
   const { pool, diskId } = input
+  const hooks = opts.hooks
   const log = opts.log ?? ((line: string) => process.stdout.write(`${line}\n`))
   const pollIntervalMs = opts.pollIntervalMs ?? 3000
 
@@ -1567,8 +1651,7 @@ export async function executeReadd(
       continue
     const partPath = `${byIdPath(diskId)}-part${part.number}`
     // Identity check: the slice's superblock must belong to THIS band array.
-    const exam = await executor.exec(MDADM, ['--examine', '--export', partPath])
-    const examUuid = exam.exitCode === 0 ? parseMdadmDetailExport(exam.stdout).uuid : null
+    const examUuid = await sliceArrayUuid(executor, partPath)
     if (examUuid !== array.detail.uuid) {
       rejects.push(`band ${band}: slice superblock ${examUuid ?? '(none)'} does not match array ${array.detail.uuid ?? '(unknown)'}`)
       continue
@@ -1584,8 +1667,27 @@ export async function executeReadd(
 
   const results: ReaddBandResult[] = []
   const degradedNotified = new Set<string>()
-  for (const c of candidates) {
+  for (const first of candidates) {
+    let c = first
     const label = `${pool.name}-r${c.band}`
+    if (hooks) {
+      // cr.38: each band's re-add is an act on the pool. Under the locks and
+      // gated now — and, after the previous band's recovery (hours on a full
+      // rebuild), against the array as it is NOW: re-resolved, its slice's
+      // identity checked again, a slot md already took back left alone.
+      await hooks.reguard()
+      const now = (await resolveAhrArrays(executor, pool.name)).get(c.band)
+      if (!now)
+        throw new Error(`array ${label} is no longer assembled — nothing was re-added to it`)
+      const uuidNow = await sliceArrayUuid(executor, c.partPath)
+      if (uuidNow !== now.detail.uuid)
+        throw new Error(`band ${c.band}: slice superblock ${uuidNow ?? '(none)'} no longer matches array ${now.detail.uuid ?? '(unknown)'} — nothing was re-added to ${label}`)
+      if (now.md.members.some(m => m.device === c.partKernel && !m.faulty)) {
+        log(`ahr.readd pool=${pool.name} band=${c.band} status=already-member`)
+        continue
+      }
+      c = { ...c, array: now }
+    }
     // Clear the stale faulty slot or `--re-add` is refused (and 11.9's
     // differential catch-up silently degrades to a full rebuild). Matched by
     // what the slot IS, not the disk's current name: a same-name return
@@ -1614,6 +1716,8 @@ export async function executeReadd(
       await execChecked(executor, MDADM, [c.array.dev, '--add', c.partPath])
     }
 
+    // cr.38 (§4.3): the recovery is md's; the job only watches it.
+    hooks?.release()
     await waitForArrayIdle(executor, {
       poolName: pool.name,
       label,
@@ -1626,6 +1730,10 @@ export async function executeReadd(
     results.push({ band: c.band, mode })
   }
 
+  // Every band md took back on its own while the job waited (cr.38): nothing
+  // was re-added by this run, so there is nothing to announce.
+  if (results.length === 0)
+    return { bands: results }
   await pveNotify(
     executor,
     'info',

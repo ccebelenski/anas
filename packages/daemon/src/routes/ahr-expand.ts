@@ -9,12 +9,12 @@ import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { randomUUID } from 'node:crypto'
 import { AhrExpandRequest, AhrReplaceRequest, DiskId, PoolName } from '@anas/shared'
 import { confirmGate } from '../safety/gate.js'
-import { guardCheck, guardConfirm, guarded, sendRefusal } from '../safety/guard.js'
+import { guardCheck, guardConfirm, guarded, refusalBody, sendRefusal } from '../safety/guard.js'
 import { executeReadd } from '../services/ahr-expand-exec.js'
 // The §5.3 recompute-and-continue core is shared with the daemon boot scan
 // (services/ahr-boot-scan.ts) — ONE implementation, no drift (single source).
 import { computePlan, resolveApproved, resumeExpansion, submitExpansion } from '../services/ahr-expand-resume.js'
-import { ahrGuard } from '../services/ahr-guard.js'
+import { ahrGuard, expansionStateRefusal } from '../services/ahr-guard.js'
 import { poolIntentIdentity } from '../services/ahr-identity.js'
 import { AhrIntentConflictError, clearIntent, readPoolIntent, writeIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, expansionGain, fmtBytes } from '../services/ahr-layout.js'
@@ -26,6 +26,9 @@ import { requireIdentity } from './identity.js'
  * WAVE3-DESIGN §5.2 rule 1): none. A test lists them.
  */
 export const AHR_ABANDON_PRESENTATION_ONLY: Record<string, string> = {}
+
+/** The fields the re-add confirm leaves out of its signature (cr.38 session B): none. */
+export const AHR_READD_PRESENTATION_ONLY: Record<string, string> = {}
 
 export interface AhrExpandRouteOptions {
   executor: CommandExecutor
@@ -54,9 +57,11 @@ export interface AhrExpandRouteOptions {
  */
 export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpandRouteOptions) {
   const { executor, jobQueue, confirmStore, diskIdentityCache, intentDir } = opts
-  // The guard's shared AHR pieces (story cr.38): abandon only in session A;
-  // the long verbs here move onto it in session B. No verb here asks the LUN
-  // question, so the guard's LIO reads stay unused.
+  // The guard's shared AHR pieces (story cr.38): abandon and re-add run on
+  // them here; expand, resume and replace run on the expansion job's spec
+  // (`expansionGuard`, services/ahr-expand-resume.ts — the boot re-attach
+  // submits the same job). No verb here asks the LUN question, so the
+  // guard's LIO reads stay unused.
   const guard = ahrGuard({ executor, intentDir, iscsiPaths: () => ({}) })
 
   // ---- shared helpers ------------------------------------------------------
@@ -150,25 +155,13 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
    * spelled out so the refusal survives the state split.
    */
   function refuseDegraded(pool: AhrPool, reply: FastifyReply): boolean {
-    const badArray = pool.arrays.find(a => a.state === 'degraded' || a.state === 'inactive' || a.state === 'failed')
-    if (badArray || pool.state === 'offline' || pool.state === 'failed' || pool.state === 'readonly') {
-      // An unreachable volume is refused for a different reason than a
-      // reduced-redundancy one, and says so: there is no double-failure window
-      // to warn about when nothing is being served in the first place.
-      const unreachable = pool.state === 'offline' || badArray?.state === 'inactive'
-      const what = badArray
-        ? `array ${pool.name}-r${badArray.band} is ${badArray.state}`
-        : `pool '${pool.name}' is ${pool.state}`
-      const why = unreachable
-        ? `The volume is not assembled, so there is nothing to reshape — bring the pool back online first.`
-        : `Reshaping a degraded pool voluntarily enters the double-failure window (§4) — replace/rebuild first.`
-      reply.code(409).send({ error: {
-        code: 'CONFLICT',
-        message: `Cannot expand: ${what}. ${why} This refusal has no confirm bypass.`,
-      } })
-      return true
-    }
-    return false
+    // One function at both doors (cr.38): the expand job re-runs it before
+    // every act step (`expansionGuard`).
+    const refusal = expansionStateRefusal(pool)
+    if (!refusal)
+      return false
+    reply.code(refusal.status).send(refusalBody(refusal))
+    return true
   }
 
   /** 409 when an expansion intent already exists for the pool. */
@@ -251,7 +244,7 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
   }
 
   /** Deps for the shared expansion-driving job submitter. */
-  const expansionDeps = { executor, jobQueue, intentDir }
+  const expansionDeps = { executor, jobQueue, intentDir, diskCache: diskIdentityCache }
 
   // ---- POST /ahr/:name/expand/plan — NO mutation ---------------------------
   server.post<{ Params: { name: string } }>('/ahr/:name/expand/plan', async (request, reply) => {
@@ -577,21 +570,40 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
-    const pool = await loadPool(request.params.name, reply)
-    if (!pool)
-      return
-    // Never interleave a member rejoin with a running/halted expansion.
-    if (await refuseExistingIntent(pool, reply))
-      return
-    if (pool.arrays.some(a => a.sync?.action === 'reshape')) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `pool '${pool.name}' is reshaping — wait for the reshape to finish before re-adding a member` } }
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
     }
+    const poolName = nameParsed.data
+    const diskId = idParsed.data
 
-    if (!confirmGate(confirmStore, request, reply, {
+    // Story cr.38 session B (§2.3 "readd": the intent was not re-checked in
+    // the job). One gate list at both doors — no expansion intent (a member
+    // rejoin is never interleaved with a running or halted expansion) and no
+    // reshape in flight — re-run when the job starts and again before every
+    // band's re-add, under the pool's key and the disk's, with the keys given
+    // back while md recovers each band.
+    const spec: GuardSpec<AhrPool> = {
       operation: 'ahr.readd',
-      params: { pool: pool.name, diskId: idParsed.data },
-      message: `Re-adding disk '${idParsed.data}' to pool '${pool.name}'`,
+      object: guard.poolView(poolName, 'a re-add'),
+      gates: [
+        guard.intentGate('Resume or Abandon it first; a member rejoin is never interleaved with an expansion'),
+        async pool => pool.arrays.some(a => a.sync?.action === 'reshape')
+          ? { status: 409, code: 'CONFLICT', message: `pool '${pool.name}' is reshaping — wait for the reshape to finish before re-adding a member` }
+          : null,
+      ],
+      locks: async (pool, bound) => guard.claims(pool, bound, 'exclusive', { disks: [diskId] }),
+    }
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { pool: poolName, diskId },
+      address: ['pool', 'diskId'],
+      presentationOnly: AHR_READD_PRESENTATION_ONLY,
+      message: `Re-adding disk '${diskId}' to pool '${poolName}'`,
       warnings: [
         'With the write-intent bitmap this is a fast differential catch-up (only regions written while the disk was away).',
         'If md refuses the shortcut (stale member), it falls back to a FULL rebuild of that slice — redundancy is only restored when the rebuild completes.',
@@ -603,8 +615,11 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
 
     const job = jobQueue.submit(
       'ahr.readd',
-      { ...identity, params: { pool: pool.name, diskId: idParsed.data } },
-      async updateProgress => executeReadd(executor, { pool, diskId: idParsed.data }, updateProgress),
+      { ...identity, params: { pool: poolName, diskId } },
+      guarded(spec, pre, async (live, ctx) => executeReadd(executor, { pool: live, diskId }, ctx.updateProgress, {
+        hooks: { release: ctx.release, reguard: ctx.reguard },
+      })),
+      { locks: pre.locks, lane: 'long' },
     )
     reply.code(202)
     return { job }

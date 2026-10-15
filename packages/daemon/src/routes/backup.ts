@@ -51,7 +51,7 @@ import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
 import { readPbsStorages, readPveMountPaths } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
-import { GuardReads, GuardRefusalError } from '../safety/guard.js'
+import { GuardReads, GuardRefusalError, iscsiTargetClaim } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { browseArchiveLevel } from '../services/backup-catalog.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
@@ -2206,7 +2206,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       // both hold the node's only iSCSI mutex for that whole time and deadlock
       // against the service's own acquisitions (the mutex is a plain chain, not
       // reentrant) — the same fix #52 applied to the in-place door.
-      async updateProgress => runNewLunImageRestore(
+      async (updateProgress, ctx) => runNewLunImageRestore(
         executor,
         {
           repo,
@@ -2233,20 +2233,25 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
             configfsRoot: iscsiPaths.configfsRoot ?? CONFIGFS_TARGET_ROOT,
             progress: updateProgress,
           },
+          // cr.38: the target's key goes back the moment the LUN is mapped,
+          // and is taken again before a failed run's undo unmaps it.
+          mapped: ctx.release,
+          beforeUndo: ctx.reacquire,
         },
         updateProgress,
       ).then((result) => {
         auditParams.bytesWritten = result.bytesWritten
         return result
       }),
-      // cr.33 (§4.3): a restore is a data mover — the long lane. It takes NO
-      // target key: the queue has no release yet, so a claim would hold every
-      // verb on a target that stays online (adding an ACL, deleting another
-      // LUN) for the hours the image takes. The LUN index and ACL grants are
-      // taken from the target re-read under withIscsiLock in the job (cr.40),
-      // which is what keeps the mapping safe; claim the key once the queue
-      // can release it after the map.
-      { lane: 'long' },
+      // cr.33 (§4.3): a restore is a data mover — the long lane. cr.38 session
+      // B (cr.40's intent): it holds the target's key (`iscsi-target:<iqn>`)
+      // from its re-read of the target until the LUN is MAPPED — the index and
+      // the ACL grants it maps with are read under it — and gives it back for
+      // the image stream (`mapped`), so a verb on a target that stays online
+      // (adding an ACL, deleting another LUN) waits only until the map, never
+      // for the hours the image takes. A failed run takes the key again before
+      // its undo unmaps the LUN (`beforeUndo`).
+      { lane: 'long', locks: [iscsiTargetClaim(target.iqn)] },
     )
 
     reply.code(202)

@@ -270,8 +270,9 @@ export interface GuardedContext<O> extends JobContext {
   /** Advisories the job found that the confirm did not list (their warnings). */
   newAdvisories: string[]
   /**
-   * Re-run read → id → revision → scope → gates now (a long job calls it before
-   * each act step). Returns the fresh object; throws like the first run does.
+   * Re-acquire the job's locks if it released them (cr.38), then re-run read →
+   * id → revision → scope → gates now (a long job calls it before each act
+   * step). Returns the fresh object; throws like the first run does.
    */
   reguard: () => Promise<O>
 }
@@ -294,7 +295,12 @@ export function guarded<O>(spec: GuardSpec<O>, pass: GuardPass<O>, body: Guarded
       bound: pass.bound,
       reads,
       newAdvisories,
-      reguard: async () => (await reverify(spec, pass.bound)).object,
+      // cr.38: a job that gave its locks back (`release()`) takes them again
+      // through the queue's FIFO before anything is re-read.
+      reguard: async () => {
+        await jobCtx.reacquire()
+        return (await reverify(spec, pass.bound)).object
+      },
     })
   }
 }

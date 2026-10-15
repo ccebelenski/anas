@@ -22,12 +22,22 @@ const SRC = fileURLToPath(new URL('..', import.meta.url))
 
 /** Every long-lane submit: file (relative to packages/daemon/src) and the operation as written. */
 const LONG_SITES: { file: string, operation: string }[] = [
+  // cr.38 session B (§4.3): the AHR long verbs — hours of md and btrfs work
+  // each, so they ride the long lane too.
+  { file: 'routes/ahr-expand.ts', operation: `'ahr.readd'` },
+  { file: 'routes/ahr-mutate.ts', operation: `'ahr.mirror-reconcile'` },
+  { file: 'routes/ahr-mutate.ts', operation: `'ahr.parity-rewrite'` },
+  { file: 'routes/ahr-mutate.ts', operation: `'ahr.repair'` },
+  { file: 'routes/ahr-mutate.ts', operation: `'ahr.scrub'` },
   { file: 'routes/backup.ts', operation: `'backup.restore.files'` },
   { file: 'routes/backup.ts', operation: `'backup.restore.image'` }, // in place
   { file: 'routes/backup.ts', operation: `'backup.restore.image'` }, // to a new LUN
   { file: 'routes/backup.ts', operation: `'backup.task.run'` }, // the Run-Now supervisor and the direct run
   { file: 'routes/cloud.ts', operation: `'cloud.task.run'` }, // the Run-Now supervisor and the direct run
   { file: 'routes/replication.ts', operation: `'zfs.replicate'` },
+  // The one expansion driver: expand, guided replace, resume and the boot
+  // re-attach (`ahr.expand`, `ahr.replace`, `ahr.expand.resume`), by argument.
+  { file: 'services/ahr-expand-resume.ts', operation: 'operation' },
 ]
 
 /**
@@ -108,7 +118,9 @@ describe('cr.33: the long lane — every data mover and run supervisor, and noth
 
   it('every run-shaped submit is either long or named here as short with its reason', () => {
     const runs = all.filter(s => RUN_SHAPED.test(s.operation))
-    assert.ok(runs.length >= LONG_SITES.length + SHORT_RUNS.size, 'the run-shaped filter matches the known runs')
+    // The AHR long verbs (cr.38) are long without being run-shaped by name.
+    const runShapedLong = LONG_SITES.filter(s => RUN_SHAPED.test(s.operation)).length
+    assert.ok(runs.length >= runShapedLong + SHORT_RUNS.size, 'the run-shaped filter matches the known runs')
     const unweighed = runs.filter(s => s.lane === null && !SHORT_RUNS.has(s.operation))
     assert.deepEqual(unweighed, [])
   })

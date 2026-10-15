@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
+import { GuardRefusalError } from '../../safety/guard.js'
 import { LVM_MIXED_BLOCK_ARGS } from '../ahr-exec.js'
 import { diskLsblkArgs, executeExpansion, executeReadd, executeReplace, projectExistingBands } from '../ahr-expand-exec.js'
 import { readIntent, writeIntent } from '../ahr-intent.js'
@@ -688,12 +689,28 @@ unused devices: <none>
       let outcome = await run(executor, plan, [X, Y, Z])
       assert.equal(outcome.ok, true, outcome.error)
       assert.deepEqual(mutatingCalls(executor), [])
-      // PV exists but unassigned → vgextend.
+      // PV exists but unassigned → vgextend (cr.38: the VG is proven the
+      // pool's first — its two band PVs are the pool's own arrays).
       executor = base()
-      executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: pvsJson([{ name: '/dev/md125', vg: null, size: GIB }]), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: pvsJson([{ name: '/dev/md/tank-r1', vg: 'tank', size: 2 * GIB }, { name: '/dev/md/tank-r2', vg: 'tank', size: GIB }, { name: '/dev/md125', vg: null, size: GIB }]), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: vgsJson(0), stderr: '', exitCode: 0 } })
       outcome = await run(executor, plan, [X, Y, Z])
       assert.equal(outcome.ok, true, outcome.error)
       assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/sbin/vgextend', ...LVM_MIXED_BLOCK_ARGS, 'tank', '/dev/md125']])
+    })
+
+    it('cr.38: vg-extend refuses a VG named like the pool that is not provably the pool\'s (requirePoolVg) — no vgextend, the expansion halts', async () => {
+      const executor = world({ mdstat: MDSTAT_WITH_R3 })
+      executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md125'], result: { stdout: exportFor('tank-r3', 'raid1', 2, R3_UUID), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/vgextend', result: { stdout: '', stderr: '', exitCode: 0 } })
+      // `tank` the VG is somebody else's: its one PV is a plain partition.
+      executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: pvsJson([{ name: '/dev/sdz1', vg: 'tank', size: 5 * GIB }, { name: '/dev/md125', vg: null, size: GIB }]), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '1', lv_count: '1', vg_size: String(5 * GIB), vg_free: '0' }] }] }), stderr: '', exitCode: 0 } })
+      const plan = mkPlan([B1, B2, B3], [{ kind: 'pv-create', target: 'md/tank-r3' }, { kind: 'vg-extend', target: 'tank' }])
+      const outcome = await run(executor, plan, [X, Y, Z])
+      assert.equal(outcome.ok, false)
+      assert.match(outcome.error ?? '', /volume group 'tank' has no physical volume that is this pool's own array/)
+      assert.deepEqual(mutatingCalls(executor).filter(c => c.command === '/usr/sbin/vgextend'), [], 'the VG was never extended')
     })
 
     it('lv-extend consumes free space; skips when nothing is free', async () => {
@@ -886,6 +903,90 @@ unused devices: <none>
       assert.ok(GROWN_BYTES > R1_BYTES) // the fixture really does grow
     })
 
+    // --- cr.38 session B: the guard's seams (WAVE3-DESIGN §3.2, §4.3) --------
+
+    it('cr.38: the run gives its locks back for the md wait and re-gates before every act step after it', async () => {
+      const executor = withTailFixtures(
+        world({ mdstat: [MDSTAT_RESHAPING, MDSTAT_RESHAPING, MDSTAT_RESHAPING, MDSTAT_GROWN_IDLE] }),
+        { lvBytes: 6 * GIB },
+      )
+      const intent = mkIntent([X, Y, Z, W])
+      await writeIntent('tank', intent, { dir })
+      const trace: string[] = []
+      const mutations = () => mutatingCalls(executor).length
+      const outcome = await executeExpansion(executor, { pool: mkPool(), intent, plan: mkPlan([B1_GROWN, B2], []) }, (m) => {
+        progress.push(m)
+      }, {
+        intentDir: dir,
+        pollIntervalMs: 1,
+        log: () => {},
+        hooks: {
+          release: () => {
+            trace.push(`release before any wait progress: ${!progress.some(m => m.includes('%'))}`)
+          },
+          reguard: async () => {
+            trace.push(`reguard before mutation ${mutations() + 1}`)
+            return mkPool()
+          },
+          reacquire: async () => {
+            trace.push('reacquire')
+          },
+        },
+      })
+      assert.equal(outcome.ok, true, outcome.error)
+      assert.deepEqual(outcome.steps.map(s => s.kind), ['reshape-wait', 'pv-create', 'pv-resize', 'vg-extend', 'lv-extend', 'fs-grow'])
+      assert.deepEqual(trace, [
+        'release before any wait progress: true', // reshape-wait: md does the work
+        'reguard before mutation 1', // pv-create (a no-op here: the PV exists)
+        'reguard before mutation 1', // pv-resize → pvresize
+        'reguard before mutation 2', // vg-extend (a no-op)
+        'reguard before mutation 2', // lv-extend → lvextend
+        'reguard before mutation 3', // fs-grow → btrfs resize
+        'reacquire', // the verdict and the intent's clearing
+      ])
+      assert.ok(progress.some(m => m.includes('%')), 'the wait did report progress')
+      assert.equal(await readIntent('tank', dir), null)
+    })
+
+    it('cr.38: a refusal at the reguard before a planned act step halts the expansion — the refusal is the cause, nothing after it runs', async () => {
+      const executor = world()
+      const intent = mkIntent([X, Y, Z])
+      await writeIntent('tank', intent, { dir })
+      const refusal = new GuardRefusalError({ status: 409, code: 'STATE_CHANGED', message: 'AHR pool \'tank\' changed since you confirmed' })
+      const outcome = await executeExpansion(executor, { pool: mkPool(), intent, plan: mkPlan([B1, B2], [{ kind: 'pv-resize', target: 'md/tank-r1' }, { kind: 'lv-extend', target: 'tank-vol' }]) }, () => {}, {
+        intentDir: dir,
+        pollIntervalMs: 1,
+        log: () => {},
+        hooks: { release: () => {}, reguard: async () => Promise.reject(refusal), reacquire: async () => {} },
+      })
+      assert.equal(outcome.ok, false)
+      assert.equal(outcome.cause, refusal)
+      assert.deepEqual(outcome.steps.map(s => `${s.kind} ${s.status}`), ['pv-resize failed', 'lv-extend pending'])
+      assert.deepEqual(mutatingCalls(executor), [])
+      assert.equal((await readIntent('tank', dir))?.state, 'halted')
+    })
+
+    it('cr.38: a refusal at the reguard after the wait halts the expansion before the next act — the steps after it never run, the refusal is the cause', async () => {
+      const executor = withTailFixtures(
+        world({ mdstat: [MDSTAT_RESHAPING, MDSTAT_RESHAPING, MDSTAT_RESHAPING, MDSTAT_GROWN_IDLE] }),
+        { lvBytes: 6 * GIB },
+      )
+      const intent = mkIntent([X, Y, Z, W])
+      await writeIntent('tank', intent, { dir })
+      const refusal = new GuardRefusalError({ status: 409, code: 'CONFLICT', message: 'Cannot expand: array tank-r1 is degraded.' })
+      const outcome = await executeExpansion(executor, { pool: mkPool(), intent, plan: mkPlan([B1_GROWN, B2], []) }, () => {}, {
+        intentDir: dir,
+        pollIntervalMs: 1,
+        log: () => {},
+        hooks: { release: () => {}, reguard: async () => Promise.reject(refusal), reacquire: async () => {} },
+      })
+      assert.equal(outcome.ok, false)
+      assert.equal(outcome.cause, refusal, 'the refusal itself, so the job keeps its code')
+      assert.deepEqual(outcome.steps.map(s => `${s.kind} ${s.status}`), ['reshape-wait done', 'pv-create failed', 'pv-resize pending', 'vg-extend pending', 'lv-extend pending', 'fs-grow pending'])
+      assert.deepEqual(mutatingCalls(executor), [], 'nothing after the wait was acted on')
+      assert.equal((await readIntent('tank', dir))?.state, 'halted')
+    })
+
     it('a plan that already contains its reshape-wait behaves exactly as before (nothing appended)', async () => {
       const executor = world({ mdstat: [MDSTAT_RESHAPING, MDSTAT_RESHAPING, MDSTAT_GROWN_IDLE] })
       const intent = mkIntent([X, Y, Z, W])
@@ -1059,6 +1160,93 @@ unused devices: <none>
       // Intent cleared by the residual executeExpansion completion.
       assert.equal(await readIntent('tank', dir), null)
     })
+
+    it('cr.38: re-gates before the partition, each band\'s swap and the detach; gives the locks back for the copy; re-acquires for the retire', async () => {
+      const executor = world({ mdstat: [MDSTAT_BASE, MDSTAT_REPLACE_RUNNING, MDSTAT_REPLACE_DONE, MDSTAT_REPLACE_DONE] })
+      executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${N}`), results: [
+        { stdout: diskJson('sdv', SIZE_2G, []), stderr: '', exitCode: 0 },
+        { stdout: diskJson('sdv', SIZE_2G, [{ name: 'sdv1', size: B1_CLAMPED_2G, label: 'tank-d4-b1' }]), stderr: '', exitCode: 0 },
+      ] })
+      const tree = { blockdevices: Object.values(DISK_PARTS).map(d => ({
+        name: d.kernel,
+        type: 'disk',
+        size: d.size,
+        children: d.parts.map(p => ({ name: p.name, type: 'part', size: p.size, partlabel: p.label })),
+      })) }
+      executor.addFixture({ command: LSBLK, args: ['-Jb', '-o', 'NAME,TYPE,SIZE,PARTLABEL'], result: { stdout: JSON.stringify(tree), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: SGDISK, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const plan = planExpansion({
+        poolName: 'tank',
+        tier: 'ahr1',
+        existingBands: [
+          { band: 1, startBytes: 0, endBytes: 2 * GIB, level: 'raid5', members: [X, Y, Z] },
+          { band: 2, startBytes: 2 * GIB, endBytes: 3 * GIB, level: 'raid1', members: [Y, Z] },
+        ],
+        approvedDisks: [{ id: N, usableBytes: SIZE_2G }, { id: Y, usableBytes: SIZE_3G }, { id: Z, usableBytes: SIZE_3G }],
+        replaced: { oldDiskId: X, newDiskId: N },
+      })
+      const intent = mkIntent([N, Y, Z], { trigger: 'replace-disk', replacedDisk: X, replacementDisk: N })
+      const trace: string[] = []
+      const mutations = () => mutatingCalls(executor).length
+      const outcome = await executeReplace(executor, { pool: mkPool(), intent, plan, oldDiskId: X, newDiskId: N }, () => {}, {
+        intentDir: dir,
+        pollIntervalMs: 1,
+        log: () => {},
+        hooks: {
+          release: () => {
+            trace.push(`release after mutation ${mutations()}`)
+          },
+          reguard: async () => {
+            trace.push(`reguard before mutation ${mutations() + 1}`)
+            return mkPool()
+          },
+          reacquire: async () => {
+            trace.push(`reacquire before mutation ${mutations() + 1}`)
+          },
+        },
+      })
+      assert.equal(outcome.ok, true, outcome.error)
+      // Mutations: 1 sgdisk (partition N), 2 --add, 3 --replace --with,
+      // 4 --remove, 5 --zero-superblock, 6 --zap-all.
+      assert.deepEqual(trace, [
+        'reguard before mutation 1', // phase 1: partition the incoming disk
+        'reguard before mutation 2', // band 1's swap
+        'release after mutation 3', // the copy is md's
+        'reguard before mutation 4', // detach the outgoing member
+        'reguard before mutation 5', // the residual plan's partition step (a no-op now)
+        'reacquire before mutation 5', // the expansion's verdict and its intent cleared
+        'reacquire before mutation 5', // the retire, with no intent left to re-gate
+      ])
+    })
+
+    it('cr.38: a refusal at a band\'s reguard halts the replace before its --add — the refusal is the cause', async () => {
+      // md finishes the copy at once if it is ever issued, so a run that skips
+      // the refusal ends (and fails the assertions) instead of waiting forever.
+      const executor = world({ mdstat: [MDSTAT_BASE, MDSTAT_REPLACE_DONE] })
+      executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${N}`), result: { stdout: diskJson('sdv', SIZE_2G, [{ name: 'sdv1', size: B1_CLAMPED_2G, label: 'tank-d4-b1' }]), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: SGDISK, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const plan = mkPlan([B1, B2], [])
+      const intent = mkIntent([N, Y, Z], { trigger: 'replace-disk', replacedDisk: X, replacementDisk: N })
+      await writeIntent('tank', intent, { dir })
+      const refusal = new GuardRefusalError({ status: 409, code: 'CONFLICT', message: `disk '${N}' is no longer available` })
+      let calls = 0
+      const outcome = await executeReplace(executor, { pool: mkPool(), intent, plan, oldDiskId: X, newDiskId: N }, () => {}, {
+        intentDir: dir,
+        pollIntervalMs: 1,
+        log: () => {},
+        hooks: {
+          release: () => {},
+          reguard: async () => (++calls === 1 ? mkPool() : Promise.reject(refusal)),
+          reacquire: async () => {},
+        },
+      })
+      assert.equal(outcome.ok, false)
+      assert.equal(outcome.cause, refusal)
+      assert.ok(!executor.calls.some(c => c.command === MDADM && (c.args.includes('--add') || c.args.includes('--replace'))), 'no --add, no --replace')
+      assert.equal((await readIntent('tank', dir))?.state, 'halted')
+    })
   })
 
   describe('projectExistingBands', () => {
@@ -1149,6 +1337,58 @@ unused devices: <none>
     )
     // No mutating mdadm command was issued.
     assert.ok(!executor.calls.some(c => c.command === MDADM && (c.args[1] === '--re-add' || c.args[1] === '--add')))
+  })
+
+  // --- cr.38 session B: the guard's seams -----------------------------------
+
+  it('cr.38: re-gates before the band\'s re-add, gives the locks back for md\'s recovery', async () => {
+    const executor = readdWorld({ mdstats: [MDSTAT_X_FAULTY, MDSTAT_X_FAULTY, MDSTAT_X_RECOVERED] })
+    const readdIssued = () => executor.calls.some(c => c.command === MDADM && c.args[1] === '--re-add')
+    const trace: string[] = []
+    const out = await executeReadd(executor, { pool: mkPool(), diskId: X }, () => {}, {
+      pollIntervalMs: 1,
+      log: () => {},
+      hooks: {
+        release: () => {
+          trace.push(`release (re-add issued: ${readdIssued()})`)
+        },
+        reguard: async () => {
+          trace.push(`reguard (re-add issued: ${readdIssued()})`)
+          return mkPool()
+        },
+      },
+    })
+    assert.deepEqual(out.bands, [{ band: 1, mode: 'differential' }])
+    assert.deepEqual(trace, ['reguard (re-add issued: false)', 'release (re-add issued: true)'])
+  })
+
+  it('cr.38: a slot md took back while the job waited for its locks is left alone — no --re-add, no notification', async () => {
+    const executor = readdWorld({ mdstats: [MDSTAT_X_FAULTY, MDSTAT_X_RECOVERED] })
+    const out = await executeReadd(executor, { pool: mkPool(), diskId: X }, () => {}, {
+      pollIntervalMs: 1,
+      log: () => {},
+      hooks: { release: () => {}, reguard: async () => mkPool() },
+    })
+    assert.deepEqual(out.bands, [])
+    assert.ok(!executor.calls.some(c => c.command === MDADM && (c.args[1] === '--re-add' || c.args[1] === '--remove')))
+    assert.ok(!executor.calls.some(c => c.command === PERL), 'nothing to announce')
+  })
+
+  it('cr.38: a slice whose superblock no longer names the band at the reguard is refused — no --re-add', async () => {
+    const executor = readdWorld({ mdstats: [MDSTAT_X_FAULTY, MDSTAT_X_FAULTY, MDSTAT_X_RECOVERED] })
+    executor.prependFixture({
+      command: MDADM,
+      args: ['--examine', '--export', `/dev/disk/by-id/${X}-part1`],
+      results: [
+        { stdout: `MD_UUID=${R1_UUID}\nMD_NAME=anas-test:tank-r1\n`, stderr: '', exitCode: 0 },
+        { stdout: 'MD_UUID=ffffffff:ffffffff:ffffffff:ffffffff\nMD_NAME=anas-test:other-r1\n', stderr: '', exitCode: 0 },
+      ],
+    })
+    await assert.rejects(
+      executeReadd(executor, { pool: mkPool(), diskId: X }, () => {}, { pollIntervalMs: 1, log: () => {}, hooks: { release: () => {}, reguard: async () => mkPool() } }),
+      /no longer matches array .* nothing was re-added/,
+    )
+    assert.ok(!executor.calls.some(c => c.command === MDADM && (c.args[1] === '--re-add' || c.args[1] === '--add' || c.args[1] === '--remove')))
   })
 
   it('absent device is refused before any command', async () => {

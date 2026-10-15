@@ -75,6 +75,27 @@ export interface JobContext {
    * the publishing job family's business (cloud sync: `CloudRunDetail`).
    */
   updateDetail: (detail: unknown) => void
+  /**
+   * Give up this job's object locks while it only WATCHES kernel work (cr.38,
+   * WAVE3-DESIGN §4.3): a long AHR job calls it before an md reshape, resync,
+   * replace copy or check it waits on, so the pool is not held for hours by a
+   * job that is changing nothing. The job keeps its SLOT: its body is still
+   * running (polling), and the long lane already leaves one slot for short
+   * verbs. A job with an abandoned child (§4.4) keeps the locks until that
+   * child exits, exactly as it would at its end. A job holding nothing (no
+   * claims, or already released) is unchanged.
+   */
+  release: () => void
+  /**
+   * Take the locks back after {@link release}, through the same FIFO table a
+   * new job goes through (§4.4): the claims queue BEHIND every job already
+   * waiting on their keys, the job's progress line names the job in its way
+   * while it waits, and the promise resolves once every claim is granted at
+   * once (all-or-nothing, so no deadlock: the job holds nothing while it
+   * waits). A job that still holds its locks resolves at once. The guard's
+   * `reguard()` calls this before it re-reads and re-gates.
+   */
+  reacquire: () => Promise<void>
 }
 
 /** The function a job executes. Receives a progress callback and the cancel seam. */
@@ -158,6 +179,21 @@ interface JobRecord {
   lane: JobLane
   /** The progress line `drain` wrote while the job waited for a lock (cleared when it no longer does). */
   waitingLine?: string
+  /**
+   * Where the job's claims stand (cr.38): `queued` before the first grant,
+   * `held` while granted, `released` after {@link JobContext.release},
+   * `reacquiring` while {@link JobContext.reacquire} waits in the table.
+   */
+  lockState: 'queued' | 'held' | 'released' | 'reacquiring'
+  /**
+   * The job's place in the lock FIFO: its submission order, renewed when it
+   * re-acquires (it waits "like a new job", behind everyone already waiting).
+   */
+  waitSeq: number
+  /** The re-acquire's resolver while it waits in the table. */
+  regranted?: () => void
+  /** A `release()` deferred because a child it ran was abandoned and still runs (§4.4). */
+  releaseDeferred?: boolean
 }
 
 /** Why a queued job cannot start yet: the claim, and the job in its way. */
@@ -178,6 +214,8 @@ export class JobQueue {
   private readonly abandoned: AbandonedRegistry
   /** At most this many slots run `long` jobs: one slot is always left for short verbs. */
   readonly longSlots: number
+  /** The lock FIFO's counter: submissions and re-acquires draw from it. */
+  private seq = 0
 
   constructor(opts?: {
     concurrency?: number
@@ -240,6 +278,8 @@ export class JobQueue {
       ...(opts.control ? { control: true } : {}),
       claims: normaliseClaims(opts.locks ?? []),
       lane: opts.lane ?? 'short',
+      lockState: 'queued',
+      waitSeq: ++this.seq,
     }
     this.jobs.set(id, record)
 
@@ -314,9 +354,17 @@ export class JobQueue {
     paramKey: string = 'name',
     /** Extra submitter-param key/values a match must ALSO carry (e.g. `{ direct: true }`). */
     withParams?: Record<string, unknown>,
+    /**
+     * `before`: only a job submitted BEFORE this job id counts (cr.38) — the
+     * question a job's own re-check asks: "is an OLDER job in my way?". The
+     * job itself, and every job after it, is never the answer.
+     */
+    opts: { before?: string } = {},
   ): Job | undefined {
     const wanted = new Set(typeof operations === 'string' ? [operations] : operations)
     for (const record of this.jobs.values()) {
+      if (opts.before !== undefined && record.job.id === opts.before)
+        return undefined
       if (!wanted.has(record.job.operation) || record.submitter.params?.[paramKey] !== target)
         continue
       if (withParams) {
@@ -474,15 +522,31 @@ export class JobQueue {
   private drain(): void {
     /** The claims of earlier jobs still queued: a later job may not overtake them. */
     const ahead: LockWait[] = []
-    for (const record of this.jobs.values()) {
-      if (record.job.status !== 'queued' || record.control)
-        continue
-
+    for (const record of this.lockFifo()) {
       const wait = this.lockWait(record, ahead)
+      // A running job re-acquiring its locks (cr.38) kept its slot: only the
+      // locks decide when it goes on.
+      if (record.lockState === 'reacquiring') {
+        if (!wait) {
+          this.locks.grant(record.job, record.claims)
+          record.lockState = 'held'
+          this.clearWaiting(record)
+          const regranted = record.regranted
+          record.regranted = undefined
+          regranted?.()
+          continue
+        }
+        this.showWaiting(record, wait)
+        for (const claim of record.claims)
+          ahead.push({ claim, job: record.job })
+        continue
+      }
+
       const slotFree = this.running < this.concurrency
         && (record.lane !== 'long' || this.runningLong < this.longSlots)
       if (!wait && slotFree) {
         this.locks.grant(record.job, record.claims)
+        record.lockState = 'held'
         this.running++
         if (record.lane === 'long')
           this.runningLong++
@@ -493,6 +557,68 @@ export class JobQueue {
       for (const claim of record.claims)
         ahead.push({ claim, job: record.job })
     }
+  }
+
+  /**
+   * Every job waiting for the lock table, in FIFO order (cr.38): the queued
+   * jobs and the running jobs re-acquiring their locks, by `waitSeq` — a
+   * re-acquire queues behind every job already waiting, like a new job.
+   */
+  private lockFifo(): JobRecord[] {
+    const waiting: JobRecord[] = []
+    for (const record of this.jobs.values()) {
+      if ((record.job.status === 'queued' && !record.control) || record.lockState === 'reacquiring')
+        waiting.push(record)
+    }
+    waiting.sort((a, b) => a.waitSeq - b.waitSeq)
+    return waiting
+  }
+
+  /**
+   * {@link JobContext.release} (cr.38): give the claims back while the body
+   * watches kernel work. A command the job ran that outlived its SIGKILL is
+   * still changing the object (§4.4), so the locks stay until it exits — the
+   * same rule as the job's end.
+   */
+  private releaseHeld(record: JobRecord): void {
+    if (record.lockState !== 'held' || record.claims.length === 0 || record.releaseDeferred)
+      return
+    const { job, claims } = record
+    if (this.abandoned.forJob(job.id).length > 0) {
+      record.releaseDeferred = true
+      void this.abandoned.whenJobClear(job.id).then(() => {
+        // Taken back meanwhile by a re-acquire, or the job ended (its own
+        // end-of-job release ran): nothing left to do here.
+        if (!record.releaseDeferred || record.lockState !== 'held')
+          return
+        record.releaseDeferred = false
+        this.locks.release(job.id, claims)
+        record.lockState = 'released'
+        this.drain()
+      })
+      return
+    }
+    this.locks.release(job.id, claims)
+    record.lockState = 'released'
+    this.drain()
+  }
+
+  /** {@link JobContext.reacquire} (cr.38): wait in the FIFO for every claim again. */
+  private reacquireReleased(record: JobRecord): Promise<void> {
+    if (record.lockState === 'held' || record.claims.length === 0) {
+      // Nothing to take back (no claims), or still held — never released, or a release deferred behind an
+      // abandoned child: the job keeps what it has.
+      record.releaseDeferred = false
+      return Promise.resolve()
+    }
+    if (record.lockState !== 'released')
+      return Promise.reject(new Error(`job ${record.job.id}: re-acquire while its locks are ${record.lockState}`))
+    return new Promise<void>((resolve) => {
+      record.lockState = 'reacquiring'
+      record.waitSeq = ++this.seq
+      record.regranted = resolve
+      this.drain()
+    })
   }
 
   /** The first claim of `record` that cannot be granted now, and the job in its way; null when all can. */
@@ -542,8 +668,12 @@ export class JobQueue {
    */
   private releaseLocks(record: JobRecord): void {
     const { job, claims } = record
-    if (claims.length === 0)
+    // A job that ended with its claims given back (cr.38 `release()`) holds
+    // nothing; a deferred release is superseded by this one.
+    record.releaseDeferred = false
+    if (claims.length === 0 || record.lockState !== 'held')
       return
+    record.lockState = 'released'
     if (this.abandoned.forJob(job.id).length === 0) {
       this.locks.release(job.id, claims)
       return
@@ -581,6 +711,8 @@ export class JobQueue {
       updateDetail: (detail) => {
         job.detail = detail
       },
+      release: () => this.releaseHeld(record),
+      reacquire: () => this.reacquireReleased(record),
     }
 
     let outcome: { ok: true, result: unknown } | { ok: false, err: unknown }
@@ -664,6 +796,12 @@ export class JobQueue {
         this.running--
         if (record.lane === 'long')
           this.runningLong--
+      }
+      // A re-acquire the body never awaited (cr.38) dies with the job: the
+      // table must never grant locks to a job that has ended.
+      if (record.lockState === 'reacquiring') {
+        record.lockState = 'released'
+        record.regranted = undefined
       }
       // cr.33: once the status is settled, never before (§4.4).
       this.releaseLocks(record)

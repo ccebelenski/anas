@@ -1,7 +1,7 @@
 import type { AhrPool, IscsiHeldByLun } from '@anas/shared'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { JobQueue, LockClaim, LockMode } from '../jobs/queue.js'
-import type { Gate, GuardBound, GuardReads, ObjectView } from '../safety/guard.js'
+import type { Gate, GuardBound, GuardReads, ObjectView, Refusal } from '../safety/guard.js'
 import type { PoolIntent } from './ahr-intent.js'
 import type { IscsiClaimCache } from './iscsi-held.js'
 import type { IscsiPaths } from './iscsi.js'
@@ -65,6 +65,28 @@ export function ahrHeldByLunConflict(what: string, action: string, held: IscsiHe
 /** The pool's array UUIDs, sorted — part of every AHR verb's bound identity. */
 export function poolArrayUuids(pool: Pick<AhrPool, 'arrays'>): string[] {
   return pool.arrays.map(a => a.uuid ?? `unknown:${a.band}`).sort()
+}
+
+/**
+ * The §4 pre-check of an expansion, as one function for both doors (story
+ * cr.38 session B; the expand route's `refuseDegraded` since Epic 11.6): never
+ * start a reshape on a degraded, inactive, failed, read-only or offline pool.
+ * `inactive` and `offline` are named for their own reason — an unassembled
+ * volume has no double-failure window, it has nothing to reshape. A hard 409,
+ * no confirm bypass.
+ */
+export function expansionStateRefusal(pool: Pick<AhrPool, 'name' | 'state' | 'arrays'>): Refusal | null {
+  const badArray = pool.arrays.find(a => a.state === 'degraded' || a.state === 'inactive' || a.state === 'failed')
+  if (!badArray && pool.state !== 'offline' && pool.state !== 'failed' && pool.state !== 'readonly')
+    return null
+  const unreachable = pool.state === 'offline' || badArray?.state === 'inactive'
+  const what = badArray
+    ? `array ${pool.name}-r${badArray.band} is ${badArray.state}`
+    : `pool '${pool.name}' is ${pool.state}`
+  const why = unreachable
+    ? `The volume is not assembled, so there is nothing to reshape — bring the pool back online first.`
+    : `Reshaping a degraded pool voluntarily enters the double-failure window (§4) — replace/rebuild first.`
+  return { status: 409, code: 'CONFLICT', message: `Cannot expand: ${what}. ${why} This refusal has no confirm bypass.` }
 }
 
 /** The advisory key and sentence for an unreadable LIO tree (the pools.ts pair, AHR's words). */

@@ -6,7 +6,7 @@ import type {
 } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { ChunkItem, MdGeometry, MemberLocation, SelfhealBand, SelfhealContext } from './selfheal-map.js'
-import { AhrMirrorReconcileResult as AhrMirrorReconcileResultSchema } from '@anas/shared'
+import { AhrMirrorReconcileReasonCode as AhrMirrorReconcileReasonCodeSchema, AhrMirrorReconcileResult as AhrMirrorReconcileResultSchema } from '@anas/shared'
 import { z } from 'zod'
 import { approximateDuration, waitForOwnSyncOp } from './ahr-parity-rewrite.js'
 import {
@@ -219,6 +219,14 @@ export interface MirrorReconcileOptions {
    * already has one. Resolved from the mountpoint when absent.
    */
   context?: SelfhealContext
+  /**
+   * The guard's seams (story cr.38 session B; see `ParityRewriteOptions`):
+   * `reguard` before every arm-A pass after the first, every whole-band check
+   * and arm B's first write; `release` while md runs each whole-band check.
+   * A refusal is reported (one result, one notification) and rethrown.
+   */
+  reguard?: () => Promise<void>
+  release?: () => void
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +598,8 @@ async function wholeBandCheck(
   if (issued.exitCode !== 0)
     return { ok: false, foreign: `mdadm --action=check on ${label} exited ${issued.exitCode}${issued.stderr.trim() ? `: ${issued.stderr.trim()}` : ''}` }
   markCheckIssued(geo.kernel)
+  // cr.38 (§4.3): the check is md's; the job only watches it.
+  opts.release?.()
   let waited: Awaited<ReturnType<typeof waitForOwnSyncOp>>
   try {
     waited = await waitForOwnSyncOp(executor, geo, label, 'check', prior, opts)
@@ -921,9 +931,34 @@ export async function reconcileMirrorBand(
   if (live !== null)
     state.mismatchBefore = live
 
+  /**
+   * The guard's re-check before an act (cr.38). A refusal ends the run with
+   * `outcome` and the refusal's sentence (its reason code when it is one of
+   * this verb's), then is rethrown for the job's error code.
+   */
+  const regate = async (outcome: 'refused' | 'residual', when: string): Promise<void> => {
+    if (!opts.reguard)
+      return
+    try {
+      await opts.reguard()
+    }
+    catch (error) {
+      const code = AhrMirrorReconcileReasonCodeSchema.safeParse((error as { refusal?: { reason?: unknown } }).refusal?.reason)
+      await finish(outcome, array.device, {
+        reason: `${error instanceof Error ? error.message : String(error)} (${when})`,
+        ...(code.success ? { reasonCode: code.data } : {}),
+      })
+      throw error
+    }
+  }
+
   // --- Arm A: scrub until clean ---------------------------------------------
   const passes = Math.max(1, opts.scrubPasses ?? MIRROR_SCRUB_PASSES)
   for (let pass = 1; pass <= passes; pass++) {
+    // The first pass runs on the job's own entry check; every later one
+    // follows a whole-band check whose wait gave the key back.
+    if (pass > 1)
+      await regate('refused', `re-checked before arm A pass ${pass}`)
     progress(`arm A, pass ${pass}/${passes}: btrfs checksum scrub of pool '${pool.name}'. A scrub that meets the rot heals the band through md`)
     const scrubStart = Date.now()
     const ran = await btrfsScrubPass(guarded, pool.mountpoint, pool.name, progress, opts.pollIntervalMs ?? AHR_SCRUB_POLL_MS)
@@ -953,6 +988,7 @@ export async function reconcileMirrorBand(
 
     const checkStart = Date.now()
     progress(`arm A, pass ${pass}: whole-band md check on ${label}. md counts legs that disagree, so this is what says whether the band is done`)
+    await regate('refused', `re-checked before arm A pass ${pass}'s whole-band check`)
     const checked = await wholeBandCheck(guarded, geo, label, opts)
     state.checkMs += Date.now() - checkStart
     if (!checked.ok) {
@@ -981,7 +1017,9 @@ export async function reconcileMirrorBand(
 
   // The same preconditions, immediately before anything is written. Arm A can
   // be hours on a real pool, and every one of these can have stopped being
-  // true in that time.
+  // true in that time. Under the guard (cr.38) the job's whole gate list runs
+  // first, against the node now.
+  await regate('refused', 're-checked before arm B; nothing was written')
   const evidenceNow = opts.evidence ? await opts.evidence() : null
   if (evidenceNow && !evidenceNow.ok)
     return finish('refused', array.device, { reason: `${evidenceNow.reason} (re-checked before arm B)`, reasonCode: evidenceNow.code })
@@ -1083,6 +1121,7 @@ export async function reconcileMirrorBand(
 
   // --- The proof: a whole-band check, again ---------------------------------
   progress(`arm B: whole-band md check on ${label}. Proving the legs agree now`)
+  await regate('residual', `arm B wrote ${state.rowsWritten.leg0 + state.rowsWritten.leg1} row(s); the verifying check was not issued, so the band is unproven`)
   const finalStart = Date.now()
   const finalCheck = await wholeBandCheck(guarded, geo, label, opts)
   state.checkMs += Date.now() - finalStart

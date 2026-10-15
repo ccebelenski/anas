@@ -1197,7 +1197,7 @@ describe('runCloudSync — an accepted cancel ends the pre-flight (rclone.5 revi
   function fakeCtx(): { ctx: JobContext, set: (c: JobCancellation | null) => void } {
     let cancellation: JobCancellation | null = null
     return {
-      ctx: { onCancel: () => {}, cancellation: () => cancellation, updateDetail: () => {} },
+      ctx: { onCancel: () => {}, cancellation: () => cancellation, updateDetail: () => {}, release: () => {}, reacquire: async () => {} },
       set: (c) => {
         cancellation = c
       },

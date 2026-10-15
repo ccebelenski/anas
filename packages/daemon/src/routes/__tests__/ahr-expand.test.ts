@@ -16,7 +16,7 @@ import { diskLsblkArgs } from '../../services/ahr-expand-exec.js'
 import { readIntent, writeIntent } from '../../services/ahr-intent.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
-import { AHR_ABANDON_PRESENTATION_ONLY, ahrExpansionRoutes } from '../ahr-expand.js'
+import { AHR_ABANDON_PRESENTATION_ONLY, AHR_READD_PRESENTATION_ONLY, ahrExpansionRoutes } from '../ahr-expand.js'
 
 const GIB = 1024 ** 3
 const MIB = 1024 ** 2
@@ -797,5 +797,200 @@ describe('cr.38 — abandon re-checks the intent in the job (ruling (j))', () =>
 
   it('the abandon confirm signs the whole request — no presentation-only fields', () => {
     assert.deepEqual(AHR_ABANDON_PRESENTATION_ONLY, {})
+  })
+})
+
+/**
+ * Story cr.38 session B — the LONG AHR verbs re-gate in the job (WAVE3-DESIGN
+ * §2.3 rows "expand", "resume", "replace", "readd"; §8.2 race tests). Each
+ * "Missing" cell gets the H8 race: the operator confirms, the job waits in
+ * the real queue behind four held slots, the node changes, the slots are
+ * released — and the job refuses with the gate's code before any mutating
+ * argv, leaving the intent it was submitted for HALTED (never `running` with
+ * nothing driving it).
+ *
+ * Fixtures: the GiB-aligned synthetic `tank` of this file (its shapes are the
+ * stage-0 captures' at GiB scale — see ahr-expand-exec.test.ts). The flips
+ * are this harness's own variants: `MDSTAT_DEGRADED` (a member lost from
+ * md127), the inventory with one disk carrying a ZFS partition, and md127/
+ * md126 answering new array UUIDs (the pool destroyed and re-created).
+ */
+describe('cr.38 session B — expand, resume, replace and readd re-gate in the job (ruling (j))', () => {
+  let dir: string
+  let executor: MockExecutor
+  let jobQueue: JobQueue
+  let server: ReturnType<typeof Fastify>
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-cr38b-'))
+    executor = buildExecutor()
+    jobQueue = new JobQueue()
+    server = Fastify({ logger: false })
+    await server.register(ahrExpansionRoutes, { prefix: '/v1', executor, jobQueue, confirmStore: new ConfirmStore(), diskIdentityCache: new DiskIdentityCache(executor), intentDir: dir })
+  })
+  afterEach(async () => {
+    await server?.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  interface Verb { url: string, payload?: Record<string, unknown> }
+  const EXPAND: Verb = { url: '/v1/ahr/tank/expand', payload: { addDisks: [W] } }
+  const RESUME: Verb = { url: '/v1/ahr/tank/expand/resume' }
+  const REPLACE: Verb = { url: `/v1/ahr/tank/disk/${X}/replace`, payload: { newDiskId: W } }
+  const READD: Verb = { url: `/v1/ahr/tank/disk/${X}/readd` }
+
+  async function confirmBehindFullQueue(verb: Verb): Promise<{ id: string, release: () => void }> {
+    const first = await server.inject({ method: 'POST', url: verb.url, headers: IDENTITY_HEADERS, payload: verb.payload })
+    assert.equal(first.statusCode, 409, first.body)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED', first.body)
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (let i = 0; i < 4; i++)
+      jobQueue.submit('test.hold', { user: 'test', uid: 0 }, () => held)
+    const res = await server.inject({ method: 'POST', url: verb.url, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string }, payload: verb.payload })
+    assert.equal(res.statusCode, 202, res.body)
+    const id = res.json().job.id as string
+    assert.equal(jobQueue.get(id)?.status, 'queued', 'the confirmed job waits behind the held slots')
+    return { id, release }
+  }
+
+  async function refusedInJob(id: string, release: () => void, code: string, message: RegExp): Promise<Job> {
+    const before = mutatingCalls(executor).length
+    release()
+    const job = await waitForJob(jobQueue, id)
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    assert.equal(job.error?.code, code, JSON.stringify(job.error))
+    assert.match(job.error!.message, message)
+    assert.deepEqual(mutatingCalls(executor).slice(before), [], 'no mutating argv')
+    return job
+  }
+
+  /** `W` now carries a ZFS partition — another pool's vdev (the inventory shape of this file, one child added). */
+  function wBecomesAZfsVdev(): void {
+    const inventory = JSON.parse(inventoryLsblkJson()) as { blockdevices: { name: string, children: unknown[] }[] }
+    inventory.blockdevices.find(d => d.name === 'sdt')!.children = [{ name: 'sdt1', type: 'part', size: SIZE_4G - 2 * MIB, fstype: 'zfs_member', mountpoint: null }]
+    executor.prependFixture({ command: '/usr/bin/lsblk', args: [...LSBLK_ARGS], result: { stdout: JSON.stringify(inventory), stderr: '', exitCode: 0 } })
+  }
+
+  /** Pool `tank` destroyed and re-created under its name: both band arrays answer new UUIDs. */
+  function tankRecreated(): void {
+    executor.prependFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: exportFor('tank-r1', 'raid5', 3, 'dddddddd:dddddddd:dddddddd:dddddddd'), stderr: '', exitCode: 0 } })
+    executor.prependFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md126'], result: { stdout: exportFor('tank-r2', 'raid1', 2, 'eeeeeeee:eeeeeeee:eeeeeeee:eeeeeeee'), stderr: '', exitCode: 0 } })
+  }
+
+  function tankDegrades(): void {
+    executor.prependFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: { stdout: MDSTAT_DEGRADED, stderr: '', exitCode: 0 } })
+  }
+
+  async function intentState(): Promise<string | undefined> {
+    return (await readIntent('tank', dir))?.state
+  }
+
+  // --- control ---------------------------------------------------------------
+
+  it('control: with nothing changed the held expand passes its re-check and goes on to partition the new disk', async () => {
+    const { id, release } = await confirmBehindFullQueue(EXPAND)
+    release()
+    const job = await waitForJob(jobQueue, id)
+    // The harness has no per-disk tree for W, so the partition step itself
+    // fails — AFTER every gate passed, which is all the control asserts.
+    assert.ok(!['CONFLICT', 'STATE_CHANGED', 'IDENTITY_MISMATCH'].includes(job.error?.code ?? ''), JSON.stringify(job.error))
+    assert.match(job.error?.message ?? '', /disk|partition/, JSON.stringify(job.error))
+    assert.ok(executor.calls.some(c => c.command === '/usr/bin/lsblk' && c.args.join(' ') === diskLsblkArgs(`/dev/disk/by-id/${W}`).join(' ')), 'the partition step ran')
+  })
+
+  // --- expand: composability, degraded, identity --------------------------------
+
+  it('expand: the new disk becomes another pool\'s vdev between the confirm and the job — refused, nothing written, the intent halted', async () => {
+    const { id, release } = await confirmBehindFullQueue(EXPAND)
+    wBecomesAZfsVdev()
+    await refusedInJob(id, release, 'CONFLICT', new RegExp(`disk '${W}' is no longer available .*nothing more was done to pool 'tank'`))
+    assert.equal(await intentState(), 'halted', 'resumable or abandonable — never a running intent nobody drives')
+  })
+
+  it('expand: a member lost between the confirm and the job — the §4 refusal in the job, nothing written, the intent halted', async () => {
+    const { id, release } = await confirmBehindFullQueue(EXPAND)
+    tankDegrades()
+    await refusedInJob(id, release, 'CONFLICT', /^Cannot expand: array tank-r1 is degraded/)
+    assert.equal(await intentState(), 'halted')
+  })
+
+  it('expand: the pool destroyed and re-created under its name between the confirm and the job — IDENTITY_MISMATCH, nothing written', async () => {
+    const { id, release } = await confirmBehindFullQueue(EXPAND)
+    tankRecreated()
+    await refusedInJob(id, release, 'IDENTITY_MISMATCH', /AHR pool 'tank'/)
+  })
+
+  it('expand: the intent replaced by another expansion\'s while the job waits — STATE_CHANGED, the other intent untouched', async () => {
+    const { id, release } = await confirmBehindFullQueue(EXPAND)
+    const other = { ...mkIntent('halted'), arrayUuids: ['aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa'] }
+    await writeIntent('tank', other, { dir })
+    await refusedInJob(id, release, 'STATE_CHANGED', /AHR pool 'tank' changed since you confirmed/)
+    assert.equal((await readIntent('tank', dir))?.id, other.id)
+    assert.equal(await intentState(), 'halted', 'the other expansion\'s intent keeps its own state')
+  })
+
+  // --- resume: as expand -----------------------------------------------------
+
+  it('resume: a disk the halted expansion approved becomes another pool\'s vdev between the confirm and the job — refused, halted again', async () => {
+    await writeIntent('tank', { ...mkIntent('halted'), approvedDisks: [X, Y, Z, W] }, { dir })
+    const { id, release } = await confirmBehindFullQueue(RESUME)
+    assert.equal(await intentState(), 'running', 'the route flipped it to running for the job')
+    wBecomesAZfsVdev()
+    await refusedInJob(id, release, 'CONFLICT', new RegExp(`disk '${W}' is no longer available`))
+    assert.equal(await intentState(), 'halted')
+  })
+
+  it('resume: the pool re-created under its name between the confirm and the job — IDENTITY_MISMATCH, nothing written', async () => {
+    await writeIntent('tank', { ...mkIntent('halted'), approvedDisks: [X, Y, Z, W] }, { dir })
+    const { id, release } = await confirmBehindFullQueue(RESUME)
+    tankRecreated()
+    await refusedInJob(id, release, 'IDENTITY_MISMATCH', /AHR pool 'tank'/)
+  })
+
+  // --- replace: composability of the new disk --------------------------------
+
+  it('replace: the replacement disk becomes another pool\'s vdev between the confirm and the job — refused, nothing written, the intent halted', async () => {
+    const { id, release } = await confirmBehindFullQueue(REPLACE)
+    wBecomesAZfsVdev()
+    await refusedInJob(id, release, 'CONFLICT', new RegExp(`disk '${W}' is no longer available`))
+    assert.equal(await intentState(), 'halted')
+  })
+
+  // --- readd: the intent -----------------------------------------------------
+
+  it('readd: an expansion intent written between the confirm and the job refuses the re-add — no mdadm', async () => {
+    const { id, release } = await confirmBehindFullQueue(READD)
+    await writeIntent('tank', { ...mkIntent('running'), arrayUuids: ['aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa'] }, { dir })
+    await refusedInJob(id, release, 'CONFLICT', /Pool 'tank' has an expansion intent \(state 'running'\) — Resume or Abandon it first/)
+  })
+
+  it('readd: a confirm signs the disk — a resend for another disk is challenged again, nothing submitted', async () => {
+    const first = await server.inject({ method: 'POST', url: READD.url, headers: IDENTITY_HEADERS })
+    const other = await server.inject({ method: 'POST', url: `/v1/ahr/tank/disk/${Y}/readd`, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
+    assert.equal(other.statusCode, 409, other.body)
+    // The disk is an ADDRESS field (the path names it): another disk is another
+    // object, so the code is no code for it — a fresh challenge, not a run.
+    assert.equal(other.json().error.code, 'CONFIRMATION_REQUIRED', other.body)
+    assert.equal(jobQueue.list().length, 0)
+  })
+
+  // --- the locks ---------------------------------------------------------------
+
+  it('the expansion job holds the pool\'s key and every disk it may partition, in the long lane', async () => {
+    const { id, release } = await confirmBehindFullQueue(EXPAND)
+    // The harness's `vgs` carries no vg_uuid column, so the pool is locked by
+    // its name key (§4.2's fallback) — plus every approved disk.
+    const record = (jobQueue as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[], lane: string }> }).jobs.get(id)!
+    assert.deepEqual(record.claims.map(c => `${c.key} ${c.mode}`).sort(), ['ahrname:tank exclusive', `disk:${W} exclusive`, `disk:${X} exclusive`, `disk:${Y} exclusive`, `disk:${Z} exclusive`])
+    assert.equal(record.lane, 'long')
+    release()
+    await waitForJob(jobQueue, id)
+  })
+
+  it('the re-add confirm signs the whole request — no presentation-only fields', () => {
+    assert.deepEqual(AHR_READD_PRESENTATION_ONLY, {})
   })
 })

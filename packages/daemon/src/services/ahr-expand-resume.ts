@@ -1,14 +1,18 @@
 import type { AhrCapacity, AhrExpansionIntent, AhrPool, AhrReplacePair, JobRef } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { Gate, GuardPass, GuardSpec } from '../safety/guard.js'
+import type { ExpansionHooks } from './ahr-expand-exec.js'
 import type { AhrExpansionPlan, AhrLayoutDisk, AhrReplacement } from './ahr-layout.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
 import { isComposableDisk } from '@anas/shared'
 import { collectDisks } from '../routes/disks.js'
-import { executeExpansion, executeReplace, projectExistingBands, pvCatchUpSteps, readDiskTree, syncCompletionSteps, syncingAhrBands, underSizedPvBands } from './ahr-expand-exec.js'
+import { guarded } from '../safety/guard.js'
+import { executeExpansion, executeReplace, haltWithFailure, projectExistingBands, pvCatchUpSteps, readDiskTree, syncCompletionSteps, syncingAhrBands, underSizedPvBands } from './ahr-expand-exec.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
+import { ahrGuard, expansionStateRefusal, poolArrayUuids } from './ahr-guard.js'
 import { classifyPartition, readAhrPoolIdentity } from './ahr-identity.js'
-import { AhrIntentConflictError, writeIntent } from './ahr-intent.js'
+import { AhrIntentConflictError, readIntent, writeIntent } from './ahr-intent.js'
 import { AhrPlanError, existingLayoutUsableBytes, planExpansion } from './ahr-layout.js'
 import { spareCoverageWarnings } from './ahr-spare.js'
 import { kernelInfo } from './kernel-version.js'
@@ -238,6 +242,106 @@ export interface ExpansionDeps {
   jobQueue: JobQueue
   /** AhrExpansionIntent store directory (§5.3 — the ONLY persisted state). */
   intentDir: string
+  /** The inventory cache the job's composability gate reads (cr.38). */
+  diskCache: DiskIdentityCache
+}
+
+/** The expansion job's guard object (cr.38): the pool as it is now, with its expansion intent. */
+export type ExpansionObject = AhrPool & { intent: AhrExpansionIntent | null }
+
+/**
+ * The guard spec of the job that drives an expansion, a guided replace or a
+ * resume (story cr.38 session B, WAVE3-DESIGN §2.3 "expand", "resume",
+ * "replace"; ruling (j)). The route has already confirmed, written the intent
+ * and submitted; the job re-reads everything against the pool as it is NOW,
+ * when it starts and again before every act step (`reguard`):
+ *
+ *  - id: the pool's VG UUID plus every band array the pool had when the job
+ *    was submitted (bands the expansion creates are its own, not a change of
+ *    pool) — a pool destroyed and re-created under the name is another pool,
+ *    and IDENTITY_MISMATCH ends the run before anything is written;
+ *  - revision: the intent's id and state — the job drives the intent it was
+ *    submitted for while it is `running`; one abandoned, halted or replaced
+ *    meanwhile fails STATE_CHANGED (the job never drives somebody else's);
+ *  - gates: every approved disk is still the one the expansion took
+ *    (`resolveApproved` in its resume form: a disk new to the pool must still
+ *    be composable, or carry nothing but this pool's own slices — what a
+ *    partition step leaves) and, for `ahr.expand`, the §4 degraded refusal:
+ *    never start or go on with a reshape the operator did not confirm on a
+ *    degraded pool. A member failing mid-expansion halts it before the next
+ *    step, and Resume is the operator's say-so to go on — resume and replace
+ *    never refused a degraded pool at their route, and replace exists for one.
+ *
+ * The locks: the pool's key exclusive (§4.2 "expand step, replace step") and
+ * every disk the run partitions or retires.
+ */
+export function expansionGuard(
+  deps: ExpansionDeps,
+  args: { pool: AhrPool, intent: AhrExpansionIntent, operation: string, replace?: AhrReplacePair },
+): { spec: GuardSpec<ExpansionObject>, pass: GuardPass<ExpansionObject> } {
+  const { executor, intentDir, diskCache } = deps
+  const { pool, intent, operation, replace } = args
+  const guard = ahrGuard({ executor, intentDir, iscsiPaths: () => ({}) })
+  const submittedArrays = poolArrayUuids(pool)
+  const idOf = (o: AhrPool) => {
+    const now = new Set(poolArrayUuids(o))
+    return {
+      arrays: submittedArrays.filter(u => now.has(u)).join(','),
+      ...(o.vg.uuid ? { vgUuid: o.vg.uuid } : {}),
+    }
+  }
+  const revisionOf = (i: AhrExpansionIntent | null) => i ? `${i.id}:${i.state}` : null
+
+  const composableGate: Gate<ExpansionObject> = async (o) => {
+    const { problems } = await resolveApproved(executor, diskCache, o, o.intent?.approvedDisks ?? intent.approvedDisks, false)
+    return problems.length > 0
+      ? { status: 409, code: 'CONFLICT', message: `${problems.join('; ')} — nothing more was done to pool '${o.name}'. Reattach or free the disk and Resume, or Abandon the expansion.` }
+      : null
+  }
+  const stateGate: Gate<ExpansionObject> = async o => expansionStateRefusal(o)
+
+  const disks = [...intent.approvedDisks, ...(replace ? [replace.oldDiskId] : [])]
+  const spec: GuardSpec<ExpansionObject> = {
+    operation,
+    object: {
+      what: `AHR pool '${pool.name}'`,
+      read: async (reads) => {
+        const now = (await guard.reads.pools(reads)).find(p => p.name === pool.name)
+        return now ? { ...now, intent: (await guard.reads.intent(reads, now)).intent } : null
+      },
+      id: async o => idOf(o),
+      revision: async o => revisionOf(o.intent),
+      unbound: () => `Could not read the identity of AHR pool '${pool.name}' — refusing an expansion that cannot be bound to it`,
+    },
+    gates: operation === 'ahr.expand' ? [stateGate, composableGate] : [composableGate],
+    locks: async (o, bound) => guard.claims(o, bound, 'exclusive', { disks }),
+  }
+  const bound = { id: idOf(pool), revision: `${intent.id}:${intent.state}` }
+  return {
+    spec,
+    pass: {
+      object: { ...pool, intent },
+      bound,
+      advisories: [],
+      locks: guard.claims(pool, bound, 'exclusive', { disks }),
+    },
+  }
+}
+
+/**
+ * A job the guard refused BEFORE its first step leaves the intent it was
+ * submitted for `running` with nothing driving it — resume refuses a running
+ * intent and abandon refuses one being driven, so the pool would be stuck
+ * until the next daemon start. Halt it with the executor's own bookkeeping —
+ * but only while the file still holds THIS intent, still running: one
+ * abandoned, halted or replaced meanwhile is somebody else's to keep.
+ */
+async function haltUnstarted(executor: CommandExecutor, intentDir: string, pool: AhrPool, intent: AhrExpansionIntent, err: unknown): Promise<void> {
+  const current = await readIntent(pool.name, intentDir)
+  if (current?.id !== intent.id || current.state !== 'running')
+    return
+  const message = err instanceof Error ? err.message : String(err)
+  await haltWithFailure(executor, { pool, intent: current }, intentDir, 'the re-check before the first step', message)
 }
 
 /**
@@ -260,15 +364,39 @@ export function submitExpansion(
 ): JobRef {
   const { executor, jobQueue, intentDir } = deps
   const { pool, bundle, intent, identity, operation, params, replace } = args
-  return jobQueue.submit(operation, { ...identity, params }, async (updateProgress) => {
-    const input = { pool, intent, plan: bundle.plan }
+  const { spec, pass } = expansionGuard(deps, { pool, intent, operation, replace })
+  let started = false
+  const run = guarded(spec, pass, async (live, ctx) => {
+    started = true
+    const hooks: ExpansionHooks = {
+      release: ctx.release,
+      reguard: async () => ctx.reguard(),
+      reacquire: ctx.reacquire,
+    }
+    const input = { pool: live, intent, plan: bundle.plan }
     const outcome = replace
-      ? await executeReplace(executor, { ...input, oldDiskId: replace.oldDiskId, newDiskId: replace.newDiskId }, updateProgress, { intentDir })
-      : await executeExpansion(executor, input, updateProgress, { intentDir })
-    if (!outcome.ok)
+      ? await executeReplace(executor, { ...input, oldDiskId: replace.oldDiskId, newDiskId: replace.newDiskId }, ctx.updateProgress, { intentDir, hooks })
+      : await executeExpansion(executor, input, ctx.updateProgress, { intentDir, hooks })
+    if (!outcome.ok) {
+      // A refusal from a reguard keeps its own code (IDENTITY_MISMATCH,
+      // STATE_CHANGED, CONFLICT); any other failure is the step's message.
+      const cause = outcome.cause
+      if (cause instanceof Error && typeof (cause as Error & { jobErrorCode?: unknown }).jobErrorCode === 'string')
+        throw cause
       throw new Error(outcome.error ?? 'expansion failed')
+    }
     return { before: bundle.before, after: bundle.after }
   })
+  return jobQueue.submit(operation, { ...identity, params }, async (updateProgress, ctx) => {
+    try {
+      return await run(updateProgress, ctx)
+    }
+    catch (err) {
+      if (!started)
+        await haltUnstarted(executor, intentDir, pool, intent, err)
+      throw err
+    }
+  }, { locks: pass.locks, lane: 'long' })
 }
 
 /** Why an auto-/operator resume could not proceed (all fail closed). */
@@ -350,7 +478,7 @@ export async function resumeExpansion(input: ResumeExpansionInput): Promise<Resu
     throw err
   }
 
-  const job = submitExpansion({ executor, jobQueue, intentDir }, {
+  const job = submitExpansion({ executor, jobQueue, intentDir, diskCache }, {
     pool,
     bundle,
     intent: running,

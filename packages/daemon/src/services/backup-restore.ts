@@ -823,6 +823,21 @@ export interface NewLunRestoreDeps {
   env: Record<string, string>
   /** The mutate context the targetcli steps run in. */
   mutate: IscsiMutateOptions
+  /**
+   * The job's lock release (story cr.38 session B: `ctx.release()`), called
+   * the moment the LUN is mapped. The job holds the target's key
+   * (`iscsi-target:<iqn>`) while it re-reads the target, creates the backing
+   * and maps the LUN — the steps whose index and ACL grants another verb on
+   * the target must not race — and gives it back for the stream, which writes
+   * only the new backing object and can run for hours. Absent = no lock.
+   */
+  mapped?: () => void
+  /**
+   * Re-acquire the target's key before the failure path's undo unmaps the
+   * LUN (cr.38: `ctx.reacquire()`): the undo changes the target again, so it
+   * waits its turn behind whatever took the key during the stream.
+   */
+  beforeUndo?: () => Promise<void>
 }
 
 /**
@@ -978,6 +993,9 @@ export async function runNewLunImageRestore(
     })
     index = mapped.index
     state.mapped = true
+    // cr.38: the target is changed; from here to the save only the new backing
+    // object is written — another verb on the target may go ahead.
+    deps.mapped?.()
 
     // ---- 3. The image -------------------------------------------------------
     const args = imageRestoreArgs(deps.snapshot, deps.archive, deps.namespace, deps.rate)
@@ -1044,6 +1062,9 @@ export async function runNewLunImageRestore(
   }
   catch (err) {
     const base = err instanceof Error ? err.message : String(err)
+    // The undo unmaps the LUN from the target: under the target's key again.
+    if (state.mapped)
+      await deps.beforeUndo?.()
     const cleanup = await removeNewLun(executor, deps, index, state)
     if (cleanup)
       throw new Error(`${base} ${cleanup}`)

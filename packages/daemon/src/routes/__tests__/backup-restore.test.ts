@@ -1,5 +1,7 @@
 import type { Job } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
+import type { ExecStreamResult } from '../../executor/types.js'
+import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { constants } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -8,6 +10,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { anasIqn } from '@anas/shared'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
+import { iscsiTargetClaim } from '../../safety/guard.js'
 import { createServer } from '../../server.js'
 import { volsizeArgs } from '../../services/backup-restore.js'
 import { PBC } from '../../services/backup-runner.js'
@@ -1111,6 +1114,130 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         [],
       )
       assert.ok(!mock.calls.some(c => c.args.join(' ').includes(ZVOL_PATH)), JSON.stringify(mock.calls))
+    })
+
+    // --- cr.38 session B: the target's key, released after the map ----------
+
+    /**
+     * Every latch a test made, opened after it — a test that fails part-way
+     * must not leave a job parked inside the iSCSI lock for the next one.
+     */
+    const latches: (() => void)[] = []
+    afterEach(() => {
+      for (const open of latches.splice(0))
+        open()
+    })
+
+    /** A promise the test opens, and one that settles when the code reaches it. */
+    function gate(): { open: () => void, wait: Promise<void>, reached: Promise<void>, arrive: () => void } {
+      let open!: () => void
+      let arrive!: () => void
+      const wait = new Promise<void>((resolve) => {
+        open = resolve
+      })
+      latches.push(() => open())
+      const reached = new Promise<void>((resolve) => {
+        arrive = resolve
+      })
+      return { open, wait, reached, arrive }
+    }
+
+    /** Hold the job at the LUN map (inside its iSCSI-lock section) and at the image stream. */
+    function pauseAtMapAndStream(mock: MockExecutor, stream: ExecStreamResult | null = null) {
+      const atMap = gate()
+      const atStream = gate()
+      const exec = mock.exec.bind(mock)
+      mock.exec = async (command, args, opts) => {
+        if (command === TARGETCLI && args[0]?.endsWith('/tpg1/luns') && args[1] === 'create') {
+          atMap.arrive()
+          await atMap.wait
+        }
+        return exec(command, args, opts)
+      }
+      const toStream = mock.execToStream.bind(mock)
+      mock.execToStream = async (command, args, target, opts) => {
+        atStream.arrive()
+        await atStream.wait
+        if (stream) {
+          mock.calls.push({ command, args })
+          return stream
+        }
+        return toStream(command, args, target, opts)
+      }
+      return { atMap, atStream }
+    }
+
+    async function settled(queue: JobQueue, id: string): Promise<void> {
+      for (let i = 0; i < 400 && !['completed', 'failed'].includes(queue.get(id)?.status ?? ''); i++)
+        await new Promise(resolve => setTimeout(resolve, 5))
+    }
+
+    it('cr.38: the job holds the target\'s key until the LUN is mapped, then gives it back — a verb on the target waits only until the map, not for the stream', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      mock.addFixture({ command: ZFS, args: volsizeArgs('tank/newvol'), result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      const { atMap, atStream } = pauseAtMapAndStream(mock)
+
+      const first = await restore(newLunBody())
+      const res = await restore(newLunBody(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      assert.equal(res.statusCode, 202)
+      const id = res.body.job!.id
+      await atMap.reached
+
+      // Before the map: another verb on the same target waits for the restore.
+      const probe = queue.submit('iscsi.acl.add', { user: 'test', uid: 0 }, async () => null, { locks: [iscsiTargetClaim(ANAS_IQN)] })
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(queue.get(probe.id)?.status, 'queued')
+      assert.equal(queue.get(probe.id)?.progress, `waiting for backup.restore.image (job ${id}) on iSCSI target ${ANAS_IQN}`)
+
+      // The LUN is mapped; the stream starts and is held — the key is back.
+      atMap.open()
+      await atStream.reached
+      await settled(queue, probe.id)
+      assert.equal(queue.get(probe.id)?.status, 'completed', 'the target verb ran while the image streams')
+      assert.equal(queue.get(id)?.status, 'running', 'the restore is still streaming')
+      assert.deepEqual(queue.heldLocks(), [], 'nobody holds the target while the image streams')
+
+      atStream.open()
+      const job = await waitForJob(id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    })
+
+    it('cr.38: a failed stream takes the target\'s key again before its undo unmaps the LUN — it waits for the verb that took it', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      const { atMap, atStream } = pauseAtMapAndStream(mock, { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 })
+      atMap.open()
+
+      const first = await restore(newLunBody())
+      const res = await restore(newLunBody(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      const id = res.body.job!.id
+      await atStream.reached
+
+      // A verb on the target takes the key while the image streams, and holds it.
+      let endProbe!: () => void
+      const probe = queue.submit('iscsi.lun.delete', { user: 'test', uid: 0 }, () => new Promise<void>((resolve) => {
+        endProbe = resolve
+        latches.push(resolve)
+      }), { locks: [iscsiTargetClaim(ANAS_IQN)] })
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(queue.get(probe.id)?.status, 'running')
+
+      atStream.open() // the stream fails
+      for (let i = 0; i < 400 && !(queue.get(id)?.progress ?? '').startsWith('waiting for'); i++)
+        await new Promise(resolve => setTimeout(resolve, 5))
+      assert.equal(queue.get(id)?.progress, `waiting for iscsi.lun.delete (job ${probe.id}) on iSCSI target ${ANAS_IQN}`)
+      const unmap = `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/luns delete lun1`
+      assert.ok(!mock.calls.some(c => `${c.command} ${c.args.join(' ')}` === unmap), 'the undo has not touched the target yet')
+
+      endProbe()
+      const job = await waitForJob(id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /ANAS has removed LUN 1/)
+      assert.ok(mock.calls.some(c => `${c.command} ${c.args.join(' ')}` === unmap), 'the undo ran, under the key')
+      assert.deepEqual(queue.heldLocks(), [])
     })
 
     it('a mid-stream failure removes the new LUN, its backstore and its backing — and never saves', async () => {
