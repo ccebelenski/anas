@@ -244,6 +244,13 @@ export class CommandTimeoutError extends Error {
   }
 }
 
+/**
+ * Why the executor was ending the call when it gave up on a child: its
+ * deadline passed, or its output went over the call's `maxBuffer` (cr.34r —
+ * an overflow is stopped on the deadline's ladder).
+ */
+export type AbandonCause = 'deadline' | 'maxBuffer'
+
 /** One child the executor gave up on: it outlived its SIGKILL (§6.2 step 3). */
 export interface AbandonedChild {
   pid: number
@@ -254,6 +261,8 @@ export interface AbandonedChild {
   lane: Lane
   jobId?: string
   budgetMs: number
+  /** Why the executor was stopping it; absent reads as `deadline` (the only cause before cr.34r). */
+  cause?: AbandonCause
   /** ISO time the executor stopped waiting for it. */
   since: string
 }

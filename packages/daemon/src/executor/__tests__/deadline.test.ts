@@ -1,7 +1,9 @@
 import type { SpawnedChild } from '../types.js'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import {
   AbandonedRegistry,
   commandLabel,
@@ -48,10 +50,10 @@ function marker(base: number): string {
   return `${base}.${String(process.pid).padStart(7, '0')}${Math.floor(Math.random() * 1000)}`
 }
 
-/** Pids of `sleep <mark>` processes still alive (empty when none). */
-function alive(mark: string): string[] {
+/** Pids of `<program> <mark>` processes still alive (empty when none); `sleep` by default. */
+function alive(mark: string, program = 'sleep'): string[] {
   try {
-    return execFileSync('/usr/bin/pgrep', ['-f', `^sleep ${mark}$`]).toString().trim().split('\n').filter(Boolean)
+    return execFileSync('/usr/bin/pgrep', ['-f', `^${program} ${mark}$`]).toString().trim().split('\n').filter(Boolean)
   }
   catch {
     return [] // pgrep exits 1 when nothing matches
@@ -59,8 +61,8 @@ function alive(mark: string): string[] {
 }
 
 /** Kill whatever a failed test left behind (never the runner itself). */
-function reap(mark: string): void {
-  for (const pid of alive(mark)) {
+function reap(mark: string, program = 'sleep'): void {
+  for (const pid of alive(mark, program)) {
     try {
       process.kill(Number(pid), 'SIGKILL')
     }
@@ -280,6 +282,158 @@ describe('cr.34 deadlines — every door has one', () => {
     const exec = fastExecutor({ laneBudgetsMs: { background: 100 } })
     const r = await exec.exec('/usr/bin/timeout', ['0.3', 'sleep', '5'])
     assert.equal(r.exitCode, 124)
+  })
+})
+
+/** The drain test's child script (see its header). */
+const DRAIN_CHILD = join(dirname(fileURLToPath(import.meta.url)), 'overflow-drain-child.ts')
+/** The outer bound on the drain child: far above the 300 + 200 ms ladder, far below "never". */
+const DRAIN_OUTER_MS = 8000
+
+interface DrainOutcome {
+  /** Exit status; null when the outer timeout had to kill it (the event loop never drained). */
+  status: number | null
+  signal: NodeJS.Signals | null
+  settled: { rejected?: string, resolved?: number, ms: number, abandoned?: number } | null
+}
+
+/**
+ * Run one over-the-cap exec in a CHILD node process under an outer timeout
+ * and report how that process ended: exit 0 inside the bound means the call
+ * settled AND nothing it started kept the event loop alive.
+ */
+function runDrainChild(script: string, mode: 'buffered' | 'tee' = 'buffered'): DrainOutcome {
+  const r = spawnSync(process.execPath, ['--import', 'tsx', DRAIN_CHILD, script, '1024', String(TERM_GRACE), String(KILL_GRACE), mode], {
+    encoding: 'utf8',
+    timeout: DRAIN_OUTER_MS,
+    killSignal: 'SIGKILL',
+  })
+  const line = r.stdout.split('\n').find(l => l.startsWith('{'))
+  return { status: r.status, signal: r.signal, settled: line ? JSON.parse(line) as DrainOutcome['settled'] : null }
+}
+
+describe('cr.34r maxBuffer overflow ends the call on the deadline\'s ladder', () => {
+  it('the reviewer\'s case: `echo ok; yes >&2` over a small cap rejects, the GROUP dies, and the event loop drains', () => {
+    const mark = marker(7)
+    try {
+      // `yes` is sh's child in sh's group, writing to the inherited stderr.
+      // Before cr.34r the overflow TERMed sh's pid alone: `yes` kept writing
+      // into a pipe nobody destroyed and the node process never ended.
+      const out = runDrainChild(`echo ok; yes ${mark} >&2`)
+      assert.equal(out.signal, null, `the outer timeout had to kill the child process: ${JSON.stringify(out)}`)
+      assert.equal(out.status, 0)
+      assert.equal(out.settled?.rejected, 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER')
+      assert.equal(out.settled?.abandoned, 0)
+      assert.deepEqual(alive(mark, 'yes'), [], 'yes survived the overflow')
+    }
+    finally {
+      reap(mark, 'yes')
+    }
+  })
+
+  it('a TERM-ignoring writer is escalated to SIGKILL; the call still rejects with the overflow error and the loop drains', () => {
+    const mark = marker(7)
+    // A writer that ignores TERM AND outlives a broken pipe (`yes` would die
+    // of EPIPE once the pipes are let go of, which would hide a missing KILL).
+    const script = `trap "" TERM PIPE; while :; do echo ${mark}; done >&2`
+    try {
+      const out = runDrainChild(script)
+      assert.equal(out.signal, null, `the outer timeout had to kill the child process: ${JSON.stringify(out)}`)
+      assert.equal(out.status, 0)
+      assert.equal(out.settled?.rejected, 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER')
+      assert.equal(out.settled?.abandoned, 0)
+      assert.ok((out.settled?.ms ?? 0) >= TERM_GRACE, `it took the SIGKILL step (settled after ${out.settled?.ms} ms)`)
+      assert.deepEqual(alive(`-c ${script}`, '/bin/sh'), [], 'the writer survived the overflow')
+    }
+    finally {
+      reap(`-c ${script}`, '/bin/sh')
+    }
+  })
+
+  it('the tee path: a stdout overflow SIGKILLs the whole group (a backgrounded holder of the pipe too) and the loop drains', () => {
+    const mark = marker(7)
+    try {
+      const out = runDrainChild(`trap "" TERM; sleep ${mark} & head -c 4096 /dev/zero; wait`, 'tee')
+      assert.equal(out.signal, null, `the outer timeout had to kill the child process: ${JSON.stringify(out)}`)
+      assert.equal(out.status, 0)
+      assert.equal(out.settled?.rejected, 'stdout exceeded maxBuffer (1024 bytes)')
+      // SIGKILL first: no TERM grace on this path.
+      assert.ok((out.settled?.ms ?? Infinity) < TERM_GRACE, `settled after ${out.settled?.ms} ms`)
+      assert.deepEqual(alive(mark), [])
+    }
+    finally {
+      reap(mark)
+    }
+  })
+
+  it('a writer no signal can stop is abandoned under cause `maxBuffer` and the call still rejects with the overflow error', async () => {
+    const registry = new AbandonedRegistry()
+    const mark = marker(2)
+    const exec = fastExecutor({ registry, signalGroup: () => {} })
+    try {
+      const { err, ms } = await rejection(() => runInLane({ lane: 'job', jobId: 'job-43' }, () =>
+        exec.exec(SH, ['-c', `head -c 4096 /dev/zero; exec sleep ${mark}`], { maxBuffer: 1024 })))
+      assert.ok(err instanceof RangeError, `rejected with ${String(err)}`)
+      assert.equal((err as RangeError & { code?: string }).code, 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER')
+      assert.ok(ms >= TERM_GRACE + KILL_GRACE, `settled after ${ms} ms: after the whole ladder, not at the overflow`)
+      const listed = registry.list()
+      assert.equal(listed.length, 1)
+      assert.equal(listed[0].cause, 'maxBuffer')
+      assert.equal(listed[0].jobId, 'job-43')
+      // cr.33: the job keeps its locks while its abandoned child runs.
+      assert.equal(registry.forJob('job-43').length, 1)
+      assert.ok(await until(() => registry.size === 0, 3000), 'the entry left the registry when the child exited')
+    }
+    finally {
+      reap(mark)
+    }
+  })
+})
+
+describe('cr.34r executor contracts callers rely on', () => {
+  it('a TERM-ignoring GRANDCHILD holding the pipe is killed by the group SIGKILL', async () => {
+    const mark = marker(31)
+    try {
+      // The child itself dies on the TERM; the grandchild ignores it and keeps
+      // the pipe open, so only the KILL to the GROUP can end it.
+      const { err, ms } = await rejection(() => fastExecutor().exec(SH, ['-c', `(trap "" TERM; exec sleep ${mark}) & exec sleep 30`], { timeoutMs: BUDGET }))
+      assert.ok(err instanceof CommandTimeoutError, `rejected with ${String(err)}`)
+      assert.equal(err.abandoned, false)
+      assert.ok(ms >= BUDGET + TERM_GRACE, `it took the SIGKILL step (settled after ${ms} ms)`)
+      assert.ok(await until(() => alive(mark).length === 0, 1000), `the grandchild survived: sleep ${mark} pid ${alive(mark).join(',')}`)
+    }
+    finally {
+      reap(mark)
+    }
+  })
+
+  it('stdin: written and closed when given, on both exec paths', async () => {
+    const exec = fastExecutor()
+    const buffered = await exec.exec(SH, ['-c', 'cat'], { stdin: 'secret\n' })
+    assert.equal(buffered.stdout, 'secret\n')
+    const teed = await exec.exec(SH, ['-c', 'cat'], { stdin: 'secret\n', onStderr: () => {} })
+    assert.equal(teed.stdout, 'secret\n')
+  })
+
+  it('stdin: left OPEN when not given on the buffered path (execFile\'s contract), /dev/null on the tee path', async () => {
+    const exec = fastExecutor()
+    // An open pipe nobody writes: `cat` waits until `timeout` ends it (124).
+    const buffered = await exec.exec(SH, ['-c', '/usr/bin/timeout 0.3 cat; echo rc=$?'])
+    assert.equal(buffered.stdout, 'rc=124\n')
+    // `ignore` is /dev/null: `cat` reads EOF at once.
+    const teed = await exec.exec(SH, ['-c', '/usr/bin/timeout 0.3 cat; echo rc=$?'], { onStderr: () => {} })
+    assert.equal(teed.stdout, 'rc=0\n')
+  })
+
+  it('a signal death resolves `exitCode: 1` plus the signal name, on both exec paths (live-proof F16)', async () => {
+    const exec = fastExecutor()
+    const killed = await exec.exec(SH, ['-c', 'echo before; kill -KILL $$'])
+    assert.deepEqual(killed, { stdout: 'before\n', stderr: '', exitCode: 1, signal: 'SIGKILL' })
+    const termed = await exec.exec(SH, ['-c', 'kill -TERM $$'], { onStderr: () => {} })
+    assert.equal(termed.exitCode, 1)
+    assert.equal(termed.signal, 'SIGTERM')
+    // A plain exit carries no signal field at all.
+    assert.equal('signal' in await exec.exec(SH, ['-c', 'exit 1']), false)
   })
 })
 

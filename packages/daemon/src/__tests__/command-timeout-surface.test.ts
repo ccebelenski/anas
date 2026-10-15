@@ -79,14 +79,27 @@ describe('cr.34: abandoned children are visible', () => {
     abandonedChildren.remove(STUCK.pid)
   })
 
-  it('GET /v1/health lists them (status stays ok: the daemon is fine)', async () => {
+  it('GET /v1/health lists them by label, never by argv (status stays ok: the daemon is fine)', async () => {
     server = createServer({ mock: true, logger: false })
     const before = HealthResponse.parse((await server.inject({ method: 'GET', url: '/v1/health' })).json())
     assert.deepEqual(before.abandonedCommands, [])
-    abandonedChildren.add(STUCK)
-    const after = HealthResponse.parse((await server.inject({ method: 'GET', url: '/v1/health' })).json())
+    // An argv token no reply may carry (cr.34r: named like the audit log names it).
+    abandonedChildren.add({ ...STUCK, args: ['status', '-jv', 'tank-argv-c0ffee'] })
+    const res = await server.inject({ method: 'GET', url: '/v1/health' })
+    assert.equal(res.body.includes('tank-argv-c0ffee'), false, 'the raw argv reached the reply')
+    const after = HealthResponse.parse(res.json())
     assert.equal(after.status, 'ok')
-    assert.deepEqual(after.abandonedCommands, [STUCK])
+    // `cause` absent on the registry entry reads as the deadline.
+    const { args: _args, ...named } = STUCK
+    assert.deepEqual(after.abandonedCommands, [{ ...named, cause: 'deadline' }])
+  })
+
+  it('GET /v1/status never carries the argv either', async () => {
+    server = createServer({ mock: true, logger: false })
+    abandonedChildren.add({ ...STUCK, args: ['status', '-jv', 'tank-argv-c0ffee'] })
+    const res = await server.inject({ method: 'GET', url: '/v1/status', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.body.includes('tank-argv-c0ffee'), false, 'the raw argv reached the reply')
   })
 
   it('GET /v1/status carries a `command` warning card for each', async () => {
@@ -107,6 +120,9 @@ describe('cr.34: abandoned children are visible', () => {
     assert.match(request.message, /from a request\)/)
     const [boot] = buildAbandonedWarnings([{ ...STUCK, lane: 'background' }])
     assert.match(boot.message, /from a background task\)/)
+    // cr.34r: a child stopped for its output says so, not "did not end within".
+    const [overflow] = buildAbandonedWarnings([{ ...STUCK, cause: 'maxBuffer' }])
+    assert.match(overflow.message, /^'zpool status' \(pid 999999001, from a request\) was stopped for writing more output than the daemon keeps and survived SIGKILL/)
     assert.deepEqual(buildAbandonedWarnings([]), [])
   })
 })

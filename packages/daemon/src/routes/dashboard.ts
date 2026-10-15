@@ -754,7 +754,8 @@ export function buildUnavailableWarnings(sections: UnavailableSection[]): Dashbo
  * and the SIGKILL after it, so it is stuck in the kernel (WAVE3-DESIGN §6.2,
  * §8.1 "an abandoned child": "the dashboard shows 'a command did not end'").
  * Nothing in ANAS can end it; the card says what usually causes it and what
- * clears it. GET /v1/health lists the same entries with their argv.
+ * clears it. GET /v1/health lists the same entries; neither shows the argv
+ * (cr.34r: commands are named the way the audit log names them, by label).
  */
 export function buildAbandonedWarnings(children: AbandonedChild[]): DashboardWarning[] {
   return children.map((c) => {
@@ -762,7 +763,7 @@ export function buildAbandonedWarnings(children: AbandonedChild[]): DashboardWar
     return {
       level: 'warning',
       category: 'command',
-      message: `'${c.label}' (pid ${c.pid}, from ${where}) did not end within ${formatBudget(c.budgetMs)} and survived SIGKILL: `
+      message: `'${c.label}' (pid ${c.pid}, from ${where}) ${c.cause === 'maxBuffer' ? 'was stopped for writing more output than the daemon keeps' : `did not end within ${formatBudget(c.budgetMs)}`} and survived SIGKILL: `
         + `it has been stuck in the kernel since ${c.since}. A suspended pool or a hung disk or mount is the usual cause. `
         + 'The warning clears when the command returns or anasd restarts.',
     }

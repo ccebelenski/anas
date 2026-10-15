@@ -1,5 +1,5 @@
 import type { ChildProcess } from 'node:child_process'
-import type { AbandonedRegistry, Lane, ResolvedDeadline } from './deadline.js'
+import type { AbandonCause, AbandonedRegistry, Lane, ResolvedDeadline } from './deadline.js'
 import type {
   CommandExecutor,
   ExecOptions,
@@ -172,10 +172,26 @@ interface WatchConfig {
  *
  * Whichever way it ends after the deadline fired — the children closed during
  * a grace, or step 3 — the call REJECTS with {@link CommandTimeoutError}.
+ *
+ * The executor ends a call early on the same ladder (cr.34r): a child over its
+ * `maxBuffer` is {@link abort}ed — its group signalled, escalated, its pipes
+ * let go of, and it is abandoned if it outlives the SIGKILL — and the call
+ * rejects with the caller's error instead of the timeout. Before cr.34r an
+ * overflow signalled the child's pid alone and never let go of the pipes, so
+ * a grandchild still writing (`sh -c '…; yes >&2'`) kept the daemon's event
+ * loop busy for good.
  */
 class DeadlineWatch {
-  /** The deadline fired: whatever happens next, the call is a timeout. */
-  expired = false
+  /**
+   * The executor is ending the call (the deadline fired, or {@link abort}):
+   * whatever the children do next, the call rejects — with {@link failure},
+   * else with a {@link CommandTimeoutError}.
+   */
+  stopping = false
+  /** The error an {@link abort} settles with; null for the deadline's own. */
+  private failure: Error | null = null
+  /** Why the executor is ending the call — recorded on any child it abandons. */
+  private cause: AbandonCause = 'deadline'
   private done = false
   private readonly timers: NodeJS.Timeout[] = []
   private readonly members: { child: ChildProcess, command: string, args: string[], exited: boolean, closed: boolean }[]
@@ -189,7 +205,8 @@ class DeadlineWatch {
     children: { child: ChildProcess, command: string, args: string[] }[],
     private readonly deadline: ResolvedDeadline,
     private readonly cfg: WatchConfig,
-    private readonly onTimeout: (err: CommandTimeoutError) => void,
+    /** Rejects the call: a {@link CommandTimeoutError}, or an {@link abort}'s own error. */
+    private readonly onSettle: (err: Error) => void,
   ) {
     this.members = children.map(({ child, command, args }) => {
       const m = { child, command, args, exited: false, closed: false }
@@ -230,16 +247,52 @@ class DeadlineWatch {
     }
   }
 
-  private expire(): void {
-    if (this.done)
+  /**
+   * End the call now, for a reason that is not the deadline (a child over its
+   * `maxBuffer`): the deadline's ladder from `first`, and the call settles
+   * with `err` once every child has closed, or at step 3 with the survivors
+   * abandoned under `cause`. A call already stopping keeps its first reason.
+   *
+   * The pipes are let go of at step 3 (or by the close), not here: while a
+   * pipe is open, a `close` still means every holder of it is gone, which is
+   * what tells the ladder a TERM-ignoring grandchild is still there to KILL.
+   * The caller stops reading once {@link stopping} is set; the pipe keeps
+   * draining, so no writer blocks before its signal arrives.
+   */
+  abort(err: Error, cause: AbandonCause, first: 'SIGTERM' | 'SIGKILL'): void {
+    if (this.done || this.stopping)
       return
-    this.expired = true
-    this.signal('SIGTERM')
+    this.failure = err
+    this.cause = cause
+    this.stop(first)
+  }
+
+  private expire(): void {
+    if (this.done || this.stopping)
+      return
+    this.stop('SIGTERM')
+  }
+
+  /** Steps 1–3 from `first`: a SIGKILL start skips the TERM grace. */
+  private stop(first: 'SIGTERM' | 'SIGKILL'): void {
+    // The budget's own timer must not restart the ladder (or re-label the
+    // reason) once an abort has begun it.
+    for (const t of this.timers.splice(0))
+      clearTimeout(t)
+    this.stopping = true
+    this.signal(first)
+    const settleLater = (): void => {
+      this.timers.push(setTimeout(() => this.final(), this.cfg.killGraceMs))
+    }
+    if (first === 'SIGKILL') {
+      settleLater()
+      return
+    }
     this.timers.push(setTimeout(() => {
       if (this.done)
         return
       this.signal('SIGKILL')
-      this.timers.push(setTimeout(() => this.final(), this.cfg.killGraceMs))
+      settleLater()
     }, this.cfg.termGraceMs))
   }
 
@@ -260,6 +313,7 @@ class DeadlineWatch {
         lane: this.deadline.lane,
         ...(this.deadline.jobId !== undefined ? { jobId: this.deadline.jobId } : {}),
         budgetMs,
+        cause: this.cause,
         since,
       })
       // `exited` was false just now and events are not concurrent with this
@@ -273,8 +327,12 @@ class DeadlineWatch {
       m.child.stdout?.destroy()
       m.child.stderr?.destroy()
     }
+    if (this.failure) {
+      this.onSettle(this.failure)
+      return
+    }
     const first = this.members[0]
-    this.onTimeout(new CommandTimeoutError(
+    this.onSettle(new CommandTimeoutError(
       first.command,
       [...first.args],
       this.deadline.lane,
@@ -318,16 +376,18 @@ export class ProdExecutor implements CommandExecutor {
    * Run a command and collect its output.
    *
    * Without `onStderr` both streams are buffered, each up to `maxBuffer`
-   * (default 10 MiB) — `execFile`'s contract, kept exactly: stdin is an open
-   * pipe (written and closed only when `stdin` is given), over the cap the
-   * child gets SIGTERM and the call rejects.
+   * (default 10 MiB) — `execFile`'s contract: stdin is an open pipe (written
+   * and closed only when `stdin` is given), over the cap the child's group
+   * gets SIGTERM (then the deadline's escalation, cr.34r) and the call
+   * rejects with `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` once the group is gone.
    *
    * With `onStderr` (rclone's JSON stats, rclone.2 slice 2) stderr is TEED to
    * the callback as it arrives and NOT retained: the result carries the last
    * {@link STDERR_TAIL_CHARS} characters only, decoded multi-byte-safely, so a
    * multi-day run's stats log never accumulates in the daemon (execFile could
    * not do this: it buffers both streams up to `maxBuffer` with no opt-out).
-   * stdin is `ignore` unless given; over the stdout cap the child gets SIGKILL.
+   * stdin is `ignore` unless given; over the stdout cap the child's group
+   * gets SIGKILL.
    *
    * Both: spawn failures reject (ENOENT/EACCES), a non-zero exit resolves
    * (never throws), exit codes pass through exactly (`timeout`'s 124 is
@@ -360,24 +420,33 @@ export class ProdExecutor implements CommandExecutor {
       watch = new DeadlineWatch([{ child, command, args }], deadline, this.cfg, fail)
 
       const maxBuffer = opts?.maxBuffer ?? DEFAULT_MAX_BUFFER
+      // Over the cap the call is ended on the deadline's own ladder (cr.34r):
+      // the child's whole GROUP is signalled and escalated, the pipes are let
+      // go of, and a survivor is abandoned — a grandchild on the inherited
+      // pipe must not outlive the call, or keep the daemon reading from it.
+      // The call rejects with the overflow's error once the group is gone.
       const overflow = (stream: 'stdout' | 'stderr'): void => {
         if (tee) {
           // The teeing path's cap is on stdout alone; the run's output is
-          // unrepresentable, so the child dies at once.
-          child.kill('SIGKILL')
-          fail(new Error(`stdout exceeded maxBuffer (${maxBuffer} bytes)`))
+          // unrepresentable, so the group gets SIGKILL at once.
+          watch.abort(new Error(`stdout exceeded maxBuffer (${maxBuffer} bytes)`), 'maxBuffer', 'SIGKILL')
           return
         }
         // execFile's contract: over the cap, SIGTERM and an error carrying
         // its code (a string code, so callers file it with the spawn failures).
-        child.kill('SIGTERM')
-        fail(Object.assign(new RangeError(`${stream} maxBuffer length exceeded`), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }))
+        watch.abort(
+          Object.assign(new RangeError(`${stream} maxBuffer length exceeded`), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }),
+          'maxBuffer',
+          'SIGTERM',
+        )
       }
 
       const stdoutChunks: Buffer[] = []
       let stdoutBytes = 0
+      // Once the executor is ending the call (deadline or overflow) its output
+      // no longer matters: the pipes keep draining, nothing is kept or teed.
       child.stdout?.on('data', (d: Buffer) => {
-        if (settled)
+        if (settled || watch.stopping)
           return
         stdoutBytes += d.length
         if (stdoutBytes > maxBuffer) {
@@ -390,7 +459,7 @@ export class ProdExecutor implements CommandExecutor {
       const stderrChunks: Buffer[] = []
       let stderrBytes = 0
       child.stderr?.on('data', (d: Buffer) => {
-        if (settled)
+        if (settled || watch.stopping)
           return
         if (tee) {
           tee.write(d)
@@ -419,7 +488,7 @@ export class ProdExecutor implements CommandExecutor {
       child.on('error', fail)
 
       child.on('close', (code, signal) => {
-        if (watch.expired) {
+        if (watch.stopping) {
           watch.settleNow()
           return
         }
@@ -502,7 +571,7 @@ export class ProdExecutor implements CommandExecutor {
       const maybeResolve = (): void => {
         if (settled || !leftClosed || !rightClosed)
           return
-        if (watch.expired) {
+        if (watch.stopping) {
           watch.settleNow()
           return
         }
@@ -633,7 +702,7 @@ export class ProdExecutor implements CommandExecutor {
       const settle = (exitCode: number, signal?: string): void => {
         if (settled)
           return
-        if (watch.expired) {
+        if (watch.stopping) {
           watch.settleNow()
           return
         }
