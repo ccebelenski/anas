@@ -2,8 +2,11 @@ import type { AhrPool, SnapshotScheduleRunResult, SnapshotSchedule as SnapshotSc
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
+import type { UnitTaskObject } from '../services/task-units.js'
 import { PRUNED_NAMES_PER_DATASET, ScheduleId, SnapshotSchedule } from '@anas/shared'
 import { parseZpoolList } from '../parsers/zpool-list.js'
+import { guardCheck, guarded, scheduleClaim, sendRefusal } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { loadPveFootprint, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { notifyScheduleRun } from '../services/snapshot-notify.js'
@@ -13,12 +16,15 @@ import {
   deriveScheduleDetail,
   readSchedule,
   readScheduleList,
+  readScheduleUnitTexts,
   removeScheduleUnits,
-  scheduleFileExists,
+  serviceUnitName,
   writeScheduleUnits,
 } from '../services/snapshot-schedule-units.js'
 import { pruneSnapshots, pruneZfsSchedule, takeSnapshot, zfsRunResult } from '../services/snapshot-schedules.js'
 import { ahrSourceClaims, datasetSourceClaims } from '../services/source-claims.js'
+import { activeRunDeleteRefusal, readUnitTaskObject, serviceUnitRevision } from '../services/task-units.js'
+import { isRunActive, showUnitProps } from '../services/unit-run-status.js'
 import { sweepSet, zfsTreeListArgs } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
@@ -203,6 +209,99 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     return target.kind === 'zfs' ? `zfs:${target.dataset}` : `ahr:${target.pool}`
   }
 
+  /**
+   * The guard specs of the schedule verbs (story cr.41, WAVE3-DESIGN §3.3
+   * Unit-store row + the operator's cr.41 Q1 ruling). One spec per verb, both
+   * doors: the route answers a refusal in the request, the job re-reads the
+   * unit store and refuses again before it writes or fires.
+   *
+   * The unit-store object (the parsed schedule + its service text) is the HALF
+   * every mutating verb shares; the run reads the bare schedule (there is no
+   * unit text to bind a fire to). Locks are `schedule:<id>` — exclusive for
+   * create, update and delete, SHARED for a fire (§4.2) — so a delete queued
+   * while a fire runs or waits waits instead for the fire and re-gates, and
+   * two fires of one schedule still run beside each other.
+   */
+  const scheduleUnitView = (id: string): ObjectView<UnitTaskObject<SnapshotScheduleT>> => ({
+    what: `Snapshot schedule '${id}'`,
+    read: () => readUnitTaskObject(readSchedule, readScheduleUnitTexts, systemdDir, id),
+    id: async o => ({ schedule: o.task.id }),
+    notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `Snapshot schedule '${id}' not found` }),
+    unbound: () => `Could not read snapshot schedule '${id}' — refusing`,
+  })
+
+  /** The Q1 refusal when a schedule's fire is active (a run job, or the unit a timer started). */
+  async function scheduleActiveRunRefusal(id: string): Promise<Refusal | null> {
+    const runJob = jobQueue.findActive('schedule.run', id, 'schedule')
+    if (runJob)
+      return activeRunDeleteRefusal(`Snapshot schedule '${id}'`, { job: runJob })
+    const props = await showUnitProps(executor, serviceUnitName(id), 'ActiveState')
+    if (isRunActive(props))
+      return activeRunDeleteRefusal(`Snapshot schedule '${id}'`, { unit: { service: serviceUnitName(id), since: null } })
+    return null
+  }
+
+  /** A create's object is the id SLOT (the mounts/shares create precedent): existence is a gate, not the read-null. */
+  function scheduleCreateSpec(id: string): GuardSpec<{ existing: SnapshotScheduleT | null }> {
+    return {
+      operation: 'schedule.create',
+      object: {
+        what: `Snapshot schedule '${id}'`,
+        read: async () => ({ existing: await readSchedule(systemdDir, id) }),
+        id: async () => ({ schedule: id }),
+        unbound: () => `Could not read snapshot schedules — refusing`,
+      },
+      gates: [
+        async o => (o.existing
+          ? { status: 409, code: 'CONFLICT', message: `Snapshot schedule '${id}' already exists` }
+          : null),
+      ],
+      locks: async () => [scheduleClaim(id, 'exclusive')],
+    }
+  }
+
+  function scheduleUpdateSpec(id: string): GuardSpec<UnitTaskObject<SnapshotScheduleT>> {
+    return {
+      operation: 'schedule.update',
+      object: {
+        ...scheduleUnitView(id),
+        revision: async o => serviceUnitRevision(o.unit),
+      },
+      gates: [],
+      locks: async () => [scheduleClaim(id, 'exclusive')],
+    }
+  }
+
+  function scheduleDeleteSpec(id: string): GuardSpec<UnitTaskObject<SnapshotScheduleT>> {
+    return {
+      operation: 'schedule.remove',
+      object: scheduleUnitView(id),
+      gates: [async () => scheduleActiveRunRefusal(id)],
+      locks: async () => [scheduleClaim(id, 'exclusive')],
+    }
+  }
+
+  /** A fire's object is the schedule itself, re-read in the job (Cap → re-read, §2.4). */
+  function scheduleRunSpec(id: string): GuardSpec<SnapshotScheduleT> {
+    return {
+      operation: 'schedule.run',
+      object: {
+        what: `Snapshot schedule '${id}'`,
+        read: async () => readSchedule(systemdDir, id),
+        id: async o => ({ schedule: o.id }),
+        notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `Snapshot schedule '${id}' not found` }),
+        unbound: () => `Could not read snapshot schedule '${id}' — refusing the run`,
+      },
+      gates: [],
+      locks: async o => [
+        ...(o.target.kind === 'zfs'
+          ? await datasetSourceClaims(executor, [o.target.dataset])
+          : ahrSourceClaims(o.target.pool, (await resolveAhrPool(o.target.pool))?.vg.uuid)),
+        scheduleClaim(id, 'shared'),
+      ],
+    }
+  }
+
   /** Fire a schedule once: take a snapshot into its cadence bucket, then prune. */
   async function fireSchedule(
     schedule: SnapshotScheduleT,
@@ -293,21 +392,25 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     if (!identity)
       return
 
-    // 409 if the schedule already exists — the unit files are the source of truth.
-    if (await scheduleFileExists(systemdDir, schedule.id)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Snapshot schedule '${schedule.id}' already exists` } }
-    }
+    // 409 if the schedule already exists — the unit files are the source of
+    // truth at the route, and the create job re-runs the same gate under its
+    // `schedule:<id>` name key (cr.41: two creates of one id cannot both pass
+    // a check made before either wrote).
+    const spec = scheduleCreateSpec(schedule.id)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
     if (!(await guardTarget(schedule.target, schedule.recursive === true, reply, schedule.exclude)))
       return reply
 
     const job = jobQueue.submit(
       'schedule.create',
       { ...identity, params: { schedule: schedule.id } },
-      async () => {
+      guarded(spec, pre, async () => {
         await writeScheduleUnits(executor, systemdDir, schedule)
         return { created: schedule.id }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -357,10 +460,17 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     if (!identity)
       return
 
-    if (!(await scheduleFileExists(systemdDir, id))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Snapshot schedule '${id}' not found` } }
-    }
+    // Story cr.41: the update is BOUND to the stored schedule's revision (the
+    // service unit's sha256) — an edit whose unit changed meanwhile refuses
+    // STATE_CHANGED, and one whose schedule was deleted refuses not-found, so
+    // an update can never resurrect a deleted schedule. The id and rev are
+    // read here and RE-READ in the job (guarded). The TARGET checks below use
+    // the same re-read as `stored`.
+    const spec = scheduleUpdateSpec(id)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const stored = pre.object.task
 
     // The TARGET is part of a schedule's identity, exactly like its id: what it
     // snapshots is what it IS. An in-place edit changes policy — cadence,
@@ -370,8 +480,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     // whole class: a dialog that fell back to the first pool of a
     // fail-open-empty inventory can no longer rewrite a schedule onto a
     // different filesystem.
-    const stored = await readSchedule(systemdDir, id)
-    if (stored && targetKey(stored.target) !== targetKey(schedule.target)) {
+    if (targetKey(stored.target) !== targetKey(schedule.target)) {
       reply.code(400)
       return {
         error: {
@@ -389,19 +498,20 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     // 0.4.2 UI always sends the key on a recursive ZFS schedule.
     const body = request.body as Record<string, unknown> | null | undefined
     const excludeAbsent = !body || typeof body !== 'object' || !Object.hasOwn(body, 'exclude')
-    if (excludeAbsent && schedule.recursive === true && schedule.target.kind === 'zfs' && stored?.exclude?.length)
+    if (excludeAbsent && schedule.recursive === true && schedule.target.kind === 'zfs' && stored.exclude?.length)
       schedule = { ...schedule, exclude: stored.exclude }
 
-    if (!(await guardTarget(schedule.target, schedule.recursive === true, reply, schedule.exclude, stored?.exclude)))
+    if (!(await guardTarget(schedule.target, schedule.recursive === true, reply, schedule.exclude, stored.exclude)))
       return reply
 
     const job = jobQueue.submit(
       'schedule.update',
       { ...identity, params: { schedule: id } },
-      async () => {
+      guarded(spec, pre, async () => {
         await writeScheduleUnits(executor, systemdDir, schedule)
         return { updated: id }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -422,18 +532,23 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     if (!identity)
       return
 
-    if (!(await scheduleFileExists(systemdDir, id))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Snapshot schedule '${id}' not found` } }
-    }
+    // Q1 (cr.41): a delete during an ACTIVE fire refuses at the route AND again
+    // in the job — a fire that started while the delete waited for a slot (or
+    // for the schedule's key) is seen and refused, not run over. The sentence
+    // names the run and how to cancel it.
+    const spec = scheduleDeleteSpec(id)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'schedule.remove',
       { ...identity, params: { schedule: id } },
-      async () => {
+      guarded(spec, pre, async () => {
         await removeScheduleUnits(executor, systemdDir, id)
         return { removed: id }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -455,27 +570,21 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     if (!identity)
       return
 
-    const schedule = await readSchedule(systemdDir, id)
-    if (!schedule) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Snapshot schedule '${id}' not found` } }
-    }
-
-    // cr.33b (§4.2 "schedule fire", S): the fire holds a SHARED claim on its
-    // target — the dataset (its ancestors and the pool shared) or the AHR
-    // pool — so a destroy, rename or rollback of the target accepted while it
-    // takes and prunes waits for it and re-gates after; other snapshots of
-    // the target still run beside it. A recursive schedule claims its target
-    // (whose recursive destroy or rename takes it exclusive), not each
-    // descendant it sweeps.
-    const locks = schedule.target.kind === 'zfs'
-      ? await datasetSourceClaims(executor, [schedule.target.dataset])
-      : ahrSourceClaims(schedule.target.pool, (await resolveAhrPool(schedule.target.pool))?.vg.uuid)
+    // Story cr.41 (§2.4 "schedule run" row): the fire RE-READS the schedule in
+    // the job — the route-read schedule was a Cap. The PVE-ownership gates were
+    // already re-run inside fireSchedule; what was missing was the schedule
+    // ITSELF, so a fire whose schedule was deleted while it waited refuses
+    // not-found, and the run reads a fresh one (a re-created schedule with the
+    // same id is the current schedule).
+    const spec = scheduleRunSpec(id)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'schedule.run',
       { ...identity, params: { schedule: id } },
-      async (updateProgress) => {
+      guarded(spec, pre, async (schedule, { updateProgress }) => {
         // 9.4: this job is the ONE place every fire converges (the timer's
         // runner and a UI Run Now both submit it), so it is also the one place
         // a run notification is emitted — success, warning (a prune that had to
@@ -494,8 +603,15 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
           await notifyScheduleRun(executor, { schedule, error: message, elapsedMs: Date.now() - startedAt })
           throw err
         }
-      },
-      { locks },
+      }),
+      // cr.33b (§4.2 "schedule fire", S): the fire holds a SHARED claim on its
+      // target — the dataset (its ancestors and the pool shared) or the AHR
+      // pool — so a destroy, rename or rollback of the target accepted while it
+      // takes and prunes waits for it and re-gates after; other snapshots of
+      // the target still run beside it. A recursive schedule claims its target
+      // (whose recursive destroy or rename takes it exclusive), not each
+      // descendant it sweeps.
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }

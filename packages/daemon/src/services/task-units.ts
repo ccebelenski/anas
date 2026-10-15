@@ -2,8 +2,10 @@ import type { DashboardWarning, Job, TaskCadence } from '@anas/shared'
 import type { ZodType } from 'zod'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { Refusal } from '../safety/guard.js'
 import type { CadenceGateDecision, TaskTrigger } from './backup-cadence.js'
 import type { TaskHelperResult, UnitRunResult } from './unit-run-status.js'
+import { createHash } from 'node:crypto'
 import { readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK, cadenceToOnCalendar, TASK_CANCELLED_EXIT_CODE } from '@anas/shared'
@@ -257,6 +259,94 @@ export async function removeTaskUnits(
   await executor.exec(SYSTEMCTL, ['reset-failed', serviceUnitName(kind, name)]).catch(() => undefined)
   await executor.exec(SYSTEMCTL, ['reset-failed', timerUnitName(kind, name)]).catch(() => undefined)
   await runSystemctl(executor, ['daemon-reload'])
+}
+
+// --- The guard objects (story cr.41, docs/WAVE3-DESIGN.md §3.3 Unit-store row)
+//
+// The unit-store verbs (task create/update/delete, schedule create/update/
+// delete) share one object shape: the parsed task (or schedule) plus the
+// `.service` unit text it was stored in. id is the name/id (the unit's own
+// namespace identity), revision is the sha256 of the service text — an edit is
+// bound to the exact unit the request was computed from (F4: an update can
+// resurrect a deleted task; a hand-edited unit refuses STATE_CHANGED). A unit
+// that is gone or unparseable reads null → the guard answers "gone" (never a
+// resurrection over an unreadable file).
+
+/** sha256 of a unit store's `.service` text — the revision the update verbs bind. */
+export function serviceUnitRevision(unit: string): string {
+  return createHash('sha256').update(unit).digest('hex')
+}
+
+/** A unit-store task (or schedule) as the guard's object: the parsed payload + its service text. */
+export interface UnitTaskObject<T> {
+  task: T
+  unit: string
+}
+
+/**
+ * Read a unit-store task or schedule's guard object: the parsed payload and
+ * the `.service` text it was stored in, in ONE read pair (the revision hashes
+ * the text this read already carried). Null when the unit is absent OR
+ * unparseable — the guard's read answers null exactly when {@link readTask}
+ * would, so a task the store cannot read is as good as gone.
+ */
+export async function readUnitTaskObject<T>(
+  readPayload: (dir: string, name: string) => Promise<T | null>,
+  readUnitTexts: (dir: string, name: string) => Promise<{ unit: string, timer: string }>,
+  dir: string,
+  name: string,
+): Promise<UnitTaskObject<T> | null> {
+  const [task, texts] = await Promise.all([readPayload(dir, name), readUnitTexts(dir, name)])
+  return task === null ? null : { task, unit: texts.unit }
+}
+
+/** What a Q1 refusal names as "the run": the direct job, or the systemd unit. */
+export interface TaskRunInFlight {
+  /** The direct run job in this daemon's queue (what Cancel run targets). */
+  job?: Job
+  /** The unit systemd reports in a still-running state, with its service name. */
+  unit?: { service: string, since: string | null }
+}
+
+/**
+ * Is a task's run in flight RIGHT NOW (cr.41 Q1)? Two sources, both read
+ * fresh: the DIRECT run job in this daemon's queue (named — it is what a
+ * Cancel run cancels), and the unit systemd reports active (a timer fire — or
+ * a run this daemon restarted out from under — executes under the unit).
+ * Fail-open: a systemd read that cannot answer is not "running".
+ */
+export async function taskRunInFlight(
+  jobQueue: JobQueue,
+  runOperation: string,
+  executor: CommandExecutor,
+  kind: TaskUnitKind,
+  name: string,
+): Promise<TaskRunInFlight> {
+  const job = runningDirectJob(jobQueue, runOperation, name)
+  const run = await readRunActive(executor, kind, name)
+  return {
+    ...(job ? { job } : {}),
+    ...(run.active ? { unit: { service: serviceUnitName(kind, name), since: run.since } } : {}),
+  }
+}
+
+/**
+ * The Q1 delete refusal (operator ruling 2026-10-15, EPICS cr.41): deleting a
+ * task or schedule whose run is active is refused with 409 until the run ends
+ * or the operator cancels it. The sentence names the run — the job id (what a
+ * Cancel run targets) or the unit — and says how to cancel it.
+ */
+export function activeRunDeleteRefusal(what: string, run: TaskRunInFlight): Refusal {
+  const named = run.job
+    ? `job ${run.job.id}`
+    : run.unit
+      ? run.unit.service
+      : 'unknown'
+  return {
+    status: 409,
+    code: 'CONFLICT',
+    message: `${what} is still running (${named}) — wait for it to end, or cancel it with Cancel run; nothing was deleted`,
+  }
 }
 
 /** The `stamp-` prefix systemd gives every Persistent timer's stamp file. */

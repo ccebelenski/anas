@@ -22,10 +22,12 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { ConsistencyFacts } from '../services/backup-consistency.js'
 import type { BackupReposPaths } from '../services/backup-repos.js'
 import type { ResolvedBacking } from '../services/iscsi-mutate.js'
 import type { IscsiPaths, IscsiReadContext } from '../services/iscsi.js'
+import type { UnitTaskObject } from '../services/task-units.js'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
   BackupBrowseRequest,
@@ -52,7 +54,7 @@ import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js
 import { READ_JOB_OPERATIONS, readJobCancel } from '../jobs/read-jobs.js'
 import { readPbsStorages, readPveMountPaths } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
-import { GuardReads, GuardRefusalError, iscsiTargetClaim } from '../safety/guard.js'
+import { guardCheck, guarded, GuardReads, GuardRefusalError, iscsiTargetClaim, sendRefusal, taskClaim } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { browseArchiveLevel } from '../services/backup-catalog.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
@@ -107,6 +109,7 @@ import {
   tcpReachable,
 } from '../services/backup-runner.js'
 import {
+  BACKUP_UNIT_KIND,
   clearCancelledRunFailedState,
   deriveTaskStatus,
   DISABLED_HISTORY_NOTE,
@@ -145,6 +148,7 @@ import { normalizeMountpointPath } from '../services/mounts.js'
 import { imageArchiveScan, NESTED_SCAN_PREVIEW_TIMEOUT_S, scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
 import { pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
 import { readSourceGuardFacts, unmountedMountFor } from '../services/source-guard.js'
+import { activeRunDeleteRefusal, readUnitTaskObject, serviceUnitRevision, taskRunInFlight } from '../services/task-units.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -384,8 +388,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       'backup.repo.create',
       { ...identity, params: { repo: repo.name } },
       async () => {
-        await writeRepoSecret(paths.credsDir, repo.name, secret)
+        // cr.41 (§8.4): the secret is written AFTER the CAS — a lost CAS (a
+        // version moved by another node in the window) must not leave a rotated
+        // secret file for a repo the registry does not carry.
         const written = await writeBackupRepos(paths, expectedVersion, [...current.repos, stored])
+        await writeRepoSecret(paths.credsDir, repo.name, secret)
         return { created: repo.name, version: written.version }
       },
     )
@@ -458,10 +465,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       { ...identity, params: { repo: name } },
       async () => {
         // A blank secret keeps the stored one (write-only field — never cleared
-        // by an edit that omits it).
+        // by an edit that omits it), and (cr.41) the CAS comes FIRST: a lost CAS
+        // must not rotate a secret onto a registry that did not move.
+        const written = await writeBackupRepos(paths, expectedVersion, next)
         if (secret)
           await writeRepoSecret(paths.credsDir, name, secret)
-        const written = await writeBackupRepos(paths, expectedVersion, next)
         return { updated: name, version: written.version, ...(advisory ? { warnings: [advisory] } : {}) }
       },
     )
@@ -524,6 +532,16 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         'backup.repo.remove',
         { ...identity, params: { repo: name } },
         async () => {
+          // cr.41: the IN_USE refusal is re-run in the job — a task created
+          // after the route's check must not be stranded on a removed repo.
+          const referencing = (await readAllTasks(systemdDir)).filter(t => t.repository === name)
+          if (referencing.length) {
+            throw new GuardRefusalError({
+              status: 409,
+              code: 'IN_USE',
+              message: `Repository '${name}' is still used by backup task(s): ${referencing.map(t => t.name).join(', ')} — remove them first`,
+            })
+          }
           const written = await writeBackupRepos(paths, expectedVersion, current.repos.filter(r => r.name !== name))
           await removeRepoSecret(paths.credsDir, name)
           return { removed: name, version: written.version }
@@ -1070,6 +1088,65 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     return { data: detail }
   })
 
+  // --- The backup-task guard specs (story cr.41, WAVE3-DESIGN §3.3 Unit-store
+  // row + the operator's Q1 ruling) ------------------------------------------
+  //
+  // One spec per verb, both doors: the route answers a refusal in the request,
+  // the job re-reads the unit store and refuses again before it writes or
+  // removes. Locks are `task:backup:<name>` — exclusive for create, update and
+  // delete, SHARED for the DIRECT run (§4.2) — so a delete queued during a run
+  // waits for the run and re-gates, and a create cannot race a delete or an
+  // earlier create of the same name.
+
+  const backupTaskView = (name: string): ObjectView<UnitTaskObject<BackupTask>> => ({
+    what: `Backup task '${name}'`,
+    read: () => readUnitTaskObject(readTask, readUnitTexts, systemdDir, name),
+    id: async o => ({ task: o.task.name }),
+    notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `Backup task '${name}' not found` }),
+    unbound: () => `Could not read backup task '${name}' — refusing`,
+  })
+
+  /** The Q1 active-run gate: the direct run job, or the unit systemd reports active. */
+  async function backupTaskActiveRunGate(name: string): Promise<Refusal | null> {
+    const inFlight = await taskRunInFlight(jobQueue, 'backup.task.run', executor, BACKUP_UNIT_KIND, name)
+    return inFlight.job || inFlight.unit ? activeRunDeleteRefusal(`Backup task '${name}'`, inFlight) : null
+  }
+
+  /** A create's object is the name SLOT: existence is a gate, re-run in the job under the name key. */
+  function backupTaskCreateSpec(name: string): GuardSpec<{ existing: BackupTask | null }> {
+    return {
+      operation: 'backup.task.create',
+      object: {
+        what: `Backup task '${name}'`,
+        read: async () => ({ existing: await readTask(systemdDir, name) }),
+        id: async () => ({ task: name }),
+        unbound: () => `Could not read backup tasks — refusing`,
+      },
+      gates: [async o => (o.existing
+        ? { status: 409, code: 'CONFLICT', message: `Backup task '${name}' already exists` }
+        : null)],
+      locks: async () => [taskClaim('backup', name, 'exclusive')],
+    }
+  }
+
+  function backupTaskUpdateSpec(name: string): GuardSpec<UnitTaskObject<BackupTask>> {
+    return {
+      operation: 'backup.task.update',
+      object: { ...backupTaskView(name), revision: async o => serviceUnitRevision(o.unit) },
+      gates: [],
+      locks: async () => [taskClaim('backup', name, 'exclusive')],
+    }
+  }
+
+  function backupTaskDeleteSpec(name: string): GuardSpec<UnitTaskObject<BackupTask>> {
+    return {
+      operation: 'backup.task.remove',
+      object: backupTaskView(name),
+      gates: [async () => backupTaskActiveRunGate(name)],
+      locks: async () => [taskClaim('backup', name, 'exclusive')],
+    }
+  }
+
   // --- POST /backup/tasks — create -----------------------------------------
   server.post('/backup/tasks', async (request, reply) => {
     // ident.2 (audit #14): a NEW task with no backup-id gets `<host>-<task>`,
@@ -1094,10 +1171,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     if (!identity)
       return
 
-    if (await taskFileExists(systemdDir, task.name)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Backup task '${task.name}' already exists` } }
-    }
+    // Story cr.41: the create's existence gate runs here AND again in the job
+    // under the `task:backup:<name>` name key — two creates of one name cannot
+    // both pass a check made before either wrote.
+    const spec = backupTaskCreateSpec(task.name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
     if (!(await guardTask(task, reply)))
       return reply
     if (!(await guardGroupUnique(task, reply)))
@@ -1106,10 +1186,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const job = jobQueue.submit(
       'backup.task.create',
       { ...identity, params: { task: task.name } },
-      async () => {
+      guarded(spec, pre, async () => {
         await writeTaskUnits(executor, systemdDir, task)
         return { created: task.name }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -1139,22 +1220,28 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     if (!identity)
       return
 
-    if (!(await taskFileExists(systemdDir, name))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Backup task '${name}' not found` } }
-    }
+    // Story cr.41: the update is BOUND to the stored task's revision (the
+    // service unit's sha256) — an edit whose unit changed meanwhile refuses
+    // STATE_CHANGED, and one whose task was deleted refuses not-found, so an
+    // update can never resurrect a deleted task. `pre.object.task` is the SAME
+    // re-read the group check compared against.
+    const spec = backupTaskUpdateSpec(name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
     if (!(await guardTask(task, reply)))
       return reply
-    if (!(await guardGroupUnique(task, reply, await readTask(systemdDir, name))))
+    if (!(await guardGroupUnique(task, reply, pre.object.task)))
       return reply
 
     const job = jobQueue.submit(
       'backup.task.update',
       { ...identity, params: { task: name } },
-      async () => {
+      guarded(spec, pre, async () => {
         await writeTaskUnits(executor, systemdDir, task)
         return { updated: name }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -1173,18 +1260,23 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     if (!identity)
       return
 
-    if (!(await taskFileExists(systemdDir, name))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Backup task '${name}' not found` } }
-    }
+    // Q1 (cr.41): a delete during an ACTIVE run refuses at the route AND again
+    // in the job — a run that started while the delete waited (for a slot or
+    // for the task's key) is seen and refused, not removed under. The sentence
+    // names the run (job id or unit) and says how to cancel it.
+    const spec = backupTaskDeleteSpec(name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'backup.task.remove',
       { ...identity, params: { task: name } },
-      async () => {
+      guarded(spec, pre, async () => {
         await removeTaskUnits(executor, systemdDir, name)
         return { removed: name }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -1257,6 +1349,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const source = sourceTask
       ? await pathSourceClaims(executor, sourceTask.archives.map(a => a.path), readAhrPools)
       : { claims: [], unlocked: [] }
+    // cr.41 (§4.2 task key, cr.33b constraint): ONLY the DIRECT run holds the
+    // task's key — shared — because it is the one that reads the task and does
+    // the work. The Run-Now SUPERVISOR holds NO task key (and no source claim):
+    // it waits for the direct run its unit submits, so a queued delete would
+    // otherwise wait for the supervisor while the direct run waited for the
+    // delete — a per-key FIFO deadlock.
+    const runClaims = [...source.claims, ...(direct ? [taskClaim('backup', name, 'shared')] : [])]
 
     const job = jobQueue.submit(
       'backup.task.run',
@@ -1392,8 +1491,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       // cr.33 (§4.3): the direct run is a data mover and rides the long lane
       // (at most 3 of the 4 slots). cr.49: the Run-Now supervisor only watches
       // the unit, so it rides the watch lane (its own slots, no claims) and its
-      // direct run never waits behind it.
-      { lane: direct ? 'long' : 'watch', locks: source.claims },
+      // direct run never waits behind it. cr.41: the task key rides the DIRECT
+      // run only (runClaims is empty for the supervisor), so a queued delete
+      // cannot deadlock the pair under per-key FIFO.
+      { lane: direct ? 'long' : 'watch', locks: runClaims },
     )
     reply.code(202)
     return { job }

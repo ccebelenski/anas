@@ -11,7 +11,9 @@ import type {
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { RcloneConfigPaths } from '../services/rclone-config.js'
+import type { UnitTaskObject } from '../services/task-units.js'
 import { access, constants } from 'node:fs/promises'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
@@ -30,6 +32,7 @@ import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js
 import { READ_JOB_OPERATIONS, readJobCancel } from '../jobs/read-jobs.js'
 import { ConfirmStore } from '../safety/confirm.js'
 import { confirmGate } from '../safety/gate.js'
+import { guardCheck, guarded, GuardRefusalError, sendRefusal, taskClaim } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyCloudRun } from '../services/cloud-notify.js'
@@ -38,6 +41,7 @@ import { describeChange, describeTasks, destinationChanges, tasksReachingRemote 
 import { runCloudSync } from '../services/cloud-runner.js'
 import {
   clearCancelledRunFailedState,
+  CLOUD_UNIT_KIND,
   DEFAULT_SYSTEMD_DIR,
   deriveTaskStatus,
   DISABLED_HISTORY_NOTE,
@@ -64,6 +68,7 @@ import { scanNestedFilesystems } from '../services/nested-filesystems.js'
 import { normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, remotesReferencing, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
 import { testRemote } from '../services/rclone-probe.js'
 import { pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
+import { activeRunDeleteRefusal, readUnitTaskObject, serviceUnitRevision, taskRunInFlight } from '../services/task-units.js'
 import { zodIssue } from '../validation.js'
 import { requireIdentity } from './identity.js'
 
@@ -534,7 +539,31 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     const job = jobQueue.submit(
       'cloud.remote.remove',
       { ...identity, params: { remote: name } },
-      async () => rcloneJob(() => removeRemote(paths, executor, name).then(() => ({ removed: name }))),
+      async () => rcloneJob(async () => {
+        // cr.41: the reference checks RE-RUN in the job — a task or a wrapper
+        // remote created after the route's check must not be stranded on a
+        // removed section. The 409s carry the route's codes so the UI reads a
+        // job refusal like the 409 it would have got.
+        const current = await readConfig(paths, executor)
+        const refs = await referencingTasks(name)
+        if (refs.length > 0) {
+          throw new GuardRefusalError({
+            status: 409,
+            code: 'CONFLICT',
+            message: `remote '${name}' is used by cloud sync task(s): ${refs.join(', ')} — remove or retarget them first`,
+          })
+        }
+        const wrappedBy = remotesReferencing(current.remotes, name)
+        if (wrappedBy.length > 0) {
+          throw new GuardRefusalError({
+            status: 409,
+            code: 'CONFLICT',
+            message: `remote '${name}' is referenced by remote(s): ${wrappedBy.join(', ')}. Remove them first.`,
+          })
+        }
+        await removeRemote(paths, executor, name)
+        return { removed: name }
+      }),
     )
     reply.code(202)
     return { job }
@@ -709,6 +738,65 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     return { data }
   })
 
+  // --- The cloud-task guard specs (story cr.41, WAVE3-DESIGN §3.3 Unit-store
+  // row + the operator's Q1 ruling) ------------------------------------------
+  //
+  // One spec per verb, both doors: the route answers a refusal in the request,
+  // the job re-reads the unit store and refuses again before it writes or
+  // removes. Locks are `task:cloud:<name>` — exclusive for create, update and
+  // delete, SHARED for the DIRECT run (§4.2) — so a delete queued during a run
+  // waits for the run and re-gates, and a create cannot race a delete or an
+  // earlier create of the same name.
+
+  const cloudTaskView = (name: string): ObjectView<UnitTaskObject<CloudSyncTask>> => ({
+    what: `Cloud sync task '${name}'`,
+    read: () => readUnitTaskObject(readTask, readUnitTexts, systemdDir, name),
+    id: async o => ({ task: o.task.name }),
+    notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `Cloud sync task '${name}' not found` }),
+    unbound: () => `Could not read cloud sync task '${name}' — refusing`,
+  })
+
+  /** The Q1 active-run gate: the direct run job, or the unit systemd reports active. */
+  async function cloudTaskActiveRunGate(name: string): Promise<Refusal | null> {
+    const inFlight = await taskRunInFlight(jobQueue, 'cloud.task.run', executor, CLOUD_UNIT_KIND, name)
+    return inFlight.job || inFlight.unit ? activeRunDeleteRefusal(`Cloud sync task '${name}'`, inFlight) : null
+  }
+
+  /** A create's object is the name SLOT: existence is a gate, re-run in the job under the name key. */
+  function cloudTaskCreateSpec(name: string): GuardSpec<{ existing: CloudSyncTask | null }> {
+    return {
+      operation: 'cloud.task.create',
+      object: {
+        what: `Cloud sync task '${name}'`,
+        read: async () => ({ existing: await readTask(systemdDir, name) }),
+        id: async () => ({ task: name }),
+        unbound: () => `Could not read cloud sync tasks — refusing`,
+      },
+      gates: [async o => (o.existing
+        ? { status: 409, code: 'CONFLICT', message: `Cloud sync task '${name}' already exists` }
+        : null)],
+      locks: async () => [taskClaim('cloud', name, 'exclusive')],
+    }
+  }
+
+  function cloudTaskUpdateSpec(name: string): GuardSpec<UnitTaskObject<CloudSyncTask>> {
+    return {
+      operation: 'cloud.task.update',
+      object: { ...cloudTaskView(name), revision: async o => serviceUnitRevision(o.unit) },
+      gates: [],
+      locks: async () => [taskClaim('cloud', name, 'exclusive')],
+    }
+  }
+
+  function cloudTaskDeleteSpec(name: string): GuardSpec<UnitTaskObject<CloudSyncTask>> {
+    return {
+      operation: 'cloud.task.remove',
+      object: cloudTaskView(name),
+      gates: [async () => cloudTaskActiveRunGate(name)],
+      locks: async () => [taskClaim('cloud', name, 'exclusive')],
+    }
+  }
+
   // --- POST /cloud/tasks — create ------------------------------------------
   server.post('/cloud/tasks', async (request, reply) => {
     const parsed = CloudSyncTaskRequest.safeParse(request.body ?? {})
@@ -722,20 +810,24 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     if (!identity)
       return
 
-    if (await taskFileExists(systemdDir, task.name)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Cloud sync task '${task.name}' already exists` } }
-    }
+    // Story cr.41: the create's existence gate runs here AND again in the job
+    // under the `task:cloud:<name>` name key — two creates of one name cannot
+    // both pass a check made before either wrote.
+    const spec = cloudTaskCreateSpec(task.name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
     if (!(await guardTask(task, reply)))
       return reply
 
     const job = jobQueue.submit(
       'cloud.task.create',
       { ...identity, params: { task: task.name, remote: task.remote } },
-      async () => {
+      guarded(spec, pre, async () => {
         await writeTaskUnits(executor, systemdDir, task)
         return { created: task.name }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -902,20 +994,25 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     if (!identity)
       return
 
-    if (!(await taskFileExists(systemdDir, name))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Cloud sync task '${name}' not found` } }
-    }
+    // Story cr.41: the update is BOUND to the stored task's revision — an edit
+    // whose unit changed meanwhile refuses STATE_CHANGED, and one whose task
+    // was deleted refuses not-found, so an update can never resurrect a deleted
+    // cloud sync task.
+    const spec = cloudTaskUpdateSpec(name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
     if (!(await guardTask(task, reply)))
       return reply
 
     const job = jobQueue.submit(
       'cloud.task.update',
       { ...identity, params: { task: name, remote: task.remote } },
-      async () => {
+      guarded(spec, pre, async () => {
         await writeTaskUnits(executor, systemdDir, task)
         return { updated: name }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -932,18 +1029,22 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     if (!identity)
       return
 
-    if (!(await taskFileExists(systemdDir, name))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Cloud sync task '${name}' not found` } }
-    }
+    // Q1 (cr.41): a delete during an ACTIVE run refuses at the route AND again
+    // in the job — a run that started while the delete waited is seen and
+    // refused, not removed under. The sentence names the run and how to cancel.
+    const spec = cloudTaskDeleteSpec(name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'cloud.task.remove',
       { ...identity, params: { task: name } },
-      async () => {
+      guarded(spec, pre, async () => {
         await removeTaskUnits(executor, systemdDir, name)
         return { removed: name }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -1013,6 +1114,10 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     const source = sourceTask
       ? await pathSourceClaims(executor, [sourceTask.source], readAhrPools)
       : { claims: [], unlocked: [] }
+    // cr.41 (§4.2 task key, cr.33b constraint): ONLY the DIRECT run holds the
+    // task's key — shared — because it is the one that reads the task and does
+    // the work. The Run-Now SUPERVISOR holds NO task key (and no source claim).
+    const runClaims = [...source.claims, ...(direct ? [taskClaim('cloud', name, 'shared')] : [])]
 
     const job = jobQueue.submit(
       'cloud.task.run',
@@ -1103,8 +1208,10 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       // cr.33 (§4.3): the direct run is a data mover and rides the long lane
       // (at most 3 of the 4 slots). cr.49: the Run-Now supervisor only watches
       // the unit, so it rides the watch lane (its own slots, no claims) and its
-      // direct run never waits behind it.
-      { lane: direct ? 'long' : 'watch', locks: source.claims },
+      // direct run never waits behind it. cr.41: the task key rides the DIRECT
+      // run only (runClaims is empty for the supervisor), so a queued delete
+      // cannot deadlock the pair under per-key FIFO.
+      { lane: direct ? 'long' : 'watch', locks: runClaims },
     )
     reply.code(202)
     return { job }

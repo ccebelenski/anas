@@ -5,6 +5,7 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { RemotesPaths } from '../services/replication-remotes.js'
 import type { ResolvedRemote, Transport } from '../services/replication-transport.js'
 import { ReplicationTaskName, TestRemoteRequest, UpsertRemoteRequest } from '@anas/shared'
+import { GuardRefusalError } from '../safety/guard.js'
 import {
   ensureKeypair,
   fingerprintOf,
@@ -217,6 +218,21 @@ export async function replicationRemotesRoutes(
         'replication.remote.remove',
         { ...identity, params: { remote: name } },
         async () => {
+          // cr.41: the referencing-task check re-runs in the job — a task
+          // created after the route's check must not be stranded on a removed
+          // remote. Same sentence and code as the route, so the job fails like
+          // the 400 the route would have answered.
+          const tasks = await readAllTasks(systemdDir)
+          const referencing = tasks.filter(
+            t => t.target.location?.kind === 'remote' && t.target.location?.name === name,
+          )
+          if (referencing.length) {
+            throw new GuardRefusalError({
+              status: 400,
+              code: 'VALIDATION_ERROR',
+              message: `Remote '${name}' is still used by replication task(s): ${referencing.map(t => t.name).join(', ')} — remove them first`,
+            })
+          }
           const written = await writeRemotes(paths, expectedVersion, current.remotes.filter(r => r.name !== name))
           return { removed: name, version: written.version }
         },

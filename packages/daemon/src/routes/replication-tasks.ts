@@ -1,10 +1,15 @@
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { Transport } from '../services/replication-transport.js'
 import type { TargetNamesResolver } from '../services/replication-units.js'
+import type { UnitTaskObject } from '../services/task-units.js'
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { ReplicationTask, ReplicationTaskName } from '@anas/shared'
 import { parseZpoolList } from '../parsers/zpool-list.js'
+import { guardCheck, guarded, sendRefusal, taskClaim } from '../safety/guard.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
 import { guardReplicationTarget } from '../services/replication-target.js'
 import {
@@ -14,9 +19,12 @@ import {
   resolveTaskDatasets,
   serviceUnitName,
   taskFileExists,
+  timerUnitName,
   validateSchedule,
   writeTaskUnits,
 } from '../services/replication-units.js'
+import { activeRunDeleteRefusal, readUnitTaskObject, serviceUnitRevision } from '../services/task-units.js'
+import { isRunActive, showUnitProps } from '../services/unit-run-status.js'
 import { requireIdentity } from './identity.js'
 
 const ZPOOL = '/usr/sbin/zpool'
@@ -158,6 +166,84 @@ export async function replicationTaskRoutes(
     }
   }
 
+  /**
+   * The replication unit store's service/timer text — this store has no
+   * `readUnitTexts` of its own (it predates the task-units extraction), and the
+   * update spec's revision hashes the ACTUAL stored bytes, never a re-render.
+   */
+  async function readReplicationUnitText(dir: string, name: string): Promise<{ unit: string, timer: string }> {
+    const [unit, timer] = await Promise.all([
+      readFile(join(dir, serviceUnitName(name)), 'utf-8').catch(() => ''),
+      readFile(join(dir, timerUnitName(name)), 'utf-8').catch(() => ''),
+    ])
+    return { unit, timer }
+  }
+
+  /**
+   * The guard specs of the replication-task verbs (story cr.41, WAVE3-DESIGN
+   * §3.3 Unit-store row + the operator's Q1 ruling). One spec per verb, both
+   * doors; locks are `task:replication:<name>` — exclusive for create, update
+   * and delete, shared for a run trigger (§4.2).
+   */
+  const replicationTaskView = (name: string): ObjectView<UnitTaskObject<ReplicationTask>> => ({
+    what: `Replication task '${name}'`,
+    read: () => readUnitTaskObject(readTask, readReplicationUnitText, systemdDir, name),
+    id: async o => ({ task: o.task.name }),
+    notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `Replication task '${name}' not found` }),
+    unbound: () => `Could not read replication task '${name}' — refusing`,
+  })
+
+  /**
+   * The Q1 active-run gate. A replication run's only durable "active" signal is
+   * the unit systemd reports in a still-running state — the trigger job
+   * (`replication.task.run`) is a fire-and-return, and the send itself is a
+   * `zfs.replicate` job that carries no task name. The unit check covers both
+   * (the runner keeps the unit active while it polls the send).
+   */
+  async function replicationTaskActiveRunRefusal(name: string): Promise<Refusal | null> {
+    const runJob = jobQueue.findActive('replication.task.run', name, 'task')
+    if (runJob)
+      return activeRunDeleteRefusal(`Replication task '${name}'`, { job: runJob })
+    const props = await showUnitProps(executor, serviceUnitName(name), 'ActiveState')
+    if (isRunActive(props))
+      return activeRunDeleteRefusal(`Replication task '${name}'`, { unit: { service: serviceUnitName(name), since: null } })
+    return null
+  }
+
+  function replicationTaskCreateSpec(name: string): GuardSpec<{ existing: ReplicationTask | null }> {
+    return {
+      operation: 'replication.task.create',
+      object: {
+        what: `Replication task '${name}'`,
+        read: async () => ({ existing: await readTask(systemdDir, name) }),
+        id: async () => ({ task: name }),
+        unbound: () => `Could not read replication tasks — refusing`,
+      },
+      gates: [async o => (o.existing
+        ? { status: 409, code: 'CONFLICT', message: `Replication task '${name}' already exists` }
+        : null)],
+      locks: async () => [taskClaim('replication', name, 'exclusive')],
+    }
+  }
+
+  function replicationTaskUpdateSpec(name: string): GuardSpec<UnitTaskObject<ReplicationTask>> {
+    return {
+      operation: 'replication.task.update',
+      object: { ...replicationTaskView(name), revision: async o => serviceUnitRevision(o.unit) },
+      gates: [],
+      locks: async () => [taskClaim('replication', name, 'exclusive')],
+    }
+  }
+
+  function replicationTaskDeleteSpec(name: string): GuardSpec<UnitTaskObject<ReplicationTask>> {
+    return {
+      operation: 'replication.task.remove',
+      object: replicationTaskView(name),
+      gates: [async () => replicationTaskActiveRunRefusal(name)],
+      locks: async () => [taskClaim('replication', name, 'exclusive')],
+    }
+  }
+
   // --- GET /replication/tasks — derived statuses (read-only) ----------------
   server.get('/replication/tasks', async () => {
     return { data: await collectTaskStatuses(executor, systemdDir, remoteTargetNames) }
@@ -176,11 +262,13 @@ export async function replicationTaskRoutes(
     if (!identity)
       return
 
-    // 409 if the task already exists — the unit files are the source of truth.
-    if (await taskFileExists(systemdDir, task.name)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Replication task '${task.name}' already exists` } }
-    }
+    // Story cr.41: the create's existence gate runs here AND again in the job
+    // under the `task:replication:<name>` name key — two creates of one name
+    // cannot both pass a check made before either wrote.
+    const spec = replicationTaskCreateSpec(task.name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     if (!(await guardTask(task, reply)))
       return reply
@@ -188,10 +276,11 @@ export async function replicationTaskRoutes(
     const job = jobQueue.submit(
       'replication.task.create',
       { ...identity, params: { task: task.name } },
-      async () => {
+      guarded(spec, pre, async () => {
         await writeTaskUnits(executor, systemdDir, task)
         return { created: task.name }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -230,16 +319,20 @@ export async function replicationTaskRoutes(
     if (!identity)
       return
 
-    if (!(await taskFileExists(systemdDir, name))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Replication task '${name}' not found` } }
-    }
+    // Story cr.41: the update is BOUND to the stored task's revision (the
+    // actual service unit bytes' sha256) — an edit whose unit changed meanwhile
+    // refuses STATE_CHANGED, and one whose task was deleted refuses not-found,
+    // so an update can never resurrect a deleted replication task.
+    const spec = replicationTaskUpdateSpec(name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const stored = pre.object.task
 
     // Retarget guard: compare against the STORED task, not against what the
-    // client believes it loaded. A unit file we cannot parse at all has no
-    // endpoints to preserve, so that PUT is a repair and passes through.
-    const stored = await readTask(systemdDir, name)
-    if (stored && request.query.retarget !== 'true') {
+    // client believes it loaded (cr.41: an unparseable unit now reads not-found
+    // — an edit cannot be bound to bytes the guard could not read).
+    if (request.query.retarget !== 'true') {
       const was = endpoints(stored)
       const now = endpoints(task)
       const moved = [
@@ -264,11 +357,12 @@ export async function replicationTaskRoutes(
     const job = jobQueue.submit(
       'replication.task.update',
       { ...identity, params: { task: name } },
-      async () => {
+      guarded(spec, pre, async () => {
         // Rewrite both units and re-sync the timer to `enabled` (toggle support).
         await writeTaskUnits(executor, systemdDir, task)
         return { updated: name }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -290,18 +384,22 @@ export async function replicationTaskRoutes(
     if (!identity)
       return
 
-    if (!(await taskFileExists(systemdDir, name))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Replication task '${name}' not found` } }
-    }
+    // Q1 (cr.41): a delete during an ACTIVE run refuses at the route AND again
+    // in the job — a run that started while the delete waited is seen and
+    // refused, not removed under. The sentence names the run and how to cancel.
+    const spec = replicationTaskDeleteSpec(name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'replication.task.remove',
       { ...identity, params: { task: name } },
-      async () => {
+      guarded(spec, pre, async () => {
         await removeTaskUnits(executor, systemdDir, name)
         return { removed: name }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -329,7 +427,8 @@ export async function replicationTaskRoutes(
 
     // Fire-and-return: `--no-block` starts the oneshot without waiting for it to
     // finish, so the trigger is instant and systemd owns the run. Audited via the
-    // quick job below.
+    // quick job below. cr.41: the trigger holds the task's key briefly (shared),
+    // so a delete queued between the trigger and the run it starts serialises.
     jobQueue.submit(
       'replication.task.run',
       { ...identity, params: { task: name } },
@@ -339,6 +438,7 @@ export async function replicationTaskRoutes(
           throw new Error(r.stderr.trim() || `systemctl start ${serviceUnitName(name)} exited with code ${r.exitCode}`)
         return { started: name }
       },
+      { locks: [taskClaim('replication', name, 'shared')] },
     )
     reply.code(202)
     return { started: true }

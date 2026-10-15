@@ -275,17 +275,20 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     const job = await race(runId, 'backup.task.run', DESTROY_RECURSIVE, pveClaimsMedia)
     // The claims the run held (pinned after the race, so a run that holds none fails on the race itself).
     const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[] }> }).jobs.get(runId)!
+    // The direct run's OWN `task:backup:<name>` claim (cr.41) rides with its
+    // source claims.
     assert.deepEqual(record.claims.map(c => `${c.key} ${c.mode}`), [
       `zfs:${TESTPOOL_GUID}/media shared`,
       `zfs:${TESTPOOL_GUID} shared`,
       `zpool:${TESTPOOL_GUID} shared`,
       'zname:testpool shared',
       'mount:/testpool/media shared',
+      'task:backup:media-nightly shared',
     ])
     assertRefusedByPve(job, DESTROY_RECURSIVE)
   })
 
-  it('backup: a source whose filesystem cannot be resolved (unreadable mount table) takes no key, and the run says so in its progress line', async () => {
+  it('backup: a source whose filesystem cannot be resolved (unreadable mount table) takes no source key — only the task\'s own key — and the run says so in its progress line', async () => {
     await writeBackupTask(QUIET, systemdDir, BackupTask.parse({
       name: 'media-nightly',
       repository: 'pbs-main',
@@ -299,12 +302,12 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     assert.equal(res.statusCode, 202, res.body)
     const runId = (res.json() as JobAccepted).job.id
     await until(() => queue().get(runId)?.status === 'running')
-    const record = (queue() as unknown as { jobs: Map<string, { claims: unknown[] }> }).jobs.get(runId)!
-    assert.deepEqual(record.claims, [])
+    const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string }[] }> }).jobs.get(runId)!
+    assert.deepEqual(record.claims.map(c => c.key), ['task:backup:media-nightly'])
     assert.equal(queue().get(runId)?.progress, `backup task 'media-nightly': /testpool/media/photos: no lock on the source - the mount table could not be read, so its filesystem is unknown`)
   })
 
-  it('backup: the Run-Now supervisor takes no source claim (it waits for the direct run its unit submits)', async () => {
+  it('backup: the Run-Now supervisor holds NO key at all — not the source, and not the task key (cr.41: only ONE of the supervisor/direct pair may claim the task, or a queued delete deadlocks them under per-key FIFO)', async () => {
     await writeBackupTask(QUIET, systemdDir, BackupTask.parse({
       name: 'media-nightly',
       repository: 'pbs-main',
@@ -315,6 +318,21 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     }))
     await serve('backup.task.run')
     const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: {} })
+    assert.equal(res.statusCode, 202, res.body)
+    const record = (queue() as unknown as { jobs: Map<string, { claims: unknown[] }> }).jobs.get((res.json() as JobAccepted).job.id)!
+    assert.deepEqual(record.claims, [])
+  })
+
+  it('cloud: the Run-Now supervisor holds NO key at all — not the source, and not the task key (cr.41, backup parity)', async () => {
+    await writeCloudTask(QUIET, systemdDir, CloudSyncTask.parse({
+      name: 'offsite',
+      source: '/testpool/media',
+      remote: 'gt',
+      path: 'pve1/media',
+      schedule: 'Tue *-*-* 02:00:00',
+    }))
+    await serve('cloud.task.run')
+    const res = await inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', payload: {} })
     assert.equal(res.statusCode, 202, res.body)
     const record = (queue() as unknown as { jobs: Map<string, { claims: unknown[] }> }).jobs.get((res.json() as JobAccepted).job.id)!
     assert.deepEqual(record.claims, [])
@@ -335,12 +353,15 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     const job = await race(runId, 'cloud.task.run', RENAME_SNAP1, pveClaimsMedia)
     // The claims the run held (pinned after the race, so a run that holds none fails on the race itself).
     const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[] }> }).jobs.get(runId)!
+    // The direct run's OWN `task:cloud:<name>` claim (cr.41) rides with its
+    // source claims.
     assert.deepEqual(record.claims.map(c => `${c.key} ${c.mode}`), [
       `zfs:${TESTPOOL_GUID}/media shared`,
       `zfs:${TESTPOOL_GUID} shared`,
       `zpool:${TESTPOOL_GUID} shared`,
       'zname:testpool shared',
       'mount:/testpool/media shared',
+      'task:cloud:offsite shared',
     ])
     assertRefusedByPve(job, RENAME_SNAP1)
   })
@@ -361,11 +382,13 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     const runId = (res.json() as JobAccepted).job.id
     const job = await race(runId, 'schedule.run', ROLLBACK_FORCE, pveClaimsMedia)
     const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[] }> }).jobs.get(runId)!
+    // The fire's own `schedule:<id>` claim (cr.41) rides with its source claims.
     assert.deepEqual(record.claims.map(c => `${c.key} ${c.mode}`), [
       `zfs:${TESTPOOL_GUID}/media shared`,
       `zfs:${TESTPOOL_GUID} shared`,
       `zpool:${TESTPOOL_GUID} shared`,
       'zname:testpool shared',
+      'schedule:nightly-media shared',
     ])
     assertRefusedByPve(job, ROLLBACK_FORCE)
   })
