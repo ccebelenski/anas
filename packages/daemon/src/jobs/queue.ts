@@ -1,6 +1,7 @@
 import type { Job, JobRef, JobStatus } from '@anas/shared'
 import type { AuditLogger } from '../audit/logger.js'
 import { randomUUID } from 'node:crypto'
+import { runInLane } from '../executor/deadline.js'
 
 /** Who cancelled a job, and when (rclone.5). */
 export interface JobCancellation {
@@ -420,7 +421,10 @@ export class JobQueue {
 
     let outcome: { ok: true, result: unknown } | { ok: false, err: unknown }
     try {
-      outcome = { ok: true, result: await handler(updateProgress, ctx) }
+      // cr.34: the job lane (300 s per command by default). `execute` is
+      // reached synchronously from `submit`, so without this the body would
+      // inherit the submitting request's 10 s lane.
+      outcome = { ok: true, result: await runInLane({ lane: 'job', jobId: job.id }, () => handler(updateProgress, ctx)) }
     }
     catch (err) {
       outcome = { ok: false, err }

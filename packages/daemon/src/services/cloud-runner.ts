@@ -1,4 +1,5 @@
 import type { AhrPool, BackupArchiveConsistency, CloudRunDetail, CloudRunRecentEvent, CloudSyncRunResult, CloudSyncTask } from '@anas/shared'
+import type { DeadlineOptions } from '../executor/deadline.js'
 import type { CommandExecutor, SpawnedChild } from '../executor/types.js'
 import type { BackupSnapshotOptions, TakenSnapshot } from './backup-snapshots.js'
 import type { RcloneConfigPaths } from './rclone-config.js'
@@ -1057,6 +1058,9 @@ async function execRclone(
     (event) => {
       tracker?.onEvent(event)
     },
+    // cr.34: the run is a data mover (days for an offsite copy); it ends on
+    // its own or through its cancel hook (rclone.5), never by a deadline.
+    { timeoutMs: null, longRunning: 'rclone sync/copy run: a data mover, days long; stopped by its cancel hook' },
   )
 }
 
@@ -1075,10 +1079,16 @@ export async function execRcloneLog(
   onStats?: (stats: RcloneStats) => void,
   onSpawn?: (child: SpawnedChild) => void,
   onEvent?: (event: RcloneFileEvent) => void,
+  /**
+   * cr.34: the call's deadline. Omitted, the executor's own rule applies (the
+   * preview's `timeout 120` wrapper sets it); the run passes `null`.
+   */
+  deadline: DeadlineOptions = {},
 ): Promise<{ exitCode: number, log: RcloneLogState }> {
   const reader = new RcloneLogReader()
   reader.onFileEvent = onEvent
   const r = await executor.exec(command, args, {
+    ...deadline,
     ...(onSpawn ? { onSpawn } : {}),
     // See RCLONE_MAX_BUFFER for the arithmetic. The tee means stderr is NOT
     // retained beyond the executor's bounded tail — a 15-day run's stats log

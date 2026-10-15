@@ -1460,7 +1460,9 @@ export async function datasetRoutes(
         // challenge refuses the destroy here, before `zfs destroy` runs.
         await requireStableId(`Dataset '${fullName}'`, destroyGuid, () => readDatasetGuid(executor, fullName))
         await recheckDestroyGates(poolName, fullName, recursive)
-        const result = await executor.exec(ZFS, args)
+        // cr.34 (WAVE3-DESIGN §6.3): a recursive destroy walks every
+        // descendant and snapshot (thousands, in user space) — 30 min.
+        const result = await executor.exec(ZFS, args, recursive ? { timeoutMs: 1_800_000 } : undefined)
         if (result.exitCode !== 0) {
           // A busy dataset can't be unmounted for destroy — name the holders
           // (3.29); the path comes from the ZFS error (`cannot unmount '<path>'`).

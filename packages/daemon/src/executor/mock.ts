@@ -1,3 +1,4 @@
+import type { Lane } from './deadline.js'
 import type {
   CommandExecutor,
   ExecOptions,
@@ -5,9 +6,11 @@ import type {
   ExecStreamOptions,
   ExecStreamResult,
   ExecStreamTarget,
+  PipelineOptions,
   PipelineResult,
   SpawnedChild,
 } from './types.js'
+import { CommandTimeoutError, resolveDeadline } from './deadline.js'
 
 /** A canned response for a specific command + args pattern. */
 export interface MockFixture {
@@ -52,6 +55,26 @@ export interface MockFixture {
    * spawned, so no `onSpawn` runs either.
    */
   throws?: Error
+  /**
+   * cr.34 — the command never answers: the exec REJECTS with the
+   * {@link CommandTimeoutError} the real executor raises at the end of the
+   * call's deadline (lane default or its own `timeoutMs`), at once — a test
+   * never waits for a real budget. `abandoned: true` models a child that
+   * survived its SIGKILL (uninterruptible sleep).
+   */
+  timesOut?: { abandoned?: boolean }
+}
+
+/** One recorded call's deadline, as the real executor would apply it (cr.34). */
+export interface MockDeadlineCall {
+  command: string
+  args: string[]
+  lane: Lane
+  jobId?: string
+  /** Milliseconds, or null for a `longRunning` call. */
+  budgetMs: number | null
+  source: 'lane' | 'call' | 'wrapper'
+  longRunning?: string
 }
 
 /** How a {@link MockFixture.live} child answers signals. */
@@ -125,6 +148,15 @@ export class MockExecutor implements CommandExecutor {
   /** Every execToStream() call, in order — argv AND the target descriptor. */
   readonly streamCalls: MockStreamCall[] = []
 
+  /**
+   * Every call's deadline (exec, pipeline, execToStream), in order — resolved
+   * with the same rules and in the same lane as the production executor, so
+   * a lane test asserts what a real child would have been given (cr.34). A
+   * call whose options break the rules (`null` without a reason) REJECTS
+   * here exactly as it would in production.
+   */
+  readonly deadlines: MockDeadlineCall[] = []
+
   /** Every signal sent to a live child through its `onSpawn` handle, in order. */
   readonly signals: { pid: number, signal: string }[] = []
 
@@ -159,6 +191,20 @@ export class MockExecutor implements CommandExecutor {
     this.pipelineCalls.length = 0
     this.streamCalls.length = 0
     this.signals.length = 0
+    this.deadlines.length = 0
+  }
+
+  /** Resolve and record a call's deadline; throws as production does on bad options. */
+  private recordDeadline(command: string, args: string[], opts?: { timeoutMs?: number | null, longRunning?: string }): MockDeadlineCall {
+    const d = resolveDeadline(command, args, opts)
+    const call: MockDeadlineCall = { command, args, ...d }
+    this.deadlines.push(call)
+    return call
+  }
+
+  /** The rejection a never-answering command ends in (`timesOut` fixtures). */
+  private timeoutOf(call: MockDeadlineCall, abandoned: boolean): CommandTimeoutError {
+    return new CommandTimeoutError(call.command, call.args, call.lane, call.budgetMs ?? 0, abandoned, call.jobId)
   }
 
   /**
@@ -222,6 +268,7 @@ export class MockExecutor implements CommandExecutor {
   async exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
     // Record for test assertions on the exact argv (e.g. the zfs hold calls).
     this.calls.push({ command, args })
+    const deadline = this.recordDeadline(command, args, opts)
     // stdin (opts.stdin) and maxBuffer (opts.maxBuffer) are accepted for
     // interface parity but ignored — mock matching is by command + args only,
     // and secrets must never be matched on.
@@ -240,6 +287,8 @@ export class MockExecutor implements CommandExecutor {
       return this.liveExec({ ...match, live: match.live }, opts)
     if (match?.throws)
       throw match.throws
+    if (match?.timesOut)
+      throw this.timeoutOf(deadline, match.timesOut.abandoned === true)
     if (match)
       return this.tee(this.resultOf(match), match, opts)
 
@@ -270,9 +319,10 @@ export class MockExecutor implements CommandExecutor {
     return fixture.result ?? { stdout: '', stderr: '', exitCode: 0 }
   }
 
-  async pipeline(cmd1: string, args1: string[], cmd2: string, args2: string[]): Promise<PipelineResult> {
+  async pipeline(cmd1: string, args1: string[], cmd2: string, args2: string[], opts?: PipelineOptions): Promise<PipelineResult> {
     // Record the call so route tests can assert the exact send/recv argv.
     this.pipelineCalls.push({ cmd1, args1, cmd2, args2 })
+    this.recordDeadline(cmd1, args1, opts)
 
     const sameArgs = (pattern: string[] | undefined, actual: string[]): boolean =>
       pattern === undefined || (pattern.length === actual.length && pattern.every((a, i) => a === actual[i]))
@@ -305,6 +355,7 @@ export class MockExecutor implements CommandExecutor {
   ): Promise<ExecStreamResult> {
     this.calls.push({ command, args })
     this.streamCalls.push({ command, args, target })
+    this.recordDeadline(command, args, opts)
 
     // Try exact match (command + args) first, then command-only match —
     // mirroring exec() so a catch-all fixture registered early cannot shadow a

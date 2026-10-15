@@ -260,10 +260,10 @@ export function mirrorGuardedExecutor(executor: CommandExecutor): CommandExecuto
       assertNoMdRepair(command, args)
       return executor.exec(command, args, opts)
     },
-    pipeline: async (cmd1, args1, cmd2, args2) => {
+    pipeline: async (cmd1, args1, cmd2, args2, opts) => {
       assertNoMdRepair(cmd1, args1)
       assertNoMdRepair(cmd2, args2)
-      return executor.pipeline(cmd1, args1, cmd2, args2)
+      return executor.pipeline(cmd1, args1, cmd2, args2, opts)
     },
     execToStream: async (command, args, target, opts) => {
       assertNoMdRepair(command, args)

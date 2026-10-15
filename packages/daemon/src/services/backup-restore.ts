@@ -659,6 +659,9 @@ export async function runImageRestore(
     let lastPercent = -1
     const r = await executor.execToStream(PBC, args, streamTarget, {
       env: deps.env,
+      // cr.34: a data mover (a whole disk image); no deadline.
+      timeoutMs: null,
+      longRunning: 'proxmox-backup-client image restore in place: a data mover, hours for a large image',
       onStderr: (chunk) => {
         // GT-59: the interval roughly DOUBLES (6 s, 16 s, 36 s, 79 s), so a
         // multi-hour restore emits a handful of late lines and long silences
@@ -950,6 +953,9 @@ export async function runNewLunImageRestore(
     let lastPercent = -1
     const r = await executor.execToStream(PBC, args, streamTarget, {
       env: deps.env,
+      // cr.34: a data mover (a whole disk image); no deadline.
+      timeoutMs: null,
+      longRunning: 'proxmox-backup-client image restore to a new backing: a data mover, hours for a large image',
       onStderr: (chunk) => {
         // GT-59: forward every progress line verbatim, as the in-place run does.
         const p = parseRestoreProgress(chunk)

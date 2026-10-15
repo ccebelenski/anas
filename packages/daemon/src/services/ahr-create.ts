@@ -11,7 +11,7 @@ import { mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-
 import { ROLLED_BACK_MARKER } from './ahr-create-status.js'
 import { destroyAhrPool } from './ahr-destroy.js'
 import { requireComposableNow } from './ahr-disk-recheck.js'
-import { LVM_MIXED_BLOCK_ARGS, run } from './ahr-exec.js'
+import { LVM_MIXED_BLOCK_ARGS, run, UPDATE_INITRAMFS_BUDGET_MS } from './ahr-exec.js'
 import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
 import { ahrNameOccupancy } from './ahr-identity.js'
 import { clearIntent } from './ahr-intent.js'
@@ -471,7 +471,7 @@ async function executeCreate(
   // Early-boot assembly reads the conf baked into the initramfs
   // (ARRAY_PIN_REQUIRES_INITRAMFS) — the executor owns this side effect.
   updateProgress('Updating initramfs (mdadm.conf changed)')
-  await run(executor, UPDATE_INITRAMFS, ['-u'])
+  await run(executor, UPDATE_INITRAMFS, ['-u'], { timeoutMs: UPDATE_INITRAMFS_BUDGET_MS })
 
   // --- LVM: PVs in band order → one VG → one LV -------------------------------
   // LVM_MIXED_BLOCK_ARGS on every call: a mixed-media pool's bands legitimately
@@ -490,7 +490,8 @@ async function executeCreate(
   // block size, always), so the guarantee must not depend on the host's arch.
   const lvPath = ahrLvPath(name)
   updateProgress('Creating btrfs filesystem')
-  await run(executor, MKFS_BTRFS, ['-L', name, '-d', 'single', '-m', 'dup', '--sectorsize', String(BTRFS_SECTOR_SIZE), lvPath])
+  // cr.34 (WAVE3-DESIGN §6.3): mkfs.btrfs discards the whole LV first — 30 min.
+  await run(executor, MKFS_BTRFS, ['-L', name, '-d', 'single', '-m', 'dup', '--sectorsize', String(BTRFS_SECTOR_SIZE), lvPath], { timeoutMs: 1_800_000 })
 
   // --- Subvolume layout (§12): @data (mounted) + @snapshots (outside) ---------
   // Mount the top-level briefly at the mountpoint dir, carve the two

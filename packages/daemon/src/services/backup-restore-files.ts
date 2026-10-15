@@ -817,7 +817,12 @@ export async function runFileRestore(
 
   let r: { exitCode: number, stderr: string, signal?: string }
   try {
-    r = await executor.exec(PBC, args, { env: buildBackupEnv(deps.repo, deps.secret) })
+    // cr.34: a data mover (a whole file tree); no deadline.
+    r = await executor.exec(PBC, args, {
+      env: buildBackupEnv(deps.repo, deps.secret),
+      timeoutMs: null,
+      longRunning: 'proxmox-backup-client file restore: a data mover, hours for a large tree',
+    })
   }
   catch (err) {
     throw new Error(`proxmox-backup-client could not be started: ${err instanceof Error ? err.message : String(err)}`)

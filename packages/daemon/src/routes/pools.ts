@@ -1607,7 +1607,9 @@ export async function poolRoutes(
       'zpool.create',
       { ...identity, params: { pool: req.name, vdevs: req.dataVdevs.length } },
       async () => {
-        const result = await executor.exec('/usr/sbin/zpool', args)
+        // cr.34 (WAVE3-DESIGN §6.3): `zpool create` discards every device
+        // first (no -K) — minutes on large SSDs; 30 min, not the job's 300 s.
+        const result = await executor.exec('/usr/sbin/zpool', args, { timeoutMs: 1_800_000 })
         if (result.exitCode !== 0) {
           throw new Error(result.stderr.trim() || `zpool create exited with code ${result.exitCode}`)
         }

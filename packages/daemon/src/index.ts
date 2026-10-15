@@ -3,6 +3,7 @@ import type { JobQueue } from './jobs/queue.js'
 import type { DiskIdentityCache } from './services/disk-identity-cache.js'
 import type { IscsiPaths } from './services/iscsi.js'
 import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs'
+import { CommandTimeoutError, runInLane } from './executor/deadline.js'
 import { createServer } from './server.js'
 import { ahrBootScan } from './services/ahr-boot-scan.js'
 import { BACKUP_UNIT_KIND } from './services/backup-units.js'
@@ -39,6 +40,20 @@ async function main() {
   process.on('SIGTERM', shutdown)
   process.on('SIGINT', shutdown)
 
+  // cr.34: a command past its deadline REJECTS (CommandTimeoutError) where it
+  // used to hang. A fire-and-forget caller that never expected a rejection
+  // (`void clearCancelledRunFailedState(…)` in the cloud and backup cancel
+  // routes) must not turn a hung `systemctl` into a dead daemon: log it and
+  // carry on. Any other unhandled rejection keeps Node's default — it is
+  // rethrown and ends the process.
+  process.on('unhandledRejection', (reason) => {
+    if (reason instanceof CommandTimeoutError) {
+      server.log.warn(`unhandled command timeout: ${reason.message}`)
+      return
+    }
+    throw reason
+  })
+
   try {
     await server.listen({ path: SOCKET_PATH })
     // The socket IS the trust boundary (Principle 9): anasd trusts the X-Anas-*
@@ -62,103 +77,111 @@ async function main() {
     // flip it to 'halted' (operator must Resume — degraded/GT-8 cases); and
     // re-attach observation of kernel-owned reshapes. Non-blocking; failures are
     // logged, never fatal. Skipped in mock mode — there is no real md state.
+    // cr.34: the boot work runs in the background lane (300 s per command by
+    // default). No store would mean background too; saying it is the point.
     if (!MOCK) {
-      const decorated = server as unknown as { executor: CommandExecutor, jobQueue: JobQueue, diskIdentityCache: DiskIdentityCache, ahrIntentDir: string, iscsiPaths: IscsiPaths }
-      void ahrBootScan(decorated.executor, {
-        intentDir: decorated.ahrIntentDir,
-        jobQueue: decorated.jobQueue,
-        diskCache: decorated.diskIdentityCache,
-      }).then((report) => {
-        if (report.recovered.length || report.cacheRecovered.length || report.haltedIntents.length || report.reattached.length || report.observedReshapes.length)
-          server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] cacheRecovered=[${report.cacheRecovered.join(',')}] reattached=[${report.reattached.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)
-      }).catch((err) => {
-        server.log.warn(`ahr boot scan failed: ${err instanceof Error ? err.message : String(err)}`)
-      }).then(() => reconcileSelfhealState(decorated.executor, {
+      runInLane({ lane: 'background' }, () => {
+        const decorated = server as unknown as { executor: CommandExecutor, jobQueue: JobQueue, diskIdentityCache: DiskIdentityCache, ahrIntentDir: string, iscsiPaths: IscsiPaths }
+        void ahrBootScan(decorated.executor, {
+          intentDir: decorated.ahrIntentDir,
+          jobQueue: decorated.jobQueue,
+          diskCache: decorated.diskIdentityCache,
+        }).then((report) => {
+          if (report.recovered.length || report.cacheRecovered.length || report.haltedIntents.length || report.reattached.length || report.observedReshapes.length)
+            server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] cacheRecovered=[${report.cacheRecovered.join(',')}] reattached=[${report.reattached.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)
+        }).catch((err) => {
+          server.log.warn(`ahr boot scan failed: ${err instanceof Error ? err.message : String(err)}`)
+        }).then(() => reconcileSelfhealState(decorated.executor, {
         // The socket is already listening (it has to be — the boot scan above
         // takes minutes on a real node), so a Repair or a Rewrite parity can
         // be in flight by the time this runs. Its md knobs and its transient
         // snapshot are in USE; reconciling over them sweeps the pin and widens
         // the window under a live run (sixth pass, N9).
-        activeJob: pool => decorated.jobQueue.findActive(
-          ['ahr.repair', 'ahr.parity-rewrite', 'ahr.mirror-reconcile', 'ahr.scrub'],
-          pool,
-        ) ?? null,
-        // The mdcheck-ownership note (the preset ruling, F7) reads the node's
-        // unit directory — the same one the scrub toggle writes.
-        systemdDir: DEFAULT_SYSTEMD_DIR,
-      })).then((report) => {
-        if (reconcileWasQuiet(report))
-          return
-        for (const line of report.notes)
-          server.log.warn(`selfheal reconcile: ${line}`)
-        for (const line of report.restored)
-          server.log.warn(`selfheal reconcile: ${line}`)
-        for (const line of report.snapshots)
-          server.log.warn(`selfheal reconcile: swept transient snapshot ${line}`)
-        for (const line of report.skipped)
-          server.log.info(`selfheal reconcile: ${line}`)
-        for (const line of report.errors)
-          server.log.warn(`selfheal reconcile: ${line}`)
-      }).catch((err) => {
-        server.log.warn(`selfheal reconcile failed: ${err instanceof Error ? err.message : String(err)}`)
-      })
+          activeJob: pool => decorated.jobQueue.findActive(
+            ['ahr.repair', 'ahr.parity-rewrite', 'ahr.mirror-reconcile', 'ahr.scrub'],
+            pool,
+          ) ?? null,
+          // The mdcheck-ownership note (the preset ruling, F7) reads the node's
+          // unit directory — the same one the scrub toggle writes.
+          systemdDir: DEFAULT_SYSTEMD_DIR,
+        })).then((report) => {
+          if (reconcileWasQuiet(report))
+            return
+          for (const line of report.notes)
+            server.log.warn(`selfheal reconcile: ${line}`)
+          for (const line of report.restored)
+            server.log.warn(`selfheal reconcile: ${line}`)
+          for (const line of report.snapshots)
+            server.log.warn(`selfheal reconcile: swept transient snapshot ${line}`)
+          for (const line of report.skipped)
+            server.log.info(`selfheal reconcile: ${line}`)
+          for (const line of report.errors)
+            server.log.warn(`selfheal reconcile: ${line}`)
+        }).catch((err) => {
+          server.log.warn(`selfheal reconcile failed: ${err instanceof Error ? err.message : String(err)}`)
+        })
 
-      // iSCSI stub quarantine (story `iscsi.8`, live-proof F2): `targetctl
-      // restore` CREATES a missing fileio backing file at its recorded size
-      // whenever the mountpoint directory exists, so a filesystem that failed to
-      // mount — or is still mounting — leaves a LUN activated, the right size,
-      // the right serial, and full of zeros. It runs long before anasd and
-      // reports success. The first useful thing anasd can do about iSCSI is take
-      // that empty disk off the network; the saved record is left alone so
-      // Repair puts the LUN back once the filesystem is there. Non-blocking,
-      // fail-open, and skipped in mock mode (no real LIO tree).
-      void iscsiStubBootScan(decorated.executor, {
-        ...decorated.iscsiPaths,
-        log: (line: string) => server.log.warn(line),
-      }).then((outcomes) => {
-        if (outcomes.length > 0)
-          server.log.warn(`iscsi stub quarantine: ${outcomes.length} placeholder LUN(s) taken offline — repair them from the iSCSI menu once the filesystem is mounted`)
-      })
+        // iSCSI stub quarantine (story `iscsi.8`, live-proof F2): `targetctl
+        // restore` CREATES a missing fileio backing file at its recorded size
+        // whenever the mountpoint directory exists, so a filesystem that failed to
+        // mount — or is still mounting — leaves a LUN activated, the right size,
+        // the right serial, and full of zeros. It runs long before anasd and
+        // reports success. The first useful thing anasd can do about iSCSI is take
+        // that empty disk off the network; the saved record is left alone so
+        // Repair puts the LUN back once the filesystem is there. Non-blocking,
+        // fail-open, and skipped in mock mode (no real LIO tree).
+        void iscsiStubBootScan(decorated.executor, {
+          ...decorated.iscsiPaths,
+          log: (line: string) => server.log.warn(line),
+        }).then((outcomes) => {
+          if (outcomes.length > 0)
+            server.log.warn(`iscsi stub quarantine: ${outcomes.length} placeholder LUN(s) taken offline — repair them from the iSCSI menu once the filesystem is mounted`)
+        }).catch((err) => {
+        // cr.34: a hung targetcli now REJECTS at its deadline instead of
+        // hanging; that is a logged failure, never a dead daemon.
+          server.log.warn(`iscsi stub quarantine failed: ${err instanceof Error ? err.message : String(err)}`)
+        })
 
-      // Stale probe configs (story rclone.1): a daemon killed mid-probe leaves
-      // /run/anas/anas-rclone-probe-*/ holding a full copy of the rclone store
-      // (its 0700/0600 modes are right, but the copy should never outlive the
-      // probe). One sweep at start — exact prefix, any age; this process has
-      // no probe of its own in flight yet. Non-blocking, fail-open.
-      void sweepStaleProbeDirs().then((swept) => {
-        if (swept.length > 0)
-          server.log.warn(`rclone probe sweep: removed ${swept.length} stale probe config dir(s) from ${PROBE_TMP_BASE} (${swept.join(', ')})`)
-      }).catch((err) => {
-        server.log.warn(`rclone probe sweep failed: ${err instanceof Error ? err.message : String(err)}`)
-      })
+        // Stale probe configs (story rclone.1): a daemon killed mid-probe leaves
+        // /run/anas/anas-rclone-probe-*/ holding a full copy of the rclone store
+        // (its 0700/0600 modes are right, but the copy should never outlive the
+        // probe). One sweep at start — exact prefix, any age; this process has
+        // no probe of its own in flight yet. Non-blocking, fail-open.
+        void sweepStaleProbeDirs().then((swept) => {
+          if (swept.length > 0)
+            server.log.warn(`rclone probe sweep: removed ${swept.length} stale probe config dir(s) from ${PROBE_TMP_BASE} (${swept.join(', ')})`)
+        }).catch((err) => {
+          server.log.warn(`rclone probe sweep failed: ${err instanceof Error ? err.message : String(err)}`)
+        })
 
-      // Orphan timer stamps (SCHEDULES-GT-17/18, operator ruling 2026-09-25):
-      // a removed task/schedule used to leave systemd's Persistent stamp
-      // behind, and re-creating one under that name fired at once — the stamp
-      // read as a missed run. Every store's removal deletes its stamp now
-      // (backup/cloud since 63532c8, replication/snapshot since this fix);
-      // this sweep clears the orphans already on a node (GT-18 counted 30-odd)
-      // for ALL our unit-store prefixes. Exact prefixes from the stores' own
-      // constants, never literals; a stamp whose task still exists is the
-      // missed-run heal and stays, and a stamp written during this boot is
-      // skipped (possibly a create in flight). Non-blocking, fail-open.
-      void sweepOrphanTaskStamps([
-        BACKUP_UNIT_KIND,
-        CLOUD_UNIT_KIND,
-        { prefix: REPLICATION_UNIT_PREFIX },
-        { prefix: SNAPSHOT_UNIT_PREFIX },
-      ]).then((swept) => {
-        for (const file of swept)
-          server.log.info(`task stamp sweep: removed orphan stamp ${file} — its task no longer exists`)
-      }).catch((err) => {
-        server.log.warn(`task stamp sweep failed: ${err instanceof Error ? err.message : String(err)}`)
-      })
+        // Orphan timer stamps (SCHEDULES-GT-17/18, operator ruling 2026-09-25):
+        // a removed task/schedule used to leave systemd's Persistent stamp
+        // behind, and re-creating one under that name fired at once — the stamp
+        // read as a missed run. Every store's removal deletes its stamp now
+        // (backup/cloud since 63532c8, replication/snapshot since this fix);
+        // this sweep clears the orphans already on a node (GT-18 counted 30-odd)
+        // for ALL our unit-store prefixes. Exact prefixes from the stores' own
+        // constants, never literals; a stamp whose task still exists is the
+        // missed-run heal and stays, and a stamp written during this boot is
+        // skipped (possibly a create in flight). Non-blocking, fail-open.
+        void sweepOrphanTaskStamps([
+          BACKUP_UNIT_KIND,
+          CLOUD_UNIT_KIND,
+          { prefix: REPLICATION_UNIT_PREFIX },
+          { prefix: SNAPSHOT_UNIT_PREFIX },
+        ]).then((swept) => {
+          for (const file of swept)
+            server.log.info(`task stamp sweep: removed orphan stamp ${file} — its task no longer exists`)
+        }).catch((err) => {
+          server.log.warn(`task stamp sweep failed: ${err instanceof Error ? err.message : String(err)}`)
+        })
 
       // No periodic-scrub adoption here (review F1/F4, design reversal
       // 2026-09-13): mdcheck's timers are enabled by default on a stock node, so
       // their presence is not an opt-in. A node that has never enabled the ANAS
       // scrub keeps its OS parity check exactly as it is; the legacy state is
       // only REPORTED by GET /v1/scrub (mechanism 'mdcheck-timer' + note).
+      })
     }
   }
   catch (err) {

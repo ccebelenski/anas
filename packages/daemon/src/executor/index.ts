@@ -1,4 +1,6 @@
+export { abandonedChildren, CommandTimeoutError, currentLane, runInLane } from './deadline.js'
+export type { AbandonedChild, DeadlineOptions, Lane, LaneContext } from './deadline.js'
 export { MockExecutor } from './mock.js'
-export type { MockFixture, MockPipelineCall, MockPipelineFixture } from './mock.js'
+export type { MockDeadlineCall, MockFixture, MockPipelineCall, MockPipelineFixture } from './mock.js'
 export { ProdExecutor } from './prod.js'
 export type { CommandExecutor, ExecResult, PipelineResult } from './types.js'

@@ -416,7 +416,9 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           }
 
           updateProgress(`zfs send ${srcSnapFull} | zfs recv ${targetFull}`)
-          const pipe = await executor.pipeline(ZFS, sendArgs, recvCmd, recvArgv)
+          // cr.34: a data mover — hours for a large send; no deadline. A dead
+          // ssh peer is cr.35's (ServerAlive*/ConnectTimeout on the argv).
+          const pipe = await executor.pipeline(ZFS, sendArgs, recvCmd, recvArgv, { timeoutMs: null, longRunning: 'zfs send | zfs recv: a data mover, hours for a large send' })
           if (pipe.leftExitCode !== 0 || pipe.rightExitCode !== 0) {
             const detail = pipe.rightStderr.trim()
               ? `recv: ${pipe.rightStderr.trim()}`

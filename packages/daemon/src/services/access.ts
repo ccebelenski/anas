@@ -1,5 +1,5 @@
 import type { AccessEntry, AccessLevel, DatasetAccess, MountpointPermissions, SetAccessRequest, ShareAccessGrantResult } from '@anas/shared'
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, ExecOptions } from '../executor/types.js'
 import type { ParsedAcl } from '../parsers/getfacl.js'
 import type { IscsiPaths } from './iscsi.js'
 import { readFile } from 'node:fs/promises'
@@ -42,6 +42,16 @@ const CHOWN = '/usr/bin/chown'
 const CHMOD = '/usr/bin/chmod'
 const GETFACL = '/usr/bin/getfacl'
 const SETFACL = '/usr/bin/setfacl'
+
+/**
+ * cr.34: a RECURSIVE apply walks the whole tree — hours on a large dataset —
+ * so its commands run with no deadline (the job lane's 300 s would stop a
+ * legitimate walk half-way). The non-recursive forms keep the lane default.
+ */
+const TREE_WALK: ExecOptions = {
+  timeoutMs: null,
+  longRunning: 'recursive chown/setfacl/chmod/find over a whole tree: hours on a large dataset',
+}
 const FIND = '/usr/bin/find'
 const GETENT = '/usr/bin/getent'
 
@@ -833,7 +843,7 @@ export function createAccessService(opts: AccessServiceOptions) {
           : `:${req.group}`
       const args = recursive ? ['-R', spec, mountpoint] : [spec, mountpoint]
       updateProgress(`chown ${args.join(' ')}`)
-      const r = await executor.exec(CHOWN, args)
+      const r = await executor.exec(CHOWN, args, recursive ? TREE_WALK : undefined)
       if (r.exitCode !== 0)
         throw new Error(r.stderr.trim() || `chown exited with code ${r.exitCode}`)
     }
@@ -859,7 +869,7 @@ export function createAccessService(opts: AccessServiceOptions) {
       const spec = buildAclSpec(base, named, recursive)
       const setArgs = recursive ? ['-R', '-b', '-m', spec, mountpoint] : ['--set', spec, mountpoint]
       updateProgress(`setfacl ${setArgs.join(' ')}`)
-      const setR = await executor.exec(SETFACL, setArgs)
+      const setR = await executor.exec(SETFACL, setArgs, recursive ? TREE_WALK : undefined)
       if (setR.exitCode !== 0)
         throw new Error(setR.stderr.trim() || `setfacl ${recursive ? '-R -b -m' : '--set'} exited with code ${setR.exitCode}`)
 
@@ -871,7 +881,7 @@ export function createAccessService(opts: AccessServiceOptions) {
       const defSpec = buildAclSpec(base, named, false)
       const defArgs = recursive ? ['-R', '-d', '--set', defSpec, mountpoint] : ['-d', '--set', defSpec, mountpoint]
       updateProgress(`setfacl ${defArgs.join(' ')}`)
-      const defR = await executor.exec(SETFACL, defArgs)
+      const defR = await executor.exec(SETFACL, defArgs, recursive ? TREE_WALK : undefined)
       if (defR.exitCode !== 0)
         throw new Error(defR.stderr.trim() || `setfacl -d --set exited with code ${defR.exitCode}`)
 
@@ -887,7 +897,7 @@ export function createAccessService(opts: AccessServiceOptions) {
         : ['g+s', mountpoint]
       const gidBin = recursive ? FIND : CHMOD
       updateProgress(recursive ? `find ${gidArgs.join(' ')}` : `chmod ${gidArgs.join(' ')}`)
-      const gidR = await executor.exec(gidBin, gidArgs)
+      const gidR = await executor.exec(gidBin, gidArgs, recursive ? TREE_WALK : undefined)
       if (gidR.exitCode !== 0)
         throw new Error(gidR.stderr.trim() || `${recursive ? 'find -type d -exec chmod g+s' : 'chmod g+s'} exited with code ${gidR.exitCode}`)
 
@@ -905,7 +915,7 @@ export function createAccessService(opts: AccessServiceOptions) {
     if (clearAcls) {
       const clearArgs = recursive ? ['-R', '-b', '-k', mountpoint] : ['-b', '-k', mountpoint]
       updateProgress(`setfacl ${clearArgs.join(' ')}`)
-      const clearR = await executor.exec(SETFACL, clearArgs)
+      const clearR = await executor.exec(SETFACL, clearArgs, recursive ? TREE_WALK : undefined)
       if (clearR.exitCode !== 0)
         throw new Error(clearR.stderr.trim() || `setfacl -b -k exited with code ${clearR.exitCode}`)
       // Also drop the setgid bit we set for ACL inheritance — with the
@@ -919,7 +929,7 @@ export function createAccessService(opts: AccessServiceOptions) {
       if (!recursive || !baseChanged) {
         const gsArgs = recursive ? ['-R', 'g-s', mountpoint] : ['g-s', mountpoint]
         updateProgress(`chmod ${gsArgs.join(' ')}`)
-        const unsetR = await executor.exec(CHMOD, gsArgs)
+        const unsetR = await executor.exec(CHMOD, gsArgs, recursive ? TREE_WALK : undefined)
         if (unsetR.exitCode !== 0)
           throw new Error(unsetR.stderr.trim() || `chmod g-s exited with code ${unsetR.exitCode}`)
       }
@@ -941,7 +951,7 @@ export function createAccessService(opts: AccessServiceOptions) {
         : levelsToMode(base)
       const modeArgs = recursive ? ['-R', mode, mountpoint] : [mode, mountpoint]
       updateProgress(`chmod ${modeArgs.join(' ')}`)
-      const modeR = await executor.exec(CHMOD, modeArgs)
+      const modeR = await executor.exec(CHMOD, modeArgs, recursive ? TREE_WALK : undefined)
       if (modeR.exitCode !== 0)
         throw new Error(modeR.stderr.trim() || `chmod ${mode} exited with code ${modeR.exitCode}`)
     }

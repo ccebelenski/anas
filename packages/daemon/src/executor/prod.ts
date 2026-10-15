@@ -1,4 +1,5 @@
 import type { ChildProcess } from 'node:child_process'
+import type { AbandonedRegistry, Lane, ResolvedDeadline } from './deadline.js'
 import type {
   CommandExecutor,
   ExecOptions,
@@ -6,12 +7,22 @@ import type {
   ExecStreamOptions,
   ExecStreamResult,
   ExecStreamTarget,
+  PipelineOptions,
   PipelineResult,
   SpawnedChild,
 } from './types.js'
-import { execFile, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { close, fsync, open, readFileSync } from 'node:fs'
 import { StringDecoder } from 'node:string_decoder'
+import {
+  abandonedChildren,
+  commandLabel,
+  CommandTimeoutError,
+  KILL_GRACE_MS,
+  LANE_BUDGET_MS,
+  resolveDeadline,
+  TERM_GRACE_MS,
+} from './deadline.js'
 
 /** Promisified `open(2)` — the caller owns the fd, so the stream cannot close it. */
 function openFd(path: string, flags: string | number): Promise<number> {
@@ -27,16 +38,6 @@ const FDINFO_POS_RE = /^pos:\s*(\d+)$/m
 function closeFd(fd: number): void {
   close(fd, () => {})
 }
-
-/**
- * Production executor — runs real commands via execFile.
- *
- * execFile is used instead of exec to prevent shell interpretation
- * and command injection. Arguments are passed as an array.
- *
- * An `onStderr` caller takes a different road (`execTeeingStderr` below): one
- * that does not retain the child's stderr at all.
- */
 
 /**
  * Hand a freshly spawned child to an `onSpawn` caller (rclone.5). Only a child
@@ -82,7 +83,7 @@ const STDERR_TAIL_CHARS = 64 * 1024
 /**
  * Decodes stderr chunks multi-byte-safely, hands each decoded piece to a live
  * sink, and keeps only the last {@link STDERR_TAIL_CHARS} characters for the
- * result. Split out of `execTeeingStderr` so the two properties that matter —
+ * result. Split out of the teeing exec path so the two properties that matter —
  * a UTF-8 character split across pipe reads, and the bounded tail — are
  * testable on hand-picked chunk splits, which an OS pipe will not hand you on
  * demand.
@@ -122,164 +123,344 @@ export class StderrTee {
   }
 }
 
-export class ProdExecutor implements CommandExecutor {
-  exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
-    const { onStderr } = opts ?? {}
-    if (onStderr)
-      return this.execTeeingStderr(command, args, { ...opts, onStderr })
-    return this.execBuffered(command, args, opts)
+/** Options for the production executor. The timing knobs and seams exist for tests. */
+export interface ProdExecutorOptions {
+  /** Per-lane default budgets in ms (default {@link LANE_BUDGET_MS}). */
+  laneBudgetsMs?: Partial<Record<Lane, number>>
+  /** SIGTERM → SIGKILL grace (default {@link TERM_GRACE_MS}). */
+  termGraceMs?: number
+  /** SIGKILL → settle-anyway grace (default {@link KILL_GRACE_MS}). */
+  killGraceMs?: number
+  /** Where abandoned children are recorded (default: the daemon's one registry). */
+  registry?: AbandonedRegistry
+  /**
+   * Signal a process group. The seam a test replaces with a no-op to model a
+   * child no signal can stop (a process in uninterruptible sleep).
+   */
+  signalGroup?: (pgid: number, signal: NodeJS.Signals) => void
+}
+
+/** Send `signal` to the process group `pgid` leads; a group that is already gone is not an error. */
+export function signalProcessGroup(pgid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pgid, signal)
+  }
+  catch {
+    // ESRCH: nothing of the group is left to signal.
+  }
+}
+
+interface WatchConfig {
+  termGraceMs: number
+  killGraceMs: number
+  registry: AbandonedRegistry
+  signalGroup: (pgid: number, signal: NodeJS.Signals) => void
+}
+
+/**
+ * One call's deadline (cr.34, WAVE3-DESIGN §6.2 "On the deadline"). The
+ * children were spawned `detached`, so each leads its own process group:
+ *
+ *   1. at the deadline, SIGTERM to every child's GROUP (a grandchild holding
+ *      the pipe dies with its parent — P02 case D, not orphaned as in case C);
+ *   2. {@link WatchConfig.termGraceMs} later, SIGKILL to every group not yet
+ *      closed (a child that ignores TERM — P02 case B — cannot ignore this);
+ *   3. {@link WatchConfig.killGraceMs} after that, settle ANYWAY: a child in
+ *      uninterruptible sleep survives SIGKILL until its kernel call returns,
+ *      and the call must not wait for it. Such a child goes into the abandoned
+ *      registry until it exits.
+ *
+ * Whichever way it ends after the deadline fired — the children closed during
+ * a grace, or step 3 — the call REJECTS with {@link CommandTimeoutError}.
+ */
+class DeadlineWatch {
+  /** The deadline fired: whatever happens next, the call is a timeout. */
+  expired = false
+  private done = false
+  private readonly timers: NodeJS.Timeout[] = []
+  private readonly members: { child: ChildProcess, command: string, args: string[], exited: boolean, closed: boolean }[]
+
+  /**
+   * @param children each child with its own argv (a pipeline's consumer is
+   *   recorded as itself if it is the one left stuck); the call's error is
+   *   named after the FIRST (the command, or a pipeline's producer).
+   */
+  constructor(
+    children: { child: ChildProcess, command: string, args: string[] }[],
+    private readonly deadline: ResolvedDeadline,
+    private readonly cfg: WatchConfig,
+    private readonly onTimeout: (err: CommandTimeoutError) => void,
+  ) {
+    this.members = children.map(({ child, command, args }) => {
+      const m = { child, command, args, exited: false, closed: false }
+      child.once('exit', () => {
+        m.exited = true
+      })
+      child.once('close', () => {
+        m.closed = true
+      })
+      return m
+    })
+    if (deadline.budgetMs !== null)
+      this.timers.push(setTimeout(() => this.expire(), deadline.budgetMs))
   }
 
-  /** The plain execFile path — stdout AND stderr fully buffered, as always. */
-  private execBuffered(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
-    return new Promise((resolve, reject) => {
-      const child = execFile(
-        command,
-        args,
-        {
-          maxBuffer: opts?.maxBuffer ?? DEFAULT_MAX_BUFFER,
-          // Merge secret env (e.g. pbc's PBS_PASSWORD, Epic 16) over the
-          // daemon's own environment for the child only — never on argv.
-          ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),
-        },
-        (err, stdout, stderr) => {
-          // System errors (ENOENT, EACCES) — command couldn't start
-          if (err && typeof err.code === 'string') {
-            reject(err)
-            return
-          }
+  /** The call settled before the deadline (or failed to start): stop watching. */
+  cancel(): void {
+    this.done = true
+    for (const t of this.timers)
+      clearTimeout(t)
+  }
 
-          // Process exited (possibly non-zero) — that's a valid result. For an
-          // async execFile error the numeric exit code lives on `err.code`
-          // (NOT `err.status`, which is a spawnSync-only field); preserving it
-          // is load-bearing for callers that classify by the exact code — e.g.
-          // `timeout` exit 124 → mount 'unreachable' (Epic 18). A signal kill
-          // (err.code === null) has no exit code, so fall back to 1 — but the
-          // signal NAME is on the error, and it is the only record of what
-          // actually happened, so carry it through (live-proof F16).
-          const errCode = err ? (err as { code?: unknown }).code : undefined
-          const exitCode = err ? (typeof errCode === 'number' ? errCode : 1) : 0
-          const errSignal = err ? (err as { signal?: unknown }).signal : undefined
-          const signal = typeof errSignal === 'string' && errSignal ? errSignal : undefined
-
-          resolve({
-            stdout: stdout ?? '',
-            stderr: stderr ?? '',
-            exitCode,
-            ...(signal ? { signal } : {}),
-          })
-        },
-      )
-
-      announceSpawn(child, opts?.onSpawn)
-
-      // Feed stdin for secrets (e.g. smbpasswd -s reads the password here, so
-      // it never lands in argv / the process list), then close the stream.
-      if (opts?.stdin !== undefined && child.stdin) {
-        child.stdin.on('error', () => {
-          // Ignore EPIPE if the child exits before consuming stdin — the
-          // execFile callback above already reports the real outcome.
-        })
-        child.stdin.end(opts.stdin)
-      }
-    })
+  /** Every child closed after the deadline fired: nothing left to wait for, settle now. */
+  settleNow(): void {
+    this.final()
   }
 
   /**
-   * The exec path for a caller that consumes stderr live (rclone's JSON stats,
-   * rclone.2 slice 2). execFile CANNOT serve it: it buffers both streams
-   * internally up to `maxBuffer` with no per-stream opt-out, so a multi-day
-   * run's stats log would be retained in full no matter what the tee did —
-   * and at the old flat 10 MiB the run would DIE near its end, mid-copy, with
-   * a maxBuffer error (the failure this path exists to remove).
-   *
-   * So this path spawns directly and applies the caps where they belong:
-   *   - stdout is buffered, up to `maxBuffer` (default 10 MiB) — overflowing
-   *     kills the child, the same contract execFile has. rclone's stdout is
-   *     empty; a cloud run passes a generous cap for the general case.
-   *   - stderr is TEEED to `onStderr` as it arrives and NOT retained: the
-   *     result carries the last {@link STDERR_TAIL_CHARS} characters only
-   *     (see the arithmetic there). Chunks are decoded with a StringDecoder
-   *     so a multi-byte character split across pipe reads — a filename in an
-   *     error line — is never turned into replacement characters.
-   *
-   * Everything else keeps execFile's observable contract: spawn failures
-   * reject (ENOENT/EACCES), a non-zero exit resolves (never throws), exit
-   * codes pass through exactly, a signal death reports `exitCode: 1` plus the
-   * signal name, stdin is fed and EPIPE on it is ignored.
+   * Signal each group that may still have members. A group whose leader
+   * exited is still signalled while its stdio is open — a grandchild holding
+   * the pipe is exactly what step 1 is for.
    */
-  private execTeeingStderr(command: string, args: string[], opts: ExecOptions & { onStderr: (chunk: string) => void }): Promise<ExecResult> {
+  private signal(signal: NodeJS.Signals): void {
+    for (const m of this.members) {
+      if (m.closed || m.child.pid === undefined)
+        continue
+      this.cfg.signalGroup(m.child.pid, signal)
+    }
+  }
+
+  private expire(): void {
+    if (this.done)
+      return
+    this.expired = true
+    this.signal('SIGTERM')
+    this.timers.push(setTimeout(() => {
+      if (this.done)
+        return
+      this.signal('SIGKILL')
+      this.timers.push(setTimeout(() => this.final(), this.cfg.killGraceMs))
+    }, this.cfg.termGraceMs))
+  }
+
+  private final(): void {
+    if (this.done)
+      return
+    this.cancel()
+    const budgetMs = this.deadline.budgetMs ?? 0
+    const stuck = this.members.filter(m => !m.exited && m.child.pid !== undefined)
+    const since = new Date().toISOString()
+    for (const m of stuck) {
+      const pid = m.child.pid as number
+      this.cfg.registry.add({
+        pid,
+        label: commandLabel(m.command, m.args),
+        command: m.command,
+        args: [...m.args],
+        lane: this.deadline.lane,
+        ...(this.deadline.jobId !== undefined ? { jobId: this.deadline.jobId } : {}),
+        budgetMs,
+        since,
+      })
+      // `exited` was false just now and events are not concurrent with this
+      // callback, so this listener sees the exit whenever it comes.
+      m.child.once('exit', () => this.cfg.registry.remove(pid))
+    }
+    // Let go of the pipes: an unkillable child (or a grandchild that escaped
+    // the group) must not keep this call, or the daemon's buffers, alive.
+    for (const m of this.members) {
+      m.child.stdin?.destroy()
+      m.child.stdout?.destroy()
+      m.child.stderr?.destroy()
+    }
+    const first = this.members[0]
+    this.onTimeout(new CommandTimeoutError(
+      first.command,
+      [...first.args],
+      this.deadline.lane,
+      budgetMs,
+      stuck.length > 0,
+      this.deadline.jobId,
+    ))
+  }
+}
+
+/**
+ * Production executor (cr.34): ONE spawn-based implementation behind every
+ * door — `exec` (buffered and teeing), `pipeline` and `execToStream`.
+ *
+ * Arguments are always an argv array handed to `spawn` (never a shell), so
+ * nothing is re-parsed. Every child is spawned `detached`: it leads its own
+ * process group, which is what lets a deadline stop a child together with
+ * whatever it started (P02 case D). Detaching changes signalling, not
+ * lifetime: anasd.service keeps systemd's default `KillMode=control-group`,
+ * so the groups still stop with the daemon (WAVE3-DESIGN F7).
+ *
+ * `execFile` is no longer used: it cannot take `detached` as a documented
+ * option, and its own `timeout` signals one pid once and then waits — the
+ * case-B hang this story exists to remove.
+ */
+export class ProdExecutor implements CommandExecutor {
+  private readonly budgets: Record<Lane, number>
+  private readonly cfg: WatchConfig
+
+  constructor(opts: ProdExecutorOptions = {}) {
+    this.budgets = { ...LANE_BUDGET_MS, ...opts.laneBudgetsMs }
+    this.cfg = {
+      termGraceMs: opts.termGraceMs ?? TERM_GRACE_MS,
+      killGraceMs: opts.killGraceMs ?? KILL_GRACE_MS,
+      registry: opts.registry ?? abandonedChildren,
+      signalGroup: opts.signalGroup ?? signalProcessGroup,
+    }
+  }
+
+  /**
+   * Run a command and collect its output.
+   *
+   * Without `onStderr` both streams are buffered, each up to `maxBuffer`
+   * (default 10 MiB) — `execFile`'s contract, kept exactly: stdin is an open
+   * pipe (written and closed only when `stdin` is given), over the cap the
+   * child gets SIGTERM and the call rejects.
+   *
+   * With `onStderr` (rclone's JSON stats, rclone.2 slice 2) stderr is TEED to
+   * the callback as it arrives and NOT retained: the result carries the last
+   * {@link STDERR_TAIL_CHARS} characters only, decoded multi-byte-safely, so a
+   * multi-day run's stats log never accumulates in the daemon (execFile could
+   * not do this: it buffers both streams up to `maxBuffer` with no opt-out).
+   * stdin is `ignore` unless given; over the stdout cap the child gets SIGKILL.
+   *
+   * Both: spawn failures reject (ENOENT/EACCES), a non-zero exit resolves
+   * (never throws), exit codes pass through exactly (`timeout`'s 124 is
+   * load-bearing for the mount probe), a signal death reports `exitCode: 1`
+   * plus the signal name (live-proof F16), EPIPE on stdin is ignored, and the
+   * deadline rejects with {@link CommandTimeoutError}.
+   */
+  exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve, reject) => {
+      const deadline = resolveDeadline(command, args, opts, this.budgets)
+      const tee = opts?.onStderr ? new StderrTee(opts.onStderr) : null
       const child = spawn(command, args, {
-        stdio: [opts.stdin !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+        detached: true,
+        stdio: [tee && opts?.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
         // Merge secret env (e.g. pbc's PBS_PASSWORD, Epic 16) over the
         // daemon's own environment for the child only — never on argv.
-        ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
+        ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),
       })
 
-      announceSpawn(child, opts.onSpawn)
+      let settled = false
+      // Declared before `fail` uses it; assigned at once below.
+      let watch: DeadlineWatch | undefined
+      const fail = (err: Error): void => {
+        if (settled)
+          return
+        settled = true
+        watch?.cancel()
+        reject(err)
+      }
+      watch = new DeadlineWatch([{ child, command, args }], deadline, this.cfg, fail)
 
-      const tee = new StderrTee(opts.onStderr)
+      const maxBuffer = opts?.maxBuffer ?? DEFAULT_MAX_BUFFER
+      const overflow = (stream: 'stdout' | 'stderr'): void => {
+        if (tee) {
+          // The teeing path's cap is on stdout alone; the run's output is
+          // unrepresentable, so the child dies at once.
+          child.kill('SIGKILL')
+          fail(new Error(`stdout exceeded maxBuffer (${maxBuffer} bytes)`))
+          return
+        }
+        // execFile's contract: over the cap, SIGTERM and an error carrying
+        // its code (a string code, so callers file it with the spawn failures).
+        child.kill('SIGTERM')
+        fail(Object.assign(new RangeError(`${stream} maxBuffer length exceeded`), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }))
+      }
 
       const stdoutChunks: Buffer[] = []
       let stdoutBytes = 0
-      const maxBuffer = opts.maxBuffer ?? DEFAULT_MAX_BUFFER
       child.stdout?.on('data', (d: Buffer) => {
+        if (settled)
+          return
         stdoutBytes += d.length
         if (stdoutBytes > maxBuffer) {
-          // execFile's contract: over the cap, the child dies. The error has
-          // no exit code worth reporting — the run's output is unrepresentable.
-          child.kill('SIGKILL')
-          reject(new Error(`stdout exceeded maxBuffer (${maxBuffer} bytes)`))
+          overflow('stdout')
           return
         }
         stdoutChunks.push(d)
       })
 
-      child.stderr?.on('data', (d: Buffer) => tee.write(d))
+      const stderrChunks: Buffer[] = []
+      let stderrBytes = 0
+      child.stderr?.on('data', (d: Buffer) => {
+        if (settled)
+          return
+        if (tee) {
+          tee.write(d)
+          return
+        }
+        stderrBytes += d.length
+        if (stderrBytes > maxBuffer) {
+          overflow('stderr')
+          return
+        }
+        stderrChunks.push(d)
+      })
 
       if (child.stdin) {
         child.stdin.on('error', () => {
           // Ignore EPIPE if the child exits before consuming stdin — the
-          // close handler below already reports the real outcome.
+          // close handler below reports the real outcome.
         })
-        child.stdin.end(opts.stdin)
+        // Feed stdin for secrets (e.g. smbpasswd -s reads the password here,
+        // so it never lands in argv / the process list), then close it.
+        if (opts?.stdin !== undefined)
+          child.stdin.end(opts.stdin)
       }
 
-      child.on('error', (err) => {
-        // Spawn failures only (ENOENT, EACCES) — the process never started.
-        reject(err)
-      })
+      // Spawn failures only (ENOENT, EACCES) — the process never started.
+      child.on('error', fail)
 
       child.on('close', (code, signal) => {
-        // `finish` flushes the decoder: the tail bytes of a multi-byte
-        // character split across the last two reads are only now decodable.
+        if (watch.expired) {
+          watch.settleNow()
+          return
+        }
+        if (settled)
+          return
+        settled = true
+        watch.cancel()
         resolve({
           stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-          stderr: tee.finish(),
+          // `finish` flushes the decoder: the tail bytes of a multi-byte
+          // character split across the last two reads are only now decodable.
+          stderr: tee ? tee.finish() : Buffer.concat(stderrChunks).toString('utf8'),
           exitCode: code === null ? 1 : code,
           ...(signal ? { signal } : {}),
         })
       })
+
+      announceSpawn(child, opts?.onSpawn)
     })
   }
 
   /**
-   * Run `cmd1 args1 | cmd2 args2` as two real processes joined by an OS pipe —
-   * NO shell (spawn, argv arrays), so nothing is re-parsed. cmd1.stdout →
-   * cmd2.stdin; both stderrs and cmd2.stdout are buffered. Resolves with both
-   * exit codes; the caller decides success (both zero).
+   * Run `cmd1 args1 | cmd2 args2` as two real processes — NO shell (spawn,
+   * argv arrays), so nothing is re-parsed. cmd1.stdout → cmd2.stdin; both
+   * stderrs and cmd2.stdout are buffered. Resolves with both exit codes; the
+   * caller decides success (both zero).
    *
    * Early-exit safety: if the consumer (recv) dies before the producer (send)
    * finishes, the producer would otherwise block forever writing into a dead
    * pipe. We unpipe and SIGTERM it so no orphaned `zfs send` lingers. Symmetric
    * cleanup runs if a process fails to spawn (the other is killed before we
    * reject).
+   *
+   * The deadline covers the pair: both groups are signalled, and the call
+   * rejects with {@link CommandTimeoutError} named after the producer.
    */
-  pipeline(cmd1: string, args1: string[], cmd2: string, args2: string[]): Promise<PipelineResult> {
+  pipeline(cmd1: string, args1: string[], cmd2: string, args2: string[], opts?: PipelineOptions): Promise<PipelineResult> {
     return new Promise((resolve, reject) => {
-      const left = spawn(cmd1, args1, { stdio: ['ignore', 'pipe', 'pipe'] })
-      const right = spawn(cmd2, args2, { stdio: ['pipe', 'pipe', 'pipe'] })
+      const deadline = resolveDeadline(cmd1, args1, opts, this.budgets)
+      const left = spawn(cmd1, args1, { detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
+      const right = spawn(cmd2, args2, { detached: true, stdio: ['pipe', 'pipe', 'pipe'] })
 
       let leftStderr = ''
       let rightStderr = ''
@@ -289,6 +470,13 @@ export class ProdExecutor implements CommandExecutor {
       let leftClosed = false
       let rightClosed = false
       let settled = false
+
+      const watch = new DeadlineWatch([{ child: left, command: cmd1, args: args1 }, { child: right, command: cmd2, args: args2 }], deadline, this.cfg, (err) => {
+        if (settled)
+          return
+        settled = true
+        reject(err)
+      })
 
       left.stderr.on('data', (d) => {
         leftStderr += d
@@ -314,7 +502,12 @@ export class ProdExecutor implements CommandExecutor {
       const maybeResolve = (): void => {
         if (settled || !leftClosed || !rightClosed)
           return
+        if (watch.expired) {
+          watch.settleNow()
+          return
+        }
         settled = true
+        watch.cancel()
         resolve({
           leftExitCode: leftExit ?? 1,
           rightExitCode: rightExit ?? 1,
@@ -330,6 +523,7 @@ export class ProdExecutor implements CommandExecutor {
         if (settled)
           return
         settled = true
+        watch.cancel()
         left.kill('SIGTERM')
         right.kill('SIGTERM')
         reject(err)
@@ -385,6 +579,10 @@ export class ProdExecutor implements CommandExecutor {
    *    was partially written" verdict is built on. The child writes through the
    *    SAME open file description, so the offset it advanced is ours to read
    *    back from `/proc/self/fdinfo/<fd>`.
+   *
+   * `onSpawn` is honoured (cr.34): an image restore can be signalled like any
+   * other run. A deadline rejects with {@link CommandTimeoutError} (the
+   * descriptor is closed, nothing is fsynced or counted).
    */
   async execToStream(
     command: string,
@@ -392,14 +590,18 @@ export class ProdExecutor implements CommandExecutor {
     target: ExecStreamTarget,
     opts?: ExecStreamOptions,
   ): Promise<ExecStreamResult> {
+    // Resolved before anything is opened: a bad deadline option is a
+    // programming error and must not leave a descriptor behind.
+    const deadline = resolveDeadline(command, args, opts, this.budgets)
     // The fd is opened HERE and stays ours: an fsync has to happen on a
     // still-open descriptor, and the byte count is read off it after the child
     // exits.
     const fd = await openFd(target.path, target.flags)
     return new Promise((resolve, reject) => {
-      let child
+      let child: ChildProcess
       try {
         child = spawn(command, args, {
+          detached: true,
           // fd 1 is the descriptor itself — see the note above.
           stdio: ['ignore', fd, 'pipe'],
           ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),
@@ -420,10 +622,23 @@ export class ProdExecutor implements CommandExecutor {
       let stderr = ''
       let settled = false
 
-      const settle = (exitCode: number, signal?: string): void => {
+      const watch = new DeadlineWatch([{ child, command, args }], deadline, this.cfg, (err) => {
         if (settled)
           return
         settled = true
+        closeFd(fd)
+        reject(err)
+      })
+
+      const settle = (exitCode: number, signal?: string): void => {
+        if (settled)
+          return
+        if (watch.expired) {
+          watch.settleNow()
+          return
+        }
+        settled = true
+        watch.cancel()
         const bytesWritten = fdPosition(fd)
         // FSYNC on a descriptor that is still ours: the child has exited, so
         // every byte it wrote is in the page cache and nowhere else yet.
@@ -447,6 +662,7 @@ export class ProdExecutor implements CommandExecutor {
         if (settled)
           return
         settled = true
+        watch.cancel()
         closeFd(fd)
         reject(err)
       })
@@ -458,6 +674,8 @@ export class ProdExecutor implements CommandExecutor {
         // must say "killed by SIGKILL", not quote a progress line as its reason.
         settle(code === null ? 1 : code, signal ?? undefined)
       })
+
+      announceSpawn(child, opts?.onSpawn)
     })
   }
 }

@@ -25,7 +25,9 @@ import { PoolState, VdevRole, VdevState, VdevType } from './zfs.js'
  */
 export const DashboardWarning = z.object({
   level: z.enum(['warning', 'critical']),
-  category: z.enum(['pool', 'disk', 'scrub', 'share', 'capacity', 'replication', 'mount', 'backup', 'ahr', 'schedule', 'iscsi', 'cloud']),
+  // `command` (cr.34): a command anasd gave up on is still stuck in the
+  // kernel (GET /v1/health lists it) — no view fixes it, so no deep link.
+  category: z.enum(['pool', 'disk', 'scrub', 'share', 'capacity', 'replication', 'mount', 'backup', 'ahr', 'schedule', 'iscsi', 'cloud', 'command']),
   message: z.string(),
   /** Optional target name (pool/disk/share) the UI can deep-link to. */
   ref: z.string().optional(),

@@ -1,3 +1,5 @@
+import type { DeadlineOptions } from './deadline.js'
+
 /** Result of a command execution. */
 export interface ExecResult {
   stdout: string
@@ -84,7 +86,7 @@ export interface ExecStreamResult {
  * caller would have hit the hard way — compiled, shipped, silently ignored.
  * Omitting it makes that caller a compile error (D6).
  */
-export type ExecStreamOptions = Omit<ExecOptions, 'stdin'>
+export type ExecStreamOptions = Omit<ExecBaseOptions, 'stdin'> & DeadlineOptions
 
 /**
  * A running child, as {@link ExecOptions.onSpawn} hands it over (rclone.5).
@@ -107,8 +109,19 @@ export interface SpawnedChild {
   readonly exit: Promise<void>
 }
 
-/** Optional execution options. */
-export interface ExecOptions {
+/**
+ * Optional execution options: the base set plus the deadline (cr.34). See
+ * {@link DeadlineOptions}: a per-call `timeoutMs` overrides the lane default
+ * (request 10 s, job and background 300 s); `timeoutMs: null` means no
+ * deadline and requires a `longRunning` reason.
+ */
+export type ExecOptions = ExecBaseOptions & DeadlineOptions
+
+/** Options for {@link CommandExecutor.pipeline}: the deadline only (it covers both processes). */
+export type PipelineOptions = DeadlineOptions
+
+/** Every exec option except the deadline. */
+export interface ExecBaseOptions {
   /**
    * Text written to the process's stdin, then closed. Use this for secrets
    * (e.g. `smbpasswd -s` reads the password from stdin) so they never appear
@@ -157,6 +170,11 @@ export interface ExecOptions {
    * process never started (ENOENT/EACCES): there is nothing to signal. The
    * result contract is unchanged — a child stopped by a signal still resolves
    * with its exit code, or `exitCode: 1` plus `signal` when it died of one.
+   * Honoured by `exec` (both paths) and `execToStream` (cr.34 — before that,
+   * an image restore could not be cancelled).
+   *
+   * The handle signals the child's PID only (the cancel ladder's contract); the
+   * executor's own deadline signals the child's whole process group.
    */
   onSpawn?: (child: SpawnedChild) => void
 }
@@ -165,7 +183,9 @@ export interface ExecOptions {
  * Command executor interface.
  *
  * All system command execution goes through this abstraction.
- * Prod uses execFile, Mock returns fixture data for development/testing.
+ * Prod spawns real processes (argv arrays, never a shell; every child leads
+ * its own process group so a deadline can stop all of it); Mock returns
+ * fixture data for development/testing.
  */
 export interface CommandExecutor {
   /**
@@ -174,7 +194,9 @@ export interface CommandExecutor {
    * @param args - Arguments as an array (never interpolated into a string)
    * @param opts - Optional execution options (e.g. stdin for secrets)
    * @returns The command result (stdout, stderr, exitCode)
-   * @throws If the command cannot be started (not found, permission denied)
+   * @throws If the command cannot be started (not found, permission denied),
+   *   and {@link CommandTimeoutError} when it did not finish within its
+   *   deadline — a timeout is never reported as an exit code (cr.34).
    */
   exec: (command: string, args: string[], opts?: ExecOptions) => Promise<ExecResult>
 
@@ -185,15 +207,16 @@ export interface CommandExecutor {
    * argv is never re-parsed. cmd1's stdout is piped to cmd2's stdin; both
    * stderrs and cmd2's stdout are captured. The Promise resolves with BOTH exit
    * codes (the pipeline is a success only when both are zero); it rejects only
-   * if a process fails to start (ENOENT/EACCES). This is the primitive behind
-   * `zfs send | zfs recv` (Epic 5.5).
+   * if a process fails to start (ENOENT/EACCES), or with CommandTimeoutError
+   * when the pair outlives its deadline (`opts`, else the lane default). This
+   * is the primitive behind `zfs send | zfs recv` (Epic 5.5).
    *
    * @param cmd1 - Absolute path to the producer (e.g. '/usr/sbin/zfs' for send)
    * @param args1 - Producer arguments as an array
    * @param cmd2 - Absolute path to the consumer (e.g. '/usr/sbin/zfs' for recv)
    * @param args2 - Consumer arguments as an array
    */
-  pipeline: (cmd1: string, args1: string[], cmd2: string, args2: string[]) => Promise<PipelineResult>
+  pipeline: (cmd1: string, args1: string[], cmd2: string, args2: string[], opts?: PipelineOptions) => Promise<PipelineResult>
 
   /**
    * Execute a command with its STDOUT streamed straight into a file or device
@@ -211,7 +234,8 @@ export interface CommandExecutor {
    *
    * Resolves with the exit code, the buffered stderr, and the byte count the
    * stream actually wrote (the evidence for a partial write); rejects only if
-   * the process fails to start or the target cannot be opened.
+   * the process fails to start, the target cannot be opened, or the deadline
+   * passes (CommandTimeoutError).
    */
   execToStream: (
     command: string,

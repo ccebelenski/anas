@@ -607,7 +607,11 @@
             // Cloud sync (rclone.3): failing/overdue offsite copies — the same
             // glyph the Cloud Sync menu carries, so a card and its menu find
             // each other at a glance.
-            cloud: 'fa-cloud'
+            cloud: 'fa-cloud',
+            // cr.34: a command anasd gave up on is still stuck in the kernel
+            // (a suspended pool, a hung disk or mount) — the terminal glyph,
+            // since it is a process, not a pool or a disk.
+            command: 'fa-terminal'
         };
         var fa = map['' + (category || '')];
         if (!fa) { return ''; }

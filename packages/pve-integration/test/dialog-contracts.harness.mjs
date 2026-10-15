@@ -12781,6 +12781,8 @@ function dashboardCloudIconChecks() {
   const ANAS = loadSources(['50-dashboard.js'], {})
   ok('dashboard: the cloud warning category carries the cloud glyph',
     /fa-cloud/.test(ANAS.dash.warnIcon('cloud')), ANAS.dash.warnIcon('cloud'))
+  ok('dashboard: the command warning category (cr.34) carries the terminal glyph',
+    /fa-terminal/.test(ANAS.dash.warnIcon('command')), ANAS.dash.warnIcon('command'))
   ok('dashboard: an unknown category still renders no icon', ANAS.dash.warnIcon('nope') === '')
 }
 

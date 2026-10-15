@@ -383,6 +383,9 @@ export {
   FsEntryType,
 } from './schemas/fs.js'
 
+// Daemon health (cr.34: the commands it gave up on)
+export { AbandonedCommand, HealthResponse } from './schemas/health.js'
+
 // Identity schemas (share users & groups — Epic 8)
 export {
   CreateGroupRequest,

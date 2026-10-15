@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Fastify from 'fastify'
 import { AuditLogger } from './audit/logger.js'
+import { CommandTimeoutError, runInLane } from './executor/deadline.js'
 import { MockExecutor } from './executor/mock.js'
 import { ProdExecutor } from './executor/prod.js'
 import { mockFixtures } from './fixtures/loader.js'
@@ -87,6 +88,14 @@ export function createServer(opts?: ServerOptions) {
   // the ANAS error envelope naming the type (§8 row 14).
   server.removeContentTypeParser('text/plain')
 
+  // cr.34 (WAVE3-DESIGN §6.2 "Lanes"): a command a request runs gets the
+  // request lane's budget (10 s). Entered first thing in onRequest, in the
+  // callback form so the rest of the lifecycle runs inside the store. Fastify
+  // carries the store across body parsing (a body arriving on later socket
+  // events still reaches the handler in this lane — executor-lanes.test.ts
+  // proves it over a real socket), so no second entry point is needed.
+  server.addHook('onRequest', (_request, _reply, done) => runInLane({ lane: 'request' }, done))
+
   server.addHook('onRequest', async (request, reply) => {
     if (!MUTATING_METHODS.has(request.method))
       return
@@ -117,6 +126,25 @@ export function createServer(opts?: ServerOptions) {
         },
       })
     }
+  })
+
+  // cr.34 (WAVE3-DESIGN §6.2 "Reject, not resolve"): a command past its
+  // deadline rejects with CommandTimeoutError. A route that does not catch it
+  // answers 503 TIMEOUT naming the command and the budget — never the bare
+  // 500 an unknown error gets, and never the "no pools" an exit code would
+  // have read as. Every other error goes on to Fastify's default handler,
+  // exactly as before there was a handler here.
+  server.setErrorHandler((error, request, reply) => {
+    if (!(error instanceof CommandTimeoutError))
+      throw error
+    request.log.warn(`command timeout on ${request.method} ${request.url}: ${error.message}`)
+    return reply.code(503).send({
+      error: {
+        code: 'TIMEOUT',
+        message: `${error.message}. The request was not completed.`,
+        details: { command: error.label, budgetMs: error.budgetMs, abandoned: error.abandoned },
+      },
+    })
   })
 
   const audit = new AuditLogger(server.log)

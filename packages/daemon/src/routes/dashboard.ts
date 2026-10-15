@@ -19,6 +19,7 @@ import type {
   VdevType,
 } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
+import type { AbandonedChild } from '../executor/deadline.js'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
@@ -27,6 +28,7 @@ import { readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { basename } from 'node:path'
 import { GROUPING_VDEV_TYPES } from '@anas/shared'
+import { abandonedChildren, formatBudget } from '../executor/deadline.js'
 import { computeArcTelemetry, parseArcstats } from '../parsers/arcstats.js'
 import { leafDiskId, parseDiskByIdListing } from '../parsers/disk-by-id.js'
 import { parseExports } from '../parsers/exports.js'
@@ -176,7 +178,7 @@ export async function dashboardRoutes(
       // A create that failed and rolled itself back leaves NO pool behind, so
       // it can only be surfaced from the job side (issue #11) — without this the
       // failure would be discoverable nowhere in the UI.
-      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings, ...mountWarnings, ...backupWarnings, ...cloudWarnings, ...ahrWarnings, ...buildAhrCapacityWarnings(ahrPools), ...buildFailedCreateWarnings(ahrPools.map(p => p.name), jobQueue), ...scheduleWarnings, ...iscsiWarnings],
+      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings, ...mountWarnings, ...backupWarnings, ...cloudWarnings, ...ahrWarnings, ...buildAhrCapacityWarnings(ahrPools), ...buildFailedCreateWarnings(ahrPools.map(p => p.name), jobQueue), ...scheduleWarnings, ...iscsiWarnings, ...buildAbandonedWarnings(abandonedChildren.list())],
       ahrPools,
     }
     return { data: summary }
@@ -622,6 +624,26 @@ function emptyTelemetry(sampledAt: string): Telemetry {
     ahrPools: [],
     net: { interfaces: [], totalRxBytesPerSec: 0, totalTxBytesPerSec: 0 },
   }
+}
+
+/**
+ * cr.34: one warning per command anasd gave up on — it outlived its deadline
+ * and the SIGKILL after it, so it is stuck in the kernel (WAVE3-DESIGN §6.2,
+ * §8.1 "an abandoned child": "the dashboard shows 'a command did not end'").
+ * Nothing in ANAS can end it; the card says what usually causes it and what
+ * clears it. GET /v1/health lists the same entries with their argv.
+ */
+export function buildAbandonedWarnings(children: AbandonedChild[]): DashboardWarning[] {
+  return children.map((c) => {
+    const where = c.jobId !== undefined ? `job ${c.jobId}` : `a ${c.lane === 'request' ? 'request' : 'background task'}`
+    return {
+      level: 'warning',
+      category: 'command',
+      message: `'${c.label}' (pid ${c.pid}, from ${where}) did not end within ${formatBudget(c.budgetMs)} and survived SIGKILL: `
+        + `it has been stuck in the kernel since ${c.since}. A suspended pool or a hung disk or mount is the usual cause. `
+        + 'The warning clears when the command returns or anasd restarts.',
+    }
+  })
 }
 
 /** Derive dashboard warnings from pool state/scan and disk health (2.5). */

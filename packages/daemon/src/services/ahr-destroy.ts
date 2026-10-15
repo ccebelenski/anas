@@ -7,7 +7,7 @@ import { parseFstab, removeMount } from '../parsers/fstab.js'
 import { lvIsCacheTarget, LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { isMdPvName, matchCachePartitionLabel, UNKNOWN_PV_NAME } from './ahr-cache-state.js'
 import { uncacheAhrLv } from './ahr-cache.js'
-import { LVM_MIXED_BLOCK_ARGS, run } from './ahr-exec.js'
+import { LVM_MIXED_BLOCK_ARGS, run, UPDATE_INITRAMFS_BUDGET_MS } from './ahr-exec.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
 import { classifyPartition, readAhrPoolIdentity, requireOwnedVgPvs, resolveMdadmConfPath } from './ahr-identity.js'
 import { clearIntent } from './ahr-intent.js'
@@ -535,7 +535,7 @@ export async function destroyAhrPool(
     updateProgress('Unpinning arrays from mdadm.conf')
     await unpinArrays(uuids, mdadmConfPath)
     updateProgress('Updating initramfs (mdadm.conf changed)')
-    await run(executor, UPDATE_INITRAMFS, ['-u'])
+    await run(executor, UPDATE_INITRAMFS, ['-u'], { timeoutMs: UPDATE_INITRAMFS_BUDGET_MS })
   }
 
   // --- The expansion intent goes with the pool (story ident.3) ---------------

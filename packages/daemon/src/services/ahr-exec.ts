@@ -31,7 +31,18 @@ export interface RunOptions {
    * the primary error is never masked. Only pass this for umount-style calls.
    */
   busyPath?: string
+  /**
+   * cr.34: this command's deadline in ms, when it can legitimately outlive
+   * its lane's default (`mkfs.btrfs` discards the whole LV first).
+   */
+  timeoutMs?: number
 }
+
+/**
+ * cr.34 (WAVE3-DESIGN §6.3): `update-initramfs -u` rebuilds every installed
+ * kernel's image — tens of seconds each, more on a slow boot disk; 10 min.
+ */
+export const UPDATE_INITRAMFS_BUDGET_MS = 600_000
 
 /**
  * Shared AHR exec helper: run a command, throw its stderr on non-zero exit.
@@ -47,7 +58,7 @@ export async function run(
   args: string[],
   opts?: RunOptions,
 ): Promise<ExecResult> {
-  const r = await executor.exec(command, args)
+  const r = await executor.exec(command, args, opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : undefined)
   if (r.exitCode !== 0) {
     const base = r.stderr.trim() || `${command} ${args[0] ?? ''} exited ${r.exitCode}`
     throw new Error(opts?.busyPath ? await enrichBusyError(executor, base, opts.busyPath) : base)

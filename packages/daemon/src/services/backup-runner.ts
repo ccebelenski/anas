@@ -696,7 +696,13 @@ export async function runBackup(
   // and then execvp's), so the pid `onSpawn` hands over IS pbc's — the cancel
   // hook's SIGINT reaches the client, not a wrapper (rclone.5).
   const exec = async (args: string[]): Promise<{ exitCode: number, stderr: string }> =>
-    executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], { env, ...(deps.onSpawn ? { onSpawn: deps.onSpawn } : {}) })
+    executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], {
+      env,
+      ...(deps.onSpawn ? { onSpawn: deps.onSpawn } : {}),
+      // cr.34: a data mover; it ends on its own or through its cancel hook.
+      timeoutMs: null,
+      longRunning: 'proxmox-backup-client backup: a data mover, hours for a large source; stopped by its cancel hook',
+    })
 
   if (!snapshotMode) {
     // The last boundary before anything runs (rclone.5 review).

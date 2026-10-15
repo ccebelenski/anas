@@ -68,7 +68,11 @@ export const ErrorCode = z.enum([
    * carries a fresh code.
    */
   'CONFIRM_SCOPE_CHANGED',
-  /** 503 — cr.32/cr.34 (WAVE3-DESIGN §6): a read a gate needed did not answer within its deadline. */
+  /**
+   * cr.34 (daemon, WAVE3-DESIGN §6.2): a command did not finish within its
+   * deadline — 503 on the request path (the sentence names the command and
+   * the budget), and the code of a job that died of it.
+   */
   'TIMEOUT',
 ])
 export type ErrorCode = z.infer<typeof ErrorCode>

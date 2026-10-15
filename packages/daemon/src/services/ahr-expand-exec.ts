@@ -13,7 +13,7 @@ import { parseFindmnt } from '../parsers/findmnt.js'
 import { LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
-import { LVM_MIXED_BLOCK_ARGS } from './ahr-exec.js'
+import { LVM_MIXED_BLOCK_ARGS, UPDATE_INITRAMFS_BUDGET_MS } from './ahr-exec.js'
 import { ahrDataOffsetArg, ahrDataOffsetBytes, planDiskPartitions } from './ahr-geometry.js'
 import { examineMember, readAhrPoolIdentity } from './ahr-identity.js'
 import { clearIntent, defaultAhrIntentDir, writeIntent } from './ahr-intent.js'
@@ -971,7 +971,7 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
         const insideName = inside.name ? matchAhrArrayName(inside.name) : null
         if (inside.uuid !== null && insideName?.pool === pool.name && insideName.band === band) {
           await pinArrays([{ name, uuid: inside.uuid }])
-          const r = await executor.exec(UPDATE_INITRAMFS, ['-u'])
+          const r = await executor.exec(UPDATE_INITRAMFS, ['-u'], { timeoutMs: UPDATE_INITRAMFS_BUDGET_MS })
           if (r.exitCode !== 0)
             ctx.log(`ahr.expand pool=${pool.name} warn=update-initramfs-failed detail=${r.stderr.trim()}`)
           ctx.log(`ahr.expand pool=${pool.name} step=array-create target=${step.target} pin=recovered uuid=${inside.uuid}`)
@@ -1008,7 +1008,7 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
         if (!uuid)
           throw new Error(`could not read the md UUID of the new array ${name} — refusing to continue without its identity`)
         await pinArrays([{ name, uuid }])
-        const r = await executor.exec(UPDATE_INITRAMFS, ['-u'])
+        const r = await executor.exec(UPDATE_INITRAMFS, ['-u'], { timeoutMs: UPDATE_INITRAMFS_BUDGET_MS })
         if (r.exitCode !== 0)
           ctx.log(`ahr.expand pool=${pool.name} warn=update-initramfs-failed detail=${r.stderr.trim()}`)
         resolved = (await resolveAhrArrays(executor, pool.name)).get(band)
