@@ -241,6 +241,19 @@ Verbatim stdout, one line each, no value edited. These are the two reads
 | `blkid-p-blank-partition.txt` | the same on `-part4` after `zpool labelclear -f`, exit **0** | A blank partition: exit 0 with ONLY `PART_ENTRY_*` keys (`wipefs -n` prints nothing). The gate's "blank" case; the replace of `-part2` by this `-part4` then completed. `-part2`, replaced away, read the same shape (exit 0, `PART_ENTRY_*` only): ZFS cleared the old log leaf's label on the replace |
 | `lsblk-partition-probe.json` | `lsblk -J -o NAME,TYPE,PKNAME,MOUNTPOINT /dev/disk/by-id/…ANAS_HOT9-part2`, exit 0 | `PARTITION_PROBE_ARGS` byte for byte on a free partition: `type: "part"`, `pkname` the disk's kernel name, `mountpoint: null`, no `children` |
 
+## Real capture — a replication base's hold (nf.3 D11, wave-3b node pass, 2026-10-15)
+
+`zfs-holds-replication-base.txt` is lines 20–21 of `docs/probes/wave3b-node/out/r5b.log`, verbatim: the
+`zfs holds` of the source snapshot after one local replication of `w3r5s/src` to `w3r5d/rep` (task `w3r5rep`,
+docs/LIVE-PROOF-0.4.4-wave3b.md row 5b). The tag `anas-repl-684abe8ac24d` is exactly
+`replicationHoldTag(local, 'w3r5d/rep')` — the per-chain tag the daemon derives. Caveats: it is the HEADER
+form (no `-H`), the command line itself is not in the committed probe script (the script's own `zfs holds
+-r w3r5s/src` names a filesystem and printed `'w3r5s/src' is not a snapshot` plus the header), and the exit
+code was not recorded. The daemon runs `zfs holds -H -- <snap…>`; `zfs-hold(8)` documents `-H` as "Do not
+print headers, use tab-delimited output", so `routes/__tests__/datasets-guard.test.ts` serves this row with
+the header dropped and the columns tab-joined (the shape `replication-holds.ts parseHolds` has read live
+since ident.4). Capture `zfs holds -H` itself, with its exit code, at the next node pass.
+
 ## Pre-existing fixtures — synthetic
 
 Everything here that is NOT in the zoo table above and not one of the two iscsi.3

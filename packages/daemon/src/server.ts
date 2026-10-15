@@ -756,7 +756,7 @@ export function createServer(opts?: ServerOptions) {
   const accessService = createAccessService({ executor, iscsiPaths, pveStorageCfg: mountsStoragePath })
   // datasetRoutes also reads the share configs to report associated shares
   // (Epic 4.4) and warn on destroy — same paths the share routes edit.
-  server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport, iscsiPaths, accessService })
+  server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport, iscsiPaths, accessService, systemdDir })
   server.register(smbShareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, fstabPath, systemdDir, accessService })
   server.register(nfsExportRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, exportsPath, accessService })
   server.register(shareIdentityRoutes, {

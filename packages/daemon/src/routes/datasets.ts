@@ -24,6 +24,7 @@ import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal
 import { readIscsiState, withIscsiLock } from '../services/iscsi-mutate.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
 import { loadPveFootprint, pveDescendantsUnlistedMessage, pveNamingGuardMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
+import { describeHolds, readLocalHoldsChecked } from '../services/replication-holds.js'
 import { createZfsSnapshot, destroyZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 import { createReplicationHandlers } from './replication.js'
@@ -355,6 +356,13 @@ export async function datasetRoutes(
      * when a caller (a test) registers the routes on their own.
      */
     accessService?: AccessService
+    /**
+     * The `anas-repl-*` task units (ANAS_SYSTEMD_DIR / `/etc/systemd/system`):
+     * a forced rollback refused over a replication hold names the task that
+     * holds the snapshot (nf.3 D11), and the replication handlers read them
+     * for the legacy hold migration. Defaults to the units' own default.
+     */
+    systemdDir?: string
   },
 ) {
   const { executor, jobQueue, confirmStore, transport } = opts
@@ -376,6 +384,7 @@ export async function datasetRoutes(
     // "is this dataset PVE's?" — the target guard asks it per request.
     pveFootprint: () => loadPveFootprint(executor),
     transport,
+    ...(opts.systemdDir ? { systemdDir: opts.systemdDir } : {}),
   })
 
   /** Does the named pool exist? (source of truth is `zpool list`). */
@@ -877,10 +886,48 @@ export async function datasetRoutes(
   }
 
   /**
+   * The forced rollback's HOLD gate (nf.3 D11). `zfs rollback -r` destroys the
+   * newer snapshots one at a time, newest first, and a snapshot with a user
+   * hold cannot be destroyed (`zfs-hold(8)`: "attempts to destroy that snapshot
+   * by using the zfs destroy command return EBUSY") — so the rollback destroys
+   * every unheld snapshot newer than the held one, then fails "dataset is busy"
+   * and is not done (wave-3b row 5b: `@s1r` lost, the replication base kept,
+   * no rollback). A forced rollback whose sweep includes a held snapshot is
+   * therefore refused before anything runs, naming each held snapshot and who
+   * holds it (a replication's `anas-repl-*` base above all: destroying it
+   * would also break that task's next incremental).
+   *
+   * Read with `zfs holds -H` on the swept snapshots, not `zfs get userrefs`:
+   * userrefs is only a count, and the refusal names the TAG (which task) —
+   * the same read the replication's own hold settle step parses. Fail closed:
+   * holds that cannot be read refuse, since destroying snapshots on a guess
+   * is exactly the case this gate exists for. Bookmarks carry no holds.
+   */
+  const rollbackHoldGate: Gate<SnapshotObject> = async (o, reads) => {
+    const swept = o.snapshots.slice(0, o.snapshots.findIndex(s => s.name === o.snapName)).map(s => s.name)
+    if (swept.length === 0)
+      return null
+    const holds = await reads.once(`holds:${swept.join('\0')}`, () => readLocalHoldsChecked(executor, swept))
+    if (!holds) {
+      return conflict(`Could not read the holds on the snapshots a forced rollback of '${o.dataset}' to '${o.snap}' destroys — `
+        + 'refusing: a held one would stop the rollback only after the newer unheld ones were destroyed', 'snapshot-holds-unreadable')
+    }
+    const held = swept.filter(name => (holds.get(name) ?? []).length > 0)
+    if (held.length === 0)
+      return null
+    const named: string[] = []
+    for (const name of held)
+      named.push(`${name} ${(await describeHolds(holds.get(name)!, opts.systemdDir)).join(', ')}`)
+    return conflict(`A forced rollback of '${o.dataset}' to '${o.snap}' is refused: it would destroy held snapshots, `
+      + `and ZFS stops at a held snapshot only after destroying the newer unheld ones — nothing was done. ${named.join('; ')}.`, 'snapshot-held')
+  }
+
+  /**
    * The ROLLBACK spec: bound to the target snapshot's createtxg and the newest
    * snapshot's (ident.1: a snapshot taken after the challenge makes it another
    * rollback). With `force` the scope is what `-r` destroys, snapshots AND
-   * bookmarks by name, so a bookmark made after the challenge is a change too.
+   * bookmarks by name, so a bookmark made after the challenge is a change too,
+   * and the hold gate (nf.3 D11) refuses a sweep over a held snapshot.
    */
   function rollbackGuardSpec(fullName: string, snap: string, force: boolean): GuardSpec<SnapshotObject> {
     return {
@@ -900,7 +947,7 @@ export async function datasetRoutes(
           ? `Could not read the snapshots and bookmarks of '${fullName}' — refusing a forced rollback that cannot be bound to what it destroys`
           : `Could not read the snapshots of '${fullName}' — refusing a rollback that cannot be bound to them`,
       }),
-      gates: [ownedGate<SnapshotObject>(o => o.dataset), rollbackLunGate],
+      gates: [ownedGate<SnapshotObject>(o => o.dataset), rollbackLunGate, ...(force ? [rollbackHoldGate] : [])],
       // cr.37 review (P1): the same LIO-unreadable disclosure destroy gives —
       // the rollback gate reads LIO exactly as fail-open, so it warns the same.
       advisories: (_o, reads) => lioUnreadableDisclosure(reads),

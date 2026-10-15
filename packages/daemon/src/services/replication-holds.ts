@@ -83,6 +83,55 @@ export async function readLocalHolds(executor: CommandExecutor, snapFulls: strin
   return parseHolds(r.stdout)
 }
 
+/**
+ * The holds on a set of LOCAL snapshots, FAIL-CLOSED (nf.3 D11): null when
+ * `zfs holds` did not answer — a non-zero exit (one of the snapshots went, the
+ * pool is suspended) or an exec that threw. {@link readLocalHolds} reads an
+ * unanswered call as "no holds", which is safe for its callers (they only
+ * RELEASE what they saw) and wrong for a gate that DESTROYS what it did not
+ * see held. `zfs-hold(8)`: `zfs holds -H` prints one tab-delimited
+ * `<snapshot>\t<tag>\t<timestamp>` row per hold and no header.
+ */
+export async function readLocalHoldsChecked(executor: CommandExecutor, snapFulls: string[]): Promise<Map<string, string[]> | null> {
+  if (snapFulls.length === 0)
+    return new Map()
+  try {
+    const r = await executor.exec('/usr/sbin/zfs', ['holds', '-H', '--', ...snapFulls])
+    return r.exitCode === 0 ? parseHolds(r.stdout) : null
+  }
+  catch {
+    return null
+  }
+}
+
+/**
+ * Who holds a snapshot, as a refusal names it (nf.3 D11): `held by
+ * replication task 'nightly': anas-repl-…` for a per-chain tag a task derives,
+ * `held by a replication no task names (an interactive replicate, or a removed
+ * task): anas-repl-…` for one none does, `held by replication (the shared tag
+ * from before per-chain tags): anas-repl` for the legacy tag, and `held by
+ * '<tag>'` for anyone else's. The task list is read best-effort — it only
+ * names the holder; the hold refuses whether or not a task is found.
+ */
+export async function describeHolds(tags: string[], systemdDir: string = DEFAULT_SYSTEMD_DIR): Promise<string[]> {
+  const byTag = new Map<string, string>()
+  if (tags.some(t => t.startsWith(REPLICATION_HOLD_TAG_PREFIX))) {
+    const { tasks } = await readAllTasksChecked(systemdDir).catch(() => ({ tasks: [] }))
+    for (const task of tasks)
+      byTag.set(replicationHoldTag(task.target.location, resolveTaskDatasets(task).targetFull), task.name)
+  }
+  return tags.map((tag) => {
+    if (tag === LEGACY_REPLICATION_HOLD_TAG)
+      return `held by replication (the shared tag from before per-chain tags): ${tag}`
+    if (!tag.startsWith(REPLICATION_HOLD_TAG_PREFIX))
+      return `held by '${tag}'`
+    const task = byTag.get(tag)
+    return task
+      ? `held by replication task '${task}': ${tag}`
+      : `held by a replication no task names (an interactive replicate, or a removed task): ${tag}`
+  })
+}
+
 /** One side of a replication, for the hold settle step. */
 export interface HoldSide {
   /** The dataset the snapshots belong to. */

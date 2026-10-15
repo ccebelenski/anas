@@ -7,9 +7,11 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import {
+  describeHolds,
   LEGACY_REPLICATION_HOLD_TAG,
   legacyReleasableOnSource,
   parseHolds,
+  readLocalHoldsChecked,
   replicationHoldTag,
   settleReplicationHolds,
 } from '../replication-holds.js'
@@ -317,5 +319,57 @@ describe('legacyReleasableOnSource', () => {
     const migrated = new MockExecutor()
     holdsFixture(migrated, [`${SRC}@s1`, `${SRC}@s2`], { [`${SRC}@s1`]: [LEGACY_REPLICATION_HOLD_TAG, TAG_B] })
     assert.deepEqual(await legacyReleasableOnSource(migrated, { sourceFull: SRC, ownTag: TAG_A, sourceSnapshotNames: ['s1', 's2'], systemdDir: dir }), { releasable: true })
+  })
+})
+
+describe('nf.3 D11 — readLocalHoldsChecked and describeHolds (the forced-rollback hold gate)', () => {
+  let dir: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-repl-holds-'))
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('readLocalHoldsChecked: the holds when zfs answers; null — never "no holds" — when it exits non-zero or cannot run', async () => {
+    const answered = new MockExecutor()
+    holdsFixture(answered, [`${SRC}@s1`, `${SRC}@s2`], { [`${SRC}@s2`]: [TAG_A] })
+    assert.deepEqual(await readLocalHoldsChecked(answered, [`${SRC}@s1`, `${SRC}@s2`]), new Map([[`${SRC}@s2`, [TAG_A]]]))
+
+    const failed = new MockExecutor()
+    failed.addFixture({ command: ZFS, args: ['holds', '-H', '--', `${SRC}@s1`], result: { stdout: '', stderr: `cannot open '${SRC}@s1': dataset does not exist`, exitCode: 1 } })
+    assert.equal(await readLocalHoldsChecked(failed, [`${SRC}@s1`]), null)
+
+    const missing = new MockExecutor() // no fixture: the mock answers 127, as for a tool that is not there
+    assert.equal(await readLocalHoldsChecked(missing, [`${SRC}@s1`]), null)
+
+    const thrown = new MockExecutor()
+    thrown.addFixture({ command: ZFS, args: ['holds', '-H', '--', `${SRC}@s1`], throws: new Error('spawn EAGAIN') })
+    assert.equal(await readLocalHoldsChecked(thrown, [`${SRC}@s1`]), null)
+
+    assert.deepEqual(await readLocalHoldsChecked(new MockExecutor(), []), new Map(), 'nothing to read, nothing run')
+  })
+
+  it('describeHolds names a task\'s chain by the task, an unclaimed chain, the legacy tag and anyone else\'s tag', async () => {
+    const t: ReplicationTask = {
+      name: 'nightly',
+      source: { pool: 'tank', dataset: 'media' },
+      target: { pool: 'backup', dataset: 'media-a' },
+      schedule: 'daily',
+      snapshotFirst: true,
+      enabled: true,
+      notify: 'on-failure',
+    }
+    await writeFile(join(dir, 'anas-repl-nightly.service'), renderServiceUnit(t), 'utf-8')
+    assert.deepEqual(await describeHolds([TAG_A, TAG_B, LEGACY_REPLICATION_HOLD_TAG, 'keep'], dir), [
+      `held by replication task 'nightly': ${TAG_A}`,
+      `held by a replication no task names (an interactive replicate, or a removed task): ${TAG_B}`,
+      'held by replication (the shared tag from before per-chain tags): anas-repl',
+      'held by \'keep\'',
+    ])
+    // An unreadable task store only loses the task's name, never the hold.
+    assert.deepEqual(await describeHolds([TAG_A], join(dir, 'missing')), [
+      `held by a replication no task names (an interactive replicate, or a removed task): ${TAG_A}`,
+    ])
   })
 })

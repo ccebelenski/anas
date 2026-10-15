@@ -600,6 +600,116 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     assert.deepEqual(calls.filter(isMutation), [])
   })
 
+  // -------------------------------------------------------------------------
+  // nf.3 D10 (node pass wave 3b, row 3 `newholder`): the confirm binds the
+  // holders it showed — a holder that opens a file between the challenge and
+  // the resend is named, never detached unseen
+  // -------------------------------------------------------------------------
+
+  const HOLDERS_SENTENCE = (was: string, now: string): string =>
+    `the holders a forced unmount detaches changed since you confirmed (was: ${was}; now: ${now}) — confirm again`
+
+  it('nf.3 D10: unmount, disable and remove — a holder that appears between the challenge and the resend is 409 CONFIRM_SCOPE_CHANGED naming it, and nothing runs', async () => {
+    for (const req of [state(CIFS_MP, 'unmount'), state(CIFS_MP, 'disable'), remove(CIFS_MP)]) {
+      await serve()
+      lsof = LSOF_ONE_HOLDER
+      const first = await send(req)
+      assert.equal(first.statusCode, 409, `${req.method} ${req.url}: ${first.body}`)
+      assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+      assert.deepEqual(first.json().error.warnings.filter((w: string) => w.startsWith('sleep')), ['sleep (pid 5960)'])
+      lsof = LSOF_TWO_HOLDERS // the record's w3r3-c: a second process opens the mount before the resend
+      const res = await send(req, first.headers['x-anas-confirm-code'] as string)
+      assert.equal(res.statusCode, 409, `${req.method} ${req.url}: ${res.body}`)
+      const error = res.json().error
+      assert.equal(error.code, 'CONFIRM_SCOPE_CHANGED')
+      assert.deepEqual(error.changed, ['holders'])
+      assert.equal(error.message, HOLDERS_SENTENCE('sleep (pid 5960)', 'sleep (pid 5960), sleep (pid 5961)'))
+      assert.deepEqual(error.warnings.filter((w: string) => w.startsWith('sleep')), ['sleep (pid 5960)', 'sleep (pid 5961)'], 'the fresh challenge lists the new holder')
+      assert.ok(res.headers['x-anas-confirm-code'], 'a fresh code for the holders there now')
+      assert.deepEqual(calls.filter(isMutation), [], `${req.method} ${req.url}: nothing ran`)
+      assert.equal(queue().list().filter(j => j.operation.startsWith('mount.')).length, 0, 'no job was submitted')
+      // The fresh code, resent with the same two holders, is accepted.
+      const again = await send(req, res.headers['x-anas-confirm-code'] as string)
+      assert.equal(again.statusCode, 202, again.body)
+      const job = await finished((again.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.ok(calls.some(c => c.command === UMOUNT && c.args[0] === '-l' && c.args[1] === CIFS_MP))
+      await server!.close()
+      server = undefined
+    }
+  })
+
+  it('nf.3 D10: without lsof (the record\'s node) a holder fuser finds at the resend that the challenge did not show is CONFIRM_SCOPE_CHANGED — no umount', async () => {
+    await serve()
+    await seedFuserHolders()
+    lsofFails = 'missing'
+    fuser = FUSER_ONE_HOLDER
+    const first = await send(state(NFS_MP, 'unmount'))
+    assert.equal(first.statusCode, 409, first.body)
+    fuser = FUSER_TWO_HOLDERS
+    const res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.equal(res.json().error.message, HOLDERS_SENTENCE('sleep (pid 483284)', 'sleep (pid 483284), sleep (pid 483285)'))
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  it('nf.3 D10: a resend that can list holders where the challenge could not (and the reverse) is a scope change', async () => {
+    await serve()
+    await seedFuserHolders()
+    lsofFails = 'missing'
+    fuserMissing = true
+    let first = await send(state(NFS_MP, 'unmount'))
+    assert.equal(first.statusCode, 409, first.body)
+    fuserMissing = false
+    fuser = FUSER_ONE_HOLDER
+    let res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.equal(res.json().error.message, HOLDERS_SENTENCE('unknown', 'sleep (pid 483284)'))
+
+    first = res
+    fuserMissing = true
+    res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.equal(res.json().error.message, HOLDERS_SENTENCE('sleep (pid 483284)', 'unknown'))
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  it('nf.3 D10: a holder appearing where the challenge showed none (a confirm for a reference only) is CONFIRM_SCOPE_CHANGED — never a forced unmount nobody was shown', async () => {
+    await serve()
+    await writeFile(paths.smb, SMB_MEDIA_ON_NFS) // the confirm is for the share riding the path
+    const first = await send(state(NFS_MP, 'unmount'))
+    assert.equal(first.statusCode, 409, first.body)
+    assert.equal(first.json().error.warnings.some((w: string) => w.includes('lose access')), false, 'no holders at the challenge')
+    lsof = LSOF_ONE_HOLDER
+    const res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.equal(res.json().error.message, HOLDERS_SENTENCE('none', 'sleep (pid 5960)'))
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  it('nf.3 D10: the bound name is lsof\'s nine characters — a holder lsof listed at the challenge and fuser at the resend is the same holder', async () => {
+    await serve()
+    // The lsof capture's holder renamed to what lsof prints for a 15-character
+    // comm (its COMMAND column is 9 wide); fuser's name is `/proc/<pid>/comm`.
+    lsof = LSOF_ONE_HOLDER.replace('sleep   5960', 'systemd-j 5960')
+    await mkdir(join(dir, 'proc', '5960'), { recursive: true })
+    await writeFile(join(dir, 'proc', '5960', 'comm'), 'systemd-journal\n')
+    const first = await send(state(NFS_MP, 'unmount'))
+    assert.equal(first.statusCode, 409, first.body)
+    assert.ok(first.json().error.warnings.includes('systemd-j (pid 5960)'), first.body)
+    lsofFails = 'missing'
+    fuser = rewrite(FUSER_ONE_HOLDER, '483284', '5960') // the fuser capture, the same pid
+    const res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(calls.filter(isMutation), [{ command: UMOUNT, args: ['-l', NFS_MP] }])
+  })
+
   it('remove ALWAYS confirms — an idle, unreferenced mount too — and the challenge names what it deletes', async () => {
     await serve()
     const res = await send(remove(NFS_MP, '?removeMountpointDir=true'))

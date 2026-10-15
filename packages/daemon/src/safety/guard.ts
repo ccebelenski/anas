@@ -379,6 +379,16 @@ export interface GuardConfirmOpts {
    * one-line reason. A test lists every route's entries.
    */
   presentationOnly?: Record<string, string>
+  /**
+   * A scope ONLY the confirm binds (nf.3 D10), beside the spec's own scope:
+   * a fact the operator was shown that the job compares its own way, so the
+   * job door's exact scope re-read ({@link reverify}) must not see it. The
+   * busy unmount's holders are the case — the confirm binds the set it named
+   * (a different set at the resend is 409 CONFIRM_SCOPE_CHANGED), while in the
+   * job a holder that has gone is no reason to stop and only a NEW one refuses.
+   * Its keys read through the spec's `scopeLabels` like any scope key.
+   */
+  confirmScope?: Record<string, string>
   message: string
   warnings: string[]
 }
@@ -479,14 +489,17 @@ export function guardConfirm<O>(
   opts: GuardConfirmOpts,
 ): boolean {
   const params = signedRequest(opts.validated, opts.presentationOnly)
-  const bound = boundSignature(pass.bound)
+  const signed: GuardPass<O> = opts.confirmScope
+    ? { ...pass, bound: { ...pass.bound, scope: { ...pass.bound.scope, ...opts.confirmScope } } }
+    : pass
+  const bound = boundSignature(signed.bound)
   const provided = request.headers['x-anas-confirm']
   if (typeof provided === 'string') {
     if (store.verifyCode(provided, spec.operation, params, bound))
       return true
     const mismatch = store.explainMismatch(provided, spec.operation, params, bound, { sameKeys: opts.address })
     if (mismatch)
-      return challenge(store, reply, spec.operation, params, bound, mismatchError(spec, pass, params, mismatch, opts))
+      return challenge(store, reply, spec.operation, params, bound, mismatchError(spec, signed, params, mismatch, opts))
   }
   return challenge(store, reply, spec.operation, params, bound, {
     code: 'CONFIRMATION_REQUIRED',

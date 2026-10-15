@@ -4,7 +4,7 @@ import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -12,6 +12,8 @@ import { fileURLToPath } from 'node:url'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { zfsListArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
+import { replicationHoldTag } from '../../services/replication-holds.js'
+import { renderServiceUnit } from '../../services/replication-units.js'
 import { DATASET_DESTROY_PRESENTATION_ONLY, SNAPSHOT_ROLLBACK_PRESENTATION_ONLY } from '../datasets.js'
 
 /**
@@ -45,6 +47,11 @@ import { DATASET_DESTROY_PRESENTATION_ONLY, SNAPSHOT_ROLLBACK_PRESENTATION_ONLY 
  *    captured pool); the one line served is TYPED in the `zfs list -Hp -o
  *    name,createtxg` shape the dev mock already serves for snapshots
  *    (server.ts), and says so here.
+ *  - holds (nf.3 D11): `zfs/zfs-holds-replication-base.txt`, the wave-3b
+ *    capture of the replication base's hold (header form; zfs/NOTES.md), served
+ *    in the `-H` shape (header dropped, columns tab-joined — zfs-hold(8)) with
+ *    the snapshot re-pointed from `w3r5s/src@snapshot-…` to the swept
+ *    `testpool/media@snap2`; the tag is the capture's.
  */
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -83,6 +90,20 @@ const ZFS_LIST_CHILD_UNDER_MEDIA = rewrite(ZFS_LIST, '"testpool/vm-100-disk-0"',
 /** TYPED (see the header): one bookmark of testpool/media made after snap2 (createtxg 240). */
 const BOOKMARK_AFTER_SNAP2 = 'testpool/media#after-snap2\t300\n'
 
+/** The wave-3b capture of a replication base's hold (zfs/NOTES.md): one row under a header. */
+const HOLDS_CAPTURE = fixture('zfs/zfs-holds-replication-base.txt')
+/** The capture's tag: the per-chain tag of a local replication into `w3r5d/rep` (task `w3r5rep`). */
+const CAPTURED_TAG = 'anas-repl-684abe8ac24d'
+/** `zfs holds -H -- testpool/media@snap2` once the capture's hold sits on snap2. */
+const HOLDS_ON_SNAP2 = (() => {
+  const [header, ...rows] = HOLDS_CAPTURE.trimEnd().split('\n')
+  assert.match(header, /^NAME +TAG +TIMESTAMP$/)
+  assert.equal(rows.length, 1)
+  const cols = rows[0].split(/ {2,}/)
+  assert.equal(cols[1], CAPTURED_TAG)
+  return `${rewrite(cols[0], 'w3r5s/src@snapshot-2026-10-15T16-58-26-312Z', 'testpool/media@snap2')}\t${cols[1]}\t${cols[2]}\n`
+})()
+
 /** The dev mock's `zpool get guid` answer for testpool (server.ts). */
 const TESTPOOL_GUID = '5823146802312415237'
 
@@ -114,6 +135,8 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
   let zfsList = ZFS_LIST
   let bookmarks = ''
   let gtiscsiList = ZFS_LIST_VOL1_2G
+  /** What `zfs holds -H -- <snap…>` answers (nf.3 D11): no hold, a hold, an error exit, or an exec that throws. */
+  let holds: ExecResult | 'throws' = ok('')
   /** A `zfs <verb>` that does not return until the test releases it. */
   const paused = new Map<string, Promise<void>>()
 
@@ -122,6 +145,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
     block: process.env.ANAS_ISCSI_SYS_BLOCK,
     saveconfig: process.env.ANAS_ISCSI_SAVECONFIG,
     storage: process.env.ANAS_STORAGE_CFG,
+    systemd: process.env.ANAS_SYSTEMD_DIR,
   }
 
   beforeEach(async () => {
@@ -139,6 +163,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
       ['ANAS_ISCSI_SYS_BLOCK', savedEnv.block],
       ['ANAS_ISCSI_SAVECONFIG', savedEnv.saveconfig],
       ['ANAS_STORAGE_CFG', savedEnv.storage],
+      ['ANAS_SYSTEMD_DIR', savedEnv.systemd],
     ] as const) {
       if (value === undefined)
         delete process.env[key]
@@ -152,6 +177,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
     zfsList = ZFS_LIST
     bookmarks = ''
     gtiscsiList = ZFS_LIST_VOL1_2G
+    holds = ok('')
     paused.clear()
     await rm(configfs, { recursive: true, force: true })
     await rm(storageCfg, { force: true })
@@ -174,6 +200,11 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
         return ok(gtiscsiList)
       if (command === ZFS && args[0] === 'list' && args[1] === '-t' && args[2] === 'bookmark')
         return ok(bookmarks)
+      if (command === ZFS && args[0] === 'holds') {
+        if (holds === 'throws')
+          throw Object.assign(new Error('spawn /usr/sbin/zfs EAGAIN'), { code: 'EAGAIN' })
+        return holds
+      }
       const hold = command === ZFS ? paused.get(args[0]) : undefined
       if (hold)
         await hold
@@ -359,6 +390,85 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
     assert.equal(job.error?.code, 'STATE_CHANGED')
     assert.match(job.error!.message, /was: testpool\/media@snap2; now: testpool\/media#after-snap2, testpool\/media@snap2\)/)
     assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  // --- nf.3 D11: a forced rollback over a held snapshot ----------------------
+
+  /** A replication task `w3r5rep` into `w3r5d/rep` — the record's task, whose chain tag is the captured one. */
+  async function replicationTaskW3r5rep(): Promise<void> {
+    const units = join(dir, 'units')
+    await mkdir(units, { recursive: true })
+    await writeFile(join(units, 'anas-repl-w3r5rep.service'), renderServiceUnit({
+      name: 'w3r5rep',
+      source: { pool: 'testpool', dataset: 'media' },
+      target: { pool: 'w3r5d', dataset: 'rep' },
+      schedule: 'daily',
+      snapshotFirst: true,
+      enabled: true,
+      notify: 'on-failure',
+    }))
+    process.env.ANAS_SYSTEMD_DIR = units
+  }
+
+  const HELD_REFUSAL = 'A forced rollback of \'testpool/media\' to \'snap1\' is refused: it would destroy held snapshots, and ZFS stops at a held '
+    + `snapshot only after destroying the newer unheld ones — nothing was done. testpool/media@snap2 held by replication task 'w3r5rep': ${CAPTURED_TAG}.`
+  const holdsCalls = (): { command: string, args: string[] }[] => calls.filter(c => c.command === ZFS && c.args[0] === 'holds')
+
+  it('nf.3 D11: a forced rollback whose sweep includes a replication-held snapshot is refused 409 naming the snapshot, the task and the tag — no challenge, nothing runs', async () => {
+    assert.equal(replicationHoldTag(undefined, 'w3r5d/rep'), CAPTURED_TAG, 'the captured tag is the one the task derives')
+    await replicationTaskW3r5rep()
+    await serve()
+    holds = ok(HOLDS_ON_SNAP2)
+    const res = await inject(ROLLBACK_FORCE)
+    assert.equal(res.statusCode, 409, res.body)
+    assert.deepEqual(res.json().error, { code: 'CONFLICT', message: HELD_REFUSAL, reason: 'snapshot-held' })
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'refused before a confirm is minted')
+    assert.deepEqual(holdsCalls().map(c => c.args), [['holds', '-H', '--', 'testpool/media@snap2']], 'the holds of the swept snapshots, read once')
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  it('nf.3 D11: a hold that appears while the confirmed forced rollback waits refuses the job (the gate re-runs) — no zfs rollback', async () => {
+    await replicationTaskW3r5rep()
+    const job = await confirmedRace(ROLLBACK_FORCE, () => {
+      holds = ok(HOLDS_ON_SNAP2)
+    })
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'CONFLICT')
+    assert.equal(job.error?.message, HELD_REFUSAL)
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  it('nf.3 D11: holds that cannot be read refuse the forced rollback — at the route, and in the job when they become unreadable while it waits', async () => {
+    const unreadable = 'Could not read the holds on the snapshots a forced rollback of \'testpool/media\' to \'snap1\' destroys — refusing: '
+      + 'a held one would stop the rollback only after the newer unheld ones were destroyed'
+    for (const answer of [{ stdout: '', stderr: 'cannot open \'testpool/media@snap2\': dataset does not exist', exitCode: 1 }, 'throws'] as const) {
+      await serve()
+      holds = answer
+      const res = await inject(ROLLBACK_FORCE)
+      assert.equal(res.statusCode, 409, res.body)
+      assert.deepEqual(res.json().error, { code: 'CONFLICT', message: unreadable, reason: 'snapshot-holds-unreadable' })
+      assert.deepEqual(calls.filter(isMutation), [])
+      await server!.close()
+      server = undefined
+    }
+    const job = await confirmedRace(ROLLBACK_FORCE, () => {
+      holds = { stdout: '', stderr: 'internal error', exitCode: 1 }
+    })
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.message, unreadable)
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  it('nf.3 D11: a rollback that destroys nothing reads no holds — without force, and with force to the newest snapshot', async () => {
+    await serve()
+    holds = ok(HOLDS_ON_SNAP2)
+    const plain = await inject(ROLLBACK)
+    assert.equal(plain.statusCode, 409, plain.body)
+    assert.equal(plain.json().error.code, 'CONFIRMATION_REQUIRED')
+    const newest = await inject({ ...ROLLBACK, url: `${ROLLBACK.url}?force=true` })
+    assert.equal(newest.statusCode, 409, newest.body)
+    assert.equal(newest.json().error.code, 'CONFIRMATION_REQUIRED')
+    assert.deepEqual(holdsCalls(), [])
   })
 
   it('a bookmark OLDER than the target is not destroyed by force and is not bound', async () => {

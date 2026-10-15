@@ -373,7 +373,8 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         },
         ...(verb === 'update' ? { revision: async (o: MountObject) => fstabLineRevision(o.fstabText, o.mountpoint) } : {}),
         ...(verb === 'remove' ? { scope: async (o: MountObject) => ({ credentialsFile: credentialsFileOf(o) ?? 'none' }) } : {}),
-        scopeLabels: { credentialsFile: 'the credentials file to remove' },
+        // `holders` is bound by the busy confirm only (nf.3 D10, `confirmScope`).
+        scopeLabels: { credentialsFile: 'the credentials file to remove', holders: 'the holders a forced unmount detaches' },
         unbound: part => part === 'revision'
           ? `Could not read the /etc/fstab line of '${mp}' — refusing an edit that cannot be bound to it`
           : `Could not read what ${VERBING[verb].toLowerCase()} '${mp}' would change — refusing`,
@@ -441,9 +442,14 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
    * A re-listing that gets no answer (D3: the tool went, or timed out) cannot
    * show the holders are still only the confirmed ones, so it refuses too —
    * a forced detach is never done on an unknowable holder set.
+   *
+   * `confirmed` is the set the CONFIRM bound (nf.3 D10): the resend is
+   * accepted only when its listing reads as that set ({@link boundHolders}),
+   * so the job compares against what the operator was shown, never against a
+   * re-listing nobody saw. Compared in the bound form ({@link holderKey}).
    */
-  async function assertNoNewHolders(mountpoint: string, confirmed: string[]): Promise<void> {
-    const listed = new Set(confirmed)
+  async function assertNoNewHolders(mountpoint: string, confirmed: Holder[]): Promise<void> {
+    const listed = new Set(confirmed.map(holderKey))
     const listing = await listHolders(executor, mountpoint, procRoot)
     if (listing.state === 'unknown') {
       throw new GuardRefusalError({
@@ -452,13 +458,13 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         message: `The holders of mount '${mountpoint}' could not be listed again before the forced unmount — nothing was done; confirm again`,
       })
     }
-    const added = listing.holders.filter(h => !listed.has(h))
+    const added = listing.holders.filter(h => !listed.has(holderKey(h)))
     if (added.length === 0)
       return
     throw new GuardRefusalError({
       status: 409,
       code: 'STATE_CHANGED',
-      message: `Mount '${mountpoint}' has holders the confirmation did not name (${added.join(', ')}) — nothing was done; confirm again`,
+      message: `Mount '${mountpoint}' has holders the confirmation did not name (${added.map(holderLine).join(', ')}) — nothing was done; confirm again`,
     })
   }
 
@@ -799,6 +805,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     // UNKNOWN holder listing (D3: neither lsof nor fuser answered) also
     // confirms — the confirm says the holders could not be listed, never that
     // there are none, and the unmount is not forced on an unknowable set.
+    // nf.3 D10: the holder set shown is BOUND into the code (`confirmScope`),
+    // so a resend that lists other holders — one that opened a file since the
+    // challenge — is 409 CONFIRM_SCOPE_CHANGED naming them, never a detach of
+    // a process the operator was not shown; the job compares against that set.
     const disabling = action === 'disable'
     const verbing = VERBING[action]
     const listing = pre.object.mounted ? await listHolders(executor, mp, procRoot) : null
@@ -808,6 +818,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       if (!guardConfirm(confirmStore, request, reply, spec, pre, {
         validated: { mountpoint: mp, action },
         address: ['mountpoint'],
+        confirmScope: { holders: boundHolders(listing) },
         message: holders.length > 0
           ? `'${mp}' is busy — ${holders.length} process(es) are holding it`
           : holdersUnknown
@@ -818,7 +829,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         return reply
       }
     }
-    const lazy = holders.length > 0 // confirmed
+    const lazy = holders.length > 0 // confirmed: the set the code bound (D10)
 
     const job = jobQueue.submit(
       `mount.${action}`,
@@ -906,9 +917,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       ...busyWarnings(mp, holders, holdersUnknown),
       ...pre.advisories.map(a => a.warning),
     ]
+    // nf.3 D10: the holders shown are bound, as for unmount and disable.
     if (!guardConfirm(confirmStore, request, reply, spec, pre, {
       validated: { mountpoint: mp, removeMountpointDir },
       address: ['mountpoint'],
+      confirmScope: { holders: boundHolders(listing) },
       message: holders.length > 0
         ? `'${mp}' is busy — ${holders.length} process(es) are holding it`
         : `Removing mount '${mp}' deletes its configuration`,
@@ -916,7 +929,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     })) {
       return reply
     }
-    const lazy = holders.length > 0 // confirmed
+    const lazy = holders.length > 0 // confirmed: the set the code bound (D10)
 
     const job = jobQueue.submit(
       'mount.remove',
@@ -1042,12 +1055,12 @@ function mountedIn(findmntText: string, mountpoint: string): boolean {
  * from it: the unmount is not forced, so a busy mount fails the job before
  * anything else is changed.
  */
-function busyWarnings(mountpoint: string, holders: string[], holdersUnknown: boolean): string[] {
+function busyWarnings(mountpoint: string, holders: Holder[], holdersUnknown: boolean): string[] {
   if (holdersUnknown)
     return [`The processes holding '${mountpoint}' could not be listed (neither lsof nor fuser answered). The unmount is not forced: if '${mountpoint}' is busy, the job fails and nothing else is changed.`]
   if (holders.length === 0)
     return []
-  return [`Unmounting '${mountpoint}' will be forced (lazy unmount); these holders lose access:`, ...holders]
+  return [`Unmounting '${mountpoint}' will be forced (lazy unmount); these holders lose access:`, ...holders.map(holderLine)]
 }
 
 /** systemctl daemon-reload — re-runs the fstab generator after an fstab edit. */
@@ -1213,12 +1226,63 @@ function serializeInlineOptions(entry: MountEntry): string {
  * "none" — and nothing is force-detached on an unknowable holder set.
  */
 type HolderListing
-  = | { state: 'listed', holders: string[] }
+  = | { state: 'listed', holders: Holder[] }
     | { state: 'unknown' }
 
+/** One process holding a mountpoint, as lsof's COMMAND/PID or fuser's pid + `/proc/<pid>/comm` name it. */
+interface Holder {
+  pid: string
+  command: string
+}
+
+/** How the confirm and the job's errors name a holder: `sleep (pid 713845)`. */
+function holderLine(h: Holder): string {
+  return `${h.command} (pid ${h.pid})`
+}
+
 /**
- * List the processes holding a busy mountpoint, as `COMMAND (pid N)` strings,
- * for the cr.39 confirm and the forced unmount's re-check (NOTES §5).
+ * lsof's COMMAND column width: it prints at most this many characters of the
+ * name (its default; ANAS passes no `+c`), while fuser's holders are named by
+ * `/proc/<pid>/comm` (up to 15). The bound form cuts every name to this.
+ */
+const LSOF_COMMAND_WIDTH = 9
+/** lsof's `\xNN` escape for a byte it will not print raw (a space in a name among them). */
+const LSOF_HEX_ESCAPE_RE = /\\x([0-9a-f]{2})/gi
+
+/**
+ * A holder as the confirm BINDS it (nf.3 D10): the pid plus the name in the
+ * form both listings can produce — lsof's `\xNN` escapes decoded, then cut to
+ * lsof's nine characters — so the same process reads the same whichever tool
+ * listed it at the challenge and which at the resend. The pid alone could be
+ * a recycled number; the pid with a name is the process the operator saw.
+ */
+function holderKey(h: Holder): string {
+  const name = h.command.replace(LSOF_HEX_ESCAPE_RE, (_m, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
+  return `${name.slice(0, LSOF_COMMAND_WIDTH)} (pid ${h.pid})`
+}
+
+/**
+ * The holder set the busy confirm binds (nf.3 D10): `unknown` when no tool
+ * answered (D3), `none` when nothing holds it (or it is not mounted), else
+ * every holder's {@link holderKey} in pid order. A resend whose listing reads
+ * otherwise — a holder more, one fewer, or a listing where the challenge had
+ * none (or the reverse) — is 409 CONFIRM_SCOPE_CHANGED naming both sets.
+ */
+function boundHolders(listing: HolderListing | null): string {
+  if (listing?.state === 'unknown')
+    return 'unknown'
+  if (!listing || listing.holders.length === 0)
+    return 'none'
+  // Two steps on an array we own (`toSorted()` is ES2023; this package targets ES2022).
+  const keys = listing.holders.map(h => ({ pid: Number(h.pid), key: holderKey(h) }))
+  keys.sort((a, b) => a.pid - b.pid)
+  return keys.map(k => k.key).join(', ')
+}
+
+/**
+ * List the processes holding a busy mountpoint (pid + name; {@link holderLine}
+ * renders `COMMAND (pid N)`), for the cr.39 confirm and the forced unmount's
+ * re-check (NOTES §5).
  *
  * `lsof +f -- <mp>` when lsof is on the node (the richest structured source).
  * A stock PVE 9 node has fuser (psmisc) and no lsof (D3), so when lsof cannot
@@ -1239,7 +1303,7 @@ async function listHolders(executor: CommandExecutor, mountpoint: string, procRo
     r = null // could not start (ENOENT/EACCES): no lsof on this node
   }
   if (r && !toolNotFound(r)) {
-    const seen = new Map<string, string>()
+    const seen = new Map<string, Holder>()
     for (const line of r.stdout.split('\n').slice(1)) { // drop the header row
       const cols = line.trim().split(WHITESPACE_RE)
       if (cols.length < 2)
@@ -1247,14 +1311,14 @@ async function listHolders(executor: CommandExecutor, mountpoint: string, procRo
       const [command, pid] = cols
       if (!PID_RE.test(pid))
         continue
-      seen.set(pid, `${command} (pid ${pid})`)
+      seen.set(pid, { pid, command })
     }
     return { state: 'listed', holders: [...seen.values()] }
   }
   const holders = await runFuser(executor, mountpoint, procRoot ? { procRoot } : undefined)
   if (holders === null)
     return { state: 'unknown' }
-  return { state: 'listed', holders: holders.map(h => `${h.command} (pid ${h.pid})`) }
+  return { state: 'listed', holders: holders.map(h => ({ pid: String(h.pid), command: h.command })) }
 }
 
 /** Directory contents, or null when the path does not exist. */
