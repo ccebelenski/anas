@@ -250,7 +250,7 @@ Scope is the findings of `docs/CODE-REVIEW-2026-10-14.md`, which is the evidence
 - **cr.42** `[ ]` Identity verbs on the guard (the job compares uid/gid). After cr.33. Opus.
 - **cr.43** `[ ]` Share verbs on the guard (vanished share → `NOT_FOUND`, no duplicate stanza). After cr.33. Local (Qwen).
 - **cr.44** `[ ]` The confirm window re-challenges a bound option in place. Before cr.36/cr.37. Opus.
-- **cr.45** `[ ]` `pollJob` retry, lost contact, still running; cancel-run toasts on `completed` only. Local (Qwen); browser probe owed.
+- **cr.45** `[done 2026-10-15; browser probe owed]` `pollJob` retry, lost contact, still running; cancel-run toasts on `completed` only. Local (Qwen); browser probe owed. A job is now polled to its real end — `onComplete` fires only on `completed`, a still-running job announces itself once past the attention window and keeps being polled at 5 s, and a vanished job or 60 s of poll failures alerts and recovers through `onLost`/`onFailed(null)` instead of dying silently.
 - **cr.46** `[ ]` Replication/snapshot-schedule delete through `runJob`; poll responses applied to the selection they were made for. Local (Qwen).
 
 ### 0.4.5 — slate DECIDED 2026-09-27 (as 0.4.2; renumbered 2026-10-05 when the #70/#71 point release took the number, 2026-10-11 when the #75 bug release took 0.4.3, and 2026-10-14 when the code-review release took 0.4.4), implementation PAUSED (operator: "pause on implementation for a while to let 0.4.1 settle with the users")

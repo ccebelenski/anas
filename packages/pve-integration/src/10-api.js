@@ -178,12 +178,22 @@
     // opts:
     //   node, method ('post'|'put'|'del'), path, body, confirmCode
     //   view       — a component; polling stops if it is destroyed
-    //   maxMs      — poll budget (default 15000)
+    //   maxMs      — the attention window (default 15000): past it a still-
+    //                running job announces itself once (cr.45), polling continues
+    //   what       — short noun phrase for the still-running / lost sentences;
+    //                falls back to 'The job' (the daemon's operation id is an
+    //                internal key, never shown to the operator)
     //   successMsg — toast on completion
     //   failTitle  — alert title on failure (default 'Operation failed')
-    //   onComplete(job) / onFailed(job) / onConfirm(err) — callbacks
+    //   onComplete(job) / onFailed(job) / onConfirm(err) — callbacks.
+    //                onComplete fires ONLY on `completed` (cr.45); a job whose
+    //                outcome is unknown (the daemon lost it, contact lost) goes
+    //                to onLost(err) if given, else onFailed(null) — the reload
+    //                every panel's onFailed already does.
     //   onCancelled(job) — the job ended `cancelled` (rclone.5); without it a
     //                toast carries the daemon's reason
+    //   onStillRunning(job) — once, when the job is still running past maxMs;
+    //                without it a default toast points at Recent activity
     // onConfirm receives the rejected 409 Error (with .confirmCode) so callers
     // can prompt and retry with { confirmCode }. If absent, ANAS.confirmAndRun
     // wraps this for the standard prompt flow.
@@ -232,18 +242,72 @@
         }
     }
 
+    // Poll one job to its end (cr.45, docs/WAVE3-DESIGN.md §7.2).
+    //
+    // Cadence: every 0.5 s for the first 5 s, then every 2 s. A job still
+    // running past maxMs (the attention window) fires onStillRunning once —
+    // default: a toast pointing at the Dashboard's Recent activity — and the
+    // poll slows to every 5 s while the view lives. onComplete fires ONLY on
+    // `completed`; the old "still running at the end of the budget → treat as
+    // done" was the F9 defect (a completion reload while md was still working,
+    // and a later failure never alerted).
+    //
+    // Poll errors: a 404 means the daemon restarted and the job is gone —
+    // terminal "lost". Anything else (network, 502/503/504 from the proxy)
+    // retries after 1, 2, 4, 8, 10, 10 … s; the first success resumes normal
+    // polling. 60 s without any successful poll is terminal "lost contact".
+    // Both terminals alert, then call onLost(err) if given, else onFailed(null)
+    // — every panel's onFailed reloads/re-enables what onSubmitted disabled,
+    // which is the right recovery when the outcome is unknown (jobRejected
+    // already calls onFailed(null) the same way).
     ANAS.pollJob = function (node, jobId, opts) {
-        var interval = 500;
         var maxMs = opts.maxMs || 15000;
-        var elapsed = 0;
         var view = opts.view;
+        var elapsed = 0;   // ms watching the job — drives the cadence and maxMs
+        var sinceOk = 0;   // ms since the last SUCCESSFUL poll — drives lost-contact
+        var retryIdx = 0;
+        var announced = false;
+        var subject = opts.what || '';
+        var RETRY_MS = [1000, 2000, 4000, 8000, 10000]; // then 10000 forever
+        var LOST_CONTACT_MS = 60000;
         function dead() {
             return view && (view.destroyed || view.destroying);
+        }
+        // The "<what>" of the still-running / lost-contact sentences: the
+        // caller's label, else a generic noun.
+        function what() {
+            return subject || ANAS.t('The job');
+        }
+        // Terminal "lost": alert, then onLost(err) or onFailed(null).
+        function lost(err, title, body) {
+            try {
+                Ext.Msg.alert(title, body);
+            } catch (e) {
+                ANAS.warn(ANAS.errText(err));
+            }
+            if (opts.onLost) { opts.onLost(err); }
+            else if (opts.onFailed) { opts.onFailed(null); }
+        }
+        function nextDelay() {
+            if (announced) { return 5000; }
+            return elapsed >= 5000 ? 2000 : 500;
+        }
+        // Time only advances when a poll fires: each scheduled delay counts
+        // toward both windows, retries included — the job runs while we retry.
+        function schedule(ms) {
+            setTimeout(function () {
+                if (dead()) { return; }
+                elapsed += ms;
+                sinceOk += ms;
+                tick();
+            }, ms);
         }
         function tick() {
             if (dead()) { return; }
             api.get(node, '/jobs/' + encodeURIComponent(jobId)).then(function (res) {
                 if (dead()) { return; }
+                sinceOk = 0;
+                retryIdx = 0;
                 var job = res && res.job;
                 var status = job && job.status;
                 if (status === 'completed') {
@@ -275,20 +339,37 @@
                     if (opts.onFailed) { opts.onFailed(job); }
                     return;
                 }
-                elapsed += interval;
-                if (elapsed >= maxMs) {
-                    // Still running after the wait window — treat as "kicked off
-                    // ok" and let the caller refresh; stop polling.
-                    if (opts.onComplete) { opts.onComplete(job); }
-                    return;
+                if (!announced && elapsed >= maxMs) {
+                    announced = true;
+                    if (opts.onStillRunning) {
+                        opts.onStillRunning(job);
+                    } else {
+                        // ANAS.toast encodes its body; the subject rides inside it.
+                        ANAS.toast(what() + ' '
+                            + ANAS.t('is still running — the Dashboard\'s Recent activity shows when it ends'));
+                    }
                 }
-                setTimeout(tick, interval);
+                schedule(nextDelay());
             }, function (err) {
                 if (dead()) { return; }
+                if (err && err.status === 404) {
+                    // Jobs live in the daemon's memory: a 404 means it
+                    // restarted and this job's outcome is unknowable here.
+                    lost(err, ANAS.t('Job lost'),
+                        ANAS.t('The node no longer knows this job (the ANAS daemon restarted). Check the object before retrying.'));
+                    return;
+                }
                 ANAS.warn('job poll failed: ' + ANAS.errText(err));
+                if (sinceOk >= LOST_CONTACT_MS) {
+                    lost(err, ANAS.t('Lost contact'),
+                        ANAS.t('Lost contact with the node while') + ' ' + ANAS.enc(what()) + ' '
+                        + ANAS.t('was running; it may still be running. Refresh to see the result.'));
+                    return;
+                }
+                schedule(RETRY_MS[Math.min(retryIdx++, RETRY_MS.length - 1)]);
             });
         }
-        setTimeout(tick, interval);
+        schedule(500);
     };
 
     // Server-warnings → HTML bullet list. Single source for the
