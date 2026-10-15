@@ -181,6 +181,11 @@ export function createServer(opts?: ServerOptions) {
   const systemdDir = process.env.ANAS_SYSTEMD_DIR
     ?? (opts?.mock ? join(tmpdir(), `anas-mock-systemd-${process.pid}`) : '/etc/systemd/system')
 
+  // /proc root for the fuser holder-name reads that follow an absent lsof (D3).
+  // Override via ANAS_PROC_ROOT (a test points fuser's `<pid>/comm` reads at a
+  // fake proc tree); unset = the real /proc.
+  const procRoot = process.env.ANAS_PROC_ROOT
+
   // /etc/fstab location (Epic 18). Config IS the API — surgical round-trip edits.
   // Override via ANAS_FSTAB_PATH (tests point it at a temp file; dev mock seeds a
   // writable copy of the sample fstab below). Credentials live in ANAS_CREDS_DIR
@@ -821,7 +826,7 @@ export function createServer(opts?: ServerOptions) {
   server.register(scrubRoutes, { prefix: '/v1', executor, jobQueue, systemdDir })
   // Mounts (Epic 18) — external & local storage. fstab round-trip + findmnt
   // inventory + PVE-tagged hands-off + guarded status probe.
-  server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath, mdadmConfPath, iscsiPaths, smbConfPath, exportsPath, systemdDir })
+  server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath, mdadmConfPath, iscsiPaths, smbConfPath, exportsPath, systemdDir, procRoot })
   // iSCSI reads (iscsi epic, story iscsi.2) — LIO's persisted saveconfig.json
   // joined against live configfs. Read-only; every mutation is iscsi.4's. The
   // paths default inside the service to the real host locations and are

@@ -1,4 +1,4 @@
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { ConfigfsOptions, LunHolder } from './iscsi-configfs.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -164,21 +164,42 @@ export function formatHolders(holders: BusyHolder[], cap = DEFAULT_CAP): string 
 }
 
 /**
- * Identify the processes holding `path`'s filesystem open: `fuser -m <path>`
- * for the PID set, then `/proc/<pid>/comm` for each command name. Fail-open —
- * `fuser` missing/erroring (exit non-zero, empty stdout) yields no PIDs, and a
- * PID that vanished before its `/proc` read is skipped. Never throws.
+ * An exec result that says the tool is not on this host: exit 127 with no
+ * stdout. On a node a missing binary makes `exec` REJECT (ENOENT) and never
+ * yields 127; the MockExecutor answers an unregistered command with exactly
+ * this, so a mock host and a node without the tool read the same (D3).
  */
-export async function diagnoseBusyPath(
+export function toolNotFound(r: ExecResult): boolean {
+  return r.exitCode === 127 && r.stdout.trim() === ''
+}
+
+/**
+ * The `fuser -m <path>` run behind {@link diagnoseBusyPath}, answering the ONE
+ * question that helper's fail-open contract cannot: did the tool answer?
+ *
+ * {@link diagnoseBusyPath} collapses "fuser is not installed" and "fuser ran
+ * and found nothing" into the same empty list, which is right for error
+ * enrichment (the primary error is what matters). The cr.39 busy gate in
+ * Mounts needs the distinction (D3): when no tool answers, the holder list is
+ * UNKNOWN and the confirm must say so — "[]" would read as "nothing holds it".
+ *
+ * `null` = no answer: fuser could not be started, {@link toolNotFound}, or it
+ * ran out of its budget (a hung mount). An empty ARRAY = fuser ran and found
+ * nothing (`fuser -m` exits 1 with empty stdout), which IS an answer. Never
+ * throws.
+ */
+export async function runFuser(
   executor: CommandExecutor,
   path: string,
   opts?: BusyDiagnosisOptions,
-): Promise<BusyHolder[]> {
+): Promise<BusyHolder[] | null> {
   const procRoot = opts?.procRoot ?? DEFAULT_PROC_ROOT
   try {
     // fuser writes PIDs to stdout (terse); its label decoration goes to stderr,
-    // which we ignore. A missing fuser returns exit 127 with empty stdout → [].
+    // which we ignore.
     const r = await executor.exec(FUSER, ['-m', path])
+    if (toolNotFound(r))
+      return null
     const holders: BusyHolder[] = []
     for (const pid of parseFuserPids(r.stdout)) {
       try {
@@ -193,8 +214,24 @@ export async function diagnoseBusyPath(
     return holders
   }
   catch {
-    return []
+    return null
   }
+}
+
+/**
+ * Identify the processes holding `path`'s filesystem open: `fuser -m <path>`
+ * for the PID set, then `/proc/<pid>/comm` for each command name. Fail-open —
+ * `fuser` missing/erroring yields no PIDs, and a PID that vanished before its
+ * `/proc` read is skipped. Never throws.
+ */
+export async function diagnoseBusyPath(
+  executor: CommandExecutor,
+  path: string,
+  opts?: BusyDiagnosisOptions,
+): Promise<BusyHolder[]> {
+  // Fail-open: an absent/ailing fuser reads as "no holders", exactly as before
+  // runFuser existed — enrichment never masks the primary error with a note.
+  return (await runFuser(executor, path, opts)) ?? []
 }
 
 /**

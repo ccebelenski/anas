@@ -1118,6 +1118,11 @@ async function createEditServer(
   executor.addFixture({ command: SYSTEMCTL, args: ['daemon-reload'], result: OK })
   executor.addFixture({ command: MOUNT, result: OK })
   executor.addFixture({ command: UMOUNT, result: OK })
+  // The busy gate's holder listing on an idle mount: lsof answers nothing
+  // holding it (exit 1, empty stdout — the dev mock's answer). Without it the
+  // mock's command-not-found reads as "no lsof and no fuser" (nf.2/D3) and an
+  // unmount asks to confirm unknown holders.
+  executor.addFixture({ command: '/usr/bin/lsof', result: { stdout: '', stderr: '', exitCode: 1 } })
 
   const app = Fastify({ logger: false })
   const jobQueue = new JobQueue()

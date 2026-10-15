@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { parseZpoolStatus } from '../../parsers/zpool-status.js'
-import { allVdevLeaves, leavesFromStatus, parseDiscardCapableKernels, poolTrimSupported } from '../pools.js'
+import { allVdevLeaves, cleanupLeaves, leavesFromStatus, parseDiscardCapableKernels, poolTrimSupported } from '../pools.js'
 
 /**
  * vdevs.1 consumer audit (GitHub #66), consumers (a) and (f): both the destroy
@@ -45,15 +45,36 @@ describe('vdev-class leaves — every class counts as a leaf (vdevs.1)', () => {
     ])
   })
 
-  it('destroy cleanup (leavesFromStatus) resolves all six for labelclear', () => {
+  it('leavesFromStatus resolves all six, each with its class', () => {
     const leaves = leavesFromStatus(pool)
-    assert.equal(leaves.length, 6)
+    assert.deepEqual(leaves.map(l => [l.leafId, l.role]).sort(), [
+      ['sdb1', 'data'],
+      ['sdb2', 'log'],
+      ['sdb3', 'cache'],
+      ['sdb4', 'spare'],
+      ['sdb5', 'special'],
+      ['sdb6', 'dedup'],
+    ])
+  })
+
+  it('nf.2/D5: destroy cleanup (cleanupLeaves) wipes the data, log, special and dedup leaves and keeps the cache and the spare, saying why', () => {
+    const { wipe, kept } = cleanupLeaves(leavesFromStatus(pool))
     // The special and dedup members are in the cleanup set — the ones a destroy
     // used to leave labelled, so the disk still read as a zfs_member.
-    const ids = leaves.map(l => l.leafId)
-    assert.ok(ids.includes('sdb5'), 'special leaf cleaned')
-    assert.ok(ids.includes('sdb6'), 'dedup leaf cleaned')
-    assert.ok(ids.includes('sdb2'), 'log leaf cleaned')
+    assert.deepEqual(wipe.map(l => l.leafId).sort(), ['sdb1', 'sdb2', 'sdb5', 'sdb6'])
+    // A cache or spare label names no pool: ident.1's label check could never
+    // match it, so the confirm must not list it as a disk to wipe (D5).
+    assert.deepEqual(kept, [
+      { leaf: 'sdb3', why: 'a cache (L2ARC) device\'s ZFS label names no pool' },
+      { leaf: 'sdb4', why: 'a hot spare\'s ZFS label names no pool (a spare can serve other pools)' },
+    ])
+  })
+
+  it('nf.2/D5: an in-use spare is wiped once (its data-vdev leg), a leaf that is not ONLINE is kept', () => {
+    const [active] = statusFixture('zpool-status-spare-active.json')
+    const { wipe, kept } = cleanupLeaves(leavesFromStatus(active))
+    assert.deepEqual(wipe.map(l => l.leafId), ['scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1-part1', 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3-part1'])
+    assert.deepEqual(kept, [{ leaf: 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2-part1', why: 'the leaf was REMOVED' }])
   })
 
   it('a kernel-name leaf is addressed by its kernel device, not a made-up by-id', () => {

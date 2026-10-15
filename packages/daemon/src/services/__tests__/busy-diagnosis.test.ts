@@ -13,6 +13,7 @@ import {
   formatHolders,
   isBusyError,
   parseFuserPids,
+  runFuser,
 } from '../busy-diagnosis.js'
 
 /**
@@ -120,6 +121,56 @@ describe('busy-diagnosis — diagnoseBusyPath (fuser + injected /proc)', () => {
     // No fixture for fuser → MockExecutor returns exit 127 (command not found).
     const holders = await diagnoseBusyPath(new MockExecutor(), '/x', { procRoot })
     assert.deepEqual(holders, [])
+  })
+})
+
+describe('busy-diagnosis — runFuser (the D3 tool-present answer, distinct from fail-open)', () => {
+  let procRoot: string
+
+  beforeEach(async () => {
+    procRoot = await mkdtemp(join(tmpdir(), 'anas-proc-'))
+  })
+  afterEach(async () => {
+    await rm(procRoot, { recursive: true, force: true })
+  })
+
+  async function seedComm(pid: number, comm: string): Promise<void> {
+    await mkdir(join(procRoot, String(pid)))
+    await writeFile(join(procRoot, String(pid), 'comm'), `${comm}\n`)
+  }
+
+  it('answers the holders from the REAL captured `fuser -m` capture — the D3 fixture', async () => {
+    await seedComm(483284, 'sleep')
+    await seedComm(483285, 'sleep')
+    const exec = new MockExecutor()
+    exec.addFixture({ command: FUSER, args: ['-m', '/mnt/anas-ahr/tank'], result: { stdout: FUSER_HOLDERS, stderr: '', exitCode: 0 } })
+
+    const holders = await runFuser(exec, '/mnt/anas-ahr/tank', { procRoot })
+    assert.deepEqual(holders, [
+      { command: 'sleep', pid: 483284 },
+      { command: 'sleep', pid: 483285 },
+    ])
+  })
+
+  it('fuser ran and found nothing → empty ARRAY, an answer (never null)', async () => {
+    const exec = new MockExecutor()
+    exec.addFixture({ command: FUSER, args: ['-m', '/idle'], result: { stdout: '', stderr: '', exitCode: 1 } })
+
+    assert.deepEqual(await runFuser(exec, '/idle', { procRoot }), [])
+  })
+
+  it('fuser cannot START (exec threw) → null — the tool is not there', async () => {
+    const exec = new MockExecutor()
+    exec.addFixture({ command: FUSER, args: ['-m', '/x'], throws: new Error('spawn /usr/bin/fuser ENOENT') })
+
+    assert.equal(await runFuser(exec, '/x', { procRoot }), null)
+  })
+
+  it('the mock\'s "command not found" (exit 127, empty stdout) reads as null, not "no holders"', async () => {
+    // No fixture for fuser → MockExecutor answers 127. What diagnoseBusyPath
+    // collapses into an empty list, runFuser must report as "the tool did not
+    // run" — the cr.39 holder list is then UNKNOWN, not empty.
+    assert.equal(await runFuser(new MockExecutor(), '/x', { procRoot }), null)
   })
 })
 

@@ -1,4 +1,4 @@
-import type { Disk, ExpansionTarget, PoolDetail, PoolExpansionReport, PoolSummary, PveOwnership, VdevSpec } from '@anas/shared'
+import type { Disk, ExpansionTarget, PoolDetail, PoolExpansionReport, PoolSummary, PveOwnership, VdevRole, VdevSpec } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { LockClaim, LockMode } from '../jobs/locks.js'
@@ -105,6 +105,53 @@ interface PoolLeaf {
    * this instead, or every partition of the disk reads as a stranger's.
    */
   leafKernel?: string
+  /** The class of the vdev the leaf belongs to (nf.2/D5: cache and spare leaves are never wiped). */
+  role: VdevRole
+}
+
+/**
+ * What a destroy with cleanup does to a pool's leaves (story nf.2, node-pass
+ * D5), decided ONCE: the confirm's "Disks to wipe" (the cr.32 bound scope),
+ * the disk lock keys and the job's wipe loop all read this one answer, so
+ * what is bound and shown is what is wiped.
+ *
+ * `wipe` is every ONLINE leaf of a class whose ZFS label names the pool —
+ * data, log, special, dedup. `kept` is every other leaf with why: a cache
+ * (L2ARC) or spare leaf's label names no pool (a spare can be shared between
+ * pools), so ident.1's label check could never match it; a leaf that is not
+ * ONLINE may be a stale path to another disk (ident.1). The job still checks
+ * each `wipe` leaf's label before it touches it (never fail open).
+ */
+export interface CleanupLeaves {
+  wipe: PoolLeaf[]
+  kept: { leaf: string, why: string }[]
+}
+
+/** The vdev classes whose leaves carry a label naming the pool. */
+const WIPED_ROLES: readonly VdevRole[] = ['data', 'log', 'special', 'dedup']
+
+const KEPT_ROLE_WHY: Partial<Record<VdevRole, string>> = {
+  cache: 'a cache (L2ARC) device\'s ZFS label names no pool',
+  spare: 'a hot spare\'s ZFS label names no pool (a spare can serve other pools)',
+}
+
+/**
+ * Split a pool's leaves into what a cleanup wipes and what it keeps (see
+ * {@link CleanupLeaves}). A leaf listed twice — an in-use spare sits in its
+ * data vdev AND in the spares section — is decided by its wiped occurrence.
+ *
+ * Exported for the consumer-audit tests.
+ */
+export function cleanupLeaves(leaves: PoolLeaf[]): CleanupLeaves {
+  const wipe = leaves.filter(l => WIPED_ROLES.includes(l.role) && (!l.state || l.state === 'ONLINE'))
+  const wiped = new Set(wipe.map(l => l.leafId))
+  const kept: CleanupLeaves['kept'] = []
+  for (const leaf of leaves) {
+    if (wiped.has(leaf.leafId) || kept.some(k => k.leaf === leaf.leafId))
+      continue
+    kept.push({ leaf: leaf.leafId, why: KEPT_ROLE_WHY[leaf.role] ?? `the leaf was ${leaf.state}` })
+  }
+  return { wipe, kept }
 }
 
 /**
@@ -113,7 +160,8 @@ interface PoolLeaf {
  * pool-list trim probe share, so "which classes count as leaves" is decided in
  * ONE place (vdevs.1 consumer audit, GitHub #66: a leaf of a log, special or
  * dedup vdev was invisible while the parser dropped those sections, and each
- * consumer would have had to learn about them separately).
+ * consumer would have had to learn about them separately). Which of them a
+ * cleanup WIPES is {@link cleanupLeaves}'s answer (nf.2/D5), not this walk's.
  *
  * Exported for the consumer-audit tests.
  */
@@ -122,7 +170,7 @@ export function allVdevLeaves(pool: ParsedPoolStatus): LeafRef[] {
   for (const group of pool.vdevGroups) {
     for (const vdev of group.vdevs) {
       for (const disk of vdev.disks)
-        leaves.push({ id: disk.id, path: disk.path, state: disk.state })
+        leaves.push({ id: disk.id, path: disk.path, state: disk.state, role: group.role })
     }
   }
   return leaves
@@ -152,8 +200,8 @@ export function allVdevLeaves(pool: ParsedPoolStatus): LeafRef[] {
  * Exported for the consumer-audit tests.
  */
 export function leavesFromStatus(pool: ParsedPoolStatus): PoolLeaf[] {
-  return allVdevLeaves(pool).map(({ path, state }) => {
-    const st = state ? { state } : {}
+  return allVdevLeaves(pool).map(({ path, state, role }) => {
+    const st = { role, ...(state ? { state } : {}) }
     if (path.startsWith(BY_ID_PREFIX)) {
       const leafId = path.slice(BY_ID_PREFIX.length)
       const wholeDiskId = leafId.replace(PART_BY_ID_RE, '')
@@ -353,6 +401,8 @@ interface LeafRef {
   path: string
   /** The leaf's vdev state (ONLINE, DEGRADED, UNAVAIL, …). */
   state?: string
+  /** The class of the vdev it belongs to. */
+  role: VdevRole
 }
 
 interface LsblkDiscardRaw {
@@ -395,7 +445,7 @@ export function parseDiscardCapableKernels(lsblkJson: string): Set<string> {
  * set. Unresolvable leaves are simply skipped — never throws.
  */
 export function poolTrimSupported(
-  leaves: LeafRef[],
+  leaves: Pick<LeafRef, 'id' | 'path'>[],
   byIdToKernel: Map<string, string>,
   capableKernels: Set<string>,
 ): boolean {
@@ -916,6 +966,11 @@ export async function poolRoutes(
     footprint: (reads: GuardReads) => reads.once('pve-footprint', () => pveFootprint()),
     claims: (reads: GuardReads) => reads.once('iscsi-claims', async () => createIscsiClaimCache(executor, iscsiPaths)),
     leaves: (reads: GuardReads, pool: string) => reads.once(`pool-leaves:${pool}`, () => readPoolLeaves(pool)),
+    /** What a destroy with cleanup wipes and keeps (nf.2/D5) — the scope, the disk keys and the job all read this. */
+    cleanup: (reads: GuardReads, pool: string) => reads.once(`pool-cleanup:${pool}`, async () => {
+      const leaves = await poolReads.leaves(reads, pool)
+      return leaves ? cleanupLeaves(leaves) : null
+    }),
     /** `zpool status -jv` — the topology the vdev gates resolve against, and the job's argv after them (cr.36). */
     status: (reads: GuardReads) => reads.once('zpool-status', () => executor.exec(ZPOOL, ['status', '-jv'])),
     getAll: (reads: GuardReads) => reads.once('zpool-get-all', () => executor.exec(ZPOOL, ['get', 'all', '-j'])),
@@ -1247,20 +1302,21 @@ export async function poolRoutes(
    * added between the challenge and the job changes what the operator agreed
    * to wipe.
    */
-  function poolGuardSpec(poolName: string, verb: 'export' | 'destroy', cleanup = false): GuardSpec<PoolObject> {
+  function poolGuardSpec(poolName: string, verb: 'export' | 'destroy', cleanup = false): GuardSpec<PoolObject & { cleanup?: CleanupLeaves | null }> {
     const action = verb === 'export' ? 'Exporting' : 'Destroying'
     const noun = verb === 'export' ? 'an export' : 'a destroy'
-    const base = poolObjectView(poolName, noun)
+    // nf.2/D5: a cleanup destroy reads what it wipes WITH the object, at each
+    // door — the scope binds `wipe`, the confirm lists it, the job wipes it.
+    const base = poolObjectView(poolName, noun, async reads => cleanup ? { cleanup: await poolReads.cleanup(reads, poolName) } : {})
     return {
       operation: verb === 'export' ? 'zpool.export' : 'zpool.destroy',
       object: {
         ...base,
         ...(cleanup
           ? {
-              scope: async (pool: PoolObject, reads: GuardReads) => {
-                const leaves = await poolReads.leaves(reads, pool.name)
-                return leaves ? { leaves: leaves.map(l => l.leafId).sort().join(', ') } : null
-              },
+              scope: async pool => pool.cleanup
+                ? { leaves: pool.cleanup.wipe.map(l => l.leafId).sort().join(', ') }
+                : null,
             }
           : {}),
         scopeLabels: { leaves: 'the disks to wipe' },
@@ -1277,12 +1333,11 @@ export async function poolRoutes(
       // A leaf ZFS names by kernel name or another path carries no disk key —
       // the inventory's keys are by-ids, and the job resolves those leaves
       // only after the pool is gone.
-      locks: async (pool, bound, reads) => {
+      locks: async (pool, bound) => {
         const claims = poolClaims(pool.name, bound.id.guid, 'exclusive', { namespace: true })
         if (!cleanup)
           return claims
-        const leaves = (await poolReads.leaves(reads, pool.name)) ?? []
-        return [...claims, ...diskClaims(leaves
+        return [...claims, ...diskClaims((pool.cleanup?.wipe ?? [])
           .filter(l => l.leafPath.startsWith(BY_ID_PREFIX) && l.wholeDiskId)
           .map(l => l.wholeDiskId as string))]
       },
@@ -2637,8 +2692,10 @@ export async function poolRoutes(
     ]
     if (cleanup) {
       warnings.push(`The pool's disks will be wiped clean (existing ZFS labels removed).`)
-      // What is bound is what was shown (WAVE3-DESIGN §5.2 rule 2).
+      // What is bound is what was shown (WAVE3-DESIGN §5.2 rule 2) — and what
+      // the job wipes (nf.2/D5); the leaves it keeps are said, with why.
       warnings.push(`Disks to wipe: ${pre.bound.scope?.leaves || 'none'}.`)
+      warnings.push(...(pre.object.cleanup?.kept ?? []).map(k => `${k.leaf} is not wiped: ${k.why}.`))
     }
     // Story cr.24: what STILL references the pool, one warning per reference
     // and per unreadable source, then the LIO-unreadable disclosure (warn,
@@ -2665,14 +2722,16 @@ export async function poolRoutes(
       { ...identity, params: { pool: poolName, cleanup, guid } },
       // Ruling (j): guid, the bound leaf set and every gate are re-checked
       // against facts read now; a refusal fails the job before anything runs.
-      guarded(spec, pre, async (_pool, ctx) => {
+      guarded(spec, pre, async (pool, ctx) => {
         const { updateProgress } = ctx
         const newRefWarnings = ctx.newAdvisories
 
         // The member leaves BEFORE destroy — the pool must still exist to
         // enumerate them. These are the leaves the guard just compared with
-        // the confirmed set (same read); resolve every leaf that names no disk.
-        const leaves = cleanup ? await resolveLeafDisks((await poolReads.leaves(ctx.reads, poolName)) ?? []) : []
+        // the confirmed set (same read; nf.2/D5: the `wipe` set, cache and
+        // spare leaves already kept); resolve every leaf that names no disk.
+        const leaves = cleanup ? await resolveLeafDisks(pool.cleanup?.wipe ?? []) : []
+        const kept = cleanup ? pool.cleanup?.kept ?? [] : []
 
         const result = await executor.exec(ZPOOL, ['destroy', '--', poolName])
         if (result.exitCode !== 0) {
@@ -2691,7 +2750,7 @@ export async function poolRoutes(
         const unitWarning = await syncZfsImportUnit(executor, poolName, 'disable')
         const unitWarnings = unitWarning ? [unitWarning] : []
 
-        if (!(cleanup && leaves.length > 0)) {
+        if (!(cleanup && leaves.length + kept.length > 0)) {
           const warnings = [...unitWarnings, ...newRefWarnings]
           return { destroyed: poolName, ...(warnings.length > 0 ? { warnings } : {}) }
         }
@@ -2717,18 +2776,17 @@ export async function poolRoutes(
         // (a stale path on a faulted or missing leaf can name another disk
         // after a reshuffle) and its on-disk ZFS label says it belongs to the
         // pool just destroyed — `blkid -p` reports a zfs_member's pool guid as
-        // UUID (the vdev's own as UUID_SUB). Anything else is skipped with a
-        // note: never fail open.
+        // UUID (the vdev's own as UUID_SUB). The state, and the classes whose
+        // label names no pool (cache, spare), are decided before the confirm
+        // (cleanupLeaves, nf.2/D5) and arrive here as `kept`; the label is
+        // checked here, on the leaf about to be written. Anything else is
+        // skipped with a note: never fail open.
         const wiped: string[] = []
         const wipedFailed: string[] = []
-        const skipped: { leaf: string, reason: string }[] = []
+        const skipped: { leaf: string, reason: string }[] = kept.map(k => ({ leaf: k.leaf, reason: `not cleaned: ${k.why}` }))
         /** Leaves proven this pool's by their label — the only ones a zap may follow. */
         const matched: PoolLeaf[] = []
         for (const leaf of leaves) {
-          if (leaf.state && leaf.state !== 'ONLINE') {
-            skipped.push({ leaf: leaf.leafId, reason: `not cleaned: the leaf was ${leaf.state}` })
-            continue
-          }
           const label = await executor.exec(BLKID, ['-p', '-s', 'UUID', '-o', 'value', leaf.leafPath])
           const labelGuid = label.exitCode === 0 ? label.stdout.trim() : ''
           if (labelGuid !== guid) {

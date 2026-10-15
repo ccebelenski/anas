@@ -9,12 +9,13 @@ import type { LiveAtTarget } from '../services/mount-match.js'
 import type { MountTestStages } from '../services/mounts.js'
 import { mkdir, readdir } from 'node:fs/promises'
 import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, UpdateMountRequest } from '@anas/shared'
+import { CommandTimeoutError } from '../executor/deadline.js'
 import { classifyKind, parseFindmnt } from '../parsers/findmnt.js'
 import { addMount, carriesAutomount, cifsAuthToken, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
 import { readPveMountPaths, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, sendRefusal } from '../safety/guard.js'
-import { diagnoseBusyPath, enrichBusyError, formatHolders } from '../services/busy-diagnosis.js'
+import { diagnoseBusyPath, enrichBusyError, formatHolders, runFuser, toolNotFound } from '../services/busy-diagnosis.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { describeLive, liveAtTarget, specMatchesLive } from '../services/mount-match.js'
@@ -101,6 +102,13 @@ export interface MountsRouteOptions {
    * sets it; the real checks are the default.
    */
   mountTestStages?: MountTestStages
+  /**
+   * TEST SEAM for the fuser holder-name reads (D3): the `/proc` root
+   * `busy-diagnosis` reads `<pid>/comm` from. A test whose fuser answers the
+   * captured fixture points this at a fake proc tree so the holder names
+   * resolve; production never sets it and the real `/proc` is read.
+   */
+  procRoot?: string
 }
 
 /** The verbs on an existing mount (create has its own spec: its object is an empty slot). */
@@ -153,6 +161,7 @@ interface MountSlot {
 export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOptions) {
   const { executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath, mdadmConfPath, mountTestStages } = opts
   const iscsiPaths = opts.iscsiPaths ?? {}
+  const procRoot = opts.procRoot
 
   /** The per-run reads the mount gates share (one per guard run, never across doors). */
   const mountReads = {
@@ -429,10 +438,21 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
    * only those (story cr.39, §2.5 "holders"). Right before the `umount -l`,
    * the job lists the holders again: one the confirm did not name refuses the
    * job, nothing done. A holder that has gone since is no reason to stop.
+   * A re-listing that gets no answer (D3: the tool went, or timed out) cannot
+   * show the holders are still only the confirmed ones, so it refuses too —
+   * a forced detach is never done on an unknowable holder set.
    */
   async function assertNoNewHolders(mountpoint: string, confirmed: string[]): Promise<void> {
     const listed = new Set(confirmed)
-    const added = (await listHolders(executor, mountpoint)).filter(h => !listed.has(h))
+    const listing = await listHolders(executor, mountpoint, procRoot)
+    if (listing.state === 'unknown') {
+      throw new GuardRefusalError({
+        status: 409,
+        code: 'STATE_CHANGED',
+        message: `The holders of mount '${mountpoint}' could not be listed again before the forced unmount — nothing was done; confirm again`,
+      })
+    }
+    const added = listing.holders.filter(h => !listed.has(h))
     if (added.length === 0)
       return
     throw new GuardRefusalError({
@@ -775,18 +795,25 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     // --- disable / unmount both unmount first ---
     // The confirm (cr.39): a busy mount (holders → a forced lazy unmount) and
     // anything riding the path (shares, exports, backup/cloud tasks, a nested
-    // mount — warn, never refuse) are both said before anything is done.
+    // mount — warn, never refuse) are both said before anything is done. An
+    // UNKNOWN holder listing (D3: neither lsof nor fuser answered) also
+    // confirms — the confirm says the holders could not be listed, never that
+    // there are none, and the unmount is not forced on an unknowable set.
     const disabling = action === 'disable'
     const verbing = VERBING[action]
-    const holders = pre.object.mounted ? await listHolders(executor, mp) : []
-    if (holders.length > 0 || pre.advisories.length > 0) {
+    const listing = pre.object.mounted ? await listHolders(executor, mp, procRoot) : null
+    const holders = listing?.state === 'listed' ? listing.holders : []
+    const holdersUnknown = listing?.state === 'unknown'
+    if (holders.length > 0 || holdersUnknown || pre.advisories.length > 0) {
       if (!guardConfirm(confirmStore, request, reply, spec, pre, {
         validated: { mountpoint: mp, action },
         address: ['mountpoint'],
         message: holders.length > 0
           ? `'${mp}' is busy — ${holders.length} process(es) are holding it`
-          : `${verbing} '${mp}' affects what is configured on it`,
-        warnings: [...busyWarnings(mp, holders), ...pre.advisories.map(a => a.warning)],
+          : holdersUnknown
+            ? `'${mp}' may be busy — its holders could not be listed`
+            : `${verbing} '${mp}' affects what is configured on it`,
+        warnings: [...busyWarnings(mp, holders, holdersUnknown), ...pre.advisories.map(a => a.warning)],
       })) {
         return reply
       }
@@ -862,7 +889,9 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       return sendRefusal(reply, pre.refusal)
     const { entry, mounted } = pre.object
     const credentialsFile = credentialsFileOf(pre.object)
-    const holders = mounted ? await listHolders(executor, mp) : []
+    const listing = mounted ? await listHolders(executor, mp, procRoot) : null
+    const holders = listing?.state === 'listed' ? listing.holders : []
+    const holdersUnknown = listing?.state === 'unknown'
 
     // Story cr.39 (WAVE3-DESIGN §2.5, §5.2): a remove ALWAYS confirms — it
     // deletes the line, the credentials file and (opted in) the directory —
@@ -874,7 +903,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       ...(mounted ? [`'${mp}' is unmounted now.`] : []),
       ...(credentialsFile ? [`The credentials file ${credentialsFile} is deleted if it exists and no other /etc/fstab line names it.`] : []),
       ...(removeMountpointDir ? [`The mountpoint directory '${mp}' is removed if it is empty (never its contents).`] : []),
-      ...busyWarnings(mp, holders),
+      ...busyWarnings(mp, holders, holdersUnknown),
       ...pre.advisories.map(a => a.warning),
     ]
     if (!guardConfirm(confirmStore, request, reply, spec, pre, {
@@ -1007,8 +1036,15 @@ function mountedIn(findmntText: string, mountpoint: string): boolean {
   return buildBaseInventory(findmntText, '', new Map()).find(r => r.mountpoint === mountpoint)?.mounted ?? false
 }
 
-/** The busy confirm's lines: the forced (lazy) unmount and who loses access. */
-function busyWarnings(mountpoint: string, holders: string[]): string[] {
+/**
+ * The busy confirm's lines: the forced (lazy) unmount and who loses access —
+ * or, when the holders could not be listed (D3), that fact and what follows
+ * from it: the unmount is not forced, so a busy mount fails the job before
+ * anything else is changed.
+ */
+function busyWarnings(mountpoint: string, holders: string[], holdersUnknown: boolean): string[] {
+  if (holdersUnknown)
+    return [`The processes holding '${mountpoint}' could not be listed (neither lsof nor fuser answered). The unmount is not forced: if '${mountpoint}' is busy, the job fails and nothing else is changed.`]
   if (holders.length === 0)
     return []
   return [`Unmounting '${mountpoint}' will be forced (lazy unmount); these holders lose access:`, ...holders]
@@ -1170,16 +1206,41 @@ function serializeInlineOptions(entry: MountEntry): string {
 }
 
 /**
- * List the processes holding a busy mountpoint via `lsof +f -- <mp>` (the
- * richest structured source; NOTES §5), as `COMMAND (pid N)` strings. Fail-open
- * to an empty list (nothing holding, or lsof unavailable).
+ * What the holder listing of a busy mountpoint says. `listed` is an ANSWER —
+ * possibly empty, meaning nothing holds it. `unknown` means no tool answered
+ * (D3): neither lsof nor fuser could be started, or the listing ran out of its
+ * budget. The confirm then says the holders could not be listed — never
+ * "none" — and nothing is force-detached on an unknowable holder set.
  */
-async function listHolders(executor: CommandExecutor, mountpoint: string): Promise<string[]> {
+type HolderListing
+  = | { state: 'listed', holders: string[] }
+    | { state: 'unknown' }
+
+/**
+ * List the processes holding a busy mountpoint, as `COMMAND (pid N)` strings,
+ * for the cr.39 confirm and the forced unmount's re-check (NOTES §5).
+ *
+ * `lsof +f -- <mp>` when lsof is on the node (the richest structured source).
+ * A stock PVE 9 node has fuser (psmisc) and no lsof (D3), so when lsof cannot
+ * be started the listing is {@link runFuser} — the `fuser -m <mp>` run and
+ * parser the busy diagnosis uses, holders rendered the way lsof's rows are so
+ * the confirm and the job's re-check agree. An lsof that TIMED OUT is not
+ * retried with fuser: it walks the same hung mount, and two 10 s budgets in a
+ * row overrun the gateway's 20 s — the listing is `unknown`.
+ */
+async function listHolders(executor: CommandExecutor, mountpoint: string, procRoot?: string): Promise<HolderListing> {
+  let r: ExecResult | null
   try {
-    const r = await executor.exec(LSOF, ['+f', '--', mountpoint])
-    const lines = r.stdout.split('\n').slice(1) // drop the header row
+    r = await executor.exec(LSOF, ['+f', '--', mountpoint])
+  }
+  catch (err) {
+    if (err instanceof CommandTimeoutError)
+      return { state: 'unknown' }
+    r = null // could not start (ENOENT/EACCES): no lsof on this node
+  }
+  if (r && !toolNotFound(r)) {
     const seen = new Map<string, string>()
-    for (const line of lines) {
+    for (const line of r.stdout.split('\n').slice(1)) { // drop the header row
       const cols = line.trim().split(WHITESPACE_RE)
       if (cols.length < 2)
         continue
@@ -1188,11 +1249,12 @@ async function listHolders(executor: CommandExecutor, mountpoint: string): Promi
         continue
       seen.set(pid, `${command} (pid ${pid})`)
     }
-    return [...seen.values()]
+    return { state: 'listed', holders: [...seen.values()] }
   }
-  catch {
-    return []
-  }
+  const holders = await runFuser(executor, mountpoint, procRoot ? { procRoot } : undefined)
+  if (holders === null)
+    return { state: 'unknown' }
+  return { state: 'listed', holders: holders.map(h => `${h.command} (pid ${h.pid})`) }
 }
 
 /** Directory contents, or null when the path does not exist. */

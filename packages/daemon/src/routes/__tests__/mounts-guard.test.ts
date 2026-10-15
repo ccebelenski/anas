@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { CommandTimeoutError } from '../../executor/deadline.js'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { disableMount } from '../../parsers/fstab.js'
 import { createServer } from '../../server.js'
@@ -45,7 +46,10 @@ import { credsFilePath } from '../../services/mounts.js'
  *    re-pointed from `/gtiscsi/images/lun2.raw` to a file under the mount;
  *  - holders: the `lsof +f -- /mnt/anas-cifs` block of
  *    `mounts/busy-unmount.txt` (two `sleep` holders), with one row dropped for
- *    the state the operator confirmed;
+ *    the state the operator confirmed; on a node without lsof (D3), the
+ *    `fuser -m` capture `busy/fuser-m-holders.txt` (pids 483284 483285), its
+ *    `/proc/<pid>/comm` names (`sleep`, busy/NOTES.md) seeded in a fake proc
+ *    tree, with one pid dropped for the confirmed state;
  *  - references: `samba/smb.conf` with `[media]`'s path re-pointed under the
  *    mount; a backup task is a real `anas-backup-*` unit (the daemon's writer).
  */
@@ -58,6 +62,14 @@ const FINDMNT = '/usr/bin/findmnt'
 const MOUNT = '/usr/bin/mount'
 const UMOUNT = '/usr/bin/umount'
 const LSOF = '/usr/bin/lsof'
+const FUSER = '/usr/bin/fuser'
+/**
+ * The `fuser -m /mnt/anas-ahr/tank` capture (busy/NOTES.md): two `sleep`
+ * holders, pids 483284 and 483285 — what a node without lsof lists (D3).
+ */
+const FUSER_TWO_HOLDERS = fixture('busy/fuser-m-holders.txt')
+/** The same capture with its second holder (pid 483285) not yet there. */
+const FUSER_ONE_HOLDER = rewrite(FUSER_TWO_HOLDERS, ' 483285', '')
 const SYSTEMCTL = '/usr/bin/systemctl'
 
 const NFS_MP = '/mnt/anas-nfs'
@@ -119,6 +131,8 @@ const BACKUP_ON_NFS: BackupTask = {
 }
 
 const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
+/** What `execFile` rejects with for a binary the node does not have. */
+const enoent = (bin: string): Error => Object.assign(new Error(`spawn ${bin} ENOENT`), { code: 'ENOENT' })
 
 /** A call that would mean a mount verb acted on the node. */
 function isMutation(c: { command: string, args: string[] }): boolean {
@@ -135,6 +149,7 @@ const ENV_KEYS = [
   'SMB_CONF_PATH',
   'ANAS_EXPORTS_PATH',
   'ANAS_SYSTEMD_DIR',
+  'ANAS_PROC_ROOT',
 ] as const
 
 describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
@@ -144,6 +159,15 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
   let calls: { command: string, args: string[] } [] = []
   /** What `lsof +f -- <mp>` answers right now (null: nothing holds it — the dev mock's answer). */
   let lsof: string | null = null
+  /**
+   * D3: how lsof fails — `missing` is a node without it (the exec rejects
+   * ENOENT, as `execFile` does), `hung` is its 10 s budget running out.
+   */
+  let lsofFails: 'missing' | 'hung' | null = null
+  /** What `fuser -m <mp>` answers right now (null: the dev mock's command-not-found, exit 127). */
+  let fuser: string | null = null
+  /** D3: fuser is not on the node either — its exec rejects ENOENT. */
+  let fuserMissing = false
   /** A command that does not return until the test releases it. */
   const paused = new Map<string, Promise<void>>()
   const saved: Partial<Record<typeof ENV_KEYS[number], string | undefined>> = {}
@@ -177,6 +201,9 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
   /** The dev mock over private copies of the captures; reads routed through the flippable state. */
   async function serve(fstab = FSTAB): Promise<void> {
     lsof = null
+    lsofFails = null
+    fuser = null
+    fuserMissing = false
     paused.clear()
     await writeFile(paths.fstab, fstab)
     await writeFile(paths.smb, fixture('samba/smb.conf'))
@@ -193,6 +220,10 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     process.env.SMB_CONF_PATH = paths.smb
     process.env.ANAS_EXPORTS_PATH = paths.exports
     process.env.ANAS_SYSTEMD_DIR = paths.systemd
+    // D3: the fuser fallback's `/proc/<pid>/comm` reads point at the test's
+    // fake proc tree, so the captured holder PIDs resolve to names.
+    process.env.ANAS_PROC_ROOT = join(dir, 'proc')
+    await mkdir(join(dir, 'proc'), { recursive: true })
     server = createServer({ mock: true, logger: false })
     const mock = (server as unknown as { executor: { exec: (c: string, a: string[], o?: unknown) => Promise<ExecResult> } }).executor
     const orig = mock.exec.bind(mock)
@@ -201,8 +232,16 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
       calls.push({ command, args })
       if (command === FINDMNT && args.length === 1 && args[0] === '--json')
         return ok(FINDMNT_FULL)
+      if (command === LSOF && lsofFails === 'missing')
+        throw enoent(LSOF)
+      if (command === LSOF && lsofFails === 'hung')
+        throw new CommandTimeoutError(LSOF, args, 'request', 10_000, false)
       if (command === LSOF && lsof !== null)
         return ok(lsof)
+      if (command === FUSER && fuserMissing)
+        throw enoent(FUSER)
+      if (command === FUSER && args[0] === '-m' && fuser !== null)
+        return ok(fuser)
       const hold = paused.get(command)
       if (hold)
         await hold
@@ -454,6 +493,111 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     const job = await finished(id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.ok(calls.some(c => c.command === UMOUNT && c.args[0] === '-l' && c.args[1] === CIFS_MP))
+  })
+
+  // -------------------------------------------------------------------------
+  // D3 (node pass wave 3): a PVE 9 node has fuser and no lsof
+  // -------------------------------------------------------------------------
+
+  /** The captured holders' `/proc/<pid>/comm` (busy/NOTES.md: both `sleep`). */
+  async function seedFuserHolders(): Promise<void> {
+    for (const pid of [483284, 483285]) {
+      await mkdir(join(dir, 'proc', String(pid)), { recursive: true })
+      await writeFile(join(dir, 'proc', String(pid), 'comm'), 'sleep\n')
+    }
+  }
+  const fuserCalls = (): number => calls.filter(c => c.command === FUSER).length
+  const FUSER_HOLDER_LINES = ['sleep (pid 483284)', 'sleep (pid 483285)']
+
+  it('D3: without lsof the busy confirm lists the holders fuser finds, and the confirmed job re-lists them with fuser and unmounts lazily', async () => {
+    await serve()
+    await seedFuserHolders()
+    lsofFails = 'missing'
+    fuser = FUSER_TWO_HOLDERS
+    const first = await send(state(NFS_MP, 'unmount'))
+    assert.equal(first.statusCode, 409, first.body)
+    assert.equal(first.json().error.message, `'${NFS_MP}' is busy — 2 process(es) are holding it`)
+    assert.deepEqual(first.json().error.warnings, [
+      `Unmounting '${NFS_MP}' will be forced (lazy unmount); these holders lose access:`,
+      ...FUSER_HOLDER_LINES,
+    ])
+    const release = holdSlots()
+    const res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 202, res.body)
+    const before = fuserCalls()
+    release()
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal(fuserCalls(), before + 1, 'the job re-lists the holders with fuser before the forced unmount')
+    assert.deepEqual(calls.filter(isMutation), [{ command: UMOUNT, args: ['-l', NFS_MP] }])
+  })
+
+  it('D3: without lsof, a holder fuser finds that the confirm did not name refuses the forced remove — no umount -l', async () => {
+    await serve()
+    await seedFuserHolders()
+    lsofFails = 'missing'
+    fuser = FUSER_ONE_HOLDER
+    const first = await send(remove(NFS_MP))
+    assert.equal(first.statusCode, 409)
+    assert.deepEqual(first.json().error.warnings.filter((w: string) => w.startsWith('sleep')), ['sleep (pid 483284)'])
+    const release = holdSlots()
+    const res = await send(remove(NFS_MP), first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 202, res.body)
+    fuser = FUSER_TWO_HOLDERS // a second process opens the mount
+    release()
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.match(job.error!.message, /holders the confirmation did not name \(sleep \(pid 483285\)\)/)
+    assert.deepEqual(calls.filter(isMutation), [])
+    assert.equal(await readFile(paths.fstab, 'utf8'), FSTAB)
+  })
+
+  it('D3: when neither lsof nor fuser answers, unmount, disable and remove confirm that the holders could not be listed, and the job does not force the unmount', async () => {
+    const unknownLine = `The processes holding '${NFS_MP}' could not be listed (neither lsof nor fuser answered). The unmount is not forced: if '${NFS_MP}' is busy, the job fails and nothing else is changed.`
+    for (const req of [state(NFS_MP, 'unmount'), state(NFS_MP, 'disable'), remove(NFS_MP)]) {
+      await serve()
+      lsofFails = 'missing'
+      fuserMissing = true
+      const first = await send(req)
+      assert.equal(first.statusCode, 409, `${req.method} ${req.url}: ${first.body}`)
+      assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+      if (req.method === 'POST')
+        assert.equal(first.json().error.message, `'${NFS_MP}' may be busy — its holders could not be listed`)
+      assert.ok(first.json().error.warnings.includes(unknownLine), `${req.method} ${req.url}: ${JSON.stringify(first.json().error.warnings)}`)
+      const res = await send(req, first.headers['x-anas-confirm-code'] as string)
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await finished((res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.deepEqual(calls.filter(c => c.command === UMOUNT), [{ command: UMOUNT, args: [NFS_MP] }], 'a plain umount: unknown holders are never force-detached')
+      await server!.close()
+      server = undefined
+    }
+  })
+
+  it('D3: an lsof that times out is not retried with fuser (same hung mount, two budgets past the gateway\'s 20 s) — the holders are unknown', async () => {
+    await serve()
+    lsofFails = 'hung'
+    fuser = FUSER_TWO_HOLDERS
+    const first = await send(state(NFS_MP, 'unmount'))
+    assert.equal(first.statusCode, 409, first.body)
+    assert.equal(first.json().error.message, `'${NFS_MP}' may be busy — its holders could not be listed`)
+    assert.equal(fuserCalls(), 0)
+  })
+
+  it('D3: holders listed at the confirm that cannot be listed again in the job refuse the forced unmount — no umount', async () => {
+    await serve()
+    await seedFuserHolders()
+    lsofFails = 'missing'
+    fuser = FUSER_TWO_HOLDERS
+    const { id, release } = await acceptedBehindFullQueue(state(NFS_MP, 'unmount'))
+    fuserMissing = true // fuser is gone before the job runs
+    release()
+    const job = await finished(id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.equal(job.error?.message, `The holders of mount '${NFS_MP}' could not be listed again before the forced unmount — nothing was done; confirm again`)
+    assert.deepEqual(calls.filter(isMutation), [])
   })
 
   it('remove ALWAYS confirms — an idle, unreferenced mount too — and the challenge names what it deletes', async () => {

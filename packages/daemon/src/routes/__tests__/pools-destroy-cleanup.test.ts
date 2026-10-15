@@ -2,7 +2,10 @@ import type { Job } from '@anas/shared'
 import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
 import { JobQueue } from '../../jobs/queue.js'
@@ -26,6 +29,7 @@ const LSBLK = '/usr/bin/lsblk'
 const BY_ID = '/dev/disk/by-id/'
 const BLKID = '/usr/sbin/blkid'
 const POOL_GUID = '9183729100142233021'
+const ZFS_FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/zfs')
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -384,6 +388,64 @@ describe('destroy cleanup: labelclear + ownership-guarded GPT zap (story 3.14)',
     ])
     for (const who of ['THEIRS', 'BLANK'])
       assert.equal(ex.calls.find(c => c.command !== BLKID && c.args.some(a => a.includes(`ata-${who}`))), undefined, `${who} never wiped or zapped`)
+  })
+
+  it('nf.2/D5: a pool with a cache and a spare — the confirm lists only the leaves the job wipes, and the job wipes exactly those', async () => {
+    // The stunt-node capture of one pool carrying all six vdev classes, one
+    // partition of sdb each (zfs/NOTES.md): sdb3 is the L2ARC, sdb4 the AVAIL
+    // spare — the shape of the node pass's D5 (`vdev-fixture.sh up`).
+    const status = readFileSync(join(ZFS_FIXTURES, 'zpool-status-all-vdev-classes-jv-2.4.4.json'), 'utf-8')
+    const ex = baseExecutor('gtvdev', status, byIdListing([]))
+    // After the wipe the cache and the spare partitions still carry their
+    // zfs_member labels (D5: `wipefs -n /dev/sdf3` → 4 zfs_member), so the
+    // whole disk is someone's: never zapped.
+    ex.addFixture({ command: LSBLK, args: ['-Jb', '-o', 'NAME,TYPE,FSTYPE,MOUNTPOINT', '/dev/sdb'], result: {
+      stdout: ownLsblk('sdb', [
+        { name: 'sdb1' },
+        { name: 'sdb2' },
+        { name: 'sdb3', fstype: 'zfs_member' },
+        { name: 'sdb4', fstype: 'zfs_member' },
+        { name: 'sdb5' },
+        { name: 'sdb6' },
+      ]),
+      stderr: '',
+      exitCode: 0,
+    } })
+    const built = await build(ex)
+    server = built.server
+    jobQueue = built.jobQueue
+
+    const first = await server.inject({ method: 'DELETE', url: '/v1/pools/gtvdev?cleanup=true', headers: IDENTITY_HEADERS })
+    assert.equal(first.statusCode, 409)
+    const warnings = first.json().error.warnings as string[]
+    const listed = warnings.find(w => w.startsWith('Disks to wipe: '))
+    assert.equal(listed, 'Disks to wipe: sdb1, sdb2, sdb5, sdb6.')
+    assert.deepEqual(warnings.filter(w => w.includes(' is not wiped: ')), [
+      'sdb3 is not wiped: a cache (L2ARC) device\'s ZFS label names no pool.',
+      'sdb4 is not wiped: a hot spare\'s ZFS label names no pool (a spare can serve other pools).',
+    ])
+
+    // The cleanup destroy still confirms and runs: the code minted with this
+    // scope verifies against the scope the job's guard reads.
+    const res = await server.inject({
+      method: 'DELETE',
+      url: '/v1/pools/gtvdev?cleanup=true',
+      headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string },
+    })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(jobQueue, (res.json() as { job: { id: string } }).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const r = job.result as Result
+    // What was listed is what was wiped — the same set, read off the confirm.
+    assert.deepEqual(r.wiped, listed!.slice('Disks to wipe: '.length, -1).split(', '))
+    assert.deepEqual(r.skipped, [
+      { leaf: 'sdb3', reason: 'not cleaned: a cache (L2ARC) device\'s ZFS label names no pool' },
+      { leaf: 'sdb4', reason: 'not cleaned: a hot spare\'s ZFS label names no pool (a spare can serve other pools)' },
+    ])
+    assert.equal(r.zapped, undefined)
+    assert.deepEqual(r.preserved, [{ disk: 'sdb', reason: 'shared' }])
+    // The kept leaves were never read, cleared or wiped.
+    assert.equal(ex.calls.find(c => c.args.some(a => a === '/dev/sdb3' || a === '/dev/sdb4')), undefined)
   })
 
   it('ident.1 (j) the pool guid changed between the challenge and the resend → 409 IDENTITY_MISMATCH naming both, with a fresh code', async () => {
