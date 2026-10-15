@@ -9918,6 +9918,9 @@ const GROUP_ROWS = [
   { name: 'alice', gid: 2000, members: ['Alice'], local: true, privateGroupOf: 'Alice' },
   { name: 'smbusers', gid: 1001, members: ['Alice', 'backup-svc'], local: true },
   { name: 'adgroup', gid: 6001, members: ['aduser'], local: false },
+  // GET /identity/groups keeps gid 0 (isShareRelevant: root owns files);
+  // `users` (gid 100) is outside the band it lists, so it is never here.
+  { name: 'root', gid: 0, members: [], local: true },
 ]
 const USER_ROUTES = {
   'GET /identity/users': { data: USER_ROWS },
@@ -10018,10 +10021,23 @@ async function shareUsersChecks() {
     const pg = win.down('#primaryGroup')
     ok('create (cr.29c): the primary-group choice is a combobox in the same section', !!pg && pg.xtype === 'combobox' && pg.parent === adv, pg && pg.xtype)
     eq('create (cr.29c): it is labelled plainly and says the default', pg && [pg.fieldLabel, pg.emptyText, pg.forceSelection], ['Primary group', '(optional — default: users)', true])
-    ok('create (cr.29c): it offers the groups the node lists',
-      !!pg && pg.store.getCount() === GROUP_ROWS.length && pg.store.getAt(1).get('name') === 'smbusers',
-      pg && pg.store.getCount())
+    // cr.29b: only the groups the daemon accepts as a primary group — `users`
+    // (gid 100, the default; the list never carries it) first, then every
+    // listed group in the share band [1000, 60000]. root (gid 0) would be a
+    // SYSTEM_ACCOUNT 409, so it is not offered.
+    eq('create (cr.29b): it offers users, then the band groups the node lists — never root',
+      pg && pg.store.getRange().map(r => r.get('name')), ['users', 'alice', 'smbusers', 'adgroup'])
+    ok('create (cr.29b): …a directory group in the band is offered (the daemon resolves it through getent)',
+      !!pg && pg.store.findExact('name', 'adgroup') >= 0)
+    eq('create (cr.29b): users is shown as the default', pg && pg.getValue(), 'users')
+    ok('create (cr.29b): the supplementary Groups list is a different store (unchanged)',
+      !!pg && win.down('#groups').store !== pg.store)
     jobs.length = 0
+    win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
+    await settle()
+    eq('create (cr.29b): the default primary group (users) is not sent', jobs[0] && jobs[0].body, { name: 'Alice' })
+    jobs.length = 0
+    pg.setValue('')
     win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
     await settle()
     eq('create (cr.29c): an EMPTY primary group is not sent', jobs[0] && jobs[0].body, { name: 'Alice' })

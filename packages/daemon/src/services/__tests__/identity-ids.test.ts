@@ -7,6 +7,7 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { CommandTimeoutError } from '../../executor/deadline.js'
 import { MockExecutor } from '../../executor/mock.js'
+import { mockFixtures } from '../../fixtures/loader.js'
 import { GuardReads } from '../../safety/guard.js'
 import {
   ID_PICK_TRIES,
@@ -39,6 +40,11 @@ import { mountIndex } from '../nested-filesystems.js'
  *  - `getent passwd <n>`: exit 2 and no output for a number nobody holds
  *    (getent(1): "One or more supplied key could not be found"); a holder is
  *    a passwd line.
+ *  - `timeout … stat -f` (cr.29b, the root-exists probe after a failed find):
+ *    `fixtures/mounts/stat-f-exit-codes.txt` (stunt node, story 18.1) through
+ *    `mockFixtures.statF` — "ext4 root (healthy local)" for a root that
+ *    exists, "nonexistent path" for one that does not, the ESTALE case for
+ *    one that cannot be read.
  */
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -60,6 +66,7 @@ const ZFS = '/usr/sbin/zfs'
 const FIND = '/usr/bin/find'
 const FINDMNT = '/usr/bin/findmnt'
 const GETENT = '/usr/bin/getent'
+const TIMEOUT = '/usr/bin/timeout'
 const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
 
 /** The smb.conf of these tests: one share on ext4 `/srv/smb/share1` (the 18.1 Samba share), one on ZFS. */
@@ -75,6 +82,8 @@ interface Node {
   holders: Record<number, string>
   /** getent group <n> holders (cr.29c); absent = nobody. */
   groupHolders?: Record<number, string>
+  /** cr.29b: walk roots that do not exist (find fails; stat says ENOENT). */
+  missing?: string[]
   fail?: (command: string, args: string[]) => ExecResult | 'timeout' | undefined
 }
 
@@ -94,6 +103,16 @@ function fakeNode(node: Node): { executor: MockExecutor, calls: { command: strin
       return ok(spaceOutput(node.userspace[args.at(-1)!] ?? []))
     if (command === FINDMNT)
       return ok(FINDMNT_FULL)
+    if (command === TIMEOUT && args.includes('-f')) {
+      // `timeout -k 1 2 stat -f -c %t -- <path>` (services/share-path.ts).
+      return node.missing?.includes(args.at(-1)!)
+        ? mockFixtures.statF('nonexistent path')
+        : mockFixtures.statF('ext4 root (healthy local)')
+    }
+    if (command === FIND && node.missing?.includes(args[1])) {
+      // find(1) on an absent start point: its complaint, exit 1, no output.
+      return { stdout: '', stderr: `find: '${args[1]}': No such file or directory\n`, exitCode: 1 }
+    }
     if (command === FIND) {
       const root = args[1]
       const test = args.includes('-uid') ? args.indexOf('-uid') : args.indexOf('-gid')
@@ -223,6 +242,46 @@ describe('cr.29 — does an id own anything?', () => {
     assert.deepEqual(await idOwnership('uid', 1005, opts(hit.executor)), { owns: true, where: `'/srv/smb/share1/a'` })
     const miss = fakeNode({ ...BASE, fail: c => c === FIND ? { stdout: '', stderr: 'find: ‘/srv/smb/share1/gone’: No such file or directory', exitCode: 1 } : undefined })
     assert.deepEqual(await idOwnership('uid', 1005, opts(miss.executor)), { unreadable: `the files under '/srv/smb/share1' (find: find: ‘/srv/smb/share1/gone’: No such file or directory)` })
+  })
+
+  it('cr.29b: a share root that does not exist owns nothing — find fails, stat says ENOENT, and the answer is owns: false', async () => {
+    const { executor, calls } = fakeNode({ ...BASE, missing: ['/srv/smb/share1'] })
+    assert.deepEqual(await idOwnership('uid', 1005, opts(executor)), { owns: false })
+    // The probe is the share list's own (timeout, stat -f, C locale), asked
+    // only after the find failed.
+    const probe = calls.find(c => c.command === TIMEOUT)
+    assert.deepEqual(probe?.args, ['-k', '1', '2', '/usr/bin/stat', '-f', '-c', '%t', '--', '/srv/smb/share1'])
+    assert.ok(calls.findIndex(c => c.command === FIND) < calls.findIndex(c => c.command === TIMEOUT))
+    // A root that exists is never stat'ed: a clean find is the whole answer.
+    const clean = fakeNode(BASE)
+    await idOwnership('uid', 1005, opts(clean.executor))
+    assert.equal(clean.calls.some(c => c.command === TIMEOUT), false)
+  })
+
+  it('cr.29b: a missing root no longer blocks the pick — it picks the next id as if the root were empty', async () => {
+    const { executor } = fakeNode({ ...BASE, missing: ['/srv/smb/share1'] })
+    const r = await pickId('uid', [0, 1000, 1004], reservations(), opts(executor))
+    assert.deepEqual(r, { id: 1005, skipped: [] })
+  })
+
+  it('cr.29b: a root that EXISTS but could not be walked, or cannot be stat\'ed, still refuses (permission, I/O, stale handle)', async () => {
+    const denied = 'find: \'/srv/smb/share1/private\': Permission denied'
+    // The root exists (stat answers): find's failure stands.
+    const exists = fakeNode({ ...BASE, fail: c => c === FIND ? { stdout: '', stderr: denied, exitCode: 1 } : undefined })
+    assert.deepEqual(await idOwnership('uid', 1005, opts(exists.executor)), { unreadable: `the files under '/srv/smb/share1' (find: ${denied})` })
+    // The root itself cannot be stat'ed (ESTALE): not "missing", so it refuses.
+    const stale = fakeNode({ ...BASE, fail: (c) => {
+      if (c === FIND)
+        return { stdout: '', stderr: 'find: \'/srv/smb/share1\': Stale file handle', exitCode: 1 }
+      if (c === TIMEOUT)
+        return mockFixtures.statF('ESTALE: held CWD in a subdir whose server-side inode was removed')
+      return undefined
+    } })
+    const r = await idOwnership('uid', 1005, opts(stale.executor))
+    assert.ok('unreadable' in r && /Stale file handle/.test(r.unreadable), JSON.stringify(r))
+    // …and the pick refuses with it, never a guess.
+    const pick = await pickId('uid', [0, 1000], reservations(), opts(fakeNode({ ...BASE, fail: c => c === FIND ? { stdout: '', stderr: denied, exitCode: 1 } : undefined }).executor))
+    assert.equal('refusal' in pick && pick.refusal, 'unreadable')
   })
 
   it('every source that cannot be read is named: zfs list, zfs userspace, an unknown userspace shape, findmnt, smb.conf, /etc/exports', async () => {

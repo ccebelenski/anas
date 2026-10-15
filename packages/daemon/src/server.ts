@@ -797,7 +797,9 @@ export function createServer(opts?: ServerOptions) {
     exportsPath,
     // The dev mock never spawns anything, so probing the real /usr/bin/smbpasswd
     // would make the SMB paths untestable on a machine without samba.
-    ...(opts?.mock ? { smbpasswdAvailable: async () => true } : {}),
+    // cr.29d: the user delete reads USERGROUPS_ENAB from the node's
+    // login.defs; the mock leaves it unset (PVE's `yes`, never the host's file).
+    ...(opts?.mock ? { smbpasswdAvailable: async () => true } : { loginDefsPath: '/etc/login.defs' }),
   })
   // Recurring replication tasks (Epic 5.5.3) — units-as-store CRUD + status.
   server.register(replicationTaskRoutes, { prefix: '/v1', executor, jobQueue, systemdDir, transport })

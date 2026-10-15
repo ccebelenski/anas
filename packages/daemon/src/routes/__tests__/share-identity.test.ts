@@ -742,12 +742,15 @@ describe('share-identity routes', () => {
       assert.equal(first.statusCode, 409)
       const challenged = first.json() as { error: { code: string, warnings: string[] } }
       assert.equal(challenged.error.code, 'CONFIRMATION_REQUIRED')
-      assert.equal(challenged.error.warnings.length, 3)
+      // cr.29d: five — Alice's private group (gid 1000, only Alice in it) goes with her.
+      assert.equal(challenged.error.warnings.length, 5)
       assert.match(challenged.error.warnings[0], /removed from the system/)
       // cr.29: the number stays on the files, said once, with what cannot be checked.
       assert.equal(challenged.error.warnings[1], 'Files owned by this user keep uid 1000. ANAS will not give uid 1000 to a new user while it still owns files on an imported ZFS filesystem or under a share, but it cannot check ids seen only in exported pools, on disconnected disks or in backups. To give the files back later, re-create the user with User ID 1000.')
       assert.equal(challenged.error.warnings.filter(w => w.includes('keep uid')).length, 1)
       assert.match(challenged.error.warnings[2], /SMB password entry will be removed/)
+      assert.match(challenged.error.warnings[3], /^Its group 'Alice' \(gid 1000\) will be removed too/)
+      assert.match(challenged.error.warnings[4], /^Files owned by this group keep gid 1000\./)
       const code = first.headers['x-anas-confirm-code'] as string
       assert.ok(code)
 
@@ -758,7 +761,7 @@ describe('share-identity routes', () => {
       assert.equal(accepted.job.operation, 'identity.user.delete')
       const job = await waitForQueueJob(accepted.job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: true })
+      assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: true, groupRemoved: 'Alice' })
 
       // Exact argv, in order (identity.2 order, identity.3 verb): the SMB
       // entry is dropped FIRST, by its STORED name (ALICE — found case-folded)
@@ -802,15 +805,16 @@ describe('share-identity routes', () => {
       const first = await del('/v1/identity/users/Alice')
       assert.equal(first.statusCode, 409)
       const challenged = first.json() as { error: { warnings: string[] } }
-      // Two warnings only — the SMB line is absent, not a blank.
-      assert.equal(challenged.error.warnings.length, 2)
+      // No SMB line — absent, not a blank (the other two are Alice's group, cr.29d).
+      assert.equal(challenged.error.warnings.length, 4)
+      assert.equal(challenged.error.warnings.some(w => /SMB/.test(w)), false)
       const code = first.headers['x-anas-confirm-code'] as string
 
       const ok = await del('/v1/identity/users/Alice', code)
       assert.equal(ok.statusCode, 202)
       const job = await waitForQueueJob((ok.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: false })
+      assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: false, groupRemoved: 'Alice' })
       assert.equal(executor.calls.some(c => c.command === '/usr/bin/smbpasswd'), false)
       assert.equal(find(executor.calls, '/usr/bin/pdbedit', a => a[0] === '-x'), undefined)
     })
@@ -820,14 +824,14 @@ describe('share-identity routes', () => {
       await bootNode({ smbConf: CLEAN_SMB_CONF, pdbedit: 'alice:4294967295:\n' })
       const first = await del('/v1/identity/users/Alice')
       const challenged = first.json() as { error: { warnings: string[] } }
-      assert.equal(challenged.error.warnings.length, 3)
+      assert.equal(challenged.error.warnings.length, 5)
       assert.match(challenged.error.warnings[2], /SMB password entry will be removed/)
       const code = first.headers['x-anas-confirm-code'] as string
 
       const ok = await del('/v1/identity/users/Alice', code)
       const job = await waitForQueueJob((ok.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: true })
+      assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: true, groupRemoved: 'Alice' })
       const seq = executor.calls
         .filter(c => (c.command === '/usr/bin/pdbedit' && c.args[0] === '-x') || c.command === '/usr/sbin/userdel')
         .map(c => [c.command, ...c.args])
@@ -843,12 +847,12 @@ describe('share-identity routes', () => {
       await bootNode({ smbConf: CLEAN_SMB_CONF, pdbedit: 'alice:1005:\n' })
       const first = await del('/v1/identity/users/Alice')
       const challenged = first.json() as { error: { warnings: string[] } }
-      assert.equal(challenged.error.warnings.length, 2)
+      assert.equal(challenged.error.warnings.length, 4)
       const code = first.headers['x-anas-confirm-code'] as string
       const ok = await del('/v1/identity/users/Alice', code)
       const job = await waitForQueueJob((ok.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: false })
+      assert.deepEqual(job.result, { deleted: 'Alice', smbEntryRemoved: false, groupRemoved: 'Alice' })
       assert.equal(find(executor.calls, '/usr/bin/pdbedit', a => a[0] === '-x'), undefined)
     })
 

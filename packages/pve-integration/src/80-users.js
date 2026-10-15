@@ -347,12 +347,36 @@
     // read the same /identity endpoints the grids do. Best-effort: a load
     // failure leaves an empty pick list, and the tagfields allow free entry.
 
-    function loadGroupNames(node, store) {
+    // cr.29b: the default primary group of a user ANAS creates (useradd -N →
+    // /etc/default/useradd GROUP=100, probe P06). The daemon accepts it by name
+    // as the one primary group outside the share band; GET /identity/groups
+    // does not list it (gid 100 is outside the band it lists).
+    var DEFAULT_PRIMARY_GROUP = 'users';
+
+    // cr.29b: the primary groups the daemon accepts — `users` first (the
+    // default), then every listed group in the share band. root (gid 0, which
+    // the list keeps because it owns files) and any other system group would
+    // be refused with SYSTEM_ACCOUNT, so they are not offered.
+    function primaryGroupRows(rows) {
+        var data = [{ name: DEFAULT_PRIMARY_GROUP }];
+        for (var i = 0; i < rows.length; i++) {
+            var gid = rows[i].gid;
+            if (typeof gid === 'number' && gid >= ID_MIN && gid <= ID_MAX && rows[i].name !== DEFAULT_PRIMARY_GROUP) {
+                data.push({ name: rows[i].name });
+            }
+        }
+        return data;
+    }
+
+    function loadGroupNames(node, store, primaryStore) {
         ANAS.api.get(node, '/identity/groups').then(function (res) {
+            var rows = (res && res.data) || [];
+            if (primaryStore && !primaryStore.destroyed) {
+                primaryStore.loadData(primaryGroupRows(rows));
+            }
             if (!store || store.destroyed) {
                 return;
             }
-            var rows = (res && res.data) || [];
             var data = [];
             for (var i = 0; i < rows.length; i++) {
                 data.push({ name: rows[i].name });
@@ -419,6 +443,8 @@
 
     function openUserCreate(node, view) {
         var groupStore = Ext.create('Ext.data.Store', { fields: ['name'], data: [] });
+        // Seeded with the default so the combo shows it before the list loads.
+        var primaryStore = Ext.create('Ext.data.Store', { fields: ['name'], data: primaryGroupRows([]) });
         var win;
         try {
             win = Ext.create('Ext.window.Window', {
@@ -492,17 +518,20 @@
                             idField('uid', 'anas-fld-user-uid', 'User ID (optional)'),
                             {
                                 // cr.29c: an existing group as the PRIMARY
-                                // group (useradd -g, no private group). Empty
-                                // = the default primary group, users.
+                                // group (useradd -g, no private group).
+                                // cr.29b: only the groups the daemon accepts
+                                // (primaryGroupRows), `users` shown as the
+                                // default — and, left at it, not sent.
                                 xtype: 'combobox',
                                 itemId: 'primaryGroup',
                                 cls: 'anas-fld-user-primary-group',
                                 fieldLabel: t('Primary group'),
-                                store: groupStore,
+                                store: primaryStore,
                                 displayField: 'name',
                                 valueField: 'name',
                                 queryMode: 'local',
                                 forceSelection: true,
+                                value: DEFAULT_PRIMARY_GROUP,
                                 emptyText: t('(optional — default: users)'),
                             },
                         ]),
@@ -540,7 +569,7 @@
             return;
         }
         win.show();
-        loadGroupNames(node, groupStore);
+        loadGroupNames(node, groupStore, primaryStore);
     }
 
     function submitUserCreate(win, node, view) {
@@ -579,7 +608,9 @@
         if (uid !== null) {
             body.uid = uid;
         }
-        if (primaryGroup) {
+        // The default (`users`) is what the daemon does without the key: send
+        // only a choice that differs from it.
+        if (primaryGroup && primaryGroup !== DEFAULT_PRIMARY_GROUP) {
             body.primaryGroup = primaryGroup;
         }
         var fullName = trim(win.down('#fullName').getValue());

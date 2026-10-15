@@ -10,6 +10,7 @@ import { isMutableShareId, parseGroups, parsePasswd } from '../parsers/getent.js
 import { parseSmbConf } from '../parsers/smb-conf.js'
 import { findPathPattern, walkScopeFrom } from './access-walk.js'
 import { isUnwalkableKind, kindOfMount, mountIndex, normalizePath } from './nested-filesystems.js'
+import { probeSharePath } from './share-path.js'
 
 // ============================================================================
 // Which uid / gid a new share user or group gets (story cr.29, ruled
@@ -55,6 +56,11 @@ import { isUnwalkableKind, kindOfMount, mountIndex, normalizePath } from './nest
 //     and armed automounts are never walked (nf.1's rule — walking a dead NFS
 //     server hangs, walking an automount arms it); their files are numbered
 //     by another host.
+//     A share root that does not exist owns nothing (cr.29b): when find fails
+//     without a match, the root is stat'ed (services/share-path.ts, the
+//     share list's own `timeout stat -f` probe, C locale) and ENOENT/ENOTDIR
+//     — `missing` — counts as an answer, "nothing here". Any other failure
+//     (permission, I/O, a stale handle, no answer in time) still refuses.
 //
 // The whole check shares one deadline per guard run ({@link ID_CHECK_BUDGET_MS}),
 // so the route answers well inside the gateway's 20 s (cr.35 ladder: 10 s +
@@ -289,6 +295,17 @@ function zfsOwners(kind: IdKind, o: OwnershipReadOpts, datasets: string[]): Prom
 }
 
 /**
+ * cr.29b: is a walk root ABSENT (ENOENT / ENOTDIR — a share or export whose
+ * path was removed)? Asked only after a find that failed without a match, once
+ * per root and guard run. Only the probe's `missing` is true: an existing
+ * root, an unreadable one (EACCES, EIO, ESTALE) and one that does not answer
+ * are all false, so the find's failure stands and the check refuses.
+ */
+function rootIsMissing(o: OwnershipReadOpts, path: string): Promise<boolean> {
+  return o.reads.once(`idcheck:missing:${path}`, async () => (await probeSharePath(o.executor, path)).state === 'missing')
+}
+
+/**
  * Does `id` own anything under the paths ANAS manages? Reads are shared
  * through `reads`, so a pick that checks several candidates lists the
  * datasets, reads the accounting and the mount table once.
@@ -316,7 +333,7 @@ export async function idOwnership(kind: IdKind, id: number, o: OwnershipReadOpts
       if (first)
         return first
       if (r.exitCode !== 0)
-        return failed(what, 'find', r)
+        return (await rootIsMissing(o, root.path)) ? '' : failed(what, 'find', r)
       return ''
     }))
     if (typeof hit !== 'string')

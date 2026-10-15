@@ -69,6 +69,63 @@ const SYSTEM_IDS = `uid/gid below ${SHARE_ID_MIN} or above ${SHARE_ID_MAX}`
  */
 const DEFAULT_PRIMARY_GID = 100
 
+/** A login.defs `USERGROUPS_ENAB <value>` line, and a double-quoted value. */
+const USERGROUPS_ENAB_RE = /^\s*USERGROUPS_ENAB\s+(\S(?:.*\S)?)\s*$/
+const QUOTED_RE = /^"(.*)"$/
+
+/**
+ * Does `userdel` remove a user's same-named group on this node (cr.29d)?
+ * login.defs(5), USERGROUPS_ENAB: "If set to yes, userdel will remove the
+ * user's group if it contains no more members, and useradd will create by
+ * default a group with the name of the user." shadow's getdef reads `NAME
+ * value` lines (`#` starts a comment, a later line wins, the value may be
+ * double-quoted), and getdef_bool is true only for `yes`, in any case.
+ *
+ * `text` null = the file could not be read. Fail closed: only a readable file
+ * that SETS the key to something other than `yes` says no. An unreadable file,
+ * an absent one, or one without the key reads as yes (PVE 9.2 ships
+ * `USERGROUPS_ENAB yes`, probe P06), so ANAS never misses a group userdel would
+ * take; at worst it names one that would have stayed.
+ */
+export function userdelRemovesUserGroup(text: string | null): boolean {
+  if (text === null)
+    return true
+  let value: string | undefined
+  for (const raw of text.split('\n')) {
+    const m = USERGROUPS_ENAB_RE.exec(raw)
+    if (m)
+      value = m[1].replace(QUOTED_RE, '$1')
+  }
+  return value === undefined || value.toLowerCase() === 'yes'
+}
+
+/**
+ * The group `userdel <name>` removes with the user (cr.29d), or null.
+ *
+ * shadow's userdel has no option to keep it: its getopt string is `fhrR:P:Z`
+ * (src/userdel.c, shadow 4.17.4 and 4.19.0; `userdel -K …` answers "invalid
+ * option -- 'K'" on 4.19.0 — the `-K KEY=VALUE` override is useradd's, not
+ * userdel's), and with
+ * USERGROUPS_ENAB its update_groups() first drops the user from every member
+ * list, then calls remove_usergroup(), which removes the group NAMED like the
+ * user unless (1) its gid is not the user's primary gid, (2) it still has
+ * members, or (3) — without `-f`, which ANAS never passes — another account
+ * has it as its primary group. userdel(8) says the same: "userdel will delete
+ * the group with the same name as the user … will check that this group is not
+ * used as a primary group for another user". This mirrors those three checks
+ * on what the node has now: `group` from the LOCAL files DB (userdel works on
+ * /etc/group), `users` every account (`getent passwd`).
+ */
+export function groupRemovedWithUser(user: PasswdEntry, group: GroupEntry | undefined, users: PasswdEntry[]): GroupEntry | null {
+  if (!group || group.name !== user.name || group.gid !== user.gid)
+    return null
+  if (group.members.some(m => m !== user.name))
+    return null
+  if (users.some(u => u.name !== user.name && u.gid === group.gid))
+    return null
+  return group
+}
+
 /**
  * The create confirms' unsigned fields (cr.29c; WAVE3-DESIGN §5.2: each named
  * with its reason, and a test lists them).
@@ -128,6 +185,13 @@ export interface ShareIdentityRouteOptions {
    * per guard run); tests shorten them.
    */
   idCheck?: Pick<OwnershipReadOpts, 'now' | 'budgetMs'>
+  /**
+   * Absolute path to /etc/login.defs: the user delete reads USERGROUPS_ENAB
+   * from it to tell whether `userdel` also removes the user's group (cr.29d).
+   * Unset (the dev mock, tests that do not ask): PVE's default, `yes` (probe
+   * P06), is assumed without reading anything.
+   */
+  loginDefsPath?: string
   /**
    * Is `smbpasswd` present and executable on this node? Defaults to a real
    * access(X_OK) probe. The dev mock overrides it to `true` (nothing is ever
@@ -400,9 +464,55 @@ export async function shareIdentityRoutes(
         return null
       }
     }),
+    /** cr.29d: does userdel remove a user's same-named group here (login.defs USERGROUPS_ENAB)? */
+    usergroupsEnab: (reads: GuardReads) => reads.once('login.defs', async (): Promise<boolean> => {
+      if (opts.loginDefsPath === undefined)
+        return true
+      let text: string | null
+      try {
+        text = await readConfig(opts.loginDefsPath)
+      }
+      catch {
+        text = null
+      }
+      return userdelRemovesUserGroup(text)
+    }),
+    /** Every LOCAL group (`getent -s files group`), STRICT: null when it could not be read. */
+    localGroupsStrict: (reads: GuardReads) => reads.once('group:files:strict', async (): Promise<GroupEntry[] | null> => {
+      const r = await executor.exec(GETENT, ['-s', 'files', 'group'])
+      return r.exitCode !== 0 && !r.stdout.trim() ? null : parseGroups(r.stdout)
+    }),
   }
 
-  interface UserObject { name: string, entry: PasswdEntry, local: boolean }
+  /**
+   * What `userdel` does to the user's same-named group (cr.29d): `group` the
+   * one it removes (null: none), or the database that could not be read.
+   */
+  type UserGroupFate = { group: GroupEntry | null } | { unreadable: string }
+
+  interface UserObject {
+    name: string
+    entry: PasswdEntry
+    local: boolean
+    /** The delete only (cr.29d): the group userdel will remove with the user. */
+    fate?: UserGroupFate
+  }
+
+  /** {@link groupRemovedWithUser} on what the node has now (cr.29d). */
+  async function userGroupFate(entry: PasswdEntry, reads: GuardReads): Promise<UserGroupFate> {
+    if (!(await idReads.usergroupsEnab(reads)))
+      return { group: null }
+    const local = await idReads.localGroupsStrict(reads)
+    if (local === null)
+      return { unreadable: 'the local group file (getent -s files group)' }
+    const group = local.find(g => g.name === entry.name)
+    if (!group)
+      return { group: null }
+    const users = await idReads.users(reads)
+    if (users === null)
+      return { unreadable: 'the account database (getent passwd)' }
+    return { group: groupRemovedWithUser(entry, group, users) }
+  }
   interface GroupObject { name: string, entry: GroupEntry, local: boolean }
   /** A create's object: the name it claims (no id exists yet). */
   interface NameSlot { name: string }
@@ -559,6 +669,42 @@ export async function shareIdentityRoutes(
     return refs.length > 0 ? referencedRefusal('group', o.name, refs) : null
   }
 
+  /**
+   * cr.29d: a user delete never removes a group behind the group delete's
+   * gates. When userdel will take the user's same-named group with it (see
+   * {@link groupRemovedWithUser}), that group passes the group delete's own
+   * gates first — the band (cr.3) and the share references (cr.30); local is
+   * given (userdel removes it from /etc/group) and "nobody else's primary
+   * group" is userdel's own condition. A refusal keeps the group gate's code
+   * and reason, its sentence led by why the user delete reached the group.
+   */
+  const userGroupGate: Gate<UserObject> = async (o, reads) => {
+    const fate = o.fate
+    if (!fate)
+      return null
+    if ('unreadable' in fate) {
+      return {
+        status: 503,
+        code: 'UNAVAILABLE',
+        message: `ANAS could not read ${fate.unreadable}, so it cannot tell whether deleting user '${o.name}' would also remove its group '${o.name}' — nothing was done`,
+      }
+    }
+    const group = fate.group
+    if (!group)
+      return null
+    const target: GroupObject = { name: group.name, entry: group, local: true }
+    for (const gate of [mutableGroupGate, groupNotReferencedGate]) {
+      const refused = await gate(target, reads)
+      if (refused) {
+        return {
+          ...refused,
+          message: `Deleting user '${o.name}' would also remove group '${group.name}' (gid ${group.gid}): userdel removes a user's same-named primary group when no other account uses it, and that group cannot be deleted. ${refused.message}`,
+        }
+      }
+    }
+    return null
+  }
+
   /** A gate that could not read the account database refuses (fail closed, §3.2). */
   function accountsUnreadable(check: string): Refusal {
     return { status: 503, code: 'UNAVAILABLE', message: `ANAS could not read the account database (getent passwd), so it cannot check ${check} — nothing was done` }
@@ -579,10 +725,10 @@ export async function shareIdentityRoutes(
   }
 
   /** The delete's one advisory: smb.conf could not be read, so the reference gate saw nothing. */
-  async function smbConfAdvisories(reads: GuardReads, name: string, isGroup: boolean): Promise<Advisory[]> {
+  async function smbConfAdvisories(reads: GuardReads, name: string, isGroup: boolean, whom?: string): Promise<Advisory[]> {
     const { unknown } = await sharesReferencing(reads, name, isGroup)
     return unknown
-      ? [{ key: 'unreadable:smb.conf', warning: `ANAS could not read smb.conf to check for share references. If this node has SMB shares, verify none of them names this ${isGroup ? 'group' : 'user'} before confirming.` }]
+      ? [{ key: 'unreadable:smb.conf', warning: `ANAS could not read smb.conf to check for share references. If this node has SMB shares, verify none of them names ${whom ?? `this ${isGroup ? 'group' : 'user'}`} before confirming.` }]
       : []
   }
 
@@ -611,30 +757,67 @@ export async function shareIdentityRoutes(
    *    deleted and re-created under the name is another user;
    *  - gates: local, band, then per verb — the SMB password re-checks Samba
    *    and the passdb entry's owner, the delete re-runs the share references;
+   *  - scope (delete, cr.29d): the group userdel removes with the user, so
+   *    the confirm binds it and a job that would remove another (or one the
+   *    confirm did not name) refuses;
    *  - advisories (delete): an smb.conf that could not be read;
-   *  - locks: `uid:<n>` exclusive; the delete also takes the name key.
+   *  - locks: `uid:<n>` exclusive; the delete also takes the name key, and
+   *    the `gid:<n>` key of the group it removes.
    */
   function userGuardSpec(name: string, verb: UserVerb): GuardSpec<UserObject> {
     const gates: Gate<UserObject>[] = [localUserGate, mutableUserGate]
     if (verb === 'smb-password')
       gates.push(sambaInstalledGate('The password was NOT changed.'), passdbNotOwnedGate)
     if (verb === 'delete')
-      gates.push(userNotReferencedGate)
+      gates.push(userNotReferencedGate, userGroupGate)
+    const goingGroup = (o: UserObject): GroupEntry | null => o.fate && 'group' in o.fate ? o.fate.group : null
     return {
       operation: verb === 'smb-password' ? 'identity.smbpasswd.set' : `identity.user.${verb}`,
       object: {
         what: `User '${name}'`,
         read: async (reads) => {
           const entry = await idReads.user(reads, name)
-          return entry ? { name, entry, local: await isLocalUser(name) } : null
+          if (!entry)
+            return null
+          const object: UserObject = { name, entry, local: await isLocalUser(name) }
+          if (verb === 'delete')
+            object.fate = await userGroupFate(entry, reads)
+          return object
         },
         notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `User '${name}' not found` }),
         id: async o => ({ uid: String(o.entry.uid) }),
-        unbound: () => `Could not read the uid of user '${name}' — refusing`,
+        ...(verb === 'delete'
+          ? {
+              // cr.29d: '' = userdel removes no group; an unreadable fate is
+              // an unbound scope (the route's gate has refused it already).
+              scope: async (o: UserObject) => {
+                if (!o.fate || 'unreadable' in o.fate)
+                  return null
+                return { group: o.fate.group ? `'${o.fate.group.name}' (gid ${o.fate.group.gid})` : '' }
+              },
+            }
+          : {}),
+        unbound: part => part === 'scope'
+          ? `Could not read whether deleting user '${name}' would also remove its group — refusing`
+          : `Could not read the uid of user '${name}' — refusing`,
       },
       gates,
-      ...(verb === 'delete' ? { advisories: async (o: UserObject, reads: GuardReads) => smbConfAdvisories(reads, o.name, false) } : {}),
-      locks: async o => [uidClaim(o.entry.uid, name), ...(verb === 'delete' ? [nameClaim(name)] : [])],
+      ...(verb === 'delete'
+        ? {
+            advisories: async (o: UserObject, reads: GuardReads) => {
+              const group = goingGroup(o)
+              return smbConfAdvisories(reads, o.name, false, group ? `this user or its group '${group.name}'` : undefined)
+            },
+          }
+        : {}),
+      locks: async (o) => {
+        const group = verb === 'delete' ? goingGroup(o) : null
+        return [
+          uidClaim(o.entry.uid, name),
+          ...(verb === 'delete' ? [nameClaim(name)] : []),
+          ...(group ? [gidClaim(group.gid, group.name)] : []),
+        ]
+      },
     }
   }
 
@@ -1549,12 +1732,15 @@ export async function shareIdentityRoutes(
 
     // exists → local → band (cr.3: userdel has no uid floor — without the band
     // gate this route could delete root or any service account, review C3) →
-    // no share names the user (cr.30) — at the route and again in the job.
+    // no share names the user (cr.30) → the group userdel removes with it
+    // passes the group delete's gates (cr.29d) — at the route and again in
+    // the job.
     const spec = userGuardSpec(name, 'delete')
     const pre = await guardCheck(spec)
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
-    const { entry } = pre.object
+    const { entry, fate } = pre.object
+    const goingGroup = fate && 'group' in fate ? fate.group : null
 
     // The passdb check is route-time for the WARNING (it describes what will
     // happen); the job re-checks live so the `pdbedit -x` side stays honest
@@ -1567,6 +1753,14 @@ export async function shareIdentityRoutes(
     ]
     if (hasSmb)
       warnings.push(`Its SMB password entry will be removed`)
+    // cr.29d: userdel offers no way to keep the group (no -K), so the confirm
+    // names it; the gates above have already run the group delete's checks.
+    if (goingGroup) {
+      warnings.push(
+        `Its group '${goingGroup.name}' (gid ${goingGroup.gid}) will be removed too: it is the user's primary group, named like the user, and no other account uses it, so userdel removes it (USERGROUPS_ENAB in /etc/login.defs)`,
+        leftOnFiles('gid', goingGroup.gid),
+      )
+    }
     warnings.push(...pre.advisories.map(a => a.warning))
     // TODO(cr.30): ACL-root references as a confirm WARNING naming the roots
     // (WAVE2-DESIGN §6 C4: `getfacl -n -p` of every share root for a named
@@ -1580,7 +1774,9 @@ export async function shareIdentityRoutes(
     if (!guardConfirm(confirmStore, request, reply, spec, pre, {
       validated: { name },
       address: ['name'],
-      message: `Deleting share user '${name}' removes the account`,
+      message: goingGroup
+        ? `Deleting share user '${name}' removes the account and its group '${goingGroup.name}'`
+        : `Deleting share user '${name}' removes the account`,
       warnings,
     })) {
       return reply
@@ -1589,8 +1785,10 @@ export async function shareIdentityRoutes(
     const job = jobQueue.submit(
       'identity.user.delete',
       { ...identity, params: { user: name } },
-      // Ruling (j): the confirmed uid, local, band and the share references
-      // run again against what the node has now.
+      // Ruling (j): the confirmed uid, local, band, the share references and
+      // the group userdel removes with the user (the bound scope, cr.29d: a
+      // job that would remove another group, or one the confirm did not
+      // name, refuses STATE_CHANGED) run again against what the node has now.
       guarded(spec, pre, async (o, { updateProgress, newAdvisories }) => {
         refuseNewlyUnreadable(newAdvisories, `user '${name}'`)
         // Order kept from identity.2: the SMB entry is dropped FIRST, so a
@@ -1611,14 +1809,17 @@ export async function shareIdentityRoutes(
           smbEntryRemoved = true
         }
 
-        updateProgress(`Deleting share user '${name}'`)
+        const group = o.fate && 'group' in o.fate ? o.fate.group : null
+        updateProgress(group ? `Deleting share user '${name}' and its group '${group.name}'` : `Deleting share user '${name}'`)
         // Without `-r`: the files keep their uid, and nothing is swept from
         // disk. A later create skips the uid while it still owns files ANAS
         // can see (cr.29); re-creating with the same uid gives them back.
+        // Without `-f`: userdel keeps a same-named group that is another
+        // account's primary group (cr.29d relies on that check).
         const r = await executor.exec(USERDEL, [name])
         if (r.exitCode !== 0)
           throw new Error(r.stderr.trim() || `userdel exited with code ${r.exitCode}`)
-        return { deleted: name, smbEntryRemoved }
+        return { deleted: name, smbEntryRemoved, groupRemoved: group ? group.name : null }
       }),
       { locks: pre.locks },
     )
