@@ -480,7 +480,7 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
       const res = await ctx.post(`${V1}/cloud/tasks/preview`, { data: { name: 'gtsync' } })
       expect(res.status(), await res.text()).toBe(200)
       const preview = (await res.json()).data
-      expect(preview.truncated, 'the look finished inside the 120 s ceiling').toBe(false)
+      expect(preview.truncated, 'the look finished inside the 15 s ceiling').toBe(false)
       expect(preview.deletes).toBeGreaterThanOrEqual(1)
       expect(preview.deletedFiles).toContain('b.bin')
       expect(preview.deletedTotal, 'the count and the list agree on a small destination').toBe(preview.deletedFiles.length)

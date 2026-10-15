@@ -9,6 +9,7 @@ import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { createServer } from '../../server.js'
+import { PREVIEW_TIMEOUT_S } from '../../services/cloud-preview.js'
 import { RCLONE, rcloneBaseArgs } from '../../services/rclone-config.js'
 
 /**
@@ -697,7 +698,7 @@ describe('cloud sync task routes (rclone.2)', () => {
       // The argv is the run's command, the live source, --dry-run.
       const call = mockOf(server).calls.find(c => isRcloneOrScan(c))
       assert.ok(call, 'the preview runs through the timeout ceiling')
-      assert.deepEqual(call!.args.slice(0, 5), ['25', RCLONE, 'sync', srcDir, 'gt:dst/preview'])
+      assert.deepEqual(call!.args.slice(0, 5), [String(PREVIEW_TIMEOUT_S), RCLONE, 'sync', srcDir, 'gt:dst/preview'])
       assert.equal(call!.args.at(-1), '--dry-run')
       // And it read the LIVE tree: no snapshot machinery ran at all.
       assert.ok(!mockOf(server).calls.some(c => c.command === '/usr/sbin/zfs' && !c.args.includes('name,mountpoint,canmount,mounted')), 'no zfs call but the guard\'s read-only mount facts — a preview takes no snapshot')

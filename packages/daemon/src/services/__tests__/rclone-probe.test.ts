@@ -15,6 +15,7 @@ import {
   cryptWrongPasswordMessage,
   PROBE_ENV_PREFIX,
   PROBE_REMOTE_NAME,
+  PROBE_TIMEOUT_S,
   probeArgs,
   sweepStaleProbeDirs,
   testRemote,
@@ -276,9 +277,9 @@ describe('rclone-probe: testRemote (rclone.1)', () => {
     assert.equal(probeConfigOf(calls[0]!.args), PATHS.configFile)
   })
 
-  it('the argv is the design\'s: timeout 25 (cr.35), base args, lsjson, the bounded flags', () => {
+  it('the argv is the design\'s: timeout 15 (cr.35), base args, lsjson, the bounded flags', () => {
     assert.deepEqual(probeArgs('/etc/anas/rclone.conf', 'gt:'), [
-      '25',
+      String(PROBE_TIMEOUT_S),
       RCLONE,
       '--config',
       '/etc/anas/rclone.conf',
@@ -290,13 +291,13 @@ describe('rclone-probe: testRemote (rclone.1)', () => {
       '--contimeout',
       '10s',
       '--timeout',
-      '30s',
+      '12s',
       '--retries',
       '1',
       '--low-level-retries',
       '1',
     ])
-    assert.equal(probeArgs(PATHS.configFile, 'gt:')[0], '25')
+    assert.equal(probeArgs(PATHS.configFile, 'gt:')[0], String(PROBE_TIMEOUT_S))
   })
 
   it('an UNSAVED target: the env carries TYPE + every option upper-cased; the password-typed value is OBSCURED, the rest plain', async () => {

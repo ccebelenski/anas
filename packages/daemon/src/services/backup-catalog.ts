@@ -50,12 +50,12 @@ const TIMEOUT_EXIT = 124
  * above the measured 0.14 s worst case, and still bounded — a picker must never
  * be the thing that wedges the daemon.
  *
- * cr.35: 25 s, down from 30 s, so the browse fails as a clean verdict before
- * AnasProxy's 30 s inactivity cut (the gateway's 20 s socket budget answers
- * the browser first on the real stack — WAVE3-DESIGN §6.2 ladder).
+ * cr.35: 15 s, down from 25 s — the wrapper fires and the browse fails as a
+ * clean verdict (exit 124) before the gateway's 20 s socket budget answers
+ * the browser (WAVE3-DESIGN §6.2 ladder).
  */
 // Q3 (WAVE3-DESIGN §10): job or sync is the operator's call
-export const CATALOG_SHELL_TIMEOUT_S = 25
+export const CATALOG_SHELL_TIMEOUT_S = 15
 
 /**
  * Cap on entries returned for one directory level, mirroring `/v1/fs/browse`'s

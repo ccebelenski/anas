@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
+import { CATALOG_SHELL_TIMEOUT_S } from '../../services/backup-catalog.js'
 
 /**
  * `POST /v1/backup/restore` with `kind: 'files'` — story backup2.6.
@@ -60,7 +61,7 @@ function statBlock(path: string, size: number, type: string, mode: string, perms
 
 /** The exact argv the pre-flight catalog `stat` pass sends. */
 function shellArgs(): string[] {
-  return ['25', PBC, 'catalog', 'shell', SNAP, 'data.pxar', '--ns', 'gtrestore']
+  return [String(CATALOG_SHELL_TIMEOUT_S), PBC, 'catalog', 'shell', SNAP, 'data.pxar', '--ns', 'gtrestore']
 }
 
 describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {

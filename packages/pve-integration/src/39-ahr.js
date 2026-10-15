@@ -2613,10 +2613,17 @@
             ANAS.toast(t('Scrub started on') + ' ' + pool);
             if (job && job.id) {
                 ANAS.pollJob(node, job.id, {
-                    node: node,
                     view: grid,
                     failTitle: 'Scrub failed',
                     onComplete: function () {
+                        loadPools(grid, node);
+                    },
+                    // cr.45 review: a scrub that ends failed or lost reloads
+                    // the pools grid too — pollJob calls onFailed(null) for
+                    // lost when there is no onLost, so one handler covers
+                    // both, and the grid reflects the outcome's aftermath
+                    // (a pool still mid-scrub reads so on the next pull).
+                    onFailed: function () {
                         loadPools(grid, node);
                     },
                 });

@@ -64,11 +64,13 @@ const SYSTEMCTL = '/usr/bin/systemctl'
  * The wall budget of one /v1/status section (cr.35). Inside the gateway's
  * 20 s socket budget with room for the reply, and above the request lane's
  * 10 s per command, so a single hung command that can be stopped is named by
- * its own CommandTimeoutError at 10 s; this budget catches a command that
- * could not be stopped (abandoned at 17 s) and a section that runs two slow
- * reads one after the other.
+ * its own CommandTimeoutError at 10 s; and BELOW the §6.3 rows' 15 s, so a
+ * row-bounded command (a 15 s smartctl or ssh inside a section) is still
+ * running when this wall fires and the section answers 'had not answered
+ * after 12 s' — the wall, not the row deadline, is the thing that ends the
+ * section's wait.
  */
-export const DASHBOARD_SECTION_BUDGET_MS = 15_000
+export const DASHBOARD_SECTION_BUDGET_MS = 12_000
 
 /** Pool states that are outright critical (data at risk / unavailable). */
 const CRITICAL_POOL_STATES = new Set(['FAULTED', 'UNAVAIL', 'REMOVED', 'SUSPENDED'])

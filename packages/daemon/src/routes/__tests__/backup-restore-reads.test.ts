@@ -9,6 +9,7 @@ import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { createServer } from '../../server.js'
+import { CATALOG_SHELL_TIMEOUT_S } from '../../services/backup-catalog.js'
 
 /**
  * The three restore READ endpoints (story backup2.5):
@@ -34,7 +35,7 @@ const TIMEOUT = '/usr/bin/timeout'
  * be registered with its exact args to win.
  */
 function shellArgs(snapshot: string, archive: string, ns?: string): string[] {
-  const args = ['25', PBC, 'catalog', 'shell', snapshot, archive]
+  const args = [String(CATALOG_SHELL_TIMEOUT_S), PBC, 'catalog', 'shell', snapshot, archive]
   if (ns)
     args.push('--ns', ns)
   return args

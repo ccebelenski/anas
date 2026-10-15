@@ -86,7 +86,7 @@ describe('cr.35 readDashboardSection: done, timed out, failed, late', () => {
       category: 'unavailable',
       message: 'Disk health is unavailable: \'zpool status\' did not finish within 10 s and was stopped. The rest of the dashboard is current.',
     }])
-    assert.equal(DASHBOARD_SECTION_BUDGET_MS, 15_000)
+    assert.equal(DASHBOARD_SECTION_BUDGET_MS, 12_000)
   })
 })
 

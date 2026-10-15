@@ -6710,6 +6710,45 @@ async function heldByLunAhrChecks() {
   ok('held(ahr): nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
+// cr.45 review — the AHR Scrub verb's poll ends failed or lost, the pools
+// grid reloads anyway (only onComplete used to). The harness drives the REAL
+// startScrub: the POST answers with a job, the flow hands pollJob its opts
+// (captured below — no stray `node` key), and the onFailed terminal reloads.
+async function scrubFailedReloadCheck() {
+  let ahrGets = 0
+  const ANAS = loadSources(['15-gfx.js', '39-ahr.js'], {
+    'GET /ahr': () => { ahrGets++; return { data: [ahrPoolRow('ahr0'), ahrPoolRow('ahr1')] } },
+    'POST /ahr/ahr0/scrub': () => ({ job: { id: 'scrub-1' } }),
+  })
+  const view = makeComponent(ANAS.views.ahr.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.itemId === 'ahrGrid' ? view : view.down('#ahrGrid')
+  ok('scrub-fail(ahr): the grid exists', !!grid, JSON.stringify(warnings))
+  if (!grid) { return }
+
+  let polled = null
+  ANAS.pollJob = (node, jobId, opts) => { polled = { node, jobId, opts } }
+
+  grid.selectRow(grid.getStore().findExact('name', 'ahr0'))
+  const scrubBtn = grid.down('#scrub')
+  ok('scrub-fail(ahr): the Scrub button is live on a selection', scrubBtn && scrubBtn.disabled === false)
+  if (!scrubBtn) { return }
+  scrubBtn.handler(scrubBtn)
+  await settle()
+
+  ok('scrub-fail(ahr): the scrub POST reached pollJob with its job id', polled && polled.jobId === 'scrub-1',
+    polled && `jobId=${polled.jobId} opts=${Object.keys(polled.opts || {}).join(',')}`)
+  ok('scrub-fail(ahr): the poll carries the grid as its view', polled && polled.opts && polled.opts.view === grid)
+  ok('scrub-fail(ahr): both terminals are wired', polled && polled.opts && typeof polled.opts.onComplete === 'function' && typeof polled.opts.onFailed === 'function')
+  ok('scrub-fail(ahr): no stray node key in the poll opts', polled && polled.opts && !Object.prototype.hasOwnProperty.call(polled.opts, 'node'))
+  const getsBefore = ahrGets
+  polled.opts.onFailed({ status: 'failed' })
+  await settle()
+  ok('scrub-fail(ahr): a FAILED scrub reloads the pools grid', ahrGets === getsBefore + 1,
+    `ahrGets ${ahrGets} after onFailed (was ${getsBefore})`)
+}
+
 const MOUNT_HELD = {
   targetIqn: 'iqn.2026-08.nas.anas:vmstore',
   index: 1,
@@ -10247,6 +10286,7 @@ for (const check of [
   heldByLunPoolChecks,
   heldByLunAhrChecks,
   heldByLunMountChecks,
+  scrubFailedReloadCheck,
   iscsiBackingOwnerChecks,
   iscsiPortalWarningChecks,
   // Story backup2.7 — the whole-image restore's size gate and its refusals.
@@ -12559,7 +12599,7 @@ async function cloudTaskChecks() {
       && /Would transfer 0 files \/ 0 B/.test(pLine().html),
     pLine() && pLine().html)
   ok('cloud preview: a truncated preview says what a partial answer is',
-    /stopped after 25 s — the counts are what rclone had reported by then, the list is everything it logged; the full run will do the rest/
+    /stopped after 15 s — the counts are what rclone had reported by then, the list is everything it logged; the full run will do the rest/
       .test(pLine().html), pLine() && pLine().html)
 
   // rclone's own first error line IS the summary — the counters lead is

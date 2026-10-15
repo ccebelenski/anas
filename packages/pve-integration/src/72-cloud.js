@@ -3393,12 +3393,12 @@
         return n === 1 ? one : many;
     }
 
-    // The 25 s ceiling (cr.35) fired: what is on screen is a partial answer, and the
+    // The 15 s ceiling (cr.35) fired: what is on screen is a partial answer, and the
     // line says exactly what a partial answer is — the counters are rclone's
     // last periodic tick, the list is everything it logged, neither is whole.
     function previewTruncatedHtml() {
         return '<div style="color:var(--anas-warn,#b06a12);font-size:11px;">'
-            + enc(t('stopped after 25 s — the counts are what rclone had reported '
+            + enc(t('stopped after 15 s — the counts are what rclone had reported '
                 + 'by then, the list is everything it logged; the full run will do '
                 + 'the rest')) + '</div>';
     }

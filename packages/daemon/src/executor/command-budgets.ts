@@ -12,9 +12,9 @@ import { currentLane, parseTimeoutWrapper } from './deadline.js'
 
 /**
  * cr.35 — the §6.3 per-command budgets that differ from the lane default
- * (WAVE3-DESIGN §6.3: "smartctl 20 s", "ssh … 20 s", "proxmox-backup-client
- * reads 25 s", "`zpool import` scan 30 s", "snapshot list 30 s",
- * "`zfs send -nP` 30 s").
+ * (WAVE3-DESIGN §6.3: "smartctl 15 s", "ssh … 15 s", "proxmox-backup-client
+ * reads 15 s", "`zpool import` scan 15 s", "snapshot list 15 s",
+ * "`zfs send -nP` 15 s").
  *
  * They are applied by {@link CommandBudgetExecutor}, which the daemon puts in
  * front of its executor (server.ts): a call that names no budget of its own
@@ -22,17 +22,17 @@ import { currentLane, parseTimeoutWrapper } from './deadline.js'
  * explicit `timeoutMs` — in the request lane, and for a row marked
  * `allLanes`, everywhere. In a job the other rows' commands keep the job
  * lane's 300 s: a snapshot list over 10k+ snapshots, or a remote's, must not
- * fail a replication run at 30 s.
+ * fail a replication run at 15 s.
  *
  * One table at the one door every daemon exec passes, so a NEW call site of
  * one of these commands gets its row's budget without knowing about it (a
  * table test pins every row against the argv the real call sites build).
  *
- * The ladder (§6.2): the gateway hangs up on anasd at 20 s. A row whose
- * budget reaches that can only answer a browser through the gateway's 504;
- * it still bounds the child, and the two display reads that must answer —
- * the dashboard and GET /disks — wait for it less long (`dashboard.ts`
- * section budget, `DiskIdentityCache.loadMany` wait).
+ * The ladder (§6.2): the gateway hangs up on anasd at 20 s, so a budget that
+ * reached it could only answer a browser through the gateway's 504, never
+ * with the daemon's own verdict. Every request-path budget is therefore at
+ * most 15 s — the daemon answers first (the two display reads sit below that
+ * too: `dashboard.ts` section budget, `DiskIdentityCache.loadMany` wait).
  */
 
 /** One row of the table. */
@@ -76,24 +76,24 @@ export const COMMAND_BUDGETS: readonly CommandBudget[] = Object.freeze([
   // `-n standby` never wakes one itself. Every lane: the identity probe runs
   // from jobs too (the composability re-check), and a probe the cache dedups
   // must not be shared for 300 s.
-  { id: 'smartctl', budgetMs: 20_000, allLanes: true, matches: c => c === SMARTCTL_BIN },
+  { id: 'smartctl', budgetMs: 15_000, allLanes: true, matches: c => c === SMARTCTL_BIN },
   // Remote reads over ssh: ConnectTimeout=10 (buildSshArgv) ends a dead host
   // at 10 s; a connected remote whose zfs hangs gets the rest.
-  { id: 'ssh', budgetMs: 20_000, matches: c => c === SSH_BIN },
+  { id: 'ssh', budgetMs: 15_000, matches: c => c === SSH_BIN },
   // `ssh-keyscan -T 10` bounds each connection; the executor sits above it.
-  { id: 'ssh-keyscan', budgetMs: 20_000, allLanes: true, matches: c => c === SSH_KEYSCAN_BIN },
+  { id: 'ssh-keyscan', budgetMs: 15_000, allLanes: true, matches: c => c === SSH_KEYSCAN_BIN },
   // Snapshot/group listings and the repo probe talk to the PBS server. (The
   // catalog shell has its own `timeout` wrapper, which wins.)
-  { id: 'proxmox-backup-client', budgetMs: 25_000, matches: c => c === PBC_BIN },
+  { id: 'proxmox-backup-client', budgetMs: 15_000, matches: c => c === PBC_BIN },
   // On the request path `zpool import` is always the device SCAN (the import
   // itself is a job). 145 ms on 6 disks (P01), scales with disk count.
-  { id: 'zpool import (scan)', budgetMs: 30_000, matches: (c, a) => c === ZPOOL_BIN && a[0] === 'import' },
+  { id: 'zpool import (scan)', budgetMs: 15_000, matches: (c, a) => c === ZPOOL_BIN && a[0] === 'import' },
   // `zfs list|get -t snapshot`: 34 ms on the stunt node, scales with
   // snapshot count (10k+ snapshots on a real node is ordinary).
-  { id: 'zfs snapshot list', budgetMs: 30_000, matches: (c, a) => c === ZFS_BIN && (a[0] === 'list' || a[0] === 'get') && typesIncludeSnapshots(a) },
+  { id: 'zfs snapshot list', budgetMs: 15_000, matches: (c, a) => c === ZFS_BIN && (a[0] === 'list' || a[0] === 'get') && typesIncludeSnapshots(a) },
   // On the request path `zfs send` is always the `-nvP` dry run (the real
   // send is a pipeline in a job): it walks the stream's blocks.
-  { id: 'zfs send -nP', budgetMs: 30_000, matches: (c, a) => c === ZFS_BIN && a[0] === 'send' },
+  { id: 'zfs send -nP', budgetMs: 15_000, matches: (c, a) => c === ZFS_BIN && a[0] === 'send' },
   // §6.3 "`lsof +f --`, `fuser -m` … walks /proc; hangs where the mount
   // hangs — 10 s", in a job too (the busy-unmount diagnosis runs in one).
   { id: 'lsof', budgetMs: 10_000, allLanes: true, matches: c => c === LSOF_BIN },
