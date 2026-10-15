@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
+import { VGS_ARGS } from '../../parsers/lvm-report.js'
+import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { AHR_ISCSI_DEVICE_TIMEOUT_OPTION, AHR_ISCSI_ORDERING_OPTION, createAhrPool, ensureAhrTargetOrdering } from '../ahr-create.js'
 import { LVM_MIXED_BLOCK_ARGS } from '../ahr-exec.js'
 
@@ -61,6 +63,11 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
     const executor = new MockExecutor()
     for (const fixture of priority)
       executor.addFixture(fixture)
+    // H6: the name-occupancy check reads /proc/mdstat, the partition labels and
+    // LVM volume groups — a real node always answers these. Empty mdstat (no
+    // live arrays), no labels, no VG of the new name.
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: 'Personalities : []\nunused devices: <none>\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/lsblk', args: ['-J', '-o', 'NAME,PARTLABEL'], result: { stdout: JSON.stringify({ blockdevices: [] }), stderr: '', exitCode: 0 } })
     okOnly(executor, [
       '/usr/sbin/wipefs',
       '/usr/sbin/sgdisk',
@@ -76,6 +83,8 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       '/usr/bin/umount', // top-level unmount after carving the subvolumes
       '/usr/bin/perl',
       '/usr/sbin/mdadm', // --create / fallback
+      '/usr/sbin/vgs', // the occupancy check (empty report = no VG)
+      '/usr/sbin/pvs', // the rollback teardown's gate (empty report)
     ])
     return executor
   }
@@ -102,10 +111,12 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
 
     assert.deepEqual(result, { created: 't2', mountpoint: join(mountBase, 't2'), arrays: ['t2-r1'] })
     assert.deepEqual(executor.calls, [
-      // Job-time name re-check (ident.3): no live `t2-r<N>` array, no pin, no
-      // `t2-*` partition label — read before the first destructive command.
+      // Job-time name re-check (ident.3, H6): no live `t2-r<N>` array, no pin,
+      // no `t2-*` partition label, no VG named `t2` — read before the first
+      // destructive command.
       { command: '/usr/bin/cat', args: ['/proc/mdstat'] },
       { command: '/usr/bin/lsblk', args: ['-J', '-o', 'NAME,PARTLABEL'] },
+      { command: '/usr/sbin/vgs', args: VGS_ARGS },
       // wipe + partition, ascending size order (§2.1); only the protected
       // band gets a slice (§2.6) — BIG's 2–3 GiB region stays raw.
       { command: '/usr/sbin/wipefs', args: ['-a', `/dev/disk/by-id/${SMALL}`] },
@@ -468,11 +479,27 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
     })
 
     it('failure at mkfs rolls back the whole stack including LVM', async () => {
+      const EMPTY_MDSTAT = 'Personalities : []\nunused devices: <none>\n'
+      const LIVE_MDSTAT = 'Personalities : [raid1]\nmd127 : active raid1 sdx1[1] sdy1[0]\n      1047552 blocks super 1.2 [2/2] [UU]\n\nmd126 : active raid1 sdy2[1] sdz2[0]\n      1047552 blocks super 1.2 [2/2] [UU]\n\nunused devices: <none>\n'
       const executor = t3Executor([
+        // mdstat answers EMPTY for the create's own name check (the arrays do
+        // not exist yet) and LIVE for the rollback — the gate proves the VG's
+        // PVs (/dev/md/t3-r1/r2) are the pool's arrays via the ident.3 read.
+        { command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, results: [
+          { stdout: EMPTY_MDSTAT, stderr: '', exitCode: 0 },
+          { stdout: LIVE_MDSTAT, stderr: '', exitCode: 0 },
+        ] },
+        { command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: `MD_NAME=t3-r1\nMD_UUID=${UUID_R1}\n`, stderr: '', exitCode: 0 } },
+        { command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md126'], result: { stdout: `MD_NAME=t3-r2\nMD_UUID=${UUID_R2}\n`, stderr: '', exitCode: 0 } },
         { command: '/usr/sbin/mkfs.btrfs', result: { stdout: '', stderr: 'mkfs.btrfs: unable to open /dev/t3/t3-vol', exitCode: 1 } },
-        // The LVM layer now EXISTS, so destroy must find and remove it.
+        // The LVM layer now EXISTS, so destroy must find and remove it. vgs
+        // answers EMPTY to the create's OWN name check (no VG yet) and the VG
+        // to the rollback (the pool's own, built after the name check).
+        { command: '/usr/sbin/vgs', results: [
+          { stdout: JSON.stringify({ report: [{ vg: [] }] }), stderr: '', exitCode: 0 },
+          { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 't3', vg_size: '5.00g', vg_free: '0 ' }] }] }), stderr: '', exitCode: 0 },
+        ] },
         { command: '/usr/sbin/lvs', result: { stdout: JSON.stringify({ report: [{ lv: [{ lv_name: 't3-vol', vg_name: 't3', lv_size: '5.00g' }] }] }), stderr: '', exitCode: 0 } },
-        { command: '/usr/sbin/vgs', result: { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 't3', vg_size: '5.00g', vg_free: '0 ' }] }] }), stderr: '', exitCode: 0 } },
         { command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [{ pv_name: '/dev/md/t3-r1', vg_name: 't3' }, { pv_name: '/dev/md/t3-r2', vg_name: 't3' }] }] }), stderr: '', exitCode: 0 } },
         { command: '/usr/sbin/lvremove', result: { stdout: '', stderr: '', exitCode: 0 } },
         { command: '/usr/sbin/vgremove', result: { stdout: '', stderr: '', exitCode: 0 } },
@@ -555,6 +582,43 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       })
       const notify = executor.calls.filter(c => c.command === '/usr/bin/perl')
       assert.equal(notify.at(-1)!.args[2], 'warning')
+    })
+
+    // Code review H6: the rollback reuses destroyAhrPool, and destroy must not
+    // tear down a volume group whose PVs are not the pool's. The failure below
+    // happens BEFORE vgcreate — the pool's OWN LVM stack was never built — and
+    // a FOREIGN VG of the same name (appearing after the create's name check,
+    // the race this gate exists for) must survive untouched.
+    it('a failure BEFORE vgcreate with a pre-existing FOREIGN VG of the same name: no LVM teardown of it (H6)', async () => {
+      const EMPTY_VGS = JSON.stringify({ report: [{ vg: [] }] })
+      const FOREIGN_VGS = JSON.stringify({ report: [{ vg: [{ vg_name: 't3' }] }] })
+      const FOREIGN_PVS = JSON.stringify({ report: [{ pv: [
+        { pv_name: '/dev/sdz3', vg_name: 't3', vg_size: '1g' },
+        { pv_name: '/dev/sdz4', vg_name: 't3', vg_size: '1g' },
+      ] }] })
+      const executor = t3Executor([
+        // update-initramfs fails AFTER the wipe + arrays + pins, BEFORE vgcreate.
+        { command: '/usr/sbin/update-initramfs', result: { stdout: '', stderr: 'update-initramfs: failure', exitCode: 1 } },
+        // vgs answers EMPTY to the create's OWN name check (the VG appears
+        // after it), then FOREIGN to the rollback.
+        { command: '/usr/sbin/vgs', results: [
+          { stdout: EMPTY_VGS, stderr: '', exitCode: 0 },
+          { stdout: FOREIGN_VGS, stderr: '', exitCode: 0 },
+        ] },
+        { command: '/usr/sbin/pvs', result: { stdout: FOREIGN_PVS, stderr: '', exitCode: 0 } },
+      ])
+
+      await assert.rejects(create(executor), (err: Error) => {
+        assert.match(err.message, /^update-initramfs: failure/)
+        // The rollback REFUSED, naming the VG and the foreign PV — not silent.
+        assert.match(err.message, /rollback ALSO FAILED: volume group 't3' contains physical volumes? \/dev\/sdz3, \/dev\/sdz4/)
+        return true
+      })
+      // No LVM teardown ran — and no md stop either: destroy tears down LVM
+      // BEFORE md, and the refused LVM layer aborts the whole teardown.
+      for (const never of ['/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/lvconvert'])
+        assert.ok(!executor.calls.some(c => c.command === never), `${never} must not touch the foreign VG`)
+      assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
     })
   })
 })

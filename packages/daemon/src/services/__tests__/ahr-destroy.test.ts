@@ -812,3 +812,133 @@ describe('destroyAhrPool — identity, not names (ident.3)', () => {
     assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/sgdisk' && c.args[0] === '--zap-all').length, 2)
   })
 })
+
+/**
+ * Code review H6 — the LVM-teardown gate. Destroy keys the LV/VG/PV layer by
+ * the pool NAME; it may act only when every PV of that VG is, ON THE DISKS, a
+ * device the pool owns (an array ident.3 identified, or an ahrcache.1 cache
+ * slice). A foreign VG of the same name — PVE's `pve`, a pool moved in from
+ * another node — is refused whole, and the md teardown that follows must not
+ * run either (LVM tears down BEFORE md; a refusal aborts before any md --stop).
+ */
+describe('destroyAhrPool — the LVM teardown gate (H6)', () => {
+  let dir: string
+  let fstabPath: string
+  let confPath: string
+  const progress: string[] = []
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-destroy-h6-'))
+    fstabPath = join(dir, 'fstab')
+    confPath = join(dir, 'mdadm.conf')
+    progress.length = 0
+    await writeFile(fstabPath, FSTAB_SEED)
+    await writeFile(confPath, CONF_SEED)
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  /** The pool's live world: its own array via the conf pin, disks readable. */
+  function world(): MockExecutor {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_LIVE, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_T2_R1, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
+    addDiskReads(executor, T2_BY_ID, T2_LSBLK)
+    // The pool's fstab line is present, so the daemon-reload side effect fires
+    // before the LVM gate — it must succeed for the refusal to be the gate's.
+    executor.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    return executor
+  }
+
+  it('a VG named like the pool that also holds a FOREIGN PV is refused — no lvremove/vgremove/pvremove, no md stop', async () => {
+    const executor = world()
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', [{ vg_name: 't2', pv_count: '2', lv_count: '2', vg_size: String(3 * GIB), vg_free: '0' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', [
+      { pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' },
+      // PVE's VM-disk partition, or an operator's hand-added PV — not a band array, not a pool cache slice.
+      { pv_name: '/dev/sdz3', vg_name: 't2', pv_size: String(GIB), pv_free: '0' },
+    ]), stderr: '', exitCode: 0 } })
+    // No lvs fixture — the gate must refuse before LVM is even listed.
+
+    await assert.rejects(
+      destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
+      /volume group 't2' contains physical volume \/dev\/sdz3/,
+    )
+    for (const never of ['/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/lvconvert'])
+      assert.ok(!executor.calls.some(c => c.command === never), `${never} must not run on a foreign-PV VG`)
+    // The md layer must not be torn down either: destroy removes LVM BEFORE the
+    // arrays are stopped, so a refused LVM layer aborts before any --stop.
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--zero-superblock'))
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/sgdisk' && c.args[0] === '--zap-all'))
+  })
+
+  it('an md PV of the VG that is ANOTHER pool\'s array is foreign too', async () => {
+    const executor = world()
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', [{ vg_name: 't2', pv_count: '1', lv_count: '1', vg_size: String(2 * GIB), vg_free: '0' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', [
+      // md9 is the OTHER pool's array — it carries the pool's name convention
+      // only if a pool of the same name built it on another node.
+      { pv_name: '/dev/md9', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' },
+    ]), stderr: '', exitCode: 0 } })
+
+    await assert.rejects(
+      destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
+      /contains physical volume \/dev\/md9/,
+    )
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/lvremove'))
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
+  })
+
+  it('an unreadable `pvs` REFUSES the LVM teardown (fail closed)', async () => {
+    const executor = world()
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', [{ vg_name: 't2' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: '', stderr: 'pvs: internal error', exitCode: 5 } })
+
+    await assert.rejects(
+      destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
+      /cannot read LVM physical volumes/,
+    )
+    for (const never of ['/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove'])
+      assert.ok(!executor.calls.some(c => c.command === never), `${never} must not run on an unprovable VG`)
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
+  })
+
+  it('a cached pool\'s PROVEN cache slice passes the gate, and the cached teardown still runs in order', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_LIVE, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_T2_R1, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
+    addDiskReads(
+      executor,
+      byIdListing([
+        { id: SMALL, kernel: 'sdc', parts: 1 },
+        { id: BIG, kernel: 'sdd', parts: 1 },
+        { id: CACHE, kernel: 'sde', parts: 1 },
+      ]),
+      lsblkTree([
+        { kernel: 'sdc', parts: ['t2-d1-b1'] },
+        { kernel: 'sdd', parts: ['t2-d2-b1'] },
+        // The cache slice is labelled — the gate's ahrcache.1 recognition.
+        { kernel: 'sde', parts: ['t2-cache1'] },
+      ]),
+    )
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', [{ vg_name: 't2', pv_count: '2', lv_count: '1', vg_size: String(3 * GIB), vg_free: '0' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', [
+      { pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' },
+      { pv_name: '/dev/sde1', vg_name: 't2', pv_size: String(GIB), pv_free: '0' },
+    ]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', [{ lv_name: 't2-vol', vg_name: 't2', lv_attr: 'Cwi-aoC---', lv_size: String(2 * GIB) }]), stderr: '', exitCode: 0 } })
+    addExamine(executor, T2_MEMBER_EXAMINE)
+    for (const command of ['/usr/bin/systemctl', '/usr/sbin/lvconvert', '/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs', '/usr/sbin/mdadm'])
+      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    await destroyAhrPool(executor, cachedPool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    // The cache-target LV is still uncached first, then the LV/VG/PV go.
+    assert.ok(executor.calls.some(c => c.command === '/usr/sbin/lvconvert' && c.args.includes('--uncache') && c.args.includes('t2/t2-vol')))
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/lvremove').length, 1)
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/pvremove').length, 2)
+  })
+})

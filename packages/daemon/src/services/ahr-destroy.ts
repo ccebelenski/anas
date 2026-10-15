@@ -9,7 +9,7 @@ import { isMdPvName, matchCachePartitionLabel } from './ahr-cache-state.js'
 import { uncacheAhrLv } from './ahr-cache.js'
 import { run } from './ahr-exec.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
-import { classifyPartition, readAhrPoolIdentity, resolveMdadmConfPath } from './ahr-identity.js'
+import { classifyPartition, readAhrPoolIdentity, requireOwnedVgPvs, resolveMdadmConfPath } from './ahr-identity.js'
 import { clearIntent } from './ahr-intent.js'
 import { unpinArrays } from './ahr-mdadm-conf.js'
 import { ahrLvPath } from './ahr-paths.js'
@@ -315,6 +315,20 @@ export async function destroyAhrPool(
   }
 
   // --- LVM teardown (each layer checked live before acting) -------------------
+  // THE VG IS OURS ONLY ON THE DISKS (code review H6): before ANY layer above
+  // this line ends — the lvremove / vgremove / pvremove / lvconvert --uncache
+  // that follow — prove every PV of the VG named `name` is a device this pool
+  // owns: a band array the ident.3 machinery decided is the pool's, or an
+  // ahrcache.1 cache slice. A foreign VG of the same name — PVE's `pve`, a
+  // pool moved in from another node, a PV an operator added by hand — is
+  // REFUSED whole, and an unreadable pvs/vgs is a refusal too (fail closed).
+  // LVM is torn down BEFORE the arrays are stopped below, so a refusal here
+  // leaves the md layer standing exactly as it was.
+  await requireOwnedVgPvs(executor, name, {
+    arrays: identity.arrays.map(a => ({ pool: a.pool, band: a.band, kernelName: a.kernelName })),
+    partsByKernel: index.partsByKernel,
+  })
+
   const lvsRes = await executor.exec(LVS, LVS_ARGS)
   const lvs = lvsRes.exitCode === 0 ? parseLvsReport(lvsRes.stdout).filter(l => l.vgName === name) : []
   for (const lv of lvs) {

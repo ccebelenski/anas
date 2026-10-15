@@ -495,6 +495,10 @@ export function createServer(opts?: ServerOptions) {
       result: { stdout: '', stderr: 'mdadm: No md superblock detected', exitCode: 1 },
     })
     mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+    // The create-name OCCUPANCY check reads partition labels with a lighter
+    // lsblk call (`-o NAME,PARTLABEL`); the dev pool's labels are nothing a
+    // fresh create name collides with.
+    mock.addFixture({ command: '/usr/bin/lsblk', args: ['-J', '-o', 'NAME,PARTLABEL'], result: { stdout: JSON.stringify({ blockdevices: [] }), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
     mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
     mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })

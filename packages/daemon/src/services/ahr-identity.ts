@@ -8,7 +8,7 @@ import { parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/l
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, mdadmExamineExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
-import { matchCachePartitionLabel } from './ahr-cache-state.js'
+import { isMdPvName, matchCachePartitionLabel, UNKNOWN_PV_NAME } from './ahr-cache-state.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
 import { DEFAULT_MDADM_CONF } from './ahr-mdadm-conf.js'
 import { readConfig } from './config-writer.js'
@@ -123,9 +123,20 @@ export interface ArrayIdentityFacts {
  *  - its UUID is pinned for the pool → the pool's;
  *  - it is a PV of the pool's VG → the pool's (the one fact that survives a
  *    pin an expansion could not write);
- *  - the pool has NO pins at all but its VG exists → the pool's: an adopted
- *    mdadm→LVM→btrfs stack (§5.3) carries no ANAS marker, and its name plus
- *    its VG is all the evidence there is — exactly the pre-ident.3 rule.
+ *  - the pool has NO pins at all, its VG exists AND the PV list gives no
+ *    answer about this array → the pool's: an adopted mdadm→LVM→btrfs stack
+ *    (§5.3) carries no ANAS marker, and its name plus its VG is all the
+ *    evidence there is — the pre-ident.3 rule. The `pvNames` guard is the
+ *    identity-audit-H6 narrowing: a VG whose JOINED PVs are NAMED (`pvs`
+ *    resolved them) puts that array's ownership on record — an array that is
+ *    not among them is someone else's (a hand-built `<pool>-r<N>`, another
+ *    pool's array beside an unrelated VG of the same name), and the VG's name
+ *    alone must not promote it to a pool Destroy could reach. The fallback
+ *    survives EXACTLY the case it is needed: an unreadable `pvs` (every reader
+ *    degrades it to no PVs) or a VG whose every PV is an `[unknown]` device —
+ *    a dead cache slice or an unassembled band, devices that were the pool's
+ *    (the ahrcache.1 'bandsdown' shape) — gives no named membership to
+ *    contradict the array, so adoption by VG name stands.
  *
  * Once a pool is pinned, only its pinned UUIDs (and its VG's PVs) are
  * admitted: a same-named array with neither is someone else's — never merged
@@ -136,7 +147,8 @@ export function isOwnedArray(a: ArrayIdentityFacts, pinned: Set<string>, pvNames
     return true
   if (pvNames.has(`/dev/${a.kernelName}`) || pvNames.has(`/dev/md/${a.pool}-r${a.band}`))
     return true
-  return pinned.size === 0 && vgExists
+  const pvAnswerUnknown = pvNames.size === 0 || [...pvNames].every(n => n === UNKNOWN_PV_NAME)
+  return pinned.size === 0 && vgExists && pvAnswerUnknown
 }
 
 /** One live md array whose superblock name follows the AHR convention. */
@@ -286,6 +298,116 @@ export async function classifyPartition(
   return ownsUuid(identity, uuid) ? 'ours' : 'foreign'
 }
 
+// ---- The LVM-teardown gate: is the VG the pool's, ON THE DISKS? (H6) --------
+
+/** The lsblk partition view the LVM-teardown gate reads (kernel name → GPT label). */
+export interface VgGatePartition {
+  partlabel: string | null
+}
+
+/** The evidence {@link requireOwnedVgPvs} checks a VG's PVs against. */
+export interface RequireOwnedVgPvsOptions {
+  /**
+   * The pool's OWNED live md arrays — `readAhrPoolIdentity().arrays`, the
+   * ident.3 machinery ({@link isOwnedArray}: pinned UUID, a PV of the pool's
+   * VG, or an adopted unpinned array). A PV named after one of these (kernel
+   * path or `/dev/md/<pool>-r<N>`) is a pool band.
+   */
+  arrays: Array<{ pool: string, band: number, kernelName: string }>
+  /**
+   * The lsblk partition index (kernel name → label), for recognizing a named,
+   * non-md PV of the VG as this pool's CACHE slice (ahrcache.1: a
+   * `<pool>-cache<n>` GPT label). Absent/empty when no tree was read: a
+   * non-md PV is then never provably a cache slice, and reads FOREIGN (fail
+   * closed). A missing device's `[unknown]` PV needs no label — the device
+   * that is gone was the pool's (a dead cache slice or an unassembled band).
+   */
+  partsByKernel?: ReadonlyMap<string, VgGatePartition>
+}
+
+/** Is `pvName` a device of `pool`'s that the LVM-teardown gate accepts? */
+function ownedVgPv(pool: string, pvName: string, opts: RequireOwnedVgPvsOptions): boolean {
+  // A missing device reads `[unknown]` — a PV the VG records whose device is
+  // gone: a dead cache slice or an unassembled band. Either way it was a pool
+  // device, and there is no data-bearing disk left for the teardown to reach.
+  if (pvName === UNKNOWN_PV_NAME)
+    return true
+  if (isMdPvName(pvName)) {
+    // A band array — owned by the SAME identity the ident.3 machinery decided
+    // is the pool's (pinned UUID, a PV of its VG, or an adopted unpinned array).
+    return opts.arrays.some(a =>
+      pvName === `/dev/${a.kernelName}` || pvName === `/dev/md/${a.pool}-r${a.band}`)
+  }
+  // A named non-md PV is the pool's ONLY on one of its cache slices
+  // (ahrcache.1): a `<pool>-cache<n>` GPT label. Without a readable label it
+  // is someone else's — fail closed.
+  const kernel = pvName.startsWith('/dev/') ? pvName.slice('/dev/'.length) : pvName
+  const label = opts.partsByKernel?.get(kernel)?.partlabel ?? null
+  return label !== null && matchCachePartitionLabel(pool, label) !== null
+}
+
+/** The first line of a command's stderr, for a refusal message. */
+function firstLine(stderr: string): string {
+  return stderr.trim().split('\n')[0] || '(no stderr)'
+}
+
+/**
+ * THE gate every LVM teardown must pass before it may run (code review H6).
+ * `lvremove`, `vgremove`, `pvremove` and `lvconvert --uncache` against the VG
+ * named `pool` — an AHR pool's name IS its VG name — may act only when EVERY
+ * PV of that VG is a device this pool owns:
+ *
+ *  - a pool BAND array — the ident.3 machinery's owned arrays (pinned, a PV
+ *    of the VG, an adopted unpinned array);
+ *  - the pool's own CACHE slice (ahrcache.1): a named non-md PV on a
+ *    `<pool>-cache<n>` labelled partition, or an `[unknown]` PV (a device the
+ *    VG records that is gone now).
+ *
+ * Anything else — PVE's root `pve` VG, a same-named pool moved in from
+ * another node, an operator's hand-added PV — REFUSES the whole teardown by
+ * throwing, naming the VG and the offending PV. FAIL CLOSED: an unreadable
+ * `pvs`/`vgs` is a refusal, never an admission — a teardown that cannot PROVE
+ * the VG is this pool's does not run, and because destroy tears top-down (LVM
+ * before md), the md-layer teardown that follows never runs either.
+ *
+ * Stateless (Principle 11): the evidence is read live from the system — lvm's
+ * PV/VG reports and the GPT labels on the disks. Nothing new is stored.
+ *
+ * No VG of that name on the node passes trivially: there is then no LV, no VG
+ * and no PV of it for the teardown to reach (destroy's own later reads find
+ * nothing by the same filter).
+ */
+export async function requireOwnedVgPvs(
+  executor: CommandExecutor,
+  pool: string,
+  opts: RequireOwnedVgPvsOptions,
+): Promise<void> {
+  const pvsRes = await executor.exec(PVS, PVS_ARGS)
+  if (pvsRes.exitCode !== 0) {
+    throw new Error(
+      `cannot read LVM physical volumes (pvs: ${firstLine(pvsRes.stderr)}) — refusing any LVM teardown of volume group '${pool}': its PVs cannot be proven to be this pool's`,
+    )
+  }
+  const vgsRes = await executor.exec(VGS, VGS_ARGS)
+  if (vgsRes.exitCode !== 0) {
+    throw new Error(
+      `cannot read LVM volume groups (vgs: ${firstLine(vgsRes.stderr)}) — refusing any LVM teardown of volume group '${pool}': it cannot be proven to be this pool's`,
+    )
+  }
+  if (!parseVgsReport(vgsRes.stdout).some(v => v.name === pool))
+    return // no VG of this name on the node — nothing this gate protects
+
+  const foreign = parsePvsReport(pvsRes.stdout)
+    .filter(pv => pv.vgName === pool)
+    .filter(pv => !ownedVgPv(pool, pv.name, opts))
+  if (foreign.length > 0) {
+    throw new Error(
+      `volume group '${pool}' contains physical volume${foreign.length === 1 ? '' : 's'} ${foreign.map(f => f.name).join(', ')} — `
+      + `not this pool's arrays or cache slices. Refusing any LVM or md teardown: ANAS only removes a volume group whose every PV is its own`,
+    )
+  }
+}
+
 // ---- Create: is the name free? --------------------------------------------
 
 /** Every GPT partition label in an `lsblk -J` tree (any depth). */
@@ -321,12 +443,18 @@ interface LabelNode {
  *
  *  - a live md array named `<name>-r<N>` — ours or anyone's;
  *  - an ARRAY pin for `/dev/md/<name>-r<N>` in mdadm.conf;
- *  - a partition labelled `<name>-d<n>-b<band>` or `<name>-cache<n>`.
+ *  - a partition labelled `<name>-d<n>-b<band>` or `<name>-cache<n>`;
+ *  - an LVM volume group named `<name>` (code review H6) — the pool name
+ *    BECOMES its VG name, and `vgcreate` runs only after the disks are wiped.
  *
  * Any one of them would make the new pool's identity ambiguous from its first
  * minute — exactly the merge every other check in this module exists to stop.
- * Fail-open per source (an unreadable listing adds no reason): the disks the
- * create wipes were each verified available, and this check guards the NAME.
+ *
+ * FAIL-CLOSED per source (code review H6): an unreadable read cannot confirm
+ * the name free, and a create that proceeds on guesswork could wipe disks
+ * under a name an array, pin, label or volume group already carries. Each
+ * source is answered with a reason the callers surface verbatim in their 409/
+ * pre-wipe refusal.
  */
 export async function ahrNameOccupancy(
   executor: CommandExecutor,
@@ -334,19 +462,41 @@ export async function ahrNameOccupancy(
   opts: { mdadmConfPath?: string } = {},
 ): Promise<string[]> {
   const reasons: string[] = []
-  const arrays = (await readNamedMdArrays(executor)).filter(a => a.pool === name)
-  if (arrays.length > 0) {
-    const list = arrays.map(a => `${a.pool}-r${a.band} (/dev/${a.kernelName})`).join(', ')
-    reasons.push(`md array${arrays.length === 1 ? '' : 's'} ${list} already ${arrays.length === 1 ? 'uses' : 'use'} the name`)
+  const mdstatRes = await executor.exec(CAT, MDSTAT_CAT_ARGS)
+  if (mdstatRes.exitCode !== 0) {
+    reasons.push('cannot read /proc/mdstat — the name cannot be confirmed free')
   }
-  if (pinnedUuids(await readMdadmConfDoc(opts.mdadmConfPath), name).size > 0)
+  else {
+    const arrays = (await readNamedMdArrays(executor, mdstatRes.stdout)).filter(a => a.pool === name)
+    if (arrays.length > 0) {
+      const list = arrays.map(a => `${a.pool}-r${a.band} (/dev/${a.kernelName})`).join(', ')
+      reasons.push(`md array${arrays.length === 1 ? '' : 's'} ${list} already ${arrays.length === 1 ? 'uses' : 'use'} the name`)
+    }
+  }
+  // ENOENT reads as '' (no pins — a fresh node); a real read failure refuses.
+  const confText = await readConfig(resolveMdadmConfPath(opts.mdadmConfPath)).catch(() => null)
+  if (confText === null) {
+    reasons.push('mdadm.conf is not readable — the name cannot be confirmed free')
+  }
+  else if (pinnedUuids(parseMdadmConfDoc(confText), name).size > 0) {
     reasons.push(`mdadm.conf already pins arrays named '${name}-r<N>'`)
+  }
   const lsblk = await executor.exec(LSBLK, LSBLK_LABEL_ARGS)
   if (lsblk.exitCode === 0) {
     const labels = collectPartLabels(lsblk.stdout)
       .filter(l => matchPartitionLabel(name, l) !== null || matchCachePartitionLabel(name, l) !== null)
     if (labels.length > 0)
       reasons.push(`partition${labels.length === 1 ? '' : 's'} labelled ${[...new Set(labels)].join(', ')} already carry the name`)
+  }
+  else {
+    reasons.push('cannot read the partition labels (lsblk failed) — the name cannot be confirmed free')
+  }
+  const vgsRes = await executor.exec(VGS, VGS_ARGS)
+  if (vgsRes.exitCode !== 0) {
+    reasons.push('LVM volume groups could not be read (vgs failed) — the name cannot be confirmed free')
+  }
+  else if (parseVgsReport(vgsRes.stdout).some(v => v.name === name)) {
+    reasons.push(`an LVM volume group named '${name}' already exists`)
   }
   return reasons
 }

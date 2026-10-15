@@ -210,6 +210,13 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
       exitCode: 0,
     } })
     ex.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    // H6: the create name check reads mdstat, the partition labels and LVM VGs
+    // at request time AND inside the job. Empty mdstat, no labels, no VGs.
+    // Command-only so a test's exact-args fixture (a live mdstat, a labelled
+    // tree, a colliding VG) outranks these by exact-match.
+    ex.addFixture({ command: '/usr/bin/cat', result: { stdout: 'Personalities : []\nunused devices: <none>\n', stderr: '', exitCode: 0 } })
+    ex.addFixture({ command: '/usr/bin/lsblk', result: { stdout: JSON.stringify({ blockdevices: [] }), stderr: '', exitCode: 0 } })
+    ex.addFixture({ command: '/usr/sbin/vgs', result: { stdout: JSON.stringify({ report: [{ vg: [] }] }), stderr: '', exitCode: 0 } })
     // The create job's commands.
     for (const command of ['/usr/sbin/wipefs', '/usr/sbin/sgdisk', '/usr/bin/udevadm', '/usr/sbin/pvcreate', '/usr/sbin/vgcreate', '/usr/sbin/lvcreate', '/usr/sbin/mkfs.btrfs', '/usr/bin/btrfs', '/usr/sbin/update-initramfs', '/usr/bin/systemctl', '/usr/bin/mount', '/usr/bin/umount', '/usr/bin/perl', '/usr/sbin/mdadm'])
       ex.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -417,8 +424,9 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
   // VG (e.g. 'pve') would pass confirm, wipe disks, then die at vgcreate. The
   // route must refuse BEFORE the confirm gate, with nothing touched.
   it('refuses (409) when the pool name collides with an existing LVM VG — before wiping', async () => {
-    // A VG named 'tpool' already exists (and it is NOT an AHR pool).
-    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: JSON.stringify({ report: [{ vg: [
+    // A VG named 'tpool' already exists (and it is NOT an AHR pool). The exact
+    // VGS_ARGS fixture outranks the controlled executor's command-only blank.
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: { stdout: JSON.stringify({ report: [{ vg: [
       { vg_name: 'tpool', pv_count: '1', lv_count: '0', snap_count: '0', vg_attr: 'wz--n-', vg_size: '<2.49g', vg_free: '0 ' },
     ] }] }), stderr: '', exitCode: 0 } })
 
@@ -427,6 +435,19 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     assert.equal(res.json().error.code, 'CONFLICT', 'a hard block, not a confirm')
     assert.ok(res.json().error.message.includes('volume group'))
     assert.ok(!res.headers['x-anas-confirm-code'], 'refused before the confirm gate')
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/wipefs'), 'no disk was wiped')
+  })
+
+  it('refuses (503) when vgs cannot be read at request time — nothing wiped, no confirm', async () => {
+    // Fail CLOSED (H6): a create that cannot check the VG name against the
+    // existing volume groups must not proceed to wipe disks. 503 is the routes'
+    // "cannot read state" idiom (the dataset "failed lookup" pattern).
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: { stdout: '', stderr: 'Internal lvm error: could not open VG metadata', exitCode: 5 } })
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] }) })
+    assert.equal(res.statusCode, 503, res.body)
+    assert.equal(res.json().error.code, 'UNAVAILABLE')
+    assert.match(res.json().error.message, /cannot read LVM volume groups.*Internal lvm error/)
+    assert.ok(!res.headers['x-anas-confirm-code'])
     assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/wipefs'), 'no disk was wiped')
   })
 

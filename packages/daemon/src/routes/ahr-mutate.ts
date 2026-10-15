@@ -456,10 +456,17 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // becomes the LVM VG name, and `vgcreate` runs only AFTER the disks are
     // wiped — so naming a pool after an existing VG (e.g. 'pve', the PVE root
     // VG) would pass confirm, wipe disks, then die at vgcreate leaving an
-    // orphaned half-stack. Refuse now, while nothing has been touched.
+    // orphaned half-stack. Refuse now, while nothing has been touched. Fail
+    // CLOSED when vgs cannot be read (code review H6): proceeding on an
+    // unreadable answer could wipe disks under a name another VG already
+    // carries. 503 is the file's idiom for "cannot read state the operation
+    // depends on" (the dataset routes' failed-lookup pattern).
     const vgsRes = await executor.exec(VGS, VGS_ARGS)
-    const existingVgs = vgsRes.exitCode === 0 ? parseVgsReport(vgsRes.stdout) : []
-    if (existingVgs.some(v => v.name === req.name)) {
+    if (vgsRes.exitCode !== 0) {
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `cannot read LVM volume groups (vgs: ${vgsRes.stderr.trim().split('\n')[0] || 'no stderr'}) — refusing to create a pool whose VG name could not be checked against the existing volume groups` } }
+    }
+    if (parseVgsReport(vgsRes.stdout).some(v => v.name === req.name)) {
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `an LVM volume group named '${req.name}' already exists. The pool name becomes its VG name, so vgcreate would fail after the disks were wiped. Choose another name` } }
     }
