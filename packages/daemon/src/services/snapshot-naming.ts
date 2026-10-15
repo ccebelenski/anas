@@ -1,4 +1,5 @@
 import type { RetentionBucket } from '@anas/shared'
+import { SCHEDULED_SNAPSHOT_PREFIX as PREFIX } from '@anas/shared'
 
 /**
  * Naming convention for ANAS-scheduled snapshots (Epic 17): `anas-<bucket>-<utc>`.
@@ -15,7 +16,8 @@ import type { RetentionBucket } from '@anas/shared'
  * are inside the date, so `anas-<bucket>-<utc>` parses unambiguously.
  */
 
-const PREFIX = 'anas-'
+// PREFIX (cr.20): the shared constant behind the schema's `NewSnapshotName`
+// gate — one definition of the owned prefix, validator and engine alike.
 
 /** Trailing `.<ms>Z` of an ISO timestamp (dropped — second precision is enough). */
 const ISO_MILLIS_RE = /\.\d+Z$/
@@ -28,9 +30,21 @@ const COLON_RE = /:/g
  */
 const BUCKETS = ['frequently', 'hourly', 'daily', 'weekly', 'monthly', 'yearly'] as const
 
+/**
+ * The collision-retry suffix (story cr.20, audit #46): two schedules of the
+ * same bucket firing on the same dataset in the SAME SECOND take the same
+ * canonical name, and the second's `zfs snapshot` answers "dataset already
+ * exists" — the take retries once with this suffix. The name stays inside the
+ * owned space: {@link PARSE_RE} accepts one optional `-\d+` suffix after the
+ * stamp, so a suffixed snapshot parses, is owned (stamped on ZFS, name-scoped
+ * on AHR), is bucketed and is pruned exactly like its unsuffixed siblings.
+ * The encoded instant is unchanged — the retry happens within the second.
+ */
+const COLLISION_SUFFIX = '-2'
+
 /** `anas-daily-2026-07-26T142301Z` → its parts, or null when not an ANAS name. */
 const PARSE_RE = new RegExp(
-  `^${PREFIX}(${BUCKETS.join('|')})-(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2})(\\d{2})(\\d{2})Z$`,
+  `^${PREFIX}(${BUCKETS.join('|')})-(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2})(\\d{2})(\\d{2})Z(?:-\\d+)?$`,
 )
 
 /** A compact UTC stamp usable as a single label/path segment (no `:`). */
@@ -78,6 +92,17 @@ export function parseScheduledName(name: string): ParsedScheduledName | null {
 /** Is `name` an ANAS-scheduled snapshot name (source: 'anas')? */
 export function isScheduledName(name: string): boolean {
   return parseScheduledName(name) !== null
+}
+
+/**
+ * The collision-retry name for a scheduled take whose canonical name already
+ * exists (audit #46): the same name with {@link COLLISION_SUFFIX}. Deterministic
+ * — the same second yields the same retry name — and owned: it parses back
+ * through {@link parseScheduledName} with the SAME instant the canonical name
+ * encodes.
+ */
+export function withCollisionSuffix(name: string): string {
+  return `${name}${COLLISION_SUFFIX}`
 }
 
 // ---------------------------------------------------------------------------

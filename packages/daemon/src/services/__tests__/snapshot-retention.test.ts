@@ -64,6 +64,28 @@ describe('planRetention — per-bucket keep-N', () => {
   })
 })
 
+describe('planRetention — collision-suffixed names are owned and pruned alike (cr.20, audit #46)', () => {
+  it('a suffixed snapshot takes its bucket slot and prunes like its siblings', () => {
+    const pair = anas('daily', '2026-07-26T00:00:00Z')
+    const suffixed = anas('daily', '2026-07-26T00:00:00Z', { name: 'anas-daily-2026-07-26T000000Z-2' })
+    const older = anas('daily', '2026-07-25T00:00:00Z', { name: 'anas-daily-2026-07-25T000000Z-2' })
+    const plan = planRetention([pair, suffixed, older], { daily: 1 }, NOW)
+    // The suffix reads the SAME instant: the pair is one bucket-second (a
+    // stable sort keeps the canonical name first within it), the older
+    // suffixed one is prunable, and every suffixed form is eligible — never
+    // an anonymous "other" snapshot grown forever.
+    assert.deepEqual(names(plan.keep), [pair.name])
+    assert.deepEqual(names(plan.prune), [older.name, suffixed.name])
+  })
+
+  it('an older suffixed snapshot prunes while the newest overall is kept', () => {
+    const oldSuffixed = anas('daily', '2026-07-20T00:00:00Z', { name: 'anas-daily-2026-07-20T000000Z-2' })
+    const fresh = anas('daily', '2026-07-26T00:00:00Z')
+    const plan = planRetention([oldSuffixed, fresh], { daily: 1 }, NOW)
+    assert.deepEqual(names(plan.prune), [oldSuffixed.name])
+  })
+})
+
 describe('planRetention — always keep the most recent overall', () => {
   it('rescues the newest even when its bucket count is 0', () => {
     const snaps = [

@@ -14,7 +14,7 @@ import type { ScheduleListRead } from './snapshot-schedule-units.js'
 import { HELD_NAMES_TOTAL, PRUNED_NAMES_PER_DATASET, PRUNED_NAMES_TOTAL, SCHEDULE_STAMP_PROPERTY } from '@anas/shared'
 import { run } from './ahr-exec.js'
 import { createAhrSnapshot, deleteAhrSnapshot, listAhrSnapshots } from './ahr-snapshots.js'
-import { formatScheduledName, isTransientRunSnapshot, parseScheduledName } from './snapshot-naming.js'
+import { formatScheduledName, isTransientRunSnapshot, parseScheduledName, withCollisionSuffix } from './snapshot-naming.js'
 import { effectiveRetention, planRetention } from './snapshot-retention.js'
 import { createZfsSnapshot, createZfsSnapshotExcluding, destroyZfsSnapshot, inSweep, isSnapshotAlreadyGone, zfsSnapshotFullName } from './zfs-snapshot.js'
 
@@ -106,6 +106,50 @@ export interface TakeSnapshotResult {
  * the stamp is set by the same atomic verb on every snapshot it creates); AHR:
  * a read-only btrfs snapshot of `@data` (reusing the 11.12 primitive).
  */
+/**
+ * Does a failed take's error say the snapshot NAME is taken? ZFS's `snapshot`
+ * on an existing snapshot prints "dataset already exists" (audit #46 quotes
+ * exactly this for the colliding second fire; same family as the destroy
+ * answer {@link isSnapshotAlreadyGone} keys on). The btrfs half — "file
+ * exists", btrfs's EEXIST text — is from btrfs's documented behaviour from
+ * memory, un-ground-truthed here: if the real wording differs the retry
+ * simply never fires on AHR and the run fails exactly as it does today
+ * (detection miss = status quo, never a wrong success).
+ */
+const SNAPSHOT_NAME_TAKEN_RE = /dataset already exists|file exists/i
+
+function isSnapshotNameTaken(err: unknown): boolean {
+  return SNAPSHOT_NAME_TAKEN_RE.test(err instanceof Error ? err.message : String(err))
+}
+
+/**
+ * Take with the collision retry (story cr.20, audit #46): scheduled names are
+ * second-resolution and the timers have no RandomizedDelaySec, so two
+ * schedules of the same bucket firing on the same dataset in the same second
+ * take the same canonical name — and the second fire used to fail the whole
+ * run ("the pool misses that hour"). On "already exists" the take retries
+ * ONCE with the deterministic suffix {@link withCollisionSuffix} yields; a
+ * second collision (three same-second fires) fails the run as before. The
+ * suffixed name stays inside the `anas-` stamped space retention recognises.
+ * Any other error propagates untouched, without a retry.
+ */
+async function takeWithCollisionRetry(
+  name: string,
+  take: (name: string) => Promise<unknown>,
+): Promise<string> {
+  try {
+    await take(name)
+    return name
+  }
+  catch (err) {
+    if (!isSnapshotNameTaken(err))
+      throw err
+    const retryName = withCollisionSuffix(name)
+    await take(retryName)
+    return retryName
+  }
+}
+
 export async function takeSnapshot(
   executor: CommandExecutor,
   target: SnapshotTarget,
@@ -113,6 +157,7 @@ export async function takeSnapshot(
   opts?: SnapshotServiceOptions,
 ): Promise<TakeSnapshotResult> {
   const name = formatScheduledName(bucket, opts?.now ?? new Date())
+  let finalName: string
   if (target.kind === 'zfs') {
     // The ONE zfs-snapshot verb (backup2.3's extraction): identical argv, shared
     // with the datasets route, replication's snapshot-first and the backup runner.
@@ -120,16 +165,18 @@ export async function takeSnapshot(
     // takes the rest in one atomic call; without one it stays the literal `-r`.
     const exclude = opts?.exclude ?? []
     const properties = opts?.scheduleId ? { [SCHEDULE_STAMP_PROPERTY]: opts.scheduleId } : undefined
-    if (opts?.recursive === true && exclude.length > 0)
-      await createZfsSnapshotExcluding(executor, { dataset: target.dataset, name, exclude, properties })
-    else
-      await createZfsSnapshot(executor, { dataset: target.dataset, name, recursive: opts?.recursive === true, properties })
+    finalName = await takeWithCollisionRetry(name, async (n) => {
+      if (opts?.recursive === true && exclude.length > 0)
+        await createZfsSnapshotExcluding(executor, { dataset: target.dataset, name: n, exclude, properties })
+      else
+        await createZfsSnapshot(executor, { dataset: target.dataset, name: n, recursive: opts?.recursive === true, properties })
+    })
   }
   else {
     const pool = requirePool(target, opts)
-    await createAhrSnapshot(executor, pool, name, opts?.updateProgress ?? noop, opts)
+    finalName = await takeWithCollisionRetry(name, async n => createAhrSnapshot(executor, pool, n, opts?.updateProgress ?? noop, opts))
   }
-  return { target, name, bucket }
+  return { target, name: finalName, bucket }
 }
 
 // ---- List -------------------------------------------------------------------

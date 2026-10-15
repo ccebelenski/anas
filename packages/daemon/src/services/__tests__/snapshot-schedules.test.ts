@@ -201,6 +201,91 @@ describe('takeSnapshot — uniform, dispatches by target.kind', () => {
     const executor = mockExec()
     await assert.rejects(() => takeSnapshot(executor, AHR_TARGET, 'daily', { now: NOW }), /requires the resolved pool/)
   })
+
+  // cr.20 (audit #46): two same-bucket schedules fire on one dataset in the
+  // same second — the canonical name exists, the second take used to fail the
+  // run ("the pool misses that hour").
+  const TAKEN = (name: string) => ({ stdout: '', stderr: `cannot create 'tank/media@${name}': dataset already exists`, exitCode: 1 })
+  const OK = { stdout: '', stderr: '', exitCode: 0 }
+
+  it('cr.20 collision: "dataset already exists" retries once with the -2 suffix', async () => {
+    const executor = mockExec()
+    executor.addFixture({ command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}`], result: TAKEN(`anas-daily-${STAMP}`) })
+    executor.addFixture({ command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}-2`], result: OK })
+    const res = await takeSnapshot(executor, ZFS_TARGET, 'daily', { now: NOW })
+    assert.deepEqual(res, { target: ZFS_TARGET, name: `anas-daily-${STAMP}-2`, bucket: 'daily' })
+    assert.deepEqual(executor.calls, [
+      { command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}`] },
+      { command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}-2`] },
+    ])
+  })
+
+  it('cr.20 collision: the retry stamps the same anas:schedule id (ownership survives)', async () => {
+    const executor = mockExec()
+    executor.addFixture({ command: ZFS, args: ['snapshot', '-o', 'anas:schedule=daily-media', `tank/media@anas-daily-${STAMP}`], result: TAKEN(`anas-daily-${STAMP}`) })
+    executor.addFixture({ command: ZFS, args: ['snapshot', '-o', 'anas:schedule=daily-media', `tank/media@anas-daily-${STAMP}-2`], result: OK })
+    await takeSnapshot(executor, ZFS_TARGET, 'daily', { now: NOW, scheduleId: 'daily-media' })
+    assert.deepEqual(executor.calls[1], { command: ZFS, args: ['snapshot', '-o', 'anas:schedule=daily-media', `tank/media@anas-daily-${STAMP}-2`] })
+  })
+
+  it('cr.20 collision: the exclude expansion retries its ONE atomic call under the suffix', async () => {
+    const executor = mockExec()
+    executor.addFixture({
+      command: ZFS,
+      args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'tank/media'],
+      result: { ...OK, stdout: ['tank/media', 'tank/media/movies'].join('\n') },
+    })
+    executor.addFixture({ command: ZFS, args: ['snapshot', '-o', 'anas:schedule=h', `tank/media@anas-hourly-${STAMP}`, `tank/media/movies@anas-hourly-${STAMP}`], result: TAKEN(`tank/media/movies@anas-hourly-${STAMP}`) })
+    executor.addFixture({ command: ZFS, args: ['snapshot', '-o', 'anas:schedule=h', `tank/media@anas-hourly-${STAMP}-2`, `tank/media/movies@anas-hourly-${STAMP}-2`], result: OK })
+    const res = await takeSnapshot(executor, ZFS_TARGET, 'hourly', { now: NOW, recursive: true, exclude: ['tank/media/scratch'], scheduleId: 'h' })
+    assert.equal(res.name, `anas-hourly-${STAMP}-2`)
+    // list, snapshot (collision), list again, then the retry's ONE atomic call.
+    assert.deepEqual(executor.calls[3], { command: ZFS, args: ['snapshot', '-o', 'anas:schedule=h', `tank/media@anas-hourly-${STAMP}-2`, `tank/media/movies@anas-hourly-${STAMP}-2`] })
+  })
+
+  it('cr.20 collision: a second collision (three same-second fires) fails the run', async () => {
+    const executor = mockExec()
+    executor.addFixture({ command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}`], result: TAKEN(`anas-daily-${STAMP}`) })
+    executor.addFixture({ command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}-2`], result: TAKEN(`anas-daily-${STAMP}-2`) })
+    await assert.rejects(() => takeSnapshot(executor, ZFS_TARGET, 'daily', { now: NOW }), /already exists/)
+    assert.equal(executor.calls.length, 2) // retry ONCE — no suffix ladder
+  })
+
+  it('cr.20: any other take failure is NOT a collision — no retry', async () => {
+    const executor = mockExec()
+    executor.addFixture({ command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}`], result: { stdout: '', stderr: 'cannot create \'tank/media@x\': no space left on device', exitCode: 1 } })
+    await assert.rejects(() => takeSnapshot(executor, ZFS_TARGET, 'daily', { now: NOW }), /no space left/)
+    assert.equal(executor.calls.length, 1)
+  })
+
+  it('cr.20 collision (AHR): btrfs "file exists" retries once with the -2 suffix', async () => {
+    const runtimeDir = await mkdtemp(join(tmpdir(), 'anas-sched-'))
+    try {
+      const executor = mockExec()
+      const top = join(runtimeDir, 'tank.toplevel')
+      executor.addFixture({ command: MOUNT, result: OK })
+      executor.addFixture({ command: UMOUNT, result: OK })
+      executor.addFixture({
+        command: BTRFS,
+        results: [
+          { stdout: '', stderr: `ERROR: ${join(top, '@snapshots', `anas-daily-${STAMP}`)}: file exists`, exitCode: 1 },
+          OK,
+        ],
+      })
+      const res = await takeSnapshot(executor, AHR_TARGET, 'daily', { now: NOW, pool: mkPool(), runtimeDir })
+      assert.equal(res.name, `anas-daily-${STAMP}-2`)
+      // The retry is a full second take — the createAhrSnapshot primitive owns
+      // its mount cycle, so the two btrfs calls sit in two mount/umount pairs.
+      const btrfsCalls = executor.calls.filter(c => c.command === BTRFS).map(c => c.args.at(-1))
+      assert.deepEqual(btrfsCalls, [
+        join(top, '@snapshots', `anas-daily-${STAMP}`),
+        join(top, '@snapshots', `anas-daily-${STAMP}-2`),
+      ])
+    }
+    finally {
+      await rm(runtimeDir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('parseZfsScheduledSnapshots — held + source marking', () => {
@@ -490,6 +575,18 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
   it('a child keeps the snapshots of OTHER buckets (its own daily schedule\'s)', () => {
     const plans = plan(tree(['tank', 'tank/media'], [row('tank/media', D1, 50)]))
     assert.ok(!byDs(plans, 'tank/media')!.prune.some(s => s.name === D1))
+  })
+
+  it('cr.20: a stamped collision-suffixed snapshot is owned and pruned like its siblings', () => {
+    // The retry's take: same second as H3, `-2` suffix, stamped like any
+    // other snapshot of the schedule. It parses, owns, buckets and prunes
+    // inside hourly:1 exactly like the unsuffixed forms.
+    const H3S = 'anas-hourly-2026-07-26T120000Z-2'
+    const plans = plan(tree(['tank'], [row('tank', H3S, 310)]))
+    const p = byDs(plans, 'tank')!
+    // hourly:1 keeps the canonical newest (stable order within the tied
+    // second); the suffixed one is a normal prune candidate, not "other".
+    assert.deepEqual(p.prune.map(s => s.name).sort(), [H1, H2, H3S].sort())
   })
 
   it('ident.1: two schedules on one dataset each prune only their OWN stamped snapshots', () => {

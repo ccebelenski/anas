@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { AbsolutePath, DevicePath, DiskId, PoolName, UUID } from './common.js'
+import { AbsolutePath, DevicePath, DiskId, PoolName, reservedSnapshotPrefixMessage, SCHEDULED_SNAPSHOT_PREFIX, UUID } from './common.js'
 import { IscsiHeldByLun } from './iscsi.js'
 
 /**
@@ -844,6 +844,20 @@ export const AhrSnapshotName = z
 export type AhrSnapshotName = z.infer<typeof AhrSnapshotName>
 
 /**
+ * A MANUAL AHR snapshot name (POST /ahr/:name/snapshots — story cr.20,
+ * audit #1's remaining gap): an {@link AhrSnapshotName} outside the
+ * `anas-` prefix the schedules own. AHR retention has no ownership stamp
+ * (btrfs has no user properties) — it scopes pruning to names that parse as
+ * `anas-<bucket>-<utc>`, so a hand-made name in that space is pruned as
+ * soon as a schedule covers the pool. Case-sensitive like its ZFS sibling
+ * {@link NewSnapshotName}. Reads keep {@link AhrSnapshotName}.
+ */
+export const NewAhrSnapshotName = AhrSnapshotName.superRefine((name, ctx) => {
+  if (name.startsWith(SCHEDULED_SNAPSHOT_PREFIX))
+    ctx.addIssue({ code: 'custom', message: reservedSnapshotPrefixMessage() })
+})
+
+/**
  * One btrfs snapshot under `@snapshots` (§12). Sizes are deliberately absent —
  * per-snapshot usage needs btrfs qgroups, OUT of v1: showing an unlabeled or
  * wrong number is worse than showing none.
@@ -874,7 +888,8 @@ export type AhrSnapshot = z.infer<typeof AhrSnapshot>
  * state — consistent with the other AHR verbs' guards.
  */
 export const AhrCreateSnapshotRequest = z.object({
-  name: AhrSnapshotName.optional(),
+  // cr.20 (audit #1): a manual name may not sit inside the `anas-` prefix.
+  name: NewAhrSnapshotName.optional(),
 })
 export type AhrCreateSnapshotRequest = z.infer<typeof AhrCreateSnapshotRequest>
 

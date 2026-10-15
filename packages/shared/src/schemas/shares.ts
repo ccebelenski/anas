@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { EXPORT_PATH_MSG, ExportClientSpec, ExportOption, isExportPath } from '../formats/exports.js'
 import { SmbConfListEntry, SmbConfValue } from '../formats/smb-conf.js'
-import { AbsolutePath, ShareName, SingleLine } from './common.js'
+import { AbsolutePath, NewShareName, ShareName, SingleLine } from './common.js'
 
 // ============================================================================
 // SMB (Samba) — shares are managed by surgical in-place edits to smb.conf.
@@ -187,7 +187,10 @@ export type ShareAccessGrantRequest = z.infer<typeof ShareAccessGrantRequest>
  * a hand-written file).
  */
 export const CreateSmbShareRequest = z.object({
-  name: ShareName,
+  // cr.20 (audit #23): a NEW share may not be named one of Samba's special
+  // sections — `global` would append a second `[global]` Samba merges into
+  // the first, and ANAS could neither show nor delete the stanza it wrote.
+  name: NewShareName,
   path: AbsolutePath.and(SmbConfValue),
   comment: SmbConfValue.optional(),
   browseable: z.boolean().optional(),

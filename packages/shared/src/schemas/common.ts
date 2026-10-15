@@ -102,12 +102,81 @@ export const SnapshotName = z
   .max(255)
   .regex(/^[\w:.-]+$/, 'Invalid snapshot name')
 
+/**
+ * The `anas-` prefix marks the snapshot names ANAS OWNS: the schedule
+ * convention `anas-<bucket>-<utc>` (and the transient run scaffolding under
+ * `anas-backup-` / `anas-cloud-`) parses from this prefix, and ZFS prune
+ * additionally treats an UNSTAMPED name that parses as scheduled as the
+ * legacy-owned snapshots of the one schedule covering the dataset. The
+ * daemon's naming module imports this constant — one definition of the
+ * prefix, schema and engine alike.
+ */
+export const SCHEDULED_SNAPSHOT_PREFIX = 'anas-'
+
+/** The refusal for a manual snapshot name inside the ANAS-owned prefix. */
+export function reservedSnapshotPrefixMessage(): string {
+  return `'${SCHEDULED_SNAPSHOT_PREFIX}' is reserved for scheduled snapshots — choose another name`
+}
+
+/**
+ * A MANUAL snapshot name (create, rename — story cr.20, audit #1's remaining
+ * gap): a {@link SnapshotName} outside the {@link SCHEDULED_SNAPSHOT_PREFIX}
+ * space. Matched case-sensitively on purpose (unlike the Samba section names
+ * of {@link NewShareName}): ZFS and btrfs snapshot labels are case-sensitive,
+ * and the retention parser that scopes pruning matches the lowercase prefix
+ * exactly — `Anas-foo` is a harmless ordinary name. Reads keep
+ * {@link SnapshotName}; an existing `anas-*` snapshot stays addressable.
+ */
+export const NewSnapshotName = SnapshotName.superRefine((name, ctx) => {
+  if (name.startsWith(SCHEDULED_SNAPSHOT_PREFIX))
+    ctx.addIssue({ code: 'custom', message: reservedSnapshotPrefixMessage() })
+})
+
 /** SMB share name */
 export const ShareName = z
   .string()
   .min(1)
   .max(255)
   .regex(/^[\w-]+$/, 'Must be alphanumeric with underscores or hyphens')
+
+/**
+ * Samba's three special section names (audit #23): `[global]` is the server
+ * configuration, and `homes`/`printers` are the documented service-template
+ * sections Samba interprets specially. A share ANAS wrote under one of these
+ * names collides with Samba's own handling of the section (a second `[global]`
+ * is merged into the first) while the parser reads `global` as the global
+ * section — so ANAS could neither show nor delete what it wrote. The special
+ * names and their case-insensitive matching are Samba's documented behaviour
+ * (man smb.conf — from memory); our own parser already folds section names
+ * the same way (`parseDoc` lowercases the key, `findSection` matches
+ * case-insensitively), which is what would otherwise let `Global` slip
+ * through as "a different share" than the existing `[global]`.
+ */
+export const RESERVED_SMB_SECTIONS = ['global', 'homes', 'printers'] as const
+
+/** The reserved Samba section name `name` folds to, or null when it reserves nothing. */
+export function reservedSmbSection(name: string): string | null {
+  const lower = name.toLowerCase()
+  return (RESERVED_SMB_SECTIONS as readonly string[]).find(s => s === lower) ?? null
+}
+
+/** The refusal text for a reserved section name (create door). */
+export function reservedSmbSectionMessage(name: string): string {
+  return `'${name}' is a reserved Samba section name and cannot be a share name`
+}
+
+/**
+ * The name of a NEW SMB share (POST — story cr.20, audit #23): a
+ * {@link ShareName} that is not one of Samba's special sections, refused
+ * case-insensitively (Samba matches section names case-insensitively). Reads
+ * keep {@link ShareName}: a hand-written `[homes]` with a path stays a
+ * listable, manageable share, exactly like it was before this gate.
+ */
+export const NewShareName = ShareName.superRefine((name, ctx) => {
+  const reserved = reservedSmbSection(name)
+  if (reserved)
+    ctx.addIssue({ code: 'custom', message: reservedSmbSectionMessage(name) })
+})
 
 /**
  * Absolute filesystem path, no traversal. Rejects control characters (newline,

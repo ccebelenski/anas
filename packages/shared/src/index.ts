@@ -143,6 +143,7 @@ export {
   ArrayLevel,
   ArrayState,
   AttachAhrCacheRequest,
+  NewAhrSnapshotName,
 } from './schemas/ahr.js'
 
 // API envelope schemas
@@ -303,11 +304,18 @@ export {
   hasControlChars,
   ISODateTime,
   NewDatasetPath,
+  NewShareName,
+  NewSnapshotName,
   NotifyMode,
   PoolName,
   RESERVED_DATASET_SEGMENTS,
+  RESERVED_SMB_SECTIONS,
   reservedDatasetSegment,
   reservedDatasetSegmentMessage,
+  reservedSmbSection,
+  reservedSmbSectionMessage,
+  reservedSnapshotPrefixMessage,
+  SCHEDULED_SNAPSHOT_PREFIX,
   ShareName,
   SingleLine,
   SnapshotName,

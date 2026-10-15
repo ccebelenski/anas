@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { ISODateTime, PoolName, reservedDatasetSegment, reservedDatasetSegmentMessage, SnapshotName } from './common.js'
+import { ISODateTime, NewSnapshotName, PoolName, reservedDatasetSegment, reservedDatasetSegmentMessage } from './common.js'
 
 // --- Read model ---
 
@@ -28,17 +28,24 @@ export type Snapshot = z.infer<typeof Snapshot>
 
 // --- Write models ---
 
-/** Create a snapshot (POST …/snapshots). `name` is the label after '@'. */
+/**
+ * Create a snapshot (POST …/snapshots). `name` is the label after '@' —
+ * cr.20 (audit #1): manual names may not sit inside the `anas-` prefix the
+ * schedules own.
+ */
 export const CreateSnapshotRequest = z.object({
-  name: SnapshotName,
+  name: NewSnapshotName,
   /** Also snapshot child datasets recursively (`zfs snapshot -r`) */
   recursive: z.boolean().optional(),
 })
 export type CreateSnapshotRequest = z.infer<typeof CreateSnapshotRequest>
 
-/** Rename a snapshot (PUT …/snapshots/:snap). `newName` is the new label. */
+/**
+ * Rename a snapshot (PUT …/snapshots/:snap). `newName` is the new label —
+ * `NewSnapshotName`: the rename door is a create door for the name.
+ */
 export const RenameSnapshotRequest = z.object({
-  newName: SnapshotName,
+  newName: NewSnapshotName,
 })
 export type RenameSnapshotRequest = z.infer<typeof RenameSnapshotRequest>
 
