@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
 import { serveBlankInventoryDisks } from './inventory-stub.js'
+import { servePoolGuardReads } from './pool-guard-reads.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -106,6 +107,8 @@ function seedRaidz(
 ): void {
   const mock = (server as unknown as { executor: MockExecutor }).executor
   mock.clearFixtures()
+  // cr.36: the guard's guid and boot-facts reads, from the capture (pool-guard-reads.ts).
+  servePoolGuardReads(mock, RZ)
   mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: raidzList(), stderr: '', exitCode: 0 } })
   mock.addFixture({ command: ZPOOL, args: ['status', '-jv'], result: { stdout: opts.status ?? raidzStatus(), stderr: '', exitCode: 0 } })
   mock.addFixture({ command: ZPOOL, args: ['get', 'all', '-j'], result: { stdout: getAll(opts.feature === undefined ? 'enabled' : opts.feature), stderr: '', exitCode: 0 } })

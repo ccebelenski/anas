@@ -21,6 +21,7 @@ import {
   spareInUseMessage,
   unreadablePoolMessage,
 } from '../../services/zfs-vdev-remove.js'
+import { servePoolGuardReads } from './pool-guard-reads.js'
 
 /**
  * Story vdevs.2 — POST /v1/pools/:name/vdevs/remove.
@@ -110,7 +111,8 @@ async function waitForJob(server: ReturnType<typeof createServer>, id: string): 
 /**
  * A server whose only live reads are the pool list and a SCRIPTED sequence of
  * `zpool status -jv` answers: the first is what the route resolves the name
- * against, the rest are what the job's settle loop re-reads (the last repeats).
+ * against (and, since cr.36, what the job's guard re-reads), the rest are
+ * what the job's settle loop re-reads (the last repeats).
  * Everything else is unmatched and fail-opens, as every read on this route does.
  */
 function serverWith(statuses: StatusDoc[], remove?: ExecResult): ReturnType<typeof createServer> {
@@ -132,10 +134,16 @@ function serverForPool(
   const mock = (server as unknown as { executor: MockExecutor }).executor
   mock.clearFixtures()
   mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: list })
-  mock.addFixture({ command: ZPOOL, args: ['status', '-jv'], results: statuses })
+  // cr.36: the job's guard re-reads the pool before it acts, so the route's
+  // answer is served twice — once to the route, once to the job's re-read —
+  // and the settle loop reads the rest. A test that changes the pool between
+  // the two doors lives in pools-guard-verbs.test.ts.
+  mock.addFixture({ command: ZPOOL, args: ['status', '-jv'], results: [statuses[0], ...statuses] })
   // Readable boot facts with no bootfs: the system-pool rule stays inactive
   // (an unreadable probe would tighten every pool to hands-off).
   mock.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: `${poolName}\t-\n`, stderr: '', exitCode: 0 } })
+  // cr.36: the guard's guid read, from the capture (pool-guard-reads.ts).
+  servePoolGuardReads(mock, poolName)
   mock.addFixture({ command: ZPOOL, args: undefined, result: remove ?? { stdout: '', stderr: '', exitCode: 0 } })
   return server
 }
@@ -389,7 +397,7 @@ describe('remove-vdev: a PVE-owned pool is refused', () => {
     dir = undefined
   })
 
-  it('400s when storage.cfg registers the pool as a zfspool storage', async () => {
+  it('409 PVE_MANAGED when storage.cfg registers the pool as a zfspool storage', async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-vdev-remove-'))
     const cfg = join(dir, 'storage.cfg')
     await writeFile(cfg, 'zfspool: local-zfs\n\tpool testpool\n\tcontent images,rootdir\n')
@@ -403,8 +411,12 @@ describe('remove-vdev: a PVE-owned pool is refused', () => {
       payload: JSON.stringify({ vdev: CACHE_ID }),
     })
 
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    // cr.36: one fact, one answer — the PVE refusal every pool verb gives (a
+    // 400 VALIDATION_ERROR on this route before; export/destroy's 409 since cr.32).
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
+    assert.equal(res.json().error.reason, 'pve-managed')
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no confirm bypass')
     assert.match(res.json().error.message, /local-zfs/)
     assert.equal(removeCall(server), undefined)
   })

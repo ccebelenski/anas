@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
+import { servePoolGuardReads } from './pool-guard-reads.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -162,6 +163,8 @@ describe('scrub endpoint: POST /v1/pools/:name/scrub', () => {
     // with a failing scrub instead of appending after the built-in success.
     const mock = (server as any).executor as MockExecutor
     mock.clearFixtures()
+    // cr.36: the guard's guid and boot-facts reads, from the capture (pool-guard-reads.ts).
+    servePoolGuardReads(mock)
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({
       command: '/usr/sbin/zpool',

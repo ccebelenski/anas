@@ -279,7 +279,7 @@ describe('change pool mountpoint: PVE-managed pools are hands-off (3.27 / 3.25)'
     dir = undefined
   })
 
-  it('400s for a pool PVE manages (storage.cfg zfspool entry names it)', async () => {
+  it('409 PVE_MANAGED for a pool PVE manages (storage.cfg zfspool entry names it)', async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-pools-3-27-'))
     const cfg = join(dir, 'storage.cfg')
     await writeFile(cfg, 'zfspool: local-zfs\n\tpool testpool\n\tcontent images,rootdir\n')
@@ -293,8 +293,12 @@ describe('change pool mountpoint: PVE-managed pools are hands-off (3.27 / 3.25)'
       headers: JSON_HEADERS,
       payload: JSON.stringify({ mountpoint: '/srv/newhome' }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    // cr.36: one fact, one answer — the PVE refusal every pool verb gives (a
+    // 400 VALIDATION_ERROR on this route before; export/destroy's 409 since cr.32).
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
+    assert.equal(res.json().error.reason, 'pve-managed')
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no confirm bypass')
     assert.match(res.json().error.message, /PVE/)
     assert.ok(!calls.some(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'set'), 'never runs zfs set')
   })

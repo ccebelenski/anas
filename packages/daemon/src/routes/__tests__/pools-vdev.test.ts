@@ -10,6 +10,7 @@ import { afterEach, describe, it } from 'node:test'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
 import { serveBlankInventoryDisks } from './inventory-stub.js'
+import { servePoolGuardReads } from './pool-guard-reads.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -323,6 +324,8 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
     // fail-closed refusal. Seed a readable-quiet boot probe — the world this
     // test is about is a failing `zpool add`, not a system pool.
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
+    // cr.36: the guard's guid read, from the capture (pool-guard-reads.ts).
+    servePoolGuardReads(mock)
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({
       command: '/usr/sbin/zpool',
@@ -363,7 +366,7 @@ describe('add-vdev: a PVE-owned pool is refused', () => {
     dir = undefined
   })
 
-  it('400s when storage.cfg registers the pool as a zfspool storage — no zpool add', async () => {
+  it('409 PVE_MANAGED when storage.cfg registers the pool as a zfspool storage — no zpool add', async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-vdev-add-'))
     const cfg = join(dir, 'storage.cfg')
     await writeFile(cfg, 'zfspool: local-zfs\n\tpool testpool\n\tcontent images,rootdir\n')
@@ -380,8 +383,12 @@ describe('add-vdev: a PVE-owned pool is refused', () => {
       payload: JSON.stringify({ vdev: { type: 'mirror', disks: [DISK_A, DISK_B] } }),
     })
 
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    // cr.36: one fact, one answer — the PVE refusal every pool verb gives (a
+    // 400 VALIDATION_ERROR on this route before; export/destroy's 409 since cr.32).
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
+    assert.equal(res.json().error.reason, 'pve-managed')
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no confirm bypass')
     assert.match(res.json().error.message, /local-zfs/)
     assert.equal(spy.calls.find(c => c.args[0] === 'add'), undefined)
   })
@@ -403,7 +410,8 @@ describe('add-vdev: a PVE-owned pool is refused', () => {
       payload: JSON.stringify({ role: 'cache', disks: [DISK_A] }),
     })
 
-    assert.equal(res.statusCode, 400)
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     assert.match(res.json().error.message, /local-zfs/)
     assert.equal(spy.calls.find(c => c.args[0] === 'add'), undefined)
   })

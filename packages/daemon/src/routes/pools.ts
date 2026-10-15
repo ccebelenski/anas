@@ -1,12 +1,14 @@
 import type { Disk, ExpansionTarget, PoolDetail, PoolExpansionReport, PoolSummary, PveOwnership, VdevSpec } from '@anas/shared'
-import type { FastifyInstance, FastifyReply } from 'fastify'
+import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
+import type { LockClaim, LockMode } from '../jobs/locks.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ParsedPoolStatus } from '../parsers/zpool-status.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { Advisory, Gate, GuardReads, GuardSpec } from '../safety/guard.js'
+import type { Advisory, Gate, GuardReads, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
+import type { ResolvedVdev } from '../services/zfs-vdev-remove.js'
 import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, DestroyPoolQuery, ExportPoolRequest, ImportPoolRequest, isComposableDisk, isRemovableVdevRole, PoolMountpointRequest, PoolName, pveStoragePath, RemoveVdevRequest, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
 import { parseByIdToKernel, parseByIdToKernelFull, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
@@ -16,13 +18,13 @@ import { parseZpoolFeature, parseZpoolGet } from '../parsers/zpool-get.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parsePoolBusyState, parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
 import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
-import { confirmGate } from '../safety/gate.js'
-import { diskClaim, guardCheck, guardConfirm, guarded, poolClaims, sendRefusal } from '../safety/guard.js'
+import { diskClaim, guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, poolClaims, sendRefusal, znameClaim, zpoolClaim } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
+import { normalizeMountpointPath } from '../services/mounts.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
 import { loadPveFootprint, systemPoolRefusalFrom } from '../services/pve-footprint.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
@@ -67,10 +69,16 @@ const LIO_UNREADABLE_WARNING = 'ANAS could not check whether an iSCSI LUN is ser
 /**
  * Story cr.32 (WAVE3-DESIGN §5.2 rule 1): the request fields the export and
  * destroy confirms do NOT sign, each with its reason. None: every field
- * changes what the job does. `pools-guard.test.ts` pins both lists.
+ * changes what the job does. `pools-guard.test.ts` pins both lists, and
+ * `pools-guard-verbs.test.ts` the four cr.36 lists below.
  */
 export const POOL_EXPORT_PRESENTATION_ONLY: Record<string, string> = {}
 export const POOL_DESTROY_PRESENTATION_ONLY: Record<string, string> = {}
+/** Story cr.36: the upgrade, mountpoint, forced-create and forced-import confirms — none either. */
+export const POOL_UPGRADE_PRESENTATION_ONLY: Record<string, string> = {}
+export const POOL_MOUNTPOINT_PRESENTATION_ONLY: Record<string, string> = {}
+export const POOL_CREATE_PRESENTATION_ONLY: Record<string, string> = {}
+export const POOL_IMPORT_PRESENTATION_ONLY: Record<string, string> = {}
 
 /** A destroyed pool's vdev leaf, resolved for disk hygiene (story 3.14). */
 interface PoolLeaf {
@@ -783,45 +791,6 @@ export async function poolRoutes(
   }
 
   /**
-   * The hard no-bypass 409 when the pool is a system pool (story cr.23: boot
-   * facts or the live mount table). The sentence names the FACT that fired.
-   */
-  async function systemPoolBlock(poolName: string) {
-    const pve = await pveFootprint()
-    if (!pve.isSystemPool(poolName))
-      return null
-    return systemPoolRefusalFrom(pve, poolName)
-  }
-
-  /**
-   * The ONE pre-flight the two vdev-shape routes stand behind — adding a vdev
-   * and removing one reshape the same topology, so they ask the same two
-   * questions: the system-pool 409 (this node's boot filesystem, no bypass),
-   * then the PVE-ownership 400. PVE owns the topology of the pools it manages;
-   * ANAS does not reshape them (story pvepool.1). Export and destroy ask the
-   * same facts through their guard gates (cr.32: `poolSystemGate`,
-   * `poolPveGate`, the latter a 409 PVE_MANAGED that also covers a storage
-   * nested in the pool); moving these two routes onto the guard is cr.36.
-   *
-   * Answers the error body to return — the reply code is already set — or null
-   * when the request may proceed.
-   */
-  async function vdevTopologyGate(poolName: string, reply: FastifyReply): Promise<object | null> {
-    const systemBlock = await systemPoolBlock(poolName)
-    if (systemBlock) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: systemBlock.reason, message: systemBlock.message } }
-    }
-    const pve = await pveFootprint()
-    const owned = pve.ownershipOf(poolName)
-    if (owned) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
-    }
-    return null
-  }
-
-  /**
    * Every leaf of a pool, for disk cleanup (labelclear + zap) and for the
    * destroy confirm's bound scope (cr.32). Null when `zpool status` cannot be
    * read or does not list the pool — UNREADABLE, never "no leaves": a
@@ -836,10 +805,21 @@ export async function poolRoutes(
   }
 
   // -------------------------------------------------------------------------
-  // The guard specs for pool export and destroy (story cr.32, WAVE3-DESIGN
+  // The pool verbs' guard specs (stories cr.32 and cr.36, WAVE3-DESIGN §2.1,
   // §3, ruling (j)). The route and the job run the SAME gate list against
-  // facts each door reads for itself: exists, system pool, PVE ownership,
-  // held by an iSCSI LUN. The cr.24 references stay advisories.
+  // facts each door reads for itself, and every job holds its lock keys
+  // (cr.33, §4.2) before it re-reads.
+  //
+  // One fact, one answer (cr.36): wherever a pool verb asks whether the pool
+  // is a SYSTEM pool, the refusal is 409 CONFLICT `system-pool`, and wherever
+  // it asks whether PVE uses the pool, the refusal is 409 PVE_MANAGED
+  // `pve-managed` — export, destroy, mountpoint, add and remove vdev, attach,
+  // replace, raidz expand. Before cr.36 the vdev routes and the mountpoint
+  // route answered PVE with 400 VALIDATION_ERROR: nothing about such a
+  // request is malformed, the pool's state refuses it, and Principle 14 makes
+  // a blocked operation a 409. The ownership question is one too: the pool
+  // root OR any storage PVE keeps on the pool (the panel greys the same
+  // verbs on any `pveStorages`).
   // -------------------------------------------------------------------------
 
   /** The per-run reads the pool gates share (one per guard run, never across doors). */
@@ -848,6 +828,17 @@ export async function poolRoutes(
     footprint: (reads: GuardReads) => reads.once('pve-footprint', () => pveFootprint()),
     claims: (reads: GuardReads) => reads.once('iscsi-claims', async () => createIscsiClaimCache(executor, iscsiPaths)),
     leaves: (reads: GuardReads, pool: string) => reads.once(`pool-leaves:${pool}`, () => readPoolLeaves(pool)),
+    /** `zpool status -jv` — the topology the vdev gates resolve against, and the job's argv after them (cr.36). */
+    status: (reads: GuardReads) => reads.once('zpool-status', () => executor.exec(ZPOOL, ['status', '-jv'])),
+    getAll: (reads: GuardReads) => reads.once('zpool-get-all', () => executor.exec(ZPOOL, ['get', 'all', '-j'])),
+    zfsVersion: (reads: GuardReads) => reads.once('zfs-version', () => detectLocalZfsVersion(executor)),
+    composable: (reads: GuardReads, ids: string[]) => reads.once(`composable:${ids.join(' ')}`, () => composableDiskProblems(ids)),
+    mountpoints: (reads: GuardReads) => reads.once('pool-mountpoints', () => readPoolMountpoints(executor)),
+    liveMounts: (reads: GuardReads) => reads.once('findmnt-real', async () => {
+      const res = await executor.exec(FINDMNT, FINDMNT_ARGS)
+      return res.exitCode === 0 ? parseFindmnt(res.stdout) : []
+    }),
+    fstab: (reads: GuardReads) => reads.once('fstab', () => readConfig(fstabPath)),
   }
 
   /** The object a pool verb acts on: a pool `zpool list` names now. */
@@ -867,31 +858,40 @@ export async function poolRoutes(
     return { status: 409, code: 'CONFLICT', reason: refusal.reason, message: refusal.message }
   }
 
+  /** What the PVE refusal says after the fact, per verb family (cr.36: one answer, the verb's own sentence). */
+  const PVE_CONSEQUENCE = {
+    'export-destroy': 'Exporting or destroying a pool PVE uses is left to PVE — remove the storage in PVE (Datacenter → Storage) first if the pool is meant to go.',
+    'reshape': 'PVE owns the topology of the pools it manages: adding, removing, attaching, replacing or widening a vdev of a pool PVE uses is left to PVE.',
+    'mountpoint': 'PVE\'s storages sit under the pool\'s mountpoint: moving a pool PVE uses is left to PVE.',
+  } as const
+
   /**
-   * The PVE-OWNERSHIP gate (cr.32; EPICS §2 "PVE territory is read-only and
-   * hands-off", DESIGN pvepool.1 "pool-level actions on a PVE pool stay
-   * hands-off"): a hard 409 PVE_MANAGED, no confirm bypass, when PVE owns the
-   * pool root OR any storage PVE keeps on the pool — exporting or destroying
-   * the pool takes a nested storage root (`tank/vmdata`) and every guest disk
-   * under it just the same. Both questions go to the ONE ownership answer
-   * (`ownershipOf`, the shared `pveOwnership` predicate); the storage paths
-   * are the candidates the recursive-verb guard already takes. The panel
-   * greys Export/Destroy on the same pools (any `pveStorages`).
+   * The PVE-OWNERSHIP gate (cr.32, every pool-level verb since cr.36; EPICS
+   * §2 "PVE territory is read-only and hands-off", DESIGN pvepool.1
+   * "pool-level actions on a PVE pool stay hands-off"): a hard 409
+   * PVE_MANAGED, no confirm bypass, when PVE owns the pool root OR any
+   * storage PVE keeps on the pool — exporting, destroying, reshaping or
+   * moving the pool touches a nested storage root (`tank/vmdata`) and every
+   * guest disk under it just the same. Both questions go to the ONE ownership
+   * answer (`ownershipOf`, the shared `pveOwnership` predicate); the storage
+   * paths are the candidates the recursive-verb guard already takes. The
+   * panel greys the same verbs on the same pools (any `pveStorages`).
    */
-  const poolPveGate: Gate<PoolObject> = async (pool, reads) => {
-    const pve = await poolReads.footprint(reads)
-    const storagePaths = (pve.storagesByPool.get(pool.name) ?? [])
-      .map(ref => pveStoragePath(ref, pool.name))
-      .filter((path): path is string => path !== undefined)
-    const owned = pve.ownershipOf(pool.name) ?? pve.ownedDescendant(storagePaths, pool.name)?.ownership ?? null
-    if (!owned)
-      return null
-    return {
-      status: 409,
-      code: 'PVE_MANAGED',
-      reason: 'pve-managed',
-      message: `Pool '${pool.name}' is PVE territory: ${owned.reason}. Exporting or destroying a pool PVE uses is left to PVE — `
-        + `remove the storage in PVE (Datacenter → Storage) first if the pool is meant to go. This refusal has no confirm bypass.`,
+  function poolPveGate(family: keyof typeof PVE_CONSEQUENCE): Gate<PoolObject> {
+    return async (pool, reads) => {
+      const pve = await poolReads.footprint(reads)
+      const storagePaths = (pve.storagesByPool.get(pool.name) ?? [])
+        .map(ref => pveStoragePath(ref, pool.name))
+        .filter((path): path is string => path !== undefined)
+      const owned = pve.ownershipOf(pool.name) ?? pve.ownedDescendant(storagePaths, pool.name)?.ownership ?? null
+      if (!owned)
+        return null
+      return {
+        status: 409,
+        code: 'PVE_MANAGED',
+        reason: 'pve-managed',
+        message: `Pool '${pool.name}' is PVE territory: ${owned.reason}. ${PVE_CONSEQUENCE[family]} This refusal has no confirm bypass.`,
+      }
     }
   }
 
@@ -913,6 +913,168 @@ export async function poolRoutes(
   }
 
   /**
+   * The DISK-COMPOSABILITY gate (cr.12, a gate at both doors since cr.36):
+   * every disk the verb writes must resolve in the inventory and be
+   * composable NOW — a disk that joined a pool, took a partition table or
+   * came back as this node's own LUN between the request and the job is
+   * refused before `zpool` sees it. Two altitudes, unchanged: named disk
+   * problems are a 400; an inventory that cannot be read fails CLOSED as a
+   * 409 `unreadable` (`refusing` completes that sentence for the verb).
+   */
+  function composableGate<O>(ids: string[], refusing: string): Gate<O> {
+    return async (_object, reads) => {
+      const check = await poolReads.composable(reads, ids)
+      if ('unreadable' in check)
+        return { status: 409, code: 'CONFLICT', reason: 'unreadable', message: `${check.unreadable}; ${refusing}` }
+      if (check.problems.length > 0)
+        return { status: 400, code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${check.problems.join('; ')}` }
+      return null
+    }
+  }
+
+  /**
+   * The MOUNTPOINT gates (story 3.27, identical to the AHR precedent; gates at
+   * both doors since cr.36): `mp` is not already this pool's mountpoint
+   * (`self`, the change route only), not a live mount, not claimed in fstab,
+   * and not another dataset's mountpoint. The reads keep their fail-open
+   * shape from 3.27 (a failed read finds no collision); cr.36 only moved them
+   * into the job as well.
+   */
+  function mountpointGates<O>(mp: string, self?: string): Gate<O>[] {
+    const gates: Gate<O>[] = []
+    if (self) {
+      gates.push(async (_object, reads) => (await poolReads.mountpoints(reads)).get(self)?.mountpoint === mp
+        ? { status: 400, code: 'VALIDATION_ERROR', message: `'${mp}' is already this pool's mountpoint` }
+        : null)
+    }
+    gates.push(
+      async (_object, reads) => (await poolReads.liveMounts(reads)).some(m => m.target === mp)
+        ? { status: 409, code: 'CONFLICT', message: `'${mp}' is already a mountpoint — pick an unused path` }
+        : null,
+      async (_object, reads) => hasMount(await poolReads.fstab(reads), mp)
+        ? { status: 409, code: 'CONFLICT', message: `'${mp}' is already claimed in fstab — pick an unused path` }
+        : null,
+      async (_object, reads) => {
+        for (const [name, m] of await poolReads.mountpoints(reads)) {
+          if (name !== self && m.mountpoint === mp)
+            return { status: 409, code: 'CONFLICT', message: `'${mp}' is already pool '${name}' mountpoint — pick an unused path` }
+        }
+        return null
+      },
+    )
+    return gates
+  }
+
+  /**
+   * The existing leaf a mirror-attach or replace names, resolved against the
+   * pool's own `zpool status` (story vdevs.1 fix batch) — and, for an attach,
+   * the BUSY gate first (3.31: never a second resilver-inducing op mid
+   * resilver/reflow; a replace is exempt, it may be replacing the degraded
+   * disk). The gate and the job body call this with the same read, so the
+   * job hands `zpool` the device the gate just resolved (cr.36: never the
+   * request-time path). An unread status fails CLOSED (vdevs.2).
+   */
+  async function lookupLeaf(reads: GuardReads, poolName: string, existingDiskId: string, replace: boolean): Promise<{ path: string } | { refusal: Refusal }> {
+    const statusResult = await poolReads.status(reads)
+    if (!replace && statusResult.exitCode === 0) {
+      const busy = parsePoolBusyState(statusResult.stdout, poolName)
+      if (busy.busy)
+        return { refusal: { status: 409, code: 'CONFLICT', reason: 'busy', message: busyDetail(busy, poolName) } }
+    }
+    const leafStatus = statusResult.exitCode === 0
+      ? parseZpoolStatusPool(statusResult.stdout, poolName)
+      : null
+    if (!leafStatus) {
+      const detail = statusResult.exitCode === 0
+        ? `zpool status no longer reports the pool`
+        : statusResult.stderr.trim() || `zpool status exited with code ${statusResult.exitCode}`
+      const verb = replace ? 'replace' : 'attach to'
+      return { refusal: { status: 409, code: 'CONFLICT', reason: 'unreadable', message: `pool ${poolName}'s status could not be read (${detail}); refusing to ${verb} a device it cannot identify` } }
+    }
+    const leaf = resolveLeafDevice(leafStatus, existingDiskId)
+    if (!leaf)
+      return { refusal: { status: 400, code: 'VALIDATION_ERROR', message: unknownVdevMessage(poolName, existingDiskId) } }
+    if (isVdevRefusal(leaf))
+      return { refusal: { status: 400, code: 'VALIDATION_ERROR', message: leaf.message } }
+    return { path: leaf.path }
+  }
+
+  /**
+   * The vdev a remove names, resolved against the pool's own `zpool status`
+   * to the token ZFS reports (story vdevs.2), refused when it is unknown,
+   * ambiguous, a spare at work, or of a class ZFS cannot simply drop. Gate
+   * and job body share the read (cr.36: the job removes the token resolved
+   * NOW, never the request-time one).
+   */
+  async function lookupRemoval(reads: GuardReads, poolName: string, requested: string): Promise<{ resolved: ResolvedVdev } | { refusal: Refusal }> {
+    const statusResult = await poolReads.status(reads)
+    const status = statusResult.exitCode === 0
+      ? parseZpoolStatusPool(statusResult.stdout, poolName)
+      : null
+    if (!status)
+      return { refusal: { status: 404, code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    const lookup = resolveVdev(status, requested)
+    if (!lookup)
+      return { refusal: { status: 400, code: 'VALIDATION_ERROR', message: unknownVdevMessage(poolName, requested) } }
+    // A name the pool carries but must not act on: it fits more than one leaf
+    // (a split by-id device), or it is a spare ZFS has put to work.
+    if (isVdevRefusal(lookup))
+      return { refusal: { status: 400, code: 'VALIDATION_ERROR', message: lookup.message } }
+    if (!isRemovableVdevRole(lookup.role))
+      return { refusal: { status: 400, code: 'VALIDATION_ERROR', message: NON_REMOVABLE_VDEV_MESSAGE } }
+    return { resolved: lookup }
+  }
+
+  /**
+   * The RAIDZ-EXPANSION gates (story 3.31) as one gate, in their order: the
+   * target is an existing raidz DATA vdev, the module is OpenZFS ≥ 2.3.0,
+   * `feature@raidz_expansion` is enabled, and no resilver or reflow runs.
+   */
+  function raidzExpandGate(targetVdev: string): Gate<PoolObject> {
+    return async (pool, reads) => {
+      const poolName = pool.name
+      const [statusResult, getResult, version] = await Promise.all([
+        poolReads.status(reads),
+        poolReads.getAll(reads),
+        poolReads.zfsVersion(reads),
+      ])
+      const status = statusResult.exitCode === 0 ? parseZpoolStatusPool(statusResult.stdout, poolName) : null
+      if (!status)
+        return { status: 404, code: 'NOT_FOUND', message: `Pool '${poolName}' not found` }
+
+      // The target must be an existing raidz DATA vdev.
+      const dataGroup = status.vdevGroups.find(g => g.role === 'data')
+      const vdev = dataGroup?.vdevs.find(v => v.name === targetVdev)
+      if (!vdev)
+        return { status: 404, code: 'NOT_FOUND', message: `Vdev '${targetVdev}' not found in pool '${poolName}'` }
+      if (raidzParity(vdev.type) === null)
+        return { status: 400, code: 'VALIDATION_ERROR', message: `Vdev '${targetVdev}' is a ${vdev.type}, not a raidz — raidz expansion needs a raidz vdev (attach a mirror leg via existingDiskId instead)` }
+
+      // GATE 1 (version): raidz expansion landed in OpenZFS 2.3.0.
+      const featureValue = getResult.exitCode === 0 ? parseZpoolFeature(getResult.stdout, poolName, RAIDZ_EXPANSION_FEATURE) : null
+      const capability = buildCapability(version, featureValue)
+      if (!capability.moduleSupported)
+        return { status: 409, code: 'CONFLICT', reason: 'version', message: `RAIDZ expansion needs OpenZFS ≥ 2.3.0; this node runs ${capability.zfsVersion ?? 'an undetectable version'}. This refusal has no confirm bypass.` }
+      // GATE 1b (flag): feature@raidz_expansion must be enabled/active.
+      if (!capability.featureEnabled)
+        return { status: 409, code: 'CONFLICT', reason: 'flag', message: `Pool '${poolName}' has feature@raidz_expansion ${capability.featureState}. Enable it first with: zpool upgrade ${poolName}` }
+      // GATE 2 (busy): no new expansion while a resilver/reflow runs.
+      const busy = parsePoolBusyState(statusResult.stdout, poolName)
+      if (busy.busy)
+        return { status: 409, code: 'CONFLICT', reason: 'busy', message: busyDetail(busy, poolName) }
+      return null
+    }
+  }
+
+  /** One exclusive `disk:` key per distinct disk id a verb writes, sorted (§4.2). */
+  function diskClaims(ids: string[]): LockClaim[] {
+    // Two steps on an array we own (`toSorted()` is ES2023; this package targets ES2022).
+    const distinct = [...new Set(ids)]
+    distinct.sort()
+    return distinct.map(id => diskClaim(id))
+  }
+
+  /**
    * What still references the pool (story cr.24): one advisory per reference
    * and per unreadable source, plus the LIO-unreadable disclosure (D3: a
    * broken claims read fail-opens to "nothing held", which a node genuinely
@@ -931,25 +1093,48 @@ export async function poolRoutes(
   }
 
   /**
-   * The guard spec of a pool-level verb. `cleanup` (destroy only) binds the
-   * leaves the cleanup would wipe as the confirm's scope: a leaf added between
-   * the challenge and the job changes what the operator agreed to wipe.
+   * An existing pool as a guard object: the pool `zpool list` names now,
+   * bound to its guid (story ident.1 — an export/import swap under the same
+   * name is a different pool, so the job fails IDENTITY_MISMATCH and nothing
+   * runs). `noun` names the verb in the unreadable-guid refusal. `extend`
+   * adds what the verb resolves against the pool as it is NOW (the vdev a
+   * remove names, the leaf an attach names): read with the object at each
+   * door, so the gate that judges it and the job body that acts on it see
+   * the same answer, and the body never acts on the route's.
+   */
+  function poolObjectView<X extends object = object>(
+    poolName: string,
+    noun: string,
+    extend?: (reads: GuardReads) => Promise<X>,
+  ): ObjectView<PoolObject & X> {
+    return {
+      what: `Pool '${poolName}'`,
+      read: async (reads) => {
+        const list = await poolReads.list(reads)
+        const pools = list.exitCode === 0 ? parseZpoolList(list.stdout) : []
+        if (!pools.some(p => p.name === poolName))
+          return null
+        return { name: poolName, ...(extend ? await extend(reads) : {}) } as PoolObject & X
+      },
+      id: pool => readPoolGuid(executor, pool.name),
+      unbound: () => `Could not read the guid of pool '${poolName}' — refusing ${noun} that cannot be bound to it`,
+    }
+  }
+
+  /**
+   * The guard spec of export and destroy (cr.32). `cleanup` (destroy only)
+   * binds the leaves the cleanup would wipe as the confirm's scope: a leaf
+   * added between the challenge and the job changes what the operator agreed
+   * to wipe.
    */
   function poolGuardSpec(poolName: string, verb: 'export' | 'destroy', cleanup = false): GuardSpec<PoolObject> {
     const action = verb === 'export' ? 'Exporting' : 'Destroying'
     const noun = verb === 'export' ? 'an export' : 'a destroy'
+    const base = poolObjectView(poolName, noun)
     return {
       operation: verb === 'export' ? 'zpool.export' : 'zpool.destroy',
       object: {
-        what: `Pool '${poolName}'`,
-        read: async (reads) => {
-          const list = await poolReads.list(reads)
-          const pools = list.exitCode === 0 ? parseZpoolList(list.stdout) : []
-          return pools.some(p => p.name === poolName) ? { name: poolName } : null
-        },
-        // Story ident.1: the pool's guid — an export/import swap under the
-        // same name is a different pool.
-        id: pool => readPoolGuid(executor, pool.name),
+        ...base,
         ...(cleanup
           ? {
               scope: async (pool: PoolObject, reads: GuardReads) => {
@@ -961,9 +1146,9 @@ export async function poolRoutes(
         scopeLabels: { leaves: 'the disks to wipe' },
         unbound: part => part === 'scope'
           ? `Could not read the member disks of pool '${poolName}' — refusing a destroy with cleanup that cannot be bound to them`
-          : `Could not read the guid of pool '${poolName}' — refusing ${noun} that cannot be bound to it`,
+          : base.unbound(part),
       },
-      gates: [poolSystemGate, poolPveGate, poolLunGate(action)],
+      gates: [poolSystemGate, poolPveGate('export-destroy'), poolLunGate(action)],
       advisories: poolAdvisories,
       // Story cr.33 (§4.2): both verbs are pool-structural and change the
       // namespace — the guid key and the name key, exclusive. A cleanup
@@ -977,14 +1162,113 @@ export async function poolRoutes(
         if (!cleanup)
           return claims
         const leaves = (await poolReads.leaves(reads, pool.name)) ?? []
-        // Two steps on an array we own (`toSorted()` is ES2023; this package targets ES2022).
-        const disks = [...new Set(leaves
+        return [...claims, ...diskClaims(leaves
           .filter(l => l.leafPath.startsWith(BY_ID_PREFIX) && l.wholeDiskId)
           .map(l => l.wholeDiskId as string))]
-        disks.sort()
-        return [...claims, ...disks.map(id => diskClaim(id))]
       },
     }
+  }
+
+  /**
+   * The guard spec of every other verb on an existing pool (cr.36): the pool
+   * object bound to its guid, the verb's gates, and its lock keys — the
+   * pool's guid key in `mode` (§4.2: exclusive for the pool-structural verbs
+   * upgrade, mountpoint, add/remove vdev, attach, replace, raidz expand;
+   * shared for scrub, trim and property sets, which change nothing about the
+   * pool's shape) plus what the verb adds (the disks it writes, the path it
+   * mounts at).
+   */
+  function poolVerbSpec<X extends object = object>(poolName: string, opts: {
+    operation: string
+    /** Names the verb in the unreadable-guid refusal: `an upgrade`. */
+    noun: string
+    /** What the verb resolves against the pool now ({@link poolObjectView}). */
+    extend?: (reads: GuardReads) => Promise<X>
+    gates?: Gate<PoolObject & X>[]
+    mode?: LockMode
+    locks?: LockClaim[]
+  }): GuardSpec<PoolObject & X> {
+    return {
+      operation: opts.operation,
+      object: poolObjectView(poolName, opts.noun, opts.extend),
+      gates: opts.gates ?? [],
+      locks: async (pool, bound) => [...poolClaims(pool.name, bound.id.guid, opts.mode ?? 'exclusive'), ...(opts.locks ?? [])],
+    }
+  }
+
+  /** The gates every verb that reshapes a pool's topology runs first (pvepool.1; cr.36 adds the attach family). */
+  const RESHAPE_GATES: Gate<PoolObject>[] = [poolSystemGate, poolPveGate('reshape')]
+
+  /** A pool that does not exist yet: the name a create claims. */
+  interface NewPool { name: string }
+
+  /** The create's name gate: no imported pool carries the name (the system is the source of truth). */
+  const poolNameFreeGate: Gate<NewPool> = async (pool, reads) => {
+    const list = await poolReads.list(reads)
+    const pools = list.exitCode === 0 ? parseZpoolList(list.stdout) : []
+    return pools.some(p => p.name === pool.name)
+      ? { status: 409, code: 'CONFLICT', message: `Pool '${pool.name}' already exists` }
+      : null
+  }
+
+  /**
+   * The create's guard spec (cr.36): the name is the object (nothing else
+   * exists yet), the gates are the name, the mountpoint and every disk, and
+   * the job holds the name key, the mount path and every disk it writes.
+   */
+  function createSpec(req: CreatePoolRequest): GuardSpec<NewPool> {
+    const ids = createRequestDiskIds(req)
+    return {
+      operation: 'zpool.create',
+      object: {
+        what: `Pool '${req.name}'`,
+        read: async () => ({ name: req.name }),
+        id: async pool => ({ pool: pool.name }),
+        unbound: () => `Could not bind the create of pool '${req.name}'`,
+      },
+      gates: [
+        poolNameFreeGate,
+        ...(req.mountpoint !== undefined ? mountpointGates<NewPool>(req.mountpoint) : []),
+        composableGate<NewPool>(ids, 'refusing to compose disks it cannot identify'),
+      ],
+      locks: async () => [
+        znameClaim(req.name),
+        ...(req.mountpoint !== undefined ? [mountClaim(normalizeMountpointPath(req.mountpoint))] : []),
+        ...diskClaims(ids),
+      ],
+    }
+  }
+
+  /**
+   * The import's guard spec (cr.36): no gate beyond the schema (§2.1), but
+   * the job holds the namespace — the name key for an import by name, the
+   * guid key for an import by guid (the key the pool carries once imported),
+   * so an import serialises with an export, destroy or create of the same
+   * pool or name.
+   */
+  function importSpec(req: ImportPoolRequest): GuardSpec<{ target: string }> {
+    const target = req.name ?? req.guid!
+    return {
+      operation: 'zpool.import',
+      object: {
+        what: req.name ? `Pool '${target}'` : `the pool with guid ${target}`,
+        read: async () => ({ target }),
+        id: async object => ({ target: object.target }),
+        unbound: () => `Could not bind the import of '${target}'`,
+      },
+      gates: [],
+      locks: async () => req.name ? [znameClaim(req.name)] : [zpoolClaim(target, 'exclusive', target)],
+    }
+  }
+
+  /**
+   * A gate's answer inside a job body that re-resolves what the gate just
+   * resolved from the same read (cr.36). It cannot refuse there — the gate
+   * passed on these very facts — but if it ever did, the job fails with the
+   * gate's own code rather than acting on a guess.
+   */
+  function refused(refusal: Refusal): never {
+    throw new GuardRefusalError(refusal)
   }
 
   /**
@@ -1197,12 +1481,13 @@ export async function poolRoutes(
     if (!identity)
       return
 
-    const listResult = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
-    const pools = listResult.exitCode === 0 ? parseZpoolList(listResult.stdout) : []
-    if (!pools.some(p => p.name === poolName)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-    }
+    // Story cr.36: exists at the route, the same pool (guid) in the job, and
+    // the pool's guid key SHARED — a scrub changes nothing about the pool's
+    // shape, but an export or destroy queued beside it waits for it.
+    const spec = poolVerbSpec(poolName, { operation: 'zpool.scrub', noun: 'a scrub', mode: 'shared' })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const args = action === 'stop'
       ? ['scrub', '-s', '--', poolName]
@@ -1211,13 +1496,14 @@ export async function poolRoutes(
     const job = jobQueue.submit(
       'zpool.scrub',
       { ...identity, params: { pool: poolName, action } },
-      async () => {
+      guarded(spec, pre, async () => {
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {
           throw new Error(result.stderr.trim() || `zpool scrub exited with code ${result.exitCode}`)
         }
         return null
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1245,10 +1531,11 @@ export async function poolRoutes(
     if (!identity)
       return
 
-    if (!(await poolExists(poolName))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-    }
+    // Story cr.36: as scrub — exists, the same pool in the job, guid key shared.
+    const spec = poolVerbSpec(poolName, { operation: 'zpool.trim', noun: 'a trim', mode: 'shared' })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const args = action === 'cancel'
       ? ['trim', '-c', '--', poolName]
@@ -1257,13 +1544,14 @@ export async function poolRoutes(
     const job = jobQueue.submit(
       'zpool.trim',
       { ...identity, params: { pool: poolName, action } },
-      async () => {
+      guarded(spec, pre, async () => {
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {
           throw new Error(result.stderr.trim() || `zpool trim exited with code ${result.exitCode}`)
         }
         return null
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1285,14 +1573,20 @@ export async function poolRoutes(
     if (!identity)
       return
 
-    if (!(await poolExists(poolName))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-    }
+    // Story cr.36 (§2.1 "pool upgrade"): the confirm binds the pool's guid,
+    // not only its name, and the job re-reads it — an export/import swap
+    // under the same name between the confirm and the job is
+    // IDENTITY_MISMATCH and the other pool is never upgraded. Structural:
+    // the guid key, exclusive.
+    const spec = poolVerbSpec(poolName, { operation: 'zpool.upgrade', noun: 'an upgrade' })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'zpool.upgrade',
-      params: { pool: poolName },
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { pool: poolName },
+      address: ['pool'],
+      presentationOnly: POOL_UPGRADE_PRESENTATION_ONLY,
       message: `Upgrading pool '${poolName}' enables new ZFS feature flags`,
       warnings: [
         'Enabling feature flags is one-way — the pool may no longer be importable on older ZFS versions or other systems.',
@@ -1304,13 +1598,14 @@ export async function poolRoutes(
     const job = jobQueue.submit(
       'zpool.upgrade',
       { ...identity, params: { pool: poolName } },
-      async () => {
+      guarded(spec, pre, async () => {
         const result = await executor.exec('/usr/sbin/zpool', ['upgrade', '--', poolName])
         if (result.exitCode !== 0) {
           throw new Error(result.stderr.trim() || `zpool upgrade exited with code ${result.exitCode}`)
         }
         return null
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1361,19 +1656,19 @@ export async function poolRoutes(
     if (!identity)
       return
 
-    const listResult = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
-    const pools = listResult.exitCode === 0 ? parseZpoolList(listResult.stdout) : []
-    if (!pools.some(p => p.name === poolName)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-    }
+    // Story cr.36: exists, the same pool in the job, guid key shared (a
+    // property set does not reshape the pool).
+    const spec = poolVerbSpec(poolName, { operation: 'zpool.set', noun: 'a property change', mode: 'shared' })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const changes = Object.entries(properties)
 
     const job = jobQueue.submit(
       'zpool.set',
       { ...identity, params: { pool: poolName, properties } },
-      async (updateProgress) => {
+      guarded(spec, pre, async (_pool, { updateProgress }) => {
         for (const [prop, value] of changes) {
           updateProgress(`Setting ${prop}=${value} on ${poolName}`)
           // cr.12: deliberately NO `--` here — `zpool set` rejects it outright
@@ -1385,7 +1680,8 @@ export async function poolRoutes(
           }
         }
         return null
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1399,7 +1695,7 @@ export async function poolRoutes(
   // written anywhere. Child datasets that inherit their mountpoint move with the
   // pool root; a child with its own explicit mountpoint stays put. Confirm-gated
   // (409 → 202). ANAS-managed pools only: a PVE-managed pool (story 3.25) is
-  // hands-off and this route 400s for it.
+  // hands-off — a hard 409 PVE_MANAGED since cr.36 (a 400 before).
   server.put<{ Params: { name: string } }>('/pools/:name/mountpoint', async (request, reply) => {
     const nameParsed = PoolName.safeParse(request.params.name)
     if (!nameParsed.success) {
@@ -1418,62 +1714,34 @@ export async function poolRoutes(
     if (!identity)
       return
 
-    if (!(await poolExists(poolName))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-    }
-
-    // SYSTEM-POOL GUARD (stories pvepool.1 + cr.23): the pool holds this
-    // node's boot filesystem or its storage sits at a system path — a hard
-    // 409 with NO confirm bypass, before anything else is negotiated.
-    const pve = await pveFootprint()
-    if (pve.isSystemPool(poolName)) {
-      const refusal = systemPoolRefusalFrom(pve, poolName)
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
-    }
-
-    // SCOPE GUARD (story 3.25): PVE owns this pool's storage — ANAS keeps its
-    // hands off the mountpoint. A hard 400, never a confirm (mirrors the grid's
-    // disabled Change mount action for PVE-managed pools).
-    const pveStorages = pve.storagesByPool.get(poolName) ?? []
-    if (pveStorages.length > 0) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Pool '${poolName}' is managed by PVE (${pveStorages.map(s => s.storage).join(', ')}) — ANAS keeps its mountpoint hands-off (story 3.25)` } }
-    }
-
+    // Request-only (WAVE3-DESIGN §3.2: about the value typed, not the pool):
+    // /mnt/pve belongs to PVE (story 3.25) and / is no pool's mountpoint.
     const mp = bodyParsed.data.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
     if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${bodyParsed.data.mountpoint}' is reserved — /mnt/pve belongs to PVE (story 3.25) and / is not a pool mountpoint` } }
     }
 
-    const poolMounts = await readPoolMountpoints(executor)
-    const current = poolMounts.get(poolName)
-    const currentMp = current?.mountpoint ?? null
-    if (currentMp === mp) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `'${mp}' is already this pool's mountpoint` } }
-    }
+    // Story cr.36 (§2.1 "pool mountpoint": every gate was request-time only).
+    // One gate list at both doors: the system-pool hard 409 (pvepool.1 +
+    // cr.23), the PVE hard 409 PVE_MANAGED (3.25 — the same answer every
+    // pool verb gives since cr.36), not already this pool's mountpoint, and
+    // the collision checks (live mount, fstab, another dataset). The job
+    // holds the pool's guid key and the target path's `mount:` key, so a
+    // mount or another pool moving onto the same path waits and is then
+    // refused by the re-run collision gate.
+    const spec = poolVerbSpec(poolName, {
+      operation: 'zpool.mountpoint',
+      noun: 'a mountpoint change',
+      gates: [poolSystemGate, poolPveGate('mountpoint'), ...mountpointGates<PoolObject>(mp, poolName)],
+      locks: [mountClaim(normalizeMountpointPath(mp))],
+    })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
-    // Collision checks (identical to the AHR precedent): live mounts, fstab
-    // claims, and any OTHER pool's mountpoint.
-    const findmntRes = await executor.exec(FINDMNT, FINDMNT_ARGS)
-    const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
-    if (mounts.some(m => m.target === mp)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `'${mp}' is already a mountpoint — pick an unused path` } }
-    }
-    if (hasMount(await readConfig(fstabPath), mp)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab — pick an unused path` } }
-    }
-    for (const [name, m] of poolMounts) {
-      if (name !== poolName && m.mountpoint === mp) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', message: `'${mp}' is already pool '${name}' mountpoint — pick an unused path` } }
-      }
-    }
+    const current = (await readPoolMountpoints(executor)).get(poolName)
+    const currentMp = current?.mountpoint ?? null
 
     // Child datasets that inherit the pool root move with it; those with their
     // OWN explicit mountpoint stay put. The confirm text states both honestly.
@@ -1491,9 +1759,13 @@ export async function poolRoutes(
       warnings.push(`${explicitChildren.length} child dataset(s) set their own explicit mountpoint (${list}${more}) — these stay where they are.`)
     }
 
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'zpool.mountpoint',
-      params: { pool: poolName, mountpoint: mp },
+    // Story cr.36: the code signs the whole validated request (the pool and
+    // the normalised path) plus the pool's guid — a confirm minted for one
+    // pool never moves another of the same name.
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { pool: poolName, mountpoint: mp },
+      address: ['pool'],
+      presentationOnly: POOL_MOUNTPOINT_PRESENTATION_ONLY,
       message: `Changing pool '${poolName}' mountpoint${currentMp ? ` from '${currentMp}'` : ''} to '${mp}' remounts it and its inheriting datasets`,
       warnings,
     })) {
@@ -1503,7 +1775,7 @@ export async function poolRoutes(
     const job = jobQueue.submit(
       'zpool.mountpoint',
       { ...identity, params: { pool: poolName, mountpoint: mp } },
-      async () => {
+      guarded(spec, pre, async () => {
         // ZFS-native: `zfs set mountpoint` unmounts and remounts the dataset (and
         // every inheriting descendant) itself — no fstab, no manual mount/umount.
         const result = await executor.exec(ZFS, ['set', '--', `mountpoint=${mp}`, poolName])
@@ -1514,7 +1786,8 @@ export async function poolRoutes(
           throw new Error(await enrichBusyError(executor, base, undefined, configfsOptionsFrom(iscsiPaths)))
         }
         return { pool: poolName, mountpoint: mp }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1547,70 +1820,46 @@ export async function poolRoutes(
     if (!identity)
       return
 
-    // 409 if a pool of that name already exists — the system is the source of truth.
-    const listResult = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
-    const existing = listResult.exitCode === 0 ? parseZpoolList(listResult.stdout) : []
-    if (existing.some(p => p.name === req.name)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Pool '${req.name}' already exists` } }
-    }
-
-    // Mountpoint override (story 3.27): identical checks to the AHR create path —
-    // never in PVE's namespace, never a path already mounted, claimed in fstab,
-    // or serving another pool. `-m` is passed verbatim to `zpool create`; ZFS
-    // owns the mount. (AbsolutePath already refused relative paths and
-    // `legacy`/`none` at parse — this is the mounted-pool flow only.)
+    // Mountpoint override (story 3.27), the request-only half (WAVE3-DESIGN
+    // §3.2): never in PVE's namespace, never `/`. `-m` is passed verbatim to
+    // `zpool create`; ZFS owns the mount. (AbsolutePath already refused
+    // relative paths and `legacy`/`none` at parse — this is the mounted-pool
+    // flow only.) The path is normalised BEFORE the guard and the confirm see it.
     if (req.mountpoint !== undefined) {
       const mp = req.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
       if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
         reply.code(400)
         return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${req.mountpoint}' is reserved — /mnt/pve belongs to PVE (story 3.25) and / is not a pool mountpoint` } }
       }
-      const findmntRes = await executor.exec(FINDMNT, FINDMNT_ARGS)
-      const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
-      if (mounts.some(m => m.target === mp)) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', message: `'${mp}' is already a mountpoint — pick an unused path` } }
-      }
-      if (hasMount(await readConfig(fstabPath), mp)) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab — pick an unused path` } }
-      }
-      const poolMounts = await readPoolMountpoints(executor)
-      for (const [name, m] of poolMounts) {
-        if (m.mountpoint === mp) {
-          reply.code(409)
-          return { error: { code: 'CONFLICT', message: `'${mp}' is already pool '${name}' mountpoint — pick an unused path` } }
-        }
-      }
       req.mountpoint = mp
     }
 
-    // SAFETY (the AHR composer's twin, D4 + cr.12): every requested disk must
-    // resolve in the inventory AND be composable. The GT-43 loop-back LUN is
-    // blank SCSI as far as the kernel and zpool can see — only the inventory's
-    // hands-off tag knows — and a non-available disk would be clobbered by the
-    // create. An id the inventory does not know is refused too (H4); an
-    // inventory that cannot be read fails CLOSED. Both refusals land BEFORE
-    // the job, naming the disk and the reason.
-    const check = await composableDiskProblems(createRequestDiskIds(req))
-    if ('unreadable' in check) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'unreadable', message: `${check.unreadable}; refusing to compose disks it cannot identify` } }
-    }
-    const diskProblems = check.problems
-    if (diskProblems.length > 0) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${diskProblems.join('; ')}` } }
-    }
+    // Story cr.36 (§2.1 "pool create": disk eligibility, the name and the
+    // mountpoint were request-time only). One gate list at both doors, in the
+    // order the route always asked: the name is free (the system is the
+    // source of truth), the mountpoint collides with nothing (a live mount,
+    // fstab, another dataset), and every disk resolves in the inventory AND
+    // is composable (D4 + cr.12: the GT-43 loop-back LUN is blank SCSI to the
+    // kernel and to zpool — only the inventory's hands-off tag knows; an id
+    // the inventory does not know is refused; an unreadable inventory fails
+    // CLOSED). The job holds the name key, the mount path and every disk it
+    // writes, so two creates naming one disk run one after the other and the
+    // second is refused by its re-run composability gate.
+    const spec = createSpec(req)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     // cr.12 (H4 step 4): `-f` on create is a label-overwrite — confirm-gated
-    // like upgrade. The code binds to operation + pool name; a request without
-    // force never reaches the gate and behaves exactly as before.
+    // like upgrade; a request without force never reaches the confirm. cr.36
+    // (§5.1): the code signs the WHOLE validated request — the disks, the
+    // vdev layout, the properties and the normalised mountpoint, not only the
+    // name — so a code minted for one layout never forces another.
     if (req.force) {
-      if (!confirmGate(confirmStore, request, reply, {
-        operation: 'zpool.create',
-        params: { pool: req.name },
+      if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+        validated: { ...req },
+        address: ['name'],
+        presentationOnly: POOL_CREATE_PRESENTATION_ONLY,
         message: `Force-creating pool '${req.name}' is destructive`,
         warnings: [
           'Forcing the create overwrites any existing filesystem or pool labels on the selected disks.',
@@ -1625,7 +1874,7 @@ export async function poolRoutes(
     const job = jobQueue.submit(
       'zpool.create',
       { ...identity, params: { pool: req.name, vdevs: req.dataVdevs.length } },
-      async () => {
+      guarded(spec, pre, async () => {
         // cr.34 (WAVE3-DESIGN §6.3): `zpool create` discards every device
         // first (no -K) — minutes on large SSDs; 30 min, not the job's 300 s.
         const result = await executor.exec('/usr/sbin/zpool', args, { timeoutMs: 1_800_000 })
@@ -1638,7 +1887,8 @@ export async function poolRoutes(
         // Best-effort — the pool exists, so a systemctl hiccup only warns.
         const warning = await syncZfsImportUnit(executor, req.name, 'enable')
         return warning ? { warnings: [warning] } : null
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1672,14 +1922,29 @@ export async function poolRoutes(
 
     const target = req.name ?? req.guid!
 
+    // Story cr.36: no gate beyond the schema (§2.1 "pool import"), but the
+    // import runs on the guard so its job holds the namespace it changes
+    // (the name key, or the guid key for an import by guid).
+    const spec = importSpec(req)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+
     // cr.12 (H4 step 4): `-f` on import can mount a pool that is still ACTIVE
-    // on another host — confirm-gated like upgrade. The code binds to
-    // operation + target (name or guid); a request without force never
-    // reaches the gate and behaves exactly as before.
+    // on another host — confirm-gated like upgrade; a request without force
+    // never reaches the confirm. cr.36 (§5.1): the code signs the WHOLE
+    // validated request — `altroot` included, which the cr.12 code left out —
+    // so a code minted for one import never forces another.
     if (req.force) {
-      if (!confirmGate(confirmStore, request, reply, {
-        operation: 'zpool.import',
-        params: { target },
+      if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+        validated: {
+          ...(req.name !== undefined ? { name: req.name } : {}),
+          ...(req.guid !== undefined ? { guid: req.guid } : {}),
+          force: true,
+          ...(req.altroot !== undefined ? { altroot: req.altroot } : {}),
+        },
+        address: ['name', 'guid'],
+        presentationOnly: POOL_IMPORT_PRESENTATION_ONLY,
         message: `Force-importing '${target}' can corrupt a pool that is still active elsewhere`,
         warnings: [
           'Forcing the import may import a pool that is active on another host, which can corrupt it.',
@@ -1699,7 +1964,7 @@ export async function poolRoutes(
     const job = jobQueue.submit(
       'zpool.import',
       { ...identity, params: { target, force: req.force ?? false } },
-      async () => {
+      guarded(spec, pre, async () => {
         // PVE parity (PVE/API2/Disks/ZFS.pm, their fix for Proxmox bug #2554) and
         // issue #22: an imported pool needs its zfs-import@<pool>.service enabled
         // too — zpool.cache alone is not a reliable boot import. The request may
@@ -1725,7 +1990,8 @@ export async function poolRoutes(
             warnings.push(warning)
         }
         return warnings.length > 0 ? { warnings } : null
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1737,10 +2003,6 @@ export async function poolRoutes(
     const listResult = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
     const pools = listResult.exitCode === 0 ? parseZpoolList(listResult.stdout) : []
     return pools.map(p => p.name)
-  }
-
-  async function poolExists(poolName: string): Promise<boolean> {
-    return (await listPoolNames()).includes(poolName)
   }
 
   // Add a vdev to an existing pool (stories 3.11, 3.21, 3.22). Expands the pool
@@ -1781,33 +2043,24 @@ export async function poolRoutes(
     if (!identity)
       return
 
-    if (!(await poolExists(poolName))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-    }
-
-    // The same topology gate the remove route asks — adding a vdev reshapes a
-    // pool exactly as removing one does, and a PVE-managed pool is hands-off
-    // either way.
-    const gate = await vdevTopologyGate(poolName, reply)
-    if (gate)
-      return gate
-
-    // SAFETY (D4 — the create path's inventory pre-flight, shared, cr.12): a
-    // hands-off (loop-back LUN) or non-available disk must not be composed in,
-    // whatever the role, and an id the inventory does not know is refused too;
-    // an unreadable inventory fails CLOSED. Refused before the job.
+    // Story cr.36 (§2.1 "add vdev": every gate was request-time only). One
+    // gate list at both doors: the topology gates every reshape asks (the
+    // system-pool hard 409, the PVE hard 409 PVE_MANAGED — PVE owns the
+    // topology of the pools it manages), then the composability of every
+    // disk the add writes (D4 + cr.12: a hands-off loop-back LUN or a
+    // non-available disk is never composed in, whatever the role; an id the
+    // inventory does not know is refused; an unreadable inventory fails
+    // CLOSED). The job holds the pool's guid key and every disk's key.
     const candidateIds = role === 'cache' || role === 'spare' ? (disks ?? []) : vdev!.disks
-    const check = await composableDiskProblems(candidateIds)
-    if ('unreadable' in check) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'unreadable', message: `${check.unreadable}; refusing to compose disks it cannot identify` } }
-    }
-    const diskProblems = check.problems
-    if (diskProblems.length > 0) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${diskProblems.join('; ')}` } }
-    }
+    const spec = poolVerbSpec(poolName, {
+      operation: 'zpool.add',
+      noun: 'an add',
+      gates: [...RESHAPE_GATES, composableGate<PoolObject>(candidateIds, 'refusing to compose disks it cannot identify')],
+      locks: diskClaims(candidateIds),
+    })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     // Build the argv by role. The schema guarantees cache/spare carry `disks`
     // and data/log/special/dedup carry `vdev`.
@@ -1835,13 +2088,14 @@ export async function poolRoutes(
     const job = jobQueue.submit(
       'zpool.add',
       { ...identity, params: { pool: poolName, role, type: jobType, disks: jobDisks } },
-      async () => {
+      guarded(spec, pre, async () => {
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {
           throw new Error(result.stderr.trim() || `zpool add exited with code ${result.exitCode}`)
         }
         return null
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1880,47 +2134,30 @@ export async function poolRoutes(
     if (!identity)
       return
 
-    if (!(await poolExists(poolName))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-    }
+    // Story cr.36 (§2.1 "remove vdev": every gate request-time only, and the
+    // job used the request-time token). One gate list at both doors: the
+    // topology gates (system pool, PVE), then the vdev the pool's own status
+    // resolves NOW (the object carries the lookup) — the job removes the
+    // token its own re-read resolved, so a vdev that went away, became
+    // ambiguous or was put to work as a spare while the job waited is
+    // refused, never guessed at.
+    const spec = poolVerbSpec(poolName, {
+      operation: 'zpool.remove',
+      noun: 'a remove',
+      extend: async reads => ({ removal: await lookupRemoval(reads, poolName, requestedVdev) }),
+      gates: [...RESHAPE_GATES, async pool => 'refusal' in pool.removal ? pool.removal.refusal : null],
+    })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
-    // The shared topology gate: system pool, then PVE ownership.
-    const gate = await vdevTopologyGate(poolName, reply)
-    if (gate)
-      return gate
-
-    const statusResult = await executor.exec(ZPOOL, ['status', '-jv'])
-    const status = statusResult.exitCode === 0
-      ? parseZpoolStatusPool(statusResult.stdout, poolName)
-      : null
-    if (!status) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-    }
-
-    const lookup = resolveVdev(status, requestedVdev)
-    if (!lookup) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: unknownVdevMessage(poolName, requestedVdev) } }
-    }
-    // A name the pool carries but must not act on: it fits more than one leaf
-    // (a split by-id device), or it is a spare ZFS has put to work.
-    if (isVdevRefusal(lookup)) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: lookup.message } }
-    }
-    const resolved = lookup
-    if (!isRemovableVdevRole(resolved.role)) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: NON_REMOVABLE_VDEV_MESSAGE } }
-    }
-
-    const { role, token } = resolved
+    const routeRole = 'resolved' in pre.object.removal ? pre.object.removal.resolved.role : null
     const job = jobQueue.submit(
       'zpool.remove',
-      { ...identity, params: { pool: poolName, vdev: requestedVdev, role } },
-      async () => {
+      { ...identity, params: { pool: poolName, vdev: requestedVdev, role: routeRole } },
+      guarded(spec, pre, async (pool) => {
+        const resolved = 'refusal' in pool.removal ? refused(pool.removal.refusal) : pool.removal.resolved
+        const { role, token } = resolved
         const result = await executor.exec(ZPOOL, ['remove', '--', poolName, token])
         if (result.exitCode !== 0)
           throw new Error(result.stderr.trim() || `zpool remove exited with code ${result.exitCode}`)
@@ -1954,7 +2191,8 @@ export async function poolRoutes(
             throw new Error(failure)
           await new Promise(resolve => setTimeout(resolve, VDEV_REMOVE_POLL_MS))
         }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -2029,92 +2267,51 @@ export async function poolRoutes(
     if (!identity)
       return
 
-    if (!(await poolExists(poolName))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-    }
-
-    // SAFETY (D4 — the create path's inventory pre-flight, shared, cr.12): the
-    // NEW disk must resolve in the inventory AND be composable — a loop-back
-    // LUN, a non-available disk or an id the inventory does not know must not
-    // become a mirror leg, a replacement or a raidz-expansion column, and an
-    // unreadable inventory fails CLOSED. The EXISTING leaf is deliberately not
-    // checked: it is already a pool member, so the inventory (honestly)
-    // reports it as anything but available, and that must never refuse a
-    // legitimate attach or replace — it is identified from the pool's own
-    // status instead, below.
-    const check = await composableDiskProblems([newDiskId])
-    if ('unreadable' in check) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'unreadable', message: `${check.unreadable}; refusing to ${replace ? 'replace' : 'attach to'} a device it cannot identify` } }
-    }
-    const diskProblems = check.problems
-    if (diskProblems.length > 0) {
+    // Request-only (WAVE3-DESIGN §3.2): the raidz target's name is a ZFS
+    // vdev name (raidz1-0, …) — a charset guard on what was typed.
+    if (targetVdev !== undefined && !VDEV_NAME_RE.test(targetVdev)) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${diskProblems.join('; ')}` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid vdev name '${targetVdev}'` } }
     }
 
+    // Story cr.36 (§2.1 "raidz expand" / "attach / replace": every gate
+    // request-time only, no topology gate at all, the leaf resolved once at
+    // the request). The attach family now stands behind the same topology
+    // gates as add and remove (the system-pool hard 409, the PVE hard 409
+    // PVE_MANAGED), then the NEW disk's composability (D4 + cr.12: a loop-back
+    // LUN, a non-available disk or an id the inventory does not know never
+    // becomes a mirror leg, a replacement or a raidz column; an unreadable
+    // inventory fails CLOSED). The EXISTING leaf is deliberately not checked
+    // for composability: it is already a pool member, so the inventory
+    // (honestly) reports it as anything but available — it is identified from
+    // the pool's own status instead. Every gate runs again in the job, which
+    // holds the pool's guid key and the new disk's key.
     const newPath = byIdPath(newDiskId)
+    const newDiskGate = composableGate<PoolObject>([newDiskId], `refusing to ${replace ? 'replace' : 'attach to'} a device it cannot identify`)
 
     // ---- RAIDZ EXPANSION path (targetVdev present) -------------------------
     if (targetVdev !== undefined) {
-      if (!VDEV_NAME_RE.test(targetVdev)) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `Invalid vdev name '${targetVdev}'` } }
-      }
-
-      const [statusResult, getResult, version] = await Promise.all([
-        executor.exec(ZPOOL, ['status', '-jv']),
-        executor.exec(ZPOOL, ['get', 'all', '-j']),
-        detectLocalZfsVersion(executor),
-      ])
-      const status = statusResult.exitCode === 0 ? parseZpoolStatusPool(statusResult.stdout, poolName) : null
-      if (!status) {
-        reply.code(404)
-        return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-      }
-
-      // The target must be an existing raidz DATA vdev.
-      const dataGroup = status.vdevGroups.find(g => g.role === 'data')
-      const vdev = dataGroup?.vdevs.find(v => v.name === targetVdev)
-      if (!vdev) {
-        reply.code(404)
-        return { error: { code: 'NOT_FOUND', message: `Vdev '${targetVdev}' not found in pool '${poolName}'` } }
-      }
-      if (raidzParity(vdev.type) === null) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `Vdev '${targetVdev}' is a ${vdev.type}, not a raidz — raidz expansion needs a raidz vdev (attach a mirror leg via existingDiskId instead)` } }
-      }
-
-      // GATE 1 (version): raidz expansion landed in OpenZFS 2.3.0.
-      const featureValue = getResult.exitCode === 0 ? parseZpoolFeature(getResult.stdout, poolName, RAIDZ_EXPANSION_FEATURE) : null
-      const capability = buildCapability(version, featureValue)
-      if (!capability.moduleSupported) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', reason: 'version', message: `RAIDZ expansion needs OpenZFS ≥ 2.3.0; this node runs ${capability.zfsVersion ?? 'an undetectable version'}. This refusal has no confirm bypass.` } }
-      }
-      // GATE 1b (flag): feature@raidz_expansion must be enabled/active.
-      if (!capability.featureEnabled) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', reason: 'flag', message: `Pool '${poolName}' has feature@raidz_expansion ${capability.featureState}. Enable it first with: zpool upgrade ${poolName}` } }
-      }
-      // GATE 2 (busy): no new expansion while a resilver/reflow runs.
-      const busy = parsePoolBusyState(statusResult.stdout, poolName)
-      if (busy.busy) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', reason: 'busy', message: busyDetail(busy, poolName) } }
-      }
+      const spec = poolVerbSpec(poolName, {
+        operation: 'zpool.raidz-expand',
+        noun: 'a raidz expansion',
+        gates: [...RESHAPE_GATES, newDiskGate, raidzExpandGate(targetVdev)],
+        locks: diskClaims([newDiskId]),
+      })
+      const pre = await guardCheck(spec)
+      if ('refusal' in pre)
+        return sendRefusal(reply, pre.refusal)
 
       const job = jobQueue.submit(
         'zpool.raidz-expand',
         { ...identity, params: { pool: poolName, vdev: targetVdev, newDisk: newDiskId } },
-        async () => {
+        guarded(spec, pre, async () => {
           // SAME `zpool attach` verb aimed at the raidz VDEV NAME (not a leaf).
           const result = await executor.exec(ZPOOL, ['attach', '--', poolName, targetVdev, newPath])
           if (result.exitCode !== 0)
             throw new Error(result.stderr.trim() || `zpool attach (raidz expand) exited with code ${result.exitCode}`)
           return { pool: poolName, vdev: targetVdev, expanded: newDiskId }
-        },
+        }),
+        { locks: pre.locks },
       )
       reply.code(202)
       return { job }
@@ -2122,72 +2319,37 @@ export async function poolRoutes(
 
     // ---- LEAF path: mirror-attach or replace (story 3.12) ------------------
     //
-    // ONE `zpool status` read answers both questions this path asks: whether
-    // the pool is busy, and which device the existing leaf actually is.
-    const leafStatusResult = await executor.exec(ZPOOL, ['status', '-jv'])
-
-    // GATE 2 (busy) applies to a mirror-attach too — never start a second
-    // resilver-inducing op mid-resilver/reflow. Replace is exempt (you may be
-    // replacing the very disk that is degraded).
-    if (!replace && leafStatusResult.exitCode === 0) {
-      const busy = parsePoolBusyState(leafStatusResult.stdout, poolName)
-      if (busy.busy) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', reason: 'busy', message: busyDetail(busy, poolName) } }
-      }
-    }
-
     // The request names the existing leaf the way the pool view shows it: a
     // by-id disk id, a by-id partition basename (`ata-SSD-part1`), a short
-    // kernel name, or the full device path. Resolve it against the pool's own
-    // status so `zpool replace`/`attach` is handed the device ZFS itself
-    // reports (story vdevs.1 fix batch): on a split SSD — log on -part1, cache
-    // on -part2, data on -part3 — every leaf carries the SAME stripped by-id
-    // id, `/dev/disk/by-id/<disk>` is a device the pool does not have, and
-    // guessing at one of the three would replace the wrong one. A name that
-    // fits several leaves is refused with its candidates, exactly as the remove
-    // route refuses it.
-    //
-    // A status we CANNOT read fails CLOSED (vdevs.2 hardening). It used to fall
-    // back to `byIdPath(existingDiskId)` — a spelling the pool may not carry at
-    // all, and on a partition-backed device a spelling that names a DIFFERENT
-    // member than the one the operator picked. `zpool replace` aimed at a
-    // substituted device destroys the data on it, and that is not a risk to run
-    // on a read that did not happen. Both leaf verbs name an existing leaf —
-    // the mirror-attach names the leaf it mirrors, the schema requires it — so
-    // neither proceeds unidentified, and the attach's busy gate above is
-    // likewise not skipped on an unread status. The refusal is a 409 with its
-    // reason: nothing about the request is wrong, the node could not answer.
-    const leafStatus = leafStatusResult.exitCode === 0
-      ? parseZpoolStatusPool(leafStatusResult.stdout, poolName)
-      : null
-    if (!leafStatus) {
-      const detail = leafStatusResult.exitCode === 0
-        ? `zpool status no longer reports the pool`
-        : leafStatusResult.stderr.trim() || `zpool status exited with code ${leafStatusResult.exitCode}`
-      const verb = replace ? 'replace' : 'attach to'
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: 'unreadable', message: `pool ${poolName}'s status could not be read (${detail}); refusing to ${verb} a device it cannot identify` } }
-    }
-    const leaf = resolveLeafDevice(leafStatus, existingDiskId!)
-    if (!leaf) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: unknownVdevMessage(poolName, existingDiskId!) } }
-    }
-    if (isVdevRefusal(leaf)) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: leaf.message } }
-    }
-    const existingPath = leaf.path
-
-    const args = replace
-      ? ['replace', '--', poolName, existingPath, newPath]
-      : ['attach', '--', poolName, existingPath, newPath]
+    // kernel name, or the full device path. It is resolved against the pool's
+    // own status (`lookupLeaf`, carried on the guard object) so `zpool
+    // replace`/`attach` is handed the device ZFS itself reports (story vdevs.1
+    // fix batch): on a split SSD — log on -part1, cache on -part2, data on
+    // -part3 — every leaf carries the SAME stripped by-id id, and guessing at
+    // one of the three would replace the wrong one. A name that fits several
+    // leaves is refused with its candidates, exactly as the remove route
+    // refuses it; a status that cannot be read fails CLOSED (vdevs.2); and a
+    // mirror-attach refuses while a resilver/reflow runs (3.31). The job acts
+    // on the device its own re-read resolved — never the request's.
+    const spec = poolVerbSpec(poolName, {
+      operation: replace ? 'zpool.replace' : 'zpool.attach',
+      noun: replace ? 'a replace' : 'an attach',
+      extend: async reads => ({ leaf: await lookupLeaf(reads, poolName, existingDiskId!, replace) }),
+      gates: [...RESHAPE_GATES, newDiskGate, async pool => 'refusal' in pool.leaf ? pool.leaf.refusal : null],
+      locks: diskClaims([newDiskId]),
+    })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       replace ? 'zpool.replace' : 'zpool.attach',
       { ...identity, params: { pool: poolName, existingDisk: existingDiskId, newDisk: newDiskId, replace } },
-      async () => {
+      guarded(spec, pre, async (pool) => {
+        const existingPath = 'refusal' in pool.leaf ? refused(pool.leaf.refusal) : pool.leaf.path
+        const args = replace
+          ? ['replace', '--', poolName, existingPath, newPath]
+          : ['attach', '--', poolName, existingPath, newPath]
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {
           const verb = replace ? 'replace' : 'attach'
@@ -2202,7 +2364,8 @@ export async function poolRoutes(
         if (replace)
           await executor.exec('/usr/sbin/zpool', ['online', '-e', '--', poolName, newPath])
         return null
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)

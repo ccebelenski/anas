@@ -7,6 +7,7 @@ import { afterEach, describe, it } from 'node:test'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
 import { serveBlankInventoryDisks } from './inventory-stub.js'
+import { servePoolGuardReads } from './pool-guard-reads.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -214,6 +215,8 @@ describe('attach/replace endpoint: POST /v1/pools/:name/attach', () => {
     serveBlankInventoryDisks(server, NEW_IDS)
     const mock = (server as unknown as { executor: MockExecutor }).executor
     mock.clearFixtures()
+    // cr.36: the guard's guid and boot-facts reads, from the capture (pool-guard-reads.ts).
+    servePoolGuardReads(mock)
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
     mock.addFixture({
@@ -313,6 +316,8 @@ function splitSsdServer(): ReturnType<typeof createServer> {
   serveBlankInventoryDisks(server, NEW_IDS)
   const mock = (server as unknown as { executor: MockExecutor }).executor
   mock.clearFixtures()
+  // cr.36: the guard's guid and boot-facts reads, from the capture (pool-guard-reads.ts).
+  servePoolGuardReads(mock, SPLIT_POOL)
   mock.addFixture({
     command: '/usr/sbin/zpool',
     args: ['list', '-j'],
@@ -418,6 +423,8 @@ function statusReadServer(status: ExecResult): ReturnType<typeof createServer> {
   serveBlankInventoryDisks(server, NEW_IDS)
   const mock = (server as unknown as { executor: MockExecutor }).executor
   mock.clearFixtures()
+  // cr.36: the guard's guid and boot-facts reads, from the capture (pool-guard-reads.ts).
+  servePoolGuardReads(mock)
   mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
   mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: status })
   mock.addFixture({ command: '/usr/sbin/zpool', args: undefined, result: { stdout: '', stderr: '', exitCode: 0 } })
