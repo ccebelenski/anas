@@ -1,0 +1,36 @@
+# host: anas-pve  pve-manager/9.2.21/4f6e0ac86f9e8c7f (running kernel: 7.0.14-23-pve)  zfs-2.4.4-pve1  kernel 7.0.14-23-pve
+# date: 2026-10-15T06:02:57Z  N=7 per command  loadavg: 0.19 0.09 0.10
+# pools: gtbackup gtiscsi pvfix sysfix   md arrays: 0  disks: 6
+zpool status -jv                                               rc=0   min=     6ms med=    22ms max=    23ms
+zpool list -j                                                  rc=0   min=    23ms med=    25ms max=    26ms
+zpool get all -j                                               rc=0   min=    11ms med=    28ms max=    35ms
+zpool get -H -o value guid -- <pool>                           rc=0   min=     6ms med=    13ms max=    22ms
+zfs list -H -p -t filesystem -o name,mountpoint,canmount,mounted rc=0   min=    30ms med=    38ms max=    45ms
+zfs get -j all -- <pool>                                       rc=0   min=    17ms med=    22ms max=    28ms
+zfs list -t snapshot -Hp -o name,createtxg -r                  rc=0   min=    10ms med=    34ms max=    38ms
+zpool import   (device scan, no args)                          rc=0   min=    91ms med=   145ms max=   185ms
+zpool iostat -plv 1 2   (samples for 1 s by design)            rc=0   min=  1012ms med=  1015ms max=  1032ms
+smartctl -n standby -iH --json <disk>   (QEMU disk)            rc=0   min=    11ms med=    24ms max=    45ms
+smartctl -a --json <disk>   (QEMU disk)                        rc=4   min=    22ms med=    38ms max=    48ms
+lsblk -Jb -O                                                   rc=0   min=     9ms med=    34ms max=    36ms
+findmnt --json                                                 rc=0   min=     2ms med=     2ms max=     5ms
+cat /proc/mdstat                                               rc=0   min=     1ms med=     1ms max=     2ms
+mdadm --detail --scan                                          rc=0   min=     1ms med=     1ms max=     1ms
+pvs --reportformat json                                        rc=0   min=    30ms med=    42ms max=    49ms
+vgs --reportformat json                                        rc=0   min=    36ms med=    44ms max=    49ms
+lvs -a --reportformat json                                     rc=0   min=    33ms med=    39ms max=    47ms
+blkid                                                          rc=0   min=    15ms med=    47ms max=   149ms
+udevadm settle   (idle event queue)                            rc=0   min=     4ms med=    16ms max=    19ms
+systemctl show anasd -p ActiveState                            rc=0   min=    24ms med=    29ms max=    34ms
+systemctl list-timers --all --output=json                      rc=0   min=    22ms med=    32ms max=    36ms
+journalctl -u anasd -n 50 -o short-iso --no-pager              rc=0   min=     4ms med=     6ms max=    11ms
+smbstatus --json                                               rc=0   min=    29ms med=    43ms max=    94ms
+smbstatus -S                                                   rc=0   min=    26ms med=    31ms max=    94ms
+testparm -s                                                    rc=0   min=    19ms med=    43ms max=    75ms
+pdbedit -L                                                     rc=0   min=    30ms med=    57ms max=    74ms
+exportfs -v   (list only)                                      rc=0   min=     2ms med=     5ms max=     6ms
+getent passwd                                                  rc=0   min=     7ms med=     8ms max=     8ms
+getent group                                                   rc=0   min=     5ms med=     7ms max=     8ms
+getfacl -pcE <pool mountpoint>                                 rc=0   min=     6ms med=     6ms max=     6ms
+ls /sys/kernel/config/target/iscsi                             rc=2   min=     6ms med=     7ms max=     7ms
+timeout 2 stat -f /   (mount liveness)                         rc=0   min=     7ms med=     8ms max=     9ms

@@ -1,0 +1,12 @@
+node v26.11.1, deadline 500 ms
+A sleep 30 (exits on TERM): callback after 535 ms, killed=true signal=SIGTERM code=null; grandchild still running: no
+B trap "" TERM; sleep 30 (ignores TERM): callback NOT fired after 4000 ms (child pid 1330855 still holds it)
+C sh exits on TERM, grandchild sleep 3 keeps stdout: callback after 532 ms, killed=true signal=SIGTERM code=null; grandchild still running: yes (pid 1331714, reparented)
+D as C, detached + group SIGTERM: close after 504 ms, code=null signal=SIGTERM
+
+# same probe on the stunt node (Node as shipped to PVE), script piped on stdin, nothing written:
+node v22.23.3, deadline 500 ms
+A sleep 30 (exits on TERM): callback after 557 ms, killed=true signal=SIGTERM code=null; grandchild still running: no
+B trap "" TERM; sleep 30 (ignores TERM): callback NOT fired after 4000 ms (child pid 79227 still holds it)
+C sh exits on TERM, grandchild sleep 3 keeps stdout: callback after 525 ms, killed=true signal=SIGTERM code=null; grandchild still running: yes (pid 79257, reparented)
+D as C, detached + group SIGTERM: close after 505 ms, code=null signal=SIGTERM

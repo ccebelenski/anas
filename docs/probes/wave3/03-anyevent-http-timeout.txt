@@ -1,0 +1,19 @@
+# Wave-3 design pass (M1): what AnasProxy's `timeout => 30` means.
+# Read-only, stunt node 192.168.200.50 (PVE 9.2.21), 2026-10-15:
+#   ssh root@node 'f=$(perl -MAnyEvent::HTTP -e "print \$INC{q{AnyEvent/HTTP.pm}}"); echo $f; dpkg -S "$f"; grep -n -A6 "^=item timeout" "$f"'
+
+/usr/share/perl5/AnyEvent/HTTP.pm
+libanyevent-http-perl: /usr/share/perl5/AnyEvent/HTTP.pm
+184:=item timeout => $seconds
+185-
+186-The time-out to use for various stages - each connect attempt will reset
+187-the timeout, as will read or write activity, i.e. this is not an overall
+188-timeout.
+189-
+190-Default timeout is 5 minutes.
+
+# Reading: an INACTIVITY timeout. The gateway writes nothing until anasd answers
+# (it buffers the whole upstream reply, packages/gateway/src/proxy.ts:136-157), so
+# for an ANAS request it acts as a 30 s total: a daemon request that takes longer
+# than 30 s reaches the browser as AnasProxy's synthetic 502, whatever the daemon
+# later answers.
