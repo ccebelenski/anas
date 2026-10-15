@@ -322,6 +322,9 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     }
 
     const intent = buildIntent(pool, bundle, approvedIds, replace)
+    // cr.28: the privilege is checked BEFORE the intent is persisted — a
+    // refusal at submit would otherwise strand an intent with no driver.
+    jobQueue.authorize('ahr.expand', identity)
     try {
       await persistNewIntent(pool, intent)
     }
@@ -389,6 +392,8 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     // §5.3 recompute-and-continue via the SHARED resume core (identical to the
     // daemon boot-time re-attach path). Fail-closed reasons map to the
     // same HTTP codes/messages this route has always returned.
+    // cr.28: checked before resume flips the intent halted→running.
+    jobQueue.authorize('ahr.expand.resume', identity)
     const result = await resumeExpansion({
       pool,
       intent,
@@ -537,6 +542,9 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     }
 
     const intent = buildIntent(pool, bundle, approvedIds, replace)
+    // cr.28: the privilege is checked BEFORE the intent is persisted — a
+    // refusal at submit would otherwise strand an intent with no driver.
+    jobQueue.authorize('ahr.replace', identity)
     try {
       await persistNewIntent(pool, intent)
     }

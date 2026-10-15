@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
+import { JobForbiddenError, readRequestAuthority, runAsRequest } from '../../jobs/authority.js'
 import { JobQueue } from '../../jobs/queue.js'
 import { LSBLK_ARGS } from '../../parsers/lsblk.js'
 import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
@@ -433,6 +434,30 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
       assert.equal(await readIntent('tank', dir), null, 'intent cleared on completion')
       assert.deepEqual(mutatingCalls(executor), [], 'a zero-step plan mutates nothing')
+    })
+  })
+
+  describe('cr.28: the privilege is checked before the intent is persisted', () => {
+    it('a Sys.Audit-only confirmed expand is refused 403 and leaves NO intent behind', async () => {
+      // build() with the daemon's own authority hook and 403 mapping
+      // (server.ts), set BEFORE the routes register so they inherit them.
+      executor = buildExecutor({})
+      jobQueue = new JobQueue()
+      const app = Fastify({ logger: false })
+      server = app
+      app.addHook('onRequest', (request, _reply, done) => runAsRequest(readRequestAuthority(request.headers), done))
+      app.setErrorHandler((error, _request, reply) => {
+        if (error instanceof JobForbiddenError)
+          return reply.code(403).send({ error: { code: 'FORBIDDEN', message: error.message } })
+        return reply.send(error)
+      })
+      await app.register(ahrExpansionRoutes, { prefix: '/v1', executor, jobQueue, confirmStore: new ConfirmStore(), diskIdentityCache: new DiskIdentityCache(executor), intentDir: dir })
+      const first = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand', headers: IDENTITY_HEADERS, payload: { addDisks: [S] } })
+      const code = first.headers['x-anas-confirm-code'] as string
+      assert.ok(code, first.body)
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand', headers: { ...IDENTITY_HEADERS, 'x-anas-privileges': 'Sys.Audit', 'x-anas-confirm': code }, payload: { addDisks: [S] } })
+      assert.equal(res.statusCode, 403, res.body)
+      assert.equal(await readIntent('tank', dir), null, 'no intent stranded without a driver')
     })
   })
 
