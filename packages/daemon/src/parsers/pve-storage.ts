@@ -31,17 +31,13 @@
 import type { PveStorageRef } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from './findmnt.js'
-import { execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
-import { promisify } from 'node:util'
 import { isFindmntTable, parseFindmnt } from './findmnt.js'
-
-const execFileAsync = promisify(execFile)
 
 /** Default location of the PVE storage config on a Proxmox host. */
 export const PVE_STORAGE_CFG = '/etc/pve/storage.cfg'
 
-/** The zfs binary the executor-routed mountpoint read runs ({@link readZfsMountpoints}). */
+/** The zfs binary the mountpoint read runs ({@link readZfsMountpoints}). */
 const ZFS_BIN = '/usr/sbin/zfs'
 
 /** The findmnt binary the mountpoint read runs for `legacy`/`none` targets. */
@@ -434,13 +430,14 @@ export function parseZfsMountpoints(text: string, mountedTargets: Map<string, st
  * as {@link readPveStorages}: callers tighten whatever gate the mountpoints
  * feed instead of reading "no ZFS datasets" (pvepool.1 review fix 1). A
  * findmnt failure only degrades the legacy/none resolution (those rows stay
- * unresolvable, `''`), never the table itself. Uses execFile (args array, no
- * shell).
+ * unresolvable, `''`), never the table itself.
  *
- * When an {@link CommandExecutor} is supplied the read goes THROUGH it — the
- * footprint service always passes its executor, so the read is mock-driven in
- * tests and captured by the real daemon's argv discipline; without one the
- * read runs directly (the pre-existing callers: mounts.ts, iscsi.ts).
+ * The read goes through the {@link CommandExecutor} (cr.35): it was the one
+ * read in the daemon that could still run outside it — a direct `execFile`
+ * with no deadline, no lane and no process group, from POST /mounts and the
+ * iSCSI read context. A `zfs list` that does not answer now rejects with the
+ * executor's CommandTimeoutError, which this read reports as UNREADABLE
+ * (`null`): every caller already tightens on that.
  */
 let mountpointsReadWarned = false
 
@@ -468,48 +465,30 @@ export interface ZfsMountpointsRead {
  * posture: `null` when the `zfs list` side fails, a findmnt failure only
  * degrades legacy/none resolution and reports `findmntNodes: null`.
  */
-export async function readZfsMountpointsFull(zfsOrExec: string | CommandExecutor = 'zfs'): Promise<ZfsMountpointsRead | null> {
-  const exec = typeof zfsOrExec === 'object' ? zfsOrExec : undefined
-  const zfs = typeof zfsOrExec === 'string' ? zfsOrExec : 'zfs'
+export async function readZfsMountpointsFull(exec: CommandExecutor): Promise<ZfsMountpointsRead | null> {
   // Declared before the try: a findmnt table that read successfully SURVIVES
   // the zfs side's failure (cr.23) — the ENOENT answer below is a READ answer
   // for the table, so the footprint's system-mount facts never pay a second
   // findmnt on a node that merely has no ZFS.
   let findmntNodes: FindmntNode[] | null = null
   try {
-    let stdout: string
     let mountedTargets = new Map<string, string>()
-    if (exec) {
-      // allSettled: the zfs side's failure is the three-valued signal, and a
-      // findmnt that succeeded ahead of it is captured, not discarded. A
-      // non-zero exit is UNREADABLE (never "no datasets") — the direct
-      // execFileAsync below rejects on one, so the executor path must too.
-      const [zfsResult, findmntResult] = await Promise.allSettled([
-        exec.exec(ZFS_BIN, ['list', '-H', '-o', 'name,mountpoint']),
-        exec.exec(FINDMNT_BIN, ['--json']),
-      ])
-      if (findmntResult.status === 'fulfilled' && findmntResult.value.exitCode === 0)
-        findmntNodes = isFindmntTable(findmntResult.value.stdout) ? parseFindmnt(findmntResult.value.stdout) : null
-      if (zfsResult.status === 'rejected')
-        throw zfsResult.reason
-      if (zfsResult.value.exitCode !== 0)
-        throw new Error(`zfs list exited ${zfsResult.value.exitCode}: ${zfsResult.value.stderr.trim()}`)
-      stdout = zfsResult.value.stdout
-    }
-    else {
-      // allSettled: the zfs side's rejection (ENOENT / nonzero) is the
-      // three-valued signal; a findmnt hiccup only loses the legacy/none
-      // resolution, never the table.
-      const [zfsResult, findmntResult] = await Promise.allSettled([
-        execFileAsync(zfs, ['list', '-H', '-o', 'name,mountpoint']),
-        execFileAsync(FINDMNT_BIN, ['--json']),
-      ])
-      if (findmntResult.status === 'fulfilled')
-        findmntNodes = isFindmntTable(findmntResult.value.stdout) ? parseFindmnt(findmntResult.value.stdout) : null
-      if (zfsResult.status === 'rejected')
-        throw zfsResult.reason
-      stdout = zfsResult.value.stdout
-    }
+    // allSettled: the zfs side's failure is the three-valued signal, and a
+    // findmnt that succeeded ahead of it is captured, not discarded. A
+    // non-zero exit is UNREADABLE (never "no datasets"); a missing binary
+    // rejects with ENOENT (no ZFS here); a timeout rejects with the
+    // executor's CommandTimeoutError (UNREADABLE).
+    const [zfsResult, findmntResult] = await Promise.allSettled([
+      exec.exec(ZFS_BIN, ['list', '-H', '-o', 'name,mountpoint']),
+      exec.exec(FINDMNT_BIN, ['--json']),
+    ])
+    if (findmntResult.status === 'fulfilled' && findmntResult.value.exitCode === 0)
+      findmntNodes = isFindmntTable(findmntResult.value.stdout) ? parseFindmnt(findmntResult.value.stdout) : null
+    if (zfsResult.status === 'rejected')
+      throw zfsResult.reason
+    if (zfsResult.value.exitCode !== 0)
+      throw new Error(`zfs list exited ${zfsResult.value.exitCode}: ${zfsResult.value.stderr.trim()}`)
+    const stdout = zfsResult.value.stdout
     if (findmntNodes !== null)
       mountedTargets = zfsMountTargets(findmntNodes)
     return { mountpoints: parseZfsMountpoints(stdout, mountedTargets), findmntNodes }
@@ -530,8 +509,8 @@ export async function readZfsMountpointsFull(zfsOrExec: string | CommandExecutor
  * (mounts, iSCSI) consume. The footprint service asks {@link readZfsMountpointsFull}
  * instead, for the findmnt table beside it. See there for the semantics.
  */
-export async function readZfsMountpoints(zfsOrExec: string | CommandExecutor = 'zfs'): Promise<ZfsMountpoint[] | null> {
-  return (await readZfsMountpointsFull(zfsOrExec))?.mountpoints ?? null
+export async function readZfsMountpoints(exec: CommandExecutor): Promise<ZfsMountpoint[] | null> {
+  return (await readZfsMountpointsFull(exec))?.mountpoints ?? null
 }
 
 /**

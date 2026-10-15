@@ -131,6 +131,7 @@ export function createServer(opts: ServerOptions = {}) {
         socketPath: config.anasdSocket,
         anasdPath,
         user: request.user,
+        ...(config.socketTimeoutMs !== undefined ? { timeoutMs: config.socketTimeoutMs } : {}),
       })
       return
     }
@@ -157,7 +158,8 @@ export function createServer(opts: ServerOptions = {}) {
       pvePort: config.pvePort,
       clusterCa: config.clusterCa,
       membersPath: config.membersPath,
-      ...(config.forwardTimeoutMs !== undefined ? { timeoutMs: config.forwardTimeoutMs } : {}),
+      ...(config.forwardConnectTimeoutMs !== undefined ? { connectTimeoutMs: config.forwardConnectTimeoutMs } : {}),
+      ...(config.forwardResponseTimeoutMs !== undefined ? { responseTimeoutMs: config.forwardResponseTimeoutMs } : {}),
     })
   })
 

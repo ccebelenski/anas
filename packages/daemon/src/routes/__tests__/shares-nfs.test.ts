@@ -2,11 +2,13 @@ import type { Job, JobAccepted, NfsExport } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
+import { sharePathProbeArgs } from '../../services/share-path.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -70,19 +72,42 @@ describe('nfs export routes', () => {
       assert.deepEqual(data.map(e => e.path), ['/srv/nfs/media', '/srv/nfs/backups', '/export/legacy'])
     })
 
-    it('sets pathExists true for a live path and false for a missing one (stale)', async () => {
+    it('reports each export\'s path check through the executor: exists, missing, not answering (cr.35)', async () => {
+      // The answers are the captured `timeout 2 stat -f` cases
+      // (mounts/stat-f-exit-codes.txt); before cr.35 this was a statSync on
+      // the daemon's event loop, which a dead hard NFS mount froze.
       const livePath = join(dir, 'live')
-      await mkdir(livePath)
+      const hungPath = '/mnt/anas-nfs/export'
       await writeFile(exportsPath, [
         `${livePath} 10.0.0.0/24(rw,sync)`,
         '/does/not/exist *(ro,sync)',
+        `${hungPath} *(ro,sync)`,
         '',
       ].join('\n'))
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      mock.prependFixture({ command: '/usr/bin/timeout', args: sharePathProbeArgs(livePath), result: mockFixtures.statF('ext4 root (healthy local)') })
+      mock.prependFixture({ command: '/usr/bin/timeout', args: sharePathProbeArgs('/does/not/exist'), result: mockFixtures.statF('nonexistent path') })
+      mock.prependFixture({ command: '/usr/bin/timeout', args: sharePathProbeArgs(hungPath), result: mockFixtures.statF('nfs-server STOPPED; hard mount -> stat hangs -> timeout kills it') })
       const res = await server!.inject({ method: 'GET', url: '/v1/shares/nfs' })
       assert.equal(res.statusCode, 200)
       const { data } = res.json() as { data: NfsExport[] }
-      assert.equal(data.find(e => e.path === livePath)!.pathExists, true)
-      assert.equal(data.find(e => e.path === '/does/not/exist')!.pathExists, false)
+      const at = (p: string): [unknown, unknown] => {
+        const e = data.find(x => x.path === p)!
+        return [e.pathState, e.pathExists]
+      }
+      assert.deepEqual(at(livePath), ['exists', true])
+      assert.deepEqual(at('/does/not/exist'), ['missing', false])
+      assert.deepEqual(at(hungPath), ['not-answering', undefined])
+    })
+
+    it('the detail carries the same check (a hung path is not-answering, never a guess)', async () => {
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      mock.prependFixture({ command: '/usr/bin/timeout', args: sharePathProbeArgs('/srv/nfs/media'), timesOut: { abandoned: true } })
+      const res = await server!.inject({ method: 'GET', url: `/v1/shares/nfs/${encodeURIComponent('/srv/nfs/media')}` })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: NfsExport }
+      assert.equal(data.pathState, 'not-answering')
+      assert.equal(data.pathExists, undefined)
     })
 
     it('returns an empty list when the file is missing', async () => {

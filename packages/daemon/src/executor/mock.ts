@@ -170,6 +170,17 @@ export class MockExecutor implements CommandExecutor {
     return this
   }
 
+  /**
+   * Register a fixture AHEAD of every earlier one (cr.35): a test that turns
+   * one command of the dev server's seeded set into a never-answering one
+   * (`timesOut`) without clearing the rest. Matching order is otherwise
+   * unchanged — exact args, then `argsMatch`, then command-only.
+   */
+  prependFixture(fixture: MockFixture): this {
+    this.fixtures.unshift(fixture)
+    return this
+  }
+
   /** Register a pipeline fixture. Unmatched pipelines default to success. */
   addPipelineFixture(fixture: MockPipelineFixture): this {
     this.pipelineFixtures.push(fixture)

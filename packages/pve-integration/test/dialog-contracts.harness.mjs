@@ -10920,6 +10920,40 @@ warnings.length = 0
 created.windows.length = 0
 await smbSelfServiceChecks()
 
+// Story cr.35 — the Shares Path column says which of the daemon's four path
+// checks it got: a missing path is stale (red), a path that did not answer a
+// 2 s stat is a hung mount (amber — never "missing", never fine), an
+// unreadable one is muted; an old daemon's pathExists:false still reads stale.
+{
+  warnings.length = 0
+  created.windows.length = 0
+  const shares = [
+    { ...SMB_SHARE, name: 'ok', path: '/tank/ok', pathState: 'exists', pathExists: true },
+    { ...SMB_SHARE, name: 'gone', path: '/tank/gone', pathState: 'missing', pathExists: false },
+    { ...SMB_SHARE, name: 'hung', path: '/mnt/nfs/hung', pathState: 'not-answering' },
+    { ...SMB_SHARE, name: 'odd', path: '/mnt/nfs/odd', pathState: 'unreadable' },
+    { ...SMB_SHARE, name: 'olddaemon', path: '/tank/old', pathExists: false },
+    { ...SMB_SHARE, name: 'unchecked', path: '/tank/unchecked' },
+  ]
+  const { grid } = await openSharesView(smbSelfServiceRoutes(shares))
+  const pathCol = (grid.columns || []).find(c => c.dataIndex === 'path')
+  ok('cr.35 shares: the grid has a Path column', !!pathCol)
+  const store = grid.getStore()
+  const cell = {}
+  for (let i = 0; i < store.getCount(); i++) {
+    const rec = store.getAt(i)
+    cell[rec.get('name')] = pathCol ? pathCol.renderer(rec.get('path'), {}, rec) : ''
+  }
+  ok('cr.35 shares: an existing path renders bare', cell.ok === '/tank/ok', cell.ok)
+  ok('cr.35 shares: a missing path carries the stale tag', /anas-share-stale/.test(cell.gone) && /path missing/.test(cell.gone), cell.gone)
+  ok('cr.35 shares: a path that did not answer carries the hung tag, not the stale one',
+    /anas-share-hung/.test(cell.hung) && /path not answering/.test(cell.hung) && !/anas-share-stale/.test(cell.hung), cell.hung)
+  ok('cr.35 shares: the hung tag says why (a 2 s stat, a hung mount)', /did not answer within 2 seconds/.test(cell.hung) && /hung/.test(cell.hung), cell.hung)
+  ok('cr.35 shares: an unreadable path carries the muted tag', /anas-share-unreadable/.test(cell.odd) && /path unreadable/.test(cell.odd), cell.odd)
+  ok('cr.35 shares: an old daemon\'s pathExists:false still reads stale', /anas-share-stale/.test(cell.olddaemon), cell.olddaemon)
+  ok('cr.35 shares: no check at all (old daemon) renders bare', cell.unchecked === '/tank/unchecked', cell.unchecked)
+}
+
 // ---- Story vdevs.2 — the Pools toolbar's "Remove vdev…" dialog ------------
 //
 // The picker must offer the three classes `zpool remove` drops instantly and
@@ -12523,7 +12557,7 @@ async function cloudTaskChecks() {
       && /Would transfer 0 files \/ 0 B/.test(pLine().html),
     pLine() && pLine().html)
   ok('cloud preview: a truncated preview says what a partial answer is',
-    /stopped after 120 s — the counts are what rclone had reported by then, the list is everything it logged; the full run will do the rest/
+    /stopped after 25 s — the counts are what rclone had reported by then, the list is everything it logged; the full run will do the rest/
       .test(pLine().html), pLine() && pLine().html)
 
   // rclone's own first error line IS the summary — the counters lead is
@@ -12784,6 +12818,29 @@ function dashboardCloudIconChecks() {
   ok('dashboard: the command warning category (cr.34) carries the terminal glyph',
     /fa-terminal/.test(ANAS.dash.warnIcon('command')), ANAS.dash.warnIcon('command'))
   ok('dashboard: an unknown category still renders no icon', ANAS.dash.warnIcon('nope') === '')
+  ok('dashboard: the unavailable warning category (cr.35) carries the question glyph',
+    /fa-question-circle/.test(ANAS.dash.warnIcon('unavailable')), ANAS.dash.warnIcon('unavailable'))
+
+  // cr.35: a section the daemon could not read is the empty shape on the wire
+  // and named in `unavailable` — it must render "unavailable", never "No
+  // pools." and never four zero tiles.
+  const zero = { total: 0, healthy: 0, warning: 0, critical: 0, unknown: 0 }
+  const base = { node: 'n', pools: [], disks: zero, shares: { smbCount: 0, nfsCount: 0 }, jobs: [], warnings: [], ahrPools: [] }
+  const poolsHtml = st => ANAS.dash.renderPoolsComposite({ _anasStatus: st, _anasTelemetry: null })
+  ok('dashboard(cr.35): an empty, readable pool list still says "No pools."',
+    /No pools\./.test(poolsHtml({ ...base, unavailable: [] })), poolsHtml({ ...base, unavailable: [] }))
+  ok('dashboard(cr.35): an older daemon (no `unavailable`) still says "No pools."',
+    /No pools\./.test(poolsHtml(base)), poolsHtml(base))
+  const pu = poolsHtml({ ...base, unavailable: ['pools', 'ahrPools'] })
+  ok('dashboard(cr.35): unreadable pools say "unavailable", not "No pools."',
+    /Pool status is unavailable/.test(pu) && !/No pools\./.test(pu), pu)
+  const zu = poolsHtml({ ...base, unavailable: ['pools'] })
+  ok('dashboard(cr.35): only the ZFS side unreadable names the ZFS side', /ZFS pool status is unavailable/.test(zu) && !/No pools\./.test(zu), zu)
+  const fleetOk = ANAS.dash.renderFleet({ ...base, unavailable: [] }, {})
+  ok('dashboard(cr.35): readable disk health renders the count tiles', /disks total/.test(fleetOk) && !/unavailable/.test(fleetOk), fleetOk)
+  const fleetGone = ANAS.dash.renderFleet({ ...base, unavailable: ['disks'] }, {})
+  ok('dashboard(cr.35): unreadable disk health says so instead of four zero tiles',
+    /Disk health is unavailable/.test(fleetGone) && !/disks total/.test(fleetGone), fleetGone)
 }
 
 // ============================================================================

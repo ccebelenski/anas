@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { runInLane } from '../../executor/deadline.js'
 import { MockExecutor } from '../../executor/mock.js'
 import { parsePbsStorages, parsePveStorageCfg, parseZfsMountpoints, pathOnZfsFilesystem, readPbsStorages, readPveStorages, readZfsMountpoints, readZfsMountpointsFull, zfsMountTargets } from '../pve-storage.js'
 
@@ -354,13 +355,34 @@ describe('readPveStorages (fail-open)', () => {
 describe('readZfsMountpoints (ENOENT vs unreadable)', () => {
   // pvepool.1 review fix 1: the same three-valued posture as the storage.cfg
   // read — a missing `zfs` binary is a genuine "no ZFS here" (fail-open, []),
-  // a command that RAN and failed is UNREADABLE (null).
-  it('returns [] when the zfs binary is missing (ENOENT)', async () => {
-    assert.deepEqual(await readZfsMountpoints('/nonexistent/anas-no-zfs-here'), [])
+  // a command that RAN and failed is UNREADABLE (null). cr.35: the read always
+  // goes through the executor (it was a direct execFile with no deadline).
+  it('returns [] when the zfs binary is missing (ENOENT — the executor\'s spawn failure)', async () => {
+    const mock = new MockExecutor()
+      .addFixture({ command: '/usr/sbin/zfs', throws: Object.assign(new Error('spawn /usr/sbin/zfs ENOENT'), { code: 'ENOENT' }) })
+      .addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: '{"filesystems":[]}', stderr: '', exitCode: 0 } })
+    assert.deepEqual(await readZfsMountpoints(mock), [])
   })
 
   it('returns null (unreadable) when the command fails with anything but ENOENT', async () => {
-    assert.equal(await readZfsMountpoints('/bin/false'), null)
+    const mock = new MockExecutor().addFixture({ command: '/usr/sbin/zfs', throws: Object.assign(new Error('spawn /usr/sbin/zfs EACCES'), { code: 'EACCES' }) })
+    assert.equal(await readZfsMountpoints(mock), null)
+  })
+
+  it('cr.35: a `zfs list` that never answers is UNREADABLE (null), never "no datasets" — and it ran under the request budget', async () => {
+    const mock = new MockExecutor()
+      .addFixture({ command: '/usr/sbin/zfs', timesOut: {} })
+      .addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: '{"filesystems":[]}', stderr: '', exitCode: 0 } })
+    assert.equal(await runInLane({ lane: 'request' }, () => readZfsMountpoints(mock)), null)
+    assert.deepEqual(mock.deadlines.map(d => [d.command, d.lane, d.budgetMs]), [
+      ['/usr/sbin/zfs', 'request', 10_000],
+      ['/usr/bin/findmnt', 'request', 10_000],
+    ])
+  })
+
+  it('cr.35: the parser module runs nothing outside the executor', () => {
+    const text = readFileSync(join(__dirname, '..', 'pve-storage.ts'), 'utf-8')
+    assert.doesNotMatch(text, /from 'node:child_process'|\bexecFile(?:Async)?\(/)
   })
 })
 

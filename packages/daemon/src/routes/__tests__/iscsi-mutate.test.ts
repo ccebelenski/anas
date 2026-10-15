@@ -1211,7 +1211,9 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       // The old code took the null size as a grow and ran a direction-blind
       // `zfs set volsize=` — a silent truncation. Nothing may have run.
       assert.equal(
-        mock.calls.filter(c => c.command === TARGETCLI || c.command === ZFS).length,
+        // (cr.35: the read context's `zfs list -H -o name,mountpoint` now runs
+        // through the executor too — a read, so it is not counted here.)
+        mock.calls.filter(c => c.command === TARGETCLI || (c.command === ZFS && c.args[0] !== 'list')).length,
         0,
         JSON.stringify(mock.calls.map(c => [c.command, c.args])),
       )
@@ -1372,7 +1374,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       const job = await waitForJob(second.body.job!.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
       assert.equal((job.result as { backingDestroyed?: string | null }).backingDestroyed, null)
-      assert.ok(!mockOf().calls.some(c => c.command === ZFS), 'no zfs destroy when the backing is kept')
+      assert.ok(!mockOf().calls.some(c => c.command === ZFS && c.args[0] !== 'list'), 'no zfs destroy when the backing is kept')
     })
 
     it('the code minted for {target, lun} verifies WITH ?destroyBacking=true — the flag is not in the signature', async () => {

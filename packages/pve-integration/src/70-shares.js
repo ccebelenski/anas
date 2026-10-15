@@ -260,6 +260,9 @@
             // shared path is missing on disk; undefined = unknown (old daemon
             // or a stat that failed — render as today, never flag stale).
             pathExists: share.pathExists,
+            // cr.35: which of the four outcomes the check had (exists /
+            // missing / not-answering / unreadable); absent from an old daemon.
+            pathState: share.pathState,
             activeConnections: Number(active) || 0,
             raw: share,
         };
@@ -279,6 +282,7 @@
             name: exp.path,
             path: exp.path,
             pathExists: exp.pathExists,
+            pathState: exp.pathState,
             activeConnections: null,
             raw: exp,
         };
@@ -301,18 +305,45 @@
         + 'definition is stale — clients cannot use it. Remove it or restore '
         + 'the path.';
 
-    // Path column. When the daemon reports pathExists === false the backing
-    // storage is gone and the share is stale: append a small danger-styled
-    // "path missing" tag (hook class 'anas-share-stale'). pathExists === undefined
-    // (unknown — old daemon or a failed stat) renders exactly as before.
+    // cr.35: the path did not answer a 2 s stat — a hung mount under the
+    // share. Not "missing" and not "fine": the daemon could not tell.
+    var HUNG_TIP = 'The shared path did not answer within 2 seconds. The '
+        + 'storage under it (usually an NFS or CIFS mount) is hung, so clients '
+        + 'probably cannot use the share either. Check the mount on the '
+        + 'Mounts screen.';
+    // cr.35: the stat answered with an error other than "missing" (stale
+    // file handle, permission, I/O error).
+    var UNREADABLE_TIP = 'The shared path could not be checked: the system '
+        + 'reported an error other than "missing" (for example a stale file '
+        + 'handle or an I/O error). See the dashboard warning for the message.';
+
+    function pathTag(cls, text, tip, bg) {
+        return ' <span class="' + cls + '" title="' + enc(t(tip)) + '"'
+            + ' style="display:inline-block;margin-left:6px;padding:0 7px;'
+            + 'border-radius:9px;font-size:0.82em;font-weight:600;color:#fff;'
+            + 'background:' + bg + ';vertical-align:baseline;">'
+            + enc(t(text)) + '</span>';
+    }
+
+    // Path column. The daemon's read-time path check (pathState, cr.35):
+    // missing → the backing storage is gone and the share is stale: a
+    // danger-styled "path missing" tag (hook class 'anas-share-stale');
+    // not-answering → an amber "path not answering" tag (hung mount);
+    // unreadable → a muted "path unreadable" tag. exists, or no check at all
+    // (an old daemon), renders the bare path. An old daemon's
+    // pathExists === false still gets the missing tag.
     function renderPath(v, meta, rec) {
         var html = enc(v);
-        if (rec.get('pathExists') === false) {
-            html += ' <span class="anas-share-stale" title="' + enc(t(STALE_TIP)) + '"'
-                + ' style="display:inline-block;margin-left:6px;padding:0 7px;'
-                + 'border-radius:9px;font-size:0.82em;font-weight:600;color:#fff;'
-                + 'background:var(--anas-danger,#c23b2c);vertical-align:baseline;">'
-                + enc(t('path missing')) + '</span>';
+        var state = rec.get('pathState');
+        if (state === 'missing' || (!state && rec.get('pathExists') === false)) {
+            html += pathTag('anas-share-stale', 'path missing', STALE_TIP,
+                'var(--anas-danger,#c23b2c)');
+        } else if (state === 'not-answering') {
+            html += pathTag('anas-share-hung', 'path not answering', HUNG_TIP,
+                'var(--anas-warn,#b06a12)');
+        } else if (state === 'unreadable') {
+            html += pathTag('anas-share-unreadable', 'path unreadable',
+                UNREADABLE_TIP, 'var(--anas-muted,gray)');
         }
         return html;
     }
@@ -1936,6 +1967,7 @@
             fields: [
                 'protocol', 'name', 'path',
                 { name: 'pathExists', type: 'auto' },
+                { name: 'pathState', type: 'auto' },
                 { name: 'activeConnections', type: 'auto' },
                 { name: 'raw', type: 'auto' },
             ],

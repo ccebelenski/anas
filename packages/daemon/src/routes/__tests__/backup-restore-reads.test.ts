@@ -34,7 +34,7 @@ const TIMEOUT = '/usr/bin/timeout'
  * be registered with its exact args to win.
  */
 function shellArgs(snapshot: string, archive: string, ns?: string): string[] {
-  const args = ['30', PBC, 'catalog', 'shell', snapshot, archive]
+  const args = ['25', PBC, 'catalog', 'shell', snapshot, archive]
   if (ns)
     args.push('--ns', ns)
   return args

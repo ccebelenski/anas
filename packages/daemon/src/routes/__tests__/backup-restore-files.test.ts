@@ -60,7 +60,7 @@ function statBlock(path: string, size: number, type: string, mode: string, perms
 
 /** The exact argv the pre-flight catalog `stat` pass sends. */
 function shellArgs(): string[] {
-  return ['30', PBC, 'catalog', 'shell', SNAP, 'data.pxar', '--ns', 'gtrestore']
+  return ['25', PBC, 'catalog', 'shell', SNAP, 'data.pxar', '--ns', 'gtrestore']
 }
 
 describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {

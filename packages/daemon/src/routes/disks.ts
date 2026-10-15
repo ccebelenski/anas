@@ -196,6 +196,17 @@ function isUsableEpochMs(ms: number | undefined): ms is number {
 }
 
 /**
+ * How long a disk list waits for the SMART probes that are due (cr.35). The
+ * probe itself may take 20 s (§6.3: a disk waking for another reader), but
+ * the gateway hangs up on anasd at 20 s, so a list that waited that long for
+ * one slow disk would reach the browser as a 504 instead of a Disks view.
+ * After 8 s the list answers with each disk's last reading (or none — health
+ * `unknown`); the slow probe keeps running and its answer is in the cache for
+ * the next pull. 8 s + the parallel base reads stays under the gateway's 20 s.
+ */
+export const SMART_DISPLAY_WAIT_MS = 8_000
+
+/**
  * Fetch all disk data: lsblk, by-id mapping, and pool membership, enriched with
  * cached identity + the fused SMART/ZFS `healthStatus`. Standalone (not a route
  * closure) so the Disks view AND the Dashboard status endpoint share ONE health
@@ -338,6 +349,7 @@ export async function collectDisks(
       presentIds: enumerationPrunable
         ? disks.filter(d => byIdMap.has(d.name)).map(d => d.id)
         : undefined,
+      waitMs: SMART_DISPLAY_WAIT_MS,
     },
   )
 

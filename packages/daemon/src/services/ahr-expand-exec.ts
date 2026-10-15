@@ -21,6 +21,7 @@ import { AHR_SIZE_GRANULARITY_BYTES, floorToGranularity, fmtBytes, isPvUnderSize
 import { pinArrays } from './ahr-mdadm-conf.js'
 import { AHR_FINDMNT_ARGS, stripSubvolSuffix } from './ahr-topology.js'
 import { pveNotify } from './pve-notify.js'
+import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
 
 /**
  * AHR expansion step executor (11.6, §5) — the dangerous part, kept dumb:
@@ -50,7 +51,6 @@ const CAT = '/usr/bin/cat'
 const LSBLK = '/usr/bin/lsblk'
 const SGDISK = '/usr/sbin/sgdisk'
 const MDADM = '/usr/sbin/mdadm'
-const UDEVADM = '/usr/bin/udevadm'
 const PARTX = '/usr/bin/partx'
 const REALPATH = '/usr/bin/realpath'
 
@@ -391,7 +391,7 @@ export async function ensureDiskPartitions(
   // exit code that conflates "already present" with "failed".
   await executor.exec(PARTX, ['-a', dev])
   // udev still owns the by-id SYMLINKS, and those it does emit events for.
-  await executor.exec(UDEVADM, ['settle'])
+  await executor.exec(UDEVADM, udevSettleArgs(), { timeoutMs: UDEVADM_SETTLE_BUDGET_MS })
 
   // VERIFY, never assume. Reporting this step done without the devices present
   // is what turned a partitioning failure into an unrelated error six minutes

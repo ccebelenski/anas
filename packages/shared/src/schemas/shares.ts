@@ -16,6 +16,24 @@ export const SmbConnection = z.object({
 })
 export type SmbConnection = z.infer<typeof SmbConnection>
 
+/**
+ * What a read-time check of a share's backing path found (cr.35). The check
+ * is `timeout 2 stat -f <path>` through the executor — never a `stat` on the
+ * daemon's own event loop, which a dead hard NFS mount would freeze along
+ * with every other request:
+ *
+ * - `exists`        the path answered;
+ * - `missing`       the path is gone (ENOENT / ENOTDIR): the share is stale;
+ * - `not-answering` the stat did not return within 2 s — the storage under
+ *                   the path (usually an NFS or CIFS mount) is hung. NOT a
+ *                   guess either way: the path may exist;
+ * - `unreadable`    the stat answered with another error (EACCES, EIO,
+ *                   ESTALE): the path is there in some form but unusable or
+ *                   unverifiable.
+ */
+export const SharePathState = z.enum(['exists', 'missing', 'not-answering', 'unreadable'])
+export type SharePathState = z.infer<typeof SharePathState>
+
 // ---------------------------------------------------------------------------
 // Self-service features on SMB shares (smbsvc.1–3, DESIGN "Self-service on
 // SMB shares"). Each feature is pure surgical smb.conf wiring of a Samba VFS
@@ -100,8 +118,12 @@ export const SmbShare = z.object({
    * whose backing storage is gone is stale: the definition outlives the path
    * and clients cannot use it. `false` = confirmed missing; `undefined` =
    * unknown (old daemon, or the stat failed, e.g. EACCES — never a false stale).
+   * `pathState` says which unknown (cr.35); `pathExists` stays for wire
+   * compatibility and is set only for `exists` (true) and `missing` (false).
    */
   pathExists: z.boolean().optional(),
+  /** The read-time path check, all four outcomes (cr.35). Absent from an old daemon. */
+  pathState: SharePathState.optional(),
   /**
    * The share's `vfs objects` module list, parsed from the stanza — absent
    * when the stanza carries no such line. Read-only information (what the
@@ -275,8 +297,12 @@ export const NfsExport = z.object({
    * export whose backing storage is gone is stale: the line outlives the path
    * and clients cannot use it. `false` = confirmed missing; `undefined` =
    * unknown (old daemon, or the stat failed, e.g. EACCES — never a false stale).
+   * `pathState` says which unknown (cr.35); `pathExists` stays for wire
+   * compatibility and is set only for `exists` (true) and `missing` (false).
    */
   pathExists: z.boolean().optional(),
+  /** The read-time path check, all four outcomes (cr.35). Absent from an old daemon. */
+  pathState: SharePathState.optional(),
 })
 export type NfsExport = z.infer<typeof NfsExport>
 

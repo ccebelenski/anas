@@ -18,6 +18,7 @@ import { readDiskTree } from './ahr-expand-exec.js'
 import { requirePoolVg } from './ahr-identity.js'
 import { isAhrMountReadOnly } from './ahr-topology.js'
 import { pveNotify } from './pve-notify.js'
+import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
 
 /**
  * AHR read cache — the attach/detach executor (story ahrcache.1,
@@ -52,7 +53,6 @@ import { pveNotify } from './pve-notify.js'
  */
 
 const SGDISK = '/usr/sbin/sgdisk'
-const UDEVADM = '/usr/bin/udevadm'
 const WIPEFS = '/usr/sbin/wipefs'
 const REALPATH = '/usr/bin/realpath'
 const LS = '/usr/bin/ls'
@@ -400,7 +400,7 @@ async function ensureCachePv(
     await run(executor, SGDISK, ['-n', '1:1M:0', '-t', `1:${SGDISK_LVM_TYPE}`, '-c', `1:${label}`, dev])
     // The kernel node appears at once on an idle disk; the by-id symlink and
     // the PARTLABEL need the settle (GT-21).
-    await run(executor, UDEVADM, ['settle'])
+    await run(executor, UDEVADM, udevSettleArgs(), { timeoutMs: UDEVADM_SETTLE_BUDGET_MS })
     tree = await readDiskTree(executor, dev)
     slice = tree?.parts.find(p => p.partlabel === label)
     log(`ahr.cache pool=${pool} disk=${diskId} slice=${label} status=created`)
@@ -646,7 +646,7 @@ export async function detachAhrCache(
     log(`ahr.cache pool=${pool.name} disk=${slice.diskId} slice=${slice.partNumber} status=released`)
   }
   if (slices.length > 0)
-    await run(executor, UDEVADM, ['settle'])
+    await run(executor, UDEVADM, udevSettleArgs(), { timeoutMs: UDEVADM_SETTLE_BUDGET_MS })
 
   return { pool: pool.name, released: [...new Set(released)] }
 }

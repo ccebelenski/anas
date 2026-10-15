@@ -6,6 +6,7 @@ import { requireComposableNow } from './ahr-disk-recheck.js'
 import { run } from './ahr-exec.js'
 import { addSpareSlice, ensureDiskPartitions, projectExistingBands, readDiskTree, removeDetachedFaultySlots, resolveAhrArrays } from './ahr-expand-exec.js'
 import { floorToGranularity, fmtBytes } from './ahr-layout.js'
+import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
 
 /**
  * AHR hot spares (story 11.11, docs/AHR-DESIGN.md §11) — pool-level spares.
@@ -33,7 +34,6 @@ import { floorToGranularity, fmtBytes } from './ahr-layout.js'
 const WIPEFS = '/usr/sbin/wipefs'
 const SGDISK = '/usr/sbin/sgdisk'
 const MDADM = '/usr/sbin/mdadm'
-const UDEVADM = '/usr/bin/udevadm'
 
 function byIdPath(diskId: string): string {
   return `/dev/disk/by-id/${diskId}`
@@ -193,7 +193,7 @@ export async function attachSpare(
   updateProgress(`Wiping ${diskId}`)
   await run(executor, WIPEFS, ['-a', dev])
   await run(executor, SGDISK, ['--zap-all', dev])
-  await run(executor, UDEVADM, ['settle'])
+  await run(executor, UDEVADM, udevSettleArgs(), { timeoutMs: UDEVADM_SETTLE_BUDGET_MS })
 
   updateProgress(`Partitioning ${diskId} (${bands.length} band slice${bands.length === 1 ? '' : 's'})`)
   await ensureDiskPartitions(executor, pool.name, diskId, bands)

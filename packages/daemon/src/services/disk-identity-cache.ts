@@ -266,7 +266,7 @@ export class DiskIdentityCache {
    */
   async loadMany(
     disks: Array<{ id: string, path: string }>,
-    opts: { prunable?: boolean, presentIds?: string[] } = {},
+    opts: { prunable?: boolean, presentIds?: string[], waitMs?: number } = {},
   ): Promise<void> {
     this.pruneAbsent(
       opts.presentIds !== undefined
@@ -279,7 +279,24 @@ export class DiskIdentityCache {
     const due = disks.filter(d => this.isDue(d.id, this.reading.get(d.id)))
     if (due.length === 0)
       return
-    await Promise.all(due.map(d => this.get(d.id, d.path)))
+    const all = Promise.all(due.map(d => this.get(d.id, d.path)))
+    if (opts.waitMs === undefined) {
+      await all
+      return
+    }
+    // cr.35: wait at most `waitMs`. A probe still running after that keeps
+    // running under its own 20 s deadline and lands in the cache when it
+    // answers (the `pending` dedup hands it to the next pull meanwhile); this
+    // pass reports whatever reading the disk already has — its last
+    // measurement with its age, or none — and never invents one.
+    let timer: NodeJS.Timeout | undefined
+    await Promise.race([
+      all,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, opts.waitMs)
+      }),
+    ])
+    clearTimeout(timer)
   }
 
   /**

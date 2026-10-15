@@ -1,6 +1,8 @@
 import type {
   AhrPool,
+  AhrPoolBrief,
   ArcTelemetry,
+  DashboardSection,
   DashboardWarning,
   Disk,
   DiskHealthCounts,
@@ -24,11 +26,13 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
+import type { SharePathProbe } from '../services/share-path.js'
 import { readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { basename } from 'node:path'
 import { GROUPING_VDEV_TYPES } from '@anas/shared'
-import { abandonedChildren, formatBudget } from '../executor/deadline.js'
+import { abandonedChildren, CommandTimeoutError, formatBudget } from '../executor/deadline.js'
+import { WatchedExecutor } from '../executor/watch.js'
 import { computeArcTelemetry, parseArcstats } from '../parsers/arcstats.js'
 import { leafDiskId, parseDiskByIdListing } from '../parsers/disk-by-id.js'
 import { parseExports } from '../parsers/exports.js'
@@ -46,15 +50,25 @@ import { readConfig } from '../services/config-writer.js'
 import { collectIscsiWarnings } from '../services/iscsi-warnings.js'
 import { collectMountWarnings } from '../services/mounts.js'
 import { buildReplicationWarnings, collectTaskStatuses } from '../services/replication-units.js'
+import { probeSharePaths } from '../services/share-path.js'
 import { collectScheduleWarnings } from '../services/snapshot-schedule-units.js'
 import { collectDisks } from './disks.js'
-import { pathExists } from './shares-smb.js'
 
 const ARCSTATS_PATH = '/proc/spl/kstat/zfs/arcstats'
 const PROC_NET_DEV = '/proc/net/dev'
 const PROC_DISKSTATS = '/proc/diskstats'
 const ZPOOL = '/usr/sbin/zpool'
 const SYSTEMCTL = '/usr/bin/systemctl'
+
+/**
+ * The wall budget of one /v1/status section (cr.35). Inside the gateway's
+ * 20 s socket budget with room for the reply, and above the request lane's
+ * 10 s per command, so a single hung command that can be stopped is named by
+ * its own CommandTimeoutError at 10 s; this budget catches a command that
+ * could not be stopped (abandoned at 17 s) and a section that runs two slow
+ * reads one after the other.
+ */
+export const DASHBOARD_SECTION_BUDGET_MS = 15_000
 
 /** Pool states that are outright critical (data at risk / unavailable). */
 const CRITICAL_POOL_STATES = new Set(['FAULTED', 'UNAVAIL', 'REMOVED', 'SUSPENDED'])
@@ -74,7 +88,10 @@ const CRITICAL_POOL_STATES = new Set(['FAULTED', 'UNAVAIL', 'REMOVED', 'SUSPENDE
  *                       per-disk I/O, and network throughput.
  *
  * Both are read-only (no jobs, no mutations) and FAIL-OPEN: any sub-part that
- * errors contributes empty/zero rather than failing the whole panel.
+ * errors contributes empty/zero rather than failing the whole panel. On
+ * /v1/status that empty part is never silent (cr.35): a section whose read
+ * failed, timed out or overran its budget is listed in `unavailable` and
+ * carded, so an empty pool list there is never "no pools".
  */
 export async function dashboardRoutes(
   server: FastifyInstance,
@@ -96,9 +113,12 @@ export async function dashboardRoutes(
     ahrIntentDir?: string
     /** iSCSI read paths (configfs / saveconfig) — defaults are production. */
     iscsiPaths?: IscsiPaths
+    /** One /v1/status section's wall budget (cr.35); tests shorten it. */
+    sectionBudgetMs?: number
   },
 ) {
   const { executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath, mdadmConfPath, ahrIntentDir, iscsiPaths } = opts
+  const sectionBudgetMs = opts.sectionBudgetMs ?? DASHBOARD_SECTION_BUDGET_MS
 
   // A pool mid-create must not card as a CRITICAL failure for the whole build
   // (issue #7): the half-built stack is genuinely VG-less, so only the live job
@@ -124,52 +144,58 @@ export async function dashboardRoutes(
 
   // --- GET /v1/status ------------------------------------------------------
   server.get('/status', async () => {
-    // Each block is independently fail-open so one failing source (e.g. no ZFS)
-    // never blanks the rest of the dashboard.
+    // Each section is read by its own collector, through its own watched
+    // executor, under its own wall budget (cr.35). A section that throws,
+    // overruns, or whose read timed out — even a timeout its collector
+    // caught and turned into an empty answer — is the empty shape here AND
+    // listed in `unavailable` with a card naming the command; every other
+    // section renders as read. One hung read never turns the dashboard into
+    // a 503 (Promise.all over collectors that could reject did), and never
+    // reads as "no pools".
     const [poolStatus, diskHealth, shares, jobs, replicationWarnings, mountWarnings, backupWarnings, cloudWarnings, ahrWarnings, ahrPools, scheduleWarnings, iscsiWarnings] = await Promise.all([
-      collectPoolStatus(),
-      collectDiskHealth(),
-      collectShareStatus(),
-      collectJobs(),
-      collectReplicationWarnings(),
-      collectMountWarnings(executor, { fstabPath, storagePath, mdadmConfPath }),
-      collectBackupWarnings(executor, systemdDir),
+      readSection('pools', { pools: [], scanErrors: new Map<string, number>() }, exec => collectPoolStatus(exec)),
+      readSection('disks', { counts: { total: 0, healthy: 0, warning: 0, critical: 0, unknown: 0 }, disks: [] as Disk[] }, exec => collectDiskHealth(exec)),
+      readSection('shares', { brief: { smbCount: 0, nfsCount: 0 }, warnings: [] as DashboardWarning[] }, exec => collectShareStatus(exec)),
+      readSection('jobs', [] as JobBrief[], async () => collectJobs()),
+      readSection('replication', [] as DashboardWarning[], exec => collectReplicationWarnings(exec)),
+      readSection('mounts', [] as DashboardWarning[], exec => collectMountWarnings(exec, { fstabPath, storagePath, mdadmConfPath })),
+      readSection('backup', [] as DashboardWarning[], exec => collectBackupWarnings(exec, systemdDir)),
       // Cloud sync (rclone.2): failed/overdue enabled tasks → 'cloud' warnings,
       // the same rule and the same code backup's go through (task-units.ts with
-      // the cloud descriptor). Healthy and disabled tasks contribute nothing;
-      // errors fail-open to [].
-      collectCloudWarnings(executor, systemdDir),
+      // the cloud descriptor). Healthy and disabled tasks contribute nothing.
+      readSection('cloud', [] as DashboardWarning[], exec => collectCloudWarnings(exec, systemdDir)),
       // AHR (11.10): only bad states card (degraded/failed/readonly/halted
-      // expansion); healthy pools contribute nothing, errors fail-open.
-      collectAhrWarnings(executor, ahrIntentDir, ahrCreateStatus),
+      // expansion); healthy pools contribute nothing.
+      readSection('ahr', [] as DashboardWarning[], exec => collectAhrWarnings(exec, ahrIntentDir, ahrCreateStatus)),
       // AHR (11.13, §10 revision): per-pool briefs for the headline Pools
-      // section — healthy pools now render alongside ZFS pools; errors
-      // fail-open to [] (the dashboard never degrades when AHR is unreadable).
-      collectAhrPoolBriefs(executor, mdadmConfPath, ahrCreateStatus),
+      // section — healthy pools render alongside ZFS pools.
+      readSection('ahrPools', [] as AhrPoolBrief[], exec => collectAhrPoolBriefs(exec, mdadmConfPath, ahrCreateStatus)),
       // Snapshot schedules (17.7): failed/overdue enabled schedules → 'schedule'
-      // warnings; healthy/idle and disabled contribute nothing, errors fail-open.
-      collectScheduleWarnings(executor, systemdDir),
+      // warnings; healthy/idle and disabled contribute nothing.
+      readSection('schedules', [] as DashboardWarning[], exec => collectScheduleWarnings(exec, systemdDir)),
       // iSCSI (iscsi.5): the saveconfig ⟷ configfs diff → 'iscsi' warnings. A
       // boot restore whose backing device was missing reports systemd SUCCESS
       // and silently drops the LUN, so this PULL is the ONLY place a missing
       // LUN, a target serving nothing or a portal on a dead address is ever
       // surfaced. Healthy adds nothing; a node without LIO costs two stats and
-      // adds nothing; errors fail-open to [].
+      // adds nothing.
       // Story `iscsi.8` widens it twice: a fileio LUN found to be serving a
       // PLACEHOLDER is quarantined here (this read is one of the two moments
       // ANAS looks at the tree at all), and a disabled ANAS target gets a card
       // that names WHY when a retained job still knows — the image restore that
       // left it dark says so in its own failure text, and nothing else on the
       // system remembers (no shadow state).
-      collectIscsiWarnings(executor, iscsiPaths ?? {}, { disabledDetail: iscsiDisabledDetail }),
+      readSection('iscsi', [] as DashboardWarning[], exec => collectIscsiWarnings(exec, iscsiPaths ?? {}, { disabledDetail: iscsiDisabledDetail })),
     ])
+    const sections = [poolStatus, diskHealth, shares, jobs, replicationWarnings, mountWarnings, backupWarnings, cloudWarnings, ahrWarnings, ahrPools, scheduleWarnings, iscsiWarnings]
+    const unavailable = sections.flatMap(r => (r.unavailable ? [r.unavailable] : []))
 
     const summary: StatusSummary = {
       node: hostname(),
-      pools: poolStatus.pools,
-      disks: diskHealth.counts,
-      shares: shares.brief,
-      jobs,
+      pools: poolStatus.value.pools,
+      disks: diskHealth.value.counts,
+      shares: shares.value.brief,
+      jobs: jobs.value,
       // Pool/disk warnings, stale-share warnings (same smb.conf/exports parse
       // collectShareStatus already ran), plus failed-replication-task warnings.
       // AHR pools get the SAME capacity cards ZFS pools do — parallel
@@ -178,20 +204,46 @@ export async function dashboardRoutes(
       // A create that failed and rolled itself back leaves NO pool behind, so
       // it can only be surfaced from the job side (issue #11) — without this the
       // failure would be discoverable nowhere in the UI.
-      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings, ...mountWarnings, ...backupWarnings, ...cloudWarnings, ...ahrWarnings, ...buildAhrCapacityWarnings(ahrPools), ...buildFailedCreateWarnings(ahrPools.map(p => p.name), jobQueue), ...scheduleWarnings, ...iscsiWarnings, ...buildAbandonedWarnings(abandonedChildren.list())],
-      ahrPools,
+      // cr.35: the unavailable sections' cards lead — the rest of the summary
+      // is read with them in mind.
+      warnings: [
+        ...buildUnavailableWarnings(unavailable),
+        ...buildWarnings(poolStatus.value, diskHealth.value.disks),
+        ...shares.value.warnings,
+        ...replicationWarnings.value,
+        ...mountWarnings.value,
+        ...backupWarnings.value,
+        ...cloudWarnings.value,
+        ...ahrWarnings.value,
+        ...buildAhrCapacityWarnings(ahrPools.value),
+        ...buildFailedCreateWarnings(ahrPools.value.map(p => p.name), jobQueue),
+        ...scheduleWarnings.value,
+        ...iscsiWarnings.value,
+        ...buildAbandonedWarnings(abandonedChildren.list()),
+      ],
+      ahrPools: ahrPools.value,
+      unavailable: unavailable.map(u => u.section),
     }
     return { data: summary }
   })
+
+  /** One /v1/status section, through {@link readDashboardSection}. */
+  function readSection<T>(
+    section: DashboardSection,
+    fallback: T,
+    read: (exec: CommandExecutor) => Promise<T>,
+  ): Promise<SectionRead<T>> {
+    return readDashboardSection(executor, sectionBudgetMs, section, fallback, read)
+  }
 
   /**
    * Replication tasks whose last run failed → 'replication' warnings (5.5.3).
    *  Reuses the same task-status derivation the Replication view uses; fail-open
    *  to no warnings (units-as-store, ZFS + systemd truth).
    */
-  async function collectReplicationWarnings(): Promise<DashboardWarning[]> {
+  async function collectReplicationWarnings(exec: CommandExecutor): Promise<DashboardWarning[]> {
     try {
-      return buildReplicationWarnings(await collectTaskStatuses(executor, systemdDir))
+      return buildReplicationWarnings(await collectTaskStatuses(exec, systemdDir))
     }
     catch {
       return []
@@ -199,7 +251,7 @@ export async function dashboardRoutes(
   }
 
   /** Pool briefs + the scan/state context the warnings pass needs. */
-  async function collectPoolStatus(): Promise<{
+  async function collectPoolStatus(exec: CommandExecutor): Promise<{
     pools: PoolStatusBrief[]
     scanErrors: Map<string, number>
   }> {
@@ -207,8 +259,8 @@ export async function dashboardRoutes(
     const scanErrors = new Map<string, number>()
     try {
       const [listResult, statusResult] = await Promise.all([
-        executor.exec(ZPOOL, ['list', '-j']),
-        executor.exec(ZPOOL, ['status', '-jv']),
+        exec.exec(ZPOOL, ['list', '-j']),
+        exec.exec(ZPOOL, ['status', '-jv']),
       ])
       if (listResult.exitCode !== 0 && !listResult.stdout.trim())
         return { pools, scanErrors }
@@ -239,11 +291,11 @@ export async function dashboardRoutes(
   }
 
   /** Fused SMART+ZFS health counts plus the disk list (for per-disk warnings). */
-  async function collectDiskHealth(): Promise<{ counts: DiskHealthCounts, disks: Disk[] }> {
+  async function collectDiskHealth(exec: CommandExecutor): Promise<{ counts: DiskHealthCounts, disks: Disk[] }> {
     const counts: DiskHealthCounts = { total: 0, healthy: 0, warning: 0, critical: 0, unknown: 0 }
     let disks: Disk[] = []
     try {
-      disks = await collectDisks(executor, diskIdentityCache)
+      disks = await collectDisks(exec, diskIdentityCache)
       for (const d of disks) {
         counts.total++
         counts[d.healthStatus]++
@@ -263,52 +315,38 @@ export async function dashboardRoutes(
    * false stale). Every stale share is emitted; the dashboard renders warnings
    * as compact wrap cards, so volume is fine.
    */
-  async function collectShareStatus(): Promise<{ brief: ShareStatusBrief, warnings: DashboardWarning[] }> {
+  async function collectShareStatus(exec: CommandExecutor): Promise<{ brief: ShareStatusBrief, warnings: DashboardWarning[] }> {
     const brief: ShareStatusBrief = { smbCount: 0, nfsCount: 0 }
     const warnings: DashboardWarning[] = []
     try {
       const smbShares = parseSmbConf(await readConfig(smbConfPath)).shares
       brief.smbCount = smbShares.length
-      for (const share of smbShares) {
-        if (pathExists(share.path) === false) {
-          warnings.push({
-            level: 'warning',
-            category: 'share',
-            message: `SMB share '${share.name}' points to a missing path ${share.path}`,
-            ref: share.name,
-          })
-        }
-      }
+      const probes = await probeSharePaths(exec, smbShares.map(s => s.path))
+      for (const share of smbShares)
+        warnings.push(...sharePathWarnings('smb', share.name, share.path, probes.get(share.path)!))
     }
     catch { /* fail-open */ }
     try {
       const exports = parseExports(await readConfig(exportsPath))
       brief.nfsCount = exports.length
-      for (const exp of exports) {
-        if (pathExists(exp.path) === false) {
-          warnings.push({
-            level: 'warning',
-            category: 'share',
-            message: `NFS export path ${exp.path} no longer exists`,
-            ref: exp.path,
-          })
-        }
-      }
+      const probes = await probeSharePaths(exec, exports.map(e => e.path))
+      for (const exp of exports)
+        warnings.push(...sharePathWarnings('nfs', exp.path, exp.path, probes.get(exp.path)!))
     }
     catch { /* fail-open */ }
-    const smbActive = await serviceActive('smbd')
+    const smbActive = await serviceActive(exec, 'smbd')
     if (smbActive !== undefined)
       brief.smbActive = smbActive
-    const nfsActive = await serviceActive('nfs-server')
+    const nfsActive = await serviceActive(exec, 'nfs-server')
     if (nfsActive !== undefined)
       brief.nfsActive = nfsActive
     return { brief, warnings }
   }
 
   /** `systemctl is-active <unit>` → true/false, or undefined if undetectable. */
-  async function serviceActive(unit: string): Promise<boolean | undefined> {
+  async function serviceActive(exec: CommandExecutor, unit: string): Promise<boolean | undefined> {
     try {
-      const r = await executor.exec(SYSTEMCTL, ['is-active', unit])
+      const r = await exec.exec(SYSTEMCTL, ['is-active', unit])
       const state = r.stdout.trim()
       // is-active prints a known state token (exit code is non-zero when
       // inactive, which is fine). Anything else (empty / mock miss) → omit.
@@ -626,6 +664,91 @@ function emptyTelemetry(sampledAt: string): Telemetry {
   }
 }
 
+/** One section's read: its value, and why it is unavailable when it is. */
+export interface SectionRead<T> {
+  value: T
+  unavailable?: UnavailableSection
+}
+
+/** A section that could not be read, and why (the command that did not answer). */
+export interface UnavailableSection {
+  section: DashboardSection
+  reason: string
+}
+
+/**
+ * Read one /v1/status section (cr.35). `read` gets a {@link WatchedExecutor}
+ * over `executor` and `budgetMs` of wall time; the section is UNAVAILABLE —
+ * `fallback` (the empty shape) plus a reason — when `read` throws, does not
+ * finish in time (it keeps running; its answer is dropped), or saw a
+ * CommandTimeoutError it may have caught and turned into an empty answer. A
+ * read that finished keeps its value even then: the reason says it is
+ * incomplete, and the value is never presented as complete.
+ */
+export async function readDashboardSection<T>(
+  executor: CommandExecutor,
+  budgetMs: number,
+  section: DashboardSection,
+  fallback: T,
+  read: (exec: CommandExecutor) => Promise<T>,
+): Promise<SectionRead<T>> {
+  const watch = new WatchedExecutor(executor)
+  let timer: NodeJS.Timeout | undefined
+  type Outcome = { kind: 'done', value: T } | { kind: 'threw', err: unknown } | { kind: 'late' }
+  const outcome = await Promise.race<Outcome>([
+    read(watch).then(value => ({ kind: 'done', value }), (err: unknown) => ({ kind: 'threw', err })),
+    new Promise<Outcome>((resolve) => {
+      timer = setTimeout(resolve, budgetMs, { kind: 'late' })
+    }),
+  ])
+  clearTimeout(timer)
+  if (outcome.kind === 'late') {
+    const waiting = watch.oldestRunning()
+    const reason = waiting
+      ? `'${waiting}' had not answered after ${formatBudget(budgetMs)}`
+      : `its read did not finish within ${formatBudget(budgetMs)}`
+    return { value: fallback, unavailable: { section, reason } }
+  }
+  if (outcome.kind === 'threw') {
+    const err = outcome.err
+    const reason = err instanceof CommandTimeoutError ? err.message : `its read failed: ${err instanceof Error ? err.message : String(err)}`
+    return { value: fallback, unavailable: { section, reason } }
+  }
+  if (watch.timeouts.length > 0)
+    return { value: outcome.value, unavailable: { section, reason: watch.timeouts[0].message } }
+  return { value: outcome.value }
+}
+
+/** What each section is called on its card. */
+const SECTION_TITLE: Readonly<Record<DashboardSection, string>> = {
+  pools: 'Pool status',
+  disks: 'Disk health',
+  shares: 'Share status',
+  jobs: 'Recent jobs',
+  replication: 'Replication task status',
+  mounts: 'Mount status',
+  backup: 'Backup task status',
+  cloud: 'Cloud sync task status',
+  ahr: 'AHR pool warnings',
+  ahrPools: 'AHR pool status',
+  schedules: 'Snapshot schedule status',
+  iscsi: 'iSCSI status',
+}
+
+/**
+ * cr.35: one `unavailable` card per section that could not be read — what is
+ * missing, the command that did not answer, and that the rest is current.
+ * Unreadable is never empty (WAVE3-DESIGN §6.2): without the card, an empty
+ * pool list would read as "no pools".
+ */
+export function buildUnavailableWarnings(sections: UnavailableSection[]): DashboardWarning[] {
+  return sections.map(u => ({
+    level: 'warning',
+    category: 'unavailable',
+    message: `${SECTION_TITLE[u.section]} is unavailable: ${u.reason}. The rest of the dashboard is current.`,
+  }))
+}
+
 /**
  * cr.34: one warning per command anasd gave up on — it outlived its deadline
  * and the SIGKILL after it, so it is stuck in the kernel (WAVE3-DESIGN §6.2,
@@ -644,6 +767,42 @@ export function buildAbandonedWarnings(children: AbandonedChild[]): DashboardWar
         + 'The warning clears when the command returns or anasd restarts.',
     }
   })
+}
+
+/**
+ * The dashboard card for one share's path check (2.5, cr.35). A missing path
+ * is a stale definition; a path that does not answer is a hung mount under a
+ * live share — clients cannot use it either, and before cr.35 the check that
+ * found it froze the whole daemon; an unreadable path is named with what stat
+ * said. A path that exists adds nothing.
+ */
+export function sharePathWarnings(protocol: 'smb' | 'nfs', ref: string, path: string, probe: SharePathProbe): DashboardWarning[] {
+  const what = protocol === 'smb' ? `SMB share '${ref}'` : `NFS export ${path}`
+  switch (probe.state) {
+    case 'exists':
+      return []
+    case 'missing':
+      return [{
+        level: 'warning',
+        category: 'share',
+        message: protocol === 'smb' ? `${what} points to a missing path ${path}` : `NFS export path ${path} no longer exists`,
+        ref,
+      }]
+    case 'not-answering':
+      return [{
+        level: 'warning',
+        category: 'share',
+        message: `${what}: the path ${path} is not answering (${probe.detail ?? 'no answer'}) — the storage under it, usually an NFS or CIFS mount, is hung, and clients cannot use the share either`,
+        ref,
+      }]
+    case 'unreadable':
+      return [{
+        level: 'warning',
+        category: 'share',
+        message: `${what}: the path ${path} could not be checked (${probe.detail ?? 'stat failed'})`,
+        ref,
+      }]
+  }
 }
 
 /** Derive dashboard warnings from pool state/scan and disk health (2.5). */

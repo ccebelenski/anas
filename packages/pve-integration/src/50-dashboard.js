@@ -611,7 +611,10 @@
             // cr.34: a command anasd gave up on is still stuck in the kernel
             // (a suspended pool, a hung disk or mount) — the terminal glyph,
             // since it is a process, not a pool or a disk.
-            command: 'fa-terminal'
+            command: 'fa-terminal',
+            // cr.35: a section of this summary could not be read in time —
+            // the question mark: what it shows there is not an observation.
+            unavailable: 'fa-question-circle'
         };
         var fa = map['' + (category || '')];
         if (!fa) { return ''; }
@@ -794,11 +797,25 @@
         return heading(t('Recent activity')) + rows;
     }
 
+    // cr.35: did the daemon say it could not read this section of /v1/status?
+    // Its fields are then the empty shape, not an observation, and render as
+    // "unavailable" — never as "no pools" or zero disks. An older daemon sends
+    // no list: nothing is unavailable.
+    function sectionUnavailable(status, name) {
+        var list = (status && status.unavailable) || [];
+        for (var i = 0; i < list.length; i++) {
+            if (list[i] === name) { return true; }
+        }
+        return false;
+    }
+
     // 2.2 — disk fleet health, now at the TOP: healthy / warning / critical /
     // unknown count tiles + total, with the recent-activity strip alongside.
     function renderFleet(status, jobDetails) {
         var d = (status && status.disks) || {};
-        var tiles = '<div class="anas-dash-stats">'
+        var tiles = sectionUnavailable(status, 'disks')
+            ? muted(t('Disk health is unavailable: a read did not answer in time. See the warning above.'))
+            : '<div class="anas-dash-stats">'
             + statTile(num(d.healthy), t('Healthy'), OK_COLOR)
             + statTile(num(d.warning), t('Warning'), WARN_COLOR)
             + statTile(num(d.critical), t('Critical'), BAD_COLOR)
@@ -1751,8 +1768,19 @@
         // telemetry pools when status hasn't arrived so the section is never
         // empty on the first telemetry tick.
         var list = statusPools.length ? statusPools : telPools;
+        // cr.35: an unreadable section is never "No pools." — say so instead.
+        var zfsUnavailable = sectionUnavailable(st, 'pools');
+        var ahrUnavailable = sectionUnavailable(st, 'ahrPools');
+        var unavailableNote = '';
+        if (zfsUnavailable || ahrUnavailable) {
+            unavailableNote = muted(zfsUnavailable && ahrUnavailable
+                ? t('Pool status is unavailable: a read did not answer in time. See the warning above.')
+                : zfsUnavailable
+                    ? t('ZFS pool status is unavailable: a read did not answer in time. See the warning above.')
+                    : t('AHR pool status is unavailable: a read did not answer in time. See the warning above.'));
+        }
         if (!list.length && !ahrPools.length) {
-            return heading(t('Pools')) + muted(t('No pools.'));
+            return heading(t('Pools')) + (unavailableNote || muted(t('No pools.')));
         }
 
         // Measure the section so the time charts render at exact px and fill it.
@@ -1780,7 +1808,7 @@
             var tap = ap.name != null ? ahrTelMap['' + ap.name] : null;
             body += renderAhrPoolBlock(view, ap, tap, dims);
         }
-        return heading(t('Pools')) + body;
+        return heading(t('Pools')) + unavailableNote + body;
     }
 
     // 2.7 — network correlation view: total rx/tx (link utilization next to the
@@ -2220,4 +2248,8 @@
     // rclone.5 pins the strip's `cancelled` rendering (neutral, never the
     // failure colour) on the same seam.
     ANAS.dash.jobsStrip = jobsStrip;
+    // cr.35 pins the "unavailable" rendering of the fleet tiles and the Pools
+    // section on the same seam.
+    ANAS.dash.renderFleet = renderFleet;
+    ANAS.dash.renderPoolsComposite = renderPoolsComposite;
 })();

@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Fastify from 'fastify'
 import { AuditLogger } from './audit/logger.js'
+import { CommandBudgetExecutor } from './executor/command-budgets.js'
 import { CommandTimeoutError, runInLane } from './executor/deadline.js'
 import { MockExecutor } from './executor/mock.js'
 import { ProdExecutor } from './executor/prod.js'
@@ -157,9 +158,14 @@ export function createServer(opts?: ServerOptions) {
 
   const audit = new AuditLogger(server.log)
   const jobQueue = new JobQueue({ audit })
-  const executor: CommandExecutor = opts?.mock
+  const baseExecutor: CommandExecutor = opts?.mock
     ? new MockExecutor()
     : new ProdExecutor()
+  // cr.35: every route, service and job the daemon wires below runs its
+  // commands through the §6.3 per-command budgets (executor/command-budgets.ts).
+  // The decorated `executor` stays the bare one (tests reach the mock through
+  // it); index.ts wraps it the same way for the boot work.
+  const executor: CommandExecutor = new CommandBudgetExecutor(baseExecutor)
 
   // /etc/exports location (Epic 7). Override via ANAS_EXPORTS_PATH — tests point
   // it at a temp file; dev mock (without the override) seeds a writable copy of
@@ -236,7 +242,7 @@ export function createServer(opts?: ServerOptions) {
 
   // Register mock fixtures for dev mode
   if (opts?.mock) {
-    const mock = executor as MockExecutor
+    const mock = baseExecutor as MockExecutor
     // The mock systemd unit dir is created EMPTY so unit-store reads (the cr.24
     // pool-reference helper among them) see nothing without touching the host.
     try {
@@ -860,7 +866,7 @@ export function createServer(opts?: ServerOptions) {
   server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath: mountsStoragePath, mdadmConfPath, ahrIntentDir, iscsiPaths })
 
   server.decorate('jobQueue', jobQueue)
-  server.decorate('executor', executor)
+  server.decorate('executor', baseExecutor)
   // Exposed for the AHR daemon-start boot scan (index.ts): the shared §5.3
   // resume core needs the disk-identity cache + the intent store dir to
   // re-attach an interrupted expansion after a restart (issue #1).

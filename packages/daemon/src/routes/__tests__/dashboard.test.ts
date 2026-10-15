@@ -20,6 +20,7 @@ import { createServer } from '../../server.js'
 import { writeIntent } from '../../services/ahr-intent.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
+import { sharePathProbeArgs } from '../../services/share-path.js'
 import { dashboardRoutes } from '../dashboard.js'
 
 const IDENTITY_HEADERS = {
@@ -260,6 +261,12 @@ describe('GET /v1/status — stale-share warnings', () => {
     process.env.ANAS_EXPORTS_PATH = exportsPath
 
     server = createServer({ mock: true, logger: false, smbConfPath })
+    // cr.35: the path check is `timeout -k 1 2 stat -f` through the executor;
+    // the dev mock answers a healthy stat, the two missing paths answer the
+    // captured "nonexistent path" case.
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    for (const gone of [missingSmb, missingNfs])
+      mock.prependFixture({ command: '/usr/bin/timeout', args: sharePathProbeArgs(gone), result: mockFixtures.statF('nonexistent path') })
     const summary = await status(server)
     const shareWarnings = summary.warnings.filter(w => w.category === 'share')
 

@@ -9,9 +9,9 @@ import { confirmGate } from '../safety/gate.js'
 import { createAccessService } from '../services/access.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
+import { probeSharePath, probeSharePaths, sharePathFields } from '../services/share-path.js'
 import { requireIdentity } from './identity.js'
 import { shareAccessHandlers } from './share-access.js'
-import { pathExists } from './shares-smb.js'
 
 /** `exportfs -ra` re-reads /etc/exports and syncs the kernel export table. */
 const EXPORTFS = '/usr/sbin/exportfs'
@@ -103,11 +103,13 @@ export async function nfsExportRoutes(
 
   // --- GET /shares/nfs — list ALL exports --------------------------------
   server.get('/shares/nfs', async () => {
-    // Stat each export's path at read time to flag stale definitions whose
-    // storage no longer exists (pathExists=false). Fail-open per export.
-    const exports = parseExports(await readConfig(exportsPath)).map(exp => ({
+    // Check each export's path at read time: missing = a stale line, not
+    // answering = a hung mount under it (cr.35, through the executor).
+    const parsed = parseExports(await readConfig(exportsPath))
+    const probes = await probeSharePaths(executor, parsed.map(e => e.path))
+    const exports = parsed.map(exp => ({
       ...exp,
-      pathExists: pathExists(exp.path),
+      ...sharePathFields(probes.get(exp.path)!),
     }))
     return { data: exports }
   })
@@ -126,7 +128,7 @@ export async function nfsExportRoutes(
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Export '${path}' not found` } }
     }
-    return { data: { ...exp, pathExists: pathExists(exp.path) } }
+    return { data: { ...exp, ...sharePathFields(await probeSharePath(executor, exp.path)) } }
   })
 
   // --- POST /shares/nfs — create an export -------------------------------

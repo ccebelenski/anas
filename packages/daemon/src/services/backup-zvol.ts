@@ -1,5 +1,6 @@
 import type { CommandExecutor } from '../executor/types.js'
 import { stat } from 'node:fs/promises'
+import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
 import { ZFS } from './zfs-snapshot.js'
 
 /**
@@ -36,8 +37,6 @@ import { ZFS } from './zfs-snapshot.js'
  * backup2.3 lifecycle, taken with `zfs snapshot -r` on the volume (which is a
  * dataset like any other) and destroyed in the run's own `finally`.
  */
-
-const UDEVADM = '/usr/bin/udevadm'
 
 /** Trailing whitespace on a `zfs get -H` row. */
 const TRAILING_WS_RE = /\s+$/
@@ -211,7 +210,7 @@ export async function withZvolSnapshotDevices<T>(
 
       // udev owns the symlink; `settle` drains the queue, and the poll proves
       // the node is really there before pbc is pointed at it.
-      await executor.exec(UDEVADM, ['settle'])
+      await executor.exec(UDEVADM, udevSettleArgs(), { timeoutMs: UDEVADM_SETTLE_BUDGET_MS })
       let present = false
       for (let attempt = 0; attempt < attempts && !present; attempt++) {
         if (attempt > 0)

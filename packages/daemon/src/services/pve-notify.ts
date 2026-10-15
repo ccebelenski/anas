@@ -1,4 +1,13 @@
 import type { CommandExecutor } from '../executor/index.js'
+import { CommandTimeoutError } from '../executor/deadline.js'
+
+/**
+ * The deadline of one notification (cr.35, WAVE3-DESIGN §6.3 "`perl -e 'use
+ * PVE::Notify; …'` … 60 s; best-effort by contract, a timeout is a warning").
+ * PVE's notification stack sends mail or a webhook synchronously; a dead SMTP
+ * relay must not hold a job (or the boot scan) for the lane's 300 s.
+ */
+export const PVE_NOTIFY_BUDGET_MS = 60_000
 
 /**
  * PVE notification emission (AHR-DESIGN §7.2, GT-17).
@@ -83,11 +92,16 @@ export async function pveNotify(
     return
   }
   try {
-    const result = await executor.exec('/usr/bin/perl', ['-e', perlNotifyBody(template), severity, title, message])
+    const result = await executor.exec('/usr/bin/perl', ['-e', perlNotifyBody(template), severity, title, message], { timeoutMs: PVE_NOTIFY_BUDGET_MS })
     if (result.exitCode !== 0)
       console.error(`pve-notify: delivery failed (exit ${result.exitCode}): ${result.stderr.trim()}`)
   }
   catch (err) {
-    console.error(`pve-notify: could not invoke perl: ${err instanceof Error ? err.message : String(err)}`)
+    // Best-effort by contract (§6.3): a notification that did not go out in
+    // 60 s is a warning in the journal, never the failure of what it reports.
+    if (err instanceof CommandTimeoutError)
+      console.error(`pve-notify: delivery did not finish within ${PVE_NOTIFY_BUDGET_MS / 1000} s and was stopped — the notification may not have been sent: ${err.message}`)
+    else
+      console.error(`pve-notify: could not invoke perl: ${err instanceof Error ? err.message : String(err)}`)
   }
 }

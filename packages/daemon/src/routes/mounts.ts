@@ -409,7 +409,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         // `zfs` ([]) fails open, an UNREADABLE answer (null) tightens: "could
         // not check" never gets to read as "nothing there".
         async (s) => {
-          const zfsMountpoints = await readZfsMountpoints()
+          const zfsMountpoints = await readZfsMountpoints(executor)
           if (zfsMountpoints === null)
             return { status: 400, code: 'VALIDATION_ERROR', message: `ANAS could not verify whether '${s.mountpoint}' is a ZFS dataset mountpoint (zfs list failed) — the mount is refused until the ZFS answer is readable` }
           return zfsMountpoints.some(m => m.mountpoint === s.mountpoint)

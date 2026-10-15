@@ -273,7 +273,7 @@ describe('cache-attach — the step sequence (ahrcache.1, §13)', () => {
     // GT-21: `udevadm settle` after sgdisk — the create path's pair. The
     // expansion path's `partx -a` answers a holders problem a cache disk,
     // which is idle by definition at attach time, does not have.
-    assert.deepEqual(callsTo(world, UDEVADM), [['settle']])
+    assert.deepEqual(callsTo(world, UDEVADM), [['settle', '--timeout=60']])
     assert.equal(world.calls.some(c => c.command === '/usr/sbin/partx'), false)
     // GT-18: `wipefs -a` BEFORE pvcreate, or a stale signature aborts it
     // non-interactively and vgextend then fails for a misleading reason.

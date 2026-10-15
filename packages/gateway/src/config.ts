@@ -41,12 +41,14 @@ export interface GatewayConfig {
    */
   membersPath: string
   /**
-   * Cross-node forward timeout (ms). Production always runs at the proxy's
-   * 15 s default; the override exists so the timeout PATH itself is testable
-   * without a 15 s wait (a peer that never answers must yield the 504, not a
-   * hang).
+   * Test overrides for the timeout ladder (cr.35, proxy.ts). Production always
+   * runs at the proxy's defaults — 20 s to the local anasd socket, 5 s to
+   * connect to a peer and 25 s for its answer; the overrides exist so each
+   * timeout PATH is testable without the real wait.
    */
-  forwardTimeoutMs?: number
+  socketTimeoutMs?: number
+  forwardConnectTimeoutMs?: number
+  forwardResponseTimeoutMs?: number
 }
 
 export function loadConfig(

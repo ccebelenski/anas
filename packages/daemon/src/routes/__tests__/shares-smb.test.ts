@@ -6,8 +6,10 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
+import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
 import { readAhrPools } from '../../services/ahr-topology.js'
+import { sharePathProbeArgs } from '../../services/share-path.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -86,11 +88,14 @@ describe('SMB share routes', () => {
       assert.deepEqual(media.validUsers, ['media', '@smbusers'])
     })
 
-    it('sets pathExists true for a live path and false for a missing one (stale)', async () => {
+    it('reports each share\'s path check: exists, missing (stale), not answering (a hung mount) — through the executor', async () => {
+      // cr.35: the check is `timeout -k 1 2 stat -f` through the executor (a
+      // statSync on a dead hard NFS mount froze the daemon's event loop). The
+      // answers are the captured `timeout 2 stat -f` cases (mounts/stat-f-exit-codes.txt).
       dir = mkdtempSync(join(tmpdir(), 'anas-smb-test-'))
       const livePath = join(dir, 'live')
-      mkdirSync(livePath)
-      const missingPath = join(dir, 'gone') // deliberately never created
+      const missingPath = join(dir, 'gone')
+      const hungPath = '/mnt/anas-nfs/media'
       confPath = join(dir, 'smb.conf')
       writeFileSync(confPath, [
         '[global]',
@@ -102,13 +107,28 @@ describe('SMB share routes', () => {
         '[stale]',
         `\tpath = ${missingPath}`,
         '',
+        '[hung]',
+        `\tpath = ${hungPath}`,
+        '',
       ].join('\n'), 'utf8')
       server = createServer({ mock: true, logger: false, smbConfPath: confPath })
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      mock.prependFixture({ command: '/usr/bin/timeout', args: sharePathProbeArgs(livePath), result: mockFixtures.statF('ext4 root (healthy local)') })
+      mock.prependFixture({ command: '/usr/bin/timeout', args: sharePathProbeArgs(missingPath), result: mockFixtures.statF('nonexistent path') })
+      mock.prependFixture({ command: '/usr/bin/timeout', args: sharePathProbeArgs(hungPath), result: mockFixtures.statF('nfs-server STOPPED; hard mount -> stat hangs -> timeout kills it') })
       const res = await server.inject({ method: 'GET', url: '/v1/shares/smb' })
       assert.equal(res.statusCode, 200)
       const { data } = res.json() as { data: SmbShare[] }
-      assert.equal(data.find(d => d.name === 'live')!.pathExists, true)
-      assert.equal(data.find(d => d.name === 'stale')!.pathExists, false)
+      const live = data.find(d => d.name === 'live')!
+      const stale = data.find(d => d.name === 'stale')!
+      const hung = data.find(d => d.name === 'hung')!
+      assert.deepEqual([live.pathState, live.pathExists], ['exists', true])
+      assert.deepEqual([stale.pathState, stale.pathExists], ['missing', false])
+      // Not answering is neither "exists" nor "missing": pathExists stays unset.
+      assert.deepEqual([hung.pathState, hung.pathExists], ['not-answering', undefined])
+      // Every check went through the executor, under C locale.
+      const probes = mock.calls.filter(c => c.command === '/usr/bin/timeout')
+      assert.deepEqual(probes.map(c => c.args.at(-1)).sort(), [hungPath, livePath, missingPath].sort())
     })
 
     it('returns an empty list when smb.conf is missing', async () => {
@@ -276,8 +296,9 @@ describe('SMB share routes', () => {
       const { data } = res.json() as { data: SmbShareDetail }
       assert.equal(data.name, 'media')
       assert.deepEqual(data.connections, [{ user: 'media', machine: '10.0.0.50' }])
-      // /tank/media does not exist in the test env → observed stale.
-      assert.equal(data.pathExists, false)
+      // The dev mock answers every `timeout … stat -f` with a healthy stat.
+      assert.equal(data.pathExists, true)
+      assert.equal(data.pathState, 'exists')
     })
 
     it('returns [] connections for a share with none', async () => {

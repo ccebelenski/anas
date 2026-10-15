@@ -276,9 +276,9 @@ describe('rclone-probe: testRemote (rclone.1)', () => {
     assert.equal(probeConfigOf(calls[0]!.args), PATHS.configFile)
   })
 
-  it('the argv is the design\'s: timeout 45, base args, lsjson, the bounded flags', () => {
+  it('the argv is the design\'s: timeout 25 (cr.35), base args, lsjson, the bounded flags', () => {
     assert.deepEqual(probeArgs('/etc/anas/rclone.conf', 'gt:'), [
-      '45',
+      '25',
       RCLONE,
       '--config',
       '/etc/anas/rclone.conf',
@@ -296,7 +296,7 @@ describe('rclone-probe: testRemote (rclone.1)', () => {
       '--low-level-retries',
       '1',
     ])
-    assert.equal(probeArgs(PATHS.configFile, 'gt:')[0], '45')
+    assert.equal(probeArgs(PATHS.configFile, 'gt:')[0], '25')
   })
 
   it('an UNSAVED target: the env carries TYPE + every option upper-cased; the password-typed value is OBSCURED, the rest plain', async () => {

@@ -355,7 +355,7 @@ export async function readIscsiContext(
     return empty
 
   const [readMountpoints, nodeAddresses] = await Promise.all([
-    paths.zfsMountpoints ? paths.zfsMountpoints() : readZfsMountpoints(),
+    paths.zfsMountpoints ? paths.zfsMountpoints() : readZfsMountpoints(executor),
     readNodeAddresses(executor),
   ])
   // A null mountpoint read (zfs list failed) only disables file→dataset

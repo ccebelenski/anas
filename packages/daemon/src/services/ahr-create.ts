@@ -22,6 +22,7 @@ import { SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-snapshots.js'
 import { isAhrMountReadOnly } from './ahr-topology.js'
 import { editConfig } from './config-writer.js'
 import { pveNotify } from './pve-notify.js'
+import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
 
 export { ahrLvPath, ahrMountBase, DEFAULT_AHR_MOUNT_BASE } from './ahr-paths.js'
 
@@ -51,7 +52,6 @@ export { ahrLvPath, ahrMountBase, DEFAULT_AHR_MOUNT_BASE } from './ahr-paths.js'
 const WIPEFS = '/usr/sbin/wipefs'
 const SGDISK = '/usr/sbin/sgdisk'
 const MDADM = '/usr/sbin/mdadm'
-const UDEVADM = '/usr/bin/udevadm'
 const REALPATH = '/usr/bin/realpath'
 const LS = '/usr/bin/ls'
 const PVCREATE = '/usr/sbin/pvcreate'
@@ -128,7 +128,7 @@ export async function clearGhostMdSignatures(
     }
     await executor.exec(WIPEFS, ['-a', partPath])
   }
-  await run(executor, UDEVADM, ['settle'])
+  await run(executor, UDEVADM, udevSettleArgs(), { timeoutMs: UDEVADM_SETTLE_BUDGET_MS })
 }
 
 /**
@@ -401,7 +401,7 @@ async function executeCreate(
   // kernel refuses to re-read a held disk's table. If create ever gains the
   // ability to partition an in-use disk, it needs the expansion path's
   // partx-then-verify treatment.
-  await run(executor, UDEVADM, ['settle'])
+  await run(executor, UDEVADM, udevSettleArgs(), { timeoutMs: UDEVADM_SETTLE_BUDGET_MS })
 
   // --- Clear ghost md state on the fresh partitions (§2.6) --------------------
   updateProgress('Clearing stale md signatures on new partitions')

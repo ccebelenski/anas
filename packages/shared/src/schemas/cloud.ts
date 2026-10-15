@@ -638,7 +638,7 @@ export const CloudSyncPreviewResult = z.object({
   deletedTotal: z.number().nonnegative(),
   /** rclone's error-level log lines, verbatim and in order. */
   errors: z.array(z.string()).default([]),
-  /** The 120 s ceiling fired: what is reported is what was parsed so far. */
+  /** The preview's time ceiling (25 s, cr.35) fired: what is reported is what was parsed so far. */
   truncated: z.boolean(),
 })
 export type CloudSyncPreviewResult = z.infer<typeof CloudSyncPreviewResult>

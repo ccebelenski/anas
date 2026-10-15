@@ -3,6 +3,7 @@ import type { JobQueue } from './jobs/queue.js'
 import type { DiskIdentityCache } from './services/disk-identity-cache.js'
 import type { IscsiPaths } from './services/iscsi.js'
 import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs'
+import { CommandBudgetExecutor } from './executor/command-budgets.js'
 import { CommandTimeoutError, runInLane } from './executor/deadline.js'
 import { createServer } from './server.js'
 import { ahrBootScan } from './services/ahr-boot-scan.js'
@@ -82,7 +83,9 @@ async function main() {
     if (!MOCK) {
       runInLane({ lane: 'background' }, () => {
         const decorated = server as unknown as { executor: CommandExecutor, jobQueue: JobQueue, diskIdentityCache: DiskIdentityCache, ahrIntentDir: string, iscsiPaths: IscsiPaths }
-        void ahrBootScan(decorated.executor, {
+        // cr.35: the boot work gets the same per-command budgets as the routes.
+        const bootExecutor = new CommandBudgetExecutor(decorated.executor)
+        void ahrBootScan(bootExecutor, {
           intentDir: decorated.ahrIntentDir,
           jobQueue: decorated.jobQueue,
           diskCache: decorated.diskIdentityCache,
@@ -91,7 +94,7 @@ async function main() {
             server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] cacheRecovered=[${report.cacheRecovered.join(',')}] reattached=[${report.reattached.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)
         }).catch((err) => {
           server.log.warn(`ahr boot scan failed: ${err instanceof Error ? err.message : String(err)}`)
-        }).then(() => reconcileSelfhealState(decorated.executor, {
+        }).then(() => reconcileSelfhealState(bootExecutor, {
         // The socket is already listening (it has to be — the boot scan above
         // takes minutes on a real node), so a Repair or a Rewrite parity can
         // be in flight by the time this runs. Its md knobs and its transient
@@ -130,7 +133,7 @@ async function main() {
         // that empty disk off the network; the saved record is left alone so
         // Repair puts the LUN back once the filesystem is there. Non-blocking,
         // fail-open, and skipped in mock mode (no real LIO tree).
-        void iscsiStubBootScan(decorated.executor, {
+        void iscsiStubBootScan(bootExecutor, {
           ...decorated.iscsiPaths,
           log: (line: string) => server.log.warn(line),
         }).then((outcomes) => {

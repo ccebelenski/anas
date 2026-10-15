@@ -33,8 +33,24 @@ const ANAS_PROXY_PREFIX = '/anas'
  */
 export const FORWARDED_HEADER = 'x-anas-forwarded'
 
-/** Cross-node forward timeout — a hung peer must not hang the browser request. */
-const FORWARD_TIMEOUT_MS = 15000
+/**
+ * The gateway's rungs of the timeout ladder (cr.35, WAVE3-DESIGN §6.2), set so
+ * the innermost layer that knows the reason answers first:
+ *
+ *   one command on the request path   10 s  (anasd's executor, its own 503 TIMEOUT)
+ *   gateway → local anasd socket      20 s  → 504 GATEWAY_TIMEOUT, request aborted
+ *   gateway → peer node              5 s to connect, then 25 s for the answer
+ *                                           (the peer's own 20 s socket answer
+ *                                           arrives before ours fires)
+ *   AnasProxy inside pveproxy         30 s inactivity → a synthetic 502
+ *
+ * Before cr.35 the local hop had no timeout at all (a hung daemon read held
+ * the gateway request open after pveproxy had already given the browser its
+ * 502), and the forward ran connect and response on one 15 s timer.
+ */
+export const LOCAL_SOCKET_TIMEOUT_MS = 20_000
+export const FORWARD_CONNECT_TIMEOUT_MS = 5_000
+export const FORWARD_RESPONSE_TIMEOUT_MS = 25_000
 
 /** pveproxy's file-fallthrough 500 body prefix (a node without ANAS installed). */
 const NO_SUCH_FILE_RE = /^no such file\b/
@@ -88,6 +104,11 @@ export function classifyUpstreamResponse(result: UpstreamResult): 'anas' | 'not-
   return 'not-installed'
 }
 
+/** `20 s`, or `250 ms` for a test's short budget. */
+function formatSeconds(ms: number): string {
+  return ms % 1000 === 0 ? `${ms / 1000} s` : `${ms} ms`
+}
+
 /** Copy a header from the upstream response onto the client reply, if present. */
 function relayHeaders(reply: FastifyReply, headers: UpstreamResult['headers']): void {
   for (const name of PASSTHROUGH_RESPONSE_HEADERS) {
@@ -107,8 +128,10 @@ function relayHeaders(reply: FastifyReply, headers: UpstreamResult['headers']): 
 export async function proxyToLocalSocket(
   request: FastifyRequest,
   reply: FastifyReply,
-  opts: { socketPath: string, anasdPath: string, user: AuthUser | undefined },
+  opts: { socketPath: string, anasdPath: string, user: AuthUser | undefined, timeoutMs?: number },
 ): Promise<void> {
+  // Overridable for tests; production always runs at LOCAL_SOCKET_TIMEOUT_MS.
+  const timeoutMs = opts.timeoutMs ?? LOCAL_SOCKET_TIMEOUT_MS
   const headers: Record<string, string> = {
     'accept': 'application/json',
     'x-anas-request-id': randomUUID(),
@@ -134,19 +157,40 @@ export async function proxyToLocalSocket(
 
   try {
     const result = await new Promise<UpstreamResult>((resolve, reject) => {
+      // The whole answer must arrive within the budget (cr.35): anasd sends
+      // nothing until its handler is done, so this is the time its reads took.
+      // On expiry the upstream request is ABORTED (the daemon sees the socket
+      // close; its commands still end at their own deadlines) and the browser
+      // gets the ANAS envelope, not pveproxy's synthetic 502 ten seconds later.
+      let timer: NodeJS.Timeout | undefined
       const req = httpRequest(
         { socketPath: opts.socketPath, method: request.method, path: opts.anasdPath, headers },
         (res) => {
           const chunks: Buffer[] = []
           res.on('data', (chunk: Buffer) => chunks.push(chunk))
-          res.on('end', () => resolve({
-            status: res.statusCode ?? 502,
-            headers: res.headers as UpstreamResult['headers'],
-            body: Buffer.concat(chunks),
-          }))
+          res.on('end', () => {
+            clearTimeout(timer)
+            resolve({
+              status: res.statusCode ?? 502,
+              headers: res.headers as UpstreamResult['headers'],
+              body: Buffer.concat(chunks),
+            })
+          })
+          res.on('error', (err) => {
+            clearTimeout(timer)
+            reject(err)
+          })
         },
       )
-      req.on('error', reject)
+      timer = setTimeout(() => {
+        const err = new Error(`anasd did not answer within ${timeoutMs} ms`) as NodeJS.ErrnoException
+        err.code = 'ANAS_SOCKET_TIMEOUT'
+        req.destroy(err)
+      }, timeoutMs)
+      req.on('error', (err) => {
+        clearTimeout(timer)
+        reject(err)
+      })
       if (body)
         req.write(body)
       req.end()
@@ -156,6 +200,18 @@ export async function proxyToLocalSocket(
     await reply.code(result.status).send(result.body)
   }
   catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ANAS_SOCKET_TIMEOUT') {
+      request.log.warn(`[gateway] anasd did not answer ${request.method} ${opts.anasdPath} within ${timeoutMs} ms — request aborted`)
+      await reply.code(504).send({
+        error: {
+          code: 'GATEWAY_TIMEOUT',
+          message: `anasd did not answer within ${formatSeconds(timeoutMs)}: the request was stopped at the gateway. `
+            + 'A command it ran may be hung (a suspended pool, a dead mount or an unresponsive remote host); '
+            + 'the dashboard lists commands that did not end. If this was a change, check its state before retrying.',
+        },
+      })
+      return
+    }
     await reply.code(502).send({
       error: {
         code: 'INTERNAL_ERROR',
@@ -245,11 +301,12 @@ export function resolveNodeAddress(node: string, membersPath: string): string | 
 export async function forwardToNode(
   request: FastifyRequest,
   reply: FastifyReply,
-  opts: { node: string, pvePort: number, clusterCa: string, membersPath: string, timeoutMs?: number },
+  opts: { node: string, pvePort: number, clusterCa: string, membersPath: string, connectTimeoutMs?: number, responseTimeoutMs?: number },
 ): Promise<void> {
-  // Overridable for tests (a real forward timeout is a 15 s wait); production
-  // always runs at FORWARD_TIMEOUT_MS.
-  const timeoutMs = opts.timeoutMs ?? FORWARD_TIMEOUT_MS
+  // Overridable for tests (the real budgets are 5 s and 25 s waits);
+  // production always runs at FORWARD_CONNECT_TIMEOUT_MS / FORWARD_RESPONSE_TIMEOUT_MS.
+  const connectTimeoutMs = opts.connectTimeoutMs ?? FORWARD_CONNECT_TIMEOUT_MS
+  const responseTimeoutMs = opts.responseTimeoutMs ?? FORWARD_RESPONSE_TIMEOUT_MS
   const ca = loadClusterCa(request, opts.clusterCa)
   if (ca === undefined) {
     // Fail CLOSED: without the cluster CA we cannot verify the peer's TLS
@@ -303,6 +360,8 @@ export async function forwardToNode(
 
   try {
     const result = await new Promise<UpstreamResult>((resolve, reject) => {
+      // Started at the TLS handshake (below); declared here for the response handler.
+      let responseTimer: NodeJS.Timeout | undefined
       const req = httpsRequest(
         {
           host: address,
@@ -317,48 +376,46 @@ export async function forwardToNode(
           path: `${ANAS_PROXY_PREFIX}${request.url}`,
           headers,
           agent: new HttpsAgent({ ca }),
-          // A down-but-not-refused peer (firewall drop, partition) must not hang
-          // the browser request — time out and surface it instead.
-          timeout: timeoutMs,
         },
         (res) => {
           const chunks: Buffer[] = []
           res.on('data', (chunk: Buffer) => chunks.push(chunk))
-          res.on('end', () => resolve({
-            status: res.statusCode ?? 502,
-            headers: res.headers as UpstreamResult['headers'],
-            body: Buffer.concat(chunks),
-          }))
+          res.on('end', () => {
+            clearTimeout(responseTimer)
+            resolve({
+              status: res.statusCode ?? 502,
+              headers: res.headers as UpstreamResult['headers'],
+              body: Buffer.concat(chunks),
+            })
+          })
         },
       )
-      req.on('error', reject)
-      // Whether the socket ever actually CONNECTED. Node's request `timeout`
-      // fires on socket inactivity — INCLUDING while the TCP/TLS connect is
-      // still pending (a firewalled/black-holed peer never answers the SYN), so
-      // "the node is reachable" may only be claimed when a connection was made.
-      let connected = false
+      // Two timers, two meanings (cr.35). The CONNECT budget covers TCP and
+      // TLS: a down-but-not-refused peer (firewall drop, partition) never
+      // answers the SYN, and "the node is reachable" may only be claimed once a
+      // connection was made — so its expiry is a plain error, NODE_UNREACHABLE.
+      // The RESPONSE budget starts when the TLS session is up: a peer that
+      // CONNECTED and then never answered is reachable; the operation is what
+      // is slow or hung (GATEWAY_TIMEOUT). It is longer than the peer's own
+      // 20 s socket budget, so a peer whose anasd hangs answers its own 504
+      // (naming itself) before this one fires.
+      const connectTimer = setTimeout(() => {
+        req.destroy(new Error(`connection attempt to ${opts.node} timed out after ${connectTimeoutMs}ms`))
+      }, connectTimeoutMs)
       req.on('socket', (s) => {
-        s.once('connect', () => {
-          connected = true
-        })
         s.once('secureConnect', () => {
-          connected = true
+          clearTimeout(connectTimer)
+          responseTimer = setTimeout(() => {
+            const err = new Error(`connection to ${opts.node} timed out after ${responseTimeoutMs}ms`) as NodeJS.ErrnoException
+            err.code = 'ANAS_FORWARD_TIMEOUT'
+            req.destroy(err)
+          }, responseTimeoutMs)
         })
       })
-      // Mark the timeout at its SOURCE so the catch can tell "the peer
-      // CONNECTED and then never answered within the budget" (GATEWAY_TIMEOUT)
-      // apart from a connection that was never established at all
-      // (NODE_UNREACHABLE). A hung peer is REACHABLE — the operation is what is
-      // slow; a connect that times out is not.
-      req.on('timeout', () => {
-        const err = new Error(connected
-          ? `connection to ${opts.node} timed out after ${timeoutMs}ms`
-          : `connection attempt to ${opts.node} timed out after ${timeoutMs}ms`)
-        if (connected) {
-          const marked = err as NodeJS.ErrnoException
-          marked.code = 'ANAS_FORWARD_TIMEOUT'
-        }
-        req.destroy(err)
+      req.on('error', (err) => {
+        clearTimeout(connectTimer)
+        clearTimeout(responseTimer)
+        reject(err)
       })
       if (body)
         req.write(body)
@@ -392,7 +449,7 @@ export async function forwardToNode(
       await reply.code(504).send({
         error: {
           code: 'GATEWAY_TIMEOUT',
-          message: `Node '${opts.node}' did not answer within ${Math.round(timeoutMs / 1000)} s: the request timed out. The node is reachable; that operation is slow or hung.`,
+          message: `Node '${opts.node}' did not answer within ${formatSeconds(responseTimeoutMs)}: the request timed out. The node is reachable; that operation is slow or hung.`,
         },
       })
       return

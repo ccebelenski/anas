@@ -5,7 +5,6 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { SelfServiceKeys } from '../parsers/smb-conf.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { AccessService, GrantShare } from '../services/access.js'
-import { statSync } from 'node:fs'
 import { rm, writeFile } from 'node:fs/promises'
 import { CreateSmbShareRequest, ShareName, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
 import { addMissingGrantParams, addShare, customVfsRefusal, getShare, hasCustomVfsObjects, hasShare, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
@@ -14,6 +13,7 @@ import { confirmGate } from '../safety/gate.js'
 import { createAccessService } from '../services/access.js'
 import { ConfigConflictError, editConfig, readConfig } from '../services/config-writer.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
+import { probeSharePath, probeSharePaths, sharePathFields } from '../services/share-path.js'
 import { enablingSelfService, ensureAhrSnapshotsMount, resolveSelfService, shareAvailableBytes, touchesSelfService } from '../services/share-selfservice.js'
 import { requireIdentity } from './identity.js'
 import { shareAccessHandlers } from './share-access.js'
@@ -21,28 +21,6 @@ import { shareAccessHandlers } from './share-access.js'
 const SMBSTATUS = '/usr/bin/smbstatus'
 const SYSTEMCTL = '/usr/bin/systemctl'
 const TESTPARM = '/usr/bin/testparm'
-
-/**
- * Read-time staleness check for a share's backing path (Principle 7 — the
- * filesystem is the source of truth; nothing is cached). Returns:
- *   true      — the path exists,
- *   false     — the path is confirmed missing (ENOENT / ENOTDIR): the share is
- *               stale, its storage is gone,
- *   undefined — unknown: any other stat failure (EACCES, EIO, …) FAILS OPEN so
- *               a healthy share is never mislabelled stale.
- */
-export function pathExists(path: string): boolean | undefined {
-  try {
-    statSync(path)
-    return true
-  }
-  catch (err) {
-    const code = (err as NodeJS.ErrnoException).code
-    if (code === 'ENOENT' || code === 'ENOTDIR')
-      return false
-    return undefined
-  }
-}
 
 export interface SmbShareRouteOptions {
   executor: CommandExecutor
@@ -315,11 +293,15 @@ export async function smbShareRoutes(
   // --- GET /shares/smb — ALL shares (incl. admin-created, Principle 11) -----
   server.get('/shares/smb', async () => {
     const text = await readSmbConf()
-    // Stat each share's path at read time to surface stale definitions whose
-    // storage no longer exists (pathExists=false). Fail-open per share.
-    const shares = parseSmbConf(text).shares.map(share => ({
+    // Check each share's path at read time (Principle 7 — nothing is cached):
+    // a missing path is a stale definition, a path that does not answer is a
+    // hung mount under the share (cr.35: through the executor, never a stat
+    // on the event loop). Each share gets its own verdict.
+    const parsed = parseSmbConf(text).shares
+    const probes = await probeSharePaths(executor, parsed.map(s => s.path))
+    const shares = parsed.map(share => ({
       ...share,
-      pathExists: pathExists(share.path),
+      ...sharePathFields(probes.get(share.path)!),
     }))
     return { data: shares }
   })
@@ -415,7 +397,7 @@ export async function smbShareRoutes(
 
     const detail: SmbShareDetail = {
       ...share,
-      pathExists: pathExists(share.path),
+      ...sharePathFields(await probeSharePath(executor, share.path)),
       connections: await connectionsFor(share.name),
     }
     // The storage's free space (smbsvc.3, additive, fail-open): the input for

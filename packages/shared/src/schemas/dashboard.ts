@@ -27,7 +27,9 @@ export const DashboardWarning = z.object({
   level: z.enum(['warning', 'critical']),
   // `command` (cr.34): a command anasd gave up on is still stuck in the
   // kernel (GET /v1/health lists it) — no view fixes it, so no deep link.
-  category: z.enum(['pool', 'disk', 'scrub', 'share', 'capacity', 'replication', 'mount', 'backup', 'ahr', 'schedule', 'iscsi', 'cloud', 'command']),
+  // `unavailable` (cr.35): one section of this summary could not be read in
+  // time; its `ref` is the DashboardSection, the message names the command.
+  category: z.enum(['pool', 'disk', 'scrub', 'share', 'capacity', 'replication', 'mount', 'backup', 'ahr', 'schedule', 'iscsi', 'cloud', 'command', 'unavailable']),
   message: z.string(),
   /** Optional target name (pool/disk/share) the UI can deep-link to. */
   ref: z.string().optional(),
@@ -160,6 +162,31 @@ export const AhrPoolBrief = z.object({
 })
 export type AhrPoolBrief = z.infer<typeof AhrPoolBrief>
 
+/**
+ * One part of GET /v1/status, each read by its own collector (cr.35). A
+ * collector that does not finish in time — or whose read timed out — leaves
+ * its part of the summary as the empty shape AND names itself in
+ * `StatusSummary.unavailable`, with an `unavailable` warning card saying
+ * which command did not answer. The rest of the dashboard renders: one hung
+ * read never turns the whole summary into an error, and an unreadable
+ * section never reads as an empty one (no pools, zero disks).
+ */
+export const DashboardSection = z.enum([
+  'pools',
+  'disks',
+  'shares',
+  'jobs',
+  'replication',
+  'mounts',
+  'backup',
+  'cloud',
+  'ahr',
+  'ahrPools',
+  'schedules',
+  'iscsi',
+])
+export type DashboardSection = z.infer<typeof DashboardSection>
+
 export const StatusSummary = z.object({
   node: z.string(),
   pools: z.array(PoolStatusBrief),
@@ -169,6 +196,12 @@ export const StatusSummary = z.object({
   warnings: z.array(DashboardWarning),
   /** AHR pools for the headline Pools section (11.13); `[]` fail-open. */
   ahrPools: z.array(AhrPoolBrief),
+  /**
+   * The sections that could not be read this time (cr.35) — their fields
+   * above are the empty shape, NOT an observation. Absent from an older
+   * daemon; `[]` when everything answered.
+   */
+  unavailable: z.array(DashboardSection).optional(),
 })
 export type StatusSummary = z.infer<typeof StatusSummary>
 

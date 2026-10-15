@@ -46,4 +46,34 @@ export const mockFixtures = {
   ahrLvs: () => fixtureResult('ahr', 'lvm-lvs.json'),
   ahrFindmnt: () => fixtureResult('ahr', 'findmnt-ahr0.json'),
   ahrBtrfsUsage: () => fixtureResult('ahr', 'btrfs-usage.txt'),
+  /**
+   * One case of the `timeout 2 stat -f` capture (mounts/stat-f-exit-codes.txt,
+   * story 18.1), replayed: `heading` is the text after `### `. The exit code
+   * is the case's `EXIT=` line; its output goes to stdout on exit 0 and to
+   * stderr otherwise (a failing stat prints only its error). cr.35's share
+   * path check runs the same probe.
+   */
+  statF: (heading: string): ExecResult => statFCase(heading),
+}
+
+/** The `EXIT=<n>` line closing each case of stat-f-exit-codes.txt. */
+const EXIT_LINE_RE = /^EXIT=(\d+)/
+
+function statFCase(heading: string): ExecResult {
+  const lines = loadFixture('mounts', 'stat-f-exit-codes.txt').split('\n')
+  const start = lines.indexOf(`### ${heading}`)
+  if (start < 0)
+    throw new Error(`stat-f-exit-codes.txt has no case '### ${heading}'`)
+  const out: string[] = []
+  for (const line of lines.slice(start + 1)) {
+    const exit = EXIT_LINE_RE.exec(line)
+    if (exit) {
+      const exitCode = Number(exit[1])
+      const text = out.length > 0 ? `${out.join('\n')}\n` : ''
+      return exitCode === 0 ? { stdout: text, stderr: '', exitCode } : { stdout: '', stderr: text, exitCode }
+    }
+    if (!line.startsWith('$ '))
+      out.push(line)
+  }
+  throw new Error(`stat-f-exit-codes.txt case '${heading}' has no EXIT= line`)
 }

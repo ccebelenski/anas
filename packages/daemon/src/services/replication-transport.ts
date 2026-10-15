@@ -77,6 +77,28 @@ export async function readMembers(membersFile: string): Promise<PveMembers | nul
 }
 
 /**
+ * The liveness options every ssh carries (cr.35, WAVE3-DESIGN §6.3).
+ *
+ * - `ConnectTimeout=10`: a host that never answers the SYN (down, firewalled,
+ *   partitioned) ends the ssh at 10 s with exit 255 — the caller's
+ *   "unreachable" — instead of at the kernel's TCP retry limit (minutes).
+ * - `ServerAliveInterval=15` + `ServerAliveCountMax=4`: a peer that dies MID
+ *   STREAM (the `zfs send | ssh zfs recv` pipeline, which has no deadline of
+ *   its own — `null-sites.test.ts`) ends the ssh after a minute of unanswered
+ *   keepalives, so the pipe breaks and the job fails instead of waiting on a
+ *   dead socket for ever. Keepalives ride the encrypted channel, so an idle
+ *   but healthy remote (a long `zfs recv` write) answers them and is never cut.
+ */
+export const SSH_LIVENESS_OPTIONS: readonly string[] = Object.freeze([
+  '-o',
+  'ConnectTimeout=10',
+  '-o',
+  'ServerAliveInterval=15',
+  '-o',
+  'ServerAliveCountMax=4',
+])
+
+/**
  * The exact ssh argv for a resolved location + remote command (argv[0] is the
  * ssh binary; callers split for exec/pipeline). Pure — the unit tests assert it.
  */
@@ -87,11 +109,12 @@ export function buildSshArgv(resolved: ResolvedLocation, remoteCmd: string[]): s
   // (services/replication-remotes.ts); the shared schemas additionally narrow
   // user/host on every write path.
   if (resolved.kind === 'peer')
-    return [SSH, '-o', 'BatchMode=yes', '--', `root@${resolved.host}`, ...remoteCmd]
+    return [SSH, '-o', 'BatchMode=yes', ...SSH_LIVENESS_OPTIONS, '--', `root@${resolved.host}`, ...remoteCmd]
   return [
     SSH,
     '-o',
     'BatchMode=yes',
+    ...SSH_LIVENESS_OPTIONS,
     '-p',
     String(resolved.port),
     '-i',

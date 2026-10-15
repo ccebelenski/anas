@@ -27,6 +27,8 @@ import { withFileLock } from './file-lock.js'
 
 const SSH_KEYGEN = '/usr/bin/ssh-keygen'
 const SSH_KEYSCAN = '/usr/bin/ssh-keyscan'
+/** ssh-keyscan's per-connection timeout in seconds (cr.35): `-T 10`. */
+export const SSH_KEYSCAN_TIMEOUT_ARGS: readonly string[] = Object.freeze(['-T', '10'])
 
 const TRAILING_EQUALS_RE = /=+$/
 const WHITESPACE_RE = /\s+/
@@ -259,7 +261,10 @@ function preferredKey(keys: ScannedKey[]): ScannedKey | null {
 export async function scanHostKeys(executor: CommandExecutor, host: string, port: number): Promise<ScannedKey[]> {
   // `--` ends option parsing so a host that starts with `-` can never be read as
   // an ssh-keyscan flag (defence in depth; the schema also rejects control chars).
-  const r = await executor.exec(SSH_KEYSCAN, ['-p', String(port), '--', host])
+  // `-T 10` (cr.35, §6.3): ssh-keyscan's own per-connection timeout, so a host
+  // that accepts the SYN and then says nothing ends at 10 s as "no key" — the
+  // caller's "unreachable" — well inside the executor's 20 s request budget.
+  const r = await executor.exec(SSH_KEYSCAN, [...SSH_KEYSCAN_TIMEOUT_ARGS, '-p', String(port), '--', host])
   if (!r.stdout.trim())
     return []
   return parseScan(r.stdout)

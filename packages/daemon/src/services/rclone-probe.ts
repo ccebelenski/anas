@@ -105,8 +105,17 @@ import { assertNoSecretValues } from './secret-argv.js'
 /** `timeout` binary — wraps the probe so a dead network can never hang us. */
 const TIMEOUT = '/usr/bin/timeout'
 
-/** The whole probe's wall budget, in seconds (the `timeout` argument). */
-export const PROBE_TIMEOUT_S = 45
+/**
+ * The whole probe's wall budget, in seconds (the `timeout` argument).
+ *
+ * cr.35: 25 s, down from 45 s. The remote test is a synchronous read on the
+ * request path and AnasProxy cuts any request at 30 s of silence, so 45 s
+ * could never answer the browser. rclone's own `--contimeout 10s` still ends
+ * a dead host first; the gateway's 20 s socket budget answers a slow one
+ * (WAVE3-DESIGN §6.2 ladder).
+ */
+// Q3 (WAVE3-DESIGN §10): job or sync is the operator's call
+export const PROBE_TIMEOUT_S = 25
 
 /**
  * The env-defined remote's name. A saved `anastest` in the file would be
@@ -456,7 +465,7 @@ function isEmptyListing(stdout: string): boolean {
 }
 
 /**
- * The probe's STATIC argv prefix — `timeout 45 rclone --config <file>
+ * The probe's STATIC argv prefix — `timeout 25 rclone --config <file>
  * --ask-password=false lsjson`: every token before the one dynamic `<fs>`
  * the caller typed. The probe's argv carries two leading tokens ahead of the
  * rclone base (`timeout` and the binary itself), so the secret-VALUES guard
@@ -470,7 +479,7 @@ export function probeStaticPrefix(configFile: string): string[] {
 }
 
 /**
- * The full probe argv — `timeout 45 rclone --config <file>
+ * The full probe argv — `timeout 25 rclone --config <file>
  * --ask-password=false lsjson <fs> --max-depth 1 --contimeout 10s --timeout
  * 30s --retries 1 --low-level-retries 1`, plus `-vv` (the exact tail the
  * crypt capture ran) when `debug` is set — today only a crypt remote, where

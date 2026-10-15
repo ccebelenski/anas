@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { VERSION } from '@anas/shared'
-import { classifyUpstreamResponse, resolveNodeAddress } from '../proxy.js'
+import { classifyUpstreamResponse, FORWARD_CONNECT_TIMEOUT_MS, FORWARD_RESPONSE_TIMEOUT_MS, LOCAL_SOCKET_TIMEOUT_MS, resolveNodeAddress } from '../proxy.js'
 import { createServer } from '../server.js'
 
 const NODE = 'testnode'
@@ -673,7 +673,7 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
     // The peer terminates TLS and accepts the request, then stays silent: the
     // forward's socket is open, so this is a SLOW/HUNG operation on a reachable
     // node — NOT a connection failure. It must read that way, or the operator
-    // chases a dead node that is fine. A short forwardTimeoutMs keeps the test
+    // chases a dead node that is fine. A short forwardResponseTimeoutMs keeps the test
     // off the real 15 s wait; the PATH is what is under test.
     const peer = createHttpsServer({ cert, key }, (_req, _res) => {
       // Deliberately no response: hold the connection open and answer nothing.
@@ -682,7 +682,7 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
     const peerPort = (peer.address() as AddressInfo).port
 
     const server = createServer({
-      config: baseConfig({ clusterCa: certPath, pvePort: peerPort, forwardTimeoutMs: 250 }),
+      config: baseConfig({ clusterCa: certPath, pvePort: peerPort, forwardResponseTimeoutMs: 250 }),
       authProvider: new AcceptAuthProvider(),
       logger: false,
     })
@@ -712,7 +712,7 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
     // made — so this keeps the 502. 192.0.2.1 (TEST-NET-1) is reserved and
     // non-routable: the connect simply hangs until the (short) forward timeout.
     const server = createServer({
-      config: baseConfig({ clusterCa: certPath, pvePort: 8006, forwardTimeoutMs: 300 }),
+      config: baseConfig({ clusterCa: certPath, pvePort: 8006, forwardConnectTimeoutMs: 300 }),
       authProvider: new AcceptAuthProvider(),
       logger: false,
     })
@@ -728,6 +728,95 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
     assert.match(body.error.message, /unreachable/i)
 
     await server.close()
+  })
+
+  it('cr.35: the connect budget ends at the TLS handshake — a peer that connects at once and answers after it has the whole response budget', async () => {
+    // Before cr.35 connect and response ran on ONE timer; with a short connect
+    // budget that would cut this slow-but-healthy answer.
+    const peer = createHttpsServer({ cert, key }, (_req, res) => {
+      setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ data: 'slow but fine' }))
+      }, 300)
+    })
+    await new Promise<void>(resolve => peer.listen(0, '127.0.0.1', resolve))
+    const peerPort = (peer.address() as AddressInfo).port
+    const server = createServer({
+      config: baseConfig({ clusterCa: certPath, pvePort: peerPort, forwardConnectTimeoutMs: 150, forwardResponseTimeoutMs: 2_000 }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({ method: 'GET', url: '/api/nodes/peer1/v1/pools', headers: { cookie: 'PVEAuthCookie=x' } })
+    assert.equal(res.statusCode, 200, res.body)
+    assert.deepEqual(res.json(), { data: 'slow but fine' })
+    await server.close()
+    await new Promise<void>(resolve => peer.close(() => resolve()))
+  })
+})
+
+describe('cr.35 the gateway\'s rungs of the timeout ladder', () => {
+  it('production budgets: 20 s to the local anasd socket, 5 s to connect to a peer, 25 s for its answer', () => {
+    assert.equal(LOCAL_SOCKET_TIMEOUT_MS, 20_000)
+    assert.equal(FORWARD_CONNECT_TIMEOUT_MS, 5_000)
+    assert.equal(FORWARD_RESPONSE_TIMEOUT_MS, 25_000)
+    // The ladder: the peer's own socket answer (20 s) beats our response
+    // budget, and connect + response stays inside AnasProxy's 30 s.
+    assert.ok(LOCAL_SOCKET_TIMEOUT_MS < FORWARD_RESPONSE_TIMEOUT_MS)
+    assert.ok(FORWARD_CONNECT_TIMEOUT_MS + FORWARD_RESPONSE_TIMEOUT_MS <= 30_000)
+  })
+
+  it('an anasd socket that never answers: 504 GATEWAY_TIMEOUT in the ANAS envelope, and the upstream request is aborted', { timeout: 5_000 }, async () => {
+    const socketPath = join(tmpdir(), `hang-${process.pid}.sock`)
+    let upstreamClosed = false
+    let received = false
+    // Accepts the request and says nothing — a daemon whose handler hangs.
+    const stub = createHttpServer((req) => {
+      received = true
+      req.socket.on('close', () => {
+        upstreamClosed = true
+      })
+    })
+    await new Promise<void>(resolve => stub.listen(socketPath, resolve))
+    const server = createServer({
+      config: baseConfig({ anasdSocket: socketPath, socketTimeoutMs: 200 }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const started = Date.now()
+    const res = await server.inject({ method: 'GET', url: '/api/nodes/testnode/v1/pools', headers: { cookie: 'PVEAuthCookie=x' } })
+    assert.ok(Date.now() - started < 2_000)
+    assert.equal(res.statusCode, 504)
+    const body = res.json() as { error: { code: string, message: string } }
+    assert.equal(body.error.code, 'GATEWAY_TIMEOUT')
+    assert.match(body.error.message, /^anasd did not answer within 200 ms: the request was stopped at the gateway\./)
+    assert.match(body.error.message, /If this was a change, check its state before retrying\.$/)
+    assert.ok(received, 'the request reached the socket')
+    await new Promise(r => setTimeout(r, 20))
+    assert.ok(upstreamClosed, 'the gateway aborted the upstream request')
+    await server.close()
+    stub.closeAllConnections()
+    await new Promise<void>(resolve => stub.close(() => resolve()))
+  })
+
+  it('an anasd that answers inside the budget is relayed as before', async () => {
+    const socketPath = join(tmpdir(), `slow-${process.pid}.sock`)
+    const stub = createHttpServer((_req, res) => {
+      setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ data: [] }))
+      }, 50)
+    })
+    await new Promise<void>(resolve => stub.listen(socketPath, resolve))
+    const server = createServer({
+      config: baseConfig({ anasdSocket: socketPath, socketTimeoutMs: 1_000 }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({ method: 'GET', url: '/api/nodes/testnode/v1/pools', headers: { cookie: 'PVEAuthCookie=x' } })
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(res.json(), { data: [] })
+    await server.close()
+    await new Promise<void>(resolve => stub.close(() => resolve()))
   })
 })
 
