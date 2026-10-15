@@ -267,7 +267,7 @@ test.describe('ident.4 — act on what is actually there (live)', () => {
 
       // Once the operator takes their disk away, Remove goes through its own door.
       await sshExec(`umount ${CIFS_MP} && rm -f ${LOOP_IMG}`)
-      await runJob(ctx, 'delete', `${V1}/mounts/${encodeURIComponent(CIFS_MP)}?removeMountpointDir=true`)
+      await runJob(ctx, 'delete', `${V1}/mounts/${encodeURIComponent(CIFS_MP)}?removeMountpointDir=true`, undefined, { headers: { 'x-anas-confirm': (await ctx.delete(`${V1}/mounts/${encodeURIComponent(CIFS_MP)}?removeMountpointDir=true`)).headers()['x-anas-confirm-code'] } })
       expect(await sshExec(`grep -cE '[[:space:]]${CIFS_MP}[[:space:]]' /etc/fstab || true`)).toBe('0')
     }
     finally {

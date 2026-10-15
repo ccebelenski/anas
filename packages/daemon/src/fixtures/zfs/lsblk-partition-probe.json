@@ -1,0 +1,10 @@
+{
+   "blockdevices": [
+      {
+         "name": "sdd2",
+         "type": "part",
+         "pkname": "sdd",
+         "mountpoint": null
+      }
+   ]
+}

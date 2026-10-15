@@ -315,7 +315,7 @@ test.describe('Owned-dataset mutations refused', () => {
     const ctx = await apiContext(playwright)
     try {
       const res = await ctx.post(`${V1}/pools/${PVE_POOL}/datasets//snapshots`, {
-        data: { name: 'anas-proof-snap' },
+        data: { name: 'proof-snap' },
       })
       expect(res.status()).toBe(400)
       const err = (await res.json()).error
@@ -323,7 +323,7 @@ test.describe('Owned-dataset mutations refused', () => {
       expect(err.message).toContain(`PVE storage '${PVE_POOL}' owns ${PVE_POOL}`)
       // The storage root really has no such snapshot (source of truth).
       const snaps = await sshExec(`zfs list -H -o name -t snapshot -d 1 ${PVE_POOL} 2>/dev/null || true`)
-      expect(snaps).not.toContain('anas-proof-snap')
+      expect(snaps).not.toContain('proof-snap')
     }
     finally {
       await ctx.dispose()

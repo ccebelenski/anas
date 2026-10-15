@@ -264,7 +264,7 @@ test.describe('ident.2 — the served device is the LUN\'s identity', () => {
 
       const replay = await ctx.delete(url, { headers: { 'x-anas-confirm': staleCode } })
       expect(replay.status()).toBe(409)
-      expect((await replay.json()).error.code).toBe('CONFIRMATION_REQUIRED')
+      expect((await replay.json()).error.code).toBe('IDENTITY_MISMATCH')
       expect(replay.headers()['x-anas-confirm-code']).not.toBe(staleCode)
 
       // The new LUN is untouched.

@@ -226,6 +226,21 @@ would block on the suspended pool — and starts **both** `anasd` and `anas` aga
 afterwards, because the gateway unit is `PartOf=anasd.service` and `PartOf`
 propagates stop and restart but never start.
 
+## Real captures — partition probes (nf.1 D1, wave-3b node pass, 2026-10-15)
+
+Captured on the stunt node (`zfs-2.4.4-pve1`, util-linux blkid of Debian 13) during the
+nf.1 D1 re-proof (docs/LIVE-PROOF-0.4.4-wave3b.md row 1), pool `gtvdev` from
+`test/stunt-node/vdev-fixture.sh up-byid` (six by-id partitions of hot disk 9, kernel `sdd`).
+Verbatim stdout, one line each, no value edited. These are the two reads
+`routes/pools.ts` `partitionDeviceProblems` runs on a new `-partN` device.
+
+| File | Command | What it is |
+|------|---------|------------|
+| `blkid-p-zfs-member-partition.txt` | `blkid -p /dev/disk/by-id/…ANAS_HOT9-part1`, exit **0** | A live data leaf: `LABEL="gtvdev"`, `UUID` = the pool guid, `TYPE="zfs_member"`, then the `PART_ENTRY_*` keys. The partition gate refuses it as `carries a signature (TYPE=zfs_member, LABEL=gtvdev)` |
+| `blkid-p-freed-spare-partition.txt` | the same on `-part4` after `zpool remove gtvdev …-part4` (an AVAIL spare), exit **0** | The removed spare KEEPS a ZFS label, and it is a spare's label: `TYPE="zfs_member"` with **no `LABEL` and no `UUID`** (no pool name, no pool guid; only `UUID_SUB`). Live, the gate answered 400 `carries a signature (TYPE=zfs_member)`. The same absence of a pool guid is why a destroy with cleanup cannot match a spare leaf to the pool (D5) |
+| `blkid-p-blank-partition.txt` | the same on `-part4` after `zpool labelclear -f`, exit **0** | A blank partition: exit 0 with ONLY `PART_ENTRY_*` keys (`wipefs -n` prints nothing). The gate's "blank" case; the replace of `-part2` by this `-part4` then completed. `-part2`, replaced away, read the same shape (exit 0, `PART_ENTRY_*` only): ZFS cleared the old log leaf's label on the replace |
+| `lsblk-partition-probe.json` | `lsblk -J -o NAME,TYPE,PKNAME,MOUNTPOINT /dev/disk/by-id/…ANAS_HOT9-part2`, exit 0 | `PARTITION_PROBE_ARGS` byte for byte on a free partition: `type: "part"`, `pkname` the disk's kernel name, `mountpoint: null`, no `children` |
+
 ## Pre-existing fixtures — synthetic
 
 Everything here that is NOT in the zoo table above and not one of the two iscsi.3

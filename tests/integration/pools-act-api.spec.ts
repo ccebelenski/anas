@@ -202,7 +202,6 @@ test.describe('Pool create / destroy / export / import (spare disks)', () => {
         data: {
           name: TMP_CREATE,
           dataVdevs: [{ type: 'stripe', disks: [spares[0]] }],
-          force: true,
         },
       })
       expect(createRes.status()).toBe(202)
