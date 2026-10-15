@@ -587,6 +587,17 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     }
   })
 
+  it('a create at `<mp>/` meets the fstab line for `<mp>` — 409, no second line for one directory (cr.39 review)', async () => {
+    await serve()
+    const mp = join(dir, 'slashed')
+    const withLine = rewrite(FSTAB, '/mnt/anas-cifs ', `${mp} `)
+    await writeFile(paths.fstab, withLine)
+    const res = await send({ method: 'POST', url: '/v1/mounts', payload: { type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export1', mountpoint: `${mp}/`, persistent: true, mountNow: false } })
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.message, `Mount '${mp}' is already in /etc/fstab`)
+    assert.equal(await readFile(paths.fstab, 'utf8'), withLine, 'fstab untouched')
+  })
+
   it('create holds mount:<path> too, keyed by the normalised mountpoint', async () => {
     await serve()
     let release!: () => void

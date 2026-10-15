@@ -498,7 +498,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid create mount request: ${zodIssue(parsed.error)}` } }
     }
-    const req = parsed.data
+    // The mountpoint is normalised at the boundary (the lock key's own
+    // normaliser): `/mnt/x/` and `/mnt/x` are one directory, so the fstab
+    // collision gates compare the same spelling and a second line for the
+    // same directory is never written (cr.39 review).
+    const req = { ...parsed.data, mountpoint: normalizeMountpointPath(parsed.data.mountpoint) }
 
     const identity = requireIdentity(request, reply)
     if (!identity)

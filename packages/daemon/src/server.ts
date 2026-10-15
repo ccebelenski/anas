@@ -81,7 +81,7 @@ export function createServer(opts?: ServerOptions) {
     // export path — and Fastify's default cap (100 characters) silently
     // turns a longer one into a route-not-found 404 (found by cr.39). PATH_MAX
     // is 4096, and percent-encoding can triple it.
-    maxParamLength: PATH_PARAM_MAX,
+    routerOptions: { maxParamLength: PATH_PARAM_MAX },
   })
 
   // cr.26 (review H1, third bullet; WAVE2-DESIGN §3, "the daemon refuses

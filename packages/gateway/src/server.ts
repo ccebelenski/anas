@@ -53,7 +53,7 @@ export function createServer(opts: ServerOptions = {}) {
   // The forwarded path carries URL-encoded object ids (mountpoints, export
   // paths); Fastify's default 100-character param cap would 404 a long one
   // before it reached the daemon. PATH_MAX (4096), percent-encoded.
-  const server = Fastify({ logger: opts.logger ?? true, maxParamLength: 3 * 4096 })
+  const server = Fastify({ logger: opts.logger ?? true, routerOptions: { maxParamLength: 3 * 4096 } })
 
   // Pure gateway: never parse bodies — forward them verbatim as raw Buffers.
   server.removeAllContentTypeParsers()
