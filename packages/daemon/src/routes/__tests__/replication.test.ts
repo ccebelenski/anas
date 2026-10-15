@@ -97,7 +97,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['send', '-nvP', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '--', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
 
     const res = await server.inject({
       method: 'POST',
@@ -127,7 +127,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }, { name: 'repl-next', txg: 200 }]), stderr: '', exitCode: 0 } })
     // target already has repl-base → the common base
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool2/share1'), result: { stdout: snapshotListJson('testpool2/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '-i', '@repl-base', 'testpool/share1@repl-next'], result: { stdout: INCR_DRYRUN, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '-i', '@repl-base', '--', 'testpool/share1@repl-next'], result: { stdout: INCR_DRYRUN, stderr: '', exitCode: 0 } })
 
     const res = await server.inject({
       method: 'POST',
@@ -186,7 +186,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
         exitCode: 0,
       },
     })
-    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '-i', '@repl-base', 'testpool/share1@repl-next'], result: { stdout: INCR_DRYRUN, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '-i', '@repl-base', '--', 'testpool/share1@repl-next'], result: { stdout: INCR_DRYRUN, stderr: '', exitCode: 0 } })
 
     const res = await server.inject({
       method: 'POST',
@@ -213,7 +213,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
     // target has ONLY an unrelated snapshot → diverged
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool2/share1'), result: { stdout: snapshotListJson('testpool2/share1', [{ name: 'stranger', txg: 500 }]), stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['send', '-nvP', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '--', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
 
     const res = await server.inject({
       method: 'POST',
@@ -277,7 +277,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['send', '-nvP', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '--', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
     // hold / holds / release fall through to the command-only zfs fallback:
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
 
@@ -302,7 +302,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     assert.equal(mock.pipelineCalls.length, 1)
     assert.deepEqual(mock.pipelineCalls[0], {
       cmd1: ZFS,
-      args1: ['send', 'testpool/share1@repl-base'],
+      args1: ['send', '--', 'testpool/share1@repl-base'],
       cmd2: ZFS,
       args2: ['recv', '-o', 'readonly=on', '--', 'testpool2/share1'],
     })
@@ -313,8 +313,8 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     assert.match(tag, /^anas-repl-[0-9a-f]{12}$/)
     const holds = mock.calls.filter(c => c.command === ZFS && c.args[0] === 'hold')
     assert.deepEqual(holds.map(h => h.args), [
-      ['hold', tag, 'testpool/share1@repl-base'],
-      ['hold', tag, 'testpool2/share1@repl-base'],
+      ['hold', '--', tag, 'testpool/share1@repl-base'],
+      ['hold', '--', tag, 'testpool2/share1@repl-base'],
     ])
     assert.equal((job.result as { holdTag?: string }).holdTag, tag)
   })
@@ -329,7 +329,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2', 'testpool2/share1']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }, { name: 'repl-next', txg: 200 }]), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool2/share1'), result: { stdout: snapshotListJson('testpool2/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '-i', '@repl-base', 'testpool/share1@repl-next'], result: { stdout: INCR_DRYRUN, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '-i', '@repl-base', '--', 'testpool/share1@repl-next'], result: { stdout: INCR_DRYRUN, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
 
     const res = await server.inject({
@@ -351,7 +351,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     assert.equal(mock.pipelineCalls.length, 1)
     assert.deepEqual(mock.pipelineCalls[0], {
       cmd1: ZFS,
-      args1: ['send', '-i', '@repl-base', 'testpool/share1@repl-next'],
+      args1: ['send', '-i', '@repl-base', '--', 'testpool/share1@repl-next'],
       cmd2: ZFS,
       args2: ['recv', '--', 'testpool2/share1'],
     })
@@ -425,7 +425,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['send', '-nvP', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '--', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     return mock
   }

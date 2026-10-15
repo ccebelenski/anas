@@ -775,13 +775,13 @@ describe('zvol grow, LUN delete, target state and target delete', () => {
     const mock = new MockExecutor()
     // An already-aligned size against a 16K volblocksize: no rounding, and the
     // applied size is what was asked for.
-    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', 'tank/vol1'], result: { stdout: '16384\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', '--', 'tank/vol1'], result: { stdout: '16384\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zfs', result: { stdout: '', stderr: '', exitCode: 0 } })
     const applied = await growZvolLun({ executor: mock }, 'tank/vol1', 2147483648)
     assert.equal(applied, 2147483648)
     assert.deepEqual(mock.calls, [
-      { command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', 'tank/vol1'] },
-      { command: '/usr/sbin/zfs', args: ['set', 'volsize=2147483648', 'tank/vol1'] },
+      { command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', '--', 'tank/vol1'] },
+      { command: '/usr/sbin/zfs', args: ['set', '--', 'volsize=2147483648', 'tank/vol1'] },
     ])
   })
 
@@ -790,7 +790,7 @@ describe('zvol grow, LUN delete, target state and target delete', () => {
     // The live-proof numbers (LP2): 16K volblocksize, 1_300_000_000 requested →
     // 1_300_004_864 applied. Before O1 this reached `zfs set volsize=` unaligned
     // and failed the JOB with a raw ZFS error out of a 202.
-    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', 'tank/vol1'], result: { stdout: '16384\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', '--', 'tank/vol1'], result: { stdout: '16384\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zfs', result: { stdout: '', stderr: '', exitCode: 0 } })
     const applied = await growZvolLun({ executor: mock }, 'tank/vol1', 1300000000)
     assert.equal(applied, 1300004864)
@@ -798,7 +798,7 @@ describe('zvol grow, LUN delete, target state and target delete', () => {
     // unaligned volsize and never errors.
     assert.deepEqual(mock.calls.find(c => c.args[0] === 'set'), {
       command: '/usr/sbin/zfs',
-      args: ['set', 'volsize=1300004864', 'tank/vol1'],
+      args: ['set', '--', 'volsize=1300004864', 'tank/vol1'],
     })
   })
 
@@ -806,19 +806,19 @@ describe('zvol grow, LUN delete, target state and target delete', () => {
     const mock = new MockExecutor()
     // `zfs get` fails: no rounding is attempted, the request goes through as-is,
     // exactly as before O1 existed.
-    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', 'tank/vol1'], result: { stdout: '', stderr: 'no dataset', exitCode: 1 } })
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', '--', 'tank/vol1'], result: { stdout: '', stderr: 'no dataset', exitCode: 1 } })
     mock.addFixture({ command: '/usr/sbin/zfs', result: { stdout: '', stderr: '', exitCode: 0 } })
     const applied = await growZvolLun({ executor: mock }, 'tank/vol1', 1300000000)
     assert.equal(applied, 1300000000)
     assert.deepEqual(mock.calls.find(c => c.args[0] === 'set'), {
       command: '/usr/sbin/zfs',
-      args: ['set', 'volsize=1300000000', 'tank/vol1'],
+      args: ['set', '--', 'volsize=1300000000', 'tank/vol1'],
     })
   })
 
   it('a zvol grow that ZFS refuses surfaces what ZFS said', async () => {
     const mock = new MockExecutor()
-    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', 'tank/vol1'], result: { stdout: '16384\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', '--', 'tank/vol1'], result: { stdout: '16384\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zfs', result: { stdout: '', stderr: 'cannot set property for \'tank/vol1\': out of space\n', exitCode: 1 } })
     await assert.rejects(() => growZvolLun({ executor: mock }, 'tank/vol1', 16384), /out of space/)
   })
@@ -863,7 +863,7 @@ describe('zvol grow, LUN delete, target state and target delete', () => {
     )
     assert.deepEqual(
       mock.calls.filter(c => c.command === '/usr/sbin/zfs'),
-      [{ command: '/usr/sbin/zfs', args: ['destroy', 'tank/vol1'] }],
+      [{ command: '/usr/sbin/zfs', args: ['destroy', '--', 'tank/vol1'] }],
     )
     assert.equal(result.backingDestroyed, 'tank/vol1')
   })
@@ -1074,7 +1074,7 @@ describe('resolveFileBackingDir — an AHR pool name is a backing, like a datase
     const mock = ahrExecutor('/mnt/anas-ahr/ahr0')
     // O2: the dataset-name branch now confirms the dataset is actually mounted
     // before handing back its mountpoint. A mounted dataset resolves as before.
-    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', 'tank/images'], result: { stdout: 'yes\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', '--', 'tank/images'], result: { stdout: 'yes\n', stderr: '', exitCode: 0 } })
     const ctx = emptyCtx({
       inputs: {
         pveStorages: new Map(),
@@ -1089,7 +1089,7 @@ describe('resolveFileBackingDir — an AHR pool name is a backing, like a datase
     assert.equal(r.ok.ahr, undefined)
     // The ONLY command run is the mounted check — no AHR topology (mdadm, lvs, …).
     assert.deepEqual(mock.calls, [
-      { command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', 'tank/images'] },
+      { command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', '--', 'tank/images'] },
     ])
   })
 
@@ -1099,7 +1099,7 @@ describe('resolveFileBackingDir — an AHR pool name is a backing, like a datase
     // served as an empty disk after the next reboot (the quarantine caught it
     // only afterwards). The create door has the facts — refuse here.
     const mock = new MockExecutor()
-    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', 'gtbackup/lp35b'], result: { stdout: 'no\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', '--', 'gtbackup/lp35b'], result: { stdout: 'no\n', stderr: '', exitCode: 0 } })
     const ctx = emptyCtx({
       inputs: {
         pveStorages: new Map(),
@@ -1118,7 +1118,7 @@ describe('resolveFileBackingDir — an AHR pool name is a backing, like a datase
     // Same hazard through the absolute-path form: the path resolves onto a
     // dataset that is not mounted, so the write would land on the parent.
     const mock = new MockExecutor()
-    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', 'tank/images'], result: { stdout: 'no\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', '--', 'tank/images'], result: { stdout: 'no\n', stderr: '', exitCode: 0 } })
     const ctx = emptyCtx({
       inputs: {
         pveStorages: new Map(),
@@ -1135,7 +1135,7 @@ describe('resolveFileBackingDir — an AHR pool name is a backing, like a datase
     // `zfs get mounted` fails: no refusal is invented, the door resolves, and the
     // stub quarantine remains the safety net — the pre-O2 behaviour.
     const mock = new MockExecutor()
-    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', 'tank/images'], result: { stdout: '', stderr: 'no dataset', exitCode: 1 } })
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', '--', 'tank/images'], result: { stdout: '', stderr: 'no dataset', exitCode: 1 } })
     const ctx = emptyCtx({
       inputs: {
         pveStorages: new Map(),

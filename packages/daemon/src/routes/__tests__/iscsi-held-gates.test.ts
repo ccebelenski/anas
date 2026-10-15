@@ -640,7 +640,7 @@ describe('iscsi.6 — the rest of ANAS knows a LUN is there (route gates)', () =
           return { stdout: ZPOOL_LIST, stderr: '', exitCode: 0 }
         if (command === ZFS && same(args, zfsListArgs(POOL)))
           return { stdout: fixtureText(ZFS_FIXTURES, 'zfs-list-volumes.json'), stderr: '', exitCode: 0 }
-        if (command === ZPOOL && same(args, ['get', '-H', '-o', 'value', 'guid', POOL]))
+        if (command === ZPOOL && same(args, ['get', '-H', '-o', 'value', 'guid', '--', POOL]))
           return { stdout: '4242\n', stderr: '', exitCode: 0 } // ident.1: the guid the confirm binds
         return orig(command, args)
       }
@@ -714,8 +714,8 @@ describe('the disclosure — a failed claims read is named at the confirm doors 
     executor.addFixture({ command: ZFS, args: zfsListArgs(POOL), result: { stdout: fixtureText(ZFS_FIXTURES, 'zfs-list-volumes.json'), stderr: '', exitCode: 0 } })
     // ident.1: the guids the destroy/export confirms bind.
     for (const pool of [POOL, UNSERVED_POOL])
-      executor.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', pool], result: { stdout: '4242\n', stderr: '', exitCode: 0 } })
-    executor.addFixture({ command: ZFS, args: ['get', '-H', '-o', 'value', 'guid', ZVOL], result: { stdout: '4343\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', pool], result: { stdout: '4242\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: ZFS, args: ['get', '-H', '-o', 'value', 'guid', '--', ZVOL], result: { stdout: '4343\n', stderr: '', exitCode: 0 } })
     const iscsiPaths = {
       configfsRoot: root,
       saveconfigPath: join(dir, 'absent-saveconfig.json'),

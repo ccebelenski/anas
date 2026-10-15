@@ -941,10 +941,10 @@ describe('runCloudSync — the transient snapshot', () => {
       assert.equal(result.snapshot, `tank/pictures@${LABEL}`)
 
       const zfsArgs = h.mock.calls.filter(c => c.command === ZFS).map(c => c.args.join(' '))
-      assert.ok(zfsArgs.includes(`snapshot -r tank/pictures@${LABEL}`), zfsArgs.join(' | '))
-      assert.ok(zfsArgs.includes(`destroy -r tank/pictures@${LABEL}`), 'destroyed in the finally')
+      assert.ok(zfsArgs.includes(`snapshot -r -- tank/pictures@${LABEL}`), zfsArgs.join(' | '))
+      assert.ok(zfsArgs.includes(`destroy -r -- tank/pictures@${LABEL}`), 'destroyed in the finally')
       // The sweep is scoped to this task's own labels, on this dataset.
-      assert.ok(zfsArgs.some(a => a.startsWith('list -t snapshot -Hp -o name -r tank/pictures')))
+      assert.ok(zfsArgs.some(a => a.startsWith('list -t snapshot -Hp -o name -r -- tank/pictures')))
 
       // rclone read the SNAPSHOT, never the live tree.
       const rcloneCall = h.mock.calls.find(c => c.command === RCLONE)!
@@ -961,7 +961,7 @@ describe('runCloudSync — the transient snapshot', () => {
       h.mock.addFixture({ command: RCLONE, result: { stdout: '', stderr: ERROR_LINE, exitCode: 7 } })
       await assert.rejects(runCloudSync(h.mock, deps(h), () => {}), /exit 7/)
       const zfsArgs = h.mock.calls.filter(c => c.command === ZFS).map(c => c.args.join(' '))
-      assert.ok(zfsArgs.includes(`destroy -r tank/pictures@${LABEL}`), 'the finally runs on a failure too')
+      assert.ok(zfsArgs.includes(`destroy -r -- tank/pictures@${LABEL}`), 'the finally runs on a failure too')
     }
     finally {
       await h.cleanup()
@@ -990,7 +990,7 @@ describe('runCloudSync — the transient snapshot', () => {
       assert.equal(job.status, 'cancelled')
       assert.match((job.result as { reason: string }).reason, /^cancelled by alice@pve at /)
       const zfsArgs = h.mock.calls.filter(c => c.command === ZFS).map(c => c.args.join(' '))
-      assert.ok(zfsArgs.includes(`destroy -r tank/pictures@${LABEL}`), 'the finally runs on a cancel too')
+      assert.ok(zfsArgs.includes(`destroy -r -- tank/pictures@${LABEL}`), 'the finally runs on a cancel too')
     }
     finally {
       await h.cleanup()
@@ -1011,7 +1011,7 @@ describe('runCloudSync — the transient snapshot', () => {
       })
       h.mock.addFixture({
         command: ZFS,
-        args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', 'tank/pictures'],
+        args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', '--', 'tank/pictures'],
         result: {
           stdout: [older, otherTask, backupTransient, 'anas-daily-2026-09-01T000000Z']
             .map(n => `tank/pictures@${n}`)

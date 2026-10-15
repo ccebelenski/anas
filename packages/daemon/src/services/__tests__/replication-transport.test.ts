@@ -159,7 +159,7 @@ describe('replication transport (Epic 5.5.2 — remote SSH)', () => {
   it('remoteSnapshotNames extracts the names after @ from the -H list', async () => {
     const mock = new MockExecutor()
     const resolved: ResolvedLocation = { kind: 'peer', host: 'node2' }
-    const argv = buildSshArgv(resolved, ['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name,creation', 'backup/media'])
+    const argv = buildSshArgv(resolved, ['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name,creation', '--', 'backup/media'])
     mock.addFixture({
       command: argv[0],
       args: argv.slice(1),

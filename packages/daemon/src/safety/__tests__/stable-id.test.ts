@@ -90,8 +90,8 @@ describe('confirmGateBound (ident.1)', () => {
 describe('stable-id readers and the job-side check (ident.1)', () => {
   it('reads pool and dataset guids with -H -o value; a failed or empty read is null', async () => {
     const ex = new MockExecutor()
-    ex.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'value', 'guid', 'tank'], result: { stdout: '123\n', stderr: '', exitCode: 0 } })
-    ex.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-H', '-o', 'value', 'guid', 'tank/a'], result: { stdout: '456\n', stderr: '', exitCode: 0 } })
+    ex.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'value', 'guid', '--', 'tank'], result: { stdout: '123\n', stderr: '', exitCode: 0 } })
+    ex.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-H', '-o', 'value', 'guid', '--', 'tank/a'], result: { stdout: '456\n', stderr: '', exitCode: 0 } })
     assert.deepEqual(await readPoolGuid(ex, 'tank'), { guid: '123' })
     assert.deepEqual(await readDatasetGuid(ex, 'tank/a'), { guid: '456' })
     assert.equal(await readPoolGuid(ex, 'gone'), null)
@@ -99,7 +99,7 @@ describe('stable-id readers and the job-side check (ident.1)', () => {
 
   it('rollback ids: the target\'s createtxg and the NEWEST snapshot\'s (numeric, not lexical)', async () => {
     const ex = new MockExecutor()
-    ex.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,createtxg', '-d', '1', 'tank/a'], result: {
+    ex.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,createtxg', '-d', '1', '--', 'tank/a'], result: {
       stdout: 'tank/a@one\t99\ntank/a@two\t100\ntank/a@three\t1000\n',
       stderr: '',
       exitCode: 0,

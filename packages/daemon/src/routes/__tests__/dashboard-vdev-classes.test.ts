@@ -74,7 +74,7 @@ describe('GET /v1/telemetry — every vdev class joins with its own role (vdevs.
     const mock = (server as unknown as { executor: MockExecutor }).executor
     mock.clearFixtures()
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: { stdout: LIST, stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', POOL, '1', '2'], result: { stdout: IOSTAT, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', '--', POOL, '1', '2'], result: { stdout: IOSTAT, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: STATUS, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: BY_ID, stderr: '', exitCode: 0 } })
     const res = await server.inject({ method: 'GET', url: '/v1/telemetry', headers: IDENTITY_HEADERS })
@@ -162,7 +162,7 @@ describe('GET /v1/telemetry — by-id partition leaves join by their own name', 
     const mock = (server as unknown as { executor: MockExecutor }).executor
     mock.clearFixtures()
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: { stdout: MULTI_LIST, stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', MULTI_POOL, '1', '2'], result: { stdout: MULTI_IOSTAT, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', '--', MULTI_POOL, '1', '2'], result: { stdout: MULTI_IOSTAT, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: MULTI_STATUS, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: BY_ID, stderr: '', exitCode: 0 } })
     const res = await server.inject({ method: 'GET', url: '/v1/telemetry', headers: IDENTITY_HEADERS })

@@ -803,7 +803,7 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
     // The footprint reads (datasetOfPath): mountpoint table + boot probe.
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: opts.zfsTable ?? '', stderr: '', exitCode: 0 } })
     // The dataset's free space (smbsvc.3): the capacity read the detail serves.
-    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'available', 'testpool/media'], result: { stdout: `${opts.availableBytes ?? 1_099_511_627_776}\n`, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'available', '--', 'testpool/media'], result: { stdout: `${opts.availableBytes ?? 1_099_511_627_776}\n`, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE,FSTYPE', '/'], result: { stdout: '/dev/sda1\text4\n', stderr: '', exitCode: 0 } })

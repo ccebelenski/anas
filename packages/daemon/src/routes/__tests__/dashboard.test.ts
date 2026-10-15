@@ -106,7 +106,7 @@ describe('GET /v1/telemetry — nested pool → vdev → disk tree', () => {
     // telemetry sample needs, with a FAILING `zpool status` (no topology join).
     mock.clearFixtures()
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
-    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', 'testpool', '1', '2'], result: mockFixtures.zpoolIostat() })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', '--', 'testpool', '1', '2'], result: mockFixtures.zpoolIostat() })
     mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: 'no pools available', exitCode: 1 } })
 
@@ -158,7 +158,7 @@ describe('GET /v1/telemetry — ahrPools (story 11.15, AHR I/O telemetry)', () =
     // fixtures stay intact so the ZFS telemetry tree is unaffected.
     mock.clearFixtures()
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
-    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', 'testpool', '1', '2'], result: mockFixtures.zpoolIostat() })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', '--', 'testpool', '1', '2'], result: mockFixtures.zpoolIostat() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
     mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'boom', exitCode: 1 } })

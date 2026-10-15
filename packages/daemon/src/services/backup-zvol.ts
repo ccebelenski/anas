@@ -59,7 +59,8 @@ export function zvolSnapshotDevice(device: string, label: string): string {
  * output rather than an assumed column set.
  */
 export function snapdevGetArgs(volume: string): string[] {
-  return ['get', '-Hp', '-o', 'name,value,source', 'snapdev', volume]
+  // cr.21: `--` ends option parsing before the derived volume operand.
+  return ['get', '-Hp', '-o', 'name,value,source', 'snapdev', '--', volume]
 }
 
 /** The `snapdev` property as ZFS reports it: the value and where it came from. */
@@ -104,9 +105,11 @@ export function parseSnapdevProperty(stdout: string): SnapdevProperty | null {
  * `zfs set snapdev=hidden` conspicuously does not (GT-46).
  */
 export function snapdevRestoreArgs(volume: string, prior: SnapdevProperty): string[] {
+  // cr.21: `--` before the derived volume operand (and, for the set, ahead of
+  // the whole property=value operand — its value is a system read).
   return prior.source === 'local'
-    ? ['set', `snapdev=${prior.value}`, volume]
-    : ['inherit', 'snapdev', volume]
+    ? ['set', '--', `snapdev=${prior.value}`, volume]
+    : ['inherit', 'snapdev', '--', volume]
 }
 
 /** One volume whose snapshot device the run needs published. */
@@ -195,7 +198,7 @@ export async function withZvolSnapshotDevices<T>(
 
       if (prior.value !== 'visible') {
         updateProgress(`publishing snapshot device for ${source.volume} (snapdev=visible, was ${prior.value}/${prior.source})`)
-        const set = await executor.exec(ZFS, ['set', 'snapdev=visible', source.volume])
+        const set = await executor.exec(ZFS, ['set', '--', 'snapdev=visible', source.volume])
         if (set.exitCode !== 0) {
           const detail = set.stderr.trim() || `zfs set snapdev=visible exited with code ${set.exitCode}`
           throw new Error(`could not publish the snapshot device of volume '${source.volume}': ${detail}`)

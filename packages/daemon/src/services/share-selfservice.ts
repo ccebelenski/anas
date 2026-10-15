@@ -97,7 +97,8 @@ export async function shareAvailableBytes(executor: CommandExecutor, path: strin
     if (!target)
       return undefined
     if (target.kind === 'zfs') {
-      const r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'value', 'available', target.dataset])
+      // cr.21: `--` ends option parsing before the derived dataset operand.
+      const r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'value', 'available', '--', target.dataset])
       if (r.exitCode !== 0)
         return undefined
       const n = Number(r.stdout.trim())

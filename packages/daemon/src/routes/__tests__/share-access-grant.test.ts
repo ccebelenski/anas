@@ -34,7 +34,7 @@ const MP = '/testpool/media'
 /** The dev mock's AHR pool mount (a fresh btrfs directory). */
 const AHR_MP = '/mnt/anas-ahr/ahr0'
 const ISCSI_FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/iscsi')
-const ACLTYPE_MEDIA = ['get', '-Hp', '-o', 'value', 'acltype', 'testpool/media']
+const ACLTYPE_MEDIA = ['get', '-Hp', '-o', 'value', 'acltype', '--', 'testpool/media']
 /** The mountpoint table the path resolver reads (the default mock has none). */
 const MOUNTPOINTS = 'testpool\t/testpool\ntestpool/media\t/testpool/media\ntestpool/x\t/testpool/x\ntestpool/x/data\t/testpool/x/data\n'
 
@@ -171,7 +171,7 @@ describe('access.1 — the share-path grant', () => {
     // Owner/group untouched (no chown); base levels restated from the mode (755).
     assert.equal(find(calls, '/usr/bin/chown', () => true), undefined)
     const spec = 'u::rwx,g::r-x,o::r-x,u:media:rwx,m::rwx'
-    assert.deepEqual(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), ['set', 'acltype=posixacl', 'xattr=sa', 'testpool/media'])
+    assert.deepEqual(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), ['set', '--', 'acltype=posixacl', 'xattr=sa', 'testpool/media'])
     assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', spec, MP])
     assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-d'), ['-d', '--set', spec, MP])
     // The share itself is written first.
@@ -278,14 +278,14 @@ describe('access.1 — the share-path grant', () => {
   it('share grant applyToExisting on ZFS switches ACLs on for a child dataset under the path first, and lists it (ruling 2026-10-11)', async () => {
     const { calls } = start([{
       command: '/usr/sbin/zfs',
-      args: ['list', '-r', '-H', '-o', 'name,mountpoint,acltype', 'testpool/media'],
+      args: ['list', '-r', '-H', '-o', 'name,mountpoint,acltype', '--', 'testpool/media'],
       result: ok('testpool/media\t/testpool/media\toff\ntestpool/media/kids\t/testpool/media/kids\toff\n'),
     }])
     const job = await createConfirmed({ name: 'media', path: MP, validUsers: ['media'], grantAccess: { applyToExisting: true } })
     const grant = grantOf(job)!
     assert.equal(grant.status, 'applied', grant.message)
     assert.deepEqual(grant.childAclEnabled, ['testpool/media/kids'])
-    const enable = calls.findIndex(c => c.command === '/usr/sbin/zfs' && c.args.join(' ') === 'set acltype=posixacl xattr=sa testpool/media/kids')
+    const enable = calls.findIndex(c => c.command === '/usr/sbin/zfs' && c.args.join(' ') === 'set -- acltype=posixacl xattr=sa testpool/media/kids')
     const walk = calls.findIndex(c => c.command === '/usr/bin/setfacl' && c.args[0] === '-R')
     assert.ok(enable >= 0 && walk > enable, `child enabled (#${enable}) before the walk (#${walk})`)
   })

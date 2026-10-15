@@ -874,7 +874,7 @@ describe('recursive verbs over a NESTED PVE storage (review fix 2)', () => {
         return { stdout: NESTED_LIST, stderr: '', exitCode: 0 }
       // ident.1: every dataset here has a guid (the destroy confirm binds it).
       if (command === '/usr/sbin/zfs' && args.slice(0, 5).join(' ') === 'get -H -o value guid')
-        return { stdout: `${guidOf(args[5])}\n`, stderr: '', exitCode: 0 }
+        return { stdout: `${guidOf(args.at(-1)!)}\n`, stderr: '', exitCode: 0 }
       return orig(command, args)
     }
   })
@@ -1166,7 +1166,7 @@ describe('ident.1 — reserved segments, the router\'s dataset-first reading, an
       [zfsListArgs('testpool').join(' '), [ok(LEGACY_LIST)]],
       [`list -H -o name -t filesystem,volume -- ${LEGACY}`, [ok(`${LEGACY}\n`)]],
       [`list -H -o name -t filesystem,volume -- testpool/snapshots`, [ok('testpool/snapshots\n')]],
-      [`get -H -o value guid ${LEGACY}`, [ok('31337\n')]],
+      [`get -H -o value guid -- ${LEGACY}`, [ok('31337\n')]],
     ])
     mock.exec = async (command: string, args: string[]) => {
       calls.push({ command, args })
@@ -1223,7 +1223,7 @@ describe('ident.1 — reserved segments, the router\'s dataset-first reading, an
   })
 
   it('rollback: a snapshot taken after the challenge → the resend is 409 IDENTITY_MISMATCH and nothing rolls back', async () => {
-    const ids = 'list -t snapshot -Hp -o name,createtxg -d 1 testpool/media'
+    const ids = 'list -t snapshot -Hp -o name,createtxg -d 1 -- testpool/media'
     answers.set(ids, [
       ok('testpool/media@snap1\t120\ntestpool/media@snap2\t240\n'),
       ok('testpool/media@snap1\t120\ntestpool/media@snap2\t240\ntestpool/media@late\t300\n'),
@@ -1275,7 +1275,7 @@ describe('ident.1 — reserved segments, the router\'s dataset-first reading, an
   })
 
   it('dataset destroy: the guid cannot be read at the gate → 409 CONFLICT, no confirm code, nothing destroyed', async () => {
-    answers.set(`get -H -o value guid ${LEGACY}`, [{ stdout: '', stderr: 'internal error: Input/output error', exitCode: 1 }])
+    answers.set(`get -H -o value guid -- ${LEGACY}`, [{ stdout: '', stderr: 'internal error: Input/output error', exitCode: 1 }])
     const res = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: IDENTITY_HEADERS })
     assert.equal(res.statusCode, 409)
     assert.equal(res.json().error.code, 'CONFLICT')
@@ -1285,7 +1285,7 @@ describe('ident.1 — reserved segments, the router\'s dataset-first reading, an
   })
 
   it('dataset destroy: the guid cannot be read when the job runs → job fails IDENTITY_MISMATCH (unreadable), nothing destroyed', async () => {
-    answers.set(`get -H -o value guid ${LEGACY}`, [ok('7\n'), ok('7\n'), { stdout: '', stderr: 'cannot open: dataset does not exist', exitCode: 1 }])
+    answers.set(`get -H -o value guid -- ${LEGACY}`, [ok('7\n'), ok('7\n'), { stdout: '', stderr: 'cannot open: dataset does not exist', exitCode: 1 }])
     const first = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: IDENTITY_HEADERS })
     const res = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
     assert.equal(res.statusCode, 202)
@@ -1297,7 +1297,7 @@ describe('ident.1 — reserved segments, the router\'s dataset-first reading, an
   })
 
   it('dataset destroy: the guid changed while the job was queued → job fails IDENTITY_MISMATCH, nothing destroyed', async () => {
-    answers.set(`get -H -o value guid ${LEGACY}`, [ok('1\n'), ok('1\n'), ok('2\n')])
+    answers.set(`get -H -o value guid -- ${LEGACY}`, [ok('1\n'), ok('1\n'), ok('2\n')])
     const first = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: IDENTITY_HEADERS })
     const res = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/x', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
     assert.equal(res.statusCode, 202)

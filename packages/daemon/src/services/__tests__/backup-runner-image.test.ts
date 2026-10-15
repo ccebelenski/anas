@@ -227,13 +227,13 @@ describe('img archives — the zvol snapshot device inside a run (backup2.4)', (
     assert.equal(result.status, 'success')
     assert.deepEqual(zfsArgs(mock), [
       // the stale sweep's list (the sweep is scoped to this task's own prefix)
-      ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', 'tank/vol1'],
-      ['snapshot', '-r', `tank/vol1@${LABEL}`],
+      ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', '--', 'tank/vol1'],
+      ['snapshot', '-r', '--', `tank/vol1@${LABEL}`],
       snapdevGetArgs('tank/vol1'),
-      ['set', 'snapdev=visible', 'tank/vol1'],
+      ['set', '--', 'snapdev=visible', 'tank/vol1'],
       // GT-46: `inherit`, never `set snapdev=hidden`.
-      ['inherit', 'snapdev', 'tank/vol1'],
-      ['destroy', '-r', `tank/vol1@${LABEL}`],
+      ['inherit', 'snapdev', '--', 'tank/vol1'],
+      ['destroy', '-r', '--', `tank/vol1@${LABEL}`],
     ])
     // pbc read the SNAPSHOT device, not the live volume.
     assert.ok(pbcArgs(mock).includes(`lun0.img:/dev/zvol/tank/vol1@${LABEL}`), pbcArgs(mock).join(' '))
@@ -256,8 +256,8 @@ describe('img archives — the zvol snapshot device inside a run (backup2.4)', (
     await run(mock)
     const restore = zfsArgs(mock).filter(a => a[0] === 'set' || a[0] === 'inherit')
     assert.deepEqual(restore, [
-      ['set', 'snapdev=visible', 'tank/vol1'],
-      ['set', 'snapdev=hidden', 'tank/vol1'],
+      ['set', '--', 'snapdev=visible', 'tank/vol1'],
+      ['set', '--', 'snapdev=hidden', 'tank/vol1'],
     ])
   })
 
@@ -274,10 +274,10 @@ describe('img archives — the zvol snapshot device inside a run (backup2.4)', (
     await assert.rejects(() => run(mock), /unable to open chunk store/)
     const args = zfsArgs(mock)
     assert.ok(args.some(a => a[0] === 'inherit'), JSON.stringify(args))
-    assert.ok(args.some(a => a[0] === 'destroy' && a[2] === `tank/vol1@${LABEL}`), JSON.stringify(args))
+    assert.ok(args.some(a => a[0] === 'destroy' && a.at(-1) === `tank/vol1@${LABEL}`), JSON.stringify(args))
     // Ordering: the property goes back BEFORE the snapshot it published is gone.
     const flat = args.map(a => a.join(' '))
-    assert.ok(flat.indexOf('inherit snapdev tank/vol1') < flat.indexOf(`destroy -r tank/vol1@${LABEL}`), flat.join(' | '))
+    assert.ok(flat.indexOf('inherit snapdev -- tank/vol1') < flat.indexOf(`destroy -r -- tank/vol1@${LABEL}`), flat.join(' | '))
   })
 
   it('an image FILE on a dataset uses the .zfs/snapshot root and NO snapdev at all', async () => {

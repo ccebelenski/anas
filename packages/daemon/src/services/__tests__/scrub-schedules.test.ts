@@ -83,7 +83,7 @@ describe('scrub schedules — ZFS org.debian:periodic-scrub property (GT-2)', ()
       zfsScrubSetArgs('tank', false).join(' '),
       zfsScrubSetArgs('tank', true).join(' '),
     ])
-    assert.equal(zfsScrubSetArgs('tank', false).join(' '), 'set org.debian:periodic-scrub=disable tank')
+    assert.equal(zfsScrubSetArgs('tank', false).join(' '), 'set -- org.debian:periodic-scrub=disable tank')
   })
 
   it('setZfsScrubEnabled throws on a failed set', async () => {

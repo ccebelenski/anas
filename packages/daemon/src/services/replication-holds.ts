@@ -78,7 +78,8 @@ export function parseHolds(stdout: string): Map<string, string[]> {
 export async function readLocalHolds(executor: CommandExecutor, snapFulls: string[]): Promise<Map<string, string[]>> {
   if (snapFulls.length === 0)
     return new Map()
-  const r = await executor.exec('/usr/sbin/zfs', ['holds', '-H', ...snapFulls])
+  // cr.21: `--` ends option parsing; every snapshot operand is derived.
+  const r = await executor.exec('/usr/sbin/zfs', ['holds', '-H', '--', ...snapFulls])
   return parseHolds(r.stdout)
 }
 
@@ -142,8 +143,9 @@ export async function settleReplicationHolds(deps: HoldDeps, input: SettleHoldsI
   const srcSnapFull = `${source.dataset}@${snapName}`
   const tgtSnapFull = `${target.dataset}@${snapName}`
 
-  // 1) The own holds — new base, both sides.
-  const srcHold = await executor.exec('/usr/sbin/zfs', ['hold', tag, srcSnapFull])
+  // 1) The own holds — new base, both sides. cr.21: `--` before the hold-tag
+  //    and snapshot operands (both derived).
+  const srcHold = await executor.exec('/usr/sbin/zfs', ['hold', '--', tag, srcSnapFull])
   const srcHeld = srcHold.exitCode === 0 || alreadyHeld(srcHold.stderr)
   if (!srcHeld) {
     warnings.push(`Could not place ${tag} hold on ${srcSnapFull}: ${failText(srcHold)}`)
@@ -151,7 +153,7 @@ export async function settleReplicationHolds(deps: HoldDeps, input: SettleHoldsI
   }
   const tgtHold = remote
     ? await transport.remoteHold(remote, tgtSnapFull, tag)
-    : await executor.exec('/usr/sbin/zfs', ['hold', tag, tgtSnapFull])
+    : await executor.exec('/usr/sbin/zfs', ['hold', '--', tag, tgtSnapFull])
   const tgtHeld = tgtHold.exitCode === 0 || alreadyHeld(tgtHold.stderr)
   if (!tgtHeld) {
     warnings.push(`Could not place ${tag} hold on ${tgtSnapFull}: ${failText(tgtHold)}`)
@@ -216,7 +218,7 @@ function alreadyHeld(stderr: string): boolean {
 }
 
 async function releaseLocal(executor: CommandExecutor, tag: string, full: string, warnings: string[]): Promise<void> {
-  const rel = await executor.exec('/usr/sbin/zfs', ['release', tag, full])
+  const rel = await executor.exec('/usr/sbin/zfs', ['release', '--', tag, full])
   if (rel.exitCode !== 0)
     warnings.push(`Could not release ${tag} hold on ${full}: ${failText(rel)}`)
 }

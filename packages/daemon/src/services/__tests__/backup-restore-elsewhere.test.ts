@@ -356,7 +356,7 @@ describe('runNewLunImageRestore — the happy sequence, as an exact call log', (
         `${TARGETCLI} /iscsi/${IQN}/tpg1/acls/${INITIATOR} create 1 1`,
         `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
         // The read-back proves the new object holds exactly the image…
-        `${ZFS} get -Hp -o value volsize tank/newvol`,
+        `${ZFS} get -Hp -o value volsize -- tank/newvol`,
         // …and only NOW is the configuration persisted.
         `${TARGETCLI} saveconfig`,
       ])

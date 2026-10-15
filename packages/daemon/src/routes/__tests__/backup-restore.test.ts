@@ -1090,7 +1090,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         .filter(a => a.startsWith(TARGETCLI)
           || a.includes(' restore ')
           || a === `${ZFS} create -s -V ${IMAGE_SIZE} -- tank/newvol`
-          || a === `${ZFS} get -Hp -o value volsize tank/newvol`)
+          || a === `${ZFS} get -Hp -o value volsize -- tank/newvol`)
       assert.deepEqual(seq, [
         `${ZFS} create -s -V ${IMAGE_SIZE} -- tank/newvol`,
         `${TARGETCLI} /backstores/block create name=newvol dev=${NEWVOL_PATH} wwn=${serial}`,
@@ -1101,7 +1101,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/luns create storage_object=/backstores/block/newvol lun=1`,
         `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/acls/${INITIATOR} create 1 1`,
         `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
-        `${ZFS} get -Hp -o value volsize tank/newvol`,
+        `${ZFS} get -Hp -o value volsize -- tank/newvol`,
         `${TARGETCLI} saveconfig`,
       ], seq.join(' | '))
 

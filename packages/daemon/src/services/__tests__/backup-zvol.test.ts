@@ -60,7 +60,7 @@ describe('snapdev — the snapshot device (backup2.4)', () => {
   })
 
   it('the get argv is the captured one: structured, one row, value AND source', () => {
-    assert.deepEqual(snapdevGetArgs(VOLUME), ['get', '-Hp', '-o', 'name,value,source', 'snapdev', VOLUME])
+    assert.deepEqual(snapdevGetArgs(VOLUME), ['get', '-Hp', '-o', 'name,value,source', 'snapdev', '--', VOLUME])
   })
 
   it('parses the property row, and returns null for anything else', () => {
@@ -79,7 +79,7 @@ describe('snapdev — the snapshot device (backup2.4)', () => {
     for (const source of ['default', 'inherited from tank', 'received', 'temporary']) {
       assert.deepEqual(
         snapdevRestoreArgs(VOLUME, { value: 'hidden', source }),
-        ['inherit', 'snapdev', VOLUME],
+        ['inherit', 'snapdev', '--', VOLUME],
         source,
       )
     }
@@ -88,12 +88,12 @@ describe('snapdev — the snapshot device (backup2.4)', () => {
   it('the restore is `zfs set <exact prior value>` when it was LOCAL', () => {
     assert.deepEqual(
       snapdevRestoreArgs(VOLUME, { value: 'hidden', source: 'local' }),
-      ['set', 'snapdev=hidden', VOLUME],
+      ['set', '--', 'snapdev=hidden', VOLUME],
     )
     // Not always `hidden`: the EXACT prior value goes back.
     assert.deepEqual(
       snapdevRestoreArgs(VOLUME, { value: 'visible', source: 'local' }),
-      ['set', 'snapdev=visible', VOLUME],
+      ['set', '--', 'snapdev=visible', VOLUME],
     )
   })
 
@@ -110,8 +110,8 @@ describe('snapdev — the snapshot device (backup2.4)', () => {
     assert.deepEqual(seen, [SNAP_DEVICE])
     assert.deepEqual(zfsArgs(mock), [
       snapdevGetArgs(VOLUME),
-      ['set', 'snapdev=visible', VOLUME],
-      ['inherit', 'snapdev', VOLUME],
+      ['set', '--', 'snapdev=visible', VOLUME],
+      ['inherit', 'snapdev', '--', VOLUME],
     ])
     // udev owns the symlink, so `settle` runs before the node is trusted.
     const order = mock.calls.map(c => `${c.command} ${c.args[0]}`)
@@ -123,7 +123,7 @@ describe('snapdev — the snapshot device (backup2.4)', () => {
     const mock = wire('hidden', 'local')
     const warnings: string[] = []
     await withZvolSnapshotDevices(mock, SOURCES, async () => 0, warnings, () => {}, PRESENT)
-    assert.deepEqual(zfsArgs(mock).at(-1), ['set', 'snapdev=hidden', VOLUME])
+    assert.deepEqual(zfsArgs(mock).at(-1), ['set', '--', 'snapdev=hidden', VOLUME])
   })
 
   it('a volume ALREADY visible is left completely alone — no set, no restore', async () => {
@@ -144,7 +144,7 @@ describe('snapdev — the snapshot device (backup2.4)', () => {
       }, warnings, () => {}, PRESENT),
       /pbc died/,
     )
-    assert.deepEqual(zfsArgs(mock).at(-1), ['inherit', 'snapdev', VOLUME])
+    assert.deepEqual(zfsArgs(mock).at(-1), ['inherit', 'snapdev', '--', VOLUME])
   })
 
   it('a FAILED restore is a warning naming the exact command, never a failure', async () => {
@@ -154,15 +154,15 @@ describe('snapdev — the snapshot device (backup2.4)', () => {
       args: snapdevGetArgs(VOLUME),
       result: { stdout: snapdev('hidden', 'default'), stderr: '', exitCode: 0 },
     })
-    mock.addFixture({ command: ZFS, args: ['set', 'snapdev=visible', VOLUME], result: { stdout: '', stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['inherit', 'snapdev', VOLUME], result: { stdout: '', stderr: 'dataset is busy', exitCode: 1 } })
+    mock.addFixture({ command: ZFS, args: ['set', '--', 'snapdev=visible', VOLUME], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['inherit', 'snapdev', '--', VOLUME], result: { stdout: '', stderr: 'dataset is busy', exitCode: 1 } })
     mock.addFixture({ command: UDEVADM, result: { stdout: '', stderr: '', exitCode: 0 } })
     const warnings: string[] = []
     const out = await withZvolSnapshotDevices(mock, SOURCES, async () => 'ok', warnings, () => {}, PRESENT)
     assert.equal(out, 'ok')
     assert.equal(warnings.length, 1)
     assert.match(warnings[0], /could not be restored/)
-    assert.match(warnings[0], /zfs inherit snapdev tank\/vol1/)
+    assert.match(warnings[0], /zfs inherit snapdev -- tank\/vol1/)
   })
 
   it('an UNREADABLE property changes nothing and fails loudly (no unrestorable change)', async () => {
@@ -191,7 +191,7 @@ describe('snapdev — the snapshot device (backup2.4)', () => {
       }),
       /never appeared/,
     )
-    assert.deepEqual(zfsArgs(mock).at(-1), ['inherit', 'snapdev', VOLUME])
+    assert.deepEqual(zfsArgs(mock).at(-1), ['inherit', 'snapdev', '--', VOLUME])
   })
 
   it('the node is polled, not assumed present the instant `zfs set` returns (GT-44)', async () => {

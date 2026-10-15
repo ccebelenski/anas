@@ -58,7 +58,7 @@ function installExecutor(server: ReturnType<typeof createServer>, stubs: Stub[] 
   return calls
 }
 
-const ACLTYPE_MEDIA = ['get', '-Hp', '-o', 'value', 'acltype', 'testpool/media']
+const ACLTYPE_MEDIA = ['get', '-Hp', '-o', 'value', 'acltype', '--', 'testpool/media']
 const MP = '/testpool/media'
 
 function ok(stdout = ''): ExecResult {
@@ -160,7 +160,7 @@ describe('access routes', () => {
       server = createServer({ mock: true, logger: false })
       installExecutor(server, [{
         command: '/usr/sbin/zfs',
-        args: ['get', '-j', 'all', 'testpool/vol'],
+        args: ['get', '-j', 'all', '--', 'testpool/vol'],
         result: ok(JSON.stringify({ datasets: { 'testpool/vol': { name: 'testpool/vol', type: 'VOLUME', properties: {} } } })),
       }])
       const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/vol/access', headers: IDENTITY_HEADERS })
@@ -292,7 +292,7 @@ describe('access routes', () => {
       assert.equal((job.result as { aclAutoEnabled: boolean }).aclAutoEnabled, true)
 
       // acltype auto-enabled first.
-      assert.deepEqual(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), ['set', 'acltype=posixacl', 'xattr=sa', 'testpool/media'])
+      assert.deepEqual(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), ['set', '--', 'acltype=posixacl', 'xattr=sa', 'testpool/media'])
 
       const expectSpec = 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx'
       assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', expectSpec, MP])
@@ -583,8 +583,8 @@ describe('access routes', () => {
 //              child that has them off BEFORE any permission is touched.
 // ============================================================================
 
-/** `zfs list -r -H -o name,mountpoint,acltype testpool/media` — the walk's children. */
-const CHILDREN_ARGS = ['list', '-r', '-H', '-o', 'name,mountpoint,acltype', 'testpool/media']
+/** `zfs list -r -H -o name,mountpoint,acltype -- testpool/media` — the walk's children. */
+const CHILDREN_ARGS = ['list', '-r', '-H', '-o', 'name,mountpoint,acltype', '--', 'testpool/media']
 /**
  * a: mounted under the path, ACLs off (enabled first);
  * b: mounted under the path, already posixacl (untouched);
@@ -679,7 +679,7 @@ describe('recursive apply — the confirm gate and child datasets (rulings 2026-
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    const enableA = calls.findIndex(c => c.command === '/usr/sbin/zfs' && c.args.join(' ') === 'set acltype=posixacl xattr=sa testpool/media/a')
+    const enableA = calls.findIndex(c => c.command === '/usr/sbin/zfs' && c.args.join(' ') === 'set -- acltype=posixacl xattr=sa testpool/media/a')
     assert.ok(enableA >= 0, 'acltype switched on for the child')
     const firstPermission = calls.findIndex(c => PERMISSION_COMMANDS.includes(c.command))
     assert.ok(firstPermission > enableA, `the child is enabled before any permission changes (enable #${enableA}, first permission #${firstPermission})`)
@@ -705,7 +705,7 @@ describe('recursive apply — the confirm gate and child datasets (rulings 2026-
     for (const child of ['testpool/media/c', 'testpool/media/d', 'testpool/media/e'])
       assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set' && a.includes(child)), undefined, child)
     // The switches flipped are exactly the child under the path and the target itself.
-    assert.deepEqual(calls.filter(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'set').map(c => c.args[3]), ['testpool/media/a', 'testpool/media'])
+    assert.deepEqual(calls.filter(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'set').map(c => c.args.at(-1)), ['testpool/media/a', 'testpool/media'])
   })
 
   it('a recursive change with NO named entry needs no ACLs: no child is switched on', async () => {
@@ -722,7 +722,7 @@ describe('recursive apply — the confirm gate and child datasets (rulings 2026-
     server = createServer({ mock: true, logger: false })
     const calls = installExecutor(server, [
       { command: '/usr/sbin/zfs', args: CHILDREN_ARGS, result: ok(CHILDREN) },
-      { command: '/usr/sbin/zfs', args: ['set', 'acltype=posixacl', 'xattr=sa', 'testpool/media/a'], result: { stdout: '', stderr: 'cannot set property for \'testpool/media/a\': permission denied', exitCode: 1 } },
+      { command: '/usr/sbin/zfs', args: ['set', '--', 'acltype=posixacl', 'xattr=sa', 'testpool/media/a'], result: { stdout: '', stderr: 'cannot set property for \'testpool/media/a\': permission denied', exitCode: 1 } },
     ])
     const res = await injectConfirmed(server, putMedia({ ...NAMED_RECURSIVE, owner: 'media' }))
     const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
@@ -730,7 +730,7 @@ describe('recursive apply — the confirm gate and child datasets (rulings 2026-
     assert.match(job.error!.message, /child dataset 'testpool\/media\/a' \(mounted at \/testpool\/media\/a\) — no permissions were changed/)
     assert.match(job.error!.message, /permission denied/)
     assert.equal(calls.some(c => PERMISSION_COMMANDS.includes(c.command)), false, 'no chown, chmod or setfacl ran')
-    assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set' && a[3] === 'testpool/media'), undefined, 'the target\'s own switch was not flipped either')
+    assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set' && a.at(-1) === 'testpool/media'), undefined, 'the target\'s own switch was not flipped either')
   })
 
   it('the child list cannot be read → the named recursive grant stops before changing anything', async () => {

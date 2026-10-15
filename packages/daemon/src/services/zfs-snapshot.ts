@@ -58,7 +58,8 @@ export function zfsSnapshotFullName(dataset: string, name: string): string {
 
 /** The `zfs snapshot [-r] [-o k=v]… <dataset>@<name>` argv. */
 export function createZfsSnapshotArgs(opts: ZfsSnapshotOptions): string[] {
-  return ['snapshot', ...(opts.recursive ? ['-r'] : []), ...propertyArgs(opts.properties), zfsSnapshotFullName(opts.dataset, opts.name)]
+  // cr.21: `--` ends option parsing before the snapshot operand (derived).
+  return ['snapshot', ...(opts.recursive ? ['-r'] : []), ...propertyArgs(opts.properties), '--', zfsSnapshotFullName(opts.dataset, opts.name)]
 }
 
 /**
@@ -68,12 +69,13 @@ export function createZfsSnapshotArgs(opts: ZfsSnapshotOptions): string[] {
  * exclude list keeps the same consistency guarantee as `-r`.
  */
 export function createZfsSnapshotsArgs(datasets: string[], name: string, properties?: Record<string, string>): string[] {
-  return ['snapshot', ...propertyArgs(properties), ...datasets.map(ds => zfsSnapshotFullName(ds, name))]
+  // cr.21: `--` ends option parsing; every snapshot operand is derived.
+  return ['snapshot', ...propertyArgs(properties), '--', ...datasets.map(ds => zfsSnapshotFullName(ds, name))]
 }
 
 /** `zfs list -H -o name -r -t filesystem,volume <dataset>` — the tree a recursive snapshot covers. */
 export function zfsTreeListArgs(dataset: string): string[] {
-  return ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', dataset]
+  return ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', '--', dataset]
 }
 
 /** Is `name` the dataset `root` itself or anywhere beneath it? */
@@ -138,7 +140,8 @@ export function sweepSet(schedule: SweepSchedule, descendants: string[]): string
 
 /** The `zfs destroy [-r] <dataset>@<name>` argv. */
 export function destroyZfsSnapshotArgs(opts: ZfsSnapshotOptions): string[] {
-  return ['destroy', ...(opts.recursive ? ['-r'] : []), zfsSnapshotFullName(opts.dataset, opts.name)]
+  // cr.21: `--` ends option parsing before the snapshot operand (derived).
+  return ['destroy', ...(opts.recursive ? ['-r'] : []), '--', zfsSnapshotFullName(opts.dataset, opts.name)]
 }
 
 /**

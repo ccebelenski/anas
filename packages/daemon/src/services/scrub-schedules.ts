@@ -63,12 +63,14 @@ export function parseZfsScrubEnabled(value: string): boolean {
 
 /** `zfs get -Hp -o value org.debian:periodic-scrub <pool>` argv. */
 export function zfsScrubGetArgs(pool: string): string[] {
-  return ['get', '-Hp', '-o', 'value', SCRUB_PROPERTY, pool]
+  // cr.21: `--` before the derived pool operand; the property stays an operand.
+  return ['get', '-Hp', '-o', 'value', SCRUB_PROPERTY, '--', pool]
 }
 
 /** `zfs set org.debian:periodic-scrub=<enable|disable> <pool>` argv. */
 export function zfsScrubSetArgs(pool: string, enabled: boolean): string[] {
-  return ['set', `${SCRUB_PROPERTY}=${enabled ? 'enable' : 'disable'}`, pool]
+  // cr.21: `--` ahead of every operand (the property VALUE is derived too).
+  return ['set', '--', `${SCRUB_PROPERTY}=${enabled ? 'enable' : 'disable'}`, pool]
 }
 
 /**

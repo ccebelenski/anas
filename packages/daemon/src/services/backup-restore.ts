@@ -72,7 +72,8 @@ const NO_SUCH_OBJECT_RE = /no such object/i
 
 /** `zfs get -Hp -o value volsize <dataset>` — the zvol target's exact size. */
 export function volsizeArgs(dataset: string): string[] {
-  return ['get', '-Hp', '-o', 'value', 'volsize', dataset]
+  // cr.21: `--` ends option parsing before the derived dataset operand.
+  return ['get', '-Hp', '-o', 'value', 'volsize', '--', dataset]
 }
 
 /**

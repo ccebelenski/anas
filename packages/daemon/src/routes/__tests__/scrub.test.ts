@@ -139,8 +139,8 @@ describe('periodic scrub routes — ZFS property (Epic 17.5)', () => {
     const mock = mockOf(server)
     mock.clearFixtures()
     mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['tank', 'rpool']), stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'org.debian:periodic-scrub', 'tank'], result: { stdout: '-\n', stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'org.debian:periodic-scrub', 'rpool'], result: { stdout: 'disable\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'org.debian:periodic-scrub', '--', 'tank'], result: { stdout: '-\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'org.debian:periodic-scrub', '--', 'rpool'], result: { stdout: 'disable\n', stderr: '', exitCode: 0 } })
     // zfs set + any other zfs: command-only success. AHR reads fail (unmocked) →
     // ahrPoolNames fail-opens to [] so GET returns only the ZFS pools.
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })

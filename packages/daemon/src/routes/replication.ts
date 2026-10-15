@@ -240,11 +240,13 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
 
     // Estimate the stream size for the resolved mode (full when diverged, so the
     // UI can show the honest byte cost even though it must not offer the run).
-    // The dry-run is always LOCAL — `zfs send -nvP` on the source side.
+    // The dry-run is always LOCAL — `zfs send -nvP` on the source side. cr.21:
+    // `--` ends option parsing, so the snapshot operand (derived) can never be
+    // read as a flag.
     const dryArgs = ['send', '-nvP']
     if (d.mode === 'incremental' && d.baseSnapshot)
       dryArgs.push('-i', `@${d.baseSnapshot}`)
-    dryArgs.push(`${source}@${snapName}`)
+    dryArgs.push('--', `${source}@${snapName}`)
     const dry = await executor.exec(ZFS, dryArgs)
     const estimatedBytes = parseSendDryRun(dry.stdout)
 
@@ -384,7 +386,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           const dryArgs = ['send', '-nvP']
           if (d.mode === 'incremental' && d.baseSnapshot)
             dryArgs.push('-i', `@${d.baseSnapshot}`)
-          dryArgs.push(srcSnapFull)
+          dryArgs.push('--', srcSnapFull)
           const dry = await executor.exec(ZFS, dryArgs)
           const bytesEstimated = parseSendDryRun(dry.stdout)
 
@@ -393,9 +395,11 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           //    must not re-set the property, which -o would reject. For a remote/
           //    peer target the recv side runs over ssh (`… | ssh <host> zfs recv`);
           //    for a local target it is a second local `zfs` process.
+          // cr.21: `--` ends zfs option parsing so srcSnapFull (derived) is
+          // always the positional source, never mistaken for a flag.
           const sendArgs = d.mode === 'incremental' && d.baseSnapshot
-            ? ['send', '-i', `@${d.baseSnapshot}`, srcSnapFull]
-            : ['send', srcSnapFull]
+            ? ['send', '-i', `@${d.baseSnapshot}`, '--', srcSnapFull]
+            : ['send', '--', srcSnapFull]
           // `--` ends zfs option parsing so `targetFull` is always the positional
           // filesystem, never mistaken for a flag (defence in depth; the schema
           // already restricts the dataset charset).

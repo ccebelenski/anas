@@ -371,11 +371,12 @@ export async function dashboardRoutes(
       catch { /* no pools */ }
 
       // The ~1s sampling window: `iostat ... 1 2` prints a since-boot sample,
-      // waits one second, prints the interval sample, then exits.
+      // waits one second, prints the interval sample, then exits. cr.21: `--`
+      // ends option parsing before the derived pool-name operands.
       let iostatText = ''
       if (poolNames.length > 0) {
         try {
-          const r = await executor.exec(ZPOOL, ['iostat', '-plv', ...poolNames, '1', '2'])
+          const r = await executor.exec(ZPOOL, ['iostat', '-plv', '--', ...poolNames, '1', '2'])
           if (r.exitCode === 0)
             iostatText = r.stdout
         }

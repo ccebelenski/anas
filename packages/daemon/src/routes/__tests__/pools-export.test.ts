@@ -217,7 +217,7 @@ describe('pools.r1 — export disables the pool boot-import unit (review M6 #22)
     mock.exec = async (command: string, args: string[]) => {
       // The mock inventory only knows testpool; give my-pool a listing and a
       // stable guid so the ident.1 gate passes.
-      if (command === '/usr/sbin/zpool' && args.join(' ') === 'get -H -o value guid my-pool')
+      if (command === '/usr/sbin/zpool' && args.join(' ') === 'get -H -o value guid -- my-pool')
         return { stdout: '17897551794000000001\n', stderr: '', exitCode: 0 }
       if (command === '/usr/sbin/zpool' && args.join(' ') === 'list -j') {
         const base = await orig(command, args)
@@ -253,7 +253,7 @@ describe('ident.1 — pool export binds the pool guid', () => {
     const calls: string[][] = []
     mock.exec = async (command: string, args: string[]) => {
       calls.push(args)
-      if (command === '/usr/sbin/zpool' && args.join(' ') === 'get -H -o value guid testpool') {
+      if (command === '/usr/sbin/zpool' && args.join(' ') === 'get -H -o value guid -- testpool') {
         const guid = guids.length > 1 ? guids.shift() : guids[0]
         return guid === null
           ? { stdout: '', stderr: 'cannot open \'testpool\': I/O error', exitCode: 1 }

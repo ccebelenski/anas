@@ -353,7 +353,8 @@ export function createAccessService(opts: AccessServiceOptions) {
 
   /** The dataset's `acltype` value (`off`, `posixacl`, …); '' if unreadable. */
   async function getAcltype(dataset: string): Promise<string> {
-    const r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'value', 'acltype', dataset])
+    // cr.21: `--` ends option parsing so `dataset` is always the operand.
+    const r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'value', 'acltype', '--', dataset])
     return r.exitCode === 0 ? r.stdout.trim() : ''
   }
 
@@ -385,7 +386,8 @@ export function createAccessService(opts: AccessServiceOptions) {
     if (!name.ok)
       return name
     const fullName = name.value
-    const r = await executor.exec(ZFS, ['get', '-j', 'all', fullName])
+    // cr.21: `--` ends option parsing so `fullName` is always the operand.
+    const r = await executor.exec(ZFS, ['get', '-j', 'all', '--', fullName])
     const parsed = r.exitCode === 0 && r.stdout.trim() ? parseDatasetGet(r.stdout, fullName) : null
     if (!parsed)
       return fail(404, 'NOT_FOUND', `Dataset '${fullName}' not found`)
@@ -530,7 +532,7 @@ export function createAccessService(opts: AccessServiceOptions) {
    * and is left out. Null when the list cannot be read.
    */
   async function childDatasetsUnder(dataset: string, dir: string): Promise<ChildDataset[] | null> {
-    const r = await executor.exec(ZFS, ['list', '-r', '-H', '-o', 'name,mountpoint,acltype', dataset])
+    const r = await executor.exec(ZFS, ['list', '-r', '-H', '-o', 'name,mountpoint,acltype', '--', dataset])
     if (r.exitCode !== 0)
       return null
     const children: ChildDataset[] = []
@@ -563,7 +565,8 @@ export function createAccessService(opts: AccessServiceOptions) {
       if (isPosixAcl(child.acltype))
         continue
       updateProgress(`zfs set acltype=posixacl xattr=sa ${child.name}`)
-      const r = await executor.exec(ZFS, ['set', 'acltype=posixacl', 'xattr=sa', child.name])
+      // cr.21: `--` ahead of every operand (the property VALUES are derived too).
+      const r = await executor.exec(ZFS, ['set', '--', 'acltype=posixacl', 'xattr=sa', child.name])
       if (r.exitCode !== 0) {
         const already = enabled.length > 0 ? ` POSIX ACLs were already switched on for ${enabled.join(', ')}.` : ''
         throw new Error(`Could not switch POSIX ACLs on for child dataset '${child.name}' (mounted at ${child.mountpoint}) — no permissions were changed.${already} ${r.stderr.trim() || `zfs set exited with code ${r.exitCode}`}`)
@@ -840,7 +843,7 @@ export function createAccessService(opts: AccessServiceOptions) {
       // only: a filesystem with native ACLs is always `enabled`.
       if (!enabled && aclDataset !== null) {
         updateProgress(`zfs set acltype=posixacl xattr=sa ${aclDataset}`)
-        const r = await executor.exec(ZFS, ['set', 'acltype=posixacl', 'xattr=sa', aclDataset])
+        const r = await executor.exec(ZFS, ['set', '--', 'acltype=posixacl', 'xattr=sa', aclDataset])
         if (r.exitCode !== 0)
           throw new Error(r.stderr.trim() || `zfs set acltype=posixacl exited with code ${r.exitCode}`)
       }

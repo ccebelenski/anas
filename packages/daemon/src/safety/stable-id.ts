@@ -82,13 +82,14 @@ async function readValue(executor: CommandExecutor, command: string, args: strin
 
 /** A pool's stable id: `zpool get -H -o value guid <pool>`. */
 export async function readPoolGuid(executor: CommandExecutor, pool: string): Promise<BoundId | null> {
-  const guid = await readValue(executor, ZPOOL, ['get', '-H', '-o', 'value', 'guid', pool])
+  // cr.21: `--` before the derived pool operand.
+  const guid = await readValue(executor, ZPOOL, ['get', '-H', '-o', 'value', 'guid', '--', pool])
   return guid ? { guid } : null
 }
 
 /** A dataset's stable id: `zfs get -H -o value guid <dataset>`. */
 export async function readDatasetGuid(executor: CommandExecutor, dataset: string): Promise<BoundId | null> {
-  const guid = await readValue(executor, ZFS, ['get', '-H', '-o', 'value', 'guid', dataset])
+  const guid = await readValue(executor, ZFS, ['get', '-H', '-o', 'value', 'guid', '--', dataset])
   return guid ? { guid } : null
 }
 
@@ -100,7 +101,7 @@ export async function readDatasetGuid(executor: CommandExecutor, dataset: string
  * when the list fails or the target is gone.
  */
 export async function readRollbackIds(executor: CommandExecutor, dataset: string, snapshot: string): Promise<BoundId | null> {
-  const r = await executor.exec(ZFS, ['list', '-t', 'snapshot', '-Hp', '-o', 'name,createtxg', '-d', '1', dataset])
+  const r = await executor.exec(ZFS, ['list', '-t', 'snapshot', '-Hp', '-o', 'name,createtxg', '-d', '1', '--', dataset])
   if (r.exitCode !== 0)
     return null
   let snapshotTxg: string | null = null

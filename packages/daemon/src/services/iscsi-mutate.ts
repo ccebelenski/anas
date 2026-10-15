@@ -932,7 +932,7 @@ export function resolveZvolBacking(
  * and the quarantine stays the safety net.
  */
 async function zfsDatasetMounted(executor: CommandExecutor, dataset: string): Promise<boolean | null> {
-  const r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'value', 'mounted', dataset])
+  const r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'value', 'mounted', '--', dataset])
   if (r.exitCode !== 0)
     return null
   const v = r.stdout.trim()
@@ -1332,7 +1332,7 @@ export function replayAttributes(
  * same behaviour as before this helper existed.
  */
 async function readVolblocksize(executor: CommandExecutor, dataset: string): Promise<number | null> {
-  const r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'value', 'volblocksize', dataset])
+  const r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'value', 'volblocksize', '--', dataset])
   if (r.exitCode !== 0)
     return null
   const n = Number.parseInt(r.stdout.trim(), 10)
@@ -1366,7 +1366,8 @@ export async function growZvolLun(
     report(opts, `Rounded volsize up to ${applied} bytes — a multiple of the ${bs}-byte volume block size (as 'zfs create' would)`)
   }
   report(opts, `Growing volume ${dataset} to ${applied} bytes`)
-  const r = await opts.executor.exec(ZFS, ['set', `volsize=${applied}`, dataset])
+  // cr.21: `--` ahead of every operand — the volsize VALUE is derived too.
+  const r = await opts.executor.exec(ZFS, ['set', '--', `volsize=${applied}`, dataset])
   if (r.exitCode !== 0)
     throw new Error(r.stderr.trim() || `zfs set volsize=${applied} ${dataset} exited with code ${r.exitCode}`)
   return applied
@@ -1484,7 +1485,7 @@ export async function deleteIscsiLun(
     if (lun.kind === 'zvol') {
       const dataset = lun.dataset ?? zvolDataset(lun.backingPath)
       report(opts, `Destroying volume ${dataset}`)
-      const r = await executor.exec(ZFS, ['destroy', dataset])
+      const r = await executor.exec(ZFS, ['destroy', '--', dataset])
       if (r.exitCode !== 0)
         throw new Error(r.stderr.trim() || `zfs destroy ${dataset} exited with code ${r.exitCode}`)
       backingDestroyed = dataset

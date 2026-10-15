@@ -204,12 +204,13 @@ export function createTransport(executor: CommandExecutor, config: TransportConf
   }
 
   async function remoteDatasetExists(resolved: ResolvedLocation, ds: string): Promise<boolean> {
-    const r = await sshExec(resolved, ['zfs', 'list', '-H', '-o', 'name', ds])
+    // cr.21: `--` before the ds operand, on the REMOTE zfs too.
+    const r = await sshExec(resolved, ['zfs', 'list', '-H', '-o', 'name', '--', ds])
     return r.exitCode === 0
   }
 
   async function remoteSnapshotNames(resolved: ResolvedLocation, ds: string): Promise<string[]> {
-    const r = await sshExec(resolved, ['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name,creation', ds])
+    const r = await sshExec(resolved, ['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name,creation', '--', ds])
     if (r.exitCode !== 0 || !r.stdout.trim())
       return []
     const names: string[] = []
@@ -225,15 +226,16 @@ export function createTransport(executor: CommandExecutor, config: TransportConf
   }
 
   async function remoteHold(resolved: ResolvedLocation, snapFull: string, tag: string): Promise<ExecResult> {
-    return sshExec(resolved, ['zfs', 'hold', tag, snapFull])
+    // cr.21: `--` ends option parsing for the remote hold too.
+    return sshExec(resolved, ['zfs', 'hold', '--', tag, snapFull])
   }
 
   async function remoteRelease(resolved: ResolvedLocation, snapFull: string, tag: string): Promise<ExecResult> {
-    return sshExec(resolved, ['zfs', 'release', tag, snapFull])
+    return sshExec(resolved, ['zfs', 'release', '--', tag, snapFull])
   }
 
   async function remoteHeldTags(resolved: ResolvedLocation, snapFull: string): Promise<string[]> {
-    const r = await sshExec(resolved, ['zfs', 'holds', '-H', snapFull])
+    const r = await sshExec(resolved, ['zfs', 'holds', '-H', '--', snapFull])
     if (r.exitCode !== 0 || !r.stdout.trim())
       return []
     return r.stdout.split('\n').filter(Boolean).map(l => l.split('\t')[1]).filter(Boolean)

@@ -102,13 +102,13 @@ describe('replication to a REMOTE target (Epic 5.5.2)', () => {
     // Local source state.
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson([SOURCE]), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs(SOURCE), result: { stdout: snapshotListJson(SOURCE, [SNAP]), stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['send', '-nvP', `${SOURCE}@${SNAP}`], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['hold', TAG, `${SOURCE}@${SNAP}`], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '--', `${SOURCE}@${SNAP}`], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['hold', '--', TAG, `${SOURCE}@${SNAP}`], result: { stdout: '', stderr: '', exitCode: 0 } })
     // Remote (ssh) state: pool exists, target dataset absent (→ full), holds ok.
     sshFix(mock, ['zpool', 'list', '-H', '-o', 'name'], { stdout: 'backup\n', stderr: '', exitCode: 0 })
-    sshFix(mock, ['zfs', 'list', '-H', '-o', 'name', TARGET], { stdout: '', stderr: 'dataset does not exist', exitCode: 1 })
-    sshFix(mock, ['zfs', 'hold', TAG, `${TARGET}@${SNAP}`], { stdout: '', stderr: '', exitCode: 0 })
-    sshFix(mock, ['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name,creation', TARGET], { stdout: '', stderr: '', exitCode: 0 })
+    sshFix(mock, ['zfs', 'list', '-H', '-o', 'name', '--', TARGET], { stdout: '', stderr: 'dataset does not exist', exitCode: 1 })
+    sshFix(mock, ['zfs', 'hold', '--', TAG, `${TARGET}@${SNAP}`], { stdout: '', stderr: '', exitCode: 0 })
+    sshFix(mock, ['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name,creation', '--', TARGET], { stdout: '', stderr: '', exitCode: 0 })
   })
 
   afterEach(async () => {
@@ -164,7 +164,7 @@ describe('replication to a REMOTE target (Epic 5.5.2)', () => {
     const call = mock.pipelineCalls[0]
     // Left (producer) is a LOCAL zfs send of the source snapshot.
     assert.equal(call.cmd1, ZFS)
-    assert.deepEqual(call.args1, ['send', `${SOURCE}@${SNAP}`])
+    assert.deepEqual(call.args1, ['send', '--', `${SOURCE}@${SNAP}`])
     // Right (consumer) is ssh into the remote running `zfs recv -o readonly=on`.
     const resolved = resolvedRemoteFields(paths, REMOTE.host, REMOTE.port, REMOTE.user)
     const expected = buildSshArgv(resolved, ['zfs', 'recv', '-o', 'readonly=on', '--', TARGET])

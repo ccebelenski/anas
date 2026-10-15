@@ -28,14 +28,14 @@ describe('zfs-snapshot — the single snapshot/destroy helper (backup2.3)', () =
   it('builds the exact argv the datasets route emitted: non-recursive', () => {
     assert.deepEqual(
       createZfsSnapshotArgs({ dataset: 'tank/media', name: 'nightly' }),
-      ['snapshot', 'tank/media@nightly'],
+      ['snapshot', '--', 'tank/media@nightly'],
     )
   })
 
   it('builds the exact argv the datasets route emitted: recursive', () => {
     assert.deepEqual(
       createZfsSnapshotArgs({ dataset: 'tank/media', name: 'nightly', recursive: true }),
-      ['snapshot', '-r', 'tank/media@nightly'],
+      ['snapshot', '-r', '--', 'tank/media@nightly'],
     )
   })
 
@@ -43,15 +43,15 @@ describe('zfs-snapshot — the single snapshot/destroy helper (backup2.3)', () =
     // `takeSnapshot` composed ['snapshot', ...(-r), '<ds>@<label>'] — identical.
     assert.deepEqual(
       createZfsSnapshotArgs({ dataset: 'tank', name: 'anas-daily-2026-07-26T142301Z', recursive: false }),
-      ['snapshot', 'tank@anas-daily-2026-07-26T142301Z'],
+      ['snapshot', '--', 'tank@anas-daily-2026-07-26T142301Z'],
     )
   })
 
   it('destroy is the same shape, with and without -r', () => {
-    assert.deepEqual(destroyZfsSnapshotArgs({ dataset: 'tank', name: 's1' }), ['destroy', 'tank@s1'])
+    assert.deepEqual(destroyZfsSnapshotArgs({ dataset: 'tank', name: 's1' }), ['destroy', '--', 'tank@s1'])
     assert.deepEqual(
       destroyZfsSnapshotArgs({ dataset: 'tank', name: 's1', recursive: true }),
-      ['destroy', '-r', 'tank@s1'],
+      ['destroy', '-r', '--', 'tank@s1'],
     )
   })
 
@@ -63,7 +63,7 @@ describe('zfs-snapshot — the single snapshot/destroy helper (backup2.3)', () =
     const mock = new MockExecutor()
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     await createZfsSnapshot(mock, { dataset: 'tank', name: 's1', recursive: true })
-    assert.deepEqual(mock.calls, [{ command: ZFS, args: ['snapshot', '-r', 'tank@s1'] }])
+    assert.deepEqual(mock.calls, [{ command: ZFS, args: ['snapshot', '-r', '--', 'tank@s1'] }])
   })
 
   it('throws the command\'s OWN stderr on failure (the routes\' long-standing text)', async () => {
@@ -153,12 +153,12 @@ describe('createZfsSnapshotsArgs / createZfsSnapshotExcluding (snapx.1)', () => 
   it('one snapshot verb, every name after it, no -r', () => {
     assert.deepEqual(
       createZfsSnapshotsArgs(['tank', 'tank/home'], 'anas-hourly-x'),
-      ['snapshot', 'tank@anas-hourly-x', 'tank/home@anas-hourly-x'],
+      ['snapshot', '--', 'tank@anas-hourly-x', 'tank/home@anas-hourly-x'],
     )
   })
 
   it('the tree listing is name-only, recursive, filesystems and volumes', () => {
-    assert.deepEqual(zfsTreeListArgs('tank'), ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'tank'])
+    assert.deepEqual(zfsTreeListArgs('tank'), ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', '--', 'tank'])
   })
 
   it('lists the tree then takes the remaining snapshots in ONE call', async () => {
@@ -171,7 +171,7 @@ describe('createZfsSnapshotsArgs / createZfsSnapshotExcluding (snapx.1)', () => 
     executor.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     const res = await createZfsSnapshotExcluding(executor, { dataset: 'tank', name: 'n', exclude: ['tank/media'] })
     assert.equal(executor.calls.length, 2)
-    assert.deepEqual(executor.calls[1], { command: ZFS, args: ['snapshot', 'tank@n', 'tank/home@n'] })
+    assert.deepEqual(executor.calls[1], { command: ZFS, args: ['snapshot', '--', 'tank@n', 'tank/home@n'] })
     assert.deepEqual(res.snapshots, ['tank@n', 'tank/home@n'])
   })
 
@@ -179,7 +179,7 @@ describe('createZfsSnapshotsArgs / createZfsSnapshotExcluding (snapx.1)', () => 
     const executor = new MockExecutor()
     executor.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     await createZfsSnapshotExcluding(executor, { dataset: 'tank', name: 'n', exclude: [] })
-    assert.deepEqual(executor.calls, [{ command: ZFS, args: ['snapshot', '-r', 'tank@n'] }])
+    assert.deepEqual(executor.calls, [{ command: ZFS, args: ['snapshot', '-r', '--', 'tank@n'] }])
   })
 
   it('a failed tree listing throws its stderr and takes nothing', async () => {

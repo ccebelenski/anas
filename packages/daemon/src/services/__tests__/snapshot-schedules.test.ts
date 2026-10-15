@@ -57,7 +57,7 @@ function mockExec(): MockExecutor {
   const orig = ex.exec.bind(ex)
   ex.exec = async (command, args, opts) => {
     if (command === ZFS && args[0] === 'get' && args.includes('anas:schedule')) {
-      const listArgs = ['list', '-t', 'snapshot', '-Hp', '-o', COLS, ...(args.includes('-r') ? ['-r'] : []), args.at(-1)!]
+      const listArgs = ['list', '-t', 'snapshot', '-Hp', '-o', COLS, ...(args.includes('-r') ? ['-r'] : []), '--', args.at(-1)!]
       const listed = await orig(command, listArgs, opts)
       ex.calls.pop() // the derivation's own list read is not a call the code under test made
       ex.calls.push({ command, args })
@@ -103,21 +103,21 @@ describe('takeSnapshot — uniform, dispatches by target.kind', () => {
     executor.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     const res = await takeSnapshot(executor, ZFS_TARGET, 'daily', { now: NOW })
     assert.deepEqual(res, { target: ZFS_TARGET, name: `anas-daily-${STAMP}`, bucket: 'daily' })
-    assert.deepEqual(executor.calls[0], { command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}`] })
+    assert.deepEqual(executor.calls[0], { command: ZFS, args: ['snapshot', '--', `tank/media@anas-daily-${STAMP}`] })
   })
 
   it('ZFS recursive adds -r', async () => {
     const executor = mockExec()
     executor.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     await takeSnapshot(executor, ZFS_TARGET, 'hourly', { now: NOW, recursive: true })
-    assert.deepEqual(executor.calls[0], { command: ZFS, args: ['snapshot', '-r', `tank/media@anas-hourly-${STAMP}`] })
+    assert.deepEqual(executor.calls[0], { command: ZFS, args: ['snapshot', '-r', '--', `tank/media@anas-hourly-${STAMP}`] })
   })
 
   it('ZFS recursive with exclude (snapx.1): zfs list the tree, then ONE zfs snapshot of the rest', async () => {
     const executor = mockExec()
     executor.addFixture({
       command: ZFS,
-      args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'tank/media'],
+      args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', '--', 'tank/media'],
       result: {
         stdout: ['tank/media', 'tank/media/movies', 'tank/media/scratch', 'tank/media/scratch/tmp', 'tank/media/tv'].join('\n'),
         stderr: '',
@@ -128,10 +128,10 @@ describe('takeSnapshot — uniform, dispatches by target.kind', () => {
     const res = await takeSnapshot(executor, ZFS_TARGET, 'hourly', { now: NOW, recursive: true, exclude: ['tank/media/scratch'] })
     assert.equal(res.name, `anas-hourly-${STAMP}`)
     assert.equal(executor.calls.length, 2)
-    assert.deepEqual(executor.calls[0], { command: ZFS, args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'tank/media'] })
+    assert.deepEqual(executor.calls[0], { command: ZFS, args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', '--', 'tank/media'] })
     assert.deepEqual(executor.calls[1], {
       command: ZFS,
-      args: ['snapshot', `tank/media@anas-hourly-${STAMP}`, `tank/media/movies@anas-hourly-${STAMP}`, `tank/media/tv@anas-hourly-${STAMP}`],
+      args: ['snapshot', '--', `tank/media@anas-hourly-${STAMP}`, `tank/media/movies@anas-hourly-${STAMP}`, `tank/media/tv@anas-hourly-${STAMP}`],
     })
   })
 
@@ -139,14 +139,14 @@ describe('takeSnapshot — uniform, dispatches by target.kind', () => {
     const executor = mockExec()
     executor.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     await takeSnapshot(executor, ZFS_TARGET, 'hourly', { now: NOW, recursive: true, exclude: [] })
-    assert.deepEqual(executor.calls, [{ command: ZFS, args: ['snapshot', '-r', `tank/media@anas-hourly-${STAMP}`] }])
+    assert.deepEqual(executor.calls, [{ command: ZFS, args: ['snapshot', '-r', '--', `tank/media@anas-hourly-${STAMP}`] }])
   })
 
   it('ZFS exclude without recursive is ignored by the service (the schema refuses it upstream)', async () => {
     const executor = mockExec()
     executor.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     await takeSnapshot(executor, ZFS_TARGET, 'hourly', { now: NOW, exclude: ['tank/media/scratch'] })
-    assert.deepEqual(executor.calls, [{ command: ZFS, args: ['snapshot', `tank/media@anas-hourly-${STAMP}`] }])
+    assert.deepEqual(executor.calls, [{ command: ZFS, args: ['snapshot', '--', `tank/media@anas-hourly-${STAMP}`] }])
   })
 
   it('ident.1: ZFS with a schedule id stamps -o anas:schedule=<id> in the same verb', async () => {
@@ -155,8 +155,8 @@ describe('takeSnapshot — uniform, dispatches by target.kind', () => {
     await takeSnapshot(executor, ZFS_TARGET, 'daily', { now: NOW, scheduleId: 'daily-media' })
     await takeSnapshot(executor, ZFS_TARGET, 'hourly', { now: NOW, recursive: true, scheduleId: 'hourly-tank' })
     assert.deepEqual(executor.calls, [
-      { command: ZFS, args: ['snapshot', '-o', 'anas:schedule=daily-media', `tank/media@anas-daily-${STAMP}`] },
-      { command: ZFS, args: ['snapshot', '-r', '-o', 'anas:schedule=hourly-tank', `tank/media@anas-hourly-${STAMP}`] },
+      { command: ZFS, args: ['snapshot', '-o', 'anas:schedule=daily-media', '--', `tank/media@anas-daily-${STAMP}`] },
+      { command: ZFS, args: ['snapshot', '-r', '-o', 'anas:schedule=hourly-tank', '--', `tank/media@anas-hourly-${STAMP}`] },
     ])
   })
 
@@ -164,14 +164,14 @@ describe('takeSnapshot — uniform, dispatches by target.kind', () => {
     const executor = mockExec()
     executor.addFixture({
       command: ZFS,
-      args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'tank/media'],
+      args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', '--', 'tank/media'],
       result: { stdout: ['tank/media', 'tank/media/movies', 'tank/media/scratch'].join('\n'), stderr: '', exitCode: 0 },
     })
     executor.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     await takeSnapshot(executor, ZFS_TARGET, 'hourly', { now: NOW, recursive: true, exclude: ['tank/media/scratch'], scheduleId: 'h' })
     assert.deepEqual(executor.calls[1], {
       command: ZFS,
-      args: ['snapshot', '-o', 'anas:schedule=h', `tank/media@anas-hourly-${STAMP}`, `tank/media/movies@anas-hourly-${STAMP}`],
+      args: ['snapshot', '-o', 'anas:schedule=h', '--', `tank/media@anas-hourly-${STAMP}`, `tank/media/movies@anas-hourly-${STAMP}`],
     })
   })
 
@@ -333,7 +333,7 @@ describe('listScheduledSnapshots — uniform inventory', () => {
     const executor = mockExec()
     executor.addFixture({
       command: ZFS,
-      args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, 'tank/media'],
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '--', 'tank/media'],
       result: { stdout: 'tank/media@anas-hourly-2026-07-26T140000Z\t1769436000\t0\t9\th\n', stderr: '', exitCode: 0 },
     })
     const snaps = await listScheduledSnapshots(executor, ZFS_TARGET)
@@ -399,7 +399,7 @@ describe('pruneZfsSchedule (non-recursive) — ZFS held-skip + source-filter', (
   it('destroys over-retention anas snapshots, SKIPS the held one, leaves manual untouched', async () => {
     const executor = mockExec()
     // Inventory: 3 anas dailies (one held) + a manual non-anas snapshot.
-    const listArgs = ['list', '-t', 'snapshot', '-Hp', '-o', COLS, 'tank/media']
+    const listArgs = ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '--', 'tank/media']
     executor.addFixture({ command: ZFS, args: listArgs, result: {
       stdout: [
         'tank/media@anas-daily-2026-07-26T000000Z\t1769385600\t0\t30\tdaily-media', // newest — kept
@@ -413,10 +413,10 @@ describe('pruneZfsSchedule (non-recursive) — ZFS held-skip + source-filter', (
     // The belt-and-suspenders per-snapshot userrefs re-check: the 25th is unheld.
     executor.addFixture({
       command: ZFS,
-      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'userrefs', 'tank/media@anas-daily-2026-07-25T000000Z'],
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'userrefs', '--', 'tank/media@anas-daily-2026-07-25T000000Z'],
       result: { stdout: '0\n', stderr: '', exitCode: 0 },
     })
-    executor.addFixture({ command: ZFS, args: ['destroy', 'tank/media@anas-daily-2026-07-25T000000Z'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: ZFS, args: ['destroy', '--', 'tank/media@anas-daily-2026-07-25T000000Z'], result: { stdout: '', stderr: '', exitCode: 0 } })
 
     const res = await pruneZfsSchedule(executor, flatSched(), { others: ALONE, now: NOW })
 
@@ -427,7 +427,7 @@ describe('pruneZfsSchedule (non-recursive) — ZFS held-skip + source-filter', (
     // Only ONE destroy call, and it was NOT the held one or the manual one.
     const destroys = executor.calls.filter(c => c.command === ZFS && c.args[0] === 'destroy')
     assert.equal(destroys.length, 1)
-    assert.deepEqual(destroys[0].args, ['destroy', 'tank/media@anas-daily-2026-07-25T000000Z'])
+    assert.deepEqual(destroys[0].args, ['destroy', '--', 'tank/media@anas-daily-2026-07-25T000000Z'])
     // A non-recursive inventory is the dataset alone (no -r).
     assert.ok(executor.calls.some(c => c.args.join(' ') === listArgs.join(' ')))
     // One dataset, nothing noted: the result carries no per-dataset list.
@@ -437,7 +437,7 @@ describe('pruneZfsSchedule (non-recursive) — ZFS held-skip + source-filter', (
 
   it('a hold taken AFTER the inventory read is caught by the re-check and NOT destroyed', async () => {
     const executor = mockExec()
-    const listArgs = ['list', '-t', 'snapshot', '-Hp', '-o', COLS, 'tank/media']
+    const listArgs = ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '--', 'tank/media']
     executor.addFixture({ command: ZFS, args: listArgs, result: {
       stdout: [
         'tank/media@anas-daily-2026-07-26T000000Z\t1769385600\t0\t30\tdaily-media',
@@ -449,7 +449,7 @@ describe('pruneZfsSchedule (non-recursive) — ZFS held-skip + source-filter', (
     // But by destroy time it is now held (userrefs=1) — the race the re-check guards.
     executor.addFixture({
       command: ZFS,
-      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'userrefs', 'tank/media@anas-daily-2026-07-25T000000Z'],
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'userrefs', '--', 'tank/media@anas-daily-2026-07-25T000000Z'],
       result: { stdout: '1\n', stderr: '', exitCode: 0 },
     })
     const res = await pruneZfsSchedule(executor, flatSched(), { others: ALONE, now: NOW })
@@ -663,13 +663,13 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     const executor = mockExec()
     executor.addFixture({
       command: ZFS,
-      args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '-r', 'tank'],
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '-r', '--', 'tank'],
       result: { stdout, stderr: '', exitCode: 0 },
     })
     for (const full of refuse) {
       executor.addFixture({
         command: ZFS,
-        args: ['destroy', full],
+        args: ['destroy', '--', full],
         result: { stdout: '', stderr: `cannot destroy '${full}': snapshot has dependent clones\nuse '-R' to destroy the following datasets:`, exitCode: 1 },
       })
     }
@@ -787,13 +787,13 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     const executor = mockExec()
     executor.addFixture({
       command: ZFS,
-      args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '-r', 'tank'],
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '-r', '--', 'tank'],
       result: { stdout: tree(['tank', 'tank/media']), stderr: '', exitCode: 0 },
     })
     // tank/media@H1 got held between the read and the destroy.
     executor.addFixture({
       command: ZFS,
-      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'userrefs', `tank/media@${H1}`],
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'userrefs', '--', `tank/media@${H1}`],
       result: { stdout: '1\n', stderr: '', exitCode: 0 },
     })
     executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
@@ -805,12 +805,12 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     })
     const destroys = executor.calls.filter(c => c.args[0] === 'destroy').map(c => c.args)
     assert.deepEqual(destroys.map(d => d.join(' ')).sort(), [
-      `destroy tank/media@${H2}`,
-      `destroy tank@${H1}`,
-      `destroy tank@${H2}`,
+      `destroy -- tank/media@${H2}`,
+      `destroy -- tank@${H1}`,
+      `destroy -- tank@${H2}`,
     ])
     assert.equal(destroys.length, 3)
-    assert.ok(destroys.every(d => d.length === 2), 'one snapshot per destroy, never -r')
+    assert.ok(destroys.every(d => d.length === 3), 'one snapshot per destroy, never -r')
     const media = res.datasets.find(d => d.dataset === 'tank/media')!
     assert.equal(media.pruned.length, 1)
     assert.deepEqual(media.skippedHeld.map(s => s.name), [H1])
@@ -920,13 +920,13 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     const executor = mockExec()
     executor.addFixture({
       command: ZFS,
-      args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '-r', 'tank'],
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '-r', '--', 'tank'],
       result: { stdout: tree(['tank', 'tank/guests']), stderr: '', exitCode: 0 },
     })
     for (const label of [H1, H2]) {
       executor.addFixture({
         command: ZFS,
-        args: ['destroy', `tank/guests@${label}`],
+        args: ['destroy', '--', `tank/guests@${label}`],
         result: { stdout: '', stderr: `cannot destroy 'tank/guests@${label}': snapshot has dependent clones`, exitCode: 1 },
       })
     }
@@ -949,12 +949,12 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     const executor = mockExec()
     executor.addFixture({
       command: ZFS,
-      args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '-r', 'tank'],
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '-r', '--', 'tank'],
       result: { stdout, stderr: '', exitCode: 0 },
     })
     for (const full of gone) {
       // The re-check of a vanished snapshot fails (not held) …
-      executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', 'userrefs', full], result: { stdout: '', stderr: `cannot open '${full}': dataset does not exist`, exitCode: 1 } })
+      executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', 'userrefs', '--', full], result: { stdout: '', stderr: `cannot open '${full}': dataset does not exist`, exitCode: 1 } })
       // … and the destroy answers the way OpenZFS 2.4 does (verified on the stunt node).
       executor.addFixture({ command: ZFS, args: ['destroy', full], result: { stdout: '', stderr: 'could not find any snapshots to destroy; check snapshot names.\n', exitCode: 1 } })
     }
@@ -982,24 +982,24 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
 
   it('C3: an already-gone destroy on a NON-recursive prune counts as pruned', async () => {
     const executor = mockExec()
-    executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, 'tank/media'], result: {
+    executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '--', 'tank/media'], result: {
       stdout: [`tank/media@${H1}\t1769385600\t0\t1\thourly-media`, `tank/media@${H2}\t1769389200\t0\t2\thourly-media`].join('\n'),
       stderr: '',
       exitCode: 0,
     } })
-    executor.addFixture({ command: ZFS, args: ['destroy', `tank/media@${H1}`], result: { stdout: '', stderr: 'could not find any snapshots to destroy; check snapshot names.\n', exitCode: 1 } })
+    executor.addFixture({ command: ZFS, args: ['destroy', '--', `tank/media@${H1}`], result: { stdout: '', stderr: 'could not find any snapshots to destroy; check snapshot names.\n', exitCode: 1 } })
     executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
     const res = await pruneZfsSchedule(executor, flatSched({ id: 'hourly-media', cadence: 'hourly', retention: { hourly: 1 } }), { others: ALONE, now: PRUNE_NOW })
     assert.deepEqual(res.pruned.map(s => s.name), [H1])
   })
   it('C3: any OTHER destroy failure on the target still fails the run', async () => {
     const executor = mockExec()
-    executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, 'tank/media'], result: {
+    executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '--', 'tank/media'], result: {
       stdout: [`tank/media@${H1}\t1769385600\t0\t1\thourly-media`, `tank/media@${H2}\t1769389200\t0\t2\thourly-media`].join('\n'),
       stderr: '',
       exitCode: 0,
     } })
-    executor.addFixture({ command: ZFS, args: ['destroy', `tank/media@${H1}`], result: { stdout: '', stderr: 'cannot destroy snapshot: dataset is busy', exitCode: 1 } })
+    executor.addFixture({ command: ZFS, args: ['destroy', '--', `tank/media@${H1}`], result: { stdout: '', stderr: 'cannot destroy snapshot: dataset is busy', exitCode: 1 } })
     executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
     await assert.rejects(() => pruneZfsSchedule(executor, flatSched({ id: 'hourly-media', cadence: 'hourly', retention: { hourly: 1 } }), { others: ALONE, now: PRUNE_NOW }), /dataset is busy/)
   })
@@ -1053,7 +1053,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     const child = flatSched({ id: 'hourly-media', cadence: 'hourly', retention: { hourly: 24 } })
     const parent = sched({ id: 'daily-tank', cadence: 'daily', retention: { daily: 7 } })
     const executor = mockExec()
-    executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, 'tank/media'], result: {
+    executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', COLS, '--', 'tank/media'], result: {
       stdout: [
         `tank/media@${D1}\t1769385600\t0\t1\t-`,
         `tank/media@${D2}\t1769385600\t0\t2\tdaily-tank`,
@@ -1116,9 +1116,9 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     // Through the executor: the stamp source is read with zfs get, and the received one is never destroyed.
     const ex = armRefusing(stdout, [])
     const res = await pruneZfsSchedule(ex, sched(), { others: { schedules: [], complete: true }, now: PRUNE_NOW })
-    assert.ok(ex.calls.some(c => c.args.join(' ') === 'get -Hp -t snapshot -r -o name,value,source anas:schedule tank'))
-    assert.ok(!ex.calls.some(c => c.args.join(' ') === `destroy tank/a@${H1}`))
-    assert.ok(ex.calls.some(c => c.args.join(' ') === `destroy tank/a@${H2}`))
+    assert.ok(ex.calls.some(c => c.args.join(' ') === 'get -Hp -t snapshot -r -o name,value,source anas:schedule -- tank'))
+    assert.ok(!ex.calls.some(c => c.args.join(' ') === `destroy -- tank/a@${H1}`))
+    assert.ok(ex.calls.some(c => c.args.join(' ') === `destroy -- tank/a@${H2}`))
     assert.equal(res.datasets.find(d => d.dataset === 'tank/a')?.note, '1 left: received')
   })
 

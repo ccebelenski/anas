@@ -43,22 +43,22 @@ function holdsText(holds: Record<string, string[]>): string {
 function wire(opts: { failHold?: string } = {}): MockExecutor {
   const mock = new MockExecutor()
   if (opts.failHold)
-    mock.addFixture({ command: ZFS, args: ['hold', ...opts.failHold.split(' ')], result: { stdout: '', stderr: 'cannot hold: permission denied', exitCode: 1 } })
+    mock.addFixture({ command: ZFS, args: ['hold', '--', ...opts.failHold.split(' ')], result: { stdout: '', stderr: 'cannot hold: permission denied', exitCode: 1 } })
   return mock
 }
 
 /** `zfs holds -H <snap…>` for exactly this snapshot list. */
 function holdsFixture(mock: MockExecutor, snapFulls: string[], holds: Record<string, string[]>): void {
-  mock.addFixture({ command: ZFS, args: ['holds', '-H', ...snapFulls], result: { stdout: holdsText(holds), stderr: '', exitCode: 0 } })
+  mock.addFixture({ command: ZFS, args: ['holds', '-H', '--', ...snapFulls], result: { stdout: holdsText(holds), stderr: '', exitCode: 0 } })
 }
 
 function okZfs(mock: MockExecutor): void {
   mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
 }
 
-/** The (verb, tag, snapshot) triples of every hold/release issued. */
+/** The (verb, tag, snapshot) triples of every hold/release issued (the `--` separator sits between verb and tag). */
 function verbs(mock: MockExecutor, verb: 'hold' | 'release'): string[] {
-  return mock.calls.filter(c => c.command === ZFS && c.args[0] === verb).map(c => `${c.args[1]} ${c.args[2]}`)
+  return mock.calls.filter(c => c.command === ZFS && c.args[0] === verb).map(c => `${c.args[2]} ${c.args[3]}`)
 }
 
 describe('replicationHoldTag', () => {
@@ -116,7 +116,7 @@ describe('settleReplicationHolds', () => {
       target: { dataset: TGT_A, snapshotNames: ['s2', 's3'] },
       releaseLegacyOnSource: true,
     })
-    const order = mock.calls.filter(c => c.command === ZFS && (c.args[0] === 'hold' || c.args[0] === 'release')).map(c => `${c.args[0]} ${c.args[1]} ${c.args[2]}`)
+    const order = mock.calls.filter(c => c.command === ZFS && (c.args[0] === 'hold' || c.args[0] === 'release')).map(c => `${c.args[0]} ${c.args[2]} ${c.args[3]}`)
     assert.deepEqual(order, [
       `hold ${TAG_A} ${SRC}@s3`,
       `hold ${TAG_A} ${TGT_A}@s3`,

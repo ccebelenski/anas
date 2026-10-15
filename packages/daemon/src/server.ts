@@ -186,7 +186,7 @@ export function createServer(opts?: ServerOptions) {
     // re-read in the job), and the ZFS label every member leaf carries — `blkid
     // -p` reports a zfs_member's pool guid as UUID; the cleanup wipes a leaf
     // only when it matches.
-    mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'value', 'guid', 'testpool'], result: { stdout: '5823146802312415237\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'value', 'guid', '--', 'testpool'], result: { stdout: '5823146802312415237\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/blkid', result: { stdout: '5823146802312415237\n', stderr: '', exitCode: 0 } })
     // Import scan (story 3.7): `zpool import` with no args lists one pool.
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['import'], result: {
@@ -235,9 +235,9 @@ export function createServer(opts?: ServerOptions) {
     // snapshot createtxgs a rollback confirm binds (snap1 120, snap2 240 — the
     // same txgs the detail fixture above carries).
     for (const [ds, guid] of [['testpool', '5823146802312415237'], ['testpool/media', '11406370120451780214'], ['testpool/vm-100-disk-0', '2907345152280611930']]) {
-      mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-H', '-o', 'value', 'guid', ds], result: { stdout: `${guid}\n`, stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-H', '-o', 'value', 'guid', '--', ds], result: { stdout: `${guid}\n`, stderr: '', exitCode: 0 } })
     }
-    mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,createtxg', '-d', '1', 'testpool/media'], result: {
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,createtxg', '-d', '1', '--', 'testpool/media'], result: {
       stdout: 'testpool/media@snap1\t120\ntestpool/media@snap2\t240\n',
       stderr: '',
       exitCode: 0,
@@ -405,7 +405,7 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/bin/systemctl', args: ['is-active', 'smbd'], result: { stdout: 'active\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/systemctl', args: ['is-active', 'nfs-server'], result: { stdout: 'active\n', stderr: '', exitCode: 0 } })
     // Live per-pool/disk I/O sample for GET /v1/telemetry (two-sample window).
-    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', 'testpool', '1', '2'], result: mockFixtures.zpoolIostat() })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', '--', 'testpool', '1', '2'], result: mockFixtures.zpoolIostat() })
 
     // --- Epic 7: NFS exports ---------------------------------------------
     // `exportfs -ra` reloads the kernel export table after each mutation.

@@ -282,7 +282,7 @@ describe('shareAvailableBytes — the cap suggestion\'s input (smbsvc.3)', () =>
   it('the ZFS dataset\'s `available`, read with -Hp', async () => {
     const mock = new MockExecutor()
     addZfsFootprintFixtures(mock, 'testpool\t/testpool\ntestpool/media\t/testpool/media\n')
-    mock.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'available', 'testpool/media'], result: { stdout: '1099511627776\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'available', '--', 'testpool/media'], result: { stdout: '1099511627776\n', stderr: '', exitCode: 0 } })
     assert.equal(await shareAvailableBytes(mock, '/testpool/media/sub'), 1_099_511_627_776)
   })
 
@@ -302,12 +302,12 @@ describe('shareAvailableBytes — the cap suggestion\'s input (smbsvc.3)', () =>
 
     const failRead = new MockExecutor()
     addZfsFootprintFixtures(failRead, 'testpool\t/testpool\ntestpool/media\t/testpool/media\n')
-    failRead.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'available', 'testpool/media'], result: { stdout: '', stderr: 'dataset gone', exitCode: 1 } })
+    failRead.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'available', '--', 'testpool/media'], result: { stdout: '', stderr: 'dataset gone', exitCode: 1 } })
     assert.equal(await shareAvailableBytes(failRead, '/testpool/media'), undefined, 'failed read → undefined')
 
     const garbage = new MockExecutor()
     addZfsFootprintFixtures(garbage, 'testpool\t/testpool\ntestpool/media\t/testpool/media\n')
-    garbage.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'available', 'testpool/media'], result: { stdout: 'not-a-number\n', stderr: '', exitCode: 0 } })
+    garbage.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'available', '--', 'testpool/media'], result: { stdout: 'not-a-number\n', stderr: '', exitCode: 0 } })
     assert.equal(await shareAvailableBytes(garbage, '/testpool/media'), undefined, 'unparseable → undefined')
   })
 })

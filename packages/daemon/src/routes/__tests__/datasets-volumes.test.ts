@@ -137,9 +137,9 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       if (command === '/usr/sbin/zfs' && sameArgs(args, zfsSnapshotDetailArgs(VOL)))
         return { stdout: VOL_SNAPSHOTS, stderr: '', exitCode: 0 }
       // ident.1: the guid a destroy confirm binds, the txgs a rollback binds.
-      if (command === '/usr/sbin/zfs' && sameArgs(args, ['get', '-H', '-o', 'value', 'guid', VOL]))
+      if (command === '/usr/sbin/zfs' && sameArgs(args, ['get', '-H', '-o', 'value', 'guid', '--', VOL]))
         return { stdout: '8812\n', stderr: '', exitCode: 0 }
-      if (command === '/usr/sbin/zfs' && sameArgs(args, ['list', '-t', 'snapshot', '-Hp', '-o', 'name,createtxg', '-d', '1', VOL]))
+      if (command === '/usr/sbin/zfs' && sameArgs(args, ['list', '-t', 'snapshot', '-Hp', '-o', 'name,createtxg', '-d', '1', '--', VOL]))
         return { stdout: `${VOL}@before-grow\t11\n`, stderr: '', exitCode: 0 }
       return orig(command, args)
     }
@@ -686,7 +686,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       })
       assert.equal(res.statusCode, 202)
       await waitForJob(server, (res.json() as JobAccepted).job.id)
-      assert.deepEqual(zfsCalls().find(a => a[0] === 'snapshot'), ['snapshot', `${VOL}@nightly`])
+      assert.deepEqual(zfsCalls().find(a => a[0] === 'snapshot'), ['snapshot', '--', `${VOL}@nightly`])
     })
 
     it('rolls a volume back — through the gate, which lets it through TODAY', async () => {

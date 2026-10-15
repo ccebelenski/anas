@@ -220,7 +220,8 @@ export interface TransientSweepOptions {
 
 /** `zfs list` argv for a dataset's own snapshot labels (direct, machine-parsable). */
 export function zfsTransientListArgs(dataset: string): string[] {
-  return ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', dataset]
+  // cr.21: `--` ends option parsing before the dataset operand.
+  return ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', '--', dataset]
 }
 
 /**

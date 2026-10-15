@@ -894,7 +894,7 @@ describe('backup routes (Epic 16)', () => {
     const mock = mockOf(server)
     mock.addFixture({
       command: ZFS_BIN,
-      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', 'mnttest'],
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', '--', 'mnttest'],
       result: { stdout: listStdout, stderr: '', exitCode: 0 },
     })
     mock.addFixture({ command: ZFS_BIN, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -938,11 +938,11 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(snapshots.length, 1, JSON.stringify(snapshots))
     // ALWAYS -r: a child dataset is a separate filesystem and needs its own label.
     assert.equal(snapshots[0][1], '-r')
-    assert.match(snapshots[0][2], /^mnttest@anas-backup-snap-zfs-\d+$/)
-    const label = snapshots[0][2].split('@')[1]
+    assert.match(snapshots[0].at(-1)!, /^mnttest@anas-backup-snap-zfs-\d+$/)
+    const label = snapshots[0].at(-1)!.split('@')[1]
 
     // Destroyed in the `finally`, recursively, matching how it was taken.
-    assert.deepEqual(zfsArgs(mock, 'destroy'), [['destroy', '-r', `mnttest@${label}`]])
+    assert.deepEqual(zfsArgs(mock, 'destroy'), [['destroy', '-r', '--', `mnttest@${label}`]])
 
     // GT-51: reachable with the default `snapdir=hidden` — no property is set.
     assert.equal(mock.calls.filter(c => c.command === ZFS_BIN && c.args[0] === 'set').length, 0)
@@ -1044,7 +1044,7 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(job.status, 'completed')
 
     const args = pbcArgs(mock)
-    const label = zfsArgs(mock, 'snapshot')[0][2].split('@')[1]
+    const label = zfsArgs(mock, 'snapshot')[0].at(-1)!.split('@')[1]
     assert.deepEqual(archiveTokens(args), [
       `pool.pxar:/mnttest/.zfs/snapshot/${label}`,
       `pool__data.pxar:/mnttest/data/.zfs/snapshot/${label}`,
@@ -1093,7 +1093,7 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(job.status, 'completed')
 
     const args = pbcArgs(mock)
-    const label = zfsArgs(mock, 'snapshot')[0][2].split('@')[1]
+    const label = zfsArgs(mock, 'snapshot')[0].at(-1)!.split('@')[1]
     assert.deepEqual(archiveTokens(args), [
       `pool.pxar:/mnttest/.zfs/snapshot/${label}`,
       `pool__data.pxar:/mnttest/data/.zfs/snapshot/${label}`,
@@ -1140,12 +1140,12 @@ describe('backup routes (Epic 16)', () => {
     })
     assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
 
-    const label = zfsArgs(mock, 'snapshot')[0][2].split('@')[1]
+    const label = zfsArgs(mock, 'snapshot')[0].at(-1)!.split('@')[1]
     assert.deepEqual(zfsArgs(mock, 'destroy'), [
-      ['destroy', '-r', 'mnttest@anas-backup-snap-sweep-1000000000'],
-      ['destroy', '-r', 'mnttest@anas-backup-snap-sweep-1000000000__photos'],
+      ['destroy', '-r', '--', 'mnttest@anas-backup-snap-sweep-1000000000'],
+      ['destroy', '-r', '--', 'mnttest@anas-backup-snap-sweep-1000000000__photos'],
       // and this run's own, in the `finally`
-      ['destroy', '-r', `mnttest@${label}`],
+      ['destroy', '-r', '--', `mnttest@${label}`],
     ])
   })
 
@@ -1331,12 +1331,12 @@ describe('backup routes (Epic 16)', () => {
     // The sweep list for the VOLUME, and the snapdev property read.
     mock.addFixture({
       command: ZFS_BIN,
-      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', 'mnttest/vol1'],
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', '--', 'mnttest/vol1'],
       result: { stdout: '', stderr: '', exitCode: 0 },
     })
     mock.addFixture({
       command: ZFS_BIN,
-      args: ['get', '-Hp', '-o', 'name,value,source', 'snapdev', 'mnttest/vol1'],
+      args: ['get', '-Hp', '-o', 'name,value,source', 'snapdev', '--', 'mnttest/vol1'],
       result: { stdout: 'mnttest/vol1\thidden\tdefault\n', stderr: '', exitCode: 0 },
     })
     mock.addFixture({ command: ZFS_BIN, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -1359,12 +1359,12 @@ describe('backup routes (Epic 16)', () => {
     assert.match(job.error?.message ?? '', /never appeared/)
     const verbs = [...zfsArgs(mock, 'set'), ...zfsArgs(mock, 'inherit')]
     assert.deepEqual(verbs, [
-      ['set', 'snapdev=visible', 'mnttest/vol1'],
-      ['inherit', 'snapdev', 'mnttest/vol1'],
+      ['set', '--', 'snapdev=visible', 'mnttest/vol1'],
+      ['inherit', 'snapdev', '--', 'mnttest/vol1'],
     ])
     // And the transient snapshot the run took is destroyed all the same.
     assert.ok(
-      zfsArgs(mock, 'destroy').some(a => a[2]?.startsWith('mnttest/vol1@anas-backup-nightly-lun-')),
+      zfsArgs(mock, 'destroy').some(a => a.at(-1)?.startsWith('mnttest/vol1@anas-backup-nightly-lun-')),
       JSON.stringify(zfsArgs(mock, 'destroy')),
     )
   })

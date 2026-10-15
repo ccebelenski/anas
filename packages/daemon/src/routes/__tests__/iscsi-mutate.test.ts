@@ -1386,7 +1386,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       const job = await waitForJob(second.body.job!.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
       assert.equal((job.result as { backingDestroyed?: string | null }).backingDestroyed, 'tank/vol1')
-      assert.ok(mockOf().calls.some(c => c.command === ZFS && c.args[0] === 'destroy' && c.args[1] === 'tank/vol1'), JSON.stringify(mockOf().calls))
+      assert.ok(mockOf().calls.some(c => c.command === ZFS && c.args[0] === 'destroy' && c.args.at(-1) === 'tank/vol1'), JSON.stringify(mockOf().calls))
     })
 
     // M5: the job runs a PLAIN `zfs destroy` (no `-r`), which refuses a volume
@@ -1448,7 +1448,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
       // Still a PLAIN destroy: the fix is a pre-check, NOT a silent `-r`.
       const destroy = mock.calls.find(c => c.command === ZFS && c.args[0] === 'destroy')
-      assert.deepEqual(destroy?.args, ['destroy', 'tank/vol1'])
+      assert.deepEqual(destroy?.args, ['destroy', '--', 'tank/vol1'])
     })
 
     it('a wrong code 409s again — a fresh challenge, and nothing has run', async () => {

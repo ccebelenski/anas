@@ -157,7 +157,7 @@ describe('transient snapshot lifecycle (backup2.3)', () => {
     const mock = new MockExecutor()
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     const taken = await takeZfsTransient(mock, 'tank/media', LABEL)
-    assert.deepEqual(mock.calls, [{ command: ZFS, args: ['snapshot', '-r', `tank/media@${LABEL}`] }])
+    assert.deepEqual(mock.calls, [{ command: ZFS, args: ['snapshot', '-r', '--', `tank/media@${LABEL}`] }])
     assert.equal(taken.recursive, true)
     assert.equal(taken.full, `tank/media@${LABEL}`)
     assert.equal(taken.backend, 'zfs')
@@ -169,7 +169,7 @@ describe('transient snapshot lifecycle (backup2.3)', () => {
     const mock = new MockExecutor()
     mock.addFixture({
       command: ZFS,
-      args: ['snapshot', '-r', `tank/media@${LABEL}`],
+      args: ['snapshot', '-r', '--', `tank/media@${LABEL}`],
       results: [
         // First take: a crashed run of THIS task died in the same wall-clock
         // second, so the label is already there. (The proven zfs wording.)
@@ -181,7 +181,7 @@ describe('transient snapshot lifecycle (backup2.3)', () => {
     })
     mock.addFixture({
       command: ZFS,
-      args: ['destroy', '-r', `tank/media@${LABEL}`],
+      args: ['destroy', '-r', '--', `tank/media@${LABEL}`],
       result: { stdout: '', stderr: '', exitCode: 0 },
     })
     return mock
@@ -192,9 +192,9 @@ describe('transient snapshot lifecycle (backup2.3)', () => {
     const taken = await takeZfsTransient(mock, 'tank/media', LABEL)
     assert.equal(taken.full, `tank/media@${LABEL}`)
     assert.deepEqual(mock.calls.map(c => c.args), [
-      ['snapshot', '-r', `tank/media@${LABEL}`],
-      ['destroy', '-r', `tank/media@${LABEL}`],
-      ['snapshot', '-r', `tank/media@${LABEL}`],
+      ['snapshot', '-r', '--', `tank/media@${LABEL}`],
+      ['destroy', '-r', '--', `tank/media@${LABEL}`],
+      ['snapshot', '-r', '--', `tank/media@${LABEL}`],
     ])
   })
 
@@ -227,8 +227,8 @@ describe('transient snapshot lifecycle (backup2.3)', () => {
     ])
     assert.deepEqual(warnings, [])
     assert.deepEqual(mock.calls.map(c => c.args), [
-      ['destroy', '-r', `tank/b@${LABEL}`],
-      ['destroy', '-r', `tank/a@${LABEL}`],
+      ['destroy', '-r', '--', `tank/b@${LABEL}`],
+      ['destroy', '-r', '--', `tank/a@${LABEL}`],
     ])
   })
 
@@ -324,7 +324,7 @@ describe('transient snapshot lifecycle (backup2.3)', () => {
     const warnings = await sweepZfsTransients(mock, 'tank/media', TASK, NOW)
     assert.deepEqual(warnings, [])
     const destroys = mock.calls.filter(c => c.args[0] === 'destroy').map(c => c.args)
-    assert.deepEqual(destroys, [['destroy', '-r', `tank/media@${OLDER}`]])
+    assert.deepEqual(destroys, [['destroy', '-r', '--', `tank/media@${OLDER}`]])
   })
 
   it('an unreadable snapshot list never fails the run — the sweep is best-effort', async () => {

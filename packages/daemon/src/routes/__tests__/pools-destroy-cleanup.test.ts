@@ -81,7 +81,7 @@ function baseExecutor(pool: string, status: string, listing: string, guid: ExecR
   ex.addFixture({ command: ZPOOL, args: ['destroy', '--', pool], result: OK })
   ex.addFixture({ command: '/usr/bin/ls', args: ['-la', BY_ID], result: { stdout: listing, stderr: '', exitCode: 0 } })
   // ident.1: the pool guid the confirm binds, and the label every leaf carries.
-  ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', pool], results: guid })
+  ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', pool], results: guid })
   ex.addFixture({ command: BLKID, result: { stdout: `${POOL_GUID}\n`, stderr: '', exitCode: 0 } })
   // Best-effort mutation fallbacks — labelclear / wipefs / sgdisk succeed unless
   // an exact fixture overrides (MockExecutor: exact match wins).

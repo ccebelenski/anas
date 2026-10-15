@@ -192,7 +192,8 @@ const ZFS_INVENTORY_COLUMNS = `name,creation,userrefs,createtxg,${SCHEDULE_STAMP
 export function zfsScheduledListArgs(dataset: string): string[] {
   // -H: no header, tab-delimited; -p: parsable (creation as epoch seconds,
   // userrefs as an exact integer). Direct-only (no -r) — scoped to this dataset.
-  return ['list', '-t', 'snapshot', '-Hp', '-o', ZFS_INVENTORY_COLUMNS, dataset]
+  // cr.21: `--` ends option parsing before the dataset operand.
+  return ['list', '-t', 'snapshot', '-Hp', '-o', ZFS_INVENTORY_COLUMNS, '--', dataset]
 }
 
 /**
@@ -378,8 +379,8 @@ export const UNSTAMPED_OUTSIDE = 'unstamped, outside this schedule\'s sweep'
 
 /** `zfs list` argv for a schedule's inventory: the whole tree (`-r`) or the dataset alone. */
 export function zfsTreeSnapshotListArgs(dataset: string, recursive = true): string[] {
-  // -r: the whole subtree in ONE read.
-  return ['list', '-t', 'snapshot', '-Hp', '-o', ZFS_INVENTORY_COLUMNS, ...(recursive ? ['-r'] : []), dataset]
+  // -r: the whole subtree in ONE read. cr.21: `--` before the dataset operand.
+  return ['list', '-t', 'snapshot', '-Hp', '-o', ZFS_INVENTORY_COLUMNS, ...(recursive ? ['-r'] : []), '--', dataset]
 }
 
 /** One snapshot in a tree inventory: the uniform shape plus its `createtxg`. */
@@ -401,7 +402,8 @@ export interface TreeSnapshot extends ScheduledSnapshot {
  * the same id as a schedule here. Only a `local` stamp is ours.
  */
 export function zfsStampSourceArgs(dataset: string, recursive = true): string[] {
-  return ['get', '-Hp', '-t', 'snapshot', ...(recursive ? ['-r'] : ['-d', '1']), '-o', 'name,value,source', SCHEDULE_STAMP_PROPERTY, dataset]
+  // cr.21: `--` before the dataset operand; the property name stays an operand.
+  return ['get', '-Hp', '-t', 'snapshot', ...(recursive ? ['-r'] : ['-d', '1']), '-o', 'name,value,source', SCHEDULE_STAMP_PROPERTY, '--', dataset]
 }
 
 /** Parse {@link zfsStampSourceArgs} output: full snapshot name → its stamp and source (unset stamps omitted). */
@@ -553,7 +555,7 @@ export function planZfsSchedulePrune(input: ZfsSchedulePruneInput): DatasetPrune
 
 /** Live `userrefs` of one ZFS snapshot — the belt-and-suspenders held re-check. */
 async function zfsIsHeld(executor: CommandExecutor, full: string): Promise<boolean> {
-  const r = await executor.exec(ZFS, ['list', '-t', 'snapshot', '-Hp', '-o', 'userrefs', full])
+  const r = await executor.exec(ZFS, ['list', '-t', 'snapshot', '-Hp', '-o', 'userrefs', '--', full])
   if (r.exitCode !== 0)
     return false
   return Number.parseInt(r.stdout.trim(), 10) > 0

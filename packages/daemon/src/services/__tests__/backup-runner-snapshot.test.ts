@@ -96,7 +96,7 @@ const PBC_OK = [
 ].join('\n')
 
 /** The stale-sweep list argv for the dataset under test. */
-const SWEEP_LIST = ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', 'tank/media']
+const SWEEP_LIST = ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', '--', 'tank/media']
 
 /** A mock wired for one snapshot-mode run of `/tank/media` (`live`: pbc runs until signalled — rclone.5). */
 function wire(pbc: ExecResult = { stdout: '', stderr: PBC_OK, exitCode: 0 }, live?: MockLiveChild): MockExecutor {
@@ -153,15 +153,15 @@ describe('snapshot-consistent run — lifecycle (backup2.3)', () => {
     // The sweep took only this task's own older transient; then the run's own
     // snapshot; then the `finally` destroy.
     assert.deepEqual(zfsArgs(mock, 'destroy'), [
-      ['destroy', '-r', 'tank/media@anas-backup-nightly-media-1000000000'],
-      ['destroy', '-r', `tank/media@${LABEL}`],
+      ['destroy', '-r', '--', 'tank/media@anas-backup-nightly-media-1000000000'],
+      ['destroy', '-r', '--', `tank/media@${LABEL}`],
     ])
-    assert.deepEqual(zfsArgs(mock, 'snapshot'), [['snapshot', '-r', `tank/media@${LABEL}`]])
+    assert.deepEqual(zfsArgs(mock, 'snapshot'), [['snapshot', '-r', '--', `tank/media@${LABEL}`]])
     // Ordering is load-bearing: the sweep runs BEFORE the snapshot is taken.
     const order = mock.calls.filter(c => c.command === ZFS).map(c => c.args.join(' '))
     assert.ok(
-      order.indexOf('destroy -r tank/media@anas-backup-nightly-media-1000000000')
-      < order.indexOf(`snapshot -r tank/media@${LABEL}`),
+      order.indexOf('destroy -r -- tank/media@anas-backup-nightly-media-1000000000')
+      < order.indexOf(`snapshot -r -- tank/media@${LABEL}`),
       order.join(' | '),
     )
 
@@ -185,7 +185,7 @@ describe('snapshot-consistent run — lifecycle (backup2.3)', () => {
     const mock = wire({ stdout: '', stderr: 'Error: unable to open chunk store \'store1\'\n', exitCode: 255 })
     await assert.rejects(() => run(mock), /unable to open chunk store/)
     assert.ok(
-      zfsArgs(mock, 'destroy').some(a => a[2] === `tank/media@${LABEL}`),
+      zfsArgs(mock, 'destroy').some(a => a.at(-1) === `tank/media@${LABEL}`),
       JSON.stringify(zfsArgs(mock, 'destroy')),
     )
   })
@@ -212,7 +212,7 @@ describe('snapshot-consistent run — lifecycle (backup2.3)', () => {
     assert.equal(job.status, 'cancelled')
     assert.match((job.result as { reason: string }).reason, /^cancelled by alice@pve at /)
     assert.ok(
-      zfsArgs(mock, 'destroy').some(a => a[2] === `tank/media@${LABEL}`),
+      zfsArgs(mock, 'destroy').some(a => a.at(-1) === `tank/media@${LABEL}`),
       JSON.stringify(zfsArgs(mock, 'destroy')),
     )
   })
@@ -232,7 +232,7 @@ describe('snapshot-consistent run — lifecycle (backup2.3)', () => {
 
     await assert.rejects(() => run(executor), /ETIMEDOUT/)
     assert.ok(
-      zfsArgs(inner, 'destroy').some(a => a[2] === `tank/media@${LABEL}`),
+      zfsArgs(inner, 'destroy').some(a => a.at(-1) === `tank/media@${LABEL}`),
       JSON.stringify(zfsArgs(inner, 'destroy')),
     )
   })
@@ -248,12 +248,12 @@ describe('snapshot-consistent run — lifecycle (backup2.3)', () => {
     mock.addFixture({ command: ZFS, args: SWEEP_LIST, result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({
       command: ZFS,
-      args: ['snapshot', '-r', `tank/media@${LABEL}`],
+      args: ['snapshot', '-r', '--', `tank/media@${LABEL}`],
       result: { stdout: '', stderr: '', exitCode: 0 },
     })
     mock.addFixture({
       command: ZFS,
-      args: ['destroy', '-r', `tank/media@${LABEL}`],
+      args: ['destroy', '-r', '--', `tank/media@${LABEL}`],
       result: { stdout: '', stderr: 'cannot destroy: dataset is busy\n', exitCode: 1 },
     })
     mock.addFixture({ command: PRLIMIT, result: { stdout: '', stderr: PBC_OK, exitCode: 0 } })

@@ -64,7 +64,8 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
 
   /** Does a ZFS dataset exist? (`zfs list -H -o name <ds>` exit 0). */
   async function zfsDatasetExists(dataset: string): Promise<boolean> {
-    const r = await executor.exec(ZFS, ['list', '-H', '-o', 'name', dataset])
+    // cr.21: `--` ends option parsing so `dataset` is always the operand.
+    const r = await executor.exec(ZFS, ['list', '-H', '-o', 'name', '--', dataset])
     return r.exitCode === 0
   }
 
