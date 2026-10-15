@@ -21,6 +21,7 @@ import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
+import { poolReferenceKey, poolReferenceWarning, poolReferenceWarnings, readPoolReferences } from '../services/pool-references.js'
 import { loadPveFootprint, systemPoolRefusal } from '../services/pve-footprint.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
 import { syncZfsImportUnit } from '../services/zfs-import-unit.js'
@@ -582,6 +583,23 @@ export async function poolRoutes(
      */
     fstabPath?: string
     /**
+     * smb.conf path (story cr.24) — the Export/Destroy confirms read it to name
+     * SMB shares that reference the pool. Defaults in the wiring; when absent
+     * the SMB-share reference kind is not checked.
+     */
+    smbConfPath?: string
+    /**
+     * /etc/exports path (story cr.24) — the NFS-export reference kind. Absent ⇒
+     * not checked.
+     */
+    exportsPath?: string
+    /**
+     * The systemd unit-store dir (story cr.24) — backup/cloud/replication tasks
+     * and the snapshot/scrub schedules that reference the pool. Absent ⇒ the
+     * unit-store kinds are not checked.
+     */
+    systemdDir?: string
+    /**
      * storage.cfg path for PVE-managed detection (story 3.25). Defaults to the
      *  real PVE file; overridable so the hands-off guard is testable.
      */
@@ -625,6 +643,39 @@ export async function poolRoutes(
    */
   async function poolHeldByLun(poolName: string, cache = createIscsiClaimCache(executor, iscsiPaths)) {
     return heldByLun(cache, { pool: poolName })
+  }
+
+  /**
+   * The paths the pool owns (story cr.24) — every dataset's mountpoint, read
+   * FRESH each call so the confirm door and the job see the pool as it is now
+   * (the job-time re-read is the whole point of ruling (j)). Only path
+   * mountpoints count: `legacy`/`none`/`-` have no path a reference points at.
+   */
+  async function poolOwnedPaths(poolName: string): Promise<string[]> {
+    const mounts = await readPoolMountpoints(executor)
+    const paths: string[] = []
+    for (const [dataset, m] of mounts) {
+      if ((dataset === poolName || dataset.startsWith(`${poolName}/`)) && m.mountpoint.startsWith('/'))
+        paths.push(m.mountpoint)
+    }
+    return paths
+  }
+
+  /**
+   * The ONE "what references this pool" answer (story cr.24). The reference
+   * sources come from the same paths the share/backup/schedule/mount routes
+   * edit; absent options leave a source unchecked (never unreadable).
+   */
+  async function poolReferences(poolName: string) {
+    return readPoolReferences({
+      executor,
+      pool: poolName,
+      paths: await poolOwnedPaths(poolName),
+      ...(opts.smbConfPath ? { smbConfPath: opts.smbConfPath } : {}),
+      ...(opts.exportsPath ? { exportsPath: opts.exportsPath } : {}),
+      ...(opts.systemdDir ? { systemdDir: opts.systemdDir } : {}),
+      ...(opts.fstabPath ? { fstabPath } : {}),
+    })
   }
 
   /**
@@ -2028,11 +2079,21 @@ export async function poolRoutes(
       return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
     }
 
-    // No cheap signal for active shares yet (Epics 6–7) — warn generically that
-    // the pool becomes unavailable. Share-aware warnings land with share support.
+    // Story cr.24: name what STILL references the pool — an SMB share, an NFS
+    // export, a backup/cloud/replication task, a snapshot/scrub schedule, a
+    // mount — so the operator decides with the facts (warn, never refuse). The
+    // generic "it becomes unavailable" line stays only when nothing specific
+    // was found; the unreadable-source sentences say what could not be checked.
+    const referencesRead = await poolReferences(poolName)
+    const referenceWarnings = poolReferenceWarnings(referencesRead, poolName)
     const warnings = [
-      `Exporting '${poolName}' makes the pool and all its datasets unavailable until it is re-imported.`,
+      ...(referenceWarnings.length === 0
+        ? [`Exporting '${poolName}' makes the pool and all its datasets unavailable until it is re-imported.`]
+        : []),
+      ...referenceWarnings,
     ]
+    // What the confirm listed — the job re-reads and reports anything new.
+    const confirmedReferenceKeys = new Set(referencesRead.refs.map(poolReferenceKey))
 
     // Fail-open is not fail-silent (D3): when the claims read broke, the empty
     // answer it fail-opened to is indistinguishable from "no LIO" — say so
@@ -2067,6 +2128,16 @@ export async function poolRoutes(
       { ...identity, params: { pool: poolName, force, guid: exportGuid.guid } },
       async () => {
         await requireStableId(`Pool '${poolName}'`, exportGuid, () => readPoolGuid(executor, poolName))
+
+        // Story cr.24 (ruling (j)): the job re-reads what references the pool
+        // BEFORE the export runs and remembers anything the confirm did not
+        // list — the operator confirmed an export, so the record says what was
+        // still pointing at it when it ran. Never a job failure.
+        const freshReferences = await poolReferences(poolName)
+        const newRefWarnings = freshReferences.refs
+          .filter(ref => !confirmedReferenceKeys.has(poolReferenceKey(ref)))
+          .map(poolReferenceWarning)
+
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {
           // A LUN added between the pre-flight refusal above and this exec still
@@ -2085,7 +2156,12 @@ export async function poolRoutes(
         // guard 409s it before the job is submitted. Best-effort — the pool is
         // already exported; a hiccup here is a warning, never a failed job.
         const unitWarning = await syncZfsImportUnit(executor, poolName, 'disable')
-        return unitWarning ? { warnings: [unitWarning] } : null
+
+        const resultWarnings: string[] = []
+        if (unitWarning)
+          resultWarnings.push(unitWarning)
+        resultWarnings.push(...newRefWarnings)
+        return resultWarnings.length > 0 ? { warnings: resultWarnings } : null
       },
     )
 
@@ -2156,6 +2232,14 @@ export async function poolRoutes(
     if (cleanup)
       warnings.push(`The pool's disks will be wiped clean (existing ZFS labels removed).`)
 
+    // Story cr.24: name what STILL references the pool, one warning per
+    // reference + one per unreadable source, so the operator decides with the
+    // facts (warn, never refuse). What the confirm listed is what the job
+    // compares against when it re-reads.
+    const referencesRead = await poolReferences(poolName)
+    warnings.push(...poolReferenceWarnings(referencesRead, poolName))
+    const confirmedReferenceKeys = new Set(referencesRead.refs.map(poolReferenceKey))
+
     // Fail-open is not fail-silent (D3): a broken claims read fail-opens to
     // "nothing held", which a node genuinely serving a LUN would look exactly
     // like at this door. Disclose it; the hard-409 refusal above is unchanged.
@@ -2192,6 +2276,17 @@ export async function poolRoutes(
       { ...identity, params: { pool: poolName, cleanup, guid: destroyGuid.guid } },
       async (updateProgress) => {
         await requireStableId(`Pool '${poolName}'`, destroyGuid, () => readPoolGuid(executor, poolName))
+
+        // Story cr.24 (ruling (j)): the job re-reads what references the pool
+        // BEFORE the destroy runs, while the pool can still answer, and
+        // remembers anything the confirm did not list — the operator confirmed
+        // a destroy, so the record says what was still pointing at it when it
+        // ran. Never a job failure.
+        const freshReferences = await poolReferences(poolName)
+        const newRefWarnings = freshReferences.refs
+          .filter(ref => !confirmedReferenceKeys.has(poolReferenceKey(ref)))
+          .map(poolReferenceWarning)
+
         // Capture the member leaves BEFORE destroy — the pool must still exist
         // to enumerate them — and resolve every leaf that names no disk.
         const leaves = cleanup ? await resolveLeafDisks(await poolMemberLeaves(poolName)) : []
@@ -2212,8 +2307,10 @@ export async function poolRoutes(
         const unitWarning = await syncZfsImportUnit(executor, poolName, 'disable')
         const unitWarnings = unitWarning ? [unitWarning] : []
 
-        if (!(cleanup && leaves.length > 0))
-          return { destroyed: poolName, ...(unitWarning ? { warnings: unitWarnings } : {}) }
+        if (!(cleanup && leaves.length > 0)) {
+          const warnings = [...unitWarnings, ...newRefWarnings]
+          return { destroyed: poolName, ...(warnings.length > 0 ? { warnings } : {}) }
+        }
 
         // Opt-in disk hygiene ("Clean Up Disks"). All best-effort: the pool is
         // already destroyed, so nothing here may fail the job — every failure is
@@ -2311,7 +2408,7 @@ export async function poolRoutes(
           skipped?: { leaf: string, reason: string }[]
           warnings?: string[]
         } = { destroyed: poolName }
-        const warningsOut = [...unitWarnings, ...skipped.map(k => `${k.leaf}: ${k.reason}`)]
+        const warningsOut = [...unitWarnings, ...newRefWarnings, ...skipped.map(k => `${k.leaf}: ${k.reason}`)]
         if (warningsOut.length > 0)
           cleanupResult.warnings = warningsOut
         if (skipped.length > 0)

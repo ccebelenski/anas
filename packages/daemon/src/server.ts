@@ -1,5 +1,5 @@
 import type { CommandExecutor } from './executor/types.js'
-import { copyFileSync, readFileSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -83,10 +83,13 @@ export function createServer(opts?: ServerOptions) {
   const envExportsPath = process.env.ANAS_EXPORTS_PATH
   let exportsPath = envExportsPath ?? '/etc/exports'
 
-  // systemd unit directory — the store for recurring replication TASKS (Epic
-  // 5.5.3). The units ARE the config; override via ANAS_SYSTEMD_DIR (tests point
-  // it at a temp dir).
-  const systemdDir = process.env.ANAS_SYSTEMD_DIR ?? '/etc/systemd/system'
+  // systemd unit directory — the store for recurring tasks (Epic 5.5.3 etc).
+  // The units ARE the config; override via ANAS_SYSTEMD_DIR (tests point it at a
+  // temp dir). Mock mode keeps an empty writable temp dir so a mock route never
+  // reads (or worse, treats as populated) the real host's units — the cr.24
+  // pool-reference helper reads these stores as "what references the pool".
+  const systemdDir = process.env.ANAS_SYSTEMD_DIR
+    ?? (opts?.mock ? join(tmpdir(), `anas-mock-systemd-${process.pid}`) : '/etc/systemd/system')
 
   // /etc/fstab location (Epic 18). Config IS the API — surgical round-trip edits.
   // Override via ANAS_FSTAB_PATH (tests point it at a temp file; dev mock seeds a
@@ -150,6 +153,12 @@ export function createServer(opts?: ServerOptions) {
   // Register mock fixtures for dev mode
   if (opts?.mock) {
     const mock = executor as MockExecutor
+    // The mock systemd unit dir is created EMPTY so unit-store reads (the cr.24
+    // pool-reference helper among them) see nothing without touching the host.
+    try {
+      mkdirSync(systemdDir, { recursive: true })
+    }
+    catch { /* best-effort — an unreadable store is disclosed, never fatal */ }
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', 'all', '-j'], result: mockFixtures.zpoolGetAll('testpool') })
@@ -618,6 +627,13 @@ export function createServer(opts?: ServerOptions) {
     jobQueue,
     confirmStore,
     fstabPath,
+    // cr.24 — the Export/Destroy confirms list what references the pool (SMB
+    // shares, NFS exports, backup/cloud/replication tasks, schedules, mounts).
+    // Same paths the share/backup/schedule routes edit, so ONE env override
+    // points every reader at a materialised capture in a test.
+    smbConfPath,
+    exportsPath,
+    systemdDir,
     pveStoragePath: process.env.ANAS_STORAGE_CFG,
     iscsiPaths,
     diskIdentityCache,
@@ -717,7 +733,23 @@ export function createServer(opts?: ServerOptions) {
   // READ layer (list/detail/preview) — detail carries the live intent (§6.2).
   server.register(ahrRoutes, { prefix: '/v1', executor, diskIdentityCache, intentDir: ahrIntentDir, jobQueue, iscsiPaths })
   // AHR mutations: create/destroy/scrub (routes/ahr-mutate.ts).
-  server.register(ahrMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase: ahrMountBase, iscsiPaths, intentDir: ahrIntentDir })
+  server.register(ahrMutationRoutes, {
+    prefix: '/v1',
+    executor,
+    jobQueue,
+    confirmStore,
+    diskIdentityCache,
+    fstabPath,
+    // cr.24 — the AHR destroy confirm lists what references the pool, read
+    // through the same paths the share/backup/schedule routes use.
+    smbConfPath,
+    exportsPath,
+    systemdDir,
+    mdadmConfPath,
+    mountBase: ahrMountBase,
+    iscsiPaths,
+    intentDir: ahrIntentDir,
+  })
   // AHR expansion engine (Epic 11.6, AHR-DESIGN §5) — plan/expand/resume/
   // abandon + guided replace.
   server.register(ahrExpansionRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, intentDir: ahrIntentDir })

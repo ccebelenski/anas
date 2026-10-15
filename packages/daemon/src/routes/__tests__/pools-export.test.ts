@@ -1,14 +1,70 @@
-import type { Job, JobAccepted } from '@anas/shared'
+import type { BackupTask, Job, JobAccepted } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
+import { renderServiceUnit as renderBackupService } from '../../services/backup-units.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
   'x-anas-request-id': randomUUID(),
+}
+
+/**
+ * Story cr.24 fixtures — a pool `testpool` (mountpoint `/testpool` in the mock
+ * `zfs list`) that really IS referenced. Written to ONE temp dir, wired into
+ * `createServer` through the env overrides the wiring honours.
+ */
+const CR24_SMB = `
+[global]
+  workgroup = WORKGROUP
+
+[media]
+  path = /testpool/media
+  read only = no
+`
+
+const CR24_EXPORTS = `
+/testpool/export  192.168.1.0/24(rw,sync,no_subtree_check)
+`
+
+const CR24_BACKUP_TASK: BackupTask = {
+  name: 'pool-src',
+  repository: 'pve:local',
+  backupId: 'pool-src',
+  archives: [{ name: 'media', path: '/testpool/media', excludes: [] }],
+  changeDetectionMode: 'default',
+  notify: 'always',
+  schedule: '*-*-* 02:00:00',
+  enabled: true,
+  limitNofile: 1024,
+}
+
+/** One temp reference-source tree; registered for cleanup. */
+interface RefFixtures { dir: string, smbConfPath: string, exportsPath: string, systemdDir: string }
+const liveRefDirs: RefFixtures[] = []
+async function makeRefFixtures(over: { smb?: string, noBackupTask?: boolean } = {}): Promise<RefFixtures> {
+  const dir = await mkdtemp(join(tmpdir(), 'anas-cr24-export-'))
+  const smbConfPath = join(dir, 'smb.conf')
+  const exportsPath = join(dir, 'exports')
+  const systemdDir = join(dir, 'units')
+  await mkdir(systemdDir)
+  await writeFile(smbConfPath, over.smb ?? CR24_SMB, 'utf-8')
+  await writeFile(exportsPath, CR24_EXPORTS, 'utf-8')
+  if (!over.noBackupTask)
+    await writeFile(join(systemdDir, 'anas-backup-pool-src.service'), renderBackupService(CR24_BACKUP_TASK), 'utf-8')
+  liveRefDirs.push({ dir, smbConfPath, exportsPath, systemdDir })
+  return { dir, smbConfPath, exportsPath, systemdDir }
+}
+async function cleanupRefDirs(): Promise<void> {
+  const pending = liveRefDirs.splice(0)
+  for (const f of pending)
+    await rm(f.dir, { recursive: true, force: true })
 }
 
 async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
@@ -313,5 +369,131 @@ describe('ident.1 — pool export binds the pool guid', () => {
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'IDENTITY_MISMATCH')
     assert.equal(calls.find(a => a[0] === 'export'), undefined)
+  })
+})
+
+describe('cr.24 — export names what still references the pool', () => {
+  let server: ReturnType<typeof createServer> | undefined
+
+  function applyCfg(f: RefFixtures, smbConfPath = f.smbConfPath) {
+    process.env.SMB_CONF_PATH = smbConfPath
+    process.env.ANAS_EXPORTS_PATH = f.exportsPath
+    process.env.ANAS_SYSTEMD_DIR = f.systemdDir
+  }
+  function clearCfg() {
+    delete process.env.SMB_CONF_PATH
+    delete process.env.ANAS_EXPORTS_PATH
+    delete process.env.ANAS_SYSTEMD_DIR
+  }
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    clearCfg()
+    await cleanupRefDirs()
+  })
+
+  it('a pool backing an SMB share, an NFS export and a backup task source warns all three by kind and name', async () => {
+    const f = await makeRefFixtures()
+    applyCfg(f)
+    server = createServer({ mock: true, logger: false })
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/export',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(res.statusCode, 409)
+    const warnings = (res.json() as { error: { warnings: string[] } }).error.warnings
+    assert.ok(warnings.some(w => /SMB share 'media'/.test(w)), `SMB named: ${warnings.join(' | ')}`)
+    assert.ok(warnings.some(w => /NFS export '\/testpool\/export'/.test(w)), `NFS named: ${warnings.join(' | ')}`)
+    assert.ok(warnings.some(w => /Backup task 'pool-src'/.test(w)), `backup named: ${warnings.join(' | ')}`)
+    // The one-line generic is replaced when something specific was found.
+    assert.ok(!warnings.some(w => w.startsWith('Exporting ')), `specific found — generic drops: ${warnings.join(' | ')}`)
+  })
+
+  it('an unreadable smb.conf warns that SMB shares could not be checked', async () => {
+    const f = await makeRefFixtures()
+    // Point SMB_CONF_PATH at a DIRECTORY: readConfig gets EISDIR, not ENOENT.
+    const dirAsSmb = join(f.dir, 'smb-is-a-dir')
+    await mkdir(dirAsSmb)
+    applyCfg(f, dirAsSmb)
+    server = createServer({ mock: true, logger: false })
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/export',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(res.statusCode, 409)
+    const warnings = (res.json() as { error: { warnings: string[] } }).error.warnings
+    assert.ok(warnings.some(w => /could not read smb\.conf/.test(w)), `smb unreadable disclosed: ${warnings.join(' | ')}`)
+    // The NFS export is still readable and still named (fail-open is per source).
+    assert.ok(warnings.some(w => /NFS export/.test(w)))
+  })
+
+  it('a pool with no references keeps only the generic warning', async () => {
+    const f = await makeRefFixtures({ smb: '# empty smb.conf\n', noBackupTask: true })
+    await writeFile(f.exportsPath, '# empty exports\n', 'utf-8')
+    applyCfg(f)
+    server = createServer({ mock: true, logger: false })
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/export',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(res.statusCode, 409)
+    const warnings = (res.json() as { error: { warnings: string[] } }).error.warnings
+    assert.ok(warnings.some(w => w.startsWith('Exporting ') && w.includes('unavailable until it is re-imported')), `generic kept: ${warnings.join(' | ')}`)
+    assert.ok(!warnings.some(w => /SMB share|NFS export|Backup task/.test(w)), `no specific refs: ${warnings.join(' | ')}`)
+  })
+
+  it('the export job reports a reference that appeared AFTER the confirm', async () => {
+    const f = await makeRefFixtures()
+    applyCfg(f)
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+
+    // `zfs list -o name,mountpoint,mounted` runs ONCE per pool-reference read:
+    // call 1 = the challenge request, call 2 = the confirmed request's route
+    // read (before the code is verified), call 3 = the JOB's re-read. Appending
+    // the share at call 3 lands it exactly where the job looks — deterministic.
+    const ADDED_SECTION = '\n[added-after-confirm]\n  path = /testpool/added\n  read only = no\n'
+    let zfsListCalls = 0
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command: string, args: string[]) => {
+      if (command === '/usr/sbin/zfs' && args.join(' ') === 'list -H -o name,mountpoint,mounted') {
+        zfsListCalls++
+        if (zfsListCalls === 3) {
+          const current = await readFile(f.smbConfPath, 'utf-8')
+          await writeFile(f.smbConfPath, current + ADDED_SECTION, 'utf-8')
+        }
+      }
+      return orig(command, args)
+    }
+
+    const first = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/export',
+      headers: IDENTITY_HEADERS,
+    })
+    const confirmWarnings = (first.json() as { error: { warnings: string[] } }).error.warnings
+    assert.ok(!confirmWarnings.some(w => /added-after-confirm/.test(w)), 'the confirm did not list the later share')
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/export',
+      headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string },
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const result = job.result as { warnings?: string[] } | null
+    assert.ok(Array.isArray(result?.warnings), 'the job result carries the new reference')
+    assert.ok(
+      (result!.warnings ?? []).some(w => /SMB share 'added-after-confirm'/.test(w)),
+      `job reports the share added after the confirm: ${JSON.stringify(result)}`,
+    )
   })
 })

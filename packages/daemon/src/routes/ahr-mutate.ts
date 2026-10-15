@@ -29,6 +29,7 @@ import { AHR_FINDMNT_ARGS, readAhrPools } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
 import { createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
+import { poolReferenceKey, poolReferenceWarning, poolReferenceWarnings, readPoolReferences } from '../services/pool-references.js'
 import { mdSysPath, readMdAttrOrNull } from '../services/selfheal-io.js'
 import { readMdGeometry } from '../services/selfheal-map.js'
 import { collectDisks } from './disks.js'
@@ -313,6 +314,20 @@ export interface AhrMutationRouteOptions {
   diskIdentityCache: DiskIdentityCache
   /** /etc/fstab location (config IS the API). Override via ANAS_FSTAB_PATH. */
   fstabPath: string
+  /**
+   * smb.conf path (story cr.24) — the AHR destroy confirm reads it to name SMB
+   * shares that reference the pool. Absent ⇒ the SMB-share kind is not checked.
+   */
+  smbConfPath?: string
+  /**
+   * /etc/exports path (story cr.24). Absent ⇒ the NFS-export kind is not checked.
+   */
+  exportsPath?: string
+  /**
+   * The systemd unit-store dir (story cr.24) — backup/cloud/replication tasks
+   * and schedules that reference the pool. Absent ⇒ these kinds are not checked.
+   */
+  systemdDir?: string
   /** mdadm.conf override (else ANAS_MDADM_CONF / the Debian default). */
   mdadmConfPath?: string
   /** Pool mount-base override (else ANAS_AHR_MOUNT_BASE / /mnt/anas-ahr). */
@@ -388,9 +403,28 @@ function poolArrayUuids(pool: AhrPool): string[] {
  * routes/ahr.ts.
  */
 export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutationRouteOptions) {
-  const { executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase, kernelRelease } = opts
+  const { executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase, kernelRelease, smbConfPath, exportsPath, systemdDir } = opts
   const iscsiPaths = opts.iscsiPaths ?? {}
   const intentDir = opts.intentDir ?? defaultAhrIntentDir()
+
+  /**
+   * The ONE "what references this pool" answer (story cr.24). The AHR pool owns
+   * its MOUNTED `@data` path and is matched by name for replication/snapshot/
+   * scrub references; an unmounted pool (`mountpoint` under /dev/) owns no path
+   * a reference could point at, so only the name-matched kinds are in scope.
+   */
+  async function ahrPoolReferences(pool: { name: string, mountpoint: string }) {
+    const mountedPath = pool.mountpoint.startsWith('/dev/') ? [] : [pool.mountpoint]
+    return readPoolReferences({
+      executor,
+      pool: pool.name,
+      paths: mountedPath,
+      ...(smbConfPath ? { smbConfPath } : {}),
+      ...(exportsPath ? { exportsPath } : {}),
+      ...(systemdDir ? { systemdDir } : {}),
+      ...(fstabPath ? { fstabPath } : {}),
+    })
+  }
 
   /**
    * A scrub or a repair already in flight on this pool, or null.
@@ -827,6 +861,14 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       warnings.push('ANAS could not check whether an iSCSI LUN is served from this pool. The LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
     }
 
+    // Story cr.24: name what STILL references the pool — an SMB share, an NFS
+    // export, a backup/cloud/replication task, a snapshot/scrub schedule, a
+    // mount — warn, never refuse. What the confirm listed is what the job
+    // compares against when it re-reads.
+    const referencesRead = await ahrPoolReferences(pool)
+    warnings.push(...poolReferenceWarnings(referencesRead, name))
+    const confirmedReferenceKeys = new Set(referencesRead.refs.map(poolReferenceKey))
+
     // The confirm is bound to the pool's IDENTITY (its array UUIDs), not just
     // its name (identity audit P1): a code minted for this pool cannot destroy
     // a different pool that carries the name by the time it is replayed.
@@ -851,7 +893,19 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
           throw new Error(`AHR pool '${name}' no longer exists — nothing was destroyed`)
         if (poolArrayUuids(live).join(',') !== confirmedUuids.join(','))
           throw new Error(`AHR pool '${name}' is not the pool that was confirmed (its arrays changed since) — nothing was destroyed. Review the pool and destroy it again`)
-        return destroyAhrPool(executor, live, updateProgress, { fstabPath, mdadmConfPath, intentDir })
+
+        // Story cr.24 (ruling (j)): re-read what references the pool BEFORE
+        // the destroy, while it can still answer, and report anything the
+        // confirm did not list in the RESULT (never a failed job).
+        const freshReferences = await ahrPoolReferences(live)
+        const newRefWarnings = freshReferences.refs
+          .filter(ref => !confirmedReferenceKeys.has(poolReferenceKey(ref)))
+          .map(poolReferenceWarning)
+
+        const result = await destroyAhrPool(executor, live, updateProgress, { fstabPath, mdadmConfPath, intentDir })
+        if (newRefWarnings.length > 0)
+          return { ...result, warnings: [...(result.warnings ?? []), ...newRefWarnings] }
+        return result
       },
     )
     reply.code(202)

@@ -137,6 +137,12 @@ export interface AhrDestroyResult {
   absentDisks?: string[]
   /** Same-named md arrays that are NOT this pool's — left running, untouched. */
   foreignArrays?: string[]
+  /**
+   * Story cr.24 (ruling (j)): references to the pool the JOB found that the
+   * confirm did not list — the operator confirmed a destroy, so the record
+   * says what was still pointing at it when it ran.
+   */
+  warnings?: string[]
 }
 
 /** One partition of a disk destroy considers, with its identity verdict. */

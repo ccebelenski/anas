@@ -21,6 +21,7 @@ import { createServer } from '../../server.js'
 import { readIntent, writeIntent } from '../../services/ahr-intent.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
+import { renderServiceUnit as renderSnapshotService } from '../../services/snapshot-schedule-units.js'
 import { ahrMutationRoutes, reconcileLunWarnings, rewriteLunWarnings } from '../ahr-mutate.js'
 import { jobRoutes } from '../jobs.js'
 
@@ -1450,5 +1451,61 @@ describe('DELETE /v1/ahr/:name — identity doors (ident.3)', () => {
     assert.equal(replay.statusCode, 409, replay.body)
     assert.equal(replay.json().error.code, 'CONFIRMATION_REQUIRED', 'a fresh confirm, never a 202')
     await after.server.close()
+  })
+})
+
+describe('cr.24 — AHR destroy names what still references the pool', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string
+  let smbConfPath: string
+  let systemdDir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-cr24-'))
+    smbConfPath = join(dir, 'smb.conf')
+    const exportsPath = join(dir, 'exports')
+    systemdDir = join(dir, 'units')
+    await mkdir(systemdDir)
+    // An SMB share under the pool's mounted @data path.
+    await writeFile(smbConfPath, `
+[global]
+  workgroup = WORKGROUP
+
+[media]
+  path = /mnt/anas-ahr/ahr0/media
+  read only = no
+`, 'utf-8')
+    await writeFile(exportsPath, '# empty\n', 'utf-8')
+    // A snapshot schedule targeting the AHR pool BY NAME.
+    await writeFile(join(systemdDir, 'anas-snap-ahr-hourly.service'), renderSnapshotService({
+      id: 'ahr-hourly',
+      name: 'AHR hourly',
+      target: { kind: 'ahr', pool: 'ahr0' },
+      cadence: 'hourly',
+      retention: { hourly: 24 },
+      enabled: true,
+      notify: 'on-failure',
+    }), 'utf-8')
+    process.env.SMB_CONF_PATH = smbConfPath
+    process.env.ANAS_EXPORTS_PATH = exportsPath
+    process.env.ANAS_SYSTEMD_DIR = systemdDir
+    server = createServer({ mock: true, logger: false })
+  })
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    delete process.env.SMB_CONF_PATH
+    delete process.env.ANAS_EXPORTS_PATH
+    delete process.env.ANAS_SYSTEMD_DIR
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('the confirm lists an SMB share under the mountpoint and a snapshot schedule on the pool', async () => {
+    const res = await server!.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 409)
+    const warnings = (res.json() as { error: { warnings: string[] } }).error.warnings
+    assert.ok(warnings.some(w => /SMB share 'media'/.test(w)), `SMB named: ${warnings.join(' | ')}`)
+    assert.ok(warnings.some(w => /Snapshot schedule 'AHR hourly'/.test(w)), `schedule named: ${warnings.join(' | ')}`)
+    assert.ok(warnings.some(w => /'ahr0'/.test(w) && w.includes('usable')), 'the inherent AHR warning stays')
   })
 })

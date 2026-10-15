@@ -490,6 +490,15 @@ describe('no mdcheck adoption at daemon start (review F1/F4) — structural guar
           offenders.push(rel)
         continue
       }
+      if (rel === 'services/pool-references.ts') {
+        // The cr.24 exception is READ-ONLY and narrow: the pool-reference
+        // helper reads the node-level schedule to LIST AHR scrub targets as
+        // pool references (export/destroy warnings) and may name NO write
+        // surface at all — not the unit writes, not the toggle.
+        if (/\bwriteScrubUnits\b|\bremoveScrubUnits\b|\bsetAhrScrubEnabled\b|\bsetMdcheck\b|\bmdcheckToggleArgs\b/.test(src))
+          offenders.push(rel)
+        continue
+      }
       if (/\bwriteScrubUnits\b|\bremoveScrubUnits\b|scrub-schedule-units/.test(src))
         offenders.push(rel)
     }
