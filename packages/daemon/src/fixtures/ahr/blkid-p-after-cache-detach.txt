@@ -1,0 +1,1 @@
+/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20: PTUUID="8ce68dcf-3f8e-4ce2-8197-4242510fb7f3" PTTYPE="gpt"

@@ -1,0 +1,11 @@
+anasd 687623 stopped (SIGSTOP) at 15:28:59.632
+GET /pools -> 504 after 20047 ms
+{"error":{"code":"GATEWAY_TIMEOUT","message":"anasd did not answer within 20 s: the request was stopped at the gateway. A command it ran may be hung (a suspended pool, a dead mount or an unresponsive remote host); the dashboard lists commands that did not end. If this was a change, check its state before retrying."}}
+GET /status -> 504 after 20052 ms
+{"error":{"code":"GATEWAY_TIMEOUT","message":"anasd did not answer within 20 s: the request was stopped at the gateway. A command it ran may be hung (a suspended pool, a dead mount or an unresponsive remote host); the dashboard lists commands that did not end. If this was a change, check its state before retrying."}}
+anasd 687623 continued at 15:29:40.126
+active
+active
+NRestarts=0
+HTTP 200 0.019558
+{"status":"ok","version":"0.4.3","abandonedCommands":[]}

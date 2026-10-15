@@ -1,0 +1,22 @@
+zpool create rc=137
+ioctl(3, ZFS_IOC_POOL_CREATE <unfinished ...>) = ?
++++ killed by SIGKILL +++
+--- zpool list w3n6a:
+cannot open 'w3n6a': no such pool
+--- lsblk:
+NAME    SIZE PARTLABEL            FSTYPE
+sde     512M                      
+├─sde1  502M zfs-be7977a25d6c0c32 
+└─sde9    8M                      
+--- blkid -p:
+/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21: PTUUID="c2ab53e7-3d6c-334c-8746-3046ba7cb7a1" PTTYPE="gpt"
+/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21-part1: PART_ENTRY_SCHEME="gpt" PART_ENTRY_NAME="zfs-be7977a25d6c0c32" PART_ENTRY_UUID="41ac7166-7e4f-5e49-bb66-cc0978b656bc" PART_ENTRY_TYPE="6a898cc3-1dd2-11b2-99a6-080020736631" PART_ENTRY_NUMBER="1" PART_ENTRY_OFFSET="2048" PART_ENTRY_SIZE="1028096" PART_ENTRY_DISK="8:64"
+/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21-part9: PART_ENTRY_SCHEME="gpt" PART_ENTRY_UUID="d811fd6a-123f-714c-86b4-e24ab15e9818" PART_ENTRY_TYPE="6a945a3b-1dd2-11b2-99a6-080020736631" PART_ENTRY_NUMBER="9" PART_ENTRY_OFFSET="1030144" PART_ENTRY_SIZE="16384" PART_ENTRY_DISK="8:64"
+--- zdb -l part1:
+failed to unpack label 0
+failed to unpack label 1
+failed to unpack label 2
+failed to unpack label 3
+--- zpool import scan:
+no pools available to import
+{"id": "scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21", "status": "other", "poolName": null, "partitions": [{"name": "sde1", "size": 526385152, "fstype": null, "mountpoint": null}, {"name": "sde9", "size": 8388608, "fstype": null, "mountpoint": null}]}

@@ -1,0 +1,201 @@
+15:16:21.060
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:31 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:21.595
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:32 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:22.180
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:33 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:22.742
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:33 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:23.283
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:34 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:23.816
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:34 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:24.365
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:35 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:24.951
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:35 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:25.521
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:36 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:26.088
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:36 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [>....................]  reshape =  0.9% (19260/2091968) finish=1.7min speed=19260K/sec
+15:16:26.660
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:37 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [>....................]  reshape =  3.1% (65600/2091968) finish=0.5min speed=65600K/sec
+15:16:27.196
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:38 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [=>...................]  reshape =  5.3% (112596/2091968) finish=0.2min speed=112596K/sec
+15:16:27.743
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:38 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [=>...................]  reshape =  8.0% (167900/2091968) finish=0.1min speed=167908K/sec
+15:16:28.291
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:39 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [==>..................]  reshape = 12.5% (262208/2091968) finish=0.2min speed=131104K/sec
+15:16:28.823
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:39 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [==>..................]  reshape = 12.7% (267872/2091968) finish=0.3min speed=89290K/sec
+15:16:29.409
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:40 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [===>.................]  reshape = 15.9% (334528/2091968) finish=0.2min speed=111509K/sec
+15:16:29.948
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:40 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [===>.................]  reshape = 19.5% (408272/2091968) finish=0.2min speed=102068K/sec
+15:16:30.489
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:41 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [====>................]  reshape = 23.3% (489796/2091968) finish=0.2min speed=122449K/sec
+15:16:31.026
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:41 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [====>................]  reshape = 24.7% (519052/2091968) finish=0.2min speed=103810K/sec
+15:16:31.592
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:42 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [=====>...............]  reshape = 25.6% (536448/2091968) finish=0.2min speed=107289K/sec
+15:16:32.154
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:43 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [=====>...............]  reshape = 28.4% (596388/2091968) finish=0.2min speed=99398K/sec
+15:16:32.709
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:43 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [======>..............]  reshape = 32.2% (674160/2091968) finish=0.2min speed=112360K/sec
+15:16:33.269
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:44 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [=======>.............]  reshape = 35.6% (745784/2091968) finish=0.2min speed=106540K/sec
+15:16:33.798
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:44 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [=======>.............]  reshape = 39.5% (828180/2091968) finish=0.1min speed=118311K/sec
+15:16:34.348
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:45 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [========>............]  reshape = 43.8% (918272/2091968) finish=0.1min speed=114784K/sec
+15:16:34.890
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:45 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [=========>...........]  reshape = 49.0% (1026388/2091968) finish=0.1min speed=114043K/sec
+15:16:35.433
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:46 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [==========>..........]  reshape = 50.1% (1048640/2091968) finish=0.1min speed=116515K/sec
+15:16:36.015
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:46 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [==========>..........]  reshape = 52.4% (1098124/2091968) finish=0.1min speed=109812K/sec
+15:16:36.550
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:47 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [============>........]  reshape = 62.0% (1297612/2091968) finish=0.0min speed=129761K/sec
+15:16:37.111
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:48 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [==============>......]  reshape = 71.7% (1500812/2091968) finish=0.0min speed=136437K/sec
+15:16:37.648
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:48 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [==============>......]  reshape = 74.8% (1566160/2091968) finish=0.0min speed=142378K/sec
+15:16:38.234
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:49 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [==============>......]  reshape = 74.8% (1566160/2091968) finish=0.0min speed=130513K/sec
+15:16:38.774
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:49 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [==============>......]  reshape = 74.8% (1566160/2091968) finish=0.0min speed=130513K/sec
+15:16:39.322
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:50 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [===============>.....]  reshape = 76.1% (1594212/2091968) finish=0.0min speed=122631K/sec
+15:16:39.862
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:50 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [================>....]  reshape = 80.7% (1689612/2091968) finish=0.0min speed=120686K/sec
+15:16:40.407
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:51 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [=================>...]  reshape = 87.4% (1829388/2091968) finish=0.0min speed=130670K/sec
+15:16:40.936
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:51 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [===================>.]  reshape = 96.4% (2017100/2091968) finish=0.0min speed=134473K/sec
+15:16:41.493
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:52 /usr/sbin/mdadm --monitor --scan
+ 575497  575496     360     360 systemd-udevd.service        D          00:00 /usr/sbin/mdadm --detail --no-devices --export /dev/md127
+  /sys/block/md127/md/sync_action=reshape
+      [===================>.]  reshape = 99.9% (2091968/2091968) finish=0.0min speed=139464K/sec
+15:16:42.025
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:52 /usr/sbin/mdadm --monitor --scan
+ 575497  575496     360     360 systemd-udevd.service        D          00:00 /usr/sbin/mdadm --detail --no-devices --export /dev/md127
+  /sys/block/md127/md/sync_action=reshape
+      [===================>.]  reshape = 99.9% (2091968/2091968) finish=0.0min speed=130748K/sec
+15:16:42.594
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:53 /usr/sbin/mdadm --monitor --scan
+ 575497  575496     360     360 systemd-udevd.service        D          00:01 /usr/sbin/mdadm --detail --no-devices --export /dev/md127
+  /sys/block/md127/md/sync_action=reshape
+      [===================>.]  reshape = 99.9% (2091968/2091968) finish=0.0min speed=130748K/sec
+15:16:43.158
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:54 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [===================>.]  reshape = 99.9% (2091968/2091968) finish=0.0min speed=123056K/sec
+15:16:43.717
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:54 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [===================>.]  reshape = 99.9% (2091968/2091968) finish=0.0min speed=123056K/sec
+15:16:44.278
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:55 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [===================>.]  reshape = 99.9% (2091968/2091968) finish=0.0min speed=116220K/sec
+15:16:44.856
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:55 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [===================>.]  reshape = 99.9% (2091968/2091968) finish=0.0min speed=116220K/sec
+15:16:45.403
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:56 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=reshape
+      [===================>.]  reshape = 99.9% (2091968/2091968) finish=0.0min speed=110103K/sec
+15:16:46.006
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:56 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:46.607
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:57 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:47.193
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:58 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:47.785
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:58 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:48.311
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:59 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:48.871
+ 568649       1  568649  568649 mdmonitor.service            Ss         01:59 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:49.403
+ 568649       1  568649  568649 mdmonitor.service            Ss         02:00 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:49.963
+ 568649       1  568649  568649 mdmonitor.service            Ss         02:00 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle
+15:16:50.516
+ 568649       1  568649  568649 mdmonitor.service            Ss         02:01 /usr/sbin/mdadm --monitor --scan
+  /sys/block/md127/md/sync_action=idle

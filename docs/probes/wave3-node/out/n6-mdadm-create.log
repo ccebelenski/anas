@@ -1,0 +1,35 @@
+bash: line 1: 693754 Killed                  strace -f -qq -e trace=ioctl -e inject=ioctl:signal=SIGKILL:when=117 -o /var/tmp/w3n6/md-kill.trace mdadm --create /dev/md/w3n6b --name=w3n6b --level=1 --raid-devices=2 --metadata=1.2 --run --assume-clean $B $C
+rc=137
+693757 ioctl(4, ADD_NEW_DISK, 0x62695a4c1a68) = 0
+693757 ioctl(4, ADD_NEW_DISK, 0x62695a4c1c48) = 0
+693757 ioctl(4, RUN_ARRAY <unfinished ...>) = ?
+693757 +++ killed by SIGKILL +++
+--- /proc/mdstat:
+Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] 
+md127 : inactive loop4[1](S) loop3[0](S)
+      522240 blocks super 1.2
+       
+unused devices: <none>
+--- examine:
+/dev/loop3:
+          Magic : a92b4efc
+     Array UUID : 7287866b:47390dc1:4c8d693a:df30e039
+           Name : anas-pve:w3n6b  (local to host anas-pve)
+          State : clean
+   Device Role : Active device 0
+   Array State : AA ('A' == active, '.' == missing, 'R' == replacing)
+/dev/loop4:
+          Magic : a92b4efc
+     Array UUID : 7287866b:47390dc1:4c8d693a:df30e039
+           Name : anas-pve:w3n6b  (local to host anas-pve)
+          State : clean
+   Device Role : Active device 1
+   Array State : AA ('A' == active, '.' == missing, 'R' == replacing)
+--- md devices:
+ls: cannot access '/dev/md/': No such file or directory
+/sys/block/md127/md/array_state=inactive
+0
+mdadm: stopped /dev/md127
+/etc/lvm/archive:
+ahrpv_00000-1413089303.vg
+ahrpv_00001-150269598.vg

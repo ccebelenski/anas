@@ -1,0 +1,12 @@
+  {
+      "report": [
+          {
+              "vg": [
+                  {"vg_name":"w3x", "pv_count":"1", "lv_count":"1", "snap_count":"0", "vg_attr":"wz--n-", "vg_size":"2139095040", "vg_free":"0", "vg_uuid":"ai5ebm-GXMR-wpLN-vvC9-3wvn-QcWj-ACb6iO"}
+              ]
+          }
+      ]
+      ,
+      "log": [
+      ]
+  }

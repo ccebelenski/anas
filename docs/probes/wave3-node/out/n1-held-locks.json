@@ -1,0 +1,39 @@
+LISTEN 0      511        127.0.0.1:9229       0.0.0.0:*    users:(("node",pid=331938,fd=31))                                                                                                             
+{
+  "at": "2026-10-15T15:02:57.900Z",
+  "held": [
+    {
+      "key": "zfs:15722995367635085689/a",
+      "mode": "shared",
+      "holders": [
+        {
+          "id": "0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba",
+          "operation": "zfs.snapshot",
+          "status": "running"
+        }
+      ]
+    },
+    {
+      "key": "zfs:15722995367635085689",
+      "mode": "shared",
+      "holders": [
+        {
+          "id": "0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba",
+          "operation": "zfs.snapshot",
+          "status": "running"
+        }
+      ]
+    },
+    {
+      "key": "zpool:15722995367635085689",
+      "mode": "shared",
+      "holders": [
+        {
+          "id": "0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba",
+          "operation": "zfs.snapshot",
+          "status": "running"
+        }
+      ]
+    }
+  ]
+}

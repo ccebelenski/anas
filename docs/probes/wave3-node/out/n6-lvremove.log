@@ -1,0 +1,62 @@
+  Physical volume "/dev/loop5" successfully created.
+  Volume group "w3n6vg" successfully created
+  Logical volume "lv" created.
+  Logical volume "keep" created.
+  LV   VG     Attr       LSize  Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  keep w3n6vg -wi-a----- 32.00m                                                    
+  lv   w3n6vg -wi-a----- 64.00m                                                    
+  Logical volume "map" created.
+  Logical volume "map" successfully removed.
+rc=0
+20:693912 openat(AT_FDCWD, "/usr/lib/locale/locale-archive", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+61:693912 openat(AT_FDCWD, "/dev/block", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+97:693912 openat(AT_FDCWD, "/dev/loop0", O_RDONLY|O_DIRECT|O_NOATIME) = 4
+98:693912 openat(AT_FDCWD, "/dev/loop1", O_RDONLY|O_DIRECT|O_NOATIME) = 4
+99:693912 openat(AT_FDCWD, "/dev/loop2", O_RDONLY|O_DIRECT|O_NOATIME) = 4
+100:693912 openat(AT_FDCWD, "/dev/loop3", O_RDONLY|O_DIRECT|O_NOATIME) = 4
+101:693912 openat(AT_FDCWD, "/dev/loop4", O_RDONLY|O_DIRECT|O_NOATIME) = 4
+102:693912 openat(AT_FDCWD, "/dev/loop5", O_RDONLY|O_DIRECT|O_NOATIME) = 4
+103:693912 openat(AT_FDCWD, "/dev/loop6", O_RDONLY|O_DIRECT|O_NOATIME) = 4
+104:693912 openat(AT_FDCWD, "/dev/loop7", O_RDONLY|O_DIRECT|O_NOATIME) = 4
+106:693912 openat(AT_FDCWD, "/sys/block/sda/holders", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+108:693912 openat(AT_FDCWD, "/sys/block/sda/holders", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+110:693912 openat(AT_FDCWD, "/sys/block/sda/holders", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+112:693912 openat(AT_FDCWD, "/sys/block/sda/holders", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+114:693912 openat(AT_FDCWD, "/sys/block/sdb/holders", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+116:693912 openat(AT_FDCWD, "/sys/block/sdb/holders", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+118:693912 openat(AT_FDCWD, "/sys/block/sdb/holders", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+120:693912 openat(AT_FDCWD, "/sys/block/sdc/holders", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+122:693912 openat(AT_FDCWD, "/sys/block/sdc/holders", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+124:693912 openat(AT_FDCWD, "/sys/block/sdc/holders", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+126:693912 openat(AT_FDCWD, "/sys/block/sdd/holders", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+128:693912 openat(AT_FDCWD, "/sys/block/sde/holders", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4
+130:693912 openat(AT_FDCWD, "/dev/loop0", O_RDONLY|O_DIRECT|O_NOATIME) = 5
+131:693912 openat(AT_FDCWD, "/dev/loop1", O_RDONLY|O_DIRECT|O_NOATIME) = 6
+132:693912 openat(AT_FDCWD, "/dev/loop2", O_RDONLY|O_DIRECT|O_NOATIME) = 7
+133:693912 openat(AT_FDCWD, "/dev/loop3", O_RDONLY|O_DIRECT|O_NOATIME) = 8
+134:693912 openat(AT_FDCWD, "/dev/loop4", O_RDONLY|O_DIRECT|O_NOATIME) = 9
+135:693912 openat(AT_FDCWD, "/dev/loop5", O_RDONLY|O_DIRECT|O_NOATIME) = 10
+148:693912 openat(AT_FDCWD, "/sys/dev/block/7:0/loop/partscan", O_RDONLY) = 23
+149:693912 openat(AT_FDCWD, "/sys/dev/block/7:1/loop/partscan", O_RDONLY) = 5
+rc=137
+bash: line 1: 694045 Killed                  strace -f -qq -e trace=io_submit -e inject=io_submit:signal=SIGKILL:when=22 -o /var/tmp/w3n6/lv-kill.trace lvremove -y w3n6vg/lv
+694048 io_submit(0x7ec42e604000, 1, [{aio_data=0, aio_lio_opcode=IOCB_CMD_PWRITE, aio_fildes=4, aio_buf="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., aio_nbytes=4608, aio_offs
+694048 io_submit(0x7ec42e604000, 1, [{aio_data=0, aio_lio_opcode=IOCB_CMD_PWRITE, aio_fildes=4, aio_buf="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., aio_nbytes=4608, aio_offs
+694048 +++ killed by SIGKILL +++
+--- lvs:
+  LV   VG     Attr       LSize  Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  keep w3n6vg -wi-a----- 32.00m                                                    
+  lv   w3n6vg -wi------- 64.00m                                                    
+--- vgck:
+vgck rc=0
+--- /run/lock/lvm:
+total 0
+drwx------ 2 root root  40 Oct 15 15:28 .
+drwxrwxrwt 7 root root 260 Oct 15 05:05 ..
+--- metadata seqno:
+  VG     Seq
+  w3n6vg   7
+--- a second lvremove:
+  Logical volume "lv" successfully removed.
+  LV   VG     Attr       LSize  Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  keep w3n6vg -wi-a----- 32.00m                                                    

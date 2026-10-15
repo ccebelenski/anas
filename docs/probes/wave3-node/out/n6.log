@@ -1,0 +1,29 @@
+a=/dev/loop2
+b=/dev/loop3
+c=/dev/loop4
+d=/dev/loop5
+rc=0
+ioctl requests of the zpool process, numbered (per tracee):
+     18 692915
+loop2   7:2   0  256M 0 loop 
+mdadm: array /dev/md/w3n6b started.
+rc=0
+38: 92:693688 ioctl(4, SET_ARRAY_INFO, 0x7ffda5287ee0) = 0
+115: 177:693688 ioctl(4, ADD_NEW_DISK, 0x5c9a79c4ea68) = 0
+116: 178:693688 ioctl(4, ADD_NEW_DISK, 0x5c9a79c4ec48) = 0
+117: 179:693688 ioctl(4, RUN_ARRAY, 0x7ffda5288030) = 0
+183:693688 write(1, "mdadm: array /dev/md/w3n6b start"..., 36) = 36
+mdadm: stopped /dev/md/w3n6b
+0
+/etc/lvm/archive:
+ahrpv_00000-1413089303.vg
+ahrpv_00001-150269598.vg
+gtcache_00000-1636167583.vg
+gtcache_00001-1232951229.vg
+gtcache_00002-1887164236.vg
+gtcache_00003-1261705507.vg
+gtcache_00004-2034930319.vg
+gtcache_00005-1414726200.vg
+gtcache_00006-638635588.vg
+/dev/loop1: [2049]:548044 (/var/tmp/pvepool-fixture/sysfix.img)
+/dev/loop0: [2049]:548022 (/var/tmp/pvepool-fixture/pvfix.img)

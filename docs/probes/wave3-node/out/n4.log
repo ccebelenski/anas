@@ -1,0 +1,93 @@
+loop=/dev/loop2
+w3dm	failmode	wait	default
+0 2097152 linear 7:2 0
+NAME     USED
+w3dm    16.2M
+w3dm/a  16.0M
+
+### measure: baseline-device-live
+  node# zpool status w3dm            rc=0     115 ms
+  node# zpool list -H                rc=0     107 ms
+  node# zpool get -H guid w3dm       rc=0     105 ms
+  node# zfs list -H -r w3dm          rc=0     104 ms
+  node# zfs get -H mountpoint w3dm/a rc=0     106 ms
+  node# zpool status -jv w3dm        rc=0     105 ms
+  node# stat -f /w3dm/a              rc=0     105 ms
+  node# ls /w3dm/a                   rc=0     111 ms
+  D-state:
+ 375319 D    folio_wait_bit_common        01:21 (udev-worker)
+ 375366 D    cv_timedwait_common          01:21 [txg_sync]
+  GET /pools -> 200 in 121 ms
+    {"data":[{"name":"gtbackup","state":"ONLINE","size":8053063680,"allocated":471040,"free":8053063680,"fragmentation":1,"capacity":0,"dedupRatio":1,"scanRunning":false,"trimSupported":false,"upgradeAvai
+  GET /status -> 200 in 117 ms
+    {"data":{"node":"anas-pve","pools":[{"name":"gtbackup","state":"ONLINE","capacity":0,"size":8053063680,"allocated":471040,"free":8053063680,"scanRunning":false},{"name":"gtiscsi","state":"ONLINE","capacity":0,"size":5905580032,"allocated":233472,"free":5905580032,"scanRunning":false},{"name":"pvfix","state":"ONLINE","capacity":0,"size":1006632960,"allocated":555008,"free":1005584384,"scanRunning":
+  GET /health -> 200 in 36 ms
+    {"status":"ok","version":"0.4.3","abandonedCommands":[]}
+  GET /pools/w3dm/datasets -> 200 in 136 ms
+    {"data":[{"name":"w3dm","pool":"w3dm","type":"filesystem","used":16956416,"available":855458816,"referenced":24576,"mountpoint":"/w3dm","compression":"on","compressratio":1,"quota":0},{"name":"w3dm/a"
+15:00:33
+State:             SUSPENDED
+Open count:        1
+
+### measure: suspended-no-io-pending
+  node# zpool status w3dm            rc=0     106 ms
+  node# zpool list -H                rc=0     110 ms
+  node# zpool get -H guid w3dm       rc=0     105 ms
+  node# zfs list -H -r w3dm          rc=0     105 ms
+  node# zfs get -H mountpoint w3dm/a rc=0     105 ms
+  node# zpool status -jv w3dm        rc=0     109 ms
+  node# stat -f /w3dm/a              rc=0     112 ms
+  node# ls /w3dm/a                   rc=0     110 ms
+  D-state:
+  GET /pools -> 200 in 104 ms
+    {"data":[{"name":"gtbackup","state":"ONLINE","size":8053063680,"allocated":471040,"free":8053063680,"fragmentation":1,"capacity":0,"dedupRatio":1,"scanRunning":false,"trimSupported":false,"upgradeAvai
+  GET /status -> 200 in 137 ms
+    {"data":{"node":"anas-pve","pools":[{"name":"gtbackup","state":"ONLINE","capacity":0,"size":8053063680,"allocated":471040,"free":8053063680,"scanRunning":false},{"name":"gtiscsi","state":"ONLINE","capacity":0,"size":5905580032,"allocated":233472,"free":5905580032,"scanRunning":false},{"name":"pvfix","state":"ONLINE","capacity":0,"size":1006632960,"allocated":555008,"free":1005584384,"scanRunning":
+  GET /health -> 200 in 40 ms
+    {"status":"ok","version":"0.4.3","abandonedCommands":[]}
+  GET /pools/w3dm/datasets -> 200 in 150 ms
+    {"data":[{"name":"w3dm","pool":"w3dm","type":"filesystem","used":16956416,"available":855458816,"referenced":24576,"mountpoint":"/w3dm","compression":"on","compressratio":1,"quota":0},{"name":"w3dm/a"
+15:00:40
+dd started
+ 375319 D    -                      (udev-worker)
+ 393199 D    cv_timedwait_common    [txg_sync]
+
+### measure: suspended-txg-sync-blocked
+  node# zpool status w3dm            rc=0     111 ms
+  node# zpool list -H                rc=0     108 ms
+  node# zpool get -H guid w3dm       rc=0      11 ms
+  node# zfs list -H -r w3dm          rc=0     104 ms
+  node# zfs get -H mountpoint w3dm/a rc=0     104 ms
+  node# zpool status -jv w3dm        rc=0     107 ms
+  node# stat -f /w3dm/a              rc=0       7 ms
+  node# ls /w3dm/a                   rc=0       6 ms
+  D-state:
+    258 D    wait_on_buffer            09:55:05 [jbd2/sda1-8]
+ 393199 D    cv_timedwait_common          00:23 [txg_sync]
+  GET /pools -> 200 in 180 ms
+    {"data":[{"name":"gtbackup","state":"ONLINE","size":8053063680,"allocated":471040,"free":8053063680,"fragmentation":1,"capacity":0,"dedupRatio":1,"scanRunning":false,"trimSupported":false,"upgradeAvai
+  GET /status -> 200 in 109 ms
+    {"data":{"node":"anas-pve","pools":[{"name":"gtbackup","state":"ONLINE","capacity":0,"size":8053063680,"allocated":471040,"free":8053063680,"scanRunning":false},{"name":"gtiscsi","state":"ONLINE","capacity":0,"size":5905580032,"allocated":233472,"free":5905580032,"scanRunning":false},{"name":"pvfix","state":"ONLINE","capacity":0,"size":1006632960,"allocated":555008,"free":1005584384,"scanRunning":
+  GET /health -> 200 in 22 ms
+    {"status":"ok","version":"0.4.3","abandonedCommands":[]}
+  GET /pools/w3dm/datasets -> 200 in 105 ms
+    {"data":[{"name":"w3dm","pool":"w3dm","type":"filesystem","used":16956416,"available":855458816,"referenced":24576,"mountpoint":"/w3dm","compression":"on","compressratio":1,"quota":0},{"name":"w3dm/a"
+
+### reads: suspended-txg-sync-blocked
+  GET /disks -> 200 in 82 ms
+    {"data":[{"id":"scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0","name":"sda","path":"/dev/sda","size":34359738368,"model":"Q
+  GET /ahr -> 200 in 40 ms
+    {"data":[]}
+  GET /mounts -> 200 in 77 ms
+    {"data":[{"mountpoint":"/","source":"/dev/sda1","type":"local","fstype":"ext4","state":"ok","mounted":true,"persistent":
+  GET /shares/smb -> 200 in 49 ms
+    {"data":[{"name":"printers","path":"/var/tmp","comment":"All Printers","browseable":false,"readOnly":true,"guestOk":fals
+  GET /iscsi/health -> 200 in 43 ms
+    {"data":{"installed":true,"configfsPresent":true,"saveconfigPresent":true,"missingLuns":[],"targetsServingNothing":[],"s
+  GET /pools/w3dm -> 200 in 95 ms
+    {"data":{"name":"w3dm","state":"ONLINE","guid":"15722995367635085689","size":1006632960,"allocated":16986931,"free":9898
+  node# blkid -p /dev/mapper/w3dm after 5 s:
+        PID STAT WCHAN                CMD
+     405916 D    folio_wait_bit_commo blkid -p /dev/mapper/w3dm
+State:             ACTIVE
+ 375366 D    cv_timedwait_common          03:14 [txg_sync]

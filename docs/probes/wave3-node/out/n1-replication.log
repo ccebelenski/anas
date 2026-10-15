@@ -1,0 +1,35 @@
+
+### task w3rep (disabled, far-future schedule)
+HTTP 202 0.174942
+{"job":{"id":"efe3ff76-4d69-43ab-a647-23e32bb732b2","status":"running","operation":"replication.task.create","createdAt":"2026-10-15T15:09:25.329Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"created": "w3rep"} | 
+State:             SUSPENDED
+
+### Run now, device suspended
+HTTP 202 0.021160
+{"started":true}
+  88e8baa1-cc68-4083-8fa6-aa9374de7946 zfs.replicate running zfs snapshot w3dm/a@snapshot-2026-10-15T15-09-26-871Z
+{
+  "at": "2026-10-15T15:09:31.272Z",
+  "held": []
+}
+ 509477 Ds   cv_wait_common         /usr/sbin/zfs snapshot -- w3dm/a@snapshot-2026-10-15T15-09-26-871Z
+
+### a pool destroy now: does it wait?
+HTTP 409 0.230588
+X-Anas-Confirm-Code: dc328cf3cb30
+(not confirmed — the code is not resent; the question is answered by the lock table above)
+State:             ACTIVE
+  8c8a0107-47d5-482d-a3b6-8439dbbf84b2 zpool.destroy failed Destroying pool 'w3dm' is refused: it is held by iSCSI LUN 0 'w3lun' of target iqn.2003-01.org.linux-iscsi.anas-pve:w3n1 (/dev/zvol/w3dm/vol). Nothing underneat
+  efe3ff76-4d69-43ab-a647-23e32bb732b2 replication.task.create completed 
+  4ca4fb81-1d1f-40d1-9cbb-c21b4113e63f replication.task.run completed 
+  88e8baa1-cc68-4083-8fa6-aa9374de7946 zfs.replicate completed 
+NAME
+w3dm
+w3dm/a
+w3dm/a@hold
+w3dm/a@snapshot-2026-10-15T15-09-26-871Z
+w3dm/rep
+w3dm/rep@snapshot-2026-10-15T15-09-26-871Z
+w3dm/vol

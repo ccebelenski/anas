@@ -1,0 +1,136 @@
+/srv/w3nfs    	127.0.0.1(sync,wdelay,hide,no_subtree_check,sec=sys,rw,insecure,no_root_squash,no_all_squash)
+HTTP 202 0.084865
+{"job":{"id":"a56ec1ff-d094-4d92-b773-7fecc337f993","status":"running","operation":"mount.create","createdAt":"2026-10-15T15:10:37.563Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed | Mounting /mnt/w3nfs | {"created": "/mnt/w3nfs", "warnings": []} | 
+127.0.0.1:/srv/w3nfs /mnt/w3nfs nfs4 vers=4.2,hard,nosuid,nodev,nofail,_netdev 0 0
+TARGET     SOURCE               FSTYPE OPTIONS
+/mnt/w3nfs 127.0.0.1:/srv/w3nfs nfs4   rw,nosuid,nodev,relatime,vers=4.2,rsize=524288,wsize=524288,namlen=255,hard,fatal_neterrors=none,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=127.0.0.1,local_lock=none,addr=127.0.0.1
+
+### row 4: is lsof / fuser installed?
+lsof: not installed
+/usr/bin/fuser
+psmisc: /usr/bin/fuser
+
+### row 4: hold a file open on /mnt/w3nfs (a shell with the file on fd 3)
+526566 bash -c setsid bash -c 'exec 3</mnt/w3nfs/f0; exec sleep 3600' </dev/null >/dev/null 2>&1 & sleep 1; pgrep -af 'sleep 3600'; fuser -vm /mnt/w3nfs 2>&1 | tail -3
+526568 sleep 3600
+                     USER        PID ACCESS COMMAND
+/mnt/w3nfs:          root     kernel mount /mnt/w3nfs
+                     root      526568 f.... sleep
+
+### row 4: Unmount through the API
+HTTP 202 0.032372
+{"job":{"id":"377db82c-e14a-4e84-9fdf-ae4410a775a7","status":"running","operation":"mount.unmount","createdAt":"2026-10-15T15:10:46.388Z","createdBy":"root"}}
+[t+0s] failed | Unmounting /mnt/w3nfs |  | {"code": "JOB_FAILED", "message": "umount.nfs4: /mnt/w3nfs: device is busy \u2014 held open by: sleep(526568)"}
+{"job":{"id":"377db82c-e14a-4e84-9fdf-ae4410a775a7","status":"failed","operation":"mount.unmount","progress":"Unmounting /mnt/w3nfs","createdAt":"2026-10-15T15:10:46.388Z","createdBy":"root","startedAt":"2026-10-15T15:10:46.388Z","completedAt":"2026-10-15T15:10:46.450Z","result":null,"error":{"code":"JOB_FAILED","message":"umount.nfs4: /mnt/w3nfs: device is busy — held open by: sleep(526568)"},"detail":null}}
+still mounted
+
+### row 4: Remove through the API (challenge only)
+HTTP 409 0.046341
+X-Anas-Confirm-Code: 2d00c82f60ea
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Removing mount '/mnt/w3nfs' deletes its configuration","warnings":["The /etc/fstab line for '/mnt/w3nfs' is deleted; the mount does not come back at boot.","'/mnt/w3nfs' is unmounted now."]}}
+HTTP 202 0.081771
+{"job":{"id":"56c7fbd8-b0ea-4983-be7a-6ca643311030","status":"running","operation":"smb.share.add","createdAt":"2026-10-15T15:10:55.572Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"created": "w3nfsshare"} | 
+[w3nfsshare]
+	create mask = 0664
+	directory mask = 0775
+	inherit acls = Yes
+HTTP 202 0.131791
+{"job":{"id":"9472c870-ec83-4634-8559-19c5096c78b9","status":"running","operation":"zfs.create","createdAt":"2026-10-15T15:10:56.596Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"created": "w3s7/a"} | 
+HTTP 202 0.166088
+{"job":{"id":"e439dcf8-523c-41d1-8ee4-a4ab22656aae","status":"running","operation":"zfs.create","createdAt":"2026-10-15T15:10:57.449Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"created": "w3s7/a/b"} | 
+mount.nfs4: Operation not permitted for 127.0.0.1:/srv/w3nfs on /w3s7/a/nfs
+NAME
+w3s7
+w3s7/a
+w3s7/a/b
+TARGET      SOURCE               FSTYPE OPTIONS
+/w3s7/a/nfs 127.0.0.1:/srv/w3nfs nfs4   rw,nosuid,nodev,relatime,vers=4.2,rsize=524288,wsize=524288,namlen=255,hard,fatal_neterrors=none,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=127.0.0.1,local_lock=none,addr=127.0.0.1
+f0
+tree
+
+### N2b: holder — recursive ownership apply on w3s7/a (its walk enters the NFS mount at /w3s7/a/nfs)
+HTTP 409 0.274887
+X-Anas-Confirm-Code: 6f832711f67b
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Applying to existing files rewrites the permissions of every file and directory under '/w3s7/a'","warnings":["It crosses the child datasets mounted under '/w3s7/a': w3s7/a/b (/w3s7/a/b).","The current permissions are not recorded anywhere, so this cannot be undone."]}}
+HTTP 202 0.215185
+{"job":{"id":"bdbfcf36-e5b5-4c9f-a69e-38af38e5b114","status":"running","operation":"fs.setAccess","createdAt":"2026-10-15T15:11:28.734Z","createdBy":"root"}}
+table inet w3n5 {
+	chain out {
+		type filter hook output priority filter; policy accept;
+		tcp dport 2049 drop
+	}
+}
+15:11:28
+
+### measure: port-blocked
+      PID STAT WCHAN                      ELAPSED CMD
+  D/S-state on the mount:
+ 535761 Ds   rpc_wait_bit_killable        00:12 /usr/bin/chown -R nobody /w3s7/a
+ 537471 Ss   do_wait                      00:04 bash -c ( stat /mnt/w3nfs >/dev/null 2>&1 & p=$!; sleep 4; ps -o pid,stat,wchan:22,etime,cmd -p $p | sed 's/^/  /' ); echo '  D/S-state on the mount:'; ps -eo pid,stat,wchan:22,etime,cmd | grep -E '[c]hown|[s]tat /mnt' | head -5
+  GET /status -> 200 in 2151 ms
+    {"data":{"node":"anas-pve","pools":[{"name":"gtbackup","state":"ONLINE","capacity":0,"size":8053063680,"allocated":471040,"free":8053063680,"scanRunning":false},{"name":"gtiscsi","state":"ONLINE","capacity":0,"size":5905580032,"allocated":233472,"free":5905580
+  GET /shares/smb -> 200 in 2051 ms
+    {"data":[{"name":"printers","path":"/var/tmp","comment":"All Printers","browseable":false,"readOnly":true,"guestOk":false,"validUsers":[],"hostsAllow":[],"hostsDeny":[],"pathState":"exists","pathExists":true},{"name":"print$","path":"/var/lib/samba/printers","
+  GET /shares/smb/w3nfsshare -> 200 in 2163 ms
+    {"data":{"name":"w3nfsshare","path":"/mnt/w3nfs","comment":null,"browseable":true,"readOnly":false,"guestOk":false,"validUsers":[],"hostsAllow":[],"hostsDeny":[],"pathState":"not-answering","connections":[]}}
+  GET /mounts -> 200 in 2132 ms
+    {"data":[{"mountpoint":"/","source":"/dev/sda1","type":"local","fstype":"ext4","state":"ok","mounted":true,"persistent":true,"remote":false,"automount":false,"disabled":false,"pveManaged":false,"ahrManaged":false,"readOnly":false,"size":33603391488,"used":1231
+  GET /health -> 200 in 22 ms
+    {"status":"ok","version":"0.4.3","abandonedCommands":[]}
+  GET /pools/w3s7/datasets -> 200 in 86 ms
+    {"data":[{"name":"w3s7","pool":"w3s7","type":"filesystem","used":6508544,"available":362590208,"referenced":25600,"mountpoint":"/w3s7","compression":"on","compressratio":1,"quota":0},{"name":"w3s7/a","pool":"w3s7","type":"filesystem","used":50176,"available":3
+HTTP 200 0.010737
+{"job":{"id":"bdbfcf36-e5b5-4c9f-a69e-38af38e5b114","status":"running","operation":"fs.setAccess","progress":"chown -R nobody /w3s7/a","createdAt":"2026-10-15T15:11:28.734Z","createdBy":"root","startedAt":"2026-10-15T15:11:28.734Z","completedAt":null,"result":null,"error":null,"detail":null}}
+
+### N2b: recursive destroy of w3s7/a while the holder hangs
+HTTP 409 0.106769
+X-Anas-Confirm-Code: e94ef9321aa6
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Destroying dataset 'w3s7/a' permanently erases its data","warnings":["Destroying 'w3s7/a' is irreversible — all data in the dataset is permanently lost.","1 child dataset(s) will also be destroyed.","Child datasets destroyed with it: w3s7/a/b."]}}
+HTTP 202 0.184750
+{"job":{"id":"a115db2e-dc44-4a52-ab91-791fbe988eb7","status":"queued","operation":"zfs.destroy","createdAt":"2026-10-15T15:11:50.270Z","createdBy":"root"}}
+HTTP 200 0.013859
+{"job":{"id":"a115db2e-dc44-4a52-ab91-791fbe988eb7","status":"queued","operation":"zfs.destroy","progress":"waiting for fs.setAccess (job bdbfcf36-e5b5-4c9f-a69e-38af38e5b114) on Dataset 'w3s7/a'","createdAt":"2026-10-15T15:11:50.270Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+by hand, destroy waiting: zfs create w3s7/a/d
+0
+1
+unblocked
+15:12:06
+[t+0s] running | chown -R nobody /w3s7/a |  | 
+[t+69s] completed | chown -R nobody /w3s7/a | {"dataset": "w3s7/a", "mountpoint": "/w3s7/a", "aclEnabled": false, "aclAutoEnabled": false, "namedCount": 0, "clearedNamed": false} | 
+{"job":{"id":"bdbfcf36-e5b5-4c9f-a69e-38af38e5b114","status":"completed","operation":"fs.setAccess","progress":"chown -R nobody /w3s7/a","createdAt":"2026-10-15T15:11:28.734Z","createdBy":"root","startedAt":"2026-10-15T15:11:28.734Z","completedAt":"2026-10-15T15:13:15.347Z","result":{"dataset":"w3s7/a","mountpoint":"/w3s7/a","aclEnabled":false,"aclAutoEnabled":false,"namedCount":0,"clearedNamed":false},"error":null,"detail":null}}
+[t+1s] failed |  |  | {"code": "STATE_CHANGED", "message": "Dataset 'w3s7/a' changed since you confirmed (the child datasets: w3s7/a/b (createtxg 50065) at the confirmation, the child datasets: w3s7/a/b (createtxg 50065), w3s7/a/d (createtxg 53890) now) \u2014 nothing was done; confirm again"}
+{"job":{"id":"a115db2e-dc44-4a52-ab91-791fbe988eb7","status":"failed","operation":"zfs.destroy","progress":null,"createdAt":"2026-10-15T15:11:50.270Z","createdBy":"root","startedAt":"2026-10-15T15:13:15.348Z","completedAt":"2026-10-15T15:13:15.415Z","result":null,"error":{"code":"STATE_CHANGED","message":"Dataset 'w3s7/a' changed since you confirmed (the child datasets: w3s7/a/b (createtxg 50065) at the confirmation, the child datasets: w3s7/a/b (createtxg 50065), w3s7/a/d (createtxg 53890) now) — nothing was done; confirm again"},"detail":null}}
+NAME
+w3s7
+w3s7/a
+w3s7/a/b
+w3s7/a/d
+nobody /srv/w3nfs
+nobody /srv/w3nfs/f0
+nobody /srv/w3nfs/tree/d0/f0
+nobody /srv/w3nfs/tree/d59/f499
+HTTP 409 0.042454
+X-Anas-Confirm-Code: 7d8dc4b99986
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Removing SMB share 'w3nfsshare' stops sharing '/mnt/w3nfs'","warnings":["Removing SMB share 'w3nfsshare' makes the shared path '/mnt/w3nfs' inaccessible over SMB."]}}
+HTTP 202 0.060103
+{"job":{"id":"95125478-a212-47db-8ab9-c695672360bb","status":"running","operation":"smb.share.remove","createdAt":"2026-10-15T15:13:34.371Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"removed": "w3nfsshare"} | 
+HTTP 409 0.028949
+X-Anas-Confirm-Code: 2ef654dd0311
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Removing mount '/mnt/w3nfs' deletes its configuration","warnings":["The /etc/fstab line for '/mnt/w3nfs' is deleted; the mount does not come back at boot.","'/mnt/w3nfs' is unmounted now.","The mountpoint directory '/mnt/w3nfs' is removed if it is empty (never its contents)."]}}
+HTTP 202 0.030801
+{"job":{"id":"35012a43-9b9e-40ff-acee-3fc4390c8d9b","status":"running","operation":"mount.remove","createdAt":"2026-10-15T15:13:35.185Z","createdBy":"root"}}
+[t+0s] running | Unmounting /mnt/w3nfs |  | 
+[t+0s] completed | Removing the mountpoint directory /mnt/w3nfs | {"removed": "/mnt/w3nfs"} | 
+0
+0
+ls: cannot access '/mnt/w3nfs': No such file or directory

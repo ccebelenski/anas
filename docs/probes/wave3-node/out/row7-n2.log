@@ -1,0 +1,110 @@
+
+### setup: pool w3s7, datasets a, a/b
+HTTP 202 0.032107
+{"job":{"id":"140482c3-06e8-4f2d-8c15-0a3401fd6351","status":"running","operation":"zpool.create","createdAt":"2026-10-15T14:59:04.811Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  |  | 
+HTTP 202 0.109327
+{"job":{"id":"77acd445-d1fe-457a-b0e3-7b4b080b3d16","status":"running","operation":"zfs.create","createdAt":"2026-10-15T14:59:05.586Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"created": "w3s7/a"} | 
+HTTP 202 0.105760
+{"job":{"id":"25cec289-d055-4b42-94cf-4368c9d252db","status":"running","operation":"zfs.create","createdAt":"2026-10-15T14:59:06.373Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"created": "w3s7/a/b"} | 
+
+### 7c: snapshots s1 s2 s3 of w3s7/a (API), bookmark #bm3 (by hand)
+HTTP 202 0.160590
+{"job":{"id":"c50c7dbe-57c0-49ee-9bc2-b77ed07e360d","status":"running","operation":"zfs.snapshot","createdAt":"2026-10-15T14:59:07.235Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+0s] completed |  | {"created": "w3s7/a@s1"} | 
+HTTP 202 0.177686
+{"job":{"id":"a764d00e-8fb7-4d06-81a8-58a660113823","status":"running","operation":"zfs.snapshot","createdAt":"2026-10-15T14:59:08.139Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+0s] completed |  | {"created": "w3s7/a@s2"} | 
+HTTP 202 0.122900
+{"job":{"id":"3f070493-ad22-4472-8851-ec6795975f99","status":"running","operation":"zfs.snapshot","createdAt":"2026-10-15T14:59:08.981Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+0s] completed |  | {"created": "w3s7/a@s3"} | 
+NAME
+w3s7/a
+w3s7/a@s1
+w3s7/a@s2
+w3s7/a@s3
+w3s7/a#bm3
+w3s7/a/b
+
+### 7c: rollback to s1 WITHOUT force (challenge)
+HTTP 409 0.213720
+X-Anas-Confirm-Code: 7c4d34bc5b6c
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Rolling back 'w3s7/a' to snapshot 's1' discards newer data","warnings":["Rolling back discards all changes to 'w3s7/a' since snapshot 's1'.","2 more recent snapshot(s) exist (s3, s2); rollback requires force to destroy them, and doing so is irreversible."]}}
+
+### 7c: rollback to s1 WITH force (challenge)
+HTTP 409 0.249785
+X-Anas-Confirm-Code: f64aec9fcddb
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Rolling back 'w3s7/a' to snapshot 's1' discards newer data","warnings":["Rolling back discards all changes to 'w3s7/a' since snapshot 's1'.","Force destroys the 3 snapshot(s) and bookmark(s) newer than 's1' — irreversible.","Destroyed by force: w3s7/a#bm3, w3s7/a@s2, w3s7/a@s3."]}}
+
+### 7c: resend the force=true code on force=false → CONFIRM_SCOPE_CHANGED
+HTTP 409 0.126865
+X-Anas-Confirm-Code: 22fdf45978f3
+{"error":{"code":"CONFIRM_SCOPE_CHANGED","message":"You confirmed with force on; this request has force off — confirm again","warnings":["You confirmed with force on; this request has force off — confirm again","Rolling back discards all changes to 'w3s7/a' since snapshot 's1'.","2 more recent snapshot(s) exist (s3, s2); rollback requires force to destroy them, and doing so is irreversible."],"changed":["force"]}}
+
+### 7c: fresh force=true challenge, resend with its code
+HTTP 409 0.124051
+X-Anas-Confirm-Code: 63c814c3e612
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Rolling back 'w3s7/a' to snapshot 's1' discards newer data","warnings":["Rolling back discards all changes to 'w3s7/a' since snapshot 's1'.","Force destroys the 3 snapshot(s) and bookmark(s) newer than 's1' — irreversible.","Destroyed by force: w3s7/a#bm3, w3s7/a@s2, w3s7/a@s3."]}}
+HTTP 202 0.178778
+{"job":{"id":"7db110d1-e016-48fb-a7e3-a69c245c0c4e","status":"running","operation":"zfs.rollback","createdAt":"2026-10-15T14:59:11.305Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"rolledBack": "w3s7/a@s1"} | 
+NAME
+w3s7/a
+w3s7/a@s1
+w3s7/a/b
+
+### N2a: recursive destroy of w3s7/a — challenge
+HTTP 409 0.089274
+X-Anas-Confirm-Code: 9873f7bc3e3d
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Destroying dataset 'w3s7/a' permanently erases its data","warnings":["Destroying 'w3s7/a' is irreversible — all data in the dataset is permanently lost.","1 child dataset(s) will also be destroyed.","1 snapshot(s) of 'w3s7/a' will also be destroyed.","Child datasets destroyed with it: w3s7/a/b."]}}
+by hand: zfs create w3s7/a/c
+
+### N2a: resend the first code after the child appeared
+HTTP 409 0.107216
+X-Anas-Confirm-Code: e2990b9be4c0
+{"error":{"code":"CONFIRM_SCOPE_CHANGED","message":"the child datasets changed since you confirmed (w3s7/a/b (createtxg 133) then, w3s7/a/b (createtxg 133), w3s7/a/c (createtxg 615) now) — confirm again","warnings":["the child datasets changed since you confirmed (w3s7/a/b (createtxg 133) then, w3s7/a/b (createtxg 133), w3s7/a/c (createtxg 615) now) — confirm again","Destroying 'w3s7/a' is irreversible — all data in the dataset is permanently lost.","2 child dataset(s) will also be destroyed.","1 snapshot(s) of 'w3s7/a' will also be destroyed.","Child datasets destroyed with it: w3s7/a/b, w3s7/a/c."],"changed":["children"]}}
+NAME
+w3s7/a
+w3s7/a/b
+w3s7/a/c
+
+### N2b: a large tree under w3s7/a/files (by hand), for the lock holder
+200000
+
+### N2b: holder — PUT access owner=nobody applyToExisting on w3s7/a (X on its key)
+HTTP 409 0.183401
+X-Anas-Confirm-Code: 562dbf8f5f32
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Applying to existing files rewrites the permissions of every file and directory under '/w3s7/a'","warnings":["It crosses the child datasets mounted under '/w3s7/a': w3s7/a/b (/w3s7/a/b), w3s7/a/c (/w3s7/a/c).","The current permissions are not recorded anywhere, so this cannot be undone."]}}
+HTTP 202 0.201428
+{"job":{"id":"0eff7cfe-043f-486c-9171-3375c3bb4c8b","status":"running","operation":"fs.setAccess","createdAt":"2026-10-15T14:59:15.445Z","createdBy":"root"}}
+holder job 0eff7cfe-043f-486c-9171-3375c3bb4c8b
+HTTP 200 0.012194
+{"job":{"id":"0eff7cfe-043f-486c-9171-3375c3bb4c8b","status":"running","operation":"fs.setAccess","progress":null,"createdAt":"2026-10-15T14:59:15.445Z","createdBy":"root","startedAt":"2026-10-15T14:59:15.446Z","completedAt":null,"result":null,"error":null,"detail":null}}
+
+### N2b: recursive destroy challenged + confirmed while the holder runs
+HTTP 409 0.195639
+X-Anas-Confirm-Code: dc91a5a209b7
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Destroying dataset 'w3s7/a' permanently erases its data","warnings":["Destroying 'w3s7/a' is irreversible — all data in the dataset is permanently lost.","2 child dataset(s) will also be destroyed.","1 snapshot(s) of 'w3s7/a' will also be destroyed.","Child datasets destroyed with it: w3s7/a/b, w3s7/a/c."]}}
+HTTP 202 0.224294
+{"job":{"id":"f9706261-c787-49ac-9971-79cc1e991b89","status":"queued","operation":"zfs.destroy","createdAt":"2026-10-15T14:59:15.975Z","createdBy":"root"}}
+HTTP 200 0.022713
+{"job":{"id":"f9706261-c787-49ac-9971-79cc1e991b89","status":"running","operation":"zfs.destroy","progress":null,"createdAt":"2026-10-15T14:59:15.975Z","createdBy":"root","startedAt":"2026-10-15T14:59:16.547Z","completedAt":null,"result":null,"error":null,"detail":null}}
+HTTP 200 0.014171
+{"job":{"id":"0eff7cfe-043f-486c-9171-3375c3bb4c8b","status":"completed","operation":"fs.setAccess","progress":"chown -R nobody /w3s7/a","createdAt":"2026-10-15T14:59:15.445Z","createdBy":"root","startedAt":"2026-10-15T14:59:15.446Z","completedAt":"2026-10-15T14:59:16.547Z","result":{"dataset":"w3s7/a","mountpoint":"/w3s7/a","aclEnabled":false,"aclAutoEnabled":false,"namedCount":0,"clearedNamed":false},"error":null,"detail":null}}
+cannot create 'w3s7/a/d': Failed to lookup parent.
+
+### N2b: the holder ends, then the destroy runs
+[t+0s] completed | chown -R nobody /w3s7/a | {"dataset": "w3s7/a", "mountpoint": "/w3s7/a", "aclEnabled": false, "aclAutoEnabled": false, "namedCount": 0, "clearedNamed": false} | 
+{"job":{"id":"0eff7cfe-043f-486c-9171-3375c3bb4c8b","status":"completed","operation":"fs.setAccess","progress":"chown -R nobody /w3s7/a","createdAt":"2026-10-15T14:59:15.445Z","createdBy":"root","startedAt":"2026-10-15T14:59:15.446Z","completedAt":"2026-10-15T14:59:16.547Z","result":{"dataset":"w3s7/a","mountpoint":"/w3s7/a","aclEnabled":false,"aclAutoEnabled":false,"namedCount":0,"clearedNamed":false},"error":null,"detail":null}}
+[t+0s] completed |  | {"destroyed": "w3s7/a"} | 
+{"job":{"id":"f9706261-c787-49ac-9971-79cc1e991b89","status":"completed","operation":"zfs.destroy","progress":null,"createdAt":"2026-10-15T14:59:15.975Z","createdBy":"root","startedAt":"2026-10-15T14:59:16.547Z","completedAt":"2026-10-15T14:59:17.291Z","result":{"destroyed":"w3s7/a"},"error":null,"detail":null}}
+cannot open 'w3s7/a': dataset does not exist

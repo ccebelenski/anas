@@ -1,0 +1,22 @@
+HTTP 202 0.085014
+{"job":{"id":"19c72702-6989-43fa-a019-b493aba07814","status":"running","operation":"zpool.create","createdAt":"2026-10-15T15:17:58.024Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+0s] completed |  |  | 
+HTTP 202 0.160291
+{"job":{"id":"c016f83b-4caa-4714-b83c-faacaff8164f","status":"running","operation":"zfs.create","createdAt":"2026-10-15T15:17:58.942Z","createdBy":"root"}}
+[t+1s] running |  |  | 
+[t+1s] completed |  | {"created": "w3n7/big"} | 
+set-up
+/w3n7/big/nfs 127.0.0.1:/srv/w3nfs
+1
+w3n7
+/w3n7/big/nfs 127.0.0.1:/srv/w3nfs
+1
+{"job":{"id":"bf44f8d0-31d1-44e4-b26d-4025e42f2400","status":"completed","operation":"fs.setAccess","progress":null,"createdAt":"2026-10-15T15:19:57.793Z","createdBy":"root","startedAt":"2026-10-15T15
+{"job":{"id":"37f4a098-f3de-4af7-ba5f-f40e78d7eded","status":"running","operation":"fs.setAccess","progress":"chown -R daemon /w3n7/big","createdAt":"2026-10-15T15:20:09.326Z","createdBy":"root","star
+active
+active
+631880 bash -c systemctl is-active anasd anas; pgrep -af "chown -R" ; zpool list -H -o name w3n7
+w3n7
+{"job":{"id":"e53ea3f4-cc1d-4809-a9f3-dab3c7e26c7a","status":"running","operation":"fs.setAccess","progress":"chown -R bin /w3n7/big","createdAt":"2026-10-15T15:25:13.831Z","createdBy":"root","started
+[t+0s] failed |  |  | {"code": "JOB_FAILED", "message": "cannot destroy 'w3n7': pool is busy"}

@@ -1,0 +1,129 @@
+
+### 1. suspend; snapshot job (the holder)
+State:             SUSPENDED
+15:02:28
+HTTP 202 0.143592
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root"}}
+HTTP 200 0.030648
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+
+### 2. pool destroy, challenged + confirmed
+HTTP 409 0.134033
+X-Anas-Confirm-Code: 7aaf2c22ae28
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Destroying pool 'w3dm' permanently erases all its data","warnings":["Destroying 'w3dm' is irreversible — all data in the pool is permanently lost.","Every dataset, snapshot, and volume in 'w3dm' will be destroyed."]}}
+HTTP 202 0.151641
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root"}}
+HTTP 200 0.025710
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+
+### 3. a LUN on w3dm/vol, by hand
+Created block storage object w3lun using /dev/zvol/w3dm/vol.
+Created target iqn.2003-01.org.linux-iscsi.anas-pve:w3n1.
+Created TPG 1.
+Global pref auto_add_default_portal=true
+Created default portal listening on all IPs (0.0.0.0), port 3260.
+Created LUN 0.
+o- luns .................................................................................................................. [LUNs: 1]
+  o- lun0 .................................................................... [block/w3lun (/dev/zvol/w3dm/vol) (default_tg_pt_gp)]
+15:02:34
+
+### 4. waiting out the holder's 300 s job deadline (+ the 7 s kill ladder)
+--- t+25s 15:02:59
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+--- t+50s 15:03:24
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+--- t+75s 15:03:49
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+--- t+100s 15:04:14
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+--- t+125s 15:04:39
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+--- t+150s 15:05:04
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+--- t+175s 15:05:29
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+--- t+200s 15:05:54
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+--- t+225s 15:06:20
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+--- t+250s 15:06:45
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+--- t+275s 15:07:10
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+--- t+300s 15:07:35
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"running","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":null,"result":null,"error":null,"detail":null}}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm'","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,"detail":null}}
+--- t+325s 15:08:00
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"failed","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":"2026-10-15T15:07:35.996Z","result":null,"error":{"code":"TIMEOUT","message":"'zfs snapshot' did not finish within 300 s and could not be stopped: it is stuck in the kernel and
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm' — that job has ended, but a command it ran could not be stopped and is still running","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,
+--- t+350s 15:08:25
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"failed","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":"2026-10-15T15:07:35.996Z","result":null,"error":{"code":"TIMEOUT","message":"'zfs snapshot' did not finish within 300 s and could not be stopped: it is stuck in the kernel and
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"queued","operation":"zpool.destroy","progress":"waiting for zfs.snapshot (job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) on Pool 'w3dm' — that job has ended, but a command it ran could not be stopped and is still running","createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":null,"completedAt":null,"result":null,"error":null,
+
+### 4b. after the deadline
+HTTP 200 0.016649
+{"status":"ok","version":"0.4.3","abandonedCommands":[{"pid":420339,"label":"zfs snapshot","command":"/usr/sbin/zfs","cause":"deadline","lane":"job","jobId":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","budgetMs":300000,"since":"2026-10-15T15:07:35.995Z"}]}
+State:             SUSPENDED
+w3dm	ONLINE
+ 420339 Ds   cv_wait_common               05:57 /usr/sbin/zfs snapshot -- w3dm/a@hold
+[
+ {
+  "level": "warning",
+  "category": "command",
+  "message": "'zfs snapshot' (pid 420339, from job 0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba) did not end within 300 s and survived SIGKILL: it has been stuck in the kernel since 2026-10-15T15:07:35.995Z. A suspended pool or a hung disk or mount is the usual cause. The warning clears when the command returns or anasd restarts."
+ }
+]
+
+### 5. resume
+State:             ACTIVE
+15:08:26
+[t+0s] failed |  |  | {"code": "TIMEOUT", "message": "'zfs snapshot' did not finish within 300 s and could not be stopped: it is stuck in the kernel and still running (a suspended pool, a hung disk or mount, or an unresponsive remote host is the usual cause); what it was acting on is in an unknown state \u2014 check it before retrying"}
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"failed","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":"2026-10-15T15:07:35.996Z","result":null,"error":{"code":"TIMEOUT","message":"'zfs snapshot' did not finish within 300 s and could not be stopped: it is stuck in the kernel and still running (a suspended pool, a hung disk or mount, or an unresponsive remote host is the usual cause); what it was acting on is in an unknown state — check it before retrying"},"detail":null}}
+[t+0s] failed |  |  | {"code": "CONFLICT", "message": "Destroying pool 'w3dm' is refused: it is held by iSCSI LUN 0 'w3lun' of target iqn.2003-01.org.linux-iscsi.anas-pve:w3n1 (/dev/zvol/w3dm/vol). Nothing underneath stops this on its own \u2014 the operation would either fail with a bare 'busy' error or succeed silently and corrupt what the initiator sees. Delete LUN 0 ('w3lun') of target iqn.2003-01.org.linux-iscsi.anas-pve:w3n1 from the iSCSI screen first, or delete it with destroyBacking=true to remove the backing object in the same step. This refusal has no confirm bypass."}
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"failed","operation":"zpool.destroy","progress":null,"createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":"2026-10-15T15:08:26.642Z","completedAt":"2026-10-15T15:08:26.817Z","result":null,"error":{"code":"CONFLICT","message":"Destroying pool 'w3dm' is refused: it is held by iSCSI LUN 0 'w3lun' of target iqn.2003-01.org.linux-iscsi.anas-pve:w3n1 (/dev/zvol/w3dm/vol). Nothing underneath stops this on its own — the operation would either fail with a bare 'busy' error or succeed silently and corrupt what the initiator sees. Delete LUN 0 ('w3lun') of target iqn.2003-01.org.linux-iscsi.anas-pve:w3n1 from the iSCSI screen first, or delete it with destroyBacking=true to remove the backing object in the same step. This refusal has no confirm bypass."},"detail":null}}
+HTTP 200 0.008900
+{"status":"ok","version":"0.4.3","abandonedCommands":[]}
+State:             ACTIVE
+w3dm	ONLINE
+NAME
+w3dm
+w3dm/a
+w3dm/a@hold
+w3dm/vol
+  o- w3lun ..................................................................... [/dev/zvol/w3dm/vol (64.0MiB) write-thru activated]
+HTTP 200 0.019189
+{"job":{"id":"8c8a0107-47d5-482d-a3b6-8439dbbf84b2","status":"failed","operation":"zpool.destroy","progress":null,"createdAt":"2026-10-15T15:02:31.316Z","createdBy":"root","startedAt":"2026-10-15T15:08:26.642Z","completedAt":"2026-10-15T15:08:26.817Z","result":null,"error":{"code":"CONFLICT","message":"Destroying pool 'w3dm' is refused: it is held by iSCSI LUN 0 'w3lun' of target iqn.2003-01.org.linux-iscsi.anas-pve:w3n1 (/dev/zvol/w3dm/vol). Nothing underneath stops this on its own — the operation would either fail with a bare 'busy' error or succeed silently and corrupt what the initiator sees. Delete LUN 0 ('w3lun') of target iqn.2003-01.org.linux-iscsi.anas-pve:w3n1 from the iSCSI screen first, or delete it with destroyBacking=true to remove the backing object in the same step. This refusal has no confirm bypass."},"detail":null}}
+HTTP 200 0.021451
+{"job":{"id":"0e3ac2cb-089c-460f-b6e7-4c1e5853e8ba","status":"failed","operation":"zfs.snapshot","progress":null,"createdAt":"2026-10-15T15:02:28.868Z","createdBy":"root","startedAt":"2026-10-15T15:02:28.868Z","completedAt":"2026-10-15T15:07:35.996Z","result":null,"error":{"code":"TIMEOUT","message":"'zfs snapshot' did not finish within 300 s and could not be stopped: it is stuck in the kernel and still running (a suspended pool, a hung disk or mount, or an unresponsive remote host is the usual cause); what it was acting on is in an unknown state — check it before retrying"},"detail":null}}
+2026-10-15T15:07:35+00:00 anas-pve node[331938]: {"level":50,"time":1792076855996,"pid":331938,"hostname":"anas-pve","audit":true,"event":"job.failed","user":"root","uid":0,"operation":"zfs.snapshot","params":{"snapshot":"w3dm/a@hold","recursive":false},"requestId":"38c2d5f6-d54f-47f9-96df-15997693e0c6","durationMs":307128,"error":"'zfs snapshot' did not finish within 300 s and could not be stopped: it is stuck in the kernel and still running (a suspended pool, a hung disk or mount, or an unresponsive remote host is the usual cause); what it was acting on is in an unknown state — check it before retrying","msg":"audit: zfs.snapshot failed (307128ms)"}
+2026-10-15T15:08:26+00:00 anas-pve node[331938]: {"level":50,"time":1792076906817,"pid":331938,"hostname":"anas-pve","audit":true,"event":"job.failed","user":"root","uid":0,"operation":"zpool.destroy","params":{"pool":"w3dm","cleanup":false,"guid":"15722995367635085689"},"requestId":"c03cc467-3947-4378-9e9f-f9b695858ede","durationMs":175,"error":"Destroying pool 'w3dm' is refused: it is held by iSCSI LUN 0 'w3lun' of target iqn.2003-01.org.linux-iscsi.anas-pve:w3n1 (/dev/zvol/w3dm/vol). Nothing underneath stops this on its own — the operation would either fail with a bare 'busy' error or succeed silently and corrupt what the initiator sees. Delete LUN 0 ('w3lun') of target iqn.2003-01.org.linux-iscsi.anas-pve:w3n1 from the iSCSI screen first, or delete it with destroyBacking=true to remove the backing object in the same step. This refusal has no confirm bypass.","msg":"audit: zpool.destroy failed (175ms)"}
+Deleted Target iqn.2003-01.org.linux-iscsi.anas-pve:w3n1.
+Deleted storage object w3lun.
+o- / ......................................................................................................................... [...]
+  o- backstores .............................................................................................................. [...]
+  | o- block .................................................................................................. [Storage Objects: 0]
+  | o- fileio ................................................................................................. [Storage Objects: 0]
+  | o- pscsi .................................................................................................. [Storage Objects: 0]
+  | o- ramdisk ................................................................................................ [Storage Objects: 0]
+  o- iscsi ............................................................................................................ [Targets: 0]
+  o- loopback ......................................................................................................... [Targets: 0]
+  o- vhost ............................................................................................................ [Targets: 0]
+  o- xen-pvscsi ....................................................................................................... [Targets: 0]
+HTTP 409 0.152614
+X-Anas-Confirm-Code: cb70bbbc51e0
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Destroying pool 'w3dm' permanently erases all its data","warnings":["Destroying 'w3dm' is irreversible — all data in the pool is permanently lost.","Every dataset, snapshot, and volume in 'w3dm' will be destroyed."]}}
+HTTP 202 0.128187
+{"job":{"id":"36d38ca7-7bef-4d89-bd08-4ab67bc909ed","status":"running","operation":"zpool.destroy","createdAt":"2026-10-15T15:09:55.836Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"destroyed": "w3dm"} | 

@@ -1,0 +1,65 @@
+{
+  "pool": "w3n3",
+  "windowBefore": "Destroy pool Destroy pool \"w3n3\"? Destroying 'w3n3' is irreversible — all data in the pool is permanently lost. Every dataset, snapshot, and volume in 'w3n3' will be destroyed. Clean up disks (wipe ZFS labels so they are reusable) Cancel Destroy",
+  "windowAfter": "Destroy pool Destroy pool \"w3n3\"? Destroying 'w3n3' is irreversible — all data in the pool is permanently lost. Every dataset, snapshot, and volume in 'w3n3' will be destroyed. The pool's disks will be wiped clean (existing ZFS labels removed). Disks to wipe: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20-part1. Clean up disks (wipe ZFS labels so they are reusable) Cancel Destroy",
+  "trace": [
+    {
+      "t": 1700,
+      "method": "DELETE",
+      "url": "/anas/api/nodes/anas-pve/v1/pools/w3n3?cleanup=false",
+      "csrf": "6AD0E9F1:6PL…(52 chars)",
+      "confirmCode": null,
+      "status": 409,
+      "respConfirmCode": "c54deae3020a",
+      "respBody": {
+        "error": {
+          "code": "CONFIRMATION_REQUIRED",
+          "message": "Destroying pool 'w3n3' permanently erases all its data",
+          "warnings": [
+            "Destroying 'w3n3' is irreversible — all data in the pool is permanently lost.",
+            "Every dataset, snapshot, and volume in 'w3n3' will be destroyed."
+          ]
+        }
+      }
+    },
+    {
+      "t": 2166,
+      "method": "DELETE",
+      "url": "/anas/api/nodes/anas-pve/v1/pools/w3n3?cleanup=true",
+      "csrf": "6AD0E9F1:6PL…(52 chars)",
+      "confirmCode": null,
+      "status": 409,
+      "respConfirmCode": "81811f540d6a",
+      "respBody": {
+        "error": {
+          "code": "CONFIRMATION_REQUIRED",
+          "message": "Destroying pool 'w3n3' permanently erases all its data",
+          "warnings": [
+            "Destroying 'w3n3' is irreversible — all data in the pool is permanently lost.",
+            "Every dataset, snapshot, and volume in 'w3n3' will be destroyed.",
+            "The pool's disks will be wiped clean (existing ZFS labels removed).",
+            "Disks to wipe: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20-part1."
+          ]
+        }
+      }
+    },
+    {
+      "t": 2609,
+      "method": "DELETE",
+      "url": "/anas/api/nodes/anas-pve/v1/pools/w3n3?cleanup=true",
+      "csrf": "6AD0E9F1:6PL…(52 chars)",
+      "confirmCode": "81811f540d6a",
+      "status": 202,
+      "respConfirmCode": null,
+      "respBody": {
+        "job": {
+          "id": "f8cbdf15-a953-4819-83e7-aa625c8e14ea",
+          "status": "running",
+          "operation": "zpool.destroy",
+          "createdAt": "2026-10-15T14:57:55.700Z",
+          "createdBy": "root"
+        }
+      }
+    }
+  ]
+}

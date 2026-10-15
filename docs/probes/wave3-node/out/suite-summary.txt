@@ -1,0 +1,161 @@
+=== run1: start 2026-10-15T12:38:49.128Z duration 1896s expected=193 unexpected=26 skipped=35 flaky=0
+  integration/ahr-cache-api.spec.ts                passed=4
+  integration/ahr-cache-review.spec.ts             failed=1 passed=2
+  integration/ahr-cache-ui.spec.ts                 skipped=3
+  integration/ahr-expand-zero-gain.spec.ts         passed=3
+  integration/alert-encoding.spec.ts               passed=2
+  integration/auth.spec.ts                         passed=4
+  integration/backup-cancel.spec.ts                failed=1 skipped=1
+  integration/backup-source-guard.spec.ts          passed=5
+  integration/cloud-backends-2.spec.ts             failed=1 skipped=2
+  integration/cloud-backends.spec.ts               failed=1 skipped=3
+  integration/cloud-cancel.spec.ts                 failed=1 skipped=3
+  integration/cloud-guided-viewer.spec.ts          failed=1 passed=3 skipped=1
+  integration/cloud-remotes-api.spec.ts            passed=10
+  integration/cloud-remotes-ui.spec.ts             failed=1 passed=6
+  integration/cloud-review-fixes.spec.ts           failed=1 passed=2
+  integration/cloud-tasks-api.spec.ts              failed=1 passed=6 skipped=2
+  integration/cloud-tasks-ui.spec.ts               failed=7 passed=1
+  integration/dashboard.spec.ts                    passed=2
+  integration/dataset-permissions.spec.ts          passed=4
+  integration/datasets-api.spec.ts                 passed=5
+  integration/datasets-gfx-ui.spec.ts              passed=3
+  integration/datasets-hero.spec.ts                passed=5
+  integration/datasets-ui.spec.ts                  passed=5
+  integration/disks-reprobe.spec.ts                passed=5
+  integration/gateway.spec.ts                      passed=7
+  integration/ident-iscsi.spec.ts                  failed=1 skipped=2
+  integration/ident-mounts-repl.spec.ts            failed=1 skipped=3
+  integration/ident-zfs.spec.ts                    failed=1 passed=4
+  integration/identity-passdb.spec.ts              passed=5
+  integration/pool-composer.spec.ts                skipped=2
+  integration/pools-act-api.spec.ts                passed=5 skipped=4
+  integration/pools-act-ui.spec.ts                 passed=5 skipped=1
+  integration/pools-status.spec.ts                 passed=2
+  integration/pve-login-flow.spec.ts               passed=1
+  integration/pve-managed-pools.spec.ts            skipped=3
+  integration/pve-native-ui.spec.ts                passed=6
+  integration/pvepool-api.spec.ts                  failed=2 passed=10
+  integration/pvepool-ui.spec.ts                   failed=1 passed=6
+  integration/replication-ui.spec.ts               passed=7
+  integration/sched-stamps.spec.ts                 passed=3
+  integration/schedules-exclude-api.spec.ts        passed=7
+  integration/schedules-exclude.spec.ts            passed=1
+  integration/share-users.spec.ts                  passed=3
+  integration/shares.spec.ts                       passed=8
+  integration/smbsvc-api.spec.ts                   failed=1 passed=5
+  integration/smbsvc-recycle.spec.ts               passed=5
+  integration/smbsvc-ui.spec.ts                    failed=1 skipped=5
+  integration/snapshots-api.spec.ts                passed=3
+  integration/snapshots-ui.spec.ts                 passed=6
+  integration/vdev-classes-api.spec.ts             passed=3
+  integration/vdev-consumers-api.spec.ts           failed=1 passed=2
+  integration/vdev-remove-api.spec.ts              passed=7
+  integration/vdev-remove-byid-api.spec.ts         failed=1 passed=5
+  -- failures:
+  integration/ahr-cache-review.spec.ts:597 shape 3: a foreign PV in the pool VG is an advisory, never a pool disk, and survives destr
+      Error: {"code":"JOB_FAILED","message":"volume group 'gtcache' contains physical volume /dev/sdg1 — not this pool's arrays or cache slices. Refusing any LVM or md teardown: ANAS only removes a volume group whose every PV 
+  integration/backup-cancel.spec.ts:306 1 — the cancel ladder: 409 + code, replay 202, the pbc child stopped (gone, exit 130), can
+      ReferenceError: expect is not defined
+  integration/cloud-backends-2.spec.ts:316 azure — create, Test ok, copy run lands 12 files (verified through the backend), sync run 
+      ReferenceError: expect is not defined
+  integration/cloud-backends.spec.ts:223 s3 — curated create, Test ok, copy run lands 12 files, sync run deletes, wrong-credential 
+      ReferenceError: expect is not defined
+  integration/cloud-cancel.spec.ts:265 1 — the cancel ladder: 409 + code, replay 202, SIGINT lands (child gone, exit 130), cancel
+      ReferenceError: expect is not defined
+  integration/cloud-guided-viewer.spec.ts:521 4 — rclone.6 viewer live: bars/spark/figures, transferring climbs, tiny + small sparks, st
+      ReferenceError: expect is not defined
+  integration/cloud-remotes-ui.spec.ts:425 7 — an injected failure before Save: the failure surfaces AND the grid still reloads
+      ReferenceError: apiContext is not defined
+  integration/cloud-review-fixes.spec.ts:324 3 — Run now gates a running run with 409, runningProgress rides the row past the supervisi
+      ReferenceError: expect is not defined
+  integration/cloud-tasks-api.spec.ts:592 a wrong-password remote fails the run with rclone's error line, notifies, and shows as a c
+      Error: the failure is reported, not swallowed
+  integration/cloud-tasks-ui.spec.ts:442 1 — create through the wizard: empty-remotes toast, nested note, sync sentence, Copy defau
+      ReferenceError: apiContext is not defined
+  integration/cloud-tasks-ui.spec.ts:531 2 — run now: the job rides the strip, the Last run pill refreshes to success
+      ReferenceError: apiContext is not defined
+  integration/cloud-tasks-ui.spec.ts:561 3 — the empty-source sync refusal: the daemon's sentence in the dialog
+      ReferenceError: apiContext is not defined
+  integration/cloud-tasks-ui.spec.ts:596 4 — a stand-in rclone exiting 7: the failure surfaces, the grid still reloads
+      ReferenceError: apiContext is not defined
+  integration/cloud-tasks-ui.spec.ts:664 6 — removing a referenced remote is refused, the task named
+      ReferenceError: apiContext is not defined
+  integration/cloud-tasks-ui.spec.ts:698 7 — a disabled task's detail shows the history note
+      ReferenceError: apiContext is not defined
+  integration/cloud-tasks-ui.spec.ts:731 8 — preview: the wizard names the deleted file, the toolbar previews the saved task
+      ReferenceError: apiContext is not defined
+  integration/ident-iscsi.spec.ts:202 rename-and-recreate a zvol under a live LUN: resize and delete-with-destroy refuse 409
+      Error: {"error":{"code":"CONFLICT","reason":"lio-not-installed","message":"The LIO iSCSI target stack is not present on this node, so nothing can be created: install 'targetcli-fb python3-rtslib-fb' first. The packages e
+  integration/ident-mounts-repl.spec.ts:159 (a) two replication tasks on one source keep BOTH incremental bases held, each under its o
+      ReferenceError: expect is not defined
+  integration/ident-zfs.spec.ts:275 5. destroy with cleanup on a by-partuuid leaf wipes only that partition; the sibling parti
+      Error: {"error":{"code":"CONFIRM_SCOPE_CHANGED","message":"You confirmed with cleanup off; this request has cleanup on — confirm again","warnings":["You confirmed with cleanup off; this request has cleanup on — confirm a
+  integration/pvepool-api.spec.ts:314 snapshot create on the storage root pvfix → 400 naming storage + dataset
+      Error: expect(received).toContain(expected) // indexOf
+  integration/pvepool-api.spec.ts:503 a zvol on the sibling is accepted; a PVE guest volume is refused with the guest sentence
+      Error: expect(received).toBe(expected) // Object.is equality
+  integration/pvepool-ui.spec.ts:114 badges per ownership kind; siblings carry none
+      Error: expect(locator).toBeVisible() failed
+  integration/smbsvc-api.spec.ts:431 5 — AHR half: real-disk pool, the @snapshots mount, smbclient through the snapshot, and de
+      Error: {"error":{"code":"VALIDATION_ERROR","message":"Invalid snapshot request: 'anas-' is reserved for scheduled snapshots — choose another name"}}
+  integration/smbsvc-ui.spec.ts:250 1 — create through the dialog: Self-service fieldset, Previous Versions unticked, no note
+      ReferenceError: apiContext is not defined
+  integration/vdev-consumers-api.spec.ts:225 destroy with cleanup labelclears all six partitions and frees the disk
+      Error: /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part3 carries no ZFS label
+  integration/vdev-remove-byid-api.spec.ts:315 the LOG partition is replaced by its basename — the stripped id is refused
+      Error: expect(received).toContain(expected) // indexOf
+=== run2a: start 2026-10-15T13:13:43.923Z duration 33s expected=0 unexpected=3 skipped=0 flaky=0
+  integration/ahr-cache-ui.spec.ts                 failed=3
+  -- failures:
+  integration/ahr-cache-ui.spec.ts:231 attach through the dialog → Cache block → detach through the confirm → disk back
+      Error: expect(received).toBeTruthy()
+  integration/ahr-cache-ui.spec.ts:326 a refused attach (the disk became in-use under the dialog) shows the sentence
+      Error: expect(received).toBeTruthy()
+  integration/ahr-cache-ui.spec.ts:386 Remount is offered only when the pool is read-only, and restores writes
+      Error: expect(received).toBeTruthy()
+=== run2: start 2026-10-15T14:22:44.094Z duration 1897s expected=98 unexpected=11 skipped=5 flaky=0
+  integration/backup-cancel.spec.ts                failed=1 passed=1
+  integration/cloud-backends-2.spec.ts             passed=3
+  integration/cloud-backends.spec.ts               passed=4
+  integration/cloud-cancel.spec.ts                 failed=1 passed=3
+  integration/cloud-guided-viewer.spec.ts          failed=1 passed=4
+  integration/cloud-remotes-ui.spec.ts             passed=7
+  integration/cloud-review-fixes.spec.ts           passed=3
+  integration/cloud-tasks-api.spec.ts              failed=1 passed=6 skipped=2
+  integration/cloud-tasks-ui.spec.ts               passed=8
+  integration/ident-iscsi.spec.ts                  failed=1 passed=1 skipped=1
+  integration/ident-mounts-repl.spec.ts            failed=1 passed=1 skipped=2
+  integration/ident-zfs.spec.ts                    passed=5
+  integration/pool-composer.spec.ts                passed=2
+  integration/pools-act-api.spec.ts                failed=1 passed=8
+  integration/pools-act-ui.spec.ts                 passed=6
+  integration/pvepool-api.spec.ts                  failed=1 passed=11
+  integration/pvepool-ui.spec.ts                   passed=7
+  integration/smbsvc-api.spec.ts                   failed=1 passed=5
+  integration/smbsvc-ui.spec.ts                    passed=6
+  integration/vdev-consumers-api.spec.ts           failed=1 passed=2
+  integration/vdev-remove-byid-api.spec.ts         failed=1 passed=5
+  -- failures:
+  integration/backup-cancel.spec.ts:459 2 — the dialog: Cancel run enabled only on a running row, the daemon words the window, Kee
+      Error: gtest untouched
+  integration/cloud-cancel.spec.ts:475 4 — the runner-poll fix: a daemon restart mid-run ends the unit failed with the interrupti
+      Error: remotes after teardown: []
+  integration/cloud-guided-viewer.spec.ts:714 5 — rclone.6 404 terminal: a job that left the queue (daemon restart) turns the viewer to 
+      Error: remotes after teardown: []
+  integration/cloud-tasks-api.spec.ts:592 a wrong-password remote fails the run with rclone's error line, notifies, and shows as a c
+      Error: the failure is reported, not swallowed
+  integration/ident-iscsi.spec.ts:241 delete + add within the confirm TTL: replaying the old code is a fresh challenge, never a 
+      Error: expect(received).toBe(expected) // Object.is equality
+  integration/ident-mounts-repl.spec.ts:229 (e) a local filesystem at a failed CIFS line's target survives Remove — 409 naming what is
+      Error: {"error":{"code":"CONFIRMATION_REQUIRED","message":"Removing mount '/mnt/ident4-cifs' deletes its configuration","warnings":["The /etc/fstab line for '/mnt/ident4-cifs' is deleted; the mount does not come back at 
+  integration/pools-act-api.spec.ts:196 creates a pool via the API, then destroys it through the confirmation flow (3.8, 3.14)
+      Error: expect(received).toBe(expected) // Object.is equality
+  integration/pvepool-api.spec.ts:314 snapshot create on the storage root pvfix → 400 naming storage + dataset
+      Error: expect(received).toContain(expected) // indexOf
+  integration/smbsvc-api.spec.ts:431 5 — AHR half: real-disk pool, the @snapshots mount, smbclient through the snapshot, and de
+      Error: expect(received).toBeTruthy()
+  integration/vdev-consumers-api.spec.ts:225 destroy with cleanup labelclears all six partitions and frees the disk
+      Error: /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part3 carries no ZFS label
+  integration/vdev-remove-byid-api.spec.ts:315 the LOG partition is replaced by its basename — the stripped id is refused
+      Error: expect(received).toContain(expected) // indexOf

@@ -1,0 +1,49 @@
+anasd main pid 331938
+    PID    PGID     SID UNIT                            CMD
+ 331938  331938  331938 anasd.service                   /usr/bin/node /opt/anas/packages/daemon/dist/index.js
+tracing
+HTTP 409 0.452129
+X-Anas-Confirm-Code: 34329743151d
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Expanding AHR pool 'w3x' starts an online reshape","warnings":["Usable capacity 1.99 GiB → 4 GiB; 2 GiB of capacity will be PENDING (physically present but locked — see below).","The pool stays ONLINE during the reshape, but performance is reduced; on large arrays a reshape takes hours to DAYS.","Do NOT remove disks while the expansion runs. Power loss is survivable (md checkpoints and resumes); pulling disks is not.","A reshape cannot be cleanly cancelled once started.","2 GiB of new capacity is pending — add one more disk of ≥4 GiB to unloc
+HTTP 202 0.436221
+{"job":{"id":"201559ef-65fc-4902-adcb-9b7e4c0bfeeb","status":"running","operation":"ahr.expand","createdAt":"2026-10-15T15:16:23.017Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+0s] running | partition: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9 |  | 
+[t+2s] running | array-convert: md/w3x-r1 |  | 
+[t+3s] running | reshape w3x-r1: 1.2% (25.2 MiB/s, ETA 2 min) |  | 
+[t+6s] running | reshape w3x-r1: 14.6% (99.8 MiB/s, ETA 1 min) |  | 
+[t+9s] running | reshape w3x-r1: 28.9% (98.6 MiB/s, ETA 1 min) |  | 
+[t+12s] running | reshape w3x-r1: 49.8% (113.2 MiB/s, ETA 1 min) |  | 
+[t+15s] running | reshape w3x-r1: 74.8% (127.5 MiB/s, ETA 0 min) |  | 
+[t+18s] running | reshape w3x-r1: 99.9% (136.2 MiB/s, ETA 0 min) |  | 
+[t+21s] running | reshape w3x-r1: 99.9% (113.5 MiB/s, ETA 0 min) |  | 
+[t+24s] running | pv-resize: md/w3x-r1 |  | 
+[t+25s] running | lv-extend: w3x-vol |  | 
+[t+26s] running | fs-grow: w3x-vol |  | 
+[t+27s] completed | fs-grow: w3x-vol | {"before": {"rawBytes": 4294967296, "usableBytes": 2139095040, "usedBytes": 360448, "freeBytes": 1908408320, "redundancyOverheadBytes": 2150661120, "unprotectedWastedBytes": 5211136, "pendingBytes": 0}, "after": {"rawBytes": 8589934592, "usableBytes": 4294967296, "usedBytes": 360448, "freeBytes": 4294606848, "redundancyOverheadBytes": 2147483648, "unprotectedWastedBytes": 0, "pendingBytes": 2147483648}} | 
+expand job took 28 s (challenge → job end)
+md127 : active raid5 sdh1[2] sdg1[1] sdf1[0]
+      4183936 blocks super 1.2 level 5, 64k chunk, algorithm 2 [3/3] [UUU]
+      bitmap: 1/1 pages [4KB], 65536KB chunk
+
+--- mdadm execs (start and exit), from the strace:
+3:574988 15:16:22.149197 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x12f56c40 /* 9 vars */) = 0
+27:575011 15:16:22.418184 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x12fba440 /* 9 vars */) = 0
+48:575021 15:16:22.618314 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x12fad480 /* 9 vars */) = 0
+73:575042 15:16:22.823613 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x12f56c40 /* 9 vars */) = 0
+93:575051 15:16:23.038320 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x12e60b50 /* 9 vars */) = 0
+118:575065 15:16:23.212570 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x13023950 /* 9 vars */) = 0
+138:575082 15:16:23.359447 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x13023950 /* 9 vars */) = 0
+163:575095 15:16:23.509940 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x12e60b50 /* 9 vars */) = 0
+197:575139 15:16:24.903662 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x12e60b50 /* 9 vars */) = 0
+222:575160 15:16:25.153252 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x74d7800c4f40 /* 9 vars */) = 0
+244:575170 15:16:25.311313 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x74d7800c4f40 /* 9 vars */) = 0
+248:575173 15:16:25.409338 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--examine", "--export", "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part1"], 0x74d7800c4f40 /* 9 vars */) = 0
+252:575175 15:16:25.442436 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x74d7800c4f40 /* 9 vars */) = 0
+262:575188 15:16:25.707448 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "/dev/md127", "--add", "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part1"], 0x12fea340 /* 9 vars */) = 0
+264:575191 15:16:25.802286 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--grow", "/dev/md127", "--level=5", "--raid-devices=3"], 0x74d7800c4f40 /* 9 vars */) = 0
+268:575197 15:16:25.917554 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x74d7800c4f40 /* 9 vars */) = 0
+274:575200 15:16:26.081352 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x12fea340 /* 9 vars */) = 0
+296:575632 15:16:47.424978 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x1302a2c0 /* 9 vars */) = 0
+314:575641 15:16:47.733774 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x12f8cb70 /* 9 vars */) = 0
+324:575676 15:16:48.606746 execve("/usr/sbin/mdadm", ["/usr/sbin/mdadm", "--detail", "--export", "/dev/md127"], 0x12f8cb70 /* 9 vars */) = 0

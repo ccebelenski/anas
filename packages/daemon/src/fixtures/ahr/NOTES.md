@@ -128,14 +128,27 @@ R2 shape A escaped the duplicate `lvremove`.
 | `lvs-cached-multiseg-origin.json` | the expanded LV cached: `lvcreate -n cr31seg-cache -l 100%PVS` on K, `lvconvert --type cache --cachevol … --cachemode writethrough` (the ahrcache.1 attach argv) | **1 row**, `lv_attr` `Cwi-a-C---`, `cache_mode` writethrough, `cache_policy` smq, 1344 blocks, 0 used — the three-segment origin is hidden |
 | `lvs-cached-single-seg.json` | VG `cr31one`: one LV on A, cached the same way from K | **1 row**, the single-band cached shape |
 
+## Genuine captures — story cr.38 node facts (added 2026-10-15, wave-3 node pass)
+
+Live-captured on the stunt node (PVE 9.2.21, kernel 7.0.14-23-pve, LVM
+2.03.31(2), util-linux blkid) from a THROWAWAY AHR pool `w3x` built through the
+API on hot7+hot8 (2 GiB each, `ahr1`), with hot20 (512 MB) as the cache disk;
+docs/LIVE-PROOF-0.4.4-wave3.md row 5 has the full sequence. Both files are
+stdout byte for byte (`ssh … > file`).
+
+| File | Command | What it is |
+|------|---------|------------|
+| `blkid-p-after-cache-detach.txt` | `blkid -p /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20`, exit **0** | The cache disk after `POST /ahr/w3x/cache` then `DELETE /ahr/w3x/cache`: the detach deletes the slice from the GPT and leaves the table, so `blkid -p` prints ONE line, `PTUUID` + `PTTYPE="gpt"`, no content `TYPE` — the PTTYPE-only shape `routes/ahr-cache.ts`'s signature gate lets through (a second attach onto this disk completed). The cr.38 test line in `routes/__tests__/ahr-cache.test.ts` (PTUUID of zeros) has the same shape; only the UUID differs. On the blank disk before the first attach the same command printed nothing and exited **2** |
+| `vgs-vg-uuid-bytes.json` | `vgs --reportformat json --units b --nosuffix -o +vg_uuid`, exit 0 | `VGS_ARGS` byte for byte (no VG operand) with one VG (`w3x`, one band, no cache): the default columns as byte strings plus `vg_uuid` in LVM's dashed form. The same UUID is the pool's live lock key (`ahr:ai5ebm-GXMR-…`, read from anasd's lock table during a cache attach — LIVE-PROOF row 5c). Closes the known gap below |
+
 ## Known gaps (for the next capture pass)
 
 - `mdadm --detail --scan` output was never captured — the topology reader
   deliberately discovers arrays via `/proc/mdstat` + per-array
   `--detail --export` instead (both shapes ARE captured).
-- `vgs --reportformat json --units b --nosuffix` (the byte form the daemon
-  actually runs) — only the suffixed form was captured. `pvs` and `lvs` in the
-  byte form ARE captured, by the ahrcache.1 set above.
+- ~~`vgs --reportformat json --units b --nosuffix` (the byte form the daemon
+  actually runs) — only the suffixed form was captured.~~ Captured 2026-10-15
+  as `vgs-vg-uuid-bytes.json` (cr.38 set above).
 - `/proc/mdstat` for the GT-8 inactive-all-spares state (see above).
 - `--detail --export` of an array with a faulty/spare member — member STATE
   therefore comes from `/proc/mdstat` flags, not from export keys.
