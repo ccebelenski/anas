@@ -119,6 +119,48 @@ describe('cr.32 — pool export/destroy refuse a PVE pool (409 PVE_MANAGED)', ()
     assert.ok(res.headers['x-anas-confirm-code'])
   })
 
+  it('race: PVE takes a DATASET of the pool between the confirm and the job — both verbs fail PVE_MANAGED with no mutating argv', async () => {
+    for (const verb of ['destroy', 'export'] as const) {
+      // The pool root is unowned at the confirm; a storage on `testpool/vmdata`
+      // appears while the job waits — exporting or destroying the pool takes
+      // the nested storage root and every guest disk under it just the same.
+      const mock = await serve(STORAGE_CFG)
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      const request = verb === 'destroy'
+        ? { method: 'DELETE' as const, url: '/v1/pools/testpool', headers: IDENTITY_HEADERS }
+        : { method: 'POST' as const, url: '/v1/pools/testpool/export', headers: JSON_HEADERS, payload: '{}' }
+
+      const first = await server!.inject(request)
+      assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+      let release!: () => void
+      const held = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      for (let i = 0; i < 4; i++)
+        queue.submit('test.hold', { user: 'test', uid: 0 }, () => held)
+      const res = await server!.inject({ ...request, headers: { ...request.headers, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
+      assert.equal(res.statusCode, 202, res.body)
+      const id = (res.json() as JobAccepted).job.id
+      assert.equal(queue.get(id)?.status, 'queued')
+
+      // PVE adds a storage on a dataset of the pool while the job waits.
+      await writeFile(cfg, NESTED_STORAGE, 'utf-8')
+      release()
+
+      let job: Job | undefined
+      for (let i = 0; i < 200 && !(job && (job.status === 'failed' || job.status === 'completed')); i++) {
+        await new Promise(resolve => setTimeout(resolve, 5))
+        job = queue.get(id)
+      }
+      assert.equal(job?.status, 'failed', verb)
+      assert.equal(job?.error?.code, 'PVE_MANAGED', verb)
+      assert.match(job!.error!.message, /PVE storage 'datapool' owns testpool\/vmdata as a storage root/)
+      assert.deepEqual(mutations(mock), [], `${verb}: no mutating argv`)
+      await server!.close()
+      server = undefined
+    }
+  })
+
   it('race: PVE takes the pool between the confirm and the job — both verbs fail PVE_MANAGED with no mutating argv', async () => {
     for (const verb of ['destroy', 'export'] as const) {
       const mock = await serve(STORAGE_CFG)

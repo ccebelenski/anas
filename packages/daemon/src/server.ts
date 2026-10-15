@@ -198,7 +198,11 @@ export function createServer(opts?: ServerOptions) {
     ?? (opts?.mock ? join(tmpdir(), `anas-mock-ahr-${process.pid}`) : undefined)
   const credsDir = process.env.ANAS_CREDS_DIR
     ?? (opts?.mock ? join(tmpdir(), `anas-mock-creds-${process.pid}`) : '/etc/anas/creds')
-  let mountsStoragePath = process.env.ANAS_STORAGE_CFG // undefined = /etc/pve/storage.cfg default
+  // The node's storage.cfg for EVERY reader wired below (mounts tagging, the
+  // pool PVE-ownership gate, the iSCSI read layer, the access service).
+  // Prod: undefined = each consumer's /etc/pve/storage.cfg default. Mock: the
+  // fixture below, so no mock server reads the host's file (cr.32r).
+  let mountsStoragePath = process.env.ANAS_STORAGE_CFG
 
   // Stage-3 remote replication (Epic 5.5.2): the corosync-store paths (registry /
   // keypair / known_hosts, all env-overridable) and the SSH transport bound to
@@ -538,11 +542,12 @@ export function createServer(opts?: ServerOptions) {
       catch { /* best-effort seed */ }
     }
     if (!mountsStoragePath) {
-      try {
-        // Only expose the fixture when the real PVE file is absent (dev host).
-        mountsStoragePath = join(mountsFixtures, 'storage.cfg')
-      }
-      catch { /* leave undefined */ }
+      // cr.32r: the mock's ONE storage.cfg — the read-only fixture, always
+      // (the old comment here claimed "only when the real file is absent",
+      // which the code never checked). Every mock reader wired below — the
+      // mounts routes and the pool/iSCSI/access gates alike — answers from
+      // this file, so a mock test never reads the host's /etc/pve/storage.cfg.
+      mountsStoragePath = join(mountsFixtures, 'storage.cfg')
     }
     // findmnt --json → the full sample mount tree.
     try {
@@ -689,7 +694,9 @@ export function createServer(opts?: ServerOptions) {
     configfsRoot: process.env.ANAS_ISCSI_CONFIGFS,
     blockRoot: process.env.ANAS_ISCSI_SYS_BLOCK,
     saveconfigPath: process.env.ANAS_ISCSI_SAVECONFIG,
-    pveStorageCfg: process.env.ANAS_STORAGE_CFG,
+    // cr.32r: the SAME resolved path the mounts routes use — mock mode gets
+    // the fixture, so the held-by-LUN/PVE tagging never reads the host.
+    pveStorageCfg: mountsStoragePath,
     // The node's own initiator IQN (the "Add this node" door). A test host has
     // no open-iscsi state to read; the default fail-opens to null on its own,
     // and the env points the read at a temp file when a test wants a value.
@@ -728,14 +735,20 @@ export function createServer(opts?: ServerOptions) {
     smbConfPath,
     exportsPath,
     systemdDir,
-    pveStoragePath: process.env.ANAS_STORAGE_CFG,
+    // cr.32r: was `process.env.ANAS_STORAGE_CFG` un-defaulted — with the env
+    // unset the pool gates read the REAL /etc/pve/storage.cfg on a PVE host.
+    // Now the same resolved path as the mounts routes: env, then (mock only)
+    // the fixture, then undefined = the route's real-path default.
+    pveStoragePath: mountsStoragePath,
     iscsiPaths,
     diskIdentityCache,
     ...(Number.isFinite(vdevRemoveSettleMs) && vdevRemoveSettleMs >= 0 ? { vdevRemoveSettleMs } : {}),
   })
   // The ONE permissions writer (access.1/access.2): the datasets editor, the
   // AHR editor and the share grant all run through this instance.
-  const accessService = createAccessService({ executor, iscsiPaths })
+  // cr.32r: the access service takes the resolved path too — without it its
+  // directory-storage lookup falls back to env → the real /etc/pve on a mock.
+  const accessService = createAccessService({ executor, iscsiPaths, pveStorageCfg: mountsStoragePath })
   // datasetRoutes also reads the share configs to report associated shares
   // (Epic 4.4) and warn on destroy — same paths the share routes edit.
   server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport, iscsiPaths, accessService })

@@ -82,6 +82,8 @@ const STATUS_TWO_MIRRORS_AND_SPARE = fixture('zfs/zpool-status-online.json')
 const LIST_WITHOUT_TESTPOOL = fixture('zfs/zpool-list-raidz.json')
 /** The dev mock's `zpool get guid` answer for testpool (server.ts). */
 const TESTPOOL_GUID = '5823146802312415237'
+/** cr.32r: the guid of the pool an export/import swap leaves under the name. */
+const SWAPPED_GUID = '11795629151027407901'
 
 const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
 
@@ -112,6 +114,8 @@ describe('cr.32 — pool export and destroy re-gate in the job (ruling (j))', ()
   let zpoolStatus = STATUS_ONE_MIRROR
   /** cr.33: `zpool list -j` when set (null: the dev mock's own answer). */
   let zpoolList: string | null = null
+  /** cr.32r: the guid `zpool get … guid testpool` answers when set (null: the mock's). */
+  let poolGuid: string | null = null
   /** cr.33: a `zpool <verb>` that does not return until the test releases it. */
   const paused = new Map<string, Promise<void>>()
 
@@ -151,6 +155,7 @@ describe('cr.32 — pool export and destroy re-gate in the job (ruling (j))', ()
     findmnt = FINDMNT_FULL
     zpoolStatus = STATUS_ONE_MIRROR
     zpoolList = null
+    poolGuid = null
     paused.clear()
     await rm(configfs, { recursive: true, force: true })
     await materializeConfigfsManifest(LIO_NO_LUNS, configfs)
@@ -170,6 +175,8 @@ describe('cr.32 — pool export and destroy re-gate in the job (ruling (j))', ()
         return ok(zpoolStatus)
       if (command === ZPOOL && args.length === 2 && args[0] === 'list' && args[1] === '-j' && zpoolList !== null)
         return ok(zpoolList)
+      if (command === ZPOOL && args[0] === 'get' && args.includes('guid') && poolGuid !== null)
+        return ok(poolGuid)
       const hold = command === ZPOOL ? paused.get(args[0]) : undefined
       if (hold)
         await hold
@@ -298,6 +305,66 @@ describe('cr.32 — pool export and destroy re-gate in the job (ruling (j))', ()
     const res = await server!.inject({ method: 'DELETE', url: DESTROY.url, headers: IDENTITY_HEADERS })
     const warnings = res.json().error.warnings as string[]
     assert.ok(warnings.includes('Disks to wipe: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1-part1, scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2-part1.'), warnings.join(' | '))
+  })
+
+  it('a guid swap under the same name between the confirm and the job refuses BOTH export and destroy — no mutating argv', async () => {
+    for (const verb of [EXPORT, DESTROY]) {
+      await serve()
+      const { id, release } = await confirmBehindFullQueue(verb)
+      // Another pool is imported under the name `testpool` while the job waits.
+      poolGuid = SWAPPED_GUID
+      release()
+      const job = await finished(id)
+      assert.equal(job.status, 'failed', verb.name)
+      assert.equal(job.error?.code, 'IDENTITY_MISMATCH', `${verb.name}: ${JSON.stringify(job.error)}`)
+      assert.match(job.error!.message, new RegExp(`^Pool 'testpool' is not the one that was confirmed \\(guid ${TESTPOOL_GUID} at the confirmation, guid ${SWAPPED_GUID} now\\) — nothing was done; confirm again$`))
+      assert.deepEqual(calls.filter(isMutation), [], `${verb.name}: no mutating argv`)
+      await server!.close()
+      server = undefined
+    }
+  })
+
+  it('a leaf that joins between the challenge and the RESEND is 409 CONFIRM_SCOPE_CHANGED naming both disk sets, with a fresh code', async () => {
+    await serve()
+    const first = await server!.inject({ method: 'DELETE', url: DESTROY.url, headers: IDENTITY_HEADERS })
+    assert.equal(first.statusCode, 409)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    // A second mirror and a spare join the pool while the operator reads the
+    // warning — the box would now wipe a set the operator never saw.
+    zpoolStatus = STATUS_TWO_MIRRORS_AND_SPARE
+    const res = await server!.inject({
+      method: 'DELETE',
+      url: DESTROY.url,
+      headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string },
+    })
+    assert.equal(res.statusCode, 409)
+    const body = res.json().error
+    assert.equal(body.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.deepEqual(body.changed, ['leaves'])
+    const m = body.message.match(/^the disks to wipe changed since you confirmed \((.+) then, (.+) now\) — confirm again$/)
+    assert.ok(m, body.message)
+    assert.equal(m[1], 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1-part1, scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2-part1', 'the set confirmed')
+    assert.ok(m[2].startsWith('ata-WDC'), `the set now: ${m[2]}`)
+    assert.ok(res.headers['x-anas-confirm-code'], 'the challenge names the set that exists now')
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  it('a pool that vanishes while the confirmed job waits refuses BOTH export and destroy — no mutating argv', async () => {
+    for (const verb of [EXPORT, DESTROY]) {
+      await serve()
+      const { id, release } = await confirmBehindFullQueue(verb)
+      // The pool leaves the node (the cr.33 capture: its name now carries
+      // another pool's guid, and `zpool list` no longer knows it).
+      zpoolList = LIST_WITHOUT_TESTPOOL
+      release()
+      const job = await finished(id)
+      assert.equal(job.status, 'failed', verb.name)
+      assert.equal(job.error?.code, 'IDENTITY_MISMATCH', `${verb.name}: ${JSON.stringify(job.error)}`)
+      assert.match(job.error!.message, new RegExp(`^Pool 'testpool' is not the one that was confirmed \\(guid ${TESTPOOL_GUID} at the confirmation, unreadable now\\) — nothing was done; confirm again$`))
+      assert.deepEqual(calls.filter(isMutation), [], `${verb.name}: no mutating argv`)
+      await server!.close()
+      server = undefined
+    }
   })
 
   /** Pause `zpool <verb>` inside its job until the returned release is called. */
@@ -429,5 +496,117 @@ describe('cr.32 — the export and destroy confirms bind the whole request', () 
   it('neither confirm leaves a request field out of the signature', () => {
     assert.deepEqual(POOL_EXPORT_PRESENTATION_ONLY, {})
     assert.deepEqual(POOL_DESTROY_PRESENTATION_ONLY, {})
+  })
+
+  it('cleanup flag spellings that mean the same sign the same: 1 ≡ true, 0 ≡ false, empty ≡ absent', async () => {
+    const srv = createServer({ mock: true, logger: false })
+    server = srv
+    for (const [from, to] of [
+      ['?cleanup=1', '?cleanup=true'],
+      ['?cleanup=0', '?cleanup=false'],
+      ['?cleanup=', ''],
+    ] as const) {
+      const first = await srv.inject({ method: 'DELETE', url: `/v1/pools/testpool${from}`, headers: IDENTITY_HEADERS })
+      assert.equal(first.statusCode, 409, `${from}: ${first.body}`)
+      const res = await srv.inject({
+        method: 'DELETE',
+        url: `/v1/pools/testpool${to}`,
+        headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string },
+      })
+      assert.equal(res.statusCode, 202, `${from} confirmed by a resend as ${to || '(no query)'}: ${res.body}`)
+    }
+  })
+
+  it('export: a {} body signs the same as no body at all (both directions)', async () => {
+    const srv = createServer({ mock: true, logger: false })
+    server = srv
+    for (const [from, to] of [
+      ['{}', undefined],
+      [undefined, '{}'],
+    ] as const) {
+      const first = await srv.inject({
+        method: 'POST',
+        url: '/v1/pools/testpool/export',
+        headers: from === undefined ? IDENTITY_HEADERS : JSON_HEADERS,
+        ...(from === undefined ? {} : { payload: from }),
+      })
+      assert.equal(first.statusCode, 409, `${from}: ${first.body}`)
+      const res = await srv.inject({
+        method: 'POST',
+        url: '/v1/pools/testpool/export',
+        headers: {
+          ...(to === undefined ? IDENTITY_HEADERS : JSON_HEADERS),
+          'x-anas-confirm': first.headers['x-anas-confirm-code'] as string,
+        },
+        ...(to === undefined ? {} : { payload: to }),
+      })
+      assert.equal(res.statusCode, 202, `${from ?? '(no body)'} confirmed by ${to ?? '(no body)'}: ${res.body}`)
+    }
+  })
+
+  it('a code is single-use: resending a consumed code is a plain CONFIRMATION_REQUIRED with a fresh code', async () => {
+    server = createServer({ mock: true, logger: false })
+    const first = await server.inject({ method: 'DELETE', url: '/v1/pools/testpool', headers: IDENTITY_HEADERS })
+    const code = first.headers['x-anas-confirm-code'] as string
+    const ok = await server.inject({ method: 'DELETE', url: '/v1/pools/testpool', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code } })
+    assert.equal(ok.statusCode, 202, ok.body)
+    const again = await server.inject({ method: 'DELETE', url: '/v1/pools/testpool', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code } })
+    assert.equal(again.statusCode, 409)
+    assert.equal(again.json().error.code, 'CONFIRMATION_REQUIRED')
+    assert.notEqual(again.headers['x-anas-confirm-code'], undefined)
+    assert.notEqual(again.headers['x-anas-confirm-code'], code)
+  })
+
+  it('a code minted for pool A never confirms pool B, and B\'s answer does not consume A\'s code', async () => {
+    server = createServer({ mock: true, logger: false })
+    // The raidz capture's pool joins the node beside `testpool`.
+    const mock = (server as unknown as { executor: { exec: (c: string, a: string[], o?: unknown) => Promise<ExecResult>, calls: { command: string, args: string[] }[] } }).executor
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command, args, opts) => {
+      if (command === ZPOOL && args.length === 2 && args[0] === 'list' && args[1] === '-j') {
+        const own = await orig(command, args, opts)
+        const json = JSON.parse(own.stdout) as { pools: Record<string, unknown> }
+        json.pools['testpool-rz'] = JSON.parse(LIST_WITHOUT_TESTPOOL).pools['testpool-rz']
+        return { stdout: JSON.stringify(json), stderr: '', exitCode: 0 }
+      }
+      if (command === ZPOOL && args[0] === 'get' && args.includes('guid') && args.at(-1) === 'testpool-rz')
+        return ok(SWAPPED_GUID)
+      return orig(command, args, opts)
+    }
+    await server.ready()
+
+    const challengeA = await server.inject({ method: 'DELETE', url: '/v1/pools/testpool', headers: IDENTITY_HEADERS })
+    const codeA = challengeA.headers['x-anas-confirm-code'] as string
+    assert.ok(challengeA.headers['x-anas-confirm-code'])
+
+    // A's code against B: refused — and with a plain challenge, the code B
+    // never touched stays exactly where it was.
+    const wrongObject = await server.inject({ method: 'DELETE', url: '/v1/pools/testpool-rz', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': codeA } })
+    assert.equal(wrongObject.statusCode, 409)
+    assert.equal(wrongObject.json().error.code, 'CONFIRMATION_REQUIRED')
+    assert.ok(wrongObject.headers['x-anas-confirm-code'], 'B gets its own fresh code')
+
+    // A's code still works for A.
+    const rightObject = await server.inject({ method: 'DELETE', url: '/v1/pools/testpool', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': codeA } })
+    assert.equal(rightObject.statusCode, 202, rightObject.body)
+    assert.ok(!mock.calls.some(c => c.command === ZPOOL && c.args[0] === 'destroy' && c.args.includes('testpool-rz')), 'testpool-rz was never destroyed')
+  })
+
+  it('an export code never confirms a destroy, and a destroy code never confirms an export', async () => {
+    const srv = createServer({ mock: true, logger: false })
+    server = srv
+    const exportChallenge = await srv.inject({ method: 'POST', url: '/v1/pools/testpool/export', headers: JSON_HEADERS, payload: '{}' })
+    const destroyChallenge = await srv.inject({ method: 'DELETE', url: '/v1/pools/testpool', headers: IDENTITY_HEADERS })
+    for (const [code, wrong] of [
+      [exportChallenge.headers['x-anas-confirm-code'] as string, { method: 'DELETE' as const, url: '/v1/pools/testpool', headers: IDENTITY_HEADERS }],
+      [destroyChallenge.headers['x-anas-confirm-code'] as string, { method: 'POST' as const, url: '/v1/pools/testpool/export', headers: JSON_HEADERS, payload: '{}' }],
+    ] as const) {
+      const res = await srv.inject({ ...wrong, headers: { ...wrong.headers, 'x-anas-confirm': code } })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
+      assert.ok(res.headers['x-anas-confirm-code'])
+    }
+    const mock = (srv as unknown as { executor: { calls: { command: string, args: string[] }[] } }).executor
+    assert.deepEqual(mock.calls.filter(isMutation), [])
   })
 })
