@@ -147,13 +147,26 @@ export function systemMountPoolsFromNodes(nodes: FindmntNode[]): SystemMountFact
  * missing facts may only tighten.
  */
 export function systemMountPoolsFromJson(text: string): SystemMountFacts | null {
+  // Unreadable unless it has findmnt's own shape — an object whose
+  // `filesystems` is an array. Valid JSON of another shape (`{}`, `[]`,
+  // `null`, `{"filesystems":42}`) is as unreadable as broken JSON, and the
+  // parse never throws: a caller that does not guard it must still get the
+  // refusal, not a 500 (cr.23 review).
+  let parsed: unknown
   try {
-    JSON.parse(text)
+    parsed = JSON.parse(text)
   }
   catch {
     return null
   }
-  return systemMountPoolsFromNodes(parseFindmnt(text))
+  if (typeof parsed !== 'object' || parsed === null || !Array.isArray((parsed as { filesystems?: unknown }).filesystems))
+    return null
+  try {
+    return systemMountPoolsFromNodes(parseFindmnt(text))
+  }
+  catch {
+    return null
+  }
 }
 
 /**
