@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { FstabOptionList, fstabOptionTokens, isFstabOptionToken, X_ANAS_DISABLED_TOKEN } from '../formats/fstab.js'
+import { FstabOptionList, fstabOptionTokens, isFstabOptionToken, X_ANAS_DISABLED_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_TOKEN } from '../formats/fstab.js'
 import { AbsolutePath, SingleLine } from './common.js'
 import { IscsiHeldByLun } from './iscsi.js'
 
@@ -309,7 +309,10 @@ export const MountEntry = z.object({
    * the `x-anas.disabled` token (`noauto,x-anas.disabled`, or
    * `x-anas.disabled=kept-noauto` over the operator's own `noauto`) — or it
    * still carries the LEGACY `#ANAS ` comment marker, which is read as disabled
-   * until ANAS next writes that line. On a disabled entry `common.noauto` is
+   * until ANAS next writes that line. An automount line additionally parks its
+   * `x-systemd.automount` as `x-anas.disabled-automount` (cr.19, automount
+   * ruling 2026-10-14) — `common.automount` still reads TRUE through the
+   * disable. On a disabled entry `common.noauto` is
    * the OPERATOR's value (false for the bare form, where ANAS forced the
    * `noauto` — see classifyOptions).
    */
@@ -474,8 +477,11 @@ export const MountExtraOptions = FstabOptionList.superRefine((s, ctx) => {
     const key = eq === -1 ? token : token.slice(0, eq)
     // cr.6 (§2 Mounts ruling): `x-anas.disabled` is the disable-without-delete
     // bookkeeping ANAS writes itself — not an operator-set option. Refused so
-    // an `extraOptions` payload can neither forge nor clear a disable.
-    if (key.toLowerCase() === X_ANAS_DISABLED_TOKEN) {
+    // an `extraOptions` payload can neither forge nor clear a disable. The
+    // cr.19 parked-automount marker is the same Disable/Enable bookkeeping
+    // (ruling 2026-10-14, automount): refused by key, case-insensitively.
+    const lower = key.toLowerCase()
+    if (lower === X_ANAS_DISABLED_TOKEN || lower === X_ANAS_DISABLED_AUTOMOUNT_TOKEN) {
       ctx.addIssue({
         code: 'custom',
         message: `'${token}' is managed by Disable/Enable — it is ANAS's own disabled-marker option and cannot be set as an extra option`,

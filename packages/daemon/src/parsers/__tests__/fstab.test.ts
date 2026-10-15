@@ -473,10 +473,15 @@ describe('cr.6 — disable/enable via `noauto` + `x-anas.disabled` (option form)
     assert.equal(enableMount(disabled, '/mnt/media'), before)
   })
 
-  it('x-systemd.automount rides the disable and re-appears byte-identical on enable', () => {
+  it('an automount line parks its token for the disable and re-appears byte-identical on enable (cr.19)', () => {
     const before = '127.0.0.1:/srv/nfs/export1  /mnt/anas-auto  nfs4  defaults,nofail,x-systemd.automount,x-systemd.idle-timeout=60  0  0\n'
     const disabled = disableMount(before, '/mnt/anas-auto')
-    assert.ok(disabled.includes('x-systemd.automount,x-systemd.idle-timeout=60,noauto,x-anas.disabled'))
+    // cr.19 (§2 Mounts automount ruling): the automount token is SWAPPED IN
+    // PLACE for `x-anas.disabled-automount` — same position, and NO live token
+    // left for the fstab-generator to arm behind the disable (node defect
+    // R1-D1: `noauto` reaches only the `.mount` unit).
+    assert.ok(disabled.includes('defaults,nofail,x-anas.disabled-automount,x-systemd.idle-timeout=60,noauto,x-anas.disabled'), disabled)
+    assert.ok(!disabled.includes('x-systemd.automount'), disabled)
     assert.equal(getMount(disabled, '/mnt/anas-auto')!.options.common.automount, true)
     assert.equal(enableMount(disabled, '/mnt/anas-auto'), before)
   })
@@ -506,6 +511,108 @@ describe('cr.6 — disable/enable via `noauto` + `x-anas.disabled` (option form)
     const once = disableMount(NFS, '/mnt/anas-nfs')
     assert.equal(disableMount(once, '/mnt/anas-nfs'), once)
     assert.equal(enableMount(NFS, '/mnt/anas-nfs'), NFS)
+  })
+})
+
+describe('cr.19 — disable/enable parks the automount token (§2 Mounts automount ruling)', () => {
+  const AUTO = '127.0.0.1:/srv/nfs/export1  /mnt/anas-auto  nfs4  defaults,nofail,x-systemd.automount,x-systemd.idle-timeout=60  0  0\n'
+
+  it('the managed fixture: disable swaps the token in place, enable restores the exact bytes, only the one line changes', () => {
+    const before = loadFixture('fstab-anas-managed')
+    const disabled = disableMount(before, '/mnt/anas-auto')
+    const beforeLines = before.split('\n')
+    for (const [i, l] of disabled.split('\n').entries()) {
+      if (l.includes('/mnt/anas-auto')) {
+        // same POSITION in the list (cr.6 rewrites the field surgically, so the
+        // surrounding tokens, column alignment and dump/pass all survive)
+        assert.ok(l.includes('defaults,nofail,x-anas.disabled-automount,x-systemd.idle-timeout=60,noauto,x-anas.disabled  0  0'), l)
+        assert.ok(!l.includes('x-systemd.automount'), `no live automount may survive a disable: ${l}`)
+      }
+      else {
+        assert.equal(l, beforeLines[i], `line ${i} must be untouched`)
+      }
+    }
+    assert.equal(enableMount(disabled, '/mnt/anas-auto'), before)
+  })
+
+  it('the parked token reads automount=true, is consumed, never shown as passthrough, while disabled', () => {
+    const entry = getMount(disableMount(AUTO, '/mnt/anas-auto'), '/mnt/anas-auto')!
+    assert.equal(entry.disabled, true)
+    assert.equal(entry.options.common.automount, true) // the operator's choice survives the disable
+    assert.equal(entry.options.passthrough, 'defaults')
+  })
+
+  it('enable of a hand-written parked line returns the live-token line', () => {
+    const parked = 'srv:/a  /mnt/anas-auto  nfs4  defaults,nofail,x-anas.disabled-automount,x-systemd.idle-timeout=60,noauto,x-anas.disabled  0  0\n'
+    assert.equal(
+      enableMount(parked, '/mnt/anas-auto'),
+      'srv:/a  /mnt/anas-auto  nfs4  defaults,nofail,x-systemd.automount,x-systemd.idle-timeout=60  0  0\n',
+    )
+  })
+
+  it('an already-disabled cr.6-era line is REPAIRED by re-disable; enable then returns those bytes', () => {
+    // the exact shape node defect R1-D1 left behind: disabled per cr.6, still
+    // armed at every boot by the live automount token.
+    const legacyDisabled = 'srv:/a  /mnt/anas-auto  nfs4  defaults,nofail,x-systemd.automount,x-systemd.idle-timeout=60,noauto,x-anas.disabled  0  0\n'
+    const repaired = disableMount(legacyDisabled, '/mnt/anas-auto')
+    assert.equal(
+      repaired,
+      'srv:/a  /mnt/anas-auto  nfs4  defaults,nofail,x-anas.disabled-automount,x-systemd.idle-timeout=60,noauto,x-anas.disabled  0  0\n',
+    )
+    assert.equal(getMount(repaired, '/mnt/anas-auto')!.options.common.automount, true)
+    assert.equal(disableMount(repaired, '/mnt/anas-auto'), repaired) // now the idempotent no-op
+    // The `noauto` in the legacy line is ANAS's OWN bare-form noauto, so enable
+    // correctly removes it — the line returns to its pre-disable active shape.
+    assert.equal(enableMount(repaired, '/mnt/anas-auto'), 'srv:/a  /mnt/anas-auto  nfs4  defaults,nofail,x-systemd.automount,x-systemd.idle-timeout=60  0  0\n')
+  })
+
+  it('a live token hand-added while disabled: enable drops the marker, returns ONE automount option', () => {
+    const both = 'srv:/a  /mnt/m  nfs4  x-anas.disabled-automount,x-systemd.automount,noauto,x-anas.disabled 0  0\n'
+    assert.equal(enableMount(both, '/mnt/m'), 'srv:/a  /mnt/m  nfs4  x-systemd.automount 0  0\n')
+  })
+
+  it('case-shifted automount exotica is NOT swapped — unrecognized, verbatim round trip (parser AND generator ignore it)', () => {
+    const upper = 'srv:/a  /mnt/m  nfs4  defaults,X-SYSTEMD.AUTOMOUNT 0  0\n'
+    const disabled = disableMount(upper, '/mnt/m')
+    assert.ok(disabled.includes('defaults,X-SYSTEMD.AUTOMOUNT,noauto,x-anas.disabled'), disabled)
+    const entry = getMount(disabled, '/mnt/m')!
+    assert.equal(entry.options.common.automount, false)
+    assert.equal(entry.options.passthrough, 'defaults,X-SYSTEMD.AUTOMOUNT')
+    assert.equal(enableMount(disabled, '/mnt/m'), upper)
+  })
+
+  it('the legacy `#ANAS ` → option-form conversion parks the automount too', () => {
+    const marked = `${ANAS_MARKER}srv:/a  /mnt/m  nfs4  defaults,nofail,x-systemd.automount,x-systemd.idle-timeout=60  0  0\n`
+    const after = disableMount(marked, '/mnt/m')
+    const line = after.trimEnd()
+    assert.ok(!line.startsWith('#'), line)
+    assert.ok(line.includes('x-anas.disabled-automount,x-systemd.idle-timeout=60'), line)
+    assert.ok(!line.includes('x-systemd.automount'), line)
+    assert.equal(getMount(after, '/mnt/m')!.options.common.automount, true)
+    assert.equal(getMount(after, '/mnt/m')!.disabled, true)
+  })
+
+  it('replaceMount of a disabled automount entry stays parked (the update path never re-arms)', () => {
+    const before = loadFixture('fstab-anas-managed')
+    const disabled = disableMount(before, '/mnt/anas-auto')
+    const entry = getMount(disabled, '/mnt/anas-auto')!
+    entry.options.common.noatime = true
+    const after = replaceMount(disabled, '/mnt/anas-auto', entry)
+    const line = after.split('\n').find(l => l.includes('/mnt/anas-auto'))!
+    assert.ok(line.includes('x-anas.disabled-automount'), line)
+    assert.ok(!line.includes('x-systemd.automount'), line)
+    const reparsed = getMount(after, '/mnt/anas-auto')!
+    assert.equal(reparsed.disabled, true)
+    assert.equal(reparsed.options.common.automount, true)
+  })
+
+  it('classifyOptions consumes the parked token by key, case-insensitively, any value', () => {
+    for (const tok of ['x-anas.disabled-automount', 'X-ANAS.DISABLED-AUTOMOUNT', 'x-anas.disabled-automount=whatever']) {
+      const { options, disable } = classifyOptions('nfs4', `defaults,nofail,noauto,${tok},x-anas.disabled`.split(','))
+      assert.equal(options.common.automount, true, tok)
+      assert.equal(disable, 'bare', tok)
+      assert.equal(options.passthrough, 'defaults', tok)
+    }
   })
 })
 

@@ -252,6 +252,35 @@ describe('buildBaseInventory — disabled entry', () => {
   })
 })
 
+// cr.19 (§2 Mounts automount ruling): a disabled line parks its automount
+// token (`x-anas.disabled-automount`, read as automount-while-disabled). The
+// row must read state=disabled — the parked token must NOT push it to 'armed',
+// and even a leftover live autofs placeholder (the D2 defect this whole story
+// fixes) may only ever lose to the disable, never win over it.
+describe('buildBaseInventory — a disabled line with the parked automount token reads disabled (cr.19)', () => {
+  const PARKED_FSTAB = '127.0.0.1:/srv/auto  /mnt/parked  nfs4  defaults,nofail,x-anas.disabled-automount,x-systemd.idle-timeout=60,noauto,x-anas.disabled  0  0\n'
+
+  it('no live row at all: state=disabled, automount still reported, never armed', () => {
+    const row = buildBaseInventory('{"filesystems":[]}', PARKED_FSTAB, new Map()).find(r => r.mountpoint === '/mnt/parked')!
+    assert.equal(row.disabled, true)
+    assert.equal(row.state, 'disabled')
+    assert.equal(row.automount, true, 'the parked token still says what the line is')
+    assert.equal(row.mounted, false)
+  })
+
+  it('a leftover live autofs placeholder under the disabled line never overrides state', () => {
+    // Exactly the D2 reality after a cr.6-era disable: the unit was never
+    // stopped, findmnt still shows the armed placeholder.
+    const findmnt = JSON.stringify({
+      filesystems: [{ target: '/mnt/parked', source: 'systemd-1', fstype: 'autofs', options: 'rw,relatime,fd=52,pgrp=1,timeout=60' }],
+    })
+    const row = buildBaseInventory(findmnt, PARKED_FSTAB, new Map()).find(r => r.mountpoint === '/mnt/parked')!
+    assert.equal(row.disabled, true)
+    assert.equal(row.state, 'disabled', 'the disable outranks the placeholder — never armed')
+    assert.equal(row.automount, true)
+  })
+})
+
 // An IDLED-OUT automount (issue #35). Once the mount idles away, findmnt shows
 // only the autofs placeholder — source `systemd-1`, fstype `autofs`, which
 // classifies as a local kind. Projected verbatim, the row lost its remote

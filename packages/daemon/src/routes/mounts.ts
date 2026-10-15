@@ -19,6 +19,7 @@ import {
   ahrPinnedSpecs,
   applyOption,
   applySecOption,
+  automountUnitName,
   buildBaseInventory,
   buildMountDetail,
   cleanMountStderr,
@@ -583,6 +584,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       lazy = gate.lazy
     }
 
+    // cr.19: whether the line carried automount BEFORE the change — the parked
+    // `x-anas.disabled-automount` token reads automount too, so a cr.6-era line
+    // disabled while armed is covered by this stop as well.
+    const wasAutomount = entry?.options.common.automount === true
+
     const job = jobQueue.submit(
       `mount.${action}`,
       { ...identity, params: { mountpoint: mp } },
@@ -595,13 +601,22 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
             throw new Error(await enrichBusyError(executor, r.stderr.trim() || `umount exited ${r.exitCode}`, mp, configfsOptionsFrom(iscsiPaths)))
         }
         if (disabling) {
+          const warnings: string[] = []
           // Append `noauto,x-anas.disabled` (or the kept-noauto token over the
           // operator's own noauto) to the fstab line; KEEP the credentials file.
           updateProgress(`Disabling ${mp} in /etc/fstab`)
           await editConfig(fstabPath, current => disableMount(current, mp))
+          if (wasAutomount) {
+            // cr.19 (D2): daemon-reload alone leaves the armed placeholder
+            // running — the .automount unit must be stopped first.
+            updateProgress(`Stopping the automount unit for ${mp}`)
+            const warn = await stopAutomountUnit(executor, mp)
+            if (warn)
+              warnings.push(warn)
+          }
           updateProgress('Reloading systemd (daemon-reload)')
           await daemonReload(executor)
-          return { disabled: mp }
+          return { disabled: mp, ...(warnings.length > 0 ? { warnings } : {}) }
         }
         return { unmounted: mp }
       },
@@ -691,6 +706,15 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         if (entry) {
           updateProgress('Removing /etc/fstab entry')
           await editConfig(fstabPath, current => removeMount(current, mp))
+          if (entry.options.common.automount) {
+            // cr.19 (D3): the generator drops the unit on the reload, but a
+            // RUNNING .automount (and its autofs placeholder) survives it —
+            // stop it first, best-effort.
+            updateProgress(`Stopping the automount unit for ${mp}`)
+            const warn = await stopAutomountUnit(executor, mp)
+            if (warn)
+              warnings.push(warn)
+          }
           updateProgress('Reloading systemd (daemon-reload)')
           await daemonReload(executor)
         }
@@ -851,6 +875,34 @@ async function daemonReload(executor: CommandExecutor): Promise<void> {
   const r = await executor.exec(SYSTEMCTL, ['daemon-reload'])
   if (r.exitCode !== 0)
     throw new Error(r.stderr.trim() || `systemctl daemon-reload exited ${r.exitCode}`)
+}
+
+/**
+ * cr.19 (§2 Mounts automount ruling, node defects D2/D3): stop the mountpoint's
+ * live `.automount` unit BEFORE the daemon-reload that follows an fstab disable
+ * or remove. systemd-fstab-generator applies `noauto` to the `.mount` unit
+ * only — an armed `.automount` stays wired into `remote-fs.target.wants` (D1),
+ * and daemon-reload does not take down a unit that is already running: the
+ * placeholder survives the disable (D2) and a removed line leaves an orphaned
+ * autofs entry until the unit is stopped (D3).
+ *
+ * BEST-EFFORT, the syncZfsImportUnit pattern: the fstab edit has
+ * already succeeded when this runs, so a failing stop never fails the job — it
+ * rides the result as a warning. Never swallowed.
+ */
+async function stopAutomountUnit(executor: CommandExecutor, mountpoint: string): Promise<string | null> {
+  const unit = await automountUnitName(executor, mountpoint)
+  if (!unit)
+    return `Could not derive the automount unit name for ${mountpoint} (systemd-escape failed) — its .automount unit may still be armed`
+  try {
+    const r = await executor.exec(SYSTEMCTL, ['stop', unit])
+    if (r.exitCode !== 0)
+      return `Stopping ${unit} exited ${r.exitCode}${r.stderr.trim() ? `: ${r.stderr.trim()}` : ''} — the automount placeholder may persist until it is stopped`
+    return null
+  }
+  catch (err) {
+    return `Stopping ${unit} failed: ${(err as Error).message} — the automount placeholder may persist until it is stopped`
+  }
 }
 
 /**

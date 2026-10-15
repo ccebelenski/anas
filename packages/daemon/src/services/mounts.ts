@@ -1176,6 +1176,29 @@ function verdictDetail(type: 'nfs' | 'cifs', verdict: MountTestVerdict, stderr: 
 // ============================================================================
 
 /**
+ * Derive a systemd unit name for a mountpoint — `systemd-escape -p
+ * --suffix=<suffix>` (never hand-built; the escaping is systemd's). Null when
+ * systemd-escape fails. The ONE derivation the daemon uses for both unit
+ * suffixes (cr.19: shared by the mount-state reader and the automount stop).
+ */
+async function escapeUnitName(executor: CommandExecutor, mountpoint: string, suffix: 'mount' | 'automount'): Promise<string | null> {
+  const esc = await executor.exec(SYSTEMD_ESCAPE, ['-p', `--suffix=${suffix}`, mountpoint])
+  const name = esc.stdout.trim()
+  if (esc.exitCode !== 0 || !name)
+    return null
+  return name
+}
+
+/**
+ * cr.19 (§2 Mounts automount ruling): the `.automount` unit name for a
+ * mountpoint, derived the same way as the mount unit name. Null when
+ * systemd-escape fails — the caller reports, never guesses a name.
+ */
+export async function automountUnitName(executor: CommandExecutor, mountpoint: string): Promise<string | null> {
+  return escapeUnitName(executor, mountpoint, 'automount')
+}
+
+/**
  * The systemd mount-unit state for a mountpoint (supplementary — NEVER the
  * health verdict; a `failed` nofail unit is EXPECTED, SURPRISE A). Derives the
  * unit name via `systemd-escape -p --suffix=mount` (never hand-built), then
@@ -1183,9 +1206,8 @@ function verdictDetail(type: 'nfs' | 'cifs', verdict: MountTestVerdict, stderr: 
  */
 export async function readUnitState(executor: CommandExecutor, mountpoint: string): Promise<MountUnit | undefined> {
   try {
-    const esc = await executor.exec(SYSTEMD_ESCAPE, ['-p', '--suffix=mount', mountpoint])
-    const name = esc.stdout.trim()
-    if (esc.exitCode !== 0 || !name)
+    const name = await escapeUnitName(executor, mountpoint, 'mount')
+    if (!name)
       return undefined
     const show = await execSystemctlShow(executor, name, 'LoadState,ActiveState,SubState,Result')
     if (show.exitCode !== 0 && !show.stdout.trim())

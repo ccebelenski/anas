@@ -46,6 +46,7 @@ export {
   fstabOptionTokens,
   isFstabOptionToken,
   unescapeFstabField,
+  X_ANAS_DISABLED_AUTOMOUNT_TOKEN,
   X_ANAS_DISABLED_KEPT_TOKEN,
   X_ANAS_DISABLED_TOKEN,
 } from './formats/fstab.js'

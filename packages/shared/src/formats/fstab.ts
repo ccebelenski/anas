@@ -128,6 +128,20 @@ export function isFstabOptionToken(t: string): boolean {
 export const X_ANAS_DISABLED_TOKEN = 'x-anas.disabled'
 export const X_ANAS_DISABLED_KEPT_TOKEN = 'x-anas.disabled=kept-noauto'
 
+/**
+ * cr.19 (§2 Mounts automount ruling, 2026-10-14): the PARKED automount token.
+ * Disable swaps an operator's `x-systemd.automount` IN PLACE to this token and
+ * Enable swaps it back (the line stays byte-identical), because `noauto` lands
+ * on the `.mount` unit only: a disabled line still carrying the live token
+ * keeps its `.automount` unit wired into `remote-fs.target.wants` and arms at
+ * every boot behind ANAS's back (node defect R1-D1). Like the disable tokens
+ * this is ANAS bookkeeping, never an operator-set option: the request schemas
+ * refuse it as an extra option and the parser consumes it — reading the entry
+ * automount=true for the duration of the disable, so the UI keeps showing the
+ * operator's choice.
+ */
+export const X_ANAS_DISABLED_AUTOMOUNT_TOKEN = 'x-anas.disabled-automount'
+
 /** One fstab option token (see {@link isFstabOptionToken}). */
 export const FstabOptionToken = z
   .string()
