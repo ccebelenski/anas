@@ -337,6 +337,37 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     assert.deepEqual(vgcreate.args.slice(0, 2), ['--config', 'devices/allow_mixed_block_sizes=1'])
   })
 
+  // cr.18 (review M7.4): create derives `<pool>-r<band>` (mdadm `--name`, 32)
+  // and `<pool>-d<n>-b<band>` (GPT label, 36) from the pool name, and mdadm
+  // only truncates/fails AFTER wipefs has already run. The length guard lives
+  // in the shared create schema, so the refusal is the route's first 400 —
+  // before confirm, before any command at all.
+  it('400 on a pool name that cannot fit the derived md/GPT identifiers — nothing runs', async () => {
+    // Two disks → one band digit → md binds: max length 29 ('-r1' + 29 = 32).
+    const tooLong = 'a'.repeat(30)
+    const payload = JSON.stringify({ name: tooLong, tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] })
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res.json().error.message, /max 29 for 2 disk\(s\)/)
+    // No confirm is minted, and no command of any kind ran — certainly no
+    // wipefs/sgdisk/mdadm, which are the ones that run past the point of no return.
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    for (const command of ['/usr/sbin/wipefs', '/usr/sbin/sgdisk', '/usr/sbin/mdadm'])
+      assert.ok(!executor.calls.some(c => c.command === command), `${command} ran for a refused create`)
+  })
+
+  it('the longest accepted name (29 for ≤9 disks) passes validation and reaches the confirm gate', async () => {
+    const longest = 'a'.repeat(29)
+    const payload = JSON.stringify({ name: longest, tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] })
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload })
+    // Accepted by the schema → the normal destructive-confirm shape (409).
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
+    assert.ok(res.headers['x-anas-confirm-code'])
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/wipefs'))
+  })
+
   // The gate is on the KERNEL, not the PVE version: PVE 9 shipped with 6.14.8,
   // so a fully supported node can sit below the md configurable-LBS floor.
   it('REFUSES a mixed selection below the 6.19 floor — 400, no confirm code, nothing touched', async () => {

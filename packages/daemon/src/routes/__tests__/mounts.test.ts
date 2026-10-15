@@ -4,7 +4,7 @@ import type { MountTestStages } from '../../services/mounts.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -309,6 +309,101 @@ describe('mount routes (Epic 18)', () => {
       assert.equal(detail.statusCode, 200)
       const { data } = detail.json() as { data: MountDetail }
       assert.equal(data.configuredOptions?.passthrough, 'x-systemd.requires=/opt')
+    })
+
+    // cr.18 (review M7.2): the "already in fstab" refusal used to run only for
+    // persistent creates, and the credentials file is named by the MOUNTPOINT —
+    // so a non-persistent CIFS mount over a mountpoint an existing fstab line
+    // owns silently overwrote that entry's secrets. The check is unconditional
+    // now, and it fires at REQUEST time: no job, no creds touched.
+    it('a non-persistent CIFS mount over a mountpoint already in fstab is refused; the existing creds file is byte-identical', async () => {
+      // The fixture's own CIFS entry: /mnt/anas-cifs, credentials in a file
+      // named exactly the way a new request for this mountpoint would name it.
+      const mountpoint = '/mnt/anas-cifs'
+      const credsDir = join(dir, 'creds')
+      await mkdir(credsDir, { recursive: true })
+      const credFile = join(credsDir, credsFileName(mountpoint))
+      const OLD_CREDS_BEFORE = 'username=olduser\npassword=old-s3cret\n'
+      await writeFile(credFile, OLD_CREDS_BEFORE, { mode: 0o600 })
+      const fstabBefore = await readFile(fstabPath, 'utf8')
+
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({
+          type: 'cifs',
+          server: 'nas.example.com',
+          remotePath: 'media',
+          mountpoint,
+          persistent: false,
+          mountNow: true,
+          credentials: { username: 'newuser', password: 'new-s3cret' },
+        }),
+      })
+      assert.equal(res.statusCode, 409)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'CONFLICT')
+      assert.match(error.message, /already in \/etc\/fstab/)
+      // Byte-identical: the refused request never wrote near the file.
+      assert.equal(await readFile(credFile, 'utf8'), OLD_CREDS_BEFORE)
+      assert.equal(await readFile(fstabPath, 'utf8'), fstabBefore)
+    })
+
+    // cr.18 (review M7.3): a mount OVER a system path (or an ancestor of one)
+    // hides the OS. One refusal, computed from the list in services/mounts.ts,
+    // enforced at request time with the same 400 envelope as the neighbouring
+    // mountpoint guards — the job is never submitted.
+    it('mount over a system path → 400 (equal, at-depth, and normalized shapes)', async () => {
+      for (const mountpoint of [
+        '/',
+        '/etc',
+        '/usr',
+        '/srv',
+        '/var',
+        '/boot',
+        '/tmp',
+        '/root',
+        '/dev', // equal to a list entry
+        '/usr/local',
+        '/etc/anas',
+        '/lib64/systemd',
+        '/run/samba',
+        '/proc/fake', // inside a protected subtree
+        '/etc/',
+        '/usr//local',
+        '/usr/./local',
+        '/usr/local/', // normalized to refused
+      ]) {
+        const res = await server!.inject({
+          method: 'POST',
+          url: '/v1/mounts',
+          headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+          payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export1', mountpoint, persistent: false, mountNow: false }),
+        })
+        assert.equal(res.statusCode, 400, `${mountpoint} → ${res.statusCode}: ${res.body}`)
+        const { error } = res.json() as { error: { code: string, message: string } }
+        assert.equal(error.code, 'VALIDATION_ERROR')
+        assert.match(error.message, /system path/, mountpoint)
+      }
+      // None of them reached fstab.
+      assert.equal(await readFile(fstabPath, 'utf8'), FSTAB_FIXTURE)
+    })
+
+    it('a mountpoint under a non-protected root passes the system check', async () => {
+      // Deep under /tmp (the harness dir IS under /tmp — every passing test
+      // here proves /tmp/... stays allowed); a directory named like a system
+      // root but living under it must not be refused on a name collision.
+      const mountpoint = join(dir, 'srv')
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export1', mountpoint, persistent: false, mountNow: false }),
+      })
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
     })
   })
 
@@ -1445,5 +1540,72 @@ describe('mount Remove — the credentials file (ident.4 (d))', () => {
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.equal(await readFile(outside, 'utf8'), OLD_CREDS)
     assert.match((job.result as { warnings?: string[] }).warnings?.join(' ') ?? '', /not in the ANAS credentials directory/)
+  })
+})
+
+// cr.18 (review M7.2): for a PERSISTENT mount the credentials file used to be
+// written BEFORE the fstab edit that names it — a failed edit left the secret
+// on disk with no fstab line referencing it, forever. The job now writes the
+// fstab line first; if that edit fails, nothing is left behind.
+describe('mount Create — a failed fstab edit leaves no credentials behind (cr.18, review M7.2)', () => {
+  // editConfig's atomic write lands its temp file and .bak in the fstab's OWN
+  // directory, so a read-only directory fails the edit while reads keep
+  // working. Root ignores directory permissions — the test skips there.
+  const AS_ROOT = typeof process.getuid === 'function' && process.getuid() === 0
+
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string
+  let etcDir: string
+  let fstabPath: string
+  let credsDir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-mounts-fail-'))
+    etcDir = join(dir, 'etc')
+    await mkdir(etcDir, { recursive: true })
+    fstabPath = join(etcDir, 'fstab')
+    await writeFile(fstabPath, '')
+    credsDir = join(dir, 'creds')
+    process.env.ANAS_FSTAB_PATH = fstabPath
+    process.env.ANAS_CREDS_DIR = credsDir
+    process.env.ANAS_STORAGE_CFG = STORAGE_CFG
+    await chmod(etcDir, 0o500)
+    server = createServer({ mock: true, logger: false })
+  })
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    await chmod(etcDir, 0o700)
+    await rm(dir, { recursive: true, force: true })
+    delete process.env.ANAS_FSTAB_PATH
+    delete process.env.ANAS_CREDS_DIR
+    delete process.env.ANAS_STORAGE_CFG
+  })
+
+  it('a persistent CIFS create whose fstab edit fails leaves no credentials file', { skip: AS_ROOT && 'running as root — read-only directories do not stop root' }, async () => {
+    const mountpoint = join(dir, 'mnt', 'editfail-cifs')
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/mounts',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        type: 'cifs',
+        server: 'nas.example.com',
+        remotePath: 'media',
+        mountpoint,
+        persistent: true,
+        mountNow: true,
+        credentials: { username: 'smbuser', password: 's3cret' },
+      }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server!, res.json().job.id)
+    assert.equal(job.status, 'failed', 'the read-only fstab directory must fail the job')
+    // No secret survives the failed edit: the creds dir was never even created.
+    const left = await readdir(credsDir).catch(() => [] as string[])
+    assert.deepEqual(left, [])
+    // And the request-time reads still worked — the failure is the WRITE.
+    assert.equal(await readFile(fstabPath, 'utf8'), '')
   })
 })

@@ -608,6 +608,44 @@ export type AhrLayoutPreviewRequest = z.infer<typeof AhrLayoutPreviewRequest>
  * in-use/foreign-label exclusions are safety-critical). The tier is chosen
  * here forever — there is no AHR-1 → AHR-2 conversion.
  */
+/**
+ * The longest pool name the create pipeline can mint names from (cr.18,
+ * review M7.4) for a pool built from `diskCount` disks.
+ *
+ * The create pipeline builds every on-disk identifier from the pool name,
+ * and TWO of them sit under hard ceilings that mdadm/sgdisk enforce only
+ * AFTER the disks are already wiped (ahr-create.ts: `wipefs -a` is the
+ * point of no return, partitioning comes after):
+ *
+ *  - the md array name  `<pool>-r<band>`   — mdadm `--name=` is capped at
+ *    32 characters (mdadm's own `--help`: "Textual name for array - max 32
+ *    characters"; verified against the installed mdadm, 2026-10).
+ *  - the member GPT label `<pool>-d<n>-b<band>` — a GPT partition name is
+ *    36 UTF-16 characters (UEFI 2.x partition-entry spec; from memory —
+ *    sgdisk truncates with a warning, silently losing the tail).
+ *
+ * Pool names are ASCII by schema (`PoolName`), so characters = bytes for
+ * both ceilings. Bands and disk ordinals never exceed the disk count
+ * (bands come from the disks' size classes), so with `d` the digit count
+ * of `diskCount` the binding arithmetic is:
+ *
+ *    md:   len + 2 + d ≤ 32        → len ≤ 30 − d
+ *    GPT:  len + 4 + d + d ≤ 36    → len ≤ 32 − 2d
+ *
+ *    min → d=1 (1–9 disks): 29 (md binds)   d=2: 28 (both)   d≥3: GPT binds
+ *
+ * The cache-slice label `<pool>-cache<n>` (ahrcache.1, GPT 36) needs
+ * len ≤ 30 − digits(n): a 29-char name fits cache slices 1–9, 10+ slices
+ * would need 28 — that guard belongs on the cache-attach path if it ever
+ * bites. The data LV `<pool>-vol`, the cache LV `<pool>-cache`, the VG
+ * name (the bare pool name) and the btrfs label all allow far more than
+ * 29 and never bind.
+ */
+export function ahrMaxPoolNameLength(diskCount: number): number {
+  const d = String(Math.max(1, diskCount)).length
+  return Math.min(32 - 2 * d, 30 - d)
+}
+
 export const AhrCreateRequest = z.object({
   name: PoolName,
   tier: AhrType,
@@ -619,6 +657,18 @@ export const AhrCreateRequest = z.object({
    * fstab.
    */
   mountpoint: AbsolutePath.optional(),
+}).superRefine((req, ctx) => {
+  // cr.18 (review M7.4): refuse a name that cannot fit the derived md/GPT
+  // identifiers at REQUEST time — the wipe happens before either tool would
+  // ever complain, so a late refusal destroys the disks for nothing.
+  const max = ahrMaxPoolNameLength(req.disks.length)
+  if (req.name.length > max) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['name'],
+      message: `Pool name too long: '${req.name}' is ${req.name.length} characters, max ${max} for ${req.disks.length} disk(s) (the derived md array '<pool>-r<N>' and GPT labels '<pool>-d<N>-b<N>' are capped at 32/36 characters)`,
+    })
+  }
 })
 export type AhrCreateRequest = z.infer<typeof AhrCreateRequest>
 

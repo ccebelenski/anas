@@ -23,6 +23,7 @@ import {
   legacyCredsFileName,
   mapCifsFailure,
   mapNfsFailure,
+  normalizeMountpointPath,
   parseSpec,
   parseStatCapacity,
   probeInventoryHealth,
@@ -30,6 +31,8 @@ import {
   removeCredentialsFileIfUnreferenced,
   removeEmptyMountpointDir,
   runMountTest,
+  SYSTEM_MOUNT_TARGETS,
+  systemMountTargetConflict,
   writeCredentialsFile,
 } from '../mounts.js'
 
@@ -740,6 +743,74 @@ describe('removeEmptyMountpointDir', () => {
 
   it('an absent directory is the asked-for outcome, not a warning', async () => {
     assert.equal(await removeEmptyMountpointDir(join(dir, 'never-existed'), false), undefined)
+  })
+})
+
+// cr.18 (review M7.3): the system mount-target rule, at the predicate.
+describe('systemMountTargetConflict — system paths and their protected subtrees', () => {
+  it('refuses every list entry, exactly', () => {
+    // The full list: `/` and all 16 top-level system roots.
+    for (const entry of SYSTEM_MOUNT_TARGETS) {
+      assert.ok(systemMountTargetConflict(entry), `${entry} must be refused`)
+      assert.match(systemMountTargetConflict(entry)!, /system path/)
+    }
+  })
+
+  it('refuses the boot-critical and virtual subtrees at any depth', () => {
+    for (const mp of [
+      '/usr/local',
+      '/usr/share/anything/deep',
+      '/etc/anas',
+      '/etc/systemd/system/multi-user.target.wants',
+      '/boot/efi',
+      '/proc/1234',
+      '/sys/firmware',
+      '/dev/shm/x',
+      '/run/samba',
+      '/bin/obscure',
+      '/sbin/obscure',
+      '/lib/systemd',
+      '/lib64/x/y',
+    ]) {
+      assert.ok(systemMountTargetConflict(mp), `${mp} must be refused`)
+      assert.match(systemMountTargetConflict(mp)!, /system path/)
+    }
+  })
+
+  it('allows mounts UNDER /srv, /home, /opt and /var — the ordinary remote-share shapes', () => {
+    for (const mp of [
+      '/srv/backup',
+      '/srv/nfs/export1',
+      '/home/shares/nas',
+      '/opt/data',
+      '/opt/anas/mnt',
+      '/var/lib/remote',
+      '/var/mnt/cephfs',
+      '/tmp/anas-mounts-abc/mnt',
+      '/mnt/remote',
+      '/mnt/pve-ish',
+    ]) {
+      assert.equal(systemMountTargetConflict(mp), null, `${mp} must be allowed`)
+    }
+  })
+
+  it('refuses on DIRECTORY boundaries, never on a shared prefix', () => {
+    // Siblings that merely share a spelling with a system root are fine.
+    for (const mp of ['/var2', '/srv-data', '/homeish', '/usrlib', '/tmpfs', '/etc-backup'])
+      assert.equal(systemMountTargetConflict(mp), null, `${mp} must be allowed`)
+  })
+
+  it('normalizes before matching: trailing slash, doubled slashes, /./ segments', () => {
+    // Refused classes first — the shape games never slip past the guard.
+    for (const mp of ['/etc/', '/etc//', '/usr//local', '/usr/./local', '//etc', '//usr/share', '/boot/efi/'])
+      assert.ok(systemMountTargetConflict(mp), `${mp} must be refused`)
+    // Allowed shapes stay allowed through normalization.
+    for (const mp of ['/srv/backup/', '/opt//data', '/var/./lib/remote'])
+      assert.equal(systemMountTargetConflict(mp), null, `${mp} must be allowed`)
+    // And the normalizer itself, on the shapes the guard documents.
+    assert.equal(normalizeMountpointPath('/etc/'), '/etc')
+    assert.equal(normalizeMountpointPath('//usr//share/'), '/usr/share')
+    assert.equal(normalizeMountpointPath('/'), '/')
   })
 })
 

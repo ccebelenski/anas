@@ -39,6 +39,7 @@ import {
   removeEmptyMountpointDir,
   rotateCredentialsFile,
   runMountTest,
+  systemMountTargetConflict,
   validatedExtraOptions,
   writeCredentialsFile,
 } from '../services/mounts.js'
@@ -237,10 +238,17 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: target.problems.join('; ') } }
     }
-    // Mountpoint safety: never PVE territory; never an existing ZFS dataset.
+    // Mountpoint safety: never PVE territory; never a system path (cr.18,
+    // review M7.3 — the target list lives once in services/mounts.ts); never
+    // an existing ZFS dataset.
     if (mountpointReservedByPve(req.mountpoint)) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Mountpoint '${req.mountpoint}' is PVE territory and off-limits to ANAS` } }
+    }
+    const systemConflict = systemMountTargetConflict(req.mountpoint)
+    if (systemConflict) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid mountpoint: ${systemConflict}` } }
     }
     if (pveStorageFor(req.mountpoint, await readPveMountPaths(storagePath))) {
       reply.code(400)
@@ -260,8 +268,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       return { error: { code: 'VALIDATION_ERROR', message: `Mountpoint '${req.mountpoint}' is a ZFS dataset mountpoint` } }
     }
 
-    // Already configured?
-    if (req.persistent && fstabHasMount(await readConfig(fstabPath), req.mountpoint)) {
+    // Already configured? cr.18 (review M7.2): this check runs for EVERY create,
+    // persistent or not. The credentials file is named by the MOUNTPOINT, so an
+    // ephemeral CIFS mount over a mountpoint an existing fstab line owns would
+    // silently overwrite that entry's secrets with new ones.
+    if (fstabHasMount(await readConfig(fstabPath), req.mountpoint)) {
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `Mount '${req.mountpoint}' is already in /etc/fstab` } }
     }
@@ -301,10 +312,6 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       'mount.create',
       { ...identity, params: { mountpoint: req.mountpoint } },
       async (updateProgress) => {
-        if (req.type === 'cifs' && req.credentials) {
-          updateProgress('Writing credentials file')
-          await writeCredentialsFile(credsDir, req.mountpoint, req.credentials)
-        }
         updateProgress(`Creating mountpoint ${req.mountpoint}`)
         await mkdir(req.mountpoint, { recursive: true })
 
@@ -317,6 +324,18 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           })
           updateProgress('Reloading systemd (daemon-reload)')
           await daemonReload(executor)
+        }
+
+        // cr.18 (review M7.2): credentials land only once nothing that can
+        // still refuse stands before them — for a persistent mount AFTER the
+        // fstab edit that names the file, for a non-persistent mount
+        // immediately before the `mount` that consumes it. A request refused
+        // or a job step that fails earlier leaves no secrets on disk. A
+        // non-persistent mount that is never mounted writes nothing: nothing
+        // is left on the system that would ever reference the file.
+        if (req.type === 'cifs' && req.credentials && (req.persistent || req.mountNow)) {
+          updateProgress('Writing credentials file')
+          await writeCredentialsFile(credsDir, req.mountpoint, req.credentials)
         }
 
         if (req.mountNow) {

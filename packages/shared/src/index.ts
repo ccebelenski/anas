@@ -120,6 +120,7 @@ export {
   AhrExpansionZeroGain,
   AhrLayoutPreview,
   AhrLayoutPreviewRequest,
+  ahrMaxPoolNameLength,
   AhrMemberState,
   AhrMetadataCorrected,
   AhrMountpointRequest,

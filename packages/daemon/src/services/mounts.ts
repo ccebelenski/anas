@@ -21,7 +21,7 @@ import { lookup } from 'node:dns/promises'
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, normalize, resolve } from 'node:path'
 import { MountCifsSec, MountExtraOptions, MountNfsSec, normalizeMountTarget, unescapeFstabField } from '@anas/shared'
 import { classifyKind, isIgnoredMount, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { cifsAuthToken, getMount, inlineCommentIndex, parseFstab } from '../parsers/fstab.js'
@@ -56,7 +56,7 @@ const WHITESPACE_RE = /\s+/
 const MOUNT_ERRNO_RE = /mount error\((\d+)\)/
 /** Kernel "malformed UNC" marker (a malformed server/share devname). */
 const MALFORMED_UNC_RE = /malformed unc/i
-/** Leading slashes on a mountpoint (creds-filename derivation). */
+/** Leading slashes on a mountpoint (creds-filename derivation, mountpoint normalization). */
 const LEADING_SLASHES_RE = /^\/+/
 /** Path separators (creds-filename derivation). */
 const SLASH_RE = /\//g
@@ -1408,6 +1408,104 @@ export function mountpointReservedByPve(mountpoint: string): boolean {
     || mountpoint.startsWith('/mnt/pve/')
     || mountpoint === '/etc/pve'
     || mountpoint.startsWith('/etc/pve/')
+}
+
+/**
+ * The system mount targets (cr.18, review M7.3) — the ONE list the mount
+ * refusal is computed from. Mounting a remote share OVER one of these (or
+ * over an ancestor of one — `mount` hides the entire subtree below it, and
+ * an ancestor of `/etc` hides all of `/etc`) breaks the node the way the
+ * PVE-territory and ZFS guards keep it from being broken by accident.
+ *
+ * The rule, applied to the NORMALIZED path (`normalizeMountpointPath`):
+ *  - EQUAL to a list entry                → refused (`/etc`, `/srv`, `/`…)
+ *  - a strict directory PREFIX of an entry → refused (`/us` would hide the
+ *    `/usr` subtree when the list entry is created under it later; `/srv`
+ *    with a trailing component below is fine — see "allowed" below)
+ *  - INSIDE one of the NEVER_MOUNT_UNDER
+ *    subtrees, at any depth                 → refused (`/usr/local`,
+ *    `/etc/x`, `/lib64/y`…)
+ *
+ * Allowed: UNDER `/srv`, `/home`, `/opt` and `/var` — `/srv/backup`,
+ * `/var/lib/remote`, `/home/shares/nas` are ordinary remote-mount shapes.
+ * `/opt` is deliberately NOT in the list: nothing ships there that a mount
+ * could hide, and it is the conventional third-party mount root.
+ */
+export const SYSTEM_MOUNT_TARGETS = [
+  '/',
+  '/bin',
+  '/boot',
+  '/dev',
+  '/etc',
+  '/home',
+  '/lib',
+  '/lib64',
+  '/proc',
+  '/root',
+  '/run',
+  '/sbin',
+  '/srv',
+  '/sys',
+  '/tmp',
+  '/usr',
+  '/var',
+] as const
+
+/**
+ * The list entries whose ENTIRE subtree is off-limits, at any depth. Derived
+ * from SYSTEM_MOUNT_TARGETS: drop `/` (everything is under it), the roots
+ * that are legitimate remote-mount parents (`/home`, `/srv`, `/var`, `/tmp`)
+ * and `/root` (nothing below it matters to the OS — it is a home directory),
+ * keep the boot-critical and virtual-filesystem roots. `/lib*` covers
+ * `/lib` and `/lib64` (the distro usrmerge layouts).
+ */
+const NEVER_MOUNT_UNDER: readonly string[] = SYSTEM_MOUNT_TARGETS.filter(entry =>
+  entry !== '/'
+  && entry !== '/home'
+  && entry !== '/root'
+  && entry !== '/srv'
+  && entry !== '/tmp'
+  && entry !== '/var',
+)
+
+/**
+ * The shape the system-target rule is matched against: POSIX-normalized
+ * (collapses `//`, `/./` and `..` — the schema already refuses `..`), with
+ * the leading slashes collapsed (Node's `normalize` keeps a leading `//`,
+ * which POSIX says is implementation-defined — ANAS treats it as `/`) and
+ * the trailing slash stripped (`/` itself stays `/`). The routes pass mount
+ * points through as given (`AbsolutePath` validates the shape but never
+ * rewrites it), so this is the normalization the guard defines and uses.
+ */
+const TRAILING_SLASHES_RE = /\/+$/
+
+export function normalizeMountpointPath(mountpoint: string): string {
+  const n = normalize(mountpoint).replace(LEADING_SLASHES_RE, '/')
+  return n.length > 1 ? n.replace(TRAILING_SLASHES_RE, '') : n
+}
+
+/**
+ * Why `mountpoint` is a system mount target, or null when mounting there is
+ * fine. `mount` over a directory hides everything below it, so the refusal
+ * covers three shapes: the mountpoint IS a system path, is an ANCESTOR of
+ * one (a directory prefix of it), or sits INSIDE one of the
+ * {@link NEVER_MOUNT_UNDER} subtrees at depth.
+ */
+export function systemMountTargetConflict(mountpoint: string): string | null {
+  const mp = normalizeMountpointPath(mountpoint)
+  for (const entry of SYSTEM_MOUNT_TARGETS) {
+    if (mp === entry)
+      return `'${entry}' is a system path — mounting over it hides the system tree living there`
+    // Ancestor of a list entry: a strict '/'-boundary directory prefix
+    // (`/us` is not an ancestor of `/usr`; `/et` neither; `/et/c`… no).
+    if (entry.startsWith(`${mp}/`))
+      return `'${mp}' is an ancestor of the system path '${entry}' — mounting there hides everything below it`
+  }
+  for (const entry of NEVER_MOUNT_UNDER) {
+    if (mp.startsWith(`${entry}/`))
+      return `'${mp}' is inside the system path '${entry}' — nothing mounts under it`
+  }
+  return null
 }
 
 /** Does the fstab already define this mountpoint? */
