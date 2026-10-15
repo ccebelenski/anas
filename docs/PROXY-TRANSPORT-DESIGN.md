@@ -44,7 +44,7 @@ The `require` is at **request time**, inside `eval` — pveproxy never compiles 
 ## Gateway changes (packages/gateway)
 - Bind **`127.0.0.1:3000`, plain HTTP, no TLS** — pveproxy terminates TLS. Remove the `0.0.0.0` bind, the PVE-cert auto-detection, and the HTTPS server. No public origin.
 - **Remove CORS entirely** (`cors.ts` + the hook) — same-origin now; the allow/expose-header machinery is dead.
-- Ticket verification unchanged (cookie arrives via the proxy; gateway verifies RSA-SHA1 vs `/etc/pve/authkey.pub` as today).
+- ~~Ticket verification unchanged (cookie arrives via the proxy; gateway verifies RSA-SHA1 vs `/etc/pve/authkey.pub` as today).~~ *Retired by cr.27 (2026-10-15):* the gateway no longer verifies tickets. `AnasProxy.pm` asks PVE inside pveproxy (`auth_handler`: ticket, enabled user, TFA, CSRF on every method but GET; `$rpcenv->check`: Sys.Audit / Sys.Modify on `/`) and forwards an HMAC-signed `X-Anas-Auth` header keyed with `/run/anas/proxy.key` (`root:www-data 0640`, written by the gateway at startup); the gateway believes nothing else. See `docs/WAVE2-DESIGN.md` §2 and DESIGN "Authentication & Authorization".
 - **Unauthenticated health/installed probe route** (e.g. `GET /anas/installed` → 200 `{name:'anas',version}` with no auth) so panels can detect "is ANAS on node X" pre-login without a 401.
 
 ## Cross-node (multi-node)
@@ -70,6 +70,7 @@ This makes ANAS's PVE integration **three** surgical, apt-hook-reapplied, fail-o
 Public `:3000` HTTPS origin; gateway PVE-cert auto-detection + HTTPS server; CORS code; the README/installer "trust the :3000 cert" first-run note (the cert exception no longer exists).
 
 ## Notes for the build
-- `require` caches by `%INC`: a new `AnasProxy.pm` needs a pveproxy **restart** to load (fail-safe: a live worker keeps serving the old good code). No hot-reload promise.
+- `require` caches by `%INC`: a new `AnasProxy.pm` needs a pveproxy **restart** to load (fail-safe: a live worker keeps serving the old good code). No hot-reload promise. *(cr.27: the installer now reloads pveproxy whenever it ships a changed `AnasProxy.pm`, because an old module sends no `X-Anas-Auth` and the new gateway refuses everything it forwards.)*
+- *(cr.27)* The hook also runs inside pvedaemon (`127.0.0.1:85`, root, `trusted_env`); `AnasProxy.pm` refuses there with a 404, because PVE's `auth_handler` skips the CSRF check at euid 0.
 - pveproxy workers run as `www-data`; loopback TCP sidesteps socket-permission issues (confirmed reachable as www-data).
 - Story: EPICS 12.2 (transport). Live-proof full-feature on the stunt node (not just spikes) before pve5; pve5 deploy is the operator's step.

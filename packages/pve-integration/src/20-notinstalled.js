@@ -1,9 +1,10 @@
 /*
  * ANAS — "not installed on this node" probe + panel (the Ceph pattern).
  *
- * Before rendering, every view probes the gateway health endpoint. On failure
- * (connection refused / gateway down / node has no ANAS), we render a friendly
- * install-hint panel instead — we cannot auto-install like Ceph (we don't ship
+ * Before rendering, every view probes the gateway health endpoint. On a 403
+ * (PVE does not grant the user Sys.Audit on /, cr.27) we render a privilege
+ * panel; on any other failure (connection refused / gateway down / node has
+ * no ANAS), we render a friendly install-hint panel instead — we cannot auto-install like Ceph (we don't ship
  * through PVE's packaging), so the hint shows the release-tarball path: copy
  * the tarball to the node and run ./install.sh (what the panel below prints).
  */
@@ -42,6 +43,35 @@
         return {
             xtype: 'panel',
             cls: 'anas-view anas-view-notinstalled',
+            bodyPadding: 20,
+            border: false,
+            scrollable: true,
+            html: html,
+        };
+    };
+
+    // A panel config telling the user PVE does not grant them Sys.Audit on /
+    // (cr.27, WAVE2-DESIGN §5 row 15). ANAS IS installed and answered — with a
+    // 403 — so the not-installed hint would send the operator to reinstall a
+    // node that is fine. `message` is the gateway's own sentence, shown as is.
+    ANAS.noPrivilegePanel = function (node, message) {
+        var enc = ANAS.enc;
+        var html = ''
+            + '<div style="max-width:640px;margin:0 auto;">'
+            + '<h2><i class="fa fa-lock"></i> '
+            + enc(ANAS.t('You need Sys.Audit on / to view ANAS on this node')) + '</h2>'
+            + '<p>' + enc(ANAS.t(
+                'ANAS asks Proxmox the question Proxmox asks for its own disk and '
+                + 'ZFS views: reading needs the Sys.Audit privilege on "/", changing '
+                + 'needs Sys.Modify. Ask an administrator for a role that carries it '
+                + '(PVEAuditor to view, Administrator to change) on node "' + node + '".',
+            )) + '</p>'
+            + (message ? '<p style="opacity:0.75;">' + enc(message) + '</p>' : '')
+            + '</div>';
+
+        return {
+            xtype: 'panel',
+            cls: 'anas-view anas-view-noprivilege',
             bodyPadding: 20,
             border: false,
             scrollable: true,
@@ -174,13 +204,20 @@
                         } catch (addErr) {
                             ANAS.warn('view render failed: ' + ANAS.errText(addErr));
                         }
-                    }, function () {
+                    }, function (err) {
                         if (panel.destroyed || panel.destroying) {
                             return;
                         }
                         try {
                             panel.setLoading(false);
-                            panel.add(ANAS.notInstalledPanel(node));
+                            // A 403 is ANAS answering "PVE does not grant you
+                            // Sys.Audit on /" (cr.27) — installed, not missing.
+                            if (err && err.status === 403) {
+                                ANAS.warn('health probe refused (403): ' + ANAS.errText(err));
+                                panel.add(ANAS.noPrivilegePanel(node, err.message));
+                            } else {
+                                panel.add(ANAS.notInstalledPanel(node));
+                            }
                         } catch (e) {
                             ANAS.warn('not-installed render failed: ' + ANAS.errText(e));
                         }

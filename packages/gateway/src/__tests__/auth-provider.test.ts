@@ -49,7 +49,11 @@ describe('createAuthProvider dev-auth tripwire', () => {
 
   it('the default (unset provider) selects pve regardless of authkey presence', () => {
     PveAuthProvider.isAvailable = () => true
-    const provider = createAuthProvider(undefined)
+    const provider = createAuthProvider(undefined, Buffer.alloc(32, 7))
     assert.equal(provider.name, 'pve')
+  })
+
+  it('cr.27: pve without the proxy key refuses to build (it could verify nothing)', () => {
+    assert.throws(() => createAuthProvider(undefined), /needs the proxy key/)
   })
 })

@@ -17,6 +17,11 @@ export const ErrorCode = z.enum([
   'CONFIRMATION_REQUIRED',
   'INTERNAL_ERROR',
   'UNAUTHORIZED',
+  /**
+   * 403 — cr.27 (WAVE2-DESIGN §5 row 11): PVE does not grant the user the
+   * privilege the method needs on `/` (GET/HEAD Sys.Audit, else Sys.Modify).
+   */
+  'FORBIDDEN',
   // cr.3 (review C3): a mutation aimed at a system account — uid/gid outside
   // the share band [1000, 60000). Hard refusal, no confirm bypass.
   'SYSTEM_ACCOUNT',

@@ -1,6 +1,6 @@
 import type { Server } from 'node:http'
 import type { AddressInfo, Server as NetServer } from 'node:net'
-import type { AuthProvider, AuthUser } from '../auth/index.js'
+import type { AuthProvider, AuthResult } from '../auth/index.js'
 import type { GatewayConfig } from '../config.js'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
@@ -31,19 +31,19 @@ writeFileSync(MEMBERS_PATH, JSON.stringify({
   },
 }))
 
-/** Auth provider that accepts everything (like dev, but with a distinct name so the cookie path runs). */
+/** Auth provider that accepts everything with both privileges (like dev, distinct name). */
 class AcceptAuthProvider implements AuthProvider {
   readonly name = 'accept'
-  async validateToken(): Promise<AuthUser | null> {
-    return { name: 'alice@pve', uid: 4242 }
+  async authenticate(): Promise<AuthResult> {
+    return { ok: true, user: { name: 'alice@pve', uid: 4242, privileges: ['Sys.Audit', 'Sys.Modify'] } }
   }
 }
 
 /** Auth provider that rejects everything → 401. */
 class RejectAuthProvider implements AuthProvider {
   readonly name = 'reject'
-  async validateToken(): Promise<AuthUser | null> {
-    return null
+  async authenticate(): Promise<AuthResult> {
+    return { ok: false, reason: 'test: rejected' }
   }
 }
 
@@ -62,7 +62,7 @@ function baseConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
 }
 
 describe('auth hook', () => {
-  it('rejects requests without a valid cookie with a 401 ApiError', async () => {
+  it('rejects a request the provider refuses with a 401 ApiError', async () => {
     const server = createServer({
       config: baseConfig(),
       authProvider: new RejectAuthProvider(),
@@ -74,7 +74,7 @@ describe('auth hook', () => {
     await server.close()
   })
 
-  it('accepts a request when the provider validates the cookie', async () => {
+  it('accepts a request the provider vouches for', async () => {
     const server = createServer({
       config: baseConfig(),
       authProvider: new AcceptAuthProvider(),
@@ -86,22 +86,6 @@ describe('auth hook', () => {
       headers: { cookie: 'PVEAuthCookie=whatever' },
     })
     assert.equal(res.statusCode, 200)
-    await server.close()
-  })
-
-  it('returns 401 for malformed percent-encoding in PVEAuthCookie (no 500)', async () => {
-    const server = createServer({
-      config: baseConfig(),
-      authProvider: new AcceptAuthProvider(),
-      logger: false,
-    })
-    const res = await server.inject({
-      method: 'GET',
-      url: '/api/health',
-      headers: { cookie: 'PVEAuthCookie=%E0%A4%A' },
-    })
-    assert.equal(res.statusCode, 401)
-    assert.equal(res.json().error.code, 'UNAUTHORIZED')
     await server.close()
   })
 })

@@ -50,7 +50,10 @@ It runs on the PVE node itself, presented as native ExtJS panels injected into t
 │  - Binds 127.0.0.1:3000, plain HTTP (no TLS, │
 │    no public origin — pveproxy terminates    │
 │    TLS at :8006 and proxies /anas here)      │
-│  - Verifies PVEAuthCookie (RSA-SHA1, local)  │
+│  - Believes only pveproxy's signed hand-off  │
+│    (X-Anas-Auth: PVE checked the ticket,    │
+│    CSRF and privileges); GET/HEAD need      │
+│    Sys.Audit on /, else Sys.Modify (cr.27)  │
 │  - Input validation (Zod schemas)            │
 │  - Node routing: self → local anasd socket,  │
 │    other → forwards to <node>:8006/anas       │
@@ -119,7 +122,7 @@ Both processes run as root (like Proxmox). The separation is architectural, not 
 | UI | ExtJS panels injected into pve-manager (the Ceph model) | Native PVE look, theme, and interaction — no iframe, no style clash, users stay in the UI they know |
 | API gateway (anas) | Fastify (TypeScript) | Same stack as anasd; auth verification, validation, node forwarding. Plain HTTP on loopback, fronted by pveproxy at `:8006/anas` (no TLS/CORS of its own) |
 | Config format | none — environment (`/etc/default/anas`, systemd unit drop-ins) | No config file exists; defaults in code, overrides via env (EPICS §5 rejected a YAML layer) |
-| Auth | PVE ticket (verified locally against the replicated cluster authkey); Dev provider for testing | Proxmox owns the session; tickets are cluster-valid |
+| Auth | PVE's own `auth_handler` and `$rpcenv->check`, run inside pveproxy by `AnasProxy.pm`, handed to the gateway as an HMAC-signed header (cr.27); Dev provider for testing | Proxmox owns the session and the privileges; tickets and ACLs are cluster-valid |
 | Daemon runtime | Node.js (TypeScript) | Same language as gateway, shared schemas, single npm package |
 | Daemon framework | Fastify | Lightweight, schema validation built-in, Unix socket support |
 | IPC | REST (HTTP) over Unix domain socket | Formal semantics, curl-debuggable, auth propagation |
@@ -153,10 +156,16 @@ All anasd routes are prefixed with `/v1/`. This allows future breaking changes w
 Every request from anas to anasd carries the authenticated user's identity via headers:
 
 ```
-X-Anas-User: admin
-X-Anas-User-UID: 1000
+X-Anas-User: alice@pve
+X-Anas-User-UID: -1
+X-Anas-Privileges: Sys.Audit,Sys.Modify
 X-Anas-Request-ID: 550e8400-e29b-41d4-a716-446655440000
 ```
+
+Since cr.27 `X-Anas-User` is the full PVE user id with its realm, and `X-Anas-User-UID` is the Linux uid only
+for a `@pam` user (-1 for any other realm: `alice@pve` is not the local `alice`). `X-Anas-Privileges` is what
+PVE granted on `/`, as pveproxy signed it; the job-queue backstop (cr.28) reads it, and a socket client that
+sends none (the timer runner, the udev script) is root.
 
 anasd trusts these headers because the Unix socket restricts access to local processes. This gives us:
 
@@ -837,15 +846,33 @@ ANAS is always accessed through Proxmox UI — Proxmox owns the session.
 
 | Provider | When | How |
 |----------|------|-----|
-| `PveAuthProvider` | Production (default) | Verifies PVEAuthCookie signature locally (RSA-SHA1 against `/etc/pve/authkey.pub`) — no network calls |
-| `DevAuthProvider` | Development & testing | Accepts everything, returns mock user |
+| `PveAuthProvider` | Production (default) | Believes only the `X-Anas-Auth` statement `AnasProxy.pm` signs inside pveproxy — no ticket parsing, no network calls (cr.27) |
+| `DevAuthProvider` | Development & testing | Accepts everything, returns a mock user holding both privileges |
 
 - **No login page** — users are already authenticated via Proxmox
-- **No JWT / session store** — PVEAuthCookie is the credential, validated on each request
+- **No JWT / session store** — PVEAuthCookie is the credential, validated by PVE on each request
 - **No PAM fallback** — standalone access outside Proxmox is not a supported path
 - **Session expiry & logout** — managed by Proxmox
-- **Auth hook** (anas gateway): verifies PVEAuthCookie signature → attaches `{ name, uid }` to the request → rejects with 401 if invalid
-- **Dev mode** (`ANAS_AUTH_PROVIDER=dev`): skips cookie validation, sets a mock user on every request
+- **Who and what, inside pveproxy** (cr.27, `docs/WAVE2-DESIGN.md` §2): `AnasProxy.pm` calls PVE's own
+  `auth_handler` — the method pveproxy calls for `/api2` — which checks the ticket, that the user exists and is
+  enabled, the TFA state and, for every method but GET, the `CSRFPreventionToken`; then `$rpcenv->check` answers
+  which of `Sys.Audit` / `Sys.Modify` PVE grants on `/`. It removes any client-supplied `X-Anas-Auth` and adds
+  `X-Anas-Auth: v1;user=<userid>;privs=<list>;ts=<epoch>;mac=<hex>`, an HMAC-SHA256 over the user (percent-encoded),
+  the privileges, the timestamp, the method and the forwarded path. PVE API tokens are refused ("PVE API tokens are
+  not accepted by ANAS"). The hook refuses to serve inside pvedaemon (`:85`, root, `trusted_env`), where PVE skips
+  the CSRF check. Every refusal is logged (journal unit `pveproxy`, `anas-proxy: refused …`), the access log names
+  the user, and a 401 is delayed 3 s as PVE delays its own.
+- **The hand-off key**: the gateway writes 32 random bytes to `/run/anas/proxy.key` (`root:www-data 0640`,
+  atomically) at every start and refuses to start if it cannot; pveproxy's workers (www-data) read it. A runtime
+  credential like the socket, rotated by a restart, never written by the installer.
+- **Auth hook** (anas gateway): verifies the MAC (constant time), `|now − ts| ≤ 30 s` and that method and path match
+  the request it received → attaches `{ name, uid, privileges }` → else 401 "This request did not come through
+  pveproxy" with the failed check logged (`[authz] refused …`, journal unit `anas`). The gateway listens on loopback,
+  where any local uid can reach it, so it trusts nothing unsigned.
+- **Dev mode** (`ANAS_AUTH_PROVIDER=dev`): no pveproxy, no hand-off; a mock user with both privileges on every
+  request; still refused on a real PVE node without `ANAS_ALLOW_INSECURE_DEV_AUTH=1`
+- **Installer**: an upgrade that changes `AnasProxy.pm` reloads pveproxy, because a running worker keeps the module
+  it loaded (F12)
 
 Proxmox integration:
 - Users logged into Proxmox UI are already authenticated to ANAS: the ANAS panels run inside the PVE UI page and reach the gateway same-origin through PVE's `:8006` under `/anas`, so the browser sends PVEAuthCookie automatically (the `Secure` cookie is satisfied by pveproxy's existing TLS — the gateway itself serves plain HTTP on loopback). Cross-node operations are forwarded server-side — the browser never contacts another node (see **PVE UI Integration**)
@@ -854,10 +881,19 @@ Proxmox integration:
 Both services run as root — no dedicated service user.
 
 ### Authorization
-- If you're authenticated, you can do everything. Auth is binary: logged in or not.
-- No roles, no groups, no permission matrix. This is a tool, not a meta-system.
-- User identity is still propagated to anasd for audit logging.
-- If finer-grained access is ever needed, it's a future discussion — not a V1 concern.
+*(Operator ruling 2026-10-14, built by cr.27; replaces "auth is binary".)* ANAS asks PVE the question PVE asks for
+its own ZFS, LVM and directory disk verbs: **`Sys.Audit` on `/` to read, `Sys.Modify` on `/` to change.**
+- **The rule is the method:** GET and HEAD need `Sys.Audit`; POST, PUT, DELETE and PATCH need `Sys.Modify`. No
+  exceptions and no route table — a new route needs no row. `GET /installed` is the only unauthenticated route.
+- **PVE answers, the gateway decides:** the privileges come from PVE's `$rpcenv->check` inside pveproxy (roles,
+  groups, `--propagate 0`, pools — PVE's compile, PVE's definedness rule); the gateway applies the rule once.
+- **A refusal is a 403 `FORBIDDEN`** naming the privilege and the path: "Permission check failed (/, Sys.Modify):
+  alice@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations." The panel shows
+  "You need Sys.Audit on / to view ANAS on this node" when the install probe is refused.
+- **What it means for operators:** `PVEAuditor`, `PVESysAdmin` and `PVEAdmin` on `/` can view and change nothing;
+  `Administrator` (or a custom role with `Sys.Modify`) on `/` can change. A grant on `/nodes/<node>` alone opens
+  nothing, exactly where PVE's own ZFS create refuses. root@pam passes every check.
+- **No ANAS roles, no permission matrix.** User identity (with realm) is propagated to anasd for the audit log.
 
 ---
 
@@ -927,7 +963,7 @@ https://<ui-host>:8006/anas/api/nodes/<node>/v1/jobs/:id
 ```
 
 - **The browser only ever talks to the PVE `:8006` on the host serving the UI.** ANAS is same-origin under `/anas`, so `PVEAuthCookie` flows automatically — no CORS, no cert exception. pveproxy proxies `/anas` to the gateway on `127.0.0.1:3000`, which strips the prefix.
-- **Node routing:** if `<node>` is the local node, the gateway forwards to the local anasd socket (`/v1/...`) — on a single-node install this branch is the whole story. Otherwise it forwards the request to `https://<node>:8006/anas/api/nodes/<node>/v1/...`, resolving the peer's address from PVE cluster membership (`/etc/pve/.members`, not DNS) and passing the user's ticket; the remote gateway verifies the ticket against the replicated cluster authkey (`/etc/pve/authkey.pub`) exactly as for a direct request, and the TLS hop is verified against the cluster CA (`/etc/pve/pve-root-ca.pem`). A node without ANAS returns a clean `ANAS_NOT_INSTALLED` signal. No new trust infrastructure — this is PVE's own fabric (Principle 15).
+- **Node routing:** if `<node>` is the local node, the gateway forwards to the local anasd socket (`/v1/...`) — on a single-node install this branch is the whole story. Otherwise it forwards the request to `https://<node>:8006/anas/api/nodes/<node>/v1/...`, resolving the peer's address from PVE cluster membership (`/etc/pve/.members`, not DNS) and passing the user's ticket and `CSRFPreventionToken`; the peer's pveproxy authenticates and authorizes the request again with PVE's own code (`AnasProxy.pm`, cr.27) exactly as for a direct request — a peer whose forwarding node sent no token answers that the forwarding node's ANAS is older — and the TLS hop is verified against the cluster CA (`/etc/pve/pve-root-ca.pem`). A node without ANAS returns a clean `ANAS_NOT_INSTALLED` signal. No new trust infrastructure — this is PVE's own fabric (Principle 15).
 - anasd's `/v1/` API is unchanged — socket-only (Principle 9), reached exclusively through a gateway.
 
 ---

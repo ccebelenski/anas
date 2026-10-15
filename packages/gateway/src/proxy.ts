@@ -118,6 +118,32 @@ function relayHeaders(reply: FastifyReply, headers: UpstreamResult['headers']): 
   }
 }
 
+/** The header carrying the privileges PVE granted on `/` to the daemon. */
+export const PRIVILEGES_HEADER = 'x-anas-privileges'
+
+/**
+ * The Content-Type the local hop sends anasd (cr.27, the cr.26 note). The
+ * daemon's rule (cr.26, WAVE2-DESIGN §3) is: a mutation whose Content-Type is
+ * present and not application/json is a 415, with or without a body. Before
+ * cr.27 the gateway sent the type only along with a body, so a body-less POST
+ * typed `text/plain` lost its header here and passed through `/anas` while the
+ * same request on the socket was refused. Now:
+ *   - with a body: the client's type, or application/json when it sent none
+ *     (as before);
+ *   - without a body: any type that is not application/json is forwarded, so
+ *     the daemon answers its own 415 exactly as on the socket; a body-less
+ *     application/json is still dropped (Fastify would refuse an empty JSON
+ *     body with its own 400, and a body-less JSON-typed POST passed before).
+ */
+export function forwardedContentType(header: string | string[] | undefined, hasBody: boolean): string | undefined {
+  const value = Array.isArray(header) ? header.join(', ') : header
+  if (hasBody)
+    return value ?? 'application/json'
+  if (value === undefined)
+    return undefined
+  return value.split(';', 1)[0]!.trim().toLowerCase() === 'application/json' ? undefined : value
+}
+
 /**
  * Proxy the request to the local anasd Unix socket.
  *
@@ -138,8 +164,14 @@ export async function proxyToLocalSocket(
   }
 
   if (opts.user) {
+    // The full PVE user id, realm included (cr.27: `alice@pve` is not the
+    // local `alice`); the uid only for a `@pam` user, -1 otherwise.
     headers['x-anas-user'] = opts.user.name
     headers['x-anas-user-uid'] = String(opts.user.uid)
+    // What PVE granted on `/`, as pveproxy signed it (WAVE2-DESIGN A3.1: the
+    // daemon's job-queue backstop, cr.28, reads it; an absent header means a
+    // root socket client).
+    headers[PRIVILEGES_HEADER] = opts.user.privileges.join(',')
   }
 
   // Forward the confirmation code for dangerous operations, if the client sent one.
@@ -150,10 +182,11 @@ export async function proxyToLocalSocket(
   const body = request.body instanceof Buffer && request.body.length > 0
     ? request.body
     : undefined
-  if (body) {
-    headers['content-type'] = (request.headers['content-type'] as string) ?? 'application/json'
+  const contentType = forwardedContentType(request.headers['content-type'], body !== undefined)
+  if (contentType !== undefined)
+    headers['content-type'] = contentType
+  if (body)
     headers['content-length'] = String(body.length)
-  }
 
   try {
     const result = await new Promise<UpstreamResult>((resolve, reject) => {

@@ -166,6 +166,7 @@ setup_env() {
   JS_DIR="${WORK}/js"
   HOOK_DIR="${WORK}/apt"
   RESTART_MARK="${WORK}/pveproxy-restarted"
+  RELOAD_MARK="${WORK}/pveproxy-reloaded"
   mkdir -p "${JS_DIR}" "${HOOK_DIR}"
   make_tpl "${TPL}"
 }
@@ -177,6 +178,7 @@ run_install() {
   PVE_TPL="${TPL}" PVE_JS_DIR="${JS_DIR}" APT_HOOK="${HOOK_DIR}/hook" \
   PVE_HTTP_SERVER_PM="${PVE_PM}" ANAS_PERL_DIR="${PERL_DIR}" \
   PVEPROXY_RESTART_CMD="touch '${RESTART_MARK}'" \
+  PVEPROXY_RELOAD_CMD="touch '${RELOAD_MARK}'" \
   PERL_BIN="${PERL_BIN_OVERRIDE:-perl}" \
     bash "${INSTALL}" >"${WORK}/install.log" 2>&1
 }
@@ -219,6 +221,38 @@ check "second install exits 0" "[ ${rc} -eq 0 ]"
 check "exactly one hook block after first install" "[ '${count1}' -eq 1 ]"
 check "still exactly one hook block (no double-insert)" "[ '${count2}' -eq 1 ]"
 check "no pveproxy restart on the idempotent no-op" "[ ! -f '${RESTART_MARK}' ]"
+check "no pveproxy reload when AnasProxy.pm is unchanged (cr.27)" "[ ! -f '${RELOAD_MARK}' ]"
+rm -rf "${WORK}"
+
+echo "== 2b. cr.27 (F12): an upgrade that only changes AnasProxy.pm reloads pveproxy =="
+setup_env
+make_anyevent "${PVE_PM}"
+PERL_BIN_OVERRIDE="" run_install >/dev/null 2>&1
+cp "${PVE_PM}" "${WORK}/spliced.pm"
+# The node runs an older module than the one this install ships.
+printf '# an older AnasProxy.pm\n' >> "${PERL_DIR}/AnasProxy.pm"
+rm -f "${RESTART_MARK}" "${RELOAD_MARK}"
+PERL_BIN_OVERRIDE="" run_install; rc=$?
+check "upgrade install exits 0" "[ ${rc} -eq 0 ]"
+check "the shipped module replaced the old one" "cmp -s '${PKG}/perl/AnasProxy.pm' '${PERL_DIR}/AnasProxy.pm'"
+check "pveproxy reload requested (workers drop the cached module)" "[ -f '${RELOAD_MARK}' ]"
+check "no restart (the hook was already spliced)" "[ ! -f '${RESTART_MARK}' ]"
+check "the PVE module is not touched" "cmp -s '${PVE_PM}' '${WORK}/spliced.pm'"
+check "install log says why" "grep -q 'AnasProxy.pm changed, pveproxy reloaded' '${WORK}/install.log'"
+rm -rf "${WORK}"
+
+echo "== 2c. cr.27 (F12): a failed reload warns with the manual step and does not fail the install =="
+setup_env
+make_anyevent "${PVE_PM}"
+PERL_BIN_OVERRIDE="" run_install >/dev/null 2>&1
+printf '# an older AnasProxy.pm\n' >> "${PERL_DIR}/AnasProxy.pm"
+PVE_TPL="${TPL}" PVE_JS_DIR="${JS_DIR}" APT_HOOK="${HOOK_DIR}/hook" \
+PVE_HTTP_SERVER_PM="${PVE_PM}" ANAS_PERL_DIR="${PERL_DIR}" \
+PVEPROXY_RESTART_CMD="touch '${RESTART_MARK}'" \
+PVEPROXY_RELOAD_CMD="false" \
+  bash "${INSTALL}" >"${WORK}/install.log" 2>&1; rc=$?
+check "install still exits 0" "[ ${rc} -eq 0 ]"
+check "the warning names the manual reload" "grep -qF \"run 'systemctl reload pveproxy'\" '${WORK}/install.log'"
 rm -rf "${WORK}"
 
 echo "== 3. anchor required: no anchor => refuse, leave module untouched =="

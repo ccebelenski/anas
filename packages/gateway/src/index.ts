@@ -1,3 +1,4 @@
+import { PROXY_KEY_PATH, removeProxyKey, writeProxyKey } from './auth/proxy-key.js'
 import { loadConfig } from './config.js'
 import { DEFAULT_PVE_LOCAL_PATH, describeNodeNameSource } from './node-name.js'
 import { createServer } from './server.js'
@@ -10,10 +11,29 @@ import { createServer } from './server.js'
 async function main() {
   const config = loadConfig()
 
-  const server = createServer({ config })
+  // cr.27: the hand-off key pveproxy signs X-Anas-Auth with (auth/proxy-key.ts).
+  // Written before the gateway listens, rotated by every start. Without it
+  // pveproxy can vouch for nobody, so a failure to write it stops the start
+  // (systemd shows the line); the dev loop has no pveproxy and needs none.
+  let proxyKey: Buffer | undefined
+  if (config.authProvider !== 'dev') {
+    try {
+      proxyKey = writeProxyKey(PROXY_KEY_PATH)
+    }
+    catch (err) {
+      console.error(`[authz] ${(err as Error).message}`)
+      process.exit(1)
+    }
+  }
+
+  const server = createServer({ config, ...(proxyKey ? { proxyKey } : {}) })
 
   const shutdown = async () => {
     server.log.info('Shutting down...')
+    // With the key gone pveproxy answers 502 "ANAS gateway not ready" rather
+    // than sign for a gateway that is no longer there.
+    if (proxyKey)
+      removeProxyKey(PROXY_KEY_PATH, proxyKey)
     await server.close()
     process.exit(0)
   }

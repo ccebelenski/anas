@@ -1,6 +1,6 @@
 import type { Server } from 'node:http'
 import type { AddressInfo, Server as NetServer } from 'node:net'
-import type { AuthProvider, AuthUser } from '../auth/index.js'
+import type { AuthProvider, AuthResult } from '../auth/index.js'
 import type { GatewayConfig } from '../config.js'
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
@@ -17,11 +17,11 @@ import { createServer } from '../server.js'
 const FQDN = 'pve-atlas.internal.mydomain.cloud'
 const PVE_NODE = 'pve-atlas'
 
-/** Auth provider that accepts everything (a distinct name so the cookie path runs). */
+/** Auth provider that accepts everything with both privileges. */
 class AcceptAuthProvider implements AuthProvider {
   readonly name = 'accept'
-  async validateToken(): Promise<AuthUser | null> {
-    return { name: 'alice@pve', uid: 4242 }
+  async authenticate(): Promise<AuthResult> {
+    return { ok: true, user: { name: 'alice@pve', uid: 4242, privileges: ['Sys.Audit', 'Sys.Modify'] } }
   }
 }
 

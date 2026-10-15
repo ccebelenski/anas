@@ -105,6 +105,9 @@ PROXY_SRC="${SCRIPT_DIR}/perl/AnasProxy.pm"
 # the installer tests never touch the real service manager; default is the real
 # systemctl sequence.
 PVEPROXY_RESTART_CMD="${PVEPROXY_RESTART_CMD:-}"
+# Command that reloads pveproxy when only AnasProxy.pm changed (cr.27, F12).
+# Overridable for the installer tests; default is the real systemctl call.
+PVEPROXY_RELOAD_CMD="${PVEPROXY_RELOAD_CMD:-}"
 
 # The exact <script> source path we inject; the grep presence-check keys on it.
 # It is a substring of the versioned tag (…anas.js?v=<hash>), so every presence
@@ -124,6 +127,20 @@ restart_pveproxy() {
   fi
   systemctl reset-failed pveproxy >/dev/null 2>&1 || true
   systemctl restart pveproxy
+}
+
+# Reload pveproxy so its workers drop a cached AnasProxy.pm (cr.27, F12). The
+# hook `require`s the module once per worker and a worker lives for 1000
+# requests (pveproxy.pm:102), so on an idle node an old module could serve for
+# days; since cr.27 an old module sends no X-Anas-Auth and the new gateway
+# refuses every request it forwards. reload-or-restart: PVE's unit reloads
+# gracefully (new workers, no dropped connections) where it can.
+reload_pveproxy() {
+  if [ -n "${PVEPROXY_RELOAD_CMD}" ]; then
+    eval "${PVEPROXY_RELOAD_CMD}"
+    return $?
+  fi
+  systemctl reload-or-restart pveproxy
 }
 
 # True if $1 carries a third-party proxy-hook block that is NOT ours (issue #20).
@@ -208,6 +225,13 @@ install_anas_proxy() {
       return 1
     fi
   fi
+  # F12: pveproxy workers keep the module they loaded; remember whether this
+  # install changes it, so an upgrade that only ships a new module still
+  # reaches the running workers (step 2 below).
+  local module_changed=0
+  if [ ! -f "${ANAS_PROXY_PM}" ] || ! cmp -s "${PROXY_SRC}" "${ANAS_PROXY_PM}"; then
+    module_changed=1
+  fi
   install -D -m 0644 "${PROXY_SRC}" "${ANAS_PROXY_PM}"
   echo "anas: installed ${ANAS_PROXY_PM}"
 
@@ -217,7 +241,15 @@ install_anas_proxy() {
     return 0
   fi
   if grep -qF "${ANAS_HOOK_MARKER}" "${PVE_HTTP_SERVER_PM}"; then
-    echo "anas: proxy hook already present in ${PVE_HTTP_SERVER_PM} (nothing to do)"
+    if [ "${module_changed}" -eq 1 ]; then
+      if reload_pveproxy; then
+        echo "anas: proxy hook already present; AnasProxy.pm changed, pveproxy reloaded so its workers load it"
+      else
+        echo "anas: WARNING: AnasProxy.pm changed but the pveproxy reload failed; run 'systemctl reload pveproxy' — until then its workers serve the old module" >&2
+      fi
+    else
+      echo "anas: proxy hook already present in ${PVE_HTTP_SERVER_PM} and AnasProxy.pm unchanged (nothing to do)"
+    fi
     return 0
   fi
   # Refuse to force onto a structure we don't recognise (guest philosophy).

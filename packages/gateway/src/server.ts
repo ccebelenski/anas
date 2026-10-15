@@ -3,6 +3,7 @@ import type { GatewayConfig } from './config.js'
 import { VERSION } from '@anas/shared'
 import Fastify from 'fastify'
 import { createAuthProvider } from './auth/index.js'
+import { forbiddenMessage, missingPrivilege } from './auth/policy.js'
 import { loadConfig } from './config.js'
 import { NODE_NAME_RE } from './node-name.js'
 import { FORWARDED_HEADER, forwardToNode, proxyToLocalSocket } from './proxy.js'
@@ -19,34 +20,21 @@ export interface ServerOptions {
   config?: GatewayConfig
   /** Override the auth provider (tests inject a stub). Defaults to env. */
   authProvider?: AuthProvider
-  /** Enable request logging. Default: true. Disable in unit tests. */
-  logger?: boolean
+  /** The hand-off key written at startup (auth/proxy-key.ts); needed by the pve provider. */
+  proxyKey?: Buffer
+  /**
+   * Enable request logging. Default: true. Disable in unit tests, or pass a
+   * stream to read what the gateway logged (the authz refusal lines).
+   */
+  logger?: boolean | { level?: string, stream: { write: (line: string) => void } }
 }
 
-/** Read a named cookie out of a raw Cookie header. */
-function readCookie(cookieHeader: string | undefined, name: string): string | undefined {
-  if (!cookieHeader)
-    return undefined
-  for (const part of cookieHeader.split(';')) {
-    const eq = part.indexOf('=')
-    if (eq < 0)
-      continue
-    if (part.slice(0, eq).trim() === name) {
-      const raw = part.slice(eq + 1).trim()
-      try {
-        return decodeURIComponent(raw)
-      }
-      catch {
-        return undefined
-      }
-    }
-  }
-  return undefined
-}
+/** The one 401 sentence for a request pveproxy did not vouch for (§5 rows 9-10). */
+export const NOT_THROUGH_PVEPROXY = 'This request did not come through pveproxy'
 
 export function createServer(opts: ServerOptions = {}) {
   const config = opts.config ?? loadConfig()
-  const provider = opts.authProvider ?? createAuthProvider(config.authProvider)
+  const provider = opts.authProvider ?? createAuthProvider(config.authProvider, opts.proxyKey)
 
   // pveproxy terminates TLS at :8006 and forwards to this loopback service, so
   // the gateway is a plain-HTTP internal service — no TLS, no public origin.
@@ -74,30 +62,38 @@ export function createServer(opts: ServerOptions = {}) {
     return { name: 'anas', version: VERSION }
   })
 
-  // Auth: verify PVEAuthCookie (or dev), attach { name, uid } → 401 otherwise.
+  // Auth (cr.27, docs/WAVE2-DESIGN.md A2-A3): PVE decided who the user is and
+  // what it holds on `/` inside pveproxy and signed the answer (X-Anas-Auth);
+  // the provider verifies that statement. Then the one rule: GET/HEAD need
+  // Sys.Audit, every other method Sys.Modify. Every refusal is logged with its
+  // reason (journal unit anas) — a gate that can refuse everyone must never do
+  // it silently.
   server.addHook('onRequest', async (request, reply) => {
     // The unauthenticated presence probe is exempt (panels hit it pre-login).
     const path = request.url.split('?', 1)[0]
     if (request.method === 'GET' && path === '/installed')
       return
 
-    if (provider.name === 'dev') {
-      request.user = (await provider.validateToken('')) ?? undefined
-      return
-    }
-
-    const cookie = readCookie(request.headers.cookie, 'PVEAuthCookie')
-    if (cookie) {
-      const user = await provider.validateToken(cookie)
-      if (user) {
-        request.user = user
-        return
-      }
-    }
-
-    return reply.code(401).send({
-      error: { code: 'UNAUTHORIZED', message: 'Access ANAS through the Proxmox UI' },
+    const result = await provider.authenticate({
+      method: request.method,
+      url: request.url,
+      headers: request.headers,
     })
+    if (!result.ok) {
+      request.log.warn(`[authz] refused ${request.method} ${path}: ${result.reason}`)
+      return reply.code(401).send({
+        error: { code: 'UNAUTHORIZED', message: NOT_THROUGH_PVEPROXY },
+      })
+    }
+
+    const missing = missingPrivilege(result.user, request.method)
+    if (missing !== undefined) {
+      request.log.warn(`[authz] forbidden: ${result.user.name} ${request.method} ${path} lacks ${missing} on /`)
+      return reply.code(403).send({
+        error: { code: 'FORBIDDEN', message: forbiddenMessage(result.user.name, missing) },
+      })
+    }
+    request.user = result.user
   })
 
   // Gateway health — the panels' not-installed probe target.

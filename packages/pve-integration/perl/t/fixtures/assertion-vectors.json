@@ -1,0 +1,66 @@
+{
+  "comment": "Known-answer vectors for the X-Anas-Auth hand-off (cr.27, WAVE2-DESIGN A2.1), signed by AnasProxy::_assertion. key_hex is the HMAC key; the gateway test verifies each header against the same request. userid_bytes_hex is the user id as PVE hands it over (bytes).",
+  "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "vectors": [
+    {
+      "header": "v1;user=root@pam;privs=Sys.Audit,Sys.Modify;ts=1760500000;mac=09ed21a07ddb323c49a6c1463ef164c0c71f69bdef021f20ee1a185534e2ae02",
+      "method": "GET",
+      "path": "/api/nodes/anas-pve/v1/pools",
+      "privileges": [
+        "Sys.Audit",
+        "Sys.Modify"
+      ],
+      "ts": 1760500000,
+      "userid_bytes_hex": "726f6f744070616d"
+    },
+    {
+      "header": "v1;user=alice@pve;privs=Sys.Audit;ts=1760500001;mac=3267ff3ade892a04e30762aac8ca1749e093ffc773b1f05b8b603bf4a6769ba8",
+      "method": "POST",
+      "path": "/api/nodes/anas-pve/v1/pools/tank/scrub",
+      "privileges": [
+        "Sys.Audit"
+      ],
+      "ts": 1760500001,
+      "userid_bytes_hex": "616c69636540707665"
+    },
+    {
+      "header": "v1;user=nobody@pve;privs=;ts=1760500002;mac=6054236b7f6264628f46bb21d8cc469058eb510cebc6f1dea7e35c50e14cc0e1",
+      "method": "GET",
+      "path": "/api/health",
+      "privileges": [],
+      "ts": 1760500002,
+      "userid_bytes_hex": "6e6f626f647940707665"
+    },
+    {
+      "header": "v1;user=a%3Bb%3Dc%2Cd@pve;privs=Sys.Audit;ts=1760500003;mac=25db0df147cfbb0ef07cd54ba61717b59ebbbde3b09a6086b241b0d61faaba9c",
+      "method": "DELETE",
+      "path": "/api/nodes/n1/v1/shares/nfs/%2Ftank%2Fx?force=1",
+      "privileges": [
+        "Sys.Audit"
+      ],
+      "ts": 1760500003,
+      "userid_bytes_hex": "613b623d632c6440707665"
+    },
+    {
+      "header": "v1;user=j%C3%B6rg@pam;privs=Sys.Audit,Sys.Modify;ts=1760500004;mac=995bb2df05e477e16d31a5d8308d3105c263d540e58b9e8e54071f9266872609",
+      "method": "PUT",
+      "path": "/api/nodes/n1/v1/users/j%C3%B6rg",
+      "privileges": [
+        "Sys.Audit",
+        "Sys.Modify"
+      ],
+      "ts": 1760500004,
+      "userid_bytes_hex": "6ac3b672674070616d"
+    },
+    {
+      "header": "v1;user=svc_backup.1@ldap-corp;privs=Sys.Audit;ts=1760500005;mac=9c02bb80f645ce981718b63a82faf438f4030d53da3842011cf6a652180a1b0f",
+      "method": "HEAD",
+      "path": "/api/health",
+      "privileges": [
+        "Sys.Audit"
+      ],
+      "ts": 1760500005,
+      "userid_bytes_hex": "7376635f6261636b75702e31406c6461702d636f7270"
+    }
+  ]
+}
