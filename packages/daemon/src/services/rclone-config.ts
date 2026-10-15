@@ -34,7 +34,7 @@ import { dirname } from 'node:path'
 import { CLOUD_BACKEND_GUIDES, CloudProvider as CloudProviderSchema } from '@anas/shared'
 import { z } from 'zod'
 import { listSections, parseRcloneConf, removeSection, upsertSection } from '../parsers/rclone-conf.js'
-import { writeFileAtomic } from './config-writer.js'
+import { ConfigConflictError, sha256, writeFileAtomic } from './config-writer.js'
 import { withFileLock } from './file-lock.js'
 import { assertNoSecretValues } from './secret-argv.js'
 
@@ -543,11 +543,45 @@ export async function obscure(
  * secrets, so a rename onto a pre-existing looser-mode target is followed by
  * a forced 0600.
  *
+ * `guard.expectedSha256` (cr.16) is the sha of the bytes the caller read: the
+ * file is re-read and re-checked against it immediately before the write, and
+ * a mismatch throws `ConfigConflictError` (the same error `editConfig` throws,
+ * so routes map both alike) instead of clobbering a writer that landed in
+ * between — rclone above all, which rewrites its own config on a token
+ * refresh and is invisible to ANAS's in-process lock.
+ *
  * Test seam: the rename-failure path (a target that is a directory) is not
  * reachable through the public API — `readConfig` would refuse to read the
  * directory first — so the helper is exported for that one test.
  */
-export async function writeConfigFileAtomic(paths: RcloneConfigPaths, text: string): Promise<void> {
+export async function writeConfigFileAtomic(
+  paths: RcloneConfigPaths,
+  text: string,
+  guard: { expectedSha256?: string } = {},
+): Promise<void> {
+  // cr.16 — change detection, the `editConfig` idiom: rclone is a SEPARATE
+  // process and rewrites this very file (an OAuth token refresh), and
+  // `withFileLock` only serialises ANAS writers. When the caller hands us the
+  // sha of the bytes IT read, re-read and re-hash the file right here — the
+  // closest point to the rename we can reach — and refuse the write on a
+  // mismatch rather than rename our stale text over rclone's newer bytes (the
+  // whole file, not just the token, would revert). The window between this
+  // check and the rename is the same one `editConfig` accepts; ANAS-vs-ANAS
+  // stays covered by the per-file lock.
+  if (guard.expectedSha256 !== undefined) {
+    let now = ''
+    try {
+      now = await readFile(paths.configFile, 'utf-8')
+    }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+        throw err
+      // Absent reads as '' — matching the read side, so absent-then-absent
+      // matches and absent-then-created conflicts.
+    }
+    if (sha256(now) !== guard.expectedSha256)
+      throw new ConfigConflictError(paths.configFile)
+  }
   await mkdir(dirname(paths.configFile), { recursive: true, mode: 0o700 })
   await writeFileAtomic(paths.configFile, text, { mode: 0o600 })
   await chmod(paths.configFile, 0o600).catch(() => {})
@@ -567,6 +601,13 @@ async function restoreConfigFile(
     await rm(paths.configFile, { force: true })
     return
   }
+  // cr.16: deliberately NO expectedSha256 guard here. This is the REPAIR path
+  // — the failed write is already on disk and the only known-good bytes ANAS
+  // holds are `previousText` — so it restores them unconditionally, exactly
+  // byte-for-byte (the `testparm` contract in the module header). Guarding
+  // the rollback would leave the file holding the bytes that just failed the
+  // gate whenever anything else wrote in the meantime, which is strictly
+  // worse than the restore it refuses.
   await writeConfigFileAtomic(paths, previousText)
 }
 
@@ -748,7 +789,11 @@ export async function writeRemote(
     for (const e of entries)
       values[e.key] = e.value
     const newText = upsertSection(current.text, input.name, values)
-    await writeConfigFileAtomic(paths, newText)
+    // cr.16: the guard sha is of the FILE BYTES readConfig read (its `text`
+    // comes from readFile, NOT from `rclone config dump` — the dump only
+    // parses the sections and can lag the file), so a rclone token-refresh
+    // landing after that read aborts this write instead of being reverted.
+    await writeConfigFileAtomic(paths, newText, { expectedSha256: sha256(current.text) })
 
     // The gate: rclone reads the file back. On a miss, the PREVIOUS bytes go
     // back byte-identically before the error is thrown.
@@ -805,7 +850,9 @@ export async function removeRemote(
       throw new RemoteNotFoundError(name)
 
     const newText = removeSection(current.text, name)
-    await writeConfigFileAtomic(paths, newText)
+    // cr.16: same change-detection guard as writeRemote — the bytes readConfig
+    // read (readFile), not rclone's dump output.
+    await writeConfigFileAtomic(paths, newText, { expectedSha256: sha256(current.text) })
 
     // The gate: the dump must parse AND the remote must be gone.
     const base = rcloneBaseArgs(paths.configFile)

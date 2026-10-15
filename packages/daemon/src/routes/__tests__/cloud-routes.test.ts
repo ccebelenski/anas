@@ -16,7 +16,7 @@ import { listSections, parseRcloneConf } from '../../parsers/rclone-conf.js'
 import { createServer } from '../../server.js'
 import { OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs } from '../../services/rclone-config.js'
 import { PROBE_REMOTE_NAME, probeArgs } from '../../services/rclone-probe.js'
-import { cloudRoutes, RCLONE_NOT_INSTALLED } from '../cloud.js'
+import { cloudRoutes, RCLONE_CONFIG_CHANGED, RCLONE_NOT_INSTALLED } from '../cloud.js'
 
 // The REAL 1.60.1 provider capture — the `config providers` fixture returns
 // the raw bytes verbatim (the route trims them, like the real binary's output).
@@ -387,6 +387,45 @@ password = mock-obscured
       assert.equal(doneSecond.status, 'completed', doneSecond.error?.message)
       const text = await readFile(configFile, 'utf-8')
       assert.ok(!text.includes('[gt]') && !text.includes('[gtcrypt]'))
+    })
+  })
+
+  // --- the rclone write race (cr.16) -------------------------------------------
+  describe('a rclone rewrite between ANAS\'s read and ANAS\'s write (cr.16)', () => {
+    it('the create job fails with the reload-and-retry sentence; the file keeps rclone\'s bytes', async () => {
+      await writeFile(configFile, GT_SECTION, 'utf-8')
+      // Stage the race where it happens in production: rclone refreshes its
+      // own token (rewriting the whole file) after ANAS read the bytes but
+      // before ANAS renamed over them. The job's `config dump` is the first
+      // rclone call after that read — readConfig is readFile, then dump —
+      // so the rewrite lands inside the window. (The POST's own precheck
+      // readConfig is dump #1; the job's is dump #2.)
+      const refreshed = `${GT_SECTION}token = {"access_token":"FRESH"}\n`
+      const mock = mockOf(server)
+      const orig = mock.exec.bind(mock)
+      let dumps = 0
+      mock.exec = async (command: string, args: string[], execOpts?: ExecOptions): Promise<ExecResult> => {
+        if (command === RCLONE && args.at(-2) === 'config' && args.at(-1) === 'dump') {
+          dumps++
+          if (dumps === 2)
+            await writeFile(configFile, refreshed, 'utf-8')
+        }
+        return orig(command, args, execOpts)
+      }
+
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/remotes',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'late', type: 'sftp', options: { host: '10.9.9.9' } }),
+      })
+      assert.equal(res.statusCode, 202)
+      const { job } = res.json() as JobAccepted
+      const done = await waitForJob(server, job.id)
+      assert.equal(done.status, 'failed')
+      assert.equal(done.error?.message, RCLONE_CONFIG_CHANGED)
+      // ANAS's edit never landed: the file is rclone's rewrite, byte for byte.
+      assert.equal(await readFile(configFile, 'utf-8'), refreshed)
     })
   })
 

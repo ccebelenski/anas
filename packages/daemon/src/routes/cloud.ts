@@ -59,6 +59,7 @@ import {
   validateSchedule,
   writeTaskUnits,
 } from '../services/cloud-units.js'
+import { ConfigConflictError } from '../services/config-writer.js'
 import { scanNestedFilesystems } from '../services/nested-filesystems.js'
 import { normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, RemoteNotFoundError, remotesReferencing, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
 import { testRemote } from '../services/rclone-probe.js'
@@ -103,6 +104,15 @@ import { requireIdentity } from './identity.js'
 /** The one "no rclone on this node" sentence — names the fix in one verb. */
 export const RCLONE_NOT_INSTALLED
   = 'rclone is not installed on this node — re-run install.sh, which installs it'
+
+/**
+ * The lost-race sentence (cr.16): rclone rewrote its own config file between
+ * ANAS's read and ANAS's write (a token refresh), so the write was refused
+ * rather than revert rclone's newer bytes. Carried by the failed job — the
+ * retry reloads the current file and applies the edit again.
+ */
+export const RCLONE_CONFIG_CHANGED
+  = 'rclone changed its config file while ANAS was editing it — reload and retry'
 
 /**
  * What cancelling a cloud sync run leaves behind — the confirm dialog's
@@ -239,7 +249,16 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     }
   }
 
-  /** Wrap a job body: a binary that vanished after the 202 fails the job with the sentence. */
+  /**
+   * Wrap a job body: a binary that vanished after the 202 fails the job with
+   * the sentence. cr.16 — a config write that found the file changed under it
+   * (rclone refreshed a token between ANAS's read and write) fails the job
+   * with the reload-and-retry sentence: the remote mutations are 202 jobs, so
+   * like shares-smb's `asJobError` for `editConfig`'s ConfigConflictError, the
+   * answer the client gets is the failed job carrying this message, not a
+   * synchronous 409 — the 409-shaped conflicts on these doors (duplicate,
+   * encrypted, referenced) are all prechecks that answer before the 202.
+   */
   function rcloneJob<T>(fn: () => Promise<T>): Promise<T> {
     return (async () => {
       try {
@@ -248,6 +267,8 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       catch (err) {
         if ((err as NodeJS.ErrnoException).code === 'ENOENT')
           throw new Error(RCLONE_NOT_INSTALLED)
+        if (err instanceof ConfigConflictError)
+          throw new Error(RCLONE_CONFIG_CHANGED)
         throw err
       }
     })()

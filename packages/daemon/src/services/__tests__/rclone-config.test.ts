@@ -8,6 +8,7 @@ import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
+import { ConfigConflictError } from '../config-writer.js'
 import {
   ConfigEncryptedError,
   defaultRcloneConfigPaths,
@@ -815,6 +816,57 @@ describe('rclone-config: writeRemote (rclone.1)', () => {
     assert.ok(text.includes('host = 10.0.0.1'))
     assert.ok(text.includes('host = 10.0.0.2'))
   })
+
+  it('cr.16: a rclone rewrite between ANAS\'s read and write aborts with ConfigConflictError — rclone keeps its bytes', async () => {
+    const seed = '[old]\ntype = sftp\nhost = 1.2.3.4\n'
+    await mkdir(dirname(cfg), { recursive: true })
+    await writeFile(cfg, seed, 'utf-8')
+    // One dump is enough: the flow must die at the write guard, before the gate.
+    mock.addFixture({
+      command: RCLONE,
+      args: [...base(), 'config', 'dump'],
+      result: dumpResult({ old: { type: 'sftp', host: '1.2.3.4' } }),
+    })
+    // The seam (the same staging the failed-rollback test uses): the mocked
+    // rclone process rewrites the config file — its OAuth token refresh —
+    // right after ANAS read it. readConfig does readFile FIRST, then the
+    // dump, so landing the write here is exactly the race window: after the
+    // bytes ANAS hashed, before the rename.
+    const refreshed = '[old]\ntype = sftp\nhost = 1.2.3.4\ntoken = {"access_token":"FRESH"}\n'
+    let dumps = 0
+    const executor: CommandExecutor = {
+      async exec(command, args, opts) {
+        const result = await mock.exec(command, args, opts)
+        if (args.at(-2) === 'config' && args.at(-1) === 'dump') {
+          dumps++
+          if (dumps === 1)
+            await writeFile(cfg, refreshed, 'utf-8')
+        }
+        return result
+      },
+      pipeline: (c1, a1, c2, a2) => mock.pipeline(c1, a1, c2, a2),
+      execToStream: (c, a, t, o) => mock.execToStream(c, a, t, o),
+    }
+    await assert.rejects(
+      writeRemote(paths, executor, { name: 'homelab', type: 'sftp', options: { host: '10.0.0.9' } }, { providers, mode: 'create' }),
+      ConfigConflictError,
+    )
+    // ANAS's edit never landed — the file is rclone's rewrite, byte for byte,
+    // not ANAS's stale read with the new section bolted on.
+    assert.equal(await readFile(cfg, 'utf-8'), refreshed)
+  })
+
+  it('cr.16: an unchanged target writes through the sha guard exactly as before', async () => {
+    await mkdir(dirname(cfg), { recursive: true })
+    mock.addFixture({
+      command: RCLONE,
+      args: [...base(), 'config', 'dump'],
+      results: [dumpResult({}), dumpResult({ homelab: { type: 'sftp', host: '10.0.0.9' } })],
+    })
+    const result = await writeRemote(paths, mock, { name: 'homelab', type: 'sftp', options: { host: '10.0.0.9' } }, { providers, mode: 'create' })
+    assert.equal(await readFile(cfg, 'utf-8'), '[homelab]\ntype = sftp\nhost = 10.0.0.9\n')
+    assert.deepEqual(result, { name: 'homelab', type: 'sftp', options: { host: '10.0.0.9' }, secretsSet: [] })
+  })
 })
 
 describe('rclone-config: removeRemote (rclone.1)', () => {
@@ -886,6 +938,35 @@ describe('rclone-config: removeRemote (rclone.1)', () => {
     })
     await assert.rejects(removeRemote(paths, mock, 'homelab'), RcloneConfigGateError)
     assert.equal(await readFile(cfg, 'utf-8'), seed)
+  })
+
+  it('cr.16: a config that changed between the read and the write aborts with ConfigConflictError — the other writer keeps its bytes', async () => {
+    const seed = '[homelab]\ntype = sftp\nhost = 127.0.0.1\n'
+    await writeFile(cfg, seed, 'utf-8')
+    mock.addFixture({
+      command: RCLONE,
+      args: [...rcloneBaseArgs(cfg), 'config', 'dump'],
+      result: dumpResult({ homelab: { type: 'sftp', host: '127.0.0.1' } }),
+    })
+    // Same staging as the writeRemote race: the file changes after ANAS's
+    // readFile, before its rename.
+    const other = '[homelab]\ntype = sftp\nhost = 127.0.0.1\ntoken = {"access_token":"THEIRS"}\n'
+    let dumps = 0
+    const executor: CommandExecutor = {
+      async exec(command, args, opts) {
+        const result = await mock.exec(command, args, opts)
+        if (args.at(-2) === 'config' && args.at(-1) === 'dump') {
+          dumps++
+          if (dumps === 1)
+            await writeFile(cfg, other, 'utf-8')
+        }
+        return result
+      },
+      pipeline: (c1, a1, c2, a2) => mock.pipeline(c1, a1, c2, a2),
+      execToStream: (c, a, t, o) => mock.execToStream(c, a, t, o),
+    }
+    await assert.rejects(removeRemote(paths, executor, 'homelab'), ConfigConflictError)
+    assert.equal(await readFile(cfg, 'utf-8'), other)
   })
 })
 

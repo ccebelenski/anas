@@ -142,7 +142,8 @@ export class ConfigConflictError extends Error {
   }
 }
 
-function sha256(text: string): string {
+/** The sha256 the change-detection idiom hashes with (cr.16: shared with rclone-config's write guard). */
+export function sha256(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
