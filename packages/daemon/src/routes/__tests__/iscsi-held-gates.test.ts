@@ -21,6 +21,7 @@ import { createServer } from '../../server.js'
 import { AHR_FINDMNT_ARGS } from '../../services/ahr-topology.js'
 import { SERVED_DEVICE_MISMATCH } from '../../services/iscsi-served.js'
 import { datasetRoutes } from '../datasets.js'
+import { jobRoutes } from '../jobs.js'
 import { poolRoutes } from '../pools.js'
 
 /**
@@ -723,6 +724,14 @@ describe('the disclosure — a failed claims read is named at the confirm doors 
     // fail-closed system-pool refusal, not a confirm code.
     executor.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: `${POOL}\t-\n${UNSERVED_POOL}\t-\n`, stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: JSON.stringify({ filesystems: [{ target: '/', source: '/dev/mapper/pve-root', fstype: 'ext4', options: 'rw' }] }), stderr: '', exitCode: 0 } })
+    // cr.37r (P1): the rollback challenge and the property-set job need the
+    // snapshot listing and a `zfs set` that succeeds.
+    // The snapshot-route resolver asks whether the dataset exists per candidate.
+    executor.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name', '-t', 'filesystem,volume', '--', IMAGES_DATASET], result: { stdout: `${IMAGES_DATASET}\n`, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name', '-t', 'filesystem,volume', '--', `${IMAGES_DATASET}/snapshots/nightly/rollback`], result: { stdout: '', stderr: `cannot open '${IMAGES_DATASET}/snapshots/nightly/rollback': dataset does not exist`, exitCode: 1 } })
+    executor.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs(IMAGES_DATASET), result: { stdout: snapshotListJson(IMAGES_DATASET, 'nightly'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: ZFS, args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,createtxg', '-d', '1', '--', IMAGES_DATASET], result: { stdout: `${IMAGES_DATASET}@before-grow\t10\n${IMAGES_DATASET}@nightly\t11\n`, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: ZFS, args: ['set', '--', 'compression=lz4', IMAGES_DATASET], result: { stdout: '', stderr: '', exitCode: 0 } })
     const iscsiPaths = {
       configfsRoot: root,
       saveconfigPath: join(dir, 'absent-saveconfig.json'),
@@ -749,6 +758,8 @@ describe('the disclosure — a failed claims read is named at the confirm doors 
       transport: stubTransport(),
       iscsiPaths,
     })
+    // cr.37r (P1): the property-set test polls the job to its result.
+    await built.register(jobRoutes, { prefix: '/v1', jobQueue })
     await built.ready()
     return built
   }
@@ -802,6 +813,49 @@ describe('the disclosure — a failed claims read is named at the confirm doors 
     assert.ok(res.headers['x-anas-confirm-code'])
     const line = body.error.warnings.find(w => w.includes('could not check whether an iSCSI LUN'))
     assert.match(line ?? '', /served from this pool/)
+  })
+
+  // cr.37 review (P1): the same fail-open read gates the rollback and the
+  // property-set — they disclose the same way destroy does.
+  it('dataset rollback mints the confirm gate WITH the could-not-check warning (P1)', async () => {
+    app = await buildDoors(BROKEN_READ)
+    const res = await app.inject({
+      method: 'POST',
+      url: `/v1/pools/${POOL}/datasets/images/snapshots/nightly/rollback`,
+      headers: JSON_HEADERS,
+      payload: '{}',
+    })
+    assert.equal(res.statusCode, 409, JSON.stringify(res.json()))
+    const body = res.json() as { error: { code: string, warnings?: string[] } }
+    assert.equal(body.error.code, 'CONFIRMATION_REQUIRED')
+    assert.ok(res.headers['x-anas-confirm-code'], 'a normal confirm challenge, not a refusal')
+    const line = body.error.warnings?.find(w => w.includes('could not check whether an iSCSI LUN'))
+    assert.match(line ?? '', /served from this dataset/)
+    assert.match(line ?? '', /LIO configuration was unreadable/)
+  })
+
+  it('dataset property-set carries the could-not-check warning in the job result (P1)', async () => {
+    app = await buildDoors(BROKEN_READ)
+    const res = await app.inject({
+      method: 'PUT',
+      url: `/v1/pools/${POOL}/datasets/images`,
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ properties: { compression: 'lz4' } }),
+    })
+    assert.equal(res.statusCode, 202, JSON.stringify(res.json()))
+    const id = (res.json() as { job: { id: string } }).job.id
+    let job
+    for (let i = 0; i < 200; i++) {
+      const jr = await app.inject({ method: 'GET', url: `/v1/jobs/${id}`, headers: IDENTITY })
+      job = (jr.json() as { job: Job }).job
+      if (job.status === 'completed' || job.status === 'failed')
+        break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    assert.equal(job!.status, 'completed', JSON.stringify(job!.error))
+    const result = job!.result as { applied?: string[], warnings?: string[] }
+    const line = result.warnings?.find(w => w.includes('could not check whether an iSCSI LUN'))
+    assert.match(line ?? '', /served from this dataset/)
   })
 
   it('a healthy read discloses NOTHING — the warning rides the failure, not the LIO', async () => {

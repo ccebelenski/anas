@@ -762,7 +762,8 @@ export function createAccessService(opts: AccessServiceOptions) {
    * Plan a set-access request against the target's CURRENT state (stat, the
    * feature-detect, the ACL switch, the live ACL) — the reads happen outside
    * the job, like the pre-lift route did. The caller has already asked the
-   * gates; this answers only the 404 for an unreadable directory.
+   * gates; this answers the 404 for an unreadable directory and the 409 for
+   * an unreadable ACL (D1 below).
    */
   async function planSetAccess(t: AccessTarget, req: SetAccessRequest): Promise<AccessOutcome<SetAccessPlan>> {
     const dir = targetDir(t)
@@ -792,8 +793,19 @@ export function createAccessService(opts: AccessServiceOptions) {
     if (enabled && supported) {
       const r = await executor.exec(GETFACL, ['-pcE', dir])
       aclRead = { exitCode: r.exitCode, stdout: r.stdout }
-      if (r.exitCode === 0 && r.stdout.trim())
+      if (r.exitCode === 0 && r.stdout.trim()) {
         liveAcl = parseGetfacl(r.stdout)
+      }
+      else {
+        // cr.37 review (D1): ACLs enabled but unreadable. readAccess marks
+        // that aclDegraded and composeGrant refuses it — the write plan is the
+        // one door that must not keep planning from the mode bits: a named
+        // request would run `setfacl -R -b -m` (or `--set`) and strip every
+        // grant nobody read, and a base-only edit would compute levels off the
+        // mode whose group digit is the ACL MASK. Refuse the way the guard's
+        // unbound read refuses (409 CONFLICT): the operator fixes the read.
+        return fail(409, 'CONFLICT', `Could not read the POSIX ACLs of '${dir}', so the existing grants are unknown — refusing a change that would replace them`)
+      }
     }
     // Story cr.37: every fact the plan below is computed from, as one hash.
     const revision = createHash('sha256')
@@ -835,9 +847,9 @@ export function createAccessService(opts: AccessServiceOptions) {
     // Only a ZFS target has a switch to flip (never `zfs set` on anything else).
     const aclAutoEnabled = hasNamed && supported && !enabled
 
-    // Strip the named ACL entries only when the caller explicitly said so. The
-    // acltype check (rather than "we saw named entries") means an explicit
-    // clear still runs when the ACL could not be read — the operator asked.
+    // Strip the named ACL entries only when the caller explicitly said so.
+    // (An ACL that could not be read never reaches here — the plan refuses
+    // above, D1 — so the acltype check is all this needs.)
     const clearAcls = clearNamed && supported && enabled
 
     return {

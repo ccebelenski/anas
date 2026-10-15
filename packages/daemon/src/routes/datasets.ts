@@ -905,6 +905,9 @@ export async function datasetRoutes(
           : `Could not read the snapshots of '${fullName}' — refusing a rollback that cannot be bound to them`,
       }),
       gates: [ownedGate<SnapshotObject>(o => o.dataset), rollbackLunGate],
+      // cr.37 review (P1): the same LIO-unreadable disclosure destroy gives —
+      // the rollback gate reads LIO exactly as fail-open, so it warns the same.
+      advisories: (_o, reads) => lioUnreadableAdvisory(reads),
       // §4.2: a rollback rewrites the dataset, exclusive.
       locks: (o, _bound, reads) => datasetClaims(reads, [[o.dataset, 'exclusive']]),
     }
@@ -1079,6 +1082,9 @@ export async function datasetRoutes(
       operation: 'zfs.set',
       object: datasetView(poolName, fullName, nameId('dataset', fullName)),
       gates: [listedGate(false, 'set'), ownedGate<DatasetObject>(o => o.name), propertyKindGate(props), shrinkGate(props)],
+      // cr.37 review (P1): shrinkGate's held-LUN read is the same fail-open
+      // read destroy's is — disclose an unreadable LIO tree the same way.
+      advisories: (_o, reads) => lioUnreadableAdvisory(reads),
       locks: (o, _bound, reads) => datasetClaims(reads, [[o.name, 'exclusive']]),
     }
   }
@@ -1545,9 +1551,10 @@ export async function datasetRoutes(
     // (an already-aligned request is unchanged).
     props.volsize = roundVolsize(target, props.volsize)
 
-    // Job-result warnings. The one a property edit can earn today is the LUN
-    // grow guidance (below) — a filesystem edit never does.
+    // Job-result warnings: the LUN grow guidance (below), and the LIO-unreadable
+    // disclosure (P1) — advisory on every verb whose LUN gate is fail-open.
     const warnings: string[] = []
+    warnings.push(...pre.advisories.map(a => a.warning))
     /** ident.1: the served LUN a volsize grow was verified against (re-read in the job). */
     let servedGrow: ReturnType<typeof servedLunIdentity> | null = null
 
@@ -1585,7 +1592,10 @@ export async function datasetRoutes(
       { ...identity, params: { dataset: fullName, properties: bodyParsed.data.properties } },
       // Ruling (j): ownership, the property kind and the volume gate again,
       // against the dataset as it is now (the shrink compares the CURRENT size).
-      guarded(spec, pre, async (dataset, { updateProgress }) => {
+      guarded(spec, pre, async (dataset, { updateProgress, newAdvisories }) => {
+        // The job's own re-read may earn the disclosure the route door did not
+        // have (P1); `newAdvisories` is already filtered against the route's.
+        warnings.push(...newAdvisories)
         // ONE `zfs set` carrying every pair, not one call per property (#43).
         // ZFS validates the whole property list before it writes any of it, so
         // a value it rejects can no longer land AFTER earlier properties were
@@ -1593,12 +1603,14 @@ export async function datasetRoutes(
         // not merely unlikely. The volsize is rounded against the volume the
         // job just re-read (the size its gate compared).
         const pairs = buildSetPairs({ ...props, volsize: roundVolsize(dataset.row, props.volsize) })
-        const spec = pairs.join(' ')
+        // (The property list as one string, for progress/errors — NOT the
+        // guard's `spec` this line used to shadow.)
+        const propArgs = pairs.join(' ')
         const apply = async () => {
-          updateProgress(`Setting ${spec} on ${fullName}`)
+          updateProgress(`Setting ${propArgs} on ${fullName}`)
           const result = await executor.exec(ZFS, ['set', '--', ...pairs, fullName])
           if (result.exitCode !== 0)
-            throw new Error(result.stderr.trim() || `zfs set ${spec} exited with code ${result.exitCode}`)
+            throw new Error(result.stderr.trim() || `zfs set ${propArgs} exited with code ${result.exitCode}`)
           return { dataset: fullName, applied: pairs, warnings }
         }
         // A grow of a served zvol: the LUN and its served device are re-read
@@ -2089,6 +2101,8 @@ export async function datasetRoutes(
     else if (laterSnapshots.length > 0) {
       warnings.push(`${laterSnapshots.length} more recent snapshot(s) exist (${laterSnapshots.join(', ')}); rollback requires force to destroy them, and doing so is irreversible.`)
     }
+    // The LIO-unreadable disclosure (D3, P1) — the same warning destroy shows.
+    warnings.push(...pre.advisories.map(a => a.warning))
 
     // Story cr.37 (M3): the code signs the whole validated request — `force`
     // included — plus the target snapshot's createtxg and the newest one's
@@ -2114,11 +2128,11 @@ export async function datasetRoutes(
       // Ruling (j): the same snapshot (both createtxgs), the same set force
       // destroys, PVE ownership and the LUN gate, read again now — a LUN
       // created on the volume while the job waited refuses it here.
-      guarded(spec, pre, async () => {
+      guarded(spec, pre, async (_snap, ctx) => {
         const result = await executor.exec(ZFS, args)
         if (result.exitCode !== 0)
           throw new Error(result.stderr.trim() || `zfs rollback exited with code ${result.exitCode}`)
-        return { rolledBack: snapName }
+        return { rolledBack: snapName, ...(ctx.newAdvisories.length > 0 ? { warnings: ctx.newAdvisories } : {}) }
       }),
       { locks: pre.locks },
     )

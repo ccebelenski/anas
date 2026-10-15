@@ -473,6 +473,52 @@ describe('access routes', () => {
       assert.equal(data.aclEnabled, false)
       assert.equal(data.entries.length, 3)
     })
+
+    // cr.37 review (D1): the write plan refuses on the same unreadable ACL the
+    // GET reports as degraded and the share grant refuses on. Planning from
+    // the mode bits would let a named request run `setfacl --set` / `-R -b -m`
+    // and strip every named grant nobody read.
+    it('a named grant is refused when the ACL cannot be read — an unreadable getfacl never plans a write', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server, [
+        { command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') },
+        { command: '/usr/bin/getfacl', args: ['-pcE', MP], result: { stdout: '', stderr: 'Permission denied', exitCode: 1 } },
+      ])
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ entries: [{ kind: 'user', name: 'alice', level: 'read-write' }] }),
+      })
+      assert.equal(res.statusCode, 409, res.body)
+      assert.equal(res.json().error.code, 'CONFLICT')
+      assert.match(res.json().error.message, /Could not read the POSIX ACLs/)
+      // Nothing ran — no strip, no chown, no chmod.
+      assert.equal(calls.some(c => ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl', '/usr/bin/find'].includes(c.command)), false, JSON.stringify(calls))
+    })
+
+    it('a base-only update is refused too — its levels would be computed off the ACL mask', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server, [
+        { command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') },
+        { command: '/usr/bin/getfacl', args: ['-pcE', MP], result: { stdout: '', stderr: 'Permission denied', exitCode: 1 } },
+      ])
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ entries: [
+          { kind: 'owner', level: 'read-write' },
+          { kind: 'owning-group', level: 'read' },
+          { kind: 'everyone', level: 'none' },
+        ] }),
+      })
+      assert.equal(res.statusCode, 409, res.body)
+      assert.equal(res.json().error.code, 'CONFLICT')
+      assert.equal(calls.some(c => ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl', '/usr/bin/find'].includes(c.command)), false, JSON.stringify(calls))
+    })
   })
 
   // --- PUT /access: applyToExisting recurses ------------------------------
@@ -663,6 +709,19 @@ describe('recursive apply — the confirm gate and child datasets (rulings 2026-
     assert.equal(err.warnings.some(w => /subvolume/.test(w)), false, 'no AHR sentence on ZFS')
     assert.equal(calls.some(c => PERMISSION_COMMANDS.includes(c.command)), false, 'nothing ran')
     assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined, 'no ACL switch flipped')
+  })
+
+  it('recursive: an unreadable ACL is refused BEFORE any confirm is offered, and nothing runs (D1)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = installExecutor(server, [
+      { command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') },
+      { command: '/usr/bin/getfacl', args: ['-pcE', MP], result: { stdout: '', stderr: 'Permission denied', exitCode: 1 } },
+    ])
+    const res = await server.inject(putMedia(NAMED_RECURSIVE))
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFLICT', 'the ACL refusal, never a confirm offer')
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'a refusal never offers a confirm')
+    assert.equal(calls.some(c => PERMISSION_COMMANDS.includes(c.command)), false, JSON.stringify(calls))
   })
 
   it('recursive: a non-recursive PUT is not gated', async () => {
