@@ -11,6 +11,7 @@ import { CommandTimeoutError, runInLane } from './executor/deadline.js'
 import { MockExecutor } from './executor/mock.js'
 import { ProdExecutor } from './executor/prod.js'
 import { mockFixtures } from './fixtures/loader.js'
+import { JobForbiddenError, readRequestAuthority, runAsRequest } from './jobs/authority.js'
 import { JobQueue } from './jobs/queue.js'
 import { btrfsUsageArgs } from './parsers/btrfs-usage.js'
 import { LSBLK_ARGS } from './parsers/lsblk.js'
@@ -61,8 +62,11 @@ const MUTATING_METHODS = new Set(['POST', 'PUT', 'DELETE', 'PATCH'])
 export interface ServerOptions {
   /** Use mock executor instead of real commands. Default: false. */
   mock?: boolean
-  /** Enable request logging. Default: true. Disable in unit tests. */
-  logger?: boolean
+  /**
+   * Enable request logging. Default: true. Disable in unit tests, or hand a
+   * stream to read the lines (the gateway's shape; cr.28 tests the refusal logs).
+   */
+  logger?: boolean | { level?: string, stream: { write: (line: string) => void } }
   /**
    * Path to smb.conf (config IS the API — Principle 13). Defaults to
    * $SMB_CONF_PATH, else a throwaway temp copy of the dev fixture in mock mode,
@@ -105,6 +109,14 @@ export function createServer(opts?: ServerOptions) {
   // proves it over a real socket), so no second entry point is needed.
   server.addHook('onRequest', (_request, _reply, done) => runInLane({ lane: 'request' }, done))
 
+  // cr.28 (WAVE2-DESIGN A3.1, the job-queue backstop): every request — through
+  // the gateway or straight onto the socket — carries what it may submit,
+  // read here from `x-anas-privileges` before any handler runs, in the same
+  // callback form as the lane so it rides the whole lifecycle. `submit` asks
+  // this store, never the submitter object a route builds, so no code an HTTP
+  // request reaches can submit as the daemon's own work (jobs/authority.ts).
+  server.addHook('onRequest', (request, _reply, done) => runAsRequest(readRequestAuthority(request.headers), done))
+
   server.addHook('onRequest', async (request, reply) => {
     if (!MUTATING_METHODS.has(request.method))
       return
@@ -143,7 +155,16 @@ export function createServer(opts?: ServerOptions) {
   // 500 an unknown error gets, and never the "no pools" an exit code would
   // have read as. Every other error goes on to Fastify's default handler,
   // exactly as before there was a handler here.
+  //
+  // cr.28: a submit the requester's privileges do not cover (JobForbiddenError,
+  // already logged by the queue's audit line) is the gateway's 403 — the same
+  // code and sentence (WAVE2-DESIGN §5 row 11), naming the privilege.
   server.setErrorHandler((error, request, reply) => {
+    if (error instanceof JobForbiddenError) {
+      return reply.code(403).send({
+        error: { code: 'FORBIDDEN', message: error.message },
+      })
+    }
     if (!(error instanceof CommandTimeoutError))
       throw error
     request.log.warn(`command timeout on ${request.method} ${request.url}: ${error.message}`)

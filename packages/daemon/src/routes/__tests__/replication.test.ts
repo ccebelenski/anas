@@ -22,6 +22,7 @@ const ZPOOL = '/usr/sbin/zpool'
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
+  'x-anas-privileges': 'Sys.Audit,Sys.Modify',
   'x-anas-request-id': randomUUID(),
 }
 
@@ -726,6 +727,7 @@ describe('snapshotFirst ownership — the in-job re-check (review fixes 1 + 4)',
       headers: {
         'x-anas-user': 'root@pam',
         'x-anas-user-uid': '0',
+        'x-anas-privileges': 'Sys.Audit,Sys.Modify',
         'x-anas-request-id': randomUUID(),
       },
       body: { target: { pool: 'testpool2' }, snapshotFirst: true },

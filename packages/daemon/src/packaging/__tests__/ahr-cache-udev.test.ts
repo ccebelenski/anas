@@ -186,6 +186,8 @@ describe('the AHR cache-event hook script (ahrcache.1 slice 2)', () => {
     assert.match(hook, /x-anas-user: system:udev-cache-event/)
     assert.match(hook, /x-anas-user-uid: 0/)
     assert.match(hook, /x-anas-request-id/)
+    // cr.28: the job queue refuses a request that names no privileges.
+    assert.match(hook, /x-anas-privileges: Sys\.Audit,Sys\.Modify/)
     assert.match(hook, /\/v1\/ahr\/\$\{POOL\}\/cache\/event/)
   })
 

@@ -62,6 +62,8 @@ check "logger has CacheDeviceRemoved" grep -q 'EVENT=CacheDeviceRemoved POOL=tan
 check "logger has Delivered" grep -q 'EVENT=CacheEventDelivered POOL=tank SLICE=tank-cache1' "${TMP}/logger.log"
 check "curl called with correct URL" grep -q 'http://localhost/v1/ahr/tank/cache/event' "${TMP}/curl.log"
 check "curl data contains slice" grep -q '"slice":"tank-cache1"' "${TMP}/curl.log"
+# cr.28: the job queue refuses a request that names no privileges.
+check "curl names both privileges" grep -q 'x-anas-privileges: Sys.Audit,Sys.Modify' "${TMP}/curl.log"
 
 echo "== 2. path traversal label x/../y-cache1 is ignored =="
 run_hook 'x/../y-cache1'

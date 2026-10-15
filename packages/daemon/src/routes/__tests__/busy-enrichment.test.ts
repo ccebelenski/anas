@@ -30,6 +30,7 @@ const GIB = 1024 ** 3
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
+  'x-anas-privileges': 'Sys.Audit,Sys.Modify',
   'x-anas-request-id': randomUUID(),
 }
 

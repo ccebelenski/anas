@@ -27,6 +27,8 @@
 # X-Anas-* identity headers are trusted because of that. The user string names
 # the RUNG rather than a person, so the job's audit record says where it came
 # from — the same shape the systemd task runners use (`root@pam`, uid 0).
+# Since cr.28 the job queue refuses a request that names no privileges, so
+# the script names both, as the runners do (it is root on a root-only socket).
 #
 # Exit status: 0 whatever happens (a udev RUN that fails is noise in the event
 # loop and changes nothing), 64 (EX_USAGE) only when called with no label.
@@ -118,6 +120,7 @@ if curl --silent --show-error --max-time 10 \
   --header 'x-anas-user: system:udev-cache-event' \
   --header 'x-anas-user-uid: 0' \
   --header "x-anas-request-id: ${REQ_ID}" \
+  --header 'x-anas-privileges: Sys.Audit,Sys.Modify' \
   --data "$BODY" \
   "http://localhost/v1/ahr/${POOL}/cache/event" >/dev/null 2>&1; then
   logger -t "$TAG" -p daemon.info "EVENT=CacheEventDelivered POOL=${POOL} SLICE=${LABEL}"

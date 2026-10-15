@@ -70,6 +70,7 @@ const SNAPSHOT_LIST_JSON = JSON.stringify([
 const IDENTITY = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
+  'x-anas-privileges': 'Sys.Audit,Sys.Modify',
   'x-anas-request-id': '11111111-2222-4333-8444-555555555555',
 }
 

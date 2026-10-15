@@ -14,6 +14,7 @@ const ALL_DISKS = ['ata-DISK1', 'ata-DISK2', 'd1', 'd2', 'd3', 'd4', 'l1', 'l2',
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
+  'x-anas-privileges': 'Sys.Audit,Sys.Modify',
   'x-anas-request-id': randomUUID(),
 }
 

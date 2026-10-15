@@ -47,6 +47,7 @@ const UUID_R2 = '11111111:22222222:33333333:44444444'
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
+  'x-anas-privileges': 'Sys.Audit,Sys.Modify',
   'x-anas-request-id': randomUUID(),
 }
 const JSON_HEADERS = { ...IDENTITY_HEADERS, 'content-type': 'application/json' }

@@ -94,12 +94,65 @@ export const ApiError = z.object({
 })
 export type ApiError = z.infer<typeof ApiError>
 
+// --- Authorization (cr.27, cr.28; docs/WAVE2-DESIGN.md A1, A3.1) ---
+
+/**
+ * The two privileges ANAS asks PVE about, on `/`: `Sys.Audit` to read,
+ * `Sys.Modify` to change — what PVE asks for its own ZFS, LVM and directory
+ * disk verbs. The gateway applies the method rule with them (cr.27); the
+ * daemon's job queue applies them again at submit (cr.28, the backstop).
+ */
+export const PRIVILEGES = ['Sys.Audit', 'Sys.Modify'] as const
+export const Privilege = z.enum(PRIVILEGES)
+export type Privilege = z.infer<typeof Privilege>
+
+/**
+ * The `x-anas-privileges` header: what PVE granted the requester on `/`,
+ * comma-separated exactly as the gateway joins them (`Sys.Audit,Sys.Modify`,
+ * `Sys.Audit`, or the empty string for none). Strict on purpose — an unknown
+ * name, a repeated one, or whitespace (two headers that Node joined with
+ * `, `) is not a list this rule can read, so it fails validation and the
+ * request is refused rather than guessed at (fail closed).
+ */
+export const PrivilegeList = z.string().transform((value, ctx): Privilege[] => {
+  if (value === '')
+    return []
+  const out: Privilege[] = []
+  for (const name of value.split(',')) {
+    const parsed = Privilege.safeParse(name)
+    if (!parsed.success || out.includes(parsed.data)) {
+      ctx.addIssue({ code: 'custom', message: `'${value}' is not a privilege list (expected names from ${PRIVILEGES.join(', ')}, comma-separated, none repeated)` })
+      return z.NEVER
+    }
+    out.push(parsed.data)
+  }
+  return out
+})
+
+/**
+ * The 403 sentence, gateway and daemon alike (WAVE2-DESIGN §5 row 11): PVE's
+ * own "Permission check failed (<path>, <priv>)" form.
+ */
+export function forbiddenMessage(user: string, privilege: Privilege): string {
+  return `Permission check failed (/, ${privilege}): ${user} does not have it. `
+    + 'ANAS asks the privilege PVE asks for its own disk and ZFS operations.'
+}
+
 // --- Request identity headers (anas → anasd) ---
 
+/**
+ * Who is asking, and (cr.28) what PVE grants them on `/`. The gateway sends
+ * all four with every forwarded request; a root socket client that submits
+ * work (the systemd task runners, the udev cache-event script) sends them
+ * too, naming both privileges. `x-anas-privileges` is REQUIRED: a request
+ * without it, or with one that is not a {@link PrivilegeList}, is refused
+ * (fail closed) — there is no "absent means trusted".
+ */
 export const RequestHeaders = z.object({
   'x-anas-user': z.string(),
   'x-anas-user-uid': z.coerce.number().int(),
   'x-anas-request-id': z.string().uuid(),
+  'x-anas-privileges': PrivilegeList,
 })
 export type RequestHeaders = z.infer<typeof RequestHeaders>
 

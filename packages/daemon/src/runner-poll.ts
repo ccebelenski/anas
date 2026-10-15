@@ -51,13 +51,19 @@ export type Requester = (req: {
   body?: unknown
 }) => Promise<RunnerResponse>
 
-/** System identity headers the daemon's requireIdentity expects for a mutation. */
+/**
+ * System identity headers the daemon's requireIdentity expects for a mutation.
+ * The runner is root on the root-only socket (systemd runs it as root), so it
+ * names both privileges itself (cr.28: the job queue refuses a request that
+ * carries none — there is no "absent means trusted").
+ */
 export function identityHeaders(): Record<string, string> {
   return {
     'content-type': 'application/json',
     'x-anas-user': 'root@pam',
     'x-anas-user-uid': '0',
     'x-anas-request-id': randomUUID(),
+    'x-anas-privileges': 'Sys.Audit,Sys.Modify',
   }
 }
 

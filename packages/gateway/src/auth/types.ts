@@ -1,10 +1,13 @@
+import type { Privilege } from '@anas/shared'
+
 /**
  * The two privileges ANAS asks PVE about, on `/` (EPICS §2 "Authorization
  * follows PVE"; docs/WAVE2-DESIGN.md A1): `Sys.Audit` to read, `Sys.Modify`
- * to change — what PVE asks for its own ZFS, LVM and directory disk verbs.
+ * to change. Defined once in @anas/shared since cr.28, where the daemon's
+ * job-queue backstop reads the same names from `x-anas-privileges`.
  */
-export const PRIVILEGES = ['Sys.Audit', 'Sys.Modify'] as const
-export type Privilege = typeof PRIVILEGES[number]
+export { PRIVILEGES } from '@anas/shared'
+export type { Privilege }
 
 /** Authenticated user identity, and what PVE grants it on `/`. */
 export interface AuthUser {

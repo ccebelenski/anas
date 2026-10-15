@@ -164,8 +164,11 @@ X-Anas-Request-ID: 550e8400-e29b-41d4-a716-446655440000
 
 Since cr.27 `X-Anas-User` is the full PVE user id with its realm, and `X-Anas-User-UID` is the Linux uid only
 for a `@pam` user (-1 for any other realm: `alice@pve` is not the local `alice`). `X-Anas-Privileges` is what
-PVE granted on `/`, as pveproxy signed it; the job-queue backstop (cr.28) reads it, and a socket client that
-sends none (the timer runner, the udev script) is root.
+PVE granted on `/`, as pveproxy signed it; the job-queue backstop (cr.28) refuses a submit it does not cover
+(`Sys.Modify`; `Sys.Audit` for a `read.*` job and for cancelling one). It is required: a request without it, or
+with an unreadable one, is refused, so the root socket clients that submit work (the systemd task runners, the
+udev cache-event script) send `Sys.Audit,Sys.Modify` themselves. Only work no request started (the boot work,
+a job's own body) is not checked.
 
 anasd trusts these headers because the Unix socket restricts access to local processes. This gives us:
 

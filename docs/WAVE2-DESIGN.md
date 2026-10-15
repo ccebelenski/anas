@@ -236,6 +236,9 @@ gateway sends `x-anas-privileges` (the signed set) with every forwarded request;
 as optional; `submit` refuses (403 `FORBIDDEN`, logged) when the header is present and lacks `Sys.Modify`.
 An absent header means a root socket client (runner, udev script — F13), which Principle 9 already trusts.
 This catches a GET that submits a job, and any gateway policy bug, without a second copy of the method rule.
+*(As built, cr.28: the header is REQUIRED — absent or unreadable is refused, fail closed — and the runner and
+the udev script send `Sys.Audit,Sys.Modify`; the queue reads the request's privileges from an async-local
+store the daemon's hooks fill, not from the submitter; a `read.*` job and its cancel need `Sys.Audit`.)*
 
 ### A4. Dev provider and the test suites
 

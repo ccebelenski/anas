@@ -39,6 +39,7 @@ const LOOPBACK_SERIAL = '689844a4-1d20-4cba-8516-bdc52a402645'
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
+  'x-anas-privileges': 'Sys.Audit,Sys.Modify',
   'x-anas-request-id': randomUUID(),
 }
 const JSON_HEADERS = { ...IDENTITY_HEADERS, 'content-type': 'application/json' }

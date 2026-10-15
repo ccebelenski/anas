@@ -4,6 +4,7 @@ import type { AbandonedRegistry } from '../executor/deadline.js'
 import type { LockClaim, LockMode } from './locks.js'
 import { randomUUID } from 'node:crypto'
 import { abandonedChildren, runInLane } from '../executor/deadline.js'
+import { runAsDaemon, submitRefusal } from './authority.js'
 import { conflicts, LockTable, normaliseClaims } from './locks.js'
 
 export type { LockClaim, LockMode } from './locks.js'
@@ -271,6 +272,11 @@ export class JobQueue {
    * job and a watch job take no locks — the one must never wait behind the job
    * it is meant to stop, the other only watches and must never hold a key the
    * run it watches needs.
+   *
+   * THE BACKSTOP (cr.28, jobs/authority.ts): a submit made for an HTTP request
+   * whose privileges do not cover the operation throws a
+   * `JobForbiddenError` — logged here, answered 403 FORBIDDEN by the
+   * server's error handler — and nothing is recorded or started.
    */
   submit(
     operation: string,
@@ -278,6 +284,7 @@ export class JobQueue {
     handler: JobHandler,
     opts: SubmitOptions = {},
   ): JobRef {
+    this.authorize(operation, submitter)
     if (opts.control && (opts.locks?.length ?? 0) > 0)
       throw new TypeError(`job '${operation}': a control job takes no locks`)
     if (opts.lane === 'watch' && (opts.locks?.length ?? 0) > 0)
@@ -331,6 +338,24 @@ export class JobQueue {
       createdAt: job.createdAt,
       createdBy: job.createdBy,
     }
+  }
+
+  /**
+   * Throw (and log) the `JobForbiddenError` for a request whose
+   * privileges do not cover `operation` (cr.28); return when they do, or when
+   * no request is asking (the daemon's own work). `submit` calls it first; a
+   * route may call it earlier — the cancel route does, so a requester that
+   * may not cancel is refused before a confirm code is minted.
+   */
+  authorize(operation: string, submitter: JobSubmitter): void {
+    const refusal = submitRefusal(operation, submitter)
+    if (refusal === null)
+      return
+    this.audit?.refused(
+      { user: refusal.user, uid: submitter.uid, operation, params: submitter.params, requestId: submitter.requestId },
+      { privilege: refusal.privilege, reason: refusal.reason },
+    )
+    throw refusal
   }
 
   /** Get a job by ID, or undefined if not found. */
@@ -756,7 +781,10 @@ export class JobQueue {
       // cr.34: the job lane (300 s per command by default). `execute` is
       // reached synchronously from `submit`, so without this the body would
       // inherit the submitting request's 10 s lane.
-      outcome = { ok: true, result: await runInLane({ lane: 'job', jobId: job.id }, () => handler(updateProgress, ctx)) }
+      // cr.28: the body is the daemon's own work — it was authorised at its
+      // submit, and a body `drain` starts would otherwise run under whichever
+      // request triggered the drain (jobs/authority.ts).
+      outcome = { ok: true, result: await runInLane({ lane: 'job', jobId: job.id }, () => runAsDaemon(() => handler(updateProgress, ctx))) }
     }
     catch (err) {
       outcome = { ok: false, err }

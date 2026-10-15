@@ -52,6 +52,7 @@ const SYSTEMCTL = '/usr/bin/systemctl'
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
+  'x-anas-privileges': 'Sys.Audit,Sys.Modify',
   'x-anas-request-id': randomUUID(),
 }
 const JSON_HEADERS = { ...IDENTITY_HEADERS, 'content-type': 'application/json' }

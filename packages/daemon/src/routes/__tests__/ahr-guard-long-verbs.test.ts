@@ -101,7 +101,7 @@ const R1_RECREATED = rewrite(R1_EXPORT, `MD_UUID=${R1_UUID}`, 'MD_UUID=0badc0de:
 const VG_UUID = 'Wq3hGd-0N1a-7c2Q-Yk5e-PZ3x-l8Rr-T6vB9m'
 const VGS_WITH_UUID = rewrite(mockFixtures.ahrVgs().stdout, '"vg_free":"0 "}', `"vg_free":"0 ", "vg_uuid":"${VG_UUID}"}`)
 
-const IDENTITY = { 'x-anas-user': 'root@pam', 'x-anas-user-uid': '0', 'x-anas-request-id': randomUUID() }
+const IDENTITY = { 'x-anas-user': 'root@pam', 'x-anas-user-uid': '0', 'x-anas-request-id': randomUUID(), 'x-anas-privileges': 'Sys.Audit,Sys.Modify' }
 const JSON_HEADERS = { ...IDENTITY, 'content-type': 'application/json' }
 
 /** The proof both band verbs stand on: a completed scrub, clean checksums, mismatches on r1 (raid5) and r2 (raid1). */

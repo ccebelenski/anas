@@ -12,11 +12,12 @@ export function requiredPrivilege(method: string): Privilege {
   return m === 'GET' || m === 'HEAD' ? 'Sys.Audit' : 'Sys.Modify'
 }
 
-/** The 403 sentence (§5 row 11): PVE's own "Permission check failed (<path>, <priv>)" form. */
-export function forbiddenMessage(user: string, privilege: Privilege): string {
-  return `Permission check failed (/, ${privilege}): ${user} does not have it. `
-    + 'ANAS asks the privilege PVE asks for its own disk and ZFS operations.'
-}
+/**
+ * The 403 sentence (§5 row 11): PVE's own "Permission check failed (<path>,
+ * <priv>)" form — in @anas/shared since cr.28, so the daemon's job-queue
+ * backstop answers with the same words.
+ */
+export { forbiddenMessage } from '@anas/shared'
 
 /** The privilege `user` lacks for `method`, or undefined when it may proceed. */
 export function missingPrivilege(user: AuthUser, method: string): Privilege | undefined {

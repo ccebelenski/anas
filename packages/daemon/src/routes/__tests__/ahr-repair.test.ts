@@ -43,6 +43,7 @@ const FILE = `${MOUNTPOINT}/movies/a very long name.mkv`
 const IDENTITY = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
+  'x-anas-privileges': 'Sys.Audit,Sys.Modify',
   'x-anas-request-id': randomUUID(),
 }
 const JSON_HEADERS = { ...IDENTITY, 'content-type': 'application/json' }

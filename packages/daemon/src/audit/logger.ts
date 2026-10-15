@@ -14,6 +14,13 @@ export interface AuditResult {
   error?: string
 }
 
+/** Why a submit was refused (cr.28): the privilege it needed, and what the request lacked. */
+export interface AuditRefusal {
+  privilege: string
+  /** e.g. "holds Sys.Audit on /", "the request carries no x-anas-privileges header". */
+  reason: string
+}
+
 /** What a cancelled job's audit line carries (rclone.5). */
 export interface AuditCancel {
   durationMs: number
@@ -51,6 +58,27 @@ export class AuditLogger {
         requestId: entry.requestId,
       },
       `audit: ${entry.user} submitted ${entry.operation}`,
+    )
+  }
+
+  /**
+   * Log a submit the job queue refused (cr.28 backstop): nothing was recorded
+   * or run, and the requester got a 403. Warn level — a refusal here means
+   * the gateway's rule did not stop it first.
+   */
+  refused(entry: AuditEntry, refusal: AuditRefusal): void {
+    this.log.warn(
+      {
+        event: 'job.refused',
+        user: entry.user,
+        uid: entry.uid,
+        operation: entry.operation,
+        params: entry.params,
+        requestId: entry.requestId,
+        privilege: refusal.privilege,
+        reason: refusal.reason,
+      },
+      `audit: ${entry.user} refused ${entry.operation}: lacks ${refusal.privilege} on / (${refusal.reason})`,
     )
   }
 

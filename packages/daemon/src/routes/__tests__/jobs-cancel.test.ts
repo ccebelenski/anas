@@ -23,6 +23,7 @@ function headers(user = 'alice@pve'): Record<string, string> {
   return {
     'x-anas-user': user,
     'x-anas-user-uid': '0',
+    'x-anas-privileges': 'Sys.Audit,Sys.Modify',
     'x-anas-request-id': randomUUID(),
   }
 }

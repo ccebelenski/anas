@@ -285,6 +285,28 @@ describe('the gateway with the pve provider (end to end)', () => {
     await s.close()
   })
 
+  it('cr.28: a client cannot hand the daemon its own identity or privileges — the gateway sends only what pveproxy signed', async () => {
+    // The daemon's job-queue backstop reads x-anas-privileges; a browser (or a
+    // local caller with a valid assertion) that adds the header itself, or a
+    // different x-anas-user, must not reach the daemon with it.
+    const s = gateway()
+    const res = await s.inject({
+      method: 'GET',
+      url: POOLS,
+      headers: {
+        'x-anas-auth': sign('anas-audit@pve', ['Sys.Audit'], 'GET', POOLS),
+        [PRIVILEGES_HEADER]: 'Sys.Audit,Sys.Modify',
+        'x-anas-user': 'root@pam',
+        'x-anas-user-uid': '0',
+      },
+    })
+    assert.equal(res.statusCode, 200)
+    assert.equal(received[0]!.headers[PRIVILEGES_HEADER], 'Sys.Audit')
+    assert.equal(received[0]!.headers['x-anas-user'], 'anas-audit@pve')
+    assert.equal(received[0]!.headers['x-anas-user-uid'], '-1')
+    await s.close()
+  })
+
   it('row 11: a reader\'s POST, PUT, DELETE and PATCH → 403 FORBIDDEN naming Sys.Modify, logged, nothing reaches the daemon', async () => {
     const s = gateway()
     for (const method of ['POST', 'PUT', 'DELETE', 'PATCH'] as const) {

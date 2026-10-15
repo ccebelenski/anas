@@ -2,6 +2,7 @@ import type { Job } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CancelMeta, JobQueue } from '../jobs/queue.js'
 import { JobStatus } from '@anas/shared'
+import { CANCEL_OPERATION } from '../jobs/authority.js'
 import { cancelRefusalMessage } from '../jobs/queue.js'
 import { isReadOnlyOperation } from '../jobs/read-jobs.js'
 import { ConfirmStore } from '../safety/confirm.js'
@@ -119,6 +120,11 @@ export async function jobRoutes(
    * stopping a read loses nothing, the operator pressed Cancel in the very
    * dialog that is waiting on it, and a confirm there would be ceremony. The
    * refusals above (not running, not cancellable) still apply to it.
+   *
+   * cr.28: cancelling a read job needs Sys.Audit, any other cancel Sys.Modify
+   * (jobs/authority.ts `requiredPrivilege`). The queue checks it at submit;
+   * the route asks the same question BEFORE the confirm gate, so a requester
+   * that may not cancel gets the 403 and no confirm code is minted for it.
    */
   server.post<{
     Params: { id: string }
@@ -143,6 +149,9 @@ export async function jobRoutes(
       }
     }
 
+    const submitter = { ...identity, params: { id, operation: target.job.operation } }
+    jobQueue.authorize(CANCEL_OPERATION, submitter)
+
     const headline = cancelHeadline(target.job, target.meta)
     const warnings = [headline, ...(target.meta.consequence ? [target.meta.consequence] : [])]
     if (!isReadOnlyOperation(target.job.operation) && !confirmGate(confirmStore, request, reply, {
@@ -155,8 +164,8 @@ export async function jobRoutes(
     }
 
     const job = jobQueue.submit(
-      'job.cancel',
-      { ...identity, params: { id, operation: target.job.operation } },
+      CANCEL_OPERATION,
+      submitter,
       async () => {
         const by = await jobQueue.cancel(id, identity.user)
         return { cancelled: id, operation: target.job.operation, cancelledBy: by.user, cancelledAt: by.at }

@@ -154,6 +154,10 @@ export {
   ConfirmHeader,
   dataResponse,
   ErrorCode,
+  forbiddenMessage,
+  Privilege,
+  PrivilegeList,
+  PRIVILEGES,
   RequestHeaders,
 } from './schemas/api.js'
 // Backup schemas (Epic 16 — PBS file backup)

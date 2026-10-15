@@ -21,6 +21,7 @@ import { createServer } from '../server.js'
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
+  'x-anas-privileges': 'Sys.Audit,Sys.Modify',
   'x-anas-request-id': randomUUID(),
 }
 
@@ -196,6 +197,7 @@ describe('cr.26 content-type: shipped client shapes pinned', () => {
         'content-type': 'application/json',
         'x-anas-user': 'system:udev-cache-event',
         'x-anas-user-uid': '0',
+        'x-anas-privileges': 'Sys.Audit,Sys.Modify',
         'x-anas-request-id': randomUUID(),
       },
       payload: '{"event":"device-removed","slice":"tank-cache1","kernel":"sdd1"}',

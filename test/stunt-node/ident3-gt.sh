@@ -77,7 +77,8 @@ check() { # check <description> <command...>
 api() {
   local method=$1 path=$2 body=${3:-} code=${4:-}
   local args=(-s --unix-socket "$SOCK" -X "$method" -D "$R/headers" -o "$R/body" -w '%{http_code}'
-    -H 'x-anas-user: root@pam' -H 'x-anas-user-uid: 0' -H "x-anas-request-id: $(cat /proc/sys/kernel/random/uuid)")
+    -H 'x-anas-user: root@pam' -H 'x-anas-user-uid: 0' -H "x-anas-request-id: $(cat /proc/sys/kernel/random/uuid)"
+    -H 'x-anas-privileges: Sys.Audit,Sys.Modify')
   [ -n "$body" ] && args+=(-H 'content-type: application/json' --data "$body")
   [ -n "$code" ] && args+=(-H "x-anas-confirm: $code")
   curl "${args[@]}" "http://localhost/v1$path"

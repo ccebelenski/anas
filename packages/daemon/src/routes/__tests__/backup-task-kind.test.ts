@@ -38,6 +38,7 @@ const SERIAL = '9bc6e907-6015-4267-be4f-5a0617cb3d71'
 const IDENTITY = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
+  'x-anas-privileges': 'Sys.Audit,Sys.Modify',
   'x-anas-request-id': randomUUID(),
 }
 const JSON_HEADERS = { ...IDENTITY, 'content-type': 'application/json' }
