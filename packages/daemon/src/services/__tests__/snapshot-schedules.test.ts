@@ -210,50 +210,50 @@ describe('takeSnapshot — uniform, dispatches by target.kind', () => {
 
   it('cr.20 collision: "dataset already exists" retries once with the -2 suffix', async () => {
     const executor = mockExec()
-    executor.addFixture({ command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}`], result: TAKEN(`anas-daily-${STAMP}`) })
-    executor.addFixture({ command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}-2`], result: OK })
+    executor.addFixture({ command: ZFS, args: ['snapshot', '--', `tank/media@anas-daily-${STAMP}`], result: TAKEN(`anas-daily-${STAMP}`) })
+    executor.addFixture({ command: ZFS, args: ['snapshot', '--', `tank/media@anas-daily-${STAMP}-2`], result: OK })
     const res = await takeSnapshot(executor, ZFS_TARGET, 'daily', { now: NOW })
     assert.deepEqual(res, { target: ZFS_TARGET, name: `anas-daily-${STAMP}-2`, bucket: 'daily' })
     assert.deepEqual(executor.calls, [
-      { command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}`] },
-      { command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}-2`] },
+      { command: ZFS, args: ['snapshot', '--', `tank/media@anas-daily-${STAMP}`] },
+      { command: ZFS, args: ['snapshot', '--', `tank/media@anas-daily-${STAMP}-2`] },
     ])
   })
 
   it('cr.20 collision: the retry stamps the same anas:schedule id (ownership survives)', async () => {
     const executor = mockExec()
-    executor.addFixture({ command: ZFS, args: ['snapshot', '-o', 'anas:schedule=daily-media', `tank/media@anas-daily-${STAMP}`], result: TAKEN(`anas-daily-${STAMP}`) })
-    executor.addFixture({ command: ZFS, args: ['snapshot', '-o', 'anas:schedule=daily-media', `tank/media@anas-daily-${STAMP}-2`], result: OK })
+    executor.addFixture({ command: ZFS, args: ['snapshot', '-o', 'anas:schedule=daily-media', '--', `tank/media@anas-daily-${STAMP}`], result: TAKEN(`anas-daily-${STAMP}`) })
+    executor.addFixture({ command: ZFS, args: ['snapshot', '-o', 'anas:schedule=daily-media', '--', `tank/media@anas-daily-${STAMP}-2`], result: OK })
     await takeSnapshot(executor, ZFS_TARGET, 'daily', { now: NOW, scheduleId: 'daily-media' })
-    assert.deepEqual(executor.calls[1], { command: ZFS, args: ['snapshot', '-o', 'anas:schedule=daily-media', `tank/media@anas-daily-${STAMP}-2`] })
+    assert.deepEqual(executor.calls[1], { command: ZFS, args: ['snapshot', '-o', 'anas:schedule=daily-media', '--', `tank/media@anas-daily-${STAMP}-2`] })
   })
 
   it('cr.20 collision: the exclude expansion retries its ONE atomic call under the suffix', async () => {
     const executor = mockExec()
     executor.addFixture({
       command: ZFS,
-      args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', 'tank/media'],
+      args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', '--', 'tank/media'],
       result: { ...OK, stdout: ['tank/media', 'tank/media/movies'].join('\n') },
     })
-    executor.addFixture({ command: ZFS, args: ['snapshot', '-o', 'anas:schedule=h', `tank/media@anas-hourly-${STAMP}`, `tank/media/movies@anas-hourly-${STAMP}`], result: TAKEN(`tank/media/movies@anas-hourly-${STAMP}`) })
-    executor.addFixture({ command: ZFS, args: ['snapshot', '-o', 'anas:schedule=h', `tank/media@anas-hourly-${STAMP}-2`, `tank/media/movies@anas-hourly-${STAMP}-2`], result: OK })
+    executor.addFixture({ command: ZFS, args: ['snapshot', '-o', 'anas:schedule=h', '--', `tank/media@anas-hourly-${STAMP}`, `tank/media/movies@anas-hourly-${STAMP}`], result: TAKEN(`tank/media/movies@anas-hourly-${STAMP}`) })
+    executor.addFixture({ command: ZFS, args: ['snapshot', '-o', 'anas:schedule=h', '--', `tank/media@anas-hourly-${STAMP}-2`, `tank/media/movies@anas-hourly-${STAMP}-2`], result: OK })
     const res = await takeSnapshot(executor, ZFS_TARGET, 'hourly', { now: NOW, recursive: true, exclude: ['tank/media/scratch'], scheduleId: 'h' })
     assert.equal(res.name, `anas-hourly-${STAMP}-2`)
     // list, snapshot (collision), list again, then the retry's ONE atomic call.
-    assert.deepEqual(executor.calls[3], { command: ZFS, args: ['snapshot', '-o', 'anas:schedule=h', `tank/media@anas-hourly-${STAMP}-2`, `tank/media/movies@anas-hourly-${STAMP}-2`] })
+    assert.deepEqual(executor.calls[3], { command: ZFS, args: ['snapshot', '-o', 'anas:schedule=h', '--', `tank/media@anas-hourly-${STAMP}-2`, `tank/media/movies@anas-hourly-${STAMP}-2`] })
   })
 
   it('cr.20 collision: a second collision (three same-second fires) fails the run', async () => {
     const executor = mockExec()
-    executor.addFixture({ command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}`], result: TAKEN(`anas-daily-${STAMP}`) })
-    executor.addFixture({ command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}-2`], result: TAKEN(`anas-daily-${STAMP}-2`) })
+    executor.addFixture({ command: ZFS, args: ['snapshot', '--', `tank/media@anas-daily-${STAMP}`], result: TAKEN(`anas-daily-${STAMP}`) })
+    executor.addFixture({ command: ZFS, args: ['snapshot', '--', `tank/media@anas-daily-${STAMP}-2`], result: TAKEN(`anas-daily-${STAMP}-2`) })
     await assert.rejects(() => takeSnapshot(executor, ZFS_TARGET, 'daily', { now: NOW }), /already exists/)
     assert.equal(executor.calls.length, 2) // retry ONCE — no suffix ladder
   })
 
   it('cr.20: any other take failure is NOT a collision — no retry', async () => {
     const executor = mockExec()
-    executor.addFixture({ command: ZFS, args: ['snapshot', `tank/media@anas-daily-${STAMP}`], result: { stdout: '', stderr: 'cannot create \'tank/media@x\': no space left on device', exitCode: 1 } })
+    executor.addFixture({ command: ZFS, args: ['snapshot', '--', `tank/media@anas-daily-${STAMP}`], result: { stdout: '', stderr: 'cannot create \'tank/media@x\': no space left on device', exitCode: 1 } })
     await assert.rejects(() => takeSnapshot(executor, ZFS_TARGET, 'daily', { now: NOW }), /no space left/)
     assert.equal(executor.calls.length, 1)
   })
