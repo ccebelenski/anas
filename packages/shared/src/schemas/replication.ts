@@ -145,7 +145,7 @@ export const ReplicationTask = z.object({
   source: z.object({ pool: PoolName, dataset: ReplicationDataset }),
   target: ReplicationTarget,
   /** systemd OnCalendar expression (e.g. 'daily', '02:00', 'Mon *-*-* 03:00'). */
-  schedule: z.string().min(1),
+  schedule: SingleLine.min(1),
   /** Snapshot the source before each run (recommended; default true). */
   snapshotFirst: z.boolean().default(true),
   enabled: z.boolean().default(true),

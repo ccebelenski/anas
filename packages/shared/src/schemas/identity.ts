@@ -168,8 +168,8 @@ export type CreateGroupRequest = z.infer<typeof CreateGroupRequest>
 
 /** Add/remove group members (PUT /v1/identity/groups/:name/members). */
 export const UpdateGroupMembersRequest = z.object({
-  add: z.array(z.string()).optional(),
-  remove: z.array(z.string()).optional(),
+  add: z.array(IdentityName).optional(),
+  remove: z.array(IdentityName).optional(),
 })
   .refine(
     b => (b.add?.length ?? 0) + (b.remove?.length ?? 0) > 0,

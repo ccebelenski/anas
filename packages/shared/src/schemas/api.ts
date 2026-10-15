@@ -22,6 +22,35 @@ export const ErrorCode = z.enum([
   'SYSTEM_ACCOUNT',
   // Gateway-only: a peer node's gateway could not be reached (story 13.8).
   'NODE_UNREACHABLE',
+  // cr.17: the codes the daemons and gateway have always emitted but the enum
+  // never carried. None of these are renames — the UI keys on several
+  // (10-api.js: CONFLICT / IN_USE / IDENTITY_MISMATCH; 65-replication.js and
+  // 69-snapshots.js: CONFLICT / UNAVAILABLE), and the enum's job is to be the
+  // complete list, not to relabel what ships.
+  /** 409 — the resource's state refuses the operation (daemon-wide). */
+  'CONFLICT',
+  /** 503 — a required tool or store is not present on the node (daemon). */
+  'UNAVAILABLE',
+  /** 409 — something else still references the resource (daemon). */
+  'IN_USE',
+  /** 409 — the resource belongs to PVE (storage.cfg), not ANAS (daemon). */
+  'PVE_MANAGED',
+  /** 409 — a confirm-bounded target changed between confirm and act (daemon). */
+  'IDENTITY_MISMATCH',
+  /** 409 — the job exists but is past the point a cancel can reach (daemon). */
+  'NOT_CANCELLABLE',
+  /** 502 — an upstream (PBS, a peer) refused or failed the read (daemon). */
+  'UPSTREAM_ERROR',
+  /** Gateway: the forwarded-to node's ANAS is not installed. */
+  'ANAS_NOT_INSTALLED',
+  /** Gateway: the PVE cluster CA needed for peer TLS is unavailable. */
+  'CLUSTER_CA_UNAVAILABLE',
+  /** Gateway: the target node name resolved to nothing. */
+  'NODE_UNRESOLVED',
+  /** Gateway: a peer node's gateway did not answer in time. */
+  'GATEWAY_TIMEOUT',
+  /** Gateway: a forward came back to us (cycle guard). */
+  'FORWARD_LOOP',
 ])
 export type ErrorCode = z.infer<typeof ErrorCode>
 

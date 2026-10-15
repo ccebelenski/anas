@@ -68,6 +68,14 @@ describe('CloudSyncTask (rclone.2)', () => {
     for (const path of ['pve1/pictures\n', 'x\u0000b', 'a\u001Fb', ' padded', 'padded ', '\tpve1'])
       assert.equal(CloudSyncTask.safeParse({ ...MINIMAL, path }).success, false, JSON.stringify(path))
   })
+
+  it('the schedule is SingleLine: one line, no control characters (cr.17, backup parity from cr.9)', () => {
+    assert.ok(CloudSyncTask.safeParse({ ...MINIMAL, schedule: 'Tue *-*-* 02:00:00' }).success)
+    // Anything past `schedule` would ride the unit JSON and reach OnCalendar —
+    // a newline is a second unit-file line waiting to happen.
+    for (const schedule of ['daily\nExecStart=/bin/sh', '02:00\n04:00', 'a\u0000b', '\tdaily', ''])
+      assert.equal(CloudSyncTask.safeParse({ ...MINIMAL, schedule }).success, false, JSON.stringify(schedule))
+  })
 })
 
 describe('CloudSyncTaskRequest (rclone.2)', () => {

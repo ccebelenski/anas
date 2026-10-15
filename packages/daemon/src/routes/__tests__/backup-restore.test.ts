@@ -1145,7 +1145,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assert.deepEqual(seq.slice(restoreIdx + 1), [
         `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/luns delete lun1`,
         `${TARGETCLI} /backstores/block/newvol delete`,
-        `${ZFS} destroy tank/newvol`,
+        `${ZFS} destroy -- tank/newvol`,
       ], seq.join(' | '))
       assert.ok(!seq.some(a => a.includes('saveconfig')), 'a failed restore must not save the LIO configuration')
       assert.deepEqual(

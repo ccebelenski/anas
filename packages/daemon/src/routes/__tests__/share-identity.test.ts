@@ -424,6 +424,21 @@ describe('share-identity routes', () => {
       })
       assert.equal(res.statusCode, 400)
     })
+    it('rejects member names that are not identity names — 400, and no gpasswd runs (cr.17)', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = recordCalls(server)
+      for (const member of ['-x', 'a:b']) {
+        const res: Awaited<ReturnType<FastifyInstance['inject']>> = await server.inject({
+          method: 'PUT',
+          url: '/v1/identity/groups/smbusers/members',
+          headers: JSON_HEADERS,
+          payload: JSON.stringify({ add: [member] }),
+        })
+        assert.equal(res.statusCode, 400, member)
+        assert.equal((res.json() as { error: { code: string } }).error.code, 'VALIDATION_ERROR', member)
+      }
+      assert.equal(find(calls, '/usr/bin/gpasswd', () => true), undefined)
+    })
   })
 
   // --- A node without samba (issue #6) ------------------------------------

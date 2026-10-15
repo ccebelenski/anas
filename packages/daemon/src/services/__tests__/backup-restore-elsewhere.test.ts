@@ -470,7 +470,7 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
         // The undo, in the REVERSE of the order the objects were made:
         `${TARGETCLI} /iscsi/${IQN}/tpg1/luns delete lun1`,
         `${TARGETCLI} /backstores/block/newvol delete`,
-        `${ZFS} destroy tank/newvol`,
+        `${ZFS} destroy -- tank/newvol`,
       ])
 
       // The point of the undo: a half-created LUN is never persisted, and

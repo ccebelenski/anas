@@ -68,7 +68,7 @@ export const ZFS_LIST_PROPS
  * does not read.
  */
 export function zfsListArgs(pool: string): string[] {
-  return ['list', '-j', '-p', '-r', '-o', ZFS_LIST_PROPS, '-t', 'filesystem,volume', pool]
+  return ['list', '-j', '-p', '-r', '-o', ZFS_LIST_PROPS, '-t', 'filesystem,volume', '--', pool]
 }
 
 // NOTE: no `-r`. A dataset's snapshot list must be DIRECT-only — `-r` pulls in
@@ -78,7 +78,7 @@ export function zfsListArgs(pool: string): string[] {
 
 /** `zfs list` argument array for a dataset's own snapshots (name only). */
 export function zfsSnapshotListArgs(dataset: string): string[] {
-  return ['list', '-j', '-o', 'name', '-t', 'snapshot', dataset]
+  return ['list', '-j', '-o', 'name', '-t', 'snapshot', '--', dataset]
 }
 
 /**
@@ -86,7 +86,7 @@ export function zfsSnapshotListArgs(dataset: string): string[] {
  * Snapshot read model needs (creation/used/referenced).
  */
 export function zfsSnapshotDetailArgs(dataset: string): string[] {
-  return ['list', '-j', '-o', 'name,creation,used,referenced', '-t', 'snapshot', dataset]
+  return ['list', '-j', '-o', 'name,creation,used,referenced', '-t', 'snapshot', '--', dataset]
 }
 
 /**

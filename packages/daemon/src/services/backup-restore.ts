@@ -1080,7 +1080,7 @@ async function removeNewLun(
     try {
       if (backing.plugin === 'block') {
         const dataset = backing.dataset ?? zvolDataset(backing.path)
-        const r = await executor.exec(ZFS, ['destroy', dataset])
+        const r = await executor.exec(ZFS, ['destroy', '--', dataset])
         if (r.exitCode !== 0) {
           throw new Error(r.stderr.trim() || `zfs destroy ${dataset} exited with code ${r.exitCode}`)
         }

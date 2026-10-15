@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { isRcloneOptionValue, RCLONE_OPTION_VALUE_MSG, RcloneOptionKey } from '../formats/rclone-conf.js'
 import { BackupArchiveConsistency, BackupName, BackupRunRequest, BackupRunResult } from './backup.js'
-import { AbsolutePath, hasControlChars, ISODateTime, NotifyMode } from './common.js'
+import { AbsolutePath, hasControlChars, ISODateTime, NotifyMode, SingleLine } from './common.js'
 import { cadenceToOnCalendar, TaskCadence } from './task-cadence.js'
 
 /**
@@ -313,7 +313,7 @@ export const CloudSyncTask = z.object({
    */
   notify: NotifyMode.default('always'),
   /** systemd OnCalendar expression. GENERATED from `cadence` when one is present. */
-  schedule: z.string().min(1),
+  schedule: SingleLine.min(1),
   /** The structured schedule — the SAME cadence contract backup tasks carry. */
   cadence: TaskCadence.optional(),
   enabled: z.boolean().default(true),
