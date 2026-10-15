@@ -259,6 +259,29 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     assert.equal(mutations('zfs.destroy').length, 1)
   })
 
+  it('cr.47 (c): a snapshot destroy under a running send of the same dataset does NOT wait — shared beside shared (ZFS busy-protects the snapshot the send reads); a dataset destroy still waits (the tests above)', async () => {
+    await serve('zfs.replicate')
+    const res = await inject({ method: 'POST', url: '/v1/pools/testpool/datasets/media/replicate', payload: { target: { pool: 'testpool', dataset: 'replica/media' } } })
+    assert.equal(res.statusCode, 202, res.body)
+    const runId = (res.json() as JobAccepted).job.id
+    await until(() => queue().get(runId)?.status === 'running')
+    // Delete an UNRELATED old snapshot while the send is parked.
+    const snapped = await inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/media/snapshots/snap1' })
+    assert.equal(snapped.statusCode, 202, snapped.body)
+    const snapId = (snapped.json() as JobAccepted).job.id
+    // The snapshot destroy takes the dataset SHARED — the same mode the send
+    // holds — so it is granted without waiting (the rename above stays exclusive:
+    // the node proved `zfs rename -r` is stopped by neither a hold nor a send).
+    const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[] }> }).jobs.get(snapId)!
+    assert.equal(record.claims.find(c => c.key === `zfs:${TESTPOOL_GUID}/media`)?.mode, 'shared')
+    await until(() => queue().get(snapId)?.status === 'completed')
+    assert.equal(queue().get(snapId)?.status, 'completed', JSON.stringify(queue().get(snapId)?.error))
+    assert.equal(queue().get(runId)?.status, 'running', 'the send is still parked — the destroy did not wait behind it')
+    unpark()
+    assert.ok(['completed', 'failed'].includes((await finished(runId)).status))
+    assert.equal(mutations('zfs.destroy').length, 1, 'the snapshot destroy ran its zfs destroy argv')
+  })
+
   it('backup: the direct run holds its source\'s dataset and mount shared; a recursive destroy accepted meanwhile waits and re-gates — no zfs destroy', async () => {
     await writeBackupTask(QUIET, systemdDir, BackupTask.parse({
       name: 'media-nightly',

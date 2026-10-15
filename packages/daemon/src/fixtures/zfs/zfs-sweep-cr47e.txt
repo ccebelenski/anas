@@ -1,0 +1,10 @@
+# cr.47e (wave-2 node row 6): the snapshot set `zfs list -H -t snapshot -r -o name -- w2z/p`
+# would print — the rows containing an `@` of the r6 "before:" tree, verbatim from
+# docs/probes/wave2-node/out/r6-zfs-partial.log. One full name per line, `-H` shape.
+# Tests re-point `w2z/p` to their dataset (testpool/media).
+w2z/p@s
+w2z/p/a@s
+w2z/p/a/g@s
+w2z/p/c@s
+w2z/p/c/g@s
+w2z/p/z@s

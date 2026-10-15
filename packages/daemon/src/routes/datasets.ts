@@ -13,7 +13,7 @@ import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchem
 import { parseExports } from '../parsers/exports.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
 import { parseZfsJson } from '../parsers/utils.js'
-import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
+import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs, zfsSweepSnapshotListArgs } from '../parsers/zfs-list.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { guardCheck, guardConfirm, guarded, sendRefusal, zfsDatasetClaims } from '../safety/guard.js'
 import { readDatasetGuid, readPoolGuid, readRollbackIds } from '../safety/stable-id.js'
@@ -746,6 +746,58 @@ export async function datasetRoutes(
   }
 
   /**
+   * The recursive destroy's HOLD gate (story cr.47e, nf.3 D11's pattern on the
+   * bigger sweep). `zfs destroy -r <fs>` over a tree whose child's snapshot
+   * carries a user hold is a PARTIAL destroy — wave-2 node row 6: it took the
+   * siblings, the held child's other children and the parent's own snapshots,
+   * then failed on the held one (exit 1; only `w2z/p`, `w2z/p/c` and
+   * `w2z/p/c@s` were left), and `zfs destroy -rnv` cannot pre-check (it exits 0
+   * and lists the held snapshot as "would destroy"). The gate reads the holds
+   * on every snapshot the sweep would destroy — the dataset's own and each
+   * descendant's — ahead of time and refuses, naming each hold, so nothing
+   * unheld is ever destroyed first.
+   *
+   * The sweep set is enumerated with ONE `zfs list -H -t snapshot -r -o name`
+   * rather than per-dataset snapshot reads: a recursive list returns exactly
+   * what `destroy -r` destroys, fresh from ZFS (a snapshot made beside the pool
+   * listing is covered), in one call instead of one per descendant. Then ONE
+   * `zfs holds -H` on all of them (the same call D11 uses) reads the tags. Fail
+   * closed: a sweep that cannot be listed, or holds that cannot be read, refuse —
+   * destroying on a guess is exactly the partial this gate exists for.
+   *
+   * A NON-recursive destroy takes no gate: ZFS itself refuses a dataset that
+   * still has snapshots before touching anything (live-proof F15), so there is
+   * no unheld half-destroy to protect against.
+   */
+  const destroyHoldGate: Gate<DatasetObject> = async (o, reads) => {
+    const swept = await reads.once(`destroy-sweep:${o.name}`, async () => {
+      const r = await executor.exec(ZFS, zfsSweepSnapshotListArgs(o.name))
+      if (r.exitCode !== 0)
+        return null
+      return r.stdout.split('\n').map(line => line.trim()).filter(Boolean)
+    })
+    if (swept === null) {
+      return conflict(`Could not read the snapshots a recursive destroy of '${o.name}' would sweep — refusing: `
+        + 'a held one would stop the destroy only after the unheld ones were gone', 'snapshot-holds-unreadable')
+    }
+    if (swept.length === 0)
+      return null
+    const holds = await reads.once(`holds:${swept.join('\0')}`, () => readLocalHoldsChecked(executor, swept))
+    if (!holds) {
+      return conflict(`Could not read the holds on the snapshots a recursive destroy of '${o.name}' would destroy — `
+        + 'refusing: a held one would stop the destroy only after the unheld ones were gone', 'snapshot-holds-unreadable')
+    }
+    const held = swept.filter(name => (holds.get(name) ?? []).length > 0)
+    if (held.length === 0)
+      return null
+    const named: string[] = []
+    for (const name of held)
+      named.push(`${name} ${(await describeHolds(holds.get(name)!, opts.systemdDir)).join(', ')}`)
+    return conflict(`A recursive destroy of '${o.name}' is refused: it would destroy held snapshots, `
+      + `and ZFS stops at a held snapshot only after destroying the unheld ones — nothing was done. ${named.join('; ')}.`, 'snapshot-held')
+  }
+
+  /**
    * Fail-open is not fail-silent (D3): a broken claims read reads as "nothing
    * held", which a dataset genuinely serving a LUN would look exactly like —
    * `zfs destroy` succeeds silently under a live session (GT-40). The key, the
@@ -794,7 +846,7 @@ export async function datasetRoutes(
       gates: [
         listedGate(recursive, 'destroy'),
         ownedGate<DatasetObject>(o => o.name),
-        ...(recursive ? [ownedDescendantGate('Destroy')] : []),
+        ...(recursive ? [ownedDescendantGate('Destroy'), destroyHoldGate] : []),
         destroyLunGate(recursive),
       ],
       advisories: (_o, reads) => lioUnreadableDisclosure(reads),
@@ -1039,15 +1091,27 @@ export async function datasetRoutes(
   /**
    * The spec of a verb on ONE existing snapshot that needs nothing but the
    * dataset's ownership: rename and destroy (pvepool.1: an owned dataset's
-   * snapshots are PVE's to manage). Both change the dataset's snapshot list,
-   * so both are exclusive on the dataset (a send reading it waits).
+   * snapshots are PVE's to manage).
+   *
+   * The DESTROY takes its dataset key SHARED (cr.47 (c), node row 6): a
+   * recursive `zfs destroy -r <fs>@<snap>` is ATOMIC — a held or send-busy
+   * child destroys NOTHING (c1/c4) — and ZFS's own "dataset is busy" refusal
+   * protects even the one snapshot a send reads (c5, no `-r`). Deleting an
+   * unrelated old snapshot therefore no longer waits hours behind a mover; the
+   * schedule's own prune already takes the key shared.
+   *
+   * The RENAME stays EXCLUSIVE: the node proved `zfs rename -r` is stopped by
+   * NEITHER a hold NOR a running send (c2/c3) — a send completes and the
+   * receiver gets the OLD name (F2) — so there is no ZFS busy refusal to lean
+   * on, and a shared key would let a mover's incremental base be renamed under
+   * it. (docs/WAVE3-DESIGN.md §4.2)
    */
   function snapshotOwnedSpec(operation: 'zfs.rename' | 'zfs.destroy', fullName: string, snap: string): GuardSpec<SnapshotObject> {
     return {
       operation,
       object: snapshotView(fullName, snap),
       gates: [ownedGate<SnapshotObject>(o => o.dataset)],
-      locks: (o, _bound, reads) => datasetClaims(reads, [[o.dataset, 'exclusive']]),
+      locks: (o, _bound, reads) => datasetClaims(reads, [[o.dataset, operation === 'zfs.rename' ? 'exclusive' : 'shared']]),
     }
   }
 

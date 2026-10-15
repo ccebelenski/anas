@@ -1,0 +1,4 @@
+# cr.47e (wave-2 node row 6): `zfs holds -H w2z/p/c@s` on the stunt node (zfs-2.4.4-pve1) —
+# one row, tab-separated `<snapshot>\t<tag>\t<timestamp>`, verbatim from
+# docs/probes/wave2-node/out/r6-zfs-partial.log. Tests re-point `w2z/p/c@s` to their held snapshot.
+w2z/p/c@s	keep	Thu Oct 15 22:26 2026

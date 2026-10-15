@@ -90,6 +90,15 @@ export function zfsSnapshotDetailArgs(dataset: string): string[] {
 }
 
 /**
+ * `zfs list` argument array for EVERY snapshot below the dataset — its own and
+ * every descendant's, in one call — exactly the set `zfs destroy -r <dataset>`
+ * would sweep (cr.47e). Plain `-H`, one full snapshot name per line.
+ */
+export function zfsSweepSnapshotListArgs(dataset: string): string[] {
+  return ['list', '-H', '-t', 'snapshot', '-r', '-o', 'name', '--', dataset]
+}
+
+/**
  * A `properties.<name>.value` reader for one raw dataset, always as a string —
  * the one place a JSON-number value (see {@link ZfsPropertyRaw}) is normalised,
  * so no downstream parser has to guess at the type it was handed.

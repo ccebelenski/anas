@@ -392,7 +392,7 @@ serialise even though they have different guids.
 | Key | Taken by | Mode |
 |---|---|---|
 | `zpool:<guid>` | every ZFS verb on the pool or anything in it | X for pool-structural verbs (destroy, export, upgrade, mountpoint, add/remove vdev, attach, replace, raidz expand, cleanup); S for everything inside the pool |
-| `zfs:<poolGuid>/<dataset path>` (+ every ancestor's key in S) | dataset and snapshot verbs, replication source/target, backup and cloud runs on a path in the pool, schedule fire | X: destroy, rollback, rename, set properties, set access, clone target; S: snapshot create, replicate source, backup/cloud source, schedule fire |
+| `zfs:<poolGuid>/<dataset path>` (+ every ancestor's key in S) | dataset and snapshot verbs, replication source/target, backup and cloud runs on a path in the pool, schedule fire | X: dataset destroy, rollback, snapshot rename (F2: a running send does not stop a rename — row 6 c3), set properties, set access, clone target; S: snapshot create, snapshot destroy (cr.47c — a recursive destroy is atomic row 6 c1/c4, and ZFS's own "dataset is busy" protects the snapshot a send reads, row 6 c5), replicate source, backup/cloud source, schedule fire |
 | `zname:<pool name>`, `ahrname:<name>` | create, import, export, destroy (both families) | X |
 | `ahr:<vg uuid>` | every AHR verb | X for destroy, mountpoint, remount, expand step, replace step, readd step, cache attach/detach, spare add/remove, snapshot rollback; S for scrub, repair block, snapshot create/delete, access, runs reading it |
 | `disk:<inventory by-id>` | every verb that writes a disk: ZFS create/add/attach/replace/cleanup, AHR create/expand/replace/spare/cache | X |
