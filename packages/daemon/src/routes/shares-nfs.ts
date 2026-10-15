@@ -3,7 +3,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { AccessService } from '../services/access.js'
-import { AbsolutePath, CreateNfsExportRequest, UpdateNfsExportRequest } from '@anas/shared'
+import { AbsolutePath, CreateNfsExportRequest, EXPORT_PATH_MSG, isExportPath, UpdateNfsExportRequest } from '@anas/shared'
 import { addExport, hasExport, parseExports, removeExport, replaceExport } from '../parsers/exports.js'
 import { confirmGate } from '../safety/gate.js'
 import { createAccessService } from '../services/access.js'
@@ -67,16 +67,26 @@ export async function nfsExportRoutes(
       if (before !== null && written !== null) {
         const previous = before
         const writtenBytes = written
+        const why = (e: unknown): string => (e instanceof Error ? e.message : String(e))
+        let restored = false
         try {
           await editConfig(exportsPath, current => (current === writtenBytes ? previous : current))
+          restored = true
+        }
+        catch (restoreErr) {
+          progress(`Could not restore /etc/exports after the failed reload — the rejected change is still in the file: ${why(restoreErr)}`)
+        }
+        if (restored) {
           // A failed `exportfs -ra` may have applied part of the bad file to
           // the kernel's export table; reload the restored file so the
           // kernel matches it again. Best-effort: the reload error below is
           // what the job reports.
-          await reloadExports()
-        }
-        catch (restoreErr) {
-          progress(`Could not restore /etc/exports after the failed reload: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`)
+          try {
+            await reloadExports()
+          }
+          catch (reloadErr) {
+            progress(`/etc/exports was restored, but reloading it failed — the kernel's export table may not match the file: ${why(reloadErr)}`)
+          }
         }
       }
       throw err
@@ -202,7 +212,9 @@ export async function nfsExportRoutes(
 
   // --- PUT /shares/nfs/:path — replace the client list -------------------
   server.put<{ Params: { path: string } }>('/shares/nfs/:path', async (request, reply) => {
-    const pathParsed = AbsolutePath.safeParse(request.params.path)
+    // The same export-path rule as the create door (cr.13 review): this path
+    // is re-serialized into /etc/exports by replaceExport.
+    const pathParsed = AbsolutePath.refine(isExportPath, EXPORT_PATH_MSG).safeParse(request.params.path)
     if (!pathParsed.success) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid export path: ${pathParsed.error.issues[0]?.message}` } }

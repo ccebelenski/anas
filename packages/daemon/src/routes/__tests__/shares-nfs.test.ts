@@ -241,6 +241,18 @@ describe('nfs export routes', () => {
       })
       assert.equal(res.statusCode, 404)
     })
+
+    it('refuses a URL path the export-path rule refuses, before any lookup (cr.13 review)', async () => {
+      for (const bad of ['/srv/a"b', '/srv/a\\b', '/srv/a#b']) {
+        const res = await server!.inject({
+          method: 'PUT',
+          url: `/v1/shares/nfs/${enc(bad)}`,
+          headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+          payload: JSON.stringify({ clients: [{ spec: '*', options: ['rw'] }] }),
+        })
+        assert.equal(res.statusCode, 400, bad)
+      }
+    })
   })
 
   // --- DELETE (confirmation-gated) --------------------------------------
