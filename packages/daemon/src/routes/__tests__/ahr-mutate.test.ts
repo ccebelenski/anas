@@ -1321,7 +1321,7 @@ describe('DELETE /v1/ahr/:name — identity doors (ident.3)', () => {
    * `r1Sequence`, successive `--detail` reads of band 1 answer in turn (the
    * last repeats) — a pool that changes between the confirm and the job.
    */
-  function ahr0World(r1Uuid?: string, r1Sequence?: string[]): MockExecutor {
+  function ahr0World(r1Uuid?: string, r1Sequence?: string[], opts: { unmounted?: boolean } = {}): MockExecutor {
     const executor = new MockExecutor()
     const r1 = mockFixtures.ahrMdadmExportR1()
     const withUuid = (uuid: string) => ({ ...r1, stdout: r1.stdout.replace(/MD_UUID=.*/, `MD_UUID=${uuid}`) })
@@ -1338,12 +1338,15 @@ describe('DELETE /v1/ahr/:name — identity doors (ident.3)', () => {
         result: band === 'r1' ? r1Export : band === 'r2' ? mockFixtures.ahrMdadmExportR2() : { stdout: '', stderr: 'no superblock', exitCode: 1 },
       })
     }
-    executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+    // `unmounted`: the same pool with its filesystem not mounted anywhere —
+    // neither findmnt nor lsblk's LV node reports a mountpoint.
+    const lsblk = mockFixtures.ahrLsblk()
+    executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: opts.unmounted ? { ...lsblk, stdout: lsblk.stdout.replaceAll('"mountpoint": "/mnt/anas-ahr/ahr0"', '"mountpoint": null') } : lsblk })
     executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
     executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
     executor.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: mockFixtures.ahrPvs() })
-    executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: opts.unmounted ? { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } : mockFixtures.ahrFindmnt() })
     executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
     for (const command of ['/usr/bin/umount', '/usr/bin/systemctl', '/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs', '/usr/sbin/mdadm'])
       executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -1451,6 +1454,35 @@ describe('DELETE /v1/ahr/:name — identity doors (ident.3)', () => {
     assert.equal(replay.statusCode, 409, replay.body)
     assert.equal(replay.json().error.code, 'CONFIRMATION_REQUIRED', 'a fresh confirm, never a 202')
     await after.server.close()
+  })
+
+  // cr.31 D3 (live proof wave 1b R5 R2-D3): the pool's OWN fstab line at its
+  // mountpoint is the pool, not "a mount beneath this pool"; a mount under it is.
+  it('cr.31 D3: the confirm does not list the pool\'s own fstab line as a reference; a mount beneath it is listed', async () => {
+    await writeFile(join(dir, 'fstab'), [
+      'UUID=abc / ext4 errors=remount-ro 0 1',
+      '/dev/ahr0/ahr0-vol /mnt/anas-ahr/ahr0 btrfs nofail,subvol=@data 0 0',
+      '//127.0.0.1/inner /mnt/anas-ahr/ahr0/inner cifs credentials=/etc/anas/creds/x.cred,nofail 0 0',
+      '',
+    ].join('\n'))
+    const { server } = await build(ahr0World())
+    const res = await server.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 409, res.body)
+    const warnings = res.json().error.warnings as string[]
+    assert.ok(!warnings.some(w => w.startsWith('Mount \'/mnt/anas-ahr/ahr0\' ')), warnings.join(' | '))
+    assert.ok(warnings.includes('Mount \'/mnt/anas-ahr/ahr0/inner\' is mounted beneath this pool and will stop working'), warnings.join(' | '))
+    assert.ok(warnings.includes('The filesystem at \'/mnt/anas-ahr/ahr0\' will be unmounted: anything serving from it (shares, backups, mounts) stops working'))
+    await server.close()
+  })
+
+  it('cr.31 D3: an UNMOUNTED pool\'s confirm never names its LV device as a place to be unmounted', async () => {
+    const { server } = await build(ahr0World(undefined, undefined, { unmounted: true }))
+    const res = await server.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 409, res.body)
+    const warnings = res.json().error.warnings as string[]
+    assert.ok(!warnings.some(w => w.includes('will be unmounted')), warnings.join(' | '))
+    assert.ok(warnings.includes('The pool\'s filesystem is not mounted. An /etc/fstab line for its volume \'/dev/ahr0/ahr0-vol\' is removed with the pool'), warnings.join(' | '))
+    await server.close()
   })
 })
 

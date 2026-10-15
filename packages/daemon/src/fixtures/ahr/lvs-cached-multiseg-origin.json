@@ -1,0 +1,12 @@
+  {
+      "report": [
+          {
+              "lv": [
+                  {"lv_name":"cr31seg-vol", "vg_name":"cr31seg", "lv_attr":"Cwi-a-C---", "lv_size":"289406976", "pool_lv":"[cr31seg-cache_cvol]", "origin":"[cr31seg-vol_corig]", "data_percent":"0.00", "metadata_percent":"0.68", "move_pv":"", "mirror_log":"", "copy_percent":"0.00", "convert_lv":"", "cache_mode":"writethrough", "cache_policy":"smq", "cache_total_blocks":"1344", "cache_used_blocks":"0", "cache_read_hits":"0", "cache_read_misses":"20", "cache_dirty_blocks":"0"}
+              ]
+          }
+      ]
+      ,
+      "log": [
+      ]
+  }

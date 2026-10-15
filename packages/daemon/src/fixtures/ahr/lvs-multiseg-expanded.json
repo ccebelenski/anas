@@ -1,0 +1,14 @@
+  {
+      "report": [
+          {
+              "lv": [
+                  {"lv_name":"cr31seg-vol", "vg_name":"cr31seg", "lv_attr":"-wi-a-----", "lv_size":"289406976", "pool_lv":"", "origin":"", "data_percent":"", "metadata_percent":"", "move_pv":"", "mirror_log":"", "copy_percent":"", "convert_lv":"", "cache_mode":"", "cache_policy":"", "cache_total_blocks":"", "cache_used_blocks":"", "cache_read_hits":"", "cache_read_misses":"", "cache_dirty_blocks":""},
+                  {"lv_name":"cr31seg-vol", "vg_name":"cr31seg", "lv_attr":"-wi-a-----", "lv_size":"289406976", "pool_lv":"", "origin":"", "data_percent":"", "metadata_percent":"", "move_pv":"", "mirror_log":"", "copy_percent":"", "convert_lv":"", "cache_mode":"", "cache_policy":"", "cache_total_blocks":"", "cache_used_blocks":"", "cache_read_hits":"", "cache_read_misses":"", "cache_dirty_blocks":""},
+                  {"lv_name":"cr31seg-vol", "vg_name":"cr31seg", "lv_attr":"-wi-a-----", "lv_size":"289406976", "pool_lv":"", "origin":"", "data_percent":"", "metadata_percent":"", "move_pv":"", "mirror_log":"", "copy_percent":"", "convert_lv":"", "cache_mode":"", "cache_policy":"", "cache_total_blocks":"", "cache_used_blocks":"", "cache_read_hits":"", "cache_read_misses":"", "cache_dirty_blocks":""}
+              ]
+          }
+      ]
+      ,
+      "log": [
+      ]
+  }

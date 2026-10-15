@@ -102,6 +102,73 @@ describe('parseLvsReport', () => {
   })
 })
 
+// Story cr.31 (docs/LIVE-PROOF-0.4.4-wave1b.md R2-D1): LVS_ARGS carries the
+// SEGMENT fields cache_mode/cache_policy, so lvs prints one row per segment.
+// The parser returns one record per LV — captured on real LVM 2.03.31.
+describe('parseLvsReport — one record per LV over a per-segment report (cr.31)', () => {
+  it('the two-band capture lists the LV twice; the parser returns it once', () => {
+    const json = loadFixture('lvs-multiseg-two-bands.json')
+    assert.equal(JSON.parse(json).report[0].lv.length, 2, 'the capture itself carries one row per segment')
+    assert.deepEqual(parseLvsReport(json), [{
+      name: 'cr31seg-vol',
+      vgName: 'cr31seg',
+      attr: '-wi-a-----',
+      sizeBytes: 192937984,
+      cacheMode: null,
+      cachePolicy: null,
+      cacheTotalBlocks: null,
+      cacheUsedBlocks: null,
+      cacheReadHits: null,
+      cacheReadMisses: null,
+      cacheDirtyBlocks: null,
+    }])
+  })
+
+  it('the expanded capture lists the LV three times; one record, the WHOLE LV size', () => {
+    const json = loadFixture('lvs-multiseg-expanded.json')
+    assert.equal(JSON.parse(json).report[0].lv.length, 3)
+    const lvs = parseLvsReport(json)
+    assert.equal(lvs.length, 1)
+    assert.equal(lvs[0].sizeBytes, 289406976)
+    // The same LV in the default columns (ahr-cache's LVS_STATE_ARGS) is one row
+    // to begin with — both forms now read the same.
+    assert.deepEqual(parseLvsReport(loadFixture('lvs-multiseg-expanded-default-columns.json')).map(l => [l.vgName, l.name, l.sizeBytes]), [['cr31seg', 'cr31seg-vol', 289406976]])
+  })
+
+  it('a cached LV over a three-segment origin is one row with its cache cells', () => {
+    const lvs = parseLvsReport(loadFixture('lvs-cached-multiseg-origin.json'))
+    assert.equal(lvs.length, 1)
+    assert.equal(lvs[0].attr, 'Cwi-a-C---')
+    assert.equal(lvs[0].sizeBytes, 289406976)
+    assert.equal(lvs[0].cacheMode, 'writethrough')
+    assert.equal(lvs[0].cachePolicy, 'smq')
+    assert.equal(lvs[0].cacheTotalBlocks, 1344)
+    assert.equal(lvs[0].cacheUsedBlocks, 0)
+    assert.equal(lvs[0].cacheDirtyBlocks, 0)
+  })
+
+  it('a cached single-segment LV is unchanged', () => {
+    const lvs = parseLvsReport(loadFixture('lvs-cached-single-seg.json'))
+    assert.deepEqual(lvs.map(l => [l.vgName, l.name, l.cacheMode, l.cachePolicy, l.cacheTotalBlocks]), [['cr31one', 'cr31one-vol', 'writethrough', 'smq', 1344]])
+  })
+
+  it('collapses by (vg, lv), keeps first-seen order, and takes a cache cell from whichever segment row carries it', () => {
+    const json = JSON.stringify({ report: [{ lv: [
+      { lv_name: 'b-vol', vg_name: 'b', lv_attr: '-wi-a-----', lv_size: '10', cache_mode: '', cache_policy: '' },
+      { lv_name: 'a-vol', vg_name: 'a', lv_attr: 'Cwi-aoC---', lv_size: '20', cache_mode: '', cache_policy: '', cache_total_blocks: '' },
+      { lv_name: 'a-vol', vg_name: 'a', lv_attr: 'Cwi-aoC---', lv_size: '20', cache_mode: 'writethrough', cache_policy: 'smq', cache_total_blocks: '8' },
+      { lv_name: 'b-vol', vg_name: 'b', lv_attr: '-wi-a-----', lv_size: '10', cache_mode: '', cache_policy: '' },
+      // Same LV name in ANOTHER VG is another LV.
+      { lv_name: 'b-vol', vg_name: 'a', lv_attr: '-wi-a-----', lv_size: '30' },
+    ] }] })
+    assert.deepEqual(parseLvsReport(json).map(l => [l.vgName, l.name, l.sizeBytes, l.cacheMode, l.cachePolicy, l.cacheTotalBlocks]), [
+      ['b', 'b-vol', 10, null, null, null],
+      ['a', 'a-vol', 20, 'writethrough', 'smq', 8],
+      ['a', 'b-vol', 30, null, null, null],
+    ])
+  })
+})
+
 // The LV state field (issue #18) — what says a volume over a partial VG is not
 // merely reduced but UNREACHABLE.
 describe('lvIsActive', () => {

@@ -686,6 +686,9 @@ export async function poolRoutes(
       executor,
       pool: poolName,
       paths: await poolOwnedPaths(poolName),
+      // A `mountpoint=legacy` dataset of the pool mounted through fstab is the
+      // pool's own filesystem, never a mount beneath it (cr.31 D3).
+      ownMounts: { zfsDatasets: true },
       ...(opts.smbConfPath ? { smbConfPath: opts.smbConfPath } : {}),
       ...(opts.exportsPath ? { exportsPath: opts.exportsPath } : {}),
       ...(opts.systemdDir ? { systemdDir: opts.systemdDir } : {}),

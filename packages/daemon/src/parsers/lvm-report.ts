@@ -43,6 +43,13 @@ export const VGS_ARGS = [...LVM_REPORT_FLAGS, '-o', '+vg_uuid']
  *
  * These numbers go STALE rather than absent once the cache device dies (GT-23),
  * so they are only ever presented behind the `dmsetup status` health gate.
+ *
+ * `cache_mode` and `cache_policy` are SEGMENT fields (story cr.31): with them
+ * in the column list `lvs` prints one row per SEGMENT, so a multi-segment LV
+ * (two bands, or an expanded pool) comes back two or three times. They have no
+ * LV-level equivalent (`kernel_cache_policy` is the kernel's live view and has
+ * no mode twin), so the columns stay and {@link parseLvsReport} returns one
+ * record per LV — every reader gets the collapse, not just destroy.
  */
 const LVS_CACHE_COLUMNS = [
   'cache_mode',
@@ -291,13 +298,35 @@ function counter(value: string | undefined): number | null {
   return Number.isNaN(n) ? null : n
 }
 
-/** Parse `lvs --reportformat json` output. */
+/**
+ * Parse `lvs --reportformat json` output into ONE record per logical volume.
+ *
+ * `cache_mode` and `cache_policy` (in {@link LVS_ARGS}) are LVM SEGMENT fields,
+ * and a report that asks for any segment field prints one row PER SEGMENT
+ * (story cr.31, docs/LIVE-PROOF-0.4.4-wave1b.md R2-D1). An LV spanning two
+ * band PVs — every uncached pool with two or more bands — or grown by an
+ * expansion is listed two or three times, and a caller that acts per row acts
+ * on the same LV again (destroy's second `lvremove` failed with "Failed to find
+ * logical volume" on every such pool from ahrcache.1 until cr.31). Captured:
+ * fixtures/ahr/lvs-multiseg-*.json.
+ *
+ * So the parser's contract is one record per LV, whatever columns were asked:
+ * rows are merged by (vg_name, lv_name) — an LV name is unique within its VG —
+ * in first-seen order. Every LV-level cell repeats on each segment row, so the
+ * first row's value is the LV's. The cache cells are taken from the first row
+ * that carries one: a cache TARGET is always a single `cache` segment at the
+ * top (its multi-segment origin is the hidden `_corig` sub-LV, never listed
+ * without `-a`), so on a cached LV there is exactly one row to take them from,
+ * and on an uncached multi-segment LV every row's cache cell is empty.
+ */
 export function parseLvsReport(json: string): LvmLv[] {
-  return reportRows<'lv', RawLv>(json, 'lv')
-    .filter(r => typeof r.lv_name === 'string' && typeof r.vg_name === 'string')
-    .map(r => ({
-      name: r.lv_name!,
-      vgName: r.vg_name!,
+  const byKey = new Map<string, LvmLv>()
+  for (const r of reportRows<'lv', RawLv>(json, 'lv')) {
+    if (typeof r.lv_name !== 'string' || typeof r.vg_name !== 'string')
+      continue
+    const row: LvmLv = {
+      name: r.lv_name,
+      vgName: r.vg_name,
       attr: r.lv_attr ?? '',
       sizeBytes: parseLvmSize(r.lv_size),
       cacheMode: cell(r.cache_mode),
@@ -307,5 +336,21 @@ export function parseLvsReport(json: string): LvmLv[] {
       cacheReadHits: counter(r.cache_read_hits),
       cacheReadMisses: counter(r.cache_read_misses),
       cacheDirtyBlocks: counter(r.cache_dirty_blocks),
-    }))
+    }
+    // JSON-encoded pair: no separator character can make two keys collide.
+    const key = JSON.stringify([row.vgName, row.name])
+    const seen = byKey.get(key)
+    if (!seen) {
+      byKey.set(key, row)
+      continue
+    }
+    seen.cacheMode ??= row.cacheMode
+    seen.cachePolicy ??= row.cachePolicy
+    seen.cacheTotalBlocks ??= row.cacheTotalBlocks
+    seen.cacheUsedBlocks ??= row.cacheUsedBlocks
+    seen.cacheReadHits ??= row.cacheReadHits
+    seen.cacheReadMisses ??= row.cacheReadMisses
+    seen.cacheDirtyBlocks ??= row.cacheDirtyBlocks
+  }
+  return [...byKey.values()]
 }

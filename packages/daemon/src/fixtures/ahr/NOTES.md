@@ -89,6 +89,45 @@ daemon itself runs — `lvs` WITHOUT `-a`, and `pvs` in the byte form.
 | `dmsetup-status-cache-failed.txt` | live, device pulled | The same call, same second the reads started failing: `0 2080768 cache Fail`. **GT §18 recorded `Error`** (captured after a write aborted the metadata transaction); a pure read load gives `Fail`. Two words for one condition — hence the structural digit test rather than a token list |
 | `dmsetup-status-uncached.txt` | live, after `--uncache` | `0 2080768 linear` — the pool LV keeps its name and dm number across attach, failure and detach (GT-18) |
 
+## Genuine captures — story cr.31 multi-segment LVs (added 2026-10-15)
+
+Live-captured on the stunt node (`anas-pve`, PVE 9, kernel 7.0.14-23-pve, LVM
+2.03.31(2)) from a THROWAWAY loop VG — four 96 MiB sparse images under
+`/var/tmp/cr31-capture` on `/dev/loop2..5` (A, B, C = band stand-ins, K = the
+cache slice stand-in), built and torn down by hand, never through ANAS, and
+removed after. Every `*.json` below is `lvs --reportformat json --units b
+--nosuffix -o +cache_mode,cache_policy,cache_total_blocks,cache_used_blocks,
+cache_read_hits,cache_read_misses,cache_dirty_blocks <vg>` — `LVS_ARGS`
+byte for byte, plus the VG operand — unless the row says otherwise.
+
+Why they exist (docs/LIVE-PROOF-0.4.4-wave1b.md R2-D1): `cache_mode` and
+`cache_policy` are LVM SEGMENT fields, so `LVS_ARGS` makes `lvs` print one row
+per segment. An LV spanning two band PVs (every uncached pool with two or more
+bands) or grown by an expansion (`vgextend` + `lvextend`) is listed two or three
+times, and destroy issued `lvremove` once per row. `lvs --noheadings -o
+lv_name,seg_count,segtype,devices` at each step:
+
+```
+two bands:      cr31seg-vol 2 linear /dev/loop2(0)   cr31seg-vol 2 linear /dev/loop3(0)
+expanded:       cr31seg-vol 3 linear /dev/loop2(0) / /dev/loop3(0) / /dev/loop4(0)
+cached (multi): cr31seg-vol 1 cache cr31seg-vol_corig(0)
+   with -a:     [cr31seg-vol_corig] 3 linear loop2/loop3/loop4, [cr31seg-cache_cvol] 1 linear loop5
+cached (one):   cr31one-vol 1 cache cr31one-vol_corig(0)
+```
+
+A CACHED LV is always ONE `cache` segment at the top: its multi-segment
+origin is the hidden `_corig` sub-LV, which `LVS_ARGS` (no `-a`) never lists —
+so the cache cells sit on a single row, and that is why the cached pool in
+R2 shape A escaped the duplicate `lvremove`.
+
+| File | Shape | What it is |
+|------|-------|------------|
+| `lvs-multiseg-two-bands.json` | VG `cr31seg` on A+B, `lvcreate -l 100%FREE` | The two-band create shape: **2 rows** for the one LV `cr31seg-vol`, identical except that each is a segment; every cache cell empty |
+| `lvs-multiseg-expanded.json` | the same VG after `vgextend` C + `lvextend -l +100%FREE` | The expansion shape: **3 rows** for the one LV; `lv_size` (an LV field) repeats the whole LV's size on each |
+| `lvs-multiseg-expanded-default-columns.json` | the same LV, `lvs --reportformat json --units b --nosuffix` (NO `-o`) | The default columns are all LV fields: **1 row** — the form `ahr-cache.ts`'s `LVS_STATE_ARGS` reads |
+| `lvs-cached-multiseg-origin.json` | the expanded LV cached: `lvcreate -n cr31seg-cache -l 100%PVS` on K, `lvconvert --type cache --cachevol … --cachemode writethrough` (the ahrcache.1 attach argv) | **1 row**, `lv_attr` `Cwi-a-C---`, `cache_mode` writethrough, `cache_policy` smq, 1344 blocks, 0 used — the three-segment origin is hidden |
+| `lvs-cached-single-seg.json` | VG `cr31one`: one LV on A, cached the same way from K | **1 row**, the single-band cached shape |
+
 ## Known gaps (for the next capture pass)
 
 - `mdadm --detail --scan` output was never captured — the topology reader

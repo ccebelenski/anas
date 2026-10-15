@@ -19,7 +19,10 @@ import { ahrSnapshotsMountpoint } from './share-selfservice.js'
 
 /**
  * AHR pool destruction (Epic 11 + AHR, docs/AHR-DESIGN.md §4) — the DESTROY
- * mutation behind DELETE /v1/ahr/:name. Tears the stack down top-down:
+ * mutation behind DELETE /v1/ahr/:name. Reads everything and runs every gate
+ * FIRST — the pool's identity, the disk truth, the LVM ownership gate
+ * (`requireOwnedVgPvs`), the LV list, the mount table and fstab — so a refusal
+ * changes nothing at all (cr.31 D2). Then it tears the stack down top-down:
  *
  *   umount (pool mountpoint AND the Previous Versions @snapshots mount)
  *     → fstab lines removed (surgical) → uncache/lvremove/vgreduce
@@ -281,14 +284,38 @@ export async function destroyAhrPool(
     facts.set(paths.id, { id: paths.id, devPath: paths.devPath, parts: partFacts })
   }
 
-  // --- umount (only when actually mounted; the directory stays) --------------
+  // --- THE GATE, before the first change of ANY kind (cr.31 D2) -------------
+  // THE VG IS OURS ONLY ON THE DISKS (code review H6): prove every PV of the
+  // VG named `name` is a device this pool owns — a band array the ident.3
+  // machinery decided is the pool's, or an ahrcache.1 cache slice. A foreign VG
+  // of the same name — PVE's `pve`, a pool moved in from another node, a PV an
+  // operator added by hand — is REFUSED whole, and an unreadable pvs/vgs is a
+  // refusal too (fail closed).
+  // An `[unknown]` PV passes only beside a NAMED PV of the pool's (cr.22): the
+  // VG is proven the pool's by a device on the pool's own disk, never by the
+  // missing rows alone, and a VG with a PV `pvs` did not report is refused.
+  //
+  // It runs HERE, ahead of the unmount, the fstab edit and the daemon-reload,
+  // not just ahead of the LVM verbs (live proof wave 1b R2-D2): the stack the
+  // gate exists for — a hand-built `<vg>-r1` pinned beside a foreign VG — also
+  // hands the topology the FOREIGN LV's mount as the pool's mountpoint, and a
+  // refusal that came after the unmount had already unmounted the operator's
+  // filesystem and deleted their own fstab line for it. A refused destroy now
+  // leaves the mount, fstab and every layer below exactly as they were.
+  const proven = await requireOwnedVgPvs(executor, name, {
+    arrays: identity.arrays.map(a => ({ pool: a.pool, band: a.band, kernelName: a.kernelName })),
+    partsByKernel: index.partsByKernel,
+  })
+
+  // --- Every other read the acts consume, also before the first act ---------
+  // The LVs of the pool's VG (one record per LV — parseLvsReport collapses the
+  // per-segment rows LVS_ARGS produces, cr.31 D1). Unmounting changes no LV.
+  const lvsRes = await executor.exec(LVS, LVS_ARGS)
+  const lvs = lvsRes.exitCode === 0 ? parseLvsReport(lvsRes.stdout).filter(l => l.vgName === name) : []
+
   const mountpoint = pool.mounted ? pool.mountpoint : null
   const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
   const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
-  if (mountpoint && mounts.some(m => m.target === mountpoint)) {
-    updateProgress(`Unmounting ${mountpoint}`)
-    await run(executor, UMOUNT, [mountpoint], { busyPath: mountpoint })
-  }
 
   // The Previous Versions @snapshots mount (smbsvc.1) is a SIBLING of the pool
   // mount base — never under the pool mountpoint — and the design keeps it
@@ -299,21 +326,32 @@ export async function destroyAhrPool(
   // stays" ruling ends. Unmounted but fstab-claimed is still torn down — the
   // mount is found live (like everything else here), never inferred from fstab.
   const snapMount = ahrSnapshotsMountpoint(name)
-  if (mounts.some(m => m.target === snapMount)) {
-    updateProgress(`Unmounting ${snapMount} (Previous Versions @snapshots mount)`)
-    await run(executor, UMOUNT, [snapMount], { busyPath: snapMount })
-  }
 
-  // --- fstab: drop the pool's lines (found by mountpoint OR by LV spec, so a
+  // The pool's fstab lines (found by mountpoint OR by LV spec, so a
   // half-destroyed, already-unmounted pool still gets its line removed). The LV
-  // spec matches BOTH the pool's own line and the @snapshots line — every
-  // match goes; a destroyed pool leaves no line behind. ------------------------
+  // spec matches BOTH the pool's own line and the @snapshots line — every match
+  // goes; a destroyed pool leaves no line behind. An unreadable fstab throws
+  // here, before anything changed.
   const fstabText = await readConfig(opts.fstabPath)
   const fstabMountpoints = new Set(
     parseFstab(fstabText)
       .filter(e => e.mountpoint === mountpoint || e.mountpoint === snapMount || e.spec === ahrLvPath(name))
       .map(e => e.mountpoint),
   )
+
+  // ===== ACTS — from here on the system changes ==============================
+
+  // --- umount (only when actually mounted; the directory stays) --------------
+  if (mountpoint && mounts.some(m => m.target === mountpoint)) {
+    updateProgress(`Unmounting ${mountpoint}`)
+    await run(executor, UMOUNT, [mountpoint], { busyPath: mountpoint })
+  }
+  if (mounts.some(m => m.target === snapMount)) {
+    updateProgress(`Unmounting ${snapMount} (Previous Versions @snapshots mount)`)
+    await run(executor, UMOUNT, [snapMount], { busyPath: snapMount })
+  }
+
+  // --- fstab: drop the pool's lines -------------------------------------------
   for (const mp of fstabMountpoints) {
     updateProgress(`Removing /etc/fstab entry for ${mp}`)
     await editConfig(opts.fstabPath, current => removeMount(current, mp))
@@ -322,26 +360,8 @@ export async function destroyAhrPool(
     await run(executor, SYSTEMCTL, ['daemon-reload'])
   }
 
-  // --- LVM teardown (each layer checked live before acting) -------------------
-  // THE VG IS OURS ONLY ON THE DISKS (code review H6): before ANY layer above
-  // this line ends — the lvremove / vgremove / pvremove / lvconvert --uncache
-  // that follow — prove every PV of the VG named `name` is a device this pool
-  // owns: a band array the ident.3 machinery decided is the pool's, or an
-  // ahrcache.1 cache slice. A foreign VG of the same name — PVE's `pve`, a
-  // pool moved in from another node, a PV an operator added by hand — is
-  // REFUSED whole, and an unreadable pvs/vgs is a refusal too (fail closed).
-  // LVM is torn down BEFORE the arrays are stopped below, so a refusal here
-  // leaves the md layer standing exactly as it was.
-  // An `[unknown]` PV passes only beside a NAMED PV of the pool's (cr.22): the
-  // VG is proven the pool's by a device on the pool's own disk, never by the
-  // missing rows alone, and a VG with a PV `pvs` did not report is refused.
-  const proven = await requireOwnedVgPvs(executor, name, {
-    arrays: identity.arrays.map(a => ({ pool: a.pool, band: a.band, kernelName: a.kernelName })),
-    partsByKernel: index.partsByKernel,
-  })
-
-  const lvsRes = await executor.exec(LVS, LVS_ARGS)
-  const lvs = lvsRes.exitCode === 0 ? parseLvsReport(lvsRes.stdout).filter(l => l.vgName === name) : []
+  // --- LVM teardown (each layer checked live before acting; the gate above
+  // proved the VG) — torn down BEFORE the arrays are stopped below. -----------
   for (const lv of lvs) {
     // A cached pool's LV is a dm-cache TARGET, and `lvremove` REFUSES one —
     // which left the pool half-destroyed exactly here: already unmounted, its

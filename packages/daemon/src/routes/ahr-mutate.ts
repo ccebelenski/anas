@@ -413,6 +413,8 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
    * its MOUNTED `@data` path and is matched by name for replication/snapshot/
    * scrub references; an unmounted pool (`mountpoint` under /dev/) owns no path
    * a reference could point at, so only the name-matched kinds are in scope.
+   * The pool's own fstab line at that path is the pool itself, never a "mount
+   * beneath this pool" (cr.31 D3).
    */
   async function ahrPoolReferences(pool: { name: string, mountpoint: string }) {
     const mountedPath = pool.mountpoint.startsWith('/dev/') ? [] : [pool.mountpoint]
@@ -420,6 +422,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       executor,
       pool: pool.name,
       paths: mountedPath,
+      ownMounts: { mountpoints: mountedPath },
       ...(smbConfPath ? { smbConfPath } : {}),
       ...(exportsPath ? { exportsPath } : {}),
       ...(systemdDir ? { systemdDir } : {}),
@@ -860,9 +863,15 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
 
     // Consumers under the mountpoint (submounts — shares/backups serving from
     // the pool stop with it). findmnt is the live truth.
+    // An UNMOUNTED pool's `mountpoint` is its LV device path (the topology's
+    // honest "where the filesystem lives"), so it is never named as a place
+    // that will be unmounted (cr.31 D3): the job drops the fstab line that
+    // names the volume, and that is what the sentence says.
     const warnings = [
       `Pool '${name}' (${fmtBytes(pool.capacity.usableBytes)} usable) will be permanently destroyed. Every array, partition, and all data is erased`,
-      `The filesystem at '${pool.mountpoint}' will be unmounted: anything serving from it (shares, backups, mounts) stops working`,
+      pool.mounted
+        ? `The filesystem at '${pool.mountpoint}' will be unmounted: anything serving from it (shares, backups, mounts) stops working`
+        : `The pool's filesystem is not mounted. An /etc/fstab line for its volume '${ahrLvPath(name)}' is removed with the pool`,
     ]
     // cr.23: the table read above for the system-pool gate — same read feeds
     // the consumer warnings (one read per request, Principle 11).

@@ -1,6 +1,6 @@
 import type { AhrDestroyTarget } from '../ahr-destroy.js'
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -846,11 +846,83 @@ describe('destroyAhrPool — the LVM teardown gate (H6)', () => {
     executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_T2_R1, stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
     addDiskReads(executor, T2_BY_ID, T2_LSBLK)
-    // The pool's fstab line is present, so the daemon-reload side effect fires
-    // before the LVM gate — it must succeed for the refusal to be the gate's.
+    // The pool's fstab line is present, so a teardown that passes the gate
+    // daemon-reloads after removing it (cr.31 D2: never before the gate).
     executor.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
     return executor
   }
+
+  /**
+   * cr.31 D2 (live proof wave 1b R2-D2) — the review's node shape: a hand-built
+   * md array `t2-r1` pinned the way `mdadm --detail --scan >> mdadm.conf` pins
+   * any array, beside a FOREIGN VG `t2` on another device whose LV is mounted
+   * from the operator's own fstab line. The topology takes that LV's mount as
+   * the pool's mountpoint, so before cr.31 the refused destroy had already
+   * unmounted it, deleted the line and daemon-reloaded.
+   */
+  describe('cr.31 D2: a refused destroy changes NOTHING — no umount, no fstab edit, no daemon-reload', () => {
+    const FOREIGN_MP = '/mnt/anasproof-fgn'
+    const FOREIGN_FSTAB = [
+      '# static file system information',
+      'UUID=abc / ext4 errors=remount-ro 0 1',
+      `/dev/t2/lv0 ${FOREIGN_MP} ext4 defaults,nofail 0 0`,
+      '',
+    ].join('\n')
+
+    function foreignWorld(pvRows: { pv_name: string, vg_name: string, pv_size: string, pv_free: string }[]): MockExecutor {
+      const executor = new MockExecutor()
+      executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_LIVE, stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_T2_R1, stderr: '', exitCode: 0 } })
+      addDiskReads(executor, T2_BY_ID, T2_LSBLK)
+      addExamine(executor, T2_MEMBER_EXAMINE)
+      executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: {
+        stdout: JSON.stringify({ filesystems: [{ target: FOREIGN_MP, source: '/dev/mapper/t2-lv0', fstype: 'ext4', options: 'rw' }] }),
+        stderr: '',
+        exitCode: 0,
+      } })
+      executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', [{ vg_name: 't2', pv_count: String(pvRows.filter(r => r.vg_name === 't2').length), lv_count: '1', vg_size: String(GIB), vg_free: '0' }]), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', pvRows), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', [{ lv_name: 'lv0', vg_name: 't2', lv_attr: '-wi-ao----', lv_size: String(GIB) }]), stderr: '', exitCode: 0 } })
+      // Every act would succeed — the only thing standing between the job and
+      // the operator's mount is the gate.
+      for (const command of ['/usr/bin/umount', '/usr/bin/systemctl', '/usr/sbin/lvconvert', '/usr/sbin/lvremove', '/usr/sbin/vgreduce', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs', '/usr/sbin/mdadm'])
+        executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+      return executor
+    }
+
+    for (const [label, pvRows] of [
+      ['the foreign VG on its own device, the pinned array beside it', [
+        { pv_name: '/dev/loop4', vg_name: 't2', pv_size: String(GIB), pv_free: '0' },
+        { pv_name: '/dev/md127', vg_name: '', pv_size: String(2 * GIB), pv_free: String(2 * GIB) },
+      ]],
+      ['the pinned array joined to the foreign VG (the hand-added PV shape)', [
+        { pv_name: '/dev/loop4', vg_name: 't2', pv_size: String(GIB), pv_free: '0' },
+        { pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' },
+      ]],
+    ] as const) {
+      it(`${label}: refused, and the mount, fstab and conf are untouched`, async () => {
+        await writeFile(fstabPath, FOREIGN_FSTAB)
+        const executor = foreignWorld([...pvRows])
+        await assert.rejects(
+          destroyAhrPool(executor, pool(FOREIGN_MP), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
+          /volume group 't2' contains physical volume \/dev\/loop4 — not this pool's arrays or cache slices/,
+        )
+        // Nothing but reads ran: no umount, no daemon-reload, no LVM/md/disk act.
+        assert.deepEqual(acts(executor), [])
+        assert.ok(!progress.some(p => /Unmounting|Removing \/etc\/fstab/.test(p)), progress.join(' | '))
+        assert.equal(await readFile(fstabPath, 'utf8'), FOREIGN_FSTAB, 'fstab byte-identical')
+        assert.equal(await readFile(confPath, 'utf8'), CONF_SEED, 'mdadm.conf byte-identical')
+      })
+    }
+
+    it('an unreadable fstab stops the destroy before the unmount, too', async () => {
+      const executor = foreignWorld([{ pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' }])
+      await rm(fstabPath)
+      await mkdir(fstabPath) // reading a directory throws EISDIR — not ENOENT
+      await assert.rejects(destroyAhrPool(executor, pool(FOREIGN_MP), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }))
+      assert.deepEqual(acts(executor), [])
+    })
+  })
 
   it('a VG named like the pool that also holds a FOREIGN PV is refused — no lvremove/vgremove/pvremove, no md stop', async () => {
     const executor = world()
@@ -1053,5 +1125,116 @@ describe('destroyAhrPool — the LVM teardown gate (H6)', () => {
     for (const never of ['/usr/sbin/vgremove', '/usr/sbin/pvremove'])
       assert.ok(!executor.calls.some(c => c.command === never), never)
     assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
+  })
+})
+
+/**
+ * Story cr.31 D1 (docs/LIVE-PROOF-0.4.4-wave1b.md R2-D1, shipped since
+ * ahrcache.1): `LVS_ARGS` carries the SEGMENT fields cache_mode/cache_policy, so
+ * `lvs` lists a multi-segment LV once per segment, and destroy sent `lvremove`
+ * per ROW — the second one failed "Failed to find logical volume" and the job
+ * died after the unmount, the fstab edit and the first lvremove, with the VG and
+ * arrays standing. The `lvs` replies here are the stunt-node captures
+ * (fixtures/ahr/lvs-multiseg-*.json, lvs-cached-multiseg-origin.json) with the
+ * throwaway VG name `cr31seg` renamed to this world's `t2`; `LVS_ARGS` prints no
+ * device column, so the reply is the same whichever PVs the segments sit on (two
+ * bands, or one band an expansion grew in place). `lvremove` answers as real LVM
+ * does: the first call removes the LV, a second one fails.
+ */
+describe('destroyAhrPool — a multi-segment LV is removed once, in one job (cr.31 D1)', () => {
+  let dir: string
+  let fstabPath: string
+  let confPath: string
+  const progress: string[] = []
+  const FIXTURES = join(import.meta.dirname, '../../fixtures/ahr')
+  const capture = (file: string): string => readFileSync(join(FIXTURES, file), 'utf8').replaceAll('cr31seg', 't2')
+  const okRes = { stdout: '', stderr: '', exitCode: 0 }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-destroy-cr31-'))
+    fstabPath = join(dir, 'fstab')
+    confPath = join(dir, 'mdadm.conf')
+    progress.length = 0
+    await writeFile(fstabPath, FSTAB_SEED)
+    await writeFile(confPath, CONF_SEED)
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  function world(lvsJson: string, cached: boolean): MockExecutor {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_LIVE, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_T2_R1, stderr: '', exitCode: 0 } })
+    addExamine(executor, T2_MEMBER_EXAMINE)
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: {
+      stdout: JSON.stringify({ filesystems: [{ target: MOUNTPOINT, source: '/dev/mapper/t2-t2--vol', fstype: 'btrfs', options: 'rw' }] }),
+      stderr: '',
+      exitCode: 0,
+    } })
+    executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: lvsJson, stderr: '', exitCode: 0 } })
+    const pvRows = [{ pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' }]
+    if (cached)
+      pvRows.push({ pv_name: '/dev/sde1', vg_name: 't2', pv_size: String(GIB), pv_free: '0' })
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', [{ vg_name: 't2', pv_count: String(pvRows.length), lv_count: '1', vg_size: String(3 * GIB), vg_free: '0' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', pvRows), stderr: '', exitCode: 0 } })
+    addDiskReads(
+      executor,
+      byIdListing([{ id: SMALL, kernel: 'sdc', parts: 1 }, { id: BIG, kernel: 'sdd', parts: 1 }, ...(cached ? [{ id: CACHE, kernel: 'sde', parts: 1 }] : [])]),
+      lsblkTree([{ kernel: 'sdc', parts: ['t2-d1-b1'] }, { kernel: 'sdd', parts: ['t2-d2-b1'] }, ...(cached ? [{ kernel: 'sde', parts: ['t2-cache1'] }] : [])]),
+    )
+    // Real LVM: the LV is gone after the first lvremove; a second one fails.
+    executor.addFixture({ command: '/usr/sbin/lvremove', results: [okRes, { stdout: '', stderr: '  Failed to find logical volume "t2/t2-vol"', exitCode: 5 }] })
+    for (const command of ['/usr/bin/umount', '/usr/bin/systemctl', '/usr/sbin/lvconvert', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs', '/usr/sbin/mdadm'])
+      executor.addFixture({ command, result: okRes })
+    return executor
+  }
+
+  const TEARDOWN_TAIL = [
+    { command: '/usr/sbin/vgremove', args: ['-y', 't2'] },
+    { command: '/usr/sbin/pvremove', args: ['-y', '/dev/md127'] },
+  ]
+  const MD_TAIL = [
+    { command: '/usr/sbin/mdadm', args: ['--stop', '/dev/md127'] },
+    { command: '/usr/sbin/mdadm', args: ['--zero-superblock', `/dev/disk/by-id/${SMALL}-part1`] },
+    { command: '/usr/sbin/mdadm', args: ['--zero-superblock', `/dev/disk/by-id/${BIG}-part1`] },
+    { command: '/usr/sbin/sgdisk', args: ['--zap-all', `/dev/disk/by-id/${SMALL}`] },
+    { command: '/usr/sbin/sgdisk', args: ['--zap-all', `/dev/disk/by-id/${BIG}`] },
+  ]
+
+  for (const [label, file, rows] of [
+    ['an uncached two-band pool (2 segment rows)', 'lvs-multiseg-two-bands.json', 2],
+    ['an expanded pool (3 segment rows)', 'lvs-multiseg-expanded.json', 3],
+  ] as const) {
+    it(`${label}: one lvremove, and the job runs to the end`, async () => {
+      const lvsJson = capture(file)
+      assert.equal(JSON.parse(lvsJson).report[0].lv.length, rows, 'the capture carries one row per segment')
+      const executor = world(lvsJson, false)
+      const result = await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+      assert.deepEqual(result, { destroyed: 't2' })
+      assert.deepEqual(acts(executor), [
+        { command: '/usr/bin/umount', args: [MOUNTPOINT] },
+        { command: '/usr/bin/systemctl', args: ['daemon-reload'] },
+        { command: '/usr/sbin/lvremove', args: ['-y', 't2/t2-vol'] },
+        ...TEARDOWN_TAIL,
+        ...MD_TAIL,
+        { command: '/usr/sbin/update-initramfs', args: ['-u'] },
+      ])
+      assert.equal(progress.filter(p => p === 'Removing logical volume t2/t2-vol').length, 1)
+    })
+  }
+
+  it('a cached pool over a three-segment origin (one row): uncache, one lvremove, to the end', async () => {
+    const executor = world(capture('lvs-cached-multiseg-origin.json'), true)
+    const result = await destroyAhrPool(executor, cachedPool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.deepEqual(result, { destroyed: 't2' })
+    const lvm = acts(executor).filter(c => ['/usr/sbin/lvconvert', '/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove'].includes(c.command))
+    assert.deepEqual(lvm, [
+      { command: '/usr/sbin/lvconvert', args: ['--config', 'devices/allow_mixed_block_sizes=1', '-y', '--uncache', 't2/t2-vol'] },
+      { command: '/usr/sbin/lvremove', args: ['-y', 't2/t2-vol'] },
+      ...TEARDOWN_TAIL,
+      { command: '/usr/sbin/pvremove', args: ['-y', '/dev/sde1'] },
+    ])
+    assert.ok(executor.calls.some(c => c.command === '/usr/sbin/update-initramfs'), 'the job reached its last step')
   })
 })

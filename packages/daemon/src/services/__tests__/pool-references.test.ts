@@ -251,6 +251,47 @@ describe('pool-references — one helper answers "what references this path"', (
   })
 })
 
+// Story cr.31 D3 (live proof wave 1b R5, R2-D3): every AHR destroy listed the
+// pool's OWN fstab line as "a mount beneath this pool".
+describe('pool-references — the pool\'s own filesystem is never a reference to itself (cr.31 D3)', () => {
+  const AHR_FSTAB = [
+    'PARTUUID=abcd / ext4 rw 0 1',
+    '/dev/media/media-vol /mnt/anas-ahr/media btrfs nofail,subvol=@data 0 0',
+    '//127.0.0.1/inner /mnt/anas-ahr/media/inner cifs credentials=/etc/anas/creds/x.cred,nofail 0 0',
+    '',
+  ].join('\n')
+
+  async function mounts(fstab: string, pool: string, paths: string[], ownMounts?: { mountpoints?: string[], zfsDatasets?: boolean }): Promise<string[]> {
+    const f = await track(await makeFixtures({ smb: '# empty', exports: '# empty', fstab }))
+    const { refs } = await readPoolReferences({ executor: {} as never, pool, paths, fstabPath: f.fstabPath, ...(ownMounts ? { ownMounts } : {}) })
+    return refs.filter(r => r.kind === 'mount').map(r => r.name)
+  }
+
+  it('AHR: the line AT the pool mountpoint is the pool\'s own; a mount under it is still a reference', async () => {
+    assert.deepEqual(await mounts(AHR_FSTAB, 'media', ['/mnt/anas-ahr/media'], { mountpoints: ['/mnt/anas-ahr/media'] }), ['/mnt/anas-ahr/media/inner'])
+    // A trailing slash on either side is the same directory.
+    assert.deepEqual(await mounts(AHR_FSTAB, 'media', ['/mnt/anas-ahr/media'], { mountpoints: ['/mnt/anas-ahr/media/'] }), ['/mnt/anas-ahr/media/inner'])
+    // Without the declaration the helper still answers the old way (the
+    // shape every AHR destroy confirm showed before cr.31).
+    assert.deepEqual(await mounts(AHR_FSTAB, 'media', ['/mnt/anas-ahr/media']), ['/mnt/anas-ahr/media', '/mnt/anas-ahr/media/inner'])
+  })
+
+  it('ZFS: a legacy-mounted dataset OF THE POOL is its own; another pool\'s dataset or a CIFS mount beneath it is a reference', async () => {
+    const zfsFstab = [
+      'PARTUUID=abcd / ext4 rw 0 1',
+      'tank/legacy /tank/legacy zfs defaults,nofail 0 0',
+      'other/data /tank/other zfs defaults,nofail 0 0',
+      '//127.0.0.1/anastest  /tank/archive  cifs  credentials=/etc/anas/creds/x.cred,nofail  0  0',
+      // A look-alike pool name is not this pool (dataset namespace, not a prefix).
+      'tankx/ds /tank/tankx zfs defaults,nofail 0 0',
+      '',
+    ].join('\n')
+    assert.deepEqual(await mounts(zfsFstab, 'tank', ['/tank'], { zfsDatasets: true }), ['/tank/other', '/tank/archive', '/tank/tankx'])
+    // Without the declaration the legacy dataset reads as a mount beneath.
+    assert.ok((await mounts(zfsFstab, 'tank', ['/tank'])).includes('/tank/legacy'))
+  })
+})
+
 describe('pool-references — unreadable sources are disclosed, never skipped', () => {
   it('an unreadable smb.conf is reported as unreadable:smb', async () => {
     const f = await track(await makeFixtures())

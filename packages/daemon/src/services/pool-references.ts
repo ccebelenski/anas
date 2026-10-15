@@ -103,6 +103,21 @@ export interface PoolReferenceContext {
   systemdDir?: string
   /** /etc/fstab location for the ANAS-mount reference. Absent ⇒ not checked. */
   fstabPath?: string
+  /**
+   * What fstab may carry of the pool's OWN filesystems — the pool itself, never
+   * a reference to it (story cr.31 D3). The confirm already says the pool's
+   * filesystem goes; listing its own line as "a mount beneath this pool" named
+   * the pool as a reference to itself on every AHR destroy.
+   *
+   *  - `mountpoints`: an AHR pool's mounted `@data` path — the fstab line ANAS
+   *    wrote for the pool. An entry AT one of these is the pool's own mount;
+   *    an entry UNDER one is still a reference.
+   *  - `zfsDatasets`: a ZFS pool's datasets mount themselves (no fstab line),
+   *    except a `mountpoint=legacy` dataset, which is mounted through fstab
+   *    (`<pool>/<ds> <dir> zfs …`). An fstab entry of fstype `zfs` whose spec
+   *    is a dataset of this pool is the pool's own dataset, not a reference.
+   */
+  ownMounts?: { mountpoints?: string[], zfsDatasets?: boolean }
 }
 
 /**
@@ -116,6 +131,28 @@ export function poolReferenceKey(ref: PoolReference): string {
 /** Is a dataset-name IN the pool's dataset namespace (pool root or below)? */
 function datasetOnPool(dataset: string, pool: string): boolean {
   return dataset === pool || dataset.startsWith(`${pool}/`)
+}
+
+const TRAILING_SLASHES_RE = /\/+$/
+
+/** The same directory, ignoring trailing slashes (`/mnt/x/` is `/mnt/x`). */
+function samePath(a: string, b: string): boolean {
+  const strip = (p: string) => (p.length > 1 ? p.replace(TRAILING_SLASHES_RE, '') : p)
+  return strip(a) === strip(b)
+}
+
+/**
+ * Is this fstab entry one of the pool's OWN filesystems (story cr.31 D3,
+ * {@link PoolReferenceContext.ownMounts}) rather than something mounted
+ * beneath it?
+ */
+function isOwnMount(entry: { spec: string, mountpoint: string, fstype: string }, ctx: PoolReferenceContext): boolean {
+  const own = ctx.ownMounts
+  if (!own)
+    return false
+  if (own.mountpoints?.some(mp => samePath(mp, entry.mountpoint)))
+    return true
+  return own.zfsDatasets === true && entry.fstype === 'zfs' && datasetOnPool(entry.spec, ctx.pool)
 }
 
 /**
@@ -238,12 +275,13 @@ export async function readPoolReferences(ctx: PoolReferenceContext): Promise<Poo
     }
   }
 
-  // --- ANAS mounts (fstab) whose mountpoint is under the pool ---------------
+  // --- ANAS mounts (fstab) whose mountpoint is under the pool — never the
+  // pool's own filesystem (cr.31 D3) ------------------------------------------
   if (ctx.fstabPath) {
     const fstabText = await readConfigOr(ctx.fstabPath)
     if (fstabText.readable) {
       for (const entry of parseFstab(fstabText.text)) {
-        if (onPoolPath(entry.mountpoint))
+        if (onPoolPath(entry.mountpoint) && !isOwnMount(entry, ctx))
           refs.push({ kind: 'mount', name: entry.mountpoint, path: entry.mountpoint })
       }
     }
