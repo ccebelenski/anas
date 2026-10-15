@@ -184,7 +184,7 @@ territory is read-only and hands-off").
 
 ### 2.3 AHR (`routes/ahr-*.ts`)
 
-Status 2026-10-15: the Missing cells of this table are closed by cr.38 sessions A and B (the access row by cr.37), except that AHR mountpoint, remount and snapshot rollback do not yet disclose an unreadable LIO tree; the table is the pre-implementation snapshot.
+Status 2026-10-15: the Missing cells of this table are closed by cr.38 sessions A and B (the access row by cr.37); the table is the pre-implementation snapshot.
 
 | Verb → op | Confirm | RT gates | Job re-runs | Missing | Runs for |
 |---|---|---|---|---|---|

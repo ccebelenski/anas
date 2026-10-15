@@ -20,7 +20,7 @@ import { readDatasetGuid, readPoolGuid, readRollbackIds } from '../safety/stable
 import { createAccessService, SET_ACCESS_PRESENTATION_ONLY, signedAccessRequest } from '../services/access.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
-import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
+import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { readIscsiState, withIscsiLock } from '../services/iscsi-mutate.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
 import { loadPveFootprint, pveDescendantsUnlistedMessage, pveNamingGuardMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
@@ -41,9 +41,6 @@ const POOL_PART_END = /[/@#]/
 
 /** A createtxg as `zfs list -Hp` prints it. */
 const TXG_RE = /^\d+$/
-
-/** The advisory key of the LIO-unreadable disclosure (the dataset destroy confirm). */
-const LIO_UNREADABLE_KEY = 'lio-unreadable'
 
 /**
  * Story cr.37 (WAVE3-DESIGN §5.2 rule 1): the request fields the dataset
@@ -740,15 +737,13 @@ export async function datasetRoutes(
   /**
    * Fail-open is not fail-silent (D3): a broken claims read reads as "nothing
    * held", which a dataset genuinely serving a LUN would look exactly like —
-   * `zfs destroy` succeeds silently under a live session (GT-40).
+   * `zfs destroy` succeeds silently under a live session (GT-40). The key, the
+   * sentence and the read-failed test are the one shared helper in
+   * `services/iscsi-held.ts`; this adapter only supplies the per-run cache and
+   * the family's noun.
    */
-  async function lioUnreadableAdvisory(reads: GuardReads): Promise<Advisory[]> {
-    if (!(await (await dsReads.claims(reads)).readFailed()))
-      return []
-    return [{
-      key: LIO_UNREADABLE_KEY,
-      warning: 'ANAS could not check whether an iSCSI LUN is served from this dataset — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.',
-    }]
+  async function lioUnreadableDisclosure(reads: GuardReads): Promise<Advisory[]> {
+    return lioUnreadableAdvisory(await dsReads.claims(reads), 'dataset')
   }
 
   /**
@@ -791,7 +786,7 @@ export async function datasetRoutes(
         ...(recursive ? [ownedDescendantGate('Destroy')] : []),
         destroyLunGate(recursive),
       ],
-      advisories: (_o, reads) => lioUnreadableAdvisory(reads),
+      advisories: (_o, reads) => lioUnreadableDisclosure(reads),
       // §4.2: exclusive on the dataset, which excludes every verb on a
       // descendant (each holds this key shared, as an ancestor).
       locks: (o, _bound, reads) => datasetClaims(reads, [[o.name, 'exclusive']]),
@@ -907,7 +902,7 @@ export async function datasetRoutes(
       gates: [ownedGate<SnapshotObject>(o => o.dataset), rollbackLunGate],
       // cr.37 review (P1): the same LIO-unreadable disclosure destroy gives —
       // the rollback gate reads LIO exactly as fail-open, so it warns the same.
-      advisories: (_o, reads) => lioUnreadableAdvisory(reads),
+      advisories: (_o, reads) => lioUnreadableDisclosure(reads),
       // §4.2: a rollback rewrites the dataset, exclusive.
       locks: (o, _bound, reads) => datasetClaims(reads, [[o.dataset, 'exclusive']]),
     }
@@ -1084,7 +1079,7 @@ export async function datasetRoutes(
       gates: [listedGate(false, 'set'), ownedGate<DatasetObject>(o => o.name), propertyKindGate(props), shrinkGate(props)],
       // cr.37 review (P1): shrinkGate's held-LUN read is the same fail-open
       // read destroy's is — disclose an unreadable LIO tree the same way.
-      advisories: (_o, reads) => lioUnreadableAdvisory(reads),
+      advisories: (_o, reads) => lioUnreadableDisclosure(reads),
       locks: (o, _bound, reads) => datasetClaims(reads, [[o.name, 'exclusive']]),
     }
   }

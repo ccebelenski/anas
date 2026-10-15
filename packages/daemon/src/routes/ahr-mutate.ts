@@ -16,7 +16,7 @@ import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
 import { ahrnameClaim, diskClaim, guardCheck, guardConfirm, guarded, mountClaim, sendRefusal } from '../safety/guard.js'
 import { changeAhrMountpoint, createAhrPool, remountAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
-import { AHR_LIO_UNREADABLE_KEY, AHR_LIO_UNREADABLE_WARNING, ahrGuard, ahrPoolHeldByLun } from '../services/ahr-guard.js'
+import { ahrGuard, ahrPoolHeldByLun } from '../services/ahr-guard.js'
 import { ahrNameOccupancy, isIntentStaleForPool } from '../services/ahr-identity.js'
 import { defaultAhrIntentDir, readIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
@@ -28,7 +28,7 @@ import { attributeScrub, pathExists, runningAhrCheck, scrubAhrPool } from '../se
 import { topLevelMountPath } from '../services/ahr-snapshots.js'
 import { AHR_FINDMNT_ARGS } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
-import { heldByLun } from '../services/iscsi-held.js'
+import { heldByLun, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
 import { normalizeMountpointPath } from '../services/mounts.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
@@ -730,6 +730,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         guard.systemPoolGate,
         guard.lunGate('Changing', pool => `the mountpoint of AHR pool '${pool.name}'`),
       ],
+      // D3, cr.38r: the LUN gate just FAILED OPEN on a broken claims read —
+      // nothing held, exactly what a node genuinely serving a LUN would look
+      // like. Warn, never refuse; the job reports any the confirm did not list.
+      advisories: async (_pool, reads) => lioUnreadableAdvisory(await guard.reads.claims(reads), 'pool'),
       locks: async (pool, bound) => guard.claims(pool, bound, 'exclusive', { extra: [mountClaim(normalizeMountpointPath(mp))] }),
     }
     const pre = await guardCheck(spec)
@@ -745,6 +749,8 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       warnings: [
         `Anything serving from '${pool.mountpoint}' (shares, backups, mounts) stops working until re-pointed at '${mp}'`,
         pool.mounted ? 'The filesystem is unmounted during the move. Open files will block it (retry after closing them)' : 'The pool is currently unmounted. Only fstab is rewritten, then the filesystem mounts at the new path',
+        // D3: the LIO-unreadable disclosure rides the confirm warnings too.
+        ...pre.advisories.map(a => a.warning),
       ],
     })) {
       return reply
@@ -755,13 +761,21 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       { ...identity, params: { name, mountpoint: mp } },
       // The pool as the job read it: its mountpoint and mount state NOW, never
       // the route's (an unmount between the two is not the job's to undo).
-      guarded(spec, pre, async (live, { updateProgress }) => changeAhrMountpoint(
-        executor,
-        { name: live.name, mountpoint: live.mountpoint, mounted: live.mounted, subvolLayout: live.subvolLayout },
-        mp,
-        updateProgress,
-        { fstabPath },
-      )),
+      guarded(spec, pre, async (live, { updateProgress, newAdvisories }) => {
+        const result = await changeAhrMountpoint(
+          executor,
+          { name: live.name, mountpoint: live.mountpoint, mounted: live.mounted, subvolLayout: live.subvolLayout },
+          mp,
+          updateProgress,
+          { fstabPath },
+        )
+        // D3 (cr.38r): the job re-read the advisories under its lock — a
+        // claims read that broke since the confirm rides the result (destroy
+        // and repair already do).
+        return newAdvisories.length > 0
+          ? { ...result, warnings: [...((result as { warnings?: string[] }).warnings ?? []), ...newAdvisories] }
+          : result
+      }),
       { locks: pre.locks },
     )
     reply.code(202)
@@ -835,6 +849,9 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         guard.systemPoolGate,
         guard.lunGate('Remounting'),
       ],
+      // D3, cr.38r: the LUN gate above FAILED OPEN on a broken claims read —
+      // warn, never refuse; the job reports any the confirm did not list.
+      advisories: async (_pool, reads) => lioUnreadableAdvisory(await guard.reads.claims(reads), 'pool'),
       locks: async (pool, bound) => guard.claims(pool, bound, 'exclusive'),
     }
     const pre = await guardCheck(spec)
@@ -850,6 +867,8 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         `Open share handles break: '${pre.object.mountpoint}' is unmounted and mounted again, and anything holding a file open on it — SMB and NFS clients, a backup mid-run, a running job — loses it`,
         'This is the only way back: btrfs refuses `mount -o remount,rw` after an I/O error, so a plain remount cannot clear the read-only flag',
         'Fix the cause first if you have not: a pool that is read-only again after this has an error it is still meeting',
+        // D3: the LIO-unreadable disclosure rides the confirm warnings too.
+        ...pre.advisories.map(a => a.warning),
       ],
     })) {
       return reply
@@ -858,7 +877,15 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const job = jobQueue.submit(
       'ahr.remount',
       { ...identity, params: { name } },
-      guarded(spec, pre, async (live, { updateProgress }) => remountAhrPool(executor, { name: live.name, mountpoint: live.mountpoint }, updateProgress)),
+      guarded(spec, pre, async (live, { updateProgress, newAdvisories }) => {
+        const result = await remountAhrPool(executor, { name: live.name, mountpoint: live.mountpoint }, updateProgress)
+        // D3 (cr.38r): a claims read that broke since the confirm rides the
+        // result (the remount's own post-mount check may fail first — the
+        // advisory is dropped then, as the report of the run's outcome must).
+        return newAdvisories.length > 0
+          ? { ...result, warnings: [...((result as { warnings?: string[] }).warnings ?? []), ...newAdvisories] }
+          : result
+      }),
       { locks: pre.locks },
     )
     reply.code(202)
@@ -889,9 +916,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
    */
   async function destroyAdvisories(pool: AhrPool, reads: GuardReads): Promise<Advisory[]> {
     const read = await ahrPoolReferences(pool)
-    const advisories: Advisory[] = []
-    if (await (await guard.reads.claims(reads)).readFailed())
-      advisories.push({ key: AHR_LIO_UNREADABLE_KEY, warning: AHR_LIO_UNREADABLE_WARNING })
+    const advisories: Advisory[] = [...(await lioUnreadableAdvisory(await guard.reads.claims(reads), 'pool'))]
     // ident.3 (deliberate): the running-intent gate reads a corrupt intent file
     // as "no expansion" so the pool stays destroyable — refusing over it would
     // leave the pool undestroyable. Deliberate is not silent: disclosed here,
@@ -1243,9 +1268,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       // over a file a live session may be holding. The gate above refuses the
       // session case; this discloses the case the read could not see. Warn,
       // never refuse; the job reports any the confirm did not list.
-      advisories: async (_pool, reads) => (await (await guard.reads.claims(reads)).readFailed())
-        ? [{ key: AHR_LIO_UNREADABLE_KEY, warning: AHR_LIO_UNREADABLE_WARNING }]
-        : [],
+      advisories: async (_pool, reads) => lioUnreadableAdvisory(await guard.reads.claims(reads), 'pool'),
       locks: async (pool, bound) => guard.claims(pool, bound, 'shared'),
     }
     const pre = await guardCheck(spec)

@@ -23,7 +23,7 @@ import { readPoolGuid } from '../safety/stable-id.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
-import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
+import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal, LIO_UNREADABLE_KEY, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { normalizeMountpointPath } from '../services/mounts.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
 import { loadPveFootprint, systemPoolRefusalFrom } from '../services/pve-footprint.js'
@@ -59,11 +59,6 @@ const VDEV_NAME_RE = /^[\w-]+$/
 const VDEV_REMOVE_SETTLE_MS = 10_000
 /** Gap between the settle re-reads. */
 const VDEV_REMOVE_POLL_MS = 250
-
-/** The advisory key of the LIO-unreadable disclosure (export/destroy confirms). */
-const LIO_UNREADABLE_KEY = 'lio-unreadable'
-/** Fail-open is not fail-silent (D3): what the confirm says when the claims read broke. */
-const LIO_UNREADABLE_WARNING = 'ANAS could not check whether an iSCSI LUN is served from this pool — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.'
 
 /**
  * Story cr.32 (WAVE3-DESIGN §5.2 rule 1): the request fields the export and
@@ -1103,8 +1098,7 @@ export async function poolRoutes(
       ...read.refs.map(ref => ({ key: `ref:${poolReferenceKey(ref)}`, warning: poolReferenceWarning(ref) })),
       ...read.unreadableSources.map(src => ({ key: `unreadable:${src.kind}`, warning: poolUnreadableWarning(src, pool.name) })),
     ]
-    if (await (await poolReads.claims(reads)).readFailed())
-      advisories.push({ key: LIO_UNREADABLE_KEY, warning: LIO_UNREADABLE_WARNING })
+    advisories.push(...(await lioUnreadableAdvisory(await poolReads.claims(reads), 'pool')))
     return advisories
   }
 

@@ -16,6 +16,7 @@ import {
   rollbackAhrSnapshot,
 } from '../services/ahr-snapshots.js'
 import { readAhrPools } from '../services/ahr-topology.js'
+import { lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -268,6 +269,10 @@ export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapsh
       operation: 'ahr.snapshot.rollback',
       object: guard.poolView(poolName, 'a rollback'),
       gates: [...SNAPSHOT_GATES, guard.systemPoolGate, guard.lunGate('Rolling back'), snapshotExistsGate(snap)],
+      // D3, cr.38r: the system-pool and LUN gates just ran on a claims read
+      // that may have FAILED OPEN — warn, never refuse; the job reports any
+      // the confirm did not list.
+      advisories: async (_pool, reads) => lioUnreadableAdvisory(await guard.reads.claims(reads), 'pool'),
       locks: async (pool, bound) => guard.claims(pool, bound, 'exclusive'),
     }
     const pre = await guardCheck(spec)
@@ -283,6 +288,8 @@ export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapsh
         `The pool at '${pre.object.mountpoint}' is briefly UNMOUNTED during the swap — anything serving from it (shares, backups, mounts) stalls; open files block the unmount (retry after closing them). It remounts automatically at the end.`,
         `Nothing is destroyed: the current @data is PRESERVED as a 'pre-rollback-<timestamp>' snapshot, so you can roll back to it to undo this. Delete it later to reclaim its space.`,
         `After rollback, @data becomes a writable copy of '${snap}'; changes made since that snapshot are no longer live (but remain in the preserved pre-rollback snapshot).`,
+        // D3: the LIO-unreadable disclosure rides the confirm warnings too.
+        ...pre.advisories.map(a => a.warning),
       ],
     })) {
       return reply
@@ -293,7 +300,14 @@ export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapsh
       { ...identity, params: { pool: poolName, snap } },
       // The pool as the job read it (§2.3: the swap's unmount used the
       // request-time `mounted`, outside the lock).
-      guarded(spec, pre, async (live, { updateProgress }) => rollbackAhrSnapshot(executor, live, snap, updateProgress, svc)),
+      guarded(spec, pre, async (live, { updateProgress, newAdvisories }) => {
+        const result = await rollbackAhrSnapshot(executor, live, snap, updateProgress, svc)
+        // D3 (cr.38r): a claims read that broke since the confirm rides the
+        // result, as destroy's does.
+        return newAdvisories.length > 0
+          ? { ...result, warnings: [...((result as { warnings?: string[] }).warnings ?? []), ...newAdvisories] }
+          : result
+      }),
       { locks: pre.locks },
     )
     reply.code(202)

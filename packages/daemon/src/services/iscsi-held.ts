@@ -34,6 +34,7 @@
 
 import type { IscsiClaim, IscsiHeldByLun } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { Advisory } from '../safety/guard.js'
 import type { ConfigfsOptions } from './iscsi-configfs.js'
 import type { IscsiPaths } from './iscsi.js'
 import { iscsiClaims, readIscsiState } from './iscsi-mutate.js'
@@ -216,6 +217,40 @@ export async function heldByLunOnce(
   paths: IscsiPaths = {},
 ): Promise<IscsiHeldByLun | null> {
   return heldByLun(createIscsiClaimCache(executor, paths), subject)
+}
+
+// ---------------------------------------------------------------------------
+// The LIO-unreadable disclosure (D3) — one key, one sentence, one advisory
+// ---------------------------------------------------------------------------
+
+/**
+ * The advisory key of the LIO-unreadable disclosure (D3). A broken claims read
+ * fail-opens to "nothing held", which a node genuinely serving a LUN would look
+ * exactly like — so the confirm doors that are about to hand the operator a
+ * code say "ANAS could not check" instead of letting a broken read impersonate
+ * a node with no LIO. ONE key shared by every guard that runs the LUN gate and
+ * discloses its failure (the ZFS destroy/export/rollback/property-set doors and
+ * every AHR verb); the job's `newAdvisories` re-read reports a key the confirm
+ * did not list.
+ */
+export const LIO_UNREADABLE_KEY = 'lio-unreadable'
+
+/** The disclosure sentence, worded for the family the guard names (`pool`, `dataset`). */
+export function lioUnreadableWarning(noun: 'pool' | 'dataset'): string {
+  return `ANAS could not check whether an iSCSI LUN is served from this ${noun} — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.`
+}
+
+/**
+ * The disclosure advisory over a claims read: an empty list when the read
+ * succeeded (a healthy LIO discloses nothing — the warning rides the failure,
+ * not the LIO), the one advisory when it failed. The noun parameter keeps each
+ * family's words ("pool", "dataset") next to the policy that decides the
+ * advisory, so a new door cannot re-type either.
+ */
+export async function lioUnreadableAdvisory(cache: IscsiClaimCache, noun: 'pool' | 'dataset'): Promise<Advisory[]> {
+  if (!(await cache.readFailed()))
+    return []
+  return [{ key: LIO_UNREADABLE_KEY, warning: lioUnreadableWarning(noun) }]
 }
 
 // ---------------------------------------------------------------------------

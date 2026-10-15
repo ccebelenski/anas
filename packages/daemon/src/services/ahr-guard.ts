@@ -89,9 +89,12 @@ export function expansionStateRefusal(pool: Pick<AhrPool, 'name' | 'state' | 'ar
   return { status: 409, code: 'CONFLICT', message: `Cannot expand: ${what}. ${why} This refusal has no confirm bypass.` }
 }
 
-/** The advisory key and sentence for an unreadable LIO tree (the pools.ts pair, AHR's words). */
-export const AHR_LIO_UNREADABLE_KEY = 'lio-unreadable'
-export const AHR_LIO_UNREADABLE_WARNING = 'ANAS could not check whether an iSCSI LUN is served from this pool. The LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.'
+/**
+ * The LIO-unreadable disclosure advisory, shared by every AHR verb and the
+ * ZFS doors — the key, the sentence and the read-failed test live in ONE place
+ * (`services/iscsi-held.ts`), so a new door cannot drift the wording.
+ */
+export { lioUnreadableAdvisory } from './iscsi-held.js'
 
 export interface AhrGuardDeps {
   executor: CommandExecutor
