@@ -424,7 +424,9 @@ Locks do not fix a different starvation: four long data movers fill all 4 slots 
 for a slot, not for a lock (Run Now holds two: the supervisor and the direct run, `queue.ts:147-151`). **Recommendation:** a
 job declares a lane (`'long'` for the data movers, the AHR long verbs and the supervisors), and `drain`
 starts a long job only while fewer than 3 slots hold long jobs, so one slot is always free for short
-verbs. This is a two-line change in `drain` and is in cr.33.
+verbs. This is a two-line change in `drain` and is in cr.33. (Superseded for the supervisors by cr.49, ruled
+2026-10-15: they ride a `watch` lane with slots of their own beyond the 4 — see DESIGN.md "Per-object locks and the
+long lane".)
 
 ### 4.4 Failure modes of the lock
 

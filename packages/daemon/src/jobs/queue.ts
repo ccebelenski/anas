@@ -9,12 +9,22 @@ import { conflicts, LockTable, normaliseClaims } from './locks.js'
 export type { LockClaim, LockMode } from './locks.js'
 
 /**
- * How long a job runs (cr.33, WAVE3-DESIGN §4.3). `long` is for the data
- * movers and the supervisors of their runs (replication, backup, cloud sync,
- * restores, Run Now): they may fill at most {@link JobQueue.longSlots} of the
+ * How long a job runs, and what it does meanwhile (cr.33, WAVE3-DESIGN §4.3).
+ * `long` is for the data movers (replication, backup, cloud sync, restores,
+ * the AHR long verbs): they may fill at most {@link JobQueue.longSlots} of the
  * slots (3 of 4), so a short verb is never stuck behind four of them.
+ *
+ * `watch` (cr.49, ruled 2026-10-15) is for a job that only WATCHES work it
+ * started elsewhere — the Run-Now supervisor, which starts the task's unit and
+ * polls it while the unit submits the direct run back as a `long` job. A watch
+ * job is an ordinary queue job (same submit, record, cancel and poll), but it
+ * runs in its own {@link JobQueue.watchSlots} slots BEYOND the 4: it never
+ * counts against the 4 or the long cap, so a direct run never waits behind
+ * its own supervisor. It takes no lock claims (refused at submit): it changes
+ * nothing, and a supervisor holding a key its direct run needs would deadlock
+ * the two (cr.33b).
  */
-export type JobLane = 'short' | 'long'
+export type JobLane = 'short' | 'long' | 'watch'
 
 /** What `submit` takes beside the operation, the submitter and the body. */
 export interface SubmitOptions {
@@ -26,7 +36,7 @@ export interface SubmitOptions {
    * no slot, and its progress line names the job it waits for.
    */
   locks?: readonly LockClaim[]
-  /** `long` for data movers and run supervisors (default `short`). */
+  /** `long` for data movers, `watch` for run supervisors (default `short`). */
   lane?: JobLane
 }
 
@@ -209,11 +219,22 @@ export class JobQueue {
   private running = 0
   /** Slots held by `long` jobs (cr.33). */
   private runningLong = 0
+  /** Watch-lane slots in use (cr.49): counted apart from `running`. */
+  private runningWatch = 0
   private audit?: AuditLogger
   private readonly locks = new LockTable()
   private readonly abandoned: AbandonedRegistry
   /** At most this many slots run `long` jobs: one slot is always left for short verbs. */
   readonly longSlots: number
+  /**
+   * Watch-lane slots, beyond the {@link concurrency} slots (cr.49). Default 8:
+   * a supervisor is one `systemctl show` every 2 s, so eight cost at most four
+   * cheap execs a second, and eight is more Run Nows than the long lane can
+   * run at once (3) with room for a burst of "Run Now on every task". Past it
+   * a supervisor waits `queued` for a watch slot — it never waits for, nor
+   * holds, a regular slot or a lock, so the lanes cannot deadlock each other.
+   */
+  readonly watchSlots: number
   /** The lock FIFO's counter: submissions and re-acquires draw from it. */
   private seq = 0
 
@@ -225,12 +246,15 @@ export class JobQueue {
     abandoned?: AbandonedRegistry
     /** Default: one less than `concurrency`, and at least 1. */
     longSlots?: number
+    /** Default 8 (cr.49): slots for `watch` jobs, outside `concurrency`. */
+    watchSlots?: number
   }) {
     this.concurrency = opts?.concurrency ?? 4
     this.maxRetained = opts?.maxRetained ?? 1000
     this.audit = opts?.audit
     this.abandoned = opts?.abandoned ?? abandonedChildren
     this.longSlots = opts?.longSlots ?? Math.max(1, this.concurrency - 1)
+    this.watchSlots = opts?.watchSlots ?? 8
   }
 
   /**
@@ -239,12 +263,14 @@ export class JobQueue {
    * `control: true` (rclone.5) starts the job AT ONCE, outside the concurrency
    * limit, and does not occupy a slot. It exists for one job: the cancel of a
    * running job. A cancel queued behind the very runs it is meant to stop
-   * (a Run-Now holds two slots — its supervisor and the direct run) would wait
-   * for them; it is short and bounded (two signal waits), so it never needs a
-   * slot of its own.
+   * (a Run-Now is two jobs — its supervisor in the watch lane and the direct
+   * run in the long lane) would wait for them; it is short and bounded (two
+   * signal waits), so it never needs a slot of its own.
    *
-   * `locks` and `lane` (cr.33): see {@link SubmitOptions}. A control job takes
-   * no locks — it must never wait behind the job it is meant to stop.
+   * `locks` and `lane` (cr.33, cr.49): see {@link SubmitOptions}. A control
+   * job and a watch job take no locks — the one must never wait behind the job
+   * it is meant to stop, the other only watches and must never hold a key the
+   * run it watches needs.
    */
   submit(
     operation: string,
@@ -254,6 +280,8 @@ export class JobQueue {
   ): JobRef {
     if (opts.control && (opts.locks?.length ?? 0) > 0)
       throw new TypeError(`job '${operation}': a control job takes no locks`)
+    if (opts.lane === 'watch' && (opts.locks?.length ?? 0) > 0)
+      throw new TypeError(`job '${operation}': a watch-lane job takes no locks`)
     const id = randomUUID()
     const now = new Date().toISOString()
 
@@ -508,7 +536,8 @@ export class JobQueue {
    * Start every queued job that can start (cr.33, WAVE3-DESIGN §4.1–§4.3), in
    * submission order. A job starts when
    *
-   *  - a slot is free, and for a `long` job fewer than {@link longSlots} run;
+   *  - a slot is free, and for a `long` job fewer than {@link longSlots} run
+   *    (a `watch` job counts only against {@link watchSlots}, cr.49);
    *  - EVERY claim is grantable now (all-or-nothing: a job never holds one key
    *    while it waits for another, so no deadlock is possible);
    *  - no EARLIER queued job has a conflicting claim on any of its keys
@@ -542,14 +571,21 @@ export class JobQueue {
         continue
       }
 
-      const slotFree = this.running < this.concurrency
-        && (record.lane !== 'long' || this.runningLong < this.longSlots)
+      const slotFree = record.lane === 'watch'
+        ? this.runningWatch < this.watchSlots
+        : this.running < this.concurrency
+          && (record.lane !== 'long' || this.runningLong < this.longSlots)
       if (!wait && slotFree) {
         this.locks.grant(record.job, record.claims)
         record.lockState = 'held'
-        this.running++
-        if (record.lane === 'long')
-          this.runningLong++
+        if (record.lane === 'watch') {
+          this.runningWatch++
+        }
+        else {
+          this.running++
+          if (record.lane === 'long')
+            this.runningLong++
+        }
         this.start(record)
         continue
       }
@@ -792,7 +828,11 @@ export class JobQueue {
     }
     finally {
       job.completedAt = new Date().toISOString()
-      if (!record.control) {
+      // A control job took no slot; a watch job took one of its own (cr.49).
+      if (!record.control && record.lane === 'watch') {
+        this.runningWatch--
+      }
+      else if (!record.control) {
         this.running--
         if (record.lane === 'long')
           this.runningLong--
