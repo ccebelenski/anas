@@ -70,9 +70,17 @@ export interface ServerOptions {
   smbConfPath?: string
 }
 
+/** Longest path param a route accepts: PATH_MAX (4096), percent-encoded. */
+export const PATH_PARAM_MAX = 3 * 4096
+
 export function createServer(opts?: ServerOptions) {
   const server = Fastify({
     logger: opts?.logger ?? true,
+    // A path param carries a URL-encoded object id — a mountpoint, an NFS
+    // export path — and Fastify's default cap (100 characters) silently
+    // turns a longer one into a route-not-found 404 (found by cr.39). PATH_MAX
+    // is 4096, and percent-encoding can triple it.
+    maxParamLength: PATH_PARAM_MAX,
   })
 
   // cr.26 (review H1, third bullet; WAVE2-DESIGN §3, "the daemon refuses

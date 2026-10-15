@@ -50,7 +50,10 @@ export function createServer(opts: ServerOptions = {}) {
 
   // pveproxy terminates TLS at :8006 and forwards to this loopback service, so
   // the gateway is a plain-HTTP internal service — no TLS, no public origin.
-  const server = Fastify({ logger: opts.logger ?? true })
+  // The forwarded path carries URL-encoded object ids (mountpoints, export
+  // paths); Fastify's default 100-character param cap would 404 a long one
+  // before it reached the daemon. PATH_MAX (4096), percent-encoded.
+  const server = Fastify({ logger: opts.logger ?? true, maxParamLength: 3 * 4096 })
 
   // Pure gateway: never parse bodies — forward them verbatim as raw Buffers.
   server.removeAllContentTypeParsers()

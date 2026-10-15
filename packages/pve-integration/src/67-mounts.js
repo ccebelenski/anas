@@ -974,10 +974,12 @@
             // A plain mount is a safe op — no confirm gate.
             ANAS.runJob(opts);
         } else {
-            // Unmount of a busy mount → 409 with the holding-process list; the
-            // standard confirm dialog surfaces those warnings before force/lazy.
-            opts.confirmTitle = 'Unmount busy filesystem';
-            opts.confirmIntro = t('Processes are using this mount:');
+            // Unmount confirms when the mount is busy or something rides the
+            // path (cr.39): the 409's headline says which, and its warnings
+            // list the holders and the shares/exports/tasks on the path.
+            opts.confirmTitle = 'Unmount';
+            opts.confirmIntro = t('Before this mount is unmounted:');
+            opts.confirmHeadline = true;
             ANAS.confirmAndRun(opts);
         }
     }
@@ -1011,7 +1013,8 @@
         };
         if (disabling) {
             opts.confirmTitle = 'Disable mount';
-            opts.confirmIntro = t('Processes are using this mount:');
+            opts.confirmIntro = t('Before this mount is disabled:');
+            opts.confirmHeadline = true;
             ANAS.confirmAndRun(opts);
         } else {
             ANAS.runJob(opts);
@@ -1031,16 +1034,17 @@
     // Fire the DELETE. `removeDir` appends the daemon's opt-in flag.
     function runRemoveMount(view, node, mp, removeDir) {
         var grid = mountsGridOf(view);
-        // Busy → 409 with holding processes; confirmAndRun surfaces them and
-        // resends with the confirm code (force/lazy behind the gate,
-        // daemon-side) — the flag rides the path, so it survives the resend.
+        // Remove always confirms (cr.39): the 409 names the holders and what
+        // rides the path; confirmAndRun resends with the code, which binds the
+        // removeMountpointDir flag riding the path.
         ANAS.confirmAndRun({
             node: node,
             method: 'del',
             path: '/mounts/' + encMp(mp) + (removeDir ? '?removeMountpointDir=true' : ''),
             view: grid,
-            confirmTitle: 'Remove busy mount',
-            confirmIntro: t('Processes are using this mount:'),
+            confirmTitle: 'Remove mount',
+            confirmIntro: t('Before this mount is removed:'),
+            confirmHeadline: true,
             failTitle: 'Remove failed',
             successMsg: t('Removed') + ' ' + mp,
             onComplete: function (job) {
