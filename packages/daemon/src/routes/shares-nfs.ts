@@ -2,12 +2,15 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { AccessService } from '../services/access.js'
+import { createHash } from 'node:crypto'
 import { AbsolutePath, CreateNfsExportRequest, EXPORT_PATH_MSG, isExportPath, UpdateNfsExportRequest } from '@anas/shared'
-import { addExport, hasExport, parseExports, removeExport, replaceExport } from '../parsers/exports.js'
-import { confirmGate } from '../safety/gate.js'
+import { addExport, hasExport, parseExports, parseExportsDoc, removeExport, replaceExport } from '../parsers/exports.js'
+import { guardCheck, guardConfirm, guarded, GuardRefusalError, nfsShareClaim, sendRefusal } from '../safety/guard.js'
 import { createAccessService } from '../services/access.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
+import { normalizeMountpointPath } from '../services/mounts.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
 import { probeSharePath, probeSharePaths, sharePathFields } from '../services/share-path.js'
 import { requireIdentity } from './identity.js'
@@ -37,6 +40,96 @@ export async function nfsExportRoutes(
     const r = await executor.exec(EXPORTFS, ['-ra'])
     const errors = r.stderr.split('\n').map(l => l.trim()).filter(l => l !== '')
     return { ok: r.exitCode === 0, errors, message: r.stderr.trim() || `exportfs -ra exited with code ${r.exitCode}` }
+  }
+
+  // --- The export guard specs (story cr.43, WAVE3-DESIGN §2.5/§3.3, ruling (j))
+  //
+  // One spec per verb, both doors: the route answers a refusal in the request,
+  // the job re-reads /etc/exports and refuses again before it writes — item 1
+  // (vanished export) included. The reads never return null: absence lives in
+  // the per-verb existence gate carrying the routes' existing sentence. A
+  // vanished update fails the JOB with NOT_FOUND through the revision —
+  // reverify checks the revision before the gates, and a throwing revision
+  // getter is the settled mechanism (the route door never reaches it:
+  // guardCheck runs the gates first).
+  //
+  // Item 3 needs nothing here beyond submitting with `{ locks: pre.locks }`:
+  // the whole job body — the cr.13 `exportfs -ra` baseline included, and its
+  // semantics are untouched — now runs while the export's lock is held.
+
+  interface NfsExportObject { path: string, text: string }
+
+  const exportNotFound = (path: string): Refusal =>
+    ({ status: 404, code: 'NOT_FOUND', message: `Export '${path}' not found` })
+
+  /** sha256 of the export's own line in the file, or null when the line is gone. */
+  function exportLineRevision(text: string, path: string): string | null {
+    for (const line of parseExportsDoc(text)) {
+      if (line.kind === 'export' && line.path === path)
+        return createHash('sha256').update(line.raw).digest('hex')
+    }
+    return null
+  }
+
+  function nfsExportView(path: string): ObjectView<NfsExportObject> {
+    return {
+      what: `NFS export ${path}`,
+      read: async reads => ({ path, text: await reads.once('exports', () => readConfig(exportsPath)) }),
+      id: async () => ({ path }),
+      unbound: part => part === 'revision'
+        ? `Could not read the /etc/exports line of '${path}' — refusing an edit that cannot be bound to it`
+        : `Could not read NFS export ${path} — refusing`,
+    }
+  }
+
+  function nfsUpdateGuardSpec(path: string): GuardSpec<NfsExportObject> {
+    return {
+      operation: 'nfs.export.set',
+      object: {
+        ...nfsExportView(path),
+        revision: async (o) => {
+          const revision = exportLineRevision(o.text, path)
+          // Vanished between confirmation and job: the job fails with the same
+          // NOT_FOUND the route answers, not STATE_CHANGED for a line the
+          // request was never computed from.
+          if (revision === null)
+            throw new GuardRefusalError(exportNotFound(path))
+          return revision
+        },
+      },
+      gates: [async o => (hasExport(o.text, path) ? null : exportNotFound(path))],
+      // The §4.2 key is the NORMALISED path, so `/tank//x/` cannot slip a
+      // second writer past the lock on a spelling of the same export.
+      locks: async () => [nfsShareClaim(normalizeMountpointPath(path))],
+    }
+  }
+
+  function nfsRemoveGuardSpec(path: string): GuardSpec<NfsExportObject> {
+    return {
+      operation: 'nfs.export.remove',
+      // A remove deletes the whole line — nothing survives to bind a revision
+      // to (the mounts precedent); the gate re-answers the 404.
+      object: nfsExportView(path),
+      gates: [async o => (hasExport(o.text, path) ? null : exportNotFound(path))],
+      locks: async () => [nfsShareClaim(normalizeMountpointPath(path))],
+    }
+  }
+
+  const exportExists = (path: string): Refusal =>
+    ({ status: 409, code: 'CONFLICT', message: `Export '${path}' already exists` })
+
+  function nfsCreateGuardSpec(path: string): GuardSpec<NfsExportObject> {
+    return {
+      operation: 'nfs.export.add',
+      // The object is the export-path SLOT (the mounts create precedent): a
+      // line there answers CONFLICT at the route, and item 2 runs the same
+      // gate again inside the job under the export's lock — a line added
+      // while the create waits refuses there, before its reload touches
+      // `exportfs` at all (no baseline runs for a create that never writes).
+      object: nfsExportView(path),
+      gates: [async o => (hasExport(o.text, path) ? exportExists(path) : null)],
+      locks: async () => [nfsShareClaim(normalizeMountpointPath(path))],
+    }
   }
 
   /**
@@ -162,25 +255,35 @@ export async function nfsExportRoutes(
       return { error: { code: 'VALIDATION_ERROR', message: `Export path '${exp.path}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims — exports cannot serve PVE territory` } }
     }
 
-    // 409 if the path is already exported — the file is the source of truth.
-    if (hasExport(await readConfig(exportsPath), exp.path)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Export '${exp.path}' already exists` } }
-    }
+    // Story cr.43 item 2: existence answers 409 CONFLICT at the route, and
+    // the same gate runs again in the job under the export's lock — a line
+    // that appears while the create waits refuses there, so no duplicate
+    // export line is ever written and a refused create never runs exportfs.
+    const spec = nfsCreateGuardSpec(exp.path)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'nfs.export.add',
       { ...identity, params: { path: exp.path } },
-      async (updateProgress) => {
+      // Ruling (j): the slot gate runs again here and the whole job holds the
+      // export's lock — a line that appeared while the create waited arrives
+      // as CONFLICT, before `exportfs -ra` runs even as the cr.13 baseline.
+      guarded(spec, pre, async (_export, { updateProgress }) => {
         updateProgress(`Adding NFS export ${exp.path}`)
         await editExportsWithReload((current) => {
-          // Re-check under the file lock — another writer may have won the race.
+          // The last-moment backstop (the mounts pattern): between the
+          // reverify read and this transform's own read a line for the path
+          // can still appear — the create refuses with the CONFLICT sentence
+          // and the file keeps its bytes.
           if (hasExport(current, exp.path))
-            throw new Error(`Export '${exp.path}' already exists`)
+            throw new GuardRefusalError(exportExists(exp.path))
           return addExport(current, exp)
         }, updateProgress)
         return { created: exp.path }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -242,23 +345,33 @@ export async function nfsExportRoutes(
     if (!identity)
       return
 
-    if (!hasExport(await readConfig(exportsPath), path)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Export '${path}' not found` } }
-    }
+    // Story cr.43: the line's existence answers 404 at the route, and the
+    // route's edit is bound to the line's revision — the job writes a merge
+    // of THIS line or refuses (NOT_FOUND when it vanished, STATE_CHANGED when
+    // a hand edit moved it under the request).
+    const spec = nfsUpdateGuardSpec(path)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'nfs.export.set',
       { ...identity, params: { path } },
-      async (updateProgress) => {
+      // Ruling (j): id, the line's revision and the existence gate run again
+      // here, and the whole job — the baseline reload included — holds the
+      // export's lock.
+      guarded(spec, pre, async (_exp, { updateProgress }) => {
         updateProgress(`Updating NFS export ${path}`)
         await editExportsWithReload((current) => {
+          // The last-moment backstop: gone since the reverify read — refuse
+          // with the 404 sentence and the file keeps its bytes.
           if (!hasExport(current, path))
-            throw new Error(`Export '${path}' not found`)
+            throw new GuardRefusalError(exportNotFound(path))
           return replaceExport(current, path, exp)
         }, updateProgress)
         return { updated: path }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -278,16 +391,19 @@ export async function nfsExportRoutes(
     if (!identity)
       return
 
-    if (!hasExport(await readConfig(exportsPath), path)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Export '${path}' not found` } }
-    }
+    // Story cr.43: the gate answers the 404 at the route; the job re-runs it
+    // under the export's lock, so removing an export that vanished while the
+    // job waited fails NOT_FOUND instead of reporting success.
+    const spec = nfsRemoveGuardSpec(path)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     // Removing an export is a live change: connected clients lose access on the
     // next `exportfs -ra`. Gate it behind a confirmation code (Principle 14).
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'nfs.export.remove',
-      params: { path },
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { path },
+      address: ['path'],
       message: `Removing NFS export '${path}' revokes access for its clients`,
       warnings: [
         `Export '${path}' will be removed from /etc/exports and unexported immediately.`,
@@ -300,11 +416,18 @@ export async function nfsExportRoutes(
     const job = jobQueue.submit(
       'nfs.export.remove',
       { ...identity, params: { path } },
-      async (updateProgress) => {
+      guarded(spec, pre, async (_exp, { updateProgress }) => {
         updateProgress(`Removing NFS export ${path}`)
-        await editExportsWithReload(current => removeExport(current, path), updateProgress)
+        await editExportsWithReload((current) => {
+          // Last-moment backstop: gone since the reverify read — refuse with
+          // the 404 sentence, the file keeps its bytes.
+          if (!hasExport(current, path))
+            throw new GuardRefusalError(exportNotFound(path))
+          return removeExport(current, path)
+        }, updateProgress)
         return { removed: path }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)

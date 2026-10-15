@@ -4,12 +4,15 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { SelfServiceKeys } from '../parsers/smb-conf.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { AccessService, GrantShare } from '../services/access.js'
+import { createHash } from 'node:crypto'
 import { rm, writeFile } from 'node:fs/promises'
 import { CreateSmbShareRequest, ShareName, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
-import { addMissingGrantParams, addShare, customVfsRefusal, getShare, hasCustomVfsObjects, hasShare, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
+import { addMissingGrantParams, addShare, customVfsRefusal, getShare, hasCustomVfsObjects, hasShare, parseDoc, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
 import { parseSmbStatusJson, parseSmbStatusText } from '../parsers/smbstatus.js'
 import { confirmGate } from '../safety/gate.js'
+import { guardCheck, guardConfirm, guarded, GuardRefusalError, sendRefusal, smbShareClaim } from '../safety/guard.js'
 import { createAccessService } from '../services/access.js'
 import { ConfigConflictError, editConfig, readConfig } from '../services/config-writer.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
@@ -109,6 +112,94 @@ export async function smbShareRoutes(
   /** Read smb.conf fresh every time — the file is the source of truth (P.11). */
   async function readSmbConf(): Promise<string> {
     return readConfig(smbConfPath)
+  }
+
+  // --- The share guard specs (story cr.43, WAVE3-DESIGN §2.5/§3.3, ruling (j))
+  //
+  // One spec per verb, both doors: the route answers a refusal in the request,
+  // the job re-reads smb.conf and refuses again before it writes — item 1
+  // (vanished share) included. The reads never return null: absence lives in
+  // the per-verb existence gate carrying the routes' existing sentence, which
+  // keeps the hasShare-vs-getShare asymmetry exactly where it is (PUT answers
+  // 404 when the stanza is gone, DELETE when it has no path to remove).
+  //
+  // A vanished update fails the JOB with NOT_FOUND, not success and not a
+  // false STATE_CHANGED: reverify checks the revision BEFORE the gates, and a
+  // throwing revision getter is the settled mechanism — so the update spec's
+  // revision throws the gate's own NOT_FOUND when the stanza is gone. (The
+  // route door never reaches it: guardCheck runs the gates first.)
+
+  interface SmbShareObject { name: string, text: string }
+
+  const shareNotFound = (name: string): Refusal =>
+    ({ status: 404, code: 'NOT_FOUND', message: `SMB share '${name}' not found` })
+
+  /** sha256 of the stanza's own lines (header through one-before-next), or null when gone. */
+  function stanzaRevision(text: string, name: string): string | null {
+    const doc = parseDoc(text)
+    const span = doc.sections.find(s => s.key === name.toLowerCase() && s.key !== 'global')
+    if (!span)
+      return null
+    return createHash('sha256').update(doc.lines.slice(span.start, span.end).join('\n')).digest('hex')
+  }
+
+  function smbShareView(name: string): ObjectView<SmbShareObject> {
+    return {
+      what: `SMB share '${name}'`,
+      read: async reads => ({ name, text: await reads.once('smbConf', () => readSmbConf()) }),
+      id: async () => ({ share: name }),
+      unbound: part => part === 'revision'
+        ? `Could not read SMB share '${name}' from smb.conf — refusing an edit that cannot be bound to it`
+        : `Could not read SMB share '${name}' — refusing`,
+    }
+  }
+
+  function smbUpdateGuardSpec(name: string): GuardSpec<SmbShareObject> {
+    return {
+      operation: 'smb.config.set',
+      object: {
+        ...smbShareView(name),
+        revision: async (o) => {
+          const revision = stanzaRevision(o.text, name)
+          // Vanished between confirmation and job: the job fails with the same
+          // NOT_FOUND the route answers, not with STATE_CHANGED for a line the
+          // request was never computed from.
+          if (revision === null)
+            throw new GuardRefusalError(shareNotFound(name))
+          return revision
+        },
+      },
+      gates: [async o => (hasShare(o.text, name) ? null : shareNotFound(name))],
+      locks: async () => [smbShareClaim(name)],
+    }
+  }
+
+  function smbRemoveGuardSpec(name: string): GuardSpec<SmbShareObject> {
+    return {
+      operation: 'smb.share.remove',
+      // A remove deletes the whole stanza — nothing survives to bind a
+      // revision to (the mounts precedent); the gate re-answers the 404.
+      object: smbShareView(name),
+      gates: [async o => (getShare(o.text, name) ? null : shareNotFound(name))],
+      locks: async () => [smbShareClaim(name)],
+    }
+  }
+
+  const shareExists = (name: string): Refusal =>
+    ({ status: 409, code: 'CONFLICT', message: `SMB share '${name}' already exists` })
+
+  function smbCreateGuardSpec(name: string): GuardSpec<SmbShareObject> {
+    return {
+      operation: 'smb.share.add',
+      // The object is the share-name SLOT (the mounts create precedent): a
+      // stanza there answers CONFLICT at the route, and item 2 runs the same
+      // gate again inside the job under the share's lock — a stanza added
+      // while the create waits refuses there, so no duplicate stanza is ever
+      // written. The job's transform carries the last-moment backstop.
+      object: smbShareView(name),
+      gates: [async o => (hasShare(o.text, name) ? shareExists(name) : null)],
+      locks: async () => [smbShareClaim(name)],
+    }
   }
 
   /**
@@ -462,12 +553,14 @@ export async function smbShareRoutes(
     if (await refuseSelfService(req.name, req.path, req, reply))
       return reply
 
-    // 409 if the share already exists — the config file is the source of truth.
-    const text = await readSmbConf()
-    if (hasShare(text, req.name)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `SMB share '${req.name}' already exists` } }
-    }
+    // Story cr.43 item 2: existence answers 409 CONFLICT at the route, and
+    // the same gate runs again in the job under the share's lock — a stanza
+    // that appears while the create waits refuses there, so no duplicate
+    // stanza is ever written.
+    const spec = smbCreateGuardSpec(req.name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     // The stanza's defaults are the ones `addShare` writes (DESIGN 5d).
     let recursiveConfirmed = false
@@ -481,13 +574,24 @@ export async function smbShareRoutes(
     const job = jobQueue.submit(
       'smb.share.add',
       { ...identity, params: { share: req.name, path: req.path } },
-      async (updateProgress) => {
+      // Ruling (j): the slot gate runs again here and the whole job holds the
+      // share's lock — a stanza that appeared while the create waited arrives
+      // as CONFLICT, before a line of smb.conf moves.
+      guarded(spec, pre, async (_share, { updateProgress }) => {
         try {
           await applySelfServiceAndEdit(
             req.name,
             req.path,
             req,
-            (current, keys) => addShare(current, req, keys),
+            (current, keys) => {
+              // The last-moment backstop (the mounts pattern): between the
+              // reverify read and this transform's own read a [name] stanza
+              // can still appear — the create refuses with the CONFLICT
+              // sentence and smb.conf keeps its bytes.
+              if (hasShare(current, req.name))
+                throw new GuardRefusalError(shareExists(req.name))
+              return addShare(current, req, keys)
+            },
           )
         }
         catch (err) {
@@ -504,7 +608,8 @@ export async function smbShareRoutes(
           return { created: req.name, grant }
         }
         return { created: req.name }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -531,11 +636,15 @@ export async function smbShareRoutes(
     if (!identity)
       return
 
-    const text = await readSmbConf()
-    if (!hasShare(text, name)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `SMB share '${name}' not found` } }
-    }
+    // Story cr.43: the stanza's existence answers 404 at the route, and the
+    // route's edit is bound to the stanza's revision — the job writes a merge
+    // of THIS stanza or refuses (NOT_FOUND when it vanished, STATE_CHANGED
+    // when a hand edit moved it under the request).
+    const spec = smbUpdateGuardSpec(name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const text = pre.object.text
 
     // The edit CAN move the path (UpdateSmbShareRequest carries an optional
     // one) — the same backstop as create applies when it does (pvepool.1
@@ -565,7 +674,10 @@ export async function smbShareRoutes(
     const job = jobQueue.submit(
       'smb.config.set',
       { ...identity, params: { share: name, config: req } },
-      async (updateProgress) => {
+      // Ruling (j): id, the stanza's revision and the existence gate run again
+      // here, and the whole job holds the share's lock — a hand edit while the
+      // job waited arrives as STATE_CHANGED, a vanished stanza as NOT_FOUND.
+      guarded(spec, pre, async (_share, { updateProgress }) => {
         // access.1: the stanza BEFORE the edit, so the grant runs only when
         // something it answers to actually changed.
         const before = req.grantAccess ? getShare(await readSmbConf(), name) : null
@@ -576,6 +688,12 @@ export async function smbShareRoutes(
             req.path ?? getShare(await readSmbConf(), name)?.path ?? '',
             req,
             (current, keys) => {
+              // The last-moment backstop (the mounts pattern): between the
+              // reverify read and this transform's own read the stanza can
+              // still go — the edit then refuses with the 404 sentence and
+              // smb.conf keeps its bytes.
+              if (!hasShare(current, name))
+                throw new GuardRefusalError(shareNotFound(name))
               const next = updateShare(current, name, req, keys)
               // live proof 0.4.3 F2, re-proof RF1: an edit that runs a grant
               // also writes `inherit acls`, `create mask` and `directory mask`,
@@ -601,7 +719,8 @@ export async function smbShareRoutes(
           return { updated: name, grant: await grantFor(after, req.grantAccess, updateProgress, recursiveConfirmed) }
         }
         return { updated: name }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -621,24 +740,31 @@ export async function smbShareRoutes(
     if (!identity)
       return
 
-    const text = await readSmbConf()
-    const share = getShare(text, name)
-    if (!share) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `SMB share '${name}' not found` } }
-    }
+    // Story cr.43: the gate answers the 404 at the route; the job re-runs it
+    // under the share's lock, so removing a share that vanished while the job
+    // waited fails NOT_FOUND instead of reporting success. (The gate is
+    // getShare, matching the route's historical 404 — a stanza without a
+    // shareable path is nothing to remove.)
+    const spec = smbRemoveGuardSpec(name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const share = getShare(pre.object.text, name)
+    if (!share)
+      return sendRefusal(reply, shareNotFound(name)) // the gate passed; TS narrowing
 
     const connections = await connectionsFor(share.name)
 
     const warnings = [
       `Removing SMB share '${name}' makes the shared path '${share.path}' inaccessible over SMB.`,
+      ...pre.advisories.map(a => a.warning),
     ]
     if (connections.length > 0)
       warnings.push(`${connections.length} active connection(s) to '${name}' will be terminated on reload.`)
 
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'smb.share.remove',
-      params: { share: name },
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { name },
+      address: ['name'],
       message: `Removing SMB share '${name}' stops sharing '${share.path}'`,
       warnings,
     })) {
@@ -648,16 +774,23 @@ export async function smbShareRoutes(
     const job = jobQueue.submit(
       'smb.share.remove',
       { ...identity, params: { share: name } },
-      async () => {
+      guarded(spec, pre, async () => {
         try {
-          await editSmbConf(current => removeShare(current, name))
+          await editSmbConf((current) => {
+            // Last-moment backstop: gone since the reverify read — refuse with
+            // the 404 sentence, the file keeps its bytes.
+            if (!getShare(current, name))
+              throw new GuardRefusalError(shareNotFound(name))
+            return removeShare(current, name)
+          })
         }
         catch (err) {
           throw asJobError(err)
         }
         await reloadSmbd()
         return { removed: name }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
