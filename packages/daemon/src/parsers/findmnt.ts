@@ -99,6 +99,24 @@ export function isIgnoredMount(fstype: string, mountpoint: string): boolean {
 const NFS_SOURCE_RE = /^[^/]+:\//
 
 /**
+ * Is this text findmnt's OWN shape — an object whose `filesystems` is an
+ * array? THE shape gate for a fail-closed caller (cr.23 review): valid JSON
+ * of another shape (`{}`, `[]`, `{"filesystems":42}`, …) is as UNREADABLE as
+ * broken JSON, so a caller that must not read a corrupt table as "no mounts"
+ * asks this before trusting {@link parseFindmnt}. It never throws.
+ */
+export function isFindmntTable(text: string): boolean {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  }
+  catch {
+    return false
+  }
+  return typeof parsed === 'object' && parsed !== null && Array.isArray((parsed as { filesystems?: unknown }).filesystems)
+}
+
+/**
  * Flatten `findmnt --json` output into a depth-first list of every mount,
  * including stacked children. Total and fail-safe: malformed input yields an
  * empty list (never throws). Rows missing a target are skipped.

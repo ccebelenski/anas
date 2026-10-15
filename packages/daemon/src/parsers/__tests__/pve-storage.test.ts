@@ -453,6 +453,20 @@ describe('readZfsMountpointsFull — the findmnt table beside the mountpoints (c
     assert.deepEqual(out?.mountpoints, [{ mountpoint: '/tank', dataset: 'tank', pool: 'tank' }])
   })
 
+  it('a WRONG-SHAPED findmnt table is UNREADABLE (findmntNodes null), not the empty table (cr.30r)', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: ZFS,
+      args: ['list', '-H', '-o', 'name,mountpoint'],
+      result: { stdout: 'tank\t/tank\n', stderr: '', exitCode: 0 },
+    })
+    for (const stdout of ['{}', '[]', 'null', '"str"', '{"report":[]}', '{"filesystems":42}', '{"filesystems":null}']) {
+      mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout, stderr: '', exitCode: 0 } })
+      const out = await readZfsMountpointsFull(mock)
+      assert.equal(out?.findmntNodes, null, stdout)
+    }
+  })
+
   it('the whole read is null when zfs list RAN and failed', async () => {
     const mock = new MockExecutor()
     mock.addFixture({

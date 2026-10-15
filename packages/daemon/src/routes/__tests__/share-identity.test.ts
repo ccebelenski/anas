@@ -1516,7 +1516,9 @@ describe('share-identity routes', () => {
   // with groups in every form the design names (`@`, `+`, `&`), plus `force
   // group`'s bare spelling. One refusal test per parameter and form, for the
   // user and the group verb, driven by the checked-in fixture
-  // fixtures/samba/smb-identity-refs.conf (the node's smb.conf verbatim).
+  // fixtures/samba/smb-identity-refs.conf — a SYNTHETIC conf authored for
+  // these tests (one share per parameter, test-scaffold accounts), not a
+  // capture from a machine.
   describe('cr.30 — delete refuses every smb.conf name reference', () => {
     let app: FastifyInstance | undefined
     let queue: JobQueue

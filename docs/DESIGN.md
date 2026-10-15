@@ -395,11 +395,11 @@ One generic endpoint backing directory pickers and gentle path validation across
 | `GET` | `/v1/identity/users/:name` | User detail | `200` |
 | `PUT` | `/v1/identity/users/:name` | Modify a user | `202` with job |
 | `POST` | `/v1/identity/users/:name/smb-password` | Set/update SMB password | `202` with job |
-| `DELETE` | `/v1/identity/users/:name` | Remove a LOCAL share user (confirm-gated; a hard `409` when a share/ACL references it, or when it is directory-provided) — `userdel` without `-r`: its files keep their uid; the SMB passdb entry is removed if present | `202`/`409` with job |
+| `DELETE` | `/v1/identity/users/:name` | Remove a LOCAL share user (confirm-gated; a hard `409` when any share's user-list parameter names it — `valid users`, `invalid users`, `read list`, `write list`, `admin users`, `force user`, `@`/`+`/`&` group forms included — or when it is directory-provided). An ACL reference is NOT a `409` — ACL roots are not scanned yet (they ride cr.29's root-enumerating scan as confirm warnings, still TODO in the code). `userdel` without `-r`: its files keep their uid; the SMB passdb entry is removed if present | `202`/`409` with job |
 | `GET` | `/v1/identity/groups` | List groups | `200` |
 | `POST` | `/v1/identity/groups` | Create a group | `202` with job |
 | `PUT` | `/v1/identity/groups/:name/members` | Modify a group (members) | `202` with job |
-| `DELETE` | `/v1/identity/groups/:name` | Remove a LOCAL group (confirm-gated; hard `409`s: `primary-group-in-use` when it is a local user's primary group, and `referenced-by-share` when a share/ACL names it) | `202`/`409` with job |
+| `DELETE` | `/v1/identity/groups/:name` | Remove a LOCAL group (confirm-gated; hard `409`s: `primary-group-in-use` when it is an account's primary group, `referenced-by-share` when any share's user-list parameter names it, and `SYSTEM_ACCOUNT` for a system gid). An ACL reference is NOT a `409` — ACL roots are not scanned yet (they ride cr.29's scan as confirm warnings, still TODO in the code) | `202`/`409` with job |
 
 #### Jobs
 

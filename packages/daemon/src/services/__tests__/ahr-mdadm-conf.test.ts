@@ -113,6 +113,21 @@ describe('ahr-mdadm-conf service', () => {
       assert.equal(await readFile(conf, 'utf8'), operatorHook)
     })
 
+    it('with BOTH the operator\'s PROGRAM line and ANAS\'s hook present, the last unpin removes ONLY the ANAS line', async () => {
+      // A conf that carries a foreign PROGRAM line while ANAS's own hook is
+      // still installed: retiring ANAS's hook must remove exactly that line —
+      // a pathless "remove whatever PROGRAM exists" would take the operator's
+      // hook with it.
+      const both = `${STOCK}PROGRAM /usr/sbin/handle-mdadm-events\nPROGRAM ${ANAS_MD_EVENT_HOOK}\n`
+      await writeFile(conf, both)
+      await pinArrays([R1], conf)
+      await unpinArrays([R1.uuid], conf)
+      const out = await readFile(conf, 'utf8')
+      assert.ok(!out.includes(`PROGRAM ${ANAS_MD_EVENT_HOOK}`), 'ANAS\'s own hook retires')
+      assert.ok(out.includes('PROGRAM /usr/sbin/handle-mdadm-events'), 'the operator\'s hook survives')
+      assert.ok(!out.includes(R1.uuid), 'the pin is gone')
+    })
+
     it('a pinned array ANAS did not write (hand-built, AHR-shaped name) keeps the hook', async () => {
       // Same naming convention, unknown to this pool's destroy: counting it
       // conservatively means the monitor keeps reporting for it.

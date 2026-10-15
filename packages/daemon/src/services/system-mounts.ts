@@ -31,7 +31,7 @@
  */
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
-import { parseFindmnt } from '../parsers/findmnt.js'
+import { isFindmntTable, parseFindmnt } from '../parsers/findmnt.js'
 import { stripSubvolSuffix } from './ahr-topology.js'
 import { SYSTEM_MOUNT_TARGETS } from './mounts.js'
 
@@ -148,19 +148,15 @@ export function systemMountPoolsFromNodes(nodes: FindmntNode[]): SystemMountFact
  */
 export function systemMountPoolsFromJson(text: string): SystemMountFacts | null {
   // Unreadable unless it has findmnt's own shape — an object whose
-  // `filesystems` is an array. Valid JSON of another shape (`{}`, `[]`,
-  // `null`, `{"filesystems":42}`) is as unreadable as broken JSON, and the
-  // parse never throws: a caller that does not guard it must still get the
-  // refusal, not a 500 (cr.23 review).
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text)
-  }
-  catch {
+  // `filesystems` is an array ({@link isFindmntTable}, the ONE shape gate the
+  // fail-closed readers share, cr.23 review). Valid JSON of another shape
+  // (`{}`, `[]`, `null`, `{"filesystems":42}`) is as unreadable as broken
+  // JSON, and the parse never throws: a caller that does not guard it must
+  // still get the refusal, not a 500.
+  if (!isFindmntTable(text))
     return null
-  }
-  if (typeof parsed !== 'object' || parsed === null || !Array.isArray((parsed as { filesystems?: unknown }).filesystems))
-    return null
+  // The shape gate checks the top level only; a malformed row deeper down
+  // (`children: 42`, a `null` filesystem) must still read as unreadable.
   try {
     return systemMountPoolsFromNodes(parseFindmnt(text))
   }

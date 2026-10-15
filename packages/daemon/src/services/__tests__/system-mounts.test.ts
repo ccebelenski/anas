@@ -154,7 +154,7 @@ describe('readSystemMountPools — fail-closed reads', () => {
   })
 
   it('valid JSON of the wrong shape is UNREADABLE too, and never throws (cr.23 review)', () => {
-    for (const text of ['{}', '[]', 'null', '"str"', '42', '{"report":[]}', '{"filesystems":42}', '{"filesystems":null}'])
+    for (const text of ['{}', '[]', 'null', '"str"', '42', '{"report":[]}', '{"filesystems":42}', '{"filesystems":null}', '{"filesystems":[null]}', '{"filesystems":[{"target":"/","children":42}]}'])
       assert.equal(systemMountPoolsFromJson(text), null, text)
     // The genuinely empty table stays a readable "no pool at a system path".
     assert.deepEqual(systemMountPoolsFromJson('{"filesystems":[]}'), { zfs: new Map(), ahr: new Map() })

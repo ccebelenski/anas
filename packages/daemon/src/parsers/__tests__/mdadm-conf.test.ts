@@ -169,5 +169,8 @@ describe('PROGRAM — exactly one, never stolen', () => {
     assert.equal(serializeMdadmConfDoc(removeProgram(parseMdadmConfDoc(foreign), hook)), foreign)
     // Unfiltered removal takes whatever PROGRAM line exists.
     assert.equal(serializeMdadmConfDoc(removeProgram(parseMdadmConfDoc(foreign))), fixture)
+    // A hand-duplicated ANAS hook leaves no residue; the foreign line stays.
+    const twice = `${foreign}PROGRAM ${hook}\nPROGRAM ${hook}\n`
+    assert.equal(serializeMdadmConfDoc(removeProgram(parseMdadmConfDoc(twice), hook)), foreign)
   })
 })

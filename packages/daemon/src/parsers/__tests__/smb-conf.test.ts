@@ -1319,7 +1319,68 @@ describe('identity references (cr.30)', () => {
     assert.deepEqual(findIdentityReferences('[note]\n\tvalid users = vuser\n', 'vuser', false), [])
   })
 
-  it('[global] user-list parameters are not scanned', () => {
-    assert.deepEqual(findIdentityReferences('[global]\n\tvalid users = vuser\n', 'vuser', false), [])
+  it('[global] user-list parameters ARE scanned — Samba applies them to every share (reports the name global)', () => {
+    assert.deepEqual(findIdentityReferences('[global]\n\tvalid users = vuser\n', 'vuser', false), [{ share: 'global', parameter: 'valid users' }])
+    assert.deepEqual(findIdentityReferences('[global]\n\tvalid users = vuser\n', 'someone-else', false), [])
+    // [global] needs no path — it is not a share, it scopes to the shares.
+    assert.deepEqual(findIdentityReferences('[global]\n\tread list = ruser\n', 'ruser', false), [{ share: 'global', parameter: 'read list' }])
+  })
+
+  it('quoted entries hold their spaces (smb.conf(5) list syntax), quotes are not part of the name', () => {
+    // `"@DOMAIN\Domain Users"` is ONE group whose name has a space; `"vuser"`
+    // is the user vuser. parseList would split both over the space.
+    const text = [
+      '[media]',
+      '\tpath = /tank/media',
+      '\tvalid users = "@DOMAIN\\Domain Users", "vuser"',
+      '',
+    ].join('\n')
+    assert.deepEqual(findIdentityReferences(text, 'DOMAIN\\Domain Users', true), [{ share: 'media', parameter: 'valid users' }])
+    // The quoted entry keeps its space — the trailing fragment does not match.
+    assert.deepEqual(findIdentityReferences(text, 'Domain Users', true), [])
+    assert.deepEqual(findIdentityReferences(text, 'Users', true), [])
+    assert.deepEqual(findIdentityReferences(text, 'vuser', false), [{ share: 'media', parameter: 'valid users' }])
+    assert.deepEqual(findIdentityReferences(text, 'vuser', true), [])
+  })
+
+  it('%S names the section (share) itself — the one % token that is a concrete account', () => {
+    const text = [
+      '[data]',
+      '\tpath = /tank/data',
+      '\tvalid users = alice %S',
+      '',
+    ].join('\n')
+    assert.deepEqual(findIdentityReferences(text, 'data', false), [{ share: 'data', parameter: 'valid users' }])
+    // A group reference to a share named like the group matches too.
+    assert.deepEqual(findIdentityReferences(text, 'DATA', false), [{ share: 'data', parameter: 'valid users' }])
+    // In [global], %S resolves to 'global', never to a share.
+    assert.deepEqual(findIdentityReferences('[global]\n\tvalid users = %S\n', 'global', false), [{ share: 'global', parameter: 'valid users' }])
+  })
+
+  it('any OTHER % token names nothing and never matches', () => {
+    const text = [
+      '[data]',
+      '\tpath = /tank/data',
+      '\tvalid users = %U %D %a alice',
+      '',
+    ].join('\n')
+    assert.deepEqual(findIdentityReferences(text, '%U', false), [])
+    assert.deepEqual(findIdentityReferences(text, '%D', false), [])
+    assert.deepEqual(findIdentityReferences(text, 'U', false), [])
+    assert.deepEqual(findIdentityReferences(text, 'alice', false), [{ share: 'data', parameter: 'valid users' }])
+  })
+
+  it('combined group sigils (+& and &+) are stripped whole (smb.conf(5) group forms)', () => {
+    const text = [
+      '[media]',
+      '\tpath = /tank/media',
+      '\tvalid users = +&crab &+lobster',
+      '',
+    ].join('\n')
+    for (const group of ['crab', 'lobster', 'CRAB', 'LOBSTER']) {
+      assert.deepEqual(findIdentityReferences(text, group, true), [{ share: 'media', parameter: 'valid users' }], group)
+    }
+    // The sigil makes the entry a GROUP — a user of that name is nobody's ref.
+    assert.deepEqual(findIdentityReferences(text, 'crab', false), [])
   })
 })

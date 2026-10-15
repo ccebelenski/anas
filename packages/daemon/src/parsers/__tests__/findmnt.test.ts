@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { classifyKind, isPseudoFstype, isSystemMountTarget, optionsReadOnly, parseFindmnt } from '../findmnt.js'
+import { classifyKind, isFindmntTable, isPseudoFstype, isSystemMountTarget, optionsReadOnly, parseFindmnt } from '../findmnt.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/mounts')
@@ -30,6 +30,18 @@ describe('parseFindmnt', () => {
   it('is total: malformed JSON yields an empty list', () => {
     assert.deepEqual(parseFindmnt('not json'), [])
     assert.deepEqual(parseFindmnt(''), [])
+  })
+})
+
+describe('isFindmntTable — the ONE shape gate the fail-closed readers share (cr.30r)', () => {
+  it('only an object with a filesystems ARRAY reads as findmnt\'s shape', () => {
+    assert.equal(isFindmntTable('{"filesystems":[]}'), true)
+    assert.equal(isFindmntTable('{"filesystems":[{"target":"/"}]}'), true)
+    for (const text of ['', 'not json', '{}', '[]', 'null', '"str"', '42', '{"report":[]}', '{"filesystems":42}', '{"filesystems":null}', '{"filesystems":"[]"}'])
+      assert.equal(isFindmntTable(text), false, text)
+  })
+  it('never throws on any input', () => {
+    assert.doesNotThrow(() => isFindmntTable('{"filesystems":'))
   })
 })
 

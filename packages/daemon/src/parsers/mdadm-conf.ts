@@ -184,14 +184,17 @@ export function upsertProgram(doc: MdadmConfDoc, path: string): MdadmConfDoc {
 }
 
 /**
- * Remove the PROGRAM line. With `path` given, removes it ONLY if it points at
- * `path` (a foreign hook is left untouched — no-op, so uninstall stays
- * idempotent). Without `path`, removes whatever PROGRAM line exists.
+ * Remove PROGRAM lines. With `path` given, removes EVERY line that points at
+ * `path` (a hand-duplicated hook leaves no residue) and only those (a foreign
+ * hook is left untouched — no-op, so uninstall stays idempotent). Without
+ * `path`, removes every PROGRAM line.
  */
 export function removeProgram(doc: MdadmConfDoc, path?: string): MdadmConfDoc {
-  const idx = doc.findIndex(l => l.kind === 'program' && (path === undefined || l.program === path))
-  if (idx !== -1)
-    doc.splice(idx, 1)
+  for (let idx = doc.length - 1; idx >= 0; idx--) {
+    const l = doc[idx]
+    if (l.kind === 'program' && (path === undefined || l.program === path))
+      doc.splice(idx, 1)
+  }
   return doc
 }
 

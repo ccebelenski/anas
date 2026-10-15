@@ -34,7 +34,7 @@ import type { FindmntNode } from './findmnt.js'
 import { execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
-import { parseFindmnt } from './findmnt.js'
+import { isFindmntTable, parseFindmnt } from './findmnt.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -450,10 +450,13 @@ export interface ZfsMountpointsRead {
   mountpoints: ZfsMountpoint[]
   /**
    * The findmnt mount table — ALL filesystems, not just the zfs ones — when
-   * that read succeeded, else `null`. The footprint service asks
-   * {@link pathOnZfsFilesystem} over it to tell a `dir` storage's unresolved
-   * path on a ZFS filesystem (claimed) from one on ext4 (allowed, caveat
-   * emptor). `null` is UNKNOWN: callers tighten, never loosen.
+   * that read succeeded AND carried findmnt's shape (an object with a
+   * `filesystems` array, the {@link isFindmntTable} gate); anything else —
+   * a failed command, or a wrong-shaped output — is `null`. The footprint
+   * service asks {@link pathOnZfsFilesystem} over it to tell a `dir`
+   * storage's unresolved path on a ZFS filesystem (claimed) from one on ext4
+   * (allowed, caveat emptor). `null` is UNKNOWN: callers tighten, never
+   * loosen.
    */
   findmntNodes: FindmntNode[] | null
 }
@@ -486,7 +489,7 @@ export async function readZfsMountpointsFull(zfsOrExec: string | CommandExecutor
         exec.exec(FINDMNT_BIN, ['--json']),
       ])
       if (findmntResult.status === 'fulfilled' && findmntResult.value.exitCode === 0)
-        findmntNodes = parseFindmnt(findmntResult.value.stdout)
+        findmntNodes = isFindmntTable(findmntResult.value.stdout) ? parseFindmnt(findmntResult.value.stdout) : null
       if (zfsResult.status === 'rejected')
         throw zfsResult.reason
       if (zfsResult.value.exitCode !== 0)
@@ -502,7 +505,7 @@ export async function readZfsMountpointsFull(zfsOrExec: string | CommandExecutor
         execFileAsync(FINDMNT_BIN, ['--json']),
       ])
       if (findmntResult.status === 'fulfilled')
-        findmntNodes = parseFindmnt(findmntResult.value.stdout)
+        findmntNodes = isFindmntTable(findmntResult.value.stdout) ? parseFindmnt(findmntResult.value.stdout) : null
       if (zfsResult.status === 'rejected')
         throw zfsResult.reason
       stdout = zfsResult.value.stdout

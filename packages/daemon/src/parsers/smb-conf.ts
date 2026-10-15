@@ -768,15 +768,23 @@ export function recyclePurgeTargets(text: string): RecyclePurgeTarget[] {
 //
 // The parameter list is WAVE2-DESIGN §6 C4: `valid users`, `invalid users`,
 // `read list`, `write list`, `admin users`, `force user`, `force group`. A
-// group is written with a sigil — `@group`, `+group` or `&group` (Samba's
-// three group notations; the design names no combined `+&`/`&+` form) — except
-// in `force group`, whose value is a group whatever it is spelled as. A bare
-// entry elsewhere names a USER. Names match case-folded (Samba folds them in
-// smb.conf too), the same fold as the passdb (`sameIdentityName`).
+// group is written with a sigil — `@group`, `+group` or `&group`, or the
+// combined `+&group`/`&+group` smb.conf(5) also accepts (the sigil is the whole
+// leading run) — except in `force group`, whose value is a group whatever it
+// is spelled as. A bare entry elsewhere names a USER. Names match case-folded
+// (Samba folds them in smb.conf too), the same fold as the passdb
+// (`sameIdentityName`).
 //
-// Scope: path-based share stanzas, exactly what the read-model lists — and, as
-// before, `[global]` occurrences of these parameters (rare, and a global
-// forcing is server management, not a share grant) are not scanned.
+// List values are tokenised the way Samba reads them ({@link identityList}),
+// NOT with {@link parseList}: an entry may be double-quoted to keep spaces
+// (`valid users = "@DOMAIN\Domain Users", "vuser"`), and a lowercase `%S`
+// entry names the SECTION ITSELF (smb.conf(5), VARIABLE SUBSTITUTIONS: "%S the
+// name of the current service, if any") — the one substitution that resolves
+// to a concrete account. Any other `%` token names nothing and never matches.
+//
+// Scope: path-based share stanzas, exactly what the read-model lists — plus
+// `[global]`, whose user-list values Samba applies to EVERY share; a hit there
+// reports the section name `global`.
 // ============================================================================
 
 /** How one user-list parameter can name an account. */
@@ -801,8 +809,18 @@ const IDENTITY_PARAMS: readonly IdentityParamRule[] = [
   { param: PARAM.forceGroup, group: true, groupBare: true },
 ]
 
-/** Samba's three group notations in a user list: `@group`, `+group`, `&group`. */
-const GROUP_SIGIL_RE = /^([@+&])(.*)$/
+/**
+ * Samba's group sigils in a user list: `@group`, `+group`, `&group` and the
+ * combined `+&group`/`&+group` (smb.conf(5), valid users: names preceded by
+ * `+` or `&` are groups; `@` too). The sigil is the WHOLE leading run of the
+ * three characters, stripped whole — `stripGroupSigil('&+grp')` = `grp`.
+ */
+function stripGroupSigil(entry: string): { sigil: string, name: string } {
+  let i = 0
+  while (i < entry.length && (entry[i] === '@' || entry[i] === '+' || entry[i] === '&'))
+    i++
+  return { sigil: entry.slice(0, i), name: entry.slice(i) }
+}
 
 /** One (share, parameter) pair whose value names an account — the refusal's evidence. */
 export interface IdentityRefHit {
@@ -812,38 +830,103 @@ export interface IdentityRefHit {
   parameter: string
 }
 
-/** Does one list entry name `name` under this rule, for a user or a group? */
-function entryNamesAccount(entry: string, name: string, rule: IdentityParamRule, isGroup: boolean): boolean {
-  const sigil = GROUP_SIGIL_RE.exec(entry)
-  if (isGroup)
-    return sigil ? rule.group === true && sameIdentityName(sigil[2], name) : rule.groupBare === true && sameIdentityName(entry, name)
-  return rule.user === true && sigil === null && sameIdentityName(entry, name)
+/** A Samba list separator character (space, tab, comma, CR/LF). */
+const LIST_SEP_IS = (c: string): boolean => c === ',' || c === ' ' || c === '\t' || c === '\n' || c === '\r'
+
+/**
+ * A Samba list value → its entries, the way Samba reads them (smb.conf(5),
+ * list syntax): whitespace and/or commas separate entries, and an entry may be
+ * double-quoted to keep the spaces — with its quotes stripped (a quoted
+ * `"@DOMAIN\Domain Users"` is ONE group whose name has a space, not a string
+ * literal). A quote toggles the quote state even mid-value, so
+ * `alice,"bob smith",carol` is three entries. The identity DISPLAY in the
+ * read model comes from {@link parseList} (the shared list parses the editors
+ * diff against, for round-trip byte identity); THIS tokeniser is the scan's
+ * own, because parseList would split `"Domain Users"` on its space and hand
+ * the refusal a `"Domain`-shaped fragment that matches nobody.
+ */
+function identityList(value: string): string[] {
+  const entries: string[] = []
+  let group = ''
+  let inQuote = false
+  for (const c of value) {
+    if (c === '"') {
+      inQuote = !inQuote
+    }
+    else if (LIST_SEP_IS(c) && !inQuote) {
+      if (group) {
+        entries.push(group)
+        group = ''
+      }
+    }
+    else {
+      group += c
+    }
+  }
+  if (group)
+    entries.push(group)
+  return entries
+}
+
+/**
+ * Does one list entry name `name` under this rule, for a user or a group?
+ * A group's `@`/`+`/`&`/`+&`/`&+` sigil is stripped whole before comparing
+ * (a name preceded by a sigil is a group — see smb.conf(5), valid users).
+ * Then a `%` token is substituted the way Samba is: an exact `%S` IS the
+ * section (share) name (VARIABLE SUBSTITUTIONS: "%S the name of the current
+ * service, if any") — the one substitution that resolves to a concrete
+ * account, matched only against `share`; any other `%` token names nothing
+ * (Samba substitutes names Samba knows, never ANAS account names), so it is a
+ * literal and matches no IdentityName.
+ */
+function entryNamesAccount(entry: string, name: string, share: string, rule: IdentityParamRule, isGroup: boolean): boolean {
+  // Strip the whole group sigil first (an entry carrying `@`/`+`/`&`/`+&`/`&+`
+  // is a GROUP reference for the reduced tail). A bare entry is whatever the
+  // scan is looking for — a user, or with `force group` (groupBare) a group.
+  const { sigil, name: bare } = stripGroupSigil(entry)
+  // Substitute a `%` token the way Samba does: an exact `%S` IS the section
+  // (share) name (smb.conf(5), VARIABLE SUBSTITUTIONS) — the ONE `%` token
+  // that resolves to a concrete account. Any other `%` token names something
+  // only Samba knows, never an identity ANAS holds, so it NEVER matches.
+  if (bare.startsWith('%') && bare !== '%S')
+    return false
+  const compared = bare === '%S' ? share : bare
+  if (sigil)
+    return isGroup && rule.group === true && sameIdentityName(compared, name)
+  return isGroup
+    ? rule.groupBare === true && sameIdentityName(compared, name)
+    : rule.user === true && sameIdentityName(compared, name)
 }
 
 /**
  * Every (share, parameter) pair in an smb.conf that names the account — the
  * hard-409 evidence for identity delete (cr.30). Reads the SAME section model
  * the read-model and the editors use (last definition wins, continuations
- * folded, synonyms honoured). Pure over the text; the caller decides what an
- * unreadable file means.
+ * folded, synonyms honoured). Scans `[global]` too — Samba applies a user-list
+ * parameter set there to EVERY share — reporting the section name `global`; a
+ * pathless stanza is not a share and names nobody. Pure over the text; the
+ * caller decides what an unreadable file means.
  */
 export function findIdentityReferences(text: string, name: string, isGroup: boolean): IdentityRefHit[] {
   const doc = parseDoc(text)
   const hits: IdentityRefHit[] = []
   for (const span of doc.sections) {
-    if (span.key === null || span.key === 'global')
+    if (span.key === null)
       continue
     const defs = sectionDefs(doc, span)
-    // The read model's share definition: a stanza without a path is not a
-    // path-based file share (mirrors `toSmbShare`), so it names nobody.
-    if (!paramValue(defs, PARAM.path))
+    // The read model's share definition (mirrors `toSmbShare`): a stanza
+    // without a path is not a path-based file share — but `[global]` is
+    // scanned WITHOUT the path test, because Samba scopes its parameters to
+    // every share.
+    if (span.key !== 'global' && !paramValue(defs, PARAM.path))
       continue
     for (const rule of IDENTITY_PARAMS) {
       const value = paramValue(defs, rule.param)
       if (value === undefined)
         continue
-      if (parseList(value).some(entry => entryNamesAccount(entry, name, rule, isGroup)))
-        hits.push({ share: span.name as string, parameter: rule.param.canonical })
+      const share = span.name as string
+      if (identityList(value).some(entry => entryNamesAccount(entry, name, share, rule, isGroup)))
+        hits.push({ share, parameter: rule.param.canonical })
     }
   }
   return hits
