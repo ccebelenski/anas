@@ -237,6 +237,9 @@ describe('boot-import unit: destroy disables the unit', () => {
     const ex = new MockExecutor()
     ex.addFixture({ command: ZPOOL, args: ['list', '-j'], result: listResult('tank') })
     ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', 'tank'], result: { stdout: '77\n', stderr: '', exitCode: 0 } }) // ident.1
+    // cr.23: readable-quiet boot facts — destroy asks them before the confirm
+    // gate, and facts gone dark would fail closed.
+    ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'tank\t-\n', stderr: '', exitCode: 0 } })
     ex.addFixture({ command: ZPOOL, args: ['destroy', '--', 'tank'], result: OK })
     ex.addFixture({ command: SYSTEMCTL, args: ['disable', 'zfs-import@tank.service'], result: OK })
 
@@ -251,6 +254,9 @@ describe('boot-import unit: destroy disables the unit', () => {
     const ex = new MockExecutor()
     ex.addFixture({ command: ZPOOL, args: ['list', '-j'], result: listResult('tank') })
     ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', 'tank'], result: { stdout: '77\n', stderr: '', exitCode: 0 } }) // ident.1
+    // cr.23: readable-quiet boot facts — destroy asks them before the confirm
+    // gate, and facts gone dark would fail closed.
+    ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'tank\t-\n', stderr: '', exitCode: 0 } })
     ex.addFixture({ command: ZPOOL, args: ['destroy', '--', 'tank'], result: OK })
     // No systemctl fixture — 127.
 
@@ -263,16 +269,23 @@ describe('boot-import unit: destroy disables the unit', () => {
     assert.ok(result.warnings![0].includes('zfs-import@tank.service'))
   })
 
-  it('never reaches the root pool — its destroy is blocked before the job', async () => {
+  it('never reaches the system pool — its destroy is blocked before the job', async () => {
+    // cr.23: the block is a FACT, never the name. A pool called `rpool` is a
+    // data pool until the boot facts say otherwise; here `zpool get bootfs`
+    // names it, and that — not the string — is what 409s the destroy.
     const ex = new MockExecutor()
     ex.addFixture({ command: ZPOOL, args: ['list', '-j'], result: listResult('rpool') })
+    ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'rpool\trpool/ROOT/pve-1\n', stderr: '', exitCode: 0 } })
     const built = await build(ex)
     server = built.server
 
     const res = await server.inject({ method: 'DELETE', url: '/v1/pools/rpool', headers: IDENTITY_HEADERS })
 
     assert.equal(res.statusCode, 409)
-    assert.equal(res.json().error.code, 'PROTECTED_RESOURCE')
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.equal(res.json().error.reason, 'system-pool')
+    assert.match(res.json().error.message, /boot filesystem \(rpool\/ROOT\/pve-1\)/)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'a hard refusal never offers a confirm code')
     assert.equal(ex.calls.filter(c => c.command === SYSTEMCTL).length, 0)
   })
 })

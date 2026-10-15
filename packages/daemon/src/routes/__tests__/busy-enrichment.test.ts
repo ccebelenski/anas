@@ -85,6 +85,10 @@ describe('3.29 — ZFS pool destroy job surfaces the holding processes', () => {
     executor.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: { stdout: ZPOOL_LIST_JSON, stderr: '', exitCode: 0 } })
     // ident.1: the pool guid the destroy confirm binds (and the job re-reads).
     executor.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'value', 'guid', '--', 'testpool'], result: { stdout: '1234\n', stderr: '', exitCode: 0 } })
+    // cr.23: the destroy gate asks the boot facts before anything is
+    // negotiated. Readable-quiet (bootfs unset) — unseeded facts go dark and
+    // dark fails closed; this test's world is a busy destroy, not a gate.
+    executor.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
     // The destroy fails busy — the exact pve5 error shape (names its own path).
     executor.addFixture({
       command: '/usr/sbin/zpool',

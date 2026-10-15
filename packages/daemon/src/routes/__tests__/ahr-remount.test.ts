@@ -189,11 +189,13 @@ function findmntResults(world: World, healAfter: boolean) {
     return [ok(JSON.stringify({ filesystems: [] }))]
   if (!readOnly(world))
     return [table(RW_OPTIONS)]
-  // Reads 1 and 2 are the route's pool loads for the confirm challenge and the
-  // confirmed request (both read-only); the third is the job's own
+  // Reads come in pairs since cr.23: each request (the confirm challenge and
+  // the confirmed one) reads the table twice — the route's pool load and the
+  // system-pool gate, which must answer BEFORE any confirm code is offered.
+  // Reads 1–4 are therefore all read-only; the fifth is the job's own
   // verification after `mount`, and the last entry repeats from there.
   return healAfter
-    ? [table(RO_OPTIONS), table(RO_OPTIONS), table(RW_OPTIONS)]
+    ? [table(RO_OPTIONS), table(RO_OPTIONS), table(RO_OPTIONS), table(RO_OPTIONS), table(RW_OPTIONS)]
     : [table(RO_OPTIONS)]
 }
 

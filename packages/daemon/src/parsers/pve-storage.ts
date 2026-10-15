@@ -468,22 +468,30 @@ export interface ZfsMountpointsRead {
 export async function readZfsMountpointsFull(zfsOrExec: string | CommandExecutor = 'zfs'): Promise<ZfsMountpointsRead | null> {
   const exec = typeof zfsOrExec === 'object' ? zfsOrExec : undefined
   const zfs = typeof zfsOrExec === 'string' ? zfsOrExec : 'zfs'
+  // Declared before the try: a findmnt table that read successfully SURVIVES
+  // the zfs side's failure (cr.23) — the ENOENT answer below is a READ answer
+  // for the table, so the footprint's system-mount facts never pay a second
+  // findmnt on a node that merely has no ZFS.
+  let findmntNodes: FindmntNode[] | null = null
   try {
     let stdout: string
     let mountedTargets = new Map<string, string>()
-    let findmntNodes: FindmntNode[] | null = null
     if (exec) {
-      // A non-zero exit is UNREADABLE (never "no datasets") — the direct
+      // allSettled: the zfs side's failure is the three-valued signal, and a
+      // findmnt that succeeded ahead of it is captured, not discarded. A
+      // non-zero exit is UNREADABLE (never "no datasets") — the direct
       // execFileAsync below rejects on one, so the executor path must too.
-      const [zfsResult, findmntResult] = await Promise.all([
+      const [zfsResult, findmntResult] = await Promise.allSettled([
         exec.exec(ZFS_BIN, ['list', '-H', '-o', 'name,mountpoint']),
         exec.exec(FINDMNT_BIN, ['--json']),
       ])
-      if (zfsResult.exitCode !== 0)
-        throw new Error(`zfs list exited ${zfsResult.exitCode}: ${zfsResult.stderr.trim()}`)
-      stdout = zfsResult.stdout
-      if (findmntResult.exitCode === 0)
-        findmntNodes = parseFindmnt(findmntResult.stdout)
+      if (findmntResult.status === 'fulfilled' && findmntResult.value.exitCode === 0)
+        findmntNodes = parseFindmnt(findmntResult.value.stdout)
+      if (zfsResult.status === 'rejected')
+        throw zfsResult.reason
+      if (zfsResult.value.exitCode !== 0)
+        throw new Error(`zfs list exited ${zfsResult.value.exitCode}: ${zfsResult.value.stderr.trim()}`)
+      stdout = zfsResult.value.stdout
     }
     else {
       // allSettled: the zfs side's rejection (ENOENT / nonzero) is the
@@ -493,11 +501,11 @@ export async function readZfsMountpointsFull(zfsOrExec: string | CommandExecutor
         execFileAsync(zfs, ['list', '-H', '-o', 'name,mountpoint']),
         execFileAsync(FINDMNT_BIN, ['--json']),
       ])
+      if (findmntResult.status === 'fulfilled')
+        findmntNodes = parseFindmnt(findmntResult.value.stdout)
       if (zfsResult.status === 'rejected')
         throw zfsResult.reason
       stdout = zfsResult.value.stdout
-      if (findmntResult.status === 'fulfilled')
-        findmntNodes = parseFindmnt(findmntResult.value.stdout)
     }
     if (findmntNodes !== null)
       mountedTargets = zfsMountTargets(findmntNodes)
@@ -505,7 +513,7 @@ export async function readZfsMountpointsFull(zfsOrExec: string | CommandExecutor
   }
   catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT')
-      return { mountpoints: [], findmntNodes: null }
+      return { mountpoints: [], findmntNodes }
     if (!mountpointsReadWarned) {
       mountpointsReadWarned = true
       console.warn('anasd: could not list ZFS mountpoints for PVE dir detection — treated as UNREADABLE, not empty:', err)

@@ -716,6 +716,13 @@ describe('the disclosure — a failed claims read is named at the confirm doors 
     for (const pool of [POOL, UNSERVED_POOL])
       executor.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', pool], result: { stdout: '4242\n', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: ZFS, args: ['get', '-H', '-o', 'value', 'guid', '--', ZVOL], result: { stdout: '4343\n', stderr: '', exitCode: 0 } })
+    // cr.23: destroy/export now ask the system-pool rule before the confirm
+    // gate. Seed BOTH fact sources readable (no bootfs anywhere, an ordinary
+    // ext4-root mount table) so these tests keep testing the claims
+    // disclosure — with both facts dark, the honest answer would be a
+    // fail-closed system-pool refusal, not a confirm code.
+    executor.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: `${POOL}\t-\n${UNSERVED_POOL}\t-\n`, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: JSON.stringify({ filesystems: [{ target: '/', source: '/dev/mapper/pve-root', fstype: 'ext4', options: 'rw' }] }), stderr: '', exitCode: 0 } })
     const iscsiPaths = {
       configfsRoot: root,
       saveconfigPath: join(dir, 'absent-saveconfig.json'),

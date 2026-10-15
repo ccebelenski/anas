@@ -1,10 +1,11 @@
-import type { Disk, ExpansionTarget, PoolDetail, PoolExpansionReport, PoolSummary, VdevSpec } from '@anas/shared'
+import type { Disk, ExpansionTarget, PoolDetail, PoolExpansionReport, PoolSummary, PveOwnership, VdevSpec } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ParsedPoolStatus } from '../parsers/zpool-status.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { IscsiPaths } from '../services/iscsi.js'
+import type { PveFootprint } from '../services/pve-footprint.js'
 import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, isComposableDisk, isRemovableVdevRole, PoolMountpointRequest, PoolName, RemoveVdevRequest, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
 import { parseByIdToKernel, parseByIdToKernelFull, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
@@ -15,14 +16,13 @@ import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parsePoolBusyState, parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
 import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
 import { confirmGate } from '../safety/gate.js'
-import { isRootPool } from '../safety/root-pool.js'
 import { confirmGateBound, readPoolGuid, requireStableId } from '../safety/stable-id.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { poolReferenceKey, poolReferenceWarning, poolReferenceWarnings, readPoolReferences } from '../services/pool-references.js'
-import { loadPveFootprint, systemPoolRefusal } from '../services/pve-footprint.js'
+import { loadPveFootprint, systemPoolRefusalFrom } from '../services/pve-footprint.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
 import { syncZfsImportUnit } from '../services/zfs-import-unit.js'
 import { isVdevRefusal, resolveLeafDevice, unknownVdevMessage } from '../services/zfs-vdev-leaf.js'
@@ -571,6 +571,21 @@ function parseImportScan(stdout: string): ImportablePool[] {
   return pools
 }
 
+/**
+ * The pool's `pve` stamp the panel reads to grey out pool verbs: PVE's own
+ * ownership of the pool root, or — cr.23 — a pool the one system-pool rule
+ * flags only by FACTS the ownership read does not see (a filesystem mounted
+ * at a system path, or both fact sources unreadable). Without this the panel
+ * offered Export/Destroy on a pool the daemon then refused. Its children stay
+ * manageable: only the pool-level verbs are refused for such a pool.
+ */
+export function poolStamp(pve: PveFootprint, pool: string): PveOwnership | null {
+  const owned = pve.ownershipOf(pool)
+  if (owned !== null || !pve.isSystemPool(pool))
+    return owned
+  return { kind: 'system', reason: systemPoolRefusalFrom(pve, pool).message, childrenManageable: true }
+}
+
 export async function poolRoutes(
   server: FastifyInstance,
   opts: {
@@ -760,15 +775,15 @@ export async function poolRoutes(
     return loadPveFootprint(executor, { pveStorageCfg: pveCfgPath })
   }
 
-  /** The hard no-bypass 409 when the pool holds this node's boot filesystem. */
+  /**
+   * The hard no-bypass 409 when the pool is a system pool (story cr.23: boot
+   * facts or the live mount table). The sentence names the FACT that fired.
+   */
   async function systemPoolBlock(poolName: string) {
     const pve = await pveFootprint()
     if (!pve.isSystemPool(poolName))
       return null
-    // The sentence names the CAUSE that made isSystemPool fire (pvepool.1
-    // review fix 4) — an unreadable storage.cfg answers "system pool" for
-    // every pool and must be said as such, not as a boot-facts failure.
-    return systemPoolRefusal(poolName, pve.systemPoolFacts(poolName), { storagesUnavailable: pve.storagesUnavailable })
+    return systemPoolRefusalFrom(pve, poolName)
   }
 
   /**
@@ -898,7 +913,7 @@ export async function poolRoutes(
       // system pool, a bare-path storage root, a dir storage on the root, and
       // the config-unreadable state are all visible in the grid. An ANAS pool
       // root is outside the footprint and carries no `pve` at all.
-      const pveOwned = pve.ownershipOf(pool.name)
+      const pveOwned = poolStamp(pve, pool.name)
       return {
         ...pool,
         state: status?.state ?? pool.state,
@@ -969,7 +984,7 @@ export async function poolRoutes(
     // Pool-root PVE ownership (pvepool.1 review fix 3) — the same per-request
     // footprint asks about the pool's ROOT dataset, so the detail view carries
     // the same verdict the list does. Absent for an ANAS pool.
-    const pveOwned = pve.ownershipOf(poolName)
+    const pveOwned = poolStamp(pve, poolName)
 
     const detail: PoolDetail = {
       name: poolName,
@@ -1244,12 +1259,12 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
-    // SYSTEM-POOL GUARD (story pvepool.1): the pool holds this node's boot
-    // filesystem — a hard 409 with NO confirm bypass, before anything else is
-    // negotiated. Level-1, like the root-pool destroy block.
+    // SYSTEM-POOL GUARD (stories pvepool.1 + cr.23): the pool holds this
+    // node's boot filesystem or its storage sits at a system path — a hard
+    // 409 with NO confirm bypass, before anything else is negotiated.
     const pve = await pveFootprint()
     if (pve.isSystemPool(poolName)) {
-      const refusal = systemPoolRefusal(poolName, pve.systemPoolFacts(poolName), { storagesUnavailable: pve.storagesUnavailable })
+      const refusal = systemPoolRefusalFrom(pve, poolName)
       reply.code(409)
       return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
     }
@@ -2054,9 +2069,10 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
-    // SYSTEM-POOL GUARD (story pvepool.1): the pool holds this node's boot
-    // filesystem — a hard 409 with NO confirm bypass. Exporting the boot pool
-    // takes the running node's root away; there is nothing to negotiate.
+    // SYSTEM-POOL GUARD (stories pvepool.1 + cr.23): the pool holds this
+    // node's boot filesystem or its storage sits at a system path — a hard
+    // 409 with NO confirm bypass. Exporting it takes the running node's root
+    // away; there is nothing to negotiate.
     const systemBlock = await systemPoolBlock(poolName)
     if (systemBlock) {
       reply.code(409)
@@ -2186,14 +2202,6 @@ export async function poolRoutes(
     if (!identity)
       return
 
-    // Level 1 block: the root/boot pool can never be destroyed, no override.
-    // Checked before existence — protection is unconditional, and a root pool
-    // is always present anyway.
-    if (isRootPool(poolName)) {
-      reply.code(409)
-      return { error: { code: 'PROTECTED_RESOURCE', message: `Cannot destroy the root pool '${poolName}'` } }
-    }
-
     const listResult = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
     const pools = listResult.exitCode === 0 ? parseZpoolList(listResult.stdout) : []
     if (!pools.some(p => p.name === poolName)) {
@@ -2201,10 +2209,10 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
-    // SYSTEM-POOL GUARD (story pvepool.1): the pool holds this node's boot
-    // filesystem — a hard 409 with NO confirm bypass, same Level-1 altitude as
-    // the root-pool block above (which guards the well-known names; this one
-    // reads the boot facts, so it also covers a non-default boot pool name).
+    // SYSTEM-POOL GUARD (stories pvepool.1 + cr.23): the pool holds this
+    // node's boot filesystem or its storage sits at a system path — a hard
+    // 409 with NO confirm bypass, decided on facts (boot properties, live
+    // mount table), never on the pool's name.
     const systemBlock = await systemPoolBlock(poolName)
     if (systemBlock) {
       reply.code(409)
@@ -2302,8 +2310,9 @@ export async function poolRoutes(
         // PVE parity (PVE/API2/Disks/ZFS.pm, their fix for Proxmox bug #2554) and
         // issue #22: the create/import path enables zfs-import@<pool>.service, so
         // destroy disables it — otherwise the unit outlives the pool and fails at
-        // every boot. The root pool can never get here (blocked above), so this
-        // never touches rpool's unit. Best-effort: the pool is already gone.
+        // every boot. A system pool can never get here (the guard above
+        // decides on facts), so this never touches a boot pool's unit.
+        // Best-effort: the pool is already gone.
         const unitWarning = await syncZfsImportUnit(executor, poolName, 'disable')
         const unitWarnings = unitWarning ? [unitWarning] : []
 

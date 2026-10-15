@@ -167,7 +167,12 @@ describe('destroy endpoint: DELETE /v1/pools/:name', () => {
     assert.ok(res.headers['x-anas-confirm-code'])
   })
 
-  it('blocks destroying the root pool with 409 PROTECTED_RESOURCE and no confirm code', async () => {
+  // Story cr.23: the well-known-name block is gone. On this mock — an ext4
+  // root node whose boot facts and mount table are readable — a pool merely
+  // NAMED rpool is no longer protected by name; it meets the verdict any
+  // unknown pool meets. The facts-based refusals live in
+  // pools-destroy-system-pool.test.ts (controlled fixtures).
+  it('a pool named rpool is no longer blocked by name (cr.23) — same 404 as any unknown pool', async () => {
     server = createServer({ mock: true, logger: false })
 
     const res = await server.inject({
@@ -176,12 +181,11 @@ describe('destroy endpoint: DELETE /v1/pools/:name', () => {
       headers: IDENTITY_HEADERS,
     })
 
-    assert.equal(res.statusCode, 409)
-    assert.equal(res.json().error.code, 'PROTECTED_RESOURCE')
-    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    assert.equal(res.statusCode, 404)
+    assert.equal(res.json().error.code, 'NOT_FOUND')
   })
 
-  it('does not offer a confirm code even when the root pool is resent with one', async () => {
+  it('the name still offers no confirm path even when resent with a code (cr.23)', async () => {
     server = createServer({ mock: true, logger: false })
 
     const res = await server.inject({
@@ -190,8 +194,8 @@ describe('destroy endpoint: DELETE /v1/pools/:name', () => {
       headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': 'anything' },
     })
 
-    assert.equal(res.statusCode, 409)
-    assert.equal(res.json().error.code, 'PROTECTED_RESOURCE')
+    assert.equal(res.statusCode, 404)
+    assert.equal(res.json().error.code, 'NOT_FOUND')
     assert.equal(res.headers['x-anas-confirm-code'], undefined)
   })
 

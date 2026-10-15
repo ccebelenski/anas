@@ -319,6 +319,10 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
     serveBlankInventoryDisks(server, DISK_IDS)
     const mock = (server as unknown as { executor: MockExecutor }).executor
     mock.clearFixtures()
+    // cr.23: clearFixtures left every system-pool fact dark, and dark is now a
+    // fail-closed refusal. Seed a readable-quiet boot probe — the world this
+    // test is about is a failing `zpool add`, not a system pool.
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({
       command: '/usr/sbin/zpool',

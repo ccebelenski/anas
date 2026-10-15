@@ -205,6 +205,9 @@ describe('backup consistency derivation (backup2.3)', () => {
   it('reads its facts once and never stats a path (the hang trap)', async () => {
     const mock = new MockExecutor()
     mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: TABLE, stderr: '', exitCode: 0 } })
+    // The world is a node with NO ZFS: zfs list is ENOENT, so the footprint
+    // keeps the findmnt table it read (cr.23) instead of re-reading it.
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint'], throws: Object.assign(new Error('spawn /usr/sbin/zfs ENOENT'), { code: 'ENOENT' }) })
     // The boot probe (pvepool.1) fails open on these fixtures — no system facts.
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: FINDMNT, args: ['-n', '-o', 'SOURCE,FSTYPE', '/'], result: { stdout: '', stderr: '', exitCode: 1 } })
@@ -233,6 +236,9 @@ describe('backup consistency derivation (backup2.3)', () => {
   it('derives a whole archive list in order from ONE fact read', async () => {
     const mock = new MockExecutor()
     mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: TABLE, stderr: '', exitCode: 0 } })
+    // No-ZFS node (ENOENT), so the footprint's system-mount facts ride its own
+    // single findmnt read (cr.23) — the derivation adds none.
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint'], throws: Object.assign(new Error('spawn /usr/sbin/zfs ENOENT'), { code: 'ENOENT' }) })
     const out = await deriveArchiveConsistency(
       mock,
       [{ path: '/tank/media' }, { path: '/mnt/nas/x' }, { path: '/mnt/ahr1' }],

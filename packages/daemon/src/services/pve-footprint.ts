@@ -1,8 +1,10 @@
 import type { PveOwnership, PveStorageRef, SystemPoolFacts } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { ZfsMountpoint } from '../parsers/pve-storage.js'
+import type { SystemMountFacts } from './system-mounts.js'
 import { isPathWithin, pveOwnership, wouldBeClaimedByPve } from '@anas/shared'
 import { matchMountpoint, pathOnZfsFilesystem, PVE_STORAGE_CFG, readPveStorages, readZfsMountpointsFull } from '../parsers/pve-storage.js'
+import { readSystemMountPools, systemMountPoolsFromNodes } from './system-mounts.js'
 
 /**
  * PVE footprint ownership — the ONE daemon service that answers "does PVE own
@@ -115,9 +117,9 @@ export function buildSystemPoolFacts(
  * UNREADABLE, and the caller tightens toward hands-off accordingly (see
  * {@link loadPveFootprint}) — a missing fact may never loosen the gate. The
  * failure is logged ONCE per process, not once per request — a system pool
- * whose facts went dark must not flood journald, and the destroy route's
- * `isRootPool` name/proc-mounts block is still there behind it for the common
- * shapes.
+ * whose facts went dark must not flood journald. Behind this probe the
+ * mount-table facts (story cr.23) keep answering; when BOTH went dark the
+ * system-pool rule refuses the verb outright.
  */
 let systemFactsWarned = false
 
@@ -367,14 +369,30 @@ export interface PveFootprint {
    */
   sharePathClaim: (path: string) => SharePathClaim | null
   /**
-   * Does this pool hold this node's boot filesystem (bootfs set or hosting /) —
-   * or is it a zfspool pool whose boot facts are UNREADABLE (the whole-pool
-   * fallback answers true for it too)? While the STORAGES are unreadable it is
-   * true for every pool: pool-level destructive verbs refuse hard.
+   * Does this pool hold this node's boot filesystem (bootfs set or hosting /),
+   * or does the live mount table show one of its filesystems at a system path
+   * (story cr.23 — facts, never names)? Or is it a zfspool pool whose boot
+   * facts are UNREADABLE (the whole-pool fallback answers true for it too),
+   * or did BOTH the mount table and the boot facts go dark — in which case
+   * nothing can disprove it and the verb is refused (cr.23)? While the
+   * STORAGES are unreadable it is true for every pool: pool-level destructive
+   * verbs refuse hard.
    */
   isSystemPool: (pool: string) => boolean
   /** The pool's boot facts when it is a system pool, else null. */
   systemPoolFacts: (pool: string) => SystemPoolFacts | null
+  /**
+   * Which pools hold storage at a system path (story cr.23) — the live mount
+   * table's answer, decided on facts not names. `null` when the table could
+   * NOT be read: UNREADABLE, and together with unreadable boot facts it makes
+   * {@link isSystemPool} true for every pool. Missing facts may only tighten.
+   */
+  systemMountFacts: SystemMountFacts | null
+  /**
+   * The system path one of this pool's filesystems is mounted at (cr.23), or
+   * null when no mount fact fires for it — the refusal sentence names it.
+   */
+  systemMountTarget: (pool: string) => string | null
 }
 
 /**
@@ -395,11 +413,18 @@ export async function loadPveFootprint(
   const mountRead = await readZfsMountpointsFull(executor)
   const zfsMountpoints = mountRead?.mountpoints ?? null
   const findmntNodes = mountRead?.findmntNodes ?? null
-  const [readStorages, readFacts] = await Promise.all([
+  const [readStorages, readFacts, readMountFacts] = await Promise.all([
     // Explicit override, then the daemon-wide env override, then the real path
     // — the same resolution server.ts hands the route-level consumers.
     readPveStorages(opts.pveStorageCfg ?? process.env.ANAS_STORAGE_CFG ?? PVE_STORAGE_CFG, zfsMountpoints),
     readSystemPoolFacts(executor),
+    // cr.23: the system-path mount facts ride the findmnt table this request
+    // already read (zero extra I/O); when that table did not make it through
+    // (its read failed, or the zfs list ahead of it did) the fact still
+    // deserves its own read before the gate tightens.
+    findmntNodes !== null
+      ? Promise.resolve(systemMountPoolsFromNodes(findmntNodes))
+      : readSystemMountPools(executor),
   ])
   // UNREADABLE ≠ empty (pvepool.1 review fix 1): null storages tighten every
   // answer below until the config can be read again.
@@ -417,6 +442,10 @@ export async function loadPveFootprint(
     .filter(d => pathOnZfsFilesystem(d.path, findmntNodes) !== false)
   const systemFactsUnavailable = readFacts === null
   const systemFacts = readFacts ?? []
+  // cr.23: null = the mount table could NOT be read (UNREADABLE, tightens);
+  // a { zfs: {}, ahr: {} } result is a READ answer of "no pool at a system
+  // path".
+  const mountFacts = readMountFacts
 
   const factsFor = (pool: string): SystemPoolFacts | null =>
     systemFacts.find(f => f.pool === pool) ?? null
@@ -485,9 +514,21 @@ export async function loadPveFootprint(
       const f = factsFor(pool)
       if (f !== null && (f.bootfs !== undefined || f.rootDataset !== undefined))
         return true
+      // cr.23: the mount-table fact — one of the pool's own filesystems sits
+      // at a system path. Facts, never names: a data pool called `rpool` on
+      // an ext4-root node answers false here, a root pool called anything
+      // else answers true.
+      if (mountFacts !== null && mountFacts.zfs.has(pool))
+        return true
+      // cr.23: neither the mount table nor the boot facts can be read — the
+      // verb is refused. A missing fact may only tighten the gate.
+      if (systemFactsUnavailable && mountFacts === null)
+        return true
       return systemFactsUnavailable && hasZfspoolRef(pool)
     },
     systemPoolFacts: factsFor,
+    systemMountFacts: mountFacts,
+    systemMountTarget: (pool: string) => mountFacts?.zfs.get(pool) ?? null,
   }
 }
 
@@ -513,29 +554,82 @@ export function pveNamingGuardMessage(storage: string, name: string): string {
 export function systemPoolRefusal(
   pool: string,
   facts: SystemPoolFacts | null,
-  opts: { storagesUnavailable?: boolean } = {},
+  opts: {
+    storagesUnavailable?: boolean
+    /** The system path one of the pool's filesystems is mounted at (cr.23). */
+    mountTarget?: string | null
+    /** The boot-facts probe failed (cr.23). */
+    bootFactsUnavailable?: boolean
+    /** The mount table could not be read (cr.23). */
+    mountTableUnavailable?: boolean
+  } = {},
 ): { reason: 'system-pool', message: string } {
   if (opts.storagesUnavailable) {
     // The real cause is the storage configuration: with it unreadable nothing
     // can be judged — not whether the pool hosts a zfspool storage, not the
-    // boot facts — so the sentence says that, and only that.
+    // boot facts, not the mount table — so the sentence says that, and only
+    // that.
     return {
       reason: 'system-pool',
       message: `PVE storage configuration is unreadable (${PVE_STORAGE_CFG}) — pool '${pool}' is treated as a system pool until it can be read — ANAS never destroys, exports or remounts a system pool`,
     }
   }
+  // The sentence names the FACT that fired (cr.23, on pvepool.1 review fix
+  // 4's shape): a boot fact first (it is the pool's reason to exist on this
+  // node), then the mount fact, then the facts that went dark.
+  const boot = facts?.bootfs ?? facts?.rootDataset
+  if (boot !== undefined) {
+    return {
+      reason: 'system-pool',
+      message: `Pool '${pool}' holds this node's boot filesystem (${boot}) — ANAS never destroys, exports or remounts a system pool`,
+    }
+  }
+  if (opts.mountTarget !== null && opts.mountTarget !== undefined) {
+    return {
+      reason: 'system-pool',
+      message: `Pool '${pool}' is mounted at ${opts.mountTarget} — ANAS never destroys, exports or remounts a system pool`,
+    }
+  }
+  if (opts.bootFactsUnavailable && opts.mountTableUnavailable) {
+    return {
+      reason: 'system-pool',
+      message: `Pool '${pool}' is treated as a system pool (the mount table and boot facts are unreadable) — ANAS never destroys, exports or remounts a system pool`,
+    }
+  }
   if (facts === null) {
     // Reachable since the unreadable-facts fallback: the pool hosts a PVE
     // zfspool storage but the boot facts could not be read — refuse on that,
-    // without claiming a boot filesystem no one could verify.
+    // without claiming a boot filesystem no one could verify. (The mount
+    // table WAS readable here — the branch above covers its unreadable twin,
+    // and a mount-path hit answers first.)
     return {
       reason: 'system-pool',
       message: `Pool '${pool}' is treated as a system pool (boot facts unreadable; it hosts a PVE zfspool storage) — ANAS never destroys, exports or remounts a system pool`,
     }
   }
-  const boot = facts.bootfs ?? facts.rootDataset ?? pool
+  // A pool with boot facts but neither field set cannot fire isSystemPool on
+  // them — kept for the sentence's totality, same as before cr.23.
   return {
     reason: 'system-pool',
-    message: `Pool '${pool}' holds this node's boot filesystem (${boot}) — ANAS never destroys, exports or remounts a system pool`,
+    message: `Pool '${pool}' holds this node's boot filesystem (${pool}) — ANAS never destroys, exports or remounts a system pool`,
   }
+}
+
+/**
+ * The refusal for a footprint that already answered {@link
+ * PveFootprint.isSystemPool} true — the one mapping from the footprint's
+ * three-valued facts to the sentence naming the fact that fired, so every
+ * door (destroy, export, change mount, the vdev pre-flight) states it
+ * identically (cr.23).
+ */
+export function systemPoolRefusalFrom(
+  pve: Pick<PveFootprint, 'systemPoolFacts' | 'systemMountTarget' | 'systemMountFacts' | 'systemFactsUnavailable' | 'storagesUnavailable'>,
+  pool: string,
+): { reason: 'system-pool', message: string } {
+  return systemPoolRefusal(pool, pve.systemPoolFacts(pool), {
+    storagesUnavailable: pve.storagesUnavailable,
+    mountTarget: pve.systemMountTarget(pool),
+    bootFactsUnavailable: pve.systemFactsUnavailable,
+    mountTableUnavailable: pve.systemMountFacts === null,
+  })
 }

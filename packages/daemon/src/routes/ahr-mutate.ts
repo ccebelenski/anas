@@ -32,6 +32,7 @@ import { kernelInfo } from '../services/kernel-version.js'
 import { poolReferenceKey, poolReferenceWarning, poolReferenceWarnings, readPoolReferences } from '../services/pool-references.js'
 import { mdSysPath, readMdAttrOrNull } from '../services/selfheal-io.js'
 import { readMdGeometry } from '../services/selfheal-map.js'
+import { ahrSystemMountRefusal, readSystemMountPools, systemMountPoolsFromJson } from '../services/system-mounts.js'
 import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
 
@@ -759,6 +760,17 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         + `and a remount would be forced read-only again by the first one. Detach the cache first (no data is lost — a writethrough cache holds no only copy), then Remount` } }
     }
 
+    // Story cr.23: the system-pool rule (same one destroy asks — an AHR pool
+    // has no boot facts, the live mount table is the whole answer). The
+    // unmount pulls whatever the pool holds at a system path away from the
+    // running node; an unreadable table is treated as a system pool.
+    const mountFacts = await readSystemMountPools(executor, AHR_FINDMNT_ARGS)
+    const systemPoolRefusal = ahrSystemMountRefusal(name, mountFacts)
+    if (systemPoolRefusal) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: systemPoolRefusal.reason, message: systemPoolRefusal.message } }
+    }
+
     const remountHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool)
     if (remountHeld) {
       reply.code(409)
@@ -818,6 +830,21 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       return { error: { code: 'CONFLICT', message: `AHR pool '${name}' has an expansion being driven right now. Wait for it to finish or halt before destroying the pool` } }
     }
 
+    // Story cr.23: the system-pool rule — an AHR pool has no boot facts, so
+    // the live mount table is its whole answer. A pool with one of its own
+    // filesystems at a system path, or an unreadable table (fail closed: a
+    // missing fact may only tighten the gate), is never destroyed. Hard 409,
+    // no confirm bypass. ONE read: the submount warnings below consume it too.
+    const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
+    const systemPoolRefusal = ahrSystemMountRefusal(
+      name,
+      findmntRes.exitCode === 0 ? systemMountPoolsFromJson(findmntRes.stdout) : null,
+    )
+    if (systemPoolRefusal) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: systemPoolRefusal.reason, message: systemPoolRefusal.message } }
+    }
+
     // Story iscsi.6: a LUN's image file on this pool makes the destroy unsafe
     // NOW — every array, partition and byte goes, including the file LIO is
     // serving, and nothing in ZFS/btrfs/md is going to refuse it. Hard 409, no
@@ -837,7 +864,8 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       `Pool '${name}' (${fmtBytes(pool.capacity.usableBytes)} usable) will be permanently destroyed. Every array, partition, and all data is erased`,
       `The filesystem at '${pool.mountpoint}' will be unmounted: anything serving from it (shares, backups, mounts) stops working`,
     ]
-    const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
+    // cr.23: the table read above for the system-pool gate — same read feeds
+    // the consumer warnings (one read per request, Principle 11).
     if (findmntRes.exitCode === 0) {
       for (const m of parseFindmnt(findmntRes.stdout)) {
         if (m.target.startsWith(`${pool.mountpoint}/`))

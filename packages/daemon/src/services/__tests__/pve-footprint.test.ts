@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { parsePveStorageCfg } from '../../parsers/pve-storage.js'
-import { buildSystemPoolFacts, loadPveFootprint, ownedDescendantIn, ownershipFromFootprintData, parseBootfsGet, parseRootMount, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage, readSystemPoolFacts, systemPoolRefusal } from '../pve-footprint.js'
+import { buildSystemPoolFacts, loadPveFootprint, ownedDescendantIn, ownershipFromFootprintData, parseBootfsGet, parseRootMount, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage, readSystemPoolFacts, systemPoolRefusal, systemPoolRefusalFrom } from '../pve-footprint.js'
 
 /**
  * Story pvepool.1 — the system-pool half of the footprint service. The boot
@@ -141,6 +141,15 @@ describe('loadPveFootprint — unreadable boot facts fall back to the whole-pool
       args: ['get', '-H', '-o', 'name,value', 'bootfs'],
       result: { stdout: '', stderr: 'zpool get: cannot open pool: no such pool', exitCode: 1 },
     })
+    // cr.23: a READABLE mount table is a readable fact — seed the ext4-root
+    // table every ordinary PVE node has, so this test keeps testing exactly
+    // what it always tested (the boot-facts fallback), not the both-facts-
+    // dark tightening below.
+    mock.addFixture({
+      command: '/usr/bin/findmnt',
+      args: ['--json'],
+      result: { stdout: JSON.stringify({ filesystems: [{ target: '/', source: '/dev/mapper/pve-root', fstype: 'ext4', options: 'rw' }] }), stderr: '', exitCode: 0 },
+    })
     const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
     assert.equal(fp.systemFactsUnavailable, true)
 
@@ -181,6 +190,55 @@ describe('loadPveFootprint — unreadable boot facts fall back to the whole-pool
     // The sibling outside the boot tree stays manageable — the relaxation.
     assert.equal(fp.ownershipOf('tank/media'), null)
     assert.equal(fp.isSystemPool('tank'), true)
+  })
+})
+
+// --- cr.23: NEITHER fact readable → every verb refused ----------------------
+
+describe('loadPveFootprint — neither the mount table nor the boot facts readable tightens every pool (cr.23)', () => {
+  let dir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-cr23-dark-'))
+    await writeFile(join(dir, 'storage.cfg'), 'zfspool: local-zfs\n\tpool tank\n\tcontent images,rootdir\n\n', 'utf8')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('both dark: any pool — zfspool ref or not — is treated as a system pool, and the sentence names both facts', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: '/usr/sbin/zpool',
+      args: ['get', '-H', '-o', 'name,value', 'bootfs'],
+      result: { stdout: '', stderr: 'zpool get: cannot open pool: no such pool', exitCode: 1 },
+    })
+    // findmnt unseeded: the mock answers 127 — the table is UNREADABLE too.
+    const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
+    assert.equal(fp.systemFactsUnavailable, true)
+    assert.equal(fp.systemMountFacts, null)
+    // Missing facts may only tighten: even a pool with no PVE storage ref.
+    assert.equal(fp.isSystemPool('tank'), true)
+    assert.equal(fp.isSystemPool('other'), true)
+    assert.equal(
+      systemPoolRefusalFrom(fp, 'other').message,
+      `Pool 'other' is treated as a system pool (the mount table and boot facts are unreadable) — ANAS never destroys, exports or remounts a system pool`,
+    )
+  })
+
+  it('only the mount table dark with boot facts readable and quiet answers NO, not refuse', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: '/usr/sbin/zpool',
+      args: ['get', '-H', '-o', 'name,value', 'bootfs'],
+      result: { stdout: 'tank\t-\n', stderr: '', exitCode: 0 },
+    })
+    // findmnt unseeded → 127; the boot facts are a readable answer of "no
+    // boot pool among these", and the story refuses only when NEITHER reads.
+    const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
+    assert.equal(fp.systemFactsUnavailable, false)
+    assert.equal(fp.systemMountFacts, null)
+    assert.equal(fp.isSystemPool('tank'), false)
   })
 })
 
