@@ -22,7 +22,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, wr
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { MountCifsSec, MountExtraOptions, MountNfsSec, normalizeMountTarget } from '@anas/shared'
+import { MountCifsSec, MountExtraOptions, MountNfsSec, normalizeMountTarget, unescapeFstabField } from '@anas/shared'
 import { classifyKind, isIgnoredMount, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { cifsAuthToken, getMount, inlineCommentIndex, parseFstab } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
@@ -1365,7 +1365,8 @@ export function fstabLineFor(fstabText: string, mountpoint: string): string | un
     const hashIdx = inlineCommentIndex(raw)
     const fieldsPart = hashIdx === -1 ? raw : raw.slice(0, hashIdx)
     const fields = fieldsPart.trim().split(WHITESPACE_RE)
-    if (fields.length >= 2 && fields[1] === mountpoint)
+    // The field is octal-escaped (`\040` for a space, cr.2); compare decoded.
+    if (fields.length >= 2 && unescapeFstabField(fields[1]) === mountpoint)
       return raw
   }
   return undefined

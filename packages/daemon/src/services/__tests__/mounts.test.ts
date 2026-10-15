@@ -18,6 +18,7 @@ import {
   credsFileName,
   entryForResponse,
   formatCredentials,
+  fstabLineFor,
   hasInlineCredentials,
   legacyCredsFileName,
   mapCifsFailure,
@@ -746,3 +747,12 @@ describe('removeEmptyMountpointDir', () => {
 function baseCommon() {
   return { readOnly: false, nofail: true, noauto: false, automount: false, noatime: false, nosuid: false, nodev: false, noexec: false, netdev: false }
 }
+
+describe('fstabLineFor (node pass R2-D1)', () => {
+  it('finds the line of a mountpoint whose fstab field is octal-escaped', () => {
+    const line = '//127.0.0.1/anas\\040proof /mnt/anas\\040proof cifs credentials=/x,nofail 0 0'
+    const text = `proc /proc proc defaults 0 0\n${line}\n`
+    assert.equal(fstabLineFor(text, '/mnt/anas proof'), line)
+    assert.equal(fstabLineFor(text, '/mnt/anas\\040proof'), undefined)
+  })
+})
