@@ -1,12 +1,12 @@
-import type { FastifyInstance, FastifyReply } from 'fastify'
+import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { AccessService, AhrAccessTarget } from '../services/access.js'
+import type { AccessOutcome, AccessService, AhrAccessTarget, SetAccessPlan } from '../services/access.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { PoolName, SetAccessRequest } from '@anas/shared'
-import { confirmGate } from '../safety/gate.js'
-import { createAccessService } from '../services/access.js'
+import { guardCheck, guardConfirm, guarded, sendRefusal } from '../safety/guard.js'
+import { createAccessService, SET_ACCESS_PRESENTATION_ONLY, signedAccessRequest } from '../services/access.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { requireIdentity } from './identity.js'
 
@@ -41,43 +41,41 @@ export async function ahrAccessRoutes(
   const access = opts.accessService ?? createAccessService({ executor, iscsiPaths: opts.iscsiPaths ?? {} })
 
   /**
-   * Pool name → the pool's mounted directory, or the refusal already sent.
-   * 404 for an unknown pool and for an unmounted one — the same answer the
-   * datasets editor gives an unmounted dataset: access applies to a directory.
+   * Pool name → the pool's mounted directory, or the refusal. 404 for an
+   * unknown pool and for an unmounted one — the same answer the datasets
+   * editor gives an unmounted dataset: access applies to a directory.
    */
-  async function resolveTarget(raw: string, reply: FastifyReply): Promise<AhrAccessTarget | null> {
+  async function resolve(raw: string): Promise<AccessOutcome<AhrAccessTarget>> {
     const parsed = PoolName.safeParse(raw)
-    if (!parsed.success) {
-      reply.code(400)
-      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${parsed.error.issues[0]?.message}` } })
-      return null
-    }
+    if (!parsed.success)
+      return { ok: false, failure: { status: 400, body: { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${parsed.error.issues[0]?.message}` } } } }
     const name = parsed.data
     const pool = (await readAhrPools(executor)).find(p => p.name === name)
-    if (!pool) {
-      reply.code(404)
-      reply.send({ error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } })
-      return null
-    }
-    if (!pool.mounted || !pool.mountpoint.startsWith('/')) {
-      reply.code(404)
-      reply.send({ error: { code: 'NOT_FOUND', message: `AHR pool '${name}' is not a mounted filesystem` } })
-      return null
-    }
+    if (!pool)
+      return { ok: false, failure: { status: 404, body: { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } } } }
+    if (!pool.mounted || !pool.mountpoint.startsWith('/'))
+      return { ok: false, failure: { status: 404, body: { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' is not a mounted filesystem` } } } }
     return {
-      kind: 'ahr',
-      pool: name,
-      mountpoint: pool.mountpoint,
-      record: { name: pool.name, mountpoint: pool.mountpoint, mounted: pool.mounted },
+      ok: true,
+      value: {
+        kind: 'ahr',
+        pool: name,
+        mountpoint: pool.mountpoint,
+        record: { name: pool.name, mountpoint: pool.mountpoint, mounted: pool.mounted },
+        // cr.33 §4.2: the pool's lock key.
+        ...(pool.vg.uuid ? { vgUuid: pool.vg.uuid } : {}),
+      },
     }
   }
 
   // --- GET /ahr/:name/access ----------------------------------------------
   server.get<{ Params: { name: string } }>('/ahr/:name/access', async (request, reply) => {
-    const target = await resolveTarget(request.params.name, reply)
-    if (!target)
-      return reply
-    const read = await access.readAccess(target)
+    const target = await resolve(request.params.name)
+    if (!target.ok) {
+      reply.code(target.failure.status)
+      return target.failure.body
+    }
+    const read = await access.readAccess(target.value)
     if (!read.ok) {
       reply.code(read.failure.status)
       return read.failure.body
@@ -98,34 +96,42 @@ export async function ahrAccessRoutes(
     if (!identity)
       return
 
-    const target = await resolveTarget(request.params.name, reply)
-    if (!target)
-      return reply
+    // Story cr.37: the one `fs.setAccess` guard spec — the pool resolves to
+    // its mount (404), a PVE storage path at or above the mount (400) and,
+    // for applyToExisting, one inside the tree (400), the directory read and
+    // the plan from its live state, whose revision the confirm and the job
+    // bind. The job runs them all again before anything is written.
+    const spec = access.setAccessGuardSpec({
+      what: `AHR pool '${request.params.name}'`,
+      address: { pool: request.params.name },
+      req,
+      resolve: () => resolve(request.params.name),
+    })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const plan = pre.object.plan as SetAccessPlan
 
-    // PVE storage path at or above the mount (400), and — for
-    // applyToExisting — a PVE storage path inside the tree (400), before any
-    // command runs.
-    const refused = await access.guardPathTarget(target, req)
-    if (refused) {
-      reply.code(refused.status)
-      return refused.body
+    // A recursive apply is confirm-gated (ruling 2026-10-11), asked last;
+    // cr.37: bound to the whole request and the ACL revision.
+    if (plan.recursive) {
+      const confirm = await access.recursiveConfirm(plan.target, { named: plan.hasNamed })
+      if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+        validated: { pool: request.params.name, ...signedAccessRequest(req) },
+        address: ['pool'],
+        presentationOnly: SET_ACCESS_PRESENTATION_ONLY,
+        message: confirm.message,
+        warnings: confirm.warnings,
+      })) {
+        return reply
+      }
     }
-
-    const planned = await access.planSetAccess(target, req)
-    if (!planned.ok) {
-      reply.code(planned.failure.status)
-      return planned.failure.body
-    }
-    const plan = planned.value
-
-    // A recursive apply is confirm-gated (ruling 2026-10-11), asked last.
-    if (plan.recursive && !confirmGate(confirmStore, request, reply, await access.recursiveConfirm(plan.target, { named: plan.hasNamed })))
-      return reply
 
     const job = jobQueue.submit(
       'fs.setAccess',
       { ...identity, params: access.jobParams(plan) },
-      async updateProgress => access.runSetAccess(plan, updateProgress),
+      guarded(spec, pre, async (_o, ctx) => access.runSetAccess(plan, ctx.updateProgress)),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }

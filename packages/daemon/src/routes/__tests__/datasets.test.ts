@@ -415,9 +415,9 @@ describe('datasets routes', () => {
       assert.ok(res.headers['x-anas-confirm-code'])
     })
 
-    it('proceeds to 202 when resent with a valid code — and recursive is NOT in the signature', async () => {
+    it('cr.37: recursive IS in the signature — a code minted without it is 409 CONFIRM_SCOPE_CHANGED naming it; the matching code proceeds', async () => {
       server = createServer({ mock: true, logger: false })
-      // Challenge WITHOUT recursive (chosen after the challenge is issued)...
+      // Challenge WITHOUT recursive...
       const first = await server.inject({
         method: 'DELETE',
         url: '/v1/pools/testpool/datasets/media',
@@ -425,15 +425,25 @@ describe('datasets routes', () => {
       })
       assert.equal(first.statusCode, 409)
       const code = first.headers['x-anas-confirm-code'] as string
-      // ...then resend WITH recursive=true. If recursive were bound into the
-      // confirm signature this would 409 again (the pool-destroy bug).
+      // ...then resend WITH recursive=true: the code was minted for another
+      // request (the confirm window re-challenges in place instead, cr.44).
       const res = await server.inject({
         method: 'DELETE',
         url: '/v1/pools/testpool/datasets/media?recursive=true',
         headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code },
       })
-      assert.equal(res.statusCode, 202)
-      const body = res.json() as JobAccepted
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+      assert.deepEqual(res.json().error.changed, ['recursive'])
+      assert.equal(res.json().error.message, 'You confirmed with recursive off; this request has recursive on — confirm again')
+      // The fresh code it carries confirms exactly that request.
+      const again = await server.inject({
+        method: 'DELETE',
+        url: '/v1/pools/testpool/datasets/media?recursive=true',
+        headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': res.headers['x-anas-confirm-code'] as string },
+      })
+      assert.equal(again.statusCode, 202, again.body)
+      const body = again.json() as JobAccepted
       assert.equal(body.job.operation, 'zfs.destroy')
       const job = await waitForJob(server, body.job.id)
       assert.equal(job.status, 'completed')

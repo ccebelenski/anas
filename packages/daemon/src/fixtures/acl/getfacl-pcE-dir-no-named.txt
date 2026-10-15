@@ -1,0 +1,4 @@
+user::rwx
+group::r-x
+other::r-x
+

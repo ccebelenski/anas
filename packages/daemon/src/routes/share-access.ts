@@ -1,10 +1,10 @@
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { AccessService } from '../services/access.js'
+import type { AccessService, SetAccessPlan } from '../services/access.js'
 import { SetAccessRequest } from '@anas/shared'
-import { confirmGate } from '../safety/gate.js'
-import { targetBacking } from '../services/access.js'
+import { guardCheck, guardConfirm, guarded, sendRefusal } from '../safety/guard.js'
+import { SET_ACCESS_PRESENTATION_ONLY, signedAccessRequest, targetBacking } from '../services/access.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -42,25 +42,40 @@ export function shareAccessHandlers(opts: { access: AccessService, jobQueue: Job
     if (!identity)
       return
 
-    const target = await access.resolveShareTarget(path)
-    const refused = await access.guardPathTarget(target, req)
-    if (refused) {
-      reply.code(refused.status)
-      return refused.body
+    // Story cr.37: the one `fs.setAccess` guard spec — the path resolves onto
+    // its home, the path gates (PVE territory at or above it, and for
+    // applyToExisting inside it), the directory read and the plan from its
+    // live state, whose revision the confirm and the job bind. The job runs
+    // them all again before anything is written.
+    const spec = access.setAccessGuardSpec({
+      what: `Share path '${path}'`,
+      address: { path },
+      req,
+      resolve: async () => ({ ok: true, value: await access.resolveShareTarget(path) }),
+    })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const plan = pre.object.plan as SetAccessPlan
+    // A recursive apply is confirm-gated (ruling 2026-10-11), asked last;
+    // cr.37: bound to the whole request and the ACL revision.
+    if (plan.recursive) {
+      const confirm = await access.recursiveConfirm(plan.target, { named: plan.hasNamed })
+      if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+        validated: { path, ...signedAccessRequest(req) },
+        address: ['path'],
+        presentationOnly: SET_ACCESS_PRESENTATION_ONLY,
+        message: confirm.message,
+        warnings: confirm.warnings,
+      })) {
+        return reply
+      }
     }
-    const planned = await access.planSetAccess(target, req)
-    if (!planned.ok) {
-      reply.code(planned.failure.status)
-      return planned.failure.body
-    }
-    const plan = planned.value
-    // A recursive apply is confirm-gated (ruling 2026-10-11), asked last.
-    if (plan.recursive && !confirmGate(confirmStore, request, reply, await access.recursiveConfirm(plan.target, { named: plan.hasNamed })))
-      return reply
     const job = jobQueue.submit(
       'fs.setAccess',
       { ...identity, params: { ...audit, ...access.jobParams(plan) } },
-      async updateProgress => access.runSetAccess(plan, updateProgress),
+      guarded(spec, pre, async (_o, ctx) => access.runSetAccess(plan, ctx.updateProgress)),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }

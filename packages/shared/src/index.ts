@@ -357,6 +357,7 @@ export {
   DatasetListDefaults,
   DatasetProperties,
   DatasetType,
+  DestroyDatasetQuery,
   MountpointPermissions,
   RecordSize,
   UpdateDatasetPropertiesRequest,
@@ -641,6 +642,7 @@ export {
   CloneSnapshotRequest,
   CreateSnapshotRequest,
   RenameSnapshotRequest,
+  RollbackSnapshotQuery,
   Snapshot,
 } from './schemas/snapshots.js'
 

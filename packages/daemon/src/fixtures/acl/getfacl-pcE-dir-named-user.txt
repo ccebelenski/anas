@@ -1,0 +1,6 @@
+user::rwx
+user:nobody:r-x
+group::r-x
+mask::r-x
+other::r-x
+

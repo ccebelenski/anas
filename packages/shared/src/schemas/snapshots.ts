@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { ISODateTime, NewSnapshotName, PoolName, reservedDatasetSegment, reservedDatasetSegmentMessage } from './common.js'
+import { PoolQueryFlag } from './zfs.js'
 
 // --- Read model ---
 
@@ -68,6 +69,18 @@ export const CloneSnapshotRequest = z.object({
     }),
 })
 export type CloneSnapshotRequest = z.infer<typeof CloneSnapshotRequest>
+
+/**
+ * Query params for POST …/snapshots/:snap/rollback (story cr.37). `force` is
+ * `zfs rollback -r`: it destroys every snapshot and bookmark newer than the
+ * target. Read leniently like the pool-destroy cleanup flag ({@link
+ * PoolQueryFlag}: `true` or `1` is on, anything else off) and normalised before
+ * the confirm signs it — absent and an explicit `false` sign the same.
+ */
+export const RollbackSnapshotQuery = z.object({
+  force: PoolQueryFlag,
+})
+export type RollbackSnapshotQuery = z.infer<typeof RollbackSnapshotQuery>
 
 // Rollback (POST …/snapshots/:snap/rollback) and destroy (DELETE) need no body:
 // the snapshot is identified by the URL. Rollback is dangerous and goes through

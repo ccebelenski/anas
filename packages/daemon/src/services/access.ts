@@ -1,12 +1,17 @@
-import type { AccessEntry, AccessLevel, DatasetAccess, MountpointPermissions, SetAccessRequest, ShareAccessGrantResult } from '@anas/shared'
+import type { AccessEntry, AccessLevel, DatasetAccess, ErrorCode, MountpointPermissions, SetAccessRequest, ShareAccessGrantResult } from '@anas/shared'
 import type { CommandExecutor, ExecOptions } from '../executor/types.js'
+import type { LockClaim } from '../jobs/locks.js'
 import type { ParsedAcl } from '../parsers/getfacl.js'
+import type { Gate, GuardReads, GuardSpec, Refusal } from '../safety/guard.js'
 import type { IscsiPaths } from './iscsi.js'
+import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { DatasetPath, isPathWithin } from '@anas/shared'
 import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
 import { parsePveMountPaths, PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
 import { parseDatasetGet, parseZfsList, zfsListArgs } from '../parsers/zfs-list.js'
+import { ahrClaim, ahrnameClaim, zfsClaims, znameClaim } from '../safety/guard.js'
+import { readPoolGuid } from '../safety/stable-id.js'
 import { heldByLunOnce } from './iscsi-held.js'
 import { loadPveFootprint, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from './pve-footprint.js'
 import { resolveSelfServiceTarget } from './share-selfservice.js'
@@ -75,13 +80,20 @@ const WHITESPACE_RE = /\s+/
 /** Where a share path lives — the home its ACL switch and gates come from. */
 export type ShareHome
   = | { kind: 'zfs', dataset: string }
-    | { kind: 'ahr', pool: string, record: { name: string, mountpoint: string, mounted: boolean } }
+    | { kind: 'ahr', pool: string, record: { name: string, mountpoint: string, mounted: boolean }, vgUuid?: string }
     | null
 
 /** The ZFS target: a mounted filesystem dataset (or the pool-root dataset). */
 export interface ZfsAccessTarget { kind: 'zfs', dataset: string, mountpoint: string }
 /** The AHR target: the pool's `@data` mount (or the flat top level). */
-export interface AhrAccessTarget { kind: 'ahr', pool: string, mountpoint: string, record: { name: string, mountpoint: string, mounted: boolean } }
+export interface AhrAccessTarget {
+  kind: 'ahr'
+  pool: string
+  mountpoint: string
+  record: { name: string, mountpoint: string, mounted: boolean }
+  /** The pool's LVM VG UUID — its lock key (cr.33 §4.2); absent when LVM did not report it. */
+  vgUuid?: string
+}
 /** A share's path, resolved onto its home (ZFS dataset, AHR pool, or neither). */
 export interface ShareAccessTarget { kind: 'share', path: string, home: ShareHome }
 
@@ -317,6 +329,51 @@ export interface SetAccessPlan {
   hasNamed: boolean
   aclAutoEnabled: boolean
   clearAcls: boolean
+  /**
+   * Story cr.37: the revision of the state this plan was computed from — a
+   * sha256 over the directory, its owner/group/mode, the ACL switch and the
+   * live ACL text. The job re-reads it and refuses STATE_CHANGED when it
+   * moved: the plan restates the named grants it READ, so running it over
+   * an ACL entry added since would silently delete that entry (F4).
+   */
+  revision: string
+}
+
+/**
+ * Story cr.37 (WAVE3-DESIGN §5.2 rule 1): the set-access request fields the
+ * recursive confirm does NOT sign. None: owner, group, entries, clearNamed
+ * and applyToExisting each change what the walk writes. The access tests pin
+ * the list.
+ */
+export const SET_ACCESS_PRESENTATION_ONLY: Record<string, string> = {}
+
+/** A set-access request with every field spelled out, so an omitted flag and its default sign the same. */
+export function signedAccessRequest(req: SetAccessRequest): Record<string, unknown> {
+  return {
+    owner: req.owner ?? null,
+    group: req.group ?? null,
+    entries: req.entries ?? null,
+    clearNamed: req.clearNamed === true,
+    applyToExisting: req.applyToExisting === true,
+  }
+}
+
+/**
+ * What a set-access guard reads (cr.37): the resolved target and the plan
+ * computed against its live state — or the refusal either produced, which
+ * the spec's gates answer in the route's order.
+ */
+export interface AccessObject {
+  target: AccessTarget | null
+  resolveFailure: AccessFailure | null
+  plan: SetAccessPlan | null
+  planFailure: AccessFailure | null
+}
+
+/** An {@link AccessFailure} as a guard {@link Refusal}. */
+function failureRefusal(f: AccessFailure): Refusal {
+  const { code, message, reason } = f.body.error
+  return { status: f.status, code: code as ErrorCode, message, ...(reason ? { reason } : {}) }
 }
 
 // ============================================================================
@@ -413,7 +470,7 @@ export function createAccessService(opts: AccessServiceOptions) {
       return { kind: 'share', path, home: { kind: 'zfs', dataset: home.dataset } }
     if (home?.kind === 'ahr') {
       const r = home.poolRecord
-      return { kind: 'share', path, home: { kind: 'ahr', pool: home.pool, record: { name: r.name, mountpoint: r.mountpoint, mounted: r.mounted } } }
+      return { kind: 'share', path, home: { kind: 'ahr', pool: home.pool, record: { name: r.name, mountpoint: r.mountpoint, mounted: r.mounted }, ...(r.vg.uuid ? { vgUuid: r.vg.uuid } : {}) } }
     }
     return { kind: 'share', path, home: null }
   }
@@ -731,11 +788,17 @@ export function createAccessService(opts: AccessServiceOptions) {
     // When ACLs are live, read the ACL once up front and reuse it for BOTH the
     // base-level fallback and the named grants we must preserve — one getfacl.
     let liveAcl: ParsedAcl | null = null
+    let aclRead: { exitCode: number, stdout: string } | null = null
     if (enabled && supported) {
       const r = await executor.exec(GETFACL, ['-pcE', dir])
+      aclRead = { exitCode: r.exitCode, stdout: r.stdout }
       if (r.exitCode === 0 && r.stdout.trim())
         liveAcl = parseGetfacl(r.stdout)
     }
+    // Story cr.37: every fact the plan below is computed from, as one hash.
+    const revision = createHash('sha256')
+      .update(JSON.stringify({ dir, perm: [perm.owner, perm.group, perm.mode], supported, enabled, acl: aclRead }))
+      .digest('hex')
 
     // Desired base three: a supplied entry overrides the current level, so a
     // partial request never silently drops an unmentioned base principal. The
@@ -796,6 +859,7 @@ export function createAccessService(opts: AccessServiceOptions) {
         hasNamed,
         aclAutoEnabled,
         clearAcls,
+        revision,
       },
     }
   }
@@ -957,6 +1021,90 @@ export function createAccessService(opts: AccessServiceOptions) {
     }
 
     return { ...ident, aclEnabled: enabled, aclAutoEnabled: false, namedCount: 0, clearedNamed: clearAcls }
+  }
+
+  // --- The guard (story cr.37) ---------------------------------------------------
+
+  /** The resolution refused (404 unknown / volume / unmounted, 400 a bad path). */
+  const resolvedGate: Gate<AccessObject> = async o => o.resolveFailure ? failureRefusal(o.resolveFailure) : null
+
+  /** The plan could not read the directory (404). */
+  const plannedGate: Gate<AccessObject> = async o => o.planFailure ? failureRefusal(o.planFailure) : null
+
+  /** An AHR or share target's PVE gates ({@link guardPathTarget}); a ZFS target brings its own. */
+  function pathGate(req: SetAccessRequest): Gate<AccessObject> {
+    return async (o) => {
+      if (!o.target || o.target.kind === 'zfs')
+        return null
+      const refused = await guardPathTarget(o.target, req)
+      return refused ? failureRefusal(refused) : null
+    }
+  }
+
+  /**
+   * The lock claims (cr.33 §4.2) a set-access job takes: exclusive on a ZFS
+   * dataset (`zfs:<pool guid>/<path>`, its ancestors shared), shared on an AHR
+   * pool (`ahr:<vg uuid>`). A pool whose key cannot be read is locked by its
+   * name key, exclusive (§4.2's fallback). A share path on neither has no key.
+   */
+  async function accessClaims(t: AccessTarget | null, reads: GuardReads): Promise<LockClaim[]> {
+    const dataset = t ? aclDatasetOf(t) : null
+    if (dataset !== null) {
+      const pool = dataset.split('/')[0]
+      const guid = (await reads.once(`pool-guid:${pool}`, () => readPoolGuid(executor, pool)))?.guid
+      return guid ? zfsClaims(guid, dataset, 'exclusive') : [znameClaim(pool)]
+    }
+    const ahr = t?.kind === 'ahr'
+      ? { pool: t.pool, vgUuid: t.vgUuid }
+      : t?.kind === 'share' && t.home?.kind === 'ahr' ? { pool: t.home.pool, vgUuid: t.home.vgUuid } : null
+    if (ahr)
+      return ahr.vgUuid ? [ahrClaim(ahr.vgUuid, 'shared', ahr.pool)] : [ahrnameClaim(ahr.pool)]
+    return []
+  }
+
+  /**
+   * The ONE guard spec of `fs.setAccess` (story cr.37, WAVE3-DESIGN §2.1/§2.3/
+   * §2.5 "set access" rows, F4), for every door: the datasets editor, the AHR
+   * editor and a share's Permissions. The object is the target resolved now
+   * and the plan computed against its live state; the revision is the hash of
+   * that state ({@link SetAccessPlan.revision}). The route binds it (with the
+   * whole request, for a recursive confirm); the job re-resolves, re-plans and
+   * refuses STATE_CHANGED when the revision moved — an ACL entry added after
+   * the plan is never deleted by a plan that did not know it. Gates, in the
+   * order the routes always asked them: the door's own (`before`: the ZFS
+   * ownership and recursive refusals, asked before the resolution so an owned
+   * volume answers 400 rather than 404), the resolution, the path gates of an
+   * AHR or share target, the directory read.
+   */
+  function setAccessGuardSpec(opts: {
+    what: string
+    /** How the confirm and the job params address the target: `{ dataset }`, `{ pool }`, `{ path }`. */
+    address: Record<string, string>
+    req: SetAccessRequest
+    resolve: () => Promise<AccessOutcome<AccessTarget>>
+    before?: Gate<AccessObject>[]
+  }): GuardSpec<AccessObject> {
+    const { what, address, req } = opts
+    return {
+      operation: 'fs.setAccess',
+      object: {
+        what,
+        read: async () => {
+          const target = await opts.resolve()
+          if (!target.ok)
+            return { target: null, resolveFailure: target.failure, plan: null, planFailure: null }
+          const planned = await planSetAccess(target.value, req)
+          return planned.ok
+            ? { target: target.value, resolveFailure: null, plan: planned.value, planFailure: null }
+            : { target: target.value, resolveFailure: null, plan: null, planFailure: planned.failure }
+        },
+        id: async () => ({ ...address }),
+        revision: async o => o.plan?.revision ?? null,
+        unbound: () => `Could not read the permissions of ${what} — refusing a change that cannot be bound to them`,
+      },
+      gates: [...(opts.before ?? []), resolvedGate, pathGate(req), plannedGate],
+      locks: (o, _bound, reads) => accessClaims(o.target, reads),
+    }
   }
 
   // --- The share grant (access.1) ------------------------------------------------
@@ -1149,5 +1297,6 @@ export function createAccessService(opts: AccessServiceOptions) {
     jobParams,
     runSetAccess,
     composeGrant,
+    setAccessGuardSpec,
   }
 }

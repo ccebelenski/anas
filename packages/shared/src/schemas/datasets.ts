@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { AbsolutePath, NewDatasetPath, PoolName } from './common.js'
 import { IscsiHeldByLun } from './iscsi.js'
-import { PveOwnership } from './zfs.js'
+import { PoolQueryFlag, PveOwnership } from './zfs.js'
 
 // --- Enums ---
 
@@ -288,6 +288,20 @@ export const UpdateDatasetPropertiesRequest = z.object({
     .refine(p => Object.keys(p).length > 0, 'at least one property required'),
 })
 export type UpdateDatasetPropertiesRequest = z.infer<typeof UpdateDatasetPropertiesRequest>
+
+/**
+ * Query params for DELETE /v1/pools/:name/datasets/*path (story cr.37). The
+ * flag is read the way the route always read it — `true` or `1` is on,
+ * anything else off ({@link PoolQueryFlag}) — and normalised BEFORE the
+ * confirm signs it, so an absent flag and the UI's explicit `?recursive=false`
+ * sign the same, and a resend with the other value is 409
+ * CONFIRM_SCOPE_CHANGED.
+ */
+export const DestroyDatasetQuery = z.object({
+  /** `zfs destroy -r`: the dataset with every child dataset and snapshot. */
+  recursive: PoolQueryFlag,
+})
+export type DestroyDatasetQuery = z.infer<typeof DestroyDatasetQuery>
 
 // Identity models (SystemUser/SystemGroup, ShareUser, …) live in identity.js —
 // they are shared by the getent pickers here and the Epic 8 management surface.

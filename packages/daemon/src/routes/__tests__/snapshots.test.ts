@@ -185,7 +185,7 @@ describe('snapshot routes (nested under datasets)', () => {
       assert.ok(warnings.some(w => w.includes('snap2')))
     })
 
-    it('proceeds to 202 when resent with a valid code — and force is NOT in the signature', async () => {
+    it('cr.37: force IS in the signature — a code minted without it is 409 CONFIRM_SCOPE_CHANGED naming it; the matching code proceeds', async () => {
       server = createServer({ mock: true, logger: false })
       // Challenge WITHOUT force...
       const first = await server.inject({
@@ -195,19 +195,50 @@ describe('snapshot routes (nested under datasets)', () => {
       })
       assert.equal(first.statusCode, 409)
       const code = first.headers['x-anas-confirm-code'] as string
-      // ...resend WITH force=true. If force were bound into the confirm
-      // signature this would 409 again (the pool-destroy bug).
+      // ...resend WITH force=true: the code was minted for another request
+      // (the confirm window re-challenges in place instead, cr.44).
       const res = await server.inject({
         method: 'POST',
         url: '/v1/pools/testpool/datasets/media/snapshots/snap1/rollback?force=true',
         headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code },
       })
-      assert.equal(res.statusCode, 202)
-      const body = res.json() as JobAccepted
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+      assert.deepEqual(res.json().error.changed, ['force'])
+      assert.equal(res.json().error.message, 'You confirmed with force off; this request has force on — confirm again')
+      const again = await server.inject({
+        method: 'POST',
+        url: '/v1/pools/testpool/datasets/media/snapshots/snap1/rollback?force=true',
+        headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': res.headers['x-anas-confirm-code'] as string },
+      })
+      assert.equal(again.statusCode, 202, again.body)
+      const body = again.json() as JobAccepted
       assert.equal(body.job.operation, 'zfs.rollback')
       const job = await waitForJob(server, body.job.id)
       assert.equal(job.status, 'completed')
       assert.equal((job.result as { rolledBack: string }).rolledBack, 'testpool/media@snap1')
+    })
+
+    it('cr.37: with force the challenge names every snapshot force destroys; without it, the plain hint', async () => {
+      server = createServer({ mock: true, logger: false })
+      const forced = await server.inject({
+        method: 'POST',
+        url: '/v1/pools/testpool/datasets/media/snapshots/snap1/rollback?force=true',
+        headers: IDENTITY_HEADERS,
+      })
+      const fw = forced.json().error.warnings as string[]
+      assert.ok(fw.includes('Force destroys the 1 snapshot(s) and bookmark(s) newer than \'snap1\' — irreversible.'), fw.join(' | '))
+      assert.ok(fw.includes('Destroyed by force: testpool/media@snap2.'), fw.join(' | '))
+      assert.ok(!fw.some(w => w.includes('rollback requires force')), fw.join(' | '))
+
+      const plain = await server.inject({
+        method: 'POST',
+        url: '/v1/pools/testpool/datasets/media/snapshots/snap1/rollback?force=false',
+        headers: IDENTITY_HEADERS,
+      })
+      const pw = plain.json().error.warnings as string[]
+      assert.ok(pw.some(w => w.includes('rollback requires force')), pw.join(' | '))
+      assert.ok(!pw.some(w => w.startsWith('Destroyed by force')), pw.join(' | '))
     })
 
     it('returns 404 for an unknown snapshot (before confirmation)', async () => {

@@ -1,20 +1,23 @@
 import type { AssociatedShare, CreateDatasetRequest, Dataset, DatasetDetail, DatasetListDefaults, IscsiHeldByLun, Snapshot, UpdateDatasetPropertiesRequest } from '@anas/shared'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
+import type { LockClaim, LockMode } from '../jobs/locks.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { AccessService } from '../services/access.js'
+import type { Advisory, Gate, GuardReads, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
+import type { AccessObject, AccessService, SetAccessPlan } from '../services/access.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
 import type { Transport } from '../services/replication-transport.js'
-import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, lunGrowGuidance, PoolName, RenameSnapshotRequest, reservedDatasetSegment, SetAccessRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
+import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, DestroyDatasetQuery, lunGrowGuidance, PoolName, RenameSnapshotRequest, reservedDatasetSegment, RollbackSnapshotQuery, SetAccessRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
 import { parseExports } from '../parsers/exports.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
+import { parseZfsJson } from '../parsers/utils.js'
 import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
-import { confirmGate } from '../safety/gate.js'
-import { confirmGateBound, readDatasetGuid, readRollbackIds, requireStableId } from '../safety/stable-id.js'
-import { createAccessService } from '../services/access.js'
+import { guardCheck, guardConfirm, guarded, sendRefusal, zfsClaims, znameClaim } from '../safety/guard.js'
+import { readDatasetGuid, readPoolGuid, readRollbackIds } from '../safety/stable-id.js'
+import { createAccessService, SET_ACCESS_PRESENTATION_ONLY, signedAccessRequest } from '../services/access.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
@@ -32,6 +35,24 @@ const ACCESS_SUFFIX = '/access'
 
 /** `zfs list` stderr when the named dataset (or its pool) is not there. */
 const DATASET_ABSENT_RE = /dataset does not exist/i
+
+/** Where a dataset name's pool part ends: the first `/`, `@` (snapshot) or `#` (bookmark). */
+const POOL_PART_END = /[/@#]/
+
+/** A createtxg as `zfs list -Hp` prints it. */
+const TXG_RE = /^\d+$/
+
+/** The advisory key of the LIO-unreadable disclosure (the dataset destroy confirm). */
+const LIO_UNREADABLE_KEY = 'lio-unreadable'
+
+/**
+ * Story cr.37 (WAVE3-DESIGN §5.2 rule 1): the request fields the dataset
+ * destroy and the rollback confirms do NOT sign, each with its reason. None:
+ * `recursive` and `force` decide what the job destroys.
+ * `datasets-guard.test.ts` pins both lists.
+ */
+export const DATASET_DESTROY_PRESENTATION_ONLY: Record<string, string> = {}
+export const SNAPSHOT_ROLLBACK_PRESENTATION_ONLY: Record<string, string> = {}
 
 /**
  * A wildcard path whose reading (dataset or snapshot sub-route) could not be
@@ -413,22 +434,6 @@ export async function datasetRoutes(
     return (await listDatasetsAndDefaults(poolName)).datasets
   }
 
-  /**
-   * The pool's flat dataset list, or `null` when the probe itself FAILED —
-   * a non-zero `zfs list`, or a read that exited 0 with nothing to say
-   * (pvepool.1 review fix 4). The recursive-verb guards need the distinction
-   * from a list that was read: a failed probe may never read as "no
-   * descendants" for a target that exists, so they refuse with
-   * {@link pveDescendantsUnlistedMessage} instead. Display and 404 paths keep
-   * the fail-open {@link listDatasets}.
-   */
-  async function listDatasetsOrNull(poolName: string): Promise<Dataset[] | null> {
-    const r = await executor.exec(ZFS, zfsListArgs(poolName))
-    if (r.exitCode !== 0 || !r.stdout.trim())
-      return null
-    return parseZfsList(r.stdout)
-  }
-
   /** Snapshot names below a dataset (for destroy warnings). */
   async function snapshotNames(fullName: string): Promise<string[]> {
     const r = await executor.exec(ZFS, zfsSnapshotListArgs(fullName))
@@ -508,16 +513,6 @@ export async function datasetRoutes(
   }
 
   /**
-   * The dataset row for one full name, or null. Fail-open by design: every
-   * caller uses it to feed {@link assertVolumeMutable}, which asserts nothing on
-   * a null (the verb then proceeds exactly as it did before this story).
-   */
-  async function datasetRow(poolName: string, fullName: string): Promise<Dataset | null> {
-    const datasets = await listDatasets(poolName)
-    return datasets.find(d => d.name === fullName) ?? null
-  }
-
-  /**
    * Is an iSCSI LUN holding this dataset (story iscsi.6)?
    *
    * The dataset name catches the zvol itself AND any zvol beneath it (a `-r`
@@ -551,30 +546,541 @@ export async function datasetRoutes(
     return access.zfsRecursiveRefusal(poolName, fullName)
   }
 
-  /**
-   * Story ident.1: the destroy job's re-run of the route's pre-flight gates —
-   * the PVE footprint (the dataset itself, and every descendant a `-r` would
-   * sweep: `ownedDescendant`) and the held-by-LUN check, against the pool as
-   * it is when the job runs. Throws the refusal; fail-closed on an unreadable
-   * dataset list.
-   */
-  async function recheckDestroyGates(poolName: string, fullName: string, recursive: boolean): Promise<void> {
-    const datasets = await listDatasetsOrNull(poolName)
-    const row = datasets?.find(d => d.name === fullName)
-    if (!datasets || !row)
-      throw new Error(recursive ? pveDescendantsUnlistedMessage('destroy', fullName) : `Dataset '${fullName}' could not be read again before the destroy`)
-    const pve = await pveFootprint()
-    const owned = pve.ownershipOf(fullName)
-    if (owned)
-      throw new Error(owned.reason)
-    if (recursive) {
-      const descendant = pve.ownedDescendant(datasets, fullName)
-      if (descendant)
-        throw new Error(pveRecursiveRefusalMessage('Destroy', fullName, descendant))
+  // -------------------------------------------------------------------------
+  // Story cr.37 (WAVE3-DESIGN §2.1 dataset rows, §3, §4.2, §5; EPICS §2 ruling
+  // (j)): every dataset and snapshot verb describes itself ONCE as a guard
+  // spec. The route runs the spec's gates (`guardCheck`) and the job runs the
+  // SAME list again against facts it reads itself (`guarded`) before any `zfs`
+  // that changes anything; a refusal fails the job with the gate's own code
+  // and sentence. The job is submitted with the verb's `zfs:` lock claims
+  // (cr.33), so its re-read sees whatever ran on the dataset before it.
+  //
+  // Identity: the two confirmed verbs bind the object's stable id (destroy:
+  // the dataset's guid; rollback: the snapshot createtxgs, ident.1). The
+  // unconfirmed verbs have no confirmed object to compare with: their id is
+  // the name the request named, and every gate re-runs against whatever
+  // carries that name when the job starts.
+  // -------------------------------------------------------------------------
+
+  /** A pool's dataset listing: the rows, and each dataset's createtxg (what a recursive destroy binds). */
+  interface PoolListing {
+    datasets: Dataset[]
+    /** name → createtxg, from the same `zfs list -j` (it prints createtxg on every row). */
+    createtxg: Map<string, string>
+  }
+
+  /** The pool's listing, or null when the read FAILED (never "no datasets": a recursive verb refuses on it). */
+  async function readPoolListing(poolName: string): Promise<PoolListing | null> {
+    const r = await executor.exec(ZFS, zfsListArgs(poolName))
+    if (r.exitCode !== 0 || !r.stdout.trim())
+      return null
+    try {
+      const raw = parseZfsJson<{ datasets?: Record<string, { name?: string, createtxg?: string }> }>(r.stdout, { datasets: {} })
+      const createtxg = new Map<string, string>()
+      for (const ds of Object.values(raw.datasets ?? {})) {
+        if (ds.name && ds.createtxg)
+          createtxg.set(ds.name, ds.createtxg)
+      }
+      return { datasets: parseZfsList(r.stdout), createtxg }
     }
-    const held = await datasetHeldByLun(row, fullName)
-    if (held)
-      throw new Error(heldByLunRefusal(`dataset '${fullName}'${recursive ? ' (recursive)' : ''}`, 'Destroying', held).message)
+    catch {
+      return null
+    }
+  }
+
+  /** The per-run reads the dataset gates share (one per guard run, never across doors). */
+  const dsReads = {
+    listing: (reads: GuardReads, pool: string) => reads.once(`zfs-list:${pool}`, () => readPoolListing(pool)),
+    footprint: (reads: GuardReads) => reads.once('pve-footprint', () => pveFootprint()),
+    claims: (reads: GuardReads) => reads.once('iscsi-claims', async () => createIscsiClaimCache(executor, iscsiPaths)),
+    snapshots: (reads: GuardReads, dataset: string) => reads.once(`snapshots:${dataset}`, () => listSnapshotsDetail(dataset)),
+    poolGuid: (reads: GuardReads, pool: string) => reads.once(`pool-guid:${pool}`, () => readPoolGuid(executor, pool)),
+    rollbackIds: (reads: GuardReads, dataset: string, snapshot: string) =>
+      reads.once(`rollback-ids:${snapshot}`, () => readRollbackIds(executor, dataset, snapshot)),
+    bookmarks: (reads: GuardReads, dataset: string) => reads.once(`bookmarks:${dataset}`, () => readBookmarks(dataset)),
+  }
+
+  /** The pool a dataset, snapshot (`@`) or bookmark (`#`) name lives in. */
+  function poolOf(name: string): string {
+    return name.split(POOL_PART_END)[0]
+  }
+
+  /**
+   * The lock claims (cr.33, §4.2) for each named dataset in its mode: the
+   * dataset's `zfs:<pool guid>/<path>` key, every ancestor's and the pool's
+   * shared. A pool whose guid cannot be read is locked by its name key only,
+   * exclusive (§4.2's conservative fallback).
+   */
+  async function datasetClaims(reads: GuardReads, wanted: [name: string, mode: LockMode][]): Promise<LockClaim[]> {
+    const out: LockClaim[] = []
+    for (const [name, mode] of wanted) {
+      const pool = poolOf(name)
+      const guid = (await dsReads.poolGuid(reads, pool))?.guid
+      out.push(...(guid ? zfsClaims(guid, name, mode) : [znameClaim(pool)]))
+    }
+    return out
+  }
+
+  /** 400 VALIDATION_ERROR: the PVE-territory refusals keep the status these routes always answered. */
+  function invalid(message: string): Refusal {
+    return { status: 400, code: 'VALIDATION_ERROR', message }
+  }
+
+  /** 409 CONFLICT, with the machine-readable reason when there is one. */
+  function conflict(message: string, reason?: string): Refusal {
+    return { status: 409, code: 'CONFLICT', message, ...(reason ? { reason } : {}) }
+  }
+
+  /**
+   * The OWNERSHIP gate (story pvepool.1): an OWNED dataset (a storage root, a
+   * guest volume, a dir-storage tree, the boot tree) is view-only to every
+   * verb here. 400 with the predicate's reason, no bypass.
+   */
+  function ownedGate<O>(nameOf: (o: O) => string): Gate<O> {
+    return async (o, reads) => {
+      const owned = (await dsReads.footprint(reads)).ownershipOf(nameOf(o))
+      return owned ? invalid(owned.reason) : null
+    }
+  }
+
+  /** A dataset verb's object: its row in the pool listing, and the listing. */
+  interface DatasetObject {
+    name: string
+    /** Null only when `listing` is (the pool listing could not be read). */
+    row: Dataset | null
+    listing: PoolListing | null
+  }
+
+  /**
+   * Read a dataset for a guard: null when the pool listing names no such
+   * dataset; an object with `listing: null` when the listing itself could not
+   * be read, so {@link listedGate} decides what that means for the verb.
+   */
+  function datasetView(
+    poolName: string,
+    fullName: string,
+    id: ObjectView<DatasetObject>['id'],
+    extra: Partial<ObjectView<DatasetObject>> = {},
+  ): ObjectView<DatasetObject> {
+    return {
+      what: `Dataset '${fullName}'`,
+      read: async (reads) => {
+        const listing = await dsReads.listing(reads, poolName)
+        if (!listing)
+          return { name: fullName, row: null, listing: null }
+        const row = listing.datasets.find(d => d.name === fullName)
+        return row ? { name: fullName, row, listing } : null
+      },
+      id,
+      unbound: () => `Could not read dataset '${fullName}' — refusing a change that cannot be bound to it`,
+      ...extra,
+    }
+  }
+
+  /** An unconfirmed verb's id: the name the request named. */
+  function nameId(key: string, name: string): () => Promise<Record<string, string>> {
+    return async () => ({ [key]: name })
+  }
+
+  /**
+   * The pool listing could not be read (pvepool.1 review fix 4): a RECURSIVE
+   * verb would sweep a subtree the daemon cannot see, refused 400; a plain one
+   * keeps its vanished-target 404.
+   */
+  function listedGate(recursive: boolean, verb: string): Gate<DatasetObject> {
+    return async (o) => {
+      if (o.listing)
+        return null
+      return recursive
+        ? invalid(pveDescendantsUnlistedMessage(verb, o.name))
+        : { status: 404, code: 'NOT_FOUND', message: `Dataset '${o.name}' not found` }
+    }
+  }
+
+  /**
+   * A recursive verb's OWNED-DESCENDANT gate (pvepool.1 review fix 2): a
+   * storage registered on a NESTED path leaves the tree above it unowned, so
+   * `-r` would take PVE's storage root and its guest disks with it.
+   */
+  function ownedDescendantGate(label: string): Gate<DatasetObject> {
+    return async (o, reads) => {
+      if (!o.listing)
+        return null
+      const descendant = (await dsReads.footprint(reads)).ownedDescendant(o.listing.datasets, o.name)
+      return descendant ? invalid(pveRecursiveRefusalMessage(label, o.name, descendant)) : null
+    }
+  }
+
+  /**
+   * The destroy's HELD-BY-LUN gate (story iscsi.6): a LUN serving the volume,
+   * a child zvol a `-r` destroy would sweep, or an image file inside a
+   * filesystem's mountpoint. ZFS refuses a destroy of a claimed object with a
+   * bare `dataset is busy` that names nothing, and a `-r` destroy whose CHILD
+   * is the claimed one destroys the parent's other children first, then
+   * stops. A volume goes through the one volume gate (iscsi.3); a filesystem
+   * gets the same refusal from the same helper. Fail-open: an unreadable LIO
+   * tree holds nothing (disclosed as an advisory).
+   */
+  function destroyLunGate(recursive: boolean): Gate<DatasetObject> {
+    return async (o, reads) => {
+      if (!o.row)
+        return null
+      const held = await datasetHeldByLun(o.row, o.name, await dsReads.claims(reads))
+      const volumeRefusal = assertVolumeMutable(o.name, 'destroy', o.row, undefined, held)
+      if (volumeRefusal)
+        return conflict(volumeRefusal.message, volumeRefusal.reason)
+      if (held && o.row.type !== 'volume') {
+        const refusal = heldByLunRefusal(`dataset '${o.name}'${recursive ? ' (recursive)' : ''}`, 'Destroying', held)
+        return conflict(refusal.message, refusal.reason)
+      }
+      return null
+    }
+  }
+
+  /**
+   * Fail-open is not fail-silent (D3): a broken claims read reads as "nothing
+   * held", which a dataset genuinely serving a LUN would look exactly like —
+   * `zfs destroy` succeeds silently under a live session (GT-40).
+   */
+  async function lioUnreadableAdvisory(reads: GuardReads): Promise<Advisory[]> {
+    if (!(await (await dsReads.claims(reads)).readFailed()))
+      return []
+    return [{
+      key: LIO_UNREADABLE_KEY,
+      warning: 'ANAS could not check whether an iSCSI LUN is served from this dataset — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.',
+    }]
+  }
+
+  /**
+   * The dataset DESTROY spec. A recursive destroy binds its blast radius as
+   * the scope (WAVE3-DESIGN §5.2 rule 2): every child dataset by name and
+   * createtxg, so a child created after the challenge makes the resend 409
+   * CONFIRM_SCOPE_CHANGED and the job (if it appears while the job waits)
+   * fail STATE_CHANGED. createtxg is ZFS's own creation stamp: a child
+   * destroyed and re-created under the same name carries a new one.
+   */
+  function destroyGuardSpec(poolName: string, fullName: string, recursive: boolean): GuardSpec<DatasetObject> {
+    return {
+      operation: 'zfs.destroy',
+      object: datasetView(poolName, fullName, o => readDatasetGuid(executor, o.name), {
+        ...(recursive
+          ? {
+              scope: async (o: DatasetObject) => {
+                if (!o.listing)
+                  return null
+                const children: string[] = []
+                for (const d of o.listing.datasets.filter(d => d.name.startsWith(`${o.name}/`))) {
+                  const txg = o.listing.createtxg.get(d.name)
+                  if (!txg)
+                    return null
+                  children.push(`${d.name} (createtxg ${txg})`)
+                }
+                children.sort()
+                return { children: children.join(', ') }
+              },
+            }
+          : {}),
+        scopeLabels: { children: 'the child datasets' },
+        unbound: part => part === 'scope'
+          ? `Could not list the child datasets of '${fullName}' — refusing a recursive destroy that cannot be bound to them`
+          : `Could not read the guid of dataset '${fullName}' — refusing a destroy that cannot be bound to it`,
+      }),
+      gates: [
+        listedGate(recursive, 'destroy'),
+        ownedGate<DatasetObject>(o => o.name),
+        ...(recursive ? [ownedDescendantGate('Destroy')] : []),
+        destroyLunGate(recursive),
+      ],
+      advisories: (_o, reads) => lioUnreadableAdvisory(reads),
+      // §4.2: exclusive on the dataset, which excludes every verb on a
+      // descendant (each holds this key shared, as an ancestor).
+      locks: (o, _bound, reads) => datasetClaims(reads, [[o.name, 'exclusive']]),
+    }
+  }
+
+  /** A snapshot verb's object: the snapshot, found in its dataset's listing. */
+  interface SnapshotObject {
+    dataset: string
+    snap: string
+    snapName: string
+    /** The dataset's snapshots, newest first. */
+    snapshots: Snapshot[]
+  }
+
+  function snapshotView(fullName: string, snap: string, extra: Partial<ObjectView<SnapshotObject>> = {}): ObjectView<SnapshotObject> {
+    const snapName = `${fullName}@${snap}`
+    return {
+      what: `Snapshot '${snapName}'`,
+      read: async (reads) => {
+        const snapshots = await dsReads.snapshots(reads, fullName)
+        return snapshots.some(s => s.name === snapName) ? { dataset: fullName, snap, snapName, snapshots } : null
+      },
+      id: nameId('snapshot', snapName),
+      unbound: () => `Could not read snapshot '${snapName}' — refusing a change that cannot be bound to it`,
+      ...extra,
+    }
+  }
+
+  /**
+   * A dataset's bookmarks with their createtxg, or null when the read failed.
+   * `zfs rollback -r` destroys every bookmark newer than the target, as well
+   * as every newer snapshot.
+   */
+  async function readBookmarks(dataset: string): Promise<{ name: string, txg: bigint }[] | null> {
+    const r = await executor.exec(ZFS, ['list', '-t', 'bookmark', '-H', '-p', '-o', 'name,createtxg', '-d', '1', '--', dataset])
+    if (r.exitCode !== 0)
+      return null
+    const out: { name: string, txg: bigint }[] = []
+    for (const line of r.stdout.split('\n')) {
+      const [name, txg] = line.trim().split('\t')
+      if (!name || !txg || !name.startsWith(`${dataset}#`) || !TXG_RE.test(txg))
+        continue
+      out.push({ name, txg: BigInt(txg) })
+    }
+    return out
+  }
+
+  /**
+   * What `zfs rollback -r` destroys: every snapshot newer than the target (the
+   * listing is newest first) and every bookmark created after it. Null when a
+   * read failed. Sorted, so the bound string compares.
+   */
+  async function forceDestroys(o: SnapshotObject, reads: GuardReads): Promise<string[] | null> {
+    const ids = await dsReads.rollbackIds(reads, o.dataset, o.snapName)
+    const bookmarks = await dsReads.bookmarks(reads, o.dataset)
+    const index = o.snapshots.findIndex(s => s.name === o.snapName)
+    if (!ids || !bookmarks || index < 0)
+      return null
+    const target = BigInt(ids.snapshotTxg)
+    const names = [
+      ...o.snapshots.slice(0, index).map(s => s.name),
+      ...bookmarks.filter(b => b.txg > target).map(b => b.name),
+    ]
+    names.sort()
+    return names
+  }
+
+  /**
+   * The rollback's HELD-BY-LUN gate (iscsi.3 + iscsi.6). ZFS rolls a zvol back
+   * under a live iSCSI session (exit 0, with a filesystem mounted on the
+   * initiator, GT-40) and rewrites an image FILE inside a filesystem
+   * underneath a LIO backstore still serving it. Refused, no bypass. The row
+   * read is fail-open (nothing asserted on an unreadable listing).
+   */
+  const rollbackLunGate: Gate<SnapshotObject> = async (o, reads) => {
+    const row = (await dsReads.listing(reads, poolOf(o.dataset)))?.datasets.find(d => d.name === o.dataset) ?? null
+    const held = await datasetHeldByLun(row, o.dataset, await dsReads.claims(reads))
+    if (row?.type === 'volume') {
+      const refusal = assertVolumeMutable(o.dataset, 'rollback', row, undefined, held)
+      return refusal ? conflict(refusal.message, refusal.reason) : null
+    }
+    if (!held)
+      return null
+    const refusal = heldByLunRefusal(`dataset '${o.dataset}' to snapshot '${o.snap}'`, 'Rolling back', held)
+    return conflict(refusal.message, refusal.reason)
+  }
+
+  /**
+   * The ROLLBACK spec: bound to the target snapshot's createtxg and the newest
+   * snapshot's (ident.1: a snapshot taken after the challenge makes it another
+   * rollback). With `force` the scope is what `-r` destroys, snapshots AND
+   * bookmarks by name, so a bookmark made after the challenge is a change too.
+   */
+  function rollbackGuardSpec(fullName: string, snap: string, force: boolean): GuardSpec<SnapshotObject> {
+    return {
+      operation: 'zfs.rollback',
+      object: snapshotView(fullName, snap, {
+        id: (o, reads) => dsReads.rollbackIds(reads, o.dataset, o.snapName),
+        ...(force
+          ? {
+              scope: async (o: SnapshotObject, reads: GuardReads) => {
+                const destroys = await forceDestroys(o, reads)
+                return destroys ? { destroys: destroys.join(', ') } : null
+              },
+            }
+          : {}),
+        scopeLabels: { destroys: 'what force destroys' },
+        unbound: part => part === 'scope'
+          ? `Could not read the snapshots and bookmarks of '${fullName}' — refusing a forced rollback that cannot be bound to what it destroys`
+          : `Could not read the snapshots of '${fullName}' — refusing a rollback that cannot be bound to them`,
+      }),
+      gates: [ownedGate<SnapshotObject>(o => o.dataset), rollbackLunGate],
+      // §4.2: a rollback rewrites the dataset, exclusive.
+      locks: (o, _bound, reads) => datasetClaims(reads, [[o.dataset, 'exclusive']]),
+    }
+  }
+
+  /**
+   * The NAME COLLISION gate: a dataset already carries the name — 409, the
+   * system is the source of truth. Fail-open on an unreadable listing: `zfs
+   * create`/`zfs clone` refuse an existing name themselves.
+   */
+  function collisionGate<O>(nameOf: (o: O) => string): Gate<O> {
+    return async (o, reads) => {
+      const name = nameOf(o)
+      const listing = await dsReads.listing(reads, poolOf(name))
+      return listing?.datasets.some(d => d.name === name) ? conflict(`Dataset '${name}' already exists`) : null
+    }
+  }
+
+  /**
+   * The PVE NAMING gate (story pvepool.1): a guest-named direct child of a
+   * storage path would be inventoried by PVE as a guest disk on its next scan.
+   */
+  function namingGate<O>(nameOf: (o: O) => string): Gate<O> {
+    return async (o, reads) => {
+      const name = nameOf(o)
+      const claim = (await dsReads.footprint(reads)).claimedByPve(name)
+      return claim ? invalid(pveNamingGuardMessage(claim.storage, name)) : null
+    }
+  }
+
+  /** A create's object: the pool the new dataset goes into. */
+  interface CreateObject { pool: string, name: string }
+
+  /**
+   * The dataset CREATE spec: the pool exists, the name is free, the naming
+   * guard and ownership of the new name (a storage root, a dir-storage tree,
+   * the boot tree). A plain child of a storage root is owned by neither rule —
+   * the point of pvepool.1.
+   */
+  function createGuardSpec(poolName: string, fullName: string): GuardSpec<CreateObject> {
+    return {
+      operation: 'zfs.create',
+      object: {
+        what: `Pool '${poolName}'`,
+        read: async reads => (await reads.once(`pool-exists:${poolName}`, () => poolExists(poolName))) ? { pool: poolName, name: fullName } : null,
+        id: nameId('dataset', fullName),
+        unbound: () => `Could not read pool '${poolName}'`,
+      },
+      gates: [collisionGate<CreateObject>(o => o.name), namingGate<CreateObject>(o => o.name), ownedGate<CreateObject>(o => o.name)],
+      // §4.2: the new name's key exclusive, its ancestors' shared — a destroy
+      // of the parent (exclusive on it) and this create serialise.
+      locks: (o, _bound, reads) => datasetClaims(reads, [[o.name, 'exclusive']]),
+    }
+  }
+
+  /** The snapshot name is taken — 409 (ZFS would refuse it too, with less to say). */
+  function snapshotCollisionGate(snapName: string): Gate<DatasetObject> {
+    return async (o, reads) => {
+      const existing = await dsReads.snapshots(reads, o.name)
+      return existing.some(s => s.name === snapName) ? conflict(`Snapshot '${snapName}' already exists`) : null
+    }
+  }
+
+  /**
+   * The SNAPSHOT CREATE spec: the dataset exists, ownership (a storage-root
+   * snapshot sweeps PVE's guest zvols; a guest volume's snapshots are PVE's to
+   * take), and with `recursive` every descendant (a storage on a NESTED path).
+   */
+  function snapshotGuardSpec(poolName: string, fullName: string, snapName: string, recursive: boolean): GuardSpec<DatasetObject> {
+    return {
+      operation: 'zfs.snapshot',
+      object: datasetView(poolName, fullName, nameId('dataset', fullName)),
+      gates: [
+        listedGate(recursive, 'snapshot'),
+        ownedGate<DatasetObject>(o => o.name),
+        ...(recursive ? [ownedDescendantGate('Recursive snapshot')] : []),
+        snapshotCollisionGate(snapName),
+      ],
+      // §4.2: a snapshot is shared — two snapshots run together; a destroy,
+      // rollback or rename of the dataset waits.
+      locks: (o, _bound, reads) => datasetClaims(reads, [[o.name, 'shared']]),
+    }
+  }
+
+  /**
+   * The spec of a verb on ONE existing snapshot that needs nothing but the
+   * dataset's ownership: rename and destroy (pvepool.1: an owned dataset's
+   * snapshots are PVE's to manage). Both change the dataset's snapshot list,
+   * so both are exclusive on the dataset (a send reading it waits).
+   */
+  function snapshotOwnedSpec(operation: 'zfs.rename' | 'zfs.destroy', fullName: string, snap: string): GuardSpec<SnapshotObject> {
+    return {
+      operation,
+      object: snapshotView(fullName, snap),
+      gates: [ownedGate<SnapshotObject>(o => o.dataset)],
+      locks: (o, _bound, reads) => datasetClaims(reads, [[o.dataset, 'exclusive']]),
+    }
+  }
+
+  /**
+   * The CLONE spec — a dataset create wearing another hat: the source
+   * snapshot exists and its dataset is not PVE's; the target name is free,
+   * passes the naming guard and is not owned.
+   */
+  function cloneGuardSpec(fullName: string, snap: string, target: string): GuardSpec<SnapshotObject> {
+    return {
+      operation: 'zfs.clone',
+      object: snapshotView(fullName, snap),
+      gates: [
+        ownedGate<SnapshotObject>(o => o.dataset),
+        collisionGate<SnapshotObject>(() => target),
+        namingGate<SnapshotObject>(() => target),
+        ownedGate<SnapshotObject>(() => target),
+      ],
+      // §4.2: the source is read (shared), the target is created (exclusive).
+      locks: (o, _bound, reads) => datasetClaims(reads, [[o.dataset, 'shared'], [target, 'exclusive']]),
+    }
+  }
+
+  /**
+   * A volsize grow rounded UP to a multiple of the volume's `volblocksize` (O1
+   * follow-up, 0.3.1), exactly as growZvolLun does on the iSCSI door and as
+   * `zfs create -V` does silently. Without it an unaligned volsize makes `zfs
+   * set volsize=` fail with a raw "must be a multiple of volume block size".
+   * Fail-open: an absent volblocksize applies the size as asked.
+   */
+  function roundVolsize(row: Dataset | null, volsize: number | undefined): number | undefined {
+    const bs = row?.volblocksize
+    if (volsize === undefined || bs === undefined || bs <= 0 || volsize % bs === 0)
+      return volsize
+    return Math.ceil(volsize / bs) * bs
+  }
+
+  /**
+   * The PROPERTY KIND gate (story iscsi.3): a volume and a filesystem accept
+   * DIFFERENT properties, and ZFS reports the mismatch as an opaque failure
+   * part-way through the set — refused at the boundary, naming the property.
+   */
+  function propertyKindGate(props: UpdateDatasetPropertiesRequest['properties']): Gate<DatasetObject> {
+    return async (o) => {
+      if (!o.row)
+        return null
+      if (o.row.type === 'volume') {
+        const notOnVolume = (['recordsize', 'quota', 'refquota', 'atime'] as const).filter(k => props[k] !== undefined)
+        return notOnVolume.length > 0
+          ? invalid(`'${o.name}' is a volume; ${notOnVolume.join(', ')} ${notOnVolume.length > 1 ? 'are filesystem properties' : 'is a filesystem property'} and ZFS does not carry ${notOnVolume.length > 1 ? 'them' : 'it'} on a volume`)
+          : null
+      }
+      return props.volsize !== undefined ? invalid(`'${o.name}' is a filesystem; volsize applies only to a volume`) : null
+    }
+  }
+
+  /**
+   * THE volume gate for a property edit (assertVolumeMutable, the one seam):
+   * grow yes, shrink never — compared against the volume's size NOW, so a
+   * volume grown past the requested size while the job waited is a shrink and
+   * refused. The holding LUN rides in, so a refused shrink names it.
+   */
+  function shrinkGate(props: UpdateDatasetPropertiesRequest['properties']): Gate<DatasetObject> {
+    return async (o, reads) => {
+      if (o.row?.type !== 'volume')
+        return null
+      const held = await datasetHeldByLun(o.row, o.name, await dsReads.claims(reads))
+      const refusal = assertVolumeMutable(o.name, 'grow', o.row, { volsize: roundVolsize(o.row, props.volsize) }, held)
+      return refusal ? conflict(refusal.message, refusal.reason) : null
+    }
+  }
+
+  /** The PROPERTY SET spec: the dataset exists, ownership, the property kind, the volume gate. */
+  function setPropertiesGuardSpec(poolName: string, fullName: string, props: UpdateDatasetPropertiesRequest['properties']): GuardSpec<DatasetObject> {
+    return {
+      operation: 'zfs.set',
+      object: datasetView(poolName, fullName, nameId('dataset', fullName)),
+      gates: [listedGate(false, 'set'), ownedGate<DatasetObject>(o => o.name), propertyKindGate(props), shrinkGate(props)],
+      locks: (o, _bound, reads) => datasetClaims(reads, [[o.name, 'exclusive']]),
+    }
   }
 
   /**
@@ -599,33 +1105,6 @@ export async function datasetRoutes(
       if (held)
         d.heldByLun = held
     }
-  }
-
-  /**
-   * Run the volume gate and, if it refuses, send the Level 1 409 (no confirm
-   * code — there is no override path, per Safety Semantics). Returns true when
-   * the caller has been answered and must stop.
-   *
-   * Story iscsi.6: the gate now also needs to know whether a LUN holds the
-   * volume, so the claims read happens HERE, before the gate — and therefore
-   * before any destructive command, which is the whole point of a pre-flight
-   * refusal.
-   */
-  async function volumeGateRefused(
-    poolName: string,
-    fullName: string,
-    op: VolumeOp,
-    reply: FastifyReply,
-    next?: { volsize?: number },
-  ): Promise<boolean> {
-    const row = await datasetRow(poolName, fullName)
-    const held = row?.type === 'volume' ? await datasetHeldByLun(row, fullName) : null
-    const refusal = assertVolumeMutable(fullName, op, row, next, held)
-    if (!refusal)
-      return false
-    reply.code(409)
-    reply.send({ error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } })
-    return true
   }
 
   /** A dataset's snapshots, newest-first (empty when it has none). */
@@ -910,48 +1389,29 @@ export async function datasetRoutes(
     if (!identity)
       return
 
-    if (!(await poolExists(poolName))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-    }
-
-    // 409 if it already exists — the system is the source of truth.
-    const existing = await listDatasets(poolName)
-    if (existing.some(d => d.name === fullName)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Dataset '${fullName}' already exists` } }
-    }
-
-    // PVE footprint guards (story pvepool.1). The NAMING GUARD first: a
-    // guest-named direct child of a storage path would be inventoried by PVE
-    // as a guest disk on its next scan. Then ownership: creating a dataset
-    // INSIDE PVE's footprint (a storage root itself, a guest volume, a
-    // dir-storage tree, the boot tree) is refused with the predicate's reason.
-    // A plain child of a storage root (`tank/media` under bare-pool storage
-    // `tank`) is owned by neither rule — that is the whole point of the story.
-    const pve = await pveFootprint()
-    const claim = pve.claimedByPve(fullName)
-    if (claim) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: pveNamingGuardMessage(claim.storage, fullName) } }
-    }
-    const owned = pve.ownershipOf(fullName)
-    if (owned) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
-    }
+    // Story cr.37: the one guard spec both doors run — the pool exists, the
+    // name is free (409; the system is the source of truth), and the PVE
+    // footprint (pvepool.1): the NAMING GUARD first (a guest-named direct
+    // child of a storage path would be inventoried by PVE as a guest disk),
+    // then ownership of the new name. The job runs them again before
+    // `zfs create`, holding the new name's lock.
+    const spec = createGuardSpec(poolName, fullName)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const args = buildCreateArgs(fullName, req)
 
     const job = jobQueue.submit(
       'zfs.create',
       { ...identity, params: { dataset: fullName } },
-      async () => {
+      guarded(spec, pre, async () => {
         const result = await executor.exec(ZFS, args)
         if (result.exitCode !== 0)
           throw new Error(result.stderr.trim() || `zfs create exited with code ${result.exitCode}`)
         return { created: fullName }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1069,74 +1529,35 @@ export async function datasetRoutes(
     if (!identity)
       return
 
-    const existing = await listDatasets(poolName)
-    const target = existing.find(d => d.name === fullName)
-    if (!target) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
-    }
+    // Story cr.37: the one guard spec both doors run — the dataset exists,
+    // PVE ownership (pvepool.1: an OWNED dataset is view-only for properties),
+    // the property kind (iscsi.3: a volume and a filesystem accept DIFFERENT
+    // properties) and the volume gate (grow yes, shrink never, compared with
+    // the size the volume has NOW). The job runs them again before `zfs set`.
+    const spec = setPropertiesGuardSpec(poolName, fullName, props)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const target = pre.object.row as Dataset
 
-    // PVE footprint (story pvepool.1): an OWNED dataset is view-only for
-    // properties — any kind (storage root, guest volume, dir-storage tree,
-    // boot tree), refused with the predicate's reason naming storage + dataset.
-    const owned = (await pveFootprint()).ownershipOf(fullName)
-    if (owned) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
-    }
+    // O1 follow-up (0.3.1): a volsize grow is rounded UP to the volume's
+    // `volblocksize` — the size the gate compared, the one the params report
+    // (an already-aligned request is unchanged).
+    props.volsize = roundVolsize(target, props.volsize)
 
-    // Story iscsi.3 — a volume and a filesystem accept DIFFERENT properties, and
-    // ZFS reports the mismatch as an opaque failure part-way through the set.
-    // Refuse the mismatch at the boundary instead, naming the property.
     // Job-result warnings. The one a property edit can earn today is the LUN
     // grow guidance (below) — a filesystem edit never does.
     const warnings: string[] = []
     /** ident.1: the served LUN a volsize grow was verified against (re-read in the job). */
     let servedGrow: ReturnType<typeof servedLunIdentity> | null = null
 
-    if (target.type === 'volume') {
-      const notOnVolume = (['recordsize', 'quota', 'refquota', 'atime'] as const)
-        .filter(k => props[k] !== undefined)
-      if (notOnVolume.length > 0) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `'${fullName}' is a volume; ${notOnVolume.join(', ')} ${notOnVolume.length > 1 ? 'are filesystem properties' : 'is a filesystem property'} and ZFS does not carry ${notOnVolume.length > 1 ? 'them' : 'it'} on a volume` } }
-      }
-      // O1 follow-up (0.3.1): round a volsize grow UP to a multiple of the
-      // volume's `volblocksize` BEFORE the gate and the `zfs set`, exactly as
-      // growZvolLun does on the iSCSI door and as `zfs create -V` does silently.
-      // Without it an unaligned volsize makes `zfs set volsize=` fail with a raw
-      // "must be a multiple of volume block size" out of a 202. The block size
-      // rides in on the dataset row (ZFS_LIST_PROPS reads volblocksize, exact
-      // after #50) — no extra `zfs get`. Fail-open: an absent/unreadable
-      // volblocksize applies the size as asked, the pre-fix behaviour. Rounding
-      // happens first so the shrink gate below compares the rounded value against
-      // current.volsize, the applied pairs carry it, and the job reports it; an
-      // already-aligned request is unchanged (round-up of a multiple is itself).
-      const bs = target.volblocksize
-      if (props.volsize !== undefined && bs !== undefined && bs > 0 && props.volsize % bs !== 0)
-        props.volsize = Math.ceil(props.volsize / bs) * bs
-
-      // THE gate: grow yes, shrink never (assertVolumeMutable, the one seam).
-      // Story iscsi.6: the holding LUN rides in too, so a refused shrink names
-      // what is serving the volume as well as why the shrink itself is refused.
-      const held = await datasetHeldByLun(target, fullName)
-      const refusal = assertVolumeMutable(
-        fullName,
-        'grow',
-        target,
-        { volsize: props.volsize },
-        held,
-      )
-      if (refusal) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
-      }
+    if (target.type === 'volume' && props.volsize !== undefined) {
       // A grow of a LUN-backed volume succeeds — and then goes quiet. The
       // shared sentence (lunGrowGuidance) rides the job result as a warning,
       // exactly as the iSCSI door's own LUN resize carries it: one definition,
-      // two doors. Not held, or a property edit that is not a volsize grow →
-      // no warning.
-      if (held !== null && props.volsize !== undefined)
+      // two doors.
+      const held = await datasetHeldByLun(target, fullName)
+      if (held !== null)
         warnings.push(lunGrowGuidance(props.volsize))
 
       // ident.1 + ident.2 (audit #8): a grow of a zvol a live LUN serves runs
@@ -1145,7 +1566,7 @@ export async function datasetRoutes(
       // major:minor) — after a rename + re-create under the live LUN it is not,
       // and the size the gate compared was the served device's. Refused 409
       // `served-device-mismatch` with ident.2's sentence; re-verified in the job.
-      if (held !== null && props.volsize !== undefined) {
+      if (held !== null) {
         const { ctx, targets } = await readIscsiState(executor, iscsiPaths)
         const lun = targets.find(t => t.iqn === held.targetIqn)?.luns.find(l => l.index === held.index)
         if (lun) {
@@ -1158,25 +1579,20 @@ export async function datasetRoutes(
         }
       }
     }
-    else if (props.volsize !== undefined) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `'${fullName}' is a filesystem; volsize applies only to a volume` } }
-    }
-
-    // Built AFTER the volume branch so a rounded `props.volsize` (O1) is the one
-    // that reaches `zfs set` and the applied/params reports.
-    const pairs = buildSetPairs(props)
 
     const job = jobQueue.submit(
       'zfs.set',
       { ...identity, params: { dataset: fullName, properties: bodyParsed.data.properties } },
-      async (updateProgress) => {
+      // Ruling (j): ownership, the property kind and the volume gate again,
+      // against the dataset as it is now (the shrink compares the CURRENT size).
+      guarded(spec, pre, async (dataset, { updateProgress }) => {
         // ONE `zfs set` carrying every pair, not one call per property (#43).
         // ZFS validates the whole property list before it writes any of it, so
         // a value it rejects can no longer land AFTER earlier properties were
         // already applied — the half-applied edit is structurally impossible,
-        // not merely unlikely. (Values are also validated at the API boundary
-        // by the shared schema, so a bad one rarely reaches ZFS at all.)
+        // not merely unlikely. The volsize is rounded against the volume the
+        // job just re-read (the size its gate compared).
+        const pairs = buildSetPairs({ ...props, volsize: roundVolsize(dataset.row, props.volsize) })
         const spec = pairs.join(' ')
         const apply = async () => {
           updateProgress(`Setting ${spec} on ${fullName}`)
@@ -1194,12 +1610,14 @@ export async function datasetRoutes(
           await reverifyServedLun(executor, iscsiPaths, served, { requireDevice: true })
           return apply()
         })
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
     return { job }
   }
+
   // --- GET access — the layered access state of a dataset mountpoint -------
   // The writer itself lives in services/access.ts (access.1): this route only
   // names the ZFS target and sends what the service answers.
@@ -1242,44 +1660,61 @@ export async function datasetRoutes(
       return name.failure.body
     }
     const fullName = name.value
-    const owned = (await pveFootprint()).ownershipOf(fullName)
-    if (owned) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
-    }
-    // Story ident.1 (audit #20): `setfacl -R`/`chmod -R` (applyToExisting)
-    // walks into every child dataset mounted beneath this one — refused when
-    // any descendant is PVE's, before the target is even resolved.
-    if (req.applyToExisting === true) {
-      const refusal = await recursiveOwnedRefusal(poolName, fullName)
-      if (refusal) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: refusal } }
-      }
-    }
 
-    const target = await access.resolveZfsTarget(poolName, path)
-    if (!target.ok) {
-      reply.code(target.failure.status)
-      return target.failure.body
-    }
-    const planned = await access.planSetAccess(target.value, req)
-    if (!planned.ok) {
-      reply.code(planned.failure.status)
-      return planned.failure.body
-    }
-    const plan = planned.value
+    // Story cr.37: the one `fs.setAccess` guard spec (services/access.ts),
+    // with this door's own gates first — pvepool.1 review fixes: an OWNED
+    // dataset is view-only (setfacl/chmod on its mountpoint is PVE's to
+    // change), asked BEFORE the target resolution so an owned VOLUME is
+    // refused 400 with the reason rather than 404'd as "not a mounted
+    // filesystem"; and ident.1 (audit #20): `setfacl -R`/`chmod -R`
+    // (applyToExisting) walks into every child dataset mounted beneath this
+    // one, refused when any descendant is PVE's. Then the resolution and the
+    // plan from the live state, whose revision the confirm and the job bind.
+    const spec = access.setAccessGuardSpec({
+      what: `Dataset '${fullName}'`,
+      address: { dataset: fullName },
+      req,
+      resolve: () => access.resolveZfsTarget(poolName, path),
+      before: [
+        ownedGate<AccessObject>(() => fullName),
+        async () => {
+          if (req.applyToExisting !== true)
+            return null
+          const refusal = await recursiveOwnedRefusal(poolName, fullName)
+          return refusal ? invalid(refusal) : null
+        },
+      ],
+    })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const plan = pre.object.plan as SetAccessPlan
 
     // Operator ruling 2026-10-11: rewriting every existing file is a Level 2
     // dangerous operation — 409 + X-Anas-Confirm-Code, asked LAST so a
-    // refused request never offers a confirm.
-    if (plan.recursive && !confirmGate(confirmStore, request, reply, await access.recursiveConfirm(plan.target, { named: plan.hasNamed })))
-      return reply
+    // refused request never offers a confirm. Story cr.37: the code signs the
+    // whole request (owner, group, entries, clearNamed) and the revision of
+    // the ACL state the plan was computed from.
+    if (plan.recursive) {
+      const confirm = await access.recursiveConfirm(plan.target, { named: plan.hasNamed })
+      if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+        validated: { dataset: fullName, ...signedAccessRequest(req) },
+        address: ['dataset'],
+        presentationOnly: SET_ACCESS_PRESENTATION_ONLY,
+        message: confirm.message,
+        warnings: confirm.warnings,
+      })) {
+        return reply
+      }
+    }
 
     const job = jobQueue.submit(
       'fs.setAccess',
       { ...identity, params: access.jobParams(plan) },
-      async updateProgress => access.runSetAccess(plan, updateProgress),
+      // Ruling (j): the gates again, and the plan only while the state it was
+      // computed from is unchanged (STATE_CHANGED otherwise, nothing written).
+      guarded(spec, pre, async (_o, ctx) => access.runSetAccess(plan, ctx.updateProgress)),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1287,7 +1722,7 @@ export async function datasetRoutes(
   }
 
   // --- DELETE /pools/:name/datasets/*path — destroy (dangerous) -----------
-  server.delete<{ Params: { 'name': string, '*': string }, Querystring: { recursive?: string } }>('/pools/:name/datasets/*', async (request, reply) => {
+  server.delete<{ Params: { 'name': string, '*': string }, Querystring: Record<string, unknown> }>('/pools/:name/datasets/*', async (request, reply) => {
     const nameParsed = PoolName.safeParse(request.params.name)
     if (!nameParsed.success) {
       reply.code(400)
@@ -1316,79 +1751,25 @@ export async function datasetRoutes(
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid dataset path: ${pathParsed.error.issues[0]?.message}` } }
     }
     const fullName = `${poolName}/${pathParsed.data}`
-    const recursive = request.query.recursive === 'true' || request.query.recursive === '1'
+    // Story cr.37: the flag is normalised (absent ≡ `false`; `true`/`1` on) by
+    // the one lenient schema before the confirm signs it.
+    const { recursive } = DestroyDatasetQuery.parse(request.query ?? {})
 
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
 
-    const datasets = await listDatasetsOrNull(poolName)
-    if (datasets === null) {
-      // pvepool.1 review fix 4: the pool list FAILED. A recursive destroy
-      // would sweep a subtree the daemon cannot see — refused, not 404'd into
-      // a guess; a non-recursive destroy keeps its vanished-target 404.
-      if (recursive) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: pveDescendantsUnlistedMessage('destroy', fullName) } }
-      }
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
-    }
-    const targetDataset = datasets.find(d => d.name === fullName)
-    if (!targetDataset) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
-    }
-
-    // PVE footprint (story pvepool.1): an OWNED dataset is never ANAS's to
-    // destroy — any kind, refused up front with the predicate's reason, before
-    // the confirm gate is even minted. A RECURSIVE destroy also sweeps the
-    // subtree, and a storage registered on a NESTED path (e.g. `tank/x/data`)
-    // leaves the tree above it unowned — review fix 2 refuses when any
-    // strict descendant is PVE-owned, so `?recursive=true` can never take
-    // PVE's storage root and its guest disks with it.
-    const pve = await pveFootprint()
-    const pveOwned = pve.ownershipOf(fullName)
-    if (pveOwned) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: pveOwned.reason } }
-    }
-    if (recursive) {
-      const descendant = pve.ownedDescendant(datasets, fullName)
-      if (descendant) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: pveRecursiveRefusalMessage('Destroy', fullName, descendant) } }
-      }
-    }
-
-    // Story iscsi.6: BEFORE the confirm gate and before any `zfs destroy`, ask
-    // configfs whether a LUN is serving this dataset — the volume itself, a
-    // child zvol a `-r` destroy would sweep, or an image file inside a
-    // filesystem's mountpoint. ZFS refuses a destroy of a claimed object with a
-    // bare `dataset is busy` that names nothing, and a `-r` destroy whose CHILD
-    // is the claimed one is worse: the parent's other children are destroyed
-    // first, then it stops. Refusing up front is the only non-destructive
-    // answer. Fail-open — an unreadable LIO tree holds nothing. The cache is
-    // created HERE (not inside the helper) so the same read's failure bit can
-    // be disclosed at the confirm door below.
-    const claimsCache = createIscsiClaimCache(executor, iscsiPaths)
-    const heldForDestroy = await datasetHeldByLun(targetDataset, fullName, claimsCache)
-    // A volume routes through the ONE gate (story iscsi.3); a filesystem gets
-    // the same refusal built from the same helper, so the two never drift.
-    const volumeRefusal = assertVolumeMutable(fullName, 'destroy', targetDataset, undefined, heldForDestroy)
-    if (volumeRefusal) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: volumeRefusal.reason, message: volumeRefusal.message } }
-    }
-    if (heldForDestroy && targetDataset.type !== 'volume') {
-      const refusal = heldByLunRefusal(
-        `dataset '${fullName}'${recursive ? ' (recursive)' : ''}`,
-        'Destroying',
-        heldForDestroy,
-      )
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
-    }
+    // Story cr.37: the one guard spec both doors run — the listing (a
+    // recursive destroy over an unreadable list is refused, pvepool.1 review
+    // fix 4), PVE ownership of the dataset and, recursive, of every
+    // descendant (pvepool.1), and the LUN gate (iscsi.6) — all before the
+    // confirm is minted, and again in the job before `zfs destroy`.
+    const spec = destroyGuardSpec(poolName, fullName, recursive)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const targetDataset = pre.object.row as Dataset
+    const datasets = pre.object.listing?.datasets ?? []
 
     const children = datasets.filter(d => d.name.startsWith(`${fullName}/`))
     const snapshots = await snapshotNames(fullName)
@@ -1405,6 +1786,10 @@ export async function datasetRoutes(
       warnings.push(`${children.length} child dataset(s) will also be destroyed.`)
     if (snapshots.length > 0)
       warnings.push(`${snapshots.length} snapshot(s) of '${fullName}' will also be destroyed.`)
+    // What is bound is what was shown (WAVE3-DESIGN §5.2 rule 2): a recursive
+    // destroy names every child dataset its code is bound to.
+    if (recursive && children.length > 0)
+      warnings.push(`Child datasets destroyed with it: ${children.map(c => c.name).sort().join(', ')}.`)
     if (shares.length > 0)
       warnings.push(`${shares.length} share(s) serve this dataset (${shares.map(s => `'${s.protocol}:${s.name}'`).join(', ')}) and will stop working.`)
     // Live-proof F15: without this, confirming a non-recursive destroy of a
@@ -1416,32 +1801,20 @@ export async function datasetRoutes(
     if (!recursive && (children.length > 0 || snapshots.length > 0)) {
       warnings.push(destroyNeedsRecursive(fullName, targetDataset.type, children.map(c => c.name), snapshots))
     }
+    // The LIO-unreadable disclosure (D3) — an advisory, re-read by the job.
+    warnings.push(...pre.advisories.map(a => a.warning))
 
-    // Fail-open is not fail-silent (D3): a broken claims read fail-opens to
-    // "nothing held", which a dataset genuinely serving a LUN would look exactly
-    // like at this door — `zfs destroy` succeeds silently under a live session
-    // (GT-40). Disclose it; the hard-409 refusals above are unchanged.
-    if (await claimsCache.readFailed()) {
-      warnings.push('ANAS could not check whether an iSCSI LUN is served from this dataset — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
-    }
-
-    // The confirmation protects "destroy this dataset" — `recursive` is NOT part
-    // of the signature. The flag is chosen after the challenge is issued (like
-    // the pool-destroy cleanup bug), so binding it here would make the confirmed
-    // request mismatch the minted code and 409 again.
-    //
-    // Story ident.1: bound to the dataset's guid — a dataset destroyed and
-    // recreated under the same name answers the resend 409 IDENTITY_MISMATCH.
-    const destroyGuid = await readDatasetGuid(executor, fullName)
-    if (!destroyGuid) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Could not read the guid of dataset '${fullName}' — refusing a destroy that cannot be bound to it` } }
-    }
-    if (!confirmGateBound(confirmStore, request, reply, {
-      operation: 'zfs.destroy',
-      params: { dataset: fullName },
-      bound: destroyGuid,
-      what: `Dataset '${fullName}'`,
+    // Story cr.37 (M3): the code signs the whole validated request —
+    // `recursive` included, the confirm window re-challenges in place when the
+    // box is ticked (cr.44) — plus the dataset's guid (ident.1: a dataset
+    // destroyed and recreated under the same name is IDENTITY_MISMATCH) and,
+    // recursive, the child datasets (a child created since is
+    // CONFIRM_SCOPE_CHANGED naming it). A resend with the other `recursive` is
+    // CONFIRM_SCOPE_CHANGED naming the flag.
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { dataset: fullName, recursive },
+      address: ['dataset'],
+      presentationOnly: DATASET_DESTROY_PRESENTATION_ONLY,
       message: `Destroying dataset '${fullName}' permanently erases its data`,
       warnings,
     })) {
@@ -1452,14 +1825,13 @@ export async function datasetRoutes(
 
     const job = jobQueue.submit(
       'zfs.destroy',
-      { ...identity, params: { dataset: fullName, recursive, guid: destroyGuid.guid } },
-      async () => {
-        // ident.1: the job may have waited behind scrubs and backups. Same
-        // object (guid), and the PVE-footprint and LUN gates asked again of
-        // the tree as it is NOW — a child PVE claimed or a LUN added since the
-        // challenge refuses the destroy here, before `zfs destroy` runs.
-        await requireStableId(`Dataset '${fullName}'`, destroyGuid, () => readDatasetGuid(executor, fullName))
-        await recheckDestroyGates(poolName, fullName, recursive)
+      { ...identity, params: { dataset: fullName, recursive, guid: pre.bound.id.guid } },
+      // Ruling (j): the job may have waited behind scrubs, backups and the
+      // dataset's lock. Same object (guid), the same child set (recursive)
+      // and every gate above, against the tree as it is NOW — a child created,
+      // a storage PVE registered or a LUN added since the challenge refuses
+      // the destroy here, before `zfs destroy` runs.
+      guarded(spec, pre, async (_dataset, ctx) => {
         // cr.34 (WAVE3-DESIGN §6.3): a recursive destroy walks every
         // descendant and snapshot (thousands, in user space) — 30 min.
         const result = await executor.exec(ZFS, args, recursive ? { timeoutMs: 1_800_000 } : undefined)
@@ -1487,8 +1859,10 @@ export async function datasetRoutes(
             dataset: fullName,
           }))
         }
-        return { destroyed: fullName }
-      },
+        return { destroyed: fullName, ...(ctx.newAdvisories.length > 0 ? { warnings: ctx.newAdvisories } : {}) }
+      }),
+      // Story cr.33: the job starts only when it holds the dataset's keys.
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1543,61 +1917,28 @@ export async function datasetRoutes(
     if (!identity)
       return
 
-    const datasets = await listDatasetsOrNull(poolName)
-    if (datasets === null) {
-      // pvepool.1 review fix 4: the pool list FAILED. A recursive snapshot
-      // would sweep a subtree the daemon cannot see — refused, not 404'd into
-      // a guess; a non-recursive snapshot keeps its vanished-target 404.
-      if (recursive === true) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: pveDescendantsUnlistedMessage('snapshot', fullName) } }
-      }
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
-    }
-    if (!datasets.some(d => d.name === fullName)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
-    }
-
-    // PVE footprint (story pvepool.1): an OWNED dataset is view-only for
-    // snapshots — any kind. A storage-root snapshot sweeps PVE's guest zvols
-    // (3.26's reasoning, now per-dataset), and a guest volume's snapshots are
-    // PVE's to take. Refused with the predicate's reason. A RECURSIVE snapshot
-    // also sweeps the subtree, so an unowned dataset with an OWNED DESCENDANT
-    // (a storage registered on a nested path) is equally hands-off — review
-    // fix 2 refuses with the descendant named.
-    const pve = await pveFootprint()
-    const owned = pve.ownershipOf(fullName)
-    if (owned) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
-    }
-    if (recursive) {
-      const descendant = pve.ownedDescendant(datasets, fullName)
-      if (descendant) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: pveRecursiveRefusalMessage('Recursive snapshot', fullName, descendant) } }
-      }
-    }
-
-    // 409 if the snapshot already exists — the system is the source of truth.
-    const existing = await listSnapshotsDetail(fullName)
-    if (existing.some(s => s.name === snapName)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Snapshot '${snapName}' already exists` } }
-    }
+    // Story cr.37: the one guard spec both doors run — the dataset exists (a
+    // recursive snapshot over an unreadable pool list is refused, pvepool.1
+    // review fix 4), PVE ownership (a storage-root snapshot sweeps PVE's guest
+    // zvols; a guest volume's snapshots are PVE's to take), with `recursive`
+    // every descendant (a storage registered on a NESTED path), and the name
+    // is free. The job runs them again before `zfs snapshot`.
+    const spec = snapshotGuardSpec(poolName, fullName, snapName, recursive === true)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'zfs.snapshot',
       { ...identity, params: { snapshot: snapName, recursive: recursive ?? false } },
-      async () => {
+      guarded(spec, pre, async () => {
         // The ONE zfs-snapshot verb (backup2.3's extraction) — same argv, same
         // error text, one definition shared with the schedules service and the
         // backup runner.
         await createZfsSnapshot(executor, { dataset: fullName, name, recursive: recursive === true })
         return { created: snapName }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1628,30 +1969,24 @@ export async function datasetRoutes(
     if (!identity)
       return
 
-    const existing = await listSnapshotsDetail(fullName)
-    if (!existing.some(s => s.name === from)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Snapshot '${from}' not found` } }
-    }
-
-    // PVE footprint (story pvepool.1): an OWNED dataset is view-only — its
-    // snapshots are PVE's to manage, like its create (the same guard above).
-    // Refused with the predicate's reason.
-    const owned = (await pveFootprint()).ownershipOf(fullName)
-    if (owned) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
-    }
+    // Story cr.37: the snapshot exists and its dataset is not PVE's
+    // (pvepool.1: an OWNED dataset's snapshots are PVE's to manage) — at the
+    // route and again in the job before `zfs rename`.
+    const spec = snapshotOwnedSpec('zfs.rename', fullName, snap)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'zfs.rename',
       { ...identity, params: { from, to } },
-      async () => {
+      guarded(spec, pre, async () => {
         const result = await executor.exec(ZFS, ['rename', '--', from, to])
         if (result.exitCode !== 0)
           throw new Error(result.stderr.trim() || `zfs rename exited with code ${result.exitCode}`)
         return { renamed: from, to }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1674,30 +2009,25 @@ export async function datasetRoutes(
     if (!identity)
       return
 
-    const existing = await listSnapshotsDetail(fullName)
-    if (!existing.some(s => s.name === snapName)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Snapshot '${snapName}' not found` } }
-    }
-
-    // PVE footprint (story pvepool.1): an OWNED dataset is view-only — a
-    // guest volume's snapshots are PVE's to destroy, and a storage root's are
-    // taken and kept by PVE itself. Refused with the predicate's reason.
-    const owned = (await pveFootprint()).ownershipOf(fullName)
-    if (owned) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
-    }
+    // Story cr.37: the snapshot exists and its dataset is not PVE's
+    // (pvepool.1: a guest volume's snapshots are PVE's to destroy, and a
+    // storage root's are taken and kept by PVE itself) — at the route and
+    // again in the job before `zfs destroy`.
+    const spec = snapshotOwnedSpec('zfs.destroy', fullName, snap)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     // Plain 202 — destroying a snapshot removes a recovery point, not live data,
     // so no confirmation gate (DESIGN safety semantics).
     const job = jobQueue.submit(
       'zfs.destroy',
       { ...identity, params: { snapshot: snapName } },
-      async () => {
+      guarded(spec, pre, async () => {
         await destroyZfsSnapshot(executor, { dataset: fullName, name: snapParsed.data })
         return { destroyed: snapName }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1715,82 +2045,61 @@ export async function datasetRoutes(
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid snapshot name: ${snapParsed.error.issues[0]?.message}` } }
     }
     const snapName = `${fullName}@${snap}`
-    // `?force=true` maps to `zfs rollback -r` (also destroys intermediate
-    // snapshots). NOT bound into the confirm signature — it is chosen after the
-    // challenge is issued (the pool-destroy cleanup bug).
-    const q = request.query as { force?: string }
-    const force = q.force === 'true' || q.force === '1'
+    // `?force=true` maps to `zfs rollback -r`: it also destroys every snapshot
+    // and bookmark newer than the target. Story cr.37: normalised by the one
+    // lenient schema (absent ≡ `false`) and BOUND into the confirm below — the
+    // confirm window re-challenges in place when the box is ticked (cr.44).
+    const { force } = RollbackSnapshotQuery.parse(request.query ?? {})
 
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
 
-    const snapshots = await listSnapshotsDetail(fullName)
-    const target = snapshots.find(s => s.name === snapName)
-    if (!target) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Snapshot '${snapName}' not found` } }
-    }
-
-    // PVE footprint (story pvepool.1): an OWNED dataset is view-only — a
-    // rollback rewrites PVE's data in place, the most damaging of the snapshot
-    // verbs here. Refused BEFORE the confirm gate is even minted, with the
-    // predicate's reason.
-    const owned = (await pveFootprint()).ownershipOf(fullName)
-    if (owned) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
-    }
+    // Story cr.37: the one guard spec both doors run — the snapshot exists,
+    // PVE ownership (pvepool.1: a rollback rewrites PVE's data in place, the
+    // most damaging snapshot verb here) and the LUN gate for a volume and for
+    // an image file inside a filesystem (iscsi.3 + iscsi.6) — all before the
+    // confirm is minted, and again in the job before `zfs rollback`.
+    const spec = rollbackGuardSpec(fullName, snap, force)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     // Snapshots newer than the target block a plain rollback; ZFS needs `-r`
-    // (force) to destroy them. listSnapshotsDetail is newest-first, so "newer"
-    // are the ones ahead of the target in the list.
-    const targetIndex = snapshots.findIndex(s => s.name === snapName)
-    const laterSnapshots = snapshots.slice(0, targetIndex).map(s => s.snapshotName)
-
-    // Story iscsi.3: a rollback of a VOLUME goes through the one gate, which
-    // iscsi.6 taught the "held by LUN" refusal. ZFS itself permits rolling a
-    // zvol back under a live iSCSI session — exit 0, with a filesystem mounted
-    // on the initiator (GT-40) — so nothing below ANAS is going to stop it.
-    if (await volumeGateRefused(poolName, fullName, 'rollback', reply))
-      return reply
-
-    // Story iscsi.6: the same applies to a FILESYSTEM dataset holding a LUN's
-    // image file. A rollback rewrites that file's contents underneath a LIO
-    // backstore that is still serving it — the initiator's filesystem does not
-    // even know, and there is no rescan that repairs it. Refused before the
-    // confirm gate, before `zfs rollback`.
-    const rollbackRow = await datasetRow(poolName, fullName)
-    if (rollbackRow?.type !== 'volume') {
-      const held = await datasetHeldByLun(rollbackRow, fullName)
-      if (held) {
-        const refusal = heldByLunRefusal(`dataset '${fullName}' to snapshot '${snap}'`, 'Rolling back', held)
-        reply.code(409)
-        reply.send({ error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } })
-        return reply
-      }
-    }
+    // (force) to destroy them. The listing is newest-first, so "newer" are the
+    // ones ahead of the target in the list.
+    const snapshots = pre.object.snapshots
+    const laterSnapshots = snapshots.slice(0, snapshots.findIndex(s => s.name === snapName)).map(s => s.snapshotName)
 
     const warnings = [
       `Rolling back discards all changes to '${fullName}' since snapshot '${snap}'.`,
     ]
-    if (laterSnapshots.length > 0) {
+    if (force) {
+      // What is bound is what was shown (WAVE3-DESIGN §5.2 rule 2): the
+      // snapshots AND bookmarks `-r` destroys, by name — the force twin of the
+      // pool destroy's "Disks to wipe".
+      const destroys = pre.bound.scope?.destroys ?? ''
+      const count = destroys ? destroys.split(', ').length : 0
+      warnings.push(count > 0
+        ? `Force destroys the ${count} snapshot(s) and bookmark(s) newer than '${snap}' — irreversible.`
+        : `Force destroys nothing here: no snapshot or bookmark is newer than '${snap}'.`)
+      if (count > 0)
+        warnings.push(`Destroyed by force: ${destroys}.`)
+    }
+    else if (laterSnapshots.length > 0) {
       warnings.push(`${laterSnapshots.length} more recent snapshot(s) exist (${laterSnapshots.join(', ')}); rollback requires force to destroy them, and doing so is irreversible.`)
     }
 
-    // Story ident.1: bound to the target snapshot's createtxg AND the newest
-    // snapshot's — a snapshot taken after this challenge listed the newer
-    // ones (which `rollback -r` destroys) is a mismatch: refuse, re-challenge.
-    const rollbackIds = await readRollbackIds(executor, fullName, snapName)
-    if (!rollbackIds) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Could not read the snapshots of '${fullName}' — refusing a rollback that cannot be bound to them` } }
-    }
-    if (!confirmGateBound(confirmStore, request, reply, {
-      operation: 'zfs.rollback',
-      params: { snapshot: snapName },
-      bound: rollbackIds,
-      what: `Snapshot '${snapName}'`,
+    // Story cr.37 (M3): the code signs the whole validated request — `force`
+    // included — plus the target snapshot's createtxg and the newest one's
+    // (ident.1: a snapshot taken after this challenge is IDENTITY_MISMATCH)
+    // and, with force, what it destroys (a bookmark made since is
+    // CONFIRM_SCOPE_CHANGED). A resend with the other `force` is
+    // CONFIRM_SCOPE_CHANGED naming the flag.
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { snapshot: snapName, force },
+      address: ['snapshot'],
+      presentationOnly: SNAPSHOT_ROLLBACK_PRESENTATION_ONLY,
       message: `Rolling back '${fullName}' to snapshot '${snap}' discards newer data`,
       warnings,
     })) {
@@ -1801,14 +2110,17 @@ export async function datasetRoutes(
 
     const job = jobQueue.submit(
       'zfs.rollback',
-      { ...identity, params: { snapshot: snapName, force, ...rollbackIds } },
-      async () => {
-        await requireStableId(`Snapshot '${snapName}'`, rollbackIds, () => readRollbackIds(executor, fullName, snapName))
+      { ...identity, params: { snapshot: snapName, force, ...pre.bound.id } },
+      // Ruling (j): the same snapshot (both createtxgs), the same set force
+      // destroys, PVE ownership and the LUN gate, read again now — a LUN
+      // created on the volume while the job waited refuses it here.
+      guarded(spec, pre, async () => {
         const result = await executor.exec(ZFS, args)
         if (result.exitCode !== 0)
           throw new Error(result.stderr.trim() || `zfs rollback exited with code ${result.exitCode}`)
         return { rolledBack: snapName }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1838,58 +2150,28 @@ export async function datasetRoutes(
     if (!identity)
       return
 
-    // 404 if the source snapshot does not exist (system is the source of truth).
-    const existing = await listSnapshotsDetail(fullName)
-    if (!existing.some(s => s.name === snapName)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Snapshot '${snapName}' not found` } }
-    }
-
-    // PVE footprint (story pvepool.1), loaded once for BOTH ends of the clone.
-    const pve = await pveFootprint()
-
-    // Source end: an OWNED dataset is view-only — a clone out of PVE's
-    // snapshot tree is PVE's to make. Refused with the predicate's reason.
-    const sourceOwned = pve.ownershipOf(fullName)
-    if (sourceOwned) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: sourceOwned.reason } }
-    }
-
-    // 409 if the target dataset already exists — clone creates a NEW dataset.
-    const targetPool = target.split('/')[0]
-    const targetDatasets = await listDatasets(targetPool)
-    if (targetDatasets.some(d => d.name === target)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Dataset '${target}' already exists` } }
-    }
-
-    // PVE footprint guards (story pvepool.1) on the NEW name — clone is a
-    // dataset create wearing another hat: the naming guard first, then
-    // ownership of the target itself (a storage root, a dir-storage tree, the
-    // boot tree — a guest-named target is already caught by the guard above).
-    const claim = pve.claimedByPve(target)
-    if (claim) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: pveNamingGuardMessage(claim.storage, target) } }
-    }
-    const owned = pve.ownershipOf(target)
-    if (owned) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
-    }
+    // Story cr.37: the one guard spec both doors run — the source snapshot
+    // exists and its dataset is not PVE's (a clone out of PVE's snapshot tree
+    // is PVE's to make); clone is a dataset create wearing another hat, so the
+    // target name is free (409), passes the naming guard and is not owned
+    // (pvepool.1). The job runs them again before `zfs clone`.
+    const spec = cloneGuardSpec(fullName, snap, target)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     // Plain 202 — creating a new dataset from a snapshot is not destructive, so
     // no confirmation gate (it never touches existing data).
     const job = jobQueue.submit(
       'zfs.clone',
       { ...identity, params: { snapshot: snapName, target } },
-      async () => {
+      guarded(spec, pre, async () => {
         const result = await executor.exec(ZFS, ['clone', '--', snapName, target])
         if (result.exitCode !== 0)
           throw new Error(result.stderr.trim() || `zfs clone exited with code ${result.exitCode}`)
         return { cloned: snapName, target }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
