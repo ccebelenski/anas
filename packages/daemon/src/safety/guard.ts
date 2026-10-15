@@ -1,5 +1,6 @@
 import type { ErrorCode } from '@anas/shared'
 import type { FastifyReply, FastifyRequest } from 'fastify'
+import type { LockClaim, LockMode } from '../jobs/locks.js'
 import type { JobContext, JobHandler } from '../jobs/queue.js'
 import type { BoundId, ConfirmMismatch, ConfirmStore } from './confirm.js'
 import { describeBound, IDENTITY_MISMATCH, IdentityMismatchError, identityMismatchMessage, sameBound } from './stable-id.js'
@@ -24,7 +25,15 @@ import { describeBound, IDENTITY_MISMATCH, IdentityMismatchError, identityMismat
  *    A refusal fails the job with the gate's own error code and sentence.
  *
  * A gate is written once and called from both doors; nothing else may
- * re-implement it. Locks (cr.33) attach to the same spec later.
+ * re-implement it.
+ *
+ * Locks (cr.33, §4): the spec names the object's lock claims, computed by the
+ * route door from what it read (so the keys are stable ids, never names that
+ * a rename or a namesake could alias). `guardCheck` returns them on the pass
+ * and the route hands them to `jobQueue.submit(…, { locks: pre.locks })`; the
+ * queue starts the job only when it holds every one, and the job door's
+ * re-read then sees whatever ran before it. The key builders are at the end
+ * of this file.
  */
 
 /** What a gate answers when it refuses: the route's 4xx and the job's error, one object. */
@@ -123,6 +132,12 @@ export interface GuardSpec<O> {
   gates: Gate<O>[]
   /** Warn-only facts; never refuse. */
   advisories?: (object: O, reads: GuardReads) => Promise<Advisory[]>
+  /**
+   * The object locks the job takes (cr.33, §4.2), from what the route door
+   * read and bound: the stable id is in `bound.id`. Built with the key
+   * builders below. Absent = the job takes no lock.
+   */
+  locks?: (object: O, bound: GuardBound, reads: GuardReads) => Promise<LockClaim[]>
 }
 
 /** What the confirm binds beside the request, and what the job compares. */
@@ -137,6 +152,8 @@ export interface GuardPass<O> {
   object: O
   bound: GuardBound
   advisories: Advisory[]
+  /** The claims the job is submitted with: `jobQueue.submit(…, { locks: pre.locks })`. */
+  locks: LockClaim[]
 }
 
 async function runGates<O>(gates: Gate<O>[], object: O, reads: GuardReads): Promise<Refusal | null> {
@@ -186,7 +203,8 @@ export async function guardCheck<O>(spec: GuardSpec<O>): Promise<GuardPass<O> | 
   }
 
   const advisories = spec.advisories ? await spec.advisories(object, reads) : []
-  return { object, bound, advisories }
+  const locks = spec.locks ? await spec.locks(object, bound, reads) : []
+  return { object, bound, advisories, locks }
 }
 
 /** `the disks to wipe: a, b` — a scope as a message names it. */
@@ -450,4 +468,157 @@ export function guardConfirm<O>(
     message: opts.message,
     warnings: opts.warnings,
   })
+}
+
+// ---------------------------------------------------------------------------
+// Lock keys (cr.33, docs/WAVE3-DESIGN.md §4.2)
+//
+// Keys are STABLE ids where the object exists (a pool's guid, an AHR pool's VG
+// UUID, a disk's by-id, a LUN's serial, a uid), so a rename or a namesake can
+// never alias two objects; a NAME key (`zname:`, `ahrname:`, `idname:`) is
+// added by every verb that changes a namespace (create, import, export,
+// destroy, rename), so an export of `tank` and an import of another pool
+// called `tank` serialise although their guids differ. `what` is how a
+// waiting job's progress line names the object.
+// ---------------------------------------------------------------------------
+
+function claim(key: string, mode: LockMode, what: string): LockClaim {
+  return { key, mode, what }
+}
+
+/**
+ * `zpool:<guid>` — every ZFS verb on the pool or on anything in it: exclusive
+ * for the pool-structural verbs (destroy, export, upgrade, mountpoint, add or
+ * remove a vdev, attach, replace, raidz expand, cleanup), shared for
+ * everything inside.
+ */
+export function zpoolClaim(guid: string, mode: LockMode, pool: string): LockClaim {
+  return claim(`zpool:${guid}`, mode, `Pool '${pool}'`)
+}
+
+/** `zname:<pool name>` — exclusive; ZFS create, import, export, destroy. */
+export function znameClaim(pool: string): LockClaim {
+  return claim(`zname:${pool}`, 'exclusive', `the pool name '${pool}'`)
+}
+
+/**
+ * A pool-level verb's claims: the guid key in `mode`, plus the name key when
+ * the verb changes the namespace. A pool whose guid could not be read is
+ * locked by its name key only, exclusive (§4.2's conservative fallback; its
+ * gates refuse anyway when they cannot read their facts).
+ */
+export function poolClaims(pool: string, guid: string | null | undefined, mode: LockMode, opts: { namespace?: boolean } = {}): LockClaim[] {
+  if (!guid)
+    return [znameClaim(pool)]
+  return [zpoolClaim(guid, mode, pool), ...(opts.namespace ? [znameClaim(pool)] : [])]
+}
+
+const SNAPSHOT_OR_BOOKMARK = /[@#]/
+
+/** The dataset a snapshot (`@`) or bookmark (`#`) name belongs to. */
+function datasetOf(name: string): string {
+  const cut = name.search(SNAPSHOT_OR_BOOKMARK)
+  return cut === -1 ? name : name.slice(0, cut)
+}
+
+/**
+ * `zfs:<poolGuid>/<dataset path>` in `mode`, every ancestor dataset's key
+ * shared, and the pool's `zpool:<guid>` shared — dataset and snapshot verbs,
+ * a replication's source or target, a backup or cloud run on a path in the
+ * pool, a schedule fire. The path is the dataset's name BELOW the pool (the
+ * pool is the guid already; the root dataset's key is `zfs:<guid>`), so a pool
+ * imported under another name keeps its keys. A snapshot or bookmark name
+ * locks its dataset.
+ *
+ * So a recursive destroy of `tank/a` (exclusive on `tank/a`) excludes a
+ * snapshot of `tank/a/b` (shared on `tank/a` as its ancestor), while two
+ * snapshots under `tank/a` run together.
+ */
+export function zfsClaims(poolGuid: string, dataset: string, mode: LockMode): LockClaim[] {
+  const name = datasetOf(dataset)
+  const parts = name.split('/')
+  const key = (depth: number): string => {
+    const rel = parts.slice(1, depth).join('/')
+    return rel ? `zfs:${poolGuid}/${rel}` : `zfs:${poolGuid}`
+  }
+  const claims: LockClaim[] = [claim(key(parts.length), mode, `Dataset '${name}'`)]
+  for (let depth = parts.length - 1; depth >= 1; depth--)
+    claims.push(claim(key(depth), 'shared', `Dataset '${parts.slice(0, depth).join('/')}'`))
+  claims.push(zpoolClaim(poolGuid, 'shared', parts[0]))
+  return claims
+}
+
+/**
+ * `ahr:<vg uuid>` — every AHR verb: exclusive for destroy, mountpoint, remount,
+ * an expand/replace/readd step, cache attach/detach, spare add/remove,
+ * snapshot rollback; shared for scrub, repair, snapshot create/delete, access
+ * and the runs that read the pool.
+ */
+export function ahrClaim(vgUuid: string, mode: LockMode, pool: string): LockClaim {
+  return claim(`ahr:${vgUuid}`, mode, `AHR pool '${pool}'`)
+}
+
+/** `ahrname:<name>` — exclusive; AHR create and destroy. */
+export function ahrnameClaim(pool: string): LockClaim {
+  return claim(`ahrname:${pool}`, 'exclusive', `the AHR pool name '${pool}'`)
+}
+
+/**
+ * `disk:<inventory by-id>` — exclusive; every verb that writes a disk (ZFS
+ * create, add, attach, replace, the destroy cleanup; AHR create, expand,
+ * replace, spare, cache). The key is the WHOLE disk's by-id as the inventory
+ * lists it (`ata-…`, `scsi-…`), never a partition's.
+ */
+export function diskClaim(byId: string): LockClaim {
+  return claim(`disk:${byId}`, 'exclusive', `disk ${byId}`)
+}
+
+/** `iscsi-target:<iqn>` — exclusive; target verbs (the `withIscsiLock` section stays inside). */
+export function iscsiTargetClaim(iqn: string): LockClaim {
+  return claim(`iscsi-target:${iqn}`, 'exclusive', `iSCSI target ${iqn}`)
+}
+
+/** `iscsi-lun:<serial>` — exclusive; LUN verbs and an image restore onto a LUN. */
+export function iscsiLunClaim(serial: string): LockClaim {
+  return claim(`iscsi-lun:${serial}`, 'exclusive', `iSCSI LUN ${serial}`)
+}
+
+/** `mount:<target path>` — exclusive; mount verbs. */
+export function mountClaim(target: string): LockClaim {
+  return claim(`mount:${target}`, 'exclusive', `the mount at ${target}`)
+}
+
+/** `share:smb:<section>` — exclusive; Samba matches section names case-insensitively, so the key is case-folded. */
+export function smbShareClaim(section: string): LockClaim {
+  return claim(`share:smb:${section.toLowerCase()}`, 'exclusive', `SMB share '${section}'`)
+}
+
+/** `share:nfs:<path>` — exclusive; NFS export verbs. */
+export function nfsShareClaim(path: string): LockClaim {
+  return claim(`share:nfs:${path}`, 'exclusive', `NFS export ${path}`)
+}
+
+/** `uid:<n>` — exclusive; user verbs (the id, never the name: a re-created user is another user). */
+export function uidClaim(uid: number, name: string): LockClaim {
+  return claim(`uid:${uid}`, 'exclusive', `user '${name}' (uid ${uid})`)
+}
+
+/** `gid:<n>` — exclusive; group verbs. */
+export function gidClaim(gid: number, name: string): LockClaim {
+  return claim(`gid:${gid}`, 'exclusive', `group '${name}' (gid ${gid})`)
+}
+
+/** `idname:<name>` — exclusive; user and group create (the name has no id yet). */
+export function idnameClaim(name: string): LockClaim {
+  return claim(`idname:${name}`, 'exclusive', `the user or group name '${name}'`)
+}
+
+/** `task:<kind>:<name>` — exclusive for create, update, delete; shared for a run. */
+export function taskClaim(kind: string, name: string, mode: LockMode): LockClaim {
+  return claim(`task:${kind}:${name}`, mode, `${kind} task '${name}'`)
+}
+
+/** `schedule:<id>` — exclusive for create, update, delete; shared for a run. */
+export function scheduleClaim(id: string, mode: LockMode): LockClaim {
+  return claim(`schedule:${id}`, mode, `schedule '${id}'`)
 }

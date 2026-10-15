@@ -266,13 +266,45 @@ export interface AbandonedChild {
  */
 export class AbandonedRegistry {
   private readonly children = new Map<number, AbandonedChild>()
+  /** cr.33: who waits for a job's last abandoned child to exit, by job id. */
+  private readonly jobWaiters = new Map<string, (() => void)[]>()
 
   add(child: AbandonedChild): void {
     this.children.set(child.pid, child)
   }
 
   remove(pid: number): void {
+    const child = this.children.get(pid)
     this.children.delete(pid)
+    const jobId = child?.jobId
+    if (jobId === undefined || this.forJob(jobId).length > 0)
+      return
+    const waiters = this.jobWaiters.get(jobId)
+    this.jobWaiters.delete(jobId)
+    for (const resolve of waiters ?? [])
+      resolve()
+  }
+
+  /** The children a job ran that are still running after it gave up on them (cr.33). */
+  forJob(jobId: string): AbandonedChild[] {
+    return [...this.children.values()].filter(c => c.jobId === jobId)
+  }
+
+  /**
+   * Resolves when no child of `jobId` is left in the registry — at once when
+   * there is none (cr.33, WAVE3-DESIGN §4.4). The job queue keeps a job's
+   * object locks until then: a command we could not stop is still changing
+   * the object. It never rejects, and it may never resolve (a child stuck in
+   * the kernel for good); a daemon restart clears both.
+   */
+  whenJobClear(jobId: string): Promise<void> {
+    if (this.forJob(jobId).length === 0)
+      return Promise.resolve()
+    return new Promise((resolve) => {
+      const waiters = this.jobWaiters.get(jobId) ?? []
+      waiters.push(resolve)
+      this.jobWaiters.set(jobId, waiters)
+    })
   }
 
   /** Oldest first. */

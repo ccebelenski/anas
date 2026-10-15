@@ -1048,6 +1048,9 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
           throw err
         }
       },
+      // cr.33 (§4.3): a data mover — the direct run and the Run-Now
+      // supervisor alike — rides the long lane (at most 3 of the 4 slots).
+      { lane: 'long' },
     )
     reply.code(202)
     return { job }

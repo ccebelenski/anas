@@ -475,6 +475,8 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           throw err
         }
       },
+      // cr.33 (§4.3): a data mover rides the long lane (at most 3 of the 4 slots).
+      { lane: 'long' },
     )
 
     reply.code(202)

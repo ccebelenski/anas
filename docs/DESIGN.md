@@ -1144,6 +1144,8 @@ Job queue is in-memory. Jobs are lost on restart — this is acceptable because:
 - Users can resubmit any operation
 - Job history is a convenience, not critical data
 
+**Per-object locks and the long lane (cr.33, `WAVE3-DESIGN.md` §4).** A job names the objects it changes as lock claims when it is submitted (`zpool:<guid>`, `zfs:<poolGuid>/<path>` with its ancestors shared, `zname:<pool>`, `disk:<by-id>`, …; builders in `safety/guard.ts`), shared or exclusive. The queue starts a job only when it can grant every claim at once, in submission order per key, so a job waiting for a lock holds none of the 4 slots and its `progress` reads "waiting for <operation> (job <id>) on <object>". Locks are released when the job's status is settled, except that a job whose command could not be stopped (an abandoned child, §6.4) keeps them until that command exits and carries `holdsLocks: true` meanwhile. Data movers and their run supervisors ride the long lane, which may fill at most 3 of the 4 slots. Locks live in memory with the jobs and vanish with them on a restart.
+
 **Audit logging goes to journald** from day one. Every mutating operation logs to the systemd journal with structured fields:
 - User, operation, parameters, result, timestamp
 - Queryable via `journalctl -u anasd` with standard tooling

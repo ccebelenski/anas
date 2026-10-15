@@ -17,7 +17,7 @@ import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parsePoolBusyState, parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
 import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
 import { confirmGate } from '../safety/gate.js'
-import { guardCheck, guardConfirm, guarded, sendRefusal } from '../safety/guard.js'
+import { diskClaim, guardCheck, guardConfirm, guarded, poolClaims, sendRefusal } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
@@ -965,6 +965,25 @@ export async function poolRoutes(
       },
       gates: [poolSystemGate, poolPveGate, poolLunGate(action)],
       advisories: poolAdvisories,
+      // Story cr.33 (§4.2): both verbs are pool-structural and change the
+      // namespace — the guid key and the name key, exclusive. A cleanup
+      // destroy also writes the member disks: one `disk:` key per whole disk
+      // its by-id leaves name (the leaves the scope just bound; same read).
+      // A leaf ZFS names by kernel name or another path carries no disk key —
+      // the inventory's keys are by-ids, and the job resolves those leaves
+      // only after the pool is gone.
+      locks: async (pool, bound, reads) => {
+        const claims = poolClaims(pool.name, bound.id.guid, 'exclusive', { namespace: true })
+        if (!cleanup)
+          return claims
+        const leaves = (await poolReads.leaves(reads, pool.name)) ?? []
+        // Two steps on an array we own (`toSorted()` is ES2023; this package targets ES2022).
+        const disks = [...new Set(leaves
+          .filter(l => l.leafPath.startsWith(BY_ID_PREFIX) && l.wholeDiskId)
+          .map(l => l.wholeDiskId as string))]
+        disks.sort()
+        return [...claims, ...disks.map(id => diskClaim(id))]
+      },
     }
   }
 
@@ -2280,6 +2299,9 @@ export async function poolRoutes(
         resultWarnings.push(...ctx.newAdvisories)
         return resultWarnings.length > 0 ? { warnings: resultWarnings } : null
       }),
+      // Story cr.33: the job starts only when it holds the pool's keys; the
+      // guard's re-read then sees whatever ran on the pool before it.
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -2488,6 +2510,8 @@ export async function poolRoutes(
           cleanupResult.preserved = preserved
         return cleanupResult
       }),
+      // Story cr.33: the pool's keys, and with cleanup the disks it wipes.
+      { locks: pre.locks },
     )
 
     reply.code(202)

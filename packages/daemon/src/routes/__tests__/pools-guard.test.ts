@@ -75,6 +75,14 @@ const FINDMNT_TESTPOOL_AT_VAR = rewrite(
 const STATUS_ONE_MIRROR = fixture('zfs/zpool-status-online-fresh.json')
 const STATUS_TWO_MIRRORS_AND_SPARE = fixture('zfs/zpool-status-online.json')
 
+/**
+ * cr.33: `zpool list -j` once `testpool` was exported — the captured list of a
+ * node whose only pool is `testpool-rz` (zfs/NOTES.md, the 3.16 session).
+ */
+const LIST_WITHOUT_TESTPOOL = fixture('zfs/zpool-list-raidz.json')
+/** The dev mock's `zpool get guid` answer for testpool (server.ts). */
+const TESTPOOL_GUID = '5823146802312415237'
+
 const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
 
 /** A call that would mean export, destroy, the cleanup or the unit edit acted. */
@@ -102,6 +110,10 @@ describe('cr.32 — pool export and destroy re-gate in the job (ruling (j))', ()
   /** What the node answers right now; a test flips these while the job waits. */
   let findmnt = FINDMNT_FULL
   let zpoolStatus = STATUS_ONE_MIRROR
+  /** cr.33: `zpool list -j` when set (null: the dev mock's own answer). */
+  let zpoolList: string | null = null
+  /** cr.33: a `zpool <verb>` that does not return until the test releases it. */
+  const paused = new Map<string, Promise<void>>()
 
   const savedEnv = {
     configfs: process.env.ANAS_ISCSI_CONFIGFS,
@@ -138,6 +150,8 @@ describe('cr.32 — pool export and destroy re-gate in the job (ruling (j))', ()
   async function serve(): Promise<void> {
     findmnt = FINDMNT_FULL
     zpoolStatus = STATUS_ONE_MIRROR
+    zpoolList = null
+    paused.clear()
     await rm(configfs, { recursive: true, force: true })
     await materializeConfigfsManifest(LIO_NO_LUNS, configfs)
     process.env.ANAS_ISCSI_CONFIGFS = configfs
@@ -154,6 +168,11 @@ describe('cr.32 — pool export and destroy re-gate in the job (ruling (j))', ()
         return ok(findmnt)
       if (command === ZPOOL && args.length === 2 && args[0] === 'status' && args[1] === '-jv')
         return ok(zpoolStatus)
+      if (command === ZPOOL && args.length === 2 && args[0] === 'list' && args[1] === '-j' && zpoolList !== null)
+        return ok(zpoolList)
+      const hold = command === ZPOOL ? paused.get(args[0]) : undefined
+      if (hold)
+        await hold
       return orig(command, args, opts)
     }
     await server.ready()
@@ -279,6 +298,91 @@ describe('cr.32 — pool export and destroy re-gate in the job (ruling (j))', ()
     const res = await server!.inject({ method: 'DELETE', url: DESTROY.url, headers: IDENTITY_HEADERS })
     const warnings = res.json().error.warnings as string[]
     assert.ok(warnings.includes('Disks to wipe: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1-part1, scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2-part1.'), warnings.join(' | '))
+  })
+
+  /** Pause `zpool <verb>` inside its job until the returned release is called. */
+  function pause(verb: string): () => void {
+    let release!: () => void
+    paused.set(verb, new Promise<void>((resolve) => {
+      release = resolve
+    }))
+    return release
+  }
+
+  /** Challenge, resend with the code, return the accepted job's id. */
+  async function confirmed(verb: Verb): Promise<string> {
+    const first = await server!.inject({ method: verb.method, url: verb.url, headers: verb.headers, payload: verb.payload })
+    assert.equal(first.statusCode, 409, first.body)
+    const res = await server!.inject({
+      method: verb.method,
+      url: verb.url,
+      headers: { ...verb.headers, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string },
+      payload: verb.payload,
+    })
+    assert.equal(res.statusCode, 202, res.body)
+    return (res.json() as JobAccepted).job.id
+  }
+
+  async function until(cond: () => boolean): Promise<void> {
+    for (let i = 0; i < 400 && !cond(); i++)
+      await new Promise(resolve => setTimeout(resolve, 5))
+    assert.ok(cond(), 'condition not reached')
+  }
+
+  it('cr.33: a destroy confirmed while an export of the same pool runs waits for its LOCK (no slot) and then refuses — the pool is gone, no zpool destroy', async () => {
+    await serve()
+    const releaseExport = pause('export')
+    const exportId = await confirmed(EXPORT)
+    await until(() => calls.some(c => c.command === ZPOOL && c.args[0] === 'export'))
+    assert.equal(queue().get(exportId)?.status, 'running')
+
+    // The route door passes (the pool is still there), the job waits.
+    const destroyId = await confirmed(DESTROY)
+    assert.equal(queue().get(destroyId)?.status, 'queued')
+    assert.equal(queue().get(destroyId)?.progress, `waiting for zpool.export (job ${exportId}) on Pool 'testpool'`)
+    assert.equal(queue().list('running').length, 1, 'the waiting destroy holds none of the free slots')
+
+    // The export takes the pool off the node; then it ends and lets go.
+    zpoolList = LIST_WITHOUT_TESTPOOL
+    releaseExport()
+    const exported = await finished(exportId)
+    assert.equal(exported.status, 'completed', JSON.stringify(exported.error))
+    const destroyed = await finished(destroyId)
+    assert.equal(destroyed.status, 'failed')
+    assert.equal(destroyed.error?.code, 'IDENTITY_MISMATCH')
+    assert.ok(!calls.some(c => c.command === ZPOOL && c.args[0] === 'destroy'), 'zpool destroy never ran')
+    assert.ok(!calls.some(c => c.command === WIPEFS || c.command === SGDISK || (c.command === ZPOOL && c.args[0] === 'labelclear')), 'nothing wiped')
+    assert.deepEqual(queue().heldLocks(), [], 'both released; no idle key left')
+  })
+
+  it('cr.33: a cleanup destroy holds the pool\'s guid and name keys and every by-id disk it wipes, exclusive, while it runs', async () => {
+    await serve()
+    const releaseDestroy = pause('destroy')
+    const id = await confirmed(DESTROY)
+    await until(() => calls.some(c => c.command === ZPOOL && c.args[0] === 'destroy'))
+    assert.deepEqual(queue().heldLocks(), [
+      { key: `zpool:${TESTPOOL_GUID}`, mode: 'exclusive', holders: [id] },
+      { key: 'zname:testpool', mode: 'exclusive', holders: [id] },
+      { key: 'disk:scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1', mode: 'exclusive', holders: [id] },
+      { key: 'disk:scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2', mode: 'exclusive', holders: [id] },
+    ])
+    releaseDestroy()
+    const job = await finished(id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(queue().heldLocks(), [])
+  })
+
+  it('cr.33: an export takes the guid and the name key — never a disk', async () => {
+    await serve()
+    const release = pause('export')
+    const id = await confirmed(EXPORT)
+    await until(() => calls.some(c => c.command === ZPOOL && c.args[0] === 'export'))
+    assert.deepEqual(queue().heldLocks().map(l => [l.key, l.mode]), [
+      [`zpool:${TESTPOOL_GUID}`, 'exclusive'],
+      ['zname:testpool', 'exclusive'],
+    ])
+    release()
+    assert.equal((await finished(id)).status, 'completed')
   })
 })
 

@@ -1,7 +1,34 @@
 import type { Job, JobRef, JobStatus } from '@anas/shared'
 import type { AuditLogger } from '../audit/logger.js'
+import type { AbandonedRegistry } from '../executor/deadline.js'
+import type { LockClaim, LockMode } from './locks.js'
 import { randomUUID } from 'node:crypto'
-import { runInLane } from '../executor/deadline.js'
+import { abandonedChildren, runInLane } from '../executor/deadline.js'
+import { conflicts, LockTable, normaliseClaims } from './locks.js'
+
+export type { LockClaim, LockMode } from './locks.js'
+
+/**
+ * How long a job runs (cr.33, WAVE3-DESIGN §4.3). `long` is for the data
+ * movers and the supervisors of their runs (replication, backup, cloud sync,
+ * restores, Run Now): they may fill at most {@link JobQueue.longSlots} of the
+ * slots (3 of 4), so a short verb is never stuck behind four of them.
+ */
+export type JobLane = 'short' | 'long'
+
+/** What `submit` takes beside the operation, the submitter and the body. */
+export interface SubmitOptions {
+  /** Start at once, outside the concurrency limit and the locks (the cancel job only). */
+  control?: boolean
+  /**
+   * The object locks the job needs (cr.33). `drain` starts the job only when
+   * EVERY claim can be granted at once; until then it stays `queued`, holds
+   * no slot, and its progress line names the job it waits for.
+   */
+  locks?: readonly LockClaim[]
+  /** `long` for data movers and run supervisors (default `short`). */
+  lane?: JobLane
+}
 
 /** Who cancelled a job, and when (rclone.5). */
 export interface JobCancellation {
@@ -126,6 +153,17 @@ interface JobRecord {
   cancelRun?: Promise<void>
   /** True once the hook succeeded: the job ends `cancelled` however its body ends. */
   cancelled?: boolean
+  /** The job's object locks, one claim per key (cr.33). */
+  claims: LockClaim[]
+  lane: JobLane
+  /** The progress line `drain` wrote while the job waited for a lock (cleared when it no longer does). */
+  waitingLine?: string
+}
+
+/** Why a queued job cannot start yet: the claim, and the job in its way. */
+interface LockWait {
+  claim: LockClaim
+  job: Job
 }
 
 export class JobQueue {
@@ -133,12 +171,28 @@ export class JobQueue {
   private concurrency: number
   private maxRetained: number
   private running = 0
+  /** Slots held by `long` jobs (cr.33). */
+  private runningLong = 0
   private audit?: AuditLogger
+  private readonly locks = new LockTable()
+  private readonly abandoned: AbandonedRegistry
+  /** At most this many slots run `long` jobs: one slot is always left for short verbs. */
+  readonly longSlots: number
 
-  constructor(opts?: { concurrency?: number, maxRetained?: number, audit?: AuditLogger }) {
+  constructor(opts?: {
+    concurrency?: number
+    maxRetained?: number
+    audit?: AuditLogger
+    /** Where the executor lists children it could not stop (default: the daemon's one registry). */
+    abandoned?: AbandonedRegistry
+    /** Default: one less than `concurrency`, and at least 1. */
+    longSlots?: number
+  }) {
     this.concurrency = opts?.concurrency ?? 4
     this.maxRetained = opts?.maxRetained ?? 1000
     this.audit = opts?.audit
+    this.abandoned = opts?.abandoned ?? abandonedChildren
+    this.longSlots = opts?.longSlots ?? Math.max(1, this.concurrency - 1)
   }
 
   /**
@@ -150,13 +204,18 @@ export class JobQueue {
    * (a Run-Now holds two slots — its supervisor and the direct run) would wait
    * for them; it is short and bounded (two signal waits), so it never needs a
    * slot of its own.
+   *
+   * `locks` and `lane` (cr.33): see {@link SubmitOptions}. A control job takes
+   * no locks — it must never wait behind the job it is meant to stop.
    */
   submit(
     operation: string,
     submitter: JobSubmitter,
     handler: JobHandler,
-    opts: { control?: boolean } = {},
+    opts: SubmitOptions = {},
   ): JobRef {
+    if (opts.control && (opts.locks?.length ?? 0) > 0)
+      throw new TypeError(`job '${operation}': a control job takes no locks`)
     const id = randomUUID()
     const now = new Date().toISOString()
 
@@ -174,7 +233,14 @@ export class JobQueue {
       detail: null,
     }
 
-    const record: JobRecord = { job, handler, submitter, ...(opts.control ? { control: true } : {}) }
+    const record: JobRecord = {
+      job,
+      handler,
+      submitter,
+      ...(opts.control ? { control: true } : {}),
+      claims: normaliseClaims(opts.locks ?? []),
+      lane: opts.lane ?? 'short',
+    }
     this.jobs.set(id, record)
 
     this.audit?.submitted({
@@ -368,6 +434,11 @@ export class JobQueue {
     return all
   }
 
+  /** Every object lock held now (cr.33): the key, its mode and the holding job ids. */
+  heldLocks(): { key: string, mode: LockMode, holders: string[] }[] {
+    return this.locks.held()
+  }
+
   /** Evict oldest completed/failed jobs when over maxRetained. */
   private evict(): void {
     if (this.jobs.size <= this.maxRetained)
@@ -376,26 +447,119 @@ export class JobQueue {
     for (const [id, record] of this.jobs) {
       if (this.jobs.size <= this.maxRetained)
         break
+      // A finished job still holding its locks (an abandoned child) stays
+      // visible: the waiting jobs' progress lines name it.
+      if (record.job.holdsLocks)
+        continue
       if (record.job.status === 'completed' || record.job.status === 'failed' || record.job.status === 'cancelled')
         this.jobs.delete(id)
     }
   }
 
-  /** Try to run queued jobs up to the concurrency limit. */
+  /**
+   * Start every queued job that can start (cr.33, WAVE3-DESIGN §4.1–§4.3), in
+   * submission order. A job starts when
+   *
+   *  - a slot is free, and for a `long` job fewer than {@link longSlots} run;
+   *  - EVERY claim is grantable now (all-or-nothing: a job never holds one key
+   *    while it waits for another, so no deadlock is possible);
+   *  - no EARLIER queued job has a conflicting claim on any of its keys
+   *    (per-key FIFO: a queued exclusive claim blocks later shared ones, so a
+   *    destroy is not starved by a stream of snapshots; whatever an earlier
+   *    job waits for, a later one does not overtake it on a key they share).
+   *
+   * A job that does not start holds no slot. When a lock is what stops it,
+   * its progress line names the job in its way.
+   */
   private drain(): void {
+    /** The claims of earlier jobs still queued: a later job may not overtake them. */
+    const ahead: LockWait[] = []
     for (const record of this.jobs.values()) {
-      if (this.running >= this.concurrency)
-        break
-      if (record.job.status !== 'queued')
+      if (record.job.status !== 'queued' || record.control)
         continue
 
-      this.running++
-      this.start(record)
+      const wait = this.lockWait(record, ahead)
+      const slotFree = this.running < this.concurrency
+        && (record.lane !== 'long' || this.runningLong < this.longSlots)
+      if (!wait && slotFree) {
+        this.locks.grant(record.job, record.claims)
+        this.running++
+        if (record.lane === 'long')
+          this.runningLong++
+        this.start(record)
+        continue
+      }
+      this.showWaiting(record, wait)
+      for (const claim of record.claims)
+        ahead.push({ claim, job: record.job })
     }
+  }
+
+  /** The first claim of `record` that cannot be granted now, and the job in its way; null when all can. */
+  private lockWait(record: JobRecord, ahead: readonly LockWait[]): LockWait | null {
+    for (const claim of record.claims) {
+      const holder = this.locks.blocker(claim)
+      if (holder)
+        return { claim, job: holder }
+      const earlier = ahead.find(a => a.claim.key === claim.key && conflicts(a.claim.mode, claim.mode))
+      if (earlier)
+        return { claim, job: earlier.job }
+    }
+    return null
+  }
+
+  /**
+   * The waiting job's progress line (§4.1): "waiting for <operation> (job
+   * <id>) on <what>". A job that waits only for a slot shows what it showed
+   * before locks existed (nothing), so a line the queue wrote is taken back.
+   */
+  private showWaiting(record: JobRecord, wait: LockWait | null): void {
+    if (!wait) {
+      this.clearWaiting(record)
+      return
+    }
+    const { claim, job } = wait
+    const line = job.holdsLocks
+      ? `waiting for ${job.operation} (job ${job.id}) on ${claim.what} — that job has ended, but a command it ran could not be stopped and is still running`
+      : `waiting for ${job.operation} (job ${job.id}) on ${claim.what}`
+    record.job.progress = line
+    record.waitingLine = line
+  }
+
+  /** Take back the queue's own "waiting for …" line (never a line the body wrote). */
+  private clearWaiting(record: JobRecord): void {
+    if (record.waitingLine !== undefined && record.job.progress === record.waitingLine)
+      record.job.progress = null
+    record.waitingLine = undefined
+  }
+
+  /**
+   * Release the job's locks once its status is settled (§4.4). A job whose
+   * child the executor had to abandon (it outlived its SIGKILL) keeps them
+   * until that child really exits: a command we could not stop is still
+   * changing the object. Meanwhile the record says so (`holdsLocks`), and the
+   * jobs waiting on it name it.
+   */
+  private releaseLocks(record: JobRecord): void {
+    const { job, claims } = record
+    if (claims.length === 0)
+      return
+    if (this.abandoned.forJob(job.id).length === 0) {
+      this.locks.release(job.id, claims)
+      return
+    }
+    job.holdsLocks = true
+    void this.abandoned.whenJobClear(job.id).then(() => {
+      this.locks.release(job.id, claims)
+      delete job.holdsLocks
+      this.evict()
+      this.drain()
+    })
   }
 
   /** Mark a record running and execute it (the slot, if any, is the caller's). */
   private start(record: JobRecord): void {
+    this.clearWaiting(record)
     record.job.status = 'running'
     record.job.startedAt = new Date().toISOString()
     this.execute(record)
@@ -496,8 +660,13 @@ export class JobQueue {
     }
     finally {
       job.completedAt = new Date().toISOString()
-      if (!record.control)
+      if (!record.control) {
         this.running--
+        if (record.lane === 'long')
+          this.runningLong--
+      }
+      // cr.33: once the status is settled, never before (§4.4).
+      this.releaseLocks(record)
       this.evict()
       this.drain()
     }

@@ -1368,6 +1368,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           throw err
         }
       },
+      // cr.33 (§4.3): a data mover — the direct run and the Run-Now
+      // supervisor alike — rides the long lane (at most 3 of the 4 slots).
+      { lane: 'long' },
     )
     reply.code(202)
     return { job }
@@ -1987,6 +1990,8 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         auditParams.bytesWritten = result.bytesWritten
         return result
       }),
+      // cr.33 (§4.3): a restore is a data mover — the long lane.
+      { lane: 'long' },
     )
 
     reply.code(202)
@@ -2211,6 +2216,8 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         auditParams.bytesWritten = result.bytesWritten
         return result
       }),
+      // cr.33 (§4.3): a restore is a data mover — the long lane.
+      { lane: 'long' },
     )
 
     reply.code(202)
@@ -2512,6 +2519,8 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         )
         return result
       },
+      // cr.33 (§4.3): a restore is a data mover — the long lane.
+      { lane: 'long' },
     )
     reply.code(202)
     return { job }

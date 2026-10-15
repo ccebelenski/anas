@@ -53,6 +53,14 @@ export const Job = z.object({
    * field, gone when the job leaves the queue.
    */
   detail: z.unknown().nullable().optional(),
+  /**
+   * cr.33 (ADDITIVE): present and true on a job that has ENDED but still holds
+   * its object locks, because a command it ran outlived its SIGKILL (a process
+   * in uninterruptible sleep, WAVE3-DESIGN §4.4) and may still be changing the
+   * object. Removed when that command exits and the locks are released; jobs
+   * waiting for the same object name this job in their progress line.
+   */
+  holdsLocks: z.boolean().optional(),
 })
 export type Job = z.infer<typeof Job>
 
