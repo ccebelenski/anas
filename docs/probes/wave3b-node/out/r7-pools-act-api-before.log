@@ -1,0 +1,28 @@
+(node:3233062) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+[1A[2K(node:3233162) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+[1A[2K[1/1] [integration] › tests/integration/pools-act-api.spec.ts:196:3 › Pool create / destroy / export / import (spare disks) › creates a pool via the API, then destroys it through the confirmation flow (3.8, 3.14)
+[1A[2K  1) [integration] › tests/integration/pools-act-api.spec.ts:196:3 › Pool create / destroy / export / import (spare disks) › creates a pool via the API, then destroys it through the confirmation flow (3.8, 3.14) 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m202[39m
+    Received: [31m409[39m
+
+      206 |         },
+      207 |       })
+    > 208 |       expect(createRes.status()).toBe(202)
+          |                                  ^
+      209 |       expect((await createRes.json()).job).toBeDefined()
+      210 |       await expect.poll(() => poolExists(TMP_CREATE), { timeout: 90_000 }).toBe(true)
+      211 |
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-a2c8412092d233f0e/tests/integration/pools-act-api.spec.ts:208:34
+
+
+[1A[2K  1 failed
+    [integration] › tests/integration/pools-act-api.spec.ts:196:3 › Pool create / destroy / export / import (spare disks) › creates a pool via the API, then destroys it through the confirmation flow (3.8, 3.14) 

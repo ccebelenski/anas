@@ -1,0 +1,15 @@
+
+### the same NFS export is ALSO mounted at /w3r2/a/nfs (row 2): a holder there only, then challenge Unmount of /mnt/w3r3
+HTTP 202 0.032328
+{"job":{"id":"18a080ff-7594-4aa9-86ad-6b21101b7dde","status":"running","operation":"mount.mount","createdAt":"2026-10-15T16:56:37.896Z","createdBy":"root"}}
+[t+1s] completed | Mounting /mnt/w3r3 | {"mounted": "/mnt/w3r3"} | 
+714166 w3r3-other 3600
+  fuser -vm /mnt/w3r3:
+                         USER        PID ACCESS COMMAND
+    /mnt/w3r3:           root     kernel mount /w3r2/a/nfs
+  stat -c %d of both mountpoints:
+    /mnt/w3r3 dev 72
+    /w3r2/a/nfs dev 72
+HTTP 202 0.089069
+{"job":{"id":"35e1fe06-4d0d-498f-8a17-ed5234092b8c","status":"running","operation":"mount.unmount","createdAt":"2026-10-15T16:56:39.652Z","createdBy":"root"}}
+  holders gone

@@ -1,0 +1,10 @@
+HTTP 409 0.019354
+X-Anas-Confirm-Code: 3d3ff6fa4af9
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Removing mount '/mnt/w3r3' deletes its configuration","warnings":["The /etc/fstab line for '/mnt/w3r3' is deleted; the mount does not come back at boot.","The mountpoint directory '/mnt/w3r3' is removed if it is empty (never its contents)."]}}
+HTTP 202 0.014525
+{"job":{"id":"5c33f505-9e0a-4033-855a-ef3eecf0858b","status":"running","operation":"mount.remove","createdAt":"2026-10-15T16:56:45.432Z","createdBy":"root"}}
+[t+0s] running | Reloading systemd (daemon-reload) |  | 
+[t+1s] completed | Removing the mountpoint directory /mnt/w3r3 | {"removed": "/mnt/w3r3"} | 
+0
+ls: cannot access '/mnt/w3r3': No such file or directory
+  not mounted

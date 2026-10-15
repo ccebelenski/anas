@@ -1,0 +1,19 @@
+0aad11027013 /usr/share/perl5/PVE/APIServer/AnyEvent.pm
+58b75a9a00d5 /usr/share/pve-manager/index.html.tpl
+b3c85fb4d426 /etc/fstab
+f1e3ca20fe45 /etc/exports
+80adock-pve-integration
+80anas-pve-integration
+adock: bundle cache-bust token v=1b821b5e9152
+adock: re-stamped script line in /usr/share/pve-manager/index.html.tpl (?v=1b821b5e9152)
+adock: installed /usr/share/adock/perl/AdockProxy.pm
+adock: proxy hook already present in /usr/share/perl5/PVE/APIServer/AnyEvent.pm (nothing to do)
+adock: installed apt hook /etc/apt/apt.conf.d/80adock-pve-integration
+adock: PVE UI integration installed.
+0aad11027013 /usr/share/perl5/PVE/APIServer/AnyEvent.pm
+58b75a9a00d5 /usr/share/pve-manager/index.html.tpl
+active
+inactive
+core
+dbroot
+iscsi

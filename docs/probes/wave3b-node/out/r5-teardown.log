@@ -1,0 +1,8 @@
+HTTP 202 0.025147
+{"job":{"id":"af73bfe5-7469-448b-a198-64384132bc21","status":"running","operation":"replication.task.remove","createdAt":"2026-10-15T16:59:42.360Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"removed": "w3r5rep"} | 
+0
+No devices found
+/dev/loop1: [2049]:548044 (/var/tmp/pvepool-fixture/sysfix.img)
+/dev/loop0: [2049]:548022 (/var/tmp/pvepool-fixture/pvfix.img)

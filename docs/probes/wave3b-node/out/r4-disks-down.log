@@ -1,0 +1,17 @@
+Detaching SCSI hot20 from anas-pve...
+Disk detached successfully
+
+✓ hot20 (SCSI) detached
+Detaching SCSI hot21 from anas-pve...
+Disk detached successfully
+
+✓ hot21 (SCSI) detached
+Detaching SCSI hot22 from anas-pve...
+Disk detached successfully
+
+✓ hot22 (SCSI) detached
+Detaching SCSI hot23 from anas-pve...
+Disk detached successfully
+
+✓ hot23 (SCSI) detached
+  hot20-23 images deleted

@@ -1,0 +1,28 @@
+(node:3213418) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+[1A[2K(node:3213512) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+[1A[2K[1/1] [integration] › tests/integration/pvepool-api.spec.ts:314:3 › Owned-dataset mutations refused › snapshot create on the storage root pvfix → 400 naming storage + dataset
+[1A[2K  1) [integration] › tests/integration/pvepool-api.spec.ts:314:3 › Owned-dataset mutations refused › snapshot create on the storage root pvfix → 400 naming storage + dataset 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoContain[2m([22m[32mexpected[39m[2m) // indexOf[22m
+
+    Expected substring: [32m"PVE storage 'pvfix' owns pvfix"[39m
+    Received string:    [31m"Invalid create snapshot request: 'anas-' is reserved for scheduled snapshots — choose another name"[39m
+
+      321 |       const err = (await res.json()).error
+      322 |       expect(err.code).toBe('VALIDATION_ERROR')
+    > 323 |       expect(err.message).toContain(`PVE storage '${PVE_POOL}' owns ${PVE_POOL}`)
+          |                           ^
+      324 |       // The storage root really has no such snapshot (source of truth).
+      325 |       const snaps = await sshExec(`zfs list -H -o name -t snapshot -d 1 ${PVE_POOL} 2>/dev/null || true`)
+      326 |       expect(snaps).not.toContain('anas-proof-snap')
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-a2c8412092d233f0e/tests/integration/pvepool-api.spec.ts:323:27
+
+
+[1A[2K  1 failed
+    [integration] › tests/integration/pvepool-api.spec.ts:314:3 › Owned-dataset mutations refused › snapshot create on the storage root pvfix → 400 naming storage + dataset 

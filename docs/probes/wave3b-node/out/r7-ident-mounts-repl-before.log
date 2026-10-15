@@ -1,0 +1,33 @@
+(node:3226874) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+[1A[2K(node:3226946) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+[1A[2K[1/1] [integration] › tests/integration/ident-mounts-repl.spec.ts:229:3 › ident.4 — act on what is actually there (live) › (e) a local filesystem at a failed CIFS line's target survives Remove — 409 naming what is there
+[1A[2K  1) [integration] › tests/integration/ident-mounts-repl.spec.ts:229:3 › ident.4 — act on what is actually there (live) › (e) a local filesystem at a failed CIFS line's target survives Remove — 409 naming what is there 
+
+    Error: {"error":{"code":"CONFIRMATION_REQUIRED","message":"Removing mount '/mnt/ident4-cifs' deletes its configuration","warnings":["The /etc/fstab line for '/mnt/ident4-cifs' is deleted; the mount does not come back at boot.","The credentials file /etc/anas/creds/mnt-0941650c86c1.cred is deleted if it exists and no other /etc/fstab line names it.","The mountpoint directory '/mnt/ident4-cifs' is removed if it is empty (never its contents)."]}}
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m202[39m
+    Received: [31m409[39m
+
+       at integration/fixtures/cloud-api.ts:58
+
+      56 |     ...(opts.headers ? { headers: opts.headers } : {}),
+      57 |   })
+    > 58 |   expect(res.status(), await res.text()).toBe(202)
+         |                                          ^
+      59 |   const { id } = (await res.json()).job
+      60 |   const job = await awaitJob(ctx, id, opts.timeout)
+      61 |   expect(job.status, job.error).toBe('completed')
+        at runJob (/home/ccebelenski/projects/anas/.claude/worktrees/agent-a2c8412092d233f0e/tests/integration/fixtures/cloud-api.ts:58:42)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-a2c8412092d233f0e/tests/integration/ident-mounts-repl.spec.ts:270:7
+
+
+[1A[2K  1 failed
+    [integration] › tests/integration/ident-mounts-repl.spec.ts:229:3 › ident.4 — act on what is actually there (live) › (e) a local filesystem at a failed CIFS line's target survives Remove — 409 naming what is there 

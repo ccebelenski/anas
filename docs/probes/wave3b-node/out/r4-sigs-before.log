@@ -1,0 +1,16 @@
+  hot20: sdd sdd1 sdd9 
+    wipefs -n /dev/sdd    1 PMBR ; 2 gpt ;
+    wipefs -n /dev/sdd1   4 zfs_member w3r4 1599436143226448872;
+    wipefs -n /dev/sdd9  
+  hot21: sde sde1 sde9 
+    wipefs -n /dev/sde    1 PMBR ; 2 gpt ;
+    wipefs -n /dev/sde1   4 zfs_member w3r4 1599436143226448872;
+    wipefs -n /dev/sde9  
+  hot22: sdf sdf1 sdf9 
+    wipefs -n /dev/sdf    1 PMBR ; 2 gpt ;
+    wipefs -n /dev/sdf1   4 zfs_member ;
+    wipefs -n /dev/sdf9  
+  hot23: sdg sdg1 sdg9 
+    wipefs -n /dev/sdg    1 PMBR ; 2 gpt ;
+    wipefs -n /dev/sdg1   4 zfs_member ;
+    wipefs -n /dev/sdg9  

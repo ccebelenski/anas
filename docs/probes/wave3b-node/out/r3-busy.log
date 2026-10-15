@@ -1,0 +1,28 @@
+
+### a holder: fd 3 on /mnt/w3r3/top
+713845 w3r3-a 3600
+  fuser -vm /mnt/w3r3:
+                         USER        PID ACCESS COMMAND
+    /mnt/w3r3:           root     kernel mount /w3r2/a/nfs
+                         root      713845 f.... sleep
+  a non-holder for comparison:
+713862 w3r3-bystander 3600
+
+### Unmount through the API: challenge
+HTTP 409 0.159237
+X-Anas-Confirm-Code: ec0d0a1725ec
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"'/mnt/w3r3' is busy — 1 process(es) are holding it","warnings":["Unmounting '/mnt/w3r3' will be forced (lazy unmount); these holders lose access:","sleep (pid 713845)"]}}
+
+### resend with the code (the forced lazy unmount)
+HTTP 202 0.085887
+{"job":{"id":"60888a8e-e41a-4cea-b402-6b1fefcd180d","status":"running","operation":"mount.unmount","createdAt":"2026-10-15T16:55:55.625Z","createdBy":"root"}}
+[t+0s] completed | Unmounting /mnt/w3r3 (lazy) | {"unmounted": "/mnt/w3r3"} | 
+{"job":{"id":"60888a8e-e41a-4cea-b402-6b1fefcd180d","status":"completed","operation":"mount.unmount","progress":"Unmounting /mnt/w3r3 (lazy)","createdAt":"2026-10-15T16:55:55.625Z","createdBy":"root","startedAt":"2026-10-15T16:55:55.626Z","completedAt":"2026-10-15T16:55:55.689Z","result":{"unmounted":"/mnt/w3r3"},"error":null,"detail":null}}
+
+### after: the mount, the holder, the bystander
+  /mnt/w3r3 NOT mounted (detached)
+  w3r3-a pid 713845 alive: yes fd3: /top
+  w3r3-bystander pid 713862 alive: yes fd3: 
+  holder reads its fd: hi
+  fstab lines for w3r3: 1
+  holders gone

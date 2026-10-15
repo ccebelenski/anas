@@ -1,0 +1,12 @@
+daemon/dist/routes/pools.js 3c7cb069d9f851fe 3c7cb069d9f851fe MATCH
+daemon/dist/routes/mounts.js c2052009ef1f9673 c2052009ef1f9673 MATCH
+daemon/dist/services/access-walk.js 411d560491d90660 411d560491d90660 MATCH
+daemon/dist/services/access.js 592670373e39dc24 592670373e39dc24 MATCH
+daemon/dist/services/partition-device.js 557aaa6d6db81c51 557aaa6d6db81c51 MATCH
+daemon/dist/services/source-claims.js af51221a4f486a82 af51221a4f486a82 MATCH
+daemon/dist/services/busy-diagnosis.js 9223fbedca0b42db 9223fbedca0b42db MATCH
+daemon/dist/safety/guard.js 4fe5acabd1cea670 4fe5acabd1cea670 MATCH
+daemon/dist/routes/dashboard.js f7ca322948e3f6e7 f7ca322948e3f6e7 MATCH
+gateway/dist/proxy.js f0a162a0da4480a3 f0a162a0da4480a3 MATCH
+deployed tree: 5b36fbe5 (main HEAD)
+per-file dist sha256 over daemon/gateway/shared dist (2136 files), LC_ALL=C sorted: host == node; hash of the list 2298f87e3d8a6b90

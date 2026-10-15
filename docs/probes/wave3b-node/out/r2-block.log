@@ -1,0 +1,8 @@
+table inet w3r2 {
+	chain out {
+		type filter hook output priority filter; policy accept;
+		tcp dport 2049 drop
+	}
+}
+16:54:10
+  timeout 3 stat -f /w3r2/a/nfs -> exit 124

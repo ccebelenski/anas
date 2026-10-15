@@ -1,0 +1,43 @@
+(node:3214507) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 12 tests using 1 worker
+
+[1A[2K(node:3214600) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+[1A[2K[1/12] [integration] › tests/integration/pvepool-api.spec.ts:110:3 › Per-dataset ownership stamps (list) › pvfix: storage root, guest volumes and dir-storage stamped; siblings clean
+[1A[2K[2/12] [integration] › tests/integration/pvepool-api.spec.ts:158:3 › Per-dataset ownership stamps (list) › sysfix: boot tree system-owned; nested storage root and its guest stamped; sibling clean
+[1A[2K[3/12] [integration] › tests/integration/pvepool-api.spec.ts:216:3 › Dataset create on a PVE pool › a child of the storage root outside PVE's footprint is created and destroyed (3)
+[1A[2K[4/12] [integration] › tests/integration/pvepool-api.spec.ts:243:3 › Dataset create on a PVE pool › naming guard: a guest-named direct child is refused; deeper in the tree it is allowed (4)
+[1A[2K[5/12] [integration] › tests/integration/pvepool-api.spec.ts:283:3 › Owned-dataset mutations refused › destroy vm-100-disk-0 → 400 naming storage + dataset
+[1A[2K[6/12] [integration] › tests/integration/pvepool-api.spec.ts:298:3 › Owned-dataset mutations refused › property set on subvol-101-disk-0 → 400 naming storage + dataset
+[1A[2K[7/12] [integration] › tests/integration/pvepool-api.spec.ts:314:3 › Owned-dataset mutations refused › snapshot create on the storage root pvfix → 400 naming storage + dataset
+[1A[2K[8/12] [integration] › tests/integration/pvepool-api.spec.ts:333:3 › Owned-dataset mutations refused › destroy sysfix/ROOT/pve-1 → 400 with the system reason
+[1A[2K[9/12] [integration] › tests/integration/pvepool-api.spec.ts:365:3 › Snapshot schedules › a schedule on the sibling is accepted (and deleted again); one on a guest volume is refused
+[1A[2K[10/12] [integration] › tests/integration/pvepool-api.spec.ts:407:3 › System-pool hard refusals (sysfix) › change mount, export and destroy are hard-refused with the boot filesystem named
+[1A[2K[11/12] [integration] › tests/integration/pvepool-api.spec.ts:503:3 › iSCSI add-LUN on a PVE pool › a zvol on the sibling is accepted; a PVE guest volume is refused with the guest sentence
+[1A[2K  1) [integration] › tests/integration/pvepool-api.spec.ts:503:3 › iSCSI add-LUN on a PVE pool › a zvol on the sibling is accepted; a PVE guest volume is refused with the guest sentence 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m"[7mcomplet[27med"[39m
+    Received: [31m"[7mfail[27med"[39m
+
+      523 |       expect(createRes.status()).toBe(202)
+      524 |       const createJob = await awaitJob(ctx, (await createRes.json()).job.id)
+    > 525 |       expect(createJob.status).toBe('completed')
+          |                                ^
+      526 |       const list = await ctx.get(`${V1}/iscsi/targets`)
+      527 |       const target = ((await list.json()).data.targets as Array<{ iqn: string }>)
+      528 |         .find(t => t.iqn.includes(TARGET_NAME))
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-a2c8412092d233f0e/tests/integration/pvepool-api.spec.ts:525:32
+
+
+[1A[2K(node:3216518) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+[1A[2K[12/12] [integration] › tests/integration/pvepool-api.spec.ts:586:3 › Backup consistency derivation › preview-nested: sibling source gets a snapshot; guest subvol is live with the reason
+[1A[2K  1 failed
+    [integration] › tests/integration/pvepool-api.spec.ts:503:3 › iSCSI add-LUN on a PVE pool › a zvol on the sibling is accepted; a PVE guest volume is refused with the guest sentence 
+  11 passed (14.2s)

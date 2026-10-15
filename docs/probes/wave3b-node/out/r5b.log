@@ -1,0 +1,23 @@
+'w3r5s/src' is not a snapshot
+no datasets available
+NAME  TAG  TIMESTAMP
+HTTP 409 0.093177
+X-Anas-Confirm-Code: 2f7885f14248
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Rolling back 'w3r5s/src' to snapshot 's0' discards newer data","warnings":["Rolling back discards all changes to 'w3r5s/src' since snapshot 's0'.","Force destroys the 2 snapshot(s) and bookmark(s) newer than 's0' — irreversible.","Destroyed by force: w3r5s/src@s1r, w3r5s/src@snapshot-2026-10-15T16-58-26-312Z."]}}
+HTTP 202 0.116306
+{"job":{"id":"6508b007-e45e-4537-9b63-be809db01a41","status":"running","operation":"zfs.rollback","createdAt":"2026-10-15T16:59:25.083Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+0s] failed |  |  | {"code": "JOB_FAILED", "message": "cannot destroy 'w3r5s/src@snapshot-2026-10-15T16-58-26-312Z': dataset is busy"}
+{"job":{"id":"6508b007-e45e-4537-9b63-be809db01a41","status":"failed","operation":"zfs.rollback","progress":null,"createdAt":"2026-10-15T16:59:25.083Z","createdBy":"root","startedAt":"2026-10-15T16:59:25.083Z","completedAt":"2026-10-15T16:59:25.171Z","result":null,"error":{"code":"JOB_FAILED","message":"cannot destroy 'w3r5s/src@snapshot-2026-10-15T16-58-26-312Z': dataset is busy"},"detail":null}}
+NAME
+w3r5s
+w3r5s/src
+w3r5s/src@s0
+w3r5s/src@snapshot-2026-10-15T16-58-26-312Z
+'w3r5s/src' is not a snapshot
+no datasets available
+NAME  TAG  TIMESTAMP
+NAME                                         TAG                     TIMESTAMP
+w3r5s/src@snapshot-2026-10-15T16-58-26-312Z  anas-repl-684abe8ac24d  Thu Oct 15 16:59 2026
+NAME                                         TAG                     TIMESTAMP
+w3r5d/rep@snapshot-2026-10-15T16-58-26-312Z  anas-repl-684abe8ac24d  Thu Oct 15 16:59 2026

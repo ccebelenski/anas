@@ -1,0 +1,73 @@
+--- ls /anas /adock
+ls: cannot access '/anas': No such file or directory
+ls: cannot access '/adock': No such file or directory
+--- pct list
+VMID       Status     Lock         Name                
+9900       stopped                 ingress-default     
+description: adock network=default id=f6b01496-c8d1-4055-bc70-55590827a632 ingress instance=c62f44aa-043e-4875-b02e-5a8b04b9f7fd%0A
+onboot: 0
+protection: 1
+tags: adock;adock-ingress;adock-net-default
+--- zpool
+gtbackup	ONLINE
+gtiscsi	ONLINE
+pvfix	ONLINE
+sysfix	ONLINE
+  pool: testpool
+--- lvm/md/loop/dm
+/dev/loop1: [2049]:548044 (/var/tmp/pvepool-fixture/sysfix.img)
+/dev/loop0: [2049]:548022 (/var/tmp/pvepool-fixture/pvfix.img)
+No devices found
+--- disks
+NAME  SERIAL
+sda   drive-scsi0-0-0-0
+sdb   ANAS_HOT2
+sdc   ANAS_HOT1
+sr0   QM00003
+zd0   
+zd16  
+zd32  
+--- remote mounts / nft / exports
+/testpool/share1
+		192.168.200.0/24(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+--- config hashes
+b3c85fb4d426 /etc/fstab
+f1e3ca20fe45 /etc/exports
+46779719d6d6 /etc/samba/smb.conf
+b86d1eddd7fc /etc/mdadm/mdadm.conf
+7f6d05dde411 /etc/udev/rules.d/99-anas-cache.rules
+0aad11027013 /usr/share/perl5/PVE/APIServer/AnyEvent.pm
+58b75a9a00d5 /usr/share/pve-manager/index.html.tpl
+--- misc
+ls: cannot access '/etc/exports.d': No such file or directory
+/mnt:
+anas-ahr
+anas-ahr-snapshots
+vzsnap0
+
+/srv:
+● anas-cloud-gtcancel.service      not-found failed failed anas-cloud-gtcancel.service
+● zfs-import@anasactimport.service loaded    failed failed Import ZFS pool anasactimport
+● zfs-import@anascomp.service      loaded    failed failed Import ZFS pool anascomp
+0
+0
+--- services
+active
+active
+active
+active
+active
+{"status":"ok","version":"0.4.3","abandonedCommands":[]}
+anas 401
+adock 401
+w3r
+ls: cannot access '/w3r*': No such file or directory
+ls: cannot access '/srv/w3r*': No such file or directory
+ls: cannot access '/mnt/w3r*': No such file or directory
+ls: cannot access '/tmp/w3r*': No such file or directory
+742139 bash -c ls /var/tmp | grep -i w3r; ls -d /w3r* /srv/w3r* /mnt/w3r* /tmp/w3r* 2>&1; nft list tables; pgrep -a -f "w3r3-" ; systemctl show -p MainPID,NRestarts anasd; ls /etc/lvm/archive 2>/dev/null | wc -l
+MainPID=710378
+NRestarts=0
+56
+removed /var/tmp/w3r (empty)
+0

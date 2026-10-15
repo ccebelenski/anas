@@ -1,0 +1,37 @@
+(node:3242491) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+[1A[2K(node:3242576) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+[1A[2K[1/3] [integration] › tests/integration/vdev-consumers-api.spec.ts:122:3 › vdevs.1 slice 2 — the vdev-class consumers, live › a faulted log leaf moves the disk row and raises the pool warning
+[1A[2K[2/3] [integration] › tests/integration/vdev-consumers-api.spec.ts:187:5 › vdevs.1 slice 2 — the vdev-class consumers, live › UI › the replace surface lists the special leaf as a replaceable member
+[1A[2K[3/3] [integration] › tests/integration/vdev-consumers-api.spec.ts:225:3 › vdevs.1 slice 2 — the vdev-class consumers, live › destroy with cleanup labelclears all six partitions and frees the disk
+[1A[2K  1) [integration] › tests/integration/vdev-consumers-api.spec.ts:225:3 › vdevs.1 slice 2 — the vdev-class consumers, live › destroy with cleanup labelclears all six partitions and frees the disk 
+
+    Error: /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part3 carries no ZFS label
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mnot[2m.[22mtoMatch[2m([22m[32mexpected[39m[2m)[22m
+
+    Expected pattern: not [32m/zfs_member/[39m
+    Received string:      [31m"DEVICE                                   OFFSET    TYPE       UUID LABEL[39m
+    [31mscsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part3 0x4000    [7mzfs_member[27m      [39m
+    [31mscsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part3 0x44000   zfs_member      [39m
+    [31mscsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part3 0xc784000 zfs_member      [39m
+    [31mscsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part3 0xc7c4000 zfs_member"[39m
+
+      254 |       for (const part of parts) {
+      255 |         const sigs = await sshExec(`if [ -e ${part} ]; then wipefs -n ${part} 2>&1 || true; else echo GONE; fi`)
+    > 256 |         expect(sigs, `${part} carries no ZFS label`).not.toMatch(/zfs_member/)
+          |                                                          ^
+      257 |       }
+      258 |       // …and neither does the whole disk.
+      259 |       const wholeDisk = await sshExec(`wipefs -n /dev/disk/by-id/${BY_ID} 2>&1 || true`)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-a2c8412092d233f0e/tests/integration/vdev-consumers-api.spec.ts:256:58
+
+
+[1A[2K  1 failed
+    [integration] › tests/integration/vdev-consumers-api.spec.ts:225:3 › vdevs.1 slice 2 — the vdev-class consumers, live › destroy with cleanup labelclears all six partitions and frees the disk 
+  2 passed (15.6s)

@@ -1,0 +1,13 @@
+
+### recursive owner apply (owner daemon) with the NFS server blocked: challenge, resend
+HTTP 409 0.213610
+X-Anas-Confirm-Code: 1c2a77872423
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Applying to existing files rewrites the permissions of every file and directory under '/w3r2/a'","warnings":["It crosses the child datasets mounted under '/w3r2/a': w3r2/a/b (/w3r2/a/b).","It does not enter the other filesystems mounted under '/w3r2/a' — not changed: /w3r2/a/nfs (nfs4).","The current permissions are not recorded anywhere, so this cannot be undone."]}}
+HTTP 202 0.246527
+{"job":{"id":"1c260c29-69ed-4c65-b2eb-5552f7f05187","status":"running","operation":"fs.setAccess","createdAt":"2026-10-15T16:54:14.661Z","createdBy":"root"}}
+  (challenge + resend took 538 ms)
+[t+0s] running |  |  | 
+[t+3s] failed |  |  | {"code": "JOB_FAILED", "message": "No permissions were changed: /w3r2/a/nfs (nfs4), mounted under '/w3r2/a', did not answer a 2 s liveness probe. The walk does not enter it, but it reads its mountpoint and would hang there with the lock held \u2014 unmount it or bring its server back, then apply again"}
+{"job":{"id":"1c260c29-69ed-4c65-b2eb-5552f7f05187","status":"failed","operation":"fs.setAccess","progress":null,"createdAt":"2026-10-15T16:54:14.661Z","createdBy":"root","startedAt":"2026-10-15T16:54:14.662Z","completedAt":"2026-10-15T16:54:16.758Z","result":null,"error":{"code":"JOB_FAILED","message":"No permissions were changed: /w3r2/a/nfs (nfs4), mounted under '/w3r2/a', did not answer a 2 s liveness probe. The walk does not enter it, but it reads its mountpoint and would hang there with the lock held — unmount it or bring its server back, then apply again"},"detail":null}}
+ 713009 Ss   do_wait                      00:00 bash -c ps -eo pid,stat,wchan:22,etime,cmd | grep -E '[f]ind -P|[c]hown' | head -5; echo '  (no find/chown left above = none hung)'
+  (no find/chown left above = none hung)

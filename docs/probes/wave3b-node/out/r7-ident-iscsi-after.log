@@ -1,0 +1,11 @@
+(node:3221152) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 2 tests using 1 worker
+
+[1A[2K(node:3221225) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+[1A[2K[1/2] [integration] › tests/integration/ident-iscsi.spec.ts:202:3 › ident.2 — the served device is the LUN's identity › rename-and-recreate a zvol under a live LUN: resize and delete-with-destroy refuse 409
+[1A[2K[2/2] [integration] › tests/integration/ident-iscsi.spec.ts:241:3 › ident.2 — the served device is the LUN's identity › delete + add within the confirm TTL: replaying the old code is a fresh challenge, never a delete
+[1A[2K  2 passed (17.7s)

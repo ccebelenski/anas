@@ -1,0 +1,18 @@
+(node:3234746) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 9 tests using 1 worker
+
+[1A[2K(node:3234832) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+[1A[2K[1/9] [integration] › tests/integration/pools-act-api.spec.ts:65:3 › Pool safety confirmation — challenge (no mutation) › export without a confirm code → 409 CONFIRMATION_REQUIRED + code header
+[1A[2K[2/9] [integration] › tests/integration/pools-act-api.spec.ts:81:3 › Pool safety confirmation — challenge (no mutation) › destroy without a confirm code → 409 CONFIRMATION_REQUIRED + code header
+[1A[2K[3/9] [integration] › tests/integration/pools-act-api.spec.ts:96:3 › Pool safety confirmation — challenge (no mutation) › destroy with a WRONG confirm code → 409 again (code not honoured)
+[1A[2K[4/9] [integration] › tests/integration/pools-act-api.spec.ts:111:3 › Pool safety confirmation — challenge (no mutation) › destroying the boot/root pool → 409 Level-1 refusal with NO code header
+[1A[2K[5/9] [integration] › tests/integration/pools-act-api.spec.ts:149:3 › Pool property modify (3.9) › PUT /pools/testpool changing a property → 202 { job }
+[1A[2K[6/9] [integration] › tests/integration/pools-act-api.spec.ts:196:3 › Pool create / destroy / export / import (spare disks) › creates a pool via the API, then destroys it through the confirmation flow (3.8, 3.14)
+[1A[2K[7/9] [integration] › tests/integration/pools-act-api.spec.ts:242:3 › Pool create / destroy / export / import (spare disks) › exports a pool through the confirmation flow (3.13)
+[1A[2K[8/9] [integration] › tests/integration/pools-act-api.spec.ts:271:3 › Pool create / destroy / export / import (spare disks) › imports a known (exported) pool (3.7)
+[1A[2K[9/9] [integration] › tests/integration/pools-act-api.spec.ts:293:3 › Pool create / destroy / export / import (spare disks) › adds a vdev to a pool (3.11)
+[1A[2K  9 passed (27.9s)

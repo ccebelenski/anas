@@ -1,0 +1,10 @@
+(node:3229241) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+[1A[2K(node:3229308) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+[1A[2K[1/1] [integration] › tests/integration/ident-mounts-repl.spec.ts:229:3 › ident.4 — act on what is actually there (live) › (e) a local filesystem at a failed CIFS line's target survives Remove — 409 naming what is there
+[1A[2K  1 passed (6.4s)

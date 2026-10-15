@@ -1,0 +1,40 @@
+(node:3247615) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 9 tests using 1 worker
+
+[1A[2K(node:3247687) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+[1A[2K[1/9] [integration] › tests/integration/cloud-tasks-api.spec.ts:307:3 › Cloud sync tasks (rclone.2) › create a copy task: both units carry the marker, the timer is enabled and nextRunAt is its next elapse
+[1A[2K[2/9] [integration] › tests/integration/cloud-tasks-api.spec.ts:354:3 › Cloud sync tasks (rclone.2) › Run Now: the files land byte-identical, rclone's counters come back, and the run read a transient snapshot that is gone afterwards
+[1A[2K[3/9] [integration] › tests/integration/cloud-tasks-api.spec.ts:413:3 › Cloud sync tasks (rclone.2) › sync mirrors a source deletion to the destination; copy never deletes
+[1A[2K[4/9] [integration] › tests/integration/cloud-tasks-api.spec.ts:461:3 › Cloud sync tasks (rclone.2) › a dry-run preview lists the would-be deletes on the live source — and refuses an unmounted mount
+[1A[2K[5/9] [integration] › tests/integration/cloud-tasks-api.spec.ts:520:3 › Cloud sync tasks (rclone.2) › an empty source is refused in sync mode with the sentence, and is a harmless no-op in copy mode
+[1A[2K[6/9] [integration] › tests/integration/cloud-tasks-api.spec.ts:561:3 › Cloud sync tasks (rclone.2) › a source on a configured-but-unmounted mount is refused, naming the mount
+[1A[2K[7/9] [integration] › tests/integration/cloud-tasks-api.spec.ts:592:3 › Cloud sync tasks (rclone.2) › a wrong-password remote fails the run with rclone's error line, notifies, and shows as a cloud warning — a quiet success does not notify
+[1A[2K  1) [integration] › tests/integration/cloud-tasks-api.spec.ts:592:3 › Cloud sync tasks (rclone.2) › a wrong-password remote fails the run with rclone's error line, notifies, and shows as a cloud warning — a quiet success does not notify 
+
+    Error: the failure is reported, not swallowed
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoBeGreaterThan[2m([22m[32mexpected[39m[2m)[22m
+
+    Expected: > [32m0[39m
+    Received:   [31m0[39m
+
+      638 |       expect(failedPreview.status(), await failedPreview.text()).toBe(200)
+      639 |       const bad = (await failedPreview.json()).data
+    > 640 |       expect(bad.errors.length, 'the failure is reported, not swallowed').toBeGreaterThan(0)
+          |                                                                           ^
+      641 |       expect(bad.errors[0]).toMatch(/NewFs|couldn't connect SSH/)
+      642 |       expect(bad.truncated, 'rclone\'s own retries finish inside the 120 s ceiling').toBe(false)
+      643 |       expect(bad.transfers).toBe(0)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-a2c8412092d233f0e/tests/integration/cloud-tasks-api.spec.ts:640:75
+
+
+[1A[2K[8/9] [integration] › tests/integration/cloud-tasks-api.spec.ts:680:3 › Cloud sync tasks (rclone.2) › a real timer fire produces the same history as a Run Now
+[1A[2K[9/9] [integration] › tests/integration/cloud-tasks-api.spec.ts:734:3 › Cloud sync tasks (rclone.2) › disable leaves the history note; delete removes the units and touches nothing at the destination; a referenced remote refuses to go
+[1A[2K  1 failed
+    [integration] › tests/integration/cloud-tasks-api.spec.ts:592:3 › Cloud sync tasks (rclone.2) › a wrong-password remote fails the run with rclone's error line, notifies, and shows as a cloud warning — a quiet success does not notify 
+  2 did not run
+  6 passed (3.2m)

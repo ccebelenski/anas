@@ -1,0 +1,117 @@
+=== rclone.2 tasks fixture — up ===
+=== rclone.1 fixture — up ===
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ rclone present
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ rclonegt created
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /home/rclonegt/dst/hello.txt in place
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ password auth already effective for rclonegt (no drop-in)
+✓ rclonegt answers sftp on 127.0.0.1 (rclone lsjson dst)
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /etc/anas/rclone.conf backed up to /etc/anas/rclone.conf.pre-fixture
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /etc/anas/rclone.conf cleared — the run starts with no store
+
+=== Fixture ready ===
+--- rclone ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+/usr/bin/rclone
+rclone v1.60.1-DEV
+
+--- user rclonegt ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+rclonegt:x:1001:1001::/home/rclonegt:/bin/bash
+
+--- target file ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+total 12
+drwxr-xr-x 2 root     root     4096 Oct 15 17:08 .
+drwx------ 3 rclonegt rclonegt 4096 Oct 15 17:08 ..
+-rw-r--r-- 1 root     root       32 Oct 15 17:08 hello.txt
+hello from the rclone.1 fixture
+
+--- effective password auth for rclonegt ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+yes
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+no sshd drop-in
+
+--- store ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+-rw------- 1 root root 0 Oct 15 14:43 /etc/anas/rclone.conf.pre-fixture
+no store (yet)
+
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ gtbackup/cloudsrc built (a.bin 200K, b.bin 150K, sub/c.txt) with the empty child gtbackup/cloudsrc/raw
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ gtbackup/cloudempty created (empty on purpose)
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /home/rclonegt/dst clean (hello.txt kept)
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /home/rclonegt/pictures swept
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ fstab entries written for /mnt/gt-unmounted (cifs, TEST-NET) and /mnt/gt-guardok (tmpfs) — boot mounts, nofail
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+
+=== Fixture ready ===
+--- source dataset ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+gtbackup/cloudsrc	/gtbackup/cloudsrc
+gtbackup/cloudsrc/raw	/gtbackup/cloudsrc/raw
+/gtbackup/cloudsrc/a.bin 204800
+/gtbackup/cloudsrc/b.bin 153600
+/gtbackup/cloudsrc/sub/c.txt 34
+--- sha256 ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+4c5a982329af9c1090c95bcd60fde2fd050dab78844bf18654a6be0088d0d3ff  a.bin
+e0dca25accf29c089c43fc7091e8dcd1ce1e7fcd072e2b5dc8842f5393552c80  b.bin
+7c913aff023f37ba01ce7d1144192111449feefd2ce9b13fefde0e9dd3aa1ddb  sub/c.txt
+--- transient snapshots (should be none between runs) ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+
+--- empty dataset ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+gtbackup/cloudempty	/gtbackup/cloudempty
+0
+
+--- sftp destination tree ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+/home/rclonegt/dst
+/home/rclonegt/dst/hello.txt
+
+--- sftp destination tree (rclone.3 UI spec) ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+
+--- unmounted-mount fixture ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+//192.0.2.9/nope /mnt/gt-unmounted cifs _netdev,nofail,x-systemd.mount-timeout=5s,guest,x-anas-fixture 0 0
+tmpfs /mnt/gt-guardok tmpfs nofail,x-anas-fixture 0 0
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+drwxr-xr-x 2 root root 4096 Oct 15 17:08 /mnt/gt-unmounted
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+not mounted (as intended)
+
+--- mountable-mount fixture (backup2.11) ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+drwxr-xr-x 2 root root 4096 Oct 15 17:08 /mnt/gt-guardok
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+not mounted (the spec mounts it)
+
+--- anas-cloud units ---
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+none

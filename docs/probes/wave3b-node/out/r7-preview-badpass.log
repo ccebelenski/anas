@@ -1,0 +1,19 @@
+
+### rclone by hand, timeout 12, stamped stderr
+rclone v1.60.1-DEV
+bash: line 1: bc: command not found
+  + 0.00s 2026/10/15 17:13:03 Failed to create file system for "w3rbad:dst/fail": NewFs: couldn't connect SSH: ssh: handshake failed: EOF
+  exit 1
+
+### through the API: remote w3rbad, POST /cloud/tasks/preview
+HTTP 202 0.174336
+{"job":{"id":"9e98a707-459b-480b-b82d-348f62766fa7","status":"running","operation":"cloud.remote.create","createdAt":"2026-10-15T17:13:03.277Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+0s] completed |  | {"name": "w3rbad", "type": "sftp", "options": {"host": "127.0.0.1", "user": "rclonegt"}, "secretsSet": ["pass"]} | 
+HTTP 200 11.302525
+{"data":{"transfers":0,"bytes":0,"checks":0,"deletes":0,"deletedFiles":[],"deletedTotal":0,"errors":["rclone copy failed (exit 1): Failed to create file system for \"w3rbad:dst/fail\": NewFs: couldn't connect SSH: ssh: handshake failed: read tcp 127.0.0.1:44886->127.0.0.1:22: read: connection reset by peer"],"truncated":false}}
+  (preview answered in 11341 ms)
+HTTP 202 0.090826
+{"job":{"id":"7fc6f09f-5121-4fb0-ac86-5a0f8c253707","status":"running","operation":"cloud.remote.remove","createdAt":"2026-10-15T17:13:15.476Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"removed": "w3rbad"} | 

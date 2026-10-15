@@ -1,0 +1,15 @@
+
+### ownership snapshot: end
+  server side /srv/w3r-nfs:
+        501 root:root 644
+         12 root:root 755
+    files: 513  sha256 of the listing: abe5c6f9e2d8ff1e
+  dataset side:
+    /w3r2/a                daemon:root 755
+    /w3r2/a/f1             daemon:root 644
+    /w3r2/a/sub            daemon:root 755
+    /w3r2/a/sub/f2         daemon:root 644
+    /w3r2/a/b              daemon:root 755
+    /w3r2/a/b/f3           daemon:root 644
+    /w3r2/a/nfs            root:root 755
+    /w3r2/a/nfs/top        root:root 644

@@ -1,0 +1,26 @@
+
+### replace with existingDiskId = the stripped id (six leaves share it) -> ambiguity refusal
+HTTP 400 0.190697
+{"error":{"code":"VALIDATION_ERROR","message":"'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9' names more than one device in pool gtvdev (data scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part1, log scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part4, cache scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part3, special scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part5, dedup scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part6) — name the one you mean by its device"}}
+
+### attach (mirror) the blank -part2 onto the data leaf -part1
+HTTP 202 0.186660
+{"job":{"id":"59d707b0-5112-4bc0-b207-59230865e914","status":"running","operation":"zpool.attach","createdAt":"2026-10-15T16:52:46.546Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] failed |  |  | {"code": "JOB_FAILED", "message": "cannot attach /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part2 to /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part1: device is too small"}
+{"job":{"id":"59d707b0-5112-4bc0-b207-59230865e914","status":"failed","operation":"zpool.attach","progress":null,"createdAt":"2026-10-15T16:52:46.546Z","createdBy":"root","startedAt":"2026-10-15T16:52:46.547Z","completedAt":"2026-10-15T16:52:46.672Z","result":null,"error":{"code":"JOB_FAILED","message":"cannot attach /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part2 to /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part1: device is too small"},"detail":null}}
+config:
+
+	NAME                                        STATE     READ WRITE CKSUM
+	gtvdev                                      ONLINE       0     0     0
+	  scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part1  ONLINE       0     0     0
+	dedup	
+	  scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part6  ONLINE       0     0     0
+	special	
+	  scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part5  ONLINE       0     0     0
+	logs	
+	  scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part4  ONLINE       0     0     0
+	cache
+	  scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part3  ONLINE       0     0     0
+
+errors: No known data errors

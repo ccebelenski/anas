@@ -1,0 +1,18 @@
+
+### challenge while live (owner nobody), block, then resend the code
+HTTP 409 0.260096
+X-Anas-Confirm-Code: adeb2657be65
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Applying to existing files rewrites the permissions of every file and directory under '/w3r2/a'","warnings":["It crosses the child datasets mounted under '/w3r2/a': w3r2/a/b (/w3r2/a/b).","It does not enter the other filesystems mounted under '/w3r2/a' — not changed: /w3r2/a/nfs (nfs4).","The current permissions are not recorded anywhere, so this cannot be undone."]}}
+table inet w3r2 {
+	chain out {
+		type filter hook output priority filter; policy accept;
+		tcp dport 2049 drop
+	}
+}
+16:54:55
+  timeout 3 stat -f /w3r2/a/nfs -> exit 124
+HTTP 202 0.234130
+{"job":{"id":"6885baaf-41f3-4baf-9370-be87e495e60e","status":"running","operation":"fs.setAccess","createdAt":"2026-10-15T16:54:59.387Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+2s] failed |  |  | {"code": "JOB_FAILED", "message": "No permissions were changed: /w3r2/a/nfs (nfs4), mounted under '/w3r2/a', did not answer a 2 s liveness probe. The walk does not enter it, but it reads its mountpoint and would hang there with the lock held \u2014 unmount it or bring its server back, then apply again"}
+{"job":{"id":"6885baaf-41f3-4baf-9370-be87e495e60e","status":"failed","operation":"fs.setAccess","progress":null,"createdAt":"2026-10-15T16:54:59.387Z","createdBy":"root","startedAt":"2026-10-15T16:54:59.388Z","completedAt":"2026-10-15T16:55:01.523Z","result":null,"error":{"code":"JOB_FAILED","message":"No permissions were changed: /w3r2/a/nfs (nfs4), mounted under '/w3r2/a', did not answer a 2 s liveness probe. The walk does not enter it, but it reads its mountpoint and would hang there with the lock held — unmount it or bring its server back, then apply again"},"detail":null}}

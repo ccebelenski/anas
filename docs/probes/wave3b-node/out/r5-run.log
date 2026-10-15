@@ -1,0 +1,67 @@
+
+### suspend the destination's device; Run now
+State:             SUSPENDED
+16:58:25.783
+HTTP 202 0.026548
+{"started":true}
+
+### the running jobs
+  8bd78685-5c39-4114-99f8-96262d775232 zfs.replicate running zfs send w3r5s/src@snapshot-2026-10-15T16-58-26-312Z | zfs recv w3r5d/rep
+  replication job: 8bd78685-5c39-4114-99f8-96262d775232
+ 715242 Dsl  anon_pipe_write              00:03 /usr/sbin/zfs send -- w3r5s/src@snapshot-2026-10-15T16-58-26-312Z
+ 715243 Ds   cv_wait_common               00:03 /usr/sbin/zfs recv -o readonly=on -- w3r5d/rep
+NAME
+w3r5s/src@s0
+w3r5s/src@s1
+w3r5s/src@snapshot-2026-10-15T16-58-26-312Z
+
+### queue 1: rename snapshot s1 -> s1r of the source (challenge, resend)
+HTTP 202 0.090150
+{"job":{"id":"cfc4abe9-5dc9-49ae-85f3-17a29bba713b","status":"queued","operation":"zfs.rename","createdAt":"2026-10-15T16:58:30.322Z","createdBy":"root"}}
+
+### queue 2: rollback of the source to s0 with force (challenge, resend)
+HTTP 409 0.222433
+X-Anas-Confirm-Code: c185b1b2aaaa
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Rolling back 'w3r5s/src' to snapshot 's0' discards newer data","warnings":["Rolling back discards all changes to 'w3r5s/src' since snapshot 's0'.","Force destroys the 2 snapshot(s) and bookmark(s) newer than 's0' — irreversible.","Destroyed by force: w3r5s/src@s1, w3r5s/src@snapshot-2026-10-15T16-58-26-312Z."]}}
+HTTP 202 0.163445
+{"job":{"id":"e03a8233-4c57-404f-b327-ec82d33ce87b","status":"queued","operation":"zfs.rollback","createdAt":"2026-10-15T16:58:30.783Z","createdBy":"root"}}
+
+### while the run lasts (every 10 s)
+--- t+15s
+  zfs.replicate running | zfs send w3r5s/src@snapshot-2026-10-15T16-58-26-312Z | zfs recv w3r5d/rep |   | 
+  zfs.rename queued | waiting for zfs.replicate (job 8bd78685-5c39-4114-99f8-96262d775232) on Dataset 'w3r5s/src' |   | 
+  zfs.rollback queued | waiting for zfs.replicate (job 8bd78685-5c39-4114-99f8-96262d775232) on Dataset 'w3r5s/src' |   | 
+--- t+25s
+  zfs.replicate running | zfs send w3r5s/src@snapshot-2026-10-15T16-58-26-312Z | zfs recv w3r5d/rep |   | 
+  zfs.rename queued | waiting for zfs.replicate (job 8bd78685-5c39-4114-99f8-96262d775232) on Dataset 'w3r5s/src' |   | 
+  zfs.rollback queued | waiting for zfs.replicate (job 8bd78685-5c39-4114-99f8-96262d775232) on Dataset 'w3r5s/src' |   | 
+--- t+36s
+  zfs.replicate running | zfs send w3r5s/src@snapshot-2026-10-15T16-58-26-312Z | zfs recv w3r5d/rep |   | 
+  zfs.rename queued | waiting for zfs.replicate (job 8bd78685-5c39-4114-99f8-96262d775232) on Dataset 'w3r5s/src' |   | 
+  zfs.rollback queued | waiting for zfs.replicate (job 8bd78685-5c39-4114-99f8-96262d775232) on Dataset 'w3r5s/src' |   | 
+--- t+46s
+  zfs.replicate running | zfs send w3r5s/src@snapshot-2026-10-15T16-58-26-312Z | zfs recv w3r5d/rep |   | 
+  zfs.rename queued | waiting for zfs.replicate (job 8bd78685-5c39-4114-99f8-96262d775232) on Dataset 'w3r5s/src' |   | 
+  zfs.rollback queued | waiting for zfs.replicate (job 8bd78685-5c39-4114-99f8-96262d775232) on Dataset 'w3r5s/src' |   | 
+
+### resume the destination at t+46s
+State:             ACTIVE
+16:59:11
+[t+0s] running | zfs send w3r5s/src@snapshot-2026-10-15T16-58-26-312Z | zfs recv w3r5d/rep |  | 
+[t+2s] completed | zfs send w3r5s/src@snapshot-2026-10-15T16-58-26-312Z | zfs recv w3r5d/rep | {"mode": "full", "snapshot": "snapshot-2026-10-15T16-58-26-312Z", "bytesEstimated": 210090096, "target": "w3r5d/rep", "holdTag": "anas-repl-684abe8ac24d"} | 
+[t+0s] completed |  | {"renamed": "w3r5s/src@s1", "to": "w3r5s/src@s1r"} | 
+[t+0s] failed |  |  | {"code": "STATE_CHANGED", "message": "Snapshot 'w3r5s/src@s0' changed since you confirmed (was: w3r5s/src@s1, w3r5s/src@snapshot-2026-10-15T16-58-26-312Z; now: w3r5s/src@s1r, w3r5s/src@snapshot-2026-10-15T16-58-26-312Z) \u2014 nothing was done; confirm again"}
+
+### final
+  zfs.replicate completed | zfs send w3r5s/src@snapshot-2026-10-15T16-58-26-312Z | zfs recv w3r5d/rep |   | {"mode": "full", "snapshot": "snapshot-2026-10-15T16-58-26-312Z", "bytesEstimated": 210090096, "target": "w3r5d/rep", "holdTag": "anas-repl-684abe8ac24d"}
+  zfs.rename completed |  |   | {"renamed": "w3r5s/src@s1", "to": "w3r5s/src@s1r"}
+  zfs.rollback failed |  | STATE_CHANGED Snapshot 'w3r5s/src@s0' changed since you confirmed (was: w3r5s/src@s1, w3r5s/src@snapshot-2026-10-15T16-58-26-312Z; now: w3r5s/src@s1r, w3r5s/src@snapshot-2026-10-15T16-58-26-312Z) — nothing was done; confirm again | 
+NAME                                         CREATION
+w3r5d                                        Thu Oct 15 16:58 2026
+w3r5d/rep                                    Thu Oct 15 16:58 2026
+w3r5d/rep@snapshot-2026-10-15T16-58-26-312Z  Thu Oct 15 16:58 2026
+w3r5s                                        Thu Oct 15 16:58 2026
+w3r5s/src                                    Thu Oct 15 16:58 2026
+w3r5s/src@s0                                 Thu Oct 15 16:58 2026
+w3r5s/src@s1r                                Thu Oct 15 16:58 2026
+w3r5s/src@snapshot-2026-10-15T16-58-26-312Z  Thu Oct 15 16:58 2026

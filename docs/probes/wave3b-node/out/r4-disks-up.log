@@ -1,0 +1,28 @@
+Creating hot20 disk image (512M)...
+Formatting '/zfspool/vmimages/anas-pve-hot20.qcow2', fmt=qcow2 cluster_size=65536 extended_l2=off compression_type=zlib size=536870912 lazy_refcounts=off refcount_bits=16
+Attaching hot20 to anas-pve as sdv (SCSI)...
+Disk attached successfully
+
+✓ hot20 attached as sdv (serial: ANAS_HOT20)
+  Inside VM: /dev/sdv  (by-id: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20)
+Creating hot21 disk image (512M)...
+Formatting '/zfspool/vmimages/anas-pve-hot21.qcow2', fmt=qcow2 cluster_size=65536 extended_l2=off compression_type=zlib size=536870912 lazy_refcounts=off refcount_bits=16
+Attaching hot21 to anas-pve as sdw (SCSI)...
+Disk attached successfully
+
+✓ hot21 attached as sdw (serial: ANAS_HOT21)
+  Inside VM: /dev/sdw  (by-id: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21)
+Creating hot22 disk image (512M)...
+Formatting '/zfspool/vmimages/anas-pve-hot22.qcow2', fmt=qcow2 cluster_size=65536 extended_l2=off compression_type=zlib size=536870912 lazy_refcounts=off refcount_bits=16
+Attaching hot22 to anas-pve as sdx (SCSI)...
+Disk attached successfully
+
+✓ hot22 attached as sdx (serial: ANAS_HOT22)
+  Inside VM: /dev/sdx  (by-id: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT22)
+Creating hot23 disk image (512M)...
+Formatting '/zfspool/vmimages/anas-pve-hot23.qcow2', fmt=qcow2 cluster_size=65536 extended_l2=off compression_type=zlib size=536870912 lazy_refcounts=off refcount_bits=16
+Attaching hot23 to anas-pve as sdy (SCSI)...
+Disk attached successfully
+
+✓ hot23 attached as sdy (serial: ANAS_HOT23)
+  Inside VM: /dev/sdy  (by-id: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT23)

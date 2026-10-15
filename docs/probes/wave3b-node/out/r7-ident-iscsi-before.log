@@ -1,0 +1,28 @@
+(node:3218988) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+[1A[2K(node:3219054) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+[1A[2K[1/1] [integration] › tests/integration/ident-iscsi.spec.ts:241:3 › ident.2 — the served device is the LUN's identity › delete + add within the confirm TTL: replaying the old code is a fresh challenge, never a delete
+[1A[2K  1) [integration] › tests/integration/ident-iscsi.spec.ts:241:3 › ident.2 — the served device is the LUN's identity › delete + add within the confirm TTL: replaying the old code is a fresh challenge, never a delete 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m"CONFIRMATION_REQUIRED"[39m
+    Received: [31m"IDENTITY_MISMATCH"[39m
+
+      265 |       const replay = await ctx.delete(url, { headers: { 'x-anas-confirm': staleCode } })
+      266 |       expect(replay.status()).toBe(409)
+    > 267 |       expect((await replay.json()).error.code).toBe('CONFIRMATION_REQUIRED')
+          |                                                ^
+      268 |       expect(replay.headers()['x-anas-confirm-code']).not.toBe(staleCode)
+      269 |
+      270 |       // The new LUN is untouched.
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-a2c8412092d233f0e/tests/integration/ident-iscsi.spec.ts:267:48
+
+
+[1A[2K  1 failed
+    [integration] › tests/integration/ident-iscsi.spec.ts:241:3 › ident.2 — the served device is the LUN's identity › delete + add within the confirm TTL: replaying the old code is a fresh challenge, never a delete 

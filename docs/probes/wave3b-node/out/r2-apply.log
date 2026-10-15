@@ -1,0 +1,10 @@
+
+### recursive owner apply on w3r2/a (NFS live): challenge, resend
+HTTP 409 0.244709
+X-Anas-Confirm-Code: f930486ad159
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Applying to existing files rewrites the permissions of every file and directory under '/w3r2/a'","warnings":["It crosses the child datasets mounted under '/w3r2/a': w3r2/a/b (/w3r2/a/b).","It does not enter the other filesystems mounted under '/w3r2/a' — not changed: /w3r2/a/nfs (nfs4).","The current permissions are not recorded anywhere, so this cannot be undone."]}}
+HTTP 202 0.226772
+{"job":{"id":"bc9ffb5a-7fff-43f5-82e6-d006b2add3df","status":"running","operation":"fs.setAccess","createdAt":"2026-10-15T16:54:01.062Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+0s] completed | find -P /w3r2/a/b -xdev ( -path /w3r2/a/b/.zfs ) -prune -o -exec /usr/bin/chown -h nobody {} + | {"dataset": "w3r2/a", "mountpoint": "/w3r2/a", "aclEnabled": false, "aclAutoEnabled": false, "namedCount": 0, "clearedNamed": false, "notChanged": ["/w3r2/a/nfs (nfs4)"]} | 
+{"job":{"id":"bc9ffb5a-7fff-43f5-82e6-d006b2add3df","status":"completed","operation":"fs.setAccess","progress":"find -P /w3r2/a/b -xdev ( -path /w3r2/a/b/.zfs ) -prune -o -exec /usr/bin/chown -h nobody {} +","createdAt":"2026-10-15T16:54:01.062Z","createdBy":"root","startedAt":"2026-10-15T16:54:01.062Z","completedAt":"2026-10-15T16:54:01.273Z","result":{"dataset":"w3r2/a","mountpoint":"/w3r2/a","aclEnabled":false,"aclAutoEnabled":false,"namedCount":0,"clearedNamed":false,"notChanged":["/w3r2/a/nfs (nfs4)"]},"error":null,"detail":null}}

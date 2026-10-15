@@ -1,0 +1,15 @@
+w3r2	ONLINE
+HTTP 202 0.123498
+{"job":{"id":"1080f57a-e17f-412c-aaeb-345e4d1e0622","status":"running","operation":"zfs.create","createdAt":"2026-10-15T16:53:55.127Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+0s] completed |  | {"created": "w3r2/a"} | 
+HTTP 202 0.057038
+{"job":{"id":"d30680d6-d974-494c-bd39-ee3098323964","status":"running","operation":"zfs.create","createdAt":"2026-10-15T16:53:55.903Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"created": "w3r2/a/b"} | 
+/srv/w3r-nfs  	127.0.0.1(sync,wdelay,hide,no_subtree_check,sec=sys,rw,insecure,no_root_squash,no_all_squash)
+TARGET          SOURCE                 FSTYPE
+/w3r2           w3r2                   zfs
+└─/w3r2/a       w3r2/a                 zfs
+  ├─/w3r2/a/b   w3r2/a/b               zfs
+  └─/w3r2/a/nfs 127.0.0.1:/srv/w3r-nfs nfs4

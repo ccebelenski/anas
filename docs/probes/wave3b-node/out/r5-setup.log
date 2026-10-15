@@ -1,0 +1,27 @@
+w3r5d	ONLINE
+w3r5s	ONLINE
+/dev/loop2: [2049]:696999 (/var/tmp/w3r/w3r5d.img)
+HTTP 202 0.098771
+{"job":{"id":"fb46de7e-32f1-45b1-a523-88ac33633173","status":"running","operation":"zfs.create","createdAt":"2026-10-15T16:58:18.098Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+0s] completed |  | {"created": "w3r5s/src"} | 
+total 204933
+-rw-r--r-- 1 root root 209715200 Oct 15 16:58 blob
+HTTP 202 0.082221
+{"job":{"id":"f7f0feac-9232-4ec7-864a-bc1b0474a734","status":"running","operation":"zfs.snapshot","createdAt":"2026-10-15T16:58:20.605Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"created": "w3r5s/src@s0"} | 
+HTTP 202 0.081781
+{"job":{"id":"bc5052c6-ffa1-467a-bed8-fb86454417b0","status":"running","operation":"zfs.snapshot","createdAt":"2026-10-15T16:58:21.369Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"created": "w3r5s/src@s1"} | 
+HTTP 202 0.055922
+{"job":{"id":"21926f77-3cee-4e37-912a-cd3bd4feaecc","status":"running","operation":"replication.task.create","createdAt":"2026-10-15T16:58:22.098Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+0s] completed |  | {"created": "w3r5rep"} | 
+NAME
+w3r5d
+w3r5s
+w3r5s/src
+w3r5s/src@s0
+w3r5s/src@s1

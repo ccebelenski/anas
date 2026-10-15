@@ -1,0 +1,28 @@
+
+### Destroy with cleanup: challenge, resend
+HTTP 409 0.273527
+X-Anas-Confirm-Code: f2ac61f6dc92
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Destroying pool 'w3r4' permanently erases all its data","warnings":["Destroying 'w3r4' is irreversible — all data in the pool is permanently lost.","Every dataset, snapshot, and volume in 'w3r4' will be destroyed.","The pool's disks will be wiped clean (existing ZFS labels removed).","Disks to wipe: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20-part1, scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21-part1.","scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT22-part1 is not wiped: a cache (L2ARC) device's ZFS label names no pool.","scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT23-part1 is not wiped: a hot spare's ZFS label names no pool (a spare can serve other pools)."]}}
+HTTP 202 0.284316
+{"job":{"id":"3b5717be-0785-4ebb-af3d-11fe08fb1780","status":"running","operation":"zpool.destroy","createdAt":"2026-10-15T17:00:44.533Z","createdBy":"root"}}
+[t+0s] running |  |  | 
+[t+1s] running | Clearing ZFS labels on scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21-part1 |  | 
+[t+1s] running | Zapping GPT on scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20 |  | 
+[t+2s] running | Zapping GPT on scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21 |  | 
+[t+3s] completed | Zapping GPT on scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21 | {"destroyed": "w3r4", "warnings": ["scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT22-part1: not cleaned: a cache (L2ARC) device's ZFS label names no pool", "scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT23-part1: not cleaned: a hot spare's ZFS label names no pool (a spare can serve other pools)"], "skipped": [{"leaf": "scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT22-part1", "reason": "not cleaned: a cache (L2ARC) device's ZFS label names no pool"}, {"leaf": "scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT23-part1", "reason": "not cleaned: a hot spare's ZFS label names no pool (a spare can serve other pools)"}], "wiped": ["scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20-part1", "scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21-part1"], "zapped": ["scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20", "scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21"]} | 
+{"job":{"id":"3b5717be-0785-4ebb-af3d-11fe08fb1780","status":"completed","operation":"zpool.destroy","progress":"Zapping GPT on scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21","createdAt":"2026-10-15T17:00:44.533Z","createdBy":"root","startedAt":"2026-10-15T17:00:44.533Z","completedAt":"2026-10-15T17:00:47.324Z","result":{"destroyed":"w3r4","warnings":["scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT22-part1: not cleaned: a cache (L2ARC) device's ZFS label names no pool","scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT23-part1: not cleaned: a hot spare's ZFS label names no pool (a spare can serve other pools)"],"skipped":[{"leaf":"scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT22-part1","reason":"not cleaned: a cache (L2ARC) device's ZFS label names no pool"},{"leaf":"scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT23-part1","reason":"not cleaned: a hot spare's ZFS label names no pool (a spare can serve other pools)"}],"wiped":["scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20-part1","scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21-part1"],"zapped":["scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20","scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21"]},"error":null,"detail":null}}
+cannot open 'w3r4': no such pool
+
+### signatures after the destroy
+  hot20: sdd 
+    wipefs -n /dev/sdd   
+  hot21: sde 
+    wipefs -n /dev/sde   
+  hot22: sdf sdf1 sdf9 
+    wipefs -n /dev/sdf    1 PMBR ; 2 gpt ;
+    wipefs -n /dev/sdf1   4 zfs_member ;
+    wipefs -n /dev/sdf9  
+  hot23: sdg sdg1 sdg9 
+    wipefs -n /dev/sdg    1 PMBR ; 2 gpt ;
+    wipefs -n /dev/sdg1   4 zfs_member ;
+    wipefs -n /dev/sdg9  

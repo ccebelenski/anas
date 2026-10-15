@@ -1,0 +1,37 @@
+--- run 1: 200 in 168 ms
+  keys: ['ahrPools', 'disks', 'jobs', 'node', 'pools', 'shares', 'unavailable', 'warnings']
+  unavailable: []
+  pools: [('gtbackup', 'ONLINE'), ('gtiscsi', 'ONLINE'), ('pvfix', 'ONLINE'), ('sysfix', 'ONLINE')]
+  pool brief keys: ['allocated', 'capacity', 'free', 'name', 'scanRunning', 'size', 'state']
+  disks: {"total": 3, "healthy": 0, "warning": 0, "critical": 0, "unknown": 3}
+  shares: {"smbCount": 3, "nfsCount": 1, "smbActive": true, "nfsActive": true}
+  jobs: 20  ahrPools: 0
+  warnings: 2 ['share']
+    - None share SMB share 'share1' points to a missing path /testpool/share1
+    - None share NFS export path /testpool/share1 no longer exists
+--- run 2: 200 in 170 ms
+  keys: ['ahrPools', 'disks', 'jobs', 'node', 'pools', 'shares', 'unavailable', 'warnings']
+  unavailable: []
+  pools: [('gtbackup', 'ONLINE'), ('gtiscsi', 'ONLINE'), ('pvfix', 'ONLINE'), ('sysfix', 'ONLINE')]
+  pool brief keys: ['allocated', 'capacity', 'free', 'name', 'scanRunning', 'size', 'state']
+  disks: {"total": 3, "healthy": 0, "warning": 0, "critical": 0, "unknown": 3}
+  shares: {"smbCount": 3, "nfsCount": 1, "smbActive": true, "nfsActive": true}
+  jobs: 20  ahrPools: 0
+  warnings: 2 ['share']
+    - None share SMB share 'share1' points to a missing path /testpool/share1
+    - None share NFS export path /testpool/share1 no longer exists
+--- run 3: 200 in 176 ms
+  keys: ['ahrPools', 'disks', 'jobs', 'node', 'pools', 'shares', 'unavailable', 'warnings']
+  unavailable: []
+  pools: [('gtbackup', 'ONLINE'), ('gtiscsi', 'ONLINE'), ('pvfix', 'ONLINE'), ('sysfix', 'ONLINE')]
+  pool brief keys: ['allocated', 'capacity', 'free', 'name', 'scanRunning', 'size', 'state']
+  disks: {"total": 3, "healthy": 0, "warning": 0, "critical": 0, "unknown": 3}
+  shares: {"smbCount": 3, "nfsCount": 1, "smbActive": true, "nfsActive": true}
+  jobs: 20  ahrPools: 0
+  warnings: 2 ['share']
+    - None share SMB share 'share1' points to a missing path /testpool/share1
+    - None share NFS export path /testpool/share1 no longer exists
+
+### the daemon's socket, directly
+200 0.072152
+  unavailable: []

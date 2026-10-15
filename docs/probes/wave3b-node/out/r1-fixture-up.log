@@ -1,0 +1,44 @@
+=== vdevs.2 fixture — up-byid (by-id partition leaves) ===
+Attaching hot9 to anas-pve as sdk (SCSI)...
+Disk attached successfully
+
+✓ hot9 attached as sdk (serial: ANAS_HOT9)
+  Inside VM: /dev/sdk  (by-id: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9)
+✓ /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9 present
+Creating new GPT entries in memory.
+GPT data structures destroyed! You may now partition the disk using fdisk or
+other utilities.
+Creating new GPT entries in memory.
+The operation has completed successfully.
+✓ gtvdev created (six classes as by-id partitions of scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9)
+
+=== Fixture ready ===
+--- zpool status gtvdev ---
+  pool: gtvdev
+ state: ONLINE
+config:
+
+	NAME                                        STATE     READ WRITE CKSUM
+	gtvdev                                      ONLINE       0     0     0
+	  scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part1  ONLINE       0     0     0
+	dedup	
+	  scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part6  ONLINE       0     0     0
+	special	
+	  scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part5  ONLINE       0     0     0
+	logs	
+	  scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part2  ONLINE       0     0     0
+	cache
+	  scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part3  ONLINE       0     0     0
+	spares
+	  scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part4  AVAIL   
+
+errors: No known data errors
+
+--- by-id links ---
+lrwxrwxrwx 1 root root  9 Oct 15 16:51 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9 -> ../../sdd
+lrwxrwxrwx 1 root root 10 Oct 15 16:51 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part1 -> ../../sdd1
+lrwxrwxrwx 1 root root 10 Oct 15 16:51 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part2 -> ../../sdd2
+lrwxrwxrwx 1 root root 10 Oct 15 16:51 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part3 -> ../../sdd3
+lrwxrwxrwx 1 root root 10 Oct 15 16:51 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part4 -> ../../sdd4
+lrwxrwxrwx 1 root root 10 Oct 15 16:51 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part5 -> ../../sdd5
+lrwxrwxrwx 1 root root 10 Oct 15 16:51 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part6 -> ../../sdd6

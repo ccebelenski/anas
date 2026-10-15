@@ -1,0 +1,11 @@
+lsof: not installed
+/usr/bin/fuser
+psmisc: /usr/bin/fuser
+/srv/w3r-nfs  	127.0.0.1(sync,wdelay,hide,no_subtree_check,sec=sys,rw,insecure,no_root_squash,no_all_squash)
+HTTP 202 0.036971
+{"job":{"id":"27fb6f44-f40a-4fc3-9d66-ab4df4574c0d","status":"running","operation":"mount.create","createdAt":"2026-10-15T16:55:52.325Z","createdBy":"root"}}
+[t+0s] running | Reloading systemd (daemon-reload) |  | 
+[t+1s] completed | Mounting /mnt/w3r3 | {"created": "/mnt/w3r3", "warnings": []} | 
+127.0.0.1:/srv/w3r-nfs /mnt/w3r3 nfs4 vers=4.2,hard,nosuid,nodev,nofail,_netdev 0 0
+TARGET    SOURCE                 FSTYPE OPTIONS
+/mnt/w3r3 127.0.0.1:/srv/w3r-nfs nfs4   rw,nosuid,nodev,relatime,vers=4.2,rsize=524288,wsize=524288,namlen=255,hard,fatal_neterrors=none,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=127.0.0.1,local_lock=none,addr=127.0.0.1

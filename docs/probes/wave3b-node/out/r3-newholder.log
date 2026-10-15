@@ -1,0 +1,17 @@
+
+### mount again, one holder, challenge; a SECOND holder opens before the resend
+HTTP 202 0.032463
+{"job":{"id":"f521d1ff-5986-4832-b11a-858abffb8f1e","status":"running","operation":"mount.mount","createdAt":"2026-10-15T16:56:04.444Z","createdBy":"root"}}
+[t+0s] completed | Mounting /mnt/w3r3 | {"mounted": "/mnt/w3r3"} | 
+713970 w3r3-b 3600
+HTTP 409 0.088703
+X-Anas-Confirm-Code: 51c44c1d9cdf
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"'/mnt/w3r3' is busy — 1 process(es) are holding it","warnings":["Unmounting '/mnt/w3r3' will be forced (lazy unmount); these holders lose access:","sleep (pid 713970)"]}}
+713987 w3r3-c 3600
+HTTP 202 0.068186
+{"job":{"id":"45c61f64-59db-489a-b872-84fcd99fb722","status":"running","operation":"mount.unmount","createdAt":"2026-10-15T16:56:07.221Z","createdBy":"root"}}
+[t+0s] running | Unmounting /mnt/w3r3 (lazy) |  | 
+[t+0s] completed | Unmounting /mnt/w3r3 (lazy) | {"unmounted": "/mnt/w3r3"} | 
+{"job":{"id":"45c61f64-59db-489a-b872-84fcd99fb722","status":"completed","operation":"mount.unmount","progress":"Unmounting /mnt/w3r3 (lazy)","createdAt":"2026-10-15T16:56:07.221Z","createdBy":"root","startedAt":"2026-10-15T16:56:07.221Z","completedAt":"2026-10-15T16:56:07.311Z","result":{"unmounted":"/mnt/w3r3"},"error":null,"detail":null}}
+  /mnt/w3r3 NOT mounted
+  holders gone
