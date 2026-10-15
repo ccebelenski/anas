@@ -657,13 +657,10 @@
         if (!quiet) {
             try { scrubGrid.setLoading(true); } catch (e) { /* non-fatal */ }
         }
-        var priorKey = null;
-        try {
-            var sel = scrubGrid.getSelectionModel().getSelection();
-            priorKey = (sel && sel.length) ? sel[0].get('rowKey') : null;
-        } catch (eS) {
-            priorKey = null;
-        }
+        // cr.46: per-grid load sequence — the `_previewSeq` idiom from the
+        // cloud preview (72-cloud.js). The grid comes from this closure, never
+        // a ComponentQuery: two Scrub windows can be open.
+        var seq = (scrubGrid._loadSeq = (scrubGrid._loadSeq || 0) + 1);
         // Two reads, one render: the uniform scrub state, and the daemon's
         // completed jobs for the last AHR scrub findings (selfheal.3). The jobs
         // read is FAIL-OPEN — an older daemon, or a list that cannot be read,
@@ -674,8 +671,20 @@
         );
         Promise.all([ANAS.api.get(node, '/scrub'), jobsRead]).then(function (both) {
             var res = both[0];
-            if (scrubGrid.destroyed || scrubGrid.destroying) {
+            // Drop a response older than the newest request: its rows, its
+            // mask and — below all else — its idea of what was selected.
+            if (scrubGrid.destroyed || scrubGrid.destroying || scrubGrid._loadSeq !== seq) {
                 return;
+            }
+            // The selection is read NOW, when the answer arrives: a row the
+            // operator picked while this request was in flight is the row to
+            // keep selected, not the one selected when the request left.
+            var priorKey = null;
+            try {
+                var sel = scrubGrid.getSelectionModel().getSelection();
+                priorKey = (sel && sel.length) ? sel[0].get('rowKey') : null;
+            } catch (eS) {
+                priorKey = null;
             }
             if (!quiet) {
                 try { scrubGrid.setLoading(false); } catch (e) { /* non-fatal */ }
@@ -710,7 +719,8 @@
             }
             updateScrubButtons(scrubGrid);
         }, function (err) {
-            if (scrubGrid.destroyed || scrubGrid.destroying) {
+            // Stale failure: the newer load owns the mask and the grid now.
+            if (scrubGrid.destroyed || scrubGrid.destroying || scrubGrid._loadSeq !== seq) {
                 return;
             }
             if (!quiet) {

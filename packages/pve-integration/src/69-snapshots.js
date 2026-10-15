@@ -427,6 +427,9 @@
     ANAS.schedules.renderTarget = renderTarget;
     // The grid's Last run cell, exposed for the pill harness (lastrun-pill.harness.mjs).
     ANAS.schedules.renderLastRun = renderLastRun;
+    // The delete door, exposed for poll-selection.harness.mjs (cr.46) — it
+    // must go through runJob, and that is only provable from the call site.
+    ANAS.schedules.deleteSchedule = deleteSchedule;
 
     // ---- Selection + toolbar state -----------------------------------------
 
@@ -1450,28 +1453,21 @@
                     if (btn !== 'yes') {
                         return;
                     }
-                    ANAS.api.del(node, '/schedules/' + encodeURIComponent(id)).then(
-                        function (res) {
-                            // DELETE is a 202 job; if a job came back, poll it, else done.
-                            var job = res && res.job;
-                            if (job && job.id) {
-                                ANAS.pollJob(node, job.id, {
-                                    view: grid,
-                                    successMsg: t('Schedule deleted') + ': ' + name,
-                                    failTitle: 'Delete failed',
-                                    onComplete: function () { loadSchedules(grid, node); }
-                                });
-                            } else {
-                                ANAS.toast(t('Schedule deleted') + ': ' + name);
-                                loadSchedules(grid, node);
-                            }
+                    // cr.46: runJob does exactly what this hand-rolled
+                    // 202-poll did, plus the failure alert when the submission
+                    // itself rejects — same shape as the replication task and
+                    // backup task deletes.
+                    ANAS.runJob({
+                        node: node,
+                        method: 'del',
+                        path: '/schedules/' + encodeURIComponent(id),
+                        view: grid,
+                        failTitle: 'Delete failed',
+                        successMsg: t('Schedule deleted') + ': ' + name,
+                        onComplete: function () {
+                            loadSchedules(grid, node);
                         },
-                        function (err) {
-                            ANAS.warn('schedule delete failed: ' + ANAS.errText(err));
-                            ANAS.alertMsg('Delete failed',
-                                t('Failed to delete schedule') + ': ' + ANAS.errText(err));
-                        }
-                    );
+                    });
                 }
             );
         } catch (e) {

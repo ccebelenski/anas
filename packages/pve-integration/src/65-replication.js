@@ -365,16 +365,25 @@
                 // non-fatal
             }
         }
-        var priorName = null;
-        try {
-            var sel = grid.getSelectionModel().getSelection();
-            priorName = (sel && sel.length) ? sel[0].get('name') : null;
-        } catch (eS) {
-            priorName = null;
-        }
+        // cr.46: per-grid load sequence — the `_previewSeq` idiom from the
+        // cloud preview (72-cloud.js). The grid comes from this closure, never
+        // a ComponentQuery: two Replication windows can be open.
+        var seq = (grid._loadSeq = (grid._loadSeq || 0) + 1);
         ANAS.api.get(node, '/replication/tasks').then(function (res) {
-            if (grid.destroyed || grid.destroying) {
+            // Drop a response older than the newest request: its rows, its
+            // mask and — below all else — its idea of what was selected.
+            if (grid.destroyed || grid.destroying || grid._loadSeq !== seq) {
                 return;
+            }
+            // The selection is read NOW, when the answer arrives: a row the
+            // operator picked while this request was in flight is the row to
+            // keep selected, not the one selected when the request left.
+            var priorName = null;
+            try {
+                var sel = grid.getSelectionModel().getSelection();
+                priorName = (sel && sel.length) ? sel[0].get('name') : null;
+            } catch (eS) {
+                priorName = null;
             }
             if (!quiet) {
                 try {
@@ -405,7 +414,8 @@
             }
             updateButtons(grid);
         }, function (err) {
-            if (grid.destroyed || grid.destroying) {
+            // Stale failure: the newer load owns the mask and the grid now.
+            if (grid.destroyed || grid.destroying || grid._loadSeq !== seq) {
                 return;
             }
             if (!quiet) {
@@ -459,6 +469,9 @@
 
     ANAS.replication = ANAS.replication || {};
     ANAS.replication.reload = loadTasks;
+    // The delete door, exposed for poll-selection.harness.mjs (cr.46) — it
+    // must go through runJob, and that is only provable from the call site.
+    ANAS.replication.deleteTask = deleteTask;
     // The grid's Last run cell, exposed for the pill harness (lastrun-pill.harness.mjs).
     ANAS.replication.renderLastRun = renderLastRun;
 
@@ -2171,17 +2184,23 @@
                     if (btn !== 'yes') {
                         return;
                     }
-                    ANAS.api.del(node, '/replication/tasks/' + encodeURIComponent(name)).then(
-                        function () {
-                            ANAS.toast(t('Replication task deleted') + ': ' + name);
+                    // cr.46: through runJob, not api.del — the route is a 202
+                    // job, and the sibling deleteTask in 68-backup.js gets the
+                    // completion toast, the failure alert and the grid reload
+                    // from the shared helper. (68-backup wraps it in
+                    // confirmAndRun because its verb is daemon-confirmed;
+                    // this one is not — plain runJob, like the toggle above.)
+                    ANAS.runJob({
+                        node: node,
+                        method: 'del',
+                        path: '/replication/tasks/' + encodeURIComponent(name),
+                        view: grid,
+                        failTitle: 'Delete failed',
+                        successMsg: t('Replication task deleted') + ': ' + name,
+                        onComplete: function () {
                             loadTasks(grid, node);
                         },
-                        function (err) {
-                            ANAS.warn('replication delete failed: ' + ANAS.errText(err));
-                            ANAS.alertMsg('Delete failed',
-                                t('Failed to delete task') + ': ' + ANAS.errText(err));
-                        }
-                    );
+                    });
                 }
             );
         } catch (e) {

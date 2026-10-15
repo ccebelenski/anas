@@ -1728,19 +1728,31 @@
                 // non-fatal
             }
         }
-        var priorSel = selectedTask(grid);
-        var priorName = priorSel ? priorSel.get('name') : null;
+        // cr.46: per-grid load sequence — the `_previewSeq` idiom from the
+        // cloud preview (72-cloud.js). The grid resolves from this view, never
+        // a ComponentQuery: two Backup windows can be open.
+        var seq = (grid._loadSeq = (grid._loadSeq || 0) + 1);
 
         // Refresh the repo map first so the datastore column can resolve, then
         // load the tasks. Both are fail-open.
+        // (The seq check lives in the response handlers only, not here: the
+        // cancel path reloads twice back-to-back, and suppressing the second
+        // read's ISSUE would change request behaviour beyond the design.)
         loadReposInto(node).then(function () {
             if (grid.destroyed || grid.destroying) {
                 return;
             }
             ANAS.api.get(node, '/backup/tasks').then(function (res) {
-                if (grid.destroyed || grid.destroying) {
+                // Drop a response older than the newest request: its rows, its
+                // mask and — below all else — its idea of what was selected.
+                if (grid.destroyed || grid.destroying || grid._loadSeq !== seq) {
                     return;
                 }
+                // The selection is read NOW, when the answer arrives: a row
+                // the operator picked while this request was in flight is the
+                // row to keep selected, not the one selected when it left.
+                var priorSel = selectedTask(grid);
+                var priorName = priorSel ? priorSel.get('name') : null;
                 if (!quiet) {
                     try {
                         grid.setLoading(false);
@@ -1775,7 +1787,8 @@
                 grid.anasReloading = false;
                 updateButtons(grid);
             }, function (err) {
-                if (grid.destroyed || grid.destroying) {
+                // Stale failure: the newer load owns the mask and the grid now.
+                if (grid.destroyed || grid.destroying || grid._loadSeq !== seq) {
                     return;
                 }
                 grid.anasReloading = false;
