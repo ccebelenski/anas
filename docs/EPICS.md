@@ -249,7 +249,7 @@ Scope is the findings of `docs/CODE-REVIEW-2026-10-14.md`, which is the evidence
 - **cr.41** `[ ]` Tasks, schedules and registries on the guard. After cr.33; **blocked on Q1**. Local (DeepSeek) + cross-model review.
 - **cr.42** `[ ]` Identity verbs on the guard (the job compares uid/gid). After cr.33. Opus.
 - **cr.43** `[ ]` Share verbs on the guard (vanished share → `NOT_FOUND`, no duplicate stanza). After cr.33. Local (Qwen).
-- **cr.44** `[ ]` The confirm window re-challenges a bound option in place. Before cr.36/cr.37. Opus.
+- **cr.44** `[done 2026-10-15]` The confirm window re-challenges a bound option in place. Before cr.36/cr.37. Opus. Pool destroy `cleanup`, dataset destroy `recursive` and rollback `force` are `confirmBind` items sent explicitly at their default (`?cleanup=false`), and ticking one re-sends the unconfirmed request and swaps the daemon's warnings and code into the same window (`confirm-bound-options.test.ts` pins "no code ⇒ 409" for every form of the three flags; Playwright N3 is the node pass's).
 - **cr.45** `[done 2026-10-15; browser probe owed]` `pollJob` retry, lost contact, still running; cancel-run toasts on `completed` only. Local (Qwen); browser probe owed. A job is now polled to its real end — `onComplete` fires only on `completed`, a still-running job announces itself once past the attention window and keeps being polled at 5 s, and a vanished job or 60 s of poll failures alerts and recovers through `onLost`/`onFailed(null)` instead of dying silently.
 - **cr.46** `[ ]` Replication/snapshot-schedule delete through `runJob`; poll responses applied to the selection they were made for. Local (Qwen).
 

@@ -410,20 +410,203 @@
         return retry;
     }
 
+    // ---- Bound options (cr.44, docs/WAVE3-DESIGN.md §5.3) -------------------
+    //
+    // An option that changes WHAT a confirmed request destroys (pool destroy
+    // `cleanup`, dataset destroy `recursive`, rollback `force`) is part of the
+    // request the code confirms, not a flag added to the resend after the
+    // challenge. An extraItems entry declares that with
+    //   confirmBind: { query: 'cleanup' }   (or { body: 'key' })
+    // and then:
+    //   * the FIRST, unconfirmed request already carries the option at the
+    //     item's default, explicitly (`?cleanup=false`);
+    //   * changing it in the confirm window disables OK, re-sends the
+    //     UNCONFIRMED request with the new value, and swaps the daemon's new
+    //     warnings and code into the same window — so the operator reads the
+    //     wipe warning before confirming, and the code always matches what is
+    //     shown;
+    //   * the confirmed resend is that request plus the code.
+    // Safe only because these verbs' daemon confirm is unconditional: an
+    // unconfirmed request never acts (pinned per route by
+    // packages/daemon/src/routes/__tests__/confirm-bound-options.test.ts).
+    // The key is `confirmBind`, not `bind`: `bind` is ExtJS's own ViewModel
+    // binding config, and a component created with it would look for one.
+    // `mapConfirm` stays for options that are NOT bound (iSCSI destroyBacking).
+
+    var CHECKBOX_XTYPES = { checkbox: true, checkboxfield: true };
+
+    function boundItems(opts) {
+        var out = [];
+        var extra = opts.extraItems || [];
+        for (var i = 0; i < extra.length; i++) {
+            var b = extra[i] && extra[i].confirmBind;
+            if (b && (b.query || b.body) && extra[i].itemId) { out.push(extra[i]); }
+        }
+        return out;
+    }
+
+    function boundDefault(item) {
+        if (CHECKBOX_XTYPES[item.xtype]) { return !!item.checked; }
+        return (item.value === undefined) ? null : item.value;
+    }
+
+    // { itemId: value } for every bound item: the values a re-prompt carried
+    // over from the request it re-asks about, else the items' defaults.
+    function boundValues(opts) {
+        var given = opts.boundValues || {};
+        var items = boundItems(opts);
+        var vals = {};
+        for (var i = 0; i < items.length; i++) {
+            var id = items[i].itemId;
+            vals[id] = given.hasOwnProperty(id) ? given[id] : boundDefault(items[i]);
+        }
+        return vals;
+    }
+
+    // The request the bound values describe: opts with the query flags on the
+    // path and the body keys on the body. No bound items → an unchanged copy.
+    function boundRequest(opts, vals) {
+        var req = shallowCopy(opts);
+        var items = boundItems(opts);
+        var qs = [];
+        var body = null;
+        for (var i = 0; i < items.length; i++) {
+            var b = items[i].confirmBind;
+            var v = vals[items[i].itemId];
+            if (b.query) {
+                qs.push(encodeURIComponent(b.query) + '=' + encodeURIComponent(String(v)));
+            } else {
+                body = body || shallowCopy(opts.body || {});
+                body[b.body] = v;
+            }
+        }
+        if (qs.length) {
+            req.path = opts.path + (opts.path.indexOf('?') >= 0 ? '&' : '?') + qs.join('&');
+        }
+        if (body) { req.body = body; }
+        return req;
+    }
+
+    // The opts a re-prompt is built from: the caller's, carrying the bound
+    // values of the request that was just sent (its fresh code was minted for
+    // THOSE values, so the next window must open on them, not the defaults).
+    function withBoundValues(opts, vals) {
+        var o = shallowCopy(opts);
+        o.boundValues = vals;
+        return o;
+    }
+
+    // An unconfirmed (no X-Anas-Confirm) request, as runJob would send it.
+    function sendUnconfirmed(req) {
+        var method = (req.method || 'post').toLowerCase();
+        if (method === 'put') { return api.put(req.node, req.path, req.body); }
+        if (method === 'del' || method === 'delete') { return api.del(req.node, req.path); }
+        return api.post(req.node, req.path, req.body);
+    }
+
+    function confirmBodyHtml(opts, err, depth) {
+        return confirmIntroFor(opts, err, depth)
+            + ANAS.warningsHtml((err.body && err.body.error && err.body.error.warnings) || []);
+    }
+
+    // Read the bound fields of THIS window (win.down, never a global query —
+    // several confirm windows can be open).
+    function readBound(win, opts) {
+        var items = boundItems(opts);
+        var vals = {};
+        for (var i = 0; i < items.length; i++) {
+            var cmp = win.down('#' + items[i].itemId);
+            var v = cmp ? cmp.getValue() : boundDefault(items[i]);
+            vals[items[i].itemId] = CHECKBOX_XTYPES[items[i].xtype] ? !!v : v;
+        }
+        return vals;
+    }
+
+    // The window's busy/error line under the warnings. text '' hides it.
+    function confirmStatus(win, html) {
+        var st = win.down('#anasConfirmStatus');
+        if (!st) { return; }
+        st.setHtml(html || '');
+        st.setHidden(!html);
+    }
+
+    // A bound option changed: re-challenge with the unconfirmed request. Only
+    // the newest re-challenge may write the window (a box ticked and
+    // un-ticked again leaves the first answer stale); OK is live again only
+    // when a 409 with a code has been swapped in.
+    function rechallenge(win, opts, state, depth) {
+        var seq = (win._confirmSeq = (win._confirmSeq || 0) + 1);
+        var vals = readBound(win, opts);
+        var ok = win.down('#anasConfirmOkBtn');
+        function stale() {
+            return win.destroyed || win.destroying || win._confirmSeq !== seq;
+        }
+        function failed(text) {
+            // OK stays disabled: the window holds no code for what it shows.
+            confirmStatus(win, '<div class="anas-confirm-error" style="color:var(--anas-danger,#c23b2c);">'
+                + ANAS.enc(text) + '</div>');
+        }
+        if (ok) { ok.setDisabled(true); }
+        confirmStatus(win, '<i>' + ANAS.enc(ANAS.t('Checking what this changes…')) + '</i>');
+        sendUnconfirmed(boundRequest(opts, vals)).then(function () {
+            if (stale()) { return; }
+            failed(ANAS.t('The server did not ask to confirm this change, so it cannot be confirmed here. Close this window and check the task log.'));
+        }, function (e) {
+            if (stale()) { return; }
+            if (e && e.status === 409 && e.confirmCode) {
+                state.vals = vals;
+                state.err = e;
+                var bodyCmp = win.down('#anasConfirmBody');
+                if (bodyCmp) { bodyCmp.setHtml(confirmBodyHtml(opts, e, depth)); }
+                confirmStatus(win, '');
+                if (ok) { ok.setDisabled(false); }
+                return;
+            }
+            failed(ANAS.errText(e));
+        });
+    }
+
     // Widget-hosting confirm window: an Ext.window.Window (Ext.Msg.confirm cannot
     // host a checkbox) with the warnings + any extraItems, a normal (non-flat)
     // primary button, and Cancel as the default (Enter = the safe choice for a
     // destructive op). On confirm, mapConfirm(win) may return
-    // { pathSuffix, bodyPatch } folded into the resend.
+    // { pathSuffix, bodyPatch } folded into the resend; bound items
+    // (`confirmBind`, above) re-challenge in place instead.
     function confirmWindow(opts, err, depth) {
-        var intro = confirmIntroFor(opts, err, depth);
+        // The request the window currently holds a code for.
+        var state = { vals: boundValues(opts), err: err };
         var items = [{
             xtype: 'component',
-            html: intro + ANAS.warningsHtml((err.body && err.body.error && err.body.error.warnings) || []),
+            itemId: 'anasConfirmBody',
+            html: confirmBodyHtml(opts, err, depth),
             margin: '0 0 8 0',
         }];
         var extra = opts.extraItems || [];
-        for (var i = 0; i < extra.length; i++) { items.push(extra[i]); }
+        var bound = boundItems(opts);
+        for (var i = 0; i < extra.length; i++) {
+            var it = extra[i];
+            if (bound.indexOf(it) >= 0) {
+                // A copy opened on the value the held code was minted for,
+                // without the marker key.
+                it = shallowCopy(it);
+                delete it.confirmBind;
+                if (CHECKBOX_XTYPES[it.xtype]) {
+                    it.checked = !!state.vals[it.itemId];
+                } else {
+                    it.value = state.vals[it.itemId];
+                }
+            }
+            items.push(it);
+        }
+        if (bound.length) {
+            items.push({
+                xtype: 'component',
+                itemId: 'anasConfirmStatus',
+                hidden: true,
+                margin: '8 0 0 0',
+                html: '',
+            });
+        }
         var win = Ext.create('Ext.window.Window', {
             title: ANAS.t(opts.confirmTitle || 'Confirm'),
             cls: opts.confirmCls || 'anas-win-confirm',
@@ -442,15 +625,25 @@
                 handler: function () { win.close(); },
             }, {
                 text: ANAS.t(opts.confirmButtonText || 'OK'),
+                itemId: 'anasConfirmOkBtn',
                 cls: opts.confirmButtonCls,
-                handler: function () {
+                handler: function (btn) {
+                    if (btn && btn.disabled) { return; }
                     var extraOut = (typeof opts.mapConfirm === 'function')
                         ? (opts.mapConfirm(win) || {}) : {};
                     win.close();
-                    ANAS.runJob(withReprompt(buildRetry(opts, err, extraOut), opts, depth));
+                    ANAS.runJob(withReprompt(
+                        buildRetry(boundRequest(opts, state.vals), state.err, extraOut),
+                        withBoundValues(opts, state.vals), depth));
                 },
             }],
         });
+        for (var j = 0; j < bound.length; j++) {
+            var cmp = win.down('#' + bound[j].itemId);
+            if (cmp) {
+                cmp.on('change', function () { rechallenge(win, opts, state, depth); });
+            }
+        }
         win.show();
     }
 
@@ -467,9 +660,14 @@
     //     { pathSuffix, bodyPatch } folds the widget values into the resend. Also
     //     honours confirmCls / confirmButtonText / confirmButtonCls / confirmWidth
     //     / cancelButtonText.
+    //
+    // Bound options (`confirmBind` on an extraItems entry, cr.44) ride the
+    // FIRST request at their defaults and re-challenge in the window; see
+    // "Bound options" above.
     ANAS.confirmAndRun = function (opts) {
-        var base = shallowCopy(opts);
-        base.onConfirm = function (err) { promptConfirm(opts, err, 0); };
+        var vals = boundValues(opts);
+        var base = boundRequest(opts, vals);
+        base.onConfirm = function (err) { promptConfirm(withBoundValues(opts, vals), err, 0); };
         ANAS.runJob(base);
     };
 
@@ -478,9 +676,12 @@
     // message names both ids, story ident.1), or the code was stale
     // (CONFIRMATION_REQUIRED again). That is a new question for the user, not a
     // failure: prompt again with the daemon's new message. Capped so a daemon
-    // that keeps answering 409 can never loop the user.
+    // that keeps answering 409 can never loop the user. CONFIRM_SCOPE_CHANGED
+    // (WAVE3-DESIGN §5.2 rule 3, cr.32): the resend's bound options differ
+    // from the ones the code was minted for — the same kind of new question.
+    // A daemon that never sends it leaves this entry inert.
     var MAX_REPROMPTS = 2;
-    var REPROMPT_CODES = { CONFIRMATION_REQUIRED: true, IDENTITY_MISMATCH: true };
+    var REPROMPT_CODES = { CONFIRMATION_REQUIRED: true, IDENTITY_MISMATCH: true, CONFIRM_SCOPE_CHANGED: true };
 
     function repromptable(err) {
         var code = err && err.body && err.body.error && err.body.error.code;
@@ -522,7 +723,7 @@
             var msg = confirmIntroFor(opts, err, depth) + ANAS.warningsHtml(warnings);
             Ext.Msg.confirm(ANAS.t(opts.confirmTitle || 'Confirm'), msg, function (btn) {
                 if (btn === 'yes') {
-                    ANAS.runJob(withReprompt(buildRetry(opts, err), opts, depth));
+                    ANAS.runJob(withReprompt(buildRetry(boundRequest(opts, boundValues(opts)), err), opts, depth));
                 }
             });
         } catch (e) {

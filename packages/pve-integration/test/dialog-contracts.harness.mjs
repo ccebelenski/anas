@@ -1013,6 +1013,9 @@ function makeAnas(routes) {
         confirmWindow: !!cfg.confirmWindow,
         extraItems: cfg.extraItems,
         mapConfirm: cfg.mapConfirm,
+        // The cfg itself, so a check can run a flow's OWN options through the
+        // REAL confirmAndRun (cr.44: the bound option's first request).
+        raw: cfg,
         // Which door, and whether the prompt leads with the daemon's 409
         // headline (access rulings 2026-10-11: the recursive apply's confirm
         // is the daemon's, its headline carried verbatim).
@@ -15127,6 +15130,388 @@ created.windows.length = 0
 jobs.length = 0
 await accessConfirmFlowChecks()
 confirmAnswer = 'yes'
+
+// ============================================================================
+//  cr.44 — bound options re-challenge in the confirm window (WAVE3-DESIGN §5.3).
+//  The REAL ANAS.confirmAndRun/confirmWindow (10-api.js), loaded the way
+//  confirmRepromptChecks loads it. An extraItems entry carrying
+//  `confirmBind: { query }` is part of the confirmed request: the first,
+//  unconfirmed request spells its default out; changing it disables OK,
+//  re-sends the UNCONFIRMED request with the new value and swaps the daemon's
+//  warnings and code into the same window; only the newest re-challenge may
+//  write the window; any answer but a 409 with a code is an error shown in
+//  the window with OK left disabled. And the three destructive flows declare
+//  their option that way (pool destroy cleanup, dataset destroy recursive,
+//  rollback force), proven by running each flow's OWN cfg through the real
+//  helper.
+// ============================================================================
+
+/** Load 10-api.js into its own sandbox; every request is answered by `answer(req)`. */
+function loadConfirmApi(answer) {
+  const sent = []
+  const completed = []
+  const failed = []
+  const win = {}
+  win.ANAS = {
+    t: s => s,
+    enc: s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+    warn() {},
+    toast() {},
+    errText: e => String((e && e.message) || e),
+  }
+  const sandbox = { window: win, Ext, console, Promise, setTimeout: (fn) => { fn(); return 1 }, clearTimeout: () => {} }
+  vm.runInNewContext(readFileSync(join(SRC, '10-api.js'), 'utf8'), sandbox, { filename: '10-api.js' })
+  const A = win.ANAS
+  const send = method => (_node, path, a, b) => {
+    const opts = method === 'DELETE' ? a : b
+    const req = { method, path, body: method === 'DELETE' ? undefined : a, confirmCode: (opts && opts.confirmCode) || null }
+    sent.push(req)
+    return answer(req)
+  }
+  A.api.del = send('DELETE')
+  A.api.post = send('POST')
+  A.api.put = send('PUT')
+  A.api.get = () => Promise.resolve({ job: { id: 'job-1', status: 'completed' } })
+  return { A, sent, completed, failed }
+}
+
+/** A 409 challenge as doFetch rejects it. */
+function challenge409(code, warnings, errCode, message) {
+  const e = new Error(message || 'Confirm?')
+  e.status = 409
+  e.confirmCode = code
+  e.body = { error: { code: errCode || 'CONFIRMATION_REQUIRED', message: message || 'Confirm?', warnings: warnings || [] } }
+  return e
+}
+
+/** A refusal with NO confirm code. */
+function refusalErr(status, message) {
+  const e = new Error(message)
+  e.status = status
+  e.confirmCode = null
+  e.body = { error: { code: 'CONFLICT', message } }
+  return e
+}
+
+function pending() {
+  let resolve
+  let reject
+  const p = new Promise((res, rej) => { resolve = res; reject = rej })
+  return { p, resolve, reject }
+}
+
+const CR44_BASE = ['Destroying \'tank\' is irreversible.']
+const CR44_WIPE = [...CR44_BASE, 'The pool\'s disks will be wiped clean (existing ZFS labels removed).']
+const CR44_WIPE_RE = /wiped clean/
+
+/** A pool-destroy-shaped cfg with the cleanup checkbox bound. */
+function cr44PoolCfg(h) {
+  return {
+    node: 'pve',
+    method: 'del',
+    path: '/pools/tank',
+    confirmWindow: true,
+    confirmTitle: 'Destroy pool',
+    confirmIntro: '<b>Destroy pool "tank"?</b>',
+    confirmButtonText: 'Destroy',
+    extraItems: [{ xtype: 'checkbox', itemId: 'cleanup', boxLabel: 'Clean up disks', confirmBind: { query: 'cleanup' } }],
+    onComplete: (j) => { h.completed.push(j) },
+    onFailed: (j) => { h.failed.push(j) },
+  }
+}
+
+/** The open confirm window's parts. */
+function cr44Win() {
+  const w = openWindow()
+  return {
+    w,
+    body: w && w.down('#anasConfirmBody'),
+    okBtn: w && w.down('#anasConfirmOkBtn'),
+    cancel: w && w.down('#anasConfirmCancelBtn'),
+    box: w && w.down('#cleanup'),
+    status: w && w.down('#anasConfirmStatus'),
+  }
+}
+
+async function confirmBindChecks() {
+  // ---- 1. The re-challenge swaps the warnings AND the code ------------------
+  created.windows.length = 0
+  alerts.length = 0
+  let h = loadConfirmApi((req) => {
+    if (req.confirmCode) { return Promise.resolve({ job: { id: 'job-1' } }) }
+    return Promise.reject(/cleanup=true/.test(req.path) ? challenge409('C2', CR44_WIPE) : challenge409('C1', CR44_BASE))
+  })
+  h.A.confirmAndRun(cr44PoolCfg(h))
+  await settle()
+  eq('bind: the FIRST request spells the default out, unconfirmed', h.sent[0], { method: 'DELETE', path: '/pools/tank?cleanup=false', body: undefined, confirmCode: null })
+  let p = cr44Win()
+  ok('bind: the confirm window opened with its parts', !!(p.w && p.body && p.okBtn && p.box && p.status))
+  if (!(p.w && p.body && p.okBtn && p.box && p.status)) { return }
+  ok('bind: the box opens unticked and the window shows no wipe warning', p.box.getValue() === false && !CR44_WIPE_RE.test(p.body.html), p.body.html)
+  ok('bind: OK is live on the first challenge', p.okBtn.disabled === false)
+  ok('bind: the box config reaching Ext carries no confirmBind (Ext\'s own `bind` stays out of it too)', p.box.confirmBind === undefined && p.box.bind === undefined)
+  p.box.setValue(true)
+  ok('bind: ticking disables OK at once', p.okBtn.disabled === true)
+  ok('bind: …and says the window is checking', !p.status.hidden && /Checking/.test(p.status.html), p.status.html)
+  await settle()
+  eq('bind: the tick re-sends the UNCONFIRMED request with cleanup=true', h.sent[1], { method: 'DELETE', path: '/pools/tank?cleanup=true', body: undefined, confirmCode: null })
+  ok('bind: the wipe warning is now in the window', CR44_WIPE_RE.test(p.body.html), p.body.html)
+  ok('bind: …still led by the caller\'s intro', p.body.html.startsWith('<b>Destroy pool "tank"?</b>'), p.body.html)
+  ok('bind: OK is live again and the checking line is gone', p.okBtn.disabled === false && p.status.hidden === true)
+  p.okBtn.handler(p.okBtn)
+  await settle()
+  eq('bind: the confirmed resend is the re-challenged request with ITS code', h.sent[2], { method: 'DELETE', path: '/pools/tank?cleanup=true', body: undefined, confirmCode: 'C2' })
+  ok('bind: three requests, the job completes, no alert', h.sent.length === 3 && h.completed.length === 1 && alerts.length === 0, JSON.stringify({ n: h.sent.length, alerts }))
+  ok('bind: the window closed on OK', p.w.destroyed === true)
+
+  // ---- 2. A stale re-challenge (ticked, then un-ticked) is dropped ----------
+  //  2a. The stale answer arrives LAST: it must not overwrite the newer one.
+  created.windows.length = 0
+  let inflight = []
+  h = loadConfirmApi((req) => {
+    if (req.confirmCode) { return Promise.resolve({ job: { id: 'job-1' } }) }
+    if (h.sent.length === 1) { return Promise.reject(challenge409('C1', CR44_BASE)) }
+    const d = pending()
+    inflight.push(d)
+    return d.p
+  })
+  h.A.confirmAndRun(cr44PoolCfg(h))
+  await settle()
+  p = cr44Win()
+  p.box.setValue(true)
+  p.box.setValue(false)
+  await settle()
+  eq('stale: both re-challenges went out, ticked then un-ticked', h.sent.slice(1).map(r => r.path), ['/pools/tank?cleanup=true', '/pools/tank?cleanup=false'])
+  inflight[1].reject(challenge409('C3', CR44_BASE))
+  await settle()
+  ok('stale: the NEWEST answer opens OK', p.okBtn.disabled === false)
+  inflight[0].reject(challenge409('C2', CR44_WIPE))
+  await settle()
+  ok('stale: the late answer for the abandoned tick is dropped — no wipe warning', !CR44_WIPE_RE.test(p.body.html), p.body.html)
+  p.okBtn.handler(p.okBtn)
+  await settle()
+  eq('stale: OK confirms what the window shows (cleanup=false, the newest code)', h.sent[h.sent.length - 1], { method: 'DELETE', path: '/pools/tank?cleanup=false', body: undefined, confirmCode: 'C3' })
+
+  //  2b. The stale answer arrives FIRST: OK stays shut until the newest one does.
+  created.windows.length = 0
+  inflight = []
+  h = loadConfirmApi((req) => {
+    if (req.confirmCode) { return Promise.resolve({ job: { id: 'job-1' } }) }
+    if (h.sent.length === 1) { return Promise.reject(challenge409('C1', CR44_BASE)) }
+    const d = pending()
+    inflight.push(d)
+    return d.p
+  })
+  h.A.confirmAndRun(cr44PoolCfg(h))
+  await settle()
+  p = cr44Win()
+  p.box.setValue(true)
+  p.box.setValue(false)
+  inflight[0].reject(challenge409('C2', CR44_WIPE))
+  await settle()
+  ok('stale(first): the abandoned answer neither opens OK nor shows its warning', p.okBtn.disabled === true && !CR44_WIPE_RE.test(p.body.html), p.body.html)
+  inflight[1].reject(challenge409('C3', CR44_BASE))
+  await settle()
+  ok('stale(first): the newest answer opens OK', p.okBtn.disabled === false && p.status.hidden === true)
+
+  // ---- 3. The error path clears the busy line and keeps OK shut -------------
+  created.windows.length = 0
+  alerts.length = 0
+  h = loadConfirmApi((req) => {
+    if (req.confirmCode) { return Promise.resolve({ job: { id: 'job-1' } }) }
+    if (/cleanup=true/.test(req.path)) { return Promise.reject(refusalErr(409, 'Pool <tank> is held by LUN 0')) }
+    return Promise.reject(challenge409(h.sent.length === 1 ? 'C1' : 'C4', CR44_BASE))
+  })
+  h.A.confirmAndRun(cr44PoolCfg(h))
+  await settle()
+  p = cr44Win()
+  p.box.setValue(true)
+  await settle()
+  ok('error: a 409 WITHOUT a code keeps OK disabled', p.okBtn.disabled === true)
+  ok('error: the daemon\'s sentence is shown in the window, encoded', /Pool &lt;tank&gt; is held by LUN 0/.test(p.status.html) && !/<tank>/.test(p.status.html), p.status.html)
+  ok('error: the checking line is gone', !/Checking/.test(p.status.html), p.status.html)
+  ok('error: no modal alert on top of the window', alerts.length === 0, JSON.stringify(alerts))
+  p.okBtn.handler(p.okBtn)
+  await settle()
+  ok('error: OK pressed while disabled sends nothing', h.sent.length === 2, JSON.stringify(h.sent))
+  p.box.setValue(false)
+  await settle()
+  ok('error: un-ticking re-challenges and opens OK again, the error line cleared', p.okBtn.disabled === false && p.status.hidden === true, p.status.html)
+  p.okBtn.handler(p.okBtn)
+  await settle()
+  eq('error: the resend is the request the window now shows', h.sent[h.sent.length - 1], { method: 'DELETE', path: '/pools/tank?cleanup=false', body: undefined, confirmCode: 'C4' })
+
+  //  3b. A 2xx to an unconfirmed re-challenge is an error too (the precondition broke).
+  created.windows.length = 0
+  h = loadConfirmApi((req) => {
+    if (h.sent.length === 1) { return Promise.reject(challenge409('C1', CR44_BASE)) }
+    return Promise.resolve({ job: { id: 'job-x' } })
+  })
+  h.A.confirmAndRun(cr44PoolCfg(h))
+  await settle()
+  p = cr44Win()
+  p.box.setValue(true)
+  await settle()
+  ok('error(2xx): an answer without a challenge keeps OK disabled and says so', p.okBtn.disabled === true && /did not ask to confirm/.test(p.status.html), p.status.html)
+
+  //  3c. A network failure (status 0) on the re-challenge.
+  created.windows.length = 0
+  h = loadConfirmApi((req) => {
+    if (h.sent.length === 1) { return Promise.reject(challenge409('C1', CR44_BASE)) }
+    const e = new Error('network error')
+    e.status = 0
+    return Promise.reject(e)
+  })
+  h.A.confirmAndRun(cr44PoolCfg(h))
+  await settle()
+  p = cr44Win()
+  p.box.setValue(true)
+  await settle()
+  ok('error(network): OK stays disabled, the failure is shown, not "checking"', p.okBtn.disabled === true && /network error/.test(p.status.html) && !/Checking/.test(p.status.html), p.status.html)
+
+  // ---- 4. Cancel while a re-challenge is in flight: the answer is dropped ---
+  created.windows.length = 0
+  inflight = []
+  h = loadConfirmApi((req) => {
+    if (h.sent.length === 1) { return Promise.reject(challenge409('C1', CR44_BASE)) }
+    const d = pending()
+    inflight.push(d)
+    return d.p
+  })
+  h.A.confirmAndRun(cr44PoolCfg(h))
+  await settle()
+  p = cr44Win()
+  p.box.setValue(true)
+  p.cancel.handler(p.cancel)
+  inflight[0].reject(challenge409('C2', CR44_WIPE))
+  await settle()
+  ok('cancel: nothing more is sent after Cancel', h.sent.length === 2 && h.completed.length === 0, JSON.stringify(h.sent))
+
+  // ---- 5. A re-prompt opens on the values its fresh code was minted for -----
+  for (const errCode of ['IDENTITY_MISMATCH', 'CONFIRM_SCOPE_CHANGED']) {
+    created.windows.length = 0
+    alerts.length = 0
+    let resends = 0
+    h = loadConfirmApi((req) => {
+      if (req.confirmCode) {
+        resends++
+        if (resends === 1) { return Promise.reject(challenge409('C5', CR44_WIPE, errCode, 'The pool changed since you confirmed')) }
+        return Promise.resolve({ job: { id: 'job-1' } })
+      }
+      return Promise.reject(/cleanup=true/.test(req.path) ? challenge409('C2', CR44_WIPE) : challenge409('C1', CR44_BASE))
+    })
+    h.A.confirmAndRun(cr44PoolCfg(h))
+    await settle()
+    p = cr44Win()
+    p.box.setValue(true)
+    await settle()
+    p.okBtn.handler(p.okBtn)
+    await settle()
+    const again = cr44Win()
+    ok(`reprompt(${errCode}): a second window opens instead of a failure`, !!again.w && again.w !== p.w && alerts.length === 0, JSON.stringify(alerts))
+    if (!again.w) { continue }
+    ok(`reprompt(${errCode}): it opens with the box TICKED (the code is for cleanup=true)`, again.box.getValue() === true)
+    ok(`reprompt(${errCode}): it leads with the daemon's sentence`, again.body.html.startsWith('The pool changed since you confirmed'), again.body.html)
+    again.okBtn.handler(again.okBtn)
+    await settle()
+    eq(`reprompt(${errCode}): the second resend carries cleanup=true and the fresh code`, h.sent[h.sent.length - 1], { method: 'DELETE', path: '/pools/tank?cleanup=true', body: undefined, confirmCode: 'C5' })
+    ok(`reprompt(${errCode}): the job completes`, h.completed.length === 1)
+  }
+
+  // ---- 6. An UNBOUND option (mapConfirm) is unchanged -----------------------
+  created.windows.length = 0
+  h = loadConfirmApi((req) => {
+    if (req.confirmCode) { return Promise.resolve({ job: { id: 'job-1' } }) }
+    return Promise.reject(challenge409('C1', ['Unmapping LUN 0.']))
+  })
+  h.A.confirmAndRun({
+    node: 'pve',
+    method: 'del',
+    path: '/iscsi/targets/t/luns/0',
+    confirmWindow: true,
+    extraItems: [{ xtype: 'checkbox', itemId: 'destroyBacking', checked: false }],
+    mapConfirm: w => (w.down('#destroyBacking').getValue() ? { pathSuffix: '?destroyBacking=true' } : {}),
+  })
+  await settle()
+  const lw = openWindow()
+  ok('unbound: the first request carries no query', h.sent[0] && h.sent[0].path === '/iscsi/targets/t/luns/0', JSON.stringify(h.sent[0]))
+  ok('unbound: the window has no status line', lw && !lw.down('#anasConfirmStatus'))
+  lw.down('#destroyBacking').setValue(true)
+  await settle()
+  ok('unbound: ticking re-sends nothing', h.sent.length === 1)
+  lw.down('#anasConfirmOkBtn').handler(lw.down('#anasConfirmOkBtn'))
+  await settle()
+  eq('unbound: mapConfirm still folds its flag into the resend', h.sent[1], { method: 'DELETE', path: '/iscsi/targets/t/luns/0?destroyBacking=true', body: undefined, confirmCode: 'C1' })
+
+  // ---- 7. The three flows declare their option bound ------------------------
+  /** Run a flow's OWN recorded cfg through the real helper; return its first request. */
+  async function firstRequestOf(cfg) {
+    const hh = loadConfirmApi(() => Promise.reject(refusalErr(404, 'stop here')))
+    hh.A.confirmAndRun(cfg)
+    await settle()
+    return hh.sent[0]
+  }
+  function boundSpec(job, itemId) {
+    const it = ((job && job.raw && job.raw.extraItems) || []).find(x => x && x.itemId === itemId)
+    return it && it.confirmBind
+  }
+
+  // Pool destroy (37-pool-destroy.js) from the Pools grid's toolbar.
+  jobs.length = 0
+  const PA = loadSources(['15-gfx.js', '30-pools.js', '36-pool-export.js', '37-pool-destroy.js'], {
+    'GET /pools': { data: [poolRow('tank')] },
+  })
+  const pview = makeComponent(PA.views.pools.factory('harness'), null)
+  const pgrid = pview.itemId === 'poolsGrid' ? pview : pview.down('#poolsGrid')
+  pgrid.fireEvent('afterrender', pgrid)
+  await settle()
+  pgrid.selectRow(pgrid.getStore().findExact('name', 'tank'))
+  const destroyBtn = pgrid.down('#destroyPool')
+  destroyBtn.handler(destroyBtn)
+  await settle()
+  const pj = jobs.find(j => j.door === 'confirmAndRun')
+  eq('flows(pool destroy): cleanup is bound as a query option', boundSpec(pj, 'cleanup'), { query: 'cleanup' })
+  ok('flows(pool destroy): no mapConfirm adds it after the challenge', !!pj && pj.raw.mapConfirm === undefined)
+  alerts.length = 0
+  eq('flows(pool destroy): the real first request sends ?cleanup=false', pj && (await firstRequestOf(pj.raw)).path, '/pools/tank?cleanup=false')
+
+  // Dataset destroy and rollback (60-datasets.js) from the Datasets tree.
+  jobs.length = 0
+  const { tree } = await openDatasetTree(DATASET_ROUTES)
+  const media = findNode(tree, 'tank/media')
+  ok('flows(datasets): tank/media loaded', !!media)
+  if (media) {
+    tree.selectNode(media)
+    const dsBtn = tree.down('#dsDestroy')
+    dsBtn.handler(dsBtn)
+    await settle()
+    const dj = jobs.find(j => j.door === 'confirmAndRun')
+    eq('flows(dataset destroy): recursive is bound as a query option', boundSpec(dj, 'recursive'), { query: 'recursive' })
+    ok('flows(dataset destroy): no mapConfirm adds it after the challenge', !!dj && dj.raw.mapConfirm === undefined)
+    const dfirst = dj && await firstRequestOf(dj.raw)
+    ok('flows(dataset destroy): the real first request sends ?recursive=false, once',
+      !!dfirst && /\/media\?recursive=false$/.test(dfirst.path) && dfirst.path.split('?').length === 2, dfirst && dfirst.path)
+
+    jobs.length = 0
+    tree.selectNode(snapshotRecord(media, 'nightly'))
+    const rbBtn = tree.down('#snapRollback')
+    rbBtn.handler(rbBtn)
+    await settle()
+    const rj = jobs.find(j => j.door === 'confirmAndRun')
+    eq('flows(rollback): force is bound as a query option', boundSpec(rj, 'force'), { query: 'force' })
+    ok('flows(rollback): no mapConfirm adds it after the challenge', !!rj && rj.raw.mapConfirm === undefined)
+    const rfirst = rj && await firstRequestOf(rj.raw)
+    ok('flows(rollback): the real first request sends ?force=false, once',
+      !!rfirst && /\/rollback\?force=false$/.test(rfirst.path) && rfirst.path.split('?').length === 2, rfirst && rfirst.path)
+  }
+  alerts.length = 0
+}
+
+warnings.length = 0
+created.windows.length = 0
+jobs.length = 0
+await confirmBindChecks()
+ok('bind: nothing warned', warnings.length === 0, warnings.join(' | '))
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

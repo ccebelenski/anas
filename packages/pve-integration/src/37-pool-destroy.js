@@ -28,11 +28,15 @@
                 if (!poolName) {
                     return;
                 }
-                // confirmAndRun fires the unconfirmed DELETE, then on the 409
-                // challenge shows the warnings + a "Clean Up Disks" checkbox
-                // (mirrors PVE's destroy-pool cleanup option) in a widget window;
-                // the chosen flag is folded into the confirmed resend. A root-pool
-                // block (PROTECTED_RESOURCE) or any hard error surfaces via failTitle.
+                // confirmAndRun fires the unconfirmed DELETE with
+                // `?cleanup=false` spelled out, then on the 409 challenge shows
+                // the warnings + a "Clean up disks" checkbox (mirrors PVE's
+                // destroy-pool cleanup option) in a widget window. The option is
+                // BOUND (cr.44, WAVE3-DESIGN §5.3): ticking it re-sends the
+                // unconfirmed request with `?cleanup=true`, so the daemon's wipe
+                // warning and a code for exactly that request replace the
+                // window's before OK can be pressed. A root-pool block
+                // (PROTECTED_RESOURCE) or any hard error surfaces via failTitle.
                 ANAS.confirmAndRun({
                     node: node,
                     method: 'del',
@@ -53,10 +57,8 @@
                         itemId: 'cleanup',
                         cls: 'anas-chk-cleanup',
                         boxLabel: ANAS.t('Clean up disks (wipe ZFS labels so they are reusable)'),
+                        confirmBind: { query: 'cleanup' },
                     }],
-                    mapConfirm: function (win) {
-                        return win.down('#cleanup').getValue() ? { pathSuffix: '?cleanup=true' } : {};
-                    },
                 });
             },
         });

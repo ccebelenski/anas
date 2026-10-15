@@ -2607,8 +2607,9 @@
     //
     // Dangerous: the daemon confirmation-gates it (409 + X-Anas-Confirm-Code +
     // warnings). Mirror 37-pool-destroy's challenge → dialog-with-checkbox →
-    // confirmed-DELETE flow. The recursive flag is chosen in the dialog and
-    // appended to the confirmed request; the confirm code is not bound to it.
+    // confirmed-DELETE flow. The recursive flag is a BOUND option (cr.44,
+    // WAVE3-DESIGN §5.3): the first request carries `?recursive=false`, and
+    // ticking the box re-challenges with `?recursive=true` in the same window.
 
     function openDestroy(node, tree, rec) {
         // Only child datasets are destroyable here. Story 3.26: the pool root is
@@ -2626,10 +2627,12 @@
         }
         var pool = rec.get('pool');
         var fullName = rec.get('fullName');
-        // confirmAndRun fires the unconfirmed DELETE, then on the 409 challenge
-        // shows the warnings + a "Recursive" checkbox; the flag is appended to the
-        // confirmed resend (the confirm code is not bound to it). A hard error
-        // surfaces via failTitle.
+        // confirmAndRun fires the unconfirmed DELETE (`?recursive=false`), then
+        // on the 409 challenge shows the warnings + a "Recursive" checkbox;
+        // ticking it re-sends the unconfirmed request with `?recursive=true`
+        // and swaps in the daemon's warnings and code for THAT request, so
+        // what is confirmed is what is shown. A hard error surfaces via
+        // failTitle.
         ANAS.confirmAndRun({
             node: node,
             method: 'del',
@@ -2651,10 +2654,8 @@
                 itemId: 'recursive',
                 cls: 'anas-chk-ds-recursive',
                 boxLabel: t('Recursive (destroy children)'),
+                confirmBind: { query: 'recursive' },
             }],
-            mapConfirm: function (win) {
-                return win.down('#recursive').getValue() ? { pathSuffix: '?recursive=true' } : {};
-            },
         });
     }
 
@@ -2937,13 +2938,15 @@
     //
     // Confirmation-gated like dataset/pool destroy: an unconfirmed POST returns
     // 409 + code + warnings; we surface the warnings in a dialog carrying an
-    // optional "force" checkbox and, on confirm, resend with the code. The code
-    // is NOT bound to force — force is appended to the confirmed request.
+    // optional "force" checkbox and, on confirm, resend with the code. Force is
+    // a BOUND option (cr.44, WAVE3-DESIGN §5.3): the first request carries
+    // `?force=false`, and ticking the box re-challenges with `?force=true`.
 
     function openRollback(node, ctx, onDone) {
-        // confirmAndRun fires the unconfirmed POST, then on the 409 challenge
-        // shows the warnings + an optional "force" checkbox; force is appended to
-        // the confirmed resend (the code is NOT bound to it). A hard error
+        // confirmAndRun fires the unconfirmed POST (`?force=false`), then on the
+        // 409 challenge shows the warnings + an optional "force" checkbox;
+        // ticking it re-challenges in the same window and the confirmed resend
+        // is exactly the request the shown code was minted for. A hard error
         // surfaces via failTitle.
         ANAS.confirmAndRun({
             node: node,
@@ -2968,10 +2971,8 @@
                 itemId: 'force',
                 cls: 'anas-chk-snap-force',
                 boxLabel: t('Force (-r): destroy any more-recent snapshots and bookmarks'),
+                confirmBind: { query: 'force' },
             }],
-            mapConfirm: function (win) {
-                return win.down('#force').getValue() ? { pathSuffix: '?force=true' } : {};
-            },
         });
     }
 
