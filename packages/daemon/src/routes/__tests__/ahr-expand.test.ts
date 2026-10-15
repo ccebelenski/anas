@@ -16,7 +16,7 @@ import { diskLsblkArgs } from '../../services/ahr-expand-exec.js'
 import { readIntent, writeIntent } from '../../services/ahr-intent.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
-import { ahrExpansionRoutes } from '../ahr-expand.js'
+import { AHR_ABANDON_PRESENTATION_ONLY, ahrExpansionRoutes } from '../ahr-expand.js'
 
 const GIB = 1024 ** 3
 const MIB = 1024 ** 2
@@ -712,5 +712,90 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       assert.equal(await readIntent('quad', dir), null, 'intent cleared on completion')
       assert.deepEqual(mutatingCalls(executor), [], 'a zero-step plan mutates nothing')
     })
+  })
+})
+
+/**
+ * Story cr.38 session A — abandon checks the intent's id and state in the job
+ * (WAVE3-DESIGN §2.3 "resume / abandon": `clearIntent` checks neither). The
+ * confirmed abandon is held behind four placeholder jobs; the intent is
+ * resumed (running again) or replaced by another expansion's (a new id)
+ * while it waits; the job refuses and the intent file is left as it is.
+ */
+describe('cr.38 — abandon re-checks the intent in the job (ruling (j))', () => {
+  let dir: string
+  let executor: MockExecutor
+  let jobQueue: JobQueue
+  let server: ReturnType<typeof Fastify>
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-cr38-abandon-'))
+    executor = buildExecutor()
+    jobQueue = new JobQueue()
+    server = Fastify({ logger: false })
+    await server.register(ahrExpansionRoutes, { prefix: '/v1', executor, jobQueue, confirmStore: new ConfirmStore(), diskIdentityCache: new DiskIdentityCache(executor), intentDir: dir })
+  })
+  afterEach(async () => {
+    await server?.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  const URL = '/v1/ahr/tank/expand/abandon'
+
+  async function confirmedBehindFullQueue(): Promise<{ id: string, release: () => void }> {
+    const first = await server.inject({ method: 'POST', url: URL, headers: IDENTITY_HEADERS })
+    assert.equal(first.statusCode, 409, first.body)
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (let i = 0; i < 4; i++)
+      jobQueue.submit('test.hold', { user: 'test', uid: 0 }, () => held)
+    const res = await server.inject({ method: 'POST', url: URL, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
+    assert.equal(res.statusCode, 202, res.body)
+    const id = res.json().job.id as string
+    assert.equal(jobQueue.get(id)?.status, 'queued')
+    return { id, release }
+  }
+
+  it('an intent resumed (running) while the confirmed abandon waits is NOT cleared — the job refuses', async () => {
+    const halted = mkIntent('halted')
+    await writeIntent('tank', halted, { dir })
+    const { id, release } = await confirmedBehindFullQueue()
+    await writeIntent('tank', { ...halted, state: 'running' }, { dir })
+    release()
+    const job = await waitForJob(jobQueue, id)
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    assert.equal(job.error?.code, 'CONFLICT')
+    assert.match(job.error!.message, /currently being driven/)
+    assert.equal((await readIntent('tank', dir))?.state, 'running', 'the running intent is untouched')
+  })
+
+  it('an intent REPLACED by another expansion\'s while the confirmed abandon waits is NOT cleared — STATE_CHANGED', async () => {
+    await writeIntent('tank', mkIntent('halted'), { dir })
+    const { id, release } = await confirmedBehindFullQueue()
+    const other = mkIntent('halted')
+    await writeIntent('tank', other, { dir })
+    release()
+    const job = await waitForJob(jobQueue, id)
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.equal((await readIntent('tank', dir))?.id, other.id, 'the other expansion\'s intent is untouched')
+  })
+
+  it('a code minted for one intent does not abandon another: the resend answers STATE_CHANGED with a fresh code', async () => {
+    await writeIntent('tank', mkIntent('halted'), { dir })
+    const first = await server.inject({ method: 'POST', url: URL, headers: IDENTITY_HEADERS })
+    const other = mkIntent('halted')
+    await writeIntent('tank', other, { dir })
+    const res = await server.inject({ method: 'POST', url: URL, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'STATE_CHANGED')
+    assert.ok(res.headers['x-anas-confirm-code'])
+    assert.equal((await readIntent('tank', dir))?.id, other.id)
+  })
+
+  it('the abandon confirm signs the whole request — no presentation-only fields', () => {
+    assert.deepEqual(AHR_ABANDON_PRESENTATION_ONLY, {})
   })
 })

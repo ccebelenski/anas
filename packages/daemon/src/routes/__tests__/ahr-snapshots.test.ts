@@ -1,19 +1,22 @@
 import type { AhrExpansionIntent, Job } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
+import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { JobQueue } from '../../jobs/queue.js'
 import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { ConfirmStore } from '../../safety/confirm.js'
 import { writeIntent } from '../../services/ahr-intent.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
-import { ahrSnapshotRoutes } from '../ahr-snapshots.js'
+import { AHR_SNAPSHOT_DELETE_PRESENTATION_ONLY, AHR_SNAPSHOT_ROLLBACK_PRESENTATION_ONLY, ahrSnapshotRoutes } from '../ahr-snapshots.js'
 import { jobRoutes } from '../jobs.js'
 
 /**
@@ -333,5 +336,177 @@ describe('AHR snapshot routes (story 11.12)', () => {
       assert.ok(res.json().error.message.includes('expansion intent'), req.url)
     }
     assert.equal(mutatingCalls().length, 0)
+  })
+})
+
+/**
+ * Story cr.38 session A — the snapshot verbs on the guard (WAVE3-DESIGN §2.3
+ * "snapshot create / delete / rollback": every gate request-time only; the
+ * rollback had no system-pool gate). The confirmed job is held behind four
+ * placeholder jobs, the node's state changes, the slots are released: the
+ * job refuses and nothing mutates.
+ *
+ * Flips: the LIO tree is the captured `iscsi/configfs-restore-empty.manifest`
+ * at the confirm and `iscsi/configfs-live.manifest` with its fileio image
+ * re-pointed onto the pool's mountpoint in the job; the mount table is this
+ * suite's own `tank` row, moved to `/var` (a system path); the snapshot list
+ * is this suite's plain list without `nightly`; the intent is the daemon's own
+ * file.
+ */
+describe('cr.38 — the AHR snapshot verbs re-gate in the job (ruling (j))', () => {
+  const ISCSI_FIXTURES = join(fileURLToPath(new URL('.', import.meta.url)), '../../fixtures/iscsi')
+  const LIO_NO_LUNS = readFileSync(join(ISCSI_FIXTURES, 'configfs-restore-empty.manifest'), 'utf-8')
+  const LIO_LUN_ON_TANK = readFileSync(join(ISCSI_FIXTURES, 'configfs-live.manifest'), 'utf-8')
+    .replace('udev_path = /gtiscsi/images/lun2.raw', 'udev_path = /mnt/anas-ahr/tank/images/lun2.raw')
+  const LIST_WITHOUT_NIGHTLY = SUBVOL_LIST_ALL.replace('ID 258 gen 42 top level 257 path @snapshots/nightly\n', '')
+
+  let dir: string
+  let runtimeDir: string
+  let configfs: string
+  let executor: MockExecutor
+  let jobQueue: JobQueue
+  let server: ReturnType<typeof Fastify>
+  /** Overrides for the flippable reads (null: the suite's own fixture). */
+  let findmnt: string | null = null
+  let subvolList: string | null = null
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-cr38-snap-'))
+    runtimeDir = join(dir, 'run')
+    configfs = join(dir, 'target')
+    findmnt = null
+    subvolList = null
+  })
+  afterEach(async () => {
+    await server.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  async function build() {
+    await materializeConfigfsManifest(LIO_NO_LUNS, configfs)
+    executor = buildExecutor()
+    const orig = executor.exec.bind(executor)
+    executor.exec = async (command, args, opts) => {
+      if (command === '/usr/bin/findmnt' && findmnt !== null && args.join(' ') === AHR_FINDMNT_ARGS.join(' '))
+        return { stdout: findmnt, stderr: '', exitCode: 0 }
+      if (command === '/usr/bin/btrfs' && subvolList !== null && args.join(' ') === 'subvolume list /mnt/anas-ahr/tank')
+        return { stdout: subvolList, stderr: '', exitCode: 0 }
+      return orig(command, args, opts)
+    }
+    jobQueue = new JobQueue()
+    server = Fastify({ logger: false })
+    await server.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await server.register(ahrSnapshotRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      confirmStore: new ConfirmStore(),
+      intentDir: join(dir, 'intent'),
+      subvolRuntimeDir: runtimeDir,
+      iscsiPaths: {
+        configfsRoot: configfs,
+        saveconfigPath: join(dir, 'absent-saveconfig.json'),
+        pveStorageCfg: join(dir, 'absent-storage.cfg'),
+        blockRoot: join(dir, 'absent-block'),
+      },
+    })
+  }
+
+  /** What would mean a snapshot verb acted. */
+  function mutating(): { command: string, args: string[] }[] {
+    return executor.calls.filter(c =>
+      c.command === '/usr/bin/mv'
+      || c.command === '/usr/bin/umount'
+      || (c.command === '/usr/bin/btrfs' && c.args[0] === 'subvolume' && ['snapshot', 'delete', 'create'].includes(c.args[1])))
+  }
+
+  /** Hold the four slots, send the request (with a confirm round when `confirm`), return the queued job. */
+  async function queued(method: 'POST' | 'DELETE', url: string, confirm: boolean): Promise<{ id: string, release: () => void }> {
+    let code: string | undefined
+    if (confirm) {
+      const first = await server.inject({ method, url, headers: JSON_HEADERS, payload: '{}' })
+      assert.equal(first.statusCode, 409, first.body)
+      code = first.headers['x-anas-confirm-code'] as string
+    }
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (let i = 0; i < 4; i++)
+      jobQueue.submit('test.hold', { user: 'test', uid: 0 }, () => held)
+    const res = await server.inject({ method, url, headers: code ? { ...JSON_HEADERS, 'x-anas-confirm': code } : JSON_HEADERS, payload: '{}' })
+    assert.equal(res.statusCode, 202, res.body)
+    const id = res.json().job.id as string
+    assert.equal(jobQueue.get(id)?.status, 'queued')
+    return { id, release }
+  }
+
+  async function refused(id: string, release: () => void, code: string, message: RegExp): Promise<void> {
+    release()
+    const job = await waitForJob(jobQueue, id)
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    assert.equal(job.error?.code, code, JSON.stringify(job.error))
+    assert.match(job.error!.message, message)
+    assert.deepEqual(mutating(), [], 'no mutating argv')
+  }
+
+  const ROLLBACK = '/v1/ahr/tank/snapshots/nightly/rollback'
+
+  it('control: with nothing changed the held rollback runs and swaps', async () => {
+    await build()
+    const { id, release } = await queued('POST', ROLLBACK, true)
+    release()
+    const job = await waitForJob(jobQueue, id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(mutating().length > 0)
+  })
+
+  it('rollback: a LUN that appears between the confirm and the job refuses it — no mutating argv', async () => {
+    await build()
+    const { id, release } = await queued('POST', ROLLBACK, true)
+    await rm(configfs, { recursive: true, force: true })
+    await materializeConfigfsManifest(LIO_LUN_ON_TANK, configfs)
+    await refused(id, release, 'CONFLICT', /^Rolling back AHR pool 'tank' is refused: it is held by iSCSI LUN/)
+  })
+
+  it('rollback: the pool mounted at a system path between the confirm and the job refuses it (cr.38 adds the gate) — no mutating argv', async () => {
+    await build()
+    const { id, release } = await queued('POST', ROLLBACK, true)
+    findmnt = findmntJson('subvolid=256,subvol=/@data').replace('"target":"/mnt/anas-ahr/tank"', '"target":"/var"')
+    assert.match(findmnt, /"target":"\/var"/)
+    await refused(id, release, 'CONFLICT', /mounted at \/var — ANAS never destroys or remounts a system pool/)
+  })
+
+  it('rollback: an expansion intent that appears between the confirm and the job refuses it — no mutating argv', async () => {
+    await build()
+    const { id, release } = await queued('POST', ROLLBACK, true)
+    await writeIntent('tank', mkIntent('halted'), { dir: join(dir, 'intent') })
+    await refused(id, release, 'CONFLICT', /has an expansion intent \(state 'halted'\)/)
+  })
+
+  it('rollback: the snapshot deleted between the confirm and the job fails it NOT_FOUND — no mutating argv', async () => {
+    await build()
+    const { id, release } = await queued('POST', ROLLBACK, true)
+    subvolList = LIST_WITHOUT_NIGHTLY
+    await refused(id, release, 'NOT_FOUND', /Snapshot 'nightly' not found in pool 'tank'/)
+  })
+
+  it('delete: the snapshot deleted elsewhere between the confirm and the job fails it NOT_FOUND — no mutating argv', async () => {
+    await build()
+    const { id, release } = await queued('DELETE', '/v1/ahr/tank/snapshots/nightly', true)
+    subvolList = LIST_WITHOUT_NIGHTLY
+    await refused(id, release, 'NOT_FOUND', /Snapshot 'nightly' not found/)
+  })
+
+  it('create: an expansion intent that appears while the job waits refuses it — no mutating argv', async () => {
+    await build()
+    const { id, release } = await queued('POST', '/v1/ahr/tank/snapshots', false)
+    await writeIntent('tank', mkIntent('running'), { dir: join(dir, 'intent') })
+    await refused(id, release, 'CONFLICT', /has an expansion intent \(state 'running'\)/)
+  })
+
+  it('the snapshot confirms sign the whole request — no presentation-only fields', () => {
+    assert.deepEqual(AHR_SNAPSHOT_DELETE_PRESENTATION_ONLY, {})
+    assert.deepEqual(AHR_SNAPSHOT_ROLLBACK_PRESENTATION_ONLY, {})
   })
 })

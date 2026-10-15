@@ -2,12 +2,16 @@ import type { AhrPool } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { LvmPv } from '../parsers/lvm-report.js'
+import type { GuardSpec } from '../safety/guard.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
 import { parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
+import { guardCheck, guarded, GuardRefusalError } from '../safety/guard.js'
+import { IdentityMismatchError } from '../safety/stable-id.js'
 import { cachedVgNames, notifyCacheRecoveryFailed, recoverFailedAhrCache } from './ahr-cache.js'
 import { resumeExpansion } from './ahr-expand-resume.js'
+import { ahrGuard } from './ahr-guard.js'
 import { isIntentStale, isOwnedArray, normalizeMdUuid, pinnedUuids, poolPvNames, readAhrPoolIdentity, readMdadmConfDoc } from './ahr-identity.js'
 import { defaultAhrIntentDir, listIntents, writeIntent } from './ahr-intent.js'
 import { ahrLvPath } from './ahr-paths.js'
@@ -291,34 +295,55 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
     // present but failed is described as failed, never as a device that is gone.
     const cause = pool.cache.deviceMissing === true ? 'missing' as const : 'failed' as const
     log(`ahr.boot pool=${pool.name} cache=failed cause=${cause} action=recover-before-mount`)
-    try {
-      const outcome = await recoverFailedAhrCache(
-        executor,
-        { pool, reason: cause },
-        message => log(`ahr.boot pool=${pool.name} rung=cache-recover progress=${message}`),
-        { log },
-      )
-      // The volume could not activate while the cache metadata was missing, so
-      // the pool is almost certainly down: activate it, then let fstab supply
-      // the spec and every option the pool's own line carries.
-      if (!pool.mounted) {
-        const vg = await executor.exec(VGCHANGE, ['-ay', pool.name])
-        log(`ahr.boot pool=${pool.name} rung=vgchange-ay result=${vg.exitCode === 0 ? 'ok' : `failed detail=${vg.stderr.trim()}`}`)
-        const mp = ahrLvPath(pool.name)
-        const mounted = await executor.exec(MOUNT, ['--', mp])
-        log(`ahr.boot pool=${pool.name} rung=mount result=${mounted.exitCode === 0 ? 'ok' : `failed detail=${mounted.stderr.trim()}`}`)
+
+    /** The rung on the pool as `target` reads it; throws (after logging and notifying) when it fails. */
+    const rung = async (target: AhrPool): Promise<void> => {
+      try {
+        const outcome = await recoverFailedAhrCache(
+          executor,
+          { pool: target, reason: cause },
+          message => log(`ahr.boot pool=${target.name} rung=cache-recover progress=${message}`),
+          { log },
+        )
+        // The volume could not activate while the cache metadata was missing, so
+        // the pool is almost certainly down: activate it, then let fstab supply
+        // the spec and every option the pool's own line carries.
+        if (!target.mounted) {
+          const vg = await executor.exec(VGCHANGE, ['-ay', target.name])
+          log(`ahr.boot pool=${target.name} rung=vgchange-ay result=${vg.exitCode === 0 ? 'ok' : `failed detail=${vg.stderr.trim()}`}`)
+          const mp = ahrLvPath(target.name)
+          const mounted = await executor.exec(MOUNT, ['--', mp])
+          log(`ahr.boot pool=${target.name} rung=mount result=${mounted.exitCode === 0 ? 'ok' : `failed detail=${mounted.stderr.trim()}`}`)
+        }
+        log(`ahr.boot pool=${target.name} rung=cache-recover uncached=${outcome.uncached} vgreduced=${outcome.vgReduced}`)
+        report.cacheRecovered.push(target.name)
       }
-      log(`ahr.boot pool=${pool.name} rung=cache-recover uncached=${outcome.uncached} vgreduced=${outcome.vgReduced}`)
-      report.cacheRecovered.push(pool.name)
+      catch (err) {
+        // The guard refusing (bands still down) lands here, and so does any LVM
+        // failure. Never fatal to the daemon; loud, because the pool is serving
+        // nothing until someone acts. The notification body is the shared one —
+        // the udev rung's event job announces the identical failure.
+        const message = err instanceof Error ? err.message : String(err)
+        log(`ahr.boot pool=${target.name} rung=cache-recover result=failed detail=${message}`)
+        await notifyCacheRecoveryFailed(executor, target.name, 'boot', message, cause)
+        throw err
+      }
     }
-    catch (err) {
-      // The guard refusing (bands still down) lands here, and so does any LVM
-      // failure. Never fatal to the daemon; loud, because the pool is serving
-      // nothing until someone acts. The notification body is the shared one —
-      // the udev rung's event job announces the identical failure.
-      const message = err instanceof Error ? err.message : String(err)
-      log(`ahr.boot pool=${pool.name} rung=cache-recover result=failed detail=${message}`)
-      await notifyCacheRecoveryFailed(executor, pool.name, 'boot', message, cause)
+
+    if (opts.jobQueue) {
+      // Story cr.38 (§4.4 "work outside the queue"): the rung is a JOB with
+      // the pool's key, like the udev rung's and an operator's detach — so it
+      // never runs beside a cache verb an operator submitted while the scan
+      // was still walking md (the socket serves before the scan ends), and
+      // the pool it acts on is the one the job reads under that key, still
+      // failed. The scan waits for it: the intent branch below reads the pool
+      // this rung may just have brought up.
+      await runCacheRungAsJob(executor, opts.jobQueue, intentDir, pool, rung, log).catch(() => {})
+    }
+    else {
+      // No queue injected (a request-less caller / legacy test): the rung runs
+      // in the scan, as it did before cr.38. The daemon always injects one.
+      await rung(pool).catch(() => {})
     }
     // Whatever happened, this pool's record is stale now.
     poolsByName = null
@@ -395,4 +420,81 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
   }
 
   return report
+}
+
+/** Synthetic identity of the boot cache rung's job (audit-traceable, like the re-attach's). */
+const BOOT_CACHE_IDENTITY = { user: 'system:boot-cache', uid: 0 } as const
+
+/**
+ * The boot cache rung as a JOB (story cr.38, WAVE3-DESIGN §4.4 "work outside
+ * the queue"): the DETACH operation (it is the same work, and the cache verbs'
+ * in-flight answer is keyed on that pair), the pool's key exclusive, and the
+ * guard's two doors — the scan's read is the first, the job re-reads the pool
+ * under the key and runs the rung only if it is the same pool and its cache
+ * still reads failed. Resolves when the rung succeeded; rejects when it
+ * failed (already logged and notified by the rung) or the guard refused
+ * (logged here).
+ */
+async function runCacheRungAsJob(
+  executor: CommandExecutor,
+  queue: JobQueue,
+  intentDir: string,
+  pool: AhrPool,
+  rung: (target: AhrPool) => Promise<void>,
+  log: (line: string) => void,
+): Promise<void> {
+  const guard = ahrGuard({ executor, intentDir, iscsiPaths: () => ({}) })
+  const spec: GuardSpec<AhrPool> = {
+    operation: 'ahr.cache.detach',
+    object: guard.poolView(pool.name, 'a boot cache recovery'),
+    gates: [
+      // The evidence, asked again on the pool each door reads: only `failed`
+      // is evidence enough to act on (see the rung's comment above).
+      async p => p.cache?.state === 'failed'
+        ? null
+        : { status: 409, code: 'STATE_CHANGED', message: `the read cache on AHR pool '${p.name}' reads '${p.cache?.state ?? 'absent'}' now — nothing to recover` },
+    ],
+    locks: async (p, bound) => guard.claims(p, bound, 'exclusive'),
+  }
+  const pre = await guardCheck(spec)
+  if ('refusal' in pre) {
+    log(`ahr.boot pool=${pool.name} rung=cache-recover result=skipped detail=${pre.refusal.message}`)
+    throw new GuardRefusalError(pre.refusal)
+  }
+
+  const handler = guarded(spec, pre, async (live) => {
+    await rung(live)
+    return { pool: live.name, recovered: true }
+  })
+  let failure: unknown = null
+  let settle!: () => void
+  const ended = new Promise<void>((resolve) => {
+    settle = resolve
+  })
+  const job = queue.submit(
+    'ahr.cache.detach',
+    { ...BOOT_CACHE_IDENTITY, params: { pool: pool.name, trigger: 'boot' } },
+    async (updateProgress, ctx) => {
+      try {
+        return await handler(updateProgress, ctx)
+      }
+      catch (err) {
+        failure = err
+        throw err
+      }
+      finally {
+        settle()
+      }
+    },
+    { locks: pre.locks },
+  )
+  log(`ahr.boot pool=${pool.name} rung=cache-recover job=${job.id}`)
+  await ended
+  if (failure !== null) {
+    // A guard refusal never reached the rung, so it is logged here; the
+    // rung's own failure was logged and notified inside it.
+    if (failure instanceof GuardRefusalError || failure instanceof IdentityMismatchError)
+      log(`ahr.boot pool=${pool.name} rung=cache-recover result=refused detail=${failure.message}`)
+    throw failure
+  }
 }

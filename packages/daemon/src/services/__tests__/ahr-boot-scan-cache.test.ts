@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
+import { JobQueue } from '../../jobs/queue.js'
 import { dmsetupStatusArgs } from '../../parsers/dmsetup.js'
 import { LSBLK_ARGS } from '../../parsers/lsblk.js'
 import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
@@ -378,5 +379,83 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
     const perl = broken.calls.find(c => c.command === '/usr/bin/perl')
     assert.ok(perl)
     assert.match(perl!.args[4], /Failed to uncache tank\/tank-vol\./)
+  })
+})
+
+/**
+ * Story cr.38 (WAVE3-DESIGN §4.4 "work outside the queue"): with the daemon's
+ * queue injected, the boot cache rung is a JOB — the detach operation, the
+ * pool's lock key, the pool re-read and the evidence re-asked under it — and
+ * never runs inline beside a cache verb an operator submitted while the scan
+ * was still walking md.
+ */
+describe('ahr-boot-scan branch (d) — the rung is a job with its keys (cr.38)', () => {
+  let dir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-cr38-boot-cache-'))
+    process.env.ANAS_MDADM_CONF = join(dir, 'mdadm.conf')
+    await writeFile(process.env.ANAS_MDADM_CONF, 'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa\n')
+  })
+  afterEach(async () => {
+    delete process.env.ANAS_MDADM_CONF
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('submits ahr.cache.detach (trigger boot), holds the pool\'s key while it acts, and recovers exactly as the inline rung did', async () => {
+    const inline = buildExecutor('missing')
+    await ahrBootScan(inline, { intentDir: dir, log: () => {} })
+
+    const executor = buildExecutor('missing')
+    const queue = new JobQueue()
+    const heldAtUncache: string[][] = []
+    const orig = executor.exec.bind(executor)
+    executor.exec = async (command, args, opts) => {
+      if (command === '/usr/sbin/lvconvert')
+        heldAtUncache.push(queue.heldLocks().map(l => `${l.key} ${l.mode}`))
+      return orig(command, args, opts)
+    }
+    const report = await ahrBootScan(executor, { intentDir: dir, log: () => {}, jobQueue: queue })
+    assert.deepEqual(report.cacheRecovered, ['tank'])
+
+    const jobs = queue.list().filter(j => j.operation === 'ahr.cache.detach')
+    assert.equal(jobs.length, 1)
+    assert.equal(jobs[0].status, 'completed', JSON.stringify(jobs[0].error))
+    assert.equal(jobs[0].createdBy, 'system:boot-cache')
+    // The suite's `vgs` carries no vg_uuid: the pool is locked by its name key (§4.2 fallback).
+    assert.deepEqual(heldAtUncache, [['ahrname:tank exclusive']])
+    assert.deepEqual(rungCalls(executor), rungCalls(inline), 'the same rung, in the same order')
+  })
+
+  it('a cache that is no longer failed when the job runs is left alone — the job refuses STATE_CHANGED, nothing uncached', async () => {
+    const missing = buildExecutor('missing')
+    const healthy = buildExecutor('healthy')
+    let healed = false
+    const executor = new MockExecutor()
+    executor.exec = async (command, args, opts) => (healed ? healthy : missing).exec(command, args, opts)
+    const queue = new JobQueue()
+    // Hold all four slots so the rung's job waits after the scan read the pool.
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (let i = 0; i < 4; i++)
+      queue.submit('test.hold', { user: 'test', uid: 0 }, () => held)
+    const lines: string[] = []
+    const scan = ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l), jobQueue: queue })
+    for (let i = 0; i < 400 && !queue.list().some(j => j.operation === 'ahr.cache.detach'); i++)
+      await new Promise(resolve => setTimeout(resolve, 5))
+    const job = queue.list().find(j => j.operation === 'ahr.cache.detach')
+    assert.equal(job?.status, 'queued')
+    // The SSD came back and dm-cache reads healthy again before the job ran.
+    healed = true
+    release()
+    const report = await scan
+    assert.deepEqual(report.cacheRecovered, [])
+    assert.equal(queue.get(job!.id)?.status, 'failed')
+    assert.equal(queue.get(job!.id)?.error?.code, 'STATE_CHANGED')
+    assert.deepEqual(rungCalls(missing), [], 'nothing acted before the heal')
+    assert.deepEqual(rungCalls(healthy), [], 'nothing acted after it')
+    assert.ok(lines.some(l => /rung=cache-recover result=refused/.test(l)), lines.join('\n'))
   })
 })

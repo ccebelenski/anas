@@ -14315,11 +14315,13 @@ function confirmDoorGuardChecks() {
   const ahrSrc = readFileSync(join(SRC, '39-ahr.js'), 'utf8')
   const ROUTES = join(SRC, '..', '..', 'daemon', 'src', 'routes')
 
-  // Every daemon route declaration, with whether its FILE calls confirmGate.
+  // Every daemon route declaration, with whether its FILE calls a confirm
+  // door: `confirmGate` or the guard's `guardConfirm` (cr.32; the AHR
+  // snapshot, spare and abandon verbs confirm only through it since cr.38).
   const gatedByPath = new Map()
   for (const file of readdirSync(ROUTES).filter(f => f.endsWith('.ts'))) {
     const text = readFileSync(join(ROUTES, file), 'utf8')
-    const gated = /confirmGate\(/.test(text.replace(/import[^\n]*confirmGate[^\n]*\n/, ''))
+    const gated = /\b(?:confirmGate|guardConfirm)\(/.test(text.replace(/import[^\n]*(?:confirmGate|guardConfirm)[^\n]*\n/g, ''))
     for (const m of text.matchAll(/server\.(post|delete|put)<[^>]*>\(\s*'([^']+)'/g)) {
       gatedByPath.set(`${m[1]} ${m[2].replace(/:[A-Za-z]+/g, ':p')}`, { file, gated })
     }

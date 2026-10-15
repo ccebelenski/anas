@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { Advisory, Gate, GuardReads, GuardSpec, Refusal } from '../safety/guard.js'
 import type { AhrLayoutDisk } from '../services/ahr-layout.js'
 import type { MirrorReconcileRefusal } from '../services/ahr-mirror-reconcile.js'
 import type { ParityRewriteRefusal } from '../services/ahr-parity-rewrite.js'
@@ -14,8 +15,10 @@ import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
 import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
 import { confirmGate } from '../safety/gate.js'
+import { ahrnameClaim, diskClaim, guardCheck, guardConfirm, guarded, mountClaim, sendRefusal } from '../safety/guard.js'
 import { changeAhrMountpoint, createAhrPool, remountAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
+import { AHR_LIO_UNREADABLE_KEY, AHR_LIO_UNREADABLE_WARNING, ahrGuard, ahrPoolHeldByLun } from '../services/ahr-guard.js'
 import { ahrNameOccupancy, isIntentStaleForPool } from '../services/ahr-identity.js'
 import { defaultAhrIntentDir, readIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
@@ -27,12 +30,12 @@ import { attributeScrub, pathExists, runningAhrCheck, scrubAhrPool } from '../se
 import { topLevelMountPath } from '../services/ahr-snapshots.js'
 import { AHR_FINDMNT_ARGS, readAhrPools } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
-import { createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
+import { createIscsiClaimCache, heldByLun } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
-import { poolReferenceKey, poolReferenceWarning, poolReferenceWarnings, readPoolReferences } from '../services/pool-references.js'
+import { normalizeMountpointPath } from '../services/mounts.js'
+import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
 import { mdSysPath, readMdAttrOrNull } from '../services/selfheal-io.js'
 import { readMdGeometry } from '../services/selfheal-map.js'
-import { ahrSystemMountRefusal, readSystemMountPools, systemMountPoolsFromJson } from '../services/system-mounts.js'
 import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
 
@@ -43,40 +46,18 @@ const VGS = '/usr/sbin/vgs'
 const TRAILING_SLASHES_RE = /\/+$/
 
 /**
- * Is an iSCSI LUN's image file living on this AHR pool (story iscsi.6)?
- *
- * A file on the btrfs volume IS the AHR block object — AHR's only backing kind
- * — so it is matched two ways: by the pool NAME (`classifyBacking` resolves an
- * AHR-hosted file onto its pool) and by the MOUNTPOINT (which still answers
- * when the pool could not be classified). `rm` of a backing file succeeds
- * silently and LIO keeps serving the unlinked inode (GT-40), so an unmount, a
- * destroy — or a rollback swapping `@data` out from under the file (issue #51)
- * — is data loss with no error anywhere.
- *
- * Module-scope (not a route closure) so routes/ahr-snapshots.ts's rollback
- * route runs the SAME check from the SAME helper — one source, one phrasing.
+ * The fields each short AHR verb's confirm leaves out of its signature (story
+ * cr.38, WAVE3-DESIGN §5.2 rule 1): none — every field of the validated
+ * request is signed. A test lists them, so adding one is a visible diff.
  */
-export async function ahrPoolHeldByLun(
-  executor: CommandExecutor,
-  iscsiPaths: IscsiPaths,
-  pool: { name: string, mountpoint: string, mounted: boolean },
-  cache = createIscsiClaimCache(executor, iscsiPaths),
-) {
-  const subject: { pool: string, path?: string } = { pool: pool.name }
-  if (pool.mounted && pool.mountpoint.startsWith('/'))
-    subject.path = pool.mountpoint
-  return heldByLun(cache, subject)
-}
+export const AHR_CREATE_PRESENTATION_ONLY: Record<string, string> = {}
+export const AHR_MOUNTPOINT_PRESENTATION_ONLY: Record<string, string> = {}
+export const AHR_REMOUNT_PRESENTATION_ONLY: Record<string, string> = {}
+export const AHR_DESTROY_PRESENTATION_ONLY: Record<string, string> = {}
 
-/**
- * The hard-409 body for a held pool — ONE shape (`CONFLICT` /
- * `reason: 'held-by-lun'`, no confirm bypass in the text) for every caller.
- * `heldByLunRefusal` writes the message; this shapes the response.
- */
-export function ahrHeldByLunConflict(what: string, action: string, held: IscsiHeldByLun) {
-  const refusal = heldByLunRefusal(what, action, held)
-  return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
-}
+// The LUN-held helpers live in ./ahr-guard.ts since cr.38 (the guard's LUN
+// gate is their caller too); re-exported so existing importers keep working.
+export { ahrHeldByLunConflict, ahrPoolHeldByLun } from '../services/ahr-guard.js'
 
 /**
  * The parity-rewrite confirm gate's LUN disclosure (seventh pass, F10), or no
@@ -383,11 +364,6 @@ const AHR_JOB_OPERATIONS = [
   'ahr.snapshot.rollback',
 ] as const
 
-/** The pool's array UUIDs, sorted — what a destroy confirm is bound to and the job re-checks. */
-function poolArrayUuids(pool: AhrPool): string[] {
-  return pool.arrays.map(a => a.uuid ?? `unknown:${a.band}`).sort()
-}
-
 /**
  * AHR mutation layer (Epic 11 + AHR, docs/AHR-DESIGN.md §4) — the CREATE /
  * DESTROY / SCRUB third of /v1/ahr:
@@ -471,6 +447,168 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     return parsed.data
   }
 
+  // -------------------------------------------------------------------------
+  // The short verbs' guard specs (story cr.38 session A, WAVE3-DESIGN §2.3,
+  // §3, ruling (j)). Create, mountpoint, remount and destroy each run ONE
+  // gate list at the route and again in the job against facts the job reads
+  // itself, and every job holds its lock keys (cr.33, §4.2) before it
+  // re-reads: `ahr:<vg uuid>` (the name key when the VG UUID is unreadable),
+  // the name key for create and destroy, the disks a verb writes, the path a
+  // verb mounts at.
+  // -------------------------------------------------------------------------
+
+  const guard = ahrGuard({ executor, intentDir, iscsiPaths: () => iscsiPaths, jobQueue })
+
+  /** `/etc/fstab`, once per guard run (the mountpoint gates of create and move share it). */
+  const fstabOnce = (reads: GuardReads) => reads.once('fstab', () => readConfig(fstabPath))
+
+  /**
+   * The MOUNTPOINT-COLLISION gates (§2.6, at both doors since cr.38): `mp` is
+   * not a live mountpoint and not claimed in fstab. The live table read keeps
+   * its fail-open shape (an unreadable table finds no collision — the
+   * system-pool gate is the one that fails closed on it); the job asks again,
+   * so an fstab line added while the job waited refuses before the wipe or the
+   * unmount instead of after it.
+   */
+  function mountpointCollisionGates<O>(mp: string): Gate<O>[] {
+    return [
+      async (_o, reads) => {
+        const res = await guard.reads.findmnt(reads)
+        const mounts = res.exitCode === 0 ? parseFindmnt(res.stdout) : []
+        return mounts.some(m => m.target === mp)
+          ? { status: 409, code: 'CONFLICT', message: `'${mp}' is already a mountpoint. Pick an unused path` }
+          : null
+      },
+      async (_o, reads) => hasMount(await fstabOnce(reads), mp)
+        ? { status: 409, code: 'CONFLICT', message: `'${mp}' is already claimed in fstab. Pick an unused path` }
+        : null,
+    ]
+  }
+
+  /** A pool that does not exist yet, with the disks it would be built on as the inventory reads them now. */
+  interface NewAhrPool {
+    name: string
+    /** The requested disks that are composable now, in the request's order. */
+    selected: (AhrLayoutDisk & { model: string | null })[]
+    /** One sentence per requested disk that is not (empty: all eligible). */
+    problems: string[]
+  }
+
+  /** The fresh layout for a selection, or the 400 that says why it cannot be built. */
+  function planCreate(o: NewAhrPool, tier: AhrCreateRequest['tier']): { layout: ReturnType<typeof planFreshLayout> } | { refusal: Refusal } {
+    let layout: ReturnType<typeof planFreshLayout>
+    try {
+      // kernelInfo() gates mixed logical block sizes: below the md floor the
+      // planner THROWS and lands as a 400 — before any confirm code is
+      // minted, and long before a disk is touched (§4).
+      layout = planFreshLayout(o.selected, tier, kernelInfo(kernelRelease))
+    }
+    catch (err) {
+      if (err instanceof AhrPlanError)
+        return { refusal: { status: 400, code: 'VALIDATION_ERROR', message: err.message } }
+      throw err
+    }
+    if (!layout.minDisksMet || layout.capacity.usableBytes === 0)
+      return { refusal: { status: 400, code: 'VALIDATION_ERROR', message: layout.warnings[0] ?? 'The disk selection cannot form a protected pool' } }
+    return { layout }
+  }
+
+  /**
+   * The create's guard spec (cr.38: "create binds disks, tier and
+   * mountpoint"). The name is the object (nothing else exists yet); its read
+   * resolves every requested disk against the live inventory, so the gate that
+   * judges the selection and the job body that wipes it see the same answer,
+   * and the body never wipes a disk only the route read. Gates, in the route's
+   * order: the name is free (pool, VG, occupancy), the mountpoint is free, every
+   * disk is composable, the layout is buildable.
+   */
+  function createSpec(req: { name: string, tier: AhrCreateRequest['tier'], disks: string[], mountpoint?: string }): GuardSpec<NewAhrPool> {
+    return {
+      operation: 'ahr.create',
+      object: {
+        what: `AHR pool '${req.name}'`,
+        read: async (reads) => {
+          // Resolve every disk against the live inventory — only status
+          // 'available' is eligible (GT-12: these exclusions are
+          // safety-critical, not cosmetic). logicalSectorSize rides along: a
+          // mixed 4Kn/512e selection gives the bands differing logical block
+          // sizes, which the LVM stack must be told to accept (issue #8).
+          const inventory = await reads.once('inventory', () => collectDisks(executor, diskIdentityCache))
+          const problems: string[] = []
+          const selected: NewAhrPool['selected'] = []
+          for (const id of req.disks) {
+            const disk = inventory.find(d => d.id === id)
+            if (!disk) {
+              problems.push(`disk '${id}' not found`)
+              continue
+            }
+            if (!isComposableDisk(disk)) {
+              problems.push(disk.handsOff
+                ? `disk '${id}' is hands-off: ${disk.handsOffReason ?? disk.handsOff}`
+                : `disk '${id}' is not available (status: ${disk.status}${disk.poolName ? `, pool '${disk.poolName}'` : ''})`)
+              continue
+            }
+            selected.push({ id: disk.id, usableBytes: disk.size, logicalSectorSize: disk.logicalSectorSize, model: disk.model })
+          }
+          return { name: req.name, selected, problems }
+        },
+        id: async o => ({ name: o.name }),
+        unbound: () => `Could not bind the create of AHR pool '${req.name}'`,
+      },
+      gates: [
+        // Name collision: one AHR pool per name (also the VG name).
+        async (o, reads) => (await guard.reads.pools(reads)).some(p => p.name === o.name)
+          ? { status: 409, code: 'CONFLICT', message: `AHR pool '${o.name}' already exists` }
+          : null,
+        // VG-name collision: the pool name becomes the LVM VG name, and
+        // `vgcreate` runs only AFTER the disks are wiped — so naming a pool
+        // after an existing VG (e.g. 'pve', the PVE root VG) would pass
+        // confirm, wipe disks, then die at vgcreate leaving an orphaned
+        // half-stack. Fail CLOSED when vgs cannot be read (code review H6):
+        // 503 is the file's idiom for "cannot read state the operation
+        // depends on".
+        async (o, reads) => {
+          const vgsRes = await reads.once('vgs', () => executor.exec(VGS, VGS_ARGS))
+          if (vgsRes.exitCode !== 0)
+            return { status: 503, code: 'UNAVAILABLE', message: `cannot read LVM volume groups (vgs: ${vgsRes.stderr.trim().split('\n')[0] || 'no stderr'}) — refusing to create a pool whose VG name could not be checked against the existing volume groups` }
+          return parseVgsReport(vgsRes.stdout).some(v => v.name === o.name)
+            ? { status: 409, code: 'CONFLICT', message: `an LVM volume group named '${o.name}' already exists. The pool name becomes its VG name, so vgcreate would fail after the disks were wiped. Choose another name` }
+            : null
+        },
+        // Name occupancy (story ident.3, identity audit #4): a live md array
+        // named `<name>-r<N>` (anyone's), an mdadm.conf pin, or a partition
+        // labelled for the name would make the new pool's identity ambiguous
+        // from its first minute.
+        async (o) => {
+          const occupied = await ahrNameOccupancy(executor, o.name, { mdadmConfPath })
+          return occupied.length > 0
+            ? { status: 409, code: 'CONFLICT', message: `the name '${o.name}' is already in use on this node: ${occupied.join('; ')}. Choose another name` }
+            : null
+        },
+        // The mountpoint override (§2.6) must not shadow or fight anything
+        // that exists — at the route and again right before the wipe.
+        ...(req.mountpoint !== undefined ? mountpointCollisionGates<NewAhrPool>(req.mountpoint) : []),
+        async o => o.problems.length > 0
+          ? { status: 400, code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${o.problems.join('; ')}` }
+          : null,
+        // The layout is buildable (the same §2.1 math the create job runs).
+        async (o) => {
+          const planned = planCreate(o, req.tier)
+          return 'refusal' in planned ? planned.refusal : null
+        },
+      ],
+      locks: async () => {
+        const disks = [...new Set(req.disks)]
+        disks.sort()
+        return [
+          ahrnameClaim(req.name),
+          ...(req.mountpoint !== undefined ? [mountClaim(normalizeMountpointPath(req.mountpoint))] : []),
+          ...disks.map(id => diskClaim(id)),
+        ]
+      },
+    }
+  }
+
   // --- POST /ahr — create pool (WIPES the selected disks) -------------------
   server.post('/ahr', async (request, reply) => {
     const parsed = AhrCreateRequest.safeParse(request.body ?? {})
@@ -484,125 +622,43 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!identity)
       return
 
-    // Name collision: one AHR pool per name (also the VG name).
-    if ((await readAhrPools(executor)).some(p => p.name === req.name)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${req.name}' already exists` } }
-    }
-
-    // VG-name collision (pre-flight, BEFORE the confirm gate): the pool name
-    // becomes the LVM VG name, and `vgcreate` runs only AFTER the disks are
-    // wiped — so naming a pool after an existing VG (e.g. 'pve', the PVE root
-    // VG) would pass confirm, wipe disks, then die at vgcreate leaving an
-    // orphaned half-stack. Refuse now, while nothing has been touched. Fail
-    // CLOSED when vgs cannot be read (code review H6): proceeding on an
-    // unreadable answer could wipe disks under a name another VG already
-    // carries. 503 is the file's idiom for "cannot read state the operation
-    // depends on" (the dataset routes' failed-lookup pattern).
-    const vgsRes = await executor.exec(VGS, VGS_ARGS)
-    if (vgsRes.exitCode !== 0) {
-      reply.code(503)
-      return { error: { code: 'UNAVAILABLE', message: `cannot read LVM volume groups (vgs: ${vgsRes.stderr.trim().split('\n')[0] || 'no stderr'}) — refusing to create a pool whose VG name could not be checked against the existing volume groups` } }
-    }
-    if (parseVgsReport(vgsRes.stdout).some(v => v.name === req.name)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `an LVM volume group named '${req.name}' already exists. The pool name becomes its VG name, so vgcreate would fail after the disks were wiped. Choose another name` } }
-    }
-
-    // Name occupancy (story ident.3, identity audit #4): a live md array named
-    // `<name>-r<N>` (anyone's), an mdadm.conf pin, or a partition labelled for
-    // the name would make the new pool's identity ambiguous from its first
-    // minute — the merge the topology read and destroy now refuse. 409 before
-    // the confirm; the job asks again before the first wipe.
-    const occupied = await ahrNameOccupancy(executor, req.name, { mdadmConfPath })
-    if (occupied.length > 0) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `the name '${req.name}' is already in use on this node: ${occupied.join('; ')}. Choose another name` } }
-    }
-
-    // Mountpoint override (§2.6): never in PVE's namespace, never a path that
-    // is already mounted or claimed in fstab — the pool must not shadow or
-    // fight anything that exists.
+    // Request-only (WAVE3-DESIGN §3.2: about the value typed, not the node):
+    // never in PVE's namespace, never `/`.
+    let mountpoint: string | undefined
     if (req.mountpoint !== undefined) {
       const mp = req.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
       if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
         reply.code(400)
         return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${req.mountpoint}' is reserved. /mnt/pve belongs to PVE, and / is not a pool mountpoint` } }
       }
-      const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
-      const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
-      if (mounts.some(m => m.target === mp)) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', message: `'${mp}' is already a mountpoint. Pick an unused path` } }
-      }
-      if (hasMount(await readConfig(fstabPath), mp)) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab. Pick an unused path` } }
-      }
-      req.mountpoint = mp
+      mountpoint = mp
     }
 
-    // Resolve every disk against the live inventory — only status 'available'
-    // is eligible (GT-12: these exclusions are safety-critical, not cosmetic).
-    const inventory = await collectDisks(executor, diskIdentityCache)
-    const problems: string[] = []
-    // logicalSectorSize rides along: a mixed 4Kn/512e selection gives the bands
-    // differing logical block sizes, which the LVM stack must be told to accept
-    // (issue #8). The planner labels it; nothing here refuses it.
-    const selected: (AhrLayoutDisk & { model: string | null })[] = []
-    for (const id of req.disks) {
-      const disk = inventory.find(d => d.id === id)
-      if (!disk) {
-        problems.push(`disk '${id}' not found`)
-        continue
-      }
-      if (!isComposableDisk(disk)) {
-        problems.push(disk.handsOff
-          ? `disk '${id}' is hands-off: ${disk.handsOffReason ?? disk.handsOff}`
-          : `disk '${id}' is not available (status: ${disk.status}${disk.poolName ? `, pool '${disk.poolName}'` : ''})`)
-        continue
-      }
-      selected.push({ id: disk.id, usableBytes: disk.size, logicalSectorSize: disk.logicalSectorSize, model: disk.model })
-    }
-    if (problems.length > 0) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${problems.join('; ')}` } }
-    }
-
-    // Validate the layout is buildable before gating (the same §2.1 math the
-    // create job will execute).
-    let layout: ReturnType<typeof planFreshLayout>
-    try {
-      // kernelInfo() gates mixed logical block sizes: below the md floor this
-      // THROWS and lands as the 400 below — before any confirm code is minted,
-      // and long before a disk is touched (§4).
-      layout = planFreshLayout(selected, req.tier, kernelInfo(kernelRelease))
-    }
-    catch (err) {
-      if (err instanceof AhrPlanError) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: err.message } }
-      }
-      throw err
-    }
-    if (!layout.minDisksMet || layout.capacity.usableBytes === 0) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: layout.warnings[0] ?? 'The disk selection cannot form a protected pool' } }
-    }
+    const spec = createSpec({ name: req.name, tier: req.tier, disks: req.disks, mountpoint })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const planned = planCreate(pre.object, req.tier)
+    if ('refusal' in planned)
+      return sendRefusal(reply, planned.refusal)
 
     // Confirm gate (Principle 14): the CONCRETE consequence — every disk that
-    // will be wiped, by id + model + size.
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'ahr.create',
-      params: { name: req.name },
-      message: `Creating AHR pool '${req.name}' will WIPE ${selected.length} disk(s). All data on them will be permanently erased`,
+    // will be wiped, by id + model + size. Story cr.38: the code signs the
+    // whole validated request — the name, the tier, the disks and the
+    // mountpoint — so a resend that picks other disks, another tier or
+    // another path answers 409 CONFIRM_SCOPE_CHANGED instead of wiping disks
+    // the operator never saw listed.
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { name: req.name, tier: req.tier, disks: req.disks, mountpoint: mountpoint ?? null },
+      address: ['name'],
+      presentationOnly: AHR_CREATE_PRESENTATION_ONLY,
+      message: `Creating AHR pool '${req.name}' will WIPE ${pre.object.selected.length} disk(s). All data on them will be permanently erased`,
       warnings: [
-        ...selected.map(d => `${d.id} (${d.model ?? 'unknown model'}, ${fmtBytes(d.usableBytes)}) will be completely erased`),
+        ...pre.object.selected.map(d => `${d.id} (${d.model ?? 'unknown model'}, ${fmtBytes(d.usableBytes)}) will be completely erased`),
         // Geometry advisories the planner raised — the mixed 4Kn/512e label
         // (issue #8) belongs in front of the operator BEFORE the wipe, not as a
-        // post-wipe job failure. The layout's own capacity warnings already ride
-        // the composer preview; only the sector-geometry one is confirm-worthy.
-        ...layout.warnings.filter(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX)),
+        // post-wipe job failure. Only the sector-geometry one is confirm-worthy.
+        ...planned.layout.warnings.filter(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX)),
       ],
     })) {
       return reply
@@ -610,16 +666,19 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
 
     const job = jobQueue.submit(
       'ahr.create',
-      { ...identity, params: { name: req.name, tier: req.tier, disks: req.disks, mountpoint: req.mountpoint ?? null } },
-      async updateProgress => createAhrPool(
+      { ...identity, params: { name: req.name, tier: req.tier, disks: req.disks, mountpoint: mountpoint ?? null } },
+      guarded(spec, pre, async (fresh, { updateProgress }) => createAhrPool(
         executor,
-        { name: req.name, tier: req.tier, disks: selected, mountpoint: req.mountpoint },
+        // The disks as the job's own inventory read resolved them (sizes and
+        // sector geometry read now, never the route's).
+        { name: req.name, tier: req.tier, disks: fresh.selected, mountpoint },
         updateProgress,
         // diskCache: the job re-checks every disk is STILL available before
         // the first wipe (ident.3 (a)); intentDir: an orphan intent under the
         // new name is cleared before anything is built (ident.3 (d)).
         { fstabPath, mdadmConfPath, mountBase, diskCache: diskIdentityCache, intentDir },
-      ),
+      )),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -640,44 +699,42 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!identity)
       return
 
-    const pool = (await readAhrPools(executor)).find(p => p.name === name)
-    if (!pool) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
-    }
-
+    // Request-only (about the value typed): never PVE's namespace, never `/`.
     const mp = parsed.data.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
     if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${parsed.data.mountpoint}' is reserved. /mnt/pve belongs to PVE, and / is not a pool mountpoint` } }
     }
-    if (mp === pool.mountpoint) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `'${mp}' is already this pool's mountpoint` } }
-    }
-    const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
-    const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
-    if (mounts.some(m => m.target === mp)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `'${mp}' is already a mountpoint. Pick an unused path` } }
-    }
-    if (hasMount(await readConfig(fstabPath), mp)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab. Pick an unused path` } }
-    }
 
-    // Story iscsi.6: moving the mountpoint UNMOUNTS the filesystem, which pulls
-    // the image file out from under a live LIO backstore. A hard 409 with no
-    // confirm bypass — "unsafe now", before anything is touched.
-    const moveHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool)
-    if (moveHeld) {
-      reply.code(409)
-      return ahrHeldByLunConflict(`the mountpoint of AHR pool '${name}'`, 'Changing', moveHeld)
-    }
-
-    if (!confirmGate(confirmStore, request, reply, {
+    // Story cr.38 (§2.3 "mountpoint": every gate was request-time only, and
+    // there was no system-pool gate). One gate list at both doors: not
+    // already this pool's mountpoint, the target free (live mount, fstab), the
+    // system-pool hard 409 (cr.23 — the move unmounts the pool), and the
+    // LUN-held hard 409 (iscsi.6 — the move pulls an image file out from
+    // under a live LIO backstore). The job holds the pool's key and the target
+    // path's `mount:` key.
+    const spec: GuardSpec<AhrPool> = {
       operation: 'ahr.mountpoint',
-      params: { name, mountpoint: mp },
+      object: guard.poolView(name, 'a mountpoint change'),
+      gates: [
+        async pool => mp === pool.mountpoint
+          ? { status: 400, code: 'VALIDATION_ERROR', message: `'${mp}' is already this pool's mountpoint` }
+          : null,
+        ...mountpointCollisionGates<AhrPool>(mp),
+        guard.systemPoolGate,
+        guard.lunGate('Changing', pool => `the mountpoint of AHR pool '${pool.name}'`),
+      ],
+      locks: async (pool, bound) => guard.claims(pool, bound, 'exclusive', { extra: [mountClaim(normalizeMountpointPath(mp))] }),
+    }
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const pool = pre.object
+
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { name, mountpoint: mp },
+      address: ['name'],
+      presentationOnly: AHR_MOUNTPOINT_PRESENTATION_ONLY,
       message: `Moving pool '${name}' from '${pool.mountpoint}' to '${mp}' briefly unmounts it`,
       warnings: [
         `Anything serving from '${pool.mountpoint}' (shares, backups, mounts) stops working until re-pointed at '${mp}'`,
@@ -690,13 +747,16 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const job = jobQueue.submit(
       'ahr.mountpoint',
       { ...identity, params: { name, mountpoint: mp } },
-      async updateProgress => changeAhrMountpoint(
+      // The pool as the job read it: its mountpoint and mount state NOW, never
+      // the route's (an unmount between the two is not the job's to undo).
+      guarded(spec, pre, async (live, { updateProgress }) => changeAhrMountpoint(
         executor,
-        { name: pool.name, mountpoint: pool.mountpoint, mounted: pool.mounted, subvolLayout: pool.subvolLayout },
+        { name: live.name, mountpoint: live.mountpoint, mounted: live.mounted, subvolLayout: live.subvolLayout },
         mp,
         updateProgress,
         { fstabPath },
-      ),
+      )),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -719,13 +779,15 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
    * clients, a backup mid-run, a job reading a file — and a machine does not get
    * to decide that on someone's behalf. The confirm gate says exactly that.
    *
-   * Three doors before the gate, cheapest first:
+   * Four gates, at the route and again in the job (cr.38), cheapest first:
    *  - not mounted read-only ⇒ 409. There is nothing to remount, and running an
    *    unmount/mount cycle "just in case" would cost the handles for nothing.
    *  - the read cache is still FAILED ⇒ 409. Every read on the pool returns EIO
    *    while the dead cache is in front of it (GT-19), so a remount would land
    *    a filesystem that cannot serve a byte and btrfs would force it read-only
    *    again on the first error. Uncache first — the message says so.
+   *  - a system pool ⇒ hard 409 (cr.23: the unmount pulls whatever the pool
+   *    holds at a system path away from the running node).
    *  - a LUN holds the pool ⇒ hard 409, no confirm bypass. The unmount pulls the
    *    image file out from under a live LIO backstore, which is the same rule
    *    destroy and change-mount already apply (iscsi.6).
@@ -739,53 +801,47 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!identity)
       return
 
-    const pool = (await readAhrPools(executor)).find(p => p.name === name)
-    if (!pool) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
-    }
-
-    if (!pool.mountedReadOnly) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: pool.mounted
-        ? `AHR pool '${name}' is mounted read-write — there is nothing to remount. Remount exists to clear a btrfs forced-readonly filesystem, which is what an I/O error leaves behind`
-        : `AHR pool '${name}' is not mounted, so there is nothing to remount. Bring the pool online first — see the Hybrid RAID view` } }
-    }
-
-    // The dead cache must go FIRST. Remounting over it lands a filesystem that
-    // returns EIO on every read, and btrfs forces it read-only again on the
-    // first error — the operator would have broken every open handle to arrive
-    // exactly where they started.
-    if (pool.cache?.state === 'failed') {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message:
-        `AHR pool '${name}' still has a FAILED read cache in front of its volume: every read returns an I/O error until the cache is removed, `
-        + `and a remount would be forced read-only again by the first one. Detach the cache first (no data is lost — a writethrough cache holds no only copy), then Remount` } }
-    }
-
-    // Story cr.23: the system-pool rule (same one destroy asks — an AHR pool
-    // has no boot facts, the live mount table is the whole answer). The
-    // unmount pulls whatever the pool holds at a system path away from the
-    // running node; an unreadable table is treated as a system pool.
-    const mountFacts = await readSystemMountPools(executor, AHR_FINDMNT_ARGS)
-    const systemPoolRefusal = ahrSystemMountRefusal(name, mountFacts)
-    if (systemPoolRefusal) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: systemPoolRefusal.reason, message: systemPoolRefusal.message } }
-    }
-
-    const remountHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool)
-    if (remountHeld) {
-      reply.code(409)
-      return ahrHeldByLunConflict(`AHR pool '${name}'`, 'Remounting', remountHeld)
-    }
-
-    if (!confirmGate(confirmStore, request, reply, {
+    const spec: GuardSpec<AhrPool> = {
       operation: 'ahr.remount',
-      params: { name },
+      object: guard.poolView(name, 'a remount'),
+      gates: [
+        async pool => !pool.mountedReadOnly
+          ? {
+              status: 409,
+              code: 'CONFLICT',
+              message: pool.mounted
+                ? `AHR pool '${pool.name}' is mounted read-write — there is nothing to remount. Remount exists to clear a btrfs forced-readonly filesystem, which is what an I/O error leaves behind`
+                : `AHR pool '${pool.name}' is not mounted, so there is nothing to remount. Bring the pool online first — see the Hybrid RAID view`,
+            }
+          : null,
+        // The dead cache must go FIRST. Remounting over it lands a filesystem
+        // that returns EIO on every read, and btrfs forces it read-only again
+        // on the first error — the operator would have broken every open
+        // handle to arrive exactly where they started.
+        async pool => pool.cache?.state === 'failed'
+          ? {
+              status: 409,
+              code: 'CONFLICT',
+              message: `AHR pool '${pool.name}' still has a FAILED read cache in front of its volume: every read returns an I/O error until the cache is removed, `
+                + `and a remount would be forced read-only again by the first one. Detach the cache first (no data is lost — a writethrough cache holds no only copy), then Remount`,
+            }
+          : null,
+        guard.systemPoolGate,
+        guard.lunGate('Remounting'),
+      ],
+      locks: async (pool, bound) => guard.claims(pool, bound, 'exclusive'),
+    }
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { name },
+      address: ['name'],
+      presentationOnly: AHR_REMOUNT_PRESENTATION_ONLY,
       message: `Remounting pool '${name}' unmounts and mounts its filesystem`,
       warnings: [
-        `Open share handles break: '${pool.mountpoint}' is unmounted and mounted again, and anything holding a file open on it — SMB and NFS clients, a backup mid-run, a running job — loses it`,
+        `Open share handles break: '${pre.object.mountpoint}' is unmounted and mounted again, and anything holding a file open on it — SMB and NFS clients, a backup mid-run, a running job — loses it`,
         'This is the only way back: btrfs refuses `mount -o remount,rw` after an I/O error, so a plain remount cannot clear the read-only flag',
         'Fix the cause first if you have not: a pool that is read-only again after this has an error it is still meeting',
       ],
@@ -796,11 +852,46 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const job = jobQueue.submit(
       'ahr.remount',
       { ...identity, params: { name } },
-      async updateProgress => remountAhrPool(executor, { name: pool.name, mountpoint: pool.mountpoint }, updateProgress),
+      guarded(spec, pre, async (live, { updateProgress }) => remountAhrPool(executor, { name: live.name, mountpoint: live.mountpoint }, updateProgress)),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
   })
+
+  /**
+   * Destroy's own gate beside the shared ones: an expansion being DRIVEN
+   * right now (story ident.3 (d)) — a running reshape is mid-flight on these
+   * very arrays. This pool's intent only: a stale one (an earlier namesake's)
+   * refuses nothing. An unreadable intent file reads as none, as it always
+   * has: the destroy clears the intent with the pool, and refusing over a
+   * corrupt file would leave the pool undestroyable.
+   */
+  const runningIntentGate: Gate<AhrPool> = async (pool) => {
+    const liveIntent = await readIntent(pool.name, intentDir).catch(() => null)
+    return liveIntent?.state === 'running' && !isIntentStaleForPool(liveIntent, pool)
+      ? { status: 409, code: 'CONFLICT', message: `AHR pool '${pool.name}' has an expansion being driven right now. Wait for it to finish or halt before destroying the pool` }
+      : null
+  }
+
+  /**
+   * What still references the pool (story cr.24) as the guard's advisories:
+   * one per reference and per unreadable source, plus the LIO-unreadable
+   * disclosure (D3: a broken claims read fail-opens to "nothing held", which
+   * a node genuinely serving a LUN would look exactly like). Warn, never
+   * refuse; the job reports any the confirm did not list.
+   */
+  async function destroyAdvisories(pool: AhrPool, reads: GuardReads): Promise<Advisory[]> {
+    const read = await ahrPoolReferences(pool)
+    const advisories: Advisory[] = []
+    if (await (await guard.reads.claims(reads)).readFailed())
+      advisories.push({ key: AHR_LIO_UNREADABLE_KEY, warning: AHR_LIO_UNREADABLE_WARNING })
+    advisories.push(
+      ...read.refs.map(ref => ({ key: `ref:${poolReferenceKey(ref)}`, warning: poolReferenceWarning(ref) })),
+      ...read.unreadableSources.map(src => ({ key: `unreadable:${src.kind}`, warning: poolUnreadableWarning(src, pool.name) })),
+    )
+    return advisories
+  }
 
   // --- DELETE /ahr/:name — destroy pool --------------------------------------
   server.delete<{ Params: { name: string } }>('/ahr/:name', async (request, reply) => {
@@ -812,54 +903,37 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!identity)
       return
 
-    const pool = (await readAhrPools(executor)).find(p => p.name === name)
-    if (!pool) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
+    // Story cr.38 (§2.3 "destroy": in-flight, intent, system pool and LUN-held
+    // were request-time only). ONE gate list at both doors, every gate a hard
+    // 409 with no confirm bypass:
+    //  - nothing may still be working on the pool (ident.3 (d)): a queued or
+    //    running AHR job would be dequeued against whatever carries the name
+    //    once this pool is gone;
+    //  - no expansion is being driven;
+    //  - not a system pool (cr.23: the live mount table is an AHR pool's whole
+    //    answer; an unreadable table is a system pool);
+    //  - no LUN's image file lives on the pool (iscsi.6: every array,
+    //    partition and byte goes, including the file LIO is serving).
+    // The confirm is bound to the pool's IDENTITY (its array UUIDs and VG
+    // UUID, identity audit P1), and the job holds the pool's key, its name key
+    // and every disk it wipes. cr.31/31b's "gate before any act" and the
+    // fail-closed `lvs` stay inside `destroyAhrPool`, after these.
+    const spec: GuardSpec<AhrPool> = {
+      operation: 'ahr.destroy',
+      object: guard.poolView(name, 'a destroy'),
+      gates: [
+        guard.inFlightGate(AHR_JOB_OPERATIONS),
+        runningIntentGate,
+        guard.systemPoolGate,
+        guard.lunGate('Destroying'),
+      ],
+      advisories: destroyAdvisories,
+      locks: async (pool, bound) => guard.claims(pool, bound, 'exclusive', { namespace: true, disks: pool.disks.map(d => d.id) }),
     }
-
-    // Story ident.3 (d): nothing may still be working on the pool. A queued or
-    // running AHR job would be dequeued against whatever carries the name once
-    // this pool is gone — a recreated pool, or nothing at all — and a running
-    // expansion is mid-reshape on these very arrays. Hard 409, no confirm.
-    const busy = jobQueue.findActive(AHR_JOB_OPERATIONS, name, 'name') ?? jobQueue.findActive(AHR_JOB_OPERATIONS, name, 'pool')
-    if (busy) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' has a ${busy.operation} job in flight (job ${busy.id}). Wait for it to finish (or cancel it) before destroying the pool` } }
-    }
-    const liveIntent = await readIntent(name, intentDir).catch(() => null)
-    if (liveIntent?.state === 'running' && !isIntentStaleForPool(liveIntent, pool)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' has an expansion being driven right now. Wait for it to finish or halt before destroying the pool` } }
-    }
-
-    // Story cr.23: the system-pool rule — an AHR pool has no boot facts, so
-    // the live mount table is its whole answer. A pool with one of its own
-    // filesystems at a system path, or an unreadable table (fail closed: a
-    // missing fact may only tighten the gate), is never destroyed. Hard 409,
-    // no confirm bypass. ONE read: the submount warnings below consume it too.
-    const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
-    const systemPoolRefusal = ahrSystemMountRefusal(
-      name,
-      findmntRes.exitCode === 0 ? systemMountPoolsFromJson(findmntRes.stdout) : null,
-    )
-    if (systemPoolRefusal) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: systemPoolRefusal.reason, message: systemPoolRefusal.message } }
-    }
-
-    // Story iscsi.6: a LUN's image file on this pool makes the destroy unsafe
-    // NOW — every array, partition and byte goes, including the file LIO is
-    // serving, and nothing in ZFS/btrfs/md is going to refuse it. Hard 409, no
-    // confirm bypass, before the confirm code is minted.
-    // The cache is created HERE so the same read's failure bit can be
-    // disclosed at the confirm door below (D3).
-    const claimsCache = createIscsiClaimCache(executor, iscsiPaths)
-    const destroyHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool, claimsCache)
-    if (destroyHeld) {
-      reply.code(409)
-      return ahrHeldByLunConflict(`AHR pool '${name}'`, 'Destroying', destroyHeld)
-    }
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const pool = pre.object
 
     // Consumers under the mountpoint (submounts — shares/backups serving from
     // the pool stop with it). findmnt is the live truth.
@@ -873,8 +947,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         ? `The filesystem at '${pool.mountpoint}' will be unmounted: anything serving from it (shares, backups, mounts) stops working`
         : `The pool's filesystem is not mounted. An /etc/fstab line for its volume '${ahrLvPath(name)}' is removed with the pool`,
     ]
-    // cr.23: the table read above for the system-pool gate — same read feeds
-    // the consumer warnings (one read per request, Principle 11).
+    const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
     if (findmntRes.exitCode === 0) {
       for (const m of parseFindmnt(findmntRes.stdout)) {
         if (m.target.startsWith(`${pool.mountpoint}/`))
@@ -891,28 +964,15 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       warnings.push(`The read cache on ${pool.cache.devices.join(', ')} is removed with the pool: the ${fmtBytes(pool.cache.sizeBytes)} slice is wiped and the disk comes back available`)
     }
 
-    // Fail-open is not fail-silent (D3): a broken claims read looks exactly
-    // like a pool holding no LUNs, and the destroy takes the image file with
-    // it. Disclose; the hard 409 above is unchanged.
-    if (await claimsCache.readFailed()) {
-      warnings.push('ANAS could not check whether an iSCSI LUN is served from this pool. The LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
-    }
+    // Fail-open is not fail-silent (D3), and story cr.24: name what STILL
+    // references the pool — warn, never refuse (the guard's advisories). What
+    // the confirm listed is what the job compares against when it re-reads.
+    warnings.push(...pre.advisories.map(a => a.warning))
 
-    // Story cr.24: name what STILL references the pool — an SMB share, an NFS
-    // export, a backup/cloud/replication task, a snapshot/scrub schedule, a
-    // mount — warn, never refuse. What the confirm listed is what the job
-    // compares against when it re-reads.
-    const referencesRead = await ahrPoolReferences(pool)
-    warnings.push(...poolReferenceWarnings(referencesRead, name))
-    const confirmedReferenceKeys = new Set(referencesRead.refs.map(poolReferenceKey))
-
-    // The confirm is bound to the pool's IDENTITY (its array UUIDs), not just
-    // its name (identity audit P1): a code minted for this pool cannot destroy
-    // a different pool that carries the name by the time it is replayed.
-    const confirmedUuids = poolArrayUuids(pool)
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'ahr.destroy',
-      params: { name, arrays: confirmedUuids },
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { name },
+      address: ['name'],
+      presentationOnly: AHR_DESTROY_PRESENTATION_ONLY,
       message: `Destroying AHR pool '${name}' erases all of its data`,
       warnings,
     })) {
@@ -922,28 +982,16 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const job = jobQueue.submit(
       'ahr.destroy',
       { ...identity, params: { name } },
-      async (updateProgress) => {
-        // Job-time re-read (ident.3): the job may have waited in the queue.
-        // The pool it tears down must still be the one that was confirmed.
-        const live = (await readAhrPools(executor)).find(p => p.name === name)
-        if (!live)
-          throw new Error(`AHR pool '${name}' no longer exists — nothing was destroyed`)
-        if (poolArrayUuids(live).join(',') !== confirmedUuids.join(','))
-          throw new Error(`AHR pool '${name}' is not the pool that was confirmed (its arrays changed since) — nothing was destroyed. Review the pool and destroy it again`)
-
-        // Story cr.24 (ruling (j)): re-read what references the pool BEFORE
-        // the destroy, while it can still answer, and report anything the
-        // confirm did not list in the RESULT (never a failed job).
-        const freshReferences = await ahrPoolReferences(live)
-        const newRefWarnings = freshReferences.refs
-          .filter(ref => !confirmedReferenceKeys.has(poolReferenceKey(ref)))
-          .map(poolReferenceWarning)
-
+      guarded(spec, pre, async (live, { updateProgress, newAdvisories }) => {
+        // The guard re-read the pool (same identity), re-ran every gate and
+        // re-read the references before this line; references the confirm did
+        // not list ride the RESULT (cr.24 ruling (j): never a failed job).
         const result = await destroyAhrPool(executor, live, updateProgress, { fstabPath, mdadmConfPath, intentDir })
-        if (newRefWarnings.length > 0)
-          return { ...result, warnings: [...(result.warnings ?? []), ...newRefWarnings] }
+        if (newAdvisories.length > 0)
+          return { ...result, warnings: [...(result.warnings ?? []), ...newAdvisories] }
         return result
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }

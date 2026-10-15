@@ -1,10 +1,12 @@
 import type { AhrExpansionIntent, Job } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { isComposableDisk } from '@anas/shared'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
@@ -309,6 +311,9 @@ function buildExecutor(world: World): MockExecutor {
   executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: ok(BTRFS_USAGE) })
   executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: '', exitCode: 1 } })
   executor.addFixture({ command: '/usr/bin/perl', result: ok('') })
+  // cr.38: the attach's signature probe. A blank disk is `blkid -p`'s captured
+  // "nothing found": exit 2, no output (docs/BACKUP-RESTORE-GROUND-TRUTH.md).
+  executor.addFixture({ command: '/usr/sbin/blkid', result: { stdout: '', stderr: '', exitCode: 2 } })
   // Mutation plumbing — quiet success; the tests assert the ARGV, not effects.
   executor.addFixture({ command: '/usr/sbin/wipefs', result: ok('') })
   executor.addFixture({ command: '/usr/sbin/sgdisk', result: ok('') })
@@ -841,5 +846,219 @@ describe('AHR read-cache routes (story ahrcache.1)', () => {
         ],
       )
     })
+  })
+})
+
+/**
+ * Story cr.38 session A — the cache verbs on the guard (WAVE3-DESIGN §2.3
+ * "cache attach": eligibility, `requirePoolVg` before `vgextend`, intent and
+ * state request-time only; "cache detach / event": intent). The job is held
+ * behind four placeholder jobs, the node's state changes, the slots are
+ * released: the job refuses and nothing mutates.
+ *
+ * FIXTURES (ruling (l)): the signature `blkid -p` finds is the captured ext4
+ * probe line (fixtures/backup/img-restore-and-map.txt, `blkid -p /dev/loop0`)
+ * re-pointed at the picked disk's by-id path; "no signature" is the captured
+ * exit 2 with no output; the other worlds are this suite's own.
+ */
+describe('cr.38 — the AHR cache verbs re-gate in the job (ruling (j))', () => {
+  const CAPTURE = readFileSync(join(fileURLToPath(new URL('.', import.meta.url)), '../../fixtures/backup/img-restore-and-map.txt'), 'utf-8').split('\n')
+  const PROBE_LINE = CAPTURE[CAPTURE.indexOf('### $ blkid -p /dev/loop0') + 1]
+  const EXT4_ON_C = `${PROBE_LINE.replace('/dev/loop0:', `/dev/disk/by-id/${C}:`)}\n`
+
+  let dir: string
+  let jobQueue: JobQueue
+  let server: ReturnType<typeof Fastify>
+  /** The executor every call goes to now (a test swaps worlds while a job waits). */
+  let world: MockExecutor
+  let calls: { command: string, args: string[] }[]
+  /** `blkid -p` on the cache pick: null = the captured "nothing found". */
+  let blkid: { stdout: string, exitCode: number } | null = null
+  /** `pvs` unreadable from now on (fail-closed VG proof). */
+  let pvsBroken = false
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-cr38-cache-'))
+    blkid = null
+    pvsBroken = false
+  })
+  afterEach(async () => {
+    await server?.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  async function build(initial: World) {
+    world = buildExecutor(initial)
+    calls = []
+    const executor = new MockExecutor()
+    executor.exec = async (command, args, opts) => {
+      calls.push({ command, args })
+      if (command === '/usr/sbin/blkid' && blkid !== null)
+        return { stdout: blkid.stdout, stderr: '', exitCode: blkid.exitCode }
+      if (command === '/usr/sbin/pvs' && pvsBroken)
+        return { stdout: '', stderr: '  Failed to read physical volumes.\n', exitCode: 5 }
+      return world.exec(command, args, opts)
+    }
+    jobQueue = new JobQueue()
+    server = Fastify({ logger: false })
+    await server.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await server.register(ahrCacheRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache: new DiskIdentityCache(executor), intentDir: dir })
+  }
+
+  function mutations(): { command: string, args: string[] }[] {
+    return calls.filter(c => ['/usr/sbin/wipefs', '/usr/sbin/sgdisk', '/usr/sbin/pvcreate', '/usr/sbin/pvremove', '/usr/sbin/vgextend', '/usr/sbin/vgreduce', '/usr/sbin/lvcreate', '/usr/sbin/lvremove', '/usr/sbin/lvconvert'].includes(c.command))
+  }
+
+  /** Hold the four slots, send the request, return the queued job. */
+  async function queued(method: 'POST' | 'DELETE', url: string, payload?: object): Promise<{ id: string, release: () => void }> {
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (let i = 0; i < 4; i++)
+      jobQueue.submit('test.hold', { user: 'test', uid: 0 }, () => held)
+    const res = await server.inject({ method, url, headers: IDENTITY_HEADERS, ...(payload ? { payload } : {}) })
+    assert.equal(res.statusCode, 202, res.body)
+    const id = res.json().job.id as string
+    assert.equal(jobQueue.get(id)?.status, 'queued')
+    return { id, release }
+  }
+
+  async function refused(id: string, release: () => void, code: string, message: RegExp): Promise<void> {
+    release()
+    const job = await waitForJob(jobQueue, id)
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    assert.equal(job.error?.code, code, JSON.stringify(job.error))
+    assert.match(job.error!.message, message)
+    assert.deepEqual(mutations(), [], 'no mutating argv')
+  }
+
+  it('the captured probe line is what the signature fixture serves', () => {
+    assert.match(EXT4_ON_C, /^\/dev\/disk\/by-id\/ata-TANK_C: LABEL="GTIMGFS" .* TYPE="ext4" USAGE="filesystem"\n$/)
+  })
+
+  it('attach: a disk with a signature the inventory did not show is refused at the route — nothing touched', async () => {
+    await build('none')
+    blkid = { stdout: EXT4_ON_C, exitCode: 0 }
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/cache', headers: IDENTITY_HEADERS, payload: { disks: [C] } })
+    assert.equal(res.statusCode, 400, res.body)
+    assert.match(res.json().error.message, /disk 'ata-TANK_C' carries a signature \(TYPE=ext4, USAGE=filesystem\)/)
+    assert.ok(calls.some(c => c.command === '/usr/sbin/blkid' && c.args.join(' ') === `-p /dev/disk/by-id/${C}`), 'probed the device itself')
+    assert.deepEqual(mutations(), [])
+  })
+
+  // SYNTHETIC until captured: no `blkid -p` of a disk carrying only an empty
+  // GPT is checked in. The line follows the captured probe's format with the
+  // two partition-table keys blkid prints for a GPT disk; the node pass owes
+  // the real line (`blkid -p` on the cache SSD right after a detach).
+  it('attach: a bare partition table (what a detach leaves, GT-22) is not a refusing signature', async () => {
+    await build('none')
+    blkid = { stdout: `/dev/disk/by-id/${C}: PTUUID="00000000-0000-0000-0000-000000000000" PTTYPE="gpt"\n`, exitCode: 0 }
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/cache', headers: IDENTITY_HEADERS, payload: { disks: [C] } })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(jobQueue, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+  })
+
+  it('attach: an unreadable probe fails closed (409 unreadable) — nothing touched', async () => {
+    await build('none')
+    blkid = { stdout: '', exitCode: 4 }
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/cache', headers: IDENTITY_HEADERS, payload: { disks: [C] } })
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.reason, 'unreadable')
+    assert.deepEqual(mutations(), [])
+  })
+
+  it('attach: a signature written to the disk while the job waits refuses the job — no mutating argv', async () => {
+    await build('none')
+    const { id, release } = await queued('POST', '/v1/ahr/tank/cache', { disks: [C] })
+    blkid = { stdout: EXT4_ON_C, exitCode: 0 }
+    await refused(id, release, 'VALIDATION_ERROR', /carries a signature \(TYPE=ext4/)
+  })
+
+  it('attach: an expansion intent that appears while the job waits refuses it — no mutating argv', async () => {
+    await build('none')
+    const { id, release } = await queued('POST', '/v1/ahr/tank/cache', { disks: [C] })
+    await writeIntent('tank', mkIntent('halted'), { dir })
+    await refused(id, release, 'CONFLICT', /has an expansion intent \(state 'halted'\)/)
+  })
+
+  it('attach: a VG that can no longer be proven the pool\'s refuses BEFORE any slice or vgextend (requirePoolVg, fail closed)', async () => {
+    await build('none')
+    const { id, release } = await queued('POST', '/v1/ahr/tank/cache', { disks: [C] })
+    pvsBroken = true
+    release()
+    const job = await waitForJob(jobQueue, id)
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    assert.equal(job.error?.code, 'CONFLICT', JSON.stringify(job.error))
+    assert.match(job.error!.message, /refusing any cache change of volume group 'tank': its PVs cannot be proven to be this pool's/)
+    assert.deepEqual(mutations(), [], 'no slice, no pvcreate, no vgextend')
+  })
+
+  it('attach: requirePoolVg is a gate at the route too — an unreadable PV view refuses before a job exists', async () => {
+    await build('none')
+    pvsBroken = true
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/cache', headers: IDENTITY_HEADERS, payload: { disks: [C] } })
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.reason, 'foreign-vg')
+    assert.equal(jobQueue.list().length, 0)
+    assert.deepEqual(mutations(), [])
+  })
+
+  it('attach holds the pool key and the cache disk\'s key', async () => {
+    await build('none')
+    let seen: string[] = []
+    const orig = world.exec.bind(world)
+    world.exec = async (command, args, opts) => {
+      if (command === '/usr/sbin/sgdisk')
+        seen = jobQueue.heldLocks().map(l => l.key)
+      return orig(command, args, opts)
+    }
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/cache', headers: IDENTITY_HEADERS, payload: { disks: [C] } })
+    assert.equal(res.statusCode, 202, res.body)
+    await waitForJob(jobQueue, res.json().job.id)
+    seen.sort()
+    assert.deepEqual(seen, ['ahrname:tank', `disk:${C}`])
+  })
+
+  it('detach: an expansion intent that appears while the job waits refuses it — no mutating argv', async () => {
+    await build('healthy')
+    const { id, release } = await queued('DELETE', '/v1/ahr/tank/cache')
+    await writeIntent('tank', mkIntent('halted'), { dir })
+    await refused(id, release, 'CONFLICT', /has an expansion intent/)
+  })
+
+  it('event: an expansion intent that appears while the recovery job waits refuses it — no mutating argv', async () => {
+    await build('failed')
+    const { id, release } = await queued('POST', '/v1/ahr/tank/cache/event', { event: 'device-removed', slice: 'tank-cache1' })
+    await writeIntent('tank', mkIntent('running'), { dir })
+    await refused(id, release, 'CONFLICT', /automatic cache recovery is skipped/)
+  })
+
+  it('event: a cache detached by the operator while the recovery job waited is not touched again — recovered:false, no mutating argv', async () => {
+    await build('failed')
+    const { id, release } = await queued('POST', '/v1/ahr/tank/cache/event', { event: 'device-removed', slice: 'tank-cache1' })
+    world = buildExecutor('none')
+    release()
+    const job = await waitForJob(jobQueue, id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal((job.result as { recovered: boolean }).recovered, false)
+    assert.deepEqual(mutations(), [])
+  })
+
+  it('event: the recovery job holds the pool\'s key', async () => {
+    await build('failed')
+    let seen: string[] = []
+    const orig = world.exec.bind(world)
+    world.exec = async (command, args, opts) => {
+      if (command === '/usr/sbin/lvconvert')
+        seen = jobQueue.heldLocks().map(l => `${l.key} ${l.mode}`)
+      return orig(command, args, opts)
+    }
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/cache/event', headers: IDENTITY_HEADERS, payload: { event: 'device-removed', slice: 'tank-cache1' } })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(jobQueue, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(seen, ['ahrname:tank exclusive'])
   })
 })

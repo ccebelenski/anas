@@ -3,20 +3,29 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { GuardSpec } from '../safety/guard.js'
 import type { PlanBundle } from '../services/ahr-expand-resume.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { randomUUID } from 'node:crypto'
 import { AhrExpandRequest, AhrReplaceRequest, DiskId, PoolName } from '@anas/shared'
 import { confirmGate } from '../safety/gate.js'
+import { guardCheck, guardConfirm, guarded, sendRefusal } from '../safety/guard.js'
 import { executeReadd } from '../services/ahr-expand-exec.js'
 // The §5.3 recompute-and-continue core is shared with the daemon boot scan
 // (services/ahr-boot-scan.ts) — ONE implementation, no drift (single source).
 import { computePlan, resolveApproved, resumeExpansion, submitExpansion } from '../services/ahr-expand-resume.js'
+import { ahrGuard } from '../services/ahr-guard.js'
 import { poolIntentIdentity } from '../services/ahr-identity.js'
 import { AhrIntentConflictError, clearIntent, readPoolIntent, writeIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, expansionGain, fmtBytes } from '../services/ahr-layout.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { requireIdentity } from './identity.js'
+
+/**
+ * The fields the abandon confirm leaves out of its signature (story cr.38,
+ * WAVE3-DESIGN §5.2 rule 1): none. A test lists them.
+ */
+export const AHR_ABANDON_PRESENTATION_ONLY: Record<string, string> = {}
 
 export interface AhrExpandRouteOptions {
   executor: CommandExecutor
@@ -45,6 +54,10 @@ export interface AhrExpandRouteOptions {
  */
 export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpandRouteOptions) {
   const { executor, jobQueue, confirmStore, diskIdentityCache, intentDir } = opts
+  // The guard's shared AHR pieces (story cr.38): abandon only in session A;
+  // the long verbs here move onto it in session B. No verb here asks the LUN
+  // question, so the guard's LIO reads stay unused.
+  const guard = ahrGuard({ executor, intentDir, iscsiPaths: () => ({}) })
 
   // ---- shared helpers ------------------------------------------------------
 
@@ -403,27 +416,58 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
   })
 
   // ---- POST /ahr/:name/expand/abandon — keep the layout, drop the intent ---
+  // Story cr.38 (§2.3 "abandon": `clearIntent` checks neither id nor state).
+  // The intent the operator confirmed is bound as the request's REVISION, and
+  // the job re-reads it under the pool's key: an intent that was resumed
+  // (running again) refuses, and one replaced by another expansion's — a new
+  // id — fails STATE_CHANGED instead of being deleted on the strength of a
+  // confirm that never saw it.
   server.post<{ Params: { name: string } }>('/ahr/:name/expand/abandon', async (request, reply) => {
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
-    const pool = await loadPool(request.params.name, reply)
-    if (!pool)
-      return
-    const intent = (await readPoolIntent(pool, intentDir)).intent
-    if (!intent) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Pool '${pool.name}' has no expansion intent to abandon.` } }
+    const parsed = PoolName.safeParse(request.params.name)
+    if (!parsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${parsed.error.issues[0]?.message}` } }
     }
-    if (intent.state === 'running') {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Pool '${pool.name}' has an expansion currently being driven — it can only be abandoned once halted.` } }
+    const poolName = parsed.data
+
+    const base = guard.poolView(poolName, 'an abandon')
+    const spec: GuardSpec<AhrPool & { intent: AhrExpansionIntent | null }> = {
+      operation: 'ahr.expand.abandon',
+      object: {
+        ...base,
+        read: async (reads) => {
+          const pool = await base.read(reads)
+          return pool ? { ...pool, intent: (await guard.reads.intent(reads, pool)).intent } : null
+        },
+        revision: async o => o.intent?.id ?? null,
+        unbound: part => part === 'revision'
+          ? `Pool '${poolName}' has no expansion intent to abandon.`
+          : base.unbound(part),
+      },
+      gates: [
+        async o => !o.intent
+          ? { status: 409, code: 'CONFLICT', message: `Pool '${o.name}' has no expansion intent to abandon.` }
+          : null,
+        async o => o.intent?.state === 'running'
+          ? { status: 409, code: 'CONFLICT', message: `Pool '${o.name}' has an expansion currently being driven — it can only be abandoned once halted.` }
+          : null,
+      ],
+      locks: async (pool, bound) => guard.claims(pool, bound, 'exclusive'),
     }
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const pool = pre.object
+    const intent = pool.intent!
 
     const layout = pool.arrays.map(a => `${pool.name}-r${a.band} ${a.level}×${a.members.length}`).join(', ')
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'ahr.expand.abandon',
-      params: { pool: pool.name, intent: intent.id },
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { pool: poolName },
+      address: ['pool'],
+      presentationOnly: AHR_ABANDON_PRESENTATION_ONLY,
       message: `Abandon the halted expansion of pool '${pool.name}'`,
       warnings: [
         `The pool KEEPS its current reachable layout — nothing is rolled back at the block layer.`,
@@ -435,11 +479,16 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       return reply
     }
 
-    const job = jobQueue.submit('ahr.expand.abandon', { ...identity, params: { pool: pool.name, intent: intent.id } }, async (updateProgress) => {
-      updateProgress(`Abandoning expansion intent ${intent.id}`)
-      await clearIntent(pool.name, intentDir)
-      return { abandoned: pool.name }
-    })
+    const job = jobQueue.submit(
+      'ahr.expand.abandon',
+      { ...identity, params: { pool: pool.name, intent: intent.id } },
+      guarded(spec, pre, async (live, { updateProgress }) => {
+        updateProgress(`Abandoning expansion intent ${live.intent!.id}`)
+        await clearIntent(live.name, intentDir)
+        return { abandoned: live.name }
+      }),
+      { locks: pre.locks },
+    )
     reply.code(202)
     return { job }
   })

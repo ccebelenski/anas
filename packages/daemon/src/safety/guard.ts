@@ -622,3 +622,17 @@ export function taskClaim(kind: string, name: string, mode: LockMode): LockClaim
 export function scheduleClaim(id: string, mode: LockMode): LockClaim {
   return claim(`schedule:${id}`, mode, `schedule '${id}'`)
 }
+
+/**
+ * An AHR pool verb's claims (story cr.38, §4.2), the AHR twin of
+ * {@link poolClaims}: `ahr:<vg uuid>` in `mode`, plus `ahrname:<name>` when the
+ * verb changes the namespace (create, destroy). A pool whose VG UUID could
+ * not be read (no VG, or a `vgs` that does not report the column) is locked by
+ * its name key only, exclusive — §4.2's conservative fallback; an AHR pool's
+ * name IS its VG name, so the name key still serialises every verb on it.
+ */
+export function ahrPoolClaims(pool: string, vgUuid: string | null | undefined, mode: LockMode, opts: { namespace?: boolean } = {}): LockClaim[] {
+  if (!vgUuid)
+    return [ahrnameClaim(pool)]
+  return [ahrClaim(vgUuid, mode, pool), ...(opts.namespace ? [ahrnameClaim(pool)] : [])]
+}

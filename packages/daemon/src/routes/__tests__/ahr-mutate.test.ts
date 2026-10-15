@@ -244,6 +244,8 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
       // 6.x runner while dev machines pass on 7.x).
       kernelRelease: '7.0.14-8-pve',
     })
+    // cr.38: the race tests hold this queue's slots.
+    ;(app as unknown as { jobQueue: JobQueue }).jobQueue = jobQueue
     return app as unknown as TestServer
   }
 
@@ -525,9 +527,60 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     assert.equal(second.statusCode, 202, second.body)
     const job = await waitForJob(server, second.json().job.id)
     assert.equal(job.status, 'failed')
-    assert.match(JSON.stringify(job.error), /changed since it was confirmed — nothing was touched/)
+    // cr.38: the guard re-runs the route's eligibility gate in the job, so the
+    // refusal is the route's own 400 sentence (createAhrPool's own pre-wipe
+    // re-check stays behind it as a second line).
+    assert.equal(job.error?.code, 'VALIDATION_ERROR', JSON.stringify(job.error))
+    assert.match(JSON.stringify(job.error), /Ineligible disk selection/)
     assert.match(JSON.stringify(job.error), new RegExp(BLANK_BIG))
     assert.ok(!exec.calls.some(c => c.command === '/usr/sbin/wipefs' || c.command === '/usr/sbin/sgdisk'), 'no disk was wiped')
+  })
+
+  // Story cr.38 (§2.3 "create": "disks, tier, mountpoint unbound"; §5.2).
+  // The tier rides the same signature (the validated request is signed
+  // whole); this inventory has too few disks for any other tier to pass the
+  // layout gate, so the two the operator can actually vary here are tested.
+  it('cr.38: the confirm signs the disks and the mountpoint — a resend that changes one answers CONFIRM_SCOPE_CHANGED naming it', async () => {
+    const base = { name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] }
+    for (const [changed, resend] of [
+      ['disks', { ...base, disks: [BLANK_SMALL, BLANK_4KN] }],
+      ['mountpoint', { ...base, mountpoint: join(dir, 'tpool-elsewhere') }],
+    ] as const) {
+      const first = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify(base) })
+      assert.equal(first.statusCode, 409, first.body)
+      const code = first.headers['x-anas-confirm-code'] as string
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload: JSON.stringify(resend) })
+      assert.equal(res.statusCode, 409, `${changed}: ${res.body}`)
+      assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED', changed)
+      assert.deepEqual(res.json().error.changed, [changed])
+    }
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/wipefs' || c.command === '/usr/sbin/sgdisk'), 'no disk was wiped')
+  })
+
+  it('cr.38: an fstab line that claims the mountpoint while the confirmed create waits refuses the JOB before any wipe', async () => {
+    const mp = join(dir, 'tpool-mp')
+    const jobQueue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+    const payload = JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG], mountpoint: mp })
+    const first = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload })
+    assert.equal(first.statusCode, 409, first.body)
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (let i = 0; i < 4; i++)
+      jobQueue.submit('test.hold', { user: 'test', uid: 0 }, () => held)
+    const second = await server.inject({ method: 'POST', url: '/v1/ahr', headers: { ...JSON_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string }, payload })
+    assert.equal(second.statusCode, 202, second.body)
+    const id = second.json().job.id as string
+    assert.equal(jobQueue.get(id)?.status, 'queued')
+    // The operator's own fstab line for that path lands while the job waits.
+    await writeFile(join(dir, 'fstab'), `# empty\n//nas/media ${mp} cifs nofail 0 0\n`)
+    release()
+    const job = await waitForJob(server, id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'CONFLICT', JSON.stringify(job.error))
+    assert.match(job.error!.message, /is already claimed in fstab/)
+    assert.ok(!executor.calls.some(c => ['/usr/sbin/wipefs', '/usr/sbin/sgdisk', '/usr/sbin/mdadm'].includes(c.command) && c.args[0] !== '--detail'), 'nothing was wiped or built')
   })
 })
 
@@ -1434,7 +1487,9 @@ describe('DELETE /v1/ahr/:name — identity doors (ident.3)', () => {
     assert.equal(second.statusCode, 202, second.body)
     const job = await waitForJob(server, second.json().job.id)
     assert.equal(job.status, 'failed')
-    assert.match(JSON.stringify(job.error), /not the pool that was confirmed/)
+    // cr.38: the guard's identity check — the job's error code is IDENTITY_MISMATCH.
+    assert.equal(job.error?.code, 'IDENTITY_MISMATCH', JSON.stringify(job.error))
+    assert.match(JSON.stringify(job.error), /not the one that was confirmed/)
     for (const destructive of ['/usr/bin/umount', '/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/sgdisk'])
       assert.ok(!executor.calls.some(c => c.command === destructive), `${destructive} must not run`)
     assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && (c.args[0] === '--stop' || c.args[0] === '--zero-superblock')))
@@ -1452,7 +1507,10 @@ describe('DELETE /v1/ahr/:name — identity doors (ident.3)', () => {
     const after = await build(ahr0World('11111111:22222222:33333333:44444444'))
     const replay = await after.server.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code } })
     assert.equal(replay.statusCode, 409, replay.body)
-    assert.equal(replay.json().error.code, 'CONFIRMATION_REQUIRED', 'a fresh confirm, never a 202')
+    // cr.38: the guard's confirm names the change — IDENTITY_MISMATCH with a
+    // fresh code, never a 202.
+    assert.equal(replay.json().error.code, 'IDENTITY_MISMATCH', 'a fresh confirm, never a 202')
+    assert.ok(replay.headers['x-anas-confirm-code'], 'a fresh code')
     await after.server.close()
   })
 

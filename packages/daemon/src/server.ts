@@ -287,6 +287,10 @@ export function createServer(opts?: ServerOptions) {
     // only when it matches.
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'value', 'guid', '--', 'testpool'], result: { stdout: '5823146802312415237\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/blkid', result: { stdout: '5823146802312415237\n', stderr: '', exitCode: 0 } })
+    // The AHR cache attach's signature probe (`blkid -p <dev>`, cr.38): a blank
+    // disk answers exit 2 with no output (captured semantics), so mock mode can
+    // attach a cache — the command-only answer above would read as a signature.
+    mock.addFixture({ command: '/usr/sbin/blkid', argsMatch: a => a.length === 2 && a[0] === '-p', result: { stdout: '', stderr: '', exitCode: 2 } })
     // Import scan (story 3.7): `zpool import` with no args lists one pool.
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['import'], result: {
       stdout: [

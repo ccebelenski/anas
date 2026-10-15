@@ -16,7 +16,7 @@ import { diskLsblkArgs } from '../../services/ahr-expand-exec.js'
 import { writeIntent } from '../../services/ahr-intent.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
-import { ahrSpareRoutes } from '../ahr-spare.js'
+import { AHR_SPARE_ADD_PRESENTATION_ONLY, AHR_SPARE_REMOVE_PRESENTATION_ONLY, ahrSpareRoutes } from '../ahr-spare.js'
 import { jobRoutes } from '../jobs.js'
 
 /**
@@ -386,5 +386,94 @@ describe('AHR hot-spare routes (story 11.11)', () => {
       assert.equal(res.statusCode, 409)
       assert.match(res.json().error.message, /expansion intent/)
     })
+  })
+})
+
+/**
+ * Story cr.38 session A — the spare verbs on the guard (WAVE3-DESIGN §2.3
+ * "spare add / remove": the intent gate was request-time only). The
+ * confirmed job is held behind four placeholder jobs, an expansion intent
+ * appears, the slots are released: the job refuses and nothing mutates.
+ */
+describe('cr.38 — the AHR spare verbs re-gate in the job (ruling (j))', () => {
+  let dir: string
+  let executor: MockExecutor
+  let jobQueue: JobQueue
+  let server: ReturnType<typeof Fastify>
+
+  async function build(opts: { spareAttached?: boolean } = {}) {
+    executor = buildExecutor(opts)
+    jobQueue = new JobQueue()
+    server = Fastify({ logger: false })
+    await server.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await server.register(ahrSpareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore: new ConfirmStore(), diskIdentityCache: new DiskIdentityCache(executor), intentDir: dir })
+  }
+
+  function mutating(): { command: string, args: string[] }[] {
+    return executor.calls.filter(c => ['/usr/sbin/wipefs', '/usr/sbin/sgdisk'].includes(c.command) || (c.command === '/usr/sbin/mdadm' && c.args[0] !== '--detail' && c.args[0] !== '--examine'))
+  }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-cr38-spare-'))
+  })
+  afterEach(async () => {
+    await server?.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  async function confirmedBehindFullQueue(method: 'POST' | 'DELETE', url: string, payload?: object): Promise<{ id: string, release: () => void }> {
+    const first = await server.inject({ method, url, headers: IDENTITY_HEADERS, ...(payload ? { payload } : {}) })
+    assert.equal(first.statusCode, 409, first.body)
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (let i = 0; i < 4; i++)
+      jobQueue.submit('test.hold', { user: 'test', uid: 0 }, () => held)
+    const res = await server.inject({ method, url, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string }, ...(payload ? { payload } : {}) })
+    assert.equal(res.statusCode, 202, res.body)
+    const id = res.json().job.id as string
+    assert.equal(jobQueue.get(id)?.status, 'queued')
+    return { id, release }
+  }
+
+  for (const [verb, method, url, payload, opts] of [
+    ['add', 'POST', '/v1/ahr/tank/spare', { diskId: W }, {}],
+    ['remove', 'DELETE', `/v1/ahr/tank/spare/${W}`, undefined, { spareAttached: true }],
+  ] as const) {
+    it(`spare ${verb}: an expansion intent that appears while the confirmed job waits refuses it — no mutating argv`, async () => {
+      await build(opts)
+      const { id, release } = await confirmedBehindFullQueue(method, url, payload)
+      await writeIntent('tank', mkIntent('halted'), { dir })
+      release()
+      const job = await waitForJob(jobQueue, id)
+      assert.equal(job.status, 'failed', JSON.stringify(job))
+      assert.equal(job.error?.code, 'CONFLICT')
+      assert.match(job.error!.message, /has an expansion intent \(state 'halted'\) — spares can be changed once it completes or is abandoned/)
+      assert.deepEqual(mutating(), [], 'no mutating argv')
+    })
+  }
+
+  it('spare add holds the pool key and the spare disk\'s key while it writes', async () => {
+    await build()
+    let seen: string[] = []
+    const orig = executor.exec.bind(executor)
+    executor.exec = async (command, args, o) => {
+      if (command === '/usr/sbin/sgdisk' && seen.length === 0)
+        seen = jobQueue.heldLocks().map(l => `${l.key} ${l.mode}`)
+      return orig(command, args, o)
+    }
+    const first = await server.inject({ method: 'POST', url: '/v1/ahr/tank/spare', headers: IDENTITY_HEADERS, payload: { diskId: W } })
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/spare', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string }, payload: { diskId: W } })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(jobQueue, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    seen.sort()
+    assert.deepEqual(seen, ['ahrname:tank exclusive', `disk:${W} exclusive`])
+  })
+
+  it('the spare confirms sign the whole request — no presentation-only fields', () => {
+    assert.deepEqual(AHR_SPARE_ADD_PRESENTATION_ONLY, {})
+    assert.deepEqual(AHR_SPARE_REMOVE_PRESENTATION_ONLY, {})
   })
 })
