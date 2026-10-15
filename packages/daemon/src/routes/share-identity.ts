@@ -4,6 +4,7 @@ import type { CommandExecutor, ExecOptions, ExecResult } from '../executor/types
 import type { JobQueue } from '../jobs/queue.js'
 import type { GroupEntry, PasswdEntry } from '../parsers/getent.js'
 import type { PassdbEntry } from '../parsers/pdbedit.js'
+import type { IdentityRefHit } from '../parsers/smb-conf.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import { constants } from 'node:fs'
 import { access } from 'node:fs/promises'
@@ -31,9 +32,8 @@ import {
   passdbEntry,
   passdbOwnedByOther,
   passdbServes,
-  sameIdentityName,
 } from '../parsers/pdbedit.js'
-import { parseSmbConf } from '../parsers/smb-conf.js'
+import { findIdentityReferences } from '../parsers/smb-conf.js'
 import { confirmGate } from '../safety/gate.js'
 import { readConfig } from '../services/config-writer.js'
 import { requireIdentity } from './identity.js'
@@ -87,7 +87,8 @@ export interface ShareIdentityRouteOptions {
   confirmStore: ConfirmStore
   /**
    * Absolute path to smb.conf — the delete routes read it to refuse an
-   * identity a share still names in `valid users` (identity.1d).
+   * identity a share still names in any user-list parameter (identity.1d,
+   * extended to the full cr.30 parameter set).
    */
   smbConfPath: string
   /**
@@ -317,11 +318,14 @@ export async function shareIdentityRoutes(
   }
 
   /**
-   * The share names (SMB `valid users`) that reference an identity (identity.1d).
-   * A user is referenced by a bare entry, a group by an `@`-prefixed one; the
-   * match is case-folded (Samba is case-insensitive in smb.conf too).
+   * The (share, parameter) pairs that reference an identity (identity.1d,
+   * extended by cr.30 to every user-list parameter of WAVE2-DESIGN §6 C4:
+   * `valid users`, `invalid users`, `read list`, `write list`, `admin users`,
+   * `force user`, `force group`). A user matches bare entries; a group matches
+   * the `@`/`+`/`&` forms and `force group` (any spelling); the match is
+   * case-folded (Samba is case-insensitive in smb.conf too).
    *
-   * Returns `{ shares, unknown }`: `unknown` is true when smb.conf could not
+   * Returns `{ refs, unknown }`: `unknown` is true when smb.conf could not
    * be read (a read error, not an absent file) — the caller then discloses it
    * at the confirm door instead of failing open silently (the ahr-mutate D3
    * pattern). An ABSENT file (samba removed) genuinely means no references.
@@ -329,30 +333,34 @@ export async function shareIdentityRoutes(
   async function sharesReferencing(
     name: string,
     isGroup: boolean,
-  ): Promise<{ shares: string[], unknown: boolean }> {
+  ): Promise<{ refs: IdentityRefHit[], unknown: boolean }> {
     let text: string
     try {
       text = await readConfig(smbConfPath)
     }
     catch {
-      return { shares: [], unknown: true }
+      return { refs: [], unknown: true }
     }
-    const shares = parseSmbConf(text).shares
-    const refs = shares
-      .filter(s => s.validUsers.some(entry => (isGroup
-        ? entry.startsWith('@') && sameIdentityName(entry.slice(1), name)
-        : sameIdentityName(entry, name))))
-      .map(s => s.name)
-    return { shares: refs, unknown: false }
+    return { refs: findIdentityReferences(text, name, isGroup), unknown: false }
   }
 
   /** The hard-409 body for a referenced identity — ONE shape for both verbs. */
-  function referencedConflict(kind: 'user' | 'group', name: string, shares: string[]) {
+  function referencedConflict(kind: 'user' | 'group', name: string, refs: IdentityRefHit[]) {
+    // One line per share, naming every parameter of it that holds the name:
+    // `media (valid users, write list), archive (force user)`.
+    const byShare = new Map<string, string[]>()
+    for (const ref of refs) {
+      const params = byShare.get(ref.share) ?? []
+      if (!params.includes(ref.parameter))
+        params.push(ref.parameter)
+      byShare.set(ref.share, params)
+    }
+    const listed = Array.from(byShare, ([share, params]) => `${share} (${params.join(', ')})`)
     return {
       error: {
         code: 'CONFLICT',
         reason: 'referenced-by-share',
-        message: `${kind === 'user' ? 'User' : 'Group'} '${name}' is referenced by share(s): ${shares.join(', ')}. Remove it from their 'valid users' first. This refusal has no confirm bypass.`,
+        message: `${kind === 'user' ? 'User' : 'Group'} '${name}' is referenced by share(s): ${listed.join(', ')}. Remove it from those share parameters first. This refusal has no confirm bypass.`,
       },
     }
   }
@@ -863,7 +871,7 @@ export async function shareIdentityRoutes(
   //
   // Identity.1d. The same local-identity gate the update routes use (LookupName
   // → exists → local), then the HARD refusals (no confirm bypass): a name a
-  // share still carries in `valid users`. What remains is confirm-gated
+  // share still carries in any user-list parameter (cr.30). What remains is confirm-gated
   // (Principle 14): the account is gone from the system, and the files it owns
   // keep their uid — `userdel` without `-r`, by design.
   server.delete<{ Params: { name: string } }>('/identity/users/:name', async (request, reply) => {
@@ -891,9 +899,9 @@ export async function shareIdentityRoutes(
       return rejectSystemAccount(reply, 'user', name, entry.uid)
 
     const refs = await sharesReferencing(name, false)
-    if (refs.shares.length > 0) {
+    if (refs.refs.length > 0) {
       reply.code(409)
-      return referencedConflict('user', name, refs.shares)
+      return referencedConflict('user', name, refs.refs)
     }
 
     // The passdb check is route-time for the WARNING (it describes what will
@@ -909,6 +917,12 @@ export async function shareIdentityRoutes(
       warnings.push(`Its SMB password entry will be removed`)
     if (refs.unknown)
       warnings.push('ANAS could not read smb.conf to check for share references. If this node has SMB shares, verify none of them names this user before confirming.')
+    // TODO(cr.30, cr.29): ACL-root references join these warnings as a
+    // confirm WARNING naming the roots (WAVE2-DESIGN §6 C4): `getfacl -n -p`
+    // of every SMB share path, NFS export path, ZFS filesystem mountpoint and
+    // AHR data mount, checked for a named user/group entry. Reading them is
+    // the route-enumerating scan cr.29 builds for the create-time backstop —
+    // no second scan gets built here; this lands when cr.29's does.
 
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'identity.user.delete',
@@ -1002,9 +1016,9 @@ export async function shareIdentityRoutes(
     }
 
     const refs = await sharesReferencing(name, true)
-    if (refs.shares.length > 0) {
+    if (refs.refs.length > 0) {
       reply.code(409)
-      return referencedConflict('group', name, refs.shares)
+      return referencedConflict('group', name, refs.refs)
     }
 
     const warnings = [
@@ -1013,6 +1027,8 @@ export async function shareIdentityRoutes(
     ]
     if (refs.unknown)
       warnings.push('ANAS could not read smb.conf to check for share references. If this node has SMB shares, verify none of them names this group before confirming.')
+    // TODO(cr.30, cr.29): ACL-root confirm warning here too — see the user
+    // delete route; both warnings ride cr.29's root-enumerating scan.
 
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'identity.group.delete',

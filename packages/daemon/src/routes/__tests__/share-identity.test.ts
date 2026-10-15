@@ -6,8 +6,9 @@ import { randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { IdentityName } from '@anas/shared'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
@@ -1504,6 +1505,181 @@ describe('share-identity routes', () => {
       assert.match(job.error?.message ?? '', /'shareuser' \(uid 999\) is a system account/)
       assert.match(job.error?.message ?? '', /managed outside ANAS/)
       assert.deepEqual(mutatorCalls(), [])
+    })
+  })
+
+  // --- cr.30 — delete refuses EVERY smb.conf name reference (review M6 #25) ---
+  //
+  // The identity.1d refusal scanned only `valid users`; cr.30 scans the full
+  // parameter list of WAVE2-DESIGN §6 C4 — `valid users`, `invalid users`,
+  // `read list`, `write list`, `admin users`, `force user`, `force group` —
+  // with groups in every form the design names (`@`, `+`, `&`), plus `force
+  // group`'s bare spelling. One refusal test per parameter and form, for the
+  // user and the group verb, driven by the checked-in fixture
+  // fixtures/samba/smb-identity-refs.conf (the node's smb.conf verbatim).
+  describe('cr.30 — delete refuses every smb.conf name reference', () => {
+    let app: FastifyInstance | undefined
+    let queue: JobQueue
+    let tmpDir: string
+
+    const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/samba/smb-identity-refs.conf')
+
+    interface RefCase { share: string, parameter: string, user?: string, group?: string }
+    const REF_CASES: RefCase[] = [
+      { share: 'valid-users', parameter: 'valid users', user: 'vuser', group: 'vgroup' },
+      { share: 'invalid-users', parameter: 'invalid users', user: 'iuser', group: 'igroup' },
+      { share: 'read-list', parameter: 'read list', user: 'ruser', group: 'rgroup' },
+      { share: 'write-list', parameter: 'write list', user: 'wuser', group: 'wgroup' },
+      { share: 'admin-users', parameter: 'admin users', user: 'auser', group: 'agroup' },
+      { share: 'force-user', parameter: 'force user', user: 'fuser' },
+      { share: 'force-group-at', parameter: 'force group', group: 'fgroupat' },
+      { share: 'force-group-bare', parameter: 'force group', group: 'fgroupbare' },
+    ]
+
+    const ok = (stdout: string): ExecResult => ({ stdout: `${stdout}\n`, stderr: '', exitCode: 0 })
+
+    /**
+     * A node whose smb.conf is the checked-in fixture (or `smbConfText`,
+     * written to a temp file for the multi-reference case). Every account in
+     * the table exists and is LOCAL, users at uid 1501+ and groups at gid
+     * 1601+ (in the share band); no account holds another's gid as its
+     * primary, so the group delete reaches the reference check. `extraUsers`
+     * adds resolvable LOCAL users beyond the table (the multi-reference and
+     * case-fold cases).
+     */
+    async function bootNode(opts: { smbConfText?: string, extraUsers?: string[] } = {}) {
+      tmpDir = await mkdtemp(join(tmpdir(), 'anas-identity-cr30-'))
+      const smbConfPath = opts.smbConfText !== undefined
+        ? join(tmpDir, 'smb.conf')
+        : FIXTURE
+      if (opts.smbConfText !== undefined)
+        writeFileSync(smbConfPath, opts.smbConfText)
+
+      const executor = new MockExecutor()
+      queue = new JobQueue()
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: ok('root:x:0:0:root:/root:/bin/bash') })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: ok('root:x:0:') })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd'], result: ok('root:x:0:0:root:/root:/bin/bash') })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group'], result: ok('root:x:0:') })
+      const addUser = (name: string, uid: number) => {
+        const line = `${name}:x:${uid}:100:Test user:/home/${name}:/usr/sbin/nologin`
+        executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', name], result: ok(line) })
+        executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd', name], result: ok(line) })
+      }
+      const addGroup = (name: string, gid: number) => {
+        const line = `${name}:x:${gid}:`
+        executor.addFixture({ command: '/usr/bin/getent', args: ['group', name], result: ok(line) })
+        executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group', name], result: ok(line) })
+      }
+      let uid = 1500
+      let gid = 1600
+      for (const c of REF_CASES) {
+        if (c.user !== undefined)
+          addUser(c.user, ++uid)
+        if (c.group !== undefined)
+          addGroup(c.group, ++gid)
+      }
+      // Namesakes for the form tests: a USER named like the `@vgroup` entry
+      // and a GROUP named like the bare `vuser` entry.
+      addUser('vgroup', 1570)
+      addGroup('vuser', 1670)
+      // The case-fold probe: same account, uppercase name resolves too.
+      addUser('VUSER', 1580)
+      for (const name of opts.extraUsers ?? [])
+        addUser(name, ++uid)
+      executor.addFixture({ command: '/usr/bin/pdbedit', args: ['-L'], result: ok('') })
+
+      app = Fastify({ logger: false })
+      await app.register(shareIdentityRoutes, {
+        prefix: '/v1',
+        executor,
+        jobQueue: queue,
+        confirmStore: new ConfirmStore(),
+        smbConfPath,
+        smbpasswdAvailable: async () => true,
+      })
+    }
+
+    function del(url: string) {
+      return app!.inject({ method: 'DELETE', url, headers: IDENTITY_HEADERS })
+    }
+
+    afterEach(async () => {
+      await app?.close()
+      app = undefined
+      await rm(tmpDir, { recursive: true, force: true })
+    })
+
+    /** The shared shape of a cr.30 refusal: hard 409, no code, no job. */
+    function assertRefusal(res: Awaited<ReturnType<FastifyInstance['inject']>>, share: string, parameter: string) {
+      assert.equal(res.statusCode, 409)
+      const { error } = res.json() as { error: { code: string, reason: string, message: string } }
+      assert.equal(error.code, 'CONFLICT')
+      assert.equal(error.reason, 'referenced-by-share')
+      assert.match(error.message, new RegExp(share))
+      assert.match(error.message, new RegExp(parameter))
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
+      assert.equal(queue.list().length, 0)
+    }
+
+    for (const c of REF_CASES) {
+      if (c.user !== undefined) {
+        it(`refuses a user named in '${c.parameter}' of [${c.share}]`, async () => {
+          await bootNode()
+          assertRefusal(await del(`/v1/identity/users/${c.user}`), c.share, c.parameter)
+        })
+      }
+      if (c.group !== undefined) {
+        it(`refuses a group named in '${c.parameter}' of [${c.share}]`, async () => {
+          await bootNode()
+          assertRefusal(await del(`/v1/identity/groups/${c.group}`), c.share, c.parameter)
+        })
+      }
+    }
+
+    it('the match is case-folded (Samba folds smb.conf names too)', async () => {
+      await bootNode()
+      assertRefusal(await del('/v1/identity/users/VUSER'), 'valid-users', 'valid users')
+    })
+
+    it('the REFUSAL names every share and every parameter — media (valid users, write list), archive (force user)', async () => {
+      await bootNode({
+        smbConfText: [
+          '[global]',
+          '\tworkgroup = WORKGROUP',
+          '',
+          '[media]',
+          '\tpath = /tank/media',
+          '\tvalid users = alice',
+          '\twrite list = alice',
+          '',
+          '[archive]',
+          '\tpath = /tank/archive',
+          '\tforce user = alice',
+          '',
+        ].join('\n'),
+        extraUsers: ['alice'],
+      })
+      const res = await del('/v1/identity/users/alice')
+      assert.equal(res.statusCode, 409)
+      const { error } = res.json() as { error: { reason: string, message: string } }
+      assert.equal(error.reason, 'referenced-by-share')
+      assert.match(error.message, /media \(valid users, write list\)/)
+      assert.match(error.message, /archive \(force user\)/)
+    })
+
+    it('a USER whose name only appears in GROUP form (@vgroup) is not refused — the gate is reached', async () => {
+      await bootNode()
+      const res = await del('/v1/identity/users/vgroup')
+      assert.equal(res.statusCode, 409)
+      assert.equal((res.json() as { error: { code: string } }).error.code, 'CONFIRMATION_REQUIRED')
+    })
+
+    it('a GROUP whose name only appears in bare user form (vuser) is not refused — the gate is reached', async () => {
+      await bootNode()
+      const res = await del('/v1/identity/groups/vuser')
+      assert.equal(res.statusCode, 409)
+      assert.equal((res.json() as { error: { code: string } }).error.code, 'CONFIRMATION_REQUIRED')
     })
   })
 })

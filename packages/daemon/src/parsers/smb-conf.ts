@@ -22,6 +22,7 @@
 
 import type { CreateSmbShareRequest, RecyclePurgeDays, SmbGlobalConfig, SmbShare, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
 import { RetentionBucket } from '@anas/shared'
+import { sameIdentityName } from './pdbedit.js'
 
 /** `[section]` header (whole trimmed line). */
 const SECTION_HEADER_RE = /^\[(.+)\]\s*$/
@@ -279,6 +280,16 @@ const PARAM = {
   // `public` is a synonym of `guest ok`.
   guestOk: { canonical: 'guest ok', norms: ['guestok', 'public'], unset: 'no' },
   validUsers: { canonical: 'valid users', norms: ['validusers'] },
+  // ── The remaining user-list parameters the identity delete refusal scans
+  // (cr.30, review M6 #25; WAVE2-DESIGN §6 C4). READ side only — ANAS never
+  // writes these; the refusal needs every name a share still resolves. None
+  // of the six has a documented Samba synonym.
+  invalidUsers: { canonical: 'invalid users', norms: ['invalidusers'] },
+  readList: { canonical: 'read list', norms: ['readlist'] },
+  writeList: { canonical: 'write list', norms: ['writelist'] },
+  adminUsers: { canonical: 'admin users', norms: ['adminusers'] },
+  forceUser: { canonical: 'force user', norms: ['forceuser'] },
+  forceGroup: { canonical: 'force group', norms: ['forcegroup'] },
   // `allow hosts` / `deny hosts` are synonyms of `hosts allow` / `hosts deny`.
   hostsAllow: { canonical: 'hosts allow', norms: ['hostsallow', 'allowhosts'] },
   hostsDeny: { canonical: 'hosts deny', norms: ['hostsdeny', 'denyhosts'] },
@@ -749,6 +760,93 @@ export function recyclePurgeTargets(text: string): RecyclePurgeTarget[] {
     })
   }
   return targets
+}
+
+// ============================================================================
+// Identity references (cr.30, review M6 #25) — which share parameters name
+// accounts, and how an entry matches one.
+//
+// The parameter list is WAVE2-DESIGN §6 C4: `valid users`, `invalid users`,
+// `read list`, `write list`, `admin users`, `force user`, `force group`. A
+// group is written with a sigil — `@group`, `+group` or `&group` (Samba's
+// three group notations; the design names no combined `+&`/`&+` form) — except
+// in `force group`, whose value is a group whatever it is spelled as. A bare
+// entry elsewhere names a USER. Names match case-folded (Samba folds them in
+// smb.conf too), the same fold as the passdb (`sameIdentityName`).
+//
+// Scope: path-based share stanzas, exactly what the read-model lists — and, as
+// before, `[global]` occurrences of these parameters (rare, and a global
+// forcing is server management, not a share grant) are not scanned.
+// ============================================================================
+
+/** How one user-list parameter can name an account. */
+interface IdentityParamRule {
+  param: SmbParam
+  /** A bare (no sigil) entry can name this USER. */
+  user?: boolean
+  /** An `@`/`+`/`&` entry can name this GROUP. */
+  group?: boolean
+  /** The parameter names a group even WITHOUT a sigil (`force group = staff`). */
+  groupBare?: boolean
+}
+
+/** The C4 table, in the design's order. */
+const IDENTITY_PARAMS: readonly IdentityParamRule[] = [
+  { param: PARAM.validUsers, user: true, group: true },
+  { param: PARAM.invalidUsers, user: true, group: true },
+  { param: PARAM.readList, user: true, group: true },
+  { param: PARAM.writeList, user: true, group: true },
+  { param: PARAM.adminUsers, user: true, group: true },
+  { param: PARAM.forceUser, user: true },
+  { param: PARAM.forceGroup, group: true, groupBare: true },
+]
+
+/** Samba's three group notations in a user list: `@group`, `+group`, `&group`. */
+const GROUP_SIGIL_RE = /^([@+&])(.*)$/
+
+/** One (share, parameter) pair whose value names an account — the refusal's evidence. */
+export interface IdentityRefHit {
+  /** Section (share) name as written. */
+  share: string
+  /** Canonical parameter spelling (`valid users`, `force group`, …). */
+  parameter: string
+}
+
+/** Does one list entry name `name` under this rule, for a user or a group? */
+function entryNamesAccount(entry: string, name: string, rule: IdentityParamRule, isGroup: boolean): boolean {
+  const sigil = GROUP_SIGIL_RE.exec(entry)
+  if (isGroup)
+    return sigil ? rule.group === true && sameIdentityName(sigil[2], name) : rule.groupBare === true && sameIdentityName(entry, name)
+  return rule.user === true && sigil === null && sameIdentityName(entry, name)
+}
+
+/**
+ * Every (share, parameter) pair in an smb.conf that names the account — the
+ * hard-409 evidence for identity delete (cr.30). Reads the SAME section model
+ * the read-model and the editors use (last definition wins, continuations
+ * folded, synonyms honoured). Pure over the text; the caller decides what an
+ * unreadable file means.
+ */
+export function findIdentityReferences(text: string, name: string, isGroup: boolean): IdentityRefHit[] {
+  const doc = parseDoc(text)
+  const hits: IdentityRefHit[] = []
+  for (const span of doc.sections) {
+    if (span.key === null || span.key === 'global')
+      continue
+    const defs = sectionDefs(doc, span)
+    // The read model's share definition: a stanza without a path is not a
+    // path-based file share (mirrors `toSmbShare`), so it names nobody.
+    if (!paramValue(defs, PARAM.path))
+      continue
+    for (const rule of IDENTITY_PARAMS) {
+      const value = paramValue(defs, rule.param)
+      if (value === undefined)
+        continue
+      if (parseList(value).some(entry => entryNamesAccount(entry, name, rule, isGroup)))
+        hits.push({ share: span.name as string, parameter: rule.param.canonical })
+    }
+  }
+  return hits
 }
 
 // ============================================================================

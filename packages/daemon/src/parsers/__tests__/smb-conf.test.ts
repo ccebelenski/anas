@@ -1,11 +1,15 @@
 import type { SmbShare, UpdateSmbShareRequest } from '@anas/shared'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import {
   addMissingGrantParams,
   addShare,
   composeVfsObjects,
   customVfsRefusal,
+  findIdentityReferences,
   formatMaxSize,
   getShare,
   hasCustomVfsObjects,
@@ -1254,5 +1258,68 @@ describe('recyclePurgeTargets — the purge runner\'s view of smb.conf', () => {
     assert.deepEqual(recyclePurgeTargets(conf), [
       { share: 'odd', path: '/tank/odd', repository: '.回收站', days: 90 },
     ])
+  })
+})
+
+// --- cr.30 — findIdentityReferences (WAVE2-DESIGN §6 C4) -------------------
+describe('identity references (cr.30)', () => {
+  const fixturePath = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/samba/smb-identity-refs.conf')
+  const fixture = readFileSync(fixturePath, 'utf8')
+
+  it('the identity-refs fixture round-trips byte-identically', () => {
+    assert.equal(serializeDoc(parseDoc(fixture)), fixture)
+  })
+
+  interface Case { share: string, parameter: string, user?: string, group?: string }
+  const CASES: Case[] = [
+    { share: 'valid-users', parameter: 'valid users', user: 'vuser', group: 'vgroup' },
+    { share: 'invalid-users', parameter: 'invalid users', user: 'iuser', group: 'igroup' },
+    { share: 'read-list', parameter: 'read list', user: 'ruser', group: 'rgroup' },
+    { share: 'write-list', parameter: 'write list', user: 'wuser', group: 'wgroup' },
+    { share: 'admin-users', parameter: 'admin users', user: 'auser', group: 'agroup' },
+    { share: 'force-user', parameter: 'force user', user: 'fuser' },
+    { share: 'force-group-at', parameter: 'force group', group: 'fgroupat' },
+    { share: 'force-group-bare', parameter: 'force group', group: 'fgroupbare' },
+  ]
+
+  for (const c of CASES) {
+    if (c.user !== undefined) {
+      const user = c.user
+      it(`a user named in '${c.parameter}' of [${c.share}] hits exactly that pair`, () => {
+        assert.deepEqual(findIdentityReferences(fixture, user, false), [{ share: c.share, parameter: c.parameter }])
+      })
+    }
+    if (c.group !== undefined) {
+      const group = c.group
+      it(`a group named in '${c.parameter}' of [${c.share}] hits exactly that pair`, () => {
+        assert.deepEqual(findIdentityReferences(fixture, group, true), [{ share: c.share, parameter: c.parameter }])
+      })
+    }
+  }
+
+  it('matches case-folded, both sides', () => {
+    assert.deepEqual(findIdentityReferences(fixture, 'VUSER', false), [{ share: 'valid-users', parameter: 'valid users' }])
+    assert.deepEqual(findIdentityReferences(fixture, 'VGROUP', true), [{ share: 'valid-users', parameter: 'valid users' }])
+  })
+
+  it('the FORM decides: bare names are users, sigiled are groups — except force group', () => {
+    // `@vgroup` names a group; a USER of that name is nobody's reference.
+    assert.deepEqual(findIdentityReferences(fixture, 'vgroup', false), [])
+    // A bare `vuser` names a user; a GROUP of that name is not its reference…
+    assert.deepEqual(findIdentityReferences(fixture, 'vuser', true), [])
+    // …while `force group = fgroupbare` names the GROUP bare, and nobody.
+    assert.deepEqual(findIdentityReferences(fixture, 'fgroupbare', true), [{ share: 'force-group-bare', parameter: 'force group' }])
+    assert.deepEqual(findIdentityReferences(fixture, 'fgroupbare', false), [])
+    // A user is never `force group`'s reference and a group is never `force user`'s.
+    assert.deepEqual(findIdentityReferences(fixture, 'fuser', true), [])
+    assert.deepEqual(findIdentityReferences(fixture, 'fgroupat', false), [])
+  })
+
+  it('a stanza without a path is not a share (mirrors the read model)', () => {
+    assert.deepEqual(findIdentityReferences('[note]\n\tvalid users = vuser\n', 'vuser', false), [])
+  })
+
+  it('[global] user-list parameters are not scanned', () => {
+    assert.deepEqual(findIdentityReferences('[global]\n\tvalid users = vuser\n', 'vuser', false), [])
   })
 })
