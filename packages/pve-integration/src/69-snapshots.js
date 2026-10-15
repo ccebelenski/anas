@@ -323,8 +323,11 @@
 
     // ---- Load / reload the schedules grid ----------------------------------
 
-    // `quiet` skips the loading mask so the timed poll refreshes in place; the
-    // selected row is restored by schedule id (the replication pattern).
+    // `quiet` skips the loading mask so the timed poll refreshes in place with
+    // no visible flash; the selected row is restored by schedule id so the poll
+    // doesn't drop it (the replication pattern, cr.46: a row picked while the
+    // request was in flight is read when the answer arrives, and a response
+    // older than the newest request is dropped).
     function loadSchedules(grid, node, quiet) {
         if (!grid || grid.destroyed || grid.destroying) {
             return;
@@ -332,20 +335,32 @@
         if (!quiet) {
             try { grid.setLoading(true); } catch (e) { /* non-fatal */ }
         }
-        var priorId = null;
-        try {
-            var sel = grid.getSelectionModel().getSelection();
-            priorId = (sel && sel.length) ? sel[0].get('id') : null;
-        } catch (eS) {
-            priorId = null;
-        }
+        // cr.46: per-grid load sequence, the `_previewSeq` idiom — the same
+        // guard every sibling loader carries.
+        var seq = (grid._loadSeq = (grid._loadSeq || 0) + 1);
         ANAS.api.get(node, '/schedules').then(function (res) {
-            if (grid.destroyed || grid.destroying) {
+            // Drop a response older than the newest request: its rows, its
+            // mask and — below all else — its idea of what was selected.
+            if (grid.destroyed || grid.destroying || grid._loadSeq !== seq) {
                 return;
             }
-            if (!quiet) {
-                try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
+            // The selection is read NOW, when the answer arrives: a row the
+            // operator picked while this request was in flight is the row to
+            // keep selected, not the one selected when the request left.
+            var priorId = null;
+            try {
+                var sel = grid.getSelectionModel().getSelection();
+                priorId = (sel && sel.length) ? sel[0].get('id') : null;
+            } catch (eS) {
+                priorId = null;
             }
+            // cr.45 review: the response that IS the newest clears the mask
+            // even when its own load was quiet — a quiet load issued under a
+            // masked one would otherwise leave that mask up forever once the
+            // masked load's response goes stale and stops touching it
+            // (setLoading(false) is a no-op when no mask is up). Applies to
+            // error alike, below; only a STALE response keeps its hands off.
+            try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
             var list = (res && res.data) || [];
             var rows = [];
             for (var i = 0; i < list.length; i++) {
@@ -368,12 +383,14 @@
             }
             updateButtons(grid);
         }, function (err) {
-            if (grid.destroyed || grid.destroying) {
+            // Stale failure: the newer load owns the mask and the grid now.
+            if (grid.destroyed || grid.destroying || grid._loadSeq !== seq) {
                 return;
             }
-            if (!quiet) {
-                try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
-            }
+            // The newest response clears the mask whether its own load was
+            // quiet or not (see the success branch) — a fresh FAILURE must
+            // leave a quiet poll's mask down too.
+            try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
             ANAS.warn('schedules load failed: ' + ANAS.errText(err));
         });
     }
@@ -1465,6 +1482,12 @@
                         failTitle: 'Delete failed',
                         successMsg: t('Schedule deleted') + ': ' + name,
                         onComplete: function () {
+                            loadSchedules(grid, node);
+                        },
+                        // cr.45 review: a delete that ends failed or lost reloads
+                        // the grid too — pollJob calls onFailed(null) for lost
+                        // when there is no onLost, so one handler covers both.
+                        onFailed: function () {
                             loadSchedules(grid, node);
                         },
                     });

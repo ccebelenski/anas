@@ -1753,12 +1753,16 @@
                 // row to keep selected, not the one selected when it left.
                 var priorSel = selectedTask(grid);
                 var priorName = priorSel ? priorSel.get('name') : null;
-                if (!quiet) {
-                    try {
-                        grid.setLoading(false);
-                    } catch (e) {
-                        // non-fatal
-                    }
+                // cr.45 review: the response that IS the newest clears the mask
+                // even when its own load was quiet — a quiet load issued under a
+                // masked one would otherwise leave that mask up forever once the
+                // masked load's response goes stale and stops touching it
+                // (setLoading(false) is a no-op when no mask is up). Applies to
+                // error alike, below; only a STALE response keeps its hands off.
+                try {
+                    grid.setLoading(false);
+                } catch (e) {
+                    // non-fatal
                 }
                 var list = (res && res.data) || [];
                 var rows = [];
@@ -1792,12 +1796,13 @@
                     return;
                 }
                 grid.anasReloading = false;
-                if (!quiet) {
-                    try {
-                        grid.setLoading(false);
-                    } catch (e) {
-                        // non-fatal
-                    }
+                // The newest response clears the mask whether its own load was
+                // quiet or not (see the success branch) — a fresh FAILURE must
+                // leave a quiet poll's mask down too.
+                try {
+                    grid.setLoading(false);
+                } catch (e) {
+                    // non-fatal
                 }
                 ANAS.warn('backup tasks load failed: ' + ANAS.errText(err));
             });
@@ -1806,6 +1811,10 @@
 
     ANAS.backup = ANAS.backup || {};
     ANAS.backup.reload = loadTasks;
+    // The delete door, exposed for poll-job.harness.mjs (cr.45 review) — it
+    // must go through runJob, and that is only provable from the call site.
+    // (The toolbar's Delete button calls the same function directly.)
+    ANAS.backup.deleteTask = deleteTask;
     // The grid's Last run cell, exposed for the pill harness (lastrun-pill.harness.mjs).
     ANAS.backup.renderLastRun = renderLastRun;
     // The second doors (a door opens the EXISTING dialog, never a second
@@ -4274,7 +4283,7 @@
             path: '/backup/tasks/' + encodeURIComponent(name) + '/run',
             body: {},
             view: grid,
-            maxMs: 600000, // a real backup can run for minutes — keep polling
+            maxMs: 600000, // a real backup can run for minutes — don't announce "still running" (maxMs) before then; the poll keeps going regardless
             failTitle: 'Run failed',
             onComplete: function (job) {
                 // Retention (16.11): the prune counts ride the job result, and a
@@ -4443,6 +4452,12 @@
                         failTitle: 'Delete failed',
                         successMsg: t('Backup task deleted') + ': ' + name,
                         onComplete: function () {
+                            loadTasks(view, node);
+                        },
+                        // cr.45 review: a delete that ends failed or lost reloads
+                        // the grid too — pollJob calls onFailed(null) for lost
+                        // when there is no onLost, so one handler covers both.
+                        onFailed: function () {
                             loadTasks(view, node);
                         },
                     });
@@ -7014,8 +7029,10 @@
             // guarded, because the operator may close it while the job runs.
             view: win._view || win,
             // A whole-image restore re-reads every byte of the source and can
-            // run for hours — the 15 s poll default would fire onComplete on
-            // a still-running job. Same budget as the files half.
+            // run for hours — keep the "still running" announcement (which
+            // fires once at maxMs) past any ordinary run's span. The poll
+            // continues until the job ends either way. Same budget as the
+            // files half.
             maxMs: 3600000,
             confirmWindow: true,
             confirmTitle: confirmTitle,

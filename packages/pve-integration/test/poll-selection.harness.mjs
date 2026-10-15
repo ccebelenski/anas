@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 /*
  * ANAS — cr.46 harness: poll responses applied to the selection they were
- * made for, and deletes through runJob.
+ * made for, deletes through runJob, and the loading-mask / sequence rules the
+ * cr.45 review added.
  *
- * Two behaviours, both lived in the UI, both proven against the REAL panel
- * loaders (10-api.js + 65-replication.js + 69-snapshots.js run in a vm with
- * the ExtJS surface stubbed — the idiom of edit-retarget.harness.mjs):
+ * Behaviours, all lived in the UI, all proven against the REAL panel loaders
+ * (10-api.js + 65-replication.js + 69-snapshots.js + 68-backup.js +
+ * 69-scrubs.js run in a vm with the ExtJS surface stubbed — the idiom of
+ * edit-retarget.harness.mjs):
  *
  *   a. a row the operator picks WHILE a refresh is in flight survives the
  *      refresh — the selection is read when the response arrives, not when
@@ -17,6 +19,13 @@
  *   c. the replication task delete and the snapshot-schedule delete go
  *      through ANAS.runJob — not api.del, not a hand-rolled pollJob — so the
  *      failure alert and the grid reload come from the shared helper.
+ *   c3/c4  a masked load followed by a quiet load: the QUIET response that is
+ *      the newest clears the mask (success and failure alike), and the stale
+ *      masked one never touches it or the grid (cr.45 review, item 3);
+ *   d/e/f  the SCHEDULES loader carries the same rules (item 5): the
+ *      selection is read at response time, a stale response is dropped, and
+ *      the newest quiet success / failure clears the mask;
+ *   g/h    the backup and scrub loaders get the same mask rule.
  *
  *   node packages/pve-integration/test/poll-selection.harness.mjs
  *
@@ -37,8 +46,14 @@ const state = {
   taskData: [],
   /** The rows GET /schedules answers with. */
   schedulesData: [],
+  /** The rows GET /backup/tasks answers with. */
+  backupData: [],
+  /** The rows GET /scrub answers with. */
+  scrubData: [],
   /** Hold the next N api.get calls until release(i) is called. */
   holdNext: 0,
+  /** When set, hold only calls whose path contains this substring. */
+  holdForPath: null,
   /** Every deferred a held GET handed out: { resolve, reject, path }. */
   pending: [],
   getCalls: [],
@@ -56,7 +71,10 @@ const state = {
 function reset() {
   state.taskData = []
   state.schedulesData = []
+  state.backupData = []
+  state.scrubData = []
   state.holdNext = 0
+  state.holdForPath = null
   state.pending = []
   state.getCalls = []
   state.dels = []
@@ -85,6 +103,10 @@ const Ext = {
 function fixtureFor(path) {
   if (path === '/replication/tasks') { return { data: state.taskData.slice() } }
   if (path === '/schedules') { return { data: state.schedulesData.slice() } }
+  if (path === '/backup/tasks') { return { data: state.backupData.slice() } }
+  if (path === '/scrub') { return { data: state.scrubData.slice() } }
+  if (path === '/backup/repos') { return { data: [] } }
+  if (path === '/jobs?status=completed') { return { data: [] } }
   return { data: [] }
 }
 
@@ -125,7 +147,12 @@ function loadUi() {
     tbar: items => ({ xtype: 'toolbar', items }),
     pollJob: () => Promise.resolve({}),
     gfx: { ready: () => false },
-    sched: { absTime: v => String(v || ''), fsTag: kind => `[${kind}] ` },
+    sched: {
+      absTime: v => String(v || ''),
+      fsTag: kind => `[${kind}] `,
+      cadence: { of: () => '', text: () => '' },
+      cancellable: () => false,
+    },
     notifyMode: {
       field: cfg => Object.assign({ xtype: 'combobox' }, cfg),
       of: (v, d) => v || d,
@@ -137,8 +164,13 @@ function loadUi() {
         // The value is captured WHEN THE REQUEST LEAVES, like a real server
         // snapshot; the promise resolves (or rejects) only when the test says.
         const value = fixtureFor(path)
-        if (state.holdNext > 0) {
-          state.holdNext -= 1
+        // holdForPath lets a test hold only ONE read in a loader that issues
+        // two (backup: repos then tasks; scrub: scrub then jobs).
+        const hold = state.holdForPath
+          ? path.indexOf(state.holdForPath) !== -1
+          : state.holdNext > 0
+        if (hold) {
+          if (state.holdNext > 0) { state.holdNext -= 1 }
           return new Promise((resolve, reject) => {
             state.pending.push({ resolve, reject, path })
           })
@@ -158,6 +190,8 @@ function loadUi() {
   })
   vm.runInNewContext(readFileSync(join(SRC, '65-replication.js'), 'utf8'), sandbox, { filename: '65-replication.js' })
   vm.runInNewContext(readFileSync(join(SRC, '69-snapshots.js'), 'utf8'), sandbox, { filename: '69-snapshots.js' })
+  vm.runInNewContext(readFileSync(join(SRC, '68-backup.js'), 'utf8'), sandbox, { filename: '68-backup.js' })
+  vm.runInNewContext(readFileSync(join(SRC, '69-scrubs.js'), 'utf8'), sandbox, { filename: '69-scrubs.js' })
   return win.ANAS
 }
 
@@ -212,6 +246,26 @@ function replTask(name) {
   return {
     task: { name, source: { pool: 'tank' }, target: { pool: 'backup' }, schedule: 'daily', enabled: true },
     lastRunResult: 'success',
+  }
+}
+
+function schedEntry(id, name) {
+  return {
+    schedule: { id, name, target: {} },
+    lastRunResult: 'unknown',
+  }
+}
+
+function scrubState(pool) {
+  return { target: { pool, kind: 'zfs' }, enabled: true, cadence: 'monthly' }
+}
+
+// The backup loader resolves the grid through the view's down('#backupGrid').
+function backupView(grid) {
+  return {
+    destroyed: false,
+    destroying: false,
+    down: q => q === '#backupGrid' ? grid : null,
   }
 }
 
@@ -369,6 +423,215 @@ function eq(label, actual, expected) {
   await settle()
   ok('c2: the schedules grid reload rides the completion',
     state.getCalls.filter(p => p === '/schedules').length === 1, state.getCalls.join(' '))
+}
+
+// =============================================================================
+//  c3. the loading-mask rule (cr.45 review, item 3): a masked load then a
+//  quiet load — the QUIET response arrives first and clears the mask (it IS
+//  the newest), and the stale masked one leaves mask and grid alone.
+// =============================================================================
+{
+  reset()
+  const grid = makeGrid()
+  state.taskData = [replTask('alpha')]
+  ANAS.replication.reload(grid, 'n1')
+  await settle()
+
+  state.holdNext = 2
+  ANAS.replication.reload(grid, 'n1')       // masked, held — request #1
+  ANAS.replication.reload(grid, 'n1', true) // quiet, held — request #2
+  eq('c3: the mask is up', grid.loading, true)
+
+  state.pending[1].resolve(fixtureFor('/replication/tasks'))
+  await settle()
+  eq('c3: the newest QUIET success clears the mask', grid.loading, false)
+
+  state.pending[0].resolve({ data: [replTask('alpha')] })
+  await settle()
+  eq('c3: the stale masked response leaves the mask down', grid.loading, false)
+  eq('c3: the stale response did not repaint', JSON.stringify(grid.names()), JSON.stringify(['alpha']))
+}
+
+// c4. the SAME rule on the failure branch — a quiet FAILURE is the newest, so
+// it clears the mask and warns; the stale masked failure stays silent.
+{
+  reset()
+  const grid = makeGrid()
+  state.taskData = [replTask('alpha')]
+  ANAS.replication.reload(grid, 'n1')
+  await settle()
+
+  state.holdNext = 2
+  ANAS.replication.reload(grid, 'n1')
+  ANAS.replication.reload(grid, 'n1', true)
+  eq('c4: the mask is up', grid.loading, true)
+
+  state.pending[1].reject(new Error('quiet boom'))
+  await settle()
+  eq('c4: the newest quiet FAILURE clears the mask', grid.loading, false)
+  ok('c4: and warns its own error', state.warnings.some(w => /quiet boom/.test(w)), state.warnings.join(' | '))
+
+  state.pending[0].reject(new Error('stale thing'))
+  await settle()
+  eq('c4: a stale failure still leaves the mask alone', grid.loading, false)
+  eq('c4: and does not warn over the newer load',
+    state.warnings.filter(w => /stale thing/.test(w)).length, 0)
+}
+
+// =============================================================================
+//  d. the SCHEDULES loader (item 5) — the selection is read at RESPONSE time:
+//  a pick made while the refresh was in flight survives it.
+// =============================================================================
+{
+  reset()
+  const grid = makeGrid()
+  state.schedulesData = [schedEntry('vault-daily', 'Vault daily'), schedEntry('backup-daily', 'Backup daily')]
+  ANAS.schedules.reload(grid, 'n1')
+  await settle()
+  eq('d: the schedules grid loaded', JSON.stringify(grid.names()), JSON.stringify(['Vault daily', 'Backup daily']))
+  grid.pick('Vault daily')
+
+  state.holdNext = 1
+  ANAS.schedules.reload(grid, 'n1')
+  grid.pick('Backup daily')
+  state.pending[0].resolve(fixtureFor('/schedules'))
+  await settle()
+  eq('d: the response-arrives read keeps the in-flight pick', JSON.stringify(grid.selectedNames()), JSON.stringify(['Backup daily']))
+  eq('d: the grid still holds both rows', JSON.stringify(grid.names()), JSON.stringify(['Vault daily', 'Backup daily']))
+}
+
+// =============================================================================
+//  e. the SCHEDULES loader drops a response older than the newest request.
+// =============================================================================
+{
+  reset()
+  const grid = makeGrid()
+  state.schedulesData = [schedEntry('vault-daily', 'Vault daily')]
+  ANAS.schedules.reload(grid, 'n1')
+  await settle()
+
+  state.holdNext = 1
+  ANAS.schedules.reload(grid, 'n1', true)
+  state.schedulesData = [schedEntry('zulu', 'Zulu')]
+  state.holdNext = 1
+  ANAS.schedules.reload(grid, 'n1', true)
+  eq('e: two requests are in flight', state.pending.length, 2)
+
+  state.pending[1].resolve(fixtureFor('/schedules'))
+  await settle()
+  eq('e: the newer response painted', JSON.stringify(grid.names()), JSON.stringify(['Zulu']))
+
+  // The OLDER answer lands late carrying a THIRD shape: it must not repaint.
+  state.pending[0].resolve({ data: [schedEntry('alpha', 'Alpha')] })
+  await settle()
+  eq('e: the stale response did not repaint', JSON.stringify(grid.names()), JSON.stringify(['Zulu']))
+}
+
+// =============================================================================
+//  f. the SCHEDULES loader mask rule: a masked load then a quiet load — the
+//  quiet response arrives first and clears, the stale masked one stays out.
+// =============================================================================
+{
+  reset()
+  const grid = makeGrid()
+  state.schedulesData = [schedEntry('vault-daily', 'Vault daily')]
+  ANAS.schedules.reload(grid, 'n1')
+  await settle()
+
+  state.holdNext = 2
+  ANAS.schedules.reload(grid, 'n1')
+  ANAS.schedules.reload(grid, 'n1', true)
+  eq('f: the mask is up', grid.loading, true)
+
+  state.pending[1].resolve(fixtureFor('/schedules'))
+  await settle()
+  eq('f: the newest QUIET success clears the mask', grid.loading, false)
+
+  state.pending[0].resolve({ data: [schedEntry('alpha', 'Alpha')] })
+  await settle()
+  eq('f: the stale masked response leaves the mask down', grid.loading, false)
+  eq('f: the stale response did not repaint', JSON.stringify(grid.names()), JSON.stringify(['Vault daily']))
+}
+
+// f2. the schedules failure branch of the same rule.
+{
+  reset()
+  const grid = makeGrid()
+  state.schedulesData = [schedEntry('vault-daily', 'Vault daily')]
+  ANAS.schedules.reload(grid, 'n1')
+  await settle()
+
+  state.holdNext = 2
+  ANAS.schedules.reload(grid, 'n1')
+  ANAS.schedules.reload(grid, 'n1', true)
+  eq('f2: the mask is up', grid.loading, true)
+
+  state.pending[1].reject(new Error('schedule boom'))
+  await settle()
+  eq('f2: the newest quiet FAILURE clears the mask', grid.loading, false)
+  ok('f2: and warns', state.warnings.some(w => /schedule boom/.test(w)), state.warnings.join(' | '))
+
+  state.pending[0].reject(new Error('stale boom'))
+  await settle()
+  eq('f2: a stale failure leaves the mask alone', grid.loading, false)
+}
+
+// =============================================================================
+//  g. the BACKUP loader gets the same mask rule (item 3) — the repos read is
+//  left instant, only the /backup/tasks read is held.
+// =============================================================================
+{
+  reset()
+  const grid = makeGrid()
+  state.backupData = [replTask('alpha')]
+  const view = backupView(grid)
+  ANAS.backup.reload(view, 'n1')
+  await settle()
+  eq('g: the backup grid loaded', JSON.stringify(grid.names()), JSON.stringify(['alpha']))
+
+  state.holdForPath = '/backup/tasks'
+  ANAS.backup.reload(view, 'n1')
+  await settle() // let the repos read resolve and the tasks read go out
+  ANAS.backup.reload(view, 'n1', true)
+  await settle()
+  eq('g: the mask is up', grid.loading, true)
+  eq('g: both task reads were held', state.pending.length, 2)
+
+  state.pending[1].resolve(fixtureFor('/backup/tasks'))
+  await settle()
+  eq('g: the newest QUIET success clears the mask', grid.loading, false)
+
+  state.pending[0].resolve({ data: [replTask('alpha')] })
+  await settle()
+  eq('g: the stale masked response leaves the mask down', grid.loading, false)
+}
+
+// =============================================================================
+//  h. the SCRUB loader gets the same mask rule (item 3) — the jobs read is
+//  left instant, only the /scrub read is held.
+// =============================================================================
+{
+  reset()
+  const grid = makeGrid()
+  state.scrubData = [scrubState('tank')]
+  const scrubPools = () => JSON.stringify(grid._rows.map(r => r.get('pool')))
+  ANAS.scrubs.reload(grid, 'n1')
+  await settle()
+  eq('h: the scrub grid loaded', scrubPools(), JSON.stringify(['tank']))
+
+  state.holdForPath = '/scrub'
+  ANAS.scrubs.reload(grid, 'n1')
+  ANAS.scrubs.reload(grid, 'n1', true)
+  eq('h: the mask is up', grid.loading, true)
+  eq('h: both scrub reads were held', state.pending.length, 2)
+
+  state.pending[1].resolve(fixtureFor('/scrub'))
+  await settle()
+  eq('h: the newest QUIET success clears the mask', grid.loading, false)
+
+  state.pending[0].resolve({ data: [scrubState('tank')] })
+  await settle()
+  eq('h: the stale masked response leaves the mask down', grid.loading, false)
 }
 
 // ---- Report -----------------------------------------------------------------

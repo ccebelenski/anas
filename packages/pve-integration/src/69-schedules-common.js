@@ -223,7 +223,8 @@
             body: {},
             view: opts.view,
             // Two SIGINTs 10 s apart is the daemon's worst case before it
-            // answers; the poll must outlast it.
+            // answers — keep the "still running" announcement (maxMs) past
+            // that; the poll goes on until the job ends either way.
             maxMs: 45000,
             confirmWindow: true,
             confirmTitle: t('Cancel run'),

@@ -260,11 +260,17 @@
     // — every panel's onFailed reloads/re-enables what onSubmitted disabled,
     // which is the right recovery when the outcome is unknown (jobRejected
     // already calls onFailed(null) the same way).
+    //
+    // Both windows are WALL-CLOCK (cr.45 review): elapsed() runs from the
+    // moment polling began and sinceOk() from the last SUCCESSFUL poll's
+    // arrival — a request that takes a long time to answer counts as time the
+    // job was being watched / contact was missing, not just the scheduled
+    // delays. Date.now() drives them, so a fake clock in a harness can too.
     ANAS.pollJob = function (node, jobId, opts) {
         var maxMs = opts.maxMs || 15000;
         var view = opts.view;
-        var elapsed = 0;   // ms watching the job — drives the cadence and maxMs
-        var sinceOk = 0;   // ms since the last SUCCESSFUL poll — drives lost-contact
+        var beganAt = Date.now();   // wall clock when the poll loop started
+        var lastOkAt = beganAt;     // wall clock of the last SUCCESSFUL poll
         var retryIdx = 0;
         var announced = false;
         var subject = opts.what || '';
@@ -288,17 +294,23 @@
             if (opts.onLost) { opts.onLost(err); }
             else if (opts.onFailed) { opts.onFailed(null); }
         }
+        // Wall time since polling began — drives the cadence and maxMs
+        // still-running announcement (a request in flight is time on it).
+        function elapsed() {
+            return Date.now() - beganAt;
+        }
+        // Wall time since the last SUCCESSFUL poll — drives lost-contact
+        // (before the first success, since the loop began).
+        function sinceOk() {
+            return Date.now() - lastOkAt;
+        }
         function nextDelay() {
             if (announced) { return 5000; }
-            return elapsed >= 5000 ? 2000 : 500;
+            return elapsed() >= 5000 ? 2000 : 500;
         }
-        // Time only advances when a poll fires: each scheduled delay counts
-        // toward both windows, retries included — the job runs while we retry.
         function schedule(ms) {
             setTimeout(function () {
                 if (dead()) { return; }
-                elapsed += ms;
-                sinceOk += ms;
                 tick();
             }, ms);
         }
@@ -306,7 +318,7 @@
             if (dead()) { return; }
             api.get(node, '/jobs/' + encodeURIComponent(jobId)).then(function (res) {
                 if (dead()) { return; }
-                sinceOk = 0;
+                lastOkAt = Date.now();
                 retryIdx = 0;
                 var job = res && res.job;
                 var status = job && job.status;
@@ -339,7 +351,7 @@
                     if (opts.onFailed) { opts.onFailed(job); }
                     return;
                 }
-                if (!announced && elapsed >= maxMs) {
+                if (!announced && elapsed() >= maxMs) {
                     announced = true;
                     if (opts.onStillRunning) {
                         opts.onStillRunning(job);
@@ -360,7 +372,7 @@
                     return;
                 }
                 ANAS.warn('job poll failed: ' + ANAS.errText(err));
-                if (sinceOk >= LOST_CONTACT_MS) {
+                if (sinceOk() >= LOST_CONTACT_MS) {
                     lost(err, ANAS.t('Lost contact'),
                         ANAS.t('Lost contact with the node while') + ' ' + ANAS.enc(what()) + ' '
                         + ANAS.t('was running; it may still be running. Refresh to see the result.'));

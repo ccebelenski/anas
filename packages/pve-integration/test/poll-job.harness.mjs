@@ -3,15 +3,19 @@
  * ANAS — pollJob harness (story cr.45, docs/WAVE3-DESIGN.md §7.2).
  *
  * Loads the real 00-core.js + 10-api.js (+ 69-schedules-common.js for the
- * cancel-run flow) in a vm sandbox with a stub Ext, a scripted stub fetch and
- * a FAKE clock: setTimeout records timers and the driver fires them in order,
- * draining microtasks between firings so the real promise chains run. Nothing
- * sleeps for real.
+ * cancel-run flow, and the four view files for the delete-through-runJob
+ * cases) in a vm sandbox with a stub Ext, a scripted stub fetch and a FAKE
+ * clock: setTimeout records timers and the driver fires them in order,
+ * draining microtasks between firings so the real promise chains run. The
+ * sandbox's Date.now() IS the fake clock, so pollJob's wall-clock windows
+ * (cr.45 review) measure fake time. Nothing sleeps for real.
  *
  * Checked sequences:
  *   a  completes → onComplete once
  *   b  running past maxMs → onStillRunning once, still polling, then
  *      completed → onComplete once (and only then)
+ *   b2 maxMs is wall-clock: one still-running poll that takes 30 s to answer
+ *      announces onStillRunning at its response
  *   c  still running at maxMs → onComplete NOT called
  *   d  404 → terminal lost: onLost(err), or onFailed(null) without onLost;
  *      polling stops
@@ -19,9 +23,17 @@
  *      1 s and 2 s retry delays observed
  *   f  60 s without a successful poll → lost contact, onFailed(null); the
  *      <what> interpolation is HTML-encoded (cr.11 idiom)
+ *   f2 the lost-contact window is wall-clock: every poll takes 30 s to fail,
+ *      so the terminal fires at the first failure whose end is ≥ 60 s after
+ *      the last success (~3 polls, ~62 s), not at ~365 s after ~11
  *   g  view destroyed mid-poll → silent stop, no callbacks
  *   h  the cancel-run flow (69-schedules-common.js) toasts "Run cancelled"
  *      only when the cancel job reaches completed
+ *   i–n a delete that ends failed or lost reloads its grid: the replication
+ *      task delete, the snapshot-schedule delete and the backup task delete
+ *      (the last through confirmAndRun's 409→confirm→202 dance) each fire the
+ *      reload from onFailed when the real runJob → pollJob sees status failed,
+ *      and from onFailed(null) when the job is lost (404)
  */
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -33,6 +45,14 @@ const SRC = join(HERE, '..', 'src')
 const coreSrc = readFileSync(join(SRC, '00-core.js'), 'utf8')
 const apiSrc = readFileSync(join(SRC, '10-api.js'), 'utf8')
 const schedSrc = readFileSync(join(SRC, '69-schedules-common.js'), 'utf8')
+// The four view files: the delete callers (65-replication, 69-snapshots,
+// 68-backup) and the scrub loader (69-scrubs) so their flows run against the
+// REAL runJob → pollJob. 69-scrubs is loaded for symmetry with the loaders the
+// sibling harness exercises; only deleteTask/deleteSchedule are driven here.
+const replSrc = readFileSync(join(SRC, '65-replication.js'), 'utf8')
+const snapSrc = readFileSync(join(SRC, '69-snapshots.js'), 'utf8')
+const backupSrc = readFileSync(join(SRC, '68-backup.js'), 'utf8')
+const scrubSrc = readFileSync(join(SRC, '69-scrubs.js'), 'utf8')
 
 // ---- env factory: fresh sandbox, fake clock and scripted fetch per case ----
 
@@ -53,34 +73,57 @@ function makeEnv(handle) {
       },
     },
     toast: function (msg) { toasts.push(msg) },
-    Msg: { alert: function (title, msg) { alerts.push({ title, msg }) } },
+    Msg: {
+      alert: function (title, msg) { alerts.push({ title, msg }) },
+      // The delete callers confirm first; the driver answers 'yes'. The 409
+      // confirm path (68-backup) re-uses it for the challenge dialog.
+      confirm: function (title, msg, fn) { fn('yes') },
+    },
   }
 
-  function ok(bodyText) {
-    return {
-      status: 200,
-      statusText: 'OK',
-      headers: { get: function () { return null } },
-      text: function () { return Promise.resolve(bodyText) },
-    }
-  }
-
+  // A handle's fetch answer: { status, statusText, body, networkError?,
+  // confirmCode? } plus delayMs to make a request take wall-clock time — the
+  // response lands on a real timer, so pollJob's Date.now() windows measure
+  // it. confirmCode is surfaced through X-Anas-Confirm-Code for the 409 dance.
   const sandbox = {
     console,
     Promise,
+    // The fake clock doubles as Date.now — pollJob's wall-clock windows
+    // (cr.45 review) must be driven by the same timers that fire the polls.
+    Date: {
+      now: function () { return now },
+      parse: Date.parse,
+    },
     Ext,
     fetch: function (url, opts) {
       const method = ((opts && opts.method) || 'GET').toUpperCase()
       calls.push({ method, url })
       const r = handle(method, url, calls)
-      if (r && r.networkError) return Promise.reject(new Error(r.networkError))
-      const body = typeof r.body === 'string' ? r.body : JSON.stringify(r.body)
-      return Promise.resolve({
-        status: r.status || 200,
-        statusText: r.statusText || (r.status === 200 ? 'OK' : 'Err'),
-        headers: { get: function () { return null } },
-        text: function () { return Promise.resolve(body) },
-      })
+      const respond = function () {
+        if (r && r.networkError) return Promise.reject(new Error(r.networkError))
+        const body = typeof r.body === 'string' ? r.body : JSON.stringify(r.body)
+        return Promise.resolve({
+          status: r.status || 200,
+          statusText: r.statusText || (r.status === 200 ? 'OK' : 'Err'),
+          headers: {
+            get: function (name) {
+              if (name === 'x-anas-confirm-code' && r && r.confirmCode) {
+                return r.confirmCode
+              }
+              return null
+            },
+          },
+          text: function () { return Promise.resolve(body) },
+        })
+      }
+      if (r && r.delayMs) {
+        return new Promise(function (resolve, reject) {
+          timers.push({ at: now + r.delayMs, seq: seq++, fn: function () {
+            respond().then(resolve, reject)
+          } })
+        })
+      }
+      return respond()
     },
     setTimeout: function (fn, ms) {
       delays.push({ at: now, ms: ms || 0 })
@@ -94,6 +137,10 @@ function makeEnv(handle) {
   vm.runInContext(coreSrc, sandbox, { filename: '00-core.js' })
   vm.runInContext(apiSrc, sandbox, { filename: '10-api.js' })
   vm.runInContext(schedSrc, sandbox, { filename: '69-schedules-common.js' })
+  vm.runInContext(replSrc, sandbox, { filename: '65-replication.js' })
+  vm.runInContext(snapSrc, sandbox, { filename: '69-snapshots.js' })
+  vm.runInContext(backupSrc, sandbox, { filename: '68-backup.js' })
+  vm.runInContext(scrubSrc, sandbox, { filename: '69-scrubs.js' })
 
   // Drain the real promise chains the fired timers kick off (doFetch wraps
   // fetch().then(res.text().then(...)) — a handful of generations).
@@ -136,6 +183,7 @@ function makeEnv(handle) {
     calls,
     jobPolls,
     scheduledDelays,
+    nowValue: function () { return now },
     advanceTo,
   }
 }
@@ -143,6 +191,57 @@ function makeEnv(handle) {
 const run = () => ({ status: 200, body: { job: { id: 'J', status: 'running', operation: 'test.op' } } })
 const done = () => ({ status: 200, body: { job: { id: 'J', status: 'completed', operation: 'test.op' } } })
 const netErr = () => ({ networkError: 'connect ECONNREFUSED' })
+
+// ---- grid / view stand-ins for the delete → reload cases -------------------
+//
+// The loader's success path calls setLoading, getStore().loadData/findExact,
+// getSelectionModel().getSelection/select and updateButtons — the last walks
+// grid.down('#…') and no-ops on null.
+
+function makeGridStub() {
+  const grid = {
+    destroyed: false,
+    destroying: false,
+    loading: false,
+    _rows: [],
+    _sel: [],
+    setLoading(v) { grid.loading = !!v },
+    getStore: () => store,
+    getSelectionModel: () => selModel,
+    getSelection: () => grid._sel.slice(),
+    down: () => null,
+    names() { return grid._rows.map(r => r.get('name')) },
+  }
+  const store = {
+    loadData(rows) {
+      grid._rows = (rows || []).map(r => ({ get: k => r[k], data: r }))
+      grid._sel = []
+    },
+    findExact(field, value) {
+      return grid._rows.findIndex(r => r.get(field) === value)
+    },
+  }
+  const selModel = {
+    select() {},
+    getSelection: () => grid._sel.slice(),
+  }
+  return grid
+}
+
+// 68-backup's loadTasks resolves the grid THROUGH the view; the real backup
+// window's down('#backupGrid') is stubbed here to return the grid.
+function makeBackupView(grid) {
+  return {
+    destroyed: false,
+    destroying: false,
+    down: function (q) { return q === '#backupGrid' ? grid : null },
+  }
+}
+
+// One full reload the fixture answers; grid must have been populated before.
+function taskRows(ofName) {
+  return { data: [{ task: { name: ofName, source: {}, target: {} }, lastRunResult: 'success' }] }
+}
 
 // ---- assertions ----
 
@@ -338,6 +437,206 @@ async function main() {
     assert('h: toast names the task', count(cancelledToasts) === 1 && contains(cancelledToasts[0], 'nightly'))
     assert('h: reload ran', reloads >= 1)
     assert('h: three polls', env.jobPolls() === 3)
+  }
+
+  // --- b2: maxMs is WALL-CLOCK — a still-running poll that takes 30 s to
+  //        answer announces at ITS response, not after accumulated delays ---
+  {
+    let polls = 0
+    const env = makeEnv(function () {
+      polls++
+      if (polls === 1) return {
+        status: 200,
+        body: { job: { id: 'J', status: 'running', operation: 'test.op' } },
+        delayMs: 30000,
+      }
+      return done()
+    })
+    let still = 0
+    let completes = 0
+    env.ANAS.pollJob('pve1', 'J', {
+      onComplete: function () { completes++ },
+      onStillRunning: function () { still++ },
+    })
+    await env.advanceTo(60000)
+    // The first response lands at ~30.5 s wall — past the 15 s default maxMs,
+    // so the announcement fires on the FIRST answer (the old code, counting
+    // only scheduled delays, would not announce within this window).
+    assert('b2: announced at the first wall-clock response', still === 1)
+    assert('b2: completed after the announced 5 s cadence', completes === 1)
+    assert('b2: exactly two polls', env.jobPolls() === 2)
+  }
+
+  // --- f2: the LOST-CONTACT window is WALL-CLOCK. One success, then every
+  //        poll takes 30 s to fail: the terminal fires at the first failure
+  //        whose end is ≥ 60 s after the last success (~62 s, 3 polls), not
+  //        at ~365 s after ~11 polls (the old delay-accumulation count) ------
+  {
+    let polls = 0
+    const env = makeEnv(function () {
+      polls++
+      if (polls === 1) return run()
+      return { networkError: 'connect timed out', delayMs: 30000 }
+    })
+    let failedCalls = 0
+    let failedArg = 'none'
+    env.ANAS.pollJob('pve1', 'J', {
+      onFailed: function (j) { failedCalls++; failedArg = j },
+    })
+    await env.advanceTo(150000)
+    assert('f2: lost contact on the first failure ending ≥ 60 s after the last success', failedCalls === 1)
+    assert('f2: the lost terminal calls onFailed(null)', failedArg === null)
+    assert('f2: one success + two failing polls reached the terminal', env.jobPolls() === 3)
+    assert('f2: terminal fired at ~62 s of wall clock, not ~365 s', env.nowValue() < 100000)
+    assert('f2: a lost-contact alert', count(env.alerts) === 1 && contains(env.alerts[0].msg, 'Lost contact'))
+  }
+
+  // ---- i–n: a delete that ends failed or lost reloads its grid, through the
+  //      REAL runJob → pollJob (cr.45 review) -------------------------------
+
+  // i: replication task delete → job FAILED → onFailed reloads the grid.
+  {
+    const env = makeEnv(function (method, url) {
+      if (method === 'DELETE') return { status: 202, body: { job: { id: 'J', status: 'running', operation: 'repl.delete' } } }
+      if (method === 'GET' && url.indexOf('/jobs/') !== -1) return {
+        status: 200,
+        body: { job: { id: 'J', status: 'failed', operation: 'repl.delete', error: { message: 'repl-boom' } } },
+      }
+      if (method === 'GET' && url.indexOf('/replication/tasks') !== -1) return { status: 200, body: taskRows('alpha') }
+      return { status: 200, body: {} }
+    })
+    const grid = makeGridStub()
+    env.ANAS.replication.deleteTask('pve1', grid, { get: k => ({ name: 'alpha' }[k]) })
+    await env.advanceTo(5000)
+    const reloadGets = env.calls.filter(c => c.method === 'GET' && c.url.indexOf('/replication/tasks') !== -1).length
+    assert('i: a failed delete reloads the grid', reloadGets === 1)
+    assert('i: the reload repopulated the grid', grid.names().indexOf('alpha') !== -1)
+    assert('i: the job failure alerted', count(env.alerts) === 1 && contains(env.alerts[0].msg, 'repl-boom'))
+  }
+
+  // j: replication task delete → 404 lost → onFailed(null) reloads the grid.
+  {
+    const env = makeEnv(function (method, url) {
+      if (method === 'DELETE') return { status: 202, body: { job: { id: 'J', status: 'running', operation: 'repl.delete' } } }
+      if (method === 'GET' && url.indexOf('/jobs/') !== -1) return { status: 404, body: {} }
+      if (method === 'GET' && url.indexOf('/replication/tasks') !== -1) return { status: 200, body: taskRows('alpha') }
+      return { status: 200, body: {} }
+    })
+    const grid = makeGridStub()
+    env.ANAS.replication.deleteTask('pve1', grid, { get: k => ({ name: 'alpha' }[k]) })
+    await env.advanceTo(5000)
+    const reloadGets = env.calls.filter(c => c.method === 'GET' && c.url.indexOf('/replication/tasks') !== -1).length
+    assert('j: a lost delete reloads the grid', reloadGets === 1)
+    assert('j: the reload repopulated the grid', grid.names().indexOf('alpha') !== -1)
+    assert('j: the lost job alerted', count(env.alerts) === 1 && contains(env.alerts[0].msg, 'no longer knows'))
+  }
+
+  // k: snapshot-schedule delete → job FAILED → onFailed reloads the grid.
+  {
+    const env = makeEnv(function (method, url) {
+      if (method === 'DELETE') return { status: 202, body: { job: { id: 'J', status: 'running', operation: 'sched.delete' } } }
+      if (method === 'GET' && url.indexOf('/jobs/') !== -1) return {
+        status: 200,
+        body: { job: { id: 'J', status: 'failed', operation: 'sched.delete', error: { message: 'sched-boom' } } },
+      }
+      if (method === 'GET' && url.indexOf('/schedules') !== -1) return {
+        status: 200,
+        body: { data: [{ schedule: { id: 'vault', name: 'Vault', target: {} }, lastRunResult: 'unknown' }] },
+      }
+      return { status: 200, body: {} }
+    })
+    const grid = makeGridStub()
+    env.ANAS.schedules.deleteSchedule('pve1', grid, { get: k => ({ id: 'vault', name: 'Vault' }[k]) })
+    await env.advanceTo(5000)
+    const reloadGets = env.calls.filter(c => c.method === 'GET' && c.url.indexOf('/schedules') !== -1).length
+    assert('k: a failed schedule delete reloads the grid', reloadGets === 1)
+    assert('k: the reload repopulated the grid', grid.names().indexOf('Vault') !== -1)
+    assert('k: the job failure alerted', count(env.alerts) === 1 && contains(env.alerts[0].msg, 'sched-boom'))
+  }
+
+  // l: snapshot-schedule delete → 404 lost → onFailed(null) reloads the grid.
+  {
+    const env = makeEnv(function (method, url) {
+      if (method === 'DELETE') return { status: 202, body: { job: { id: 'J', status: 'running', operation: 'sched.delete' } } }
+      if (method === 'GET' && url.indexOf('/jobs/') !== -1) return { status: 404, body: {} }
+      if (method === 'GET' && url.indexOf('/schedules') !== -1) return {
+        status: 200,
+        body: { data: [{ schedule: { id: 'vault', name: 'Vault', target: {} }, lastRunResult: 'unknown' }] },
+      }
+      return { status: 200, body: {} }
+    })
+    const grid = makeGridStub()
+    env.ANAS.schedules.deleteSchedule('pve1', grid, { get: k => ({ id: 'vault', name: 'Vault' }[k]) })
+    await env.advanceTo(5000)
+    const reloadGets = env.calls.filter(c => c.method === 'GET' && c.url.indexOf('/schedules') !== -1).length
+    assert('l: a lost schedule delete reloads the grid', reloadGets === 1)
+    assert('l: the reload repopulated the grid', grid.names().indexOf('Vault') !== -1)
+    assert('l: the lost job alerted', count(env.alerts) === 1 && contains(env.alerts[0].msg, 'no longer knows'))
+  }
+
+  // m: backup task delete — through confirmAndRun's 409 → confirm → resend —
+  //    job FAILED → onFailed reloads the grid. The window shadow stays out of
+  //    scope: deleteTask's op is NOT confirmWindow, so Ext.Msg.confirm drives.
+  {
+    let deletes = 0
+    const env = makeEnv(function (method, url) {
+      if (method === 'DELETE') {
+        deletes++
+        if (deletes === 1) return {
+          status: 409,
+          statusText: 'Conflict',
+          confirmCode: 'C1',
+          body: { error: { code: 'CONFIRMATION_REQUIRED', message: 'confirm first', warnings: [] } },
+        }
+        return { status: 202, body: { job: { id: 'J', status: 'running', operation: 'backup.delete' } } }
+      }
+      if (method === 'GET' && url.indexOf('/jobs/') !== -1) return {
+        status: 200,
+        body: { job: { id: 'J', status: 'failed', operation: 'backup.delete', error: { message: 'backup-boom' } } },
+      }
+      if (method === 'GET' && url.indexOf('/backup/repos') !== -1) return { status: 200, body: { data: [] } }
+      if (method === 'GET' && url.indexOf('/backup/tasks') !== -1) return { status: 200, body: taskRows('alpha') }
+      return { status: 200, body: {} }
+    })
+    const grid = makeGridStub()
+    const view = makeBackupView(grid)
+    env.ANAS.backup.deleteTask(view, 'pve1', { get: k => ({ name: 'alpha' }[k]) })
+    await env.advanceTo(5000)
+    assert('m: the confirm challenge preceded the delete', deletes === 2)
+    const reloadGets = env.calls.filter(c => c.method === 'GET' && c.url.indexOf('/backup/tasks') !== -1).length
+    assert('m: a failed backup delete reloads the grid', reloadGets === 1)
+    assert('m: the reload repopulated the grid', grid.names().indexOf('alpha') !== -1)
+    assert('m: the job failure alerted', count(env.alerts) === 1 && contains(env.alerts[0].msg, 'backup-boom'))
+  }
+
+  // n: backup task delete → 404 lost after the confirmed resend → onFailed(null)
+  //    reloads the grid.
+  {
+    let deletes = 0
+    const env = makeEnv(function (method, url) {
+      if (method === 'DELETE') {
+        deletes++
+        if (deletes === 1) return {
+          status: 409,
+          statusText: 'Conflict',
+          confirmCode: 'C1',
+          body: { error: { code: 'CONFIRMATION_REQUIRED', message: 'confirm first', warnings: [] } },
+        }
+        return { status: 202, body: { job: { id: 'J', status: 'running', operation: 'backup.delete' } } }
+      }
+      if (method === 'GET' && url.indexOf('/jobs/') !== -1) return { status: 404, body: {} }
+      if (method === 'GET' && url.indexOf('/backup/repos') !== -1) return { status: 200, body: { data: [] } }
+      if (method === 'GET' && url.indexOf('/backup/tasks') !== -1) return { status: 200, body: taskRows('alpha') }
+      return { status: 200, body: {} }
+    })
+    const grid = makeGridStub()
+    const view = makeBackupView(grid)
+    env.ANAS.backup.deleteTask(view, 'pve1', { get: k => ({ name: 'alpha' }[k]) })
+    await env.advanceTo(5000)
+    const reloadGets = env.calls.filter(c => c.method === 'GET' && c.url.indexOf('/backup/tasks') !== -1).length
+    assert('n: a lost backup delete reloads the grid', reloadGets === 1)
+    assert('n: the reload repopulated the grid', grid.names().indexOf('alpha') !== -1)
+    assert('n: the lost job alerted', count(env.alerts) === 1 && contains(env.alerts[0].msg, 'no longer knows'))
   }
 
   if (!failures) {

@@ -2446,7 +2446,7 @@
             path: '/cloud/tasks/' + encodeURIComponent(name) + '/run',
             body: {},
             view: grid,
-            maxMs: 600000, // a real sync can run for minutes — keep polling
+            maxMs: 600000, // a real sync can run for minutes — don't announce "still running" (maxMs) before then; the poll keeps going regardless
             failTitle: 'Run failed',
             onComplete: function (job) {
                 var msg = t('Cloud sync finished') + ': ' + name;

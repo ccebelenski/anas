@@ -686,9 +686,13 @@
             } catch (eS) {
                 priorKey = null;
             }
-            if (!quiet) {
-                try { scrubGrid.setLoading(false); } catch (e) { /* non-fatal */ }
-            }
+            // cr.45 review: the response that IS the newest clears the mask
+            // even when its own load was quiet — a quiet load issued under a
+            // masked one would otherwise leave that mask up forever once the
+            // masked load's response goes stale and stops touching it
+            // (setLoading(false) is a no-op when no mask is up). Applies to
+            // error alike, below; only a STALE response keeps its hands off.
+            try { scrubGrid.setLoading(false); } catch (e) { /* non-fatal */ }
             var findingsByPool = {};
             var parityByPool = {};
             try {
@@ -723,9 +727,10 @@
             if (scrubGrid.destroyed || scrubGrid.destroying || scrubGrid._loadSeq !== seq) {
                 return;
             }
-            if (!quiet) {
-                try { scrubGrid.setLoading(false); } catch (e) { /* non-fatal */ }
-            }
+            // The newest response clears the mask whether its own load was
+            // quiet or not (see the success branch) — a fresh FAILURE must
+            // leave a quiet poll's mask down too.
+            try { scrubGrid.setLoading(false); } catch (e) { /* non-fatal */ }
             ANAS.warn('scrub load failed: ' + ANAS.errText(err));
         });
     }
@@ -2218,6 +2223,11 @@
     }
 
     // ---- View registration -------------------------------------------------
+
+    // The loader door, exposed for poll-selection.harness.mjs (cr.45 review)
+    // — the mask/sequence rule is only provable from the call site.
+    ANAS.scrubs = ANAS.scrubs || {};
+    ANAS.scrubs.reload = loadScrub;
 
     ANAS.views['scrubs'] = {
         itemId: 'anas-scrubs',

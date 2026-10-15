@@ -385,12 +385,16 @@
             } catch (eS) {
                 priorName = null;
             }
-            if (!quiet) {
-                try {
-                    grid.setLoading(false);
-                } catch (e) {
-                    // non-fatal
-                }
+            // cr.45 review: the response that IS the newest clears the mask
+            // even when its own load was quiet — a quiet load issued under a
+            // masked one would otherwise leave that mask up forever once the
+            // masked load's response goes stale and stops touching it
+            // (setLoading(false) is a no-op when no mask is up). Applies to
+            // error alike, below; only a STALE response keeps its hands off.
+            try {
+                grid.setLoading(false);
+            } catch (e) {
+                // non-fatal
             }
             var list = (res && res.data) || [];
             var rows = [];
@@ -418,12 +422,13 @@
             if (grid.destroyed || grid.destroying || grid._loadSeq !== seq) {
                 return;
             }
-            if (!quiet) {
-                try {
-                    grid.setLoading(false);
-                } catch (e) {
-                    // non-fatal
-                }
+            // The newest response clears the mask whether its own load was
+            // quiet or not (see the success branch) — a fresh FAILURE must
+            // leave a quiet poll's mask down too.
+            try {
+                grid.setLoading(false);
+            } catch (e) {
+                // non-fatal
             }
             ANAS.warn('replication tasks load failed: ' + ANAS.errText(err));
         });
@@ -2198,6 +2203,12 @@
                         failTitle: 'Delete failed',
                         successMsg: t('Replication task deleted') + ': ' + name,
                         onComplete: function () {
+                            loadTasks(grid, node);
+                        },
+                        // cr.45 review: a delete that ends failed or lost reloads
+                        // the grid too — pollJob calls onFailed(null) for lost
+                        // when there is no onLost, so one handler covers both.
+                        onFailed: function () {
                             loadTasks(grid, node);
                         },
                     });
