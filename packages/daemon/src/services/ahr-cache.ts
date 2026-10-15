@@ -15,6 +15,7 @@ import {
 } from './ahr-cache-state.js'
 import { LVM_MIXED_BLOCK_ARGS, run } from './ahr-exec.js'
 import { readDiskTree } from './ahr-expand-exec.js'
+import { requirePoolVg } from './ahr-identity.js'
 import { isAhrMountReadOnly } from './ahr-topology.js'
 import { pveNotify } from './pve-notify.js'
 
@@ -77,6 +78,9 @@ const LVS_STATE_ARGS = ['--reportformat', 'json', '--units', 'b', '--nosuffix']
 
 /** lsblk args for the cache-slice sweep: the device tree with partition labels. */
 export const AHR_CACHE_LSBLK_ARGS = ['-Jb', '-o', 'NAME,TYPE,SIZE,PARTLABEL']
+
+/** `/dev/sdd1` → `sdd1`: the kernel-name key the lsblk partition index uses. */
+const DEV_PREFIX_RE = /^\/dev\//
 
 /** The trailing partition number of a kernel device name (`sdd1` → 1). */
 const PART_NUMBER_RE = /(\d+)$/
@@ -438,6 +442,11 @@ async function ensureCachePv(
 
 // ---- cache-detach -----------------------------------------------------------
 
+/** The pool's band arrays as the LVM gates match them (`/dev/<kernel>` or `/dev/md/<pool>-r<N>`). */
+function poolBandArrays(pool: AhrPool): Array<{ pool: string, band: number, kernelName?: string }> {
+  return pool.arrays.map(a => ({ pool: pool.name, band: a.band, kernelName: a.kernelName }))
+}
+
 /**
  * `lvconvert --uncache <vg>/<lv>` — the ONE command that releases a dm-cache,
  * in the ONE place that knows how to spell it.
@@ -522,6 +531,11 @@ export interface CacheDetachResult {
  * It ENDS at deleting the partition, not at wiping it: a wiped partition is
  * still a partition, and /v1/disks reports the disk `other` — never
  * `available` — until the slice is removed from the GPT (GT-22).
+ *
+ * The VG verbs (uncache, the orphan lvremove, vgreduce) run only after
+ * `requirePoolVg` (cr.22) proves the VG named like the pool is the pool's: the
+ * slice guards decide which PARTITIONS are ours, and say nothing about whose
+ * VG `<pool>/<lv>` is.
  */
 export async function detachAhrCache(
   executor: CommandExecutor,
@@ -561,6 +575,19 @@ export async function detachAhrCache(
     return true
   })
   const sliceDevices = new Set(slices.flatMap(s => [s.kernelPath, s.path]))
+
+  // THE VG IS THE POOL'S, ON THE DISKS (cr.22, code review H6 finding 3) —
+  // before the uncache, the orphan lvremove and the vgreduce act on the VG
+  // named like the pool. The slice guards above protect PARTITIONS; they say
+  // nothing about the VG, and `lvconvert --uncache <pool>/<lv>` on a VG that
+  // only shares the pool's name would strip someone else's cache. The anchor:
+  // a named PV of the VG that is one of the pool's band arrays or one of its
+  // labelled cache slices. A foreign PV beside that anchor is left alone, as
+  // detach always has.
+  await requirePoolVg(executor, pool.name, {
+    arrays: poolBandArrays(pool),
+    partsByKernel: new Map(labelled.map(s => [s.kernelPath.replace(DEV_PREFIX_RE, ''), { partlabel: cachePartitionLabel(pool.name, s.ordinal) }])),
+  })
 
   // 1. Uncache — drops the cache volume and restores direct service.
   const lvs = await readVgLvs(executor, pool.name)
@@ -706,6 +733,13 @@ export async function recoverFailedAhrCache(
   // topology resolved while the disk was there, else the GPT label udev
   // reported, else nothing. A disk that is gone cannot be asked what it was.
   const device = pool.cache?.devices[0] ?? input.sliceLabel ?? null
+
+  // The VG must be provably the pool's before an UNATTENDED uncache (cr.22):
+  // a named band PV of the pool's anchors it. No slice labels are read here —
+  // the slice is usually the thing that vanished — so a band is the anchor,
+  // which every shape this rung recovers has (a dead cache under the band
+  // guard means every band's md PV is named).
+  await requirePoolVg(executor, pool.name, { arrays: poolBandArrays(pool) })
 
   // 1. Uncache. The pool LV's own attribute is the completion marker (a live
   //    cache volume is the HIDDEN `_cvol`, which `lvs` without `-a` never

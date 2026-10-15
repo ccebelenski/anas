@@ -38,7 +38,8 @@ import { jobRoutes } from '../jobs.js'
  *               band's md PV plus one `[unknown]` → the recovery runs
  *   'absent'    no cache target at all → a no-op 200, whatever the body says
  *   'bandsdown' a dead cache AND an unassembled band: `pvs` shows TWO
- *               `[unknown]` rows → `vgreduce --removemissing` is REFUSED
+ *               `[unknown]` rows → the VG gate refuses (cr.22: no named PV
+ *               of the pool's proves the VG), nothing runs
  *   'readonly'  'failed', plus btrfs already forced read-only by a write that
  *               met the dead cache → the notification says writes are stopped
  *
@@ -435,21 +436,22 @@ describe('AHR cache removal event (ahrcache.1 slice 2)', () => {
       assert.equal(executor.calls.filter(c => c.command === cmd).length, 0, cmd)
   })
 
-  it('REFUSES --removemissing while a band PV is also missing', async () => {
+  it('REFUSES to touch a VG whose every PV is `[unknown]` — nothing proves it is the pool\'s (cr.22)', async () => {
     await build('bandsdown')
     const res = await postEvent()
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(jobQueue, res.json().job.id)
     assert.equal(job.status, 'failed')
-    // GT-19: a stopped band array reads `[unknown]` exactly as a dead cache
-    // device does, and `--removemissing` drops EVERY absent PV — it would evict
-    // the band's PV from a pool that was merely not assembled.
-    assert.match(job.error!.message, /a stopped band array is indistinguishable/)
-    assert.match(job.error!.message, /Bring the band arrays up first/)
+    // This one-band pool's band PV AND cache PV both read `[unknown]`: the VG
+    // shows no device of the pool's at all, which is exactly what a FOREIGN VG
+    // with dead devices looks like beside a same-named array (code review H6,
+    // cr.22). The unattended rung refuses before the uncache. (Real LVM lists a
+    // VG only through a PV it can read, so on a node this VG would not be
+    // listed; the multi-band shape, where `--removemissing` itself is held
+    // back by the band guard, is covered in services/ahr-cache.test.ts.)
+    assert.match(job.error!.message, /volume group 'tank' has no physical volume that is this pool's own array or cache slice/)
     assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/vgreduce').length, 0)
-    // The uncache DID run — it is safe and it restores reads; only the VG edit
-    // is held back.
-    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/lvconvert').length, 1)
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/lvconvert').length, 0)
   })
 
   it('announces the failed auto-recovery with the boot rung\'s error notification', async () => {
@@ -471,9 +473,8 @@ describe('AHR cache removal event (ahrcache.1 slice 2)', () => {
     // proves which nameless PV is the cache's, so the body says what IS known —
     // dm reported the cache failed (ahrcache.1 review).
     assert.match(body, /Pool 'tank' has a read cache that has failed/)
-    // The reason, verbatim from the guard that refused the recovery.
-    assert.match(body, /a stopped band array is indistinguishable/)
-    assert.match(body, /Bring the band arrays up first/)
+    // The reason, verbatim from the gate that refused the recovery (cr.22).
+    assert.match(body, /volume group 'tank' has no physical volume that is this pool's own array or cache slice/)
   })
 
   it('refuses while a cache job is already in flight on the pool', async () => {

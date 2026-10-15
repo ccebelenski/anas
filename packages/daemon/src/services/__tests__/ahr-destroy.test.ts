@@ -941,4 +941,117 @@ describe('destroyAhrPool — the LVM teardown gate (H6)', () => {
     assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/lvremove').length, 1)
     assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/pvremove').length, 2)
   })
+
+  // ---- cr.22 ------------------------------------------------------------------
+
+  const MIXED = ['--config', 'devices/allow_mixed_block_sizes=1']
+  const ok = (stdout = ''): { stdout: string, stderr: string, exitCode: number } => ({ stdout, stderr: '', exitCode: 0 })
+  /** The dead-cache shape of lvm-pvs-cache-missing.json, on t2: the band named, the cache PV `[unknown]`. */
+  const DEAD_CACHE_PVS = report('pv', [
+    { pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' },
+    { pv_name: '[unknown]', vg_name: 't2', pv_size: String(GIB), pv_free: '0', dev_size: '0' },
+  ])
+
+  /** world() plus the acts a full teardown needs, and the LVM reads given. */
+  function teardownWorld(lvm: { pvs: { stdout: string, stderr: string, exitCode: number }[], vgs: { stdout: string, stderr: string, exitCode: number }[], lvs: string }): MockExecutor {
+    const executor = world()
+    executor.addFixture({ command: '/usr/sbin/pvs', results: lvm.pvs })
+    executor.addFixture({ command: '/usr/sbin/vgs', results: lvm.vgs })
+    executor.addFixture({ command: '/usr/sbin/lvs', result: ok(lvm.lvs) })
+    addExamine(executor, T2_MEMBER_EXAMINE)
+    for (const command of ['/usr/sbin/lvconvert', '/usr/sbin/lvremove', '/usr/sbin/vgreduce', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs', '/usr/sbin/mdadm'])
+      executor.addFixture({ command, result: ok() })
+    return executor
+  }
+  const T2_VGS = ok(report('vg', [{ vg_name: 't2', pv_count: '2', lv_count: '1', vg_size: String(3 * GIB), vg_free: '0' }]))
+  const CACHED_LV = report('lv', [{ lv_name: 't2-vol', vg_name: 't2', lv_attr: 'Cwi-aoC-p-', lv_size: String(2 * GIB) }])
+
+  it('cr.22: a dead cache device — uncache, lvremove, `vgreduce --removemissing`, vgremove, and `pvremove` names only /dev/md127', async () => {
+    // LVM as it moves: the missing row stays until the vgreduce; after the
+    // vgremove the band is an orphan PV.
+    const executor = teardownWorld({
+      pvs: [ok(DEAD_CACHE_PVS), ok(DEAD_CACHE_PVS), ok(DEAD_CACHE_PVS), ok(report('pv', [{ pv_name: '/dev/md127', vg_name: '', pv_size: String(2 * GIB), pv_free: String(2 * GIB) }]))],
+      vgs: [T2_VGS, T2_VGS],
+      lvs: CACHED_LV,
+    })
+    await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    const lvmActs = acts(executor).filter(c => ['/usr/sbin/lvconvert', '/usr/sbin/lvremove', '/usr/sbin/vgreduce', '/usr/sbin/vgremove', '/usr/sbin/pvremove'].includes(c.command))
+    assert.deepEqual(lvmActs, [
+      { command: '/usr/sbin/lvconvert', args: [...MIXED, '-y', '--uncache', 't2/t2-vol'] },
+      { command: '/usr/sbin/lvremove', args: ['-y', 't2/t2-vol'] },
+      { command: '/usr/sbin/vgreduce', args: [...MIXED, '--removemissing', 't2'] },
+      { command: '/usr/sbin/vgremove', args: ['-y', 't2'] },
+      { command: '/usr/sbin/pvremove', args: ['-y', '/dev/md127'] },
+    ])
+    assert.ok(progress.includes('Dropping the missing devices from volume group t2'))
+  })
+
+  it('cr.22: `pvremove` is NEVER given `[unknown]`, even when `pvs` still lists the missing row (the review\'s observation)', async () => {
+    // A static pvs answer — exactly what the review's probe saw: the old pass
+    // took every row of the VG, `[unknown]` included.
+    const executor = teardownWorld({ pvs: [ok(DEAD_CACHE_PVS)], vgs: [T2_VGS], lvs: CACHED_LV })
+    await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.deepEqual(executor.calls.filter(c => c.command === '/usr/sbin/pvremove').map(c => c.args), [['-y', '/dev/md127']])
+  })
+
+  it('cr.22: `pvremove` skips a PV the gate did not prove and a PV another VG holds', async () => {
+    const before = report('pv', [{ pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' }])
+    const executor = teardownWorld({
+      pvs: [ok(before), ok(before), ok(before), ok(report('pv', [
+        { pv_name: '/dev/md127', vg_name: '', pv_size: String(2 * GIB), pv_free: '0' },
+        // An orphan PV nobody proved, and a PV of someone else's VG.
+        { pv_name: '/dev/sdz3', vg_name: '', pv_size: String(GIB), pv_free: '0' },
+        { pv_name: '/dev/sdy1', vg_name: 'other', pv_size: String(GIB), pv_free: '0' },
+      ]))],
+      vgs: [ok(report('vg', [{ vg_name: 't2', pv_count: '1' }]))],
+      lvs: report('lv', [{ lv_name: 't2-vol', vg_name: 't2', lv_attr: '-wi-a-----', lv_size: String(2 * GIB) }]),
+    })
+    await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.deepEqual(executor.calls.filter(c => c.command === '/usr/sbin/pvremove').map(c => c.args), [['-y', '/dev/md127']])
+    // No missing PV: no vgreduce at all.
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/vgreduce').length, 0)
+  })
+
+  it('cr.22: the pool\'s own array is not pvremoved once ANOTHER VG holds it (pvremove is never sent at a PV in use)', async () => {
+    const before = report('pv', [{ pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' }])
+    const executor = teardownWorld({
+      pvs: [ok(before), ok(before), ok(before), ok(report('pv', [{ pv_name: '/dev/md127', vg_name: 'other', pv_size: String(2 * GIB), pv_free: '0' }]))],
+      vgs: [ok(report('vg', [{ vg_name: 't2', pv_count: '1' }]))],
+      lvs: report('lv', []),
+    })
+    await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/pvremove').length, 0)
+  })
+
+  it('cr.22: the review\'s shape — a VG of nothing but `[unknown]` rows — refuses before any LVM or md act', async () => {
+    const executor = world()
+    executor.addFixture({ command: '/usr/sbin/vgs', result: T2_VGS })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: ok(report('pv', [
+      { pv_name: '[unknown]', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' },
+      { pv_name: '[unknown]', vg_name: 't2', pv_size: String(GIB), pv_free: '0' },
+    ])) })
+    await assert.rejects(
+      destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
+      /volume group 't2' has no physical volume that is this pool's own array or cache slice/,
+    )
+    for (const never of ['/usr/sbin/lvconvert', '/usr/sbin/lvremove', '/usr/sbin/vgreduce', '/usr/sbin/vgremove', '/usr/sbin/pvremove'])
+      assert.ok(!executor.calls.some(c => c.command === never), never)
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
+  })
+
+  it('cr.22: `vgs` unreadable after the LVs are gone stops before vgremove/pvremove instead of skipping the vgremove', async () => {
+    const before = report('pv', [{ pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' }])
+    const executor = teardownWorld({
+      pvs: [ok(before)],
+      vgs: [ok(report('vg', [{ vg_name: 't2', pv_count: '1' }])), { stdout: '', stderr: 'vgs: locking failed', exitCode: 5 }],
+      lvs: report('lv', [{ lv_name: 't2-vol', vg_name: 't2', lv_attr: '-wi-a-----', lv_size: String(2 * GIB) }]),
+    })
+    await assert.rejects(
+      destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
+      /cannot read LVM volume groups before removing 't2' \(vgs: vgs: locking failed\) — stopping before vgremove/,
+    )
+    for (const never of ['/usr/sbin/vgremove', '/usr/sbin/pvremove'])
+      assert.ok(!executor.calls.some(c => c.command === never), never)
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
+  })
 })

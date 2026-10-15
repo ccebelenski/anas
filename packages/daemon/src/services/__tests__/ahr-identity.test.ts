@@ -7,12 +7,13 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
-import { parsePvsReport, PVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
+import { parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { parseMdadmConfDoc } from '../../parsers/mdadm-conf.js'
 import { mdadmDetailExportArgs, mdadmExamineExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import {
   ahrNameOccupancy,
+  assessVgPvs,
   canonicalMdUuid,
   classifyPartition,
   isIntentStale,
@@ -23,6 +24,7 @@ import {
   poolPvNames,
   readAhrPoolIdentity,
   requireOwnedVgPvs,
+  requirePoolVg,
 } from '../ahr-identity.js'
 
 /** The shipped lvm captures under `fixtures/ahr` — provenance in NOTES.md. */
@@ -302,6 +304,226 @@ describe('readAhrPoolIdentity / classifyPartition', () => {
     // …and an extra UUID admits exactly the array that carries it.
     const id = await readAhrPoolIdentity(executor, 'media', { mdadmConfPath: join(dir, 'mdadm.conf'), extraUuids: [FOREIGN.toUpperCase()] })
     assert.ok(id.arrays.some(a => a.kernelName === 'md9'))
+  })
+})
+
+/**
+ * cr.22 — the gaps a cross-model review found in cr.15's gate. `[unknown]` is
+ * the VG's own metadata saying "a member of mine is missing"; it is the POOL's
+ * missing device only when the VG is provably the pool's, and the proof is a
+ * NAMED PV of the VG that is the pool's own array or cache slice. A VG `vgs`
+ * lists must also have every PV accounted for by `pvs`.
+ */
+describe('cr.22 — `[unknown]` counts only beside a named PV of the pool\'s; every PV must be reported', () => {
+  let dir: string
+  let conf: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-identity-cr22-'))
+    conf = join(dir, 'mdadm.conf')
+    await writeFile(conf, '')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  const AHR0_PVS = loadFixture('lvm-pvs.json') // ahr0: /dev/md126 + /dev/md127
+  const AHR0_VGS = loadFixture('lvm-vgs.json') // ahr0, pv_count 2
+  const CACHE_MISS_PVS = loadFixture('lvm-pvs-cache-missing.json') // gtcache: /dev/md127 + [unknown]
+
+  function vgsOf(rows: { name: string, pvCount?: number }[]): string {
+    return report('vg', rows.map(r => ({ vg_name: r.name, ...(r.pvCount !== undefined ? { pv_count: String(r.pvCount) } : {}) })))
+  }
+  function pvsOf(rows: [string, string][]): string {
+    return report('pv', rows.map(([pv, vg]) => ({ pv_name: pv, vg_name: vg, pv_size: '1073741824', pv_free: '0' })))
+  }
+  function lvmWorld(pvs: string, vgs: string): MockExecutor {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: { stdout: pvs, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: { stdout: vgs, stderr: '', exitCode: 0 } })
+    return executor
+  }
+  /** A hand-built `pve-r1` mirror on md127, next to the node's real `pve` VG. */
+  function pveWorld(pvs: string, vgs: string): MockExecutor {
+    const executor = lvmWorld(pvs, vgs)
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: `Personalities : [raid1]\nmd127 : active raid1 sdc1[1] sdb1[0]\n      1047552 blocks super 1.2 [2/2] [UU]\n\nunused devices: <none>\n`, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: { stdout: exportFor('pvehost:pve-r1', FOREIGN), stderr: '', exitCode: 0 } })
+    return executor
+  }
+
+  describe('finding 1: the review\'s shape is refused', () => {
+    // PVE's own `pve` VG (VM disks) with every device missing, so each of its
+    // PVs reads `[unknown]`; beside it a hand-built md mirror named `pve-r1`.
+    const ALL_UNKNOWN_PVE = pvsOf([['[unknown]', 'pve'], ['[unknown]', 'pve']])
+    const PVE_VGS = vgsOf([{ name: 'pve', pvCount: 2 }])
+
+    it('the unpinned fallback still ADOPTS `pve-r1` for display — and both LVM gates refuse the VG', async () => {
+      const executor = pveWorld(ALL_UNKNOWN_PVE, PVE_VGS)
+      const id = await readAhrPoolIdentity(executor, 'pve', { mdadmConfPath: conf })
+      // isOwnedArray's VG-name fallback (unchanged): no pins, the VG exists,
+      // and the PV list names nobody.
+      assert.deepEqual(id.arrays.map(a => a.dev), ['/dev/md127'])
+      const arrays = id.arrays.map(a => ({ pool: a.pool, band: a.band, kernelName: a.kernelName }))
+      await assert.rejects(
+        requireOwnedVgPvs(executor, 'pve', { arrays }),
+        /volume group 'pve' has no physical volume that is this pool's own array or cache slice \(it shows 2 missing devices \(\[unknown\]\)\)/,
+      )
+      await assert.rejects(requirePoolVg(executor, 'pve', { arrays }), /volume group 'pve' has no physical volume that is this pool's own/)
+    })
+
+    it('a PIN does not change it: `mdadm --detail --scan >> mdadm.conf` writes the same ARRAY line for a hand-built array', async () => {
+      await writeFile(conf, `ARRAY /dev/md/pve-r1 metadata=1.2 name=pvehost:pve-r1 UUID=${FOREIGN}\n`)
+      const executor = pveWorld(ALL_UNKNOWN_PVE, PVE_VGS)
+      const id = await readAhrPoolIdentity(executor, 'pve', { mdadmConfPath: conf })
+      assert.equal(id.pinned.size, 1)
+      assert.deepEqual(id.arrays.map(a => a.dev), ['/dev/md127'])
+      await assert.rejects(
+        requireOwnedVgPvs(executor, 'pve', { arrays: id.arrays }),
+        /has no physical volume that is this pool's own/,
+      )
+    })
+
+    it('the real `pve` VG with its devices present: its named PV is foreign', async () => {
+      const executor = pveWorld(pvsOf([['/dev/sda3', 'pve']]), vgsOf([{ name: 'pve', pvCount: 1 }]))
+      const id = await readAhrPoolIdentity(executor, 'pve', { mdadmConfPath: conf })
+      // The PV list now NAMES the VG's member, and md127 is not it: foreign.
+      assert.equal(id.arrays.length, 0)
+      await assert.rejects(
+        requireOwnedVgPvs(executor, 'pve', { arrays: id.foreign.map(a => ({ pool: a.pool, band: a.band, kernelName: a.kernelName })) }),
+        /volume group 'pve' contains physical volume \/dev\/sda3/,
+      )
+    })
+
+    it('an all-`[unknown]` VG is refused even when the caller passes the pool\'s own arrays', async () => {
+      await assert.rejects(
+        requireOwnedVgPvs(lvmWorld(pvsOf([['[unknown]', 'tank']]), vgsOf([{ name: 'tank', pvCount: 1 }])), 'tank', {
+          arrays: [{ pool: 'tank', band: 1, kernelName: 'md127' }],
+        }),
+        /has no physical volume that is this pool's own array or cache slice \(it shows 1 missing device \(\[unknown\]\)\)/,
+      )
+    })
+  })
+
+  describe('finding 1: every supported shape still passes', () => {
+    it('a dead cache device beside the pool\'s own band (capture: lvm-pvs-cache-missing.json)', async () => {
+      const a = await requireOwnedVgPvs(lvmWorld(CACHE_MISS_PVS, vgsOf([{ name: 'gtcache', pvCount: 2 }])), 'gtcache', {
+        arrays: [{ pool: 'gtcache', band: 1, kernelName: 'md127' }],
+      })
+      assert.deepEqual({ owned: a.owned, foreign: a.foreign, missing: a.missing }, { owned: ['/dev/md127'], foreign: [], missing: 1 })
+    })
+
+    it('a pinned pool with ONE band unassembled — the other band\'s named PV anchors the VG (capture: lvm-pvs.json, md126 gone)', async () => {
+      const captured = JSON.parse(AHR0_PVS) as { report: [{ pv: { pv_name: string }[] }] }
+      captured.report[0].pv[0].pv_name = '[unknown]' // md126 (band 2) did not assemble
+      const a = await requireOwnedVgPvs(lvmWorld(JSON.stringify(captured), AHR0_VGS), 'ahr0', {
+        arrays: [{ pool: 'ahr0', band: 1, kernelName: 'md127' }],
+      })
+      assert.deepEqual({ owned: a.owned, missing: a.missing }, { owned: ['/dev/md127'], missing: 1 })
+    })
+
+    it('a band down with the cache SSD present — the labelled cache slice anchors the VG', async () => {
+      const a = await requireOwnedVgPvs(
+        lvmWorld(pvsOf([['[unknown]', 'tank'], ['/dev/sdd1', 'tank']]), vgsOf([{ name: 'tank', pvCount: 2 }])),
+        'tank',
+        { arrays: [], partsByKernel: new Map([['sdd1', { partlabel: 'tank-cache1' }]]) },
+      )
+      assert.deepEqual({ owned: a.owned, missing: a.missing }, { owned: ['/dev/sdd1'], missing: 1 })
+    })
+
+    it('a legacy adopted UNPINNED pool whose PVs are readable, end to end through the identity read (captures: mdstat-clean, mdadm-export-r1/r2, lvm-pvs, lvm-vgs)', async () => {
+      const executor = lvmWorld(AHR0_PVS, AHR0_VGS)
+      executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: loadFixture('mdstat-clean.txt'), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: { stdout: loadFixture('mdadm-export-r1.txt'), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: { stdout: loadFixture('mdadm-export-r2.txt'), stderr: '', exitCode: 0 } })
+      const id = await readAhrPoolIdentity(executor, 'ahr0', { mdadmConfPath: conf })
+      assert.equal(id.pinned.size, 0)
+      assert.deepEqual(id.arrays.map(a => a.dev).sort(), ['/dev/md126', '/dev/md127'])
+      const a = await requireOwnedVgPvs(executor, 'ahr0', { arrays: id.arrays })
+      assert.deepEqual({ owned: new Set(a.owned), missing: a.missing, foreign: a.foreign }, { owned: new Set(['/dev/md126', '/dev/md127']), missing: 0, foreign: [] })
+    })
+  })
+
+  describe('finding 2: a VG whose PVs `pvs` does not account for is refused', () => {
+    it('`vgs` lists the VG and `pvs` gives it NO row', async () => {
+      const executor = lvmWorld(pvsOf([['/dev/md5', 'other']]), vgsOf([{ name: 'tank', pvCount: 1 }]))
+      const arrays = [{ pool: 'tank', band: 1, kernelName: 'md127' }]
+      await assert.rejects(requireOwnedVgPvs(executor, 'tank', { arrays }), /volume group 'tank' records 1 physical volume but pvs reported none/)
+      await assert.rejects(requirePoolVg(executor, 'tank', { arrays }), /pvs reported none/)
+    })
+
+    it('without a `pv_count` column, zero rows still refuse', async () => {
+      await assert.rejects(
+        requireOwnedVgPvs(lvmWorld(pvsOf([]), vgsOf([{ name: 'tank' }])), 'tank', { arrays: [{ pool: 'tank', band: 1, kernelName: 'md127' }] }),
+        /volume group 'tank' is listed by vgs but pvs reported none/,
+      )
+    })
+
+    it('fewer rows than the VG\'s own `pv_count` (a PV hidden from pvs) — even when every shown PV is the pool\'s', async () => {
+      await assert.rejects(
+        requireOwnedVgPvs(lvmWorld(pvsOf([['/dev/md127', 'tank']]), vgsOf([{ name: 'tank', pvCount: 2 }])), 'tank', { arrays: [{ pool: 'tank', band: 1, kernelName: 'md127' }] }),
+        /records 2 physical volumes but pvs reported only 1/,
+      )
+    })
+
+    it('`pvs` readable and `vgs` failing, and the reverse, refuse the cache gate too (fail closed)', async () => {
+      const arrays = [{ pool: 'tank', band: 1, kernelName: 'md127' }]
+      const vgsFails = new MockExecutor()
+      vgsFails.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: { stdout: pvsOf([['/dev/md127', 'tank']]), stderr: '', exitCode: 0 } })
+      vgsFails.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: { stdout: '', stderr: 'vgs: locking failed', exitCode: 5 } })
+      await assert.rejects(requirePoolVg(vgsFails, 'tank', { arrays }), /cannot read LVM volume groups \(vgs: vgs: locking failed\) — refusing any cache change/)
+      const pvsFails = new MockExecutor()
+      pvsFails.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: { stdout: '', stderr: 'pvs: locking failed', exitCode: 5 } })
+      pvsFails.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: { stdout: vgsOf([{ name: 'tank', pvCount: 1 }]), stderr: '', exitCode: 0 } })
+      await assert.rejects(requirePoolVg(pvsFails, 'tank', { arrays }), /cannot read LVM physical volumes/)
+    })
+  })
+
+  describe('the review\'s other probes', () => {
+    const TANK_ARRAYS = [{ pool: 'tank', band: 1, kernelName: 'md127' }]
+
+    it('cache slice labels: `tank-cache0` is tank\'s; `other-cache0` and `tankx-cache0` are not', async () => {
+      const world = (): MockExecutor => lvmWorld(pvsOf([['/dev/md127', 'tank'], ['/dev/sdd1', 'tank']]), vgsOf([{ name: 'tank', pvCount: 2 }]))
+      await requireOwnedVgPvs(world(), 'tank', { arrays: TANK_ARRAYS, partsByKernel: new Map([['sdd1', { partlabel: 'tank-cache0' }]]) })
+      for (const label of ['other-cache0', 'tankx-cache0']) {
+        await assert.rejects(
+          requireOwnedVgPvs(world(), 'tank', { arrays: TANK_ARRAYS, partsByKernel: new Map([['sdd1', { partlabel: label }]]) }),
+          /volume group 'tank' contains physical volume \/dev\/sdd1/,
+          label,
+        )
+        // The cache gate leaves a foreign PV in the pool's VG alone (detach
+        // ejects only its own slices) — the band anchor proves the VG.
+        await requirePoolVg(world(), 'tank', { arrays: TANK_ARRAYS, partsByKernel: new Map([['sdd1', { partlabel: label }]]) })
+      }
+    })
+
+    it('prefix overlap `tank` / `tank2`: neither VG\'s PVs count for the other', async () => {
+      const pvs = pvsOf([['/dev/md127', 'tank'], ['/dev/md/tank2-r1', 'tank2']])
+      const vgs = vgsOf([{ name: 'tank', pvCount: 1 }, { name: 'tank2', pvCount: 1 }])
+      const a = await requireOwnedVgPvs(lvmWorld(pvs, vgs), 'tank', { arrays: TANK_ARRAYS })
+      assert.deepEqual({ owned: a.owned, rows: a.rows }, { owned: ['/dev/md127'], rows: 1 })
+      // tank2's array inside tank's VG is not tank's band 1.
+      await assert.rejects(
+        requireOwnedVgPvs(lvmWorld(pvsOf([['/dev/md127', 'tank'], ['/dev/md/tank2-r1', 'tank']]), vgsOf([{ name: 'tank', pvCount: 2 }])), 'tank', { arrays: TANK_ARRAYS }),
+        /contains physical volume \/dev\/md\/tank2-r1/,
+      )
+    })
+
+    it('the unreadable-`pvs` adoption: the identity read still adopts the array, the gate refuses the teardown', async () => {
+      const executor = new MockExecutor()
+      executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: loadFixture('mdstat-clean.txt'), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: { stdout: loadFixture('mdadm-export-r1.txt'), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: { stdout: loadFixture('mdadm-export-r2.txt'), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: { stdout: '', stderr: 'pvs: internal error', exitCode: 5 } })
+      executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: { stdout: AHR0_VGS, stderr: '', exitCode: 0 } })
+      const id = await readAhrPoolIdentity(executor, 'ahr0', { mdadmConfPath: conf })
+      assert.equal(id.arrays.length, 2)
+      await assert.rejects(requireOwnedVgPvs(executor, 'ahr0', { arrays: id.arrays }), /cannot read LVM physical volumes/)
+    })
+
+    it('assessVgPvs sorts a capture without reading anything', () => {
+      const a = assessVgPvs('gtcache', parsePvsReport(CACHE_MISS_PVS), parseVgsReport(vgsOf([{ name: 'gtcache', pvCount: 2 }])), { arrays: [{ pool: 'gtcache', band: 1, kernelName: 'md127' }] })
+      assert.equal(a.vg?.pvCount, 2)
+      assert.deepEqual({ owned: a.owned, foreign: a.foreign, missing: a.missing, rows: a.rows }, { owned: ['/dev/md127'], foreign: [], missing: 1, rows: 2 })
+    })
   })
 })
 

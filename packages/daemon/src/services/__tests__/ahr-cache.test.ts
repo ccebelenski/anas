@@ -7,7 +7,7 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
 import { cachePartitionLabel } from '../ahr-cache-state.js'
-import { attachAhrCache, detachAhrCache, findCacheSlices } from '../ahr-cache.js'
+import { attachAhrCache, detachAhrCache, findCacheSlices, recoverFailedAhrCache } from '../ahr-cache.js'
 
 const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/ahr')
 function loadFixture(name: string): string {
@@ -55,6 +55,7 @@ const LVS = '/usr/sbin/lvs'
 const LVCREATE = '/usr/sbin/lvcreate'
 const LVREMOVE = '/usr/sbin/lvremove'
 const LVCONVERT = '/usr/sbin/lvconvert'
+const VGS = '/usr/sbin/vgs'
 
 const MIXED = ['--config', 'devices/allow_mixed_block_sizes=1']
 
@@ -68,7 +69,8 @@ function pool(extra: Partial<AhrPool> = {}, bands = 1): AhrPool {
   return {
     name: POOL,
     lv: { name: POOL_LV, sizeBytes: 1065353216 },
-    arrays: Array.from({ length: bands }, (_, i) => ({ band: i + 1 })),
+    // Band 1 is md127 (the capture's); further bands count down from it.
+    arrays: Array.from({ length: bands }, (_, i) => ({ band: i + 1, kernelName: `md${127 - i}` })),
     ...extra,
   } as AhrPool
 }
@@ -102,6 +104,11 @@ class CacheWorld extends MockExecutor {
   extraPvRows: Record<string, string>[] = []
   /** The node-wide lsblk tree answers exit 0 with output that is not JSON. */
   lsblkGarbage = false
+  /**
+   * Serve this exact `vgs` JSON. By default the pool VG is listed with a
+   * `pv_count` equal to its `pvs` rows — the consistent LVM answer.
+   */
+  vgsOverride: string | null = null
 
   private ok(stdout = ''): ExecResult {
     return { stdout, stderr: '', exitCode: 0 }
@@ -152,6 +159,13 @@ class CacheWorld extends MockExecutor {
     return JSON.stringify({ report: [{ pv: rows }] })
   }
 
+  private vgsJson(): string {
+    if (this.vgsOverride !== null)
+      return this.vgsOverride
+    const rows = (JSON.parse(this.pvsJson()) as { report: [{ pv: { vg_name: string }[] }] }).report[0].pv.filter(r => r.vg_name === POOL).length
+    return JSON.stringify({ report: [{ vg: [{ vg_name: POOL, pv_count: String(rows) }] }] })
+  }
+
   private lvsJson(): string {
     const rows: Record<string, string>[] = [{
       lv_name: POOL_LV,
@@ -189,6 +203,8 @@ lrwxrwxrwx 1 root root 10 Sep 24 20:00 ${CACHE_DISK}-part1 -> ../../sdd1
         return this.ok(this.pvsJson())
       case LVS:
         return this.ok(this.lvsJson())
+      case VGS:
+        return this.ok(this.vgsJson())
       case REALPATH:
         return this.slice ? this.ok('/dev/sdd1\n') : { stdout: '', stderr: 'no such file', exitCode: 1 }
       case SGDISK:
@@ -503,7 +519,28 @@ describe('cache-detach — the step sequence (ahrcache.1, §13/GT-20/GT-22)', ()
     world.cached = true
     // A stopped band array reads `[unknown]` exactly as a dead cache device
     // does. `--removemissing` here would evict the BAND's PV from a pool that
-    // was merely not assembled.
+    // was merely not assembled. Two bands: band 1's md PV still names the VG
+    // as the pool's (cr.22's anchor), band 2's is missing with the cache's.
+    world.pvsOverride = JSON.stringify({
+      report: [{
+        pv: [
+          { pv_name: '/dev/md127', vg_name: POOL, pv_size: '1065353216', pv_free: '0', dev_size: '1068433408' },
+          { pv_name: '[unknown]', vg_name: POOL, pv_size: '1065353216', pv_free: '0', dev_size: '0' },
+          { pv_name: '[unknown]', vg_name: POOL, pv_size: String(CACHE_PV_BYTES), pv_free: '0', dev_size: '0' },
+        ],
+      }],
+    })
+
+    await assert.rejects(
+      detachAhrCache(world, { pool: pool({}, 2) }, noop),
+      /only 1 of 2 band arrays are present.*Bring the band arrays up first/s,
+    )
+    assert.deepEqual(callsTo(world, VGREDUCE), [], 'nothing was reduced')
+  })
+
+  it('cr.22: a VG of nothing but `[unknown]` PVs is refused BEFORE the uncache — it shows no device of the pool\'s', async () => {
+    const world = new CacheWorld()
+    world.cached = true
     world.pvsOverride = JSON.stringify({
       report: [{
         pv: [
@@ -512,12 +549,87 @@ describe('cache-detach — the step sequence (ahrcache.1, §13/GT-20/GT-22)', ()
         ],
       }],
     })
-
     await assert.rejects(
       detachAhrCache(world, { pool: pool() }, noop),
-      /only 0 of 1 band arrays are present.*Bring the band arrays up first/s,
+      /volume group 'gtcache' has no physical volume that is this pool's own array or cache slice \(it shows 2 missing devices/,
     )
-    assert.deepEqual(callsTo(world, VGREDUCE), [], 'nothing was reduced')
+    for (const cmd of [LVCONVERT, LVREMOVE, VGREDUCE, PVREMOVE, WIPEFS, SGDISK])
+      assert.deepEqual(callsTo(world, cmd), [], `${cmd} must not run`)
+  })
+
+  it('cr.22: a same-named VG whose only PV is someone else\'s is never uncached (the slice guards protect partitions, not the VG)', async () => {
+    // A topology that adopted `gtcache` by name, over a VG of that name on an
+    // operator's disk with an lvmcache of its own in front of its LV.
+    const world = new CacheWorld()
+    world.cached = true
+    world.pvsOverride = JSON.stringify({
+      report: [{ pv: [{ pv_name: '/dev/sda3', vg_name: POOL, pv_size: '1065353216', pv_free: '0', dev_size: '1068433408' }] }],
+    })
+    await assert.rejects(
+      detachAhrCache(world, { pool: pool() }, noop),
+      /volume group 'gtcache' has no physical volume that is this pool's own array or cache slice \(it shows \/dev\/sda3\) — refusing any cache change/,
+    )
+    for (const cmd of [LVCONVERT, LVREMOVE, VGREDUCE, PVREMOVE, WIPEFS, SGDISK])
+      assert.deepEqual(callsTo(world, cmd), [], `${cmd} must not run`)
+  })
+
+  it('cr.22: the pool\'s labelled cache slice anchors the VG when no band PV is named (a band down, the SSD present)', async () => {
+    const world = new CacheWorld()
+    world.slice = true
+    world.pv = true
+    world.inVg = true
+    world.pvsOverride = JSON.stringify({
+      report: [{
+        pv: [
+          { pv_name: '[unknown]', vg_name: POOL, pv_size: '1065353216', pv_free: '0', dev_size: '0' },
+          { pv_name: '/dev/sdd1', vg_name: POOL, pv_size: String(CACHE_PV_BYTES), pv_free: '0', dev_size: String(SLICE_BYTES) },
+        ],
+      }],
+    })
+    // The gate passes on the slice; what follows is detach's own business
+    // (its band guard holds `--removemissing` back: band 1 is the missing PV).
+    await assert.rejects(detachAhrCache(world, { pool: pool() }, noop), /only 0 of 1 band arrays are present/)
+  })
+
+  it('cr.22: `vgs` unreadable — detach refuses before any LVM verb (fail closed)', async () => {
+    const world = new CacheWorld()
+    world.cached = true
+    world.slice = true
+    world.pv = true
+    world.inVg = true
+    world.failCommands = [{ command: VGS, stderr: 'vgs: locking failed' }]
+    await assert.rejects(detachAhrCache(world, { pool: pool() }, noop), /cannot read LVM volume groups \(vgs: vgs: locking failed\)/)
+    for (const cmd of [LVCONVERT, LVREMOVE, VGREDUCE, PVREMOVE, WIPEFS, SGDISK])
+      assert.deepEqual(callsTo(world, cmd), [], `${cmd} must not run`)
+  })
+
+  it('cr.22: the UNATTENDED recovery rung refuses the same foreign VG — and still recovers the pool\'s own dead cache', async () => {
+    const foreign = new CacheWorld()
+    foreign.cached = true
+    foreign.pvsOverride = JSON.stringify({
+      report: [{ pv: [{ pv_name: '/dev/sda3', vg_name: POOL, pv_size: '1065353216', pv_free: '0', dev_size: '1068433408' }] }],
+    })
+    await assert.rejects(recoverFailedAhrCache(foreign, { pool: pool() }, noop, { log: noop }), /has no physical volume that is this pool's own array/)
+    assert.deepEqual(callsTo(foreign, LVCONVERT), [])
+    assert.deepEqual(callsTo(foreign, VGREDUCE), [])
+
+    // The pool's own: md127 named, the cache PV `[unknown]` (lvm-pvs-cache-missing.json's shape).
+    const own = new CacheWorld()
+    own.cached = true
+    own.missingPv = true
+    const result = await recoverFailedAhrCache(own, { pool: pool() }, noop, { log: noop })
+    assert.equal(result.uncached, true)
+    assert.deepEqual(callsTo(own, VGREDUCE), [[...MIXED, '--removemissing', POOL]])
+  })
+
+  it('cr.22: no VG of the pool\'s name — a leftover slice is still handed back', async () => {
+    const world = new CacheWorld()
+    world.slice = true
+    world.pv = true // a PV of no VG: the died-and-returned device (§13)
+    world.vgsOverride = JSON.stringify({ report: [{ vg: [] }] })
+    const result = await detachAhrCache(world, { pool: pool() }, noop)
+    assert.deepEqual(result.released, [CACHE_DISK])
+    assert.deepEqual(callsTo(world, LVCONVERT), [])
   })
 
   it('a FOREIGN PV in the pool VG is left alone — only OUR slices are ejected', async () => {

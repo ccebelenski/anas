@@ -5,9 +5,9 @@ import { parseByIdToKernel, parseDiskByIdListing } from '../parsers/disk-by-id.j
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { parseFstab, removeMount } from '../parsers/fstab.js'
 import { lvIsCacheTarget, LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
-import { isMdPvName, matchCachePartitionLabel } from './ahr-cache-state.js'
+import { isMdPvName, matchCachePartitionLabel, UNKNOWN_PV_NAME } from './ahr-cache-state.js'
 import { uncacheAhrLv } from './ahr-cache.js'
-import { run } from './ahr-exec.js'
+import { LVM_MIXED_BLOCK_ARGS, run } from './ahr-exec.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
 import { classifyPartition, readAhrPoolIdentity, requireOwnedVgPvs, resolveMdadmConfPath } from './ahr-identity.js'
 import { clearIntent } from './ahr-intent.js'
@@ -22,7 +22,8 @@ import { ahrSnapshotsMountpoint } from './share-selfservice.js'
  * mutation behind DELETE /v1/ahr/:name. Tears the stack down top-down:
  *
  *   umount (pool mountpoint AND the Previous Versions @snapshots mount)
- *     → fstab lines removed (surgical) → uncache/lvremove/vgremove/pvremove
+ *     → fstab lines removed (surgical) → uncache/lvremove/vgreduce
+ *       --removemissing (only when a PV is missing)/vgremove/pvremove
  *     → mdadm --stop per array → --zero-superblock per member partition
  *     → sgdisk --zap-all per member DISK → partlabel sweep for members no
  *       array still claims (issue #16) → unpin mdadm.conf ARRAY lines
@@ -55,6 +56,7 @@ const PVS = '/usr/sbin/pvs'
 const LVREMOVE = '/usr/sbin/lvremove'
 const VGREMOVE = '/usr/sbin/vgremove'
 const PVREMOVE = '/usr/sbin/pvremove'
+const VGREDUCE = '/usr/sbin/vgreduce'
 const MDADM = '/usr/sbin/mdadm'
 const SGDISK = '/usr/sbin/sgdisk'
 const UPDATE_INITRAMFS = '/usr/sbin/update-initramfs'
@@ -324,7 +326,10 @@ export async function destroyAhrPool(
   // REFUSED whole, and an unreadable pvs/vgs is a refusal too (fail closed).
   // LVM is torn down BEFORE the arrays are stopped below, so a refusal here
   // leaves the md layer standing exactly as it was.
-  await requireOwnedVgPvs(executor, name, {
+  // An `[unknown]` PV passes only beside a NAMED PV of the pool's (cr.22): the
+  // VG is proven the pool's by a device on the pool's own disk, never by the
+  // missing rows alone, and a VG with a PV `pvs` did not report is refused.
+  const proven = await requireOwnedVgPvs(executor, name, {
     arrays: identity.arrays.map(a => ({ pool: a.pool, band: a.band, kernelName: a.kernelName })),
     partsByKernel: index.partsByKernel,
   })
@@ -346,14 +351,43 @@ export async function destroyAhrPool(
     updateProgress(`Removing logical volume ${name}/${lv.name}`)
     await run(executor, LVREMOVE, ['-y', `${name}/${lv.name}`])
   }
+
+  // A MISSING PV (cr.22 finding 4) is a record in the VG's metadata, not a
+  // device: `pvremove` takes device paths, so the literal `[unknown]` can only
+  // fail there and abort the teardown midway — and `vgremove` refuses a VG
+  // that still records a missing PV ("Consider vgreduce --removemissing";
+  // node check owed). The record is dropped from the VG instead, with every LV
+  // already gone: plain `--removemissing` (NEVER `--force`, which deletes LVs)
+  // then has nothing partial to refuse over and drops only the ghost rows,
+  // the step GT-20 measured after `--uncache`. The gate above proved this VG
+  // the pool's, so its missing members are the pool's and go with it.
+  const pvsAfterLvs = await executor.exec(PVS, PVS_ARGS)
+  if (pvsAfterLvs.exitCode !== 0)
+    throw new Error(`cannot read LVM physical volumes after removing the logical volumes of '${name}' (pvs: ${pvsAfterLvs.stderr.trim().split('\n')[0] || `exit ${pvsAfterLvs.exitCode}`}) — stopping before the volume group is touched`)
+  if (parsePvsReport(pvsAfterLvs.stdout).some(pv => pv.vgName === name && pv.name === UNKNOWN_PV_NAME)) {
+    updateProgress(`Dropping the missing devices from volume group ${name}`)
+    await run(executor, VGREDUCE, [...LVM_MIXED_BLOCK_ARGS, '--removemissing', name])
+  }
+
+  // `vgs` was readable for the gate a moment ago; an unreadable one now must
+  // not skip `vgremove` silently and send `pvremove` at PVs still in the VG.
   const vgsRes = await executor.exec(VGS, VGS_ARGS)
-  if (vgsRes.exitCode === 0 && parseVgsReport(vgsRes.stdout).some(v => v.name === name)) {
+  if (vgsRes.exitCode !== 0)
+    throw new Error(`cannot read LVM volume groups before removing '${name}' (vgs: ${vgsRes.stderr.trim().split('\n')[0] || `exit ${vgsRes.exitCode}`}) — stopping before vgremove`)
+  if (parseVgsReport(vgsRes.stdout).some(v => v.name === name)) {
     updateProgress(`Removing volume group ${name}`)
     await run(executor, VGREMOVE, ['-y', name])
   }
+
+  // `pvremove` ONLY the named devices proven the pool's (cr.22): the gate's
+  // owned PVs (band arrays and cache slices of this VG) and the pool's own live
+  // arrays (a band an expansion pvcreated but never added). Never `[unknown]`,
+  // never a PV some other VG holds, never a PV the gate did not prove.
+  const ownedPvs = new Set([...proven.owned, ...liveArrays])
   const pvsRes = await executor.exec(PVS, PVS_ARGS)
   const pvs = pvsRes.exitCode === 0
-    ? parsePvsReport(pvsRes.stdout).filter(pv => pv.vgName === name || liveArrays.includes(pv.name))
+    ? parsePvsReport(pvsRes.stdout).filter(pv =>
+        pv.name !== UNKNOWN_PV_NAME && ownedPvs.has(pv.name) && (pv.vgName === null || pv.vgName === name))
     : []
   for (const pv of pvs) {
     updateProgress(`Removing physical volume ${pv.name}`)
