@@ -285,9 +285,10 @@ export async function forwardToNode(
     [FORWARDED_HEADER]: '1',
   }
   // Forward the credential and confirmation/content headers verbatim. The CSRF
-  // token rides with the cookie (cr.25a, docs/WAVE2-DESIGN.md §3): the peer's
-  // pveproxy authenticates the hop and checks the token again for the node that
-  // does the work. Absent → not sent, and the forward goes out as before.
+  // token rides with the cookie (cr.25a, docs/WAVE2-DESIGN.md §3) so that, once
+  // cr.27 enforces it, the peer's pveproxy can check it for the node that does
+  // the work; until then nothing checks it. Absent → not sent, and the forward
+  // goes out as before.
   for (const name of ['cookie', 'csrfpreventiontoken', 'content-type', 'x-anas-confirm'] as const) {
     const value = request.headers[name]
     if (typeof value === 'string')
