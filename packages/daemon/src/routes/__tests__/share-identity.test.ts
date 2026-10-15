@@ -946,9 +946,10 @@ describe('share-identity routes', () => {
 
     /**
      * Boot the identity routes. `pdbedit` is the `pdbedit -L` answer sequence
-     * (route-time read first, then each verify read); `namePasswd` the
-     * `getent passwd Name` sequence (the create route sees it absent, the job
-     * after useradd sees it).
+     * (route-time read first, the job's guard re-read second (cr.42), then
+     * each verify read); `namePasswd` the `getent passwd Name` sequence (the
+     * create route and the job's guard re-read see it absent, the job after
+     * useradd sees it).
      */
     async function boot(opts: { pdbedit: string[], namePasswd?: ExecResult[] }) {
       tmpDir = await mkdtemp(join(tmpdir(), 'anas-identity-passdb-'))
@@ -1051,7 +1052,7 @@ describe('share-identity routes', () => {
 
     // --- (1)+(2) create --------------------------------------------------
     it('create, clean path: useradd → smbpasswd -a -s → verify read (pinned byte-for-byte)', async () => {
-      await boot({ pdbedit: ['smbtest:1000:\n', FIXED], namePasswd: [NOT_FOUND, ok(NAME_LINE)] })
+      await boot({ pdbedit: ['smbtest:1000:\n', 'smbtest:1000:\n', FIXED], namePasswd: [NOT_FOUND, NOT_FOUND, ok(NAME_LINE)] })
       const res = await post('/v1/identity/users', { name: 'Name', smbPassword: 'hunter2' })
       assert.equal(res.statusCode, 202)
       const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
@@ -1068,7 +1069,7 @@ describe('share-identity routes', () => {
     })
 
     it('create over a case-mismatched orphan: repairs it (pdbedit -x → smbpasswd -a → verify) and logs one line', async () => {
-      await boot({ pdbedit: [ORPHAN, ORPHAN, FIXED], namePasswd: [NOT_FOUND, ok(NAME_LINE)] })
+      await boot({ pdbedit: [ORPHAN, ORPHAN, ORPHAN, FIXED], namePasswd: [NOT_FOUND, NOT_FOUND, ok(NAME_LINE)] })
       const res = await post('/v1/identity/users', { name: 'Name', smbPassword: 'hunter2' })
       assert.equal(res.statusCode, 202)
       const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
@@ -1090,7 +1091,7 @@ describe('share-identity routes', () => {
     })
 
     it('create: a repair that still does not verify fails the job naming the stored entry', async () => {
-      await boot({ pdbedit: [ORPHAN, ORPHAN, ORPHAN], namePasswd: [NOT_FOUND, ok(NAME_LINE)] })
+      await boot({ pdbedit: [ORPHAN, ORPHAN, ORPHAN, ORPHAN], namePasswd: [NOT_FOUND, NOT_FOUND, ok(NAME_LINE)] })
       const res = await post('/v1/identity/users', { name: 'Name', smbPassword: 'hunter2' })
       const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'failed')
@@ -1147,7 +1148,7 @@ describe('share-identity routes', () => {
     })
 
     it('set password over a mismatched entry repairs it: pdbedit -x → smbpasswd -a → verify', async () => {
-      await boot({ pdbedit: [ORPHAN, ORPHAN, FIXED] })
+      await boot({ pdbedit: [ORPHAN, ORPHAN, ORPHAN, FIXED] })
       const res = await post('/v1/identity/users/Name/smb-password', { password: 's3cret' })
       const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
@@ -1496,14 +1497,16 @@ describe('share-identity routes', () => {
     it('job re-gate (ruling (j)): in-band at request time, out-of-band when the job runs → failed, no command', async () => {
       // The getent answer MOVES between the request and the job: uid 1001 at
       // request time (the route admits the mutation), 999 by the time the job
-      // re-reads — the job must fail closed before its first usermod.
+      // re-reads — the job must fail closed before its first usermod. Since
+      // cr.42 the uid is the account's id, so a moved uid is another account
+      // (IDENTITY_MISMATCH) before the band gate is even asked.
       await boot({ sharePasswd: [ok(SHARE_LINE), ok(SHARE_LINE.replace(':1001:', ':999:'))] })
       const res = await put('/v1/identity/users/shareuser', { enabled: false })
       assert.equal(res.statusCode, 202)
       const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'failed')
-      assert.match(job.error?.message ?? '', /'shareuser' \(uid 999\) is a system account/)
-      assert.match(job.error?.message ?? '', /managed outside ANAS/)
+      assert.equal(job.error?.code, 'IDENTITY_MISMATCH')
+      assert.match(job.error?.message ?? '', /User 'shareuser' is not the one that was confirmed \(uid 1001 at the confirmation, uid 999 now\)/)
       assert.deepEqual(mutatorCalls(), [])
     })
   })

@@ -1,11 +1,12 @@
 import type { ShareGroup, ShareUser } from '@anas/shared'
-import type { FastifyInstance, FastifyReply } from 'fastify'
+import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor, ExecOptions, ExecResult } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { GroupEntry, PasswdEntry } from '../parsers/getent.js'
 import type { PassdbEntry } from '../parsers/pdbedit.js'
 import type { IdentityRefHit } from '../parsers/smb-conf.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { Advisory, Gate, GuardReads, GuardSpec, Refusal } from '../safety/guard.js'
 import { constants } from 'node:fs'
 import { access } from 'node:fs/promises'
 import {
@@ -34,7 +35,7 @@ import {
   passdbServes,
 } from '../parsers/pdbedit.js'
 import { findIdentityReferences } from '../parsers/smb-conf.js'
-import { confirmGate } from '../safety/gate.js'
+import { gidClaim, guardCheck, guardConfirm, guarded, GuardRefusalError, idnameClaim, sendRefusal, uidClaim } from '../safety/guard.js'
 import { readConfig } from '../services/config-writer.js'
 import { requireIdentity } from './identity.js'
 
@@ -317,35 +318,84 @@ export async function shareIdentityRoutes(
     }
   }
 
+  // --- the guard (story cr.42, WAVE3-DESIGN §2.5 identity row, §3.3) -------
+  //
+  // Every identity verb is a guard spec: the route runs its gates, the job
+  // runs the SAME gates again against facts read when it starts, and the queue
+  // starts it only while it holds the object's keys. The object's id is its
+  // uid / gid, never its name: a user deleted and re-created under the same
+  // name between the request and the job is another user (IDENTITY_MISMATCH),
+  // and the job acts on what it read, never on the request-time entry.
+
+  /** The per-run reads the identity gates share (one per guard run, never across doors). */
+  const idReads = {
+    user: (reads: GuardReads, name: string) => reads.once(`passwd:${name}`, () => resolveUser(name)),
+    group: (reads: GuardReads, name: string) => reads.once(`group:${name}`, () => resolveGroup(name)),
+    /**
+     * Every account (`getent passwd`), STRICT: null when the database could
+     * not be read. The list GETs fail open (`allUsers`); a gate never does.
+     */
+    users: (reads: GuardReads) => reads.once('passwd', async (): Promise<PasswdEntry[] | null> => {
+      const r = await executor.exec(GETENT, ['passwd'])
+      return r.exitCode !== 0 && !r.stdout.trim() ? null : parsePasswd(r.stdout)
+    }),
+    groups: (reads: GuardReads) => reads.once('group', () => allGroups()),
+    passdb: (reads: GuardReads) => reads.once('passdb', () => smbEntries()),
+    /** smb.conf's text; null when it could not be read (an ABSENT file reads as ''). */
+    smbConf: (reads: GuardReads) => reads.once('smb.conf', async (): Promise<string | null> => {
+      try {
+        return await readConfig(smbConfPath)
+      }
+      catch {
+        return null
+      }
+    }),
+  }
+
+  interface UserObject { name: string, entry: PasswdEntry, local: boolean }
+  interface GroupObject { name: string, entry: GroupEntry, local: boolean }
+  /** A create's object: the name it claims (no id exists yet). */
+  interface NameSlot { name: string }
+
+  /**
+   * The name key of a verb that changes the account namespace (create,
+   * delete). Case-FOLDED: Samba finds a passdb entry case-insensitively
+   * (identity.3), so a create of `Alice` and one of `alice` must not run side
+   * by side — each job's passdb gate would pass before the other's smbpasswd
+   * landed.
+   */
+  function nameClaim(name: string) {
+    return idnameClaim(name.toLowerCase())
+  }
+
   /**
    * The (share, parameter) pairs that reference an identity (identity.1d,
    * extended by cr.30 to every user-list parameter of WAVE2-DESIGN §6 C4:
    * `valid users`, `invalid users`, `read list`, `write list`, `admin users`,
-   * `force user`, `force group`). A user matches bare entries; a group matches
-   * the `@`/`+`/`&` forms and `force group` (any spelling); the match is
-   * case-folded (Samba is case-insensitive in smb.conf too).
+   * `force user`, `force group`; quoted entries, `[global]`, `%S` and `+&`
+   * read the way Samba reads them). A user matches bare entries; a group
+   * matches the `@`/`+`/`&` forms and `force group` (any spelling); the match
+   * is case-folded (Samba is case-insensitive in smb.conf too).
    *
    * Returns `{ refs, unknown }`: `unknown` is true when smb.conf could not
-   * be read (a read error, not an absent file) — the caller then discloses it
+   * be read (a read error, not an absent file) — the route then discloses it
    * at the confirm door instead of failing open silently (the ahr-mutate D3
-   * pattern). An ABSENT file (samba removed) genuinely means no references.
+   * pattern), and the job refuses when it cannot read what the confirm could.
+   * An ABSENT file (samba removed) genuinely means no references.
    */
   async function sharesReferencing(
+    reads: GuardReads,
     name: string,
     isGroup: boolean,
   ): Promise<{ refs: IdentityRefHit[], unknown: boolean }> {
-    let text: string
-    try {
-      text = await readConfig(smbConfPath)
-    }
-    catch {
+    const text = await idReads.smbConf(reads)
+    if (text === null)
       return { refs: [], unknown: true }
-    }
     return { refs: findIdentityReferences(text, name, isGroup), unknown: false }
   }
 
-  /** The hard-409 body for a referenced identity — ONE shape for both verbs. */
-  function referencedConflict(kind: 'user' | 'group', name: string, refs: IdentityRefHit[]) {
+  /** The hard-409 refusal for a referenced identity — ONE shape for both verbs and both doors. */
+  function referencedRefusal(kind: 'user' | 'group', name: string, refs: IdentityRefHit[]): Refusal {
     // One line per share, naming every parameter of it that holds the name:
     // `media (valid users, write list), archive (force user)`.
     const byShare = new Map<string, string[]>()
@@ -357,71 +407,241 @@ export async function shareIdentityRoutes(
     }
     const listed = Array.from(byShare, ([share, params]) => `${share} (${params.join(', ')})`)
     return {
-      error: {
-        code: 'CONFLICT',
-        reason: 'referenced-by-share',
-        message: `${kind === 'user' ? 'User' : 'Group'} '${name}' is referenced by share(s): ${listed.join(', ')}. Remove it from those share parameters first. This refusal has no confirm bypass.`,
-      },
+      status: 409,
+      code: 'CONFLICT',
+      reason: 'referenced-by-share',
+      message: `${kind === 'user' ? 'User' : 'Group'} '${name}' is referenced by share(s): ${listed.join(', ')}. Remove it from those share parameters first. This refusal has no confirm bypass.`,
     }
   }
 
   /** 409 for a mutation aimed at a directory-provided (read-only) identity. */
-  function rejectDirectory(reply: FastifyReply, kind: 'user' | 'group', name: string) {
-    reply.code(409)
+  function directoryRefusal(kind: 'user' | 'group', name: string): Refusal {
     return {
-      error: {
-        code: 'CONFLICT',
-        message: `${kind === 'user' ? 'User' : 'Group'} '${name}' is directory-provided (not in the local files DB) and is read-only here`,
-      },
+      status: 409,
+      code: 'CONFLICT',
+      message: `${kind === 'user' ? 'User' : 'Group'} '${name}' is directory-provided (not in the local files DB) and is read-only here`,
     }
   }
 
   /**
-   * The cr.3 refusal sentence (review C3). `id` is null only on the job-time
-   * re-gate when the account stopped resolving between request and job — the
-   * gate fails closed, so the sentence says the id could not be read.
-   */
-  function systemAccountMessage(kind: 'user' | 'group', name: string, id: number | null): string {
-    const what = kind === 'user' ? 'User' : 'Group'
-    if (id === null)
-      return `${what} '${name}' could not be resolved (getent), so ANAS cannot confirm it is a share account and will not change it. System accounts (uid/gid below 1000 or from 60000) are managed outside ANAS.`
-    return `${what} '${name}' (${kind === 'user' ? 'uid' : 'gid'} ${id}) is a system account. System accounts (uid/gid below 1000 or from 60000) are managed outside ANAS.`
-  }
-
-  /**
-   * The cr.3 hard-409 (Principle 14 "blocked" — like `referencedConflict`, no
+   * The cr.3 hard-409 (Principle 14 "blocked" — like the reference refusal, no
    * confirm code is minted): the target's uid/gid is outside the share band,
-   * so it is a system account and ANAS never changes it.
+   * so it is a system account and ANAS never changes it (review C3).
    */
-  function rejectSystemAccount(reply: FastifyReply, kind: 'user' | 'group', name: string, id: number) {
-    reply.code(409)
+  function systemAccountRefusal(kind: 'user' | 'group', name: string, id: number): Refusal {
+    const what = kind === 'user' ? 'User' : 'Group'
     return {
-      error: {
-        code: 'SYSTEM_ACCOUNT',
-        message: systemAccountMessage(kind, name, id),
+      status: 409,
+      code: 'SYSTEM_ACCOUNT',
+      message: `${what} '${name}' (${kind === 'user' ? 'uid' : 'gid'} ${id}) is a system account. System accounts (uid/gid below 1000 or from 60000) are managed outside ANAS.`,
+    }
+  }
+
+  /** The Samba preflight (issue #6) as a gate: the sentence names what was NOT done. */
+  function sambaInstalledGate<O>(notDone: string): Gate<O> {
+    return async () => (await smbAvailable())
+      ? null
+      : { status: 400, code: 'VALIDATION_ERROR', message: `${SMB_NOT_INSTALLED}. ${notDone}` }
+  }
+
+  // User gates (each one function, run by both doors).
+
+  const localUserGate: Gate<UserObject> = async o => o.local ? null : directoryRefusal('user', o.name)
+
+  /** cr.3: the uid must be in the mutable share band (`isMutableShareId`). */
+  const mutableUserGate: Gate<UserObject> = async o =>
+    isMutableShareId(o.entry.uid) ? null : systemAccountRefusal('user', o.name, o.entry.uid)
+
+  /**
+   * identity.3: smbpasswd lands on the entry Samba finds case-folded — when
+   * that entry is ANOTHER live account's, setting this password would change
+   * that account's. Re-run in the job: an entry that appears while the job
+   * waits would otherwise take the password.
+   */
+  const passdbNotOwnedGate: Gate<UserObject> = async (o, reads) => {
+    const existing = passdbEntry(await idReads.passdb(reads), o.name)
+    if (!existing || !passdbOwnedByOther(existing, o.entry.uid))
+      return null
+    return {
+      status: 409,
+      code: 'CONFLICT',
+      reason: 'passdb-entry-owned',
+      message: `Samba's password database entry for '${o.name}' is stored as '${existing.stored}', which belongs to another account (uid ${existing.uid}). Samba matches user names case-insensitively, so '${o.name}' cannot hold its own SMB password. The password was NOT changed.`,
+    }
+  }
+
+  /** identity.1d / cr.30: a name a share still carries in any user-list parameter (hard, no bypass). */
+  const userNotReferencedGate: Gate<UserObject> = async (o, reads) => {
+    const { refs } = await sharesReferencing(reads, o.name, false)
+    return refs.length > 0 ? referencedRefusal('user', o.name, refs) : null
+  }
+
+  // Group gates.
+
+  const localGroupGate: Gate<GroupObject> = async o => o.local ? null : directoryRefusal('group', o.name)
+
+  const mutableGroupGate: Gate<GroupObject> = async o =>
+    isMutableShareId(o.entry.gid) ? null : systemAccountRefusal('group', o.name, o.entry.gid)
+
+  /**
+   * groupdel cannot run while the group is ANY account's primary group (the
+   * account would be left with an unresolvable primary gid). Every resolvable
+   * account is checked, not only local ones: a directory user pinned to this
+   * gid would be broken the same way.
+   */
+  const notPrimaryGroupGate: Gate<GroupObject> = async (o, reads) => {
+    const users = await idReads.users(reads)
+    if (users === null)
+      return accountsUnreadable(`that group '${o.name}' is nobody's primary group`)
+    const primaries = users.filter(u => u.gid === o.entry.gid).map(u => u.name)
+    if (primaries.length === 0)
+      return null
+    return {
+      status: 409,
+      code: 'CONFLICT',
+      reason: 'primary-group-in-use',
+      message: `Group '${o.name}' is the primary group of: ${primaries.join(', ')}. Change their primary group (or remove the users) first. This refusal has no confirm bypass.`,
+    }
+  }
+
+  const groupNotReferencedGate: Gate<GroupObject> = async (o, reads) => {
+    const { refs } = await sharesReferencing(reads, o.name, true)
+    return refs.length > 0 ? referencedRefusal('group', o.name, refs) : null
+  }
+
+  /** A gate that could not read the account database refuses (fail closed, §3.2). */
+  function accountsUnreadable(check: string): Refusal {
+    return { status: 503, code: 'UNAVAILABLE', message: `ANAS could not read the account database (getent passwd), so it cannot check ${check} — nothing was done` }
+  }
+
+  /** Members being ADDED must resolve (getent); removals need not. */
+  function membersResolveGate(add: string[]): Gate<GroupObject> {
+    return async (_o, reads) => {
+      if (add.length === 0)
+        return null
+      const users = await idReads.users(reads)
+      if (users === null)
+        return accountsUnreadable(`that ${add.join(', ')} exist`)
+      const known = new Set(users.map(u => u.name))
+      const missing = add.filter(u => !known.has(u))
+      return missing.length > 0 ? { status: 400, code: 'VALIDATION_ERROR', message: `Unknown user(s): ${missing.join(', ')}` } : null
+    }
+  }
+
+  /** The delete's one advisory: smb.conf could not be read, so the reference gate saw nothing. */
+  async function smbConfAdvisories(reads: GuardReads, name: string, isGroup: boolean): Promise<Advisory[]> {
+    const { unknown } = await sharesReferencing(reads, name, isGroup)
+    return unknown
+      ? [{ key: 'unreadable:smb.conf', warning: `ANAS could not read smb.conf to check for share references. If this node has SMB shares, verify none of them names this ${isGroup ? 'group' : 'user'} before confirming.` }]
+      : []
+  }
+
+  /**
+   * The reference gate passes on an unreadable smb.conf (the route discloses
+   * it in the confirm instead). When the job cannot read the file the confirm
+   * DID read, the operator confirmed a check the job cannot repeat: fail
+   * closed, nothing done.
+   */
+  function refuseNewlyUnreadable(newAdvisories: string[], whom: string): void {
+    if (newAdvisories.length === 0)
+      return
+    throw new GuardRefusalError({
+      status: 409,
+      code: 'STATE_CHANGED',
+      message: `ANAS could not read smb.conf when the job ran, so it cannot check that no share names ${whom} (it could at the confirmation) — nothing was done; confirm again`,
+    })
+  }
+
+  /** The verbs on an existing user. */
+  type UserVerb = 'smb-password' | 'enable' | 'disable' | 'delete'
+
+  /**
+   * The guard spec of a verb on an existing user (WAVE3-DESIGN §3.3 User row):
+   *  - id: the uid (`getent passwd <name>`), compared by the job — a user
+   *    deleted and re-created under the name is another user;
+   *  - gates: local, band, then per verb — the SMB password re-checks Samba
+   *    and the passdb entry's owner, the delete re-runs the share references;
+   *  - advisories (delete): an smb.conf that could not be read;
+   *  - locks: `uid:<n>` exclusive; the delete also takes the name key.
+   */
+  function userGuardSpec(name: string, verb: UserVerb): GuardSpec<UserObject> {
+    const gates: Gate<UserObject>[] = [localUserGate, mutableUserGate]
+    if (verb === 'smb-password')
+      gates.push(sambaInstalledGate('The password was NOT changed.'), passdbNotOwnedGate)
+    if (verb === 'delete')
+      gates.push(userNotReferencedGate)
+    return {
+      operation: verb === 'smb-password' ? 'identity.smbpasswd.set' : `identity.user.${verb}`,
+      object: {
+        what: `User '${name}'`,
+        read: async (reads) => {
+          const entry = await idReads.user(reads, name)
+          return entry ? { name, entry, local: await isLocalUser(name) } : null
+        },
+        notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `User '${name}' not found` }),
+        id: async o => ({ uid: String(o.entry.uid) }),
+        unbound: () => `Could not read the uid of user '${name}' — refusing`,
       },
+      gates,
+      ...(verb === 'delete' ? { advisories: async (o: UserObject, reads: GuardReads) => smbConfAdvisories(reads, o.name, false) } : {}),
+      locks: async o => [uidClaim(o.entry.uid, name), ...(verb === 'delete' ? [nameClaim(name)] : [])],
+    }
+  }
+
+  /** The verbs on an existing group. */
+  type GroupVerb = 'members' | 'delete'
+
+  /**
+   * The guard spec of a verb on an existing group: id the gid; gates local,
+   * band, then the added members resolve (members) or the primary-group use
+   * and the share references (delete); locks `gid:<n>`, the delete also the
+   * name key.
+   */
+  function groupGuardSpec(name: string, verb: GroupVerb, add: string[] = []): GuardSpec<GroupObject> {
+    const gates: Gate<GroupObject>[] = [localGroupGate, mutableGroupGate]
+    if (verb === 'members')
+      gates.push(membersResolveGate(add))
+    if (verb === 'delete')
+      gates.push(notPrimaryGroupGate, groupNotReferencedGate)
+    return {
+      operation: `identity.group.${verb}`,
+      object: {
+        what: `Group '${name}'`,
+        read: async (reads) => {
+          const entry = await idReads.group(reads, name)
+          return entry ? { name, entry, local: await isLocalGroup(name) } : null
+        },
+        notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `Group '${name}' not found` }),
+        id: async o => ({ gid: String(o.entry.gid) }),
+        unbound: () => `Could not read the gid of group '${name}' — refusing`,
+      },
+      gates,
+      ...(verb === 'delete' ? { advisories: async (o: GroupObject, reads: GuardReads) => smbConfAdvisories(reads, o.name, true) } : {}),
+      locks: async o => [gidClaim(o.entry.gid, name), ...(verb === 'delete' ? [nameClaim(name)] : [])],
     }
   }
 
   /**
-   * Resolve an existing user/group name to its uid/gid via the module's
-   * getent readers and refuse (throw) unless it is in the mutable share band
-   * — `isMutableShareId`, i.e. the list band without its uid-0 exception.
-   * FAIL CLOSED: a name whose id cannot be read (getent failure, or the
-   * account vanished) is not mutable. Used by every job body before its first
-   * mutating command (EPICS §2 ruling (j): jobs re-read and re-gate); the
-   * routes answer 409 first using the entry they already resolved.
+   * The guard spec of a create: the object is the name slot (it has no id
+   * yet), the gates are the request's. A user created into supplementary
+   * groups changes those groups too, so it also takes their `gid:` keys.
    */
-  async function gateMutableUser(name: string): Promise<void> {
-    const entry = await resolveUser(name)
-    if (!entry || !isMutableShareId(entry.uid))
-      throw new Error(systemAccountMessage('user', name, entry?.uid ?? null))
-  }
-
-  async function gateMutableGroup(name: string): Promise<void> {
-    const entry = await resolveGroup(name)
-    if (!entry || !isMutableShareId(entry.gid))
-      throw new Error(systemAccountMessage('group', name, entry?.gid ?? null))
+  function createGuardSpec(kind: 'user' | 'group', name: string, gates: Gate<NameSlot>[], groups: string[] = []): GuardSpec<NameSlot> {
+    return {
+      operation: kind === 'user' ? 'identity.user.add' : 'identity.group.add',
+      object: {
+        what: `${kind === 'user' ? 'User' : 'Group'} name '${name}'`,
+        read: async () => ({ name }),
+        id: async () => ({ name }),
+        unbound: () => `Could not read the name '${name}' — refusing`,
+      },
+      gates,
+      locks: async (_slot, _bound, reads) => {
+        const byName = new Map((groups.length > 0 ? await idReads.groups(reads) : []).map(g => [g.name, g]))
+        const gids = groups.map(g => byName.get(g)).filter((g): g is GroupEntry => g !== undefined)
+        return [nameClaim(name), ...gids.map(g => gidClaim(g.gid, g.name))]
+      },
+    }
   }
 
   // --- GET /identity/users — enriched ShareUser list ------------------------
@@ -496,49 +716,78 @@ export async function shareIdentityRoutes(
     if (!identity)
       return
 
-    // 409 if the name already resolves anywhere (local OR directory) — getent is
-    // the source of truth, and useradd would collide.
-    if (await resolveUser(req.name)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `User '${req.name}' already exists` } }
-    }
-
-    // Referenced supplementary groups must exist.
-    if (req.groups && req.groups.length > 0) {
-      const groups = await allGroups()
-      const known = new Set(groups.map(g => g.name))
-      const missing = req.groups.filter(g => !known.has(g))
-      if (missing.length > 0) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `Unknown group(s): ${missing.join(', ')}` } }
-      }
+    const groups = req.groups ?? []
+    const gates: Gate<NameSlot>[] = [
+      // 409 if the name already resolves anywhere (local OR directory) —
+      // getent is the source of truth, and useradd would collide.
+      async (s, reads) => (await idReads.user(reads, s.name))
+        ? { status: 409, code: 'CONFLICT', message: `User '${s.name}' already exists` }
+        : null,
+      // Referenced supplementary groups must exist.
+      async (_s, reads) => {
+        if (groups.length === 0)
+          return null
+        const known = new Set((await idReads.groups(reads)).map(g => g.name))
+        const missing = groups.filter(g => !known.has(g))
+        return missing.length > 0 ? { status: 400, code: 'VALIDATION_ERROR', message: `Unknown group(s): ${missing.join(', ')}` } : null
+      },
       // cr.3 (review C3): existing ≠ mutable. `useradd -G sudo` would hand the
       // new account the sudo group; membership of anything outside the share
       // band is system management, so name the group and refuse.
-      const byName = new Map(groups.map(g => [g.name, g]))
-      const systemGroups = req.groups.filter((g) => {
-        const entry = byName.get(g)
-        return entry !== undefined && !isMutableShareId(entry.gid)
-      })
-      if (systemGroups.length > 0) {
-        reply.code(409)
-        return {
-          error: {
-            code: 'SYSTEM_ACCOUNT',
-            message: `Group(s) ${systemGroups.map(g => `'${g}' (gid ${byName.get(g)?.gid})`).join(', ')} are system groups. System accounts (uid/gid below 1000 or from 60000) are managed outside ANAS.`,
-          },
+      async (_s, reads) => {
+        if (groups.length === 0)
+          return null
+        const byName = new Map((await idReads.groups(reads)).map(g => [g.name, g]))
+        const systemGroups = groups.filter((g) => {
+          const entry = byName.get(g)
+          return entry !== undefined && !isMutableShareId(entry.gid)
+        })
+        return systemGroups.length > 0
+          ? {
+              status: 409,
+              code: 'SYSTEM_ACCOUNT',
+              message: `Group(s) ${systemGroups.map(g => `'${g}' (gid ${byName.get(g)?.gid})`).join(', ')} are system groups. System accounts (uid/gid below 1000 or from 60000) are managed outside ANAS.`,
+            }
+          : null
+      },
+      // Samba preflight (issue #6). Refuse BEFORE the job runs useradd, so a
+      // node without samba never ends up with a half-created user whose SMB
+      // password silently never landed. The API is the authority on what is
+      // possible (Principle 14) — the client just gets a 400 that says what
+      // to install.
+      ...(req.smbPassword !== undefined ? [sambaInstalledGate<NameSlot>('The user was NOT created.')] : []),
+      // identity.3 (#68): Samba looks passdb entries up case-FOLDED, so an
+      // entry left under another case would be the one this account logs in
+      // with — and it can never map to it. An orphan (its account gone) is
+      // replaced by the job when this create sets an SMB password; without
+      // one there is nothing to replace it with, and an entry that belongs to
+      // another live account is never touched. Re-run in the job (cr.42): an
+      // entry that appears while the job waits refuses before useradd.
+      async (s, reads) => {
+        const existing = passdbEntry(await idReads.passdb(reads), s.name)
+        if (existing && passdbOwnedByOther(existing, null)) {
+          return {
+            status: 409,
+            code: 'CONFLICT',
+            reason: 'passdb-entry-owned',
+            message: `Samba's password database already holds an entry stored as '${existing.stored}', which belongs to another account (uid ${existing.uid}). Samba matches user names case-insensitively, so '${s.name}' could never hold its own SMB password. Pick a different name. The user was NOT created.`,
+          }
         }
-      }
-    }
-
-    // Samba preflight (issue #6). Refuse BEFORE the job runs useradd, so a node
-    // without samba never ends up with a half-created user whose SMB password
-    // silently never landed. The API is the authority on what is possible
-    // (Principle 14) — the client just gets a 400 that says what to install.
-    if (req.smbPassword !== undefined && !(await smbAvailable())) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `${SMB_NOT_INSTALLED}. The user was NOT created.` } }
-    }
+        if (existing && existing.stored !== s.name && req.smbPassword === undefined) {
+          return {
+            status: 409,
+            code: 'CONFLICT',
+            reason: 'passdb-orphan',
+            message: `Samba's password database holds an orphan entry stored as '${existing.stored}' (its account no longer exists), which Samba would match to '${s.name}' and turn into a guest session. Set an SMB password in this dialog to replace it, or remove it first with: pdbedit -x -u ${existing.stored}. The user was NOT created.`,
+          }
+        }
+        return null
+      },
+    ]
+    const spec = createGuardSpec('user', req.name, gates, groups)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     // useradd -N -M -s /usr/sbin/nologin [-c <fullName>] [-G <groups>] <name>
     // -N (identity.1c): NO user-private group — the account takes the default
@@ -548,44 +797,18 @@ export async function shareIdentityRoutes(
     const args = ['-N', '-M', '-s', NOLOGIN]
     if (req.fullName !== undefined)
       args.push('-c', req.fullName)
-    if (req.groups && req.groups.length > 0)
-      args.push('-G', req.groups.join(','))
+    if (groups.length > 0)
+      args.push('-G', groups.join(','))
     args.push(req.name)
-
-    // identity.3 (#68): Samba looks passdb entries up case-FOLDED, so an entry
-    // left under another case would be the one this account logs in with —
-    // and it can never map to it. An orphan (its account gone) is replaced by
-    // the job when this create sets an SMB password; without one there is
-    // nothing to replace it with, and an entry that belongs to another live
-    // account is never touched. Checked before the job runs useradd.
-    const existing = passdbEntry(await smbEntries(), req.name)
-    if (existing && passdbOwnedByOther(existing, null)) {
-      reply.code(409)
-      return {
-        error: {
-          code: 'CONFLICT',
-          reason: 'passdb-entry-owned',
-          message: `Samba's password database already holds an entry stored as '${existing.stored}', which belongs to another account (uid ${existing.uid}). Samba matches user names case-insensitively, so '${req.name}' could never hold its own SMB password. Pick a different name. The user was NOT created.`,
-        },
-      }
-    }
-    if (existing && existing.stored !== req.name && req.smbPassword === undefined) {
-      reply.code(409)
-      return {
-        error: {
-          code: 'CONFLICT',
-          reason: 'passdb-orphan',
-          message: `Samba's password database holds an orphan entry stored as '${existing.stored}' (its account no longer exists), which Samba would match to '${req.name}' and turn into a guest session. Set an SMB password in this dialog to replace it, or remove it first with: pdbedit -x -u ${existing.stored}. The user was NOT created.`,
-        },
-      }
-    }
 
     const smbPassword = req.smbPassword
 
     const job = jobQueue.submit(
       'identity.user.add',
       { ...identity, params: { user: req.name, groups: req.groups, smbEnabled: smbPassword !== undefined } },
-      async (updateProgress) => {
+      // Ruling (j): the name is still free, the groups still exist and are
+      // in band, Samba is still there and no passdb entry claims the name.
+      guarded(spec, pre, async (_slot, { updateProgress }) => {
         updateProgress(`Creating share user '${req.name}'`)
         const created = await executor.exec(USERADD, args)
         if (created.exitCode !== 0)
@@ -611,7 +834,8 @@ export async function shareIdentityRoutes(
           smbEnabled: smbPassword !== undefined,
           ...(replaced !== undefined ? { smbEntryReplaced: replaced } : {}),
         }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -638,51 +862,26 @@ export async function shareIdentityRoutes(
     if (!identity)
       return
 
-    const account = await resolveUser(name)
-    if (!account) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `User '${name}' not found` } }
-    }
-    if (!(await isLocalUser(name)))
-      return rejectDirectory(reply, 'user', name)
-    // cr.3: system accounts never take an SMB password (root's would ride the
-    // same PAM/ssh surface ANAS must not touch).
-    if (!isMutableShareId(account.uid))
-      return rejectSystemAccount(reply, 'user', name, account.uid)
-
-    // Samba preflight (issue #6) — same reasoning as the create route above.
-    if (!(await smbAvailable())) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `${SMB_NOT_INSTALLED}. The password was NOT changed.` } }
-    }
-
-    // identity.3: smbpasswd lands on the entry Samba finds case-folded — when
-    // that entry is ANOTHER live account's, setting this password would change
-    // that account's. Refuse before anything runs.
-    const existing = passdbEntry(await smbEntries(), name)
-    if (existing && passdbOwnedByOther(existing, account.uid)) {
-      reply.code(409)
-      return {
-        error: {
-          code: 'CONFLICT',
-          reason: 'passdb-entry-owned',
-          message: `Samba's password database entry for '${name}' is stored as '${existing.stored}', which belongs to another account (uid ${existing.uid}). Samba matches user names case-insensitively, so '${name}' cannot hold its own SMB password. The password was NOT changed.`,
-        },
-      }
-    }
+    // exists → local → band (cr.3: system accounts never take an SMB password;
+    // root's would ride the same PAM/ssh surface ANAS must not touch) → Samba
+    // installed (issue #6) → the case-folded passdb entry is not another live
+    // account's (identity.3) — at the route and again in the job.
+    const spec = userGuardSpec(name, 'smb-password')
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'identity.smbpasswd.set',
       { ...identity, params: { user: name } },
-      async (updateProgress) => {
-        // cr.3 re-gate (ruling (j)): re-check the band before the first
-        // smbpasswd; a vanished/unreadable account fails the job closed.
-        await gateMutableUser(name)
+      // Ruling (j): the same uid, every gate again, before the first smbpasswd.
+      guarded(spec, pre, async (_o, { updateProgress }) => {
         // Password on stdin (smbpasswd -s), never argv — never logged;
         // verified exact-case afterwards, a stale entry replaced (identity.3).
         const replaced = await setSmbPasswordVerified(name, password, updateProgress)
         return { user: name, smbEnabled: true, ...(replaced !== undefined ? { smbEntryReplaced: replaced } : {}) }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -709,17 +908,13 @@ export async function shareIdentityRoutes(
     if (!identity)
       return
 
-    const account = await resolveUser(name)
-    if (!account) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `User '${name}' not found` } }
-    }
-    if (!(await isLocalUser(name)))
-      return rejectDirectory(reply, 'user', name)
-    // cr.3: `usermod --expiredate 1` on root or a service account locks the
-    // node (PVE @pam login and sshd honour expiry) — the band gate refuses.
-    if (!isMutableShareId(account.uid))
-      return rejectSystemAccount(reply, 'user', name, account.uid)
+    // exists → local → band (cr.3: `usermod --expiredate 1` on root or a
+    // service account locks the node — PVE @pam login and sshd honour expiry)
+    // — at the route and again in the job.
+    const spec = userGuardSpec(name, enabled ? 'enable' : 'disable')
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     // enable → clear expiry; disable → expire immediately. Share users have no
     // Unix password, so `--lock`/`--unlock` is redundant (it warns on a
@@ -733,9 +928,8 @@ export async function shareIdentityRoutes(
     const job = jobQueue.submit(
       enabled ? 'identity.user.enable' : 'identity.user.disable',
       { ...identity, params: { user: name, enabled } },
-      async (updateProgress) => {
-        // cr.3 re-gate (ruling (j)) before the first usermod.
-        await gateMutableUser(name)
+      // Ruling (j): the same uid, every gate again, before the first usermod.
+      guarded(spec, pre, async (o, { updateProgress }) => {
         updateProgress(`${enabled ? 'Enabling' : 'Disabling'} account '${name}'`)
         const r = await executor.exec(USERMOD, usermodArgs)
         if (r.exitCode !== 0)
@@ -747,16 +941,18 @@ export async function shareIdentityRoutes(
         // smbEntries() fails open to empty, so this is skipped entirely.
         // Found case-FOLDED (identity.1b) the way smbpasswd finds it — but an
         // entry that belongs to another live account is that account's to
-        // toggle, never this one's (identity.3).
+        // toggle, never this one's (identity.3). The uid is the one the job
+        // read (cr.42), never the request's.
         const smb = passdbEntry(await smbEntries(), name)
-        if (smb && !passdbOwnedByOther(smb, account.uid)) {
+        if (smb && !passdbOwnedByOther(smb, o.entry.uid)) {
           updateProgress(`${enabled ? 'Enabling' : 'Disabling'} SMB access for '${name}'`)
           const smb = await execSmbpasswd([enabled ? '-e' : '-d', name])
           if (smb.exitCode !== 0)
             throw new Error(smb.stderr.trim() || `smbpasswd exited with code ${smb.exitCode}`)
         }
         return { user: name, enabled }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -776,20 +972,26 @@ export async function shareIdentityRoutes(
     if (!identity)
       return
 
-    if (await resolveGroup(req.name)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Group '${req.name}' already exists` } }
-    }
+    const spec = createGuardSpec('group', req.name, [
+      async (s, reads) => (await idReads.group(reads, s.name))
+        ? { status: 409, code: 'CONFLICT', message: `Group '${s.name}' already exists` }
+        : null,
+    ])
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'identity.group.add',
       { ...identity, params: { group: req.name } },
-      async () => {
+      // Ruling (j): the name is still free when groupadd runs.
+      guarded(spec, pre, async () => {
         const r = await executor.exec(GROUPADD, [req.name])
         if (r.exitCode !== 0)
           throw new Error(r.stderr.trim() || `groupadd exited with code ${r.exitCode}`)
         return { created: req.name }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -818,35 +1020,20 @@ export async function shareIdentityRoutes(
     if (!identity)
       return
 
-    const target = await resolveGroup(name)
-    if (!target) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Group '${name}' not found` } }
-    }
-    if (!(await isLocalGroup(name)))
-      return rejectDirectory(reply, 'group', name)
-    // cr.3: `gpasswd -a <u> sudo` hands `u` the sudo group — membership edits
-    // of system groups are system management, outside ANAS.
-    if (!isMutableShareId(target.gid))
-      return rejectSystemAccount(reply, 'group', name, target.gid)
-
-    // Members being ADDED must resolve (getent); removals need not.
-    if (add.length > 0) {
-      const users = await allUsers()
-      const known = new Set(users.map(u => u.name))
-      const missing = add.filter(u => !known.has(u))
-      if (missing.length > 0) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `Unknown user(s): ${missing.join(', ')}` } }
-      }
-    }
+    // exists → local → band (cr.3: `gpasswd -a <u> sudo` hands `u` the sudo
+    // group — membership edits of system groups are system management,
+    // outside ANAS) → the members being added resolve — at the route and
+    // again in the job.
+    const spec = groupGuardSpec(name, 'members', add)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'identity.group.members',
       { ...identity, params: { group: name, add, remove } },
-      async (updateProgress) => {
-        // cr.3 re-gate (ruling (j)) before the first gpasswd.
-        await gateMutableGroup(name)
+      // Ruling (j): the same gid, every gate again, before the first gpasswd.
+      guarded(spec, pre, async (_o, { updateProgress }) => {
         for (const user of add) {
           updateProgress(`Adding '${user}' to '${name}'`)
           const r = await executor.exec(GPASSWD, ['-a', user, name])
@@ -860,7 +1047,8 @@ export async function shareIdentityRoutes(
             throw new Error(r.stderr.trim() || `gpasswd -d ${user} exited with code ${r.exitCode}`)
         }
         return { group: name, added: add, removed: remove }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -886,23 +1074,14 @@ export async function shareIdentityRoutes(
     if (!identity)
       return
 
-    const entry = await resolveUser(name)
-    if (!entry) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `User '${name}' not found` } }
-    }
-    if (!(await isLocalUser(name)))
-      return rejectDirectory(reply, 'user', name)
-    // cr.3: userdel has no uid floor — without the band gate this route could
-    // delete root or any service account (review C3).
-    if (!isMutableShareId(entry.uid))
-      return rejectSystemAccount(reply, 'user', name, entry.uid)
-
-    const refs = await sharesReferencing(name, false)
-    if (refs.refs.length > 0) {
-      reply.code(409)
-      return referencedConflict('user', name, refs.refs)
-    }
+    // exists → local → band (cr.3: userdel has no uid floor — without the band
+    // gate this route could delete root or any service account, review C3) →
+    // no share names the user (cr.30) — at the route and again in the job.
+    const spec = userGuardSpec(name, 'delete')
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const { entry } = pre.object
 
     // The passdb check is route-time for the WARNING (it describes what will
     // happen); the job re-checks live so the `pdbedit -x` side stays honest
@@ -915,8 +1094,7 @@ export async function shareIdentityRoutes(
     ]
     if (hasSmb)
       warnings.push(`Its SMB password entry will be removed`)
-    if (refs.unknown)
-      warnings.push('ANAS could not read smb.conf to check for share references. If this node has SMB shares, verify none of them names this user before confirming.')
+    warnings.push(...pre.advisories.map(a => a.warning))
     // TODO(cr.30, cr.29): ACL-root references join these warnings as a
     // confirm WARNING naming the roots (WAVE2-DESIGN §6 C4): `getfacl -n -p`
     // of every SMB share path, NFS export path, ZFS filesystem mountpoint and
@@ -924,9 +1102,13 @@ export async function shareIdentityRoutes(
     // the route-enumerating scan cr.29 builds for the create-time backstop —
     // no second scan gets built here; this lands when cr.29's does.
 
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'identity.user.delete',
-      params: { name },
+    // cr.42 (WAVE3-DESIGN §5.1 "User / group delete"): the code signs the
+    // request AND the uid, so a resend after the name was re-created for
+    // another account is 409 IDENTITY_MISMATCH, never a delete of the
+    // namesake.
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { name },
+      address: ['name'],
       message: `Deleting share user '${name}' removes the account`,
       warnings,
     })) {
@@ -936,10 +1118,10 @@ export async function shareIdentityRoutes(
     const job = jobQueue.submit(
       'identity.user.delete',
       { ...identity, params: { user: name } },
-      async (updateProgress) => {
-        // cr.3 / ruling (j): re-read and re-gate before the first command —
-        // the account must still be a mutable share user when the job runs.
-        await gateMutableUser(name)
+      // Ruling (j): the confirmed uid, local, band and the share references
+      // run again against what the node has now.
+      guarded(spec, pre, async (o, { updateProgress, newAdvisories }) => {
+        refuseNewlyUnreadable(newAdvisories, `user '${name}'`)
         // Order kept from identity.2: the SMB entry is dropped FIRST, so a
         // failed SMB step destroys nothing. identity.3: by its STORED name
         // with `pdbedit -x -u` — `smbpasswd -x` resolves the entry through a
@@ -950,7 +1132,7 @@ export async function shareIdentityRoutes(
         // without samba smbEntries() fails open to empty, so this is skipped.
         let smbEntryRemoved = false
         const smb = passdbEntry(await smbEntries(), name)
-        if (smb && !passdbOwnedByOther(smb, entry.uid)) {
+        if (smb && !passdbOwnedByOther(smb, o.entry.uid)) {
           updateProgress(`Removing SMB password entry for '${name}' (stored as '${smb.stored}')`)
           const dropped = await executor.exec(PDBEDIT, ['-x', '-u', smb.stored])
           if (dropped.exitCode !== 0)
@@ -965,7 +1147,8 @@ export async function shareIdentityRoutes(
         if (r.exitCode !== 0)
           throw new Error(r.stderr.trim() || `userdel exited with code ${r.exitCode}`)
         return { deleted: name, smbEntryRemoved }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -989,50 +1172,28 @@ export async function shareIdentityRoutes(
     if (!identity)
       return
 
-    const entry = await resolveGroup(name)
-    if (!entry) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Group '${name}' not found` } }
-    }
-    if (!(await isLocalGroup(name)))
-      return rejectDirectory(reply, 'group', name)
-    // cr.3: groupdel has no gid floor — without the band gate this route could
-    // delete `sudo` (gid 27), `root`, or any system group (review C3).
-    if (!isMutableShareId(entry.gid))
-      return rejectSystemAccount(reply, 'group', name, entry.gid)
-
-    // Every resolvable account is checked, not only local ones: a directory
-    // user pinned to this gid would be broken the same way.
-    const primaries = (await allUsers()).filter(u => u.gid === entry.gid).map(u => u.name)
-    if (primaries.length > 0) {
-      reply.code(409)
-      return {
-        error: {
-          code: 'CONFLICT',
-          reason: 'primary-group-in-use',
-          message: `Group '${name}' is the primary group of: ${primaries.join(', ')}. Change their primary group (or remove the users) first. This refusal has no confirm bypass.`,
-        },
-      }
-    }
-
-    const refs = await sharesReferencing(name, true)
-    if (refs.refs.length > 0) {
-      reply.code(409)
-      return referencedConflict('group', name, refs.refs)
-    }
+    // exists → local → band (cr.3: groupdel has no gid floor — without the
+    // band gate this route could delete `sudo` (gid 27), `root`, or any system
+    // group, review C3) → nobody's primary group → no share names the group
+    // (cr.30) — at the route and again in the job.
+    const spec = groupGuardSpec(name, 'delete')
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const { entry } = pre.object
 
     const warnings = [
       `Group '${name}' (gid ${entry.gid}) will be removed from the system`,
       `Files owned by the group keep their gid (${entry.gid}) — ownership is not changed, and a later group with the same gid would own them`,
     ]
-    if (refs.unknown)
-      warnings.push('ANAS could not read smb.conf to check for share references. If this node has SMB shares, verify none of them names this group before confirming.')
+    warnings.push(...pre.advisories.map(a => a.warning))
     // TODO(cr.30, cr.29): ACL-root confirm warning here too — see the user
     // delete route; both warnings ride cr.29's root-enumerating scan.
 
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'identity.group.delete',
-      params: { name },
+    // cr.42: the code signs the request and the gid (see the user delete).
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { name },
+      address: ['name'],
       message: `Deleting group '${name}' removes the group`,
       warnings,
     })) {
@@ -1042,15 +1203,17 @@ export async function shareIdentityRoutes(
     const job = jobQueue.submit(
       'identity.group.delete',
       { ...identity, params: { group: name } },
-      async (updateProgress) => {
-        // cr.3 / ruling (j): re-read and re-gate before groupdel runs.
-        await gateMutableGroup(name)
+      // Ruling (j): the confirmed gid, local, band, the primary-group use and
+      // the share references run again before groupdel.
+      guarded(spec, pre, async (_o, { updateProgress, newAdvisories }) => {
+        refuseNewlyUnreadable(newAdvisories, `group '${name}'`)
         updateProgress(`Deleting group '${name}'`)
         const r = await executor.exec(GROUPDEL, [name])
         if (r.exitCode !== 0)
           throw new Error(r.stderr.trim() || `groupdel exited with code ${r.exitCode}`)
         return { deleted: name }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
