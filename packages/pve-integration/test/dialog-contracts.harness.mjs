@@ -9994,11 +9994,46 @@ async function shareUsersChecks() {
     eq('create (cr.29): a cleared User ID is not sent', jobs[0] && jobs[0].body, { name: 'Alice' })
     jobs.length = 0
     warnings.length = 0
-    uidField.setValue(60000)
+    uidField.setValue(60001)
     win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
     await settle()
     eq('create (cr.29): a User ID outside the share band sends nothing', jobs.length, 0)
-    ok('create (cr.29): …and says the band', warnings.some(w => /User ID must be a whole number from 1000 to 59999, or empty/.test(w)), JSON.stringify(warnings))
+    ok('create (cr.29): …and says the band', warnings.some(w => /User ID must be a whole number from 1000 to 60000, or empty/.test(w)), JSON.stringify(warnings))
+    // cr.29c (7): the band's top is login.defs UID_MAX 60000 itself, inclusive.
+    eq('create (cr.29c): the field\'s limits are the band, 60000 included', [uidField.minValue, uidField.maxValue], [1000, 60000])
+    jobs.length = 0
+    uidField.setValue(60000)
+    win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
+    await settle()
+    eq('create (cr.29c): a User ID of 60000 is sent', jobs[0] && jobs[0].body, { name: 'Alice', uid: 60000 })
+    validates('create (cr.29c): …and parses as CreateShareUserRequest', CreateShareUserRequest, jobs[0] && jobs[0].body)
+
+    // --- cr.29c: the Advanced section — the User ID and the primary group,
+    // in a collapsed fieldset (the 67-mounts.js nfsAdvanced idiom)
+    uidField.setValue(null)
+    const adv = uidField.parent
+    ok('create (cr.29c): the User ID sits in a fieldset', !!adv && adv.xtype === 'fieldset', adv && adv.xtype)
+    eq('create (cr.29c): …titled Advanced, collapsible, collapsed by default',
+      adv && [adv.title, adv.collapsible, adv.collapsed, adv.cls], ['Advanced', true, true, 'anas-fs-user-advanced'])
+    const pg = win.down('#primaryGroup')
+    ok('create (cr.29c): the primary-group choice is a combobox in the same section', !!pg && pg.xtype === 'combobox' && pg.parent === adv, pg && pg.xtype)
+    eq('create (cr.29c): it is labelled plainly and says the default', pg && [pg.fieldLabel, pg.emptyText, pg.forceSelection], ['Primary group', '(optional — default: users)', true])
+    ok('create (cr.29c): it offers the groups the node lists',
+      !!pg && pg.store.getCount() === GROUP_ROWS.length && pg.store.getAt(1).get('name') === 'smbusers',
+      pg && pg.store.getCount())
+    jobs.length = 0
+    win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
+    await settle()
+    eq('create (cr.29c): an EMPTY primary group is not sent', jobs[0] && jobs[0].body, { name: 'Alice' })
+    eq('create (cr.29c): the create goes through the confirm door, the daemon\'s sentence leading',
+      jobs[0] && [jobs[0].door, jobs[0].confirmHeadline, jobs[0].confirmTitle], ['confirmAndRun', true, 'Create user'])
+    jobs.length = 0
+    pg.setValue('smbusers')
+    uidField.setValue(1004)
+    win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
+    await settle()
+    eq('create (cr.29c): a chosen primary group rides by name, the User ID as a number', jobs[0] && jobs[0].body, { name: 'Alice', uid: 1004, primaryGroup: 'smbusers' })
+    validates('create (cr.29c): the body parses as CreateShareUserRequest', CreateShareUserRequest, jobs[0] && jobs[0].body)
     if (!win.destroyed) { win.close() }
   }
 
@@ -10044,7 +10079,18 @@ async function shareUsersChecks() {
     win.buttonCmps.find(b => b.cls === 'anas-btn-group-create-submit').handler(null)
     await settle()
     eq('group create (cr.29): a Group ID outside the share band sends nothing', jobs.length, 0)
-    ok('group create (cr.29): …and says the band', warnings.some(w => /Group ID must be a whole number from 1000 to 59999, or empty/.test(w)), JSON.stringify(warnings))
+    ok('group create (cr.29): …and says the band', warnings.some(w => /Group ID must be a whole number from 1000 to 60000, or empty/.test(w)), JSON.stringify(warnings))
+
+    // cr.29c: the Group ID in the group dialog's own collapsed Advanced section.
+    const gadv = gidField.parent
+    eq('group create (cr.29c): the Group ID sits in a collapsed Advanced fieldset',
+      gadv && [gadv.xtype, gadv.title, gadv.collapsible, gadv.collapsed, gadv.cls], ['fieldset', 'Advanced', true, true, 'anas-fs-group-advanced'])
+    jobs.length = 0
+    gidField.setValue(1005)
+    win.buttonCmps.find(b => b.cls === 'anas-btn-group-create-submit').handler(null)
+    await settle()
+    eq('group create (cr.29c): the create goes through the confirm door, the daemon\'s sentence leading',
+      jobs[0] && [jobs[0].door, jobs[0].confirmHeadline, jobs[0].confirmTitle, jobs[0].body], ['confirmAndRun', true, 'Create group', { name: 'media', gid: 1005 }])
     if (!win.destroyed) { win.close() }
   }
 

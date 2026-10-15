@@ -511,9 +511,12 @@ describe('share-identity routes', () => {
     it('creates a user with no SMB password even when samba is missing', async () => {
       const { app, executor } = await withoutSamba()
       // cr.29: the uid pick reads the accounts, the ZFS filesystems (none)
-      // and looks the candidate up by number (free: getent exit 2).
+      // and looks the candidate up by number (free: getent exit 2); cr.29c:
+      // it reads the groups too and looks gid 1000 up (free as well).
       executor.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: { stdout: 'root:x:0:0:root:/root:/bin/bash\n', stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', '1000'], result: { stdout: '', stderr: '', exitCode: 2 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: { stdout: 'root:x:0:\nusers:x:100:\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group', '1000'], result: { stdout: '', stderr: '', exitCode: 2 } })
       executor.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name', '-t', 'filesystem'], result: { stdout: '', stderr: '', exitCode: 0 } })
       const res = await app.inject({
         method: 'POST',
@@ -984,6 +987,8 @@ describe('share-identity routes', () => {
       // nobody holds is exit 2 (getent(1)) — the create picks uid 1007.
       executor.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name', '-t', 'filesystem'], result: ok('') })
       executor.addFixture({ command: '/usr/bin/getent', argsMatch: a => a.length === 2 && a[0] === 'passwd' && Number(a[1]) >= 1007, result: NOT_FOUND })
+      // cr.29c: the pick and the same-number check look gid 1007 up too (free).
+      executor.addFixture({ command: '/usr/bin/getent', argsMatch: a => a.length === 2 && a[0] === 'group' && Number(a[1]) >= 1007, result: NOT_FOUND })
 
       logLines = []
       app = Fastify({
@@ -1298,7 +1303,7 @@ describe('share-identity routes', () => {
 
   // --- cr.3 (review C3) — system accounts are not mutable --------------------
   //
-  // A mutation may target only accounts in the share band [1000, 60000). root
+  // A mutation may target only accounts in the share band [1000, 60000]. root
   // (uid 0), the 1..999 service range, nobody (65534) and system groups (sudo,
   // gid 27) get a HARD 409 SYSTEM_ACCOUNT: no confirm code is minted, no job
   // is submitted, and no mutating command ever runs. Band accounts pass every
@@ -1422,7 +1427,7 @@ describe('share-identity routes', () => {
       await rm(tmpDir, { recursive: true, force: true })
     })
 
-    // The three out-of-band shapes: uid 0, the service range, the 60000+ range.
+    // The three out-of-band shapes: uid 0, the service range, the range above 60000.
     const OUT_OF_BAND: Array<[string, number]> = [['root', 0], ['svcbackup', 100], ['nobody', 65534]]
 
     it('refuses to disable/enable root, a service account, and nobody (uid 0/100/65534)', async () => {

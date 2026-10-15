@@ -8,7 +8,7 @@
  */
 
 import type { SystemGroup, SystemUser } from '@anas/shared'
-import { SHARE_ID_LIMIT, SHARE_ID_MIN } from '@anas/shared'
+import { SHARE_ID_MAX, SHARE_ID_MIN } from '@anas/shared'
 
 /** One `getent passwd` line, all seven colon-separated fields. */
 export interface PasswdEntry {
@@ -29,9 +29,9 @@ export interface GroupEntry {
 }
 
 /**
- * Share-relevant ids: root (0) plus the regular-user band [1000, 60000)
- * (Debian login.defs UID_MIN..UID_MAX, `SHARE_ID_MIN`/`SHARE_ID_LIMIT` in the
- * shared identity schema; UID_MAX 60000 itself is outside — WAVE2-DESIGN §11).
+ * Share-relevant ids: root (0) plus the regular-user band [1000, 60000]
+ * inclusive (login.defs UID_MIN..UID_MAX, `SHARE_ID_MIN`/`SHARE_ID_MAX` in the
+ * shared identity schema; cr.29c moved UID_MAX 60000 itself inside).
  * Filters out both the 1..999 service
  * range AND high dynamically-allocated system accounts (e.g. `ceph` 64045,
  * `nobody` 65534) so pickers/lists show a clean access landscape (story 8.1).
@@ -45,13 +45,14 @@ export function isShareRelevant(id: number): boolean {
  * Mutable share ids: exactly the band {@link isShareRelevant} draws, WITHOUT
  * its uid-0 exception. The two differ on purpose: root (and the group `root`)
  * owns files, so lists and ownership pickers must keep showing it — but no
- * ANAS mutation may ever TARGET an account outside [1000, 60000): disabling
+ * ANAS mutation may ever TARGET an account outside [1000, 60000]: disabling
  * root would lock root@pam and sshd out of the whole node (PAM honours
- * expiry), and the 1..999 service range plus the 60000+ dynamic-system range
+ * expiry), and the 1..999 service range plus the dynamic-system range above
+ * 60000 (`ceph` 64045, systemd's DynamicUser 61184+, `nobody` 65534)
  * belong to the OS, not to shares (story cr.3, review C3).
  */
 export function isMutableShareId(id: number): boolean {
-  return id >= SHARE_ID_MIN && id < SHARE_ID_LIMIT
+  return id >= SHARE_ID_MIN && id <= SHARE_ID_MAX
 }
 
 /**

@@ -686,7 +686,8 @@ describe('cr.42 — identity verbs take their lock keys', () => {
     assert.equal(res.statusCode, 202, res.body)
     const id = (res.json() as JobAccepted).job.id
     await until(() => calls.some(c => c.command === USERADD))
-    assert.deepEqual(queue.heldLocks().map(l => [l.key, l.mode]), [['idname:accuser', 'exclusive'], ['uid:1000', 'exclusive'], ['gid:1005', 'exclusive']])
+    // …and the same number's gid key (cr.29c): a group create of gid 1000 waits.
+    assert.deepEqual(queue.heldLocks().map(l => [l.key, l.mode]), [['idname:accuser', 'exclusive'], ['uid:1000', 'exclusive'], ['gid:1000', 'exclusive'], ['gid:1005', 'exclusive']])
     releaseAdd()
     assert.equal((await finished(id)).status, 'completed')
 

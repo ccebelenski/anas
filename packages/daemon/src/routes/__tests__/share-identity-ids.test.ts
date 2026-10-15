@@ -10,10 +10,11 @@ import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import Fastify from 'fastify'
+import { AuditLogger } from '../../audit/logger.js'
 import { MockExecutor } from '../../executor/mock.js'
 import { JobQueue } from '../../jobs/queue.js'
 import { ConfirmStore } from '../../safety/confirm.js'
-import { shareIdentityRoutes } from '../share-identity.js'
+import { GROUP_CREATE_PRESENTATION_ONLY, shareIdentityRoutes, USER_CREATE_PRESENTATION_ONLY } from '../share-identity.js'
 
 /**
  * Story cr.29 (ruled 2026-10-15): create user / create group pass an explicit
@@ -103,6 +104,8 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
   let broken: (c: Call) => ExecResult | undefined
   /** Held until released: a test parks a command here. */
   let gate: ((c: Call) => Promise<void> | undefined) | undefined
+  /** The daemon's log lines (pino JSON), the audit lines among them. */
+  let logLines: string[]
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-cr29-'))
@@ -147,8 +150,13 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
         return ok('')
       return ok('')
     }
-    queue = new JobQueue()
-    app = Fastify({ logger: false })
+    logLines = []
+    app = Fastify({ logger: { level: 'info', stream: { write: (line: string) => {
+      logLines.push(line)
+    } } } })
+    // The real audit logger (audit/logger.ts) over the app's pino: what
+    // journald receives is these JSON lines.
+    queue = new JobQueue({ audit: new AuditLogger(app.log) })
     await app.register(shareIdentityRoutes, {
       prefix: '/v1',
       executor,
@@ -191,11 +199,11 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
 
   // --- A free id is used ---------------------------------------------------
 
-  it('a free id is used: the next uid above the highest in-band account (accuser 1004) → useradd -u 1005', async () => {
+  it('a free id is used: the next uid above the highest in-band account (accuser 1004) that no group holds as its gid (accgroup 1005, cr.29c) → useradd -u 1006', async () => {
     const job = await created('/v1/identity/users', { name: 'alice' })
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.deepEqual(argvOf(USERADD), [['-N', '-M', '-s', '/usr/sbin/nologin', '-u', '1005', 'alice']])
-    assert.deepEqual(job.result, { created: 'alice', uid: 1005, smbEnabled: false })
+    assert.deepEqual(argvOf(USERADD), [['-N', '-M', '-s', '/usr/sbin/nologin', '-u', '1006', 'alice']])
+    assert.deepEqual(job.result, { created: 'alice', uid: 1006, smbEnabled: false })
     // It looked: the ZFS accounting of both filesystems and a bounded find of
     // every non-ZFS share root (smb.conf [backups] and every export), once
     // at the route and once more in the job.
@@ -216,18 +224,18 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
   // --- An id that owns something is skipped ------------------------------
 
   it('an id that owns a file under a share root is skipped (find), and one ZFS accounts for is skipped too', async () => {
-    owned = { '/tank/backups': { 1005: '/tank/backups/2026/old-alice.tar' } }
-    space = { 'mnttest': [0], 'mnttest/data': [0, 1006] }
+    owned = { '/tank/backups': { 1006: '/tank/backups/2026/old-alice.tar' } }
+    space = { 'mnttest': [0], 'mnttest/data': [0, 1007] }
     const res = await post('/v1/identity/users', { name: 'alice' })
     assert.equal(res.statusCode, 202, res.body)
     const id = (res.json() as JobAccepted).job.id
     const job = await finished(id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.deepEqual(argvOf(USERADD), [['-N', '-M', '-s', '/usr/sbin/nologin', '-u', '1007', 'alice']])
+    assert.deepEqual(argvOf(USERADD), [['-N', '-M', '-s', '/usr/sbin/nologin', '-u', '1008', 'alice']])
   })
 
   it('the job\'s progress names what the skipped ids still own', async () => {
-    owned = { '/tank/backups': { 1005: '/tank/backups/x' } }
+    owned = { '/tank/backups': { 1006: '/tank/backups/x' } }
     let line = ''
     const releaseAdd = parkUseradd()
     const res = await post('/v1/identity/users', { name: 'alice' })
@@ -236,7 +244,7 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
     line = queue.get(id)?.progress ?? ''
     releaseAdd()
     await finished(id)
-    assert.equal(line, `Creating share user 'alice' with uid 1006 (uid 1005 still owns '/tank/backups/x')`)
+    assert.equal(line, `Creating share user 'alice' with uid 1007 (uid 1006 still owns '/tank/backups/x')`)
   })
 
   // --- Explicit ids --------------------------------------------------------
@@ -264,13 +272,233 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
     assert.deepEqual(argvOf(GROUPADD), [['-g', '1010', 'team']])
   })
 
-  it('an explicit id outside the share band is a 400 naming the band (UID_MAX 60000 included)', async () => {
-    for (const uid of [999, 60000, 0]) {
+  it('cr.29c (1): an explicit id that owns files gets NO ownership confirm — the create is accepted at once, nothing walked', async () => {
+    // Both sources say uid 1010 / gid 1011 own something; neither is read.
+    space = { 'mnttest': [0], 'mnttest/data': [0, 1010, 1011] }
+    owned = { '/tank/backups': { 1010: '/tank/backups/bob', 1011: '/tank/backups/team' } }
+    for (const [url, body] of [['/v1/identity/users', { name: 'bob', uid: 1010 }], ['/v1/identity/groups', { name: 'team', gid: 1011 }]] as const) {
+      const res = await post(url, body)
+      assert.equal(res.statusCode, 202, res.body)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined, `${url}: no confirm code minted`)
+      await finished((res.json() as JobAccepted).job.id)
+    }
+    assert.equal(walked(), false, 'no zfs userspace/groupspace, no find for an explicit id')
+  })
+
+  it('an explicit id outside the share band is a 400 naming the band', async () => {
+    for (const uid of [999, 60001, 0]) {
       const res = await post('/v1/identity/users', { name: 'alice', uid })
       assert.equal(res.statusCode, 400, `uid ${uid}`)
-      assert.match(res.json().error.message, /from 1000 to 59999 \(the share band\)/)
+      assert.match(res.json().error.message, /from 1000 to 60000 \(the share band\)/)
     }
     assert.deepEqual(argvOf(USERADD), [])
+  })
+
+  it('cr.29c (7): the band\'s top, login.defs UID_MAX / GID_MAX 60000, is a share id — given explicitly it is created', async () => {
+    const u = await created('/v1/identity/users', { name: 'alice', uid: 60000 })
+    assert.equal(u.status, 'completed', JSON.stringify(u.error))
+    assert.deepEqual(argvOf(USERADD), [['-N', '-M', '-s', '/usr/sbin/nologin', '-u', '60000', 'alice']])
+    const g = await created('/v1/identity/groups', { name: 'team', gid: 60000 })
+    assert.equal(g.status, 'completed', JSON.stringify(g.error))
+    assert.deepEqual(argvOf(GROUPADD), [['-g', '60000', 'team']])
+  })
+
+  // --- cr.29c (2): uid N where a group already has gid N ---------------------
+  //
+  // ANAS creates users with `useradd -N` (identity.1c): no private group is
+  // made, the primary group is the default GROUP=100 (`useradd -D`, probe
+  // P06). USERGROUPS_ENAB (yes on PVE, P06) does not apply with -N
+  // (useradd(8): "The default behavior (if the -g, -N, and -U options are not
+  // specified) is defined by the USERGROUPS_ENAB variable"). What remains of
+  // the ruling's case is uid N and gid N belonging to two unrelated accounts:
+  // that is the confirm.
+
+  function postConfirmed(url: string, body: unknown, code: string) {
+    return app!.inject({ method: 'POST', url, headers: { ...HEADERS, 'x-anas-confirm': code }, payload: JSON.stringify(body) })
+  }
+
+  it('cr.29c (2): an explicit uid a group holds as its gid is a 409 confirm naming the group; the resend with the code creates it, still -N', async () => {
+    const first = await post('/v1/identity/users', { name: 'alice', uid: 1005 })
+    assert.equal(first.statusCode, 409, first.body)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    assert.equal(first.json().error.message, `Create user 'alice' with uid 1005?`)
+    assert.deepEqual(first.json().error.warnings, [
+      `Group 'accgroup' already has gid 1005. User 'alice' will get uid 1005 with primary group gid 100 (the default), so uid 1005 and gid 1005 will belong to two unrelated accounts. To avoid it, give another User ID, choose 'accgroup' as the primary group, or leave the User ID empty and ANAS picks one no group holds as its gid.`,
+    ])
+    const code = first.headers['x-anas-confirm-code']
+    assert.equal(typeof code, 'string')
+    assert.deepEqual(argvOf(USERADD), [], 'nothing created before the confirm')
+    assert.deepEqual(queue.list(), [], 'no job before the confirm')
+
+    // The challenge dropped the id promise: the resend is not "being given to another".
+    const res = await postConfirmed('/v1/identity/users', { name: 'alice', uid: 1005 }, code as string)
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(argvOf(USERADD), [['-N', '-M', '-s', '/usr/sbin/nologin', '-u', '1005', 'alice']])
+  })
+
+  it('cr.29c (2): the code binds what holds the number — a resend after the holder changed is asked again', async () => {
+    const first = await post('/v1/identity/users', { name: 'alice', uid: 1005 })
+    const code = first.headers['x-anas-confirm-code'] as string
+    // The holder changed between the challenge and the resend.
+    groups = groups.map(l => l === ACCGROUP ? 'renamed:x:1005:' : l)
+    const again = await postConfirmed('/v1/identity/users', { name: 'alice', uid: 1005 }, code)
+    assert.equal(again.statusCode, 409)
+    assert.equal(again.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.match(again.json().error.message, /what holds the same number changed since you confirmed/)
+    assert.deepEqual(argvOf(USERADD), [])
+  })
+
+  it('cr.29c (2): a group that takes gid N while the job waits fails the job STATE_CHANGED; no useradd', async () => {
+    const release = holdSlots()
+    const res = await post('/v1/identity/users', { name: 'alice', uid: 1030 })
+    assert.equal(res.statusCode, 202, res.body)
+    groups = [...groups, 'late:x:1030:']
+    release()
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.match(job.error!.message, /^Since the request was checked: Group 'late' already has gid 1030\. .* Nothing was created; create it again to confirm\.$/)
+    assert.deepEqual(argvOf(USERADD), [])
+  })
+
+  it('cr.29c (2): the SMB password is the one unsigned field of the user create confirm, and never reaches its sentences', async () => {
+    assert.deepEqual(Object.keys(USER_CREATE_PRESENTATION_ONLY), ['smbPassword'])
+    assert.deepEqual(GROUP_CREATE_PRESENTATION_ONLY, {})
+    const first = await post('/v1/identity/users', { name: 'alice', uid: 1005, smbPassword: 'Secret-one-1' })
+    assert.equal(first.statusCode, 409)
+    const code = first.headers['x-anas-confirm-code'] as string
+    // Another password AND full name on the resend: the sentence names the full name, never a password.
+    const again = await postConfirmed('/v1/identity/users', { name: 'alice', uid: 1005, smbPassword: 'Secret-two-2', fullName: 'Alice' }, code)
+    assert.equal(again.statusCode, 409)
+    assert.equal(again.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.match(again.json().error.message, /fullName/)
+    assert.equal(again.body.includes('Secret-'), false, again.body)
+  })
+
+  // --- cr.29c (3): an explicit primary group on Add -------------------------
+
+  it('cr.29c (3): a primary group the request names is passed as useradd -g <its gid> beside -N, and its gid key is taken', async () => {
+    const releaseAdd = parkUseradd()
+    const res = await post('/v1/identity/users', { name: 'alice', primaryGroup: 'accgroup' })
+    assert.equal(res.statusCode, 202, res.body)
+    await until(() => argvOf(USERADD).length === 1)
+    assert.ok(queue.heldLocks().some(l => l.key === 'gid:1005'), JSON.stringify(queue.heldLocks()))
+    releaseAdd()
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(argvOf(USERADD), [['-N', '-M', '-s', '/usr/sbin/nologin', '-u', '1006', '-g', '1005', 'alice']])
+  })
+
+  it('cr.29c (3): uid N with the group of gid N as its primary group is coherent — no same-number confirm', async () => {
+    const job = await created('/v1/identity/users', { name: 'alice', uid: 1005, primaryGroup: 'accgroup' })
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(argvOf(USERADD), [['-N', '-M', '-s', '/usr/sbin/nologin', '-u', '1005', '-g', '1005', 'alice']])
+  })
+
+  it('cr.29c (3): the default primary group (users, gid 100) may be named; a system group is refused, an unknown one is a 400', async () => {
+    const job = await created('/v1/identity/users', { name: 'alice', primaryGroup: 'users' })
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(argvOf(USERADD).at(-1)!.slice(-3), ['-g', '100', 'alice'])
+    const root = await post('/v1/identity/users', { name: 'bob', primaryGroup: 'root' })
+    assert.equal(root.statusCode, 409)
+    assert.equal(root.json().error.code, 'SYSTEM_ACCOUNT')
+    assert.match(root.json().error.message, /^Group 'root' \(gid 0\) is a system group, so it cannot be a share user's primary group\./)
+    const none = await post('/v1/identity/users', { name: 'bob', primaryGroup: 'nosuch' })
+    assert.equal(none.statusCode, 400)
+    assert.equal(none.json().error.message, 'Unknown primary group: nosuch')
+    const bad = await post('/v1/identity/users', { name: 'bob', primaryGroup: '-g0' })
+    assert.equal(bad.statusCode, 400, 'the schema refuses a name that is not an identity name')
+    assert.equal(argvOf(USERADD).length, 1)
+  })
+
+  it('cr.29c (3): a primary group whose gid changed while the job waited fails the job STATE_CHANGED; no useradd', async () => {
+    const release = holdSlots()
+    const res = await post('/v1/identity/users', { name: 'alice', primaryGroup: 'accgroup' })
+    assert.equal(res.statusCode, 202, res.body)
+    groups = groups.map(l => l === ACCGROUP ? 'accgroup:x:1040:' : l)
+    release()
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.equal(job.error?.message, `Group 'accgroup' has gid 1040 now (it had gid 1005 when the request was checked). Nothing was created; create the user again.`)
+    assert.deepEqual(argvOf(USERADD), [])
+  })
+
+  // --- cr.29c (5): groups alike ----------------------------------------------
+  //
+  // An explicit gid a group holds is refused — cr.29's 'an explicit id an
+  // account holds is refused' above (gid 1005 / accgroup) stays the proof.
+
+  it('cr.29c (5): an explicit gid equal to a user\'s uid whose primary group is another gid is a 409 confirm naming the user; the resend creates it', async () => {
+    const first = await post('/v1/identity/groups', { name: 'team', gid: 1004 })
+    assert.equal(first.statusCode, 409, first.body)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    assert.equal(first.json().error.message, `Create group 'team' with gid 1004?`)
+    assert.deepEqual(first.json().error.warnings, [
+      `User 'accuser' already has uid 1004, and its primary group is gid 100. Group 'team' will get gid 1004, so uid 1004 and gid 1004 will belong to two unrelated accounts: 'team' looks like the private group of 'accuser' without being it. To avoid it, give another Group ID, or leave it empty and ANAS picks one no user holds as its uid.`,
+    ])
+    assert.deepEqual(argvOf(GROUPADD), [])
+    const res = await postConfirmed('/v1/identity/groups', { name: 'team', gid: 1004 }, first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 202, res.body)
+    assert.equal((await finished((res.json() as JobAccepted).job.id)).status, 'completed')
+    assert.deepEqual(argvOf(GROUPADD), [['-g', '1004', 'team']])
+  })
+
+  it('cr.29c (5): a gid equal to the uid of a user whose primary gid IS that number is its private group — no confirm', async () => {
+    // `getent passwd` line shape of accuser (the capture), uid/gid rewritten:
+    // a user whose primary group gid 1050 no longer exists.
+    passwd = [...passwd, rewrite(ACCUSER, 'accuser:x:1004:100:', 'orphan:x:1050:1050:')]
+    const res = await post('/v1/identity/groups', { name: 'orphan', gid: 1050 })
+    assert.equal(res.statusCode, 202, res.body)
+    assert.equal((await finished((res.json() as JobAccepted).job.id)).status, 'completed')
+    assert.deepEqual(argvOf(GROUPADD), [['-g', '1050', 'orphan']])
+  })
+
+  it('cr.29c (5): a picked gid steps over a number a user holds as its uid', async () => {
+    passwd = [...passwd, rewrite(ACCUSER, 'accuser:x:1004:', 'bob:x:1006:')]
+    const job = await created('/v1/identity/groups', { name: 'media' })
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(argvOf(GROUPADD), [['-g', '1007', 'media']])
+  })
+
+  it('cr.29c (5): a user that takes uid N while the group job waits fails the job STATE_CHANGED; no groupadd', async () => {
+    const release = holdSlots()
+    const res = await post('/v1/identity/groups', { name: 'team', gid: 1030 })
+    assert.equal(res.statusCode, 202, res.body)
+    passwd = [...passwd, 'zed:x:1030:100::/home/zed:/usr/sbin/nologin']
+    release()
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.match(job.error!.message, /^Since the request was checked: User 'zed' already has uid 1030, and its primary group is gid 100\. /)
+    assert.deepEqual(argvOf(GROUPADD), [])
+  })
+
+  // --- cr.29c (6): the audit line ------------------------------------------------
+
+  it('cr.29c (6): a create\'s journald audit line carries the uid / gid used and whether it was explicit or picked', async () => {
+    const audit = (operation: string) => logLines
+      .map(l => JSON.parse(l) as { audit?: boolean, event?: string, operation?: string, params?: Record<string, unknown> })
+      .filter(l => l.audit === true && l.event === 'job.submitted' && l.operation === operation)
+      .map(l => l.params)
+    await created('/v1/identity/users', { name: 'alice' })
+    await created('/v1/identity/users', { name: 'bob', uid: 1010, primaryGroup: 'accgroup' })
+    assert.deepEqual(audit('identity.user.add'), [
+      { user: 'alice', uid: 1006, explicit: false, smbEnabled: false },
+      { user: 'bob', uid: 1010, explicit: true, primaryGroup: 'accgroup', primaryGid: 1005, smbEnabled: false },
+    ])
+    // gid 1006: the fake's account lists do not grow with useradd.
+    await created('/v1/identity/groups', { name: 'media' })
+    await created('/v1/identity/groups', { name: 'team', gid: 1020 })
+    assert.deepEqual(audit('identity.group.add'), [
+      { group: 'media', gid: 1006, explicit: false },
+      { group: 'team', gid: 1020, explicit: true },
+    ])
+    // The finished line carries the same params.
+    const done = logLines.map(l => JSON.parse(l) as { event?: string, params?: { uid?: number, explicit?: boolean } }).filter(l => l.event === 'job.completed' && l.params?.uid === 1010)
+    assert.equal(done.length, 1)
+    assert.equal(done[0].params?.explicit, true)
   })
 
   // --- Fail closed -----------------------------------------------------------
@@ -280,7 +508,9 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
       [c => c.command === FINDMNT ? { stdout: '', stderr: 'findmnt: cannot read /proc/self/mountinfo', exitCode: 1 } : undefined, 'the mount table (findmnt: findmnt: cannot read /proc/self/mountinfo)'],
       [c => c.command === ZFS && c.args[0] === 'userspace' ? { stdout: '', stderr: `cannot get used/quota for mnttest: dataset is busy`, exitCode: 1 } : undefined, `ZFS's per-user accounting of 'mnttest' (zfs userspace: cannot get used/quota for mnttest: dataset is busy)`],
       [c => c.command === FIND ? { stdout: '', stderr: `find: '/tank/backups/x': Input/output error`, exitCode: 1 } : undefined, `the files under '/tank/backups' (find: find: '/tank/backups/x': Input/output error)`],
-      [c => c.command === GETENT && c.args[1] === '1005' ? { stdout: '', stderr: '', exitCode: 1 } : undefined, 'the account database (getent passwd 1005: exit code 1)'],
+      [c => c.command === GETENT && c.args.join(' ') === 'passwd 1006' ? { stdout: '', stderr: '', exitCode: 1 } : undefined, 'the account database (getent passwd 1006: exit code 1)'],
+      // cr.29c: the candidate's by-number group lookup (is gid 1006 a group's?).
+      [c => c.command === GETENT && c.args.join(' ') === 'group 1006' ? { stdout: '', stderr: '', exitCode: 1 } : undefined, 'the account database (getent group 1006: exit code 1)'],
     ]
     for (const [fail, what] of cases) {
       broken = fail
@@ -333,11 +563,11 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
     // The two jobs hold different uid keys (they can run side by side).
     await until(() => argvOf(USERADD).length === 2)
     const keys = queue.heldLocks().map(l => l.key).filter(k => k.startsWith('uid:')).sort()
-    assert.deepEqual(keys, ['uid:1005', 'uid:1006'])
+    assert.deepEqual(keys, ['uid:1006', 'uid:1007'])
     releaseAdd()
     const uids = await Promise.all([a, b].map(async r => (await finished((r.json() as JobAccepted).job.id)).result as { uid: number }))
-    assert.deepEqual(uids.map(r => r.uid).sort(), [1005, 1006])
-    assert.deepEqual(argvOf(USERADD).map(a => a[a.indexOf('-u') + 1]).sort(), ['1005', '1006'])
+    assert.deepEqual(uids.map(r => r.uid).sort(), [1006, 1007])
+    assert.deepEqual(argvOf(USERADD).map(a => a[a.indexOf('-u') + 1]).sort(), ['1006', '1007'])
   })
 
   it('an explicit id already promised to an unfinished create is refused at the route', async () => {
@@ -353,7 +583,7 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
     releaseAdd()
     await finished((first.json() as JobAccepted).job.id)
     const carol = await finished((third.json() as JobAccepted).job.id)
-    assert.equal((carol.result as { uid: number }).uid, 1005)
+    assert.equal((carol.result as { uid: number }).uid, 1006)
   })
 
   it('the promise ends with the job: a failed create frees its id for the next one', async () => {
@@ -362,7 +592,7 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
     assert.equal(failed.status, 'failed')
     broken = () => undefined
     const job = await created('/v1/identity/users', { name: 'alice' })
-    assert.equal((job.result as { uid: number }).uid, 1005)
+    assert.equal((job.result as { uid: number }).uid, 1006)
   })
 
   // --- The job door (ruling (j)) -------------------------------------------------
@@ -371,12 +601,12 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
     const release = holdSlots()
     const res = await post('/v1/identity/users', { name: 'alice' })
     assert.equal(res.statusCode, 202, res.body)
-    passwd = [...passwd, 'zed:x:1005:100::/home/zed:/usr/sbin/nologin']
+    passwd = [...passwd, 'zed:x:1006:100::/home/zed:/usr/sbin/nologin']
     release()
     const job = await finished((res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'CONFLICT')
-    assert.equal(job.error?.message, `uid 1005 was given meanwhile to user 'zed'. Nothing was created. Create it again and ANAS picks another.`)
+    assert.equal(job.error?.message, `uid 1006 was given meanwhile to user 'zed'. Nothing was created. Create it again and ANAS picks another.`)
     assert.deepEqual(argvOf(USERADD), [])
   })
 
@@ -384,12 +614,12 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
     const release = holdSlots()
     const res = await post('/v1/identity/users', { name: 'alice' })
     assert.equal(res.statusCode, 202, res.body)
-    space = { 'mnttest': [0, 1005], 'mnttest/data': [0] }
+    space = { 'mnttest': [0, 1006], 'mnttest/data': [0] }
     release()
     const job = await finished((res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'STATE_CHANGED')
-    assert.equal(job.error?.message, `uid 1005 owns the ZFS filesystem 'mnttest' now (it owned nothing when the request was checked). Nothing was created. Create it again and ANAS picks another.`)
+    assert.equal(job.error?.message, `uid 1006 owns the ZFS filesystem 'mnttest' now (it owned nothing when the request was checked). Nothing was created. Create it again and ANAS picks another.`)
     assert.deepEqual(argvOf(USERADD), [])
   })
 

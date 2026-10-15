@@ -73,6 +73,8 @@ interface Node {
   owned: Record<string, Record<number, string>>
   /** getent passwd <n> holders. */
   holders: Record<number, string>
+  /** getent group <n> holders (cr.29c); absent = nobody. */
+  groupHolders?: Record<number, string>
   fail?: (command: string, args: string[]) => ExecResult | 'timeout' | undefined
 }
 
@@ -97,6 +99,12 @@ function fakeNode(node: Node): { executor: MockExecutor, calls: { command: strin
       const test = args.includes('-uid') ? args.indexOf('-uid') : args.indexOf('-gid')
       const hit = node.owned[root]?.[Number(args[test + 1])]
       return ok(hit ? `${hit}\n` : '')
+    }
+    if (command === GETENT && args[0] === 'group') {
+      // A `getent group` line: `name:x:gid:` (no members), like the
+      // route tests' `users:x:100:` from the stunt-node capture.
+      const holder = node.groupHolders?.[Number(args[1])]
+      return holder ? ok(`${holder}:x:${args[1]}:\n`) : { stdout: '', stderr: '', exitCode: 2 }
     }
     if (command === GETENT) {
       const holder = node.holders[Number(args[1])]
@@ -260,7 +268,8 @@ describe('cr.29 — getent by number', () => {
   it('exit 2 is free; a passwd line is its holder; anything else is unreadable', async () => {
     const { executor } = fakeNode({ ...BASE, holders: { 1005: 'carol' } })
     assert.deepEqual(await idHolder(executor, 'uid', 1006), { holder: null })
-    assert.deepEqual(await idHolder(executor, 'uid', 1005), { holder: 'carol' })
+    // cr.29c: a user found by uid carries its primary gid (field 4 of the line).
+    assert.deepEqual(await idHolder(executor, 'uid', 1005), { holder: 'carol', primaryGid: 100 })
     const broken = fakeNode({ ...BASE, fail: c => c === GETENT ? { stdout: '', stderr: '', exitCode: 1 } : undefined })
     assert.deepEqual(await idHolder(broken.executor, 'uid', 1005), { unreadable: 'the account database (getent passwd 1005: exit code 1)' })
   })
@@ -301,6 +310,26 @@ describe('cr.29 — the pick', () => {
     assert.ok(table.taken.has(1007), 'the pick promised what it chose')
   })
 
+  it('cr.29c: with `avoid`, a number the other kind holds is stepped over — enumerated, promised, or found by number', async () => {
+    const { executor } = fakeNode({ ...BASE, groupHolders: { 1007: 'ldapgroup' } })
+    // gid 1005 is a group's (enumerated), 1006 promised to a group create,
+    // 1007 a directory group only a by-number lookup finds.
+    const r = await pickId('uid', [1004], reservations(), opts(executor), { ids: [1005], held: n => n === 1006 })
+    assert.deepEqual(r, { id: 1008, skipped: [] })
+    // Without `avoid` the pick is cr.29's: 1005.
+    assert.deepEqual(await pickId('uid', [1004], reservations(), opts(executor)), { id: 1005, skipped: [] })
+  })
+
+  it('cr.29c: avoiding is "where it can": when it leaves nothing in the band, the pick runs again without it', async () => {
+    const { executor } = fakeNode(BASE)
+    assert.deepEqual(await pickId('uid', [1000, 59999], reservations(), opts(executor), { ids: [60000], held: () => false }), { id: 60000, skipped: [] })
+  })
+
+  it('cr.29c: a by-number lookup of the other kind that fails refuses the pick (never a guess)', async () => {
+    const { executor } = fakeNode({ ...BASE, fail: (c, a) => c === GETENT && a[0] === 'group' ? { stdout: '', stderr: '', exitCode: 1 } : undefined })
+    assert.deepEqual(await pickId('uid', [1004], reservations(), opts(executor), { ids: [], held: () => false }), { refusal: 'unreadable', unreadable: 'the account database (getent group 1005: exit code 1)' })
+  })
+
   it('two picks at once get different ids (the promise is taken synchronously after the last await)', async () => {
     const { executor } = fakeNode(BASE)
     const table = reservations()
@@ -325,8 +354,13 @@ describe('cr.29 — the pick', () => {
     assert.equal('skipped' in r && r.skipped.length, ID_PICK_TRIES)
   })
 
-  it('the band is full above the top account: refused, not wrapped into a hole or onto UID_MAX 60000', async () => {
+  it('the band\'s top is UID_MAX 60000 itself (cr.29c): a top account of 59999 picks 60000', async () => {
     const { executor } = fakeNode(BASE)
-    assert.deepEqual(await pickId('uid', [1000, 59999, 60000], reservations(), opts(executor)), { refusal: 'band-full', from: 60000 })
+    assert.deepEqual(await pickId('uid', [1000, 59999], reservations(), opts(executor)), { id: 60000, skipped: [] })
+  })
+
+  it('the band is full above the top account: refused, not wrapped into a hole or past UID_MAX 60000', async () => {
+    const { executor } = fakeNode(BASE)
+    assert.deepEqual(await pickId('uid', [1000, 60000, 60001], reservations(), opts(executor)), { refusal: 'band-full', from: 60001 })
   })
 })

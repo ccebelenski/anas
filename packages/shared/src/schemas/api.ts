@@ -23,7 +23,7 @@ export const ErrorCode = z.enum([
    */
   'FORBIDDEN',
   // cr.3 (review C3): a mutation aimed at a system account — uid/gid outside
-  // the share band [1000, 60000). Hard refusal, no confirm bypass.
+  // the share band [1000, 60000] (cr.29c: inclusive). Hard refusal, no confirm bypass.
   'SYSTEM_ACCOUNT',
   // Gateway-only: a peer node's gateway could not be reached (story 13.8).
   'NODE_UNREACHABLE',

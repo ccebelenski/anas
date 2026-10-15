@@ -66,10 +66,12 @@ describe('parseGroups', () => {
 })
 
 describe('isShareRelevant', () => {
-  it('keeps root (0) and the regular-user band [1000, 60000), drops service ids', () => {
+  it('keeps root (0) and the regular-user band [1000, 60000] (inclusive, cr.29c), drops service ids', () => {
     assert.equal(isShareRelevant(0), true)
     assert.equal(isShareRelevant(1000), true)
     assert.equal(isShareRelevant(59999), true)
+    assert.equal(isShareRelevant(60000), true) // login.defs UID_MAX
+    assert.equal(isShareRelevant(60001), false)
     assert.equal(isShareRelevant(1), false)
     assert.equal(isShareRelevant(999), false)
     // High dynamically-allocated system accounts are noise, not share users.
@@ -83,6 +85,8 @@ describe('isMutableShareId', () => {
     // Same band on both ends...
     assert.equal(isMutableShareId(1000), true)
     assert.equal(isMutableShareId(59999), true)
+    assert.equal(isMutableShareId(60000), true)
+    assert.equal(isMutableShareId(60001), false)
     // ...minus root, who stays LISTED (owners pickers) but is never mutable.
     assert.equal(isMutableShareId(0), false)
     assert.equal(isShareRelevant(0), true)

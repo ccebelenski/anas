@@ -2,7 +2,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
 import type { GuardReads } from '../safety/guard.js'
 import type { WalkRoot } from './access-walk.js'
-import { isPathWithin, SHARE_ID_LIMIT, SHARE_ID_MIN } from '@anas/shared'
+import { isPathWithin, SHARE_ID_MAX, SHARE_ID_MIN } from '@anas/shared'
 import { CommandTimeoutError } from '../executor/deadline.js'
 import { parseExports } from '../parsers/exports.js'
 import { isFindmntTable } from '../parsers/findmnt.js'
@@ -327,8 +327,12 @@ export async function idOwnership(kind: IdKind, id: number, o: OwnershipReadOpts
   return { owns: false }
 }
 
-/** The account holding `id`, looked up BY NUMBER through every NSS source. */
-export type IdHolder = { holder: string | null } | { unreadable: string }
+/**
+ * The account holding `id`, looked up BY NUMBER through every NSS source. A
+ * user found by uid also carries its primary gid (cr.29c: whether a group of
+ * the same number would be that user's private group).
+ */
+export type IdHolder = { holder: string | null, primaryGid?: number } | { unreadable: string }
 
 /**
  * `getent passwd <uid>` / `getent group <gid>`: a lookup by number reaches
@@ -354,7 +358,14 @@ export async function idHolder(executor: CommandExecutor, kind: IdKind, id: numb
     ? parsePasswd(r.stdout).find(e => e.uid === id)
     : parseGroups(r.stdout).find(e => e.gid === id)
   // exit 0 with a line that does not hold the id is not a shape we know.
-  return entry ? { holder: entry.name } : { unreadable: `the account database (getent ${db} ${id} answered in an unknown shape)` }
+  if (!entry)
+    return { unreadable: `the account database (getent ${db} ${id} answered in an unknown shape)` }
+  return 'uid' in entry ? { holder: entry.name, primaryGid: entry.gid } : { holder: entry.name }
+}
+
+/** The other number space: a uid's is the gids, a gid's the uids. */
+export function otherKind(kind: IdKind): IdKind {
+  return kind === 'uid' ? 'gid' : 'uid'
 }
 
 /** Why the pick could not choose an id. */
@@ -373,10 +384,26 @@ export interface PickReservations {
 }
 
 /**
+ * The OTHER number space the pick steps around where it can (cr.29c): a uid
+ * pick skips numbers a group holds as its gid, a gid pick numbers a user holds
+ * as its uid, so a picked id never makes uid N and gid N name two unrelated
+ * accounts (the state an explicit id is asked to confirm).
+ */
+export interface PickAvoid {
+  /** Every id of the other kind the account database enumerates. */
+  ids: number[]
+  /** Is this number promised to an unfinished create of the other kind? */
+  held: (id: number) => boolean
+}
+
+/**
  * Pick the id a new account gets: from the highest in-band id any account
  * holds + 1 (the band's first, 1000, when none does), skipping ids an account
  * or an unfinished create holds, and ids that own something. `accounts` is
- * every id the account database enumerates (any band). The final check of a
+ * every id the account database enumerates (any band). With `avoid`, numbers
+ * the other kind holds are stepped over too (enumerated, promised, then a
+ * by-number lookup of the candidate) — and when that leaves nothing in the
+ * band, the pick runs again without it ("where it can"). The final check of a
  * candidate is a by-number `getent` lookup, then the synchronous reservation.
  */
 export async function pickId(
@@ -384,14 +411,40 @@ export async function pickId(
   accounts: number[],
   reservations: PickReservations,
   o: OwnershipReadOpts,
+  avoid?: PickAvoid,
+): Promise<PickResult> {
+  const picked = await pickFrom(kind, accounts, reservations, o, avoid)
+  if (avoid && 'refusal' in picked && picked.refusal === 'band-full')
+    return pickFrom(kind, accounts, reservations, o, undefined)
+  return picked
+}
+
+async function pickFrom(
+  kind: IdKind,
+  accounts: number[],
+  reservations: PickReservations,
+  o: OwnershipReadOpts,
+  avoid: PickAvoid | undefined,
 ): Promise<PickResult> {
   const used = new Set(accounts)
+  const others = new Set(avoid?.ids ?? [])
   const top = accounts.reduce((m, id) => (isMutableShareId(id) && id > m ? id : m), SHARE_ID_MIN - 1)
   const from = top + 1
   const skipped: { id: number, where: string }[] = []
-  for (let n = from; n < SHARE_ID_LIMIT; n++) {
+  // The band's top, 60000 (login.defs UID_MAX / GID_MAX), is a candidate too (cr.29c).
+  for (let n = from; n <= SHARE_ID_MAX; n++) {
     if (used.has(n) || reservations.held(n))
       continue
+    if (avoid && (others.has(n) || avoid.held(n)))
+      continue
+    if (avoid) {
+      // By number: a directory group / user the enumeration does not list.
+      const other = await idHolder(o.executor, otherKind(kind), n)
+      if ('unreadable' in other)
+        return { refusal: 'unreadable', unreadable: other.unreadable }
+      if (other.holder !== null)
+        continue
+    }
     if (skipped.length >= ID_PICK_TRIES)
       return { refusal: 'tries', from, skipped }
     const owned = await idOwnership(kind, n, o)

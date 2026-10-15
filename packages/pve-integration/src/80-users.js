@@ -20,11 +20,13 @@
  * Data (paths relative to /v1):
  *   GET  /identity/users                    → { data: ShareUser[] }
  *   GET  /identity/groups                   → { data: ShareGroup[] }
- *   POST /identity/users                    → 202 { job }  (CreateShareUserRequest)
+ *   POST /identity/users                    → 202/409 (CreateShareUserRequest; cr.29c:
+ *                                            a confirm when uid N and gid N would
+ *                                            belong to two unrelated accounts)
  *   POST /identity/users/:name/smb-password → 202 { job }  (SetSmbPasswordRequest)
  *   PUT  /identity/users/:name              → 202 { job }  (SetUserEnabledRequest)
  *   DELETE /identity/users/:name            → 202/409 (confirm-gated)
- *   POST /identity/groups                   → 202 { job }  (CreateGroupRequest)
+ *   POST /identity/groups                   → 202/409 (CreateGroupRequest; the same confirm)
  *   PUT  /identity/groups/:name/members     → 202 { job }  (UpdateGroupMembersRequest)
  *   DELETE /identity/groups/:name           → 202/409 (confirm-gated)
  *
@@ -48,7 +50,10 @@
  *                    'anas-fld-user-groups' / 'anas-fld-smb-password' /
  *                    'anas-fld-group-name' / 'anas-fld-group-members' /
  *                    'anas-fld-user-uid' / 'anas-fld-group-gid' (cr.29: optional
- *                    numeric ids — sent as a number, omitted when empty)
+ *                    numeric ids — sent as a number, omitted when empty) and
+ *                    'anas-fld-user-primary-group' (cr.29c: an existing group,
+ *                    omitted when empty), inside the collapsed
+ *                    'anas-fs-user-advanced' / 'anas-fs-group-advanced'
  *   submit buttons   'anas-btn-user-create-submit' / 'anas-btn-smb-password-submit' /
  *                    'anas-btn-group-create-submit' / 'anas-btn-group-members-submit'
  *
@@ -86,9 +91,10 @@
     var NAME_RE = /^[A-Za-z_][A-Za-z0-9_-]*\$?$/;
 
     // cr.29: the share band an explicit User ID / Group ID must sit in
-    // (shared SHARE_ID_MIN / SHARE_ID_LIMIT - 1; the daemon is authoritative).
+    // (shared SHARE_ID_MIN / SHARE_ID_MAX, inclusive since cr.29c — login.defs
+    // UID_MAX / GID_MAX; the daemon is authoritative).
     var ID_MIN = 1000;
-    var ID_MAX = 59999;
+    var ID_MAX = 60000;
 
     // The optional numeric id field of the Add dialogs (cr.29). Left empty,
     // ANAS picks the next free id that owns no files; a number given is used
@@ -130,6 +136,25 @@
             return false;
         }
         return v;
+    }
+
+    // cr.29c: the Add dialogs' collapsed "Advanced" section (the uid / gid and
+    // the primary group — fields most creates leave alone). The collapsible
+    // fieldset idiom copied from 67-mounts.js's 'nfsAdvanced' (collapsible,
+    // collapsed, titleCollapse, the dialog's own label width).
+    function advancedSection(itemId, cls, items) {
+        return {
+            xtype: 'fieldset',
+            itemId: itemId,
+            cls: cls,
+            title: t('Advanced'),
+            collapsible: true,
+            collapsed: true,
+            titleCollapse: true,
+            margin: '6 0 0 0',
+            defaults: { anchor: '100%', labelWidth: 150 },
+            items: items,
+        };
     }
 
     // ---- Selection helpers -------------------------------------------------
@@ -430,7 +455,6 @@
                             fieldLabel: t('Full name'),
                             emptyText: t('(optional)'),
                         },
-                        idField('uid', 'anas-fld-user-uid', 'User ID (optional)'),
                         {
                             xtype: 'tagfield',
                             itemId: 'groups',
@@ -464,6 +488,24 @@
                             inputAttrTpl: ANAS.noAutofill.secret.inputAttrTpl,
                             fieldLabel: t('Confirm password'),
                         },
+                        advancedSection('advanced', 'anas-fs-user-advanced', [
+                            idField('uid', 'anas-fld-user-uid', 'User ID (optional)'),
+                            {
+                                // cr.29c: an existing group as the PRIMARY
+                                // group (useradd -g, no private group). Empty
+                                // = the default primary group, users.
+                                xtype: 'combobox',
+                                itemId: 'primaryGroup',
+                                cls: 'anas-fld-user-primary-group',
+                                fieldLabel: t('Primary group'),
+                                store: groupStore,
+                                displayField: 'name',
+                                valueField: 'name',
+                                queryMode: 'local',
+                                forceSelection: true,
+                                emptyText: t('(optional — default: users)'),
+                            },
+                        ]),
                         {
                             xtype: 'component',
                             margin: '4 0 0 0',
@@ -523,13 +565,22 @@
 
         var uid = idValue(win.down('#uid'));
         if (uid === false) {
-            ANAS.alertMsg('Invalid input', t('User ID must be a whole number from 1000 to 59999, or empty.'));
+            ANAS.alertMsg('Invalid input', t('User ID must be a whole number from 1000 to 60000, or empty.'));
+            return;
+        }
+
+        var primaryGroup = trim(win.down('#primaryGroup').getValue());
+        if (primaryGroup && !NAME_RE.test(primaryGroup)) {
+            ANAS.alertMsg('Invalid input', t('Choose an existing group as the primary group, or leave it empty.'));
             return;
         }
 
         var body = { name: name };
         if (uid !== null) {
             body.uid = uid;
+        }
+        if (primaryGroup) {
+            body.primaryGroup = primaryGroup;
         }
         var fullName = trim(win.down('#fullName').getValue());
         if (fullName) {
@@ -543,13 +594,18 @@
             body.smbPassword = pw;
         }
 
-        ANAS.runJob({
+        // confirmAndRun (cr.29c): the daemon answers 409 with a code when uid N
+        // and gid N would belong to two unrelated accounts; its own sentence
+        // leads the prompt. Without a collision this is a plain 202.
+        ANAS.confirmAndRun({
             node: node,
             method: 'post',
             path: '/identity/users',
             body: body,
             view: win,
             failTitle: 'Create failed',
+            confirmTitle: 'Create user',
+            confirmHeadline: true,
             successMsg: t('Share user created') + ': ' + name,
             onComplete: function () {
                 if (!win.destroyed && !win.destroying) {
@@ -1000,7 +1056,9 @@
                             regexText: t('Letters, digits, underscore and hyphen only; may start with a letter or underscore.'),
                             maxLength: 32,
                         },
-                        idField('gid', 'anas-fld-group-gid', 'Group ID (optional)'),
+                        advancedSection('advanced', 'anas-fs-group-advanced', [
+                            idField('gid', 'anas-fld-group-gid', 'Group ID (optional)'),
+                        ]),
                     ],
                 }],
                 buttons: [
@@ -1043,7 +1101,7 @@
         }
         var gid = idValue(win.down('#gid'));
         if (gid === false) {
-            ANAS.alertMsg('Invalid input', t('Group ID must be a whole number from 1000 to 59999, or empty.'));
+            ANAS.alertMsg('Invalid input', t('Group ID must be a whole number from 1000 to 60000, or empty.'));
             return;
         }
         var body = { name: name };
@@ -1051,13 +1109,15 @@
             body.gid = gid;
         }
 
-        ANAS.runJob({
+        ANAS.confirmAndRun({
             node: node,
             method: 'post',
             path: '/identity/groups',
             body: body,
             view: win,
             failTitle: 'Create failed',
+            confirmTitle: 'Create group',
+            confirmHeadline: true,
             successMsg: t('Group created') + ': ' + name,
             onComplete: function () {
                 if (!win.destroyed && !win.destroying) {

@@ -88,17 +88,21 @@ export type ShareGroup = z.infer<typeof ShareGroup>
 // --- Write models ---
 
 /**
- * The share band: the uids and gids ANAS creates and changes, `[1000, 60000)`.
- * Debian's login.defs says `UID_MIN 1000` / `UID_MAX 60000` (and the same for
- * GIDs, probe P06), so UID_MAX itself sits OUTSIDE this band: a uid of exactly
- * 60000 that `useradd`'s own allocator could hand out reads as a system account
- * here (WAVE2-DESIGN §11). Since cr.29 ANAS always passes an explicit `-u`/`-g`
- * from inside the band, so it never creates one. The daemon's `getent.ts`
- * band helpers read these two numbers; nothing else may restate them.
+ * The share band: the uids and gids ANAS creates and changes, `[1000, 60000]`
+ * INCLUSIVE (cr.29c, operator 2026-10-15). It is login.defs' own range for
+ * regular accounts: login.defs(5) "UID_MAX (number), UID_MIN (number) Range of
+ * user IDs used for the creation of regular users by useradd or newusers. The
+ * default value for UID_MIN (resp. UID_MAX) is 1000 (resp. 60000)" — and the
+ * same for GID_MIN / GID_MAX; PVE 9.2's /etc/login.defs says exactly
+ * `UID_MIN 1000`, `UID_MAX 60000`, `GID_MIN 1000`, `GID_MAX 60000` (probe
+ * P06). Until cr.29c the band stopped at 59999, so a uid of 60000 that
+ * useradd itself could hand out read as a system account. The daemon's
+ * `getent.ts` band helpers read these two numbers; nothing else may restate
+ * them (the ES5 panel mirrors them by hand, 80-users.js `ID_MIN`/`ID_MAX`).
  */
 export const SHARE_ID_MIN = 1000
-/** The first id ABOVE the share band (exclusive bound). */
-export const SHARE_ID_LIMIT = 60000
+/** The LAST id of the share band (inclusive bound): login.defs UID_MAX / GID_MAX. */
+export const SHARE_ID_MAX = 60000
 
 /**
  * An explicit uid/gid on Add (story cr.29, ruled 2026-10-15): the out for
@@ -109,8 +113,8 @@ export const SHARE_ID_LIMIT = 60000
  */
 export const ShareId = z.number()
   .int('must be a whole number')
-  .min(SHARE_ID_MIN, `must be from ${SHARE_ID_MIN} to ${SHARE_ID_LIMIT - 1} (the share band)`)
-  .max(SHARE_ID_LIMIT - 1, `must be from ${SHARE_ID_MIN} to ${SHARE_ID_LIMIT - 1} (the share band)`)
+  .min(SHARE_ID_MIN, `must be from ${SHARE_ID_MIN} to ${SHARE_ID_MAX} (the share band)`)
+  .max(SHARE_ID_MAX, `must be from ${SHARE_ID_MIN} to ${SHARE_ID_MAX} (the share band)`)
 export type ShareId = z.infer<typeof ShareId>
 
 /**
@@ -176,6 +180,14 @@ export const CreateShareUserRequest = z.object({
    * free uid in the share band that owns nothing under the paths it manages.
    */
   uid: ShareId.optional(),
+  /**
+   * An existing group to be the user's PRIMARY group (cr.29c), passed as
+   * `useradd -g <its gid> -N`. Absent: the default primary group (`useradd -D`
+   * GROUP=100, `users`), as every user ANAS created before. A strict identity
+   * name like `groups`; the route checks it exists and sits in the share band
+   * (or is the default group itself).
+   */
+  primaryGroup: IdentityName.optional(),
 })
 export type CreateShareUserRequest = z.infer<typeof CreateShareUserRequest>
 

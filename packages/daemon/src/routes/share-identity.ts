@@ -1,12 +1,13 @@
 import type { ShareGroup, ShareUser } from '@anas/shared'
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor, ExecOptions, ExecResult } from '../executor/types.js'
+import type { LockClaim } from '../jobs/locks.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { GroupEntry, PasswdEntry } from '../parsers/getent.js'
 import type { PassdbEntry } from '../parsers/pdbedit.js'
 import type { IdentityRefHit } from '../parsers/smb-conf.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { Advisory, Gate, GuardReads, GuardSpec, Refusal } from '../safety/guard.js'
+import type { Advisory, Gate, GuardPass, GuardReads, GuardSpec, Refusal } from '../safety/guard.js'
 import type { IdKind, OwnershipReadOpts } from '../services/identity-ids.js'
 import { constants } from 'node:fs'
 import { access } from 'node:fs/promises'
@@ -16,6 +17,8 @@ import {
   LookupName,
   SetSmbPasswordRequest,
   SetUserEnabledRequest,
+  SHARE_ID_MAX,
+  SHARE_ID_MIN,
   UpdateGroupMembersRequest,
 } from '@anas/shared'
 import {
@@ -38,7 +41,7 @@ import {
 import { findIdentityReferences } from '../parsers/smb-conf.js'
 import { gidClaim, guardCheck, guardConfirm, guarded, GuardRefusalError, idnameClaim, sendRefusal, uidClaim } from '../safety/guard.js'
 import { readConfig } from '../services/config-writer.js'
-import { ID_PICK_TRIES, idHolder, idOwnership, pickId } from '../services/identity-ids.js'
+import { ID_PICK_TRIES, idHolder, idOwnership, otherKind, pickId } from '../services/identity-ids.js'
 import { requireIdentity } from './identity.js'
 
 // Command whitelist (Principle 5). Debian/PVE paths: user/group admin tools
@@ -54,6 +57,26 @@ const SMBPASSWD = '/usr/bin/smbpasswd'
 const PDBEDIT = '/usr/bin/pdbedit'
 
 const NOLOGIN = '/usr/sbin/nologin'
+
+/** What a system account is, in the refusals' words: outside the share band [1000, 60000] (cr.3, cr.29c). */
+const SYSTEM_IDS = `uid/gid below ${SHARE_ID_MIN} or above ${SHARE_ID_MAX}`
+
+/**
+ * The primary gid of a user ANAS creates without naming one: with `-N`,
+ * useradd(8) (shadow-utils 4.x) adds "the user to the group specified by the
+ * -g option or by the GROUP variable in /etc/default/useradd", and
+ * `useradd -D` on PVE 9.2 says `GROUP=100` (probe P06) — `users`.
+ */
+const DEFAULT_PRIMARY_GID = 100
+
+/**
+ * The create confirms' unsigned fields (cr.29c; WAVE3-DESIGN §5.2: each named
+ * with its reason, and a test lists them).
+ */
+export const USER_CREATE_PRESENTATION_ONLY: Record<string, string> = {
+  smbPassword: 'a secret: never kept in the confirm store or named in a mismatch sentence; the confirm is about the uid, which no password changes',
+}
+export const GROUP_CREATE_PRESENTATION_ONLY: Record<string, string> = {}
 
 /**
  * The actionable "no samba on this node" sentence (issue #6). smbpasswd lives in
@@ -460,7 +483,7 @@ export async function shareIdentityRoutes(
     return {
       status: 409,
       code: 'SYSTEM_ACCOUNT',
-      message: `${what} '${name}' (${kind === 'user' ? 'uid' : 'gid'} ${id}) is a system account. System accounts (uid/gid below 1000 or from 60000) are managed outside ANAS.`,
+      message: `${what} '${name}' (${kind === 'user' ? 'uid' : 'gid'} ${id}) is a system account. System accounts (${SYSTEM_IDS}) are managed outside ANAS.`,
     }
   }
 
@@ -701,6 +724,11 @@ export async function shareIdentityRoutes(
     key: string | null
     /** Ids the pick moved past because they own something. */
     skipped: { id: number, where: string }[]
+    /**
+     * A user create's primary group when the request names one (cr.29c),
+     * with the gid the route door read; absent = the default (GROUP=100).
+     */
+    primary?: { name: string, gid: number }
   }
 
   function createId(kind: IdKind, explicit: number | undefined): CreateId {
@@ -808,7 +836,18 @@ export async function shareIdentityRoutes(
             ? accountsUnreadable('which uid is free')
             : { status: 503, code: 'UNAVAILABLE', message: 'ANAS could not read the group database (getent group), so it cannot check which gid is free — nothing was done' }
         }
-        const picked = await pickId(state.kind, accounts, { held: n => promisedTo(keyOf(n)), take: n => promiseId(keyOf(n)) }, own)
+        // cr.29c: step around numbers the OTHER kind holds, so a picked uid
+        // never lands on a group's gid (or a picked gid on a user's uid).
+        const others = state.kind === 'uid'
+          ? (await idReads.groupsStrict(reads))?.map(g => g.gid)
+          : (await idReads.users(reads))?.map(u => u.uid)
+        if (others === undefined) {
+          return state.kind === 'uid'
+            ? { status: 503, code: 'UNAVAILABLE', message: 'ANAS could not read the group database (getent group), so it cannot check which uid no group holds as its gid — nothing was done' }
+            : accountsUnreadable('which gid no user holds as its uid')
+        }
+        const avoid = { ids: others, held: (n: number) => promisedTo(`${otherKind(state.kind)}:${n}`) }
+        const picked = await pickId(state.kind, accounts, { held: n => promisedTo(keyOf(n)), take: n => promiseId(keyOf(n)) }, own, avoid)
         if ('id' in picked) {
           state.id = picked.id
           state.key = keyOf(picked.id)
@@ -820,7 +859,7 @@ export async function shareIdentityRoutes(
         const field = `${idWhom(state.kind)}'s ${idField(state.kind)}`
         const message = picked.refusal === 'tries'
           ? `The next ${ID_PICK_TRIES} free ${state.kind}s from ${picked.from} all still own files (${state.kind} ${picked.skipped[0].id} owns ${picked.skipped[0].where}, …), so ANAS did not pick one. Nothing was created. Give the ${field} explicitly.`
-          : `No ${state.kind} from ${picked.from} to 59999 is free. Nothing was created. Give the ${field} explicitly (any free id from 1000).`
+          : `No ${state.kind} from ${picked.from} to ${SHARE_ID_MAX} is free. Nothing was created. Give the ${field} explicitly (any free id from ${SHARE_ID_MIN}).`
         return { status: 409, code: 'CONFLICT', reason: 'no-free-id', message }
       }
 
@@ -902,15 +941,116 @@ export async function shareIdentityRoutes(
         read: async () => ({ name }),
         id: async () => ({ name }),
         unbound: () => `Could not read the name '${name}' — refusing`,
+        scopeLabels: { [state.kind]: `the ${state.kind}`, sameNumber: 'what holds the same number' },
       },
       gates: [...gates, createIdGate(state)],
+      // cr.29c: uid N and gid N belonging to two unrelated accounts is a
+      // confirm (advisories run after the gates, so the id is decided).
+      advisories: async (_slot, reads) => sameNumberAdvisories(state, name, reads),
       locks: async (_slot, _bound, reads) => {
         const byName = new Map((groups.length > 0 ? await idReads.groups(reads) : []).map(g => [g.name, g]))
         const gids = groups.map(g => byName.get(g)).filter((g): g is GroupEntry => g !== undefined)
         const idKey = state.kind === 'uid' ? uidClaim(state.id!, name) : gidClaim(state.id!, name)
-        return [nameClaim(name), idKey, ...gids.map(g => gidClaim(g.gid, g.name))]
+        // The same number of the other kind too (cr.29c): a group create of
+        // gid N and a user create of uid N serialise, so whichever runs second
+        // sees the other in its job-door re-read of the same-number check.
+        const other = otherKind(state.kind)
+        const sameNumber: LockClaim = { key: `${other}:${state.id!}`, mode: 'exclusive', what: `${other} ${state.id!}` }
+        // cr.29c: a create into a named primary group changes that group too.
+        const primary = state.primary ? [gidClaim(state.primary.gid, state.primary.name)] : []
+        return [nameClaim(name), idKey, sameNumber, ...primary, ...gids.map(g => gidClaim(g.gid, g.name))]
       },
     }
+  }
+
+  /**
+   * cr.29c (operator 2026-10-15): a uid and a gid of the same number belonging
+   * to two unrelated accounts is a confirm, never silent.
+   *
+   *  - user create, uid N: a group already has gid N, and it is not the new
+   *    user's primary group. ANAS creates users with `useradd -N`
+   *    (identity.1c), so no private group is made: the primary group is the
+   *    default (`GROUP=100`, {@link DEFAULT_PRIMARY_GID}) or the one the
+   *    request names;
+   *  - group create, gid N: a user already has uid N and its primary group is
+   *    not gid N (were it gid N, the new group would be that user's private
+   *    group — a repair, not a collision).
+   *
+   * Looked up BY NUMBER (every NSS source). A lookup that fails is disclosed
+   * at the confirm instead (the delete's smb.conf pattern), never a guess.
+   */
+  async function sameNumberAdvisories(state: CreateId, name: string, reads: GuardReads): Promise<Advisory[]> {
+    const id = state.id
+    if (id === null)
+      return []
+    const other = otherKind(state.kind)
+    const held = await reads.once(`samenumber:${other}:${id}`, () => idHolder(executor, other, id))
+    if ('unreadable' in held) {
+      return [{
+        key: `samenumber-unreadable:${other}:${id}`,
+        warning: `ANAS could not check whether a ${idWhom(other)} already has ${other} ${id}: it could not read ${held.unreadable}. If one does, uid ${id} and gid ${id} will belong to two unrelated accounts.`,
+      }]
+    }
+    if (held.holder === null)
+      return []
+    if (state.kind === 'uid') {
+      if ((state.primary?.gid ?? DEFAULT_PRIMARY_GID) === id)
+        return []
+      const primary = state.primary ? `'${state.primary.name}' (gid ${state.primary.gid})` : `gid ${DEFAULT_PRIMARY_GID} (the default)`
+      return [{
+        key: `samenumber:gid:${id}:${held.holder}`,
+        warning: `Group '${held.holder}' already has gid ${id}. User '${name}' will get uid ${id} with primary group ${primary}, so uid ${id} and gid ${id} will belong to two unrelated accounts. To avoid it, give another User ID, choose '${held.holder}' as the primary group, or leave the User ID empty and ANAS picks one no group holds as its gid.`,
+      }]
+    }
+    if (held.primaryGid === id)
+      return []
+    return [{
+      key: `samenumber:uid:${id}:${held.holder}`,
+      warning: `User '${held.holder}' already has uid ${id}, and its primary group is gid ${held.primaryGid}. Group '${name}' will get gid ${id}, so uid ${id} and gid ${id} will belong to two unrelated accounts: '${name}' looks like the private group of '${held.holder}' without being it. To avoid it, give another Group ID, or leave it empty and ANAS picks one no user holds as its uid.`,
+    }]
+  }
+
+  /**
+   * The create's confirm door (cr.29c): only when the same-number check
+   * listed something. The code signs the request (a secret left out, named in
+   * `presentationOnly`) and the id with what holds its number, so a resend
+   * after either changed is asked again. Answering the challenge drops the id
+   * promise: the resend decides its id afresh. False = answered (`return reply`).
+   */
+  function createConfirm(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    spec: GuardSpec<NameSlot>,
+    pre: GuardPass<NameSlot>,
+    state: CreateId,
+    validated: Record<string, unknown>,
+    presentationOnly: Record<string, string>,
+    message: string,
+  ): boolean {
+    if (pre.advisories.length === 0)
+      return true
+    const passed = guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated,
+      address: ['name'],
+      presentationOnly,
+      confirmScope: { [state.kind]: String(state.id), sameNumber: pre.advisories.map(a => a.key).join(', ') },
+      message,
+      warnings: pre.advisories.map(a => a.warning),
+    })
+    if (!passed && state.key !== null)
+      promisedIds.delete(state.key)
+    return passed
+  }
+
+  /** The job door's half: a same-number collision that appeared since the request refuses. */
+  function refuseNewSameNumber(newAdvisories: string[]): void {
+    if (newAdvisories.length === 0)
+      return
+    throw new GuardRefusalError({
+      status: 409,
+      code: 'STATE_CHANGED',
+      message: `Since the request was checked: ${newAdvisories.join(' ')} Nothing was created; create it again to confirm.`,
+    })
   }
 
   // --- GET /identity/users — enriched ShareUser list ------------------------
@@ -986,6 +1126,7 @@ export async function shareIdentityRoutes(
       return
 
     const groups = req.groups ?? []
+    const idState = createId('uid', req.uid)
     const gates: Gate<NameSlot>[] = [
       // 409 if the name already resolves anywhere (local OR directory) —
       // getent is the source of truth, and useradd would collide.
@@ -1015,9 +1156,36 @@ export async function shareIdentityRoutes(
           ? {
               status: 409,
               code: 'SYSTEM_ACCOUNT',
-              message: `Group(s) ${systemGroups.map(g => `'${g}' (gid ${byName.get(g)?.gid})`).join(', ')} are system groups. System accounts (uid/gid below 1000 or from 60000) are managed outside ANAS.`,
+              message: `Group(s) ${systemGroups.map(g => `'${g}' (gid ${byName.get(g)?.gid})`).join(', ')} are system groups. System accounts (${SYSTEM_IDS}) are managed outside ANAS.`,
             }
           : null
+      },
+      // cr.29c: the explicit primary group (`useradd -g <gid> -N`). It must
+      // exist, and sit in the share band like a supplementary group (cr.3) —
+      // or be the default primary group itself (gid 100, `users`; probe P06
+      // `useradd -D` GROUP=100), which every user ANAS creates already has.
+      // The route door records the gid it read; the job door refuses when the
+      // name has another gid by then (the `-g` it passes is that number).
+      async (_s, reads) => {
+        if (req.primaryGroup === undefined)
+          return null
+        const entry = await idReads.group(reads, req.primaryGroup)
+        if (!entry)
+          return { status: 400, code: 'VALIDATION_ERROR', message: `Unknown primary group: ${req.primaryGroup}` }
+        if (!isMutableShareId(entry.gid) && entry.gid !== DEFAULT_PRIMARY_GID) {
+          return {
+            status: 409,
+            code: 'SYSTEM_ACCOUNT',
+            message: `Group '${entry.name}' (gid ${entry.gid}) is a system group, so it cannot be a share user's primary group. System accounts (${SYSTEM_IDS}) are managed outside ANAS; the default primary group (gid ${DEFAULT_PRIMARY_GID}) is the one exception.`,
+          }
+        }
+        if (idState.primary === undefined) {
+          idState.primary = { name: entry.name, gid: entry.gid }
+          return null
+        }
+        return idState.primary.gid === entry.gid
+          ? null
+          : { status: 409, code: 'STATE_CHANGED', message: `Group '${entry.name}' has gid ${entry.gid} now (it had gid ${idState.primary.gid} when the request was checked). Nothing was created; create the user again.` }
       },
       // Samba preflight (issue #6). Refuse BEFORE the job runs useradd, so a
       // node without samba never ends up with a half-created user whose SMB
@@ -1053,20 +1221,27 @@ export async function shareIdentityRoutes(
         return null
       },
     ]
-    const idState = createId('uid', req.uid)
     const spec = createGuardSpec('user', req.name, gates, idState, groups)
     const pre = await createCheck(spec, idState)
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
     const uid = idState.id!
+    if (!createConfirm(request, reply, spec, pre, idState, { ...req }, USER_CREATE_PRESENTATION_ONLY, `Create user '${req.name}' with uid ${uid}?`))
+      return reply
 
-    // useradd -N -M -s /usr/sbin/nologin -u <uid> [-c <fullName>] [-G <groups>] <name>
+    // useradd -N -M -s /usr/sbin/nologin -u <uid> [-g <gid>] [-c <fullName>] [-G <groups>] <name>
     // -N (identity.1c): NO user-private group — the account takes the default
     // group from /etc/default/useradd, so creating 'Alice' does not conjure a
     // phantom group 'alice' into the Groups list. Pre-existing users keep
     // whatever group they already had. -u (cr.29): the uid decided above,
-    // never useradd's own highest-plus-one.
+    // never useradd's own highest-plus-one. -g (cr.29c): the primary group
+    // the request names, by the gid the gate read — useradd(8): "-g, --gid
+    // GROUP  The name or the number of the user's primary group … A group
+    // number must refer to an already existing group"; with -N, "add the user
+    // to the group specified by the -g option".
     const args = ['-N', '-M', '-s', NOLOGIN, '-u', String(uid)]
+    if (idState.primary !== undefined)
+      args.push('-g', String(idState.primary.gid))
     if (req.fullName !== undefined)
       args.push('-c', req.fullName)
     if (groups.length > 0)
@@ -1078,11 +1253,24 @@ export async function shareIdentityRoutes(
     const job = submitCreate(
       idState,
       'identity.user.add',
-      { ...identity, params: { user: req.name, uid, uidGiven: idState.explicit, groups: req.groups, smbEnabled: smbPassword !== undefined } },
+      // The audit line (cr.29c): the uid used and whether the operator gave
+      // it (`explicit: true`) or ANAS picked it; the primary group by gid.
+      {
+        ...identity,
+        params: {
+          user: req.name,
+          uid,
+          explicit: idState.explicit,
+          ...(idState.primary !== undefined ? { primaryGroup: idState.primary.name, primaryGid: idState.primary.gid } : {}),
+          groups: req.groups,
+          smbEnabled: smbPassword !== undefined,
+        },
+      },
       // Ruling (j): the name is still free, the groups still exist and are
       // in band, Samba is still there, no passdb entry claims the name, and
       // the uid is still free (a picked one still owns nothing).
-      guarded(spec, pre, async (_slot, { updateProgress }) => {
+      guarded(spec, pre, async (_slot, { updateProgress, newAdvisories }) => {
+        refuseNewSameNumber(newAdvisories)
         updateProgress(`Creating share user '${req.name}' with uid ${uid}${skippedNote(idState)}`)
         const created = await executor.exec(USERADD, args)
         if (created.exitCode !== 0)
@@ -1257,14 +1445,18 @@ export async function shareIdentityRoutes(
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
     const gid = idState.id!
+    if (!createConfirm(request, reply, spec, pre, idState, { ...req }, GROUP_CREATE_PRESENTATION_ONLY, `Create group '${req.name}' with gid ${gid}?`))
+      return reply
 
     const job = submitCreate(
       idState,
       'identity.group.add',
-      { ...identity, params: { group: req.name, gid, gidGiven: idState.explicit } },
+      // The audit line (cr.29c): the gid used, explicit or picked.
+      { ...identity, params: { group: req.name, gid, explicit: idState.explicit } },
       // Ruling (j): the name and the gid are still free (a picked gid still
       // owns nothing) when groupadd runs.
-      guarded(spec, pre, async (_slot, { updateProgress }) => {
+      guarded(spec, pre, async (_slot, { updateProgress, newAdvisories }) => {
+        refuseNewSameNumber(newAdvisories)
         updateProgress(`Creating group '${req.name}' with gid ${gid}${skippedNote(idState)}`)
         // groupadd -g <gid> <name> (cr.29): never groupadd's own highest-plus-one.
         const r = await executor.exec(GROUPADD, ['-g', String(gid), req.name])

@@ -401,7 +401,7 @@ export {
   LookupName,
   SetSmbPasswordRequest,
   SetUserEnabledRequest,
-  SHARE_ID_LIMIT,
+  SHARE_ID_MAX,
   SHARE_ID_MIN,
   ShareGroup,
   ShareId,
