@@ -61,6 +61,30 @@ function installExecutor(server: ReturnType<typeof createServer>, stubs: Stub[] 
 const ACLTYPE_MEDIA = ['get', '-Hp', '-o', 'value', 'acltype', '--', 'testpool/media']
 const MP = '/testpool/media'
 
+/** The dev mock's mount table (`mounts/findmnt-full.json`) has nothing at or under /testpool/media: one root, `-xdev`, nothing pruned. */
+const WALK_XDEV: string[] = ['-xdev']
+
+const FIND = '/usr/bin/find'
+
+/**
+ * Story nf.1 (wave-3 D2): every recursive step is a bounded `find` walk —
+ * `find -P <root> [-xdev] [( -path … ) -prune -o] <select> -exec <action> {} +` —
+ * never `-R`, which crosses every mount under the directory. WALK_XDEV is
+ * `-xdev` unless the root sits on btrfs (an AHR pool, whose subvolumes carry
+ * their own st_dev and no mount line).
+ */
+function walkOf(root: string, select: string[], action: string[]): string[] {
+  return ['-P', root, ...WALK_XDEV, ...select, '-exec', ...action, '{}', '+']
+}
+
+/** The walk whose action is `tool` (and whose action arguments pass `pred`). */
+function walkCall(calls: Call[], tool: string, pred: (action: string[]) => boolean = () => true): string[] | undefined {
+  return calls.find((c) => {
+    const at = c.args.indexOf('-exec')
+    return c.command === FIND && at >= 0 && c.args[at + 1] === tool && pred(c.args.slice(at + 2, -2))
+  })?.args
+}
+
 function ok(stdout = ''): ExecResult {
   return { stdout, stderr: '', exitCode: 0 }
 }
@@ -221,9 +245,9 @@ describe('access routes', () => {
       assert.equal(job.status, 'completed')
 
       // Symbolic mode with X (owner rwX, group rX, other rX) — never a numeric octal.
-      const chmod = find(calls, '/usr/bin/chmod', a => a[0] === '-R')
-      assert.deepEqual(chmod, ['-R', 'u=rwX,g=rX,o=rX', MP])
-      assert.ok(chmod && chmod[1].includes('X'), 'recursive chmod mode uses capital X')
+      const chmod = walkCall(calls, '/usr/bin/chmod')
+      assert.deepEqual(chmod, walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX']))
+      assert.equal(calls.some(c => c.command === '/usr/bin/chmod'), false, 'no chmod -R: the walk is find-driven (nf.1)')
       assert.equal(find(calls, '/usr/bin/chmod', a => /^[0-7]{3,4}$/.test(a[1] ?? '')), undefined)
     })
   })
@@ -350,7 +374,7 @@ describe('access routes', () => {
       assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('755')), ['755', MP]) // 7,5,5
     })
 
-    it('recursively clears the ACL then folds setgid-drop into a single chmod -R', async () => {
+    it('recursively clears the ACL then folds setgid-drop into a single chmod walk', async () => {
       server = createServer({ mock: true, logger: false })
       // Same posixacl dataset with a live named entry, but applyToExisting so the
       // whole subtree is walked. The setgid-clear must ride along with the mode
@@ -372,14 +396,14 @@ describe('access routes', () => {
       assert.equal(job.status, 'completed')
 
       // The ACL clear is a different tool (setfacl) and stays recursive.
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), ['-R', '-b', '-k', MP])
+      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-b', '-k']))
       // A SINGLE recursive chmod carries both the base perms (symbolic X) and the
-      // setgid-drop clause — not two `chmod -R` walks.
-      const chmodR = calls.filter(c => c.command === '/usr/bin/chmod' && c.args[0] === '-R')
-      assert.equal(chmodR.length, 1, 'exactly one recursive chmod')
-      assert.deepEqual(chmodR[0].args, ['-R', 'u=rwX,g=rX,o=rX,g-s', MP])
-      // No standalone `chmod -R g-s`.
-      assert.equal(find(calls, '/usr/bin/chmod', a => a.length === 3 && a[0] === '-R' && a[1] === 'g-s'), undefined)
+      // setgid-drop clause — not two chmod walks.
+      const chmodWalks = calls.filter(c => c.command === FIND && c.args.includes('/usr/bin/chmod'))
+      assert.equal(chmodWalks.length, 1, 'exactly one recursive chmod')
+      assert.deepEqual(chmodWalks[0].args, walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX,g-s']))
+      // No standalone `g-s` walk.
+      assert.equal(walkCall(calls, '/usr/bin/chmod', a => a.length === 1 && a[0] === 'g-s'), undefined)
     })
   })
 
@@ -523,7 +547,7 @@ describe('access routes', () => {
 
   // --- PUT /access: applyToExisting recurses ------------------------------
   describe('PUT /v1/pools/:name/datasets/*path/access — applyToExisting', () => {
-    it('adds -R to chown and setfacl (access + default) and walks directories for g+s, using X for read', async () => {
+    it('walks chown and setfacl (access + default) with find, directories only for g+s, using X for read', async () => {
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server) // acltype 'off'
 
@@ -546,17 +570,20 @@ describe('access routes', () => {
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
 
-      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['-R', 'media', MP])
+      // chown -h: a link's own owner, as `chown -R` (-P) changed it.
+      assert.deepEqual(walkCall(calls, '/usr/bin/chown'), walkOf(MP, [], ['/usr/bin/chown', '-h', 'media']))
       // Recursive → every execute bit is capital X, the mask too, so plain
       // files gain no execute; `-b -m` resolves X per file against its own bits.
       const spec = 'u::rwX,g::r-X,o::r-X,u:alice:r-X,m::rwX'
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-b'), ['-R', '-b', '-m', spec, MP])
+      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-b'), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-b', '-m', spec]))
       // The default ACL sits on directories only: the lowercase form is what is stored.
       const defSpec = 'u::rwx,g::r-x,o::r-x,u:alice:r-x,m::rwx'
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-d'), ['-R', '-d', '--set', defSpec, MP])
+      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-d'), walkOf(MP, ['-type', 'd'], ['/usr/bin/setfacl', '-d', '--set', defSpec]))
       // setgid on directories only.
-      assert.deepEqual(find(calls, '/usr/bin/find', () => true), [MP, '-type', 'd', '-exec', '/usr/bin/chmod', 'g+s', '{}', '+'])
+      assert.deepEqual(walkCall(calls, '/usr/bin/chmod', a => a[0] === 'g+s'), walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s']))
       assert.equal(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), undefined, 'no chmod g+s over the whole tree')
+      // No tool walks on its own: `-R` crosses every mount (nf.1).
+      assert.equal(calls.some(c => ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl'].includes(c.command) && c.args.includes('-R')), false)
     })
 
     it('a recursive read-write grant carries no lowercase x and never sets setgid on a regular file', async () => {
@@ -584,18 +611,19 @@ describe('access routes', () => {
 
       // (a) One literal x in the walk's spec turns every X into x (live proof
       // 0.4.3 §3x): the access spec of the recursive walk has none.
-      const walk = find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-b')
+      const walk = walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-b')
       assert.ok(walk, 'the recursive access ACL was written')
-      assert.equal(walk[3], 'u::rwX,g::rwX,o::r-X,u:alice:rwX,g:media:rwX,m::rwX')
-      assert.equal(walk[3].includes('x'), false, `no lowercase x in ${walk[3]}`)
-      assert.equal(calls.some(c => c.command === '/usr/bin/setfacl' && c.args[0] === '-R' && c.args[1] === '--set'), false, 'the walk never uses --set (it would strip execute from executables)')
+      const walkSpec = walk[walk.indexOf('-m') + 1]
+      assert.equal(walkSpec, 'u::rwX,g::rwX,o::r-X,u:alice:rwX,g:media:rwX,m::rwX')
+      assert.equal(walkSpec.includes('x'), false, `no lowercase x in ${walkSpec}`)
+      assert.equal(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '--set'), undefined, 'the walk never uses --set (it would strip execute from executables)')
 
       // (b) The only setgid change is the directories-only walk: no chmod
       // anywhere carries g+s, and the find selects -type d before -exec.
       assert.equal(calls.some(c => c.command === '/usr/bin/chmod' && c.args.includes('g+s')), false, 'no chmod g+s over the tree')
-      const gid = find(calls, '/usr/bin/find', () => true)
+      const gid = walkCall(calls, '/usr/bin/chmod', a => a[0] === 'g+s')
       assert.ok(gid, 'the setgid walk ran')
-      assert.deepEqual(gid, [MP, '-type', 'd', '-exec', '/usr/bin/chmod', 'g+s', '{}', '+'])
+      assert.deepEqual(gid, walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s']))
 
       // (c) Run that exact argv against a real tree: the directories get
       // setgid, the regular files (plain and executable) do not.
@@ -742,7 +770,7 @@ describe('recursive apply — the confirm gate and child datasets (rulings 2026-
     assert.ok(enableA >= 0, 'acltype switched on for the child')
     const firstPermission = calls.findIndex(c => PERMISSION_COMMANDS.includes(c.command))
     assert.ok(firstPermission > enableA, `the child is enabled before any permission changes (enable #${enableA}, first permission #${firstPermission})`)
-    assert.ok(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-b'), 'the -R walk ran')
+    assert.ok(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-b'), 'the walk ran')
     assert.deepEqual((job.result as { childAclEnabled?: string[] }).childAclEnabled, ['testpool/media/a'])
   })
 
@@ -792,18 +820,22 @@ describe('recursive apply — the confirm gate and child datasets (rulings 2026-
     assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set' && a.at(-1) === 'testpool/media'), undefined, 'the target\'s own switch was not flipped either')
   })
 
-  it('the child list cannot be read → the named recursive grant stops before changing anything', async () => {
+  it('the child list cannot be read → the recursive change is refused before any confirm, and nothing runs (nf.1)', async () => {
+    // Since nf.1 the plan reads the walk's scope (the children it crosses, the
+    // mounts it leaves alone) — a scope that cannot be named is refused at
+    // the door, named grant or not, before a confirm is ever offered.
     server = createServer({ mock: true, logger: false })
     const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: CHILDREN_ARGS, result: { stdout: '', stderr: 'boom', exitCode: 1 } }])
-    const res = await injectConfirmed(server, putMedia(NAMED_RECURSIVE))
-    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
-    assert.equal(job.status, 'failed')
-    assert.match(job.error!.message, /Could not list the child datasets of 'testpool\/media' — no permissions were changed/)
+    const res = await server.inject(putMedia(NAMED_RECURSIVE))
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.equal(res.json().error.message, `Could not tell which filesystems a recursive change of '${MP}' would cross: the child datasets of 'testpool/media' could not be listed — refusing it until they can be read`)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'a refusal never offers a confirm')
     assert.equal(calls.some(c => PERMISSION_COMMANDS.includes(c.command)), false)
     assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined)
   })
 
-  it('a PVE-owned descendant → refused before anything (no confirm, no child list, no switch)', async () => {
+  it('a PVE-owned descendant → refused before anything is written (no confirm, no switch)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'anas-access-pve-'))
     const saved = process.env.ANAS_STORAGE_CFG
     writeFileSync(join(dir, 'storage.cfg'), 'zfspool: local-zfs\n\tpool testpool/media/vm\n\tcontent images,rootdir\n', 'utf8')
@@ -822,7 +854,8 @@ describe('recursive apply — the confirm gate and child datasets (rulings 2026-
       assert.equal(res.statusCode, 400, res.body)
       assert.match(res.json().error.message, /Recursive permission change of 'testpool\/media' would include testpool\/media\/vm/)
       assert.equal(res.headers['x-anas-confirm-code'], undefined, 'a refusal never offers a confirm')
-      assert.equal(find(calls, '/usr/sbin/zfs', a => a.join(' ') === CHILDREN_ARGS.join(' ')), undefined, 'the child list was never read')
+      // nf.1: the plan READS the child list (the walk's scope) with the
+      // directory's other facts; the refusal still comes before any write.
       assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined)
       assert.equal(calls.some(c => PERMISSION_COMMANDS.includes(c.command)), false)
     }

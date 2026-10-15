@@ -1703,7 +1703,7 @@ export async function datasetRoutes(
     // whole request (owner, group, entries, clearNamed) and the revision of
     // the ACL state the plan was computed from.
     if (plan.recursive) {
-      const confirm = await access.recursiveConfirm(plan.target, { named: plan.hasNamed })
+      const confirm = await access.recursiveConfirm(plan.target, { named: plan.hasNamed, walk: plan.walk })
       if (!guardConfirm(confirmStore, request, reply, spec, pre, {
         validated: { dataset: fullName, ...signedAccessRequest(req) },
         address: ['dataset'],

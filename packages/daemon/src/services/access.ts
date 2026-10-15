@@ -3,16 +3,21 @@ import type { CommandExecutor, ExecOptions } from '../executor/types.js'
 import type { LockClaim } from '../jobs/locks.js'
 import type { ParsedAcl } from '../parsers/getfacl.js'
 import type { Gate, GuardReads, GuardSpec, Refusal } from '../safety/guard.js'
+import type { WalkScope } from './access-walk.js'
 import type { IscsiPaths } from './iscsi.js'
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { DatasetPath, isPathWithin } from '@anas/shared'
+import { isFindmntTable } from '../parsers/findmnt.js'
 import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
 import { parsePveMountPaths, PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
 import { parseDatasetGet, parseZfsList, zfsListArgs } from '../parsers/zfs-list.js'
 import { ahrClaim, ahrnameClaim, zfsClaims, znameClaim } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
+import { notChangedList, walkArgs, walkScopeFrom } from './access-walk.js'
 import { heldByLunOnce } from './iscsi-held.js'
+import { probeMount } from './mounts.js'
+import { isProbeableKind, kindOfMount, mountIndex } from './nested-filesystems.js'
 import { loadPveFootprint, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from './pve-footprint.js'
 import { resolveSelfServiceTarget } from './share-selfservice.js'
 
@@ -52,12 +57,21 @@ const SETFACL = '/usr/bin/setfacl'
  * cr.34: a RECURSIVE apply walks the whole tree — hours on a large dataset —
  * so its commands run with no deadline (the job lane's 300 s would stop a
  * legitimate walk half-way). The non-recursive forms keep the lane default.
+ *
+ * Story nf.1 (wave-3 D2) keeps that and bounds the one way a walk could hang
+ * that has nothing to do with the tree's size: since the walk no longer
+ * enters other filesystems, the only foreign entry it still reads is the
+ * MOUNTPOINT of a mount below the target (find lstats an entry before the
+ * prune that skips it, GT amendment 16) — and a dead NFS/CIFS server hangs
+ * that lstat for ever. The job probes every such remote mount first and
+ * refuses before changing anything ({@link refuseDeadRemotes}).
  */
 const TREE_WALK: ExecOptions = {
   timeoutMs: null,
   longRunning: 'recursive chown/setfacl/chmod/find over a whole tree: hours on a large dataset',
 }
 const FIND = '/usr/bin/find'
+const FINDMNT = '/usr/bin/findmnt'
 const GETENT = '/usr/bin/getent'
 
 /** The base-three access kinds (mode bits), in owner/group/everyone order. */
@@ -101,6 +115,15 @@ export type AccessTarget = ZfsAccessTarget | AhrAccessTarget | ShareAccessTarget
 
 /** A descendant dataset mounted under a recursive walk's directory. */
 interface ChildDataset { name: string, mountpoint: string, acltype: string }
+
+/**
+ * What a recursive apply walks (story nf.1, wave-3 D2; see `access-walk.ts`):
+ * the roots and their bounds, the mounts it leaves alone, and the child
+ * datasets it crosses (with their `acltype`, for the ACL switch).
+ */
+export interface PlanWalk extends WalkScope {
+  children: ChildDataset[]
+}
 
 /** The directory the writer acts on. */
 export function targetDir(t: AccessTarget): string {
@@ -329,6 +352,12 @@ export interface SetAccessPlan {
   hasNamed: boolean
   aclAutoEnabled: boolean
   clearAcls: boolean
+  /**
+   * Story nf.1 (wave-3 D2): the walk a recursive plan runs — read with the
+   * plan and part of its revision, so the job walks exactly the scope the
+   * confirm named, or refuses STATE_CHANGED. Null for a non-recursive plan.
+   */
+  walk: PlanWalk | null
   /**
    * Story cr.37: the revision of the state this plan was computed from — a
    * sha256 over the directory, its owner/group/mode, the ACL switch and the
@@ -615,18 +644,55 @@ export function createAccessService(opts: AccessServiceOptions) {
   }
 
   /**
+   * The walk a recursive apply on `t` runs (story nf.1, wave-3 D2): the
+   * mount table (`findmnt --json`, which reads /proc/self/mountinfo and never
+   * touches a filesystem) and, on ZFS, the child datasets the walk crosses.
+   * Both are needed to say what the walk enters and what it leaves alone, so
+   * either one unreadable is an answer of its own — the plan refuses rather
+   * than walk a scope it cannot name.
+   */
+  async function readWalk(t: AccessTarget, dir: string): Promise<{ walk: PlanWalk } | { unreadable: string }> {
+    const ds = aclDatasetOf(t)
+    const children = ds !== null ? await childDatasetsUnder(ds, dir) : []
+    if (!children)
+      return { unreadable: `the child datasets of '${ds}' could not be listed` }
+    const r = await executor.exec(FINDMNT, ['--json'])
+    if (r.exitCode !== 0 || !isFindmntTable(r.stdout))
+      return { unreadable: `the mount table could not be read (findmnt ${r.exitCode !== 0 ? `exited ${r.exitCode}` : 'answered in an unknown shape'})` }
+    const scope = walkScopeFrom(dir, mountIndex(r.stdout), children)
+    const crossed = new Set(scope.crossed.map(c => c.name))
+    return { walk: { ...scope, children: children.filter(c => crossed.has(c.name)) } }
+  }
+
+  /**
+   * Before the walk touches anything: every NFS/CIFS mount it leaves alone
+   * gets the mounts family's ONE liveness probe (`timeout 2 stat -f`). The
+   * walk never enters such a mount, but it still lstats the mountpoint while
+   * it reads the parent directory, and a dead server hangs that lstat for
+   * ever — with the dataset's lock held (wave-3 N2b). A dead one refuses the
+   * job, naming it; an inconclusive probe is not a refusal (as in the
+   * nested-filesystem scan). Armed automounts are never probed (Epic 18).
+   */
+  async function refuseDeadRemotes(walk: PlanWalk, dir: string): Promise<void> {
+    const remotes = walk.excluded.filter(e => isProbeableKind(kindOfMount({ target: e.target, source: '', fstype: e.fstype, options: '' })))
+    for (const mount of remotes) {
+      const probe = await probeMount(executor, mount.target).catch(() => null)
+      if (probe?.state === 'unreachable')
+        throw new Error(`No permissions were changed: ${mount.target} (${mount.fstype}), mounted under '${dir}', did not answer a 2 s liveness probe. The walk does not enter it, but it reads its mountpoint and would hang there with the lock held — unmount it or bring its server back, then apply again`)
+    }
+  }
+
+  /**
    * Before a recursive apply with named entries on a ZFS target: switch POSIX
    * ACLs on for every child dataset the walk enters that has them off — the
    * SAME rule the target gets on its first named grant — BEFORE any permission
-   * is touched. A child with `acltype=off` would otherwise make `setfacl -R`
-   * fail part-way, after the parent (and every child before it) was already
-   * rewritten. Returns the children it enabled; throws, naming the child,
-   * when the list cannot be read or an enable fails (nothing else has run).
+   * is touched. A child with `acltype=off` would otherwise make the walk's
+   * `setfacl` fail part-way, after the parent (and every child before it) was
+   * already rewritten. Returns the children it enabled; throws, naming the
+   * child, when an enable fails (nothing else has run). The children are the
+   * plan's (nf.1: read with the plan, bound by its revision).
    */
-  async function enableChildAcls(dataset: string, dir: string, updateProgress: (msg: string) => void): Promise<string[]> {
-    const children = await childDatasetsUnder(dataset, dir)
-    if (!children)
-      throw new Error(`Could not list the child datasets of '${dataset}' — no permissions were changed. A recursive grant crosses every child dataset mounted under '${dir}', and each needs POSIX ACLs on first`)
+  async function enableChildAcls(children: ChildDataset[], updateProgress: (msg: string) => void): Promise<string[]> {
     const enabled: string[] = []
     for (const child of children) {
       if (isPosixAcl(child.acltype))
@@ -655,21 +721,27 @@ export function createAccessService(opts: AccessServiceOptions) {
    * path. The signature is the resource only (`fs.setAccess.recursive` + the
    * target), like every other confirm.
    */
-  async function recursiveConfirm(t: AccessTarget, opts: { named: boolean }): Promise<{ operation: string, params: Record<string, unknown>, message: string, warnings: string[] }> {
+  async function recursiveConfirm(t: AccessTarget, opts: { named: boolean, walk?: PlanWalk | null }): Promise<{ operation: string, params: Record<string, unknown>, message: string, warnings: string[] }> {
     const dir = targetDir(t)
     const warnings: string[] = []
     const ds = aclDatasetOf(t)
-    if (ds !== null) {
-      const children = await childDatasetsUnder(ds, dir)
-      if (!children) {
-        warnings.push(`ANAS could not list the child datasets under '${dir}'; the walk crosses any that are mounted there${opts.named ? ', and the grant will stop before changing anything until they can be listed' : ''}.`)
-      }
-      else if (children.length > 0) {
+    // Story nf.1: the walk the plan read (and its revision binds). A caller
+    // without one gets a fresh read; an unreadable one is said, never guessed.
+    const read = opts.walk ? { walk: opts.walk } : await readWalk(t, dir)
+    if ('unreadable' in read) {
+      warnings.push(`ANAS could not tell which filesystems the walk would cross under '${dir}' (${read.unreadable}); the change will be refused until it can.`)
+    }
+    else {
+      const { children, excluded } = read.walk
+      if (ds !== null && children.length > 0) {
         warnings.push(`It crosses the child datasets mounted under '${dir}': ${children.map(c => `${c.name} (${c.mountpoint})`).join(', ')}.`)
         const off = children.filter(c => !isPosixAcl(c.acltype)).map(c => c.name)
         if (opts.named && off.length > 0)
           warnings.push(`POSIX ACLs (acltype=posixacl) are switched on first for ${off.join(', ')}, as for '${ds}' itself.`)
       }
+      // Wave-3 D2: every other filesystem mounted below is left alone, and said so.
+      if (excluded.length > 0)
+        warnings.push(`It does not enter the other filesystems mounted under '${dir}' — not changed: ${notChangedList(excluded).join(', ')}.`)
     }
     if (targetBacking(t) === 'ahr')
       warnings.push('On a Hybrid RAID pool it sweeps every subvolume under the pool\'s data as one tree; the pool\'s snapshots are not touched.')
@@ -807,9 +879,26 @@ export function createAccessService(opts: AccessServiceOptions) {
         return fail(409, 'CONFLICT', `Could not read the POSIX ACLs of '${dir}', so the existing grants are unknown — refusing a change that would replace them`)
       }
     }
+    // Story nf.1 (wave-3 D2): a recursive plan reads the walk it will run —
+    // the roots, the mounts it leaves alone, the child datasets it crosses —
+    // and refuses when it cannot (a scope nobody can name is not confirmed).
+    let walk: PlanWalk | null = null
+    if (recursive) {
+      const read = await readWalk(t, dir)
+      if ('unreadable' in read)
+        return fail(409, 'CONFLICT', `Could not tell which filesystems a recursive change of '${dir}' would cross: ${read.unreadable} — refusing it until they can be read`)
+      walk = read.walk
+    }
+
     // Story cr.37: every fact the plan below is computed from, as one hash.
+    // nf.1: the walk's scope with it, so a child dataset or a mount that
+    // appears under the target after the confirm moves the revision and the
+    // job refuses STATE_CHANGED instead of walking what nobody confirmed.
+    const walkFacts = walk
+      ? { roots: walk.roots, excluded: walk.excluded, children: walk.children.map(c => [c.name, c.mountpoint, c.acltype]) }
+      : null
     const revision = createHash('sha256')
-      .update(JSON.stringify({ dir, perm: [perm.owner, perm.group, perm.mode], supported, enabled, acl: aclRead }))
+      .update(JSON.stringify({ dir, perm: [perm.owner, perm.group, perm.mode], supported, enabled, acl: aclRead, ...(walkFacts ? { walk: walkFacts } : {}) }))
       .digest('hex')
 
     // Desired base three: a supplied entry overrides the current level, so a
@@ -871,6 +960,7 @@ export function createAccessService(opts: AccessServiceOptions) {
         hasNamed,
         aclAutoEnabled,
         clearAcls,
+        walk,
         revision,
       },
     }
@@ -902,12 +992,35 @@ export function createAccessService(opts: AccessServiceOptions) {
     if (hasNamed && !supported)
       throw new Error('The acl package (setfacl) is not installed; named user/group grants require it. Install it (apt install acl), or grant owner/group/everyone only.')
 
+    // Story nf.1 (wave-3 D2): a recursive plan carries the walk it confirmed.
+    // Every recursive command below is a `find` over its roots, bounded by
+    // `-xdev` and the pruned mounts (see access-walk.ts) — never `-R`, which
+    // crosses every mount below the directory. A dead remote mount among the
+    // ones left alone refuses here, before anything is touched.
+    const walk = recursive ? plan.walk : null
+    if (recursive && !walk)
+      throw new Error(`No permissions were changed: the plan for '${mountpoint}' carries no walk scope — refusing a recursive change that could cross other filesystems`)
+    if (walk)
+      await refuseDeadRemotes(walk, mountpoint)
+    /** Run one recursive step over every walk root; `label` names it in a failure. */
+    const walkStep = async (label: string, select: string[], action: string[]): Promise<void> => {
+      for (const root of walk!.roots) {
+        const args = walkArgs(root, select, action)
+        updateProgress(`find ${args.join(' ')}`)
+        const r = await executor.exec(FIND, args, TREE_WALK)
+        if (r.exitCode !== 0)
+          throw new Error(r.stderr.trim() || `${label} over '${root.path}' exited with code ${r.exitCode}`)
+      }
+    }
+    const notChanged = walk && walk.excluded.length > 0 ? { notChanged: notChangedList(walk.excluded) } : {}
+
     // 0) A recursive named grant on ZFS crosses every child dataset mounted
-    // under the directory; one with ACLs off would fail `setfacl -R` part-way.
-    // Switch them on first, before any permission changes (ruling 2026-10-11).
+    // under the directory; one with ACLs off would fail the walk's `setfacl`
+    // part-way. Switch them on first, before any permission changes (ruling
+    // 2026-10-11).
     const aclDataset = aclDatasetOf(plan.target)
-    const childAclEnabled = recursive && hasNamed && aclDataset !== null
-      ? await enableChildAcls(aclDataset, mountpoint, updateProgress)
+    const childAclEnabled = walk && hasNamed && aclDataset !== null
+      ? await enableChildAcls(walk.children, updateProgress)
       : null
 
     // 1) Ownership.
@@ -917,11 +1030,18 @@ export function createAccessService(opts: AccessServiceOptions) {
         : plan.ownerChanged
           ? `${req.owner}`
           : `:${req.group}`
-      const args = recursive ? ['-R', spec, mountpoint] : [spec, mountpoint]
-      updateProgress(`chown ${args.join(' ')}`)
-      const r = await executor.exec(CHOWN, args, recursive ? TREE_WALK : undefined)
-      if (r.exitCode !== 0)
-        throw new Error(r.stderr.trim() || `chown exited with code ${r.exitCode}`)
+      if (walk) {
+        // `-h`: a link's own owner, as `chown -R` (-P) changes it — never
+        // the file it points at, which may sit outside the tree.
+        await walkStep('chown', [], [CHOWN, '-h', spec])
+      }
+      else {
+        const args = [spec, mountpoint]
+        updateProgress(`chown ${args.join(' ')}`)
+        const r = await executor.exec(CHOWN, args)
+        if (r.exitCode !== 0)
+          throw new Error(r.stderr.trim() || `chown exited with code ${r.exitCode}`)
+      }
     }
 
     if (hasNamed) {
@@ -943,11 +1063,18 @@ export function createAccessService(opts: AccessServiceOptions) {
       // plain file gets none. `--set` with an all-`X` spec would strip
       // execute from every file in the tree.
       const spec = buildAclSpec(base, named, recursive)
-      const setArgs = recursive ? ['-R', '-b', '-m', spec, mountpoint] : ['--set', spec, mountpoint]
-      updateProgress(`setfacl ${setArgs.join(' ')}`)
-      const setR = await executor.exec(SETFACL, setArgs, recursive ? TREE_WALK : undefined)
-      if (setR.exitCode !== 0)
-        throw new Error(setR.stderr.trim() || `setfacl ${recursive ? '-R -b -m' : '--set'} exited with code ${setR.exitCode}`)
+      if (walk) {
+        // Links filtered out: setfacl -R skips the links it meets, but one
+        // named as an argument is followed.
+        await walkStep('setfacl -b -m', ['!', '-type', 'l'], [SETFACL, '-b', '-m', spec])
+      }
+      else {
+        const setArgs = ['--set', spec, mountpoint]
+        updateProgress(`setfacl ${setArgs.join(' ')}`)
+        const setR = await executor.exec(SETFACL, setArgs)
+        if (setR.exitCode !== 0)
+          throw new Error(setR.stderr.trim() || `setfacl --set exited with code ${setR.exitCode}`)
+      }
 
       // 4) Matching DEFAULT ACL so new files inherit the grants. `setfacl -R
       // -d --set` writes the default entries on directories only and passes
@@ -955,29 +1082,35 @@ export function createAccessService(opts: AccessServiceOptions) {
       // no `default:` lines and the job completed). The spec is always the
       // lowercase form — see {@link buildAclSpec}.
       const defSpec = buildAclSpec(base, named, false)
-      const defArgs = recursive ? ['-R', '-d', '--set', defSpec, mountpoint] : ['-d', '--set', defSpec, mountpoint]
-      updateProgress(`setfacl ${defArgs.join(' ')}`)
-      const defR = await executor.exec(SETFACL, defArgs, recursive ? TREE_WALK : undefined)
-      if (defR.exitCode !== 0)
-        throw new Error(defR.stderr.trim() || `setfacl -d --set exited with code ${defR.exitCode}`)
+      if (walk) {
+        // Directories only — what `setfacl -R -d` wrote anyway (above).
+        await walkStep('setfacl -d --set', ['-type', 'd'], [SETFACL, '-d', '--set', defSpec])
+      }
+      else {
+        const defArgs = ['-d', '--set', defSpec, mountpoint]
+        updateProgress(`setfacl ${defArgs.join(' ')}`)
+        const defR = await executor.exec(SETFACL, defArgs)
+        if (defR.exitCode !== 0)
+          throw new Error(defR.stderr.trim() || `setfacl -d --set exited with code ${defR.exitCode}`)
+      }
 
       // 5) setgid on directories so new files take the directory's group,
       // completing inheritance. Directories ONLY: `chmod -R g+s` marks every
       // regular file setgid as well (0.4.3 live proof §3: a root-owned 0755
       // binary ended `-rwxrwsr-x`, a setgid-root executable). The recursive
-      // form walks with `find -type d`, which crosses mounts like the
-      // `setfacl -R` walk above (no `-xdev`) and, like it, does not follow
-      // symbolic links.
-      const gidArgs = recursive
-        ? [mountpoint, '-type', 'd', '-exec', CHMOD, 'g+s', '{}', '+']
-        : ['g+s', mountpoint]
-      const gidBin = recursive ? FIND : CHMOD
-      updateProgress(recursive ? `find ${gidArgs.join(' ')}` : `chmod ${gidArgs.join(' ')}`)
-      const gidR = await executor.exec(gidBin, gidArgs, recursive ? TREE_WALK : undefined)
-      if (gidR.exitCode !== 0)
-        throw new Error(gidR.stderr.trim() || `${recursive ? 'find -type d -exec chmod g+s' : 'chmod g+s'} exited with code ${gidR.exitCode}`)
+      // form is the same bounded walk as every step, `-type d` only.
+      if (walk) {
+        await walkStep('find -type d -exec chmod g+s', ['-type', 'd'], [CHMOD, 'g+s'])
+      }
+      else {
+        const gidArgs = ['g+s', mountpoint]
+        updateProgress(`chmod ${gidArgs.join(' ')}`)
+        const gidR = await executor.exec(CHMOD, gidArgs)
+        if (gidR.exitCode !== 0)
+          throw new Error(gidR.stderr.trim() || `chmod g+s exited with code ${gidR.exitCode}`)
+      }
 
-      const result: Record<string, unknown> = { ...ident, aclEnabled: true, aclAutoEnabled, namedCount: named.length }
+      const result: Record<string, unknown> = { ...ident, aclEnabled: true, aclAutoEnabled, namedCount: named.length, ...notChanged }
       // The child datasets whose ACLs were switched on (present whenever the
       // walk was checked for them — an empty list says none needed it).
       if (childAclEnabled)
@@ -989,11 +1122,16 @@ export function createAccessService(opts: AccessServiceOptions) {
     // Strip the requested-away ACLs first so the mode bits are the whole
     // truth. This runs only for `clearNamed: true` — never inferred.
     if (clearAcls) {
-      const clearArgs = recursive ? ['-R', '-b', '-k', mountpoint] : ['-b', '-k', mountpoint]
-      updateProgress(`setfacl ${clearArgs.join(' ')}`)
-      const clearR = await executor.exec(SETFACL, clearArgs, recursive ? TREE_WALK : undefined)
-      if (clearR.exitCode !== 0)
-        throw new Error(clearR.stderr.trim() || `setfacl -b -k exited with code ${clearR.exitCode}`)
+      if (walk) {
+        await walkStep('setfacl -b -k', ['!', '-type', 'l'], [SETFACL, '-b', '-k'])
+      }
+      else {
+        const clearArgs = ['-b', '-k', mountpoint]
+        updateProgress(`setfacl ${clearArgs.join(' ')}`)
+        const clearR = await executor.exec(SETFACL, clearArgs)
+        if (clearR.exitCode !== 0)
+          throw new Error(clearR.stderr.trim() || `setfacl -b -k exited with code ${clearR.exitCode}`)
+      }
       // Also drop the setgid bit we set for ACL inheritance — with the
       // named grants gone there is nothing to inherit, and a leftover
       // setgid would make the reported mode (e.g. 2775 vs 775) misleading.
@@ -1002,10 +1140,13 @@ export function createAccessService(opts: AccessServiceOptions) {
       // other shape needs its own call. The recursive `g-s` reaches regular
       // files on purpose: it repairs trees an earlier recursive grant marked
       // setgid file by file (before 0.4.3 that step ran `chmod -R g+s`).
-      if (!recursive || !baseChanged) {
-        const gsArgs = recursive ? ['-R', 'g-s', mountpoint] : ['g-s', mountpoint]
+      if (walk && !baseChanged) {
+        await walkStep('chmod g-s', ['!', '-type', 'l'], [CHMOD, 'g-s'])
+      }
+      else if (!walk) {
+        const gsArgs = ['g-s', mountpoint]
         updateProgress(`chmod ${gsArgs.join(' ')}`)
-        const unsetR = await executor.exec(CHMOD, gsArgs, recursive ? TREE_WALK : undefined)
+        const unsetR = await executor.exec(CHMOD, gsArgs)
         if (unsetR.exitCode !== 0)
           throw new Error(unsetR.stderr.trim() || `chmod g-s exited with code ${unsetR.exitCode}`)
       }
@@ -1025,14 +1166,20 @@ export function createAccessService(opts: AccessServiceOptions) {
       const mode = recursive
         ? (clearAcls ? `${levelsToSymbolic(base)},g-s` : levelsToSymbolic(base))
         : levelsToMode(base)
-      const modeArgs = recursive ? ['-R', mode, mountpoint] : [mode, mountpoint]
-      updateProgress(`chmod ${modeArgs.join(' ')}`)
-      const modeR = await executor.exec(CHMOD, modeArgs, recursive ? TREE_WALK : undefined)
-      if (modeR.exitCode !== 0)
-        throw new Error(modeR.stderr.trim() || `chmod ${mode} exited with code ${modeR.exitCode}`)
+      if (walk) {
+        // Links filtered out: chmod follows a link named as an argument.
+        await walkStep(`chmod ${mode}`, ['!', '-type', 'l'], [CHMOD, mode])
+      }
+      else {
+        const modeArgs = [mode, mountpoint]
+        updateProgress(`chmod ${modeArgs.join(' ')}`)
+        const modeR = await executor.exec(CHMOD, modeArgs)
+        if (modeR.exitCode !== 0)
+          throw new Error(modeR.stderr.trim() || `chmod ${mode} exited with code ${modeR.exitCode}`)
+      }
     }
 
-    return { ...ident, aclEnabled: enabled, aclAutoEnabled: false, namedCount: 0, clearedNamed: clearAcls }
+    return { ...ident, aclEnabled: enabled, aclAutoEnabled: false, namedCount: 0, clearedNamed: clearAcls, ...notChanged }
   }
 
   // --- The guard (story cr.37) ---------------------------------------------------

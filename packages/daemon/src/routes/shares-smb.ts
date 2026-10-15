@@ -136,7 +136,7 @@ export async function smbShareRoutes(
     if ('refusal' in pass)
       return { bound: null }
     if (prepared.plan.recursive) {
-      const confirm = await access.recursiveConfirm(prepared.plan.target, { named: prepared.plan.hasNamed })
+      const confirm = await access.recursiveConfirm(prepared.plan.target, { named: prepared.plan.hasNamed, walk: prepared.plan.walk })
       if (!guardConfirm(confirmStore, request, reply, spec, pass, {
         validated: { path, ...signedAccessRequest(prepared.plan.req) },
         address: ['path'],

@@ -25,6 +25,7 @@ import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal, LIO_UNREADABLE_KEY, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { normalizeMountpointPath } from '../services/mounts.js'
+import { BLKID_AMBIVALENT, BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures, LSBLK_NONE_FOUND, parsePartitionProbe, PART_BY_ID_RE, PARTITION_PROBE_ARGS } from '../services/partition-device.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
 import { loadPveFootprint, systemPoolRefusalFrom } from '../services/pve-footprint.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
@@ -45,7 +46,6 @@ const FINDMNT = '/usr/bin/findmnt'
 const FINDMNT_ARGS = ['--json', '--real']
 
 const BY_ID_PREFIX = '/dev/disk/by-id/'
-const PART_BY_ID_RE = /-part\d+$/
 /** `/dev/sdb1`, `/dev/nvme0n1p2` — a leaf ZFS named by its kernel device. */
 const KERNEL_DEV_PATH_RE = /^\/dev\/([a-z0-9]+)$/
 const TRAILING_CR_RE = /\r$/
@@ -417,6 +417,21 @@ function byIdPath(id: string): string {
   return `/dev/disk/by-id/${id}`
 }
 
+/** `: <first stderr line>`, or nothing — the tail of an unreadable-read sentence. */
+function firstStderrLine(stderr: string): string {
+  const line = stderr.trim().split('\n')[0]
+  return line ? `: ${line}` : ''
+}
+
+/**
+ * The lock key of a new device (cr.33 `disk:<by-id>`): its own by-id for a
+ * whole disk, the WHOLE disk's for a by-id partition (story nf.1) — two verbs
+ * writing partitions of one disk, or one writing the disk itself, serialise.
+ */
+function newDeviceLockId(id: string): string {
+  return id.replace(PART_BY_ID_RE, '')
+}
+
 /**
  * The result of the composability pre-flight (cr.12): the named per-disk
  * problems, or WHY the inventory could not be read. Two altitudes — bad
@@ -748,6 +763,85 @@ export async function poolRoutes(
     return { problems }
   }
 
+  /**
+   * The PARTITION pre-flight (story nf.1, wave-3 node pass D1) — the
+   * composability check for a new device named `<disk>-partN`. Before cr.12
+   * an id the inventory did not know was skipped and `zpool` alone judged a
+   * partition (the vdevs.2 / #66 live proof replaced a log partition by a
+   * freed spare partition that way); cr.12 made an unknown id "not found" and
+   * cr.36 put that check at both doors, so every partition was refused before
+   * ZFS saw it. The inventory lists whole disks only, so a partition is
+   * checked on what it is, from three reads:
+   *
+   *  - `lsblk -J -o NAME,TYPE,PKNAME,MOUNTPOINT <dev>`: the device exists
+   *    (exit 32 = "none of specified devices found", a 400), is a `part`,
+   *    is not mounted and has nothing stacked on it (a dm/md child);
+   *  - the inventory: the disk it sits on (joined by its KERNEL name, so any
+   *    by-id alias of the disk resolves) is one ANAS knows and is not
+   *    hands-off (iscsi.6: this node's own LUN coming back is never storage).
+   *    The disk is NOT required to be `available` — a disk whose other
+   *    partitions are pool members is exactly the #66 layout;
+   *  - `blkid -p <dev>`: the low-level probe reads the partition itself, not
+   *    udev's cache, so a ZFS label (or any filesystem/RAID signature) written
+   *    since the last udev event still refuses. Exit 2 = nothing; exit 0 with
+   *    only `PART_ENTRY_*` keys = a blank partition (wave-3 capture); exit 8 =
+   *    ambivalent, i.e. more than one signature.
+   *
+   * Same altitudes as the whole-disk check: a named problem is a 400, a read
+   * that failed is a 409 `unreadable` (fail CLOSED).
+   */
+  async function partitionDeviceProblems(id: string): Promise<ComposableCheck> {
+    const dev = byIdPath(id)
+    const probe = await executor.exec(LSBLK, [...PARTITION_PROBE_ARGS, dev])
+    if (probe.exitCode === LSBLK_NONE_FOUND)
+      return { problems: [`partition '${id}' not found`] }
+    if (probe.exitCode !== 0)
+      return { unreadable: `partition '${id}' could not be read (lsblk exited ${probe.exitCode}${firstStderrLine(probe.stderr)})` }
+    const part = parsePartitionProbe(probe.stdout)
+    if (!part)
+      return { unreadable: `partition '${id}' could not be read (lsblk's answer could not be parsed)` }
+    if (part.type !== 'part')
+      return { problems: [`'${id}' is not a partition (lsblk reports type '${part.type}')`] }
+
+    let inventory: Disk[]
+    try {
+      inventory = await collectDisks(executor, diskIdentityCache, iscsiPaths)
+    }
+    catch (err: unknown) {
+      const detail = err instanceof Error && err.message ? err.message : String(err)
+      return { unreadable: `disk inventory could not be read (${detail})` }
+    }
+    const disk = part.pkname ? inventory.find(d => d.name === part.pkname) : undefined
+    if (!disk)
+      return { problems: [`partition '${id}' is on a disk the inventory does not know (${part.pkname ?? 'lsblk names no parent disk'})`] }
+
+    const problems: string[] = []
+    if (disk.handsOff)
+      problems.push(`partition '${id}' is on a hands-off disk: ${disk.handsOffReason ?? disk.handsOff}`)
+    if (part.mountpoint)
+      problems.push(`partition '${id}' is mounted at ${part.mountpoint}`)
+    if (part.holders.length > 0)
+      problems.push(`partition '${id}' is in use by ${part.holders.join(', ')}`)
+
+    const sig = await executor.exec(BLKID, ['-p', dev])
+    if (sig.exitCode === BLKID_FOUND) {
+      const found = blkidContentSignatures(sig.stdout)
+      if (found.length > 0) {
+        // What it IS first (TYPE, a nested PTTYPE), then its name; every key
+        // only when the line carries none of those.
+        const named = ['TYPE=', 'PTTYPE=', 'LABEL='].flatMap(key => found.filter(f => f.startsWith(key)))
+        problems.push(`partition '${id}' carries a signature (${(named.length > 0 ? named : found).join(', ')}) — clear it first if the partition is really free`)
+      }
+    }
+    else if (sig.exitCode === BLKID_AMBIVALENT) {
+      problems.push(`partition '${id}' carries more than one signature (blkid -p: ambivalent probing result) — clear it first if the partition is really free`)
+    }
+    else if (sig.exitCode !== BLKID_NOTHING) {
+      return { unreadable: `partition '${id}' could not be probed for signatures (blkid exited ${sig.exitCode}${firstStderrLine(sig.stderr)})` }
+    }
+    return { problems }
+  }
+
   /** Every disk id a create request names, across all six vdev classes. */
   function createRequestDiskIds(req: CreatePoolRequest): string[] {
     return [
@@ -827,6 +921,8 @@ export async function poolRoutes(
     getAll: (reads: GuardReads) => reads.once('zpool-get-all', () => executor.exec(ZPOOL, ['get', 'all', '-j'])),
     zfsVersion: (reads: GuardReads) => reads.once('zfs-version', () => detectLocalZfsVersion(executor)),
     composable: (reads: GuardReads, ids: string[]) => reads.once(`composable:${ids.join(' ')}`, () => composableDiskProblems(ids)),
+    /** The partition pre-flight (story nf.1) — fresh at each door, like every read here. */
+    partition: (reads: GuardReads, id: string) => reads.once(`partition:${id}`, () => partitionDeviceProblems(id)),
     mountpoints: (reads: GuardReads) => reads.once('pool-mountpoints', () => readPoolMountpoints(executor)),
     liveMounts: (reads: GuardReads) => reads.once('findmnt-real', async () => {
       const res = await executor.exec(FINDMNT, FINDMNT_ARGS)
@@ -916,14 +1012,28 @@ export async function poolRoutes(
    * 409 `unreadable` (`refusing` completes that sentence for the verb).
    */
   function composableGate<O>(ids: string[], refusing: string): Gate<O> {
-    return async (_object, reads) => {
-      const check = await poolReads.composable(reads, ids)
-      if ('unreadable' in check)
-        return { status: 409, code: 'CONFLICT', reason: 'unreadable', message: `${check.unreadable}; ${refusing}` }
-      if (check.problems.length > 0)
-        return { status: 400, code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${check.problems.join('; ')}` }
-      return null
-    }
+    return async (_object, reads) => composableRefusal(await poolReads.composable(reads, ids), refusing)
+  }
+
+  /** The two altitudes of a composability answer (cr.12): named problems 400, an unreadable read 409. */
+  function composableRefusal(check: ComposableCheck, refusing: string): Refusal | null {
+    if ('unreadable' in check)
+      return { status: 409, code: 'CONFLICT', reason: 'unreadable', message: `${check.unreadable}; ${refusing}` }
+    if (check.problems.length > 0)
+      return { status: 400, code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${check.problems.join('; ')}` }
+    return null
+  }
+
+  /**
+   * The NEW-DEVICE gate of the attach family (attach, replace, raidz expand):
+   * a whole disk through the inventory's composability check, a by-id
+   * partition (`<disk>-partN`, the vdevs.2 / #66 layout) through the
+   * partition pre-flight (story nf.1). Both run at both doors (cr.36).
+   */
+  function newDeviceGate<O>(id: string, refusing: string): Gate<O> {
+    if (!PART_BY_ID_RE.test(id))
+      return composableGate<O>([id], refusing)
+    return async (_object, reads) => composableRefusal(await poolReads.partition(reads, id), refusing)
   }
 
   /**
@@ -2306,7 +2416,11 @@ export async function poolRoutes(
     // the pool's own status instead. Every gate runs again in the job, which
     // holds the pool's guid key and the new disk's key.
     const newPath = byIdPath(newDiskId)
-    const newDiskGate = composableGate<PoolObject>([newDiskId], `refusing to ${replace ? 'replace' : 'attach to'} a device it cannot identify`)
+    // Story nf.1 (wave-3 node pass D1): a by-id PARTITION as the new device is
+    // checked as a partition, not looked up in the whole-disk inventory, and
+    // locks its whole disk's key.
+    const newDiskGate = newDeviceGate<PoolObject>(newDiskId, `refusing to ${replace ? 'replace' : 'attach to'} a device it cannot identify`)
+    const newDiskLocks = diskClaims([newDeviceLockId(newDiskId)])
 
     // ---- RAIDZ EXPANSION path (targetVdev present) -------------------------
     if (targetVdev !== undefined) {
@@ -2314,7 +2428,7 @@ export async function poolRoutes(
         operation: 'zpool.raidz-expand',
         noun: 'a raidz expansion',
         gates: [...RESHAPE_GATES, newDiskGate, raidzExpandGate(targetVdev)],
-        locks: diskClaims([newDiskId]),
+        locks: newDiskLocks,
       })
       const pre = await guardCheck(spec)
       if ('refusal' in pre)
@@ -2355,7 +2469,7 @@ export async function poolRoutes(
       noun: replace ? 'a replace' : 'an attach',
       extend: async reads => ({ leaf: await lookupLeaf(reads, poolName, existingDiskId!, replace) }),
       gates: [...RESHAPE_GATES, newDiskGate, async pool => 'refusal' in pool.leaf ? pool.leaf.refusal : null],
-      locks: diskClaims([newDiskId]),
+      locks: newDiskLocks,
     })
     const pre = await guardCheck(spec)
     if ('refusal' in pre)

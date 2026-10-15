@@ -31,6 +31,30 @@ const IDENTITY_HEADERS = {
 const JSON_HEADERS = { ...IDENTITY_HEADERS, 'content-type': 'application/json' }
 
 const MP = '/testpool/media'
+
+/** The dev mock's mount table (`mounts/findmnt-full.json`) has nothing at or under /testpool/media: one root, `-xdev`, nothing pruned. */
+const WALK_XDEV: string[] = ['-xdev']
+
+const FIND = '/usr/bin/find'
+
+/**
+ * Story nf.1 (wave-3 D2): every recursive step is a bounded `find` walk —
+ * `find -P <root> [-xdev] [( -path … ) -prune -o] <select> -exec <action> {} +` —
+ * never `-R`, which crosses every mount under the directory. WALK_XDEV is
+ * `-xdev` unless the root sits on btrfs (an AHR pool, whose subvolumes carry
+ * their own st_dev and no mount line).
+ */
+function walkOf(root: string, select: string[], action: string[]): string[] {
+  return ['-P', root, ...WALK_XDEV, ...select, '-exec', ...action, '{}', '+']
+}
+
+/** The walk whose action is `tool` (and whose action arguments pass `pred`). */
+function walkCall(calls: Call[], tool: string, pred: (action: string[]) => boolean = () => true): string[] | undefined {
+  return calls.find((c) => {
+    const at = c.args.indexOf('-exec')
+    return c.command === FIND && at >= 0 && c.args[at + 1] === tool && pred(c.args.slice(at + 2, -2))
+  })?.args
+}
 /** The dev mock's AHR pool mount (a fresh btrfs directory). */
 const AHR_MP = '/mnt/anas-ahr/ahr0'
 const ISCSI_FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/iscsi')
@@ -258,21 +282,22 @@ describe('access.1 — the share-path grant', () => {
     assert.equal(find(calls, '/usr/bin/chmod', a => a.includes('755')), undefined, 'everyone was not lowered')
   })
 
-  it('share grant applyToExisting is off by default: no command carries -R', async () => {
+  it('share grant applyToExisting is off by default: no command carries -R, no walk runs', async () => {
     const { calls } = start()
     const job = await create({ name: 'media', path: MP, validUsers: ['media'], grantAccess: {} })
     assert.equal(grantOf(job)!.applyToExisting, false)
     assert.equal(calls.some(c => ['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown', '/usr/bin/find'].includes(c.command) && c.args.includes('-R')), false)
+    assert.equal(calls.some(c => c.command === FIND), false)
   })
 
-  it('share grant with applyToExisting runs the editor\'s recursive job (-R, capital X)', async () => {
+  it('share grant with applyToExisting runs the editor\'s recursive job (the bounded walk, capital X)', async () => {
     const { calls } = start()
     const job = await createConfirmed({ name: 'media', path: MP, readOnly: true, validUsers: ['media'], grantAccess: { applyToExisting: true } })
     assert.equal(grantOf(job)!.status, 'applied')
     const spec = 'u::rwX,g::r-X,o::r-X,u:media:r-X,m::rwX'
-    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-b'), ['-R', '-b', '-m', spec, MP])
-    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-d'), ['-R', '-d', '--set', 'u::rwx,g::r-x,o::r-x,u:media:r-x,m::rwx', MP])
-    assert.deepEqual(find(calls, '/usr/bin/find', () => true), [MP, '-type', 'd', '-exec', '/usr/bin/chmod', 'g+s', '{}', '+'])
+    assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-b'), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-b', '-m', spec]))
+    assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-d'), walkOf(MP, ['-type', 'd'], ['/usr/bin/setfacl', '-d', '--set', 'u::rwx,g::r-x,o::r-x,u:media:r-x,m::rwx']))
+    assert.deepEqual(walkCall(calls, '/usr/bin/chmod', a => a[0] === 'g+s'), walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s']))
   })
 
   it('share grant applyToExisting on ZFS switches ACLs on for a child dataset under the path first, and lists it (ruling 2026-10-11)', async () => {
@@ -286,7 +311,7 @@ describe('access.1 — the share-path grant', () => {
     assert.equal(grant.status, 'applied', grant.message)
     assert.deepEqual(grant.childAclEnabled, ['testpool/media/kids'])
     const enable = calls.findIndex(c => c.command === '/usr/sbin/zfs' && c.args.join(' ') === 'set -- acltype=posixacl xattr=sa testpool/media/kids')
-    const walk = calls.findIndex(c => c.command === '/usr/bin/setfacl' && c.args[0] === '-R')
+    const walk = calls.findIndex(c => c.command === FIND && c.args.includes('/usr/bin/setfacl'))
     assert.ok(enable >= 0 && walk > enable, `child enabled (#${enable}) before the walk (#${walk})`)
   })
 
@@ -474,7 +499,7 @@ describe('access.1 — the share-path grant', () => {
     const { calls } = start([], MEDIA_SHARE)
     const job = await updateConfirmed('media', { grantAccess: { applyToExisting: true } })
     assert.equal(grantOf(job)!.status, 'applied')
-    assert.ok(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-b'), 'the -R walk ran')
+    assert.ok(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-b'), 'the walk ran')
   })
 
   it('share edit that removes a principal revokes nothing: the live entry is restated, never stripped', async () => {

@@ -10,6 +10,7 @@ import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
+import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
 import { AHR_FINDMNT_ARGS } from '../../services/ahr-topology.js'
 
@@ -36,6 +37,30 @@ const JSON_HEADERS = { ...IDENTITY_HEADERS, 'content-type': 'application/json' }
 const POOL = 'ahr0'
 const MP = '/mnt/anas-ahr/ahr0'
 const URL = `/v1/ahr/${POOL}/access`
+
+/** The AHR pool sits on btrfs (`ahr/findmnt-ahr0.json`): its walk has no `-xdev` — subvolumes are not mounts. */
+const WALK_XDEV: string[] = []
+
+const FIND = '/usr/bin/find'
+
+/**
+ * Story nf.1 (wave-3 D2): every recursive step is a bounded `find` walk —
+ * `find -P <root> [-xdev] [( -path … ) -prune -o] <select> -exec <action> {} +` —
+ * never `-R`, which crosses every mount under the directory. WALK_XDEV is
+ * `-xdev` unless the root sits on btrfs (an AHR pool, whose subvolumes carry
+ * their own st_dev and no mount line).
+ */
+function walkOf(root: string, select: string[], action: string[]): string[] {
+  return ['-P', root, ...WALK_XDEV, ...select, '-exec', ...action, '{}', '+']
+}
+
+/** The walk whose action is `tool` (and whose action arguments pass `pred`). */
+function walkCall(calls: Call[], tool: string, pred: (action: string[]) => boolean = () => true): string[] | undefined {
+  return calls.find((c) => {
+    const at = c.args.indexOf('-exec')
+    return c.command === FIND && at >= 0 && c.args[at + 1] === tool && pred(c.args.slice(at + 2, -2))
+  })?.args
+}
 
 /** A live ACL on the pool's mount with one named user (alice rwx) and a default ACL. */
 const GETFACL_WITH_ALICE = [
@@ -73,6 +98,10 @@ function installExecutor(server: ReturnType<typeof createServer>, stubs: Stub[] 
   const orig = mock.exec.bind(mock)
   mock.exec = async (command: string, args: string[]): Promise<ExecResult> => {
     calls.push({ command, args })
+    // nf.1: the recursive walk reads `findmnt --json`; the AHR pool's mount
+    // is the captured `ahr/findmnt-ahr0.json` (`/` ext4, the pool btrfs).
+    if (command === '/usr/bin/findmnt' && args.join(' ') === '--json' && !stubs.some(s => s.command === command && s.args?.join(' ') === '--json'))
+      return mockFixtures.ahrFindmnt()
     const stub = stubs.find(s =>
       s.command === command
       && (s.args === undefined
@@ -242,7 +271,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a[0] === '-R'), ['-R', 'u=rwX,g=rX,o=rX', MP])
+      assert.deepEqual(walkCall(calls, '/usr/bin/chmod'), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX']))
       assertNoAcltypeStep(calls)
     })
 
@@ -314,7 +343,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('755')), ['755', MP])
     })
 
-    it('ahr recursive clear folds the setgid drop into a single chmod -R', async () => {
+    it('ahr recursive clear folds the setgid drop into a single chmod walk', async () => {
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server, [{ command: '/usr/bin/getfacl', args: ['-pcE', MP], result: ok(GETFACL_WITH_ALICE) }])
       const res = await putConfirmed({ clearNamed: true, applyToExisting: true, entries: [
@@ -324,10 +353,10 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       ] })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), ['-R', '-b', '-k', MP])
-      const chmodR = calls.filter(c => c.command === '/usr/bin/chmod' && c.args[0] === '-R')
-      assert.equal(chmodR.length, 1)
-      assert.deepEqual(chmodR[0].args, ['-R', 'u=rwX,g=rX,o=rX,g-s', MP])
+      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-b', '-k']))
+      const chmodWalks = calls.filter(c => c.command === FIND && c.args.includes('/usr/bin/chmod'))
+      assert.equal(chmodWalks.length, 1)
+      assert.deepEqual(chmodWalks[0].args, walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX,g-s']))
     })
 
     it('ahr base-only update with no named entries LEAVES existing named ACLs alone (#37)', async () => {
@@ -359,7 +388,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
 
   // --- PUT: applyToExisting -------------------------------------------------------
   describe('PUT — applyToExisting', () => {
-    it('ahr applyToExisting adds -R to chown and setfacl (access + default) and walks directories for g+s — the whole @data tree', async () => {
+    it('ahr applyToExisting walks chown and setfacl (access + default) and directories for g+s with find — the whole @data tree, no -xdev', async () => {
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server)
       const res = await putConfirmed({
@@ -374,11 +403,13 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['-R', 'media', MP])
+      assert.deepEqual(walkCall(calls, '/usr/bin/chown'), walkOf(MP, [], ['/usr/bin/chown', '-h', 'media']))
       const spec = 'u::rwX,g::r-X,o::r-X,u:alice:r-X,m::rwX'
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-b'), ['-R', '-b', '-m', spec, MP])
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-d'), ['-R', '-d', '--set', 'u::rwx,g::r-x,o::r-x,u:alice:r-x,m::rwx', MP])
-      assert.deepEqual(find(calls, '/usr/bin/find', () => true), [MP, '-type', 'd', '-exec', '/usr/bin/chmod', 'g+s', '{}', '+'])
+      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-b'), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-b', '-m', spec]))
+      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-d'), walkOf(MP, ['-type', 'd'], ['/usr/bin/setfacl', '-d', '--set', 'u::rwx,g::r-x,o::r-x,u:alice:r-x,m::rwx']))
+      assert.deepEqual(walkCall(calls, '/usr/bin/chmod', a => a[0] === 'g+s'), walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s']))
+      // btrfs: no -xdev, so every subvolume under @data is still swept (nf.1).
+      assert.equal(calls.some(c => c.command === FIND && c.args.includes('-xdev')), false)
       assert.equal(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), undefined, 'no chmod g+s over the whole tree')
       // The walk starts at the mount (@data); @snapshots is a sibling subvolume
       // outside it, so no command ever names a snapshot path.
@@ -407,7 +438,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       assert.equal(ok2.statusCode, 202)
       const job = await waitForJob(server, (ok2.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['-R', 'media', MP])
+      assert.deepEqual(walkCall(calls, '/usr/bin/chown'), walkOf(MP, [], ['/usr/bin/chown', '-h', 'media']))
     })
 
     it('ahr applyToExisting is refused when a PVE storage path sits inside the tree; the flat change is not', async () => {

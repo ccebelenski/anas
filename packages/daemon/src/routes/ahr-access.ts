@@ -115,7 +115,7 @@ export async function ahrAccessRoutes(
     // A recursive apply is confirm-gated (ruling 2026-10-11), asked last;
     // cr.37: bound to the whole request and the ACL revision.
     if (plan.recursive) {
-      const confirm = await access.recursiveConfirm(plan.target, { named: plan.hasNamed })
+      const confirm = await access.recursiveConfirm(plan.target, { named: plan.hasNamed, walk: plan.walk })
       if (!guardConfirm(confirmStore, request, reply, spec, pre, {
         validated: { pool: request.params.name, ...signedAccessRequest(req) },
         address: ['pool'],
