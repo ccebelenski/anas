@@ -226,8 +226,8 @@ Scope is the findings of `docs/CODE-REVIEW-2026-10-14.md`, which is the evidence
 **Wave 2 stories (cut 2026-10-15 from docs/WAVE2-DESIGN.md §9 — the design is the spec; its §10 open questions are the operator's).** Order: nothing may require what an earlier merge does not yet send — cr.25a deployed before cr.27; cr.27 is one merge across Perl, gateway and UI; cr.28 after cr.27; cr.26, cr.29, cr.30 independent of the auth chain.
 - **cr.25a** `[ ]` The UI and the gateway send PVE's CSRF token (no enforcement). Opus.
 - **cr.25b** `[ ]` The integration specs send the token through one helper. After cr.25a. Local lane.
-- **cr.26** `[ ]` The daemon accepts JSON bodies only (415 otherwise). Local lane.
-- **cr.27** `[ ]` PVE decides who and what inside pveproxy; the gateway enforces Sys.Audit/Sys.Modify; refuses outside pveproxy (the hook also runs in pvedaemon on :85); disabled users and realms honoured. **Blocked on operator Q2** (HMAC header over loopback TCP vs a root:www-data unix socket). Opus + node smoke.
+- **cr.26** `[done 2026-10-15]` The daemon accepts JSON bodies only (415 otherwise). Local lane.
+- **cr.27** `[ ]` (cr.26 note: a body-less POST that carries `Content-Type: text/plain` loses the header in the gateway's forward, so the daemon's 415 rule is stricter at the socket than through `/anas` — make it uniform here.) PVE decides who and what inside pveproxy; the gateway enforces Sys.Audit/Sys.Modify; refuses outside pveproxy (the hook also runs in pvedaemon on :85); disabled users and realms honoured. **Blocked on operator Q2** (HMAC header over loopback TCP vs a root:www-data unix socket). Opus + node smoke.
 - **cr.28** `[ ]` The job queue refuses work without Sys.Modify. After cr.27.
 - **cr.29** `[ ]` A deleted user's or group's number is never handed out again (tombstone + create-time backstop). **Blocked on operator Q1** (may delete leave an `anas-deleted-<uid>` placeholder). Opus.
 - **cr.30** `[ ]` Delete refuses every smb.conf name reference (all user-list parameters, `@`/`+`/`&` forms); ACL references become warnings. Local lane.

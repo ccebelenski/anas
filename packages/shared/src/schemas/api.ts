@@ -51,6 +51,11 @@ export const ErrorCode = z.enum([
   'GATEWAY_TIMEOUT',
   /** Gateway: a forward came back to us (cycle guard). */
   'FORWARD_LOOP',
+  /**
+   * cr.26 (daemon, WAVE2-DESIGN §3 row 14): mutation with a non-JSON
+   * `Content-Type`, or a body without one — the daemon accepts JSON only.
+   */
+  'UNSUPPORTED_MEDIA_TYPE',
 ])
 export type ErrorCode = z.infer<typeof ErrorCode>
 

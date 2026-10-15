@@ -53,6 +53,9 @@ import { defaultRcloneConfigPaths, RCLONE, rcloneBaseArgs } from './services/rcl
 import { defaultRemotesPaths } from './services/replication-remotes.js'
 import { createTransport, defaultMembersFile } from './services/replication-transport.js'
 
+/** Methods that change state — the cr.26 JSON-only rule applies to these. */
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'DELETE', 'PATCH'])
+
 export interface ServerOptions {
   /** Use mock executor instead of real commands. Default: false. */
   mock?: boolean
@@ -69,6 +72,51 @@ export interface ServerOptions {
 export function createServer(opts?: ServerOptions) {
   const server = Fastify({
     logger: opts?.logger ?? true,
+  })
+
+  // cr.26 (review H1, third bullet; WAVE2-DESIGN §3, "the daemon refuses
+  // non-JSON bodies"): "for POST/PUT/DELETE/PATCH, a Content-Type that is
+  // present and not `application/json` is a 415 naming the type, with or
+  // without a body, and a body without a Content-Type is a 415; the
+  // `text/plain` parser is removed." Defence in depth — the CSRF token is
+  // the fix; this closes the shape a plain HTML form could otherwise drive:
+  // Fastify registers `text/plain` by default, so a form POST arrived with
+  // `body: undefined` and body-less mutation POSTs executed. Removing the
+  // parser alone would leave Fastify's own 415 (FST_ERR_CTP_*) on the
+  // surface; the onRequest hook below refuses first, so the reply carries
+  // the ANAS error envelope naming the type (§8 row 14).
+  server.removeContentTypeParser('text/plain')
+
+  server.addHook('onRequest', async (request, reply) => {
+    if (!MUTATING_METHODS.has(request.method))
+      return
+    const contentType = request.headers['content-type']
+    if (contentType !== undefined) {
+      // Parameters and case are not part of the media type.
+      if (contentType.split(';', 1)[0].trim().toLowerCase() === 'application/json')
+        return
+      return reply.code(415).send({
+        error: {
+          code: 'UNSUPPORTED_MEDIA_TYPE',
+          message: `Unsupported Content-Type "${contentType}" — the daemon accepts application/json bodies only`,
+          details: { method: request.method, path: request.url, contentType },
+        },
+      })
+    }
+    // No Content-Type header at all: legal with no body (the design keeps a
+    // body-less POST "as today"), a 415 with one. Fastify would catch the
+    // typed-body-without-type case too, but with its own error shape.
+    const contentLength = Number.parseInt(request.headers['content-length'] ?? '', 10)
+    if (request.headers['transfer-encoding'] !== undefined
+      || (Number.isFinite(contentLength) && contentLength > 0)) {
+      return reply.code(415).send({
+        error: {
+          code: 'UNSUPPORTED_MEDIA_TYPE',
+          message: 'Request body sent without a Content-Type — the daemon accepts application/json bodies only',
+          details: { method: request.method, path: request.url, contentType: '(missing)' },
+        },
+      })
+    }
   })
 
   const audit = new AuditLogger(server.log)
