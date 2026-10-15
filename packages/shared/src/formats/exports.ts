@@ -49,13 +49,17 @@ export function isExportClientSpec(s: string): boolean {
     return false
   if (!EXPORT_CLIENT_SPEC_RE.test(s))
     return false
+  // A leading `-` makes exportfs read the token as a default-options block
+  // (`-x(rw)` → `unknown keyword "x(rw)"`, node pass 2026-10-14).
+  if (s.startsWith('-'))
+    return false
   return !EXPORT_CLIENT_SPEC_CHARS_RE.test(s)
 }
 
 /** One client spec (see {@link isExportClientSpec}). */
 export const ExportClientSpec = z
   .string()
-  .refine(isExportClientSpec, 'a client spec is a single host, wildcard host (*.lan), IP/CIDR, @netgroup or `*` — no whitespace, parentheses, comma, quote, backslash or hash')
+  .refine(isExportClientSpec, 'a client spec is a single host, wildcard host (*.lan), IP/CIDR, @netgroup or `*` — no leading dash, whitespace, parentheses, comma, quote, backslash or hash')
 
 // ── Options ──────────────────────────────────────────────────────────────────
 

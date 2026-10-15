@@ -182,6 +182,9 @@ describe('nfs export routes', () => {
       mock.exec = async (command: string, args: string[]) => {
         if (command === '/usr/sbin/exportfs') {
           exportfsCalls++
+          // The pre-edit baseline reload is clean; the change is what fails.
+          if (exportfsCalls === 1)
+            return { stdout: '', stderr: '', exitCode: 0 }
           return { stdout: '', stderr: 'exportfs: bogus fs type', exitCode: 1 }
         }
         return orig(command, args)
@@ -200,7 +203,28 @@ describe('nfs export routes', () => {
       assert.equal(await readFile(exportsPath, 'utf8'), before, 'the failed write must not survive')
       assert.ok(!(await readFile(exportsPath, 'utf8')).includes('/srv/nfs/rollback'))
       // The restored file is reloaded so the kernel's table matches it again.
-      assert.equal(exportfsCalls, 2, 'exportfs -ra runs again after the restore')
+      assert.equal(exportfsCalls, 3, 'baseline, the failing reload, and a reload of the restored file')
+    })
+
+    it('an export elsewhere that already fails the reload does not roll back a good change (node pass R3-D1)', async () => {
+      const mock = (server! as unknown as { executor: MockExecutor }).executor
+      const orig = mock.exec.bind(mock)
+      const stale = 'exportfs: Failed to stat /testpool/share1: No such file or directory'
+      mock.exec = async (command: string, args: string[]) => {
+        if (command === '/usr/sbin/exportfs')
+          return { stdout: '', stderr: `${stale}\n`, exitCode: 1 }
+        return orig(command, args)
+      }
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/shares/nfs',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ path: '/srv/nfs/fine', clients: [{ spec: '*', options: ['rw', 'sync'] }] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      assert.ok((await readFile(exportsPath, 'utf8')).includes('/srv/nfs/fine'), 'the change stays applied')
     })
   })
 

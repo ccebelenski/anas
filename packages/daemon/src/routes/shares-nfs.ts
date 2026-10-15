@@ -32,24 +32,32 @@ export async function nfsExportRoutes(
   const { executor, jobQueue, confirmStore, exportsPath } = opts
   const shareAccess = shareAccessHandlers({ access: opts.accessService ?? createAccessService({ executor }), jobQueue, confirmStore: opts.confirmStore })
 
-  /** Reload the kernel export table; throws on failure (fails the job). */
-  async function reloadExports(): Promise<void> {
+  /** One `exportfs -ra`: whether it succeeded and the error lines it printed. */
+  async function runExportfs(): Promise<{ ok: boolean, errors: string[], message: string }> {
     const r = await executor.exec(EXPORTFS, ['-ra'])
-    if (r.exitCode !== 0)
-      throw new Error(r.stderr.trim() || `exportfs -ra exited with code ${r.exitCode}`)
+    const errors = r.stderr.split('\n').map(l => l.trim()).filter(l => l !== '')
+    return { ok: r.exitCode === 0, errors, message: r.stderr.trim() || `exportfs -ra exited with code ${r.exitCode}` }
   }
 
   /**
    * Edit /etc/exports under the config-writer's lock and reload, ROLLING THE
-   * FILE BACK when `exportfs -ra` rejects the result (review H3(b): a failed
-   * reload used to leave the bad file standing). The pre-edit bytes are captured
-   * inside the SAME `editConfig` transform (the truth the write started from),
-   * and the restore is a second `editConfig` call under the same
-   * change-detecting lock — so a hand-edit that lands between the write and the
-   * reload is left alone, never clobbered. The reload error is what fails the
-   * job, with the restore attempted as part of the rollback.
+   * FILE BACK when `exportfs -ra` rejects the change (review H3(b): a failed
+   * reload used to leave the bad file standing).
+   *
+   * "Rejects the change" is judged against a baseline, not on the exit code
+   * alone (node pass R3-D1): `exportfs -ra` exits non-zero for ANY bad line —
+   * a stale export whose dataset is gone fails every reload — so the file is
+   * reloaded once before the edit and only an error line the baseline did not
+   * print counts against this change. Errors that predate it are reported and
+   * left alone. When the baseline was clean, any failure counts.
+   *
+   * The pre-edit bytes are captured inside the SAME `editConfig` transform and
+   * the restore is a second `editConfig` under the same change-detecting lock,
+   * so a hand-edit that lands between the write and the reload is left alone.
    */
   async function editExportsWithReload(transform: (current: string) => string, progress: (message: string) => void): Promise<void> {
+    progress('Checking the current NFS exports (exportfs -ra)')
+    const baseline = await runExportfs()
     let before: string | null = null
     let written: string | null = null
     await editConfig(exportsPath, (current) => {
@@ -58,39 +66,39 @@ export async function nfsExportRoutes(
       return written
     })
     progress('Reloading NFS exports (exportfs -ra)')
-    try {
-      await reloadExports()
+    const after = await runExportfs()
+    if (after.ok)
+      return
+    const known = new Set(baseline.ok ? [] : baseline.errors)
+    const fresh = after.errors.filter(line => !known.has(line))
+    if (!baseline.ok && fresh.length === 0) {
+      progress(`exportfs -ra reports errors that predate this change and were left as they are: ${after.message}`)
+      return
     }
-    catch (err) {
-      // Roll the previous bytes back only when the file is still what we wrote
-      // (a hand-edit that landed between the write and the reload is left alone).
-      if (before !== null && written !== null) {
-        const previous = before
-        const writtenBytes = written
-        const why = (e: unknown): string => (e instanceof Error ? e.message : String(e))
-        let restored = false
-        try {
-          await editConfig(exportsPath, current => (current === writtenBytes ? previous : current))
-          restored = true
-        }
-        catch (restoreErr) {
-          progress(`Could not restore /etc/exports after the failed reload — the rejected change is still in the file: ${why(restoreErr)}`)
-        }
-        if (restored) {
-          // A failed `exportfs -ra` may have applied part of the bad file to
-          // the kernel's export table; reload the restored file so the
-          // kernel matches it again. Best-effort: the reload error below is
-          // what the job reports.
-          try {
-            await reloadExports()
-          }
-          catch (reloadErr) {
-            progress(`/etc/exports was restored, but reloading it failed — the kernel's export table may not match the file: ${why(reloadErr)}`)
-          }
-        }
+    // Roll the previous bytes back only when the file is still what we wrote
+    // (a hand-edit that landed between the write and the reload is left alone).
+    if (before !== null && written !== null) {
+      const previous = before
+      const writtenBytes = written
+      const why = (e: unknown): string => (e instanceof Error ? e.message : String(e))
+      let restored = false
+      try {
+        await editConfig(exportsPath, current => (current === writtenBytes ? previous : current))
+        restored = true
       }
-      throw err
+      catch (restoreErr) {
+        progress(`Could not restore /etc/exports after the failed reload — the rejected change is still in the file: ${why(restoreErr)}`)
+      }
+      if (restored) {
+        // A failed `exportfs -ra` may have applied part of the bad file to the
+        // kernel's export table; reload the restored file so the kernel
+        // matches it again. Best-effort: the error below is what the job reports.
+        const again = await runExportfs().catch(() => null)
+        if (again && !again.ok && (baseline.ok || again.errors.some(line => !known.has(line))))
+          progress(`/etc/exports was restored, but reloading it failed — the kernel's export table may not match the file: ${again.message}`)
+      }
     }
+    throw new Error(fresh.length > 0 ? fresh.join('\n') : after.message)
   }
 
   // --- GET /shares/nfs — list ALL exports --------------------------------

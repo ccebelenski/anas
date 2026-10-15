@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { ExportClientSpec, ExportOption, ExportOptionList, isExportPath } from '../formats/exports.js'
+import { ExportClientSpec, ExportOption, ExportOptionList, isExportClientSpec, isExportPath } from '../formats/exports.js'
 import { CreateNfsExportRequest, UpdateNfsExportRequest } from '../schemas/shares.js'
 
 /**
@@ -108,5 +108,13 @@ describe('the export request schemas gate both boundaries', () => {
     // The writer joins options with ',' and the reader splits on ',' — a token
     // carrying whitespace is a different list on read than on write.
     assert.equal(CreateNfsExportRequest.safeParse({ path: '/srv/x', clients: [{ spec: '*', options: ['ro ,sync'] }] }).success, false)
+  })
+})
+
+describe('export client spec: no leading dash (node pass 2026-10-14)', () => {
+  it('refuses a spec exportfs would read as a default-options block', () => {
+    assert.equal(isExportClientSpec('-x'), false)
+    assert.equal(isExportClientSpec('-'), false)
+    assert.equal(isExportClientSpec('host-1'), true)
   })
 })
