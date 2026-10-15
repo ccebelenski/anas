@@ -15,7 +15,7 @@ import { parseSmbConf } from '../parsers/smb-conf.js'
 import { parseZfsJson } from '../parsers/utils.js'
 import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
-import { guardCheck, guardConfirm, guarded, sendRefusal, zfsClaims, znameClaim } from '../safety/guard.js'
+import { guardCheck, guardConfirm, guarded, sendRefusal, zfsDatasetClaims } from '../safety/guard.js'
 import { readDatasetGuid, readPoolGuid, readRollbackIds } from '../safety/stable-id.js'
 import { createAccessService, SET_ACCESS_PRESENTATION_ONLY, signedAccessRequest } from '../services/access.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
@@ -605,15 +605,16 @@ export async function datasetRoutes(
   /**
    * The lock claims (cr.33, §4.2) for each named dataset in its mode: the
    * dataset's `zfs:<pool guid>/<path>` key, every ancestor's and the pool's
-   * shared. A pool whose guid cannot be read is locked by its name key only,
-   * exclusive (§4.2's conservative fallback).
+   * shared, and the pool's name key shared. A pool whose guid cannot be read
+   * is locked by its name key only, exclusive (§4.2's conservative fallback;
+   * cr.33b: the shared name key of every guid-keyed claim set meets it).
    */
   async function datasetClaims(reads: GuardReads, wanted: [name: string, mode: LockMode][]): Promise<LockClaim[]> {
     const out: LockClaim[] = []
     for (const [name, mode] of wanted) {
       const pool = poolOf(name)
       const guid = (await dsReads.poolGuid(reads, pool))?.guid
-      out.push(...(guid ? zfsClaims(guid, name, mode) : [znameClaim(pool)]))
+      out.push(...zfsDatasetClaims(guid, name, mode))
     }
     return out
   }

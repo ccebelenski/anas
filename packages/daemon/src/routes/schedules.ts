@@ -18,6 +18,7 @@ import {
   writeScheduleUnits,
 } from '../services/snapshot-schedule-units.js'
 import { pruneSnapshots, pruneZfsSchedule, takeSnapshot, zfsRunResult } from '../services/snapshot-schedules.js'
+import { ahrSourceClaims, datasetSourceClaims } from '../services/source-claims.js'
 import { sweepSet, zfsTreeListArgs } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
@@ -460,6 +461,17 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       return { error: { code: 'NOT_FOUND', message: `Snapshot schedule '${id}' not found` } }
     }
 
+    // cr.33b (§4.2 "schedule fire", S): the fire holds a SHARED claim on its
+    // target — the dataset (its ancestors and the pool shared) or the AHR
+    // pool — so a destroy, rename or rollback of the target accepted while it
+    // takes and prunes waits for it and re-gates after; other snapshots of
+    // the target still run beside it. A recursive schedule claims its target
+    // (whose recursive destroy or rename takes it exclusive), not each
+    // descendant it sweeps.
+    const locks = schedule.target.kind === 'zfs'
+      ? await datasetSourceClaims(executor, [schedule.target.dataset])
+      : ahrSourceClaims(schedule.target.pool, (await resolveAhrPool(schedule.target.pool))?.vg.uuid)
+
     const job = jobQueue.submit(
       'schedule.run',
       { ...identity, params: { schedule: id } },
@@ -483,6 +495,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
           throw err
         }
       },
+      { locks },
     )
     reply.code(202)
     return { job }

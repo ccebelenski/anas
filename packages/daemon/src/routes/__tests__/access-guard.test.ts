@@ -246,6 +246,7 @@ describe('cr.37 — fs.setAccess binds its plan and the ACL revision (ruling (j)
       ['zfs:N/media', 'exclusive'],
       ['zfs:N', 'shared'],
       ['zpool:N', 'shared'],
+      ['zname:testpool', 'shared'],
     ])
     // The dev mock's `vgs` capture (ahr/lvm-vgs.json) predates ident.3's
     // `+vg_uuid`, so ahr0 has no VG UUID: §4.2's fallback, the name key, exclusive.
@@ -260,7 +261,7 @@ describe('cr.37 — fs.setAccess binds its plan and the ACL revision (ruling (j)
     const release = fillSlots()
     const ahrJob = (await put(AHR_DOOR, BASE_ONLY)).json() as JobAccepted
     const claims = (queue() as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[] }> }).jobs
-    assert.deepEqual(claims.get(ahrJob.job.id)?.claims.map(c => [c.key, c.mode]), [[`ahr:${VG_UUID}`, 'shared']])
+    assert.deepEqual(claims.get(ahrJob.job.id)?.claims.map(c => [c.key, c.mode]), [[`ahr:${VG_UUID}`, 'shared'], ['ahrname:ahr0', 'shared']])
     release()
     assert.equal((await finished(ahrJob.job.id)).status, 'completed')
   })

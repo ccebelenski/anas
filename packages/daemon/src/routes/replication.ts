@@ -11,6 +11,7 @@ import { legacyReleasableOnSource, replicationHoldTag, settleReplicationHolds } 
 import { notifyReplicationRun } from '../services/replication-notify.js'
 import { guardReplicationTarget } from '../services/replication-target.js'
 import { isTransientRunSnapshot } from '../services/snapshot-naming.js'
+import { datasetSourceClaims } from '../services/source-claims.js'
 import { createZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
@@ -332,6 +333,16 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       notify: notifyMode,
     }
 
+    // cr.33b (§4.3): the run holds a SHARED claim on its source dataset, so a
+    // destroy, rename or rollback of the source accepted meanwhile waits for
+    // the send ("waiting for zfs.replicate (job …)") and re-gates after it,
+    // instead of pulling the dataset out from under the stream. Shared, so
+    // snapshots of the source (and other sends from it) still run beside it.
+    // The target is not claimed: §4.2 lists a replication target as a `zfs:`
+    // claim too, but cr.33b is the source's story (a remote target is not
+    // ours to lock in any case).
+    const locks = await datasetSourceClaims(executor, [source])
+
     const job = jobQueue.submit(
       'zfs.replicate',
       { ...identity, params: { source, target: targetFull, ...(loc.isRemote ? { location: target.location } : {}) } },
@@ -476,7 +487,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
         }
       },
       // cr.33 (§4.3): a data mover rides the long lane (at most 3 of the 4 slots).
-      { lane: 'long' },
+      { lane: 'long', locks },
     )
 
     reply.code(202)

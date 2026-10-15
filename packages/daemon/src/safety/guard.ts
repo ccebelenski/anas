@@ -491,6 +491,16 @@ export function guardConfirm<O>(
 // destroy, rename), so an export of `tank` and an import of another pool
 // called `tank` serialise although their guids differ. `what` is how a
 // waiting job's progress line names the object.
+//
+// cr.33b (the guid-fallback split): every guid-keyed ZFS or AHR claim set ALSO
+// carries the pool's name key SHARED, and the fallback for a pool whose guid
+// or VG UUID could not be read is that name key EXCLUSIVE. Without the shared
+// name key a verb that read the guid (`zpool:<guid>`, `zfs:<guid>/…`) and a
+// verb on the same pool whose read failed (`zname:<pool>` only) share no key
+// and ran together. The name key in shared mode costs the in-pool verbs
+// nothing (shared claims coexist); it conflicts only with the fallback and
+// with the namespace verbs (create, import, export, destroy), which take it
+// exclusive and already exclude every in-pool verb through the guid key.
 // ---------------------------------------------------------------------------
 
 function claim(key: string, mode: LockMode, what: string): LockClaim {
@@ -507,21 +517,25 @@ export function zpoolClaim(guid: string, mode: LockMode, pool: string): LockClai
   return claim(`zpool:${guid}`, mode, `Pool '${pool}'`)
 }
 
-/** `zname:<pool name>` — exclusive; ZFS create, import, export, destroy. */
-export function znameClaim(pool: string): LockClaim {
-  return claim(`zname:${pool}`, 'exclusive', `the pool name '${pool}'`)
+/**
+ * `zname:<pool name>` — exclusive for ZFS create, import, export, destroy and
+ * for the guid fallback; shared beside every guid-keyed claim (cr.33b).
+ */
+export function znameClaim(pool: string, mode: LockMode = 'exclusive'): LockClaim {
+  return claim(`zname:${pool}`, mode, `the pool name '${pool}'`)
 }
 
 /**
- * A pool-level verb's claims: the guid key in `mode`, plus the name key when
- * the verb changes the namespace. A pool whose guid could not be read is
- * locked by its name key only, exclusive (§4.2's conservative fallback; its
- * gates refuse anyway when they cannot read their facts).
+ * A pool-level verb's claims: the guid key in `mode`, plus the name key —
+ * exclusive when the verb changes the namespace, shared otherwise (cr.33b). A
+ * pool whose guid could not be read is locked by its name key only, exclusive
+ * (§4.2's conservative fallback; its gates refuse anyway when they cannot read
+ * their facts), which the shared name key of every guid-keyed verb meets.
  */
 export function poolClaims(pool: string, guid: string | null | undefined, mode: LockMode, opts: { namespace?: boolean } = {}): LockClaim[] {
   if (!guid)
     return [znameClaim(pool)]
-  return [zpoolClaim(guid, mode, pool), ...(opts.namespace ? [znameClaim(pool)] : [])]
+  return [zpoolClaim(guid, mode, pool), znameClaim(pool, opts.namespace ? 'exclusive' : 'shared')]
 }
 
 const SNAPSHOT_OR_BOOKMARK = /[@#]/
@@ -544,6 +558,10 @@ function datasetOf(name: string): string {
  * So a recursive destroy of `tank/a` (exclusive on `tank/a`) excludes a
  * snapshot of `tank/a/b` (shared on `tank/a` as its ancestor), while two
  * snapshots under `tank/a` run together.
+ *
+ * The pool's name key rides last, shared (cr.33b), so a verb on the same pool
+ * whose guid read failed ({@link zfsDatasetClaims}' fallback, the name key
+ * exclusive) waits for this one and this one for it.
  */
 export function zfsClaims(poolGuid: string, dataset: string, mode: LockMode): LockClaim[] {
   const name = datasetOf(dataset)
@@ -556,7 +574,20 @@ export function zfsClaims(poolGuid: string, dataset: string, mode: LockMode): Lo
   for (let depth = parts.length - 1; depth >= 1; depth--)
     claims.push(claim(key(depth), 'shared', `Dataset '${parts.slice(0, depth).join('/')}'`))
   claims.push(zpoolClaim(poolGuid, 'shared', parts[0]))
+  claims.push(znameClaim(parts[0], 'shared'))
   return claims
+}
+
+/**
+ * The claims of a dataset verb whose pool guid was read at the route (cr.33b:
+ * the ONE fallback rule for every dataset door — the dataset verbs, set access,
+ * the data movers): {@link zfsClaims} when the guid is known, else the pool's
+ * name key exclusive (§4.2's conservative fallback).
+ */
+export function zfsDatasetClaims(poolGuid: string | null | undefined, dataset: string, mode: LockMode): LockClaim[] {
+  if (poolGuid)
+    return zfsClaims(poolGuid, dataset, mode)
+  return [znameClaim(datasetOf(dataset).split('/')[0])]
 }
 
 /**
@@ -569,9 +600,12 @@ export function ahrClaim(vgUuid: string, mode: LockMode, pool: string): LockClai
   return claim(`ahr:${vgUuid}`, mode, `AHR pool '${pool}'`)
 }
 
-/** `ahrname:<name>` — exclusive; AHR create and destroy. */
-export function ahrnameClaim(pool: string): LockClaim {
-  return claim(`ahrname:${pool}`, 'exclusive', `the AHR pool name '${pool}'`)
+/**
+ * `ahrname:<name>` — exclusive for AHR create and destroy and for the VG UUID
+ * fallback; shared beside every `ahr:<vg uuid>` claim (cr.33b).
+ */
+export function ahrnameClaim(pool: string, mode: LockMode = 'exclusive'): LockClaim {
+  return claim(`ahrname:${pool}`, mode, `the AHR pool name '${pool}'`)
 }
 
 /**
@@ -594,9 +628,12 @@ export function iscsiLunClaim(serial: string): LockClaim {
   return claim(`iscsi-lun:${serial}`, 'exclusive', `iSCSI LUN ${serial}`)
 }
 
-/** `mount:<target path>` — exclusive; mount verbs. */
-export function mountClaim(target: string): LockClaim {
-  return claim(`mount:${target}`, 'exclusive', `the mount at ${target}`)
+/**
+ * `mount:<target path>` — exclusive for mount verbs; shared for a data mover
+ * whose source sits on that mount (cr.33b), so an unmount waits for the run.
+ */
+export function mountClaim(target: string, mode: LockMode = 'exclusive'): LockClaim {
+  return claim(`mount:${target}`, mode, `the mount at ${target}`)
 }
 
 /** `share:smb:<section>` — exclusive; Samba matches section names case-insensitively, so the key is case-folded. */
@@ -636,14 +673,16 @@ export function scheduleClaim(id: string, mode: LockMode): LockClaim {
 
 /**
  * An AHR pool verb's claims (story cr.38, §4.2), the AHR twin of
- * {@link poolClaims}: `ahr:<vg uuid>` in `mode`, plus `ahrname:<name>` when the
- * verb changes the namespace (create, destroy). A pool whose VG UUID could
- * not be read (no VG, or a `vgs` that does not report the column) is locked by
- * its name key only, exclusive — §4.2's conservative fallback; an AHR pool's
- * name IS its VG name, so the name key still serialises every verb on it.
+ * {@link poolClaims}: `ahr:<vg uuid>` in `mode`, plus `ahrname:<name>` —
+ * exclusive when the verb changes the namespace (create, destroy), shared
+ * otherwise (cr.33b). A pool whose VG UUID could not be read (no VG, or a
+ * `vgs` that does not report the column) is locked by its name key only,
+ * exclusive — §4.2's conservative fallback; an AHR pool's name IS its VG name,
+ * and every UUID-keyed claim set carries that name key shared, so the
+ * fallback serialises with every verb on the pool.
  */
 export function ahrPoolClaims(pool: string, vgUuid: string | null | undefined, mode: LockMode, opts: { namespace?: boolean } = {}): LockClaim[] {
   if (!vgUuid)
     return [ahrnameClaim(pool)]
-  return [ahrClaim(vgUuid, mode, pool), ...(opts.namespace ? [ahrnameClaim(pool)] : [])]
+  return [ahrClaim(vgUuid, mode, pool), ahrnameClaim(pool, opts.namespace ? 'exclusive' : 'shared')]
 }

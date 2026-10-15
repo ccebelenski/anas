@@ -379,6 +379,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
       { key: `zfs:${TESTPOOL_GUID}/media`, mode: 'exclusive', holders: [id] },
       { key: `zfs:${TESTPOOL_GUID}`, mode: 'shared', holders: [id] },
       { key: `zpool:${TESTPOOL_GUID}`, mode: 'shared', holders: [id] },
+      { key: 'zname:testpool', mode: 'shared', holders: [id] },
     ])
     release()
     assert.equal((await finished(id)).status, 'completed')
@@ -511,6 +512,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
       [`zfs:${TESTPOOL_GUID}/media`, 'shared'],
       [`zfs:${TESTPOOL_GUID}`, 'shared'],
       [`zpool:${TESTPOOL_GUID}`, 'shared'],
+      ['zname:testpool', 'shared'],
     ])
     releaseSnap()
     assert.equal((await finished(snapId)).status, 'completed')
@@ -523,6 +525,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
       [`zfs:${TESTPOOL_GUID}/media`, 'shared'],
       [`zfs:${TESTPOOL_GUID}`, 'shared'],
       [`zpool:${TESTPOOL_GUID}`, 'shared'],
+      ['zname:testpool', 'shared'],
       [`zfs:${TESTPOOL_GUID}/data`, 'exclusive'],
     ])
     releaseClone()

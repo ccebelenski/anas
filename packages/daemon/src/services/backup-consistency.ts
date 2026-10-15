@@ -121,6 +121,38 @@ export async function readConsistencyFacts(
   readAhrPools: (executor: CommandExecutor) => Promise<AhrPool[]>,
   opts: { pveStorageCfg?: string } = {},
 ): Promise<ConsistencyFacts> {
+  const { mounts, ahrPools } = await readFilesystemFacts(executor, readAhrPools)
+  // Per-source ownership is the ONE footprint service's answer (pvepool.1
+  // review fixes): it assembles storage.cfg + the ZFS mountpoint list (with the
+  // ANAS_STORAGE_CFG env override this route honours everywhere else) + the
+  // boot facts, so the derivation judges sources exactly as the routes do —
+  // no second loader that could drift. Its three-valued posture carries over:
+  // absent storage.cfg fails open (empty refs), UNREADABLE comes back as
+  // `storagesUnavailable` and the derivation tightens to hands-off; a failed
+  // `zfs list` only disables `dir` resolution — the parser's secondary signal.
+  const pve = await loadPveFootprint(executor, { pveStorageCfg: opts.pveStorageCfg })
+  // Unreadable boot facts stay `null` here — NOT `[]`: the derivation tightens
+  // toward hands-off through the whole-pool fallback, exactly like the
+  // footprint service does.
+  const systemFacts = pve.systemFactsUnavailable ? null : pve.systemFacts
+  return { mounts, ahrPools, pveStorages: pve.storagesByPool, storagesUnavailable: pve.storagesUnavailable, systemFacts }
+}
+
+/** The two facts that say which filesystem a path lives on (the mount table, the AHR pools). */
+export interface FilesystemFacts {
+  mounts: Map<string, FindmntNode>
+  ahrPools: AhrPool[]
+}
+
+/**
+ * Read the mount table and the AHR topology. Both fail OPEN to empty (the
+ * derivation then says `live` and names why; the source-claim builder takes no
+ * key and says why) — never an exception that fails a run.
+ */
+export async function readFilesystemFacts(
+  executor: CommandExecutor,
+  readAhrPools: (executor: CommandExecutor) => Promise<AhrPool[]>,
+): Promise<FilesystemFacts> {
   let mounts = new Map<string, FindmntNode>()
   try {
     const r = await executor.exec(FINDMNT, ['--json'])
@@ -137,20 +169,46 @@ export async function readConsistencyFacts(
   catch {
     ahrPools = []
   }
-  // Per-source ownership is the ONE footprint service's answer (pvepool.1
-  // review fixes): it assembles storage.cfg + the ZFS mountpoint list (with the
-  // ANAS_STORAGE_CFG env override this route honours everywhere else) + the
-  // boot facts, so the derivation judges sources exactly as the routes do —
-  // no second loader that could drift. Its three-valued posture carries over:
-  // absent storage.cfg fails open (empty refs), UNREADABLE comes back as
-  // `storagesUnavailable` and the derivation tightens to hands-off; a failed
-  // `zfs list` only disables `dir` resolution — the parser's secondary signal.
-  const pve = await loadPveFootprint(executor, { pveStorageCfg: opts.pveStorageCfg })
-  // Unreadable boot facts stay `null` here — NOT `[]`: the derivation tightens
-  // toward hands-off through the whole-pool fallback, exactly like the
-  // footprint service does.
-  const systemFacts = pve.systemFactsUnavailable ? null : pve.systemFacts
-  return { mounts, ahrPools, pveStorages: pve.storagesByPool, storagesUnavailable: pve.storagesUnavailable, systemFacts }
+  return { mounts, ahrPools }
+}
+
+/** The ANAS AHR pool mounted at a btrfs mount's target, or undefined (a btrfs volume ANAS does not manage). */
+export function ahrPoolMountedAt(target: string, ahrPools: readonly AhrPool[]): AhrPool | undefined {
+  return ahrPools.find(p => normalizePath(p.mountpoint) === normalizePath(target))
+}
+
+/**
+ * The filesystem a source path lives on, as the lock keys name it (story
+ * cr.33b): the same resolution {@link deriveConsistency} makes — a zvol device
+ * path is its volume, otherwise the longest mount-table target containing the
+ * path ({@link filesystemOf}), a `zfs` row its dataset, a `btrfs` row the AHR
+ * pool mounted there — but asked about the filesystem itself, not whether a
+ * run may snapshot it (a PVE-owned dataset is `live` to the derivation and
+ * still the dataset a destroy would take away). `mountpoint` is the target the
+ * path's mount has in the table (absent for a zvol, which has none). Null when
+ * no table entry contains the path (an unreadable table reads as empty).
+ */
+export type SourceFilesystem
+  = | { kind: 'zfs', dataset: string, mountpoint?: string }
+    | { kind: 'ahr', pool: AhrPool, mountpoint: string }
+    | { kind: 'other', mountpoint: string }
+
+export function sourceFilesystemOf(path: string, facts: FilesystemFacts): SourceFilesystem | null {
+  const source = normalizePath(path)
+  const zvol = zvolDatasetFromPath(source)
+  if (zvol)
+    return { kind: 'zfs', dataset: zvol }
+  const node = filesystemOf(source, facts.mounts)
+  if (!node)
+    return null
+  if (node.fstype === 'zfs')
+    return { kind: 'zfs', dataset: node.source, mountpoint: node.target }
+  if (node.fstype === 'btrfs') {
+    const pool = ahrPoolMountedAt(node.target, facts.ahrPools)
+    if (pool)
+      return { kind: 'ahr', pool, mountpoint: node.target }
+  }
+  return { kind: 'other', mountpoint: node.target }
 }
 
 /**
@@ -308,7 +366,7 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
 
   // --- AHR (btrfs) -------------------------------------------------------
   if (node.fstype === 'btrfs') {
-    const pool = facts.ahrPools.find(p => normalizePath(p.mountpoint) === normalizePath(node.target))
+    const pool = ahrPoolMountedAt(node.target, facts.ahrPools)
     if (!pool) {
       return {
         consistency: 'live',

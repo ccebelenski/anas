@@ -461,7 +461,7 @@ describe('cr.38 session B — scrub, repair, parity rewrite and mirror reconcile
     for (const verb of [SCRUB, REWRITE, RECONCILE, REPAIR]) {
       const { id, release } = await acceptedBehindFullQueue(verb)
       const record = (jobQueue as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[], lane: string }> }).jobs.get(id)!
-      assert.deepEqual(record.claims.map(c => `${c.key} ${c.mode}`), [`ahr:${VG_UUID} shared`], verb.name)
+      assert.deepEqual(record.claims.map(c => `${c.key} ${c.mode}`), [`ahr:${VG_UUID} shared`, 'ahrname:ahr0 shared'], verb.name)
       assert.equal(record.lane, 'long', verb.name)
       release()
       await finished(id)

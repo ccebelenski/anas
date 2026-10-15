@@ -142,6 +142,7 @@ import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from '../services/iscsi.js'
 import { normalizeMountpointPath } from '../services/mounts.js'
 import { imageArchiveScan, NESTED_SCAN_PREVIEW_TIMEOUT_S, scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
+import { pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
 import { readSourceGuardFacts, unmountedMountFor } from '../services/source-guard.js'
 import { requireIdentity } from './identity.js'
 
@@ -1240,6 +1241,22 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       }
     }
 
+    // cr.33b (§4.3): the DIRECT run — the one that reads the source — holds
+    // SHARED claims on the filesystem every source path lives on (the zfs:
+    // dataset, ahr: pool and mount: keys the destructive verbs take, resolved
+    // the way the consistency derivation resolves a path), so a destroy,
+    // rename, rollback or unmount of a source accepted meanwhile waits for
+    // the run and re-gates after it. The Run-Now SUPERVISOR takes none: it
+    // waits for the direct run its unit submits, so a destroy queued between
+    // the two (per-key FIFO) would wait for the supervisor while the direct
+    // run waited for the destroy. The task is read here for its paths; the
+    // body reads it again (a task edited in between is cr.41's — its claims
+    // are the ones read now).
+    const sourceTask = direct ? await readTask(systemdDir, name) : null
+    const source = sourceTask
+      ? await pathSourceClaims(executor, sourceTask.archives.map(a => a.path), readAhrPools)
+      : { claims: [], unlocked: [] }
+
     const job = jobQueue.submit(
       'backup.task.run',
       { ...identity, params: { task: name, ...(direct ? { direct: true } : {}) } },
@@ -1248,6 +1265,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           // The manual/UI path: run through the task's own unit and supervise it.
           return superviseRun(executor, name, { onProgress: updateProgress })
         }
+        const unlocked = unlockedSourcesLine(source.unlocked)
+        if (unlocked)
+          updateProgress(`backup task '${name}': ${unlocked}`)
         // rclone.5 (backup parity): the direct run is cancellable from its first
         // line — the SAME hook shape the cloud run registers (child-cancel.ts),
         // SIGINT to proxmox-backup-client; the transient snapshots are still
@@ -1370,7 +1390,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       },
       // cr.33 (§4.3): a data mover — the direct run and the Run-Now
       // supervisor alike — rides the long lane (at most 3 of the 4 slots).
-      { lane: 'long' },
+      { lane: 'long', locks: source.claims },
     )
     reply.code(202)
     return { job }

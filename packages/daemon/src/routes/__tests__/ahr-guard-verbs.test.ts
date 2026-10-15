@@ -487,9 +487,9 @@ describe('cr.38 — the short AHR verbs re-gate in the job (ruling (j))', () => 
  * pins the builder for the pool the column names.
  */
 describe('cr.38 — ahrPoolClaims, the AHR twin of poolClaims', () => {
-  it('the VG UUID key in the verb\'s mode, the name key only for a namespace verb', () => {
-    assert.deepEqual(ahrPoolClaims('tank', 'VGU-1', 'shared').map(c => `${c.key} ${c.mode}`), ['ahr:VGU-1 shared'])
-    assert.deepEqual(ahrPoolClaims('tank', 'VGU-1', 'exclusive').map(c => `${c.key} ${c.mode}`), ['ahr:VGU-1 exclusive'])
+  it('the VG UUID key in the verb\'s mode, the name key shared — exclusive only for a namespace verb (cr.33b)', () => {
+    assert.deepEqual(ahrPoolClaims('tank', 'VGU-1', 'shared').map(c => `${c.key} ${c.mode}`), ['ahr:VGU-1 shared', 'ahrname:tank shared'])
+    assert.deepEqual(ahrPoolClaims('tank', 'VGU-1', 'exclusive').map(c => `${c.key} ${c.mode}`), ['ahr:VGU-1 exclusive', 'ahrname:tank shared'])
     assert.deepEqual(ahrPoolClaims('tank', 'VGU-1', 'exclusive', { namespace: true }).map(c => `${c.key} ${c.mode}`), ['ahr:VGU-1 exclusive', 'ahrname:tank exclusive'])
   })
 

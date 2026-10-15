@@ -403,7 +403,9 @@ serialise even though they have different guids.
 | `task:<kind>:<name>`, `schedule:<id>` | task/schedule create, update, delete (X); run (S) | as stated |
 
 A pool whose key cannot be read (VG unreadable, `zpool get guid` fails) is locked by its name key only, in
-X — the conservative fallback, and its gates will refuse anyway when they cannot read their facts.
+X — the conservative fallback, and its gates will refuse anyway when they cannot read their facts. So that
+the fallback meets the verbs that did read the key (cr.33b), every guid- or VG-UUID-keyed claim set also
+carries the pool's name key (`zname:`/`ahrname:`) in S — X for the namespace verbs, as in the table.
 
 ### 4.3 Long jobs and the 4 slots
 

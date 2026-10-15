@@ -222,6 +222,8 @@ describe('nf.1 — attach / replace onto a by-id partition (wave-3 D1)', () => {
     assert.deepEqual(queue().heldLocks().map(l => [l.key, l.mode]), [
       // The guid the guard reads (`pool-guard-reads.ts`: the captured `zpool get` under gtvdev's name).
       [`zpool:${capturedPoolGet().guid}`, 'exclusive'],
+      // cr.33b: a guid-keyed claim also holds the pool's name key shared.
+      ['zname:gtvdev', 'shared'],
       [`disk:${DISK}`, 'exclusive'],
     ])
     release()

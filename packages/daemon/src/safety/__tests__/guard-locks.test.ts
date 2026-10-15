@@ -4,12 +4,15 @@ import { describe, it } from 'node:test'
 import { JobQueue } from '../../jobs/queue.js'
 import {
   ahrClaim,
+  ahrPoolClaims,
   diskClaim,
   guardCheck,
   guarded,
   poolClaims,
   smbShareClaim,
   zfsClaims,
+  zfsDatasetClaims,
+  znameClaim,
   zpoolClaim,
 } from '../guard.js'
 
@@ -45,13 +48,16 @@ describe('cr.33 — lock key builders (§4.2)', () => {
       { key: `zfs:${GUID}/a`, mode: 'shared', what: `Dataset 'tank/a'` },
       { key: `zfs:${GUID}`, mode: 'shared', what: `Dataset 'tank'` },
       { key: `zpool:${GUID}`, mode: 'shared', what: `Pool 'tank'` },
+      { key: 'zname:tank', mode: 'shared', what: `the pool name 'tank'` },
     ])
     assert.deepEqual(zfsClaims(GUID, 'tank', 'exclusive').map(c => [c.key, c.mode]), [
       [`zfs:${GUID}`, 'exclusive'],
       [`zpool:${GUID}`, 'shared'],
+      ['zname:tank', 'shared'],
     ])
-    // A pool imported under another name keeps its dataset keys.
-    assert.deepEqual(zfsClaims(GUID, 'renamed/a/b', 'shared').map(c => c.key), zfsClaims(GUID, 'tank/a/b', 'shared').map(c => c.key))
+    // A pool imported under another name keeps its dataset keys (only the
+    // name key, cr.33b, follows the name it is known by now).
+    assert.deepEqual(zfsClaims(GUID, 'renamed/a/b', 'shared').map(c => c.key).slice(0, -1), zfsClaims(GUID, 'tank/a/b', 'shared').map(c => c.key).slice(0, -1))
   })
 
   it('a snapshot or bookmark name locks its dataset', () => {
@@ -59,12 +65,12 @@ describe('cr.33 — lock key builders (§4.2)', () => {
     assert.deepEqual(zfsClaims(GUID, 'tank/a#mark', 'shared'), zfsClaims(GUID, 'tank/a', 'shared'))
   })
 
-  it('a pool verb: the guid key, plus the name key for a namespace verb; an unreadable guid falls back to the name key, exclusive', () => {
+  it('a pool verb: the guid key, plus the name key (exclusive for a namespace verb, shared otherwise — cr.33b); an unreadable guid falls back to the name key, exclusive', () => {
     assert.deepEqual(poolClaims('tank', GUID, 'exclusive', { namespace: true }), [
       { key: `zpool:${GUID}`, mode: 'exclusive', what: `Pool 'tank'` },
       { key: 'zname:tank', mode: 'exclusive', what: `the pool name 'tank'` },
     ])
-    assert.deepEqual(poolClaims('tank', GUID, 'shared'), [zpoolClaim(GUID, 'shared', 'tank')])
+    assert.deepEqual(poolClaims('tank', GUID, 'shared'), [zpoolClaim(GUID, 'shared', 'tank'), znameClaim('tank', 'shared')])
     assert.deepEqual(poolClaims('tank', null, 'shared'), [{ key: 'zname:tank', mode: 'exclusive', what: `the pool name 'tank'` }])
   })
 
@@ -180,5 +186,89 @@ describe('cr.33 — a guard spec\'s claims reach the queue', () => {
     assert.equal(queue.get(id2)?.status, 'failed')
     assert.equal(queue.get(id2)?.error?.code, 'CONFLICT')
     assert.deepEqual(acted, ['first'], 'the second body never ran')
+  })
+})
+
+/**
+ * Story cr.33b P1 — the guid-fallback key split. A route-time guid read that
+ * fails leaves a verb with the name key only (§4.2's fallback); before cr.33b a
+ * guid-keyed verb on the same pool carried no name key, so the two shared no
+ * key and ran together. The builders below are the REAL ones the routes call
+ * (datasets.ts `datasetClaims` and access.ts `accessClaims` through
+ * `zfsDatasetClaims`, the AHR verbs through `ahrPoolClaims`).
+ */
+describe('cr.33b — a guid-keyed verb and a name-keyed fallback on one pool serialise', () => {
+  const short = (claims: { key: string, mode: string }[]): string[] => claims.map(c => `${c.key} ${c.mode}`)
+
+  it('the four claim sets: a dataset snapshot, a recursive destroy, a pool export, and the fallback', () => {
+    assert.deepEqual(short(zfsDatasetClaims(GUID, 'tank/a@s1', 'shared')), [
+      `zfs:${GUID}/a shared`,
+      `zfs:${GUID} shared`,
+      `zpool:${GUID} shared`,
+      'zname:tank shared',
+    ])
+    assert.deepEqual(short(zfsDatasetClaims(GUID, 'tank/a', 'exclusive')), [
+      `zfs:${GUID}/a exclusive`,
+      `zfs:${GUID} shared`,
+      `zpool:${GUID} shared`,
+      'zname:tank shared',
+    ])
+    assert.deepEqual(short(poolClaims('tank', GUID, 'exclusive', { namespace: true })), [
+      `zpool:${GUID} exclusive`,
+      'zname:tank exclusive',
+    ])
+    for (const guid of [null, undefined, ''])
+      assert.deepEqual(short(zfsDatasetClaims(guid, 'tank/a@s1', 'shared')), ['zname:tank exclusive'])
+  })
+
+  it('a snapshot holding the guid keys: a destroy whose guid read failed waits for it, named — and the other way round', async () => {
+    const queue = new JobQueue()
+    const snap = held(queue, 'zfs.snapshot', zfsDatasetClaims(GUID, 'tank/a@s1', 'shared'))
+    const destroy = held(queue, 'zfs.destroy', zfsDatasetClaims(null, 'tank/a', 'exclusive'))
+    assert.equal(queue.get(snap.id)?.status, 'running')
+    assert.equal(queue.get(destroy.id)?.status, 'queued', 'the fallback destroy no longer runs beside the guid-keyed snapshot')
+    assert.equal(queue.get(destroy.id)?.progress, `waiting for zfs.snapshot (job ${snap.id}) on the pool name 'tank'`)
+    snap.end()
+    await tick()
+    assert.equal(queue.get(destroy.id)?.status, 'running')
+    // Now the fallback holds the name key: a guid-keyed rollback waits for it.
+    const rollback = held(queue, 'zfs.rollback', zfsDatasetClaims(GUID, 'tank/a', 'exclusive'))
+    assert.equal(queue.get(rollback.id)?.status, 'queued')
+    assert.equal(queue.get(rollback.id)?.progress, `waiting for zfs.destroy (job ${destroy.id}) on the pool name 'tank'`)
+    destroy.end()
+    await tick()
+    assert.equal(queue.get(rollback.id)?.status, 'running')
+    rollback.end()
+    await tick()
+    assert.deepEqual(queue.heldLocks(), [])
+  })
+
+  it('the AHR twin: a VG-UUID-keyed verb and a name-keyed fallback on one pool serialise', async () => {
+    const queue = new JobQueue()
+    const scrub = held(queue, 'ahr.scrub', ahrPoolClaims('media', 'VGU-1', 'shared'))
+    const remount = held(queue, 'ahr.remount', ahrPoolClaims('media', null, 'exclusive'))
+    assert.equal(queue.get(remount.id)?.status, 'queued')
+    assert.equal(queue.get(remount.id)?.progress, `waiting for ahr.scrub (job ${scrub.id}) on the AHR pool name 'media'`)
+    scrub.end()
+    await tick()
+    assert.equal(queue.get(remount.id)?.status, 'running')
+    remount.end()
+    await tick()
+  })
+
+  it('no over-serialisation: guid-keyed verbs on one pool still run together, and a namespace verb on another name does not wait', async () => {
+    // Four at a time (the queue's four slots).
+    for (const claims of [
+      [zfsDatasetClaims(GUID, 'tank/a@s1', 'shared'), zfsDatasetClaims(GUID, 'tank/x', 'exclusive'), poolClaims('tank2', '1111', 'exclusive'), [znameClaim('tank3')]],
+      [ahrPoolClaims('media', 'VGU-1', 'shared'), ahrPoolClaims('media', 'VGU-1', 'shared'), zfsDatasetClaims(GUID, 'tank/a@s2', 'shared'), zfsDatasetClaims(GUID, 'tank/y', 'exclusive')],
+    ]) {
+      const queue = new JobQueue()
+      const jobs = claims.map((c, i) => held(queue, `verb.${i}`, c))
+      assert.deepEqual(jobs.map(j => queue.get(j.id)?.status), ['running', 'running', 'running', 'running'])
+      for (const j of jobs)
+        j.end()
+      await tick()
+      assert.deepEqual(queue.heldLocks(), [])
+    }
   })
 })

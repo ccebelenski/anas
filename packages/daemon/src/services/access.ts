@@ -12,7 +12,7 @@ import { isFindmntTable } from '../parsers/findmnt.js'
 import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
 import { parsePveMountPaths, PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
 import { parseDatasetGet, parseZfsList, zfsListArgs } from '../parsers/zfs-list.js'
-import { ahrClaim, ahrnameClaim, zfsClaims, znameClaim } from '../safety/guard.js'
+import { ahrPoolClaims, zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
 import { notChangedList, walkArgs, walkScopeFrom } from './access-walk.js'
 import { heldByLunOnce } from './iscsi-held.js'
@@ -1203,21 +1203,22 @@ export function createAccessService(opts: AccessServiceOptions) {
   /**
    * The lock claims (cr.33 §4.2) a set-access job takes: exclusive on a ZFS
    * dataset (`zfs:<pool guid>/<path>`, its ancestors shared), shared on an AHR
-   * pool (`ahr:<vg uuid>`). A pool whose key cannot be read is locked by its
-   * name key, exclusive (§4.2's fallback). A share path on neither has no key.
+   * pool (`ahr:<vg uuid>`), each with the pool's name key shared. A pool whose
+   * key cannot be read is locked by its name key, exclusive (§4.2's fallback,
+   * which that shared name key meets — cr.33b). A share path on neither has no key.
    */
   async function accessClaims(t: AccessTarget | null, reads: GuardReads): Promise<LockClaim[]> {
     const dataset = t ? aclDatasetOf(t) : null
     if (dataset !== null) {
       const pool = dataset.split('/')[0]
       const guid = (await reads.once(`pool-guid:${pool}`, () => readPoolGuid(executor, pool)))?.guid
-      return guid ? zfsClaims(guid, dataset, 'exclusive') : [znameClaim(pool)]
+      return zfsDatasetClaims(guid, dataset, 'exclusive')
     }
     const ahr = t?.kind === 'ahr'
       ? { pool: t.pool, vgUuid: t.vgUuid }
       : t?.kind === 'share' && t.home?.kind === 'ahr' ? { pool: t.home.pool, vgUuid: t.home.vgUuid } : null
     if (ahr)
-      return ahr.vgUuid ? [ahrClaim(ahr.vgUuid, 'shared', ahr.pool)] : [ahrnameClaim(ahr.pool)]
+      return ahrPoolClaims(ahr.pool, ahr.vgUuid, 'shared')
     return []
   }
 

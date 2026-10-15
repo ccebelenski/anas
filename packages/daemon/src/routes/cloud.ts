@@ -63,6 +63,7 @@ import { ConfigConflictError } from '../services/config-writer.js'
 import { scanNestedFilesystems } from '../services/nested-filesystems.js'
 import { normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, RemoteNotFoundError, remotesReferencing, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
 import { testRemote } from '../services/rclone-probe.js'
+import { pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
 import { zodIssue } from '../validation.js'
 import { requireIdentity } from './identity.js'
 
@@ -965,6 +966,22 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       }
     }
 
+    // cr.33b (§4.3): the DIRECT run — the one that reads the source — holds
+    // SHARED claims on the filesystem every source path lives on (the zfs:
+    // dataset, ahr: pool and mount: keys the destructive verbs take, resolved
+    // the way the consistency derivation resolves a path), so a destroy,
+    // rename, rollback or unmount of a source accepted meanwhile waits for
+    // the run and re-gates after it. The Run-Now SUPERVISOR takes none: it
+    // waits for the direct run its unit submits, so a destroy queued between
+    // the two (per-key FIFO) would wait for the supervisor while the direct
+    // run waited for the destroy. The task is read here for its paths; the
+    // body reads it again (a task edited in between is cr.41's — its claims
+    // are the ones read now).
+    const sourceTask = direct ? await readTask(systemdDir, name) : null
+    const source = sourceTask
+      ? await pathSourceClaims(executor, [sourceTask.source], readAhrPools)
+      : { claims: [], unlocked: [] }
+
     const job = jobQueue.submit(
       'cloud.task.run',
       { ...identity, params: { task: name, ...(direct ? { direct: true } : {}) } },
@@ -973,6 +990,9 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
           // The manual/UI path: run through the task's own unit and supervise it.
           return superviseRun(executor, name, { onProgress: updateProgress })
         }
+        const unlocked = unlockedSourcesLine(source.unlocked)
+        if (unlocked)
+          updateProgress(`cloud sync task '${name}': ${unlocked}`)
         // rclone.5: the direct run is cancellable from its first line — the
         // hook SIGINTs the rclone child (the shared ladder in child-cancel.ts);
         // the transient snapshot is still destroyed in runCloudSync's finally.
@@ -1050,7 +1070,7 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       },
       // cr.33 (§4.3): a data mover — the direct run and the Run-Now
       // supervisor alike — rides the long lane (at most 3 of the 4 slots).
-      { lane: 'long' },
+      { lane: 'long', locks: source.claims },
     )
     reply.code(202)
     return { job }

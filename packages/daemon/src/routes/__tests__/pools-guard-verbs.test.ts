@@ -557,6 +557,7 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
     await until(() => calls.some(c => c.command === ZPOOL && c.args[0] === 'add'))
     assert.deepEqual(queue().heldLocks().map(l => [l.key, l.mode]), [
       [`zpool:${TESTPOOL_GUID}`, 'exclusive'],
+      ['zname:testpool', 'shared'],
       [`disk:${NEW_DISK}`, 'exclusive'],
     ])
     release()
@@ -649,6 +650,7 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
     await until(() => calls.some(c => c.command === ZPOOL && c.args[0] === 'replace'))
     assert.deepEqual(queue().heldLocks().map(l => [l.key, l.mode]), [
       [`zpool:${TESTPOOL_GUID}`, 'exclusive'],
+      ['zname:testpool', 'shared'],
       [`disk:${NEW_DISK}`, 'exclusive'],
     ])
     release()
@@ -706,7 +708,10 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
     const release = pause('set')
     const id = ((await send({ method: 'PUT', url: '/v1/pools/testpool', payload: { properties: { autotrim: 'on' } } })).json() as JobAccepted).job.id
     await until(() => calls.some(c => c.command === ZPOOL && c.args[0] === 'set'))
-    assert.deepEqual(queue().heldLocks(), [{ key: `zpool:${TESTPOOL_GUID}`, mode: 'shared', holders: [id] }])
+    assert.deepEqual(queue().heldLocks(), [
+      { key: `zpool:${TESTPOOL_GUID}`, mode: 'shared', holders: [id] },
+      { key: 'zname:testpool', mode: 'shared', holders: [id] },
+    ])
     release()
     assert.equal((await finished(id)).status, 'completed')
   })
@@ -719,6 +724,7 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
     await until(() => calls.some(c => c.command === ZFS && c.args[0] === 'set'))
     assert.deepEqual(queue().heldLocks().map(l => [l.key, l.mode]), [
       [`zpool:${TESTPOOL_GUID}`, 'exclusive'],
+      ['zname:testpool', 'shared'],
       ['mount:/srv/newhome', 'exclusive'],
     ])
     release()
