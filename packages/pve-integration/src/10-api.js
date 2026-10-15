@@ -29,6 +29,14 @@
         return API_BASE + '/api/nodes/' + encodeURIComponent(node) + '/v1';
     }
 
+    // The current PVE CSRF token, or null when the PVE global does not carry one
+    // (not yet logged in, or a page outside the PVE UI). Never throws.
+    function csrfToken() {
+        var pve = window.Proxmox;
+        var token = pve && pve.CSRFPreventionToken;
+        return (typeof token === 'string' && token.length > 0) ? token : null;
+    }
+
     // Low-level fetch → Promise. Parses JSON when the response advertises it,
     // otherwise text. Resolves on 2xx (incl. 202), rejects otherwise with an
     // Error carrying .status, .body, and (for 409 confirmation) .confirmCode /
@@ -56,6 +64,14 @@
             }
             if (opts.confirmCode) {
                 fetchOpts.headers['X-Anas-Confirm'] = opts.confirmCode;
+            }
+            // PVE's CSRF token (cr.25a, docs/WAVE2-DESIGN.md §3), sent on every
+            // request. Read from the PVE global at CALL time, never cached: PVE
+            // replaces it on every ticket renewal and a kept copy expires after
+            // 2 h. Absent global → header omitted, the request goes out as before.
+            var csrf = csrfToken();
+            if (csrf) {
+                fetchOpts.headers.CSRFPreventionToken = csrf;
             }
 
             fetch(url, fetchOpts).then(function (res) {

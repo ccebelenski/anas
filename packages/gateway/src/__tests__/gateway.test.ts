@@ -554,6 +554,65 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
     await new Promise<void>(resolve => peer.close(() => resolve()))
   })
 
+  // cr.25a: PVE's CSRF token rides the cross-node hop with the cookie, so the
+  // peer's pveproxy can check it for the node that does the work. Nothing
+  // requires it yet: a request without it forwards exactly as before.
+  async function forwardMutation(headers: Record<string, string>): Promise<{
+    status: number
+    body: unknown
+    peerHeaders: Record<string, string | string[] | undefined>
+    peerBody: string
+  }> {
+    let peerHeaders: Record<string, string | string[] | undefined> = {}
+    let peerBody = ''
+    const peer = createHttpsServer({ cert, key }, (req, res) => {
+      peerHeaders = req.headers
+      const chunks: Buffer[] = []
+      req.on('data', (c: Buffer) => chunks.push(c))
+      req.on('end', () => {
+        peerBody = Buffer.concat(chunks).toString('utf8')
+        res.writeHead(202, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ job: { id: 'j1' } }))
+      })
+    })
+    await new Promise<void>(resolve => peer.listen(0, '127.0.0.1', resolve))
+    const peerPort = (peer.address() as AddressInfo).port
+    const server = createServer({
+      config: baseConfig({ clusterCa: certPath, pvePort: peerPort }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({
+      method: 'POST',
+      url: '/api/nodes/peer1/v1/pools/tank/scrub',
+      headers: { 'cookie': 'PVEAuthCookie=x', 'content-type': 'application/json', ...headers },
+      payload: JSON.stringify({ action: 'start' }),
+    })
+    await server.close()
+    await new Promise<void>(resolve => peer.close(() => resolve()))
+    return { status: res.statusCode, body: res.json(), peerHeaders, peerBody }
+  }
+
+  it('forwards the CSRFPreventionToken header to the peer with the cookie (cr.25a)', async () => {
+    const r = await forwardMutation({ CSRFPreventionToken: '6720A1B2:c2lnbmF0dXJl' })
+    assert.equal(r.status, 202)
+    assert.deepEqual(r.body, { job: { id: 'j1' } })
+    assert.equal(r.peerHeaders.csrfpreventiontoken, '6720A1B2:c2lnbmF0dXJl')
+    assert.equal(r.peerHeaders.cookie, 'PVEAuthCookie=x')
+    assert.equal(r.peerHeaders['content-type'], 'application/json')
+    assert.equal(r.peerBody, '{"action":"start"}')
+  })
+
+  it('a request WITHOUT the token still forwards, with no token header invented (no enforcement)', async () => {
+    const r = await forwardMutation({})
+    assert.equal(r.status, 202)
+    assert.deepEqual(r.body, { job: { id: 'j1' } })
+    assert.equal(r.peerHeaders.csrfpreventiontoken, undefined)
+    assert.equal(r.peerHeaders.cookie, 'PVEAuthCookie=x')
+    assert.equal(r.peerHeaders['x-anas-forwarded'], '1')
+    assert.equal(r.peerBody, '{"action":"start"}')
+  })
+
   it('returns 502 ANAS_NOT_INSTALLED when the peer :8006 answers no-such-path', async () => {
     const peer = createHttpsServer({ cert, key }, (req, res) => {
       // pveproxy's fallback when /anas is not hooked (ANAS absent on the node).

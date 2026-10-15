@@ -205,7 +205,8 @@ function loadClusterCa(request: FastifyRequest, caPath: string): string | Buffer
  *   → nodeB pveproxy strips → nodeB gateway sees /api/nodes/B/v1/x → served locally.
  *
  * The user's PVEAuthCookie rides along so the remote gateway verifies the ticket
- * against the replicated cluster authkey exactly as for a direct request. The
+ * against the replicated cluster authkey exactly as for a direct request, and
+ * PVE's `CSRFPreventionToken` header with it when the browser sent one. The
  * TLS hop is verified against the cluster CA (fail-closed if it is unreadable).
  * Connection failure → 502 NODE_UNREACHABLE — including a connect that never
  * COMPLETES (a firewalled/black-holed peer whose SYN is dropped): Node's
@@ -283,8 +284,11 @@ export async function forwardToNode(
     // an already-forwarded request refuses (FORWARD_LOOP) rather than loop.
     [FORWARDED_HEADER]: '1',
   }
-  // Forward the credential and confirmation/content headers verbatim.
-  for (const name of ['cookie', 'content-type', 'x-anas-confirm'] as const) {
+  // Forward the credential and confirmation/content headers verbatim. The CSRF
+  // token rides with the cookie (cr.25a, docs/WAVE2-DESIGN.md §3): the peer's
+  // pveproxy authenticates the hop and checks the token again for the node that
+  // does the work. Absent → not sent, and the forward goes out as before.
+  for (const name of ['cookie', 'csrfpreventiontoken', 'content-type', 'x-anas-confirm'] as const) {
     const value = request.headers[name]
     if (typeof value === 'string')
       headers[name] = value
