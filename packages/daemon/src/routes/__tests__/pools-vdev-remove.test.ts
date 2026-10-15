@@ -175,7 +175,7 @@ describe('remove-vdev endpoint: POST /v1/pools/:name/vdevs/remove', () => {
     const job = await waitForJob(server, body.job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.deepEqual(job.result, { pool: 'testpool', vdev: CACHE_ID, role: 'cache' })
-    assert.deepEqual(removeCall(server), ['remove', 'testpool', CACHE_PATH])
+    assert.deepEqual(removeCall(server), ['remove', '--', 'testpool', CACHE_PATH])
   })
 
   it('removes a cache leaf named by its device-path basename', async () => {
@@ -191,7 +191,7 @@ describe('remove-vdev endpoint: POST /v1/pools/:name/vdevs/remove', () => {
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.deepEqual(removeCall(server), ['remove', 'testpool', CACHE_PATH])
+    assert.deepEqual(removeCall(server), ['remove', '--', 'testpool', CACHE_PATH])
   })
 
   it('removes a spare leaf', async () => {
@@ -208,7 +208,7 @@ describe('remove-vdev endpoint: POST /v1/pools/:name/vdevs/remove', () => {
     const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.deepEqual(job.result, { pool: 'testpool', vdev: SPARE_ID, role: 'spare' })
-    assert.deepEqual(removeCall(server), ['remove', 'testpool', SPARE_PATH])
+    assert.deepEqual(removeCall(server), ['remove', '--', 'testpool', SPARE_PATH])
   })
 
   it('refuses a DATA leaf with the evacuation sentence — never runs zpool remove', async () => {
@@ -291,7 +291,7 @@ describe('remove-vdev endpoint: POST /v1/pools/:name/vdevs/remove', () => {
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'failed')
       assert.match(job.error!.message, /still part of pool testpool/)
-      assert.deepEqual(removeCall(server), ['remove', 'testpool', CACHE_PATH])
+      assert.deepEqual(removeCall(server), ['remove', '--', 'testpool', CACHE_PATH])
     }
     finally {
       delete process.env.ANAS_VDEV_REMOVE_SETTLE_MS
@@ -669,7 +669,7 @@ describe('remove-vdev over a by-id partition-backed pool (the #66 layout)', () =
     const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.equal((job.result as { role: string }).role, 'cache')
-    assert.deepEqual(removeCall(server), ['remove', MULTI_POOL, MULTI_PART(3)])
+    assert.deepEqual(removeCall(server), ['remove', '--', MULTI_POOL, MULTI_PART(3)])
   })
 
   it('the second cache leaf comes out on its own — one container, one leaf at a time', async () => {
@@ -679,7 +679,7 @@ describe('remove-vdev over a by-id partition-backed pool (the #66 layout)', () =
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.deepEqual(removeCall(server), ['remove', MULTI_POOL, MULTI_PART(6)])
+    assert.deepEqual(removeCall(server), ['remove', '--', MULTI_POOL, MULTI_PART(6)])
   })
 
   it('a spare comes out by its partition, leaving the other spare alone', async () => {
@@ -689,7 +689,7 @@ describe('remove-vdev over a by-id partition-backed pool (the #66 layout)', () =
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.deepEqual(removeCall(server), ['remove', MULTI_POOL, MULTI_PART(4)])
+    assert.deepEqual(removeCall(server), ['remove', '--', MULTI_POOL, MULTI_PART(4)])
   })
 
   it('the stripped disk id is refused as ambiguous — nothing is removed', async () => {
@@ -783,7 +783,7 @@ describe('remove-vdev: the settle poll only completes on an answer', () => {
     )
     // The removal itself WAS run — this is the read-back that failed, and the
     // job is honest about which half of the operation it could not confirm.
-    assert.deepEqual(removeCall(server), ['remove', MULTI_POOL, MULTI_PART(3)])
+    assert.deepEqual(removeCall(server), ['remove', '--', MULTI_POOL, MULTI_PART(3)])
   })
 })
 
@@ -959,6 +959,6 @@ describe('remove-vdev: a basename that names two classes is refused', () => {
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.deepEqual(removeCall(server), ['remove', DM_POOL, '/dev/disk/by-id/ssd-part1'])
+    assert.deepEqual(removeCall(server), ['remove', '--', DM_POOL, '/dev/disk/by-id/ssd-part1'])
   })
 })

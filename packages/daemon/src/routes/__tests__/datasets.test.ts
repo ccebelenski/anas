@@ -82,7 +82,7 @@ const SNAPSHOTS_RECURSIVE = JSON.stringify({
 })
 
 /** The recursive snapshot-count command the enriched flat list issues. */
-const SNAPSHOT_COUNT_ARGS = ['list', '-j', '-o', 'name', '-t', 'snapshot', '-r', 'testpool']
+const SNAPSHOT_COUNT_ARGS = ['list', '-j', '-o', 'name', '-t', 'snapshot', '-r', '--', 'testpool']
 
 describe('datasets routes', () => {
   let server: ReturnType<typeof createServer> | undefined
@@ -196,6 +196,15 @@ describe('datasets routes', () => {
       const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/nope' })
       assert.equal(res.statusCode, 404)
       assert.equal(res.json().error.code, 'NOT_FOUND')
+    })
+
+    it('rejects a hostile pool name with 400 before any command (cr.12)', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = recordCalls(server)
+      const res = await server.inject({ method: 'GET', url: '/v1/pools/-x/datasets/media' })
+      assert.equal(res.statusCode, 400)
+      assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+      assert.deepEqual(calls, [], 'an invalid pool name never reaches zfs')
     })
 
     it('lists SMB and NFS shares serving the dataset mountpoint (Epic 4.4)', async () => {
@@ -321,6 +330,7 @@ describe('datasets routes', () => {
       assert.equal(sets.length, 1, 'exactly one zfs set carries the whole edit')
       assert.deepEqual(sets[0].args, [
         'set',
+        '--',
         'compression=zstd',
         'recordsize=1048576',
         'quota=none',
@@ -1154,8 +1164,8 @@ describe('ident.1 — reserved segments, the router\'s dataset-first reading, an
     calls = []
     answers = new Map([
       [zfsListArgs('testpool').join(' '), [ok(LEGACY_LIST)]],
-      [`list -H -o name -t filesystem,volume ${LEGACY}`, [ok(`${LEGACY}\n`)]],
-      [`list -H -o name -t filesystem,volume testpool/snapshots`, [ok('testpool/snapshots\n')]],
+      [`list -H -o name -t filesystem,volume -- ${LEGACY}`, [ok(`${LEGACY}\n`)]],
+      [`list -H -o name -t filesystem,volume -- testpool/snapshots`, [ok('testpool/snapshots\n')]],
       [`get -H -o value guid ${LEGACY}`, [ok('31337\n')]],
     ])
     mock.exec = async (command: string, args: string[]) => {
@@ -1181,13 +1191,13 @@ describe('ident.1 — reserved segments, the router\'s dataset-first reading, an
     const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     const destroys = calls.filter(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'destroy').map(c => c.args.join(' '))
-    assert.deepEqual(destroys, [`destroy ${LEGACY}`])
+    assert.deepEqual(destroys, [`destroy -- ${LEGACY}`])
     assert.ok(!destroys.some(d => d.includes('@')), 'no snapshot destroyed')
   })
 
   it('GET of that dataset reads the dataset; a path naming NO dataset is still the snapshot route', async () => {
     const detail = await server!.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/snapshots/x', headers: IDENTITY_HEADERS })
-    assert.ok(calls.some(c => c.args.join(' ') === `get -j all ${LEGACY}`), 'read as the dataset')
+    assert.ok(calls.some(c => c.args.join(' ') === `get -j all -- ${LEGACY}`), 'read as the dataset')
     assert.notEqual(detail.statusCode, 500)
     calls = []
     await server!.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/media/snapshots', headers: IDENTITY_HEADERS })
@@ -1230,7 +1240,7 @@ describe('ident.1 — reserved segments, the router\'s dataset-first reading, an
   })
 
   it('DELETE <pool>/snapshots/old: ZFS says the dataset does not exist → the snapshot route (destroys <pool>@old)', async () => {
-    answers.set('list -H -o name -t filesystem,volume testpool/snapshots/old', [{ stdout: '', stderr: 'cannot open \'testpool/snapshots/old\': dataset does not exist\n', exitCode: 1 }])
+    answers.set('list -H -o name -t filesystem,volume -- testpool/snapshots/old', [{ stdout: '', stderr: 'cannot open \'testpool/snapshots/old\': dataset does not exist\n', exitCode: 1 }])
     const res = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/old', headers: IDENTITY_HEADERS })
     // The snapshot route answered (the mock pool has no such snapshot).
     assert.equal(res.statusCode, 404, res.body)
@@ -1238,7 +1248,7 @@ describe('ident.1 — reserved segments, the router\'s dataset-first reading, an
   })
 
   it('DELETE <pool>/snapshots/old: a FAILED lookup (not "does not exist") → 503, never the snapshot route', async () => {
-    answers.set('list -H -o name -t filesystem,volume testpool/snapshots/old', [{ stdout: '', stderr: 'internal error: Input/output error\n', exitCode: 1 }])
+    answers.set('list -H -o name -t filesystem,volume -- testpool/snapshots/old', [{ stdout: '', stderr: 'internal error: Input/output error\n', exitCode: 1 }])
     const res = await server!.inject({ method: 'DELETE', url: '/v1/pools/testpool/datasets/snapshots/old', headers: IDENTITY_HEADERS })
     assert.equal(res.statusCode, 503)
     assert.equal(res.json().error.code, 'UNAVAILABLE')
@@ -1248,8 +1258,8 @@ describe('ident.1 — reserved segments, the router\'s dataset-first reading, an
 
   it('GET/PUT/POST on a path whose lookup fails → 503, no fall-through', async () => {
     const suspended: ExecResult = { stdout: '', stderr: 'pool I/O is currently suspended\n', exitCode: 1 }
-    answers.set('list -H -o name -t filesystem,volume testpool/snapshots/old', [suspended])
-    answers.set('list -H -o name -t filesystem,volume testpool/snapshots/old/rollback', [suspended])
+    answers.set('list -H -o name -t filesystem,volume -- testpool/snapshots/old', [suspended])
+    answers.set('list -H -o name -t filesystem,volume -- testpool/snapshots/old/rollback', [suspended])
     const get = await server!.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/snapshots/old', headers: IDENTITY_HEADERS })
     assert.equal(get.statusCode, 503, get.body)
     const put = await server!.inject({

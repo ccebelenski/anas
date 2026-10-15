@@ -19,8 +19,10 @@ import { createServer } from '../../server.js'
  * the node's own LUN arriving over its own initiator, indistinguishable from a
  * remote array to `zpool` — and a non-available disk would be clobbered by the
  * create. All three composer doors (create, add-vdev, attach/replace) refuse
- * such a disk BEFORE the job, naming the disk and the hands-off reason, and a
- * disk the inventory does not know keeps zpool's own error as the answer.
+ * such a disk BEFORE the job, naming the disk and the hands-off reason. Since
+ * cr.12 an id the inventory does not know is refused too (and an unreadable
+ * inventory fails CLOSED) — the unknown-id and fail-closed cases live in the
+ * cr.12 tests; here every id resolves.
  *
  * The loop-back is produced the honest way: the real `iscsi.1` configfs capture
  * is materialised (so the inventory's served-serial read sees the LUN) and the

@@ -297,7 +297,7 @@ async function readExplicitChildMountpoints(
   executor: CommandExecutor,
   poolName: string,
 ): Promise<{ name: string, value: string }[]> {
-  const res = await executor.exec(ZFS, ['get', '-Hp', '-r', '-o', 'name,value,source', 'mountpoint', poolName])
+  const res = await executor.exec(ZFS, ['get', '-Hp', '-r', '-o', 'name,value,source', 'mountpoint', '--', poolName])
   if (res.exitCode !== 0)
     return []
   const out: { name: string, value: string }[] = []
@@ -389,10 +389,23 @@ export function poolTrimSupported(
   return false
 }
 
-/** Map a disk by-id identifier to its stable /dev/disk/by-id path. */
+/**
+ * Map a disk by-id identifier to its stable /dev/disk/by-id path. The id is
+ * the validated basename: every request path to here passes the DiskId
+ * schema (no `/`, no whitespace — cr.12) and the live inventory check, so
+ * this cannot be steered out of the by-id directory (review H4).
+ */
 function byIdPath(id: string): string {
   return `/dev/disk/by-id/${id}`
 }
+
+/**
+ * The result of the composability pre-flight (cr.12): the named per-disk
+ * problems, or WHY the inventory could not be read. Two altitudes — bad
+ * disks are a 400 naming them; an unreadable inventory fails CLOSED as a
+ * 409 with reason 'unreadable' (the attach route's unreadable-status idiom).
+ */
+type ComposableCheck = { problems: string[] } | { unreadable: string }
 
 /**
  * Whether a vdev spec carries redundancy. Every VdevSpec type except our
@@ -440,7 +453,10 @@ function buildCreateArgs(req: CreatePoolRequest): string[] {
   if (req.mountpoint)
     args.push('-m', req.mountpoint)
 
-  args.push(req.name)
+  // cr.12: `--` ends option parsing before the pool name; the vdev-class
+  // keywords (mirror/raidz/…) are operand-level to zpool and still parse
+  // after it (proven against the real binary).
+  args.push('--', req.name)
 
   // Data vdevs carry no class keyword; the redundant allocation classes
   // (log/special/dedup) and the bare-disk classes (cache/spare) follow, in the
@@ -622,34 +638,39 @@ export async function poolRoutes(
    * `zpool` itself cannot see either; handed such a disk it would happily build
    * storage on top of itself. One refusal per disk, joined `; `-style.
    *
-   * A disk that does NOT resolve in the inventory is deliberately passed
-   * through: the current behavior — zpool's own error surfacing from the job —
-   * stays, and inventing a second refusal for it is out of scope here.
+   * A disk the inventory does NOT know is refused (cr.12 / review H4, matching
+   * the AHR composer): the UI only ever offers inventory ids, so an id that
+   * does not resolve is either a typo or hostile input, and handing it to
+   * `zpool` as `/dev/disk/by-id/<id>` to fail from the job is the worse
+   * answer. An inventory that cannot be read FAILS CLOSED — the same altitude
+   * the attach route takes for an unreadable `zpool status` (vdevs.2): nothing
+   * about the request is wrong, the node could not answer, so it is a 409 with
+   * reason 'unreadable' and no bypass. Callers distinguish the two through
+   * {@link ComposableCheck}.
    */
-  async function composableDiskProblems(ids: string[]): Promise<string[]> {
-    // FAIL-OPEN, like every read this route makes: an inventory that cannot be
-    // read yields no refusal — zpool's own error stays the answer — exactly as
-    // the held-by-LUN gate treats an unreadable configfs. Never a 500.
+  async function composableDiskProblems(ids: string[]): Promise<ComposableCheck> {
     let inventory: Disk[]
     try {
       inventory = await collectDisks(executor, diskIdentityCache, iscsiPaths)
     }
     catch (err: unknown) {
-      console.warn('anasd: could not read the disk inventory for the composability pre-flight:', err)
-      return []
+      const detail = err instanceof Error && err.message ? err.message : String(err)
+      return { unreadable: `disk inventory could not be read (${detail})` }
     }
     const problems: string[] = []
     for (const id of ids) {
       const disk = inventory.find(d => d.id === id)
-      if (!disk)
+      if (!disk) {
+        problems.push(`disk '${id}' not found`)
         continue
+      }
       if (!isComposableDisk(disk)) {
         problems.push(disk.handsOff
           ? `disk '${id}' is hands-off: ${disk.handsOffReason ?? disk.handsOff}`
           : `disk '${id}' is not available (status: ${disk.status}${disk.poolName ? `, pool '${disk.poolName}'` : ''})`)
       }
     }
-    return problems
+    return { problems }
   }
 
   /** Every disk id a create request names, across all six vdev classes. */
@@ -954,8 +975,8 @@ export async function poolRoutes(
     }
 
     const args = action === 'stop'
-      ? ['scrub', '-s', poolName]
-      : ['scrub', poolName]
+      ? ['scrub', '-s', '--', poolName]
+      : ['scrub', '--', poolName]
 
     const job = jobQueue.submit(
       'zpool.scrub',
@@ -1000,8 +1021,8 @@ export async function poolRoutes(
     }
 
     const args = action === 'cancel'
-      ? ['trim', '-c', poolName]
-      : ['trim', poolName]
+      ? ['trim', '-c', '--', poolName]
+      : ['trim', '--', poolName]
 
     const job = jobQueue.submit(
       'zpool.trim',
@@ -1054,7 +1075,7 @@ export async function poolRoutes(
       'zpool.upgrade',
       { ...identity, params: { pool: poolName } },
       async () => {
-        const result = await executor.exec('/usr/sbin/zpool', ['upgrade', poolName])
+        const result = await executor.exec('/usr/sbin/zpool', ['upgrade', '--', poolName])
         if (result.exitCode !== 0) {
           throw new Error(result.stderr.trim() || `zpool upgrade exited with code ${result.exitCode}`)
         }
@@ -1125,6 +1146,9 @@ export async function poolRoutes(
       async (updateProgress) => {
         for (const [prop, value] of changes) {
           updateProgress(`Setting ${prop}=${value} on ${poolName}`)
+          // cr.12: deliberately NO `--` here — `zpool set` rejects it outright
+          // (probed: "invalid option '-'"). Injection is bounded by the
+          // SETTABLE_POOL_PROPS whitelist + PoolName param validation.
           const result = await executor.exec('/usr/sbin/zpool', ['set', `${prop}=${value}`, poolName])
           if (result.exitCode !== 0) {
             throw new Error(result.stderr.trim() || `zpool set ${prop}=${value} exited with code ${result.exitCode}`)
@@ -1252,7 +1276,7 @@ export async function poolRoutes(
       async () => {
         // ZFS-native: `zfs set mountpoint` unmounts and remounts the dataset (and
         // every inheriting descendant) itself — no fstab, no manual mount/umount.
-        const result = await executor.exec(ZFS, ['set', `mountpoint=${mp}`, poolName])
+        const result = await executor.exec(ZFS, ['set', '--', `mountpoint=${mp}`, poolName])
         if (result.exitCode !== 0) {
           // `zfs set mountpoint` unmounts to move — a busy pool blocks it; name
           // the holders (3.29). Path comes from the ZFS error (`cannot unmount`).
@@ -1332,16 +1356,38 @@ export async function poolRoutes(
       req.mountpoint = mp
     }
 
-    // SAFETY (the AHR composer's twin, D4): every requested disk must be
-    // composable. The GT-43 loop-back LUN is blank SCSI as far as the kernel
-    // and zpool can see — only the inventory's hands-off tag knows — and a
-    // non-available disk would be clobbered by the create. Refused BEFORE the
-    // job, naming the disk and the reason; an id the inventory does not know
-    // keeps zpool's own error as the answer.
-    const diskProblems = await composableDiskProblems(createRequestDiskIds(req))
+    // SAFETY (the AHR composer's twin, D4 + cr.12): every requested disk must
+    // resolve in the inventory AND be composable. The GT-43 loop-back LUN is
+    // blank SCSI as far as the kernel and zpool can see — only the inventory's
+    // hands-off tag knows — and a non-available disk would be clobbered by the
+    // create. An id the inventory does not know is refused too (H4); an
+    // inventory that cannot be read fails CLOSED. Both refusals land BEFORE
+    // the job, naming the disk and the reason.
+    const check = await composableDiskProblems(createRequestDiskIds(req))
+    if ('unreadable' in check) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'unreadable', message: `${check.unreadable}; refusing to compose disks it cannot identify` } }
+    }
+    const diskProblems = check.problems
     if (diskProblems.length > 0) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${diskProblems.join('; ')}` } }
+    }
+
+    // cr.12 (H4 step 4): `-f` on create is a label-overwrite — confirm-gated
+    // like upgrade. The code binds to operation + pool name; a request without
+    // force never reaches the gate and behaves exactly as before.
+    if (req.force) {
+      if (!confirmGate(confirmStore, request, reply, {
+        operation: 'zpool.create',
+        params: { pool: req.name },
+        message: `Force-creating pool '${req.name}' is destructive`,
+        warnings: [
+          'Forcing the create overwrites any existing filesystem or pool labels on the selected disks.',
+        ],
+      })) {
+        return reply
+      }
     }
 
     const args = buildCreateArgs(req)
@@ -1393,12 +1439,30 @@ export async function poolRoutes(
       return
 
     const target = req.name ?? req.guid!
+
+    // cr.12 (H4 step 4): `-f` on import can mount a pool that is still ACTIVE
+    // on another host — confirm-gated like upgrade. The code binds to
+    // operation + target (name or guid); a request without force never
+    // reaches the gate and behaves exactly as before.
+    if (req.force) {
+      if (!confirmGate(confirmStore, request, reply, {
+        operation: 'zpool.import',
+        params: { target },
+        message: `Force-importing '${target}' can corrupt a pool that is still active elsewhere`,
+        warnings: [
+          'Forcing the import may import a pool that is active on another host, which can corrupt it.',
+        ],
+      })) {
+        return reply
+      }
+    }
+
     const args = ['import']
     if (req.force)
       args.push('-f')
     if (req.altroot)
       args.push('-R', req.altroot)
-    args.push(target)
+    args.push('--', target)
 
     const job = jobQueue.submit(
       'zpool.import',
@@ -1497,11 +1561,17 @@ export async function poolRoutes(
     if (gate)
       return gate
 
-    // SAFETY (D4 — the create path's inventory pre-flight, shared): a hands-off
-    // (loop-back LUN) or non-available disk must not be composed in, whatever
-    // the role. Refused before the job; unresolvable ids keep zpool's error.
+    // SAFETY (D4 — the create path's inventory pre-flight, shared, cr.12): a
+    // hands-off (loop-back LUN) or non-available disk must not be composed in,
+    // whatever the role, and an id the inventory does not know is refused too;
+    // an unreadable inventory fails CLOSED. Refused before the job.
     const candidateIds = role === 'cache' || role === 'spare' ? (disks ?? []) : vdev!.disks
-    const diskProblems = await composableDiskProblems(candidateIds)
+    const check = await composableDiskProblems(candidateIds)
+    if ('unreadable' in check) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'unreadable', message: `${check.unreadable}; refusing to compose disks it cannot identify` } }
+    }
+    const diskProblems = check.problems
     if (diskProblems.length > 0) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${diskProblems.join('; ')}` } }
@@ -1514,13 +1584,13 @@ export async function poolRoutes(
     let jobType: string
     if (role === 'cache' || role === 'spare') {
       const diskIds = disks ?? []
-      args = ['add', poolName, role, ...diskIds.map(byIdPath)]
+      args = ['add', '--', poolName, role, ...diskIds.map(byIdPath)]
       jobDisks = diskIds
       jobType = role
     }
     else {
       const v = vdev!
-      const head = ['add', poolName]
+      const head = ['add', '--', poolName]
       // log/special/dedup prepend their class keyword; data has none.
       if (role === 'log' || role === 'special' || role === 'dedup')
         head.push(role)
@@ -1619,7 +1689,7 @@ export async function poolRoutes(
       'zpool.remove',
       { ...identity, params: { pool: poolName, vdev: requestedVdev, role } },
       async () => {
-        const result = await executor.exec(ZPOOL, ['remove', poolName, token])
+        const result = await executor.exec(ZPOOL, ['remove', '--', poolName, token])
         if (result.exitCode !== 0)
           throw new Error(result.stderr.trim() || `zpool remove exited with code ${result.exitCode}`)
 
@@ -1732,14 +1802,21 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
-    // SAFETY (D4 — the create path's inventory pre-flight, shared): the NEW
-    // disk must be composable — a loop-back LUN or a non-available disk must
-    // not become a mirror leg, a replacement or a raidz-expansion column. The
-    // EXISTING leaf is deliberately not checked: it is already a pool member,
-    // so the inventory (honestly) reports it as anything but available, and
-    // that must never refuse a legitimate attach or replace. Refused before
-    // the job; an unresolvable id keeps zpool's error.
-    const diskProblems = await composableDiskProblems([newDiskId])
+    // SAFETY (D4 — the create path's inventory pre-flight, shared, cr.12): the
+    // NEW disk must resolve in the inventory AND be composable — a loop-back
+    // LUN, a non-available disk or an id the inventory does not know must not
+    // become a mirror leg, a replacement or a raidz-expansion column, and an
+    // unreadable inventory fails CLOSED. The EXISTING leaf is deliberately not
+    // checked: it is already a pool member, so the inventory (honestly)
+    // reports it as anything but available, and that must never refuse a
+    // legitimate attach or replace — it is identified from the pool's own
+    // status instead, below.
+    const check = await composableDiskProblems([newDiskId])
+    if ('unreadable' in check) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'unreadable', message: `${check.unreadable}; refusing to ${replace ? 'replace' : 'attach to'} a device it cannot identify` } }
+    }
+    const diskProblems = check.problems
     if (diskProblems.length > 0) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${diskProblems.join('; ')}` } }
@@ -1801,7 +1878,7 @@ export async function poolRoutes(
         { ...identity, params: { pool: poolName, vdev: targetVdev, newDisk: newDiskId } },
         async () => {
           // SAME `zpool attach` verb aimed at the raidz VDEV NAME (not a leaf).
-          const result = await executor.exec(ZPOOL, ['attach', poolName, targetVdev, newPath])
+          const result = await executor.exec(ZPOOL, ['attach', '--', poolName, targetVdev, newPath])
           if (result.exitCode !== 0)
             throw new Error(result.stderr.trim() || `zpool attach (raidz expand) exited with code ${result.exitCode}`)
           return { pool: poolName, vdev: targetVdev, expanded: newDiskId }
@@ -1872,8 +1949,8 @@ export async function poolRoutes(
     const existingPath = leaf.path
 
     const args = replace
-      ? ['replace', poolName, existingPath, newPath]
-      : ['attach', poolName, existingPath, newPath]
+      ? ['replace', '--', poolName, existingPath, newPath]
+      : ['attach', '--', poolName, existingPath, newPath]
 
     const job = jobQueue.submit(
       replace ? 'zpool.replace' : 'zpool.attach',
@@ -1891,7 +1968,7 @@ export async function poolRoutes(
         // we never flip the pool's autoexpand property. Best-effort: a failure
         // here does not fail the (already-succeeded) replace.
         if (replace)
-          await executor.exec('/usr/sbin/zpool', ['online', '-e', poolName, newPath])
+          await executor.exec('/usr/sbin/zpool', ['online', '-e', '--', poolName, newPath])
         return null
       },
     )
@@ -1983,7 +2060,7 @@ export async function poolRoutes(
       return reply
     }
 
-    const args = force ? ['export', '-f', poolName] : ['export', poolName]
+    const args = force ? ['export', '-f', '--', poolName] : ['export', '--', poolName]
 
     const job = jobQueue.submit(
       'zpool.export',
@@ -2119,7 +2196,7 @@ export async function poolRoutes(
         // to enumerate them — and resolve every leaf that names no disk.
         const leaves = cleanup ? await resolveLeafDisks(await poolMemberLeaves(poolName)) : []
 
-        const result = await executor.exec(ZPOOL, ['destroy', poolName])
+        const result = await executor.exec(ZPOOL, ['destroy', '--', poolName])
         if (result.exitCode !== 0) {
           // A busy destroy fails to unmount a dataset — name the holders (3.29).
           // The path comes from the ZFS error itself (`cannot unmount '<path>'`).
@@ -2185,7 +2262,9 @@ export async function poolRoutes(
           }
           matched.push(leaf)
           updateProgress(`Clearing ZFS labels on ${leaf.leafId}`)
-          const labelclear = await executor.exec(ZPOOL, ['labelclear', '-f', leaf.leafPath])
+          // The leaf path is pool-status-sourced, not user input; `--` is
+          // defense-in-depth against a crafted on-disk label path (probed).
+          const labelclear = await executor.exec(ZPOOL, ['labelclear', '-f', '--', leaf.leafPath])
           const wipe = await executor.exec(WIPEFS, ['-a', '--force', leaf.leafPath])
           if (labelclear.exitCode === 0 && wipe.exitCode === 0)
             wiped.push(leaf.leafId)

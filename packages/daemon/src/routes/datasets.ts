@@ -84,7 +84,8 @@ export function buildCreateArgs(fullName: string, req: CreateDatasetRequest): st
   }
   if (isVolume && req.volsize !== undefined)
     args.push('-V', String(req.volsize))
-  args.push(fullName)
+  // cr.12: `--` ends option parsing before the dataset name.
+  args.push('--', fullName)
   return args
 }
 
@@ -453,7 +454,7 @@ export async function datasetRoutes(
     if (!PoolName.safeParse(poolName).success || !DatasetPath.safeParse(path).success)
       return false
     const full = `${poolName}/${path}`
-    const r = await executor.exec(ZFS, ['list', '-H', '-o', 'name', '-t', 'filesystem,volume', full])
+    const r = await executor.exec(ZFS, ['list', '-H', '-o', 'name', '-t', 'filesystem,volume', '--', full])
     if (r.exitCode === 0)
       return r.stdout.trim() === full
     if (DATASET_ABSENT_RE.test(r.stderr))
@@ -698,7 +699,7 @@ export async function datasetRoutes(
    */
   async function snapshotCounts(poolName: string): Promise<Map<string, number>> {
     const counts = new Map<string, number>()
-    const r = await executor.exec(ZFS, ['list', '-j', '-o', 'name', '-t', 'snapshot', '-r', poolName])
+    const r = await executor.exec(ZFS, ['list', '-j', '-o', 'name', '-t', 'snapshot', '-r', '--', poolName])
     if (r.exitCode !== 0 || !r.stdout.trim())
       return counts
     for (const full of parseSnapshotNames(r.stdout)) {
@@ -804,7 +805,14 @@ export async function datasetRoutes(
   // permissions action shares this wildcard because find-my-way only allows a
   // wildcard as the final path segment — see the PUT handler below.
   server.get<{ Params: { 'name': string, '*': string } }>('/pools/:name/datasets/*', async (request, reply) => {
-    const poolName = request.params.name
+    // cr.12 (H4 step 5): the pool name is validated before ANY command runs —
+    // same validator, same 400 shape as the list route above.
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
     const path = request.params['*']
 
     // ident.1: a path naming an existing dataset is that dataset, whatever
@@ -837,7 +845,7 @@ export async function datasetRoutes(
 
     const fullName = path ? `${poolName}/${path}` : poolName
 
-    const r = await executor.exec(ZFS, ['get', '-j', 'all', fullName])
+    const r = await executor.exec(ZFS, ['get', '-j', 'all', '--', fullName])
     if (r.exitCode !== 0 || !r.stdout.trim()) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
@@ -1172,7 +1180,7 @@ export async function datasetRoutes(
         const spec = pairs.join(' ')
         const apply = async () => {
           updateProgress(`Setting ${spec} on ${fullName}`)
-          const result = await executor.exec(ZFS, ['set', ...pairs, fullName])
+          const result = await executor.exec(ZFS, ['set', '--', ...pairs, fullName])
           if (result.exitCode !== 0)
             throw new Error(result.stderr.trim() || `zfs set ${spec} exited with code ${result.exitCode}`)
           return { dataset: fullName, applied: pairs, warnings }
@@ -1440,7 +1448,7 @@ export async function datasetRoutes(
       return reply
     }
 
-    const args = recursive ? ['destroy', '-r', fullName] : ['destroy', fullName]
+    const args = recursive ? ['destroy', '-r', '--', fullName] : ['destroy', '--', fullName]
 
     const job = jobQueue.submit(
       'zfs.destroy',
@@ -1637,7 +1645,7 @@ export async function datasetRoutes(
       'zfs.rename',
       { ...identity, params: { from, to } },
       async () => {
-        const result = await executor.exec(ZFS, ['rename', from, to])
+        const result = await executor.exec(ZFS, ['rename', '--', from, to])
         if (result.exitCode !== 0)
           throw new Error(result.stderr.trim() || `zfs rename exited with code ${result.exitCode}`)
         return { renamed: from, to }
@@ -1787,7 +1795,7 @@ export async function datasetRoutes(
       return reply
     }
 
-    const args = force ? ['rollback', '-r', snapName] : ['rollback', snapName]
+    const args = force ? ['rollback', '-r', '--', snapName] : ['rollback', '--', snapName]
 
     const job = jobQueue.submit(
       'zfs.rollback',
@@ -1875,7 +1883,7 @@ export async function datasetRoutes(
       'zfs.clone',
       { ...identity, params: { snapshot: snapName, target } },
       async () => {
-        const result = await executor.exec(ZFS, ['clone', snapName, target])
+        const result = await executor.exec(ZFS, ['clone', '--', snapName, target])
         if (result.exitCode !== 0)
           throw new Error(result.stderr.trim() || `zfs clone exited with code ${result.exitCode}`)
         return { cloned: snapName, target }

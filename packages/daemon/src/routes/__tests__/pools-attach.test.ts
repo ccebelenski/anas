@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
+import { serveBlankInventoryDisks } from './inventory-stub.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -22,12 +23,15 @@ const FAILED = 'ata-WDC_WD2003FZEX-00SRLA0_WD-34567890'
 // spelling that names exactly one of them (vdevs.1 fix batch, GitHub #66).
 const EXISTING_LEAF = `${BY_ID}${EXISTING}-part1`
 const FAILED_LEAF = `${BY_ID}${FAILED}-part1`
-// The NEW disks deliberately do NOT resolve in the mock disk inventory (where
-// the WD-45678901/56789012 fixtures are testpool members): the composability
-// pre-flight refuses an inventory-known non-available disk before the job, and
-// these tests assert argv construction, not that refusal (see pools-composable).
+// The NEW disks are served as blank, available disks in the mock inventory
+// (cr.12: the pre-flight now refuses an id the inventory does NOT know, so
+// argv tests must make their invented ids real — see inventory-stub.ts).
+// They deliberately avoid WD-45678901/56789012, the testpool members: the
+// composability pre-flight refuses an inventory-known non-available disk
+// before the job (see pools-composable).
 const NEW_A = 'ata-WDC_WD2003FZEX-00SRLA0_WD-99999991'
 const NEW_B = 'ata-WDC_WD2003FZEX-00SRLA0_WD-99999992'
+const NEW_IDS = [NEW_A, NEW_B]
 
 /** Poll a job until it reaches a terminal state. */
 async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
@@ -63,6 +67,7 @@ describe('attach/replace endpoint: POST /v1/pools/:name/attach', () => {
 
   it('attach (replace=false) runs zpool attach <pool> <existing> <new>', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -85,6 +90,7 @@ describe('attach/replace endpoint: POST /v1/pools/:name/attach', () => {
     assert.ok(call, 'zpool attach was invoked')
     assert.deepEqual(call!.args, [
       'attach',
+      '--',
       'testpool',
       EXISTING_LEAF,
       `${BY_ID}${NEW_A}`,
@@ -93,6 +99,7 @@ describe('attach/replace endpoint: POST /v1/pools/:name/attach', () => {
 
   it('defaults to attach when replace is omitted', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -110,11 +117,12 @@ describe('attach/replace endpoint: POST /v1/pools/:name/attach', () => {
 
     const call = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'attach')
     assert.ok(call)
-    assert.deepEqual(call!.args, ['attach', 'testpool', EXISTING_LEAF, `${BY_ID}${NEW_A}`])
+    assert.deepEqual(call!.args, ['attach', '--', 'testpool', EXISTING_LEAF, `${BY_ID}${NEW_A}`])
   })
 
   it('replace (replace=true) runs zpool replace <pool> <old> <new>', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -135,6 +143,7 @@ describe('attach/replace endpoint: POST /v1/pools/:name/attach', () => {
     assert.ok(call, 'zpool replace was invoked')
     assert.deepEqual(call!.args, [
       'replace',
+      '--',
       'testpool',
       FAILED_LEAF,
       `${BY_ID}${NEW_B}`,
@@ -202,13 +211,14 @@ describe('attach/replace endpoint: POST /v1/pools/:name/attach', () => {
   // the job (never a 500 from us).
   it('fails the job when zpool replace fails', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     const mock = (server as unknown as { executor: MockExecutor }).executor
     mock.clearFixtures()
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
     mock.addFixture({
       command: '/usr/sbin/zpool',
-      args: ['replace', 'testpool', FAILED_LEAF, `${BY_ID}${NEW_B}`],
+      args: ['replace', '--', 'testpool', FAILED_LEAF, `${BY_ID}${NEW_B}`],
       result: { stdout: '', stderr: 'cannot replace: device is too small', exitCode: 1 },
     })
 
@@ -300,6 +310,7 @@ function splitSsdStatus(): ExecResult {
 
 function splitSsdServer(): ReturnType<typeof createServer> {
   const server = createServer({ mock: true, logger: false })
+  serveBlankInventoryDisks(server, NEW_IDS)
   const mock = (server as unknown as { executor: MockExecutor }).executor
   mock.clearFixtures()
   mock.addFixture({
@@ -339,7 +350,7 @@ describe('attach/replace on a by-id partition-backed split device (#66)', () => 
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
 
     const call = spy.calls.find(c => c.args[0] === 'replace')
-    assert.deepEqual(call!.args, ['replace', SPLIT_POOL, SSD_PART(1), `${BY_ID}${NEW_A}`])
+    assert.deepEqual(call!.args, ['replace', '--', SPLIT_POOL, SSD_PART(1), `${BY_ID}${NEW_A}`])
   })
 
   it('the CACHE partition basename names the cache leaf', async () => {
@@ -351,7 +362,7 @@ describe('attach/replace on a by-id partition-backed split device (#66)', () => 
     await waitForJob(server, (res.json() as JobAccepted).job.id)
     assert.deepEqual(
       spy.calls.find(c => c.args[0] === 'replace')!.args,
-      ['replace', SPLIT_POOL, SSD_PART(2), `${BY_ID}${NEW_A}`],
+      ['replace', '--', SPLIT_POOL, SSD_PART(2), `${BY_ID}${NEW_A}`],
     )
   })
 
@@ -364,7 +375,7 @@ describe('attach/replace on a by-id partition-backed split device (#66)', () => 
     await waitForJob(server, (res.json() as JobAccepted).job.id)
     assert.deepEqual(
       spy.calls.find(c => c.args[0] === 'attach')!.args,
-      ['attach', SPLIT_POOL, SSD_PART(3), `${BY_ID}${NEW_A}`],
+      ['attach', '--', SPLIT_POOL, SSD_PART(3), `${BY_ID}${NEW_A}`],
     )
   })
 
@@ -404,6 +415,7 @@ describe('attach/replace on a by-id partition-backed split device (#66)', () => 
 /** A server whose pool LISTS but whose `zpool status -jv` answers as given. */
 function statusReadServer(status: ExecResult): ReturnType<typeof createServer> {
   const server = createServer({ mock: true, logger: false })
+  serveBlankInventoryDisks(server, NEW_IDS)
   const mock = (server as unknown as { executor: MockExecutor }).executor
   mock.clearFixtures()
   mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
@@ -476,7 +488,7 @@ describe('attach/replace refuses when the pool status cannot be read', () => {
     await waitForJob(server, (res.json() as JobAccepted).job.id)
     assert.deepEqual(
       spy.calls.find(c => c.args[0] === 'replace')!.args,
-      ['replace', 'testpool', EXISTING_LEAF, `${BY_ID}${NEW_A}`],
+      ['replace', '--', 'testpool', EXISTING_LEAF, `${BY_ID}${NEW_A}`],
     )
   })
 })

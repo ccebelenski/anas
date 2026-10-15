@@ -62,7 +62,7 @@ describe('trim endpoint: POST /v1/pools/:name/trim', () => {
 
     const trimCall = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'trim')
     assert.ok(trimCall, 'zpool trim was invoked')
-    assert.deepEqual(trimCall!.args, ['trim', 'testpool'])
+    assert.deepEqual(trimCall!.args, ['trim', '--', 'testpool'])
   })
 
   it('issues zpool trim -c <name> for the cancel action', async () => {
@@ -83,7 +83,7 @@ describe('trim endpoint: POST /v1/pools/:name/trim', () => {
 
     const trimCall = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'trim')
     assert.ok(trimCall, 'zpool trim was invoked')
-    assert.deepEqual(trimCall!.args, ['trim', '-c', 'testpool'])
+    assert.deepEqual(trimCall!.args, ['trim', '-c', '--', 'testpool'])
   })
 
   it('returns 404 for a pool that does not exist', async () => {

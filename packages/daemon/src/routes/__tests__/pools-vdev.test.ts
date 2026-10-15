@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
+import { serveBlankInventoryDisks } from './inventory-stub.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -17,12 +18,14 @@ const IDENTITY_HEADERS = {
 }
 
 const BY_ID = '/dev/disk/by-id/'
-// Deliberately NOT resolvable in the mock disk inventory (the WD-45678901 /
-// 56789012 fixtures are testpool members there): the composability pre-flight
-// refuses an inventory-known non-available disk before the job, and these tests
-// assert argv construction, not that refusal (see pools-composable).
+// Served as blank, available disks in the mock inventory (cr.12: the
+// pre-flight refuses an id the inventory does NOT know, so argv tests must
+// make their invented ids real — see inventory-stub.ts). They deliberately
+// avoid WD-45678901 / 56789012, the testpool members: an inventory-known
+// non-available disk is refused before the job (see pools-composable).
 const DISK_A = 'ata-WDC_WD2003FZEX-00SRLA0_WD-99999991'
 const DISK_B = 'ata-WDC_WD2003FZEX-00SRLA0_WD-99999992'
+const DISK_IDS = [DISK_A, DISK_B]
 
 /** Poll a job until it reaches a terminal state. */
 async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
@@ -58,6 +61,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
 
   it('returns 202, completes the job, and runs zpool add with the mirror keyword', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -80,6 +84,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
     assert.ok(addCall, 'zpool add was invoked')
     assert.deepEqual(addCall!.args, [
       'add',
+      '--',
       'testpool',
       'mirror',
       `${BY_ID}${DISK_A}`,
@@ -89,6 +94,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
 
   it('runs zpool add with bare disks for a stripe vdev (no redundancy keyword)', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -105,11 +111,12 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
 
     const addCall = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'add')
     assert.ok(addCall)
-    assert.deepEqual(addCall!.args, ['add', 'testpool', `${BY_ID}${DISK_A}`])
+    assert.deepEqual(addCall!.args, ['add', '--', 'testpool', `${BY_ID}${DISK_A}`])
   })
 
   it('adds a log vdev with the log keyword (role: log)', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -126,6 +133,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
     const addCall = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'add')
     assert.deepEqual(addCall!.args, [
       'add',
+      '--',
       'testpool',
       'log',
       'mirror',
@@ -136,6 +144,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
 
   it('adds bare cache disks (role: cache, no redundancy keyword)', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -149,11 +158,12 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
     await waitForJob(server, (res.json() as JobAccepted).job.id)
 
     const addCall = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'add')
-    assert.deepEqual(addCall!.args, ['add', 'testpool', 'cache', `${BY_ID}${DISK_A}`])
+    assert.deepEqual(addCall!.args, ['add', '--', 'testpool', 'cache', `${BY_ID}${DISK_A}`])
   })
 
   it('adds bare spare disks (role: spare)', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -167,11 +177,12 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
     await waitForJob(server, (res.json() as JobAccepted).job.id)
 
     const addCall = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'add')
-    assert.deepEqual(addCall!.args, ['add', 'testpool', 'spare', `${BY_ID}${DISK_A}`])
+    assert.deepEqual(addCall!.args, ['add', '--', 'testpool', 'spare', `${BY_ID}${DISK_A}`])
   })
 
   it('adds a redundant special vdev with the special keyword (role: special)', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -187,6 +198,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
     const addCall = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'add')
     assert.deepEqual(addCall!.args, [
       'add',
+      '--',
       'testpool',
       'special',
       'mirror',
@@ -197,6 +209,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
 
   it('rejects a striped (non-redundant) special vdev with 400 — never invokes zpool add', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -213,6 +226,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
 
   it('rejects a striped (non-redundant) dedup vdev with 400', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
 
     const res = await server.inject({
       method: 'POST',
@@ -227,6 +241,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
 
   it('rejects a cache role carrying a vdev spec instead of bare disks', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
 
     const res = await server.inject({
       method: 'POST',
@@ -241,6 +256,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
 
   it('rejects requests without identity headers', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
 
     const res = await server.inject({
       method: 'POST',
@@ -255,6 +271,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
 
   it('returns 404 for a pool that does not exist', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
 
     const res = await server.inject({
       method: 'POST',
@@ -269,6 +286,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
 
   it('rejects a vdev spec that violates the minimum disk count', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
 
     const res = await server.inject({
       method: 'POST',
@@ -283,6 +301,7 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
 
   it('rejects an invalid pool name', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
 
     const res = await server.inject({
       method: 'POST',
@@ -297,12 +316,13 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
 
   it('fails the job when zpool add fails', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
     const mock = (server as unknown as { executor: MockExecutor }).executor
     mock.clearFixtures()
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({
       command: '/usr/sbin/zpool',
-      args: ['add', 'testpool', 'mirror', `${BY_ID}${DISK_A}`, `${BY_ID}${DISK_B}`],
+      args: ['add', '--', 'testpool', 'mirror', `${BY_ID}${DISK_A}`, `${BY_ID}${DISK_B}`],
       result: { stdout: '', stderr: 'cannot add to testpool: mismatched replication level', exitCode: 1 },
     })
 
@@ -346,6 +366,7 @@ describe('add-vdev: a PVE-owned pool is refused', () => {
     process.env.ANAS_STORAGE_CFG = cfg
 
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -368,6 +389,7 @@ describe('add-vdev: a PVE-owned pool is refused', () => {
     process.env.ANAS_STORAGE_CFG = cfg
 
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({

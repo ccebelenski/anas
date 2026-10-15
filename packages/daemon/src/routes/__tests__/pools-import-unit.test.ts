@@ -9,6 +9,7 @@ import { JobQueue } from '../../jobs/queue.js'
 import { ConfirmStore } from '../../safety/confirm.js'
 import { jobRoutes } from '../jobs.js'
 import { poolRoutes } from '../pools.js'
+import { serveBlankInventoryDisksOn } from './inventory-stub.js'
 
 /**
  * Boot-import unit parity (issue #22). ANAS used to rely on /etc/zfs/zpool.cache
@@ -41,6 +42,9 @@ function listResult(...pools: string[]): ExecResult {
 }
 
 async function build(ex: MockExecutor): Promise<{ server: ReturnType<typeof Fastify>, jobQueue: JobQueue }> {
+  // cr.12: the composer refuses disk ids the inventory does not know — serve
+  // the invented d1/d2 as blank, available disks (see inventory-stub.ts).
+  serveBlankInventoryDisksOn(ex, ['d1', 'd2'])
   const jobQueue = new JobQueue()
   const server = Fastify({ logger: false })
   await server.register(jobRoutes, { prefix: '/v1', jobQueue })
@@ -233,7 +237,7 @@ describe('boot-import unit: destroy disables the unit', () => {
     const ex = new MockExecutor()
     ex.addFixture({ command: ZPOOL, args: ['list', '-j'], result: listResult('tank') })
     ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', 'tank'], result: { stdout: '77\n', stderr: '', exitCode: 0 } }) // ident.1
-    ex.addFixture({ command: ZPOOL, args: ['destroy', 'tank'], result: OK })
+    ex.addFixture({ command: ZPOOL, args: ['destroy', '--', 'tank'], result: OK })
     ex.addFixture({ command: SYSTEMCTL, args: ['disable', 'zfs-import@tank.service'], result: OK })
 
     const job = await destroyPool(ex, 'tank')
@@ -247,7 +251,7 @@ describe('boot-import unit: destroy disables the unit', () => {
     const ex = new MockExecutor()
     ex.addFixture({ command: ZPOOL, args: ['list', '-j'], result: listResult('tank') })
     ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', 'tank'], result: { stdout: '77\n', stderr: '', exitCode: 0 } }) // ident.1
-    ex.addFixture({ command: ZPOOL, args: ['destroy', 'tank'], result: OK })
+    ex.addFixture({ command: ZPOOL, args: ['destroy', '--', 'tank'], result: OK })
     // No systemctl fixture — 127.
 
     const job = await destroyPool(ex, 'tank')

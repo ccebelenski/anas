@@ -130,7 +130,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
         return { stdout: ZPOOL_LIST, stderr: '', exitCode: 0 }
       if (command === '/usr/sbin/zfs' && sameArgs(args, listArgs))
         return { stdout: fixtureText('zfs-list-volumes.json'), stderr: '', exitCode: 0 }
-      if (command === '/usr/sbin/zfs' && sameArgs(args, ['get', '-j', 'all', VOL]))
+      if (command === '/usr/sbin/zfs' && sameArgs(args, ['get', '-j', 'all', '--', VOL]))
         return { stdout: fixtureText('zfs-get-volume.json'), stderr: '', exitCode: 0 }
       // Only the DETAIL listing (the one carrying `creation`) — the name-only
       // listing must stay empty so the create-snapshot collision check passes.
@@ -358,7 +358,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       const done = await waitForJob(server, job.id)
       assert.equal(done.status, 'completed')
       const args = zfsCalls().find(a => a[0] === 'create')!
-      assert.deepEqual(args, ['create', '-V', String(GiB), 'gtiscsi/vol2'])
+      assert.deepEqual(args, ['create', '-V', String(GiB), '--', 'gtiscsi/vol2'])
     })
 
     it('builds `-s -b <blocksize> … -V <bytes>` in zfs(8) order for a sparse sized volume', async () => {
@@ -367,7 +367,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       assert.equal(res.status, 202)
       await waitForJob(server, (res.json() as JobAccepted).job.id)
       const args = zfsCalls().find(a => a[0] === 'create')!
-      assert.deepEqual(args, ['create', '-s', '-b', '8192', '-o', 'compression=zstd', '-V', String(4 * GiB), 'gtiscsi/vol2'])
+      assert.deepEqual(args, ['create', '-s', '-b', '8192', '-o', 'compression=zstd', '-V', String(4 * GiB), '--', 'gtiscsi/vol2'])
     })
 
     it('omits -b entirely when no block size was asked for (ZFS owns the default)', async () => {
@@ -383,7 +383,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       const res = await create({ path: 'fs2', properties: { recordsize: 131072 } })
       await waitForJob(server, (res.json() as JobAccepted).job.id)
       const args = zfsCalls().find(a => a[0] === 'create')!
-      assert.deepEqual(args, ['create', '-o', 'recordsize=131072', 'gtiscsi/fs2'])
+      assert.deepEqual(args, ['create', '-o', 'recordsize=131072', '--', 'gtiscsi/fs2'])
     })
 
     it('400s a volume with no volsize', async () => {
@@ -421,7 +421,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       assert.equal(res.statusCode, 202)
       await waitForJob(server, (res.json() as JobAccepted).job.id)
       const args = zfsCalls().find(a => a[0] === 'set')!
-      assert.deepEqual(args, ['set', `volsize=${4 * GiB}`, VOL])
+      assert.deepEqual(args, ['set', '--', `volsize=${4 * GiB}`, VOL])
     })
 
     it('a grow of a volume no LUN holds carries no LUN guidance', async () => {
@@ -469,7 +469,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       const res = await put(VOL_PATH, { properties: { compression: 'zstd' } })
       assert.equal(res.statusCode, 202)
       await waitForJob(server, (res.json() as JobAccepted).job.id)
-      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', 'compression=zstd', VOL])
+      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', '--', 'compression=zstd', VOL])
     })
   })
 
@@ -545,7 +545,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       assert.equal(res.statusCode, 202)
       await waitForJob(server, (res.json() as JobAccepted).job.id)
       // The raw request never reaches ZFS — only the rounded multiple does.
-      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', `volsize=${APPLIED}`, VOL])
+      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', '--', `volsize=${APPLIED}`, VOL])
     })
 
     it('reports the applied (rounded) size on the job result, so read model and filesystem agree', async () => {
@@ -563,7 +563,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       const res = await put({ properties: { volsize: ALIGNED } })
       assert.equal(res.statusCode, 202)
       await waitForJob(server, (res.json() as JobAccepted).job.id)
-      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', `volsize=${ALIGNED}`, VOL])
+      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', '--', `volsize=${ALIGNED}`, VOL])
     })
 
     it('fails open — an unreadable volblocksize applies the size exactly as asked', async () => {
@@ -571,7 +571,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       const res = await put({ properties: { volsize: REQUESTED } })
       assert.equal(res.statusCode, 202)
       await waitForJob(server, (res.json() as JobAccepted).job.id)
-      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', `volsize=${REQUESTED}`, VOL])
+      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', '--', `volsize=${REQUESTED}`, VOL])
     })
   })
 
@@ -668,7 +668,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       const res = await put({ properties: { volsize: TRUE_SIZE + GiB } })
       assert.equal(res.statusCode, 202)
       await waitForJob(server, (res.json() as JobAccepted).job.id)
-      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', `volsize=${TRUE_SIZE + GiB}`, VOL])
+      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', '--', `volsize=${TRUE_SIZE + GiB}`, VOL])
     })
   })
 
@@ -704,7 +704,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       const res = await server.inject({ method: 'POST', url, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code } })
       assert.equal(res.statusCode, 202)
       await waitForJob(server, (res.json() as JobAccepted).job.id)
-      assert.deepEqual(zfsCalls().find(a => a[0] === 'rollback'), ['rollback', `${VOL}@before-grow`])
+      assert.deepEqual(zfsCalls().find(a => a[0] === 'rollback'), ['rollback', '--', `${VOL}@before-grow`])
     })
 
     /**
@@ -736,7 +736,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
           }
         }
         // …and ZFS's real refusal, verbatim from the live proof.
-        if (command === '/usr/sbin/zfs' && same(args, ['destroy', VOL])) {
+        if (command === '/usr/sbin/zfs' && same(args, ['destroy', '--', VOL])) {
           return {
             stdout: '',
             stderr: `cannot destroy '${VOL}': volume has children\nuse '-r' to destroy the following datasets:\n${VOL}@r1`,
@@ -781,7 +781,7 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       const res = await server.inject({ method: 'DELETE', url, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code } })
       assert.equal(res.statusCode, 202)
       await waitForJob(server, (res.json() as JobAccepted).job.id)
-      assert.deepEqual(zfsCalls().find(a => a[0] === 'destroy'), ['destroy', VOL])
+      assert.deepEqual(zfsCalls().find(a => a[0] === 'destroy'), ['destroy', '--', VOL])
     })
   })
 })

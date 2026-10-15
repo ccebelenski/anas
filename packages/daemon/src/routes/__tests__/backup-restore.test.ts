@@ -1089,10 +1089,10 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         .map(c => `${c.command} ${c.args.join(' ')}`)
         .filter(a => a.startsWith(TARGETCLI)
           || a.includes(' restore ')
-          || a === `${ZFS} create -s -V ${IMAGE_SIZE} tank/newvol`
+          || a === `${ZFS} create -s -V ${IMAGE_SIZE} -- tank/newvol`
           || a === `${ZFS} get -Hp -o value volsize tank/newvol`)
       assert.deepEqual(seq, [
-        `${ZFS} create -s -V ${IMAGE_SIZE} tank/newvol`,
+        `${ZFS} create -s -V ${IMAGE_SIZE} -- tank/newvol`,
         `${TARGETCLI} /backstores/block create name=newvol dev=${NEWVOL_PATH} wwn=${serial}`,
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_tpu=1`,
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_tpws=1`,

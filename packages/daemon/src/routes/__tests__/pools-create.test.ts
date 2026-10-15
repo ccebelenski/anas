@@ -5,6 +5,11 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
+import { serveBlankInventoryDisks } from './inventory-stub.js'
+
+// cr.12: the composer now refuses disk ids the inventory does not know, so the
+// invented ids these argv pins use are served as blank, available disks.
+const ALL_DISKS = ['ata-DISK1', 'ata-DISK2', 'd1', 'd2', 'd3', 'd4', 'l1', 'l2', 'c1', 's1', 'sp1', 'sp2', 'dd1', 'dd2', 'onlyone']
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -50,6 +55,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
   it('returns 202, completes the job, and builds a mirror arg array', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
     const calls = spyExecutor(server)
 
     const res = await server.inject({
@@ -75,6 +81,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
       // Story 3.31a: ANAS-created pools default to autoexpand=on.
       '-o',
       'autoexpand=on',
+      '--',
       'newpool',
       'mirror',
       '/dev/disk/by-id/ata-DISK1',
@@ -84,6 +91,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
   it('builds a raidz2 arg array', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
     const calls = spyExecutor(server)
 
     const res = await server.inject({
@@ -104,6 +112,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
       'create',
       '-o',
       'autoexpand=on',
+      '--',
       'rzpool',
       'raidz2',
       '/dev/disk/by-id/d1',
@@ -115,6 +124,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
   it('builds a stripe arg array with no redundancy keyword', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
     const calls = spyExecutor(server)
 
     const res = await server.inject({
@@ -135,6 +145,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
       'create',
       '-o',
       'autoexpand=on',
+      '--',
       'strp',
       '/dev/disk/by-id/d1',
       '/dev/disk/by-id/d2',
@@ -143,6 +154,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
   it('appends log, cache, and spare vdevs with their keywords', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
     const calls = spyExecutor(server)
 
     const res = await server.inject({
@@ -166,6 +178,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
       'create',
       '-o',
       'autoexpand=on',
+      '--',
       'full',
       'mirror',
       '/dev/disk/by-id/d1',
@@ -183,6 +196,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
   it('appends special and dedup allocation-class vdevs with their keywords', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
     const calls = spyExecutor(server)
 
     const res = await server.inject({
@@ -205,6 +219,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
       'create',
       '-o',
       'autoexpand=on',
+      '--',
       'alloc',
       'mirror',
       '/dev/disk/by-id/d1',
@@ -222,6 +237,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
   it('rejects a striped (non-redundant) special vdev with 400 — never forced', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
     const calls = spyExecutor(server)
 
     const res = await server.inject({
@@ -243,6 +259,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
   it('rejects a striped (non-redundant) dedup vdev with 400', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
 
     const res = await server.inject({
       method: 'POST',
@@ -261,6 +278,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
   it('returns 409 for a pool name that already exists', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
 
     const res = await server.inject({
       method: 'POST',
@@ -278,6 +296,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
   it('returns 400 for a request with too few disks', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
 
     const res = await server.inject({
       method: 'POST',
@@ -295,6 +314,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
   it('rejects requests without identity headers', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
 
     const res = await server.inject({
       method: 'POST',
@@ -313,6 +333,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
   // Story 3.31a: autoexpand default + override.
   it('defaults autoexpand=on when the request says nothing about it', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
     const calls = spyExecutor(server)
 
     const res = await server.inject({
@@ -329,6 +350,7 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
   it('honors an explicit autoexpand=false override (no default injected)', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
     const calls = spyExecutor(server)
 
     const res = await server.inject({
@@ -346,5 +368,96 @@ describe('create pool endpoint: POST /v1/pools', () => {
     const joined = createCall(calls)!.join(' ')
     assert.ok(joined.includes('autoexpand=off'), 'explicit off honored')
     assert.ok(!joined.includes('autoexpand=on'), 'default not injected over an explicit override')
+  })
+
+  it('force create without a confirm code is a 409 naming the label-overwrite risk, and no zpool command runs (cr.12)', async () => {
+    server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'newpool',
+        dataVdevs: [{ type: 'mirror', disks: ['ata-DISK1', 'ata-DISK2'] }],
+        force: true,
+      }),
+    })
+
+    assert.equal(res.statusCode, 409)
+    const body = res.json() as { error: { code: string, warnings?: string[] } }
+    assert.equal(body.error.code, 'CONFIRMATION_REQUIRED')
+    assert.ok(res.headers['x-anas-confirm-code'], 'a confirm code is offered for the resend')
+    assert.ok(
+      body.error.warnings?.some(w => w.includes('overwrites any existing filesystem or pool labels')),
+      `the overwrite warning names what -f destroys: ${JSON.stringify(body.error.warnings)}`,
+    )
+    assert.equal(createCall(calls), undefined, 'force without a confirm never reaches zpool')
+  })
+
+  it('force create resent with the confirm code proceeds, and the argv carries -f (cr.12)', async () => {
+    server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
+    const calls = spyExecutor(server)
+
+    const first = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'newpool',
+        dataVdevs: [{ type: 'mirror', disks: ['ata-DISK1', 'ata-DISK2'] }],
+        force: true,
+      }),
+    })
+    assert.equal(first.statusCode, 409)
+    const code = first.headers['x-anas-confirm-code'] as string
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code, 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'newpool',
+        dataVdevs: [{ type: 'mirror', disks: ['ata-DISK1', 'ata-DISK2'] }],
+        force: true,
+      }),
+    })
+
+    assert.equal(res.statusCode, 202)
+    await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.deepEqual(createCall(calls), [
+      'create',
+      '-f',
+      '-o',
+      'autoexpand=on',
+      '--',
+      'newpool',
+      'mirror',
+      '/dev/disk/by-id/ata-DISK1',
+      '/dev/disk/by-id/ata-DISK2',
+    ])
+  })
+
+  it('rejects a path-traversal disk id with 400 and no zpool command (cr.12)', async () => {
+    server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'newpool',
+        dataVdevs: [{ type: 'mirror', disks: ['../../sdb', 'ata-DISK2'] }],
+      }),
+    })
+
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(createCall(calls), undefined, 'a traversal disk never reaches zpool create')
   })
 })

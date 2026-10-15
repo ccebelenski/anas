@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { AbsolutePath, DevicePath, ISODateTime, PoolName } from './common.js'
+import { AbsolutePath, DevicePath, DiskId, ISODateTime, PoolName } from './common.js'
 import { IscsiHeldByLun } from './iscsi.js'
 
 // --- Enums ---
@@ -347,8 +347,12 @@ export type PoolDetail = z.infer<typeof PoolDetail>
 export const VdevSpec = z
   .object({
     type: z.enum(['mirror', 'raidz', 'raidz2', 'raidz3', 'stripe']),
-    /** Disk by-id identifiers */
-    disks: z.array(z.string()).min(1),
+    /**
+     * Disk by-id identifiers (cr.12: DiskId keeps path separators and
+     * whitespace out of the argv; the daemon's inventory check is the
+     * authority on what exists).
+     */
+    disks: z.array(DiskId).min(1),
   })
   .check((ctx) => {
     const minDisks: Record<string, number> = {
@@ -389,9 +393,9 @@ export const CreatePoolRequest = z.object({
    */
   dedupVdevs: z.array(VdevSpec).optional(),
   /** Cache (L2ARC) disk IDs — always individual disks */
-  cacheDisks: z.array(z.string()).optional(),
+  cacheDisks: z.array(DiskId).optional(),
   /** Hot spare disk IDs — always individual disks */
-  spareDisks: z.array(z.string()).optional(),
+  spareDisks: z.array(DiskId).optional(),
   /** Properties to set at creation time */
   properties: z
     .object({
@@ -461,10 +465,10 @@ export type ExportPoolRequest = z.infer<typeof ExportPoolRequest>
 /** Import a pool (POST /v1/pools/import) */
 export const ImportPoolRequest = z
   .object({
-    /** Pool name to import */
-    name: z.string().optional(),
-    /** Pool GUID to import */
-    guid: z.string().optional(),
+    /** Pool name to import (cr.12: PoolName, like every other pool-name surface) */
+    name: PoolName.optional(),
+    /** Pool GUID to import — ZFS guids are decimal digits (cr.12) */
+    guid: z.string().regex(/^\d+$/, 'Pool GUID must be decimal digits').optional(),
     /** Force import */
     force: z.boolean().optional(),
     /** Alternative root */
@@ -490,7 +494,7 @@ export const AddVdevRequest = z
     /** Redundant vdev spec — for data/log/special/dedup roles. */
     vdev: VdevSpec.optional(),
     /** Bare disk IDs — for cache/spare roles (always individual disks). */
-    disks: z.array(z.string()).optional(),
+    disks: z.array(DiskId).optional(),
   })
   .check((ctx) => {
     const { role, vdev, disks } = ctx.value
@@ -588,7 +592,7 @@ export const AttachDiskRequest = z
     /** Target raidz vdev NAME to widen (raidz-expand). Mutually excl. with existingDiskId. */
     targetVdev: z.string().optional(),
     /** New disk to add (by-id). */
-    newDiskId: z.string(),
+    newDiskId: DiskId,
     /** true = replace (leaf only); false = attach mirror leg / raidz-expand. */
     replace: z.boolean().default(false),
   })

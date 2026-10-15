@@ -83,10 +83,10 @@ describe('import pool endpoint: /v1/pools/import', () => {
     const job = await waitForJob(server, body.job.id)
     assert.equal(job.status, 'completed')
 
-    assert.deepEqual(importCall(calls), ['import', 'oldtank'])
+    assert.deepEqual(importCall(calls), ['import', '--', 'oldtank'])
   })
 
-  it('POST with force adds the -f flag', async () => {
+  it('POST with force without a confirm code is a 409 naming the cross-host risk, and no zpool command runs (cr.12)', async () => {
     server = createServer({ mock: true, logger: false })
     const calls = spyExecutor(server)
 
@@ -97,11 +97,77 @@ describe('import pool endpoint: /v1/pools/import', () => {
       payload: JSON.stringify({ name: 'oldtank', force: true }),
     })
 
+    assert.equal(res.statusCode, 409)
+    const body = res.json() as { error: { code: string, warnings?: string[] } }
+    assert.equal(body.error.code, 'CONFIRMATION_REQUIRED')
+    assert.ok(res.headers['x-anas-confirm-code'], 'a confirm code is offered for the resend')
+    assert.ok(
+      body.error.warnings?.some(w => w.includes('active on another host')),
+      `the corruption warning names the cross-host risk: ${JSON.stringify(body.error.warnings)}`,
+    )
+    assert.equal(importCall(calls), undefined, 'force without a confirm never reaches zpool')
+  })
+
+  it('POST with force resent with the confirm code proceeds, and the argv carries -f (cr.12)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = spyExecutor(server)
+
+    const first = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'oldtank', force: true }),
+    })
+    assert.equal(first.statusCode, 409)
+    const code = first.headers['x-anas-confirm-code'] as string
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'oldtank', force: true }),
+    })
+
     assert.equal(res.statusCode, 202)
     const body = res.json() as JobAccepted
-    await waitForJob(server, body.job.id)
+    const job = await waitForJob(server, body.job.id)
+    assert.equal(job.status, 'completed')
+    assert.deepEqual(importCall(calls), ['import', '-f', '--', 'oldtank'])
+  })
 
-    assert.deepEqual(importCall(calls), ['import', '-f', 'oldtank'])
+  it('rejects a hostile pool name with 400 and no zpool command (cr.12)', async () => {
+    // '-aDf' would read as zpool import's own flags (-a -D -f) if it ever
+    // reached argv unvalidated — the schema refuses it at the boundary.
+    server = createServer({ mock: true, logger: false })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: '-aDf' }),
+    })
+
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(importCall(calls), undefined)
+    assert.equal(calls.filter(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'import' && c.args.length > 1).length, 0)
+  })
+
+  it('rejects a guid that is not decimal digits with 400 (cr.12)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ guid: '1 2' }),
+    })
+
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(importCall(calls), undefined)
   })
 
   it('POST with a guid imports by numeric identifier', async () => {
@@ -119,7 +185,7 @@ describe('import pool endpoint: /v1/pools/import', () => {
     const body = res.json() as JobAccepted
     await waitForJob(server, body.job.id)
 
-    assert.deepEqual(importCall(calls), ['import', '9876543210987654321'])
+    assert.deepEqual(importCall(calls), ['import', '--', '9876543210987654321'])
   })
 
   it('returns 400 when neither name nor guid is given', async () => {

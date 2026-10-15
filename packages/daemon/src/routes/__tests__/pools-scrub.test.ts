@@ -89,7 +89,7 @@ describe('scrub endpoint: POST /v1/pools/:name/scrub', () => {
     await waitForJob(server, (stop.json() as JobAccepted).job.id)
     const stopCall = calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'scrub')
     assert.ok(stopCall, 'zpool scrub was invoked for stop')
-    assert.deepEqual(stopCall!.args, ['scrub', '-s', 'testpool'])
+    assert.deepEqual(stopCall!.args, ['scrub', '-s', '--', 'testpool'])
 
     calls.length = 0
     const start = await server.inject({
@@ -101,7 +101,7 @@ describe('scrub endpoint: POST /v1/pools/:name/scrub', () => {
     await waitForJob(server, (start.json() as JobAccepted).job.id)
     const startCall = calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'scrub')
     assert.ok(startCall, 'zpool scrub was invoked for start')
-    assert.deepEqual(startCall!.args, ['scrub', 'testpool'])
+    assert.deepEqual(startCall!.args, ['scrub', '--', 'testpool'])
   })
 
   it('rejects requests without identity headers', async () => {
@@ -165,7 +165,7 @@ describe('scrub endpoint: POST /v1/pools/:name/scrub', () => {
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({
       command: '/usr/sbin/zpool',
-      args: ['scrub', 'testpool'],
+      args: ['scrub', '--', 'testpool'],
       result: { stdout: '', stderr: 'cannot scrub testpool: currently scrubbing', exitCode: 1 },
     })
 

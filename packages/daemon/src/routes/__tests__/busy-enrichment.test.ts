@@ -88,7 +88,7 @@ describe('3.29 — ZFS pool destroy job surfaces the holding processes', () => {
     // The destroy fails busy — the exact pve5 error shape (names its own path).
     executor.addFixture({
       command: '/usr/sbin/zpool',
-      args: ['destroy', 'testpool'],
+      args: ['destroy', '--', 'testpool'],
       result: { stdout: '', stderr: `cannot unmount '/testpool': pool or dataset is busy`, exitCode: 1 },
     })
     // fuser names THIS test process as the holder → /proc/<pid>/comm resolves real.

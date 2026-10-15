@@ -8,6 +8,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
+import { serveBlankInventoryDisks } from './inventory-stub.js'
+
+// cr.12: the composer refuses disk ids the inventory does not know, so the
+// invented d1/d2 these create pins use are served as blank, available disks.
+const DISK_IDS = ['d1', 'd2']
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -55,6 +60,7 @@ describe('create pool: mountpoint override (3.27)', () => {
 
   it('passes -m <mountpoint> to zpool create when overridden', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
     const calls = spyExecutor(server)
     const res = await server.inject({
       method: 'POST',
@@ -75,6 +81,7 @@ describe('create pool: mountpoint override (3.27)', () => {
       'autoexpand=on',
       '-m',
       '/srv/tank',
+      '--',
       'newpool',
       'mirror',
       '/dev/disk/by-id/d1',
@@ -84,6 +91,7 @@ describe('create pool: mountpoint override (3.27)', () => {
 
   it('omits -m entirely when no mountpoint is given (ZFS default /<pool>)', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
     const calls = spyExecutor(server)
     const res = await server.inject({
       method: 'POST',
@@ -218,7 +226,7 @@ describe('change pool mountpoint: PUT /v1/pools/:name/mountpoint (3.27)', () => 
     const mock = (server as unknown as { executor: MockExecutor }).executor
     mock.addFixture({
       command: '/usr/sbin/zfs',
-      args: ['get', '-Hp', '-r', '-o', 'name,value,source', 'mountpoint', 'testpool'],
+      args: ['get', '-Hp', '-r', '-o', 'name,value,source', 'mountpoint', '--', 'testpool'],
       result: { stdout: 'testpool\t/testpool\tdefault\ntestpool/media\t/mnt/media\tlocal\n', stderr: '', exitCode: 0 },
     })
     const calls = spyExecutor(server)
@@ -253,7 +261,7 @@ describe('change pool mountpoint: PUT /v1/pools/:name/mountpoint (3.27)', () => 
     assert.equal(job.operation, 'zpool.mountpoint')
     // The mechanic is ZFS-native — a single `zfs set mountpoint=<path> <pool>`.
     const setCall = calls.find(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'set')
-    assert.deepEqual(setCall?.args, ['set', 'mountpoint=/srv/newhome', 'testpool'])
+    assert.deepEqual(setCall?.args, ['set', '--', 'mountpoint=/srv/newhome', 'testpool'])
   })
 })
 

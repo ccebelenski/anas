@@ -343,7 +343,7 @@ describe('runNewLunImageRestore — the happy sequence, as an exact call log', (
       assert.equal(wwnOf(mock), serial, 'the wwn= at create IS the reported serial')
 
       assert.deepEqual(mock.calls.map(c => `${c.command} ${c.args.join(' ')}`), [
-        `${ZFS} create -s -V ${IMAGE_SIZE} tank/newvol`,
+        `${ZFS} create -s -V ${IMAGE_SIZE} -- tank/newvol`,
         `${TARGETCLI} /backstores/block create name=newvol dev=/dev/zvol/tank/newvol wwn=${serial}`,
         // Every attribute BEFORE the map — block_size would stop working after it.
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_tpu=1`,
@@ -458,7 +458,7 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
 
       const serial = wwnOf(mock)
       assert.deepEqual(mock.calls.map(c => `${c.command} ${c.args.join(' ')}`), [
-        `${ZFS} create -s -V ${IMAGE_SIZE} tank/newvol`,
+        `${ZFS} create -s -V ${IMAGE_SIZE} -- tank/newvol`,
         `${TARGETCLI} /backstores/block create name=newvol dev=/dev/zvol/tank/newvol wwn=${serial}`,
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_tpu=1`,
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_tpws=1`,
@@ -694,6 +694,6 @@ describe('runNewLunImageRestore — where the iSCSI lock is held, and where it i
 
 describe('newLunZvolCreateArgs — the dataset door\'s volume-create argv, not a second copy', () => {
   it('a sparse volume of exactly the image\'s size', () => {
-    assert.deepEqual(newLunZvolCreateArgs('tank/newvol', 536870912), ['create', '-s', '-V', '536870912', 'tank/newvol'])
+    assert.deepEqual(newLunZvolCreateArgs('tank/newvol', 536870912), ['create', '-s', '-V', '536870912', '--', 'tank/newvol'])
   })
 })

@@ -86,7 +86,7 @@ describe('upgrade endpoint: POST /v1/pools/:name/upgrade', () => {
 
     const upgradeCall = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'upgrade')
     assert.ok(upgradeCall, 'zpool upgrade was invoked')
-    assert.deepEqual(upgradeCall!.args, ['upgrade', 'testpool'])
+    assert.deepEqual(upgradeCall!.args, ['upgrade', '--', 'testpool'])
   })
 
   it('returns 404 for a pool that does not exist', async () => {

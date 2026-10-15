@@ -5,6 +5,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
+import { serveBlankInventoryDisks } from './inventory-stub.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -17,6 +18,9 @@ const ZFS = '/usr/sbin/zfs'
 const BY_ID = '/dev/disk/by-id/'
 const NEW_DISK = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT4'
 const D1 = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1'
+// cr.12: the pre-flight refuses ids the inventory does not know — the invented
+// NEW disks are served as blank, available disks (see inventory-stub.ts).
+const NEW_IDS = [NEW_DISK, 'ata-WDC_WD2003FZEX-00SRLA0_WD-99999999']
 
 async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
   for (let i = 0; i < 50; i++) {
@@ -122,6 +126,7 @@ describe('pool expansion (story 3.31)', () => {
   // --- GET /pools/:name/expansion ------------------------------------------
   it('GET expansion reports a raidz-expand target with honest capacity', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     seedRaidz(server)
 
     const res = await server.inject({ method: 'GET', url: `/v1/pools/${RZ}/expansion`, headers: IDENTITY_HEADERS })
@@ -144,6 +149,7 @@ describe('pool expansion (story 3.31)', () => {
 
   it('GET expansion marks targets not-allowed (version) on old ZFS', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     seedRaidz(server, { version: '2.2.6' })
 
     const res = await server.inject({ method: 'GET', url: `/v1/pools/${RZ}/expansion`, headers: IDENTITY_HEADERS })
@@ -156,6 +162,7 @@ describe('pool expansion (story 3.31)', () => {
   // --- raidz-expand dispatch ------------------------------------------------
   it('raidz-expand dispatches `zpool attach <pool> <raidz-vdev> <new>`', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     seedRaidz(server)
     const spy = spyExecutor(server)
 
@@ -173,11 +180,12 @@ describe('pool expansion (story 3.31)', () => {
 
     const call = spy.calls.find(c => c.command === ZPOOL && c.args[0] === 'attach')
     assert.ok(call, 'zpool attach was invoked')
-    assert.deepEqual(call!.args, ['attach', RZ, 'raidz1-0', `${BY_ID}${NEW_DISK}`])
+    assert.deepEqual(call!.args, ['attach', '--', RZ, 'raidz1-0', `${BY_ID}${NEW_DISK}`])
   })
 
   it('raidz-expand refuses on OpenZFS < 2.3.0 (version gate)', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     seedRaidz(server, { version: '2.2.6' })
 
     const res = await server.inject({
@@ -194,6 +202,7 @@ describe('pool expansion (story 3.31)', () => {
 
   it('raidz-expand refuses when feature@raidz_expansion is disabled (flag gate)', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     seedRaidz(server, { feature: 'disabled' })
 
     const res = await server.inject({
@@ -210,6 +219,7 @@ describe('pool expansion (story 3.31)', () => {
 
   it('raidz-expand refuses while a reflow is in progress (busy gate)', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     seedRaidz(server, { status: raidzStatus({ reflow: true }) })
 
     const res = await server.inject({
@@ -226,6 +236,7 @@ describe('pool expansion (story 3.31)', () => {
 
   it('raidz-expand rejects a non-raidz target vdev', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     seedRaidz(server)
 
     // Ask to raidz-expand a name that exists but is not raidz — swap in a mirror
@@ -248,6 +259,7 @@ describe('pool expansion (story 3.31)', () => {
     // Default testpool fixtures = two mirrors, scan FINISHED (not busy). No
     // version fixture is even consulted for a mirror-attach.
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -266,6 +278,7 @@ describe('pool expansion (story 3.31)', () => {
 
   it('mirror-attach refuses while a resilver runs (busy gate)', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     seedRaidz(server, { status: raidzStatus({ resilver: true }) })
 
     const res = await server.inject({
@@ -281,6 +294,7 @@ describe('pool expansion (story 3.31)', () => {
   // --- replace + online -e side-effect (3.31a) -----------------------------
   it('replace runs `zpool online -e` on the new device afterward', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     const spy = spyExecutor(server)
 
     const res = await server.inject({
@@ -297,11 +311,12 @@ describe('pool expansion (story 3.31)', () => {
 
     const online = spy.calls.find(c => c.command === ZPOOL && c.args[0] === 'online')
     assert.ok(online, 'zpool online -e was invoked after replace')
-    assert.deepEqual(online!.args, ['online', '-e', 'testpool', `${BY_ID}ata-WDC_WD2003FZEX-00SRLA0_WD-99999999`])
+    assert.deepEqual(online!.args, ['online', '-e', '--', 'testpool', `${BY_ID}ata-WDC_WD2003FZEX-00SRLA0_WD-99999999`])
   })
 
   it('rejects a request carrying neither existingDiskId nor targetVdev', async () => {
     server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, NEW_IDS)
     const res = await server.inject({
       method: 'POST',
       url: '/v1/pools/testpool/attach',

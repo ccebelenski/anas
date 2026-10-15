@@ -78,7 +78,7 @@ function baseExecutor(pool: string, status: string, listing: string, guid: ExecR
   const ex = new MockExecutor()
   ex.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: listJson(pool), stderr: '', exitCode: 0 } })
   ex.addFixture({ command: ZPOOL, args: ['status', '-jv'], result: { stdout: status, stderr: '', exitCode: 0 } })
-  ex.addFixture({ command: ZPOOL, args: ['destroy', pool], result: OK })
+  ex.addFixture({ command: ZPOOL, args: ['destroy', '--', pool], result: OK })
   ex.addFixture({ command: '/usr/bin/ls', args: ['-la', BY_ID], result: { stdout: listing, stderr: '', exitCode: 0 } })
   // ident.1: the pool guid the confirm binds, and the label every leaf carries.
   ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', pool], results: guid })
@@ -174,7 +174,7 @@ describe('destroy cleanup: labelclear + ownership-guarded GPT zap (story 3.14)',
     const zap = idx(c => c.command === SGDISK && c.args[0] === '--zap-all')
     const diskWipe = idx(c => c.command === WIPEFS && !c.args.includes('--force') && c.args.at(-1) === `${BY_ID}ata-EXCL`)
     assert.ok(lc >= 0 && leafWipe >= 0 && zap >= 0 && diskWipe >= 0, 'all four steps ran')
-    assert.deepEqual(ex.calls[lc].args, ['labelclear', '-f', `${BY_ID}ata-EXCL-part1`])
+    assert.deepEqual(ex.calls[lc].args, ['labelclear', '-f', '--', `${BY_ID}ata-EXCL-part1`])
     assert.deepEqual(ex.calls[zap].args, ['--zap-all', `${BY_ID}ata-EXCL`])
     // labelclear BEFORE zap; leaf cleared before whole-disk touched.
     assert.ok(lc < zap, 'labelclear precedes sgdisk zap')
@@ -212,7 +212,7 @@ describe('destroy cleanup: labelclear + ownership-guarded GPT zap (story 3.14)',
       const foreignTouch = ex.calls.find(c => c.args.some(a => a.includes('sdy2') || a.includes('ata-SHARED-part2')))
       assert.equal(foreignTouch, undefined, 'the foreign partition was never touched')
       // But the leaf WAS cleared.
-      assert.ok(ex.calls.some(c => c.command === ZPOOL && c.args[0] === 'labelclear' && c.args[2] === `${BY_ID}ata-SHARED-part1`))
+      assert.ok(ex.calls.some(c => c.command === ZPOOL && c.args[0] === 'labelclear' && c.args.at(-1) === `${BY_ID}ata-SHARED-part1`))
     })
   }
 
@@ -240,7 +240,7 @@ describe('destroy cleanup: labelclear + ownership-guarded GPT zap (story 3.14)',
     const listing = byIdListing([['ata-LC', 'sdw'], ['ata-LC-part1', 'sdw1']])
     const ex = baseExecutor('lcfail', status, listing)
     // labelclear fails on this exact leaf.
-    ex.addFixture({ command: ZPOOL, args: ['labelclear', '-f', `${BY_ID}ata-LC-part1`], result: { stdout: '', stderr: 'failed to clear label', exitCode: 1 } })
+    ex.addFixture({ command: ZPOOL, args: ['labelclear', '-f', '--', `${BY_ID}ata-LC-part1`], result: { stdout: '', stderr: 'failed to clear label', exitCode: 1 } })
     ex.addFixture({ command: LSBLK, args: ['-Jb', '-o', 'NAME,TYPE,FSTYPE,MOUNTPOINT', `${BY_ID}ata-LC`], result: {
       stdout: ownLsblk('sdw', [{ name: 'sdw1' }]),
       stderr: '',
@@ -323,7 +323,7 @@ describe('destroy cleanup: labelclear + ownership-guarded GPT zap (story 3.14)',
     assert.deepEqual(r.wiped, [PARTUUID])
     assert.deepEqual(r.preserved, [{ disk: 'loop7', reason: 'shared' }])
     // labelclear + wipefs hit the partition path only; nothing touched a whole disk.
-    assert.deepEqual(ex.calls.find(c => c.command === ZPOOL && c.args[0] === 'labelclear')?.args, ['labelclear', '-f', PARTUUID])
+    assert.deepEqual(ex.calls.find(c => c.command === ZPOOL && c.args[0] === 'labelclear')?.args, ['labelclear', '-f', '--', PARTUUID])
     const wipes = ex.calls.filter(c => c.command === WIPEFS).map(c => c.args.at(-1))
     assert.deepEqual(wipes, [PARTUUID])
     assert.equal(ex.calls.find(c => c.command === SGDISK), undefined)

@@ -153,8 +153,8 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', 'all', '-j'], result: mockFixtures.zpoolGetAll('testpool') })
-    mock.addFixture({ command: '/usr/sbin/zpool', args: ['scrub', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: '/usr/sbin/zpool', args: ['scrub', '-s', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['scrub', '--', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['scrub', '-s', '--', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: mockFixtures.lsblk() })
     mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     mock.addFixture({ command: '/usr/sbin/smartctl', result: mockFixtures.smartctl() })
@@ -177,9 +177,9 @@ export function createServer(opts?: ServerOptions) {
       mock.addFixture({ command: '/usr/sbin/zpool', args: ['set', kv, 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
     }
     // Export / destroy (stories 3.13/3.14)
-    mock.addFixture({ command: '/usr/sbin/zpool', args: ['export', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: '/usr/sbin/zpool', args: ['export', '-f', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: '/usr/sbin/zpool', args: ['destroy', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['export', '--', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['export', '-f', '--', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['destroy', '--', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
     // Disk cleanup after destroy (story 3.14 cleanup option) — wipefs any device.
     mock.addFixture({ command: '/usr/sbin/wipefs', result: { stdout: '', stderr: '', exitCode: 0 } })
     // Story ident.1: the pool's guid (bound into the destroy/export confirm and
@@ -219,6 +219,10 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['version'], result: { stdout: 'zfs-2.3.1-1\nzfs-kmod-2.3.1-1\n', stderr: '', exitCode: 0 } })
     // Pool root mountpoint + mounted flag (story 3.27 — the grid's Mount column).
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint,mounted'], result: { stdout: 'testpool\t/testpool\tyes\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-j', 'all', '--', 'testpool/media'], result: mockFixtures.zfsGetMedia() })
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-j', 'all', '--', 'testpool'], result: mockFixtures.zfsGetAll() })
+    // cr.12: the route reads moved to `get -j all -- <name>`; the access
+    // service's own read (services/access.ts) keeps its shape — serve both.
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-j', 'all', 'testpool/media'], result: mockFixtures.zfsGetMedia() })
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-j', 'all', 'testpool'], result: mockFixtures.zfsGetAll() })
     // Mountpoint stat for the media dataset's permissions.
