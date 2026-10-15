@@ -1,4 +1,5 @@
 import type { BackupTask, CloudSyncTask, ReplicationTask, SnapshotSchedule } from '@anas/shared'
+import type { PoolReferenceKind } from '../pool-references.js'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -7,8 +8,11 @@ import { afterEach, describe, it } from 'node:test'
 import { renderServiceUnit as renderBackupService } from '../backup-units.js'
 import { renderServiceUnit as renderCloudService } from '../cloud-units.js'
 import {
+  mountReferenceWarning,
+  mountUnreadableWarning,
   poolReferenceWarning,
   poolReferenceWarnings,
+  readMountReferences,
   readPoolReferences,
 } from '../pool-references.js'
 import { renderServiceUnit as renderReplicationService } from '../replication-units.js'
@@ -331,6 +335,79 @@ describe('pool-references — unreadable sources are disclosed, never skipped', 
     })
     assert.deepEqual(refs.map(r => r.kind), ['smb', 'nfs'])
     assert.deepEqual(unreadableSources, [])
+  })
+
+  it('cr.39: `kinds` reads only the named kinds — the others are neither listed nor disclosed as unreadable', async () => {
+    const f = await track(await makeFixtures())
+    await writeTaskUnits(f)
+    const read = (kinds: PoolReferenceKind[]) => readPoolReferences({
+      executor: {} as never,
+      pool: 'tank',
+      paths: ['/tank'],
+      smbConfPath: f.smbConfPath,
+      exportsPath: f.exportsPath,
+      systemdDir: f.systemdDir,
+      fstabPath: f.fstabPath,
+      kinds: new Set(kinds),
+    })
+    assert.deepEqual((await read(['smb', 'backup'])).refs.map(r => r.kind).sort(), ['backup', 'smb'])
+    // An unreadable unit store is disclosed only for the kinds asked about.
+    await rm(f.systemdDir, { recursive: true, force: true })
+    await writeFile(f.systemdDir, 'not a directory', 'utf-8')
+    assert.deepEqual((await read(['backup', 'cloud'])).unreadableSources.map(s => s.kind).sort(), ['backup', 'cloud'])
+    assert.deepEqual((await read(['smb'])).unreadableSources, [])
+  })
+})
+
+describe('pool-references — what rides a MOUNT\'s path (cr.39)', () => {
+  /** An NFS mount at /mnt/nas: a share, an export, a backup and a cloud task on it, a mount beneath it. */
+  const MP = '/mnt/nas'
+  const MOUNT_FIXTURES = {
+    smb: SMB_TEMPLATE.replace('path = /tank/media', `path = ${MP}/media`),
+    exports: EXPORTS_TEMPLATE.replace('/tank/nfs-media', `${MP}/nfs-media`),
+    fstab: `${FSTAB_TEMPLATE}10.0.0.9:/export ${MP} nfs4 defaults,nofail 0 0\n//127.0.0.1/sub ${MP}/sub cifs guest,nofail 0 0\n`,
+  }
+
+  it('lists the share, the export, the path-sourced tasks and a nested mount — never the mount\'s own line, never a dataset-matched kind', async () => {
+    const f = await track(await makeFixtures(MOUNT_FIXTURES))
+    await writeFile(join(f.systemdDir, 'anas-backup-nas.service'), renderBackupService({ ...BACKUP_TASK, name: 'nas', backupId: 'nas', archives: [{ name: 'media', path: `${MP}/media`, excludes: [] }] }), 'utf-8')
+    await writeFile(join(f.systemdDir, 'anas-cloud-nas.service'), renderCloudService({ ...CLOUD_TASK, name: 'nas-sync', source: `${MP}/media` }), 'utf-8')
+    // A replication task and a snapshot schedule exist; they address datasets, which a mount path never is.
+    await writeFile(join(f.systemdDir, 'anas-repl-media-repl.service'), renderReplicationService(REPLICATION_TASK), 'utf-8')
+    await writeFile(join(f.systemdDir, 'anas-snap-media-hourly.service'), renderSnapshotService(SNAPSHOT_SCHEDULE), 'utf-8')
+
+    const { refs, unreadableSources } = await readMountReferences({
+      executor: {} as never,
+      mountpoint: MP,
+      smbConfPath: f.smbConfPath,
+      exportsPath: f.exportsPath,
+      systemdDir: f.systemdDir,
+      fstabPath: f.fstabPath,
+    })
+    assert.deepEqual(unreadableSources, [])
+    assert.deepEqual(refs.map(r => [r.kind, r.name, r.path]), [
+      ['smb', 'media', `${MP}/media`],
+      ['nfs', `${MP}/nfs-media`, `${MP}/nfs-media`],
+      ['backup', 'nas', `${MP}/media`],
+      ['cloud', 'nas-sync', `${MP}/media`],
+      ['mount', `${MP}/sub`, `${MP}/sub`],
+    ])
+    assert.deepEqual(refs.map(mountReferenceWarning), [
+      `SMB share 'media' serves '${MP}/media', which is on this mount, and stops working while it is not mounted`,
+      `NFS export '${MP}/nfs-media' serves a path on this mount and stops working while it is not mounted`,
+      `Backup task 'nas' backs up '${MP}/media', which is on this mount - its source is missing while it is not mounted`,
+      `Cloud-sync task 'nas-sync' syncs '${MP}/media', which is on this mount - its source is missing while it is not mounted`,
+      `Mount '${MP}/sub' is mounted beneath this mount and stops working with it`,
+    ])
+  })
+
+  it('an unreadable source is disclosed with the mount-worded sentence', async () => {
+    const f = await track(await makeFixtures(MOUNT_FIXTURES))
+    await rm(f.smbConfPath, { force: true })
+    await mkdir(f.smbConfPath)
+    const { unreadableSources } = await readMountReferences({ executor: {} as never, mountpoint: MP, smbConfPath: f.smbConfPath })
+    assert.deepEqual(unreadableSources, [{ kind: 'smb', unreadable: true }])
+    assert.equal(mountUnreadableWarning(unreadableSources[0], MP), `ANAS could not read smb.conf, so it could not check whether an SMB share serves a path on '${MP}'. If this node has SMB shares, verify their paths before confirming.`)
   })
 })
 

@@ -790,7 +790,7 @@ export function createServer(opts?: ServerOptions) {
   server.register(scrubRoutes, { prefix: '/v1', executor, jobQueue, systemdDir })
   // Mounts (Epic 18) — external & local storage. fstab round-trip + findmnt
   // inventory + PVE-tagged hands-off + guarded status probe.
-  server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath, mdadmConfPath, iscsiPaths })
+  server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath, mdadmConfPath, iscsiPaths, smbConfPath, exportsPath, systemdDir })
   // iSCSI reads (iscsi epic, story iscsi.2) — LIO's persisted saveconfig.json
   // joined against live configfs. Read-only; every mutation is iscsi.4's. The
   // paths default inside the service to the real host locations and are

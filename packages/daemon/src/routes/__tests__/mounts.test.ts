@@ -45,6 +45,17 @@ async function waitForJob(server: { inject: FastifyInstance['inject'] }, id: str
   throw new Error(`Job ${id} did not finish`)
 }
 
+/**
+ * Story cr.39: a Remove ALWAYS confirms (it deletes the line, the credentials
+ * file and, opted in, the directory). Challenge, then resend with the code.
+ */
+async function confirmedDelete(app: { inject: FastifyInstance['inject'] }, url: string): Promise<Awaited<ReturnType<FastifyInstance['inject']>>> {
+  const first = await app.inject({ method: 'DELETE', url, headers: IDENTITY_HEADERS })
+  assert.equal(first.statusCode, 409, first.payload)
+  assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+  return app.inject({ method: 'DELETE', url, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
+}
+
 describe('mount routes (Epic 18)', () => {
   let server: ReturnType<typeof createServer> | undefined
   let dir: string
@@ -836,7 +847,7 @@ describe('mount routes (Epic 18)', () => {
 
   describe('DELETE /v1/mounts/:mountpoint', () => {
     it('unmounts + drops the fstab entry (202)', async () => {
-      const res = await server!.inject({ method: 'DELETE', url: `/v1/mounts/${enc('/mnt/anas-nfs')}`, headers: IDENTITY_HEADERS })
+      const res = await confirmedDelete(server!, `/v1/mounts/${enc('/mnt/anas-nfs')}`)
       assert.equal(res.statusCode, 202)
       const job = await waitForJob(server!, res.json().job.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
@@ -871,7 +882,7 @@ describe('mount routes (Epic 18)', () => {
 
     /** DELETE the mount, optionally with the flag, and wait for its job. */
     async function deleteMount(mountpoint: string, query = ''): Promise<Job> {
-      const res = await server!.inject({ method: 'DELETE', url: `/v1/mounts/${enc(mountpoint)}${query}`, headers: IDENTITY_HEADERS })
+      const res = await confirmedDelete(server!, `/v1/mounts/${enc(mountpoint)}${query}`)
       assert.equal(res.statusCode, 202)
       return waitForJob(server!, res.json().job.id)
     }
@@ -1468,8 +1479,9 @@ describe('mount mutations act only on what is actually there (ident.4 (e))', () 
 
   it('the job re-checks: a local disk mounted after the request fails the job, not the disk', async () => {
     // Request time: the share is there. Job time: a local disk sits there instead.
+    // cr.39: one read per guard run — the challenge, the confirmed resend, the job.
     h = await createEditServer(cifsFstab, [THE_SHARE, THE_SHARE, LOCAL_DISK])
-    const res = await h.app.inject({ method: 'DELETE', url: `/v1/mounts/${enc(CIFS_MP)}`, headers: IDENTITY_HEADERS })
+    const res = await confirmedDelete(h.app, `/v1/mounts/${enc(CIFS_MP)}`)
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(h.app, res.json().job.id)
     assert.equal(job.status, 'failed')
@@ -1479,7 +1491,7 @@ describe('mount mutations act only on what is actually there (ident.4 (e))', () 
 
   it('the configured share itself unmounts and removes as before', async () => {
     h = await createEditServer(cifsFstab, [THE_SHARE, THE_SHARE, THE_SHARE, findmntJson([])])
-    const res = await h.app.inject({ method: 'DELETE', url: `/v1/mounts/${enc(CIFS_MP)}`, headers: IDENTITY_HEADERS })
+    const res = await confirmedDelete(h.app, `/v1/mounts/${enc(CIFS_MP)}`)
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(h.app, res.json().job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
@@ -1498,7 +1510,7 @@ describe('mount Remove — the credentials file (ident.4 (d))', () => {
   })
 
   async function remove(mp: string): Promise<Job> {
-    const res = await h!.app.inject({ method: 'DELETE', url: `/v1/mounts/${enc(mp)}`, headers: IDENTITY_HEADERS })
+    const res = await confirmedDelete(h!.app, `/v1/mounts/${enc(mp)}`)
     assert.equal(res.statusCode, 202, res.payload)
     return waitForJob(h!.app, res.json().job.id)
   }
@@ -1655,7 +1667,7 @@ describe('mount Disable / Remove stop an automount line\'s .automount unit (cr.1
   async function act(method: 'POST' | 'DELETE', mp = AUTO_MP): Promise<Job> {
     const res = method === 'POST'
       ? await h!.app.inject({ method, url: `/v1/mounts/${enc(mp)}/state`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ action: 'disable' }) })
-      : await h!.app.inject({ method, url: `/v1/mounts/${enc(mp)}`, headers: IDENTITY_HEADERS })
+      : await confirmedDelete(h!.app, `/v1/mounts/${enc(mp)}`)
     assert.equal(res.statusCode, 202, res.payload)
     return waitForJob(h!.app, res.json().job.id)
   }

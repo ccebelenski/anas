@@ -24,7 +24,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, normalize, resolve } from 'node:path'
 import { MountCifsSec, MountExtraOptions, MountNfsSec, normalizeMountTarget, unescapeFstabField } from '@anas/shared'
 import { classifyKind, isIgnoredMount, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
-import { cifsAuthToken, getMount, inlineCommentIndex, parseFstab } from '../parsers/fstab.js'
+import { cifsAuthToken, getMount, inlineCommentIndex, parseFstab, parseFstabDoc } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
 import { readPveMountPaths } from '../parsers/pve-storage.js'
@@ -1568,4 +1568,17 @@ export function systemMountTargetConflict(mountpoint: string): string | null {
 /** Does the fstab already define this mountpoint? */
 export function fstabHasMount(fstabText: string, mountpoint: string): boolean {
   return parseFstab(fstabText).some(e => e.mountpoint === mountpoint)
+}
+
+/**
+ * Story cr.39 (WAVE3-DESIGN §3.3, Mount row): the REVISION of a mount's
+ * fstab line — a sha256 of its raw bytes, whichever form it is in (active, the
+ * new-form disabled line, an old `#ANAS ` line). An edit is computed from the
+ * line as the request read it; the job compares this before it writes the
+ * merged line, so a line changed in between is never overwritten with a merge
+ * of its old self. Null when the file has no line for the mountpoint.
+ */
+export function fstabLineRevision(fstabText: string, mountpoint: string): string | null {
+  const line = parseFstabDoc(fstabText).find(l => l.kind === 'entry' && l.entry.mountpoint === mountpoint)
+  return line ? createHash('sha256').update(line.raw).digest('hex') : null
 }

@@ -118,6 +118,14 @@ export interface PoolReferenceContext {
    *    is a dataset of this pool is the pool's own dataset, not a reference.
    */
   ownMounts?: { mountpoints?: string[], zfsDatasets?: boolean }
+  /**
+   * Story cr.39: read ONLY these kinds (absent = every kind the paths above
+   * enable). A mount's path is not in any pool's dataset namespace, so the
+   * dataset-matched kinds (replication, snapshot and scrub schedules) cannot
+   * reference it — reading their stores would only add "could not check"
+   * disclosures for references that cannot exist.
+   */
+  kinds?: ReadonlySet<PoolReferenceKind>
 }
 
 /**
@@ -172,12 +180,13 @@ export async function readPoolReferences(ctx: PoolReferenceContext): Promise<Poo
   const refs: PoolReference[] = []
   const unreadableSources: UnreadablePoolSource[] = []
   const onPoolPath = (path: string) => pathAtOrUnder(path, ctx.paths)
+  const wanted = (kind: PoolReferenceKind): boolean => !ctx.kinds || ctx.kinds.has(kind)
 
   // --- SMB shares (smb.conf) + NFS exports (/etc/exports) -------------------
   // readConfig throws on anything but ENOENT; an ABSENT file genuinely has no
   // shares/exports (the "samba removed" case in share-identity.ts is this exact
   // reading), so only a real read failure is an unreadable source.
-  if (ctx.smbConfPath) {
+  if (ctx.smbConfPath && wanted('smb')) {
     const smbText = await readConfigOr(ctx.smbConfPath)
     if (smbText.readable) {
       for (const share of parseSmbConf(smbText.text).shares) {
@@ -190,7 +199,7 @@ export async function readPoolReferences(ctx: PoolReferenceContext): Promise<Poo
     }
   }
 
-  if (ctx.exportsPath) {
+  if (ctx.exportsPath && wanted('nfs')) {
     const exportsText = await readConfigOr(ctx.exportsPath)
     if (exportsText.readable) {
       for (const exp of parseExports(exportsText.text)) {
@@ -205,79 +214,90 @@ export async function readPoolReferences(ctx: PoolReferenceContext): Promise<Poo
 
   // --- Unit-store kinds (backup, cloud, replication, schedules, AHR scrub) --
   if (ctx.systemdDir) {
-    const backup = await readAllBackupTasks(ctx.systemdDir)
-    const backupListed = await listServiceUnitsChecked(ctx.systemdDir, BACKUP_UNIT_KIND.prefix)
-    if (!backupListed.complete)
-      unreadableSources.push({ kind: 'backup', unreadable: true })
-    for (const task of backup) {
-      for (const archive of task.archives ?? []) {
-        if (onPoolPath(archive.path)) {
-          refs.push({ kind: 'backup', name: task.name, path: archive.path })
-        }
-        else if (effectiveArchiveKind(archive) === 'img') {
-          // An `img` archive's source may be a ZVOL DEVICE (`/dev/zvol/<pool>/<vol>`),
-          // which is not a path under a mountpoint — match it by its dataset name.
-          const dataset = zvolDatasetFromPath(archive.path)
-          if (dataset && datasetOnPool(dataset, ctx.pool))
+    const dir = ctx.systemdDir
+    if (wanted('backup')) {
+      const backup = await readAllBackupTasks(dir)
+      const backupListed = await listServiceUnitsChecked(dir, BACKUP_UNIT_KIND.prefix)
+      if (!backupListed.complete)
+        unreadableSources.push({ kind: 'backup', unreadable: true })
+      for (const task of backup) {
+        for (const archive of task.archives ?? []) {
+          if (onPoolPath(archive.path)) {
             refs.push({ kind: 'backup', name: task.name, path: archive.path })
+          }
+          else if (effectiveArchiveKind(archive) === 'img') {
+            // An `img` archive's source may be a ZVOL DEVICE (`/dev/zvol/<pool>/<vol>`),
+            // which is not a path under a mountpoint — match it by its dataset name.
+            const dataset = zvolDatasetFromPath(archive.path)
+            if (dataset && datasetOnPool(dataset, ctx.pool))
+              refs.push({ kind: 'backup', name: task.name, path: archive.path })
+          }
         }
       }
     }
 
-    const cloud = await readAllCloudTasks(ctx.systemdDir)
-    const cloudListed = await listServiceUnitsChecked(ctx.systemdDir, CLOUD_UNIT_KIND.prefix)
-    if (!cloudListed.complete)
-      unreadableSources.push({ kind: 'cloud', unreadable: true })
-    for (const task of cloud) {
-      if (onPoolPath(task.source))
-        refs.push({ kind: 'cloud', name: task.name, path: task.source })
-    }
-
-    const replication = await readAllReplicationTasks(ctx.systemdDir)
-    if (!replication.complete)
-      unreadableSources.push({ kind: 'replication', unreadable: true })
-    for (const task of replication.tasks) {
-      if (task.source.pool === ctx.pool) {
-        const dataset = task.source.dataset === '' ? ctx.pool : `${task.source.pool}/${task.source.dataset}`
-        refs.push({ kind: 'replication', name: task.name, path: dataset })
-      }
-      // A LOCAL target on this pool (stage-3 `location.kind` defaults to local):
-      // a remote target's zfs recv runs on the other node and does not live here.
-      const location = task.target.location
-      if (task.target.pool === ctx.pool && (location === undefined || location.kind === 'local')) {
-        const dataset = task.target.dataset ?? ''
-        const targetPath = dataset === '' ? ctx.pool : `${task.target.pool}/${dataset}`
-        refs.push({ kind: 'replication', name: task.name, path: targetPath })
+    if (wanted('cloud')) {
+      const cloud = await readAllCloudTasks(dir)
+      const cloudListed = await listServiceUnitsChecked(dir, CLOUD_UNIT_KIND.prefix)
+      if (!cloudListed.complete)
+        unreadableSources.push({ kind: 'cloud', unreadable: true })
+      for (const task of cloud) {
+        if (onPoolPath(task.source))
+          refs.push({ kind: 'cloud', name: task.name, path: task.source })
       }
     }
 
-    const schedules = await readScheduleList(ctx.systemdDir)
-    if (!schedules.complete)
-      unreadableSources.push({ kind: 'snapshot-schedule', unreadable: true })
-    for (const schedule of schedules.schedules) {
-      if (schedule.target.kind === 'zfs' && datasetOnPool(schedule.target.dataset, ctx.pool))
-        refs.push({ kind: 'snapshot-schedule', name: schedule.name, path: schedule.target.dataset })
-      if (schedule.target.kind === 'ahr' && schedule.target.pool === ctx.pool)
-        refs.push({ kind: 'snapshot-schedule', name: schedule.name, path: schedule.target.pool })
+    if (wanted('replication')) {
+      const replication = await readAllReplicationTasks(dir)
+      if (!replication.complete)
+        unreadableSources.push({ kind: 'replication', unreadable: true })
+      for (const task of replication.tasks) {
+        if (task.source.pool === ctx.pool) {
+          const dataset = task.source.dataset === '' ? ctx.pool : `${task.source.pool}/${task.source.dataset}`
+          refs.push({ kind: 'replication', name: task.name, path: dataset })
+        }
+        // A LOCAL target on this pool (stage-3 `location.kind` defaults to local):
+        // a remote target's zfs recv runs on the other node and does not live here.
+        const location = task.target.location
+        if (task.target.pool === ctx.pool && (location === undefined || location.kind === 'local')) {
+          const dataset = task.target.dataset ?? ''
+          const targetPath = dataset === '' ? ctx.pool : `${task.target.pool}/${dataset}`
+          refs.push({ kind: 'replication', name: task.name, path: targetPath })
+        }
+      }
+    }
+
+    if (wanted('snapshot-schedule')) {
+      const schedules = await readScheduleList(dir)
+      if (!schedules.complete)
+        unreadableSources.push({ kind: 'snapshot-schedule', unreadable: true })
+      for (const schedule of schedules.schedules) {
+        if (schedule.target.kind === 'zfs' && datasetOnPool(schedule.target.dataset, ctx.pool))
+          refs.push({ kind: 'snapshot-schedule', name: schedule.name, path: schedule.target.dataset })
+        if (schedule.target.kind === 'ahr' && schedule.target.pool === ctx.pool)
+          refs.push({ kind: 'snapshot-schedule', name: schedule.name, path: schedule.target.pool })
+      }
     }
 
     // The node-level AHR scrub timer lists the pools it scrubs. An ABSENT unit
     // is no schedule; an unreadable unit dir, or a unit FILE that exists but
     // does not parse as ours, means the pool list could not be read and is
     // disclosed (never assumed absent).
-    const scrubListed = await listServiceUnitsChecked(ctx.systemdDir, 'anas-scrub')
-    const scrub = await readScrubSchedule(ctx.systemdDir)
-    if (!scrubListed.complete || (scrubListed.files.includes(SCRUB_SERVICE_NAME) && scrub === null)) {
-      unreadableSources.push({ kind: 'scrub-schedule', unreadable: true })
-    }
-    else if (scrub && scrub.pools.includes(ctx.pool)) {
-      refs.push({ kind: 'scrub-schedule', name: 'ANAS scrub timer', path: ctx.pool })
+    if (wanted('scrub-schedule')) {
+      const scrubListed = await listServiceUnitsChecked(dir, 'anas-scrub')
+      const scrub = await readScrubSchedule(dir)
+      if (!scrubListed.complete || (scrubListed.files.includes(SCRUB_SERVICE_NAME) && scrub === null)) {
+        unreadableSources.push({ kind: 'scrub-schedule', unreadable: true })
+      }
+      else if (scrub && scrub.pools.includes(ctx.pool)) {
+        refs.push({ kind: 'scrub-schedule', name: 'ANAS scrub timer', path: ctx.pool })
+      }
     }
   }
 
   // --- ANAS mounts (fstab) whose mountpoint is under the pool — never the
   // pool's own filesystem (cr.31 D3) ------------------------------------------
-  if (ctx.fstabPath) {
+  if (ctx.fstabPath && wanted('mount')) {
     const fstabText = await readConfigOr(ctx.fstabPath)
     if (fstabText.readable) {
       for (const entry of parseFstab(fstabText.text)) {
@@ -368,4 +388,88 @@ export function poolReferenceWarnings(read: PoolReferenceRead, pool: string): st
     ...read.refs.map(poolReferenceWarning),
     ...read.unreadableSources.map(s => poolUnreadableWarning(s, pool)),
   ]
+}
+
+// ---------------------------------------------------------------------------
+// Story cr.39 — what rides a MOUNT's path (EPICS §2 Mounts: "unmount
+// cross-checks shares and backup tasks riding the path"; WAVE3-DESIGN §10 Q4:
+// warn, never refuse). The SAME reader as the pools, scoped to the kinds a
+// path can carry; the sentences say "this mount" instead of "this pool".
+// ---------------------------------------------------------------------------
+
+/**
+ * The kinds that can reference a path on a mount: shares, exports, the
+ * path-sourced tasks, and an fstab mount nested beneath it. Replication and
+ * snapshot/scrub schedules address datasets by pool name, which an NFS/CIFS
+ * mountpoint never is.
+ */
+export const MOUNT_REFERENCE_KINDS: ReadonlySet<PoolReferenceKind> = new Set<PoolReferenceKind>(['smb', 'nfs', 'backup', 'cloud', 'mount'])
+
+/** Where the reference sources live — the same paths the share/task/mount routes edit. */
+export interface MountReferenceContext {
+  executor: CommandExecutor
+  mountpoint: string
+  smbConfPath?: string
+  exportsPath?: string
+  systemdDir?: string
+  fstabPath?: string
+}
+
+/**
+ * Everything that references a path at or under `mountpoint`, and every
+ * source that could not be read. The mount's OWN fstab line is not a
+ * reference to itself (cr.31 D3's rule, by mountpoint); a line mounted
+ * beneath it is. Never throws.
+ */
+export async function readMountReferences(ctx: MountReferenceContext): Promise<PoolReferenceRead> {
+  return readPoolReferences({
+    executor: ctx.executor,
+    // No dataset-matched kind is read (MOUNT_REFERENCE_KINDS), and a zvol
+    // device path's dataset never starts with `/`, so the "pool" namespace
+    // matches nothing here.
+    pool: ctx.mountpoint,
+    paths: [ctx.mountpoint],
+    ownMounts: { mountpoints: [ctx.mountpoint] },
+    kinds: MOUNT_REFERENCE_KINDS,
+    ...(ctx.smbConfPath ? { smbConfPath: ctx.smbConfPath } : {}),
+    ...(ctx.exportsPath ? { exportsPath: ctx.exportsPath } : {}),
+    ...(ctx.systemdDir ? { systemdDir: ctx.systemdDir } : {}),
+    ...(ctx.fstabPath ? { fstabPath: ctx.fstabPath } : {}),
+  })
+}
+
+/** The confirm-door sentence for ONE reference riding a mount. ASCII only (the mojibake rule). */
+export function mountReferenceWarning(ref: PoolReference): string {
+  switch (ref.kind) {
+    case 'smb':
+      return `SMB share '${ref.name}' serves '${ref.path}', which is on this mount, and stops working while it is not mounted`
+    case 'nfs':
+      return `NFS export '${ref.name}' serves a path on this mount and stops working while it is not mounted`
+    case 'backup':
+      return `Backup task '${ref.name}' backs up '${ref.path}', which is on this mount - its source is missing while it is not mounted`
+    case 'cloud':
+      return `Cloud-sync task '${ref.name}' syncs '${ref.path}', which is on this mount - its source is missing while it is not mounted`
+    case 'mount':
+      return `Mount '${ref.name}' is mounted beneath this mount and stops working with it`
+    default:
+      return poolReferenceWarning(ref)
+  }
+}
+
+/** The confirm-door sentence for ONE source that could not be read (the D3 disclosure). */
+export function mountUnreadableWarning(source: UnreadablePoolSource, mountpoint: string): string {
+  switch (source.kind) {
+    case 'smb':
+      return `ANAS could not read smb.conf, so it could not check whether an SMB share serves a path on '${mountpoint}'. If this node has SMB shares, verify their paths before confirming.`
+    case 'nfs':
+      return `ANAS could not read /etc/exports, so it could not check whether an NFS export serves a path on '${mountpoint}'. If this node exports NFS, verify the exports before confirming.`
+    case 'backup':
+      return `ANAS could not read the backup task store, so it could not check whether a backup task sources from '${mountpoint}'. If this node has backup tasks, verify their sources before confirming.`
+    case 'cloud':
+      return `ANAS could not read the cloud-sync task store, so it could not check whether a cloud-sync task syncs a path on '${mountpoint}'. If this node has cloud-sync tasks, verify their sources before confirming.`
+    case 'mount':
+      return `ANAS could not read /etc/fstab, so it could not check whether a mount lives beneath '${mountpoint}'. If this node has mounts, verify their mountpoints before confirming.`
+    default:
+      return poolUnreadableWarning(source, mountpoint)
+  }
 }

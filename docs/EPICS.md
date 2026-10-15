@@ -244,7 +244,7 @@ Scope is the findings of `docs/CODE-REVIEW-2026-10-14.md`, which is the evidence
 - **cr.36** `[ ]` ZFS pool verbs on the guard. After cr.33. Opus.
 - **cr.37** `[ ]` ZFS dataset/snapshot verbs and `fs.setAccess` on the guard. After cr.33. Opus.
 - **cr.38** `[ ]` AHR verbs on the guard (two sessions: short verbs, long verbs). After cr.33. Opus.
-- **cr.39** `[ ]` Mount verbs on the guard, and the unmount reference check §2 Mounts already describes (warn, Q4). After cr.33. Opus.
+- **cr.39** `[done 2026-10-15]` Mount verbs on the guard, and the unmount reference check §2 Mounts already describes (warn, Q4). After cr.33. Opus. Every mount verb runs one gate list at the route and again in the job under its `mount:<path>` lock (held by a LUN, the verb's state, the fstab entry for every create), an edit is bound to its fstab line's revision, a remove always confirms and binds `removeMountpointDir` and the credentials file it deletes, a forced unmount detaches only the holders it confirmed, and unmount, disable and remove name the shares, exports, backup and cloud tasks and nested mounts riding the path in the confirm and report new ones on the job.
 - **cr.40** `[ ]` iSCSI and image restore on the guard. After cr.33. Opus.
 - **cr.41** `[ ]` Tasks, schedules and registries on the guard. After cr.33; **blocked on Q1**. Local (DeepSeek) + cross-model review.
 - **cr.42** `[ ]` Identity verbs on the guard (the job compares uid/gid). After cr.33. Opus.

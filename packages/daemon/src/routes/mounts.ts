@@ -3,7 +3,9 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { Advisory, Gate, GuardReads, GuardSpec, Refusal } from '../safety/guard.js'
 import type { IscsiPaths } from '../services/iscsi.js'
+import type { LiveAtTarget } from '../services/mount-match.js'
 import type { MountTestStages } from '../services/mounts.js'
 import { mkdir, readdir } from 'node:fs/promises'
 import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, UpdateMountRequest } from '@anas/shared'
@@ -11,6 +13,7 @@ import { classifyKind, parseFindmnt } from '../parsers/findmnt.js'
 import { addMount, carriesAutomount, cifsAuthToken, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
 import { readPveMountPaths, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
+import { guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, sendRefusal } from '../safety/guard.js'
 import { diagnoseBusyPath, enrichBusyError, formatHolders } from '../services/busy-diagnosis.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
@@ -26,10 +29,12 @@ import {
   deliveredMatchesIntent,
   entryFromRequest,
   fstabHasMount,
+  fstabLineRevision,
   hasInlineCredentials,
   InvalidExtraOptionsError,
   isRemoteKind,
   mountpointReservedByPve,
+  normalizeMountpointPath,
   probeInventoryHealth,
   pveStorageFor,
   readEffectiveOptions,
@@ -44,6 +49,7 @@ import {
   validatedExtraOptions,
   writeCredentialsFile,
 } from '../services/mounts.js'
+import { mountReferenceWarning, mountUnreadableWarning, poolReferenceKey, readMountReferences } from '../services/pool-references.js'
 import { zodIssue } from '../validation.js'
 import { requireIdentity } from './identity.js'
 
@@ -80,12 +86,55 @@ export interface MountsRouteOptions {
    */
   iscsiPaths?: IscsiPaths
   /**
+   * Story cr.39 — the reference sources Unmount, Disable and Remove list in
+   * their confirm (EPICS §2 Mounts: "unmount cross-checks shares and backup
+   * tasks riding the path"): the same paths the share and task routes edit.
+   * An absent path leaves that kind unchecked (never "unreadable").
+   */
+  smbConfPath?: string
+  exportsPath?: string
+  systemdDir?: string
+  /**
    * TEST SEAM for POST /mounts/test's network stages (DNS + TCP to 2049/445):
    * a test host has no share server on those ports, so the mount stage — and
    * its verdict mapping — was unreachable from a route test. Production never
    * sets it; the real checks are the default.
    */
   mountTestStages?: MountTestStages
+}
+
+/** The verbs on an existing mount (create has its own spec: its object is an empty slot). */
+type MountVerb = 'update' | 'mount' | 'enable' | 'unmount' | 'disable' | 'remove'
+
+/** How a refusal sentence names each verb. */
+const VERBING: Record<MountVerb, string> = {
+  update: 'Editing',
+  mount: 'Mounting',
+  enable: 'Enabling',
+  unmount: 'Unmounting',
+  disable: 'Disabling',
+  remove: 'Removing',
+}
+
+/**
+ * What a mount verb acts on, read NOW (story cr.39, ruling (j)): the fstab
+ * line for the mountpoint and what the kernel has at it. Every door reads its
+ * own; nothing the route read reaches the job's gates.
+ */
+interface MountObject {
+  mountpoint: string
+  fstabText: string
+  /** The fstab line's entry, or undefined (an ephemeral mount, or nothing). */
+  entry?: MountEntry
+  /** The kernel mount table lists the mountpoint (an armed automount alone is not "mounted"). */
+  mounted: boolean
+  live: LiveAtTarget
+}
+
+/** What a create acts on: the mountpoint slot, and the fstab as it is now. */
+interface MountSlot {
+  mountpoint: string
+  fstabText: string
 }
 
 /**
@@ -95,76 +144,302 @@ export interface MountsRouteOptions {
  * storage.cfg parse) are tagged hands-off and reject every mutation. All
  * mutations are jobs (202); status never touches a mountpoint synchronously
  * (guarded `stat -f` in a child process).
+ *
+ * Story cr.39 (WAVE3-DESIGN §2.5, ruling (j)): every verb is a guard spec. The
+ * route runs its gates, the job runs the SAME gates again against facts read
+ * when it starts, and the queue starts it only while it holds the mountpoint's
+ * `mount:<path>` lock.
  */
 export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOptions) {
   const { executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath, mdadmConfPath, mountTestStages } = opts
   const iscsiPaths = opts.iscsiPaths ?? {}
 
-  /**
-   * Refuse an unmount/remove while a LUN's image file lives under the
-   * mountpoint (story iscsi.6). Returns true when the 409 has been sent.
-   *
-   * This is the mount-side twin of the shares/backup-task cross-check the verb
-   * ladder already does — with one difference that makes it a HARD refusal
-   * rather than a warning: `umount` of a filesystem holding an open fileio
-   * backing file does not fail the way a share does. LIO holds the INODE, so an
-   * unmount can succeed and leave the LUN serving a file that is no longer
-   * reachable by any path — and `fuser`/`lsof` show nothing at all (GT-41).
-   * "Unsafe now", no confirm bypass, before `umount` runs.
-   */
-  async function lunHeldRefused(mountpoint: string, action: string, reply: FastifyReply): Promise<boolean> {
-    const held = await heldByLun(createIscsiClaimCache(executor, iscsiPaths), { path: mountpoint })
-    if (!held)
-      return false
-    const refusal = heldByLunRefusal(`mount '${mountpoint}'`, action, held)
-    reply.code(409)
-    reply.send({ error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } })
-    return true
+  /** The per-run reads the mount gates share (one per guard run, never across doors). */
+  const mountReads = {
+    findmnt: (reads: GuardReads) => reads.once('findmnt', () => readFindmnt(executor)),
+    fstab: (reads: GuardReads) => reads.once('fstab', () => readConfig(fstabPath)),
+    pvePaths: (reads: GuardReads) => reads.once('pve-mount-paths', () => readPveMountPaths(storagePath)),
+    ahrSpecs: (reads: GuardReads) => reads.once('ahr-specs', () => readAhrSpecs()),
+    claims: (reads: GuardReads) => reads.once('iscsi-claims', async () => createIscsiClaimCache(executor, iscsiPaths)),
+  }
+
+  /** The mount at `mountpoint` as the node has it now. Never null: absence is each verb's own gate. */
+  async function readMountObject(mountpoint: string, reads: GuardReads): Promise<MountObject> {
+    const [findmntText, fstabText] = await Promise.all([mountReads.findmnt(reads), mountReads.fstab(reads)])
+    return {
+      mountpoint,
+      fstabText,
+      entry: getMount(fstabText, mountpoint),
+      mounted: mountedIn(findmntText, mountpoint),
+      live: liveAtTarget(parseFindmnt(findmntText), mountpoint),
+    }
+  }
+
+  // --- the gates (each one function, run by both doors) -------------------
+
+  /** Reject a mutation on a PVE-owned mount (hands-off). */
+  const pveGate: Gate<MountObject> = async (o, reads) => {
+    if (!mountpointReservedByPve(o.mountpoint) && !pveStorageFor(o.mountpoint, await mountReads.pvePaths(reads)))
+      return null
+    return { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${o.mountpoint}' is PVE-owned (hands-off) and cannot be modified by ANAS` }
   }
 
   /**
-   * What is mounted at `mountpoint` when it is NOT what the fstab line names
-   * (story ident.4 (e), audit #18), or undefined. A local disk mounted by hand
-   * where a failed CIFS line points is the case: before ident.4 a Remove,
-   * Unmount, Disable or Edit of the CIFS line unmounted the disk, and a Mount
-   * stacked the share on top of it. Nothing mounted (or only an armed
-   * automount placeholder) is not a mismatch.
+   * Reject a mutation on an AHR pool's persistence (hands-off — mirrors the
+   * PVE gate). A Mounts unmount/delete/edit on a pool's LV entry would rip the
+   * pool's persistence out from under the Hybrid RAID feature. Matches on the
+   * LV SPEC via the shared inventory tagging (never the mountpoint), so a
+   * custom-mountpoint pool is still refused.
    */
-  async function foreignAt(mountpoint: string, entry: { spec: string, fstype: string } | undefined): Promise<string | undefined> {
-    if (!entry)
-      return undefined
-    const live = liveAtTarget(parseFindmnt(await readFindmnt(executor)), mountpoint)
-    if (!live.real || specMatchesLive(entry, live.real))
-      return undefined
-    return describeLive(live.real)
+  const ahrGate: Gate<MountObject> = async (o, reads) => {
+    if (!mdadmConfPath)
+      return null
+    const ahrSpecs = await mountReads.ahrSpecs(reads)
+    if (ahrSpecs.size === 0)
+      return null
+    const row = buildBaseInventory(await mountReads.findmnt(reads), o.fstabText, new Map(), ahrSpecs).find(r => r.mountpoint === o.mountpoint)
+    if (!row?.ahrManaged)
+      return null
+    return { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${o.mountpoint}' is an ANAS Hybrid RAID (AHR) pool — manage it from the Hybrid RAID view, not the Mounts feature` }
   }
 
-  /** The refusal sentence for a foreign mount at the target — the 409 and the in-job re-check share it. */
-  function foreignMountMessage(mountpoint: string, entry: { spec: string, fstype: string }, live: string, action: string): string {
-    return `${action} refused: '${mountpoint}' has ${live} mounted on it, not ${entry.spec} (${entry.fstype}) that its /etc/fstab line names. `
-      + `ANAS unmounts or mounts over only the filesystem the line configures. Unmount ${mountpoint} on the node yourself (umount ${mountpoint}), then try again.`
+  /**
+   * NAS-surface guard (operator ruling): ANAS mutates REMOTE share mounts
+   * only. Local filesystems are observe-only — the local-drive path is ZFS or
+   * AHR, not generic mount management. Unknown targets pass to the verbs' own
+   * existence gates.
+   */
+  const remoteGate: Gate<MountObject> = async (o, reads) => {
+    let kind: string | undefined = o.entry ? classifyKind(o.entry.fstype, o.entry.spec) : undefined
+    if (kind === undefined)
+      kind = buildBaseInventory(await mountReads.findmnt(reads), '', new Map()).find(r => r.mountpoint === o.mountpoint)?.type
+    if (kind === undefined || isRemoteKind(kind))
+      return null
+    return { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${o.mountpoint}' is not an ANAS-managed filesystem — ANAS manages remote (NFS/CIFS) shares only` }
   }
 
-  /** 409 (no confirm — unsafe now) when a foreign filesystem sits at the target. Returns true when sent. */
-  async function foreignMountRefused(
-    mountpoint: string,
-    entry: { spec: string, fstype: string } | undefined,
-    action: string,
-    reply: FastifyReply,
-  ): Promise<boolean> {
-    const live = await foreignAt(mountpoint, entry)
-    if (!live || !entry)
-      return false
-    reply.code(409)
-    reply.send({ error: { code: 'CONFLICT', reason: 'mount-mismatch', message: foreignMountMessage(mountpoint, entry, live, action) } })
-    return true
+  /**
+   * What is mounted at the mountpoint when it is NOT what the fstab line
+   * names (story ident.4 (e), audit #18): a hard 409, no confirm. A local disk
+   * mounted by hand where a failed CIFS line points is the case: before
+   * ident.4 a Remove, Unmount, Disable or Edit of the CIFS line unmounted the
+   * disk, and a Mount stacked the share on top of it. Nothing mounted (or only
+   * an armed automount placeholder) is not a mismatch.
+   */
+  function foreignGate(verbing: string): Gate<MountObject> {
+    return async (o) => {
+      if (!o.entry || !o.live.real || specMatchesLive(o.entry, o.live.real))
+        return null
+      return {
+        status: 409,
+        code: 'CONFLICT',
+        reason: 'mount-mismatch',
+        message: `${verbing} refused: '${o.mountpoint}' has ${describeLive(o.live.real)} mounted on it, not ${o.entry.spec} (${o.entry.fstype}) that its /etc/fstab line names. `
+          + `ANAS unmounts or mounts over only the filesystem the line configures. Unmount ${o.mountpoint} on the node yourself (umount ${o.mountpoint}), then try again.`,
+      }
+    }
   }
 
-  /** The in-job re-check right before `umount`/`mount`: the table may have changed since the request. */
-  async function assertNotForeign(mountpoint: string, entry: { spec: string, fstype: string } | undefined, action: string): Promise<void> {
-    const live = await foreignAt(mountpoint, entry)
-    if (live && entry)
-      throw new Error(foreignMountMessage(mountpoint, entry, live, action))
+  /**
+   * Refuse an unmount/disable/remove while a LUN's image file lives under the
+   * mountpoint (story iscsi.6) — a HARD refusal, no confirm bypass, at the
+   * route and again in the job (cr.39): `umount` of a filesystem holding an
+   * open fileio backing file does not fail the way a share does. LIO holds the
+   * INODE, so an unmount can succeed and leave the LUN serving a file that is
+   * no longer reachable by any path — and `fuser`/`lsof` show nothing at all
+   * (GT-41). It runs before the busy confirm: a lazy unmount is precisely the
+   * wrong answer to a LUN.
+   */
+  function lunGate(verbing: string): Gate<MountObject> {
+    return async (o, reads) => {
+      const held = await heldByLun(await mountReads.claims(reads), { path: o.mountpoint })
+      if (!held)
+        return null
+      const refusal = heldByLunRefusal(`mount '${o.mountpoint}'`, verbing, held)
+      return { status: 409, code: 'CONFLICT', reason: refusal.reason, message: refusal.message }
+    }
+  }
+
+  /** A state gate: `holds(o)` must be true, else the refusal (the route's 4xx, the job's error). */
+  function stateGate(holds: (o: MountObject) => boolean, refusal: Refusal): Gate<MountObject> {
+    return async o => (holds(o) ? null : refusal)
+  }
+
+  /**
+   * The verb's gate list, in the order the route has always answered them.
+   * The SAME list runs in the job (ruling (j)), so a state that changed while
+   * the job waited for its lock or a slot — a LUN created under the
+   * mountpoint, the line disabled, the share unmounted by hand — refuses there
+   * with the sentence the route would have given.
+   */
+  function mountGates(mp: string, verb: MountVerb): Gate<MountObject>[] {
+    const verbing = VERBING[verb]
+    const gates: Gate<MountObject>[] = [pveGate, ahrGate]
+    if (verb === 'update')
+      gates.push(stateGate(o => !!o.entry, { status: 404, code: 'NOT_FOUND', message: `Mount '${mp}' is not in /etc/fstab` }))
+    if (verb === 'remove')
+      gates.push(stateGate(o => !!o.entry || o.mounted, { status: 404, code: 'NOT_FOUND', message: `Mount '${mp}' not found` }))
+    gates.push(remoteGate)
+    // Enable touches fstab alone; every other verb acts on the target.
+    if (verb !== 'enable')
+      gates.push(foreignGate(verbing))
+    if (verb === 'mount') {
+      gates.push(
+        stateGate(o => !!o.entry || o.mounted, { status: 404, code: 'NOT_FOUND', message: `Mount '${mp}' is not configured and not mounted` }),
+        stateGate(o => !o.entry?.disabled, { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${mp}' is disabled — enable it first` }),
+      )
+    }
+    if (verb === 'enable') {
+      gates.push(
+        stateGate(o => !!o.entry, { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${mp}' is not in /etc/fstab` }),
+        stateGate(o => !!o.entry?.disabled, { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${mp}' is not disabled` }),
+      )
+    }
+    if (verb === 'disable')
+      gates.push(stateGate(o => !!o.entry, { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${mp}' is not in /etc/fstab — nothing to disable` }))
+    if (verb === 'unmount')
+      gates.push(stateGate(o => o.mounted, { status: 404, code: 'NOT_FOUND', message: `Mount '${mp}' is not currently mounted` }))
+    if (verb === 'unmount' || verb === 'disable' || verb === 'remove')
+      gates.push(lunGate(verbing))
+    return gates
+  }
+
+  /**
+   * What rides the mountpoint (story cr.39, the cr.24 helper): one advisory
+   * per share, export, backup/cloud task or nested mount whose path is at or
+   * under it, and one per source that could not be read. Warn, never refuse
+   * (EPICS §3 Q4); the job reports any the confirm did not list.
+   */
+  async function mountAdvisories(o: MountObject): Promise<Advisory[]> {
+    const read = await readMountReferences({
+      executor,
+      mountpoint: o.mountpoint,
+      fstabPath,
+      ...(opts.smbConfPath ? { smbConfPath: opts.smbConfPath } : {}),
+      ...(opts.exportsPath ? { exportsPath: opts.exportsPath } : {}),
+      ...(opts.systemdDir ? { systemdDir: opts.systemdDir } : {}),
+    })
+    return [
+      ...read.refs.map(ref => ({ key: `ref:${poolReferenceKey(ref)}`, warning: mountReferenceWarning(ref) })),
+      ...read.unreadableSources.map(src => ({ key: `unreadable:${src.kind}`, warning: mountUnreadableWarning(src, o.mountpoint) })),
+    ]
+  }
+
+  /**
+   * The credentials file a Remove deletes (ident.4 (d)): the file the line
+   * names, or (a CIFS line naming none) this mountpoint's own hashed name —
+   * never the flattened pre-ident.4 name, which two mountpoints could share.
+   */
+  function credentialsFileOf(o: MountObject): string | undefined {
+    const kind = o.entry ? classifyKind(o.entry.fstype, o.entry.spec) : undefined
+    return o.entry?.credentialsFile ?? (kind === 'cifs' ? credsFilePath(credsDir, o.mountpoint) : undefined)
+  }
+
+  /**
+   * The guard spec of a verb on an existing mount (story cr.39, WAVE3-DESIGN
+   * §3.3 Mount row):
+   *  - id: the fstab line's spec + type (what the ident.4 foreign check
+   *    compares), or the live mount's for an ephemeral one — a line replaced
+   *    by another share between the request and the job is another mount;
+   *  - revision (update): the line's sha256 — the edit writes a merge of the
+   *    line the request read, so a line changed meanwhile refuses
+   *    STATE_CHANGED instead of being overwritten;
+   *  - scope (remove): the credentials file it deletes, bound into the
+   *    confirm with the request (`removeMountpointDir`);
+   *  - advisories (unmount, disable, remove): what rides the path;
+   *  - locks: `mount:<path>`, exclusive, for every verb.
+   */
+  function mountGuardSpec(mp: string, verb: MountVerb): GuardSpec<MountObject> {
+    return {
+      operation: `mount.${verb}`,
+      object: {
+        what: `Mount '${mp}'`,
+        read: reads => readMountObject(mp, reads),
+        id: async (o) => {
+          if (o.entry)
+            return { spec: o.entry.spec, fstype: o.entry.fstype }
+          if (o.live.real)
+            return { spec: o.live.real.source, fstype: o.live.real.fstype }
+          return { spec: 'none', fstype: 'none' }
+        },
+        ...(verb === 'update' ? { revision: async (o: MountObject) => fstabLineRevision(o.fstabText, o.mountpoint) } : {}),
+        ...(verb === 'remove' ? { scope: async (o: MountObject) => ({ credentialsFile: credentialsFileOf(o) ?? 'none' }) } : {}),
+        scopeLabels: { credentialsFile: 'the credentials file to remove' },
+        unbound: part => part === 'revision'
+          ? `Could not read the /etc/fstab line of '${mp}' — refusing an edit that cannot be bound to it`
+          : `Could not read what ${VERBING[verb].toLowerCase()} '${mp}' would change — refusing`,
+      },
+      gates: mountGates(mp, verb),
+      ...(verb === 'unmount' || verb === 'disable' || verb === 'remove' ? { advisories: mountAdvisories } : {}),
+      locks: async () => [mountClaim(normalizeMountpointPath(mp))],
+    }
+  }
+
+  /**
+   * The guard spec of a create: the object is the mountpoint SLOT, and its
+   * gates are the mountpoint-safety rules — never PVE territory, never a
+   * system path (cr.18, review M7.3), never a PVE storage, never an existing
+   * ZFS dataset's mountpoint, never a mountpoint an fstab line already owns.
+   * cr.18 (review M7.2) made the last one hold for EVERY create, persistent or
+   * not, because the credentials file is named by the mountpoint; cr.39 runs
+   * it in the job too, so a line added while a non-persistent create waited
+   * refuses before its credentials are written over that line's.
+   */
+  function createGuardSpec(mp: string): GuardSpec<MountSlot> {
+    return {
+      operation: 'mount.create',
+      object: {
+        what: `Mountpoint '${mp}'`,
+        read: async reads => ({ mountpoint: mp, fstabText: await mountReads.fstab(reads) }),
+        id: async () => ({ mountpoint: mp }),
+        unbound: () => `Could not read the mountpoint '${mp}' — refusing`,
+      },
+      gates: [
+        async s => mountpointReservedByPve(s.mountpoint)
+          ? { status: 400, code: 'VALIDATION_ERROR', message: `Mountpoint '${s.mountpoint}' is PVE territory and off-limits to ANAS` }
+          : null,
+        async (s) => {
+          const conflict = systemMountTargetConflict(s.mountpoint)
+          return conflict ? { status: 400, code: 'VALIDATION_ERROR', message: `Invalid mountpoint: ${conflict}` } : null
+        },
+        async (s, reads) => pveStorageFor(s.mountpoint, await mountReads.pvePaths(reads))
+          ? { status: 400, code: 'VALIDATION_ERROR', message: `Mountpoint '${s.mountpoint}' belongs to a PVE storage (hands-off)` }
+          : null,
+        // pvepool.1 review fix 1: the mountpoint list is three-valued — absent
+        // `zfs` ([]) fails open, an UNREADABLE answer (null) tightens: "could
+        // not check" never gets to read as "nothing there".
+        async (s) => {
+          const zfsMountpoints = await readZfsMountpoints()
+          if (zfsMountpoints === null)
+            return { status: 400, code: 'VALIDATION_ERROR', message: `ANAS could not verify whether '${s.mountpoint}' is a ZFS dataset mountpoint (zfs list failed) — the mount is refused until the ZFS answer is readable` }
+          return zfsMountpoints.some(m => m.mountpoint === s.mountpoint)
+            ? { status: 400, code: 'VALIDATION_ERROR', message: `Mountpoint '${s.mountpoint}' is a ZFS dataset mountpoint` }
+            : null
+        },
+        async s => fstabHasMount(s.fstabText, s.mountpoint)
+          ? { status: 409, code: 'CONFLICT', message: `Mount '${s.mountpoint}' is already in /etc/fstab` }
+          : null,
+      ],
+      locks: async () => [mountClaim(normalizeMountpointPath(mp))],
+    }
+  }
+
+  /**
+   * A forced (lazy) unmount detaches the holders the operator confirmed — and
+   * only those (story cr.39, §2.5 "holders"). Right before the `umount -l`,
+   * the job lists the holders again: one the confirm did not name refuses the
+   * job, nothing done. A holder that has gone since is no reason to stop.
+   */
+  async function assertNoNewHolders(mountpoint: string, confirmed: string[]): Promise<void> {
+    const listed = new Set(confirmed)
+    const added = (await listHolders(executor, mountpoint)).filter(h => !listed.has(h))
+    if (added.length === 0)
+      return
+    throw new GuardRefusalError({
+      status: 409,
+      code: 'STATE_CHANGED',
+      message: `Mount '${mountpoint}' has holders the confirmation did not name (${added.join(', ')}) — nothing was done; confirm again`,
+    })
   }
 
   /** Stamp `heldByLun` onto every mount a LUN's image sits under. */
@@ -229,54 +504,22 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (!identity)
       return
 
-    // Remote shares only (see rejectIfNotRemote): a mount needs its server —
-    // and the typed target is normalised at the boundary (the UI applies the
-    // same normaliser): an empty server or an empty CIFS share comes back as
-    // a guiding 400, never as a job that fails inside the kernel with a
+    // Remote shares only (see remoteGate): a mount needs its server — and the
+    // typed target is normalised at the boundary (the UI applies the same
+    // normaliser): an empty server or an empty CIFS share comes back as a
+    // guiding 400, never as a job that fails inside the kernel with a
     // malformed UNC (`//host/` → "CIFS: VFS: Malformed UNC in devname").
     const target = normalizeMountTarget(req.type, req)
     if (target.problems.length > 0) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: target.problems.join('; ') } }
     }
-    // Mountpoint safety: never PVE territory; never a system path (cr.18,
-    // review M7.3 — the target list lives once in services/mounts.ts); never
-    // an existing ZFS dataset.
-    if (mountpointReservedByPve(req.mountpoint)) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Mountpoint '${req.mountpoint}' is PVE territory and off-limits to ANAS` } }
-    }
-    const systemConflict = systemMountTargetConflict(req.mountpoint)
-    if (systemConflict) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid mountpoint: ${systemConflict}` } }
-    }
-    if (pveStorageFor(req.mountpoint, await readPveMountPaths(storagePath))) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Mountpoint '${req.mountpoint}' belongs to a PVE storage (hands-off)` } }
-    }
-    // pvepool.1 review fix 1: the mountpoint list is three-valued now — absent
-    // `zfs` ([]) fails open, an UNREADABLE answer (null) tightens: this check
-    // keeps a mount from shadowing a ZFS dataset's mountpoint, and "could not
-    // check" never gets to read as "nothing there".
-    const zfsMountpoints = await readZfsMountpoints()
-    if (zfsMountpoints === null) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `ANAS could not verify whether '${req.mountpoint}' is a ZFS dataset mountpoint (zfs list failed) — the mount is refused until the ZFS answer is readable` } }
-    }
-    if (zfsMountpoints.some(m => m.mountpoint === req.mountpoint)) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Mountpoint '${req.mountpoint}' is a ZFS dataset mountpoint` } }
-    }
 
-    // Already configured? cr.18 (review M7.2): this check runs for EVERY create,
-    // persistent or not. The credentials file is named by the MOUNTPOINT, so an
-    // ephemeral CIFS mount over a mountpoint an existing fstab line owns would
-    // silently overwrite that entry's secrets with new ones.
-    if (fstabHasMount(await readConfig(fstabPath), req.mountpoint)) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Mount '${req.mountpoint}' is already in /etc/fstab` } }
-    }
+    // Story cr.39: the mountpoint-safety gates, run here and again in the job.
+    const spec = createGuardSpec(req.mountpoint)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     // Empty-dir / shadow check: a non-empty existing directory needs confirmation.
     const contents = await dirContents(req.mountpoint)
@@ -312,7 +555,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const job = jobQueue.submit(
       'mount.create',
       { ...identity, params: { mountpoint: req.mountpoint } },
-      async (updateProgress) => {
+      // Ruling (j): every gate above runs again before the first act — for a
+      // NON-persistent create too (the "already in /etc/fstab" refusal used to
+      // be re-checked only inside the persistent path's fstab edit).
+      guarded(spec, pre, async (_slot, { updateProgress }) => {
         updateProgress(`Creating mountpoint ${req.mountpoint}`)
         await mkdir(req.mountpoint, { recursive: true })
 
@@ -344,7 +590,9 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           await doMount(executor, req.persistent ? undefined : entry, req.mountpoint)
         }
         return { created: req.mountpoint, warnings }
-      },
+      }),
+      // Story cr.39: one mount verb at a time per mountpoint.
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -368,27 +616,14 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (!identity)
       return
 
-    const rejected = await rejectIfPve(mp, reply)
-    if (rejected)
-      return rejected
-
-    const rejectedAhr = await rejectIfAhr(mp, reply)
-    if (rejectedAhr)
-      return rejectedAhr
-
-    const existing = getMount(await readConfig(fstabPath), mp)
-    if (!existing) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Mount '${mp}' is not in /etc/fstab` } }
-    }
-
-    const rejectedLocal = await rejectIfNotRemote(mp, existing, reply)
-    if (rejectedLocal)
-      return rejectedLocal
-
-    // ident.4 (e): the edit remounts — never another filesystem at the target.
-    if (await foreignMountRefused(mp, existing, 'Editing', reply))
-      return reply
+    // PVE, AHR, the line exists, remote only, and (ident.4 (e): the edit
+    // remounts) never another filesystem at the target. Story cr.39: the line's
+    // revision is bound — the job writes a merge of THIS line or nothing.
+    const spec = mountGuardSpec(mp, 'update')
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const existing = pre.object.entry as MountEntry // the line-exists gate passed
 
     // `mergeEntry` re-validates a SUPPLIED `extraOptions` at this write door
     // (cr.2 — defence in depth, Principle 6); a wayward value is a 400.
@@ -414,8 +649,9 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       // The changed options ride the audit entry: a live diagnosis of "the edit
       // completed but nothing changed" (issue #25) had only the mountpoint to go on.
       { ...identity, params: { mountpoint: mp, ...(body.options ? { options: body.options } : {}) } },
-      async (updateProgress) => {
-        await assertNotForeign(mp, existing, 'Editing')
+      // Ruling (j): id, the line's revision and every gate (the foreign mount
+      // check among them, right before anything is written) run again here.
+      guarded(spec, pre, async (_o, { updateProgress }) => {
         // VALIDATE-THEN-COMMIT (issue #24): the new secret is proven against the
         // server BEFORE anything is written. Nothing below this point runs on a
         // rejected password, so the live creds file and fstab stay untouched.
@@ -463,7 +699,8 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         updateProgress(`Remounting ${mp}`)
         await remountEntry(executor, merged)
         return { updated: mp, ...(editWarnings.length > 0 ? { warnings: editWarnings } : {}) }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -487,47 +724,27 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (!identity)
       return
 
-    const rejected = await rejectIfPve(mp, reply)
-    if (rejected)
-      return rejected
-
-    const rejectedAhr = await rejectIfAhr(mp, reply)
-    if (rejectedAhr)
-      return rejectedAhr
-
-    const fstabText = await readConfig(fstabPath)
-    const entry = getMount(fstabText, mp)
-    const mounted = await isMounted(mp)
-
-    const rejectedLocal = await rejectIfNotRemote(mp, entry, reply)
-    if (rejectedLocal)
-      return rejectedLocal
-
-    // ident.4 (e): mount, unmount and disable act on the target only while
-    // what is there is what the line names (enable touches fstab alone).
-    const verb = action === 'mount' ? 'Mounting' : action === 'unmount' ? 'Unmounting' : action === 'disable' ? 'Disabling' : undefined
-    if (verb && await foreignMountRefused(mp, entry, verb, reply))
-      return reply
+    // Story cr.39: PVE, AHR, remote only, the foreign-mount check (not for
+    // enable, which touches fstab alone), the verb's state, and — for unmount
+    // and disable — held by a LUN (iscsi.6: BEFORE the busy confirm, since the
+    // busy confirm offers a lazy unmount, precisely the wrong answer to a LUN).
+    const spec = mountGuardSpec(mp, action)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     // --- mount: bring it up (keep the fstab entry) ---
     if (action === 'mount') {
-      if (!entry && !mounted) {
-        reply.code(404)
-        return { error: { code: 'NOT_FOUND', message: `Mount '${mp}' is not configured and not mounted` } }
-      }
-      if (entry?.disabled) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mp}' is disabled — enable it first` } }
-      }
       const job = jobQueue.submit(
         'mount.mount',
         { ...identity, params: { mountpoint: mp } },
-        async (updateProgress) => {
-          await assertNotForeign(mp, entry, 'Mounting')
+        guarded(spec, pre, async (_o, { updateProgress }) => {
           updateProgress(`Mounting ${mp}`)
-          await doMount(executor, entry && !fstabHasMount(fstabText, mp) ? entry : undefined, mp)
+          // Mounted from its fstab line (`mount -- <mp>`).
+          await doMount(executor, undefined, mp)
           return { mounted: mp }
-        },
+        }),
+        { locks: pre.locks },
       )
       reply.code(202)
       return { job }
@@ -535,66 +752,60 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
 
     // --- enable: remove exactly what disable added (config inverse; no mount) ---
     if (action === 'enable') {
-      if (!entry) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mp}' is not in /etc/fstab` } }
-      }
-      if (!entry.disabled) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mp}' is not disabled` } }
-      }
       const job = jobQueue.submit(
         'mount.enable',
         { ...identity, params: { mountpoint: mp } },
-        async (updateProgress) => {
+        guarded(spec, pre, async (_o, { updateProgress }) => {
           updateProgress(`Enabling ${mp} in /etc/fstab`)
           await editConfig(fstabPath, current => enableMount(current, mp))
           updateProgress('Reloading systemd (daemon-reload)')
           await daemonReload(executor)
           return { enabled: mp }
-        },
+        }),
+        { locks: pre.locks },
       )
       reply.code(202)
       return { job }
     }
 
-    // --- disable / unmount both unmount first (busy → the same 409 gate) ---
+    // --- disable / unmount both unmount first ---
+    // The confirm (cr.39): a busy mount (holders → a forced lazy unmount) and
+    // anything riding the path (shares, exports, backup/cloud tasks, a nested
+    // mount — warn, never refuse) are both said before anything is done.
     const disabling = action === 'disable'
-    if (disabling && !entry) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mp}' is not in /etc/fstab — nothing to disable` } }
-    }
-    if (!disabling && !mounted) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Mount '${mp}' is not currently mounted` } }
-    }
-
-    // Story iscsi.6: BEFORE the busy gate — the busy gate offers a lazy unmount
-    // behind a confirm code, and a lazy unmount is precisely the wrong answer to
-    // a LUN (the backstore keeps the inode and the data quietly detaches). Hard
-    // 409, no bypass.
-    if (await lunHeldRefused(mp, disabling ? 'Disabling' : 'Unmounting', reply))
-      return reply
-
-    let lazy = false
-    if (mounted) {
-      const gate = await busyGate(mp, `mount.${action}`, request, reply)
-      if (gate === 'sent')
+    const verbing = VERBING[action]
+    const holders = pre.object.mounted ? await listHolders(executor, mp) : []
+    if (holders.length > 0 || pre.advisories.length > 0) {
+      if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+        validated: { mountpoint: mp, action },
+        address: ['mountpoint'],
+        message: holders.length > 0
+          ? `'${mp}' is busy — ${holders.length} process(es) are holding it`
+          : `${verbing} '${mp}' affects what is configured on it`,
+        warnings: [...busyWarnings(mp, holders), ...pre.advisories.map(a => a.warning)],
+      })) {
         return reply
-      lazy = gate.lazy
+      }
     }
+    const lazy = holders.length > 0 // confirmed
 
     const job = jobQueue.submit(
       `mount.${action}`,
       { ...identity, params: { mountpoint: mp } },
-      async (updateProgress) => {
-        if (mounted) {
-          await assertNotForeign(mp, entry, disabling ? 'Disabling' : 'Unmounting')
+      // Ruling (j): id, every gate (held by a LUN among them) and the
+      // references run again here, against what the node has now.
+      guarded(spec, pre, async (o, ctx) => {
+        const { updateProgress } = ctx
+        if (o.mounted) {
+          if (lazy)
+            await assertNoNewHolders(mp, holders)
           updateProgress(`Unmounting ${mp}${lazy ? ' (lazy)' : ''}`)
           const r = await executor.exec(UMOUNT, lazy ? ['-l', mp] : [mp])
           if (r.exitCode !== 0 && !lazy)
             throw new Error(await enrichBusyError(executor, r.stderr.trim() || `umount exited ${r.exitCode}`, mp, configfsOptionsFrom(iscsiPaths)))
         }
+        // Story cr.24/cr.39: references that appeared after the confirm.
+        const warnings = [...ctx.newAdvisories]
         if (disabling) {
           // Append `noauto,x-anas.disabled` (or the kept-noauto token over the
           // operator's own noauto) to the fstab line and park its automount;
@@ -605,13 +816,14 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
             automount = carriesAutomount(current, mp) // the line BEFORE the change
             return disableMount(current, mp)
           })
-          const warnings = await stopAutomountIf(automount, mp, updateProgress)
+          warnings.push(...await stopAutomountIf(automount, mp, updateProgress))
           updateProgress('Reloading systemd (daemon-reload)')
           await daemonReload(executor)
           return { disabled: mp, ...(warnings.length > 0 ? { warnings } : {}) }
         }
-        return { unmounted: mp }
-      },
+        return { unmounted: mp, ...(warnings.length > 0 ? { warnings } : {}) }
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -624,7 +836,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       return
 
     // Opt-in tidy-up (18.5 refinement): also rmdir the now-empty mountpoint
-    // directory. Absent ⇒ false ⇒ the pre-flag behaviour, byte for byte.
+    // directory. Absent ⇒ false, normalised before the confirm signs it.
     const query = DeleteMountQuery.safeParse(request.query ?? {})
     if (!query.success) {
       reply.code(400)
@@ -636,81 +848,79 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (!identity)
       return
 
-    const rejected = await rejectIfPve(mp, reply)
-    if (rejected)
-      return rejected
+    // PVE, AHR, exists, remote only, ident.4 (e) (a failed CIFS line whose
+    // target now carries a local filesystem must not take that filesystem
+    // down with it), held by a LUN (iscsi.6: remove unmounts first) — at the
+    // route and again in the job.
+    const spec = mountGuardSpec(mp, 'remove')
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const { entry, mounted } = pre.object
+    const credentialsFile = credentialsFileOf(pre.object)
+    const holders = mounted ? await listHolders(executor, mp) : []
 
-    const rejectedAhr = await rejectIfAhr(mp, reply)
-    if (rejectedAhr)
-      return rejectedAhr
-
-    const fstabText = await readConfig(fstabPath)
-    const entry = getMount(fstabText, mp)
-    const mounted = await isMounted(mp)
-    if (!entry && !mounted) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Mount '${mp}' not found` } }
-    }
-
-    const rejectedLocal = await rejectIfNotRemote(mp, entry ?? undefined, reply)
-    if (rejectedLocal)
-      return rejectedLocal
-
-    // ident.4 (e), audit #18: a failed CIFS line whose target now carries a
-    // local filesystem must not take that filesystem down with it.
-    if (await foreignMountRefused(mp, entry ?? undefined, 'Removing', reply))
+    // Story cr.39 (WAVE3-DESIGN §2.5, §5.2): a remove ALWAYS confirms — it
+    // deletes the line, the credentials file and (opted in) the directory —
+    // and the code signs the whole request (`removeMountpointDir`), the
+    // mount's spec + type, and the credentials file it deletes. Anything riding
+    // the path is listed (warn, never refuse).
+    const warnings = [
+      ...(entry ? [`The /etc/fstab line for '${mp}' is deleted; the mount does not come back at boot.`] : []),
+      ...(mounted ? [`'${mp}' is unmounted now.`] : []),
+      ...(credentialsFile ? [`The credentials file ${credentialsFile} is deleted if it exists and no other /etc/fstab line names it.`] : []),
+      ...(removeMountpointDir ? [`The mountpoint directory '${mp}' is removed if it is empty (never its contents).`] : []),
+      ...busyWarnings(mp, holders),
+      ...pre.advisories.map(a => a.warning),
+    ]
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { mountpoint: mp, removeMountpointDir },
+      address: ['mountpoint'],
+      message: holders.length > 0
+        ? `'${mp}' is busy — ${holders.length} process(es) are holding it`
+        : `Removing mount '${mp}' deletes its configuration`,
+      warnings,
+    })) {
       return reply
-
-    // Story iscsi.6 — same hard refusal as unmount, and for the same reason:
-    // remove unmounts first, and a LUN under the mountpoint must not be handed a
-    // lazy unmount behind a confirm code.
-    if (await lunHeldRefused(mp, 'Removing', reply))
-      return reply
-
-    let lazy = false
-    if (mounted) {
-      const gate = await busyGate(mp, 'mount.remove', request, reply)
-      if (gate === 'sent')
-        return reply
-      lazy = gate.lazy
     }
-
-    // ident.4 (d): the file the line names, or (a line naming none) this
-    // mountpoint's own hashed name — never the flattened pre-ident.4 name,
-    // which two mountpoints could share. Removed only from the creds dir and
-    // only when no other line references it (decided in the job, on the
-    // fstab as it is after the line is gone).
-    const kind = entry ? classifyKind(entry.fstype, entry.spec) : undefined
-    const credentialsFile = entry?.credentialsFile ?? (kind === 'cifs' ? credsFilePath(credsDir, mp) : undefined)
+    const lazy = holders.length > 0 // confirmed
 
     const job = jobQueue.submit(
       'mount.remove',
       { ...identity, params: { mountpoint: mp, ...(removeMountpointDir ? { removeMountpointDir } : {}) } },
-      async (updateProgress) => {
-        const warnings: string[] = []
-        if (mounted) {
-          await assertNotForeign(mp, entry ?? undefined, 'Removing')
+      // Ruling (j): id, the bound credentials file, every gate and the
+      // references run again against what the node has now.
+      guarded(spec, pre, async (o, ctx) => {
+        const { updateProgress } = ctx
+        const resultWarnings: string[] = [...ctx.newAdvisories]
+        if (o.mounted) {
+          if (lazy)
+            await assertNoNewHolders(mp, holders)
           updateProgress(`Unmounting ${mp}${lazy ? ' (lazy)' : ''}`)
           const r = await executor.exec(UMOUNT, lazy ? ['-l', mp] : [mp])
           if (r.exitCode !== 0 && !lazy)
             throw new Error(await enrichBusyError(executor, r.stderr.trim() || `umount exited ${r.exitCode}`, mp, configfsOptionsFrom(iscsiPaths)))
         }
-        if (entry) {
+        if (o.entry) {
           updateProgress('Removing /etc/fstab entry')
           let automount = false
           await editConfig(fstabPath, (current) => {
             automount = carriesAutomount(current, mp) // the line BEFORE the change
             return removeMount(current, mp)
           })
-          warnings.push(...await stopAutomountIf(automount, mp, updateProgress))
+          resultWarnings.push(...await stopAutomountIf(automount, mp, updateProgress))
           updateProgress('Reloading systemd (daemon-reload)')
           await daemonReload(executor)
         }
-        if (credentialsFile) {
+        // The file the confirm named (the scope check above proved it still is
+        // the one); removed only from the creds dir and only when no other line
+        // references it — decided on the fstab as it is after the line is gone.
+        const file = credentialsFileOf(o)
+        if (file) {
           updateProgress('Removing credentials file')
-          const kept = await removeCredentialsFileIfUnreferenced(credsDir, credentialsFile, await readConfig(fstabPath))
+          const kept = await removeCredentialsFileIfUnreferenced(credsDir, file, await readConfig(fstabPath))
           if (kept)
-            warnings.push(kept)
+            resultWarnings.push(kept)
         }
         if (removeMountpointDir) {
           // rmdir semantics only, and only once the mount is really gone. A
@@ -719,10 +929,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           updateProgress(`Removing the mountpoint directory ${mp}`)
           const left = await removeEmptyMountpointDir(mp, await isMounted(mp))
           if (left)
-            warnings.push(left)
+            resultWarnings.push(left)
         }
-        return { removed: mp, ...(warnings.length > 0 ? { warnings } : {}) }
-      },
+        return { removed: mp, ...(resultWarnings.length > 0 ? { warnings: resultWarnings } : {}) }
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -772,94 +983,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
 
   /** Is the mountpoint currently in the kernel mount table? */
   async function isMounted(mountpoint: string): Promise<boolean> {
-    const findmntText = await readFindmnt(executor)
-    return buildBaseInventory(findmntText, '', new Map()).find(r => r.mountpoint === mountpoint)?.mounted ?? false
-  }
-
-  /**
-   * Busy-unmount gate: if holders are present, 409-confirm carrying the list
-   * (force/lazy behind the gate). Returns 'sent' when the 409 was sent (caller
-   * must `return reply`), else `{ lazy }` telling the job whether to lazy-unmount.
-   */
-  async function busyGate(
-    mountpoint: string,
-    operation: string,
-    request: import('fastify').FastifyRequest,
-    reply: FastifyReply,
-  ): Promise<'sent' | { lazy: boolean }> {
-    const holders = await listHolders(executor, mountpoint)
-    if (holders.length === 0)
-      return { lazy: false }
-    if (!confirmGate(confirmStore, request, reply, {
-      operation,
-      params: { mountpoint },
-      message: `'${mountpoint}' is busy — ${holders.length} process(es) are holding it`,
-      warnings: [
-        `Unmounting '${mountpoint}' will be forced (lazy unmount); these holders lose access:`,
-        ...holders,
-      ],
-    })) {
-      return 'sent'
-    }
-    return { lazy: true } // confirmed
-  }
-
-  /**
-   * NAS-surface guard (operator ruling): ANAS mutates REMOTE share mounts
-   * only. Local filesystems are observe-only — the local-drive path is ZFS or
-   * AHR, not generic mount management. Returns a 400 body when
-   * the target exists and is not an NFS/CIFS mount; unknown targets fall
-   * through to the handlers' own 404s.
-   */
-  async function rejectIfNotRemote(
-    mountpoint: string,
-    entry: { fstype: string, spec: string } | undefined,
-    reply: FastifyReply,
-  ): Promise<object | undefined> {
-    let kind: string | undefined = entry ? classifyKind(entry.fstype, entry.spec) : undefined
-    if (kind === undefined) {
-      const findmntText = await readFindmnt(executor)
-      kind = buildBaseInventory(findmntText, '', new Map()).find(r => r.mountpoint === mountpoint)?.type
-    }
-    if (kind !== undefined && !isRemoteKind(kind)) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mountpoint}' is not an ANAS-managed filesystem — ANAS manages remote (NFS/CIFS) shares only` } }
-    }
-    return undefined
-  }
-
-  /** Reject a mutation on a PVE-owned mount (hands-off). Returns a body to send. */
-  async function rejectIfPve(mountpoint: string, reply: FastifyReply): Promise<object | undefined> {
-    if (mountpointReservedByPve(mountpoint) || pveStorageFor(mountpoint, await readPveMountPaths(storagePath))) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mountpoint}' is PVE-owned (hands-off) and cannot be modified by ANAS` } }
-    }
-    return undefined
-  }
-
-  /**
-   * Reject a mutation on an AHR pool's persistence (hands-off — mirrors
-   * rejectIfPve). A Mounts unmount/delete/edit on a pool's LV entry would rip
-   * the pool's persistence out from under the Hybrid RAID feature. Matches on
-   * the LV SPEC via the shared inventory tagging (never the mountpoint), so a
-   * custom-mountpoint pool is still refused.
-   */
-  async function rejectIfAhr(mountpoint: string, reply: FastifyReply): Promise<object | undefined> {
-    if (!mdadmConfPath)
-      return undefined
-    const [findmntText, fstabText, ahrSpecs] = await Promise.all([
-      readFindmnt(executor),
-      readConfig(fstabPath),
-      readAhrSpecs(),
-    ])
-    if (ahrSpecs.size === 0)
-      return undefined
-    const row = buildBaseInventory(findmntText, fstabText, new Map(), ahrSpecs).find(r => r.mountpoint === mountpoint)
-    if (row?.ahrManaged) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mountpoint}' is an ANAS Hybrid RAID (AHR) pool — manage it from the Hybrid RAID view, not the Mounts feature` } }
-    }
-    return undefined
+    return mountedIn(await readFindmnt(executor), mountpoint)
   }
 
   /** Parse + validate a URL-encoded mountpoint param, or 400 and return null. */
@@ -872,6 +996,18 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     }
     return parsed.data
   }
+}
+
+/** Does the findmnt table list `mountpoint` as mounted? */
+function mountedIn(findmntText: string, mountpoint: string): boolean {
+  return buildBaseInventory(findmntText, '', new Map()).find(r => r.mountpoint === mountpoint)?.mounted ?? false
+}
+
+/** The busy confirm's lines: the forced (lazy) unmount and who loses access. */
+function busyWarnings(mountpoint: string, holders: string[]): string[] {
+  if (holders.length === 0)
+    return []
+  return [`Unmounting '${mountpoint}' will be forced (lazy unmount); these holders lose access:`, ...holders]
 }
 
 /** systemctl daemon-reload — re-runs the fstab generator after an fstab edit. */
