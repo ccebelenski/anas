@@ -377,9 +377,16 @@
             if (!store || store.destroyed) {
                 return;
             }
+            // Supplementary groups: the daemon refuses membership of any
+            // group outside the share band with SYSTEM_ACCOUNT (cr.3 review
+            // C3), so root (gid 0, listed because it owns files) and any
+            // other system group are not offered here either.
             var data = [];
             for (var i = 0; i < rows.length; i++) {
-                data.push({ name: rows[i].name });
+                var gid = rows[i].gid;
+                if (typeof gid === 'number' && gid >= ID_MIN && gid <= ID_MAX) {
+                    data.push({ name: rows[i].name });
+                }
             }
             store.loadData(data);
         }, function (err) {

@@ -539,7 +539,7 @@ sub _forward {
             # AnyEvent::HTTP reports transport errors (connection refused, TLS,
             # timeout, ...) as pseudo-status 59x. Gateway unreachable -> 502.
             if (!defined($status) || $status =~ /^59\d$/) {
-                return _respond_502($self, $reqstate);
+                return _respond_502($self, $reqstate, $method, $target, $status, $hdr->{Reason});
             }
 
             my $reason = $hdr->{Reason};
@@ -563,9 +563,15 @@ sub _forward {
     return;
 }
 
-# Synthetic 502 when the loopback gateway cannot be reached.
+# Synthetic 502 when the loopback gateway cannot be reached. Logged like every
+# other answer this module gives (cr.27 review: it was the one silent path), with
+# AnyEvent::HTTP's transport pseudo-status and reason so the journal says WHY.
 sub _respond_502 {
-    my ($self, $reqstate) = @_;
+    my ($self, $reqstate, $method, $target, $status, $reason) = @_;
+    my ($path) = split /\?/, (defined($target) ? $target : '-'), 2;
+    my $peer = (ref($reqstate) eq 'HASH' && defined($reqstate->{peer_host})) ? $reqstate->{peer_host} : '-';
+    my $why  = (defined($status) ? $status : 'no status') . (defined($reason) && $reason ne '' ? " $reason" : '');
+    $LOG->("anas-proxy: 502 for " . (defined($method) ? $method : '-') . " $path from $peer: gateway not reachable on the loopback interface ($why)");
     my $resp = HTTP::Response->new(502, 'Bad Gateway');
     $resp->header('Content-Type' => 'application/json');
     $resp->content(

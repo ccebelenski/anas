@@ -293,8 +293,9 @@ function loadClusterCa(request: FastifyRequest, caPath: string): string | Buffer
  *   → forward https://B:8006/anas/api/nodes/B/v1/x
  *   → nodeB pveproxy strips → nodeB gateway sees /api/nodes/B/v1/x → served locally.
  *
- * The user's PVEAuthCookie rides along so the remote gateway verifies the ticket
- * against the replicated cluster authkey exactly as for a direct request, and
+ * The user's PVEAuthCookie rides along so the PEER's pveproxy authenticates the
+ * user and signs a fresh hand-off with its own key (cr.27: a gateway believes
+ * only its local pveproxy's assertion; nothing from this hop is trusted), and
  * PVE's `CSRFPreventionToken` header with it when the browser sent one. The
  * TLS hop is verified against the cluster CA (fail-closed if it is unreadable).
  * Connection failure → 502 NODE_UNREACHABLE — including a connect that never

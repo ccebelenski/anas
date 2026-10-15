@@ -171,9 +171,17 @@ require_ok('AnasProxy.pm');
       *{'AnasProxyTest::FakeServer::response'} = sub {
           my ($s, $rs, $resp) = @_; $captured = $resp; };
     }
+    my @logs;
+    no warnings 'once';
+    local $AnasProxy::LOG = sub { push @logs, $_[0] };
     AnasProxy::_respond_502($fake_self, {});
     ok($captured, 'response() was called');
     is($captured->code, 502, '502 status');
+    is(scalar(@logs), 1, 'the 502 is logged (the one path that was silent)');
+    like($logs[0], qr/^anas-proxy: 502 for - - from -: gateway not reachable/, 'log line without request context');
+    @logs = ();
+    AnasProxy::_respond_502($fake_self, { peer_host => '10.0.0.9' }, 'GET', '/api/nodes/n1/v1/pools?x=1', 595, 'Connection refused');
+    like($logs[0], qr{^anas-proxy: 502 for GET /api/nodes/n1/v1/pools from 10\.0\.0\.9: gateway not reachable on the loopback interface \(595 Connection refused\)$}, 'log line names method, path (no query), peer and the transport reason');
     like($captured->content, qr/UPSTREAM_UNREACHABLE/, 'carries the UPSTREAM_UNREACHABLE code');
     is($captured->header('Content-Type'), 'application/json', 'JSON content type');
 }
