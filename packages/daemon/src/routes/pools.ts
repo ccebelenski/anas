@@ -4,9 +4,10 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ParsedPoolStatus } from '../parsers/zpool-status.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { Advisory, Gate, GuardReads, GuardSpec } from '../safety/guard.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
-import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, isComposableDisk, isRemovableVdevRole, PoolMountpointRequest, PoolName, RemoveVdevRequest, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
+import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, DestroyPoolQuery, ExportPoolRequest, ImportPoolRequest, isComposableDisk, isRemovableVdevRole, PoolMountpointRequest, PoolName, pveStoragePath, RemoveVdevRequest, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
 import { parseByIdToKernel, parseByIdToKernelFull, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
@@ -16,12 +17,13 @@ import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parsePoolBusyState, parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
 import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
 import { confirmGate } from '../safety/gate.js'
-import { confirmGateBound, readPoolGuid, requireStableId } from '../safety/stable-id.js'
+import { guardCheck, guardConfirm, guarded, sendRefusal } from '../safety/guard.js'
+import { readPoolGuid } from '../safety/stable-id.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
-import { poolReferenceKey, poolReferenceWarning, poolReferenceWarnings, readPoolReferences } from '../services/pool-references.js'
+import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
 import { loadPveFootprint, systemPoolRefusalFrom } from '../services/pve-footprint.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
 import { syncZfsImportUnit } from '../services/zfs-import-unit.js'
@@ -56,6 +58,19 @@ const VDEV_NAME_RE = /^[\w-]+$/
 const VDEV_REMOVE_SETTLE_MS = 10_000
 /** Gap between the settle re-reads. */
 const VDEV_REMOVE_POLL_MS = 250
+
+/** The advisory key of the LIO-unreadable disclosure (export/destroy confirms). */
+const LIO_UNREADABLE_KEY = 'lio-unreadable'
+/** Fail-open is not fail-silent (D3): what the confirm says when the claims read broke. */
+const LIO_UNREADABLE_WARNING = 'ANAS could not check whether an iSCSI LUN is served from this pool — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.'
+
+/**
+ * Story cr.32 (WAVE3-DESIGN §5.2 rule 1): the request fields the export and
+ * destroy confirms do NOT sign, each with its reason. None: every field
+ * changes what the job does. `pools-guard.test.ts` pins both lists.
+ */
+export const POOL_EXPORT_PRESENTATION_ONLY: Record<string, string> = {}
+export const POOL_DESTROY_PRESENTATION_ONLY: Record<string, string> = {}
 
 /** A destroyed pool's vdev leaf, resolved for disk hygiene (story 3.14). */
 interface PoolLeaf {
@@ -650,17 +665,6 @@ export async function poolRoutes(
   const diskIdentityCache = opts.diskIdentityCache ?? new DiskIdentityCache(executor)
 
   /**
-   * Is an iSCSI LUN holding anything on this pool (story iscsi.6)?
-   *
-   * A zvol served as a block backstore, or an image file on one of the pool's
-   * datasets — both resolve onto the pool root in the claim, so ONE question
-   * covers both backing kinds.
-   */
-  async function poolHeldByLun(poolName: string, cache = createIscsiClaimCache(executor, iscsiPaths)) {
-    return heldByLun(cache, { pool: poolName })
-  }
-
-  /**
    * The paths the pool owns (story cr.24) — every dataset's mountpoint, read
    * FRESH each call so the confirm door and the job see the pool as it is now
    * (the job-time re-read is the whole point of ruling (j)). Only path
@@ -791,11 +795,13 @@ export async function poolRoutes(
 
   /**
    * The ONE pre-flight the two vdev-shape routes stand behind — adding a vdev
-   * and removing one reshape the same topology, so they ask the same two doors
-   * export/destroy and the dataset verbs stand behind: the system-pool 409
-   * (this node's boot filesystem, no bypass), then the PVE-ownership 400. PVE
-   * owns the topology of the pools it manages; ANAS does not reshape them
-   * (story pvepool.1).
+   * and removing one reshape the same topology, so they ask the same two
+   * questions: the system-pool 409 (this node's boot filesystem, no bypass),
+   * then the PVE-ownership 400. PVE owns the topology of the pools it manages;
+   * ANAS does not reshape them (story pvepool.1). Export and destroy ask the
+   * same facts through their guard gates (cr.32: `poolSystemGate`,
+   * `poolPveGate`, the latter a 409 PVE_MANAGED that also covers a storage
+   * nested in the pool); moving these two routes onto the guard is cr.36.
    *
    * Answers the error body to return — the reply code is already set — or null
    * when the request may proceed.
@@ -815,15 +821,151 @@ export async function poolRoutes(
     return null
   }
 
-  /** Every leaf disk of a pool resolved for disk cleanup (labelclear + zap). */
-  async function poolMemberLeaves(poolName: string): Promise<PoolLeaf[]> {
+  /**
+   * Every leaf of a pool, for disk cleanup (labelclear + zap) and for the
+   * destroy confirm's bound scope (cr.32). Null when `zpool status` cannot be
+   * read or does not list the pool — UNREADABLE, never "no leaves": a
+   * cleanup destroy is then refused rather than bound to an empty set.
+   */
+  async function readPoolLeaves(poolName: string): Promise<PoolLeaf[] | null> {
     const statusResult = await executor.exec(ZPOOL, ['status', '-jv'])
     if (statusResult.exitCode !== 0)
-      return []
+      return null
     const pool = parseZpoolStatusPool(statusResult.stdout, poolName)
-    if (!pool)
-      return []
-    return leavesFromStatus(pool)
+    return pool ? leavesFromStatus(pool) : null
+  }
+
+  // -------------------------------------------------------------------------
+  // The guard specs for pool export and destroy (story cr.32, WAVE3-DESIGN
+  // §3, ruling (j)). The route and the job run the SAME gate list against
+  // facts each door reads for itself: exists, system pool, PVE ownership,
+  // held by an iSCSI LUN. The cr.24 references stay advisories.
+  // -------------------------------------------------------------------------
+
+  /** The per-run reads the pool gates share (one per guard run, never across doors). */
+  const poolReads = {
+    list: (reads: GuardReads) => reads.once('zpool-list', () => executor.exec(ZPOOL, ['list', '-j'])),
+    footprint: (reads: GuardReads) => reads.once('pve-footprint', () => pveFootprint()),
+    claims: (reads: GuardReads) => reads.once('iscsi-claims', async () => createIscsiClaimCache(executor, iscsiPaths)),
+    leaves: (reads: GuardReads, pool: string) => reads.once(`pool-leaves:${pool}`, () => readPoolLeaves(pool)),
+  }
+
+  /** The object a pool verb acts on: a pool `zpool list` names now. */
+  interface PoolObject { name: string }
+
+  /**
+   * The SYSTEM-POOL gate (stories pvepool.1 + cr.23): the pool holds this
+   * node's boot filesystem or one of its filesystems sits at a system path —
+   * a hard 409, no confirm bypass, decided on facts (boot properties, the
+   * live mount table), never on the pool's name.
+   */
+  const poolSystemGate: Gate<PoolObject> = async (pool, reads) => {
+    const pve = await poolReads.footprint(reads)
+    if (!pve.isSystemPool(pool.name))
+      return null
+    const refusal = systemPoolRefusalFrom(pve, pool.name)
+    return { status: 409, code: 'CONFLICT', reason: refusal.reason, message: refusal.message }
+  }
+
+  /**
+   * The PVE-OWNERSHIP gate (cr.32; EPICS §2 "PVE territory is read-only and
+   * hands-off", DESIGN pvepool.1 "pool-level actions on a PVE pool stay
+   * hands-off"): a hard 409 PVE_MANAGED, no confirm bypass, when PVE owns the
+   * pool root OR any storage PVE keeps on the pool — exporting or destroying
+   * the pool takes a nested storage root (`tank/vmdata`) and every guest disk
+   * under it just the same. Both questions go to the ONE ownership answer
+   * (`ownershipOf`, the shared `pveOwnership` predicate); the storage paths
+   * are the candidates the recursive-verb guard already takes. The panel
+   * greys Export/Destroy on the same pools (any `pveStorages`).
+   */
+  const poolPveGate: Gate<PoolObject> = async (pool, reads) => {
+    const pve = await poolReads.footprint(reads)
+    const storagePaths = (pve.storagesByPool.get(pool.name) ?? [])
+      .map(ref => pveStoragePath(ref, pool.name))
+      .filter((path): path is string => path !== undefined)
+    const owned = pve.ownershipOf(pool.name) ?? pve.ownedDescendant(storagePaths, pool.name)?.ownership ?? null
+    if (!owned)
+      return null
+    return {
+      status: 409,
+      code: 'PVE_MANAGED',
+      reason: 'pve-managed',
+      message: `Pool '${pool.name}' is PVE territory: ${owned.reason}. Exporting or destroying a pool PVE uses is left to PVE — `
+        + `remove the storage in PVE (Datacenter → Storage) first if the pool is meant to go. This refusal has no confirm bypass.`,
+    }
+  }
+
+  /**
+   * The HELD-BY-LUN gate (story iscsi.6): a LUN serving anything on the pool
+   * makes export and destroy unsafe NOW — a hard 409, no confirm bypass.
+   * ZFS does not reliably refuse `zpool destroy` over a claimed zvol, and its
+   * `busy` for an export names nothing `fuser` can find (GT-40/41). Fail-open:
+   * no LIO ⇒ nothing held; an unreadable LIO tree is disclosed as an advisory.
+   */
+  function poolLunGate(action: 'Exporting' | 'Destroying'): Gate<PoolObject> {
+    return async (pool, reads) => {
+      const held = await heldByLun(await poolReads.claims(reads), { pool: pool.name })
+      if (!held)
+        return null
+      const refusal = heldByLunRefusal(`pool '${pool.name}'`, action, held)
+      return { status: 409, code: 'CONFLICT', reason: refusal.reason, message: refusal.message }
+    }
+  }
+
+  /**
+   * What still references the pool (story cr.24): one advisory per reference
+   * and per unreadable source, plus the LIO-unreadable disclosure (D3: a
+   * broken claims read fail-opens to "nothing held", which a node genuinely
+   * serving a LUN would look exactly like). Warn, never refuse; the job
+   * reports any the confirm did not list.
+   */
+  async function poolAdvisories(pool: PoolObject, reads: GuardReads): Promise<Advisory[]> {
+    const read = await poolReferences(pool.name)
+    const advisories: Advisory[] = [
+      ...read.refs.map(ref => ({ key: `ref:${poolReferenceKey(ref)}`, warning: poolReferenceWarning(ref) })),
+      ...read.unreadableSources.map(src => ({ key: `unreadable:${src.kind}`, warning: poolUnreadableWarning(src, pool.name) })),
+    ]
+    if (await (await poolReads.claims(reads)).readFailed())
+      advisories.push({ key: LIO_UNREADABLE_KEY, warning: LIO_UNREADABLE_WARNING })
+    return advisories
+  }
+
+  /**
+   * The guard spec of a pool-level verb. `cleanup` (destroy only) binds the
+   * leaves the cleanup would wipe as the confirm's scope: a leaf added between
+   * the challenge and the job changes what the operator agreed to wipe.
+   */
+  function poolGuardSpec(poolName: string, verb: 'export' | 'destroy', cleanup = false): GuardSpec<PoolObject> {
+    const action = verb === 'export' ? 'Exporting' : 'Destroying'
+    const noun = verb === 'export' ? 'an export' : 'a destroy'
+    return {
+      operation: verb === 'export' ? 'zpool.export' : 'zpool.destroy',
+      object: {
+        what: `Pool '${poolName}'`,
+        read: async (reads) => {
+          const list = await poolReads.list(reads)
+          const pools = list.exitCode === 0 ? parseZpoolList(list.stdout) : []
+          return pools.some(p => p.name === poolName) ? { name: poolName } : null
+        },
+        // Story ident.1: the pool's guid — an export/import swap under the
+        // same name is a different pool.
+        id: pool => readPoolGuid(executor, pool.name),
+        ...(cleanup
+          ? {
+              scope: async (pool: PoolObject, reads: GuardReads) => {
+                const leaves = await poolReads.leaves(reads, pool.name)
+                return leaves ? { leaves: leaves.map(l => l.leafId).sort().join(', ') } : null
+              },
+            }
+          : {}),
+        scopeLabels: { leaves: 'the disks to wipe' },
+        unbound: part => part === 'scope'
+          ? `Could not read the member disks of pool '${poolName}' — refusing a destroy with cleanup that cannot be bound to them`
+          : `Could not read the guid of pool '${poolName}' — refusing ${noun} that cannot be bound to it`,
+      },
+      gates: [poolSystemGate, poolPveGate, poolLunGate(action)],
+      advisories: poolAdvisories,
+    }
   }
 
   /**
@@ -2059,81 +2201,41 @@ export async function poolRoutes(
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid export request: ${bodyParsed.error.issues[0]?.message}` } }
     }
-    const force = bodyParsed.data?.force ?? false
+    const { force } = bodyParsed.data
 
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
 
-    const listResult = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
-    const pools = listResult.exitCode === 0 ? parseZpoolList(listResult.stdout) : []
-    if (!pools.some(p => p.name === poolName)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-    }
+    // Story cr.32: the one guard spec both doors run — exists, the
+    // system-pool hard 409 (pvepool.1 + cr.23: exporting it takes the running
+    // node's root away), the held-by-LUN hard 409 (iscsi.6) — and the cr.24
+    // references as advisories.
+    const spec = poolGuardSpec(poolName, 'export')
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
-    // SYSTEM-POOL GUARD (stories pvepool.1 + cr.23): the pool holds this
-    // node's boot filesystem or its storage sits at a system path — a hard
-    // 409 with NO confirm bypass. Exporting it takes the running node's root
-    // away; there is nothing to negotiate.
-    const systemBlock = await systemPoolBlock(poolName)
-    if (systemBlock) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: systemBlock.reason, message: systemBlock.message } }
-    }
-
-    // Story iscsi.6: a LUN on this pool makes the export unsafe NOW, so it is a
-    // hard 409 with no confirm bypass — BEFORE the confirm gate and before
-    // `zpool export`. ZFS does refuse an export whose dataset is open (GT-40),
-    // but only with `pool or dataset is busy` and only for the FILE kind that
-    // holds a mount; naming the LUN up front is the difference between "try
-    // again" and "here is what to do". Fail-open: no LIO ⇒ nothing held.
-    // The claims read is shared by the refusal above and the disclosure below —
-    // one read per request (Principle 11), one verdict.
-    const claimsCache = createIscsiClaimCache(executor, iscsiPaths)
-    const exportHeld = await poolHeldByLun(poolName, claimsCache)
-    if (exportHeld) {
-      const refusal = heldByLunRefusal(`pool '${poolName}'`, 'Exporting', exportHeld)
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
-    }
-
-    // Story cr.24: name what STILL references the pool — an SMB share, an NFS
-    // export, a backup/cloud/replication task, a snapshot/scrub schedule, a
-    // mount — so the operator decides with the facts (warn, never refuse). The
-    // generic "it becomes unavailable" line stays only when nothing specific
-    // was found; the unreadable-source sentences say what could not be checked.
-    const referencesRead = await poolReferences(poolName)
-    const referenceWarnings = poolReferenceWarnings(referencesRead, poolName)
+    // Story cr.24: name what STILL references the pool so the operator
+    // decides with the facts (warn, never refuse). The generic "it becomes
+    // unavailable" line stays only when nothing specific was found; the
+    // unreadable-source sentences say what could not be checked.
+    const referenceWarnings = pre.advisories.filter(a => a.key !== LIO_UNREADABLE_KEY)
     const warnings = [
       ...(referenceWarnings.length === 0
         ? [`Exporting '${poolName}' makes the pool and all its datasets unavailable until it is re-imported.`]
         : []),
-      ...referenceWarnings,
+      ...pre.advisories.map(a => a.warning),
     ]
-    // What the confirm listed — the job re-reads and reports anything new.
-    const confirmedReferenceKeys = new Set(referencesRead.refs.map(poolReferenceKey))
 
-    // Fail-open is not fail-silent (D3): when the claims read broke, the empty
-    // answer it fail-opened to is indistinguishable from "no LIO" — say so
-    // before the operator confirms. The hard-409 refusal above is unchanged.
-    if (await claimsCache.readFailed()) {
-      warnings.push('ANAS could not check whether an iSCSI LUN is served from this pool — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
-    }
-
-    // Story ident.1: the confirm is bound to the pool's guid, so a resend after
-    // an export/import swap under the same name is a 409 naming both guids,
-    // and the job re-reads it before it acts.
-    const exportGuid = await readPoolGuid(executor, poolName)
-    if (!exportGuid) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Could not read the guid of pool '${poolName}' — refusing an export that cannot be bound to it` } }
-    }
-    if (!confirmGateBound(confirmStore, request, reply, {
-      operation: 'zpool.export',
-      params: { pool: poolName },
-      bound: exportGuid,
-      what: `Pool '${poolName}'`,
+    // Story cr.32 (M3): the code signs the whole validated request — `force`
+    // included — plus the pool's guid (ident.1). A resend with another
+    // `force` is 409 CONFIRM_SCOPE_CHANGED; an export/import swap under the
+    // same name is 409 IDENTITY_MISMATCH.
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { pool: poolName, force },
+      address: ['pool'],
+      presentationOnly: POOL_EXPORT_PRESENTATION_ONLY,
       message: `Exporting pool '${poolName}' has consequences`,
       warnings,
     })) {
@@ -2144,24 +2246,15 @@ export async function poolRoutes(
 
     const job = jobQueue.submit(
       'zpool.export',
-      { ...identity, params: { pool: poolName, force, guid: exportGuid.guid } },
-      async () => {
-        await requireStableId(`Pool '${poolName}'`, exportGuid, () => readPoolGuid(executor, poolName))
-
-        // Story cr.24 (ruling (j)): the job re-reads what references the pool
-        // BEFORE the export runs and remembers anything the confirm did not
-        // list — the operator confirmed an export, so the record says what was
-        // still pointing at it when it ran. Never a job failure.
-        const freshReferences = await poolReferences(poolName)
-        const newRefWarnings = freshReferences.refs
-          .filter(ref => !confirmedReferenceKeys.has(poolReferenceKey(ref)))
-          .map(poolReferenceWarning)
-
+      { ...identity, params: { pool: poolName, force, guid: pre.bound.id.guid } },
+      // Ruling (j): the job re-reads the pool, compares the guid and re-runs
+      // every gate above before `zpool export`; a refusal fails the job with
+      // the gate's own code and sentence and nothing runs.
+      guarded(spec, pre, async (_pool, ctx) => {
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {
-          // A LUN added between the pre-flight refusal above and this exec still
-          // reaches ZFS, and ZFS's `pool or dataset is busy` names nothing that
-          // `fuser` can find (GT-41) — the LIO branch of the diagnosis does.
+          // ZFS's `pool or dataset is busy` names nothing `fuser` can find
+          // (GT-41) — the LIO branch of the diagnosis does.
           const base = result.stderr.trim() || `zpool export exited with code ${result.exitCode}`
           throw new Error(await enrichBusyError(executor, base, undefined, configfsOptionsFrom(iscsiPaths)))
         }
@@ -2172,25 +2265,29 @@ export async function poolRoutes(
         // plain failure, so the enabled unit fails every boot until the pool
         // comes back (twelve such units found on one real node). Re-import
         // re-enables. The root/boot pool can never get here: the system-pool
-        // guard 409s it before the job is submitted. Best-effort — the pool is
-        // already exported; a hiccup here is a warning, never a failed job.
+        // gate refuses it at both doors. Best-effort — the pool is already
+        // exported; a hiccup here is a warning, never a failed job.
         const unitWarning = await syncZfsImportUnit(executor, poolName, 'disable')
 
+        // Story cr.24 (ruling (j)): what references the pool now that the
+        // confirm did not list — the operator confirmed an export, so the
+        // record says what was still pointing at it when it ran.
         const resultWarnings: string[] = []
         if (unitWarning)
           resultWarnings.push(unitWarning)
-        resultWarnings.push(...newRefWarnings)
+        resultWarnings.push(...ctx.newAdvisories)
         return resultWarnings.length > 0 ? { warnings: resultWarnings } : null
-      },
+      }),
     )
 
     reply.code(202)
     return { job }
   })
 
-  // Destroy a pool (story 3.14) — the dangerous one. Blocked outright for the
-  // root/boot pool (Level 1, no override); otherwise confirmation-gated.
-  server.delete<{ Params: { name: string }, Querystring: { cleanup?: string } }>('/pools/:name', async (request, reply) => {
+  // Destroy a pool (story 3.14) — the dangerous one. Refused outright for a
+  // system pool, a PVE pool or a pool a LUN serves (no override); otherwise
+  // confirmation-gated.
+  server.delete<{ Params: { name: string }, Querystring: Record<string, unknown> }>('/pools/:name', async (request, reply) => {
     const nameParsed = PoolName.safeParse(request.params.name)
     if (!nameParsed.success) {
       reply.code(400)
@@ -2198,109 +2295,64 @@ export async function poolRoutes(
     }
     const poolName = nameParsed.data
     // Opt-in disk hygiene (PVE's "Clean Up Disks"): after destroy, wipe each
-    // freed member so it comes back pristine and immediately reusable.
-    const cleanup = request.query.cleanup === 'true' || request.query.cleanup === '1'
+    // freed member so it comes back pristine and immediately reusable. The
+    // flag is normalised (absent ≡ `false`) before the confirm signs it.
+    const { cleanup } = DestroyPoolQuery.parse(request.query ?? {})
 
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
 
-    const listResult = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
-    const pools = listResult.exitCode === 0 ? parseZpoolList(listResult.stdout) : []
-    if (!pools.some(p => p.name === poolName)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
-    }
-
-    // SYSTEM-POOL GUARD (stories pvepool.1 + cr.23): the pool holds this
-    // node's boot filesystem or its storage sits at a system path — a hard
-    // 409 with NO confirm bypass, decided on facts (boot properties, live
-    // mount table), never on the pool's name.
-    const systemBlock = await systemPoolBlock(poolName)
-    if (systemBlock) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: systemBlock.reason, message: systemBlock.message } }
-    }
-
-    // Story iscsi.6: refuse a destroy while a LUN serves anything on the pool.
-    // Unlike export, `zpool destroy` is NOT reliably refused by ZFS for a zvol
-    // backstore — and a destroy that gets through takes the data with it. Hard
-    // 409, no confirm bypass, before the confirm gate is even minted.
-    // The claims read is shared by the refusal and the disclosure below — one
-    // read per request (Principle 11), one verdict.
-    const claimsCache = createIscsiClaimCache(executor, iscsiPaths)
-    const destroyHeld = await poolHeldByLun(poolName, claimsCache)
-    if (destroyHeld) {
-      const refusal = heldByLunRefusal(`pool '${poolName}'`, 'Destroying', destroyHeld)
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
-    }
+    // Story cr.32: exists, system pool, PVE ownership, held by a LUN — the
+    // same list the job re-runs — and, with cleanup, the leaves it would wipe
+    // bound as the confirm's scope.
+    const spec = poolGuardSpec(poolName, 'destroy', cleanup)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const warnings = [
       `Destroying '${poolName}' is irreversible — all data in the pool is permanently lost.`,
       `Every dataset, snapshot, and volume in '${poolName}' will be destroyed.`,
     ]
-    if (cleanup)
+    if (cleanup) {
       warnings.push(`The pool's disks will be wiped clean (existing ZFS labels removed).`)
-
-    // Story cr.24: name what STILL references the pool, one warning per
-    // reference + one per unreadable source, so the operator decides with the
-    // facts (warn, never refuse). What the confirm listed is what the job
-    // compares against when it re-reads.
-    const referencesRead = await poolReferences(poolName)
-    warnings.push(...poolReferenceWarnings(referencesRead, poolName))
-    const confirmedReferenceKeys = new Set(referencesRead.refs.map(poolReferenceKey))
-
-    // Fail-open is not fail-silent (D3): a broken claims read fail-opens to
-    // "nothing held", which a node genuinely serving a LUN would look exactly
-    // like at this door. Disclose it; the hard-409 refusal above is unchanged.
-    if (await claimsCache.readFailed()) {
-      warnings.push('ANAS could not check whether an iSCSI LUN is served from this pool — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
+      // What is bound is what was shown (WAVE3-DESIGN §5.2 rule 2).
+      warnings.push(`Disks to wipe: ${pre.bound.scope?.leaves || 'none'}.`)
     }
+    // Story cr.24: what STILL references the pool, one warning per reference
+    // and per unreadable source, then the LIO-unreadable disclosure (warn,
+    // never refuse).
+    warnings.push(...pre.advisories.map(a => a.warning))
 
-    // The confirmation protects "destroy this pool" — `cleanup` is NOT part of
-    // the signature. The checkbox is chosen after the challenge is issued, so
-    // binding cleanup here would make the confirmed request (cleanup=true)
-    // mismatch the code minted for the challenge (cleanup=false) and 409 again.
-    //
-    // Story ident.1: bound to the pool's guid — a pool exported and another
-    // imported under the same name answers the resend 409 IDENTITY_MISMATCH,
-    // and the job re-reads the guid before it destroys anything.
-    const destroyGuid = await readPoolGuid(executor, poolName)
-    if (!destroyGuid) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Could not read the guid of pool '${poolName}' — refusing a destroy that cannot be bound to it` } }
-    }
-    if (!confirmGateBound(confirmStore, request, reply, {
-      operation: 'zpool.destroy',
-      params: { pool: poolName },
-      bound: destroyGuid,
-      what: `Pool '${poolName}'`,
+    // Story cr.32 (M3): `cleanup` is bound. The confirm window re-challenges
+    // in place when the box is ticked (cr.44), so the code always matches the
+    // request it confirms; a resend whose code was minted with the other value
+    // is 409 CONFIRM_SCOPE_CHANGED naming `cleanup`, with a fresh code.
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: { pool: poolName, cleanup },
+      address: ['pool'],
+      presentationOnly: POOL_DESTROY_PRESENTATION_ONLY,
       message: `Destroying pool '${poolName}' permanently erases all its data`,
       warnings,
     })) {
       return reply
     }
 
+    const guid = pre.bound.id.guid
     const job = jobQueue.submit(
       'zpool.destroy',
-      { ...identity, params: { pool: poolName, cleanup, guid: destroyGuid.guid } },
-      async (updateProgress) => {
-        await requireStableId(`Pool '${poolName}'`, destroyGuid, () => readPoolGuid(executor, poolName))
+      { ...identity, params: { pool: poolName, cleanup, guid } },
+      // Ruling (j): guid, the bound leaf set and every gate are re-checked
+      // against facts read now; a refusal fails the job before anything runs.
+      guarded(spec, pre, async (_pool, ctx) => {
+        const { updateProgress } = ctx
+        const newRefWarnings = ctx.newAdvisories
 
-        // Story cr.24 (ruling (j)): the job re-reads what references the pool
-        // BEFORE the destroy runs, while the pool can still answer, and
-        // remembers anything the confirm did not list — the operator confirmed
-        // a destroy, so the record says what was still pointing at it when it
-        // ran. Never a job failure.
-        const freshReferences = await poolReferences(poolName)
-        const newRefWarnings = freshReferences.refs
-          .filter(ref => !confirmedReferenceKeys.has(poolReferenceKey(ref)))
-          .map(poolReferenceWarning)
-
-        // Capture the member leaves BEFORE destroy — the pool must still exist
-        // to enumerate them — and resolve every leaf that names no disk.
-        const leaves = cleanup ? await resolveLeafDisks(await poolMemberLeaves(poolName)) : []
+        // The member leaves BEFORE destroy — the pool must still exist to
+        // enumerate them. These are the leaves the guard just compared with
+        // the confirmed set (same read); resolve every leaf that names no disk.
+        const leaves = cleanup ? await resolveLeafDisks((await poolReads.leaves(ctx.reads, poolName)) ?? []) : []
 
         const result = await executor.exec(ZPOOL, ['destroy', '--', poolName])
         if (result.exitCode !== 0) {
@@ -2313,8 +2365,8 @@ export async function poolRoutes(
         // PVE parity (PVE/API2/Disks/ZFS.pm, their fix for Proxmox bug #2554) and
         // issue #22: the create/import path enables zfs-import@<pool>.service, so
         // destroy disables it — otherwise the unit outlives the pool and fails at
-        // every boot. A system pool can never get here (the guard above
-        // decides on facts), so this never touches a boot pool's unit.
+        // every boot. A system pool can never get here (the gate refuses it at
+        // both doors), so this never touches a boot pool's unit.
         // Best-effort: the pool is already gone.
         const unitWarning = await syncZfsImportUnit(executor, poolName, 'disable')
         const unitWarnings = unitWarning ? [unitWarning] : []
@@ -2323,7 +2375,6 @@ export async function poolRoutes(
           const warnings = [...unitWarnings, ...newRefWarnings]
           return { destroyed: poolName, ...(warnings.length > 0 ? { warnings } : {}) }
         }
-
         // Opt-in disk hygiene ("Clean Up Disks"). All best-effort: the pool is
         // already destroyed, so nothing here may fail the job — every failure is
         // REPORTED in the result instead.
@@ -2360,12 +2411,12 @@ export async function poolRoutes(
           }
           const label = await executor.exec(BLKID, ['-p', '-s', 'UUID', '-o', 'value', leaf.leafPath])
           const labelGuid = label.exitCode === 0 ? label.stdout.trim() : ''
-          if (labelGuid !== destroyGuid.guid) {
+          if (labelGuid !== guid) {
             skipped.push({
               leaf: leaf.leafId,
               reason: labelGuid
-                ? `not cleaned: its ZFS label names pool guid ${labelGuid}, not ${destroyGuid.guid}`
-                : `not cleaned: no ZFS label of pool guid ${destroyGuid.guid} found on it`,
+                ? `not cleaned: its ZFS label names pool guid ${labelGuid}, not ${guid}`
+                : `not cleaned: no ZFS label of pool guid ${guid} found on it`,
             })
             continue
           }
@@ -2434,7 +2485,7 @@ export async function poolRoutes(
         if (preserved.length > 0)
           cleanupResult.preserved = preserved
         return cleanupResult
-      },
+      }),
     )
 
     reply.code(202)

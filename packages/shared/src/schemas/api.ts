@@ -56,6 +56,20 @@ export const ErrorCode = z.enum([
    * `Content-Type`, or a body without one — the daemon accepts JSON only.
    */
   'UNSUPPORTED_MEDIA_TYPE',
+  /**
+   * 409 — cr.32 (WAVE3-DESIGN §3.2): the object is the same one, but its state
+   * (or the set a destructive verb would sweep) is not the one the request
+   * was computed from; nothing was done.
+   */
+  'STATE_CHANGED',
+  /**
+   * 409 — cr.32 (WAVE3-DESIGN §5.2): the confirm code was minted for this
+   * object with different request options; the error names the fields and
+   * carries a fresh code.
+   */
+  'CONFIRM_SCOPE_CHANGED',
+  /** 503 — cr.32/cr.34 (WAVE3-DESIGN §6): a read a gate needed did not answer within its deadline. */
+  'TIMEOUT',
 ])
 export type ErrorCode = z.infer<typeof ErrorCode>
 

@@ -126,12 +126,14 @@ describe('destroy endpoint: DELETE /v1/pools/:name', () => {
     assert.equal(job.status, 'completed')
   })
 
-  it('wipes the freed member disks when cleanup=true', async () => {
+  it('wipes the freed member disks when cleanup=true — and cleanup is BOUND into the code (cr.32)', async () => {
     server = createServer({ mock: true, logger: false })
 
-    // The UI challenges WITHOUT cleanup (the checkbox is shown afterward), then
-    // resends WITH cleanup=true. cleanup must NOT be part of the confirmation
-    // signature, or the resend 409s — the bug this guards against.
+    // Until cr.32 the UI challenged WITHOUT cleanup and resent WITH it, and
+    // cleanup was deliberately left out of the signature. The confirm now binds
+    // it (WAVE3-DESIGN §5.2; the window re-challenges in place, cr.44): the old
+    // two-step answers 409 CONFIRM_SCOPE_CHANGED naming `cleanup`, with a fresh
+    // code minted for the cleanup request, which then confirms it.
     const first = await server.inject({
       method: 'DELETE',
       url: '/v1/pools/testpool',
@@ -140,10 +142,23 @@ describe('destroy endpoint: DELETE /v1/pools/:name', () => {
     assert.equal(first.statusCode, 409)
     const code = first.headers['x-anas-confirm-code'] as string
 
-    const res = await server.inject({
+    const changed = await server.inject({
       method: 'DELETE',
       url: '/v1/pools/testpool?cleanup=true',
       headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code },
+    })
+    assert.equal(changed.statusCode, 409)
+    assert.equal(changed.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.deepEqual(changed.json().error.changed, ['cleanup'])
+    assert.match(changed.json().error.message, /You confirmed with cleanup off; this request has cleanup on/)
+    assert.ok(changed.json().error.warnings.some((w: string) => /disks will be wiped clean/.test(w)), 'the wipe warning is shown before the confirm')
+    const fresh = changed.headers['x-anas-confirm-code'] as string
+    assert.ok(fresh && fresh !== code)
+
+    const res = await server.inject({
+      method: 'DELETE',
+      url: '/v1/pools/testpool?cleanup=true',
+      headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': fresh },
     })
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, (res.json() as JobAccepted).job.id)

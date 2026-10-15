@@ -60,3 +60,39 @@ describe('ConfirmStore', () => {
     assert.equal(store.verifyCode(code, 'zpool.destroy', { pool: 'tank' }), false)
   })
 })
+
+describe('ConfirmStore.explainMismatch (cr.32)', () => {
+  it('names the param keys that differ, and consumes the code', () => {
+    const store = new ConfirmStore()
+    const { code } = store.generateCode('zpool.destroy', { pool: 'tank', cleanup: false }, { guid: '1' })
+    const why = store.explainMismatch(code, 'zpool.destroy', { pool: 'tank', cleanup: true }, { guid: '1' })
+    assert.deepEqual(why, { params: ['cleanup'], bound: [], was: { params: { pool: 'tank', cleanup: false }, bound: { guid: '1' } } })
+    assert.equal(store.verifyCode(code, 'zpool.destroy', { pool: 'tank', cleanup: false }, { guid: '1' }), false, 'consumed')
+  })
+
+  it('names the bound keys that differ', () => {
+    const store = new ConfirmStore()
+    const { code } = store.generateCode('zpool.destroy', { pool: 'tank' }, { 'guid': '1', '@scope:leaves': 'a' })
+    const why = store.explainMismatch(code, 'zpool.destroy', { pool: 'tank' }, { 'guid': '1', '@scope:leaves': 'a, b' })
+    assert.deepEqual(why?.bound, ['@scope:leaves'])
+    assert.deepEqual(why?.params, [])
+  })
+
+  it('is null — and leaves the code alone — for an exact match, another operation, or another object', () => {
+    const store = new ConfirmStore()
+    const { code } = store.generateCode('zpool.export', { pool: 'tank', force: false }, { guid: '1' })
+    assert.equal(store.explainMismatch(code, 'zpool.export', { pool: 'tank', force: false }, { guid: '1' }), null)
+    assert.equal(store.explainMismatch(code, 'zpool.destroy', { pool: 'tank', force: true }, { guid: '1' }), null)
+    assert.equal(store.explainMismatch(code, 'zpool.export', { pool: 'other', force: true }, { guid: '1' }, { sameKeys: ['pool'] }), null)
+    assert.equal(store.verifyCode(code, 'zpool.export', { pool: 'tank', force: false }, { guid: '1' }), true, 'still valid')
+  })
+
+  it('is null for an unknown or expired code', () => {
+    let t = 1000
+    const store = new ConfirmStore({ ttlMs: 10, now: () => t })
+    const { code } = store.generateCode('zpool.export', { pool: 'tank', force: false })
+    assert.equal(store.explainMismatch('nope', 'zpool.export', { pool: 'tank', force: true }), null)
+    t = 2000
+    assert.equal(store.explainMismatch(code, 'zpool.export', { pool: 'tank', force: true }), null)
+  })
+})

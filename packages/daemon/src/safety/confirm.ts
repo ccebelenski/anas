@@ -28,6 +28,10 @@ export interface ConfirmStoreOptions {
 }
 
 interface ConfirmEntry {
+  /** The operation the code was minted for. */
+  operation: string
+  /** The params it was minted for, as signed — what {@link ConfirmStore.explainMismatch} compares. */
+  params: Record<string, unknown>
   /** Operation signature this code authorizes (operation + params + bound id). */
   signature: string
   /** The signature WITHOUT the bound id — what a name-only match compares. */
@@ -44,6 +48,17 @@ interface ConfirmEntry {
 /** The stable id a confirm is bound to: a few named string facts (`{ guid }`). */
 export type BoundId = Record<string, string>
 
+/**
+ * Why a code does not verify for a request it was resent with (story cr.32):
+ * the param keys and the bound keys whose values differ, and what the code
+ * was minted for.
+ */
+export interface ConfirmMismatch {
+  params: string[]
+  bound: string[]
+  was: { params: Record<string, unknown>, bound: BoundId }
+}
+
 /** A generated code plus its ISO-8601 expiry (for the X-Anas-Confirm-Expires header). */
 export interface GeneratedConfirm {
   code: string
@@ -51,6 +66,12 @@ export interface GeneratedConfirm {
 }
 
 const HYPHENS = /-/g
+
+/** The keys of either record whose values differ (a missing key differs from any value). */
+function differingKeys(a: Record<string, unknown>, b: Record<string, unknown>): string[] {
+  const keys = Object.keys({ ...a, ...b }).sort()
+  return keys.filter(k => (k in a) !== (k in b) || stableStringify(a[k]) !== stableStringify(b[k]))
+}
 
 /** Stable JSON: object keys sorted so signatures are order-independent. */
 function stableStringify(value: unknown): string {
@@ -97,6 +118,8 @@ export class ConfirmStore {
     const code = randomUUID().replace(HYPHENS, '').slice(0, 12)
     const expiresAt = this.now() + this.ttlMs
     this.entries.set(code, {
+      operation,
+      params: JSON.parse(stableStringify(params)) as Record<string, unknown>,
       signature: this.signature(operation, params, bound),
       base: this.signature(operation, params),
       ...(bound ? { bound: { ...bound } } : {}),
@@ -142,5 +165,34 @@ export class ConfirmStore {
       return null
     this.entries.delete(code)
     return entry.bound
+  }
+
+  /**
+   * Story cr.32 (WAVE3-DESIGN §5.2): `code` does not verify for this request —
+   * say why. Returns the param keys and bound keys whose values differ from
+   * what the code was minted for (and consumes the code, which can never
+   * verify again), or null when the code is unknown, expired, minted for
+   * another operation, minted for another object (any of `sameKeys` differs —
+   * the code stays usable there), or matches exactly. The guard turns the
+   * answer into 409 CONFIRM_SCOPE_CHANGED / IDENTITY_MISMATCH / STATE_CHANGED.
+   */
+  explainMismatch(
+    code: string,
+    operation: string,
+    params: Record<string, unknown>,
+    bound?: BoundId,
+    opts: { sameKeys?: string[] } = {},
+  ): ConfirmMismatch | null {
+    const entry = this.entries.get(code)
+    if (!entry || entry.expiresAt <= this.now() || entry.operation !== operation)
+      return null
+    const changedParams = differingKeys(entry.params, params)
+    if ((opts.sameKeys ?? []).some(k => changedParams.includes(k)))
+      return null
+    const changedBound = differingKeys(entry.bound ?? {}, bound ?? {})
+    if (changedParams.length === 0 && changedBound.length === 0)
+      return null
+    this.entries.delete(code)
+    return { params: changedParams, bound: changedBound, was: { params: entry.params, bound: { ...(entry.bound ?? {}) } } }
   }
 }

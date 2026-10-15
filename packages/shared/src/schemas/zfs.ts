@@ -454,13 +454,36 @@ export type TrimPoolRequest = z.infer<typeof TrimPoolRequest>
 // Pool feature-flag upgrade (POST /v1/pools/:name/upgrade) needs no body — it
 // enables all supported features on the pool. One-way; the UI must warn.
 
-/** Export a pool (POST /v1/pools/:name/export) */
+/**
+ * Export a pool (POST /v1/pools/:name/export). The body may be absent; the
+ * parse applies the default either way, so an omitted `force` and an explicit
+ * `false` are the same request — the confirm code signs the parsed value
+ * (cr.32).
+ */
 export const ExportPoolRequest = z
   .object({
-    force: z.boolean().optional(),
+    force: z.boolean().default(false),
   })
-  .optional()
+  .default({ force: false })
 export type ExportPoolRequest = z.infer<typeof ExportPoolRequest>
+
+/**
+ * A pool-destroy query flag as the route has always read it: `true` or `1`
+ * is on; anything else — absent, `false`, `0`, an empty value, another
+ * spelling, a repeated key (which arrives as an array) — is off. Lenient on
+ * purpose: the destroy confirm is unconditional, and cr.44 pins that every
+ * one of these forms meets the confirm rather than a 400. The value is
+ * normalised before the confirm signs it (cr.32), so `?cleanup=false` and an
+ * absent flag sign the same.
+ */
+export const PoolQueryFlag = z.unknown().transform(v => v === true || v === 'true' || v === '1')
+
+/** Query params for DELETE /v1/pools/:name (story 3.14; bound into the confirm by cr.32). */
+export const DestroyPoolQuery = z.object({
+  /** Opt-in disk hygiene after the destroy (PVE's "Clean Up Disks"). */
+  cleanup: PoolQueryFlag,
+})
+export type DestroyPoolQuery = z.infer<typeof DestroyPoolQuery>
 
 /** Import a pool (POST /v1/pools/import) */
 export const ImportPoolRequest = z

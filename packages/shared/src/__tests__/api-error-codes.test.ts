@@ -32,6 +32,10 @@ const EMITTED_CODES = [
   'IDENTITY_MISMATCH',
   'NOT_CANCELLABLE',
   'UPSTREAM_ERROR',
+  // cr.32: the guard (safety/guard.ts) — a job refusal or a re-challenged confirm.
+  'STATE_CHANGED',
+  'CONFIRM_SCOPE_CHANGED',
+  'TIMEOUT',
   // gateway
   'NODE_UNREACHABLE',
   'ANAS_NOT_INSTALLED',

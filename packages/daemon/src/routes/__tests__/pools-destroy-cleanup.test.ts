@@ -109,9 +109,13 @@ async function waitForJob(jobQueue: JobQueue, id: string): Promise<Job> {
   throw new Error(`job ${id} did not finish`)
 }
 
-/** DELETE with the confirm two-step, resending with cleanup=true. */
+/**
+ * DELETE with the confirm two-step, both requests with cleanup=true — the
+ * confirm binds `cleanup` (cr.32), so the challenge is for the request the
+ * code confirms (the confirm window re-challenges when the box is ticked, cr.44).
+ */
 async function destroyWithCleanup(server: ReturnType<typeof Fastify>, jobQueue: JobQueue, pool: string): Promise<Job> {
-  const first = await server.inject({ method: 'DELETE', url: `/v1/pools/${pool}`, headers: IDENTITY_HEADERS })
+  const first = await server.inject({ method: 'DELETE', url: `/v1/pools/${pool}?cleanup=true`, headers: IDENTITY_HEADERS })
   assert.equal(first.statusCode, 409)
   const code = first.headers['x-anas-confirm-code'] as string
   const res = await server.inject({
