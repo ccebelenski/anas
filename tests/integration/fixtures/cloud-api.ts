@@ -1,4 +1,5 @@
 import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import { expect } from '@playwright/test'
 import { apiContext } from './auth'
 import { NODE_NAME, PVE_URL } from './target'
 

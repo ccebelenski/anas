@@ -285,7 +285,7 @@ test.describe('ident.1 — ZFS ownership stamps, stable-id confirms, wipe-by-ide
     expect((await sshExec(`blkid -p -s UUID -o value ${leaf}`)).trim(), 'blkid reads the pool guid as UUID').toBe(guid)
 
     const url = `${V1}/pools/${PART_POOL}`
-    const code = await challenge(ctx, url)
+    const code = await challenge(ctx, `${url}?cleanup=true`)
     const done = await accepted(ctx, await ctx.delete(`${url}?cleanup=true`, { headers: { 'x-anas-confirm': code } }))
     expect(done.status, JSON.stringify(done.error ?? '')).toBe('completed')
     const result = done.result as { wiped?: string[], zapped?: string[], preserved?: { disk: string, reason: string }[] }

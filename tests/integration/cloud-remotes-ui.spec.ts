@@ -2,6 +2,7 @@ import type { APIRequestContext, Locator, Page } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { expect, test } from '@playwright/test'
+import { apiContext } from './fixtures/auth'
 import { loginToPve, NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
