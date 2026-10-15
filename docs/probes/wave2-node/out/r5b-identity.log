@@ -1,0 +1,55 @@
+
+### 3 — user w2u2 uid 51001 while group w2g1 holds gid 51001: challenge, then resend WITH the code
+  HTTP 409 0.067997
+  X-Anas-Confirm-Code: 8fd1f98658f4
+  {"error":{"code":"CONFIRMATION_REQUIRED","message":"Create user 'w2u2' with uid 51001?","warnings":["Group 'w2g1' already has gid 51001. User 'w2u2' will get uid 51001 with primary group gid 100 (the default), so uid 51001 and gid 51001 will belong to two unrelated accounts. To avoid it, give another User ID, choose 'w2g1' as the primary group, or leave the User ID empty and ANAS picks one no group holds as its gid."]}}
+> resend with x-anas-confirm: 8fd1f98658f4
+  HTTP 202 0.055888
+  {"job":{"id":"771de087-e915-4cf2-a582-4a9dd06dd51e","status":"running","operation":"identity.user.add","createdAt":"2026-10-15T22:25:31.888Z","createdBy":"root@pam"}}
+  [t+1s] completed | Creating share user 'w2u2' with uid 51001 | {"created": "w2u2", "uid": 51001, "smbEnabled": false} | 
+w2u2:x:51001:100::/home/w2u2:/usr/sbin/nologin
+uid=51001(w2u2) gid=100(users) groups=100(users)
+w2g1:x:51001:
+
+### 3b — group w2g2 with gid = w2u1's uid: challenge, then resend WITH the code
+  HTTP 409 0.042304
+  X-Anas-Confirm-Code: f898fa7d5859
+  {"error":{"code":"CONFIRMATION_REQUIRED","message":"Create group 'w2g2' with gid 1002?","warnings":["User 'w2u1' already has uid 1002, and its primary group is gid 100. Group 'w2g2' will get gid 1002, so uid 1002 and gid 1002 will belong to two unrelated accounts: 'w2g2' looks like the private group of 'w2u1' without being it. To avoid it, give another Group ID, or leave it empty and ANAS picks one no user holds as its uid."]}}
+> resend with x-anas-confirm: f898fa7d5859
+  HTTP 202 0.027269
+  {"job":{"id":"6d041c7b-042d-46e0-b94f-287b68f51aed","status":"running","operation":"identity.group.add","createdAt":"2026-10-15T22:25:33.133Z","createdBy":"root@pam"}}
+  [t+0s] completed | Creating group 'w2g2' with gid 1002 | {"created": "w2g2", "gid": 1002} | 
+w2g2:x:1002:
+
+### 3c — a replayed code after the state changed (w2u2 exists now): the same body + the first code again
+  HTTP 409 0.017577
+  {"error":{"code":"CONFLICT","message":"User 'w2u2' already exists"}}
+
+### 5b — group w2u7 (gid 51007) is the primary group of users w2u7 (uid 51008) AND w2u8 (uid 51009); delete w2u7
+  HTTP 202 0.024312
+  {"job":{"id":"cf547104-a16a-430d-b98c-e8301f182012","status":"running","operation":"identity.group.add","createdAt":"2026-10-15T22:25:33.445Z","createdBy":"root@pam"}}
+  [t+0s] completed | Creating group 'w2u7' with gid 51007 | {"created": "w2u7", "gid": 51007} | 
+  HTTP 202 0.084944
+  {"job":{"id":"44e16fbb-b455-47f2-8814-d7de3b59c67f","status":"running","operation":"identity.user.add","createdAt":"2026-10-15T22:25:33.647Z","createdBy":"root@pam"}}
+  [t+1s] completed | Creating share user 'w2u7' with uid 51008 | {"created": "w2u7", "uid": 51008, "smbEnabled": false} | 
+  HTTP 202 0.082694
+  {"job":{"id":"68e67900-dbb0-4097-bad6-aa2bb3494ce2","status":"running","operation":"identity.user.add","createdAt":"2026-10-15T22:25:34.456Z","createdBy":"root@pam"}}
+  [t+1s] completed | Creating share user 'w2u8' with uid 51009 | {"created": "w2u8", "uid": 51009, "smbEnabled": false} | 
+  HTTP 409 0.042825
+  X-Anas-Confirm-Code: 8284b847dd05
+  {"error":{"code":"CONFIRMATION_REQUIRED","message":"Deleting share user 'w2u7' removes the account","warnings":["User 'w2u7' (uid 51008) will be removed from the system","Files owned by this user keep uid 51008. ANAS will not give uid 51008 to a new user while it still owns files on an imported ZFS filesystem or under a share, but it cannot check ids seen only in exported pools, on disconnected disks or in backups. To give the files back later, re-create the user with User ID 51008."]}}
+  HTTP 202 0.036316
+  {"job":{"id":"45dc77b8-4fef-499f-8971-1f23e948e9d5","status":"running","operation":"identity.user.delete","createdAt":"2026-10-15T22:25:35.254Z","createdBy":"root@pam"}}
+  [t+0s] completed | Deleting share user 'w2u7' | {"deleted": "w2u7", "smbEntryRemoved": false, "groupRemoved": null} | 
+  user w2u7 gone
+w2u7:x:51007:
+  group w2u7 SURVIVES
+uid=51009(w2u8) gid=51007(w2u7) groups=51007(w2u7)
+
+### audit
+   job.submitted identity.user.add {"user": "w2u2", "uid": 51001, "explicit": true, "smbEnabled": false}
+   job.submitted identity.group.add {"group": "w2g2", "gid": 1002, "explicit": true}
+   job.submitted identity.group.add {"group": "w2u7", "gid": 51007, "explicit": true}
+   job.submitted identity.user.add {"user": "w2u7", "uid": 51008, "explicit": true, "primaryGroup": "w2u7", "primaryGid": 51007, "smbEnabled": false}
+   job.submitted identity.user.add {"user": "w2u8", "uid": 51009, "explicit": true, "primaryGroup": "w2u7", "primaryGid": 51007, "smbEnabled": false}
+   job.submitted identity.user.delete {"user": "w2u7"}

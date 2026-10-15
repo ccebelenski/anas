@@ -1,0 +1,57 @@
+
+### dataset gtbackup/w2src
+HTTP 400 0.018654
+{"error":{"code":"VALIDATION_ERROR","message":"Invalid create request: Invalid input: expected string, received undefined"}}
+3.0K	/gtbackup/w2src
+
+### nft blackhole for 192.0.2.10
+table inet w2bh {
+	chain out {
+		type filter hook output priority filter; policy accept;
+		ip daddr 192.0.2.10 drop
+		ip daddr 192.0.2.10 drop
+	}
+}
+
+### cloud fixture
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+-rw------- 1 root root 0 Oct 15 17:13 /etc/anas/rclone.conf.pre-fixture
+no store (yet)
+
+### cloud remotes w2ok, w2bh
+HTTP 202 0.111067
+{"job":{"id":"d9c74e0e-ec8d-48f2-9350-5cc6689fb854","status":"running","operation":"cloud.remote.create","createdAt":"2026-10-15T22:17:00.640Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"name": "w2ok", "type": "sftp", "options": {"host": "127.0.0.1", "user": "rclonegt"}, "secretsSet": ["pass"]} | 
+HTTP 202 0.100266
+{"job":{"id":"c23a9de7-d4fb-4ac6-96c9-e05aff43a0a0","status":"running","operation":"cloud.remote.create","createdAt":"2026-10-15T22:17:01.385Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"name": "w2bh", "type": "sftp", "options": {"host": "192.0.2.10", "user": "nobody"}, "secretsSet": ["pass"]} | 
+
+### backup repo w2bh
+HTTP 202 0.016736
+{"job":{"id":"2d930a4b-eabb-4fb9-8eb9-6f5c4fb0507c","status":"running","operation":"backup.repo.create","createdAt":"2026-10-15T22:17:02.124Z","createdBy":"root@pam"}}
+[t+0s] completed |  | {"created": "w2bh", "version": 2} | 
+
+### backup task w2b1
+HTTP 202 0.024900
+{"job":{"id":"50b333cb-3bf5-4b1f-9734-d1abab2a7f41","status":"running","operation":"backup.task.create","createdAt":"2026-10-15T22:17:02.233Z","createdBy":"root@pam"}}
+[t+0s] completed |  | {"created": "w2b1"} | 
+
+### backup task w2b2
+HTTP 202 0.020604
+{"job":{"id":"db137a5c-9619-4bcf-96ec-29dd64e9d0d7","status":"running","operation":"backup.task.create","createdAt":"2026-10-15T22:17:02.896Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"created": "w2b2"} | 
+
+### backup task w2b3
+HTTP 202 0.019608
+{"job":{"id":"da82d160-0225-442c-9e74-e27188babebc","status":"running","operation":"backup.task.create","createdAt":"2026-10-15T22:17:03.569Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"created": "w2b3"} | 
+
+### snapshot schedule w2snap
+HTTP 400 0.033345
+{"error":{"code":"VALIDATION_ERROR","message":"Dataset 'gtbackup/w2src' does not exist"}}
+anas-backup-w2b1.service
+anas-backup-w2b1.timer
+anas-backup-w2b2.service
+anas-backup-w2b2.timer
+anas-backup-w2b3.service
+anas-backup-w2b3.timer

@@ -1,0 +1,12 @@
+(node:814871) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:814937) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/vdev-consumers-api.spec.ts:125:3 › vdevs.1 slice 2 — the vdev-class consumers, live › a faulted log leaf moves the disk row and raises the pool warning (1.6s)
+  ✓  2 [integration] › tests/integration/vdev-consumers-api.spec.ts:190:5 › vdevs.1 slice 2 — the vdev-class consumers, live › UI › the replace surface lists the special leaf as a replaceable member (3.8s)
+  ✓  3 [integration] › tests/integration/vdev-consumers-api.spec.ts:228:3 › vdevs.1 slice 2 — the vdev-class consumers, live › destroy with cleanup labelclears the data, log, special and dedup partitions and keeps the cache and spare (3.5s)
+
+  3 passed (21.5s)

@@ -1,0 +1,20 @@
+# 12 GETs /pools through :8006/anas
+      1 HTTP 200 0.028716
+      1 HTTP 200 0.028810
+      1 HTTP 200 0.029718
+      1 HTTP 200 0.036423
+      1 HTTP 200 0.037375
+      1 HTTP 200 0.037513
+      1 HTTP 200 0.040829
+      1 HTTP 200 0.047340
+      1 HTTP 200 0.051138
+      1 HTTP 200 0.052034
+      1 HTTP 200 0.062768
+      1 HTTP 200 0.064103
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: starting 3 worker(s)
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: worker 1413 started
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: worker 1414 started
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: worker 1415 started
+2026-10-15T22:06:32+00:00 anas-pve systemd[1]: Started pveproxy.service - PVE API Proxy Server.
+workers:
+1413 1414 1415 

@@ -1,0 +1,39 @@
+(node:799624) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:799737) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/vdev-consumers-api.spec.ts:125:3 › vdevs.1 slice 2 — the vdev-class consumers, live › a faulted log leaf moves the disk row and raises the pool warning (1.4s)
+  ✓  2 [integration] › tests/integration/vdev-consumers-api.spec.ts:190:5 › vdevs.1 slice 2 — the vdev-class consumers, live › UI › the replace surface lists the special leaf as a replaceable member (3.8s)
+[w2 observe] job result: {"destroyed":"gtvdev","warnings":["sdb3: not cleaned: a cache (L2ARC) device's ZFS label names no pool","sdb4: not cleaned: a hot spare's ZFS label names no pool (a spare can serve other pools)"],"skipped":[{"leaf":"sdb3","reason":"not cleaned: a cache (L2ARC) device's ZFS label names no pool"},{"leaf":"sdb4","reason":"not cleaned: a hot spare's ZFS label names no pool (a spare can serve other pools)"}],"wiped":["sdb1","sdb2","sdb5","sdb6"],"preserved":[{"disk":"sdb","reason":"shared"}]}
+  ✘  3 [integration] › tests/integration/vdev-consumers-api.spec.ts:228:3 › vdevs.1 slice 2 — the vdev-class consumers, live › destroy with cleanup labelclears the data, log, special and dedup partitions and keeps the cache and spare (2.4s)
+
+
+  1) [integration] › tests/integration/vdev-consumers-api.spec.ts:228:3 › vdevs.1 slice 2 — the vdev-class consumers, live › destroy with cleanup labelclears the data, log, special and dedup partitions and keeps the cache and spare 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoEqual[2m([22m[32mexpected[39m[2m) // deep equality[22m
+
+    [32m- Expected  - 2[39m
+    [31m+ Received  + 2[39m
+
+    [2m  Array [[22m
+    [32m-   "sdb3",[39m
+    [32m-   "sdb4",[39m
+    [31m+   undefined,[39m
+    [31m+   undefined,[39m
+    [2m  ][22m
+
+      268 |       const result = job.result as { wiped: string[], skipped: { device: string, reason: string }[] }
+      269 |       expect([...result.wiped].sort()).toEqual(wiped.map(part).sort())
+    > 270 |       expect(result.skipped.map(s => s.device).sort()).toEqual(kept.map(part).sort())
+          |                                                        ^
+      271 |
+      272 |       // The node's own verdict, per partition. GROUND TRUTH (ZFS 2.4.4):
+      273 |       // `zpool labelclear` has no read-only `-c` ("invalid option 'c'"), so the
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-acd7d1b88f6e61c61/tests/integration/vdev-consumers-api.spec.ts:270:56
+
+  1 failed
+    [integration] › tests/integration/vdev-consumers-api.spec.ts:228:3 › vdevs.1 slice 2 — the vdev-class consumers, live › destroy with cleanup labelclears the data, log, special and dedup partitions and keeps the cache and spare 
+  2 passed (20.3s)

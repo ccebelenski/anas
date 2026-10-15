@@ -1,0 +1,13 @@
+host files: 2192   node files: 2192
+host list hash: 1303cdef0c086ef9
+node list hash: 1303cdef0c086ef9
+IDENTICAL
+--- spot list
+3dd8411a7c133a70  packages/daemon/dist/jobs/authority.js
+3d8544ffba3622cc  packages/daemon/dist/jobs/queue.js
+c948779c6f314412  packages/daemon/dist/jobs/read-jobs.js
+57e462affbbeb8ba  packages/daemon/dist/routes/share-identity.js
+f5f3ff7a75c1dc0b  packages/gateway/dist/auth/assertion.js
+e0a826cbd963456c  packages/gateway/dist/auth/policy.js
+7aa302f5184504e2  packages/gateway/dist/auth/proxy-key.js
+--- AnasProxy.pm  host c6beac85a012f590  node c6beac85a012f590

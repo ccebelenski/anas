@@ -1,0 +1,15 @@
+send running: 51638 zfs send w2z/p/c@s
+$ zfs rename -r w2z/p@s w2z/p@t
+exit code: 0
+pipeline exit codes: send/recv 0/0
+  | w2z	64.3M
+  | w2z/p	32.1M
+  | w2z/p@t	0B
+  | w2z/p/c	32.1M
+  | w2z/p/c@t	0B
+  | w2z/p/c/g	24K
+  | w2z/p/c/g@t	0B
+  | w2z/r	32.0M
+  | w2z/r@s	0B
+received data: 69941fb621d6e600  source: 69941fb621d6e600
+w2z destroyed

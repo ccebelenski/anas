@@ -1,0 +1,36 @@
+
+### schedule, tasks, repo, remotes
+HTTP 202 0.029397
+{"job":{"id":"0678b54a-50db-4458-b8d4-16c7a13bd616","status":"running","operation":"schedule.remove","createdAt":"2026-10-15T22:35:20.949Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"removed": "w2snap"} | 
+HTTP 202 0.032860
+{"job":{"id":"e7d1755e-f091-46a4-a2d5-65643a141a96","status":"running","operation":"backup.task.remove","createdAt":"2026-10-15T22:35:21.632Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"removed": "w2b1"} | 
+HTTP 202 0.012517
+{"job":{"id":"16a932b4-3d96-4a57-a536-b17d3441575f","status":"running","operation":"backup.task.remove","createdAt":"2026-10-15T22:35:22.321Z","createdBy":"root@pam"}}
+[t+0s] completed |  | {"removed": "w2b2"} | 
+HTTP 202 0.011565
+{"job":{"id":"d02c3cdd-4124-4f34-91ce-59c7e91fc74a","status":"running","operation":"backup.task.remove","createdAt":"2026-10-15T22:35:22.976Z","createdBy":"root@pam"}}
+[t+0s] completed |  | {"removed": "w2b3"} | 
+HTTP 202 0.011892
+{"job":{"id":"d99b9308-e7cf-42da-bd19-d5df329080fe","status":"running","operation":"backup.repo.remove","createdAt":"2026-10-15T22:35:23.704Z","createdBy":"root@pam"}}
+[t+0s] completed |  | {"removed": "w2bh", "version": 3} | 
+HTTP 202 0.089653
+{"job":{"id":"e58e4d0b-ae03-4a8d-ade6-e447a36349de","status":"running","operation":"cloud.remote.remove","createdAt":"2026-10-15T22:35:23.924Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"removed": "w2ok"} | 
+HTTP 202 0.093300
+{"job":{"id":"a5c57255-4a53-4c37-a4ed-e688bcaa1193","status":"running","operation":"cloud.remote.remove","createdAt":"2026-10-15T22:35:24.703Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"removed": "w2bh"} | 
+
+### cloud fixture down
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ rclonegt removed (with its home)
+
+### dataset
+gtbackup/w2src@anas-hourly-2026-10-15T221803Z
+gtbackup/w2src@anas-hourly-2026-10-15T221840Z
+[t+1s] completed |  | {"destroyed": "gtbackup/w2src"} | 
+gtbackup
+no w2 units
+0

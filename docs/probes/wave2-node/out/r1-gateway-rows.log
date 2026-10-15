@@ -1,0 +1,96 @@
+
+### row 19 — who can read /run/anas/proxy.key
+drwxr-xr-x root:root 80 bytes /run/anas
+-rw-r----- root:www-data 32 bytes /run/anas/proxy.key
+www-data:  32 bytes read, exit 0
+nobody:    head: cannot open '/run/anas/proxy.key' for reading: Permission denied
+debian(1000): head: cannot open '/run/anas/proxy.key' for reading: Permission denied
+pveproxy worker uid: www-data
+
+### row 18 — a signed target with %2F in the path and a query, through real pveproxy
+> GET /shares/nfs/%2Ftestpool%2Fshare1?w2=a%2Fb&x=1
+  {"data":{"path":"/testpool/share1","clients":[{"spec":"192.168.200.0/24","options":["rw","sync","no_subtree_check","no_root_squash"]}],"pathState":"missing","pathExists":false}}
+    HTTP 200
+> GET /shares/nfs/%2Ftestpool%2Fshare1/access?w2=%2F
+  {"error":{"code":"NOT_FOUND","message":"Share path '/testpool/share1' could not be read"}}
+    HTTP 404
+> GET /pools/gtbackup/datasets/cloudsrc%2Fx?probe=1
+  {"error":{"code":"NOT_FOUND","message":"Dataset 'gtbackup/cloudsrc/x' not found"}}
+    HTTP 404
+  journal since 2026-10-15 22:11:13:
+    (end)
+  access.log: ::ffff:192.168.200.1 - root@pam [15/10/2026:22:11:13 +0000] "GET /anas/api/nodes/anas-pve/v1/shares/nfs/%2Ftestpool%2Fshare1?w2=a%2Fb&x=1 HTTP/1.1" 200 177
+  access.log: ::ffff:192.168.200.1 - root@pam [15/10/2026:22:11:13 +0000] "GET /anas/api/nodes/anas-pve/v1/shares/nfs/%2Ftestpool%2Fshare1/access?w2=%2F HTTP/1.1" 404 90
+  access.log: ::ffff:192.168.200.1 - root@pam [15/10/2026:22:11:13 +0000] "GET /anas/api/nodes/anas-pve/v1/pools/gtbackup/datasets/cloudsrc%2Fx?probe=1 HTTP/1.1" 404 82
+
+### row 14 — latency of GET /v1/pools through /anas, 20 runs on the node (loopback, one TLS handshake each)
+  n=20 min 0.0363 median 0.0562 max 0.0851 s
+  the same 20 runs against PVE /api2/json/nodes/anas-pve/disks/zfs (PVE auth + ACL, no ANAS):
+  /api2/json/version n=20 min 0.0050 median 0.0133 max 0.0201 s
+  the daemon alone over its socket, 20 runs:
+  socket n=20 min 0.0160 median 0.0293 max 0.0365 s
+
+### row 12 — systemctl stop anas, then a request; start again
+2624 -rw-r----- 1 root www-data 32 Oct 15 22:08 /run/anas/proxy.key
+stopped at 22:11:16
+ls: cannot access '/run/anas/proxy.key': No such file or directory
+  {"error":{"code":"UPSTREAM_UNREACHABLE","message":"ANAS gateway not ready (no proxy key)"}}
+    HTTP 502 0.011628s
+  {"error":{"code":"UPSTREAM_UNREACHABLE","message":"ANAS gateway not reachable on the loopback interface"}}
+    HTTP 502 0.005771s (presence probe)
+    pveproxy| anas-proxy: refused GET /api/nodes/anas-pve/v1/pools from ::ffff:192.168.200.1 (root@pam): proxy key unreadable: /run/anas/proxy.key: No such file or directory
+    pveproxy| anas-proxy: 502 for GET /installed from ::ffff:192.168.200.1: gateway not reachable on the loopback interface (595 Connection refused)
+started at 22:11:17
+3524 -rw-r----- 1 root www-data 32 Oct 15 22:11 /run/anas/proxy.key
+  after start: HTTP 200 0.066933s
+MainPID=1412
+2842 2843 2844 
+
+### row 20 — key rotation: restart the gateway while 4 loops hammer /anas for 12 s
+MainPID=1412
+workers 2842 2843 2844
+3524 -rw-r----- 1 root www-data 32 Oct 15 22:11 /run/anas/proxy.key
+restart at 1792102282.367
+restart returned 1792102282.387
+status counts:
+   2693 200
+     57 502
+non-200 answers (code, time):
+502 1792102282.368
+502 1792102282.377
+502 1792102282.378
+502 1792102282.378
+502 1792102282.379
+502 1792102282.389
+502 1792102282.390
+502 1792102282.390
+502 1792102282.397
+502 1792102282.400
+502 1792102282.401
+502 1792102282.402
+502 1792102282.413
+502 1792102282.417
+502 1792102282.417
+502 1792102282.420
+502 1792102282.427
+502 1792102282.429
+502 1792102282.431
+502 1792102282.437
+first and last 200 after the restart:
+  (gateway (re)start logged at 1792102282.386089)
+3564 -rw-r----- 1 root www-data 32 Oct 15 22:11 /run/anas/proxy.key
+MainPID=1412
+workers 2842 2843 2844
+journal:
+     11     pveproxy| anas-proxy: 502 for GET /api/nodes/anas-pve/v1/health from ::ffff:127.0.0.1: gateway not reachable on the loopback interface (595 Connection refused)
+     46     pveproxy| anas-proxy: refused GET /api/nodes/anas-pve/v1/health from ::ffff:127.0.0.1 (root@pam): proxy key unreadable: /run/anas/proxy.key: No such file or directory
+  after: HTTP 200
+
+### row 17b — a second install with nothing changed
+MainPID=1412
+workers 2842 2843 2844
+anas: installed /usr/share/anas/perl/AnasProxy.pm
+anas: proxy hook already present in /usr/share/perl5/PVE/APIServer/AnyEvent.pm and AnasProxy.pm unchanged (nothing to do)
+MainPID=1412
+workers 2842 2843 2844
+  (no reload/HUP/restart in the pveproxy journal)

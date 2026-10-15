@@ -1,0 +1,83 @@
+
+### (1) the shipped suite, node perl v5.40.1
+packages/pve-integration/perl/t/AnasProxy-auth.t .. ok
+packages/pve-integration/perl/t/AnasProxy.t ....... ok
+All tests successful.
+Files=2, Tests=176,  1 wallclock secs ( 0.03 usr  0.01 sys +  0.14 cusr  0.02 csys =  0.20 CPU)
+Result: PASS
+
+### (2) AnasProxy-node.t, real PVE modules, as www-data
+anas-off@pve disabled for the run
+Name "AnasProxy::LOG" used only once: possible typo at AnasProxy-node.t line 40, <DATA> line 960.
+Name "AnasProxy::UNAUTH_DELAY" used only once: possible typo at AnasProxy-node.t line 41, <DATA> line 960.
+authentication failure: user 'anas-off@pve' is disabled
+
+Use of uninitialized value $token in pattern match (m//) at /usr/share/perl5/PVE/AccessControl.pm line 349, <DATA> line 960.
+Use of uninitialized value $token in pattern match (m//) at /usr/share/perl5/PVE/Ticket.pm line 32, <DATA> line 960.
+Use of uninitialized value $token in pattern match (m//) at /usr/share/perl5/PVE/AccessControl.pm line 349, <DATA> line 960.
+Use of uninitialized value $token in pattern match (m//) at /usr/share/perl5/PVE/Ticket.pm line 32, <DATA> line 960.
+# row 14: auth_handler + 2 x check + key read + HMAC, 50 runs: min 0.309 median 0.391 max 1.436 ms
+AnasProxy-node.t .. 
+ok 1 - running as uid 33 (not root: auth_handler skips CSRF for euid 0)
+ok 2 - the installed AnasProxy.pm is under test
+ok 3 - real PVE::HTTPServer::auth_handler loaded from /usr/share/perl5/PVE/HTTPServer.pm
+ok 4 - anas-admin@pve: authenticated by PVE
+ok 5 - anas-admin@pve: PVE grants [Sys.Audit,Sys.Modify] on /
+ok 6 - anas-admin@pve: user id from auth_handler
+ok 7 - anas-audit@pve: authenticated by PVE
+ok 8 - anas-audit@pve: PVE grants [Sys.Audit] on /
+ok 9 - anas-audit@pve: user id from auth_handler
+ok 10 - anas-gm@pve: authenticated by PVE
+ok 11 - anas-gm@pve: PVE grants [Sys.Audit] on /
+ok 12 - anas-gm@pve: user id from auth_handler
+ok 13 - anas-node@pve: authenticated by PVE
+ok 14 - anas-node@pve: PVE grants [] on /
+ok 15 - anas-node@pve: user id from auth_handler
+ok 16 - anas-none@pve: authenticated by PVE
+ok 17 - anas-none@pve: PVE grants [] on /
+ok 18 - anas-none@pve: user id from auth_handler
+ok 19 - anas-np@pve: authenticated by PVE
+ok 20 - anas-np@pve: PVE grants [Sys.Audit,Sys.Modify] on /
+ok 21 - anas-np@pve: user id from auth_handler
+ok 22 - root@pam: authenticated by PVE
+ok 23 - root@pam: PVE grants [Sys.Audit,Sys.Modify] on /
+ok 24 - root@pam: user id from auth_handler
+ok 25 - row 8 anas-off (disabled): 401
+ok 26 - row 8: PVE's sentence
+ok 27 - row 8: logged reason
+ok 28 - POST with its own CSRF token: passes
+ok 29 - POST without a token: invalid csrf token
+ok 30 - a token refusal still names the user
+ok 31 - POST with root@pam's token: invalid csrf token (bound to the user)
+ok 32 - auth_handler(POST, csrf undef) as www-data dies "invalid csrf token"
+ok 33 - … and returns nothing
+ok 34 - auth_handler(GET, csrf undef) passes (GET needs no token, as PVE)
+ok 35 - e2e anas-audit@pve GET /api/nodes/anas-pve/v1/pools → 200
+ok 36 -    access-log user id set to anas-audit@pve
+ok 37 - e2e anas-audit@pve POST /api/nodes/anas-pve/v1/pools/w2nosuch/scrub → 403
+ok 38 -    the 403 names the privilege and anas-audit@pve
+ok 39 -    access-log user id set to anas-audit@pve
+ok 40 - e2e anas-none@pve GET /api/nodes/anas-pve/v1/health → 403
+ok 41 -    the 403 names the privilege and anas-none@pve
+ok 42 -    access-log user id set to anas-none@pve
+ok 43 - e2e anas-np@pve GET /api/nodes/anas-pve/v1/pools → 200
+ok 44 -    access-log user id set to anas-np@pve
+ok 45 - e2e anas-np@pve POST /api/nodes/anas-pve/v1/pools/w2nosuch/scrub → 404
+ok 46 -    access-log user id set to anas-np@pve
+ok 47 - e2e anas-node@pve GET /api/nodes/anas-pve/v1/pools → 403
+ok 48 -    the 403 names the privilege and anas-node@pve
+ok 49 -    access-log user id set to anas-node@pve
+ok 50 - e2e anas-gm@pve GET /api/nodes/anas-pve/v1/pools → 200
+ok 51 -    access-log user id set to anas-gm@pve
+ok 52 - e2e anas-gm@pve POST /api/nodes/anas-pve/v1/pools/w2nosuch/scrub → 403
+ok 53 -    the 403 names the privilege and anas-gm@pve
+ok 54 -    access-log user id set to anas-gm@pve
+ok 55 - e2e root@pam GET /api/nodes/anas-pve/v1/shares/nfs/%2Ftestpool%2Fshare1?w2=a%2Fb → 200
+ok 56 -    access-log user id set to root@pam
+ok 57 - row 14: median added work ≤ 2 ms
+1..57
+ok
+All tests successful.
+Files=1, Tests=57,  1 wallclock secs ( 0.03 usr  0.00 sys +  0.26 cusr  0.04 csys =  0.33 CPU)
+Result: PASS
+anas-off@pve re-enabled

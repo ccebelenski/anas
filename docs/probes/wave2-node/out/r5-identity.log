@@ -1,0 +1,128 @@
+
+### 1a — automatic pick while w2id/enc is LOCKED (and w2id/unm unmounted, w2id/vol a zvol)
+NAME      TYPE        MOUNTED  KEYSTATUS
+w2id      filesystem  yes      -
+w2id/enc  filesystem  no       unavailable
+w2id/fs   filesystem  yes      -
+w2id/unm  filesystem  no       -
+w2id/vol  volume      -        -
+debian:x:1000:1000:Debian:/home/debian:/bin/bash
+rclonegt:x:1001:1001::/home/rclonegt:/bin/bash
+  HTTP 409 0.123270
+  {"error":{"code":"CONFLICT","message":"ANAS could not check which uid is free: it could not read ZFS's per-user accounting of 'w2id/enc' (zfs userspace: cannot get used/quota for w2id/enc: permission denied). Nothing was created. To create the user without this check, give its User ID explicitly (an id you give is not checked for files).","reason":"id-check-unreadable"}}
+
+### 1b — the same with w2id/enc unlocked (key loaded, mounted); w2id/unm stays unmounted, the zvol stays
+NAME      MOUNTED  KEYSTATUS
+w2id      yes      -
+w2id/enc  yes      available
+w2id/fs   yes      -
+w2id/unm  no       -
+w2id/vol  -        -
+  HTTP 202 0.152117
+  {"job":{"id":"664b1a90-1cde-442c-8e8a-d2f33b962e20","status":"running","operation":"identity.user.add","createdAt":"2026-10-15T22:24:51.518Z","createdBy":"root@pam"}}
+  [t+1s] completed | Creating share user 'w2u1' with uid 1002 | {"created": "w2u1", "uid": 1002, "smbEnabled": false} | 
+w2u1:x:1002:100::/home/w2u1:/usr/sbin/nologin
+uid=1002(w2u1) gid=100(users) groups=100(users)
+
+### 1c — the group door, automatic gid
+  HTTP 202 0.154092
+  {"job":{"id":"1d518ffa-f491-4ca9-9a10-59bae69642bf","status":"running","operation":"identity.group.add","createdAt":"2026-10-15T22:24:52.503Z","createdBy":"root@pam"}}
+  [t+1s] completed | Creating group 'w2g0' with gid 1003 | {"created": "w2g0", "gid": 1003} | 
+w2g0:x:1003:
+
+### 2 — an explicit uid held by an account (1000, debian) → 409
+  HTTP 409 0.057684
+  {"error":{"code":"CONFLICT","message":"uid 1000 already belongs to user 'debian'. Nothing was created. Give another User ID, or leave it empty and ANAS picks a free one.","reason":"id-in-use"}}
+
+### 2b — an explicit uid in band that owns files (51099 owns /w2id/fs/owned-51099) → created (an explicit id is never checked for files)
+  HTTP 202 0.054748
+  {"job":{"id":"7f7ed226-2cb6-4cb2-97e1-0ff717bfab7d","status":"running","operation":"identity.user.add","createdAt":"2026-10-15T22:24:53.531Z","createdBy":"root@pam"}}
+  [t+1s] completed | Creating share user 'w2u99' with uid 51099 | {"created": "w2u99", "uid": 51099, "smbEnabled": false} | 
+w2u99:x:51099:100::/home/w2u99:/usr/sbin/nologin
+total 1
+-rwxr-xr-x 1 51099 51099 0 Oct 15 22:24 owned-51099
+
+### 3 — uid N where gid N is held by an unrelated group: group w2g1 gid 51001, then user w2u2 uid 51001
+  HTTP 202 0.029498
+  {"job":{"id":"66984c59-f2a4-4179-a10f-41833a07152a","status":"running","operation":"identity.group.add","createdAt":"2026-10-15T22:24:54.363Z","createdBy":"root@pam"}}
+  [t+0s] completed | Creating group 'w2g1' with gid 51001 | {"created": "w2g1", "gid": 51001} | 
+  HTTP 409 0.065854
+  X-Anas-Confirm-Code: 28e83dac22c0
+  {"error":{"code":"CONFIRMATION_REQUIRED","message":"Create user 'w2u2' with uid 51001?","warnings":["Group 'w2g1' already has gid 51001. User 'w2u2' will get uid 51001 with primary group gid 100 (the default), so uid 51001 and gid 51001 will belong to two unrelated accounts. To avoid it, give another User ID, choose 'w2g1' as the primary group, or leave the User ID empty and ANAS picks one no group holds as its gid."]}}
+> resend with x-anas-confirm: 28e83dac22c0
+  HTTP 409 0.074126
+  X-Anas-Confirm-Code: f7ebd18c9781
+  {"error":{"code":"CONFIRMATION_REQUIRED","message":"Create user 'w2u2' with uid 51001?","warnings":["Group 'w2g1' already has gid 51001. User 'w2u2' will get uid 51001 with primary group gid 100 (the default), so uid 51001 and gid 51001 will belong to two unrelated accounts. To avoid it, give another User ID, choose 'w2g1' as the primary group, or leave the User ID empty and ANAS picks one no group holds as its gid."]}}
+  (a second name on the same uid → 409)
+id: ‘w2u2’: no such user
+w2g1:x:51001:
+
+### 3b — the group door's mirror: group w2g2 with gid = an existing user's uid (w2u1)
+  HTTP 409 0.034861
+  X-Anas-Confirm-Code: 16b2dd090403
+  {"error":{"code":"CONFIRMATION_REQUIRED","message":"Create group 'w2g2' with gid 1002?","warnings":["User 'w2u1' already has uid 1002, and its primary group is gid 100. Group 'w2g2' will get gid 1002, so uid 1002 and gid 1002 will belong to two unrelated accounts: 'w2g2' looks like the private group of 'w2u1' without being it. To avoid it, give another Group ID, or leave it empty and ANAS picks one no user holds as its uid."]}}
+  HTTP 409 0.031529
+  X-Anas-Confirm-Code: 64b718552f7e
+  {"error":{"code":"CONFIRMATION_REQUIRED","message":"Create group 'w2g2' with gid 1002?","warnings":["User 'w2u1' already has uid 1002, and its primary group is gid 100. Group 'w2g2' will get gid 1002, so uid 1002 and gid 1002 will belong to two unrelated accounts: 'w2g2' looks like the private group of 'w2u1' without being it. To avoid it, give another Group ID, or leave it empty and ANAS picks one no user holds as its uid."]}}
+
+### 4 — primaryGroup: a band group (w2g1) and the default 'users'; root refused
+  HTTP 202 0.046522
+  {"job":{"id":"959b7a4f-75f8-4da8-b310-230b7c8da864","status":"running","operation":"identity.user.add","createdAt":"2026-10-15T22:24:55.469Z","createdBy":"root@pam"}}
+  [t+1s] completed | Creating share user 'w2u3' with uid 51003 | {"created": "w2u3", "uid": 51003, "smbEnabled": false} | 
+  HTTP 202 0.164462
+  {"job":{"id":"8918478d-5688-4a30-bc4d-e294b667e09a","status":"running","operation":"identity.user.add","createdAt":"2026-10-15T22:24:56.297Z","createdBy":"root@pam"}}
+  [t+0s] completed | Creating share user 'w2u4' with uid 51100 | {"created": "w2u4", "uid": 51100, "smbEnabled": false} | 
+  HTTP 409 0.036976
+  {"error":{"code":"SYSTEM_ACCOUNT","message":"Group 'root' (gid 0) is a system group, so it cannot be a share user's primary group. System accounts (uid/gid below 1000 or above 60000) are managed outside ANAS; the default primary group (gid 100) is the one exception."}}
+uid=51003(w2u3) gid=51001(w2g1) groups=51001(w2g1)
+uid=51100(w2u4) gid=100(users) groups=100(users)
+
+### 5 — a user whose primary group is named like the user: group w2u5 gid 51005, user w2u5 uid 51006 primaryGroup w2u5; delete the user
+  HTTP 202 0.031845
+  {"job":{"id":"c81d5c49-c2f6-4021-a627-f5187f28d351","status":"running","operation":"identity.group.add","createdAt":"2026-10-15T22:24:57.324Z","createdBy":"root@pam"}}
+  [t+0s] completed | Creating group 'w2u5' with gid 51005 | {"created": "w2u5", "gid": 51005} | 
+  HTTP 202 0.077044
+  {"job":{"id":"401a25dd-4ae7-4867-873e-a5966759974b","status":"running","operation":"identity.user.add","createdAt":"2026-10-15T22:24:57.502Z","createdBy":"root@pam"}}
+  [t+1s] completed | Creating share user 'w2u5' with uid 51006 | {"created": "w2u5", "uid": 51006, "smbEnabled": false} | 
+uid=51006(w2u5) gid=51005(w2u5) groups=51005(w2u5)
+USERGROUPS_ENAB yes
+  HTTP 409 0.097533
+  X-Anas-Confirm-Code: 4de7c1dd6b1d
+  {"error":{"code":"CONFIRMATION_REQUIRED","message":"Deleting share user 'w2u5' removes the account and its group 'w2u5'","warnings":["User 'w2u5' (uid 51006) will be removed from the system","Files owned by this user keep uid 51006. ANAS will not give uid 51006 to a new user while it still owns files on an imported ZFS filesystem or under a share, but it cannot check ids seen only in exported pools, on disconnected disks or in backups. To give the files back later, re-create the user with User ID 51006.","Its group 'w2u5' (gid 51005) will be removed too: it is the user's primary group, named like the user, and no other account uses it, so userdel removes it (USERGROUPS_ENAB in /etc/login.defs)","Files owned by this group keep gid 51005. ANAS will not give gid 51005 to a new group while it still owns files on an imported ZFS filesystem or under a share, but it cannot check ids seen only in exported pools, on disconnected disks or in backups. To give the files back later, re-create the group with Group ID 51005."]}}
+  HTTP 202 0.078725
+  {"job":{"id":"5a608abd-edfa-401d-bef2-7e88f7d39b3a","status":"running","operation":"identity.user.delete","createdAt":"2026-10-15T22:24:58.627Z","createdBy":"root@pam"}}
+  [t+1s] completed | Deleting share user 'w2u5' and its group 'w2u5' | {"deleted": "w2u5", "smbEntryRemoved": false, "groupRemoved": "w2u5"} | 
+  user w2u5 gone
+
+### 6 — the automatic pick steps over ids ZFS accounts for, on a mounted AND an unmounted filesystem
+  highest in-band uid now: 51100
+NAME      MOUNTED
+w2id/unm  no
+0 51098 51102 
+  HTTP 202 0.236976
+  {"job":{"id":"ec4b4f52-09de-46df-b762-2922e6e35050","status":"running","operation":"identity.user.add","createdAt":"2026-10-15T22:25:00.125Z","createdBy":"root@pam"}}
+  [t+0s] completed | Creating share user 'w2u6' with uid 51103 (uid 51101 still owns the ZFS filesystem 'w2id/fs'; uid 51102 still owns the ZFS filesystem 'w2id/unm') | {"created": "w2u6", "uid": 51103, "smbEnabled": false} | 
+w2u6:x:51103:100::/home/w2u6:/usr/sbin/nologin
+  expected: 51103 (skips 51101 on w2id/fs and 51102 on the unmounted w2id/unm)
+
+### audit lines
+   job.submitted identity.user.add {"user": "w2u1", "uid": 1002, "explicit": false, "smbEnabled": false} 
+   job.completed identity.user.add {"user": "w2u1", "uid": 1002, "explicit": false, "smbEnabled": false} 
+   job.submitted identity.group.add {"group": "w2g0", "gid": 1003, "explicit": false} 
+   job.completed identity.group.add {"group": "w2g0", "gid": 1003, "explicit": false} 
+   job.submitted identity.user.add {"user": "w2u99", "uid": 51099, "explicit": true, "smbEnabled": false} 
+   job.completed identity.user.add {"user": "w2u99", "uid": 51099, "explicit": true, "smbEnabled": false} 
+   job.submitted identity.group.add {"group": "w2g1", "gid": 51001, "explicit": true} 
+   job.completed identity.group.add {"group": "w2g1", "gid": 51001, "explicit": true} 
+   job.submitted identity.user.add {"user": "w2u3", "uid": 51003, "explicit": true, "primaryGroup": "w2g1", "primaryGid": 51001, "smbEnabled": false} 
+   job.completed identity.user.add {"user": "w2u3", "uid": 51003, "explicit": true, "primaryGroup": "w2g1", "primaryGid": 51001, "smbEnabled": false} 
+   job.submitted identity.user.add {"user": "w2u4", "uid": 51100, "explicit": false, "primaryGroup": "users", "primaryGid": 100, "smbEnabled": false} 
+   job.completed identity.user.add {"user": "w2u4", "uid": 51100, "explicit": false, "primaryGroup": "users", "primaryGid": 100, "smbEnabled": false} 
+   job.submitted identity.group.add {"group": "w2u5", "gid": 51005, "explicit": true} 
+   job.completed identity.group.add {"group": "w2u5", "gid": 51005, "explicit": true} 
+   job.submitted identity.user.add {"user": "w2u5", "uid": 51006, "explicit": true, "primaryGroup": "w2u5", "primaryGid": 51005, "smbEnabled": false} 
+   job.completed identity.user.add {"user": "w2u5", "uid": 51006, "explicit": true, "primaryGroup": "w2u5", "primaryGid": 51005, "smbEnabled": false} 
+   job.submitted identity.user.delete {"user": "w2u5"} 
+   job.completed identity.user.delete {"user": "w2u5"} 
+   job.submitted identity.user.add {"user": "w2u6", "uid": 51103, "explicit": false, "smbEnabled": false} 
+   job.completed identity.user.add {"user": "w2u6", "uid": 51103, "explicit": false, "smbEnabled": false} 

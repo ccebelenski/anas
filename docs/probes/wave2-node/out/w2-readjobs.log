@@ -1,0 +1,80 @@
+(node:822862) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 6 tests using 1 worker
+
+(node:822928) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+[t+0.1s] clicked Preview (w2ok)
+[t+0.1s] POST /cloud/tasks/preview -> HTTP 202 job=8562e75f-4e15-4259-aecc-f2e5cad113f7 operation=read.cloud.preview
+[t+0.7s] GET /jobs/8562e75f-4e15-4259-aecc-f2e5cad113f7 -> HTTP 200 status=completed progress="0 checked, 4 to transfer (20971520 bytes), 0 to delete" result={"transfers":4,"bytes":20971520,"checks":0,"deletes":0,"deletedFiles":[],"deletedTotal":0,"errors":[],"truncated":false}
+[t+1s]   dom[t+0.1s from sampler start] line: visible "asking the server…"
+[t+1s]   dom[t+0.1s from sampler start] cancel: visible "Cancel preview"
+[t+1s]   dom[t+0.7s from sampler start] line: visible "Would transfer 4 files / 20.00 MiB"
+[t+1s]   dom[t+0.7s from sampler start] cancel: hidden
+[t+1s] final line: "Would transfer 4 files / 20.00 MiB"
+[t+1.1s] wizard closed with Cancel; task-saving requests made: none
+  ✓  1 [w2probe] › docs/probes/wave2-node/w2-readjobs.spec.ts:105:3 › cr.48 read jobs in the PVE UI › preview fast: w2ok answers, result from job.result (4.1s)
+[t+0s] clicked Preview (w2bh)
+[t+0.1s] POST /cloud/tasks/preview -> HTTP 202 job=ac2c6c84-d246-4431-a23a-b14186fc64ef operation=read.cloud.preview
+[t+0.6s] GET /jobs/ac2c6c84-d246-4431-a23a-b14186fc64ef -> HTTP 200 status=running result=null
+[t+14.3s] at t+14.1s: job status running after 14 polls; line "asking the server…"; node: 1 rclone process(es)
+[t+14.4s] preview: clicking Cancel preview (job ac2c6c84-d246-4431-a23a-b14186fc64ef, last status running)
+[t+14.4s] POST /jobs/ac2c6c84-d246-4431-a23a-b14186fc64ef/cancel -> HTTP 202 (x-anas-confirm sent: false)
+[t+15.7s] GET /jobs/ac2c6c84-d246-4431-a23a-b14186fc64ef -> HTTP 200 status=cancelled result={"status":"cancelled","reason":"cancelled by root@pam at 2026-10-15T22:31:33.612Z","cancelledBy":"root@pam","cancelledAt":"2026-10-15T22:31:33.612Z"}
+[t+17.9s] preview: message boxes before the click [], after []
+[t+17.9s] final line: "Preview cancelled — nothing was copied or deleted."
+[t+18.1s] preview: on the node `pgrep -ax rclone` -> (empty)
+[t+18.2s] wizard closed with Cancel; task-saving requests made: none
+  ✓  2 [w2probe] › docs/probes/wave2-node/w2-readjobs.spec.ts:134:3 › cr.48 read jobs in the PVE UI › preview slow: w2bh still running past 12 s, then Cancel (21.6s)
+[t+0.1s] clicked Test (w2ok)
+[t+0.1s] POST /cloud/remotes/test -> HTTP 202 job=76d8d76b-4f6b-4b30-9837-6fabeacb3e23 operation=read.cloud.remote.test
+[t+0.6s] GET /jobs/76d8d76b-4f6b-4b30-9837-6fabeacb3e23 -> HTTP 200 status=running result=null
+[t+1.2s] GET /jobs/76d8d76b-4f6b-4b30-9837-6fabeacb3e23 -> HTTP 200 status=completed result={"verdict":"ok","message":""}
+[t+2s]   dom[t+0.1s from sampler start] area: visible "testing remote…"
+[t+2s]   dom[t+0.1s from sampler start] cancel: visible "Cancel test"
+[t+2s]   dom[t+1.2s from sampler start] area: visible "Reachable"
+[t+2s]   dom[t+1.2s from sampler start] cancel: hidden
+[t+2s] verdict line: "Reachable"
+  ✓  3 [w2probe] › docs/probes/wave2-node/w2-readjobs.spec.ts:185:3 › cr.48 read jobs in the PVE UI › remote test fast: w2ok verdict ok (4.2s)
+[t+0.1s] clicked Test (w2bh)
+[t+0.1s] POST /cloud/remotes/test -> HTTP 202 job=6871b386-b3c8-4ce6-9f8a-116f723ef006 operation=read.cloud.remote.test
+[t+0.6s] GET /jobs/6871b386-b3c8-4ce6-9f8a-116f723ef006 -> HTTP 200 status=running result=null
+[t+3.3s] at t+3.1s: job status running; area "testing remote…"; node: 63029 /usr/bin/rclone --config /etc/anas/rclone.conf --ask-password=false lsjson w2bh: --max-depth 1 --contimeout 10s --timeout 9s --retries 1 --low-level-retries 1
+[t+3.3s] remote test: clicking Cancel test (job 6871b386-b3c8-4ce6-9f8a-116f723ef006, last status running)
+[t+3.4s] POST /jobs/6871b386-b3c8-4ce6-9f8a-116f723ef006/cancel -> HTTP 202 (x-anas-confirm sent: false)
+[t+3.8s] GET /jobs/6871b386-b3c8-4ce6-9f8a-116f723ef006 -> HTTP 200 status=cancelled result={"status":"cancelled","reason":"cancelled by root@pam at 2026-10-15T22:31:47.687Z","cancelledBy":"root@pam","cancelledAt":"2026-10-15T22:31:47.687Z"}
+[t+5.3s] remote test: message boxes before the click [], after []
+[t+5.3s] final area: "Test cancelled — nothing was changed."
+[t+5.3s]   dom[t+0.1s from sampler start] area: visible "testing remote…"
+[t+5.3s]   dom[t+0.1s from sampler start] cancel: visible "Cancel test"
+[t+5.3s]   dom[t+3.4s from sampler start] area: visible "stopping the test…"
+[t+5.3s]   dom[t+3.4s from sampler start] cancel: visible "Cancelling…"
+[t+5.3s]   dom[t+3.8s from sampler start] area: visible "Test cancelled — nothing was changed."
+[t+5.3s]   dom[t+3.8s from sampler start] cancel: hidden
+[t+5.6s] remote test: on the node `pgrep -ax rclone` -> (empty)
+  ✓  4 [w2probe] › docs/probes/wave2-node/w2-readjobs.spec.ts:206:3 › cr.48 read jobs in the PVE UI › remote test slow: w2bh cancelled at ~3 s (8.3s)
+[t+0.1s] clicked Choose files… (archive picker, path /)
+[t+0.1s] POST /backup/restore/browse -> HTTP 202 job=2f3d6fa7-e3b6-4eeb-9754-aa0f20eef23c operation=read.backup.catalog
+[t+0.6s] GET /jobs/2f3d6fa7-e3b6-4eeb-9754-aa0f20eef23c -> HTTP 200 status=completed result={"verdict":"ok","repository":"pbsgt","snapshot":"host/gtguard/2026-09-25T02:36:53Z","archive":"guarded.pxar","archiveKind":"pxar","path":"/","entries":[{"name":"proof.txt","path":"/proof.txt","type":"file","size":23,"modified":"2026-09-25 02:36:52","mtimeZone":"node-local","mode":"644"}],"warnings":
+[t+1s]   dom[t+0.1s from sampler start] stop: visible "Stop"
+[t+1s]   dom[t+0.1s from sampler start] mask: visible "Loading..."
+[t+1s]   dom[t+0.7s from sampler start] stop: hidden
+[t+1s]   dom[t+0.7s from sampler start] mask: hidden
+[t+1s] job.result entries: ["/proof.txt"]; tree rows: ["\t\nproof.txt\n\t\n23 B\n\t\n2026-09-25 02:36:52 node local time"]
+[t+1.2s] mutating requests made: none
+  ✓  5 [w2probe] › docs/probes/wave2-node/w2-readjobs.spec.ts:231:3 › cr.48 read jobs in the PVE UI › catalog listing fast: root of guarded.pxar in the pbsgt snapshot (3.4s)
+[t+0.1s] opened ANAS.pathPicker (archive backend) on repo w2bh
+[t+0.1s] POST /backup/restore/browse -> HTTP 202 job=7f8d1bc0-0271-4790-a4bb-42824427f8b5 operation=read.backup.catalog
+[t+0.6s] GET /jobs/7f8d1bc0-0271-4790-a4bb-42824427f8b5 -> HTTP 200 status=running result=null
+[t+3.3s] at t+3.3s: job status running; node: 64153   64153       3 /usr/bin/timeout 300 /usr/bin/proxmox-backup-client catalog shell host/w2b1/2026-10-15T00:00:00Z w2data.pxar
+  64154   64153       3 /usr/bin/proxmox-backup-client catalog shell host/w2b1/2026-10-15T00:00:00Z w2data.pxar
+[t+3.4s] catalog listing: clicking Stop (job 7f8d1bc0-0271-4790-a4bb-42824427f8b5, last status running)
+[t+3.4s] POST /jobs/7f8d1bc0-0271-4790-a4bb-42824427f8b5/cancel -> HTTP 202 (x-anas-confirm sent: false)
+[t+3.8s] GET /jobs/7f8d1bc0-0271-4790-a4bb-42824427f8b5 -> HTTP 200 status=cancelled result={"status":"cancelled","reason":"cancelled by root@pam at 2026-10-15T22:31:58.694Z","cancelledBy":"root@pam","cancelledAt":"2026-10-15T22:31:58.694Z"}
+[t+5.4s] catalog listing: message boxes before the click [], after []
+[t+5.4s] picker note: "Listing of / stopped."
+[t+5.6s] catalog listing: on the node `ps | grep proxmox-backup-client` -> (empty)
+  ✓  6 [w2probe] › docs/probes/wave2-node/w2-readjobs.spec.ts:287:3 › cr.48 read jobs in the PVE UI › catalog listing slow: the archive picker on the blackholed repo w2bh, Stop (7.4s)
+
+  6 passed (50.0s)

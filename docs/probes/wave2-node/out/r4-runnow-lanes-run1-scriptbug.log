@@ -1,0 +1,34 @@
+
+### three Run-Nows, back to back
+node clock 22:22:13.058716463
+  w2b1: HTTP 202 0.037575
+  w2b1: {"job":{"id":"d72b837f-4296-4ba9-98d7-e83844cbc697","status":"running","operation":"backup.task.run","createdAt":"2026-10-15T22:22:13.109Z","createdBy":"root@pam"}}
+  w2b2: HTTP 202 0.019758
+  w2b2: {"job":{"id":"863e0f43-b9ba-46c3-8fb6-1489b7c6a1fa","status":"running","operation":"backup.task.run","createdAt":"2026-10-15T22:22:13.148Z","createdBy":"root@pam"}}
+  w2b3: HTTP 202 0.022101
+  w2b3: {"job":{"id":"075424bf-db82-4a76-9908-6f6c3348da08","status":"running","operation":"backup.task.run","createdAt":"2026-10-15T22:22:13.186Z","createdBy":"root@pam"}}
+
+### t+4 s: the jobs and the processes
+  46347       3 /usr/bin/proxmox-backup-client backup w2data.pxar:/gtbackup/w2src/.zfs/snapshot/anas-backup-w2b1-1792102933 --backup-id w2b1
+  46376       3 /usr/bin/proxmox-backup-client backup w2data.pxar:/gtbackup/w2src/.zfs/snapshot/anas-backup-w2b2-1792102933 --backup-id w2b2
+  46385       3 /usr/bin/proxmox-backup-client backup w2data.pxar:/gtbackup/w2src/.zfs/snapshot/anas-backup-w2b3-1792102933 --backup-id w2b3
+● anas-backup-w2b1.service loaded activating start   start ANAS backup task w2b1
+● anas-backup-w2b2.service loaded activating start   start ANAS backup task w2b2
+● anas-backup-w2b3.service loaded activating start   start ANAS backup task w2b3
+  anas-backup-w2b1.timer   loaded active     waiting       ANAS backup timer w2b1
+  anas-backup-w2b2.timer   loaded active     waiting       ANAS backup timer w2b2
+  anas-backup-w2b3.timer   loaded active     waiting       ANAS backup timer w2b3
+
+### row 2 extra: cancel a running DIRECT run over the socket with Sys.Audit only
+  {"error":{"code":"NOT_FOUND","message":"Job '' not found"}}
+  HTTP 404
+
+### t+10 s
+
+### wait for the direct runs to end (connect deadline) and the supervisors to follow
+● anas-backup-w2b1.service loaded activating start   start ANAS backup task w2b1
+● anas-backup-w2b2.service loaded activating start   start ANAS backup task w2b2
+● anas-backup-w2b3.service loaded activating start   start ANAS backup task w2b3
+  anas-backup-w2b1.timer   loaded active     waiting       ANAS backup timer w2b1
+  anas-backup-w2b2.timer   loaded active     waiting       ANAS backup timer w2b2
+  anas-backup-w2b3.timer   loaded active     waiting       ANAS backup timer w2b3

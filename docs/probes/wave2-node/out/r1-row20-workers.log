@@ -1,0 +1,16 @@
+Oct 15 22:12:10.253634 anas-pve pveproxy[2844]: worker exit
+Oct 15 22:12:10.282538 anas-pve pveproxy[1412]: worker 2844 finished
+Oct 15 22:12:10.282571 anas-pve pveproxy[1412]: starting 1 worker(s)
+Oct 15 22:12:10.286070 anas-pve pveproxy[1412]: worker 23490 started
+Oct 15 22:12:10.322076 anas-pve pveproxy[2842]: worker exit
+Oct 15 22:12:10.347941 anas-pve pveproxy[1412]: worker 2842 finished
+Oct 15 22:12:10.348027 anas-pve pveproxy[1412]: starting 1 worker(s)
+Oct 15 22:12:10.349915 anas-pve pveproxy[1412]: worker 23580 started
+Oct 15 22:12:10.350924 anas-pve pveproxy[2843]: worker exit
+Oct 15 22:12:10.381248 anas-pve pveproxy[1412]: worker 2843 finished
+Oct 15 22:12:10.381278 anas-pve pveproxy[1412]: starting 1 worker(s)
+Oct 15 22:12:10.383550 anas-pve pveproxy[1412]: worker 23613 started
+::ffff:127.0.0.1 - root@pam [15/10/2026:22:12:13 +0000] "GET /anas/api/nodes/anas-pve/v1/health HTTP/1.1" 503 80
+/usr/share/perl5/PVE/Service/pveproxy.pm:102:        max_requests => 1000,
+/usr/share/perl5/PVE/APIServer/AnyEvent.pm:1779:                        if ($self->{request_count} >= $self->{max_requests}) {
+/usr/share/perl5/PVE/APIServer/AnyEvent.pm:2129:    $self->{max_requests} = 8000 if !$self->{max_requests};

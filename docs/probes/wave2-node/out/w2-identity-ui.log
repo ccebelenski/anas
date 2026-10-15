@@ -1,0 +1,27 @@
+(node:834477) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+(node:834740) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+[22:32:15] group dialog: Advanced fieldset "Advanced" collapsed, gid field hidden
+[22:32:15] group dialog: expanded; field label "Group ID (optional):"
+[22:32:16] group create confirm: none
+[22:32:16] node: getent group w2uigrp -> w2uigrp:x:51234:
+[22:32:16] user dialog: Advanced fieldset collapsed; uid and primary group hidden
+[22:32:17] user dialog: expanded; labels ["User ID (optional):","Primary group:"]; primary group value "users"
+[22:32:17] node: 70 groups, 63 outside 1000..60000 (e.g. root, daemon, bin, sys, adm, tty)
+[22:32:20] primary-group list: ["users(100)","debian(1000)","rclonegt(1001)","w2g0(1003)","w2g1(51001)","w2g2(1002)","w2u7(51007)","w2uigrp(51234)"]
+[22:32:21] supplementary-group picker: ["debian(1000)","rclonegt(1001)","w2g0(1003)","w2g1(51001)","w2g2(1002)","w2u7(51007)","w2uigrp(51234)"]
+[22:32:21] user create request body: {"name":"w2uiuser","uid":51234,"primaryGroup":"w2uigrp"}
+[22:32:21] user create confirm: none
+[22:32:22] node: getent passwd w2uiuser -> w2uiuser:x:51234:51234::/home/w2uiuser:/usr/sbin/nologin
+[22:32:22] users grid row: "w2uiuser 51234 w2uigrp ✗ Active Local"
+[22:32:22] user delete confirm: "Delete user Delete share user "w2uiuser"? User 'w2uiuser' (uid 51234) will be removed from the system Files owned by this user keep uid 51234. ANAS will not give uid 51234 to a new user while it still owns files on an imported ZFS filesystem or under a share, but it cannot check ids seen only in exported pools, on disconnected disks or in backups. To give the files back later, re-create the user with User ID 51234. Cancel Delete"
+[22:32:23] node: getent passwd w2uiuser -> (absent); group still: w2uigrp:x:51234:
+[22:32:24] group delete confirm: "Delete group Delete group "w2uigrp"? Group 'w2uigrp' (gid 51234) will be removed from the system Files owned by this group keep gid 51234. ANAS will not give gid 51234 to a new group while it still owns files on an imported ZFS filesystem or under a share, but it cannot check ids seen only in exported pools, on disconnected disks or in backups. To give the files back later, re-create the group with Group ID 51234. Cancel Delete"
+[22:32:25] node: getent passwd w2uiuser -> "", getent group w2uigrp -> "", getent passwd/group 51234 -> ""
+  ✓  1 [w2probe] › docs/probes/wave2-node/w2-identity-ui.spec.ts:95:3 › cr.29/29b/29c identity dialogs › Advanced sections, band-only group pickers, explicit uid/gid, delete through the UI (12.6s)
+
+  1 passed (14.7s)

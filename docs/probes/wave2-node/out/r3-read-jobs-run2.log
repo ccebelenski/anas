@@ -1,0 +1,43 @@
+
+### remote test — fast (w2ok)
+HTTP 202 0.014916
+{"job":{"id":"8439819d-870e-47c8-b5bc-1290bca45710","status":"running","operation":"read.cloud.remote.test","createdAt":"2026-10-15T22:20:43.268Z","createdBy":"root@pam"}}
+  [t+0s] running |  |  | 
+  [t+0s] completed |  | {"verdict": "ok", "message": ""} | 
+
+### remote test — slow: against 192.0.2.10
+HTTP 202 0.032755
+{"job":{"id":"38e77cd7-cdc7-4be5-9fbd-f5556d4e6b7b","status":"running","operation":"read.cloud.remote.test","createdAt":"2026-10-15T22:20:43.973Z","createdBy":"root@pam"}}
+> at t+3s:
+  job read.cloud.remote.test running | progress: None
+  ps:   45559   45559       3 /usr/bin/timeout 120 /usr/bin/rclone --config /etc/anas/rclone.conf --ask-password=false lsjson w2bh: --max-depth 1 --contimeout 10s --timeout 9s --retries 1 --low-level-retrie
+> Cancel (POST /jobs/38e77cd7-cdc7-4be5-9fbd-f5556d4e6b7b/cancel, no x-anas-confirm)
+  HTTP 202 0.017386
+  {"job":{"id":"def85535-f3f9-47a7-be3d-8a451a63079b","status":"running","operation":"job.cancel","createdAt":"2026-10-15T22:20:47.490Z","createdBy":"root@pam"}}
+  [t+0s] cancelled |  | {"status": "cancelled", "reason": "cancelled by root@pam at 2026-10-15T22:20:47.490Z", "cancelledBy": "root@pam", "cancelledAt": "2026-10-15T22:20:47.490Z"} | 
+> process group 45559 after the cancel: 0 processes
+> any child left: 0
+  lasted 4s
+
+### catalog listing — fast (pbsgt on the PBS VM, read-only)
+groups: ['host/gtguard', 'host/lun-e151d443-ddcd-47ac-91ed-87305926981a', 'host/lun-8e39120e-b946-43d7-9fa4-ffe1bcd12cdb', 'host/gtbackcancel', 'host/gtcal2', 'host/gtcal', 'host/gtsmoke']
+snapshot: host/gtguard/2026-09-25T02:36:53Z  archive: guarded.pxar
+HTTP 202 0.020670
+{"job":{"id":"0e2d6613-3f09-412e-ac77-c4bcbaa8015d","status":"running","operation":"read.backup.catalog","createdAt":"2026-10-15T22:20:49.234Z","createdBy":"root@pam"}}
+  [t+0s] running |  |  | 
+  [t+0s] completed |  | {"verdict": "ok", "repository": "pbsgt", "snapshot": "host/gtguard/2026-09-25T02:36:53Z", "archive": "guarded.pxar", "archiveKind": "pxar", "path": "/", "entries": [{"name": "proof.txt", "path": "/proof.txt", "type": "file", "size": 23, "modified": "2026-09-25 02:36:52", "mtimeZone": "node-local", "mode": "644"}], "warnings": []} | 
+
+### catalog listing — slow: against 192.0.2.10
+HTTP 202 0.010700
+{"job":{"id":"f98b5749-b35e-425c-8142-03bd6ea99ca0","status":"running","operation":"read.backup.catalog","createdAt":"2026-10-15T22:20:49.928Z","createdBy":"root@pam"}}
+> at t+3s:
+  job read.backup.catalog running | progress: None
+  ps:   45667   45667       3 /usr/bin/timeout 300 /usr/bin/proxmox-backup-client catalog shell host/w2b1/2026-10-15T00:00:00Z w2data.pxar
+  ps:   45668   45667       3 /usr/bin/proxmox-backup-client catalog shell host/w2b1/2026-10-15T00:00:00Z w2data.pxar
+> Cancel (POST /jobs/f98b5749-b35e-425c-8142-03bd6ea99ca0/cancel, no x-anas-confirm)
+  HTTP 202 0.015283
+  {"job":{"id":"441d4d29-05d1-495e-9e74-940e23787328","status":"running","operation":"job.cancel","createdAt":"2026-10-15T22:20:53.240Z","createdBy":"root@pam"}}
+  [t+0s] cancelled |  | {"status": "cancelled", "reason": "cancelled by root@pam at 2026-10-15T22:20:53.240Z", "cancelledBy": "root@pam", "cancelledAt": "2026-10-15T22:20:53.240Z"} | 
+> process group 45667 after the cancel: 0 processes
+> any child left: 0
+  lasted 5s

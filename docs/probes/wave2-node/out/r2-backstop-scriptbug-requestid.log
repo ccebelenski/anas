@@ -1,0 +1,74 @@
+
+### A — POST /v1/pools/gtbackup/scrub over the socket
+> privileges: Sys.Audit
+  {"error":{"code":"UNAUTHORIZED","message":"Missing or invalid identity headers (x-anas-user, x-anas-user-uid, x-anas-request-id, x-anas-privileges)"}}
+  HTTP 401
+> privileges: Sys.Audit,Sys.Modify
+  {"error":{"code":"UNAUTHORIZED","message":"Missing or invalid identity headers (x-anas-user, x-anas-user-uid, x-anas-request-id, x-anas-privileges)"}}
+  HTTP 401
+> no x-anas-privileges header
+  {"error":{"code":"UNAUTHORIZED","message":"Missing or invalid identity headers (x-anas-user, x-anas-user-uid, x-anas-request-id, x-anas-privileges)"}}
+  HTTP 401
+> privileges: Sys.Modify (only)
+  {"error":{"code":"UNAUTHORIZED","message":"Missing or invalid identity headers (x-anas-user, x-anas-user-uid, x-anas-request-id, x-anas-privileges)"}}
+  HTTP 401
+    anasd| {"level":40,"time":1792102670489,"pid":2532,"hostname":"anas-pve","reqId":"req-4a6","msg":"[authz] refused POST /v1/pools/gtbackup/scrub: invalid identity headers (x-anas-request-id: Invalid UUID)"}
+    anasd| {"level":40,"time":1792102670641,"pid":2532,"hostname":"anas-pve","reqId":"req-4a7","msg":"[authz] refused POST /v1/pools/gtbackup/scrub: invalid identity headers (x-anas-request-id: Invalid UUID)"}
+    anasd| {"level":40,"time":1792102670842,"pid":2532,"hostname":"anas-pve","reqId":"req-4a8","msg":"[authz] refused POST /v1/pools/gtbackup/scrub: invalid identity headers (x-anas-request-id: Invalid UUID; x-anas-privileges: Invalid input: expected string, received undefined)"}
+    anasd| {"level":40,"time":1792102671007,"pid":2532,"hostname":"anas-pve","reqId":"req-4a9","msg":"[authz] refused POST /v1/pools/gtbackup/scrub: invalid identity headers (x-anas-request-id: Invalid UUID)"}
+
+### B — a read.* job (cloud preview, w2ok → rclonegt@127.0.0.1) with Sys.Audit only
+  {"error":{"code":"UNAUTHORIZED","message":"Missing or invalid identity headers (x-anas-user, x-anas-user-uid, x-anas-request-id, x-anas-privileges)"}}
+  HTTP 401
+  job: {"error":{"code":"NOT_FOUND","message":"Job '' not found"}}
+> the same preview over the socket, slow remote (w2bh, blackholed), then its cancel with Sys.Audit only
+  {"error":{"code":"UNAUTHORIZED","message":"Missing or invalid identity headers (x-anas-user, x-anas-user-uid, x-anas-request-id, x-anas-privileges)"}}
+  HTTP 401
+  ps: 43375 bash -c sleep 3; pgrep -af "rclone " | cut -c1-200
+  {"error":{"code":"UNAUTHORIZED","message":"Missing or invalid identity headers (x-anas-user, x-anas-user-uid, x-anas-request-id, x-anas-privileges)"}}
+  HTTP 401
+  {"error":{"code":"NOT_FOUND","message":"Job '' not found"}}
+  
+  43403 bash -c sleep 3; curl -s --unix-socket /run/anas/anasd.sock -H 'x-anas-privileges: Sys.Audit' http://localhost/v1/jobs/ | cut -c1-500; echo; pgrep -af 'rclone ' || echo '(no rclone process)'
+> a NON-read job's cancel with Sys.Audit only (a running scrub's job id)
+  {"error":{"code":"UNAUTHORIZED","message":"Missing or invalid identity headers (x-anas-user, x-anas-user-uid, x-anas-request-id, x-anas-privileges)"}}
+  HTTP 401
+> through /anas as anas-audit@pve (PVEAuditor): the same preview POST
+  {"error":{"code":"FORBIDDEN","message":"Permission check failed (/, Sys.Modify): anas-audit@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations."}}
+    HTTP 403
+    anasd| {"level":40,"time":1792102671007,"pid":2532,"hostname":"anas-pve","reqId":"req-4a9","msg":"[authz] refused POST /v1/pools/gtbackup/scrub: invalid identity headers (x-anas-request-id: Invalid UUID)"}
+    anasd| {"level":40,"time":1792102671539,"pid":2532,"hostname":"anas-pve","reqId":"req-4aa","msg":"[authz] refused POST /v1/cloud/tasks/preview: invalid identity headers (x-anas-request-id: Invalid UUID)"}
+    anasd| {"level":40,"time":1792102675885,"pid":2532,"hostname":"anas-pve","reqId":"req-4ac","msg":"[authz] refused POST /v1/cloud/tasks/preview: invalid identity headers (x-anas-request-id: Invalid UUID)"}
+    anasd| {"level":40,"time":1792102679290,"pid":2532,"hostname":"anas-pve","reqId":"req-4ad","msg":"[authz] refused POST /v1/jobs//cancel: invalid identity headers (x-anas-request-id: Invalid UUID)"}
+    anasd| {"level":40,"time":1792102682679,"pid":2532,"hostname":"anas-pve","reqId":"req-4af","msg":"[authz] refused POST /v1/pools/gtbackup/scrub: invalid identity headers (x-anas-request-id: Invalid UUID)"}
+    anasd| {"level":40,"time":1792102682870,"pid":2532,"hostname":"anas-pve","reqId":"req-4ag","msg":"[authz] refused POST /v1/jobs//cancel: invalid identity headers (x-anas-request-id: Invalid UUID)"}
+    anas| {"level":40,"time":1792102682967,"pid":28450,"hostname":"anas-pve","reqId":"req-1ez","msg":"[authz] forbidden: anas-audit@pve POST /api/nodes/anas-pve/v1/cloud/tasks/preview lacks Sys.Modify on /"}
+
+### C — the snapshot schedule w2snap: fire its unit (what the timer does)
+[Unit]
+OnCalendar=hourly
+ExecStart=/usr/bin/node /opt/anas/packages/daemon/dist/snapshot-task.js --id w2snap
+exit 0
+Result=success
+ExecMainStatus=0
+Starting anas-snap-w2snap.service - ANAS snapshot schedule w2 node pass...
+{"schedule":"w2snap","result":{"schedule":"w2snap","taken":"anas-hourly-2026-10-15T221803Z","pruned":[],"prunedCount":0,"skippedHeld":[],"heldCount":0}}
+anas-snap-w2snap.service: Deactivated successfully.
+Finished anas-snap-w2snap.service - ANAS snapshot schedule w2 node pass.
+anas-snap-w2snap.service: Consumed 659ms CPU time, 71.5M memory peak.
+gtbackup/w2src@anas-hourly-2026-10-15T221803Z
+  job: schedule.create completed root@pam 2026-10-15T22:17:19.896Z 
+  job: schedule.run completed root@pam 2026-10-15T22:18:03.915Z 
+
+### D — the udev cache-event script's identity
+> its exact headers (x-anas-user: system:udev-cache-event, Sys.Audit,Sys.Modify) on POST /v1/pools/gtbackup/scrub
+  {"error":{"code":"UNAUTHORIZED","message":"Missing or invalid identity headers (x-anas-user, x-anas-user-uid, x-anas-request-id, x-anas-privileges)"}}
+  HTTP 401
+> /usr/local/bin/anas-cache-event w2nopool-cache0 sdz (the installed script), and the same request it sends, with its answer shown
+  script exit 0
+  EVENT=CacheDeviceRemoved POOL=w2nopool SLICE=w2nopool-cache0 KERNEL=sdz
+  EVENT=CacheEventDelivered POOL=w2nopool SLICE=w2nopool-cache0
+  {"error":{"code":"UNAUTHORIZED","message":"Missing or invalid identity headers (x-anas-user, x-anas-user-uid, x-anas-request-id, x-anas-privileges)"}}
+  HTTP 401
+    anasd| {"level":40,"time":1792102694608,"pid":2532,"hostname":"anas-pve","reqId":"req-4al","msg":"[authz] refused POST /v1/pools/gtbackup/scrub: invalid identity headers (x-anas-request-id: Invalid UUID)"}
+    anasd| {"level":40,"time":1792102694808,"pid":2532,"hostname":"anas-pve","reqId":"req-4an","msg":"[authz] refused POST /v1/ahr/w2nopool/cache/event: invalid identity headers (x-anas-request-id: Invalid UUID)"}

@@ -1,0 +1,120 @@
+NAME      TYPE        MOUNTED  KEYSTATUS    CANMOUNT  MOUNTPOINT
+w2id      filesystem  yes      -            on        /w2id
+w2id/enc  filesystem  no       unavailable  on        /w2id/enc
+w2id/fs   filesystem  yes      -            on        /w2id/fs
+w2id/unm  filesystem  no       -            on        /w2id/unm
+w2id/vol  volume      -        -            -         -
+
+=================== w2id/fs
+$ zfs userspace -Hpn -o name w2id/fs
+exit code: 0
+stdout (8 bytes):
+  | 0
+  | 51099
+stderr (0 bytes):
+
+$ zfs groupspace -Hpn -o name w2id/fs
+exit code: 0
+stdout (8 bytes):
+  | 0
+  | 51099
+stderr (0 bytes):
+
+$ zfs userspace -H -p -n -o name -t posixuser -- w2id/fs
+exit code: 0
+stdout (8 bytes):
+  | 0
+  | 51099
+stderr (0 bytes):
+
+$ zfs groupspace -H -p -n -o name -t posixgroup -- w2id/fs
+exit code: 0
+stdout (8 bytes):
+  | 0
+  | 51099
+stderr (0 bytes):
+
+=================== w2id/unm
+$ zfs userspace -Hpn -o name w2id/unm
+exit code: 0
+stdout (8 bytes):
+  | 0
+  | 51098
+stderr (0 bytes):
+
+$ zfs groupspace -Hpn -o name w2id/unm
+exit code: 0
+stdout (8 bytes):
+  | 0
+  | 51098
+stderr (0 bytes):
+
+$ zfs userspace -H -p -n -o name -t posixuser -- w2id/unm
+exit code: 0
+stdout (8 bytes):
+  | 0
+  | 51098
+stderr (0 bytes):
+
+$ zfs groupspace -H -p -n -o name -t posixgroup -- w2id/unm
+exit code: 0
+stdout (8 bytes):
+  | 0
+  | 51098
+stderr (0 bytes):
+
+=================== w2id/enc
+$ zfs userspace -Hpn -o name w2id/enc
+exit code: 255
+stdout (0 bytes):
+stderr (54 bytes):
+  | cannot get used/quota for w2id/enc: permission denied
+
+$ zfs groupspace -Hpn -o name w2id/enc
+exit code: 255
+stdout (0 bytes):
+stderr (54 bytes):
+  | cannot get used/quota for w2id/enc: permission denied
+
+$ zfs userspace -H -p -n -o name -t posixuser -- w2id/enc
+exit code: 255
+stdout (0 bytes):
+stderr (54 bytes):
+  | cannot get used/quota for w2id/enc: permission denied
+
+$ zfs groupspace -H -p -n -o name -t posixgroup -- w2id/enc
+exit code: 255
+stdout (0 bytes):
+stderr (54 bytes):
+  | cannot get used/quota for w2id/enc: permission denied
+
+=================== w2id/vol
+$ zfs userspace -Hpn -o name w2id/vol
+exit code: 1
+stdout (0 bytes):
+stderr (74 bytes):
+  | cannot open 'w2id/vol': operation not applicable to datasets of this type
+
+$ zfs groupspace -Hpn -o name w2id/vol
+exit code: 1
+stdout (0 bytes):
+stderr (74 bytes):
+  | cannot open 'w2id/vol': operation not applicable to datasets of this type
+
+$ zfs userspace -H -p -n -o name -t posixuser -- w2id/vol
+exit code: 1
+stdout (0 bytes):
+stderr (74 bytes):
+  | cannot open 'w2id/vol': operation not applicable to datasets of this type
+
+$ zfs groupspace -H -p -n -o name -t posixgroup -- w2id/vol
+exit code: 1
+stdout (0 bytes):
+stderr (74 bytes):
+  | cannot open 'w2id/vol': operation not applicable to datasets of this type
+
+=================== the list the daemon walks (zfs list -H -o name -t filesystem), w2id rows
+w2id
+w2id/enc
+w2id/fs
+w2id/unm

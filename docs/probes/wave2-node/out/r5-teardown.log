@@ -1,0 +1,13 @@
+  w2u1: [t+0s] completed | Deleting share user 'w2u1' | {"deleted": "w2u1", "smbEntryRemoved": false, "groupRemoved": null} | 
+  w2u2: [t+0s] completed | Deleting share user 'w2u2' | {"deleted": "w2u2", "smbEntryRemoved": false, "groupRemoved": null} | 
+  w2u3: [t+1s] completed | Deleting share user 'w2u3' | {"deleted": "w2u3", "smbEntryRemoved": false, "groupRemoved": null} | 
+  w2u4: [t+1s] completed | Deleting share user 'w2u4' | {"deleted": "w2u4", "smbEntryRemoved": false, "groupRemoved": null} | 
+  w2u6: [t+1s] completed | Deleting share user 'w2u6' | {"deleted": "w2u6", "smbEntryRemoved": false, "groupRemoved": null} | 
+  w2u99: [t+1s] completed | Deleting share user 'w2u99' | {"deleted": "w2u99", "smbEntryRemoved": false, "groupRemoved": null} | 
+  w2g0: [t+0s] completed | Deleting group 'w2g0' | {"deleted": "w2g0"} | 
+  w2g1: [t+0s] completed | Deleting group 'w2g1' | {"deleted": "w2g1"} | 
+  w2g2: [t+0s] completed | Deleting group 'w2g2' | {"deleted": "w2g2"} | 
+debian:x:1000:1000:Debian:/home/debian:/bin/bash
+w2u8:x:51009:51007::/home/w2u8:/usr/sbin/nologin
+debian:x:1000:
+w2u7:x:51007:

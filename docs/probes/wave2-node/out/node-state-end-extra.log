@@ -1,0 +1,12 @@
+debian
+ls: cannot access '/w2id': No such file or directory
+ls: cannot access '/w2z': No such file or directory
+ls: cannot access '/gtbackup/w2src': No such file or directory
+/var/tmp/w2
+-rw-r--r-- 1 root root 25493 Oct 15 22:11 /usr/share/anas/perl/AnasProxy.pm
+total 4
+srw------- 1 root root      0 Oct 15 22:08 anasd.sock
+-rw-r----- 1 root www-data 32 Oct 15 22:12 proxy.key
+0
+0
+removed

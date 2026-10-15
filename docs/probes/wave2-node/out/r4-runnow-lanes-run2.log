@@ -1,0 +1,40 @@
+
+### three Run-Nows, back to back
+  w2b1: HTTP 202 0.044497
+  w2b1: {"job":{"id":"d0e49bfc-9309-4e87-ab20-774be4eff59a","status":"running","operation":"backup.task.run","createdAt":"2026-10-15T22:22:56.637Z","createdBy":"root@pam"}}
+  w2b2: HTTP 202 0.030392
+  w2b2: {"job":{"id":"fc4b48c1-9904-4eaa-9049-5ff3e7dfc8f5","status":"running","operation":"backup.task.run","createdAt":"2026-10-15T22:22:56.736Z","createdBy":"root@pam"}}
+  w2b3: HTTP 202 0.023012
+  w2b3: {"job":{"id":"55924b79-093f-4c56-9a22-adb4aedb1c64","status":"running","operation":"backup.task.run","createdAt":"2026-10-15T22:22:56.812Z","createdBy":"root@pam"}}
+
+### t+3 s: the jobs and the processes
+  d0e49bfc supervisor running   created 22:22:56.637 started 22:22:56.637 ended  | started backup task 'w2b1' | 
+  fc4b48c1 supervisor running   created 22:22:56.736 started 22:22:56.736 ended  | started backup task 'w2b2' | 
+  55924b79 supervisor running   created 22:22:56.812 started 22:22:56.812 ended  | started backup task 'w2b3' | 
+  97a50270 direct     running   created 22:22:56.953 started 22:22:56.953 ended  | archive 'w2data' <- /gtbackup/w2src/.zfs/snapshot/anas-backu | 
+  f8edcdc8 direct     running   created 22:22:56.968 started 22:22:56.968 ended  | archive 'w2data' <- /gtbackup/w2src/.zfs/snapshot/anas-backu | 
+  13c580ae direct     running   created 22:22:57.068 started 22:22:57.068 ended  | archive 'w2data' <- /gtbackup/w2src/.zfs/snapshot/anas-backu | 
+  46879       3 /usr/bin/proxmox-backup-client backup w2data.pxar:/gtbackup/w2src/.zfs/snapshot/anas-backup-w2b1-1792102976 --backup-id w2b1
+  46887       3 /usr/bin/proxmox-backup-client backup w2data.pxar:/gtbackup/w2src/.zfs/snapshot/anas-backup-w2b2-1792102977 --backup-id w2b2
+  46914       2 /usr/bin/proxmox-backup-client backup w2data.pxar:/gtbackup/w2src/.zfs/snapshot/anas-backup-w2b3-1792102977 --backup-id w2b3
+
+### row 2 extra: cancel the running direct run 97a50270 over the socket with Sys.Audit only
+  {"error":{"code":"FORBIDDEN","message":"Permission check failed (/, Sys.Modify): w2probe@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations."}}
+  HTTP 403
+
+### wait for all six to end
+  d0e49bfc supervisor failed    created 22:22:56.637 started 22:22:56.637 ended 22:23:19.001 | started backup task 'w2b1' | Error: client error (Connect)
+  fc4b48c1 supervisor failed    created 22:22:56.736 started 22:22:56.736 ended 22:23:19.013 | started backup task 'w2b2' | Error: client error (Connect)
+  55924b79 supervisor failed    created 22:22:56.812 started 22:22:56.812 ended 22:23:19.132 | started backup task 'w2b3' | Error: client error (Connect)
+  97a50270 direct     failed    created 22:22:56.953 started 22:22:56.953 ended 22:23:07.322 | Starting backup: host/w2b1/2026-10-15T22:22:57Z | Error: client error (Connect)
+  f8edcdc8 direct     failed    created 22:22:56.968 started 22:22:56.968 ended 22:23:07.289 | Starting backup: host/w2b2/2026-10-15T22:22:57Z | Error: client error (Connect)
+  13c580ae direct     failed    created 22:22:57.068 started 22:22:57.068 ended 22:23:07.282 | Starting backup: host/w2b3/2026-10-15T22:22:57Z | Error: client error (Connect)
+
+### audit lines (job.submitted / job.refused) for these runs
+   1792102976637 job.submitted root@pam backup.task.run {"task": "w2b1"}  
+   1792102976736 job.submitted root@pam backup.task.run {"task": "w2b2"}  
+   1792102976812 job.submitted root@pam backup.task.run {"task": "w2b3"}  
+   1792102976953 job.submitted root@pam backup.task.run {"task": "w2b1", "direct": true}  
+   1792102976968 job.submitted root@pam backup.task.run {"task": "w2b2", "direct": true}  
+   1792102977068 job.submitted root@pam backup.task.run {"task": "w2b3", "direct": true}  
+   1792102980288 job.refused w2probe@pve job.cancel {"id": "97a50270-a570-441d-af03-1d082a6a3b98", "operation": "backup.task.run"}  holds Sys.Audit on /

@@ -1,0 +1,23 @@
+now 2026-10-15T22:07:31Z (1792102051)
+MainPID=1412
+ExecMainStartTimestamp=Thu 2026-10-15 22:06:32 UTC
+ActiveEnterTimestamp=Thu 2026-10-15 22:06:32 UTC
+--- workers (pid, start time)
+1413 Thu Oct 15 22:06:31 2026
+1414 Thu Oct 15 22:06:31 2026
+1415 Thu Oct 15 22:06:31 2026
+--- installed module
+-rw-r--r-- 1 root root 9350 2026-10-15T17:14:09 /usr/share/anas/perl/AnasProxy.pm
+adc45d9d00d32777
+--- hook in AnyEvent.pm
+2
+--- proxy.key
+ls: cannot access '/run/anas/proxy.key': No such file or directory
+--- pveproxy journal (last 15 min, reload/restart/anas lines)
+2026-10-15T22:06:31+00:00 anas-pve systemd[1]: Starting pveproxy.service - PVE API Proxy Server...
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: starting server
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: starting 3 worker(s)
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: worker 1413 started
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: worker 1414 started
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: worker 1415 started
+2026-10-15T22:06:32+00:00 anas-pve systemd[1]: Started pveproxy.service - PVE API Proxy Server.

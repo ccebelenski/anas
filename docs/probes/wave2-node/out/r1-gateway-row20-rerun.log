@@ -1,0 +1,23 @@
+
+### row 20 — key rotation: restart the gateway while 4 loops hammer /anas for 12 s
+MainPID=1412
+workers 2842 2843 2844 
+3564 -rw-r----- 1 root www-data 32 Oct 15 22:11 /run/anas/proxy.key
+restart at 1792102333.432
+restart returned 1792102333.453
+status counts:
+   2756 200
+     57 502
+      1 503
+window: first non-200 1792102333.428, last non-200 1792102333.651, first 200 after it 1792102333.652
+non-200 answers by code:
+     57 502
+      1 503
+3682 -rw-r----- 1 root www-data 32 Oct 15 22:12 /run/anas/proxy.key
+MainPID=1412
+workers 23490 23580 23613 
+journal:
+      9     pveproxy| anas-proxy: 502 for GET /api/nodes/anas-pve/v1/health from ::ffff:127.0.0.1: gateway not reachable on the loopback interface (595 Connection refused)
+      1     pveproxy| anas-proxy: 502 for GET /api/nodes/anas-pve/v1/health from ::ffff:127.0.0.1: gateway not reachable on the loopback interface (596 Connection reset by peer)
+     47     pveproxy| anas-proxy: refused GET /api/nodes/anas-pve/v1/health from ::ffff:127.0.0.1 (root@pam): proxy key unreadable: /run/anas/proxy.key: No such file or directory
+  after: HTTP 200

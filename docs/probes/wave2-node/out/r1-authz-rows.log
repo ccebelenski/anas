@@ -1,0 +1,146 @@
+
+### row 1 — root@pam: GET /pools; POST scrub (gtbackup) with token
+> root@pam GET /pools (csrf: root@pam)
+  HTTP 200 0.051013s
+> root@pam POST /pools/gtbackup/scrub (csrf: root@pam)
+  {"job":{"id":"c0f4f470-58b9-461e-949e-5c70e2fa9001","status":"running","operation":"zpool.scrub","createdAt":"2026-10-15T22:10:06.651Z","createdBy":"root@pam"}}
+  HTTP 202 0.032456s
+  journal since 2026-10-15 22:10:06:
+
+### row 2 — root@pam: POST scrub without token; with anas-admin's token
+> root@pam POST /pools/gtbackup/scrub (csrf: -)
+  {"error":{"code":"UNAUTHORIZED","message":"Permission denied - invalid csrf token"}}
+  HTTP 401 3.010071s
+> root@pam POST /pools/gtbackup/scrub (csrf: anas-admin@pve)
+  {"error":{"code":"UNAUTHORIZED","message":"Permission denied - invalid csrf token"}}
+  HTTP 401 3.019442s
+  journal since 2026-10-15 22:10:06:
+    pveproxy| anas-proxy: refused POST /api/nodes/anas-pve/v1/pools/gtbackup/scrub from ::ffff:192.168.200.1 (root@pam): invalid csrf token
+    pveproxy| anas-proxy: refused POST /api/nodes/anas-pve/v1/pools/gtbackup/scrub from ::ffff:192.168.200.1 (root@pam): invalid csrf token
+
+### row 3 — anas-audit (PVEAuditor on /): GET /pools; POST scrub with its own token
+> anas-audit@pve GET /pools (csrf: anas-audit@pve)
+  HTTP 200 0.047438s
+> anas-audit@pve POST /pools/gtbackup/scrub (csrf: anas-audit@pve)
+  {"error":{"code":"FORBIDDEN","message":"Permission check failed (/, Sys.Modify): anas-audit@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations."}}
+  HTTP 403 0.005699s
+  journal since 2026-10-15 22:10:13:
+    anas| {"level":40,"time":1792102213389,"pid":2534,"hostname":"anas-pve","reqId":"req-5","msg":"[authz] forbidden: anas-audit@pve POST /api/nodes/anas-pve/v1/pools/gtbackup/scrub lacks Sys.Modify on /"}
+
+### row 4 — anas-none (no ACL): GET /health (panel half: r1-panel-privilege.spec.ts)
+> anas-none@pve GET /health (csrf: anas-none@pve)
+  {"error":{"code":"FORBIDDEN","message":"Permission check failed (/, Sys.Audit): anas-none@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations."}}
+  HTTP 403 0.020953s
+  journal since 2026-10-15 22:10:13:
+    anas| {"level":40,"time":1792102213389,"pid":2534,"hostname":"anas-pve","reqId":"req-5","msg":"[authz] forbidden: anas-audit@pve POST /api/nodes/anas-pve/v1/pools/gtbackup/scrub lacks Sys.Modify on /"}
+    anas| {"level":40,"time":1792102213814,"pid":2534,"hostname":"anas-pve","reqId":"req-6","msg":"[authz] forbidden: anas-none@pve GET /api/nodes/anas-pve/v1/health lacks Sys.Audit on /"}
+
+### row 5 — anas-np (Administrator on / with --propagate 0): GET and POST
+> anas-np@pve GET /pools (csrf: anas-np@pve)
+  HTTP 200 0.063223s
+> anas-np@pve POST /pools/gtbackup/scrub (csrf: anas-np@pve)
+  {"job":{"id":"08638182-a04d-468a-942a-6e0b871096df","status":"running","operation":"zpool.scrub","createdAt":"2026-10-15T22:10:14.284Z","createdBy":"anas-np@pve"}}
+  HTTP 202 0.053765s
+  journal since 2026-10-15 22:10:14:
+
+### row 6 — anas-node (Administrator on /nodes/anas-pve only): ANAS GET; PVE's own ZFS create for comparison
+> anas-node@pve GET /pools (csrf: anas-node@pve)
+  {"error":{"code":"FORBIDDEN","message":"Permission check failed (/, Sys.Audit): anas-node@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations."}}
+  HTTP 403 0.010746s
+> anas-node POST /api2/json/nodes/anas-pve/disks/zfs (name=w2bogus devices=/dev/w2nonexistent raidlevel=single)
+  {"message":"Permission check failed (/, Sys.Modify)\n","data":null}
+  HTTP 403
+> anas-node GET /api2/json/nodes/anas-pve/disks/zfs (PVE's list)
+  {"data":null,"message":"Permission check failed (/, Sys.Audit)\n"}
+  HTTP 403
+> root@pam POST the same bogus ZFS create (PVE's answer past the permission check)
+  {"data":null,"message":"not a valid block device\n"}
+  HTTP 500
+  journal since 2026-10-15 22:10:14:
+    anas| {"level":40,"time":1792102214695,"pid":2534,"hostname":"anas-pve","reqId":"req-9","msg":"[authz] forbidden: anas-node@pve GET /api/nodes/anas-pve/v1/pools lacks Sys.Audit on /"}
+
+### row 7 — anas-gm (PVEAuditor through group anas-g): GET; POST
+> anas-gm@pve GET /pools (csrf: anas-gm@pve)
+  HTTP 200 0.056356s
+> anas-gm@pve POST /pools/gtbackup/scrub (csrf: anas-gm@pve)
+  {"error":{"code":"FORBIDDEN","message":"Permission check failed (/, Sys.Modify): anas-gm@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations."}}
+  HTTP 403 0.009177s
+  journal since 2026-10-15 22:10:15:
+    anas| {"level":40,"time":1792102215177,"pid":2534,"hostname":"anas-pve","reqId":"req-b","msg":"[authz] forbidden: anas-gm@pve POST /api/nodes/anas-pve/v1/pools/gtbackup/scrub lacks Sys.Modify on /"}
+
+### row 8 — anas-off: GET with a live ticket, --enable 0, GET again with the same ticket
+> anas-off@pve GET /pools (csrf: anas-off@pve)
+  HTTP 200 0.084393s
+  (pveum user modify anas-off@pve --enable 0 at 22:10:16.009)
+> anas-off@pve GET /pools (csrf: anas-off@pve)
+  {"error":{"code":"UNAUTHORIZED","message":"Authentication failed!"}}
+  HTTP 401 3.004458s
+  journal since 2026-10-15 22:10:15:
+    pveproxy| anas-proxy: refused GET /api/nodes/anas-pve/v1/pools from ::ffff:192.168.200.1: authentication failed
+    anas| {"level":40,"time":1792102215177,"pid":2534,"hostname":"anas-pve","reqId":"req-b","msg":"[authz] forbidden: anas-gm@pve POST /api/nodes/anas-pve/v1/pools/gtbackup/scrub lacks Sys.Modify on /"}
+  (re-enabled)
+
+### row 9 — direct to the gateway's loopback port, with a valid cookie; with a forged X-Anas-Auth
+  {"error":{"code":"UNAUTHORIZED","message":"This request did not come through pveproxy"}}
+  HTTP 401
+  {"error":{"code":"UNAUTHORIZED","message":"This request did not come through pveproxy"}}
+  HTTP 401
+  > through :8006 with a client-supplied X-Anas-Auth (anas-none): AnasProxy strips it
+> anas-none GET /pools with a forged X-Anas-Auth claiming root@pam
+  {"error":{"code":"FORBIDDEN","message":"Permission check failed (/, Sys.Audit): anas-none@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations."}}
+  HTTP 403
+  journal since 2026-10-15 22:10:19:
+    anas| {"level":40,"time":1792102219832,"pid":2534,"hostname":"anas-pve","reqId":"req-d","msg":"[authz] refused GET /api/nodes/anas-pve/v1/pools: no proxy assertion"}
+    anas| {"level":40,"time":1792102219842,"pid":2534,"hostname":"anas-pve","reqId":"req-e","msg":"[authz] refused GET /api/nodes/anas-pve/v1/pools: bad proxy assertion MAC (forged, tampered, or signed for another method or path)"}
+    anas| {"level":40,"time":1792102219860,"pid":2534,"hostname":"anas-pve","reqId":"req-f","msg":"[authz] forbidden: anas-none@pve GET /api/nodes/anas-pve/v1/pools lacks Sys.Audit on /"}
+
+### row 10 / row 21 — pvedaemon's :85 serves the hook too: GET http://127.0.0.1:85/anas/installed (and an authenticated path)
+  {"error":{"code":"NOT_FOUND","message":"ANAS is served through pveproxy on :8006 only"}}
+  HTTP 404
+  {"error":{"code":"NOT_FOUND","message":"ANAS is served through pveproxy on :8006 only"}}
+  HTTP 404
+    listener:
+  LISTEN 0      4096       127.0.0.1:85         0.0.0.0:*    users:(("pvedaemon worke",pid=1382,fd=6),("pvedaemon worke",pid=1381,fd=6),("pvedaemon worke",pid=1380,fd=6),("pvedaemon",pid=1379,fd=6))
+    pvedaemon| anas-proxy: refused GET /installed from 127.0.0.1: served outside pveproxy (trusted_env)
+    pvedaemon| anas-proxy: refused GET /api/nodes/anas-pve/v1/pools from 127.0.0.1: served outside pveproxy (trusted_env)
+  journal since 2026-10-15 22:10:20:
+
+### row 11 — /anas/installed without a cookie
+  {"name":"anas","version":"0.4.3"}
+  HTTP 200
+  journal since 2026-10-15 22:10:20:
+
+### row 13 — access.log names the user on /anas lines
+  ::ffff:192.168.200.1 - - [15/10/2026:22:07:45 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - - [15/10/2026:22:07:46 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - - [15/10/2026:22:07:46 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - - [15/10/2026:22:07:46 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - - [15/10/2026:22:07:46 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - - [15/10/2026:22:07:46 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - - [15/10/2026:22:07:46 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - - [15/10/2026:22:07:46 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - - [15/10/2026:22:07:46 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - root@pam [15/10/2026:22:10:06 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - root@pam [15/10/2026:22:10:06 +0000] "POST /anas/api/nodes/anas-pve/v1/pools/gtbackup/scrub HTTP/1.1" 202 160
+  ::ffff:192.168.200.1 - root@pam [15/10/2026:22:10:09 +0000] "POST /anas/api/nodes/anas-pve/v1/pools/gtbackup/scrub HTTP/1.1" 401 84
+  ::ffff:192.168.200.1 - root@pam [15/10/2026:22:10:13 +0000] "POST /anas/api/nodes/anas-pve/v1/pools/gtbackup/scrub HTTP/1.1" 401 84
+  ::ffff:192.168.200.1 - anas-audit@pve [15/10/2026:22:10:13 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - anas-audit@pve [15/10/2026:22:10:13 +0000] "POST /anas/api/nodes/anas-pve/v1/pools/gtbackup/scrub HTTP/1.1" 403 186
+  ::ffff:192.168.200.1 - anas-none@pve [15/10/2026:22:10:13 +0000] "GET /anas/api/nodes/anas-pve/v1/health HTTP/1.1" 403 184
+  ::ffff:192.168.200.1 - anas-np@pve [15/10/2026:22:10:14 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - anas-np@pve [15/10/2026:22:10:14 +0000] "POST /anas/api/nodes/anas-pve/v1/pools/gtbackup/scrub HTTP/1.1" 202 163
+  ::ffff:192.168.200.1 - anas-node@pve [15/10/2026:22:10:14 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 403 184
+  ::ffff:192.168.200.1 - anas-gm@pve [15/10/2026:22:10:15 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - anas-gm@pve [15/10/2026:22:10:15 +0000] "POST /anas/api/nodes/anas-pve/v1/pools/gtbackup/scrub HTTP/1.1" 403 183
+  ::ffff:192.168.200.1 - anas-off@pve [15/10/2026:22:10:15 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 200 532
+  ::ffff:192.168.200.1 - - [15/10/2026:22:10:19 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 401 68
+  ::ffff:192.168.200.1 - anas-none@pve [15/10/2026:22:10:19 +0000] "GET /anas/api/nodes/anas-pve/v1/pools HTTP/1.1" 403 184
+  ::ffff:192.168.200.1 - - [15/10/2026:22:10:20 +0000] "GET /anas/installed HTTP/1.1" 200 33
+
+### row 15 — ADOCK's /adock on the same node (no cookie; root cookie)
+  /adock/ no cookie: HTTP 401
+{"name":"adock","version":"0.1.0"}
+  HTTP 200
+  active
+  active
+  0

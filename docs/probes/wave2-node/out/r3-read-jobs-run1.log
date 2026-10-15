@@ -1,0 +1,73 @@
+
+### preview — fast (w2ok → rclonegt@127.0.0.1)
+HTTP 202 0.048739
+{"job":{"id":"b6892926-37a0-4e8d-9204-8ed65a0f422c","status":"running","operation":"read.cloud.preview","createdAt":"2026-10-15T22:19:20.071Z","createdBy":"root@pam"}}
+  [t+0s] running |  |  | 
+  [t+0s] completed | 0 checked, 4 to transfer (20971520 bytes), 0 to delete | {"transfers": 4, "bytes": 20971520, "checks": 0, "deletes": 0, "deletedFiles": [], "deletedTotal": 0, "errors": [], "truncated": false} | 
+
+### preview — slow: against 192.0.2.10
+HTTP 202 0.029467
+{"job":{"id":"e6e0a3af-9351-4dc0-859c-bfff5dafdcfb","status":"running","operation":"read.cloud.preview","createdAt":"2026-10-15T22:19:20.797Z","createdBy":"root@pam"}}
+> at t+15s:
+  job read.cloud.preview running | progress: None
+  ps:   44648   44648      15 /usr/bin/timeout 600 /usr/bin/rclone copy /gtbackup/w2src w2bh:w2dst --config /etc/anas/rclone.conf --ask-password=false --use-json-log -v --stats 5s --stats-log-level NOTICE -
+  ps:   44649   44648      15 /usr/bin/rclone copy /gtbackup/w2src w2bh:w2dst --config /etc/anas/rclone.conf --ask-password=false --use-json-log -v --stats 5s --stats-log-level NOTICE --dry-run
+> Cancel (POST /jobs/e6e0a3af-9351-4dc0-859c-bfff5dafdcfb/cancel, no x-anas-confirm)
+  HTTP 202 0.016148
+  {"job":{"id":"3baba3eb-86bf-481b-b4fd-750a8788bdf4","status":"running","operation":"job.cancel","createdAt":"2026-10-15T22:19:36.278Z","createdBy":"root@pam"}}
+  [t+0s] cancelled |  | {"status": "cancelled", "reason": "cancelled by root@pam at 2026-10-15T22:19:36.278Z", "cancelledBy": "root@pam", "cancelledAt": "2026-10-15T22:19:36.278Z"} | 
+> process group 44648 after the cancel: 0 processes
+> any child left: 0
+  lasted 17s
+
+### remote test — fast (w2ok)
+HTTP 202 0.012583
+{"job":{"id":"fed1139e-abd5-49a8-9807-e57f53ad50cd","status":"running","operation":"read.cloud.remote.test","createdAt":"2026-10-15T22:19:37.892Z","createdBy":"root@pam"}}
+  [t+0s] running |  |  | 
+  [t+1s] completed |  | {"verdict": "ok", "message": ""} | 
+
+### remote test — slow: against 192.0.2.10
+HTTP 202 0.017611
+{"job":{"id":"6024d769-698c-4424-bbc4-9134399d0b7d","status":"running","operation":"read.cloud.remote.test","createdAt":"2026-10-15T22:19:38.602Z","createdBy":"root@pam"}}
+> at t+15s:
+  job read.cloud.remote.test completed | progress: None
+  ps: 
+> Cancel (POST /jobs/6024d769-698c-4424-bbc4-9134399d0b7d/cancel, no x-anas-confirm)
+  HTTP 409 0.019288
+  {"error":{"code":"CONFLICT","message":"Job '6024d769-698c-4424-bbc4-9134399d0b7d' (read.cloud.remote.test) is not running — it already ended completed"}}
+  [t+0s] completed |  | {"verdict": "unreachable", "message": "Failed to create file system for \"w2bh:\": NewFs: couldn't connect SSH: dial tcp 192.0.2.10:22: i/o timeout"} | 
+> process group  after the cancel: 2 processes
+     1059 /sbin/agetty -o -- \u --noreset --noclear - linux
+     1060 /sbin/agetty -o -- \u --noreset --noclear --keep-baud 115200,57600,38400,9600 - vt220
+> any child left: 0
+  lasted 17s
+
+### catalog listing — fast (pbsgt on the PBS VM, read-only)
+{"data":{"verdict":"ok","repository":"pbsgt","groups":[{"group":"host/gtguard","backupType":"host","backupId":"gtguard","files":[{"filename":"index.json.blob","kind":"other"},{"filename":"catalog.pcat1.didx","kind":"other"},{"filename":"guarded.pxar.didx","kind":"pxar","archive":"guarded.pxar"}],"backupCount":6,"lastBackup":1792068523,"lastBackupIso":"2026-10-15T12:48:43Z","owner":"root@pam!anas"}
+first group: host/gtguard
+{"data":{"verdict":"ok","repository":"pbsgt","groups":[],"group":"host/gtguard","snapshots":[{"snapshot":"host/gtguard/2026-10-15T12:48:43Z","backupType":"host","backupId":"gtguard","backupTime":1792068523,"backupTimeIso":"2026-10-15T12:48:43Z","files":[{"filename":"guarded.pxar.didx","kind":"pxar","archive":"guarded.pxar","size":241,"cryptMode":"none"},{"filename":"catalog.pcat1.didx","kind":"other","size":57,"cryptMode":"none"},{"filename":"index.json.blob","kind":"other","size":368,"cryptMode
+Traceback (most recent call last):
+  File "<string>", line 6, in <module>
+    a=a.replace(".didx","").replace(".mpxar",".pxar")
+      ^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'replace'
+snapshot:   archive: 
+HTTP 400 0.012656
+{"error":{"code":"VALIDATION_ERROR","message":"Invalid browse request: Too small: expected string to have >=1 characters"}}
+  [t+0s] None |  |  | {"code": "NOT_FOUND", "message": "Job '' not found"}
+
+### catalog listing — slow: against 192.0.2.10
+HTTP 202 0.016870
+{"job":{"id":"2c4db1dd-b153-438c-8d4e-6303004a5f18","status":"running","operation":"read.backup.catalog","createdAt":"2026-10-15T22:19:56.253Z","createdBy":"root@pam"}}
+> at t+15s:
+  job read.backup.catalog completed | progress: None
+  ps: 
+> Cancel (POST /jobs/2c4db1dd-b153-438c-8d4e-6303004a5f18/cancel, no x-anas-confirm)
+  HTTP 409 0.014437
+  {"error":{"code":"CONFLICT","message":"Job '2c4db1dd-b153-438c-8d4e-6303004a5f18' (read.backup.catalog) is not running — it already ended completed"}}
+  [t+0s] completed |  | {"verdict": "unreachable", "repository": "w2bh", "snapshot": "host/w2b1/2026-10-15T00:00:00Z", "archive": "w2data.pxar", "archiveKind": "pxar", "path": "/", "entries": [], "warnings": [], "detail": "Could not reach the Proxmox Backup Server: error connecting to https://192.0.2.10:8007/ - tcp connect error: deadline has elapsed"} | 
+> process group  after the cancel: 2 processes
+     1059 /sbin/agetty -o -- \u --noreset --noclear - linux
+     1060 /sbin/agetty -o -- \u --noreset --noclear --keep-baud 115200,57600,38400,9600 - vt220
+> any child left: 0
+  lasted 17s

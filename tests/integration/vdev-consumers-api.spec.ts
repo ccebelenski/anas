@@ -18,9 +18,12 @@ import { sshExec } from './fixtures/stunt-node'
  *   (b) the Expand / Replace dialog lists the special leaf as a replaceable
  *       member — the one failure that loses the whole pool, previously
  *       unreachable from the UI.
- *   (c) DELETE /v1/pools/gtvdev?cleanup=true → every one of the six partitions
- *       is labelcleared (a destroy used to leave the log, special and dedup
- *       members carrying live ZFS labels) and the disk reads available again.
+ *   (c) DELETE /v1/pools/gtvdev?cleanup=true → the data, log, special and
+ *       dedup partitions are labelcleared (a destroy used to leave the log,
+ *       special and dedup members carrying live ZFS labels); the cache and spare
+ *       partitions are named in the confirm as kept and keep their labels — a
+ *       cache or spare label names no pool, so it is not this pool's to wipe
+ *       (nf.2 D5, docs/LIVE-PROOF-0.4.4-wave3.md) — and the disk leaves the pool.
  *
  * The file OWNS its fixture (`test/stunt-node/vdev-fixture.sh`): down then up in
  * beforeAll, down in afterAll. Test (c) destroys the pool through the API, so
@@ -220,14 +223,23 @@ test.describe.serial('vdevs.1 slice 2 — the vdev-class consumers, live', () =>
   })
 
   // -----------------------------------------------------------------------
-  // (c) destroy with cleanup clears the labels of EVERY class's partition
+  // (c) destroy with cleanup clears the labels of the pool's own leaves
   // -----------------------------------------------------------------------
-  test('destroy with cleanup labelclears all six partitions and frees the disk', async ({ playwright }) => {
+  test('destroy with cleanup labelclears the data, log, special and dedup partitions and keeps the cache and spare', async ({ playwright }) => {
     const ctx = await apiContext(playwright)
     try {
-      const parts: string[] = []
+      // The fixture builds the pool from KERNEL partition names, so the
+      // confirm and the job name the leaves that way (sdb1 …).
+      const kernel: Record<number, string> = {}
       for (let n = 1; n <= 6; n++)
-        parts.push(`/dev/disk/by-id/${BY_ID}-part${n}`)
+        kernel[n] = await partitionKernelName(n)
+      const part = (n: number): string => kernel[n]!
+      const byId = (n: number): string => `${BY_ID}-part${n}`
+      // nf.2 D5: one set is listed, bound and wiped — the ONLINE data, log,
+      // special and dedup leaves; a cache or spare label names no pool, so
+      // those two are named as kept and left as they are.
+      const wiped = [1, 2, 5, 6]
+      const kept = [3, 4]
 
       // The confirm-code flow: 409 with the code, then the same request
       // carrying it. `cleanup=true` is the disk-hygiene opt-in.
@@ -235,7 +247,16 @@ test.describe.serial('vdevs.1 slice 2 — the vdev-class consumers, live', () =>
       expect(challenge.status()).toBe(409)
       const code = challenge.headers()['x-anas-confirm-code']
       expect(code).toBeTruthy()
-      expect((await challenge.json()).error.code).toBe('CONFIRMATION_REQUIRED')
+      const refusal = (await challenge.json()).error as { code: string, warnings: string[] }
+      expect(refusal.code).toBe('CONFIRMATION_REQUIRED')
+      const warnings = refusal.warnings.join('\n')
+      const toWipe = refusal.warnings.find(w => w.startsWith('Disks to wipe:')) ?? ''
+      for (const n of wiped)
+        expect(toWipe, `the confirm lists ${part(n)} to wipe`).toContain(part(n))
+      for (const n of kept) {
+        expect(toWipe, `the confirm does not list ${part(n)} to wipe`).not.toContain(part(n))
+        expect(warnings, `the confirm names ${part(n)} as kept`).toContain(`${part(n)} is not wiped`)
+      }
 
       const confirmed = await ctx.delete(`${V1}/pools/${POOL}?cleanup=true`, {
         headers: { 'x-anas-confirm': code },
@@ -243,27 +264,35 @@ test.describe.serial('vdevs.1 slice 2 — the vdev-class consumers, live', () =>
       expect(confirmed.status()).toBe(202)
       const job = await awaitJob(ctx, (await confirmed.json()).job.id, 120_000)
       expect(job.status, JSON.stringify(job.error ?? '')).toBe('completed')
-
-      // The node's own verdict, per partition: no ZFS label left anywhere.
-      // GROUND TRUTH (ZFS 2.4.4): `zpool labelclear` has no read-only `-c`
-      // ("invalid option 'c'"), so the non-destructive check is `wipefs` with
-      // no `-a` — it lists a labelled partition's four `zfs_member` signatures
-      // and says nothing about a clean one. The cleanup also zaps the GPT when
-      // the disk is exclusively the pool's, so a partition may be gone
-      // entirely; either way it carries no label.
-      for (const part of parts) {
-        const sigs = await sshExec(`if [ -e ${part} ]; then wipefs -n ${part} 2>&1 || true; else echo GONE; fi`)
-        expect(sigs, `${part} carries no ZFS label`).not.toMatch(/zfs_member/)
+      const result = job.result as {
+        wiped: string[]
+        skipped: { leaf: string, reason: string }[]
+        preserved?: { disk: string, reason: string }[]
       }
-      // …and neither does the whole disk.
-      const wholeDisk = await sshExec(`wipefs -n /dev/disk/by-id/${BY_ID} 2>&1 || true`)
-      expect(wholeDisk, `${BY_ID} is blank`).not.toMatch(/zfs_member/)
+      expect(result.wiped).toHaveLength(wiped.length)
+      expect(result.wiped).toEqual(expect.arrayContaining(wiped.map(part)))
+      expect(result.skipped.map(s => s.leaf).sort()).toEqual(kept.map(part).sort())
+      // The disk still carries the kept leaves, so its partition table is not zapped.
+      expect(result.preserved?.map(p => p.reason)).toEqual(['shared'])
 
-      // And the inventory agrees the whole disk is free again.
-      await expect.poll(async () => (await fixtureDisk(ctx)).status, { timeout: 30_000 })
-        .toBe('available')
+      // The node's own verdict, per partition. GROUND TRUTH (ZFS 2.4.4):
+      // `zpool labelclear` has no read-only `-c` ("invalid option 'c'"), so the
+      // non-destructive check is `wipefs` with no `-a` — it lists a labelled
+      // partition's four `zfs_member` signatures and says nothing about a
+      // clean one. A disk with a kept leaf is not the pool's alone, so its GPT
+      // is not zapped and the wiped partitions are still there, blank.
+      const sigs = (n: number): Promise<string> =>
+        sshExec(`if [ -e /dev/disk/by-id/${byId(n)} ]; then wipefs -n /dev/disk/by-id/${byId(n)} 2>&1 || true; else echo GONE; fi`)
+      for (const n of wiped)
+        expect(await sigs(n), `${byId(n)} carries no ZFS label`).not.toMatch(/zfs_member/)
+      for (const n of kept)
+        expect(await sigs(n), `${byId(n)} keeps its ZFS label`).toMatch(/zfs_member/)
+
+      // And the inventory: the disk is no longer the pool's, and with two
+      // labelled partitions left on it it is not offered as available either.
+      await expect.poll(async () => (await fixtureDisk(ctx)).poolName, { timeout: 30_000 }).toBeNull()
       const freed = await fixtureDisk(ctx)
-      expect(freed.poolName).toBeNull()
+      expect(freed.status).toBe('other')
       expect(freed.vdevRole).toBeNull()
     }
     finally {

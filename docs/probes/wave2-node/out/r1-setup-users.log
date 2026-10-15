@@ -1,0 +1,43 @@
++ pveum user add anas-audit@pve --password anas-w2-pw
++ pveum acl modify / --users anas-audit@pve --roles PVEAuditor
++ pveum user add anas-admin@pve --password anas-w2-pw
++ pveum acl modify / --users anas-admin@pve --roles Administrator
++ pveum user add anas-none@pve --password anas-w2-pw
++ pveum user add anas-np@pve --password anas-w2-pw
++ pveum acl modify / --users anas-np@pve --roles Administrator --propagate 0
++ pveum user add anas-node@pve --password anas-w2-pw
++ pveum acl modify /nodes/anas-pve --users anas-node@pve --roles Administrator
++ pveum group add anas-g
++ pveum user add anas-gm@pve --password anas-w2-pw --groups anas-g
++ pveum acl modify / --groups anas-g --roles PVEAuditor
++ pveum user add anas-off@pve --password anas-w2-pw
++ pveum acl modify / --users anas-off@pve --roles Administrator
++ set +x
+anas-admin@pve 1 
+anas-audit@pve 1 
+anas-gm@pve 1 
+anas-node@pve 1 
+anas-none@pve 1 
+anas-np@pve 1 
+anas-off@pve 1 
+root@pam 1 
+{'path': '/', 'propagate': 1, 'roleid': 'Administrator', 'type': 'user', 'ugid': 'anas-off@pve'}
+{'path': '/', 'propagate': 1, 'roleid': 'PVEAuditor', 'type': 'user', 'ugid': 'anas-audit@pve'}
+{'path': '/', 'propagate': 1, 'roleid': 'Administrator', 'type': 'user', 'ugid': 'anas-admin@pve'}
+{'path': '/', 'propagate': 0, 'roleid': 'Administrator', 'type': 'user', 'ugid': 'anas-np@pve'}
+{'path': '/', 'propagate': 1, 'roleid': 'PVEAuditor', 'type': 'group', 'ugid': 'anas-g'}
+{'path': '/nodes/anas-pve', 'propagate': 1, 'roleid': 'Administrator', 'type': 'user', 'ugid': 'anas-node@pve'}
+root@pam / -> {"/":{"Datastore.Allocate":1,"Datastore.AllocateSpace":1,"Datastore.AllocateTemplate":1,"Datastore.Audit":1,"Group.Allocate":1,"Mapping.Audit":1,"Mapping.Modify":1,"Mapping.Use":1,"Permissions.Modify":1,"Pool.Allocate":1,"Pool.Audit":1,"Realm.Allocate":1,"Realm.AllocateUser":1,"SDN.Allocate":1,"SDN.Audit":1,"SDN.Use":1,"Sys.AccessNetwork":1,"Sys.Audit":1,"Sys.Console":1,"Sys.Incoming":1,"Sys.Modify":1,"Sys.PowerMgmt":1,"Sys.Syslog":1,"User.Modify":1,"VM.Allocate":1,"VM.Audit":1,"VM.Backup":1,"VM.Clone":1,"VM.Config.CDROM":1,"VM.Config.CPU":1,"VM.Config.Cloudinit":1,"VM.Config.Disk":1,"VM.Config.HWType":1,"VM.Config.Memory":1,"VM.Config.Network":1,"VM.Config.Options":1,"VM.Console":1,"VM.GuestAgent.Audit":1,"VM.GuestAgent.FileRead":1,"VM.GuestAgent.FileSystemMgmt":1,"VM.GuestAgent.FileWrite":1,"VM.GuestAgent.Unrestricted":1,"VM.Migrate":1,"VM.PowerMgmt":1,"VM.Replicate":1,"VM.Snapshot":1,"VM.Snapshot.Rollback":1}}
+anas-audit@pve / -> {"/":{"Datastore.Audit":1,"Mapping.Audit":1,"Pool.Audit":1,"SDN.Audit":1,"Sys.Audit":1,"VM.Audit":1,"VM.GuestAgent.Audit":1}}
+anas-admin@pve / -> {"/":{"Datastore.Allocate":1,"Datastore.AllocateSpace":1,"Datastore.AllocateTemplate":1,"Datastore.Audit":1,"Group.Allocate":1,"Mapping.Audit":1,"Mapping.Modify":1,"Mapping.Use":1,"Permissions.Modify":1,"Pool.Allocate":1,"Pool.Audit":1,"Realm.Allocate":1,"Realm.AllocateUser":1,"SDN.Allocate":1,"SDN.Audit":1,"SDN.Use":1,"Sys.AccessNetwork":1,"Sys.Audit":1,"Sys.Console":1,"Sys.Incoming":1,"Sys.Modify":1,"Sys.PowerMgmt":1,"Sys.Syslog":1,"User.Modify":1,"VM.Allocate":1,"VM.Audit":1,"VM.Backup":1,"VM.Clone":1,"VM.Config.CDROM":1,"VM.Config.CPU":1,"VM.Config.Cloudinit":1,"VM.Config.Disk":1,"VM.Config.HWType":1,"VM.Config.Memory":1,"VM.Config.Network":1,"VM.Config.Options":1,"VM.Console":1,"VM.GuestAgent.Audit":1,"VM.GuestAgent.FileRead":1,"VM.GuestAgent.FileSystemMgmt":1,"VM.GuestAgent.FileWrite":1,"VM.GuestAgent.Unrestricted":1,"VM.Migrate":1,"VM.PowerMgmt":1,"VM.Replicate":1,"VM.Snapshot":1,"VM.Snapshot.Rollback":1}}
+anas-none@pve / -> {"/":{}}
+anas-np@pve / -> {"/":{"Datastore.Allocate":0,"Datastore.AllocateSpace":0,"Datastore.AllocateTemplate":0,"Datastore.Audit":0,"Group.Allocate":0,"Mapping.Audit":0,"Mapping.Modify":0,"Mapping.Use":0,"Permissions.Modify":0,"Pool.Allocate":0,"Pool.Audit":0,"Realm.Allocate":0,"Realm.AllocateUser":0,"SDN.Allocate":0,"SDN.Audit":0,"SDN.Use":0,"Sys.AccessNetwork":0,"Sys.Audit":0,"Sys.Console":0,"Sys.Incoming":0,"Sys.Modify":0,"Sys.PowerMgmt":0,"Sys.Syslog":0,"User.Modify":0,"VM.Allocate":0,"VM.Audit":0,"VM.Backup":0,"VM.Clone":0,"VM.Config.CDROM":0,"VM.Config.CPU":0,"VM.Config.Cloudinit":0,"VM.Config.Disk":0,"VM.Config.HWType":0,"VM.Config.Memory":0,"VM.Config.Network":0,"VM.Config.Options":0,"VM.Console":0,"VM.GuestAgent.Audit":0,"VM.GuestAgent.FileRead":0,"VM.GuestAgent.FileSystemMgmt":0,"VM.GuestAgent.FileWrite":0,"VM.GuestAgent.Unrestricted":0,"VM.Migrate":0,"VM.PowerMgmt":0,"VM.Replicate":0,"VM.Snapshot":0,"VM.Snapshot.Rollback":0}}
+anas-node@pve / -> {"/":{}}
+anas-gm@pve / -> {"/":{"Datastore.Audit":1,"Mapping.Audit":1,"Pool.Audit":1,"SDN.Audit":1,"Sys.Audit":1,"VM.Audit":1,"VM.GuestAgent.Audit":1}}
+anas-off@pve / -> {"/":{"Datastore.Allocate":1,"Datastore.AllocateSpace":1,"Datastore.AllocateTemplate":1,"Datastore.Audit":1,"Group.Allocate":1,"Mapping.Audit":1,"Mapping.Modify":1,"Mapping.Use":1,"Permissions.Modify":1,"Pool.Allocate":1,"Pool.Audit":1,"Realm.Allocate":1,"Realm.AllocateUser":1,"SDN.Allocate":1,"SDN.Audit":1,"SDN.Use":1,"Sys.AccessNetwork":1,"Sys.Audit":1,"Sys.Console":1,"Sys.Incoming":1,"Sys.Modify":1,"Sys.PowerMgmt":1,"Sys.Syslog":1,"User.Modify":1,"VM.Allocate":1,"VM.Audit":1,"VM.Backup":1,"VM.Clone":1,"VM.Config.CDROM":1,"VM.Config.CPU":1,"VM.Config.Cloudinit":1,"VM.Config.Disk":1,"VM.Config.HWType":1,"VM.Config.Memory":1,"VM.Config.Network":1,"VM.Config.Options":1,"VM.Console":1,"VM.GuestAgent.Audit":1,"VM.GuestAgent.FileRead":1,"VM.GuestAgent.FileSystemMgmt":1,"VM.GuestAgent.FileWrite":1,"VM.GuestAgent.Unrestricted":1,"VM.Migrate":1,"VM.PowerMgmt":1,"VM.Replicate":1,"VM.Snapshot":1,"VM.Snapshot.Rollback":1}}
+anas-node@pve (all paths) -> {"/nodes/anas-pve":{"Datastore.Allocate":1,"Datastore.AllocateSpace":1,"Datastore.AllocateTemplate":1,"Datastore.Audit":1,"Group.Allocate":1,"Mapping.Audit":1,"Mapping.Modify":1,"Mapping.Use":1,"Permissions.Modify":1,"Pool.Allocate":1,"Pool.Audit":1,"Realm.Allocate":1,"Realm.AllocateUser":1,"SDN.Allocate":1,"SDN.Audit":1,"SDN.Use":1,"Sys.AccessNetwork":1,"Sys.Audit":1,"Sys.Console":1,"Sys.Incoming":1,"Sys.Modify":1,"Sys.PowerMgmt":1,"Sys.Syslog":1,"User.Modify":1,"VM.Allocate":1,"VM.Audit":1,"VM.Backup":1,"VM.Clone":1,"VM.Config.CDROM":1,"VM.Config.CPU":1,"VM.Config.Cloudinit":1,"VM.Config.Disk":1,"VM.Config.HWType":1,"VM.Config.Memory":1,"VM.Config.Network":1,"VM.Config.Options":1,"VM.Console":1,"VM.GuestAgent.Audit":1,"VM.GuestAgent.FileRead":1,"VM.GuestAgent.FileSystemMgmt":1,"VM.GuestAgent.FileWrite":1,"VM.GuestAgent.Unrestricted":1,"VM.Migrate":1,"VM.PowerMgmt":1,"VM.Replicate":1,"VM.Snapshot":1,"VM.Snapshot.Rollback":1}}
+--- .members
+{
+"nodename": "anas-pve",
+"version": 0
+}

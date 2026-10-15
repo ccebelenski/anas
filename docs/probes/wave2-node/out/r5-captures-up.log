@@ -1,0 +1,21 @@
++ mkdir -p /var/tmp/w2
++ truncate -s 1G /var/tmp/w2/w2id.img
++ zpool create -O mountpoint=/w2id w2id /var/tmp/w2/w2id.img
++ zfs create w2id/fs
++ install -o 51099 -g 51099 /dev/null /w2id/fs/owned-51099
++ zfs create w2id/unm
++ install -o 51098 -g 51098 /dev/null /w2id/unm/owned-51098
++ zfs unmount w2id/unm
++ echo w2passphrase
++ zfs create -o encryption=on -o keyformat=passphrase -o keylocation=prompt w2id/enc
++ install -o 51097 -g 51097 /dev/null /w2id/enc/owned-51097
++ zfs unmount w2id/enc
++ zfs unload-key w2id/enc
++ zfs create -V 64M w2id/vol
++ set +x
+NAME      TYPE        MOUNTED  KEYSTATUS    CANMOUNT
+w2id      filesystem  yes      -            on
+w2id/enc  filesystem  no       unavailable  on
+w2id/fs   filesystem  yes      -            on
+w2id/unm  filesystem  no       -            on
+w2id/vol  volume      -        -            -

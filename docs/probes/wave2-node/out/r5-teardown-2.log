@@ -1,0 +1,4 @@
+  w2u8: [t+1s] completed | Deleting share user 'w2u8' | {"deleted": "w2u8", "smbEntryRemoved": false, "groupRemoved": null} | 
+  w2u7: [t+0s] completed | Deleting group 'w2u7' | {"deleted": "w2u7"} | 
+debian:x:1000:1000:Debian:/home/debian:/bin/bash
+debian:x:1000:

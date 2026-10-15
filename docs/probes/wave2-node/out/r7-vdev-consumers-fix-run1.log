@@ -1,0 +1,13 @@
+(node:804363) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:804904) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/vdev-consumers-api.spec.ts:125:3 › vdevs.1 slice 2 — the vdev-class consumers, live › a faulted log leaf moves the disk row and raises the pool warning (1.6s)
+  ✓  2 [integration] › tests/integration/vdev-consumers-api.spec.ts:190:5 › vdevs.1 slice 2 — the vdev-class consumers, live › UI › the replace surface lists the special leaf as a replaceable member (3.7s)
+[w2 observe] scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9 after the destroy: {"id":"scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9","name":"sdb","path":"/dev/sdb","size":4294967296,"model":"QEMU HARDDISK","modelFamily":null,"serial":"ANAS_HOT9","vendor":"QEMU","revision":"2.5+","formFactor":null,"transport":null,"rotational":true,"physicalSectorSize":512,"logicalSectorSize":512,"wwn":null,"smartHealthy":null,"status":"other","poolName":null,"ahrArray":null,"vdevName":null,"vdevRole":null,"zfsErrors":null,"healthStatus":"unknown","partitions":[{"name":"sdb1","size":419430400,"fstype":null,"mountpoint":null},{"name":"sdb2","size":209715200,"fstype":null,"mountpoint":null},{"name":"sdb3","size":209715200,"fstype":"zfs_member","mountpoint":null},{"name":"sdb4","size":419430400,"fstype":"zfs_member","mountpoint":null},{"name":"sdb5","size":314572800,"fstype":null,"mountpoint":null},{"name":"sdb6","size":2721037824,"fstype":null,"mountpoint":null}],"smartMeasuredAt":"2026-10-15T22:27:22.098Z"}
+  ✓  3 [integration] › tests/integration/vdev-consumers-api.spec.ts:228:3 › vdevs.1 slice 2 — the vdev-class consumers, live › destroy with cleanup labelclears the data, log, special and dedup partitions and keeps the cache and spare (3.6s)
+
+  3 passed (16.7s)

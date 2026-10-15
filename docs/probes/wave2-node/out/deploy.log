@@ -1,0 +1,79 @@
+=== ANAS Stunt Node — Deploy ANAS ===
+
+Checking workspace links...
+  ✓ daemon -> ../../packages/daemon
+  ✓ gateway -> ../../packages/gateway
+  ✓ shared -> ../../packages/shared
+✓ Workspace links ok
+
+Building ANAS on host...
+
+> anas@0.4.3 build
+> npm run build:shared && npm run build:daemon && npm run build:gateway
+
+
+> anas@0.4.3 build:shared
+> cd packages/shared && tsc
+
+
+> anas@0.4.3 build:daemon
+> cd packages/daemon && tsc
+
+
+> anas@0.4.3 build:gateway
+> cd packages/gateway && tsc
+
+✓ Build complete
+
+Syncing to VM...
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ Files synced
+
+Installing systemd units...
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+  ✓ anasd.service + anas.service installed from packaging/systemd/
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+  ✓ iSCSI ordering drop-in installed
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ Systemd units installed
+
+Starting services...
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+
+Verifying...
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+  ✓ anasd active, 0 restarts, /v1/health answers version 0.4.3
+  ✓ anas active, /installed answers the same version
+
+Checking daemon dependencies...
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+  ✓ acl (setfacl) present
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+  ✓ mdadm present
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+  ✓ btrfs-progs (mkfs.btrfs) present
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+  ✓ anas-md-event hook installed (/usr/local/bin/anas-md-event)
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+  ✓ anas-cache-event hook + udev rule installed (/usr/local/bin/anas-cache-event, /etc/udev/rules.d/99-anas-cache.rules)
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+  ✓ smbd (samba) present
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+  ✓ exportfs (nfs-kernel-server) present
+
+Installing PVE UI integration...
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+anas: installed /usr/share/pve-manager/js/anas.js (generated from src/)
+anas: bundle cache-bust token v=08d64cd10f2c
+anas: re-stamped script line in /usr/share/pve-manager/index.html.tpl (?v=08d64cd10f2c)
+anas: installed /usr/share/anas/perl/AnasProxy.pm
+anas: proxy hook already present; AnasProxy.pm changed, pveproxy reloaded so its workers load it
+anas: installed apt hook /etc/apt/apt.conf.d/80anas-pve-integration
+anas: PVE UI integration installed.
+✓ PVE UI integration installed
+
+=== Deploy complete ===
+ANAS available at https://192.168.200.50:3000

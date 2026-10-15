@@ -1,0 +1,206 @@
+zfs zfs-2.4.4-pve1, kernel 7.0.14-23-pve
+
+==================== (e) zfs destroy -r of the parent filesystem, child@s held
+before:
+  | w2z
+  | w2z/p
+  | w2z/p@s
+  | w2z/p/a
+  | w2z/p/a@s
+  | w2z/p/a/g
+  | w2z/p/a/g@s
+  | w2z/p/c
+  | w2z/p/c@s
+  | w2z/p/c/g
+  | w2z/p/c/g@s
+  | w2z/p/z
+  | w2z/p/z@s
+$ zfs destroy -r w2z/p
+exit code: 1
+stdout:
+stderr:
+  | cannot destroy snapshot w2z/p/c@s: it's being held. Run 'zfs holds -r w2z/p/c@s' to see holders.
+  | cannot unmount '/w2z/p': pool or dataset is busy
+zfs list -t all -r -o name w2z  (after):
+  | w2z
+  | w2z/p
+  | w2z/p/c
+  | w2z/p/c@s
+
+==================== (e') the same, dry-run first: zfs destroy -rnv w2z/p (held)
+$ zfs destroy -rnv w2z/p
+exit code: 0
+stdout:
+  | would destroy w2z/p/a/g@s
+  | would destroy w2z/p/a/g
+  | would destroy w2z/p/a@s
+  | would destroy w2z/p/a
+  | would destroy w2z/p/c/g@s
+  | would destroy w2z/p/c/g
+  | would destroy w2z/p/c@s
+  | would destroy w2z/p/c
+  | would destroy w2z/p/z@s
+  | would destroy w2z/p/z
+  | would destroy w2z/p@s
+  | would destroy w2z/p
+stderr:
+zfs list -t all -r -o name w2z  (after):
+  | w2z
+  | w2z/p
+  | w2z/p@s
+  | w2z/p/a
+  | w2z/p/a@s
+  | w2z/p/a/g
+  | w2z/p/a/g@s
+  | w2z/p/c
+  | w2z/p/c@s
+  | w2z/p/c/g
+  | w2z/p/c/g@s
+  | w2z/p/z
+  | w2z/p/z@s
+
+==================== (c1) zfs destroy -r w2z/p@s, child@s held
+$ zfs destroy -r w2z/p@s
+exit code: 1
+stdout:
+stderr:
+  | cannot destroy snapshot w2z/p/c@s: it's being held. Run 'zfs holds -r w2z/p/c@s' to see holders.
+zfs list -t all -r -o name w2z  (after):
+  | w2z
+  | w2z/p
+  | w2z/p@s
+  | w2z/p/a
+  | w2z/p/a@s
+  | w2z/p/a/g
+  | w2z/p/a/g@s
+  | w2z/p/c
+  | w2z/p/c@s
+  | w2z/p/c/g
+  | w2z/p/c/g@s
+  | w2z/p/z
+  | w2z/p/z@s
+
+==================== (c2) zfs rename -r w2z/p@s w2z/p@t, child@s held
+$ zfs rename -r w2z/p@s w2z/p@t
+exit code: 0
+stdout:
+stderr:
+zfs list -t all -r -o name w2z  (after):
+  | w2z
+  | w2z/p
+  | w2z/p@t
+  | w2z/p/a
+  | w2z/p/a@t
+  | w2z/p/a/g
+  | w2z/p/a/g@t
+  | w2z/p/c
+  | w2z/p/c@t
+  | w2z/p/c/g
+  | w2z/p/c/g@t
+  | w2z/p/z
+  | w2z/p/z@t
+$ zfs holds -H -r w2z/p@t
+exit code: 0
+stdout:
+  | w2z/p/c@t	keep	Thu Oct 15 22:26 2026
+stderr:
+
+==================== (c3) zfs rename -r w2z/p@s w2z/p@t while zfs send w2z/p/c@s runs (no hold)
+send running: 50551 zfs send w2z/p/c@s
+$ zfs holds -H w2z/p/c@s
+exit code: 0
+stdout:
+stderr:
+$ zfs rename -r w2z/p@s w2z/p@t
+exit code: 0
+stdout:
+stderr:
+zfs list -t all -r -o name w2z  (after):
+  | w2z
+  | w2z/p
+  | w2z/p@t
+  | w2z/p/a
+  | w2z/p/a@t
+  | w2z/p/a/g
+  | w2z/p/a/g@t
+  | w2z/p/c
+  | w2z/p/c@t
+  | w2z/p/c/g
+  | w2z/p/c/g@t
+  | w2z/p/z
+  | w2z/p/z@t
+Terminated
+
+==================== (c4) zfs destroy -r w2z/p@s while zfs send w2z/p/c@s runs (no hold)
+send running: 50797 zfs send w2z/p/c@s
+$ zfs destroy -r w2z/p@s
+exit code: 1
+stdout:
+stderr:
+  | cannot destroy snapshot w2z/p/c@s: dataset is busy
+zfs list -t all -r -o name w2z  (after):
+  | w2z
+  | w2z/p
+  | w2z/p@s
+  | w2z/p/a
+  | w2z/p/a@s
+  | w2z/p/a/g
+  | w2z/p/a/g@s
+  | w2z/p/c
+  | w2z/p/c@s
+  | w2z/p/c/g
+  | w2z/p/c/g@s
+  | w2z/p/z
+  | w2z/p/z@s
+Terminated
+
+==================== (c5) zfs destroy (single, not -r) w2z/p/c@s while the send runs
+send running: 51024 zfs send w2z/p/c@s
+$ zfs destroy w2z/p/c@s
+exit code: 1
+stdout:
+stderr:
+  | cannot destroy snapshot w2z/p/c@s: dataset is busy
+zfs list -t all -r -o name w2z  (after):
+  | w2z
+  | w2z/p
+  | w2z/p@s
+  | w2z/p/a
+  | w2z/p/a@s
+  | w2z/p/a/g
+  | w2z/p/a/g@s
+  | w2z/p/c
+  | w2z/p/c@s
+  | w2z/p/c/g
+  | w2z/p/c/g@s
+  | w2z/p/z
+  | w2z/p/z@s
+Terminated
+
+==================== holds
+$ zfs holds -H w2z/p/c@s
+exit code: 0
+stdout:
+  | w2z/p/c@s	keep	Thu Oct 15 22:26 2026
+stderr:
+$ zfs holds -H w2z/p@s
+exit code: 0
+stdout:
+stderr:
+$ zfs holds -H w2z/p@nope
+exit code: 1
+stdout:
+stderr:
+  | cannot open 'w2z/p@nope': dataset does not exist
+  | no datasets available
+$ zfs holds -H -r w2z/p@s
+exit code: 0
+stdout:
+  | w2z/p/c@s	keep	Thu Oct 15 22:26 2026
+stderr:
+
+==================== teardown
+gtbackup
+gtiscsi
+w2id
+w2id.img

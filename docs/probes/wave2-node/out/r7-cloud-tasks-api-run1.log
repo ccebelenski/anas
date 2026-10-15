@@ -1,0 +1,18 @@
+(node:868518) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 9 tests using 1 worker
+
+(node:868596) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/cloud-tasks-api.spec.ts:308:3 › Cloud sync tasks (rclone.2) › create a copy task: both units carry the marker, the timer is enabled and nextRunAt is its next elapse (1.6s)
+  ✓  2 [integration] › tests/integration/cloud-tasks-api.spec.ts:355:3 › Cloud sync tasks (rclone.2) › Run Now: the files land byte-identical, rclone's counters come back, and the run read a transient snapshot that is gone afterwards (14.0s)
+  ✓  3 [integration] › tests/integration/cloud-tasks-api.spec.ts:414:3 › Cloud sync tasks (rclone.2) › sync mirrors a source deletion to the destination; copy never deletes (40.5s)
+  ✓  4 [integration] › tests/integration/cloud-tasks-api.spec.ts:462:3 › Cloud sync tasks (rclone.2) › a dry-run preview lists the would-be deletes on the live source — and refuses an unmounted mount (1.5s)
+  ✓  5 [integration] › tests/integration/cloud-tasks-api.spec.ts:522:3 › Cloud sync tasks (rclone.2) › an empty source is refused in sync mode with the sentence, and is a harmless no-op in copy mode (27.0s)
+  ✓  6 [integration] › tests/integration/cloud-tasks-api.spec.ts:563:3 › Cloud sync tasks (rclone.2) › a source on a configured-but-unmounted mount is refused, naming the mount (14.4s)
+  ✓  7 [integration] › tests/integration/cloud-tasks-api.spec.ts:594:3 › Cloud sync tasks (rclone.2) › a wrong-password remote fails the run with rclone's error line, notifies, and shows as a cloud warning — a quiet success does not notify (57.8s)
+  ✓  8 [integration] › tests/integration/cloud-tasks-api.spec.ts:685:3 › Cloud sync tasks (rclone.2) › a real timer fire produces the same history as a Run Now (1.5m)
+  ✓  9 [integration] › tests/integration/cloud-tasks-api.spec.ts:739:3 › Cloud sync tasks (rclone.2) › disable leaves the history note; delete removes the units and touches nothing at the destination; a referenced remote refuses to go (7.2s)
+
+  9 passed (4.7m)

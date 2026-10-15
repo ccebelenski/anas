@@ -1,0 +1,17 @@
+(node:833474) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+(node:833541) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+[t+0.9s] realm field: "Proxmox VE authentication server"
+[t+1.1s] subscription nag shown; dismissed
+[t+1.2s] logged in; user shown: ["anas-none@pve"]
+[t+1.5s] GET /anas/api/nodes/anas-pve/v1/health -> HTTP 403 {"error":{"code":"FORBIDDEN","message":"Permission check failed (/, Sys.Audit): anas-none@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations."}}
+[t+1.5s] opened ANAS → Dashboard
+[t+1.5s] panel text: "You need Sys.Audit on / to view ANAS on this node ANAS asks Proxmox the question Proxmox asks for its own disk and ZFS views: reading needs the Sys.Audit privilege on "/", changing needs Sys.Modify. Ask an administrator for a role that carries it (PVEAuditor to view, Administrator to change) on node "anas-pve". Permission check failed (/, Sys.Audit): anas-none@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations."
+[t+1.5s] health responses: 403
+  ✓  1 [w2probe] › docs/probes/wave2-node/w2-privilege-panel.spec.ts:47:1 › anas-none@pve sees the Sys.Audit privilege panel, not "not installed" (1.6s)
+
+  1 passed (2.5s)

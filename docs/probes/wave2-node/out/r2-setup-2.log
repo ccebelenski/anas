@@ -1,0 +1,55 @@
+
+### dataset gtbackup/w2src
+HTTP 202 0.067738
+{"job":{"id":"63b27462-77df-4dbe-a8ca-9bcd792599ee","status":"running","operation":"zfs.create","createdAt":"2026-10-15T22:17:16.282Z","createdBy":"root@pam"}}
+[t+0s] completed |  | {"created": "gtbackup/w2src"} | 
+gtbackup/w2src
+3.0K	/gtbackup/w2src
+
+### nft blackhole for 192.0.2.10
+table inet w2bh {
+	chain out {
+		type filter hook output priority filter; policy accept;
+		ip daddr 192.0.2.10 drop
+	}
+}
+
+### cloud fixture
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+ERROR: a fixture capture is already held (/etc/anas/rclone.conf.pre-fixture) and /etc/anas/rclone.conf now exists on the node — this 'up' would clear it and 'down' would restore the OLD capture over it. Run '/home/ccebelenski/projects/anas/.claude/worktrees/agent-acd7d1b88f6e61c61/test/stunt-node/cloud-fixture.sh down' first.
+
+### cloud remotes w2ok, w2bh
+HTTP 409 0.203629
+{"error":{"code":"CONFLICT","message":"remote 'w2ok' already exists"}}
+HTTP 409 0.187197
+{"error":{"code":"CONFLICT","message":"remote 'w2bh' already exists"}}
+
+### backup repo w2bh
+HTTP 409 0.023608
+{"error":{"code":"CONFLICT","message":"Repository 'w2bh' already exists"}}
+
+### backup task w2b1
+HTTP 409 0.026438
+{"error":{"code":"CONFLICT","message":"Backup task 'w2b1' already exists"}}
+
+### backup task w2b2
+HTTP 409 0.029922
+{"error":{"code":"CONFLICT","message":"Backup task 'w2b2' already exists"}}
+
+### backup task w2b3
+HTTP 409 0.030610
+{"error":{"code":"CONFLICT","message":"Backup task 'w2b3' already exists"}}
+
+### snapshot schedule w2snap
+HTTP 202 0.047967
+{"job":{"id":"16309c79-38af-4177-9ab3-cf7ac9de556e","status":"running","operation":"schedule.create","createdAt":"2026-10-15T22:17:19.896Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"created": "w2snap"} | 
+anas-backup-w2b1.service
+anas-backup-w2b1.timer
+anas-backup-w2b2.service
+anas-backup-w2b2.timer
+anas-backup-w2b3.service
+anas-backup-w2b3.timer
+anas-snap-w2snap.service
+anas-snap-w2snap.timer

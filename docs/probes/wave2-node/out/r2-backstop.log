@@ -1,0 +1,69 @@
+
+### A — POST /v1/pools/gtbackup/scrub over the socket
+> privileges: Sys.Audit
+  {"error":{"code":"FORBIDDEN","message":"Permission check failed (/, Sys.Modify): w2probe@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations."}}
+  HTTP 403
+> privileges: Sys.Audit,Sys.Modify
+  {"job":{"id":"a9d8d867-90b3-40df-a49f-52b1fece8c04","status":"running","operation":"zpool.scrub","createdAt":"2026-10-15T22:18:26.910Z","createdBy":"w2probe@pve"}}
+  HTTP 202
+> no x-anas-privileges header
+  {"error":{"code":"UNAUTHORIZED","message":"Missing or invalid identity headers (x-anas-user, x-anas-user-uid, x-anas-request-id, x-anas-privileges)"}}
+  HTTP 401
+> privileges: Sys.Modify (only)
+  {"job":{"id":"f6ede437-6adb-48fb-a74e-f4b61d7ec3a3","status":"running","operation":"zpool.scrub","createdAt":"2026-10-15T22:18:27.345Z","createdBy":"w2probe@pve"}}
+  HTTP 202
+    anasd| {"level":40,"time":1792102706711,"pid":2532,"hostname":"anas-pve","audit":true,"event":"job.refused","user":"w2probe@pve","uid":0,"operation":"zpool.scrub","params":{"pool":"gtbackup","action":"start"},"requestId":"3e226f4c-2702-457e-b6de-7f14f4a7d9a9","privilege":"Sys.Modify","reason":"holds Sys.Audit on /","msg":"audit: w2probe@pve refused zpool.scrub: lacks Sys.Modify on / (holds Sys.Audit on /
+    anasd| {"level":40,"time":1792102707109,"pid":2532,"hostname":"anas-pve","reqId":"req-4aq","msg":"[authz] refused POST /v1/pools/gtbackup/scrub: invalid identity headers (x-anas-privileges: Invalid input: expected string, received undefined)"}
+
+### B — a read.* job (cloud preview, w2ok → rclonegt@127.0.0.1) with Sys.Audit only
+  {"job":{"id":"4154b06d-8423-4db5-931b-1499b48f6d0d","status":"running","operation":"read.cloud.preview","createdAt":"2026-10-15T22:18:27.896Z","createdBy":"w2probe@pve"}}
+  HTTP 202
+  job: {"job":{"id":"4154b06d-8423-4db5-931b-1499b48f6d0d","status":"completed","operation":"read.cloud.preview","progress":"0 checked, 4 to transfer (20971520 bytes), 0 to delete","createdAt":"2026-10-15T22:18:27.896Z","createdBy":"w2probe@pve","startedAt":"2026-10-15T22:18:27.897Z","completedAt":"2026-10-15T22:18:28.325Z","result":{"transfers":4,"bytes":20971520,"checks":0,"deletes":0,"deletedFiles":[],"deletedTotal":0,"errors":[],"truncated":false},"error":null,"detail":null}}
+> the same preview over the socket, slow remote (w2bh, blackholed), then its cancel with Sys.Audit only
+  {"job":{"id":"4d11d617-dba5-4c15-a9e4-35779c2a1623","status":"running","operation":"read.cloud.preview","createdAt":"2026-10-15T22:18:32.240Z","createdBy":"w2probe@pve"}}
+  HTTP 202
+  ps: 44059 /usr/bin/timeout 600 /usr/bin/rclone copy /gtbackup/w2src w2bh:w2dst --config /etc/anas/rclone.conf --ask-password=false --use-json-log -v --stats 5s --stats-log-level NOTICE --dry-run
+  ps: 44060 /usr/bin/rclone copy /gtbackup/w2src w2bh:w2dst --config /etc/anas/rclone.conf --ask-password=false --use-json-log -v --stats 5s --stats-log-level NOTICE --dry-run
+  ps: 44079 bash -c sleep 3; pgrep -af "rclone " | cut -c1-200
+  {"job":{"id":"80f3cbee-95fb-4b58-8585-0e578d7d6a6c","status":"running","operation":"job.cancel","createdAt":"2026-10-15T22:18:35.575Z","createdBy":"w2probe@pve"}}
+  HTTP 202
+  {"job":{"id":"4d11d617-dba5-4c15-a9e4-35779c2a1623","status":"cancelled","operation":"read.cloud.preview","progress":null,"createdAt":"2026-10-15T22:18:32.240Z","createdBy":"w2probe@pve","startedAt":"2026-10-15T22:18:32.240Z","completedAt":"2026-10-15T22:18:35.581Z","result":{"status":"cancelled","reason":"cancelled by w2probe@pve at 2026-10-15T22:18:35.575Z","cancelledBy":"w2probe@pve","cancelledAt":"2026-10-15T22:18:35.575Z"},"error":null,"detail":null}}
+  
+  44107 bash -c sleep 3; curl -s --unix-socket /run/anas/anasd.sock -H 'x-anas-privileges: Sys.Audit' http://localhost/v1/jobs/4d11d617-dba5-4c15-a9e4-35779c2a1623 | cut -c1-500; echo; pgrep -af 'rclone ' || echo '(no rclone process)'
+> a NON-read job's cancel with Sys.Audit only (a running scrub's job id)
+  {"error":{"code":"CONFLICT","message":"Job 'd9a20464-133d-4f04-948b-58cefa259e88' (zpool.scrub) is not running — it already ended completed"}}
+  HTTP 409
+> through /anas as anas-audit@pve (PVEAuditor): the same preview POST
+  {"error":{"code":"FORBIDDEN","message":"Permission check failed (/, Sys.Modify): anas-audit@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations."}}
+    HTTP 403
+    anasd| {"level":40,"time":1792102707109,"pid":2532,"hostname":"anas-pve","reqId":"req-4aq","msg":"[authz] refused POST /v1/pools/gtbackup/scrub: invalid identity headers (x-anas-privileges: Invalid input: expected string, received undefined)"}
+    anas| {"level":40,"time":1792102719290,"pid":28450,"hostname":"anas-pve","reqId":"req-1f1","msg":"[authz] forbidden: anas-audit@pve POST /api/nodes/anas-pve/v1/cloud/tasks/preview lacks Sys.Modify on /"}
+
+### C — the snapshot schedule w2snap: fire its unit (what the timer does)
+[Unit]
+OnCalendar=hourly
+ExecStart=/usr/bin/node /opt/anas/packages/daemon/dist/snapshot-task.js --id w2snap
+exit 0
+Result=success
+ExecMainStatus=0
+Starting anas-snap-w2snap.service - ANAS snapshot schedule w2 node pass...
+{"schedule":"w2snap","result":{"schedule":"w2snap","taken":"anas-hourly-2026-10-15T221840Z","pruned":[],"prunedCount":0,"skippedHeld":[],"heldCount":0}}
+anas-snap-w2snap.service: Deactivated successfully.
+Finished anas-snap-w2snap.service - ANAS snapshot schedule w2 node pass.
+anas-snap-w2snap.service: Consumed 670ms CPU time, 89.3M memory peak.
+gtbackup/w2src@anas-hourly-2026-10-15T221803Z
+gtbackup/w2src@anas-hourly-2026-10-15T221840Z
+  job: schedule.create completed root@pam 2026-10-15T22:17:19.896Z 
+  job: schedule.run completed root@pam 2026-10-15T22:18:03.915Z 
+  job: schedule.run completed root@pam 2026-10-15T22:18:40.265Z 
+
+### D — the udev cache-event script's identity
+> its exact headers (x-anas-user: system:udev-cache-event, Sys.Audit,Sys.Modify) on POST /v1/pools/gtbackup/scrub
+  {"job":{"id":"eb379c43-0c1b-4fe4-b5a0-f55eca8eed65","status":"running","operation":"zpool.scrub","createdAt":"2026-10-15T22:18:50.889Z","createdBy":"system:udev-cache-event"}}
+  HTTP 202
+> /usr/local/bin/anas-cache-event w2nopool-cache0 sdz (the installed script), and the same request it sends, with its answer shown
+  script exit 0
+  EVENT=CacheDeviceRemoved POOL=w2nopool SLICE=w2nopool-cache0 KERNEL=sdz
+  EVENT=CacheEventDelivered POOL=w2nopool SLICE=w2nopool-cache0
+  {"error":{"code":"NOT_FOUND","message":"AHR pool 'w2nopool' not found"}}
+  HTTP 404

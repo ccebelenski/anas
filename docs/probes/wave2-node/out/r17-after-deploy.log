@@ -1,0 +1,37 @@
+now 2026-10-15T22:08:15Z (1792102095)
+MainPID=1412
+ExecMainStartTimestamp=Thu 2026-10-15 22:06:32 UTC
+ActiveEnterTimestamp=Thu 2026-10-15 22:06:32 UTC
+--- workers (pid, start time)
+1413 Thu Oct 15 22:06:31 2026
+1414 Thu Oct 15 22:06:31 2026
+1415 Thu Oct 15 22:06:31 2026
+2842 Thu Oct 15 22:08:11 2026
+2843 Thu Oct 15 22:08:11 2026
+2844 Thu Oct 15 22:08:11 2026
+--- installed module
+-rw-r--r-- 1 root root 25493 2026-10-15T22:08:12 /usr/share/anas/perl/AnasProxy.pm
+c6beac85a012f590
+--- hook in AnyEvent.pm
+2
+--- proxy.key
+-rw-r----- 1 root www-data 32 2026-10-15T22:08:08 /run/anas/proxy.key
+--- pveproxy journal (last 15 min, reload/restart/anas lines)
+2026-10-15T22:06:31+00:00 anas-pve systemd[1]: Starting pveproxy.service - PVE API Proxy Server...
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: starting server
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: starting 3 worker(s)
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: worker 1413 started
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: worker 1414 started
+2026-10-15T22:06:32+00:00 anas-pve pveproxy[1412]: worker 1415 started
+2026-10-15T22:06:32+00:00 anas-pve systemd[1]: Started pveproxy.service - PVE API Proxy Server.
+2026-10-15T22:08:12+00:00 anas-pve systemd[1]: Reloading pveproxy.service - PVE API Proxy Server...
+2026-10-15T22:08:12+00:00 anas-pve pveproxy[2837]: send HUP to 1412
+2026-10-15T22:08:12+00:00 anas-pve pveproxy[1412]: received signal HUP
+2026-10-15T22:08:12+00:00 anas-pve pveproxy[1412]: server closing
+2026-10-15T22:08:12+00:00 anas-pve pveproxy[1412]: server shutdown (restart)
+2026-10-15T22:08:12+00:00 anas-pve systemd[1]: Reloaded pveproxy.service - PVE API Proxy Server.
+2026-10-15T22:08:12+00:00 anas-pve pveproxy[1412]: restarting server
+2026-10-15T22:08:12+00:00 anas-pve pveproxy[1412]: starting 3 worker(s)
+2026-10-15T22:08:12+00:00 anas-pve pveproxy[1412]: worker 2842 started
+2026-10-15T22:08:12+00:00 anas-pve pveproxy[1412]: worker 2843 started
+2026-10-15T22:08:12+00:00 anas-pve pveproxy[1412]: worker 2844 started

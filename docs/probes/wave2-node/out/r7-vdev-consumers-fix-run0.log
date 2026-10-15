@@ -1,0 +1,33 @@
+(node:795568) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:795641) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/vdev-consumers-api.spec.ts:125:3 › vdevs.1 slice 2 — the vdev-class consumers, live › a faulted log leaf moves the disk row and raises the pool warning (1.7s)
+  ✓  2 [integration] › tests/integration/vdev-consumers-api.spec.ts:190:5 › vdevs.1 slice 2 — the vdev-class consumers, live › UI › the replace surface lists the special leaf as a replaceable member (3.7s)
+  ✘  3 [integration] › tests/integration/vdev-consumers-api.spec.ts:228:3 › vdevs.1 slice 2 — the vdev-class consumers, live › destroy with cleanup labelclears the data, log, special and dedup partitions and keeps the cache and spare (140ms)
+
+
+  1) [integration] › tests/integration/vdev-consumers-api.spec.ts:228:3 › vdevs.1 slice 2 — the vdev-class consumers, live › destroy with cleanup labelclears the data, log, special and dedup partitions and keeps the cache and spare 
+
+    Error: the confirm lists scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part1 to wipe
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoContain[2m([22m[32mexpected[39m[2m) // indexOf[22m
+
+    Expected substring: [32m"scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part1"[39m
+    Received string:    [31m"Disks to wipe: sdb1, sdb2, sdb5, sdb6."[39m
+
+      247 |       const toWipe = refusal.warnings.find(w => w.startsWith('Disks to wipe:')) ?? ''
+      248 |       for (const n of wiped)
+    > 249 |         expect(toWipe, `the confirm lists ${part(n)} to wipe`).toContain(part(n))
+          |                                                                ^
+      250 |       for (const n of kept) {
+      251 |         expect(toWipe, `the confirm does not list ${part(n)} to wipe`).not.toContain(part(n))
+      252 |         expect(warnings, `the confirm names ${part(n)} as kept`).toContain(`${part(n)} is not wiped`)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-acd7d1b88f6e61c61/tests/integration/vdev-consumers-api.spec.ts:249:64
+
+  1 failed
+    [integration] › tests/integration/vdev-consumers-api.spec.ts:228:3 › vdevs.1 slice 2 — the vdev-class consumers, live › destroy with cleanup labelclears the data, log, special and dedup partitions and keeps the cache and spare 
+  2 passed (13.3s)
