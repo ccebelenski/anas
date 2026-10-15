@@ -1,7 +1,7 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import {
   datasetExists,
@@ -11,7 +11,6 @@ import {
   skipIfFixtureMissing,
   sshExec,
 } from './fixtures/stunt-node'
-import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -102,17 +101,6 @@ let stanzaBeforeRecycle = ''
 
 /** Absolute path of the fixture script, relative to this spec file. */
 const FIXTURE_SH = new URL('../../test/stunt-node/smbsvc-fixture.sh', import.meta.url).pathname
-
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -260,17 +248,11 @@ test.describe('Recycle bin on SMB shares (smbsvc.2)', () => {
     // through their own API doors, the /var/tmp staging files are swept, and
     // the fixture teardown destroys the dataset WITH the #recycle directory.
     // All best-effort: an afterAll failure must not mask the run's results.
-    // The ticket is fetched here (afterAll sees no test-scoped fixtures) with
-    // the same PVE login the auth fixture uses. The recycle timer pair STAYS
+    // apiContext (cr.25b) brings its own login — afterAll sees no
+    // test-scoped fixtures. The recycle timer pair STAYS
     // installed and enabled — it is the product's install path (install.sh),
     // the runner is a no-op without marked shares, and the proof asserted it.
-    const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-    const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-    })
-    const ticket = (await ticketRes.json()).data.ticket as string
-    await login.dispose()
-    const ctx = await authedContext(playwright, ticket)
+    const ctx = await apiContext(playwright)
     try {
       for (const user of [SHARE_USER]) {
         try {
@@ -301,8 +283,8 @@ test.describe('Recycle bin on SMB shares (smbsvc.2)', () => {
     }
   })
 
-  test('1 — enable through the API: detail shows the purge age; the stanza carries the composed VFS line, the four recycle keys, and the marker', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('1 — enable through the API: detail shows the purge age; the stanza carries the composed VFS line, the four recycle keys, and the marker', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // A share user with an SMB password (the same door the Shares UI uses),
       // so smbclient can authenticate — and write (test 2).
@@ -391,8 +373,8 @@ test.describe('Recycle bin on SMB shares (smbsvc.2)', () => {
     expect(await fileExists(`${BIN_PATH}/docs/a.txt`)).toBe(true)
   })
 
-  test('3 — purge through the unit: young files are kept; with the age at 7 a file whose ctime is 8 days old is removed, its emptied dir pruned, a young file beside it kept, the bin kept — the node clock never moves', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('3 — purge through the unit: young files are kept; with the age at 7 a file whose ctime is 8 days old is removed, its emptied dir pruned, a young file beside it kept, the bin kept — the node clock never moves', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
 
     // The timer pair as installed: the timer is enabled (list-timers shows it),
     // the unit's ExecStart names the runner, and the runner exists on the node.
@@ -474,8 +456,8 @@ test.describe('Recycle bin on SMB shares (smbsvc.2)', () => {
     expect(Math.abs(nodeNow - Date.now() / 1000)).toBeLessThan(300)
   })
 
-  test('4 — never and off: purgeDays null writes the `never` marker and the runner skips the share; recycle null restores the stanza byte-identically and leaves #recycle on disk', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('4 — never and off: purgeDays null writes the `never` marker and the runner skips the share; recycle null restores the stanza byte-identically and leaves #recycle on disk', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // A young file in the bin — the disable proof below wants data to leave
       // in place (a checkbox never deletes data).
@@ -512,8 +494,8 @@ test.describe('Recycle bin on SMB shares (smbsvc.2)', () => {
     }
   })
 
-  test('5 — refusal: a share with a custom vfs objects line cannot enable the recycle bin (400, share named)', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('5 — refusal: a share with a custom vfs objects line cannot enable the recycle bin (400, share named)', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // A share carrying a hand-written `vfs objects` line (injected straight
       // into smb.conf on the node, surgical, as a user would) is never merged:

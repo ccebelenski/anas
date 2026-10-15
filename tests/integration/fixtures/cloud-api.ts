@@ -1,6 +1,6 @@
 import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
-import { expect } from '@playwright/test'
-import { NODE_NAME, PVE_ROOT_PASSWORD, PVE_URL } from './target'
+import { apiContext } from './auth'
+import { NODE_NAME, PVE_URL } from './target'
 
 /**
  * PVE-authenticated API access for the cloud specs — the ticket dance and the
@@ -9,54 +9,17 @@ import { NODE_NAME, PVE_ROOT_PASSWORD, PVE_URL } from './target'
  * source-of-truth rule; the two older cloud specs still carry their own copy).
  *
  * Every request goes through the PVE origin's `/anas` forward carrying the
- * PVEAuthCookie — the same door the UI itself uses.
+ * PVEAuthCookie AND the CSRFPreventionToken from the same login — the same
+ * door the UI itself uses (cr.25b; the pairing lives in ./auth's apiContext).
  */
 
 export const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
-
-function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: {
-      cookies: [{
-        name: 'PVEAuthCookie',
-        value: ticket,
-        domain: new URL(PVE_URL).hostname,
-        path: '/',
-        expires: -1,
-        httpOnly: false,
-        secure: true,
-        sameSite: 'Lax' as const,
-      }],
-      origins: [],
-    },
-  })
-}
-
-async function pveTicket(playwright: PlaywrightWorkerArgs['playwright']): Promise<string | null> {
-  const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-  try {
-    const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-    })
-    const ok = ticketRes.ok()
-    return ok ? ((await ticketRes.json()).data.ticket as string) : null
-  }
-  finally {
-    await login.dispose()
-  }
-}
 
 /** Ticket + request context in one step — every test's setup door. */
 export async function apiCtx(
   playwright: PlaywrightWorkerArgs['playwright'],
 ): Promise<APIRequestContext> {
-  const ticket = await pveTicket(playwright)
-  expect(ticket, 'PVE ticket for API setup').toBeTruthy()
-  return authedContext(playwright, ticket as string)
+  return apiContext(playwright)
 }
 
 /** Poll a 202 job through GET /v1/jobs/:id until it reaches a terminal state. */

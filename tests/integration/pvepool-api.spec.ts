@@ -1,5 +1,5 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import type { APIRequestContext } from '@playwright/test'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL, STUNT_HOST } from './fixtures/pve-ui'
 import {
   datasetExists,
@@ -58,17 +58,6 @@ const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
 const PVE_POOL = 'pvfix'
 const SYS_POOL = 'sysfix'
 
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
-
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
   ctx: APIRequestContext,
@@ -118,8 +107,8 @@ test.beforeEach(async () => {
 test.describe('Per-dataset ownership stamps (list)', () => {
   test.setTimeout(60_000)
 
-  test('pvfix: storage root, guest volumes and dir-storage stamped; siblings clean', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('pvfix: storage root, guest volumes and dir-storage stamped; siblings clean', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.get(`${V1}/pools/${PVE_POOL}/datasets`)
       expect(res.status()).toBe(200)
@@ -166,8 +155,8 @@ test.describe('Per-dataset ownership stamps (list)', () => {
     }
   })
 
-  test('sysfix: boot tree system-owned; nested storage root and its guest stamped; sibling clean', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('sysfix: boot tree system-owned; nested storage root and its guest stamped; sibling clean', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.get(`${V1}/pools/${SYS_POOL}/datasets`)
       expect(res.status()).toBe(200)
@@ -224,8 +213,8 @@ test.describe('Dataset create on a PVE pool', () => {
     await destroyDataset(SIBLING_GUEST_FQ)
   })
 
-  test('a child of the storage root outside PVE\'s footprint is created and destroyed (3)', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a child of the storage root outside PVE\'s footprint is created and destroyed (3)', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const createRes = await ctx.post(`${V1}/pools/${PVE_POOL}/datasets`, {
         data: { path: PROOF_PATH },
@@ -251,8 +240,8 @@ test.describe('Dataset create on a PVE pool', () => {
     }
   })
 
-  test('naming guard: a guest-named direct child is refused; deeper in the tree it is allowed (4)', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('naming guard: a guest-named direct child is refused; deeper in the tree it is allowed (4)', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // Direct child of the storage path — PVE would inventory it as a guest
       // disk. 400 backstop, and the sentence names the STORAGE and the DATASET.
@@ -291,8 +280,8 @@ test.describe('Dataset create on a PVE pool', () => {
 test.describe('Owned-dataset mutations refused', () => {
   test.setTimeout(90_000)
 
-  test('destroy vm-100-disk-0 → 400 naming storage + dataset', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('destroy vm-100-disk-0 → 400 naming storage + dataset', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.delete(`${V1}/pools/${PVE_POOL}/datasets/vm-100-disk-0`)
       expect(res.status()).toBe(400)
@@ -306,8 +295,8 @@ test.describe('Owned-dataset mutations refused', () => {
     }
   })
 
-  test('property set on subvol-101-disk-0 → 400 naming storage + dataset', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('property set on subvol-101-disk-0 → 400 naming storage + dataset', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.put(`${V1}/pools/${PVE_POOL}/datasets/subvol-101-disk-0`, {
         data: { properties: { compression: 'lz4' } },
@@ -322,8 +311,8 @@ test.describe('Owned-dataset mutations refused', () => {
     }
   })
 
-  test('snapshot create on the storage root pvfix → 400 naming storage + dataset', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('snapshot create on the storage root pvfix → 400 naming storage + dataset', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.post(`${V1}/pools/${PVE_POOL}/datasets//snapshots`, {
         data: { name: 'anas-proof-snap' },
@@ -341,8 +330,8 @@ test.describe('Owned-dataset mutations refused', () => {
     }
   })
 
-  test('destroy sysfix/ROOT/pve-1 → 400 with the system reason', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('destroy sysfix/ROOT/pve-1 → 400 with the system reason', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.delete(`${V1}/pools/${SYS_POOL}/datasets/ROOT/pve-1`)
       expect(res.status()).toBe(400)
@@ -373,8 +362,8 @@ test.describe('Snapshot schedules', () => {
 
   test.setTimeout(90_000)
 
-  test('a schedule on the sibling is accepted (and deleted again); one on a guest volume is refused', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a schedule on the sibling is accepted (and deleted again); one on a guest volume is refused', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // Sibling target → accepted as a job.
       const ok = await ctx.post(`${V1}/schedules`, { data: SCHEDULE_BODY })
@@ -415,8 +404,8 @@ test.describe('System-pool hard refusals (sysfix)', () => {
 
   test.setTimeout(90_000)
 
-  test('change mount, export and destroy are hard-refused with the boot filesystem named', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('change mount, export and destroy are hard-refused with the boot filesystem named', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const expectedMessage = `Pool '${SYS_POOL}' holds this node's boot filesystem (${BOOT}) — ANAS never destroys, exports or remounts a system pool`
 
@@ -511,8 +500,8 @@ test.describe('iSCSI add-LUN on a PVE pool', () => {
     await sshExec(`zfs destroy ${ZVOL_FQ} 2>/dev/null || true`).catch(() => {})
   })
 
-  test('a zvol on the sibling is accepted; a PVE guest volume is refused with the guest sentence', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a zvol on the sibling is accepted; a PVE guest volume is refused with the guest sentence', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // Pre-clean a target a crashed earlier run may have leaked.
       await deleteProofTarget(ctx)
@@ -594,8 +583,8 @@ test.describe('iSCSI add-LUN on a PVE pool', () => {
 test.describe('Backup consistency derivation', () => {
   test.setTimeout(60_000)
 
-  test('preview-nested: sibling source gets a snapshot; guest subvol is live with the reason', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('preview-nested: sibling source gets a snapshot; guest subvol is live with the reason', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.post(`${V1}/backup/tasks/preview-nested`, {
         data: {

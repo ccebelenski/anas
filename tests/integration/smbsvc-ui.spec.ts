@@ -1,4 +1,4 @@
-import type { APIRequestContext, Locator, Page, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext, Locator, Page } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { expect, test } from '@playwright/test'
@@ -10,7 +10,6 @@ import {
   skipIfFixtureMissing,
   sshExec,
 } from './fixtures/stunt-node'
-import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -68,28 +67,6 @@ const FAIL_SENTENCE = 'testparm rejected the new configuration: '
 const FIXTURE_SH = new URL('../../test/stunt-node/smbsvc-fixture.sh', import.meta.url).pathname
 
 // ---- API helpers (request contexts carrying the PVE cookie) ----------------
-
-function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: {
-      cookies: [{
-        name: 'PVEAuthCookie',
-        value: ticket,
-        domain: new URL(PVE_URL).hostname,
-        path: '/',
-        expires: -1,
-        httpOnly: false,
-        secure: true,
-        sameSite: 'Lax' as const,
-      }],
-      origins: [],
-    },
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -229,14 +206,7 @@ test.describe('smbsvc.1 — Self-service on SMB shares (stunt node UI)', () => {
     await removeSmbShare(SHARE).catch(() => {})
     await removeShareUser(SHARE_USER).catch(() => {})
 
-    const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-    const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-    })
-    expect(ticketRes.ok()).toBeTruthy()
-    const ticket = (await ticketRes.json()).data.ticket as string
-    await login.dispose()
-    const ctx = await authedContext(playwright, ticket)
+    const ctx = await apiContext(playwright)
     try {
       await runJob(ctx, 'post', `${V1}/identity/users`, { name: SHARE_USER, smbPassword: SHARE_PW })
     }
@@ -250,13 +220,7 @@ test.describe('smbsvc.1 — Self-service on SMB shares (stunt node UI)', () => {
     // ssh safety net), the user through the identity API (with the same
     // net), finally the fixture down. All best-effort — an afterAll failure
     // must not mask the run's results.
-    const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-    const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-    })
-    const ticket = ticketRes.ok() ? ((await ticketRes.json()).data.ticket as string) : null
-    await login.dispose()
-    const ctx = ticket ? await authedContext(playwright, ticket) : null
+    const ctx = await apiContext(playwright).catch(() => null)
     try {
       if (ctx) {
         try {

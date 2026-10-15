@@ -1,5 +1,5 @@
-import type { APIRequestContext, APIResponse, PlaywrightWorkerArgs } from '@playwright/test'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import type { APIRequestContext, APIResponse } from '@playwright/test'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { datasetExists, poolExists, skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
@@ -53,10 +53,6 @@ interface JobRes {
     error?: { code?: string, message?: string } | null
     result?: Record<string, unknown> & { taken?: string, pruned?: string[], prunedCount?: number }
   }
-}
-
-function authed(playwright: PlaywrightWorkerArgs['playwright'], ticket: string): Promise<APIRequestContext> {
-  return playwright.request.newContext({ ignoreHTTPSErrors: true, storageState: pveAuthState(ticket) })
 }
 
 async function waitJob(ctx: APIRequestContext, id: string): Promise<JobRes['job']> {
@@ -143,9 +139,9 @@ test.describe('ident.1 — ZFS ownership stamps, stable-id confirms, wipe-by-ide
   test.setTimeout(180_000)
   let ctx: APIRequestContext
 
-  test.beforeAll(async ({ playwright, pveTicket }) => {
+  test.beforeAll(async ({ playwright }) => {
     skipIfFixtureMissing(!(await poolExists(POOL)), 'testpool not present — run setup-test-data.sh')
-    ctx = await authed(playwright, pveTicket)
+    ctx = await apiContext(playwright)
     for (const id of [SCHED_TAKE, SCHED_STD, SCHED_MIN])
       await deleteSchedule(ctx, id)
     for (const ds of [DS, PAIR, LEGACY_PARENT]) {

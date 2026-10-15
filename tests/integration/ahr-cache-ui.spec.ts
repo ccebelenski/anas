@@ -1,7 +1,7 @@
-import type { APIRequestContext, Locator, Page, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext, Locator, Page } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
@@ -85,17 +85,6 @@ interface PoolDetail {
 
 /** The pool's mountpoint on the node — the Remount test writes into it. */
 const MOUNT = `/mnt/anas-ahr/${POOL}`
-
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -239,8 +228,8 @@ test.describe('AHR read cache — the UI (ahrcache.1 slice 3)', () => {
     await execFileAsync(FIXTURE_SH, ['up']).catch(() => {})
   })
 
-  test('attach through the dialog → Cache block → detach through the confirm → disk back', async ({ page, playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('attach through the dialog → Cache block → detach through the confirm → disk back', async ({ page, playwright }) => {
+    const ctx = await apiContext(playwright)
     await buildPool(ctx)
     try {
       const grid = await openAhrGrid(page)
@@ -334,8 +323,8 @@ test.describe('AHR read cache — the UI (ahrcache.1 slice 3)', () => {
     }
   })
 
-  test('a refused attach (the disk became in-use under the dialog) shows the sentence', async ({ page, playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a refused attach (the disk became in-use under the dialog) shows the sentence', async ({ page, playwright }) => {
+    const ctx = await apiContext(playwright)
     await buildPool(ctx)
     try {
       const grid = await openAhrGrid(page)
@@ -394,10 +383,10 @@ test.describe('AHR read cache — the UI (ahrcache.1 slice 3)', () => {
    * The cache is attached through the API here: the UI attach is the first
    * test's business, and repeating it would only lengthen the staging.
    */
-  test('Remount is offered only when the pool is read-only, and restores writes', async ({ page, playwright, pveTicket }) => {
+  test('Remount is offered only when the pool is read-only, and restores writes', async ({ page, playwright }) => {
     const WRITE_LOG = '/tmp/anas-cache-ui-write.log'
     const WRITE_STOP = '/tmp/anas-cache-ui-write.stop'
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     await buildPool(ctx)
     try {
       // ---- A live, warm cache ---------------------------------------------

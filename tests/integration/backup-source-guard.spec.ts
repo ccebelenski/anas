@@ -1,11 +1,10 @@
-import type { APIRequestContext, Locator, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext, Locator } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
-import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -116,18 +115,6 @@ function pbsCredentials(): { secret: string, fingerprint: string } {
   expect(secret, 'PBS_TOKEN_SECRET is in test/pbs-node/config.local').not.toBe('')
   expect(fingerprint, 'PBS_FINGERPRINT is in test/pbs-node/config.local').not.toBe('')
   return { secret, fingerprint }
-}
-
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-    timeout: 120_000,
-  })
 }
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
@@ -273,17 +260,9 @@ test.describe('Backup source guard (backup2.11)', () => {
     await execFileAsync(FIXTURE_SH, ['down'], { timeout: 300_000 })
     await execFileAsync(FIXTURE_SH, ['up'], { timeout: 300_000 })
 
-    // A beforeAll hook may only use WORKER-scoped fixtures, so the session
-    // ticket is fetched here rather than taken from the test-scoped pveTicket.
-    const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-    const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-    })
-    expect(ticketRes.ok()).toBeTruthy()
-    const ticket = (await ticketRes.json()).data.ticket as string
-    await login.dispose()
-
-    const ctx = await authedContext(playwright, ticket)
+    // A beforeAll hook may only use WORKER-scoped fixtures; apiContext
+    // (cr.25b) brings its own login, so the hook needs nothing else.
+    const ctx = await apiContext(playwright)
     try {
       // Any task left from a crashed run — its units would collide on create.
       for (const name of TASKS) {
@@ -324,13 +303,7 @@ test.describe('Backup source guard (backup2.11)', () => {
     // Leave the node as found: this spec's task units go, the repository stays.
     // Best-effort — an afterAll failure must not mask the run's results.
     try {
-      const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-      const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-        form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-      })
-      const ticket = (await ticketRes.json()).data.ticket as string
-      await login.dispose()
-      const ctx = await authedContext(playwright, ticket)
+      const ctx = await apiContext(playwright)
       for (const name of TASKS) {
         const res = await ctx.get(`${V1}/backup/tasks/${name}`)
         if (res.status() === 200)
@@ -349,8 +322,8 @@ test.describe('Backup source guard (backup2.11)', () => {
     }
   })
 
-  test('preview-nested carries the unmounted fact for the tmpfs line, and nothing for a mounted source', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('preview-nested carries the unmounted fact for the tmpfs line, and nothing for a mounted source', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // The fixture's starting state, read from the node itself.
       expect(await sshExec(`grep -c ' ${GUARDOK} ' /etc/fstab || true`), 'the tmpfs fstab line is there').toBe('1')
@@ -402,8 +375,8 @@ test.describe('Backup source guard (backup2.11)', () => {
     await expect(row).not.toContainText('Not mounted')
   })
 
-  test('Run now on an archive under the unmounted tmpfs line FAILS with the sentence, notifies, and shows as a backup warning', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('Run now on an archive under the unmounted tmpfs line FAILS with the sentence, notifies, and shows as a backup warning', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // Saving is NOT blocked: the fact is time-dependent, so a task defined
       // while the mount is down is a legitimate thing to have.
@@ -469,8 +442,8 @@ test.describe('Backup source guard (backup2.11)', () => {
     }
   })
 
-  test('the CIFS line is refused the same way, naming the CIFS source', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('the CIFS line is refused the same way, naming the CIFS source', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // The incident's own shape: an empty mountpoint directory where a share
       // should be, on a host that can never answer (192.0.2.9 is TEST-NET).
@@ -488,8 +461,8 @@ test.describe('Backup source guard (backup2.11)', () => {
     }
   })
 
-  test('mounting it makes the SAME task run: the backup completes and PBS lists the snapshot', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('mounting it makes the SAME task run: the backup completes and PBS lists the snapshot', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // The recovery the failure's tooltip tells the operator to perform: mount
       // it and run it again. Nothing about the task changes.

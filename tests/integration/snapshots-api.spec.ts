@@ -1,5 +1,4 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { GATEWAY_URL, NODE_NAME } from './fixtures/pve-ui'
 import {
   getDatasetMountpoint,
@@ -53,17 +52,6 @@ const SNAPS = `${V1}/pools/${POOL}/datasets/${DS_PATH}/snapshots`
 const ALL_SNAP_NAMES = ['s1', 's1b', 's2']
 const ROLLBACK_MARKER = 'anas-rollback-marker'
 
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
-
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off). poolExists swallows SSH failures → skips when the node is off.
 test.beforeEach(async () => {
@@ -88,8 +76,8 @@ test.describe('Snapshot lifecycle: create → list → dup → rename → destro
       await sshExec(`zfs destroy testpool/share1@${name}`).catch(() => {})
   })
 
-  test('create → list (newest-first, typed fields) → duplicate 409 → rename → PLAIN destroy', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('create → list (newest-first, typed fields) → duplicate 409 → rename → PLAIN destroy', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // --- create 's1' (5.3) — 202 job, then the snapshot really appears.
       const createRes = await ctx.post(SNAPS, { data: { name: 's1' } })
@@ -177,8 +165,8 @@ test.describe('Snapshot rollback — confirmation-gated, verified against the re
     await sshExec(`rm -f /testpool/share1/${ROLLBACK_MARKER}`).catch(() => {})
   })
 
-  test('rollback demands x-anas-confirm (409 + code), then rolls back on resend', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('rollback demands x-anas-confirm (409 + code), then rolls back on resend', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const mountpoint = await getDatasetMountpoint(DS_FQ)
       expect(mountpoint.startsWith('/')).toBe(true)
@@ -241,11 +229,11 @@ test.describe('Snapshot nesting — a dataset lists only its OWN snapshots, not 
     await sshExec(`zfs destroy -r ${PARENT}`).catch(() => {})
   })
 
-  test('a recursive snapshot of the parent does not leak the child snapshot into the parent list', async ({ playwright, pveTicket }) => {
+  test('a recursive snapshot of the parent does not leak the child snapshot into the parent list', async ({ playwright }) => {
     // Recursive snapshot → both nesttest@n1 AND nesttest/child@n1 exist.
     await sshExec(`zfs snapshot -r ${PARENT}@n1`)
 
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       const parent = await ctx.get(PARENT_SNAPS)
       expect(parent.status()).toBe(200)

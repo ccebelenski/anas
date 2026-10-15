@@ -1,7 +1,7 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import {
   datasetExists,
@@ -11,7 +11,6 @@ import {
   skipIfFixtureMissing,
   sshExec,
 } from './fixtures/stunt-node'
-import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -115,17 +114,6 @@ const AHR_BY_ID = AHR_HOT_SERIALS.map(s => `scsi-0QEMU_QEMU_HARDDISK_${s}`)
 
 /** The plain-share stanza, captured on the node before the feature goes on. */
 let stanzaBeforeEnable = ''
-
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -245,15 +233,9 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
     // through the confirm flow — and finally the fixture is torn down
     // (smbsvc-fixture.sh down, which also sweeps a leaked [pvshare] stanza).
     // All best-effort: an afterAll failure must not mask the run's results.
-    // The ticket is fetched here (afterAll sees no test-scoped fixtures) with
-    // the same PVE login the auth fixture uses.
-    const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-    const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-    })
-    const ticket = (await ticketRes.json()).data.ticket as string
-    await login.dispose()
-    const ctx = await authedContext(playwright, ticket)
+    // apiContext (cr.25b) brings its own login — afterAll sees no
+    // test-scoped fixtures.
+    const ctx = await apiContext(playwright)
     try {
       for (const id of [HOURLY_SCHEDULE, DAILY_SCHEDULE]) {
         try {
@@ -291,8 +273,8 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
     }
   })
 
-  test('1 — enable through the API: bucket = finest ENABLED schedule (hourly); stanza carries the composed VFS line and the managed shadow keys', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('1 — enable through the API: bucket = finest ENABLED schedule (hourly); stanza carries the composed VFS line and the managed shadow keys', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // The schedule store decides the bucket — two ENABLED schedules on this
       // dataset, hourly and daily; the daemon must pick the finest (hourly).
@@ -378,8 +360,8 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
     expect(`${dailyErr.stdout ?? ''}\n${dailyErr.message}`).toContain('NT_STATUS_OBJECT_NAME_NOT_FOUND')
   })
 
-  test('3 — disable through the API: stanza loses vfs objects/shadow keys and is byte-identical to pre-enable', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('3 — disable through the API: stanza loses vfs objects/shadow keys and is byte-identical to pre-enable', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       await runJob(ctx, 'put', `${V1}/shares/smb/${SHARE}`, { previousVersions: { enabled: false } })
       const detail = await ctx.get(`${V1}/shares/smb/${SHARE}`)
@@ -397,8 +379,8 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
     }
   })
 
-  test('4 — refusals: plain-directory path and a custom vfs objects line are both refused 400 with their sentences', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('4 — refusals: plain-directory path and a custom vfs objects line are both refused 400 with their sentences', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // (a) A share on a plain directory under /var/tmp — nothing snapshot-
       // bearing underneath. The enable is refused with the design's sentence.
@@ -446,7 +428,7 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
     }
   })
 
-  test('5 — AHR half: real-disk pool, the @snapshots mount, smbclient through the snapshot, and destroy takes the mount with the pool', async ({ playwright, pveTicket }) => {
+  test('5 — AHR half: real-disk pool, the @snapshots mount, smbclient through the snapshot, and destroy takes the mount with the pool', async ({ playwright }) => {
     // A real-disk AHR pool (loop devices have no /dev/disk/by-id entry, and the
     // daemon addresses AHR create disks exclusively by by-id — shared DiskId):
     // `smbsvc-fixture.sh ahr-up` attaches the two hot disks the fixture owns
@@ -459,7 +441,7 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
     expect(await fileExists(`/dev/disk/by-id/${AHR_BY_ID[0]}`), `${AHR_BY_ID[0]} present`).toBe(true)
     expect(await fileExists(`/dev/disk/by-id/${AHR_BY_ID[1]}`), `${AHR_BY_ID[1]} present`).toBe(true)
 
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       // The two hot disks must be live inventory and 'available' — the create
       // route resolves every id against /v1/disks and refuses anything else.
@@ -602,8 +584,8 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
     }
   })
 
-  test('6 — Time Machine target (smbsvc.3, beta): enable with a 500 GiB cap — the fruit keys land and ANAS writes nothing besides', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('6 — Time Machine target (smbsvc.3, beta): enable with a 500 GiB cap — the fruit keys land and ANAS writes nothing besides', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // The share may already exist (test 1 made it plain; a grep'd solo run
       // starts without it) — either way it stands plain here.

@@ -1,7 +1,7 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { getMode, sshExec } from './fixtures/stunt-node'
 
@@ -59,21 +59,6 @@ const RCLONE_VERSION = '1.60.1'
 
 /** The absolute path of the fixture script, relative to this spec file. */
 const FIXTURE_SH = new URL('../../test/stunt-node/cloud-fixture.sh', import.meta.url).pathname
-
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  // The Test endpoint holds its request for the whole probe (up to the 45 s
-  // `timeout` wrapper on a dead network) — well past Playwright's 30 s request
-  // default, so the context carries a wider one.
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-    timeout: 120_000,
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -156,8 +141,8 @@ test.describe('Cloud remotes (rclone.1)', () => {
     }
   })
 
-  test('create the sftp remote: the file is 0600 with the obscured pass, the API returns no value', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('create the sftp remote: the file is 0600 with the obscured pass, the API returns no value', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // The trimmed catalogue, from the node's real rclone: the two facts the
       // dialog renders — sftp's `pass` is password-TYPED (obscured in the
@@ -224,8 +209,8 @@ test.describe('Cloud remotes (rclone.1)', () => {
     }
   })
 
-  test('Test the saved remote: ok on the root and on dst (the real probe)', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('Test the saved remote: ok on the root and on dst (the real probe)', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       for (const body of [{ name: REMOTE }, { name: REMOTE, path: 'dst' }]) {
         const res = await ctx.post(`${V1}/cloud/remotes/test`, { data: body })
@@ -238,8 +223,8 @@ test.describe('Cloud remotes (rclone.1)', () => {
     }
   })
 
-  test('the probe\'s sftp shell detection is kept in the section and listed by the API', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('the probe\'s sftp shell detection is kept in the section and listed by the API', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // rclone's sftp backend autodetects the remote shell on connect and
       // PERSISTS what it learned into the --config it was given (GT
@@ -262,8 +247,8 @@ test.describe('Cloud remotes (rclone.1)', () => {
     }
   })
 
-  test('Test an unsaved dialog with the wrong password: auth, and nothing is written to the store', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('Test an unsaved dialog with the wrong password: auth, and nothing is written to the store', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const before = await storeText()
       const res = await ctx.post(`${V1}/cloud/remotes/test`, {
@@ -291,8 +276,8 @@ test.describe('Cloud remotes (rclone.1)', () => {
     }
   })
 
-  test('Test an unsaved dialog at 192.0.2.1: unreachable (and the API stayed responsive)', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('Test an unsaved dialog at 192.0.2.1: unreachable (and the API stayed responsive)', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // 192.0.2.1 is TEST-NET — nothing answers. The probe must come back
       // bounded (the 45 s `timeout` wrapper), classified as unreachable, not
@@ -317,8 +302,8 @@ test.describe('Cloud remotes (rclone.1)', () => {
     }
   })
 
-  test('Test the saved remote with a missing path: not-found', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('Test the saved remote with a missing path: not-found', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.post(`${V1}/cloud/remotes/test`, { data: { name: REMOTE, path: 'no-such-dir' } })
       expect(res.status(), await res.text()).toBe(200)
@@ -329,8 +314,8 @@ test.describe('Cloud remotes (rclone.1)', () => {
     }
   })
 
-  test('Test a saved name the file does not carry: 404 NOT_FOUND', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('Test a saved name the file does not carry: 404 NOT_FOUND', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.post(`${V1}/cloud/remotes/test`, { data: { name: 'nosuchremote' } })
       expect(res.status()).toBe(404)
@@ -343,8 +328,8 @@ test.describe('Cloud remotes (rclone.1)', () => {
     }
   })
 
-  test('a duplicate create is refused 409; a PUT carrying type is refused 400', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a duplicate create is refused 409; a PUT carrying type is refused 400', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const before = await storeText()
 
@@ -370,8 +355,8 @@ test.describe('Cloud remotes (rclone.1)', () => {
     }
   })
 
-  test('an edit without the secret keeps it: the file is byte-identical except the changed key', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('an edit without the secret keeps it: the file is byte-identical except the changed key', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // Captured RIGHT BEFORE the edit: the probes above legitimately added
       // rclone's own shell-detection keys to [gt], and those are part of the
@@ -393,8 +378,8 @@ test.describe('Cloud remotes (rclone.1)', () => {
     }
   })
 
-  test('a hand-added section with a comment survives an ANAS write byte-for-byte; delete removes only its section', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a hand-added section with a comment survives an ANAS write byte-for-byte; delete removes only its section', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // An operator edit ANAS did not make: a section with a full-line
       // comment, appended exactly as a text editor would leave it.

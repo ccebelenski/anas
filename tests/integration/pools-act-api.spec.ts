@@ -1,5 +1,4 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { GATEWAY_URL, NODE_NAME } from './fixtures/pve-ui'
 import {
   createTestPool,
@@ -49,17 +48,6 @@ const TMP_IMPORT = 'anasactimport'
 const TMP_ADDVDEV = 'anasactvdev'
 const ALL_TMP = [TMP_CREATE, TMP_EXPORT, TMP_IMPORT, TMP_ADDVDEV]
 
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
-
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off). Mirrors pve-native-ui.spec.ts and scrub-era specs.
 test.beforeEach(async () => {
@@ -74,8 +62,8 @@ test.describe('Pool safety confirmation — challenge (no mutation)', () => {
   // export are genuinely consequential (Safety Semantics Level 2). We never send
   // a confirm code here, so testpool is never mutated.
 
-  test('export without a confirm code → 409 CONFIRMATION_REQUIRED + code header', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('export without a confirm code → 409 CONFIRMATION_REQUIRED + code header', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.post(`${V1}/pools/testpool/export`)
       expect(res.status()).toBe(409)
@@ -90,8 +78,8 @@ test.describe('Pool safety confirmation — challenge (no mutation)', () => {
     }
   })
 
-  test('destroy without a confirm code → 409 CONFIRMATION_REQUIRED + code header', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('destroy without a confirm code → 409 CONFIRMATION_REQUIRED + code header', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.delete(`${V1}/pools/testpool`)
       expect(res.status()).toBe(409)
@@ -105,8 +93,8 @@ test.describe('Pool safety confirmation — challenge (no mutation)', () => {
     }
   })
 
-  test('destroy with a WRONG confirm code → 409 again (code not honoured)', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('destroy with a WRONG confirm code → 409 again (code not honoured)', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.delete(`${V1}/pools/testpool`, {
         headers: { 'x-anas-confirm': 'not-a-real-code' },
@@ -120,12 +108,12 @@ test.describe('Pool safety confirmation — challenge (no mutation)', () => {
     }
   })
 
-  test('destroying the boot/root pool → 409 Level-1 refusal with NO code header', async ({ playwright, pveTicket }) => {
+  test('destroying the boot/root pool → 409 Level-1 refusal with NO code header', async ({ playwright }) => {
     const root = await getRootPool()
     test.skip(!root, 'no pool holds this node\'s root or carries bootfs — no protected pool to exercise')
     const { pool: rootPool, via } = root!
 
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.delete(`${V1}/pools/${rootPool}`)
       expect(res.status()).toBe(409)
@@ -158,8 +146,8 @@ test.describe('Pool safety confirmation — challenge (no mutation)', () => {
 test.describe('Pool property modify (3.9)', () => {
   test.setTimeout(90_000)
 
-  test('PUT /pools/testpool changing a property → 202 { job }', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('PUT /pools/testpool changing a property → 202 { job }', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     // autoexpand is a standard, reversible tunable (story 3.9). Toggle it, assert
     // the job is accepted, wait for it to actually apply, then restore.
     const orig = (await sshExec('zpool get -H -o value autoexpand testpool')).trim()
@@ -205,9 +193,9 @@ test.describe('Pool create / destroy / export / import (spare disks)', () => {
       await destroyPool(p)
   })
 
-  test('creates a pool via the API, then destroys it through the confirmation flow (3.8, 3.14)', async ({ playwright, pveTicket }) => {
+  test('creates a pool via the API, then destroys it through the confirmation flow (3.8, 3.14)', async ({ playwright }) => {
     skipIfFixtureMissing(spares.length < 1, 'no spare disks — attach one with add-disk.sh')
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       // Create — 202 job, then the pool really appears (async job).
       const createRes = await ctx.post(`${V1}/pools`, {
@@ -252,9 +240,9 @@ test.describe('Pool create / destroy / export / import (spare disks)', () => {
     }
   })
 
-  test('exports a pool through the confirmation flow (3.13)', async ({ playwright, pveTicket }) => {
+  test('exports a pool through the confirmation flow (3.13)', async ({ playwright }) => {
     skipIfFixtureMissing(spares.length < 1, 'no spare disks — attach one with add-disk.sh')
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       // Stage a disposable, consequential pool directly (not the create path).
       await createTestPool(TMP_EXPORT, [spares[0]])
@@ -281,9 +269,9 @@ test.describe('Pool create / destroy / export / import (spare disks)', () => {
     }
   })
 
-  test('imports a known (exported) pool (3.7)', async ({ playwright, pveTicket }) => {
+  test('imports a known (exported) pool (3.7)', async ({ playwright }) => {
     skipIfFixtureMissing(spares.length < 1, 'no spare disks — attach one with add-disk.sh')
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       // Stage a pool, then export it so it becomes importable but absent.
       await createTestPool(TMP_IMPORT, [spares[0]])
@@ -303,9 +291,9 @@ test.describe('Pool create / destroy / export / import (spare disks)', () => {
     }
   })
 
-  test('adds a vdev to a pool (3.11)', async ({ playwright, pveTicket }) => {
+  test('adds a vdev to a pool (3.11)', async ({ playwright }) => {
     skipIfFixtureMissing(spares.length < 2, 'need 2 spare disks — attach more with add-disk.sh')
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       // Stage a single-disk stripe, then add a second stripe vdev via the API.
       await createTestPool(TMP_ADDVDEV, [spares[0]])

@@ -1,5 +1,5 @@
 import type { Locator, PlaywrightWorkerArgs } from '@playwright/test'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { datasetExists, poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
 
@@ -31,8 +31,8 @@ const SCHED_NAME = 'snapx proof'
 const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
 
 /** Remove the proof schedule through its own door; absent is fine. */
-async function deleteSchedule(playwright: PlaywrightWorkerArgs['playwright'], ticket: string): Promise<void> {
-  const ctx = await playwright.request.newContext({ ignoreHTTPSErrors: true, storageState: pveAuthState(ticket) })
+async function deleteSchedule(playwright: PlaywrightWorkerArgs['playwright']): Promise<void> {
+  const ctx = await apiContext(playwright)
   try {
     const res = await ctx.delete(`${V1}/schedules/${SCHED_ID}`)
     expect([202, 404]).toContain(res.status())
@@ -70,16 +70,16 @@ async function setCheckbox(win: Locator, cls: string, check: boolean): Promise<v
     await input.click()
 }
 
-test.beforeEach(async ({ playwright, pveTicket }) => {
+test.beforeEach(async ({ playwright }) => {
   skipIfFixtureMissing(
     !(await poolExists(PVE_POOL)) || !(await datasetExists(CHILD)),
     'pvepool fixture not present — run test/stunt-node/pvepool-fixture.sh up',
   )
-  await deleteSchedule(playwright, pveTicket)
+  await deleteSchedule(playwright)
 })
 
-test.afterEach(async ({ playwright, pveTicket }) => {
-  await deleteSchedule(playwright, pveTicket)
+test.afterEach(async ({ playwright }) => {
+  await deleteSchedule(playwright)
 })
 
 test.describe('snapx.1 — exclude datasets from a recursive snapshot schedule (stunt node fixture)', () => {

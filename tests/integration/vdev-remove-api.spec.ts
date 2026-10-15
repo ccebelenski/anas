@@ -1,7 +1,7 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { getZpoolStatus, sshExec } from './fixtures/stunt-node'
 
@@ -46,16 +46,6 @@ const EVACUATION_SENTENCE
 interface PoolDisk { id: string, path: string }
 interface PoolVdev { name: string, type: string, disks: PoolDisk[] }
 interface PoolGroup { role: string, vdevs: PoolVdev[] }
-
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -140,8 +130,8 @@ test.describe.serial('Remove a cache, log or spare vdev (story vdevs.2)', () => 
     await execFileAsync(FIXTURE_SH, ['down'], { timeout: 240_000 }).catch(() => {})
   })
 
-  test('the fixture pool starts with all six vdev classes', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('the fixture pool starts with all six vdev classes', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const groups = await vdevGroups(ctx)
       for (const role of ['data', 'log', 'cache', 'spare', 'special', 'dedup'])
@@ -152,8 +142,8 @@ test.describe.serial('Remove a cache, log or spare vdev (story vdevs.2)', () => 
     }
   })
 
-  test('a cache leaf comes out — zpool status and the API agree', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a cache leaf comes out — zpool status and the API agree', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const leaves = leavesOf(await vdevGroups(ctx), 'cache')
       expect(leaves.length).toBe(1)
@@ -170,8 +160,8 @@ test.describe.serial('Remove a cache, log or spare vdev (story vdevs.2)', () => 
     }
   })
 
-  test('a spare comes out', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a spare comes out', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const leaves = leavesOf(await vdevGroups(ctx), 'spare')
       expect(leaves.length).toBe(1)
@@ -188,8 +178,8 @@ test.describe.serial('Remove a cache, log or spare vdev (story vdevs.2)', () => 
     }
   })
 
-  test('a single log leaf comes out', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a single log leaf comes out', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const leaves = leavesOf(await vdevGroups(ctx), 'log')
       expect(leaves.length).toBe(1)
@@ -206,8 +196,8 @@ test.describe.serial('Remove a cache, log or spare vdev (story vdevs.2)', () => 
     }
   })
 
-  test('a MIRRORED log added on the command line comes out by its mirror-N name', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a MIRRORED log added on the command line comes out by its mirror-N name', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // The two partitions freed by the log and cache removals above.
       const base = await deviceBase(ctx)
@@ -234,8 +224,8 @@ test.describe.serial('Remove a cache, log or spare vdev (story vdevs.2)', () => 
     }
   })
 
-  test('special, dedup and a data leaf are refused with the evacuation sentence', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('special, dedup and a data leaf are refused with the evacuation sentence', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const groups = await vdevGroups(ctx)
       const targets = [
@@ -258,8 +248,8 @@ test.describe.serial('Remove a cache, log or spare vdev (story vdevs.2)', () => 
     }
   })
 
-  test('a vdev the pool does not carry is refused by name', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a vdev the pool does not carry is refused by name', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       expect(await refuseVdev(ctx, 'mirror-99')).toBe(`pool ${POOL} carries no vdev 'mirror-99'`)
     }

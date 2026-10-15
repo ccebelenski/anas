@@ -1,10 +1,9 @@
-import type { APIRequestContext, Locator, Page, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext, Locator, Page } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { expect, test } from '@playwright/test'
 import { loginToPve, NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
-import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -50,43 +49,6 @@ const HOST = '127.0.0.1'
 const FIXTURE_SH = new URL('../../test/stunt-node/cloud-fixture.sh', import.meta.url).pathname
 
 // ---- API helpers (request contexts carrying the PVE cookie) ----------------
-
-function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: {
-      cookies: [{
-        name: 'PVEAuthCookie',
-        value: ticket,
-        domain: new URL(PVE_URL).hostname,
-        path: '/',
-        expires: -1,
-        httpOnly: false,
-        secure: true,
-        sameSite: 'Lax' as const,
-      }],
-      origins: [],
-    },
-  })
-}
-
-async function pveTicket(playwright: PlaywrightWorkerArgs['playwright']): Promise<string | null> {
-  const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-  try {
-    const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-    })
-    const ok = ticketRes.ok()
-    const ticket = ok ? ((await ticketRes.json()).data.ticket as string) : null
-    return ticket
-  }
-  finally {
-    await login.dispose()
-  }
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -265,8 +227,7 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     // ssh safety net), finally the fixture down (which restores the store's
     // captured pre-state). Best-effort — an afterAll failure must not mask
     // the run's results.
-    const ticket = await pveTicket(playwright)
-    const ctx = ticket ? await authedContext(playwright, ticket) : null
+    const ctx = await apiContext(playwright).catch(() => null)
     try {
       if (ctx) {
         await removeGtViaApi(ctx)
@@ -463,9 +424,7 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
 
   test('7 — an injected failure before Save: the failure surfaces AND the grid still reloads', async ({ page, playwright }) => {
     // A remote to edit (test 6 removed it) — through the API door.
-    const ticket = await pveTicket(playwright)
-    expect(ticket).toBeTruthy()
-    const ctx = await authedContext(playwright, ticket as string)
+    const ctx = await apiContext(playwright)
     try {
       await createGtViaApi(ctx)
     }

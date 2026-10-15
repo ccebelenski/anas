@@ -1,5 +1,5 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import type { APIRequestContext } from '@playwright/test'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { datasetExists, poolExists, releaseHolds, skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
@@ -57,10 +57,6 @@ interface JobRes {
   }
 }
 
-function authed(playwright: PlaywrightWorkerArgs['playwright'], ticket: string): Promise<APIRequestContext> {
-  return playwright.request.newContext({ ignoreHTTPSErrors: true, storageState: pveAuthState(ticket) })
-}
-
 async function waitJob(ctx: APIRequestContext, id: string): Promise<JobRes['job']> {
   let last: JobRes['job'] | undefined
   await expect.poll(async () => {
@@ -111,12 +107,12 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
   test.describe.configure({ mode: 'serial' })
   let ctx: APIRequestContext
 
-  test.beforeAll(async ({ playwright, pveTicket }) => {
+  test.beforeAll(async ({ playwright }) => {
     skipIfFixtureMissing(
       !(await poolExists(PVE_POOL)) || !(await datasetExists(CHILD)),
       'pvepool fixture not present — run test/stunt-node/pvepool-fixture.sh up',
     )
-    ctx = await authed(playwright, pveTicket)
+    ctx = await apiContext(playwright)
     await deleteSchedule(ctx)
     // Another ENABLED schedule on the node changes what this spec proves
     // (snapprune.1 judges swept and excluded datasets by every enabled

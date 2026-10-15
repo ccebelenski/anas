@@ -1,4 +1,4 @@
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { GATEWAY_URL, NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 
 /**
@@ -29,21 +29,15 @@ test.describe('Gateway API', () => {
     await context.dispose()
   })
 
-  test('serves the health probe with the PVE cookie (200)', async ({ playwright, pveTicket }) => {
-    const context = await playwright.request.newContext({
-      ignoreHTTPSErrors: true,
-      storageState: pveAuthState(pveTicket),
-    })
+  test('serves the health probe with the PVE cookie (200)', async ({ playwright }) => {
+    const context = await apiContext(playwright)
     const response = await context.get(`${GATEWAY}/api/health`)
     expect(response.status()).toBe(200)
     await context.dispose()
   })
 
-  test('returns the pool list for the local node with the PVE cookie (200)', async ({ playwright, pveTicket }) => {
-    const context = await playwright.request.newContext({
-      ignoreHTTPSErrors: true,
-      storageState: pveAuthState(pveTicket),
-    })
+  test('returns the pool list for the local node with the PVE cookie (200)', async ({ playwright }) => {
+    const context = await apiContext(playwright)
     const response = await context.get(`${GATEWAY}/api/nodes/${NODE}/v1/pools`)
     expect(response.status()).toBe(200)
     // Collection reads return `{ data: [...] }` (DESIGN → Response Conventions).
@@ -52,22 +46,16 @@ test.describe('Gateway API', () => {
     await context.dispose()
   })
 
-  test('rejects a malformed node name (400)', async ({ playwright, pveTicket }) => {
-    const context = await playwright.request.newContext({
-      ignoreHTTPSErrors: true,
-      storageState: pveAuthState(pveTicket),
-    })
+  test('rejects a malformed node name (400)', async ({ playwright }) => {
+    const context = await apiContext(playwright)
     // Authenticated, so this is a validation failure (400), not an auth failure.
     const response = await context.get(`${GATEWAY}/api/nodes/bad_node!/v1/pools`)
     expect(response.status()).toBe(400)
     await context.dispose()
   })
 
-  test('surfaces a node outside the cluster membership as 502 NODE_UNRESOLVED', async ({ playwright, pveTicket }) => {
-    const context = await playwright.request.newContext({
-      ignoreHTTPSErrors: true,
-      storageState: pveAuthState(pveTicket),
-    })
+  test('surfaces a node outside the cluster membership as 502 NODE_UNRESOLVED', async ({ playwright }) => {
+    const context = await apiContext(playwright)
     // A syntactically valid node that is not in /etc/pve/.members: the gateway
     // cannot resolve its address and reports a gateway error.
     const response = await context.get(`${GATEWAY}/api/nodes/ghost.example/v1/pools`)

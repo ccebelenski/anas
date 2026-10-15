@@ -1,5 +1,4 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { GATEWAY_URL, NODE_NAME } from './fixtures/pve-ui'
 import {
   datasetExists,
@@ -49,17 +48,6 @@ const POOL = 'testpool'
 const DS_PATH = 'itest'
 const DS_FQ = `${POOL}/${DS_PATH}`
 
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
-
 // Skip the whole file when the reference pool is absent (box not set up / node
 // off). Mirrors the pool specs.
 test.beforeEach(async () => {
@@ -75,8 +63,8 @@ test.afterEach(async () => {
 test.describe('Dataset read model (4.1–4.4)', () => {
   test.setTimeout(60_000)
 
-  test('GET /pools/testpool/datasets → 200 { data: [] } that includes testpool itself', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('GET /pools/testpool/datasets → 200 { data: [] } that includes testpool itself', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.get(`${V1}/pools/${POOL}/datasets`)
       expect(res.status()).toBe(200)
@@ -91,8 +79,8 @@ test.describe('Dataset read model (4.1–4.4)', () => {
     }
   })
 
-  test('GET /identity/users → 200 non-empty array including root', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('GET /identity/users → 200 non-empty array including root', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.get(`${V1}/identity/users`)
       expect(res.status()).toBe(200)
@@ -107,8 +95,8 @@ test.describe('Dataset read model (4.1–4.4)', () => {
     }
   })
 
-  test('GET /identity/groups → 200 non-empty array including root', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('GET /identity/groups → 200 non-empty array including root', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.get(`${V1}/identity/groups`)
       expect(res.status()).toBe(200)
@@ -132,8 +120,8 @@ test.describe('Dataset lifecycle: create → detail → modify → permissions �
     await destroyDataset(DS_FQ)
   })
 
-  test('full lifecycle through the API, verified against the real system', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('full lifecycle through the API, verified against the real system', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // --- create (4.5) — 202 job, then the dataset really appears (async job).
       const createRes = await ctx.post(`${V1}/pools/${POOL}/datasets`, {
@@ -238,8 +226,8 @@ test.describe('Dataset destroy with children — plain fails, recursive succeeds
     await sshExec(`zfs create -p ${CHILD_FQ}`)
   })
 
-  test('a plain destroy of a parent with children fails; ?recursive=true removes the tree', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a plain destroy of a parent with children fails; ?recursive=true removes the tree', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       expect(await datasetExists(CHILD_FQ)).toBe(true)
 

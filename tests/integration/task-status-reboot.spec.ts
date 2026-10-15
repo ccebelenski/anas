@@ -1,10 +1,9 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { poolExists, skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
-import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -54,10 +53,6 @@ const FAR_SCHEDULE = '2030-01-01 00:00:00'
 
 interface Row { lastRunResult: string, lastRunAt: string | null, lastRunNote?: string }
 
-function authed(playwright: PlaywrightWorkerArgs['playwright'], ticket: string): Promise<APIRequestContext> {
-  return playwright.request.newContext({ ignoreHTTPSErrors: true, storageState: pveAuthState(ticket), timeout: 120_000 })
-}
-
 async function awaitJob(ctx: APIRequestContext, id: string, timeout = 180_000): Promise<{ status: string, error?: { message?: string } | null }> {
   const deadline = Date.now() + timeout
   for (;;) {
@@ -104,15 +99,6 @@ function within(a: string | null, b: string | null, ms: number): boolean {
   if (!a || !b)
     return false
   return Math.abs(Date.parse(a) - Date.parse(b)) <= ms
-}
-
-async function ticketFor(playwright: PlaywrightWorkerArgs['playwright']): Promise<string> {
-  const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-  const res = await login.post(`${PVE_URL}/api2/json/access/ticket`, { form: { username: 'root@pam', password: PVE_ROOT_PASSWORD } })
-  expect(res.ok()).toBeTruthy()
-  const ticket = (await res.json()).data.ticket as string
-  await login.dispose()
-  return ticket
 }
 
 /**
@@ -177,7 +163,7 @@ test.describe('taskstatus.1 — last run and verdict survive a reboot (stunt nod
     pvepoolWasUp = await poolExists(PVEPOOL)
     await execFileAsync(FIXTURE_SH, ['down'], { timeout: 300_000 })
     await execFileAsync(FIXTURE_SH, ['up'], { timeout: 300_000 })
-    ctx = await authed(playwright, await ticketFor(playwright))
+    ctx = await apiContext(playwright, { timeout: 120_000 })
     await removeQuietly(ctx, `${V1}/schedules/${SCHED_ID}`)
     await removeQuietly(ctx, `${V1}/cloud/tasks/${TASK}`)
     await removeQuietly(ctx, `${V1}/cloud/remotes/${REMOTE}`)

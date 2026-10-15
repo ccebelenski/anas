@@ -1,7 +1,6 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
 
@@ -47,17 +46,6 @@ const BY_ID = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9'
 /** Absolute path of the fixture script, relative to this spec file. */
 const FIXTURE_SH = new URL('../../test/stunt-node/vdev-fixture.sh', import.meta.url).pathname
 
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
-
 /** The KERNEL name of the pool's Nth partition (source of truth: the node). */
 async function partitionKernelName(n: number): Promise<string> {
   const dev = await sshExec(`readlink -f /dev/disk/by-id/${BY_ID}-part${n}`)
@@ -84,8 +72,8 @@ test.describe('vdevs.1 — pool-level vdev classes (stunt node fixture)', () => 
   // -----------------------------------------------------------------------
   // 1 — the API lists all six classes in the fixed order
   // -----------------------------------------------------------------------
-  test('GET /v1/pools/gtvdev lists all six vdev classes in fixed order', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('GET /v1/pools/gtvdev lists all six vdev classes in fixed order', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // The pool's six partition leaves, by kernel name, from the node itself.
       const leaves: string[] = []
@@ -129,8 +117,8 @@ test.describe('vdevs.1 — pool-level vdev classes (stunt node fixture)', () => 
   // -----------------------------------------------------------------------
   // 1b — telemetry: the kernel-named leaves land on the disk id (0.4.1)
   // -----------------------------------------------------------------------
-  test('GET /v1/telemetry resolves the kernel-named partition leaves to the disk id the Disks list carries', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('GET /v1/telemetry resolves the kernel-named partition leaves to the disk id the Disks list carries', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const res = await ctx.get(`${V1}/telemetry`)
       expect(res.status()).toBe(200)

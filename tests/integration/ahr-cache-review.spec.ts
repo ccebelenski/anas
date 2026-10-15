@@ -1,7 +1,7 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
 
@@ -68,17 +68,6 @@ const FOREIGN_ID = BY_ID(FOREIGN_SERIAL)
 
 /** Absolute paths of the fixture scripts, relative to this spec file. */
 const FIXTURE_SH = new URL('../../test/stunt-node/ahrcache-fixture.sh', import.meta.url).pathname
-
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -298,7 +287,7 @@ test.describe('AHR read cache — review-fix live proofs (ahrcache.1)', () => {
    * record carries its classification → the disk returns and Detach reclaims
    * it → the pool is destroyed through the API.
    */
-  test('shape 1: the idle pull — the rung uncaches before the first read', async ({ playwright, pveTicket }) => {
+  test('shape 1: the idle pull — the rung uncaches before the first read', async ({ playwright }) => {
     const cacheId = BY_ID(CACHE_SERIAL)
     // Blank images: a disk left over from an earlier run carries stale labels,
     // and a stale signature aborts `pvcreate` non-interactively (GT-18).
@@ -306,7 +295,7 @@ test.describe('AHR read cache — review-fix live proofs (ahrcache.1)', () => {
     for (const serial of [...BAND_SERIALS, CACHE_SERIAL])
       expect(await fileExists(`/dev/disk/by-id/${BY_ID(serial)}`), `${serial} attached`).toBe(true)
 
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       await buildCachedPool(ctx)
 
@@ -462,13 +451,13 @@ test.describe('AHR read cache — review-fix live proofs (ahrcache.1)', () => {
    * Then the volume is activated and mounted, a second restart sees a healthy
    * cached pool and touches nothing, and the teardown goes through the API.
    */
-  test('shape 2: band down, cache SSD healthy — no rung uncaches it; inactive where the API can see it', async ({ playwright, pveTicket }) => {
+  test('shape 2: band down, cache SSD healthy — no rung uncaches it; inactive where the API can see it', async ({ playwright }) => {
     const cacheId = BY_ID(CACHE_SERIAL)
     await execFileAsync(FIXTURE_SH, ['up'])
     for (const serial of [...BAND_SERIALS, CACHE_SERIAL])
       expect(await fileExists(`/dev/disk/by-id/${BY_ID(serial)}`), `${serial} attached`).toBe(true)
 
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       await buildCachedPool(ctx)
       expect((await poolDetail(ctx)).cache?.state).toBe('healthy')
@@ -605,7 +594,7 @@ test.describe('AHR read cache — review-fix live proofs (ahrcache.1)', () => {
    * around it and leaves it a physical volume with no volume group, which
    * this proof verifies on the node before cleaning the disk up by hand.
    */
-  test('shape 3: a foreign PV in the pool VG is an advisory, never a pool disk, and survives destroy', async ({ playwright, pveTicket }) => {
+  test('shape 3: a foreign PV in the pool VG is an advisory, never a pool disk, and survives destroy', async ({ playwright }) => {
     const cacheId = BY_ID(CACHE_SERIAL)
     await execFileAsync(FIXTURE_SH, ['up'])
     for (const serial of [...BAND_SERIALS, CACHE_SERIAL])
@@ -614,7 +603,7 @@ test.describe('AHR read cache — review-fix live proofs (ahrcache.1)', () => {
     await execFileAsync(FIXTURE_SH, ['attach-foreign'])
     expect(await fileExists(`/dev/disk/by-id/${FOREIGN_ID}`), `${FOREIGN_SERIAL} attached`).toBe(true)
 
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       // --- the pool, cached, healthy — the state before the hand-work ------
       const inventory = await ctx.get(`${V1}/disks`)

@@ -1,7 +1,7 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
 
@@ -53,16 +53,6 @@ interface DiskRow {
 }
 
 interface DashboardWarning { level: string, category: string, message: string, ref?: string }
-
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(ctx: APIRequestContext, jobId: string, timeout = 60_000): Promise<{ status: string, [k: string]: any }> {
@@ -129,8 +119,8 @@ test.describe.serial('vdevs.1 slice 2 — the vdev-class consumers, live', () =>
   // in-pool ZIL and goes DEGRADED), so that is the fault used here. It exercises
   // the same join, and one step further: with the log OFFLINE the disk's single
   // row has to move from the special context to the faulted log one.
-  test('a faulted log leaf moves the disk row and raises the pool warning', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a faulted log leaf moves the disk row and raises the pool warning', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const logLeaf = await partitionKernelName(2)
 
@@ -232,8 +222,8 @@ test.describe.serial('vdevs.1 slice 2 — the vdev-class consumers, live', () =>
   // -----------------------------------------------------------------------
   // (c) destroy with cleanup clears the labels of EVERY class's partition
   // -----------------------------------------------------------------------
-  test('destroy with cleanup labelclears all six partitions and frees the disk', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('destroy with cleanup labelclears all six partitions and frees the disk', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const parts: string[] = []
       for (let n = 1; n <= 6; n++)

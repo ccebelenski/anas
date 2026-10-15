@@ -1,7 +1,7 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
 
@@ -64,17 +64,6 @@ const BY_ID = (serial: string): string => `scsi-0QEMU_QEMU_HARDDISK_${serial}`
 
 /** Absolute path of the fixture script, relative to this spec file. */
 const FIXTURE_SH = new URL('../../test/stunt-node/ahrcache-fixture.sh', import.meta.url).pathname
-
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -241,7 +230,7 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
     await execFileAsync(FIXTURE_SH, ['down']).catch(() => {})
   })
 
-  test('attach on a blank SSD, hits climb, detach hands the disk back', async ({ playwright, pveTicket }) => {
+  test('attach on a blank SSD, hits climb, detach hands the disk back', async ({ playwright }) => {
     // The fixture owns disks 7/8/9 and recreates their images blank — a disk
     // left over from an earlier run carries stale labels, and a stale signature
     // is exactly what makes `pvcreate` abort non-interactively (GT-18).
@@ -251,7 +240,7 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
     for (const serial of [...BAND_SERIALS, CACHE_SERIAL])
       expect(await fileExists(`/dev/disk/by-id/${BY_ID(serial)}`), `${serial} attached`).toBe(true)
 
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       // --- 0. The pool, through the daemon's own API (confirm flow) ---------
       const inventory = await ctx.get(`${V1}/disks`)
@@ -385,7 +374,7 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
    * Unit tests pin the argv order; only the node can prove `lvremove` actually
    * accepts what follows, so this rides slice 2's live proof.
    */
-  test('destroy with the cache still attached tears the whole stack down', async ({ playwright, pveTicket }) => {
+  test('destroy with the cache still attached tears the whole stack down', async ({ playwright }) => {
     const cacheId = BY_ID(CACHE_SERIAL)
     // Blank images: a disk left over from the previous test carries stale
     // labels, and a stale signature aborts `pvcreate` non-interactively.
@@ -393,7 +382,7 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
     for (const serial of [...BAND_SERIALS, CACHE_SERIAL])
       expect(await fileExists(`/dev/disk/by-id/${BY_ID(serial)}`), `${serial} attached`).toBe(true)
 
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       const inventory = await ctx.get(`${V1}/disks`)
       const disks = (await inventory.json()).data as DiskRow[]
@@ -468,7 +457,7 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
    *   8. the returned disk is detached, which deletes the slice and hands it
    *      back as `available` (GT-22)
    */
-  test('slice 2: the cache device dies live, ANAS uncaches itself, Remount restores writes', async ({ playwright, pveTicket }) => {
+  test('slice 2: the cache device dies live, ANAS uncaches itself, Remount restores writes', async ({ playwright }) => {
     // The write loop's files, declared here so the finally can stop the loop
     // and clean up even when a step below threw: a loop writing into the
     // pool's mount must never outlive the test.
@@ -479,7 +468,7 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
     for (const serial of [...BAND_SERIALS, CACHE_SERIAL])
       expect(await fileExists(`/dev/disk/by-id/${BY_ID(serial)}`), `${serial} attached`).toBe(true)
 
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       // --- 0. A pool with a LIVE, WARM cache -------------------------------
       const inventory = await ctx.get(`${V1}/disks`)
@@ -690,10 +679,10 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
    * there by the recovery running BEFORE the mount — never by coming up with a
    * dm-cache target in front of a device that is not there.
    */
-  test('slice 2: the boot rung recovers a cached pool whose cache PV is missing', async ({ playwright, pveTicket }) => {
+  test('slice 2: the boot rung recovers a cached pool whose cache PV is missing', async ({ playwright }) => {
     const cacheId = BY_ID(CACHE_SERIAL)
     await execFileAsync(FIXTURE_SH, ['up'])
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       const inventory = await ctx.get(`${V1}/disks`)
       const disks = (await inventory.json()).data as DiskRow[]

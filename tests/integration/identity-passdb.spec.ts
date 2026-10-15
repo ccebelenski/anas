@@ -1,8 +1,7 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import type { APIRequestContext } from '@playwright/test'
+import { apiContext, expect, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { makeDir, removeSmbShare, sshExec } from './fixtures/stunt-node'
-import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 /**
  * Story identity.3 (GitHub #68) — LIVE PROOF that a share user's Samba passdb
@@ -51,17 +50,6 @@ const ORPHAN_PW = 'anas-idp-orphan'
 const SHARE = 'idpcase'
 const SHARE_DIR = '/var/tmp/anas-idpcase'
 const MISMATCH_TEXT = `SMB entry stored as '${LOWER}' — set the password again to repair`
-
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -162,16 +150,10 @@ test.describe('Passdb entry matches the account exactly (identity.3, #68)', () =
 
   test.afterAll(async ({ playwright }) => {
     // Through the API doors first (share, then user), then the SSH sweep as
-    // the safety net. afterAll sees no test-scoped fixtures, so the ticket is
-    // fetched here with the auth fixture's login.
+    // the safety net. afterAll sees no test-scoped fixtures; apiContext
+    // (cr.25b) brings its own login.
     try {
-      const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-      const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-        form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-      })
-      const ticket = (await ticketRes.json()).data.ticket as string
-      await login.dispose()
-      const ctx = await authedContext(playwright, ticket)
+      const ctx = await apiContext(playwright)
       try {
         await deleteViaApi(ctx, `${V1}/shares/smb/${SHARE}`).catch(() => {})
         await deleteViaApi(ctx, `${V1}/identity/users/${USER}`).catch(() => {})
@@ -184,8 +166,8 @@ test.describe('Passdb entry matches the account exactly (identity.3, #68)', () =
     await sweep()
   })
 
-  test('1 — create over a staged case-mismatched orphan repairs it: Idpcase:<uid> exact, smbEnabled, one journal line', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('1 — create over a staged case-mismatched orphan repairs it: Idpcase:<uid> exact, smbEnabled, one journal line', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       await stageOrphan()
       const since = await sshExec('date -Is')
@@ -211,8 +193,8 @@ test.describe('Passdb entry matches the account exactly (identity.3, #68)', () =
     }
   })
 
-  test('2 — smbclient as Idpcase lists and writes on a valid-users share (no guest), Windows-shaped login too', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('2 — smbclient as Idpcase lists and writes on a valid-users share (no guest), Windows-shaped login too', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       await makeDir(SHARE_DIR)
       await sshExec(`chown ${USER} ${SHARE_DIR}`)
@@ -234,12 +216,12 @@ test.describe('Passdb entry matches the account exactly (identity.3, #68)', () =
     }
   })
 
-  test('3 — a mismatched entry planted after create: API and grid show the stored name, smbclient is refused', async ({ page, playwright, pveTicket }) => {
+  test('3 — a mismatched entry planted after create: API and grid show the stored name, smbclient is refused', async ({ page, playwright }) => {
     // Drop the exact entry, then re-stage the lowercase orphan by hand.
     await sshExec(`pdbedit -x -u ${USER}`)
     await stageOrphan()
 
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       const list = await ctx.get(`${V1}/identity/users`)
       expect(list.status()).toBe(200)
@@ -271,8 +253,8 @@ test.describe('Passdb entry matches the account exactly (identity.3, #68)', () =
     await expect(gridRow).not.toContainText('✓')
   })
 
-  test('4 — set password repairs the mismatch: exact entry again, smbclient lists', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('4 — set password repairs the mismatch: exact entry again, smbclient lists', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const result = await runJob(ctx, 'post', `${V1}/identity/users/${USER}/smb-password`, { password: PW })
       expect(result).toEqual({ user: USER, smbEnabled: true, smbEntryReplaced: LOWER })
@@ -293,8 +275,8 @@ test.describe('Passdb entry matches the account exactly (identity.3, #68)', () =
     }
   })
 
-  test('5 — delete on a mismatched entry succeeds and leaves nothing behind', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('5 — delete on a mismatched entry succeeds and leaves nothing behind', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // The share names the user in valid users — remove it first (the delete
       // would otherwise be a hard referenced-by-share refusal).

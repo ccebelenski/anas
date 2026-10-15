@@ -1,5 +1,5 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import type { APIRequestContext } from '@playwright/test'
+import { apiContext, expect, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
 
@@ -206,17 +206,6 @@ async function probesSince(cursor: string): Promise<Map<string, number>> {
 
 // ---- API helpers ------------------------------------------------------------
 
-function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-    timeout: 60_000,
-  })
-}
-
 /** One Disks LOAD: `GET /v1/disks`, the call that carries the re-probe pass. */
 async function loadDisks(ctx: APIRequestContext): Promise<any[]> {
   const res = await ctx.get(`${V1}/disks`)
@@ -272,8 +261,8 @@ test.describe('disks.1 — SMART readings age out (stunt node)', () => {
     console.log(`[disks.1] teardown — anasd/anas: ${state.split('\n').join(' ')}`)
   })
 
-  test('a reading older than the cadence is re-probed: two loads 3 s apart, two probes per disk', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a reading older than the cadence is re-probed: two loads 3 s apart, two probes per disk', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       await setCadence(CADENCE_MS)
       await waitForDaemon(ctx)
@@ -304,8 +293,8 @@ test.describe('disks.1 — SMART readings age out (stunt node)', () => {
     }
   })
 
-  test('a reading younger than the cadence is a hit: two loads 1 s apart, one probe per disk', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a reading younger than the cadence is a hit: two loads 1 s apart, one probe per disk', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // Restart to clear the cache, so load 1 below is the disk's first pass.
       await setCadence(CADENCE_MS)
@@ -338,8 +327,8 @@ test.describe('disks.1 — SMART readings age out (stunt node)', () => {
     }
   })
 
-  test('control: without the drop-in the shipped 30-minute cadence holds — two loads 3 s apart, one probe per disk', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('control: without the drop-in the shipped 30-minute cadence holds — two loads 3 s apart, one probe per disk', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       await setCadence(null)
       await waitForDaemon(ctx)
@@ -363,8 +352,8 @@ test.describe('disks.1 — SMART readings age out (stunt node)', () => {
     }
   })
 
-  test('the disk detail dates the reading and shows no power-mode row for a disk that reports none', async ({ page, playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('the disk detail dates the reading and shows no power-mode row for a disk that reports none', async ({ page, playwright }) => {
+    const ctx = await apiContext(playwright)
     const disks = await loadDisks(ctx).finally(() => ctx.dispose())
     // The daemon reports no power mode for any disk on this node — QEMU SCSI
     // documents carry no `power_mode` object, and it is never inferred. That
@@ -416,8 +405,8 @@ test.describe('disks.1 — SMART readings age out (stunt node)', () => {
     expect(gridText, 'the reading line is not duplicated into the grid').not.toContain('SMART read')
   })
 
-  test('the dashboard header shows "ANAS <version>", the version /v1/health reports', async ({ page, playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('the dashboard header shows "ANAS <version>", the version /v1/health reports', async ({ page, playwright }) => {
+    const ctx = await apiContext(playwright)
     const health = await ctx.get(`${V1}/health`)
       .then(async (res) => {
         expect(res.status(), await res.text()).toBe(200)

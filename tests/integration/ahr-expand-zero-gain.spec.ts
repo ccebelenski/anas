@@ -1,10 +1,9 @@
-import type { APIRequestContext, Locator, Page, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext, Locator, Page } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
-import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -62,18 +61,6 @@ const SMALL_B = BY_ID('ANAS_HOT8')
 const BIG = BY_ID('ANAS_HOT9')
 
 const GiB = 1024 ** 3
-
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-    timeout: 300_000,
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -214,13 +201,7 @@ test.describe('AHR zero-gain expansion guard (ahrexpand.1)', () => {
     // Destroy the pool through the API when it is still there, then take the
     // fixture down (which also sweeps whatever a crashed run left).
     try {
-      const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-      const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-        form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-      })
-      const ticket = (await ticketRes.json()).data.ticket as string
-      await login.dispose()
-      const ctx = await authedContext(playwright, ticket)
+      const ctx = await apiContext(playwright)
       try {
         if (await poolExists(ctx))
           await runConfirmedJob(ctx, 'delete', `${V1}/ahr/${POOL}`)
@@ -240,8 +221,8 @@ test.describe('AHR zero-gain expansion guard (ahrexpand.1)', () => {
     }
   })
 
-  test('the plan refuses to credit a replace above a band boundary, and the 409 says what unlocks it', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('the plan refuses to credit a replace above a band boundary, and the 409 says what unlocks it', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // --- the pool: AHR-1 on the two 2 GiB disks -------------------------
       await runConfirmedJob(ctx, 'post', `${V1}/ahr`, { name: POOL, tier: 'ahr1', disks: [SMALL_A, SMALL_B] })
@@ -332,8 +313,8 @@ test.describe('AHR zero-gain expansion guard (ahrexpand.1)', () => {
     }
   })
 
-  test('adding the freed disk back is a positive-gain plan, and its 409 is the ordinary reshape confirm', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('adding the freed disk back is a positive-gain plan, and its 409 is the ordinary reshape confirm', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const before = await untilHealthy(ctx)
       const usableBefore = before.capacity.usableBytes
@@ -380,11 +361,11 @@ test.describe('AHR zero-gain expansion guard (ahrexpand.1)', () => {
     }
   })
 
-  test('the expansion wizard reads the same verdict: the Change row and the confirm dialog', async ({ page, playwright, pveTicket }) => {
+  test('the expansion wizard reads the same verdict: the Change row and the confirm dialog', async ({ page, playwright }) => {
     // The previous test left a three-disk pool, so the §5.2 shape is rebuilt
     // from scratch through the API: the wizard needs the 4 GiB disk AVAILABLE
     // and a 2 GiB member to point it at.
-    const ctx = await authedContext(playwright, pveTicket)
+    const ctx = await apiContext(playwright)
     try {
       if (await poolExists(ctx))
         await runConfirmedJob(ctx, 'delete', `${V1}/ahr/${POOL}`)

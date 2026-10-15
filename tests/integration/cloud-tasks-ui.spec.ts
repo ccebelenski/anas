@@ -4,7 +4,6 @@ import { promisify } from 'node:util'
 import { expect, test } from '@playwright/test'
 import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
-import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -112,52 +111,6 @@ const TASK_BODY: Record<string, unknown> = {
 
 // ---- API helpers (request contexts carrying the PVE cookie) ----------------
 
-function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: {
-      cookies: [{
-        name: 'PVEAuthCookie',
-        value: ticket,
-        domain: new URL(PVE_URL).hostname,
-        path: '/',
-        expires: -1,
-        httpOnly: false,
-        secure: true,
-        sameSite: 'Lax' as const,
-      }],
-      origins: [],
-    },
-  })
-}
-
-async function pveTicket(playwright: PlaywrightWorkerArgs['playwright']): Promise<string | null> {
-  const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-  try {
-    const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-    })
-    const ok = ticketRes.ok()
-    const ticket = ok ? ((await ticketRes.json()).data.ticket as string) : null
-    return ticket
-  }
-  finally {
-    await login.dispose()
-  }
-}
-
-/** Ticket + request context in one step — every test's setup door. */
-async function apiCtx(
-  playwright: PlaywrightWorkerArgs['playwright'],
-): Promise<APIRequestContext> {
-  const ticket = await pveTicket(playwright)
-  expect(ticket, 'PVE ticket for API setup').toBeTruthy()
-  return authedContext(playwright, ticket as string)
-}
-
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
   ctx: APIRequestContext,
@@ -248,7 +201,7 @@ async function setupViaApi(
   playwright: PlaywrightWorkerArgs['playwright'],
   taskBody: Record<string, unknown> | null,
 ): Promise<void> {
-  const ctx = await apiCtx(playwright)
+  const ctx = await apiContext(playwright)
   try {
     await createGtViaApi(ctx)
     if (taskBody) {
@@ -303,7 +256,7 @@ async function expectRunOfThisTest(
   result: string,
   startedAtMs: number,
 ): Promise<void> {
-  const ctx = await apiCtx(playwright)
+  const ctx = await apiContext(playwright)
   try {
     const row = await taskViewViaApi(ctx, name)
     expect(row.lastRunResult, `${name} lastRunResult`).toBe(result)
@@ -464,7 +417,7 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     // doors, the stand-in rclone restored if a test died mid-swap, the empty
     // source dir swept, finally the fixture down. Best-effort — an afterAll
     // failure must not mask the run's results.
-    const ctx = await apiCtx(playwright).catch(() => null)
+    const ctx = await apiContext(playwright).catch(() => null)
     try {
       if (ctx) {
         await removeTaskViaApi(ctx, TASK)
@@ -686,7 +639,7 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
 
     // The real binary is back: one more run succeeds, the row recovers.
     const recoveryStartedAt = await nodeNowMs()
-    const ctx = await apiCtx(playwright)
+    const ctx = await apiContext(playwright)
     try {
       await runJob(ctx, 'post', `${V1}/cloud/tasks/${TASK}/run`, {})
     }
@@ -746,7 +699,7 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     // The earlier tests left this task ENABLED, and the create helper skips a
     // task that already exists — so the disabled state is written explicitly.
     await setupViaApi(playwright, TASK_BODY)
-    const setupCtx = await apiCtx(playwright)
+    const setupCtx = await apiContext(playwright)
     try {
       await putTaskViaApi(setupCtx, { ...TASK_BODY, enabled: false })
     }
@@ -789,14 +742,14 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     // this one copy + disabled — the state the preview needs is written
     // explicitly.
     await setupViaApi(playwright, TASK_BODY)
-    const putCtx = await apiCtx(playwright)
+    const putCtx = await apiContext(playwright)
     try {
       await putTaskViaApi(putCtx, { ...TASK_BODY, mode: 'sync', enabled: true })
     }
     finally {
       await putCtx.dispose()
     }
-    const runCtx = await apiCtx(playwright)
+    const runCtx = await apiContext(playwright)
     try {
       await runJob(runCtx, 'post', `${V1}/cloud/tasks/${TASK}/run`, {})
     }

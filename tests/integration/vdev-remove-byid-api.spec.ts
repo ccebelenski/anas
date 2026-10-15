@@ -1,7 +1,7 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { getZpoolStatus, sshExec } from './fixtures/stunt-node'
 
@@ -47,16 +47,6 @@ interface PoolDisk { id: string, path: string }
 interface PoolVdev { name: string, type: string, state: string, disks: PoolDisk[] }
 interface PoolGroup { role: string, vdevs: PoolVdev[] }
 interface TelemetryVdev { name: string, role: string, state: string }
-
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -189,8 +179,8 @@ test.describe.serial('Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #
     await execFileAsync(FIXTURE_SH, ['down'], { timeout: 240_000 }).catch(() => {})
   })
 
-  test('all six classes sit on partitions of ONE disk — the ids collide', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('all six classes sit on partitions of ONE disk — the ids collide', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const groups = await vdevGroups(ctx)
       for (const role of ['data', 'log', 'cache', 'spare', 'special', 'dedup'])
@@ -207,8 +197,8 @@ test.describe.serial('Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #
     }
   })
 
-  test('the special partition joins the dashboard with role special, not data', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('the special partition joins the dashboard with role special, not data', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const disk = await fixtureDiskId(ctx)
       const res = await ctx.get(`${V1}/telemetry`)
@@ -229,8 +219,8 @@ test.describe.serial('Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #
     }
   })
 
-  test('the STRIPPED disk id is refused as ambiguous — nothing comes out', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('the STRIPPED disk id is refused as ambiguous — nothing comes out', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const disk = await fixtureDiskId(ctx)
       const message = await refuseVdev(ctx, disk)
@@ -247,8 +237,8 @@ test.describe.serial('Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #
     }
   })
 
-  test('the cache partition comes out and the LOG is untouched', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('the cache partition comes out and the LOG is untouched', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const disk = await fixtureDiskId(ctx)
       const cachePath = leafPathsOf(await vdevGroups(ctx), 'cache')[0]
@@ -274,8 +264,8 @@ test.describe.serial('Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #
     }
   })
 
-  test('a section with TWO cache leaves is one vdev, and they come out one at a time', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a section with TWO cache leaves is one vdev, and they come out one at a time', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const disk = await fixtureDiskId(ctx)
       const byId = (part: number) => `/dev/disk/by-id/${disk}-part${part}`
@@ -322,8 +312,8 @@ test.describe.serial('Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #
    * The replacement is the partition the two tests above freed (the old spare,
    * bigger than the log partition it takes over).
    */
-  test('the LOG partition is replaced by its basename — the stripped id is refused', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('the LOG partition is replaced by its basename — the stripped id is refused', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const disk = await fixtureDiskId(ctx)
       const byId = (part: number) => `/dev/disk/by-id/${disk}-part${part}`

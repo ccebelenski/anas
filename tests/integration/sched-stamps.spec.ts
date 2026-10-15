@@ -1,10 +1,9 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
-import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -94,18 +93,6 @@ const MISSING_ARCHIVE = '/gtbackup/no-such-path-gtstamp'
 const PASSED_TODAY = '*-*-* 00:05:00'
 /** An absolute future date: enabled, but nothing to catch up on (GT-21). */
 const FUTURE_DATE = '2030-01-01 00:00:00'
-
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-    timeout: 120_000,
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -348,15 +335,7 @@ test.describe('Scheduled-task timer stamps (sched.stamps)', () => {
     await execFileAsync(CLOUD_FIXTURE_SH, ['down'], { timeout: 300_000 })
     await execFileAsync(CLOUD_FIXTURE_SH, ['up'], { timeout: 300_000 })
 
-    const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-    const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-    })
-    expect(ticketRes.ok()).toBeTruthy()
-    const ticket = (await ticketRes.json()).data.ticket as string
-    await login.dispose()
-
-    const ctx = await authedContext(playwright, ticket)
+    const ctx = await apiContext(playwright)
     try {
       await runJob(ctx, 'post', `${V1}/cloud/remotes`, {
         name: REMOTE,
@@ -428,8 +407,8 @@ test.describe('Scheduled-task timer stamps (sched.stamps)', () => {
     await sshExec(`rm -f ${PLANTED_SURVIVORS.map(f => `${STAMP_DIR}/${f}`).join(' ')}`)
   })
 
-  test('a backup task: delete clears stamp and failed state, and a re-used name does not run itself', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a backup task: delete clears stamp and failed state, and a re-used name does not run itself', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const { failedBefore, failedAfter } = await proveKind(ctx, 'backup', BACKUP_TASK, backupTaskBody)
       // GT-23 capture — printed so the ground-truth doc quotes the real thing.
@@ -441,8 +420,8 @@ test.describe('Scheduled-task timer stamps (sched.stamps)', () => {
     }
   })
 
-  test('a cloud task: the same three facts under the anas-cloud- prefix', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a cloud task: the same three facts under the anas-cloud- prefix', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const { failedBefore, failedAfter } = await proveKind(ctx, 'cloud', CLOUD_TASK, cloudTaskBody)
       console.error(`GT-23 cloud --- list-units --failed BEFORE the delete ---\n${failedBefore}`)

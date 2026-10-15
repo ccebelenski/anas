@@ -1,10 +1,9 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
-import { PVE_ROOT_PASSWORD } from './fixtures/target'
 
 const execFileAsync = promisify(execFile)
 
@@ -91,18 +90,6 @@ const SCHEDULE = '2030-01-01 00:00:00'
 
 /** The absolute path of the fixture script, relative to this spec file. */
 const FIXTURE_SH = new URL('../../test/stunt-node/cloud-tasks-fixture.sh', import.meta.url).pathname
-
-/** Build an authenticated request context carrying the PVE session cookie. */
-async function authedContext(
-  playwright: PlaywrightWorkerArgs['playwright'],
-  ticket: string,
-): Promise<APIRequestContext> {
-  return playwright.request.newContext({
-    ignoreHTTPSErrors: true,
-    storageState: pveAuthState(ticket),
-    timeout: 120_000,
-  })
-}
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
@@ -288,21 +275,12 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
     await execFileAsync(FIXTURE_SH, ['down'], { timeout: 300_000 })
     await execFileAsync(FIXTURE_SH, ['up'], { timeout: 300_000 })
 
-    // A beforeAll hook may only use WORKER-scoped fixtures, so the session
-    // ticket is fetched here rather than taken from the test-scoped
-    // `pveTicket` (smbsvc-ui.spec.ts's pattern).
-    const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-    const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-      form: { username: 'root@pam', password: PVE_ROOT_PASSWORD },
-    })
-    expect(ticketRes.ok()).toBeTruthy()
-    const ticket = (await ticketRes.json()).data.ticket as string
-    await login.dispose()
-
+    // A beforeAll hook may only use WORKER-scoped fixtures; apiContext
+    // (cr.25b) brings its own login, so the hook needs nothing else.
     // The remote every task but the failure one points at: sftp to the node's
     // OWN sshd as the fixture user. Registered through the API, like a user
     // would (rclone.1's door).
-    const ctx = await authedContext(playwright, ticket)
+    const ctx = await apiContext(playwright)
     try {
       await runJob(ctx, 'post', `${V1}/cloud/remotes`, {
         name: REMOTE,
@@ -326,8 +304,8 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
     }
   })
 
-  test('create a copy task: both units carry the marker, the timer is enabled and nextRunAt is its next elapse', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('create a copy task: both units carry the marker, the timer is enabled and nextRunAt is its next elapse', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       await runJob(ctx, 'post', `${V1}/cloud/tasks`, taskBody({
         name: 'gtcopy',
@@ -373,8 +351,8 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
     }
   })
 
-  test('Run Now: the files land byte-identical, rclone\'s counters come back, and the run read a transient snapshot that is gone afterwards', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('Run Now: the files land byte-identical, rclone\'s counters come back, and the run read a transient snapshot that is gone afterwards', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       const sourceHashes = await sha256(SRC, ['a.bin', 'b.bin', 'sub/c.txt'])
       expect(Object.keys(sourceHashes), 'the fixture staged three files').toHaveLength(3)
@@ -432,8 +410,8 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
     }
   })
 
-  test('sync mirrors a source deletion to the destination; copy never deletes', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('sync mirrors a source deletion to the destination; copy never deletes', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       await runJob(ctx, 'post', `${V1}/cloud/tasks`, taskBody({
         name: 'gtsync',
@@ -480,8 +458,8 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
     }
   })
 
-  test('a dry-run preview lists the would-be deletes on the live source — and refuses an unmounted mount', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a dry-run preview lists the would-be deletes on the live source — and refuses an unmounted mount', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // The source lost b.bin in the previous test, but that test's second
       // sync already mirrored the deletion — so stage the would-be delete
@@ -539,8 +517,8 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
     }
   })
 
-  test('an empty source is refused in sync mode with the sentence, and is a harmless no-op in copy mode', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('an empty source is refused in sync mode with the sentence, and is a harmless no-op in copy mode', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       await runJob(ctx, 'post', `${V1}/cloud/tasks`, taskBody({
         name: 'gtempty',
@@ -580,8 +558,8 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
     }
   })
 
-  test('a source on a configured-but-unmounted mount is refused, naming the mount', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a source on a configured-but-unmounted mount is refused, naming the mount', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // The boot-race shape the guard exists for: an fstab CIFS entry
       // configured to mount at boot (`nofail`, no `noauto`) that is not
@@ -611,8 +589,8 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
     }
   })
 
-  test('a wrong-password remote fails the run with rclone\'s error line, notifies, and shows as a cloud warning — a quiet success does not notify', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a wrong-password remote fails the run with rclone\'s error line, notifies, and shows as a cloud warning — a quiet success does not notify', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // First half: a SUCCESSFUL run of an `on-failure` task must emit no
       // notification at all. Counted over the daemon's own journal.
@@ -699,8 +677,8 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
     }
   })
 
-  test('a real timer fire produces the same history as a Run Now', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('a real timer fire produces the same history as a Run Now', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // A REAL fire, not `systemctl start`: an absolute OnCalendar a little
       // over a minute out, which systemd accepts and elapses once. That is the
@@ -753,8 +731,8 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
     }
   })
 
-  test('disable leaves the history note; delete removes the units and touches nothing at the destination; a referenced remote refuses to go', async ({ playwright, pveTicket }) => {
-    const ctx = await authedContext(playwright, pveTicket)
+  test('disable leaves the history note; delete removes the units and touches nothing at the destination; a referenced remote refuses to go', async ({ playwright }) => {
+    const ctx = await apiContext(playwright)
     try {
       // --- disable ------------------------------------------------------
       await runJob(ctx, 'put', `${V1}/cloud/tasks/gtcopy`, taskBody({

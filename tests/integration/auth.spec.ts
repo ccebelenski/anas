@@ -1,4 +1,4 @@
-import { expect, pveAuthState, test } from './fixtures/auth'
+import { apiContext, expect, test } from './fixtures/auth'
 import { GATEWAY_URL, PVE_URL } from './fixtures/pve-ui'
 
 const GATEWAY = GATEWAY_URL
@@ -32,11 +32,8 @@ test.describe('Authentication', () => {
     await context.dispose()
   })
 
-  test('the gateway accepts the PVE auth cookie', async ({ playwright, pveTicket }) => {
-    const context = await playwright.request.newContext({
-      ignoreHTTPSErrors: true,
-      storageState: pveAuthState(pveTicket),
-    })
+  test('the gateway accepts the PVE auth cookie', async ({ playwright }) => {
+    const context = await apiContext(playwright)
     const response = await context.get(`${GATEWAY}/api/health`)
     expect(response.status()).toBe(200)
     await context.dispose()
