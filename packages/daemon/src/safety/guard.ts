@@ -224,8 +224,13 @@ function scopeChangedMessage<O>(view: ObjectView<O>, confirmed: BoundId | undefi
  * Re-read the object and re-run every check of the spec against facts read
  * now. Throws {@link IdentityMismatchError} (gone or a different object) or
  * {@link GuardRefusalError} (state or scope changed, or a gate refused).
+ *
+ * Exported for a job that binds a SECOND spec (cr.43 step 5: the SMB verbs
+ * bind their ACL grant's spec beside the share's own): the job door runs the
+ * verb's spec, and the body re-runs the second spec's checks here before its
+ * first act.
  */
-async function reverify<O>(spec: GuardSpec<O>, confirmed: GuardBound): Promise<{ object: O, reads: GuardReads }> {
+export async function reverify<O>(spec: GuardSpec<O>, confirmed: GuardBound): Promise<{ object: O, reads: GuardReads }> {
   const view = spec.object
   const reads = new GuardReads()
   const object = await view.read(reads)

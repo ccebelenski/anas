@@ -4,16 +4,16 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { SelfServiceKeys } from '../parsers/smb-conf.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
-import type { AccessService, GrantShare } from '../services/access.js'
+import type { GuardPass, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
+import type { AccessObject, AccessService, GrantShare } from '../services/access.js'
 import { createHash } from 'node:crypto'
 import { rm, writeFile } from 'node:fs/promises'
 import { CreateSmbShareRequest, ShareName, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
 import { addMissingGrantParams, addShare, customVfsRefusal, getShare, hasCustomVfsObjects, hasShare, parseDoc, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
 import { parseSmbStatusJson, parseSmbStatusText } from '../parsers/smbstatus.js'
 import { confirmGate } from '../safety/gate.js'
-import { guardCheck, guardConfirm, guarded, GuardRefusalError, sendRefusal, smbShareClaim } from '../safety/guard.js'
-import { createAccessService } from '../services/access.js'
+import { guardCheck, guardConfirm, guarded, GuardRefusalError, reverify, sendRefusal, smbShareClaim } from '../safety/guard.js'
+import { createAccessService, SET_ACCESS_PRESENTATION_ONLY, signedAccessRequest } from '../services/access.js'
 import { ConfigConflictError, editConfig, readConfig } from '../services/config-writer.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
 import { probeSharePath, probeSharePaths, sharePathFields } from '../services/share-path.js'
@@ -89,24 +89,65 @@ export async function smbShareRoutes(
   }
 
   /**
-   * The grant's "apply to existing files" is the editor's recursive apply and
-   * carries the same 409 + X-Anas-Confirm-Code (ruling 2026-10-11), with the
-   * same headline and warnings for the share's path — asked AFTER every
-   * refusal, as on the editor's door: the grant is prepared first (the same
-   * gates, composition and plan the job runs), and when it would be refused or
-   * would do nothing there is nothing to confirm. The share is then created or
-   * updated as asked and the job result's `grant` carries the refusal sentence
-   * (the share-door contract: a grant refusal never refuses the share).
-   * `sent` = the 409 went out; otherwise `confirmed` says whether the recursive
-   * apply was confirmed (false when the grant will not run).
+   * A share grant bound (cr.43 step 5) to cr.37's revision-bound access spec:
+   * the plan the job will run is prepared HERE, the spec carries the ACL
+   * revision the composition read, the recursive confirm signs the whole
+   * normalised grant request plus that revision (guardConfirm's bound
+   * signature), and the job re-verifies it before its first write — a moved
+   * ACL fails the job STATE_CHANGED with no setfacl, chown or chmod argv run.
+   * The access spec's lock claims ride on the job beside the share's own.
    */
-  async function confirmRecursiveGrant(path: string, share: GrantShare, request: FastifyRequest, reply: FastifyReply): Promise<{ sent: true } | { sent: false, confirmed: boolean }> {
-    const prepared = await access.prepareShareGrant(path, share, true)
+  interface BoundGrant {
+    spec: GuardSpec<AccessObject>
+    pass: GuardPass<AccessObject>
+    /** The plan would rewrite the tree, and the recursive confirm passed. */
+    recursive: boolean
+  }
+
+  /**
+   * Bind the grant at the route: prepare it (the same gates, composition and
+   * plan the job runs) and pass it through the access spec's route door.
+   * The recursive confirm — when the plan rewrites the tree — is asked AFTER
+   * every refusal, as on the editor's door: a grant that would be refused or
+   * would do nothing has nothing to confirm. `sent` = the confirm's 409 went
+   * out. `bound` is null when the grant is NOT bound to a revision: it will
+   * not run (the preparation finished refused/nothing), or its door refused
+   * in the instant after the prepare — either way the job's own re-prepare
+   * carries that outcome on the share's result, because a grant refusal
+   * never refuses the share (the share-door contract, access.1).
+   */
+  async function bindGrant(
+    path: string,
+    share: GrantShare,
+    applyToExisting: boolean,
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<{ sent: true } | { bound: BoundGrant | null }> {
+    const prepared = await access.prepareShareGrant(path, share, applyToExisting)
     if ('done' in prepared)
-      return { sent: false, confirmed: false }
-    if (!confirmGate(confirmStore, request, reply, await access.recursiveConfirm(prepared.plan.target, { named: prepared.plan.hasNamed })))
-      return { sent: true }
-    return { sent: false, confirmed: true }
+      return { bound: null }
+    const spec = access.setAccessGuardSpec({
+      what: `Share path '${path}'`,
+      address: { path },
+      req: prepared.plan.req,
+      resolve: async () => ({ ok: true, value: await access.resolveShareTarget(path) }),
+    })
+    const pass = await guardCheck(spec)
+    if ('refusal' in pass)
+      return { bound: null }
+    if (prepared.plan.recursive) {
+      const confirm = await access.recursiveConfirm(prepared.plan.target, { named: prepared.plan.hasNamed })
+      if (!guardConfirm(confirmStore, request, reply, spec, pass, {
+        validated: { path, ...signedAccessRequest(prepared.plan.req) },
+        address: ['path'],
+        presentationOnly: SET_ACCESS_PRESENTATION_ONLY,
+        message: confirm.message,
+        warnings: confirm.warnings,
+      })) {
+        return { sent: true }
+      }
+    }
+    return { bound: { spec, pass, recursive: prepared.plan.recursive } }
   }
 
   /** Read smb.conf fresh every time — the file is the source of truth (P.11). */
@@ -562,13 +603,16 @@ export async function smbShareRoutes(
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
 
-    // The stanza's defaults are the ones `addShare` writes (DESIGN 5d).
-    let recursiveConfirmed = false
-    if (req.grantAccess?.applyToExisting === true) {
-      const gate = await confirmRecursiveGrant(req.path, { validUsers: req.validUsers ?? [], guestOk: req.guestOk ?? false, readOnly: req.readOnly ?? false }, request, reply)
-      if (gate.sent)
+    // cr.43 step 5: the grant is prepared here and bound to its ACL revision
+    // (cr.37's spec); the recursive confirm signs it. A grant that will not
+    // run, or whose door refused just now, stays unbound and the job's own
+    // re-prepare reports it on the result.
+    let grantBinding: BoundGrant | null = null
+    if (req.grantAccess) {
+      const gate = await bindGrant(req.path, { validUsers: req.validUsers ?? [], guestOk: req.guestOk ?? false, readOnly: req.readOnly ?? false }, req.grantAccess.applyToExisting === true, request, reply)
+      if ('sent' in gate)
         return reply
-      recursiveConfirmed = gate.confirmed
+      grantBinding = gate.bound
     }
 
     const job = jobQueue.submit(
@@ -578,6 +622,12 @@ export async function smbShareRoutes(
       // share's lock — a stanza that appeared while the create waited arrives
       // as CONFLICT, before a line of smb.conf moves.
       guarded(spec, pre, async (_share, { updateProgress }) => {
+        // cr.43 step 5: the grant's revision is re-verified FIRST — an ACL
+        // that moved while this job waited fails STATE_CHANGED before a line
+        // of smb.conf is written and before any setfacl, chown or chmod argv
+        // runs ("nothing was done" means nothing).
+        if (grantBinding)
+          await reverify(grantBinding.spec, grantBinding.pass.bound)
         try {
           await applySelfServiceAndEdit(
             req.name,
@@ -603,13 +653,15 @@ export async function smbShareRoutes(
         if (req.grantAccess) {
           const created = getShare(await readSmbConf(), req.name)
           const grant = created
-            ? await grantFor(created, req.grantAccess, updateProgress, recursiveConfirmed)
+            ? await grantFor(created, req.grantAccess, updateProgress, grantBinding?.recursive === true)
             : { status: 'failed' as const, message: `SMB share '${req.name}' could not be read back after the write`, path: req.path, granted: [], skipped: [], applyToExisting: req.grantAccess.applyToExisting === true }
           return { created: req.name, grant }
         }
         return { created: req.name }
       }),
-      { locks: pre.locks },
+      // The share's lock still covers the whole job; the bound grant's access
+      // claims (the dataset, its ancestors, the pool — cr.33) ride along.
+      { locks: [...pre.locks, ...(grantBinding?.pass.locks ?? [])] },
     )
 
     reply.code(202)
@@ -659,16 +711,19 @@ export async function smbShareRoutes(
       return reply
 
     // The edit's fields laid over the stanza: what the grant will answer to.
-    let recursiveConfirmed = false
-    if (req.grantAccess?.applyToExisting === true && currentShare) {
-      const gate = await confirmRecursiveGrant(req.path ?? currentShare.path, {
+    // cr.43 step 5: the grant is bound whenever it will RUN — the same rule
+    // the job applies, and the stanza's revision is bound to the share's own
+    // door, so the before/after the job compares are the ones predicted here.
+    let grantBinding: BoundGrant | null = null
+    if (req.grantAccess && currentShare && editRunsGrant(req.grantAccess, currentShare, getShare(updateShare(text, name, req), name))) {
+      const gate = await bindGrant(req.path ?? currentShare.path, {
         validUsers: req.validUsers ?? currentShare.validUsers,
         guestOk: req.guestOk ?? currentShare.guestOk,
         readOnly: req.readOnly ?? currentShare.readOnly,
-      }, request, reply)
-      if (gate.sent)
+      }, req.grantAccess.applyToExisting === true, request, reply)
+      if ('sent' in gate)
         return reply
-      recursiveConfirmed = gate.confirmed
+      grantBinding = gate.bound
     }
 
     const job = jobQueue.submit(
@@ -678,6 +733,12 @@ export async function smbShareRoutes(
       // here, and the whole job holds the share's lock — a hand edit while the
       // job waited arrives as STATE_CHANGED, a vanished stanza as NOT_FOUND.
       guarded(spec, pre, async (_share, { updateProgress }) => {
+        // cr.43 step 5: the grant's revision is re-verified FIRST — an ACL
+        // that moved while this job waited fails STATE_CHANGED before a line
+        // of smb.conf is written and before any setfacl, chown or chmod argv
+        // runs ("nothing was done" means nothing).
+        if (grantBinding)
+          await reverify(grantBinding.spec, grantBinding.pass.bound)
         // access.1: the stanza BEFORE the edit, so the grant runs only when
         // something it answers to actually changed.
         const before = req.grantAccess ? getShare(await readSmbConf(), name) : null
@@ -716,11 +777,13 @@ export async function smbShareRoutes(
           // An explicit "apply to existing files" is its own reason to run.
           if (!editRunsGrant(req.grantAccess, before, after))
             return { updated: name, grant: { status: 'nothing' as const, path: after.path, granted: [], skipped: [], applyToExisting: false } }
-          return { updated: name, grant: await grantFor(after, req.grantAccess, updateProgress, recursiveConfirmed) }
+          return { updated: name, grant: await grantFor(after, req.grantAccess, updateProgress, grantBinding?.recursive === true) }
         }
         return { updated: name }
       }),
-      { locks: pre.locks },
+      // The share's lock still covers the whole job; the bound grant's access
+      // claims (the dataset, its ancestors, the pool — cr.33) ride along.
+      { locks: [...pre.locks, ...(grantBinding?.pass.locks ?? [])] },
     )
 
     reply.code(202)

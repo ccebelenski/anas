@@ -35,6 +35,20 @@ const fixture = (rel: string): string => readFileSync(join(FIXTURES, rel), 'utf-
 
 const SYSTEMCTL = '/usr/bin/systemctl'
 const TESTPARM = '/usr/bin/testparm'
+const GETFACL = '/usr/bin/getfacl'
+const STAT = '/usr/bin/stat'
+
+const WRITERS = new Set(['/usr/bin/setfacl', '/usr/bin/chmod', '/usr/bin/chown', '/usr/bin/find'])
+
+/** The paths the grant tests aim at: a create's target and `[backups]`'s own. */
+const PHOTOS_DIR = '/tank/photos'
+const BACKUPS_DIR = '/tank/backups'
+
+/** The live ACL of the grant directories (acl/NOTES.md), before and after an entry lands. */
+const ACL_NO_NAMED = fixture('acl/getfacl-pcE-dir-no-named.txt')
+const ACL_NAMED_USER = fixture('acl/getfacl-pcE-dir-named-user.txt')
+
+const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
 
 const SMB = 'media'
 const SMB_NOT_FOUND = `SMB share '${SMB}' not found`
@@ -61,13 +75,20 @@ function isMutation(c: { command: string, args: string[] }): boolean {
   return c.command === SYSTEMCTL
 }
 
-const ENV_KEYS = ['SMB_CONF_PATH', 'ANAS_FSTAB_PATH', 'ANAS_SYSTEMD_DIR'] as const
+/** A call that would mean the grant wrote a permission (cr.43 step 5). */
+function isWrite(c: { command: string, args: string[] }): boolean {
+  return WRITERS.has(c.command)
+}
+
+const ENV_KEYS = ['SMB_CONF_PATH', 'ANAS_FSTAB_PATH', 'ANAS_SYSTEMD_DIR', 'ANAS_STORAGE_CFG'] as const
 
 describe('cr.43 — SMB share verbs re-gate in the job (ruling (j))', () => {
   let dir: string
   let paths: { smb: string, fstab: string, systemd: string }
   let server: ReturnType<typeof createServer> | undefined
   let calls: { command: string, args: string[] }[] = []
+  /** The live ACL of the grant directories; a race test flips it. */
+  let acl = ACL_NO_NAMED
   /** A command that does not return until the test releases it. */
   const paused = new Map<string, Promise<void>>()
   const saved: Partial<Record<typeof ENV_KEYS[number], string | undefined>> = {}
@@ -94,17 +115,26 @@ describe('cr.43 — SMB share verbs re-gate in the job (ruling (j))', () => {
   /** The dev mock over a private copy of the capture; commands can pause. */
   async function serve(smbConf = SMB_CONF): Promise<void> {
     paused.clear()
+    acl = ACL_NO_NAMED
     await writeFile(paths.smb, smbConf)
     await mkdir(paths.systemd, { recursive: true })
     process.env.SMB_CONF_PATH = paths.smb
     process.env.ANAS_FSTAB_PATH = paths.fstab
     process.env.ANAS_SYSTEMD_DIR = paths.systemd
+    // Hermetic: a node without PVE storage (cr.32 review) — the grant's path
+    // gates read storage.cfg, and the answer must never come from this host.
+    process.env.ANAS_STORAGE_CFG = join(dir, 'storage.cfg')
     server = createServer({ mock: true, logger: false })
     const mock = (server as unknown as { executor: { exec: (c: string, a: string[], o?: unknown) => Promise<ExecResult> } }).executor
     const orig = mock.exec.bind(mock)
     calls = []
     mock.exec = async (command, args, opts) => {
       calls.push({ command, args })
+      // cr.43 step 5: the grant directories answer with the live capture.
+      if (command === GETFACL && args[0] === '-pcE' && (args[1] === PHOTOS_DIR || args[1] === BACKUPS_DIR))
+        return ok(acl)
+      if (command === STAT && (args[2] === PHOTOS_DIR || args[2] === BACKUPS_DIR))
+        return ok('root root 755\n')
       const hold = paused.get(command)
       if (hold)
         await hold
@@ -330,5 +360,82 @@ describe('cr.43 — SMB share verbs re-gate in the job (ruling (j))', () => {
     assert.equal(text.split(/\[photos\]/i).length - 1, 1, 'exactly one [photos] stanza in smb.conf')
     assert.ok(!text.includes('/tank/photos2'), 'the refused add wrote no line of its own')
     assert.deepEqual(queue().heldLocks(), [])
+  })
+
+  // -------------------------------------------------------------------------
+  // cr.43 step 5: the create/edit grant rides the revision-bound access spec
+  // (cr.37) — an ACL that moves while the job waits fails STATE_CHANGED
+  // before any setfacl, chown or chmod argv runs
+  //
+  // Guest grants (no valid users) so the composition needs no name
+  // resolution: the entry the plan restates is Everyone. The live ACL is
+  // `acl/getfacl-pcE-dir-no-named.txt` at the bind and
+  // `acl/getfacl-pcE-dir-named-user.txt` once an entry landed — two real
+  // captures of one directory before and after `setfacl -m u:nobody:r-x`.
+  // -------------------------------------------------------------------------
+
+  it('control: a held create with a guest grant runs the grant when nothing moved — the harness binds without refusing on its own', async () => {
+    await serve()
+    const { id, release } = await acceptedBehindFullQueue(create({ name: 'photos', path: PHOTOS_DIR, guestOk: true, grantAccess: {} }))
+    release()
+    const job = await finished(id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const grant = (job.result as { grant?: { status: string, message?: string } }).grant
+    assert.equal(grant?.status, 'applied', grant?.message)
+    assert.ok(calls.some(isWrite), 'the grant wrote the folder permissions')
+    assert.ok((await readFile(paths.smb, 'utf8')).includes('[photos]'), 'the share was created')
+  })
+
+  it('a create whose ACL gains an entry while it waits fails STATE_CHANGED — no write argv, no stanza, no reload', async () => {
+    await serve()
+    const { id, release } = await acceptedBehindFullQueue(create({ name: 'photos', path: PHOTOS_DIR, guestOk: true, grantAccess: {} }))
+    // Someone else's `setfacl -m u:nobody:r-x` lands while the job waits.
+    acl = ACL_NAMED_USER
+    release()
+    const job = await finished(id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'STATE_CHANGED', JSON.stringify(job.error))
+    assert.equal(job.error?.message, `Share path '${PHOTOS_DIR}' changed since you confirmed — nothing was done; reload and confirm again`)
+    // The grant's plan restated an ACL that no longer matches — no setfacl,
+    // chmod, chown or find argv ran, and the job door stopped the share too.
+    assert.deepEqual(calls.filter(isWrite), [], 'no setfacl, chmod, chown or find ran')
+    assert.deepEqual(calls.filter(isMutation), [], 'smbd never reloaded')
+    assert.equal(await readFile(paths.smb, 'utf8'), SMB_CONF, 'no [photos] stanza was written')
+  })
+
+  it('an edit whose ACL gains an entry while it waits fails STATE_CHANGED — the stanza keeps its bytes, nothing written', async () => {
+    await serve()
+    // `[backups]` has no valid users, so the guest toggle composes a grant,
+    // and the guest change is what makes the edit run it (editRunsGrant).
+    const { id, release } = await acceptedBehindFullQueue(update('backups', { guestOk: true, grantAccess: {} }))
+    acl = ACL_NAMED_USER
+    release()
+    const job = await finished(id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'STATE_CHANGED', JSON.stringify(job.error))
+    assert.equal(job.error?.message, `Share path '${BACKUPS_DIR}' changed since you confirmed — nothing was done; reload and confirm again`)
+    assert.deepEqual(calls.filter(isWrite), [], 'no setfacl, chmod, chown or find ran')
+    assert.deepEqual(calls.filter(isMutation), [], 'smbd never reloaded')
+    assert.equal(await readFile(paths.smb, 'utf8'), SMB_CONF, 'the [backups] stanza keeps its bytes — no guest line either')
+  })
+
+  it('recursive: the grant confirm signs the composed grant — a resent edit of the entries is CONFIRM_SCOPE_CHANGED naming them', async () => {
+    await serve()
+    const body = { name: 'photos', path: PHOTOS_DIR, guestOk: true, grantAccess: { applyToExisting: true } }
+    const first = await send(create(body))
+    assert.equal(first.statusCode, 409, first.body)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    assert.equal(first.json().error.message, `Applying to existing files rewrites the permissions of every file and directory under '${PHOTOS_DIR}'`)
+    assert.ok(first.headers['x-anas-confirm-code'], 'the 409 carries X-Anas-Confirm-Code')
+    assert.deepEqual(calls.filter(isWrite), [], 'nothing behind the challenge')
+    // The same door, a DIFFERENT composed grant: a read-only share asks
+    // Everyone read, not Everyone read-write. The signature covers the
+    // composed entries, so the old code never rides it.
+    const res = await send(create({ ...body, readOnly: true }), first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.deepEqual(res.json().error.changed, ['entries'])
+    assert.deepEqual(calls.filter(isWrite), [], 'nothing was written for the scope-changed resend')
+    assert.equal(await readFile(paths.smb, 'utf8'), SMB_CONF, 'no share was created behind the refused confirm')
   })
 })
