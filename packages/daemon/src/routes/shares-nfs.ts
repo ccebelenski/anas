@@ -231,7 +231,13 @@ export async function nfsExportRoutes(
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid create export request: ${bodyParsed.error.issues[0]?.message}` } }
     }
-    const exp = bodyParsed.data
+    // cr.36r: the export path is canonicalised ONCE at the door with the lock
+    // key's own normaliser (mirroring 0ef1284e): `/srv//x` and `/srv/x` are one
+    // directory, so the PVE-territory claim, the exists-gate, the last-moment
+    // backstop, the lock key and the written exports line all carry one
+    // spelling — `/srv//x` can no longer slip past the `l.path === path`
+    // compare and write a second line for a directory already exported.
+    const exp = { ...bodyParsed.data, path: normalizeMountpointPath(bodyParsed.data.path) }
 
     const identity = requireIdentity(request, reply)
     if (!identity)

@@ -281,6 +281,23 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     assert.ok(!call.args.some(a => a.includes('token-secret-value')))
   })
 
+  // cr.36r: the destination is canonicalised ONCE at the door, so the probe,
+  // the confirm signature and the restore argv all carry one spelling.
+  it('`/gtbackup//elsewhere/` restores to `/gtbackup/elsewhere` — the argv carries the canonical spelling', async () => {
+    // The fixtures answer for the CANONICAL directory only (seeded default):
+    // the raw spelling reaching any probe would miss and fail the job.
+    seedHappyPath()
+    const res = await post(body({ target: { mode: 'newLocation', path: '/gtbackup//elsewhere/' } }))
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
+    assert.equal(job.status, 'completed')
+    const result = job.result as BackupFilesRestoreResult
+    assert.equal(result.target, NEWLOC, 'the job result names the canonical directory')
+    const call = mockOf(server).calls.find(c => c.command === PBC && c.args[0] === 'restore')!
+    assert.equal(call.args[3], NEWLOC)
+    assert.ok(!call.args.some(a => a.includes('//')), 'no doubled slash reaches the client argv')
+  })
+
   it('an EXISTING newLocation directory earns a 409 confirm code — not a plain refusal', async () => {
     // Ruling 2026-08-29: restoring into a directory the operator already has
     // is legitimate — it overwrites live data, so it earns the same gate as an
@@ -489,6 +506,18 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     assert.match((res.json() as { error: { message: string } }).error.message, /belongs to Proxmox/)
     assert.equal(restoreRan(), false)
     // Not a confirm-gated refusal: PVE territory has no override.
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+  })
+
+  // cr.36r: the destination is canonicalised ONCE at the door, so the
+  // territory check sees one spelling. The old trailing-slash-only strip let
+  // `/mnt//pve/…` slip past the `startsWith` in isPathWithin — one directory,
+  // two answers.
+  it('the `/mnt//pve/backups` spelling of a PVE-territory target is refused too, and nothing ran', async () => {
+    const res = await post(body({ task: undefined, target: { mode: 'inPlace', path: '/mnt//pve/backups' } }))
+    assert.equal(res.statusCode, 409)
+    assert.match((res.json() as { error: { message: string } }).error.message, /belongs to Proxmox/)
+    assert.equal(restoreRan(), false)
     assert.equal(res.headers['x-anas-confirm-code'], undefined)
   })
 

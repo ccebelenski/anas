@@ -49,7 +49,6 @@ const PART_BY_ID_RE = /-part\d+$/
 /** `/dev/sdb1`, `/dev/nvme0n1p2` — a leaf ZFS named by its kernel device. */
 const KERNEL_DEV_PATH_RE = /^\/dev\/([a-z0-9]+)$/
 const TRAILING_CR_RE = /\r$/
-const TRAILING_SLASHES_RE = /\/+$/
 /** ZFS vdev names (raidz1-0, mirror-0, …) — charset guard for raidz-expand. */
 const VDEV_NAME_RE = /^[\w-]+$/
 /**
@@ -1011,8 +1010,17 @@ export async function poolRoutes(
     const status = statusResult.exitCode === 0
       ? parseZpoolStatusPool(statusResult.stdout, poolName)
       : null
-    if (!status)
-      return { refusal: { status: 404, code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    // cr.36r: a status that FAILS is not "pool not found" — a truly-absent
+    // pool is 404'd by the object view (the `zpool list` read) before this
+    // lookup ever runs. Reaching here means the pool is in `zpool list` but
+    // its own status could not be read: fail CLOSED with a 409, exactly as
+    // lookupLeaf answers (vdevs.2), never a 404 that reads like a typo.
+    if (!status) {
+      const detail = statusResult.exitCode === 0
+        ? 'zpool status no longer reports the pool'
+        : statusResult.stderr.trim() || `zpool status exited with code ${statusResult.exitCode}`
+      return { refusal: { status: 409, code: 'CONFLICT', reason: 'unreadable', message: `pool ${poolName}'s status could not be read (${detail}); refusing to remove a vdev it cannot identify` } }
+    }
     const lookup = resolveVdev(status, requested)
     if (!lookup)
       return { refusal: { status: 400, code: 'VALIDATION_ERROR', message: unknownVdevMessage(poolName, requested) } }
@@ -1039,8 +1047,16 @@ export async function poolRoutes(
         poolReads.zfsVersion(reads),
       ])
       const status = statusResult.exitCode === 0 ? parseZpoolStatusPool(statusResult.stdout, poolName) : null
-      if (!status)
-        return { status: 404, code: 'NOT_FOUND', message: `Pool '${poolName}' not found` }
+      // cr.36r: a status that FAILS is not "pool not found" — the object
+      // view already 404'd a truly-absent pool. Here the pool IS in `zpool
+      // list` but its status could not be read: a 409 CONFLICT, as
+      // lookupLeaf answers, never a 404 that invites a retry of the name.
+      if (!status) {
+        const detail = statusResult.exitCode === 0
+          ? 'zpool status no longer reports the pool'
+          : statusResult.stderr.trim() || `zpool status exited with code ${statusResult.exitCode}`
+        return { status: 409, code: 'CONFLICT', reason: 'unreadable', message: `pool ${poolName}'s status could not be read (${detail}); refusing to expand a vdev it cannot identify` }
+      }
 
       // The target must be an existing raidz DATA vdev.
       const dataGroup = status.vdevGroups.find(g => g.role === 'data')
@@ -1714,9 +1730,13 @@ export async function poolRoutes(
     if (!identity)
       return
 
+    // The mountpoint is canonicalised ONCE at the door with the lock key's own
+    // normaliser (cr.36r, mirroring 0ef1284e): `/mnt//x` and `/mnt/x` are one
+    // directory, so the reserved check, every collision gate, the confirm
+    // signature, the lock key and the `zfs set` argv all carry one spelling.
+    const mp = normalizeMountpointPath(bodyParsed.data.mountpoint)
     // Request-only (WAVE3-DESIGN §3.2: about the value typed, not the pool):
     // /mnt/pve belongs to PVE (story 3.25) and / is no pool's mountpoint.
-    const mp = bodyParsed.data.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
     if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${bodyParsed.data.mountpoint}' is reserved — /mnt/pve belongs to PVE (story 3.25) and / is not a pool mountpoint` } }
@@ -1824,12 +1844,17 @@ export async function poolRoutes(
     // §3.2): never in PVE's namespace, never `/`. `-m` is passed verbatim to
     // `zpool create`; ZFS owns the mount. (AbsolutePath already refused
     // relative paths and `legacy`/`none` at parse — this is the mounted-pool
-    // flow only.) The path is normalised BEFORE the guard and the confirm see it.
+    // flow only.) The path is canonicalised ONCE here with the lock key's own
+    // normaliser (cr.36r, mirroring 0ef1284e) — the reserved check, the
+    // collision gates, the confirm signature, the lock key and the `-m` argv
+    // all carry the one spelling, so `/mnt//x` never slips past a check that
+    // `/mnt/x` would fail.
     if (req.mountpoint !== undefined) {
-      const mp = req.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
+      const raw = req.mountpoint
+      const mp = normalizeMountpointPath(raw)
       if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
         reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${req.mountpoint}' is reserved — /mnt/pve belongs to PVE (story 3.25) and / is not a pool mountpoint` } }
+        return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${raw}' is reserved — /mnt/pve belongs to PVE (story 3.25) and / is not a pool mountpoint` } }
       }
       req.mountpoint = mp
     }

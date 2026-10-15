@@ -167,6 +167,40 @@ describe('nfs export routes', () => {
       assert.equal(res.json().error.code, 'CONFLICT')
     })
 
+    // cr.36r: the path is canonicalised ONCE at the door (the lock key's own
+    // normaliser), so the exists-gate, the PVE-territory claim, the lock and
+    // the written line all see one spelling.
+    it('the `/srv//nfs/media` spelling of an exported directory meets the 409 — the file keeps its bytes', async () => {
+      const before = await readFile(exportsPath, 'utf8')
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/shares/nfs',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ path: '/srv//nfs/media', clients: [{ spec: '*', options: ['rw'] }] }),
+      })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.json().error.code, 'CONFLICT')
+      // The refusal names the directory as the file spells it, not the raw body.
+      assert.equal(res.json().error.message, `Export '/srv/nfs/media' already exists`)
+      assert.equal(await readFile(exportsPath, 'utf8'), before, 'no second line for a directory already exported')
+    })
+
+    it('the written exports line carries the canonical spelling — `/srv//nfs/new/` lands as `/srv/nfs/new`', async () => {
+      const before = await readFile(exportsPath, 'utf8')
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/shares/nfs',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ path: '/srv//nfs/new/', clients: [{ spec: '10.1.0.0/16', options: ['rw', 'sync'] }] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      const after = await readFile(exportsPath, 'utf8')
+      assert.ok(after.startsWith(before), 'existing lines preserved verbatim')
+      assert.equal(after.slice(before.length), '/srv/nfs/new 10.1.0.0/16(rw,sync)\n')
+    })
+
     it('rejects an export with no clients (schema min 1)', async () => {
       const res = await server!.inject({
         method: 'POST',

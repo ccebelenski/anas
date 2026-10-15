@@ -148,6 +148,45 @@ describe('create pool: mountpoint override (3.27)', () => {
     assert.equal(res.json().error.code, 'CONFLICT')
     assert.equal(createCall(calls), undefined)
   })
+
+  // cr.36r: the mountpoint is canonicalised once at the door (the lock key's
+  // own normaliser), so every check below it sees one spelling.
+  it('rejects the `/mnt//pve` spelling of the reserved namespace with 400 — never creates', async () => {
+    server = createServer({ mock: true, logger: false })
+    // Composable disks: the ONLY thing that may refuse this request is the
+    // reserved check (without the inventory stub the disk gate 400s for a
+    // different reason and masks it).
+    serveBlankInventoryDisks(server, DISK_IDS)
+    const calls = spyExecutor(server)
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ name: 'newpool', dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }], mountpoint: '/mnt//pve' }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res.json().error.message, /reserved/)
+    assert.equal(createCall(calls), undefined)
+  })
+
+  it('`-m` carries the canonical spelling — `/srv//tank/` reaches zpool create as `/srv/tank`', async () => {
+    server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, DISK_IDS)
+    const calls = spyExecutor(server)
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ name: 'newpool', dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }], mountpoint: '/srv//tank/' }),
+    })
+    assert.equal(res.statusCode, 202)
+    await waitForJob(server, (res.json() as JobAccepted).job.id)
+    const args = createCall(calls)!
+    const mIdx = args.indexOf('-m')
+    assert.ok(mIdx >= 0, '-m passed')
+    assert.equal(args[mIdx + 1], '/srv/tank')
+  })
 })
 
 // --- Change mountpoint (PUT /v1/pools/:name/mountpoint) --------------------
@@ -192,6 +231,59 @@ describe('change pool mountpoint: PUT /v1/pools/:name/mountpoint (3.27)', () => 
     })
     assert.equal(res.statusCode, 400)
     assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+  })
+
+  // cr.36r: the mountpoint is canonicalised once at the door (the lock key's
+  // own normaliser), so every check below it sees one spelling.
+  it('400 for the `/mnt//pve` spelling of the reserved namespace', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/pools/testpool/mountpoint',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ mountpoint: '/mnt//pve' }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res.json().error.message, /reserved/)
+  })
+
+  it('`/mnt/anas-ahr//ahr0` meets the live mount at `/mnt/anas-ahr/ahr0` — 409, never a zfs set', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = spyExecutor(server)
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/pools/testpool/mountpoint',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ mountpoint: '/mnt/anas-ahr//ahr0' }),
+    })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.ok(!calls.some(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'set'), 'never runs zfs set')
+  })
+
+  it('the `zfs set` argv carries the canonical spelling — `/srv//newhome/` moves the pool to `/srv/newhome`', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = spyExecutor(server)
+    const first = await server.inject({
+      method: 'PUT',
+      url: '/v1/pools/testpool/mountpoint',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ mountpoint: '/srv//newhome/' }),
+    })
+    assert.equal(first.statusCode, 409)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    const second = await server.inject({
+      method: 'PUT',
+      url: '/v1/pools/testpool/mountpoint',
+      headers: { ...JSON_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string },
+      payload: JSON.stringify({ mountpoint: '/srv//newhome/' }),
+    })
+    assert.equal(second.statusCode, 202)
+    const job = await waitForJob(server, (second.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed')
+    const setCall = calls.find(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'set')
+    assert.deepEqual(setCall?.args, ['set', '--', 'mountpoint=/srv/newhome', 'testpool'])
   })
 
   it('400 when the target equals the pool current mountpoint', async () => {

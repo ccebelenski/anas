@@ -140,6 +140,7 @@ import {
 import { classifyBacking } from '../services/iscsi-ownership.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from '../services/iscsi.js'
+import { normalizeMountpointPath } from '../services/mounts.js'
 import { imageArchiveScan, NESTED_SCAN_PREVIEW_TIMEOUT_S, scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
 import { readSourceGuardFacts, unmountedMountFor } from '../services/source-guard.js'
 import { requireIdentity } from './identity.js'
@@ -209,9 +210,6 @@ export interface BackupRouteOptions {
    */
   fstabPath?: string
 }
-
-/** Trailing slashes on a restore target (the root survives as `/`). */
-const RESTORE_TRAILING_SLASHES_RE = /\/+$/
 
 /**
  * What cancelling a backup run leaves behind — the confirm dialog's
@@ -2341,7 +2339,12 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       }
     }
 
-    const target = home.replace(RESTORE_TRAILING_SLASHES_RE, '') || '/'
+    // cr.36r: the destination is canonicalised ONCE here with the normaliser
+    // the mount routes use (mirroring 0ef1284e), so the PVE-territory check,
+    // the held-by-LUN claim, the path probe, the confirm signature and the
+    // write all see one spelling — `/mnt//pve/x` is `/mnt/pve/x` and cannot
+    // slip past the territory refusal on a trailing-slash-only strip.
+    const target = normalizeMountpointPath(home)
 
     // --- Pre-flight 1: whose storage is this? --------------------------------
     // Two hard refusals with no override.

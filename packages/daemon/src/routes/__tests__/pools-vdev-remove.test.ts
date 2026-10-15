@@ -266,6 +266,22 @@ describe('remove-vdev endpoint: POST /v1/pools/:name/vdevs/remove', () => {
     assert.equal(removeCall(server), undefined)
   })
 
+  it('an unreadable zpool status is 409 CONFLICT "could not be read" — never a 404 that reads as no such pool (cr.36 review)', async () => {
+    server = serverForPool('testpool', mockFixtures.zpoolList(), [{ stdout: '', stderr: 'cannot open pool: I/O error', exitCode: 1 }])
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/vdevs/remove',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ vdev: 'sdc' }),
+    })
+
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.match(res.json().error.message, /status could not be read \(cannot open pool: I\/O error\)/)
+    assert.equal(removeCall(server), undefined)
+  })
+
   it('refuses the synthetic cache CONTAINER name — the leaf is the removable unit', async () => {
     server = serverWith([withCache()])
 
