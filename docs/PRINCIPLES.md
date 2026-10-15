@@ -34,7 +34,7 @@ This runs on Proxmox hosts that are already doing real work. Minimal memory foot
 
 ## 8. Single-package deployment
 
-The entire system ships as one release tarball. Copy it to the node and run `./install.sh` — it installs the code, the systemd units, the permissions, and the PVE UI integration. The install experience is simple and repeatable. We do not introduce build steps, external binaries, platform-specific compilation, or dedicated service users into the deployment path.
+The entire system ships as one release tarball. Copy it to the node and run `./install.sh` — it installs the code, the systemd units, the permissions, and the PVE UI integration. The install experience is simple and repeatable. We do not introduce build steps, platform-specific compilation, or dedicated service users into the deployment path, and ANAS ships no binaries of its own. It builds no undifferentiated code: it drives the standard Linux and PVE tooling (ZFS, mdadm, LVM, btrfs, Samba, NFS, LIO, rclone, systemd), installed from the node's package repositories by `install.sh`, and anything it needs beyond that is an exception that gets scrutinized and named in the installer (today: Node.js from NodeSource, ANAS's own runtime). What ANAS writes is that tooling's own configuration, so the system keeps working if ANAS is removed. *(Wording clarified by the operator 2026-10-14; it replaced "no external binaries", which read as refusing the tools ANAS drives.)*
 
 ## 9. Unix socket, not TCP, for internal IPC
 
