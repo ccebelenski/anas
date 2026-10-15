@@ -158,6 +158,7 @@ export {
   Privilege,
   PrivilegeList,
   PRIVILEGES,
+  privilegeSatisfied,
   RequestHeaders,
 } from './schemas/api.js'
 // Backup schemas (Epic 16 — PBS file backup)

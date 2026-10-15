@@ -1,4 +1,5 @@
 import type { AuthUser, Privilege } from './types.js'
+import { privilegeSatisfied } from '@anas/shared'
 
 /**
  * The one rule (EPICS §2 "Authorization follows PVE"; docs/WAVE2-DESIGN.md A3):
@@ -22,5 +23,5 @@ export { forbiddenMessage } from '@anas/shared'
 /** The privilege `user` lacks for `method`, or undefined when it may proceed. */
 export function missingPrivilege(user: AuthUser, method: string): Privilege | undefined {
   const need = requiredPrivilege(method)
-  return user.privileges.includes(need) ? undefined : need
+  return privilegeSatisfied(user.privileges, need) ? undefined : need
 }

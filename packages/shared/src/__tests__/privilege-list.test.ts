@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { forbiddenMessage, PrivilegeList, RequestHeaders } from '../schemas/api.js'
+import { forbiddenMessage, PrivilegeList, privilegeSatisfied, RequestHeaders } from '../schemas/api.js'
 
 /**
  * cr.28: `x-anas-privileges` is part of the request identity the daemon
@@ -49,5 +49,15 @@ describe('forbiddenMessage', () => {
       forbiddenMessage('anas-audit@pve', 'Sys.Modify'),
       'Permission check failed (/, Sys.Modify): anas-audit@pve does not have it. ANAS asks the privilege PVE asks for its own disk and ZFS operations.',
     )
+  })
+})
+
+describe('privilegeSatisfied — ANAS tiers the two privileges (operator 2026-10-15)', () => {
+  it('Sys.Modify covers a Sys.Audit read; Sys.Audit never covers Sys.Modify; nothing covers anything', () => {
+    assert.equal(privilegeSatisfied(['Sys.Audit'], 'Sys.Audit'), true)
+    assert.equal(privilegeSatisfied(['Sys.Modify'], 'Sys.Audit'), true)
+    assert.equal(privilegeSatisfied(['Sys.Modify'], 'Sys.Modify'), true)
+    assert.equal(privilegeSatisfied(['Sys.Audit'], 'Sys.Modify'), false)
+    assert.equal(privilegeSatisfied([], 'Sys.Audit'), false)
   })
 })

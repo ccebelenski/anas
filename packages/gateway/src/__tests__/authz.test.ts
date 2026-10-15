@@ -336,12 +336,14 @@ describe('the gateway with the pve provider (end to end)', () => {
     await s.close()
   })
 
-  it('the rule reads the privilege the method needs, not "any": Sys.Modify alone may POST but not GET', async () => {
+  it('the privileges are tiered by ANAS (operator 2026-10-15): Sys.Modify alone may POST AND GET; Sys.Audit alone may GET but not POST', async () => {
     const s = gateway()
     let res = await s.inject({ method: 'POST', url: SCRUB, headers: { 'x-anas-auth': sign('odd@pve', ['Sys.Modify'], 'POST', SCRUB) } })
     assert.equal(res.statusCode, 200)
     res = await s.inject({ method: 'GET', url: POOLS, headers: { 'x-anas-auth': sign('odd@pve', ['Sys.Modify'], 'GET', POOLS) } })
-    assert.equal(res.statusCode, 403)
+    assert.equal(res.statusCode, 200, 'the higher privilege covers a read')
+    res = await s.inject({ method: 'POST', url: SCRUB, headers: { 'x-anas-auth': sign('reader@pve', ['Sys.Audit'], 'POST', SCRUB) } })
+    assert.equal(res.statusCode, 403, 'the lower privilege never covers a change')
     await s.close()
   })
 

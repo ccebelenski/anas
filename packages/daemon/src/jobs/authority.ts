@@ -1,7 +1,7 @@
 import type { Privilege } from '@anas/shared'
 import type { JobSubmitter } from './queue.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { forbiddenMessage, RequestHeaders } from '@anas/shared'
+import { forbiddenMessage, privilegeSatisfied, RequestHeaders } from '@anas/shared'
 import { isReadOnlyOperation } from './read-jobs.js'
 
 /**
@@ -120,7 +120,7 @@ export function submitRefusal(operation: string, submitter: Pick<JobSubmitter, '
   const user = authority.user ?? submitter.user
   if (authority.privileges === null)
     return new JobForbiddenError(user, need, operation, authority.problem ?? 'no privileges')
-  if (!authority.privileges.includes(need)) {
+  if (!privilegeSatisfied(authority.privileges, need)) {
     const held = authority.privileges.length > 0 ? authority.privileges.join(',') : 'no privilege'
     return new JobForbiddenError(user, need, operation, `holds ${held} on /`)
   }

@@ -130,6 +130,19 @@ export const PrivilegeList = z.string().transform((value, ctx): Privilege[] => {
 })
 
 /**
+ * Does `held` cover `need`? PVE's privileges are granular, not tiered — a
+ * custom role can carry Sys.Modify without Sys.Audit — so ANAS supplies the
+ * tier itself (operator 2026-10-15): where a read asks for Sys.Audit, the
+ * higher Sys.Modify also passes. Sys.Modify is satisfied only by itself.
+ * The ONE comparison the gateway (cr.27) and the daemon backstop (cr.28) use.
+ */
+export function privilegeSatisfied(held: readonly Privilege[], need: Privilege): boolean {
+  if (held.includes(need))
+    return true
+  return need === 'Sys.Audit' && held.includes('Sys.Modify')
+}
+
+/**
  * The 403 sentence, gateway and daemon alike (WAVE2-DESIGN §5 row 11): PVE's
  * own "Permission check failed (<path>, <priv>)" form.
  */

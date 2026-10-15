@@ -150,6 +150,9 @@ describe('cr.28 the backstop on the daemon (createServer)', () => {
     let res = await server.inject({ method: 'POST', url: '/test/read', headers: headers('Sys.Audit') })
     assert.equal(res.statusCode, 202, res.body)
     assert.equal((res.json() as JobAccepted).job.operation, READ_JOB_OPERATIONS.cloudPreview)
+    // Tiered by ANAS (operator 2026-10-15): Sys.Modify alone covers the read too.
+    res = await server.inject({ method: 'POST', url: '/test/read', headers: headers('Sys.Modify') })
+    assert.equal(res.statusCode, 202, res.body)
     res = await server.inject({ method: 'POST', url: '/test/read', headers: headers('') })
     assert.equal(res.statusCode, 403)
     assert.equal(res.json().error.message, forbiddenMessage('anas-audit@pve', 'Sys.Audit'))
