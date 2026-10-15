@@ -63,14 +63,15 @@ const TIMEOUT = '/usr/bin/timeout'
 /**
  * The whole preview's wall budget, in seconds (the `timeout` argument).
  *
- * cr.35: 15 s, down from 25 s (25 was already down from 120 s, which a
- * synchronous read could never answer). At 15 s the wrapper fires first and
+ * cr.35r: 12 s, down from 15 s (25 was already down from 120 s, which a
+ * synchronous read could never answer). At 12 s the wrapper fires first and
  * the preview ends as itself (`truncated: true`, the counts so far) — the
- * daemon answers the browser before the gateway's 20 s socket budget does
- * (WAVE3-DESIGN §6.2 ladder).
+ * daemon answers the browser before the gateway's 20 s socket budget does,
+ * and the executor's own deadline (12 s + the 5 s wrapper margin, 17 s)
+ * still lands inside it (WAVE3-DESIGN §6.2 ladder).
  */
 // Q3 (WAVE3-DESIGN §10): job or sync is the operator's call
-export const PREVIEW_TIMEOUT_S = 15
+export const PREVIEW_TIMEOUT_S = 12
 
 /** `timeout`'s own exit code when it is the one that killed the child. */
 export const TIMEOUT_EXIT_CODE = 124

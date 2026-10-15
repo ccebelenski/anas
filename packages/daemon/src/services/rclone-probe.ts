@@ -3,7 +3,7 @@
  *
  * `POST /v1/cloud/remotes/test` is the mounts / repo-Test shape (DESIGN
  * "Cloud sync — rclone"): a `timeout`-bounded
- * `rclone lsjson <remote>:<path> --max-depth 1 --contimeout 10s --timeout 12s
+ * `rclone lsjson <remote>:<path> --max-depth 1 --contimeout 10s --timeout 9s
  * --retries 1 --low-level-retries 1` — a dead network can never hang the API.
  *
  * The verdict is a CLASSIFIER over rclone's message, not its exit code:
@@ -108,15 +108,17 @@ const TIMEOUT = '/usr/bin/timeout'
 /**
  * The whole probe's wall budget, in seconds (the `timeout` argument).
  *
- * cr.35: 15 s, down from 25 s. The remote test is a synchronous read on the
- * request path; the wrapper fires and the probe answers the browser before
- * the gateway's 20 s socket budget does (WAVE3-DESIGN §6.2 ladder). rclone's
- * own `--contimeout 10s` still ends a dead host first, and its `--timeout
- * 12s` — shorter than the wrapper — makes rclone's own error win over the
- * wrapper's 124.
+ * cr.35r: 12 s, down from 15 s — the whole shape now fits the 20 s ladder:
+ * rclone answers inside its own `--timeout 9s` (rclone's error wins), a
+ * stalled CONNECT ends at `--contimeout 10s`, and the wrapper's 124 at 12 s —
+ * all before the gateway hangs up on anasd (WAVE3-DESIGN §6.2 ladder). The
+ * executor's deadline (12 s + the 5 s wrapper margin) fires at 17 s, still
+ * before the 20 s; past that the wrapper itself is stuck in the kernel, where
+ * the gateway's 504 is the honest answer. The remote test is a synchronous
+ * read on the request path.
  */
 // Q3 (WAVE3-DESIGN §10): job or sync is the operator's call
-export const PROBE_TIMEOUT_S = 15
+export const PROBE_TIMEOUT_S = 12
 
 /**
  * The env-defined remote's name. A saved `anastest` in the file would be
@@ -466,7 +468,7 @@ function isEmptyListing(stdout: string): boolean {
 }
 
 /**
- * The probe's STATIC argv prefix — `timeout 15 rclone --config <file>
+ * The probe's STATIC argv prefix — `timeout 12 rclone --config <file>
  * --ask-password=false lsjson`: every token before the one dynamic `<fs>`
  * the caller typed. The probe's argv carries two leading tokens ahead of the
  * rclone base (`timeout` and the binary itself), so the secret-VALUES guard
@@ -480,9 +482,9 @@ export function probeStaticPrefix(configFile: string): string[] {
 }
 
 /**
- * The full probe argv — `timeout 15 rclone --config <file>
+ * The full probe argv — `timeout 12 rclone --config <file>
  * --ask-password=false lsjson <fs> --max-depth 1 --contimeout 10s --timeout
- * 12s --retries 1 --low-level-retries 1`, plus `-vv` (the exact tail the
+ * 9s --retries 1 --low-level-retries 1`, plus `-vv` (the exact tail the
  * crypt capture ran) when `debug` is set — today only a crypt remote, where
  * the undecryptable-name verdict reads the DEBUG stream. The timeout shape
  * and the flag spelling are the design's; exported so the tests assert the
@@ -498,7 +500,7 @@ export function probeArgs(configFile: string, fs: string, opts: { debug?: boolea
     '--contimeout',
     '10s',
     '--timeout',
-    '12s',
+    '9s',
     '--retries',
     '1',
     '--low-level-retries',

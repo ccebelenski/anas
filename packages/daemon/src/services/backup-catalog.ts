@@ -50,12 +50,13 @@ const TIMEOUT_EXIT = 124
  * above the measured 0.14 s worst case, and still bounded — a picker must never
  * be the thing that wedges the daemon.
  *
- * cr.35: 15 s, down from 25 s — the wrapper fires and the browse fails as a
+ * cr.35r: 12 s, down from 15 s — the wrapper fires and the browse fails as a
  * clean verdict (exit 124) before the gateway's 20 s socket budget answers
- * the browser (WAVE3-DESIGN §6.2 ladder).
+ * the browser, and the executor's own deadline (12 s + the 5 s wrapper
+ * margin, 17 s) still lands inside it (WAVE3-DESIGN §6.2 ladder).
  */
 // Q3 (WAVE3-DESIGN §10): job or sync is the operator's call
-export const CATALOG_SHELL_TIMEOUT_S = 15
+export const CATALOG_SHELL_TIMEOUT_S = 12
 
 /**
  * Cap on entries returned for one directory level, mirroring `/v1/fs/browse`'s

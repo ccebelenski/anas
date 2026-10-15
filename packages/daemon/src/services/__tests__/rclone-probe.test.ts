@@ -277,7 +277,7 @@ describe('rclone-probe: testRemote (rclone.1)', () => {
     assert.equal(probeConfigOf(calls[0]!.args), PATHS.configFile)
   })
 
-  it('the argv is the design\'s: timeout 15 (cr.35), base args, lsjson, the bounded flags', () => {
+  it('the argv is the design\'s: timeout 12 (cr.35r), base args, lsjson, the bounded flags', () => {
     assert.deepEqual(probeArgs('/etc/anas/rclone.conf', 'gt:'), [
       String(PROBE_TIMEOUT_S),
       RCLONE,
@@ -291,7 +291,7 @@ describe('rclone-probe: testRemote (rclone.1)', () => {
       '--contimeout',
       '10s',
       '--timeout',
-      '12s',
+      '9s',
       '--retries',
       '1',
       '--low-level-retries',

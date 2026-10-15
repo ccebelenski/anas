@@ -1,15 +1,18 @@
 import type { Disk } from '@anas/shared'
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { CommandTimeoutError } from '../../executor/deadline.js'
 import { MockExecutor } from '../../executor/mock.js'
 import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
 import { LSBLK_ARGS } from '../../parsers/lsblk.js'
 import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
+import { createServer } from '../../server.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
 import { collectDisks } from '../disks.js'
@@ -30,6 +33,11 @@ import { collectDisks } from '../disks.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ahrFixtures = join(__dirname, '../../fixtures/ahr')
+const IDENTITY_HEADERS = {
+  'x-anas-user': 'root@pam',
+  'x-anas-user-uid': '0',
+  'x-anas-request-id': randomUUID(),
+}
 function ahrFixture(name: string): string {
   return readFileSync(join(ahrFixtures, name), 'utf-8')
 }
@@ -223,6 +231,37 @@ describe('collectDisks — AHR members classify as ahr_member (issue #3)', () =>
     // ZFS + free classification are unaffected by the AHR failure.
     assert.equal(byName.get('sde')!.status, 'pool_member')
     assert.equal(byName.get('sdf')!.status, 'available')
+  })
+
+  it('cr.35r: an AHR TIMEOUT is not an empty membership — collectDisks rejects it', async () => {
+    // The never-answering AHR read (the MockExecutor's `timesOut` fixture on
+    // the read's first command, the mdstat cat). "no AHR members" is a fact a
+    // hung read cannot establish: the rejection propagates like the
+    // zpool-status read beside it, so the route answers 503 TIMEOUT (next
+    // test) instead of rendering member disks free.
+    const mock = makeExecutor()
+    mock.prependFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, timesOut: {} })
+    await assert.rejects(
+      () => collectDisks(mock, new DiskIdentityCache(mock)),
+      (err: unknown) => err instanceof CommandTimeoutError && err.label === 'cat',
+    )
+  })
+})
+
+describe('GET /v1/disks — an AHR read that never answers is 503 TIMEOUT (cr.35r)', () => {
+  it('the route says TIMEOUT, it does not list member disks as free', async () => {
+    const server = createServer({ mock: true, logger: false })
+    await server.ready()
+    try {
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      mock.prependFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, timesOut: {} })
+      const res = await server.inject({ method: 'GET', url: '/v1/disks', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 503)
+      assert.equal((res.json() as { error: { code: string } }).error.code, 'TIMEOUT')
+    }
+    finally {
+      await server.close()
+    }
   })
 })
 

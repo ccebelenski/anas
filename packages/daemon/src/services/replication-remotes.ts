@@ -263,7 +263,8 @@ export async function scanHostKeys(executor: CommandExecutor, host: string, port
   // an ssh-keyscan flag (defence in depth; the schema also rejects control chars).
   // `-T 10` (cr.35, §6.3): ssh-keyscan's own per-connection timeout, so a host
   // that accepts the SYN and then says nothing ends at 10 s as "no key" — the
-  // caller's "unreachable" — well inside the executor's 20 s request budget.
+  // caller's "unreachable" — inside the ssh-keyscan row's 12 s budget
+  // (`command-budgets.ts`, lowered at the cr.35 merge) and its ladder.
   const r = await executor.exec(SSH_KEYSCAN, [...SSH_KEYSCAN_TIMEOUT_ARGS, '-p', String(port), '--', host])
   if (!r.stdout.trim())
     return []

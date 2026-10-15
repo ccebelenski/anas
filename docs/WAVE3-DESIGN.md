@@ -538,8 +538,11 @@ socket hop (F8). Four gaps the executor default alone cannot close:
    stdout" would make a suspended pool vanish from the UI.
 4. **Request-path work longer than 30 s cannot reach the browser at all.** AnasProxy's `timeout => 30` is
    an inactivity timeout [P03], and the gateway sends no byte until anasd answers, so anything slower than
-   30 s on the request path is a 502 today: the cloud preview (`timeout 120 rclone … --dry-run`,
-   `cloud-preview.ts:64`), the rclone remote test (45 s) and the PBS catalog shell (30 s) can all exceed it.
+   30 s on the request path is a 502: the cloud preview (once `timeout 120 rclone … --dry-run`),
+   the rclone remote test (once 45 s) and the PBS catalog shell (once 30 s) could all exceed it. All
+   three now answer synchronously under a 12 s `timeout` wrapper (lowered at the cr.35 merge; see
+   `command-budgets.ts` for the ladder: budget + 5 s TERM grace + 2 s KILL grace < the gateway's 20 s);
+   making them jobs stays the open Q3.
 
 ### 6.2 Design
 
@@ -600,7 +603,7 @@ the operator may prefer to keep the preview synchronous with a shorter budget (Q
 
 | Layer | Today | Proposed |
 |---|---|---|
-| one command on the request path | none | 10 s (§6.2) |
+| one command on the request path | none | 10 s lane default; the §6.3 rows at most **12 s** (lowered at the cr.35 merge; see `command-budgets.ts`) — and the rule is the WHOLE ladder: budget + 5 s TERM grace + 2 s KILL grace < 20 s, so even a child that ignores SIGTERM settles with the daemon's own verdict before the gateway's 504 |
 | gateway → local anasd socket | none | **20 s** → 504 `GATEWAY_TIMEOUT` in the ANAS envelope, request aborted |
 | gateway → peer node | 15 s, connect and response on one timer | **5 s connect, 25 s response** (a peer's own 20 s socket answer arrives before ours fires) |
 | AnasProxy (pveproxy) | 30 s inactivity [P03] | unchanged |
@@ -614,16 +617,16 @@ boot/background.
 | Command (subcommand) | Lane | Measured median | Class | Proposed deadline |
 |---|---|---|---|---|
 | `zpool list -j`, `zpool status -jv`, `zpool get all -j`, `zpool get guid`, `zpool upgrade` (list) | R, J | 25, 22, 28, 13 ms | instant read | lane default |
-| `zpool import` (device scan) | R | 145 ms (max 185) | read, scales with disk count | 30 s, and a job if a real node shows seconds **[U]** |
+| `zpool import` (device scan) | R | 145 ms (max 185) | read, scales with disk count | 12 s (lowered at the cr.35 merge; see `command-budgets.ts`), and a job if a real node shows seconds **[U]** |
 | `zpool iostat -plv … 1 2` | R | 1 015 ms (by design) | sampling read | 10 s (lane) |
 | `zfs list` (tree, mountpoints), `zfs get` | R, J | 38, 22 ms | instant read | lane default |
-| `zfs list -t snapshot -r <pool>` | R | 34 ms (4 pools, few snapshots) | scales with snapshot count | 30 s **[U]** at 10k+ snapshots |
-| `zfs send -nP` (plan) | R | — | read | 30 s → better a job (cr.35) |
+| `zfs list -t snapshot -r <pool>` | R | 34 ms (4 pools, few snapshots) | scales with snapshot count | 12 s (lowered at the cr.35 merge; see `command-budgets.ts`) **[U]** at 10k+ snapshots |
+| `zfs send -nP` (plan) | R | — | read | 12 s (lowered at the cr.35 merge; see `command-budgets.ts`); better a job (cr.35) |
 | `zpool create/add/attach/replace/online -e/remove/destroy/export/import <pool>/scrub/trim/set/upgrade <pool>/labelclear` | J | — | single kernel call (scrub/trim return at once) | job default 300 s; `zpool create` 1 800 s (it discards every device unless `-K`; minutes on large SSDs **[U]**) |
 | `zfs set/create/destroy/rename/clone/rollback/snapshot/hold/release` | J | — | seconds | job default; `zfs destroy -r` 1 800 s **[U]** (thousands of snapshots) |
 | `zfs send` → `[ssh] zfs recv` pipeline | J | — | data mover, hours | `null` (`longRunning`); add `ServerAliveInterval=15`, `ServerAliveCountMax=4`, `ConnectTimeout=10` to the ssh argv (none today, `replication-transport.ts:90-104`) so a dead peer ends the pipe |
-| `ssh` remote reads (`zpool list`, `zfs list`, holds, `zfs --version`), `ssh-keyscan` | R, J | — (network) | remote read | 20 s with `ConnectTimeout=10`; `ssh-keyscan -T 10` |
-| `smartctl -n standby -iH --json`, `-a --json` | R | 24, 38 ms (QEMU disk) | read; a USB bridge or a waking SAS disk can take seconds **[U]** | 20 s; the timeout rejection also clears the `pending` dedup (gap 2) |
+| `ssh` remote reads (`zpool list`, `zfs list`, holds, `zfs --version`), `ssh-keyscan` | R, J | — (network) | remote read | 12 s (lowered at the cr.35 merge; see `command-budgets.ts`) with `ConnectTimeout=10`; `ssh-keyscan -T 10` |
+| `smartctl -n standby -iH --json`, `-a --json` | R | 24, 38 ms (QEMU disk) | read; a USB bridge or a waking SAS disk can take seconds **[U]** | 12 s (lowered at the cr.35 merge; see `command-budgets.ts`); the timeout rejection also clears the `pending` dedup (gap 2) |
 | `lsblk`, `ls /dev/disk/by-*`, `realpath`, `readlink`, `blkid` | R, J | 34, —, —, —, 47 ms | instant read | lane default |
 | `cat /proc/mdstat`, `/sys/block/md*/md/*`, `mdadm --detail/--examine` | R, J, B | 1, —, 1 ms | instant read | lane default |
 | `mdadm --create/--grow/--add/--add-spare/--remove/--replace/--re-add/--fail/--zero-superblock/--stop`, `--action=` | J | — | returns at once; the kernel does the work | job default |
@@ -651,8 +654,8 @@ boot/background.
 | `ip -j addr`, `pve-firewall status` | R | — | read | lane default |
 | `rclone version/config providers/config dump/obscure` | R, J | — | read | lane default |
 | `rclone sync/copy` (run) | J | — | data mover | `null`; supervised by its cancel hook (no SIGKILL by contract, `jobs/child-cancel.ts:11-17`) |
-| `rclone lsjson` probe, `rclone --dry-run` preview | R | — | network | existing `timeout 45` / `timeout 120`, executor +5 s; both should become jobs (gap 4) |
-| `proxmox-backup-client` reads (snapshots, groups, repo probe) | R | — | network | 25 s; `catalog shell` keeps `timeout 30` → a job |
+| `rclone lsjson` probe, `rclone --dry-run` preview | R | — | network | `timeout 12` each (lowered at the cr.35 merge; see `command-budgets.ts`), rclone's own `--timeout 9s` / `--contimeout 10s` inside, executor +5 s; both should become jobs (gap 4, Q3) |
+| `proxmox-backup-client` reads (snapshots, groups, repo probe) | R | — | network | 12 s (lowered at the cr.35 merge; see `command-budgets.ts`); `catalog shell` wraps its own `timeout 12` → a job (Q3) |
 | `prlimit -- proxmox-backup-client backup`, pbc file and image restores | J | — | data mover | `null`; backup has its cancel hook; `execToStream` ignores `onSpawn` today (`prod.ts` calls `announceSpawn` only at `:174, 220`), so image restores cannot be cancelled — fixed in cr.34 so the hook exists |
 | `perl -e 'use PVE::Notify; …'` | J, B | — | sends mail through PVE | 60 s; best-effort by contract, a timeout is a warning |
 | `dd`, `dd | base64`, `sync` (self-heal block I/O) | J | — | one block | job default |

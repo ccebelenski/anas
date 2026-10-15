@@ -8,7 +8,7 @@ import { dirname, join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { COMMAND_BUDGETS, CommandBudgetExecutor, commandBudgetRow } from '../executor/command-budgets.js'
-import { LANE_BUDGET_MS, runInLane, TIMEOUT_WRAPPER_MARGIN_MS } from '../executor/deadline.js'
+import { formatBudget, KILL_GRACE_MS, LANE_BUDGET_MS, runInLane, TERM_GRACE_MS, TIMEOUT_WRAPPER_MARGIN_MS } from '../executor/deadline.js'
 import { MockExecutor as Mock } from '../executor/mock.js'
 import { zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { createServer } from '../server.js'
@@ -48,6 +48,13 @@ const ZFS = '/usr/sbin/zfs'
 const ZPOOL = '/usr/sbin/zpool'
 const SMARTCTL = '/usr/sbin/smartctl'
 
+/** A row's budget, read from the table itself — the tests never hard-code it. */
+function rowMs(id: string): number {
+  const row = COMMAND_BUDGETS.find(r => r.id === id)
+  assert.ok(row, `row '${id}' exists`)
+  return row.budgetMs
+}
+
 /** The deadline one argv gets through the daemon's executor (the §6.3 table in front of it), in a lane. */
 async function budgetOf(command: string, args: string[], lane: 'request' | 'job' | 'background' = 'request', opts?: ExecOptions): Promise<{ budgetMs: number | null, source: string }> {
   const mock = new Mock()
@@ -65,20 +72,20 @@ describe('cr.35 §6.3 per-command budgets: the table, against the argv the call 
   it('every row matches what its call sites actually run, with its §6.3 budget', async () => {
     const peerSsh = buildSshArgv({ kind: 'peer', host: 'node2' }, ['zpool', 'list', '-H', '-o', 'name'])
     const cases: Array<[string, string, string[], number]> = [
-      ['smartctl', SMARTCTL, ['-n', 'standby', '-iH', '--json', '/dev/sda'], 15_000],
-      ['smartctl', SMARTCTL, ['-n', 'standby', '-a', '--json', '/dev/sda'], 15_000],
-      ['ssh', peerSsh[0], peerSsh.slice(1), 15_000],
-      ['ssh-keyscan', '/usr/bin/ssh-keyscan', ['-T', '10', '-p', '22', '--', 'host'], 15_000],
-      ['proxmox-backup-client', PBC, buildSnapshotListArgs('vm/100'), 15_000],
-      ['zpool import (scan)', ZPOOL, ['import'], 15_000],
-      ['zfs snapshot list', ZFS, zfsSnapshotListArgs('tank/a'), 15_000],
-      ['zfs snapshot list', ZFS, zfsTreeSnapshotListArgs('tank/a'), 15_000],
-      ['zfs snapshot list', ZFS, zfsStampSourceArgs('tank/a'), 15_000],
-      ['zfs snapshot list', ZFS, zfsTransientListArgs('tank/a'), 15_000],
-      ['zfs send -nP', ZFS, ['send', '-nvP', '--', 'tank/a@s1'], 15_000],
+      ['smartctl', SMARTCTL, ['-n', 'standby', '-iH', '--json', '/dev/sda'], rowMs('smartctl')],
+      ['smartctl', SMARTCTL, ['-n', 'standby', '-a', '--json', '/dev/sda'], rowMs('smartctl')],
+      ['ssh', peerSsh[0], peerSsh.slice(1), rowMs('ssh')],
+      ['ssh-keyscan', '/usr/bin/ssh-keyscan', ['-T', '10', '-p', '22', '--', 'host'], rowMs('ssh-keyscan')],
+      ['proxmox-backup-client', PBC, buildSnapshotListArgs('vm/100'), rowMs('proxmox-backup-client')],
+      ['zpool import (scan)', ZPOOL, ['import'], rowMs('zpool import (scan)')],
+      ['zfs snapshot list', ZFS, zfsSnapshotListArgs('tank/a'), rowMs('zfs snapshot list')],
+      ['zfs snapshot list', ZFS, zfsTreeSnapshotListArgs('tank/a'), rowMs('zfs snapshot list')],
+      ['zfs snapshot list', ZFS, zfsStampSourceArgs('tank/a'), rowMs('zfs snapshot list')],
+      ['zfs snapshot list', ZFS, zfsTransientListArgs('tank/a'), rowMs('zfs snapshot list')],
+      ['zfs send -nP', ZFS, ['send', '-nvP', '--', 'tank/a@s1'], rowMs('zfs send -nP')],
       // routes/mounts.ts listHolders and services/busy-diagnosis.ts diagnoseBusyPath.
-      ['lsof', '/usr/bin/lsof', ['+f', '--', '/mnt/anas-nfs'], 10_000],
-      ['fuser', '/usr/bin/fuser', ['-m', '/mnt/anas-nfs'], 10_000],
+      ['lsof', '/usr/bin/lsof', ['+f', '--', '/mnt/anas-nfs'], rowMs('lsof')],
+      ['fuser', '/usr/bin/fuser', ['-m', '/mnt/anas-nfs'], rowMs('fuser')],
     ]
     for (const [id, cmd, args, budget] of cases) {
       assert.equal(commandBudgetRow(cmd, args)?.id, id, `${cmd} ${args.join(' ')}`)
@@ -113,19 +120,19 @@ describe('cr.35 §6.3 per-command budgets: the table, against the argv the call 
     assert.equal((await budgetOf(ZFS, zfsTreeSnapshotListArgs('tank/a'), 'job')).budgetMs, LANE_BUDGET_MS.job)
     assert.equal((await budgetOf('/usr/bin/ssh', ['-o', 'BatchMode=yes', '--', 'root@node2', 'zfs', 'list'], 'job')).budgetMs, LANE_BUDGET_MS.job)
     assert.equal((await budgetOf(ZFS, ['send', '-nvP', 'a@b'], 'job')).budgetMs, LANE_BUDGET_MS.job)
-    assert.equal((await budgetOf(SMARTCTL, ['-n', 'standby', '-iH', '--json', '/dev/sda'], 'job')).budgetMs, 15_000)
-    assert.equal((await budgetOf('/usr/bin/ssh-keyscan', ['-T', '10', '-p', '22', '--', 'h'], 'job')).budgetMs, 15_000)
-    assert.equal((await budgetOf('/usr/bin/fuser', ['-m', '/x'], 'job')).budgetMs, 10_000)
-    assert.equal((await budgetOf('/usr/bin/lsof', ['+f', '--', '/x'], 'job')).budgetMs, 10_000)
+    assert.equal((await budgetOf(SMARTCTL, ['-n', 'standby', '-iH', '--json', '/dev/sda'], 'job')).budgetMs, rowMs('smartctl'))
+    assert.equal((await budgetOf('/usr/bin/ssh-keyscan', ['-T', '10', '-p', '22', '--', 'h'], 'job')).budgetMs, rowMs('ssh-keyscan'))
+    assert.equal((await budgetOf('/usr/bin/fuser', ['-m', '/x'], 'job')).budgetMs, rowMs('fuser'))
+    assert.equal((await budgetOf('/usr/bin/lsof', ['+f', '--', '/x'], 'job')).budgetMs, rowMs('lsof'))
     // Boot/background pulls too.
-    assert.equal((await budgetOf(SMARTCTL, ['-n', 'standby', '-iH', '--json', '/dev/sda'], 'background')).budgetMs, 15_000)
+    assert.equal((await budgetOf(SMARTCTL, ['-n', 'standby', '-iH', '--json', '/dev/sda'], 'background')).budgetMs, rowMs('smartctl'))
   })
 
-  it('ssh-keyscan carries `-T 10` and gets its 15 s on the request path', async () => {
+  it('ssh-keyscan carries `-T 10` and gets its row budget on the request path', async () => {
     const mock = new Mock()
     await runInLane({ lane: 'request' }, () => scanHostKeys(new CommandBudgetExecutor(mock), 'backup.example', 22))
     assert.deepEqual(mock.deadlines.map(d => [d.args, d.budgetMs]), [
-      [['-T', '10', '-p', '22', '--', 'backup.example'], 15_000],
+      [['-T', '10', '-p', '22', '--', 'backup.example'], rowMs('ssh-keyscan')],
     ])
   })
 
@@ -136,7 +143,7 @@ describe('cr.35 §6.3 per-command budgets: the table, against the argv the call 
     mock.deadlines.length = 0
     const res = await server.inject({ method: 'GET', url: '/v1/pools/import', headers: IDENTITY_HEADERS })
     assert.equal(res.statusCode, 200)
-    assert.deepEqual(mock.deadlines.map(d => [d.args, d.lane, d.budgetMs]), [[['import'], 'request', 15_000]])
+    assert.deepEqual(mock.deadlines.map(d => [d.args, d.lane, d.budgetMs]), [[['import'], 'request', rowMs('zpool import (scan)')]])
     await server.close()
   })
 
@@ -201,19 +208,32 @@ describe('cr.35 §6.3 per-command budgets: the table, against the argv the call 
   })
 })
 
-describe('cr.35 Q3 (open): the request-path reads stay synchronous at 15 s — each wrapper fires inside the gateway\'s 20 s', () => {
-  it('cloud preview, rclone remote test and the PBS catalog shell: a 15 s `timeout` wrapper each, under the gateway\'s 20 s', async () => {
-    assert.equal(PREVIEW_TIMEOUT_S, 15)
-    assert.equal(PROBE_TIMEOUT_S, 15)
-    assert.equal(CATALOG_SHELL_TIMEOUT_S, 15)
-    assert.equal(probeArgs('/etc/pve/priv/anas/rclone.conf', 'gt:')[0], String(PROBE_TIMEOUT_S))
+describe('cr.35 Q3 (open): the request-path reads stay synchronous at 12 s — each wrapper fires inside the gateway\'s 20 s', () => {
+  it('cloud preview, rclone remote test and the PBS catalog shell: a 12 s `timeout` wrapper each, under the gateway\'s 20 s', async () => {
+    // The wrapper durations themselves are pinned by the ladder test below
+    // (budget + graces < 20 s); here: every layer's own argv, and every
+    // inner bound under the wrapper that has to beat it to the answer.
+    const argv = probeArgs('/etc/pve/priv/anas/rclone.conf', 'gt:')
+    assert.equal(argv[0], String(PROBE_TIMEOUT_S))
+    // rclone's own bounds — its error must win over the wrapper's 124, and
+    // a stalled CONNECT must end inside the wrapper too.
+    for (const [flag, value] of [['--timeout', '9s'], ['--contimeout', '10s']] as const) {
+      const at = argv.indexOf(flag)
+      assert.ok(at > 0, flag)
+      assert.equal(argv[at + 1], value)
+      assert.ok(Number(value.replace('s', '')) < PROBE_TIMEOUT_S, `${flag} ${value} fits under the ${PROBE_TIMEOUT_S} s wrapper`)
+    }
     const shell = buildCatalogShellArgs('host/pve1/2026-10-15T00:00:00Z', 'root.pxar')
     assert.deepEqual([shell.command, shell.args[0]], ['/usr/bin/timeout', String(CATALOG_SHELL_TIMEOUT_S)])
-    // The executor sits 5 s above the wrapper, so exit 124 (the verdict each
-    // caller already words) arrives FIRST — at 15 s, inside the 20 s socket
-    // budget the gateway keeps (the +5 s only catches a wrapper that itself
-    // cannot end, where the gateway 504 is the honest answer).
+    // The executor sits TIMEOUT_WRAPPER_MARGIN_MS above the wrapper, so exit
+    // 124 (the verdict each caller already words) arrives FIRST — at 12 s,
+    // inside the 20 s socket budget the gateway keeps (the +5 s only catches
+    // a wrapper that itself cannot end, where the gateway 504 is the honest
+    // answer; the ladder test below pins that the executor's own deadline —
+    // wrapper + margin — still fires before the gateway hangs up).
     assert.deepEqual(await budgetOf(shell.command, shell.args), { budgetMs: CATALOG_SHELL_TIMEOUT_S * 1000 + TIMEOUT_WRAPPER_MARGIN_MS, source: 'wrapper' })
+    assert.deepEqual(await budgetOf('/usr/bin/timeout', [String(PROBE_TIMEOUT_S), '/usr/bin/rclone', 'lsjson']), { budgetMs: PROBE_TIMEOUT_S * 1000 + TIMEOUT_WRAPPER_MARGIN_MS, source: 'wrapper' })
+    assert.deepEqual(await budgetOf('/usr/bin/timeout', [String(PREVIEW_TIMEOUT_S), '/usr/bin/rclone', 'sync']), { budgetMs: PREVIEW_TIMEOUT_S * 1000 + TIMEOUT_WRAPPER_MARGIN_MS, source: 'wrapper' })
   })
 
   it('each site carries the Q3 marker until the operator rules', () => {
@@ -223,7 +243,53 @@ describe('cr.35 Q3 (open): the request-path reads stay synchronous at 15 s — e
   })
 })
 
-describe('cr.35 the SMART probe: 15 s for the probe, 8 s for the list that waits on it', () => {
+describe('cr.35r the ladder arithmetic: every request-path budget settles before the gateway hangs up', () => {
+  // The gateway hangs up on anasd at 20 s and answers 504 itself:
+  // LOCAL_SOCKET_TIMEOUT_MS in packages/gateway/src/proxy.ts. The gateway is
+  // a sibling package and not a dependency of the daemon or its tests (the
+  // daemon depends on @anas/shared alone), so its number rides here as a
+  // literal; packages/gateway/src/__tests__/gateway.test.ts pins the
+  // constant itself.
+  const GATEWAY_LOCAL_SOCKET_TIMEOUT_MS = 20_000
+
+  it('every §6.3 row and every Q3 wrapper, as the executor resolves them, beats the socket budget', async () => {
+    // A row's WHOLE ladder: the budget, then TERM_GRACE_MS to the process
+    // group, then SIGKILL, then KILL_GRACE_MS before the call settles
+    // anyway — a child that ignores SIGTERM, and even one stuck in the
+    // kernel, end with the daemon's verdict before the gateway replaces it
+    // with a 504.
+    for (const row of COMMAND_BUDGETS) {
+      assert.ok(
+        row.budgetMs + TERM_GRACE_MS + KILL_GRACE_MS < GATEWAY_LOCAL_SOCKET_TIMEOUT_MS,
+        `${row.id}: ${formatBudget(row.budgetMs)} + ${formatBudget(TERM_GRACE_MS)} + ${formatBudget(KILL_GRACE_MS)} reaches the gateway's ${formatBudget(GATEWAY_LOCAL_SOCKET_TIMEOUT_MS)}`,
+      )
+    }
+    // The Q3 wrappers, as resolveDeadline resolves them (duration + the
+    // wrapper margin). The strict ladder rule cannot hold for a wrapper at
+    // any duration the margin leaves usable (margin 5 s + graces 7 s would
+    // cap it at 8 s); what must hold, and what this pins: the wrapper fires
+    // and answers as its own verdict (exit 124) inside the socket budget,
+    // and the executor's deadline ON the wrapper still fires before the
+    // gateway hangs up. Past the executor's deadline the wrapper itself is
+    // stuck in the kernel — there, the gateway's 504 is the honest answer
+    // (§6.2), which is why the wrapper's own ladder is not this test's.
+    const catalogShell = buildCatalogShellArgs('host/pve1/2026-10-15T00:00:00Z', 'root.pxar')
+    const wrappers: Array<[string, number, string, string[]]> = [
+      ['PBS catalog shell', CATALOG_SHELL_TIMEOUT_S, catalogShell.command, catalogShell.args],
+      ['rclone remote probe', PROBE_TIMEOUT_S, '/usr/bin/timeout', probeArgs('/etc/pve/priv/anas/rclone.conf', 'gt:')],
+      ['cloud preview', PREVIEW_TIMEOUT_S, '/usr/bin/timeout', [String(PREVIEW_TIMEOUT_S), '/usr/bin/rclone', 'sync', '/src', 'gt:dst']],
+    ]
+    for (const [name, seconds, command, args] of wrappers) {
+      assert.ok(seconds * 1000 < GATEWAY_LOCAL_SOCKET_TIMEOUT_MS, `${name}: the wrapper's own 124 lands inside the socket budget`)
+      const resolved = await budgetOf(command, args)
+      assert.equal(resolved.source, 'wrapper', name)
+      assert.equal(resolved.budgetMs, seconds * 1000 + TIMEOUT_WRAPPER_MARGIN_MS, name)
+      assert.ok((resolved.budgetMs as number) < GATEWAY_LOCAL_SOCKET_TIMEOUT_MS, `${name}: the executor's deadline on the wrapper beats the gateway`)
+    }
+  })
+})
+
+describe(`cr.35 the SMART probe: ${rowMs('smartctl') / 1000} s for the probe, 8 s for the list that waits on it`, () => {
   const identityJson = readFileSync(join(FIXTURES, 'system', 'smartctl-ata-identity.json'), 'utf-8')
 
   it('a probe still running after the wait leaves the list to answer with no reading; its answer lands in the cache later', { timeout: 5_000 }, async () => {
@@ -287,10 +353,10 @@ describe('cr.35 request-path conventions with a command that never answers (§6.
     const probes = s2.mock.deadlines.filter(d => d.command === SMARTCTL)
     assert.ok(probes.length > 0)
     for (const p of probes)
-      assert.deepEqual([p.lane, p.budgetMs, p.source], ['request', 15_000, 'call'])
+      assert.deepEqual([p.lane, p.budgetMs, p.source], ['request', rowMs('smartctl'), 'call'])
   })
 
-  it('Strict: GET /v1/disks/:id/smart with smartctl hung is 503 TIMEOUT naming it (15 s), not an empty SMART table', async () => {
+  it('Strict: GET /v1/disks/:id/smart with smartctl hung is 503 TIMEOUT naming it (its row budget), not an empty SMART table', async () => {
     const { server, mock } = await mockServer()
     const { data } = (await server.inject({ method: 'GET', url: '/v1/disks', headers: IDENTITY_HEADERS })).json() as { data: Disk[] }
     const disk = data[0]
@@ -299,18 +365,18 @@ describe('cr.35 request-path conventions with a command that never answers (§6.
     assert.equal(res.statusCode, 503)
     const body = res.json() as { error: { code: string, message: string, details: { budgetMs: number } } }
     assert.equal(body.error.code, 'TIMEOUT')
-    assert.match(body.error.message, /^'smartctl' did not finish within 15 s/)
-    assert.equal(body.error.details.budgetMs, 15_000)
+    assert.match(body.error.message, new RegExp(`^'smartctl' did not finish within ${formatBudget(rowMs('smartctl'))}`))
+    assert.equal(body.error.details.budgetMs, rowMs('smartctl'))
   })
 
-  it('Strict: GET /v1/pools/import with the device scan hung is 503 TIMEOUT (15 s) — never `data: []` ("nothing to import")', async () => {
+  it('Strict: GET /v1/pools/import with the device scan hung is 503 TIMEOUT (its row budget) — never `data: []` ("nothing to import")', async () => {
     const { server, mock } = await mockServer()
     mock.prependFixture({ command: ZPOOL, args: ['import'], timesOut: {} })
     const res = await server.inject({ method: 'GET', url: '/v1/pools/import', headers: IDENTITY_HEADERS })
     assert.equal(res.statusCode, 503)
     const body = res.json() as { error: { code: string, message: string, details: { budgetMs: number } } }
     assert.equal(body.error.code, 'TIMEOUT')
-    assert.match(body.error.message, /^'zpool import' did not finish within 15 s/)
+    assert.match(body.error.message, new RegExp(`^'zpool import' did not finish within ${formatBudget(rowMs('zpool import (scan)'))}`))
   })
 
   it('Gate: a pool destroy whose read hangs is refused 503 TIMEOUT before any confirm code is minted', async () => {

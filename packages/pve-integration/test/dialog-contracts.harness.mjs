@@ -12599,7 +12599,7 @@ async function cloudTaskChecks() {
       && /Would transfer 0 files \/ 0 B/.test(pLine().html),
     pLine() && pLine().html)
   ok('cloud preview: a truncated preview says what a partial answer is',
-    /stopped after 15 s — the counts are what rclone had reported by then, the list is everything it logged; the full run will do the rest/
+    /stopped after 12 s — the counts are what rclone had reported by then, the list is everything it logged; the full run will do the rest/
       .test(pLine().html), pLine() && pLine().html)
 
   // rclone's own first error line IS the summary — the counters lead is

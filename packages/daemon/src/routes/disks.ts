@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
+import { CommandTimeoutError } from '../executor/deadline.js'
 import { parseByIdToKernel, parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { LSBLK_ARGS, parseLsblk } from '../parsers/lsblk.js'
 import { isSmartctlStandby, parseSmartctl, standbySmartData } from '../parsers/smartctl.js'
@@ -197,13 +198,14 @@ function isUsableEpochMs(ms: number | undefined): ms is number {
 
 /**
  * How long a disk list waits for the SMART probes that are due (cr.35). The
- * probe itself may take 15 s (§6.3: a disk waking for another reader), but
- * the gateway hangs up on anasd at 20 s, so a list that waited that long for
- * one slow disk would reach the browser as a 504 instead of a Disks view.
- * After 8 s — below the probe's own 15 s budget — the list answers with each
- * disk's last reading (or none — health `unknown`); the slow probe keeps
- * running and its answer is in the cache for the next pull. 8 s + the
- * parallel base reads stays under the gateway's 20 s.
+ * probe itself may take 12 s (§6.3, lowered at the cr.35 merge: a disk
+ * waking for another reader), but the gateway hangs up on anasd at 20 s, so
+ * a list that waited that long for one slow disk would reach the browser as
+ * a 504 instead of a Disks view. After 8 s — below the probe's own 12 s
+ * budget — the list answers with each disk's last reading (or none — health
+ * `unknown`); the slow probe keeps running and its answer is in the cache
+ * for the next pull. 8 s + the parallel base reads stays under the gateway's
+ * 20 s.
  */
 export const SMART_DISPLAY_WAIT_MS = 8_000
 
@@ -231,8 +233,15 @@ export async function collectDisks(
     // Single-source AHR membership from the topology reader (never re-parse
     // mdstat here). Fail-soft: an AHR read error (or md absent) yields no AHR
     // membership and disks fall through to their existing status — the disks
-    // endpoint must never crash because AHR is unreadable.
-    readAhrPools(executor).catch(() => []),
+    // endpoint must never crash because AHR is unreadable. A TIMEOUT is the
+    // exception (cr.35r, mirroring the zpool-status read beside it): "no AHR
+    // members" is a fact a hung read cannot establish, and rendering a member
+    // disk as free on one is worse than a 503. Let it propagate.
+    readAhrPools(executor).catch((err: unknown) => {
+      if (err instanceof CommandTimeoutError)
+        throw err
+      return []
+    }),
     // The serials of the LUNs THIS node serves (story iscsi.6). Costs two stats
     // on a node with no LIO (the read layer short-circuits before it touches
     // ZFS, PVE or the network) and fail-opens to an empty set.

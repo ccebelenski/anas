@@ -64,11 +64,12 @@ const SYSTEMCTL = '/usr/bin/systemctl'
  * The wall budget of one /v1/status section (cr.35). Inside the gateway's
  * 20 s socket budget with room for the reply, and above the request lane's
  * 10 s per command, so a single hung command that can be stopped is named by
- * its own CommandTimeoutError at 10 s; and BELOW the §6.3 rows' 15 s, so a
- * row-bounded command (a 15 s smartctl or ssh inside a section) is still
- * running when this wall fires and the section answers 'had not answered
- * after 12 s' — the wall, not the row deadline, is the thing that ends the
- * section's wait.
+ * its own CommandTimeoutError at 10 s. The §6.3 rows are 12 s (cr.35r) — at
+ * the wall, not below it — and the wall still ends the section first: a row
+ * deadline only becomes an error after the child stops (up to 7 s later on
+ * the TERM/KILL ladder), so a row-bounded command (a 12 s smartctl or ssh
+ * inside a section) is still running when this wall fires and the section
+ * answers 'had not answered after 12 s'.
  */
 export const DASHBOARD_SECTION_BUDGET_MS = 12_000
 
