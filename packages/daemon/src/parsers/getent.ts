@@ -8,6 +8,7 @@
  */
 
 import type { SystemGroup, SystemUser } from '@anas/shared'
+import { SHARE_ID_LIMIT, SHARE_ID_MIN } from '@anas/shared'
 
 /** One `getent passwd` line, all seven colon-separated fields. */
 export interface PasswdEntry {
@@ -29,13 +30,15 @@ export interface GroupEntry {
 
 /**
  * Share-relevant ids: root (0) plus the regular-user band [1000, 60000)
- * (Debian login.defs UID_MIN..UID_MAX). Filters out both the 1..999 service
+ * (Debian login.defs UID_MIN..UID_MAX, `SHARE_ID_MIN`/`SHARE_ID_LIMIT` in the
+ * shared identity schema; UID_MAX 60000 itself is outside — WAVE2-DESIGN §11).
+ * Filters out both the 1..999 service
  * range AND high dynamically-allocated system accounts (e.g. `ceph` 64045,
  * `nobody` 65534) so pickers/lists show a clean access landscape (story 8.1).
  * Reused for both uids and gids.
  */
 export function isShareRelevant(id: number): boolean {
-  return id === 0 || (id >= 1000 && id < 60000)
+  return id === 0 || isMutableShareId(id)
 }
 
 /**
@@ -48,7 +51,7 @@ export function isShareRelevant(id: number): boolean {
  * belong to the OS, not to shares (story cr.3, review C3).
  */
 export function isMutableShareId(id: number): boolean {
-  return id >= 1000 && id < 60000
+  return id >= SHARE_ID_MIN && id < SHARE_ID_LIMIT
 }
 
 /**

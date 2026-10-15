@@ -7,6 +7,7 @@ import type { PassdbEntry } from '../parsers/pdbedit.js'
 import type { IdentityRefHit } from '../parsers/smb-conf.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { Advisory, Gate, GuardReads, GuardSpec, Refusal } from '../safety/guard.js'
+import type { IdKind, OwnershipReadOpts } from '../services/identity-ids.js'
 import { constants } from 'node:fs'
 import { access } from 'node:fs/promises'
 import {
@@ -37,6 +38,7 @@ import {
 import { findIdentityReferences } from '../parsers/smb-conf.js'
 import { gidClaim, guardCheck, guardConfirm, guarded, GuardRefusalError, idnameClaim, sendRefusal, uidClaim } from '../safety/guard.js'
 import { readConfig } from '../services/config-writer.js'
+import { ID_PICK_TRIES, idHolder, idOwnership, pickId } from '../services/identity-ids.js'
 import { requireIdentity } from './identity.js'
 
 // Command whitelist (Principle 5). Debian/PVE paths: user/group admin tools
@@ -93,6 +95,17 @@ export interface ShareIdentityRouteOptions {
    */
   smbConfPath: string
   /**
+   * Absolute path to /etc/exports — a create reads its export paths (with
+   * smb.conf's share paths) as the share roots a picked uid/gid must own
+   * nothing under (cr.29).
+   */
+  exportsPath: string
+  /**
+   * The cr.29 ownership check's clock and budget (default: `Date.now`, 10 s
+   * per guard run); tests shorten them.
+   */
+  idCheck?: Pick<OwnershipReadOpts, 'now' | 'budgetMs'>
+  /**
    * Is `smbpasswd` present and executable on this node? Defaults to a real
    * access(X_OK) probe. The dev mock overrides it to `true` (nothing is ever
    * really spawned there), and tests override it to `false` to prove the
@@ -105,7 +118,7 @@ export async function shareIdentityRoutes(
   server: FastifyInstance,
   opts: ShareIdentityRouteOptions,
 ) {
-  const { executor, jobQueue, confirmStore, smbConfPath } = opts
+  const { executor, jobQueue, confirmStore, smbConfPath, exportsPath } = opts
   const smbAvailable = opts.smbpasswdAvailable ?? smbpasswdIsInstalled
 
   /**
@@ -340,11 +353,25 @@ export async function shareIdentityRoutes(
       return r.exitCode !== 0 && !r.stdout.trim() ? null : parsePasswd(r.stdout)
     }),
     groups: (reads: GuardReads) => reads.once('group', () => allGroups()),
+    /** Every group (`getent group`), STRICT: null when the database could not be read. */
+    groupsStrict: (reads: GuardReads) => reads.once('group:strict', async (): Promise<GroupEntry[] | null> => {
+      const r = await executor.exec(GETENT, ['group'])
+      return r.exitCode !== 0 && !r.stdout.trim() ? null : parseGroups(r.stdout)
+    }),
     passdb: (reads: GuardReads) => reads.once('passdb', () => smbEntries()),
     /** smb.conf's text; null when it could not be read (an ABSENT file reads as ''). */
     smbConf: (reads: GuardReads) => reads.once('smb.conf', async (): Promise<string | null> => {
       try {
         return await readConfig(smbConfPath)
+      }
+      catch {
+        return null
+      }
+    }),
+    /** /etc/exports' text; null when it could not be read (an ABSENT file reads as ''). */
+    exports: (reads: GuardReads) => reads.once('exports', async (): Promise<string | null> => {
+      try {
+        return await readConfig(exportsPath)
       }
       catch {
         return null
@@ -621,12 +648,253 @@ export async function shareIdentityRoutes(
     }
   }
 
+  // --- cr.29: the uid / gid a create passes to useradd / groupadd ----------
+  //
+  // Ruled 2026-10-15 (WAVE2-DESIGN §6; no tombstones): every create passes an
+  // explicit `-u`/`-g`. The operator's own id is used as given (refused only
+  // when an account holds it — the band is the schema's), never checked for
+  // files; otherwise ANAS picks one that owns nothing under the paths it
+  // manages (services/identity-ids.ts). The id is decided at the route door,
+  // promised to the request, and the create's guard takes its `uid:`/`gid:`
+  // key; the job re-checks it.
+
   /**
-   * The guard spec of a create: the object is the name slot (it has no id
-   * yet), the gates are the request's. A user created into supplementary
-   * groups changes those groups too, so it also takes their `gid:` keys.
+   * Ids promised to creates that have not finished: `uid:<n>` / `gid:<n>` →
+   * the job that will use it (no job yet while the route is still deciding).
+   * Two creates at once must not pick the same id, and the job queue's lock
+   * keys only order jobs that already have one, so the pick consults this.
+   * Runtime state of the job queue's own kind — once the job ends the account
+   * database is the answer again — so a promise lapses when its job is no
+   * longer queued or running, or (never submitted) after a minute.
    */
-  function createGuardSpec(kind: 'user' | 'group', name: string, gates: Gate<NameSlot>[], groups: string[] = []): GuardSpec<NameSlot> {
+  const promisedIds = new Map<string, { jobId?: string, at: number }>()
+  const PROMISE_UNSUBMITTED_MS = 60_000
+
+  function promisedTo(key: string): boolean {
+    const p = promisedIds.get(key)
+    if (!p)
+      return false
+    const status = p.jobId !== undefined ? jobQueue.get(p.jobId)?.status : undefined
+    const live = p.jobId !== undefined
+      ? status === 'queued' || status === 'running'
+      : Date.now() - p.at < PROMISE_UNSUBMITTED_MS
+    if (!live)
+      promisedIds.delete(key)
+    return live
+  }
+
+  /** Promise `key` to this request — synchronously; false when another create holds it. */
+  function promiseId(key: string): boolean {
+    if (promisedTo(key))
+      return false
+    promisedIds.set(key, { at: Date.now() })
+    return true
+  }
+
+  /** What a create decides about its id; the route door fills `id` and `key`, the job door reads them. */
+  interface CreateId {
+    kind: IdKind
+    /** The operator gave it (never checked for files). */
+    explicit: boolean
+    id: number | null
+    /** The promise this request holds (`uid:<n>`); null until the route door decided. */
+    key: string | null
+    /** Ids the pick moved past because they own something. */
+    skipped: { id: number, where: string }[]
+  }
+
+  function createId(kind: IdKind, explicit: number | undefined): CreateId {
+    return { kind, explicit: explicit !== undefined, id: explicit ?? null, key: null, skipped: [] }
+  }
+
+  /** The progress line's tail naming the ids a pick moved past (empty when none). */
+  function skippedNote(state: CreateId): string {
+    if (state.skipped.length === 0)
+      return ''
+    return ` (${state.skipped.map(s => `${state.kind} ${s.id} still owns ${s.where}`).join('; ')})`
+  }
+
+  /**
+   * The delete confirm's one sentence about the number (cr.29): it stays on
+   * the files; a create skips it while ANAS can still see it owning
+   * something, but ids seen only in exported pools or backups cannot be
+   * checked; re-creating with the same id is how the files come back.
+   */
+  function leftOnFiles(kind: IdKind, id: number): string {
+    const whom = kind === 'uid' ? 'user' : 'group'
+    return `Files owned by this ${whom} keep ${kind} ${id}. ANAS will not give ${kind} ${id} to a new ${whom} while it still owns files on an imported ZFS filesystem or under a share, but it cannot check ids seen only in exported pools, on disconnected disks or in backups. To give the files back later, re-create the ${whom} with ${idField(kind)} ${id}.`
+  }
+
+  /** `User ID` / `Group ID` — what the Add dialog calls the field. */
+  function idField(kind: IdKind): string {
+    return kind === 'uid' ? 'User ID' : 'Group ID'
+  }
+
+  function idWhom(kind: IdKind): string {
+    return kind === 'uid' ? 'user' : 'group'
+  }
+
+  /** The 409 when a source of the check could not be read (fail closed, never a guess). */
+  function idCheckUnreadable(state: CreateId, unreadable: string, id: number | null): Refusal {
+    const what = id === null ? `which ${state.kind} is free` : `that ${state.kind} ${id} ${state.explicit ? 'is free' : 'owns no files'}`
+    const out = state.explicit ? '' : ` To create the ${idWhom(state.kind)} without this check, give its ${idField(state.kind)} explicitly (an id you give is not checked for files).`
+    return {
+      status: 409,
+      code: 'CONFLICT',
+      reason: 'id-check-unreadable',
+      message: `ANAS could not check ${what}: it could not read ${unreadable}. Nothing was created.${out}`,
+    }
+  }
+
+  /** The 409 when an account already holds the id. */
+  function idInUse(state: CreateId, id: number, holder: string, verb: string): Refusal {
+    const next = state.explicit
+      ? ` Give another ${idField(state.kind)}, or leave it empty and ANAS picks a free one.`
+      : ' Create it again and ANAS picks another.'
+    return {
+      status: 409,
+      code: 'CONFLICT',
+      reason: 'id-in-use',
+      message: `${state.kind} ${id} ${verb} ${idWhom(state.kind)} '${holder}'. Nothing was created.${next}`,
+    }
+  }
+
+  /**
+   * The create's id gate, run by both doors (the LAST gate, so a pass at the
+   * route goes straight to the submit that binds its promise):
+   *  - route door (`key` null): an explicit id must be held by no account and
+   *    promised to no other create; otherwise one is picked (`pickId`) —
+   *    either way the id is promised to this request;
+   *  - job door: the promised id is still held by no account, and a PICKED id
+   *    still owns nothing (ruling (j); nothing is re-picked — the job's lock
+   *    is that id's key).
+   */
+  function createIdGate(state: CreateId): Gate<NameSlot> {
+    return async (_slot, reads) => {
+      const own: OwnershipReadOpts = {
+        executor,
+        reads,
+        smbConf: () => idReads.smbConf(reads),
+        exports: () => idReads.exports(reads),
+        ...opts.idCheck,
+      }
+      const keyOf = (n: number): string => `${state.kind}:${n}`
+
+      if (state.key === null && state.explicit) {
+        const id = state.id!
+        const held = await idHolder(executor, state.kind, id)
+        if ('unreadable' in held)
+          return idCheckUnreadable(state, held.unreadable, id)
+        if (held.holder !== null)
+          return idInUse(state, id, held.holder, 'already belongs to')
+        if (!promiseId(keyOf(id))) {
+          return {
+            status: 409,
+            code: 'CONFLICT',
+            reason: 'id-in-use',
+            message: `${state.kind} ${id} is being given to another ${idWhom(state.kind)} by a create that has not finished. Nothing was created.`,
+          }
+        }
+        state.key = keyOf(id)
+        return null
+      }
+
+      if (state.key === null) {
+        const accounts = state.kind === 'uid'
+          ? (await idReads.users(reads))?.map(u => u.uid)
+          : (await idReads.groupsStrict(reads))?.map(g => g.gid)
+        if (accounts === undefined) {
+          return state.kind === 'uid'
+            ? accountsUnreadable('which uid is free')
+            : { status: 503, code: 'UNAVAILABLE', message: 'ANAS could not read the group database (getent group), so it cannot check which gid is free — nothing was done' }
+        }
+        const picked = await pickId(state.kind, accounts, { held: n => promisedTo(keyOf(n)), take: n => promiseId(keyOf(n)) }, own)
+        if ('id' in picked) {
+          state.id = picked.id
+          state.key = keyOf(picked.id)
+          state.skipped = picked.skipped
+          return null
+        }
+        if (picked.refusal === 'unreadable')
+          return idCheckUnreadable(state, picked.unreadable, null)
+        const field = `${idWhom(state.kind)}'s ${idField(state.kind)}`
+        const message = picked.refusal === 'tries'
+          ? `The next ${ID_PICK_TRIES} free ${state.kind}s from ${picked.from} all still own files (${state.kind} ${picked.skipped[0].id} owns ${picked.skipped[0].where}, …), so ANAS did not pick one. Nothing was created. Give the ${field} explicitly.`
+          : `No ${state.kind} from ${picked.from} to 59999 is free. Nothing was created. Give the ${field} explicitly (any free id from 1000).`
+        return { status: 409, code: 'CONFLICT', reason: 'no-free-id', message }
+      }
+
+      // The job door.
+      const id = state.id!
+      const held = await idHolder(executor, state.kind, id)
+      if ('unreadable' in held)
+        return idCheckUnreadable(state, held.unreadable, id)
+      if (held.holder !== null)
+        return idInUse(state, id, held.holder, 'was given meanwhile to')
+      if (!state.explicit) {
+        const owned = await idOwnership(state.kind, id, own)
+        if ('unreadable' in owned)
+          return idCheckUnreadable(state, owned.unreadable, id)
+        if (owned.owns) {
+          return {
+            status: 409,
+            code: 'STATE_CHANGED',
+            reason: 'id-owns-files',
+            message: `${state.kind} ${id} owns ${owned.where} now (it owned nothing when the request was checked). Nothing was created. Create it again and ANAS picks another.`,
+          }
+        }
+      }
+      return null
+    }
+  }
+
+  /** The route door of a create: guardCheck, dropping the id promise on any refusal or throw. */
+  async function createCheck(spec: GuardSpec<NameSlot>, state: CreateId): ReturnType<typeof guardCheck<NameSlot>> {
+    const drop = (): void => {
+      if (state.key !== null)
+        promisedIds.delete(state.key)
+    }
+    try {
+      const pre = await guardCheck(spec)
+      if ('refusal' in pre)
+        drop()
+      return pre
+    }
+    catch (err) {
+      drop()
+      throw err
+    }
+  }
+
+  /**
+   * Submit a create's job with its id promise bound to it: the promise is
+   * dropped as soon as the body ends (the account database answers from then
+   * on), and lapses if the job is cancelled before it ever starts.
+   */
+  function submitCreate(state: CreateId, ...[operation, submitter, handler, submitOpts]: Parameters<JobQueue['submit']>): ReturnType<JobQueue['submit']> {
+    const key = state.key!
+    const job = jobQueue.submit(operation, submitter, async (...args) => {
+      try {
+        return await handler(...args)
+      }
+      finally {
+        promisedIds.delete(key)
+      }
+    }, submitOpts)
+    const p = promisedIds.get(key)
+    if (p && p.jobId === undefined)
+      p.jobId = job.id
+    return job
+  }
+
+  /**
+   * The guard spec of a create: the object is the name slot, the gates are
+   * the request's with the id gate last. A create takes the case-folded name
+   * key and its id's `uid:`/`gid:` key (cr.29); a user created into
+   * supplementary groups changes those groups too, so it also takes their
+   * `gid:` keys.
+   */
+  function createGuardSpec(kind: 'user' | 'group', name: string, gates: Gate<NameSlot>[], state: CreateId, groups: string[] = []): GuardSpec<NameSlot> {
     return {
       operation: kind === 'user' ? 'identity.user.add' : 'identity.group.add',
       object: {
@@ -635,11 +903,12 @@ export async function shareIdentityRoutes(
         id: async () => ({ name }),
         unbound: () => `Could not read the name '${name}' — refusing`,
       },
-      gates,
+      gates: [...gates, createIdGate(state)],
       locks: async (_slot, _bound, reads) => {
         const byName = new Map((groups.length > 0 ? await idReads.groups(reads) : []).map(g => [g.name, g]))
         const gids = groups.map(g => byName.get(g)).filter((g): g is GroupEntry => g !== undefined)
-        return [nameClaim(name), ...gids.map(g => gidClaim(g.gid, g.name))]
+        const idKey = state.kind === 'uid' ? uidClaim(state.id!, name) : gidClaim(state.id!, name)
+        return [nameClaim(name), idKey, ...gids.map(g => gidClaim(g.gid, g.name))]
       },
     }
   }
@@ -784,17 +1053,20 @@ export async function shareIdentityRoutes(
         return null
       },
     ]
-    const spec = createGuardSpec('user', req.name, gates, groups)
-    const pre = await guardCheck(spec)
+    const idState = createId('uid', req.uid)
+    const spec = createGuardSpec('user', req.name, gates, idState, groups)
+    const pre = await createCheck(spec, idState)
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
+    const uid = idState.id!
 
-    // useradd -N -M -s /usr/sbin/nologin [-c <fullName>] [-G <groups>] <name>
+    // useradd -N -M -s /usr/sbin/nologin -u <uid> [-c <fullName>] [-G <groups>] <name>
     // -N (identity.1c): NO user-private group — the account takes the default
     // group from /etc/default/useradd, so creating 'Alice' does not conjure a
     // phantom group 'alice' into the Groups list. Pre-existing users keep
-    // whatever group they already had.
-    const args = ['-N', '-M', '-s', NOLOGIN]
+    // whatever group they already had. -u (cr.29): the uid decided above,
+    // never useradd's own highest-plus-one.
+    const args = ['-N', '-M', '-s', NOLOGIN, '-u', String(uid)]
     if (req.fullName !== undefined)
       args.push('-c', req.fullName)
     if (groups.length > 0)
@@ -803,13 +1075,15 @@ export async function shareIdentityRoutes(
 
     const smbPassword = req.smbPassword
 
-    const job = jobQueue.submit(
+    const job = submitCreate(
+      idState,
       'identity.user.add',
-      { ...identity, params: { user: req.name, groups: req.groups, smbEnabled: smbPassword !== undefined } },
+      { ...identity, params: { user: req.name, uid, uidGiven: idState.explicit, groups: req.groups, smbEnabled: smbPassword !== undefined } },
       // Ruling (j): the name is still free, the groups still exist and are
-      // in band, Samba is still there and no passdb entry claims the name.
+      // in band, Samba is still there, no passdb entry claims the name, and
+      // the uid is still free (a picked one still owns nothing).
       guarded(spec, pre, async (_slot, { updateProgress }) => {
-        updateProgress(`Creating share user '${req.name}'`)
+        updateProgress(`Creating share user '${req.name}' with uid ${uid}${skippedNote(idState)}`)
         const created = await executor.exec(USERADD, args)
         if (created.exitCode !== 0)
           throw new Error(created.stderr.trim() || `useradd exited with code ${created.exitCode}`)
@@ -831,6 +1105,7 @@ export async function shareIdentityRoutes(
         }
         return {
           created: req.name,
+          uid,
           smbEnabled: smbPassword !== undefined,
           ...(replaced !== undefined ? { smbEntryReplaced: replaced } : {}),
         }
@@ -972,24 +1247,30 @@ export async function shareIdentityRoutes(
     if (!identity)
       return
 
+    const idState = createId('gid', req.gid)
     const spec = createGuardSpec('group', req.name, [
       async (s, reads) => (await idReads.group(reads, s.name))
         ? { status: 409, code: 'CONFLICT', message: `Group '${s.name}' already exists` }
         : null,
-    ])
-    const pre = await guardCheck(spec)
+    ], idState)
+    const pre = await createCheck(spec, idState)
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
+    const gid = idState.id!
 
-    const job = jobQueue.submit(
+    const job = submitCreate(
+      idState,
       'identity.group.add',
-      { ...identity, params: { group: req.name } },
-      // Ruling (j): the name is still free when groupadd runs.
-      guarded(spec, pre, async () => {
-        const r = await executor.exec(GROUPADD, [req.name])
+      { ...identity, params: { group: req.name, gid, gidGiven: idState.explicit } },
+      // Ruling (j): the name and the gid are still free (a picked gid still
+      // owns nothing) when groupadd runs.
+      guarded(spec, pre, async (_slot, { updateProgress }) => {
+        updateProgress(`Creating group '${req.name}' with gid ${gid}${skippedNote(idState)}`)
+        // groupadd -g <gid> <name> (cr.29): never groupadd's own highest-plus-one.
+        const r = await executor.exec(GROUPADD, ['-g', String(gid), req.name])
         if (r.exitCode !== 0)
           throw new Error(r.stderr.trim() || `groupadd exited with code ${r.exitCode}`)
-        return { created: req.name }
+        return { created: req.name, gid }
       }),
       { locks: pre.locks },
     )
@@ -1090,17 +1371,15 @@ export async function shareIdentityRoutes(
     const hasSmb = routeSmb !== null && !passdbOwnedByOther(routeSmb, entry.uid)
     const warnings = [
       `User '${name}' (uid ${entry.uid}) will be removed from the system`,
-      `Files owned by the user keep their uid (${entry.uid}) — ownership is not changed, and a later user with the same uid would own them`,
+      leftOnFiles('uid', entry.uid),
     ]
     if (hasSmb)
       warnings.push(`Its SMB password entry will be removed`)
     warnings.push(...pre.advisories.map(a => a.warning))
-    // TODO(cr.30, cr.29): ACL-root references join these warnings as a
-    // confirm WARNING naming the roots (WAVE2-DESIGN §6 C4): `getfacl -n -p`
-    // of every SMB share path, NFS export path, ZFS filesystem mountpoint and
-    // AHR data mount, checked for a named user/group entry. Reading them is
-    // the route-enumerating scan cr.29 builds for the create-time backstop —
-    // no second scan gets built here; this lands when cr.29's does.
+    // TODO(cr.30): ACL-root references as a confirm WARNING naming the roots
+    // (WAVE2-DESIGN §6 C4: `getfacl -n -p` of every share root for a named
+    // entry). cr.29 as ruled (2026-10-15) reads OWNERSHIP (`zfs userspace`,
+    // `find -uid`), not ACL entries, so no scan exists for this to ride yet.
 
     // cr.42 (WAVE3-DESIGN §5.1 "User / group delete"): the code signs the
     // request AND the uid, so a resend after the name was re-created for
@@ -1142,7 +1421,8 @@ export async function shareIdentityRoutes(
 
         updateProgress(`Deleting share user '${name}'`)
         // Without `-r`: the files keep their uid, and nothing is swept from
-        // disk — a later user with the same uid would own them.
+        // disk. A later create skips the uid while it still owns files ANAS
+        // can see (cr.29); re-creating with the same uid gives them back.
         const r = await executor.exec(USERDEL, [name])
         if (r.exitCode !== 0)
           throw new Error(r.stderr.trim() || `userdel exited with code ${r.exitCode}`)
@@ -1184,11 +1464,10 @@ export async function shareIdentityRoutes(
 
     const warnings = [
       `Group '${name}' (gid ${entry.gid}) will be removed from the system`,
-      `Files owned by the group keep their gid (${entry.gid}) — ownership is not changed, and a later group with the same gid would own them`,
+      leftOnFiles('gid', entry.gid),
     ]
     warnings.push(...pre.advisories.map(a => a.warning))
-    // TODO(cr.30, cr.29): ACL-root confirm warning here too — see the user
-    // delete route; both warnings ride cr.29's root-enumerating scan.
+    // TODO(cr.30): ACL-root confirm warning here too — see the user delete route.
 
     // cr.42: the code signs the request and the gid (see the user delete).
     if (!guardConfirm(confirmStore, request, reply, spec, pre, {

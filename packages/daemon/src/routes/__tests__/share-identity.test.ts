@@ -47,6 +47,9 @@ const IDENTITY_HEADERS = {
 }
 const JSON_HEADERS = { ...IDENTITY_HEADERS, 'content-type': 'application/json' }
 
+/** No /etc/exports: an absent file reads as no exports (cr.29's share roots). */
+const ABSENT_EXPORTS = join(tmpdir(), `anas-test-absent-exports-${process.pid}`)
+
 async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
   for (let i = 0; i < 50; i++) {
     const res = await server.inject({ method: 'GET', url: `/v1/jobs/${id}`, headers: IDENTITY_HEADERS })
@@ -470,6 +473,7 @@ describe('share-identity routes', () => {
         confirmStore: new ConfirmStore(),
         // Never read on the paths this section exercises; absent file = none.
         smbConfPath: join(tmpdir(), `anas-test-absent-${process.pid}.conf`),
+        exportsPath: ABSENT_EXPORTS,
         smbpasswdAvailable: async () => false,
       })
       bare = app
@@ -505,6 +509,11 @@ describe('share-identity routes', () => {
 
     it('creates a user with no SMB password even when samba is missing', async () => {
       const { app, executor } = await withoutSamba()
+      // cr.29: the uid pick reads the accounts, the ZFS filesystems (none)
+      // and looks the candidate up by number (free: getent exit 2).
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: { stdout: 'root:x:0:0:root:/root:/bin/bash\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', '1000'], result: { stdout: '', stderr: '', exitCode: 2 } })
+      executor.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name', '-t', 'filesystem'], result: { stdout: '', stderr: '', exitCode: 0 } })
       const res = await app.inject({
         method: 'POST',
         url: '/v1/identity/users',
@@ -583,7 +592,7 @@ describe('share-identity routes', () => {
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
       // identity.1c rides the same argv: -N (no user-private group) first.
-      assert.deepEqual(find(calls, '/usr/sbin/useradd', () => true), ['-N', '-M', '-s', '/usr/sbin/nologin', 'Carol'])
+      assert.deepEqual(find(calls, '/usr/sbin/useradd', () => true), ['-N', '-M', '-s', '/usr/sbin/nologin', '-u', '1002', 'Carol'])
     })
   })
 
@@ -670,6 +679,7 @@ describe('share-identity routes', () => {
         jobQueue: queue,
         confirmStore: new ConfirmStore(),
         smbConfPath,
+        exportsPath: ABSENT_EXPORTS,
         smbpasswdAvailable: async () => true,
       })
     }
@@ -730,8 +740,9 @@ describe('share-identity routes', () => {
       assert.equal(challenged.error.code, 'CONFIRMATION_REQUIRED')
       assert.equal(challenged.error.warnings.length, 3)
       assert.match(challenged.error.warnings[0], /removed from the system/)
-      assert.match(challenged.error.warnings[1], /uid \(1000\)/)
-      assert.match(challenged.error.warnings[1], /not changed/)
+      // cr.29: the number stays on the files, said once, with what cannot be checked.
+      assert.equal(challenged.error.warnings[1], 'Files owned by this user keep uid 1000. ANAS will not give uid 1000 to a new user while it still owns files on an imported ZFS filesystem or under a share, but it cannot check ids seen only in exported pools, on disconnected disks or in backups. To give the files back later, re-create the user with User ID 1000.')
+      assert.equal(challenged.error.warnings.filter(w => w.includes('keep uid')).length, 1)
       assert.match(challenged.error.warnings[2], /SMB password entry will be removed/)
       const code = first.headers['x-anas-confirm-code'] as string
       assert.ok(code)
@@ -880,7 +891,7 @@ describe('share-identity routes', () => {
       assert.equal(challenged.error.code, 'CONFIRMATION_REQUIRED')
       assert.equal(challenged.error.warnings.length, 2)
       assert.match(challenged.error.warnings[0], /removed from the system/)
-      assert.match(challenged.error.warnings[1], /gid \(1002\)/)
+      assert.equal(challenged.error.warnings[1], 'Files owned by this group keep gid 1002. ANAS will not give gid 1002 to a new group while it still owns files on an imported ZFS filesystem or under a share, but it cannot check ids seen only in exported pools, on disconnected disks or in backups. To give the files back later, re-create the group with Group ID 1002.')
       const code = first.headers['x-anas-confirm-code'] as string
 
       const ok = await del('/v1/identity/groups/team', code)
@@ -968,6 +979,10 @@ describe('share-identity routes', () => {
       executor.addFixture({ command: '/usr/bin/pdbedit', result: ok('') })
       executor.addFixture({ command: '/usr/bin/smbpasswd', result: ok('') })
       executor.addFixture({ command: '/usr/sbin/useradd', result: ok('') })
+      // cr.29: no dataset, no share path; `getent passwd <n>` for a number
+      // nobody holds is exit 2 (getent(1)) — the create picks uid 1007.
+      executor.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name', '-t', 'filesystem'], result: ok('') })
+      executor.addFixture({ command: '/usr/bin/getent', argsMatch: a => a.length === 2 && a[0] === 'passwd' && Number(a[1]) >= 1007, result: NOT_FOUND })
 
       logLines = []
       app = Fastify({
@@ -986,6 +1001,7 @@ describe('share-identity routes', () => {
         jobQueue: queue,
         confirmStore: new ConfirmStore(),
         smbConfPath,
+        exportsPath: ABSENT_EXPORTS,
         smbpasswdAvailable: async () => true,
       })
       return app
@@ -1018,7 +1034,7 @@ describe('share-identity routes', () => {
       await rm(tmpDir, { recursive: true, force: true })
     })
 
-    const USERADD_NAME = ['/usr/sbin/useradd', '-N', '-M', '-s', '/usr/sbin/nologin', 'Name']
+    const USERADD_NAME = ['/usr/sbin/useradd', '-N', '-M', '-s', '/usr/sbin/nologin', '-u', '1007', 'Name']
     const SMBPASSWD_NAME = ['/usr/bin/smbpasswd', '-a', '-s', 'Name']
     const GETENT_NAME = ['/usr/bin/getent', 'passwd', 'Name']
     const PDBEDIT_LIST = ['/usr/bin/pdbedit', '-L']
@@ -1057,7 +1073,7 @@ describe('share-identity routes', () => {
       assert.equal(res.statusCode, 202)
       const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(job.result, { created: 'Name', smbEnabled: true })
+      assert.deepEqual(job.result, { created: 'Name', uid: 1007, smbEnabled: true })
       assert.deepEqual(sequenceFrom(c => c.command === '/usr/sbin/useradd'), [
         USERADD_NAME,
         SMBPASSWD_NAME,
@@ -1074,7 +1090,7 @@ describe('share-identity routes', () => {
       assert.equal(res.statusCode, 202)
       const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(job.result, { created: 'Name', smbEnabled: true, smbEntryReplaced: 'name' })
+      assert.deepEqual(job.result, { created: 'Name', uid: 1007, smbEnabled: true, smbEntryReplaced: 'name' })
       assert.deepEqual(sequenceFrom(c => c.command === '/usr/sbin/useradd'), [
         USERADD_NAME,
         SMBPASSWD_NAME,
@@ -1233,6 +1249,7 @@ describe('share-identity routes', () => {
         jobQueue: new JobQueue(),
         confirmStore: new ConfirmStore(),
         smbConfPath,
+        exportsPath: ABSENT_EXPORTS,
         smbpasswdAvailable: async () => true,
       })
       return app
@@ -1358,6 +1375,7 @@ describe('share-identity routes', () => {
         jobQueue: queue,
         confirmStore: new ConfirmStore(),
         smbConfPath,
+        exportsPath: ABSENT_EXPORTS,
         smbpasswdAvailable: async () => true,
       })
     }
@@ -1601,6 +1619,7 @@ describe('share-identity routes', () => {
         jobQueue: queue,
         confirmStore: new ConfirmStore(),
         smbConfPath,
+        exportsPath: ABSENT_EXPORTS,
         smbpasswdAvailable: async () => true,
       })
     }

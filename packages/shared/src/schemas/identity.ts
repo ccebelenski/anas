@@ -88,6 +88,32 @@ export type ShareGroup = z.infer<typeof ShareGroup>
 // --- Write models ---
 
 /**
+ * The share band: the uids and gids ANAS creates and changes, `[1000, 60000)`.
+ * Debian's login.defs says `UID_MIN 1000` / `UID_MAX 60000` (and the same for
+ * GIDs, probe P06), so UID_MAX itself sits OUTSIDE this band: a uid of exactly
+ * 60000 that `useradd`'s own allocator could hand out reads as a system account
+ * here (WAVE2-DESIGN §11). Since cr.29 ANAS always passes an explicit `-u`/`-g`
+ * from inside the band, so it never creates one. The daemon's `getent.ts`
+ * band helpers read these two numbers; nothing else may restate them.
+ */
+export const SHARE_ID_MIN = 1000
+/** The first id ABOVE the share band (exclusive bound). */
+export const SHARE_ID_LIMIT = 60000
+
+/**
+ * An explicit uid/gid on Add (story cr.29, ruled 2026-10-15): the out for
+ * re-creating an account that was deleted in error, so it owns its old files
+ * again. A whole number inside the share band; the route refuses one an
+ * existing account already holds, and does NOT check it for files (owning the
+ * old files is the point).
+ */
+export const ShareId = z.number()
+  .int('must be a whole number')
+  .min(SHARE_ID_MIN, `must be from ${SHARE_ID_MIN} to ${SHARE_ID_LIMIT - 1} (the share band)`)
+  .max(SHARE_ID_LIMIT - 1, `must be from ${SHARE_ID_MIN} to ${SHARE_ID_LIMIT - 1} (the share band)`)
+export type ShareId = z.infer<typeof ShareId>
+
+/**
  * Name for a locally-created user or group: exactly what `useradd`/`groupadd`
  * accept on Debian (identity.1a) — a letter or underscore (upper OR lowercase)
  * start, then letters/digits/underscore/hyphen; a trailing `$` allows machine
@@ -145,6 +171,11 @@ export const CreateShareUserRequest = z.object({
   groups: z.array(IdentityName).optional(),
   /** If set, also create the SMB passdb entry with this password */
   smbPassword: z.string().min(1).optional(),
+  /**
+   * The uid to create the account with (cr.29). Absent: ANAS picks the next
+   * free uid in the share band that owns nothing under the paths it manages.
+   */
+  uid: ShareId.optional(),
 })
 export type CreateShareUserRequest = z.infer<typeof CreateShareUserRequest>
 
@@ -163,6 +194,8 @@ export type SetUserEnabledRequest = z.infer<typeof SetUserEnabledRequest>
 /** Create a local group (POST /v1/identity/groups). */
 export const CreateGroupRequest = z.object({
   name: IdentityName,
+  /** The gid to create the group with (cr.29); absent: ANAS picks one, as for a user's uid. */
+  gid: ShareId.optional(),
 })
 export type CreateGroupRequest = z.infer<typeof CreateGroupRequest>
 

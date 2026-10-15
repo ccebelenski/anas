@@ -183,7 +183,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { AttachAhrCacheRequest, BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncPreviewRequest, CloudSyncTaskRequest, CreateSmbShareRequest, deriveArchiveName, lunBackupId, SetAccessRequest } from '@anas/shared'
+import { AttachAhrCacheRequest, BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncPreviewRequest, CloudSyncTaskRequest, CreateGroupRequest, CreateShareUserRequest, CreateSmbShareRequest, deriveArchiveName, lunBackupId, SetAccessRequest } from '@anas/shared'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = join(HERE, '..', 'src')
@@ -9941,6 +9941,31 @@ async function shareUsersChecks() {
     eq('create: a mixed-case name POSTs verbatim',
       [jobs[0] && jobs[0].method, jobs[0] && jobs[0].path, jobs[0] && jobs[0].body],
       ['post', '/identity/users', { name: 'Alice' }])
+
+    // --- (b) cr.29: the optional User ID — a number when given, no key when empty
+    const uidField = win.down('#uid')
+    ok('create (cr.29): the dialog has a numeric User ID field', !!uidField && uidField.xtype === 'numberfield')
+    eq('create (cr.29): it is labelled plainly', uidField && uidField.fieldLabel, 'User ID (optional)')
+    ok('create (cr.29): an EMPTY User ID sends no uid key', jobs[0] && !('uid' in jobs[0].body), JSON.stringify(jobs[0] && jobs[0].body))
+    jobs.length = 0
+    uidField.setValue(1004)
+    win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
+    await settle()
+    eq('create (cr.29): a User ID rides as a NUMBER', jobs[0] && jobs[0].body, { name: 'Alice', uid: 1004 })
+    ok('create (cr.29): …typeof number, not its text', jobs[0] && typeof jobs[0].body.uid === 'number')
+    validates('create (cr.29): the body parses as CreateShareUserRequest', CreateShareUserRequest, jobs[0] && jobs[0].body)
+    jobs.length = 0
+    uidField.setValue(null)
+    win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
+    await settle()
+    eq('create (cr.29): a cleared User ID is not sent', jobs[0] && jobs[0].body, { name: 'Alice' })
+    jobs.length = 0
+    warnings.length = 0
+    uidField.setValue(60000)
+    win.buttonCmps.find(b => b.cls === 'anas-btn-user-create-submit').handler(null)
+    await settle()
+    eq('create (cr.29): a User ID outside the share band sends nothing', jobs.length, 0)
+    ok('create (cr.29): …and says the band', warnings.some(w => /User ID must be a whole number from 1000 to 59999, or empty/.test(w)), JSON.stringify(warnings))
     if (!win.destroyed) { win.close() }
   }
 
@@ -9963,6 +9988,30 @@ async function shareUsersChecks() {
     ok('group create: it alerts with the mixed-case wording',
       warnings.some(w => /Enter a valid group name \(letters, digits, _ and -\)/.test(w)),
       JSON.stringify(warnings))
+
+    // cr.29: the optional Group ID, the same contract as the User ID.
+    const gidField = win.down('#gid')
+    ok('group create (cr.29): the dialog has a numeric Group ID field', !!gidField && gidField.xtype === 'numberfield')
+    eq('group create (cr.29): it is labelled plainly', gidField && gidField.fieldLabel, 'Group ID (optional)')
+    gname.setValue('media')
+    win.buttonCmps.find(b => b.cls === 'anas-btn-group-create-submit').handler(null)
+    await settle()
+    eq('group create (cr.29): an EMPTY Group ID sends no gid key', jobs[0] && jobs[0].body, { name: 'media' })
+    validates('group create (cr.29): the body parses as CreateGroupRequest', CreateGroupRequest, jobs[0] && jobs[0].body)
+    jobs.length = 0
+    gidField.setValue(1005)
+    win.buttonCmps.find(b => b.cls === 'anas-btn-group-create-submit').handler(null)
+    await settle()
+    eq('group create (cr.29): a Group ID rides as a NUMBER', jobs[0] && jobs[0].body, { name: 'media', gid: 1005 })
+    ok('group create (cr.29): …typeof number', jobs[0] && typeof jobs[0].body.gid === 'number')
+    validates('group create (cr.29): the body parses as CreateGroupRequest', CreateGroupRequest, jobs[0] && jobs[0].body)
+    jobs.length = 0
+    warnings.length = 0
+    gidField.setValue(999)
+    win.buttonCmps.find(b => b.cls === 'anas-btn-group-create-submit').handler(null)
+    await settle()
+    eq('group create (cr.29): a Group ID outside the share band sends nothing', jobs.length, 0)
+    ok('group create (cr.29): …and says the band', warnings.some(w => /Group ID must be a whole number from 1000 to 59999, or empty/.test(w)), JSON.stringify(warnings))
     if (!win.destroyed) { win.close() }
   }
 

@@ -471,6 +471,10 @@ export function createServer(opts?: ServerOptions) {
     // which the routes read as "resolves / is local" — fine for dev mutations.
     mock.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'media'], result: { stdout: 'media:x:1000:1000:Media User:/home/media:/usr/sbin/nologin\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/getent', args: ['group', 'smbusers'], result: { stdout: 'smbusers:x:1001:media,backup-svc\n', stderr: '', exitCode: 0 } })
+    // cr.29: a create looks its uid/gid up BY NUMBER (`getent passwd 1002`);
+    // the sample's in-band ids are 1000/1001, so any number from 1002 is free
+    // (exit 2, as getent(1) documents for a key the database does not hold).
+    mock.addFixture({ command: '/usr/bin/getent', argsMatch: a => a.length === 2 && (a[0] === 'passwd' || a[0] === 'group') && Number(a[1]) >= 1002, result: { stdout: '', stderr: '', exitCode: 2 } })
     // Identity mutations (useradd/usermod/groupadd/gpasswd/smbpasswd) — dynamic
     // args, so command-only fallbacks let dev-mode mutations succeed.
     mock.addFixture({ command: '/usr/sbin/useradd', result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -767,6 +771,9 @@ export function createServer(opts?: ServerOptions) {
     // The delete routes read it to refuse an identity a share still names in
     // `valid users` — the SAME path the share routes edit.
     smbConfPath,
+    // A create reads the share and export paths as the roots a picked
+    // uid/gid must own nothing under (cr.29) — the SAME file the NFS routes edit.
+    exportsPath,
     // The dev mock never spawns anything, so probing the real /usr/bin/smbpasswd
     // would make the SMB paths untestable on a machine without samba.
     ...(opts?.mock ? { smbpasswdAvailable: async () => true } : {}),

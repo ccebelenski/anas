@@ -116,6 +116,9 @@ const GROUPADD = '/usr/sbin/groupadd'
 const GROUPDEL = '/usr/sbin/groupdel'
 const GPASSWD = '/usr/bin/gpasswd'
 const SMBPASSWD = '/usr/bin/smbpasswd'
+const FINDMNT = '/usr/bin/findmnt'
+/** cr.29: a create walks the smb.conf share roots; the stunt node's captured mount table (story 18.1) puts /tank on the ext4 root. */
+const FINDMNT_FULL = readFileSync(join(FIXTURES, 'mounts/findmnt-full.json'), 'utf-8')
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -203,6 +206,8 @@ describe('cr.42 — identity verbs re-gate in the job (ruling (j))', () => {
           return getent(groups, a[1])
         return ok('')
       }
+      if (command === FINDMNT)
+        return ok(FINDMNT_FULL)
       if (command === PDBEDIT && args[0] === '-L')
         return ok(pdbedit)
       return ok('')
@@ -215,6 +220,7 @@ describe('cr.42 — identity verbs re-gate in the job (ruling (j))', () => {
       jobQueue: queue,
       confirmStore: new ConfirmStore(),
       smbConfPath,
+      exportsPath: join(dir, 'exports'),
       smbpasswdAvailable: async () => true,
     })
   }
@@ -499,7 +505,7 @@ describe('cr.42 — the delete confirm binds the uid / gid', () => {
     }
     queue = new JobQueue()
     app = Fastify({ logger: false })
-    await app.register(shareIdentityRoutes, { prefix: '/v1', executor, jobQueue: queue, confirmStore: new ConfirmStore(), smbConfPath, smbpasswdAvailable: async () => true })
+    await app.register(shareIdentityRoutes, { prefix: '/v1', executor, jobQueue: queue, confirmStore: new ConfirmStore(), smbConfPath, exportsPath: join(dir, 'exports'), smbpasswdAvailable: async () => true })
   })
 
   afterEach(async () => {
@@ -575,6 +581,8 @@ describe('cr.42 — identity verbs take their lock keys', () => {
         const line = lines.find(l => l.split(':')[0] === a[1])
         return line ? ok(`${line}\n`) : ABSENT
       }
+      if (command === FINDMNT)
+        return ok(FINDMNT_FULL)
       if (command === PDBEDIT && args[0] === '-L')
         return ok(passwd.includes(ACCUSER) ? `${PDBEDIT_ACCUSER}\n` : '')
       const hold = paused.get(command)
@@ -584,7 +592,7 @@ describe('cr.42 — identity verbs take their lock keys', () => {
     }
     queue = new JobQueue()
     app = Fastify({ logger: false })
-    await app.register(shareIdentityRoutes, { prefix: '/v1', executor, jobQueue: queue, confirmStore: new ConfirmStore(), smbConfPath, smbpasswdAvailable: async () => true })
+    await app.register(shareIdentityRoutes, { prefix: '/v1', executor, jobQueue: queue, confirmStore: new ConfirmStore(), smbConfPath, exportsPath: join(dir, 'exports'), smbpasswdAvailable: async () => true })
   })
 
   afterEach(async () => {
@@ -670,14 +678,14 @@ describe('cr.42 — identity verbs take their lock keys', () => {
     assert.equal((await finished(id)).status, 'completed')
   })
 
-  it('a create holds the case-folded name key and the gid of every group it joins; a disable / SMB password holds uid:<n> only', async () => {
+  it('a create holds the case-folded name key, its uid:<n> (cr.29) and the gid of every group it joins; a disable / SMB password holds uid:<n> only', async () => {
     passwd = []
     const releaseAdd = pause(USERADD)
     const res = await app!.inject({ method: 'POST', url: '/v1/identity/users', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'AccUser', groups: ['accgroup'] }) })
     assert.equal(res.statusCode, 202, res.body)
     const id = (res.json() as JobAccepted).job.id
     await until(() => calls.some(c => c.command === USERADD))
-    assert.deepEqual(queue.heldLocks().map(l => [l.key, l.mode]), [['idname:accuser', 'exclusive'], ['gid:1005', 'exclusive']])
+    assert.deepEqual(queue.heldLocks().map(l => [l.key, l.mode]), [['idname:accuser', 'exclusive'], ['uid:1000', 'exclusive'], ['gid:1005', 'exclusive']])
     releaseAdd()
     assert.equal((await finished(id)).status, 'completed')
 

@@ -46,7 +46,9 @@
  *                    'anas-win-group-create' / 'anas-win-group-members'
  *   fields           'anas-fld-user-name' / 'anas-fld-user-fullname' /
  *                    'anas-fld-user-groups' / 'anas-fld-smb-password' /
- *                    'anas-fld-group-name' / 'anas-fld-group-members'
+ *                    'anas-fld-group-name' / 'anas-fld-group-members' /
+ *                    'anas-fld-user-uid' / 'anas-fld-group-gid' (cr.29: optional
+ *                    numeric ids — sent as a number, omitted when empty)
  *   submit buttons   'anas-btn-user-create-submit' / 'anas-btn-smb-password-submit' /
  *                    'anas-btn-group-create-submit' / 'anas-btn-group-members-submit'
  *
@@ -82,6 +84,53 @@
     // optional trailing $ for machine accounts. The daemon is authoritative;
     // this only catches obvious typos before the round-trip.
     var NAME_RE = /^[A-Za-z_][A-Za-z0-9_-]*\$?$/;
+
+    // cr.29: the share band an explicit User ID / Group ID must sit in
+    // (shared SHARE_ID_MIN / SHARE_ID_LIMIT - 1; the daemon is authoritative).
+    var ID_MIN = 1000;
+    var ID_MAX = 59999;
+
+    // The optional numeric id field of the Add dialogs (cr.29). Left empty,
+    // ANAS picks the next free id that owns no files; a number given is used
+    // as is — the out for re-creating an account deleted in error.
+    function idField(itemId, cls, label) {
+        return {
+            xtype: 'numberfield',
+            itemId: itemId,
+            cls: cls,
+            fieldLabel: t(label),
+            emptyText: t('(optional — ANAS picks a free one)'),
+            allowDecimals: false,
+            minValue: ID_MIN,
+            maxValue: ID_MAX,
+            hideTrigger: true,
+        };
+    }
+
+    // The id field's value for the request body: null when empty (the key is
+    // then NOT sent), the NUMBER otherwise (a numberfield's value rides as a
+    // number, never its text — cr.44), false when it is not a whole number in
+    // the band.
+    function idValue(field) {
+        var v = field ? field.getValue() : null;
+        if (v === null || v === undefined || v === '') {
+            return null;
+        }
+        if (typeof v === 'string') {
+            v = trim(v);
+            if (!v) {
+                return null;
+            }
+            if (!/^\d+$/.test(v)) {
+                return false;
+            }
+            v = Number(v);
+        }
+        if (typeof v !== 'number' || !isFinite(v) || Math.floor(v) !== v || v < ID_MIN || v > ID_MAX) {
+            return false;
+        }
+        return v;
+    }
 
     // ---- Selection helpers -------------------------------------------------
 
@@ -381,6 +430,7 @@
                             fieldLabel: t('Full name'),
                             emptyText: t('(optional)'),
                         },
+                        idField('uid', 'anas-fld-user-uid', 'User ID (optional)'),
                         {
                             xtype: 'tagfield',
                             itemId: 'groups',
@@ -471,7 +521,16 @@
             }
         }
 
+        var uid = idValue(win.down('#uid'));
+        if (uid === false) {
+            ANAS.alertMsg('Invalid input', t('User ID must be a whole number from 1000 to 59999, or empty.'));
+            return;
+        }
+
         var body = { name: name };
+        if (uid !== null) {
+            body.uid = uid;
+        }
         var fullName = trim(win.down('#fullName').getValue());
         if (fullName) {
             body.fullName = fullName;
@@ -941,6 +1000,7 @@
                             regexText: t('Letters, digits, underscore and hyphen only; may start with a letter or underscore.'),
                             maxLength: 32,
                         },
+                        idField('gid', 'anas-fld-group-gid', 'Group ID (optional)'),
                     ],
                 }],
                 buttons: [
@@ -981,12 +1041,21 @@
             ANAS.alertMsg('Invalid input', t('Enter a valid group name (letters, digits, _ and -).'));
             return;
         }
+        var gid = idValue(win.down('#gid'));
+        if (gid === false) {
+            ANAS.alertMsg('Invalid input', t('Group ID must be a whole number from 1000 to 59999, or empty.'));
+            return;
+        }
+        var body = { name: name };
+        if (gid !== null) {
+            body.gid = gid;
+        }
 
         ANAS.runJob({
             node: node,
             method: 'post',
             path: '/identity/groups',
-            body: { name: name },
+            body: body,
             view: win,
             failTitle: 'Create failed',
             successMsg: t('Group created') + ': ' + name,
