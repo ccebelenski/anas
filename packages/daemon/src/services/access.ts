@@ -409,6 +409,19 @@ function failureRefusal(f: AccessFailure): Refusal {
 // The service
 // ============================================================================
 
+/**
+ * A PVE-territory gate's refusal and WHICH fact it states (cr.47b):
+ * `pveOwned: true` — PVE owns the object or something in its tree, the one
+ * fact that answers 409 PVE_MANAGED at every door; `pveOwned: false` — the
+ * daemon cannot SEE the answer (unreadable storage.cfg, unlistable subtree),
+ * a different fact that keeps its 400. The doors map the flag; the helpers
+ * never invent the status.
+ */
+export interface TerritoryRefusal {
+  message: string
+  pveOwned: boolean
+}
+
 export interface AccessServiceOptions {
   executor: CommandExecutor
   /** iSCSI read-layer overrides — the held-by-LUN gate on AHR targets. */
@@ -521,12 +534,14 @@ export function createAccessService(opts: AccessServiceOptions) {
    * or null when there is none. An unreadable dataset list refuses (a walk the
    * daemon cannot see through is never allowed).
    */
-  async function zfsRecursiveRefusal(poolName: string, fullName: string): Promise<string | null> {
+  async function zfsRecursiveRefusal(poolName: string, fullName: string): Promise<TerritoryRefusal | null> {
     const datasets = await listDatasetsOrNull(poolName)
     if (!datasets)
-      return pveDescendantsUnlistedMessage('permission change', fullName)
+      return { message: pveDescendantsUnlistedMessage('permission change', fullName), pveOwned: false }
     const descendant = (await loadPveFootprint(executor)).ownedDescendant(datasets, fullName)
-    return descendant ? pveRecursiveRefusalMessage('Recursive permission change', fullName, descendant) : null
+    return descendant
+      ? { message: pveRecursiveRefusalMessage('Recursive permission change', fullName, descendant), pveOwned: descendant.ownership.kind !== 'config-unreadable' }
+      : null
   }
 
   /**
@@ -551,25 +566,25 @@ export function createAccessService(opts: AccessServiceOptions) {
   }
 
   /** A non-ZFS directory that sits at or under a PVE storage's path is PVE's to manage. */
-  async function pathOwnershipRefusal(dir: string): Promise<string | null> {
+  async function pathOwnershipRefusal(dir: string): Promise<TerritoryRefusal | null> {
     const paths = await pveStoragePaths()
     if (!paths)
-      return storageUnreadableMessage(dir)
+      return { message: storageUnreadableMessage(dir), pveOwned: false }
     for (const [storagePath, storage] of paths) {
       if (isPathWithin(storagePath, dir))
-        return `'${dir}' is inside '${storagePath}', the path of PVE storage '${storage}' — its permissions are PVE's to manage`
+        return { message: `'${dir}' is inside '${storagePath}', the path of PVE storage '${storage}' — its permissions are PVE's to manage`, pveOwned: true }
     }
     return null
   }
 
   /** A recursive walk over a non-ZFS directory that holds a PVE storage's path below it. */
-  async function pathRecursiveRefusal(dir: string): Promise<string | null> {
+  async function pathRecursiveRefusal(dir: string): Promise<TerritoryRefusal | null> {
     const paths = await pveStoragePaths()
     if (!paths)
-      return storageUnreadableMessage(dir)
+      return { message: storageUnreadableMessage(dir), pveOwned: false }
     for (const [storagePath, storage] of paths) {
       if (storagePath !== dir && isPathWithin(dir, storagePath))
-        return `Recursive permission change of '${dir}' would include ${storagePath} — the path of PVE storage '${storage}'`
+        return { message: `Recursive permission change of '${dir}' would include ${storagePath} — the path of PVE storage '${storage}'`, pveOwned: true }
     }
     return null
   }
@@ -589,19 +604,28 @@ export function createAccessService(opts: AccessServiceOptions) {
    */
   async function guardPathTarget(t: AhrAccessTarget | ShareAccessTarget, req: SetAccessRequest): Promise<AccessFailure | null> {
     const dir = targetDir(t)
+    // cr.47b: a PVE-territory FACT answers 409 PVE_MANAGED (the one answer,
+    // reason `pve-managed`); a fact the daemon cannot see (unreadable
+    // storage.cfg, unlistable subtree) is a DIFFERENT fact and keeps 400.
+    const pveFail = (message: string): AccessFailure => ({ status: 409, body: { error: { code: 'PVE_MANAGED', reason: 'pve-managed', message } } })
     const bad = (message: string): AccessFailure => ({ status: 400, body: { error: { code: 'VALIDATION_ERROR', message } } })
+    const fail = (r: TerritoryRefusal): AccessFailure => (r.pveOwned ? pveFail(r.message) : bad(r.message))
 
     if (t.kind === 'share' && t.home?.kind === 'zfs') {
       // The share backstop's own answer (pvepool.1): a path on an owned
-      // dataset, or inside a dir storage's path on ZFS.
+      // dataset, or inside a dir storage's path on ZFS. The config-unreadable
+      // verdict is the cannot-see fact (cr.47b) and keeps its 400.
       const claim = (await loadPveFootprint(executor)).sharePathClaim(dir)
-      if (claim)
-        return bad(claim.kind === 'dataset' ? claim.ownership.reason : `'${dir}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims`)
+      if (claim) {
+        if (claim.kind === 'dataset')
+          return claim.ownership.kind === 'config-unreadable' ? bad(claim.ownership.reason) : pveFail(claim.ownership.reason)
+        return pveFail(`'${dir}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims`)
+      }
     }
     else {
       const owned = await pathOwnershipRefusal(dir)
       if (owned)
-        return bad(owned)
+        return fail(owned)
     }
 
     if (req.applyToExisting === true) {
@@ -609,11 +633,11 @@ export function createAccessService(opts: AccessServiceOptions) {
         const poolName = t.home.dataset.split('/')[0]
         const refusal = await zfsRecursiveRefusal(poolName, t.home.dataset)
         if (refusal)
-          return bad(refusal)
+          return fail(refusal)
       }
       const refusal = await pathRecursiveRefusal(dir)
       if (refusal)
-        return bad(refusal)
+        return fail(refusal)
     }
     return null
   }

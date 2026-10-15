@@ -628,7 +628,8 @@ describe('PVE footprint ownership (pvepool.1)', () => {
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ path: 'vm-100-disk-0/inner' }),
     })
-    assert.equal(res.statusCode, 400)
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     assert.match(res.json().error.message, /owns testpool\/vm-100-disk-0\/inner/)
   })
 
@@ -640,7 +641,8 @@ describe('PVE footprint ownership (pvepool.1)', () => {
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ properties: { compression: 'lz4' } }),
     })
-    assert.equal(res.statusCode, 400)
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     assert.match(res.json().error.message, /guest volume/)
   })
 
@@ -651,7 +653,8 @@ describe('PVE footprint ownership (pvepool.1)', () => {
       url: '/v1/pools/testpool/datasets/vm-100-disk-0',
       headers: IDENTITY_HEADERS,
     })
-    assert.equal(res.statusCode, 400)
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     assert.match(res.json().error.message, /guest volume/)
   })
 
@@ -672,8 +675,9 @@ describe('PVE footprint ownership (pvepool.1)', () => {
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ entries: [{ kind: 'owner', level: 'read-write' }] }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
+    assert.equal(res.json().error.reason, 'pve-managed')
     assert.match(res.json().error.message, /local-zfs/)
     assert.match(res.json().error.message, /testpool\/vm-100-disk-0/)
     assert.match(res.json().error.message, /guest volume/)
@@ -728,8 +732,8 @@ describe('PVE footprint ownership (pvepool.1)', () => {
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ name: 'pre-upgrade' }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     assert.match(res.json().error.message, /local-zfs/)
     assert.match(res.json().error.message, /testpool\/vm-100-disk-0/)
     assert.match(res.json().error.message, /guest volume/)
@@ -743,19 +747,20 @@ describe('PVE footprint ownership (pvepool.1)', () => {
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ newName: 'renamed' }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     assert.match(res.json().error.message, /guest volume/)
   })
 
-  it('rolling back an OWNED dataset is refused before the confirm gate (400, not 409)', async () => {
+  it('rolling back an OWNED dataset is refused before the confirm gate (409 PVE_MANAGED, cr.47b)', async () => {
     guestVolumeWithSnapshot()
     const res = await server!.inject({
       method: 'POST',
       url: '/v1/pools/testpool/datasets/vm-100-disk-0/snapshots/vm-snap/rollback',
       headers: IDENTITY_HEADERS,
     })
-    assert.equal(res.statusCode, 400)
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     assert.match(res.json().error.message, /guest volume/)
     assert.equal(res.headers['x-anas-confirm-code'], undefined)
   })
@@ -767,7 +772,8 @@ describe('PVE footprint ownership (pvepool.1)', () => {
       url: '/v1/pools/testpool/datasets/vm-100-disk-0/snapshots/vm-snap',
       headers: IDENTITY_HEADERS,
     })
-    assert.equal(res.statusCode, 400)
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     assert.match(res.json().error.message, /guest volume/)
   })
 
@@ -779,7 +785,8 @@ describe('PVE footprint ownership (pvepool.1)', () => {
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ target: 'testpool/restored' }),
     })
-    assert.equal(res.statusCode, 400)
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     assert.match(res.json().error.message, /guest volume/)
   })
 
@@ -916,9 +923,9 @@ describe('recursive verbs over a NESTED PVE storage (review fix 2)', () => {
       url: '/v1/pools/testpool/datasets/x?recursive=true',
       headers: IDENTITY_HEADERS,
     })
-    assert.equal(res.statusCode, 400)
+    assert.equal(res.statusCode, 409)
     const { error } = res.json() as { error: { code: string, message: string } }
-    assert.equal(error.code, 'VALIDATION_ERROR')
+    assert.equal(error.code, 'PVE_MANAGED')
     assert.match(error.message, /Destroy of 'testpool\/x' would include testpool\/x\/data/)
     assert.match(error.message, /local-zfs/)
   })
@@ -940,9 +947,9 @@ describe('recursive verbs over a NESTED PVE storage (review fix 2)', () => {
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ name: 'snap1', recursive: true }),
     })
-    assert.equal(res.statusCode, 400)
+    assert.equal(res.statusCode, 409)
     const { error } = res.json() as { error: { code: string, message: string } }
-    assert.equal(error.code, 'VALIDATION_ERROR')
+    assert.equal(error.code, 'PVE_MANAGED')
     assert.match(error.message, /Recursive snapshot of 'testpool\/x' would include testpool\/x\/data/)
   })
 
@@ -1143,9 +1150,10 @@ describe('ident.1 — recursive permission changes stop at PVE descendants (audi
     payload: JSON.stringify(body),
   })
 
-  it('a recursive access change (applyToExisting) over the same tree → 400 naming it', async () => {
+  it('a recursive access change (applyToExisting) over the same tree → 409 PVE_MANAGED naming it (cr.47b)', async () => {
     const res = await put('/v1/pools/testpool/datasets/x/access', { owner: 'root', applyToExisting: true })
-    assert.equal(res.statusCode, 400)
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     assert.match(res.json().error.message, /would include testpool\/x\/data/)
   })
 })

@@ -23,7 +23,7 @@ import { readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { readIscsiState, withIscsiLock } from '../services/iscsi-mutate.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
-import { loadPveFootprint, pveDescendantsUnlistedMessage, pveNamingGuardMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
+import { loadPveFootprint, ownershipRefusal, pveDescendantsUnlistedMessage, pveManagedRefusal, pveNamingGuardMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { describeHolds, readLocalHoldsChecked } from '../services/replication-holds.js'
 import { createZfsSnapshot, destroyZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
@@ -548,7 +548,7 @@ export async function datasetRoutes(
    * daemon cannot see through is never allowed). The question lives in the
    * access service (access.1) so the share grant asks the same one.
    */
-  async function recursiveOwnedRefusal(poolName: string, fullName: string): Promise<string | null> {
+  async function recursiveOwnedRefusal(poolName: string, fullName: string) {
     return access.zfsRecursiveRefusal(poolName, fullName)
   }
 
@@ -628,7 +628,7 @@ export async function datasetRoutes(
     return out
   }
 
-  /** 400 VALIDATION_ERROR: the PVE-territory refusals keep the status these routes always answered. */
+  /** 400 VALIDATION_ERROR: a request the daemon cannot act on as stated. */
   function invalid(message: string): Refusal {
     return { status: 400, code: 'VALIDATION_ERROR', message }
   }
@@ -641,12 +641,13 @@ export async function datasetRoutes(
   /**
    * The OWNERSHIP gate (story pvepool.1): an OWNED dataset (a storage root, a
    * guest volume, a dir-storage tree, the boot tree) is view-only to every
-   * verb here. 400 with the predicate's reason, no bypass.
+   * verb here. 409 PVE_MANAGED (cr.47b — the one answer a PVE-territory fact
+   * gets at every door) with the predicate's reason, no bypass.
    */
   function ownedGate<O>(nameOf: (o: O) => string): Gate<O> {
     return async (o, reads) => {
       const owned = (await dsReads.footprint(reads)).ownershipOf(nameOf(o))
-      return owned ? invalid(owned.reason) : null
+      return owned ? ownershipRefusal(owned) : null
     }
   }
 
@@ -714,7 +715,7 @@ export async function datasetRoutes(
       if (!o.listing)
         return null
       const descendant = (await dsReads.footprint(reads)).ownedDescendant(o.listing.datasets, o.name)
-      return descendant ? invalid(pveRecursiveRefusalMessage(label, o.name, descendant)) : null
+      return descendant ? ownershipRefusal(descendant.ownership, pveRecursiveRefusalMessage(label, o.name, descendant)) : null
     }
   }
 
@@ -1705,10 +1706,10 @@ export async function datasetRoutes(
 
     // pvepool.1 review fixes: an OWNED dataset is view-only — setfacl/chmod on
     // its mountpoint (let alone -R) is PVE's territory to change. Asked BEFORE
-    // the target resolution so an owned VOLUME is refused 400 with the reason
-    // (the resolution would 404 it as "not a mounted filesystem") and before
-    // any command runs. The plain path parse is the one the resolution repeats;
-    // the 400 it can send is identical.
+    // the target resolution so an owned VOLUME is refused 409 PVE_MANAGED with
+    // the reason (the resolution would 404 it as "not a mounted filesystem")
+    // and before any command runs. The plain path parse is the one the
+    // resolution repeats; the 400 it can send is identical.
     const name = access.zfsFullName(poolName, path)
     if (!name.ok) {
       reply.code(name.failure.status)
@@ -1735,8 +1736,11 @@ export async function datasetRoutes(
         async () => {
           if (req.applyToExisting !== true)
             return null
+          // cr.47b: an owned descendant answers 409 PVE_MANAGED like every
+          // other door; the unlistable-subtree case is a different fact and
+          // keeps its 400.
           const refusal = await recursiveOwnedRefusal(poolName, fullName)
-          return refusal ? invalid(refusal) : null
+          return refusal ? (refusal.pveOwned ? pveManagedRefusal(refusal.message) : invalid(refusal.message)) : null
         },
       ],
     })

@@ -1,6 +1,7 @@
 import type { PveOwnership, PveStorageRef, SystemPoolFacts } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { ZfsMountpoint } from '../parsers/pve-storage.js'
+import type { Refusal } from '../safety/guard.js'
 import type { SystemMountFacts } from './system-mounts.js'
 import { isPathWithin, pveOwnership, wouldBeClaimedByPve } from '@anas/shared'
 import { matchMountpoint, pathOnZfsFilesystem, PVE_STORAGE_CFG, readPveStorages, readZfsMountpointsFull } from '../parsers/pve-storage.js'
@@ -541,6 +542,31 @@ export async function loadPveFootprint(
 export function pveNamingGuardMessage(storage: string, name: string): string {
   return `PVE storage '${storage}' would inventory '${name}' as a guest disk on its next scan — `
     + `pick a name that does not start with vm-/base-/subvol-/basevol-<number>-`
+}
+
+/**
+ * The ONE answer to a PVE-territory fact (cr.47b, operator ruling 2026-10-15):
+ * 409 PVE_MANAGED, reason `pve-managed`, at every dataset, snapshot, access
+ * and share door — the same answer pools have given since cr.32. The sentence
+ * is the predicate's own; only doors that state a DIFFERENT fact (an
+ * unreadable storage.cfg, an unlistable subtree) answer otherwise.
+ */
+export function pveManagedRefusal(message: string): Refusal {
+  return { status: 409, code: 'PVE_MANAGED', message, reason: 'pve-managed' }
+}
+
+/**
+ * The refusal an OWNERSHIP VERDICT raises (cr.47b): the verdict carries which
+ * fact it states. A real claim (storage root, guest volume, dir tree, system
+ * pool) is the one territory fact — 409 PVE_MANAGED. The `config-unreadable`
+ * verdict is the daemon saying it CANNOT SEE (storage.cfg unreadable), a
+ * different fact that keeps the 400 VALIDATION_ERROR it has always given.
+ * `message` lets a recursive door state its own sentence over the verdict.
+ */
+export function ownershipRefusal(ownership: PveOwnership, message: string = ownership.reason): Refusal {
+  return ownership.kind === 'config-unreadable'
+    ? { status: 400, code: 'VALIDATION_ERROR', message }
+    : pveManagedRefusal(message)
 }
 
 /**

@@ -852,7 +852,8 @@ describe('recursive apply — the confirm gate and child datasets (rulings 2026-
         { command: '/usr/sbin/zfs', args: CHILDREN_ARGS, result: ok(`${CHILDREN}testpool/media/vm\t/testpool/media/vm\toff\n`) },
       ])
       const res = await server.inject(putMedia(NAMED_RECURSIVE))
-      assert.equal(res.statusCode, 400, res.body)
+      assert.equal(res.statusCode, 409, res.body)
+      assert.equal(res.json().error.code, 'PVE_MANAGED')
       assert.match(res.json().error.message, /Recursive permission change of 'testpool\/media' would include testpool\/media\/vm/)
       assert.equal(res.headers['x-anas-confirm-code'], undefined, 'a refusal never offers a confirm')
       // nf.1: the plan READS the child list (the walk's scope) with the

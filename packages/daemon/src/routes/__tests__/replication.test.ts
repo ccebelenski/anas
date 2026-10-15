@@ -549,7 +549,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     }
   }
 
-  it('snapshot-first onto an OWNED source is refused 400 with the ownership reason', async () => {
+  it('snapshot-first onto an OWNED source is refused 409 PVE_MANAGED with the ownership reason (cr.47b)', async () => {
     server = createServer({ mock: true, logger: false })
     armSuccessfulRun()
     const { restore } = await storageCfg(CLAIM)
@@ -560,8 +560,9 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
         headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
         payload: JSON.stringify({ target: { pool: 'testpool2' }, snapshotFirst: true }),
       })
-      assert.equal(res.statusCode, 400)
-      assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.json().error.code, 'PVE_MANAGED')
+      assert.equal(res.json().error.reason, 'pve-managed')
       assert.match(res.json().error.message, /snapshot-first replication would snapshot/i)
       assert.match(res.json().error.message, /local-zfs/)
       assert.match(res.json().error.message, /testpool\/share1/)
@@ -622,7 +623,8 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
         headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
         payload: JSON.stringify({ target: { pool: 'testpool2' }, snapshotFirst: true }),
       })
-      assert.equal(res.statusCode, 400)
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.json().error.code, 'PVE_MANAGED')
       assert.match(res.json().error.message, /local-zfs/)
       assert.match(res.json().error.message, /testpool\/share1/)
     }

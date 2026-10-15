@@ -15,7 +15,7 @@ import { confirmGate } from '../safety/gate.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, reverify, sendRefusal, smbShareClaim } from '../safety/guard.js'
 import { createAccessService, SET_ACCESS_PRESENTATION_ONLY, signedAccessRequest } from '../services/access.js'
 import { ConfigConflictError, editConfig, readConfig } from '../services/config-writer.js'
-import { loadPveFootprint } from '../services/pve-footprint.js'
+import { loadPveFootprint, ownershipRefusal, pveManagedRefusal } from '../services/pve-footprint.js'
 import { probeSharePath, probeSharePaths, sharePathFields } from '../services/share-path.js'
 import { enablingSelfService, ensureAhrSnapshotsMount, resolveSelfService, shareAvailableBytes, touchesSelfService } from '../services/share-selfservice.js'
 import { requireIdentity } from './identity.js'
@@ -399,8 +399,9 @@ export async function smbShareRoutes(
    * The share-path backstop (pvepool.1 review fixes): refuse a share whose
    * `path` is PVE's. The ONE footprint service answers {@link sharePathClaim}:
    * the path resolves onto an OWNED dataset (a storage root, a guest volume,
-   * a dir-storage tree or the boot tree — refused 400 with the reason, which
-   * names the storage AND the dataset), or it sits under a `dir` storage's
+   * a dir-storage tree or the boot tree — refused 409 PVE_MANAGED with the
+   * reason (cr.47b), which names the storage AND the dataset), or it sits
+   * under a `dir` storage's
    * CONFIGURED path on a ZFS filesystem whose dataset could not be resolved (a
    * `legacy`/`none` dataset with no live mount — refused against the path
    * itself, the same rule mounts and restore use; pvepool.1 review fix 5). A
@@ -414,11 +415,13 @@ export async function smbShareRoutes(
     const claim = pve.sharePathClaim(path)
     if (!claim)
       return false
-    reply.code(400)
-    if (claim.kind === 'dataset')
-      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Share path '${path}' is on '${claim.dataset}', which is PVE-owned — ${claim.ownership.reason}` } })
-    else
-      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Share path '${path}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims — shares cannot serve PVE territory` } })
+    // cr.47b: the ownership fact is the ONE answer — 409 PVE_MANAGED, reason
+    // `pve-managed` — at every dataset, snapshot, access and share door; the
+    // config-unreadable verdict is a different fact and keeps its 400.
+    const refusal = claim.kind === 'dataset'
+      ? ownershipRefusal(claim.ownership, `Share path '${path}' is on '${claim.dataset}', which is PVE-owned — ${claim.ownership.reason}`)
+      : pveManagedRefusal(`Share path '${path}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims — shares cannot serve PVE territory`)
+    reply.send(sendRefusal(reply, refusal))
     return true
   }
 

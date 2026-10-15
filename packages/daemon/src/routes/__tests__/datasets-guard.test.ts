@@ -350,7 +350,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
   it('destroy: a PVE storage registered on the dataset while the job waits refuses it with the predicate\'s reason', async () => {
     const job = await confirmedRace(DESTROY_RECURSIVE, pveClaimsMedia)
     assert.equal(job.status, 'failed')
-    assert.equal(job.error?.code, 'VALIDATION_ERROR')
+    assert.equal(job.error?.code, 'PVE_MANAGED')
     assert.match(job.error!.message, /datapool/)
     assert.deepEqual(calls.filter(isMutation), [])
   })
@@ -358,7 +358,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
   it('rollback: a PVE storage registered on the dataset while the job waits refuses it (ownership re-run) — no zfs rollback', async () => {
     const job = await confirmedRace(ROLLBACK, pveClaimsMedia)
     assert.equal(job.status, 'failed')
-    assert.equal(job.error?.code, 'VALIDATION_ERROR')
+    assert.equal(job.error?.code, 'PVE_MANAGED')
     assert.match(job.error!.message, /datapool/)
     assert.deepEqual(calls.filter(isMutation), [])
   })
@@ -544,7 +544,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
   it('create: a PVE storage registered on the new name while the job waits refuses it (ownership re-run) — no zfs create', async () => {
     const job = await acceptedRace(CREATE_DATA, () => writeFile(storageCfg, STORAGE_ON_DATA))
     assert.equal(job.status, 'failed')
-    assert.equal(job.error?.code, 'VALIDATION_ERROR')
+    assert.equal(job.error?.code, 'PVE_MANAGED')
     assert.match(job.error!.message, /datapool/)
     assert.deepEqual(calls.filter(isMutation), [])
   })
@@ -552,7 +552,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
   it('snapshot: a PVE storage registered on the dataset while the job waits refuses it (ownership re-run) — no zfs snapshot', async () => {
     const job = await acceptedRace(SNAPSHOT_MEDIA, pveClaimsMedia)
     assert.equal(job.status, 'failed')
-    assert.equal(job.error?.code, 'VALIDATION_ERROR')
+    assert.equal(job.error?.code, 'PVE_MANAGED')
     assert.match(job.error!.message, /datapool/)
     assert.deepEqual(calls.filter(isMutation), [])
   })
@@ -560,7 +560,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
   it('recursive snapshot: a PVE storage registered on a DESCENDANT while the job waits refuses it (descendants re-run)', async () => {
     const job = await acceptedRace(SNAPSHOT_POOL_RECURSIVE, pveClaimsMedia)
     assert.equal(job.status, 'failed')
-    assert.equal(job.error?.code, 'VALIDATION_ERROR')
+    assert.equal(job.error?.code, 'PVE_MANAGED')
     assert.match(job.error!.message, /^Recursive snapshot of 'testpool'.*testpool\/media/)
     assert.deepEqual(calls.filter(isMutation), [])
   })
@@ -569,7 +569,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
     for (const verb of [RENAME_SNAP1, DESTROY_SNAP1]) {
       const job = await acceptedRace(verb, pveClaimsMedia)
       assert.equal(job.status, 'failed', verb.name)
-      assert.equal(job.error?.code, 'VALIDATION_ERROR', verb.name)
+      assert.equal(job.error?.code, 'PVE_MANAGED', verb.name)
       assert.match(job.error!.message, /datapool/, verb.name)
       assert.deepEqual(calls.filter(isMutation), [], verb.name)
       await server!.close()
@@ -580,7 +580,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
   it('clone: the source dataset claimed by PVE, or the target name taken, while the job waits refuses it — no zfs clone', async () => {
     const owned = await acceptedRace(CLONE_TO_DATA, pveClaimsMedia)
     assert.equal(owned.status, 'failed')
-    assert.equal(owned.error?.code, 'VALIDATION_ERROR')
+    assert.equal(owned.error?.code, 'PVE_MANAGED')
     assert.match(owned.error!.message, /datapool/)
     assert.deepEqual(calls.filter(isMutation), [])
     await server!.close()
@@ -598,7 +598,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
   it('set: a PVE storage registered on the dataset while the job waits refuses it (ownership re-run) — no zfs set', async () => {
     const job = await acceptedRace(SET_MEDIA, pveClaimsMedia)
     assert.equal(job.status, 'failed')
-    assert.equal(job.error?.code, 'VALIDATION_ERROR')
+    assert.equal(job.error?.code, 'PVE_MANAGED')
     assert.match(job.error!.message, /datapool/)
     assert.deepEqual(calls.filter(isMutation), [])
   })

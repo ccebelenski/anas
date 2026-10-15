@@ -199,7 +199,7 @@ describe('cr.37 — fs.setAccess binds its plan and the ACL revision (ruling (j)
   it('dataset: a PVE storage registered on the dataset while the job waits refuses it (ownership re-run) — nothing written', async () => {
     const job = await race(ZFS_DOOR, () => writeFile(storageCfg, STORAGE_ON_MEDIA))
     assert.equal(job.status, 'failed')
-    assert.equal(job.error?.code, 'VALIDATION_ERROR')
+    assert.equal(job.error?.code, 'PVE_MANAGED')
     assert.match(job.error!.message, /datapool/)
     assert.deepEqual(calls.filter(isWrite), [])
   })

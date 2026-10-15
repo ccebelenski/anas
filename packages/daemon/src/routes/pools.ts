@@ -951,8 +951,9 @@ export async function poolRoutes(
   // One fact, one answer (cr.36): wherever a pool verb asks whether the pool
   // is a SYSTEM pool, the refusal is 409 CONFLICT `system-pool`, and wherever
   // it asks whether PVE uses the pool, the refusal is 409 PVE_MANAGED
-  // `pve-managed` — export, destroy, mountpoint, add and remove vdev, attach,
-  // replace, raidz expand. Before cr.36 the vdev routes and the mountpoint
+  // `pve-managed` — export, destroy, mountpoint, add and remove vdev, and
+  // (the PVE question only, cr.47a) attach, replace, raidz expand. Before
+  // cr.36 the vdev routes and the mountpoint
   // route answered PVE with 400 VALIDATION_ERROR: nothing about such a
   // request is malformed, the pool's state refuses it, and Principle 14 makes
   // a blocked operation a 409. The ownership question is one too: the pool
@@ -1371,8 +1372,19 @@ export async function poolRoutes(
     }
   }
 
-  /** The gates every verb that reshapes a pool's topology runs first (pvepool.1; cr.36 adds the attach family). */
+  /** The gates add and remove vdev run first (pvepool.1): the system pool AND PVE. The attach family asks only PVE ({@link ATTACH_FAMILY_GATES}, cr.47a). */
   const RESHAPE_GATES: Gate<PoolObject>[] = [poolSystemGate, poolPveGate('reshape')]
+
+  /**
+   * The attach family's topology gates (cr.47a, operator ruling 2026-10-15):
+   * attach, replace and raidz-expand answer only the PVE question. Before
+   * wave 3 these verbs ran no topology gate at all (WAVE3-DESIGN §2.2), and a
+   * verb the API allowed is not newly restricted on a SYSTEM pool — cr.36's
+   * system-pool gate came off. The PVE-ownership gate stays (standing
+   * "PVE territory is read-only and hands-off" ruling), and add/remove vdev
+   * keep both, as they had them before wave 3.
+   */
+  const ATTACH_FAMILY_GATES: Gate<PoolObject>[] = [poolPveGate('reshape')]
 
   /** A pool that does not exist yet: the name a create claims. */
   interface NewPool { name: string }
@@ -2460,9 +2472,11 @@ export async function poolRoutes(
 
     // Story cr.36 (§2.1 "raidz expand" / "attach / replace": every gate
     // request-time only, no topology gate at all, the leaf resolved once at
-    // the request). The attach family now stands behind the same topology
-    // gates as add and remove (the system-pool hard 409, the PVE hard 409
-    // PVE_MANAGED), then the NEW disk's composability (D4 + cr.12: a loop-back
+    // the request). The attach family stands behind the PVE hard 409
+    // PVE_MANAGED — and, per the operator's ruling of 2026-10-15 (cr.47a),
+    // behind nothing else topology-wise: the system-pool gate cr.36 added
+    // came off, these verbs were allowed on a system pool before wave 3,
+    // then the NEW disk's composability (D4 + cr.12: a loop-back
     // LUN, a non-available disk or an id the inventory does not know never
     // becomes a mirror leg, a replacement or a raidz column; an unreadable
     // inventory fails CLOSED). The EXISTING leaf is deliberately not checked
@@ -2482,7 +2496,7 @@ export async function poolRoutes(
       const spec = poolVerbSpec(poolName, {
         operation: 'zpool.raidz-expand',
         noun: 'a raidz expansion',
-        gates: [...RESHAPE_GATES, newDiskGate, raidzExpandGate(targetVdev)],
+        gates: [...ATTACH_FAMILY_GATES, newDiskGate, raidzExpandGate(targetVdev)],
         locks: newDiskLocks,
       })
       const pre = await guardCheck(spec)
@@ -2523,7 +2537,7 @@ export async function poolRoutes(
       operation: replace ? 'zpool.replace' : 'zpool.attach',
       noun: replace ? 'a replace' : 'an attach',
       extend: async reads => ({ leaf: await lookupLeaf(reads, poolName, existingDiskId!, replace) }),
-      gates: [...RESHAPE_GATES, newDiskGate, async pool => 'refusal' in pool.leaf ? pool.leaf.refusal : null],
+      gates: [...ATTACH_FAMILY_GATES, newDiskGate, async pool => 'refusal' in pool.leaf ? pool.leaf.refusal : null],
       locks: newDiskLocks,
     })
     const pre = await guardCheck(spec)

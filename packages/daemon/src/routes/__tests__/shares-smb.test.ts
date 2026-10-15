@@ -544,7 +544,7 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
     }
   })
 
-  it('a share on an OWNED mountpoint is refused 400 with the ownership reason', async () => {
+  it('a share on an OWNED mountpoint is refused 409 PVE_MANAGED with the ownership reason', async () => {
     const s = startServer()
     const res = await s.inject({
       method: 'POST',
@@ -552,8 +552,8 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ name: 'pve-root', path: '/testpool' }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     // The sentence names the resolved dataset AND the owning storage.
     assert.match(res.json().error.message, /'\/testpool'/)
     assert.match(res.json().error.message, /'testpool'/)
@@ -599,7 +599,8 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ path: '/testpool' }),
     })
-    assert.equal(moved.statusCode, 400)
+    assert.equal(moved.statusCode, 409)
+    assert.equal(moved.json().error.code, 'PVE_MANAGED')
     assert.match(moved.json().error.message, /storage root/)
     // The untouched edit — no `path` in the body — never asks the footprint
     // for a move and succeeds.
@@ -666,8 +667,8 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ name: 'dump-share', path: '/srv/dump' }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     // The path resolved onto the DATASET (via findmnt) and the dataset is the
     // dir storage — the dataset claim quotes the ownership reason.
     assert.match(res.json().error.message, /'\/srv\/dump'/)
@@ -689,8 +690,8 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ name: 'dump-share', path: '/srv/dump' }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     // The path-rule sentence names the storage and its configured path.
     assert.match(res.json().error.message, /'\/srv\/dump'/)
     assert.match(res.json().error.message, /PVE storage 'dump' claims/)

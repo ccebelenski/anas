@@ -7,6 +7,8 @@ import type { ReplicationNotifyContext } from '../services/replication-notify.js
 import type { TargetPlacement } from '../services/replication-target.js'
 import type { Transport } from '../services/replication-transport.js'
 import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
+import { GuardRefusalError, sendRefusal } from '../safety/guard.js'
+import { ownershipRefusal } from '../services/pve-footprint.js'
 import { legacyReleasableOnSource, replicationHoldTag, settleReplicationHolds } from '../services/replication-holds.js'
 import { notifyReplicationRun } from '../services/replication-notify.js'
 import { guardReplicationTarget } from '../services/replication-target.js'
@@ -303,8 +305,9 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     if (pve) {
       const owned = pve.ownershipOf(source)
       if (owned) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `Snapshot-first replication would snapshot '${source}' — ${owned.reason}` } }
+        // cr.47b: a snapshot door — the ownership fact answers 409 PVE_MANAGED
+        // here as at every dataset door (a config-unreadable verdict keeps 400).
+        return sendRefusal(reply, ownershipRefusal(owned, `Snapshot-first replication would snapshot '${source}' — ${owned.reason}`))
       }
     }
 
@@ -367,7 +370,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             // fireSchedule pattern.
             const owned = (await deps.pveFootprint()).ownershipOf(source)
             if (owned)
-              throw new Error(`Snapshot-first replication refused: '${source}' is PVE-owned — ${owned.reason}`)
+              throw new GuardRefusalError(ownershipRefusal(owned, `Snapshot-first replication refused: '${source}' is PVE-owned — ${owned.reason}`))
             const name = defaultSnapName()
             updateProgress(`zfs snapshot ${source}@${name}`)
             // The ONE zfs-snapshot verb (backup2.3's extraction) — same argv,

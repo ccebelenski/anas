@@ -11,7 +11,7 @@ import { guardCheck, guardConfirm, guarded, GuardRefusalError, nfsShareClaim, se
 import { createAccessService } from '../services/access.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
 import { normalizeMountpointPath } from '../services/mounts.js'
-import { loadPveFootprint } from '../services/pve-footprint.js'
+import { loadPveFootprint, ownershipRefusal, pveManagedRefusal } from '../services/pve-footprint.js'
 import { probeSharePath, probeSharePaths, sharePathFields } from '../services/share-path.js'
 import { requireIdentity } from './identity.js'
 import { shareAccessHandlers } from './share-access.js'
@@ -244,8 +244,9 @@ export async function nfsExportRoutes(
       return
 
     // Share-path backstop (pvepool.1 review fixes): a path that is PVE's is
-    // refused 400 — the SAME sharePathClaim answer the SMB create refuses
-    // through: an export onto an OWNED dataset's mountpoint, or under a `dir`
+    // refused 409 PVE_MANAGED (cr.47b) — the SAME sharePathClaim answer the
+    // SMB create refuses through: an export onto an OWNED dataset's
+    // mountpoint, or under a `dir`
     // storage's configured path on a ZFS filesystem whose dataset could not be
     // resolved (review fix 5; a non-ZFS dir path such as /var/lib/vz is
     // allowed — caveat emptor, EPICS §2, ruled 2026-09-22). A path on a
@@ -255,10 +256,11 @@ export async function nfsExportRoutes(
     const pve = await loadPveFootprint(executor)
     const claim = pve.sharePathClaim(exp.path)
     if (claim) {
-      reply.code(400)
-      if (claim.kind === 'dataset')
-        return { error: { code: 'VALIDATION_ERROR', message: `Export path '${exp.path}' is on '${claim.dataset}', which is PVE-owned — ${claim.ownership.reason}` } }
-      return { error: { code: 'VALIDATION_ERROR', message: `Export path '${exp.path}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims — exports cannot serve PVE territory` } }
+      // The config-unreadable verdict is a different fact and keeps its 400.
+      const refusal = claim.kind === 'dataset'
+        ? ownershipRefusal(claim.ownership, `Export path '${exp.path}' is on '${claim.dataset}', which is PVE-owned — ${claim.ownership.reason}`)
+        : pveManagedRefusal(`Export path '${exp.path}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims — exports cannot serve PVE territory`)
+      return sendRefusal(reply, refusal)
     }
 
     // Story cr.43 item 2: existence answers 409 CONFLICT at the route, and

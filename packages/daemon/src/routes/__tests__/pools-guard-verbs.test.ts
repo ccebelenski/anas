@@ -34,7 +34,8 @@ import { capturedPoolGet } from './pool-guard-reads.js'
  *    (`zpool-get-all.json`, via pool-guard-reads.ts) — a different pool under
  *    the same name, as an export/import swap leaves it.
  *  - the system mount: `mounts/findmnt-full.json` with its one nested ZFS row
- *    re-pointed to `testpool/var` at `/var` (as pools-guard.test.ts).
+ *    re-pointed to `testpool/var` (`testpool-rz/var` for the raidz pool) at
+ *    `/var` (as pools-guard.test.ts).
  *  - PVE takes the pool: `pve/storage.cfg` with its zfspool storage's
  *    `pool datapool` line re-pointed to `pool testpool`.
  *  - a disk joins a pool: `zfs/zpool-status-online-fresh.json` (one mirror of
@@ -89,6 +90,11 @@ const FINDMNT_TESTPOOL_AT_VAR = rewrite(
   rewrite(FINDMNT_FULL, '"target": "/mnttest/data"', '"target": "/var"'),
   '"source": "mnttest/data"',
   '"source": "testpool/var"',
+)
+const FINDMNT_TESTPOOL_RZ_AT_VAR = rewrite(
+  rewrite(FINDMNT_FULL, '"target": "/mnttest/data"', '"target": "/var"'),
+  '"source": "mnttest/data"',
+  '"source": "testpool-rz/var"',
 )
 const FINDMNT_REAL_ROOT_ONLY = fixture('mounts/findmnt-real.json')
 const FINDMNT_REAL_AHR0 = mockFixtures.ahrFindmnt().stdout
@@ -624,9 +630,14 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
     }
   })
 
-  it('attach and replace: a system mount, PVE, another pool — each refuses the waiting job', async () => {
+  // cr.47a (operator ruling 2026-10-15): the attach family dropped cr.36's
+  // system-pool gate — these verbs were allowed on a system pool before wave
+  // 3. What the waiting job still refuses: PVE taking the pool, and another
+  // pool under the same name. (`systemMount` on this family is now a
+  // completes-the-job flip — pinned by the accepted-and-run test below.)
+  it('attach and replace: PVE, another pool — each refuses the waiting job', async () => {
     for (const req of [ATTACH, REPLACE]) {
-      for (const [flip, code] of [[systemMount, 'CONFLICT'], [pveTakesPool, 'PVE_MANAGED'], [swapPool, 'IDENTITY_MISMATCH']] as const) {
+      for (const [flip, code] of [[pveTakesPool, 'PVE_MANAGED'], [swapPool, 'IDENTITY_MISMATCH']] as const) {
         await serve()
         await race(req, false, flip, code)
         await server!.close()
@@ -635,13 +646,27 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
     }
   })
 
-  it('attach: a PVE pool is refused at the route now (the attach family had no topology gate)', async () => {
-    await serve()
-    await pveTakesPool()
-    const res = await send(ATTACH)
-    assert.equal(res.statusCode, 409)
-    assert.equal(res.json().error.code, 'PVE_MANAGED')
-    assert.deepEqual(calls.filter(isMutation), [])
+  it('attach and replace on a system pool: accepted and run (cr.47a — not newly restricted)', async () => {
+    for (const req of [ATTACH, REPLACE]) {
+      await serve()
+      systemMount()
+      await control(req, false, c => c.command === ZPOOL && (c.args[0] === 'attach' || c.args[0] === 'replace'))
+      await server!.close()
+      server = undefined
+    }
+  })
+
+  it('attach and replace: a PVE pool is refused at the route — the PVE gate survives cr.47a', async () => {
+    for (const req of [ATTACH, REPLACE]) {
+      await serve()
+      await pveTakesPool()
+      const res = await send(req)
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.json().error.code, 'PVE_MANAGED')
+      assert.deepEqual(calls.filter(isMutation), [])
+      await server!.close()
+      server = undefined
+    }
   })
 
   it('replace: the job holds the pool\'s guid key and the new disk\'s key', async () => {
@@ -672,6 +697,12 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
 
   it('raidz expand: control — the job widens the raidz vdev', async () => {
     await serveRaidz()
+    await control(EXPAND, false, c => c.command === ZPOOL && c.args[0] === 'attach' && c.args[3] === 'raidz1-0')
+  })
+
+  it('raidz expand on a system pool: accepted and run (cr.47a — not newly restricted)', async () => {
+    await serveRaidz()
+    findmnt = FINDMNT_TESTPOOL_RZ_AT_VAR
     await control(EXPAND, false, c => c.command === ZPOOL && c.args[0] === 'attach' && c.args[3] === 'raidz1-0')
   })
 

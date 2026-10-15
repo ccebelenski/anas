@@ -228,7 +228,7 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
 
   function assertRefusedByPve(job: Job, verb: Verb): void {
     assert.equal(job.status, 'failed', `${verb.name}: ${JSON.stringify(job.error)}`)
-    assert.equal(job.error?.code, 'VALIDATION_ERROR')
+    assert.equal(job.error?.code, 'PVE_MANAGED')
     assert.match(job.error!.message, /datapool/)
     assert.deepEqual(mutations(verb.operation), [], `${verb.name} ran no mutating zfs argv`)
   }

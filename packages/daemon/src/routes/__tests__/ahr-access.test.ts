@@ -448,7 +448,8 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server)
       const refused = await put({ owner: 'media', applyToExisting: true })
-      assert.equal(refused.statusCode, 400)
+      assert.equal(refused.statusCode, 409)
+      assert.equal(refused.json().error.code, 'PVE_MANAGED')
       assert.match(refused.json().error.message, /Recursive permission change of '\/mnt\/anas-ahr\/ahr0' would include \/mnt\/anas-ahr\/ahr0\/vz/)
       assert.match(refused.json().error.message, /ahrvz/)
       assert.equal(find(calls, '/usr/bin/chown', () => true), undefined, 'nothing ran')
@@ -456,13 +457,14 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       assert.equal(flat.statusCode, 202)
     })
 
-    it('ahr mount at a PVE storage path is PVE\'s to manage → 400, nothing runs', async () => {
+    it('ahr mount at a PVE storage path is PVE\'s to manage → 409 PVE_MANAGED, nothing runs', async () => {
       await writeFile(join(dir, 'storage.cfg'), `dir: ahrstore\n\tpath ${MP}\n\tcontent backup\n`, 'utf8')
       process.env.ANAS_STORAGE_CFG = join(dir, 'storage.cfg')
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server)
       const res = await put({ owner: 'media' })
-      assert.equal(res.statusCode, 400)
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.json().error.code, 'PVE_MANAGED')
       assert.match(res.json().error.message, /PVE storage 'ahrstore'/)
       assert.equal(find(calls, '/usr/bin/chown', () => true), undefined)
     })

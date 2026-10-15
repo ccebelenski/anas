@@ -431,15 +431,15 @@ describe('NFS export path vs the PVE footprint (pvepool.1 review fixes)', () => 
     await rm(dir, { recursive: true, force: true })
   })
 
-  it('an export on an OWNED mountpoint is refused 400 with the ownership reason', async () => {
+  it('an export on an OWNED mountpoint is refused 409 PVE_MANAGED with the ownership reason', async () => {
     const res = await server!.inject({
       method: 'POST',
       url: '/v1/shares/nfs',
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ path: '/testpool', clients: [{ spec: '192.168.1.0/24', options: ['rw', 'sync'] }] }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     assert.match(res.json().error.message, /'\/testpool'/)
     assert.match(res.json().error.message, /'testpool'/)
     assert.match(res.json().error.message, /local-zfs/)
@@ -495,8 +495,8 @@ describe('NFS export path vs the PVE footprint (pvepool.1 review fixes)', () => 
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ path: '/srv/dump', clients: [{ spec: '*', options: ['ro', 'sync'] }] }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
     // The path-rule sentence names the storage and its configured path.
     assert.match(res.json().error.message, /'\/srv\/dump'/)
     assert.match(res.json().error.message, /PVE storage 'dump' claims/)
