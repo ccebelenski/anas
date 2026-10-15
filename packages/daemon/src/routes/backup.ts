@@ -51,6 +51,7 @@ import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
 import { readPbsStorages, readPveMountPaths } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
+import { GuardReads, GuardRefusalError } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { browseArchiveLevel } from '../services/backup-catalog.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
@@ -126,6 +127,7 @@ import {
   writeTaskUnits,
 } from '../services/backup-units.js'
 import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
+import { foreignGate, lunClaims, lunNameFreeGate, refreshTarget, saveableGate } from '../services/iscsi-guard.js'
 import { createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import {
   assertInstalled,
@@ -1974,8 +1976,20 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           // ident.2: called under the lock by runImageRestore — same serial,
           // backstore, path and served device (throws otherwise), and the
           // backing object's size as read NOW.
+          //
+          // cr.40: and the route's pre-flight gates (1)-(2), asked of the same
+          // read — LIO installed and not degraded (the disable and the
+          // re-enable each end in saveconfig, GT-22), the target still ANAS's.
+          // The returned target is the fresh one: its `enabled` decides the
+          // disable.
           reverify: async () => {
             const fresh = await reverifyServedLun(executor, iscsiPaths, bound, { requireDevice: true })
+            const freshState = { ctx: fresh.ctx, targets: fresh.targets }
+            for (const gate of [saveableGate, foreignGate]) {
+              const refused = await gate({ state: freshState, target: fresh.target }, new GuardReads())
+              if (refused)
+                throw new GuardRefusalError(refused)
+            }
             const size = await readTargetSize(executor, fresh.lun)
             return { target: fresh.target, lun: fresh.lun, size: 'error' in size ? null : size.size }
           },
@@ -1990,8 +2004,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         auditParams.bytesWritten = result.bytesWritten
         return result
       }),
-      // cr.33 (§4.3): a restore is a data mover — the long lane.
-      { lane: 'long' },
+      // cr.33 (§4.3): a restore is a data mover — the long lane. cr.40: it
+      // holds the target's key and the LUN's for the run — the whole target
+      // is disabled while the image streams.
+      { lane: 'long', locks: lunClaims(target.iqn, lun.serial) },
     )
 
     reply.code(202)
@@ -2200,6 +2216,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           archive: req.archive,
           imageSize,
           target,
+          // cr.40 (audit #34): the destination re-read in the job, with the
+          // route's own gates — the index and the grants come from this read.
+          refresh: () => refreshTarget(
+            { executor, paths: iscsiPaths },
+            target.iqn,
+            [saveableGate, foreignGate, lunNameFreeGate(newLun.name)],
+          ),
           name: newLun.name,
           backing,
           ...(ahr ? { ahr: { fstabPath, pool: ahr } } : {}),
@@ -2216,7 +2239,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         auditParams.bytesWritten = result.bytesWritten
         return result
       }),
-      // cr.33 (§4.3): a restore is a data mover — the long lane.
+      // cr.33 (§4.3): a restore is a data mover — the long lane. It takes NO
+      // target key: the queue has no release yet, so a claim would hold every
+      // verb on a target that stays online (adding an ACL, deleting another
+      // LUN) for the hours the image takes. The LUN index and ACL grants are
+      // taken from the target re-read under withIscsiLock in the job (cr.40),
+      // which is what keeps the mapping safe; claim the key once the queue
+      // can release it after the map.
       { lane: 'long' },
     )
 

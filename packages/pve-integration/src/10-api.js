@@ -437,7 +437,7 @@
     // packages/daemon/src/routes/__tests__/confirm-bound-options.test.ts).
     // The key is `confirmBind`, not `bind`: `bind` is ExtJS's own ViewModel
     // binding config, and a component created with it would look for one.
-    // `mapConfirm` stays for options that are NOT bound (iSCSI destroyBacking).
+    // `mapConfirm` stays for an option that is NOT bound (none of the shipped flows since cr.40).
 
     var CHECKBOX_XTYPES = { checkbox: true, checkboxfield: true };
 

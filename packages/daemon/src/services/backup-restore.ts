@@ -636,12 +636,17 @@ export async function runImageRestore(
     if (sessions.length > 0)
       throw new Error(liveSessionsAtRunRefusal(target.iqn, sessions))
 
-    if (target.enabled) {
+    // cr.40 (WAVE3-DESIGN §2.4 "image restore in place"): whether the target
+    // is enabled is read NOW, under the lock — not taken from the request's
+    // read. A target the operator disabled while the job waited is left
+    // disabled (and not re-enabled after); one enabled meanwhile is disabled
+    // for the stream like any other.
+    if (now.target.enabled) {
       updateProgress(
         `disabling iSCSI target ${target.iqn} for the duration of the restore `
         + `(the whole target goes offline, not just LUN ${lun.index})`,
       )
-      await setIscsiTargetState(deps.mutate, target, 'disable')
+      await setIscsiTargetState(deps.mutate, now.target, 'disable')
       disabledByUs = true
     }
     else {
@@ -784,8 +789,22 @@ export interface NewLunRestoreDeps {
   archive: string
   /** The manifest's image size — the new backing is created at EXACTLY this. */
   imageSize: number
-  /** The destination target — ANAS-owned, the route's pre-flight proved it. */
+  /**
+   * The destination target as the REQUEST read it — ANAS-owned, the route's
+   * pre-flight proved it. It names the target (IQN, TPG tag) and nothing else:
+   * the index and the ACL grants come from {@link refresh}.
+   */
   target: IscsiTargetDetail
+  /**
+   * Re-read the destination target NOW and re-run the route's gates on it (LIO
+   * installed and not degraded, the target there and ANAS's, the name still
+   * free node-wide); throws the gate's refusal (story cr.40, audit #34). Called
+   * once before anything is created, and again UNDER the iSCSI lock right
+   * before the LUN is mapped — whose index and ACL grants are the answer's, so
+   * a LUN or an ACL added while the job waited is seen. Required, never
+   * optional: without it the LUN lands at the request-time index.
+   */
+  refresh: () => Promise<IscsiTargetDetail>
   /** The new LUN's name — the backstore name and the SCSI model string. */
   name: string
   /**
@@ -894,6 +913,13 @@ export async function runNewLunImageRestore(
   const state = { backingCreated: false, backstoreTouched: false, mapped: false }
 
   try {
+    // ---- 0. The destination as it is NOW (cr.40) ---------------------------
+    // The job may have waited behind other work: the target, its ownership and
+    // the name are re-proved before anything is created, so a refusal here
+    // leaves nothing to clean up.
+    updateProgress(`re-reading iSCSI target ${target.iqn} - the request-time read is not the run-time one`)
+    await deps.refresh()
+
     // ---- 1. The backing at exactly the manifest's size ---------------------
     if (kind === 'zvol') {
       const dataset = backing.dataset ?? zvolDataset(backing.path)
@@ -932,16 +958,25 @@ export async function runNewLunImageRestore(
     // LIO tree (backstore create, attributes, map, ACL grants), so it must not
     // interleave with another node mutation. The lock is taken HERE and released
     // the moment the LUN is mapped — NOT held across the hours-long stream below.
-    const mapped = await withIscsiLock(async () => createAndMapLun(
-      deps.mutate,
-      target,
-      deps.name,
-      backing,
-      kind === 'file' ? deps.imageSize : null,
-      serial,
-    ))
+    //
+    // cr.40 (audit #34): the index and the ACL grants come from the target as
+    // read HERE, under the lock — not from the request's read, which a LUN or
+    // an ACL added while the job waited has made stale.
+    const mapped = await withIscsiLock(async () => {
+      const fresh = await deps.refresh()
+      // From the first targetcli on, a failure may have left a backstore —
+      // the cleanup's delete tolerates one that was never created.
+      state.backstoreTouched = true
+      return createAndMapLun(
+        deps.mutate,
+        fresh,
+        deps.name,
+        backing,
+        kind === 'file' ? deps.imageSize : null,
+        serial,
+      )
+    })
     index = mapped.index
-    state.backstoreTouched = true
     state.mapped = true
 
     // ---- 3. The image -------------------------------------------------------

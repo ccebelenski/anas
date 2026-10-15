@@ -29,8 +29,9 @@ import type { IscsiLun, IscsiTargetDetail } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { ConfigfsBackstore, LioLiveState } from './iscsi-configfs.js'
 import type { IscsiRefusal } from './iscsi-mutate.js'
-import type { IscsiPaths } from './iscsi.js'
+import type { IscsiPaths, IscsiReadContext } from './iscsi.js'
 import { stat } from 'node:fs/promises'
+import { GuardRefusalError } from '../safety/guard.js'
 import { normalizePlugin } from './iscsi-configfs.js'
 import { readIscsiState } from './iscsi-mutate.js'
 
@@ -261,8 +262,19 @@ export async function reverifyServedLun(
   executor: CommandExecutor,
   paths: IscsiPaths,
   expected: ServedLunIdentity,
-  opts: { requireDevice: boolean },
-): Promise<{ target: IscsiTargetDetail, lun: IscsiLun, live: LioLiveState }> {
+  opts: {
+    requireDevice: boolean
+    /**
+     * Story cr.40 (WAVE3-DESIGN §2.4 "LUN update"): the verb is refused under
+     * a live session at the request (GT-42), so it is refused under one NOW —
+     * an initiator that logged in while the job waited fails it with the
+     * route's code (CONFLICT, `session-open`) and nothing changed. Unset for a
+     * verb that is allowed under a session (a zvol grow is live end to end,
+     * GT-28 — this door's and the Datasets door's).
+     */
+    refuseSessions?: boolean
+  },
+): Promise<{ target: IscsiTargetDetail, lun: IscsiLun, live: LioLiveState, ctx: IscsiReadContext, targets: IscsiTargetDetail[] }> {
   const { ctx, targets } = await readIscsiState(executor, paths)
   const target = targets.find(t => t.iqn === expected.target)
   const head = `LUN ${expected.index} of ${expected.target} is no longer the LUN this request was accepted for`
@@ -287,7 +299,18 @@ export async function reverifyServedLun(
   }
   if (opts.requireDevice && expected.device === null)
     throw new Error(`${head}: its served device was never verified. ${tail}`)
-  return { target, lun, live: ctx.live }
+  if (opts.refuseSessions && lun.connectedInitiators.length > 0) {
+    const n = lun.connectedInitiators.length
+    throw new GuardRefusalError({
+      status: 409,
+      code: 'CONFLICT',
+      reason: 'session-open',
+      message: `LUN ${expected.index} of '${expected.target}' has ${n} live session${n === 1 ? '' : 's'} `
+        + `(${lun.connectedInitiators.join(', ')}) now — an initiator logged in after the request was accepted, and LIO `
+        + `would act anyway and leave a stale device on that host with no kernel message. Log the initiator out first. ${tail}`,
+    })
+  }
+  return { target, lun, live: ctx.live, ctx, targets }
 }
 
 /**

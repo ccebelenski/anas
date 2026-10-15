@@ -272,6 +272,7 @@ function deps(mock: MockExecutor, configfsRoot: string, over: Partial<NewLunRest
     archive: 'vol.img',
     imageSize: IMAGE_SIZE,
     target: targetDetail(),
+    refresh: async () => targetDetail(),
     name: 'newvol',
     backing: { path: '/dev/zvol/tank/newvol', plugin: 'block', dataset: 'tank/newvol' },
     env: buildBackupEnv(REPO, 'super-secret'),
@@ -688,6 +689,50 @@ describe('runNewLunImageRestore — where the iSCSI lock is held, and where it i
       await run
       // saveconfig still ran, after the stream, under the lock again.
       assert.ok(base.calls.some(c => c.args.includes('saveconfig')))
+    })
+  })
+})
+
+describe('cr.40 — the new LUN takes its index and grants from the target as read in the job (audit #34)', () => {
+  const SECOND = 'iqn.2026-08.dev.anas.gtiscsi:allowed2'
+
+  it('a LUN and an ACL added while the job waited: the new LUN maps at the next FREE index and is granted to BOTH ACLs', async () => {
+    await withConfigfsRoot(async (configfsRoot) => {
+      await mkdir(join(configfsRoot, 'iscsi', IQN, 'tpgt_1', 'acls', SECOND), { recursive: true })
+      const mock = successMock('tank/newvol')
+      // The request read LUN 0 and one ACL; by the time the job runs, LUN 1
+      // exists and a second ACL maps both.
+      const now = targetDetail()
+      now.luns = [sourceLun(), { ...sourceLun(), index: 1, name: 'other', serial: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', backingPath: '/dev/zvol/tank/other' }]
+      now.acls = [...now.acls, { ...now.acls[0], initiatorIqn: SECOND, mappedLuns: [0, 1] }]
+      let refreshed = 0
+      const result = await runNewLunImageRestore(mock, deps(mock, configfsRoot, {
+        refresh: async () => {
+          refreshed++
+          return now
+        },
+      }), noop)
+      assert.equal(refreshed, 2, 'once before anything is created, once under the lock before the map')
+      const argv = mock.calls.map(c => `${c.command} ${c.args.join(' ')}`)
+      assert.ok(argv.includes(`${TARGETCLI} /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/block/newvol lun=2`), argv.join('\n'))
+      assert.ok(argv.includes(`${TARGETCLI} /iscsi/${IQN}/tpg1/acls/${INITIATOR} create 2 2`), argv.join('\n'))
+      assert.ok(argv.includes(`${TARGETCLI} /iscsi/${IQN}/tpg1/acls/${SECOND} create 2 2`), argv.join('\n'))
+      assert.equal(result.lunIndex, 2)
+    })
+  })
+
+  it('a refusal on the fresh read (the target gone, the name taken) fails the job before anything is created', async () => {
+    await withConfigfsRoot(async (configfsRoot) => {
+      const mock = successMock('tank/newvol')
+      await assert.rejects(
+        runNewLunImageRestore(mock, deps(mock, configfsRoot, {
+          refresh: async () => {
+            throw new Error('A LUN named \'newvol\' already exists on this node.')
+          },
+        }), noop),
+        /already exists on this node/,
+      )
+      assert.deepEqual(mock.calls, [], 'no zfs create, no targetcli')
     })
   })
 })

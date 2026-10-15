@@ -3938,12 +3938,14 @@ async function iscsiResizeAndDeleteChecks() {
     !!box && box.getValue() === false)
   ok('deletelun: it names the object it would destroy',
     /\/dev\/zvol\/tank\/vol1/.test(box.boxLabel), box.boxLabel)
-  ok('deletelun: and warns a zvol takes its snapshots with it',
-    /snapshots/.test(box.boxLabel), box.boxLabel)
-  eq('deletelun: unticked adds no query at all', jobs[0].mapConfirm(extra), {})
-  box.setValue(true)
-  eq('deletelun: ticked becomes ?destroyBacking=true',
-    jobs[0].mapConfirm(extra), { pathSuffix: '?destroyBacking=true' })
+  ok('deletelun: and says a zvol\'s snapshots are NOT swept (a volume with any is refused, M5)',
+    /volume only/.test(box.boxLabel) && /snapshots is refused/.test(box.boxLabel), box.boxLabel)
+  // cr.40: the flag is BOUND (cr.44 idiom) — ticking it re-challenges in place
+  // rather than folding a suffix into the confirmed resend.
+  eq('deletelun: the checkbox is bound to the destroyBacking query flag',
+    jobs[0].extraItems[0].confirmBind, { query: 'destroyBacking' })
+  ok('deletelun: no mapConfirm — an unbound suffix would resend a request the code was not minted for',
+    jobs[0].mapConfirm === undefined)
 
   ok('resize/delete: nothing warned', warnings.length === 0, warnings.join(' | '))
 }

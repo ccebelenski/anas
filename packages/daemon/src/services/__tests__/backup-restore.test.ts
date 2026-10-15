@@ -636,6 +636,32 @@ describe('runImageRestore — the run-time LUN re-read (ident.2, audit #10)', ()
     assert.deepEqual(mock.streamCalls, [])
   })
 
+  // cr.40 (WAVE3-DESIGN §2.4 "image restore in place"): `enabled` is the
+  // run-time read's, not the request's.
+  it('a target the operator DISABLED while the job waited is left disabled — no disable, no re-enable', async () => {
+    const mock = successMock()
+    const lun = zvolLun()
+    const tgt = target([lun])
+    const now = target([lun], { enabled: false })
+    const result = await runImageRestore(mock, deps(mock, lun, tgt, { reverify: async () => ({ target: now, lun, size: IMAGE_SIZE }) }), noop)
+    assert.equal(mock.calls.some(c => c.args.includes('disable')), false, 'not disabled again')
+    assert.equal(mock.calls.some(c => c.args.includes('enable')), false, 'not switched back on behind the operator')
+    assert.equal(result.targetDisabled, false)
+    assert.equal(result.targetReEnabled, false)
+    assert.equal(mock.streamCalls.length, 1, 'the image still streamed')
+  })
+
+  it('a target ENABLED while the job waited is disabled for the stream and re-enabled after', async () => {
+    const mock = successMock()
+    const lun = zvolLun()
+    const tgt = target([lun], { enabled: false })
+    const now = target([lun])
+    const result = await runImageRestore(mock, deps(mock, lun, tgt, { reverify: async () => ({ target: now, lun, size: IMAGE_SIZE }) }), noop)
+    assert.ok(mock.calls.some(c => c.args.join(' ') === `/iscsi/${IQN}/tpg1 disable`))
+    assert.equal(result.targetDisabled, true)
+    assert.equal(result.targetReEnabled, true)
+  })
+
   it('an unreadable size at run time refuses too', async () => {
     const mock = successMock()
     const lun = zvolLun()

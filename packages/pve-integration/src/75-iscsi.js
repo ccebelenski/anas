@@ -3544,23 +3544,22 @@
                 + t('The backing object is kept unless you tick the box:'),
             confirmButtonText: t('Delete'),
             // The destructive half is a deliberate second choice, not a default.
+            // It is BOUND (cr.40, cr.44's confirmBind): the first request
+            // spells `?destroyBacking=false` out, and ticking the box re-sends
+            // the unconfirmed request with `?destroyBacking=true`, so the
+            // daemon's "WILL be destroyed" warning and a code for exactly that
+            // request replace the window's before OK can be pressed.
+            // The volume ONLY: the daemon refuses a zvol that still has
+            // snapshots (M5) and never sweeps them.
             extraItems: [{
                 xtype: 'checkbox',
                 itemId: 'destroyBacking',
                 cls: 'anas-chk-destroy-backing',
                 boxLabel: t('Also destroy') + ' ' + enc(backing || '')
-                    + (kind === 'zvol' ? ' (' + t('the volume and all its snapshots') + ')' : ''),
-                checked: false
+                    + (kind === 'zvol' ? ' (' + t('the volume only; a volume with snapshots is refused') + ')' : ''),
+                checked: false,
+                confirmBind: { query: 'destroyBacking' }
             }],
-            mapConfirm: function (w) {
-                try {
-                    return w.down('#destroyBacking').getValue()
-                        ? { pathSuffix: '?destroyBacking=true' }
-                        : {};
-                } catch (e) {
-                    return {};
-                }
-            },
             failTitle: 'Delete failed',
             successMsg: t('LUN deleted') + ': ' + rec.get('name'),
             onComplete: function () {

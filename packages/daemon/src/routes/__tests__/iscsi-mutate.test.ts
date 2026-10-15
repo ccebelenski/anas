@@ -1377,14 +1377,25 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       assert.ok(!mockOf().calls.some(c => c.command === ZFS && c.args[0] !== 'list'), 'no zfs destroy when the backing is kept')
     })
 
-    it('the code minted for {target, lun} verifies WITH ?destroyBacking=true — the flag is not in the signature', async () => {
+    // cr.40 (M3): destroyBacking is BOUND — the confirm window re-challenges
+    // when the box is ticked (cr.44 confirmBind), so a code minted for the
+    // plain delete no longer verifies the destroying one.
+    it('a code minted WITHOUT destroyBacking does not verify ?destroyBacking=true — 409 CONFIRM_SCOPE_CHANGED naming it; the re-challenged code destroys', async () => {
       await serveAnas()
+      mockOf().addFixture({ command: ZFS, args: zfsSnapshotListArgs('tank/vol1'), result: { stdout: snapshotListJson('tank/vol1', []), stderr: '', exitCode: 0 } })
       mockOf().addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
       mockOf().addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
       const first = await call('DELETE', `${targetUrl()}/luns/0`)
       const code = first.headers['x-anas-confirm-code'] as string
-      const second = await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`, undefined, { 'x-anas-confirm': code })
-      assert.equal(second.statusCode, 202)
+      const scoped = await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`, undefined, { 'x-anas-confirm': code })
+      assert.equal(scoped.statusCode, 409)
+      assert.equal(scoped.body.error!.code, 'CONFIRM_SCOPE_CHANGED')
+      assert.equal(scoped.body.error!.message, 'You confirmed with destroyBacking off; this request has destroyBacking on — confirm again')
+      // The re-challenge says what THIS request destroys.
+      assert.ok(scoped.body.error!.warnings!.some(w => /The volume tank\/vol1 WILL be destroyed/.test(w)), JSON.stringify(scoped.body.error!.warnings))
+      assert.ok(!mockOf().calls.some(c => c.command === TARGETCLI), 'nothing ran')
+      const second = await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`, undefined, { 'x-anas-confirm': scoped.headers['x-anas-confirm-code'] as string })
+      assert.equal(second.statusCode, 202, JSON.stringify(second.body))
       const job = await waitForJob(second.body.job!.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
       assert.equal((job.result as { backingDestroyed?: string | null }).backingDestroyed, 'tank/vol1')
@@ -1542,7 +1553,10 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       await writeFile(join(vmdisk(), 'wwn', 'vpd_unit_serial'), NEW_SERIAL)
       const res = await call('DELETE', `${targetUrl()}/luns/0`, undefined, { 'x-anas-confirm': code })
       assert.equal(res.statusCode, 409)
-      assert.equal(res.body.error!.code, 'CONFIRMATION_REQUIRED')
+      // cr.40: the guard names it — a different LUN under the confirmed address.
+      assert.equal(res.body.error!.code, 'IDENTITY_MISMATCH')
+      assert.match(res.body.error!.message, /serial 9bc6e907-6015-4267-be4f-5a0617cb3d71.*at the confirmation, serial 11111111-2222-3333-4444-555555555555/)
+      assert.ok(res.headers['x-anas-confirm-code'])
       assert.notEqual(res.headers['x-anas-confirm-code'], code)
       assert.equal(argv().some(a => a.startsWith(TARGETCLI)), false)
     })
@@ -1559,14 +1573,17 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       await lock.held
       const job = await waitForJob(res.body.job!.id)
       assert.equal(job.status, 'failed')
-      assert.match(job.error!.message, /no longer the LUN this request was accepted for/)
+      assert.equal(job.error!.code, 'IDENTITY_MISMATCH')
+      assert.match(job.error!.message, /^LUN 0 of '.+' is not the one that was confirmed/)
       assert.equal(argv().some(a => a.startsWith(TARGETCLI)), false)
     })
 
     it('a queued destroyBacking whose served device changed fails — no zfs destroy', async () => {
       await serveAnas()
+      mockOf().addFixture({ command: ZFS, args: zfsSnapshotListArgs('tank/vol1'), result: { stdout: snapshotListJson('tank/vol1', []), stderr: '', exitCode: 0 } })
       mockOf().addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
-      const code = String((await call('DELETE', `${targetUrl()}/luns/0`)).headers['x-anas-confirm-code'])
+      // cr.40: the code is minted for the destroying request (destroyBacking is bound).
+      const code = String((await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`)).headers['x-anas-confirm-code'])
       const lock = await parkLock()
       const res = await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`, undefined, { 'x-anas-confirm': code })
       assert.equal(res.statusCode, 202, JSON.stringify(res.body))
@@ -1575,7 +1592,9 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       await lock.held
       const job = await waitForJob(res.body.job!.id)
       assert.equal(job.status, 'failed')
-      assert.match(job.error!.message, /LUN serves a different device than its path names/)
+      // cr.40: the served device is the bound scope of a destroying delete.
+      assert.equal(job.error!.code, 'STATE_CHANGED')
+      assert.match(job.error!.message, /the backing device to destroy: block:230:16 at the confirmation, unreadable now/)
       assert.equal(argv().some(a => a.startsWith(`${ZFS} destroy`)), false)
       assert.equal(argv().some(a => a.startsWith(TARGETCLI)), false)
     })
