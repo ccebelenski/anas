@@ -1,0 +1,50 @@
+# Probe 06: identity allocation facts (login.defs, useradd, zfs userspace)
+# READ-ONLY capture, stunt node anas-pve (PVE 9.2), 2026-10-15, wave-2 design pass. Excerpts of PVE Perl/JS sources are quoted as evidence (AGPL-3.0, Proxmox Server Solutions GmbH).
+
+$ grep -E "^(UID_MIN|UID_MAX|GID_MIN|GID_MAX|USERGROUPS_ENAB)" /etc/login.defs
+UID_MIN			 1000
+UID_MAX			60000
+GID_MIN			 1000
+GID_MAX			60000
+USERGROUPS_ENAB yes
+
+$ useradd -D
+GROUP=100
+GROUPS=
+HOME=/home
+INACTIVE=-1
+EXPIRE=
+SHELL=/bin/sh
+SKEL=/etc/skel
+USRSKEL=/usr/etc/skel
+CREATE_MAIL_SPOOL=no
+LOG_INIT=yes
+
+$ useradd --help / usermod --help / groupmod --help (relevant options)
+  -K, --key KEY=VALUE           override /etc/login.defs defaults
+  -N, --no-user-group           do not create a group with the same name as
+  -o, --non-unique              allow to create users with duplicate
+  -r, --system                  create a system account
+  -u, --uid UID                 user ID of the new account
+  -e, --expiredate EXPIRE_DATE  set account expiration date to EXPIRE_DATE
+  -G, --groups GROUPS           new list of supplementary GROUPS
+  -l, --login NEW_LOGIN         new value of the login name
+  -L, --lock                    lock the user account
+  -s, --shell SHELL             new login shell for the user account
+  -U, --unlock                  unlock the user account
+  -n, --new-name NEW_GROUP      change the name to NEW_GROUP
+
+$ zfs userspace usage line; one dataset, numeric, timed
+	userspace [-Hinp] [-o field[,...]] [-s field] ...
+	    [-S field] ... [-t type[,...]] <filesystem|snapshot|path>
+dataset: gtbackup
+POSIX User	0	512	1
+
+real	0m0.006s
+user	0m0.003s
+sys	0m0.002s
+POSIX Group	0	512
+gtbackup	feature@userobj_accounting	active
+gtiscsi	feature@userobj_accounting	active
+pvfix	feature@userobj_accounting	active
+sysfix	feature@userobj_accounting	active

@@ -1,0 +1,139 @@
+# Probe 03: PVE's CSRF token — secret, binding, lifetime, and how the PVE UI sends it
+# READ-ONLY capture, stunt node anas-pve (PVE 9.2), 2026-10-15, wave-2 design pass. Excerpts of PVE Perl/JS sources are quoted as evidence (AGPL-3.0, Proxmox Server Solutions GmbH).
+
+$ sed -n 44,62p;324,361p /usr/share/perl5/PVE/AccessControl.pm
+# $authdir must be writable by root only!
+my $confdir = "/etc/pve";
+my $authdir = "$confdir/priv";
+
+my $pve_www_key_fn = "$confdir/pve-www.key";
+
+my $pve_auth_key_files = {
+    priv => "$authdir/authkey.key",
+    pub => "$confdir/authkey.pub",
+    pubold => "$confdir/authkey.pub.old",
+};
+
+my $pve_auth_key_cache = {};
+
+my $ticket_lifetime = 3600 * 2; # 2 hours
+my $auth_graceperiod = 60 * 5; # 5 minutes
+my $authkey_lifetime = 3600 * 24; # rotate every 24 hours
+
+Crypt::OpenSSL::RSA->import_random_seed();
+my $csrf_prevention_secret;
+my $csrf_prevention_secret_legacy;
+my $get_csrfr_secret = sub {
+    if (!$csrf_prevention_secret) {
+        my $input = PVE::Tools::file_get_contents($pve_www_key_fn);
+        $csrf_prevention_secret = Digest::SHA::hmac_sha256_base64($input);
+        $csrf_prevention_secret_legacy = Digest::SHA::sha1_base64($input);
+    }
+    return $csrf_prevention_secret;
+};
+
+sub assemble_csrf_prevention_token {
+    my ($username) = @_;
+
+    my $secret = &$get_csrfr_secret();
+
+    return PVE::Ticket::assemble_csrf_prevention_token($secret, $username);
+}
+
+sub verify_csrf_prevention_token {
+    my ($username, $token, $noerr) = @_;
+
+    my $secret = $get_csrfr_secret->();
+
+    # FIXME: remove with PVE 7 and/or refactor all into PVE::Ticket ?
+    if ($token =~ m/^([A-Z0-9]{8}):(\S+)\z/) {
+        my $sig = $2;
+        if (length($sig) == 27) {
+            # the legacy secret got populated by above get_csrfr_secret call
+            $secret = $csrf_prevention_secret_legacy;
+        }
+    }
+
+    return PVE::Ticket::verify_csrf_prevention_token(
+        $secret, $username, $token, -$auth_graceperiod, $ticket_lifetime, $noerr,
+    );
+}
+
+
+$ sed -n 19,50p /usr/share/perl5/PVE/Ticket.pm
+sub assemble_csrf_prevention_token {
+    my ($secret, $username) = @_;
+
+    my $timestamp = sprintf("%08X", time());
+
+    my $digest = Digest::SHA::hmac_sha256_base64("$timestamp:$username", $secret);
+
+    return "$timestamp:$digest";
+}
+
+sub verify_csrf_prevention_token {
+    my ($secret, $username, $token, $min_age, $max_age, $noerr) = @_;
+
+    if ($token =~ m/^([A-Z0-9]{8}):(\S+)$/) {
+        my $sig = $2;
+        my $timestamp = $1;
+        my $ttime = hex($timestamp);
+
+        my $digest = Digest::SHA::hmac_sha256_base64("$timestamp:$username", $secret);
+
+        my $age = time() - $ttime;
+        return 1
+            if ($digest eq $sig)
+            && ($age > $min_age)
+            && ($age < $max_age);
+    }
+
+    raise("Permission denied - invalid csrf token\n", code => HTTP_UNAUTHORIZED)
+        if !$noerr;
+
+    return undef;
+}
+
+$ ls -l /etc/pve/pve-www.key /etc/pve/authkey.pub /etc/pve/user.cfg /etc/pve/priv/authkey.key   (www-data can read the CSRF secret and user.cfg; never the private key)
+-rw-r----- 1 root www-data  451 Oct 14 17:32 /etc/pve/authkey.pub
+-rw------- 1 root www-data 1679 Oct 14 17:32 /etc/pve/priv/authkey.key
+-rw-r----- 1 root www-data 1704 Oct 12 17:32 /etc/pve/pve-www.key
+-rw-r----- 1 root www-data   42 Oct 14 20:27 /etc/pve/user.cfg
+
+$ grep -n CSRF index.html.tpl; sed -n 29,41p;330,346p proxmoxlib.js
+50:        CSRFPreventionToken: '[% token %]',
+Ext.Ajax.on('beforerequest', function (conn, options) {
+    if (Proxmox.CSRFPreventionToken) {
+        if (!options.headers) {
+            options.headers = {};
+        }
+        options.headers.CSRFPreventionToken = Proxmox.CSRFPreventionToken;
+    }
+    let storedAuth = Proxmox.Utils.getStoredAuth();
+    if (storedAuth.token) {
+        options.headers.Authorization = storedAuth.token;
+    }
+});
+
+            Proxmox.LoggedOut = data.LoggedOut;
+            // creates a session cookie (expire = null)
+            // that way the cookie gets deleted after the browser window is closed
+            if (data.ticket) {
+                Proxmox.CSRFPreventionToken = data.CSRFPreventionToken;
+                Ext.util.Cookies.set(
+                    Proxmox.Setup.auth_cookie_name,
+                    data.ticket,
+                    null,
+                    '/',
+                    null,
+                    true,
+                    'lax',
+                );
+            }
+
+            if (data.token) {
+
+$ grep -n token /usr/share/perl5/PVE/Service/pveproxy.pm   (index page embeds a CSRF token for the cookie user)
+211:    my $token = 'null';
+231:            $token = PVE::AccessControl::assemble_csrf_prevention_token($username);
+276:        token => $token,

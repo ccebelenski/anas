@@ -1,0 +1,30 @@
+# Probe 07: the spliced hook also runs inside pvedaemon (root, trusted_env) on 127.0.0.1:85
+# READ-ONLY: two GETs of the unauthenticated ANAS presence probe. 2026-10-15, stunt node anas-pve.
+# Consequence: HTTPServer::auth_handler skips the CSRF check when euid == 0 (probe 01), so AnasProxy must
+# refuse to serve when it finds itself in a trusted (root) server rather than rely on auth_handler there.
+
+$ ss -ltnpH | grep -E ":85 |:3128 "
+LISTEN 0      4096       127.0.0.1:85    0.0.0.0:* users:(("pvedaemon worke",pid=1440,fd=6),("pvedaemon worke",pid=1439,fd=6),("pvedaemon worke",pid=1438,fd=6),("pvedaemon",pid=1437,fd=6))
+LISTEN 0      4096               *:3128        *:* users:(("spiceproxy work",pid=1472,fd=6),("spiceproxy",pid=1471,fd=6))                                                                   
+
+$ curl -s -i http://127.0.0.1:85/anas/installed   (pvedaemon)
+HTTP/1.1 200 OK
+Cache-Control: max-age=0
+Connection: Keep-Alive
+Date: Thu, 15 Oct 2026 05:18:01 GMT
+Pragma: no-cache
+Server: pve-api-daemon/3.0
+Content-Length: 33
+Content-Type: application/json; charset=utf-8
+Expires: Thu, 15 Oct 2026 05:18:01 GMT
+X-Anas-Version: 0.4.3
+
+{"name":"anas","version":"0.4.3"}
+
+$ curl -sk https://127.0.0.1:8006/anas/installed   (pveproxy)
+{"name":"anas","version":"0.4.3"}
+
+$ grep -n "spiceproxy" AnyEvent.pm | head -4   (spiceproxy branches off before handle_request)
+1177:                    . "User-Agent: spiceproxy\015\012"
+1578:    if ($self->{spiceproxy}) {
+2196:    if ($self->{spiceproxy}) {

@@ -1,0 +1,28 @@
+# Probe 05: standalone-node facts, the gateway's loopback exposure, local accounts
+# READ-ONLY capture, stunt node anas-pve (PVE 9.2), 2026-10-15, wave-2 design pass. Excerpts of PVE Perl/JS sources are quoted as evidence (AGPL-3.0, Proxmox Server Solutions GmbH).
+
+$ cat /etc/pve/.members   (standalone node: NO nodelist — the shape that killed ADOCK 15.3 on its first deploy)
+{
+"nodename": "anas-pve",
+"version": 0
+}
+
+$ cat /etc/pve/user.cfg   (stunt node: root@pam only)
+user:root@pam:1:0:::root@localhost:::
+
+
+
+
+
+$ ss -ltnpH | grep -E ":3000|:8006"   (the gateway listens on 127.0.0.1:3000 — reachable by ANY local uid)
+LISTEN 0      511        127.0.0.1:3000  0.0.0.0:* users:(("node",pid=1355,fd=21))                                                                                                          
+LISTEN 0      4096               *:8006        *:* users:(("pveproxy worker",pid=1463,fd=6),("pveproxy worker",pid=1462,fd=6),("pveproxy worker",pid=1461,fd=6),("pveproxy",pid=1460,fd=6)) 
+
+$ ls -ld /run/anas; ls -l /run/anas
+drwxr-xr-x 2 root root 60 Oct 15 05:05 /run/anas
+total 0
+srw------- 1 root root 0 Oct 15 05:05 anasd.sock
+
+$ getent passwd | accounts with a login shell
+root 0 /bin/bash
+debian 1000 /bin/bash

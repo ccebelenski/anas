@@ -1,0 +1,215 @@
+# Probe 02: the privileges PVE's own disk / ZFS / storage API requires
+# READ-ONLY capture, stunt node anas-pve (PVE 9.2), 2026-10-15, wave-2 design pass. Excerpts of PVE Perl/JS sources are quoted as evidence (AGPL-3.0, Proxmox Server Solutions GmbH).
+
+$ cd /usr/share/perl5/PVE/API2; grep -n "name =>\|method =>\|check =>" Disks.pm Disks/ZFS.pm Disks/LVM.pm Disks/LVMThin.pm Disks/Directory.pm
+Disks.pm:43:    name => 'index',
+Disks.pm:45:    method => 'GET',
+Disks.pm:82:    name => 'list',
+Disks.pm:84:    method => 'GET',
+Disks.pm:89:        check => ['or', ['perm', '/', ['Sys.Audit']], ['perm', '/nodes/{node}', ['Sys.Audit']]],
+Disks.pm:180:    name => 'smart',
+Disks.pm:182:    method => 'GET',
+Disks.pm:187:        check => ['perm', '/', ['Sys.Audit']],
+Disks.pm:229:    name => 'initgpt',
+Disks.pm:231:    method => 'POST',
+Disks.pm:236:        check => ['perm', '/', ['Sys.Modify']],
+Disks.pm:279:    name => 'wipe_disk',
+Disks.pm:281:    method => 'PUT',
+Disks/ZFS.pm:57:    name => 'index',
+Disks/ZFS.pm:59:    method => 'GET',
+Disks/ZFS.pm:63:        check => ['perm', '/', ['Sys.Audit']],
+Disks/ZFS.pm:77:                name => {
+Disks/ZFS.pm:130:    name => 'detail',
+Disks/ZFS.pm:132:    method => 'GET',
+Disks/ZFS.pm:136:        check => ['perm', '/', ['Sys.Audit']],
+Disks/ZFS.pm:143:            name => get_standard_option('pve-storage-id'),
+Disks/ZFS.pm:149:            name => {
+Disks/ZFS.pm:183:                        name => {
+Disks/ZFS.pm:255:                            name => $name,
+Disks/ZFS.pm:309:    name => 'create',
+Disks/ZFS.pm:311:    method => 'POST',
+Disks/ZFS.pm:317:        check => ['perm', '/', ['Sys.Modify']],
+Disks/ZFS.pm:324:            name => get_standard_option('pve-storage-id'),
+Disks/ZFS.pm:540:    name => 'delete',
+Disks/ZFS.pm:542:    method => 'DELETE',
+Disks/ZFS.pm:548:        check => ['perm', '/', ['Sys.Modify']],
+Disks/ZFS.pm:555:            name => get_standard_option('pve-storage-id'),
+Disks/LVM.pm:18:    name => 'index',
+Disks/LVM.pm:20:    method => 'GET',
+Disks/LVM.pm:24:        check => ['perm', '/', ['Sys.Audit']],
+Disks/LVM.pm:47:                        name => {
+Disks/LVM.pm:69:                                    name => {
+Disks/LVM.pm:116:    name => 'create',
+Disks/LVM.pm:118:    method => 'POST',
+Disks/LVM.pm:124:        check => ['perm', '/', ['Sys.Modify']],
+Disks/LVM.pm:131:            name => get_standard_option('pve-storage-id'),
+Disks/LVM.pm:205:    name => 'delete',
+Disks/LVM.pm:207:    method => 'DELETE',
+Disks/LVM.pm:213:        check => ['perm', '/', ['Sys.Modify']],
+Disks/LVM.pm:220:            name => get_standard_option('pve-storage-id'),
+Disks/LVMThin.pm:19:    name => 'index',
+Disks/LVMThin.pm:21:    method => 'GET',
+Disks/LVMThin.pm:25:        check => ['perm', '/', ['Sys.Audit']],
+Disks/LVMThin.pm:73:    name => 'create',
+Disks/LVMThin.pm:75:    method => 'POST',
+Disks/LVMThin.pm:81:        check => ['perm', '/', ['Sys.Modify']],
+Disks/LVMThin.pm:88:            name => get_standard_option('pve-storage-id'),
+Disks/LVMThin.pm:189:    name => 'delete',
+Disks/LVMThin.pm:191:    method => 'DELETE',
+Disks/LVMThin.pm:197:        check => ['perm', '/', ['Sys.Modify']],
+Disks/LVMThin.pm:204:            name => get_standard_option('pve-storage-id'),
+Disks/Directory.pm:94:    name => 'index',
+Disks/Directory.pm:96:    method => 'GET',
+Disks/Directory.pm:100:        check => ['perm', '/', ['Sys.Audit']],
+Disks/Directory.pm:168:    name => 'create',
+Disks/Directory.pm:170:    method => 'POST',
+Disks/Directory.pm:176:        check => ['perm', '/', ['Sys.Modify']],
+Disks/Directory.pm:184:            name => get_standard_option('pve-storage-id'),
+Disks/Directory.pm:335:    name => 'delete',
+Disks/Directory.pm:337:    method => 'DELETE',
+Disks/Directory.pm:343:        check => ['perm', '/', ['Sys.Modify']],
+Disks/Directory.pm:350:            name => get_standard_option('pve-storage-id'),
+
+$ sed -n 278,300p Disks.pm   (wipe_disk declares NO permissions block)
+__PACKAGE__->register_method({
+    name => 'wipe_disk',
+    path => 'wipedisk',
+    method => 'PUT',
+    description => "Wipe a disk or partition.",
+    proxyto => 'node',
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            disk => {
+                type => 'string',
+                description => "Block device name",
+                pattern => '^/dev/[a-zA-Z0-9\/]+$',
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $disk = PVE::Diskmanage::verify_blockdev_path($param->{disk});
+
+$ grep -n "check =>" Services.pm Network.pm APT.pm Storage/Config.pm Storage/Scan.pm | head -30   (node-level verbs use /nodes/{node}; storage.cfg uses /storage)
+Services.pm:221:        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+Services.pm:267:        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+Services.pm:306:        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+Services.pm:348:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+Services.pm:388:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+Services.pm:428:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+Services.pm:465:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+Network.pm:496:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+Network.pm:626:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+Network.pm:720:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+Network.pm:822:        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+Network.pm:886:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+Network.pm:957:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+APT.pm:256:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+APT.pm:300:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+APT.pm:430:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+APT.pm:489:        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+APT.pm:689:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+APT.pm:728:        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+APT.pm:784:        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+Storage/Config.pm:180:        check => ['perm', '/storage/{storage}', ['Datastore.Allocate']],
+Storage/Config.pm:205:        check => ['perm', '/storage', ['Datastore.Allocate']],
+Storage/Config.pm:305:        check => ['perm', '/storage', ['Datastore.Allocate']],
+Storage/Config.pm:422:        check => ['perm', '/storage', ['Datastore.Allocate']],
+Storage/Scan.pm:67:        check => ['perm', '/storage', ['Datastore.Allocate']],
+Storage/Scan.pm:118:        check => ['perm', '/storage', ['Datastore.Allocate']],
+Storage/Scan.pm:191:        check => ['perm', '/storage', ['Datastore.Allocate']],
+Storage/Scan.pm:257:        check => ['perm', '/storage', ['Datastore.Allocate']],
+Storage/Scan.pm:308:        check => ['perm', '/storage', ['Datastore.Allocate']],
+Storage/Scan.pm:344:        check => ['perm', '/storage', ['Datastore.Allocate']],
+
+$ pveum role list: which built-in roles carry Sys.Audit / Sys.Modify
+Administrator        Sys.Audit=yes Sys.Modify=yes
+NoAccess             Sys.Audit=no  Sys.Modify=no
+PVEAdmin             Sys.Audit=yes Sys.Modify=no
+PVEAuditor           Sys.Audit=yes Sys.Modify=no
+PVEDatastoreAdmin    Sys.Audit=no  Sys.Modify=no
+PVEDatastoreUser     Sys.Audit=no  Sys.Modify=no
+PVEMappingAdmin      Sys.Audit=no  Sys.Modify=no
+PVEMappingUser       Sys.Audit=no  Sys.Modify=no
+PVEPoolAdmin         Sys.Audit=no  Sys.Modify=no
+PVEPoolUser          Sys.Audit=no  Sys.Modify=no
+PVESDNAdmin          Sys.Audit=no  Sys.Modify=no
+PVESDNUser           Sys.Audit=no  Sys.Modify=no
+PVESysAdmin          Sys.Audit=yes Sys.Modify=no
+PVETemplateUser      Sys.Audit=no  Sys.Modify=no
+PVEUserAdmin         Sys.Audit=no  Sys.Modify=no
+PVEVMAdmin           Sys.Audit=no  Sys.Modify=no
+PVEVMUser            Sys.Audit=no  Sys.Modify=no
+
+$ sed -n 510,575p API2/AccessControl.pm   (GET /access/permissions: values are the PROPAGATE flag, 0 or 1)
+    name => 'permissions',
+    path => 'permissions',
+    method => 'GET',
+    description => 'Retrieve effective permissions of given user/token.',
+    permissions => {
+        description =>
+            "Each user/token is allowed to dump their own permissions (or that of owned"
+            . " tokens). A user can dump the permissions of another user or their tokens if they"
+            . " have 'Sys.Audit' permission on /access.",
+        user => 'all',
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            userid => {
+                type => 'string',
+                description => "User ID or full API token ID",
+                pattern => $PVE::AccessControl::userid_or_token_regex,
+                optional => 1,
+            },
+            path => get_standard_option(
+                'acl-path',
+                {
+                    description => "Only dump this specific path, not the whole tree.",
+                    optional => 1,
+                },
+            ),
+        },
+    },
+    returns => {
+        type => 'object',
+        description => 'Map of "path" => (Map of "privilege" => "propagate boolean").',
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authid = $rpcenv->get_user();
+
+        my $userid = $param->{userid};
+        $userid = $authid if !defined($userid);
+
+        my ($user, $token) = PVE::AccessControl::split_tokenid($userid, 1);
+        my $check_self = $userid eq $authid;
+        my $check_owned_token = defined($user) && $user eq $authid;
+
+        if (!($check_self || $check_owned_token)) {
+            $rpcenv->check($rpcenv->get_user(), '/access', ['Sys.Audit']);
+        }
+        my $res;
+
+        if (my $path = $param->{path}) {
+            my $perms = $rpcenv->permissions($userid, $path);
+            if ($perms) {
+                $res = { $path => $perms };
+            } else {
+                $res = {};
+            }
+        } else {
+            $res = $rpcenv->get_effective_permissions($userid);
+        }
+
+        return $res;
+    },
+});
+

@@ -1,0 +1,397 @@
+# Probe 01: where PVE authenticates, and where the ANAS hook sits
+# READ-ONLY capture, stunt node anas-pve (PVE 9.2), 2026-10-15, wave-2 design pass. Excerpts of PVE Perl/JS sources are quoted as evidence (AGPL-3.0, Proxmox Server Solutions GmbH).
+
+$ pveversion; dpkg-query -W libpve-access-control libpve-http-server-perl pve-manager proxmox-widget-toolkit passwd zfsutils-linux
+pve-manager/9.2.21/4f6e0ac86f9e8c7f (running kernel: 7.0.14-23-pve)
+libpve-access-control 9.1.2
+libpve-http-server-perl 6.0.5
+passwd 1:4.17.4-2
+proxmox-widget-toolkit 5.2.10
+pve-manager 9.2.21
+zfsutils-linux 2.4.4-pve1
+
+$ ps -eo user,cmd | grep pveproxy/pvedaemon   (pveproxy workers run as www-data)
+root     pvedaemon
+root     pvedaemon worker
+www-data pveproxy
+www-data pveproxy worker
+
+$ grep -n  AnyEvent.pm  (line numbers of the dispatch, the hooks, the auth call)
+293:sub response {
+1213:sub handle_request {
+1226:            $self->handle_api2_request($reqstate, $auth, $method, $path);
+1229:	# >>> ANAS proxy hook (additive; restored on uninstall/upgrade-clobber)
+1238:	# <<< ANAS proxy hook
+1239:	# >>> ADOCK proxy hook (additive; restored on uninstall/upgrade-clobber)
+1248:	# <<< ADOCK proxy hook
+1556:sub authenticate_and_handle_request {
+1590:    } elsif ($path =~ m/^\Q$base_uri\E/) {
+1622:            $auth = $self->auth_handler(
+1668:    $reqstate->{log}->{userid} = $auth->{userid};
+
+$ sed -n 1213,1249p /usr/share/perl5/PVE/APIServer/AnyEvent.pm   (handle_request: /api2 dispatch first, then the ANAS and ADOCK hooks)
+sub handle_request {
+    my ($self, $reqstate, $auth, $method, $path) = @_;
+
+    my $base_uri = $self->{base_uri};
+
+    eval {
+        my $r = $reqstate->{request};
+
+        # disable timeout on handle (we already have all data we need)
+        # we re-enable timeout in response()
+        $reqstate->{hdl}->timeout(0);
+
+        if ($path =~ m/^\Q$base_uri\E/) {
+            $self->handle_api2_request($reqstate, $auth, $method, $path);
+            return;
+        }
+	# >>> ANAS proxy hook (additive; restored on uninstall/upgrade-clobber)
+	if ($path =~ m{^/anas(?:/|$)}) {
+	    eval {
+		require '/usr/share/anas/perl/AnasProxy.pm';
+		AnasProxy::handle($self, $reqstate, $method, $r->uri);
+	    };
+	    $self->error($reqstate, 500, 'ANAS proxy error') if $@;
+	    return;
+	}
+	# <<< ANAS proxy hook
+	# >>> ADOCK proxy hook (additive; restored on uninstall/upgrade-clobber)
+	if ($path =~ m{^/adock(?:/|$)}) {
+	    eval {
+		require '/usr/share/adock/perl/AdockProxy.pm';
+		AdockProxy::handle($self, $reqstate, $method, $r->uri);
+	    };
+	    $self->error($reqstate, 500, 'ADOCK proxy error') if $@;
+	    return;
+	}
+	# <<< ADOCK proxy hook
+
+
+$ sed -n 1556,1632p AnyEvent.pm   (authenticate_and_handle_request: $auth is computed ONLY inside the /api2 branch; /anas gets $auth = {})
+sub authenticate_and_handle_request {
+    my ($self, $reqstate) = @_;
+
+    my $request = $reqstate->{request};
+    my $method = $request->method();
+
+    my $path = uri_unescape($request->uri->path());
+    my $base_uri = $self->{base_uri};
+
+    my $auth = {};
+
+    if (my $proxy_real_ip_header = $self->{proxy_real_ip_header}) {
+        if (my $proxy_real_ip_value = $request->header($proxy_real_ip_header)) {
+            my $real_ip = Net::IP->new($proxy_real_ip_value);
+            if (defined($real_ip) && $self->check_allowed_proxy($reqstate->{peer_host})) {
+                $reqstate->{log}->{real_ip} = Net::IP::ip_compress_address(
+                    $real_ip->ip(), $real_ip->version(),
+                );
+            }
+        }
+    }
+
+    if ($self->{spiceproxy}) {
+        my $connect_str = $request->header('Host');
+        my ($vmid, $node, $port) = $self->verify_spice_connect_url($connect_str);
+
+        if (!(defined($vmid) && $node && $port)) {
+            $self->error($reqstate, HTTP_UNAUTHORIZED, "invalid ticket");
+            return;
+        }
+
+        $self->handle_spice_proxy_request($reqstate, $connect_str, $vmid, $node, $port);
+        return;
+
+    } elsif ($path =~ m/^\Q$base_uri\E/) {
+        my $token = $request->header('CSRFPreventionToken');
+        my $cookie = $request->header('Cookie');
+        my $auth_header = $request->header('Authorization');
+
+        # prefer actual cookie
+        my $ticket = PVE::APIServer::Formatter::extract_auth_value(
+            $cookie, $self->{cookie_name},
+        );
+
+        # fallback to cookie in 'Authorization' header
+        if (!$ticket) {
+            $ticket = PVE::APIServer::Formatter::extract_auth_value(
+                $auth_header, $self->{cookie_name},
+            );
+        }
+
+        # finally, fallback to API token if no ticket has been provided so far
+        my $api_token;
+        if (!$ticket) {
+            $api_token = PVE::APIServer::Formatter::extract_auth_value(
+                $auth_header, $self->{apitoken_name},
+            );
+        }
+
+        my ($rel_uri, $format) = &$split_abs_uri($path, $self->{base_uri});
+        if (!$format) {
+            $self->error($reqstate, HTTP_NOT_IMPLEMENTED, "no such uri");
+            return;
+        }
+
+        eval {
+            $auth = $self->auth_handler(
+                $method,
+                $rel_uri,
+                $ticket,
+                $token,
+                $api_token,
+                $reqstate->{peer_host},
+            );
+        };
+        if (my $err = $@) {
+            # HACK: see Note 1
+
+$ sed -n 1678,1680p AnyEvent.pm
+        my $ctype = $request->header('Content-Type');
+        my ($ct, $boundary) = $ctype ? parse_content_type($ctype) : ();
+
+
+$ sed -n 54,141p /usr/share/perl5/PVE/HTTPServer.pm   (auth_handler: the subclass method pveproxy calls for /api2)
+sub auth_handler {
+    my ($self, $method, $rel_uri, $ticket, $token, $api_token, $peer_host) = @_;
+
+    my $rpcenv = $self->{rpcenv};
+
+    # set environment variables
+    $rpcenv->set_user(undef);
+    $rpcenv->set_language('C');
+    $rpcenv->set_client_ip($peer_host);
+
+    eval { $rpcenv->init_request() };
+    raise("RPCEnvironment init request failed: $@\n") if $@;
+
+    my $require_auth = 1;
+
+    # explicitly allow some calls without auth
+    if (
+        ($rel_uri eq '/access/domains' && $method eq 'GET')
+        || ($rel_uri eq '/access/ticket' && ($method eq 'GET' || $method eq 'POST'))
+        || ($rel_uri eq '/access/vncticket' && $method eq 'POST')
+        || ($rel_uri eq '/access/openid/login' && $method eq 'POST')
+        || ($rel_uri eq '/access/openid/auth-url' && $method eq 'POST')
+    ) {
+        $require_auth = 0;
+    }
+
+    my ($username, $age);
+
+    my $isUpload = 0;
+
+    if ($require_auth) {
+        if ($api_token) {
+            # the token-ID `<user>@<realm>!<tokenname>` is the user for token based authentication
+            $username = eval { PVE::AccessControl::verify_token($api_token); };
+            if (my $err = $@) {
+                warn "authentication failure: $err\n";
+                die "Authentication failed!\n";
+            }
+        } else {
+            die "No ticket\n" if !$ticket;
+
+            my $tfa_info;
+            eval {
+                ($username, $age, $tfa_info) = PVE::AccessControl::verify_ticket($ticket);
+                $rpcenv->check_user_enabled($username);
+            };
+            if (my $err = $@) {
+                warn "authentication failure: $err\n";
+                die "Authentication failed!\n";
+            }
+
+            if (defined($tfa_info)) {
+                if (defined(my $challenge = $tfa_info->{challenge})) {
+                    $rpcenv->set_u2f_challenge($challenge);
+                }
+                die "No ticket\n" if ($rel_uri ne '/access/tfa' || $method ne 'POST');
+            }
+        }
+
+        $rpcenv->set_user($username);
+
+        if ($method eq 'POST' && $rel_uri =~ m|^/nodes/([^/]+)/storage/([^/]+)/upload$|) {
+            my ($node, $storeid) = ($1, $2);
+            # CSRF check are omitted if $isUpload is set, so check user upload permission here
+            my $perm = { check => ['perm', "/storage/$storeid", ['Datastore.AllocateTemplate']] };
+            $rpcenv->check_api2_permissions($perm, $username, {});
+            $isUpload = 1;
+        }
+
+        # Skip CSRF check for file upload (difficult to pass CSRF header with native html forms).
+        # Also skip the check with API tokens, as one of the design goals of API tokens was to
+        # provide stateless API access without requiring round-trips to get such CSRF tokens.
+        # CSRF-prevention also does not make much sense outside of the browser context.
+        if ($method ne 'GET' && !($api_token || $isUpload)) {
+            my $euid = $>;
+            PVE::AccessControl::verify_csrf_prevention_token($username, $token) if $euid != 0;
+        }
+    }
+
+    return {
+        ticket => $ticket,
+        token => $token,
+        userid => $username,
+        age => $age,
+        isUpload => $isUpload,
+        api_token => $api_token,
+    };
+}
+
+$ sed -n 170,175p HTTPServer.pm   (rest_handler: pveproxy runs check_api2_permissions itself, as www-data, before proxying to pvedaemon)
+        raise_perm_exc("URI '$rel_uri' not available with API token, need proper ticket.\n")
+            if $auth->{api_token} && !$info->{allowtoken};
+
+        # check access permissions
+        $rpcenv->check_api2_permissions($info->{permissions}, $auth->{userid}, $uri_param);
+
+
+$ sed -n "118,131p;136,140p;291,305p;549,566p;596,640p" /usr/share/perl5/PVE/RPCEnvironment.pm
+    return $privs;
+};
+
+# this is the method used by permission check helpers below
+#
+# returned value is a hash mapping all set privileges on $path to their
+# respective propagation flag. the propagation flag is informational only -
+# actual propagation is handled in PVE::AccessControl::roles(). to determine
+# whether a privilege is set, check for definedness in the returned hash.
+#
+# compiled ACLs are cached, so repeated checks for the same path and user are
+# almost free.
+#
+# if $user is a tokenid, permissions are calculated depending on the
+sub permissions {
+    my ($self, $user, $path) = @_;
+
+    if ($user eq 'root@pam') { # root can do anything
+        my $cfg = $self->{user_cfg};
+sub check {
+    my ($self, $user, $path, $privs, $noerr) = @_;
+
+    my $perm = $self->permissions($user, $path);
+
+    foreach my $priv (@$privs) {
+        PVE::AccessControl::verify_privname($priv);
+        if (!defined($perm->{$priv})) {
+            return undef if $noerr;
+            raise_perm_exc("$path, $priv");
+        }
+    }
+
+    return 1;
+}
+sub check_api2_permissions {
+    my ($self, $perm, $username, $param) = @_;
+
+    return 1 if !$username && $perm->{user} && $perm->{user} eq 'world';
+
+    raise_perm_exc("user != null") if !$username;
+
+    return 1 if $username eq 'root@pam';
+
+    raise_perm_exc('user != root@pam') if !$perm;
+
+    return 1 if $perm->{user} && $perm->{user} eq 'all';
+
+    return $self->exec_api2_perm_check($perm->{check}, $username, $param)
+        if $perm->{check};
+
+    raise_perm_exc();
+}
+sub init_request {
+    my ($self, %params) = @_;
+
+    PVE::Cluster::cfs_update();
+
+    $self->{result_attributes} = {};
+
+    my $userconfig; # we use this for regression tests
+    foreach my $p (keys %params) {
+        if ($p eq 'userconfig') {
+            $userconfig = $params{$p};
+        } else {
+            die "unknown parameter '$p'";
+        }
+    }
+
+    eval {
+        $self->{aclcache} = {};
+        if ($userconfig) {
+            my $ucdata = PVE::Tools::file_get_contents($userconfig);
+            my $cfg = PVE::AccessControl::parse_user_config($userconfig, $ucdata);
+            $self->{user_cfg} = $cfg;
+        } else {
+            my $ucvers = PVE::Cluster::cfs_file_version('user.cfg');
+            if (
+                !$self->{aclcache}
+                || !defined($self->{aclversion})
+                || !defined($ucvers)
+                || ($ucvers ne $self->{aclversion})
+            ) {
+                $self->{aclversion} = $ucvers;
+                my $cfg = PVE::Cluster::cfs_read_file('user.cfg');
+                $self->{user_cfg} = $cfg;
+            }
+        }
+    };
+    if (my $err = $@) {
+        $self->{user_cfg} = {};
+        die "Unable to load access control list: $err";
+    }
+}
+
+# hacks: to provide better backwards compatibility
+
+# old code uses PVE::RPCEnvironment::get();
+
+$ grep -n "sub raise_perm_exc" -A9 /usr/share/perl5/PVE/Exception.pm
+53:sub raise_perm_exc {
+54-    my ($what) = @_;
+55-
+56-    my $param = { code => HTTP_FORBIDDEN };
+57-
+58-    my $msg = "Permission check failed";
+59-
+60-    $msg .= " ($what)" if $what;
+61-
+62-    my $exc = PVE::Exception->new("$msg\n", %$param);
+
+$ tail of /var/log/pveproxy/access.log: /anas lines log user "-", /api2 lines log the user (tickets redacted)
+::ffff:192.168.200.1 - - [15/10/2026:05:16:21 +0000] "GET /anas/api/nodes/anas-pve/v1/jobs/61c3fa04-8c27-4b7c-945b-a0de4f455bc2 HTTP/1.1" 200 307
+::ffff:192.168.200.1 - - [15/10/2026:05:16:22 +0000] "GET /anas/api/nodes/anas-pve/v1/jobs/61c3fa04-8c27-4b7c-945b-a0de4f455bc2 HTTP/1.1" 200 307
+::ffff:192.168.200.1 - root@pam [15/10/2026:05:16:16 +0000] "GET /api2/json/cluster/tasks HTTP/1.1" 200 980
+::ffff:192.168.200.1 - root@pam [15/10/2026:05:16:19 +0000] "GET /api2/json/cluster/resources HTTP/1.1" 200 577
+
+$ grep -n max_requests AnyEvent.pm pveproxy.pm   (a worker keeps a require-d AnasProxy.pm until it has served max_requests, then exits; a fresh worker loads the file anew)
+/usr/share/perl5/PVE/APIServer/AnyEvent.pm:1779:                        if ($self->{request_count} >= $self->{max_requests}) {
+/usr/share/perl5/PVE/APIServer/AnyEvent.pm:2129:    $self->{max_requests} = 8000 if !$self->{max_requests};
+/usr/share/perl5/PVE/Service/pveproxy.pm:102:        max_requests => 1000,
+
+$ sed -n 176,197p /usr/share/perl5/PVE/HTTPServer.pm   (after the check: proxyto another node, or a protected call proxied to the local pvedaemon)
+        if ($info->{proxyto} || $info->{proxyto_callback}) {
+            my $node = PVE::API2Tools::resolve_proxyto(
+                $rpcenv,
+                $info->{proxyto_callback},
+                $info->{proxyto},
+                $uri_param,
+            );
+
+            if ($node ne 'localhost' && $node ne PVE::INotify::nodename()) {
+                die "unable to proxy file uploads" if $auth->{isUpload};
+                my $remip = $self->remote_node_ip($node);
+                $resp = { proxy => $remip, proxynode => $node, proxy_params => $params };
+                return;
+            }
+        }
+
+        my $euid = $>;
+        if ($info->{protected} && ($euid != 0)) {
+            $resp = { proxy => 'localhost', proxy_params => $params };
+            return;
+        }
+

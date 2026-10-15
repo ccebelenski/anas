@@ -1,0 +1,67 @@
+# Probe 04: PVE's own ticket verifier, ACL check and CSRF verifier, run in-process AS www-data (euid 33) — the uid of a pveproxy worker, i.e. the uid AnasProxy.pm runs as.
+# READ-ONLY: the script is piped on stdin (nothing written on the node); root only assembles a fresh ticket for root@pam with PVE's own assemble_ticket (no state written). 2026-10-15, stunt node anas-pve, PVE 9.2.21.
+# 'nobody-probe@pve' does not exist: it stands in for a PVE user with no ACL entry (refused).
+
+## Script
+#!/usr/bin/perl
+# READ-ONLY probe: runs PVE's own verifiers and ACL check in-process, as the
+# calling uid (run as www-data to mirror a pveproxy worker). Writes nothing.
+use strict; use warnings;
+use Time::HiRes qw(time);
+use PVE::RPCEnvironment;
+use PVE::AccessControl;
+my ($ticket) = @ARGV;
+printf "euid=%d egid=%s\n", $>, $);
+my $rpcenv = PVE::RPCEnvironment->init('pub');
+my $t0 = time; $rpcenv->init_request(); my $t1 = time;
+printf "init_request: %.2f ms\n", ($t1-$t0)*1000;
+$t0 = time; $rpcenv->init_request(); $t1 = time;
+printf "init_request (2nd, user.cfg version unchanged): %.2f ms\n", ($t1-$t0)*1000;
+if ($ticket) {
+  my $t = time;
+  my ($u, $age) = eval { PVE::AccessControl::verify_ticket($ticket) };
+  printf "verify_ticket: %s (%.2f ms)\n", ($@ ? "FAIL $@" : "user=$u age=$age"), (time-$t)*1000;
+  eval { $rpcenv->check_user_enabled($u) }; print "check_user_enabled: ", ($@ ? "FAIL $@" : "ok\n");
+}
+for my $u ('root@pam', 'nobody-probe@pve') {
+  for my $p ('Sys.Audit', 'Sys.Modify') {
+    my $t = time;
+    my $ok = $rpcenv->check($u, '/', [$p], 1);
+    printf "check(%s, /, %s) = %s  (%.3f ms)\n", $u, $p, ($ok ? 'allowed' : 'refused'), (time-$t)*1000;
+  }
+}
+my $csrf = PVE::AccessControl::assemble_csrf_prevention_token('root@pam');
+my ($ts, $sig) = split /:/, $csrf, 2;
+printf "csrf token shape: %s:<%d chars>\n", ($ts =~ /^[0-9A-F]{8}$/ ? '<8 hex ts>' : 'other'), length($sig);
+my $t = time;
+my $okc = PVE::AccessControl::verify_csrf_prevention_token('root@pam', $csrf, 1);
+printf "verify_csrf(root\@pam, own token) = %s (%.3f ms)\n", ($okc ? 'ok' : 'FAIL'), (time-$t)*1000;
+printf "verify_csrf(alice\@pve, root's token) = %s\n", (PVE::AccessControl::verify_csrf_prevention_token('alice@pve', $csrf, 1) ? 'ok' : 'refused');
+printf "verify_csrf(root\@pam, garbage) = %s\n", (PVE::AccessControl::verify_csrf_prevention_token('root@pam', 'ZZZ', 1) ? 'ok' : 'refused');
+
+## Run: T=$(perl -MPVE::AccessControl -e "print PVE::AccessControl::assemble_ticket(q(root@pam))"); runuser -u www-data -- perl - "$T" < probe
+ticket shape: PVE:root@pam:6AD061B5::<sig>
+euid=33 egid=33 33
+init_request: 9.96 ms
+init_request (2nd, user.cfg version unchanged): 0.06 ms
+verify_ticket: user=root@pam age=0 (1.06 ms)
+check_user_enabled: ok
+check(root@pam, /, Sys.Audit) = allowed  (0.013 ms)
+check(root@pam, /, Sys.Modify) = allowed  (0.005 ms)
+check(nobody-probe@pve, /, Sys.Audit) = refused  (0.044 ms)
+check(nobody-probe@pve, /, Sys.Modify) = refused  (0.003 ms)
+csrf token shape: <8 hex ts>:<43 chars>
+verify_csrf(root@pam, own token) = ok (0.009 ms)
+verify_csrf(alice@pve, root's token) = refused
+verify_csrf(root@pam, garbage) = refused
+
+## Earlier run (same session), kept because it shows a gap: a quoting slip made root mint a ticket for the
+## NON-EXISTENT user 'root\@pam'. PVE's verify_ticket accepted the signature; only check_user_enabled refused it.
+## ANAS's gateway (packages/gateway/src/auth/providers/pve.ts) verifies the signature and age only — it has no
+## check_user_enabled step, so a disabled, expired or deleted PVE user's unexpired ticket keeps working in ANAS.
+ticket shape: PVE:root\@pam:6AD0605A::<sig>
+euid=33 egid=33 33
+init_request: 7.91 ms
+init_request (2nd, user.cfg version unchanged): 0.11 ms
+verify_ticket: user=root\@pam age=0 (0.88 ms)
+check_user_enabled: FAIL no such user ('root\@pam')
