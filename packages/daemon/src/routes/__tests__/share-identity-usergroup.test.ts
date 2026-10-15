@@ -23,16 +23,21 @@ import { groupRemovedWithUser, shareIdentityRoutes, userdelRemovesUserGroup } fr
  * With `USERGROUPS_ENAB yes` (PVE 9.2's login.defs, probe P06) `userdel
  * <name>` also removes the group NAMED like the user when it is the user's
  * primary group, has no members once the user is dropped from every member
- * list, and is nobody else's primary group (shadow src/userdel.c,
- * update_groups → remove_usergroup, 4.17.4 and 4.19.0). userdel has no option
- * to keep it (its getopt string is `fhrR:P:Z`; `-K` is useradd's), so the
- * user delete names that group in its confirm, binds it as the confirm's
- * scope, takes its gid key and runs the group delete's band and share
- * reference gates on it.
+ * list, and is no other LOCAL account's primary group (shadow src/userdel.c,
+ * update_groups → remove_usergroup, 4.19.0; cr.29e — the third check reads
+ * the LOCAL passwd file, not the directory). userdel has no option to keep it
+ * (its getopt string is `fhrR:P:Z`; `-K` is useradd's), so the user delete
+ * names that group in its confirm, binds it as the confirm's scope, takes its
+ * gid key and runs the group delete's band, primary-group and share
+ * reference gates on it — the primary-group gate over ALL of NSS, so a
+ * directory account's primary group makes the delete refuse (cr.29e) where
+ * userdel alone would have orphaned it.
  *
  * FIXTURES: getent lines in the passwd(5)/group(5) shape the route tests use
  * (`name:x:uid:gid:gecos:home:shell`, `name:x:gid:members`); the PVE
- * login.defs line is probe P06's verbatim (`USERGROUPS_ENAB yes`).
+ * login.defs line is probe P06's verbatim (`USERGROUPS_ENAB yes`). Accounts
+ * in `Boot.directory` answer only the plain `getent passwd` — the shape of
+ * an sssd/AD account on a node whose nsswitch consults the directory.
  */
 
 const IDENTITY_HEADERS = {
@@ -50,12 +55,16 @@ const CLEAN_SMB_CONF = '[global]\nworkgroup = WORKGROUP\n\n[media]\npath = /tank
 interface Boot {
   /** carol's passwd line (default {@link CAROL}). */
   carol?: string
-  /** Extra passwd lines (other accounts). */
+  /** Extra passwd lines (other LOCAL accounts — in every answer). */
   passwd?: string[]
+  /** Accounts only the plain `getent passwd` holds (directory: sssd/AD, cr.29e). */
+  directory?: string[]
   /** The group file's carol line (default `carol:x:1005:` — empty). */
   group?: string
   /** A SEQUENCE of `getent -s files group` answers (route, route, job …). */
   groupFiles?: string[]
+  /** A SEQUENCE of `getent -s files passwd` answers; `!` prefix = unreadable (cr.29e). */
+  passwdFiles?: string[]
   smbConf?: string
   /** login.defs text; unset = the option is not passed (PVE's yes assumed). */
   loginDefs?: string
@@ -82,9 +91,13 @@ describe('cr.29d — the group userdel removes with a user', () => {
       writeFileSync(loginDefsPath, o.loginDefs)
     }
     const carol = o.carol ?? CAROL
-    const passwd = ['root:x:0:0:root:/root:/bin/bash', carol, ...(o.passwd ?? []), ''].join('\n')
+    const filesLines = ['root:x:0:0:root:/root:/bin/bash', carol, ...(o.passwd ?? [])]
+    const filesPasswd = [...filesLines, ''].join('\n')
+    const passwd = [...filesLines, ...(o.directory ?? []), ''].join('\n')
     const groups = o.groupFiles ?? [groupFile(o.group ?? 'carol:x:1005:')]
+    const passwdFiles = o.passwdFiles ?? [filesPasswd]
     const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
+    const answer = (line: string): ExecResult => line.startsWith('!') ? { stdout: '', stderr: line.slice(1), exitCode: 1 } : ok(line)
 
     executor = new MockExecutor()
     queue = new JobQueue()
@@ -97,8 +110,8 @@ describe('cr.29d — the group userdel removes with a user', () => {
 
     executor.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: ok(passwd) })
     executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: ok(groups[0]) })
-    executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd'], result: ok(passwd) })
-    executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group'], results: groups.map(g => g.startsWith('!') ? { stdout: '', stderr: g.slice(1), exitCode: 1 } : ok(g)) })
+    executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd'], results: passwdFiles.map(answer) })
+    executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group'], results: groups.map(answer) })
     executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'carol'], result: ok(`${carol}\n`) })
     executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd', 'carol'], result: ok(`${carol}\n`) })
     executor.addFixture({ command: '/usr/bin/pdbedit', args: ['-L'], result: ok('') })
@@ -172,7 +185,7 @@ describe('cr.29d — the group userdel removes with a user', () => {
       const { error } = res.json() as { error: { code: string, reason: string, message: string } }
       assert.equal(error.code, 'CONFLICT', ref)
       assert.equal(error.reason, 'referenced-by-share', ref)
-      assert.match(error.message, /^Deleting user 'carol' would also remove group 'carol' \(gid 1005\): userdel removes a user's same-named primary group when no other account uses it, and that group cannot be deleted\. Group 'carol' is referenced by share\(s\): media/, ref)
+      assert.match(error.message, /^Deleting user 'carol' would also remove group 'carol' \(gid 1005\): userdel removes a user's same-named primary group when no other local account uses it, and that group cannot be deleted\. Group 'carol' is referenced by share\(s\): media/, ref)
       assert.equal(res.headers['x-anas-confirm-code'], undefined, ref)
       assert.equal(queue.list().length, 0, ref)
       assert.equal(userdelRan(), false, ref)
@@ -246,6 +259,47 @@ describe('cr.29d — the group userdel removes with a user', () => {
     assert.match((res.json() as { error: { message: string } }).error.message, /could not read the local group file .* so it cannot tell whether deleting user 'carol' would also remove its group/)
     assert.equal(queue.list().length, 0)
   })
+
+  it('cr.29e — a directory account holds the going group as its primary gid: the mirror says userdel removes it, the primary-group gate (ALL of NSS) refuses the delete', async () => {
+    // adacct is visible to `getent passwd` but not to `getent -s files
+    // passwd` — shadow 4.19.0 proven: userdel checks the LOCAL passwd file
+    // only, sees nobody, and REMOVES the group. ANAS must not stand by
+    // while that orphans adacct's primary gid, so the going group passes
+    // the group delete's primary-group gate — reason 'primary-group-in-use'.
+    await boot({ directory: ['adacct:x:2001:1005::/home/adacct:/usr/sbin/nologin'] })
+    const res = await del()
+    assert.equal(res.statusCode, 409)
+    const { error } = res.json() as { error: { code: string, reason: string, message: string } }
+    assert.equal(error.code, 'CONFLICT')
+    assert.equal(error.reason, 'primary-group-in-use')
+    assert.match(error.message, /^Deleting user 'carol' would also remove group 'carol' \(gid 1005\): userdel removes a user's same-named primary group when no other local account uses it, and that group cannot be deleted\. Group 'carol' is the primary group of: adacct\./)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    assert.equal(queue.list().length, 0)
+    assert.equal(userdelRan(), false)
+  })
+
+  it('cr.29e — the same primary gid held by a LOCAL account: userdel keeps the group — not named, not gated, no gid lock (pinned)', async () => {
+    await boot({ passwd: ['erin:x:1006:1005::/home/erin:/usr/sbin/nologin'] })
+    const first = await del()
+    const { error } = first.json() as { error: { code: string, warnings: string[] } }
+    assert.equal(error.code, 'CONFIRMATION_REQUIRED')
+    assert.equal(error.warnings.some(w => /group 'carol'/.test(w)), false)
+    const ok = await del(first.headers['x-anas-confirm-code'] as string)
+    assert.equal(ok.statusCode, 202)
+    const job = await settle((ok.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed')
+    assert.deepEqual(job.result, { deleted: 'carol', smbEntryRemoved: false, groupRemoved: null })
+    assert.equal(submittedLocks[0].some(l => l.key.startsWith('gid:')), false)
+  })
+
+  it('cr.29e — a local account file that cannot be read refuses (503), naming the local account file', async () => {
+    await boot({ passwdFiles: ['!getent: cannot open database'] })
+    const res = await del()
+    assert.equal(res.statusCode, 503)
+    assert.match((res.json() as { error: { message: string } }).error.message, /could not read the local account file \(getent -s files passwd\), so it cannot tell whether deleting user 'carol' would also remove its group 'carol'/)
+    assert.equal(queue.list().length, 0)
+    assert.equal(userdelRan(), false)
+  })
 })
 
 describe('cr.29d — userdel\'s rule, mirrored', () => {
@@ -261,8 +315,28 @@ describe('cr.29d — userdel\'s rule, mirrored', () => {
     assert.equal(userdelRemovesUserGroup(null), true)
   })
 
-  it('remove_usergroup: named like the user, the user\'s primary gid, no member but the user, nobody else\'s primary group', () => {
+  it('cr.29e — a trailing comment does not change the value: shadow\'s getdef strips `# …` before the value test', () => {
+    // Proven against shadow 4.19.0: under `USERGROUPS_ENAB yes # note` the
+    // real userdel REMOVED the group; ANAS had read the value as
+    // `yes # note`, seen not-yes, and skipped every cr.29d gate.
+    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB yes # comment'), true)
+    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB yes\t# comment'), true)
+    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB "yes" # comment'), true)
+    // The strip never turns a setting into its opposite, and a comment-only
+    // line sets nothing (fail closed: yes).
+    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB no # keep it'), false)
+    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB # note'), true)
+    // A comment LINE and a quoted value stay exactly as pinned above.
+    assert.equal(userdelRemovesUserGroup('# USERGROUPS_ENAB yes\nUSERGROUPS_ENAB no\n'), false)
+    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB "no"\n'), false)
+  })
+
+  it('remove_usergroup: named like the user, the user\'s primary gid, no member but the user, no other LOCAL account\'s primary group', () => {
     const [carol] = parsePasswd(`${CAROL}\n`)
+    // cr.29e: this list is the LOCAL accounts (`getent -s files passwd`) —
+    // userdel checks the local passwd file only. A directory account with
+    // gid 1005 as its primary is NOT here and must not stop the mirror; it
+    // is caught by the delete's primary-group gate (route test above).
     const users = parsePasswd(`root:x:0:0:root:/root:/bin/bash\n${CAROL}\n`)
     const g = (line: string) => parseGroups(`${line}\n`)[0]
     assert.equal(groupRemovedWithUser(carol, g('carol:x:1005:'), users)?.name, 'carol')

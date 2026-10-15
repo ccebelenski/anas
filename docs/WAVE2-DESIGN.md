@@ -583,7 +583,10 @@ once in the docs, not guarded (no babysitting).
 
 **Create user / group:** candidate = highest uid (gid) in `[1000, 60000)` among `getent passwd`
 (`getent group`), tombstones included, + 1; while the candidate is in R, add one; refuse with a guiding 409
-when the band is exhausted. R = the numeric ids from `zfs userspace -Hpn -o name -t posixuser` (groups:
+when the band is exhausted. *(This text was written against the half-open band; cr.29c moved the fencepost
+to `[1000, 60000]` inclusive. What is settled: `SHARE_ID_MIN`/`SHARE_ID_MAX` in
+`packages/shared/src/schemas/identity.ts` and the `isShareRelevant` / `isMutableShareId` reads in
+`packages/daemon/src/parsers/getent.ts`.)* R = the numeric ids from `zfs userspace -Hpn -o name -t posixuser` (groups:
 `groupspace … -t posixgroup`) over every filesystem dataset and snapshot of every imported pool; `getfacl
 -n -p` (access and default entries) of every SMB share path, NFS export path, ZFS filesystem mountpoint and
 AHR data mount; the uids of `pdbedit -L` entries; `anonuid=`/`anongid=` in `/etc/exports`. Then `useradd
@@ -787,6 +790,9 @@ fixture.
 - `login.defs` `UID_MAX` is 60000 inclusive [P06]; ANAS's share band is `[1000, 60000)`
   (`getent.ts:38, 51`), so a uid of exactly 60000 that `useradd` may assign is treated as a system account
   by ANAS. Harmless with an explicit `-u` (cr.29), worth knowing.
+  *(As written this row held until cr.29c, which moved the fencepost: 60000 is a share id, not a system
+  account. What is settled: `SHARE_ID_MIN`/`SHARE_ID_MAX` in `packages/shared/src/schemas/identity.ts`
+  and the band reads in `packages/daemon/src/parsers/getent.ts`.)*
 - The gateway's ticket check accepts tickets up to 2 h old whatever the key's rotation age; PVE clamps the
   window after a key rotation (`AccessControl.pm` `get_ticket_age_range`). Moot once cr.27 takes PVE's
   verifier.

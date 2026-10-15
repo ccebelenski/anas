@@ -69,9 +69,32 @@ const SYSTEM_IDS = `uid/gid below ${SHARE_ID_MIN} or above ${SHARE_ID_MAX}`
  */
 const DEFAULT_PRIMARY_GID = 100
 
-/** A login.defs `USERGROUPS_ENAB <value>` line, and a double-quoted value. */
+/**
+ * A login.defs `USERGROUPS_ENAB <value>` line (the value may carry a trailing
+ * comment, stripped below), and a double-quoted value.
+ */
 const USERGROUPS_ENAB_RE = /^\s*USERGROUPS_ENAB\s+(\S(?:.*\S)?)\s*$/
 const QUOTED_RE = /^"(.*)"$/
+
+/**
+ * Drop a trailing comment from a login.defs value: `#` starts a comment that
+ * runs to the end of the line, unless it sits inside double quotes (cr.29e —
+ * shadow's getdef strips it, so `USERGROUPS_ENAB yes # note` sets yes; before
+ * the strip ANAS read the value as `yes # note`, saw not-yes, and skipped the
+ * cr.29d gates under exactly that line).
+ */
+function stripTrailingComment(value: string): string {
+  let out = ''
+  let quoted = false
+  for (const ch of value) {
+    if (ch === '#' && !quoted)
+      break
+    if (ch === '"')
+      quoted = !quoted
+    out += ch
+  }
+  return out.trim()
+}
 
 /**
  * Does `userdel` remove a user's same-named group on this node (cr.29d)?
@@ -85,7 +108,9 @@ const QUOTED_RE = /^"(.*)"$/
  * that SETS the key to something other than `yes` says no. An unreadable file,
  * an absent one, or one without the key reads as yes (PVE 9.2 ships
  * `USERGROUPS_ENAB yes`, probe P06), so ANAS never misses a group userdel would
- * take; at worst it names one that would have stayed.
+ * take; at worst it names one that would have stayed. A line whose value is
+ * empty once its comment is stripped (`USERGROUPS_ENAB # note`) sets nothing —
+ * shadow's getdef sees no value token there either.
  */
 export function userdelRemovesUserGroup(text: string | null): boolean {
   if (text === null)
@@ -93,8 +118,11 @@ export function userdelRemovesUserGroup(text: string | null): boolean {
   let value: string | undefined
   for (const raw of text.split('\n')) {
     const m = USERGROUPS_ENAB_RE.exec(raw)
-    if (m)
-      value = m[1].replace(QUOTED_RE, '$1')
+    if (m) {
+      const token = stripTrailingComment(m[1])
+      if (token !== '')
+        value = token.replace(QUOTED_RE, '$1')
+    }
   }
   return value === undefined || value.toLowerCase() === 'yes'
 }
@@ -113,15 +141,24 @@ export function userdelRemovesUserGroup(text: string | null): boolean {
  * has it as its primary group. userdel(8) says the same: "userdel will delete
  * the group with the same name as the user … will check that this group is not
  * used as a primary group for another user". This mirrors those three checks
- * on what the node has now: `group` from the LOCAL files DB (userdel works on
- * /etc/group), `users` every account (`getent passwd`).
+ * on what the node has now, each against the source shadow reads (cr.29e):
+ * `group` from the LOCAL files DB (`getent -s files group`, shadow 4.19.0
+ * removes it from /etc/group), and check (3) against the LOCAL passwd file
+ * only (`getent -s files passwd`) — userdel edits /etc/passwd with the local
+ * files tools and never consults the directory, so a directory account is not
+ * "another account" to it. What the mirror must therefore never be handed is
+ * every account: an sssd/AD primary holder would make it answer "stays" while
+ * the real userdel removes the group. A directory account's primary group is
+ * caught one step later instead — the delete runs the group's own
+ * primary-group gate (all of NSS, deliberately over-strict) on the going
+ * group and refuses, because userdel would orphan that account.
  */
-export function groupRemovedWithUser(user: PasswdEntry, group: GroupEntry | undefined, users: PasswdEntry[]): GroupEntry | null {
+export function groupRemovedWithUser(user: PasswdEntry, group: GroupEntry | undefined, localUsers: PasswdEntry[]): GroupEntry | null {
   if (!group || group.name !== user.name || group.gid !== user.gid)
     return null
   if (group.members.some(m => m !== user.name))
     return null
-  if (users.some(u => u.name !== user.name && u.gid === group.gid))
+  if (localUsers.some(u => u.name !== user.name && u.gid === group.gid))
     return null
   return group
 }
@@ -482,6 +519,15 @@ export async function shareIdentityRoutes(
       const r = await executor.exec(GETENT, ['-s', 'files', 'group'])
       return r.exitCode !== 0 && !r.stdout.trim() ? null : parseGroups(r.stdout)
     }),
+    /**
+     * Every LOCAL account (`getent -s files passwd`), STRICT: null when it
+     * could not be read. cr.29e: the userdel mirror's "another account's
+     * primary group" check reads the files source only — userdel does.
+     */
+    localUsersStrict: (reads: GuardReads) => reads.once('passwd:files:strict', async (): Promise<PasswdEntry[] | null> => {
+      const r = await executor.exec(GETENT, ['-s', 'files', 'passwd'])
+      return r.exitCode !== 0 && !r.stdout.trim() ? null : parsePasswd(r.stdout)
+    }),
   }
 
   /**
@@ -508,10 +554,10 @@ export async function shareIdentityRoutes(
     const group = local.find(g => g.name === entry.name)
     if (!group)
       return { group: null }
-    const users = await idReads.users(reads)
-    if (users === null)
-      return { unreadable: 'the account database (getent passwd)' }
-    return { group: groupRemovedWithUser(entry, group, users) }
+    const localUsers = await idReads.localUsersStrict(reads)
+    if (localUsers === null)
+      return { unreadable: 'the local account file (getent -s files passwd)' }
+    return { group: groupRemovedWithUser(entry, group, localUsers) }
   }
   interface GroupObject { name: string, entry: GroupEntry, local: boolean }
   /** A create's object: the name it claims (no id exists yet). */
@@ -648,21 +694,29 @@ export async function shareIdentityRoutes(
    * account would be left with an unresolvable primary gid). Every resolvable
    * account is checked, not only local ones: a directory user pinned to this
    * gid would be broken the same way.
+   *
+   * `except` (a user delete's going group, cr.29e) names the account being
+   * deleted itself: its own primary gid leaves with it, so it is not who the
+   * check guards.
    */
-  const notPrimaryGroupGate: Gate<GroupObject> = async (o, reads) => {
-    const users = await idReads.users(reads)
-    if (users === null)
-      return accountsUnreadable(`that group '${o.name}' is nobody's primary group`)
-    const primaries = users.filter(u => u.gid === o.entry.gid).map(u => u.name)
-    if (primaries.length === 0)
-      return null
-    return {
-      status: 409,
-      code: 'CONFLICT',
-      reason: 'primary-group-in-use',
-      message: `Group '${o.name}' is the primary group of: ${primaries.join(', ')}. Change their primary group (or remove the users) first. This refusal has no confirm bypass.`,
+  function primaryGroupGate(except?: string): Gate<GroupObject> {
+    return async (o, reads) => {
+      const users = await idReads.users(reads)
+      if (users === null)
+        return accountsUnreadable(`that group '${o.name}' is nobody's primary group`)
+      const primaries = users.filter(u => u.gid === o.entry.gid && u.name !== except).map(u => u.name)
+      if (primaries.length === 0)
+        return null
+      return {
+        status: 409,
+        code: 'CONFLICT',
+        reason: 'primary-group-in-use',
+        message: `Group '${o.name}' is the primary group of: ${primaries.join(', ')}. Change their primary group (or remove the users) first. This refusal has no confirm bypass.`,
+      }
     }
   }
+
+  const notPrimaryGroupGate = primaryGroupGate()
 
   const groupNotReferencedGate: Gate<GroupObject> = async (o, reads) => {
     const { refs } = await sharesReferencing(reads, o.name, true)
@@ -673,10 +727,15 @@ export async function shareIdentityRoutes(
    * cr.29d: a user delete never removes a group behind the group delete's
    * gates. When userdel will take the user's same-named group with it (see
    * {@link groupRemovedWithUser}), that group passes the group delete's own
-   * gates first — the band (cr.3) and the share references (cr.30); local is
-   * given (userdel removes it from /etc/group) and "nobody else's primary
-   * group" is userdel's own condition. A refusal keeps the group gate's code
-   * and reason, its sentence led by why the user delete reached the group.
+   * gates first — the band (cr.3), "nobody else's primary group" and the
+   * share references (cr.30); local is given (userdel removes it from
+   * /etc/group). The primary-group gate reads ALL of NSS (minus the user
+   * being deleted) and is deliberately over-strict (cr.29e): the mirror said
+   * "removed" precisely because no LOCAL account holds the gid, so this is
+   * where a directory account's primary group makes the delete REFUSE —
+   * userdel would remove the group and orphan that account's primary gid. A
+   * refusal keeps the group gate's code and reason, its sentence led by why
+   * the user delete reached the group.
    */
   const userGroupGate: Gate<UserObject> = async (o, reads) => {
     const fate = o.fate
@@ -693,12 +752,12 @@ export async function shareIdentityRoutes(
     if (!group)
       return null
     const target: GroupObject = { name: group.name, entry: group, local: true }
-    for (const gate of [mutableGroupGate, groupNotReferencedGate]) {
+    for (const gate of [mutableGroupGate, primaryGroupGate(o.name), groupNotReferencedGate]) {
       const refused = await gate(target, reads)
       if (refused) {
         return {
           ...refused,
-          message: `Deleting user '${o.name}' would also remove group '${group.name}' (gid ${group.gid}): userdel removes a user's same-named primary group when no other account uses it, and that group cannot be deleted. ${refused.message}`,
+          message: `Deleting user '${o.name}' would also remove group '${group.name}' (gid ${group.gid}): userdel removes a user's same-named primary group when no other local account uses it, and that group cannot be deleted. ${refused.message}`,
         }
       }
     }
