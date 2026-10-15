@@ -420,6 +420,25 @@ describe('previewCloudSync — a non-JSON failure carries the run\'s own sentenc
     }
   })
 
+  it('D9: a TRUNCATED preview keeps the last stderr line rclone wrote — "cut short", never with the "couldn\'t connect SSH" hidden', async () => {
+    const h = await harness()
+    try {
+      // A wrong credential on a slow remote: rclone prints its plain pre-logger
+      // auth line and keeps retrying, and the 15 s wrapper fires before it
+      // exits. Before D9 the `truncated` branch returned [] and hid the line;
+      // now the look answers `truncated: true` WITH rclone's own words.
+      replayRclone(h.mock, await authFailLog(), TIMEOUT_EXIT_CODE)
+      const result = await previewCloudSync(h.mock, deps(h))
+      assert.equal(result.truncated, true)
+      assert.ok(result.errors.length >= 1, 'the truncated look names what rclone logged')
+      assert.match(result.errors.join('\n'), /couldn't connect SSH|NewFs/)
+      // An empty stderr at the ceiling stays an honest `errors: []` (the test above).
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
   it(`an error line rclone DID log wins over the sentence — its own words, not ours (captured ${READ_ERROR_FIXTURE})`, async () => {
     const h = await harness()
     try {

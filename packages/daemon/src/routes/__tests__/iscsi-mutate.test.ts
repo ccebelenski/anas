@@ -1594,7 +1594,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       assert.equal(job.status, 'failed')
       // cr.40: the served device is the bound scope of a destroying delete.
       assert.equal(job.error!.code, 'STATE_CHANGED')
-      assert.match(job.error!.message, /the backing device to destroy: block:230:16 at the confirmation, unreadable now/)
+      assert.match(job.error!.message, /was: block:230:16; now: unreadable\)/)
       assert.equal(argv().some(a => a.startsWith(`${ZFS} destroy`)), false)
       assert.equal(argv().some(a => a.startsWith(TARGETCLI)), false)
     })

@@ -291,7 +291,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
     assert.equal(res.statusCode, 409, res.body)
     assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
     assert.deepEqual(res.json().error.changed, ['children'])
-    assert.equal(res.json().error.message, 'the child datasets changed since you confirmed (none then, testpool/media/vm-100-disk-0 (createtxg 88) now) — confirm again')
+    assert.equal(res.json().error.message, 'the child datasets changed since you confirmed (was: none; now: testpool/media/vm-100-disk-0 (createtxg 88)) — confirm again')
     assert.ok((res.json().error.warnings as string[]).includes('Child datasets destroyed with it: testpool/media/vm-100-disk-0.'))
     assert.ok(res.headers['x-anas-confirm-code'], 'a fresh code for what is there now')
     assert.deepEqual(calls.filter(isMutation), [])
@@ -303,7 +303,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
     })
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'STATE_CHANGED')
-    assert.equal(job.error?.message, 'Dataset \'testpool/media\' changed since you confirmed (the child datasets: none at the confirmation, the child datasets: testpool/media/vm-100-disk-0 (createtxg 88) now) — nothing was done; confirm again')
+    assert.equal(job.error?.message, 'Dataset \'testpool/media\' changed since you confirmed (was: none; now: testpool/media/vm-100-disk-0 (createtxg 88)) — nothing was done; confirm again')
     assert.deepEqual(calls.filter(isMutation), [])
   })
 
@@ -357,7 +357,7 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
     })
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'STATE_CHANGED')
-    assert.match(job.error!.message, /what force destroys: testpool\/media@snap2 at the confirmation, what force destroys: testpool\/media#after-snap2, testpool\/media@snap2 now/)
+    assert.match(job.error!.message, /was: testpool\/media@snap2; now: testpool\/media#after-snap2, testpool\/media@snap2\)/)
     assert.deepEqual(calls.filter(isMutation), [])
   })
 

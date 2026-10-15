@@ -373,9 +373,13 @@
                 }
                 ANAS.warn('job poll failed: ' + ANAS.errText(err));
                 if (sinceOk() >= LOST_CONTACT_MS) {
+                    // D6: the <what> (a caller's label, or the capitalised
+                    // default "The job") leads its OWN sentence — never "while
+                    // The job was running" with the capitalised subject dropped
+                    // mid-sentence. opts.what is NOT lowercased.
                     lost(err, ANAS.t('Lost contact'),
-                        ANAS.t('Lost contact with the node while') + ' ' + ANAS.enc(what()) + ' '
-                        + ANAS.t('was running; it may still be running. Refresh to see the result.'));
+                        ANAS.t('Lost contact with the node') + '. ' + ANAS.enc(what()) + ' '
+                        + ANAS.t('was still running when contact was lost; it may still be running. Refresh to see the result.'));
                     return;
                 }
                 schedule(RETRY_MS[Math.min(retryIdx++, RETRY_MS.length - 1)]);

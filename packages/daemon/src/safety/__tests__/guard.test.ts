@@ -193,7 +193,8 @@ describe('guard (cr.32): the job door', () => {
     const job = await runJob(guarded(spec, pre, async () => 'acted'))
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'STATE_CHANGED')
-    assert.match(job.error!.message, /the members to wipe: disk-a, disk-b at the confirmation, the members to wipe: disk-a, disk-b, disk-c now/)
+    // D7: the two sets are separated as `was: …; now: …`, never run together.
+    assert.match(job.error!.message, /was: disk-a, disk-b; now: disk-a, disk-b, disk-c\) — nothing was done/)
   })
 
   it('reports only the advisories the confirm did not list', async () => {
@@ -343,7 +344,7 @@ describe('guard (cr.32): the bound confirm', () => {
     const res = await post(app, { cleanup: true }, code)
     assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
     assert.deepEqual(res.json().error.changed, ['members'])
-    assert.match(res.json().error.message, /the members to wipe changed since you confirmed \(disk-a, disk-b then, disk-a, disk-b, disk-c now\)/)
+    assert.match(res.json().error.message, /the members to wipe changed since you confirmed \(was: disk-a, disk-b; now: disk-a, disk-b, disk-c\)/)
   })
 
   it('a changed revision between challenge and resend is STATE_CHANGED', async () => {

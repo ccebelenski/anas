@@ -207,17 +207,29 @@ export async function guardCheck<O>(spec: GuardSpec<O>): Promise<GuardPass<O> | 
   return { object, bound, advisories, locks }
 }
 
-/** `the disks to wipe: a, b` — a scope as a message names it. */
+/**
+ * A scope as a message names it. ONE key (today's scopes all have one) reads
+ * as its bare set — `the members to wipe` is the lead-in of the sentence, so
+ * the label would only repeat it (D7: `was: disk-a, disk-b; now: …`); several
+ * keys keep their labels so the two sets cannot blur together.
+ */
 function describeScope(scope: BoundId | undefined, labels: Record<string, string> = {}): string {
   if (!scope)
     return 'nothing'
-  return Object.keys(scope).sort().map(k => `${labels[k] ?? k}: ${scope[k] || 'none'}`).join('; ')
+  const keys = Object.keys(scope).sort()
+  if (keys.length === 1)
+    return String(scope[keys[0]] || 'none')
+  return keys.map(k => `${labels[k] ?? k}: ${scope[k] || 'none'}`).join('; ')
 }
 
-/** The job-time sentence when the bound scope moved. */
+/**
+ * The job-time sentence when the bound scope moved — the two sets SEPARATED
+ * as `was: …; now: …`, so a grown child set reads as two lists, not one
+ * run-together string (D7).
+ */
 function scopeChangedMessage<O>(view: ObjectView<O>, confirmed: BoundId | undefined, now: BoundId | null): string {
-  return `${view.what} changed since you confirmed (${describeScope(confirmed, view.scopeLabels)} at the confirmation, `
-    + `${now ? describeScope(now, view.scopeLabels) : 'unreadable'} now) — nothing was done; confirm again`
+  return `${view.what} changed since you confirmed (was: ${describeScope(confirmed, view.scopeLabels)}; `
+    + `now: ${now ? describeScope(now, view.scopeLabels) : 'unreadable'}) — nothing was done; confirm again`
 }
 
 /**
@@ -427,7 +439,9 @@ function mismatchError<O>(
     if (scopeKeys.length > 0) {
       const was = scopePart(mismatch.was.bound)
       const labels = view.scopeLabels ?? {}
-      parts.push(scopeKeys.map(k => `${labels[k] ?? k} changed since you confirmed (${was[k] || 'none'} then, ${pass.bound.scope?.[k] || 'none'} now)`).join('; '))
+      // D7: the two sets are separated (`was: a, b; now: a, b, c`), never
+      // written as one run-together string with a suffix marker each.
+      parts.push(scopeKeys.map(k => `${labels[k] ?? k} changed since you confirmed (was: ${was[k] || 'none'}; now: ${pass.bound.scope?.[k] || 'none'})`).join('; '))
     }
     const sentence = `${parts.join('; ')} — confirm again`
     return {

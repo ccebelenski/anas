@@ -343,7 +343,12 @@ describe('buildAhrCacheState — ahrcache.1 review fixes', () => {
     const one = foreignVgPvAdvisory('tank', ['/dev/sde1'])
     assert.match(one, /volume group 'tank' also holds \/dev\/sde1, which is neither a band array nor one of this pool's cache slices/)
     assert.match(one, /Detach cache does not remove it/)
-    assert.match(one, /Destroy removes the volume group and leaves it as a physical volume with no volume group/)
+    // D4 (0.4.4 wave-3 pass): since cr.22 Destroy refuses the teardown while a
+    // foreign PV is in the volume group — the advisory must say that, never the
+    // old "Destroy removes the volume group" promise.
+    assert.doesNotMatch(one, /Destroy removes the volume group/)
+    assert.match(one, /Destroy is refused while it is in it/)
+    assert.match(one, /ANAS only removes a volume group whose every PV is its own/)
     assert.match(one, /expansion grows the pool volume into any free space it has/)
     assert.match(foreignVgPvAdvisory('tank', ['/dev/sde1', '/dev/sdf1']), /\/dev\/sde1, \/dev\/sdf1, which are neither/)
   })

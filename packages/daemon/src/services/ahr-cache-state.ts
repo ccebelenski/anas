@@ -337,8 +337,8 @@ export function cacheFailedAdvisory(pool: string): string {
 export function foreignVgPvAdvisory(pool: string, pvNames: string[]): string {
   const one = pvNames.length === 1
   return `volume group '${pool}' also holds ${pvNames.join(', ')}, which ${one ? 'is' : 'are'} neither a band array nor one of this pool's cache slices. `
-    + `ANAS leaves ${one ? 'it' : 'them'} alone: Detach cache does not remove ${one ? 'it' : 'them'} from the volume group, and Destroy removes the volume group `
-    + `and leaves ${one ? 'it as a physical volume' : 'them as physical volumes'} with no volume group. `
+    + `ANAS leaves ${one ? 'it' : 'them'} alone: Detach cache does not remove ${one ? 'it' : 'them'} from the volume group, and Destroy is refused while `
+    + `${one ? 'it' : 'they'} ${one ? 'is' : 'are'} in it — ANAS only removes a volume group whose every PV is its own (cr.22). `
     + `An expansion grows the pool volume into any free space ${one ? 'it has' : 'they have'}`
 }
 

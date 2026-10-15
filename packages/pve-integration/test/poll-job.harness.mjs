@@ -491,6 +491,26 @@ async function main() {
     assert('f2: a lost-contact alert', count(env.alerts) === 1 && contains(env.alerts[0].msg, 'Lost contact'))
   }
 
+  // --- f3: no `what` → the DEFAULT subject is capitalised, so the lost-contact
+  //        sentence must not stick it mid-sentence (D6: "while The job was
+  //        running"). The subject starts its own sentence; `opts.what` was NOT
+  //        lowercased (a caller's label keeps its case).
+  {
+    const env = makeEnv(netErr)
+    let failedCalls = 0
+    env.ANAS.pollJob('pve1', 'J', {
+      onFailed: function (j) { failedCalls++ },
+    })
+    await env.advanceTo(300000)
+    assert('f3: lost contact once', failedCalls === 1)
+    assert('f3: one alert', count(env.alerts) === 1)
+    const body = env.alerts[0].msg
+    assert('f3: names what was running', contains(body, 'The job was still running'))
+    assert('f3: not "while The job" — no capitalised subject mid-sentence', !contains(body, 'while The job'))
+    assert('f3: keeps the lost-contact fact', contains(body, 'Lost contact with the node'))
+    assert('f3: still says it may be running', contains(body, 'it may still be running'))
+  }
+
   // ---- i–n: a delete that ends failed or lost reloads its grid, through the
   //      REAL runJob → pollJob (cr.45 review) -------------------------------
 

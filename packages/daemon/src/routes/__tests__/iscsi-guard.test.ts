@@ -314,7 +314,8 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
     const job = await race(UPDATE_KEEP_ALLOWED2, LIVE, loggedIn(LIVE))
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'STATE_CHANGED')
-    assert.ok(job.error!.message.includes(`live sessions this edit drops: none; live connections on portals this edit removes: none at the confirmation, live sessions this edit drops: ${DEBIAN};`), job.error!.message)
+    // D7: a multi-key scope keeps its labels, with the sides named `was:`/`now:`.
+    assert.ok(job.error!.message.includes(`(was: live sessions this edit drops: none; live connections on portals this edit removes: none; now: live sessions this edit drops: ${DEBIAN}`), job.error!.message)
     assert.deepEqual(calls.filter(isMutation), [])
   })
 

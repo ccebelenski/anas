@@ -494,7 +494,7 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     const job = await finished(id)
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'STATE_CHANGED')
-    assert.match(job.error!.message, /the credentials file to remove: \/etc\/anas\/creds\/anastest\.cred at the confirmation, the credentials file to remove: \S+other\.cred now/)
+    assert.match(job.error!.message, /was: \/etc\/anas\/creds\/anastest\.cred; now: \S+other\.cred\)/)
     assert.deepEqual(calls.filter(isMutation), [])
   })
 

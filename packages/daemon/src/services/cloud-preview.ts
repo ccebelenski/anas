@@ -199,7 +199,17 @@ export async function previewCloudSync(
 function previewErrors(mode: string, exitCode: number, truncated: boolean, log: RcloneLogState): string[] {
   if (log.errorLines.length)
     return log.errorLines
-  if (truncated || rcloneRunCompleted(exitCode))
+  // D9: the 15 s wrapper can end a preview while rclone has already said what
+  // is wrong — a wrong credential prints its pre-logger plain line and keeps
+  // retrying past the ceiling. The last RAW line rclone wrote answers the
+  // "what went wrong" question an empty `errors` would leave open, so the
+  // truncated look carries it too (the run's own failure path already falls
+  // back to that line). Nothing logged at the ceiling stays an honest `[]`.
+  if (truncated) {
+    const last = log.rawLines.at(-1)
+    return last ? [last] : []
+  }
+  if (rcloneRunCompleted(exitCode))
     return []
   return [rcloneFailureMessage(mode, exitCode, log)]
 }
