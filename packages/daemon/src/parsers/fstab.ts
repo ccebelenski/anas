@@ -1,5 +1,5 @@
 import type { MountCifsOptions, MountCommonOptions, MountEntry, MountInlineCredentials, MountNfsOptions, MountOptions } from '@anas/shared'
-import { escapeFstabField, MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec, unescapeFstabField, X_ANAS_DISABLED_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_KEPT_TOKEN, X_ANAS_DISABLED_TOKEN } from '@anas/shared'
+import { escapeFstabField, MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec, unescapeFstabField, X_ANAS_DISABLED_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_KEPT_TOKEN, X_ANAS_DISABLED_TOKEN, X_SYSTEMD_AUTOMOUNT_TOKEN } from '@anas/shared'
 
 /** Recognized enum-value sets, mirrored from the shared schema (never drift). */
 const CIFS_CACHE_VALUES = new Set<string>(MountCifsCache.options)
@@ -63,13 +63,6 @@ const FSTAB_FOUR_FIELDS = /^(\s*)(\S+)(\s+)(\S+)(\s+)(\S+)(\s+)(\S+)((?:\s[\s\S]
 
 /** Single whitespace char — the token boundary before an inline `#` comment. */
 const WS_CHAR = /\s/
-
-/**
- * The systemd automount option (the fstab-generator token that arms a mount on
- * first access). The ONE spelling the parser recognizes (exact lowercase, like
- * every {@link COMMON_TRUE_FLAGS} lookup) and the one Disable parks (cr.19).
- */
-const X_SYSTEMD_AUTOMOUNT_TOKEN = 'x-systemd.automount'
 
 /**
  * The index of a `#` that BEGINS an inline trailing comment — a `#` at column 0
@@ -271,6 +264,24 @@ export function addMountOption(text: string, mountpoint: string, token: string):
   return serializeFstabDoc(doc)
 }
 
+/**
+ * Does the line for `mountpoint` carry an automount — a LIVE
+ * `x-systemd.automount` or a PARKED `x-anas.disabled-automount` (cr.19)? Read
+ * from the raw option tokens, not the structured entry, so a parked token on a
+ * line whose disable token a hand edit removed still counts: the routes use
+ * this to decide whether the line's `.automount` unit may be armed and must be
+ * stopped before the daemon-reload (node pass R1-D2/D3).
+ */
+export function carriesAutomount(text: string, mountpoint: string): boolean {
+  for (const line of parseFstabDoc(text)) {
+    if (line.kind !== 'entry' || line.entry.mountpoint !== mountpoint)
+      continue
+    const ops = entryOptionsOps(line)
+    return ops !== null && ops.opts.split(',').some(t => isLiveAutomountToken(t) || isParkedAutomountToken(t))
+  }
+  return false
+}
+
 /** Remove ONLY the line for `mountpoint` (active or disabled). No-op if absent. */
 export function removeMount(text: string, mountpoint: string): string {
   const doc = parseFstabDoc(text)
@@ -291,65 +302,87 @@ function disabledTokens(entry: MountEntry): string[] {
   return entry.options.common.noauto ? [X_ANAS_DISABLED_KEPT_TOKEN] : ['noauto', X_ANAS_DISABLED_TOKEN]
 }
 
+/** The key of one option token (before any `=`), whitespace-trimmed. */
+function optionKey(token: string): string {
+  const t = token.trim()
+  const eq = t.indexOf('=')
+  return eq === -1 ? t : t.slice(0, eq)
+}
+
+/** Is `token` the LIVE `x-systemd.automount` (exact, as the generator matches it)? */
+function isLiveAutomountToken(token: string): boolean {
+  return token.trim() === X_SYSTEMD_AUTOMOUNT_TOKEN
+}
+
 /**
- * Append option tokens to the OPTIONS column of a canonical serialized line.
- * `parkAutomount` (cr.19) first swaps the line's live `x-systemd.automount` for
- * its parked marker — the writer of a DISABLED line uses this so the generated
- * bytes never carry a token the fstab-generator would arm.
+ * Is `token` the PARKED automount (cr.19)? By key and case-insensitively —
+ * the same way the reader matches the `x-anas.disabled` tokens, so whatever
+ * the reader honours as parked, enable un-parks.
  */
-function injectOptionTokens(serialized: string, tokens: string[], parkAutomount = false): string {
+function isParkedAutomountToken(token: string): boolean {
+  return optionKey(token).toLowerCase() === X_ANAS_DISABLED_AUTOMOUNT_TOKEN
+}
+
+/** Replace a token's trimmed text, keeping any surrounding whitespace byte-for-byte. */
+function swapTokenText(token: string, to: string): string {
+  const core = token.trim()
+  const at = token.indexOf(core)
+  return `${token.slice(0, at)}${to}${token.slice(at + core.length)}`
+}
+
+/**
+ * Park every live `x-systemd.automount` in an OPTIONS column IN PLACE (cr.19,
+ * §2 Mounts automount ruling): the token keeps its position, every other
+ * token keeps its exact bytes. Returns the column unchanged when it carries
+ * no live automount.
+ */
+function parkAutomount(opts: string): string {
+  return opts.split(',').map(t => (isLiveAutomountToken(t) ? swapTokenText(t, X_ANAS_DISABLED_AUTOMOUNT_TOKEN) : t)).join(',')
+}
+
+/** The inverse of {@link parkAutomount}: every parked token back to `x-systemd.automount`, in place. */
+function unparkAutomount(opts: string): string {
+  return opts.split(',').map(t => (isParkedAutomountToken(t) ? swapTokenText(t, X_SYSTEMD_AUTOMOUNT_TOKEN) : t)).join(',')
+}
+
+/** An OPTIONS column without any parked automount token (every other token byte-identical). */
+function dropParkedAutomount(opts: string): string {
+  const kept = opts.split(',').filter(t => !isParkedAutomountToken(t))
+  return kept.join(',')
+}
+
+/**
+ * The OPTIONS column of a line being disabled: any live automount parked in
+ * place, then the disable token(s) appended. The one rule for both disable
+ * writers (the byte-surgical one and the canonical serialization), so the
+ * two can never disagree about what a disabled line carries.
+ */
+function disabledOptions(opts: string, tokens: string[]): string {
+  const parked = parkAutomount(opts)
+  const added = tokens.join(',')
+  return parked ? `${parked},${added}` : added
+}
+
+/** Apply the disable rewrite to the OPTIONS column of a canonical serialized line. */
+function injectDisableTokens(serialized: string, tokens: string[]): string {
   const m = serialized.match(FSTAB_FOUR_FIELDS)
   if (!m)
     return serialized // cannot happen for our own serialization — fail open
   const [, lead, spec, s1, mp, s2, fstype, s3, opts, tail] = m
-  const base = parkAutomount ? parkAutomountTokens(opts) : opts
-  const added = tokens.join(',')
-  return `${lead}${spec}${s1}${mp}${s2}${fstype}${s3}${base ? `${base},` : ''}${added}${tail}`
-}
-
-/**
- * cr.19 (§2 Mounts automount ruling, 2026-10-14): park the automount option for
- * the duration of a disable — swap every `x-systemd.automount` in an OPTIONS
- * column for its parked marker, IN PLACE (same position in the list; Enable
- * swaps back there, so the round trip is byte-identical). `noauto` lands on the
- * `.mount` unit only, so a disabled line still carrying the live token keeps
- * its `.automount` wired into `remote-fs.target.wants` and arms at boot (node
- * defect R1-D1).
- *
- * The match is the EXACT lowercase token after trim — precisely what the reader
- * recognizes as automount ({@link COMMON_TRUE_FLAGS} looks up exact lowercase,
- * and systemd's generator is likewise case-sensitive). A token written with any
- * other casing is unrecognized exotica: it classifies automount=false,
- * round-trips verbatim in passthrough, arms nothing — and so is neither swapped
- * here nor stopped by the routes' unit-stop.
- */
-function parkAutomountTokens(opts: string): string {
-  let parked = false
-  const out = opts.split(',').map((t) => {
-    if (t.trim() === X_SYSTEMD_AUTOMOUNT_TOKEN) {
-      parked = true
-      return t.replace(X_SYSTEMD_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_AUTOMOUNT_TOKEN)
-    }
-    return t
-  })
-  return parked ? out.join(',') : opts
+  return `${lead}${spec}${s1}${mp}${s2}${fstype}${s3}${disabledOptions(opts, tokens)}${tail}`
 }
 
 /**
  * The DISABLED (option-form) rendering of an entry: its canonical ACTIVE line
- * plus exactly the disable token(s) the entry's own `noauto` calls for.
- * `comment` is the inline trailing comment to re-attach (after the options,
- * where it always was). This is the one writer for a disabled line — the
- * convert-an-`#ANAS`-line and keep-a-disabled-line-stays-disabled paths share
- * it, so the two produce identical bytes.
- *
- * cr.19: the automount option is EMITTED PARKED — the canonical serializer
- * writes the active token, and a line rendered through here is by definition
- * disabled, so the swap happens on the way out (the entry object keeps
- * `automount: true`; the token is what the generator reads).
+ * with its `x-systemd.automount` (if any) parked in place, plus exactly the
+ * disable token(s) the entry's own `noauto` calls for. `comment` is the inline
+ * trailing comment to re-attach (after the options, where it always was).
+ * This is the one writer for a disabled line — the convert-an-`#ANAS`-line and
+ * keep-a-disabled-line-stays-disabled paths share it, so the two produce
+ * identical bytes.
  */
 function disabledSerialization(entry: MountEntry, comment: string): string {
-  return injectOptionTokens(serializeMountLine(entry), disabledTokens(entry), entry.options.common.automount) + comment
+  return injectDisableTokens(serializeMountLine(entry), disabledTokens(entry)) + comment
 }
 
 /**
@@ -358,14 +391,15 @@ function disabledSerialization(entry: MountEntry, comment: string): string {
  * (Principle 12): the options column gains `noauto,x-anas.disabled` (or only
  * `x-anas.disabled=kept-noauto` when the operator's own `noauto` is already on
  * the line), byte-surgically, so enabling later removes exactly these and the
- * line returns BYTE-IDENTICAL. An `x-systemd.automount` line additionally has
- * its automount token PARKED in place as `x-anas.disabled-automount` (cr.19) —
- * Enable swaps it back, so the byte-identity holds for automount lines too.
- * A line already disabled in the option form is a no-op (cr.19 repair aside:
- * re-disabling one that still carries a live automount token parks it); a
- * legacy `#ANAS ` line is CONVERTED to the option form — this is one of the
- * three places ANAS writes that line, and the ruling says such a line is
- * rewritten to the new form when ANAS changes it.
+ * line returns BYTE-IDENTICAL. An `x-systemd.automount` on the line is swapped
+ * IN PLACE for `x-anas.disabled-automount` (cr.19, §2 Mounts automount ruling):
+ * `noauto` alone does not stop systemd-fstab-generator arming the line's
+ * `.automount` at boot (node pass R1-D1). A line already disabled in the
+ * option form is left alone — except that a live `x-systemd.automount` still
+ * on it (a cr.6-era disable, or a hand edit) is parked, which repairs it; a
+ * legacy `#ANAS ` line is CONVERTED to the option form (automount parked the
+ * same way) — this is one of the three places ANAS writes that line, and the
+ * ruling says such a line is rewritten to the new form when ANAS changes it.
  */
 export function disableMount(text: string, mountpoint: string): string {
   const doc = parseFstabDoc(text)
@@ -373,45 +407,29 @@ export function disableMount(text: string, mountpoint: string): string {
     if (line.kind !== 'entry' || line.entry.mountpoint !== mountpoint)
       continue
     if (!line.disabled) {
-      // cr.19: an `x-systemd.automount` line parks its automount token IN PLACE
-      // alongside the disable tokens — `noauto` reaches only the `.mount` unit,
-      // and the live token would keep the `.automount` armed at boot (R1-D1).
-      parkAutomountTokensInPlace(line)
-      appendOptionTokens(line, disabledTokens(line.entry))
+      const tokens = disabledTokens(line.entry)
+      // A parked token on an ENABLED line is an orphan (a hand edit took the
+      // disable token off): inert to systemd and read as automount=false, so
+      // it is dropped here — kept, it would read as the operator's automount
+      // once disabled and come back LIVE on enable.
+      rewriteEntryOptions(line, opts => disabledOptions(dropParkedAutomount(opts), tokens))
       refreshEntry(line)
     }
     else if (line.raw.startsWith(ANAS_MARKER)) {
-      // Legacy marker — convert to the option form (writes THAT line). The
-      // conversion serializes through `disabledSerialization`, which parks the
-      // automount token like every other write of a disabled line (cr.19).
+      // Legacy marker — convert to the option form (writes THAT line).
       const comment = line.trailingComment ? `   ${line.trailingComment}` : ''
       line.raw = disabledSerialization(line.entry, comment)
       refreshEntry(line)
     }
     else {
-      // Already in the option form. cr.19 repair: a line disabled BEFORE the
-      // automount ruling can still carry a live `x-systemd.automount` behind
-      // ANAS's back (the R1-D1 leftovers) — disable is idempotent-NEUTRALISING,
-      // so re-disabling parks the token now. A line with no live token (the
-      // normal case) comes back byte-identical: nothing to do.
-      parkAutomountTokensInPlace(line)
+      // Already in the option form: only a still-live automount is touched
+      // (the repair); otherwise the line stays byte-identical.
+      rewriteEntryOptions(line, parkAutomount)
+      refreshEntry(line)
     }
     break
   }
   return serializeFstabDoc(doc)
-}
-
-/** Park the line's live automount token(s), in place, byte-surgically (cr.19). */
-function parkAutomountTokensInPlace(line: { disabled: boolean, raw: string }): void {
-  rewriteEntryOptions(line, parkAutomountTokens)
-}
-
-/** Append one or more option tokens to an entry line's options column, byte-surgically. */
-function appendOptionTokens(line: FstabDocLine & { kind: 'entry' }, tokens: string[]): void {
-  rewriteEntryOptions(line, (opts) => {
-    const added = tokens.join(',')
-    return opts ? `${opts},${added}` : added
-  })
 }
 
 /**
@@ -421,7 +439,8 @@ function appendOptionTokens(line: FstabDocLine & { kind: 'entry' }, tokens: stri
  * An option-form line loses its disable token — and, when the token is the bare
  * `x-anas.disabled` (meaning disable also added the `noauto`), the `noauto`
  * too. The kept-noauto form removes only its own token, leaving the operator's
- * `noauto` alone.
+ * `noauto` alone. A parked `x-anas.disabled-automount` goes back IN PLACE to
+ * `x-systemd.automount` (cr.19).
  */
 export function enableMount(text: string, mountpoint: string): string {
   const doc = parseFstabDoc(text)
@@ -450,34 +469,13 @@ export function enableMount(text: string, mountpoint: string): string {
       // every SURVIVING token keeps its exact bytes — a comma-separated
       // `defaults, nofail` the operator wrote stays `defaults, nofail`, so the
       // round trip is byte-identical even with hand spacing.
-      // cr.19: the parked automount marker swaps BACK to the operator's
-      // `x-systemd.automount` at its own position (byte-identical round trip).
-      // Matched case-insensitively by KEY, exactly like the disable tokens —
-      // the reader honours any casing, so enable must clear any casing. A line
-      // hand-edited while disabled to carry the live token ALREADY just loses
-      // the marker: one automount option comes back, never a duplicate.
-      const isParkedAutomountToken = (t: string): boolean =>
-        t.trim().split('=')[0].toLowerCase() === X_ANAS_DISABLED_AUTOMOUNT_TOKEN
       rewriteEntryOptions(line, (opts) => {
-        const src = opts.split(',').filter(o => o !== '')
-        let automountLive = src.some(t => t.trim() === X_SYSTEMD_AUTOMOUNT_TOKEN)
         const out: string[] = []
-        for (const t of src) {
-          if (isDisableToken(t) || (hasBare && t.trim() === 'noauto'))
-            continue
-          if (isParkedAutomountToken(t)) {
-            if (automountLive)
-              continue // the operator's option is already back — the marker just goes
-            automountLive = true
-            // Swap in place, keeping the token's surrounding whitespace bytes.
-            const trimmed = t.trim()
-            const at = t.indexOf(trimmed)
-            out.push(`${t.slice(0, at)}${X_SYSTEMD_AUTOMOUNT_TOKEN}${t.slice(at + trimmed.length)}`)
-            continue
-          }
-          out.push(t)
+        for (const t of opts.split(',').filter(o => o !== '')) {
+          if (!isDisableToken(t) && !(hasBare && t.trim() === 'noauto'))
+            out.push(t)
         }
-        return out.join(',')
+        return unparkAutomount(out.join(','))
       })
     }
     line.disabled = false
@@ -522,7 +520,11 @@ function parseEntryLine(raw: string): { entry: MountEntry, trailingComment: stri
     if (!parsed)
       return null // not an entry under the marker → an ordinary comment
     parsed.entry.disabled = true
-    return { ...parsed, disabled: true }
+    // A parked automount is the operator's automount on ANY disabled line
+    // (cr.19); the option-form case is settled in classifyOptions.
+    if (parsed.parkedAutomount)
+      parsed.entry.options.common.automount = true
+    return { entry: parsed.entry, trailingComment: parsed.trailingComment, disabled: true }
   }
 
   const trimmed = raw.trim()
@@ -535,11 +537,11 @@ function parseEntryLine(raw: string): { entry: MountEntry, trailingComment: stri
   // The option-form disable is carried by the entry itself — the parser sets
   // `disabled` when the options carry an `x-anas.disabled` token; the `#ANAS `
   // form was set in the branch above. No other line is ever disabled.
-  return { ...parsed, disabled: parsed.entry.disabled === true }
+  return { entry: parsed.entry, trailingComment: parsed.trailingComment, disabled: parsed.entry.disabled === true }
 }
 
 /** Parse an ACTIVE (uncommented) fstab data line into an entry, or null. */
-function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: string } | null {
+function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: string, parkedAutomount: boolean } | null {
   const trimmed = raw.trim()
   if (trimmed === '' || trimmed.startsWith('#'))
     return null
@@ -570,7 +572,7 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
     return null
 
   const tokens = optStr.split(',').map(o => o.trim()).filter(Boolean)
-  const { options, credentialsFile, inlineCredentials, disable } = classifyOptions(fstype, tokens)
+  const { options, credentialsFile, inlineCredentials, disable, parkedAutomount } = classifyOptions(fstype, tokens)
 
   const entry: MountEntry = {
     spec,
@@ -589,7 +591,7 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
   if (disable)
     entry.disabled = true
 
-  return { entry, trailingComment }
+  return { entry, trailingComment, parkedAutomount: parkedAutomount === true }
 }
 
 /** Parse an integer field, defaulting to 0 (fstab fs_freq/fs_passno). */
@@ -612,7 +614,7 @@ function isNfs(fstype: string): boolean {
 export function classifyOptions(
   fstype: string,
   tokens: string[],
-): { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto' } {
+): { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto', parkedAutomount?: true } {
   const common: MountCommonOptions = {
     readOnly: false,
     nofail: false,
@@ -633,6 +635,8 @@ export function classifyOptions(
   const cifsFs = fstype === 'cifs'
   /** How (if at all) the line is disabled: the form of its `x-anas.disabled` token. */
   let disable: 'bare' | 'kept-noauto' | undefined
+  /** Did the line carry a parked `x-anas.disabled-automount` (cr.19)? */
+  let parkedAutomount = false
 
   for (const token of tokens) {
     const eq = token.indexOf('=')
@@ -651,16 +655,13 @@ export function classifyOptions(
       disable = token.toLowerCase() === X_ANAS_DISABLED_KEPT_TOKEN ? 'kept-noauto' : 'bare'
       continue
     }
-
-    // --- ANAS parked-automount marker (cr.19, §2 Mounts automount ruling) ---
-    // CONSUMED like the disable tokens (case-insensitive by key): it IS the
-    // operator's own `x-systemd.automount`, parked for the duration of a
-    // disable — the entry keeps READING automount=true through the disable (the
-    // UI shows the operator's choice), while the line itself carries nothing
-    // the fstab-generator can arm. Never an extra option, never passthrough;
-    // the request schema refuses it on the write side.
+    // --- ANAS parked automount (cr.19, §2 Mounts automount ruling) ---
+    // CONSUMED like the disable token — bookkeeping, never passthrough, never
+    // an extra option. It stands for the operator's `x-systemd.automount`
+    // while the line is disabled (applied after the pass, below). Matched by
+    // key, case-insensitively, the same way as the disable token.
     if (key.toLowerCase() === X_ANAS_DISABLED_AUTOMOUNT_TOKEN) {
-      common.automount = true
+      parkedAutomount = true
       continue
     }
 
@@ -722,14 +723,23 @@ export function classifyOptions(
   // `noauto` is FALSE — decided after the full pass (see the consume above).
   if (disable === 'bare')
     common.noauto = false
+  // A parked automount IS the operator's automount on a disabled line. On a
+  // line that is no longer disabled (a hand edit took the disable token off)
+  // the parked token is inert to systemd, so the line is honestly read as
+  // not automounted; the token is still consumed, and ANAS's next write of
+  // the line drops it.
+  if (parkedAutomount && disable !== undefined)
+    common.automount = true
 
-  const result: { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto' } = { options }
+  const result: { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto', parkedAutomount?: true } = { options }
   if (credentialsFile !== undefined)
     result.credentialsFile = credentialsFile
   if (Object.keys(inline).length > 0)
     result.inlineCredentials = inline
   if (disable !== undefined)
     result.disable = disable
+  if (parkedAutomount)
+    result.parkedAutomount = true
   return result
 }
 
@@ -756,15 +766,15 @@ function enumOr(allowed: Set<string>, value: string, passthrough: string[], toke
 
 /** Common boolean flags → the field they set true (rw/idle-timeout handled separately). */
 const COMMON_TRUE_FLAGS: Record<string, keyof MountCommonOptions> = {
-  ro: 'readOnly',
-  nofail: 'nofail',
-  noauto: 'noauto',
-  noatime: 'noatime',
-  nosuid: 'nosuid',
-  nodev: 'nodev',
-  noexec: 'noexec',
-  _netdev: 'netdev',
-  [X_SYSTEMD_AUTOMOUNT_TOKEN]: 'automount',
+  'ro': 'readOnly',
+  'nofail': 'nofail',
+  'noauto': 'noauto',
+  'noatime': 'noatime',
+  'nosuid': 'nosuid',
+  'nodev': 'nodev',
+  'noexec': 'noexec',
+  '_netdev': 'netdev',
+  'x-systemd.automount': 'automount',
 }
 
 /** Apply a common-tier token; returns true when consumed. */
@@ -1032,7 +1042,7 @@ function buildOptionTokens(entry: MountEntry): string[] {
   if (c.netdev)
     t.push('_netdev')
   if (c.automount)
-    t.push(X_SYSTEMD_AUTOMOUNT_TOKEN)
+    t.push('x-systemd.automount')
   if (c.automountIdleTimeout !== undefined)
     t.push(`x-systemd.idle-timeout=${c.automountIdleTimeout}`)
 

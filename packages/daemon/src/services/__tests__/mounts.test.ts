@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
+import { disableMount } from '../../parsers/fstab.js'
 import { parsePveMountPaths } from '../../parsers/pve-storage.js'
 import {
   ahrPinnedSpecs,
@@ -252,31 +253,29 @@ describe('buildBaseInventory — disabled entry', () => {
   })
 })
 
-// cr.19 (§2 Mounts automount ruling): a disabled line parks its automount
-// token (`x-anas.disabled-automount`, read as automount-while-disabled). The
-// row must read state=disabled — the parked token must NOT push it to 'armed',
-// and even a leftover live autofs placeholder (the D2 defect this whole story
-// fixes) may only ever lose to the disable, never win over it.
-describe('buildBaseInventory — a disabled line with the parked automount token reads disabled (cr.19)', () => {
-  const PARKED_FSTAB = '127.0.0.1:/srv/auto  /mnt/parked  nfs4  defaults,nofail,x-anas.disabled-automount,x-systemd.idle-timeout=60,noauto,x-anas.disabled  0  0\n'
+// cr.19: a disabled automount line carries `x-anas.disabled-automount` in
+// place of `x-systemd.automount`. It reads disabled — never armed — even when
+// a live autofs placeholder (a failed stop, a pre-cr.19 disable) is still at
+// the path, and with the placeholder's real mount stacked on top.
+describe('buildBaseInventory — a parked (disabled) automount line over a leftover placeholder (cr.19)', () => {
+  const fstab = disableMount(loadFixture('fstab-anas-managed'), '/mnt/anas-auto')
 
-  it('no live row at all: state=disabled, automount still reported, never armed', () => {
-    const row = buildBaseInventory('{"filesystems":[]}', PARKED_FSTAB, new Map()).find(r => r.mountpoint === '/mnt/parked')!
-    assert.equal(row.disabled, true)
-    assert.equal(row.state, 'disabled')
-    assert.equal(row.automount, true, 'the parked token still says what the line is')
-    assert.equal(row.mounted, false)
-  })
-
-  it('a leftover live autofs placeholder under the disabled line never overrides state', () => {
-    // Exactly the D2 reality after a cr.6-era disable: the unit was never
-    // stopped, findmnt still shows the armed placeholder.
-    const findmnt = JSON.stringify({
-      filesystems: [{ target: '/mnt/parked', source: 'systemd-1', fstype: 'autofs', options: 'rw,relatime,fd=52,pgrp=1,timeout=60' }],
+  for (const fixture of ['findmnt-automount-armed.json', 'findmnt-automount-mounted.json']) {
+    it(`${fixture}: state disabled, never armed; automount and the NFS identity from the line`, () => {
+      const row = buildBaseInventory(loadFixture(fixture), fstab, new Map()).find(r => r.mountpoint === '/mnt/anas-auto')!
+      assert.equal(row.state, 'disabled')
+      assert.equal(row.disabled, true)
+      assert.equal(row.automount, true)
+      assert.equal(row.persistent, true)
+      assert.equal(row.type, 'nfs')
+      assert.equal(row.remote, true)
     })
-    const row = buildBaseInventory(findmnt, PARKED_FSTAB, new Map()).find(r => r.mountpoint === '/mnt/parked')!
-    assert.equal(row.disabled, true)
-    assert.equal(row.state, 'disabled', 'the disable outranks the placeholder — never armed')
+  }
+
+  it('with no placeholder: a disabled, unmounted row that still says automount', () => {
+    const row = buildBaseInventory('{"filesystems":[]}', fstab, new Map()).find(r => r.mountpoint === '/mnt/anas-auto')!
+    assert.equal(row.state, 'disabled')
+    assert.equal(row.mounted, false)
     assert.equal(row.automount, true)
   })
 })

@@ -31,6 +31,7 @@ import { readPveMountPaths } from '../parsers/pve-storage.js'
 import { zodIssue } from '../validation.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { readConfig, writeFileAtomic } from './config-writer.js'
+import { liveAtTarget } from './mount-match.js'
 import { execSystemctlShow } from './unit-run-status.js'
 
 /** `timeout` binary — wraps the probe so a dead NFS server can never hang us. */
@@ -41,6 +42,7 @@ const MOUNT = '/usr/bin/mount'
 const UMOUNT = '/usr/bin/umount'
 const FINDMNT = '/usr/bin/findmnt'
 const SYSTEMD_ESCAPE = '/usr/bin/systemd-escape'
+const SYSTEMCTL = '/usr/bin/systemctl'
 
 /** Default credentials directory (per-mount 0600 root-only files, 18.5). */
 export const DEFAULT_CREDS_DIR = '/etc/anas/creds'
@@ -1176,26 +1178,54 @@ function verdictDetail(type: 'nfs' | 'cifs', verdict: MountTestVerdict, stderr: 
 // ============================================================================
 
 /**
- * Derive a systemd unit name for a mountpoint — `systemd-escape -p
- * --suffix=<suffix>` (never hand-built; the escaping is systemd's). Null when
- * systemd-escape fails. The ONE derivation the daemon uses for both unit
- * suffixes (cr.19: shared by the mount-state reader and the automount stop).
+ * The systemd unit name for a mountpoint's `.mount` / `.automount` unit, via
+ * `systemd-escape -p --suffix=<suffix>` (never hand-built: hyphens become
+ * `\x2d`, NOTES.md §7). Undefined when the escape fails or prints nothing.
+ * Throws only if the binary cannot be started (the executor's contract).
  */
-async function escapeUnitName(executor: CommandExecutor, mountpoint: string, suffix: 'mount' | 'automount'): Promise<string | null> {
+async function escapeMountUnitName(executor: CommandExecutor, mountpoint: string, suffix: 'mount' | 'automount'): Promise<string | undefined> {
   const esc = await executor.exec(SYSTEMD_ESCAPE, ['-p', `--suffix=${suffix}`, mountpoint])
   const name = esc.stdout.trim()
-  if (esc.exitCode !== 0 || !name)
-    return null
-  return name
+  return esc.exitCode !== 0 || !name ? undefined : name
 }
 
+/** Health detail of a disabled mount whose automount placeholder is still armed (cr.19). */
+export const DISABLED_PLACEHOLDER_DETAIL
+  = 'Disabled in /etc/fstab — will not mount at boot. An automount placeholder is still armed at this path, so the first access mounts the share until its .automount unit is stopped.'
+
+/** `systemctl` exit status for a unit the manager has not loaded ("Unit … not loaded."). */
+const SYSTEMCTL_UNIT_NOT_LOADED = 5
+
 /**
- * cr.19 (§2 Mounts automount ruling): the `.automount` unit name for a
- * mountpoint, derived the same way as the mount unit name. Null when
- * systemd-escape fails — the caller reports, never guesses a name.
+ * cr.19 (§2 Mounts automount ruling; node pass R1-D2/D3) — stop the
+ * `.automount` unit of an automount line that Disable or Remove is taking out
+ * of service. The daemon-reload alone leaves an ARMED automount armed (D2: the
+ * first access then mounts the disabled share) and, for a removed line, leaves
+ * an orphaned autofs placeholder that answers "Host is down" (D3), so the
+ * routes call this after the fstab edit and before the daemon-reload.
+ *
+ * Best-effort side effect of the mutation: the fstab edit has already
+ * happened, so a failure never fails the job — it comes back as the warning
+ * sentence to put on the job result (never swallowed). A unit the manager has
+ * not loaded (exit 5 — e.g. a line disabled earlier whose automount the
+ * generator no longer makes) is not armed, so there is nothing to stop and no
+ * warning.
  */
-export async function automountUnitName(executor: CommandExecutor, mountpoint: string): Promise<string | null> {
-  return escapeUnitName(executor, mountpoint, 'automount')
+export async function stopAutomountUnit(executor: CommandExecutor, mountpoint: string): Promise<string | undefined> {
+  const failed = (why: string): string =>
+    `Could not stop the automount unit for '${mountpoint}' (${why}) — it may still be armed and mount the share on first access until it is stopped.`
+  try {
+    const unit = await escapeMountUnitName(executor, mountpoint, 'automount')
+    if (!unit)
+      return failed('systemd-escape gave no unit name')
+    const r = await executor.exec(SYSTEMCTL, ['stop', unit])
+    if (r.exitCode === 0 || r.exitCode === SYSTEMCTL_UNIT_NOT_LOADED)
+      return undefined
+    return failed(r.stderr.trim() || `systemctl stop ${unit} exited ${r.exitCode}`)
+  }
+  catch (err) {
+    return failed(err instanceof Error ? err.message : String(err))
+  }
 }
 
 /**
@@ -1206,7 +1236,7 @@ export async function automountUnitName(executor: CommandExecutor, mountpoint: s
  */
 export async function readUnitState(executor: CommandExecutor, mountpoint: string): Promise<MountUnit | undefined> {
   try {
-    const name = await escapeUnitName(executor, mountpoint, 'mount')
+    const name = await escapeMountUnitName(executor, mountpoint, 'mount')
     if (!name)
       return undefined
     const show = await execSystemctlShow(executor, name, 'LoadState,ActiveState,SubState,Result')
@@ -1305,8 +1335,13 @@ export async function buildMountDetail(
   let capacity: MountCapacity | undefined
   if (row.disabled) {
     // cr.6: a disabled line carries `noauto` (+ an `x-anas.disabled` token) or
-    // a legacy `#ANAS ` comment — either way it is not mounted at boot.
-    health = { state: 'disabled', detail: 'Disabled in /etc/fstab — will not mount at boot.' }
+    // a legacy `#ANAS ` comment — either way it is not mounted at boot. The
+    // STATE stays 'disabled' even over a leftover autofs placeholder (cr.19:
+    // the line's automount is parked; the placeholder is what a failed stop,
+    // or a disable from before cr.19, left behind) — but the detail says so,
+    // because that placeholder still mounts the share on first access.
+    const placeholder = liveAtTarget(parseFindmnt(findmntText), mountpoint).armed
+    health = { state: 'disabled', detail: placeholder ? DISABLED_PLACEHOLDER_DETAIL : 'Disabled in /etc/fstab — will not mount at boot.' }
   }
   else if (row.mounted && row.state !== 'armed') {
     const probe = await probeMount(executor, mountpoint)

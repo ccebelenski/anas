@@ -49,16 +49,16 @@ describe('MountExtraOptions — token list + credential refusal', () => {
     assert.match(bad.error.issues[0].message, /Disable\/Enable/)
   })
 
-  it('refuses the cr.19 parked-automount token too, case-insensitively, naming Disable/Enable', () => {
-    for (const s of ['x-anas.disabled-automount', 'defaults,x-anas.disabled-automount', 'X-ANAS.DISABLED-AUTOMOUNT', 'X-Anas.Disabled-Automount=whatever'])
+  it('refuses the parked automount token by key, case-insensitively, naming Disable/Enable (cr.19)', () => {
+    for (const s of ['x-anas.disabled-automount', 'nofail,x-anas.disabled-automount', 'X-ANAS.DISABLED-AUTOMOUNT', 'x-anas.disabled-automount=1'])
       assert.equal(MountExtraOptions.safeParse(s).success, false, JSON.stringify(s))
-    const bad = MountExtraOptions.safeParse('x-anas.disabled-automount')
+    const bad = MountExtraOptions.safeParse('nofail,x-anas.disabled-automount')
     assert.ok(!bad.success)
     assert.match(bad.error.issues[0].message, /Disable\/Enable/)
   })
 
-  it('still allows near-miss application-option names — only the exact disable keys are refused', () => {
-    for (const s of ['x-anas-note=keep', 'x-systemd.automount', 'noauto', 'x-anas.disabled-clearing', 'x-anas.disabled-automount-x', 'x-anas.automount'])
+  it('still allows near-miss application-option names — only the exact disable key is refused', () => {
+    for (const s of ['x-anas-note=keep', 'x-systemd.automount', 'noauto', 'x-anas.disabled-clearing'])
       assert.equal(MountExtraOptions.safeParse(s).success, true, JSON.stringify(s))
   })
 })

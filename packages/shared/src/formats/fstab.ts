@@ -129,16 +129,23 @@ export const X_ANAS_DISABLED_TOKEN = 'x-anas.disabled'
 export const X_ANAS_DISABLED_KEPT_TOKEN = 'x-anas.disabled=kept-noauto'
 
 /**
- * cr.19 (§2 Mounts automount ruling, 2026-10-14): the PARKED automount token.
- * Disable swaps an operator's `x-systemd.automount` IN PLACE to this token and
- * Enable swaps it back (the line stays byte-identical), because `noauto` lands
- * on the `.mount` unit only: a disabled line still carrying the live token
- * keeps its `.automount` unit wired into `remote-fs.target.wants` and arms at
- * every boot behind ANAS's back (node defect R1-D1). Like the disable tokens
- * this is ANAS bookkeeping, never an operator-set option: the request schemas
- * refuse it as an extra option and the parser consumes it — reading the entry
- * automount=true for the duration of the disable, so the UI keeps showing the
- * operator's choice.
+ * systemd-fstab-generator's automount option. Matched EXACTLY (the generator
+ * tests the option by its exact name), so a differently-cased token is inert
+ * and is not treated as an automount.
+ */
+export const X_SYSTEMD_AUTOMOUNT_TOKEN = 'x-systemd.automount'
+
+/**
+ * cr.19 — the PARKED automount (EPICS §2 Mounts, automount ruling 2026-10-14,
+ * node pass R1-D1). `noauto` stops the generator starting a line's `.mount` at
+ * boot but NOT wiring its `.automount` into `remote-fs.target.wants`, so a
+ * disabled `x-systemd.automount` line would still arm at every boot. Disable
+ * therefore also swaps `x-systemd.automount` IN PLACE for this token (same
+ * position in the option list), and Enable swaps it back, so the line still
+ * comes back byte-identical. Like the disable tokens it lives in the `x-`
+ * application namespace (systemd and mount ignore it), it is consumed by the
+ * reader as the operator's `automount=true` on a disabled line (never
+ * passthrough), and the request schemas refuse it as an extra option.
  */
 export const X_ANAS_DISABLED_AUTOMOUNT_TOKEN = 'x-anas.disabled-automount'
 

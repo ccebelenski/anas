@@ -15,7 +15,7 @@ import { MockExecutor } from '../../executor/mock.js'
 import { JobQueue } from '../../jobs/queue.js'
 import { ConfirmStore } from '../../safety/confirm.js'
 import { createServer } from '../../server.js'
-import { credsFileName } from '../../services/mounts.js'
+import { credsFileName, DISABLED_PLACEHOLDER_DETAIL } from '../../services/mounts.js'
 import { jobRoutes } from '../jobs.js'
 import { mountsRoutes } from '../mounts.js'
 
@@ -1610,101 +1610,202 @@ describe('mount Create — a failed fstab edit leaves no credentials behind (cr.
   })
 })
 
-// ============================================================================
-// cr.19 (§2 Mounts automount ruling, node defects D2/D3): disable and remove
-// stop the mountpoint's .automount unit BEFORE daemon-reload — daemon-reload
-// alone leaves a running placeholder (D2) and an orphaned autofs entry (D3).
-// A failing stop never fails the job; it rides the result as a warning.
-// ============================================================================
-
-const SYSTEMD_ESCAPE = '/usr/bin/systemd-escape'
-const AUTO_MP = '/mnt/edit-auto'
-const AUTO_UNIT = 'mnt-edit-auto.automount'
-const AUTO_LINE = `127.0.0.1:/srv/auto ${AUTO_MP} nfs4 defaults,nofail,x-systemd.automount,x-systemd.idle-timeout=60 0 0`
-const PLAIN_LINE = '127.0.0.1:/srv/plain /mnt/edit-plain nfs4 defaults,nofail 0 0'
-
-describe('mount disable/remove — the .automount unit is stopped first (cr.19, D2/D3)', () => {
+// cr.19 (§2 Mounts automount ruling; node pass R1-D2/D3): the daemon-reload
+// alone leaves an ARMED automount armed (D2) and a removed line's autofs
+// placeholder orphaned (D3), so Disable and Remove stop the line's `.automount`
+// unit — after the fstab edit, before the daemon-reload. A failed stop is a
+// warning on a COMPLETED job; a plain line runs no stop.
+describe('mount Disable / Remove stop an automount line\'s .automount unit (cr.19)', () => {
   let h: EditHarness | undefined
 
-  afterEach(async () => {
-    await h?.app.close()
-    if (h)
-      await rm(h.dir, { recursive: true, force: true })
-    h = undefined
-  })
+  const AUTO_MP = '/mnt/edit-auto'
+  /** `systemd-escape -p --suffix=automount /mnt/edit-auto` (hyphen → `\x2d`, NOTES §7). */
+  const AUTO_UNIT = 'mnt-edit\\x2dauto.automount'
+  const SYSTEMD_ESCAPE = '/usr/bin/systemd-escape'
+  const AUTO_LINE = `10.0.0.9:/export ${AUTO_MP} nfs4 defaults,nofail,_netdev,x-systemd.automount 0 0`
+  const PARKED_LINE = `10.0.0.9:/export ${AUTO_MP} nfs4 defaults,nofail,_netdev,x-anas.disabled-automount,noauto,x-anas.disabled 0 0`
+  const PLACEHOLDER = { target: AUTO_MP, source: 'systemd-1', fstype: 'autofs', options: 'rw,relatime,fd=108,pgrp=1,timeout=60,minproto=5,maxproto=5,direct' }
+  const ARMED = findmntJson([PLACEHOLDER])
+  const ARMED_AND_MOUNTED = findmntJson([PLACEHOLDER, { target: AUTO_MP, source: '10.0.0.9:/export', fstype: 'nfs4', options: 'rw,relatime,vers=4.2' }])
 
-  /** The automount-unit-name answer for `mountpoint` (and only that one). */
-  function mockAutomountEscape(executor: MockExecutor, mountpoint: string, unit: string): void {
-    executor.addFixture({ command: SYSTEMD_ESCAPE, args: ['-p', '--suffix=automount', mountpoint], result: { stdout: `${unit}\n`, stderr: '', exitCode: 0 } })
+  /** fstab as the `systemctl stop` call saw it (proves the edit came first). */
+  let fstabAtStop: string | undefined
+
+  async function harness(
+    fstab: string,
+    tables: string[],
+    stop: { exitCode: number, stderr?: string } = { exitCode: 0 },
+    escape: { stdout: string, exitCode: number } = { stdout: `${AUTO_UNIT}\n`, exitCode: 0 },
+  ): Promise<EditHarness> {
+    const made = await createEditServer(() => `${fstab}\n`, tables)
+    made.executor.addFixture({ command: SYSTEMD_ESCAPE, args: ['-p', '--suffix=automount', AUTO_MP], result: { ...escape, stderr: '' } })
+    made.executor.addFixture({
+      command: SYSTEMCTL,
+      argsMatch: (args) => {
+        if (args[0] !== 'stop')
+          return false
+        fstabAtStop = readFileSync(made.fstabPath, 'utf8')
+        return true
+      },
+      result: { stdout: '', stderr: stop.stderr ?? '', exitCode: stop.exitCode },
+    })
+    return made
   }
 
-  /** First position of this exact command+argv in the executor's log, -1 never. */
-  function callIndex(executor: MockExecutor, command: string, args: string[]): number {
-    return executor.calls.findIndex(c => c.command === command && c.args.length === args.length && c.args.every((a, i) => a === args[i]))
-  }
-
-  async function disableMountAt(mp: string): Promise<Job> {
-    const res = await h!.app.inject({ method: 'POST', url: `/v1/mounts/${enc(mp)}/state`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ action: 'disable' }) })
+  async function act(method: 'POST' | 'DELETE', mp = AUTO_MP): Promise<Job> {
+    const res = method === 'POST'
+      ? await h!.app.inject({ method, url: `/v1/mounts/${enc(mp)}/state`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ action: 'disable' }) })
+      : await h!.app.inject({ method, url: `/v1/mounts/${enc(mp)}`, headers: IDENTITY_HEADERS })
     assert.equal(res.statusCode, 202, res.payload)
     return waitForJob(h!.app, res.json().job.id)
   }
 
-  it('disable of an automount line stops the .automount unit BEFORE daemon-reload', async () => {
-    h = await createEditServer(() => `${AUTO_LINE}\n`, [findmntJson([])])
-    mockAutomountEscape(h.executor, AUTO_MP, AUTO_UNIT)
-    h.executor.addFixture({ command: SYSTEMCTL, args: ['stop', AUTO_UNIT], result: OK })
+  /** Index of the first call matching command + exact argv (−1 when absent). */
+  function callIndex(command: string, args: string[]): number {
+    return h!.executor.calls.findIndex(c => c.command === command && c.args.length === args.length && c.args.every((a, i) => a === args[i]))
+  }
 
-    const job = await disableMountAt(AUTO_MP)
-    assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.equal((job.result as { warnings?: string[] }).warnings, undefined, 'a clean stop adds no warning')
-    // The line is disabled with the automount token parked (cr.19 parser).
-    assert.match(await readFile(h.fstabPath, 'utf8'), /x-anas\.disabled-automount/)
+  /** The ladder this story adds: stop the automount, THEN daemon-reload. */
+  function assertStopThenReload(): void {
+    const stop = callIndex(SYSTEMCTL, ['stop', AUTO_UNIT])
+    const reload = callIndex(SYSTEMCTL, ['daemon-reload'])
+    assert.ok(stop !== -1, 'systemctl stop <unit>.automount ran')
+    assert.ok(reload !== -1, 'daemon-reload ran')
+    assert.ok(stop < reload, `stop (call ${stop}) must come before daemon-reload (call ${reload})`)
+    assert.ok(callIndex(SYSTEMD_ESCAPE, ['-p', '--suffix=automount', AUTO_MP]) < stop, 'the unit name came from systemd-escape')
+  }
 
-    const stopIdx = callIndex(h.executor, SYSTEMCTL, ['stop', AUTO_UNIT])
-    const reloadIdx = callIndex(h.executor, SYSTEMCTL, ['daemon-reload'])
-    assert.ok(stopIdx >= 0, `stop ${AUTO_UNIT} issued: ${JSON.stringify(h.executor.calls.map(c => [c.command, ...c.args]))}`)
-    assert.ok(reloadIdx >= 0, 'daemon-reload issued')
-    assert.ok(stopIdx < reloadIdx, `stop (${stopIdx}) must precede daemon-reload (${reloadIdx})`)
+  beforeEach(() => {
+    fstabAtStop = undefined
   })
 
-  it('disable of a plain line runs NO unit-name derivation and NO stop', async () => {
-    h = await createEditServer(() => `${PLAIN_LINE}\n`, [findmntJson([])])
-    const job = await disableMountAt('/mnt/edit-plain')
-    assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.ok(!h.executor.calls.some(c => c.command === SYSTEMD_ESCAPE), 'no systemd-escape for a line that never carried automount')
-    assert.ok(!h.executor.calls.some(c => c.command === SYSTEMCTL && c.args[0] === 'stop'), 'no unit stop')
-    assert.ok(h.executor.calls.some(c => c.command === SYSTEMCTL && c.args[0] === 'daemon-reload'), 'the reload still runs')
+  afterEach(async () => {
+    await h?.app.close()
+    await rm(h!.dir, { recursive: true, force: true })
+    h = undefined
   })
 
-  it('remove of an automount line stops the .automount unit BEFORE daemon-reload', async () => {
-    h = await createEditServer(() => `${AUTO_LINE}\n`, [findmntJson([])])
-    mockAutomountEscape(h.executor, AUTO_MP, AUTO_UNIT)
-    h.executor.addFixture({ command: SYSTEMCTL, args: ['stop', AUTO_UNIT], result: OK })
-
-    const res = await h.app.inject({ method: 'DELETE', url: `/v1/mounts/${enc(AUTO_MP)}`, headers: IDENTITY_HEADERS })
-    assert.equal(res.statusCode, 202, res.payload)
-    const job = await waitForJob(h.app, res.json().job.id)
+  it('Disable of an armed automount: the line is parked, then the unit is stopped, then daemon-reload (R1-D1/D2)', async () => {
+    h = await harness(AUTO_LINE, [ARMED])
+    const job = await act('POST')
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.equal((job.result as { warnings?: string[] }).warnings, undefined)
-    assert.ok(!(await readFile(h.fstabPath, 'utf8')).includes(AUTO_MP), 'the line still went')
-
-    const stopIdx = callIndex(h.executor, SYSTEMCTL, ['stop', AUTO_UNIT])
-    const reloadIdx = callIndex(h.executor, SYSTEMCTL, ['daemon-reload'])
-    assert.ok(stopIdx >= 0 && reloadIdx >= 0 && stopIdx < reloadIdx, `stop (${stopIdx}) must precede daemon-reload (${reloadIdx})`)
+    assert.deepEqual(job.result, { disabled: AUTO_MP })
+    assertStopThenReload()
+    assert.equal(fstabAtStop, `${PARKED_LINE}\n`, 'the fstab edit landed before the stop')
+    assert.equal(await readFile(h.fstabPath, 'utf8'), `${PARKED_LINE}\n`)
+    assert.ok(callIndex(UMOUNT, [AUTO_MP]) === -1, 'only the placeholder was there — nothing to umount')
   })
 
-  it('a failing stop leaves the job COMPLETED with a warning — the line is still disabled', async () => {
-    h = await createEditServer(() => `${AUTO_LINE}\n`, [findmntJson([])])
-    mockAutomountEscape(h.executor, AUTO_MP, AUTO_UNIT)
-    h.executor.addFixture({ command: SYSTEMCTL, args: ['stop', AUTO_UNIT], result: { stdout: '', stderr: `Unit ${AUTO_UNIT} not loaded.`, exitCode: 1 } })
+  it('Disable of an armed AND mounted automount: umount, fstab edit, stop, daemon-reload', async () => {
+    h = await harness(AUTO_LINE, [ARMED_AND_MOUNTED, ARMED_AND_MOUNTED, ARMED_AND_MOUNTED, ARMED])
+    const job = await act('POST')
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const umount = callIndex(UMOUNT, [AUTO_MP])
+    assert.ok(umount !== -1 && umount < callIndex(SYSTEMCTL, ['stop', AUTO_UNIT]), 'the real mount came off first')
+    assertStopThenReload()
+    assert.equal(fstabAtStop, `${PARKED_LINE}\n`)
+  })
 
-    const job = await disableMountAt(AUTO_MP)
-    assert.equal(job.status, 'completed', 'a failing best-effort stop never fails the disable')
+  it('Remove of an armed automount: the line is dropped, then the unit is stopped, then daemon-reload (R1-D3)', async () => {
+    h = await harness(AUTO_LINE, [ARMED])
+    const job = await act('DELETE')
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(job.result, { removed: AUTO_MP })
+    assertStopThenReload()
+    assert.equal(fstabAtStop, '', 'the line was already gone when the unit was stopped')
+  })
+
+  it('Remove of a DISABLED (parked) automount line still stops its unit', async () => {
+    h = await harness(PARKED_LINE, [ARMED])
+    const job = await act('DELETE')
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assertStopThenReload()
+  })
+
+  it('repair: Disable of a cr.6-form line with a live automount parks it and stops the unit', async () => {
+    h = await harness(`10.0.0.9:/export ${AUTO_MP} nfs4 defaults,nofail,_netdev,x-systemd.automount,noauto,x-anas.disabled 0 0`, [ARMED])
+    const job = await act('POST')
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal(await readFile(h.fstabPath, 'utf8'), `${PARKED_LINE}\n`)
+    assertStopThenReload()
+  })
+
+  it('a unit the manager has not loaded (systemctl exit 5) is not armed: no warning', async () => {
+    h = await harness(PARKED_LINE, [findmntJson([])], { exitCode: 5, stderr: `Failed to stop ${AUTO_UNIT}: Unit ${AUTO_UNIT} not loaded.` })
+    const job = await act('POST')
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(job.result, { disabled: AUTO_MP })
+    assert.equal(await readFile(h.fstabPath, 'utf8'), `${PARKED_LINE}\n`, 'an already-parked line is left byte-identical')
+    assertStopThenReload()
+  })
+
+  it('a failed stop on Disable is a warning on a COMPLETED job; the reload still runs', async () => {
+    h = await harness(AUTO_LINE, [ARMED], { exitCode: 1, stderr: `Failed to stop ${AUTO_UNIT}: Access denied` })
+    const job = await act('POST')
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
     const warnings = (job.result as { warnings?: string[] }).warnings ?? []
-    assert.equal(warnings.length, 1, JSON.stringify(job.result))
-    assert.ok(warnings[0].includes(AUTO_UNIT), `the warning names the unit: ${warnings[0]}`)
-    assert.match(warnings[0], /exited 1/)
-    // The primary mutation stands.
-    assert.match(await readFile(h.fstabPath, 'utf8'), /,x-anas\.disabled(\s|$)/m)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0], /Could not stop the automount unit for '\/mnt\/edit-auto'/)
+    assert.ok(warnings[0].includes('Access denied'), warnings[0])
+    assertStopThenReload()
+    assert.equal(await readFile(h.fstabPath, 'utf8'), `${PARKED_LINE}\n`)
+  })
+
+  it('a failed stop on Remove is a warning on a COMPLETED job; the line is still gone', async () => {
+    h = await harness(AUTO_LINE, [ARMED], { exitCode: 1, stderr: 'Failed to stop: Transport endpoint is not connected' })
+    const job = await act('DELETE')
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const warnings = (job.result as { removed: string, warnings?: string[] }).warnings ?? []
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0], /Could not stop the automount unit/)
+    assertStopThenReload()
+    assert.equal(await readFile(h.fstabPath, 'utf8'), '')
+  })
+
+  it('a failed unit-name escape is a warning too, never a silent skip', async () => {
+    h = await harness(AUTO_LINE, [ARMED], { exitCode: 0 }, { stdout: '', exitCode: 1 })
+    const job = await act('POST')
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.match(((job.result as { warnings?: string[] }).warnings ?? []).join(' '), /systemd-escape gave no unit name/)
+    assert.equal(callIndex(SYSTEMCTL, ['stop', AUTO_UNIT]), -1)
+    assert.ok(callIndex(SYSTEMCTL, ['daemon-reload']) !== -1)
+  })
+
+  it('a plain line: Disable and Remove run no automount stop', async () => {
+    const plain = `10.0.0.9:/export ${AUTO_MP} nfs4 defaults,nofail,_netdev 0 0`
+    h = await harness(plain, [findmntJson([])])
+    const djob = await act('POST')
+    assert.equal(djob.status, 'completed', JSON.stringify(djob.error))
+    assert.deepEqual(djob.result, { disabled: AUTO_MP })
+    const rjob = await act('DELETE')
+    assert.equal(rjob.status, 'completed', JSON.stringify(rjob.error))
+    assert.ok(!h.executor.calls.some(c => c.command === SYSTEMCTL && c.args[0] === 'stop'), 'no systemctl stop')
+    assert.ok(!h.executor.calls.some(c => c.command === SYSTEMD_ESCAPE && c.args.includes('--suffix=automount')), 'no automount unit lookup')
+    assert.equal(fstabAtStop, undefined)
+  })
+
+  it('inventory: a parked disabled line reads disabled over a leftover placeholder, and the detail names the placeholder', async () => {
+    for (const table of [ARMED, ARMED_AND_MOUNTED]) {
+      h = await harness(PARKED_LINE, [table])
+      const inv = await h.app.inject({ method: 'GET', url: '/v1/mounts', headers: IDENTITY_HEADERS })
+      const row = (inv.json() as { data: MountSummary[] }).data.find(r => r.mountpoint === AUTO_MP)!
+      assert.equal(row.state, 'disabled')
+      assert.equal(row.disabled, true)
+      assert.equal(row.automount, true)
+      assert.equal(row.type, 'nfs') // the fstab line is the identity, never the placeholder
+      const det = await h.app.inject({ method: 'GET', url: `/v1/mounts/${enc(AUTO_MP)}`, headers: IDENTITY_HEADERS })
+      const detail = (det.json() as { data: MountDetail }).data
+      assert.equal(detail.state, 'disabled')
+      assert.equal(detail.health.state, 'disabled')
+      assert.equal(detail.health.detail, DISABLED_PLACEHOLDER_DETAIL)
+      assert.equal(detail.configuredOptions?.common.automount, true)
+      assert.ok(!detail.configuredOptions?.passthrough.includes('x-anas'), detail.configuredOptions?.passthrough)
+      await h.app.close()
+      await rm(h.dir, { recursive: true, force: true })
+    }
+    // With no placeholder left, the plain disabled sentence.
+    h = await harness(PARKED_LINE, [findmntJson([])])
+    const det = await h.app.inject({ method: 'GET', url: `/v1/mounts/${enc(AUTO_MP)}`, headers: IDENTITY_HEADERS })
+    assert.equal((det.json() as { data: MountDetail }).data.health.detail, 'Disabled in /etc/fstab — will not mount at boot.')
   })
 })

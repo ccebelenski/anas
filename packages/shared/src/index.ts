@@ -49,6 +49,7 @@ export {
   X_ANAS_DISABLED_AUTOMOUNT_TOKEN,
   X_ANAS_DISABLED_KEPT_TOKEN,
   X_ANAS_DISABLED_TOKEN,
+  X_SYSTEMD_AUTOMOUNT_TOKEN,
 } from './formats/fstab.js'
 
 // rclone.conf (cr.13, review H3(c)): the option key/value validators that gate
