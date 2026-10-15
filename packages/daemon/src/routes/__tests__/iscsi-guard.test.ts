@@ -106,6 +106,29 @@ function disabled(manifest: string): string {
   return rewrite(manifest, '/tpgt_1/enable = 1', '/tpgt_1/enable = 0')
 }
 
+/** The target's TPG CHAP off. */
+function noAuth(manifest: string): string {
+  return rewrite(manifest, '/tpgt_1/attrib/authentication = 1', '/tpgt_1/attrib/authentication = 0')
+}
+
+/**
+ * The capture with a second portal's `np` subtree added, spelled out exactly as
+ * the captured `np/192.168.200.50:3260` (a directory plus its two value files).
+ * Appended: the materializer treats the manifest as a set of nodes, not an order.
+ */
+function withPortal(manifest: string, address: string, port: number): string {
+  const np = `iscsi/${IQN}/tpgt_1/np/${address}:${port}`
+  return `${manifest}\nD ${np}\nF ${np}/cxgbit = 0\nF ${np}/iser = 0\n`
+}
+
+/** The capture without one `np` portal subtree. */
+function withoutPortal(manifest: string, address: string, port: number): string {
+  const lines = manifest.split('\n')
+  const kept = lines.filter(l => !l.includes(`tpgt_1/np/${address}:${port}`))
+  assert.ok(kept.length < lines.length, `no portal ${address}:${port} in the capture`)
+  return kept.join('\n')
+}
+
 const SNAPSHOTS_CAPTURE = fixture('zfs/zfs-snapshots-media.json')
 const ZVOL_SNAPSHOTS = SNAPSHOTS_CAPTURE.split('testpool/media').join(ZVOL_DATASET)
 const NO_SNAPSHOTS = JSON.stringify({ ...JSON.parse(SNAPSHOTS_CAPTURE), datasets: {} })
@@ -128,6 +151,8 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
   let snapshots = NO_SNAPSHOTS
   /** When set, every targetcli call waits for it (a job held mid-sequence). */
   let targetcliHold: Promise<void> | null = null
+  /** When set, a targetcli whose joined argv starts with an entry fails with its stderr (injected, only echoed — never parsed). */
+  let failTargetcli: { argv: string, stderr: string }[] = []
 
   const savedEnv: Record<string, string | undefined> = {}
   const ENV_KEYS = ['ANAS_ISCSI_CONFIGFS', 'ANAS_ISCSI_SYS_BLOCK', 'ANAS_ISCSI_SAVECONFIG', 'ANAS_STORAGE_CFG', 'ANAS_ISCSI_INITIATOR_NAME', 'ANAS_ISCSI_DEVICE_STAT']
@@ -173,11 +198,15 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
     const orig = mock.exec.bind(mock)
     calls = []
     targetcliHold = null
+    failTargetcli = []
     mock.exec = async (command, args, opts) => {
       calls.push({ command, args })
       if (command === TARGETCLI) {
         if (targetcliHold)
           await targetcliHold
+        const fail = failTargetcli.find(f => args.join(' ').startsWith(f.argv))
+        if (fail)
+          return { stdout: '', stderr: fail.stderr, exitCode: 1 }
         return ok('')
       }
       if (command === ZFS && args.join(' ') === zfsSnapshotListArgs(ZVOL_DATASET).join(' '))
@@ -289,6 +318,29 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
     assert.deepEqual(calls.filter(isMutation), [])
   })
 
+  // --- revision dimensions C1/C2 (cr.40r): portals and auth -----------------
+
+  it('revision: a portal ADDED to the tree while the job waits fails it STATE_CHANGED — no targetcli', async () => {
+    const job = await race(UPDATE_KEEP_DEBIAN, LIVE, withPortal(LIVE, '10.99.99.1', 3260))
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  it('revision: a portal REMOVED from the tree while the job waits fails it STATE_CHANGED — no targetcli', async () => {
+    const job = await race(UPDATE_KEEP_DEBIAN, LIVE, withoutPortal(LIVE, '192.168.200.50', 3260))
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  it('revision: CHAP toggled OFF in the tree while the job waits fails it STATE_CHANGED — no targetcli', async () => {
+    const job = await race(UPDATE_KEEP_DEBIAN, LIVE, noAuth(LIVE))
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
   it('update: the confirm binds the edit — a resend with another ACL set is 409 CONFIRM_SCOPE_CHANGED naming it, with no secret in the 409', async () => {
     await serve(loggedIn(LIVE))
     // Removing the logged-in ACL is the challenged edit.
@@ -393,6 +445,51 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
     assert.equal(job.error?.code, 'CONFLICT')
     assert.match(job.error!.message, /A LUN named 'gtiscsi_vol1' already exists on this node/)
     assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  // --- LUN add: a mid-sequence targetcli failure (cr.40r DEFECT-1) ----------
+
+  it('LUN add: the map targetcli fails after the backstore exists — the job deletes the half-created backstore it made, never saves, and fails with the original error', async () => {
+    await serve(HOLE)
+    const { id, release } = await acceptBehindFullQueue(addLun('newlun', 'gtiscsi/vol9'))
+    // The probe (cr.40r): the map dies after the backstore create, so the
+    // backstore exists, no LUN is mapped, and only ANAS knows it was made.
+    // The stderr is injected (echoed into the job error, never parsed).
+    failTargetcli = [
+      { argv: `/iscsi/${IQN}/tpg1/luns create storage_object=/backstores/block/newlun`, stderr: 'fabric: mapping newlun at lun 0 failed' },
+    ]
+    release()
+    const job = await finished(id)
+    assert.equal(job.status, 'failed')
+    assert.ok(job.error!.message.includes('fabric: mapping newlun at lun 0 failed'), job.error!.message)
+    const argv = calls.filter(isMutation).map(c => c.args.join(' '))
+    assert.ok(argv.includes(`/backstores/block/newlun delete`), `no backstore-delete argv:\n${argv.join('\n')}`)
+    assert.ok(argv.some(a => a.startsWith(`/iscsi/${IQN}/tpg1/luns create storage_object=/backstores/block/newlun`)), argv.join('\n'))
+    assert.ok(!argv.includes('saveconfig'), `a half-created LUN must never be persisted:\n${argv.join('\n')}`)
+  })
+
+  it('LUN add: the backstore CREATE itself fails — nothing existed, so the cleanup finds no object and deletes nothing, and the job error is the create\'s alone', async () => {
+    await serve(HOLE)
+    const { id, release } = await acceptBehindFullQueue(addLun('newlun', 'gtiscsi/vol9'))
+    // The flag is set BEFORE the create-and-map call (the restore's pattern),
+    // so the cleanup's delete still RUNS for a create failure — and proves it
+    // deletes nothing by finding no object: the injected "No such object" the
+    // delete returns is swallowed by the tolerance, the job error stays the
+    // create's, and nothing is mapped or persisted.
+    failTargetcli = [
+      { argv: '/backstores/block create name=newlun', stderr: 'backport_create_simple: offlining non-existing object' },
+      { argv: '/backstores/block/newlun delete', stderr: 'No such object: /backstores/block/newlun' },
+    ]
+    release()
+    const job = await finished(id)
+    assert.equal(job.status, 'failed')
+    assert.ok(job.error!.message.includes('backport_create_simple: offlining non-existing object'), job.error!.message)
+    assert.ok(!job.error!.message.includes('could not be deleted'), `the tolerance for a never-created backstore must swallow the no-such-object delete:\n${job.error!.message}`)
+    const argv = calls.filter(isMutation).map(c => c.args.join(' '))
+    const deleteRan = argv.filter(a => a.startsWith('/backstores/block/newlun delete'))
+    assert.equal(deleteRan.length, 1, `the cleanup must still try — and find nothing:\n${argv.join('\n')}`)
+    assert.ok(!argv.some(a => a.startsWith(`/iscsi/${IQN}/tpg1/luns create`)), `nothing may be mapped:\n${argv.join('\n')}`)
+    assert.ok(!argv.includes('saveconfig'), `a half-created LUN must never be persisted:\n${argv.join('\n')}`)
   })
 
   // --- LUN update (§2.4: sessions) -------------------------------------------

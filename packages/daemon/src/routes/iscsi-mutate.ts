@@ -21,7 +21,7 @@ import {
   UpdateIscsiTargetRequest,
 } from '@anas/shared'
 import { readNodeInitiatorName } from '../parsers/iscsi-initiator.js'
-import { guardCheck, guardConfirm, iscsiTargetClaim, sendRefusal as sendGuardRefusal } from '../safety/guard.js'
+import { guardCheck, guardConfirm, GuardRefusalError, iscsiTargetClaim, sendRefusal as sendGuardRefusal } from '../safety/guard.js'
 import { ensureAhrTargetOrdering } from '../services/ahr-create.js'
 import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
 import {
@@ -47,6 +47,7 @@ import {
   addIscsiLun,
   assertInstalled,
   assertSaveable,
+  backstorePath,
   claimsFromTargets,
   createIscsiTarget,
   createSparseImage,
@@ -61,6 +62,7 @@ import {
   resizeFileLun,
   resolveFileBackingDir,
   resolveZvolBacking,
+  runTargetcli,
   saveIscsiConfig,
   setIscsiTargetState,
   setLunWriteBack,
@@ -160,6 +162,40 @@ export function targetUpdateSignature(iqn: string, req: UpdateIscsiTargetRequest
     acls: req.acls ? canon(req.acls.map(a => a.initiatorIqn)) : 'unchanged',
     credentials: (req.acls ?? []).some(a => a.chapUserid !== undefined || a.chapSecret !== undefined
       || a.mutualUserid !== undefined || a.mutualSecret !== undefined),
+  }
+}
+
+/**
+ * targetcli's stderr for a delete that found no object — the backstore was
+ * never created (the first targetcli of the create-and-map sequence is the one
+ * that died). The new-LUN restore's cleanup matches the same line.
+ */
+const BACKSTORE_GONE_RE = /no such object/i
+
+/**
+ * Delete a backstore an add-LUN job may have half-created when `createAndMapLun`
+ * died mid-sequence, WITHOUT saving the configuration (cr.40r, DEFECT-1): a
+ * half-created LUN must never be persisted as if it were healthy, and the state
+ * it would otherwise leave — live in the LIO tree, absent from
+ * `saveconfig.json` — is exactly the health diff's `lun-not-persisted`, with no
+ * job left to own it. Mirrors the new-LUN restore's cleanup
+ * (`services/backup-restore.ts` `removeNewLun`): the caller sets its flag
+ * BEFORE the create-and-map call, and a delete that finds nothing has left
+ * nothing behind. The job body runs under the iSCSI mutex the route's
+ * `iscsiGuarded` takes, so there is no lock to take here. Returns the sentence
+ * to append to the job's failure, or '' when nothing was left behind (already
+ * gone, or a delete that found no object).
+ */
+async function removeOrphanedBackstore(executor: CommandExecutor, plugin: string, name: string): Promise<string> {
+  try {
+    await runTargetcli(executor, [backstorePath(plugin, name), 'delete'])
+    return `deleted the half-created backstore '${name}'`
+  }
+  catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (BACKSTORE_GONE_RE.test(msg))
+      return ''
+    return `the half-created backstore '${name}' could not be deleted (${msg})`
   }
 }
 
@@ -716,8 +752,14 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       iscsiGuarded(spec, pre, async (now, ctx) => {
         const { updateProgress } = ctx
         const resolved = await backingOf(now, ctx.reads)
+        // Unreachable (cr.40r): `backingOf` memoises on the run's GuardReads,
+        // and `backingGate` resolved the SAME cached read when the job door ran
+        // — a refusal already threw the gate's own 409 before this line. It
+        // STAYS as the type-narrower, throwing the GATE's refusal if the memo
+        // invariant ever breaks: a plain Error would mislabel one as JOB_FAILED,
+        // and the route and the job must refuse a backing with the same code.
         if ('refusal' in resolved)
-          throw new Error(resolved.refusal.message)
+          throw new GuardRefusalError(conflict(resolved.refusal))
         const { path: backingPath, plugin, dataset, size, ahrPool } = resolved.ok
         if (req.kind === 'file' && size !== null) {
           updateProgress(`Creating sparse image ${backingPath}`)
@@ -734,15 +776,38 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
           if (added)
             updateProgress(`Ordered the mount of AHR pool '${ahrPool.name}' before the iSCSI restore service`)
         }
-        const result = await addIscsiLun(
-          mutateOptions(updateProgress),
-          now.target,
-          req,
-          { path: backingPath, plugin, ...(dataset ? { dataset } : {}) },
-          size,
-          serial,
-        )
-        return { ...result, warnings: lunAttributeWarnings(plugin) }
+        // DEFECT-1 (cr.40r): the backstore this sequence creates is persisted
+        // only when addIscsiLun finishes with a saveconfig. A targetcli that
+        // dies after the backstore exists — the map, an ACL grant — used to
+        // leave it live-only: present in the LIO tree, absent from
+        // `saveconfig.json`, owned by no job, and the state the health diff
+        // would name `lun-not-persisted` for as long as it sat there. The undo
+        // mirrors the new-LUN restore's cleanup (backup-restore.ts): the flag
+        // is set BEFORE the create-and-map sequence, a failure deletes the
+        // backstore WITHOUT saving (a half-created LUN must never be
+        // persisted), a delete that finds nothing — the first targetcli may
+        // itself be the one that died — is tolerated, and the job still fails
+        // with the original error.
+        let backstoreTouched = false
+        try {
+          backstoreTouched = true
+          const result = await addIscsiLun(
+            mutateOptions(updateProgress),
+            now.target,
+            req,
+            { path: backingPath, plugin, ...(dataset ? { dataset } : {}) },
+            size,
+            serial,
+          )
+          return { ...result, warnings: lunAttributeWarnings(plugin) }
+        }
+        catch (err) {
+          const base = err instanceof Error ? err.message : String(err)
+          const cleanup = backstoreTouched ? await removeOrphanedBackstore(executor, plugin, req.name) : ''
+          if (cleanup)
+            throw new Error(`${base} ${cleanup}`)
+          throw err
+        }
       }),
       { locks: pre.locks },
     )
