@@ -4,7 +4,7 @@ import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -319,6 +319,58 @@ describe('cr.38 — the short AHR verbs re-gate in the job (ruling (j))', () => 
     const job = await refusedInJob(id, release, 'CONFLICT', new RegExp(`has a ahr\\.scrub job in flight \\(job ${scrub.id}\\)`))
     assert.ok(!job.error!.message.includes(id), 'the destroy never counts itself')
     endScrub?.()
+  })
+
+  // --- destroy: a corrupt intent file is a ruling, not a hole ------------------
+
+  /** The intent dir exists only once the daemon writes an intent; give it one. */
+  async function corruptIntent(): Promise<void> {
+    await mkdir(intentDir, { recursive: true })
+    await writeFile(join(intentDir, 'ahr0.json'), 'this is not an intent file')
+  }
+
+  it('a corrupt intent file does not block destroy — deliberate, see the runningIntentGate comment (refusing would strand the pool)', async () => {
+    await serve()
+    const first = await server!.inject({ method: DESTROY.method, url: DESTROY.url, headers: DESTROY.headers })
+    assert.equal(first.statusCode, 409, first.body)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED', first.body)
+    // The file exists but decodes to nothing — the running-intent gate's
+    // deliberate read-as-none: only a state of 'running' that is THIS pool's
+    // may refuse, and an undecodable file must not make the pool undestroyable.
+    await corruptIntent()
+    const res = await server!.inject({ method: DESTROY.method, url: DESTROY.url, headers: { ...DESTROY.headers, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(calls.some(isAhrMutation), 'the destroy acted — the corrupt file did not stop it')
+  })
+
+  it('a corrupt intent file is disclosed at the destroy confirm (deliberate is not silent)', async () => {
+    await serve()
+    await corruptIntent()
+    const res = await server!.inject({ method: DESTROY.method, url: DESTROY.url, headers: DESTROY.headers })
+    assert.equal(res.statusCode, 409, res.body)
+    const body = res.json() as { error: { code: string, warnings: string[] } }
+    assert.equal(body.error.code, 'CONFIRMATION_REQUIRED', res.body)
+    assert.ok(res.headers['x-anas-confirm-code'], 'a normal confirm challenge, not a refusal')
+    const line = body.error.warnings.find(w => w.includes('expansion-intent file'))
+    assert.match(line ?? '', /could not be read/)
+    assert.match(line ?? '', /treated as no expansion/)
+    assert.match(line ?? '', /removed with the pool/)
+  })
+
+  it('a corrupt intent file that appears while the destroy job waits is reported on its result (cr.24 ruling (j))', async () => {
+    await serve()
+    const { id, release } = await confirmBehindFullQueue(DESTROY)
+    // The confirm was computed over an absent intent file; the corruption that
+    // lands while the job waits is a NEW advisory the confirm did not list —
+    // and the destroy still runs (the ruling above), told ON the result.
+    await corruptIntent()
+    release()
+    const job = await finished(id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const line = (job.result as { warnings?: string[] }).warnings?.find(w => w.includes('expansion-intent file'))
+    assert.match(line ?? '', /could not be read/)
   })
 
   // --- mountpoint: every gate (system pool new) --------------------------------

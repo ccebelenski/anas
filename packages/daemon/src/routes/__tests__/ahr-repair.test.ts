@@ -1,6 +1,7 @@
 import type { Job } from '@anas/shared'
 import type { MockFixture } from '../../executor/mock.js'
 import type { ExecResult } from '../../executor/types.js'
+import type { ZfsMountpoint } from '../../parsers/pve-storage.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -465,6 +466,12 @@ describe('POST /v1/ahr/:name/repair — the confirm gate and the job', () => {
  * btrfs's copy-on-write leaves the old extent alone — so this is not the
  * "corrupt what the initiator sees" hazard — but the initiator is holding its
  * own cache of the file and has no idea the bytes moved.
+ *
+ * D3 rides the same claims read: a BROKEN read fail-opens to "nothing held",
+ * which a node genuinely serving a LUN would look exactly like — repair then
+ * writes reconstructed data through md over a possibly live session. Fail-open
+ * is not fail-silent: the advisory is disclosed at the confirm and, when the
+ * break lands after the confirm, on the job's result (cr.24 ruling (j)).
  */
 describe('POST /v1/ahr/:name/repair — a file backing a live LUN (F10)', () => {
   let dir: string
@@ -495,7 +502,7 @@ describe('POST /v1/ahr/:name/repair — a file backing a live LUN (F10)', () => 
     return root
   }
 
-  async function serverServing(root: string): Promise<TestServer> {
+  async function serverServing(root: string, zfsMountpoints?: () => Promise<ZfsMountpoint[]>): Promise<TestServer> {
     const executor = withFiles(ahrExecutor(), [FILE])
     const app = Fastify({ logger: false })
     const jobQueue = new JobQueue()
@@ -513,6 +520,7 @@ describe('POST /v1/ahr/:name/repair — a file backing a live LUN (F10)', () => 
         saveconfigPath: join(dir, 'absent-saveconfig.json'),
         pveStorageCfg: join(dir, 'absent-storage.cfg'),
         blockRoot: join(dir, 'absent-block'),
+        ...(zfsMountpoints ? { zfsMountpoints } : {}),
       },
     })
     const server = app as unknown as TestServer
@@ -548,6 +556,56 @@ describe('POST /v1/ahr/:name/repair — a file backing a live LUN (F10)', () => 
     const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: FILE, blocks: [300] }]) })
     assert.equal(res.statusCode, 409)
     assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
+    await server.close()
+  })
+
+  // D3 — a broken claims read fail-opens the gate, but it is DISCLOSED, never
+  // a silent pass-over-a-live-session. The zfs mountpoint read is the seam the
+  // iscsi-held suite already throws to produce a genuinely broken read.
+  it('a failed LIO read puts the lio-unreadable advisory in the repair confirm (D3)', async () => {
+    const server = await serverServing(await configfsServing(FILE, false), () => {
+      throw new Error('zfs list exploded')
+    })
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload: body([{ path: FILE, blocks: [300] }]) })
+    assert.equal(res.statusCode, 409, JSON.stringify(res.json()))
+    const error = res.json().error
+    assert.equal(error.code, 'CONFIRMATION_REQUIRED')
+    assert.ok(res.headers['x-anas-confirm-code'], 'a normal confirm challenge, not a refusal')
+    const warnings = (error.warnings as string[]).join('\n')
+    const line = warnings.split('\n').find(w => w.includes('could not check whether an iSCSI LUN'))
+    assert.match(line ?? '', /served from this pool/, warnings)
+    assert.match(line ?? '', /LIO configuration was unreadable/)
+    assert.match(line ?? '', /verify by hand/)
+    await server.close()
+  })
+
+  it('a LIO read that breaks after the confirm rides the repair job result (cr.24 ruling (j))', async () => {
+    // The route's two passes read claims while the read is healthy, so the
+    // confirm discloses nothing; the JOB's fresh read — after the confirm —
+    // is the broken one, and its advisory rides the result, never a failed job.
+    let reads = 0
+    const zfsMountpoints = async (): Promise<ZfsMountpoint[]> => {
+      reads += 1
+      if (reads >= 3)
+        throw new Error('zfs list exploded')
+      return []
+    }
+    const server = await serverServing(await configfsServing(FILE, false), zfsMountpoints)
+    const payload = body([{ path: FILE, blocks: [300] }])
+    const first = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: JSON_HEADERS, payload })
+    assert.equal(first.statusCode, 409, JSON.stringify(first.json()))
+    const confirmWarnings = (first.json().error.warnings as string[]).join('\n')
+    assert.ok(!confirmWarnings.includes('could not check whether an iSCSI LUN'), 'the confirm reads a HEALTHY LIO — nothing to disclose yet')
+    const code = first.headers['x-anas-confirm-code'] as string
+    const second = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/repair', headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload })
+    assert.equal(second.statusCode, 202, JSON.stringify(second.json()))
+    const job = await waitForJob(server, (second.json() as { job: { id: string } }).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    // The engine also asks the LIO question per unrepairable file (D10), so
+    // `reads` is at LEAST the three guard doors, not exactly three.
+    assert.ok(reads >= 3, `expected ≥3 claims reads, saw ${reads}`)
+    const line = (job.result as { warnings?: string[] }).warnings?.find(w => w.includes('could not check whether an iSCSI LUN'))
+    assert.match(line ?? '', /LIO configuration was unreadable/)
     await server.close()
   })
 })

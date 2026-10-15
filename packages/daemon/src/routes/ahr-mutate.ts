@@ -28,7 +28,7 @@ import { attributeScrub, pathExists, runningAhrCheck, scrubAhrPool } from '../se
 import { topLevelMountPath } from '../services/ahr-snapshots.js'
 import { AHR_FINDMNT_ARGS } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
-import { createIscsiClaimCache, heldByLun } from '../services/iscsi-held.js'
+import { heldByLun } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
 import { normalizeMountpointPath } from '../services/mounts.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
@@ -456,9 +456,11 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
   // §3, ruling (j)). Create, mountpoint, remount and destroy each run ONE
   // gate list at the route and again in the job against facts the job reads
   // itself, and every job holds its lock keys (cr.33, §4.2) before it
-  // re-reads: `ahr:<vg uuid>` (the name key when the VG UUID is unreadable),
-  // the name key for create and destroy, the disks a verb writes, the path a
-  // verb mounts at.
+  // re-reads. What a confirm binds to the pool is the band arrays, plus the VG
+  // UUID when `vgs` reports one; what the job locks is `ahr:<vg uuid>` while
+  // that UUID is known and the `ahrname:<name>` lock alone when it is
+  // unreadable — and always the name key for create and destroy, plus the
+  // disks a verb writes and the path a verb mounts at.
   // -------------------------------------------------------------------------
 
   const guard = ahrGuard({ executor, intentDir, iscsiPaths: () => iscsiPaths, jobQueue })
@@ -890,6 +892,19 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const advisories: Advisory[] = []
     if (await (await guard.reads.claims(reads)).readFailed())
       advisories.push({ key: AHR_LIO_UNREADABLE_KEY, warning: AHR_LIO_UNREADABLE_WARNING })
+    // ident.3 (deliberate): the running-intent gate reads a corrupt intent file
+    // as "no expansion" so the pool stays destroyable — refusing over it would
+    // leave the pool undestroyable. Deliberate is not silent: disclosed here,
+    // listed at the confirm and (through the job's re-read) on the result.
+    try {
+      await readIntent(pool.name, intentDir)
+    }
+    catch {
+      advisories.push({
+        key: 'intent-unreadable',
+        warning: `The expansion-intent file for AHR pool '${pool.name}' could not be read — it is treated as no expansion so the destroy is not blocked, and it is removed with the pool`,
+      })
+    }
     advisories.push(
       ...read.refs.map(ref => ({ key: `ref:${poolReferenceKey(ref)}`, warning: poolReferenceWarning(ref) })),
       ...read.unreadableSources.map(src => ({ key: `unreadable:${src.kind}`, warning: poolUnreadableWarning(src, pool.name) })),
@@ -1206,11 +1221,12 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         async pool => pool.repair && 'refusal' in pool.repair ? pool.repair.refusal : null,
         // LUN awareness (seventh pass, F10): a file that backs a LUN with a
         // LIVE initiator session is refused — in the same tier as every other
-        // "unsafe now". ONE claims read per run, shared across every file.
-        async (pool) => {
+        // "unsafe now". ONE claims read per run, shared across every file and
+        // with the advisory below.
+        async (pool, reads) => {
           if (!pool.repair || !('files' in pool.repair))
             return null
-          const claims = createIscsiClaimCache(executor, iscsiPaths)
+          const claims = await guard.reads.claims(reads)
           for (const file of pool.repair.files) {
             const held = await heldByLun(claims, { path: file.path })
             if (held && held.connectedInitiators.length > 0) {
@@ -1221,6 +1237,15 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
           return null
         },
       ],
+      // Fail-open is not fail-silent (D3): a broken claims read reads as
+      // "nothing held", which a node genuinely serving a LUN would look
+      // exactly like — and repair then writes reconstructed data through md
+      // over a file a live session may be holding. The gate above refuses the
+      // session case; this discloses the case the read could not see. Warn,
+      // never refuse; the job reports any the confirm did not list.
+      advisories: async (_pool, reads) => (await (await guard.reads.claims(reads)).readFailed())
+        ? [{ key: AHR_LIO_UNREADABLE_KEY, warning: AHR_LIO_UNREADABLE_WARNING }]
+        : [],
       locks: async (pool, bound) => guard.claims(pool, bound, 'shared'),
     }
     const pre = await guardCheck(spec)
@@ -1254,6 +1279,9 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         `Per block: two node-wide page-cache drops (drop_caches), two ~${sweepMiB} MiB read sweeps over the array${striped ? ', and the band\'s stripe cache held at its floor for the duration' : ''}. A busy node will feel it. Bring latency-sensitive workloads down first`,
         'Nothing else on the array is touched: no other file, and no parity rewrite beyond the stripes these blocks live in',
         'A block that cannot be proven is left untouched. It is reported as unrepairable, or as corruption that arrived above md',
+        // Fail-open is not fail-silent (D3): the LIO-unreadable advisory when
+        // the claims read the gate just used could not run. Warn, never refuse.
+        ...pre.advisories.map(a => a.warning),
       ],
     })) {
       return reply
@@ -1262,7 +1290,12 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     const job = jobQueue.submit(
       'ahr.repair',
       { ...identity, params: { name, files: files.map(f => f.path), blocks } },
-      guarded(spec, pre, async (live, ctx) => repairAhrFiles(executor, live, (live.repair as { files: AhrRepairFile[] }).files, ctx.updateProgress)),
+      guarded(spec, pre, async (live, { updateProgress, newAdvisories }) => {
+        const result = await repairAhrFiles(executor, live, (live.repair as { files: AhrRepairFile[] }).files, updateProgress)
+        if (newAdvisories.length > 0)
+          return { ...result, warnings: newAdvisories }
+        return result
+      }),
       { locks: pre.locks, lane: 'long' },
     )
     reply.code(202)

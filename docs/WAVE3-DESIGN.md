@@ -184,6 +184,8 @@ territory is read-only and hands-off").
 
 ### 2.3 AHR (`routes/ahr-*.ts`)
 
+Status 2026-10-15: the Missing cells of this table are closed by cr.38 sessions A and B (the access row by cr.37), except that AHR mountpoint, remount and snapshot rollback do not yet disclose an unreadable LIO tree; the table is the pre-implementation snapshot.
+
 | Verb → op | Confirm | RT gates | Job re-runs | Missing | Runs for |
 |---|---|---|---|---|---|
 | create → `ahr.create` (`ahr-mutate.ts:475`) | `{name}` only; **disks, tier, mountpoint unbound** | name/VG free, `ahrNameOccupancy`, mountpoint, composability, layout | `ahrNameOccupancy`, `requireComposableNow`, re-plan | mountpoint (an fstab clash throws after the wipe, then the rollback runs) | minutes (resync not awaited) |
