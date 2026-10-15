@@ -180,8 +180,9 @@ test.describe('Dataset lifecycle: create → detail → modify → permissions �
       // …/permissions route was removed by cr.4). owner/group root:root are
       // guaranteed to exist; owner and owning group read-write with everyone
       // none is a clear change from the ZFS default (0755), so `stat` is a
-      // meaningful source-of-truth check. The editor may also set the
-      // directory's setgid bit, so the mode reads 770 or 2770.
+      // meaningful source-of-truth check. The node run (LIVE-PROOF-0.4.4-wave1
+      // R7) showed exactly `root root 770` for this body (no setgid bit), so
+      // the mode is pinned rather than allowing 2770.
       const perms = await ctx.put(`${V1}/pools/${POOL}/datasets/${DS_PATH}/access`, {
         data: {
           owner: 'root',
@@ -200,7 +201,7 @@ test.describe('Dataset lifecycle: create → detail → modify → permissions �
       expect(mountpoint.startsWith('/')).toBe(true)
       await expect
         .poll(() => statOwnership(mountpoint), { timeout: 30_000 })
-        .toMatch(/^root root 2?770$/)
+        .toBe('root root 770')
 
       // --- destroy through the confirmation flow (4.8).
       // Challenge — no confirm header → 409 + code.
