@@ -266,6 +266,12 @@
     // arrival — a request that takes a long time to answer counts as time the
     // job was being watched / contact was missing, not just the scheduled
     // delays. Date.now() drives them, so a fake clock in a harness can too.
+    //
+    // cr.48, two additive options for a dialog that shows a job's outcome
+    // INLINE (ANAS.readJob): `alerts: false` drops the failed / lost modals
+    // (the callbacks still fire, with the same arguments), and
+    // `onRunning(job)` fires on every poll that finds the job not yet ended —
+    // its progress line is on it.
     ANAS.pollJob = function (node, jobId, opts) {
         var maxMs = opts.maxMs || 15000;
         var view = opts.view;
@@ -286,10 +292,12 @@
         }
         // Terminal "lost": alert, then onLost(err) or onFailed(null).
         function lost(err, title, body) {
-            try {
-                Ext.Msg.alert(title, body);
-            } catch (e) {
-                ANAS.warn(ANAS.errText(err));
+            if (opts.alerts !== false) {
+                try {
+                    Ext.Msg.alert(title, body);
+                } catch (e) {
+                    ANAS.warn(ANAS.errText(err));
+                }
             }
             if (opts.onLost) { opts.onLost(err); }
             else if (opts.onFailed) { opts.onFailed(null); }
@@ -342,14 +350,23 @@
                 }
                 if (status === 'failed') {
                     var msg = (job && job.error && job.error.message) || ANAS.t('unknown error');
-                    try {
-                        // Encoded: the job's error is daemon text (review M5).
-                        Ext.Msg.alert(ANAS.t(opts.failTitle || 'Operation failed'), ANAS.enc(msg));
-                    } catch (e) {
-                        ANAS.warn(msg);
+                    if (opts.alerts !== false) {
+                        try {
+                            // Encoded: the job's error is daemon text (review M5).
+                            Ext.Msg.alert(ANAS.t(opts.failTitle || 'Operation failed'), ANAS.enc(msg));
+                        } catch (e) {
+                            ANAS.warn(msg);
+                        }
                     }
                     if (opts.onFailed) { opts.onFailed(job); }
                     return;
+                }
+                if (opts.onRunning) {
+                    try {
+                        opts.onRunning(job);
+                    } catch (eRun) {
+                        ANAS.warn('onRunning failed: ' + ANAS.errText(eRun));
+                    }
                 }
                 if (!announced && elapsed() >= maxMs) {
                     announced = true;
@@ -386,6 +403,164 @@
             });
         }
         schedule(500);
+    };
+
+    // ---- Slow READS as cancellable jobs (cr.48) ----
+    //
+    // The cloud sync preview, the rclone remote Test and the PBS catalog
+    // listing answer 202 + a job whose operation starts `read.` (operator
+    // ruling 2026-10-15): the dialog shows progress while it waits, and its
+    // Cancel goes through the ONE job-cancel door, which stops a read without
+    // a confirm (nothing a stopped read leaves behind needs one). This helper
+    // is the whole client side, so the three dialogs cannot drift:
+    //
+    //   opts: node, path, body, view (polling stops when it is destroyed),
+    //         what (noun phrase for the lost-contact case)
+    //   Exactly ONE of these ends every request:
+    //     onResult(result, job) — completed; `job.result` is the answer. A
+    //                             daemon that predates cr.48 answers the read
+    //                             with 200 + `data` — handed over the same way
+    //                             (job null).
+    //     onError(message, errOrJob) — refused at the door (400/404/503…) or
+    //                             the job failed. `message` is the daemon's
+    //                             own text, RAW — the caller encodes it.
+    //     onCancelled(job)      — the job ended cancelled.
+    //     onLost(message, err)  — the outcome is unknown (the daemon restarted
+    //                             and forgot the job, or contact was lost).
+    //   And along the way: onSubmitted(job) at the 202, onProgress(text, job)
+    //   on every poll while it runs (the job's progress line, '' when none),
+    //   onCancelling() once a cancel is under way, onCancelFailed(message) when
+    //   the daemon could not stop it (the read goes on; the poll still ends it).
+    //
+    // Returns a handle: cancel() asks to stop it (false when it has already
+    // ended or a cancel is already under way); cancel({ quiet: true }) is for a
+    // dialog that is closing or superseding its own request — no callbacks,
+    // errors ignored, sent even after the view is gone so the read never runs
+    // on for nobody.
+    ANAS.readJob = function (opts) {
+        var state = { jobId: null, wanted: false, quiet: false, retry: false, done: false, quietTries: 0 };
+        function dead() {
+            var v = opts.view;
+            return !!(v && (v.destroyed || v.destroying));
+        }
+        function call(name) {
+            if (state.quiet || typeof opts[name] !== 'function') { return; }
+            var args = Array.prototype.slice.call(arguments, 1);
+            try {
+                opts[name].apply(null, args);
+            } catch (e) {
+                ANAS.warn('readJob ' + name + ' failed: ' + ANAS.errText(e));
+            }
+        }
+        // Each terminal outcome reaches its callback exactly once.
+        function end(name) {
+            if (state.done) { return; }
+            state.done = true;
+            call.apply(null, arguments);
+        }
+        function errorCode(err) {
+            return err && err.body && err.body.error && err.body.error.code;
+        }
+        function sendCancel() {
+            if (state.done || !state.jobId) { return; }
+            state.retry = false;
+            ANAS.api.post(opts.node, '/jobs/' + encodeURIComponent(state.jobId) + '/cancel', {}).then(function () {
+                // Accepted: the poll reports the cancelled job.
+            }, function (err) {
+                if (state.done) { return; }
+                var code = errorCode(err);
+                if (state.quiet) {
+                    // Nobody is watching: a QUEUED read whose dialog closed is
+                    // asked again every 2 s for two minutes, so it does not
+                    // start and run for nobody. Everything else is dropped.
+                    if (err && err.status === 409 && code === 'NOT_CANCELLABLE' && state.quietTries < 60) {
+                        state.quietTries++;
+                        setTimeout(sendCancel, 2000);
+                    }
+                    return;
+                }
+                // It ended on its own meanwhile, is already being cancelled,
+                // or the daemon forgot it: the poll says what happened.
+                if (err && (err.status === 404 || (err.status === 409 && code === 'CONFLICT'))) { return; }
+                // Still QUEUED: a job registers its stop when it starts. Ask
+                // again on the first poll that finds it running.
+                if (err && err.status === 409 && code === 'NOT_CANCELLABLE') {
+                    state.retry = true;
+                    return;
+                }
+                state.wanted = false;
+                call('onCancelFailed', ANAS.errText(err));
+            });
+        }
+        var handle = {
+            cancel: function (o) {
+                var quiet = !!(o && o.quiet);
+                if (state.done) { return false; }
+                if (quiet) {
+                    state.quiet = true;
+                } else if (state.wanted) {
+                    return false;
+                }
+                var first = !state.wanted;
+                state.wanted = true;
+                if (!quiet) { call('onCancelling'); }
+                if (first && state.jobId) { sendCancel(); }
+                return true;
+            },
+            // The job id once the daemon accepted it (null before the 202).
+            jobId: function () { return state.jobId; },
+        };
+        ANAS.api.post(opts.node, opts.path, opts.body).then(function (res) {
+            var job = res && res.job;
+            if (!job || !job.id) {
+                // A daemon that predates cr.48 answers the read synchronously.
+                if (res && res.data !== undefined) {
+                    end('onResult', res.data, null);
+                } else {
+                    end('onError', ANAS.t('The node answered without a result.'), null);
+                }
+                return;
+            }
+            state.jobId = job.id;
+            if (state.wanted) {
+                // Cancelled (or closed) before the 202 arrived.
+                sendCancel();
+            }
+            if (state.quiet || dead()) {
+                if (!state.wanted) {
+                    state.wanted = true;
+                    state.quiet = true;
+                    sendCancel();
+                }
+                return;
+            }
+            call('onSubmitted', job);
+            ANAS.pollJob(opts.node, job.id, {
+                view: opts.view,
+                what: opts.what,
+                alerts: false,
+                // The dialog IS the progress display: no "still running" toast.
+                onStillRunning: function () {},
+                onRunning: function (j) {
+                    if (state.done) { return; }
+                    if (state.retry && j && j.status === 'running') { sendCancel(); }
+                    call('onProgress', '' + ((j && j.progress) || ''), j);
+                },
+                onComplete: function (j) { end('onResult', j ? j.result : null, j); },
+                onFailed: function (j) {
+                    end('onError', (j && j.error && j.error.message) || ANAS.t('unknown error'), j);
+                },
+                onCancelled: function (j) { end('onCancelled', j); },
+                onLost: function (err) {
+                    end('onLost', err && err.status === 404
+                        ? ANAS.t('The node no longer knows this request (the ANAS daemon restarted). Try again.')
+                        : ANAS.t('Lost contact with the node while waiting for the answer. Try again.'), err);
+                },
+            });
+        }, function (err) {
+            end('onError', ANAS.errText(err), err);
+        });
+        return handle;
     };
 
     // Server-warnings → HTML bullet list. Single source for the

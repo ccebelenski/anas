@@ -270,14 +270,15 @@ describe('rclone-probe: testRemote (rclone.1)', () => {
     assert.equal(calls.length, 1)
     assert.equal(calls[0]!.command, '/usr/bin/timeout')
     assert.deepEqual(calls[0]!.args, probeArgs(PATHS.configFile, 'gt:dst'))
-    assert.equal(calls[0]!.opts, undefined)
+    // No env (the file holds the values) — and no onSpawn unless a job's cancel seam passed one.
+    assert.deepEqual(calls[0]!.opts, {})
     // A saved remote is probed against ANAS's OWN store: the three sftp
     // detection keys rclone appends land in that remote's own section, which
     // the INI writer keeps and the API lists (GT fact 1).
     assert.equal(probeConfigOf(calls[0]!.args), PATHS.configFile)
   })
 
-  it('the argv is the design\'s: timeout 12 (cr.35r), base args, lsjson, the bounded flags', () => {
+  it('the argv is the design\'s: timeout PROBE_TIMEOUT_S (cr.48: 120), base args, lsjson, the bounded flags', () => {
     assert.deepEqual(probeArgs('/etc/anas/rclone.conf', 'gt:'), [
       String(PROBE_TIMEOUT_S),
       RCLONE,

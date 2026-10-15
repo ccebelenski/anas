@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { describe, it } from 'node:test'
 import Fastify from 'fastify'
 import { JobQueue } from '../../jobs/queue.js'
+import { READ_JOB_OPERATIONS } from '../../jobs/read-jobs.js'
 import { ConfirmStore } from '../../safety/confirm.js'
 import { cancelHeadline, formatElapsed, jobRoutes } from '../jobs.js'
 
@@ -266,6 +267,66 @@ describe('POST /v1/jobs/:id/cancel (rclone.5)', () => {
     const { server } = await build()
     const res = await server.inject({ method: 'GET', url: '/v1/jobs?status=cancelled' })
     assert.equal(res.statusCode, 200)
+    await server.close()
+  })
+})
+
+describe('cr.48 — a READ-ONLY job is cancelled without the confirm', () => {
+  /** A running read job (the `read.` prefix): its hook resolves the body's wait. */
+  function submitRead(jobQueue: JobQueue, operation: string): { id: string, calls: () => number } {
+    let calls = 0
+    let stop: () => void = () => {}
+    const ref = jobQueue.submit(operation, { user: 'root@pam', uid: 0 }, async (_progress, ctx) => {
+      ctx.onCancel(async () => {
+        calls++
+        stop()
+      }, { subject: 'Cloud sync preview', consequence: 'Nothing is changed — it only reads.' })
+      await new Promise<void>((resolve) => {
+        stop = resolve
+      })
+      return { transfers: 0 }
+    })
+    return { id: ref.id, calls: () => calls }
+  }
+
+  for (const operation of Object.values(READ_JOB_OPERATIONS)) {
+    it(`${operation}: the FIRST call is the cancel — 202, no confirm code, and the job ends cancelled`, async () => {
+      const { server, jobQueue } = await build()
+      const run = submitRead(jobQueue, operation)
+      await settle()
+      const res = await server.inject({ method: 'POST', url: `/v1/jobs/${run.id}/cancel`, headers: headers() })
+      assert.equal(res.statusCode, 202, res.body)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no confirm for a read')
+      assert.equal((res.json() as JobAccepted).job.operation, 'job.cancel')
+      const job = await waitTerminal(jobQueue, run.id)
+      assert.equal(job.status, 'cancelled')
+      assert.match((job.result as { reason: string }).reason, /^cancelled by alice@pve at /)
+      assert.equal(run.calls(), 1)
+      await server.close()
+    })
+  }
+
+  it('the SAME body under a run\'s operation still answers 409 + a confirm code (only the read prefix skips it)', async () => {
+    const { server, jobQueue } = await build()
+    const run = submitRead(jobQueue, 'cloud.task.run')
+    await settle()
+    const res = await server.inject({ method: 'POST', url: `/v1/jobs/${run.id}/cancel`, headers: headers() })
+    assert.equal(res.statusCode, 409)
+    assert.ok(res.headers['x-anas-confirm-code'], 'a run\'s cancel is still confirm-gated')
+    assert.equal(run.calls(), 0)
+    await server.close()
+  })
+
+  it('a QUEUED read job is still refused (it registers its hook when it starts) — the UI retries once it runs', async () => {
+    const { server, jobQueue } = await build({ concurrency: 1 })
+    const blocker = submitRead(jobQueue, 'test.blocker')
+    const queued = submitRead(jobQueue, READ_JOB_OPERATIONS.cloudPreview)
+    await settle()
+    assert.equal(jobQueue.get(queued.id)?.status, 'queued')
+    const res = await server.inject({ method: 'POST', url: `/v1/jobs/${queued.id}/cancel`, headers: headers() })
+    assert.equal(res.statusCode, 409)
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'NOT_CANCELLABLE')
+    await jobQueue.cancel(blocker.id, 'root@pam')
     await server.close()
   })
 })

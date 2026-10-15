@@ -3,7 +3,7 @@ import type {
   BackupBrowseEntryType,
   BackupBrowseResult,
 } from '@anas/shared'
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, SpawnedChild } from '../executor/types.js'
 import type { BackupReadDeps } from './backup-reads.js'
 import { classifyArchiveFile, isBrowsableArchive } from '@anas/shared'
 import { classifyBackupReadVerdict } from './backup-reads.js'
@@ -46,17 +46,31 @@ const TIMEOUT = '/usr/bin/timeout'
 const TIMEOUT_EXIT = 124
 
 /**
- * Wall-clock budget for ONE catalog-shell invocation. Two orders of magnitude
- * above the measured 0.14 s worst case, and still bounded — a picker must never
- * be the thing that wedges the daemon.
+ * Wall-clock ceiling for ONE directory LISTING (the picker's), in seconds:
+ * five minutes (cr.48, operator ruling 2026-10-15). A listing is a
+ * cancellable READ job now (202 + poll), so the gateway's 20 s socket budget
+ * no longer bounds it (cr.35r's 12 s was that budget's arithmetic). The
+ * measured case is 0.14 s; what the ceiling admits is the catalog FETCH of a
+ * very large archive over a slow link, which `catalog shell` does before it
+ * answers anything. Still bounded — a picker must never be the thing that
+ * wedges the daemon — and the operator can stop it sooner (the picker's Stop).
  *
- * cr.35r: 12 s, down from 15 s — the wrapper fires and the browse fails as a
- * clean verdict (exit 124) before the gateway's 20 s socket budget answers
- * the browser, and the executor's own deadline (12 s + the 5 s wrapper
- * margin, 17 s) still lands inside it (WAVE3-DESIGN §6.2 ladder).
+ * The ceiling covers the whole level: the `ls` invocation gets all of it and
+ * the `stat` invocation what is left (see {@link browseArchiveLevel}). The
+ * `timeout` wrapper stays so a ceiling hit is the clean `unreachable` verdict
+ * (exit 124), never the executor's job-lane timeout.
  */
-// Q3 (WAVE3-DESIGN §10): job or sync is the operator's call
-export const CATALOG_SHELL_TIMEOUT_S = 12
+export const CATALOG_SHELL_TIMEOUT_S = 300
+
+/**
+ * Wall-clock budget for the restore PRE-FLIGHT's catalog session
+ * ({@link statArchivePaths}): 12 s, unchanged by cr.48. That session runs on
+ * the request path of `POST /backup/restore` (before the confirm and the 202)
+ * and is fail-open, so it keeps the cr.35r ladder arithmetic — the wrapper's
+ * 124 and the executor's deadline on it (12 s + the 5 s margin) both land
+ * inside the gateway's 20 s.
+ */
+export const CATALOG_PREFLIGHT_TIMEOUT_S = 12
 
 /**
  * Cap on entries returned for one directory level, mirroring `/v1/fs/browse`'s
@@ -298,24 +312,33 @@ export interface BrowseArchiveDeps extends BackupReadDeps {
   timeoutSeconds?: number
   /** Override the per-level entry cap (tests). */
   maxEntries?: number
+  /** Each invocation's `onSpawn` (cr.48) — the listing job's read-cancel hook takes the child here. */
+  onSpawn?: (child: SpawnedChild) => void
+  /** Called before each invocation: throws (JobCancelledError) when a cancel was already accepted. */
+  checkpoint?: (next: string) => void
 }
 
-/** Run one catalog-shell invocation with a script on stdin. */
+/** Run one catalog-shell invocation with a script on stdin, under a `timeout <seconds>` wrapper. */
 async function runShell(
   executor: CommandExecutor,
   deps: BrowseArchiveDeps,
   script: string,
+  seconds: number,
 ): Promise<{ ok: true, stdout: string, stderr: string } | { ok: false, verdict: BackupBrowseResult['verdict'], detail: string }> {
   const { command, args } = buildCatalogShellArgs(
     deps.snapshot,
     deps.archive,
     deps.namespace,
-    deps.timeoutSeconds ?? CATALOG_SHELL_TIMEOUT_S,
+    seconds,
   )
+  // Outside the try: a cancel accepted before this invocation ends the job
+  // `cancelled` (JobCancelledError), never an `error` verdict.
+  deps.checkpoint?.('the catalog shell')
   try {
     const r = await executor.exec(command, args, {
       stdin: script,
       env: buildBackupEnv(deps.repo, deps.secret),
+      ...(deps.onSpawn ? { onSpawn: deps.onSpawn } : {}),
     })
     if (r.exitCode === TIMEOUT_EXIT)
       return { ok: false, ...classifyBackupReadVerdict(r.exitCode, r.stderr, true) }
@@ -368,7 +391,7 @@ export async function statArchivePaths(
     return { ok: false, verdict: 'error', detail: err instanceof Error ? err.message : String(err) }
   }
 
-  const out = await runShell(executor, deps, script)
+  const out = await runShell(executor, deps, script, deps.timeoutSeconds ?? CATALOG_PREFLIGHT_TIMEOUT_S)
   if (!out.ok)
     return out
 
@@ -433,7 +456,11 @@ export async function browseArchiveLevel(
     return { ...base, verdict: 'error', detail: err instanceof Error ? err.message : String(err) }
   }
 
-  const listed = await runShell(executor, deps, script)
+  // ONE ceiling for the level (cr.48): the `stat` invocation gets what the
+  // `ls` left of it, never a fresh one.
+  const ceiling = deps.timeoutSeconds ?? CATALOG_SHELL_TIMEOUT_S
+  const startedAt = Date.now()
+  const listed = await runShell(executor, deps, script, ceiling)
   if (!listed.ok)
     return { ...base, verdict: listed.verdict, detail: listed.detail }
 
@@ -476,7 +503,8 @@ export async function browseArchiveLevel(
     return { ...base, verdict: 'error', detail: err instanceof Error ? err.message : String(err) }
   }
 
-  const statted = await runShell(executor, deps, statScript)
+  const remaining = Math.max(1, Math.ceil(ceiling - (Date.now() - startedAt) / 1000))
+  const statted = await runShell(executor, deps, statScript, remaining)
   const warnings: string[] = []
   const byPath = new Map<string, CatalogStat>()
   if (statted.ok) {

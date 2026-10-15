@@ -30,7 +30,10 @@
  *         "not asked", never "none there"), truncated? }
  *
  *   POST /v1/backup/restore/browse { repo, ns?, snapshot, archive, path }
- *     → { verdict:'ok'|'not-found'|'permission'|'unreachable'|'error', detail?,
+ *     → 202 { job } (cr.48: a cancellable READ job — the catalog fetch of a
+ *       large archive can take minutes; the picker's Stop cancels it), whose
+ *       job.result is
+ *       { verdict:'ok'|'not-found'|'permission'|'unreachable'|'error', detail?,
  *         archiveKind:'pxar'|'img'|'other', path,
  *         entries:[{ name, path, type:'dir'|'file'|'symlink'|'hardlink'|'image'
  *                    |'other', size?, modified?, mtimeZone?:'node-local',
@@ -324,6 +327,26 @@
         return body;
     }
 
+    // The archive answer → the level the window fills, or the error a refusing
+    // verdict carries.
+    function archiveLevel(data, path, mode) {
+        var d = data || {};
+        if (d.verdict && d.verdict !== 'ok') {
+            var err = new Error(d.detail || t('The archive could not be read.'));
+            err.verdict = d.verdict;
+            throw err;
+        }
+        return {
+            path: normalizePath(d.path || path),
+            rows: entriesFromArchive(d, path, mode),
+            truncated: !!d.truncated,
+            warnings: isArray(d.warnings) ? d.warnings : [],
+            // An image archive has no navigable inside; the single
+            // pseudo-entry IS the answer.
+            flat: d.archiveKind === 'img',
+        };
+    }
+
     function makeBackend(cfg) {
         var mode = cfg.mode || 'dir';
         // The live backend only pays for a file listing when files can be picked.
@@ -331,24 +354,42 @@
         if (cfg.backend === 'archive') {
             return {
                 key: 'archive',
-                load: function (path) {
-                    return ANAS.api.post(cfg.node, '/backup/restore/browse',
-                        archiveBrowseBody(cfg.archive, path)).then(function (res) {
-                        var d = (res && res.data) || {};
-                        if (d.verdict && d.verdict !== 'ok') {
-                            var err = new Error(d.detail || t('The archive could not be read.'));
-                            err.verdict = d.verdict;
-                            throw err;
-                        }
-                        return {
-                            path: normalizePath(d.path || path),
-                            rows: entriesFromArchive(d, path, mode),
-                            truncated: !!d.truncated,
-                            warnings: isArray(d.warnings) ? d.warnings : [],
-                            // An image archive has no navigable inside; the single
-                            // pseudo-entry IS the answer.
-                            flat: d.archiveKind === 'img',
-                        };
+                // cr.48: one level is a READ job (ANAS.readJob). `ctl` is the
+                // window's side of it: `view` (polling stops with it),
+                // onHandle(handle) — the cancel handle, the moment it exists —
+                // and onCancelling / onCancelFailed for the Stop button. A
+                // stopped listing rejects with `cancelled: true`.
+                load: function (path, ctl) {
+                    var c = ctl || {};
+                    return new Promise(function (resolve, reject) {
+                        var handle = ANAS.readJob({
+                            node: cfg.node,
+                            path: '/backup/restore/browse',
+                            body: archiveBrowseBody(cfg.archive, path),
+                            view: c.view,
+                            what: t('The archive listing'),
+                            onResult: function (d) {
+                                try {
+                                    resolve(archiveLevel(d, path, mode));
+                                } catch (e) {
+                                    reject(e);
+                                }
+                            },
+                            onError: function (msg) { reject(new Error(msg)); },
+                            onLost: function (msg) { reject(new Error(msg)); },
+                            onCancelled: function () {
+                                var err = new Error(t('Listing stopped.'));
+                                err.cancelled = true;
+                                reject(err);
+                            },
+                            onCancelling: function () {
+                                if (c.onCancelling) { c.onCancelling(); }
+                            },
+                            onCancelFailed: function (msg) {
+                                if (c.onCancelFailed) { c.onCancelFailed(msg); }
+                            },
+                        });
+                        if (c.onHandle) { c.onHandle(handle); }
                     });
                 },
             };
@@ -433,11 +474,37 @@
     }
 
     // Clear the shared tree loading mask; every loadLevel exit path needs it.
+    // The Stop button (cr.48) goes with it.
     function clearPickerLoading(win) {
         try {
             win.down('#pickerTree').setLoading(false);
         } catch (e) {
             // tree not available (window closing)
+        }
+        setPickerStop(win, false);
+    }
+
+    // The archive listing's Stop (cr.48): shown while a listing job runs,
+    // greyed once its cancel is under way.
+    function setPickerStop(win, busy, cancelling) {
+        var stop = win.down('#pickerStop');
+        if (!stop) {
+            return;
+        }
+        try {
+            stop.setDisabled(!busy || cancelling === true);
+            stop.setHidden(!busy);
+        } catch (e) {
+            // cosmetic
+        }
+    }
+
+    // A listing nobody will read any more (a newer navigation, the window
+    // closing) is stopped, quietly.
+    function abandonLoad(win) {
+        if (win._loadJob) {
+            win._loadJob.cancel({ quiet: true });
+            win._loadJob = null;
         }
     }
 
@@ -481,16 +548,33 @@
         var backend = win._backend;
         var path = node.get('path') || '/';
         var stamp = (win._nav = (win._nav || 0) + 1);
+        abandonLoad(win);
         try {
             win.down('#pickerTree').setLoading(true);
         } catch (e) {
             // non-fatal
         }
-        return backend.load(path).then(function (level) {
+        var ctl = {
+            view: win,
+            onHandle: function (handle) {
+                win._loadJob = handle;
+                setPickerStop(win, true);
+            },
+            onCancelling: function () {
+                if (stamp === win._nav) { setPickerStop(win, true, true); }
+            },
+            onCancelFailed: function (msg) {
+                if (stamp !== win._nav) { return; }
+                setPickerStop(win, true);
+                setNote(win, t('Could not stop the listing') + ': ' + msg, true);
+            },
+        };
+        return backend.load(path, ctl).then(function (level) {
             if (win.destroyed || win.destroying || stamp !== win._nav) {
                 clearPickerLoading(win);
                 return;
             }
+            win._loadJob = null;
             clearPickerLoading(win);
             fillNode(node, level.rows);
             var notes = [];
@@ -506,8 +590,14 @@
                 clearPickerLoading(win);
                 return;
             }
+            win._loadJob = null;
             clearPickerLoading(win);
             node.set('loaded', false);
+            if (err && err.cancelled) {
+                // What the operator asked for — said, not flagged.
+                setNote(win, t('Listing of') + ' ' + path + ' ' + t('stopped.'), false);
+                return;
+            }
             setNote(win, t('Could not read') + ' ' + path + ': ' + errText(err), true);
         });
     }
@@ -838,6 +928,23 @@
                                     navigate(win, up);
                                 },
                             },
+                            {
+                                // cr.48: stops the archive listing in flight
+                                // (a READ job — nothing is changed by it).
+                                xtype: 'button',
+                                itemId: 'pickerStop',
+                                text: t('Stop'),
+                                cls: 'anas-btn-picker-stop',
+                                iconCls: 'fa fa-stop',
+                                margin: '0 0 0 6',
+                                hidden: true,
+                                handler: function (btn) {
+                                    var w = btn.up('window');
+                                    if (w && w._loadJob) {
+                                        w._loadJob.cancel();
+                                    }
+                                },
+                            },
                         ],
                     },
                     {
@@ -990,6 +1097,8 @@
 
         win._backend = makeBackend(conf);
         win._picked = [];
+        // cr.48: a listing still running when the picker closes stops with it.
+        win.on('destroy', function () { abandonLoad(win); });
         win.show();
         navigate(win, startDir);
         return win;

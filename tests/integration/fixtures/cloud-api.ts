@@ -43,6 +43,24 @@ export async function awaitJob(
   }
 }
 
+/**
+ * cr.48 — one of the three slow READS (the cloud preview, the remote Test,
+ * the catalog listing): POST, require the 202 with a `read.*` job, and wait
+ * for it. The answer the door used to give is `job.result`.
+ */
+export async function readJob(
+  ctx: APIRequestContext,
+  url: string,
+  data: unknown,
+  timeout = 150_000,
+): Promise<{ status: string, error?: any, result?: any, [k: string]: any }> {
+  const res = await ctx.post(url, { data })
+  expect(res.status(), await res.text()).toBe(202)
+  const accepted = (await res.json()).job
+  expect(String(accepted.operation)).toMatch(/^read\./)
+  return awaitJob(ctx, accepted.id, timeout)
+}
+
 /** Submit a mutation, wait for its job, and require it to complete. */
 export async function runJob(
   ctx: APIRequestContext,

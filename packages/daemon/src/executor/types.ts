@@ -103,6 +103,17 @@ export interface SpawnedChild {
   readonly pid: number
   /** Send a signal. False when the process is already gone (nothing was sent). */
   kill: (signal: NodeJS.Signals) => boolean
+  /**
+   * Send a signal to the child's whole PROCESS GROUP (cr.48): every child the
+   * executor spawns leads its own group, so this reaches what it started too
+   * — the tool under a `/usr/bin/timeout` wrapper, a shell's grandchild. The
+   * cancel of a READ uses it (nothing a read leaves half-done needs a gentle
+   * stop); a run's cancel keeps the PID-only SIGINT ladder of {@link kill}.
+   * False when nothing of the group is left to signal. Optional: an executor
+   * that cannot address a group leaves it out, and the read cancel falls back
+   * to {@link kill}.
+   */
+  killGroup?: (signal: NodeJS.Signals) => boolean
   /** Has the process exited? */
   readonly exited: () => boolean
   /** Settles when the process has exited (never rejects). */

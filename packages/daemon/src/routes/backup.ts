@@ -49,6 +49,7 @@ import {
 } from '@anas/shared'
 import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
+import { READ_JOB_OPERATIONS, readJobCancel } from '../jobs/read-jobs.js'
 import { readPbsStorages, readPveMountPaths } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
 import { GuardReads, GuardRefusalError, iscsiTargetClaim } from '../safety/guard.js'
@@ -1630,9 +1631,12 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   // --- POST /backup/restore/browse — ONE directory level of an archive ------
   //
   // A POST because the key is compound (repo + ns + snapshot + archive + path),
-  // not because anything changes: it is a read, 200, never a job. The driver is
-  // `catalog shell` over a pipe, wrapped in `timeout` — NEVER the FUSE `mount`,
-  // whose black-holed-server D-state readers cannot be killed at all (GT-33).
+  // not because anything changes. cr.48: a READ job (202, the level in
+  // `job.result`) with a five-minute ceiling and a Cancel — the catalog fetch
+  // of a large archive over a slow link can take minutes. The validation and
+  // the repository/secret read answer before the 202. The driver is `catalog
+  // shell` over a pipe, wrapped in `timeout` — NEVER the FUSE `mount`, whose
+  // black-holed-server D-state readers cannot be killed at all (GT-33).
   server.post('/backup/restore/browse', async (request, reply) => {
     const parsed = BackupBrowseRequest.safeParse(request.body ?? {})
     if (!parsed.success) {
@@ -1641,17 +1645,31 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     }
     const req = parsed.data
 
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
     const deps = await readDepsFor(req.repo, reply, req.ns?.trim() || undefined)
     if (!deps)
       return
 
-    const data: BackupBrowseResult = await browseArchiveLevel(executor, {
-      ...deps,
-      snapshot: req.snapshot,
-      archive: req.archive,
-      path: req.path,
-    })
-    return { data }
+    const job = jobQueue.submit(
+      READ_JOB_OPERATIONS.backupCatalog,
+      { ...identity, params: { repo: req.repo, snapshot: req.snapshot, archive: req.archive, path: req.path } },
+      async (_progress, ctx): Promise<BackupBrowseResult> => {
+        const cancel = readJobCancel(ctx, 'proxmox-backup-client catalog shell', `Listing of '${req.path}' in ${req.archive}`)
+        return browseArchiveLevel(executor, {
+          ...deps,
+          snapshot: req.snapshot,
+          archive: req.archive,
+          path: req.path,
+          onSpawn: cancel.onSpawn,
+          checkpoint: cancel.checkpoint,
+        })
+      },
+    )
+    reply.code(202)
+    return { job }
   })
 
   // --- POST /backup/restore — the restore family ---------------------------

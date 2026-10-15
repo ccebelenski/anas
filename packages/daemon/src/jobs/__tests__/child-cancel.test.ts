@@ -1,10 +1,11 @@
 import type { SpawnedChild } from '../../executor/types.js'
 import type { CancelHook, CancelMeta, JobCancellation, JobContext } from '../queue.js'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { ProdExecutor } from '../../executor/prod.js'
-import { assertRunNotCancelled, CANCEL_SIGNAL_WAIT_MS, ChildCancel, stopChild } from '../child-cancel.js'
+import { assertRunNotCancelled, CANCEL_SIGNAL_WAIT_MS, ChildCancel, READ_CANCEL_WAIT_MS, stopChild, stopReadChild } from '../child-cancel.js'
 import { JobCancelledError } from '../queue.js'
 
 /**
@@ -15,6 +16,16 @@ import { JobCancelledError } from '../queue.js'
  */
 
 const TOOL = '/usr/bin/tool'
+/** Pids of `sleep <mark>` processes still alive (empty when none). */
+function sleepers(mark: string): string[] {
+  try {
+    return execFileSync('/usr/bin/pgrep', ['-f', `^sleep ${mark}$`]).toString().trim().split('\n').filter(Boolean)
+  }
+  catch {
+    return [] // pgrep exits 1 when nothing matches
+  }
+}
+
 /** Short waits: the ladder's timing is the parameter, not the subject. */
 const FAST = { waitMs: 20 }
 
@@ -214,5 +225,106 @@ describe('assertRunNotCancelled — the pre-flight boundary (rclone.5 review)', 
       (err: unknown) => err instanceof JobCancelledError
         && err.message === 'cancelled by alice@pve at 2026-09-25T14:02:11.000Z before the transient snapshot',
     )
+  })
+})
+
+describe('stopReadChild — the READ ladder (cr.48): SIGTERM, then SIGKILL, to the process group', () => {
+  it('the default wait is 2 s per step', () => {
+    assert.equal(READ_CANCEL_WAIT_MS, 2_000)
+  })
+
+  it('one SIGTERM to the GROUP that the child obeys is the whole stop', async () => {
+    const mock = new MockExecutor().addFixture({ command: TOOL, live: { signalsToExit: 1 } })
+    const { child, done } = await liveChild(mock)
+    const t0 = Date.now()
+    await stopReadChild(child, 'rclone lsjson', { waitMs: 2000 })
+    assert.ok(Date.now() - t0 < 1000, 'returned on the exit, not on the wait')
+    assert.deepEqual(mock.signals.map(s => [s.signal, s.group]), [['SIGTERM', true]], 'through killGroup, never the PID-only kill')
+    await done
+  })
+
+  it('a child that survives the SIGTERM gets SIGKILL to the group, and stops', async () => {
+    const mock = new MockExecutor().addFixture({ command: TOOL, live: { signalsToExit: 2 } })
+    const { child } = await liveChild(mock)
+    await stopReadChild(child, 'rclone lsjson', FAST)
+    assert.deepEqual(mock.signals.map(s => [s.signal, s.group]), [['SIGTERM', true], ['SIGKILL', true]])
+    assert.equal(child.exited(), true)
+  })
+
+  it('a child that survives SIGKILL (stuck in the kernel) fails the stop with the reason', async () => {
+    const mock = new MockExecutor().addFixture({ command: TOOL, live: { signalsToExit: Number.POSITIVE_INFINITY } })
+    const { child } = await liveChild(mock)
+    await assert.rejects(
+      stopReadChild(child, 'catalog shell', FAST),
+      /catalog shell \(pid \d+\) did not stop after SIGTERM and SIGKILL to its process group — it is stuck in the kernel; the read ends when it does/,
+    )
+    mock.finishLive()
+  })
+
+  it('a child that already exited is not signalled at all — the stop succeeds (the body stops at its next boundary)', async () => {
+    const mock = new MockExecutor().addFixture({ command: TOOL, live: {} })
+    const { child } = await liveChild(mock)
+    mock.finishLive()
+    await new Promise(r => setImmediate(r))
+    await stopReadChild(child, 'catalog shell', FAST)
+    assert.equal(mock.signals.length, 0, 'a gone leader\'s group id is never addressed')
+  })
+
+  it('a child without killGroup falls back to the PID-only kill', async () => {
+    const mock = new MockExecutor().addFixture({ command: TOOL, live: {} })
+    const { child } = await liveChild(mock)
+    const pidOnly: SpawnedChild = { pid: child.pid, kill: child.kill, exited: child.exited, exit: child.exit }
+    await stopReadChild(pidOnly, 'x', FAST)
+    assert.deepEqual(mock.signals.map(s => [s.signal, s.group]), [['SIGTERM', undefined]])
+  })
+
+  it('reaches a REAL process group: a TERM-ignoring shell and its grandchild sleep both die of the SIGKILL', async () => {
+    const exec = new ProdExecutor()
+    let child: SpawnedChild | undefined
+    const mark = `${400 + Math.floor(Math.random() * 100)}.${process.pid}`
+    const done = exec.exec('/bin/sh', ['-c', `trap "" TERM; sleep ${mark}; true`], { onSpawn: (c) => {
+      child = c
+    } })
+    assert.ok(child)
+    // Let the shell fork its sleep before the stop.
+    await new Promise(r => setTimeout(r, 150))
+    assert.equal(sleepers(mark).length, 1, 'the grandchild is running')
+    await stopReadChild(child, 'sh', { waitMs: 300 })
+    const r = await done
+    assert.equal(r.signal, 'SIGKILL', 'the TERM was ignored; the group SIGKILL ended it')
+    assert.deepEqual(sleepers(mark), [], 'the grandchild went with the group')
+  })
+})
+
+describe('ChildCancel with the read ladder (cr.48)', () => {
+  it('stops the live child with the group ladder', async () => {
+    const f = fakeCtx()
+    const cancel = new ChildCancel(f.ctx, 'rclone lsjson', {}, { ladder: 'read', waitMs: 20 })
+    const mock = new MockExecutor().addFixture({ command: TOOL, live: {} })
+    const done = mock.exec(TOOL, [], { onSpawn: cancel.onSpawn })
+    await new Promise(r => setImmediate(r))
+    const by = { user: 'alice@pve', at: '2026-10-15T10:00:00.000Z' }
+    f.set(by)
+    await f.hook()!(by)
+    assert.deepEqual(mock.signals.map(s => [s.signal, s.group]), [['SIGTERM', true]])
+    await done
+  })
+
+  it('a cancel BETWEEN two children (the first exited, the next not spawned) is accepted; the next spawn is stopped at once', async () => {
+    const f = fakeCtx()
+    const cancel = new ChildCancel(f.ctx, 'catalog shell', {}, { ladder: 'read', waitMs: 20 })
+    const mock = new MockExecutor().addFixture({ command: TOOL, live: {} })
+    const first = mock.exec(TOOL, [], { onSpawn: cancel.onSpawn })
+    await new Promise(r => setImmediate(r))
+    mock.finishLive()
+    await first
+    const by = { user: 'alice@pve', at: '2026-10-15T10:00:00.000Z' }
+    f.set(by)
+    await f.hook()!(by) // resolves: accepted, nothing to signal
+    assert.equal(mock.signals.length, 0)
+    const second = mock.exec(TOOL, [], { onSpawn: cancel.onSpawn })
+    await new Promise(r => setTimeout(r, 30))
+    assert.deepEqual(mock.signals.map(s => [s.signal, s.group]), [['SIGTERM', true]], 'the next child is stopped the moment it appears')
+    await second
   })
 })

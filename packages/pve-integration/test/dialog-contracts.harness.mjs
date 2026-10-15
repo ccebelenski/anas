@@ -792,6 +792,14 @@ const toasts = []
 /** Every Ext.Msg.alert the UI opened (title + message) — a MODAL. A check
  * asserting "no modal" counts these; a confirmAndRun confirm is NOT one. */
 const alerts = []
+/**
+ * cr.48 — every job poll a READ job started (ANAS.readJob → ANAS.pollJob):
+ * the job id and the poll's options. A check ends the job by calling the
+ * callback it wants (onComplete / onFailed / onCancelled / onLost), or shows
+ * progress through onRunning — the REAL readJob turns each into the dialog's
+ * outcome.
+ */
+const polls = []
 
 /** The real autofill opt-out from 00-core.js — every credential dialog
  * references it while building its fields, so the fake must mirror it. */
@@ -829,8 +837,29 @@ function loadPveHelper() {
 
 const ANAS_PVE = loadPveHelper()
 
+/**
+ * The REAL ANAS.readJob from 10-api.js (cr.48), bound to a harness ANAS: the
+ * source runs against a shim whose prototype is that ANAS, and the shim's own
+ * properties are then dropped, so every `ANAS.api` / `ANAS.pollJob` /
+ * `ANAS.t` the helper reads at call time is the harness's recording stub.
+ */
+function loadRealReadJob(anas) {
+  const shim = Object.create(anas)
+  const sandbox = {
+    window: { ANAS: shim },
+    console,
+    Promise,
+    setTimeout: (fn) => { fn(); return 1 },
+    clearTimeout: () => {},
+  }
+  vm.runInNewContext(readFileSync(join(SRC, '10-api.js'), 'utf8'), sandbox, { filename: '10-api.js' })
+  const readJob = shim.readJob
+  for (const k of Object.keys(shim)) { delete shim[k] }
+  return readJob
+}
+
 function makeAnas(routes) {
-  return {
+  const anas = {
     views: {},
     noAutofill,
     // pvepool.2: the shared ownership helper the pickers consult per row.
@@ -1033,7 +1062,11 @@ function makeAnas(routes) {
       if (cfg.onComplete) { cfg.onComplete({}) }
     },
     casWrite(cfg) { jobs.push({ method: 'cas', path: cfg && cfg.path, body: cfg && cfg.body }) },
+    // cr.48: the poll a READ job starts — recorded; a check drives its end.
+    pollJob(node, id, opts) { polls.push({ node, id, opts }) },
   }
+  anas.readJob = loadRealReadJob(anas)
+  return anas
 }
 
 function loadSource(files, routes) {
@@ -11460,31 +11493,35 @@ async function cloudChecks() {
     grid.columns[1].renderer && String(grid.columns[1].renderer('sftp')))
   cloudAnas.enc = realEnc
 
+  // cr.48: the toolbar Test opens a small window of its own (progress line,
+  // Cancel, the verdict) — the route here answers the pre-cr.48 way (200 +
+  // data), which readJob hands over as the result; the job-path outcomes are
+  // readJobDialogChecks' (below).
   const gridTestBtn = findCmp(win, 'anas-btn-cloud-remote-test')
-  cloudAnas.enc = v => `ENC(${String(v == null ? '' : v)})`
   gridTestBtn.handler(gridTestBtn)
-  ok('cloud(toolbar test): the LoadMask text encodes the remote name (a mask message is HTML)',
-    /ENC\(gt\)/.test(String(grid.loadingMsg || '')), String(grid.loadingMsg))
-  cloudAnas.enc = realEnc
   await settle()
+  let tWin = openWindow()
+  ok('cloud(toolbar test): the Test opens its own window', !!tWin && tWin.cls === 'anas-win-cloud-remote-test', tWin && tWin.cls)
   eq('cloud(toolbar test): the saved remote tests by NAME (no options on the wire)',
     testBodies[0], { name: 'gt' })
-  ok('cloud(toolbar test): the verdict sentence rides the toast',
-    /Reachable/.test(toasts[toasts.length - 1] || ''), toasts[toasts.length - 1])
+  const tVerdict = () => ((tWin.down('#cloudTestResult').items.getAt(0) || {}).html || '')
+  ok('cloud(toolbar test): the verdict sentence lands in the window',
+    /Reachable/.test(tVerdict()), tVerdict())
+  ok('cloud(toolbar test): with the answer in, the Cancel is hidden again (busy cleared)',
+    findCmp(tWin, 'anas-btn-cloud-test-cancel').hidden === true)
+  tWin.close()
 
-  // A toast is HTML: rclone's own message goes through ANAS.enc, exactly as
-  // the in-dialog verdict does (renderCloudTestResult).
+  // The verdict area is HTML: rclone's own message goes through ANAS.enc,
+  // exactly as the in-dialog verdict does (renderCloudTestResult).
   testReply = { verdict: 'auth', message: '<b>ssh: handshake failed</b>' }
   cloudAnas.enc = v => `ENC(${String(v == null ? '' : v)})`
   gridTestBtn.handler(gridTestBtn)
   await settle()
   cloudAnas.enc = realEnc
-  // cr.11: ANAS.toast encodes its body (proved against the real 00-core.js in
-  // alert-encoding.harness.mjs), so the caller hands it the RAW sentence —
-  // encoding here too would show `&lt;` to the operator.
-  eq('cloud(toolbar test): the whole verdict sentence, daemon message included, reaches ANAS.toast raw (it encodes)',
-    toasts[toasts.length - 1],
-    'Authentication failed \u2014 <b>ssh: handshake failed</b>')
+  tWin = openWindow()
+  ok('cloud(toolbar test): the whole verdict sentence, daemon message included, is encoded into the window',
+    tVerdict().indexOf('ENC(Authentication failed \u2014 <b>ssh: handshake failed</b>)') >= 0, tVerdict())
+  tWin.close()
   testReply = { verdict: 'ok', message: '' }
 
   // --- (c) Add dialog: the live gate, then the create body -----------------
@@ -12648,7 +12685,7 @@ async function cloudTaskChecks() {
       && /Would transfer 0 files \/ 0 B/.test(pLine().html),
     pLine() && pLine().html)
   ok('cloud preview: a truncated preview says what a partial answer is',
-    /stopped after 12 s — the counts are what rclone had reported by then, the list is everything it logged; the full run will do the rest/
+    /stopped at the preview's time limit — the counts are what rclone had reported by then, the list is everything it logged; the full run will do the rest/
       .test(pLine().html), pLine() && pLine().html)
 
   // rclone's own first error line IS the summary — the counters lead is
@@ -13130,6 +13167,418 @@ function dashboardCancelledStripChecks() {
 warnings.length = 0
 created.windows.length = 0
 await cloudTaskChecks()
+
+// ============================================================================
+//  cr.48 — the three slow reads as cancellable READ jobs, in every dialog
+// ============================================================================
+//
+// The daemon answers 202 + a `read.*` job; the REAL ANAS.readJob (10-api.js,
+// bound to the harness ANAS) starts the poll, which the harness records in
+// `polls` and ends by hand. Every home — the toolbar Test window, the remote
+// dialog's Test, the wizard's Preview, the toolbar Preview window and the
+// archive picker — is driven through the same five outcomes:
+//
+//   progress  — the waiting line, the Cancel shown and live, the start button held;
+//   cancel    — the Cancel posts to the ONE cancel door (no confirm: a read),
+//               greys itself, and the cancelled job's line clears the busy state;
+//   completed — job.result rendered, busy cleared, Cancel hidden;
+//   failed    — the job's own message, ENCODED, inline (no modal), busy cleared;
+//   lost      — the "no longer knows" sentence inline (no modal), busy cleared.
+//
+// Plus: closing a window while its read runs posts the cancel (quietly).
+
+/** A read job's 202 body. */
+function readAccepted(id, operation) {
+  return { job: { id, status: 'running', operation, createdAt: '2026-10-15T10:00:00.000Z', createdBy: 'root@pam' } }
+}
+
+/** The ENC(...) marker, to prove a message went through ANAS.enc. */
+const encMarker = v => `ENC(${String(v == null ? '' : v)})`
+
+async function readJobDialogChecks() {
+  let seq = 0
+  /** Every POST to a job's cancel door: the job id. */
+  const cancels = []
+  /** The routes every home shares: each read answers with a fresh job id. */
+  function readRoutes(base, path, operation) {
+    const routes = { ...base }
+    routes[`POST ${path}`] = () => readAccepted(`rj-${++seq}`, operation)
+    return routes
+  }
+  function withCancelDoor(routes) {
+    return new Proxy(routes, {
+      has(target, key) { return key in target || /^POST \/jobs\/[^/]+\/cancel$/.test(String(key)) },
+      get(target, key) {
+        if (key in target) { return target[key] }
+        const m = /^POST \/jobs\/([^/]+)\/cancel$/.exec(String(key))
+        if (m) { return () => { cancels.push(m[1]); return { job: { id: `cancel-${m[1]}`, operation: 'job.cancel' } } } }
+        return undefined
+      },
+    })
+  }
+  const lastPoll = () => polls[polls.length - 1]
+
+  /**
+   * Run the five outcomes against one home. `h`:
+   *   label, anas, start() → the window, area(win) → html,
+   *   cancelBtn(win), busy(win) → true while the read runs (start held),
+   *   result (the job.result to complete with), resultRe (what it renders to),
+   *   progress? ({ text, re }) — a home that shows the job's progress line.
+   */
+  async function drive(h) {
+    const L = h.label
+    // --- progress ------------------------------------------------------------
+    let win = await h.start()
+    let poll = lastPoll()
+    ok(`${L}: the read was accepted as a job and is being polled`, !!poll && /^rj-\d+$/.test(poll.id), poll && poll.id)
+    ok(`${L}: the poll shows its outcome INLINE (alerts: false)`, poll && poll.opts.alerts === false)
+    ok(`${L}: progress — the waiting line is up`, /fa-spin/.test(h.area(win)), h.area(win))
+    ok(`${L}: progress — the Cancel is shown and live`, h.cancelBtn(win).hidden === false && h.cancelBtn(win).disabled === false)
+    ok(`${L}: progress — the start button is held while the read runs`, h.busy(win) === true)
+    if (h.progress) {
+      poll.opts.onRunning({ id: poll.id, status: 'running', progress: h.progress.text })
+      ok(`${L}: progress — the job's own progress line rides the waiting line`, h.progress.re.test(h.area(win)), h.area(win))
+    }
+    // --- completed -----------------------------------------------------------
+    poll.opts.onComplete({ id: poll.id, status: 'completed', result: h.result })
+    await settle()
+    ok(`${L}: completed — job.result is rendered`, h.resultRe.test(h.area(win)), h.area(win))
+    ok(`${L}: completed — busy cleared, Cancel hidden`, h.busy(win) === false && h.cancelBtn(win).hidden === true)
+    if (h.close) { h.close(win) }
+
+    // --- failed (the message encoded, no modal) --------------------------------
+    win = await h.start()
+    poll = lastPoll()
+    const alertsBefore = alerts.length
+    const realEnc = h.anas.enc
+    h.anas.enc = encMarker
+    poll.opts.onFailed({ id: poll.id, status: 'failed', error: { code: 'JOB_FAILED', message: '<b>rclone exploded</b>' } })
+    await settle()
+    h.anas.enc = realEnc
+    ok(`${L}: failed — the job's message is shown, through ANAS.enc`, h.area(win).indexOf('<b>rclone exploded</b>)') >= 0 && h.area(win).indexOf('ENC(') >= 0, h.area(win))
+    ok(`${L}: failed — no modal (the dialog says it inline)`, alerts.length === alertsBefore, JSON.stringify(alerts.slice(alertsBefore)))
+    ok(`${L}: failed — busy cleared, Cancel hidden`, h.busy(win) === false && h.cancelBtn(win).hidden === true)
+    if (h.close) { h.close(win) }
+
+    // --- lost ------------------------------------------------------------------
+    win = await h.start()
+    poll = lastPoll()
+    const lostErr = new Error('Not found')
+    lostErr.status = 404
+    poll.opts.onLost(lostErr)
+    await settle()
+    ok(`${L}: lost — the "no longer knows" sentence is shown`, /no longer knows this request/.test(h.area(win)), h.area(win))
+    ok(`${L}: lost — busy cleared, Cancel hidden`, h.busy(win) === false && h.cancelBtn(win).hidden === true)
+    if (h.close) { h.close(win) }
+
+    // --- cancel ----------------------------------------------------------------
+    win = await h.start()
+    poll = lastPoll()
+    cancels.length = 0
+    const btn = h.cancelBtn(win)
+    btn.handler(btn)
+    await settle()
+    eq(`${L}: cancel — the Cancel posts to the job's own cancel door`, cancels, [poll.id])
+    ok(`${L}: cancel — the Cancel greys itself while the cancel runs`, h.cancelBtn(win).disabled === true)
+    ok(`${L}: cancel — no confirm was asked (a read)`, true)
+    poll.opts.onCancelled({ id: poll.id, status: 'cancelled', result: { status: 'cancelled', reason: 'cancelled by root@pam at 2026-10-15T10:00:01.000Z' } })
+    await settle()
+    ok(`${L}: cancel — the cancelled line is shown`, /cancelled|stopped/i.test(h.area(win)), h.area(win))
+    ok(`${L}: cancel — busy cleared, Cancel hidden`, h.busy(win) === false && h.cancelBtn(win).hidden === true)
+    if (h.close) { h.close(win) }
+
+    // --- the window closes while the read runs ---------------------------------
+    if (h.closeWhileRunning) {
+      win = await h.start()
+      poll = lastPoll()
+      cancels.length = 0
+      h.closeWhileRunning(win)
+      await settle()
+      eq(`${L}: closing the window posts the cancel of the read it waits on`, cancels, [poll.id])
+    }
+  }
+
+  // ---- 1. the toolbar Test window -------------------------------------------
+  {
+    const routes = withCancelDoor(readRoutes(cloudRoutes(), '/cloud/remotes/test', 'read.cloud.remote.test'))
+    const { ANAS, win: mgr } = await openCloudRemotes(routes)
+    const grid = mgr.down('#cloudRemotesGrid')
+    grid.selectRow(0)
+    const area = w => ((w.down('#cloudTestResult').items.getAt(0) || {}).html || '')
+    await drive({
+      label: 'cr.48 toolbar Test',
+      anas: ANAS,
+      async start() {
+        const b = findCmp(mgr, 'anas-btn-cloud-remote-test')
+        b.handler(b)
+        await settle()
+        return openWindow()
+      },
+      area,
+      cancelBtn: w => findCmp(w, 'anas-btn-cloud-test-cancel'),
+      // The toolbar window has no Test button of its own: busy is the Cancel.
+      busy: w => findCmp(w, 'anas-btn-cloud-test-cancel').hidden === false,
+      result: { verdict: 'auth', message: 'ssh: unable to authenticate' },
+      resultRe: /Authentication failed — ssh: unable to authenticate/,
+      close: w => w.close(),
+      closeWhileRunning: (w) => { w.close(); w.fireEvent('destroy', w) },
+    })
+  }
+
+  // ---- 2. the remote dialog's Test ------------------------------------------
+  {
+    const routes = withCancelDoor(readRoutes(cloudRoutes(), '/cloud/remotes/test', 'read.cloud.remote.test'))
+    const { ANAS, win: mgr } = await openCloudRemotes(routes)
+    const grid = mgr.down('#cloudRemotesGrid')
+    grid.selectRow(0)
+    created.windows.length = 0
+    const edit = findCmp(mgr, 'anas-btn-cloud-remote-edit')
+    edit.handler(edit)
+    await settle()
+    const dlg = openWindow()
+    ok('cr.48 dialog Test: the edit dialog opened with its Test', !!dlg && !!dlg.down('#cloudTestBtn'))
+    const area = w => ((w.down('#cloudTestResult').items.getAt(0) || {}).html || '')
+    await drive({
+      label: 'cr.48 dialog Test',
+      anas: ANAS,
+      async start() {
+        dlg.down('#cloudTestBtn').handler()
+        await settle()
+        return dlg
+      },
+      area,
+      cancelBtn: w => findCmp(w, 'anas-btn-cloud-test-cancel'),
+      busy: w => w.down('#cloudTestBtn').disabled === true,
+      result: { verdict: 'ok', message: '' },
+      resultRe: /Reachable/,
+      closeWhileRunning: (w) => { w.close(); w.fireEvent('destroy', w) },
+    })
+  }
+
+  // ---- 3. the wizard's Preview ----------------------------------------------
+  {
+    const routes = withCancelDoor(readRoutes(cloudTaskRoutes(), '/cloud/tasks/preview', 'read.cloud.preview'))
+    const ANAS = loadSources(['10-api.js', '12-picker.js', '69-schedules-common.js', '72-cloud.js'], routes)
+    const view = makeComponent(ANAS.views.cloud.factory('harness'), null)
+    view.fireEvent('afterrender', view)
+    await settle()
+    created.windows.length = 0
+    const create = findCmp(view, 'anas-btn-cloud-task-create')
+    create.handler(create)
+    await settle()
+    const wiz = openWindow()
+    wiz.down('#cloudSource').setValue('/mnt/pictures')
+    wiz.down('#cloudRemote').setValue('gt')
+    await settle()
+    const line = w => (w.down('#cloudPreviewLine').html || '')
+    await drive({
+      label: 'cr.48 wizard Preview',
+      anas: ANAS,
+      async start() {
+        findCmp(wiz, 'anas-btn-cloud-task-preview').handler()
+        await settle()
+        return wiz
+      },
+      area: line,
+      cancelBtn: w => findCmp(w, 'anas-btn-cloud-preview-cancel'),
+      busy: w => findCmp(w, 'anas-btn-cloud-task-preview').disabled === true,
+      progress: { text: '41 checked, 2 to transfer (358400 bytes), 1 to delete', re: /asking the server… 41 checked, 2 to transfer \(358400 bytes\), 1 to delete/ },
+      result: CLOUD_PREVIEW,
+      resultRe: /delete 1 file at the destination/,
+      closeWhileRunning: (w) => { w.close(); w.fireEvent('destroy', w) },
+    })
+
+    // A field change while a preview runs withdraws the question: the job
+    // computing the stale answer is cancelled, and nothing is painted.
+    const wiz2Routes = withCancelDoor(readRoutes(cloudTaskRoutes(), '/cloud/tasks/preview', 'read.cloud.preview'))
+    const A2 = loadSources(['10-api.js', '12-picker.js', '69-schedules-common.js', '72-cloud.js'], wiz2Routes)
+    const v2 = makeComponent(A2.views.cloud.factory('harness'), null)
+    v2.fireEvent('afterrender', v2)
+    await settle()
+    created.windows.length = 0
+    const c2 = findCmp(v2, 'anas-btn-cloud-task-create')
+    c2.handler(c2)
+    await settle()
+    const w2 = openWindow()
+    w2.down('#cloudSource').setValue('/mnt/pictures')
+    w2.down('#cloudRemote').setValue('gt')
+    await settle()
+    findCmp(w2, 'anas-btn-cloud-task-preview').handler()
+    await settle()
+    const p2 = lastPoll()
+    cancels.length = 0
+    w2.down('#cloudSource').setValue('/mnt/other')
+    await settle()
+    eq('cr.48 wizard Preview: a field change cancels the job computing the withdrawn answer', cancels, [p2.id])
+    p2.opts.onCancelled({ id: p2.id, status: 'cancelled' })
+    await settle()
+    ok('cr.48 wizard Preview: …and paints nothing for it (the line stays cleared)', line(w2) === '', line(w2))
+    ok('cr.48 wizard Preview: …and its Cancel is hidden again', findCmp(w2, 'anas-btn-cloud-preview-cancel').hidden === true)
+  }
+
+  // ---- 4. the toolbar Preview window ----------------------------------------
+  {
+    const routes = withCancelDoor(readRoutes(cloudTaskRoutes(), '/cloud/tasks/preview', 'read.cloud.preview'))
+    const ANAS = loadSources(['10-api.js', '12-picker.js', '69-schedules-common.js', '72-cloud.js'], routes)
+    const view = makeComponent(ANAS.views.cloud.factory('harness'), null)
+    view.fireEvent('afterrender', view)
+    await settle()
+    const tGrid = view.down('#cloudTasksGrid')
+    tGrid.selectRow(0)
+    const tbBtn = tGrid.down('#cloudTaskPreview')
+    const line = w => (w.down('#cloudPreviewLine').html || '')
+    await drive({
+      label: 'cr.48 toolbar Preview',
+      anas: ANAS,
+      async start() {
+        created.windows.length = 0
+        tbBtn.handler(tbBtn)
+        await settle()
+        return openWindow()
+      },
+      area: line,
+      cancelBtn: w => findCmp(w, 'anas-btn-cloud-preview-cancel'),
+      busy: () => tbBtn.disabled === true,
+      progress: { text: '7 checked, 0 to transfer (0 bytes), 0 to delete', re: /7 checked, 0 to transfer/ },
+      result: CLOUD_PREVIEW,
+      resultRe: /Would transfer 2 files/,
+      close: w => w.close(),
+      closeWhileRunning: (w) => { w.close(); w.fireEvent('destroy', w) },
+    })
+    ok('cr.48 toolbar Preview: closing the window mid-read hands the toolbar button back', tbBtn.disabled === false)
+  }
+
+  // ---- 5. the archive picker (the file-restore picker's backend) ------------
+  {
+    const routes = withCancelDoor(readRoutes({}, '/backup/restore/browse', 'read.backup.catalog'))
+    const ANAS = loadSources(['10-api.js', '12-picker.js'], routes)
+    const pickCfg = {
+      node: 'harness',
+      backend: 'archive',
+      mode: 'any',
+      archive: { repo: 'pbs-main', snapshot: 'host/pictures/2026-08-25T19:16:45Z', archive: 'data.pxar' },
+    }
+    // The picker's "area" is its note line and the tree it fills; busy is
+    // the tree's loading mask with the Stop beside it.
+    const note = w => (w.down('#pickerNote').html || '')
+    const tree = w => w.down('#pickerTree')
+    await drive({
+      label: 'cr.48 archive picker',
+      anas: ANAS,
+      async start() {
+        created.windows.length = 0
+        const w = ANAS.pathPicker(pickCfg)
+        await settle()
+        return w
+      },
+      // While it waits the tree carries the mask (the waiting "line"); after,
+      // the note says what happened and the tree holds the rows.
+      area: w => (tree(w).loadingMsg === true ? 'fa-spin (mask)' : '') + note(w)
+        + tree(w).getRootNode().childNodes.map(n => n.get('name')).join(','),
+      cancelBtn: w => findCmp(w, 'anas-btn-picker-stop'),
+      busy: w => tree(w).loadingMsg === true,
+      result: ARCHIVE_TREE['/'],
+      resultRe: /docs,alpha\.txt,hard-a\.txt,hard-b\.txt,link-to-alpha/,
+      close: w => w.close(),
+      closeWhileRunning: (w) => { w.close(); w.fireEvent('destroy', w) },
+    })
+
+    // A non-ok VERDICT in a completed job is the daemon's detail, flagged.
+    const w = ANAS.pathPicker(pickCfg)
+    await settle()
+    const p = lastPoll()
+    p.opts.onComplete({ id: p.id, status: 'completed', result: { verdict: 'unreachable', detail: 'The Proxmox Backup Server did not answer in time - the request was cancelled.' } })
+    await settle()
+    ok('cr.48 archive picker: a non-ok verdict in the job result is the daemon\'s detail in the note',
+      /did not answer in time/.test(note(w)) && tree(w).loadingMsg === false, note(w))
+
+    // Navigating while a level loads stops the superseded listing.
+    const w3 = ANAS.pathPicker(pickCfg)
+    await settle()
+    const first = lastPoll()
+    cancels.length = 0
+    const up = findCmp(w3, 'anas-btn-picker-up')
+    up.handler(up)
+    await settle()
+    eq('cr.48 archive picker: a new navigation cancels the listing it supersedes', cancels, [first.id])
+  }
+
+  // ---- a QUEUED read: the cancel is asked again once it runs ----------------
+  {
+    let calls = 0
+    const routes = readRoutes(cloudRoutes(), '/cloud/remotes/test', 'read.cloud.remote.test')
+    const proxied = new Proxy(routes, {
+      has(target, key) { return key in target || /\/cancel$/.test(String(key)) },
+      get(target, key) {
+        if (key in target) { return target[key] }
+        if (/\/cancel$/.test(String(key))) {
+          return () => {
+            calls++
+            if (calls === 1) {
+              const e = new Error('queued')
+              e.status = 409
+              e.body = { error: { code: 'NOT_CANCELLABLE', message: 'queued' } }
+              return Promise.reject(e)
+            }
+            return { job: { id: 'cancel-ok' } }
+          }
+        }
+        return undefined
+      },
+    })
+    const { win: mgr } = await openCloudRemotes(proxied)
+    mgr.down('#cloudRemotesGrid').selectRow(0)
+    const b = findCmp(mgr, 'anas-btn-cloud-remote-test')
+    b.handler(b)
+    await settle()
+    const w = openWindow()
+    const p = lastPoll()
+    const c = findCmp(w, 'anas-btn-cloud-test-cancel')
+    c.handler(c)
+    await settle()
+    eq('cr.48 queued read: the first cancel is refused (the job has not started)', calls, 1)
+    p.opts.onRunning({ id: p.id, status: 'queued' })
+    await settle()
+    eq('cr.48 queued read: still queued — not asked again yet', calls, 1)
+    p.opts.onRunning({ id: p.id, status: 'running' })
+    await settle()
+    eq('cr.48 queued read: the first poll that finds it running asks again', calls, 2)
+    ok('cr.48 queued read: the Cancel stays greyed (the cancel is under way)', c.disabled === true)
+  }
+
+  // ---- a daemon that refuses the cancel: said, and the Cancel comes back ----
+  {
+    const routes = readRoutes(cloudRoutes(), '/cloud/remotes/test', 'read.cloud.remote.test')
+    const proxied = new Proxy(routes, {
+      has(target, key) { return key in target || /\/cancel$/.test(String(key)) },
+      get(target, key) {
+        if (key in target) { return target[key] }
+        if (/\/cancel$/.test(String(key))) {
+          const e = new Error('the read could not be stopped: it is stuck in the kernel')
+          e.status = 500
+          return e
+        }
+        return undefined
+      },
+    })
+    const { win: mgr } = await openCloudRemotes(proxied)
+    mgr.down('#cloudRemotesGrid').selectRow(0)
+    const b = findCmp(mgr, 'anas-btn-cloud-remote-test')
+    b.handler(b)
+    await settle()
+    const w = openWindow()
+    const c = findCmp(w, 'anas-btn-cloud-test-cancel')
+    const before = warnings.length
+    c.handler(c)
+    await settle()
+    ok('cr.48 cancel refused: the reason is said (Cancel failed)',
+      warnings.slice(before).some(m => /alert: Cancel failed: the read could not be stopped/.test(m)), warnings.slice(before).join(' | '))
+    ok('cr.48 cancel refused: the Cancel is live again', c.disabled === false && c.hidden === false)
+  }
+}
+
+await readJobDialogChecks()
+
 
 warnings.length = 0
 created.windows.length = 0

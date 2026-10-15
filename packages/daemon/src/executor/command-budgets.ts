@@ -36,7 +36,11 @@ import { currentLane, parseTimeoutWrapper } from './deadline.js'
  * a child stuck in the kernel only settles after KILL_GRACE_MS more, so every
  * request-path row satisfies budget + TERM_GRACE_MS + KILL_GRACE_MS < 20 s —
  * at most 12 s here, so even the worst settlement (19 s) beats the gateway
- * (one test pins the arithmetic for every row and every Q3 wrapper). The two
+ * (one test pins the arithmetic for every row and every request-path
+ * `timeout` wrapper). The three slow interactive reads (the cloud preview,
+ * the rclone remote Test, the catalog listing) are not on the request path
+ * since cr.48: they are read JOBS under wrappers of minutes, and the same
+ * test file pins those ceilings as their job-lane budgets. The two
  * display waits stay inside it too: the `dashboard.ts` section budget (12 s —
  * it still ends the section first, because a row deadline only becomes an
  * error after the child stops) and the `DiskIdentityCache.loadMany` wait (8 s).
@@ -90,7 +94,8 @@ export const COMMAND_BUDGETS: readonly CommandBudget[] = Object.freeze([
   // `ssh-keyscan -T 10` bounds each connection; the executor sits above it.
   { id: 'ssh-keyscan', budgetMs: 12_000, allLanes: true, matches: c => c === SSH_KEYSCAN_BIN },
   // Snapshot/group listings and the repo probe talk to the PBS server. (The
-  // catalog shell has its own `timeout` wrapper, which wins.)
+  // catalog shell has its own `timeout` wrapper, which wins: 300 s for the
+  // listing job, 12 s for the restore pre-flight — cr.48.)
   { id: 'proxmox-backup-client', budgetMs: 12_000, matches: c => c === PBC_BIN },
   // On the request path `zpool import` is always the device SCAN (the import
   // itself is a job). 145 ms on 6 disks (P01), scales with disk count.

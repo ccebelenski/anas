@@ -124,6 +124,16 @@ async function postRemoteTest(
     data: { remote: { name: 'gtdraft', type: 'drive', options } },
   })
   const body = await res.json().catch(() => ({}))
+  // cr.48: an accepted Test is a READ job — its verdict is the job's result;
+  // the 200 the callers assert on stands for "accepted and answered".
+  if (res.status() === 202) {
+    const job = await awaitJob(ctx, body.job.id, 150_000)
+    return {
+      status: job.status === 'completed' ? 200 : 500,
+      message: job.result?.message ?? (job.error as { message?: string } | undefined)?.message,
+      verdict: job.result?.verdict,
+    }
+  }
   return {
     status: res.status(),
     message: body?.data?.message ?? body?.error?.message,

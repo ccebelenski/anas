@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify'
 import type { CancelMeta, JobQueue } from '../jobs/queue.js'
 import { JobStatus } from '@anas/shared'
 import { cancelRefusalMessage } from '../jobs/queue.js'
+import { isReadOnlyOperation } from '../jobs/read-jobs.js'
 import { ConfirmStore } from '../safety/confirm.js'
 import { confirmGate } from '../safety/gate.js'
 import { requireIdentity } from './identity.js'
@@ -112,6 +113,12 @@ export async function jobRoutes(
    * limit): it would otherwise queue behind the very run it is meant to stop.
    * It fails with the hook's reason when the run could not be stopped — and
    * the run then continues.
+   *
+   * A job that only READS (cr.48 — the cloud preview, the remote Test, the
+   * catalog listing; `isReadOnlyOperation`) is cancelled WITHOUT the confirm:
+   * stopping a read loses nothing, the operator pressed Cancel in the very
+   * dialog that is waiting on it, and a confirm there would be ceremony. The
+   * refusals above (not running, not cancellable) still apply to it.
    */
   server.post<{
     Params: { id: string }
@@ -138,7 +145,7 @@ export async function jobRoutes(
 
     const headline = cancelHeadline(target.job, target.meta)
     const warnings = [headline, ...(target.meta.consequence ? [target.meta.consequence] : [])]
-    if (!confirmGate(confirmStore, request, reply, {
+    if (!isReadOnlyOperation(target.job.operation) && !confirmGate(confirmStore, request, reply, {
       operation: 'job.cancel',
       params: { id },
       message: headline,

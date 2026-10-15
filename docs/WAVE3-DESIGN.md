@@ -658,8 +658,8 @@ boot/background.
 | `ip -j addr`, `pve-firewall status` | R | — | read | lane default |
 | `rclone version/config providers/config dump/obscure` | R, J | — | read | lane default |
 | `rclone sync/copy` (run) | J | — | data mover | `null`; supervised by its cancel hook (no SIGKILL by contract, `jobs/child-cancel.ts:11-17`) |
-| `rclone lsjson` probe, `rclone --dry-run` preview | R | — | network | `timeout 12` each (lowered at the cr.35 merge; see `command-budgets.ts`), rclone's own `--timeout 9s` / `--contimeout 10s` inside, executor +5 s; both should become jobs (gap 4, Q3) |
-| `proxmox-backup-client` reads (snapshots, groups, repo probe) | R | — | network | 12 s (lowered at the cr.35 merge; see `command-budgets.ts`); `catalog shell` wraps its own `timeout 12` → a job (Q3) |
+| `rclone lsjson` probe, `rclone --dry-run` preview | R | — | network | `timeout 12` each (lowered at the cr.35 merge; see `command-budgets.ts`), rclone's own `--timeout 9s` / `--contimeout 10s` inside, executor +5 s; both should become jobs (gap 4, Q3) — **done in cr.48: read jobs, `timeout 120` / `timeout 600`** |
+| `proxmox-backup-client` reads (snapshots, groups, repo probe) | R | — | network | 12 s (lowered at the cr.35 merge; see `command-budgets.ts`); `catalog shell` wraps its own `timeout 12` → a job (Q3) — **done in cr.48: the listing is a read job under `timeout 300`; the restore pre-flight's session stays 12 s** |
 | `prlimit -- proxmox-backup-client backup`, pbc file and image restores | J | — | data mover | `null`; backup has its cancel hook; `execToStream` ignores `onSpawn` today (`prod.ts` calls `announceSpawn` only at `:174, 220`), so image restores cannot be cancelled — fixed in cr.34 so the hook exists |
 | `perl -e 'use PVE::Notify; …'` | J, B | — | sends mail through PVE | 60 s; best-effort by contract, a timeout is a warning |
 | `dd`, `dd | base64`, `sync` (self-heal block I/O) | J | — | one block | job default |
@@ -873,6 +873,9 @@ cleanup destroy re-prompt); cr.45 and cr.46 independent.
    accept "timed out" on slow remotes. Note for cr.28: a job requires `Sys.Modify`, so a read that is a
    GET today (the catalog listing) would need `Sys.Modify` as a job, or the queue rule would need a
    read-job exemption.
+   **Ruled 2026-10-15: jobs.** Built as cr.48 — each is a cancellable READ job (operation prefix `read.`,
+   `jobs/read-jobs.ts`) with a ceiling of minutes (preview 600 s, remote test 120 s, catalog listing 300 s);
+   a read job is cancelled without a confirm, and cr.28 admits it on `Sys.Audit`.
 4. **Mounts: the unmount reference check the ruling describes does not exist.** Build it as cr.24 does for
    pools (name each share, export and task riding the path in the confirm; never refuse), or refuse while
    a share rides the path? Recommendation: warn, as for pools (one failure-mode rule for both).

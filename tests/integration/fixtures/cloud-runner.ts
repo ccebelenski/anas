@@ -132,9 +132,16 @@ export async function probeRemote(
   const body = p.name !== undefined
     ? { name: p.name }
     : { remote: { name: 'gtdraft', type: p.type, options: p.options } }
+  // cr.48: a READ job — a refusal at the door is still its 4xx; a probe's
+  // verdict is the job's result (a failed job carries its message).
   const res = await ctx.post(`${V1}/cloud/remotes/test`, { data: body })
   const json = await res.json().catch(() => ({}))
-  return { status: res.status(), verdict: json?.data?.verdict, message: json?.data?.message }
+  if (res.status() !== 202)
+    return { status: res.status(), message: json?.error?.message }
+  const job = await awaitJob(ctx, json.job.id, 150_000)
+  if (job.status !== 'completed')
+    return { status: 500, message: (job.error as { message?: string } | undefined)?.message ?? job.status }
+  return { status: 200, verdict: job.result?.verdict, message: job.result?.message }
 }
 
 async function createRemote(ctx: APIRequestContext, r: CloudRemoteCase): Promise<void> {

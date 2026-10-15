@@ -42,9 +42,22 @@ export class ChildUnsignallableError extends Error {
 }
 
 export interface ChildCancelOptions {
-  /** Per-signal wait (default {@link CANCEL_SIGNAL_WAIT_MS}); tests shorten it. */
+  /** Per-signal wait (default {@link CANCEL_SIGNAL_WAIT_MS}, or {@link READ_CANCEL_WAIT_MS} for a read); tests shorten it. */
   waitMs?: number
+  /**
+   * Which stop the hook runs (cr.48). `run` (the default) is the SIGINT ladder
+   * a data mover needs — {@link stopChild}. `read` is for a job that only
+   * READS (the cloud preview, the remote test, the catalog listing): there is
+   * nothing a stopped read leaves half-done, so it stops the child's whole
+   * process group with SIGTERM, then SIGKILL — {@link stopReadChild} — and a
+   * cancel that arrives between two children is accepted at once (the body's
+   * next boundary or next spawn ends the read).
+   */
+  ladder?: 'run' | 'read'
 }
+
+/** How long each step of a READ's stop waits (cr.48): SIGTERM, then SIGKILL, to the group. */
+export const READ_CANCEL_WAIT_MS = 2_000
 
 /** Resolve true when `exit` settles within `ms`, false on the timeout. */
 async function exitedWithin(exit: Promise<void>, ms: number): Promise<boolean> {
@@ -82,6 +95,36 @@ export async function stopChild(child: SpawnedChild, label: string, opts: ChildC
     return
   throw new Error(
     `${label} (pid ${child.pid}) did not stop after two SIGINTs ${seconds} s apart — the run continues`,
+  )
+}
+
+/**
+ * Stop a READ's child (cr.48): SIGTERM to its whole process group — the tool
+ * under the `timeout` wrapper is in it — wait up to {@link READ_CANCEL_WAIT_MS};
+ * still alive → SIGKILL to the group, wait again; still alive → throw (a child
+ * stuck in the kernel: the read ends when it does, and the cancel says so).
+ *
+ * A child that has ALREADY exited is not signalled at all, and the stop
+ * succeeds: the read between two children (the catalog's `ls` and `stat`
+ * invocations) is stopped at its next boundary instead. A group whose leader
+ * is gone is never addressed — its id could by then lead somebody else's
+ * group.
+ */
+export async function stopReadChild(child: SpawnedChild, label: string, opts: ChildCancelOptions = {}): Promise<void> {
+  const waitMs = opts.waitMs ?? READ_CANCEL_WAIT_MS
+  const signal = (sig: NodeJS.Signals): boolean => (child.killGroup ? child.killGroup(sig) : child.kill(sig))
+  if (child.exited())
+    return
+  signal('SIGTERM')
+  if (await exitedWithin(child.exit, waitMs))
+    return
+  if (!child.exited())
+    signal('SIGKILL')
+  if (await exitedWithin(child.exit, waitMs))
+    return
+  throw new Error(
+    `${label} (pid ${child.pid}) did not stop after SIGTERM and SIGKILL to its process group — `
+    + 'it is stuck in the kernel; the read ends when it does',
   )
 }
 
@@ -161,6 +204,12 @@ export class ChildCancel {
   private async stop(): Promise<void> {
     if (!this.child)
       return
+    if (this.opts.ladder === 'read') {
+      // A read: nothing to lose, so no SIGINT courtesy and no "run continues".
+      await stopReadChild(this.child, this.label, this.opts)
+      this.delivered = true
+      return
+    }
     try {
       await stopChild(this.child, this.label, this.opts)
       this.delivered = true

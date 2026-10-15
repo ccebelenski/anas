@@ -20,7 +20,7 @@ import { RCLONE } from '../rclone-config.js'
 /**
  * The dry-run PREVIEW (rclone.2 addendum): the parser over the CAPTURED
  * 1.60.1 `--dry-run` logs (stunt node, sftp to the node's own sshd), the
- * delete-name cap, the 12 s ceiling, the argv (one builder, `--dry-run`,
+ * delete-name cap, the ceiling (truncated), the argv (one builder, `--dry-run`,
  * the secret backstop, no snapshot) and the guards (the unmounted mount
  * refuses, the empty source does NOT — that is what the preview is for).
  *

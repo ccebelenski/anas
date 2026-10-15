@@ -55,11 +55,27 @@ async function waitForJob(server: ReturnType<typeof createServer>, id: string, a
   for (let i = 0; i < attempts; i++) {
     const res = await server.inject({ method: 'GET', url: `/v1/jobs/${id}`, headers: IDENTITY })
     const { job } = res.json() as { job: Job }
-    if (job.status === 'completed' || job.status === 'failed')
+    if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled')
       return job
     await new Promise(r => setTimeout(r, 10))
   }
   throw new Error(`Job ${id} did not finish`)
+}
+
+/** Preview result fields the route tests read. */
+interface PreviewData { transfers: number, bytes: number, checks: number, deletes: number, deletedFiles: string[], deletedTotal: number, errors: string[], truncated: boolean }
+
+/**
+ * cr.48 — POST a preview: 202 + a READ job (`read.cloud.preview`), waited
+ * for. Answers the settled job; `data` is its result.
+ */
+async function previewJob(server: ReturnType<typeof createServer>, payload: Record<string, unknown>): Promise<{ job: Job, data: PreviewData }> {
+  const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/preview', headers: JSON_HEADERS, payload })
+  assert.equal(res.statusCode, 202, res.body)
+  const accepted = (res.json() as JobAccepted).job
+  assert.equal(accepted.operation, 'read.cloud.preview')
+  const job = await waitForJob(server, accepted.id)
+  return { job, data: job.result as PreviewData }
 }
 
 function taskBody(over: Record<string, unknown> = {}) {
@@ -664,13 +680,13 @@ describe('cloud sync task routes (rclone.2)', () => {
       })
     }
 
-    it('previews a SAVED task by name and lists its would-be deletes — no job, 200', async () => {
+    it('previews a SAVED task by name and lists its would-be deletes — a READ job (cr.48), the counters in its result', async () => {
       await createTask({ source: srcDir })
       await replayDryRun(DRY_RUN_DELETE_LOG)
 
-      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/preview', headers: JSON_HEADERS, payload: { name: 'offsite' } })
-      assert.equal(res.statusCode, 200, res.body)
-      const body = res.json() as { data: { transfers: number, bytes: number, checks: number, deletes: number, deletedFiles: string[], deletedTotal: number, errors: string[], truncated: boolean }, job?: unknown }
+      const { job, data } = await previewJob(server, { name: 'offsite' })
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const body = { data }
       // The counters are rclone's final stats object from the captured log.
       assert.deepEqual(
         { transfers: body.data.transfers, bytes: body.data.bytes, checks: body.data.checks, deletes: body.data.deletes },
@@ -680,20 +696,13 @@ describe('cloud sync task routes (rclone.2)', () => {
       assert.equal(body.data.deletedTotal, 1)
       assert.deepEqual(body.data.errors, [])
       assert.equal(body.data.truncated, false)
-      assert.equal(body.job, undefined, 'a preview is a read: it answers 200, never a 202 job')
     })
 
     it('previews the INLINE form and issues the run\'s own argv plus --dry-run', async () => {
       await replayDryRun(DRY_RUN_DELETE_LOG)
 
-      const res = await server.inject({
-        method: 'POST',
-        url: '/v1/cloud/tasks/preview',
-        headers: JSON_HEADERS,
-        payload: { source: srcDir, remote: 'gt', path: 'dst/preview', mode: 'sync' },
-      })
-      assert.equal(res.statusCode, 200, res.body)
-      assert.deepEqual((res.json() as { data: { deletedFiles: string[] } }).data.deletedFiles, ['b.bin'])
+      const { data } = await previewJob(server, { source: srcDir, remote: 'gt', path: 'dst/preview', mode: 'sync' })
+      assert.deepEqual(data.deletedFiles, ['b.bin'])
 
       // The argv is the run's command, the live source, --dry-run.
       const call = mockOf(server).calls.find(c => isRcloneOrScan(c))
@@ -781,13 +790,7 @@ describe('cloud sync task routes (rclone.2)', () => {
       await createTask({ source: srcDir, path: 'dst/saved' })
       await replayDryRun(DRY_RUN_DELETE_LOG)
 
-      const res = await server.inject({
-        method: 'POST',
-        url: '/v1/cloud/tasks/preview',
-        headers: JSON_HEADERS,
-        payload: { name: 'offsite', source: srcDir, remote: 'gt', path: 'dst/inline', mode: 'sync' },
-      })
-      assert.equal(res.statusCode, 200, res.body)
+      assert.equal((await previewJob(server, { name: 'offsite', source: srcDir, remote: 'gt', path: 'dst/inline', mode: 'sync' })).job.status, 'completed')
       const call = mockOf(server).calls.find(c => isRcloneOrScan(c))
       assert.ok(call, 'the dry run was issued')
       assert.deepEqual(call!.args.slice(2, 5), ['sync', srcDir, 'gt:dst/inline'], 'the INLINE destination and mode, not the saved task\'s')
@@ -795,16 +798,11 @@ describe('cloud sync task routes (rclone.2)', () => {
       // And a name that is NOT saved rides along with an inline form just the
       // same — the inline arm never touches the store, so there is no 404.
       await replayDryRun(DRY_RUN_DELETE_LOG)
-      const unsaved = await server.inject({
-        method: 'POST',
-        url: '/v1/cloud/tasks/preview',
-        headers: JSON_HEADERS,
-        payload: { name: 'nosuch', source: srcDir, remote: 'gt', path: 'dst/inline', mode: 'copy' },
-      })
-      assert.equal(unsaved.statusCode, 200, unsaved.body)
+      const unsaved = await previewJob(server, { name: 'nosuch', source: srcDir, remote: 'gt', path: 'dst/inline', mode: 'copy' })
+      assert.equal(unsaved.job.status, 'completed')
     })
 
-    it('an INTERNAL fault inside the preview is a 500, not a 400 dressed up as the operator\'s mistake', async () => {
+    it('an INTERNAL fault inside the dry run FAILS the read job with its own message — never a 400 dressed up as the operator\'s mistake', async () => {
       // Only the typed guard refusal is the operator's to fix. A broken
       // executor answered 400 would send them looking at their own input.
       const mock = mockOf(server)
@@ -815,14 +813,10 @@ describe('cloud sync task routes (rclone.2)', () => {
         return orig(cmd, args, opts)
       }
 
-      const res = await server.inject({
-        method: 'POST',
-        url: '/v1/cloud/tasks/preview',
-        headers: JSON_HEADERS,
-        payload: { source: srcDir, remote: 'gt' },
-      })
-      assert.equal(res.statusCode, 500, res.body)
-      assert.notEqual((res.json() as { error?: { code?: string } }).error?.code, 'VALIDATION_ERROR')
+      const { job } = await previewJob(server, { source: srcDir, remote: 'gt' })
+      assert.equal(job.status, 'failed')
+      assert.equal(job.error?.code, 'JOB_FAILED')
+      assert.equal(job.error?.message, 'boom')
     })
   })
 })

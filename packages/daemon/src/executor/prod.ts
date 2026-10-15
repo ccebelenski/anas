@@ -58,9 +58,23 @@ export function announceSpawn(child: ChildProcess, onSpawn: ((child: SpawnedChil
     child.once('exit', done)
     child.once('error', done)
   })
+  const pgid = child.pid
   onSpawn({
     pid: child.pid,
     kill: signal => (gone ? false : child.kill(signal)),
+    // The child was spawned `detached`, so it leads a group whose id is its
+    // pid. Addressed even after the leader exited: a member it left behind is
+    // still in the group (cr.48).
+    killGroup: (signal) => {
+      try {
+        process.kill(-pgid, signal)
+        return true
+      }
+      catch {
+        // ESRCH: nothing of the group is left to signal.
+        return false
+      }
+    },
     exited: () => gone,
     exit,
   })

@@ -12,7 +12,7 @@ import { formatBudget, KILL_GRACE_MS, LANE_BUDGET_MS, runInLane, TERM_GRACE_MS, 
 import { MockExecutor as Mock } from '../executor/mock.js'
 import { zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { createServer } from '../server.js'
-import { buildCatalogShellArgs, CATALOG_SHELL_TIMEOUT_S } from '../services/backup-catalog.js'
+import { buildCatalogShellArgs, CATALOG_PREFLIGHT_TIMEOUT_S, CATALOG_SHELL_TIMEOUT_S } from '../services/backup-catalog.js'
 import { buildSnapshotListArgs } from '../services/backup-reads.js'
 import { PBC } from '../services/backup-runner.js'
 import { zfsTransientListArgs } from '../services/backup-snapshots.js'
@@ -108,8 +108,8 @@ describe('cr.35 §6.3 per-command budgets: the table, against the argv the call 
 
   it('a call\'s own budget, a `null` data mover and a timeout wrapper all win over the table', async () => {
     assert.deepEqual(await budgetOf(ZFS, ['send', '-nvP', 'a@b'], 'request', { timeoutMs: 5_000 }), { budgetMs: 5_000, source: 'call' })
-    // The catalog shell: pbc under its own `timeout <CATALOG_SHELL_TIMEOUT_S>`.
-    assert.deepEqual(await budgetOf('/usr/bin/timeout', [String(CATALOG_SHELL_TIMEOUT_S), PBC, 'catalog', 'shell']), { budgetMs: CATALOG_SHELL_TIMEOUT_S * 1000 + TIMEOUT_WRAPPER_MARGIN_MS, source: 'wrapper' })
+    // The restore pre-flight's catalog shell: pbc under its own `timeout <CATALOG_PREFLIGHT_TIMEOUT_S>`.
+    assert.deepEqual(await budgetOf('/usr/bin/timeout', [String(CATALOG_PREFLIGHT_TIMEOUT_S), PBC, 'catalog', 'shell']), { budgetMs: CATALOG_PREFLIGHT_TIMEOUT_S * 1000 + TIMEOUT_WRAPPER_MARGIN_MS, source: 'wrapper' })
     // The send|recv pipeline: no deadline, ended by the ssh keepalives instead.
     const mock = new Mock()
     await runInLane({ lane: 'job', jobId: 'j1' }, () => new CommandBudgetExecutor(mock).pipeline(ZFS, ['send', 'tank/a@s1'], '/usr/bin/ssh', ['root@node2', 'zfs', 'recv', 'b'], { timeoutMs: null, longRunning: 'zfs send|recv' }))
@@ -208,38 +208,58 @@ describe('cr.35 §6.3 per-command budgets: the table, against the argv the call 
   })
 })
 
-describe('cr.35 Q3 (open): the request-path reads stay synchronous at 12 s — each wrapper fires inside the gateway\'s 20 s', () => {
-  it('cloud preview, rclone remote test and the PBS catalog shell: a 12 s `timeout` wrapper each, under the gateway\'s 20 s', async () => {
-    // The wrapper durations themselves are pinned by the ladder test below
-    // (budget + graces < 20 s); here: every layer's own argv, and every
-    // inner bound under the wrapper that has to beat it to the answer.
+describe('cr.48: the three slow interactive reads are READ JOBS — each wrapper is a ceiling of minutes, resolved in the job lane', () => {
+  // Operator ruling 2026-10-15 (W3 Q3): the cloud preview, the rclone remote
+  // Test and the PBS catalog listing leave the request lane. Each keeps its
+  // `timeout` wrapper — exit 124 is the verdict its caller words (truncated,
+  // unreachable) — at the ceiling cr.48 chose, and the executor's deadline on
+  // it is that ceiling plus the wrapper margin, in the JOB lane.
+  const catalogShell = buildCatalogShellArgs('host/pve1/2026-10-15T00:00:00Z', 'root.pxar')
+  const reads: Array<[string, number, number, string, string[]]> = [
+    ['cloud preview', PREVIEW_TIMEOUT_S, 600, '/usr/bin/timeout', [String(PREVIEW_TIMEOUT_S), '/usr/bin/rclone', 'sync', '/src', 'gt:dst']],
+    ['rclone remote test', PROBE_TIMEOUT_S, 120, '/usr/bin/timeout', probeArgs('/etc/pve/priv/anas/rclone.conf', 'gt:')],
+    ['PBS catalog listing', CATALOG_SHELL_TIMEOUT_S, 300, catalogShell.command, catalogShell.args],
+  ]
+
+  it('the ceilings: preview 10 min, remote test 2 min, catalog listing 5 min — and each argv carries its own', () => {
+    for (const [name, seconds, want, command, args] of reads) {
+      assert.equal(seconds, want, name)
+      assert.deepEqual([command, args[0]], ['/usr/bin/timeout', String(seconds)], name)
+    }
+  })
+
+  it('in the job lane each wrapper resolves to its ceiling + the wrapper margin — never the lane default, never a §6.3 row', async () => {
+    for (const [name, seconds, , command, args] of reads) {
+      assert.deepEqual(
+        await budgetOf(command, args, 'job'),
+        { budgetMs: seconds * 1000 + TIMEOUT_WRAPPER_MARGIN_MS, source: 'wrapper' },
+        name,
+      )
+      // The wrapper wins over the pbc row (its argv starts with `timeout`).
+      assert.equal(commandBudgetRow(command, args), undefined, name)
+    }
+  })
+
+  it('rclone\'s own connect/idle bounds still end a dead remote long before the Test\'s ceiling', () => {
     const argv = probeArgs('/etc/pve/priv/anas/rclone.conf', 'gt:')
-    assert.equal(argv[0], String(PROBE_TIMEOUT_S))
-    // rclone's own bounds — its error must win over the wrapper's 124, and
-    // a stalled CONNECT must end inside the wrapper too.
     for (const [flag, value] of [['--timeout', '9s'], ['--contimeout', '10s']] as const) {
       const at = argv.indexOf(flag)
       assert.ok(at > 0, flag)
       assert.equal(argv[at + 1], value)
       assert.ok(Number(value.replace('s', '')) < PROBE_TIMEOUT_S, `${flag} ${value} fits under the ${PROBE_TIMEOUT_S} s wrapper`)
     }
-    const shell = buildCatalogShellArgs('host/pve1/2026-10-15T00:00:00Z', 'root.pxar')
-    assert.deepEqual([shell.command, shell.args[0]], ['/usr/bin/timeout', String(CATALOG_SHELL_TIMEOUT_S)])
-    // The executor sits TIMEOUT_WRAPPER_MARGIN_MS above the wrapper, so exit
-    // 124 (the verdict each caller already words) arrives FIRST — at 12 s,
-    // inside the 20 s socket budget the gateway keeps (the +5 s only catches
-    // a wrapper that itself cannot end, where the gateway 504 is the honest
-    // answer; the ladder test below pins that the executor's own deadline —
-    // wrapper + margin — still fires before the gateway hangs up).
-    assert.deepEqual(await budgetOf(shell.command, shell.args), { budgetMs: CATALOG_SHELL_TIMEOUT_S * 1000 + TIMEOUT_WRAPPER_MARGIN_MS, source: 'wrapper' })
-    assert.deepEqual(await budgetOf('/usr/bin/timeout', [String(PROBE_TIMEOUT_S), '/usr/bin/rclone', 'lsjson']), { budgetMs: PROBE_TIMEOUT_S * 1000 + TIMEOUT_WRAPPER_MARGIN_MS, source: 'wrapper' })
-    assert.deepEqual(await budgetOf('/usr/bin/timeout', [String(PREVIEW_TIMEOUT_S), '/usr/bin/rclone', 'sync']), { budgetMs: PREVIEW_TIMEOUT_S * 1000 + TIMEOUT_WRAPPER_MARGIN_MS, source: 'wrapper' })
   })
 
-  it('each site carries the Q3 marker until the operator rules', () => {
+  it('the Q3 markers are gone: the operator ruled', () => {
     const src = join(__dirname, '..')
     for (const rel of ['services/cloud-preview.ts', 'services/rclone-probe.ts', 'services/backup-catalog.ts'])
-      assert.match(readFileSync(join(src, rel), 'utf-8'), /\/\/ Q3 \(WAVE3-DESIGN §10\): job or sync is the operator's call/, rel)
+      assert.doesNotMatch(readFileSync(join(src, rel), 'utf-8'), /Q3 \(WAVE3-DESIGN §10\)/, rel)
+  })
+
+  it('the restore PRE-FLIGHT\'s catalog session stays a 12 s request-path read (not one of cr.48\'s three)', async () => {
+    assert.equal(CATALOG_PREFLIGHT_TIMEOUT_S, 12)
+    const shell = buildCatalogShellArgs('host/pve1/2026-10-15T00:00:00Z', 'root.pxar', undefined, CATALOG_PREFLIGHT_TIMEOUT_S)
+    assert.deepEqual(await budgetOf(shell.command, shell.args), { budgetMs: CATALOG_PREFLIGHT_TIMEOUT_S * 1000 + TIMEOUT_WRAPPER_MARGIN_MS, source: 'wrapper' })
   })
 })
 
@@ -252,7 +272,7 @@ describe('cr.35r the ladder arithmetic: every request-path budget settles before
   // constant itself.
   const GATEWAY_LOCAL_SOCKET_TIMEOUT_MS = 20_000
 
-  it('every §6.3 row and every Q3 wrapper, as the executor resolves them, beats the socket budget', async () => {
+  it('every §6.3 row and every request-path wrapper, as the executor resolves them, beats the socket budget', async () => {
     // A row's WHOLE ladder: the budget, then TERM_GRACE_MS to the process
     // group, then SIGKILL, then KILL_GRACE_MS before the call settles
     // anyway — a child that ignores SIGTERM, and even one stuck in the
@@ -264,20 +284,18 @@ describe('cr.35r the ladder arithmetic: every request-path budget settles before
         `${row.id}: ${formatBudget(row.budgetMs)} + ${formatBudget(TERM_GRACE_MS)} + ${formatBudget(KILL_GRACE_MS)} reaches the gateway's ${formatBudget(GATEWAY_LOCAL_SOCKET_TIMEOUT_MS)}`,
       )
     }
-    // The Q3 wrappers, as resolveDeadline resolves them (duration + the
-    // wrapper margin). The strict ladder rule cannot hold for a wrapper at
-    // any duration the margin leaves usable (margin 5 s + graces 7 s would
-    // cap it at 8 s); what must hold, and what this pins: the wrapper fires
-    // and answers as its own verdict (exit 124) inside the socket budget,
-    // and the executor's deadline ON the wrapper still fires before the
-    // gateway hangs up. Past the executor's deadline the wrapper itself is
-    // stuck in the kernel — there, the gateway's 504 is the honest answer
-    // (§6.2), which is why the wrapper's own ladder is not this test's.
-    const catalogShell = buildCatalogShellArgs('host/pve1/2026-10-15T00:00:00Z', 'root.pxar')
+    // The request-path `timeout` wrappers, as resolveDeadline resolves them
+    // (duration + the wrapper margin). Since cr.48 the cloud preview, the
+    // remote Test and the catalog LISTING are jobs and not here; the restore
+    // pre-flight's catalog session is. The strict ladder rule cannot hold
+    // for a wrapper at any duration the margin leaves usable (margin 5 s +
+    // graces 7 s would cap it at 8 s); what must hold, and what this pins:
+    // the wrapper fires and answers as its own verdict (exit 124) inside the
+    // socket budget, and the executor's deadline ON the wrapper still fires
+    // before the gateway hangs up.
+    const preflight = buildCatalogShellArgs('host/pve1/2026-10-15T00:00:00Z', 'root.pxar', undefined, CATALOG_PREFLIGHT_TIMEOUT_S)
     const wrappers: Array<[string, number, string, string[]]> = [
-      ['PBS catalog shell', CATALOG_SHELL_TIMEOUT_S, catalogShell.command, catalogShell.args],
-      ['rclone remote probe', PROBE_TIMEOUT_S, '/usr/bin/timeout', probeArgs('/etc/pve/priv/anas/rclone.conf', 'gt:')],
-      ['cloud preview', PREVIEW_TIMEOUT_S, '/usr/bin/timeout', [String(PREVIEW_TIMEOUT_S), '/usr/bin/rclone', 'sync', '/src', 'gt:dst']],
+      ['PBS catalog shell (restore pre-flight)', CATALOG_PREFLIGHT_TIMEOUT_S, preflight.command, preflight.args],
     ]
     for (const [name, seconds, command, args] of wrappers) {
       assert.ok(seconds * 1000 < GATEWAY_LOCAL_SOCKET_TIMEOUT_MS, `${name}: the wrapper's own 124 lands inside the socket budget`)

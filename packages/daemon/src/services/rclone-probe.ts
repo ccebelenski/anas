@@ -84,7 +84,7 @@
 
 import type { CloudProvider, CloudRemoteTestResult, CloudRemoteWrite } from '@anas/shared'
 import type { Dirent } from 'node:fs'
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, SpawnedChild } from '../executor/types.js'
 import type { RcloneConfigPaths } from './rclone-config.js'
 import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -106,19 +106,21 @@ import { assertNoSecretValues } from './secret-argv.js'
 const TIMEOUT = '/usr/bin/timeout'
 
 /**
- * The whole probe's wall budget, in seconds (the `timeout` argument).
+ * The whole probe's wall ceiling, in seconds (the `timeout` argument): two
+ * minutes (cr.48, operator ruling 2026-10-15).
  *
- * cr.35r: 12 s, down from 15 s — the whole shape now fits the 20 s ladder:
- * rclone answers inside its own `--timeout 9s` (rclone's error wins), a
- * stalled CONNECT ends at `--contimeout 10s`, and the wrapper's 124 at 12 s —
- * all before the gateway hangs up on anasd (WAVE3-DESIGN §6.2 ladder). The
- * executor's deadline (12 s + the 5 s wrapper margin) fires at 17 s, still
- * before the 20 s; past that the wrapper itself is stuck in the kernel, where
- * the gateway's 504 is the honest answer. The remote test is a synchronous
- * read on the request path.
+ * The Test is a cancellable READ job now (202 + poll), so the gateway's 20 s
+ * socket budget no longer bounds it — cr.35r's 12 s was that budget's
+ * arithmetic. rclone's own bounds are unchanged: a dead network still ends
+ * at `--contimeout 10s` and an idle connection at `--timeout 9s`, so an
+ * unreachable remote answers in seconds as before. What the ceiling admits is
+ * a remote that is alive and SLOW — a cold bucket's first listing, an OAuth
+ * backend refreshing its token, a large share root — which 12 s cut off as
+ * "unreachable". The wrapper stays: its exit 124 is the `unreachable` verdict
+ * the classifier words, where the executor's job-lane timeout would fail the
+ * job with a sentence about an object in an unknown state.
  */
-// Q3 (WAVE3-DESIGN §10): job or sync is the operator's call
-export const PROBE_TIMEOUT_S = 12
+export const PROBE_TIMEOUT_S = 120
 
 /**
  * The env-defined remote's name. A saved `anastest` in the file would be
@@ -260,6 +262,10 @@ export interface RcloneProbeOptions {
    * that is absent). Injectable so the tests can hold it somewhere writable.
    */
   tmpBase?: string
+  /** The exec's `onSpawn` (cr.48) — the Test job's read-cancel hook takes the child here. */
+  onSpawn?: (child: SpawnedChild) => void
+  /** Called before the listing: throws (JobCancelledError) when a cancel was already accepted. */
+  checkpoint?: (next: string) => void
 }
 
 /**
@@ -433,7 +439,11 @@ export async function testRemote(
     // substring of the temp config path or of `false` refuses a clean probe.
     assertNoSecretValues(args, secretValues, probeStaticPrefix(probeConfig).length)
 
-    const result = await executor.exec(TIMEOUT, args, env ? { env } : undefined)
+    opts.checkpoint?.('the listing')
+    const result = await executor.exec(TIMEOUT, args, {
+      ...(env ? { env } : {}),
+      ...(opts.onSpawn ? { onSpawn: opts.onSpawn } : {}),
+    })
     const verdict = classifyProbe(result.exitCode, result.stderr)
     if (isCrypt && verdict.verdict === 'ok') {
       if (CRYPT_UNDECRYPTABLE_RE.test(result.stderr))
@@ -468,7 +478,7 @@ function isEmptyListing(stdout: string): boolean {
 }
 
 /**
- * The probe's STATIC argv prefix — `timeout 12 rclone --config <file>
+ * The probe's STATIC argv prefix — `timeout 120 rclone --config <file>
  * --ask-password=false lsjson`: every token before the one dynamic `<fs>`
  * the caller typed. The probe's argv carries two leading tokens ahead of the
  * rclone base (`timeout` and the binary itself), so the secret-VALUES guard
@@ -482,7 +492,7 @@ export function probeStaticPrefix(configFile: string): string[] {
 }
 
 /**
- * The full probe argv — `timeout 12 rclone --config <file>
+ * The full probe argv — `timeout 120 rclone --config <file>
  * --ask-password=false lsjson <fs> --max-depth 1 --contimeout 10s --timeout
  * 9s --retries 1 --low-level-retries 1`, plus `-vv` (the exact tail the
  * crypt capture ran) when `debug` is set — today only a crypt remote, where

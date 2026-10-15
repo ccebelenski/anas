@@ -19,9 +19,12 @@ import { CATALOG_SHELL_TIMEOUT_S } from '../../services/backup-catalog.js'
  *   POST /v1/backup/restore/browse
  *
  * All three are user-initiated PBS contacts on Epic 16's sanctioned list, and
- * all three are READS: 200, never a job, never a poll. A local fault (unknown
- * task / repo / no credential) is a 4xx; a PBS-side outcome is a 200 carrying a
- * verdict, exactly as prune-preview and the repo Test already do.
+ * all three are READS. The two listings answer 200; the BROWSE is a read JOB
+ * since cr.48 (202, the level in `job.result`, cancellable — a catalog fetch
+ * can take minutes). A local fault (unknown task / repo / no credential) is a
+ * 4xx at the door; a PBS-side outcome is an answer carrying a verdict (the
+ * 200's body, or the browse job's result), exactly as prune-preview and the
+ * repo Test already do.
  */
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/backup')
@@ -60,11 +63,22 @@ async function waitForJob(server: ReturnType<typeof createServer>, id: string): 
   for (let i = 0; i < 100; i++) {
     const res = await server.inject({ method: 'GET', url: `/v1/jobs/${id}`, headers: IDENTITY })
     const { job } = res.json() as { job: Job }
-    if (job.status === 'completed' || job.status === 'failed')
+    if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled')
       return job
     await new Promise(r => setTimeout(r, 10))
   }
   throw new Error(`Job ${id} did not finish`)
+}
+
+/** POST a browse: 202 + a read job, waited for; the level is the job's result (cr.48). */
+async function browse(server: ReturnType<typeof createServer>, payload: Record<string, unknown>): Promise<{ job: Job, data: BackupBrowseResult }> {
+  const res = await server.inject({ method: 'POST', url: '/v1/backup/restore/browse', headers: JSON_HEADERS, payload })
+  assert.equal(res.statusCode, 202, res.body)
+  const accepted = (res.json() as { job: { id: string, operation: string } }).job
+  assert.equal(accepted.operation, 'read.backup.catalog')
+  const job = await waitForJob(server, accepted.id)
+  assert.equal(job.status, 'completed', JSON.stringify(job.error))
+  return { job, data: job.result as BackupBrowseResult }
 }
 
 /** The four-line `stat` block shape, verbatim from the real capture. */
@@ -268,14 +282,7 @@ describe('backup restore reads (story backup2.5)', () => {
         { stdout: `${childStats}\n`, stderr: 'Starting interactive shell    \n', exitCode: 0 },
       ],
     })
-    const res = await server.inject({
-      method: 'POST',
-      url: '/v1/backup/restore/browse',
-      headers: JSON_HEADERS,
-      payload: { repo: 'pbs-main', ns: 'gtrestore', snapshot: SNAP, archive: 'data.pxar', path: '/' },
-    })
-    assert.equal(res.statusCode, 200)
-    const { data } = res.json() as { data: BackupBrowseResult }
+    const { data } = await browse(server, { repo: 'pbs-main', ns: 'gtrestore', snapshot: SNAP, archive: 'data.pxar', path: '/' })
     assert.equal(data.verdict, 'ok')
     assert.equal(data.archiveKind, 'pxar')
     assert.deepEqual(data.entries.map(e => e.name), ['docs', 'alpha.txt', 'hard-b.txt'])
@@ -302,14 +309,7 @@ describe('backup restore reads (story backup2.5)', () => {
 
   it('an .img archive answers with one whole-image entry and NO PBS contact', async () => {
     const mock = mockOf(server)
-    const res = await server.inject({
-      method: 'POST',
-      url: '/v1/backup/restore/browse',
-      headers: JSON_HEADERS,
-      payload: { repo: 'pbs-main', snapshot: SNAP, archive: 'lun.img' },
-    })
-    assert.equal(res.statusCode, 200)
-    const { data } = res.json() as { data: BackupBrowseResult }
+    const { data } = await browse(server, { repo: 'pbs-main', snapshot: SNAP, archive: 'lun.img' })
     assert.equal(data.archiveKind, 'img')
     assert.deepEqual(data.entries, [{ name: 'lun.img', path: '/', type: 'image' }])
     assert.equal(mock.calls.filter(c => c.command === TIMEOUT).length, 0)
@@ -318,14 +318,8 @@ describe('backup restore reads (story backup2.5)', () => {
   it('the path defaults to the archive root when omitted', async () => {
     const mock = mockOf(server)
     mock.addFixture({ command: TIMEOUT, args: shellArgs(SNAP, 'data.pxar', 'gtrestore'), result: { stdout: '', stderr: '', exitCode: 0 } })
-    const res = await server.inject({
-      method: 'POST',
-      url: '/v1/backup/restore/browse',
-      headers: JSON_HEADERS,
-      payload: { repo: 'pbs-main', snapshot: SNAP, archive: 'data.pxar' },
-    })
-    assert.equal(res.statusCode, 200)
-    assert.equal((res.json() as { data: BackupBrowseResult }).data.path, '/')
+    const { data } = await browse(server, { repo: 'pbs-main', snapshot: SNAP, archive: 'data.pxar' })
+    assert.equal(data.path, '/')
   })
 
   it('a relative path, a `..` path and a control character are all 400s', async () => {
@@ -350,25 +344,18 @@ describe('backup restore reads (story backup2.5)', () => {
     assert.equal(res.statusCode, 404)
   })
 
-  it('a PBS failure during a browse is a 200 with the verdict', async () => {
+  it('a PBS failure during a browse is a COMPLETED read job carrying the verdict', async () => {
     mockOf(server).addFixture({
       command: TIMEOUT,
       args: shellArgs(SNAP, 'data.pxar', 'gtrestore'),
       result: { stdout: '', stderr: 'Error: no permissions on /datastore/anastest-store/gtrestore\n', exitCode: 255 },
     })
-    const res = await server.inject({
-      method: 'POST',
-      url: '/v1/backup/restore/browse',
-      headers: JSON_HEADERS,
-      payload: { repo: 'pbs-main', snapshot: SNAP, archive: 'data.pxar' },
-    })
-    assert.equal(res.statusCode, 200)
-    const { data } = res.json() as { data: BackupBrowseResult }
+    const { data } = await browse(server, { repo: 'pbs-main', snapshot: SNAP, archive: 'data.pxar' })
     assert.equal(data.verdict, 'permission')
     assert.ok(data.detail?.includes('Datastore.Audit'))
   })
 
-  it('none of the three reads submits a job — they are reads, not mutations', async () => {
+  it('the two listings submit no job; the browse submits exactly ONE read job (cr.48)', async () => {
     const mock = mockOf(server)
     mock.addFixture({ command: PBC, result: { stdout: '[]', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: TIMEOUT, args: shellArgs(SNAP, 'data.pxar', 'gtrestore'), result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -379,12 +366,8 @@ describe('backup restore reads (story backup2.5)', () => {
     const before = await jobCount()
     await server.inject({ method: 'GET', url: '/v1/backup/tasks/nightly/snapshots', headers: IDENTITY })
     await server.inject({ method: 'GET', url: '/v1/backup/repos/pbs-main/groups', headers: IDENTITY })
-    await server.inject({
-      method: 'POST',
-      url: '/v1/backup/restore/browse',
-      headers: JSON_HEADERS,
-      payload: { repo: 'pbs-main', snapshot: SNAP, archive: 'data.pxar' },
-    })
     assert.equal(await jobCount(), before)
+    await browse(server, { repo: 'pbs-main', snapshot: SNAP, archive: 'data.pxar' })
+    assert.equal(await jobCount(), before + 1)
   })
 })

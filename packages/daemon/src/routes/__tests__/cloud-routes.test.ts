@@ -63,6 +63,18 @@ async function waitForJob(server: ReturnType<typeof createServer> | FastifyInsta
   throw new Error(`Job ${id} did not finish`)
 }
 
+/**
+ * cr.48 — the remote Test is a READ job: 202 with `read.cloud.remote.test`,
+ * the verdict in `job.result`. Answers the settled job (completed or failed).
+ */
+async function testJob(server: ReturnType<typeof createServer> | FastifyInstance, payload: unknown): Promise<Job> {
+  const res = await server.inject({ method: 'POST', url: '/v1/cloud/remotes/test', headers: JSON_HEADERS, payload: JSON.stringify(payload) })
+  assert.equal(res.statusCode, 202, res.body)
+  const accepted = (res.json() as { job: { id: string, operation: string } }).job
+  assert.equal(accepted.operation, 'read.cloud.remote.test')
+  return waitForJob(server, accepted.id)
+}
+
 /** Make one command REJECT the way execFile does when its binary is missing (issue #6). */
 function failToSpawn(server: ReturnType<typeof createServer>, command: string): void {
   const mock = mockOf(server)
@@ -526,16 +538,8 @@ password = mock-obscured
           probeEnvs.push(execOpts?.env as Record<string, string> | undefined)
         return orig(command, args, execOpts)
       }
-      const res = await server.inject({
-        method: 'POST',
-        url: '/v1/cloud/remotes/test',
-        headers: JSON_HEADERS,
-        payload: JSON.stringify({
-          remote: { name: 'draft', type: 'drive', options: { token: MARKER_PASTE } },
-        }),
-      })
-      assert.equal(res.statusCode, 200)
-      assert.deepEqual(res.json(), { data: { verdict: 'ok', message: '' } })
+      const job = await testJob(server, { remote: { name: 'draft', type: 'drive', options: { token: MARKER_PASTE } } })
+      assert.deepEqual(job.result, { verdict: 'ok', message: '' })
       const env = probeEnvs[0] ?? {}
       // The env-defined remote carries the NORMALISED text — the same bytes a
       // save would write.
@@ -610,7 +614,7 @@ password = mock-obscured
       }
     })
 
-    it('POST /cloud/remotes/test: a refusal vector → 400 with the sentence, the probe never runs; a valid vector → 200', async () => {
+    it('POST /cloud/remotes/test: a refusal vector → 400 with the sentence, the probe never runs; a valid vector → 202 (a read job)', async () => {
       mockOf(server).addFixture({ command: '/usr/bin/timeout', result: { stdout: '[]', stderr: '', exitCode: 0 } })
       for (const c of OWN_CLIENT_CASES) {
         const res = await server.inject({
@@ -624,7 +628,8 @@ password = mock-obscured
           assert.equal(res.json().error.message, c.message, c.name)
         }
         else {
-          assert.equal(res.statusCode, 200, c.name)
+          assert.equal(res.statusCode, 202, c.name)
+          await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
         }
       }
       // The refusals never reached the probe: one probe call per VALID vector.
@@ -637,16 +642,11 @@ password = mock-obscured
 
   // --- POST /cloud/remotes/test (the bounded lsjson probe) ---------------------
   describe('POST /v1/cloud/remotes/test', () => {
-    it('a SAVED target → 200 ok, the exact timeout-wrapped argv, nothing else spawned', async () => {
+    it('a SAVED target → 202 read job, ok, the exact timeout-wrapped argv, nothing else spawned', async () => {
       mockOf(server).addFixture({ command: '/usr/bin/timeout', result: { stdout: '[]', stderr: '', exitCode: 0 } })
-      const res = await server.inject({
-        method: 'POST',
-        url: '/v1/cloud/remotes/test',
-        headers: JSON_HEADERS,
-        payload: JSON.stringify({ name: 'gt' }),
-      })
-      assert.equal(res.statusCode, 200)
-      assert.deepEqual(res.json(), { data: { verdict: 'ok', message: '' } })
+      const job = await testJob(server, { name: 'gt' })
+      assert.equal(job.status, 'completed')
+      assert.deepEqual(job.result, { verdict: 'ok', message: '' })
       const calls = mockOf(server).calls
       const probe = calls.find(c => c.command === '/usr/bin/timeout')
       assert.deepEqual(probe?.args, probeArgs(configFile, 'gt:'))
@@ -657,30 +657,18 @@ password = mock-obscured
 
     it('a SAVED target with a path lists that path', async () => {
       mockOf(server).addFixture({ command: '/usr/bin/timeout', result: { stdout: '[]', stderr: '', exitCode: 0 } })
-      const res = await server.inject({
-        method: 'POST',
-        url: '/v1/cloud/remotes/test',
-        headers: JSON_HEADERS,
-        payload: JSON.stringify({ name: 'gt', path: 'dst/sub' }),
-      })
-      assert.equal(res.statusCode, 200)
+      assert.equal((await testJob(server, { name: 'gt', path: 'dst/sub' })).status, 'completed')
       const probe = mockOf(server).calls.find(c => c.command === '/usr/bin/timeout')
       assert.deepEqual(probe?.args, probeArgs(configFile, 'gt:dst/sub'))
     })
 
     it('an UNSAVED dialog → the password-typed value is obscured via stdin, then the env-defined remote is probed', async () => {
       mockOf(server).addFixture({ command: '/usr/bin/timeout', result: { stdout: '[]', stderr: '', exitCode: 0 } })
-      const res = await server.inject({
-        method: 'POST',
-        url: '/v1/cloud/remotes/test',
-        headers: JSON_HEADERS,
-        payload: JSON.stringify({
-          remote: { name: 'draft', type: 'sftp', options: { host: '127.0.0.1', user: 'rclonegt', pass: 'gtpass' } },
-          path: 'dst',
-        }),
+      const job = await testJob(server, {
+        remote: { name: 'draft', type: 'sftp', options: { host: '127.0.0.1', user: 'rclonegt', pass: 'gtpass' } },
+        path: 'dst',
       })
-      assert.equal(res.statusCode, 200)
-      assert.deepEqual(res.json(), { data: { verdict: 'ok', message: '' } })
+      assert.deepEqual(job.result, { verdict: 'ok', message: '' })
 
       const calls = mockOf(server).calls
       const obscure = calls.find(c => c.command === RCLONE && c.args.includes('obscure'))
@@ -691,7 +679,7 @@ password = mock-obscured
       // file: rclone persists its sftp shell detection as an [anastest]
       // section into whatever --config it is handed (GT 2026-09-24), and an
       // unsaved dialog must leave no trace. The copy's directory is gone by
-      // the time the response is out.
+      // the time the job has settled.
       const probeConfig = probe!.args[3]!
       assert.notEqual(probeConfig, configFile)
       assert.deepEqual(probe?.args, probeArgs(probeConfig, `${PROBE_REMOTE_NAME}:dst`))
@@ -702,7 +690,7 @@ password = mock-obscured
       await assert.rejects(readFile(configFile, 'utf-8'))
     })
 
-    it('the verdicts ride the response: auth, unreachable, not-found, error', async () => {
+    it('the verdicts ride the job result: auth, unreachable, not-found, error', async () => {
       const cases: { stderr: string, exitCode: number, verdict: string }[] = [
         { stderr: AUTH_STDERR, exitCode: 1, verdict: 'auth' },
         { stderr: UNREACHABLE_STDERR, exitCode: 1, verdict: 'unreachable' },
@@ -714,45 +702,29 @@ password = mock-obscured
         mock.clearFixtures()
         installRcloneFixtures(mock, configFile)
         mock.addFixture({ command: '/usr/bin/timeout', result: { stdout: '', stderr: c.stderr, exitCode: c.exitCode } })
-        const res = await server.inject({
-          method: 'POST',
-          url: '/v1/cloud/remotes/test',
-          headers: JSON_HEADERS,
-          payload: JSON.stringify({ name: 'gt' }),
-        })
-        assert.equal(res.statusCode, 200, `${c.verdict}: ${res.payload}`)
-        const { data } = res.json() as { data: { verdict: string, message: string } }
+        const job = await testJob(server, { name: 'gt' })
+        assert.equal(job.status, 'completed', `${c.verdict}: ${JSON.stringify(job.error)}`)
+        const data = job.result as { verdict: string, message: string }
         assert.equal(data.verdict, c.verdict)
         assert.equal(data.message, c.stderr.trimEnd().split('\n').at(-1), `${c.verdict}: one line, verbatim`)
       }
     })
 
-    it('a name the config file does not carry → 404 (a local fact, not a verdict)', async () => {
+    it('a name the config file does not carry → the job FAILS with the not-found sentence (a local fact, not a verdict)', async () => {
       mockOf(server).addFixture({
         command: '/usr/bin/timeout',
         result: { stdout: '', stderr: UNKNOWN_REMOTE_STDERR, exitCode: 1 },
       })
-      const res = await server.inject({
-        method: 'POST',
-        url: '/v1/cloud/remotes/test',
-        headers: JSON_HEADERS,
-        payload: JSON.stringify({ name: 'nosuch' }),
-      })
-      assert.equal(res.statusCode, 404)
-      assert.equal(res.json().error.code, 'NOT_FOUND')
-      assert.match(res.json().error.message, /nosuch/)
+      const job = await testJob(server, { name: 'nosuch' })
+      assert.equal(job.status, 'failed')
+      assert.equal(job.result, null, 'no verdict rides a failed Test')
+      assert.match(job.error?.message ?? '', /nosuch/)
     })
 
     it('a timeout-wrapped run that never returns → the wrapper\'s 124 → unreachable', async () => {
       mockOf(server).addFixture({ command: '/usr/bin/timeout', result: { stdout: '', stderr: '', exitCode: 124 } })
-      const res = await server.inject({
-        method: 'POST',
-        url: '/v1/cloud/remotes/test',
-        headers: JSON_HEADERS,
-        payload: JSON.stringify({ name: 'gt' }),
-      })
-      assert.equal(res.statusCode, 200)
-      assert.deepEqual(res.json(), { data: { verdict: 'unreachable', message: '' } })
+      const job = await testJob(server, { name: 'gt' })
+      assert.deepEqual(job.result, { verdict: 'unreachable', message: '' })
     })
 
     it('neither name nor remote → 400; both → 400; no identity → 401', async () => {
@@ -779,31 +751,20 @@ password = mock-obscured
       assert.equal(noId.statusCode, 401)
     })
 
-    it('a missing `timeout` binary → the ENOENT rides the same 503 install sentence', async () => {
+    it('a missing `timeout` binary (after the 202) → the job fails with the install sentence', async () => {
       failToSpawn(server, '/usr/bin/timeout')
-      const res = await server.inject({
-        method: 'POST',
-        url: '/v1/cloud/remotes/test',
-        headers: JSON_HEADERS,
-        payload: JSON.stringify({ name: 'gt' }),
-      })
-      assert.equal(res.statusCode, 503)
-      assert.equal(res.json().error.code, 'UNAVAILABLE')
-      assert.equal(res.json().error.message, RCLONE_NOT_INSTALLED)
+      const job = await testJob(server, { name: 'gt' })
+      assert.equal(job.status, 'failed')
+      assert.equal(job.error?.message, RCLONE_NOT_INSTALLED)
     })
 
-    it('fires the audit job (the journald record) with the remote and the verdict', async () => {
+    it('the Test job IS the audit record: one job, the read-only operation, the remote and path in its params', async () => {
       mockOf(server).addFixture({ command: '/usr/bin/timeout', result: { stdout: '[]', stderr: '', exitCode: 0 } })
-      const res = await server.inject({
-        method: 'POST',
-        url: '/v1/cloud/remotes/test',
-        headers: JSON_HEADERS,
-        payload: JSON.stringify({ name: 'gt' }),
-      })
-      assert.equal(res.statusCode, 200)
-      const jobs = await server.inject({ method: 'GET', url: '/v1/jobs', headers: IDENTITY })
-      const { data } = jobs.json() as { data: Job[] }
-      assert.ok(data.some(j => j.operation === 'cloud.remote.test'), 'the audit job was submitted')
+      const before = ((await server.inject({ method: 'GET', url: '/v1/jobs', headers: IDENTITY })).json() as { data: Job[] }).data.length
+      await testJob(server, { name: 'gt' })
+      const { data } = (await server.inject({ method: 'GET', url: '/v1/jobs', headers: IDENTITY })).json() as { data: Job[] }
+      assert.equal(data.length, before + 1, 'no stand-in audit job beside the read job')
+      assert.ok(!data.some(j => j.operation === 'cloud.remote.test'), 'the pre-cr.48 stand-in is gone')
     })
   })
 

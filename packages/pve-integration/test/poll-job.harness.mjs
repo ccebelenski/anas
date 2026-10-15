@@ -29,6 +29,11 @@
  *   g  view destroyed mid-poll → silent stop, no callbacks
  *   h  the cancel-run flow (69-schedules-common.js) toasts "Run cancelled"
  *      only when the cancel job reaches completed
+ *   r1–r9 cr.48 ANAS.readJob over this real pollJob: progress, completed,
+ *      failed and lost reach their callbacks with NO modal; a door refusal is
+ *      onError; Cancel posts the job's own cancel door once (early clicks
+ *      wait for the id, a lost race is silent); a pre-cr.48 200 + data is the
+ *      result; a view gone before the 202 cancels the orphaned read
  *   i–n a delete that ends failed or lost reloads its grid: the replication
  *      task delete, the snapshot-schedule delete and the backup task delete
  *      (the last through confirmAndRun's 409→confirm→202 dance) each fire the
@@ -657,6 +662,163 @@ async function main() {
     assert('n: a lost backup delete reloads the grid', reloadGets === 1)
     assert('n: the reload repopulated the grid', grid.names().indexOf('alpha') !== -1)
     assert('n: the lost job alerted', count(env.alerts) === 1 && contains(env.alerts[0].msg, 'no longer knows'))
+  }
+
+  // ======================================================================
+  //  cr.48 — ANAS.readJob over the REAL pollJob (fake clock, scripted fetch)
+  // ======================================================================
+
+  // A recorder for one readJob's callbacks.
+  function readRecorder() {
+    const seen = []
+    const opts = {}
+    for (const name of ['onSubmitted', 'onProgress', 'onResult', 'onError', 'onCancelled', 'onLost', 'onCancelling', 'onCancelFailed']) {
+      opts[name] = function () { seen.push({ name, args: Array.prototype.slice.call(arguments) }) }
+    }
+    return { seen, opts, names: () => seen.map(s => s.name) }
+  }
+  const readJobBody = { job: { id: 'R', status: 'running', operation: 'read.cloud.preview' } }
+
+  // --- r1: 202 → running (progress) → completed → onResult(job.result) -------
+  {
+    let polls = 0
+    const env = makeEnv(function (method, url) {
+      if (method === 'POST') return { status: 202, body: readJobBody }
+      polls++
+      if (polls < 3) return { status: 200, body: { job: { id: 'R', status: 'running', progress: `${polls} checked` } } }
+      return { status: 200, body: { job: { id: 'R', status: 'completed', result: { transfers: 2 } } } }
+    })
+    const rec = readRecorder()
+    env.ANAS.readJob(Object.assign({ node: 'pve1', path: '/cloud/tasks/preview', body: { name: 't' } }, rec.opts))
+    await env.advanceTo(60000)
+    assert('r1: submitted, two progress lines, one result', rec.names().join(',') === 'onSubmitted,onProgress,onProgress,onResult')
+    assert('r1: the progress line is the job\'s own', rec.seen[1].args[0] === '1 checked' && rec.seen[2].args[0] === '2 checked')
+    assert('r1: the result is job.result', rec.seen[3].args[0].transfers === 2)
+    assert('r1: no modal, no toast', count(env.alerts) === 0 && count(env.toasts) === 0)
+    assert('r1: polled the job the 202 named', env.calls.some(c => c.method === 'GET' && c.url.indexOf('/jobs/R') !== -1))
+  }
+
+  // --- r2: failed → onError with the job's message, NO modal ------------------
+  {
+    const env = makeEnv(function (method) {
+      if (method === 'POST') return { status: 202, body: readJobBody }
+      return { status: 200, body: { job: { id: 'R', status: 'failed', error: { code: 'JOB_FAILED', message: 'rclone is not installed' } } } }
+    })
+    const rec = readRecorder()
+    env.ANAS.readJob(Object.assign({ node: 'pve1', path: '/cloud/remotes/test', body: { name: 'gt' } }, rec.opts))
+    await env.advanceTo(60000)
+    assert('r2: one onError with the job\'s message', rec.names().join(',') === 'onSubmitted,onError' && rec.seen[1].args[0] === 'rclone is not installed')
+    assert('r2: no modal (the dialog says it inline)', count(env.alerts) === 0)
+  }
+
+  // --- r3: a refusal at the door (400) → onError, nothing polled --------------
+  {
+    const env = makeEnv(function () {
+      return { status: 400, statusText: 'Bad Request', body: { error: { code: 'VALIDATION_ERROR', message: '/mnt/x is not mounted' } } }
+    })
+    const rec = readRecorder()
+    env.ANAS.readJob(Object.assign({ node: 'pve1', path: '/cloud/tasks/preview', body: {} }, rec.opts))
+    await env.advanceTo(60000)
+    assert('r3: one onError carrying the daemon\'s sentence', rec.names().join(',') === 'onError' && contains(rec.seen[0].args[0], 'is not mounted'))
+    assert('r3: the refused error keeps its status', rec.seen[0].args[1] && rec.seen[0].args[1].status === 400)
+    assert('r3: nothing polled', env.jobPolls() === 0)
+  }
+
+  // --- r4: lost (404 on the poll) → onLost, NO modal ---------------------------
+  {
+    const env = makeEnv(function (method) {
+      if (method === 'POST') return { status: 202, body: readJobBody }
+      return { status: 404, statusText: 'Not Found', body: { error: { code: 'NOT_FOUND', message: 'gone' } } }
+    })
+    const rec = readRecorder()
+    env.ANAS.readJob(Object.assign({ node: 'pve1', path: '/backup/restore/browse', body: {} }, rec.opts))
+    await env.advanceTo(60000)
+    assert('r4: one onLost with the restart sentence', rec.names().join(',') === 'onSubmitted,onLost' && contains(rec.seen[1].args[0], 'no longer knows this request'))
+    assert('r4: no modal', count(env.alerts) === 0)
+  }
+
+  // --- r5: Cancel → POST /jobs/R/cancel (no confirm) → cancelled → onCancelled -
+  {
+    let cancelled = false
+    const env = makeEnv(function (method, url) {
+      if (method === 'POST' && url.indexOf('/cancel') !== -1) {
+        cancelled = true
+        return { status: 202, body: { job: { id: 'C', status: 'running', operation: 'job.cancel' } } }
+      }
+      if (method === 'POST') return { status: 202, body: readJobBody }
+      return { status: 200, body: { job: { id: 'R', status: cancelled ? 'cancelled' : 'running', result: cancelled ? { status: 'cancelled', reason: 'cancelled by root@pam at x' } : null } } }
+    })
+    const rec = readRecorder()
+    const handle = env.ANAS.readJob(Object.assign({ node: 'pve1', path: '/cloud/tasks/preview', body: {} }, rec.opts))
+    await env.advanceTo(600)
+    assert('r5: the cancel is accepted by the handle', handle.cancel() === true)
+    assert('r5: a second click is a no-op while the first runs', handle.cancel() === false)
+    await env.advanceTo(60000)
+    const cancelPosts = env.calls.filter(c => c.method === 'POST' && c.url.indexOf('/jobs/R/cancel') !== -1)
+    assert('r5: ONE cancel posted to the job\'s own door', cancelPosts.length === 1)
+    assert('r5: onCancelling, then onCancelled', rec.names().indexOf('onCancelling') !== -1 && rec.names()[rec.names().length - 1] === 'onCancelled')
+    assert('r5: no result, no error', rec.names().indexOf('onResult') === -1 && rec.names().indexOf('onError') === -1)
+    assert('r5: no confirm dialog, no modal', count(env.alerts) === 0)
+  }
+
+  // --- r6: a cancel clicked BEFORE the 202 is sent the moment the id exists ----
+  {
+    const env = makeEnv(function (method, url) {
+      if (method === 'POST' && url.indexOf('/cancel') !== -1) return { status: 202, body: { job: { id: 'C' } } }
+      if (method === 'POST') return { status: 202, body: readJobBody, delayMs: 300 }
+      return { status: 200, body: { job: { id: 'R', status: 'cancelled' } } }
+    })
+    const rec = readRecorder()
+    const handle = env.ANAS.readJob(Object.assign({ node: 'pve1', path: '/cloud/tasks/preview', body: {} }, rec.opts))
+    handle.cancel()
+    await env.advanceTo(60000)
+    assert('r6: the early cancel reached the job once its id was known', env.calls.filter(c => c.url.indexOf('/jobs/R/cancel') !== -1).length === 1)
+    assert('r6: and the job ended cancelled', rec.names()[rec.names().length - 1] === 'onCancelled')
+  }
+
+  // --- r7: the cancel lost the race (the job ended first) → silent; the poll says --
+  {
+    const env = makeEnv(function (method, url) {
+      if (method === 'POST' && url.indexOf('/cancel') !== -1) {
+        return { status: 409, statusText: 'Conflict', body: { error: { code: 'CONFLICT', message: 'not running — it already ended completed' } } }
+      }
+      if (method === 'POST') return { status: 202, body: readJobBody }
+      return { status: 200, body: { job: { id: 'R', status: 'completed', result: { verdict: 'ok', message: '' } } }, delayMs: 50 }
+    })
+    const rec = readRecorder()
+    const handle = env.ANAS.readJob(Object.assign({ node: 'pve1', path: '/cloud/remotes/test', body: {} }, rec.opts))
+    await env.advanceTo(100)
+    handle.cancel()
+    await env.advanceTo(60000)
+    assert('r7: the race is silent — no onCancelFailed, no modal', rec.names().indexOf('onCancelFailed') === -1 && count(env.alerts) === 0)
+    assert('r7: the outcome is the job\'s own (completed)', rec.names()[rec.names().length - 1] === 'onResult')
+  }
+
+  // --- r8: a pre-cr.48 daemon answers 200 + data → onResult, nothing polled ----
+  {
+    const env = makeEnv(function () { return { status: 200, body: { data: { verdict: 'ok', message: '' } } } })
+    const rec = readRecorder()
+    env.ANAS.readJob(Object.assign({ node: 'pve1', path: '/cloud/remotes/test', body: {} }, rec.opts))
+    await env.advanceTo(60000)
+    assert('r8: an older daemon\'s synchronous answer is the result', rec.names().join(',') === 'onResult' && rec.seen[0].args[0].verdict === 'ok')
+    assert('r8: nothing polled', env.jobPolls() === 0)
+  }
+
+  // --- r9: the view goes away before the 202 → the read is cancelled, quietly --
+  {
+    const view = { destroyed: false, destroying: false }
+    const env = makeEnv(function (method, url) {
+      if (method === 'POST' && url.indexOf('/cancel') !== -1) return { status: 202, body: { job: { id: 'C' } } }
+      if (method === 'POST') return { status: 202, body: readJobBody, delayMs: 300 }
+      return { status: 200, body: { job: { id: 'R', status: 'running' } } }
+    })
+    const rec = readRecorder()
+    env.ANAS.readJob(Object.assign({ node: 'pve1', path: '/backup/restore/browse', body: {}, view }, rec.opts))
+    view.destroyed = true
+    await env.advanceTo(60000)
+    assert('r9: the orphaned read was cancelled', env.calls.filter(c => c.url.indexOf('/jobs/R/cancel') !== -1).length === 1)
+    assert('r9: no callback reached the dead view', rec.names().length === 0)
+    assert('r9: and it was never polled', env.jobPolls() === 0)
   }
 
   if (!failures) {

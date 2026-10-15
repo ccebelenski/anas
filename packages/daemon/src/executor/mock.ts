@@ -157,8 +157,12 @@ export class MockExecutor implements CommandExecutor {
    */
   readonly deadlines: MockDeadlineCall[] = []
 
-  /** Every signal sent to a live child through its `onSpawn` handle, in order. */
-  readonly signals: { pid: number, signal: string }[] = []
+  /**
+   * Every signal sent to a live child through its `onSpawn` handle, in order.
+   * `group: true` marks one sent through `killGroup` (cr.48) — absent for the
+   * PID-only `kill`.
+   */
+  readonly signals: { pid: number, signal: string, group?: true }[] = []
 
   /** Live children still running, by pid — {@link finishLive} ends them. */
   private readonly liveChildren = new Map<number, (result: ExecResult) => void>()
@@ -258,17 +262,21 @@ export class MockExecutor implements CommandExecutor {
       const initial = this.resultOf(fixture)
       if (initial.stderr && opts?.onStderr && fixture.teeStderr !== false)
         opts.onStderr(initial.stderr)
+      const signal = (sig: NodeJS.Signals, group: boolean): boolean => {
+        if (gone)
+          return false
+        this.signals.push(group ? { pid, signal: sig, group: true } : { pid, signal: sig })
+        received++
+        if (received >= needed)
+          end(stopped)
+        return true
+      }
       const child: SpawnedChild = {
         pid,
-        kill: (signal) => {
-          if (gone)
-            return false
-          this.signals.push({ pid, signal })
-          received++
-          if (received >= needed)
-            end(stopped)
-          return true
-        },
+        kill: sig => signal(sig, false),
+        // A mock child is its own whole group (cr.48): the record says which
+        // door the signal came through.
+        killGroup: sig => signal(sig, true),
         exited: () => gone,
         exit,
       }

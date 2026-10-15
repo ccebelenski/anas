@@ -86,7 +86,8 @@
  *   DEL  /v1/cloud/remotes/:name                        → 202 { job } / 409
  *        (referencing tasks named in the message / config-encrypted)
  *   POST /v1/cloud/remotes/test  {name} | {remote:{name,type,options}}
- *                               → { data: {verdict, message} }
+ *                               → 202 { job } (cr.48: a READ job; the
+ *                                 verdict {verdict, message} is job.result)
  *
  * Test hooks: window 'anas-win-cloud-remotes' (grid 'anas-grid-cloud-remotes',
  * footer 'anas-cloud-footer', unavailable note 'anas-cloud-unavailable',
@@ -97,7 +98,10 @@
  * OAuth note 'anas-cloud-oauth', own-client fieldset 'anas-fld-cloud-own-client',
  * more-options fieldset 'anas-fld-cloud-more',
  * other keys 'anas-cloud-other-keys', Test 'anas-btn-cloud-remote-testconn',
- * verdict area 'anas-cloud-test-result', save 'anas-btn-cloud-remote-save').
+ * Test's Cancel 'anas-btn-cloud-test-cancel', verdict area
+ * 'anas-cloud-test-result', save 'anas-btn-cloud-remote-save'); the
+ * toolbar Test's window 'anas-win-cloud-remote-test' (same verdict area and
+ * Cancel).
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  * Fail-open everywhere: a broken window warns and returns, never breaks PVE.
@@ -388,30 +392,38 @@
     }
 
     // Toolbar Test: the SAVED remote, by name (the daemon reads its stored
-    // secret). The verdict sentence rides the toast — a pure read, no reload.
+    // secret). cr.48 — the Test is a READ job that can wait on a slow remote
+    // for up to two minutes, so it runs in a small window of its own: the
+    // progress line, a Cancel, and the verdict when it lands (the same area
+    // and the same runner as the dialog's Test). Closing the window stops the
+    // Test. A pure read: nothing reloads.
     function testRemoteRow(node, grid, rec) {
         if (!rec) {
             return;
         }
         var name = rec.get('name');
-        try { grid.setLoading(t('Testing') + ' ' + enc(name) + '…'); } catch (e) { /* non-fatal */ }
-        ANAS.api.post(node, '/cloud/remotes/test', { name: name }).then(function (res) {
-            try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
-            if (grid.destroyed || grid.destroying) {
-                return;
-            }
-            var d = (res && res.data) || {};
-            // The daemon's message is rclone's own text — encoded like the
-            // in-dialog verdict (renderCloudTestResult), never raw markup.
-            ANAS.toast(verdictSentence(d.verdict, d.message));
-        }, function (err) {
-            try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
-            if (grid.destroyed || grid.destroying) {
-                return;
-            }
-            ANAS.warn('cloud remote test failed: ' + ANAS.errText(err));
-            ANAS.alertMsg('Test failed', ANAS.errText(err));
-        });
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-cloud-remote-test',
+                title: t('Test') + ': ' + enc(name),
+                modal: true,
+                width: 520,
+                bodyPadding: 12,
+                layout: 'anchor',
+                items: [testResultArea()],
+                buttons: [
+                    testCancelButton(),
+                    { text: t('Close'), handler: function (btn) { btn.up('window').close(); } },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('cloud remote test window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win.on('destroy', function () { abandonTest(win); });
+        win.show();
+        runRemoteTest(win, node, { name: name });
     }
 
     function removeRemote(node, win, rec) {
@@ -1131,7 +1143,8 @@
         var ok = REMOTE_NAME_RE.test(name) && !!type && !missing && !tokenErr && !ownClientErr;
         try {
             var testBtn = win.down('#cloudTestBtn');
-            if (testBtn) { testBtn.setDisabled(!ok); }
+            // cr.48: held while a Test runs (its Cancel is the live button).
+            if (testBtn) { testBtn.setDisabled(!ok || win._cloudTestBusy === true); }
             var submit = win.down('#submit');
             if (submit) { submit.setDisabled(!ok); }
         } catch (e) {
@@ -1515,6 +1528,9 @@
     }
 
     function runDialogTest(win, node) {
+        if (win._cloudTestBusy === true) {
+            return;
+        }
         var name = trim(valOf(win, '#cloudRemoteName') || '');
         var type = trim(valOf(win, '#cloudRemoteType') || '');
         if (!REMOTE_NAME_RE.test(name) || !type || requiredMissing(win)) {
@@ -1526,32 +1542,157 @@
         if (!ownClientMark(win)) {
             return;
         }
+        runRemoteTest(win, node, testBody(win, name, type));
+    }
+
+    // ---- Running a Test (cr.48) ---------------------------------------------
+    //
+    // POST /cloud/remotes/test answers 202 + a READ job whose result is the
+    // verdict; ANAS.readJob polls it and carries the Cancel. ONE runner for
+    // both homes — the dialog's inline area and the toolbar's window — so the
+    // progress line, the Cancel and every outcome read the same in both. The
+    // window holds `#cloudTestResult` (the area) and `#cloudTestCancel` (the
+    // Cancel, shown only while a Test runs); the dialog's `#cloudTestBtn` is
+    // held disabled while it runs (refreshDialogButtons reads the busy flag).
+
+    function testResultArea() {
+        return {
+            xtype: 'container',
+            itemId: 'cloudTestResult',
+            cls: 'anas-cloud-test-result',
+            layout: { type: 'vbox', align: 'stretch' },
+            minHeight: 24,
+            items: [],
+        };
+    }
+
+    function testCancelButton(margin) {
+        return {
+            xtype: 'button',
+            itemId: 'cloudTestCancel',
+            cls: 'anas-btn-cloud-test-cancel',
+            text: t('Cancel test'),
+            iconCls: 'fa fa-stop',
+            hidden: true,
+            margin: margin,
+            handler: function (btn) {
+                var w = btn.up('window');
+                if (w && w._cloudTestJob) {
+                    w._cloudTestJob.cancel();
+                }
+            },
+        };
+    }
+
+    // One status line into the area (the verdict renderer has its own).
+    function setTestArea(win, html) {
         var area = win.down('#cloudTestResult');
-        if (area) {
+        if (!area) {
+            return;
+        }
+        try {
+            area.removeAll();
+            area.add({ xtype: 'component', cls: 'anas-cloud-test-status', html: html });
+        } catch (e) {
+            ANAS.warn('cloud test render failed: ' + ANAS.errText(e));
+        }
+    }
+
+    function spinnerHtml(text) {
+        return '<span style="color:var(--anas-muted,gray);">'
+            + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
+            + enc(text) + '</span>';
+    }
+
+    // Busy ON: Test held, Cancel shown and live. Busy OFF (every outcome):
+    // Cancel hidden and reset, Test back to whatever the dialog's gate says.
+    function setTestBusy(win, busy) {
+        win._cloudTestBusy = busy === true;
+        var cancel = win.down('#cloudTestCancel');
+        if (cancel) {
             try {
-                area.removeAll();
-                area.add({
-                    xtype: 'component',
-                    html: '<span style="color:var(--anas-muted,gray);">'
-                        + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
-                        + enc(t('testing remote…')) + '</span>',
-                });
+                cancel.setText(t('Cancel test'));
+                cancel.setDisabled(!busy);
+                cancel.setHidden(!busy);
             } catch (e) {
-                // non-fatal
+                // cosmetic
             }
         }
-        ANAS.api.post(node, '/cloud/remotes/test', testBody(win, name, type)).then(function (res) {
-            if (win.destroyed || win.destroying) {
-                return;
-            }
-            renderCloudTestResult(win, (res && res.data) || {});
-        }, function (err) {
-            if (win.destroyed || win.destroying) {
-                return;
-            }
-            ANAS.warn('cloud remote test failed: ' + ANAS.errText(err));
-            renderCloudTestResult(win, { verdict: 'error', message: ANAS.errText(err) });
+        if (win.down('#cloudTestBtn')) {
+            refreshDialogButtons(win);
+        }
+    }
+
+    // The window is closing: the Test it started stops with it.
+    function abandonTest(win) {
+        if (win._cloudTestJob) {
+            win._cloudTestJob.cancel({ quiet: true });
+            win._cloudTestJob = null;
+        }
+    }
+
+    function runRemoteTest(win, node, body) {
+        abandonTest(win);
+        setTestBusy(win, true);
+        setTestArea(win, spinnerHtml(t('testing remote…')));
+        var job;
+        function stale() {
+            return win.destroyed || win.destroying || win._cloudTestJob !== job;
+        }
+        function done() {
+            win._cloudTestJob = null;
+            setTestBusy(win, false);
+        }
+        job = ANAS.readJob({
+            node: node,
+            path: '/cloud/remotes/test',
+            body: body,
+            view: win,
+            what: t('The remote test'),
+            onCancelling: function () {
+                if (stale()) { return; }
+                var cancel = win.down('#cloudTestCancel');
+                if (cancel) {
+                    cancel.setDisabled(true);
+                    cancel.setText(t('Cancelling…'));
+                }
+                setTestArea(win, spinnerHtml(t('stopping the test…')));
+            },
+            onCancelFailed: function (msg) {
+                if (stale()) { return; }
+                var cancel = win.down('#cloudTestCancel');
+                if (cancel) {
+                    cancel.setDisabled(false);
+                    cancel.setText(t('Cancel test'));
+                }
+                setTestArea(win, spinnerHtml(t('testing remote…')));
+                ANAS.alertMsg('Cancel failed', msg);
+            },
+            onResult: function (result) {
+                if (stale()) { return; }
+                done();
+                renderCloudTestResult(win, result || {});
+            },
+            onError: function (msg) {
+                if (stale()) { return; }
+                done();
+                ANAS.warn('cloud remote test failed: ' + msg);
+                // Encoded by the renderer, like every verdict message.
+                renderCloudTestResult(win, { verdict: 'error', message: msg });
+            },
+            onCancelled: function () {
+                if (stale()) { return; }
+                done();
+                setTestArea(win, '<span style="color:var(--anas-muted,gray);">'
+                    + enc(t('Test cancelled — nothing was changed.')) + '</span>');
+            },
+            onLost: function (msg) {
+                if (stale()) { return; }
+                done();
+                setTestArea(win, '<span style="color:var(--anas-warn,#b06a12);">' + enc(msg) + '</span>');
+            },
         });
+        win._cloudTestJob = job;
     }
 
     // --- Submit ---------------------------------------------------------------
@@ -1763,15 +1904,24 @@
                             hidden: true,
                         },
                         {
-                            xtype: 'button',
-                            itemId: 'cloudTestBtn',
-                            cls: 'anas-btn-cloud-remote-testconn',
-                            text: t('Test'),
-                            iconCls: 'fa fa-plug',
-                            width: 120,
+                            // cr.48: Test and its Cancel side by side — the
+                            // Cancel shows only while a Test runs.
+                            xtype: 'container',
+                            layout: 'hbox',
                             margin: '4 0 0 0',
-                            disabled: true,
-                            handler: function () { runDialogTest(win, node); },
+                            items: [
+                                {
+                                    xtype: 'button',
+                                    itemId: 'cloudTestBtn',
+                                    cls: 'anas-btn-cloud-remote-testconn',
+                                    text: t('Test'),
+                                    iconCls: 'fa fa-plug',
+                                    width: 120,
+                                    disabled: true,
+                                    handler: function () { runDialogTest(win, node); },
+                                },
+                                testCancelButton('0 0 0 8'),
+                            ],
                         },
                         {
                             xtype: 'container',
@@ -1819,6 +1969,8 @@
             rebuildOptionFields(win, provs, isEdit, win._cloudStoredOptions || {});
         };
         win._cloudRefresh = function () { refreshDialogButtons(win); };
+        // cr.48: a Test still running when the dialog closes stops with it.
+        win.on('destroy', function () { abandonTest(win); });
 
         win.show();
         // The type combo's change listener does not fire for the initial
@@ -3370,8 +3522,10 @@
     // ---- Preview (the rider — the dry run) ----------------------------------
     //
     // POST /cloud/tasks/preview is a USER-INITIATED, one-shot READ (the backup
-    // wizard's prune-preview precedent): never polled, never automatic. The
-    // wizard sends its UNSAVED form inline — the CloudSyncPreviewRequest shape,
+    // wizard's prune-preview precedent): never automatic. cr.48 — it answers
+    // 202 + a READ job with a ten-minute ceiling (the counters arrive as
+    // job.result, rclone's periodic stats as the progress line), and the line
+    // carries a Cancel while it runs. The wizard sends its UNSAVED form inline — the CloudSyncPreviewRequest shape,
     // the task's data fields WITHOUT the management keys a dry run never reads
     // (name, schedule, cadence, notify, enabled); the grid toolbar sends the
     // saved task's {name}. One renderer, two homes: the wizard's summary line
@@ -3383,23 +3537,26 @@
     var EMPTY_SOURCE_PREVIEW = 'an empty source in sync mode would delete '
         + 'everything at the destination';
 
-    function previewPendingHtml() {
+    // The waiting line; `progress` is the job's own line (rclone's counters so
+    // far) once the dry run has reported one.
+    function previewPendingHtml(progress) {
         return '<div style="color:var(--anas-muted,gray);font-size:11px;">'
             + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
-            + enc(t('asking the server…')) + '</div>';
+            + enc(t('asking the server…')) + (progress ? ' ' + enc(progress) : '') + '</div>';
     }
 
     function countWord(n, one, many) {
         return n === 1 ? one : many;
     }
 
-    // The 12 s ceiling (cr.35r) fired: what is on screen is a partial answer, and the
-    // line says exactly what a partial answer is — the counters are rclone's
-    // last periodic tick, the list is everything it logged, neither is whole.
+    // The ceiling (cr.48: ten minutes) fired: what is on screen is a partial
+    // answer, and the line says exactly what a partial answer is — the
+    // counters are rclone's last periodic tick, the list is everything it
+    // logged, neither is whole.
     function previewTruncatedHtml() {
         return '<div style="color:var(--anas-warn,#b06a12);font-size:11px;">'
-            + enc(t('stopped after 12 s — the counts are what rclone had reported '
-                + 'by then, the list is everything it logged; the full run will do '
+            + enc(t('stopped at the preview\'s time limit — the counts are what rclone had '
+                + 'reported by then, the list is everything it logged; the full run will do '
                 + 'the rest')) + '</div>';
     }
 
@@ -3480,15 +3637,122 @@
         return lines.join('');
     }
 
-    // A guard refusal (the unmounted mount) is the answer the user came for —
-    // the daemon's own sentence, in the line, in red. Everything else warns the
-    // console as well.
-    function previewErrorHtml(err) {
+    // A guard refusal (the unmounted mount, a 400 at the door) is the answer
+    // the user came for — the daemon's own sentence, in the line, in red.
+    // Everything else (a failed job, another refusal) warns the console as
+    // well. `msg` is the daemon's raw text; it is encoded here.
+    function previewErrorHtml(msg, err) {
         if (!err || err.status !== 400) {
-            ANAS.warn('cloud preview failed: ' + ANAS.errText(err));
+            ANAS.warn('cloud preview failed: ' + msg);
         }
         return '<div style="color:var(--anas-danger,#c23b2c);font-size:11px;">'
-            + enc(ANAS.errText(err)) + '</div>';
+            + enc(msg) + '</div>';
+    }
+
+    function previewNoteHtml(text, color) {
+        return '<div style="color:' + color + ';font-size:11px;">' + enc(text) + '</div>';
+    }
+
+    // The Preview's Cancel (cr.48), the same button in both homes — shown
+    // only while a preview runs; it cancels the window's own job.
+    function previewCancelButton(margin) {
+        return {
+            xtype: 'button',
+            itemId: 'cloudPreviewCancel',
+            cls: 'anas-btn-cloud-preview-cancel',
+            text: t('Cancel preview'),
+            iconCls: 'fa fa-stop',
+            hidden: true,
+            margin: margin,
+            handler: function (btn) {
+                var w = btn.up('window');
+                if (w && w._previewJob) {
+                    w._previewJob.cancel();
+                }
+            },
+        };
+    }
+
+    function setPreviewCancel(win, busy, cancelling) {
+        var cancel = win.down('#cloudPreviewCancel');
+        if (!cancel) {
+            return;
+        }
+        try {
+            cancel.setText(cancelling ? t('Cancelling…') : t('Cancel preview'));
+            cancel.setDisabled(!busy || cancelling === true);
+            cancel.setHidden(!busy);
+        } catch (e) {
+            // cosmetic
+        }
+    }
+
+    // A preview still running whose answer nobody will read any more (the
+    // inputs changed, the window closed) is stopped, quietly.
+    function abandonPreview(win) {
+        if (win._previewJob) {
+            win._previewJob.cancel({ quiet: true });
+            win._previewJob = null;
+        }
+        setPreviewCancel(win, false);
+    }
+
+    // ONE runner for both homes (cr.48): POST, then the read job — the
+    // waiting line with rclone's counters so far, the Cancel, and exactly one
+    // final line for every outcome. `settled()` runs on every outcome (the
+    // caller's busy state), `seq` is the window's request token: an answer
+    // to a request a newer one superseded paints nothing.
+    function runCloudPreview(win, node, body, seq, settled) {
+        abandonPreview(win);
+        setPreviewLine(win, previewPendingHtml());
+        setPreviewCancel(win, true);
+        var job;
+        function stale() {
+            return win.destroyed || win.destroying || win._previewSeq !== seq || win._previewJob !== job;
+        }
+        function done(html) {
+            win._previewJob = null;
+            setPreviewCancel(win, false);
+            settled();
+            setPreviewLine(win, html);
+        }
+        job = ANAS.readJob({
+            node: node,
+            path: '/cloud/tasks/preview',
+            body: body,
+            view: win,
+            what: t('The preview'),
+            onProgress: function (progress) {
+                if (stale()) { return; }
+                setPreviewLine(win, previewPendingHtml(progress));
+            },
+            onCancelling: function () {
+                if (stale()) { return; }
+                setPreviewCancel(win, true, true);
+            },
+            onCancelFailed: function (msg) {
+                if (stale()) { return; }
+                setPreviewCancel(win, true);
+                ANAS.alertMsg('Cancel failed', msg);
+            },
+            onResult: function (result) {
+                if (stale()) { settled(); return; }
+                done(cloudPreviewHtml(result || {}));
+            },
+            onError: function (msg, err) {
+                if (stale()) { settled(); return; }
+                done(previewErrorHtml(msg, err));
+            },
+            onCancelled: function () {
+                if (stale()) { settled(); return; }
+                done(previewNoteHtml(t('Preview cancelled — nothing was copied or deleted.'), 'var(--anas-muted,gray)'));
+            },
+            onLost: function (msg) {
+                if (stale()) { settled(); return; }
+                done(previewNoteHtml(msg, 'var(--anas-warn,#b06a12)'));
+            },
+        });
+        win._previewJob = job;
     }
 
     // The line both windows render into — the same itemId on purpose, so one
@@ -3512,6 +3776,8 @@
     // sequence drops whatever answer is still in flight: its inputs are gone.
     function refreshCloudPreview(win) {
         win._previewSeq = (win._previewSeq || 0) + 1;
+        // cr.48: the job computing the withdrawn answer is stopped too.
+        abandonPreview(win);
         var fields = cloudTaskFields(win);
         setPreviewEnabled(win, false, !fields.source || !fields.remote);
         setPreviewLine(win, '');
@@ -3561,19 +3827,12 @@
         var body = cloudPreviewBody(win);
         var seq = (win._previewSeq = (win._previewSeq || 0) + 1);
         setPreviewEnabled(win, true);
-        setPreviewLine(win, previewPendingHtml());
-        ANAS.api.post(node, '/cloud/tasks/preview', body).then(function (res) {
-            if (win.destroyed || win.destroying || win._previewSeq !== seq) {
-                return;
+        runCloudPreview(win, node, body, seq, function () {
+            // Every outcome releases the button — unless a newer request
+            // (another Preview, or a field change) owns it now.
+            if (!win.destroyed && !win.destroying && win._previewSeq === seq) {
+                setPreviewEnabled(win, false);
             }
-            setPreviewEnabled(win, false);
-            setPreviewLine(win, cloudPreviewHtml((res && res.data) || {}));
-        }, function (err) {
-            if (win.destroyed || win.destroying || win._previewSeq !== seq) {
-                return;
-            }
-            setPreviewEnabled(win, false);
-            setPreviewLine(win, previewErrorHtml(err));
         });
     }
 
@@ -3604,13 +3863,22 @@
                     html: previewPendingHtml(),
                 }],
                 buttons: [
-                    { text: t('Close'), handler: function () { win.close(); } },
+                    previewCancelButton(),
+                    { text: t('Close'), handler: function (b) { b.up('window').close(); } },
                 ],
             });
         } catch (e) {
             ANAS.warn('cloud preview window failed: ' + ANAS.errText(e));
             return;
         }
+        // cr.48: closing the window stops the preview it is waiting on — and
+        // hands the toolbar button back (a quiet cancel answers nobody).
+        win.on('destroy', function () {
+            abandonPreview(win);
+            if (win._releasePreviewBtn) {
+                win._releasePreviewBtn();
+            }
+        });
         win.show();
         var seq = (win._previewSeq = (win._previewSeq || 0) + 1);
         try {
@@ -3631,19 +3899,8 @@
                 }
             }
         };
-        ANAS.api.post(node, '/cloud/tasks/preview', { name: name }).then(function (res) {
-            releaseBtn();
-            if (win.destroyed || win.destroying || win._previewSeq !== seq) {
-                return;
-            }
-            setPreviewLine(win, cloudPreviewHtml((res && res.data) || {}));
-        }, function (err) {
-            releaseBtn();
-            if (win.destroyed || win.destroying || win._previewSeq !== seq) {
-                return;
-            }
-            setPreviewLine(win, previewErrorHtml(err));
-        });
+        win._releasePreviewBtn = releaseBtn;
+        runCloudPreview(win, node, { name: name }, seq, releaseBtn);
     }
 
     // ---- Task wizard (create / edit) — 'anas-win-cloud-task' ----------------
@@ -4040,6 +4297,7 @@
                                         previewCloudTaskForm(win, node);
                                     },
                                 },
+                                previewCancelButton('0 0 0 8'),
                                 {
                                     xtype: 'component',
                                     flex: 1,
@@ -4156,6 +4414,8 @@
             refreshCloudPreview(win);
         };
         win._cloudRemoteTypes = remoteTypes || {};
+        // cr.48: a preview still running when the wizard closes stops with it.
+        win.on('destroy', function () { abandonPreview(win); });
         win.show();
         syncSmbPathHint(win); // the opening remote's type decides the SMB hint
         ANAS.sched.cadence.syncFields(win); // show only the fields the opening cadence uses

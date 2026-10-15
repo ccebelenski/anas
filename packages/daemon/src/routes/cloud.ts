@@ -1,6 +1,5 @@
 import type {
   CloudProvider,
-  CloudRemoteTestRequest,
   CloudRemoteTestResult,
   CloudRemoteWrite,
   CloudSyncPreviewResult,
@@ -28,12 +27,13 @@ import {
 } from '@anas/shared'
 import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
+import { READ_JOB_OPERATIONS, readJobCancel } from '../jobs/read-jobs.js'
 import { ConfirmStore } from '../safety/confirm.js'
 import { confirmGate } from '../safety/gate.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyCloudRun } from '../services/cloud-notify.js'
-import { previewCloudSync, PreviewRefusal } from '../services/cloud-preview.js'
+import { checkPreviewSource, PreviewRefusal, runPreview } from '../services/cloud-preview.js'
 import { describeChange, describeTasks, destinationChanges, tasksReachingRemote } from '../services/cloud-retarget.js'
 import { runCloudSync } from '../services/cloud-runner.js'
 import {
@@ -61,7 +61,7 @@ import {
 } from '../services/cloud-units.js'
 import { ConfigConflictError } from '../services/config-writer.js'
 import { scanNestedFilesystems } from '../services/nested-filesystems.js'
-import { normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, RemoteNotFoundError, remotesReferencing, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
+import { normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, remotesReferencing, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
 import { testRemote } from '../services/rclone-probe.js'
 import { pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
 import { zodIssue } from '../validation.js'
@@ -76,10 +76,10 @@ import { requireIdentity } from './identity.js'
  *   POST   /v1/cloud/remotes          → 202 job (surgical INI write + gate)
  *   PUT    /v1/cloud/remotes/:name    → 202 job (type immutable; 409 + confirm when it re-points tasks)
  *   DELETE /v1/cloud/remotes/:name    → 202 job (409 while a task references it)
- *   POST   /v1/cloud/remotes/test     → 200 { verdict, message } (bounded lsjson, no job)
+ *   POST   /v1/cloud/remotes/test     → 202 read job → result { verdict, message } (bounded lsjson; cr.48)
  *   GET    /v1/cloud/tasks            → the grid: task + LOCAL-ONLY systemd status
  *   POST   /v1/cloud/tasks            → 202 job (remote must exist; schedule validated)
- *   POST   /v1/cloud/tasks/preview    → 200 dry run on the LIVE source (no job, no notify)
+ *   POST   /v1/cloud/tasks/preview    → 202 read job → the dry run on the LIVE source (no notify; cr.48)
  *   GET    /v1/cloud/tasks/:name      → detail: consistency, nested, unit+timer, journal
  *   PUT    /v1/cloud/tasks/:name      → 202 job (update / enable / disable)
  *   DELETE /v1/cloud/tasks/:name      → 202 job (units only; the remote is untouched)
@@ -540,7 +540,12 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     return { job }
   })
 
-  // --- POST /cloud/remotes/test — bounded lsjson (200, no job) --------------
+  // --- POST /cloud/remotes/test — bounded lsjson, a READ job (cr.48) --------
+  // 202 + a job whose result is the verdict: a slow remote is waited for (up
+  // to PROBE_TIMEOUT_S) and the dialog's Cancel stops the probe's process
+  // group. The validation and the 503 door answer before the 202; a remote
+  // the config file does not carry fails the JOB with the not-found sentence
+  // (that fact comes from rclone's own answer, inside the job).
   server.post('/cloud/remotes/test', async (request, reply) => {
     const parsed = CloudRemoteTestRequestSchema.safeParse(request.body ?? {})
     if (!parsed.success) {
@@ -568,30 +573,39 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     if (!identity)
       return
 
-    const data = await guard503(reply, async () => {
+    const ready = await guard503(reply, async () => {
       await requireRclone()
-      // The catalogue is needed only for the UNSAVED target (it decides which
-      // option values are password-typed and go in obscured on the env).
-      const provs = req.remote ? await providers() : undefined
-      let result: CloudRemoteTestResult
-      try {
-        result = await testRemote(executor, paths, { name: req.name, remote: req.remote }, { path: req.path, providers: provs })
-      }
-      catch (err) {
-        // The config file does not carry the name — a local fact, the route's
-        // 404 (never a verdict).
-        if (err instanceof RemoteNotFoundError) {
-          reply.code(404).send({ error: { code: 'NOT_FOUND', message: err.message } })
-          return null
-        }
-        throw err
-      }
-      auditTest(identity, req, result)
-      return result
+      return true as const
     })
-    if (data === undefined || data === null)
+    if (ready === undefined)
       return undefined
-    return { data }
+
+    const label = req.name ?? req.remote?.name ?? ''
+    const job = jobQueue.submit(
+      READ_JOB_OPERATIONS.cloudRemoteTest,
+      // The job IS the audit record now (submitted + finished lines); before
+      // cr.48 a stand-in job carried the verdict in its params.
+      { ...identity, params: { remote: req.name ?? req.remote?.type, path: req.path ?? '' } },
+      async (_progress, ctx): Promise<CloudRemoteTestResult> => {
+        // FIRST, so a running Test always has its hook (the cancel route
+        // never answers "not cancellable" for one).
+        const cancel = readJobCancel(ctx, 'rclone lsjson', `Test of remote '${label}'`)
+        return rcloneJob(async () => {
+          // The catalogue is needed only for the UNSAVED target (it decides
+          // which option values are password-typed and go in obscured on the
+          // env).
+          const provs = req.remote ? await providers() : undefined
+          return testRemote(executor, paths, { name: req.name, remote: req.remote }, {
+            path: req.path,
+            providers: provs,
+            onSpawn: cancel.onSpawn,
+            checkpoint: cancel.checkpoint,
+          })
+        })
+      },
+    )
+    reply.code(202)
+    return { job }
   })
 
   // =========================================================================
@@ -729,11 +743,12 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
 
   // --- POST /cloud/tasks/preview — the dry run (rclone.2 addendum) -----------
   // A USER-INITIATED READ, registered BEFORE any /cloud/tasks/:name door so
-  // the literal segment is never read as a task name. 200 with rclone's own
-  // counters — NO job (it mutates nothing), NO notification, no audit of its
-  // own beyond the request log. The unmounted-mount guard refuses (400, the
-  // run's sentence); the empty-source guard does NOT — a sync preview that
-  // shows it would delete everything is the point.
+  // the literal segment is never read as a task name. cr.48: a READ job (202,
+  // rclone's own counters in `job.result`, its periodic stats as the job's
+  // progress line) with a ten-minute ceiling and a Cancel — NO notification.
+  // The unmounted-mount guard refuses at the door (400, the run's sentence)
+  // before any job exists; the empty-source guard does NOT — a sync preview
+  // that shows it would delete everything is the point.
   server.post('/cloud/tasks/preview', async (request, reply) => {
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -777,11 +792,13 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       task = parsed.data
     }
 
-    let data: CloudSyncPreviewResult | undefined
+    const deps = { task, paths, fstabPath }
+    let ready: true | undefined
     try {
-      data = await guard503(reply, async () => {
+      ready = await guard503(reply, async () => {
         await requireRclone()
-        return previewCloudSync(executor, { task, paths, fstabPath })
+        await checkPreviewSource(executor, deps)
+        return true as const
       })
     }
     catch (err) {
@@ -795,9 +812,24 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: err.message } }
     }
-    if (data === undefined)
+    if (ready === undefined)
       return undefined
-    return { data }
+
+    const subject = 'name' in task ? `Preview of cloud sync task '${task.name}'` : 'Cloud sync preview'
+    const job = jobQueue.submit(
+      READ_JOB_OPERATIONS.cloudPreview,
+      { ...identity, params: { source: task.source, remote: task.remote, path: task.path, mode: task.mode } },
+      async (updateProgress, ctx): Promise<CloudSyncPreviewResult> => {
+        const cancel = readJobCancel(ctx, 'rclone dry run', subject)
+        return rcloneJob(() => runPreview(executor, deps, {
+          onSpawn: cancel.onSpawn,
+          checkpoint: cancel.checkpoint,
+          updateProgress,
+        }))
+      },
+    )
+    reply.code(202)
+    return { job }
   })
 
   // --- GET /cloud/tasks/:name — detail --------------------------------------
@@ -1108,11 +1140,4 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
    * replication-remotes' auditTest carries). The params are the remote's NAME
    * or the dialog's TYPE, the path and the verdict — never an option value.
    */
-  function auditTest(identity: NonNullable<ReturnType<typeof requireIdentity>>, req: CloudRemoteTestRequest, result: CloudRemoteTestResult): void {
-    jobQueue.submit(
-      'cloud.remote.test',
-      { ...identity, params: { remote: req.name ?? req.remote?.type, path: req.path ?? '', verdict: result.verdict } },
-      async () => ({ verdict: result.verdict }),
-    )
-  }
 }

@@ -2,6 +2,7 @@ import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { apiContext, expect, test } from './fixtures/auth'
+import { readJob } from './fixtures/cloud-api'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
 
@@ -477,10 +478,11 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
       // The sync PREVIEW of the saved task must read the live source and name
       // b.bin as a would-be delete — rclone's own `skipped: delete` object,
       // counted in its own `deletes` counter.
-      const res = await ctx.post(`${V1}/cloud/tasks/preview`, { data: { name: 'gtsync' } })
-      expect(res.status(), await res.text()).toBe(200)
-      const preview = (await res.json()).data
-      expect(preview.truncated, 'the look finished inside the 15 s ceiling').toBe(false)
+      // cr.48: a READ job; its result is the old body.
+      const previewJob = await readJob(ctx, `${V1}/cloud/tasks/preview`, { name: 'gtsync' })
+      expect(previewJob.status, previewJob.error?.message).toBe('completed')
+      const preview = previewJob.result
+      expect(preview.truncated, 'the look finished inside the ceiling').toBe(false)
       expect(preview.deletes).toBeGreaterThanOrEqual(1)
       expect(preview.deletedFiles).toContain('b.bin')
       expect(preview.deletedTotal, 'the count and the list agree on a small destination').toBe(preview.deletedFiles.length)
@@ -632,14 +634,17 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
       // answered zero counters with an empty `errors` would be
       // byte-identical to an honest "nothing to do", which is the one lie
       // this endpoint must never tell.
-      const failedPreview = await ctx.post(`${V1}/cloud/tasks/preview`, {
-        data: { source: SRC, remote: BAD_REMOTE, path: 'dst/fail', mode: 'copy' },
+      const failedPreview = await readJob(ctx, `${V1}/cloud/tasks/preview`, {
+        source: SRC,
+        remote: BAD_REMOTE,
+        path: 'dst/fail',
+        mode: 'copy',
       })
-      expect(failedPreview.status(), await failedPreview.text()).toBe(200)
-      const bad = (await failedPreview.json()).data
+      expect(failedPreview.status, 'a failing dry run is still a COMPLETED read: its errors carry rclone\'s sentence').toBe('completed')
+      const bad = failedPreview.result
       expect(bad.errors.length, 'the failure is reported, not swallowed').toBeGreaterThan(0)
       expect(bad.errors[0]).toMatch(/NewFs|couldn't connect SSH/)
-      expect(bad.truncated, 'rclone\'s own retries finish inside the 120 s ceiling').toBe(false)
+      expect(bad.truncated, 'rclone\'s own retries finish inside the ceiling').toBe(false)
       expect(bad.transfers).toBe(0)
       expect(bad.bytes).toBe(0)
       expect(bad.checks).toBe(0)

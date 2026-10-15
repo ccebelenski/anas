@@ -23,7 +23,8 @@ const execFileAsync = promisify(execFile)
  *   2. Edit → the password box is blank ("(unchanged)") → change the USER and
  *      save → the file's `user =` line moves while the `pass =` line stays
  *      byte-identical (ssh; the secret is write-only), then the user goes back.
- *   3. Test from the toolbar → "Reachable" (the saved remote, by name).
+ *   3. Test from the toolbar → "Reachable" (the saved remote, by name), in
+ *      the Test's own window (cr.48: a cancellable read job).
  *   4. A wrong-password UNSAVED dialog → the "Authentication failed" verdict.
  *   5. The S3 form waits for a provider pick, then shows exactly ONE `region`
  *      row — and it is the PICKED provider's row, not rclone's `!AWS,…`
@@ -344,8 +345,14 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     const win = await openRemotesWindow(page)
     await remoteRow(page, win, REMOTE).click()
     await win.locator('.anas-btn-cloud-remote-test').click()
-    // The verdict sentence rides the toast.
-    await expect(page.locator('.x-toast', { hasText: 'Reachable' })).toBeVisible({ timeout: 60_000 })
+    // cr.48: the Test runs as a read job in a window of its own — the
+    // verdict lands there, and its Cancel goes away with the answer.
+    const testWin = page.locator('.anas-win-cloud-remote-test')
+    await expect(testWin).toBeVisible({ timeout: 15_000 })
+    await expect(testWin.locator('.anas-cloud-test-verdict')).toContainText('Reachable', { timeout: 150_000 })
+    await expect(testWin.locator('.anas-btn-cloud-test-cancel')).toBeHidden()
+    await testWin.locator('.x-tool-close').click()
+    await expect(testWin).toBeHidden({ timeout: 15_000 })
   })
 
   test('4 — a wrong password in an UNSAVED dialog: the Authentication-failed verdict', async ({ page }) => {

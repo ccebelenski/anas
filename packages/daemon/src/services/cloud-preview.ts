@@ -1,6 +1,6 @@
 import type { CloudSyncPreviewResult, CloudSyncTask } from '@anas/shared'
-import type { CommandExecutor } from '../executor/types.js'
-import type { RcloneLogState } from './cloud-runner.js'
+import type { CommandExecutor, SpawnedChild } from '../executor/types.js'
+import type { RcloneLogState, RcloneStats } from './cloud-runner.js'
 import type { RcloneConfigPaths } from './rclone-config.js'
 import { stat } from 'node:fs/promises'
 import {
@@ -21,7 +21,11 @@ import { guardSourcePath, readSourceGuardFacts } from './source-guard.js'
  * rclone command a run would issue, with `--dry-run` and a wall ceiling, read
  * against the LIVE source. DESIGN's words: "a preview is a look, not a run" —
  * so it takes NO snapshot (a transient would be pure cost the look does not
- * pay), it answers 200 with rclone's own counters, and it writes nothing.
+ * pay), it answers with rclone's own counters, and it writes nothing. Since
+ * cr.48 (operator ruling 2026-10-15) the look runs as a cancellable READ job
+ * with a ceiling of minutes: the route checks the source here
+ * ({@link checkPreviewSource}, a 400 at the door) and the job runs
+ * {@link runPreview}.
  *
  * What it reuses, and why the preview is thin:
  *   - `buildRcloneArgs` with `dryRun: true` — ONE argv builder; the preview
@@ -61,17 +65,20 @@ import { guardSourcePath, readSourceGuardFacts } from './source-guard.js'
 const TIMEOUT = '/usr/bin/timeout'
 
 /**
- * The whole preview's wall budget, in seconds (the `timeout` argument).
+ * The whole preview's wall ceiling, in seconds (the `timeout` argument): ten
+ * minutes (cr.48, operator ruling 2026-10-15 — "minutes, not seconds").
  *
- * cr.35r: 12 s, down from 15 s (25 was already down from 120 s, which a
- * synchronous read could never answer). At 12 s the wrapper fires first and
- * the preview ends as itself (`truncated: true`, the counts so far) — the
- * daemon answers the browser before the gateway's 20 s socket budget does,
- * and the executor's own deadline (12 s + the 5 s wrapper margin, 17 s)
- * still lands inside it (WAVE3-DESIGN §6.2 ladder).
+ * The preview is a JOB now, so the gateway's 20 s socket budget no longer
+ * bounds it (cr.35r's 12 s was that budget's arithmetic). A dry run walks the
+ * whole source and lists the whole destination: a large tree against a slow
+ * remote legitimately takes minutes, and the operator can stop it at any
+ * time (the dialog's Cancel). The wrapper stays because its exit 124 is what
+ * makes a ceiling hit read as itself — `truncated: true` with the counts so
+ * far — and never as the executor's job-lane timeout, whose sentence ("what
+ * it was acting on is in an unknown state") would be a lie about a read. The
+ * executor's own deadline sits the wrapper margin (5 s) above it.
  */
-// Q3 (WAVE3-DESIGN §10): job or sync is the operator's call
-export const PREVIEW_TIMEOUT_S = 12
+export const PREVIEW_TIMEOUT_S = 600
 
 /** `timeout`'s own exit code when it is the one that killed the child. */
 export const TIMEOUT_EXIT_CODE = 124
@@ -105,6 +112,25 @@ export class PreviewRefusal extends Error {
  */
 export type PreviewTask = Pick<CloudSyncTask, 'source' | 'remote' | 'path' | 'mode' | 'excludes' | 'bwlimit'>
 
+/** What the job body hands the look (cr.48): the cancel seam and the progress line. */
+export interface PreviewRunHooks {
+  /** The exec's `onSpawn` — the job's read-cancel hook takes the child here. */
+  onSpawn?: (child: SpawnedChild) => void
+  /** Called before the exec: throws (JobCancelledError) when a cancel was already accepted. */
+  checkpoint?: (next: string) => void
+  /** rclone's periodic stats, as one progress line ({@link previewProgressLine}). */
+  updateProgress?: (line: string) => void
+}
+
+/**
+ * One periodic stats object as the preview job's progress line — rclone's own
+ * counters, labelled, nothing derived (the run's `statsProgressLine` idiom, in
+ * the would-be words of a dry run).
+ */
+export function previewProgressLine(stats: RcloneStats): string {
+  return `${stats.checks} checked, ${stats.transfers} to transfer (${stats.bytes} bytes), ${stats.deletes} to delete`
+}
+
 export interface CloudPreviewDeps {
   task: PreviewTask
   /** Where ANAS's own rclone.conf lives (every invocation names it). */
@@ -133,10 +159,23 @@ export interface CloudPreviewDeps {
 export async function previewCloudSync(
   executor: CommandExecutor,
   deps: CloudPreviewDeps,
+  hooks: PreviewRunHooks = {},
 ): Promise<CloudSyncPreviewResult> {
-  const { task } = deps
+  await checkPreviewSource(executor, deps)
+  return runPreview(executor, deps, hooks)
+}
 
-  // ---- The guards (the run's own, minus the empty-source one) ------------
+/**
+ * The preview's guards — the run's own, minus the empty-source one. Throws a
+ * {@link PreviewRefusal} with the run's sentence; the route answers it 400
+ * BEFORE the job is submitted (cr.48), so the refusal still arrives as the
+ * door's answer, not as a failed job.
+ */
+export async function checkPreviewSource(
+  executor: CommandExecutor,
+  deps: CloudPreviewDeps,
+): Promise<void> {
+  const { task } = deps
   // The unmounted-mount check first: the one that explains an empty
   // directory, and the only one that can answer without touching the path.
   const guardFacts = await readSourceGuardFacts(executor, deps.fstabPath, [task.source])
@@ -152,18 +191,33 @@ export async function previewCloudSync(
 
   // Deliberately ABSENT: the empty-source guard. A `sync` preview of an empty
   // source reporting "would delete everything" is the point.
+}
 
-  // ---- The look ------------------------------------------------------------
+/**
+ * The look itself: the run's argv plus `--dry-run`, under the
+ * {@link PREVIEW_TIMEOUT_S} wrapper. A rclone failure is NOT a throw (see
+ * {@link previewCloudSync}); a cancel stops the child through `hooks.onSpawn`
+ * and the job ends `cancelled` whatever this returns.
+ */
+export async function runPreview(
+  executor: CommandExecutor,
+  deps: CloudPreviewDeps,
+  hooks: PreviewRunHooks = {},
+): Promise<CloudSyncPreviewResult> {
+  const { task } = deps
   const args = buildRcloneArgs(task, deps.paths.configFile, task.source, { dryRun: true })
   // The executor-side argv backstop, uniform with every other rclone call
   // ANAS makes (the run's own call, over the same argv).
   assertNoSecretValues(args, deps.secrets ?? [])
 
-  const { exitCode, log } = await execRcloneLog(executor, TIMEOUT, [
-    String(PREVIEW_TIMEOUT_S),
-    RCLONE,
-    ...args,
-  ])
+  hooks.checkpoint?.('the dry run')
+  const { exitCode, log } = await execRcloneLog(
+    executor,
+    TIMEOUT,
+    [String(PREVIEW_TIMEOUT_S), RCLONE, ...args],
+    hooks.updateProgress ? stats => hooks.updateProgress?.(previewProgressLine(stats)) : undefined,
+    hooks.onSpawn,
+  )
   const stats = finalStats(log)
   const truncated = exitCode === TIMEOUT_EXIT_CODE
   return {
@@ -199,7 +253,7 @@ export async function previewCloudSync(
 function previewErrors(mode: string, exitCode: number, truncated: boolean, log: RcloneLogState): string[] {
   if (log.errorLines.length)
     return log.errorLines
-  // D9: the 15 s wrapper can end a preview while rclone has already said what
+  // D9: the wrapper can end a preview while rclone has already said what
   // is wrong — a wrong credential prints its pre-logger plain line and keeps
   // retrying past the ceiling. The last RAW line rclone wrote answers the
   // "what went wrong" question an empty `errors` would leave open, so the
