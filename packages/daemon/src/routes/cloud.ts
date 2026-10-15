@@ -68,7 +68,7 @@ import { scanNestedFilesystems } from '../services/nested-filesystems.js'
 import { normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, remotesReferencing, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
 import { testRemote } from '../services/rclone-probe.js'
 import { pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
-import { activeRunDeleteRefusal, readUnitTaskObject, serviceUnitRevision, taskRunInFlight } from '../services/task-units.js'
+import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision, taskRunInFlight } from '../services/task-units.js'
 import { zodIssue } from '../validation.js'
 import { requireIdentity } from './identity.js'
 
@@ -756,10 +756,21 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     unbound: () => `Could not read cloud sync task '${name}' — refusing`,
   })
 
-  /** The Q1 active-run gate: the direct run job, or the unit systemd reports active. */
+  /**
+   * The Q1 active-run gate: the direct run job, or the unit systemd reports
+   * active. cr.41b: the read FAILS CLOSED — a `systemctl show` that cannot
+   * answer refuses rather than reading "not running", because an unreadable run
+   * state is not evidence the run is over and a delete must not remove a unit
+   * whose run it could not see (guards fail loud).
+   */
   async function cloudTaskActiveRunGate(name: string): Promise<Refusal | null> {
-    const inFlight = await taskRunInFlight(jobQueue, 'cloud.task.run', executor, CLOUD_UNIT_KIND, name)
-    return inFlight.job || inFlight.unit ? activeRunDeleteRefusal(`Cloud sync task '${name}'`, inFlight) : null
+    try {
+      const inFlight = await taskRunInFlight(jobQueue, 'cloud.task.run', executor, CLOUD_UNIT_KIND, name)
+      return inFlight.job || inFlight.unit ? activeRunDeleteRefusal(`Cloud sync task '${name}'`, inFlight) : null
+    }
+    catch {
+      return runStateUnreadableRefusal(`Cloud sync task '${name}'`)
+    }
   }
 
   /** A create's object is the name SLOT: existence is a gate, re-run in the job under the name key. */
@@ -788,10 +799,24 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     }
   }
 
-  function cloudTaskDeleteSpec(name: string): GuardSpec<UnitTaskObject<CloudSyncTask>> {
+  function cloudTaskDeleteSpec(name: string): GuardSpec<{ unit: string, timer: string }> {
     return {
       operation: 'cloud.task.remove',
-      object: cloudTaskView(name),
+      // cr.41b: the delete's object is the unit AS STORED — the stores' own
+      // existence (a `.service` on disk), never the parsed task. A unit whose
+      // X-ANAS-Task no longer parses (a hand edit; a task an older ANAS wrote)
+      // is skipped by the list AND by a parsed-object read, which would answer
+      // 404 on exactly the unit the operator needs to remove — this read makes
+      // it deletable. The UPDATE spec above stays bound to the parsed object:
+      // an edit cannot be bound to bytes that do not parse — 404 not-found is
+      // right there.
+      object: {
+        what: `Cloud sync task '${name}'`,
+        read: () => readUnitStoreEntry(readUnitTexts, systemdDir, name),
+        id: async () => ({ task: name }),
+        notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `Cloud sync task '${name}' not found` }),
+        unbound: () => `Could not read cloud sync task '${name}' — refusing`,
+      },
       gates: [async () => cloudTaskActiveRunGate(name)],
       locks: async () => [taskClaim('cloud', name, 'exclusive')],
     }

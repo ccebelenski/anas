@@ -117,6 +117,24 @@ export async function showUnitProps(executor: CommandExecutor, unit: string, pro
   }
 }
 
+/**
+ * `systemctl show <unit> -p <props>` → a prop map, STRICT (cr.41b). Unlike
+ * {@link showUnitProps} this does NOT fail open: a systemctl that cannot answer
+ * — it failed to start ({@link execSystemctlShow} threw), or exited non-zero
+ * without stdout, the shape of a unit systemd cannot load — THROWS. The delete
+ * doors' active-run gate reads through this: an unreadable run state is not
+ * evidence the run is over, and a guard fails loud — a delete must refuse over
+ * a state it could not see, never pass. The status/dashboard readers keep the
+ * fail-open {@link showUnitProps}; only the guard that would otherwise delete
+ * under an unreadable fact is strict.
+ */
+export async function showUnitPropsStrict(executor: CommandExecutor, unit: string, props: string): Promise<Record<string, string>> {
+  const r = await execSystemctlShow(executor, unit, props)
+  if (r.exitCode !== 0)
+    throw new Error(`systemctl show ${unit} exited with code ${r.exitCode}`)
+  return parseShow(r.stdout)
+}
+
 /** The service's {@link SERVICE_STATUS_PROPS} snapshot (fail-open to {}). */
 export function readServiceStatusProps(executor: CommandExecutor, serviceUnit: string): Promise<Record<string, string>> {
   return showUnitProps(executor, serviceUnit, SERVICE_STATUS_PROPS)

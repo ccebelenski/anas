@@ -23,8 +23,8 @@ import {
   validateSchedule,
   writeTaskUnits,
 } from '../services/replication-units.js'
-import { activeRunDeleteRefusal, readUnitTaskObject, serviceUnitRevision } from '../services/task-units.js'
-import { isRunActive, showUnitProps } from '../services/unit-run-status.js'
+import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision } from '../services/task-units.js'
+import { isRunActive, showUnitPropsStrict } from '../services/unit-run-status.js'
 import { requireIdentity } from './identity.js'
 
 const ZPOOL = '/usr/sbin/zpool'
@@ -198,16 +198,24 @@ export async function replicationTaskRoutes(
    * the unit systemd reports in a still-running state — the trigger job
    * (`replication.task.run`) is a fire-and-return, and the send itself is a
    * `zfs.replicate` job that carries no task name. The unit check covers both
-   * (the runner keeps the unit active while it polls the send).
+   * (the runner keeps the unit active while it polls the send). cr.41b: the
+   * read FAILS CLOSED — a `systemctl show` that cannot answer refuses (a
+   * `zfs.replicate` send can run for hours and shows only as the unit), because
+   * an unreadable run state is not evidence the run is over.
    */
   async function replicationTaskActiveRunRefusal(name: string): Promise<Refusal | null> {
     const runJob = jobQueue.findActive('replication.task.run', name, 'task')
     if (runJob)
       return activeRunDeleteRefusal(`Replication task '${name}'`, { job: runJob })
-    const props = await showUnitProps(executor, serviceUnitName(name), 'ActiveState')
-    if (isRunActive(props))
-      return activeRunDeleteRefusal(`Replication task '${name}'`, { unit: { service: serviceUnitName(name), since: null } })
-    return null
+    try {
+      const props = await showUnitPropsStrict(executor, serviceUnitName(name), 'ActiveState')
+      if (isRunActive(props))
+        return activeRunDeleteRefusal(`Replication task '${name}'`, { unit: { service: serviceUnitName(name), since: null } })
+      return null
+    }
+    catch {
+      return runStateUnreadableRefusal(`Replication task '${name}'`)
+    }
   }
 
   function replicationTaskCreateSpec(name: string): GuardSpec<{ existing: ReplicationTask | null }> {
@@ -235,10 +243,24 @@ export async function replicationTaskRoutes(
     }
   }
 
-  function replicationTaskDeleteSpec(name: string): GuardSpec<UnitTaskObject<ReplicationTask>> {
+  function replicationTaskDeleteSpec(name: string): GuardSpec<{ unit: string, timer: string }> {
     return {
       operation: 'replication.task.remove',
-      object: replicationTaskView(name),
+      // cr.41b: the delete's object is the unit AS STORED — the stores' own
+      // existence (a `.service` on disk), never the parsed task. A unit whose
+      // X-ANAS-Task no longer parses (a hand edit; a task an older ANAS wrote)
+      // is skipped by the list AND by a parsed-object read, which would answer
+      // 404 on exactly the unit the operator needs to remove — this read makes
+      // it deletable. The UPDATE spec above stays bound to the parsed object:
+      // an edit cannot be bound to bytes that do not parse — 404 not-found is
+      // right there.
+      object: {
+        what: `Replication task '${name}'`,
+        read: () => readUnitStoreEntry(readReplicationUnitText, systemdDir, name),
+        id: async () => ({ task: name }),
+        notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `Replication task '${name}' not found` }),
+        unbound: () => `Could not read replication task '${name}' — refusing`,
+      },
       gates: [async () => replicationTaskActiveRunRefusal(name)],
       locks: async () => [taskClaim('replication', name, 'exclusive')],
     }

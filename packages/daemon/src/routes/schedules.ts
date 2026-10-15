@@ -23,8 +23,8 @@ import {
 } from '../services/snapshot-schedule-units.js'
 import { pruneSnapshots, pruneZfsSchedule, takeSnapshot, zfsRunResult } from '../services/snapshot-schedules.js'
 import { ahrSourceClaims, datasetSourceClaims } from '../services/source-claims.js'
-import { activeRunDeleteRefusal, readUnitTaskObject, serviceUnitRevision } from '../services/task-units.js'
-import { isRunActive, showUnitProps } from '../services/unit-run-status.js'
+import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision } from '../services/task-units.js'
+import { isRunActive, showUnitPropsStrict } from '../services/unit-run-status.js'
 import { sweepSet, zfsTreeListArgs } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
@@ -230,15 +230,25 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     unbound: () => `Could not read snapshot schedule '${id}' — refusing`,
   })
 
-  /** The Q1 refusal when a schedule's fire is active (a run job, or the unit a timer started). */
+  /**
+   * The Q1 refusal when a schedule's fire is active (a run job, or the unit a
+   * timer started). cr.41b: the read FAILS CLOSED — a `systemctl show` that
+   * cannot answer refuses (a fire can snap + prune for a while and shows only
+   * as the unit), because an unreadable run state is not evidence it is over.
+   */
   async function scheduleActiveRunRefusal(id: string): Promise<Refusal | null> {
     const runJob = jobQueue.findActive('schedule.run', id, 'schedule')
     if (runJob)
       return activeRunDeleteRefusal(`Snapshot schedule '${id}'`, { job: runJob })
-    const props = await showUnitProps(executor, serviceUnitName(id), 'ActiveState')
-    if (isRunActive(props))
-      return activeRunDeleteRefusal(`Snapshot schedule '${id}'`, { unit: { service: serviceUnitName(id), since: null } })
-    return null
+    try {
+      const props = await showUnitPropsStrict(executor, serviceUnitName(id), 'ActiveState')
+      if (isRunActive(props))
+        return activeRunDeleteRefusal(`Snapshot schedule '${id}'`, { unit: { service: serviceUnitName(id), since: null } })
+      return null
+    }
+    catch {
+      return runStateUnreadableRefusal(`Snapshot schedule '${id}'`)
+    }
   }
 
   /** A create's object is the id SLOT (the mounts/shares create precedent): existence is a gate, not the read-null. */
@@ -272,10 +282,24 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     }
   }
 
-  function scheduleDeleteSpec(id: string): GuardSpec<UnitTaskObject<SnapshotScheduleT>> {
+  function scheduleDeleteSpec(id: string): GuardSpec<{ unit: string, timer: string }> {
     return {
       operation: 'schedule.remove',
-      object: scheduleUnitView(id),
+      // cr.41b: the delete's object is the unit AS STORED — the store's own
+      // existence (a `.service` on disk), never the parsed schedule. A unit
+      // whose X-ANAS-Schedule no longer parses (a hand edit; a schedule an
+      // older ANAS wrote) is skipped by the list AND by a parsed-object read,
+      // which would answer 404 on exactly the unit the operator needs to remove
+      // — this read makes it deletable. The UPDATE spec above stays bound to
+      // the parsed object: an edit cannot be bound to bytes that do not parse —
+      // 404 not-found is right there.
+      object: {
+        what: `Snapshot schedule '${id}'`,
+        read: () => readUnitStoreEntry(readScheduleUnitTexts, systemdDir, id),
+        id: async () => ({ schedule: id }),
+        notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `Snapshot schedule '${id}' not found` }),
+        unbound: () => `Could not read snapshot schedule '${id}' — refusing`,
+      },
       gates: [async () => scheduleActiveRunRefusal(id)],
       locks: async () => [scheduleClaim(id, 'exclusive')],
     }

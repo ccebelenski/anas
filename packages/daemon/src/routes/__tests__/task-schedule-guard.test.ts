@@ -192,7 +192,7 @@ describe('cr.41 — a task/schedule/registry state that flips while the job wait
     return release
   }
 
-  interface Req { method: 'POST' | 'PUT' | 'DELETE', url: string, payload?: unknown }
+  interface Req { method: 'GET' | 'POST' | 'PUT' | 'DELETE', url: string, payload?: unknown }
 
   async function send(req: Req) {
     return server!.inject({
@@ -245,6 +245,23 @@ describe('cr.41 — a task/schedule/registry state that flips while the job wait
       args: ['show', service, '-p', props],
       result: ok(`ActiveState=active\nInactiveExitTimestamp=Mon 2026-10-12 02:00:00 UTC\n`),
     })
+  }
+
+  /** A `systemctl show` that CANNOT answer: non-zero exit, no stdout (cr.41b's fail-closed read). */
+  function systemctlUnreadableFixture(service: string, props: string): void {
+    const mock = (server as unknown as { executor: { addFixture: (f: unknown) => void } }).executor
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: ['show', service, '-p', props],
+      result: { stdout: '', stderr: 'Failed to load unit: systemd could not load the unit', exitCode: 1 },
+    })
+  }
+
+  /** Hand-edit a unit's marker line so the canonical JSON no longer parses (cr.41b). */
+  async function corruptTaskMarker(unitPath: string, marker: string): Promise<void> {
+    const text = await readFile(unitPath, 'utf-8')
+    assert.ok(text.includes(marker), `unit ${unitPath} carries the marker`)
+    await writeFile(unitPath, text.replace(marker, `${marker}broken:`), 'utf-8')
   }
 
   async function writeTaskFiles(prefix: string, name: string): Promise<void> {
@@ -577,5 +594,147 @@ describe('cr.41 — a task/schedule/registry state that flips while the job wait
     const stored = parseBackupServiceUnit(text)
     assert.equal(stored?.name, 'media-nightly')
     assert.equal(stored?.schedule, BACKUP_TASK.schedule, 'the surviving unit is the first create\'s, not the second\'s')
+  })
+
+  // --- cr.41b: a unit that no longer parses is invisible but still deletable ---
+  //
+  // The list skips an unparseable unit with a warning, so before cr.41b a
+  // delete whose object was the PARSED task answered 404 on exactly the unit
+  // the operator needs to remove (a hand edit; a task an older ANAS wrote in a
+  // shape the current schema refuses). The delete verbs' object is the unit AS
+  // STORED: a `.service` on disk reads present, and DELETE answers 202.
+
+  it('backup: a corrupted X-ANAS-Task unit is not in the list, and DELETE removes its units (cr.41b)', async () => {
+    await writeBackupTask(QUIET, systemdDir, BackupTask.parse(BACKUP_TASK))
+    const servicePath = join(systemdDir, 'anas-backup-media-nightly.service')
+    const timerPath = join(systemdDir, 'anas-backup-media-nightly.timer')
+    await corruptTaskMarker(servicePath, 'X-ANAS-Task=')
+
+    const list = await send({ method: 'GET', url: '/v1/backup/tasks' })
+    assert.equal(list.statusCode, 200, list.body)
+    const names = (list.json() as { data: { task: { name: string } }[] }).data.map(e => e.task.name)
+    assert.ok(!names.includes('media-nightly'), 'the corrupted task is skipped by the list')
+
+    const res = await send({ method: 'DELETE', url: '/v1/backup/tasks/media-nightly' })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(!(await readFile(servicePath, 'utf-8').catch(() => undefined)), 'the service unit was removed')
+    assert.ok(!(await readFile(timerPath, 'utf-8').catch(() => undefined)), 'the timer unit was removed')
+  })
+
+  it('cloud: a corrupted X-ANAS-Task unit is not in the list, and DELETE removes its units (cr.41b)', async () => {
+    await seedRcloneRemote()
+    await writeCloudTask(QUIET, systemdDir, CloudSyncTask.parse(CLOUD_TASK))
+    const servicePath = join(systemdDir, 'anas-cloud-offsite.service')
+    const timerPath = join(systemdDir, 'anas-cloud-offsite.timer')
+    await corruptTaskMarker(servicePath, 'X-ANAS-Task=')
+
+    const list = await send({ method: 'GET', url: '/v1/cloud/tasks' })
+    assert.equal(list.statusCode, 200, list.body)
+    const names = (list.json() as { data: { name: string }[] }).data.map(e => e.name)
+    assert.ok(!names.includes('offsite'), 'the corrupted task is skipped by the list')
+
+    const res = await send({ method: 'DELETE', url: '/v1/cloud/tasks/offsite' })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(!(await readFile(servicePath, 'utf-8').catch(() => undefined)), 'the service unit was removed')
+    assert.ok(!(await readFile(timerPath, 'utf-8').catch(() => undefined)), 'the timer unit was removed')
+  })
+
+  it('replication: a corrupted X-ANAS-Task unit is not in the list, and DELETE removes its units (cr.41b)', async () => {
+    await writeReplicationTask(QUIET, systemdDir, ReplicationTask.parse(REPLICATION_TASK_LOCAL))
+    const servicePath = join(systemdDir, 'anas-repl-repl-nas1.service')
+    const timerPath = join(systemdDir, 'anas-repl-repl-nas1.timer')
+    await corruptTaskMarker(servicePath, 'X-ANAS-Task=')
+
+    const list = await send({ method: 'GET', url: '/v1/replication/tasks' })
+    assert.equal(list.statusCode, 200, list.body)
+    const names = (list.json() as { data: { task: { name: string } }[] }).data.map(e => e.task.name)
+    assert.ok(!names.includes('repl-nas1'), 'the corrupted task is skipped by the list')
+
+    const res = await send({ method: 'DELETE', url: '/v1/replication/tasks/repl-nas1' })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(!(await readFile(servicePath, 'utf-8').catch(() => undefined)), 'the service unit was removed')
+    assert.ok(!(await readFile(timerPath, 'utf-8').catch(() => undefined)), 'the timer unit was removed')
+  })
+
+  it('schedule: a corrupted X-ANAS-Schedule unit is not in the list, and DELETE removes its units (cr.41b)', async () => {
+    await writeScheduleUnits(QUIET, systemdDir, SnapshotSchedule.parse(SCHEDULE))
+    const servicePath = join(systemdDir, 'anas-snap-nightly-media.service')
+    const timerPath = join(systemdDir, 'anas-snap-nightly-media.timer')
+    await corruptTaskMarker(servicePath, 'X-ANAS-Schedule=')
+
+    const list = await send({ method: 'GET', url: '/v1/schedules' })
+    assert.equal(list.statusCode, 200, list.body)
+    const ids = (list.json() as { data: { schedule: { id: string } }[] }).data.map(e => e.schedule.id)
+    assert.ok(!ids.includes('nightly-media'), 'the corrupted schedule is skipped by the list')
+
+    const res = await send({ method: 'DELETE', url: '/v1/schedules/nightly-media' })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(!(await readFile(servicePath, 'utf-8').catch(() => undefined)), 'the service unit was removed')
+    assert.ok(!(await readFile(timerPath, 'utf-8').catch(() => undefined)), 'the timer unit was removed')
+  })
+
+  // --- cr.41b: the delete's active-run gate fails closed ----------------------
+  //
+  // The active-run read used to fail open to "not running" on an unreadable
+  // `systemctl show`, so a delete proceeded over a run it could not see. The
+  // delete gate now FAILS CLOSED: no answer → 409 CONFLICT saying the run state
+  // could not be read and nothing was deleted (a guard fails loud). The
+  // status/dashboard readers keep their fail-open reads — only the mutation
+  // this would delete under is strict.
+
+  it('backup: a delete whose run state systemd cannot read refuses — the gate fails closed (cr.41b)', async () => {
+    await writeBackupTask(QUIET, systemdDir, BackupTask.parse(BACKUP_TASK))
+    systemctlUnreadableFixture('anas-backup-media-nightly.service', 'ActiveState,InactiveExitTimestamp')
+    const res = await send({ method: 'DELETE', url: '/v1/backup/tasks/media-nightly' })
+    assert.equal(res.statusCode, 409, res.body)
+    const error = (res.json() as { error: { code: string, message: string } }).error
+    assert.equal(error.code, 'CONFLICT')
+    assert.match(error.message, /run state from systemd/)
+    assert.match(error.message, /nothing was deleted/)
+    assert.ok(await readFile(join(systemdDir, 'anas-backup-media-nightly.service'), 'utf-8'), 'the task was not removed')
+  })
+
+  it('cloud: a delete whose run state systemd cannot read refuses — the gate fails closed (cr.41b)', async () => {
+    await writeCloudTask(QUIET, systemdDir, CloudSyncTask.parse(CLOUD_TASK))
+    systemctlUnreadableFixture('anas-cloud-offsite.service', 'ActiveState,InactiveExitTimestamp')
+    const res = await send({ method: 'DELETE', url: '/v1/cloud/tasks/offsite' })
+    assert.equal(res.statusCode, 409, res.body)
+    const error = (res.json() as { error: { code: string, message: string } }).error
+    assert.equal(error.code, 'CONFLICT')
+    assert.match(error.message, /run state from systemd/)
+    assert.match(error.message, /nothing was deleted/)
+    assert.ok(await readFile(join(systemdDir, 'anas-cloud-offsite.service'), 'utf-8'), 'the task was not removed')
+  })
+
+  it('replication: a delete whose run state systemd cannot read refuses — the gate fails closed (cr.41b)', async () => {
+    await writeReplicationTask(QUIET, systemdDir, ReplicationTask.parse(REPLICATION_TASK_LOCAL))
+    systemctlUnreadableFixture('anas-repl-repl-nas1.service', 'ActiveState')
+    const res = await send({ method: 'DELETE', url: '/v1/replication/tasks/repl-nas1' })
+    assert.equal(res.statusCode, 409, res.body)
+    const error = (res.json() as { error: { code: string, message: string } }).error
+    assert.equal(error.code, 'CONFLICT')
+    assert.match(error.message, /run state from systemd/)
+    assert.match(error.message, /nothing was deleted/)
+    assert.ok(await readFile(join(systemdDir, 'anas-repl-repl-nas1.service'), 'utf-8'), 'the task was not removed')
+  })
+
+  it('schedule: a delete whose run state systemd cannot read refuses — the gate fails closed (cr.41b)', async () => {
+    await writeScheduleUnits(QUIET, systemdDir, SnapshotSchedule.parse(SCHEDULE))
+    systemctlUnreadableFixture('anas-snap-nightly-media.service', 'ActiveState')
+    const res = await send({ method: 'DELETE', url: '/v1/schedules/nightly-media' })
+    assert.equal(res.statusCode, 409, res.body)
+    const error = (res.json() as { error: { code: string, message: string } }).error
+    assert.equal(error.code, 'CONFLICT')
+    assert.match(error.message, /run state from systemd/)
+    assert.match(error.message, /nothing was deleted/)
+    assert.ok(await readFile(join(systemdDir, 'anas-snap-nightly-media.service'), 'utf-8'), 'the schedule was not removed')
   })
 })

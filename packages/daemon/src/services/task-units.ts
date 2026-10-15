@@ -22,6 +22,7 @@ import {
   readOnce,
   readUnitJournal,
   showUnitProps,
+  showUnitPropsStrict,
   TRIGGER_SLACK_MS,
 } from './unit-run-status.js'
 
@@ -300,6 +301,30 @@ export async function readUnitTaskObject<T>(
   return task === null ? null : { task, unit: texts.unit }
 }
 
+/**
+ * A unit-store entry as the DELETE verbs' object (cr.41b): the `.service` +
+ * `.timer` texts AS STORED, whether or not they parse. Null only when neither
+ * file exists — the store's own "this task exists" (a `.service` on disk is
+ * present even when its `X-ANAS-Task=`/`X-ANAS-Schedule=` JSON no longer
+ * reads). The list endpoints SKIP an unparseable unit with a warning, so a
+ * parsed-object delete answers 404 on exactly the unit an operator needs to
+ * remove (a hand edit; a task an older ANAS wrote in a shape the current
+ * schema refuses) — this read makes that unit deletable again.
+ *
+ * The UPDATE verbs deliberately stay bound to {@link readUnitTaskObject}: an
+ * edit cannot be bound to bytes that do not parse — over an unreadable unit
+ * the only honest answers are gone (404) or the caller's own refusal, never a
+ * rewrite over bytes the guard could not read.
+ */
+export async function readUnitStoreEntry(
+  readUnitTexts: (dir: string, name: string) => Promise<{ unit: string, timer: string }>,
+  dir: string,
+  name: string,
+): Promise<{ unit: string, timer: string } | null> {
+  const texts = await readUnitTexts(dir, name)
+  return texts.unit !== '' || texts.timer !== '' ? texts : null
+}
+
 /** What a Q1 refusal names as "the run": the direct job, or the systemd unit. */
 export interface TaskRunInFlight {
   /** The direct run job in this daemon's queue (what Cancel run targets). */
@@ -313,7 +338,14 @@ export interface TaskRunInFlight {
  * fresh: the DIRECT run job in this daemon's queue (named — it is what a
  * Cancel run cancels), and the unit systemd reports active (a timer fire — or
  * a run this daemon restarted out from under — executes under the unit).
- * Fail-open: a systemd read that cannot answer is not "running".
+ *
+ * cr.41b: the DELETE gates are this function's only callers, so its systemd
+ * read FAILS CLOSED — {@link showUnitPropsStrict} throws when systemd cannot
+ * answer, and the gate answers the {@link runStateUnreadableRefusal}: an
+ * unreadable run state is not evidence the run is over, and a guard fails
+ * loud (never a delete over a fact it could not see). The direct-job lookup
+ * is in-process and cannot fail; a found job short-circuits the unit read,
+ * because the job is the run and names it better than a unit anyway.
  */
 export async function taskRunInFlight(
   jobQueue: JobQueue,
@@ -323,10 +355,27 @@ export async function taskRunInFlight(
   name: string,
 ): Promise<TaskRunInFlight> {
   const job = runningDirectJob(jobQueue, runOperation, name)
-  const run = await readRunActive(executor, kind, name)
+  if (job)
+    return { job }
+  const props = await showUnitPropsStrict(executor, serviceUnitName(kind, name), 'ActiveState,InactiveExitTimestamp')
+  const active = isRunActive(props)
+  return active
+    ? { unit: { service: serviceUnitName(kind, name), since: parseSystemdTimestamp(props.InactiveExitTimestamp) } }
+    : {}
+}
+
+/**
+ * The fail-closed refusal when a delete's active-run gate could not READ the
+ * run state (cr.41b): a `systemctl show` that cannot answer is not evidence
+ * the run is over, so the delete refuses with a sentence saying the state
+ * could not be read and nothing was deleted. The status/dashboard readers
+ * keep their fail-open reads — only a mutation on the guard fails this way.
+ */
+export function runStateUnreadableRefusal(what: string): Refusal {
   return {
-    ...(job ? { job } : {}),
-    ...(run.active ? { unit: { service: serviceUnitName(kind, name), since: run.since } } : {}),
+    status: 409,
+    code: 'CONFLICT',
+    message: `Could not read ${what} run state from systemd — refusing to delete; nothing was deleted`,
   }
 }
 
