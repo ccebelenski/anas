@@ -183,6 +183,9 @@ describe('cr.63 L17 — a LUN verb and a dataset verb on the same backing serial
         return ok(`${GTISCSI_POOL_GUID}\n`)
       if (command === ZFS && argv === `get -H -o value guid -- ${ZVOL_DATASET}`)
         return ok(`${VOL1_GUID}\n`)
+      // cr.64c item 8: the LUN add proves the zvol exists before its first targetcli act.
+      if (command === ZFS && argv === `list -H -o name -- ${ZVOL_DATASET}`)
+        return ok(`${ZVOL_DATASET}\n`)
       if (command === ZFS && args.join('\0') === listArgs)
         return ok(VOLUMES)
       if (command === ZFS && argv === zfsSnapshotListArgs(ZVOL_DATASET).join(' '))
