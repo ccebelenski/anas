@@ -1,6 +1,7 @@
 import type { AhrPool } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { LvmLv, LvmPv } from '../parsers/lvm-report.js'
+import type { DiskTree } from './ahr-expand-exec.js'
 import { parseDiskByIdListing } from '../parsers/disk-by-id.js'
 import { lvIsCacheTarget, parseLvsReport, parsePvsReport, PVS_ARGS } from '../parsers/lvm-report.js'
 import {
@@ -53,6 +54,7 @@ import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle
  */
 
 const SGDISK = '/usr/sbin/sgdisk'
+const PARTX = '/usr/bin/partx'
 const WIPEFS = '/usr/sbin/wipefs'
 const REALPATH = '/usr/bin/realpath'
 const LS = '/usr/bin/ls'
@@ -223,6 +225,11 @@ async function readPvs(executor: CommandExecutor): Promise<LvmPv[]> {
 /** Structured log sink (default stdout → journald, §7.1). */
 export interface CacheOptions {
   log?: (line: string) => void
+  /**
+   * Test seam for the cr.50 detach heal: the wait between `partx -d`
+   * attempts. Defaults to `PARTITION_GONE_INTERVAL_MS`.
+   */
+  partxRetryIntervalMs?: number
 }
 
 export interface CacheAttachInput {
@@ -516,6 +523,76 @@ export interface CacheDetachResult {
 }
 
 /**
+ * Bounded wait of the cr.50 detach heal — the same shape as the expansion's
+ * appear-wait (ahr-expand-exec.ts `waitForPartitions`): the holders that make
+ * the kernel refuse a table re-read (udev's blkid/pvscan reacting to the
+ * wipefs change event, a pvestatd poll, a disk hot-added seconds earlier) are
+ * all brief, so this absorbs their lag, not a real refusal.
+ */
+const PARTITION_GONE_ATTEMPTS = 10
+const PARTITION_GONE_INTERVAL_MS = 200
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/**
+ * What the kernel says about partition `number` of a disk: `gone` only when a
+ * READ tree does not list it. A null tree (the per-disk lsblk failed or was
+ * unparsable — exactly what a udev storm around a hot-add produces) is
+ * `unreadable`, never `gone`: a read that could not see cannot assert the
+ * slice is gone (the cr.50 review's reproduced defect). The device-gone
+ * recovery (GT-20) never reaches this check — findCacheSlices finds no slice
+ * on an absent device — so null here is not that case.
+ */
+type KernelVerdict = 'gone' | 'listed' | 'unreadable'
+function kernelVerdict(tree: DiskTree | null, number: number): KernelVerdict {
+  if (tree === null)
+    return 'unreadable'
+  return tree.parts.some(p => p.number === number) ? 'listed' : 'gone'
+}
+
+/**
+ * Heal the cr.50 race: `sgdisk -d` deletes the slice from the GPT and asks
+ * the kernel for a whole-table re-read (BLKRRPART) — but when anything holds
+ * the disk at that instant the kernel REFUSES, and sgdisk still exits 0. The
+ * partition stays in the kernel, /v1/disks reads the disk `other` for ever,
+ * and nothing says why (node-proven 2026-10-16: shape-1 detach logged
+ * `status=released` with no kernel re-read line).
+ *
+ * `partx -d` deletes the ONE partition through BLKPG, which needs no
+ * exclusive re-read and works on a held disk — the delete twin of the
+ * reasoning in the expansion's `partx -a` (ahr-expand-exec.ts). A non-zero
+ * partx while a holder still has the partition node open means "try again on
+ * the next attempt", never failure: the verdict comes from the tree re-read,
+ * not the exit code. Done once a READ tree stops listing it; an unreadable
+ * tree is another attempt, never "gone". Returns the last verdict and the
+ * last non-zero partx's stderr, so a failure can say what partx itself said.
+ */
+async function waitForPartitionGone(
+  executor: CommandExecutor,
+  dev: string,
+  kernelDev: string,
+  number: number,
+  intervalMs: number,
+): Promise<{ verdict: KernelVerdict, lastPartxError: string }> {
+  let verdict: KernelVerdict = 'listed'
+  let lastPartxError = ''
+  for (let attempt = 0; attempt < PARTITION_GONE_ATTEMPTS; attempt++) {
+    if (attempt > 0)
+      await sleep(intervalMs)
+    const partx = await executor.exec(PARTX, ['-d', String(number), kernelDev])
+    if (partx.exitCode !== 0)
+      lastPartxError = stderrHead(partx.stderr) || `partx exited ${partx.exitCode}`
+    await run(executor, UDEVADM, udevSettleArgs(), { timeoutMs: UDEVADM_SETTLE_BUDGET_MS })
+    verdict = kernelVerdict(await readDiskTree(executor, dev), number)
+    if (verdict === 'gone')
+      break
+  }
+  return { verdict, lastPartxError }
+}
+
+/**
  * Detach the read cache (§13) — also the RECOVERY path when the cache device
  * has failed, which is why every step tolerates the device being absent:
  *
@@ -530,7 +607,9 @@ export interface CacheDetachResult {
  *
  * It ENDS at deleting the partition, not at wiping it: a wiped partition is
  * still a partition, and /v1/disks reports the disk `other` — never
- * `available` — until the slice is removed from the GPT (GT-22).
+ * `available` — until the slice is removed from the GPT (GT-22). `sgdisk -d`
+ * exiting 0 is not yet that proof (cr.50): the step settles, asks the kernel,
+ * and heals a refused re-read with `partx -d` — see `waitForPartitionGone`.
  *
  * The VG verbs (uncache, the orphan lvremove, vgreduce) run only after
  * `requirePoolVg` (cr.22) proves the VG named like the pool is the pool's: the
@@ -642,6 +721,54 @@ export async function detachAhrCache(
     // the disk `other` for ever and it can never be picked again (GT-22).
     updateProgress(`Deleting the cache slice from ${slice.diskId}`)
     await run(executor, SGDISK, ['-d', String(slice.partNumber), byIdPath(slice.diskId)])
+    // cr.50: sgdisk's exit code does NOT mean the kernel adopted the new
+    // table — a holder at the instant of its BLKRRPART makes the kernel
+    // refuse and sgdisk still exits 0 (see waitForPartitionGone). Settle,
+    // then ASK the kernel: released only once it says the slice is gone.
+    await run(executor, UDEVADM, udevSettleArgs(), { timeoutMs: UDEVADM_SETTLE_BUDGET_MS })
+    const tree = await readDiskTree(executor, byIdPath(slice.diskId))
+    const first = kernelVerdict(tree, slice.partNumber)
+    if (first !== 'gone') {
+      if (first === 'listed')
+        updateProgress(`The kernel kept the old partition table of ${slice.diskId} (something held the disk); removing the slice directly`)
+      else
+        updateProgress(`The kernel's partition table of ${slice.diskId} could not be read after the delete; asking again and removing the slice directly`)
+      log(`ahr.cache pool=${pool.name} disk=${slice.diskId} slice=${slice.partNumber} status=${first === 'listed' ? 'kernel-table-kept' : 'kernel-table-unreadable'}`)
+      // The kernel name the direct removal addresses: from the tree when it
+      // was read, else resolved from the by-id link (an unreadable tree has
+      // no name to offer). Neither known → the disk cannot be asked at all.
+      let kernelName = tree?.kernel ?? ''
+      if (kernelName === '') {
+        const resolved = await executor.exec(REALPATH, [byIdPath(slice.diskId)])
+        kernelName = resolved.exitCode === 0 ? resolved.stdout.trim().replace(DEV_PREFIX_RE, '') : ''
+      }
+      if (kernelName === '') {
+        throw new Error(
+          `\`${slice.diskId}\`'s cache slice ${slice.partNumber} was deleted from the GPT but the disk could not be read afterwards `
+          + `(neither lsblk nor realpath answered), so the detach cannot say whether the kernel still lists the slice. `
+          + `Check \`lsblk /dev/disk/by-id/${slice.diskId}\`; the slice is already gone on disk, so re-running Detach is safe`,
+        )
+      }
+      const { verdict, lastPartxError } = await waitForPartitionGone(
+        executor,
+        byIdPath(slice.diskId),
+        `/dev/${kernelName}`,
+        slice.partNumber,
+        opts.partxRetryIntervalMs ?? PARTITION_GONE_INTERVAL_MS,
+      )
+      if (verdict !== 'gone') {
+        const partxNote = lastPartxError ? ` (last partx answer: ${lastPartxError})` : ''
+        throw new Error(verdict === 'listed'
+          ? `\`${slice.diskId}\`'s cache slice ${slice.partNumber} was deleted from the GPT but the kernel still lists it — `
+          + `something holds the disk, so neither a table re-read nor a direct removal went through${partxNote}. `
+          + `Run \`partx -d ${slice.partNumber} /dev/${kernelName}\` (or \`blockdev --rereadpt /dev/${kernelName}\`) once the holder is gone; `
+          + `the slice is already gone on disk, so re-running Detach is safe`
+          : `\`${slice.diskId}\`'s cache slice ${slice.partNumber} was deleted from the GPT but the kernel's partition table could not be read `
+            + `afterwards${partxNote}, so the detach cannot say whether the slice is gone. `
+            + `Check \`lsblk /dev/${kernelName}\` and run \`partx -d ${slice.partNumber} /dev/${kernelName}\` if it still lists the slice; `
+            + `the slice is already gone on disk, so re-running Detach is safe`)
+      }
+    }
     released.push(slice.diskId)
     log(`ahr.cache pool=${pool.name} disk=${slice.diskId} slice=${slice.partNumber} status=released`)
   }

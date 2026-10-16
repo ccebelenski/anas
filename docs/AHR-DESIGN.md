@@ -594,7 +594,12 @@ create path's pair — the issue-#12 retry dance is a holders problem, not a cac
 the slice before `pvcreate` (a stale signature makes `pvcreate` abort non-
 interactively) and `lvconvert -y`. `cache-detach` must DELETE the partition
 (`sgdisk -d` / `--zap-all`), not merely `pvremove` + `wipefs`, or the disk keeps
-reading `other` instead of `available` (GT-22). **Consumers:** the cache disk is
+reading `other` instead of `available` (GT-22). And `sgdisk -d` exiting 0 is not yet
+that proof (cr.50): a holder at the instant of its whole-table re-read makes the kernel
+refuse it while sgdisk still succeeds, so detach settles, checks the kernel's own tree
+for the slice, and on a kept table removes the slice with `partx -d` (BLKPG — no
+exclusive re-read), re-checking with a short bounded retry before failing with the disk
+and the command named. **Consumers:** the cache disk is
 `in-use`, role `cache`, attributed to its pool (today `other`, unattributed — safe by
 accident since `isComposableDisk()` admits only `available`); `vg.sizeBytes` includes
 the cache slice — capacity derives from the LV, never the VG (audit the consumers);

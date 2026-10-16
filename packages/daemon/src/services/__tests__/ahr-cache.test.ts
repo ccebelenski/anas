@@ -43,6 +43,7 @@ const SLICE_BYTES = 535805440
 const LSBLK = '/usr/bin/lsblk'
 const LS = '/usr/bin/ls'
 const SGDISK = '/usr/sbin/sgdisk'
+const PARTX = '/usr/bin/partx'
 const UDEVADM = '/usr/bin/udevadm'
 const WIPEFS = '/usr/sbin/wipefs'
 const REALPATH = '/usr/bin/realpath'
@@ -109,6 +110,17 @@ class CacheWorld extends MockExecutor {
    * `pv_count` equal to its `pvs` rows — the consistent LVM answer.
    */
   vgsOverride: string | null = null
+  /**
+   * cr.50 (S1): the kernel refuses the whole-table re-read `sgdisk -d` asks
+   * for — the delete exits 0 but the partition STAYS listed (lsblk tree and
+   * realpath alike) until a `partx -d` reaches it directly.
+   */
+  kernelKeepsTable = false
+  /** cr.50: answer this many `partx` calls busy (exit 1) — a holder on the node. */
+  partxBusyCalls = 0
+  /** cr.50 review: the per-disk lsblk reads after `sgdisk -d` fail this many times (a udev storm) — readDiskTree null. */
+  lsblkFailAfterSgdisk = 0
+  private sgdiskRan = false
 
   private ok(stdout = ''): ExecResult {
     return { stdout, stderr: '', exitCode: 0 }
@@ -191,6 +203,10 @@ class CacheWorld extends MockExecutor {
       case LSBLK:
         if (this.lsblkGarbage && !args.includes(CACHE_DEV))
           return this.ok('lsblk: sdd: failed to get device path\n')
+        if (args.includes(CACHE_DEV) && this.sgdiskRan && this.lsblkFailAfterSgdisk > 0) {
+          this.lsblkFailAfterSgdisk--
+          return { stdout: '', stderr: 'lsblk: sdd: failed to get device path', exitCode: 1 }
+        }
         return this.ok(args.includes(CACHE_DEV) ? this.lsblkDisk() : this.lsblkNode())
       case LS:
         return this.ok(`total 0
@@ -206,13 +222,28 @@ lrwxrwxrwx 1 root root 10 Sep 24 20:00 ${CACHE_DISK}-part1 -> ../../sdd1
       case VGS:
         return this.ok(this.vgsJson())
       case REALPATH:
+        if (args[0] === CACHE_DEV)
+          return this.ok('/dev/sdd\n')
         return this.slice ? this.ok('/dev/sdd1\n') : { stdout: '', stderr: 'no such file', exitCode: 1 }
       case SGDISK:
         if (args[0] === '-d') {
-          this.slice = false
+          // cr.50: a refused whole-table re-read still exits 0 — the slice
+          // stays in the kernel until `partx -d` deletes it directly.
+          if (!this.kernelKeepsTable)
+            this.slice = false
           this.pv = false
+          this.sgdiskRan = true
         }
         else { this.slice = true }
+        return this.ok()
+      case PARTX:
+        // BLKPG delete of the ONE partition — needs no exclusive re-read.
+        // Busy (the holder still has the node open) is retryable, not fatal.
+        if (this.partxBusyCalls > 0) {
+          this.partxBusyCalls--
+          return { stdout: '', stderr: 'partx: failed to delete partition: Device or resource busy', exitCode: 1 }
+        }
+        this.slice = false
         return this.ok()
       case WIPEFS:
         this.pv = false
@@ -684,6 +715,130 @@ describe('cache-detach — the step sequence (ahrcache.1, §13/GT-20/GT-22)', ()
     // vgreduce cannot proceed while the orphan still holds the cache PV.
     assert.ok(
       world.calls.findIndex(c => c.command === LVREMOVE) < world.calls.findIndex(c => c.command === VGREDUCE),
+    )
+  })
+
+  // ---- cr.50 (S1): sgdisk exits 0; the KERNEL decides ----------------------
+
+  it('cr.50: the kernel adopts the delete — released, NO partx call, argv unchanged', async () => {
+    const world = new CacheWorld()
+    await attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop)
+    clearCalls(world)
+
+    const result = await detachAhrCache(world, { pool: pool() }, noop)
+
+    assert.deepEqual(callsTo(world, PARTX), [], 'nothing to heal, so the direct removal never runs')
+    assert.deepEqual(callsTo(world, SGDISK), [['-d', '1', CACHE_DEV]])
+    assert.deepEqual(result.released, [CACHE_DISK])
+  })
+
+  it('cr.50: the kernel kept the table — partx -d heals it, the disk is released with a progress line', async () => {
+    const world = new CacheWorld()
+    await attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop)
+    world.kernelKeepsTable = true
+    clearCalls(world)
+    const progress: string[] = []
+    const lines: string[] = []
+
+    const result = await detachAhrCache(world, { pool: pool() }, m => progress.push(m), { log: l => lines.push(l), partxRetryIntervalMs: 1 })
+
+    // Exactly ONE direct removal, addressed at the kernel disk (BLKPG, not a
+    // whole-table re-read) — the first attempt took, since nothing was busy.
+    assert.deepEqual(callsTo(world, PARTX), [['-d', '1', '/dev/sdd']])
+    assert.deepEqual(result.released, [CACHE_DISK])
+    assert.equal(world.slice, false)
+    assert.ok(progress.some(m => m.includes(`The kernel kept the old partition table of ${CACHE_DISK}`)), progress.join(' | '))
+    // The journal shows the race without a failure: kept, then released.
+    assert.ok(lines.some(l => l.includes(`disk=${CACHE_DISK}`) && l.includes('slice=1') && l.includes('status=kernel-table-kept')), lines.join(' | '))
+    assert.ok(lines.some(l => l.includes(`disk=${CACHE_DISK}`) && l.includes('status=released')), lines.join(' | '))
+  })
+
+  it('cr.50: partx busy twice is a retry, not a failure — three attempts, then released', async () => {
+    const world = new CacheWorld()
+    await attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop)
+    world.kernelKeepsTable = true
+    world.partxBusyCalls = 2
+    clearCalls(world)
+
+    const result = await detachAhrCache(world, { pool: pool() }, noop, { log: noop, partxRetryIntervalMs: 1 })
+
+    assert.equal(callsTo(world, PARTX).length, 3, 'the busy answers are retried, partx -d re-run each attempt')
+    assert.deepEqual(result.released, [CACHE_DISK])
+    assert.equal(world.slice, false)
+  })
+
+  it('cr.50: still listed after every attempt — the job FAILS naming the disk and the command, and the disk is not released', async () => {
+    const world = new CacheWorld()
+    await attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop)
+    world.kernelKeepsTable = true
+    world.partxBusyCalls = Number.MAX_SAFE_INTEGER
+    clearCalls(world)
+    const lines: string[] = []
+
+    await assert.rejects(
+      detachAhrCache(world, { pool: pool() }, noop, { log: l => lines.push(l), partxRetryIntervalMs: 1 }),
+      (err: Error) => {
+        assert.ok(err.message.includes(CACHE_DISK), `names the disk: ${err.message}`)
+        assert.ok(err.message.includes('cache slice 1'), `names the slice: ${err.message}`)
+        assert.ok(err.message.includes('partx -d 1 /dev/sdd'), `names the one command: ${err.message}`)
+        return true
+      },
+    )
+    assert.ok(world.calls.some(c => c.command === SGDISK && c.args[0] === '-d'), 'the GPT delete did happen — the slice is gone on disk')
+    assert.equal(lines.some(l => l.includes('status=released')), false, 'a disk whose heal FAILED is not released')
+  })
+
+  it('cr.50 review: the post-sgdisk lsblk fails once — an unreadable kernel view is never "gone"; partx heals, then released', async () => {
+    const world = new CacheWorld()
+    await attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop)
+    world.kernelKeepsTable = true
+    world.lsblkFailAfterSgdisk = 1
+    clearCalls(world)
+    const lines: string[] = []
+    const progress: string[] = []
+
+    const result = await detachAhrCache(world, { pool: pool() }, m => progress.push(m), { log: l => lines.push(l), partxRetryIntervalMs: 1 })
+    assert.deepEqual(result.released, [CACHE_DISK])
+    assert.deepEqual(callsTo(world, PARTX), [['-d', '1', '/dev/sdd']], 'the kernel name comes from realpath when the tree was unreadable')
+    assert.ok(lines.some(l => l.includes('status=kernel-table-unreadable')), lines.join('\n'))
+    assert.ok(progress.some(m => m.includes('could not be read after the delete')), progress.join('\n'))
+    assert.ok(lines.some(l => l.includes('status=released')))
+  })
+
+  it('cr.50 review: the kernel view stays unreadable — the job FAILS saying so (never released on a read that could not see)', async () => {
+    const world = new CacheWorld()
+    await attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop)
+    world.kernelKeepsTable = true
+    world.lsblkFailAfterSgdisk = Number.MAX_SAFE_INTEGER
+    clearCalls(world)
+    const lines: string[] = []
+
+    await assert.rejects(
+      detachAhrCache(world, { pool: pool() }, noop, { log: l => lines.push(l), partxRetryIntervalMs: 1 }),
+      (err: Error) => {
+        assert.ok(err.message.includes(CACHE_DISK), `names the disk: ${err.message}`)
+        assert.ok(err.message.includes('could not be read'), `says the read failed: ${err.message}`)
+        assert.ok(err.message.includes('partx -d 1 /dev/sdd'), `names the command: ${err.message}`)
+        return true
+      },
+    )
+    assert.equal(callsTo(world, PARTX).length, 10, 'every attempt still tried the direct removal')
+    assert.equal(lines.some(l => l.includes('status=released')), false)
+  })
+
+  it('cr.50 review: a failure names what partx itself said', async () => {
+    const world = new CacheWorld()
+    await attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop)
+    world.kernelKeepsTable = true
+    world.partxBusyCalls = Number.MAX_SAFE_INTEGER
+    clearCalls(world)
+
+    await assert.rejects(
+      detachAhrCache(world, { pool: pool() }, noop, { partxRetryIntervalMs: 1 }),
+      (err: Error) => {
+        assert.ok(err.message.includes('Device or resource busy'), `carries partx's stderr: ${err.message}`)
+        return true
+      },
     )
   })
 })

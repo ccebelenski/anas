@@ -296,9 +296,15 @@ function buildExecutor(world: World): MockExecutor {
   executor.addFixture({ command: '/usr/bin/lsblk', args: [...AHR_LSBLK_ARGS], result: ok(ahrLsblkJson(world)) })
   executor.addFixture({ command: '/usr/bin/lsblk', args: [...LSBLK_ARGS], result: ok(inventoryLsblkJson(world)) })
   executor.addFixture({ command: '/usr/bin/lsblk', args: [...AHR_CACHE_LSBLK_ARGS], result: ok(ahrLsblkJson(world)) })
-  // The cache disk's own tree: blank on the first read (the step's detect),
-  // carrying the slice on every read after it (what sgdisk just wrote).
-  executor.addFixture({ command: '/usr/bin/lsblk', args: diskLsblkArgs(`/dev/disk/by-id/${C}`), results: sliceOnDisk(world) ? [ok(carvedDisk('sds'))] : [ok(blankDisk('sds')), ok(carvedDisk('sds'))] })
+  // The cache disk's own tree: on an unsliced disk, blank on the first read
+  // (the step's detect), carrying the slice on every read after it (what
+  // sgdisk just wrote). On a sliced one: carved on the read that finds it
+  // (attach's detect), and blank from the read after — which for detach is the
+  // cr.50 check after `sgdisk -d`: the kernel kept the table once, the
+  // partx-healed re-read clears it, so this file proves the heal path through
+  // the real route and job wiring (the adopted-on-first-check shape, with the
+  // busy-partx retries, is the service test's model node).
+  executor.addFixture({ command: '/usr/bin/lsblk', args: diskLsblkArgs(`/dev/disk/by-id/${C}`), results: sliceOnDisk(world) ? [ok(carvedDisk('sds')), ok(blankDisk('sds'))] : [ok(blankDisk('sds')), ok(carvedDisk('sds'))] })
   executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok(byIdListing(world)) })
   executor.addFixture({ command: '/usr/sbin/vgs', args: [...VGS_ARGS], result: ok(JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: cacheTarget(world) ? '2' : '1', lv_count: '1', vg_size: String(LV_SIZE), vg_free: '0' }] }] })) })
   executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: ok(lvsJson(world)) })
@@ -318,6 +324,7 @@ function buildExecutor(world: World): MockExecutor {
   // Mutation plumbing — quiet success; the tests assert the ARGV, not effects.
   executor.addFixture({ command: '/usr/sbin/wipefs', result: ok('') })
   executor.addFixture({ command: '/usr/sbin/sgdisk', result: ok('') })
+  executor.addFixture({ command: '/usr/bin/partx', result: ok('') })
   executor.addFixture({ command: '/usr/bin/udevadm', result: ok('') })
   executor.addFixture({ command: '/usr/bin/realpath', result: ok('/dev/sds1\n') })
   executor.addFixture({ command: '/usr/sbin/pvcreate', result: ok('') })
