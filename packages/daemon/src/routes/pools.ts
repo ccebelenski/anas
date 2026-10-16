@@ -20,12 +20,13 @@ import { parsePoolBusyState, parseZpoolStatus, parseZpoolStatusPool } from '../p
 import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
 import { diskClaim, guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, poolClaims, sendRefusal, znameClaim, zpoolClaim } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
+import { ahrSliceLabelOwner } from '../services/ahr-identity.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal, LIO_UNREADABLE_KEY, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { mountTargetGate, normalizeMountpointPath } from '../services/mounts.js'
-import { BLKID_AMBIVALENT, BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures, LSBLK_NONE_FOUND, parsePartitionProbe, PART_BY_ID_RE, PARTITION_PROBE_ARGS } from '../services/partition-device.js'
+import { BLKID_AMBIVALENT, BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures, blkidPartEntryName, LSBLK_NONE_FOUND, parsePartitionProbe, PART_BY_ID_RE, PARTITION_PROBE_ARGS } from '../services/partition-device.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
 import { loadPveFootprint, systemPoolRefusalFrom } from '../services/pve-footprint.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
@@ -347,6 +348,14 @@ export function parsePoolMountpoints(text: string): Map<string, PoolMount> {
   return out
 }
 
+/** The pool part of a ZFS name: `tank` of `tank/a`, of a snapshot `tank@s`, and of a bind mount's findmnt source `tank/a[/sub]`. */
+const ZFS_NAME_POOL_END_RE = /[/@[]/
+
+/** Is this ZFS name (a dataset, or a findmnt zfs SOURCE) on `pool`? (cr.57, review L25) */
+function datasetOfPool(name: string, pool: string): boolean {
+  return name.split(ZFS_NAME_POOL_END_RE, 1)[0] === pool
+}
+
 /** Read every dataset's mountpoint + mounted flag, FAIL-OPEN (→ empty map). */
 async function readPoolMountpoints(executor: CommandExecutor): Promise<Map<string, PoolMount>> {
   const res = await executor.exec(ZFS, ['list', '-H', '-o', 'name,mountpoint,mounted'])
@@ -474,21 +483,15 @@ function firstStderrLine(stderr: string): string {
 }
 
 /**
- * The lock key of a new device (cr.33 `disk:<by-id>`): its own by-id for a
- * whole disk, the WHOLE disk's for a by-id partition (story nf.1) — two verbs
- * writing partitions of one disk, or one writing the disk itself, serialise.
- */
-function newDeviceLockId(id: string): string {
-  return id.replace(PART_BY_ID_RE, '')
-}
-
-/**
  * The result of the composability pre-flight (cr.12): the named per-disk
  * problems, or WHY the inventory could not be read. Two altitudes — bad
  * disks are a 400 naming them; an unreadable inventory fails CLOSED as a
  * 409 with reason 'unreadable' (the attach route's unreadable-status idiom).
+ * The partition pre-flight also names the INVENTORY id of the disk the
+ * partition sits on (`diskId`, resolved from lsblk's PKNAME) — the one
+ * spelling of its `disk:` lock key (cr.57, review L14).
  */
-type ComposableCheck = { problems: string[] } | { unreadable: string }
+type ComposableCheck = { problems: string[], diskId?: string } | { unreadable: string }
 
 /**
  * Whether a vdev spec carries redundancy. Every VdevSpec type except our
@@ -736,15 +739,38 @@ export async function poolRoutes(
    * FRESH each call so the confirm door and the job see the pool as it is now
    * (the job-time re-read is the whole point of ruling (j)). Only path
    * mountpoints count: `legacy`/`none`/`-` have no path a reference points at.
+   *
+   * cr.57 (review L25), two more facts: a `mountpoint=legacy` dataset has a
+   * path all the same — wherever it is MOUNTED (fstab or by hand) — so every
+   * live mount whose filesystem is one of the pool's datasets (`findmnt`,
+   * fstype `zfs`, source `<pool>` or `<pool>/…`) adds its target; and a read
+   * that fails is `unreadable`, never "the pool has no paths" (the strict
+   * read here; `readPoolMountpoints` stays fail-open for its other callers).
    */
-  async function poolOwnedPaths(poolName: string): Promise<string[]> {
-    const mounts = await readPoolMountpoints(executor)
-    const paths: string[] = []
-    for (const [dataset, m] of mounts) {
-      if ((dataset === poolName || dataset.startsWith(`${poolName}/`)) && m.mountpoint.startsWith('/'))
-        paths.push(m.mountpoint)
+  async function poolOwnedPaths(poolName: string): Promise<{ paths: string[], unreadable: boolean }> {
+    const paths = new Set<string>()
+    let unreadable = false
+    const list = await executor.exec(ZFS, ['list', '-H', '-o', 'name,mountpoint,mounted'])
+    if (list.exitCode === 0) {
+      for (const [dataset, m] of parsePoolMountpoints(list.stdout)) {
+        if (datasetOfPool(dataset, poolName) && m.mountpoint.startsWith('/'))
+          paths.add(m.mountpoint)
+      }
     }
-    return paths
+    else {
+      unreadable = true
+    }
+    const mounted = await executor.exec(FINDMNT, FINDMNT_ARGS)
+    if (mounted.exitCode === 0) {
+      for (const fs of parseFindmnt(mounted.stdout)) {
+        if (fs.fstype === 'zfs' && fs.target.startsWith('/') && datasetOfPool(fs.source, poolName))
+          paths.add(fs.target)
+      }
+    }
+    else {
+      unreadable = true
+    }
+    return { paths: [...paths], unreadable }
   }
 
   /**
@@ -753,10 +779,12 @@ export async function poolRoutes(
    * edit; absent options leave a source unchecked (never unreadable).
    */
   async function poolReferences(poolName: string) {
+    const owned = await poolOwnedPaths(poolName)
     return readPoolReferences({
       executor,
       pool: poolName,
-      paths: await poolOwnedPaths(poolName),
+      paths: owned.paths,
+      ...(owned.unreadable ? { pathsUnreadable: true } : {}),
       // A `mountpoint=legacy` dataset of the pool mounted through fstab is the
       // pool's own filesystem, never a mount beneath it (cr.31 D3).
       ownMounts: { zfsDatasets: true },
@@ -835,7 +863,9 @@ export async function poolRoutes(
    *    udev's cache, so a ZFS label (or any filesystem/RAID signature) written
    *    since the last udev event still refuses. Exit 2 = nothing; exit 0 with
    *    only `PART_ENTRY_*` keys = a blank partition (wave-3 capture); exit 8 =
-   *    ambivalent, i.e. more than one signature.
+   *    ambivalent, i.e. more than one signature. A blank partition whose
+   *    `PART_ENTRY_NAME` is an AHR member or cache slice label is refused
+   *    too (cr.57, review M3): AHR still counts it as its pool's.
    *
    * Same altitudes as the whole-disk check: a named problem is a 400, a read
    * that failed is a 409 `unreadable` (fail CLOSED).
@@ -875,6 +905,16 @@ export async function poolRoutes(
 
     const sig = await executor.exec(BLKID, ['-p', dev])
     if (sig.exitCode === BLKID_FOUND) {
+      // cr.57 (review M3): an AHR slice is blank until md writes it — a
+      // halted expansion leaves exactly that, and its resume then writes md
+      // over whatever ZFS put there. The slice's GPT NAME says whose it is.
+      const name = blkidPartEntryName(sig.stdout)
+      const ahr = name !== null ? ahrSliceLabelOwner(name) : null
+      if (ahr) {
+        problems.push(ahr.kind === 'member'
+          ? `partition '${id}' carries AHR pool '${ahr.pool}''s member slice label '${name}' — AHR still counts it as that pool's (an expansion resume writes md onto it); delete or relabel the partition first if it is really free`
+          : `partition '${id}' carries AHR pool '${ahr.pool}''s cache slice label '${name}' — AHR still counts it as that pool's (Detach cache reclaims it); delete or relabel the partition first if it is really free`)
+      }
       const found = blkidContentSignatures(sig.stdout)
       if (found.length > 0) {
         // What it IS first (TYPE, a nested PTTYPE), then its name; every key
@@ -889,7 +929,7 @@ export async function poolRoutes(
     else if (sig.exitCode !== BLKID_NOTHING) {
       return { unreadable: `partition '${id}' could not be probed for signatures (blkid exited ${sig.exitCode}${firstStderrLine(sig.stderr)})` }
     }
-    return { problems }
+    return { problems, diskId: disk.id }
   }
 
   /** Every disk id a create request names, across all six vdev classes. */
@@ -1367,13 +1407,40 @@ export async function poolRoutes(
     extend?: (reads: GuardReads) => Promise<X>
     gates?: Gate<PoolObject & X>[]
     mode?: LockMode
-    locks?: LockClaim[]
+    /** Fixed claims, or claims read from the door's own reads (the new device's disk key, cr.57). */
+    locks?: LockClaim[] | ((reads: GuardReads) => Promise<LockClaim[]>)
   }): GuardSpec<PoolObject & X> {
+    const extra = opts.locks
     return {
       operation: opts.operation,
       object: poolObjectView(poolName, opts.noun, opts.extend),
       gates: opts.gates ?? [],
-      locks: async (pool, bound) => [...poolClaims(pool.name, bound.id.guid, opts.mode ?? 'exclusive'), ...(opts.locks ?? [])],
+      locks: async (pool, bound, reads) => [
+        ...poolClaims(pool.name, bound.id.guid, opts.mode ?? 'exclusive'),
+        ...(typeof extra === 'function' ? await extra(reads) : extra ?? []),
+      ],
+    }
+  }
+
+  /**
+   * The `disk:` key of the attach family's new device (cr.33, story nf.1):
+   * its own id for a whole disk — the composability gate already required it
+   * to BE the inventory's id — and the WHOLE disk's for a by-id partition, so
+   * two verbs writing partitions of one disk, or one writing the disk itself,
+   * serialise. ONE spelling (cr.57, review L14): the partition's disk key is
+   * the inventory id the partition gate resolved from lsblk's PKNAME, never
+   * the by-id prefix the caller typed — a `wwn-…-part4` attach and an AHR
+   * spare or cache verb on the same disk (which lock the inventory's `ata-…`
+   * id, `diskClaim`) take the same key. The locks are read after every gate
+   * passed, so the partition read (once per guard run) has resolved the disk;
+   * the typed prefix is only a fallback no passing request reaches.
+   */
+  function newDeviceLocks(id: string): LockClaim[] | ((reads: GuardReads) => Promise<LockClaim[]>) {
+    if (!PART_BY_ID_RE.test(id))
+      return diskClaims([id])
+    return async (reads) => {
+      const check = await poolReads.partition(reads, id)
+      return diskClaims(['diskId' in check && check.diskId ? check.diskId : id.replace(PART_BY_ID_RE, '')])
     }
   }
 
@@ -2492,9 +2559,9 @@ export async function poolRoutes(
     const newPath = byIdPath(newDiskId)
     // Story nf.1 (wave-3 node pass D1): a by-id PARTITION as the new device is
     // checked as a partition, not looked up in the whole-disk inventory, and
-    // locks its whole disk's key.
+    // locks its whole disk's key — the inventory's spelling (cr.57).
     const newDiskGate = newDeviceGate<PoolObject>(newDiskId, `refusing to ${replace ? 'replace' : 'attach to'} a device it cannot identify`)
-    const newDiskLocks = diskClaims([newDeviceLockId(newDiskId)])
+    const newDiskLocks = newDeviceLocks(newDiskId)
 
     // ---- RAIDZ EXPANSION path (targetVdev present) -------------------------
     if (targetVdev !== undefined) {

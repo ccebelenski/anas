@@ -199,10 +199,21 @@ function liveStackExecutor(): MockExecutor {
   return executor
 }
 
+/**
+ * `blkid -p` on a partition with nothing on it (cr.57: `classifyPartition`
+ * asks it once `mdadm --examine` finds no superblock) — the captured blank
+ * line `fixtures/zfs/blkid-p-blank-partition.txt` (exit 0, only
+ * `PART_ENTRY_*` keys), for every partition the test asks about.
+ */
+function addBlankBlkid(executor: MockExecutor): void {
+  const line = readFileSync(join(import.meta.dirname, '../../fixtures/zfs/blkid-p-blank-partition.txt'), 'utf8')
+  executor.addFixture({ command: '/usr/sbin/blkid', argsMatch: a => a.length === 2 && a[0] === '-p', result: { stdout: line, stderr: '', exitCode: 0 } })
+}
+
 /** Every command that only READS — the acts are what remains. */
 function acts(executor: MockExecutor): { command: string, args: string[] }[] {
   return executor.calls.filter(c =>
-    !(c.command === '/usr/bin/cat' || c.command === '/usr/bin/findmnt' || c.command === '/usr/bin/lsblk'
+    !(c.command === '/usr/bin/cat' || c.command === '/usr/bin/findmnt' || c.command === '/usr/bin/lsblk' || c.command === '/usr/sbin/blkid'
       || c.command === '/usr/bin/ls' || c.command === '/usr/sbin/lvs' || c.command === '/usr/sbin/vgs'
       || c.command === '/usr/sbin/pvs' || (c.command === '/usr/sbin/mdadm' && (c.args[0] === '--detail' || c.args[0] === '--examine'))),
   )
@@ -390,6 +401,7 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
       { kernel: 'sdc', parts: ['t2-d1-b1'] },
       { kernel: 'sdd', parts: ['t2-d2-b1'] },
     ], { blank: true }))
+    addBlankBlkid(executor)
     executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: 'Unrecognised md component device', exitCode: 1 } })
     executor.addFixture({ command: '/usr/sbin/sgdisk', result: { stdout: '', stderr: '', exitCode: 0 } })
 

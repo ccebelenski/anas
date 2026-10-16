@@ -2,12 +2,15 @@ import type { AhrCapacity, AhrExpansionIntent, AhrPool, JobRef } from '@anas/sha
 import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
+import { LSBLK_ARGS } from '../../parsers/lsblk.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
+import { diskLsblkArgs } from '../ahr-expand-exec.js'
 import { resumeExpansion } from '../ahr-expand-resume.js'
 import { readIntent, writeIntent } from '../ahr-intent.js'
 import { DiskIdentityCache } from '../disk-identity-cache.js'
@@ -314,6 +317,91 @@ describe('resumeExpansion — the shared §5.3 recompute-and-continue core', () 
       if (!result.ok)
         return
       assert.deepEqual(result.bundle.plan.steps, [])
+    })
+  })
+
+  /**
+   * cr.57 (review M3): a halted expansion cut W's slices (`tank-d4-b1`,
+   * `tank-d4-b2`) and stopped before md wrote them; while it sat halted a ZFS
+   * attach took `-part2` as a leaf (the other half of M3 — the partition gate
+   * saw a blank partition). On Resume the half-joined check read only md
+   * superblocks, so the ZFS leaf read `blank` and the resume went on to
+   * `mdadm --add` over it. Now any content `blkid -p` finds is foreign.
+   *
+   * The `blkid -p` answers are the stunt-node captures
+   * (`fixtures/zfs/blkid-p-blank-partition.txt` for -part1,
+   * `fixtures/zfs/blkid-p-zfs-member-partition.txt` for -part2: a live ZFS
+   * data leaf on a GPT partition), read verbatim; the parsers ignore the
+   * device path at the head of the line.
+   */
+  describe('cr.57 — a half-joined slice that became a ZFS leaf stops the resume', () => {
+    const W = 'ata-TANK_W' // the disk the halted expansion was adding → sdt
+    const SIZE_4G = 4 * GIB + 8 * MIB
+    const FIXTURES = join(import.meta.dirname, '../../fixtures/zfs')
+    const capture = (name: string): string => readFileSync(join(FIXTURES, name), 'utf-8')
+
+    function halfJoinedWorld(part2Blkid: string): MockExecutor {
+      const executor = buildExecutor(MDSTAT_IDLE)
+      const disks = [
+        { kernel: 'sdq', id: X, size: SIZE_2G, parts: ['sdq1'] },
+        { kernel: 'sdr', id: Y, size: SIZE_3G, parts: ['sdr1', 'sdr2'] },
+        { kernel: 'sds', id: Z, size: SIZE_3G, parts: ['sds1', 'sds2'] },
+        { kernel: 'sdt', id: W, size: SIZE_4G, parts: ['sdt1', 'sdt2'] },
+      ]
+      // The inventory (collectDisks): W carries partitions, so it is not
+      // `available` — the resume asks the half-joined check about it.
+      executor.addFixture({ command: '/usr/bin/lsblk', args: [...LSBLK_ARGS], result: { stdout: JSON.stringify({ blockdevices: disks.map(d => ({
+        'name': d.kernel,
+        'type': 'disk',
+        'size': d.size,
+        'model': 'SYNTH DISK',
+        'serial': d.id.replace('ata-', ''),
+        'tran': 'sata',
+        'fstype': null,
+        'mountpoint': null,
+        'rota': true,
+        'phy-sec': 4096,
+        'log-sec': 512,
+        'children': d.parts.map(p => ({ name: p, type: 'part', size: GIB, fstype: null, mountpoint: null })),
+      })) }), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: `${disks.map(d => `lrwxrwxrwx 1 root root 9 Jul 23 10:00 ${d.id} -> ../../${d.kernel}`).join('\n')}\n`, stderr: '', exitCode: 0 } })
+      // W's own GPT (readDiskTree): both slices carry THIS pool's labels.
+      executor.addFixture({ command: '/usr/bin/lsblk', args: diskLsblkArgs(`/dev/disk/by-id/${W}`), result: { stdout: JSON.stringify({ blockdevices: [{ name: 'sdt', type: 'disk', size: SIZE_4G, partlabel: null, children: [
+        { name: 'sdt1', type: 'part', size: 2 * GIB - MIB, partlabel: 'tank-d4-b1' },
+        { name: 'sdt2', type: 'part', size: GIB, partlabel: 'tank-d4-b2' },
+      ] }] }), stderr: '', exitCode: 0 } })
+      for (const n of [1, 2]) {
+        const dev = `/dev/disk/by-id/${W}-part${n}`
+        executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--examine', '--export', dev], result: { stdout: '', stderr: `mdadm: No md superblock detected on ${dev}.`, exitCode: 1 } })
+      }
+      executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', `/dev/disk/by-id/${W}-part1`], result: { stdout: capture('blkid-p-blank-partition.txt'), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', `/dev/disk/by-id/${W}-part2`], result: { stdout: part2Blkid, stderr: '', exitCode: 0 } })
+      return executor
+    }
+
+    const resumeWithW = async (executor: MockExecutor) => {
+      const { submitted, queue } = stubJobQueue()
+      const intent = { ...mkIntent(), approvedDisks: [X, Y, Z, W] }
+      await writeIntent('tank', intent, { dir })
+      const result = await resumeExpansion({ pool: mkPool(), intent, executor, jobQueue: queue, diskCache: new DiskIdentityCache(executor), intentDir: dir, identity: IDENTITY })
+      return { result, submitted }
+    }
+
+    it('the ZFS leaf in -part2 makes W foreign: refused, nothing submitted, the intent stays halted', async () => {
+      const { result, submitted } = await resumeWithW(halfJoinedWorld(capture('blkid-p-zfs-member-partition.txt')))
+      assert.equal(result.ok, false, 'the resume must not drive md onto a ZFS leaf')
+      if (result.ok)
+        return
+      assert.equal(result.reason, 'missing-disk')
+      assert.match(result.message, new RegExp(`disk '${W}' is no longer available .*does not carry only this expansion's own 'tank' slices`))
+      assert.deepEqual(submitted, [])
+      assert.equal((await readIntent('tank', dir))?.state, 'halted')
+    })
+
+    it('the same slices still BLANK (captured blank line on both) resume as before', async () => {
+      const { result, submitted } = await resumeWithW(halfJoinedWorld(capture('blkid-p-blank-partition.txt')))
+      assert.equal(result.ok, true, result.ok ? '' : result.message)
+      assert.deepEqual(submitted, ['ahr.expand.resume'])
     })
   })
 

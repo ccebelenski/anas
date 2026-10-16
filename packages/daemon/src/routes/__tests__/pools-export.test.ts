@@ -450,6 +450,71 @@ describe('cr.24 — export names what still references the pool', () => {
     assert.ok(!warnings.some(w => /SMB share|NFS export|Backup task/.test(w)), `no specific refs: ${warnings.join(' | ')}`)
   })
 
+  /**
+   * cr.57 (review L25): the pool's own path list. A failed `zfs list` made
+   * every path-based reference silently "none"; a `mountpoint=legacy`
+   * dataset mounted from fstab was never attributed (only `/`-mountpoints
+   * counted). The findmnt answer is the captured one-zfs-mount table
+   * (`fixtures/mounts/findmnt-zfs.json`, `findmnt --json` on the dev node)
+   * with its source rewritten to a dataset of `testpool` and its target to
+   * where fstab mounts it.
+   */
+  describe('cr.57 — the pool\'s own path list', () => {
+    const ZFS_LIST = 'list -H -o name,mountpoint,mounted'
+    const FINDMNT_REAL = '--json --real'
+
+    function answer(over: Record<string, (args: string[]) => Promise<{ stdout: string, stderr: string, exitCode: number }>>): void {
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      const orig = mock.exec.bind(mock)
+      mock.exec = async (command: string, args: string[], opts?: unknown) => {
+        const hit = over[`${command} ${args.join(' ')}`]
+        return hit ? hit(args) : orig(command, args, opts as never)
+      }
+    }
+
+    async function confirmWarnings(): Promise<string[]> {
+      const res = await server!.inject({ method: 'POST', url: '/v1/pools/testpool/export', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 409, res.body)
+      return (res.json() as { error: { warnings: string[] } }).error.warnings
+    }
+
+    it('an unreadable `zfs list` is disclosed — never "nothing references the pool"', async () => {
+      const f = await makeRefFixtures()
+      applyCfg(f)
+      server = createServer({ mock: true, logger: false })
+      answer({ [`/usr/sbin/zfs ${ZFS_LIST}`]: async () => ({ stdout: '', stderr: 'cannot open \'testpool\': pool I/O is currently suspended', exitCode: 1 }) })
+      const warnings = await confirmWarnings()
+      assert.ok(warnings.includes('ANAS could not read every path on \'testpool\' (its datasets\' mountpoints and the filesystems mounted from it), so it could not fully check whether a share, export, backup or cloud-sync task, or mount uses a path on it. Verify them before confirming.'), warnings.join(' | '))
+    })
+
+    it('an unreadable mount table is disclosed too, and what `zfs list` named is still checked', async () => {
+      const f = await makeRefFixtures()
+      applyCfg(f)
+      server = createServer({ mock: true, logger: false })
+      answer({ [`/usr/bin/findmnt ${FINDMNT_REAL}`]: async () => ({ stdout: '', stderr: 'findmnt: cannot read /proc/self/mountinfo', exitCode: 1 }) })
+      const warnings = await confirmWarnings()
+      assert.ok(warnings.some(w => w.startsWith('ANAS could not read every path on \'testpool\'')), warnings.join(' | '))
+      assert.ok(warnings.some(w => /SMB share 'media'/.test(w)), warnings.join(' | '))
+    })
+
+    it('a share on a LEGACY-mounted dataset of the pool is named', async () => {
+      const f = await makeRefFixtures({ smb: '[global]\n  workgroup = WORKGROUP\n\n[legacy-media]\n  path = /srv/legacy/media\n', noBackupTask: true })
+      await writeFile(f.exportsPath, '# empty exports\n', 'utf-8')
+      applyCfg(f)
+      server = createServer({ mock: true, logger: false })
+      const captured = JSON.parse(await readFile(join(import.meta.dirname, '../../fixtures/mounts/findmnt-zfs.json'), 'utf-8')) as { filesystems: { target: string, source: string, fstype: string, options: string }[] }
+      assert.equal(captured.filesystems[0].fstype, 'zfs')
+      const table = { filesystems: [{ ...captured.filesystems[0], target: '/srv/legacy', source: 'testpool/legacy' }] }
+      answer({
+        [`/usr/sbin/zfs ${ZFS_LIST}`]: async () => ({ stdout: 'testpool\t/testpool\tyes\ntestpool/legacy\tlegacy\tyes\n', stderr: '', exitCode: 0 }),
+        [`/usr/bin/findmnt ${FINDMNT_REAL}`]: async () => ({ stdout: JSON.stringify(table), stderr: '', exitCode: 0 }),
+      })
+      const warnings = await confirmWarnings()
+      assert.ok(warnings.includes('SMB share \'legacy-media\' serves \'/srv/legacy/media\', which is a path on this pool, and will stop working'), warnings.join(' | '))
+      assert.ok(!warnings.some(w => w.startsWith('ANAS could not read every path')), warnings.join(' | '))
+    })
+  })
+
   it('the export job reports a reference that appeared AFTER the confirm', async () => {
     const f = await makeRefFixtures()
     applyCfg(f)

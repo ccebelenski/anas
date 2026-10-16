@@ -7,6 +7,7 @@ import type {
 import type { CommandExecutor } from '../executor/types.js'
 import type { MdadmDetailExport } from '../parsers/mdadm-detail.js'
 import type { MdstatArray } from '../parsers/mdstat.js'
+import type { RetireVerdict } from './ahr-identity.js'
 import type { AhrExpansionPlan, ExistingBand } from './ahr-layout.js'
 import { btrfsUsageArgs, parseBtrfsUsage } from '../parsers/btrfs-usage.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
@@ -15,7 +16,7 @@ import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { LVM_MIXED_BLOCK_ARGS, UPDATE_INITRAMFS_BUDGET_MS } from './ahr-exec.js'
 import { ahrDataOffsetArg, ahrDataOffsetBytes, planDiskPartitions } from './ahr-geometry.js'
-import { examineMember, readAhrPoolIdentity, requirePoolVg } from './ahr-identity.js'
+import { classifyRetiredPartition, examineMember, mayZapRetiredDisk, readAhrPoolIdentity, requirePoolVg, retiredDiskKeptSentence } from './ahr-identity.js'
 import { clearIntent, defaultAhrIntentDir, writeIntent } from './ahr-intent.js'
 import { AHR_SIZE_GRANULARITY_BYTES, floorToGranularity, fmtBytes, isPvUnderSized } from './ahr-layout.js'
 import { pinArrays } from './ahr-mdadm-conf.js'
@@ -1425,13 +1426,19 @@ export async function executeReplace(
     .filter(a => a.members.some(m => m.disk === oldDiskId))
     .map(a => a.band)
     .sort((a, b) => a - b)
-  const oldWasHealthy = pool.arrays.every(a =>
+  /** The outgoing disk is a healthy member of every band it sits in, in `p`. */
+  const oldHealthyIn = (p: AhrPool): boolean => p.arrays.every(a =>
     a.members.every(m => m.disk !== oldDiskId || m.memberState === 'in_sync'),
   )
+  let oldWasHealthy = oldHealthyIn(pool)
 
   try {
     // Phase 1 — partition the incoming disk for every band it will serve.
     await reguard()
+    // cr.57 (review L13): "was the outgoing disk healthy" is read from the
+    // pool as the job re-read it under its locks, not the route's copy — a
+    // job can wait hours, and a disk that failed meanwhile is left alone.
+    oldWasHealthy = oldHealthyIn(live)
     updateProgress(`partitioning ${newDiskId}`)
     log(`ahr.replace pool=${pool.name} phase=partition disk=${newDiskId}`)
     await ensureDiskPartitions(executor, pool.name, newDiskId, input.plan.preview.bands)
@@ -1526,13 +1533,31 @@ export async function executeReplace(
       await hooks?.reacquire()
       const oldDisk = await readDiskTree(executor, byIdPath(oldDiskId))
       if (oldDisk) {
-        updateProgress(`retiring ${oldDiskId} (zero superblocks, zap GPT)`)
+        // cr.57 (review L13): destroy's per-partition ownership rule decides,
+        // read before the first zero — only the pool's own slices are
+        // cleared, and the GPT goes only when every partition is the pool's.
+        // Since nf.1 a partition the operator cut in the disk's free tail can
+        // be a ZFS leaf; zapping the table erased it.
+        const identity = await readAhrPoolIdentity(executor, pool.name)
+        const facts: { path: string, verdict: RetireVerdict }[] = []
         for (const part of oldDisk.parts) {
-          if (part.number !== null && part.partlabel !== null && dNumberRe(pool.name).test(part.partlabel))
-            await executor.exec(MDADM, ['--zero-superblock', partByIdPath(oldDiskId, part.number)])
+          const path = part.number !== null ? partByIdPath(oldDiskId, part.number) : `/dev/${part.name}`
+          facts.push({ path, verdict: await classifyRetiredPartition(executor, identity, pool.name, path, part.partlabel) })
         }
-        await executor.exec(SGDISK, ['--zap-all', byIdPath(oldDiskId)])
-        log(`ahr.replace pool=${pool.name} disk=${oldDiskId} status=retired`)
+        updateProgress(`retiring ${oldDiskId} (zero superblocks, zap GPT)`)
+        for (const f of facts) {
+          if (f.verdict === 'ours')
+            await executor.exec(MDADM, ['--zero-superblock', f.path])
+        }
+        if (mayZapRetiredDisk(facts.map(f => f.verdict))) {
+          await executor.exec(SGDISK, ['--zap-all', byIdPath(oldDiskId)])
+          log(`ahr.replace pool=${pool.name} disk=${oldDiskId} status=retired`)
+        }
+        else {
+          const kept = retiredDiskKeptSentence(oldDiskId, facts.filter(f => f.verdict === 'foreign').map(f => f.path))
+          updateProgress(kept)
+          log(`ahr.replace pool=${pool.name} disk=${oldDiskId} status=retired-table-kept detail=${kept}`)
+        }
       }
       else {
         log(`ahr.replace pool=${pool.name} disk=${oldDiskId} status=absent-left-alone`)

@@ -138,7 +138,7 @@ function exportFor(name: string, level: string, devices: number, uuid: string): 
   ].join('\n')
 }
 
-interface PartSpec { name: string, size: number, label: string }
+interface PartSpec { name: string, size: number, label: string | null }
 
 function diskJson(kernel: string, size: number, parts: PartSpec[]): string {
   return JSON.stringify({ blockdevices: [{
@@ -271,7 +271,7 @@ function mkIntent(approved: string[], extra: Partial<AhrExpansionIntent> = {}): 
 function mutatingCalls(executor: MockExecutor): { command: string, args: string[] }[] {
   return executor.calls.filter((c) => {
     if (c.command === MDADM)
-      return c.args[0] !== '--detail'
+      return c.args[0] !== '--detail' && c.args[0] !== '--examine'
     if (c.command === '/usr/bin/btrfs')
       return c.args.includes('resize')
     return [SGDISK, '/usr/sbin/pvcreate', '/usr/sbin/pvresize', '/usr/sbin/vgextend', '/usr/sbin/lvextend', '/usr/sbin/update-initramfs'].includes(c.command)
@@ -1120,6 +1120,9 @@ unused devices: <none>
         children: d.parts.map(p => ({ name: p.name, type: 'part', size: p.size, partlabel: p.label })),
       })) }
       executor.addFixture({ command: LSBLK, args: ['-Jb', '-o', 'NAME,TYPE,SIZE,PARTLABEL'], result: { stdout: JSON.stringify(tree), stderr: '', exitCode: 0 } })
+      // cr.57: the retired slice still carries tank-r1's superblock — the
+      // pool's to zero, and the disk the pool's to zap.
+      executor.addFixture({ command: MDADM, args: ['--examine', '--export', `/dev/disk/by-id/${X}-part1`], result: { stdout: exportFor('tank-r1', 'raid5', 3, R1_UUID), stderr: '', exitCode: 0 } })
       executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
       executor.addFixture({ command: SGDISK, result: { stdout: '', stderr: '', exitCode: 0 } })
 
@@ -1246,6 +1249,88 @@ unused devices: <none>
       assert.equal(outcome.cause, refusal)
       assert.ok(!executor.calls.some(c => c.command === MDADM && (c.args.includes('--add') || c.args.includes('--replace'))), 'no --add, no --replace')
       assert.equal((await readIntent('tank', dir))?.state, 'halted')
+    })
+
+    /**
+     * cr.57 (review L13): the retire zeroed every labelled slice and then
+     * zapped the whole GPT of the outgoing disk, healthy-or-not decided from
+     * the ROUTE's copy of the pool. Destroy's per-partition ownership rule now
+     * decides, and "healthy" is read from the pool the job re-read.
+     */
+    describe('cr.57 — retiring the outgoing disk', () => {
+      /** The full-sequence world; `xExtra` adds partitions to the outgoing disk X. */
+      function replaceWorld(xExtra: { name: string, size: number, label: string | null }[] = []): MockExecutor {
+        const executor = world({ mdstat: [MDSTAT_BASE, MDSTAT_REPLACE_RUNNING, MDSTAT_REPLACE_DONE, MDSTAT_REPLACE_DONE] })
+        if (xExtra.length > 0) {
+          const x = DISK_PARTS[X]
+          executor.prependFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${X}`), result: { stdout: diskJson(x.kernel, x.size, [...x.parts, ...xExtra]), stderr: '', exitCode: 0 } })
+        }
+        executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${N}`), results: [
+          { stdout: diskJson('sdv', SIZE_2G, []), stderr: '', exitCode: 0 },
+          { stdout: diskJson('sdv', SIZE_2G, [{ name: 'sdv1', size: B1_CLAMPED_2G, label: 'tank-d4-b1' }]), stderr: '', exitCode: 0 },
+        ] })
+        const tree = { blockdevices: Object.values(DISK_PARTS).map(d => ({
+          name: d.kernel,
+          type: 'disk',
+          size: d.size,
+          children: d.parts.map(p => ({ name: p.name, type: 'part', size: p.size, partlabel: p.label })),
+        })) }
+        executor.addFixture({ command: LSBLK, args: ['-Jb', '-o', 'NAME,TYPE,SIZE,PARTLABEL'], result: { stdout: JSON.stringify(tree), stderr: '', exitCode: 0 } })
+        executor.addFixture({ command: MDADM, args: ['--examine', '--export', `/dev/disk/by-id/${X}-part1`], result: { stdout: exportFor('tank-r1', 'raid5', 3, R1_UUID), stderr: '', exitCode: 0 } })
+        executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+        executor.addFixture({ command: SGDISK, result: { stdout: '', stderr: '', exitCode: 0 } })
+        return executor
+      }
+
+      const replacePlan = () => planExpansion({
+        poolName: 'tank',
+        tier: 'ahr1',
+        existingBands: [
+          { band: 1, startBytes: 0, endBytes: 2 * GIB, level: 'raid5', members: [X, Y, Z] },
+          { band: 2, startBytes: 2 * GIB, endBytes: 3 * GIB, level: 'raid1', members: [Y, Z] },
+        ],
+        approvedDisks: [{ id: N, usableBytes: SIZE_2G }, { id: Y, usableBytes: SIZE_3G }, { id: Z, usableBytes: SIZE_3G }],
+        replaced: { oldDiskId: X, newDiskId: N },
+      })
+
+      const retireActs = (executor: MockExecutor) => mutatingCalls(executor)
+        .filter(c => (c.command === MDADM && c.args[0] === '--zero-superblock') || (c.command === SGDISK && c.args[0] === '--zap-all'))
+        .map(c => [c.command, ...c.args])
+
+      it('a ZFS leaf in the outgoing disk\'s free tail keeps its GPT: only the pool\'s slice is zeroed, no zap, the sentence is said', async () => {
+        // X-part2: unlabelled, no md superblock, and `blkid -p` answers the
+        // captured ZFS data-leaf line (fixtures/zfs/blkid-p-zfs-member-partition.txt).
+        const executor = replaceWorld([{ name: 'sdq2', size: GIB / 2, label: null }])
+        executor.addFixture({ command: MDADM, args: ['--examine', '--export', `/dev/disk/by-id/${X}-part2`], result: { stdout: '', stderr: 'mdadm: No md superblock detected.', exitCode: 1 } })
+        executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', `/dev/disk/by-id/${X}-part2`], result: { stdout: readFileSync(join(import.meta.dirname, '../../fixtures/zfs/blkid-p-zfs-member-partition.txt'), 'utf-8'), stderr: '', exitCode: 0 } })
+        const progress: string[] = []
+        const intent = mkIntent([N, Y, Z], { trigger: 'replace-disk', replacedDisk: X, replacementDisk: N })
+        const outcome = await executeReplace(executor, { pool: mkPool(), intent, plan: replacePlan(), oldDiskId: X, newDiskId: N }, m => progress.push(m), { intentDir: dir, pollIntervalMs: 1, log: () => {} })
+        assert.equal(outcome.ok, true, outcome.error)
+        assert.deepEqual(retireActs(executor), [[MDADM, '--zero-superblock', `/dev/disk/by-id/${X}-part1`]])
+        assert.ok(progress.includes(`Leaving the partition table on ${X} — it carries partitions that are not this pool's (/dev/disk/by-id/${X}-part2); only the pool's own slices were cleared`), progress.join(' | '))
+      })
+
+      it('"was the outgoing disk healthy" is read from the pool the job re-read: a member that failed while queued is left alone', async () => {
+        const executor = replaceWorld()
+        const intent = mkIntent([N, Y, Z], { trigger: 'replace-disk', replacedDisk: X, replacementDisk: N })
+        // The route's copy (mkPool) shows X in sync; the job's re-read shows it faulty.
+        const reread = (): AhrPool => {
+          const p = mkPool()
+          p.arrays = p.arrays.map(a => ({ ...a, members: a.members.map(m => m.disk === X ? { ...m, memberState: 'faulty' as const } : m) }))
+          return p
+        }
+        const logs: string[] = []
+        const outcome = await executeReplace(executor, { pool: mkPool(), intent, plan: replacePlan(), oldDiskId: X, newDiskId: N }, () => {}, {
+          intentDir: dir,
+          pollIntervalMs: 1,
+          log: l => logs.push(l),
+          hooks: { release: () => {}, reguard: async () => reread(), reacquire: async () => {} },
+        })
+        assert.equal(outcome.ok, true, outcome.error)
+        assert.deepEqual(retireActs(executor), [], 'no zero, no zap on a disk that failed')
+        assert.ok(logs.some(l => l.includes(`disk=${X} status=dead-left-alone`)), logs.join('\n'))
+      })
     })
   })
 

@@ -1,10 +1,12 @@
 import type { AhrPool, AhrPreviewBand } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { RetireVerdict } from './ahr-identity.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
 import { clearGhostMdSignatures } from './ahr-create.js'
 import { requireComposableNow } from './ahr-disk-recheck.js'
 import { run } from './ahr-exec.js'
 import { addSpareSlice, ensureDiskPartitions, projectExistingBands, readDiskTree, removeDetachedFaultySlots, resolveAhrArrays } from './ahr-expand-exec.js'
+import { classifyRetiredPartition, mayZapRetiredDisk, readAhrPoolIdentity, retiredDiskKeptSentence } from './ahr-identity.js'
 import { floorToGranularity, fmtBytes } from './ahr-layout.js'
 import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
 
@@ -263,7 +265,7 @@ export async function removeSpare(
   input: { pool: AhrPool, diskId: string },
   updateProgress: (message: string) => void,
   opts: SpareOptions = {},
-): Promise<{ removed: string }> {
+): Promise<{ removed: string, partitionTableKept?: string }> {
   const { pool, diskId } = input
   const log = opts.log ?? ((line: string) => process.stdout.write(`${line}\n`))
 
@@ -322,10 +324,28 @@ export async function removeSpare(
     log(`ahr.spare pool=${pool.name} band=${band} disk=${diskId} status=removed`)
   }
 
-  // Zap: superblocks first (tolerated — a clean slice has none), then GPT.
+  // Zap — destroy's per-partition ownership rule decides (cr.57, review L13),
+  // read before the first zero: only the pool's own slices are zeroed, and
+  // the GPT goes only when every partition on the disk is the pool's. Since
+  // nf.1 a partition the operator cut in the disk's free tail can be a ZFS
+  // leaf; zapping the whole table erased it.
+  const identity = await readAhrPoolIdentity(executor, pool.name)
+  const facts: { path: string, verdict: RetireVerdict }[] = []
+  for (const part of tree.parts) {
+    const path = part.number !== null ? `${byIdPath(diskId)}-part${part.number}` : `/dev/${part.name}`
+    facts.push({ path, verdict: await classifyRetiredPartition(executor, identity, pool.name, path, part.partlabel) })
+  }
   updateProgress(`Zapping ${diskId} (zero superblocks, zap GPT)`)
-  for (const [, number] of partNumbers)
-    await executor.exec(MDADM, ['--zero-superblock', `${byIdPath(diskId)}-part${number}`])
+  for (const f of facts) {
+    if (f.verdict === 'ours')
+      await executor.exec(MDADM, ['--zero-superblock', f.path])
+  }
+  if (!mayZapRetiredDisk(facts.map(f => f.verdict))) {
+    const kept = retiredDiskKeptSentence(diskId, facts.filter(f => f.verdict === 'foreign').map(f => f.path))
+    updateProgress(kept)
+    log(`ahr.spare pool=${pool.name} disk=${diskId} status=removed-table-kept detail=${kept}`)
+    return { removed: diskId, partitionTableKept: kept }
+  }
   await run(executor, SGDISK, ['--zap-all', byIdPath(diskId)])
   log(`ahr.spare pool=${pool.name} disk=${diskId} status=zapped`)
 

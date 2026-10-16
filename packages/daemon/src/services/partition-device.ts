@@ -103,3 +103,22 @@ export function blkidContentSignatures(stdout: string): string[] {
   }
   return found
 }
+
+/**
+ * The GPT partition NAME on a `blkid -p` line — its `PART_ENTRY_NAME` key —
+ * or null when the partition is unnamed (the captured blank line
+ * `zfs/blkid-p-blank-partition.txt` carries none) or the line is not
+ * blkid's. The name says nothing about content (see
+ * {@link blkidContentSignatures}), but it is where AHR writes its slice labels
+ * (`<pool>-d<n>-b<band>`, `<pool>-cache<n>`; ZFS's own whole-disk label reads
+ * `PART_ENTRY_NAME="zfs-be7977a25d6c0c32"` in the wave-3 capture
+ * `docs/probes/wave3-node/out/n6-zpool-create.log`), so the ZFS partition gate
+ * reads it to see the other door's slices (cr.57, review M3).
+ */
+export function blkidPartEntryName(stdout: string): string | null {
+  for (const [, key, value] of stdout.matchAll(BLKID_PAIR_RE)) {
+    if (key === 'PART_ENTRY_NAME')
+      return value === '' ? null : value
+  }
+  return null
+}

@@ -13,12 +13,14 @@ import { mdadmDetailExportArgs, mdadmExamineExportArgs } from '../../parsers/mda
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import {
   ahrNameOccupancy,
+  ahrSliceLabelOwner,
   assessVgPvs,
   canonicalMdUuid,
   classifyPartition,
   isIntentStale,
   isIntentStaleForPool,
   isOwnedArray,
+  mayZapRetiredDisk,
   pinnedUuids,
   poolIntentIdentity,
   poolPvNames,
@@ -31,6 +33,11 @@ import {
 const AHR_FIXTURES = join(fileURLToPath(new URL('.', import.meta.url)), '../../fixtures/ahr')
 function loadFixture(name: string): string {
   return readFileSync(join(AHR_FIXTURES, name), 'utf-8')
+}
+
+/** The stunt-node `blkid -p` captures under `fixtures/zfs` (NOTES.md, nf.1). */
+function zfsCapture(name: string): string {
+  return readFileSync(join(AHR_FIXTURES, '../zfs', name), 'utf-8')
 }
 
 /**
@@ -166,8 +173,56 @@ describe('readAhrPoolIdentity / classifyPartition', () => {
     executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs('/dev/sdb1'), result: { stdout: exportFor('pve:media-r1', OURS), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs('/dev/sdp1'), result: { stdout: exportFor('otherbox:media-r1', FOREIGN), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs('/dev/sdz1'), result: { stdout: '', stderr: 'mdadm: No md superblock detected on /dev/sdz1.', exitCode: 1 } })
+    // cr.57: no superblock → `blkid -p` decides blank vs content. The
+    // captured blank line (exit 0, only PART_ENTRY_* keys).
+    executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sdz1'], result: { stdout: zfsCapture('blkid-p-blank-partition.txt'), stderr: '', exitCode: 0 } })
     return executor
   }
+
+  /**
+   * cr.57 (review M3): a partition with no md superblock is `blank` only when
+   * `blkid -p` finds NOTHING on it. The review's shape: a ZFS leaf in what
+   * was an AHR slice — `mdadm --examine` says "no superblock", the low-level
+   * probe says `zfs_member` (the captured `zfs/blkid-p-zfs-member-partition.txt`).
+   */
+  describe('cr.57 — any non-md content signature is foreign', () => {
+    it('a ZFS leaf (captured zfs_member line) with no md superblock is FOREIGN, not blank', async () => {
+      const executor = world()
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs('/dev/sdz2'), result: { stdout: '', stderr: 'mdadm: No md superblock detected on /dev/sdz2.', exitCode: 1 } })
+      executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sdz2'], result: { stdout: zfsCapture('blkid-p-zfs-member-partition.txt'), stderr: '', exitCode: 0 } })
+      const id = await readAhrPoolIdentity(executor, 'media', { mdadmConfPath: join(dir, 'mdadm.conf') })
+      assert.equal(await classifyPartition(executor, id, '/dev/sdz2'), 'foreign')
+    })
+
+    it('a freed ZFS spare (captured: zfs_member, no LABEL/UUID) and an ambivalent probe are foreign', async () => {
+      const executor = world()
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs('/dev/sdz3'), result: { stdout: '', stderr: 'mdadm: No md superblock detected on /dev/sdz3.', exitCode: 1 } })
+      executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sdz3'], result: { stdout: zfsCapture('blkid-p-freed-spare-partition.txt'), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs('/dev/sdz4'), result: { stdout: '', stderr: 'mdadm: No md superblock detected on /dev/sdz4.', exitCode: 1 } })
+      executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sdz4'], result: { stdout: '', stderr: '', exitCode: 8 } })
+      const id = await readAhrPoolIdentity(executor, 'media', { mdadmConfPath: join(dir, 'mdadm.conf') })
+      assert.equal(await classifyPartition(executor, id, '/dev/sdz3'), 'foreign')
+      assert.equal(await classifyPartition(executor, id, '/dev/sdz4'), 'foreign')
+    })
+
+    it('blkid exit 2 (nothing found) is blank; a probe that FAILED is foreign (fail closed)', async () => {
+      const executor = world()
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs('/dev/sdz5'), result: { stdout: '', stderr: 'mdadm: No md superblock detected on /dev/sdz5.', exitCode: 1 } })
+      executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sdz5'], result: { stdout: '', stderr: '', exitCode: 2 } })
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs('/dev/sdz6'), result: { stdout: '', stderr: 'mdadm: No md superblock detected on /dev/sdz6.', exitCode: 1 } })
+      executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sdz6'], result: { stdout: '', stderr: 'blkid: error: /dev/sdz6: Input/output error', exitCode: 4 } })
+      const id = await readAhrPoolIdentity(executor, 'media', { mdadmConfPath: join(dir, 'mdadm.conf') })
+      assert.equal(await classifyPartition(executor, id, '/dev/sdz5'), 'blank')
+      assert.equal(await classifyPartition(executor, id, '/dev/sdz6'), 'foreign')
+    })
+
+    it('a partition whose md superblock is read never reaches blkid (the md answer stands)', async () => {
+      const executor = world()
+      const id = await readAhrPoolIdentity(executor, 'media', { mdadmConfPath: join(dir, 'mdadm.conf') })
+      assert.equal(await classifyPartition(executor, id, '/dev/sdb1'), 'ours')
+      assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/blkid'))
+    })
+  })
 
   it('a same-named foreign array is split out: owned = pinned, foreign = the other `media-r1`', async () => {
     const id = await readAhrPoolIdentity(world(), 'media', { mdadmConfPath: join(dir, 'mdadm.conf'), withVgUuid: true })
@@ -632,5 +687,46 @@ describe('the expansion intent — whose is it?', () => {
     assert.equal(canonicalMdUuid(OURS.toUpperCase()), OURS)
     assert.equal(canonicalMdUuid('not-a-uuid'), null)
     assert.equal(canonicalMdUuid(null), null)
+  })
+})
+
+/**
+ * cr.57 (review M3): the ZFS partition gate holds a GPT label and no pool
+ * name. Labels below are CAPTURED: `ahr0-d3-b2` is a member slice of the
+ * stunt-node pool in `fixtures/ahr/lsblk-ahr0.json`, `gtcache-cache1` the
+ * cache slice the GT-25 udev capture names (AHR-GROUND-TRUTH.md), and
+ * `zfs-be7977a25d6c0c32` ZFS's own whole-disk label from the wave-3 n6 capture.
+ */
+describe('mayZapRetiredDisk — destroy\'s rule for every retire (cr.57, L13)', () => {
+  it('only when every partition is the pool\'s, and never on a disk with none read', () => {
+    assert.equal(mayZapRetiredDisk(['ours', 'blank-ours']), true)
+    assert.equal(mayZapRetiredDisk(['ours', 'foreign']), false)
+    assert.equal(mayZapRetiredDisk([]), false)
+  })
+})
+
+describe('ahrSliceLabelOwner — whose AHR slice is this label (cr.57)', () => {
+  it('a member label names its pool', () => {
+    assert.ok(loadFixture('lsblk-ahr0.json').includes('"partlabel": "ahr0-d3-b2"'), 'the capture carries the label')
+    assert.deepEqual(ahrSliceLabelOwner('ahr0-d3-b2'), { pool: 'ahr0', kind: 'member' })
+  })
+
+  it('a cache label names its pool', () => {
+    assert.deepEqual(ahrSliceLabelOwner('gtcache-cache1'), { pool: 'gtcache', kind: 'cache' })
+  })
+
+  it('a pool name with dashes in it is kept whole', () => {
+    assert.deepEqual(ahrSliceLabelOwner('my-pool-d12-b3'), { pool: 'my-pool', kind: 'member' })
+    assert.deepEqual(ahrSliceLabelOwner('my-pool-cache2'), { pool: 'my-pool', kind: 'cache' })
+  })
+
+  it('ZFS\'s own label, an md array name and labels AHR could never write are nobody\'s', () => {
+    assert.equal(ahrSliceLabelOwner('zfs-be7977a25d6c0c32'), null)
+    assert.equal(ahrSliceLabelOwner('ahr0-r1'), null)
+    assert.equal(ahrSliceLabelOwner('-d1-b1'), null)
+    assert.equal(ahrSliceLabelOwner('1pool-d1-b1'), null, 'a pool name starts with a letter')
+    assert.equal(ahrSliceLabelOwner('a b-d1-b1'), null)
+    assert.equal(ahrSliceLabelOwner('ahr0-d3-b'), null)
+    assert.equal(ahrSliceLabelOwner('EFI System Partition'), null)
   })
 })

@@ -1,6 +1,7 @@
 import type { AhrExpansionIntent, Job } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -208,6 +209,10 @@ function buildExecutor(opts: { mdstat?: string, spareAttached?: boolean } = {}):
   executor.addFixture({ command: '/usr/bin/udevadm', result: { stdout: '', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/realpath', result: { stdout: '/dev/sdt1\n', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/ls', result: { stdout: '', stderr: '', exitCode: 0 } }) // holders: none
+  // cr.57: the md superblock inside each spare slice names tank's own arrays —
+  // what makes them the pool's to zero and W the pool's to zap at removal.
+  executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--examine', '--export', `/dev/disk/by-id/${W}-part1`], result: { stdout: exportFor('tank-r1', 'raid5', 3, 'aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa'), stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--examine', '--export', `/dev/disk/by-id/${W}-part2`], result: { stdout: exportFor('tank-r2', 'raid1', 2, 'bbbbbbbb:bbbbbbbb:bbbbbbbb:bbbbbbbb'), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: '', exitCode: 0 } }) // --add-spare / --remove / --zero-superblock
   return executor
 }
@@ -363,7 +368,7 @@ describe('AHR hot-spare routes (story 11.11)', () => {
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
       assert.deepEqual(job.result, { removed: W })
       // Each slice removed, then superblocks zeroed, then the GPT zapped.
-      const md = executor.calls.filter(c => c.command === '/usr/sbin/mdadm' && c.args[0] !== '--detail').map(c => c.args)
+      const md = executor.calls.filter(c => c.command === '/usr/sbin/mdadm' && c.args[0] !== '--detail' && c.args[0] !== '--examine').map(c => c.args)
       assert.deepEqual(md, [
         ['/dev/md127', '--remove', `/dev/disk/by-id/${W}-part1`],
         ['/dev/md126', '--remove', `/dev/disk/by-id/${W}-part2`],
@@ -371,6 +376,36 @@ describe('AHR hot-spare routes (story 11.11)', () => {
         ['--zero-superblock', `/dev/disk/by-id/${W}-part2`],
       ])
       assert.ok(executor.calls.some(c => c.command === '/usr/sbin/sgdisk' && c.args[0] === '--zap-all'))
+    })
+
+    /**
+     * cr.57 (review L13), through the real route: W also carries a partition
+     * the operator cut in its free tail and gave to ZFS (nf.1). Its `blkid
+     * -p` answer is the captured ZFS data-leaf line
+     * (`fixtures/zfs/blkid-p-zfs-member-partition.txt`); it has no md
+     * superblock. The removal completes, zeroes only the pool's two slices,
+     * and keeps the GPT with the sentence in the job result.
+     */
+    it('cr.57: a spare disk carrying a ZFS leaf keeps its GPT — the job zeroes only the pool\'s slices and says why', async () => {
+      await build({ spareAttached: true })
+      executor.prependFixture({ command: '/usr/bin/lsblk', args: diskLsblkArgs(`/dev/disk/by-id/${W}`), result: { stdout: JSON.stringify({ blockdevices: [{ name: 'sdt', type: 'disk', size: SIZE_4G, partlabel: null, children: [
+        { name: 'sdt1', type: 'part', size: B1_INTERIOR, partlabel: 'tank-d4-b1' },
+        { name: 'sdt2', type: 'part', size: B2_INTERIOR, partlabel: 'tank-d4-b2' },
+        { name: 'sdt3', type: 'part', size: 512 * 1024 * 1024, partlabel: null },
+      ] }] }), stderr: '', exitCode: 0 } })
+      executor.prependFixture({ command: '/usr/sbin/mdadm', args: ['--examine', '--export', `/dev/disk/by-id/${W}-part3`], result: { stdout: '', stderr: 'mdadm: No md superblock detected.', exitCode: 1 } })
+      executor.prependFixture({ command: '/usr/sbin/blkid', args: ['-p', `/dev/disk/by-id/${W}-part3`], result: { stdout: readFileSync(join(import.meta.dirname, '../../fixtures/zfs/blkid-p-zfs-member-partition.txt'), 'utf-8'), stderr: '', exitCode: 0 } })
+      const first = await server.inject({ method: 'DELETE', url: `/v1/ahr/tank/spare/${W}`, headers: IDENTITY_HEADERS })
+      const code = first.headers['x-anas-confirm-code'] as string
+      assert.ok(code, first.body)
+      const second = await server.inject({ method: 'DELETE', url: `/v1/ahr/tank/spare/${W}`, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code } })
+      assert.equal(second.statusCode, 202, second.body)
+      const job = await waitForJob(jobQueue, second.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.deepEqual(job.result, { removed: W, partitionTableKept: `Leaving the partition table on ${W} — it carries partitions that are not this pool's (/dev/disk/by-id/${W}-part3); only the pool's own slices were cleared` })
+      const zeroed = executor.calls.filter(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--zero-superblock').map(c => c.args[1])
+      assert.deepEqual(zeroed, [`/dev/disk/by-id/${W}-part1`, `/dev/disk/by-id/${W}-part2`])
+      assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/sgdisk'), 'no zap')
     })
 
     it('400 on an invalid disk id', async () => {

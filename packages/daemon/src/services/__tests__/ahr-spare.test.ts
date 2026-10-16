@@ -83,7 +83,7 @@ function exportFor(name: string, level: string, devices: number, uuid: string): 
   return `MD_LEVEL=${level}\nMD_DEVICES=${devices}\nMD_METADATA=1.2\nMD_UUID=${uuid}\nMD_DEVNAME=${name}\nMD_NAME=anas-test:${name}\n`
 }
 
-interface PartSpec { name: string, size: number, label: string }
+interface PartSpec { name: string, size: number, label: string | null }
 
 function diskJson(kernel: string, size: number, parts: PartSpec[]): string {
   return JSON.stringify({ blockdevices: [{
@@ -380,21 +380,57 @@ describe('removeSpare (§11)', () => {
     { band: 2, sizeBytes: B2_INTERIOR, part: 2 },
   ])
 
-  function spareWorld(): MockExecutor {
+  /**
+   * The spare's own GPT, and (cr.57) the md superblock inside each slice:
+   * `mdadm --examine --export` names tank's own arrays, which is what makes
+   * the slices the pool's to zero and the disk the pool's to zap. `extra`
+   * appends partitions the operator cut in the disk's free tail.
+   */
+  function spareWorld(extra: PartSpec[] = []): MockExecutor {
     const executor = world({ mdstat: MDSTAT_WITH_SPARE })
     executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${SP}`), result: { stdout: diskJson('sdv', SIZE_3G, [
       { name: 'sdv1', size: B1_INTERIOR, label: 'tank-d4-b1' },
       { name: 'sdv2', size: B2_INTERIOR, label: 'tank-d4-b2' },
+      ...extra,
     ]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, args: ['--examine', '--export', `/dev/disk/by-id/${SP}-part1`], result: { stdout: exportFor('tank-r1', 'raid5', 3, R1_UUID), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, args: ['--examine', '--export', `/dev/disk/by-id/${SP}-part2`], result: { stdout: exportFor('tank-r2', 'raid1', 2, R2_UUID), stderr: '', exitCode: 0 } })
     return executor
   }
+
+  /**
+   * cr.57 (review L13): spare removal zeroed EVERY partition and zapped the
+   * whole GPT. Since nf.1 a partition the operator cut in the disk's free
+   * tail can be a ZFS leaf. Destroy's per-partition ownership rule now
+   * decides. `-part3` carries no md superblock and `blkid -p` answers the
+   * captured ZFS data-leaf line (`fixtures/zfs/blkid-p-zfs-member-partition.txt`).
+   */
+  it('cr.57: a partition that is not the pool\'s (a ZFS leaf in the free tail) keeps the GPT and is never zeroed', async () => {
+    const executor = spareWorld([{ name: 'sdv3', size: GIB, label: null }])
+    executor.addFixture({ command: MDADM, args: ['--examine', '--export', `/dev/disk/by-id/${SP}-part3`], result: { stdout: '', stderr: `mdadm: No md superblock detected on /dev/disk/by-id/${SP}-part3.`, exitCode: 1 } })
+    executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', `/dev/disk/by-id/${SP}-part3`], result: { stdout: readFileSync(join(import.meta.dirname, '../../fixtures/zfs/blkid-p-zfs-member-partition.txt'), 'utf-8'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+    const progress: string[] = []
+    const result = await removeSpare(executor, { pool: mkPool({ spare: spareDisk }), diskId: SP }, m => progress.push(m), { log: () => {} })
+    const kept = `Leaving the partition table on ${SP} — it carries partitions that are not this pool's (/dev/disk/by-id/${SP}-part3); only the pool's own slices were cleared`
+    assert.deepEqual(result, { removed: SP, partitionTableKept: kept })
+    assert.ok(progress.includes(kept), progress.join(' | '))
+    const md = executor.calls.filter(c => c.command === MDADM && c.args[0] !== '--detail' && c.args[0] !== '--examine')
+    assert.deepEqual(md.map(c => c.args), [
+      ['/dev/md127', '--remove', `/dev/disk/by-id/${SP}-part1`],
+      ['/dev/md126', '--remove', `/dev/disk/by-id/${SP}-part2`],
+      ['--zero-superblock', `/dev/disk/by-id/${SP}-part1`],
+      ['--zero-superblock', `/dev/disk/by-id/${SP}-part2`],
+    ])
+    assert.deepEqual(executor.calls.filter(c => c.command === SGDISK), [], 'no zap')
+  })
 
   it('removes every slice, zeroes superblocks, zaps the disk', async () => {
     const executor = spareWorld()
     executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
     const result = await removeSpare(executor, { pool: mkPool({ spare: spareDisk }), diskId: SP }, noop, { log: () => {} })
     assert.deepEqual(result, { removed: SP })
-    const md = executor.calls.filter(c => c.command === MDADM && c.args[0] !== '--detail')
+    const md = executor.calls.filter(c => c.command === MDADM && c.args[0] !== '--detail' && c.args[0] !== '--examine')
     assert.deepEqual(md.map(c => c.args), [
       ['/dev/md127', '--remove', `/dev/disk/by-id/${SP}-part1`],
       ['/dev/md126', '--remove', `/dev/disk/by-id/${SP}-part2`],

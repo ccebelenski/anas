@@ -63,9 +63,16 @@ export interface PoolReference {
   path: string
 }
 
+/**
+ * What can fail to be read: a reference kind's own store, or the POOL'S PATH
+ * LIST itself (`pool-paths`, cr.57 / review L25) — without it no path-based
+ * kind can be judged, so it is disclosed rather than read as "nothing".
+ */
+export type PoolReferenceSource = PoolReferenceKind | 'pool-paths'
+
 /** A source that could not be read — the caller discloses it at the confirm door. */
 export interface UnreadablePoolSource {
-  kind: PoolReferenceKind
+  kind: PoolReferenceSource
   unreadable: true
 }
 
@@ -88,6 +95,14 @@ export interface PoolReferenceContext {
    * `@data` path (AHR). References whose path is at or under one of these count.
    */
   paths: string[]
+  /**
+   * The caller could not read the whole path list (cr.57 / review L25: a
+   * failed `zfs list` or `findmnt`). `paths` then holds what WAS read (maybe
+   * nothing); the read reports an unreadable `pool-paths` source so the
+   * confirm door says the path-based kinds could not be fully checked —
+   * "could not read" never reads as "nothing references the pool".
+   */
+  pathsUnreadable?: boolean
   /**
    * smb.conf location (config IS the API). Absent ⇒ the SMB-share kind is not
    * checked. An unreadable file · unreadable:smb.
@@ -181,6 +196,8 @@ export async function readPoolReferences(ctx: PoolReferenceContext): Promise<Poo
   const unreadableSources: UnreadablePoolSource[] = []
   const onPoolPath = (path: string) => pathAtOrUnder(path, ctx.paths)
   const wanted = (kind: PoolReferenceKind): boolean => !ctx.kinds || ctx.kinds.has(kind)
+  if (ctx.pathsUnreadable)
+    unreadableSources.push({ kind: 'pool-paths', unreadable: true })
 
   // --- SMB shares (smb.conf) + NFS exports (/etc/exports) -------------------
   // readConfig throws on anything but ENOENT; an ABSENT file genuinely has no
@@ -359,6 +376,8 @@ export function poolReferenceWarning(ref: PoolReference): string {
  */
 export function poolUnreadableWarning(source: UnreadablePoolSource, pool: string): string {
   switch (source.kind) {
+    case 'pool-paths':
+      return `ANAS could not read every path on '${pool}' (its datasets' mountpoints and the filesystems mounted from it), so it could not fully check whether a share, export, backup or cloud-sync task, or mount uses a path on it. Verify them before confirming.`
     case 'smb':
       return `ANAS could not read smb.conf, so it could not check whether an SMB share references '${pool}'. If this node has SMB shares, verify their paths before confirming.`
     case 'nfs':

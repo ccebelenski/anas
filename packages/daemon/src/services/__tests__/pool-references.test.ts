@@ -323,6 +323,21 @@ describe('pool-references — unreadable sources are disclosed, never skipped', 
       assert.match(poolReferenceWarnings({ refs: [], unreadableSources: [source] }, 'tank')[0], /could not (read|check)/i)
   })
 
+  it('cr.57: a path list the caller could not read is disclosed as unreadable:pool-paths, and what it did read still counts', async () => {
+    const f = await track(await makeFixtures())
+    const { refs, unreadableSources } = await readPoolReferences({
+      executor: {} as never,
+      pool: 'tank',
+      paths: ['/tank'],
+      pathsUnreadable: true,
+      smbConfPath: f.smbConfPath,
+      exportsPath: f.exportsPath,
+    })
+    assert.deepEqual(refs.map(r => r.kind), ['smb', 'nfs'])
+    assert.deepEqual(unreadableSources, [{ kind: 'pool-paths', unreadable: true }])
+    assert.match(poolReferenceWarnings({ refs: [], unreadableSources }, 'tank')[0], /^ANAS could not read every path on 'tank'/)
+  })
+
   it('an absent systemdDir means the unit-store kinds are not checked at all', async () => {
     const f = await track(await makeFixtures())
     const { refs, unreadableSources } = await readPoolReferences({

@@ -4,14 +4,16 @@ import type { LvmPv, LvmVg } from '../parsers/lvm-report.js'
 import type { MdadmConfDoc } from '../parsers/mdadm-conf.js'
 import type { MdadmDetailExport } from '../parsers/mdadm-detail.js'
 import type { MdstatArray } from '../parsers/mdstat.js'
+import { PoolName } from '@anas/shared'
 import { parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, mdadmExamineExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
-import { isMdPvName, matchCachePartitionLabel, UNKNOWN_PV_NAME } from './ahr-cache-state.js'
+import { isMdPvName, matchCachePartitionLabel, poolOfCacheLabel, UNKNOWN_PV_NAME } from './ahr-cache-state.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
 import { ahrArrayLinePool, DEFAULT_MDADM_CONF } from './ahr-mdadm-conf.js'
 import { readConfig } from './config-writer.js'
+import { BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures } from './partition-device.js'
 
 /**
  * "Is this array / partition / slice OURS?" — the ONE answer every AHR verb
@@ -51,6 +53,7 @@ const MDADM = '/usr/sbin/mdadm'
 const PVS = '/usr/sbin/pvs'
 const VGS = '/usr/sbin/vgs'
 const LSBLK = '/usr/bin/lsblk'
+const BLKID = '/usr/sbin/blkid'
 
 /** Labels only — the occupancy check needs nothing else from the tree. */
 const LSBLK_LABEL_ARGS = ['-J', '-o', 'NAME,PARTLABEL']
@@ -282,8 +285,20 @@ export type PartitionVerdict = 'ours' | 'foreign' | 'blank'
 
 /**
  * Classify one partition: `ours` when its md superblock's UUID is the pool's,
- * `foreign` when it carries a superblock of any other array, `blank` when it
- * carries none. `blank` is not ownership — a destroy zeroes nothing on it.
+ * `foreign` when it carries a superblock of any other array OR any other
+ * content, `blank` when it carries nothing. `blank` is not ownership — a
+ * destroy zeroes nothing on it.
+ *
+ * "Any other content" is the block layer's own low-level probe, `blkid -p`
+ * (cr.57, review M3), the same read the ZFS partition gate makes: a partition
+ * with no md superblock can still be a ZFS leaf (`TYPE="zfs_member"`, the
+ * captured `zfs/blkid-p-zfs-member-partition.txt`), an LVM PV or a
+ * filesystem, and reading it as `blank` let an AHR resume `mdadm --add` over a
+ * ZFS leaf that had been cut into one of its halted slices. blkid's own exit
+ * codes decide: 2 = nothing, 0 with only `PART_ENTRY_*` keys = a blank
+ * partition (the captured `zfs/blkid-p-blank-partition.txt`), 0 with any other
+ * key = content, 8 = more than one signature; any other exit is a probe that
+ * failed, and fails CLOSED as `foreign` with the rest of this module.
  */
 export async function classifyPartition(
   executor: CommandExecutor,
@@ -291,9 +306,80 @@ export async function classifyPartition(
   device: string,
 ): Promise<PartitionVerdict> {
   const { uuid } = await examineMember(executor, device)
-  if (uuid === null)
+  if (uuid !== null)
+    return ownsUuid(identity, uuid) ? 'ours' : 'foreign'
+  const sig = await executor.exec(BLKID, ['-p', device])
+  if (sig.exitCode === BLKID_NOTHING)
     return 'blank'
-  return ownsUuid(identity, uuid) ? 'ours' : 'foreign'
+  if (sig.exitCode === BLKID_FOUND && blkidContentSignatures(sig.stdout).length === 0)
+    return 'blank'
+  return 'foreign'
+}
+
+/** The member-label shape with its pool prefix captured; {@link matchPartitionLabel} confirms it. */
+const MEMBER_LABEL_POOL_RE = /^(.+)-d\d+-b\d+$/
+
+/**
+ * Whose AHR slice does this GPT partition label name, if any — the question
+ * a door that is NOT an AHR verb asks, holding a label and no pool name (the
+ * ZFS partition gate, cr.57 / review M3). A member label `<pool>-d<n>-b<band>`
+ * ({@link matchPartitionLabel}) or a cache label `<pool>-cache<n>`
+ * ({@link poolOfCacheLabel}), and only when the prefix is a name an AHR pool
+ * can carry (`PoolName`) — ZFS's own whole-disk label (`zfs-<hex>`) and any
+ * label AHR could never have written are null.
+ */
+export function ahrSliceLabelOwner(label: string): { pool: string, kind: 'member' | 'cache' } | null {
+  const cachePool = poolOfCacheLabel(label)
+  if (cachePool !== null && PoolName.safeParse(cachePool).success)
+    return { pool: cachePool, kind: 'cache' }
+  const m = label.match(MEMBER_LABEL_POOL_RE)
+  if (m && matchPartitionLabel(m[1], label) !== null && PoolName.safeParse(m[1]).success)
+    return { pool: m[1], kind: 'member' }
+  return null
+}
+
+// ---- Retiring a disk: may its GPT go? (destroy's rule, cr.57 / review L13) --
+
+/**
+ * One partition of a disk a verb is about to give back, judged by destroy's
+ * per-partition ownership rule (ahr-destroy.ts `zappable`): `ours` when the md
+ * superblock inside it is the pool's, `blank-ours` when it is empty
+ * ({@link classifyPartition} `blank` — no superblock and nothing `blkid -p`
+ * finds) and carries one of the pool's own member or cache labels, `foreign`
+ * otherwise — another array's superblock, any other content, an unlabelled
+ * or foreign-labelled empty slice, a probe that failed.
+ */
+export type RetireVerdict = 'ours' | 'blank-ours' | 'foreign'
+
+/** {@link RetireVerdict} of one partition of a disk the pool is giving back. */
+export async function classifyRetiredPartition(
+  executor: CommandExecutor,
+  identity: Pick<AhrPoolIdentity, 'uuids'>,
+  pool: string,
+  device: string,
+  partlabel: string | null,
+): Promise<RetireVerdict> {
+  const verdict = await classifyPartition(executor, identity, device)
+  if (verdict === 'ours')
+    return 'ours'
+  const labelled = partlabel !== null && (matchPartitionLabel(pool, partlabel) !== null || matchCachePartitionLabel(pool, partlabel) !== null)
+  return verdict === 'blank' && labelled ? 'blank-ours' : 'foreign'
+}
+
+/**
+ * May the whole GPT go? Only when EVERY partition on the disk is the pool's
+ * (destroy's rule): one that is not keeps the table, so a ZFS leaf the
+ * operator cut in a member disk's free tail (nf.1 made that a legal ZFS
+ * device) survives a Replace or a spare removal. A disk with no partition
+ * read is not zapped either — there is nothing on it that is provably ours.
+ */
+export function mayZapRetiredDisk(verdicts: readonly RetireVerdict[]): boolean {
+  return verdicts.length > 0 && verdicts.every(v => v !== 'foreign')
+}
+
+/** The sentence a retire says when it keeps a disk's partition table (destroy's wording, with the partitions). */
+export function retiredDiskKeptSentence(diskId: string, foreign: readonly string[]): string {
+  return `Leaving the partition table on ${diskId} — it carries partitions that are not this pool's (${foreign.join(', ')}); only the pool's own slices were cleared`
 }
 
 // ---- The LVM gates: is the VG the pool's, ON THE DISKS? (H6, cr.22) --------
