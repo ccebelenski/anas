@@ -51,21 +51,30 @@ import { mountIndex } from '../nested-filesystems.js'
  *    `mockFixtures.statF` — "ext4 root (healthy local)" for a root that
  *    exists, "nonexistent path" for one that does not, the ESTALE case for
  *    one that cannot be read.
- *  - cr.59 `find … -exec getfacl -n -p -c -E -s {} + | sort -u`:
- *    {@link GETFACL_CAPTURE}, captured 2026-10-16 on the development host
- *    (Fedora, acl 2.4.0 — the node runs 2.3.2, same entry format — GNU
- *    findutils 4.10.0) over a scratch tree made for it: a directory given
- *    `setfacl -m u:1005:r-x` and `setfacl -d -m u:1005:r-x,g:1005:r-x` (the
- *    access editor's access + default grant), a file created after it (it
- *    inherits both), a file below given `setfacl -m g:1007:rw-`, a plain
- *    file, and a dangling symlink. Verbatim stdout of
- *    `find -P <dir> -xdev '!' -type l -exec getfacl -n -p -c -E -s {} + |
- *    LC_ALL=C sort -u`; the blank line is getfacl's record separator. The
- *    same tree without `! -type l`: getfacl on the dangling link printed
- *    `getfacl: <dir>/dangling: No such file or directory`, exit 1 — why links
- *    are filtered. A walk into a mode-000 directory: find printed
- *    `/usr/bin/find: ‘locked’: Permission denied`, exit 1 (path rewritten
- *    below to the test's root).
+ *  - cr.59/cr.59n `find … -type d -execdir getfacl -n -p -c -E -s {} + |
+ *    sort -u`: {@link GETFACL_CAPTURE}, captured 2026-10-16 on the
+ *    development host (Fedora, acl 2.4.0 — the node runs 2.3.2, same entry
+ *    format — GNU findutils 4.10.0) over a scratch tree made for it: a
+ *    directory given `setfacl -m u:1005:r-x` and `setfacl -d -m
+ *    u:1005:r-x,g:1005:r-x` (the access editor’s access + default grant), a
+ *    file created after it (it inherits both), a file below given
+ *    `setfacl -m g:1007:rw-`, a plain file, and a dangling symlink. Verbatim
+ *    stdout of `find -P <dir> -xdev -type d -execdir getfacl -n -p -c -E -s
+ *    {} + | LC_ALL=C sort -u`; the blank line is getfacl’s record separator.
+ *    cr.59n narrowed the walk from `! -type l` to `-type d`; these are that
+ *    same tree re-captured, so the file-only records the old capture held
+ *    are gone: the two files’ base entries the directories do not share
+ *    (`user::rw-`, `group::r--`, `mask::r--`, `mask::rw-`, `other::r--`),
+ *    the inherited file’s ACCESS `group:1005:r-x` (the directory holds that
+ *    grant only as a default entry) and `group:1007:rw-` — the hand-written
+ *    file-level grant cr.59n accepts as the miss. Links can still never
+ *    reach getfacl: under `-P` find follows none and `-type` tests the link
+ *    itself, so a symlink is type `l` even pointing at a directory. (The
+ *    old capture’s rationale stands for any link find does hand over:
+ *    getfacl on the dangling link printed `getfacl: <dir>/dangling: No such
+ *    file or directory`, exit 1.) A walk into a mode-000 directory: find
+ *    printed `/usr/bin/find: ‘locked’: Permission denied`, exit 1 (path
+ *    rewritten below to the test’s root).
  *  - `zfs get -H -p -o name,value -t filesystem acltype`: no capture; one
  *    `name<TAB>value` line per filesystem (zfs-get(8) `-H`: "tab-delimited",
  *    no header), value `off` unless a test switches a filesystem to `posix`.
@@ -86,7 +95,7 @@ const MDSTAT_NO_ARRAYS = readFileSync(join(FIXTURES, 'ahr/mdstat-clean.txt'), 'u
   .map(l => `${l}\n`)
   .join('')
 
-/** cr.59: the captured `getfacl -n -p -c -E -s | sort -u` lines (see FIXTURES above). */
+/** cr.59n: the captured directories-only `getfacl -n -p -c -E -s | sort -u` lines (see FIXTURES above). */
 const GETFACL_CAPTURE = [
   '',
   'default:group:1005:r-x',
@@ -95,17 +104,10 @@ const GETFACL_CAPTURE = [
   'default:other::r-x',
   'default:user:1005:r-x',
   'default:user::rwx',
-  'group:1005:r-x',
-  'group:1007:rw-',
-  'group::r--',
   'group::r-x',
-  'mask::r--',
   'mask::r-x',
-  'mask::rw-',
-  'other::r--',
   'other::r-x',
   'user:1005:r-x',
-  'user::rw-',
   'user::rwx',
 ].map(l => `${l}\n`).join('')
 /** The capture's lines without a named entry other than `default:group:1005` (a default-only grant). */
@@ -204,7 +206,7 @@ function fakeNode(node: Node): { executor: MockExecutor, calls: { command: strin
     }
     return { stdout: '', stderr: `unexpected ${command}`, exitCode: 127 }
   }
-  // cr.59: the ACL walk, `find … -exec getfacl … {} + | sort -u`.
+  // cr.59/cr.59n: the ACL walk, `find … -type d -execdir getfacl … {} + | sort -u`.
   executor.pipeline = async (cmd1: string, args1: string[], cmd2: string, args2: string[], opts?: PipelineOptions): Promise<PipelineResult> => {
     calls.push({ command: `${cmd1} | ${cmd2}`, args: [...args1, '|', ...args2], timeoutMs: opts?.timeoutMs ?? undefined })
     const root = args1[1]
@@ -517,14 +519,14 @@ describe('cr.59 — ids a POSIX ACL entry names are skipped too', () => {
   /** BASE with the ZFS share's filesystem switched to POSIX ACLs (what the access editor's first named grant does). */
   const POSIX: Node = { ...BASE, acltype: { 'mnttest/data': 'posix' } }
 
-  it('argv: every acltype in one zfs get; the walk is nf.1\'s bounded find, links filtered, into getfacl -n -p -c -E -s, then sort -u', async () => {
+  it('argv: every acltype in one zfs get; the walk is nf.1\'s bounded find, directories only (cr.59n), into getfacl -n -p -c -E -s, then sort -u', async () => {
     assert.deepEqual(ACLTYPE_ARGS, ['get', '-H', '-p', '-o', 'name,value', '-t', 'filesystem', 'acltype'])
     assert.deepEqual(
       aclFindArgs({ path: '/srv/share', xdev: true, prune: ['/srv/share/nfs'] }),
-      ['-P', '/srv/share', '-xdev', '(', '-path', '/srv/share/nfs', ')', '-prune', '-o', '!', '-type', 'l', '-execdir', '/usr/bin/getfacl', '-n', '-p', '-c', '-E', '-s', '{}', '+'],
+      ['-P', '/srv/share', '-xdev', '(', '-path', '/srv/share/nfs', ')', '-prune', '-o', '-type', 'd', '-execdir', '/usr/bin/getfacl', '-n', '-p', '-c', '-E', '-s', '{}', '+'],
     )
     // btrfs (AHR): no -xdev, as nf.1.
-    assert.deepEqual(aclFindArgs({ path: '/mnt/anas-ahr/ahr0', xdev: false, prune: [] }).slice(0, 3), ['-P', '/mnt/anas-ahr/ahr0', '!'])
+    assert.deepEqual(aclFindArgs({ path: '/mnt/anas-ahr/ahr0', xdev: false, prune: [] }).slice(0, 3), ['-P', '/mnt/anas-ahr/ahr0', '-type'])
     const { executor, calls } = fakeNode(POSIX)
     await idOwnership('uid', 1005, opts(executor))
     const pipe = calls.find(c => c.command === `${FIND} | ${SORT}`)!
@@ -534,7 +536,11 @@ describe('cr.59 — ids a POSIX ACL entry names are skipped too', () => {
   it('parses the captured getfacl lines: user: and group: entries, access and default, name ids; base entries, mask and other name nobody', () => {
     const ids = parseAclIds(GETFACL_CAPTURE)!
     assert.deepEqual(ids.uid, new Set([1005]))
-    assert.deepEqual(ids.gid, new Set([1005, 1007]))
+    // Only the capture's DEFAULT group line names a gid now (cr.59n dropped
+    // the file records); an access `group:` entry still arrives from a
+    // directory's own named group grant, e.g. `setfacl -m g:1007:rw- <dir>`.
+    assert.deepEqual(ids.gid, new Set([1005]))
+    assert.deepEqual(parseAclIds('group:1007:rw-\n'), { uid: new Set(), gid: new Set([1007]) })
     assert.deepEqual(parseAclIds(DEFAULT_GROUP_ONLY), { uid: new Set(), gid: new Set([1005]) })
     assert.deepEqual(parseAclIds(''), { uid: new Set(), gid: new Set() })
     // A shape -n -c -E never prints is unknown, never "no grants".
@@ -610,6 +616,20 @@ describe('cr.59 — ids a POSIX ACL entry names are skipped too', () => {
     assert.deepEqual(r, { id: 1006, skipped: [{ id: 1005, where: `an ACL entry under '/mnttest/data'` }] })
     // The job door's re-check (idOwnership) sees the grant as well.
     assert.deepEqual(await idOwnership('uid', 1005, opts(fakeNode(node).executor)), { owns: true, where: `an ACL entry under '/mnttest/data'` })
+  })
+
+  it('cr.59n\'s accepted miss: a hand-written grant on a single FILE is not walked, so its id stays pickable', async () => {
+    // The capture tree's inherited file also carries `setfacl -m u:1006:rwx`
+    // (checked 2026-10-16): the old `! -type l` walk printed its
+    // `user:1006:rwx` line, the `-type d` walk does not — the file's own
+    // record is never read. That is the accepted miss: the grant names no
+    // default entry, nothing inherits it, so uid 1006 is not in the skip set
+    // and the pick uses it (only 1005, named by the directory, is skipped).
+    const { executor } = fakeNode({ ...POSIX, acls: { '/mnttest/data': GETFACL_CAPTURE } })
+    assert.deepEqual(await pickId('uid', [1004], reservations(), opts(executor)), {
+      id: 1006,
+      skipped: [{ id: 1005, where: `an ACL entry under '/mnttest/data'` }],
+    })
   })
 
   it('the access editor\'s roots: a ZFS filesystem with ACLs on is walked though nothing shares it, and a mounted AHR pool; an unmounted pool is not', async () => {

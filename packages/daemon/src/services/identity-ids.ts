@@ -68,9 +68,15 @@ import { probeSharePath } from './share-path.js'
 //     under every share/export path, every mounted ZFS filesystem whose
 //     `acltype` is posix and every mounted AHR pool (the access editor's
 //     targets), bounded by root exactly as (2) is, with
-//     `find … ! -type l -exec getfacl -n -p -c -E -s {} + | sort -u` —
-//     {@link aclFindArgs}. One getfacl per file: ~4x the no-match find on
-//     the same tree (dev host, 440k entries: 1.9 s against 0.5 s warm).
+//     `find … -type d -execdir getfacl -n -p -c -E -s {} + | sort -u` —
+//     {@link aclFindArgs}. DIRECTORIES ONLY (cr.59n, operator ruling
+//     2026-10-16): a directory's getfacl prints its access AND default
+//     entries, so an inheritable grant — the one a new account would receive
+//     — is always seen; the accepted miss is a grant written by hand on a
+//     single FILE, which names no default and inherits nothing. ~4x cheaper
+//     than the whole-tree walk it replaces (dev host, 440k entries: 1.9 s
+//     warm for one getfacl per file, 0.5 s warm for the directories-only
+//     find; the pick's whole check shares the {@link ID_CHECK_BUDGET_MS}).
 //
 // The whole check shares one deadline per guard run ({@link ID_CHECK_BUDGET_MS}),
 // so the route answers well inside the gateway's 20 s (cr.35 ladder: 10 s +
@@ -442,9 +448,16 @@ export function aclWalkRoots(starts: string[], mounts: Map<string, FindmntNode>,
 
 /**
  * The producer of one root's ACL read: nf.1's bounded `find` (`-P`, `-xdev`,
- * the mounts below pruned), symlinks filtered out (getfacl follows a link it
- * is handed: a dangling one fails the walk, one pointing out of the tree
- * reads a foreign ACL; Linux links carry no ACL), then
+ * the mounts below pruned) restricted to `-type d` — directories only
+ * (cr.59n, operator ruling 2026-10-16, the cost narrowing of cr.59). A
+ * directory's getfacl prints its access AND its default entries, so a deleted
+ * account's inheritable grant is still seen; a grant written by hand on a
+ * single FILE is the accepted miss (it names no default and passes to
+ * nothing). A symlink to a directory is still never followed: `-P` means
+ * find never follows a link, and `-type` tests the link itself — type `l`,
+ * even one pointing at a directory — so (as with cr.59's `! -type l`, which
+ * filtered links because getfacl follows a link it is handed) no link ever
+ * reaches getfacl. Then
  * `getfacl -n -p -c -E -s {} +` — getfacl(1), acl 2.3: `-n` "List numeric
  * user and group IDs", `-p` absolute names (no "Removing leading '/'" on
  * stderr), `-c` "Do not display the comment header" (no file names, owners),
@@ -454,7 +467,7 @@ export function aclWalkRoots(starts: string[], mounts: Map<string, FindmntNode>,
  * going over the executor's 10 MiB buffer.
  */
 export function aclFindArgs(root: WalkRoot): string[] {
-  return walkArgs(root, ['!', '-type', 'l'], [GETFACL, '-n', '-p', '-c', '-E', '-s'])
+  return walkArgs(root, ['-type', 'd'], [GETFACL, '-n', '-p', '-c', '-E', '-s'])
 }
 
 /** `[default:]user|group|mask|other:<qualifier>:<perms>` — one getfacl entry line (`-E`: no comment). */
