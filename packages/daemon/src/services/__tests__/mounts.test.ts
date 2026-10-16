@@ -1,4 +1,5 @@
 import type { MountEntry, MountSummary, MountType } from '@anas/shared'
+import type { MountTargetRefusalDeps } from '../mounts.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
@@ -22,8 +23,10 @@ import {
   fstabLineFor,
   hasInlineCredentials,
   legacyCredsFileName,
+  lexicalMountTargetReason,
   mapCifsFailure,
   mapNfsFailure,
+  mountTargetRefusal,
   normalizeMountpointPath,
   parseSpec,
   parseStatCapacity,
@@ -33,7 +36,6 @@ import {
   removeEmptyMountpointDir,
   runMountTest,
   SYSTEM_MOUNT_TARGETS,
-  systemMountTargetConflict,
   writeCredentialsFile,
 } from '../mounts.js'
 
@@ -774,17 +776,27 @@ describe('removeEmptyMountpointDir', () => {
   })
 })
 
-// cr.18 (review M7.3): the system mount-target rule, at the predicate.
-describe('systemMountTargetConflict — system paths and their protected subtrees', () => {
-  it('refuses every list entry, exactly', () => {
+// cr.18 (review M7.3) + cr.52 (review H1): the ONE shared mount-target rule, at
+// the predicate. `mountTargetRefusal` is async and reads the filesystem for the
+// symlink branches — the lexical shapes here inject a filesystem where nothing
+// is a symlink, so the host's own `/srv`/`/home` layout can never affect them.
+describe('mountTargetRefusal — system paths, the protected credential/login trees, and symlinks', () => {
+  /** A filesystem where nothing is launderable: no symlink resolves, no leaf follows. */
+  const NEUTRAL_DEPS: MountTargetRefusalDeps = { realpathDir: async () => null, leafIsSymlink: async () => false }
+
+  it('refuses every list entry, exactly, with the ONE 409 code', async () => {
     // The full list: `/` and all 16 top-level system roots.
     for (const entry of SYSTEM_MOUNT_TARGETS) {
-      assert.ok(systemMountTargetConflict(entry), `${entry} must be refused`)
-      assert.match(systemMountTargetConflict(entry)!, /system path/)
+      const refusal = await mountTargetRefusal(entry, NEUTRAL_DEPS)
+      assert.ok(refusal, `${entry} must be refused`)
+      assert.equal(refusal!.status, 409)
+      assert.equal(refusal!.code, 'CONFLICT')
+      assert.equal(refusal!.reason, 'system-mount-target')
+      assert.match(refusal!.message, /system path/)
     }
   })
 
-  it('refuses the boot-critical and virtual subtrees at any depth', () => {
+  it('refuses the boot-critical and virtual subtrees at any depth', async () => {
     for (const mp of [
       '/usr/local',
       '/usr/share/anything/deep',
@@ -800,16 +812,38 @@ describe('systemMountTargetConflict — system paths and their protected subtree
       '/lib/systemd',
       '/lib64/x/y',
     ]) {
-      assert.ok(systemMountTargetConflict(mp), `${mp} must be refused`)
-      assert.match(systemMountTargetConflict(mp)!, /system path/)
+      const refusal = await mountTargetRefusal(mp, NEUTRAL_DEPS)
+      assert.ok(refusal, `${mp} must be refused`)
+      assert.match(refusal!.message, /system path/)
     }
   })
 
-  it('allows mounts UNDER /srv, /home, /opt and /var — the ordinary remote-share shapes', () => {
+  it('refuses the credential and login trees cr.18 deliberately left open', async () => {
+    for (const mp of [
+      '/root/.ssh',
+      '/root/.ssh/authorized_keys',
+      '/home/alice/.ssh',
+      '/home/alice/.ssh/id_rsa',
+      '/var/spool/cron',
+      '/var/spool/cron/crontabs',
+      '/var/lib/pve',
+      '/var/lib/pve/cluster',
+      '/var/lib/pve-cluster/config',
+      '/mnt/pve',
+      '/mnt/pve/anastest',
+    ]) {
+      const refusal = await mountTargetRefusal(mp, NEUTRAL_DEPS)
+      assert.ok(refusal, `${mp} must be refused`)
+      assert.match(refusal!.message, /protected/, `${mp}: ${refusal?.message}`)
+    }
+  })
+
+  it('allows mounts UNDER /srv, /home (outside .ssh), /opt and /var — the ordinary remote-share shapes', async () => {
     for (const mp of [
       '/srv/backup',
       '/srv/nfs/export1',
       '/home/shares/nas',
+      '/home/alice/Documents',
       '/opt/data',
       '/opt/anas/mnt',
       '/var/lib/remote',
@@ -818,27 +852,62 @@ describe('systemMountTargetConflict — system paths and their protected subtree
       '/mnt/remote',
       '/mnt/pve-ish',
     ]) {
-      assert.equal(systemMountTargetConflict(mp), null, `${mp} must be allowed`)
+      assert.equal(await mountTargetRefusal(mp, NEUTRAL_DEPS), null, `${mp} must be allowed`)
     }
   })
 
-  it('refuses on DIRECTORY boundaries, never on a shared prefix', () => {
+  it('refuses on DIRECTORY boundaries, never on a shared prefix', async () => {
     // Siblings that merely share a spelling with a system root are fine.
-    for (const mp of ['/var2', '/srv-data', '/homeish', '/usrlib', '/tmpfs', '/etc-backup'])
-      assert.equal(systemMountTargetConflict(mp), null, `${mp} must be allowed`)
+    for (const mp of ['/var2', '/srv-data', '/homeish', '/usrlib', '/tmpfs', '/etc-backup', '/mnt/pve-backup-ish'])
+      assert.equal(await mountTargetRefusal(mp, NEUTRAL_DEPS), null, `${mp} must be allowed`)
   })
 
-  it('normalizes before matching: trailing slash, doubled slashes, /./ segments', () => {
+  it('normalizes before matching: trailing slash, doubled slashes, /./ segments', async () => {
     // Refused classes first — the shape games never slip past the guard.
-    for (const mp of ['/etc/', '/etc//', '/usr//local', '/usr/./local', '//etc', '//usr/share', '/boot/efi/'])
-      assert.ok(systemMountTargetConflict(mp), `${mp} must be refused`)
+    for (const mp of ['/etc/', '/etc//', '/usr//local', '/usr/./local', '//etc', '//usr/share', '/boot/efi/', '/var/spool/cron/', '/home/alice/.ssh/'])
+      assert.ok(await mountTargetRefusal(mp, NEUTRAL_DEPS), `${mp} must be refused`)
     // Allowed shapes stay allowed through normalization.
     for (const mp of ['/srv/backup/', '/opt//data', '/var/./lib/remote'])
-      assert.equal(systemMountTargetConflict(mp), null, `${mp} must be allowed`)
+      assert.equal(await mountTargetRefusal(mp, NEUTRAL_DEPS), null, `${mp} must be allowed`)
     // And the normalizer itself, on the shapes the guard documents.
     assert.equal(normalizeMountpointPath('/etc/'), '/etc')
     assert.equal(normalizeMountpointPath('//usr//share/'), '/usr/share')
     assert.equal(normalizeMountpointPath('/'), '/')
+  })
+
+  it('refuses a symlinked parent that would launder a legal-looking mountpoint into a system path', async () => {
+    // The flyleaf: `/mnt/anas-x` resolves to `/etc`, so the mountpoint's real
+    // target is `/etc/data` — the refusal names the laundering chain.
+    const refusal = await mountTargetRefusal('/mnt/anas-x/data', {
+      realpathDir: async p => (p === '/mnt/anas-x' ? '/etc' : null),
+      leafIsSymlink: async () => false,
+    })
+    assert.ok(refusal)
+    assert.match(refusal!.message, /resolves via the symlink/)
+    assert.match(refusal!.message, /\/etc/)
+  })
+
+  it('refuses a symlinked final component outright, wherever it points', async () => {
+    const refusal = await mountTargetRefusal('/srv/mnt/data', {
+      realpathDir: async () => null,
+      leafIsSymlink: async p => p === '/srv/mnt/data',
+    })
+    assert.ok(refusal)
+    assert.match(refusal!.message, /ends in a symlink/)
+  })
+
+  it('a symlinked parent that resolves to a LEGAL directory is not refused by the laundering check', async () => {
+    const refusal = await mountTargetRefusal('/mnt/anas-x/data', {
+      realpathDir: async p => (p === '/mnt/anas-x' ? '/srv/real' : null),
+      leafIsSymlink: async () => false,
+    })
+    assert.equal(refusal, null)
+  })
+
+  it('lexicalMountTargetReason is the sentence clause both doors compose from', () => {
+    assert.equal(lexicalMountTargetReason('/etc'), `the system path '/etc'`)
+    assert.equal(lexicalMountTargetReason('/home/who/.ssh'), `at or under the protected '/home/*/.ssh' tree (an SSH key directory (authorized_keys and any private keys))`)
+    assert.equal(lexicalMountTargetReason('/srv/backup'), null)
   })
 })
 

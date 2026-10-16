@@ -30,7 +30,7 @@ import { AHR_FINDMNT_ARGS } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
 import { heldByLun, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
-import { normalizeMountpointPath } from '../services/mounts.js'
+import { mountTargetGate, normalizeMountpointPath } from '../services/mounts.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
 import { mdSysPath, readMdAttrOrNull } from '../services/selfheal-io.js'
 import { readMdGeometry } from '../services/selfheal-map.js'
@@ -562,6 +562,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         unbound: () => `Could not bind the create of AHR pool '${req.name}'`,
       },
       gates: [
+        // cr.52 (review H1): the create's mountpoint runs the one shared
+        // system-path refusal (like every door that sets one) — at the route
+        // and again in the job, before a single disk is wiped.
+        mountTargetGate<NewAhrPool>(req.mountpoint),
         // Name collision: one AHR pool per name (also the VG name).
         async (o, reads) => (await guard.reads.pools(reads)).some(p => p.name === o.name)
           ? { status: 409, code: 'CONFLICT', message: `AHR pool '${o.name}' already exists` }
@@ -726,6 +730,9 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         async pool => mp === pool.mountpoint
           ? { status: 400, code: 'VALIDATION_ERROR', message: `'${mp}' is already this pool's mountpoint` }
           : null,
+        // cr.52 (review H1): the one shared system-path refusal on the move's
+        // TARGET, re-run in the job under the pool's key.
+        mountTargetGate<AhrPool>(mp),
         ...mountpointCollisionGates<AhrPool>(mp),
         guard.systemPoolGate,
         guard.lunGate('Changing', pool => `the mountpoint of AHR pool '${pool.name}'`),

@@ -35,6 +35,7 @@ import {
   InvalidExtraOptionsError,
   isRemoteKind,
   mountpointReservedByPve,
+  mountTargetRefusal,
   normalizeMountpointPath,
   probeInventoryHealth,
   pveStorageFor,
@@ -46,7 +47,6 @@ import {
   rotateCredentialsFile,
   runMountTest,
   stopAutomountUnit,
-  systemMountTargetConflict,
   validatedExtraOptions,
   writeCredentialsFile,
 } from '../services/mounts.js'
@@ -408,10 +408,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         async s => mountpointReservedByPve(s.mountpoint)
           ? { status: 400, code: 'VALIDATION_ERROR', message: `Mountpoint '${s.mountpoint}' is PVE territory and off-limits to ANAS` }
           : null,
-        async (s) => {
-          const conflict = systemMountTargetConflict(s.mountpoint)
-          return conflict ? { status: 400, code: 'VALIDATION_ERROR', message: `Invalid mountpoint: ${conflict}` } : null
-        },
+        // cr.52 (review H1): one shared system-path refusal at every door that
+        // sets a mountpoint — the mount takes the 409 with the shared code and
+        // sentence, and the job re-runs the gate under its lock.
+        async s => mountTargetRefusal(s.mountpoint),
         async (s, reads) => pveStorageFor(s.mountpoint, await mountReads.pvePaths(reads))
           ? { status: 400, code: 'VALIDATION_ERROR', message: `Mountpoint '${s.mountpoint}' belongs to a PVE storage (hands-off)` }
           : null,
@@ -551,13 +551,18 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
 
-    // Empty-dir / shadow check: a non-empty existing directory needs confirmation.
+    // Empty-dir / shadow check (L4, cr.52): §2 Mounts says "Mountpoint must be
+    // an empty dir" — a non-empty directory honest with that ruling is refused
+    // without a confirm by nothing; the CONFIRM is the explicit exception the
+    // operator climbs over, and its sentence names the ruling so the two never
+    // contradict (the panel's Proceed is the other story — cr.52 reports the
+    // panel half's needs).
     const contents = await dirContents(req.mountpoint)
     if (contents !== null && contents.length > 0) {
       if (!confirmGate(confirmStore, request, reply, {
         operation: 'mount.create',
         params: { mountpoint: req.mountpoint },
-        message: `Mounting over '${req.mountpoint}' will shadow the ${contents.length} item(s) already there`,
+        message: `'${req.mountpoint}' is not empty — a mountpoint must be an empty directory (§2 Mounts), so confirming will hide the ${contents.length} item(s) already there`,
         warnings: [
           `'${req.mountpoint}' is not empty — the mount will hide its current contents until unmounted.`,
         ],
@@ -1074,13 +1079,18 @@ async function daemonReload(executor: CommandExecutor): Promise<void> {
  * Mount a filesystem. When `entry` is undefined the mount resolves from the
  * fstab line (`mount <mountpoint>`); otherwise it is mounted directly from the
  * entry's fields (the non-persistent path). Throws on failure.
+ *
+ * `-c` (cr.52, review H1) canonicalises the target paths so `mount(8)` resolves
+ * the mountpoint the same way the target refusal did — a symlink that lands
+ * after the job's own gate re-runs cannot redirect the kernel mount to a place
+ * the gate never looked.
  */
 async function doMount(executor: CommandExecutor, entry: MountEntry | undefined, mountpoint: string): Promise<void> {
   // `--` ends option parsing so the positional spec/mountpoint can never be read
   // as a `mount` flag (defence in depth; the schema already rejects control chars).
   const args = entry
-    ? ['-t', entry.fstype, '-o', serializeInlineOptions(entry), '--', entry.spec, mountpoint]
-    : ['--', mountpoint]
+    ? ['-c', '-t', entry.fstype, '-o', serializeInlineOptions(entry), '--', entry.spec, mountpoint]
+    : ['-c', '--', mountpoint]
   const r = await executor.exec(MOUNT, args)
   if (r.exitCode !== 0)
     throw new Error(r.stderr.trim() || `mount exited ${r.exitCode}`)

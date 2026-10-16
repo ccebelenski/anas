@@ -24,7 +24,7 @@ import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal, LIO_UNREADABLE_KEY, lioUnreadableAdvisory } from '../services/iscsi-held.js'
-import { normalizeMountpointPath } from '../services/mounts.js'
+import { mountTargetGate, normalizeMountpointPath } from '../services/mounts.js'
 import { BLKID_AMBIVALENT, BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures, LSBLK_NONE_FOUND, parsePartitionProbe, PART_BY_ID_RE, PARTITION_PROBE_ARGS } from '../services/partition-device.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
 import { loadPveFootprint, systemPoolRefusalFrom } from '../services/pve-footprint.js'
@@ -1107,7 +1107,12 @@ export async function poolRoutes(
         ? { status: 400, code: 'VALIDATION_ERROR', message: `'${mp}' is already this pool's mountpoint` }
         : null)
     }
+    // cr.52 (review H1): the one shared system-path refusal, at every door that
+    // sets a mountpoint (pool create and pool mountpoint change both ride this
+    // gate list). It is a gate like the collision checks, so the job re-runs it
+    // under its lock before the argv reaches `zpool`.
     gates.push(
+      mountTargetGate<O>(mp),
       async (_object, reads) => (await poolReads.liveMounts(reads)).some(m => m.target === mp)
         ? { status: 409, code: 'CONFLICT', message: `'${mp}' is already a mountpoint — pick an unused path` }
         : null,

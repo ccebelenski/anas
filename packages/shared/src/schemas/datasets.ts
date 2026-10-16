@@ -284,6 +284,14 @@ export const UpdateDatasetPropertiesRequest = z.object({
        * rather than confirm-gated.
        */
       volsize: VolSize.optional(),
+      /**
+       * cr.52 (review H1): where a dataset MOUNTS is settable here like the
+       * create door always made it (`-o mountpoint=`); the same system-path
+       * refusal guards it at both doors. Absolute paths only (mirroring
+       * create's `mountpoint`) — `inherit`/`none`/`legacy` are the create- and
+       * property-set UI's business, not this schema's.
+       */
+      mountpoint: AbsolutePath.optional(),
     })
     .refine(p => Object.keys(p).length > 0, 'at least one property required'),
 })

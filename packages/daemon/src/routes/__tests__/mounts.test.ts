@@ -362,11 +362,11 @@ describe('mount routes (Epic 18)', () => {
       assert.equal(await readFile(fstabPath, 'utf8'), fstabBefore)
     })
 
-    // cr.18 (review M7.3): a mount OVER a system path (or an ancestor of one)
-    // hides the OS. One refusal, computed from the list in services/mounts.ts,
-    // enforced at request time with the same 400 envelope as the neighbouring
-    // mountpoint guards — the job is never submitted.
-    it('mount over a system path → 400 (equal, at-depth, and normalized shapes)', async () => {
+    // cr.18 (review M7.3) + cr.52 (review H1): a mount OVER a system path (or
+    // an ancestor of one) hides the OS. ONE refusal shared with every door that
+    // sets a mountpoint (mountTargetRefusal), 409 CONFLICT — the job is never
+    // submitted.
+    it('mount over a system path → 409 (equal, at-depth, and normalized shapes)', async () => {
       for (const mountpoint of [
         '/',
         '/etc',
@@ -393,9 +393,10 @@ describe('mount routes (Epic 18)', () => {
           headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
           payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export1', mountpoint, persistent: false, mountNow: false }),
         })
-        assert.equal(res.statusCode, 400, `${mountpoint} → ${res.statusCode}: ${res.body}`)
-        const { error } = res.json() as { error: { code: string, message: string } }
-        assert.equal(error.code, 'VALIDATION_ERROR')
+        assert.equal(res.statusCode, 409, `${mountpoint} → ${res.statusCode}: ${res.body}`)
+        const { error } = res.json() as { error: { code: string, reason: string, message: string } }
+        assert.equal(error.code, 'CONFLICT')
+        assert.equal(error.reason, 'system-mount-target')
         assert.match(error.message, /system path/, mountpoint)
       }
       // None of them reached fstab.
@@ -1303,7 +1304,7 @@ describe('PUT /v1/mounts — credentials are proven before anything is committed
     const line = (await readFile(h!.fstabPath, 'utf8')).split('\n').find(l => l.includes(CIFS_MP))!
     assert.ok(line.includes(`credentials=${credsPath}`), line)
     assert.ok(line.split(/\s+/)[3].split(',').includes('ro'), line)
-    assert.ok(called(h!.executor, MOUNT, ['--', CIFS_MP]))
+    assert.ok(called(h!.executor, MOUNT, ['-c', '--', CIFS_MP]))
   })
 })
 
@@ -1377,7 +1378,7 @@ describe('PUT /v1/mounts — a completed edit means the new options are LIVE (is
     h = await createEditServer(nfsFstab, [findmntJson([])])
     const job = await putReadOnly()
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.ok(called(h.executor, MOUNT, ['--', NFS_MP]))
+    assert.ok(called(h.executor, MOUNT, ['-c', '--', NFS_MP]))
     assert.ok(!called(h.executor, MOUNT, ['-o', 'remount', '--', NFS_MP]))
   })
 })

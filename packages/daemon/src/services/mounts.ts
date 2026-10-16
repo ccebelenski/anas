@@ -16,12 +16,13 @@ import type {
 } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
+import type { Gate, Refusal } from '../safety/guard.js'
 import { createHash } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
-import { dirname, join, normalize, resolve } from 'node:path'
+import { basename, dirname, join, normalize, resolve } from 'node:path'
 import { MountCifsSec, MountExtraOptions, MountNfsSec, normalizeMountTarget, unescapeFstabField } from '@anas/shared'
 import { classifyKind, isIgnoredMount, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { cifsAuthToken, getMount, inlineCommentIndex, parseFstab, parseFstabDoc } from '../parsers/fstab.js'
@@ -1541,27 +1542,172 @@ export function normalizeMountpointPath(mountpoint: string): string {
   return n.length > 1 ? n.replace(TRAILING_SLASHES_RE, '') : n
 }
 
+/** The machine-readable cause every system- or protected-mount-target refusal carries. */
+export const MOUNT_TARGET_REFUSAL_REASON = 'system-mount-target' as const
+
 /**
- * Why `mountpoint` is a system mount target, or null when mounting there is
- * fine. `mount` over a directory hides everything below it, so the refusal
- * covers three shapes: the mountpoint IS a system path, is an ANCESTOR of
- * one (a directory prefix of it), or sits INSIDE one of the
- * {@link NEVER_MOUNT_UNDER} subtrees at depth.
+ * One protected mount-target rule (cr.52, review H1): the paths a mountpoint
+ * must not be at or under, among the credential and login trees cr.18's list
+ * deliberately left open. cr.18 refused a remote share equal to a system root
+ * and anything under the boot-critical/virtual roots ({@link NEVER_MOUNT_UNDER})
+ * but ALLOWED everything under `/root`, `/home`, `/srv`, `/opt`, `/var` and
+ * `/tmp` — so `/root/.ssh` and `/var/spool/cron/crontabs` passed — and a ZFS
+ * pool, a dataset or an AHR pool had no such list at all. Every entry here is
+ * refused at the path itself and at any depth below it. A trailing `*` matches
+ * any suffix (`/var/lib/pve*`); a lone `*` matches exactly one segment (the
+ * `/home`-`.ssh` rule, e.g. `/home/<user>/.ssh`).
  */
-export function systemMountTargetConflict(mountpoint: string): string | null {
-  const mp = normalizeMountpointPath(mountpoint)
+export interface MountTargetRefusalRule {
+  /** The protected root, matched at `/` boundaries. */
+  root: string
+  /** The reason clause the refusal's sentence prints (constants only — user input never reaches it). */
+  reason: string
+}
+
+export const MOUNT_TARGET_REFUSALS: ReadonlyArray<MountTargetRefusalRule> = [
+  { root: '/root', reason: 'root\'s home holds SSH keys, dotfiles and shell state' },
+  { root: '/home/*/.ssh', reason: 'an SSH key directory (authorized_keys and any private keys)' },
+  { root: '/var/spool/cron', reason: 'the system cron jobs' },
+  { root: '/var/lib/pve*', reason: 'PVE\'s cluster filesystem and state under /var/lib/pve' },
+  { root: '/mnt/pve', reason: 'PVE territory — the §2 Mounts ruling reserves /mnt/pve' },
+]
+
+/** Escape one literal path segment for the protected-root matcher's regex. */
+const SEGMENT_ESC_RE = /[.*+?^${}()|[\]\\]/g
+
+/** Does `mp` sit at or under a protected root, at `/` boundaries? */
+function atOrUnderProtectedRoot(mp: string, root: string): boolean {
+  if (root.endsWith('*')) {
+    // `/var/lib/pve*`: the prefix itself and any suffix of it.
+    const prefix = root.slice(0, -1)
+    return mp === prefix || mp.startsWith(prefix)
+  }
+  if (root.includes('*')) {
+    // `/home/*/.ssh`: `*` is EXACTLY one segment (`/home/a/b/.ssh` does not match).
+    const escaped = root.split('/').map(seg => seg === '*' ? '[^/]+' : seg.replace(SEGMENT_ESC_RE, '\\$&')).join('/')
+    return new RegExp(`^${escaped}(/|$)`).test(mp)
+  }
+  return mp === root || mp.startsWith(`${root}/`)
+}
+
+/**
+ * The sentence's reason clause for a NORMALIZED mountpoint the lexical rules
+ * refuse, or null. The three shapes cr.18 defines (equal to a system target,
+ * a strict `/`-boundary ancestor of one, inside a never-mount-under subtree)
+ * plus the cr.52 protected rules. Named the same path resolution the refusal
+ * applies to the resolved mountpoint after a symlinked parent.
+ */
+export function lexicalMountTargetReason(mp: string): string | null {
   for (const entry of SYSTEM_MOUNT_TARGETS) {
     if (mp === entry)
-      return `'${entry}' is a system path — mounting over it hides the system tree living there`
+      return `the system path '${entry}'`
     // Ancestor of a list entry: a strict '/'-boundary directory prefix
     // (`/us` is not an ancestor of `/usr`; `/et` neither; `/et/c`… no).
     if (entry.startsWith(`${mp}/`))
-      return `'${mp}' is an ancestor of the system path '${entry}' — mounting there hides everything below it`
+      return `an ancestor of the system path '${entry}'`
   }
   for (const entry of NEVER_MOUNT_UNDER) {
     if (mp.startsWith(`${entry}/`))
-      return `'${mp}' is inside the system path '${entry}' — nothing mounts under it`
+      return `inside the system path '${entry}'`
   }
+  for (const rule of MOUNT_TARGET_REFUSALS) {
+    if (atOrUnderProtectedRoot(mp, rule.root))
+      return `at or under the protected '${rule.root}' tree (${rule.reason})`
+  }
+  return null
+}
+
+/** The filesystem answers {@link mountTargetRefusal} needs: real fs in production, injected in tests. */
+export interface MountTargetRefusalDeps {
+  /** The real path of a directory, resolved through symlinks; null when any component is missing. */
+  realpathDir: (path: string) => Promise<string | null>
+  /** Whether the path's final component is a symlink; false when the path does not exist. */
+  leafIsSymlink: (path: string) => Promise<boolean>
+}
+
+const REAL_FS_DEPS: MountTargetRefusalDeps = {
+  async realpathDir(path) {
+    try {
+      return await realpath(path)
+    }
+    catch {
+      return null
+    }
+  },
+  async leafIsSymlink(path) {
+    try {
+      return (await lstat(path)).isSymbolicLink()
+    }
+    catch {
+      return false
+    }
+  },
+}
+
+/**
+ * The ONE wiring every door that sets a mountpoint uses (cr.52): a guard gate
+ * that asks {@link mountTargetRefusal} when a mountpoint is set, or passes when
+ * the request set none. A gate runs at the route AND in the job (ruling (j)), so
+ * the verdict the job re-applies is the same object the route answered.
+ */
+export function mountTargetGate<O>(mountpoint: string | undefined): Gate<O> {
+  return async () => (mountpoint === undefined ? null : mountTargetRefusal(mountpoint))
+}
+
+/**
+ * Why a mountpoint is refused, asked at every door that sets one (cr.52,
+ * review H1): the typed path against cr.18's system targets, then the RESOLVED
+ * path — a planted symlink in the parent chain must not launder the target past
+ * the lexical list — then the final component, refused outright when it is
+ * itself a symlink (a `mkdir`/`mount` over it would land wherever the link
+ * points, not where the operator typed).
+ *
+ * ONE code and ONE sentence shape everywhere: the caller returns this object
+ * straight off a gate, so the route's 409 and the job's failure carry the same
+ * code, reason and phrasing (a gate the job re-runs re-examines the filesystem
+ * as it is when the job starts — a review flip between the doors is caught).
+ */
+export async function mountTargetRefusal(
+  mountpoint: string,
+  deps: MountTargetRefusalDeps = REAL_FS_DEPS,
+): Promise<Refusal | null> {
+  const mp = normalizeMountpointPath(mountpoint)
+  const say = (message: string): Refusal => ({
+    status: 409,
+    code: 'CONFLICT',
+    reason: MOUNT_TARGET_REFUSAL_REASON,
+    message,
+  })
+
+  // (1) The typed path, as typed: equal to a system target, an ancestor of
+  // one, inside a never-mount-under subtree, or at/under a protected rule.
+  const typed = lexicalMountTargetReason(mp)
+  if (typed)
+    return say(`Mountpoint '${mp}' is ${typed} — a mount there is refused`)
+
+  // (2) The PARENT resolved. `mount` over a directory hides everything below
+  // it, so a path whose parent chain a symlink redirects into a protected tree
+  // is the same hiding the lexical list refuses — only when the parent
+  // resolves to somewhere DIFFERENT (a symlink was traversed) does the RESOLVED
+  // mountpoint get the lexical list again.
+  const parent = dirname(mp)
+  const resolvedParent = await deps.realpathDir(parent)
+  if (resolvedParent !== null && resolvedParent !== parent) {
+    const resolved = normalizeMountpointPath(join(resolvedParent, basename(mp)))
+    const laundered = lexicalMountTargetReason(resolved)
+    if (laundered)
+      return say(`Mountpoint '${mp}' resolves via the symlink '${parent}' to '${resolved}', ${laundered} — a mount there is refused`)
+  }
+
+  // (3) The FINAL component: a symlink is refused outright, whether or not it
+  // resolves somewhere protected — the mount would land at the link's target,
+  // not where the operator typed (lstat: the component itself is not followed).
+  const leafPath = resolvedParent !== null && resolvedParent !== parent
+    ? join(resolvedParent, basename(mp))
+    : mp
+  if (await deps.leafIsSymlink(leafPath))
+    return say(`Mountpoint '${mp}' ends in a symlink — a mount over a symlinked directory is refused`)
+
   return null
 }
 
