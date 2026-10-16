@@ -151,16 +151,24 @@ fi
 # The daemon is reached through pveproxy's /anas forward with a PVE ticket —
 # the same door the specs use from the outside; here it just runs on the node.
 
-api_ticket() {
-  $SSH_CMD "curl -sk -d 'username=root@pam&password=anas-test' https://127.0.0.1:8006/api2/json/access/ticket \
-    | sed 's/.*\"ticket\":\"\([^\"]*\)\".*/\1/'"
+# api_login — ONE /access/ticket reply carries BOTH the ticket and its CSRF
+# token; since cr.27 every non-GET through pveproxy must send
+# CSRFPreventionToken beside the PVEAuthCookie, or pveproxy answers 401.
+# Sets TICKET and CSRF (the docs/probes/wave3-node/api.sh idiom).
+api_login() {
+  local both
+  both="$($SSH_CMD "curl -sk -d 'username=root@pam&password=anas-test' https://127.0.0.1:8006/api2/json/access/ticket \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin)[\"data\"]; print(d[\"ticket\"]); print(d[\"CSRFPreventionToken\"])'")"
+  TICKET="$(printf '%s\n' "$both" | sed -n 1p)"
+  CSRF="$(printf '%s\n' "$both" | sed -n 2p)"
+  [ -n "$TICKET" ] && [ -n "$CSRF" ] || { echo "ERROR: could not obtain ticket + CSRF token" >&2; return 1; }
 }
 
 # api_call METHOD PATH [JSON-BODY] → stdout, with the HTTP code prefixed.
 api_call() {
   local method="$1" path="$2" body="${3:-}" extra="${4:-}"
   method="${method^^}"
-  $SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' -H 'Content-Type: application/json' \
+  $SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' -H 'CSRFPreventionToken: $CSRF' -H 'Content-Type: application/json' \
     ${body:+-d '$body'} ${extra:+-H '$extra'} -X $method -w '\n%{http_code}' \
     https://127.0.0.1:8006/anas/api/nodes/anas-pve/v1$path"
 }
@@ -173,7 +181,7 @@ api_mutate() {
   out="$(api_call "$method" "$path" "$body")"
   code="${out##*$'\n'}"
   if [ "$code" = "409" ] && printf '%s' "$out" | grep -q CONFIRMATION_REQUIRED; then
-    hdr="$($SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' -H 'Content-Type: application/json' \
+    hdr="$($SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' -H 'CSRFPreventionToken: $CSRF' -H 'Content-Type: application/json' \
       ${body:+-d '$body'} -X ${method^^} -D - -o /dev/null \
       https://127.0.0.1:8006/anas/api/nodes/anas-pve/v1$path" | tr -d '\r')"
     conf="$(printf '%s\n' "$hdr" | sed -n 's/^[Xx]-[Aa]nas-[Cc]onfirm-[Cc]ode: *//p')"
@@ -187,7 +195,7 @@ api_mutate() {
   fi
   jobid="$(printf '%s' "${out%$'\n'*}" | sed 's/.*\"job\":{\"id\":\"\([^\"]*\)\".*/\1/')"
   for _ in $(seq 1 30); do
-    status="$($SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' \
+    status="$($SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' -H 'CSRFPreventionToken: $CSRF' \
       https://127.0.0.1:8006/anas/api/nodes/anas-pve/v1/jobs/$jobid" \
       | jq -r '.job.status // empty')"
     [ "$status" = "completed" ] && return 0
@@ -295,10 +303,10 @@ status_s3() {
 }
 
 up_smb() {
-  TICKET="$(api_ticket)"
+  api_login
   # Idempotent: a leftover share (a crashed earlier up/spec) is removed
   # through the API BEFORE the directory it points at is rebuilt.
-  if $SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' https://127.0.0.1:8006/anas/api/nodes/anas-pve/v1/shares/smb" \
+  if $SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' -H 'CSRFPreventionToken: $CSRF' https://127.0.0.1:8006/anas/api/nodes/anas-pve/v1/shares/smb" \
       | grep -q "\"name\":\"$SMB_SHARE\""; then
     api_mutate delete "/shares/smb/$SMB_SHARE" || return 1
     echo "✓ leftover share $SMB_SHARE removed through the API"
@@ -306,7 +314,7 @@ up_smb() {
   # The directory first (the share create stats its path).
   $SSH_CMD "rm -rf $SMB_DIR && mkdir -p $SMB_DIR && chmod 777 $SMB_DIR"
   # The user (with its SMB passdb entry), then the share, both through the API.
-  if $SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' https://127.0.0.1:8006/anas/api/nodes/anas-pve/v1/identity/users" \
+  if $SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' -H 'CSRFPreventionToken: $CSRF' https://127.0.0.1:8006/anas/api/nodes/anas-pve/v1/identity/users" \
       | grep -q "\"name\":\"$SMB_USER\""; then
     echo "  $SMB_USER already exists (leaving it — the share up re-uses it)"
   else
@@ -329,9 +337,9 @@ up_smb() {
 }
 
 down_smb() {
-  TICKET="$(api_ticket)"
+  api_login
   # Share first: the user delete refuses while a share names it in valid users.
-  if $SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' https://127.0.0.1:8006/anas/api/nodes/anas-pve/v1/shares/smb" \
+  if $SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' -H 'CSRFPreventionToken: $CSRF' https://127.0.0.1:8006/anas/api/nodes/anas-pve/v1/shares/smb" \
       | grep -q "\"name\":\"$SMB_SHARE\""; then
     api_mutate delete "/shares/smb/$SMB_SHARE" || return 1
   fi
@@ -354,8 +362,8 @@ down_smb() {
 
 status_smb() {
   echo "--- smb ---"
-  TICKET="$(api_ticket)"
-  $SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' https://127.0.0.1:8006/anas/api/nodes/anas-pve/v1/shares/smb" \
+  api_login
+  $SSH_CMD "curl -sk -b 'PVEAuthCookie=$TICKET' -H 'CSRFPreventionToken: $CSRF' https://127.0.0.1:8006/anas/api/nodes/anas-pve/v1/shares/smb" \
     | grep -o "\"name\":\"$SMB_SHARE\"" || echo "no $SMB_SHARE share"
   $SSH_CMD "getent passwd $SMB_USER || echo 'no $SMB_USER'"
   $SSH_CMD "ls -ld $SMB_DIR 2>/dev/null || echo 'no $SMB_DIR'"
