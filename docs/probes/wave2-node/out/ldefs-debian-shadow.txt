@@ -1,0 +1,26 @@
+# Post-pass probe (2026-10-16, stunt node anas-pve, PVE 9 / Debian 13): how Debian's shadow parses
+# login.defs USERGROUPS_ENAB — real `userdel -P <prefix> carol` over a prefix tree (passwd carol:1004:1005,
+# group carol:x:1005: empty, no other members or primaries), one tree per login.defs body. The earlier
+# proofs (cross-model reviews of cr.29d/cr.29e) ran on Fedora's shadow 4.19.0, which parses login.defs
+# through libeconf; Debian's `passwd` package links no libeconf and uses shadow's own getdef parser.
+# Script: docs/probes/wave2-node/ldefs-probe.sh (run as root over ssh; the tree is removed after).
+$ dpkg-query -W passwd login; ldd /usr/sbin/userdel | grep -i econf
+login 1:4.16.0-2+really2.41.5-0+deb13u1
+passwd 1:4.17.4-2
+userdel: no libeconf linked
+
+scenario          login.defs body                      result (carol group)
+plain_yes         USERGROUPS_ENAB yes                  rc=0 group-REMOVED
+yes_note          USERGROUPS_ENAB yes # note           rc=0 group-KEPT      <- inline comment NOT stripped
+yes_tab_note      USERGROUPS_ENAB yes<TAB># note       rc=0 group-KEPT
+quoted_yes        USERGROUPS_ENAB "yes"                rc=0 group-REMOVED
+quoted_yes_note   USERGROUPS_ENAB "yes" # note         rc=0 group-REMOVED   <- a quoted value ends at its closing quote
+yes_hashx         USERGROUPS_ENAB yes#x                rc=0 group-KEPT
+quoted_mixed      USERGROUPS_ENAB "yes # not a comment" rc=0 group-KEPT
+no_note           USERGROUPS_ENAB no # keep            rc=0 group-KEPT
+plain_no          USERGROUPS_ENAB no                   rc=0 group-KEPT
+absent            (empty file)                         rc=0 group-KEPT      <- no key = not removed on 4.17.4
+comment_only      USERGROUPS_ENAB # note               rc=0 group-KEPT      (no crash; Fedora 4.19.0 segfaults here)
+two_lines         yes, then no                         rc=0 group-KEPT      <- last line wins
+
+The node's own /etc/login.defs: line 192 `USERGROUPS_ENAB yes` (PVE 9 ships the key once, unquoted, no comment).

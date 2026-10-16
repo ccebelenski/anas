@@ -625,3 +625,17 @@ No product defect (D12+) was found in this pass. Two findings for the operator, 
 | 6 cr.47 probe | DONE | (e) `zfs destroy -r <fs>` over a held child snapshot is PARTIAL; (c) recursive snapshot destroy and rename are ATOMIC; rename is not stopped by a hold or a running send (F2) |
 | 7 cr.25b | RUN, classified | vdev-consumers (c) re-cut to nf.2 D5, 5 × green; cloud-tasks-api green ×3 unchanged (cr.48); smbsvc-api 5, ahr-cache-review 3 blocked by the mdadm.conf names |
 | 8 node state | CLEAN | mdadm.conf, LVM archive, failed units, ADOCK, fstab/exports/smb.conf, user.cfg as at the start |
+
+---
+
+## Post-pass probe (2026-10-16) — login.defs parsing on Debian's shadow
+
+Owed by cr.29e: its comment-stripping premise was proven on Fedora's shadow 4.19.0, which parses
+login.defs through libeconf. On the stunt node (`passwd 1:4.17.4-2`, `userdel` links no libeconf) a
+real `userdel -P <prefix> carol` over twelve login.defs bodies (`docs/probes/wave2-node/ldefs-probe.sh`,
+capture `out/ldefs-debian-shadow.txt`) shows Debian's own getdef: an unquoted value runs to the end of
+the line (`yes # note`, `yes#x` → group KEPT), a quoted value ends at its closing quote (`"yes" # note`
+→ REMOVED), an absent key → KEPT, a comment-only value → KEPT (no crash), two lines → the last wins.
+The node's own `/etc/login.defs` carries `USERGROUPS_ENAB yes` once. **Verdict: the mirror follows this
+rule now; cr.29e's stripping was the safe-direction over-estimate on the target.**
+

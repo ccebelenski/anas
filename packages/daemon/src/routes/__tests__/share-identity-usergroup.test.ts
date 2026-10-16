@@ -278,6 +278,23 @@ describe('cr.29d — the group userdel removes with a user', () => {
     assert.equal(userdelRan(), false)
   })
 
+  it('cr.29e review — a DIRECTORY account with the SAME NAME as the local user holds the going group as its primary gid: excepting the deleted user by name alone let it through; name+uid refuses', async () => {
+    // nsswitch can answer a directory `carol` (uid 2001) beside the local
+    // carol (uid 1004). userdel reads the local file, sees nobody, and
+    // REMOVES the group — orphaning the directory carol's primary gid. The
+    // except must be the deleted account itself (name AND uid), never a name.
+    await boot({ directory: ['carol:x:2001:1005::/home/carol:/usr/sbin/nologin'] })
+    const res = await del()
+    assert.equal(res.statusCode, 409)
+    const { error } = res.json() as { error: { code: string, reason: string, message: string } }
+    assert.equal(error.code, 'CONFLICT')
+    assert.equal(error.reason, 'primary-group-in-use')
+    assert.match(error.message, /Group 'carol' is the primary group of: carol\./)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    assert.equal(queue.list().length, 0)
+    assert.equal(userdelRan(), false)
+  })
+
   it('cr.29e — the same primary gid held by a LOCAL account: userdel keeps the group — not named, not gated, no gid lock (pinned)', async () => {
     await boot({ passwd: ['erin:x:1006:1005::/home/erin:/usr/sbin/nologin'] })
     const first = await del()
@@ -316,16 +333,20 @@ describe('cr.29d — userdel\'s rule, mirrored', () => {
   })
 
   it('cr.29e — a trailing comment does not change the value: shadow\'s getdef strips `# …` before the value test', () => {
-    // Proven against shadow 4.19.0: under `USERGROUPS_ENAB yes # note` the
-    // real userdel REMOVED the group; ANAS had read the value as
-    // `yes # note`, seen not-yes, and skipped every cr.29d gate.
-    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB yes # comment'), true)
-    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB yes\t# comment'), true)
+    // Proven on the stunt node (Debian 13, shadow 4.17.4, no libeconf —
+    // docs/probes/wave2-node/out/ldefs-debian-shadow.txt): Debian's getdef
+    // reads an UNQUOTED value to the end of the line (no inline comments), so
+    // `yes # note` and `yes#x` KEEP the group; a QUOTED value ends at its
+    // closing quote, so `"yes" # note` REMOVES it. (Fedora's shadow 4.19.0
+    // parses through libeconf and strips the comment — not the target.)
+    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB yes # comment'), false)
+    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB yes\t# comment'), false)
+    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB yes#x'), false)
     assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB "yes" # comment'), true)
-    // The strip never turns a setting into its opposite, and a comment-only
-    // line sets nothing (fail closed: yes).
+    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB "yes # not a comment"'), false)
+    // A comment-only value is the value `# note`: not yes, kept (Debian).
     assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB no # keep it'), false)
-    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB # note'), true)
+    assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB # note'), false)
     // A comment LINE and a quoted value stay exactly as pinned above.
     assert.equal(userdelRemovesUserGroup('# USERGROUPS_ENAB yes\nUSERGROUPS_ENAB no\n'), false)
     assert.equal(userdelRemovesUserGroup('USERGROUPS_ENAB "no"\n'), false)

@@ -69,31 +69,26 @@ const SYSTEM_IDS = `uid/gid below ${SHARE_ID_MIN} or above ${SHARE_ID_MAX}`
  */
 const DEFAULT_PRIMARY_GID = 100
 
-/**
- * A login.defs `USERGROUPS_ENAB <value>` line (the value may carry a trailing
- * comment, stripped below), and a double-quoted value.
- */
+/** A login.defs `USERGROUPS_ENAB <rest>` line: the rest of the line after the key. */
 const USERGROUPS_ENAB_RE = /^\s*USERGROUPS_ENAB\s+(\S(?:.*\S)?)\s*$/
-const QUOTED_RE = /^"(.*)"$/
 
 /**
- * Drop a trailing comment from a login.defs value: `#` starts a comment that
- * runs to the end of the line, unless it sits inside double quotes (cr.29e —
- * shadow's getdef strips it, so `USERGROUPS_ENAB yes # note` sets yes; before
- * the strip ANAS read the value as `yes # note`, saw not-yes, and skipped the
- * cr.29d gates under exactly that line).
+ * The VALUE shadow's own getdef reads from the rest of a login.defs line —
+ * Debian's parser, which is what PVE runs (proven on the stunt node, shadow
+ * 4.17.4, `passwd` links no libeconf; docs/probes/wave2-node/out/
+ * ldefs-debian-shadow.txt): a value that starts with `"` ends at its closing
+ * quote and whatever follows is ignored (`"yes" # note` → `yes`); an unquoted
+ * value runs to the END OF THE LINE — there are no inline comments, so
+ * `yes # note` is the value `yes # note` (not yes) and so is `yes#x`. The
+ * cr.29e stripping of a trailing `#…` was Fedora's libeconf behaviour and
+ * over-estimated removal on Debian (the safe direction, but wrong).
  */
-function stripTrailingComment(value: string): string {
-  let out = ''
-  let quoted = false
-  for (const ch of value) {
-    if (ch === '#' && !quoted)
-      break
-    if (ch === '"')
-      quoted = !quoted
-    out += ch
+function loginDefsValue(rest: string): string {
+  if (rest.startsWith('"')) {
+    const close = rest.indexOf('"', 1)
+    return close === -1 ? rest.slice(1) : rest.slice(1, close)
   }
-  return out.trim()
+  return rest
 }
 
 /**
@@ -101,16 +96,18 @@ function stripTrailingComment(value: string): string {
  * login.defs(5), USERGROUPS_ENAB: "If set to yes, userdel will remove the
  * user's group if it contains no more members, and useradd will create by
  * default a group with the name of the user." shadow's getdef reads `NAME
- * value` lines (`#` starts a comment, a later line wins, the value may be
- * double-quoted), and getdef_bool is true only for `yes`, in any case.
+ * value` lines (a comment LINE starts with `#`; a later line wins; the value
+ * may be double-quoted — see {@link loginDefsValue} for Debian's exact rule),
+ * and getdef_bool is true only for `yes`, in any case.
  *
  * `text` null = the file could not be read. Fail closed: only a readable file
  * that SETS the key to something other than `yes` says no. An unreadable file,
  * an absent one, or one without the key reads as yes (PVE 9.2 ships
- * `USERGROUPS_ENAB yes`, probe P06), so ANAS never misses a group userdel would
- * take; at worst it names one that would have stayed. A line whose value is
- * empty once its comment is stripped (`USERGROUPS_ENAB # note`) sets nothing —
- * shadow's getdef sees no value token there either.
+ * `USERGROUPS_ENAB yes`, probe P06; Debian's 4.17.4 itself KEEPS the group
+ * when the key is absent — the capture above — so this is the documented
+ * over-estimate, never a missed removal). A line whose value is only a
+ * comment (`USERGROUPS_ENAB # note`) sets the value `# note`: not yes, kept —
+ * which is what Debian's userdel does with it.
  */
 export function userdelRemovesUserGroup(text: string | null): boolean {
   if (text === null)
@@ -118,11 +115,8 @@ export function userdelRemovesUserGroup(text: string | null): boolean {
   let value: string | undefined
   for (const raw of text.split('\n')) {
     const m = USERGROUPS_ENAB_RE.exec(raw)
-    if (m) {
-      const token = stripTrailingComment(m[1])
-      if (token !== '')
-        value = token.replace(QUOTED_RE, '$1')
-    }
+    if (m)
+      value = loginDefsValue(m[1])
   }
   return value === undefined || value.toLowerCase() === 'yes'
 }
@@ -695,16 +689,21 @@ export async function shareIdentityRoutes(
    * account is checked, not only local ones: a directory user pinned to this
    * gid would be broken the same way.
    *
-   * `except` (a user delete's going group, cr.29e) names the account being
+   * `except` (a user delete's going group, cr.29e) is the account being
    * deleted itself: its own primary gid leaves with it, so it is not who the
-   * check guards.
+   * check guards. It is matched by name AND uid (cr.29e review): nsswitch can
+   * hold a directory account under the SAME name as the local user with
+   * another uid, and that account's primary group is exactly what userdel
+   * would orphan — excepting by name alone let it through.
    */
-  function primaryGroupGate(except?: string): Gate<GroupObject> {
+  function primaryGroupGate(except?: { name: string, uid: number }): Gate<GroupObject> {
     return async (o, reads) => {
       const users = await idReads.users(reads)
       if (users === null)
         return accountsUnreadable(`that group '${o.name}' is nobody's primary group`)
-      const primaries = users.filter(u => u.gid === o.entry.gid && u.name !== except).map(u => u.name)
+      const primaries = users
+        .filter(u => u.gid === o.entry.gid && !(except !== undefined && u.name === except.name && u.uid === except.uid))
+        .map(u => u.name)
       if (primaries.length === 0)
         return null
       return {
@@ -752,7 +751,7 @@ export async function shareIdentityRoutes(
     if (!group)
       return null
     const target: GroupObject = { name: group.name, entry: group, local: true }
-    for (const gate of [mutableGroupGate, primaryGroupGate(o.name), groupNotReferencedGate]) {
+    for (const gate of [mutableGroupGate, primaryGroupGate({ name: o.name, uid: o.entry.uid }), groupNotReferencedGate]) {
       const refused = await gate(target, reads)
       if (refused) {
         return {
