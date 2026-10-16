@@ -543,6 +543,59 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
       assertSourceUntouched(mock)
     })
   })
+
+  it('cr.48d: a classified failure whose pbc stderr echoes the repo secret is masked in the thrown job error', async () => {
+    await withConfigfsRoot(async (configfsRoot) => {
+      const mock = new MockExecutor()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addStreamFixture({
+        command: PBC,
+        result: {
+          stderr: 'Error: error extracting archive - connection closed because of a broken pipe while using super-secret\n',
+          exitCode: 255,
+          bytesWritten: 268435456,
+        },
+      })
+
+      await assert.rejects(
+        runNewLunImageRestore(mock, deps(mock, configfsRoot), noop),
+        (err: Error) => {
+          assert.match(err.message, /dropped part-way through the image/, err.message)
+          assert.ok(err.message.includes('[secret]'), err.message)
+          assert.ok(!err.message.includes('super-secret'), err.message)
+          return true
+        },
+      )
+      assertSourceUntouched(mock)
+    })
+  })
+
+  it('cr.48d: a pbc that cannot be started carries no secret in the newLun rejection the job would record', async () => {
+    await withConfigfsRoot(async (configfsRoot) => {
+      const mock = new MockExecutor()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addStreamFixture({
+        command: PBC,
+        // The `result` is the run-time throw's dead weight — the interface needs
+        // it, and a throwing fixture never reaches it.
+        result: { stderr: '', exitCode: 0, bytesWritten: 0 },
+        throws: new Error('spawn /usr/bin/proxmox-backup-client ENOENT while using super-secret'),
+      })
+
+      await assert.rejects(
+        runNewLunImageRestore(mock, deps(mock, configfsRoot), noop),
+        (err: Error) => {
+          assert.match(err.message, /could not be started/)
+          assert.ok(err.message.includes('[secret]'), err.message)
+          assert.ok(!err.message.includes('super-secret'), err.message)
+          return true
+        },
+      )
+      assertSourceUntouched(mock)
+    })
+  })
 })
 
 describe('runNewLunImageRestore — where the iSCSI lock is held, and where it is not (the #52 shape for the new-LUN door)', () => {

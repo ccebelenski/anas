@@ -407,6 +407,48 @@ describe('explainRestoreFailure — the real taxonomy (GT-56)', () => {
     const privs = explainRestoreFailure('Error: permission check failed - missing Datastore.Audit|Datastore.Backup on /datastore/anastest-store/gtrestore')
     assert.match(privs, /not allowed to read this datastore/)
   })
+
+  it('cr.48d: an echoed repo secret is masked in every classified detail, the verdict unchanged', () => {
+    // A pbc line that echoes the repo password/token secret appears in the
+    // quoted `Error:` line; the classification must stay on the RAW text and
+    // the sentence that leaves must show `[secret]`, never the plain value.
+    const dropped = explainRestoreFailure(
+      'Error: error extracting archive - connection closed because of a broken pipe while using super-secret\n',
+      undefined,
+      ['super-secret'],
+    )
+    assert.match(dropped, /dropped part-way through the image/, 'the broken-pipe wording survived the mask')
+    assert.ok(dropped.includes('[secret]'), dropped)
+    assert.ok(!dropped.includes('super-secret'), dropped)
+
+    const missing = explainRestoreFailure(
+      'Error: snapshot host/gtrestore/2020-01-01T00:00:00Z does not exist - super-secret\n',
+      undefined,
+      ['super-secret'],
+    )
+    assert.match(missing, /missing NAMESPACE/, 'the collapsed-causes wording survived the mask')
+    assert.ok(missing.includes('[secret]'), missing)
+    assert.ok(!missing.includes('super-secret'), missing)
+  })
+
+  it('cr.48d: the generic fallback masks the echoed secret too (b)', () => {
+    // None of the taxonomy branches match, so the sentence is the quoted
+    // `Error:` line itself — it must still be masked at the boundary.
+    const said = explainRestoreFailure(
+      'Error: proxmox-backup-client rejected super-secret\n',
+      undefined,
+      ['super-secret'],
+    )
+    assert.match(said, /^Error: /, 'the ERROR line is still the sentence')
+    assert.ok(said.includes('[secret]'), said)
+    assert.ok(!said.includes('super-secret'), said)
+  })
+
+  it('cr.48d: with no secret values the sentence is untouched', () => {
+    const said = explainRestoreFailure('Error: archive not found in manifest\n', undefined, [])
+    assert.match(said, /holds no archive by that name/)
+    assert.equal(said.includes('[secret]'), false)
+  })
 })
 
 // ============================================================================
@@ -936,6 +978,94 @@ describe('runImageRestore — failures', () => {
     assert.ok(
       result.warnings?.some(w => /reported a complete restore but 536866816 bytes reached/.test(w)),
       JSON.stringify(result.warnings),
+    )
+  })
+
+  it('cr.48d: a classified failure whose pbc stderr echoes the repo secret is masked in the thrown job error', async () => {
+    // The `detail` sentence rides the job error AND the audit line verbatim
+    // (the route's completion reading), so a pbc error line that echoes the
+    // secret this restore handed it must meet `[secret]` there — twice: once
+    // on the partial-write path (the LUN stays disabled), once before any byte
+    // lands (the target comes back).
+    const caseImpl = async (stderr: string, bytesWritten: number, expected: RegExp, noBytes: boolean) => {
+      const mock = new MockExecutor()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addStreamFixture({ command: PBC, result: { stderr, exitCode: 255, bytesWritten } })
+      const lun = zvolLun()
+      const tgt = target([lun])
+      await assert.rejects(
+        runImageRestore(mock, deps(mock, lun, tgt), noop),
+        (err: Error) => {
+          assert.match(err.message, expected, err.message)
+          assert.ok(err.message.includes('[secret]'), err.message)
+          assert.ok(!err.message.includes('super-secret'), err.message)
+          return true
+        },
+      )
+      const enables = mock.calls.filter(c => c.command === TARGETCLI && c.args.includes('enable'))
+      if (noBytes)
+        assert.equal(enables.length, 1, 'a clean miss re-enables the target')
+      else
+        assert.deepEqual(enables, [], 'a partial write stays offline')
+    }
+
+    // (a) a classified failure — the dropped-connection wording, partial and clean.
+    await caseImpl(
+      'Error: error extracting archive - connection closed because of a broken pipe while using super-secret\n',
+      268435456,
+      /dropped part-way through the image/,
+      false,
+    )
+    // A snapshot the client cannot find, before any byte landed.
+    await caseImpl(
+      'Error: snapshot host/gtrestore/2020-01-01T00:00:00Z does not exist - super-secret\n',
+      0,
+      /missing NAMESPACE/,
+      true,
+    )
+  })
+
+  it('cr.48d: the generic fallback masks the echoed secret in the thrown job error too (b)', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addStreamFixture({
+      command: PBC,
+      result: { stderr: 'Error: proxmox-backup-client rejected super-secret\n', exitCode: 255, bytesWritten: 0 },
+    })
+    const lun = zvolLun()
+    const tgt = target([lun])
+    await assert.rejects(
+      runImageRestore(mock, deps(mock, lun, tgt), noop),
+      (err: Error) => {
+        assert.match(err.message, /^Error: /, err.message)
+        assert.match(err.message, /Nothing was written to/)
+        assert.ok(err.message.includes('[secret]'), err.message)
+        assert.ok(!err.message.includes('super-secret'), err.message)
+        return true
+      },
+    )
+  })
+
+  it('cr.48d: a pbc that cannot be started carries no secret in the rejection the job would record', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addStreamFixture({
+      command: PBC,
+      // The `result` is the run-time throw's dead weight — the interface needs
+      // it, and a throwing fixture never reaches it.
+      result: { stderr: '', exitCode: 0, bytesWritten: 0 },
+      throws: new Error('spawn /usr/bin/proxmox-backup-client ENOENT while using super-secret'),
+    })
+    const lun = zvolLun()
+    const tgt = target([lun])
+    await assert.rejects(
+      runImageRestore(mock, deps(mock, lun, tgt), noop),
+      (err: Error) => {
+        assert.match(err.message, /could not be started/)
+        assert.ok(err.message.includes('[secret]'), err.message)
+        assert.ok(!err.message.includes('super-secret'), err.message)
+        return true
+      },
     )
   })
 })

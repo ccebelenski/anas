@@ -844,6 +844,37 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assert.deepEqual(enables, [], JSON.stringify(enables))
     })
 
+    it('cr.48d: pbc echoing the repo secret in a failed restore is masked on the whole job record', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      mock.clearFixtures()
+      mock.addFixture({ command: PBC, result: { stdout: SNAPSHOT_LIST_JSON, stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
+      // A pbc ERROR line that echoes the credential this restore handed it.
+      mock.addStreamFixture({
+        command: PBC,
+        result: {
+          stderr: 'Error: error extracting archive - connection closed because of a broken pipe while using super-secret\n',
+          exitCode: 255,
+          bytesWritten: 0,
+        },
+      })
+
+      const first = await restore()
+      const res = await restore(body(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'failed')
+      // The detail rides the job error AND the audit line verbatim.
+      assert.match(job.error!.message, /dropped part-way through the image/)
+      assert.match(job.error!.message, /\[secret\]/)
+      assert.ok(!job.error!.message.includes('super-secret'), job.error!.message)
+      // And no secret value anywhere on the whole job record — the wire shape,
+      // the queue record's audit params and its progress lines, all of it.
+      assert.equal(JSON.stringify(job).includes('super-secret'), false)
+    })
+
     it('a snapshot the client cannot find fails the job and RE-ENABLES the target', async () => {
       await serveAnas()
       const mock = mockOf()

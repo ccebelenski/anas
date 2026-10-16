@@ -7,7 +7,7 @@ import type {
   IscsiSession,
   IscsiTargetDetail,
 } from '@anas/shared'
-import type { CommandExecutor, ExecStreamTarget } from '../executor/types.js'
+import type { CommandExecutor, ExecStreamResult, ExecStreamTarget } from '../executor/types.js'
 import type { IscsiMutateOptions, ResolvedBacking } from './iscsi-mutate.js'
 import { constants } from 'node:fs'
 import { stat, unlink } from 'node:fs/promises'
@@ -15,6 +15,7 @@ import { buildCreateArgs } from '../routes/datasets.js'
 import { ensureAhrTargetOrdering } from './ahr-create.js'
 import { classifyPermissionFailure, PBC } from './backup-runner.js'
 import { backstorePath, createAndMapLun, createSparseImage, newSerial, runTargetcli, saveIscsiConfig, setIscsiTargetState, tpgPath, withIscsiLock, ZFS, zvolDataset } from './iscsi-mutate.js'
+import { maskSecretValues } from './secret-argv.js'
 
 /**
  * WHOLE-IMAGE RESTORE of an iSCSI LUN (story backup2.7).
@@ -257,7 +258,16 @@ const BAD_SUFFIX_RE = /failed to parse archive type/i
 const NO_PERM_RE = /no permissions on/i
 const BROKEN_PIPE_RE = /broken pipe|connection closed/i
 
-/** The client-safe `Error:` line (pbc stderr never carries the secret). */
+/**
+ * The `Error:` line to quote in a failure detail — RAW, on purpose.
+ *
+ * cr.48d: the line can echo the repo secret a restore handed pbc (a bad
+ * credential answered with the token, a URL repeated back — the assumption
+ * cr.48b rejected), so every CALLER masks it — {@link explainRestoreFailure}
+ * masks its whole sentence at the boundary, and {@link runImageRestore} /
+ * {@link runNewLunImageRestore} are covered by that one pass. This stays raw
+ * because classification must read the truth.
+ */
 export function firstRestoreError(stderr: string): string {
   const lines = stderr.split(LINE_SPLIT_RE).map(l => l.trim()).filter(Boolean)
   return lines.find(l => l.startsWith('Error:')) ?? (lines.at(-1) ?? 'restore failed')
@@ -293,8 +303,26 @@ export function hasImageRestoreErrorText(stderr: string): boolean {
  * killed and left nothing but progress behind, the reason is HOW it ended —
  * `the client was killed by SIGKILL` — never the progress line, which is not a
  * reason. A client that said something real before dying keeps its words.
+ *
+ * `secretValues` are the secret values this restore handed pbc (the repo
+ * password / token secret, cr.48b): the sentence that leaves is masked against
+ * them, because a pbc ERROR line can echo the value it was pointed at (a bad
+ * credential answered with the token, a URL repeated back) and the sentence
+ * would otherwise ride the job error and the audit line. The classification
+ * reads the RAW stderr — the same split cr.48b/c make: the verdict is drawn
+ * from the truth, only the reply is masked.
  */
-export function explainRestoreFailure(stderr: string, signal?: string): string {
+export function explainRestoreFailure(stderr: string, signal?: string, secretValues: string[] = []): string {
+  // cr.48d: the sentence is THE thing that leaves (the job error the detail
+  // rides, the audit line that carries it verbatim) — ONE masking pass at the
+  // boundary, over whatever the raw classifier composed from stderr. The
+  // classification above reads the RAW text and is untouched. A masked value
+  // under four characters, or no values at all, is a no-op.
+  return maskSecretValues(rawExplainRestoreFailure(stderr, signal), secretValues)
+}
+
+/** The classification itself — over the raw stderr, unmasked ({@link explainRestoreFailure}). */
+function rawExplainRestoreFailure(stderr: string, signal?: string): string {
   if (signal && !hasImageRestoreErrorText(stderr)) {
     return `The image restore was interrupted - the client was killed by ${signal} `
       + 'and reported no error of its own; what reached the target is whatever its last progress line claimed.'
@@ -662,22 +690,33 @@ export async function runImageRestore(
     )
 
     let lastPercent = -1
-    const r = await executor.execToStream(PBC, args, streamTarget, {
-      env: deps.env,
-      // cr.34: a data mover (a whole disk image); no deadline.
-      timeoutMs: null,
-      longRunning: 'proxmox-backup-client image restore in place: a data mover, hours for a large image',
-      onStderr: (chunk) => {
-        // GT-59: the interval roughly DOUBLES (6 s, 16 s, 36 s, 79 s), so a
-        // multi-hour restore emits a handful of late lines and long silences
-        // are normal. Every line pbc does emit is forwarded verbatim.
-        const p = parseRestoreProgress(chunk)
-        if (p.percent !== null && p.percent !== lastPercent) {
-          lastPercent = p.percent
-          updateProgress(`restore ${p.lastLine ?? `progress ${p.percent}%`}`)
-        }
-      },
-    })
+    let r: ExecStreamResult
+    try {
+      r = await executor.execToStream(PBC, args, streamTarget, {
+        env: deps.env,
+        // cr.34: a data mover (a whole disk image); no deadline.
+        timeoutMs: null,
+        longRunning: 'proxmox-backup-client image restore in place: a data mover, hours for a large image',
+        onStderr: (chunk) => {
+          // GT-59: the interval roughly DOUBLES (6 s, 16 s, 36 s, 79 s), so a
+          // multi-hour restore emits a handful of late lines and long silences
+          // are normal. Every line pbc does emit is forwarded verbatim.
+          const p = parseRestoreProgress(chunk)
+          if (p.percent !== null && p.percent !== lastPercent) {
+            lastPercent = p.percent
+            updateProgress(`restore ${p.lastLine ?? `progress ${p.percent}%`}`)
+          }
+        },
+      })
+    }
+    catch (err) {
+      // cr.48d: a rejection's message (an executor error) is masked the same
+      // way the reads mask theirs — the secret rides the child env and can be
+      // echoed by anyone, and this message lands in job.error. No
+      // classification ever runs on this text; it only ever leaves.
+      throw new Error(`proxmox-backup-client could not be started: ${
+        maskSecretValues(err instanceof Error ? err.message : String(err), [deps.secret])}`)
+    }
     const progress = parseRestoreProgress(r.stderr)
     const written = imageBytesWritten(r.bytesWritten, progress, deps.imageSize, r.exitCode)
     bytesWritten = written.bytes
@@ -685,7 +724,10 @@ export async function runImageRestore(
       duration = progress.complete
 
     if (r.exitCode !== 0) {
-      const detail = explainRestoreFailure(r.stderr, r.signal)
+      // cr.48d: the detail (and through it every sentence that rides the job
+      // error and the audit line) is masked against the repo secret this
+      // restore handed pbc — a pbc error line that echoes it meets `[secret]`.
+      const detail = explainRestoreFailure(r.stderr, r.signal, [deps.secret])
       if (bytesWritten > 0) {
         // The half-written state, stated in the words the story asks for. The
         // device has no marker of its own; this sentence IS the record.
@@ -1004,20 +1046,30 @@ export async function runNewLunImageRestore(
       + `(${deps.imageSize} bytes, streamed to stdout - the client refuses to write an existing target)`,
     )
     let lastPercent = -1
-    const r = await executor.execToStream(PBC, args, streamTarget, {
-      env: deps.env,
-      // cr.34: a data mover (a whole disk image); no deadline.
-      timeoutMs: null,
-      longRunning: 'proxmox-backup-client image restore to a new backing: a data mover, hours for a large image',
-      onStderr: (chunk) => {
-        // GT-59: forward every progress line verbatim, as the in-place run does.
-        const p = parseRestoreProgress(chunk)
-        if (p.percent !== null && p.percent !== lastPercent) {
-          lastPercent = p.percent
-          updateProgress(`restore ${p.lastLine ?? `progress ${p.percent}%`}`)
-        }
-      },
-    })
+    let r: ExecStreamResult
+    try {
+      r = await executor.execToStream(PBC, args, streamTarget, {
+        env: deps.env,
+        // cr.34: a data mover (a whole disk image); no deadline.
+        timeoutMs: null,
+        longRunning: 'proxmox-backup-client image restore to a new backing: a data mover, hours for a large image',
+        onStderr: (chunk) => {
+          // GT-59: forward every progress line verbatim, as the in-place run does.
+          const p = parseRestoreProgress(chunk)
+          if (p.percent !== null && p.percent !== lastPercent) {
+            lastPercent = p.percent
+            updateProgress(`restore ${p.lastLine ?? `progress ${p.percent}%`}`)
+          }
+        },
+      })
+    }
+    catch (err) {
+      // cr.48d: the same mask the in-place door applies — a rejection's message
+      // can echo the repo secret and this lands in job.error via the cleanup
+      // sentence below.
+      throw new Error(`proxmox-backup-client could not be started: ${
+        maskSecretValues(err instanceof Error ? err.message : String(err), [deps.secret])}`)
+    }
     const progress = parseRestoreProgress(r.stderr)
     const written = imageBytesWritten(r.bytesWritten, progress, deps.imageSize, r.exitCode)
     bytesWritten = written.bytes
@@ -1025,7 +1077,9 @@ export async function runNewLunImageRestore(
       duration = progress.complete
 
     if (r.exitCode !== 0) {
-      const detail = explainRestoreFailure(r.stderr, r.signal)
+      // cr.48d: the detail is masked against the repo secret this restore
+      // handed pbc, as the in-place door's is.
+      const detail = explainRestoreFailure(r.stderr, r.signal, [deps.secret])
       if (bytesWritten > 0) {
         throw new Error(
           `the image was partially written (${written.estimated ? 'at least ' : ''}${bytesWritten} `
