@@ -50,7 +50,7 @@ const execFileAsync = promisify(execFile)
  * has state on the node), the gtbackup/gtcancelsrc dataset (6 x 2 MiB) and the
  * sftp landing area. Like the review-fix profile it NEVER touches
  * /etc/anas/rclone.conf: the spec's remote arrives and leaves through the API.
- * The operator's own remote (gtest) and task (testoff) are asserted present at
+ * The operator's own remotes and tasks (as found after setup) are asserted present at
  * teardown — nothing here ever runs, edits or removes them.
  */
 
@@ -208,6 +208,26 @@ test.beforeAll(async () => {
   await execFileAsync(FIXTURE_SH, ['up', 'cancel']).catch(() => {})
 })
 
+/**
+ * The operator's own remotes and cloud tasks as they stand AFTER this file's
+ * own cleanup: the teardown proves every one of them survived, whatever they
+ * are called. (The file used to assert a standing `gtest` remote and
+ * `testoff` task by name — true on the operator's node, false on a rebuilt one.)
+ */
+let remotesBefore: string[] = []
+let tasksBefore: string[] = []
+
+test.beforeAll(async ({ playwright }) => {
+  const ctx = await apiCtx(playwright)
+  try {
+    remotesBefore = await remoteNames(ctx)
+    tasksBefore = await taskNames(ctx)
+  }
+  finally {
+    ctx.dispose()
+  }
+})
+
 test.beforeEach(async () => {
   // The fixture user is the "fixture present" signal (as in the other cloud
   // specs). The rclone STORE is deliberately absent from that check: on this
@@ -253,9 +273,9 @@ test.describe.serial('cloud cancel live proofs — the rclone.5 cancel ladder + 
     const ctx2 = await apiCtx(playwright)
     try {
       expect(await remoteNames(ctx2), `remotes after teardown: ${JSON.stringify(await remoteNames(ctx2))}`)
-        .toContain('gtest')
+        .toEqual(expect.arrayContaining(remotesBefore))
       expect(await taskNames(ctx2), `tasks after teardown: ${JSON.stringify(await taskNames(ctx2))}`)
-        .toContain('testoff')
+        .toEqual(expect.arrayContaining(tasksBefore))
     }
     finally {
       await ctx2.dispose()

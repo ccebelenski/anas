@@ -387,6 +387,21 @@ other detach that day (15:12:28, 15:13:10, 15:15:14, 15:16:51, and the hand-driv
 exclusive re-read) then verify the partition node is gone and FAIL the job naming the disk when it is not — so a held disk
 produces a reported failure instead of a silent `other`. Timing exposes it; the missing verify is the defect.
 
+**Built the same day as cr.50** (merged 81bcf8ae): settle → ask the kernel → `partx -d` under a bounded retry → released with a
+progress line, or a failure naming the disk, the slice, what partx said and the command; an unreadable kernel view is never "gone"
+(the build's cross-model review reproduced that gap and it was fixed before the merge). The merged build's node rerun of
+`ahr-cache-review` + `ahr-cache-api` is recorded in the handoff.
+
+### The PBS-writing tests and the standing-remote teardowns (2026-10-16, operator ruling: writes to the TEST PBS are permitted)
+
+The brief's "PBS read-only" clause was a misreading of the production rule (ANAS never writes to a PBS it does not own); for the test
+PBS VM the operator permits writes. With `anas-pbs` powered on: `backup-source-guard` 5/5 (test 5 wrote a real snapshot to `pbsgt`
+and PBS listed it), `backup-cancel` 2/2 (a real backup started and cancelled mid-upload: 409 + code, replay 202, pbc gone with exit
+130, no new point in time on PBS). `backup-cancel`'s teardown had asserted the operator's standing `gtest` remote and `testoff` task
+BY NAME (absent on the rebuilt node; wave-3 class (c)), as did `cloud-cancel` and `cloud-guided-viewer`: all three now record the
+remotes and cloud tasks present after their own setup and assert those survived — 11/11 on the rerun. Datastore `gtstore` carries the
+test snapshots; nothing else on the PBS VM changed.
+
 `task-status-reboot` reboots the node by design (boot −1 ended 06:39:19, boot 0 began 06:39:24); ADOCK's CT 9900
 stayed stopped (onboot 0) and adock/adockd came back active.
 

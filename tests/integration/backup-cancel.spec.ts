@@ -45,7 +45,7 @@ import { sshExec } from './fixtures/stunt-node'
  * backup specs share (registered here if absent, then KEPT, exactly as
  * backup-source-guard.spec.ts leaves it), and the source dataset
  * gtbackup/gtbackcancel is created and destroyed by this spec. The operator's
- * remote `gtest` and task `testoff` are asserted present at teardown — nothing
+ * remotes and cloud tasks present before the run are asserted present at teardown — nothing
  * here ever runs, edits or removes them.
  */
 
@@ -222,6 +222,15 @@ function taskRow(page: Page, grid: Locator, name: string): Locator {
 
 // ---- Fixtures -----------------------------------------------------------------
 
+/**
+ * The operator's own remotes and cloud tasks as they were BEFORE this spec
+ * ran: the teardown proves every one of them survived, whatever they are
+ * called. (The spec used to assert a standing `gtest` remote and `testoff`
+ * task by name — true on the operator's node, false on a rebuilt one.)
+ */
+let remotesBefore: string[] = []
+let cloudTasksBefore: string[] = []
+
 test.beforeAll(async ({ playwright }) => {
   // The throwaway source dataset: a crashed earlier run's leftover transient
   // snapshots and staged data are not a "before" this spec should read.
@@ -230,6 +239,8 @@ test.beforeAll(async ({ playwright }) => {
 
   const ctx = await apiCtx(playwright)
   try {
+    remotesBefore = ((await (await ctx.get(`${V1}/cloud/remotes`)).json()).data.remotes as { name: string }[]).map(r => r.name)
+    cloudTasksBefore = ((await (await ctx.get(`${V1}/cloud/tasks`)).json()).data as { name: string }[]).map(t => t.name)
     // Any task left from a crashed run — its units would collide on create.
     const list = await ctx.get(`${V1}/backup/tasks/${TASK}`)
     if (list.status() === 200)
@@ -285,14 +296,10 @@ test.describe.serial('backup cancel live proof — the rclone.5 backup half', ()
     // non-negotiable.
     const ctx2 = await apiCtx(playwright)
     try {
-      expect(await (await ctx2.get(`${V1}/cloud/remotes`)).json(), 'gtest untouched')
-        .toEqual(expect.objectContaining({ data: expect.objectContaining({
-          remotes: expect.arrayContaining([expect.objectContaining({ name: 'gtest' })]),
-        }) }))
-      expect(await (await ctx2.get(`${V1}/cloud/tasks`)).json(), 'testoff untouched')
-        .toEqual(expect.objectContaining({ data: expect.arrayContaining([
-          expect.objectContaining({ name: 'testoff' }),
-        ]) }))
+      const remotesAfter = ((await (await ctx2.get(`${V1}/cloud/remotes`)).json()).data.remotes as { name: string }[]).map(r => r.name)
+      expect(remotesAfter, 'every remote present before survived').toEqual(expect.arrayContaining(remotesBefore))
+      const cloudTasksAfter = ((await (await ctx2.get(`${V1}/cloud/tasks`)).json()).data as { name: string }[]).map(t => t.name)
+      expect(cloudTasksAfter, 'every cloud task present before survived').toEqual(expect.arrayContaining(cloudTasksBefore))
       expect(await (await ctx2.get(`${V1}/backup/repos`)).json(), 'pbsgt kept')
         .toEqual(expect.objectContaining({ data: expect.objectContaining({
           repos: expect.arrayContaining([expect.objectContaining({ name: REPO })]),
