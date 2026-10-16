@@ -155,6 +155,38 @@ describe('destroy system-pool guard (cr.23) — facts, never names', () => {
     assert.match(message, /^Pool 'tank' is mounted at \/var —/)
   })
 
+  it('cr.60 (L23): a BIND mount of a directory of the pool\'s ROOT dataset at /home is refused — the sentence names /home', async () => {
+    // The root dataset row is the captured `mnttest` one (findmnt-full.json:
+    // target /mnttest, source mnttest, zfs); the bind carries findmnt's
+    // `[fsroot]` suffix, the form the AHR captures show (`…--vol[/@data]`).
+    // Before cr.60 the head of `mnttest[/home]` was the pool `mnttest[`.
+    server = await build(baseExecutor('mnttest', {
+      bootfs: 'mnttest\t-\n',
+      findmnt: { stdout: findmntJson([
+        { target: '/', source: '/dev/mapper/pve-root', fstype: 'ext4' },
+        { target: '/mnttest', source: 'mnttest', fstype: 'zfs' },
+        { target: '/home', source: 'mnttest[/home]', fstype: 'zfs' },
+      ]), stderr: '', exitCode: 0 },
+    }))
+    const message = systemPoolMessage(await server.inject({ method: 'DELETE', url: '/v1/pools/mnttest', headers: IDENTITY_HEADERS }))
+    assert.match(message, /^Pool 'mnttest' is mounted at \/home —/)
+  })
+
+  it('cr.60 (L24): the mount table unreadable ON ITS OWN refuses — readable, quiet boot facts do not stand in for it', async () => {
+    // findmnt exits 1 with a table still on stdout (the exit decides); the
+    // boot facts read and name no boot pool. Before cr.60 this reached the
+    // ordinary confirm, and a pool mounted at /var was destroyable.
+    server = await build(baseExecutor('tank', {
+      bootfs: 'tank\t-\n',
+      findmnt: { stdout: findmntJson([
+        { target: '/', source: '/dev/mapper/pve-root', fstype: 'ext4' },
+        { target: '/var', source: 'tank/var', fstype: 'zfs' },
+      ]), stderr: 'findmnt: failed', exitCode: 1 },
+    }))
+    const message = systemPoolMessage(await server.inject({ method: 'DELETE', url: '/v1/pools/tank', headers: IDENTITY_HEADERS }))
+    assert.match(message, /^Pool 'tank' is treated as a system pool \(the mount table is unreadable/)
+  })
+
   it('when BOTH the mount table and the boot facts are unreadable, the verb is refused', async () => {
     // bootfs probe exits 1 (the BaseOpts default), zfs list exits 1, and the
     // mount table exits 1 — no fact readable anywhere, so the gate tightens.

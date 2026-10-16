@@ -149,6 +149,43 @@ export const X_SYSTEMD_AUTOMOUNT_TOKEN = 'x-systemd.automount'
  */
 export const X_ANAS_DISABLED_AUTOMOUNT_TOKEN = 'x-anas.disabled-automount'
 
+/**
+ * The mount.cifs(8) option keys that carry a credential (story cr.60, review
+ * M7) — the ONE list three users share: the daemon's fstab reader (lifts them
+ * out of the passthrough a response carries), `redactFstabLine` (masks the
+ * secret values in the raw line a response carries) and cr.2's
+ * `MountExtraOptions` refusal (never written into a line). The names are
+ * mount.cifs(8)'s on Debian 13 (cifs-utils 7.4): `password`/`pass` and
+ * `password2` (the second password a server-side rotation uses) carry a
+ * SECRET; `username`/`user` and `domain`/`dom`/`workgroup` are the account
+ * METADATA (shown, never secret); `credentials` names the file holding them.
+ * Keys compare case-insensitively ({@link cifsCredentialKeyKind}): the reader
+ * hides `PASSWORD=` exactly as it hides `password=`.
+ */
+export const CIFS_CREDENTIAL_OPTION_KEYS = {
+  secret: ['password', 'pass', 'password2'],
+  username: ['username', 'user'],
+  domain: ['domain', 'dom', 'workgroup'],
+  file: ['credentials'],
+} as const
+
+/** Which credential an option key carries ({@link CIFS_CREDENTIAL_OPTION_KEYS}). */
+export type CifsCredentialKeyKind = keyof typeof CIFS_CREDENTIAL_OPTION_KEYS
+
+/**
+ * The credential kind of an option KEY (the part before `=`), compared
+ * case-insensitively against {@link CIFS_CREDENTIAL_OPTION_KEYS}; null for
+ * any other key.
+ */
+export function cifsCredentialKeyKind(key: string): CifsCredentialKeyKind | null {
+  const k = key.toLowerCase()
+  for (const kind of Object.keys(CIFS_CREDENTIAL_OPTION_KEYS) as CifsCredentialKeyKind[]) {
+    if ((CIFS_CREDENTIAL_OPTION_KEYS[kind] as readonly string[]).includes(k))
+      return kind
+  }
+  return null
+}
+
 /** One fstab option token (see {@link isFstabOptionToken}). */
 export const FstabOptionToken = z
   .string()

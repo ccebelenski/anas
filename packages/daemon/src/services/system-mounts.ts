@@ -31,11 +31,9 @@
  */
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
-import { isFindmntTable, parseFindmnt } from '../parsers/findmnt.js'
+import { parseFindmntTable, readFindmntTable } from '../parsers/findmnt.js'
 import { stripSubvolSuffix } from './ahr-topology.js'
 import { SYSTEM_MOUNT_TARGETS } from './mounts.js'
-
-const FINDMNT = '/usr/bin/findmnt'
 
 /** Exact-match set over cr.18's list — the single source, never a copy. */
 const SYSTEM_MOUNT_TARGET_SET: ReadonlySet<string> = new Set<string>(SYSTEM_MOUNT_TARGETS)
@@ -109,10 +107,16 @@ export function ahrPoolFromMountSource(source: string): string | null {
 
 /**
  * The ZFS pool a `zfs`-fstype mount belongs to: the dataset head
- * (`rpool/ROOT/pve-1` → `rpool`). Empty source (a malformed row) answers null.
+ * (`rpool/ROOT/pve-1` → `rpool`). A BIND mount carries findmnt's `[fsroot]`
+ * suffix on its source (util-linux appends the bound directory: the AHR
+ * captures show `/dev/mapper/…--vol[/@data]`), so a bind of a directory of a
+ * pool's ROOT dataset reads `tank[/home]` — the suffix goes through the ONE
+ * normalizer before the head is taken (cr.60, review L23: it answered pool
+ * `tank[`, and a pool bound at `/home` was not a system pool). A ZFS name
+ * cannot contain `[`. Empty source (a malformed row) answers null.
  */
 export function zfsPoolFromMountSource(source: string): string | null {
-  const pool = source.split('/')[0]
+  const pool = stripSubvolSuffix(source).split('/')[0]
   return pool === '' ? null : pool
 }
 
@@ -153,16 +157,10 @@ export function systemMountPoolsFromJson(text: string): SystemMountFacts | null 
   // (`{}`, `[]`, `null`, `{"filesystems":42}`) is as unreadable as broken
   // JSON, and the parse never throws: a caller that does not guard it must
   // still get the refusal, not a 500.
-  if (!isFindmntTable(text))
-    return null
-  // The shape gate checks the top level only; a malformed row deeper down
-  // (`children: 42`, a `null` filesystem) must still read as unreadable.
-  try {
-    return systemMountPoolsFromNodes(parseFindmnt(text))
-  }
-  catch {
-    return null
-  }
+  // The strict parse (cr.60) checks every depth: a malformed row deeper down
+  // (`children: 42`, a `null` filesystem) reads as unreadable too.
+  const nodes = parseFindmntTable(text)
+  return nodes === null ? null : systemMountPoolsFromNodes(nodes)
 }
 
 /**
@@ -176,15 +174,10 @@ export async function readSystemMountPools(
   exec: CommandExecutor,
   args: readonly string[] = ['--json'],
 ): Promise<SystemMountFacts | null> {
-  try {
-    const res = await exec.exec(FINDMNT, [...args])
-    if (res.exitCode !== 0)
-      return null
-    return systemMountPoolsFromJson(res.stdout)
-  }
-  catch {
-    return null
-  }
+  // The ONE strict mount-table read (cr.60): null on a failed start, a
+  // non-zero exit or a wrong shape.
+  const text = await readFindmntTable(exec, args)
+  return text === null ? null : systemMountPoolsFromJson(text)
 }
 
 /**

@@ -11,7 +11,7 @@ import type { PveFootprint } from '../services/pve-footprint.js'
 import type { ResolvedVdev } from '../services/zfs-vdev-remove.js'
 import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, DestroyPoolQuery, ExportPoolRequest, ImportPoolRequest, isComposableDisk, isRemovableVdevRole, PoolMountpointRequest, PoolName, pveStoragePath, RemoveVdevRequest, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
 import { parseByIdToKernel, parseByIdToKernelFull, wholeDiskKernel } from '../parsers/disk-by-id.js'
-import { parseFindmnt } from '../parsers/findmnt.js'
+import { parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
 import { PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
 import { parseZpoolFeature, parseZpoolGet } from '../parsers/zpool-get.js'
@@ -42,9 +42,6 @@ const WIPEFS = '/usr/sbin/wipefs'
 const SGDISK = '/usr/sbin/sgdisk'
 const LSBLK = '/usr/bin/lsblk'
 const BLKID = '/usr/sbin/blkid'
-const FINDMNT = '/usr/bin/findmnt'
-/** findmnt args for live-mount collision checks (matches the AHR precedent). */
-const FINDMNT_ARGS = ['--json', '--real']
 
 const BY_ID_PREFIX = '/dev/disk/by-id/'
 /** `/dev/sdb1`, `/dev/nvme0n1p2` — a leaf ZFS named by its kernel device. */
@@ -760,9 +757,12 @@ export async function poolRoutes(
     else {
       unreadable = true
     }
-    const mounted = await executor.exec(FINDMNT, FINDMNT_ARGS)
-    if (mounted.exitCode === 0) {
-      for (const fs of parseFindmnt(mounted.stdout)) {
+    // cr.60 (L26): the ONE strict mount-table read (a wrong shape at any
+    // depth is unreadable too; `datasetOfPool` already cuts a bind's
+    // `[fsroot]` suffix, so `tank[/home]` counts as pool tank's).
+    const mounted = await readFindmntTable(executor, ['--json', '--real'])
+    if (mounted !== null) {
+      for (const fs of parseFindmnt(mounted)) {
         if (fs.fstype === 'zfs' && fs.target.startsWith('/') && datasetOfPool(fs.source, poolName))
           paths.add(fs.target)
       }
@@ -1020,9 +1020,12 @@ export async function poolRoutes(
     /** The partition pre-flight (story nf.1) — fresh at each door, like every read here. */
     partition: (reads: GuardReads, id: string) => reads.once(`partition:${id}`, () => partitionDeviceProblems(id)),
     mountpoints: (reads: GuardReads) => reads.once('pool-mountpoints', () => readPoolMountpoints(executor)),
-    liveMounts: (reads: GuardReads) => reads.once('findmnt-real', async () => {
-      const res = await executor.exec(FINDMNT, FINDMNT_ARGS)
-      return res.exitCode === 0 ? parseFindmnt(res.stdout) : []
+    // cr.60 (review L26): the WHOLE table (a tmpfs or an armed automount at
+    // the path is a mountpoint too — `--real` hid both), read strictly: null
+    // is unreadable, and the collision gate refuses on it.
+    liveMounts: (reads: GuardReads) => reads.once('findmnt', async () => {
+      const text = await readFindmntTable(executor)
+      return text === null ? null : parseFindmnt(text)
     }),
     fstab: (reads: GuardReads) => reads.once('fstab', () => readConfig(fstabPath)),
   }
@@ -1136,9 +1139,10 @@ export async function poolRoutes(
    * The MOUNTPOINT gates (story 3.27, identical to the AHR precedent; gates at
    * both doors since cr.36): `mp` is not already this pool's mountpoint
    * (`self`, the change route only), not a live mount, not claimed in fstab,
-   * and not another dataset's mountpoint. The reads keep their fail-open
-   * shape from 3.27 (a failed read finds no collision); cr.36 only moved them
-   * into the job as well.
+   * and not another dataset's mountpoint. The fstab and dataset reads keep
+   * their fail-open shape from 3.27 (a failed read finds no collision); cr.36
+   * only moved them into the job as well. The live-mount read fails CLOSED
+   * since cr.60 (review L26).
    */
   function mountpointGates<O>(mp: string, self?: string): Gate<O>[] {
     const gates: Gate<O>[] = []
@@ -1153,9 +1157,14 @@ export async function poolRoutes(
     // under its lock before the argv reaches `zpool`.
     gates.push(
       mountTargetGate<O>(mp),
-      async (_object, reads) => (await poolReads.liveMounts(reads)).some(m => m.target === mp)
-        ? { status: 409, code: 'CONFLICT', message: `'${mp}' is already a mountpoint — pick an unused path` }
-        : null,
+      async (_object, reads) => {
+        const live = await poolReads.liveMounts(reads)
+        if (live === null)
+          return { status: 503, code: 'UNAVAILABLE', message: `ANAS could not read the kernel mount table (findmnt), so it cannot check whether '${mp}' is already a mountpoint — nothing was done` }
+        return live.some(m => m.target === mp)
+          ? { status: 409, code: 'CONFLICT', message: `'${mp}' is already a mountpoint — pick an unused path` }
+          : null
+      },
       async (_object, reads) => hasMount(await poolReads.fstab(reads), mp)
         ? { status: 409, code: 'CONFLICT', message: `'${mp}' is already claimed in fstab — pick an unused path` }
         : null,

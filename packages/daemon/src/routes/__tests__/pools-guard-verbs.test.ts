@@ -49,9 +49,10 @@ import { capturedPoolGet } from './pool-guard-reads.js'
  *  - a spare is put to work: `zfs/zpool-status-with-spare.json` (HOT3 AVAIL)
  *    at the request, `zfs/zpool-status-spare-active.json` (HOT3 INUSE) or
  *    the fresh capture (no spare at all) when the job runs. No rewrite.
- *  - a mount appears at the path: `mounts/findmnt-real.json` (only `/`) at the
+ *  - a mount appears at the path: `mounts/findmnt-real.json` (no ahr0) at the
  *    request, the AHR capture `ahr/findmnt-ahr0.json` (`/mnt/anas-ahr/ahr0`)
- *    when the job runs; fstab: `mounts/fstab-stock` then
+ *    when the job runs — both served as `findmnt --json`, the one table the
+ *    collision gate and the system facts read since cr.60; fstab: `mounts/fstab-stock` then
  *    `mounts/fstab-anas-managed` (`/mnt/anas-nfs`). No rewrite.
  *  - another dataset takes the path / the pool already sits there: the
  *    `zfs list -H -o name,mountpoint,mounted` rows built from the captured
@@ -159,7 +160,6 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
   let calls: { command: string, args: string[] }[] = []
   /** What the node answers right now; a test flips these while the job waits. */
   let findmnt = FINDMNT_FULL
-  let findmntReal: string | null = null
   let zpoolStatus = STATUS_FRESH
   let zpoolList: string | null = null
   let guid: string | null = null
@@ -193,7 +193,6 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
   /** The dev mock, its reads routed through the flippable state. */
   async function serve(): Promise<void> {
     findmnt = FINDMNT_FULL
-    findmntReal = null
     zpoolStatus = STATUS_FRESH
     zpoolList = null
     guid = null
@@ -217,8 +216,6 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
       const argv = args.join(' ')
       if (command === FINDMNT && argv === '--json')
         return ok(findmnt)
-      if (command === FINDMNT && argv === '--json --real' && findmntReal !== null)
-        return ok(findmntReal)
       if (command === ZPOOL && argv === 'status -jv')
         return ok(zpoolStatus)
       if (command === ZPOOL && argv === 'list -j' && zpoolList !== null)
@@ -379,14 +376,17 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
 
   it('mountpoint: a live mount appears at the path → CONFLICT, no zfs set', async () => {
     await serve()
-    findmntReal = FINDMNT_REAL_ROOT_ONLY
+    findmnt = FINDMNT_REAL_ROOT_ONLY
     await race(mountpointTo('/mnt/anas-ahr/ahr0'), true, () => {
-      findmntReal = FINDMNT_REAL_AHR0
+      findmnt = FINDMNT_REAL_AHR0
     }, 'CONFLICT', /'\/mnt\/anas-ahr\/ahr0' is already a mountpoint/)
   })
 
   it('mountpoint: fstab claims the path → CONFLICT, no zfs set', async () => {
     await serve()
+    // cr.60: the collision gate reads the whole table, and fails closed — the
+    // AHR capture (`/` and ahr0) is a table where the path is not live.
+    findmnt = FINDMNT_REAL_AHR0
     await race(mountpointTo('/mnt/anas-nfs'), true, async () => {
       await writeFile(fstab(), FSTAB_WITH_NFS)
     }, 'CONFLICT', /already claimed in fstab/)
@@ -452,9 +452,9 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
 
   it('create: a mount appears at its mountpoint before the job → CONFLICT, no zpool create', async () => {
     await serve()
-    findmntReal = FINDMNT_REAL_ROOT_ONLY
+    findmnt = FINDMNT_REAL_ROOT_ONLY
     await race(create({ mountpoint: '/mnt/anas-ahr/ahr0' }), false, () => {
-      findmntReal = FINDMNT_REAL_AHR0
+      findmnt = FINDMNT_REAL_AHR0
     }, 'CONFLICT', /already a mountpoint/)
   })
 

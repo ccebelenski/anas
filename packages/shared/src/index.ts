@@ -40,6 +40,8 @@ export {
 // getmntent(3) reads it, plus the option-token list the OPTIONS column is.
 // See docs/CODE-REVIEW-2026-10-14.md C2 and docs/EPICS.md §2 ruling (i).
 export {
+  CIFS_CREDENTIAL_OPTION_KEYS,
+  cifsCredentialKeyKind,
   escapeFstabField,
   FstabOptionList,
   FstabOptionToken,
@@ -51,6 +53,7 @@ export {
   X_ANAS_DISABLED_TOKEN,
   X_SYSTEMD_AUTOMOUNT_TOKEN,
 } from './formats/fstab.js'
+export type { CifsCredentialKeyKind } from './formats/fstab.js'
 
 // rclone.conf (cr.13, review H3(c)): the option key/value validators that gate
 // every field written into ANAS's own rclone.conf.

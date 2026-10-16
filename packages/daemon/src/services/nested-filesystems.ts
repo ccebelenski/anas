@@ -2,7 +2,7 @@ import type { BackupArchiveKind, BackupIncludeNested, BackupNestedEntry, BackupN
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
 import { effectiveArchiveKind, effectiveIncludeNested, isPathWithin, nestedIncluded } from '@anas/shared'
-import { parseFindmnt } from '../parsers/findmnt.js'
+import { effectiveMounts, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
 import { probeMount } from './mounts.js'
 
 /**
@@ -67,7 +67,6 @@ import { probeMount } from './mounts.js'
 const TRAILING_SLASHES_RE = /\/+$/
 
 const FIND = '/usr/bin/find'
-const FINDMNT = '/usr/bin/findmnt'
 const BTRFS = '/usr/bin/btrfs'
 /** `timeout` binary — the same hang guard the mounts family uses. */
 const TIMEOUT = '/usr/bin/timeout'
@@ -245,22 +244,13 @@ export function parentOf(path: string): string {
 }
 
 /**
- * Pick, for each path, the effective findmnt row: the LAST row for a target wins
- * (a stacked real filesystem over an autofs placeholder — the mounts-family
- * precedence). Rows for `.zfs/snapshot` automounts are dropped outright.
+ * Pick, for each path, the effective findmnt row by the ONE stacked-mount rule
+ * (cr.60, `effectiveMounts` in parsers/findmnt: the top real filesystem; an
+ * autofs placeholder only when nothing real sits there). Rows for
+ * `.zfs/snapshot` automounts are dropped outright.
  */
 export function mountIndex(findmntJson: string): Map<string, FindmntNode> {
-  const byTarget = new Map<string, FindmntNode>()
-  for (const node of parseFindmnt(findmntJson)) {
-    if (isZfsSnapshotMount(node))
-      continue
-    const existing = byTarget.get(node.target)
-    // A real filesystem stacked on an autofs placeholder is the identity.
-    if (existing && node.fstype === 'autofs')
-      continue
-    byTarget.set(node.target, node)
-  }
-  return byTarget
+  return effectiveMounts(parseFindmnt(findmntJson).filter(node => !isZfsSnapshotMount(node)))
 }
 
 /**
@@ -340,14 +330,15 @@ export async function scanNestedFilesystems(
   }
 
   // 1. The mount table (hang-proof).
+  // cr.60 (review L26): a non-zero findmnt (or a wrong shape) is the same
+  // unreadable table as a findmnt that never started — warned, never read as
+  // "nothing mounted".
   let mounts = new Map<string, FindmntNode>()
-  try {
-    const r = await executor.exec(FINDMNT, ['--json'])
-    mounts = mountIndex(r.stdout)
-  }
-  catch (err) {
-    warnings.push(`could not read the mount table: ${errText(err)} — nested filesystems are named as 'unknown'`)
-  }
+  const table = await readFindmntTable(executor)
+  if (table === null)
+    warnings.push('could not read the mount table (findmnt failed or answered in an unknown shape) — nested filesystems are named as \'unknown\'')
+  else
+    mounts = mountIndex(table)
 
   // 1b. A source ROOTED on a remote mount is the whole answer: findmnt already
   // names the root itself, and there is nothing under it to walk. The walk is a

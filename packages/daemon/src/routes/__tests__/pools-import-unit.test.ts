@@ -10,6 +10,7 @@ import { ConfirmStore } from '../../safety/confirm.js'
 import { jobRoutes } from '../jobs.js'
 import { poolRoutes } from '../pools.js'
 import { serveBlankInventoryDisksOn } from './inventory-stub.js'
+import { capturedRootMountTable } from './pool-guard-reads.js'
 
 /**
  * Boot-import unit parity (issue #22). ANAS used to rely on /etc/zfs/zpool.cache
@@ -241,6 +242,8 @@ describe('boot-import unit: destroy disables the unit', () => {
     // cr.23: readable-quiet boot facts — destroy asks them before the confirm
     // gate, and facts gone dark would fail closed.
     ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'tank\t-\n', stderr: '', exitCode: 0 } })
+    // cr.60: the mount table too — on its own, an unreadable one tightens.
+    ex.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: capturedRootMountTable(), stderr: '', exitCode: 0 } })
     ex.addFixture({ command: ZPOOL, args: ['destroy', '--', 'tank'], result: OK })
     ex.addFixture({ command: SYSTEMCTL, args: ['disable', 'zfs-import@tank.service'], result: OK })
 
@@ -258,6 +261,8 @@ describe('boot-import unit: destroy disables the unit', () => {
     // cr.23: readable-quiet boot facts — destroy asks them before the confirm
     // gate, and facts gone dark would fail closed.
     ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'tank\t-\n', stderr: '', exitCode: 0 } })
+    // cr.60: the mount table too — on its own, an unreadable one tightens.
+    ex.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: capturedRootMountTable(), stderr: '', exitCode: 0 } })
     ex.addFixture({ command: ZPOOL, args: ['destroy', '--', 'tank'], result: OK })
     // No systemctl fixture — 127.
 

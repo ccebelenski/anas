@@ -220,6 +220,18 @@ describe('nested filesystems — the scan against the REAL captured node', () =>
     assert.ok(!ex.calls.some(c => c.command.endsWith('/stat')))
   })
 
+  it('cr.60 (L26): a findmnt that exits non-zero is an UNREADABLE table — warned and named `unknown`, never read as "nothing mounted"', async () => {
+    // The captured table rides the failed exit: before cr.60 the scan read
+    // stdout whatever the exit, so this named the boundary from it silently.
+    const ex = new MockExecutor()
+    ex.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: REAL_FINDMNT, stderr: 'findmnt: failed', exitCode: 1 } })
+    ex.addFixture({ command: TIMEOUT, result: ok(REAL_WALK_GTBACKUP) })
+    const scan = await scanNestedFilesystems(ex, '/gtbackup')
+    assert.ok(scan.warnings.some(w => w.startsWith('could not read the mount table')), JSON.stringify(scan.warnings))
+    assert.equal(scan.nested.length, 1)
+    assert.equal(scan.nested[0].kind, 'unknown')
+  })
+
   it('the product-level example: /etc reports /etc/pve (pmxcfs) as NOT included', async () => {
     const ex = makeExecutor(ok(REAL_WALK_ETC))
     const scan = await scanNestedFilesystems(ex, '/etc', { archive: 'etc' })

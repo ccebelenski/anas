@@ -23,8 +23,8 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, wr
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, normalize, resolve } from 'node:path'
-import { MountCifsSec, MountExtraOptions, MountNfsSec, normalizeMountTarget, unescapeFstabField } from '@anas/shared'
-import { classifyKind, isIgnoredMount, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
+import { CIFS_CREDENTIAL_OPTION_KEYS, MountCifsSec, MountExtraOptions, MountNfsSec, normalizeMountTarget, unescapeFstabField } from '@anas/shared'
+import { classifyKind, effectiveMountAt, effectiveMounts, isIgnoredMount, optionsReadOnly, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
 import { cifsAuthToken, getMount, inlineCommentIndex, parseFstab, parseFstabDoc } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
@@ -41,7 +41,6 @@ const TIMEOUT = '/usr/bin/timeout'
 const STAT = 'stat'
 const MOUNT = '/usr/bin/mount'
 const UMOUNT = '/usr/bin/umount'
-const FINDMNT = '/usr/bin/findmnt'
 const SYSTEMD_ESCAPE = '/usr/bin/systemd-escape'
 const SYSTEMCTL = '/usr/bin/systemctl'
 
@@ -95,22 +94,13 @@ export function buildBaseInventory(
   const entryByMount = new Map(entries.map(e => [e.mountpoint, e]))
 
   const byTarget = new Map<string, MountSummary>()
-  for (const node of nodes) {
+  // cr.60 (review L26): the ONE stacked-mount rule (parsers/findmnt) — the
+  // top real filesystem at a target is its row, an autofs placeholder only
+  // when nothing real sits there; a placeholder anywhere in the stack is what
+  // makes the row an automount.
+  const armedAt = new Set(nodes.filter(n => n.fstype === 'autofs').map(n => n.target))
+  for (const node of effectiveMounts(nodes).values()) {
     const isAutofs = node.fstype === 'autofs'
-    const existing = byTarget.get(node.target)
-    if (existing) {
-      // A real fs stacked on an existing autofs placeholder: prefer the real fs.
-      if (!isAutofs) {
-        existing.source = node.source
-        existing.fstype = node.fstype
-        existing.type = classifyKind(node.fstype, node.source)
-        existing.remote = isRemoteKind(existing.type)
-        existing.mounted = true
-        existing.readOnly = optionsReadOnly(node.options)
-        existing.state = 'unknown'
-      }
-      continue
-    }
     const kind = classifyKind(node.fstype, node.source)
     byTarget.set(node.target, {
       mountpoint: node.target,
@@ -121,7 +111,7 @@ export function buildBaseInventory(
       mounted: !isAutofs,
       persistent: false,
       remote: isRemoteKind(kind),
-      automount: isAutofs,
+      automount: armedAt.has(node.target),
       disabled: false,
       pveManaged: false,
       ahrManaged: false,
@@ -395,34 +385,41 @@ export async function collectMountWarnings(
   }
 }
 
-/** `findmnt --json` — the safe backbone. Returns '' on any failure. */
+/**
+ * `findmnt --json` for the DISPLAY readers (inventory, detail, dashboard, the
+ * fail-open source guard) — '' when the table is unreadable (cr.60: a
+ * non-zero exit or a wrong shape included, never its stdout), which those
+ * readers already take as "no live facts". A GATE reads the table through
+ * {@link readFindmntTable} instead, where unreadable is `null` and refuses.
+ */
 export async function readFindmnt(executor: CommandExecutor): Promise<string> {
-  try {
-    const r = await executor.exec(FINDMNT, ['--json'])
-    return r.stdout
-  }
-  catch {
-    return ''
-  }
+  return (await readFindmntTable(executor)) ?? ''
 }
 
 /**
- * The REAL (non-autofs) findmnt node for a mountpoint. An automount target
- * carries a stacked `autofs` placeholder that is never the filesystem itself,
- * so it is skipped here — the caller asking "what is actually mounted, with
- * which options" must not be answered with the placeholder.
+ * The REAL (non-autofs) findmnt node for a mountpoint — the TOP one when
+ * mounts are stacked (cr.60, review L26: this used to answer the BOTTOM row,
+ * so an edit's delivery check read options the kernel was not serving while
+ * the inventory showed the top). An automount target's `autofs` placeholder
+ * is never the filesystem itself, so the caller asking "what is actually
+ * mounted, with which options" is never answered with it.
  */
 export function effectiveMountNode(findmntText: string, mountpoint: string): FindmntNode | undefined {
-  return parseFindmnt(findmntText).find(n => n.target === mountpoint && n.fstype !== 'autofs')
+  return effectiveMountAt(parseFindmnt(findmntText), mountpoint)
 }
 
 /**
  * The LIVE (kernel) option string for a mountpoint, or undefined when nothing is
  * mounted there. The kernel mount table is the only honest answer to "did the
- * change land" — `mount` exits 0 on an already-mounted target.
+ * change land" — `mount` exits 0 on an already-mounted target. An UNREADABLE
+ * table THROWS (cr.60): "could not read" must never read as "nothing mounted",
+ * which sent an edit down the mount-over path and reported it delivered.
  */
 export async function readEffectiveOptions(executor: CommandExecutor, mountpoint: string): Promise<string | undefined> {
-  return effectiveMountNode(await readFindmnt(executor), mountpoint)?.options
+  const text = await readFindmntTable(executor)
+  if (text === null)
+    throw new Error(`The kernel mount table could not be read (findmnt failed), so whether '${mountpoint}' is mounted and with which options is unknown — the /etc/fstab line carries the change; check the live mount on the node`)
+  return effectiveMountNode(text, mountpoint)?.options
 }
 
 /**
@@ -1145,19 +1142,41 @@ function cifsProbeOptions(probe: ProbeMountSpec): string {
 }
 
 /**
+ * Where an UNSAVED test's probe credentials live (cr.60, review L8): anasd's
+ * own runtime directory — tmpfs, root-only, made by the unit's
+ * `ExecStartPre` — never `os.tmpdir()`, where a daemon that died mid-probe
+ * left the plaintext on whatever `/tmp` is. `ANAS_MOUNT_PROBE_RUNTIME_DIR`
+ * points a test at its own directory. There is no fallback: a probe that
+ * cannot make its private directory here refuses rather than writing the
+ * secret anywhere else.
+ */
+export const MOUNT_PROBE_RUNTIME_DIR = '/run/anas'
+
+/** The mkdtemp prefix of an unsaved probe's private credentials directory. */
+export const MOUNT_PROBE_CREDS_PREFIX = 'anas-mount-probe-creds-'
+
+function mountProbeRuntimeDir(): string {
+  return process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR ?? MOUNT_PROBE_RUNTIME_DIR
+}
+
+/**
  * The preflight probe for a test request: build the spec the write path would
- * write (`buildSpec`) and prove it. CIFS credentials ride a temp 0600 file in a
- * private dir (never argv), removed with the dir.
+ * write (`buildSpec`) and prove it. CIFS credentials ride a 0600 file in a
+ * private 0700 dir under the daemon's runtime directory (never argv, never
+ * `/tmp` — cr.60, review L8), removed with the dir on every path out.
  */
 async function probeMountAttempt(executor: CommandExecutor, req: MountTestRequest): Promise<ProbeOutcome> {
   const spec = buildSpec(req.type, req)
   if (req.type === 'nfs' || !req.credentials)
     return probeMountSpec(executor, { type: req.type, spec, ...(req.vers !== undefined ? { vers: req.vers } : {}) })
 
-  const credsDir = await mkdtemp(join(tmpdir(), 'anas-mount-probe-creds-'))
+  const base = mountProbeRuntimeDir()
+  await mkdir(base, { recursive: true, mode: 0o700 })
+  const credsDir = await mkdtemp(join(base, MOUNT_PROBE_CREDS_PREFIX))
   const credentialsFile = join(credsDir, 'probe.cred')
   try {
-    await writeFile(credentialsFile, formatCredentials(req.credentials), { encoding: 'utf8', mode: 0o600 })
+    await chmod(credsDir, 0o700)
+    await writeFile(credentialsFile, formatCredentials(req.credentials), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
     return await probeMountSpec(executor, { type: req.type, spec, ...(req.vers !== undefined ? { vers: req.vers } : {}), credentialsFile })
   }
   finally {
@@ -1271,32 +1290,48 @@ export async function readUnitState(executor: CommandExecutor, mountpoint: strin
 
 /** Placeholder the plaintext password is replaced with in any client-facing string. */
 export const REDACTED_SECRET = '*****'
-/** `password=<value>` up to the next option separator (comma) or whitespace. */
-const INLINE_PASSWORD_RE = /(password=)[^,\s]*/gi
+/**
+ * A SECRET option token — `<key>=<value>` for every secret key of the ONE
+ * shared list (`CIFS_CREDENTIAL_OPTION_KEYS.secret`: `password`, `pass`,
+ * `password2`; cr.60, review M7) — at a token boundary (line start,
+ * whitespace or comma), any case, its value up to the next comma or
+ * whitespace. Built from the list, never a second copy of it; the `=` right
+ * after the key means `password2=` is never read as `password` + `2`.
+ */
+const SECRET_OPTION_RE = new RegExp(
+  `(^|[\\s,])((?:${CIFS_CREDENTIAL_OPTION_KEYS.secret.join('|')})=)[^,\\s]*`,
+  'gi',
+)
 /** Advisory shown when a mount still carries inline plaintext credentials. */
 export const INLINE_CREDS_WARNING
   = 'Credentials are stored inline in /etc/fstab (plaintext); saving migrates them to a protected root-only file.'
+/** Advisory shown when a line carries a secret option ANAS does not migrate (cr.60). */
+export const INLINE_SECRET_OPTION_WARNING
+  = 'A password option ANAS does not migrate (password2=, or a password on a line that is not read as CIFS) is stored inline in /etc/fstab (plaintext). ANAS never shows it and writes it back unchanged when it rewrites the line.'
 
 /**
- * Redact the inline plaintext CIFS password from an fstab line so it can be
- * returned as `MountDetail.fstabLine` without leaking the secret. Replaces the
- * `password=<value>` token with `password=*****`; leaves everything else — incl.
- * `username=` (already surfaced via credentials) — byte-for-byte.
+ * Redact every inline plaintext secret from an fstab line so it can be
+ * returned as `MountDetail.fstabLine` without leaking it: each secret option
+ * of the shared list, in any case (`password=`, `pass=`, `password2=`,
+ * `PASSWORD=`…), keeps its key and has its value replaced with `*****`;
+ * everything else — incl. `username=` (already surfaced via credentials) —
+ * stays byte-for-byte.
  */
 export function redactFstabLine(line: string): string {
-  return line.replace(INLINE_PASSWORD_RE, `$1${REDACTED_SECRET}`)
+  return line.replace(SECRET_OPTION_RE, `$1$2${REDACTED_SECRET}`)
 }
 
 /**
  * A response-safe copy of an entry: the transient `inlineCredentials` channel
- * (which carries the plaintext password) is DROPPED entirely — its information
- * is conveyed instead via `MountDetail.credentials` (presence + username/domain,
- * never the secret) and a warning. Everything else is preserved.
+ * (which carries the plaintext password) and the `secretOptions` tokens are
+ * DROPPED entirely — their information is conveyed instead via
+ * `MountDetail.credentials` (presence + username/domain, never the secret)
+ * and a warning. Everything else is preserved.
  */
 export function entryForResponse(entry: MountEntry): MountEntry {
-  if (!entry.inlineCredentials)
+  if (!entry.inlineCredentials && !entry.secretOptions)
     return entry
-  const { inlineCredentials: _drop, ...rest } = entry
+  const { inlineCredentials: _drop, secretOptions: _secrets, ...rest } = entry
   return rest
 }
 
@@ -1383,6 +1418,8 @@ export async function buildMountDetail(
   if (unit)
     detail.unit = unit
 
+  if (entry?.secretOptions)
+    detail.warnings.push(INLINE_SECRET_OPTION_WARNING)
   if (row.type === 'cifs') {
     if (hasInlineCredentials(entry)) {
       // Inline plaintext credentials found (18.5 anti-pattern): reflect their

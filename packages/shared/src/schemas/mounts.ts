@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { FstabOptionList, fstabOptionTokens, isFstabOptionToken, X_ANAS_DISABLED_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_TOKEN } from '../formats/fstab.js'
+import { cifsCredentialKeyKind, FstabOptionList, fstabOptionTokens, isFstabOptionToken, X_ANAS_DISABLED_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_TOKEN } from '../formats/fstab.js'
 import { AbsolutePath, SingleLine } from './common.js'
 import { IscsiHeldByLun } from './iscsi.js'
 
@@ -302,6 +302,16 @@ export const MountEntry = z.object({
    * Drives one-time migration to the protected creds file on the next save.
    */
   inlineCredentials: MountInlineCredentials.optional(),
+  /**
+   * Hand-written SECRET option tokens ANAS does not migrate (cr.60, review
+   * M7): `password2=…` on a CIFS line (mount.cifs's second password — not
+   * part of the credentials file ANAS writes), and any secret key of the
+   * shared list on a line of another fstype (`smb3`). Verbatim tokens, kept
+   * OUT of `passthrough` so no response carries them, and written back as
+   * they were when ANAS rewrites the line. TRANSIENT, daemon-only — dropped
+   * before any response, like `inlineCredentials`.
+   */
+  secretOptions: z.array(z.string()).optional(),
   dump: z.number().int().nonnegative(),
   pass: z.number().int().nonnegative(),
   /**
@@ -448,27 +458,20 @@ export type MountDetail = z.infer<typeof MountDetail>
 // ---- Requests ----------------------------------------------------------------
 
 /**
- * Option keys that carry an authentication secret to mount.cifs(8) or a mount
- * helper. The API routes ALL credentials through the write-only MountCredentials
- * fields (written to the per-mount 0600 creds file, §2 Secrets); a secret
- * smuggled in as an option token would land on the fstab line itself — visible
- * to every reader and returned verbatim in `passthrough`. `user` is a documented
- * mount.cifs(8) synonym for `username`; `pass` a synonym for `password`;
- * `domain` is part of the credential set.
- */
-const CREDENTIAL_OPTION_KEYS = new Set(['credentials', 'password', 'pass', 'username', 'user', 'domain'])
-
-/**
  * The verbatim extra-options list a mounts request may carry (cr.2, review C2
  * and 0.4.3 retrospective ruling (i)): a strict {@link FstabOptionList} —
  * comma-separated TOKENS, a token being a name of letters/digits/`_ . -`
  * optionally `=value` with no whitespace, `,`, `#`, `"`, `\` or control
- * character — that ADDITIONALLY refuses credential-carrying token KEYS
- * (`credentials`, `password`, `pass`, `username`, `user`, `domain`,
- * case-insensitive, before the `=`): secrets live in the Credentials fields,
- * never in a config line. The READ side stays lenient — a hand-written fstab
- * line carrying one of these still parses (the parser lifts them into its
- * structured credentials channel); this schema gates only what the API WRITES.
+ * character — that ADDITIONALLY refuses every credential-carrying token KEY
+ * of the ONE shared list ({@link CIFS_CREDENTIAL_OPTION_KEYS}, cr.60: the
+ * secrets `password`/`pass`/`password2`, the metadata `username`/`user` and
+ * `domain`/`dom`/`workgroup`, and `credentials`; case-insensitive, before
+ * the `=`): the API routes ALL credentials through the write-only
+ * MountCredentials fields (the per-mount 0600 creds file, §2 Secrets), and a
+ * secret smuggled in as an option token would land on the fstab line itself.
+ * The READ side stays lenient — a hand-written fstab line carrying one of
+ * these still parses (the reader lifts them out of the passthrough by the
+ * same list); this schema gates only what the API WRITES.
  */
 export const MountExtraOptions = FstabOptionList.superRefine((s, ctx) => {
   for (const token of fstabOptionTokens(s)) {
@@ -487,7 +490,7 @@ export const MountExtraOptions = FstabOptionList.superRefine((s, ctx) => {
       })
       return
     }
-    if (CREDENTIAL_OPTION_KEYS.has(key.toLowerCase())) {
+    if (cifsCredentialKeyKind(key) !== null) {
       ctx.addIssue({
         code: 'custom',
         message: `'${token}' carries a credential — secrets go in the Credentials fields, never in the extra option list`,

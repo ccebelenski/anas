@@ -120,6 +120,33 @@ describe('classifyOptions — inline plaintext CIFS credentials (BUG-1 security)
     assert.equal(options.passthrough, '')
   })
 
+  it('cr.60 (M7): every spelling of the shared list lifts the same way — `user=`/`pass=`, any case, `dom=`/`workgroup=`', () => {
+    for (const [u, p, d] of [['user', 'pass', 'dom'], ['USERNAME', 'PASSWORD', 'WORKGROUP'], ['User', 'Pass', 'workgroup']]) {
+      const spelled = tokens.map(t => t.replace(/^username=/, `${u}=`).replace(/^password=/, `${p}=`).replace(/^domain=/, `${d}=`))
+      const { options, inlineCredentials, secretOptions } = classifyOptions('cifs', spelled)
+      assert.deepEqual(inlineCredentials, { username: 'ccebelenski', password: 'Xy#zzy!$', domain: 'CORP' }, spelled.join(','))
+      assert.equal(options.cifs?.domain, 'CORP')
+      assert.equal(options.passthrough, '')
+      assert.equal(secretOptions, undefined)
+    }
+  })
+
+  it('cr.60 (M7): `password2=` is hidden from the passthrough and kept verbatim; a line of another fstype hides its secret too', () => {
+    const withTwo = classifyOptions('cifs', [...tokens, 'password2=R0tate#2'])
+    assert.deepEqual(withTwo.secretOptions, ['password2=R0tate#2'])
+    assert.equal(withTwo.options.passthrough, '')
+    const smb3 = classifyOptions('smb3', tokens)
+    assert.deepEqual(smb3.secretOptions, ['password=Xy#zzy!$'])
+    assert.ok(!smb3.options.passthrough.includes('Xy#zzy'), smb3.options.passthrough)
+    // A bare `user` is mount(8)'s "users may mount" flag — never a username.
+    assert.equal(classifyOptions('cifs', ['user', 'vers=3.0']).options.passthrough, 'user')
+  })
+
+  it('cr.60 (M7): a rewritten line writes `password2=` back unchanged', () => {
+    const entry = parseFstab(`//10.0.0.114/chiap2 /m cifs ${[...tokens, 'password2=R0tate#2'].join(',')} 0 0\n`)[0]
+    assert.ok(serializeMountLine(entry).includes('password2=R0tate#2'), serializeMountLine(entry))
+  })
+
   it('options AFTER a `#`-bearing password are still parsed (no mid-field comment truncation)', () => {
     const { options } = classifyOptions('cifs', tokens)
     assert.equal(options.cifs?.uid, 1000)

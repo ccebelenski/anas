@@ -291,6 +291,21 @@ describe('mount routes (Epic 18)', () => {
       assert.equal(await readFile(fstabPath, 'utf8'), before)
     })
 
+    it('cr.60 (M7): the shared list refuses `password2=`, `dom=` and `workgroup=` in extraOptions at the route too', async () => {
+      const before = await readFile(fstabPath, 'utf8')
+      for (const extraOptions of ['vers=3.0,password2=r0tate', 'dom=CORP', 'WORKGROUP=CORP']) {
+        const res = await server!.inject({
+          method: 'POST',
+          url: '/v1/mounts',
+          headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+          payload: JSON.stringify({ type: 'cifs', server: '127.0.0.1', remotePath: 'share', mountpoint: join(dir, 'cred-inj2'), extraOptions, credentials: { username: 'smbuser', password: 's3cret' } }),
+        })
+        assert.equal(res.statusCode, 400, extraOptions)
+        assert.match((res.json() as { error: { message: string } }).error.message, /carries a credential/, extraOptions)
+      }
+      assert.equal(await readFile(fstabPath, 'utf8'), before)
+    })
+
     it('accepted extraOptions are written verbatim as tokens', async () => {
       const mountpoint = join(dir, 'tokmnt')
       const res = await server!.inject({
@@ -781,6 +796,54 @@ describe('mount routes (Epic 18)', () => {
       const g = await server!.inject({ method: 'GET', url: `/v1/mounts/${enc(INLINE_MP)}`, headers: IDENTITY_HEADERS })
       assert.ok(!g.payload.includes(PASSWORD))
     })
+
+    // cr.60 (review M7): every spelling of the ONE shared credential-key list,
+    // in any case, over the same captured BUG-1 line — `pass=` and `user=`
+    // (mount.cifs(8) synonyms), upper case, `password2=`, and the secret on a
+    // line of another fstype (`smb3`). The plaintext appears NOWHERE in the
+    // GET body — not in `fstabLine`, not in `configuredOptions.passthrough`.
+    const SPELLINGS: Array<{ name: string, line: string, secret: string, redacted: string }> = [
+      { name: 'user= / pass= (the review probe)', line: INLINE_LINE.replace('username=', 'user=').replace('password=', 'pass='), secret: PASSWORD, redacted: 'pass=*****' },
+      { name: 'USERNAME= / PASSWORD= (upper case)', line: INLINE_LINE.replace('username=', 'USERNAME=').replace('password=', 'PASSWORD='), secret: PASSWORD, redacted: 'PASSWORD=*****' },
+      { name: 'password2= (the rotation password)', line: INLINE_LINE.replace(',uid=1000', ',password2=R0tate#2,uid=1000'), secret: 'R0tate#2', redacted: 'password2=*****' },
+      { name: 'password= on an smb3 line', line: INLINE_LINE.replace(' cifs ', ' smb3 '), secret: PASSWORD, redacted: 'password=*****' },
+    ]
+    for (const s of SPELLINGS) {
+      it(`cr.60: GET never returns the secret in plain text — ${s.name}`, async () => {
+        await writeFile(fstabPath, FSTAB_FIXTURE + s.line)
+        const res = await server!.inject({ method: 'GET', url: `/v1/mounts/${enc(INLINE_MP)}`, headers: IDENTITY_HEADERS })
+        assert.equal(res.statusCode, 200, res.payload)
+        assert.ok(!res.payload.includes(s.secret), `the secret appears nowhere in the body: ${res.payload}`)
+        const { data } = res.json() as { data: MountDetail }
+        assert.ok(data.fstabLine?.includes(s.redacted), data.fstabLine)
+        // No secret key rides the passthrough (a username is metadata: on a line
+        // ANAS does not read as CIFS it stays there).
+        assert.ok(!/pass/i.test(data.configuredOptions?.passthrough ?? ''), data.configuredOptions?.passthrough)
+      })
+    }
+
+    it('cr.60: `user=` is the username — the credentials section shows it, never the password', async () => {
+      await writeFile(fstabPath, FSTAB_FIXTURE + SPELLINGS[0].line)
+      const res = await server!.inject({ method: 'GET', url: `/v1/mounts/${enc(INLINE_MP)}`, headers: IDENTITY_HEADERS })
+      const { data } = res.json() as { data: MountDetail }
+      assert.equal(data.credentials?.set, true)
+      assert.equal(data.credentials?.username, 'ccebelenski')
+    })
+
+    it('cr.60: a save migrates `pass=` like `password=`, and writes `password2=` back unchanged', async () => {
+      await writeFile(fstabPath, FSTAB_FIXTURE + SPELLINGS[2].line.replace('username=', 'user=').replace('password=', 'pass='))
+      const res = await server!.inject({ method: 'PUT', url: `/v1/mounts/${enc(INLINE_MP)}`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ options: { ro: true } }) })
+      assert.equal(res.statusCode, 202, res.payload)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(INLINE_MP))!
+      assert.ok(line.includes('credentials='), line)
+      assert.ok(!line.includes(`pass=${PASSWORD}`) && !line.includes('user='), line)
+      assert.ok(line.includes('password2=R0tate#2'), `the rotation password stays on the line: ${line}`)
+      const creds = await readFile(join(dir, 'creds', credsFileName(INLINE_MP)), 'utf8')
+      assert.ok(creds.includes(`password=${PASSWORD}`), creds)
+      assert.ok(creds.includes('username=ccebelenski'), creds)
+    })
   })
 
   describe('POST /v1/mounts/:mountpoint/state — disable / enable (cr.6 option form)', () => {
@@ -1161,12 +1224,42 @@ describe('mount routes — POST /v1/mounts/test reaches the mount stage (seam)',
       resolves: async () => true,
       tcpReachable: async () => true,
     })
+    // cr.60 (L8): the probe credentials go under the daemon's runtime dir —
+    // a private stand-in for /run/anas, inside the harness directory.
+    process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR = join(h.dir, 'run', 'anas')
   })
 
   afterEach(async () => {
+    delete process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR
     await h?.app.close()
     await rm(h!.dir, { recursive: true, force: true })
     h = undefined
+  })
+
+  it('cr.60 (L8): an unsaved CIFS test writes its probe credentials under the runtime dir, never os.tmpdir(), and removes them', async () => {
+    const runtime = process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR!
+    let during: { path: string, mode: number } | undefined
+    const orig = h!.executor.exec.bind(h!.executor)
+    h!.executor.exec = async (command, args, opts) => {
+      if (command === TIMEOUT) {
+        const path = /credentials=([^,]+)$/.exec(args[5])![1]
+        during = { path, mode: (await stat(path)).mode & 0o777 }
+        return { stdout: '', stderr: '', exitCode: 0 }
+      }
+      return orig(command, args, opts)
+    }
+    const res = await h!.app.inject({
+      method: 'POST',
+      url: '/v1/mounts/test',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ type: 'cifs', server: '127.0.0.1', remotePath: 'pictures', credentials: { username: 'u', password: 'p' } }),
+    })
+    assert.equal(res.statusCode, 200, res.payload)
+    assert.equal((res.json() as { data: { verdict: string } }).data.verdict, 'ok')
+    assert.ok(during, 'the probe ran')
+    assert.ok(during.path.startsWith(`${runtime}/anas-mount-probe-creds-`), during.path)
+    assert.equal(during.mode, 0o600)
+    assert.deepEqual(await readdir(runtime), [], 'removed after the probe')
   })
 
   it('EINVAL / "Malformed UNC" comes back `invalid` — never `unreachable`', async () => {

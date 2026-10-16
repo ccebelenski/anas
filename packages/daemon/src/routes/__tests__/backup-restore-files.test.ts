@@ -563,6 +563,20 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     assert.equal(restoreRan(), false)
   })
 
+  it('cr.60 (from cr.54): refuses a restore into a CT rootfs under local-zfs — a zfspool with no `mountpoint` claims /<pool dataset>', async () => {
+    // The installer's local-zfs stanza: `pool rpool/data`, NO mountpoint key.
+    // Before cr.60 the territory reader saw no path at all for it, and an
+    // in-place restore into a container's rootfs passed the gate.
+    await writeFile(join(dir, 'storage.cfg'), readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/pve/storage-zfsroot.cfg'), 'utf8'))
+    const res = await post(body({ task: undefined, target: { mode: 'inPlace', path: '/rpool/data/subvol-100-disk-0/root' } }))
+    assert.equal(res.statusCode, 409, res.body)
+    const err = (res.json() as { error: { code: string, reason: string, message: string } }).error
+    assert.equal(err.code, 'PVE_MANAGED')
+    assert.equal(err.reason, 'pve-managed')
+    assert.match(err.message, /inside '\/rpool\/data', a path Proxmox's storage\.cfg claims/)
+    assert.equal(restoreRan(), false)
+  })
+
   it('refuses a selection this archive does not hold — a silent success is worse (GT-24)', async () => {
     const mock = mockOf(server)
     mock.addFixture({

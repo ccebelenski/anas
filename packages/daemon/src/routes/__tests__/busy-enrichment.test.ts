@@ -13,6 +13,7 @@ import { changeAhrMountpoint } from '../../services/ahr-create.js'
 import { rollbackAhrSnapshot } from '../../services/ahr-snapshots.js'
 import { jobRoutes } from '../jobs.js'
 import { poolRoutes } from '../pools.js'
+import { capturedRootMountTable } from './pool-guard-reads.js'
 
 /**
  * Busy-unmount root-cause enrichment (story 3.29) at the route/job level — one
@@ -90,6 +91,8 @@ describe('3.29 — ZFS pool destroy job surfaces the holding processes', () => {
     // negotiated. Readable-quiet (bootfs unset) — unseeded facts go dark and
     // dark fails closed; this test's world is a busy destroy, not a gate.
     executor.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
+    // cr.60 (L24): and a readable mount table — dark, it now tightens on its own.
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: capturedRootMountTable(), stderr: '', exitCode: 0 } })
     // The destroy fails busy — the exact pve5 error shape (names its own path).
     executor.addFixture({
       command: '/usr/sbin/zpool',

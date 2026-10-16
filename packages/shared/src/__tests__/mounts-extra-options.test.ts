@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { CIFS_CREDENTIAL_OPTION_KEYS } from '../formats/fstab.js'
 import { CreateMountRequest, MountExtraOptions, UpdateMountRequest } from '../schemas/mounts.js'
 
 /**
@@ -34,6 +35,17 @@ describe('MountExtraOptions — token list + credential refusal', () => {
     const bad = MountExtraOptions.safeParse('credentials=/etc/foo')
     assert.ok(!bad.success)
     assert.match(bad.error.issues[0].message, /Credentials fields/)
+  })
+
+  it('cr.60 (M7): refuses EVERY key of the one shared credential list — password2, dom, workgroup too — in any case', () => {
+    for (const kind of Object.keys(CIFS_CREDENTIAL_OPTION_KEYS) as Array<keyof typeof CIFS_CREDENTIAL_OPTION_KEYS>) {
+      for (const key of CIFS_CREDENTIAL_OPTION_KEYS[kind]) {
+        for (const spelled of [key, key.toUpperCase()])
+          assert.equal(MountExtraOptions.safeParse(`vers=3.0,${spelled}=x`).success, false, `${kind}: ${spelled}`)
+      }
+    }
+    for (const s of ['password2=r0tate', 'dom=CORP', 'workgroup=CORP', 'PASSWORD2=r0tate'])
+      assert.match((MountExtraOptions.safeParse(s) as { error: { issues: Array<{ message: string }> } }).error.issues[0].message, /carries a credential/, s)
   })
 
   it('allows the safe near-misses: `users`, `nouser`, `noexec` stay valid', () => {

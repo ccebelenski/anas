@@ -10,9 +10,9 @@ import type { MountTestStages } from '../services/mounts.js'
 import { mkdir, readdir } from 'node:fs/promises'
 import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, UpdateMountRequest } from '@anas/shared'
 import { CommandTimeoutError } from '../executor/deadline.js'
-import { classifyKind, parseFindmnt } from '../parsers/findmnt.js'
+import { classifyKind, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
 import { addMount, carriesAutomount, cifsAuthToken, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
-import { readPveMountPaths, readZfsMountpoints } from '../parsers/pve-storage.js'
+import { PVE_STORAGE_CFG, readPveMountPaths, readPveMountPathsStrict, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, sendRefusal } from '../safety/guard.js'
 import { diagnoseBusyPath, enrichBusyError, formatHolders, runFuser, toolNotFound } from '../services/busy-diagnosis.js'
@@ -51,6 +51,7 @@ import {
   writeCredentialsFile,
 } from '../services/mounts.js'
 import { mountReferenceWarning, mountUnreadableWarning, poolReferenceKey, readMountReferences } from '../services/pool-references.js'
+import { ownershipRefusal } from '../services/pve-footprint.js'
 import { zodIssue } from '../validation.js'
 import { requireIdentity } from './identity.js'
 
@@ -137,6 +138,8 @@ interface MountObject {
   /** The kernel mount table lists the mountpoint (an armed automount alone is not "mounted"). */
   mounted: boolean
   live: LiveAtTarget
+  /** The mount table could not be read (cr.60): `mounted`/`live` say nothing, and the table gate refuses. */
+  tableUnreadable: boolean
 }
 
 /** What a create acts on: the mountpoint slot, and the fstab as it is now. */
@@ -165,9 +168,14 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
 
   /** The per-run reads the mount gates share (one per guard run, never across doors). */
   const mountReads = {
-    findmnt: (reads: GuardReads) => reads.once('findmnt', () => readFindmnt(executor)),
+    // cr.60 (review L26): the gates read the table STRICTLY — `null` is
+    // unreadable (a findmnt that failed, exited non-zero or answered in an
+    // unknown shape), never "nothing mounted".
+    findmnt: (reads: GuardReads) => reads.once('findmnt', () => readFindmntTable(executor)),
     fstab: (reads: GuardReads) => reads.once('fstab', () => readConfig(fstabPath)),
-    pvePaths: (reads: GuardReads) => reads.once('pve-mount-paths', () => readPveMountPaths(storagePath)),
+    // cr.60 (from cr.54's report): the STRICT reader — an unreadable
+    // storage.cfg is null, and the PVE gates refuse on it (never an empty map).
+    pvePaths: (reads: GuardReads) => reads.once('pve-mount-paths', () => readPveMountPathsStrict(storagePath ?? PVE_STORAGE_CFG)),
     ahrSpecs: (reads: GuardReads) => reads.once('ahr-specs', () => readAhrSpecs()),
     claims: (reads: GuardReads) => reads.once('iscsi-claims', async () => createIscsiClaimCache(executor, iscsiPaths)),
   }
@@ -179,18 +187,50 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       mountpoint,
       fstabText,
       entry: getMount(fstabText, mountpoint),
-      mounted: mountedIn(findmntText, mountpoint),
-      live: liveAtTarget(parseFindmnt(findmntText), mountpoint),
+      mounted: mountedIn(findmntText ?? '', mountpoint),
+      live: liveAtTarget(parseFindmnt(findmntText ?? ''), mountpoint),
+      tableUnreadable: findmntText === null,
     }
   }
 
   // --- the gates (each one function, run by both doors) -------------------
 
+  /**
+   * cr.60 (review L26): every verb that acts on the TARGET decides on the live
+   * mount table (mounted?, what is mounted, the foreign-mount check). When it
+   * cannot be read nothing is known about the target, so the verb refuses —
+   * at the route and again in the job — instead of reading "nothing mounted".
+   */
+  const tableGate: Gate<MountObject> = async o => o.tableUnreadable
+    ? { status: 503, code: 'UNAVAILABLE', message: `ANAS could not read the kernel mount table (findmnt), so it cannot check what is mounted at '${o.mountpoint}' — nothing was done` }
+    : null
+
   /** Reject a mutation on a PVE-owned mount (hands-off). */
   const pveGate: Gate<MountObject> = async (o, reads) => {
-    if (!mountpointReservedByPve(o.mountpoint) && !pveStorageFor(o.mountpoint, await mountReads.pvePaths(reads)))
-      return null
-    return { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${o.mountpoint}' is PVE-owned (hands-off) and cannot be modified by ANAS` }
+    if (mountpointReservedByPve(o.mountpoint))
+      return pveOwnedRefusal(o.mountpoint)
+    const paths = await mountReads.pvePaths(reads)
+    if (paths === null)
+      return pveConfigUnreadable(o.mountpoint)
+    return pveStorageFor(o.mountpoint, paths) ? pveOwnedRefusal(o.mountpoint) : null
+  }
+
+  function pveOwnedRefusal(mountpoint: string): Refusal {
+    return { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${mountpoint}' is PVE-owned (hands-off) and cannot be modified by ANAS` }
+  }
+
+  /**
+   * An unreadable storage.cfg (cr.60, from cr.54's report) is cr.47(b)'s
+   * `config-unreadable` verdict — the daemon cannot see whether the path is
+   * PVE's, so the verb refuses (400, the fact every other territory door
+   * states), never "no PVE storage here". The fixed PVE paths are answered
+   * before it: they need no file.
+   */
+  function pveConfigUnreadable(mountpoint: string): Refusal {
+    return ownershipRefusal({
+      kind: 'config-unreadable',
+      reason: `PVE storage configuration is unreadable (${storagePath ?? PVE_STORAGE_CFG}) — '${mountpoint}' cannot be checked against the paths PVE storage claims, so the change is refused until it can be read`,
+    })
   }
 
   /**
@@ -206,7 +246,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const ahrSpecs = await mountReads.ahrSpecs(reads)
     if (ahrSpecs.size === 0)
       return null
-    const row = buildBaseInventory(await mountReads.findmnt(reads), o.fstabText, new Map(), ahrSpecs).find(r => r.mountpoint === o.mountpoint)
+    const row = buildBaseInventory((await mountReads.findmnt(reads)) ?? '', o.fstabText, new Map(), ahrSpecs).find(r => r.mountpoint === o.mountpoint)
     if (!row?.ahrManaged)
       return null
     return { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${o.mountpoint}' is an ANAS Hybrid RAID (AHR) pool — manage it from the Hybrid RAID view, not the Mounts feature` }
@@ -221,7 +261,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
   const remoteGate: Gate<MountObject> = async (o, reads) => {
     let kind: string | undefined = o.entry ? classifyKind(o.entry.fstype, o.entry.spec) : undefined
     if (kind === undefined)
-      kind = buildBaseInventory(await mountReads.findmnt(reads), '', new Map()).find(r => r.mountpoint === o.mountpoint)?.type
+      kind = buildBaseInventory((await mountReads.findmnt(reads)) ?? '', '', new Map()).find(r => r.mountpoint === o.mountpoint)?.type
     if (kind === undefined || isRemoteKind(kind))
       return null
     return { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${o.mountpoint}' is not an ANAS-managed filesystem — ANAS manages remote (NFS/CIFS) shares only` }
@@ -284,6 +324,9 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
   function mountGates(mp: string, verb: MountVerb): Gate<MountObject>[] {
     const verbing = VERBING[verb]
     const gates: Gate<MountObject>[] = [pveGate, ahrGate]
+    // Enable touches fstab alone; every other verb decides on the live table.
+    if (verb !== 'enable')
+      gates.push(tableGate)
     if (verb === 'update')
       gates.push(stateGate(o => !!o.entry, { status: 404, code: 'NOT_FOUND', message: `Mount '${mp}' is not in /etc/fstab` }))
     if (verb === 'remove')
@@ -412,9 +455,14 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         // sets a mountpoint — the mount takes the 409 with the shared code and
         // sentence, and the job re-runs the gate under its lock.
         async s => mountTargetRefusal(s.mountpoint),
-        async (s, reads) => pveStorageFor(s.mountpoint, await mountReads.pvePaths(reads))
-          ? { status: 400, code: 'VALIDATION_ERROR', message: `Mountpoint '${s.mountpoint}' belongs to a PVE storage (hands-off)` }
-          : null,
+        async (s, reads) => {
+          const paths = await mountReads.pvePaths(reads)
+          if (paths === null)
+            return pveConfigUnreadable(s.mountpoint)
+          return pveStorageFor(s.mountpoint, paths)
+            ? { status: 400, code: 'VALIDATION_ERROR', message: `Mountpoint '${s.mountpoint}' belongs to a PVE storage (hands-off)` }
+            : null
+        },
         // pvepool.1 review fix 1: the mountpoint list is three-valued — absent
         // `zfs` ([]) fails open, an UNREADABLE answer (null) tightens: "could
         // not check" never gets to read as "nothing there".

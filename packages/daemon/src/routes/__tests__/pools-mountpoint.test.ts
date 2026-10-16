@@ -7,6 +7,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
+import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
 import { serveBlankInventoryDisks } from './inventory-stub.js'
 
@@ -44,6 +45,17 @@ function spyExecutor(server: ReturnType<typeof createServer>): Array<{ command: 
     return orig(command, args)
   }
   return calls
+}
+
+/**
+ * The live mount at `/mnt/anas-ahr/ahr0`: the AHR capture
+ * (`ahr/findmnt-ahr0.json`) served as `findmnt --json` — the one table the
+ * collision gate reads since cr.60 (it read `--json --real` before, which
+ * the mock answered with that same capture).
+ */
+function serveLiveAhr0(server: ReturnType<typeof createServer>): void {
+  const mock = (server as unknown as { executor: MockExecutor }).executor
+  mock.prependFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: mockFixtures.ahrFindmnt() })
 }
 
 function createCall(calls: Array<{ command: string, args: string[] }>): string[] | undefined {
@@ -137,6 +149,7 @@ describe('create pool: mountpoint override (3.27)', () => {
 
   it('rejects a mountpoint already serving a live mount with 409', async () => {
     server = createServer({ mock: true, logger: false })
+    serveLiveAhr0(server)
     const calls = spyExecutor(server)
     // The AHR findmnt fixture mounts /mnt/anas-ahr/ahr0 — a live-mount collision.
     const res = await server.inject({
@@ -251,6 +264,7 @@ describe('change pool mountpoint: PUT /v1/pools/:name/mountpoint (3.27)', () => 
 
   it('`/mnt/anas-ahr//ahr0` meets the live mount at `/mnt/anas-ahr/ahr0` — 409, never a zfs set', async () => {
     server = createServer({ mock: true, logger: false })
+    serveLiveAhr0(server)
     const calls = spyExecutor(server)
     const res = await server.inject({
       method: 'PUT',
@@ -302,6 +316,7 @@ describe('change pool mountpoint: PUT /v1/pools/:name/mountpoint (3.27)', () => 
 
   it('409 when the target collides with a live mount', async () => {
     server = createServer({ mock: true, logger: false })
+    serveLiveAhr0(server)
     const res = await server.inject({
       method: 'PUT',
       url: '/v1/pools/testpool/mountpoint',

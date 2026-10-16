@@ -8,8 +8,10 @@ import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
+import { parseFindmnt } from '../../parsers/findmnt.js'
 import { disableMount } from '../../parsers/fstab.js'
 import { parsePveMountPaths } from '../../parsers/pve-storage.js'
+import { liveAtTarget } from '../mount-match.js'
 import {
   ahrPinnedSpecs,
   applyMountDefaults,
@@ -18,6 +20,7 @@ import {
   buildSpec,
   classifyStatHealth,
   credsFileName,
+  effectiveMountNode,
   entryForResponse,
   formatCredentials,
   fstabLineFor,
@@ -38,12 +41,40 @@ import {
   SYSTEM_MOUNT_TARGETS,
   writeCredentialsFile,
 } from '../mounts.js'
+import { mountIndex } from '../nested-filesystems.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/mounts')
 function loadFixture(name: string): string {
   return readFileSync(join(fixturesDir, name), 'utf-8')
 }
+
+// --- cr.60 (review L26): the mount-family readers agree on stacked mounts ---
+
+describe('cr.60 — every mount-family reader answers the TOP of a stack', () => {
+  // Built from the captured `findmnt --json /mnt/anas-nfs` row: the same row
+  // with `ro` stacked over it as its child (findmnt-full.json's stacked shape).
+  const row = (JSON.parse(loadFixture('findmnt-nfs.json')) as { filesystems: Array<Record<string, string>> }).filesystems[0]
+  const top = { ...row, options: row.options.replace(/^rw,/, 'ro,') }
+  const stacked = JSON.stringify({ filesystems: [{ ...row, children: [top] }] })
+
+  it('inventory, effective options, the nested index and the live-match all read the `ro` top row', () => {
+    const inv = buildBaseInventory(stacked, '', new Map()).find(r => r.mountpoint === '/mnt/anas-nfs')!
+    assert.equal(inv.readOnly, true)
+    // Before cr.60 this answered the BOTTOM (rw) row while the list showed the top.
+    assert.ok(effectiveMountNode(stacked, '/mnt/anas-nfs')!.options.startsWith('ro,'))
+    assert.ok(mountIndex(stacked).get('/mnt/anas-nfs')!.options.startsWith('ro,'))
+    assert.ok(liveAtTarget(parseFindmnt(stacked), '/mnt/anas-nfs').real!.options.startsWith('ro,'))
+  })
+
+  it('a real mount over the captured automount placeholder: one row, mounted, still an automount', () => {
+    const inv = buildBaseInventory(loadFixture('findmnt-automount-mounted.json'), '', new Map())
+    assert.equal(inv.length, 1)
+    assert.equal(inv[0].fstype, 'nfs4')
+    assert.equal(inv[0].mounted, true)
+    assert.equal(inv[0].automount, true)
+  })
+})
 
 // --- Inventory building (findmnt + fstab + storage.cfg PVE tagging) ----------
 
@@ -493,6 +524,18 @@ describe('runMountTest — probe stages (TEST SEAM)', () => {
     assert.equal(probe.args[6], '//10.0.0.212/pictures')
   })
 
+  // cr.60 (review L8): the probe credentials live under the daemon's runtime
+  // directory (here a private stand-in for /run/anas), never os.tmpdir().
+  let runtimeDir: string
+  beforeEach(async () => {
+    runtimeDir = await mkdtemp(join(tmpdir(), 'anas-cr60-run-'))
+    process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR = join(runtimeDir, 'run', 'anas')
+  })
+  afterEach(async () => {
+    delete process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR
+    await rm(runtimeDir, { recursive: true, force: true })
+  })
+
   it('a credentials probe authenticates from a temp file (no guest); EACCES → auth-failed with its advice', async () => {
     const exec = new MockExecutor()
     exec.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: 'mount error(13): Permission denied\n', exitCode: 32 } })
@@ -502,6 +545,36 @@ describe('runMountTest — probe stages (TEST SEAM)', () => {
     const probe = exec.calls.find(c => c.command === TIMEOUT)!
     assert.match(probe.args[5], /^vers=3\.1\.1,credentials=\/.+probe\.cred$/)
     assert.ok(!probe.args[5].includes('guest'))
+  })
+
+  it('cr.60 (L8): the probe credentials are a 0600 file in a 0700 dir under the runtime dir — removed on success, failure and a throw', async () => {
+    const base = process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR!
+    for (const outcome of ['ok', 'auth-failed', 'throws'] as const) {
+      const exec = new MockExecutor()
+      const seen: Array<{ file: string, fileMode: number, dirMode: number, content: string }> = []
+      const orig = exec.exec.bind(exec)
+      exec.exec = async (command, args, opts) => {
+        if (command === TIMEOUT) {
+          const file = /credentials=([^,]+)$/.exec(args[5])![1]
+          seen.push({ file, fileMode: (await stat(file)).mode & 0o777, dirMode: (await stat(dirname(file))).mode & 0o777, content: await readFile(file, 'utf8') })
+          if (outcome === 'throws')
+            throw new Error('spawn /usr/bin/timeout ENOENT')
+          return outcome === 'ok' ? { stdout: '', stderr: '', exitCode: 0 } : { stdout: '', stderr: 'mount error(13): Permission denied\n', exitCode: 32 }
+        }
+        return orig(command, args, opts)
+      }
+      const run = runMountTest(exec, { type: 'cifs', server: 'nas', remotePath: 'media', credentials: { username: 'u', password: 'Pr0be-secret' } }, STAGES)
+      if (outcome === 'throws')
+        await assert.rejects(run)
+      else
+        await run
+      assert.equal(seen.length, 1, outcome)
+      assert.ok(seen[0].file.startsWith(`${base}/anas-mount-probe-creds-`), `${outcome}: ${seen[0].file} is under the runtime dir`)
+      assert.equal(seen[0].fileMode, 0o600, outcome)
+      assert.equal(seen[0].dirMode, 0o700, outcome)
+      assert.ok(seen[0].content.includes('password=Pr0be-secret'), outcome)
+      assert.deepEqual(await readdir(base), [], `${outcome}: nothing left behind`)
+    }
   })
 })
 
@@ -704,6 +777,25 @@ describe('inline-credential redaction (SECURITY — secret never crosses the bou
     // Everything else — incl. username and the options past the password — is kept.
     assert.ok(redacted.includes('username=ccebelenski'))
     assert.ok(redacted.includes('uid=1000,gid=100'))
+  })
+
+  it('cr.60 (M7): redactFstabLine masks EVERY secret key of the shared list, in any case, at a token boundary only', () => {
+    for (const [spelled, masked] of [
+      [line.replace('password=', 'pass='), 'pass=*****'],
+      [line.replace('password=', 'PASSWORD='), 'PASSWORD=*****'],
+      [line.replace('password=', 'Pass='), 'Pass=*****'],
+    ] as const) {
+      const redacted = redactFstabLine(spelled)
+      assert.ok(!redacted.includes('Xy#zzy'), redacted)
+      assert.ok(redacted.includes(masked), redacted)
+      assert.ok(redacted.includes('uid=1000,gid=100'), redacted)
+    }
+    // password2 keeps its own key (never read as `password` + `2…`).
+    const two = redactFstabLine(line.replace(',uid=', ',password2=R0tate,uid='))
+    assert.ok(two.includes('password2=*****') && !two.includes('R0tate'), two)
+    // A key that merely ENDS in a secret name is not a credential.
+    const nearMiss = '//h/s /m cifs nopass=1,xpassword=keep,vers=3.0 0 0'
+    assert.equal(redactFstabLine(nearMiss), nearMiss)
   })
 
   it('redactFstabLine is a no-op on a secure (credentials=file) line', () => {

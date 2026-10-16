@@ -1,5 +1,5 @@
 import type { MountCifsOptions, MountCommonOptions, MountEntry, MountInlineCredentials, MountNfsOptions, MountOptions } from '@anas/shared'
-import { escapeFstabField, MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec, unescapeFstabField, X_ANAS_DISABLED_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_KEPT_TOKEN, X_ANAS_DISABLED_TOKEN, X_SYSTEMD_AUTOMOUNT_TOKEN } from '@anas/shared'
+import { cifsCredentialKeyKind, escapeFstabField, MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec, unescapeFstabField, X_ANAS_DISABLED_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_KEPT_TOKEN, X_ANAS_DISABLED_TOKEN, X_SYSTEMD_AUTOMOUNT_TOKEN } from '@anas/shared'
 
 /** Recognized enum-value sets, mirrored from the shared schema (never drift). */
 const CIFS_CACHE_VALUES = new Set<string>(MountCifsCache.options)
@@ -572,7 +572,7 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
     return null
 
   const tokens = optStr.split(',').map(o => o.trim()).filter(Boolean)
-  const { options, credentialsFile, inlineCredentials, disable, parkedAutomount } = classifyOptions(fstype, tokens)
+  const { options, credentialsFile, inlineCredentials, disable, parkedAutomount, secretOptions } = classifyOptions(fstype, tokens)
 
   const entry: MountEntry = {
     spec,
@@ -586,6 +586,8 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
     entry.credentialsFile = credentialsFile
   if (inlineCredentials !== undefined)
     entry.inlineCredentials = inlineCredentials
+  if (secretOptions !== undefined)
+    entry.secretOptions = secretOptions
   // The option-form disable: carried by the line's own tokens, so a disabled
   // entry is `disabled: true` exactly like a legacy `#ANAS ` one.
   if (disable)
@@ -614,7 +616,7 @@ function isNfs(fstype: string): boolean {
 export function classifyOptions(
   fstype: string,
   tokens: string[],
-): { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto', parkedAutomount?: true } {
+): { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto', parkedAutomount?: true, secretOptions?: string[] } {
   const common: MountCommonOptions = {
     readOnly: false,
     nofail: false,
@@ -631,6 +633,8 @@ export function classifyOptions(
   const passthrough: string[] = []
   let credentialsFile: string | undefined
   const inline: MountInlineCredentials = {}
+  /** Hand-written secret tokens kept verbatim, never passthrough (cr.60). */
+  const secretOptions: string[] = []
   const nfsFs = isNfs(fstype)
   const cifsFs = fstype === 'cifs'
   /** How (if at all) the line is disabled: the form of its `x-anas.disabled` token. */
@@ -665,6 +669,17 @@ export function classifyOptions(
       continue
     }
 
+    // --- credential tokens (cr.60, review M7): the ONE shared, case-insensitive
+    // list. A credential is `key=value` — a bare `user` is mount(8)'s own
+    // "users may mount" flag, never a username. A SECRET never rides the
+    // passthrough a response carries, whatever the fstype: on a line ANAS
+    // does not read as CIFS (`smb3`, …) it is kept verbatim in secretOptions.
+    const credKind = cifsCredentialKeyKind(key)
+    if (credKind === 'secret' && eq !== -1 && !cifsFs) {
+      secretOptions.push(token)
+      continue
+    }
+
     // --- common (any fstype) ---
     if (applyCommonToken(common, token, key, value, passthrough))
       continue
@@ -675,7 +690,7 @@ export function classifyOptions(
 
     // --- CIFS tier ---
     if (cifsFs) {
-      if (key === 'credentials') {
+      if (credKind === 'file') {
         credentialsFile = value
         continue
       }
@@ -685,26 +700,37 @@ export function classifyOptions(
       // never parked in passthrough (where it would come back a second time).
       if (key === 'guest')
         continue
-      // SECURITY (BUG-1): inline `username=`/`password=` are credential tokens,
-      // NOT passthrough — lifting them into the structured `inlineCredentials`
+      // SECURITY (BUG-1, cr.60 M7): inline credential tokens are NOT
+      // passthrough — lifting them into the structured `inlineCredentials`
       // channel keeps the plaintext password out of `passthrough` (which is
       // returned to clients and round-tripped into fstab verbatim). They are
-      // migrated to the protected 0600 creds file on the next save.
-      if (key === 'username') {
+      // migrated to the protected 0600 creds file on the next save. Every
+      // spelling of the shared list counts, in any case: `pass=` and
+      // `PASSWORD=` are `password=`, `user=` is `username=`.
+      if (eq !== -1 && credKind === 'username') {
         inline.username = value
         continue
       }
-      if (key === 'password') {
-        inline.password = value
+      if (eq !== -1 && credKind === 'secret') {
+        // `password2=` (the rotation password) is not part of the creds file
+        // ANAS writes: hidden the same, kept verbatim on the line.
+        if (key.toLowerCase() === 'password2')
+          secretOptions.push(token)
+        else
+          inline.password = value
         continue
       }
-      // `domain=` is a credential-set token too; record it in the credentials
-      // channel (surfaced in the UI credentials section) while STILL classifying
-      // it into the cifs tier so a non-inline `domain=` option round-trips as
-      // before. Only when username/password are ALSO present is it treated as an
-      // inline-credential domain (migrated to the creds file, stripped inline).
-      if (key === 'domain')
+      // `domain=` (and `dom=`/`workgroup=`) is a credential-set token too;
+      // record it in the credentials channel (surfaced in the UI credentials
+      // section) while STILL classifying it into the cifs tier so a
+      // non-inline `domain=` option round-trips as before. Only when
+      // username/password are ALSO present is it treated as an inline-
+      // credential domain (migrated to the creds file, stripped inline).
+      if (eq !== -1 && credKind === 'domain') {
         inline.domain = value
+        applyCifsToken(cifs, 'domain', value, passthrough)
+        continue
+      }
       if (applyCifsToken(cifs, key, value, passthrough))
         continue
     }
@@ -731,7 +757,7 @@ export function classifyOptions(
   if (parkedAutomount && disable !== undefined)
     common.automount = true
 
-  const result: { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto', parkedAutomount?: true } = { options }
+  const result: { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto', parkedAutomount?: true, secretOptions?: string[] } = { options }
   if (credentialsFile !== undefined)
     result.credentialsFile = credentialsFile
   if (Object.keys(inline).length > 0)
@@ -740,6 +766,8 @@ export function classifyOptions(
     result.disable = disable
   if (parkedAutomount)
     result.parkedAutomount = true
+  if (secretOptions.length > 0)
+    result.secretOptions = secretOptions
   return result
 }
 
@@ -1048,6 +1076,10 @@ function buildOptionTokens(entry: MountEntry): string[] {
 
   if (entry.options.passthrough)
     t.push(...entry.options.passthrough.split(','))
+  // cr.60 (M7): the hand-written secrets ANAS does not migrate (`password2=`)
+  // go back on the line as they were — out of every response, never dropped.
+  if (entry.secretOptions)
+    t.push(...entry.secretOptions)
 
   if (t.length === 0)
     t.push('defaults')

@@ -10,9 +10,9 @@ import type { BrowseArchiveDeps } from './backup-catalog.js'
 import type { BackupReadDeps } from './backup-reads.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'node:fs'
-import { open, readFile, unlink } from 'node:fs/promises'
+import { open, unlink } from 'node:fs/promises'
 import { isPathWithin, restorePatternsFor } from '@anas/shared'
-import { parsePveMountPaths } from '../parsers/pve-storage.js'
+import { readPveMountPathsStrict } from '../parsers/pve-storage.js'
 import { isHardlinkStat, statArchivePaths } from './backup-catalog.js'
 import { classifyBackupReadVerdict } from './backup-reads.js'
 import { buildBackupEnv, PBC } from './backup-runner.js'
@@ -1028,25 +1028,11 @@ export function pveTerritoryReason(
 
 /**
  * storage.cfg's PVE-owned paths for the restore's territory check, FAIL-CLOSED
- * (story cr.54, review H3): `null` when the file exists but cannot be read, so
- * the check refuses instead of passing. `readPveMountPaths` (the Mounts
- * inventory's tagger) fails OPEN on every error and stays that way for its
- * own callers; a restore that `--overwrite`s into whatever the check let
- * through may not. ENOENT is a READ answer — no storages — exactly as the PVE
- * footprint's `readPveStorages` takes it (a node off PVE has no file at all).
+ * (story cr.54, review H3) — lifted to parsers/pve-storage.ts by cr.60 so the
+ * mount verbs' PVE gate reads the same one; re-exported here for the restore
+ * route's existing import.
  */
-export async function readPveMountPathsStrict(path: string): Promise<Map<string, string> | null> {
-  let text: string
-  try {
-    text = await readFile(path, 'utf8')
-  }
-  catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
-      return new Map()
-    return null
-  }
-  return parsePveMountPaths(text)
-}
+export { readPveMountPathsStrict }
 
 /**
  * The restore's PVE-territory gate (cr.54), one answer per fact — cr.47(b)'s

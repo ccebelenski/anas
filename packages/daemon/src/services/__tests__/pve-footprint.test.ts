@@ -1,12 +1,17 @@
 import type { SystemPoolFacts } from '@anas/shared'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
 import { parsePveStorageCfg } from '../../parsers/pve-storage.js'
 import { buildSystemPoolFacts, loadPveFootprint, ownedDescendantIn, ownershipFromFootprintData, parseBootfsGet, parseRootMount, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage, readSystemPoolFacts, systemPoolRefusal, systemPoolRefusalFrom } from '../pve-footprint.js'
+
+/** The captured `findmnt --json /` of an ext4-root node: readable, no pool at a system path. */
+const ROOT_TABLE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/mounts/findmnt-root.json'), 'utf-8')
 
 /**
  * Story pvepool.1 — the system-pool half of the footprint service. The boot
@@ -226,18 +231,38 @@ describe('loadPveFootprint — neither the mount table nor the boot facts readab
     )
   })
 
-  it('only the mount table dark with boot facts readable and quiet answers NO, not refuse', async () => {
+  it('cr.60 (L24): the mount table dark ON ITS OWN refuses — readable, quiet boot facts cannot see `/var` or `/home`', async () => {
     const mock = new MockExecutor()
     mock.addFixture({
       command: '/usr/sbin/zpool',
       args: ['get', '-H', '-o', 'name,value', 'bootfs'],
       result: { stdout: 'tank\t-\n', stderr: '', exitCode: 0 },
     })
-    // findmnt unseeded → 127; the boot facts are a readable answer of "no
-    // boot pool among these", and the story refuses only when NEITHER reads.
+    // findmnt exits non-zero with the captured table still on stdout: the
+    // exit decides. Before cr.60 the boot facts' "no boot pool" answered NO
+    // here, and a pool mounted at /var on an ext4-root node was destroyable.
+    mock.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: ROOT_TABLE, stderr: 'findmnt: failed', exitCode: 1 } })
     const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
     assert.equal(fp.systemFactsUnavailable, false)
     assert.equal(fp.systemMountFacts, null)
+    assert.equal(fp.isSystemPool('tank'), true)
+    assert.equal(fp.isSystemPool('other'), true)
+    assert.equal(
+      systemPoolRefusalFrom(fp, 'other').message,
+      `Pool 'other' is treated as a system pool (the mount table is unreadable, so ANAS cannot see whether its filesystems sit at a system path) — ANAS never destroys, exports or remounts a system pool`,
+    )
+  })
+
+  it('the same boot facts with the captured ext4-root table READABLE answer NO', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: '/usr/sbin/zpool',
+      args: ['get', '-H', '-o', 'name,value', 'bootfs'],
+      result: { stdout: 'tank\t-\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: ROOT_TABLE, stderr: '', exitCode: 0 } })
+    const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
+    assert.notEqual(fp.systemMountFacts, null)
     assert.equal(fp.isSystemPool('tank'), false)
   })
 })
@@ -268,6 +293,8 @@ describe('loadPveFootprint — unreadable storage.cfg tightens EVERY pool (revie
       args: ['-n', '-o', 'SOURCE,FSTYPE', '/'],
       result: { stdout: '', stderr: '', exitCode: 1 },
     })
+    // cr.60 (L24): a readable mount table, so only storage.cfg decides here.
+    mock.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: ROOT_TABLE, stderr: '', exitCode: 0 } })
     return mock
   }
 

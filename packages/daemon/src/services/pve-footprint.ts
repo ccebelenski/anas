@@ -374,8 +374,9 @@ export interface PveFootprint {
    * or does the live mount table show one of its filesystems at a system path
    * (story cr.23 — facts, never names)? Or is it a zfspool pool whose boot
    * facts are UNREADABLE (the whole-pool fallback answers true for it too),
-   * or did BOTH the mount table and the boot facts go dark — in which case
-   * nothing can disprove it and the verb is refused (cr.23)? While the
+   * or could the mount table not be read (cr.60, review L24: on its own — the
+   * boot facts never see `/var` or `/home`), in which case nothing can
+   * disprove it and the verb is refused? While the
    * STORAGES are unreadable it is true for every pool: pool-level destructive
    * verbs refuse hard.
    */
@@ -385,7 +386,7 @@ export interface PveFootprint {
   /**
    * Which pools hold storage at a system path (story cr.23) — the live mount
    * table's answer, decided on facts not names. `null` when the table could
-   * NOT be read: UNREADABLE, and together with unreadable boot facts it makes
+   * NOT be read: UNREADABLE, and on its own it makes (cr.60, review L24)
    * {@link isSystemPool} true for every pool. Missing facts may only tighten.
    */
   systemMountFacts: SystemMountFacts | null
@@ -521,9 +522,12 @@ export async function loadPveFootprint(
       // else answers true.
       if (mountFacts !== null && mountFacts.zfs.has(pool))
         return true
-      // cr.23: neither the mount table nor the boot facts can be read — the
-      // verb is refused. A missing fact may only tighten the gate.
-      if (systemFactsUnavailable && mountFacts === null)
+      // cr.60 (review L24): an unreadable mount table refuses ON ITS OWN. The
+      // boot facts answer only `/` (bootfs, the root dataset); a pool whose
+      // dataset sits at `/var` or `/home` on an ext4-root node is seen by the
+      // mount table alone, so readable boot facts cannot stand in for it —
+      // cr.23 "a missing fact may only tighten", as the AHR gate always did.
+      if (mountFacts === null)
         return true
       return systemFactsUnavailable && hasZfspoolRef(pool)
     },
@@ -620,6 +624,15 @@ export function systemPoolRefusal(
     return {
       reason: 'system-pool',
       message: `Pool '${pool}' is treated as a system pool (the mount table and boot facts are unreadable) — ANAS never destroys, exports or remounts a system pool`,
+    }
+  }
+  if (opts.mountTableUnavailable) {
+    // cr.60 (review L24): the mount table alone went dark — the boot facts
+    // read and named no boot filesystem, so the sentence says which fact is
+    // missing.
+    return {
+      reason: 'system-pool',
+      message: `Pool '${pool}' is treated as a system pool (the mount table is unreadable, so ANAS cannot see whether its filesystems sit at a system path) — ANAS never destroys, exports or remounts a system pool`,
     }
   }
   if (facts === null) {

@@ -9,6 +9,7 @@ import {
   readSystemMountPools,
   systemMountPoolsFromJson,
   systemMountPoolsFromNodes,
+  zfsPoolFromMountSource,
 } from '../system-mounts.js'
 
 /**
@@ -104,6 +105,26 @@ describe('systemMountPoolsFromNodes — the captures', () => {
     ])))
     assert.equal(facts.zfs.size, 0)
     assert.equal(facts.ahr.size, 0)
+  })
+})
+
+describe('zfsPoolFromMountSource — a bind of the pool ROOT dataset (cr.60, review L23)', () => {
+  it('strips findmnt\'s `[fsroot]` bind suffix before taking the dataset head', () => {
+    // `mnttest` is the captured root-dataset source (findmnt-full.json); the
+    // suffix is the form the AHR captures show (`…--vol[/@data]`).
+    assert.equal(zfsPoolFromMountSource('mnttest[/home]'), 'mnttest')
+    assert.equal(zfsPoolFromMountSource('mnttest/data[/sub]'), 'mnttest')
+    assert.equal(zfsPoolFromMountSource('mnttest'), 'mnttest')
+    assert.equal(zfsPoolFromMountSource(''), null)
+  })
+
+  it('a pool whose ROOT dataset is bound at /home is a system pool', () => {
+    const facts = systemMountPoolsFromNodes(parseFindmnt(findmntJson([
+      { target: '/', source: '/dev/mapper/pve-root', fstype: 'ext4' },
+      { target: '/mnttest', source: 'mnttest', fstype: 'zfs' },
+      { target: '/home', source: 'mnttest[/home]', fstype: 'zfs' },
+    ])))
+    assert.deepEqual([...facts.zfs], [['mnttest', '/home']])
   })
 })
 

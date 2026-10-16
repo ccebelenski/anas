@@ -12,6 +12,7 @@ import { JobQueue } from '../../jobs/queue.js'
 import { ConfirmStore } from '../../safety/confirm.js'
 import { jobRoutes } from '../jobs.js'
 import { poolRoutes } from '../pools.js'
+import { capturedRootMountTable } from './pool-guard-reads.js'
 
 /**
  * Destroy-with-cleanup disk hygiene (story 3.14). Proves the production bug fix:
@@ -88,6 +89,9 @@ function baseExecutor(pool: string, status: string, listing: string, guid: ExecR
   // ident.1: the pool guid the confirm binds, and the label every leaf carries.
   ex.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', pool], results: guid })
   ex.addFixture({ command: BLKID, result: { stdout: `${POOL_GUID}\n`, stderr: '', exitCode: 0 } })
+  // cr.60 (L24): a readable mount table with no pool at a system path — an
+  // unserved one now tightens every pool on its own.
+  ex.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: capturedRootMountTable(), stderr: '', exitCode: 0 } })
   // Best-effort mutation fallbacks — labelclear / wipefs / sgdisk succeed unless
   // an exact fixture overrides (MockExecutor: exact match wins).
   ex.addFixture({ command: ZPOOL, result: OK }) // labelclear

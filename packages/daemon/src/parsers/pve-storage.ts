@@ -32,16 +32,13 @@ import type { PveStorageRef } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from './findmnt.js'
 import { readFile } from 'node:fs/promises'
-import { isFindmntTable, parseFindmnt } from './findmnt.js'
+import { parseFindmntTable, readFindmntTable } from './findmnt.js'
 
 /** Default location of the PVE storage config on a Proxmox host. */
 export const PVE_STORAGE_CFG = '/etc/pve/storage.cfg'
 
 /** The zfs binary the mountpoint read runs ({@link readZfsMountpoints}). */
 const ZFS_BIN = '/usr/sbin/zfs'
-
-/** The findmnt binary the mountpoint read runs for `legacy`/`none` targets. */
-const FINDMNT_BIN = '/usr/bin/findmnt'
 
 /**
  * A ZFS dataset's mountpoint, as needed to resolve a PVE `dir` storage back to
@@ -478,12 +475,15 @@ export async function readZfsMountpointsFull(exec: CommandExecutor): Promise<Zfs
     // non-zero exit is UNREADABLE (never "no datasets"); a missing binary
     // rejects with ENOENT (no ZFS here); a timeout rejects with the
     // executor's CommandTimeoutError (UNREADABLE).
+    // The findmnt side is the ONE strict mount-table read (cr.60): null on a
+    // failed start, a non-zero exit or a wrong shape at any depth; it never
+    // rejects, so a malformed deep row no longer takes the zfs side down too.
     const [zfsResult, findmntResult] = await Promise.allSettled([
       exec.exec(ZFS_BIN, ['list', '-H', '-o', 'name,mountpoint']),
-      exec.exec(FINDMNT_BIN, ['--json']),
+      readFindmntTable(exec),
     ])
-    if (findmntResult.status === 'fulfilled' && findmntResult.value.exitCode === 0)
-      findmntNodes = isFindmntTable(findmntResult.value.stdout) ? parseFindmnt(findmntResult.value.stdout) : null
+    if (findmntResult.status === 'fulfilled' && findmntResult.value !== null)
+      findmntNodes = parseFindmntTable(findmntResult.value)
     if (zfsResult.status === 'rejected')
       throw zfsResult.reason
     if (zfsResult.value.exitCode !== 0)
@@ -519,15 +519,36 @@ export async function readZfsMountpoints(exec: CommandExecutor): Promise<ZfsMoun
  * lands its mount at `path /mnt/pve/<id>` and shows in findmnt as an ordinary
  * remote mount — the ONLY way to recognise it is to cross-reference this file
  * (NOTES §3; never shell `pvesm status`). We collect the `path` of every
- * remote/dir storage and the `mountpoint` of every zfspool storage; the caller
+ * remote/dir storage and the mountpoint of every zfspool storage; the caller
  * matches a findmnt target against these paths (and the `/mnt/pve/` prefix).
+ *
+ * A zfspool's mountpoint is its `mountpoint` key, and when that OPTIONAL key
+ * is absent it is `/<pool dataset>` (story cr.60, from cr.54's report) — the
+ * path PVE's own zfspool plugin builds its subvol paths under
+ * (`mountpoint // "/$pool"`) and the ZFS default for the dataset. PVE's
+ * installer writes `local-zfs` exactly that way (`pool rpool/data`, no
+ * `mountpoint`), so before cr.60 every CT rootfs on it was invisible to the
+ * territory checks this map feeds (the file restore's, the mount verbs').
+ * The footprint's ZFS doors answer the same storage by dataset
+ * (`ownershipOf`); this is its path form for the path-only doors.
  *
  * Pure and total: commented-out lines are skipped, malformed input yields an
  * empty map, never throws.
  */
 export function parsePveMountPaths(text: string): Map<string, string> {
   const byPath = new Map<string, string>()
-  let id: string | null = null
+  let current: { type: string, id: string, pool?: string, mountpoint?: string } | null = null
+
+  const claim = (path: string, id: string): void => {
+    if (path.startsWith('/'))
+      byPath.set(stripTrailingSlash(path), id)
+  }
+  // A zfspool without its own `mountpoint` claims `/<pool dataset>`.
+  const flush = (): void => {
+    if (current?.type === 'zfspool' && current.mountpoint === undefined && current.pool)
+      claim(`/${current.pool}`, current.id)
+    current = null
+  }
 
   for (const rawLine of text.split('\n')) {
     const line = rawLine.replace(TRAILING_CR_RE, '')
@@ -537,27 +558,58 @@ export function parsePveMountPaths(text: string): Map<string, string> {
 
     const header = HEADER_RE.exec(line)
     if (header) {
-      id = header[2]
+      flush()
+      current = { type: header[1], id: header[2] }
       continue
     }
-    if (!id)
+    if (!current)
       continue
     const kv = KEY_VALUE_RE.exec(trimmed)
     if (!kv)
       continue
-    const [, key, value] = kv
+    const [, key, raw] = kv
+    const value = raw.trim()
     // `path` (dir/nfs/cifs storages) and `mountpoint` (zfspool) both name an
     // absolute filesystem path PVE owns.
-    if ((key === 'path' || key === 'mountpoint') && value.trim().startsWith('/'))
-      byPath.set(stripTrailingSlash(value.trim()), id)
+    if (key === 'path' || key === 'mountpoint')
+      claim(value, current.id)
+    if (key === 'mountpoint')
+      current.mountpoint = value
+    else if (key === 'pool')
+      current.pool = value
   }
+  flush()
   return byPath
 }
 
 /**
  * Read storage.cfg and return the PVE-owned mount-path → storage-id map,
- * FAIL-OPEN (missing file / parse error → empty map, never throws). Path is
- * overridable for tests.
+ * FAIL-CLOSED (story cr.54, lifted here by cr.60 so every territory door
+ * shares ONE reader): `null` when the file exists but cannot be read, so the
+ * check refuses instead of passing. ENOENT is a READ answer — no storages —
+ * exactly as {@link readPveStorages} takes it (a node off PVE has no file at
+ * all). The restore's territory gate and the mount verbs' PVE gate read
+ * through this; {@link readPveMountPaths} stays fail-open for the Mounts
+ * inventory's display tags only.
+ */
+export async function readPveMountPathsStrict(path: string): Promise<Map<string, string> | null> {
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  }
+  catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return new Map()
+    return null
+  }
+  return parsePveMountPaths(text)
+}
+
+/**
+ * Read storage.cfg and return the PVE-owned mount-path → storage-id map,
+ * FAIL-OPEN (missing file / parse error → empty map, never throws) — for
+ * DISPLAY (the Mounts inventory's hands-off tags, the dashboard). A gate
+ * reads {@link readPveMountPathsStrict}. Path is overridable for tests.
  */
 export async function readPveMountPaths(path: string = PVE_STORAGE_CFG): Promise<Map<string, string>> {
   try {
