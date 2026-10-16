@@ -113,6 +113,17 @@ if vgs ${POOL} >/dev/null 2>&1; then
   vgremove -ff -y ${POOL} 2>/dev/null || true
 fi
 for md in /dev/md/${POOL}-*; do mdadm --stop "\$md" 2>/dev/null || true; done
+# A destroy the daemon REFUSED (cr.22: a foreign PV in the VG) or a run that
+# died before its destroy leaves the pool's ARRAY pins in mdadm.conf — and a
+# pin blocks the next create of the same name ("mdadm.conf already pins
+# arrays named '${POOL}-r<N>'"). Mirror the daemon's unpin: drop this pool's
+# ARRAY lines, drop the monitor PROGRAM line when no ANAS pin remains
+# (cr.31b), refresh the initramfs as the daemon does.
+if grep -q '^ARRAY /dev/md/${POOL}-' /etc/mdadm/mdadm.conf 2>/dev/null; then
+  sed -i '\#^ARRAY /dev/md/${POOL}-#d' /etc/mdadm/mdadm.conf
+  grep -q '^ARRAY ' /etc/mdadm/mdadm.conf || sed -i '\#^PROGRAM /usr/local/bin/anas-md-event\$#d' /etc/mdadm/mdadm.conf
+  update-initramfs -u >/dev/null 2>&1 || true
+fi
 for d in ${ids}; do
   for p in /dev/disk/by-id/\$d-part*; do
     [ -e "\$p" ] && pvremove -ff -y "\$p" 2>/dev/null || true

@@ -645,6 +645,8 @@ test.describe('AHR read cache — review-fix live proofs (ahrcache.1)', () => {
       expect(advisory, `an advisory names the foreign PV ${foreignPv}`).toBeTruthy()
       expect(advisory!, 'it says what the verbs do with it')
         .toContain(`neither a band array nor one of this pool's cache slices`)
+      expect(advisory!, 'it says Destroy is refused while the PV is in the VG (cr.22, D4)')
+        .toContain('Destroy is refused while it is in it')
       // NOT a pool disk: pool.disks is destroy's wipe list, and disk 10 is
       // the operator's.
       expect(after.disks.some(d => d.id === FOREIGN_ID), 'disk 10 is not a pool disk').toBe(false)
@@ -657,13 +659,35 @@ test.describe('AHR read cache — review-fix live proofs (ahrcache.1)', () => {
       expect(foreignDisk.poolName, 'disk 10 is not attributed to the pool').not.toBe(POOL)
       expect(foreignDisk.status).not.toBe('ahr_member')
 
-      // --- destroy: the VG goes, the foreign PV stays ----------------------
+      // --- destroy is REFUSED while the foreign PV is in the VG (cr.22) -----
+      // The confirm is issued (the pool is destroyable on its face) and the
+      // job then refuses before any teardown: ANAS only removes a volume group
+      // whose every PV is its own, and this one holds the operator's.
+      const refusedChallenge = await ctx.delete(`${V1}/ahr/${POOL}`)
+      expect(refusedChallenge.status(), await refusedChallenge.text()).toBe(409)
+      const refusedCode = refusedChallenge.headers()['x-anas-confirm-code']
+      expect(refusedCode).toBeTruthy()
+      const refusedRes = await ctx.delete(`${V1}/ahr/${POOL}`, { headers: { 'x-anas-confirm': refusedCode } })
+      expect(refusedRes.status(), await refusedRes.text()).toBe(202)
+      const refused = await awaitJob(ctx, (await refusedRes.json()).job.id, 120_000)
+      expect(refused.status, JSON.stringify(refused.error)).toBe('failed')
+      expect(refused.error?.message).toContain(`volume group '${POOL}' contains physical volume ${foreignPv}`)
+      expect(refused.error?.message).toContain('ANAS only removes a volume group whose every PV is its own')
+      // Nothing was torn down: the pool is still listed, still cached, the
+      // VG still holds every PV it held, and the advisory still stands.
+      const stillThere = await poolDetail(ctx)
+      expect(stillThere.cache?.state).toBe('healthy')
+      expect(stillThere.advisories.some(a => a.includes(foreignPv))).toBe(true)
+      expect(await sshExec(`vgs --noheadings -o pv_count ${POOL} | tr -d ' '`)).toBe('3')
+
+      // --- the operator takes the PV out of the VG by hand; destroy completes
+      await sshExec(`vgreduce ${POOL} ${foreignPv}`)
       await runConfirmedJob(ctx, 'delete', `${V1}/ahr/${POOL}`)
       const list = await ctx.get(`${V1}/ahr`)
       expect((await list.json()).data).toEqual([])
 
       // The GPT is intact and the partition is STILL a physical volume —
-      // with no volume group, exactly as the advisory promised.
+      // with no volume group: destroy's pvremove names only the pool's own PVs.
       const gpt = await sshExec(`sgdisk -p /dev/disk/by-id/${FOREIGN_ID}`)
       expect(gpt, 'the partition table survived destroy').toMatch(/\n\s+1\s+/)
       expect(gpt).toContain('8E00')

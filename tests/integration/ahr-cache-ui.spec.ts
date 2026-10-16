@@ -86,6 +86,14 @@ interface PoolDetail {
 /** The pool's mountpoint on the node — the Remount test writes into it. */
 const MOUNT = `/mnt/anas-ahr/${POOL}`
 
+/** Ids of every ahr.cache.detach job the queue lists, newest or oldest first — the caller diffs sets. */
+async function detachJobIds(ctx: APIRequestContext): Promise<string[]> {
+  const res = await ctx.get(`${V1}/jobs`)
+  expect(res.status()).toBe(200)
+  const jobs = (await res.json()).data as { id: string, operation: string }[]
+  return jobs.filter(j => j.operation === 'ahr.cache.detach').map(j => j.id)
+}
+
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
 async function awaitJob(
   ctx: APIRequestContext,
@@ -221,6 +229,14 @@ async function openDetail(page: Page, grid: Locator, name: string): Promise<Loca
 test.describe('AHR read cache — the UI (ahrcache.1 slice 3)', () => {
   test.setTimeout(900_000)
 
+  test.beforeAll(async () => {
+    // The three disks, blank — `up` recreates the images, so a pool a prior
+    // spec's refused destroy left (or its pins, which `down` clears) cannot
+    // make this file's creates answer 409 "name already in use".
+    await execFileAsync(FIXTURE_SH, ['down'])
+    await execFileAsync(FIXTURE_SH, ['up'])
+  })
+
   test.afterAll(async () => {
     // Leave the node as found. Both tests destroy the pool through the API;
     // this is the safety net for a run that died partway.
@@ -292,18 +308,25 @@ test.describe('AHR read cache — the UI (ahrcache.1 slice 3)', () => {
       await expect(confirm).toContainText('reads continue from the pool')
       await expect(confirm).toContainText('the SSD is wiped and returns to available')
       await expect(confirm).toContainText(CACHE_ID)
+      // The detach JOB, not the detail's cache state: the detail reads
+      // `absent` as soon as the LV is uncached (step 1 of the job), a second
+      // before the slice is wiped and deleted (steps 3–5) — opening Disks on
+      // that signal read the still-partitioned disk as Unknown and the grid
+      // never reloads. Wait for the job the click submitted to reach its end.
+      const detachJobsBefore = new Set(await detachJobIds(ctx))
       await confirm.getByRole('button', { name: 'Yes' }).click()
-
-      // The block reads "no cache" once the job lands.
-      const detachDeadline = Date.now() + 180_000
+      const detachDeadline = Date.now() + 30_000
+      let detachJobId: string | undefined
       for (;;) {
-        const detail = await poolDetail(ctx)
-        if (detail.cache?.state === 'absent')
+        detachJobId = (await detachJobIds(ctx)).find(id => !detachJobsBefore.has(id))
+        if (detachJobId)
           break
         if (Date.now() > detachDeadline)
-          throw new Error('cache still present after 180s')
-        await new Promise(resolve => setTimeout(resolve, 1000))
+          throw new Error('no ahr.cache.detach job appeared within 30s of the confirm')
+        await new Promise(resolve => setTimeout(resolve, 500))
       }
+      const detachJob = await awaitJob(ctx, detachJobId, 180_000)
+      expect(detachJob.status, JSON.stringify(detachJob.error)).toBe('completed')
       const bodyAfter = await openDetail(page, grid, POOL)
       await expect(bodyAfter).toContainText('no cache')
       await expect(bodyAfter).not.toContainText(CACHE_ID)

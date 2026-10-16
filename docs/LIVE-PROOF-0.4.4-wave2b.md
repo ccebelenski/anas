@@ -359,6 +359,34 @@ added) and the pvepool fixture (`pvepool-fixture.sh up`; wave 2 found its loops 
 `gtexpand` through ANAS, and every ANAS AHR create pins its arrays in `/etc/mdadm/mdadm.conf` — an edit of the file the
 brief says never to edit).
 
+### Post-pass smoke of the five not-run specs (2026-10-16, after the operator cleared mdadm.conf; node on the 0.4.4 RC df28fbfc)
+
+`ahr-cache-api`, `ahr-cache-review`, `ahr-cache-ui`, `ahr-expand-zero-gain`, `smbsvc-api`: 19 tests, all green after the
+re-cuts below (first run 14/19; every spec re-run to green; `/etc/mdadm/mdadm.conf` sha256 `da56d6ab…` before and after
+every run, no array, no VG, no mapping left). Classified as the wave-3 pass did:
+
+| test | first run | class | what was true |
+|---|---|---|---|
+| ahr-cache-review shape 3 | job failed "volume group 'gtcache' contains physical volume /dev/sde1 — not this pool's …" | (a) | cr.22: Destroy refuses a VG holding a foreign PV. Re-cut: the confirm is issued, the job refuses naming the PV and tears nothing down (pool listed, cache healthy, `pv_count` 3), the operator `vgreduce`s the PV out by hand, Destroy completes, the PV survives with no VG; the D4 advisory sentence asserted |
+| ahr-cache-ui ×3 | fixture missing; 409 at `POST /ahr` with no confirm code | (c) | residue of shape 3's refused destroy: the pins stayed and the fixture's `down` stopped the arrays without unpinning. Both AHR fixtures now mirror the daemon's unpin (this pool's ARRAY lines, the PROGRAM line when no pin remains, `update-initramfs -u`); proven on the leftover pin without a hand edit. The UI spec brings its own fixture up |
+| ahr-cache-ui "attach … detach … disk back" (run 2) | Disks row `Unknown … Partitioned` after Detach | (a) | spec race: it opened Disks when the detail read `cache.state=absent`, which is true after step 1 of the detach job (uncache), a second before the slice is wiped and deleted; the grid loaded the still-partitioned disk and never reloads. Re-cut: wait for the `ahr.cache.detach` job the click submitted (set-diff of job ids) to complete, then open Disks |
+| smbsvc-api 5 | 400 "'anas-' is reserved" | (a) | cr.20: the schedule prefix is refused on a manual create. The schedule-shaped snapshot is now planted as the scheduler takes it (top-level mount `subvolid=5`, `btrfs subvolume snapshot -r @data @snapshots/<name>`, unmount on every path), the AHR twin of the ZFS half's fixture-made `zfs snapshot`; `findmnt -nv` for the device (plain `-o SOURCE` carries the `[/@data]` fsroot suffix) |
+| ahr-cache-api "hits climb" (run 2 only) | `hits` 0 after three dropped-cache passes | flake | passed on the first run and alone on a rerun; not chased |
+| ahr-cache-review shape 1 (run 2 only) | released disk `other` | **S1** | NOT a spec problem — see below. Passed on rerun 3 (the race did not fire) |
+
+**S1 (daemon, medium; operator's call whether it ships in 0.4.4): a cache detach can report the disk released while the kernel
+still carries its partition.** `detachAhrCache` runs `wipefs -a` + `sgdisk -d <n>` on the slice, settles udev, and logs
+`status=released` on sgdisk's exit code alone. sgdisk asks the kernel for a whole-table re-read (BLKRRPART); when anything holds
+the disk at that instant the kernel refuses, sgdisk prints "the kernel is still using the old partition table" and exits 0, and
+the inventory then classifies the disk `other` (a partition is a signature) with no error anywhere — until a `blockdev --rereadpt`.
+Evidence: the shape-1 detach at 15:14:07–08 UTC ran two seconds after `return-cache` hot-added the disk (kernel `sdd: sdd1` at
+:06, `lvm … PV /dev/sdd1 online` at :06) and the journal carries NO kernel ` sdd:` re-read line after `status=released`, while every
+other detach that day (15:12:28, 15:13:10, 15:15:14, 15:16:51, and the hand-driven one at 15:2x whose row read `available` with
+`partitions: []`) has one. The expansion path already handles the add direction of exactly this (`partx -a` then
+`waitForPartitions`, `ahr-expand-exec.ts` ~412–442, issue #12); the detach needs the delete twin — `partx -d <n> <dev>` (BLKPG, no
+exclusive re-read) then verify the partition node is gone and FAIL the job naming the disk when it is not — so a held disk
+produces a reported failure instead of a silent `other`. Timing exposes it; the missing verify is the defect.
+
 `task-status-reboot` reboots the node by design (boot −1 ended 06:39:19, boot 0 began 06:39:24); ADOCK's CT 9900
 stayed stopped (onboot 0) and adock/adockd came back active.
 

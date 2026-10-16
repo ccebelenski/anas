@@ -502,12 +502,23 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
       expect(findmntSnap).toContain(AHR_SNAP_MOUNT)
       expect(findmntSnap).toContain('ro')
 
-      // 3. A file through smbclient, a snapshot through the daemon's own API,
-      // the file changed — the FIRST content reads back through @GMT.
+      // 3. A file through smbclient, a schedule-shaped snapshot, the file
+      // changed — the FIRST content reads back through @GMT. The `anas-`
+      // prefix is the schedule's (cr.20 refuses it on a manual create), so the
+      // snapshot is planted exactly as the scheduler takes one — a read-only
+      // btrfs snapshot of @ under @snapshots through the top-level subvolume —
+      // the AHR twin of the ZFS half's fixture-made `zfs snapshot`.
       await sshExec(`printf '${AHR_V1}\\n' > /var/tmp/ahr-v1.txt && chmod 644 /var/tmp/ahr-v1.txt`)
       await sshExec(`printf '${AHR_V2}\\n' > /var/tmp/ahr-v2.txt && chmod 644 /var/tmp/ahr-v2.txt`)
       await smbClientAs(AHR_SHARE, AHR_USER, AHR_PW, `put /var/tmp/ahr-v1.txt ${AHR_SHARE_FILE}`)
-      await runJob(ctx, 'post', `${V1}/ahr/${AHR_POOL}/snapshots`, { name: AHR_SNAPSHOT })
+      // The top-level mount is undone whether or not the snapshot succeeds —
+      // a mount left behind holds the pool volume open and the fixture's
+      // teardown cannot stop the array under it.
+      await sshExec(
+        `dev=$(findmnt -nv -o SOURCE ${AHR_MOUNT}) && top=$(mktemp -d /var/tmp/ahr-top.XXXXXX) `
+        + `&& mount -o subvolid=5 "$dev" "$top" && { btrfs subvolume snapshot -r "$top/@data" "$top/@snapshots/${AHR_SNAPSHOT}"; rc=$?; `
+        + `umount "$top"; rmdir "$top"; exit $rc; }`,
+      )
       await smbClientAs(AHR_SHARE, AHR_USER, AHR_PW, `put /var/tmp/ahr-v2.txt ${AHR_SHARE_FILE}`)
 
       // The snapshot is visible through the read-only mount (that mount IS the
