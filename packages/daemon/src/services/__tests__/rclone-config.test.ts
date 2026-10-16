@@ -1092,6 +1092,19 @@ describe('rclone-config: remotesReferencing (cloudproof.2 finding 4)', () => {
     assert.deepEqual(remotesReferencing(remotes, 'gtsftp'), [])
   })
 
+  it('cr.55r P1: a connection-string value references only its `remote=` VALUE — never a `key=value` token that looks like one', () => {
+    const remotes = [
+      // The inline s3's secret value happens to read `backup:bucket` — the
+      // old parser saw a `backup:` reference here and refused to delete
+      // `backup`; rclone opens no such remote.
+      mkRemote('crypt-inline', { remote: ':s3,secret_access_key=backup:bucket' }, 'crypt'),
+      // A real wrapped reference inside a connection string IS a reference.
+      mkRemote('crypt-wrap', { remote: ':crypt,remote=backup:enc' }, 'crypt'),
+      mkRemote('backup', { host: 'h' }),
+    ]
+    assert.deepEqual(remotesReferencing(remotes, 'backup'), ['crypt-wrap'])
+  })
+
   it('the deleted remote never names itself, and an empty config references nothing', () => {
     const remotes = [mkRemote('selfwrap', { remote: 'selfwrap:loop' })]
     assert.deepEqual(remotesReferencing(remotes, 'selfwrap'), [])
@@ -1244,6 +1257,22 @@ describe('rclone-config: remoteSecretValues — a remote\'s secret list, transit
     await writeFile(configFile, '[c]\ntype = crypt\nremote = :s3,access_key_id=AKIAPUBLIC,secret_access_key=inlineS3secret:bucket\n\n[d]\ntype = alias\nremote = ":sftp,host=h,pass=\'quotedPassVal\'":dir\n', 'utf-8')
     assert.deepEqual(await remoteSecretValues(configFile, 'c'), ['inlineS3secret'])
     assert.deepEqual(await remoteSecretValues(configFile, 'd'), ['quotedPassVal'])
+  })
+
+  it('cr.55r P1: a connection-string `key=value` token never names a remote — a secret value like `backup:bucket` does not pull in a section `backup`', async () => {
+    await writeFile(configFile, '[c]\ntype = crypt\nremote = :s3,secret_access_key=backup:bucket\n\n[backup]\ntype = s3\nsecret_access_key = backupSecretX\n', 'utf-8')
+    const values = await remoteSecretValues(configFile, 'c')
+    // The old `[\s,]+` split took the token `secret_access_key=backup:bucket`,
+    // cut at the `=`, and looked up a section named `backup` — its credential
+    // would show up here. Only the `remote=`/`upstreams=`/`dir=` VALUES name
+    // a remote; a key=value pair's key never does.
+    assert.ok(!values.includes('backupSecretX'), JSON.stringify(values))
+  })
+
+  it('cr.55r P1: a real wrapped reference INSIDE a connection string is followed (`:crypt,remote=s3wrap:enc`)', async () => {
+    await writeFile(configFile, '[c]\ntype = crypt\nremote = :crypt,remote=s3wrap:enc\n\n[s3wrap]\ntype = s3\nsecret_access_key = wrappedSecret1\n', 'utf-8')
+    const values = await remoteSecretValues(configFile, 'c')
+    assert.ok(values.includes('wrappedSecret1'), JSON.stringify(values))
   })
 
   it('an UNSAVED dialog\'s option map: only what it REFERENCES is read from the file', async () => {

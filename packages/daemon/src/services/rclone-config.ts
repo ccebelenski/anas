@@ -39,7 +39,7 @@ import { z } from 'zod'
 import { listSections, parseRcloneConf, removeSection, upsertSection } from '../parsers/rclone-conf.js'
 import { ConfigConflictError, sha256, writeFileAtomic } from './config-writer.js'
 import { withFileLock } from './file-lock.js'
-import { assertNoSecretValues } from './secret-argv.js'
+import { assertNoSecretValues, maskSecretValues } from './secret-argv.js'
 
 // ── The binary, the file, the argv every invocation starts with ────────────
 
@@ -351,7 +351,9 @@ export interface RcloneConfigRead {
  *    comes back),
  *  - non-zero whose output mentions `password` / `encrypted` / `decrypt`
  *    → `{ encrypted: true, remotes: [] }` — a password-protected file,
- *  - any other non-zero → an Error carrying rclone's last output line.
+ *  - any other non-zero → an Error carrying rclone's last output line,
+ *    masked against the file's stored secrets (cr.55r D1 — the echoed bad
+ *    line can carry one; see {@link remoteSecretValuesFromText}).
  *
  * `secrets` are the plain SECRET values in scope at the caller (an in-flight
  * write's secret options) — the argv guard runs for them too, on the dynamic
@@ -394,7 +396,15 @@ export async function readConfig(
 
   if (ENCRYPTED_CONFIG_RE.test(`${result.stderr}\n${result.stdout}`))
     return { text, encrypted: true, remotes: [], existedBefore }
-  throw new Error(`rclone config dump failed: ${lastOutputLine(result) || `exit ${result.exitCode}`}`)
+  // cr.55r (D1): a corrupted rclone.conf makes rclone echo the bad LINE — and
+  // a bad line can carry a stored credential. The quoted text is masked where
+  // the message is MADE, against every section's stored secrets built from the
+  // RAW file text just read (the dump failed, so there is no dump to scope the
+  // list by — the whole file is the scope) plus the in-flight write's secret
+  // values in scope. The doors that surface this throw — the remotes GET 500,
+  // the remote-create reply, a write/remove job's error — then carry `[secret]`.
+  const quoted = lastOutputLine(result) || `exit ${result.exitCode}`
+  throw new Error(`rclone config dump failed: ${maskSecretValues(quoted, [...secrets, ...remoteSecretValuesFromText(text)])}`)
 }
 
 /** A `config dump` JSON object → the secret-stripped remotes, sorted by name. */
@@ -434,20 +444,60 @@ function dumpToRemotes(dump: Record<string, unknown>, providers?: CloudProvider[
  */
 const REMOTE_REFERENCE_OPTIONS = ['remote', 'upstreams', 'remotes']
 
-/** The token split of a reference value: whitespace or commas. */
-const REFERENCE_TOKEN_SPLIT_RE = /[\s,]+/
+/**
+ * THE reference parser (cr.55r P1) — the remote NAMES a reference option's
+ * value points at, as rclone reads it. The value is a list of entries split
+ * on WHITESPACE only — commas belong to a connection string, never to the
+ * split. Each entry is one of:
+ *
+ *  - a QUOTED entry: parsed inside the quotes; what follows the closing
+ *    quote (`":sftp,host=h,pass=p":dir`) is a path suffix and names nothing;
+ *  - a CONNECTION STRING `:type,key=value,...:path` (the entry starts with
+ *    `:`): only the `remote=`/`upstreams=`/`dir=` PARAMETER VALUES name a
+ *    remote — each value runs to the next comma with its colons kept
+ *    (`remote=s3wrap:enc` names `s3wrap`) and is parsed recursively; the
+ *    type and the trailing path never do, and a `key=value` pair whose key
+ *    is not one of those three never names one either — rclone opens no
+ *    remote for `secret_access_key=backup:bucket`;
+ *  - a COMBINE/UNION MODIFIER `X=Y` (a top-level `=`): the reference follows
+ *    the FIRST `=` (`root=gtsftp:sub` names `gtsftp`);
+ *  - a BARE entry: what precedes its first `:` (`gtsftp:crypt-base` names
+ *    `gtsftp`); a local path has no `:` and names nothing.
+ */
+/** The entry split of a reference value: WHITESPACE only (commas belong to a connection string). */
+const REFERENCE_ENTRY_SPLIT_RE = /\s+/
 
-/** Does one option VALUE reference remote `name`? `myremote:path` shape. */
-function valueReferencesRemote(value: string, name: string): boolean {
-  const prefix = `${name}:`
-  for (const token of value.split(REFERENCE_TOKEN_SPLIT_RE)) {
-    // combine's `dir=remote:path` and union's quoted entries: the reference
-    // is what follows the `=`, when there is one.
-    const target = token.includes('=') ? token.slice(token.lastIndexOf('=') + 1) : token
-    if (target.startsWith(prefix))
-      return true
+function referencedRemoteNames(value: string): string[] {
+  const names: string[] = []
+  for (const entry of value.split(REFERENCE_ENTRY_SPLIT_RE)) {
+    if (entry !== '')
+      names.push(...entryRemoteNames(entry))
   }
-  return false
+  return names
+}
+
+/** The reference-naming parameters inside a connection string entry. */
+const CONNECTION_REFERENCE_PARAM_RE = /(?:^|,)(?:remote|upstreams|dir)=([^,]*)/g
+
+/** The remote NAMES one reference-list ENTRY points at ({@link referencedRemoteNames}). */
+function entryRemoteNames(entry: string): string[] {
+  const quote = entry[0]
+  if (quote === '"' || quote === '\'') {
+    const close = entry.indexOf(quote, 1)
+    if (close > 0)
+      return entryRemoteNames(entry.slice(1, close))
+  }
+  if (entry.startsWith(':')) {
+    const names: string[] = []
+    for (const m of entry.matchAll(CONNECTION_REFERENCE_PARAM_RE))
+      names.push(...entryRemoteNames(m[1]!))
+    return names
+  }
+  const eq = entry.indexOf('=')
+  if (eq >= 0)
+    return entryRemoteNames(entry.slice(eq + 1))
+  const colon = entry.indexOf(':')
+  return colon > 0 ? [entry.slice(0, colon)] : []
 }
 
 /**
@@ -455,10 +505,12 @@ function valueReferencesRemote(value: string, name: string): boolean {
  * would strand (cloudproof.2 finding 4: DELETE of the sftp remote under a
  * crypt remote answered 202 and left the crypt remote pointing at a section
  * that no longer exists, every later use failing `didn't find section in
- * config file`). A reference is an option value in the `<name>:…` shape;
- * a mere PATH that contains the name (`/mnt/<name>/data`, `<name>2:bucket`)
- * is not a reference. Reference options are never secret, so the values are
- * present in the secret-stripped remotes. Sorted, unique.
+ * config file`). A reference is an option value in the `<name>:…` shape as
+ * the shared {@link referencedRemoteNames} parses it; a mere PATH that
+ * contains the name (`/mnt/<name>/data`, `<name>2:bucket`) or a `key=value`
+ * token that only LOOKS like one is not a reference. Reference options are
+ * never secret, so the values are present in the secret-stripped remotes.
+ * Sorted, unique.
  */
 export function remotesReferencing(remotes: CloudRemote[], name: string): string[] {
   const refs = new Set<string>()
@@ -467,7 +519,7 @@ export function remotesReferencing(remotes: CloudRemote[], name: string): string
       continue
     for (const key of REMOTE_REFERENCE_OPTIONS) {
       const value = remote.options[key]
-      if (value !== undefined && valueReferencesRemote(value, name)) {
+      if (value !== undefined && referencedRemoteNames(value).includes(name)) {
         refs.add(remote.name)
         break
       }
@@ -506,7 +558,9 @@ export class ConfigEncryptedError extends Error {
 /**
  * The `config dump` gate failed after a write — the PREVIOUS bytes have
  * already been put back (byte-identical rollback) before this is thrown.
- * `detail` is rclone's last output line (or a gate-mismatch sentence).
+ * `detail` is rclone's last output line (or a gate-mismatch sentence), masked
+ * where it is made (cr.55r D1 — the line a failed gate echoes can carry a
+ * stored credential; the job error and the audit line then read `[secret]`).
  */
 export class RcloneConfigGateError extends Error {
   constructor(readonly detail: string) {
@@ -683,21 +737,45 @@ function pushSecretValue(out: string[], value: string): void {
 }
 
 /**
- * The remote NAMES a reference option's value points at — `name:path`, one
- * per whitespace/comma token, the part after a combine `dir=` — by the same
- * token rule as {@link remotesReferencing}. A token with no name before its
- * first `:` (a local path, an on-the-fly `:backend` connection string) names
- * no saved remote.
+ * The secret-rule values of ONE section: the name-rule keys and the
+ * `IsPassword`-outside-the-rule keys for its type (bool literals excluded),
+ * each as stored bytes + in-process decode, plus the secret-rule parameters
+ * inline in its reference options' connection strings. The ONE per-section
+ * collector — {@link remoteSecretValues} walks with it,
+ * {@link remoteSecretValuesFromText} runs it over every section.
  */
-function referencedRemoteNames(value: string): string[] {
-  const names: string[] = []
-  for (const token of value.split(REFERENCE_TOKEN_SPLIT_RE)) {
-    const target = token.includes('=') ? token.slice(token.lastIndexOf('=') + 1) : token
-    const colon = target.indexOf(':')
-    if (colon > 0)
-      names.push(target.slice(0, colon).replace(QUOTE_RE, ''))
+function sectionSecretValues(values: Record<string, string>): string[] {
+  const out: string[] = []
+  const outside = PASSWORD_KEYS_OUTSIDE_NAME_RULE[values.type ?? ''] ?? []
+  for (const [key, value] of Object.entries(values)) {
+    if (value === '')
+      continue
+    if (REMOTE_REFERENCE_OPTIONS.includes(key)) {
+      for (const param of connectionStringSecrets(value))
+        pushSecretValue(out, param)
+      continue
+    }
+    if (BOOL_LITERAL_RE.test(value) || !(isSecretKey(key) || outside.includes(key)))
+      continue
+    pushSecretValue(out, value)
   }
-  return names
+  return out
+}
+
+/**
+ * EVERY secret-rule value the file's sections carry (cr.55r D1) — the mask
+ * list for text the daemon quotes from a FAILED rclone run. When `config dump`
+ * fails there is no dump to scope a remote's list by, so the scope is the
+ * whole file: every section's stored name-rule secrets and obscured values
+ * (with their in-process decode), crypt `password2`, and inline
+ * connection-string parameters. Takes the TEXT, not a path — the caller holds
+ * the bytes it read ({@link readConfig}) or reads them best-effort (the gate).
+ */
+export function remoteSecretValuesFromText(text: string): string[] {
+  const out: string[] = []
+  for (const sec of listSections(parseRcloneConf(text)))
+    out.push(...sectionSecretValues(sec.values))
+  return [...new Set(out)]
 }
 
 /**
@@ -723,7 +801,7 @@ function connectionStringSecrets(value: string): string[] {
  *  - TRANSITIVELY over wrapped remotes. A crypt/alias/chunker/compress/hasher/
  *    cache remote names the remote it wraps in `remote = other:path`, union
  *    and combine in `upstreams = a:x b:y` / `dir=a:x` — the same reference
- *    options and token rule {@link remotesReferencing} reads. rclone opens the
+ *    options, read by the one parser {@link referencedRemoteNames}. rclone opens the
  *    wrapped remote with ITS stored credentials, so a backend error under a
  *    crypt task can quote the wrapped s3 remote's `secret_access_key`. The walk
  *    follows every reference to a section the file carries, each section once
@@ -780,26 +858,18 @@ export async function remoteSecretValues(
   }
   while (queue.length) {
     const values = queue.shift()!
-    const outside = PASSWORD_KEYS_OUTSIDE_NAME_RULE[values.type ?? ''] ?? []
+    out.push(...sectionSecretValues(values))
     for (const [key, value] of Object.entries(values)) {
-      if (value === '')
+      if (!REMOTE_REFERENCE_OPTIONS.includes(key) || value === '')
         continue
-      if (REMOTE_REFERENCE_OPTIONS.includes(key)) {
-        for (const ref of referencedRemoteNames(value)) {
-          if (visited.has(ref))
-            continue
-          visited.add(ref)
-          const wrapped = sections.get(ref)
-          if (wrapped)
-            queue.push(wrapped)
-        }
-        for (const param of connectionStringSecrets(value))
-          pushSecretValue(out, param)
-        continue
+      for (const ref of referencedRemoteNames(value)) {
+        if (visited.has(ref))
+          continue
+        visited.add(ref)
+        const wrapped = sections.get(ref)
+        if (wrapped)
+          queue.push(wrapped)
       }
-      if (BOOL_LITERAL_RE.test(value) || !(isSecretKey(key) || outside.includes(key)))
-        continue
-      pushSecretValue(out, value)
     }
   }
   return [...new Set(out)]
@@ -885,8 +955,9 @@ async function restoreConfigFile(
 
 /**
  * The post-write gate: `rclone config dump` must exit 0 AND agree with what
- * we wrote. Returns rclone's last output line when it does not, null when it
- * does. `expected` is the section's expected non-secret values (the `type`
+ * we wrote. Returns rclone's last output line — masked against the file's
+ * stored secrets and the write's own values (cr.55r D1) — when it does not,
+ * null when it does. `expected` is the section's expected non-secret values (the `type`
  * key included) — secret keys are NOT compared: the dump never returns them,
  * and rclone revealing one would be the bug, not our mismatch.
  */
@@ -901,8 +972,21 @@ async function configDumpGate(
   const args = [...base, 'config', 'dump']
   assertNoSecretValues(args, secrets, base.length)
   const result = await executor.exec(RCLONE, args)
-  if (result.exitCode !== 0)
-    return lastOutputLine(result) || `exit ${result.exitCode}`
+  if (result.exitCode !== 0) {
+    // cr.55r (D1): the gate runs against the bytes the write just put down,
+    // and a dump failure echoes the bad line — which can carry a credential
+    // (plain name-rule, or the obscured spelling of an IsPassword value). The
+    // returned detail is masked HERE, where the message is made: the rollback
+    // puts the previous bytes back, but the error text already left.
+    let diskText = ''
+    try {
+      diskText = await readFile(paths.configFile, 'utf-8')
+    }
+    catch {
+      // Unreadable — the write's own secret values still mask what rclone echoed.
+    }
+    return maskSecretValues(lastOutputLine(result) || `exit ${result.exitCode}`, [...secrets, ...remoteSecretValuesFromText(diskText)])
+  }
   try {
     const dump = JSON.parse(result.stdout) as Record<string, Record<string, unknown> | undefined>
     const entry = dump[name]
@@ -1131,7 +1215,11 @@ export async function removeRemote(
     const gate = await executor.exec(RCLONE, args)
     let gateError: string
     if (gate.exitCode !== 0) {
-      gateError = lastOutputLine(gate) || `exit ${gate.exitCode}`
+      // cr.55r (D1): masked where made, against the sections of the PRE-write
+      // text the service holds — a superset of what the on-disk file carries
+      // now (the removal only took a section out), so a credential rclone
+      // echoes from the file is covered.
+      gateError = maskSecretValues(lastOutputLine(gate) || `exit ${gate.exitCode}`, remoteSecretValuesFromText(current.text))
     }
     else {
       try {

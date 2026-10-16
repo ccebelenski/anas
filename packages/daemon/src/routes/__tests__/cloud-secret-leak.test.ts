@@ -3,7 +3,7 @@ import type { Requester } from '../../cloud-task.js'
 import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -311,5 +311,230 @@ describe('cr.55 — the cloud doors never hand out a saved remote\'s credential 
     assertNoSecret(await journalLines(job), 'the crypt runner\'s journal line')
     // The failure still names the cause — the mask removes values, not the line.
     assert.match(job.error?.message ?? '', /SignatureDoesNotMatch/)
+  })
+})
+
+// ── cr.55r D1 (review 2026-10-16, DEFECT) ──────────────────────────────────
+//
+// The `config dump` FAILURE path quotes rclone's echoed line into the error —
+// and a corrupted rclone.conf makes rclone echo the bad LINE, which can carry
+// a stored credential. Three doors surface that text: the remotes GET (500),
+// the remote-create precheck (500) and the write/remove gate's
+// `RcloneConfigGateError` (a job error). The mask is applied where the message
+// is MADE, against every section's stored secrets built from the RAW file (the
+// dump failed, so the whole file is the scope) — nothing here feeds the mask
+// an oracle.
+
+describe('cr.55r D1 — the config-dump failure path quotes rclone\'s line only masked', () => {
+  let server: ReturnType<typeof createServer>
+  let dir: string
+  let configFile: string
+  const saved: Record<string, string | undefined> = {}
+
+  function setEnv(k: string, v: string) {
+    saved[k] = process.env[k]
+    process.env[k] = v
+  }
+
+  /** rclone's echo of the corrupted line — the credential verbatim. */
+  const DUMP_ECHO = `Failed to load rclone.conf: on line 6: bad syntax near "secret_access_key = ${S3_SECRET}"`
+  /** From this `config dump` call on (1-based), the dump FAILS echoing the line. */
+  let failDumpFrom = 1
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-cr55r-d1-'))
+    const systemdDir = await mkdtemp(join(dir, 'systemd-'))
+    configFile = join(dir, 'rclone.conf')
+    await writeFile(configFile, CONF, { encoding: 'utf-8', mode: 0o600 })
+    setEnv('ANAS_RCLONE_CONFIG', configFile)
+    setEnv('ANAS_SYSTEMD_DIR', systemdDir)
+    failDumpFrom = 1
+    server = createServer({ mock: true, logger: false })
+
+    const mock = mockOf(server)
+    mock.clearFixtures()
+    mock.addFixture({ command: RCLONE, args: ['version'], result: { stdout: 'rclone v1.60.1\n', stderr: '', exitCode: 0 } })
+    // A minimal s3 catalogue — enough for the write door's provider lookup
+    // (the gate test writes an s3 section; the name rule makes
+    // `secret_access_key` a secret without any IsPassword flag).
+    mock.addFixture({
+      command: RCLONE,
+      args: [...rcloneBaseArgs(configFile), 'config', 'providers'],
+      result: {
+        stdout: JSON.stringify([{ Name: 's3', Description: 'Amazon S3', Options: [{ Name: 'provider' }, { Name: 'access_key_id' }, { Name: 'secret_access_key' }, { Name: 'region' }] }]),
+        stderr: '',
+        exitCode: 0,
+      },
+    })
+    // The dev mock's own `config dump` override answers from the file and can
+    // never fail — wrap it (the same way the dev mock wrapped the bare exec)
+    // so the Nth dump fails the way a corrupted file makes the real binary
+    // echo its bad line (no `password`/`encrypted`/`decrypt` word — that shape
+    // is the encrypted-file door).
+    const inner = mock.exec.bind(mock)
+    let dumpCalls = 0
+    mock.exec = async (command, args, execOpts) => {
+      if (command === RCLONE && args.at(-2) === 'config' && args.at(-1) === 'dump') {
+        dumpCalls++
+        if (dumpCalls >= failDumpFrom)
+          return { stdout: '', stderr: `${DUMP_ECHO}\n`, exitCode: 1 }
+        const text = await readFile(configFile, 'utf-8')
+        return { stdout: JSON.stringify(Object.fromEntries(listSections(parseRcloneConf(text)).map(s => [s.name, { ...s.values }]))), stderr: '', exitCode: 0 }
+      }
+      return inner(command, args, execOpts)
+    }
+  })
+
+  afterEach(async () => {
+    await server.close()
+    await rm(dir, { recursive: true, force: true })
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined)
+        delete process.env[k]
+      else
+        process.env[k] = v
+    }
+  })
+
+  it('GET /cloud/remotes: the dump failure answers 500 with [secret], never the credential', async () => {
+    const res = await server.inject({ method: 'GET', url: '/v1/cloud/remotes', headers: IDENTITY })
+    assert.equal(res.statusCode, 500, res.body)
+    assert.ok(res.body.includes('[secret]'), res.body)
+    assert.ok(res.body.includes('rclone config dump failed'), 'the failure still reads as itself')
+    assertNoSecret(res.body, 'the remotes GET 500 body')
+  })
+
+  it('POST /cloud/remotes: the precheck read answers 500 with [secret], never the credential', async () => {
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/cloud/remotes',
+      headers: JSON_HEADERS,
+      payload: { name: 'gateone', type: 's3', options: { provider: 'AWS', access_key_id: 'AKIAEXAMPLEKEYID0', secret_access_key: 'gatePlainValue99' } },
+    })
+    assert.equal(res.statusCode, 500, res.body)
+    assert.ok(res.body.includes('[secret]'), res.body)
+    assertNoSecret(res.body, 'the remote-create 500 body')
+  })
+
+  it('the write gate: a dump failure after the write fails the job with [secret] in the error', async () => {
+    // The precheck and the job's own read see a GOOD dump; the GATE (the third
+    // dump) fails echoing the credential-bearing line.
+    failDumpFrom = 3
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/cloud/remotes',
+      headers: JSON_HEADERS,
+      payload: { name: 'gateone', type: 's3', options: { provider: 'AWS', access_key_id: 'AKIAEXAMPLEKEYID0', secret_access_key: 'gatePlainValue99' } },
+    })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.match(job.error?.message ?? '', /could not read the config back after the write/)
+    assert.match(job.error?.message ?? '', /\[secret\]/)
+    assertNoSecret(JSON.stringify(job), 'the gate-path job')
+  })
+
+  it('the remove gate: a dump failure after the removal fails the job with [secret] in the error', async () => {
+    // precheck read (1), the job's re-check read (2), removeRemote's own read
+    // (3), the gate (4) fails.
+    failDumpFrom = 4
+    // `cryptleak` — nothing wraps it, so the precheck lets the removal through.
+    const res = await server.inject({ method: 'DELETE', url: '/v1/cloud/remotes/cryptleak', headers: IDENTITY })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.match(job.error?.message ?? '', /could not read the config back after the write/)
+    assert.match(job.error?.message ?? '', /\[secret\]/)
+    assertNoSecret(JSON.stringify(job), 'the remove-gate job')
+  })
+})
+
+// ── cr.55r P2 (review 2026-10-16, possible → confirmed) ────────────────────
+//
+// A wrapped remote's stored credential that is a SUBSTRING of the Test's
+// composed fs token (`cwrap` under `[cwrap] type=crypt remote=s3wrap:`) made
+// the argv guard refuse a legitimate Test: the guard checked the STORED list
+// against the daemon-composed `name:path` token. The guard now checks only
+// the DIALOG-supplied values (cr.48f's contract); the stored list masks. The
+// layout below must answer 202 + a verdict, and the leak probe must still
+// mask the echoed value.
+
+describe('cr.55r P2 — a stored credential that is a substring of the fs token does not refuse the Test', () => {
+  let server: ReturnType<typeof createServer>
+  let dir: string
+  let configFile: string
+  const saved: Record<string, string | undefined> = {}
+
+  function setEnv(k: string, v: string) {
+    saved[k] = process.env[k]
+    process.env[k] = v
+  }
+
+  // The review's shape: the crypt remote `cwrap` wraps `s3wrap`, whose
+  // stored `secret_access_key` is the string `cwrap` — the wrapper's own name.
+  const CONF_WRAP = `[s3wrap]
+type = s3
+provider = AWS
+access_key_id = AKIAEXAMPLEKEYID0
+secret_access_key = cwrap
+
+[cwrap]
+type = crypt
+remote = s3wrap:
+`
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-cr55r-p2-'))
+    const systemdDir = await mkdtemp(join(dir, 'systemd-'))
+    configFile = join(dir, 'rclone.conf')
+    await writeFile(configFile, CONF_WRAP, { encoding: 'utf-8', mode: 0o600 })
+    setEnv('ANAS_RCLONE_CONFIG', configFile)
+    setEnv('ANAS_SYSTEMD_DIR', systemdDir)
+    server = createServer({ mock: true, logger: false })
+    const mock = mockOf(server)
+    mock.clearFixtures()
+    mock.addFixture({ command: RCLONE, args: ['version'], result: { stdout: 'rclone v1.60.1\n', stderr: '', exitCode: 0 } })
+  })
+
+  afterEach(async () => {
+    await server.close()
+    await rm(dir, { recursive: true, force: true })
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined)
+        delete process.env[k]
+      else
+        process.env[k] = v
+    }
+  })
+
+  async function testCwrap(): Promise<Job> {
+    const res = await server.inject({ method: 'POST', url: '/v1/cloud/remotes/test', headers: JSON_HEADERS, payload: { name: 'cwrap' } })
+    assert.equal(res.statusCode, 202, res.body)
+    return waitForJob(server, (res.json() as JobAccepted).job.id)
+  }
+
+  it('the legitimate Test answers a verdict, not the argv-guard refusal', async () => {
+    mockOf(server).addFixture({ command: TIMEOUT, result: { stdout: '[]', stderr: '', exitCode: 0 } })
+    const job = await testCwrap()
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const verdict = (job.result as { verdict: string }).verdict
+    assert.ok(['ok', 'auth', 'not-found', 'unreachable', 'error'].includes(verdict), verdict)
+    assert.ok(!JSON.stringify(job.error ?? '').includes('secret value on the command line'), JSON.stringify(job))
+  })
+
+  it('the leak probe still masks the echoed stored value', async () => {
+    mockOf(server).addFixture({
+      command: TIMEOUT,
+      result: { stdout: '', stderr: 'Failed to create file system for "cwrap:": NewFs: AccessDenied: bad credential cwrap for s3wrap\n', exitCode: 1 },
+    })
+    const job = await testCwrap()
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const message = (job.result as { verdict: string, message: string }).message
+    assert.equal((job.result as { verdict: string }).verdict, 'auth')
+    assert.ok(message.includes('[secret]'), message)
+    // The stored value (`cwrap`) is also the remote's NAME — the mask shreds
+    // both occurrences in the MESSAGE (the recorded word-like-secret trade,
+    // cr.55 L6); the job's own params legitimately name the remote.
+    assert.ok(!message.includes('cwrap'), message)
   })
 })

@@ -363,8 +363,12 @@ async function storedRemoteType(configFile: string, name: string): Promise<strin
  *    in a `finally`, so the `[anastest]` section rclone would persist cannot
  *    land in ANAS's own file (GT facts 1 and 2). The argv tail (the
  *    `lsjson <fs>` argument — a path a user typed) still rides the shared
- *    secret-VALUES guard: a value in scope that would ride it is refused, and
- *    the error names nothing (secret-argv).
+ *    secret-VALUES guard: a DIALOG-supplied value that would ride it is
+ *    refused, and the error names nothing (secret-argv). The STORED list
+ *    masks but never refuses (cr.55r P2) — the saved probe's dynamic tail is
+ *    the remote's own NAME plus the typed path, daemon-composed tokens, and
+ *    a stored credential that is a substring of that token must not refuse a
+ *    legitimate Test.
  *
  * A CRYPT remote (the stored section's type for a saved target, the dialog's
  * for an unsaved one) is probed with debug logging on (cloudproof.2 GT): a
@@ -392,7 +396,20 @@ export async function testRemote(
   // dialog's draft name — never the internal env-remote sentinel.
   let namedFs: string
   let env: Record<string, string> | undefined
-  const secretValues: string[] = []
+  // cr.55r P2 (review 2026-10-16): TWO lists, two jobs. `maskValues` is
+  // everything rclone can echo — the dialog's values, their obscured spellings,
+  // and the stored credentials of the target and everything it wraps — and it
+  // masks the RESULT. `dialogSecrets` is only what the DIALOG supplied, and it
+  // is the argv guard's list: cr.48f's contract is that a dialog secret never
+  // rides the argv the daemon composes. The stored list masks but never
+  // refuses — the saved probe's dynamic tail is the remote's own NAME plus the
+  // typed path (daemon-composed tokens, not dialog secrets), and a stored
+  // credential that is a substring of that token (`cwrap` under
+  // `[cwrap] type=crypt remote=s3wrap:`) must not refuse a legitimate Test.
+  // The preview and the run already keep the stored list out of their guard
+  // (cr.55 pinned); the probe now follows the same rule.
+  const maskValues: string[] = []
+  const dialogSecrets: string[] = []
   // The `--config` the PROBE runs against: ANAS's own file for a saved
   // remote, a private throwaway copy for an unsaved dialog (GT fact 2).
   let probeConfig = paths.configFile
@@ -402,14 +419,15 @@ export async function testRemote(
     fs = `${target.name}:${path}`
     namedFs = fs
     // cr.48f: a SAVED remote's credentials live in rclone.conf and were never
-    // loaded — recover them at probe time so the mask (and the argv guard)
-    // cover a backend echoing a STORED credential, exactly as cr.48b covered
-    // the values a dialog hands over. cr.55: through the ONE secret-list
-    // builder the preview and the run mask with too — transitive over the
-    // remotes this one wraps, crypt `password2` included. The recovery is
-    // IN-PROCESS (`remoteSecretValues` → `revealObscured`) — no rclone call
-    // carries a stored or recovered value on its argv.
-    secretValues.push(...await remoteSecretValues(paths.configFile, target.name))
+    // loaded — recover them at probe time so the mask covers a backend
+    // echoing a STORED credential, exactly as cr.48b covered the values a
+    // dialog hands over. cr.55: through the ONE secret-list builder the
+    // preview and the run mask with too — transitive over the remotes this
+    // one wraps, crypt `password2` included. The recovery is IN-PROCESS
+    // (`remoteSecretValues` → `revealObscured`) — no rclone call carries a
+    // stored or recovered value on its argv. The guard list stays EMPTY here
+    // (cr.55r P2): nothing the dialog supplied exists for a saved target.
+    maskValues.push(...await remoteSecretValues(paths.configFile, target.name))
   }
   else {
     const remote = target.remote!
@@ -421,8 +439,12 @@ export async function testRemote(
     const passwordKeys = passwordKeysFor(opts.providers, remote.type)
     for (const [key, value] of Object.entries(remote.options)) {
       const secret = isSecretKey(key, providerOption(opts.providers, remote.type, key))
-      if (secret)
-        secretValues.push(value)
+      if (secret) {
+        // A dialog value: masks AND guards (cr.55r P2 — the guard's list is
+        // the dialog's own values).
+        maskValues.push(value)
+        dialogSecrets.push(value)
+      }
       // `rclone obscure -` neither opens nor writes the config file, so it
       // still names ANAS's own path — only the LISTING gets the copy.
       const envValue = passwordKeys.has(key)
@@ -431,15 +453,20 @@ export async function testRemote(
       // cr.55 (review L7): the child is handed the OBSCURED spelling of an
       // IsPassword value, and rclone `-vv` (the crypt probe's debug stream)
       // prints option values in exactly that spelling — so the mask carries
-      // what the env carried, beside the plain text the dialog typed.
-      if (secret && envValue !== value)
-        secretValues.push(envValue)
+      // what the env carried, beside the plain text the dialog typed. The
+      // obscured spelling is the dialog's value in the form the child
+      // received, so it guards too.
+      if (secret && envValue !== value) {
+        maskValues.push(envValue)
+        dialogSecrets.push(envValue)
+      }
       env[`${PROBE_ENV_PREFIX}${key.toUpperCase()}`] = envValue
     }
     // cr.55: an unsaved wrapper (a crypt over a SAVED s3 remote) opens the
     // wrapped remote with ITS stored credentials — the same builder walks what
-    // the dialog references in the file.
-    secretValues.push(...await remoteSecretValues(paths.configFile, remote.options))
+    // the dialog references in the file. Stored, so: masks, never guards
+    // (cr.55r P2).
+    maskValues.push(...await remoteSecretValues(paths.configFile, remote.options))
     const tmp = await makeProbeConfigDir(paths.configFile, opts.tmpBase)
     tmpDir = tmp.dir
     probeConfig = tmp.configFile
@@ -453,12 +480,15 @@ export async function testRemote(
   try {
     const args = probeArgs(probeConfig, fs, { debug: isCrypt })
     // The dynamic tail (the fs argument — a path a user typed — and the flags
-    // after it) must not carry a plain secret value. The skip count is the
-    // static prefix's own length (timeout + rclone + the --config base +
-    // lsjson — {@link probeStaticPrefix}); anything shorter leaves those
-    // static tokens in the checked tail, where a secret value that is a
-    // substring of the temp config path or of `false` refuses a clean probe.
-    assertNoSecretValues(args, secretValues, probeStaticPrefix(probeConfig).length)
+    // after it) must not carry a DIALOG-supplied plain secret value (cr.55r
+    // P2: the stored list masks but never refuses — the saved probe's fs token
+    // is the remote's own name, and a stored credential that is a substring of
+    // it must not refuse a legitimate Test). The skip count is the static
+    // prefix's own length (timeout + rclone + the --config base + lsjson —
+    // {@link probeStaticPrefix}); anything shorter leaves those static tokens
+    // in the checked tail, where a secret value that is a substring of the
+    // temp config path or of `false` refuses a clean probe.
+    assertNoSecretValues(args, dialogSecrets, probeStaticPrefix(probeConfig).length)
 
     opts.checkpoint?.('the listing')
     const result = await executor.exec(TIMEOUT, args, {
@@ -471,11 +501,11 @@ export async function testRemote(
     // child (on the env) must never ride the message a backend echoed.
     if (isCrypt && verdict.verdict === 'ok') {
       if (CRYPT_UNDECRYPTABLE_RE.test(result.stderr))
-        return { verdict: 'auth', message: maskSecretValues(cryptWrongPasswordMessage(namedFs), secretValues) }
+        return { verdict: 'auth', message: maskSecretValues(cryptWrongPasswordMessage(namedFs), maskValues) }
       if (isEmptyListing(result.stdout))
-        return { verdict: 'ok', message: maskSecretValues(CRYPT_NOTHING_STORED_MESSAGE, secretValues) }
+        return { verdict: 'ok', message: maskSecretValues(CRYPT_NOTHING_STORED_MESSAGE, maskValues) }
     }
-    return { ...verdict, message: maskSecretValues(verdict.message, secretValues) }
+    return { ...verdict, message: maskSecretValues(verdict.message, maskValues) }
   }
   finally {
     // The copy must not outlive the probe — and a cleanup failure must not
