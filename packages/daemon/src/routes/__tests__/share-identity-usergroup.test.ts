@@ -332,7 +332,7 @@ describe('cr.29d — userdel\'s rule, mirrored', () => {
     assert.equal(userdelRemovesUserGroup(null), true)
   })
 
-  it('cr.29e — a trailing comment does not change the value: shadow\'s getdef strips `# …` before the value test', () => {
+  it('cr.29e (Debian rule, node-proven) — no inline comments: an unquoted value runs to the end of the line, a quoted value ends at its closing quote', () => {
     // Proven on the stunt node (Debian 13, shadow 4.17.4, no libeconf —
     // docs/probes/wave2-node/out/ldefs-debian-shadow.txt): Debian's getdef
     // reads an UNQUOTED value to the end of the line (no inline comments), so
