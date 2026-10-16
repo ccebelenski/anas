@@ -521,7 +521,7 @@ describe('cr.59 — ids a POSIX ACL entry names are skipped too', () => {
     assert.deepEqual(ACLTYPE_ARGS, ['get', '-H', '-p', '-o', 'name,value', '-t', 'filesystem', 'acltype'])
     assert.deepEqual(
       aclFindArgs({ path: '/srv/share', xdev: true, prune: ['/srv/share/nfs'] }),
-      ['-P', '/srv/share', '-xdev', '(', '-path', '/srv/share/nfs', ')', '-prune', '-o', '!', '-type', 'l', '-exec', '/usr/bin/getfacl', '-n', '-p', '-c', '-E', '-s', '{}', '+'],
+      ['-P', '/srv/share', '-xdev', '(', '-path', '/srv/share/nfs', ')', '-prune', '-o', '!', '-type', 'l', '-execdir', '/usr/bin/getfacl', '-n', '-p', '-c', '-E', '-s', '{}', '+'],
     )
     // btrfs (AHR): no -xdev, as nf.1.
     assert.deepEqual(aclFindArgs({ path: '/mnt/anas-ahr/ahr0', xdev: false, prune: [] }).slice(0, 3), ['-P', '/mnt/anas-ahr/ahr0', '!'])
