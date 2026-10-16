@@ -235,7 +235,12 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
     // left over from an earlier run carries stale labels, and a stale signature
     // is exactly what makes `pvcreate` abort non-interactively (GT-18).
     const cacheId = BY_ID(CACHE_SERIAL)
-    if (!(await fileExists(`/dev/disk/by-id/${cacheId}`)))
+    // ANY of the three missing → `up` (the smbsvc fixture's AHR half shares
+    // hot7/hot8 and its teardown detaches them while hot9 stays).
+    let allPresent = true
+    for (const serial of [...BAND_SERIALS, CACHE_SERIAL])
+      allPresent = allPresent && await fileExists(`/dev/disk/by-id/${BY_ID(serial)}`)
+    if (!allPresent)
       await execFileAsync(FIXTURE_SH, ['up'])
     for (const serial of [...BAND_SERIALS, CACHE_SERIAL])
       expect(await fileExists(`/dev/disk/by-id/${BY_ID(serial)}`), `${serial} attached`).toBe(true)
