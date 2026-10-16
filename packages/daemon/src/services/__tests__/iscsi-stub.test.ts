@@ -17,6 +17,7 @@
  * of.
  */
 
+import type { IscsiHealth, StatusSummary } from '@anas/shared'
 import type { CommandExecutor, ExecResult, ExecStreamResult, PipelineResult } from '../../executor/types.js'
 import type { IscsiBackingProbe, IscsiReadContext } from '../iscsi.js'
 import assert from 'node:assert/strict'
@@ -25,8 +26,13 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import Fastify from 'fastify'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
+import { JobQueue } from '../../jobs/queue.js'
 import { parseLioSaveconfig } from '../../parsers/lio-saveconfig.js'
+import { dashboardRoutes } from '../../routes/dashboard.js'
+import { iscsiRoutes } from '../../routes/iscsi.js'
+import { DiskIdentityCache } from '../disk-identity-cache.js'
 import { readConfigfs } from '../iscsi-configfs.js'
 import { computeIscsiHealth } from '../iscsi-health.js'
 import { assertSaveable } from '../iscsi-mutate.js'
@@ -636,5 +642,59 @@ describe('quarantine — unmap that LUN, delete the stub backstore, never saveco
     assert.equal(health.installed, false)
     assert.deepEqual(outcomes, [])
     assert.deepEqual(calls, [])
+  })
+
+  // cr.62 (review L9): no GET acts. Both reads that used to quarantine — the
+  // iSCSI health read and the dashboard — now REPORT the placeholder and leave
+  // the act to Repair (POST, Sys.Modify, PVE's CSRF token). The same ANAS-owned
+  // two-signal stub the pass above tears down is the fixture: a GET must run no
+  // targetcli and unlink nothing.
+  describe('cr.62 — the reads report a stub and never act on it (review L9)', () => {
+    it('GET /v1/iscsi/health reports the ANAS stub as still served, runs no targetcli and unlinks nothing', async () => {
+      const calls: string[][] = []
+      const { image, paths: p } = await paths({ probe: { exists: true, size: 0 }, childMounted: false })
+      const srv = Fastify({ logger: false })
+      await srv.register(iscsiRoutes, { prefix: '/v1', executor: recorder(calls), ...p })
+      const res = await srv.inject({ method: 'GET', url: '/v1/iscsi/health' })
+      await srv.close()
+      assert.equal(res.statusCode, 200, res.body)
+      const health = (res.json() as { data: IscsiHealth }).data
+      assert.deepEqual(calls, [], 'a GET never runs targetcli')
+      assert.equal(existsSync(image), true, 'a GET never unlinks the placeholder')
+      assert.equal(health.stubLuns.length, 1)
+      assert.equal(health.stubLuns[0].ownership, 'anas')
+      assert.equal(health.stubLuns[0].quarantined, false)
+      assert.equal(health.stubLuns[0].fileRemoved, false)
+      // Still degraded: every iSCSI mutation but Repair refuses until it is gone.
+      assert.equal(health.degraded, true)
+    })
+
+    it('GET /v1/status cards the stub as still served and points at Repair, and runs no targetcli', async () => {
+      const calls: string[][] = []
+      const { image, paths: p } = await paths({ probe: { exists: true, size: 0 }, childMounted: false })
+      const executor = recorder(calls)
+      const srv = Fastify({ logger: false })
+      await srv.register(dashboardRoutes, {
+        prefix: '/v1',
+        executor,
+        jobQueue: new JobQueue(),
+        diskIdentityCache: new DiskIdentityCache(executor),
+        smbConfPath: join(dir, 'smb.conf'),
+        exportsPath: join(dir, 'exports'),
+        systemdDir: join(dir, 'systemd'),
+        fstabPath: join(dir, 'fstab'),
+        iscsiPaths: p,
+      })
+      const res = await srv.inject({ method: 'GET', url: '/v1/status' })
+      await srv.close()
+      assert.equal(res.statusCode, 200, res.body)
+      const summary = (res.json() as { data: StatusSummary }).data
+      assert.deepEqual(calls, [], 'the dashboard never runs targetcli')
+      assert.equal(existsSync(image), true, 'the dashboard never unlinks the placeholder')
+      const card = summary.warnings.find(w => w.category === 'iscsi' && /placeholder created by/.test(w.message))
+      assert.ok(card, JSON.stringify(summary.warnings))
+      assert.match(card.message, /It is still being served\. Use Repair on the iSCSI menu to take it offline now/)
+      assert.ok(!/could NOT/.test(card.message), 'nothing was attempted, so nothing "could not" be done')
+    })
   })
 })

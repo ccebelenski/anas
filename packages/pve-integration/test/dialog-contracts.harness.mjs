@@ -3148,6 +3148,7 @@ function iscsiHealth(opts = {}) {
       configfsPresent: true,
       saveconfigPresent: true,
       missingLuns: missing,
+      ...(opts.stubs ? { stubLuns: opts.stubs } : {}),
       targetsServingNothing: opts.servingNothing || [],
       portalsWithoutInterface: [],
       foreignChanges: [],
@@ -4206,6 +4207,48 @@ async function iscsiRepairChecks() {
   })).view
   grid = view.down('#iscsiGrid')
   ok('repair(not-installed): DISABLED with the rest of the toolbar',
+    toolbar(grid, ['iscsiRepair']).iscsiRepair.disabled === true)
+
+  // 5. cr.62 (review L9): the health GET no longer takes a placeholder LUN
+  //    offline, so an ANAS-owned stub it REPORTS as still served is Repair's
+  //    to take down — the button is live with no hole at all, and says why.
+  const stub = ownership => ({
+    targetIqn: ISCSI_IQN,
+    tpgTag: 1,
+    lunIndex: 0,
+    backstoreName: 'img1',
+    backingPath: '/tank/img/img1.raw',
+    persistedSize: 1073741824,
+    actualSize: 0,
+    containingMount: '/',
+    expectedMount: '/tank/img',
+    zeroSized: true,
+    wrongMount: true,
+    ownership,
+    quarantined: false,
+    fileRemoved: false,
+  })
+  created.windows.length = 0
+  jobs.length = 0
+  view = (await openIscsiView({ ...ISCSI_ROUTES, 'GET /iscsi/health': iscsiHealth({ stubs: [stub('anas')] }) })).view
+  grid = view.down('#iscsiGrid')
+  state = toolbar(grid, ['iscsiRepair'])
+  ok('repair(served stub): ENABLED — Repair is what takes a placeholder offline (cr.62)',
+    state.iscsiRepair.disabled === false)
+  ok('repair(served stub): the tooltip says it serves a placeholder and Repair takes it offline first',
+    /serving a placeholder, not your data\. Repair takes it offline first/.test(state.iscsiRepair.tip), state.iscsiRepair.tip)
+  const stubBtn = grid.down('#iscsiRepair')
+  stubBtn.handler(stubBtn)
+  await settle()
+  eq('repair(served stub): POSTs the node-level repair',
+    { method: jobs[0] && jobs[0].method, path: jobs[0] && jobs[0].path }, { method: 'post', path: '/iscsi/health/repair' })
+
+  // 6. A FOREIGN target's stub is never ANAS's to touch: it alone does not
+  //    make Repair live.
+  created.windows.length = 0
+  view = (await openIscsiView({ ...ISCSI_ROUTES, 'GET /iscsi/health': iscsiHealth({ stubs: [stub('foreign')] }) })).view
+  grid = view.down('#iscsiGrid')
+  ok('repair(foreign stub): still DISABLED — hands-off',
     toolbar(grid, ['iscsiRepair']).iscsiRepair.disabled === true)
 
   ok('repair: nothing warned', warnings.length === 0, warnings.join(' | '))

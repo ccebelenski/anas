@@ -205,6 +205,37 @@ describe('local proxy → anasd socket', () => {
 
     await server.close()
   })
+  // cr.62 (review L12): the review's exact request. Fastify decodes the node
+  // param (`n%31` → `n1`), which matched this gateway's name while the raw
+  // marker did not, and the fallback rebuilt the daemon path from the DECODED
+  // wildcard — `pools%2Ftank` reached the daemon as `/v1/pools/tank`.
+  it('a percent-encoded node segment is a 400 and never reaches the daemon decoded (L12)', async () => {
+    const server = createServer({
+      config: baseConfig({ nodeName: 'n1', anasdSocket: socketPath }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    received = { headers: {} }
+    const res = await server.inject({
+      method: 'GET',
+      url: '/api/nodes/n%31/v1/pools%2Ftank',
+      headers: { cookie: 'PVEAuthCookie=x' },
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res.json().error.message, /Invalid node name: 'n%31'/)
+    assert.equal(received.url, undefined, 'the daemon was never asked')
+
+    // The same request spelled canonically is forwarded with its encoding intact.
+    const ok = await server.inject({
+      method: 'GET',
+      url: '/api/nodes/n1/v1/pools%2Ftank',
+      headers: { cookie: 'PVEAuthCookie=x' },
+    })
+    assert.equal(ok.statusCode, 200)
+    assert.equal(received.url, '/v1/pools%2Ftank')
+    await server.close()
+  })
 })
 
 describe('remote node forwarding', () => {

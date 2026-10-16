@@ -32,6 +32,18 @@ export interface ServerOptions {
 /** The one 401 sentence for a request pveproxy did not vouch for (§5 rows 9-10). */
 export const NOT_THROUGH_PVEPROXY = 'This request did not come through pveproxy'
 
+/**
+ * The `<node>` segment of `/api/nodes/<node>/…` exactly as the client sent it
+ * (still percent-encoded), or undefined when the URL is not of that shape.
+ */
+export function rawNodeSegment(url: string): string | undefined {
+  const prefix = '/api/nodes/'
+  if (!url.startsWith(prefix))
+    return undefined
+  const end = url.indexOf('/', prefix.length)
+  return end > prefix.length ? url.slice(prefix.length, end) : undefined
+}
+
 export function createServer(opts: ServerOptions = {}) {
   const config = opts.config ?? loadConfig()
   const provider = opts.authProvider ?? createAuthProvider(config.authProvider, opts.proxyKey)
@@ -103,13 +115,21 @@ export function createServer(opts: ServerOptions = {}) {
 
   // Node-scoped API: local node → anasd socket; other node → peer gateway.
   server.all('/api/nodes/:node/v1/*', async (request, reply) => {
-    const { node } = request.params as { 'node': string, '*': string }
-
-    if (!NODE_NAME_RE.test(node)) {
+    // cr.62 (review L12): the node segment is read from the RAW request line,
+    // never from Fastify's decoded param. A node name is a hostname — nothing
+    // in it ever needs percent-encoding — so a segment that is not a node name
+    // AS SENT (`n%31`) is a 400, not a different spelling of `n1`. Before this,
+    // the decoded param matched while the raw marker below did not, and the
+    // fallback rebuilt the daemon path from the DECODED wildcard: `%2F` became
+    // a real `/` and the daemon saw a different path than the client sent.
+    const rawNode = rawNodeSegment(request.url)
+    if (rawNode === undefined || !NODE_NAME_RE.test(rawNode)) {
+      const shown = rawNode ?? (request.params as { node: string }).node
       return reply.code(400).send({
-        error: { code: 'VALIDATION_ERROR', message: `Invalid node name: '${node}'` },
+        error: { code: 'VALIDATION_ERROR', message: `Invalid node name: '${shown}'` },
       })
     }
+    const node = rawNode
 
     if (node === config.nodeName) {
       // Preserve the path's original percent-encoding. Fastify decodes the
@@ -117,12 +137,16 @@ export function createServer(opts: ServerOptions = {}) {
       // routes keyed by a URL-encoded path — e.g. NFS exports at
       // /shares/nfs/:path (identity is the URL-encoded mountpoint). Slice the
       // still-encoded suffix (path + query) out of the raw request URL instead.
+      //
+      // The marker is built from the raw segment (validated above), so it is
+      // always found; there is no fallback to the decoded wildcard (L12).
       const marker = `/api/nodes/${node}/v1/`
-      const idx = request.url.indexOf(marker)
-      const rest = idx >= 0
-        ? request.url.slice(idx + marker.length)
-        : `${(request.params as { '*': string })['*'] ?? ''}`
-      const anasdPath = `/v1/${rest}`
+      if (!request.url.startsWith(marker)) {
+        return reply.code(400).send({
+          error: { code: 'VALIDATION_ERROR', message: `Invalid request path for node '${node}'` },
+        })
+      }
+      const anasdPath = `/v1/${request.url.slice(marker.length)}`
       await proxyToLocalSocket(request, reply, {
         socketPath: config.anasdSocket,
         anasdPath,

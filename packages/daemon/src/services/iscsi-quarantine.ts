@@ -53,11 +53,21 @@
  *
  * ## Why it runs where it runs
  *
- * At daemon start, and on every `/v1/iscsi/health` read and every dashboard
- * warning collection. Those are the moments ANAS looks at the iSCSI tree at all
- * — there is no poller and there will not be one (Principle 7). Detection is a
- * cheap gate: a node with no stub never takes the lock, never re-reads, and pays
- * only the `stat` and `findmnt` the read layer already does.
+ * At daemon start (the case F2 was found in: `targetctl restore` runs long
+ * before anasd), and at the head of `POST /v1/iscsi/health/repair` — the
+ * operator's one verb for a degraded iSCSI tree. There is no poller and there
+ * will not be one (Principle 7). Detection is a cheap gate: a node with no stub
+ * never takes the lock, never re-reads, and pays only the `stat` and `findmnt`
+ * the read layer already does.
+ *
+ * NOT on a read (story cr.62, review L9). `GET /v1/iscsi/health` and the
+ * dashboard's `GET /v1/status` used to quarantine here too. A GET is a read
+ * (Principle 4, cr.27): a Sys.Audit holder — or a cross-site top-level
+ * navigation, which carries PVE's Lax cookie and needs no CSRF token — must
+ * not be able to make the daemon unmap a LUN and unlink a file. The reads now
+ * go through {@link readIscsiHealth}: they REPORT a stub (`quarantined: false`,
+ * the node degraded while it is ANAS's) and the card points at Repair, which
+ * needs `Sys.Modify` and PVE's CSRF token like every other change.
  *
  * Idempotent and fail-open throughout: no LIO, no `targetcli`, an unreadable
  * mount table or a `targetcli` that refuses all end in "nothing was quarantined"
@@ -278,6 +288,21 @@ export async function readIscsiHealthWithQuarantine(
     health: { ...after.health, stubLuns, degraded: after.health.degraded || stubLuns.some(s => s.ownership === 'anas') },
     outcomes,
   }
+}
+
+/**
+ * The health a READ answers (cr.62, review L9): one gather, build and diff, no
+ * lock and no act. A stub is reported exactly as it is — still served,
+ * `quarantined: false` — and an ANAS-owned one degrades the node, so every
+ * iSCSI mutation but Repair refuses until Repair (which quarantines first) or
+ * the next daemon start takes it offline.
+ */
+export async function readIscsiHealth(
+  executor: CommandExecutor,
+  paths: IscsiPaths = {},
+  opts: { disabledDetail?: (target: IscsiTargetDetail) => string | undefined } = {},
+): Promise<{ ctx: IscsiReadContext, targets: IscsiTargetDetail[], health: IscsiHealth }> {
+  return read(executor, paths, opts)
 }
 
 /** One gather + build + diff. */

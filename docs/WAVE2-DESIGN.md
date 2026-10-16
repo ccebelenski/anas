@@ -379,7 +379,7 @@ index lists `GET /v1/iscsi/targets/:iqn/luns/:lun`, which no route registers (al
 | `PUT` | `/v1/cloud/tasks/:name` | Sys.Modify | `cloud.ts:852` |  |
 | `DELETE` | `/v1/cloud/tasks/:name` | Sys.Modify | `cloud.ts:893` |  |
 | `POST` | `/v1/cloud/tasks/:name/run` | Sys.Modify | `cloud.ts:928` |  |
-| `GET` | `/v1/status` | Sys.Audit | `dashboard.ts:124` |  |
+| `GET` | `/v1/status` | Sys.Audit | `dashboard.ts:124` | a pure read since cr.62 (review L9): an iSCSI placeholder LUN is carded, never quarantined here |
 | `GET` | `/v1/telemetry` | Sys.Audit | `dashboard.ts:352` |  |
 | `GET` | `/v1/pools/:name/datasets` | Sys.Audit | `datasets.ts:733` |  |
 | `GET` | `/v1/pools/:name/datasets/*` | Sys.Audit | `datasets.ts:807` |  |
@@ -390,7 +390,7 @@ index lists `GET /v1/iscsi/targets/:iqn/luns/:lun`, which no route registers (al
 | `GET` | `/v1/disks` | Sys.Audit | `disks.ts:444` |  |
 | `GET` | `/v1/disks/:id` | Sys.Audit | `disks.ts:449` |  |
 | `GET` | `/v1/disks/:id/smart` | Sys.Audit | `disks.ts:462` | runs smartctl (may wake a spun-down disk) |
-| `GET` | `/v1/fs/browse` | Sys.Audit | `fs.ts:17` | lists directory names anywhere on the host (as root) |
+| `GET` | `/v1/fs/browse` | Sys.Audit | `fs.ts:17` | cr.62 (review L11): without Sys.Modify, only inside an SMB share, NFS export or ZFS dataset mountpoint (never `/`, real path) — else 403 naming Sys.Modify; Sys.Modify is unbounded (the pickers are mutation dialogs) |
 | `GET` | `/v1/health` | Sys.Audit | `health.ts:5` | the panels' install probe (`20-notinstalled.js:135`): a 403 must not read as "not installed" |
 | `POST` | `/v1/iscsi/targets` | Sys.Modify | `iscsi-mutate.ts:248` |  |
 | `PUT` | `/v1/iscsi/targets/:iqn` | Sys.Modify | `iscsi-mutate.ts:314` |  |
@@ -403,7 +403,7 @@ index lists `GET /v1/iscsi/targets/:iqn/luns/:lun`, which no route registers (al
 | `GET` | `/v1/iscsi/claims` | Sys.Audit | `iscsi-mutate.ts:1140` |  |
 | `GET` | `/v1/iscsi/targets` | Sys.Audit | `iscsi.ts:41` |  |
 | `GET` | `/v1/iscsi/sessions` | Sys.Audit | `iscsi.ts:60` |  |
-| `GET` | `/v1/iscsi/health` | Sys.Audit | `iscsi.ts:76` |  |
+| `GET` | `/v1/iscsi/health` | Sys.Audit | `iscsi.ts:76` | a pure read since cr.62 (review L9): a placeholder LUN is reported, still served; `POST /v1/iscsi/health/repair` (and the daemon start) takes it offline |
 | `GET` | `/v1/iscsi/targets/:iqn` | Sys.Audit | `iscsi.ts:85` |  |
 | `GET` | `/v1/jobs` | Sys.Audit | `jobs.ts:62` | every user's jobs, with createdBy |
 | `GET` | `/v1/jobs/:id` | Sys.Audit | `jobs.ts:84` |  |
@@ -431,7 +431,8 @@ index lists `GET /v1/iscsi/targets/:iqn/luns/:lun`, which no route registers (al
 | `POST` | `/v1/pools/:name/attach` | Sys.Modify | `pools.ts:1847` |  |
 | `POST` | `/v1/pools/:name/export` | Sys.Modify | `pools.ts:2046` |  |
 | `DELETE` | `/v1/pools/:name` | Sys.Modify | `pools.ts:2190` |  |
-| `GET` | `/v1/replication/remotes` | Sys.Audit | `replication-remotes.ts:79` |  |
+| `GET` | `/v1/replication/remotes` | Sys.Audit | `replication-remotes.ts:79` | a pure read since cr.62 (review L9): `publicKey` is `''` until the key exists; it no longer runs `ssh-keygen` |
+| `POST` | `/v1/replication/remotes/keypair` | Sys.Modify | `replication-remotes.ts` | cr.62: creates the cluster replication key (a job; never regenerates an existing one) |
 | `POST` | `/v1/replication/remotes` | Sys.Modify | `replication-remotes.ts:88` |  |
 | `PUT` | `/v1/replication/remotes/:name` | Sys.Modify | `replication-remotes.ts:123` |  |
 | `DELETE` | `/v1/replication/remotes/:name` | Sys.Modify | `replication-remotes.ts:169` |  |

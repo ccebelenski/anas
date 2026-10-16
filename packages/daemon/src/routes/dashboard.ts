@@ -183,8 +183,8 @@ export async function dashboardRoutes(
       // surfaced. Healthy adds nothing; a node without LIO costs two stats and
       // adds nothing.
       // Story `iscsi.8` widens it twice: a fileio LUN found to be serving a
-      // PLACEHOLDER is quarantined here (this read is one of the two moments
-      // ANAS looks at the tree at all), and a disabled ANAS target gets a card
+      // PLACEHOLDER gets a card (REPORTED only since cr.62 — review L9, no GET
+      // acts; Repair takes it offline), and a disabled ANAS target gets a card
       // that names WHY when a retained job still knows — the image restore that
       // left it dark says so in its own failure text, and nothing else on the
       // system remembers (no shadow state).

@@ -724,6 +724,31 @@ async function openRemotes() {
   eq('and the edited field applied', edited.body.remote.user, 'backup')
 }
 
+// --- 15b. cr.62 (review L9): the GET no longer creates the cluster key ---------
+// A node that never made one answers publicKey ''. The window says so and
+// offers Create cluster key — the POST that makes it — instead of a read
+// that wrote /etc/pve/priv as a side effect.
+{
+  reset()
+  state.get = { '/replication/remotes': { data: { ...REGISTRY.data, publicKey: '' } } }
+  const mgr = await openRemotes()
+  const createKey = mgr.down('#createPublicKey')
+  ok('cr.62: a Create cluster key button exists', !!createKey)
+  eq('cr.62: it is shown while the node has no key', createKey && createKey.hidden, false)
+  ok('cr.62: the key field says there is none yet',
+    /no cluster key yet/.test(mgr.down('#publicKey').getValue() || ''), mgr.down('#publicKey').getValue())
+  createKey.handler(createKey)
+  await settle()
+  eq('cr.62: Create POSTs the keypair verb as a job',
+    state.requests.map(r => `${r.method} ${r.path}`).join(' | '), 'post /replication/remotes/keypair')
+
+  reset()
+  state.get = { '/replication/remotes': REGISTRY }
+  const mgr2 = await openRemotes()
+  eq('cr.62: with a key, Create is hidden', mgr2.down('#createPublicKey').hidden, true)
+  eq('cr.62: and nothing was posted by opening the window', state.requests.length, 0)
+}
+
 // =============================================================================
 //  pvepool.2 (U2) — the pickers list PVE pools and omit what PVE owns
 // =============================================================================

@@ -92,6 +92,8 @@
  *   GET  /v1/iscsi/health   → { …envelope, missingLuns[], targetsServingNothing[],
  *        portalsWithoutInterface[], foreignChanges[], degraded, interfacesUnknown }
  *   POST /v1/iscsi/health/repair                                       → 202/409
+ *        (cr.62: the GET is a pure read — a placeholder LUN is REPORTED in
+ *        stubLuns[] and still served; Repair takes it offline before it plans)
  *
  *   backup2.7 — the whole-image restore lives on the LUN toolbar, because the
  *   LUN is the thing being restored:
@@ -490,6 +492,22 @@
         return out;
     }
 
+    // cr.62 (review L9): the health read no longer takes a placeholder LUN
+    // offline — no GET acts. An ANAS-owned stub the read reports as still
+    // served is Repair's to take down (the POST quarantines before it plans),
+    // so it makes the button live on its own. A foreign target's stub is never
+    // ANAS's to touch and does not count.
+    function servedStubs(health) {
+        var stubs = (health && isArray(health.stubLuns)) ? health.stubLuns : [];
+        var out = [];
+        for (var i = 0; i < stubs.length; i++) {
+            if (stubs[i] && stubs[i].ownership === 'anas' && stubs[i].quarantined !== true) {
+                out.push(stubs[i]);
+            }
+        }
+        return out;
+    }
+
     function applyHealth(view, health) {
         var grid = gridOf(view);
         if (!grid) {
@@ -501,9 +519,14 @@
         }
         var missing = (health && isArray(health.missingLuns)) ? health.missingLuns : [];
         var ready = repairableHoles(health);
-        setDisabled(grid, 'iscsiRepair', ready.length === 0);
+        var stubs = servedStubs(health);
+        setDisabled(grid, 'iscsiRepair', ready.length === 0 && stubs.length === 0);
         var tip;
-        if (!missing.length) {
+        if (stubs.length) {
+            tip = stubs.length + ' ' + (stubs.length === 1 ? t('LUN is') : t('LUNs are'))
+                + ' ' + t('serving a placeholder, not your data. Repair takes it offline first (the saved record is kept), '
+                    + 'then puts back whatever LUN has its storage again.');
+        } else if (!missing.length) {
             tip = t('Nothing to repair — the live configuration matches the saved one.');
         } else if (!ready.length) {
             var paths = [];
@@ -542,7 +565,8 @@
     function repairHoles(view, node) {
         var grid = gridOf(view);
         var ready = repairableHoles(grid && grid.anasHealth);
-        if (!ready.length) {
+        var stubs = servedStubs(grid && grid.anasHealth);
+        if (!ready.length && !stubs.length) {
             return;
         }
         ANAS.runJob({
@@ -552,9 +576,15 @@
             body: {},
             view: view,
             failTitle: 'Repair failed',
-            successMsg: t('Restore holes repaired') + ': ' + ready.length + ' '
-                + (ready.length === 1 ? t('LUN') : t('LUNs')),
+            successMsg: ready.length
+                ? t('Restore holes repaired') + ': ' + ready.length + ' ' + (ready.length === 1 ? t('LUN') : t('LUNs'))
+                : t('Placeholder LUNs taken offline'),
             onComplete: function () {
+                loadTargets(view, node);
+            },
+            // cr.62: a refusal can follow a placeholder Repair DID take offline
+            // (its storage is still absent), so the view re-reads either way.
+            onFailed: function () {
                 loadTargets(view, node);
             }
         });

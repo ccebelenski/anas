@@ -28,7 +28,7 @@
 import type { DashboardWarning, IscsiHealth, IscsiTargetDetail } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { IscsiPaths } from './iscsi.js'
-import { readIscsiHealthWithQuarantine } from './iscsi-quarantine.js'
+import { readIscsiHealth } from './iscsi-quarantine.js'
 
 /**
  * Build the `iscsi` dashboard cards from a health diff. Pure — the caller has
@@ -88,9 +88,16 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
       : stub.zeroSized
         ? `it is 0 bytes where the saved configuration says ${stub.persistedSize}`
         : `it is on ${stub.containingMount} instead of ${stub.expectedMount}`
+    // cr.62 (review L9): the dashboard and the health read no longer act, so
+    // an un-quarantined stub here means "not taken offline YET", not "ANAS
+    // tried and failed". The act is Repair's (POST, Sys.Modify): it unmaps a
+    // placeholder before it plans anything. A foreign target's stub is never
+    // ANAS's to touch (story `iscsi.5`), so that one stays a hand job.
     const action = stub.quarantined
       ? `ANAS has taken it offline${stub.fileRemoved ? ' and removed the placeholder' : ''}; mount the filesystem and use Repair on the iSCSI menu to put the LUN back with its own serial.`
-      : `ANAS could NOT take it offline — it is still being served. Log initiators out and delete LUN ${stub.lunIndex} by hand, then mount the filesystem and use Repair.`
+      : stub.ownership === 'anas'
+        ? `It is still being served. Use Repair on the iSCSI menu to take it offline now — Repair unmaps a placeholder before anything else and keeps the saved record — then mount the filesystem and use Repair again to put the LUN back with its own serial.`
+        : `It is still being served, and the target is not ANAS's, so ANAS will not unmap it. Log initiators out and delete LUN ${stub.lunIndex} by hand, then mount the filesystem.`
     warnings.push({
       level: 'critical',
       category: 'iscsi',
@@ -208,11 +215,10 @@ export async function collectIscsiWarnings(
   opts: { disabledDetail?: (target: IscsiTargetDetail) => string | undefined } = {},
 ): Promise<DashboardWarning[]> {
   try {
-    // The dashboard read is one of the two moments ANAS looks at the iSCSI tree,
-    // so it is one of the two that QUARANTINES a stub (story `iscsi.8`). A node
-    // with no placeholder pays exactly what it paid before: one gather, no lock,
-    // no second read.
-    const { ctx, health } = await readIscsiHealthWithQuarantine(executor, paths, opts)
+    // A pure read (cr.62, review L9): the dashboard REPORTS a placeholder LUN
+    // (the card above says it is still served and points at Repair); it never
+    // quarantines one — a GET must not act. One gather, no lock.
+    const { ctx, health } = await readIscsiHealth(executor, paths, opts)
     if (!ctx.live.present && ctx.persisted === null)
       return []
     return buildIscsiWarnings(health)

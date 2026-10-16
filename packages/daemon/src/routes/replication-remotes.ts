@@ -4,6 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { RemotesPaths } from '../services/replication-remotes.js'
 import type { ResolvedRemote, Transport } from '../services/replication-transport.js'
+import { readFile } from 'node:fs/promises'
 import { ReplicationTaskName, TestRemoteRequest, UpsertRemoteRequest } from '@anas/shared'
 import { GuardRefusalError } from '../safety/guard.js'
 import {
@@ -23,6 +24,8 @@ import { requireIdentity } from './identity.js'
  * connection diagnostics + target-picker feeds.
  *
  *   GET    /v1/replication/remotes            → { version, remotes, publicKey }
+ *                                                (publicKey '' until one exists)
+ *   POST   /v1/replication/remotes/keypair    → create the cluster key (202 job, cr.62)
  *   POST   /v1/replication/remotes            → register (CAS; 409 on stale/dup)
  *   PUT    /v1/replication/remotes/:name      → upsert (CAS)
  *   DELETE /v1/replication/remotes/:name      → remove (CAS; 400 if a task uses it)
@@ -77,12 +80,36 @@ export async function replicationRemotesRoutes(
   const { executor, jobQueue, paths, transport, systemdDir } = opts
 
   // --- GET /replication/remotes — registry + public key ---------------------
+  // A pure read (cr.62, review L9). It used to CREATE the cluster keypair
+  // (`ssh-keygen` → /etc/pve/priv/anas/replication_key) when none existed, so a
+  // Sys.Audit login — or a cross-site navigation riding PVE's Lax cookie, which
+  // needs no CSRF token — picked the moment a private key was written. The key
+  // is now read if it is there and '' when it is not; creating it is the POST
+  // below (Sys.Modify, CSRF, a job).
   server.get('/replication/remotes', async () => {
     const [reg, publicKey] = await Promise.all([
       readRemotes(paths),
-      ensureKeypair(executor, paths),
+      readFile(`${paths.keyPath}.pub`, 'utf-8').then(t => t.trim(), () => ''),
     ])
     return { data: { version: reg.version, remotes: reg.remotes, publicKey } }
+  })
+
+  // --- POST /replication/remotes/keypair — create the cluster key (cr.62) ----
+  // The act the GET above used to perform, as a mutation: idempotent (an
+  // existing key is never regenerated — ensureKeypair checks first, again in
+  // the job), journald-audited through the queue, and the job's result is the
+  // public key. The Remotes window offers it when the GET answered no key.
+  server.post('/replication/remotes/keypair', async (request, reply) => {
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+    const job = jobQueue.submit(
+      'replication.keypair.create',
+      { ...identity, params: {} },
+      async () => ({ publicKey: await ensureKeypair(executor, paths) }),
+    )
+    reply.code(202)
+    return { job }
   })
 
   // --- POST /replication/remotes — register (CAS) ---------------------------

@@ -325,6 +325,29 @@ describe('the gateway with the pve provider (end to end)', () => {
     await s.close()
   })
 
+  // cr.62 (review L9): the acts that used to ride a GET — the iSCSI placeholder
+  // quarantine (GET /iscsi/health, GET /status) and the cluster replication key
+  // (GET /replication/remotes) — are POST verbs now: Repair and the keypair
+  // verb. A reader (or a cross-site navigation, which can only make a GET and
+  // carries no CSRF token — PVE refuses a token-less POST with 401 before the
+  // gateway, AnasProxy-auth.t row 5) cannot reach them; Sys.Modify can.
+  it('cr.62: the acting verbs are POSTs — a reader gets 403 and nothing reaches the daemon; Sys.Modify goes through', async () => {
+    const s = gateway()
+    const ACTS = ['/api/nodes/testnode/v1/iscsi/health/repair', '/api/nodes/testnode/v1/replication/remotes/keypair']
+    for (const url of ACTS) {
+      const res = await s.inject({ method: 'POST', url, headers: { 'x-anas-auth': sign('anas-audit@pve', ['Sys.Audit'], 'POST', url) } })
+      assert.equal(res.statusCode, 403, url)
+      assert.match(res.json().error.message, /^Permission check failed \(\/, Sys\.Modify\): anas-audit@pve does not have it\./)
+    }
+    assert.equal(received.length, 0)
+    for (const url of ACTS) {
+      const res = await s.inject({ method: 'POST', url, headers: { 'x-anas-auth': sign('root@pam', ['Sys.Audit', 'Sys.Modify'], 'POST', url) } })
+      assert.equal(res.statusCode, 200, url)
+    }
+    assert.deepEqual(received.map(r => `${r.method} ${r.url}`), ['POST /v1/iscsi/health/repair', 'POST /v1/replication/remotes/keypair'])
+    await s.close()
+  })
+
   it('a user with no privilege on / → 403 naming Sys.Audit on a read (also on the gateway\'s own health route)', async () => {
     const s = gateway()
     for (const url of [POOLS, '/api/health']) {

@@ -473,6 +473,7 @@ Routes not carried by the resource tables above, as a route registration exists.
 | `POST` | `/v1/replication/remotes` | replication-remotes.ts |
 | `PUT` | `/v1/replication/remotes/:name` | replication-remotes.ts |
 | `DELETE` | `/v1/replication/remotes/:name` | replication-remotes.ts |
+| `POST` | `/v1/replication/remotes/keypair` | replication-remotes.ts (cr.62: creates the cluster key; the GET above only reads it) |
 | `POST` | `/v1/replication/remotes/test` | replication-remotes.ts |
 | `POST` | `/v1/replication/remotes/:name/test` | replication-remotes.ts |
 | `GET` | `/v1/replication/locations` | replication-remotes.ts |

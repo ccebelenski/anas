@@ -223,7 +223,10 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
     assert.match(card.message, /mount the filesystem and use Repair/i)
   })
 
-  it('a placeholder ANAS could NOT unmap says so, instead of implying it is handled', () => {
+  // cr.62 (review L9): the reads no longer quarantine, so `quarantined: false`
+  // on a card means "not taken offline yet" — the card says it is still served
+  // and names Repair (the POST that takes it offline), never "could NOT".
+  it('a placeholder still being served says so and names Repair as the way to take it offline (cr.62)', () => {
     const w = buildIscsiWarnings(health({
       stubLuns: [{
         targetIqn: IQN,
@@ -244,9 +247,34 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
       degraded: true,
     }))
     const card = w.find(c => /placeholder created by/.test(c.message))!
-    assert.match(card.message, /could NOT take it offline - it is still being served|could NOT take it offline — it is still being served/)
+    assert.match(card.message, /It is still being served\. Use Repair on the iSCSI menu to take it offline now/)
+    assert.ok(!/could NOT/.test(card.message), card.message)
     // Only the signal that actually fired is quoted.
     assert.ok(!/instead of/.test(card.message), card.message)
+  })
+
+  it('a FOREIGN placeholder is a hand job — ANAS will not unmap another tool\'s LUN (cr.62)', () => {
+    const w = buildIscsiWarnings(health({
+      stubLuns: [{
+        targetIqn: 'iqn.2026-08.dev.example:other',
+        tpgTag: 1,
+        lunIndex: 3,
+        backstoreName: 'lpahrlun',
+        backingPath: '/mnt/anas-ahr/lpahr/lpahrlun.raw',
+        persistedSize: 536870912,
+        actualSize: 0,
+        containingMount: '/',
+        expectedMount: '/mnt/anas-ahr/lpahr',
+        zeroSized: true,
+        wrongMount: false,
+        ownership: 'foreign',
+        quarantined: false,
+        fileRemoved: false,
+      }],
+    }))
+    const card = w.find(c => /placeholder created by/.test(c.message))!
+    assert.match(card.message, /the target is not ANAS's, so ANAS will not unmap it\. Log initiators out and delete LUN 3 by hand/)
+    assert.ok(!/Use Repair/.test(card.message), card.message)
   })
 
   it('a hole whose path still holds a placeholder says THAT, not "still missing"', () => {

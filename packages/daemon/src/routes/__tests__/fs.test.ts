@@ -6,13 +6,21 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
 
+/** An operator (Sys.Modify): the unbounded browse every picker dialog uses. */
+const MODIFY = { 'x-anas-user': 'root@pam', 'x-anas-privileges': 'Sys.Audit,Sys.Modify' }
+/** A reader (Sys.Audit only): bounded to the managed roots since cr.62. */
+const AUDIT = { 'x-anas-user': 'audit@pve', 'x-anas-privileges': 'Sys.Audit' }
+
 async function browse(
   server: ReturnType<typeof createServer>,
   path: string,
+  headers: Record<string, string> = MODIFY,
+  files = false,
 ): Promise<{ statusCode: number, data?: FsBrowseResult, error?: { code: string, message: string } }> {
   const res = await server.inject({
     method: 'GET',
-    url: `/v1/fs/browse?path=${encodeURIComponent(path)}`,
+    url: `/v1/fs/browse?path=${encodeURIComponent(path)}${files ? '&files=1' : ''}`,
+    headers,
   })
   const body = res.json() as { data?: FsBrowseResult, error?: { code: string, message: string } }
   return { statusCode: res.statusCode, ...body }
@@ -26,6 +34,7 @@ async function browseWithFiles(
   const res = await server.inject({
     method: 'GET',
     url: `/v1/fs/browse?path=${encodeURIComponent(path)}&files=1`,
+    headers: MODIFY,
   })
   const body = res.json() as { data?: FsBrowseResult }
   return { statusCode: res.statusCode, ...body }
@@ -200,5 +209,107 @@ describe('fs browse route (Epic 16.9)', () => {
     const res = await browseWithFiles(server!, dir)
     assert.equal(res.data!.truncated, true)
     assert.equal(res.data!.files!.length, 500)
+  })
+})
+
+// cr.62 (review L11): the daemon lists as root, so a reader (Sys.Audit, no
+// Sys.Modify) is bounded to the managed roots — SMB share paths, NFS export
+// paths, ZFS dataset mountpoints — and `/` is never one. Sys.Modify stays
+// unbounded (the pickers are all in mutation dialogs; the H4 ruling).
+describe('fs browse is bounded for a reader (cr.62, review L11)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string
+  let share: string
+  let outside: string
+
+  /** An smb.conf that shares `sharePath` (and, optionally, `/`); returns its path. */
+  async function shareConf(sharePath: string, alsoRoot = false): Promise<string> {
+    const conf = join(dir, 'smb.conf')
+    await writeFile(conf, [
+      '[global]',
+      '   workgroup = WORKGROUP',
+      '[media]',
+      `   path = ${sharePath}`,
+      ...(alsoRoot ? ['[everything]', '   path = /'] : []),
+      '',
+    ].join('\n'))
+    return conf
+  }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-fs-bound-'))
+    share = join(dir, 'share')
+    outside = join(dir, 'secret')
+    await mkdir(join(share, 'photos'), { recursive: true })
+    await writeFile(join(share, 'readme.txt'), 'x')
+    await mkdir(join(outside, 'keys'), { recursive: true })
+    await writeFile(join(outside, 'id_ed25519'), 'PRIVATE')
+  })
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('a reader lists directories AND files inside a share path', async () => {
+    server = createServer({ mock: true, logger: false, smbConfPath: await shareConf(share) })
+    const res = await browse(server!, share, AUDIT, true)
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(res.data!.dirs, ['photos'])
+    assert.deepEqual(res.data!.files, ['readme.txt'])
+    const sub = await browse(server!, join(share, 'photos'), AUDIT)
+    assert.equal(sub.statusCode, 200)
+  })
+
+  it('a reader is refused outside every root — directories and files — with a 403 naming Sys.Modify', async () => {
+    server = createServer({ mock: true, logger: false, smbConfPath: await shareConf(share) })
+    for (const files of [false, true]) {
+      const res = await browse(server!, outside, AUDIT, files)
+      assert.equal(res.statusCode, 403)
+      assert.equal(res.error!.code, 'FORBIDDEN')
+      assert.match(res.error!.message, /^Permission check failed \(\/, Sys\.Modify\): audit@pve does not have it\./)
+      assert.match(res.error!.message, /limited to the node's shares, exports and dataset mountpoints/)
+      assert.equal(res.data, undefined, 'no listing rides the refusal')
+    }
+    // The review's own examples: the node's private trees.
+    for (const p of ['/root', '/etc/pve/priv', '/etc/anas/creds', '/'])
+      assert.equal((await browse(server!, p, AUDIT, true)).statusCode, 403, p)
+  })
+
+  it('a symlink inside a share does not carry a reader outside it', async () => {
+    await symlink(outside, join(share, 'escape'))
+    server = createServer({ mock: true, logger: false, smbConfPath: await shareConf(share) })
+    const res = await browse(server!, join(share, 'escape'), AUDIT, true)
+    assert.equal(res.statusCode, 403)
+    // A path that does not exist yet is judged by its nearest real ancestor.
+    const below = await browse(server!, join(share, 'escape', 'not-there'), AUDIT)
+    assert.equal(below.statusCode, 403)
+  })
+
+  it('a missing path inside a share is an ordinary exists=false', async () => {
+    server = createServer({ mock: true, logger: false, smbConfPath: await shareConf(share) })
+    const res = await browse(server!, join(share, 'new-folder'), AUDIT)
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.data!.exists, false)
+  })
+
+  it('`/` is never a root: a share of / does not open the host to a reader', async () => {
+    server = createServer({ mock: true, logger: false, smbConfPath: await shareConf(share, true) })
+    assert.equal((await browse(server!, outside, AUDIT)).statusCode, 403)
+    assert.equal((await browse(server!, share, AUDIT)).statusCode, 200)
+  })
+
+  it('a request with no readable privileges is bounded too (fail closed)', async () => {
+    server = createServer({ mock: true, logger: false, smbConfPath: await shareConf(share) })
+    assert.equal((await browse(server!, outside, {})).statusCode, 403)
+  })
+
+  it('Sys.Modify is unbounded, files included (every picker is in a mutation dialog)', async () => {
+    server = createServer({ mock: true, logger: false, smbConfPath: await shareConf(share) })
+    const res = await browse(server!, outside, MODIFY, true)
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(res.data!.dirs, ['keys'])
+    assert.deepEqual(res.data!.files, ['id_ed25519'])
   })
 })

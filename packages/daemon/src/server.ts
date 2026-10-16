@@ -703,7 +703,9 @@ export function createServer(opts?: ServerOptions) {
 
   server.register(healthRoutes, { prefix: '/v1' })
   // Read-only filesystem browse (Epic 16.9) — backs the directory picker and
-  // gentle path validation. No executor, no mutation; node fs only.
+  // gentle path validation. No mutation; node fs only. Its registration (below)
+  // takes the executor and the share/export paths since cr.62: a reader without
+  // Sys.Modify is bounded to the shares, exports and dataset mountpoints.
   // iSCSI read-layer path overrides, declared ONCE and shared by every route
   // that has to ask "is a LUN holding this?" (story iscsi.6) as well as by the
   // iSCSI routes themselves. Defaults live in the service (the real host
@@ -737,7 +739,7 @@ export function createServer(opts?: ServerOptions) {
     // ident.2: the served-device comparison's stat, seamed the same way.
     ...(iscsiDeviceStat ? { deviceStat: iscsiDeviceStat } : {}),
   }
-  server.register(fsRoutes, { prefix: '/v1' })
+  server.register(fsRoutes, { prefix: '/v1', executor, smbConfPath, exportsPath })
   // rclone.5: POST /jobs/:id/cancel is confirm-gated, so the job routes take the store.
   server.register(jobRoutes, { prefix: '/v1', jobQueue, confirmStore })
   // fstabPath + pveStoragePath feed the story 3.27 mountpoint flow: fstab

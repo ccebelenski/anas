@@ -1052,9 +1052,16 @@
             } catch (eLoad) {
                 ANAS.warn('remotes grid load failed: ' + ANAS.errText(eLoad));
             }
+            // cr.62 (review L9): the GET only READS the cluster key — it no
+            // longer creates one on first sight — so a node that never made one
+            // answers ''. The window says so and offers Create, a POST (Sys.Modify).
             var key = win.down('#publicKey');
             if (key) {
-                key.setValue(data.publicKey || t('(no cluster key returned by the daemon)'));
+                key.setValue(data.publicKey || t('(no cluster key yet — use Create cluster key)'));
+            }
+            var createKey = win.down('#createPublicKey');
+            if (createKey) {
+                createKey.setHidden(!!data.publicKey);
             }
             updateRemoteButtons(grid);
         }, function (err) {
@@ -1164,7 +1171,23 @@
         }
     }
 
-    function publicKeyPanel() {
+    // cr.62: create the cluster replication key (POST, a job). Idempotent on
+    // the daemon side — an existing key is never regenerated.
+    function createClusterKey(node, win) {
+        ANAS.runJob({
+            node: node,
+            method: 'post',
+            path: '/replication/remotes/keypair',
+            body: {},
+            view: win,
+            failTitle: 'Key creation failed',
+            successMsg: t('Cluster key created'),
+            onComplete: function () { reloadRemotes(win, node); },
+            onFailed: function () { reloadRemotes(win, node); },
+        });
+    }
+
+    function publicKeyPanel(node, getWin) {
         var pasteTrueNas = t('TrueNAS: Credentials → Users → root → Authorized Keys → paste.');
         var pasteLinux = t('Generic Linux: append the key to ~/.ssh/authorized_keys on the remote.');
         return {
@@ -1197,6 +1220,18 @@
                     fieldStyle: 'font-family:monospace;font-size:11px;white-space:pre;',
                     anchor: '100%',
                     value: t('(loading…)'),
+                },
+                {
+                    xtype: 'button',
+                    itemId: 'createPublicKey',
+                    cls: 'anas-btn-repl-create-key',
+                    text: t('Create cluster key'),
+                    iconCls: 'fa fa-key',
+                    hidden: true,
+                    margin: '6 0 0 0',
+                    handler: function () {
+                        createClusterKey(node, getWin());
+                    },
                 },
                 {
                     xtype: 'panel',
@@ -1312,7 +1347,7 @@
                             },
                         },
                     },
-                    publicKeyPanel(),
+                    publicKeyPanel(node, function () { return win; }),
                 ],
                 buttons: [
                     { text: t('Close'), handler: function () { win.close(); } },

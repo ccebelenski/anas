@@ -4,7 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { IscsiIqn } from '@anas/shared'
 import { readNodeInitiatorName } from '../parsers/iscsi-initiator.js'
-import { readIscsiHealthWithQuarantine } from '../services/iscsi-quarantine.js'
+import { readIscsiHealth } from '../services/iscsi-quarantine.js'
 import { buildIscsiTargets, collectIscsiSessions, iscsiAvailability, readIscsiContext, toTargetSummary } from '../services/iscsi.js'
 import { readPveFirewallAdvisory } from '../services/pve-firewall.js'
 
@@ -17,7 +17,9 @@ import { readPveFirewallAdvisory } from '../services/pve-firewall.js'
  *   GET /v1/iscsi/health        → the saveconfig ⟷ configfs diff
  *
  * Read-only, all of it. Every mutation in the epic is a job and belongs to
- * `iscsi.4`; nothing here writes, execs `targetcli`, or touches configfs.
+ * `iscsi.4`; nothing here writes, execs `targetcli`, or touches configfs —
+ * including the health read, which stopped quarantining a stub in cr.62
+ * (review L9: no GET acts; the act is `POST /iscsi/health/repair`'s).
  *
  * FAIL-OPEN is the contract, not a nicety: a node without `targetcli-fb` has no
  * configfs target tree and no `saveconfig.json`, and these routes report that as
@@ -68,13 +70,16 @@ export async function iscsiRoutes(server: FastifyInstance, opts: IscsiRouteOptio
   })
 
   // --- GET /iscsi/health ---------------------------------------------------
-  // The one read that is allowed to CHANGE something (story `iscsi.8`): a fileio
-  // LUN found to be serving a placeholder is unmapped before the answer is sent,
-  // because the alternative is reporting the problem while the empty disk stays
-  // on the network. Everything else here is still strictly read-only, and a node
-  // with no stub takes no lock and does no extra work.
+  // A pure read (cr.62, review L9). Until cr.62 this was the one read allowed
+  // to CHANGE something (story `iscsi.8`): a fileio LUN serving a placeholder
+  // was unmapped before the answer was sent. A GET carries no CSRF token and
+  // needs only Sys.Audit, so that let a read-only login — or a cross-site
+  // navigation riding PVE's Lax cookie — pick the moment ANAS unmapped a LUN
+  // and unlinked a file. The stub is now REPORTED (still served, the node
+  // degraded while it is ANAS's) and the act belongs to Repair (POST, Sys.Modify,
+  // CSRF), which quarantines before it plans; the daemon-start pass still runs.
   server.get('/iscsi/health', async () => {
-    const { health } = await readIscsiHealthWithQuarantine(executor, paths)
+    const { health } = await readIscsiHealth(executor, paths)
     const result: IscsiHealth = health
     return { data: result }
   })

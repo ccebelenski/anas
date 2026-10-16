@@ -109,6 +109,50 @@ describe('replication remotes routes (Epic 5.5.2)', () => {
     assert.equal(data.publicKey, 'ssh-ed25519 AAAAPUB anas-replication')
   })
 
+  // --- cr.62 (review L9): the GET never writes the key; the POST does --------
+  it('GET with no key answers publicKey \'\' and runs no ssh-keygen (cr.62)', async () => {
+    await rm(`${paths.keyPath}.pub`)
+    const res = await server.inject({ method: 'GET', url: '/v1/replication/remotes', headers: IDENTITY })
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.json().data.publicKey, '')
+    assert.deepEqual(mockOf(server).calls.filter(c => c.command.endsWith('ssh-keygen')), [], 'a GET never creates the cluster key')
+  })
+
+  it('POST /replication/remotes/keypair creates the key in a job; GET then shows it (cr.62)', async () => {
+    await rm(`${paths.keyPath}.pub`)
+    mockOf(server).addFixture({ command: '/usr/bin/ssh-keygen', result: { stdout: '', stderr: '', exitCode: 0 } })
+    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/keypair', headers: IDENTITY })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, res.json().job.id)
+    assert.equal(job.status, 'completed')
+    const keygen = mockOf(server).calls.filter(c => c.command.endsWith('ssh-keygen'))
+    assert.equal(keygen.length, 1)
+    assert.deepEqual(keygen[0].args, ['-t', 'ed25519', '-N', '', '-C', 'anas-replication', '-f', paths.keyPath])
+    // What the real ssh-keygen leaves behind, then the read the window makes.
+    await writeFile(`${paths.keyPath}.pub`, 'ssh-ed25519 AAAANEW anas-replication\n', 'utf-8')
+    const { data } = (await server.inject({ method: 'GET', url: '/v1/replication/remotes', headers: IDENTITY })).json()
+    assert.equal(data.publicKey, 'ssh-ed25519 AAAANEW anas-replication')
+  })
+
+  it('POST /replication/remotes/keypair never regenerates an existing key (cr.62)', async () => {
+    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/keypair', headers: IDENTITY })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, res.json().job.id)
+    assert.deepEqual(job.result, { publicKey: 'ssh-ed25519 AAAAPUB anas-replication' })
+    assert.deepEqual(mockOf(server).calls.filter(c => c.command.endsWith('ssh-keygen')), [])
+  })
+
+  it('POST /replication/remotes/keypair from a Sys.Audit-only request is refused by the job backstop (cr.62)', async () => {
+    await rm(`${paths.keyPath}.pub`)
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/replication/remotes/keypair',
+      headers: { ...IDENTITY, 'x-anas-user': 'audit@pve', 'x-anas-privileges': 'Sys.Audit' },
+    })
+    assert.equal(res.statusCode, 403, res.body)
+    assert.deepEqual(mockOf(server).calls.filter(c => c.command.endsWith('ssh-keygen')), [])
+  })
+
   // --- POST create + CAS -----------------------------------------------------
   it('POST registers a remote (202 job); GET then shows it at version 1', async () => {
     const res = await createRemote(0)
