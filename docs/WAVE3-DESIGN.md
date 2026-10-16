@@ -418,10 +418,10 @@ A job holds its locks only while ANAS itself is changing the object. Kernel-driv
   its role as the persisted "an expansion owns this pool" claim that other verbs' gates refuse on;
 - data movers (replication, backup, cloud — *restores hold no source keys, see the note below*) hold shared
   claims on their source for the run, which exclude a destroy, rollback or rename of that dataset, an
-  unmount/disable/remove of the mount a path sits on (`mount:`), and the AHR expand, replace, spare and
+  unmount/disable/remove of the mount a path sits on (`mount:`), and the AHR expand, replace, readd, spare and
   cache steps (`ahr:`) — the operator gets "waiting for zfs.replicate (job …)" instead of a send that dies
   mid-stream. *Restores are not claim holders: a file restore takes no source key (it is `{ lane: 'long' }`
-  with no locks, routes/backup.ts:2726) and an image restore holds only its iSCSI keys — so nothing waits
+  with no locks, routes/backup.ts:2728) and an image restore holds only its iSCSI keys — so nothing waits
   on (or re-gates behind) one.*
 
 Locks do not fix a different starvation: four long data movers fill all 4 slots and a short destroy waits
