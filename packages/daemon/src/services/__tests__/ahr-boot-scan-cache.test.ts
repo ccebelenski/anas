@@ -1,3 +1,4 @@
+import type { AhrCapacity } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -11,6 +12,7 @@ import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { ahrBootScan } from '../ahr-boot-scan.js'
 import { AHR_CACHE_LSBLK_ARGS } from '../ahr-cache.js'
+import { writeIntent } from '../ahr-intent.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../ahr-topology.js'
 
 /**
@@ -63,6 +65,9 @@ const MD_EXPORT = `MD_LEVEL=raid1\nMD_DEVICES=2\nMD_METADATA=1.2\nMD_UUID=aaaaaa
 function ok(stdout: string) {
   return { stdout, stderr: '', exitCode: 0 }
 }
+
+/** An empty capacity record — the intent's before/after are not read by the cache rung. */
+const CAP: AhrCapacity = { rawBytes: 0, usableBytes: 0, usedBytes: 0, freeBytes: 0, redundancyOverheadBytes: 0, unprotectedWastedBytes: 0, pendingBytes: 0 }
 
 type World = 'missing' | 'healthy' | 'bandsdown' | 'bandonly' | 'present'
 
@@ -457,5 +462,129 @@ describe('ahr-boot-scan branch (d) — the rung is a job with its keys (cr.38)',
     assert.deepEqual(rungCalls(missing), [], 'nothing acted before the heal')
     assert.deepEqual(rungCalls(healthy), [], 'nothing acted after it')
     assert.ok(lines.some(l => /rung=cache-recover result=refused/.test(l)), lines.join('\n'))
+  })
+})
+
+/**
+ * Story cr.61 (review M8, L19). Two ways the boot rung used to say nothing:
+ *
+ *  - the AHR topology unreadable while a VG carries a cache — the rung logged
+ *    a skip and notified nobody, so a cache SSD that died while the udev rung
+ *    was refused for the same unreadable topology went unreported;
+ *  - an expansion intent on the pool — the udev door and the operator's
+ *    detach refuse under any intent (`vgreduce --removemissing` must not run
+ *    while the VG's shape is in flight), and the boot rung did not ask.
+ */
+describe('ahr-boot-scan branch (d) — the skips the rung must not keep silent or skip (cr.61)', () => {
+  let dir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-cr61-boot-cache-'))
+    process.env.ANAS_MDADM_CONF = join(dir, 'mdadm.conf')
+    await writeFile(process.env.ANAS_MDADM_CONF, 'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa\n')
+  })
+  afterEach(async () => {
+    delete process.env.ANAS_MDADM_CONF
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  /** The md view answers mdstat, but `mdadm --detail` of the array fails: readAhrPools throws (D12). */
+  function unreadableTopology(lvs: string): MockExecutor {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: ok(MDSTAT) })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: '', stderr: 'mdadm: cannot open /dev/md127: Input/output error\n', exitCode: 1 } })
+    executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_STATE_ARGS, result: ok(lvs) })
+    executor.addFixture({ command: '/usr/bin/perl', result: ok('') })
+    executor.addFixture({ command: '/usr/sbin/lvconvert', result: ok('') })
+    executor.addFixture({ command: '/usr/sbin/vgreduce', result: ok('') })
+    executor.addFixture({ command: '/usr/sbin/vgchange', result: ok('') })
+    executor.addFixture({ command: '/usr/bin/mount', result: ok('') })
+    return executor
+  }
+
+  it('topology unreadable and a VG carries a cache: the operator is told, once per cached VG, and nothing acts (M8)', async () => {
+    const executor = unreadableTopology(lvsJson('missing'))
+    const lines: string[] = []
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l), jobQueue: new JobQueue() })
+    assert.deepEqual(report.cacheRecovered, [])
+    assert.deepEqual(rungCalls(executor), [], 'no recovery on a pool the scan could not read')
+    assert.ok(lines.some(l => /cache-rung=skipped reason=topology-unreadable vgs=tank /.test(l)), lines.join('\n'))
+    const perl = executor.calls.filter(c => c.command === '/usr/bin/perl')
+    assert.equal(perl.length, 1, 'one notification for the one cached VG')
+    const [, , severity, title, body] = perl[0].args
+    assert.equal(severity, 'warning')
+    assert.equal(title, 'AHR read cache not checked: tank')
+    // It names the unreadable read, and claims only what is known.
+    assert.match(body, /could not read the AHR pools at start-up \(.*mdadm --detail --export \/dev\/md127/)
+    assert.match(body, /could not check whether that cache has failed/)
+    assert.match(body, /automatic recovery of a failed or missing cache device did not run/)
+    assert.ok(!/recovery FAILED|whose device is missing/.test(body), body)
+  })
+
+  it('topology unreadable and NO VG carries a cache: nothing to tell', async () => {
+    const executor = unreadableTopology(JSON.stringify({
+      report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: '-wi-ao----', lv_size: String(LV_SIZE) }] }],
+    }))
+    const report = await ahrBootScan(executor, { intentDir: dir, log: () => {}, jobQueue: new JobQueue() })
+    assert.deepEqual(report.cacheRecovered, [])
+    assert.equal(executor.calls.filter(c => c.command === '/usr/bin/perl').length, 0)
+  })
+
+  /** An expansion intent on `tank`, HALTED so branch (b) leaves it alone and only the cache rung is asked. */
+  async function tankIntent(): Promise<void> {
+    await writeIntent('tank', {
+      id: '00000000-0000-4000-8000-000000000061',
+      trigger: 'add-disk',
+      approvedDisks: [X],
+      before: CAP,
+      after: CAP,
+      state: 'halted',
+    }, { dir })
+  }
+
+  it('a failed cache on a pool with an expansion intent is SKIPPED, as the udev and operator doors skip it (L19)', async () => {
+    await tankIntent()
+    const executor = buildExecutor('missing')
+    const queue = new JobQueue()
+    const lines: string[] = []
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l), jobQueue: queue })
+    assert.deepEqual(report.cacheRecovered, [])
+    assert.deepEqual(rungCalls(executor), [], 'no uncache, no removemissing while the VG shape is in flight')
+    assert.equal(queue.list().filter(j => j.operation === 'ahr.cache.detach').length, 0, 'no job submitted')
+    assert.ok(lines.some(l => /pool=tank rung=cache-recover result=skipped detail=Pool 'tank' has an expansion intent \(state 'halted'\)/.test(l)), lines.join('\n'))
+  })
+
+  it('the inline rung (no queue injected) asks the same intent gate', async () => {
+    await tankIntent()
+    const executor = buildExecutor('missing')
+    const lines: string[] = []
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.deepEqual(report.cacheRecovered, [])
+    assert.deepEqual(rungCalls(executor), [])
+    assert.ok(lines.some(l => /pool=tank rung=cache-recover result=skipped detail=Pool 'tank' has an expansion intent/.test(l)), lines.join('\n'))
+  })
+
+  it('an intent written while the rung\'s job waits is seen by the job\'s own re-gate — nothing uncached', async () => {
+    const executor = buildExecutor('missing')
+    const queue = new JobQueue()
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (let i = 0; i < 4; i++)
+      queue.submit('test.hold', { user: 'test', uid: 0 }, () => held)
+    const lines: string[] = []
+    const scan = ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l), jobQueue: queue })
+    for (let i = 0; i < 400 && !queue.list().some(j => j.operation === 'ahr.cache.detach'); i++)
+      await new Promise(resolve => setTimeout(resolve, 5))
+    const job = queue.list().find(j => j.operation === 'ahr.cache.detach')
+    assert.equal(job?.status, 'queued')
+    await tankIntent()
+    release()
+    const report = await scan
+    assert.deepEqual(report.cacheRecovered, [])
+    assert.equal(queue.get(job!.id)?.status, 'failed')
+    assert.match(queue.get(job!.id)?.error?.message ?? '', /has an expansion intent/)
+    assert.deepEqual(rungCalls(executor), [])
   })
 })

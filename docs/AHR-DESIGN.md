@@ -643,7 +643,11 @@ trust boundary, exactly as for the systemd task runners. The script decides
 NOTHING and runs no storage command: the verdict is the daemon's own `dmsetup
 status` read, so the body cannot uncache a healthy pool, and a daemon that is
 not running costs a DELAYED repair rather than a lost one (the boot rung runs
-the same recovery at the next start, and the journal says so). The endpoint
+the same recovery at the next start, and the journal says so). The script
+logs `CacheEventDelivered` only on a 2xx answer; any other status is
+`CacheEventUndelivered REASON=http-<code>` with the daemon's sentence, and no
+answer at all is `REASON=curl-exit-<n>` (cr.61: curl exits 0 on any HTTP
+answer, so a refusal used to read as delivered). The endpoint
 runs `recoverFailedAhrCache` as a job — `lvconvert --uncache` → guarded
 `vgreduce --removemissing` → one `anas-ahr` notification — and is idempotent: a
 second event on an already-uncached pool answers 200 and runs nothing, which
@@ -657,7 +661,11 @@ then `vgchange -ay` and the fstab `mount`, in that order, so a pool never comes
 up serving EIO. It runs AFTER the (a) md ladder on purpose — the
 `--removemissing` guard needs the band arrays present to tell a dead cache from
 an unassembled band. A healthy cached pool is untouched; a guard refusal
-notifies `error` and never takes the daemon down. (3) **`POST
+notifies `error` and never takes the daemon down. Like the udev and operator
+doors, the rung skips (and logs) a pool with an expansion intent (cr.61); and
+when the AHR topology cannot be read while a VG carries a cache, it acts on
+nothing and sends one `warning` per cached VG saying its cache went unchecked
+(cr.61). (3) **`POST
 /v1/ahr/:name/remount`** — `umount` then `mount`, never `remount,rw` (GT-20:
 btrfs refuses it after an error). 409 unless `mountedReadOnly`, 409 while the
 cache still reads `failed` (remounting over a dead cache lands a filesystem

@@ -113,8 +113,19 @@ fi
 BODY=$(printf '{"event":"device-removed","slice":"%s","kernel":"%s"}' "$LABEL" "$KERNEL")
 
 # --max-time bounds this against udev's event timeout; the daemon answers 202
-# as soon as the job is queued, so the normal case is milliseconds.
-if curl --silent --show-error --max-time 10 \
+# as soon as the job is queued (200 when there is nothing to recover), so the
+# normal case is milliseconds.
+#
+# DELIVERED MEANS THE DAEMON ACCEPTED IT (review M8). curl exits 0 on ANY HTTP
+# answer, so its exit status alone would log a 409 or a 503 as delivered while
+# the pool keeps returning EIO. The status code is the verdict: 2xx is
+# delivered; any other answer is a refusal, logged with the code and the
+# daemon's own sentence (the event stays unrecovered until the next event or
+# the boot rung at the next daemon start); a curl failure with no HTTP answer
+# at all (the daemon died mid-request, the timeout) is logged with curl's exit
+# status. The reply body is read into the journal line, flattened to one line
+# and cut, never evaluated.
+RESP=$(curl --silent --show-error --max-time 10 \
   --unix-socket "$SOCKET" \
   --header 'content-type: application/json' \
   --header 'x-anas-user: system:udev-cache-event' \
@@ -122,11 +133,24 @@ if curl --silent --show-error --max-time 10 \
   --header "x-anas-request-id: ${REQ_ID}" \
   --header 'x-anas-privileges: Sys.Audit,Sys.Modify' \
   --data "$BODY" \
-  "http://localhost/v1/ahr/${POOL}/cache/event" >/dev/null 2>&1; then
-  logger -t "$TAG" -p daemon.info "EVENT=CacheEventDelivered POOL=${POOL} SLICE=${LABEL}"
-else
-  logger -t "$TAG" -p daemon.warning \
-    "EVENT=CacheEventUndelivered POOL=${POOL} SLICE=${LABEL} REASON=post-failed DETAIL=recovered-at-next-daemon-start"
-fi
+  --write-out '\n%{http_code}' \
+  "http://localhost/v1/ahr/${POOL}/cache/event" 2>/dev/null)
+CURL_RC=$?
+HTTP_CODE=$(printf '%s\n' "$RESP" | tail -n 1)
+REPLY=$(printf '%s\n' "$RESP" | sed '$d' | tr '\n\r' '  ' | cut -c1-300)
+
+case "$HTTP_CODE" in
+  2[0-9][0-9])
+    logger -t "$TAG" -p daemon.info "EVENT=CacheEventDelivered POOL=${POOL} SLICE=${LABEL} HTTP=${HTTP_CODE}"
+    ;;
+  [1-5][0-9][0-9])
+    logger -t "$TAG" -p daemon.err \
+      "EVENT=CacheEventUndelivered POOL=${POOL} SLICE=${LABEL} REASON=http-${HTTP_CODE} DETAIL=${REPLY:-no-reply-body}"
+    ;;
+  *)
+    logger -t "$TAG" -p daemon.warning \
+      "EVENT=CacheEventUndelivered POOL=${POOL} SLICE=${LABEL} REASON=curl-exit-${CURL_RC} DETAIL=recovered-at-next-daemon-start"
+    ;;
+esac
 
 exit 0

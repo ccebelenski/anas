@@ -835,6 +835,22 @@ health_check() {
   return 1
 }
 
+# The whole-file copy of pve-manager's index.html.tpl that older installs took
+# once, as `index.html.tpl.anas-orig` (review L5, cr.61). Nothing ever read it:
+# the script line is removed surgically by pve-integration/uninstall.sh, and
+# the copy was never refreshed, so after a pve-manager upgrade it is a stale
+# PVE file inside /usr/share/pve-manager that a by-hand "restore" would
+# downgrade the UI with (the 2026-10-14 H2 hazard class, the AnyEvent.pm copy
+# cr.7 retired). No copy is taken any more; one left behind is removed here,
+# never used.
+sweep_stale_tpl_backup() {
+  local tpl="${PVE_TPL:-/usr/share/pve-manager/index.html.tpl}"
+  if [ -f "${tpl}.anas-orig" ]; then
+    rm -f "${tpl}.anas-orig"
+    info "removed stale ${tpl}.anas-orig left by an older install (unused, never restored)"
+  fi
+}
+
 phase1_install() {
   trap rollback ERR
   log "Installing ANAS to ${PREFIX} ..."
@@ -938,16 +954,12 @@ phase1_install() {
   info "waiting for health check"
   health_check
 
-  # 5. PVE UI integration (injection + apt hook), then verify it landed.
-  # First keep a byte-perfect copy of the ONLY Proxmox-owned file we edit
-  # (index.html.tpl) — captured ONCE, as the pristine pre-ANAS original, before
-  # the surgical <script> insert. The uninstall reverts the line surgically, but
-  # this is the belt-and-suspenders original to restore by hand if ever needed.
+  # 5. PVE UI integration (injection + apt hook), then verify it landed. The
+  # ONLY Proxmox-owned file edited is index.html.tpl, by one surgical <script>
+  # line that the uninstall removes the same way; no whole-file copy is kept
+  # (see sweep_stale_tpl_backup).
   local tpl="${PVE_TPL:-/usr/share/pve-manager/index.html.tpl}"
-  if [ -f "${tpl}" ] && ! grep -qF '/pve2/js/anas.js' "${tpl}" && [ ! -f "${tpl}.anas-orig" ]; then
-    cp -a "${tpl}" "${tpl}.anas-orig"
-    info "saved pristine template -> ${tpl}.anas-orig"
-  fi
+  sweep_stale_tpl_backup
   info "installing PVE UI integration"
   "${PREFIX}/packages/pve-integration/install.sh"
   UI_INSTALLED=1

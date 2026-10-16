@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # Tests for packaging/uninstall.sh remove_schedule_units (review F2/F8): the
-# uninstaller removes ALL FOUR ANAS schedule unit families (anas-snap-*,
-# anas-backup-*, anas-repl-*, anas-scrub.*) — their runners are gone with
+# uninstaller removes ALL FIVE ANAS schedule unit families (anas-snap-*,
+# anas-backup-*, anas-repl-*, anas-cloud-*, anas-scrub.*) — their runners are
+# gone with
 # /opt/anas, and a timer firing a missing runner is worse than a lost schedule —
 # and RESTORES mdadm's mdcheck timers when it removed the scrub timer (ruling
 # 2026-09-14, reversing review F2): those timers are enabled by default on a
@@ -72,6 +73,27 @@ make_units() {
       : > "${STAMPS}/stamp-anas-${fam}-${n}.timer"
     done
   done
+  make_cloud_units
+}
+
+# A scheduled cloud sync task's units as services/cloud-units.ts writes them
+# (cr.61, review M9 / W5): `anas-cloud-<name>.{service,timer}`, the runner in
+# /opt/anas, the task JSON in an X-ANAS-Task= comment, a Persistent stamp.
+make_cloud_units() {
+  local n
+  for n in offsite photos; do
+    cat > "${SYSTEMD_DIR}/anas-cloud-${n}.service" <<UNIT
+[Unit]
+Description=ANAS cloud sync task ${n}
+# X-ANAS-Task={"name":"${n}"}
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/node /opt/anas/packages/daemon/dist/cloud-task.js ${n}
+UNIT
+    printf '[Timer]\nOnCalendar=daily\nPersistent=true\n' > "${SYSTEMD_DIR}/anas-cloud-${n}.timer"
+    : > "${STAMPS}/stamp-anas-cloud-${n}.timer"
+  done
 }
 
 echo "== 1. all four families removed =="
@@ -89,6 +111,16 @@ for fam in snap backup repl; do
   check "${fam} timer disabled" \
     grep -q "disable --now anas-${fam}-nightly.timer" "${WORK}/systemctl.log"
 done
+
+echo "== 1b. the cloud sync family is removed too (M9) =="
+for n in offsite photos; do
+  check "cloud ${n}: timer disabled before removal" \
+    grep -q "disable --now anas-cloud-${n}.timer" "${WORK}/systemctl.log"
+  check "cloud ${n}: unit pair + stamp removed" \
+    bash -c "! test -e '${SYSTEMD_DIR}/anas-cloud-${n}.timer' && ! test -e '${SYSTEMD_DIR}/anas-cloud-${n}.service' && ! test -e '${STAMPS}/stamp-anas-cloud-${n}.timer'"
+done
+check "no anas-cloud-* unit file left at all" \
+  bash -c "! ls '${SYSTEMD_DIR}'/anas-cloud-* >/dev/null 2>&1"
 
 echo "== 2. mdcheck is RESTORED to the distro default =="
 check "both mdcheck timers re-enabled, --now" \
@@ -151,6 +183,16 @@ check "no mdcheck mention without a removed scrub timer" \
   bash -c "! grep -q 'mdcheck' '${WORK}/out2.log'"
 check "other families still removed" \
   bash -c "! test -e '${SYSTEMD_DIR}/anas-snap-nightly.timer' && ! test -e '${SYSTEMD_DIR}/anas-backup-hourly.timer'"
+
+echo "== 4b. a node with ONLY cloud tasks still gets them removed =="
+rm -rf "${SYSTEMD_DIR}" "${STAMPS}"
+mkdir -p "${SYSTEMD_DIR}" "${STAMPS}"
+make_cloud_units
+source_uninstall > "${WORK}/cloud-only.log" 2>&1
+check "both cloud unit pairs gone" \
+  bash -c "! ls '${SYSTEMD_DIR}'/anas-cloud-* >/dev/null 2>&1"
+check "the family and its count are printed" \
+  grep -F 'removed 2 ANAS schedule unit pair(s) (anas-cloud-*)' "${WORK}/cloud-only.log"
 
 echo "== 5. idempotent — a second run is clean =="
 make_units

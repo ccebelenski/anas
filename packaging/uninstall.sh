@@ -20,11 +20,15 @@ err()  { printf 'ERROR: %s\n' "$*" >&2; }
 # months-old missed occurrence (review R10).
 TIMERS_STAMP_DIR="${TIMERS_STAMP_DIR:-/var/lib/systemd/timers}"
 
-# Remove the ANAS SCHEDULE units (review F2/F8). ONE rule for all four unit
-# families — `anas-snap-*`, `anas-backup-*`, `anas-repl-*`, `anas-scrub.*` —
-# and one reason for it: every family's runner lives in /opt/anas, which this
-# uninstall is deleting. A systemd timer left behind keeps firing a runner that
-# no longer exists, month after month; a lost schedule is the honest outcome of
+# Remove the ANAS SCHEDULE units (review F2/F8). ONE rule for all five unit
+# families — `anas-snap-*`, `anas-backup-*`, `anas-repl-*`, `anas-cloud-*`,
+# `anas-scrub.*` — and one reason for it: every family's runner lives in
+# /opt/anas, which this
+# uninstall is deleting (a cloud task's ExecStart is
+# /opt/anas/packages/daemon/dist/cloud-task.js; the family was missing here
+# from rclone.2 until cr.61, review M9). A systemd timer left behind keeps
+# firing a runner that no longer exists, month after month; a lost schedule is
+# the honest outcome of
 # uninstalling, a broken one is not. Each family's timers are disabled --now,
 # its unit files and Persistent stamps removed, and one line names the family
 # and the count.
@@ -41,9 +45,9 @@ TIMERS_STAMP_DIR="${TIMERS_STAMP_DIR:-/var/lib/systemd/timers}"
 # Idempotent: every step is guarded, a partially-uninstalled node is fine.
 remove_schedule_units() {
   local family f svc count
-  for family in anas-snap anas-backup anas-repl; do
+  for family in anas-snap anas-backup anas-repl anas-cloud; do
     count=0
-    for f in "${SYSTEMD_DIR}"/${family}-*.service; do
+    for f in "${SYSTEMD_DIR}/${family}"-*.service; do
       [ -e "${f}" ] || continue
       svc="${f##*/}"; svc="${svc%.service}"
       systemctl disable --now "${svc}.timer" >/dev/null 2>&1 || true
@@ -101,6 +105,22 @@ remove_recycle_units() {
   info "removed 1 ANAS schedule unit pair (anas-recycle.*); every #recycle directory and its contents are left in place"
 }
 
+# The whole-file copy of pve-manager's index.html.tpl that older installs took
+# once, as `index.html.tpl.anas-orig` (review L5, cr.61). Nothing ever read it:
+# the script line is removed surgically by pve-integration/uninstall.sh, and
+# the copy was never refreshed, so after a pve-manager upgrade it is a stale
+# PVE file inside /usr/share/pve-manager that a by-hand "restore" would
+# downgrade the UI with (the 2026-10-14 H2 hazard class, the AnyEvent.pm copy
+# cr.7 retired). No copy is taken any more; one left behind is removed here,
+# never used.
+sweep_stale_tpl_backup() {
+  local tpl="${PVE_TPL:-/usr/share/pve-manager/index.html.tpl}"
+  if [ -f "${tpl}.anas-orig" ]; then
+    rm -f "${tpl}.anas-orig"
+    info "removed stale ${tpl}.anas-orig left by an older install (unused, never restored)"
+  fi
+}
+
 usage() {
   cat <<EOF
 ANAS uninstaller
@@ -148,6 +168,8 @@ if [ -x "${PREFIX}/packages/pve-integration/uninstall.sh" ]; then
 else
   info "pve-integration uninstaller not found (skipping)"
 fi
+# 2a. The stale index.html.tpl copy an older install took (review L5).
+sweep_stale_tpl_backup
 
 # 3. Remove the systemd unit files and reload.
 removed_unit=0
@@ -162,7 +184,8 @@ if [ "${removed_unit}" -eq 1 ]; then
 fi
 
 # 3a. Remove the ANAS schedule units (periodic scrub + the snapshot/backup/
-# replication schedules) — all four families, and mdcheck restored to the
+# replication schedules + the cloud sync tasks) — all five families, and
+# mdcheck restored to the
 # distro default when the scrub timer was one of them.
 # See the function above (review F2/F8).
 remove_schedule_units

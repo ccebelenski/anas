@@ -71,6 +71,9 @@ import { pveNotify } from './pve-notify.js'
  *      `cache.state: 'failed'`, which needs evidence the cache is the
  *      problem; a cached volume that is merely inactive (a band that did not
  *      assemble, the cache SSD fine) reads `inactive` and is left alone.
+ *      Like the udev and operator doors it refuses under an expansion intent
+ *      (cr.61), and when the topology cannot be read while a VG carries a
+ *      cache it tells the operator the cache went unchecked (cr.61).
  */
 
 const CAT = '/usr/bin/cat'
@@ -281,13 +284,28 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
   //
   // ONE `lvs` call gates the whole rung: most daemon starts have no cache on
   // the node at all, and the topology read this needs is a dozen commands.
+  //
+  // A topology that cannot be read while a VG carries a cache is NOT silent
+  // (cr.61, review M8): the rung cannot tell a dead cache from a healthy one
+  // without it, so it acts on nothing — and says so to the operator, once per
+  // cached VG, because nothing else will. The udev rung may have been refused
+  // for the same unreadable topology (the script logs that as undelivered),
+  // and the pool can be returning EIO on every read. The sentence claims only
+  // what is known: the VG carries a cache and its state was not checked.
   const cachedVgs = await cachedVgNames(executor)
-  const cacheCandidates: AhrPool[] = cachedVgs.size === 0
-    ? []
-    : [...(await loadPools().catch((err: unknown) => {
-        log(`ahr.boot cache-rung=skipped reason=topology-unreadable detail=${err instanceof Error ? err.message : String(err)}`)
-        return new Map<string, AhrPool>()
-      })).values()].filter(p => cachedVgs.has(p.name))
+  let cacheCandidates: AhrPool[] = []
+  if (cachedVgs.size > 0) {
+    try {
+      cacheCandidates = [...(await loadPools()).values()].filter(p => cachedVgs.has(p.name))
+    }
+    catch (err) {
+      const detail = err instanceof Error ? err.message : String(err)
+      log(`ahr.boot cache-rung=skipped reason=topology-unreadable vgs=${[...cachedVgs].join(',')} detail=${detail}`)
+      for (const vg of cachedVgs)
+        await notifyCacheUnchecked(executor, vg, detail)
+    }
+  }
+  const bootGuard = ahrGuard({ executor, intentDir, iscsiPaths: () => ({}) })
   for (const pool of cacheCandidates) {
     if (pool.cache?.state !== 'failed')
       continue
@@ -338,12 +356,18 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
       // the pool it acts on is the one the job reads under that key, still
       // failed. The scan waits for it: the intent branch below reads the pool
       // this rung may just have brought up.
-      await runCacheRungAsJob(executor, opts.jobQueue, intentDir, pool, rung, log).catch(() => {})
+      await runCacheRungAsJob(opts.jobQueue, bootGuard, pool, rung, log).catch(() => {})
     }
     else {
       // No queue injected (a request-less caller / legacy test): the rung runs
-      // in the scan, as it did before cr.38. The daemon always injects one.
-      await rung(pool).catch(() => {})
+      // in the scan, as it did before cr.38 — behind the same gates the job
+      // runs (cr.61: the expansion-intent gate included). The daemon always
+      // injects a queue.
+      const pre = await guardCheck(bootCacheSpec(bootGuard, pool.name))
+      if ('refusal' in pre)
+        log(`ahr.boot pool=${pool.name} rung=cache-recover result=skipped detail=${pre.refusal.message}`)
+      else
+        await rung(pre.object).catch(() => {})
     }
     // Whatever happened, this pool's record is stale now.
     poolsByName = null
@@ -426,6 +450,52 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
 const BOOT_CACHE_IDENTITY = { user: 'system:boot-cache', uid: 0 } as const
 
 /**
+ * A cached VG the boot scan could not judge (cr.61, review M8): the AHR
+ * topology was unreadable, so whether its cache failed is unknown and the
+ * automatic recovery did not run. Not {@link notifyCacheRecoveryFailed}: that
+ * body asserts a failed or missing cache and a pool that cannot serve reads,
+ * which the scan has no evidence for here — and `lvs` names every cached VG on
+ * the node, an operator's own lvmcache VG included.
+ */
+async function notifyCacheUnchecked(executor: CommandExecutor, vg: string, detail: string): Promise<void> {
+  await pveNotify(
+    executor,
+    'warning',
+    `AHR read cache not checked: ${vg}`,
+    `Volume group '${vg}' carries a read cache, and ANAS could not read the AHR pools at start-up (${detail}), `
+    + `so it could not check whether that cache has failed; the automatic recovery of a failed or missing cache device did not run. `
+    + `If '${vg}' is an AHR pool whose cache device has failed, every read on the pool returns an I/O error until the cache is removed. `
+    + `Check the pool in the Hybrid RAID view and Detach the cache there if it reads failed.`,
+  )
+}
+
+/**
+ * The boot rung's guard spec — the job's and the inline path's, one list.
+ *
+ * THE EXPANSION-INTENT GATE FIRST (cr.61, review L19), as the udev door and
+ * the operator's detach apply it: `vgreduce --removemissing` must not run
+ * while the VG's shape is in flight, and a half-done expansion's unassembled
+ * band reads `[unknown]` in `pvs` exactly as a dead cache device does. The rung
+ * skips and logs; it loses nothing — once the expansion completes or is
+ * abandoned, the next daemon start or cache event runs it.
+ */
+function bootCacheSpec(guard: ReturnType<typeof ahrGuard>, poolName: string): GuardSpec<AhrPool> {
+  return {
+    operation: 'ahr.cache.detach',
+    object: guard.poolView(poolName, 'a boot cache recovery'),
+    gates: [
+      guard.intentGate('the automatic cache recovery is skipped at start-up; it re-runs at the next daemon start or cache event once the expansion completes or is abandoned'),
+      // The evidence, asked again on the pool each door reads: only `failed`
+      // is evidence enough to act on (see the rung's comment above).
+      async p => p.cache?.state === 'failed'
+        ? null
+        : { status: 409, code: 'STATE_CHANGED', message: `the read cache on AHR pool '${p.name}' reads '${p.cache?.state ?? 'absent'}' now — nothing to recover` },
+    ],
+    locks: async (p, bound) => guard.claims(p, bound, 'exclusive'),
+  }
+}
+
+/**
  * The boot cache rung as a JOB (story cr.38, WAVE3-DESIGN §4.4 "work outside
  * the queue"): the DETACH operation (it is the same work, and the cache verbs'
  * in-flight answer is keyed on that pair), the pool's key exclusive, and the
@@ -436,26 +506,13 @@ const BOOT_CACHE_IDENTITY = { user: 'system:boot-cache', uid: 0 } as const
  * (logged here).
  */
 async function runCacheRungAsJob(
-  executor: CommandExecutor,
   queue: JobQueue,
-  intentDir: string,
+  guard: ReturnType<typeof ahrGuard>,
   pool: AhrPool,
   rung: (target: AhrPool) => Promise<void>,
   log: (line: string) => void,
 ): Promise<void> {
-  const guard = ahrGuard({ executor, intentDir, iscsiPaths: () => ({}) })
-  const spec: GuardSpec<AhrPool> = {
-    operation: 'ahr.cache.detach',
-    object: guard.poolView(pool.name, 'a boot cache recovery'),
-    gates: [
-      // The evidence, asked again on the pool each door reads: only `failed`
-      // is evidence enough to act on (see the rung's comment above).
-      async p => p.cache?.state === 'failed'
-        ? null
-        : { status: 409, code: 'STATE_CHANGED', message: `the read cache on AHR pool '${p.name}' reads '${p.cache?.state ?? 'absent'}' now — nothing to recover` },
-    ],
-    locks: async (p, bound) => guard.claims(p, bound, 'exclusive'),
-  }
+  const spec = bootCacheSpec(guard, pool.name)
   const pre = await guardCheck(spec)
   if ('refusal' in pre) {
     log(`ahr.boot pool=${pool.name} rung=cache-recover result=skipped detail=${pre.refusal.message}`)

@@ -142,6 +142,29 @@ for p in "${WORKSPACES[@]}"; do
   cp "${src}/package.json" "${dst}/package.json"
 done
 
+# Dev/test-only build output never ships (2026-10-14 review W3, closed by
+# cr.61). The package tsconfigs compile every src/**/__tests__ into dist, and
+# daemon/dist/bin/selfheal-*.js are the self-heal loop-device suite's entry
+# points: they drive the repair engine outside the job queue and its gates
+# (2026-10-14 review §4), which is not something a node should carry. The
+# suite runs them from the stunt node's rsync deploy
+# (test/stunt-node/deploy-anas.sh), never from a tarball. Pruned for --dev
+# builds too: a dev tarball is a release candidate, and the prune must be
+# what the boot smoke below runs against. The check after the prune fails the
+# build if anything is left, so a renamed directory cannot slip through.
+for p in "${WORKSPACES[@]}"; do
+  find "${APP}/packages/${p}/dist" -type d -name __tests__ -prune -exec rm -rf {} +
+done
+rm -f "${APP}/packages/daemon/dist/bin/"selfheal-*
+rmdir "${APP}/packages/daemon/dist/bin" 2>/dev/null || true
+DEV_ONLY_LEFT="$(find "${APP}/packages" \( -type d -name __tests__ -o -name 'selfheal-*' -path '*/dist/bin/*' \) -print)"
+if [ -n "${DEV_ONLY_LEFT}" ]; then
+  err "dev/test-only files left in the staged tree after the prune:"
+  printf '%s\n' "${DEV_ONLY_LEFT}" >&2
+  exit 1
+fi
+log "Pruned __tests__ and the selfheal-* dev entry points from the staged dist"
+
 # Dev stamp into the STAGED shared const only — this is what /v1/health and
 # the x-anas-version header report at runtime. Fail loudly if the const ever
 # moves and the sed stops matching.

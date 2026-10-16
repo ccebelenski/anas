@@ -9,6 +9,15 @@ on:
 permissions:
   contents: read
 
+# Actions are pinned to the commit their v4 tag pointed at when pinned (2026-10-14
+# review W3, closed by cr.61) — a moved tag cannot change what runs here. Bump by
+# replacing the SHA and the version comment together.
+#
+# NOT run here, on purpose: the Playwright integration specs (tests/integration)
+# drive a live PVE node (the stunt node) and run from test/stunt-node/run-tests.sh,
+# so `forbidOnly`/`retries` keyed on CI in playwright.config.ts never apply; they are
+# type-checked below. AnasProxy-node.t (docs/probes/wave2-node/, the 57 node checks
+# cr.27 cites) needs a node too; `test:unit:perl` runs perl/t/AnasProxy.t only.
 jobs:
   # Build is the real gate: tsc emits AND type-fails (shared -> daemon ->
   # gateway, in dependency order), and the unit tests run against the built
@@ -16,15 +25,23 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+      # --ignore-scripts: no dependency's install script runs in the pipeline;
+      # nothing the build or the suites use needs one.
+      - run: npm ci --ignore-scripts
       - run: npm run build
+      - name: Type-check the integration specs and helpers
+        run: npx tsc -p tests/integration/tsconfig.json
       - name: Install Perl dependencies for tests
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwww-perl liburi-perl
+      # test:unit = shared, daemon, gateway, the UI harnesses, the shell suites
+      # (packaging/test, pve-integration/test) and the perl suite (ruling (k)).
       - run: npm run test:unit
       # 0.4.0/0.4.1 retrospective ruling (c): tests build instants in UTC, and
       # the daemon suite runs a second time under a large-offset non-UTC zone
@@ -37,10 +54,12 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm run lint
