@@ -20,6 +20,15 @@ import { cancelledRunnerExit, defaultSocket, errorMessage, identityHeaders, poll
  *
  * Poll loop (interval, 24h backstop) lives in runner-poll.ts, shared with the
  * backup, snapshot and replicate runners.
+ *
+ * What it prints IS the unit journal's record of the run — and the status and
+ * the Run-Now supervisor read it back verbatim (`parseHelperResult`,
+ * `failureDetailFromJournal`). It needs no mask of its own and must never
+ * print anything but the job record: the daemon masks every string it makes
+ * from rclone's stderr against the remote's stored credentials WHERE the
+ * string is made (cr.55 — the failure message that is `job.error`, the
+ * result's `errorLines`), so the line printed here is already the masked one
+ * (pinned by the route-level leak probe, routes/__tests__/cloud-secret-leak).
  */
 
 export type { Requester, RunLoopOptions, RunnerResponse } from './runner-poll.js'

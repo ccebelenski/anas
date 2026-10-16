@@ -18,8 +18,8 @@ import {
   withTopLevelMounts,
 } from './backup-snapshots.js'
 import { scanNestedFilesystems } from './nested-filesystems.js'
-import { RCLONE, rcloneBaseArgs } from './rclone-config.js'
-import { assertNoSecretValues } from './secret-argv.js'
+import { RCLONE, rcloneBaseArgs, remoteSecretValues } from './rclone-config.js'
+import { assertNoSecretValues, maskSecretValues } from './secret-argv.js'
 import { formatTransientCloudSnapshot, parseTransientCloudSnapshot } from './snapshot-naming.js'
 import { guardSourcePath, readSourceGuardFacts } from './source-guard.js'
 
@@ -45,6 +45,15 @@ import { guardSourcePath, readSourceGuardFacts } from './source-guard.js'
  *     missing at the destination. A missing file is a failure, not a warning.
  *   - Every credential lives in the config file rclone is pointed at, so
  *     NOTHING secret is ever built into this argv.
+ *   - ...but rclone (and the backend behind it) can ECHO a stored credential
+ *     in its own error text. cr.55 (review 2026-10-16 M1): every string the
+ *     run makes from rclone's stderr — the failure message that becomes
+ *     `job.error` and the notification's Error block, the result's
+ *     `errorLines`, the run detail's `recent` messages and `lastError` — is
+ *     masked WHERE IT IS MADE against the remote's stored credentials
+ *     (`remoteSecretValues`, transitive over wrapped remotes), one pass per
+ *     boundary, after the raw text was read. The journal needs no mask of its
+ *     own: the cloud-task runner prints the already-masked job record.
  */
 
 /** rclone's "everything transferred" exit code. */
@@ -763,10 +772,17 @@ export interface CloudRunDeps {
   /** Injectable clock — the transient label and the sweep cutoff. */
   now?: Date
   /**
-   * Plain secret values in scope for the argv guard. There are none in a cloud
-   * sync run — rclone reads every credential from the config file, and a remote
-   * NAME is not a secret — so this is normally empty and the guard is the
-   * structural backstop that would fire if that ever stopped being true.
+   * Plain secret values HANDED to the child, for the argv guard. There are none
+   * in a cloud sync run — rclone reads every credential from the config file,
+   * and a remote NAME is not a secret — so this is normally empty and the
+   * guard is the structural backstop that would fire if that ever stopped
+   * being true. They are masked out of the run's output too; the remote's
+   * STORED credentials (which rclone can echo) are not passed here —
+   * {@link runCloudSync} reads them itself (cr.55), so no caller can forget
+   * them. They do NOT feed the argv guard: the argv holds the operator's own
+   * paths and ANAS's constants, where a stored credential that happens to be
+   * a substring (a source path, `--stats`, the config path) is a coincidence
+   * the guard — which has no length floor — would refuse every run over.
    */
   secrets?: string[]
   /**
@@ -890,6 +906,12 @@ export async function runCloudSync(
     // ANAS makes. Nothing secret is in scope here (see `deps.secrets`), so it
     // normally has nothing to check — which is the point of a backstop.
     assertNoSecretValues(args, deps.secrets ?? [])
+    // cr.55: what rclone can ECHO — the remote's stored credentials,
+    // transitive over the remotes it wraps (the ONE builder the Test and the
+    // preview use; in process, no rclone call). Every string made from its
+    // stderr below is masked with this where it is made.
+    const maskValues = [...(deps.secrets ?? []), ...await remoteSecretValues(deps.paths.configFile, task.remote)]
+    const mask = (text: string): string => maskSecretValues(text, maskValues)
 
     // The last boundary before anything runs (rclone.5 review): a cancel
     // accepted by now ends the run here — the `finally` below still destroys
@@ -908,13 +930,16 @@ export async function runCloudSync(
     // The wall-clock silence watch rides the rclone invocation itself: a hung
     // process emits no stats objects, so the zeros have to come from a clock.
     tracker?.start(publish, deps.timer)
-    const exec = () => execRclone(executor, args, task.mode, updateProgress, deps.onSpawn, tracker ?? undefined, publish)
+    const exec = () => execRclone(executor, args, task.mode, updateProgress, mask, deps.onSpawn, tracker ?? undefined, publish)
     const run = plan.pool
       ? await withTopLevelMounts(executor, [plan.pool], exec, deps.snapshotOptions)
       : await exec()
 
+    // cr.55: the failure message is made from rclone's raw lines and masked
+    // HERE, once — it becomes `job.error`, the notification's Error block and
+    // (through the cloud-task runner) the unit journal's line.
     if (!rcloneRunCompleted(run.exitCode))
-      throw new Error(rcloneFailureMessage(task.mode, run.exitCode, run.log))
+      throw new Error(mask(rcloneFailureMessage(task.mode, run.exitCode, run.log)))
 
     const stats = finalStats(run.log)
     result = {
@@ -935,7 +960,10 @@ export async function runCloudSync(
       // print none (its interval has not fired), and the counters below read
       // 0 in that case — honest only when this flag says so.
       countersReported: run.log.stats !== null,
-      errorLines: run.log.errorLines,
+      // cr.55: rclone's own error lines, masked where the result is made —
+      // they reach `job.result`, the notification's "rclone errors" block and
+      // the runner's result-JSON journal line.
+      errorLines: run.log.errorLines.map(mask),
       ...(nested.length ? { nested } : {}),
     }
   }
@@ -1041,6 +1069,8 @@ async function execRclone(
   args: string[],
   mode: string,
   updateProgress: (message: string) => void,
+  /** cr.55: the run's mask — applied to a per-file event's message before the `recent` ring keeps it. */
+  mask: (text: string) => string,
   onSpawn?: (child: SpawnedChild) => void,
   tracker?: CloudRunDetailTracker,
   publish?: () => void,
@@ -1056,7 +1086,11 @@ async function execRclone(
     },
     onSpawn,
     (event) => {
-      tracker?.onEvent(event)
+      // cr.55: an error event's message is rclone's own text — masked as it
+      // enters the ring, so `recent` and the `lastError` built from it carry
+      // no echoed credential (the file NAME is the operator's data, not a
+      // credential, and is kept).
+      tracker?.onEvent(event.message ? { ...event, message: mask(event.message) } : event)
     },
     // cr.34: the run is a data mover (days for an offsite copy); it ends on
     // its own or through its cancel hook (rclone.5), never by a deadline.

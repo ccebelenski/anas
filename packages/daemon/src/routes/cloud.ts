@@ -36,7 +36,7 @@ import { guardCheck, guarded, GuardRefusalError, sendRefusal, taskClaim } from '
 import { readAhrPools } from '../services/ahr-topology.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyCloudRun } from '../services/cloud-notify.js'
-import { checkPreviewSource, PreviewRefusal, runPreview } from '../services/cloud-preview.js'
+import { checkPreviewSource, cloudPreviewDeps, PreviewRefusal, runPreview } from '../services/cloud-preview.js'
 import { describeChange, describeTasks, destinationChanges, tasksReachingRemote } from '../services/cloud-retarget.js'
 import { runCloudSync } from '../services/cloud-runner.js'
 import {
@@ -909,7 +909,9 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       task = parsed.data
     }
 
-    const deps = { task, paths, fstabPath }
+    // cr.55 (W5): the ONE builder the unit tests use too; the secret list the
+    // answer is masked with is read by the service itself at the boundary.
+    const deps = cloudPreviewDeps(task, paths, fstabPath)
     let ready: true | undefined
     try {
       ready = await guard503(reply, async () => {

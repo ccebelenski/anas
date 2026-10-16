@@ -17,6 +17,7 @@ import {
   normalizeOAuthToken,
   OAUTH_TOKEN_ERROR,
   obscure,
+  PASSWORD_KEYS_OUTSIDE_NAME_RULE,
   passwordKeysFor,
   providerOption,
   RCLONE,
@@ -26,6 +27,7 @@ import {
   readConfig,
   RemoteExistsError,
   RemoteNotFoundError,
+  remoteSecretValues,
   remotesReferencing,
   removeRemote,
   revealObscured,
@@ -1161,5 +1163,99 @@ describe('rclone-config: normalizeOAuthToken (the OAuth paste, human-pass findin
       if (c.value !== undefined)
         assert.equal(res.value, c.value, `value for ${JSON.stringify(c.input)}`)
     }
+  })
+})
+
+// ── cr.55: the ONE secret-list builder (review 2026-10-16 M1, L7 related) ──
+//
+// `remoteSecretValues` is what the remote Test, the task preview and the task
+// run all mask with. These pin its rules against a real file: the stored
+// bytes and the in-process decode, the bool exclusion, the transitive walk
+// over wrapped remotes (crypt/alias `remote`, union `upstreams`, combine
+// `dir=`), a cycle, inline connection-string parameters, crypt `password2`
+// (IsPassword outside the name rule), and fail-open reading.
+
+describe('rclone-config: remoteSecretValues — a remote\'s secret list, transitive (cr.55)', () => {
+  let dir: string
+  let configFile: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-rclone-secrets-'))
+    configFile = join(dir, 'rclone.conf')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  /** REAL rclone v1.74.3 obscurings, KAT-pinned above. */
+  const TOPSECRET1 = 'Sp0SC2lTn1lEc3b6AhZl7HttaRoEDLZhQgk'
+  const GTPASS = '-UHN1nBu7Yj3jQ11eG7NixuTyxrbmw'
+
+  it('PASSWORD_KEYS_OUTSIDE_NAME_RULE is exactly what the captured catalogue types IsPassword outside the name rule', () => {
+    const raw = RAW_FIXTURE as unknown as { Name: string, Options?: { Name: string, IsPassword?: boolean }[] }[]
+    const derived: Record<string, string[]> = {}
+    for (const p of raw) {
+      for (const o of p.Options ?? []) {
+        if (o.IsPassword === true && !isSecretKey(o.Name))
+          (derived[p.Name] ??= []).push(o.Name)
+      }
+    }
+    assert.deepEqual(derived, PASSWORD_KEYS_OUTSIDE_NAME_RULE)
+  })
+
+  it('a section\'s own secrets: the stored bytes, the decoded plain of an obscuring, never a bool literal or a non-secret option', async () => {
+    await writeFile(configFile, `[s3]\ntype = s3\naccess_key_id = AKIAPUBLIC\nsecret_access_key = Sup3rS3cretValue42\n\n[sf]\ntype = sftp\nhost = h\nuser = u\npass = ${GTPASS}\nask_password = true\n`, 'utf-8')
+    assert.deepEqual(await remoteSecretValues(configFile, 's3'), ['Sup3rS3cretValue42'])
+    assert.deepEqual(await remoteSecretValues(configFile, 'sf'), [GTPASS, 'gtpass'])
+  })
+
+  it('TRANSITIVE: a crypt over an s3 remote carries the s3 credential AND its own password + password2 (stored and decoded)', async () => {
+    await writeFile(configFile, `[s3]\ntype = s3\nsecret_access_key = Sup3rS3cretValue42\n\n[c]\ntype = crypt\nremote = s3:bucket/enc\npassword = ${TOPSECRET1}\npassword2 = ${GTPASS}\n`, 'utf-8')
+    const values = await remoteSecretValues(configFile, 'c')
+    for (const v of [TOPSECRET1, 'topsecret1', GTPASS, 'gtpass', 'Sup3rS3cretValue42'])
+      assert.ok(values.includes(v), `${v} missing from ${JSON.stringify(values)}`)
+    // The wrapped remote's list does NOT climb back up to its wrapper.
+    assert.deepEqual(await remoteSecretValues(configFile, 's3'), ['Sup3rS3cretValue42'])
+  })
+
+  it('password2 is a secret on a crypt section only — the same key on another backend is not taken', async () => {
+    await writeFile(configFile, '[x]\ntype = sftp\npassword2 = notasecretvalue\n', 'utf-8')
+    assert.deepEqual(await remoteSecretValues(configFile, 'x'), [])
+  })
+
+  it('an alias over a crypt over an s3 remote: the walk goes all the way down', async () => {
+    await writeFile(configFile, `[s3]\ntype = s3\nsecret_access_key = deepS3secret\n\n[c]\ntype = crypt\nremote = s3:b\npassword = ${TOPSECRET1}\n\n[a]\ntype = alias\nremote = c:sub\n`, 'utf-8')
+    const values = await remoteSecretValues(configFile, 'a')
+    assert.ok(values.includes('deepS3secret') && values.includes('topsecret1'), JSON.stringify(values))
+  })
+
+  it('union `upstreams` (several, with modifiers) and combine `dir=` references are both followed', async () => {
+    await writeFile(configFile, '[a]\ntype = s3\nsecret_access_key = secretOfA1\n\n[b]\ntype = b2\nkey = secretOfB2\n\n[u]\ntype = union\nupstreams = a:x b:y:ro /local/path\n\n[k]\ntype = combine\nupstreams = "one=a:x" two=b:y\n', 'utf-8')
+    assert.deepEqual((await remoteSecretValues(configFile, 'u')).sort(), ['secretOfA1', 'secretOfB2'])
+    assert.deepEqual((await remoteSecretValues(configFile, 'k')).sort(), ['secretOfA1', 'secretOfB2'])
+  })
+
+  it('a reference CYCLE ends — each section is read once', async () => {
+    await writeFile(configFile, '[p]\ntype = alias\nremote = q:\ntoken = cycleTokenP\n\n[q]\ntype = alias\nremote = p:\ntoken = cycleTokenQ\n', 'utf-8')
+    assert.deepEqual((await remoteSecretValues(configFile, 'p')).sort(), ['cycleTokenP', 'cycleTokenQ'])
+  })
+
+  it('an inline connection string\'s secret-rule parameters are taken (quoted or not); its other parameters are not', async () => {
+    await writeFile(configFile, '[c]\ntype = crypt\nremote = :s3,access_key_id=AKIAPUBLIC,secret_access_key=inlineS3secret:bucket\n\n[d]\ntype = alias\nremote = ":sftp,host=h,pass=\'quotedPassVal\'":dir\n', 'utf-8')
+    assert.deepEqual(await remoteSecretValues(configFile, 'c'), ['inlineS3secret'])
+    assert.deepEqual(await remoteSecretValues(configFile, 'd'), ['quotedPassVal'])
+  })
+
+  it('an UNSAVED dialog\'s option map: only what it REFERENCES is read from the file', async () => {
+    await writeFile(configFile, '[s3]\ntype = s3\nsecret_access_key = Sup3rS3cretValue42\n', 'utf-8')
+    // The dialog's own `password` is the probe's business (it has the catalogue).
+    assert.deepEqual(await remoteSecretValues(configFile, { remote: 's3:bucket', password: 'typedInDialog' }), ['Sup3rS3cretValue42'])
+  })
+
+  it('fail-open READING: an absent file, an absent section and a dangling reference contribute nothing', async () => {
+    assert.deepEqual(await remoteSecretValues(join(dir, 'nope.conf'), 'x'), [])
+    await writeFile(configFile, '[c]\ntype = crypt\nremote = gone:b\npassword = plainButShortX\n', 'utf-8')
+    assert.deepEqual(await remoteSecretValues(configFile, 'nosuch'), [])
+    assert.deepEqual(await remoteSecretValues(configFile, 'c'), ['plainButShortX'])
   })
 })

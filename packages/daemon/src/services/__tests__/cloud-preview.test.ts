@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { CloudSyncTask as CloudSyncTaskSchema } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import {
+  cloudPreviewDeps,
   DELETED_FILES_CAP,
   PREVIEW_TIMEOUT_S,
   previewCloudSync,
@@ -43,7 +44,6 @@ import { RCLONE } from '../rclone-config.js'
 const FINDMNT = '/usr/bin/findmnt'
 const TIMEOUT = '/usr/bin/timeout'
 const ZFS = '/usr/sbin/zfs'
-const CONFIG = '/etc/anas/rclone.conf'
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone')
 
 /**
@@ -79,6 +79,8 @@ interface Harness {
   dir: string
   source: string
   fstab: string
+  /** The harness's OWN rclone.conf (cr.55: the preview reads the remote's credentials from it). */
+  configFile: string
   mock: MockExecutor
   cleanup: () => Promise<void>
 }
@@ -108,18 +110,19 @@ async function harness(opts: { findmnt?: string, fstab?: string, source?: 'dir' 
     dir,
     source,
     fstab,
+    configFile: join(dir, 'rclone.conf'),
     mock,
     cleanup: () => rm(dir, { recursive: true, force: true }),
   }
 }
 
-function deps(h: Harness, over: Partial<CloudPreviewDeps> = {}) {
-  return {
-    task: task({ source: h.source }),
-    paths: { configFile: CONFIG },
-    fstabPath: h.fstab,
-    ...over,
-  }
+/**
+ * The deps, built by the SAME builder the route uses (cr.55, review W5): a
+ * test cannot hand the service a secret list the route never would — the
+ * mask's list is read by the service from the harness's rclone.conf.
+ */
+function deps(h: Harness, over: Partial<CloudPreviewDeps> = {}): CloudPreviewDeps {
+  return { ...cloudPreviewDeps(task({ source: h.source }), { configFile: h.configFile }, h.fstab), ...over }
 }
 
 /** Replays a log through the mock executor the way a real child's stderr would. */
@@ -337,14 +340,16 @@ describe('previewCloudSync — the captured 1.60.1 dry-run logs', () => {
     }
   })
 
-  it('cr.48b: rclone echoing a secret value in its stderr is masked in the errors, the exit facts unchanged', async () => {
+  it('cr.48b/cr.55: rclone echoing the remote\'s STORED credential is masked in the errors, the exit facts unchanged', async () => {
     const h = await harness()
     try {
-      // The pre-logger line echoes the exact secret the preview "handed"
-      // rclone (injected through deps.secrets — the same list the argv guard
-      // owns, normally empty because credentials live in the config file).
+      // cr.55 (W5): the credential lives where it lives on a node — the
+      // remote's section in rclone.conf — and NOTHING feeds the mask: the
+      // preview reads it itself (until cr.55 it masked with deps.secrets,
+      // which the route never set). The pre-logger line echoes it.
+      await writeFile(h.configFile, '[gt]\ntype = s3\nsecret_access_key = hunter2\n', 'utf-8')
       replayRclone(h.mock, '2026/09/25 12:00:00 Failed to create file system for "gtbad:dst/fail": 401 Unauthorized: hunter2\n', 1)
-      const result = await previewCloudSync(h.mock, deps(h, { secrets: ['hunter2'] }))
+      const result = await previewCloudSync(h.mock, deps(h))
       assert.equal(result.errors.length, 1)
       assert.ok(result.errors[0]!.includes('[secret]'), result.errors[0])
       assert.ok(!result.errors[0]!.includes('hunter2'), result.errors[0])
@@ -361,9 +366,10 @@ describe('previewCloudSync — the captured 1.60.1 dry-run logs', () => {
     }
   })
 
-  it('cr.48b: a JSON error line echoing the secret is masked there too', async () => {
+  it('cr.48b/cr.55: a JSON error line echoing the stored credential is masked there too', async () => {
     const h = await harness()
     try {
+      await writeFile(h.configFile, '[gt]\ntype = s3\nsecret_access_key = hunter2\n', 'utf-8')
       // The post-logger form: a JSON `level: error` object whose msg echoes
       // the value — the errorLines path, not the raw-line fallback.
       const line = JSON.stringify({
@@ -373,7 +379,7 @@ describe('previewCloudSync — the captured 1.60.1 dry-run logs', () => {
         time: '2026-09-25T12:00:00.000000+00:00',
       })
       replayRclone(h.mock, `${line}\n`, 1)
-      const result = await previewCloudSync(h.mock, deps(h, { secrets: ['hunter2'] }))
+      const result = await previewCloudSync(h.mock, deps(h))
       assert.ok(result.errors.length >= 1)
       assert.ok(!JSON.stringify(result.errors).includes('hunter2'))
       assert.ok(result.errors.some(e => e.includes('[secret]')))
@@ -606,7 +612,7 @@ describe('previewCloudSync — the argv', () => {
         h.source,
         'gt:dst/preview',
         '--config',
-        CONFIG,
+        h.configFile,
         '--ask-password=false',
         ...RCLONE_LOG_ARGS,
         '--bwlimit',
@@ -634,6 +640,26 @@ describe('previewCloudSync — the argv', () => {
       const rcloneSource = h.mock.calls.find(c => isRcloneCall(c))!.args
       assert.equal(rcloneSource[3], h.source, 'rclone is pointed at the LIVE tree, not a snapshot path')
       assert.ok(!h.mock.calls.some(c => c.command === ZFS && !c.args.includes('name,mountpoint,canmount,mounted')), 'no zfs call but the guard\'s read-only mount facts — no snapshot, no sweep')
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('cr.55: the stored credentials of a WRAPPED remote and a crypt\'s password2 are masked; nothing of them rides the argv', async () => {
+    const h = await harness()
+    try {
+      // A crypt task over a saved s3 remote — rclone opens the s3 remote with
+      // ITS stored credential, so a backend error can quote it.
+      await writeFile(h.configFile, '[s3]\ntype = s3\nsecret_access_key = wrappedS3Secret\n\n[gt]\ntype = crypt\nremote = s3:bucket\npassword2 = -UHN1nBu7Yj3jQ11eG7NixuTyxrbmw\n', 'utf-8')
+      const line = JSON.stringify({ level: 'error', msg: 'SignatureDoesNotMatch wrappedS3Secret; salt gtpass', object: 'a.bin', time: '2026-09-25T12:00:00.000000+00:00' })
+      replayRclone(h.mock, `${line}\n`, 1)
+      const result = await previewCloudSync(h.mock, deps(h))
+      assert.deepEqual(result.errors, ['a.bin: SignatureDoesNotMatch [secret]; salt [secret]'])
+      for (const c of h.mock.calls) {
+        for (const a of c.args)
+          assert.ok(!a.includes('wrappedS3Secret') && !a.includes('gtpass'), `a credential rode an argv token: ${a}`)
+      }
     }
     finally {
       await h.cleanup()

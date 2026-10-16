@@ -7,7 +7,9 @@
  * passed on every invocation as `--config <file> --ask-password=false`.
  *
  * Reads go through `rclone config dump` (JSON) — ANAS never parses secret
- * values back out of the file itself. Writes are ANAS's own surgical INI edit
+ * values back out of the file to RETURN them; the one reader of stored
+ * secrets is the output mask's list ({@link remoteSecretValues}, cr.48f/cr.55),
+ * which reads them to REPLACE them in what a tool echoed. Writes are ANAS's own surgical INI edit
  * (`parsers/rclone-conf.ts`): rclone's config verbs would carry a secret on
  * argv (GT 2026-09-23: the rc verbs take input only as an argv string), so
  * the section is written by hand and rclone reads the file back as the GATE —
@@ -635,6 +637,172 @@ export function revealObscured(value: string): string | undefined {
   catch {
     return undefined
   }
+}
+
+// ── A remote's secret list, for the output mask (cr.48f → cr.55) ──────────
+
+/**
+ * A stored `true`/`false` (or `1`/`0`) is a BOOL option's value
+ * (`sftp.ask_password`, `ftp.ask_password`) — never a secret (the
+ * {@link isSecretKey} rule). Excluding the literals by VALUE is what lets the
+ * secret list below be built without the provider catalogue: they are the
+ * only name-rule-matching keys whose stored value is one of these, and
+ * masking `true`/`false` would shred ordinary text.
+ */
+const BOOL_LITERAL_RE = /^(?:true|false|1|0)$/i
+
+/**
+ * The options rclone types `IsPassword` whose NAME the generic rule does not
+ * see, per backend — read from the captured catalogue
+ * (`fixtures/rclone/providers-1.60.1.json`; rclone-config.test.ts re-derives
+ * this table from the capture, so a recapture that adds one fails there). In
+ * 1.60.1 there is exactly one: crypt's `password2` (the salt). The secret
+ * list needs it because it is built WITHOUT the catalogue (no rclone call on
+ * any run's path), and the stored value is obscured, so rclone `-vv` echoes
+ * it and its plain text can ride an error line like any other credential
+ * (review 2026-10-16 L7, related).
+ */
+export const PASSWORD_KEYS_OUTSIDE_NAME_RULE: Readonly<Record<string, readonly string[]>> = {
+  crypt: ['password2'],
+}
+
+/** The `key=value` parameters of an rclone connection string (`:s3,k=v,k2=v2:path`). */
+const CONNECTION_PARAM_RE = /(?:^|,)([\w-]+)=("[^"]*"|'[^']*'|[^,:]*)/g
+
+/** A leading/trailing quote character around a token. */
+const QUOTE_RE = /^["']|["']$/g
+
+/** One secret-rule value: the stored bytes, and the in-process decode when it recovers. */
+function pushSecretValue(out: string[], value: string): void {
+  out.push(value)
+  // The IsPassword plain text, when the stored spelling is a well-formed
+  // obscuring. A decode of an empty/short/identical value adds nothing.
+  const plain = revealObscured(value)
+  if (plain !== undefined && plain !== '' && plain !== value && plain.length >= 4)
+    out.push(plain)
+}
+
+/**
+ * The remote NAMES a reference option's value points at — `name:path`, one
+ * per whitespace/comma token, the part after a combine `dir=` — by the same
+ * token rule as {@link remotesReferencing}. A token with no name before its
+ * first `:` (a local path, an on-the-fly `:backend` connection string) names
+ * no saved remote.
+ */
+function referencedRemoteNames(value: string): string[] {
+  const names: string[] = []
+  for (const token of value.split(REFERENCE_TOKEN_SPLIT_RE)) {
+    const target = token.includes('=') ? token.slice(token.lastIndexOf('=') + 1) : token
+    const colon = target.indexOf(':')
+    if (colon > 0)
+      names.push(target.slice(0, colon).replace(QUOTE_RE, ''))
+  }
+  return names
+}
+
+/**
+ * The secret-rule parameter values inline in a reference value's connection
+ * string (`:s3,access_key_id=AK,secret_access_key=SK:bucket`).
+ */
+function connectionStringSecrets(value: string): string[] {
+  const found: string[] = []
+  for (const m of value.matchAll(CONNECTION_PARAM_RE)) {
+    const raw = m[2]!.replace(QUOTE_RE, '')
+    if (raw !== '' && !BOOL_LITERAL_RE.test(raw) && isSecretKey(m[1]!))
+      found.push(raw)
+  }
+  return found
+}
+
+/**
+ * THE secret list of a remote, for the output mask (cr.55, review 2026-10-16
+ * M1 — the ONE builder; the remote Test, the task preview and the task run
+ * all mask with it). cr.48f built it for the Test only, from the tested
+ * section alone; cr.55 makes it the one helper and widens it in three ways:
+ *
+ *  - TRANSITIVELY over wrapped remotes. A crypt/alias/chunker/compress/hasher/
+ *    cache remote names the remote it wraps in `remote = other:path`, union
+ *    and combine in `upstreams = a:x b:y` / `dir=a:x` — the same reference
+ *    options and token rule {@link remotesReferencing} reads. rclone opens the
+ *    wrapped remote with ITS stored credentials, so a backend error under a
+ *    crypt task can quote the wrapped s3 remote's `secret_access_key`. The walk
+ *    follows every reference to a section the file carries, each section once
+ *    (a reference cycle ends).
+ *  - Inline connection-string parameters in a reference value
+ *    (`remote = :s3,secret_access_key=…:bucket`): a parameter whose NAME is a
+ *    secret by the rule is taken like a stored option. Quoted values are
+ *    unquoted; the parse is the simple shape (a value with `,` or `:` inside
+ *    quotes is a recorded residual).
+ *  - `IsPassword` options outside the name rule
+ *    ({@link PASSWORD_KEYS_OUTSIDE_NAME_RULE}: crypt `password2`).
+ *
+ * Per section, every secret-rule value (the name rule, bool literals
+ * excluded) contributes its STORED bytes — a name-rule secret is stored plain;
+ * an IsPassword one is the obscured spelling, which rclone's own `-vv` debug
+ * echoes — and its in-process decode through {@link revealObscured} when the
+ * stored spelling is a well-formed obscuring (rclone's `Reveal`, KAT-pinned).
+ * NO rclone invocation rides this: the file is read directly and the decode
+ * is in-process, so no stored or recovered credential ever touches an argv.
+ *
+ * `start` is a saved remote's NAME, or an unsaved dialog's option map (the
+ * probe's env-defined remote: its own values come from the probe, which has
+ * the catalogue — only what it REFERENCES is read from the file here).
+ *
+ * Fail-open by design, and only for the reading: an unreadable file or an
+ * absent section contribute nothing (the tool then fails loudly as it would
+ * have, and it could not have echoed a value it could not read), and a stored
+ * value that fails to decode contributes its stored bytes only.
+ */
+export async function remoteSecretValues(
+  configFile: string,
+  start: string | Record<string, string>,
+): Promise<string[]> {
+  let text: string
+  try {
+    text = await readFile(configFile, 'utf-8')
+  }
+  catch {
+    text = ''
+  }
+  const sections = new Map(listSections(parseRcloneConf(text)).map(sec => [sec.name, sec.values]))
+  const out: string[] = []
+  const visited = new Set<string>()
+  const queue: Record<string, string>[] = []
+  if (typeof start === 'string') {
+    visited.add(start)
+    const own = sections.get(start)
+    if (own)
+      queue.push(own)
+  }
+  else {
+    // An unsaved dialog: only its REFERENCES are walked (see the doc).
+    queue.push(Object.fromEntries(Object.entries(start).filter(([key]) => REMOTE_REFERENCE_OPTIONS.includes(key))))
+  }
+  while (queue.length) {
+    const values = queue.shift()!
+    const outside = PASSWORD_KEYS_OUTSIDE_NAME_RULE[values.type ?? ''] ?? []
+    for (const [key, value] of Object.entries(values)) {
+      if (value === '')
+        continue
+      if (REMOTE_REFERENCE_OPTIONS.includes(key)) {
+        for (const ref of referencedRemoteNames(value)) {
+          if (visited.has(ref))
+            continue
+          visited.add(ref)
+          const wrapped = sections.get(ref)
+          if (wrapped)
+            queue.push(wrapped)
+        }
+        for (const param of connectionStringSecrets(value))
+          pushSecretValue(out, param)
+        continue
+      }
+      if (BOOL_LITERAL_RE.test(value) || !(isSecretKey(key) || outside.includes(key)))
+        continue
+      pushSecretValue(out, value)
+    }
+  }
+  return [...new Set(out)]
 }
 
 /**

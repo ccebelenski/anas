@@ -725,3 +725,69 @@ describe('rclone-probe: the saved-remote probe masks against its own stored cred
     }
   })
 })
+
+// ── cr.55: the probe masks with the ONE secret list — transitive, and the
+//    obscured spelling the unsaved crypt's env carried (review L7) ─────────
+
+describe('rclone-probe: the one secret list — wrapped remotes and the obscured env value (cr.55)', () => {
+  let dir: string
+  let configFile: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(TMP_BASE, 'cr55-store-'))
+    configFile = join(dir, 'rclone.conf')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('a SAVED crypt over a saved s3 remote: the WRAPPED credential and crypt password2 rclone echoes are masked', async () => {
+    await writeFile(configFile, '[s3]\ntype = s3\nsecret_access_key = Sup3rS3cretValue42\n\n[c]\ntype = crypt\nremote = s3:bucket\npassword2 = -UHN1nBu7Yj3jQ11eG7NixuTyxrbmw\n', 'utf-8')
+    const echo = 'Failed to create file system for "c:": NewFs: SignatureDoesNotMatch: Sup3rS3cretValue42 (salt gtpass)'
+    const exec = async (command: string): Promise<ExecResult> => {
+      if (command === '/usr/bin/timeout')
+        return { stdout: '', stderr: `${echo}\n`, exitCode: 1 }
+      throw new Error(`unexpected call: ${command}`)
+    }
+    const r = await testRemote(stubExecutor(exec), { configFile }, { name: 'c' })
+    assert.equal(r.verdict, 'auth')
+    assert.equal(r.message, 'Failed to create file system for "c:": NewFs: SignatureDoesNotMatch: [secret] (salt [secret])')
+  })
+
+  it('L7: an UNSAVED crypt probe masks the OBSCURED value its env carried — the spelling rclone -vv prints (captured debug line)', async () => {
+    // The obscured spelling is the one the cloudproof.2 capture's debug line
+    // prints (`probe-crypt-good-debug-1.60.1.log` line 6); the stub's
+    // `obscure` answers it, so the env carries exactly what rclone echoes.
+    const obscured = 'Dj8pksfQxTzq-sbvei2DR5W4r7VLmEZummK0etk'
+    const debugLine = `2026/09/27 22:46:50 DEBUG : Setting password="${obscured}" for "anastest" from environment variable RCLONE_CONFIG_ANASTEST_PASSWORD`
+    const calls: { command: string, args: string[], opts?: ExecOptions }[] = []
+    const exec = async (command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> => {
+      calls.push({ command, args, opts })
+      if (command === RCLONE)
+        return { stdout: `${obscured}\n`, stderr: '', exitCode: 0 } // the obscure call
+      // rclone's last word is the -vv line quoting the env value.
+      return { stdout: '', stderr: `${debugLine}\n`, exitCode: 1 }
+    }
+    const r = await testRemote(stubExecutor(exec), PATHS, {
+      remote: { name: 'gtdraft', type: 'crypt', options: { remote: 'gtsftp:crypt-base', password: 'gtcryptpass' } },
+    }, { providers, tmpBase: TMP_BASE })
+    assert.equal(r.verdict, 'error')
+    assert.equal(r.message, '2026/09/27 22:46:50 DEBUG : Setting password="[secret]" for "anastest" from environment variable RCLONE_CONFIG_ANASTEST_PASSWORD')
+    const ls = calls.find(c => c.command === '/usr/bin/timeout')!
+    assert.equal(ls.opts?.env?.[`${PROBE_ENV_PREFIX}PASSWORD`], obscured, 'the env carried the obscured spelling')
+  })
+
+  it('an UNSAVED crypt over a SAVED s3 remote: the wrapped remote\'s stored credential is masked too', async () => {
+    await writeFile(configFile, '[s3]\ntype = s3\nsecret_access_key = Sup3rS3cretValue42\n', 'utf-8')
+    const exec = async (command: string): Promise<ExecResult> => {
+      if (command === RCLONE)
+        return { stdout: 'obscured-by-mock\n', stderr: '', exitCode: 0 }
+      return { stdout: '', stderr: 'Failed to create file system for "anastest:": NewFs: AccessDenied: Sup3rS3cretValue42\n', exitCode: 1 }
+    }
+    const r = await testRemote(stubExecutor(exec), { configFile }, {
+      remote: { name: 'gtdraft', type: 'crypt', options: { remote: 's3:bucket', password: 'gtcryptpass' } },
+    }, { providers, tmpBase: TMP_BASE })
+    assert.equal(r.verdict, 'auth')
+    assert.equal(r.message, 'Failed to create file system for "anastest:": NewFs: AccessDenied: [secret]')
+  })
+})

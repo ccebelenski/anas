@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { maskSecretValues } from '../secret-argv.js'
+import { maskSecretValues, secretForms } from '../secret-argv.js'
 
 /**
  * cr.48b — `maskSecretValues`, the output-side mirror of the argv guard: a
@@ -108,5 +108,69 @@ describe('secret-argv: maskSecretValues (cr.48e form space)', () => {
 
   it('an ASCII value masks no differently than before (normalisations are no-ops)', () => {
     assert.equal(maskSecretValues('plain s3cr3t-pass here', ['s3cr3t-pass']), 'plain [secret] here')
+  })
+})
+
+/**
+ * cr.55 (review 2026-10-16 L6) — the spellings GO tools print. rclone and pbc
+ * are Go programs: a URL query is built with `url.QueryEscape` (which escapes
+ * `!'()*` where `encodeURIComponent` does not, and writes space as `+`), an
+ * error that quotes a value uses `%q` (`"` and `\` backslashed), and
+ * rclone's `--use-json-log` puts every message inside a JSON string (Go's
+ * `json.Marshal` additionally escapes `<`, `>`, `&`). Each form gets its own
+ * test with the review's probe values, and each was shown to fail with its
+ * line in `secretForms` removed.
+ */
+describe('secret-argv: maskSecretValues (cr.55 — the spellings Go tools print)', () => {
+  it('Go url.QueryEscape: `!\'()*` escaped — the review\'s probe value `p@ss!w0rd(x)`', () => {
+    assert.equal(maskSecretValues('GET /?pw=p%40ss%21w0rd%28x%29&x=1', ['p@ss!w0rd(x)']), 'GET /?pw=[secret]&x=1')
+    assert.equal(maskSecretValues('q=it%27s%2Asecret', ['it\'s*secret']), 'q=[secret]')
+  })
+
+  it('Go url.QueryEscape with a space: `+` AND the Go-only escapes in one spelling', () => {
+    assert.equal(maskSecretValues('body pw=my+pa%21ss+word', ['my pa!ss word']), 'body pw=[secret]')
+  })
+
+  it('Go %q / strconv.Quote: the quoted body with `\\"` and `\\\\` — the review\'s probe value', () => {
+    // The stored value is ab"cd\ef9; a Go error that %q-quotes it prints
+    // "ab\"cd\\ef9" — the body between the quotes never matched before.
+    assert.equal(maskSecretValues('bad token "ab\\"cd\\\\ef9" refused', ['ab"cd\\ef9']), 'bad token "[secret]" refused')
+  })
+
+  it('Go %q of a control character: `\\t` short escape and `\\xHH`', () => {
+    assert.equal(maskSecretValues('pw "tab\\there" bad', ['tab\there']), 'pw "[secret]" bad')
+    assert.equal(maskSecretValues('pw "bel\\x01x" bad', ['bel\x01x']), 'pw "[secret]" bad')
+  })
+
+  it('a JSON string body as an encoder WITHOUT HTML escaping writes it (`\\u0001` where %q writes `\\x01`, `<` bare where json.Marshal writes `\\u003c`)', () => {
+    // JSON.stringify is exactly that encoder (Go's json.Encoder with
+    // SetEscapeHTML(false)); the value carries both a control character and
+    // `<`, so this spelling matches neither the %q body nor Go's HTML-safe one.
+    const line = JSON.stringify({ level: 'error', msg: 'auth failed for bel<\x01x"q' })
+    assert.ok(line.includes('bel<\\u0001x\\"q'), line)
+    assert.equal(maskSecretValues(line, ['bel<\x01x"q']), JSON.stringify({ level: 'error', msg: 'auth failed for [secret]' }))
+  })
+
+  it('Go json.Marshal (HTML-safe): `<`, `>`, `&` as \\u003c-style escapes', () => {
+    assert.equal(maskSecretValues('{"msg":"key a\\u003cb\\u0026c\\u003e rejected"}', ['a<b&c>']), '{"msg":"key [secret] rejected"}')
+  })
+
+  it('every new form is built from each normalisation too (an NFD-stored value echoed QueryEscaped from its NFC form)', () => {
+    const stored = 'cafe\u0301!pw'
+    const nfcQuery = encodeURIComponent('caf\u00E9!pw').replace('!', '%21')
+    assert.equal(maskSecretValues(`q=${nfcQuery}`, [stored]), 'q=[secret]')
+  })
+
+  it('the floor still binds: a value under 4 characters yields NO form at all, however long its encoding', () => {
+    assert.deepEqual(secretForms('a"b'), [])
+    assert.equal(maskSecretValues('pw "a\\"b" and a%22b', ['a"b']), 'pw "a\\"b" and a%22b')
+  })
+
+  it('a WORD-like secret is still masked (L6, recorded): the guessable gap beats printing the value', () => {
+    // The review's probe: secret `copy` turns "Failed to copy" into "Failed to
+    // [secret]". Kept by decision — the alternative prints the credential, and
+    // the minimum length the review proposes was closed by the operator's
+    // 2026-10-16 ruling (the helper's doc comment records both).
+    assert.equal(maskSecretValues('Failed to copy: 403 Forbidden', ['copy']), 'Failed to [secret]: 403 Forbidden')
   })
 })

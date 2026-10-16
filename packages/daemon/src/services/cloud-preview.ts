@@ -12,7 +12,7 @@ import {
   rcloneFailureMessage,
   rcloneRunCompleted,
 } from './cloud-runner.js'
-import { RCLONE } from './rclone-config.js'
+import { RCLONE, remoteSecretValues } from './rclone-config.js'
 import { assertNoSecretValues, maskSecretValues } from './secret-argv.js'
 import { guardSourcePath, readSourceGuardFacts } from './source-guard.js'
 
@@ -138,11 +138,25 @@ export interface CloudPreviewDeps {
   /** The fstab the source guard reads (the Mounts path, overridable for tests). */
   fstabPath: string
   /**
-   * Plain secret values in scope for the argv guard — normally none (rclone
-   * reads every credential from the config file), the structural backstop
-   * that would fire if that ever stopped being true. Uniform with the run.
+   * Plain secret values HANDED to the child, for the argv guard — normally
+   * none (rclone reads every credential from the config file), the structural
+   * backstop that would fire if that ever stopped being true. Uniform with the
+   * run. They are masked out of the answer too; the remote's STORED
+   * credentials are not passed here — {@link runPreview} reads them itself
+   * (cr.55), so no caller can forget them and no test can feed the mask.
    */
   secrets?: string[]
+}
+
+/**
+ * The preview's deps, built ONE way (cr.55, review 2026-10-16 W5): the route
+ * builds them with this and so do the unit tests, so a test cannot hand the
+ * service something the route never would. The secret list the answer is
+ * masked with is NOT a field here — {@link runPreview} derives it from the
+ * remote the task names, in the config file the route points it at.
+ */
+export function cloudPreviewDeps(task: PreviewTask, paths: RcloneConfigPaths, fstabPath: string): CloudPreviewDeps {
+  return { task, paths, fstabPath }
 }
 
 /**
@@ -210,6 +224,13 @@ export async function runPreview(
   // ANAS makes (the run's own call, over the same argv).
   assertNoSecretValues(args, deps.secrets ?? [])
 
+  // cr.55 (review 2026-10-16 M1): the remote's OWN credentials — stored in
+  // rclone.conf, transitive over the remotes it wraps — are what rclone can
+  // echo; until cr.55 the route built these deps without them and the mask
+  // below ran over an empty list. Read here, at the boundary, by the one
+  // builder the Test and the run use (in process, no rclone call, no argv).
+  const secrets = [...(deps.secrets ?? []), ...await remoteSecretValues(deps.paths.configFile, task.remote)]
+
   hooks.checkpoint?.('the dry run')
   const { exitCode, log } = await execRcloneLog(
     executor,
@@ -221,10 +242,9 @@ export async function runPreview(
   const stats = finalStats(log)
   const truncated = exitCode === TIMEOUT_EXIT_CODE
   // cr.48b: the errors are rclone's own stderr lines — the one stderr-derived
-  // string in the answer. Whatever the child echoed of a secret value this
-  // preview handed it is replaced AT the result, after the parsing read the
-  // raw text (only what leaves is masked).
-  const secrets = deps.secrets ?? []
+  // string in the answer. Whatever the child echoed of a secret value in scope
+  // (the remote's stored credentials, cr.55) is replaced AT the result, ONE
+  // pass, after the parsing read the raw text (only what leaves is masked).
   return {
     transfers: stats.transfers,
     bytes: stats.bytes,

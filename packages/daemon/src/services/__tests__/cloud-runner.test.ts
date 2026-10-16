@@ -656,7 +656,9 @@ async function harness(opts: { findmnt?: string, fstab?: string } = {}): Promise
 function deps(h: Harness, over: Partial<Parameters<typeof runCloudSync>[1]> = {}) {
   return {
     task: task({ source: h.source }),
-    paths: { configFile: CONFIG },
+    // The harness's OWN rclone.conf (cr.55: the run reads the remote's stored
+    // credentials from it for the mask — never the host's /etc/anas).
+    paths: { configFile: join(h.dir, 'rclone.conf') },
     fstabPath: h.fstab,
     // Absent storage.cfg = no PVE footprint at all (the parser's fail-open).
     consistencyOptions: { pveStorageCfg: join(h.dir, 'no-storage.cfg') },
@@ -1031,6 +1033,89 @@ describe('runCloudSync — the transient snapshot', () => {
         `tank/pictures@${older}`,
         `tank/pictures@${LABEL}`,
       ], 'the stale one of this task, then this run\'s own in the finally')
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  cr.55 — every string the run makes from rclone's stderr is masked where it
+//  is made, against the remote's STORED credentials (review 2026-10-16 M1)
+// ---------------------------------------------------------------------------
+
+describe('runCloudSync — a stored credential rclone echoes never leaves the run (cr.55)', () => {
+  /** The task's remote `backblaze` as a b2 remote whose `key` rclone quotes back. */
+  const B2_SECTION = '[backblaze]\ntype = b2\naccount = 0012345abcdef\nkey = K001storedB2key\n'
+  const ECHO_LINE = JSON.stringify({
+    level: 'error',
+    msg: 'Failed to copy: 401 bad_auth_token: application key K001storedB2key rejected',
+    object: 'a.jpg',
+    objectType: '*b2.Object',
+    source: 'operations/copy.go:368',
+    time: '2026-09-24T02:00:12.000+00:00',
+  })
+
+  async function echoHarness(exitCode: number): Promise<Harness> {
+    const h = await liveHarness()
+    await writeFile(join(h.dir, 'rclone.conf'), B2_SECTION, 'utf-8')
+    h.mock.addFixture({ command: RCLONE, result: { stdout: '', stderr: `${ECHO_LINE}\n${statsLine({ errors: 1 })}\n`, exitCode } })
+    return h
+  }
+
+  it('the FAILURE message (job.error, the notification\'s Error block, the journal line) is masked as it is thrown', async () => {
+    const h = await echoHarness(1)
+    try {
+      await assert.rejects(
+        runCloudSync(h.mock, deps(h), () => {}),
+        (err: Error) => {
+          assert.equal(err.message, 'rclone copy failed (exit 1): a.jpg: Failed to copy: 401 bad_auth_token: application key [secret] rejected')
+          return true
+        },
+      )
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('a COMPLETED run\'s errorLines (job.result, the notification\'s rclone-errors block) are masked where the result is made', async () => {
+    const h = await echoHarness(0)
+    try {
+      const result = await runCloudSync(h.mock, deps(h), () => {})
+      assert.deepEqual(result.errorLines, ['a.jpg: Failed to copy: 401 bad_auth_token: application key [secret] rejected'])
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('the run detail\'s `recent` ring and `lastError` are masked as the event enters the ring; the file name is kept', async () => {
+    const h = await echoHarness(0)
+    try {
+      const details: import('@anas/shared').CloudRunDetail[] = []
+      await runCloudSync(h.mock, deps(h, { onDetail: d => details.push(d) }), () => {})
+      const last = details.at(-1)!
+      assert.deepEqual(last.recent.map(e => [e.name, e.kind, e.message]), [['a.jpg', 'error', 'Failed to copy: 401 bad_auth_token: application key [secret] rejected']])
+      assert.equal(last.lastError, 'a.jpg: Failed to copy: 401 bad_auth_token: application key [secret] rejected')
+      assert.ok(!JSON.stringify(details).includes('K001storedB2key'))
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('the stored credential is NOT fed to the argv guard — a source path that happens to contain it still runs', async () => {
+    const h = await liveHarness()
+    try {
+      // A stored credential that is an ordinary substring of the operator's
+      // own argv (here the source directory's name): a coincidence, not a
+      // leak — the guard (no length floor) would otherwise refuse every run.
+      await writeFile(join(h.dir, 'rclone.conf'), '[backblaze]\ntype = b2\nkey = source\n', 'utf-8')
+      h.mock.addFixture({ command: RCLONE, result: { stdout: '', stderr: `${FINAL_STATS}\n`, exitCode: 0 } })
+      const result = await runCloudSync(h.mock, deps(h), () => {})
+      assert.equal(result.status, 'success')
     }
     finally {
       await h.cleanup()

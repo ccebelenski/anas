@@ -412,8 +412,16 @@ export function parseHelperResult(journal: string): CloudHelperResult | null {
 /**
  * The client-safe failure detail from the unit journal: prefer rclone's own
  * failure line (or the runner's thrown message), else the last non-JSON message
- * line. Never contains a secret — a remote NAME is not a secret and no option
- * value ever reaches an argv or rclone's log.
+ * line. Taken verbatim, and that is safe for a narrower reason than this
+ * comment used to give ("no option value ever reaches rclone's log" — false:
+ * a backend can echo a stored credential in rclone's error text, review
+ * 2026-10-16 M1). The unit's journal is written ONLY by the cloud-task runner,
+ * which prints the job record the daemon already masked where each string was
+ * made (cr.55: the failure message, `errorLines`), and the unit carries no
+ * credential in its environment — so this reader, which holds no secret at
+ * read time, is not a mask door (the cr.48f rule-2 pattern). The residual,
+ * pinned: a FUTURE journal writer that printed raw rclone stderr would
+ * surface it here.
  */
 export function failureDetailFromJournal(journal: string): string | null {
   return failureDetailFromJournalGeneric(CLOUD_UNIT_KIND, journal)
