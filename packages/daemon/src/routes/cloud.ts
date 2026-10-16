@@ -1,5 +1,6 @@
 import type {
   CloudProvider,
+  CloudRemote,
   CloudRemoteTestResult,
   CloudRemoteWrite,
   CloudSyncPreviewResult,
@@ -11,9 +12,10 @@ import type {
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
-import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
+import type { GuardPass, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { RcloneConfigPaths } from '../services/rclone-config.js'
 import type { UnitTaskObject } from '../services/task-units.js'
+import { createHash } from 'node:crypto'
 import { access, constants } from 'node:fs/promises'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
@@ -30,10 +32,10 @@ import {
 import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
 import { READ_JOB_OPERATIONS, readJobCancel } from '../jobs/read-jobs.js'
+import { parseRcloneConf } from '../parsers/rclone-conf.js'
 import { directFromClientRefusal, TASK_RUNNER_USER } from '../runner-poll.js'
 import { ConfirmStore } from '../safety/confirm.js'
-import { confirmGate } from '../safety/gate.js'
-import { guardCheck, guarded, GuardRefusalError, sendRefusal, sourcePathsMoved, taskClaim, unheldClaimsRefusal } from '../safety/guard.js'
+import { guardCheck, guardConfirm, guarded, GuardRefusalError, sendRefusal, sourcePathsMoved, taskClaim, unheldClaimsRefusal } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyCloudRun } from '../services/cloud-notify.js'
@@ -146,6 +148,31 @@ class RcloneNotInstalledError extends Error {
   constructor() {
     super(RCLONE_NOT_INSTALLED)
     this.name = 'RcloneNotInstalledError'
+  }
+}
+
+/**
+ * The identity of a remote's stored section (cr.64c, cr.63 (j)): the sha256 of
+ * the section's own lines in rclone.conf — header through one-before-next, the
+ * smb/nfs stanza precedent — or null when the section is gone. A remote deleted
+ * and re-created under the same name inside a confirm's TTL hashes differently,
+ * so a code minted for the old section cannot carry the update through.
+ */
+function remoteSectionHash(text: string, name: string): string | null {
+  const doc = parseRcloneConf(text)
+  const span = doc.sections.find(s => s.name === name)
+  if (!span)
+    return null
+  return createHash('sha256').update(doc.lines.slice(span.start, span.end).join('\n')).digest('hex')
+}
+
+/** The retarget door's object view: the remote as read, bound by name + section hash. */
+function remoteView(name: string, existing: CloudRemote, section: string): ObjectView<CloudRemote> {
+  return {
+    what: `remote '${name}'`,
+    read: async () => existing,
+    id: async () => ({ remote: name, section }),
+    unbound: () => `remote '${name}' could not be bound to its section in rclone.conf — refusing the retarget`,
   }
 }
 
@@ -452,23 +479,50 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       }
       // Story ident.4 (b), audit #15: an update that changes WHERE the remote
       // points re-points every task syncing through it — directly or through
-      // a wrapper — so it is a 409 + confirm naming them. The code is bound
-      // to the remote AND the exact changes, so it cannot carry a different
-      // retarget through.
+      // a wrapper — so it is a 409 + confirm naming them. cr.64c (cr.63 (j)):
+      // the legacy confirmGate signed only {remote, changes} — a same-name
+      // remote deleted and re-created inside the TTL replayed the code onto a
+      // different remote. The code now rides guardConfirm, bound to the
+      // remote's identity: its name plus the sha256 of its own section lines
+      // in rclone.conf (the smb/nfs stanza precedent), so a re-created or
+      // edited section is 409 IDENTITY_MISMATCH, and a replay with different
+      // changes is 409 CONFIRM_SCOPE_CHANGED naming the field. `options`
+      // itself is not a signed field: it carries the secret option NAMES and
+      // describeField would echo values into the 409 — the destination-
+      // relevant half, with values the retarget rule keeps non-secret, is
+      // exactly `changes`.
       const changes = destinationChanges(existing, input.options, catalog)
       if (changes.length > 0) {
         const tasks = await tasksReachingRemote(current.remotes, name, referencingTasks)
-        if (tasks.length > 0 && !confirmGate(confirmStore, request, reply, {
-          operation: 'cloud.remote.retarget',
-          params: { remote: name, changes: changes.map(c => [c.key, c.to]) },
-          message: `Changing where remote '${name}' points re-points cloud sync task(s): ${describeTasks(tasks)}`,
-          warnings: [
-            `Tasks that sync through it: ${describeTasks(tasks)}`,
-            ...changes.map(describeChange),
-            `Every listed task will sync to the new destination on its next run; a sync task makes that destination match its source, deleting what is there and not in the source.`,
-          ],
-        })) {
-          return null
+        if (tasks.length > 0) {
+          const section = remoteSectionHash(current.text, name)
+          if (section === null) {
+            reply.code(409).send({ error: { code: 'CONFLICT', message: `remote '${name}' could not be bound to its section in rclone.conf — refusing the retarget` } })
+            return null
+          }
+          const spec: GuardSpec<CloudRemote> = {
+            operation: 'cloud.remote.retarget',
+            object: remoteView(name, existing, section),
+            gates: [],
+          }
+          const pass: GuardPass<CloudRemote> = {
+            object: existing,
+            bound: { id: { remote: name, section } },
+            advisories: [],
+            locks: [],
+          }
+          if (!guardConfirm(confirmStore, request, reply, spec, pass, {
+            validated: { remote: name, changes: changes.map(c => [c.key, c.to]) },
+            address: ['remote'],
+            message: `Changing where remote '${name}' points re-points cloud sync task(s): ${describeTasks(tasks)}`,
+            warnings: [
+              `Tasks that sync through it: ${describeTasks(tasks)}`,
+              ...changes.map(describeChange),
+              `Every listed task will sync to the new destination on its next run; a sync task makes that destination match its source, deleting what is there and not in the source.`,
+            ],
+          })) {
+            return null
+          }
         }
       }
       return { catalog, type: existing.type }

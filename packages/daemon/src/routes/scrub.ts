@@ -22,6 +22,25 @@ const ZPOOL = '/usr/sbin/zpool'
 const CAT = '/usr/bin/cat'
 
 /**
+ * The ZFS pool list could not be READ: `zpool list -j` exited non-zero, so
+ * "there are no ZFS pools" cannot be asserted — the ZFS twin of cr.63's L15
+ * (cr.64c). An EMPTY list from a successful read is honestly no pools; this is
+ * a read that could not see, and the doors answer 503 UNAVAILABLE with its
+ * sentence instead of 404-ing a live pool or dropping every ZFS row.
+ */
+class ZfsPoolListUnreadableError extends Error {
+  constructor(
+    /** The command whose non-zero exit made the pool list unreadable — names what could not be read. */
+    readonly command: string,
+    readonly exitCode: number,
+    readonly stderr: string,
+  ) {
+    super(`the ZFS pool list could not be read (${command} exited ${exitCode}: ${stderr.trim().split('\n')[0] || 'no stderr'})`)
+    this.name = 'ZfsPoolListUnreadableError'
+  }
+}
+
+/**
  * Periodic SCRUB — uniform surface, filesystem-native backend (Epic 17.5 +
  * story selfheal.4, docs/SCHEDULES-DESIGN.md §Scrub). One "periodic scrub:
  * on/off" control for a ZFS pool and an AHR pool; the toggle flips the
@@ -64,15 +83,17 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
   const { executor, jobQueue } = opts
   const systemdDir = opts.systemdDir ?? DEFAULT_SYSTEMD_DIR
 
-  /** Live ZFS pool names (fail-open to []). */
+  /**
+   * Live ZFS pool names. A `zpool list -j` that could not run throws
+   * {@link ZfsPoolListUnreadableError} (cr.64c, the ZFS twin of cr.63's L15):
+   * before, a failed read was an empty list, so `PUT /scrub/zfs/:pool`
+   * answered 404 for a live pool and GET silently dropped every ZFS row.
+   */
   async function zfsPoolNames(): Promise<string[]> {
-    try {
-      const r = await executor.exec(ZPOOL, ['list', '-j'])
-      return r.exitCode === 0 && r.stdout.trim() ? parseZpoolList(r.stdout).map(p => p.name) : []
-    }
-    catch {
-      return []
-    }
+    const r = await executor.exec(ZPOOL, ['list', '-j'])
+    if (r.exitCode !== 0)
+      throw new ZfsPoolListUnreadableError('zpool list -j', r.exitCode, r.stderr)
+    return r.stdout.trim() ? parseZpoolList(r.stdout).map(p => p.name) : []
   }
 
   /**
@@ -90,6 +111,12 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
 
   /** The 503 a read that could not see the AHR topology answers (the routes/ahr.ts sentence). */
   function ahrUnreadable(reply: FastifyReply, err: AhrTopologyUnreadableError): { error: { code: 'UNAVAILABLE', message: string } } {
+    reply.code(503)
+    return { error: { code: 'UNAVAILABLE', message: err.message } }
+  }
+
+  /** The 503 a read that could not see the ZFS pools answers (the same shape, cr.64c). */
+  function zfsUnreadable(reply: FastifyReply, err: ZfsPoolListUnreadableError): { error: { code: 'UNAVAILABLE', message: string } } {
     reply.code(503)
     return { error: { code: 'UNAVAILABLE', message: err.message } }
   }
@@ -122,8 +149,16 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
         return ahrUnreadable(reply, err)
       throw err
     }
-    const [zfsPools, scans, mdstat] = await Promise.all([
-      zfsPoolNames(),
+    let zfsPools: string[]
+    try {
+      zfsPools = await zfsPoolNames()
+    }
+    catch (err) {
+      if (err instanceof ZfsPoolListUnreadableError)
+        return zfsUnreadable(reply, err)
+      throw err
+    }
+    const [scans, mdstat] = await Promise.all([
       zfsScrubScans(),
       // The node's md arrays — diffed against the AHR bands so a foreign array
       // (one ANAS's scrub never covers) is said in the note, never silent.
@@ -167,7 +202,16 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
     if (!identity)
       return
 
-    if (!(await zfsPoolNames()).includes(pool)) {
+    let zfsNames: string[]
+    try {
+      zfsNames = await zfsPoolNames()
+    }
+    catch (err) {
+      if (err instanceof ZfsPoolListUnreadableError)
+        return zfsUnreadable(reply, err)
+      throw err
+    }
+    if (!zfsNames.includes(pool)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `ZFS pool '${pool}' not found` } }
     }

@@ -48,7 +48,7 @@ import { nfsExportRoutes } from './routes/shares-nfs.js'
 import { smbShareRoutes } from './routes/shares-smb.js'
 import { ConfirmStore } from './safety/confirm.js'
 import { createAccessService } from './services/access.js'
-import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from './services/ahr-topology.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, AhrTopologyUnreadableError } from './services/ahr-topology.js'
 import { defaultBackupReposPaths } from './services/backup-repos.js'
 import { DiskIdentityCache } from './services/disk-identity-cache.js'
 import { deviceStatSeamFromEnv } from './services/iscsi-served.js'
@@ -159,10 +159,22 @@ export function createServer(opts?: ServerOptions) {
   // cr.28: a submit the requester's privileges do not cover (JobForbiddenError,
   // already logged by the queue's audit line) is the gateway's 403 — the same
   // code and sentence (WAVE2-DESIGN §5 row 11), naming the privilege.
+  //
+  // cr.64c (cr.63 (g)): an AHR MUTATION route whose guard-gate topology read
+  // fails throws AhrTopologyUnreadableError out of `guardCheck` — the reads
+  // (routes/ahr.ts, routes/scrub.ts) already answer that read 503 UNAVAILABLE
+  // with its sentence; a mutation that cannot see the arrays says the same
+  // thing at the same code, never a bare 500.
   server.setErrorHandler((error, request, reply) => {
     if (error instanceof JobForbiddenError) {
       return reply.code(403).send({
         error: { code: 'FORBIDDEN', message: error.message },
+      })
+    }
+    if (error instanceof AhrTopologyUnreadableError) {
+      request.log.warn(`AHR topology unreadable on ${request.method} ${request.url}: ${error.message}`)
+      return reply.code(503).send({
+        error: { code: 'UNAVAILABLE', message: error.message },
       })
     }
     if (!(error instanceof CommandTimeoutError))

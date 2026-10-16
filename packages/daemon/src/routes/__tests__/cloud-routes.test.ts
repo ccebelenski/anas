@@ -900,14 +900,36 @@ password = mock-obscured
         await untilFileHas('host = 10.0.0.99')
       })
 
-      it('the code is bound to the exact change: it cannot carry a different destination through', async () => {
+      it('cr.64c: the code is bound to the exact change — a replay with different changes is 409 CONFIRM_SCOPE_CHANGED naming the field', async () => {
+        // Was CONFIRMATION_REQUIRED (the legacy gate could not tell a changed
+        // request from an unknown code); guardConfirm explains the mismatch.
         await bare({ referencingTasks: async name => (name === 'gt' ? ['nightly'] : []) })
         await writeFile(bareFile, GT_SECTION, 'utf-8')
         const code = (await put({ host: '10.0.0.99' })).headers['x-anas-confirm-code'] as string
         assert.ok(code)
         const other = await put({ host: '10.0.0.77' }, code)
         assert.equal(other.statusCode, 409)
-        assert.equal(other.json().error.code, 'CONFIRMATION_REQUIRED')
+        assert.equal(other.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+        assert.deepEqual(other.json().error.changed, ['changes'])
+        assert.match(other.json().error.message, /You confirmed with changes .*10\.0\.0\.99.*; this request has changes .*10\.0\.0\.77.* — confirm again/)
+      })
+
+      it('cr.64c: the code is bound to the remote identity — a section re-created inside the TTL is 409 IDENTITY_MISMATCH', async () => {
+        // The legacy gate signed only {remote, changes}: delete the remote and
+        // re-create it under the same name, and the old code carried the update
+        // onto the NEW remote. The code now also binds the section's own lines.
+        await bare({ referencingTasks: async name => (name === 'gt' ? ['nightly'] : []) })
+        await writeFile(bareFile, GT_SECTION, 'utf-8')
+        const code = (await put({ host: '10.0.0.99' })).headers['x-anas-confirm-code'] as string
+        assert.ok(code)
+        // Same name, different section (a re-created remote, another host base).
+        await writeFile(bareFile, '[gt]\ntype = sftp\nhost = 198.51.100.7\nuser = rclonegt\npass = mock-obscured\n', 'utf-8')
+        const replay = await put({ host: '10.0.0.99' }, code)
+        assert.equal(replay.statusCode, 409)
+        assert.equal(replay.json().error.code, 'IDENTITY_MISMATCH')
+        // Nothing was written: the new section still holds its own host.
+        assert.ok((await readFile(bareFile, 'utf-8')).includes('host = 198.51.100.7'))
+        assert.equal((await readFile(bareFile, 'utf-8')).includes('host = 10.0.0.99'), false)
       })
 
       it('a task reaching the remote THROUGH a wrapper is named, with the wrapper', async () => {

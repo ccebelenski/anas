@@ -10,7 +10,7 @@ import { mockFixtures } from '../../fixtures/loader.js'
 import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
-import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../ahr-topology.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, AhrTopologyUnreadableError } from '../ahr-topology.js'
 import {
   ACL_AUTH_NULL,
   aclAuthPath,
@@ -78,10 +78,12 @@ function targetcliCalls(mock: MockExecutor): string[] {
   return mock.calls.filter(c => c.command === TARGETCLI).map(c => c.args.join(' '))
 }
 
-/** A MockExecutor whose targetcli always succeeds. */
+/** A MockExecutor whose targetcli always succeeds (and whose `tank/vol1` exists). */
 function okExecutor(): MockExecutor {
   const mock = new MockExecutor()
   mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+  // cr.64c: addIscsiLun proves the zvol exists before the first targetcli act.
+  mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name', '--', 'tank/vol1'], result: { stdout: 'tank/vol1\n', stderr: '', exitCode: 0 } })
   return mock
 }
 
@@ -522,6 +524,34 @@ describe('addIscsiLun — wwn at create, attributes before the map, then the gra
     // The backstore points at the STABLE path — a zdN name moves across a
     // reboot and is never stored or matched (GT-48).
     assert.ok(!JSON.stringify(mock.calls).includes('/dev/zd1'))
+  })
+
+  it('cr.64c: a zvol that does not exist is refused before the first targetcli act', async () => {
+    // `classifyBacking` calls any /dev/zvol/<p>/<v> path a zvol, so a request
+    // naming a volume that is not there used to sail through every gate and die
+    // mid-sequence in targetcli, after the backstore create.
+    const mock = okExecutor()
+    mock.addFixture({
+      command: '/usr/sbin/zfs',
+      args: ['list', '-H', '-o', 'name', '--', 'tank/gone'],
+      result: { stdout: '', stderr: 'dataset does not exist\n', exitCode: 1 },
+    })
+    await assert.rejects(
+      addIscsiLun(
+        { executor: mock },
+        target(),
+        { name: 'vmdisk1', kind: 'zvol', backing: 'tank/gone' },
+        { path: '/dev/zvol/tank/gone', plugin: 'block', dataset: 'tank/gone' },
+        null,
+        newSerial(),
+      ),
+      (err: Error) => {
+        assert.match(err.message, /volume 'tank\/gone' does not exist/)
+        assert.match(err.message, /dataset does not exist/)
+        return true
+      },
+    )
+    assert.deepEqual(targetcliCalls(mock), [], 'nothing was handed to targetcli')
   })
 
   it('an image LUN: fileio backstore with size, write_back=false and wwn=', async () => {
@@ -1152,6 +1182,23 @@ describe('resolveFileBackingDir — an AHR pool name is a backing, like a datase
     assert.ok('refusal' in r)
     assert.equal(r.refusal.reason, 'backing-not-found')
     assert.match(r.refusal.message, /'nosuch' is neither a mounted ZFS dataset nor an AHR pool on this node/)
+  })
+
+  it('cr.64c: an UNREADABLE AHR topology throws the typed error on both forms — not "not ANAS storage", not "not found"', async () => {
+    // cr.63 (h): a read that could not see the arrays used to catch into null,
+    // so an image file on an AHR pool read as unknown storage and a pool NAME
+    // read as no pool at all. The typed error rides out instead: 503 UNAVAILABLE
+    // with the read's sentence at the route, a failed job in the job.
+    const unreadable = new MockExecutor()
+    unreadable.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'cat: /proc/mdstat: Permission denied', exitCode: 1 } })
+    await assert.rejects(
+      resolveFileBackingDir(unreadable, '/mnt/anas-ahr/ahr0', emptyCtx()),
+      (err: unknown) => err instanceof AhrTopologyUnreadableError && /the AHR topology could not be read \(cat \/proc\/mdstat exited 1/.test((err as Error).message),
+    )
+    await assert.rejects(
+      resolveFileBackingDir(unreadable, 'ahr0', emptyCtx()),
+      err => err instanceof AhrTopologyUnreadableError,
+    )
   })
 })
 

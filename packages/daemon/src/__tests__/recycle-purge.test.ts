@@ -204,8 +204,9 @@ describe('runRecyclePurge — the sweep over smb.conf', () => {
 
   /**
    * The bin swapped for a symlink to `victim` right AFTER the `nth` lstat of
-   * the bin path returns (1 = the runner's own check, 2 = purgeBin's re-check
-   * before the unlink loop). Real filesystem; only the lstat seam is wrapped.
+   * the bin path returns (1 = the runner's own check, 2 = purgeBin's check
+   * before the walk, 3 = purgeBin's re-check before the unlink loop — cr.64c
+   * added the pre-walk check). Real filesystem; only the lstat seam is wrapped.
    */
   function swapAfterBinLstat(mediaBin: string, victim: string, nth: number): { lstat: (p: string) => Promise<Stats> } {
     let seen = 0
@@ -243,7 +244,7 @@ describe('runRecyclePurge — the sweep over smb.conf', () => {
   it('a bin swapped AFTER the re-check: containment is anchored at the share, so every file through the link is refused', async () => {
     const { mediaBin } = setup('')
     const victim = victimTree(dir)
-    const result = await runRecyclePurge({ ...opts, smbConfPath: confPath, fs: swapAfterBinLstat(mediaBin, victim, 2) })
+    const result = await runRecyclePurge({ ...opts, smbConfPath: confPath, fs: swapAfterBinLstat(mediaBin, victim, 3) })
     assert.equal(result.purged, 1, logLines.join('\n'))
     assert.ok(existsSync(join(victim, 'precious.txt')), 'past the re-check, the share anchor is what refuses the link')
     assert.ok(existsSync(join(victim, 'sub/old.txt')))

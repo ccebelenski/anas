@@ -1092,19 +1092,20 @@ export interface ResolvedFileDir {
   ahr?: ResolvedAhrPool
 }
 
-/** The AHR pool whose mountpoint contains `path`, or null. */
+/**
+ * The AHR pool whose mountpoint contains `path`, or null when the topology is
+ * readable and no pool's mountpoint holds it. A topology that could NOT be
+ * read throws {@link AhrTopologyUnreadableError} (cr.64c, cr.63 (h)): "I could
+ * not see the arrays" is not "no AHR pool lives here" — the caller's refusal
+ * carries the read's sentence (503 at the route, a failed job in the job)
+ * instead of the misleading "not on storage ANAS manages".
+ */
 async function ahrPoolFor(executor: CommandExecutor, path: string): Promise<ResolvedAhrPool | null> {
-  try {
-    for (const pool of await readAhrPools(executor)) {
-      if (!pool.mountpoint)
-        continue
-      if (path === pool.mountpoint || path.startsWith(`${pool.mountpoint}/`))
-        return { name: pool.name, mountpoint: pool.mountpoint }
-    }
-  }
-  catch {
-    // Fail-open: without AHR topology a file on an AHR pool simply reads as
-    // unknown storage, which is a refusal with a reason, not a broken screen.
+  for (const pool of await readAhrPools(executor)) {
+    if (!pool.mountpoint)
+      continue
+    if (path === pool.mountpoint || path.startsWith(`${pool.mountpoint}/`))
+      return { name: pool.name, mountpoint: pool.mountpoint }
   }
   return null
 }
@@ -1118,18 +1119,17 @@ async function ahrPoolFor(executor: CommandExecutor, path: string): Promise<Reso
  * not-found refusal. `mounted` is the test, NOT `mountpoint`'s truthiness —
  * an unmounted pool still carries a mountpoint (the LV device path), which is
  * not a directory an image can live in.
+ *
+ * A topology that could NOT be read throws {@link AhrTopologyUnreadableError}
+ * (cr.64c, cr.63 (h)) — the same fact the path branch reports, never the
+ * misleading not-found refusal.
  */
 async function ahrPoolByName(
   executor: CommandExecutor,
   name: string,
 ): Promise<{ name: string, mountpoint: string, mounted: boolean } | null> {
-  try {
-    const pool = (await readAhrPools(executor)).find(p => p.name === name)
-    return pool ? { name: pool.name, mountpoint: pool.mountpoint, mounted: pool.mounted } : null
-  }
-  catch {
-    return null
-  }
+  const pool = (await readAhrPools(executor)).find(p => p.name === name)
+  return pool ? { name: pool.name, mountpoint: pool.mountpoint, mounted: pool.mounted } : null
 }
 
 /** The image file a `file` LUN gets: `<dir>/<name>.raw`. */
@@ -1267,6 +1267,17 @@ export async function createAndMapLun(
 /**
  * Add a LUN to an existing target: the shared create-and-map step, then the
  * save — add-LUN persists the moment the LUN is mapped.
+ *
+ * cr.64c: the zvol's EXISTENCE is proved here, before the first targetcli act.
+ * `classifyBacking` calls any `/dev/zvol/<pool>/<vol>` path a zvol — it must,
+ * to read ownership for LUNs that already exist — so a request naming a volume
+ * that was never created (or was destroyed since the gate read) passed every
+ * gate and reached targetcli, which failed mid-sequence with an opaque
+ * "no such device" AFTER the backstore create. A precondition is checked
+ * before the first act, not discovered by the act. (The request-time 409
+ * would need the same check in the route's backing gate; this is the one
+ * place every add-LUN job passes through, and the restore path creates its
+ * own backing with a checked `zfs create`, so it needs nothing here.)
  */
 export async function addIscsiLun(
   opts: IscsiMutateOptions,
@@ -1276,6 +1287,19 @@ export async function addIscsiLun(
   size: number | null,
   serial: string,
 ): Promise<{ index: number, name: string, serial: string, backingPath: string, attributes: IscsiBackstoreAttributes }> {
+  if (backing.plugin === 'block' && backing.path.startsWith('/dev/zvol/')) {
+    const dataset = backing.dataset ?? backing.path.slice('/dev/zvol/'.length)
+    // cr.21: `--` ahead of the derived operand. Anything but the dataset's own
+    // name in the output — a failed read included — is "not there": the add
+    // refuses rather than let targetcli discover it mid-sequence.
+    const r = await opts.executor.exec(ZFS, ['list', '-H', '-o', 'name', '--', dataset])
+    if (!(r.exitCode === 0 && r.stdout.split('\n').some(l => l.trim() === dataset))) {
+      const why = r.exitCode !== 0
+        ? (r.stderr.trim().split('\n')[0] || `zfs list exited ${r.exitCode}`)
+        : 'zfs list named no such volume'
+      throw new Error(`volume '${dataset}' does not exist — a zvol LUN is backed by an existing ZFS volume (${why}); nothing was done`)
+    }
+  }
   const { index, attributes } = await createAndMapLun(
     opts,
     target,

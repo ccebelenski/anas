@@ -8,8 +8,7 @@ import { lvIsCacheTarget, LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsRepo
 import { isMdPvName, matchCachePartitionLabel, UNKNOWN_PV_NAME } from './ahr-cache-state.js'
 import { uncacheAhrLv } from './ahr-cache.js'
 import { LVM_MIXED_BLOCK_ARGS, run, UPDATE_INITRAMFS_BUDGET_MS } from './ahr-exec.js'
-import { matchPartitionLabel } from './ahr-geometry.js'
-import { classifyPartition, readAhrPoolIdentity, requireOwnedVgPvs, resolveMdadmConfPath } from './ahr-identity.js'
+import { ahrSliceLabelOwner, classifyPartition, classifyRetiredPartition, mayZapRetiredDisk, readAhrPoolIdentity, requireOwnedVgPvs, resolveMdadmConfPath, retiredDiskKeptSentence } from './ahr-identity.js'
 import { clearIntent } from './ahr-intent.js'
 import { unpinArrays } from './ahr-mdadm-conf.js'
 import { ahrLvPath } from './ahr-paths.js'
@@ -176,24 +175,6 @@ function diskPaths(kernel: string, byIdByKernel: ByIdMap): { id: string, devPath
   }
 }
 
-/** Does this GPT label mark a member or cache slice of `pool`? */
-function isPoolLabel(pool: string, label: string | null): boolean {
-  return label !== null && (matchPartitionLabel(pool, label) !== null || matchCachePartitionLabel(pool, label) !== null)
-}
-
-/**
- * May destroy zap this whole disk? Only when EVERY partition on it is the
- * pool's: proven by the superblock inside it, or an empty slice the pool
- * itself labelled (the state a re-run finds after an earlier pass zeroed the
- * superblocks — there is nothing on it to lose, and leaving the labels would
- * keep the disk out of the inventory). One partition that is anyone else's —
- * a superblock of another array, a filesystem, an unlabelled slice — keeps the
- * GPT (guest philosophy: the same exclusivity the ZFS destroy cleanup applies).
- */
-function zappable(disk: DiskFact): boolean {
-  return disk.parts.length > 0 && disk.parts.every(p => p.verdict !== 'foreign')
-}
-
 /**
  * Destroy an AHR pool. `pool` names the disks and member partitions to scrub
  * even after the upper layers are gone — the live topology read for an
@@ -259,16 +240,20 @@ export async function destroyAhrPool(
     partsByDisk.set(part.disk.name, list)
   }
   const targetIds = new Set(pool.disks.map(d => d.id))
+  // Whose AHR slice a GPT label names — the shared classifier (cr.57): a disk
+  // is in play when it carries a slice of THIS pool.
+  const carriesPoolSlice = (label: string | null): boolean =>
+    label !== null && ahrSliceLabelOwner(label)?.pool === name
   const facts = new Map<string, DiskFact>()
   for (const [kernel, parts] of partsByDisk) {
     const paths = diskPaths(kernel, byIdByKernel)
-    const relevant = targetIds.has(paths.id) || parts.some(p => isPoolLabel(name, p.partlabel))
+    const relevant = targetIds.has(paths.id) || parts.some(p => carriesPoolSlice(p.partlabel))
     if (!relevant)
       continue
     const partFacts: PartFact[] = []
     for (const part of parts.sort((a, b) => (a.partNumber ?? 0) - (b.partNumber ?? 0))) {
       const path = paths.partPath(part)
-      const labeled = isPoolLabel(name, part.partlabel)
+      const labeled = carriesPoolSlice(part.partlabel)
       let verdict: PartFact['verdict']
       if (wipedByCaller && targetIds.has(paths.id)) {
         verdict = 'ours' // the caller wiped this disk in this very job
@@ -277,8 +262,11 @@ export async function destroyAhrPool(
         verdict = 'ours'
       }
       else {
-        const v = await classifyPartition(executor, identity, path)
-        verdict = v === 'ours' ? 'ours' : v === 'blank' && labeled && part.fstype === null ? 'blank-ours' : 'foreign'
+        // The shared retire rule (cr.57, ahr-identity): the FRESH probe decides.
+        // Its `blank` already means `blkid -p` found no content signature, so a
+        // stale udev FSTYPE on the same slice adds nothing — destroy and the
+        // retire paths judge one partition exactly one way.
+        verdict = await classifyRetiredPartition(executor, identity, name, path, part.partlabel)
       }
       partFacts.push({ path, verdict, labeled })
     }
@@ -469,9 +457,9 @@ export async function destroyAhrPool(
   const preservedDisks: string[] = []
   for (const disk of presentDisks) {
     const fact = facts.get(disk.id)
-    if (!wipedByCaller && (!fact || !zappable(fact))) {
+    if (!wipedByCaller && (!fact || !mayZapRetiredDisk(fact.parts.map(p => p.verdict)))) {
       if (fact && fact.parts.length > 0) {
-        updateProgress(`Leaving the partition table on ${disk.id} — it carries partitions that are not this pool's`)
+        updateProgress(retiredDiskKeptSentence(disk.id, fact.parts.filter(p => p.verdict === 'foreign').map(p => p.path)))
         preservedDisks.push(disk.id)
       }
       continue
@@ -505,11 +493,11 @@ export async function destroyAhrPool(
       else
         sweepFailures.push(part.path)
     }
-    if (!zappable(disk)) {
+    if (!mayZapRetiredDisk(disk.parts.map(p => p.verdict))) {
       // Guest philosophy: a disk carrying anything that is not provably this
       // pool's keeps its GPT. Its own superblocks (if any) are gone above,
       // which is what closes the ghost-assembly hole.
-      updateProgress(`Leaving the partition table on ${disk.id} — it carries partitions that are not this pool's`)
+      updateProgress(retiredDiskKeptSentence(disk.id, disk.parts.filter(p => p.verdict === 'foreign').map(p => p.path)))
       preservedDisks.push(disk.id)
       continue
     }

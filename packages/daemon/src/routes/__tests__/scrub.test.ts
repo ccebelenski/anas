@@ -226,6 +226,25 @@ describe('periodic scrub routes — ZFS property (Epic 17.5)', () => {
     assert.equal(res.statusCode, 404)
   })
 
+  it('cr.64c: an unreadable `zpool list` is 503 UNAVAILABLE naming the read at both doors — never 404 for a live pool, never a ZFS-less list, and no job', async () => {
+    // The ZFS twin of cr.63's L15: a failed `zpool list -j` used to read as
+    // "no pools", so the toggle 404-ed a live pool and GET dropped every row.
+    const mock = mockOf(server)
+    mock.clearFixtures()
+    // The AHR side stays honestly md-less (the ABSENT /proc/mdstat, cr.33e) so
+    // the 503 can only come from the ZFS read.
+    mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'cat: /proc/mdstat: No such file or directory', exitCode: 1 } })
+    mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: '', stderr: 'cannot open the pool list: I/O error', exitCode: 1 } })
+    const put = await server.inject({ method: 'PUT', url: '/v1/scrub/zfs/tank', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: true }) })
+    assert.equal(put.statusCode, 503, put.body)
+    assert.equal(put.json().error.code, 'UNAVAILABLE')
+    assert.equal(put.json().error.message, 'the ZFS pool list could not be read (zpool list -j exited 1: cannot open the pool list: I/O error)')
+    const get = await server.inject({ method: 'GET', url: '/v1/scrub' })
+    assert.equal(get.statusCode, 503, get.body)
+    assert.equal(get.json().error.code, 'UNAVAILABLE')
+    assert.match(get.json().error.message, /^the ZFS pool list could not be read \(zpool list -j exited 1/)
+  })
+
   it('PUT /scrub/zfs/:pool with a bad body → 400', async () => {
     const res = await server.inject({ method: 'PUT', url: '/v1/scrub/zfs/tank', headers: JSON_HEADERS, payload: JSON.stringify({ on: 'yes' }) })
     assert.equal(res.statusCode, 400)
@@ -367,6 +386,9 @@ describe('periodic scrub routes — AHR node-level anas-scrub timer (selfheal.4)
     // server's default replays the idle capture, and first fixture wins).
     const executor = mockAhrTopologyExecutor(new MockExecutor(), mockFixtures.ahrMdstatCheck())
     executor.addFixture({ command: SYSTEMCTL, result: { stdout: 'enabled\n', stderr: '', exitCode: 0 } })
+    // cr.64c: GET now fails CLOSED on an unreadable `zpool list` — this node
+    // honestly has no ZFS pools (a successful empty read), so the AHR row stands.
+    executor.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson([]), stderr: '', exitCode: 0 } })
     const bare = Fastify({ logger: false })
     await bare.register(scrubRoutes, { prefix: '/v1', executor, jobQueue: new JobQueue() })
 

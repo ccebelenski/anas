@@ -164,12 +164,22 @@ export class BinNotPlainError extends Error {
  * Containment is anchored at the SHARE: the bin's resolved path is the share's
  * realpath (read once) joined with the single-segment repository — never the
  * realpath of the bin itself, which a user who swapped the bin for a symlink
- * would choose. The bin is lstat'ed again after the walk and before anything
- * is unlinked (a bin that became a link or a non-directory throws
- * {@link BinNotPlainError}); every file and directory is then acted on only
- * while its resolved path stays inside that anchored bin and it is what it was
- * listed as (`lstat`: a regular file, a real directory) — never through a
- * symlink (ident.4 (f)). `refused` counts what was left for failing that check.
+ * would choose. The bin is lstat'ed before the walk and again after it, before
+ * anything is unlinked (a bin that is or became a link or a non-directory
+ * throws {@link BinNotPlainError}); every file and directory is then acted on
+ * only while its resolved path stays inside that anchored bin and it is what
+ * it was listed as (`lstat`: a regular file, a real directory) — never through
+ * a symlink (ident.4 (f)). `refused` counts what was left for failing that
+ * check.
+ *
+ * The residual window, stated (cr.64c, 2026-10-14 §4 / 2026-10-16 L27): the
+ * check and the act are separate syscalls, and Node's `fs` has no
+ * `openat`/`unlinkat` — a dirfd-relative purge (the review's fix) needs a
+ * native binding, which the no-new-dependencies ruling forbids. What a share
+ * user can still attempt is swapping a DIRECTORY component between the
+ * containment check and the `unlink`; `unlink` itself never follows the final
+ * component, so a swapped FILE (symlink or otherwise) is only ever removed as
+ * itself, never through. The window is the residue; the checks bound it.
  */
 export async function purgeBin(
   sharePath: string,
@@ -182,6 +192,15 @@ export async function purgeBin(
   const ageOf = opts.ageOf ?? ((stats: Stats) => now() - stats.ctimeMs)
   const bin = join(sharePath, repository)
   const realBin = join(await fs.realpath(sharePath), repository)
+  // cr.64c (cr.53's L27 half, 2026-10-14 §4): the bin is judged BEFORE it is
+  // listed — `readdir` follows a symlink, so listing first walked through a
+  // swapped bin (harmlessly: nothing was acted on before the old after-walk
+  // check threw, but the walk itself followed a link this file refuses
+  // everywhere else). The after-walk re-check below stays: the walk is long,
+  // and the bin can still be swapped during it.
+  const before = binSkipReason(await fs.lstat(bin), repository)
+  if (before)
+    throw new BinNotPlainError(before)
   const files = await listFiles(bin)
   const reason = binSkipReason(await fs.lstat(bin), repository)
   if (reason)

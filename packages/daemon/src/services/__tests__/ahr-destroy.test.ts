@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { AhrPool } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import { destroyAhrPool } from '../ahr-destroy.js'
+import { classifyRetiredPartition, readAhrPoolIdentity } from '../ahr-identity.js'
 import { AHR_LSBLK_ARGS } from '../ahr-topology.js'
 
 /**
@@ -420,6 +421,41 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
     // The foreign pin and the fstab were untouched.
     assert.equal(await readFile(confPath, 'utf8'), `ARRAY /dev/md/foreign metadata=1.2 UUID=${UUID_FOREIGN}\n`)
     assert.equal(await readFile(fstabPath, 'utf8'), '# empty\n')
+  })
+
+  it('a pool-labelled empty slice with a STALE udev FSTYPE is judged like the retire path: blank-ours, zapped (cr.64c)', async () => {
+    // The shared retire rule (cr.57) judges a partition by the FRESH probe:
+    // `mdadm --examine` finds no superblock and `blkid -p` finds no content
+    // signature, so the slice is blank — even though udev still caches
+    // `linux_raid_member` on it. Destroy must judge that slice exactly the way
+    // `classifyRetiredPartition` does (its old private copy also demanded
+    // udev's FSTYPE be null, which kept the GPT of a disk the retire paths
+    // would zap).
+    await writeFile(fstabPath, '# empty\n')
+    await writeFile(confPath, '')
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_EMPTY, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', []), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', []), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', []), stderr: '', exitCode: 0 } })
+    // Labels intact, superblocks zeroed — but udev's FSTYPE is stale (not blank).
+    addDiskReads(executor, T2_BY_ID, lsblkTree([
+      { kernel: 'sdc', parts: ['t2-d1-b1'] },
+      { kernel: 'sdd', parts: ['t2-d2-b1'] },
+    ]))
+    addBlankBlkid(executor)
+    executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: 'mdadm: No md superblock detected.', exitCode: 1 } })
+    executor.addFixture({ command: '/usr/sbin/sgdisk', result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    const result = await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.equal(result.preservedDisks, undefined)
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/sgdisk' && c.args[0] === '--zap-all').length, 2)
+
+    // The pin: the shared classifier judges the same partition the same way.
+    const identity = await readAhrPoolIdentity(executor, 't2', { mdadmConfPath: confPath })
+    const verdict = await classifyRetiredPartition(executor, identity, 't2', `/dev/disk/by-id/${SMALL}-part1`, 't2-d1-b1')
+    assert.equal(verdict, 'blank-ours')
   })
 
   it('unmounted-but-persisted pool: the fstab line is still found by LV spec', async () => {
