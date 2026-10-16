@@ -1,5 +1,5 @@
 import type { AhrPool } from '@anas/shared'
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { AhrLayoutDisk } from '../services/ahr-layout.js'
@@ -9,7 +9,7 @@ import { AhrLayoutPreviewRequest, isComposableDisk, PoolName } from '@anas/share
 import { withAhrCreateStatus } from '../services/ahr-create-status.js'
 import { readPoolIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, planFreshLayout } from '../services/ahr-layout.js'
-import { readAhrPools, withExpansionIntent } from '../services/ahr-topology.js'
+import { AhrTopologyUnreadableError, readAhrPools, withExpansionIntent } from '../services/ahr-topology.js'
 import { createIscsiClaimCache, heldByLun } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
 import { collectDisks } from './disks.js'
@@ -27,6 +27,11 @@ import { collectDisks } from './disks.js'
  * PURE computation over the /v1/disks inventory: no mutation, ever.
  * Mutation routes (create/expand/replace/scrub/destroy — all jobs, all
  * confirm-gated) live separately in routes/ahr-mutate.ts.
+ *
+ * A topology that could not be READ answers 503 UNAVAILABLE with a sentence
+ * naming the failed read (D12) — a read that cannot see says so, never a
+ * silent `[]`/404. A readable-empty topology (no AHR arrays on the node) is
+ * still an honest empty list.
  */
 export async function ahrRoutes(
   server: FastifyInstance,
@@ -84,10 +89,24 @@ export async function ahrRoutes(
     }
   }
 
+  /** The 503 the "cannot read" routes answer (D12): a READ that cannot see says so, never `[]`/404. */
+  function ahrUnreadable(reply: FastifyReply, err: AhrTopologyUnreadableError): { error: { code: 'UNAVAILABLE', message: string } } {
+    reply.code(503)
+    return { error: { code: 'UNAVAILABLE', message: err.message } }
+  }
+
   // --- GET /ahr — list pools ----------------------------------------------
-  server.get('/ahr', async () => {
-    const pools = await Promise.all((await readAhrPools(executor)).map(withIntent))
-    return { data: await annotateHeldByLun(pools) }
+  server.get('/ahr', async (_request, reply) => {
+    let pools: AhrPool[]
+    try {
+      pools = await readAhrPools(executor)
+    }
+    catch (err) {
+      if (err instanceof AhrTopologyUnreadableError)
+        return ahrUnreadable(reply, err)
+      throw err
+    }
+    return { data: await annotateHeldByLun(await Promise.all(pools.map(withIntent))) }
   })
 
   // --- GET /ahr/:name — full pool detail ----------------------------------
@@ -97,7 +116,16 @@ export async function ahrRoutes(
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
     }
-    const pool = (await readAhrPools(executor)).find(p => p.name === nameParsed.data)
+    let pools: AhrPool[]
+    try {
+      pools = await readAhrPools(executor)
+    }
+    catch (err) {
+      if (err instanceof AhrTopologyUnreadableError)
+        return ahrUnreadable(reply, err)
+      throw err
+    }
+    const pool = pools.find(p => p.name === nameParsed.data)
     if (!pool) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `AHR pool '${nameParsed.data}' not found` } }

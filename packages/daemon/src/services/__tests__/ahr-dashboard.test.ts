@@ -45,6 +45,13 @@ function healthyExecutor(overrides?: { mdstat?: string, findmnt?: string, vgs?: 
   return mock
 }
 
+/** `mdstat-reshape-degraded` carries a third kernel md125 (not part of ahr0): its detail answers and names no AHR pool, so it stays "not ours" — a FAILED read would throw (D12), not silently pass as unidentified. */
+function degradedExecutor(): MockExecutor {
+  const mock = healthyExecutor({ mdstat: loadFixture('mdstat-reshape-degraded.txt') })
+  mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md125'), result: ok('MD_LEVEL=raid1\nMD_DEVICES=2\nMD_DEVNAME=backup256\nMD_NAME=otherhost:backup256\n') })
+  return mock
+}
+
 const EMPTY_CAPACITY: AhrCapacity = {
   rawBytes: 0,
   usableBytes: 0,
@@ -78,7 +85,7 @@ describe('buildAhrWarnings (story 11.10, AHR-DESIGN §10)', () => {
   })
 
   it('degraded: exactly one warning card naming which array/band + which member', async () => {
-    const pools = await readAhrPools(healthyExecutor({ mdstat: loadFixture('mdstat-reshape-degraded.txt') }))
+    const pools = await readAhrPools(degradedExecutor())
     const warnings = buildAhrWarnings(pools)
     assert.equal(warnings.length, 1)
     const w = warnings[0]
@@ -185,7 +192,7 @@ describe('buildAhrWarnings (story 11.10, AHR-DESIGN §10)', () => {
   })
 
   it('degraded + halted expansion: still ONE card per pool, naming both', async () => {
-    const pools = await readAhrPools(healthyExecutor({ mdstat: loadFixture('mdstat-reshape-degraded.txt') }))
+    const pools = await readAhrPools(degradedExecutor())
     const pool: AhrPool = { ...pools[0], expansion: intent('halted') }
     const warnings = buildAhrWarnings([pool])
     assert.equal(warnings.length, 1)

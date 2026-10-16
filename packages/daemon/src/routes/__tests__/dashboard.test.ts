@@ -370,6 +370,10 @@ describe('GET /v1/status — AHR warnings (story 11.10, AHR-DESIGN §10)', () =>
     dir = mkdtempSync(join(tmpdir(), 'anas-ahr-dash-'))
     const mock = new MockExecutor()
     addAhrFixtures(mock, loadFixture('mdstat-reshape-degraded.txt'))
+    // The fixture's third kernel md125 is not part of ahr0: its detail answers
+    // (exit 0) and names no AHR pool, so it stays "not ours" (D12 — a FAILED
+    // read would throw, never silently pass as unidentified).
+    mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md125'), result: ok('MD_LEVEL=raid1\nMD_DEVICES=2\nMD_DEVNAME=backup256\nMD_NAME=otherhost:backup256\n') })
     server = await bareDashboardServer(mock, dir)
     const summary = await fetchStatus(server)
     const ahr = summary.warnings.filter(w => w.category === 'ahr')

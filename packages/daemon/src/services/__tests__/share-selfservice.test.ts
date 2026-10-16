@@ -174,6 +174,10 @@ describe('resolveSelfServiceTarget (smbsvc.1)', () => {
   it('a path on neither stack resolves to null', async () => {
     const mock = new MockExecutor()
     addZfsFootprintFixtures(mock, '')
+    // A READABLE-empty AHR topology (mdstat answers, no arrays) — a node with
+    // no AHR pools at all. An UNREADABLE topology is not this: it must fail
+    // loud (D12), never claim the path is off both stacks.
+    mock.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: { stdout: 'Personalities : [raid1]\nunused devices: <none>\n', stderr: '', exitCode: 0 } })
     assert.equal(await resolveSelfServiceTarget(mock, '/srv/scratch'), null)
   })
 })
@@ -216,6 +220,9 @@ describe('resolveSelfService — keys, shapes, refusals (smbsvc.1)', () => {
   it(`refuses a path on neither stack: "…no snapshots to expose"`, async () => {
     const mock = new MockExecutor()
     addZfsFootprintFixtures(mock, '')
+    // A READABLE-empty AHR topology — the honest "no AHR pools" world (D12:
+    // an unreadable one must fail loud, not read as "neither stack").
+    mock.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: { stdout: 'Personalities : [raid1]\nunused devices: <none>\n', stderr: '', exitCode: 0 } })
     await assert.rejects(
       resolveSelfService(mock, '/srv/scratch', { previousVersions: { enabled: true } }, { systemdDir: '/tmp' }),
       (err: Error) => err.message === `'/srv/scratch' is not on a ZFS dataset or an AHR pool — there are no snapshots to expose`,

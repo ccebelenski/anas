@@ -448,23 +448,56 @@ function arrayState(md: MdstatArray): ArrayState {
 }
 
 /**
+ * The AHR topology read FAILED: `cat /proc/mdstat` or one `mdadm --detail
+ * --export` answered with a non-zero exit, so the node's md arrays could not
+ * be enumerated and "there are no ANAS pools" cannot be asserted (D12). This
+ * is the shape the throw already had for a spawn failure (mode B) — a failed
+ * READ (mode A) is the same fact and now rides the same typed error, so every
+ * existing fail-open caller keeps working and the readers answer a sentence.
+ * It is deliberately NOT thrown for a topology that IS readable but names no
+ * AHR array (a foreign md): that is honestly "no pools", an empty list.
+ */
+export class AhrTopologyUnreadableError extends Error {
+  constructor(
+    /** The command whose non-zero exit made the topology unreadable — names what could not be read. */
+    readonly command: string,
+    readonly exitCode: number,
+    readonly stderr: string,
+  ) {
+    super(`the AHR topology could not be read (${command} exited ${exitCode}: ${stderr.trim().split('\n')[0] || 'no stderr'})`)
+    this.name = 'AhrTopologyUnreadableError'
+  }
+}
+
+/**
  * Read every AHR pool from the live system. Returns schema-validated
  * {@link AhrPool} records; an empty list when no AHR arrays exist (or md is
- * absent entirely — fail-open, this is a guest).
+ * absent entirely — the read answered and there is nothing, a guest). Throws
+ * {@link AhrTopologyUnreadableError} when the topology could not be READ — a
+ * non-zero exit of `cat /proc/mdstat` or of `mdadm --detail --export` for any
+ * array (D12): a read that cannot see cannot assert "no ANAS pools". A
+ * readable topology that names no AHR array (a foreign md) stays "not ours"
+ * and returns `[]` — only a FAILED read is unreadable.
  */
 export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: string): Promise<AhrPool[]> {
   const mdstatRes = await executor.exec(CAT, MDSTAT_CAT_ARGS)
   if (mdstatRes.exitCode !== 0)
-    return []
+    throw new AhrTopologyUnreadableError('cat /proc/mdstat', mdstatRes.exitCode, mdstatRes.stderr)
   const mdArrays = parseMdstat(mdstatRes.stdout)
   if (mdArrays.length === 0)
     return []
 
   // Identify each array via --detail --export (superblock name/UUID — the
-  // stable identities). Non-AHR-named arrays are foreign: not ours to report.
+  // stable identities). A --detail that EXITS NON-ZERO is a failed read (the
+  // array could not be detailed): the topology is unreadable, not a pool that
+  // is "not ours" — an empty detail would silently match no AHR name and a
+  // LIVE pool would read as "no AHR pools" (D12). Non-AHR-named arrays whose
+  // detail DID answer are foreign: not ours to report.
   const discovered: DiscoveredArray[] = []
   for (const md of mdArrays) {
     const res = await executor.exec(MDADM, mdadmDetailExportArgs(`/dev/${md.kernelName}`))
+    if (res.exitCode !== 0)
+      throw new AhrTopologyUnreadableError(`mdadm --detail --export /dev/${md.kernelName}`, res.exitCode, res.stderr)
     const detail = parseMdadmDetailExport(res.stdout)
     const named = matchAhrArrayName(detail.name ?? detail.devName ?? '')
     if (!named)

@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url'
 import { BackupTask, CloudSyncTask, SnapshotSchedule } from '@anas/shared'
 import { currentLane } from '../../executor/deadline.js'
 import { VGS_ARGS } from '../../parsers/lvm-report.js'
+import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { createServer } from '../../server.js'
 import { AHR_FINDMNT_ARGS } from '../../services/ahr-topology.js'
@@ -58,6 +59,7 @@ const fixture = (rel: string): string => readFileSync(join(__dirname, '../../fix
 const ZFS = '/usr/sbin/zfs'
 const FINDMNT = '/usr/bin/findmnt'
 const CAT = '/usr/bin/cat'
+const MDADM = '/usr/sbin/mdadm'
 const VGS = '/usr/sbin/vgs'
 const PRLIMIT = '/usr/bin/prlimit'
 const TESTPOOL_GUID = '5823146802312415237'
@@ -159,6 +161,8 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
   let ahrFindmnt: string | null | undefined
   /** `cat /proc/mdstat` THROWS — `readAhrPools` fails open (cr.33c F1). */
   let ahrBroken = false
+  /** `mdadm --detail --export /dev/md127` EXITS 1 with empty stdout (D12 mode A). */
+  let ahrDetailBroken = false
   /** The ahr0 VG answers WITH its UUID — the pool's live `ahr:<uuid>` key. */
   let ahrUuid = false
   /** `prlimit` answers success — the direct backup's pbc run completes. */
@@ -208,18 +212,21 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
    * The dev mock, its findmnt the re-pointed capture, every command recorded,
    * the mover's job bodies parkable. The AHR world follows the ahr0 cap: the
    * VG UUID answer and the pbc completion are opt-in (`ahrUuid`, `prlimitOk`),
-   * and `ahrBroken` makes `readAhrPools` fail open (cr.33c F1).
+   * `ahrBroken` makes `cat /proc/mdstat` THROW (cr.33c F1's spawn shape), and
+   * `ahrDetailBroken` makes one array's `--detail --export` EXIT 1 (cr.33d
+   * D12's failed-read shape) — both reach `readAhrPools`'s unreadable fact.
    */
   async function serve(
     mover: string,
     table: string | null = FINDMNT_MEDIA,
-    opts: { ahrFindmnt?: string | null, ahrBroken?: boolean, ahrUuid?: boolean, prlimitOk?: boolean } = {},
+    opts: { ahrFindmnt?: string | null, ahrBroken?: boolean, ahrDetailBroken?: boolean, ahrUuid?: boolean, prlimitOk?: boolean } = {},
   ): Promise<void> {
     calls = []
     findmnt = table
     parkedOp = mover
     ahrFindmnt = opts.ahrFindmnt
     ahrBroken = opts.ahrBroken ?? false
+    ahrDetailBroken = opts.ahrDetailBroken ?? false
     ahrUuid = opts.ahrUuid ?? false
     prlimitOk = opts.prlimitOk ?? false
     park = new Promise<void>((resolve) => {
@@ -244,6 +251,8 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
       }
       if (command === CAT && ahrBroken && args.length === MDSTAT_CAT_ARGS.length && args.every((a, i) => a === MDSTAT_CAT_ARGS[i]))
         throw new Error('mock: /proc/mdstat is unreadable')
+      if (command === MDADM && ahrDetailBroken && args.length === mdadmDetailExportArgs('/dev/md127').length && args.every((a, i) => a === mdadmDetailExportArgs('/dev/md127')[i]))
+        return { stdout: '', stderr: 'mdadm: cannot open /dev/md127: injected by the w2b node pass', exitCode: 1 }
       if (command === VGS && ahrUuid && args.length === VGS_ARGS.length && args.every((a, i) => a === VGS_ARGS[i]))
         return ok(AHR_VGS_WITH_UUID)
       if (command === PRLIMIT && prlimitOk)
@@ -580,6 +589,33 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     await until(() => queue().get(runId)?.status === 'running')
     // Only the mount the path sits on and the task's own key — the ahr: lock
     // could not be taken, and the progress line says exactly why.
+    const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string }[] }> }).jobs.get(runId)!
+    assert.deepEqual(record.claims.map(c => c.key), ['mount:/mnt/anas-ahr/ahr0', 'task:backup:media-nightly'])
+    assert.equal(
+      queue().get(runId)?.progress,
+      `backup task 'media-nightly': ${AHR_SOURCE}: no lock on the source - the AHR topology could not be read, so it is unknown whether the filesystem is an ANAS AHR pool`,
+    )
+    unpark()
+    assert.equal((await finished(runId)).status, 'completed')
+  })
+
+  it('cr.33d (a): a `--detail --export` that EXITS 1 for one array (D12 mode A) reaches the SAME unreadable fact the spawn failure does — the run holds no ahr: key, the unlocked sentence names the AHR topology, and the run still completes', async () => {
+    await registerBackupRepo()
+    await writeBackupTask(QUIET, systemdDir, BackupTask.parse({
+      name: 'media-nightly',
+      repository: 'pbs-main',
+      backupId: 'anas-pve',
+      archives: [{ name: 'media', path: AHR_SOURCE, excludes: [] }],
+      schedule: '*-*-* 02:00:00',
+      enabled: true,
+    }))
+    await serve('backup.task.run', FINDMNT_AHR, { ahrDetailBroken: true, prlimitOk: true })
+    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true } })
+    assert.equal(res.statusCode, 202, res.body)
+    const runId = (res.json() as JobAccepted).job.id
+    await until(() => queue().get(runId)?.status === 'running')
+    // The exit-code shape is indistinguishable from the throw here — the run is
+    // claimed by its mount only and says why (the ahr: lock could not be taken).
     const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string }[] }> }).jobs.get(runId)!
     assert.deepEqual(record.claims.map(c => c.key), ['mount:/mnt/anas-ahr/ahr0', 'task:backup:media-nightly'])
     assert.equal(

@@ -6,13 +6,17 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { createServer } from '../../server.js'
 import { parseServiceUnit } from '../../services/snapshot-schedule-units.js'
 
+const CAT = '/usr/bin/cat'
 const ZPOOL = '/usr/sbin/zpool'
 const ZFS = '/usr/sbin/zfs'
 const SYSTEMCTL = '/usr/bin/systemctl'
 const JOURNALCTL = '/usr/bin/journalctl'
+/** A readable-empty mdstat — a node with no md arrays, so no AHR pools (D12: an unreadable one is not "no pools"). */
+const EMPTY_MDSTAT = { stdout: 'Personalities : [raid1]\nunused devices: <none>\n', stderr: '', exitCode: 0 }
 
 const IDENTITY = {
   'x-anas-user': 'root@pam',
@@ -271,8 +275,10 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
   })
 
   it('POST onto an AHR pool that live topology does not list → 400 (fail-open inventory never creates)', async () => {
-    // No mdstat/mdadm fixtures → readAhrPools sees nothing, exactly what the UI's
-    // fail-open loader would have shown as an empty list.
+    // A READABLE-empty AHR topology — the UI's fail-open loader shows exactly
+    // this as an empty list. An UNREADABLE topology is not this (D12: it must
+    // fail loud, never claim a pool the reader could not see is absent).
+    mockOf(server).addFixture({ command: CAT, args: [...MDSTAT_CAT_ARGS], result: EMPTY_MDSTAT })
     const res = await create({ ...SCHEDULE, id: 'ahr-sched', target: { kind: 'ahr', pool: 'vault' } })
     assert.equal(res.statusCode, 400)
     assert.match(res.json().error.message, /AHR pool 'vault' not found/)

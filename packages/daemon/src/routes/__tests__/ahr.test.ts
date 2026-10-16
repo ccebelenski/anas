@@ -1,4 +1,5 @@
 import type { AhrLayoutPreview, AhrPool } from '@anas/shared'
+import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import Fastify from 'fastify'
@@ -232,6 +233,98 @@ describe('POST /v1/ahr/layout/preview (available disks)', () => {
     })
     assert.equal(res.statusCode, 400)
     assert.ok(res.json().error.message.includes('duplicate'))
+    await server.close()
+  })
+})
+
+// ---- D12: an unreadable topology fails loud, never a silent []/404 ----------
+// The node pass injected these exact failures: mdadm --detail --export for one
+// ARRAY exits 1 (mode A), or cat /proc/mdstat fails (mode b); the wrinkle is
+// that only a FAILED read is unreadable — a READABLE foreign array is "not
+// ours" and the readable controls stay green.
+describe('D12 — /ahr read failure shapes', () => {
+  const MDADM = '/usr/sbin/mdadm'
+  const CAT = '/usr/bin/cat'
+  /** A mock server whose executor answers one read differently (else the dev-mock cap). */
+  async function faultedServer(
+    override: (command: string, args: string[]) => ExecResult | undefined | Promise<ExecResult | undefined>,
+  ): Promise<ReturnType<typeof createServer>> {
+    const s = createServer({ mock: true, logger: false })
+    const mock = (s as unknown as { executor: { exec: (c: string, a: string[], o?: unknown) => Promise<ExecResult> } }).executor
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command, args, opts) => (await override(command, args)) ?? orig(command, args, opts)
+    return s
+  }
+
+  const ahrDetailFault: (command: string, args: string[]) => ExecResult | undefined = (command, args) =>
+    command === MDADM && args[0] === '--detail' && args[1] === '--export' && args[2] === '/dev/md127'
+      ? { stdout: '', stderr: 'mdadm: cannot open /dev/md127: injected by the w2b node pass', exitCode: 1 }
+      : undefined
+
+  it('(a) `mdadm --detail --export /dev/md127` exit 1 — GET /ahr answers 503 naming the read, never []', async () => {
+    const server = await faultedServer(ahrDetailFault)
+    const res = await server.inject({ method: 'GET', url: '/v1/ahr' })
+    assert.equal(res.statusCode, 503)
+    const { error } = res.json() as { error: { code: string, message: string } }
+    assert.equal(error.code, 'UNAVAILABLE')
+    assert.match(error.message, /the AHR topology could not be read/)
+    assert.match(error.message, /mdadm --detail --export \/dev\/md127/)
+    await server.close()
+  })
+
+  it('(a) the same read — GET /ahr/:name answers 503, never a 404', async () => {
+    const server = await faultedServer(ahrDetailFault)
+    const res = await server.inject({ method: 'GET', url: '/v1/ahr/ahr0' })
+    assert.equal(res.statusCode, 503)
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'UNAVAILABLE')
+    await server.close()
+  })
+
+  it('(b) `cat /proc/mdstat` exit 1 — GET /ahr answers 503 naming the read', async () => {
+    const server = await faultedServer((command, args) =>
+      command === CAT && args[0] === '/proc/mdstat'
+        ? { stdout: '', stderr: 'cat: /proc/mdstat: injected by the w2b node pass', exitCode: 1 }
+        : undefined)
+    const res = await server.inject({ method: 'GET', url: '/v1/ahr' })
+    assert.equal(res.statusCode, 503)
+    const { error } = res.json() as { error: { code: string, message: string } }
+    assert.equal(error.code, 'UNAVAILABLE')
+    assert.match(error.message, /the AHR topology could not be read/)
+    assert.match(error.message, /cat \/proc\/mdstat/)
+    await server.close()
+  })
+
+  it('(c) a READABLE topology with a foreign md array beside the ANAS pools — GET /ahr lists the ANAS pools only (no regression)', async () => {
+    const foreign = [
+      'md40 : active raid1 sdy1[1] sdx1[0]',
+      '      1047552 blocks super 1.2 [2/2] [UU]',
+      '',
+      'unused devices: <none>',
+    ].join('\n')
+    const mdstatWithForeign = mockFixtures.ahrMdstat().stdout.replace('unused devices: <none>', foreign)
+    const server = await faultedServer(async (command, args) => {
+      if (command === CAT && args[0] === '/proc/mdstat')
+        return { stdout: mdstatWithForeign, stderr: '', exitCode: 0 }
+      if (command === MDADM && args[0] === '--detail' && args[1] === '--export' && args[2] === '/dev/md40')
+        return { stdout: 'MD_LEVEL=raid1\nMD_DEVICES=2\nMD_DEVNAME=foreign0\nMD_NAME=otherhost:foreign0\n', stderr: '', exitCode: 0 }
+      return undefined
+    })
+    const res = await server.inject({ method: 'GET', url: '/v1/ahr' })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: AhrPool[] }
+    assert.deepEqual(data.map(p => p.name), ['ahr0'])
+    await server.close()
+  })
+
+  it('(d) a SPAWN failure (EACCES) still answers 500 with its own code — only a typed unreadable read is the 503 (cr.33c pinned)', async () => {
+    const server = await faultedServer(async (command, args) => {
+      if (command === MDADM && args[0] === '--detail' && args[1] === '--export' && args[2] === '/dev/md126')
+        throw Object.assign(new Error('spawn /usr/sbin/mdadm EACCES'), { code: 'EACCES' })
+      return undefined
+    })
+    const res = await server.inject({ method: 'GET', url: '/v1/ahr' })
+    assert.equal(res.statusCode, 500)
+    assert.equal((res.json() as { code: string }).code, 'EACCES')
     await server.close()
   })
 })

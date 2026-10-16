@@ -3,6 +3,9 @@ import type { ConsistencyFacts } from '../backup-consistency.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
+import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
+import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
+import { readAhrPools } from '../ahr-topology.js'
 import { deriveArchiveConsistency, deriveConsistency, filesystemOf, isZvolConsistency, readConsistencyFacts } from '../backup-consistency.js'
 import { mountIndex } from '../nested-filesystems.js'
 
@@ -240,6 +243,30 @@ describe('backup consistency derivation (backup2.3)', () => {
     // twin: a Readable-but-empty AHR list is "no pools", never "unreadable").
     const readable = await readConsistencyFacts(new MockExecutor(), async () => [])
     assert.equal(readable.ahrUnreadable, false)
+  })
+
+  it('cr.33d — a NON-ZERO `--detail` exit (D12 mode A) reaches ahrUnreadable too: the btrfs reason is the honest one, never "not an ANAS AHR pool"', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: TABLE, stderr: '', exitCode: 0 } })
+    // The real readAhrPools with a node whose mdstat answers but whose single
+    // array's `mdadm --detail --export` EXITS 1 (the node-proved shape).
+    mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: {
+      stdout: 'Personalities : [raid1]\nmd127 : active raid1 sde1[1] sdd1[0]\n      1047552 blocks super 1.2 [2/2] [UU]\n\nunused devices: <none>\n',
+      stderr: '',
+      exitCode: 0,
+    } })
+    mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: {
+      stdout: '',
+      stderr: 'mdadm: cannot open /dev/md127: injected by the w2b node pass',
+      exitCode: 1,
+    } })
+    const facts = await readConsistencyFacts(mock, readAhrPools, { pveStorageCfg: '/nonexistent/storage.cfg' })
+    assert.equal(facts.ahrUnreadable, true)
+    assert.deepEqual(facts.ahrPools, [])
+    const c = deriveConsistency('/mnt/ahr1', facts)
+    assert.equal(c.consistency, 'live')
+    assert.match(c.reason, /the AHR topology could not be read/)
+    assert.doesNotMatch(c.reason, /not an ANAS AHR pool/)
   })
 
   it('derives a whole archive list in order from ONE fact read', async () => {

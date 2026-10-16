@@ -11,7 +11,7 @@ import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { isPvUnderSized, PV_UNDERSIZE_MARGIN_BYTES } from '../ahr-layout.js'
-import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, buildAhrWarnings, readAhrPools, withExpansionIntent } from '../ahr-topology.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, AhrTopologyUnreadableError, buildAhrWarnings, readAhrPools, withExpansionIntent } from '../ahr-topology.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/ahr')
@@ -242,9 +242,11 @@ describe('readAhrPools', () => {
   })
 
   it('reports the drilled degraded-reshape state (phase C1)', async () => {
-    // Only md127 identifies as an AHR array here (the other kernels have no
-    // export fixture) — defensive-parse tolerance for unidentifiable arrays.
+    // md125 is a third array that is NOT part of ahr0 — its detail answers
+    // (exit 0) and names no AHR pool, so it stays "not ours" (D12: only a
+    // FAILED read is unreadable; a readable foreign detail is tolerated).
     const mock = healthyExecutor({ mdstat: loadFixture('mdstat-reshape-degraded.txt') })
+    mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md125'), result: ok('MD_LEVEL=raid1\nMD_DEVICES=2\nMD_DEVNAME=backup256\nMD_NAME=otherhost:backup256\n') })
     const pools = await readAhrPools(mock)
     assert.equal(pools.length, 1)
     const pool = pools[0]
@@ -405,16 +407,54 @@ describe('readAhrPools', () => {
     assert.equal(pools[0].capacity.usedBytes, 294912)
   })
 
-  it('returns [] when mdstat is unreadable or has no AHR arrays', async () => {
+  it('a FAILED mdstat read is UNREADABLE, not empty — the topology cannot be enumerated (D12)', async () => {
     const noMd = new MockExecutor()
     noMd.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'No such file', exitCode: 1 } })
-    assert.deepEqual(await readAhrPools(noMd), [])
+    await assert.rejects(
+      readAhrPools(noMd),
+      (err: unknown) => err instanceof AhrTopologyUnreadableError
+        && /cat \/proc\/mdstat/.test((err as AhrTopologyUnreadableError).command)
+        && /could not be read/.test((err as Error).message),
+    )
+  })
 
-    // Arrays exist but none carries an AHR name — foreign, not ours to report.
+  it('returns [] when the mdstat read answers and no array carries an AHR name (foreign, not ours)', async () => {
     const foreign = new MockExecutor()
     foreign.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: ok(loadFixture('mdstat-clean.txt')) })
+    // Every detail EXITS 0 but names no AHR pool — a READABLE topology that is
+    // simply not ANAS's. A non-zero detail exit is unreadable (D12), not this.
     foreign.addFixture({ command: '/usr/sbin/mdadm', result: ok('MD_LEVEL=raid1\nMD_DEVNAME=foreign0\nMD_NAME=otherhost:foreign0\n') })
     assert.deepEqual(await readAhrPools(foreign), [])
+  })
+
+  it('a non-zero `mdadm --detail --export` exit for ONE of two arrays is an unreadable topology (D12 mode A)', async () => {
+    // mirror the node: md126's detail answers, md127's EXITS 1 with empty
+    // stdout — a LIVE pool must read "unreadable", never "no AHR pools".
+    const mock = new MockExecutor()
+    mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: ok(loadFixture('mdstat-clean.txt')) })
+    mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: ok(loadFixture('mdadm-export-r2.txt')) })
+    mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: { stdout: '', stderr: 'mdadm: cannot open /dev/md127: injected by the w2b node pass', exitCode: 1 } })
+    await assert.rejects(
+      readAhrPools(mock),
+      (err: unknown) => err instanceof AhrTopologyUnreadableError
+        && (err as AhrTopologyUnreadableError).exitCode === 1
+        && /mdadm --detail --export \/dev\/md127/.test((err as AhrTopologyUnreadableError).command)
+        && /injected/.test((err as Error).message),
+    )
+  })
+
+  it('a DETAIL that is READABLE but names no AHR array beside the ANAS pools stays "not ours" (D12 regression pin)', async () => {
+    const mock = healthyExecutor({
+      mdstat: loadFixture('mdstat-clean.txt').replace('unused devices: <none>', [
+        'md40 : active raid1 sdy1[1] sdx1[0]',
+        '      1047552 blocks super 1.2 [2/2] [UU]',
+        '',
+        'unused devices: <none>',
+      ].join('\n')),
+    })
+    mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md40'), result: ok('MD_LEVEL=raid1\nMD_DEVICES=2\nMD_DEVNAME=foreign0\nMD_NAME=otherhost:foreign0\n') })
+    const pools = await readAhrPools(mock)
+    assert.deepEqual(pools.map(p => p.name), ['ahr0'])
   })
 
   // Bug #2 (code review): a `<pool>-r<N>`-NAMED bare md array (e.g. a hand-built
