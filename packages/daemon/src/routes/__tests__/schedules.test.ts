@@ -352,6 +352,9 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
         target: { kind: 'zfs', dataset: 'testpool/vm-100-disk-0' },
       })
       assert.equal(created.statusCode, 202)
+      // The create is a JOB: its unit write must land before the run is posted
+      // (a run posted first answered 404 under load — a test race, not a door).
+      await waitForJob(server, (created.json() as { job: { id: string } }).job.id)
 
       // PVE claims testpool — the fixture storage.cfg is written AFTER the
       // schedule exists. The timer's next fire (or a Run Now) must refuse.
@@ -385,6 +388,9 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
         recursive: true,
       })
       assert.equal(created.statusCode, 202)
+      // The create is a JOB: its unit write must land before the run is posted
+      // (a run posted first answered 404 under load — a test race, not a door).
+      await waitForJob(server, (created.json() as { job: { id: string } }).job.id)
 
       // A storage is registered on the NESTED path testpool/x/data — its
       // subtree is PVE's, the schedule's target above it is not.
