@@ -400,6 +400,25 @@ describe('backup runner — result classification (NOTES §6, SURPRISE A/B)', ()
     assert.equal(out.kind, 'failure')
     assert.match((out as { detail: string }).detail, /no such datastore/)
   })
+
+  it('cr.48e: a failure detail quoting the run secret is masked — the taxonomy ran on raw stderr', () => {
+    // The thrown job error is built from THIS detail, so the value must be
+    // gone before it leaves: cr.48b's boundary, one pass, classification first.
+    const out = classifyBackupResult(255, 'Error: authentication failed - run-side-secret was rejected', ['run-side-secret'])
+    assert.equal(out.kind, 'failure')
+    assert.match((out as { detail: string }).detail, /authentication failed - \[secret\]/)
+    assert.ok(!(out as { detail: string }).detail.includes('run-side-secret'))
+
+    // The owner branch embeds the same firstErrorLine — masked alike.
+    const owner = classifyBackupResult(255, 'Error: backup owner check failed for run-side-secret', ['run-side-secret'])
+    assert.equal(owner.kind, 'failure')
+    assert.equal((owner as { owner?: boolean }).owner, true)
+    assert.ok(!(owner as { detail: string }).detail.includes('run-side-secret'))
+
+    // With no secret values the line stays verbatim (every pre-cr.48e caller).
+    const raw = classifyBackupResult(255, 'Error: authentication failed - run-side-secret was rejected')
+    assert.match((raw as { detail: string }).detail, /run-side-secret/)
+  })
 })
 
 describe('backup runner — test verdicts from the REAL failure taxonomy fixture', () => {
@@ -445,5 +464,33 @@ describe('backup runner — test verdicts from the REAL failure taxonomy fixture
 
   it('nonexistent namespace → namespace', () => {
     assert.equal(classifyTestVerdict(byNum(9).exit, byNum(9).stderr).stage, 'namespace')
+  })
+})
+
+describe('cr.48e — the test verdict\'s detail is masked against the secret the probe handed pbc', () => {
+  // The datastore, namespace and generic-auth branches quote the probe's
+  // `Error:` line verbatim; a backend echoing the credential it was handed
+  // rides that line into the Test reply. The stage taxonomy must keep reading
+  // the RAW stderr; only the detail that leaves is masked.
+  it('the datastore branch keeps the stage and masks the echoed value', () => {
+    const v = classifyTestVerdict(255, 'Error: no such datastore \'store1\' (asked with probe-side-secret)', ['probe-side-secret'])
+    assert.equal(v.stage, 'datastore', 'the taxonomy ran on the raw text')
+    assert.match(v.detail ?? '', /no such datastore/)
+    assert.match(v.detail ?? '', /\[secret\]/)
+    assert.ok(!(v.detail ?? '').includes('probe-side-secret'), v.detail)
+  })
+
+  it('the generic auth fallback masks the echoed value', () => {
+    const v = classifyTestVerdict(255, 'Error: server replied HTTP 400 to probe-side-secret', ['probe-side-secret'])
+    assert.equal(v.stage, 'auth')
+    assert.match(v.detail ?? '', /\[secret\]/)
+    assert.ok(!(v.detail ?? '').includes('probe-side-secret'), v.detail)
+  })
+
+  it('the constant details are untouched, and with no secret values the echo stays verbatim', () => {
+    const auth = classifyTestVerdict(255, 'Error: authentication failed.', ['probe-side-secret'])
+    assert.equal(auth.detail, 'Authentication failed — check the token id/secret (a revoked token looks the same).')
+    const raw = classifyTestVerdict(255, 'Error: server replied HTTP 400 to probe-side-secret')
+    assert.match(raw.detail ?? '', /probe-side-secret/)
   })
 })

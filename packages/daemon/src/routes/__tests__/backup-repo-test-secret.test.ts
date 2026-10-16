@@ -254,6 +254,41 @@ describe('POST /backup/repos/test — stored-secret fallback (#41)', () => {
     const res = await server.inject({ method: 'POST', url: '/v1/backup/repos/test', headers: JSON_HEADERS, payload: { name: 'nope' } })
     assert.equal(res.statusCode, 404)
   })
+
+  // cr.48e — the Test verdict's detail quotes the probe's `Error:` line on the
+  // datastore/namespace/generic-auth branches. A backend echoing the credential
+  // it was handed puts it in the reply; the mask runs at the classifier,
+  // against the very secret this probe was given, so the whole response body —
+  // not just the detail — carries no value.
+  it('a probe line quoting the stored secret leaves [secret] — the reply body carries no value', async () => {
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    // Prepended: the command-only success fixture of beforeEach must lose.
+    mock.prependFixture({
+      command: PBC,
+      result: { stdout: '', stderr: 'Error: server replied after auth \'stored-token-secret\' rejected\n', exitCode: 255 },
+    })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/repos/test', headers: JSON_HEADERS, payload: { name: 'pbs-main' } })
+    assert.equal(res.statusCode, 200, res.body)
+    const data = (res.json() as { data: { stage: string, detail?: string } }).data
+    assert.equal(data.stage, 'auth', 'the generic fallback — classification ran on the raw stderr')
+    assert.match(data.detail!, /server replied after auth '\[secret\]' rejected/)
+    assert.equal(res.body.includes(STORED_SECRET), false)
+  })
+
+  it('the datastore branch keeps its stage and masks the echoed secret', async () => {
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    mock.prependFixture({
+      command: PBC,
+      result: { stdout: '', stderr: 'Error: no such datastore \'nosuch\' (asked with stored-token-secret)\n', exitCode: 255 },
+    })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/repos/test', headers: JSON_HEADERS, payload: { name: 'pbs-main' } })
+    assert.equal(res.statusCode, 200, res.body)
+    const data = (res.json() as { data: { stage: string, detail?: string } }).data
+    assert.equal(data.stage, 'datastore')
+    assert.match(data.detail!, /no such datastore/)
+    assert.match(data.detail!, /\[secret\]/)
+    assert.equal(res.body.includes(STORED_SECRET), false)
+  })
 })
 
 // #44: TLS ServerName must not be an IP — Node throws synchronously

@@ -67,3 +67,46 @@ describe('secret-argv: maskSecretValues (cr.48b)', () => {
     assert.equal(maskSecretValues('', []), '')
   })
 })
+
+/**
+ * cr.48e — the widened form space: the `+`-for-space spelling of the URL
+ * encoding (the form-urlencoded echo) and both Unicode normalisations, when
+ * they differ from the stored value. Base64 is deliberately OUT OF SCOPE (a
+ * tool does not echo a credential base64-encoded in an error line — recorded
+ * in the helper's doc comment).
+ */
+describe('secret-argv: maskSecretValues (cr.48e form space)', () => {
+  it('the +-for-space form of the encoding is masked too', () => {
+    // One value, three spellings a tool can print: plain, %20-encoded, +.
+    const value = 's3cr3t pa ss'
+    assert.equal(maskSecretValues('body: s3cr3t+pa+ss=on', [value]), 'body: [secret]=on')
+    assert.equal(maskSecretValues('url: s3cr3t%20pa%20ss here', [value]), 'url: [secret] here')
+    assert.equal(maskSecretValues('echo: s3cr3t pa ss here', [value]), 'echo: [secret] here')
+  })
+
+  it('a value with no space produces no + form (a lone + in text survives)', () => {
+    assert.equal(maskSecretValues('a+b stays, s3cr3t goes', ['s3cr3t']), 'a+b stays, [secret] goes')
+  })
+
+  it('the NFC form is masked (value stored decomposed, tool echoes composed)', () => {
+    // Stored: 'cafe\u0301-secret' (e + combining acute); the NFC echo composes.
+    assert.equal(maskSecretValues('pbc echoed caf\u00E9-secret back', ['cafe\u0301-secret']), 'pbc echoed [secret] back')
+  })
+
+  it('the NFD form is masked (value stored composed, tool echoes decomposed)', () => {
+    // The text carries the decomposed echo of the stored COMPOSED value.
+    assert.equal(maskSecretValues('pbc echoed cafe\u0301-secret back', ['caf\u00E9-secret']), 'pbc echoed [secret] back')
+  })
+
+  it('the 4-character floor applies to every form (a short normalisation is not masked)', () => {
+    // 'e\u0301e\u0301f' is 5 code units (eligible plain); its NFC form
+    // '\u00e9\u00e9f' is 3 — below the floor, so it survives in text rather
+    // than shredding it. The plain stored form is still masked.
+    assert.equal(maskSecretValues('the word \u00E9\u00E9f stays', ['e\u0301e\u0301f']), 'the word \u00E9\u00E9f stays')
+    assert.equal(maskSecretValues('the word e\u0301e\u0301f goes', ['e\u0301e\u0301f']), 'the word [secret] goes')
+  })
+
+  it('an ASCII value masks no differently than before (normalisations are no-ops)', () => {
+    assert.equal(maskSecretValues('plain s3cr3t-pass here', ['s3cr3t-pass']), 'plain [secret] here')
+  })
+})

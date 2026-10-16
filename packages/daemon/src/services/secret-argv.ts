@@ -90,22 +90,40 @@ export function assertNoSecretValues(args: string[], secretValues: string[], ski
  * the value verbatim, or an rclone/pbc line that echoes the URL it was pointed
  * at). A secret never rides in a reply, whatever a tool answers.
  *
- * Both the plain value and its `encodeURIComponent` form are masked (rclone and
- * pbc echo URLs, where the value is percent-encoded). Values are matched
- * LONGEST FIRST, so a secret value that contains another is masked whole. A
- * value SHORTER than 4 characters is not masked: replacing so short a string
- * would shred ordinary text (it could be any word). Empty values cannot match
- * anything and are ignored.
+ * A value is masked in EVERY form a tool can echo it back in (cr.48e widened
+ * the set): the plain value; its `encodeURIComponent` form (rclone and pbc
+ * echo URLs, where the value is percent-encoded); the `+`-for-space form of
+ * that encoding (`encodeURIComponent` with `%20` rewritten to `+` — the
+ * application/x-www-form-urlencoded spelling a tool echoes when it prints the
+ * request body it was handed); and both Unicode normalisations of the value,
+ * `normalize('NFC')` and `normalize('NFD')`, when they differ from it (a tool
+ * that round-trips the credential through a normalising layer prints bytes that
+ * never match the stored string). Values are matched LONGEST FIRST, so a secret
+ * value that contains another is masked whole. A value (or form) SHORTER than 4
+ * characters is not masked: replacing so short a string would shred ordinary
+ * text (it could be any word). Empty values cannot match anything and are
+ * ignored.
+ *
+ * OUT OF SCOPE, recorded: the BASE64 form. A tool does not echo a credential
+ * base64-encoded in an error line — the forms above are what rclone, pbc and
+ * the HTTP layer actually print. Also recorded: the secret schemas
+ * (`BackupRepoWrite.secret` and `BackupRepoTestRequest.secret`,
+ * shared/schemas/backup.ts) set NO minimum length, so a 3-character secret
+ * rides through unmasked — widening the mask below 4 characters would shred
+ * ordinary text, and shortening a credential is the operator's call, not ours.
  *
  * The verdict classifiers never see the masked text — the classification runs
  * on the RAW output and only what leaves in the result is masked.
  */
 export function maskSecretValues(text: string, secretValues: string[]): string {
   const forms = new Set<string>()
+  // The 4-character floor (see the note above): an eligible plain value's
+  // encoded forms are always at least as long (encoding never shrinks), but a
+  // NORMALISED form can be shorter than the value (NFC composes), so the floor
+  // is checked per form.
+  const eligible = (s: string): boolean => s.length >= 4
   for (const value of secretValues) {
-    // The 4-character floor guards the plain value; the encoded form of an
-    // eligible value is always at least as long (encoding never shrinks).
-    if (value === '' || value.length < 4)
+    if (value === '' || !eligible(value))
       continue
     forms.add(value)
     let encoded: string
@@ -117,6 +135,15 @@ export function maskSecretValues(text: string, secretValues: string[]): string {
     }
     if (encoded !== value)
       forms.add(encoded)
+    // The form-urlencoded spelling: the same encoding, space as `+`.
+    const plusForm = encoded.split('%20').join('+')
+    if (plusForm !== encoded && plusForm !== value)
+      forms.add(plusForm)
+    // Both normalisations, when they differ from the stored value.
+    for (const normalised of [value.normalize('NFC'), value.normalize('NFD')]) {
+      if (normalised !== value && eligible(normalised))
+        forms.add(normalised)
+    }
   }
   if (forms.size === 0)
     return text

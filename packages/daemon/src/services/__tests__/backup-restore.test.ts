@@ -1113,3 +1113,36 @@ describe('readBackWarnings — the serial and attributes must survive', () => {
     assert.ok(result.warnings?.some(w => /LIO read-back failed: configfs gone/.test(w)))
   })
 })
+
+// ============================================================================
+//  cr.48e — the forwarded progress line is masked at the door
+// ============================================================================
+
+describe('cr.48e — the in-place door masks the forwarded progress line', () => {
+  it('a progress-shaped line echoing the repo secret forwards [secret]; the percent still parses off the raw chunk', async () => {
+    // The progress SHAPE does not guarantee the CONTENT: a line matching
+    // `progress N% (…)` can carry an error fragment quoting the credential
+    // (cr.48d left this line verbatim — that is the carrier this step closes).
+    const mock = new MockExecutor()
+    mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addStreamFixture({
+      command: PBC,
+      result: {
+        stderr: 'progress 25% (Error: credential rejected super-secret)\r',
+        exitCode: 255,
+        bytesWritten: 0,
+      },
+    })
+    const seen: string[] = []
+    const lun = zvolLun()
+    // The run itself fails at exit 255 — this test is about what the progress
+    // sink received on the way, so the rejection is only collected, not judged.
+    await assert.rejects(runImageRestore(mock, deps(mock, lun, target([lun])), m => seen.push(m)))
+    const line = seen.find(m => m.startsWith('restore progress'))
+    assert.ok(line, `no forwarded progress line in: ${JSON.stringify(seen)}`)
+    // The percentage survived the RAW parse — the mask runs after extraction.
+    assert.match(line, /^restore progress 25%/)
+    assert.match(line, /\[secret\]/)
+    assert.ok(!line.includes('super-secret'), line)
+  })
+})

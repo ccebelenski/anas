@@ -33,6 +33,7 @@ import {
 } from './backup-snapshots.js'
 import { withZvolSnapshotDevices } from './backup-zvol.js'
 import { nestedRunNotices, nestedRunWarnings, resolveNestedIncludes, scanArchives } from './nested-filesystems.js'
+import { maskSecretValues } from './secret-argv.js'
 import { formatTransientBackupSnapshot } from './snapshot-naming.js'
 import { notThereClause, readSourceGuardFacts, unmountedMountFor } from './source-guard.js'
 
@@ -418,7 +419,14 @@ export type BackupOutcome
   /** A real failure (incl. the owner-coupling case) — detail is client-safe. */
     | { kind: 'failure', detail: string, owner?: boolean }
 
-/** Extract the client-safe `Error:` line (pbc stderr never carries the secret). */
+/**
+ * Extract the `Error:` line as written. The old comment here promised pbc
+ * stderr never carries the secret — cr.48b/e dropped that promise: a backend
+ * that quotes the credential it was handed can put it in any line, so every
+ * caller whose string LEAVES the daemon masks the result with
+ * `maskSecretValues` (the callers below and in backup-prune all pass the run's
+ * secret values).
+ */
 export function firstErrorLine(stderr: string): string {
   const lines = stderr.split('\n').map(l => l.trim()).filter(Boolean)
   const errLine = lines.find(l => l.startsWith('Error:'))
@@ -429,16 +437,20 @@ export function firstErrorLine(stderr: string): string {
  * Classify a pbc backup run. exit 0 → success. A too-soon collision is BENIGN
  * (skipped, not a failure — no dashboard warning). The owner-coupling refusal
  * gets a clear flag so the caller can surface an actionable message. Everything
- * else is a failure carrying the verbatim (secret-free) `Error:` line.
+ * else is a failure carrying the verbatim `Error:` line — masked (cr.48e), not
+ * verbatim, when it echoes a secret value: the classification runs on the RAW
+ * stderr and only the detail that leaves is masked against the secret values
+ * the run handed pbc (the cr.48b boundary pattern; a line that quotes the
+ * credential meets `[secret]` in the job error and the run notification).
  */
-export function classifyBackupResult(exitCode: number, stderr: string): BackupOutcome {
+export function classifyBackupResult(exitCode: number, stderr: string, secretValues: string[] = []): BackupOutcome {
   if (exitCode === 0)
     return { kind: 'success' }
   if (TOO_SOON_RE.test(stderr))
-    return { kind: 'too-soon', detail: firstErrorLine(stderr) }
+    return { kind: 'too-soon', detail: maskSecretValues(firstErrorLine(stderr), secretValues) }
   if (OWNER_MISMATCH_RE.test(stderr))
-    return { kind: 'failure', detail: firstErrorLine(stderr), owner: true }
-  return { kind: 'failure', detail: firstErrorLine(stderr) }
+    return { kind: 'failure', detail: maskSecretValues(firstErrorLine(stderr), secretValues), owner: true }
+  return { kind: 'failure', detail: maskSecretValues(firstErrorLine(stderr), secretValues) }
 }
 
 // --- Run one backup ---------------------------------------------------------
@@ -803,7 +815,9 @@ export async function runBackup(
   if (summary)
     updateProgress(summary)
 
-  const outcome = classifyBackupResult(r.exitCode, r.stderr)
+  // cr.48e: the failure detail becomes the thrown job error, so it is masked
+  // against the secret this run handed pbc; the taxonomy ran on the raw stderr.
+  const outcome = classifyBackupResult(r.exitCode, r.stderr, [secret])
   if (outcome.kind === 'failure') {
     const prefix = outcome.owner
       // ASCII only: this text becomes the run job's error and is embedded
@@ -996,7 +1010,19 @@ export function classifyPermissionFailure(stderr: string): PermissionFailureKind
  * 'permission' verdict in the UI/DESIGN set — an authenticated-but-unauthorized
  * token folds into 'auth' with a distinguishing detail.
  */
-export function classifyTestVerdict(exitCode: number, stderr: string): BackupRepoTestResult {
+export function classifyTestVerdict(exitCode: number, stderr: string, secretValues: string[] = []): BackupRepoTestResult {
+  const verdict = rawClassifyTestVerdict(exitCode, stderr)
+  // cr.48e: the datastore/namespace/generic-auth details quote the probe's
+  // `Error:` line verbatim — the same exposure cr.48b closed for the read
+  // jobs' details. Classification ran on the RAW stderr above; only the detail
+  // that leaves is masked against the secret values the test handed pbc.
+  return verdict.detail !== undefined
+    ? { ...verdict, detail: maskSecretValues(verdict.detail, secretValues) }
+    : verdict
+}
+
+/** The staged verdict over the RAW stderr — the taxonomy, no masking. */
+function rawClassifyTestVerdict(exitCode: number, stderr: string): BackupRepoTestResult {
   if (exitCode === 0)
     return { stage: 'ok' }
   const s = stderr

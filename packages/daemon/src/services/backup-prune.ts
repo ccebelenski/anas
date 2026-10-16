@@ -2,6 +2,7 @@ import type { BackupPruneResult, BackupPruneSnapshot, BackupPruneVerdict, Backup
 import type { CommandExecutor } from '../executor/types.js'
 import { hasRetentionKeeps } from '@anas/shared'
 import { buildBackupEnv, effectiveNamespace, firstErrorLine, PBC } from './backup-runner.js'
+import { maskSecretValues } from './secret-argv.js'
 
 /**
  * PBS RETENTION (story 16.11) — `proxmox-backup-client prune`, the only prune
@@ -208,18 +209,32 @@ export function summarizePrune(snapshots: BackupPruneSnapshot[]): {
  * Map a failed prune to a verdict + client-safe detail. Honest about what the
  * server actually told us: ENOENT cannot distinguish a missing group from a
  * missing namespace, so the message names both.
+ *
+ * cr.48e: the permission and error branches quote pbc's `Error:` line verbatim,
+ * and a backend that echoes the credential it was handed can put it there — so
+ * the detail is masked against `secretValues`, the secret values THIS prune
+ * handed pbc. ONE pass, UPSTREAM of both consumers, which is what covers them
+ * both: the prune-preview reply takes the detail straight from `runPrune`, and
+ * the run's Warnings (→ the 16.12 notification body, embedded verbatim) take it
+ * from the same field via `pruneAfterBackup`. Masking at the notification
+ * builder instead would leave the preview reply unmasked. The verdict
+ * classification above runs on the RAW stderr (cr.48b's pattern).
  */
 export function classifyPruneVerdict(
   exitCode: number,
   stderr: string,
+  secretValues: string[] = [],
 ): { verdict: BackupPruneVerdict, detail: string } {
   if (PRUNE_PERM_RE.test(stderr)) {
     return {
       verdict: 'permission',
       // ASCII only: this detail is embedded verbatim in the run notification's
       // Warnings block, and that pipeline mangles non-ASCII (see backup-notify).
-      detail: 'The credential lacks prune privileges - PBS wants Datastore.Modify or '
+      detail: maskSecretValues(
+        'The credential lacks prune privileges - PBS wants Datastore.Modify or '
         + `Datastore.Prune on this datastore/namespace (${firstErrorLine(stderr)}).`,
+        secretValues,
+      ),
     }
   }
   if (PRUNE_ENOENT_RE.test(stderr)) {
@@ -229,7 +244,7 @@ export function classifyPruneVerdict(
         + 'the same ENOENT for both, so which one is missing cannot be told apart.',
     }
   }
-  return { verdict: 'error', detail: `${firstErrorLine(stderr) || `prune exited with code ${exitCode}`}` }
+  return { verdict: 'error', detail: maskSecretValues(`${firstErrorLine(stderr) || `prune exited with code ${exitCode}`}`, secretValues) }
 }
 
 export interface PruneDeps {
@@ -269,11 +284,14 @@ export async function runPrune(executor: CommandExecutor, deps: PruneDeps): Prom
     stderr = r.stderr
   }
   catch (err) {
-    return { ok: false, verdict: 'error', detail: err instanceof Error ? err.message : String(err) }
+    // cr.48e: an executor rejection's message lands in the same two consumers
+    // as a classified detail (the preview reply, the run's Warnings), so it is
+    // masked against the secret this prune handed the child.
+    return { ok: false, verdict: 'error', detail: maskSecretValues(err instanceof Error ? err.message : String(err), [deps.secret]) }
   }
 
   if (exitCode !== 0)
-    return { ok: false, ...classifyPruneVerdict(exitCode, stderr) }
+    return { ok: false, ...classifyPruneVerdict(exitCode, stderr, [deps.secret]) }
 
   const snapshots = parsePruneOutput(stdout)
   if (!snapshots) {

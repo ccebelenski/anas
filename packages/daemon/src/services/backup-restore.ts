@@ -700,11 +700,15 @@ export async function runImageRestore(
         onStderr: (chunk) => {
           // GT-59: the interval roughly DOUBLES (6 s, 16 s, 36 s, 79 s), so a
           // multi-hour restore emits a handful of late lines and long silences
-          // are normal. Every line pbc does emit is forwarded verbatim.
+          // are normal. Every line pbc does emit is forwarded — masked (cr.48e):
+          // the progress SHAPE does not guarantee the CONTENT, and a line
+          // matching it can carry an error fragment quoting the repo secret.
+          // The percentage parse below reads the raw chunk; only the forwarded
+          // line is masked with the secret this restore handed pbc.
           const p = parseRestoreProgress(chunk)
           if (p.percent !== null && p.percent !== lastPercent) {
             lastPercent = p.percent
-            updateProgress(`restore ${p.lastLine ?? `progress ${p.percent}%`}`)
+            updateProgress(`restore ${p.lastLine !== null ? maskSecretValues(p.lastLine, [deps.secret]) : `progress ${p.percent}%`}`)
           }
         },
       })
@@ -1054,11 +1058,14 @@ export async function runNewLunImageRestore(
         timeoutMs: null,
         longRunning: 'proxmox-backup-client image restore to a new backing: a data mover, hours for a large image',
         onStderr: (chunk) => {
-          // GT-59: forward every progress line verbatim, as the in-place run does.
+          // GT-59: forward every progress line, as the in-place run does —
+          // masked (cr.48e), same as there: a line matching the progress shape
+          // can carry an error fragment quoting the repo secret, and the
+          // percentage parse reads the raw chunk either way.
           const p = parseRestoreProgress(chunk)
           if (p.percent !== null && p.percent !== lastPercent) {
             lastPercent = p.percent
-            updateProgress(`restore ${p.lastLine ?? `progress ${p.percent}%`}`)
+            updateProgress(`restore ${p.lastLine !== null ? maskSecretValues(p.lastLine, [deps.secret]) : `progress ${p.percent}%`}`)
           }
         },
       })

@@ -795,3 +795,29 @@ describe('newLunZvolCreateArgs — the dataset door\'s volume-create argv, not a
     assert.deepEqual(newLunZvolCreateArgs('tank/newvol', 536870912), ['create', '-s', '-V', '536870912', '--', 'tank/newvol'])
   })
 })
+
+describe('cr.48e — the new-LUN door masks the forwarded progress line', () => {
+  it('a progress-shaped line echoing the repo secret forwards [secret]; the percent still parses off the raw chunk', async () => {
+    await withConfigfsRoot(async (configfsRoot) => {
+      const mock = new MockExecutor()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addStreamFixture({
+        command: PBC,
+        result: {
+          stderr: 'progress 40% (Error: credential rejected super-secret)\r',
+          exitCode: 255,
+          bytesWritten: 0,
+        },
+      })
+      const seen: string[] = []
+      // The run fails at exit 255 — what matters is what the progress sink got.
+      await assert.rejects(runNewLunImageRestore(mock, deps(mock, configfsRoot), m => seen.push(m)))
+      const line = seen.find(m => m.startsWith('restore progress'))
+      assert.ok(line, `no forwarded progress line in: ${JSON.stringify(seen)}`)
+      assert.match(line, /^restore progress 40%/)
+      assert.match(line, /\[secret\]/)
+      assert.ok(!line.includes('super-secret'), line)
+    })
+  })
+})

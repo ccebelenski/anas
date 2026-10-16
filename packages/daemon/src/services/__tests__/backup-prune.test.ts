@@ -1,4 +1,5 @@
 import type { BackupRepo, BackupTask } from '@anas/shared'
+import type { CommandExecutor } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -295,6 +296,90 @@ describe('backup prune — pruneAfterBackup (the post-success step)', () => {
     assert.equal(out.warnings!.length, 1)
     assert.match(out.warnings![0], /Backup succeeded/)
     assert.match(out.warnings![0], /Datastore\.Prune/)
+  })
+})
+
+describe('cr.48e — the prune detail is masked against the secret the prune handed pbc', () => {
+  // The same exposure cr.48b–d closed elsewhere: a backend that quotes the
+  // credential it was handed puts it in the `Error:` line, and the prune
+  // verdict EMBEDS that line — the reply of the wizard's Preview and the run's
+  // Warnings block (→ the 16.12 notification body) are both built from this
+  // one field, so the mask runs once, upstream, where both read it.
+
+  it('the permission branch keeps the quoted echo out of the detail — verdict unchanged', () => {
+    const v = classifyPruneVerdict(
+      255,
+      'Error: permission check failed - missing Datastore.Prune (credential token-secret-value was rejected)',
+      ['token-secret-value'],
+    )
+    assert.equal(v.verdict, 'permission', 'classification ran on the raw text')
+    assert.match(v.detail, /Datastore\.Modify or Datastore\.Prune/)
+    assert.match(v.detail, /\[secret\]/)
+    assert.ok(!v.detail.includes('token-secret-value'), v.detail)
+  })
+
+  it('the generic error branch masks the verbatim echo too', () => {
+    const v = classifyPruneVerdict(255, 'Error: unable to authenticate token-secret-value', ['token-secret-value'])
+    assert.equal(v.verdict, 'error')
+    assert.match(v.detail, /unable to authenticate \[secret\]/)
+    assert.ok(!v.detail.includes('token-secret-value'), v.detail)
+  })
+
+  it('runPrune masks a classified echo against deps.secret', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: PBC,
+      result: { stdout: '', stderr: 'Error: prune refused for credential prune-side-secret', exitCode: 255 },
+    })
+    const out = await runPrune(mock, {
+      repo: makeRepo(),
+      secret: 'prune-side-secret',
+      backupId: 'prune-gt2',
+      retention: { keepLast: 1 },
+    })
+    assert.equal(out.ok, false)
+    const detail = (out as { detail: string }).detail
+    assert.match(detail, /\[secret\]/)
+    assert.ok(!detail.includes('prune-side-secret'), detail)
+  })
+
+  it('runPrune masks an executor rejection the same way', async () => {
+    // The catch branch: the child never answered, and a spawn error that
+    // quotes the env can carry the value into the same two consumers.
+    const exploding = {
+      exec: async () => {
+        throw new Error('spawn /usr/bin/proxmox-backup-client EACCES while passing secret-of-spawn')
+      },
+    } as unknown as CommandExecutor
+    const out = await runPrune(exploding, {
+      repo: makeRepo(),
+      secret: 'secret-of-spawn',
+      backupId: 'prune-gt2',
+      retention: { keepLast: 1 },
+    })
+    assert.equal(out.ok, false)
+    const detail = (out as { detail: string }).detail
+    assert.match(detail, /EACCES/)
+    assert.match(detail, /\[secret\]/)
+    assert.ok(!detail.includes('secret-of-spawn'), detail)
+  })
+
+  it('the run\'s Warnings line carries [secret], never the value', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: PBC,
+      result: { stdout: '', stderr: 'Error: permission check failed - missing Datastore.Prune (token warning-block-secret rejected)', exitCode: 255 },
+    })
+    const out = await pruneAfterBackup(mock, {
+      task: makeTask({ retention: { keepLast: 3 } }),
+      repo: makeRepo(),
+      secret: 'warning-block-secret',
+      log: QUIET,
+    })
+    assert.equal(out.warnings!.length, 1)
+    assert.match(out.warnings![0], /Backup succeeded, but the retention prune did not run/)
+    assert.match(out.warnings![0], /\[secret\]/)
+    assert.ok(!out.warnings![0].includes('warning-block-secret'), out.warnings![0])
   })
 })
 

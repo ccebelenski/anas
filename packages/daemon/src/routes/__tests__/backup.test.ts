@@ -1,5 +1,6 @@
-import type { BackupRepoResponse, BackupTaskDetail, BackupTaskEntry, Job } from '@anas/shared'
+import type { BackupRepoResponse, BackupTask, BackupTaskDetail, BackupTaskEntry, Job } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
+import type { BackupNotifyResult } from '../../services/backup-notify.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -8,6 +9,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
 import { isoWeekParity } from '../../services/backup-cadence.js'
+import { buildBackupNotifyBody } from '../../services/backup-notify.js'
 
 /** A real `pbs` stanza (ground truth 16.8) — a password-auth PVE-defined repo. */
 const PVE_STORAGE_CFG = [
@@ -406,6 +408,65 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(result.prune, undefined)
     assert.match(result.warnings![0], /Backup succeeded, but the retention prune did not run/)
     assert.match(result.warnings![0], /group or the namespace/)
+  })
+
+  // cr.48e — the prune verdict embeds pbc's `Error:` line verbatim, and a
+  // backend that quotes the credential it was handed puts it there. The mask
+  // runs upstream in backup-prune (one pass), so BOTH consumers of the field —
+  // this job's Warnings and the 16.12 notification body that embeds them
+  // verbatim — carry `[secret]` instead.
+  it('a prune failure quoting the repo secret leaves [secret] — neither the job record nor the notification body carries the value', async () => {
+    await createRepo()
+    await createTaskPayload(RETAINED_TASK)
+    const mock = mockOf(server)
+    mock.addFixture({
+      command: PBC_CMD,
+      result: {
+        stdout: '',
+        stderr: 'Error: permission check failed - missing Datastore.Prune (token \'token-secret-value\' rejected)',
+        exitCode: 255,
+      },
+    })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    const result = job.result as { warnings?: string[] }
+    assert.match(result.warnings![0], /retention prune did not run/)
+    assert.match(result.warnings![0], /token '\[secret\]' rejected/)
+    // The WHOLE job record — result, progress, error, everything — carries no value.
+    assert.equal(JSON.stringify(job).includes('token-secret-value'), false)
+
+    // The notification builder embeds the Warnings block verbatim; with the
+    // warning masked upstream, the body the operator would receive is clean.
+    const detailRes = await server.inject({ method: 'GET', url: '/v1/backup/tasks/retained', headers: IDENTITY })
+    const task = (detailRes.json() as { data: { task: BackupTask } }).data.task
+    const body = buildBackupNotifyBody({ task, result: result as BackupNotifyResult })
+    assert.match(body, /token '\[secret\]' rejected/)
+    assert.equal(body.includes('token-secret-value'), false)
+  })
+
+  it('a failed run whose pbc line quotes the repo secret leaves [secret] in job.error — the whole job record carries no value', async () => {
+    // cr.48e's carrier (c): classifyBackupResult's detail becomes the thrown
+    // job error (and the failure notification's error line). Same boundary:
+    // taxonomy on raw stderr, mask on the way out.
+    await createRepo()
+    await createTaskPayload(RETAINED_TASK)
+    const mock = mockOf(server)
+    mock.addFixture({
+      command: '/usr/bin/prlimit',
+      args: RETAINED_BACKUP_ARGS,
+      result: {
+        stdout: '',
+        stderr: 'Error: authentication failed - remote echoed \'token-secret-value\' back',
+        exitCode: 255,
+      },
+    })
+    mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'failed')
+    assert.match(job.error!.message, /authentication failed - remote echoed '\[secret\]' back/)
+    assert.equal(JSON.stringify(job).includes('token-secret-value'), false)
   })
 
   it('a task with NO retention never invokes prune at all', async () => {

@@ -651,7 +651,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // Cert confirmed. Now exercise auth/datastore/namespace via a cheap read.
     const env = buildBackupEnv(repo, secret ?? '')
     const r = await executor.exec(PBC, buildProbeArgs(repo.namespace), { env })
-    return classifyTestVerdict(r.exitCode, r.stderr)
+    // cr.48e: the verdict's detail leaves in the reply, so it is masked against
+    // the secret THIS probe handed pbc (the value list is what the tool got).
+    return classifyTestVerdict(r.exitCode, r.stderr, [secret ?? ''])
   }
 
   // ==========================================================================
