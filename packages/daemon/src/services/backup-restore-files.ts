@@ -14,6 +14,7 @@ import { isPathWithin, restorePatternsFor } from '@anas/shared'
 import { isHardlinkStat, statArchivePaths } from './backup-catalog.js'
 import { classifyBackupReadVerdict } from './backup-reads.js'
 import { buildBackupEnv, PBC } from './backup-runner.js'
+import { maskSecretValues } from './secret-argv.js'
 
 /**
  * SELECTIVE FILE RESTORE (story backup2.6) — `proxmox-backup-client restore`
@@ -293,8 +294,33 @@ export function progressSummaryLine(parsed: ParsedRestoreProgress): string {
  * `classifyBackupReadVerdict` — so a wording change happens once. Everything
  * below is restore-specific and is checked FIRST, because a restore fails in
  * ways a listing cannot.
+ *
+ * `secretValues` are the secret values this restore handed pbc (the repo
+ * password / token secret, cr.48b): every `detail` that leaves is masked
+ * against them, because a pbc ERROR line can echo the value it was pointed at
+ * (a bad credential answered with the token, a URL repeated back) and the
+ * detail would otherwise ride the job result and the marker. The
+ * classification reads the RAW stderr — the same split cr.48b makes for the
+ * read classifier: the verdict is drawn from the truth, only the reply is
+ * masked.
  */
 export function classifyRestoreFailure(
+  exitCode: number,
+  stderr: string,
+  signal?: string,
+  secretValues: string[] = [],
+): { detail: string, interrupted: boolean } {
+  const raw = rawClassifyRestoreFailure(exitCode, stderr, signal)
+  // cr.48c: the detail is THE thing that leaves (the job result, the marker,
+  // the audit record) — one masking pass at the boundary, over whatever the
+  // raw classifier composed from stderr (its own words and the shared
+  // classifier's, whose detail is covered by the same pass). A masked value
+  // with fewer than 4 characters, or no values at all, is a no-op.
+  return { detail: maskSecretValues(raw.detail, secretValues), interrupted: raw.interrupted }
+}
+
+/** The classification itself — over the raw stderr, unmasked ({@link classifyRestoreFailure}). */
+function rawClassifyRestoreFailure(
   exitCode: number,
   stderr: string,
   signal?: string,
@@ -361,8 +387,17 @@ export function classifyRestoreFailure(
  * progress line: a killed pbc's last words are `progress 22% (…)`, and writing
  * that into `reason:` reads as though the progress WAS the reason. The last
  * progress line has its own field in the marker, right below this one.
+ *
+ * cr.48c: the line is masked against {@link classifyRestoreFailure}'s
+ * `secretValues` before it returns — an ERROR line that echoes the repo secret
+ * must never ride the marker, which ANAS writes into the restored tree.
  */
-export function partialMarkerReason(exitCode: number, stderr: string, signal?: string): string {
+export function partialMarkerReason(
+  exitCode: number,
+  stderr: string,
+  signal?: string,
+  secretValues: string[] = [],
+): string {
   const lines = restoreLines(stderr).map(l => l.trim()).filter(Boolean)
   // Two steps on an array we own — `toReversed()` is not in this package's TS
   // lib target (the same note as `backup-snapshots.ts`).
@@ -370,16 +405,21 @@ export function partialMarkerReason(exitCode: number, stderr: string, signal?: s
   newestFirst.reverse()
   const said = lines.find(l => l.startsWith('Error:'))
     ?? newestFirst.find(l => !isRestoreProgressLine(l))
-  return said ?? describeAbnormalExit(exitCode, signal)
+  return maskSecretValues(said ?? describeAbnormalExit(exitCode, signal), secretValues)
 }
 
 /**
- * The client-safe `Error:` line (pbc's stderr never carries the secret).
+ * The `Error:` line to quote in a failure detail — RAW, on purpose.
  *
  * The fallback skips PROGRESS lines: pbc's last words before a kill are
  * `progress 22% (…)`, and quoting that as the failure reads as though the
  * progress WAS the reason (live-proof F16). When there is nothing but progress
  * there is nothing to quote, and the caller says so instead.
+ *
+ * cr.48c: the line can echo the repo secret a restore handed pbc, so every
+ * CALLER masks it — {@link classifyRestoreFailure} masks its whole detail at
+ * the boundary, and {@link runFileRestore} masks its thrown executor error.
+ * This stays raw because classification must read the truth.
  */
 export function firstRestoreError(stderr: string): string {
   const lines = restoreLines(stderr).map(l => l.trim()).filter(Boolean)
@@ -825,7 +865,12 @@ export async function runFileRestore(
     })
   }
   catch (err) {
-    throw new Error(`proxmox-backup-client could not be started: ${err instanceof Error ? err.message : String(err)}`)
+    // cr.48c: a rejection's message (an executor error) is masked the same way
+    // the reads mask theirs — the secret rides the child env and can be echoed
+    // by anyone, and this message lands in job.error. Classifications never
+    // run on this text; it only ever leaves.
+    throw new Error(`proxmox-backup-client could not be started: ${
+      maskSecretValues(err instanceof Error ? err.message : String(err), [deps.secret])}`)
   }
 
   const parsed = parseRestoreProgress(r.stderr)
@@ -851,14 +896,17 @@ export async function runFileRestore(
   }
 
   if (r.exitCode !== 0) {
-    const { detail } = classifyRestoreFailure(r.exitCode, r.stderr, r.signal)
+    // cr.48c: the masked detail, the marker's masked `reason:` and the masked
+    // executor rejection are the only ways stderr defeats the job — a pbc line
+    // that echoes the repo password/token secret meets `[secret]` everywhere.
+    const { detail } = classifyRestoreFailure(r.exitCode, r.stderr, r.signal, [deps.secret])
     const partialText = [
       'ANAS restore did not finish.',
       `snapshot: ${deps.snapshot}`,
       `archive: ${deps.archive}`,
       `target: ${deps.target}`,
       `selections: ${deps.selections.length}`,
-      `reason: ${partialMarkerReason(r.exitCode, r.stderr, r.signal)}`,
+      `reason: ${partialMarkerReason(r.exitCode, r.stderr, r.signal, [deps.secret])}`,
       `detail: ${detail}`,
       `last progress: ${progressSummaryLine(parsed)}`,
       'The Proxmox backup client leaves no marker of its own; this file is written by ANAS.',

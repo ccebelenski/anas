@@ -923,4 +923,43 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     // Nothing landed, so the empty directory was removed rather than left as litter.
     assert.match(job.error!.message, /empty restore directory/)
   })
+
+  it('cr.48c: pbc echoing the repo secret on a failed restore leaves only [secret] in the failed job record', async () => {
+    // The shared-classifier fallback: the stderr line echoes the repo's token
+    // secret, and the whole job record — error message, params, everything the
+    // queue persists — must never carry the plain value.
+    const mock = mockOf(server)
+    mock.addFixture({
+      command: TIMEOUT,
+      args: shellArgs(),
+      result: { stdout: statBlock('/alpha.txt', 23, 'file', '644', '-rw-r--r--'), stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
+      result: { stdout: '', stderr: 'No such file', exitCode: 1 },
+    })
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/stat', '-f', '-c', '%S %a', '/gtbackup'],
+      result: { stdout: '4096 1000000\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['30', '/usr/bin/find', '-P', NEWLOC, '-mindepth', '1', '-maxdepth', '1', '-printf', '.'],
+      result: { stdout: '', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: PBC,
+      args: ['restore', SNAP, 'data.pxar', NEWLOC, '--ns', 'gtrestore', '--pattern', '/alpha.txt'],
+      result: { stdout: '', stderr: 'Error: proxmox-backup-client rejected token-secret-value\n', exitCode: 255 },
+    })
+    const res = await post(body())
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
+    assert.equal(job.status, 'failed')
+    assert.match(job.error!.message, /\[secret\]/)
+    assert.ok(!job.error!.message.includes('token-secret-value'), job.error!.message)
+    assert.ok(!JSON.stringify(job).includes('token-secret-value'), 'no plain secret anywhere in the job record')
+  })
 })

@@ -580,6 +580,46 @@ describe('backup2.6 — classifyRestoreFailure', () => {
     const { detail } = classifyRestoreFailure(255, 'Error: … ENOSPC: No space left on device\n')
     assert.match(detail, /ran out of space/)
   })
+
+  it('cr.48c: an echoed repo secret is masked in every restore-specific detail, the verdict unchanged', () => {
+    // A pbc line that echoes the repo password/token secret appears in the
+    // quoted Error: line on the (a) disconnect and (b) out-of-space paths; the
+    // classification must stay on the RAW text and the detail must show
+    // `[secret]`, never the plain value.
+    const disconnected = classifyRestoreFailure(
+      255,
+      'HTTP/2.0 connection failed\nError: error extracting archive - connection closed because of a broken pipe while using token-secret-value\n',
+      undefined,
+      ['token-secret-value'],
+    )
+    assert.equal(disconnected.interrupted, true)
+    assert.match(disconnected.detail, /went away part-way/, 'the disconnect wording survived the mask')
+    assert.ok(disconnected.detail.includes('[secret]'), disconnected.detail)
+    assert.ok(!disconnected.detail.includes('token-secret-value'), disconnected.detail)
+
+    const outOfSpace = classifyRestoreFailure(
+      255,
+      'Error: error extracting archive - ENOSPC: No space left on device (token-secret-value)\n',
+      undefined,
+      ['token-secret-value'],
+    )
+    assert.match(outOfSpace.detail, /ran out of space/, 'the out-of-space wording survived the mask')
+    assert.ok(outOfSpace.detail.includes('[secret]'), outOfSpace.detail)
+    assert.ok(!outOfSpace.detail.includes('token-secret-value'), outOfSpace.detail)
+  })
+
+  it('cr.48c: the shared-classifier fallback masks the echoed secret too (c)', () => {
+    // None of the restore-specific branches match, so the shared READ classifier
+    // names the failure — its detail is covered by the same boundary mask.
+    const { detail } = classifyRestoreFailure(
+      255,
+      'Error: proxmox-backup-client rejected token-secret-value\n',
+      undefined,
+      ['token-secret-value'],
+    )
+    assert.ok(detail.includes('[secret]'), detail)
+    assert.ok(!detail.includes('token-secret-value'), detail)
+  })
 })
 
 // ============================================================================
@@ -645,6 +685,18 @@ describe('backup2.8 — the partial marker\'s reason is never a progress line (F
     assert.match(reason, /^Error: /)
     assert.match(reason, /broken pipe/)
     assert.doesNotMatch(reason, /progress/)
+  })
+
+  it('cr.48c: a reason line that echoed the repo secret is masked in the marker sentence', () => {
+    const reason = partialMarkerReason(
+      255,
+      'Error: proxmox-backup-client rejected token-secret-value\n',
+      undefined,
+      ['token-secret-value'],
+    )
+    assert.match(reason, /^Error: /, 'the ERROR line is still the reason')
+    assert.ok(reason.includes('[secret]'), reason)
+    assert.ok(!reason.includes('token-secret-value'), reason)
   })
 
   it('the classifier says the client reported nothing, and names how it ended', () => {
@@ -1243,6 +1295,56 @@ describe('backup2.6 — runFileRestore', () => {
     finally {
       await rm(dir, { recursive: true, force: true })
     }
+  })
+
+  it('cr.48c: pbc echoing the repo secret in an out-of-space error is masked in the detail, the marker and the thrown job error', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-restore-partial-'))
+    try {
+      const mock = restoreMock(
+        {
+          stderr: 'Error: error extracting archive - ENOSPC: No space left on device (token-secret-value)\n',
+          exitCode: 255,
+        },
+        // directoryHasEntries → not empty, so the partial marker is written.
+        [{ stdout: '..', exitCode: 0 }],
+      )
+      await assert.rejects(
+        () => runFileRestore(mock, deps({ target: dir }), () => {}),
+        (err: Error) => {
+          assert.ok(!err.message.includes('token-secret-value'), err.message)
+          assert.match(err.message, /\[secret\]/)
+          assert.match(err.message, /ran out of space/)
+          return true
+        },
+      )
+      const marker = await readFile(join(dir, PARTIAL_MARKER_NAME), 'utf8')
+      for (const line of marker.split('\n')) {
+        if (!line.startsWith('reason: ') && !line.startsWith('detail: '))
+          continue
+        assert.ok(!line.includes('token-secret-value'), line)
+        assert.match(line, /\[secret\]/, line)
+      }
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('cr.48c: a pbc that cannot even be started carries no secret in the rejection the job would record', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: PBC,
+      throws: new Error('spawn /usr/bin/proxmox-backup-client ENOENT with token-secret-value on the line'),
+    })
+    await assert.rejects(
+      () => runFileRestore(mock, deps(), () => {}),
+      (err: Error) => {
+        assert.match(err.message, /could not be started/)
+        assert.ok(!err.message.includes('token-secret-value'), err.message)
+        assert.match(err.message, /\[secret\]/)
+        return true
+      },
+    )
   })
 
   it('a failed newLocation restore whose created directory is EMPTY removes it', async () => {
