@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { TASK_RUNNER_USER } from '../../runner-poll.js'
 import { createServer } from '../../server.js'
 import { PREVIEW_TIMEOUT_S } from '../../services/cloud-preview.js'
 import { RCLONE, rcloneBaseArgs } from '../../services/rclone-config.js'
@@ -44,6 +45,8 @@ const IDENTITY = {
   'x-anas-request-id': randomUUID(),
 }
 const JSON_HEADERS = { ...IDENTITY, 'content-type': 'application/json' }
+/** The task runner's own identity (cr.56): the only one a `direct:true` run is taken from. */
+const RUNNER_HEADERS = { ...JSON_HEADERS, 'x-anas-user': TASK_RUNNER_USER }
 
 /** A saved sftp remote exactly as ANAS would have written it. */
 const GT_SECTION = '[gt]\ntype = sftp\nhost = 127.0.0.1\nuser = rclonegt\npass = obscured\n'
@@ -460,9 +463,32 @@ describe('cloud sync task routes (rclone.2)', () => {
       // The direct path never asks the gate (and this test's task has no
       // source on disk, so the run fails at its own guard — the 202 is the
       // point, not the outcome).
-      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: { direct: true } })
+      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: RUNNER_HEADERS, payload: { direct: true } })
       assert.equal(res.statusCode, 202)
       await waitForJob(server, (res.json() as JobAccepted).job.id)
+    })
+
+    it('cr.56 (review L10): a DIRECT run from a CLIENT is refused 403 naming the flag — with the unit mid-run, no job is submitted and rclone never runs', async () => {
+      await createTask()
+      const mock = mockOf(server)
+      mock.addFixture({
+        command: SYSTEMCTL,
+        args: ['show', 'anas-cloud-offsite.service', '-p', 'ActiveState,InactiveExitTimestamp'],
+        result: {
+          stdout: `ActiveState=active\nInactiveExitTimestamp=${Date.parse('2026-09-25T10:00:00Z') * 1000}\n`,
+          stderr: '',
+          exitCode: 0,
+        },
+      })
+      mock.calls.length = 0
+      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: { direct: true } })
+      assert.equal(res.statusCode, 403)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'FORBIDDEN')
+      assert.match(error.message, /^Cloud sync task 'offsite': 'direct' is the task runner's own flag .* and is refused from a client — run the task with Run Now, without 'direct', which starts that unit$/)
+      const jobs = await server.inject({ method: 'GET', url: '/v1/jobs', headers: IDENTITY })
+      assert.ok(!((jobs.json() as { data: { operation: string }[] }).data ?? []).some(j => j.operation === 'cloud.task.run'))
+      assert.equal(mock.calls.some(c => c.command === RCLONE), false)
     })
 
     it('a UI Run-Now (no direct) starts and supervises the task\'s own unit', async () => {
@@ -533,7 +559,7 @@ describe('cloud sync task routes (rclone.2)', () => {
       })
       mock.calls.length = 0
 
-      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: { direct: true } })
+      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: RUNNER_HEADERS, payload: { direct: true } })
       const runId = (res.json() as JobAccepted).job.id
       for (let i = 0; i < 200 && !mock.calls.some(c => c.command === RCLONE && (c.args[0] === 'copy' || c.args[0] === 'sync')); i++)
         await new Promise(r => setTimeout(r, 5))
@@ -595,7 +621,7 @@ describe('cloud sync task routes (rclone.2)', () => {
       mock.addFixture({ command: TIMEOUT, args: ['-s', 'KILL', '5', '/usr/bin/realpath', '-e', '--', srcDir], result: { stdout: `${srcDir}\n`, stderr: '', exitCode: 0 } })
       mock.calls.length = 0
 
-      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: { direct: true } })
+      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: RUNNER_HEADERS, payload: { direct: true } })
       const runId = (res.json() as JobAccepted).job.id
       for (let i = 0; i < 200 && !mock.calls.some(c => isRcloneOrScan(c)); i++)
         await new Promise(r => setTimeout(r, 5))
@@ -632,7 +658,7 @@ describe('cloud sync task routes (rclone.2)', () => {
     it('a DIRECT run never re-enters systemctl — the recursion guard', async () => {
       await createTask({ source: '/nonexistent/source' })
       const before = mockOf(server).calls.filter(c => c.command === SYSTEMCTL).length
-      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: { direct: true } })
+      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: RUNNER_HEADERS, payload: { direct: true } })
       assert.equal(res.statusCode, 202)
       // The source does not exist, so the run FAILS at the guard — which is
       // exactly what proves the direct path ran the work rather than the unit.

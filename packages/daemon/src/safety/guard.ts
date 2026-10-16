@@ -322,6 +322,68 @@ export function guarded<O>(spec: GuardSpec<O>, pass: GuardPass<O>, body: Guarded
   }
 }
 
+/**
+ * The claims a run needs NOW that its job does not hold (cr.56, review M2).
+ *
+ * A data mover's or a schedule fire's lock claims are computed by its route
+ * from the route's read of the task or schedule, and the queue grants exactly
+ * those; the job then re-reads the object and acts on what IT read. An edit
+ * (or a pool re-created under the same name, or a mount appearing over a
+ * source path) landing between the two leaves the job working on an object it
+ * holds no key for — a destroy, rollback, rename or unmount accepted meanwhile
+ * is not serialised against it. So the job recomputes the claims from its own
+ * re-read, with the route's builder, and this compares them with the set it
+ * holds: every claim it needs must be held (a held exclusive claim covers a
+ * needed shared one). A run that now needs FEWER keys (an archive removed)
+ * holds everything it acts on and proceeds — the extra keys only make other
+ * verbs wait for it. `moved` names the claim-bearing field that moved, as the
+ * door reads it; the refusal names the objects it holds no lock on.
+ *
+ * Returns the STATE_CHANGED refusal, or null when every needed claim is held.
+ */
+export function unheldClaimsRefusal(
+  what: string,
+  moved: string,
+  held: readonly LockClaim[],
+  needed: readonly LockClaim[],
+): Refusal | null {
+  const holds = new Map<string, LockMode>()
+  for (const c of held) {
+    if (holds.get(c.key) !== 'exclusive')
+      holds.set(c.key, c.mode)
+  }
+  const missing = needed.filter((c) => {
+    const mode = holds.get(c.key)
+    return mode === undefined || (mode === 'shared' && c.mode === 'exclusive')
+  })
+  if (missing.length === 0)
+    return null
+  const objects = [...new Set(missing.map(c => c.what))].join(', ')
+  return {
+    status: 409,
+    code: 'STATE_CHANGED',
+    message: `${what} changed while this run waited (${moved}) — the run holds no lock on ${objects}, so nothing was done; run it again`,
+  }
+}
+
+/** A list of source paths as a refusal names it. */
+function pathList(paths: readonly string[]): string {
+  return paths.length ? paths.join(', ') : 'none'
+}
+
+/**
+ * What moved between a run's route read and its job read, for a door whose
+ * claim-bearing field is a list of source PATHS (the backup run's archive
+ * paths, the cloud run's source): the field itself when it changed, else the
+ * filesystems the same paths resolve to (a mount, dataset or pool that moved
+ * under them).
+ */
+export function sourcePathsMoved(field: { name: string, plural: boolean }, was: readonly string[], now: readonly string[]): string {
+  if (was.join('\n') !== now.join('\n'))
+    return `${field.name} ${field.plural ? 'were' : 'was'} ${pathList(was)}; now ${pathList(now)}`
+  return `${field.name} ${pathList(now)} now ${field.plural ? 'resolve' : 'resolves'} to a different filesystem`
+}
+
 // ---------------------------------------------------------------------------
 // The bound confirm (M3, docs/WAVE3-DESIGN.md §5.2)
 // ---------------------------------------------------------------------------

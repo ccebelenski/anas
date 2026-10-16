@@ -427,6 +427,12 @@ A job holds its locks only while ANAS itself is changing the object. Kernel-driv
   shared for the run (`pathSourceClaims`, as a mover's source), and the new-LUN restore holds the new volume's
   dataset keys (as `zfs.create`) or its image directory's filesystem keys beside `iscsi-target:<iqn>` until
   the map. A destroy, rollback or unmount of the destination waits for the restore and re-gates after it.)*
+  *(cr.56, 2026-10-16 — the claims a mover holds are the ROUTE's, computed from the route's read of its task or
+  schedule; the job re-reads the object and recomputes them from that read with the same builder, and refuses
+  `STATE_CHANGED` before any mover argv when it needs a key it does not hold (an archive path or a cloud source edited
+  onto another filesystem, a schedule re-created under its id on another target, a pool or mount that moved under an
+  unchanged path) — "holds its source for the run" is true for the source the run actually reads. Only the task's own
+  runner (`system:task-runner`) may send the direct run.)*
 
 Locks do not fix a different starvation: four long data movers fill all 4 slots and a short destroy waits
 for a slot, not for a lock (Run Now holds two: the supervisor and the direct run, `queue.ts:147-151`). **Recommendation:** a

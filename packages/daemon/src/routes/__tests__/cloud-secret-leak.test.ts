@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { main as cloudTaskMain } from '../../cloud-task.js'
 import { listSections, parseRcloneConf } from '../../parsers/rclone-conf.js'
+import { TASK_RUNNER_USER } from '../../runner-poll.js'
 import { createServer } from '../../server.js'
 import { RCLONE, rcloneBaseArgs } from '../../services/rclone-config.js'
 
@@ -71,6 +72,8 @@ const IDENTITY = {
   'x-anas-request-id': randomUUID(),
 }
 const JSON_HEADERS = { ...IDENTITY, 'content-type': 'application/json' }
+/** The task runner's own identity (cr.56): the only one a `direct:true` run is taken from. */
+const RUNNER_HEADERS = { ...JSON_HEADERS, 'x-anas-user': TASK_RUNNER_USER }
 
 /** rclone's JSON log object for an error naming a file — what `--use-json-log` prints. */
 function errorObject(msg: string, object = 'a.bin'): string {
@@ -177,7 +180,7 @@ describe('cr.55 — the cloud doors never hand out a saved remote\'s credential 
 
   /** Run the task DIRECT (the unit's own execution) and settle it. */
   async function directRun(): Promise<Job> {
-    const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     assert.equal(res.statusCode, 202, res.body)
     return waitForJob(server, (res.json() as JobAccepted).job.id)
   }

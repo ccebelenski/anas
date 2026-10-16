@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { forbiddenMessage } from '@anas/shared'
 import { requireIdentity } from '../../routes/identity.js'
-import { identityHeaders, socketRequester } from '../../runner-poll.js'
+import { identityHeaders, socketRequester, TASK_RUNNER_USER } from '../../runner-poll.js'
 import { createServer } from '../../server.js'
 import { CANCEL_OPERATION, readRequestAuthority, requiredPrivilege, runAsDaemon, runAsRequest } from '../authority.js'
 import { JobQueue } from '../queue.js'
@@ -337,7 +337,10 @@ describe('cr.28 internal submitters keep working', () => {
     it('the systemd task runners (timers, Run-Now direct runs: runner-poll identity) → 202', async () => {
       const res = await socketRequester(sock)({ method: 'POST', path: '/test/write', headers: identityHeaders(), body: {} })
       assert.equal(res.statusCode, 202, JSON.stringify(res.body))
-      assert.equal((res.body as JobAccepted).job.createdBy, 'root@pam')
+      // cr.56 (review L10): the runners name themselves, not root@pam — the run
+      // doors take `direct:true` from this identity alone, and the audit tells a
+      // timer run from a real root@pam click.
+      assert.equal((res.body as JobAccepted).job.createdBy, TASK_RUNNER_USER)
     })
 
     it('the udev cache-event script\'s headers, read from the script itself → 202', async () => {

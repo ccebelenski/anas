@@ -1,5 +1,6 @@
 import type { Job, JobAccepted } from '@anas/shared'
 import type { CommandExecutor, ExecResult } from '../../executor/types.js'
+import type { LockClaim } from '../../jobs/locks.js'
 import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
@@ -14,6 +15,8 @@ import { currentLane } from '../../executor/deadline.js'
 import { VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
+import { TASK_RUNNER_USER } from '../../runner-poll.js'
+import { scheduleClaim, taskClaim } from '../../safety/guard.js'
 import { createServer } from '../../server.js'
 import { AHR_FINDMNT_ARGS } from '../../services/ahr-topology.js'
 import { writeTaskUnits as writeBackupTask } from '../../services/backup-units.js'
@@ -262,8 +265,9 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     await server.ready()
   }
 
-  function inject(verb: { method: Verb['method'], url: string, payload?: unknown }, confirm?: string) {
-    const headers: Record<string, string> = { ...IDENTITY_HEADERS }
+  /** `runner`: the request comes from the task's own runner (cr.56: the only identity `direct:true` is taken from). */
+  function inject(verb: { method: Verb['method'], url: string, payload?: unknown, runner?: boolean }, confirm?: string) {
+    const headers: Record<string, string> = { ...IDENTITY_HEADERS, ...(verb.runner ? { 'x-anas-user': TASK_RUNNER_USER } : {}) }
     if (verb.payload !== undefined)
       headers['content-type'] = 'application/json'
     if (confirm)
@@ -390,7 +394,7 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
       enabled: true,
     }))
     await serve('backup.task.run')
-    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true } })
+    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true }, runner: true })
     assert.equal(res.statusCode, 202, res.body)
     const runId = (res.json() as JobAccepted).job.id
     const job = await race(runId, 'backup.task.run', DESTROY_RECURSIVE, pveClaimsMedia)
@@ -419,7 +423,7 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
       enabled: true,
     }))
     await serve('backup.task.run', null)
-    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true } })
+    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true }, runner: true })
     assert.equal(res.statusCode, 202, res.body)
     const runId = (res.json() as JobAccepted).job.id
     await until(() => queue().get(runId)?.status === 'running')
@@ -468,7 +472,7 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
       schedule: 'Tue *-*-* 02:00:00',
     }))
     await serve('cloud.task.run')
-    const res = await inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', payload: { direct: true } })
+    const res = await inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', payload: { direct: true }, runner: true })
     assert.equal(res.statusCode, 202, res.body)
     const runId = (res.json() as JobAccepted).job.id
     const job = await race(runId, 'cloud.task.run', RENAME_SNAP1, pveClaimsMedia)
@@ -541,7 +545,7 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
       enabled: true,
     }))
     await serve('backup.task.run', FINDMNT_AHR, { ahrUuid: true })
-    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true } })
+    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true }, runner: true })
     assert.equal(res.statusCode, 202, res.body)
     const runId = (res.json() as JobAccepted).job.id
     await until(() => queue().get(runId)?.status === 'running')
@@ -583,7 +587,7 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
       enabled: true,
     }))
     await serve('backup.task.run', FINDMNT_AHR, { ahrBroken: true, prlimitOk: true })
-    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true } })
+    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true }, runner: true })
     assert.equal(res.statusCode, 202, res.body)
     const runId = (res.json() as JobAccepted).job.id
     await until(() => queue().get(runId)?.status === 'running')
@@ -610,7 +614,7 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
       enabled: true,
     }))
     await serve('backup.task.run', FINDMNT_AHR, { ahrDetailBroken: true, prlimitOk: true })
-    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true } })
+    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true }, runner: true })
     assert.equal(res.statusCode, 202, res.body)
     const runId = (res.json() as JobAccepted).job.id
     await until(() => queue().get(runId)?.status === 'running')
@@ -624,5 +628,160 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     )
     unpark()
     assert.equal((await finished(runId)).status, 'completed')
+  })
+
+  // --- cr.56 (review M2): the job's own re-read decides the keys it needs ----
+  //
+  // The paused-queue race: an UPDATE of the task or schedule holds its key
+  // exclusive (a stand-in job here, holding exactly the claim the update
+  // takes, so the edit can land at a chosen moment); the run is accepted
+  // behind it — its route reads the OLD object and computes its claims from
+  // it — and waits; the object is edited; the holder lets go. The run's job
+  // re-reads the object, recomputes its claims with the route's own builder,
+  // and refuses STATE_CHANGED naming what moved and what it holds no lock
+  // on, before any mover argv. Controls: an edit that needs no new key runs.
+
+  /** Park the queue on `claim` (as an update holding the task or schedule key does); returns the release. */
+  function holdKey(claim: LockClaim): () => void {
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    queue().submit('test.hold', { user: 'test', uid: 0 }, async () => {
+      await held
+    }, { locks: [claim] })
+    return release
+  }
+
+  const PBC = '/usr/bin/proxmox-backup-client'
+  const RCLONE = '/usr/bin/rclone'
+  /** Did the run's job reach its mover (pbc through prlimit, rclone copy/sync, a zfs snapshot)? */
+  const moverRan = (op: string): boolean => calls.some(c => c.op === op && (
+    c.command === PRLIMIT || c.command === PBC
+    || (c.command === RCLONE && (c.args[0] === 'copy' || c.args[0] === 'sync'))
+    || (c.command === ZFS && c.args[0] === 'snapshot')))
+
+  async function backupTask(path: string): Promise<void> {
+    await writeBackupTask(QUIET, systemdDir, BackupTask.parse({
+      name: 'media-nightly',
+      repository: 'pbs-main',
+      backupId: 'anas-pve',
+      archives: [{ name: 'media', path, excludes: [] }],
+      schedule: '*-*-* 02:00:00',
+      enabled: true,
+    }))
+  }
+
+  /** Accept the runner's direct run behind the held key; returns its job id, asserted waiting. */
+  async function directRunWaiting(url: string): Promise<string> {
+    const res = await inject({ method: 'POST', url, payload: { direct: true }, runner: true })
+    assert.equal(res.statusCode, 202, res.body)
+    const runId = (res.json() as JobAccepted).job.id
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(queue().get(runId)?.status, 'queued', 'the run waits behind the key holder')
+    return runId
+  }
+
+  it('cr.56 M2 backup: an archive path edited onto another filesystem while the direct run waits → STATE_CHANGED naming the paths and the unheld mount, and no pbc argv', async () => {
+    await registerBackupRepo()
+    await backupTask('/testpool/media/photos')
+    await serve('none', FINDMNT_MEDIA, { prlimitOk: true })
+    const release = holdKey(taskClaim('backup', 'media-nightly', 'exclusive'))
+    const runId = await directRunWaiting('/v1/backup/tasks/media-nightly/run')
+    // The update's write: the archive moves to the NFS mount the run holds no key on.
+    await backupTask('/mnt/anas-nfs/photos')
+    release()
+    const job = await finished(runId)
+    assert.equal(job.status, 'failed', JSON.stringify(job.result))
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.equal(job.error?.message, `Backup task 'media-nightly' changed while this run waited (archive paths were /testpool/media/photos; `
+    + `now /mnt/anas-nfs/photos) — the run holds no lock on the mount at /mnt/anas-nfs, so nothing was done; run it again`)
+    assert.equal(moverRan('backup.task.run'), false, 'no pbc argv')
+  })
+
+  it('cr.56 M2 backup: the SAME archive path whose filesystem moved (the dataset\'s mount went away) while the run waited → STATE_CHANGED — why the claims are recomputed, not the paths bound', async () => {
+    await registerBackupRepo()
+    await backupTask('/testpool/media/photos')
+    await serve('none', FINDMNT_MEDIA, { prlimitOk: true })
+    const release = holdKey(taskClaim('backup', 'media-nightly', 'exclusive'))
+    const runId = await directRunWaiting('/v1/backup/tasks/media-nightly/run')
+    // The capture as it was before the re-point: no testpool/media row, so the
+    // path now lives on the root filesystem.
+    findmnt = fixture('mounts/findmnt-full.json')
+    release()
+    const job = await finished(runId)
+    assert.equal(job.status, 'failed', JSON.stringify(job.result))
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.equal(job.error?.message, `Backup task 'media-nightly' changed while this run waited (archive paths /testpool/media/photos now resolve `
+    + `to a different filesystem) — the run holds no lock on the mount at /, so nothing was done; run it again`)
+    assert.equal(moverRan('backup.task.run'), false, 'no pbc argv')
+  })
+
+  it('cr.56 M2 backup (control): an archive path edited within the SAME dataset needs no new key — the run backs up the edited path', async () => {
+    await registerBackupRepo()
+    await backupTask('/testpool/media/photos')
+    await serve('none', FINDMNT_MEDIA, { prlimitOk: true })
+    const release = holdKey(taskClaim('backup', 'media-nightly', 'exclusive'))
+    const runId = await directRunWaiting('/v1/backup/tasks/media-nightly/run')
+    await backupTask('/testpool/media/music')
+    release()
+    const job = await finished(runId)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    // The run's transient snapshot of testpool/media, read at the EDITED path.
+    const pbc = calls.filter(c => c.op === 'backup.task.run' && c.command === PRLIMIT)
+    assert.equal(pbc.length, 1)
+    assert.match(pbc[0].args[4], /^media\.pxar:\/testpool\/media\/\.zfs\/snapshot\/anas-backup-media-nightly-\d+\/music$/)
+  })
+
+  it('cr.56 M2 cloud: the source edited onto another filesystem while the direct run waits → STATE_CHANGED naming the source and the unheld mount, and no rclone copy/sync', async () => {
+    const task = (source: string) => writeCloudTask(QUIET, systemdDir, CloudSyncTask.parse({
+      name: 'offsite',
+      source,
+      remote: 'gt',
+      path: 'pve1/media',
+      schedule: 'Tue *-*-* 02:00:00',
+    }))
+    await task('/testpool/media')
+    await serve('none')
+    const release = holdKey(taskClaim('cloud', 'offsite', 'exclusive'))
+    const runId = await directRunWaiting('/v1/cloud/tasks/offsite/run')
+    await task('/mnt/anas-nfs')
+    release()
+    const job = await finished(runId)
+    assert.equal(job.status, 'failed', JSON.stringify(job.result))
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.equal(job.error?.message, `Cloud sync task 'offsite' changed while this run waited (source was /testpool/media; now /mnt/anas-nfs) `
+    + `— the run holds no lock on the mount at /mnt/anas-nfs, so nothing was done; run it again`)
+    assert.equal(moverRan('cloud.task.run'), false, 'no rclone copy/sync argv')
+  })
+
+  it('cr.56 M2 schedule: the schedule deleted and re-created under its id onto another dataset while the fire waits → STATE_CHANGED naming the target and the unheld dataset, and no zfs snapshot', async () => {
+    const schedule = (dataset: string) => writeScheduleUnits(QUIET, systemdDir, SnapshotSchedule.parse({
+      id: 'nightly-media',
+      name: 'Nightly media',
+      target: { kind: 'zfs', dataset },
+      cadence: 'daily',
+      retention: { daily: 7 },
+      recursive: false,
+      enabled: true,
+    }))
+    await schedule('testpool/media')
+    await serve('none')
+    // The schedule key exclusive: a delete (or the create after it) holding it.
+    const release = holdKey(scheduleClaim('nightly-media', 'exclusive'))
+    const res = await inject({ method: 'POST', url: '/v1/schedules/nightly-media/run' })
+    assert.equal(res.statusCode, 202, res.body)
+    const runId = (res.json() as JobAccepted).job.id
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(queue().get(runId)?.status, 'queued', 'the fire waits behind the key holder')
+    // An edit cannot retarget (PUT refuses it); delete + create under the same id can.
+    await schedule('testpool/vm-100-disk-0')
+    release()
+    const job = await finished(runId)
+    assert.equal(job.status, 'failed', JSON.stringify(job.result))
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.equal(job.error?.message, `Snapshot schedule 'nightly-media' changed while this run waited (target was zfs:testpool/media; `
+    + `now zfs:testpool/vm-100-disk-0) — the run holds no lock on Dataset 'testpool/vm-100-disk-0', so nothing was done; run it again`)
+    assert.equal(moverRan('schedule.run'), false, 'no zfs snapshot argv')
   })
 })

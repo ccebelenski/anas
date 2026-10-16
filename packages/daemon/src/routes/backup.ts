@@ -23,7 +23,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { LockClaim } from '../jobs/locks.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { Gate, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
+import type { Gate, GuardPass, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { ConsistencyFacts } from '../services/backup-consistency.js'
 import type { BackupReposPaths } from '../services/backup-repos.js'
 import type { SelectionFacts } from '../services/backup-restore-files.js'
@@ -58,8 +58,8 @@ import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
 import { READ_JOB_OPERATIONS, readJobCancel } from '../jobs/read-jobs.js'
 import { readPbsStorages } from '../parsers/pve-storage.js'
-import { confirmGate } from '../safety/gate.js'
-import { guardCheck, guardConfirm, guarded, GuardReads, GuardRefusalError, iscsiTargetClaim, reverify, sendRefusal, taskClaim, zfsDatasetClaims } from '../safety/guard.js'
+import { directFromClientRefusal, TASK_RUNNER_USER } from '../runner-poll.js'
+import { guardCheck, guardConfirm, guarded, GuardReads, GuardRefusalError, iscsiTargetClaim, reverify, sendRefusal, sourcePathsMoved, taskClaim, unheldClaimsRefusal, zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { browseArchiveLevel } from '../services/backup-catalog.js'
@@ -223,6 +223,25 @@ export interface BackupRouteOptions {
    */
   fstabPath?: string
 }
+
+/**
+ * The in-place image restore's CONFIRM-ONLY spec (cr.56). Its confirm goes
+ * through `guardConfirm` so a resend with a changed request field answers 409
+ * CONFIRM_SCOPE_CHANGED naming it, but the door is not on a guard spec — its
+ * job-time re-checks are `runImageRestore`'s own, under the iSCSI lock — so
+ * this names only the operation and how a message calls the LUN. Nothing
+ * here is read, gated or locked: `guardCheck` and `guarded` never see it.
+ */
+function imageRestoreConfirmSpec(what: string): GuardSpec<null> {
+  return {
+    operation: 'backup.restore.image',
+    object: { what, read: async () => null, id: async () => null, unbound: () => `${what} could not be bound` },
+    gates: [],
+  }
+}
+
+/** The pass a confirm-only spec signs with: no id, revision or scope — the signed request fields carry the binding. */
+const CONFIRM_ONLY_PASS: GuardPass<null> = { object: null, bound: { id: {} }, advisories: [], locks: [] }
 
 /**
  * What cancelling a backup run leaves behind — the confirm dialog's
@@ -1343,6 +1362,12 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
+    // cr.56 (review L10): `direct` is the runner's flag — it skips the
+    // in-flight refusal below and runs the work without the task's unit — so
+    // it is taken only from the runner's own identity, which no request
+    // through the gateway can carry (runner-poll.ts TASK_RUNNER_USER).
+    if (direct && identity.user !== TASK_RUNNER_USER)
+      return sendRefusal(reply, directFromClientRefusal(`Backup task '${name}'`))
 
     if (!(await taskFileExists(systemdDir, name))) {
       reply.code(404)
@@ -1377,8 +1402,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // waits for the direct run its unit submits, so a destroy queued between
     // the two (per-key FIFO) would wait for the supervisor while the direct
     // run waited for the destroy. The task is read here for its paths; the
-    // body reads it again (a task edited in between is cr.41's — its claims
-    // are the ones read now).
+    // body reads it again and — cr.56 (review M2) — recomputes the claims from
+    // ITS read and refuses STATE_CHANGED when it needs one the job does not
+    // hold (an archive path edited onto another filesystem while the run
+    // waited behind the update that holds the task key).
     const sourceTask = direct ? await readTask(systemdDir, name) : null
     const source = sourceTask
       ? await pathSourceClaims(executor, sourceTask.archives.map(a => a.path), readAhrPools)
@@ -1446,6 +1473,24 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           }
           if (gate.reason === 'heal' || gate.reason === 'no-record')
             updateProgress(`backup task '${name}': ${gate.detail}`)
+
+          // cr.56 (review M2): the claim-bearing field is the archive PATHS
+          // (each resolved to the filesystem it lives on). The keys the queue
+          // granted were computed from the route's read; the run backs up what
+          // THIS read says, so every key this read needs must be held — or a
+          // destroy, rollback or unmount accepted meanwhile is not serialised
+          // against it. Recomputed rather than bound as a revision: the keys
+          // also move when the filesystem under an unchanged path moves (a
+          // pool re-created under its name, a mount over the path).
+          const needed = await pathSourceClaims(executor, task.archives.map(a => a.path), readAhrPools)
+          const moved = unheldClaimsRefusal(
+            `Backup task '${name}'`,
+            sourcePathsMoved({ name: 'archive paths', plural: true }, (sourceTask?.archives ?? []).map(a => a.path), task.archives.map(a => a.path)),
+            source.claims,
+            needed.claims,
+          )
+          if (moved)
+            throw new GuardRefusalError(moved)
 
           assertRunNotCancelled(cancel, 'the repository lookup')
           // Resolve tier-2 (registry) or tier-1 (pve:<id>) repo + secret FRESH.
@@ -1672,6 +1717,46 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // storage often carries one) — the same fallback every other path uses.
     const namespace = namespaceOverride ?? repo.namespace
     return { repo, secret, ...(namespace ? { namespace } : {}) }
+  }
+
+  /**
+   * A restore's repository and secret as they are when its JOB starts (cr.56,
+   * folded from cr.54's report) — read fresh, as the backup run reads them in
+   * its job, never the value the route captured: a restore can wait hours in
+   * the queue behind long data movers, and a token rotated meanwhile (a PVE
+   * storage's .pw changes the moment the operator saves it) must not fail the
+   * restore, nor a deleted credential still be used. The repository must still
+   * be the one the route read the snapshot from — the same host, port and
+   * datastore; another address is another server, whose snapshot of that name
+   * nobody picked, so the job refuses STATE_CHANGED before anything runs. Its
+   * auth details (token id, fingerprint) are taken as they are now, beside the
+   * secret they belong with.
+   */
+  async function restoreDepsNow(reference: string, atRoute: BackupRepo): Promise<{ repo: BackupRepo, secret: string }> {
+    const resolved = await resolveRepoAndSecret(reference)
+    if (!resolved) {
+      throw new GuardRefusalError({
+        status: 404,
+        code: 'NOT_FOUND',
+        message: `Repository '${reference}' is no longer configured — nothing was restored`,
+      })
+    }
+    const { repo, secret } = resolved
+    const where = (r: BackupRepo): string => `${r.host}:${r.port}/${r.datastore}`
+    if (where(repo) !== where(atRoute)) {
+      throw new GuardRefusalError({
+        status: 409,
+        code: 'STATE_CHANGED',
+        message: `Repository '${reference}' changed while the restore waited (was ${where(atRoute)}; now ${where(repo)}) `
+          + `— the snapshot was picked from the old one, so nothing was restored; pick it again`,
+      })
+    }
+    if (secret === null) {
+      throw new Error(isPveRepoName(reference)
+        ? `No PBS credential file for '${reference}' (${paths.pvePrivStorageDir}/${pveStorageId(reference)}.pw is missing) — set it in Datacenter → Storage; nothing was restored`
+        : `No secret stored for repository '${repo.name}' — set its credentials first; nothing was restored`)
+    }
+    return { repo, secret }
   }
 
   // --- GET /backup/tasks/:name/snapshots — the task's points in time --------
@@ -2065,9 +2150,16 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // ident.2 (audit #10): the code binds the LUN's SERIAL and the exact
     // snapshot + archive, never the index — a LUN re-created at the index, or
     // a different point in time picked inside the TTL, mints a new challenge.
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'backup.restore.image',
-      params: { target: target.iqn, serial: lun.serial, repo: req.repo, snapshot: req.snapshot, archive: req.archive },
+    // cr.56 (folded from cr.54, review H3's last line): and the EFFECTIVE
+    // namespace — a snapshot is named within its namespace, so the same name
+    // in another one is another point in time. Signed through `guardConfirm`
+    // (request fields only; this door is not on a guard spec): a resend with
+    // another namespace, snapshot, archive or repository is 409
+    // CONFIRM_SCOPE_CHANGED naming the field, while another LUN (target or
+    // serial — the address) is a fresh challenge, as before.
+    if (!guardConfirm(confirmStore, request, reply, imageRestoreConfirmSpec(`LUN ${lun.index} of ${target.iqn}`), CONFIRM_ONLY_PASS, {
+      validated: { target: target.iqn, serial: lun.serial, repo: req.repo, ns: deps.namespace ?? null, snapshot: req.snapshot, archive: req.archive },
+      address: ['target', 'serial'],
       message: `Restoring ${req.archive} from ${req.snapshot} over LUN ${lun.index} of ${target.iqn}`,
       warnings: [
         `This OVERWRITES ${lun.backingPath} completely — every byte currently on LUN ${lun.index} is replaced `
@@ -2089,9 +2181,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // allocated. A sparse zvol or a sparse image file may of course consume
     // more of its pool as the holes fill — that is a pool-capacity question,
     // not a restore pre-flight one.
-    // The repo and its FRESH secret came back from `readDepsFor` above; nothing
-    // re-reads them, and neither ever leaves this scope.
-    const { repo, secret } = deps
+    // The repo as the route read it (the snapshot's list and size came from
+    // it); the job reads it and its secret again when it starts (cr.56,
+    // `restoreDepsNow`), and neither ever leaves this scope.
+    const { repo } = deps
 
     // The journald audit params: what was restored, from where, onto which LUN.
     // No secret and no repository credential ever rides here.
@@ -2126,8 +2219,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       async updateProgress => runImageRestore(
         executor,
         {
-          repo,
-          secret,
+          ...(await restoreDepsNow(req.repo, repo).then(now => ({ ...now, env: buildBackupEnv(now.repo, now.secret) }))),
           ...(deps.namespace ? { namespace: deps.namespace } : {}),
           snapshot: req.snapshot,
           archive: req.archive,
@@ -2135,7 +2227,6 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           target,
           lun,
           ...(req.rate ? { rate: req.rate } : {}),
-          env: buildBackupEnv(repo, secret),
           readBack: async () => (await readIscsiState(executor, iscsiPaths)).targets,
           // The run-time answer to the question the entry gate asked at the
           // request. A target that has VANISHED in the meantime reports no
@@ -2410,7 +2501,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return reply
     }
 
-    const { repo, secret } = deps
+    // The repo as the route read it; the job reads it and its secret again
+    // when it starts (cr.56, `restoreDepsNow`).
+    const { repo } = deps
 
     // The journald audit params — the queue's completion line carries them, with
     // `bytesWritten` filled in when the job finishes, exactly as the in-place
@@ -2453,11 +2546,12 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         // re-read takes that answer, and its re-read under the lock before
         // the map runs the whole spec again (the id and every gate).
         let proved: IscsiTargetDetail | undefined = now.target
+        const depsNow = await restoreDepsNow(req.repo, repo)
         return runNewLunImageRestore(
           executor,
           {
-            repo,
-            secret,
+            repo: depsNow.repo,
+            secret: depsNow.secret,
             ...(deps.namespace ? { namespace: deps.namespace } : {}),
             snapshot: req.snapshot,
             archive: req.archive,
@@ -2477,7 +2571,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
             backing: fresh.ok.backing,
             ...(fresh.ok.ahr ? { ahr: { fstabPath, pool: fresh.ok.ahr } } : {}),
             ...(req.rate ? { rate: req.rate } : {}),
-            env: buildBackupEnv(repo, secret),
+            env: buildBackupEnv(depsNow.repo, depsNow.secret),
             mutate: {
               executor,
               configfsRoot: iscsiPaths.configfsRoot ?? CONFIGFS_TARGET_ROOT,
@@ -2612,7 +2706,17 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // write all see one spelling — `/mnt//pve/x` is `/mnt/pve/x` and cannot
     // slip past the territory refusal on a trailing-slash-only strip.
     const target = normalizeMountpointPath(home)
-    const browseDeps = { ...deps, snapshot: req.snapshot, archive: req.archive, path: '/' }
+
+    // cr.56 (folded from cr.54's report): the repository and its secret per
+    // guard RUN — the route's run uses what `readDepsFor` just read; the job's
+    // runs (its gates contact PBS too: the catalog shell, the snapshot size)
+    // read them fresh through `restoreDepsNow`, as the backup run does, so a
+    // token rotated while the restore waited is the one every job-time pbc
+    // call carries. The confirm signed the route's effective namespace, which
+    // stays.
+    let routeRun = true
+    const depsOf = (reads: GuardReads): Promise<typeof deps> => reads.once('restore:deps', async () =>
+      routeRun ? deps : { ...deps, ...(await restoreDepsNow(req.repo, deps.repo)) })
 
     /**
      * The destination as ONE guard run reads it. Every fact is lazy and read
@@ -2631,7 +2735,8 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       // A newLocation directory that does NOT exist yet is created by the
       // client, so the write and space probes go where it will be created.
       const writeDir = async (): Promise<string> => (await merge()) ? target : parentDirectory(target)
-      const selection = (): Promise<SelectionFacts> => reads.once('restore:selection', () => readSelectionFacts(executor, browseDeps, req.selections))
+      const selection = (): Promise<SelectionFacts> => reads.once('restore:selection', async () =>
+        readSelectionFacts(executor, { ...(await depsOf(reads)), snapshot: req.snapshot, archive: req.archive, path: '/' }, req.selections))
       // The exact sum of the picked files when every selection is a file, else
       // the manifest's logical archive size (GT-4) — an upper bound, and the
       // refusal says which figure it used.
@@ -2641,7 +2746,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         let archiveBytes: number | null = null
         const group = groupOfSnapshotId(req.snapshot)
         if (facts.exactBytes === null && group) {
-          const listing = await listSnapshots(executor, deps, group)
+          const listing = await listSnapshots(executor, await depsOf(reads), group)
           if (listing.ok) {
             const snap = listing.data.find(s => s.snapshot === req.snapshot)
             const file = snap?.files.find(f => f.archive === req.archive)
@@ -2742,6 +2847,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     }
 
     const pre = await guardCheck(spec)
+    routeRun = false
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
     const merge = await pre.object.merge()
@@ -2824,10 +2930,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         const fresh = await now.selection()
         const { warnings } = await now.space()
         const mergeNow = await now.merge()
+        // cr.56: the repository and its secret this job run read (`depsOf`),
+        // with the route's effective namespace (the confirm signed it).
+        const depsNow = await depsOf(ctx.reads)
         const result = await runFileRestore(
           executor,
           {
-            ...deps,
+            ...depsNow,
             snapshot: req.snapshot,
             archive: req.archive,
             target,

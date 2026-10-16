@@ -1,4 +1,5 @@
 import type { Job, JobRef } from '@anas/shared'
+import type { Refusal } from './safety/guard.js'
 import { randomUUID } from 'node:crypto'
 import { request as httpRequest } from 'node:http'
 import { TASK_CANCELLED_EXIT_CODE } from '@anas/shared'
@@ -52,6 +53,37 @@ export type Requester = (req: {
 }) => Promise<RunnerResponse>
 
 /**
+ * The user every systemd task runner names itself as (cr.56, review L10).
+ *
+ * A PVE user id is always `<name>@<realm>` and PVE refuses a `:` in the name
+ * (user.cfg is a colon-separated file), and the gateway builds the identity
+ * headers it forwards from scratch out of pveproxy's signed assertion — so no
+ * request that came through the gateway can carry this name. Only a root
+ * process on the root-only socket can: the runner a task's own unit starts.
+ * The run doors accept their runner-only `direct:true` from this user alone,
+ * and the audit record tells a timer run from a real `root@pam` click (the
+ * udev cache-event script names itself `system:udev-cache-event` the same way).
+ */
+export const TASK_RUNNER_USER = 'system:task-runner'
+
+/**
+ * The run doors' answer to `direct:true` from anyone but {@link TASK_RUNNER_USER}
+ * (cr.56, review L10): `direct` skips the in-flight refusal and runs the work
+ * in the daemon without the task's unit, so a client sending it would bypass
+ * §2's "Run Now goes through the task's own unit" — one code path, one
+ * history. Decided on the request's identity (the door the runner comes in
+ * by), never on the body.
+ */
+export function directFromClientRefusal(subject: string): Refusal {
+  return {
+    status: 403,
+    code: 'FORBIDDEN',
+    message: `${subject}: 'direct' is the task runner's own flag (the request the task's systemd unit makes when it runs) `
+      + `and is refused from a client — run the task with Run Now, without 'direct', which starts that unit`,
+  }
+}
+
+/**
  * System identity headers the daemon's requireIdentity expects for a mutation.
  * The runner is root on the root-only socket (systemd runs it as root), so it
  * names both privileges itself (cr.28: the job queue refuses a request that
@@ -60,7 +92,7 @@ export type Requester = (req: {
 export function identityHeaders(): Record<string, string> {
   return {
     'content-type': 'application/json',
-    'x-anas-user': 'root@pam',
+    'x-anas-user': TASK_RUNNER_USER,
     'x-anas-user-uid': '0',
     'x-anas-request-id': randomUUID(),
     'x-anas-privileges': 'Sys.Audit,Sys.Modify',

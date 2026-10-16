@@ -30,9 +30,10 @@ import {
 import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
 import { READ_JOB_OPERATIONS, readJobCancel } from '../jobs/read-jobs.js'
+import { directFromClientRefusal, TASK_RUNNER_USER } from '../runner-poll.js'
 import { ConfirmStore } from '../safety/confirm.js'
 import { confirmGate } from '../safety/gate.js'
-import { guardCheck, guarded, GuardRefusalError, sendRefusal, taskClaim } from '../safety/guard.js'
+import { guardCheck, guarded, GuardRefusalError, sendRefusal, sourcePathsMoved, taskClaim, unheldClaimsRefusal } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyCloudRun } from '../services/cloud-notify.js'
@@ -1101,6 +1102,12 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
+    // cr.56 (review L10): `direct` is the runner's flag — it skips the
+    // in-flight refusal below and runs the work without the task's unit — so
+    // it is taken only from the runner's own identity, which no request
+    // through the gateway can carry (runner-poll.ts TASK_RUNNER_USER).
+    if (direct && identity.user !== TASK_RUNNER_USER)
+      return sendRefusal(reply, directFromClientRefusal(`Cloud sync task '${name}'`))
 
     if (!(await taskFileExists(systemdDir, name))) {
       reply.code(404)
@@ -1135,8 +1142,9 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     // waits for the direct run its unit submits, so a destroy queued between
     // the two (per-key FIFO) would wait for the supervisor while the direct
     // run waited for the destroy. The task is read here for its paths; the
-    // body reads it again (a task edited in between is cr.41's — its claims
-    // are the ones read now).
+    // body reads it again and — cr.56 (review M2) — recomputes the claims from
+    // ITS read and refuses STATE_CHANGED when it needs one the job does not
+    // hold (the source edited onto another filesystem while the run waited).
     const sourceTask = direct ? await readTask(systemdDir, name) : null
     const source = sourceTask
       ? await pathSourceClaims(executor, [sourceTask.source], readAhrPools)
@@ -1189,6 +1197,21 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
           }
           if (gate.reason === 'heal' || gate.reason === 'no-record')
             updateProgress(`cloud sync task '${name}': ${gate.detail}`)
+
+          // cr.56 (review M2): the claim-bearing field is the SOURCE path
+          // (resolved to the filesystem it lives on). Every key the run needs
+          // by THIS read must be among the ones the queue granted from the
+          // route's read — recomputed, not bound as a revision, because the
+          // keys also move when the filesystem under an unchanged path moves.
+          const needed = await pathSourceClaims(executor, [task.source], readAhrPools)
+          const moved = unheldClaimsRefusal(
+            `Cloud sync task '${name}'`,
+            sourcePathsMoved({ name: 'source', plural: false }, sourceTask ? [sourceTask.source] : [], [task.source]),
+            source.claims,
+            needed.claims,
+          )
+          if (moved)
+            throw new GuardRefusalError(moved)
 
           const result = await runCloudSync(
             executor,

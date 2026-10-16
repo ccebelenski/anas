@@ -10,6 +10,8 @@ import {
   guarded,
   poolClaims,
   smbShareClaim,
+  sourcePathsMoved,
+  unheldClaimsRefusal,
   zfsClaims,
   zfsDatasetClaims,
   znameClaim,
@@ -270,5 +272,35 @@ describe('cr.33b — a guid-keyed verb and a name-keyed fallback on one pool ser
       await tick()
       assert.deepEqual(queue.heldLocks(), [])
     }
+  })
+})
+
+describe('cr.56 (review M2) — unheldClaimsRefusal: the claims a run needs now against the set its job holds', () => {
+  const held = [...zfsClaims(GUID, 'tank/media', 'shared'), znameClaim('tank', 'exclusive')]
+
+  it('every needed claim held (the same set, or fewer) → null: an edit that needs no new key runs', () => {
+    assert.equal(unheldClaimsRefusal('Backup task \'t\'', 'x', held, held), null)
+    assert.equal(unheldClaimsRefusal('Backup task \'t\'', 'x', held, zfsClaims(GUID, 'tank', 'shared')), null)
+    // A held EXCLUSIVE claim covers a needed shared one (the name key here).
+    assert.equal(unheldClaimsRefusal('Backup task \'t\'', 'x', held, [znameClaim('tank', 'shared')]), null)
+  })
+
+  it('a needed claim not held, or held shared where exclusive is needed → STATE_CHANGED naming the field and each unheld object once', () => {
+    const r = unheldClaimsRefusal('Backup task \'t\'', 'archive paths were /a; now /b', held, [
+      ...zfsClaims(GUID, 'tank/other', 'shared'),
+      zpoolClaim(GUID, 'exclusive', 'tank'),
+    ])
+    assert.deepEqual(r, {
+      status: 409,
+      code: 'STATE_CHANGED',
+      message: `Backup task 't' changed while this run waited (archive paths were /a; now /b) — the run holds no lock on `
+        + `Dataset 'tank/other', Pool 'tank', so nothing was done; run it again`,
+    })
+  })
+
+  it('sourcePathsMoved names the field when it changed, else the filesystem under the same paths', () => {
+    assert.equal(sourcePathsMoved({ name: 'archive paths', plural: true }, ['/a', '/b'], ['/a']), 'archive paths were /a, /b; now /a')
+    assert.equal(sourcePathsMoved({ name: 'source', plural: false }, [], ['/x']), 'source was none; now /x')
+    assert.equal(sourcePathsMoved({ name: 'source', plural: false }, ['/x'], ['/x']), 'source /x now resolves to a different filesystem')
   })
 })

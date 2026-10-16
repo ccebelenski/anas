@@ -7,6 +7,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { TASK_RUNNER_USER } from '../../runner-poll.js'
 import { createServer } from '../../server.js'
 import { isoWeekParity } from '../../services/backup-cadence.js'
 import { buildBackupNotifyBody } from '../../services/backup-notify.js'
@@ -34,6 +35,8 @@ const IDENTITY = {
   'x-anas-request-id': randomUUID(),
 }
 const JSON_HEADERS = { ...IDENTITY, 'content-type': 'application/json' }
+/** The task runner's own identity (cr.56): the only one a `direct:true` run is taken from. */
+const RUNNER_HEADERS = { ...JSON_HEADERS, 'x-anas-user': TASK_RUNNER_USER }
 
 /** A real pbc backup transcript on STDERR (SURPRISE C: stdout is empty). */
 const PBC_BACKUP_STDERR = [
@@ -263,7 +266,7 @@ describe('backup routes (Epic 16)', () => {
     await createTask()
     const mock = mockOf(server)
     mock.calls.length = 0
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
@@ -301,6 +304,36 @@ describe('backup routes (Epic 16)', () => {
     // Nothing was submitted: no supervising job sits "waiting" in the list.
     const jobs = await server.inject({ method: 'GET', url: '/v1/jobs', headers: IDENTITY })
     assert.ok(!((jobs.json() as { data: { operation: string }[] }).data ?? []).some(j => j.operation === 'backup.task.run'))
+  })
+
+  it('cr.56 (review L10): POST /run { direct:true } from a CLIENT is refused 403 naming the flag — with the unit mid-run (the gate `direct` would skip), no job is submitted and pbc never runs', async () => {
+    await createRepo()
+    await createTask()
+    const mock = mockOf(server)
+    mock.addFixture({
+      command: '/usr/bin/systemctl',
+      args: ['show', 'anas-backup-nightly-etc.service', '-p', 'ActiveState,InactiveExitTimestamp'],
+      result: {
+        stdout: `ActiveState=active\nInactiveExitTimestamp=${Date.parse('2026-09-25T10:00:00Z') * 1000}\n`,
+        stderr: '',
+        exitCode: 0,
+      },
+    })
+    mock.calls.length = 0
+    // root@pam through the gateway is a client like any other: the flag is
+    // the runner's, and the runner is told apart by its identity, not the body.
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
+    assert.equal(res.statusCode, 403)
+    const { error } = res.json() as { error: { code: string, message: string } }
+    assert.equal(error.code, 'FORBIDDEN')
+    assert.equal(
+      error.message,
+      `Backup task 'nightly-etc': 'direct' is the task runner's own flag (the request the task's systemd unit makes when it runs) `
+      + `and is refused from a client — run the task with Run Now, without 'direct', which starts that unit`,
+    )
+    const jobs = await server.inject({ method: 'GET', url: '/v1/jobs', headers: IDENTITY })
+    assert.ok(!((jobs.json() as { data: { operation: string }[] }).data ?? []).some(j => j.operation === 'backup.task.run'))
+    assert.equal(mock.calls.some(c => c.command === '/usr/bin/prlimit'), false)
   })
 
   it('POST /run (no direct) starts the unit and supervises it to a systemd result (Fix 1)', async () => {
@@ -379,7 +412,7 @@ describe('backup routes (Epic 16)', () => {
     const mock = mockOf(server)
     mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
     mock.calls.length = 0
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
     const result = job.result as { status: string, prune?: { kept: number, removed: number, dryRun: boolean }, warnings?: string[] }
@@ -399,7 +432,7 @@ describe('backup routes (Epic 16)', () => {
     await createTaskPayload(RETAINED_TASK)
     const mock = mockOf(server)
     mock.addFixture({ command: PBC_CMD, result: { stdout: '', stderr: 'Error: ENOENT: No such file or directory', exitCode: 255 } })
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     // The backup data is safe — the job COMPLETES, carrying the prune problem.
     assert.equal(job.status, 'completed')
@@ -427,7 +460,7 @@ describe('backup routes (Epic 16)', () => {
         exitCode: 255,
       },
     })
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
     const result = job.result as { warnings?: string[] }
@@ -462,7 +495,7 @@ describe('backup routes (Epic 16)', () => {
       },
     })
     mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'failed')
     assert.match(job.error!.message, /authentication failed - remote echoed '\[secret\]' back/)
@@ -490,7 +523,7 @@ describe('backup routes (Epic 16)', () => {
     ].join('\n')
     const mock = mockOf(server)
     mock.addFixture({ command: '/usr/bin/prlimit', args: RETAINED_BACKUP_ARGS, result: { stdout: '', stderr: leakedStderr, exitCode: 0 } })
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
     const result = job.result as { archives?: string[], nofileWarning?: string }
@@ -521,7 +554,7 @@ describe('backup routes (Epic 16)', () => {
     const mock = mockOf(server)
     mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
     mock.calls.length = 0
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
     assert.deepEqual(pruneCalls(mock), [])
@@ -534,7 +567,7 @@ describe('backup routes (Epic 16)', () => {
     mock.addFixture({ command: '/usr/bin/prlimit', args: RETAINED_BACKUP_ARGS, result: { stdout: '', stderr: 'Error: no such datastore \'store1\'', exitCode: 255 } })
     mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
     mock.calls.length = 0
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'failed')
     assert.deepEqual(pruneCalls(mock), [])
@@ -549,7 +582,7 @@ describe('backup routes (Epic 16)', () => {
     mock.addFixture({ command: '/usr/bin/prlimit', args: RETAINED_BACKUP_ARGS, result: { stdout: '', stderr: 'Error: backup timestamp is older than last backup.', exitCode: 255 } })
     mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
     mock.calls.length = 0
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
     assert.equal((job.result as { status: string }).status, 'skipped')
@@ -841,7 +874,7 @@ describe('backup routes (Epic 16)', () => {
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/pool-task/run',
-      headers: JSON_HEADERS,
+      headers: RUNNER_HEADERS,
       payload: { direct: true },
     })
     assert.equal(res.statusCode, 202)
@@ -863,7 +896,7 @@ describe('backup routes (Epic 16)', () => {
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/pool-noticed/run',
-      headers: JSON_HEADERS,
+      headers: RUNNER_HEADERS,
       payload: { direct: true },
     })
     const job = await waitForJob(server, await jobIdFrom(res))
@@ -925,7 +958,7 @@ describe('backup routes (Epic 16)', () => {
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/pool-all/run',
-      headers: JSON_HEADERS,
+      headers: RUNNER_HEADERS,
       payload: { direct: true },
     })
     assert.equal(res.statusCode, 202)
@@ -969,7 +1002,7 @@ describe('backup routes (Epic 16)', () => {
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/pool-all-timeout/run',
-      headers: JSON_HEADERS,
+      headers: RUNNER_HEADERS,
       payload: { direct: true },
     })
     const job = await waitForJob(server, await jobIdFrom(res))
@@ -1036,7 +1069,7 @@ describe('backup routes (Epic 16)', () => {
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/snap-zfs/run',
-      headers: JSON_HEADERS,
+      headers: RUNNER_HEADERS,
       payload: { direct: true },
     })
     const job = await waitForJob(server, await jobIdFrom(res))
@@ -1092,7 +1125,7 @@ describe('backup routes (Epic 16)', () => {
     let res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/ident-live/run',
-      headers: JSON_HEADERS,
+      headers: RUNNER_HEADERS,
       payload: { direct: true },
     })
     assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
@@ -1114,7 +1147,7 @@ describe('backup routes (Epic 16)', () => {
     res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/ident-snap/run',
-      headers: JSON_HEADERS,
+      headers: RUNNER_HEADERS,
       payload: { direct: true },
     })
     assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
@@ -1145,7 +1178,7 @@ describe('backup routes (Epic 16)', () => {
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/snap-expand/run',
-      headers: JSON_HEADERS,
+      headers: RUNNER_HEADERS,
       payload: { direct: true },
     })
     const job = await waitForJob(server, await jobIdFrom(res))
@@ -1194,7 +1227,7 @@ describe('backup routes (Epic 16)', () => {
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/snap-three/run',
-      headers: JSON_HEADERS,
+      headers: RUNNER_HEADERS,
       payload: { direct: true },
     })
     const job = await waitForJob(server, await jobIdFrom(res))
@@ -1243,7 +1276,7 @@ describe('backup routes (Epic 16)', () => {
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/snap-sweep/run',
-      headers: JSON_HEADERS,
+      headers: RUNNER_HEADERS,
       payload: { direct: true },
     })
     assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
@@ -1273,7 +1306,7 @@ describe('backup routes (Epic 16)', () => {
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/snap-notify/run',
-      headers: JSON_HEADERS,
+      headers: RUNNER_HEADERS,
       payload: { direct: true },
     })
     assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
@@ -1454,7 +1487,7 @@ describe('backup routes (Epic 16)', () => {
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/nightly-lun/run',
-      headers: JSON_HEADERS,
+      headers: RUNNER_HEADERS,
       payload: { direct: true },
     })
     // The snapdev node poll is a real (bounded) ~2 s wait, so this job needs a
@@ -1591,7 +1624,7 @@ describe('backup routes (Epic 16)', () => {
     const create = await server.inject({ method: 'POST', url: '/v1/backup/tasks', headers: JSON_HEADERS, payload: pveTask })
     await waitForJob(server, await jobIdFrom(create))
     // The direct path is the unit's own exec — it reads the .pw secret at run time.
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pve-run/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pve-run/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
@@ -1688,7 +1721,7 @@ describe('backup routes (Epic 16)', () => {
     })
     mock.calls.length = 0
 
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pictures/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pictures/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     // A skip is a COMPLETED job with its own status — not a failure, and not a
     // success that pretends a backup happened.
@@ -1712,7 +1745,7 @@ describe('backup routes (Epic 16)', () => {
     assert.equal((await waitForJob(server, await jobIdFrom(create))).status, 'completed')
     scheduleTrigger('pictures', now)
 
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pictures/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pictures/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
     assert.equal((job.result as { status: string }).status, 'success')
@@ -1732,7 +1765,7 @@ describe('backup routes (Epic 16)', () => {
     // The timer last fired 8 hours ago; THIS run started now → started by hand.
     scheduleTrigger('pictures', new Date(now.getTime() - 8 * 3600_000))
 
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pictures/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pictures/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
     assert.equal((job.result as { status: string }).status, 'success')
@@ -1759,7 +1792,7 @@ describe('backup routes (Epic 16)', () => {
       result: { stdout: `${lastSuccess} pve anas-backup-pictures[900]: {"task":"pictures","result":{"status":"success","archives":[]}}`, stderr: '', exitCode: 0 },
     })
 
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pictures/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pictures/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
     assert.equal((job.result as { status: string }).status, 'success')
@@ -1775,7 +1808,7 @@ describe('backup routes (Epic 16)', () => {
     assert.match(data.timer, /OnCalendar=\*-\*-\* 02:00:00/)
     // Its scheduled fire is never gated — no cadence, nothing to gate.
     scheduleTrigger('nightly-etc', new Date())
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal((job.result as { status: string }).status, 'success')
   })
@@ -1807,7 +1840,7 @@ describe('backup routes (Epic 16)', () => {
     await createTask() // no `notify` in the payload → the schema default, always
     const mock = allowNotify()
     mock.calls.length = 0
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
     const sent = notifications(mock)
@@ -1828,7 +1861,7 @@ describe('backup routes (Epic 16)', () => {
     await createTaskPayload({ ...TASK, name: 'quiet', notify: 'on-failure' })
     const mock = allowNotify()
     mock.calls.length = 0
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/quiet/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/quiet/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
     assert.deepEqual(notifications(mock), [])
   })
@@ -1842,7 +1875,7 @@ describe('backup routes (Epic 16)', () => {
       // The prune fails AFTER a good backup (16.11) — the job completes carrying it.
       mock.addFixture({ command: PBC_CMD, result: { stdout: '', stderr: 'Error: ENOENT: No such file or directory', exitCode: 255 } })
       mock.calls.length = 0
-      const res = await server.inject({ method: 'POST', url: `/v1/backup/tasks/${name}/run`, headers: JSON_HEADERS, payload: { direct: true } })
+      const res = await server.inject({ method: 'POST', url: `/v1/backup/tasks/${name}/run`, headers: RUNNER_HEADERS, payload: { direct: true } })
       const job = await waitForJob(server, await jobIdFrom(res))
       assert.equal(job.status, 'completed', notify)
       const sent = notifications(mock)
@@ -1887,7 +1920,7 @@ describe('backup routes (Epic 16)', () => {
       ],
     })
     mock.calls.length = 0
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const runId = await jobIdFrom(res)
     // Wait until pbc is actually running (the prlimit exec was issued).
     for (let i = 0; i < 100 && !mock.calls.some(c => c.command === '/usr/bin/prlimit'); i++)
@@ -1945,7 +1978,7 @@ describe('backup routes (Epic 16)', () => {
       const mock = allowNotify()
       mock.addFixture({ command: '/usr/bin/prlimit', args: RETAINED_BACKUP_ARGS, result: { stdout: '', stderr: 'Error: no such datastore \'store1\'', exitCode: 255 } })
       mock.calls.length = 0
-      const res = await server.inject({ method: 'POST', url: `/v1/backup/tasks/${name}/run`, headers: JSON_HEADERS, payload: { direct: true } })
+      const res = await server.inject({ method: 'POST', url: `/v1/backup/tasks/${name}/run`, headers: RUNNER_HEADERS, payload: { direct: true } })
       const job = await waitForJob(server, await jobIdFrom(res))
       assert.equal(job.status, 'failed', notify)
       const sent = notifications(mock)
@@ -1983,7 +2016,7 @@ describe('backup routes (Epic 16)', () => {
         result: { stdout: `${lastSuccess} pve anas-backup-${name}[900]: {"task":"${name}","result":{"status":"success","archives":[]}}`, stderr: '', exitCode: 0 },
       })
       mock.calls.length = 0
-      const res = await server.inject({ method: 'POST', url: `/v1/backup/tasks/${name}/run`, headers: JSON_HEADERS, payload: { direct: true } })
+      const res = await server.inject({ method: 'POST', url: `/v1/backup/tasks/${name}/run`, headers: RUNNER_HEADERS, payload: { direct: true } })
       const job = await waitForJob(server, await jobIdFrom(res))
       assert.equal((job.result as { status: string }).status, 'skipped-off-week', notify)
       assert.deepEqual(notifications(mock), [], notify)
@@ -1998,7 +2031,7 @@ describe('backup routes (Epic 16)', () => {
     await createTask()
     const mock = allowNotify(255) // perl runs, PVE has no target → non-zero exit
     mock.calls.length = 0
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: RUNNER_HEADERS, payload: { direct: true } })
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
     assert.equal((job.result as { status: string }).status, 'success')

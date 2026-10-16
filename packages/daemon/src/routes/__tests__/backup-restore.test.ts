@@ -5,7 +5,7 @@ import type { LockClaim } from '../../jobs/locks.js'
 import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { constants } from 'node:fs'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -716,13 +716,36 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assertNothingDestructive()
     })
 
-    it('the code binds the snapshot and the archive: a different archive is a new challenge', async () => {
+    // cr.56: the in-place door's confirm now answers a changed request field
+    // the way every guard door does — 409 CONFIRM_SCOPE_CHANGED naming the
+    // field, with a fresh code (was: CONFIRMATION_REQUIRED). What the test
+    // protects is unchanged: the code does not authorise a different archive.
+    it('the code binds the snapshot and the archive: a different archive is a new challenge (409 CONFIRM_SCOPE_CHANGED naming it)', async () => {
       await serveAnas()
       const first = await restore()
       const code = String(first.headers['x-anas-confirm-code'])
       const res = await restore(body({ archive: 'lun.img' }), { 'x-anas-confirm': code })
       assert.equal(res.statusCode, 409)
-      assert.equal(res.body.error!.code, 'CONFIRMATION_REQUIRED')
+      assert.equal(res.body.error!.code, 'CONFIRM_SCOPE_CHANGED')
+      assert.deepEqual((res.body.error as { changed?: string[] }).changed, ['archive'])
+      assert.ok(res.headers['x-anas-confirm-code'])
+      assert.notEqual(res.headers['x-anas-confirm-code'], code)
+      assertNothingDestructive()
+    })
+
+    it('cr.56 (H3, folded from cr.54): the code binds the NAMESPACE — a code minted for ns gtrestore replayed with another ns is 409 CONFIRM_SCOPE_CHANGED naming ns, and nothing runs', async () => {
+      await serveAnas()
+      const first = await restore()
+      assert.equal(first.body.error!.code, 'CONFIRMATION_REQUIRED')
+      const code = String(first.headers['x-anas-confirm-code'])
+      // The same snapshot NAME in another namespace is another point in time.
+      const res = await restore(body({ ns: 'gtrestore-old' }), { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+      assert.equal(res.body.error!.code, 'CONFIRM_SCOPE_CHANGED')
+      assert.deepEqual((res.body.error as { changed?: string[] }).changed, ['ns'])
+      assert.match(res.body.error!.message, /^You confirmed with ns "gtrestore"; this request has ns "gtrestore-old" — confirm again$/)
+      assert.ok(res.headers['x-anas-confirm-code'])
+      assert.notEqual(res.headers['x-anas-confirm-code'], code)
       assertNothingDestructive()
     })
 
@@ -755,6 +778,81 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       const job = await waitForJob(res.body.job!.id)
       assert.equal(job.status, 'failed')
       assert.match(job.error!.message, /LUN serves a different device than its path names/)
+      assertNothingDestructive()
+    })
+  })
+
+  // --- cr.56 (folded from cr.54): the job reads the repository and its secret ---
+  //
+  // The restore waits in the queue behind a job holding the target's key (the
+  // key the in-place restore takes, cr.40); the repository changes while it
+  // waits; the job's first act is to read the repository and its secret again.
+
+  describe('cr.56 — the job re-resolves the repository and its secret, as the backup run does', () => {
+    function hold(): () => void {
+      let release!: () => void
+      const held = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      ;(server as unknown as { jobQueue: JobQueue }).jobQueue.submit('test.hold', { user: 'test', uid: 0 }, async () => {
+        await held
+      }, { locks: [iscsiTargetClaim(ANAS_IQN)] })
+      return release
+    }
+
+    async function acceptedBehindHold(): Promise<{ id: string, release: () => void }> {
+      const code = String((await restore()).headers['x-anas-confirm-code'])
+      const release = hold()
+      const res = await restore(body(), { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      return { id: res.body.job!.id, release }
+    }
+
+    it('a token ROTATED while the restore waits is the one the job hands pbc — pbc echoing the NEW value is masked, so the job carried it', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      mock.clearFixtures()
+      mock.addFixture({ command: PBC, result: { stdout: SNAPSHOT_LIST_JSON, stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
+      // pbc fails echoing the credential it was handed: the ROTATED one.
+      mock.addStreamFixture({
+        command: PBC,
+        result: { stderr: 'Error: error extracting archive - connection closed because of a broken pipe while using rotated-secret\n', exitCode: 255, bytesWritten: 0 },
+      })
+      const { id, release } = await acceptedBehindHold()
+      await writeFile(join(dir, 'creds', 'backup-repo-pbs-main.secret'), 'rotated-secret', { mode: 0o600 })
+      release()
+      const job = await waitForJob(id)
+      assert.equal(job.status, 'failed')
+      // The mask is built from the value the job handed pbc: the rotated one.
+      assert.match(job.error!.message, /\[secret\]/)
+      assert.equal(JSON.stringify(job).includes('rotated-secret'), false, job.error!.message)
+    })
+
+    it('a credential DELETED while the restore waits fails the job naming it — nothing disabled, nothing written', async () => {
+      await serveAnas()
+      const { id, release } = await acceptedBehindHold()
+      await rm(join(dir, 'creds', 'backup-repo-pbs-main.secret'))
+      release()
+      const job = await waitForJob(id)
+      assert.equal(job.status, 'failed')
+      assert.equal(job.error!.message, `No secret stored for repository 'pbs-main' — set its credentials first; nothing was restored`)
+      assertNothingDestructive()
+    })
+
+    it('a repository re-pointed at another server while the restore waits fails STATE_CHANGED — the snapshot was picked from the old one; nothing disabled, nothing written', async () => {
+      await serveAnas()
+      const { id, release } = await acceptedBehindHold()
+      const reg = JSON.parse(await readFile(join(dir, 'backup-repos.json'), 'utf8')) as { repos: { host: string }[] }
+      reg.repos[0].host = 'pbs-other.example'
+      await writeFile(join(dir, 'backup-repos.json'), `${JSON.stringify(reg, null, 2)}\n`)
+      release()
+      const job = await waitForJob(id)
+      assert.equal(job.status, 'failed')
+      assert.equal(job.error!.code, 'STATE_CHANGED')
+      assert.equal(job.error!.message, `Repository 'pbs-main' changed while the restore waited (was pbs.example:8007/store; `
+      + `now pbs-other.example:8007/store) — the snapshot was picked from the old one, so nothing was restored; pick it again`)
       assertNothingDestructive()
     })
   })
@@ -1406,6 +1504,26 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         assert.equal(job.status, 'failed')
         assert.equal(job.error?.code, 'STATE_CHANGED')
         assert.match(job.error!.message, /was: \/tank\/images\/newvol\.raw; now: \/srv\/images\/newvol\.raw/)
+        assertNothingDestructive()
+      })
+
+      it('cr.56: a credential DELETED while the new-LUN restore waits fails the job naming it — the job reads the repository and its secret again; no volume, no targetcli, no stream', async () => {
+        await serveAnas()
+        const mock = mockOf()
+        mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: 'tank\t/tank\ntank/images\t/tank/images\n', stderr: '', exitCode: 0 } })
+        const payload = newLunBody(targetWith({ backing: { kind: 'file', dataset: 'tank/images' } }))
+        const code = await mint(payload)
+        const blocker = hold('iscsi.acl.add', iscsiTargetClaim(ANAS_IQN))
+        const res = await restore(payload, { 'x-anas-confirm': code })
+        assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+        const id = res.body.job!.id
+        await queuedBehind(id, `waiting for iscsi.acl.add (job ${blocker.id}) on iSCSI target ${ANAS_IQN}`)
+
+        await rm(join(dir, 'creds', 'backup-repo-pbs-main.secret'))
+        blocker.release()
+        const job = await waitForJob(id)
+        assert.equal(job.status, 'failed')
+        assert.equal(job.error!.message, `No secret stored for repository 'pbs-main' — set its credentials first; nothing was restored`)
         assertNothingDestructive()
       })
 

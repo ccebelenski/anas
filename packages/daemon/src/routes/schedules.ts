@@ -1,12 +1,13 @@
 import type { AhrPool, SnapshotScheduleRunResult, SnapshotSchedule as SnapshotScheduleT, SnapshotTarget } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
+import type { LockClaim } from '../jobs/locks.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { UnitTaskObject } from '../services/task-units.js'
 import { PRUNED_NAMES_PER_DATASET, ScheduleId, SnapshotSchedule } from '@anas/shared'
 import { parseZpoolList } from '../parsers/zpool-list.js'
-import { guardCheck, guarded, scheduleClaim, sendRefusal } from '../safety/guard.js'
+import { guardCheck, guarded, GuardRefusalError, scheduleClaim, sendRefusal, unheldClaimsRefusal } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { loadPveFootprint, ownershipRefusal, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { notifyScheduleRun } from '../services/snapshot-notify.js'
@@ -320,13 +321,30 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
         unbound: () => `Could not read snapshot schedule '${id}' — refusing the run`,
       },
       gates: [],
-      locks: async o => [
-        ...(o.target.kind === 'zfs'
-          ? await datasetSourceClaims(executor, [o.target.dataset])
-          : ahrSourceClaims(o.target.pool, (await resolveAhrPool(o.target.pool))?.vg.uuid)),
-        scheduleClaim(id, 'shared'),
-      ],
+      locks: async o => scheduleRunClaims(o),
     }
+  }
+
+  /**
+   * A fire's claims (cr.33b): its target shared — the dataset (its ancestors
+   * and the pool shared) or the AHR pool — and its own `schedule:<id>` shared.
+   * The ONE builder the route (the spec's `locks`) and the job's cr.56
+   * re-check both call.
+   */
+  async function scheduleRunClaims(o: SnapshotScheduleT): Promise<LockClaim[]> {
+    return [
+      ...(o.target.kind === 'zfs'
+        ? await datasetSourceClaims(executor, [o.target.dataset])
+        : ahrSourceClaims(o.target.pool, (await resolveAhrPool(o.target.pool))?.vg.uuid)),
+      scheduleClaim(o.id, 'shared'),
+    ]
+  }
+
+  /** What moved under a fire's target between the route read and the job read (cr.56). */
+  function targetMoved(was: SnapshotTarget, now: SnapshotTarget): string {
+    return targetKey(was) !== targetKey(now)
+      ? `target was ${targetKey(was)}; now ${targetKey(now)}`
+      : `target ${targetKey(now)} now resolves to a different pool`
   }
 
   /** Fire a schedule once: take a snapshot into its cadence bucket, then prune. */
@@ -621,6 +639,21 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
         // cannot turn a good snapshot into a failed job.
         const startedAt = Date.now()
         try {
+          // cr.56 (review M2): the claim-bearing field is the TARGET (kind +
+          // dataset or AHR pool, resolved to the pool's guid / VG UUID). An
+          // edit cannot move it (PUT refuses a retarget), but a delete and a
+          // re-create under the same id can, and so can a pool re-created
+          // under its name: the job re-read the schedule (guarded), so it
+          // recomputes the claims from that read with the spec's own builder
+          // and refuses when it needs a key the queue did not grant it.
+          const moved = unheldClaimsRefusal(
+            `Snapshot schedule '${id}'`,
+            targetMoved(pre.object.target, schedule.target),
+            pre.locks,
+            await scheduleRunClaims(schedule),
+          )
+          if (moved)
+            throw new GuardRefusalError(moved)
           const result = await fireSchedule(schedule, updateProgress)
           await notifyScheduleRun(executor, { schedule, result, elapsedMs: Date.now() - startedAt })
           return result

@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { mountClaim } from '../../safety/guard.js'
 import { createServer } from '../../server.js'
 import { CATALOG_PREFLIGHT_TIMEOUT_S } from '../../services/backup-catalog.js'
@@ -530,19 +531,27 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     // A file-backed LUN is an ordinary file: an in-place `--overwrite` restore
     // into its directory would rewrite it while an initiator is mid-write, and
     // nothing below ANAS stops that.
-    const configfs = join(dir, 'configfs')
-    await mkdir(join(configfs, 'target/core/fileio_0/lun2'), { recursive: true })
-    await writeFile(join(configfs, 'target/core/fileio_0/lun2/udev_path'), '/gtbackup/data/lun2.raw\n')
+    // The captured live configfs tree (ruling (l)) with its file-backed LUN's
+    // backing re-pointed into the restore's destination.
+    const configfs = join(dir, 'target')
+    const manifest = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/iscsi/configfs-live.manifest'), 'utf8')
+    assert.equal(manifest.split('= /gtiscsi/images/lun2.raw\n').length, 2)
+    await materializeConfigfsManifest(manifest.replace('= /gtiscsi/images/lun2.raw\n', '= /gtbackup/data/lun2.raw\n'), configfs)
     setEnv('ANAS_ISCSI_CONFIGFS', configfs)
     // A fresh server so the route picks the override up.
     await server.close()
     server = createServer({ mock: true, logger: false })
     const res = await post(body({ task: undefined, target: { mode: 'inPlace', path: '/gtbackup/data' } }))
-    // Either the claim reader found it (409) or the node has no LIO stack in
-    // this harness (fail-open) — what must NEVER happen is a restore starting
-    // over a live LUN, so that is what is asserted.
-    if (res.statusCode === 409)
-      assert.match((res.json() as { error: { message: string } }).error.message, /LUN/)
+    // cr.56: the refusal itself is asserted — the 409 used to be checked only
+    // `if` it came, and the request was in fact answered 400 by the selection
+    // gate (the hand-made configfs above was not a tree the claims reader
+    // reads, so the gate never saw a LUN).
+    assert.equal(res.statusCode, 409, res.body)
+    const err = (res.json() as { error: { code: string, reason?: string, message: string } }).error
+    assert.equal(err.code, 'CONFLICT')
+    assert.equal(err.reason, 'held-by-lun')
+    assert.match(err.message, /LUN/)
+    assert.match(err.message, /\/gtbackup\/data\/lun2\.raw/)
     assert.equal(restoreRan(), false)
   })
 
@@ -1181,6 +1190,23 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
       const job = await waitForJob(server, id)
       assert.equal(job.status, 'failed')
       assert.equal(job.error?.code, 'STATE_CHANGED')
+      assert.equal(restoreRan(), false, 'no restore argv')
+    })
+
+    it('cr.56: a credential DELETED while the restore waits fails the job naming it — the job reads the repository and its secret again; no restore argv', async () => {
+      seedHappyPath()
+      seedZfsDestination()
+      const blocker = holdDestinationMount()
+      const res = await post(body())
+      assert.equal(res.statusCode, 202, res.body)
+      const id = (res.json() as { job: { id: string } }).job.id
+      await waitingBehind(id, blocker.id)
+
+      await rm(join(dir, 'creds', 'backup-repo-pbs-main.secret'))
+      blocker.release()
+      const job = await waitForJob(server, id)
+      assert.equal(job.status, 'failed')
+      assert.equal(job.error?.message, `No secret stored for repository 'pbs-main' — set its credentials first; nothing was restored`)
       assert.equal(restoreRan(), false, 'no restore argv')
     })
 
