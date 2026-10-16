@@ -711,6 +711,81 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     assert.deepEqual(calls.filter(isMutation), [{ command: UMOUNT, args: ['-l', NFS_MP] }])
   })
 
+  // -------------------------------------------------------------------------
+  // nf.3b (cross-model review of nf.3, probes M1/M2/M3/M5): the six proven
+  // behaviours the review found unpinned — three here, three in
+  // datasets-guard.test.ts for D11.
+  // -------------------------------------------------------------------------
+
+  it('nf.3 review 1: a holder GONE at the resend is CONFIRM_SCOPE_CHANGED naming both sets — the job is never submitted', async () => {
+    // The bound set is the set the operator was shown: one fewer holder is a
+    // different set too, so the resend re-challenges rather than silently
+    // detaching a set nobody confirmed against.
+    await serve()
+    lsof = LSOF_TWO_HOLDERS
+    const first = await send(state(CIFS_MP, 'unmount'))
+    assert.equal(first.statusCode, 409, first.body)
+    lsof = LSOF_ONE_HOLDER // pid 5961 exited before the resend
+    const res = await send(state(CIFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 409, res.body)
+    const error = res.json().error
+    assert.equal(error.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.deepEqual(error.changed, ['holders'])
+    assert.equal(error.message, HOLDERS_SENTENCE('sleep (pid 5960), sleep (pid 5961)', 'sleep (pid 5960)'))
+    assert.deepEqual(calls.filter(isMutation), [])
+    assert.equal(queue().list().filter(j => j.operation.startsWith('mount.')).length, 0, 'no job was submitted')
+  })
+
+  it('nf.3 review 2: a pid reused by another program — CONFIRM_SCOPE_CHANGED at the resend; inside the job, STATE_CHANGED naming it, zero umount argv', async () => {
+    // At the resend (the review's M2): the key is pid AND name — a recycled
+    // pid running another program is not the holder the operator saw.
+    await serve()
+    lsof = LSOF_ONE_HOLDER
+    const first = await send(state(CIFS_MP, 'unmount'))
+    assert.equal(first.statusCode, 409, first.body)
+    lsof = LSOF_ONE_HOLDER.replace('sleep   5960', 'rsync   5960') // the pid now runs rsync
+    const res = await send(state(CIFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.equal(res.json().error.message, HOLDERS_SENTENCE('sleep (pid 5960)', 'rsync (pid 5960)'))
+    assert.deepEqual(calls.filter(isMutation), [])
+
+    // Inside the job (the review's M3): the reuse happened after the
+    // confirmed resend — the job re-lists, finds a holder the confirm did not
+    // name (the same pid, another program), and refuses before any umount.
+    await server!.close()
+    server = undefined
+    await serve()
+    lsof = LSOF_ONE_HOLDER
+    const challenge = await send(state(CIFS_MP, 'unmount'))
+    assert.equal(challenge.statusCode, 409, challenge.body)
+    const release = holdSlots()
+    const accepted = await send(state(CIFS_MP, 'unmount'), challenge.headers['x-anas-confirm-code'] as string)
+    assert.equal(accepted.statusCode, 202, accepted.body)
+    const id = (accepted.json() as JobAccepted).job.id
+    lsof = LSOF_ONE_HOLDER.replace('sleep   5960', 'rsync   5960') // recycled while the job waits
+    release()
+    const job = await finished(id)
+    assert.equal(job.status, 'failed', JSON.stringify(job.error))
+    assert.equal(job.error?.code, 'STATE_CHANGED')
+    assert.match(job.error!.message, /holders the confirmation did not name \(rsync \(pid 5960\)\)/)
+    assert.deepEqual(calls.filter(isMutation), [], 'zero umount argv')
+  })
+
+  it('nf.3 review 3: neither lsof nor fuser on either door — the unknown == unknown resend is accepted, but the job runs a PLAIN umount, never the lazy detach', async () => {
+    await serve()
+    lsofFails = 'missing'
+    fuserMissing = true
+    const first = await send(state(NFS_MP, 'unmount'))
+    assert.equal(first.statusCode, 409, first.body)
+    assert.match(first.json().error.message, /could not be listed/)
+    const res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(calls.filter(c => c.command === UMOUNT).map(c => c.args), [[NFS_MP]], 'plain umount, never -l: an unknown holder set is never force-detached; the kernel refuses a busy one before any config change')
+  })
+
   it('remove ALWAYS confirms — an idle, unreferenced mount too — and the challenge names what it deletes', async () => {
     await serve()
     const res = await send(remove(NFS_MP, '?removeMountpointDir=true'))

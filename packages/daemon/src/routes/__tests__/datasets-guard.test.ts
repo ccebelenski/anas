@@ -472,6 +472,67 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
     assert.deepEqual(holdsCalls(), [])
   })
 
+  // --- nf.3b (cross-model review of nf.3, probes D1/D2/D3): three of the six
+  // proven behaviours the review found unpinned; the other three are the D10
+  // ones in mounts-guard.test.ts ---------------------------------------------
+
+  it('nf.3 review 4: a hold on the TARGET snapshot itself is allowed — the sweep excludes it, and the forced rollback runs', async () => {
+    // The gate refuses holds the rollback would destroy MID-SWEEP; the target
+    // survives a rollback (it is the state rolled back TO), so its own hold
+    // is no reason to refuse, and it never reaches `zfs holds` as an operand.
+    await serve()
+    holds = ok(`testpool/media@snap1\t${CAPTURED_TAG}\tThu Oct 15 16:59 2026\n`)
+    const res = await inject(ROLLBACK_FORCE)
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED', 'a hold on the target is no reason to refuse — the challenge is asked')
+    const res2 = await inject(ROLLBACK_FORCE, res.headers['x-anas-confirm-code'] as string)
+    assert.equal(res2.statusCode, 202, res2.body)
+    const job = await finished((res2.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(calls.some(c => c.command === ZFS && c.args[0] === 'rollback'), 'the rollback ran over the held target')
+    assert.ok(!holdsCalls().some(c => c.args.includes('testpool/media@snap1')), 'the target never reaches zfs holds')
+  })
+
+  it('nf.3 review 5: bookmarks in the sweep never reach zfs holds — the argv is exactly the swept snapshots, no bookmark operand', async () => {
+    // Bookmarks carry no holds (a hold is per-snapshot); handing one to
+    // `zfs holds` would error the whole read and fail the gate closed on a
+    // healthy rollback. The sweep for HOLDS is snapshots only, even when the
+    // destroy scope bound for force names bookmarks too.
+    await serve()
+    bookmarks = BOOKMARK_AFTER_SNAP2 // newer than the target: force would destroy it
+    const res = await inject(ROLLBACK_FORCE)
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED', 'a bookmark is no reason to refuse')
+    assert.ok((res.json().error.warnings as string[]).includes('Destroyed by force: testpool/media#after-snap2, testpool/media@snap2.'), res.body)
+    assert.deepEqual(holdsCalls().map(c => c.args), [['holds', '-H', '--', 'testpool/media@snap2']], 'only the swept snapshot, never the bookmark')
+  })
+
+  it('nf.3 review 6: zfs holds exit 0 with a garbled (tab-less) row reads as NO hold (the documented fail-open row) — a clean row beside it still refuses, garbled alone lets the rollback proceed', async () => {
+    // parseHolds is total: a line without a tab is skipped, and skipping it
+    // cannot invent or hide a hold on a well-formed row. (The exit-1 half —
+    // unreadable refuses — is pinned by the builder's unreadable test and not
+    // duplicated here.)
+    await serve()
+    holds = ok(`garbage line with no tabs at all\n${HOLDS_ON_SNAP2}`)
+    const refused = await inject(ROLLBACK_FORCE)
+    assert.equal(refused.statusCode, 409, refused.body)
+    assert.equal(refused.json().error.reason, 'snapshot-held', 'the clean row still refuses despite the garbage')
+    assert.deepEqual(calls.filter(isMutation), [])
+    await server!.close()
+    server = undefined
+
+    await serve()
+    holds = ok('garbage line with no tabs at all\nalso-not-a-hold-line\n')
+    const res = await inject(ROLLBACK_FORCE)
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED', 'exit 0 + only-unparseable rows reads as no holds: the gate passes')
+    const res2 = await inject(ROLLBACK_FORCE, res.headers['x-anas-confirm-code'] as string)
+    assert.equal(res2.statusCode, 202, res2.body)
+    const job = await finished((res2.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(calls.some(c => c.command === ZFS && c.args[0] === 'rollback'))
+  })
+
   it('a bookmark OLDER than the target is not destroyed by force and is not bound', async () => {
     await serve()
     bookmarks = 'testpool/media#before-snap1\t100\n'
