@@ -400,7 +400,7 @@ serialise even though they have different guids.
 | `mount:<target path>` | mount verbs | X |
 | `share:smb:<section, case-folded>`, `share:nfs:<path>` | share verbs | X |
 | `uid:<n>`, `gid:<n>`, `idname:<name>` | identity verbs (`idname` for create) | X |
-| `task:<kind>:<name>`, `schedule:<id>` | task/schedule create, update, delete (X); run (S) | as stated |
+| `task:<kind>:<name>`, `schedule:<id>` | task/schedule create, update, delete (X); the DIRECT run (S); the Run-Now supervisor takes NO key (cr.41, cr.33b constraint: only one of the supervisor/direct pair may hold it or a queued delete deadlocks them under per-key FIFO; cr.49's watch lane refuses locks outright) | as stated |
 
 A pool whose key cannot be read (VG unreadable, `zpool get guid` fails) is locked by its name key only, in
 X — the conservative fallback, and its gates will refuse anyway when they cannot read their facts. So that
