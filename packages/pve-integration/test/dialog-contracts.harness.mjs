@@ -705,7 +705,10 @@ const Ext = {
     // what happens AFTER the confirm wants. `confirmAnswer` lets a check say
     // 'no' instead, which is the only way to prove a door actually holds.
     confirm(title, msg, fn) { confirms.push({ title, msg }); if (fn) { fn(confirmAnswer) } },
-    alert(title, msg) { alerts.push({ title, msg }) },
+    // A dismiss callback (cr.48g: jobRejected rides onFailed on one) is called
+    // synchronously, the same way confirm above answers — the fake box is up
+    // and dismissed within the call.
+    alert(title, msg, fn) { alerts.push({ title, msg }); if (fn) { fn('ok') } },
   },
   // PVE's own /nodes/<node>/network, which the portal picker reads (the same
   // endpoint the SMB "how to connect" strings use). `ajax.responses` lets a

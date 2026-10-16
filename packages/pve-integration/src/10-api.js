@@ -230,15 +230,24 @@
         });
     };
 
-    // A mutation the daemon refused outright: onFailed, then the failure alert
-    // carrying the daemon's own sentence.
+    // A mutation the daemon refused outright: the failure alert carrying the
+    // daemon's own sentence FIRST, and onFailed rides the alert's dismiss
+    // callback (cr.48g, D14). Ext.Msg is ONE singleton box: raising the reload
+    // first let a failing reload's own alert replace the refusal ~0.1 s later
+    // and the operator never read why the save was refused. The callback form
+    // is the only ordering Ext.Msg honours — the refusal is up, and the reload
+    // (and any alert it fails with) starts only after the operator dismisses.
     function jobRejected(opts, err) {
-        if (opts.onFailed) { opts.onFailed(null); }
+        function reload() {
+            if (opts.onFailed) { opts.onFailed(null); }
+        }
         try {
             // Encoded: daemon text can carry remote-controlled stderr (review M5).
-            Ext.Msg.alert(ANAS.t(opts.failTitle || 'Operation failed'), ANAS.enc(ANAS.errText(err)));
+            Ext.Msg.alert(ANAS.t(opts.failTitle || 'Operation failed'), ANAS.enc(ANAS.errText(err)), reload);
         } catch (e) {
+            // No box could be raised; the recovery still runs, exactly once.
             ANAS.warn(ANAS.errText(err));
+            reload();
         }
     }
 

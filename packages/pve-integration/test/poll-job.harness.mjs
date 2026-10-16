@@ -39,6 +39,11 @@
  *      (the last through confirmAndRun's 409→confirm→202 dance) each fire the
  *      reload from onFailed when the real runJob → pollJob sees status failed,
  *      and from onFailed(null) when the job is lost (404)
+ *   o  a mutation the daemon REFUSED outright (jobRejected): the refusal alert
+ *      is the only modal up, and the reload onFailed(null) does rides that
+ *      alert's dismiss callback — a reload whose own GET fails cannot replace
+ *      the refusal in the singleton Ext.Msg before the operator reads it
+ *      (cr.48g, D14)
  */
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -64,6 +69,7 @@ const scrubSrc = readFileSync(join(SRC, '69-scrubs.js'), 'utf8')
 function makeEnv(handle) {
   const toasts = []
   const alerts = []
+  const dismissals = [] // dismiss callbacks the alerts carried (cr.48g)
   const delays = [] // every setTimeout delay in scheduling order
   const calls = [] // every fetch: { method, url }
   let now = 0
@@ -79,7 +85,13 @@ function makeEnv(handle) {
     },
     toast: function (msg) { toasts.push(msg) },
     Msg: {
-      alert: function (title, msg) { alerts.push({ title, msg }) },
+      // A dismiss callback (cr.48g: jobRejected rides the reload on one) is
+      // RECORDED, not answered — the real box stays up until the operator
+      // dismisses it, and row o proves the reload waits for exactly that.
+      alert: function (title, msg, fn) {
+        alerts.push({ title, msg })
+        if (fn) { dismissals.push(fn) }
+      },
       // The delete callers confirm first; the driver answers 'yes'. The 409
       // confirm path (68-backup) re-uses it for the challenge dialog.
       confirm: function (title, msg, fn) { fn('yes') },
@@ -180,6 +192,14 @@ function makeEnv(handle) {
     return delays.map(function (d) { return d.ms })
   }
 
+  // The driver dismissing the most recent alert that carried a callback —
+  // what the operator does with the mouse. Answers 'ok' like the real box.
+  function dismissLast() {
+    const fn = dismissals.pop()
+    if (fn) { fn('ok'); return true }
+    return false
+  }
+
   return {
     sandbox,
     ANAS: sandbox.window.ANAS,
@@ -190,6 +210,7 @@ function makeEnv(handle) {
     scheduledDelays,
     nowValue: function () { return now },
     advanceTo,
+    dismissLast,
   }
 }
 
@@ -662,6 +683,56 @@ async function main() {
     assert('n: a lost backup delete reloads the grid', reloadGets === 1)
     assert('n: the reload repopulated the grid', grid.names().indexOf('alpha') !== -1)
     assert('n: the lost job alerted', count(env.alerts) === 1 && contains(env.alerts[0].msg, 'no longer knows'))
+  }
+
+  // o: a mutation the daemon REFUSED outright (jobRejected) — cr.48g, D14.
+  //    The wave-2b node probe saved an rclone remote, the daemon refused with
+  //    a 500, and the save dialog's onFailed reloaded the remote list — whose
+  //    own GET failed and alerted ~0.1 s later in the singleton Ext.Msg,
+  //    REPLACING the refusal before the operator read it. Now the reload rides
+  //    the refusal alert's dismiss callback: the refusal is the only modal up,
+  //    and the reload (and any alert it fails with) starts only after the
+  //    operator dismisses. The reload here fails exactly as the node's did.
+  {
+    const env = makeEnv(function (method, url) {
+      if (method === 'PUT') {
+        return {
+          status: 500, statusText: 'Internal Server Error',
+          body: { error: { message: 'the rclone config could not be read' } },
+        }
+      }
+      if (method === 'GET' && url.indexOf('/cloud/remotes') !== -1) {
+        return {
+          status: 500, statusText: 'Internal Server Error',
+          body: { error: { message: 'EISDIR: illegal operation on a directory, read' } },
+        }
+      }
+      return { status: 200, body: {} }
+    })
+    env.ANAS.runJob({
+      node: 'pve1', method: 'put', path: '/cloud/remotes/gt', body: { name: 'gt' },
+      failTitle: 'Save failed',
+      onFailed: function () {
+        // The cloud dialog's reload, 72-cloud.js:390's shape: a failed load
+        // alerts through ANAS.alertMsg.
+        env.ANAS.api.get('pve1', '/cloud/remotes').then(function () {}, function (err) {
+          env.ANAS.alertMsg('Load failed', 'Failed to load the rclone remotes: ' + env.ANAS.errText(err))
+        })
+      },
+    })
+    await env.advanceTo(5000)
+    const reloadGets = env.calls.filter(c => c.method === 'GET' && c.url.indexOf('/cloud/remotes') !== -1).length
+    assert('o: the refused save has NOT reloaded — the reload rides the alert', reloadGets === 0)
+    assert('o: the only modal up is the refusal, carrying the daemon sentence',
+      count(env.alerts) === 1 && env.alerts[0].title === 'Save failed' &&
+      contains(env.alerts[0].msg, 'the rclone config could not be read'))
+    env.dismissLast()
+    await env.advanceTo(5000)
+    const reloadGets2 = env.calls.filter(c => c.method === 'GET' && c.url.indexOf('/cloud/remotes') !== -1).length
+    assert('o: dismissing the refusal runs the reload', reloadGets2 === 1)
+    assert('o: the reload failure alerts only AFTER the operator read the refusal',
+      count(env.alerts) === 2 && env.alerts[1].title === 'Load failed' &&
+      contains(env.alerts[1].msg, 'Failed to load the rclone remotes'))
   }
 
   // ======================================================================
