@@ -17,7 +17,7 @@ import { readPoolGuid } from '../safety/stable-id.js'
 import { notChangedList, walkArgs, walkScopeFrom } from './access-walk.js'
 import { heldByLunOnce } from './iscsi-held.js'
 import { probeMount } from './mounts.js'
-import { isProbeableKind, kindOfMount, mountIndex } from './nested-filesystems.js'
+import { isProbeableKind, kindOfMount, mountIndex, normalizePath } from './nested-filesystems.js'
 import { loadPveFootprint, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from './pve-footprint.js'
 import { resolveSelfServiceTarget } from './share-selfservice.js'
 
@@ -448,16 +448,33 @@ export function createAccessService(opts: AccessServiceOptions) {
   }
 
   /**
-   * Is `getfacl`/`setfacl` present (the `acl` package)? Feature-detect, then
-   * memoize: whether the package is installed does not change at runtime, so we
-   * probe `getfacl --version` once per service instead of on every access
-   * request. A fresh server (each `createServer()`) builds a fresh service and
-   * so a fresh cache. A cached Promise avoids a concurrent double-probe.
+   * Is `getfacl`/`setfacl` present (the `acl` package)? Feature-detect via
+   * `getfacl --version` and memoize ONLY the positive answer (cr.53 L27):
+   * a probe that exits non-zero answers "absent" for THIS call but is not
+   * cached, because a failed probe is not always a fact about the package —
+   * a transient one (fork/EAGAIN under load) cached for the process lifetime
+   * would have every later plan skip the ACL read and plan from the mode
+   * bits, the mask hazard the unreadable-ACL refusal (composePlan) exists to
+   * prevent. A true answer is stable (packages do not appear at runtime),
+   * cached, and its Promise lets concurrent callers share one probe; a false
+   * answer costs one re-probe per call until it succeeds or the daemon
+   * restarts.
    */
   let aclSupportedCache: Promise<boolean> | null = null
   function aclSupported(): Promise<boolean> {
-    aclSupportedCache ??= executor.exec(GETFACL, ['--version']).then(r => r.exitCode === 0)
-    return aclSupportedCache
+    if (aclSupportedCache !== null)
+      return aclSupportedCache
+    const probe = executor.exec(GETFACL, ['--version']).then((r) => {
+      if (r.exitCode !== 0 && aclSupportedCache === probe)
+        aclSupportedCache = null
+      return r.exitCode === 0
+    }, (err: unknown) => {
+      if (aclSupportedCache === probe)
+        aclSupportedCache = null
+      throw err
+    })
+    aclSupportedCache = probe
+    return probe
   }
 
   /** The dataset's `acltype` value (`off`, `posixacl`, …); '' if unreadable. */
@@ -1056,11 +1073,14 @@ export function createAccessService(opts: AccessServiceOptions) {
           : `:${req.group}`
       if (walk) {
         // `-h`: a link's own owner, as `chown -R` (-P) changes it — never
-        // the file it points at, which may sit outside the tree.
-        await walkStep('chown', [], [CHOWN, '-h', spec])
+        // the file it points at, which may sit outside the tree. `-execdir`
+        // addresses every member relative to the directory find opened (H2).
+        await walkStep('chown', [], [CHOWN, '-h', spec, '--'])
       }
       else {
-        const args = [spec, mountpoint]
+        // cr.53 (L16): `--` ends option parsing — a name that somehow
+        // reached here still cannot become a chown option.
+        const args = [spec, '--', mountpoint]
         updateProgress(`chown ${args.join(' ')}`)
         const r = await executor.exec(CHOWN, args)
         if (r.exitCode !== 0)
@@ -1088,12 +1108,13 @@ export function createAccessService(opts: AccessServiceOptions) {
       // execute from every file in the tree.
       const spec = buildAclSpec(base, named, recursive)
       if (walk) {
-        // Links filtered out: setfacl -R skips the links it meets, but one
-        // named as an argument is followed.
-        await walkStep('setfacl -b -m', ['!', '-type', 'l'], [SETFACL, '-b', '-m', spec])
+        // Links filtered out at the listing (`! -type l`) AND refused at
+        // the operand (`-P`, --physical): a link swapped in between the two
+        // fails the job instead of being followed (H2).
+        await walkStep('setfacl -b -m', ['!', '-type', 'l'], [SETFACL, '-P', '-b', '-m', spec, '--'])
       }
       else {
-        const setArgs = ['--set', spec, mountpoint]
+        const setArgs = ['--set', spec, '--', mountpoint]
         updateProgress(`setfacl ${setArgs.join(' ')}`)
         const setR = await executor.exec(SETFACL, setArgs)
         if (setR.exitCode !== 0)
@@ -1107,11 +1128,12 @@ export function createAccessService(opts: AccessServiceOptions) {
       // lowercase form — see {@link buildAclSpec}.
       const defSpec = buildAclSpec(base, named, false)
       if (walk) {
-        // Directories only — what `setfacl -R -d` wrote anyway (above).
-        await walkStep('setfacl -d --set', ['-type', 'd'], [SETFACL, '-d', '--set', defSpec])
+        // Directories only — what `setfacl -R -d` wrote anyway (above); `-P`
+        // so a directory swapped for a link is refused, not followed (H2).
+        await walkStep('setfacl -d --set', ['-type', 'd'], [SETFACL, '-P', '-d', '--set', defSpec, '--'])
       }
       else {
-        const defArgs = ['-d', '--set', defSpec, mountpoint]
+        const defArgs = ['-d', '--set', defSpec, '--', mountpoint]
         updateProgress(`setfacl ${defArgs.join(' ')}`)
         const defR = await executor.exec(SETFACL, defArgs)
         if (defR.exitCode !== 0)
@@ -1124,10 +1146,13 @@ export function createAccessService(opts: AccessServiceOptions) {
       // binary ended `-rwxrwsr-x`, a setgid-root executable). The recursive
       // form is the same bounded walk as every step, `-type d` only.
       if (walk) {
-        await walkStep('find -type d -exec chmod g+s', ['-type', 'd'], [CHMOD, 'g+s'])
+        // find's own `-type d` decides the members (chmod has no operand
+        // no-follow on Linux); `-execdir` runs the batch relative to the
+        // directory find opened (H2).
+        await walkStep('find -type d -execdir chmod g+s', ['-type', 'd'], [CHMOD, 'g+s', '--'])
       }
       else {
-        const gidArgs = ['g+s', mountpoint]
+        const gidArgs = ['g+s', '--', mountpoint]
         updateProgress(`chmod ${gidArgs.join(' ')}`)
         const gidR = await executor.exec(CHMOD, gidArgs)
         if (gidR.exitCode !== 0)
@@ -1147,10 +1172,10 @@ export function createAccessService(opts: AccessServiceOptions) {
     // truth. This runs only for `clearNamed: true` — never inferred.
     if (clearAcls) {
       if (walk) {
-        await walkStep('setfacl -b -k', ['!', '-type', 'l'], [SETFACL, '-b', '-k'])
+        await walkStep('setfacl -b -k', ['!', '-type', 'l'], [SETFACL, '-P', '-b', '-k', '--'])
       }
       else {
-        const clearArgs = ['-b', '-k', mountpoint]
+        const clearArgs = ['-b', '-k', '--', mountpoint]
         updateProgress(`setfacl ${clearArgs.join(' ')}`)
         const clearR = await executor.exec(SETFACL, clearArgs)
         if (clearR.exitCode !== 0)
@@ -1165,10 +1190,10 @@ export function createAccessService(opts: AccessServiceOptions) {
       // files on purpose: it repairs trees an earlier recursive grant marked
       // setgid file by file (before 0.4.3 that step ran `chmod -R g+s`).
       if (walk && !baseChanged) {
-        await walkStep('chmod g-s', ['!', '-type', 'l'], [CHMOD, 'g-s'])
+        await walkStep('chmod g-s', ['!', '-type', 'l'], [CHMOD, 'g-s', '--'])
       }
       else if (!walk) {
-        const gsArgs = ['g-s', mountpoint]
+        const gsArgs = ['g-s', '--', mountpoint]
         updateProgress(`chmod ${gsArgs.join(' ')}`)
         const unsetR = await executor.exec(CHMOD, gsArgs)
         if (unsetR.exitCode !== 0)
@@ -1191,11 +1216,13 @@ export function createAccessService(opts: AccessServiceOptions) {
         ? (clearAcls ? `${levelsToSymbolic(base)},g-s` : levelsToSymbolic(base))
         : levelsToMode(base)
       if (walk) {
-        // Links filtered out: chmod follows a link named as an argument.
-        await walkStep(`chmod ${mode}`, ['!', '-type', 'l'], [CHMOD, mode])
+        // Links filtered out by find's own `! -type l` (chmod has no operand
+        // no-follow on Linux) and addressed relative to the directory find
+        // opened (`-execdir`, H2).
+        await walkStep(`chmod ${mode}`, ['!', '-type', 'l'], [CHMOD, mode, '--'])
       }
       else {
-        const modeArgs = [mode, mountpoint]
+        const modeArgs = [mode, '--', mountpoint]
         updateProgress(`chmod ${modeArgs.join(' ')}`)
         const modeR = await executor.exec(CHMOD, modeArgs)
         if (modeR.exitCode !== 0)
@@ -1225,25 +1252,43 @@ export function createAccessService(opts: AccessServiceOptions) {
   }
 
   /**
-   * The lock claims (cr.33 §4.2) a set-access job takes: exclusive on a ZFS
-   * dataset (`zfs:<pool guid>/<path>`, its ancestors shared), shared on an AHR
-   * pool (`ahr:<vg uuid>`), each with the pool's name key shared. A pool whose
-   * key cannot be read is locked by its name key, exclusive (§4.2's fallback,
-   * which that shared name key meets — cr.33b). A share path on neither has no key.
+   * `access:<normalised dir>` — exclusive; the permission writer's OWN path
+   * key (cr.53 L20, following the guard's path-key family — `mount:<path>`,
+   * `share:nfs:<path>` in safety/guard.ts). Every claim set below carries it,
+   * so two applies on one directory serialise whatever the directory sits
+   * on: the pool keys alone left two recursive applies on one AHR directory
+   * (`ahr:<uuid>` is SHARED for access) or on one plain path (no key at all)
+   * walking the same files at once — each restating the ACL from the plan it
+   * made before the other's changes, the second silently undoing the first.
+   */
+  function accessPathClaim(dir: string): LockClaim {
+    const key = normalizePath(dir)
+    return { key: `access:${key}`, mode: 'exclusive', what: `the permissions of ${key}` }
+  }
+
+  /**
+   * The lock claims (cr.33 §4.2) a set-access job takes: the exclusive
+   * `access:<dir>` path key (cr.53 L20) on every home, plus exclusive on a
+   * ZFS dataset (`zfs:<pool guid>/<path>`, its ancestors shared), shared on
+   * an AHR pool (`ahr:<vg uuid>`), each with the pool's name key shared. A
+   * pool whose key cannot be read is locked by its name key, exclusive
+   * (§4.2's fallback, which that shared name key meets — cr.33b). A share
+   * path on neither now has the path key.
    */
   async function accessClaims(t: AccessTarget | null, reads: GuardReads): Promise<LockClaim[]> {
+    const pathClaim = t ? [accessPathClaim(targetDir(t))] : []
     const dataset = t ? aclDatasetOf(t) : null
     if (dataset !== null) {
       const pool = dataset.split('/')[0]
       const guid = (await reads.once(`pool-guid:${pool}`, () => readPoolGuid(executor, pool)))?.guid
-      return zfsDatasetClaims(guid, dataset, 'exclusive')
+      return [...pathClaim, ...zfsDatasetClaims(guid, dataset, 'exclusive')]
     }
     const ahr = t?.kind === 'ahr'
       ? { pool: t.pool, vgUuid: t.vgUuid }
       : t?.kind === 'share' && t.home?.kind === 'ahr' ? { pool: t.home.pool, vgUuid: t.home.vgUuid } : null
     if (ahr)
-      return ahrPoolClaims(ahr.pool, ahr.vgUuid, 'shared')
-    return []
+      return [...pathClaim, ...ahrPoolClaims(ahr.pool, ahr.vgUuid, 'shared')]
+    return pathClaim
   }
 
   /**

@@ -184,7 +184,7 @@ describe('nf.1 — a recursive apply never crosses a mount it did not name (wave
     // `-xdev` cannot be exercised without a real mount and is pinned above.
     const scope = walkScopeFrom(MP, mountIndex(FINDMNT_NFS_UNDER), [])
     const [root] = scope.roots
-    const args = walkArgs(root, [], ['/usr/bin/chown', '-h', 'nobody'])
+    const args = walkArgs(root, [], ['/usr/bin/chown', '-h', 'nobody', '--'])
     const tree = mkdtempSync(join(tmpdir(), 'anas-nf1-'))
     try {
       for (const d of ['nfs/tree/d0', 'keep/sub'])
@@ -192,11 +192,17 @@ describe('nf.1 — a recursive apply never crosses a mount it did not name (wave
       writeFileSync(join(tree, 'nfs/f0'), '')
       writeFileSync(join(tree, 'nfs/tree/d0/f0'), '')
       writeFileSync(join(tree, 'keep/sub/f'), '')
-      const at = args.indexOf('-exec')
+      const at = args.indexOf('-execdir')
       const real = [...args.slice(0, at + 1), '/usr/bin/echo', '{}', '+'].map(a => a === MP ? tree : a.replace(MP, findPathPattern(tree)))
       const seen = execFileSync(FIND, real, { encoding: 'utf-8' }).trim().split(/\s+/)
-      assert.ok(seen.includes(tree) && seen.includes(join(tree, 'keep/sub/f')), seen.join(' '))
-      assert.equal(seen.filter(p => p === join(tree, 'nfs') || p.startsWith(`${join(tree, 'nfs')}/`)).length, 0, seen.join(' '))
+      // cr.53 (H2): under `-execdir` every operand is a bare `./name` inside
+      // the directory handle find opened — no absolute path ever reaches the
+      // tool, so a directory swapped between listing and batch cannot
+      // redirect a batch out of the tree.
+      for (const operand of seen)
+        assert.match(operand, /^\.\/[^/]+$/, `${operand} in ${seen.join(' ')}`)
+      assert.ok(seen.includes('./sub') && seen.includes('./f'), seen.join(' '))
+      assert.equal(seen.filter(p => p.includes('nfs') || p.includes('f0') || p.includes('d0')).length, 0, seen.join(' '))
     }
     finally {
       rmSync(tree, { recursive: true, force: true })
@@ -213,9 +219,9 @@ describe('nf.1 — a recursive apply never crosses a mount it did not name (wave
     const chown = walks().filter(a => a.includes('/usr/bin/chown'))
     assert.deepEqual(chown, [
       // The dataset: its own .zfs, the child (walked on its own) and the NFS mount pruned.
-      ['-P', MP, '-xdev', '(', '-path', `${MP}/.zfs`, '-o', '-path', CHILD_A, '-o', '-path', NFS, ')', '-prune', '-o', '-exec', '/usr/bin/chown', '-h', 'nobody', '{}', '+'],
+      ['-P', MP, '-xdev', '(', '-path', `${MP}/.zfs`, '-o', '-path', CHILD_A, '-o', '-path', NFS, ')', '-prune', '-o', '-execdir', '/usr/bin/chown', '-h', 'nobody', '--', '{}', '+'],
       // The child, from its own mountpoint, on its own device.
-      ['-P', CHILD_A, '-xdev', '(', '-path', `${CHILD_A}/.zfs`, ')', '-prune', '-o', '-exec', '/usr/bin/chown', '-h', 'nobody', '{}', '+'],
+      ['-P', CHILD_A, '-xdev', '(', '-path', `${CHILD_A}/.zfs`, ')', '-prune', '-o', '-execdir', '/usr/bin/chown', '-h', 'nobody', '--', '{}', '+'],
     ])
     // Every step covers both roots.
     for (const tool of ['/usr/bin/chown', '/usr/bin/setfacl', '/usr/bin/chmod'])
@@ -289,7 +295,7 @@ describe('nf.1 — the walk scope (access-walk.ts)', () => {
 
   it('a mountpoint with glob characters is pruned as itself', () => {
     assert.equal(findPathPattern('/tank/we[ir]d*?\\x'), '/tank/we\\[ir\\]d\\*\\?\\\\x')
-    const args = walkArgs({ path: '/tank', xdev: true, prune: ['/tank/a*'] }, ['-type', 'd'], ['/usr/bin/chmod', 'g+s'])
-    assert.deepEqual(args, ['-P', '/tank', '-xdev', '(', '-path', '/tank/a\\*', ')', '-prune', '-o', '-type', 'd', '-exec', '/usr/bin/chmod', 'g+s', '{}', '+'])
+    const args = walkArgs({ path: '/tank', xdev: true, prune: ['/tank/a*'] }, ['-type', 'd'], ['/usr/bin/chmod', 'g+s', '--'])
+    assert.deepEqual(args, ['-P', '/tank', '-xdev', '(', '-path', '/tank/a\\*', ')', '-prune', '-o', '-type', 'd', '-execdir', '/usr/bin/chmod', 'g+s', '--', '{}', '+'])
   })
 })

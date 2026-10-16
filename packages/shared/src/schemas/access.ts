@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { LookupName } from './identity.js'
 
 // ============================================================================
 // Filesystem access — the layered permissions editor (Epic 4.7.2).
@@ -21,8 +22,20 @@ export type AccessLevel = z.infer<typeof AccessLevel>
  */
 export const AccessEntry = z.object({
   kind: z.enum(['owner', 'owning-group', 'everyone', 'user', 'group']),
-  /** System user/group name — required iff kind is 'user' or 'group' */
-  name: z.string().optional(),
+  /**
+   * System user/group name — required iff kind is 'user' or 'group'.
+   * cr.53 (L16): `LookupName`, the identity module's argv-safe name rule —
+   * it rejects a leading `-` (option injection), whitespace, control
+   * characters, `/`, and `:` (the ACL spec's field delimiter: a name
+   * carrying one could otherwise smuggle extra entries into the
+   * declarative `setfacl` spec), while still accepting every form the
+   * editor reads back from a live ACL — directory identities (`DOMAIN\\user`,
+   * `user@domain`, `john.doe`) and the bare numeric id of an orphaned
+   * entry. The strict create rule (`IdentityName`) is wrong here: this
+   * editor manages EXISTING identities, and a name it cannot express
+   * would lock a tree out of its own permissions dialog.
+   */
+  name: LookupName.optional(),
   level: AccessLevel,
   /**
    * Read-only marker (set by the daemon): the principal's uid/gid no longer
@@ -131,8 +144,16 @@ export type ShareAccessGrantResult = z.infer<typeof ShareAccessGrantResult>
  * for any list-valued field whose emptiness would destroy data.
  */
 export const SetAccessRequest = z.object({
-  owner: z.string().optional(),
-  group: z.string().optional(),
+  /**
+   * New owner/group (cr.53 L16): `LookupName` — the editor resolves an
+   * EXISTING identity, and this value rides into `chown`'s operand list
+   * (a bare uid/gid number is legal there, and LookupName allows it). The
+   * probe this closes: `{ owner: '--reference=/etc/shadow' }` was one PUT
+   * away from a reference chown.
+   */
+  owner: LookupName.optional(),
+  /** New owning group — the same rule as `owner`. */
+  group: LookupName.optional(),
   entries: z.array(AccessEntry).optional(),
   /** Remove every named (user/group) ACL entry — the only way to clear them. */
   clearNamed: z.boolean().optional(),

@@ -2,15 +2,16 @@ import type { AccessEntry, DatasetAccess, Job, JobAccepted } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { SetAccessRequest } from '@anas/shared'
 import { zfsListArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
+import { findPathPattern } from '../../services/access-walk.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -75,13 +76,13 @@ const FIND = '/usr/bin/find'
  * their own st_dev and no mount line).
  */
 function walkOf(root: string, select: string[], action: string[]): string[] {
-  return ['-P', root, ...WALK_XDEV, ...select, '-exec', ...action, '{}', '+']
+  return ['-P', root, ...WALK_XDEV, ...select, '-execdir', ...action, '{}', '+']
 }
 
 /** The walk whose action is `tool` (and whose action arguments pass `pred`). */
 function walkCall(calls: Call[], tool: string, pred: (action: string[]) => boolean = () => true): string[] | undefined {
   return calls.find((c) => {
-    const at = c.args.indexOf('-exec')
+    const at = c.args.indexOf('-execdir')
     return c.command === FIND && at >= 0 && c.args[at + 1] === tool && pred(c.args.slice(at + 2, -2))
   })?.args
 }
@@ -217,7 +218,7 @@ describe('access routes', () => {
       assert.equal(job.status, 'completed')
 
       // owner=rwx(7), group=r-x(5), everyone=---(0) → 750
-      assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['750', MP])
+      assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['750', '--', MP])
       assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
       assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined)
     })
@@ -247,9 +248,9 @@ describe('access routes', () => {
 
       // Symbolic mode with X (owner rwX, group rX, other rX) — never a numeric octal.
       const chmod = walkCall(calls, '/usr/bin/chmod')
-      assert.deepEqual(chmod, walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX']))
+      assert.deepEqual(chmod, walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX', '--']))
       assert.equal(calls.some(c => c.command === '/usr/bin/chmod'), false, 'no chmod -R: the walk is find-driven (nf.1)')
-      assert.equal(find(calls, '/usr/bin/chmod', a => /^[0-7]{3,4}$/.test(a[1] ?? '')), undefined)
+      assert.equal(find(calls, '/usr/bin/chmod', a => /^[0-7]{3,4}$/.test(a[0] ?? '')), undefined)
     })
   })
 
@@ -320,9 +321,9 @@ describe('access routes', () => {
       assert.deepEqual(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), ['set', '--', 'acltype=posixacl', 'xattr=sa', 'testpool/media'])
 
       const expectSpec = 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx'
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', expectSpec, MP])
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-d'), ['-d', '--set', expectSpec, MP])
-      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), ['g+s', MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', expectSpec, '--', MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-d'), ['-d', '--set', expectSpec, '--', MP])
+      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), ['g+s', '--', MP])
     })
 
     it('fails the job clearly when the acl package is absent', async () => {
@@ -339,6 +340,51 @@ describe('access routes', () => {
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'failed')
       assert.match(job.error!.message, /acl package/)
+    })
+
+    it('cr.53 L27: a FAILED acl-package probe answers the request but is NOT cached — the next request probes again and the grant runs', async () => {
+      server = createServer({ mock: true, logger: false })
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      const orig = mock.exec.bind(mock)
+      let probes = 0
+      // Every probe fails until the flip — then every probe answers, the shape
+      // of a fork/EAGAIN blip that ends. `packagePresent` flips between requests
+      // so both halves are deterministic (plan and job see the same answer).
+      let packagePresent = false
+      const calls: Call[] = []
+      mock.exec = async (command, args) => {
+        calls.push({ command, args })
+        if (command === '/usr/bin/getfacl' && args.length === 1 && args[0] === '--version') {
+          probes++
+          if (!packagePresent)
+            return { stdout: '', stderr: 'mock: transient probe failure', exitCode: 127 }
+          return ok('getfacl 2.3.2\n')
+        }
+        return orig(command, args)
+      }
+      const put = () => server!.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ entries: [{ kind: 'user', name: 'alice', level: 'read-write' }] }),
+      })
+
+      // The failed probe answers THIS request: a named grant needs the acl package.
+      const first = await put()
+      assert.equal(first.statusCode, 202)
+      const job1 = await waitForJob(server, (first.json() as JobAccepted).job.id)
+      assert.equal(job1.status, 'failed')
+      assert.match(job1.error!.message, /acl package/)
+
+      // And nothing was cached: the next request probes again, sees the package, and grants.
+      // (Under the old cache-everything memo this job failed `/acl package/` forever.)
+      packagePresent = true
+      const second = await put()
+      assert.equal(second.statusCode, 202)
+      const job2 = await waitForJob(server, (second.json() as JobAccepted).job.id)
+      assert.equal(job2.status, 'completed', JSON.stringify(job2.error))
+      assert.ok(probes >= 2, 'the second request probed again — the failure was not memoized')
+      assert.ok(calls.some(c => c.command === '/usr/bin/setfacl'), 'the grant ran its setfacl argv')
     })
   })
 
@@ -368,11 +414,11 @@ describe('access routes', () => {
       assert.equal(job.status, 'completed')
       assert.equal((job.result as { clearedNamed: boolean }).clearedNamed, true)
 
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), ['-b', '-k', MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), ['-b', '-k', '--', MP])
       // Clearing the ACLs also drops the setgid bit we set for inheritance, so
       // the reported mode is the whole truth (no misleading 2775).
-      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g-s')), ['g-s', MP])
-      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('755')), ['755', MP]) // 7,5,5
+      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g-s')), ['g-s', '--', MP])
+      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('755')), ['755', '--', MP]) // 7,5,5
     })
 
     it('recursively clears the ACL then folds setgid-drop into a single chmod walk', async () => {
@@ -397,12 +443,12 @@ describe('access routes', () => {
       assert.equal(job.status, 'completed')
 
       // The ACL clear is a different tool (setfacl) and stays recursive.
-      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-b', '-k']))
+      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-P', '-b', '-k', '--']))
       // A SINGLE recursive chmod carries both the base perms (symbolic X) and the
       // setgid-drop clause — not two chmod walks.
       const chmodWalks = calls.filter(c => c.command === FIND && c.args.includes('/usr/bin/chmod'))
       assert.equal(chmodWalks.length, 1, 'exactly one recursive chmod')
-      assert.deepEqual(chmodWalks[0].args, walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX,g-s']))
+      assert.deepEqual(chmodWalks[0].args, walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX,g-s', '--']))
       // No standalone `g-s` walk.
       assert.equal(walkCall(calls, '/usr/bin/chmod', a => a.length === 1 && a[0] === 'g-s'), undefined)
     })
@@ -443,7 +489,7 @@ describe('access routes', () => {
       // levels — and the base lands on `g::`, not on the ACL mask a chmod would
       // have moved instead.
       const spec = find(calls, '/usr/bin/setfacl', a => a[0] === '--set')
-      assert.deepEqual(spec, ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx', MP])
+      assert.deepEqual(spec, ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx', '--', MP])
       assert.equal((job.result as { namedCount: number }).namedCount, 1)
     })
 
@@ -461,7 +507,7 @@ describe('access routes', () => {
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
 
-      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['media', MP])
+      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['media', '--', MP])
       assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
       assert.equal(find(calls, '/usr/bin/chmod', () => true), undefined)
     })
@@ -572,16 +618,16 @@ describe('access routes', () => {
       assert.equal(job.status, 'completed')
 
       // chown -h: a link's own owner, as `chown -R` (-P) changed it.
-      assert.deepEqual(walkCall(calls, '/usr/bin/chown'), walkOf(MP, [], ['/usr/bin/chown', '-h', 'media']))
+      assert.deepEqual(walkCall(calls, '/usr/bin/chown'), walkOf(MP, [], ['/usr/bin/chown', '-h', 'media', '--']))
       // Recursive → every execute bit is capital X, the mask too, so plain
       // files gain no execute; `-b -m` resolves X per file against its own bits.
       const spec = 'u::rwX,g::r-X,o::r-X,u:alice:r-X,m::rwX'
-      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-b'), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-b', '-m', spec]))
+      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-P', '-b', '-m', spec, '--']))
       // The default ACL sits on directories only: the lowercase form is what is stored.
       const defSpec = 'u::rwx,g::r-x,o::r-x,u:alice:r-x,m::rwx'
-      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-d'), walkOf(MP, ['-type', 'd'], ['/usr/bin/setfacl', '-d', '--set', defSpec]))
+      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-d')), walkOf(MP, ['-type', 'd'], ['/usr/bin/setfacl', '-P', '-d', '--set', defSpec, '--']))
       // setgid on directories only.
-      assert.deepEqual(walkCall(calls, '/usr/bin/chmod', a => a[0] === 'g+s'), walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s']))
+      assert.deepEqual(walkCall(calls, '/usr/bin/chmod', a => a[0] === 'g+s'), walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s', '--']))
       assert.equal(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), undefined, 'no chmod g+s over the whole tree')
       // No tool walks on its own: `-R` crosses every mount (nf.1).
       assert.equal(calls.some(c => ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl'].includes(c.command) && c.args.includes('-R')), false)
@@ -612,7 +658,7 @@ describe('access routes', () => {
 
       // (a) One literal x in the walk's spec turns every X into x (live proof
       // 0.4.3 §3x): the access spec of the recursive walk has none.
-      const walk = walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-b')
+      const walk = walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b'))
       assert.ok(walk, 'the recursive access ACL was written')
       const walkSpec = walk[walk.indexOf('-m') + 1]
       assert.equal(walkSpec, 'u::rwX,g::rwX,o::r-X,u:alice:rwX,g:media:rwX,m::rwX')
@@ -624,7 +670,7 @@ describe('access routes', () => {
       assert.equal(calls.some(c => c.command === '/usr/bin/chmod' && c.args.includes('g+s')), false, 'no chmod g+s over the tree')
       const gid = walkCall(calls, '/usr/bin/chmod', a => a[0] === 'g+s')
       assert.ok(gid, 'the setgid walk ran')
-      assert.deepEqual(gid, walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s']))
+      assert.deepEqual(gid, walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s', '--']))
 
       // (c) Run that exact argv against a real tree: the directories get
       // setgid, the regular files (plain and executable) do not.
@@ -645,6 +691,163 @@ describe('access routes', () => {
       finally {
         rmSync(root, { recursive: true, force: true })
       }
+    })
+  })
+
+  // --- cr.53 (review H2): the walk is `-execdir`-driven and no-follows ----
+  // A path-addressed batch (`-exec … <full path> +`) can be redirected by
+  // swapping a LISTED DIRECTORY for a symlink (`d -> /etc`) between find's
+  // listing and the batch — the review's simulation landed a named recursive
+  // grant on a file outside the tree. `-execdir` runs every batch relative
+  // to the directory handle find opened, and each tool no-follows its final
+  // component: chown `-h` acts on the link itself, setfacl `-P` refuses a
+  // link operand, and chmod (no operand no-follow on Linux) only ever
+  // receives members find's own `-type` test admitted.
+  describe('cr.53 H2 — the recursive walk is -execdir-driven and never follows an operand', () => {
+    const RECURSIVE_GRANT = {
+      owner: 'media',
+      entries: [
+        { kind: 'owner', level: 'read-write' },
+        { kind: 'owning-group', level: 'read' },
+        { kind: 'everyone', level: 'read' },
+        { kind: 'user', name: 'alice', level: 'read' },
+      ],
+      applyToExisting: true,
+    }
+
+    /** The confirmed recursive apply; its recorded commands. */
+    async function recursiveApply(): Promise<Call[]> {
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server)
+      const res = await injectConfirmed(server, {
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify(RECURSIVE_GRANT),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      return calls
+    }
+
+    it('every batch runs through -execdir — chown with -h, setfacl with -P, chmod only behind find\'s own -type filter', async () => {
+      const calls = await recursiveApply()
+      const walks = calls.filter(c => c.command === FIND)
+      assert.ok(walks.length >= 4, 'the recursive apply walked (chown, access ACL, default ACL, setgid)')
+      for (const { args } of walks) {
+        assert.equal(args.includes('-exec'), false, `never -exec: ${args.join(' ')}`)
+        const at = args.indexOf('-execdir')
+        assert.ok(at >= 0, `every batch is -execdir: ${args.join(' ')}`)
+        const select = args.slice(0, at).join(' ')
+        const tool = args[at + 1]
+        const action = args.slice(at + 2, -2) // options up to `{} +`
+        assert.equal(action.at(-1), '--', `-- ends the tool options: ${args.join(' ')}`)
+        if (tool === '/usr/bin/chown') {
+          assert.ok(action.includes('-h'), 'chown never follows a link operand')
+        }
+        else if (tool === '/usr/bin/setfacl') {
+          assert.ok(action.includes('-P'), 'setfacl refuses a link operand (--physical)')
+        }
+        else {
+          assert.equal(tool, '/usr/bin/chmod', args.join(' '))
+          assert.ok(select.includes('-type d') || select.includes('! -type l'), `chmod members are find-typed: ${select}`)
+        }
+      }
+    })
+
+    it('run for real: each batch addresses ./name inside the directory find opened — the outside target of a planted symlink is never an operand', async () => {
+      const calls = await recursiveApply()
+      const base = mkdtempSync(join(tmpdir(), 'anas-h2-'))
+      try {
+        const root = join(base, 'walk-root')
+        mkdirSync(join(root, 'sub'), { recursive: true })
+        writeFileSync(join(root, 'sub', 'file'), 'data\n')
+        writeFileSync(join(base, 'victim'), 'secret\n', { mode: 0o600 })
+        // The H2 shapes: a link to an outside file and a link to an outside
+        // directory (what a swapped subdirectory becomes).
+        symlinkSync(join(base, 'victim'), join(root, 'link-out'))
+        symlinkSync(base, join(root, 'dir-out'))
+        // The recorded argv, run by the REAL find — only the tool swapped
+        // for a recorder that prints `<cwd>\t<operands>` per invocation.
+        const recorder = join(base, 'record.sh')
+        writeFileSync(recorder, '#!/bin/sh\nprintf \'%s\\t%s\\n\' "$PWD" "$*"\n')
+        chmodSync(recorder, 0o755)
+        const rpBase = realpathSync(base)
+        const rpRoot = realpathSync(root)
+        for (const { args } of calls.filter(c => c.command === FIND)) {
+          const at = args.indexOf('-execdir')
+          const real = [...args.slice(0, at + 1), recorder, ...args.slice(at + 2)]
+            .map(a => a === MP ? root : a.replace(MP, findPathPattern(root)))
+          const log = execFileSync(FIND, real, { encoding: 'utf-8' })
+          for (const line of log.trim().split('\n')) {
+            const [cwd, ops] = line.split('\t')
+            const rc = realpathSync(cwd)
+            assert.ok(rc === rpBase || rc === rpRoot || rc.startsWith(`${rpRoot}/`), `the batch runs inside the tree: ${line}`)
+            for (const op of (ops ?? '').split(' ')) {
+              if (!op.startsWith('./'))
+                continue // tool options (modes, specs, --)
+              assert.match(op, /^\.\/[^/]+$/, `operand is one name in the opened directory: ${line}`)
+              assert.ok(!op.includes('victim'), `the outside file is never an operand: ${line}`)
+            }
+          }
+        }
+      }
+      finally {
+        rmSync(base, { recursive: true, force: true })
+      }
+    })
+
+    it('setfacl -P refuses a symlinked operand — a swapped-in link fails the job, never follows', () => {
+      const base = mkdtempSync(join(tmpdir(), 'anas-h2p-'))
+      try {
+        writeFileSync(join(base, 'victim'), 'secret\n', { mode: 0o600 })
+        symlinkSync(join(base, 'victim'), join(base, 'link'))
+        const r = spawnSync('/usr/bin/setfacl', ['-P', '-b', '-m', 'u:nobody:rwx', '--', join(base, 'link')], { encoding: 'utf-8' })
+        assert.notEqual(r.status, 0, '-P refuses the link operand')
+        const live = spawnSync('/usr/bin/getfacl', ['-pcE', join(base, 'victim')], { encoding: 'utf-8' })
+        assert.equal(live.stdout.includes('nobody'), false, 'the target was never touched')
+      }
+      finally {
+        rmSync(base, { recursive: true, force: true })
+      }
+    })
+  })
+
+  // --- cr.53 (review L16): names are validated at the boundary -------------
+  describe('cr.53 L16 — an injection-shaped name never reaches an argv', () => {
+    async function putAccess(body: unknown): Promise<{ statusCode: number, body: string }> {
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server)
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify(body),
+      })
+      // Route matching may read the dataset list (the wildcard-tail
+      // ambiguity check runs before the handler); nothing that CHANGES
+      // anything may run.
+      assert.equal(calls.some(c => ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl', '/usr/bin/find'].includes(c.command)
+        || (c.command === '/usr/sbin/zfs' && c.args[0] === 'set')), false, JSON.stringify(calls))
+      return { statusCode: res.statusCode, body: res.body }
+    }
+
+    it('400s the review\'s owner probe (--reference=/etc/shadow) before anything runs', async () => {
+      const res = await putAccess({ owner: '--reference=/etc/shadow' })
+      assert.equal(res.statusCode, 400)
+      assert.equal(JSON.parse(res.body).error.code, 'VALIDATION_ERROR')
+    })
+
+    it('400s the review\'s entry-name probe (a spec-delimiter name smuggling an extra o::)', async () => {
+      const res = await putAccess({
+        entries: [
+          { kind: 'everyone', level: 'none' },
+          { kind: 'user', name: 'media:r-x,o::rwx,u:nobody', level: 'read-write' },
+        ],
+      })
+      assert.equal(res.statusCode, 400)
+      assert.equal(JSON.parse(res.body).error.code, 'VALIDATION_ERROR')
     })
   })
 })
@@ -771,7 +974,7 @@ describe('recursive apply — the confirm gate and child datasets (rulings 2026-
     assert.ok(enableA >= 0, 'acltype switched on for the child')
     const firstPermission = calls.findIndex(c => PERMISSION_COMMANDS.includes(c.command))
     assert.ok(firstPermission > enableA, `the child is enabled before any permission changes (enable #${enableA}, first permission #${firstPermission})`)
-    assert.ok(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-b'), 'the walk ran')
+    assert.ok(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), 'the walk ran')
     assert.deepEqual((job.result as { childAclEnabled?: string[] }).childAclEnabled, ['testpool/media/a'])
   })
 

@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { currentLane } from '../../executor/deadline.js'
 import { createServer } from '../../server.js'
 import { SET_ACCESS_PRESENTATION_ONLY } from '../../services/access.js'
 
@@ -78,9 +79,17 @@ describe('cr.37 — fs.setAccess binds its plan and the ACL revision (ruling (j)
   let dir: string
   let storageCfg: string
   let server: ReturnType<typeof createServer> | undefined
-  let calls: { command: string, args: string[] }[] = []
+  let calls: { command: string, args: string[], jobId: string }[] = []
   /** The live ACL of every door's directory right now; a test flips it. */
   let acl = ACL_NO_NAMED
+  /**
+   * cr.53 L20: when set, the FIRST job whose commands run parks at every
+   * command (its claims held), until `unpark()`. `parkedJobId` names it.
+   */
+  let parkFirst = false
+  let parkedJobId = ''
+  let park: Promise<void> = Promise.resolve()
+  let unpark: () => void = () => {}
   /** `vgs` when set (null: the dev mock's own answer). */
   let vgs: string | null = null
   const savedStorage = process.env.ANAS_STORAGE_CFG
@@ -91,6 +100,7 @@ describe('cr.37 — fs.setAccess binds its plan and the ACL revision (ruling (j)
   })
 
   afterEach(async () => {
+    unpark()
     await server?.close()
     server = undefined
     await rm(dir, { recursive: true, force: true })
@@ -103,6 +113,11 @@ describe('cr.37 — fs.setAccess binds its plan and the ACL revision (ruling (j)
   async function serve(): Promise<void> {
     acl = ACL_NO_NAMED
     vgs = null
+    parkFirst = false
+    parkedJobId = ''
+    park = new Promise<void>((resolve) => {
+      unpark = resolve
+    })
     await rm(storageCfg, { force: true })
     process.env.ANAS_STORAGE_CFG = storageCfg
     server = createServer({ mock: true, logger: false })
@@ -111,7 +126,12 @@ describe('cr.37 — fs.setAccess binds its plan and the ACL revision (ruling (j)
     const dirs = new Set([ZFS_DOOR.dir, AHR_DOOR.dir, SHARE_DOOR.dir])
     calls = []
     mock.exec = async (command, args, opts) => {
-      calls.push({ command, args })
+      const jobId = currentLane().jobId ?? ''
+      if (parkFirst && parkedJobId === '' && jobId !== '')
+        parkedJobId = jobId
+      if (jobId !== '' && jobId === parkedJobId)
+        await park
+      calls.push({ command, args, jobId })
       // testpool/media with POSIX ACLs on, so its live ACL is read.
       if (command === ZFS && args.join(' ') === 'get -Hp -o value acltype -- testpool/media')
         return ok('posixacl\n')
@@ -147,6 +167,12 @@ describe('cr.37 — fs.setAccess binds its plan and the ACL revision (ruling (j)
     for (let i = 0; i < 4; i++)
       queue().submit('test.hold', { user: 'test', uid: 0 }, () => held)
     return release
+  }
+
+  async function until(cond: () => boolean, what = 'condition'): Promise<void> {
+    for (let i = 0; i < 400 && !cond(); i++)
+      await new Promise(resolve => setTimeout(resolve, 5))
+    assert.ok(cond(), `${what} not reached`)
   }
 
   async function finished(id: string): Promise<Job> {
@@ -243,7 +269,9 @@ describe('cr.37 — fs.setAccess binds its plan and the ACL revision (ruling (j)
     release()
     // Both are granted at once (different objects); look while they hold.
     const claims = (queue() as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[] }> }).jobs
+    // cr.53 L20: every claim set leads with the exclusive `access:<dir>` key.
     assert.deepEqual(claims.get(zfsJob.job.id)?.claims.map(c => [c.key.replace(/\d+/g, 'N'), c.mode]), [
+      ['access:/testpool/media', 'exclusive'],
       ['zfs:N/media', 'exclusive'],
       ['zfs:N', 'shared'],
       ['zpool:N', 'shared'],
@@ -251,7 +279,10 @@ describe('cr.37 — fs.setAccess binds its plan and the ACL revision (ruling (j)
     ])
     // The dev mock's `vgs` capture (ahr/lvm-vgs.json) predates ident.3's
     // `+vg_uuid`, so ahr0 has no VG UUID: §4.2's fallback, the name key, exclusive.
-    assert.deepEqual(claims.get(ahrJob.job.id)?.claims.map(c => [c.key, c.mode]), [['ahrname:ahr0', 'exclusive']])
+    assert.deepEqual(claims.get(ahrJob.job.id)?.claims.map(c => [c.key, c.mode]), [
+      ['access:/mnt/anas-ahr/ahr0', 'exclusive'],
+      ['ahrname:ahr0', 'exclusive'],
+    ])
     assert.equal((await finished(zfsJob.job.id)).status, 'completed')
     assert.equal((await finished(ahrJob.job.id)).status, 'completed')
   })
@@ -262,9 +293,39 @@ describe('cr.37 — fs.setAccess binds its plan and the ACL revision (ruling (j)
     const release = fillSlots()
     const ahrJob = (await put(AHR_DOOR, BASE_ONLY)).json() as JobAccepted
     const claims = (queue() as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[] }> }).jobs
-    assert.deepEqual(claims.get(ahrJob.job.id)?.claims.map(c => [c.key, c.mode]), [[`ahr:${VG_UUID}`, 'shared'], ['ahrname:ahr0', 'shared']])
+    assert.deepEqual(claims.get(ahrJob.job.id)?.claims.map(c => [c.key, c.mode]), [
+      ['access:/mnt/anas-ahr/ahr0', 'exclusive'],
+      [`ahr:${VG_UUID}`, 'shared'],
+      ['ahrname:ahr0', 'shared'],
+    ])
     release()
     assert.equal((await finished(ahrJob.job.id)).status, 'completed')
+  })
+
+  it('cr.53 L20: two applies on one directory serialise on the exclusive `access:<dir>` key — the second waits on it and runs after the first — while an apply on another tree runs beside them', async () => {
+    await serve()
+    // A parks at its first in-job command, claims held.
+    parkFirst = true
+    const aId = ((await put(ZFS_DOOR, BASE_ONLY)).json() as JobAccepted).job.id
+    await until(() => parkedJobId === aId, 'the first apply parked')
+    // B: the same directory again. It may not overtake A — it waits named.
+    const bId = ((await put(ZFS_DOOR, BASE_ONLY)).json() as JobAccepted).job.id
+    await until(() => queue().get(bId)?.progress !== null && queue().get(bId)?.progress !== undefined, 'B waits')
+    assert.equal(queue().get(bId)?.status, 'queued')
+    assert.equal(queue().get(bId)?.progress, `waiting for fs.setAccess (job ${aId}) on the permissions of ${ZFS_DOOR.dir}`)
+    assert.deepEqual(calls.filter(c => c.jobId === bId), [], 'the waiting job ran no commands')
+    // C: a different tree — no key shared with A, a free slot — it does NOT wait.
+    const cId = ((await put(AHR_DOOR, BASE_ONLY)).json() as JobAccepted).job.id
+    assert.equal((await finished(cId)).status, 'completed', JSON.stringify(queue().get(cId)?.error))
+    assert.equal(queue().get(aId)?.status, 'running', 'A is still parked — C ran beside it, not behind it')
+    // Let A go: it finishes, then B takes the key and runs — after A's last command.
+    unpark()
+    assert.equal((await finished(aId)).status, 'completed', JSON.stringify(queue().get(aId)?.error))
+    assert.equal((await finished(bId)).status, 'completed', JSON.stringify(queue().get(bId)?.error))
+    const jobIds = calls.map(c => c.jobId)
+    const lastA = jobIds.lastIndexOf(aId)
+    const firstB = jobIds.indexOf(bId)
+    assert.ok(lastA >= 0 && firstB > lastA, `B's first command (${firstB}) comes after A's last (${lastA})`)
   })
 
   it('the recursive confirm leaves no request field out of the signature', () => {

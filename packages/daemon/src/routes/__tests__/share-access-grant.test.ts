@@ -46,13 +46,13 @@ const FIND = '/usr/bin/find'
  * their own st_dev and no mount line).
  */
 function walkOf(root: string, select: string[], action: string[]): string[] {
-  return ['-P', root, ...WALK_XDEV, ...select, '-exec', ...action, '{}', '+']
+  return ['-P', root, ...WALK_XDEV, ...select, '-execdir', ...action, '{}', '+']
 }
 
 /** The walk whose action is `tool` (and whose action arguments pass `pred`). */
 function walkCall(calls: Call[], tool: string, pred: (action: string[]) => boolean = () => true): string[] | undefined {
   return calls.find((c) => {
-    const at = c.args.indexOf('-exec')
+    const at = c.args.indexOf('-execdir')
     return c.command === FIND && at >= 0 && c.args[at + 1] === tool && pred(c.args.slice(at + 2, -2))
   })?.args
 }
@@ -197,8 +197,8 @@ describe('access.1 — the share-path grant', () => {
     assert.equal(find(calls, '/usr/bin/chown', () => true), undefined)
     const spec = 'u::rwx,g::r-x,o::r-x,u:media:rwx,m::rwx'
     assert.deepEqual(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), ['set', '--', 'acltype=posixacl', 'xattr=sa', 'testpool/media'])
-    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', spec, MP])
-    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-d'), ['-d', '--set', spec, MP])
+    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', spec, '--', MP])
+    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-d'), ['-d', '--set', spec, '--', MP])
     // The share itself is written first.
     assert.ok(readFileSync(confPath, 'utf8').includes('[media]'))
   })
@@ -207,7 +207,7 @@ describe('access.1 — the share-path grant', () => {
     const { calls } = start()
     const job = await create({ name: 'media', path: MP, readOnly: true, validUsers: ['media', '@smbusers'], grantAccess: {} })
     assert.equal(grantOf(job)!.status, 'applied')
-    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::r-x,u:media:r-x,g:smbusers:r-x,m::rwx', MP])
+    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::r-x,u:media:r-x,g:smbusers:r-x,m::rwx', '--', MP])
   })
 
   it('share create with guest access gives Everyone the share\'s level (mode bits, no named rows)', async () => {
@@ -217,7 +217,7 @@ describe('access.1 — the share-path grant', () => {
     assert.equal(grant.status, 'applied')
     assert.deepEqual(grant.granted, [{ kind: 'everyone', level: 'read-write' }])
     // 755 → owner rw, group r, everyone rw: a single chmod, no ACL commands.
-    assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['757', MP])
+    assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['757', '--', MP])
     assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
   })
 
@@ -234,7 +234,7 @@ describe('access.1 — the share-path grant', () => {
     // The spec is the plain named grant: alice at rwx, and `o::` stays at the
     // level the folder had (755 → r-x) — compare the guest-only test, where
     // Everyone goes to rwx via chmod 757.
-    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::r-x,u:alice:rwx,m::rwx', MP])
+    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::r-x,u:alice:rwx,m::rwx', '--', MP])
     assert.equal(find(calls, '/usr/bin/chmod', a => a[0] === '757'), undefined, 'Everyone was not raised (no 757 chmod)')
     assert.deepEqual(grant.granted, [{ kind: 'user', name: 'alice', level: 'read-write' }])
     assert.equal(grant.guestNote, GUEST_NOTE)
@@ -246,7 +246,7 @@ describe('access.1 — the share-path grant', () => {
     const grant = grantOf(job)!
     assert.equal(grant.status, 'applied')
     assert.deepEqual(grant.granted, [{ kind: 'everyone', level: 'read-write' }])
-    assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['757', MP])
+    assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['757', '--', MP])
     assert.equal(grant.guestNote, undefined)
   })
 
@@ -255,7 +255,7 @@ describe('access.1 — the share-path grant', () => {
     const job = await create({ name: 'media', path: MP, readOnly: true, validUsers: ['alice', 'media'], grantAccess: {} })
     assert.equal(grantOf(job)!.status, 'applied')
     // Live ACL (server fixture): u::rwx, u:alice:rwx, g::r-x, o::---.
-    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,u:media:r-x,m::rwx', MP])
+    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,u:media:r-x,m::rwx', '--', MP])
     // Already posixacl: no switch flipped.
     assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined)
   })
@@ -296,9 +296,9 @@ describe('access.1 — the share-path grant', () => {
     const job = await createConfirmed({ name: 'media', path: MP, readOnly: true, validUsers: ['media'], grantAccess: { applyToExisting: true } })
     assert.equal(grantOf(job)!.status, 'applied')
     const spec = 'u::rwX,g::r-X,o::r-X,u:media:r-X,m::rwX'
-    assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-b'), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-b', '-m', spec]))
-    assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-d'), walkOf(MP, ['-type', 'd'], ['/usr/bin/setfacl', '-d', '--set', 'u::rwx,g::r-x,o::r-x,u:media:r-x,m::rwx']))
-    assert.deepEqual(walkCall(calls, '/usr/bin/chmod', a => a[0] === 'g+s'), walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s']))
+    assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-P', '-b', '-m', spec, '--']))
+    assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-d')), walkOf(MP, ['-type', 'd'], ['/usr/bin/setfacl', '-P', '-d', '--set', 'u::rwx,g::r-x,o::r-x,u:media:r-x,m::rwx', '--']))
+    assert.deepEqual(walkCall(calls, '/usr/bin/chmod', a => a[0] === 'g+s'), walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s', '--']))
   })
 
   it('share grant applyToExisting on ZFS switches ACLs on for a child dataset under the path first, and lists it (ruling 2026-10-11)', async () => {
@@ -387,7 +387,7 @@ describe('access.1 — the share-path grant', () => {
       assert.equal(grant.status, 'applied', grant.message)
       assert.deepEqual(grant.granted, [{ kind: 'user', name: 'media', level: 'read-write' }])
       // btrfs: native ACLs — the grant is written with no acltype step.
-      assert.ok(find(calls, '/usr/bin/setfacl', a => a[0] === '--set' && a[2] === AHR_MP), 'the ACL was written on the pool mount')
+      assert.ok(find(calls, '/usr/bin/setfacl', a => a[0] === '--set' && a.at(-1) === AHR_MP), 'the ACL was written on the pool mount')
       assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined)
     }
     finally {
@@ -484,7 +484,7 @@ describe('access.1 — the share-path grant', () => {
     const grant = grantOf(job)!
     // The grant RUNS (the principal set changed) — but as a plain named grant.
     assert.equal(grant.status, 'applied', grant.message)
-    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::r-x,u:alice:rwx,m::rwx', MP])
+    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::r-x,u:alice:rwx,m::rwx', '--', MP])
     assert.ok(!grant.granted.some(e => e.kind === 'everyone'), JSON.stringify(grant.granted))
     assert.equal(grant.guestNote, GUEST_NOTE)
   })
@@ -500,7 +500,7 @@ describe('access.1 — the share-path grant', () => {
     const { calls } = start([], MEDIA_SHARE)
     const job = await updateConfirmed('media', { grantAccess: { applyToExisting: true } })
     assert.equal(grantOf(job)!.status, 'applied')
-    assert.ok(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-b'), 'the walk ran')
+    assert.ok(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), 'the walk ran')
   })
 
   it('share edit that removes a principal revokes nothing: the live entry is restated, never stripped', async () => {
@@ -508,7 +508,7 @@ describe('access.1 — the share-path grant', () => {
     const job = await update('media', { validUsers: ['media'], grantAccess: {} })
     assert.equal(grantOf(job)!.status, 'applied')
     // alice is no longer selected but keeps her live rwx entry.
-    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,u:media:rwx,m::rwx', MP])
+    assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,u:media:rwx,m::rwx', '--', MP])
     assert.equal(find(calls, '/usr/bin/setfacl', a => a.includes('-b') || a.includes('-x')), undefined)
   })
 
@@ -580,7 +580,7 @@ describe('access.1 — the share-path grant', () => {
     assert.equal((res.json() as JobAccepted).job.operation, 'fs.setAccess')
     const job = await waitForJob((res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['750', MP])
+    assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['750', '--', MP])
   })
 
   it('nfs export access GET/PUT open the editor on the export path; unknown export → 404', async () => {
@@ -599,7 +599,7 @@ describe('access.1 — the share-path grant', () => {
       assert.equal(put.statusCode, 202)
       const job = await waitForJob((put.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
-      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['media', MP])
+      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['media', '--', MP])
       const missing = await server!.inject({ method: 'GET', url: `/v1/shares/nfs/${encodeURIComponent('/nope')}/access`, headers: IDENTITY_HEADERS })
       assert.equal(missing.statusCode, 404)
     }

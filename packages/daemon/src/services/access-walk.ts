@@ -19,21 +19,43 @@ import { normalizePath } from './nested-filesystems.js'
 //     filesystem), so an action would reach the NFS export's top directory;
 //     every mount below a walk root is therefore also `-prune`d by path
 //     ("-prune True; if the file is a directory, do not descend into it.").
-//   - chown(1) and chmod(1) have no one-filesystem option (`-R` with
-//     `-H`/`-L`/`-P` decides symlinks only), so both are driven from find
-//     with `-exec … {} +`. chown gets `-h` ("affect symbolic links instead of
-//     any referenced file") — what `chown -R` (`-P` "the default") does to a
-//     link it meets. chmod "ignores symbolic links encountered during
-//     recursive directory traversals" but FOLLOWS one named on its command
-//     line, so links are filtered out (`! -type l`) before it.
-//   - setfacl(1) `-R` "Apply operations to all files and directories
-//     recursively" — no mount option either; `-P, --physical` rejects symlink
-//     arguments (an error, not a skip), so setfacl is driven from find too,
-//     with links filtered out: setfacl -R's own default is to "skip symbolic
-//     links encountered in subdirectories".
-//   - `-exec command {} +`: "If any invocation with the `+' form returns a
-//     non-zero value as exit status, then find returns a non-zero exit
-//     status" — a failure still fails the job.
+// Every action runs as `-execdir … {} +`, never `-exec` (review H2,
+// 2026-10-16). `-exec` runs the batch on the full paths collected when find
+// LISTED them; between a listing and the batch a write-capable user can swap
+// a listed DIRECTORY for a symlink (`d -> /etc`), the kernel traverses it
+// when the tool resolves the absolute operand, and the action lands outside
+// the tree — the review's simulation put a named recursive grant on a victim
+// file through exactly that swap. `-execdir` closes the swap at its root:
+// find(1) runs each batch "in the subdirectory that contains the files",
+// reaching that directory through the handle it OPENED during the descent (a
+// renamed or swapped name cannot move an open fd), and every member arrives
+// as `./name` relative to that handle — never as an absolute path, so
+// nothing outside the opened directory is addressable at all. Batches never
+// mix directories ("the set of files passed is always restricted such that
+// they all live under the same directory"), and the `+` form's exit-status
+// rule is unchanged: a failing invocation fails find.
+//
+// The final component gets its no-follow too — each tool in its own way:
+//   - chown(1) `-h, --no-dereference`: "affect … the symbolic link itself
+//     rather than the file to which the link refers" — what `chown -R`'s
+//     default `-P` did to a link it met, and never the referent;
+//   - setfacl(1) `-P, --physical`: do not follow symbolic-link operands —
+//     one is REFUSED (an error, so a swapped-in link fails the job loudly
+//     instead of being followed);
+//   - chmod has no operand no-follow option on Linux (GNU chmod's `-h`
+//     affects only the `-R` traversal — and there is no lchmod here anyway),
+//     so a chmod batch's members are filtered by find's OWN type test,
+//     evaluated per entry ahead of `-execdir`: `! -type l` for the mode and
+//     `g-s` steps, `-type d` for setgid (which under find's `-P` already
+//     excludes links). No chmod invocation can receive a member find typed
+//     as anything but the kind it selects.
+//   - chown(1), chmod(1) and setfacl(1) `-R` have no one-filesystem option,
+//     so all three stay find-driven with `-xdev` and the prunes; none is
+//     ever run with `-R` (that is what crossed mounts).
+//
+// Exit status is unchanged from `-exec … {} +`: "If any invocation with the
+// `+' form returns a non-zero value as exit status, then find returns a
+// non-zero exit status" — a failing action still fails the job.
 //
 // Child ZFS datasets the confirm names are still included: each is a walk
 // root of its own (`-xdev` keeps every root inside its own dataset). Every
@@ -137,8 +159,10 @@ export function walkScopeFrom(
  * The `find` argv for one walk root: `-P` (never follow a link), the start,
  * `-xdev` (a global option, so ahead of every test), the pruned paths, then
  * the selection and the action. `select` filters what the action sees
- * (`! -type l`, `-type d`); `action` is the command and its options, run as
- * `-exec … {} +`.
+ * (`! -type l`, `-type d`) and is what keeps a chmod batch — the one tool
+ * with no operand no-follow — free of every member find did not type in;
+ * `action` is the command and its options, run as `-execdir … {} +` so each
+ * batch executes relative to the directory find opened (H2 — see the header).
  */
 export function walkArgs(root: WalkRoot, select: string[], action: string[]): string[] {
   const args = ['-P', root.path]
@@ -148,7 +172,7 @@ export function walkArgs(root: WalkRoot, select: string[], action: string[]): st
     const terms = root.prune.flatMap((p, i) => [...(i > 0 ? ['-o'] : []), '-path', findPathPattern(p)])
     args.push('(', ...terms, ')', '-prune', '-o')
   }
-  args.push(...select, '-exec', ...action, '{}', '+')
+  args.push(...select, '-execdir', ...action, '{}', '+')
   return args
 }
 

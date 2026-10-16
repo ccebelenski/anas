@@ -52,13 +52,13 @@ const FIND = '/usr/bin/find'
  * their own st_dev and no mount line).
  */
 function walkOf(root: string, select: string[], action: string[]): string[] {
-  return ['-P', root, ...WALK_XDEV, ...select, '-exec', ...action, '{}', '+']
+  return ['-P', root, ...WALK_XDEV, ...select, '-execdir', ...action, '{}', '+']
 }
 
 /** The walk whose action is `tool` (and whose action arguments pass `pred`). */
 function walkCall(calls: Call[], tool: string, pred: (action: string[]) => boolean = () => true): string[] | undefined {
   return calls.find((c) => {
-    const at = c.args.indexOf('-exec')
+    const at = c.args.indexOf('-execdir')
     return c.command === FIND && at >= 0 && c.args[at + 1] === tool && pred(c.args.slice(at + 2, -2))
   })?.args
 }
@@ -253,7 +253,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       assert.equal((res.json() as JobAccepted).job.operation, 'fs.setAccess')
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
-      assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['750', MP])
+      assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['750', '--', MP])
       assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
       assert.deepEqual((job.result as { pool: string, mountpoint: string }).pool, POOL)
       assertNoAcltypeStep(calls)
@@ -272,7 +272,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(walkCall(calls, '/usr/bin/chmod'), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX']))
+      assert.deepEqual(walkCall(calls, '/usr/bin/chmod'), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX', '--']))
       assertNoAcltypeStep(calls)
     })
 
@@ -289,7 +289,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       ] })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx', MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx', '--', MP])
     })
   })
 
@@ -309,9 +309,9 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       // Native ACLs: nothing to auto-enable.
       assert.equal((job.result as { aclAutoEnabled: boolean }).aclAutoEnabled, false)
       const spec = 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx'
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', spec, MP])
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-d'), ['-d', '--set', spec, MP])
-      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), ['g+s', MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', spec, '--', MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-d'), ['-d', '--set', spec, '--', MP])
+      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), ['g+s', '--', MP])
       assertNoAcltypeStep(calls)
     })
 
@@ -339,9 +339,9 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
       assert.equal((job.result as { clearedNamed: boolean }).clearedNamed, true)
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), ['-b', '-k', MP])
-      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g-s')), ['g-s', MP])
-      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('755')), ['755', MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), ['-b', '-k', '--', MP])
+      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g-s')), ['g-s', '--', MP])
+      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('755')), ['755', '--', MP])
     })
 
     it('ahr recursive clear folds the setgid drop into a single chmod walk', async () => {
@@ -354,10 +354,10 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       ] })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-b', '-k']))
+      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-P', '-b', '-k', '--']))
       const chmodWalks = calls.filter(c => c.command === FIND && c.args.includes('/usr/bin/chmod'))
       assert.equal(chmodWalks.length, 1)
-      assert.deepEqual(chmodWalks[0].args, walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX,g-s']))
+      assert.deepEqual(chmodWalks[0].args, walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX,g-s', '--']))
     })
 
     it('ahr base-only update with no named entries LEAVES existing named ACLs alone (#37)', async () => {
@@ -371,7 +371,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
       assert.equal(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), undefined)
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx', MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx', '--', MP])
       assert.equal((job.result as { namedCount: number }).namedCount, 1)
     })
 
@@ -381,7 +381,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       const res = await put({ owner: 'media' })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['media', MP])
+      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['media', '--', MP])
       assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
       assert.equal(find(calls, '/usr/bin/chmod', () => true), undefined)
     })
@@ -404,11 +404,11 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(walkCall(calls, '/usr/bin/chown'), walkOf(MP, [], ['/usr/bin/chown', '-h', 'media']))
+      assert.deepEqual(walkCall(calls, '/usr/bin/chown'), walkOf(MP, [], ['/usr/bin/chown', '-h', 'media', '--']))
       const spec = 'u::rwX,g::r-X,o::r-X,u:alice:r-X,m::rwX'
-      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-b'), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-b', '-m', spec]))
-      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a[0] === '-d'), walkOf(MP, ['-type', 'd'], ['/usr/bin/setfacl', '-d', '--set', 'u::rwx,g::r-x,o::r-x,u:alice:r-x,m::rwx']))
-      assert.deepEqual(walkCall(calls, '/usr/bin/chmod', a => a[0] === 'g+s'), walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s']))
+      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-P', '-b', '-m', spec, '--']))
+      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-d')), walkOf(MP, ['-type', 'd'], ['/usr/bin/setfacl', '-P', '-d', '--set', 'u::rwx,g::r-x,o::r-x,u:alice:r-x,m::rwx', '--']))
+      assert.deepEqual(walkCall(calls, '/usr/bin/chmod', a => a[0] === 'g+s'), walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s', '--']))
       // btrfs: no -xdev, so every subvolume under @data is still swept (nf.1).
       assert.equal(calls.some(c => c.command === FIND && c.args.includes('-xdev')), false)
       assert.equal(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), undefined, 'no chmod g+s over the whole tree')
@@ -439,7 +439,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       assert.equal(ok2.statusCode, 202)
       const job = await waitForJob(server, (ok2.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(walkCall(calls, '/usr/bin/chown'), walkOf(MP, [], ['/usr/bin/chown', '-h', 'media']))
+      assert.deepEqual(walkCall(calls, '/usr/bin/chown'), walkOf(MP, [], ['/usr/bin/chown', '-h', 'media', '--']))
     })
 
     it('ahr applyToExisting is refused when a PVE storage path sits inside the tree; the flat change is not', async () => {
