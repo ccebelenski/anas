@@ -143,10 +143,6 @@ function buildSetPairs(p: UpdateDatasetPropertiesRequest['properties']): string[
     pairs.push(`readonly=${p.readonly ? 'on' : 'off'}`)
   if (p.dedup !== undefined)
     pairs.push(`dedup=${p.dedup}`)
-  // cr.52 (review H1): the property-set door gains the mountpoint property that
-  // create always carried — `zfs set mountpoint=<path>`, guarded like create's.
-  if (p.mountpoint !== undefined)
-    pairs.push(`mountpoint=${p.mountpoint}`)
   // Volumes only (story iscsi.3). No 0 -> 'none' mapping: `volsize` has no such
   // value, and the schema's 1 MiB floor means a blanked field is a 400 at the
   // boundary rather than a `volsize=0` that ZFS would refuse mid-apply (#43).
@@ -1172,7 +1168,7 @@ export async function datasetRoutes(
       if (!o.row)
         return null
       if (o.row.type === 'volume') {
-        const notOnVolume = (['recordsize', 'quota', 'refquota', 'atime', 'mountpoint'] as const).filter(k => props[k] !== undefined)
+        const notOnVolume = (['recordsize', 'quota', 'refquota', 'atime'] as const).filter(k => props[k] !== undefined)
         return notOnVolume.length > 0
           ? invalid(`'${o.name}' is a volume; ${notOnVolume.join(', ')} ${notOnVolume.length > 1 ? 'are filesystem properties' : 'is a filesystem property'} and ZFS does not carry ${notOnVolume.length > 1 ? 'them' : 'it'} on a volume`)
           : null
@@ -1202,9 +1198,7 @@ export async function datasetRoutes(
     return {
       operation: 'zfs.set',
       object: datasetView(poolName, fullName, nameId('dataset', fullName)),
-      // cr.52 (review H1): once `mountpoint` is settable here its value runs
-      // the one shared system-path refusal, at the route and in the job.
-      gates: [listedGate(false, 'set'), ownedGate<DatasetObject>(o => o.name), mountTargetGate<DatasetObject>(props.mountpoint), propertyKindGate(props), shrinkGate(props)],
+      gates: [listedGate(false, 'set'), ownedGate<DatasetObject>(o => o.name), propertyKindGate(props), shrinkGate(props)],
       // cr.37 review (P1): shrinkGate's held-LUN read is the same fail-open
       // read destroy's is — disclose an unreadable LIO tree the same way.
       advisories: (_o, reads) => lioUnreadableDisclosure(reads),

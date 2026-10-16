@@ -17,7 +17,7 @@ import { serveBlankInventoryDisks } from './inventory-stub.js'
 /**
  * Story cr.52 (review H1 + L4's daemon half): ONE shared `mountTargetRefusal`
  * at EVERY door that sets a mountpoint — remote mount, pool create and
- * mountpoint change, dataset create and property set, AHR create and
+ * mountpoint change, dataset create, AHR create and
  * mountpoint — asked at the route AND in the job, answering 409 CONFLICT with
  * the one reason `system-mount-target`. Probes over the REAL routes and the
  * fake executor: every refused door refuses, a planted symlink in the parent
@@ -230,19 +230,13 @@ describe('cr.52 — one shared mountTargetRefusal at every mountpoint door', () 
     })
   })
 
-  // --- Dataset create and property set -------------------------------------
+  // --- Dataset create ------------------------------------------------------
   describe('dataset doors', () => {
     const createDataset = (mountpoint: string) => server!.inject({
       method: 'POST',
       url: '/v1/pools/testpool/datasets',
       headers: JSON_HEADERS,
       payload: JSON.stringify({ path: 'cr52probe', properties: { mountpoint } }),
-    })
-    const setProperty = (mountpoint: string) => server!.inject({
-      method: 'PUT',
-      url: '/v1/pools/testpool/datasets/media',
-      headers: JSON_HEADERS,
-      payload: JSON.stringify({ properties: { mountpoint } }),
     })
 
     it('dataset create with mountpoint=/usr/bin → 409, no zfs create (H1 probe line)', async () => {
@@ -264,28 +258,6 @@ describe('cr.52 — one shared mountTargetRefusal at every mountpoint door', () 
       assert.ok(createArgs?.includes('mountpoint=/srv/cr52-legal'), JSON.stringify(createArgs))
     })
 
-    it('dataset property set of mountpoint=/usr/bin → 409, no zfs set', async () => {
-      server = createServer({ mock: true, logger: false })
-      const calls = spyExecutor(server)
-      const message = refusalIs(await setProperty('/usr/bin'))
-      assert.match(message, /system path/)
-      assert.ok(!calls.some(c => c.command === ZFS && c.args[0] === 'set'), 'no zfs set')
-    })
-
-    it('dataset property set of a legal /srv mountpoint still 202s and sets the pair', async () => {
-      server = createServer({ mock: true, logger: false })
-      const calls = spyExecutor(server)
-      const res = await setProperty('/srv/cr52-propset')
-      assert.equal(res.statusCode, 202, res.body)
-      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
-      assert.equal(job.status, 'completed', JSON.stringify(job.error))
-      const setArgs = calls.find(c => c.command === ZFS && c.args[0] === 'set')?.args
-      assert.ok(setArgs?.includes('mountpoint=/srv/cr52-propset'), JSON.stringify(setArgs))
-    })
-  })
-
-  // --- AHR create and mountpoint change ------------------------------------
-  describe('AHR doors', () => {
     it('AHR create at /etc → 409 before any disk is touched', async () => {
       server = createServer({ mock: true, logger: false })
       const calls = spyExecutor(server)
