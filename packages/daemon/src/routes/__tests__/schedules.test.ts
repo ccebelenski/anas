@@ -145,6 +145,17 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     assert.match(res.json().error.message, /Invalid snapshot schedule/)
   })
 
+  // cr.51 / review C1: the reviewer's end-to-end proof — a newline in the name
+  // reached the unit's Description= and forged an ExecStartPre= directive run
+  // as root. The schema (SingleLine) now answers 400 with its sentence, and no
+  // unit file is ever written.
+  it('POST a name with a newline → 400, no unit written', async () => {
+    const res = await create({ ...SCHEDULE, name: 'x\n[Service]\nExecStartPre=/bin/touch /root/pwned' })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /Control characters are not allowed/)
+    assert.deepEqual(await readdir(dir), [])
+  })
+
   it('POST onto a non-existent pool → 400', async () => {
     const res = await create({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'ghost/media' } })
     assert.equal(res.statusCode, 400)

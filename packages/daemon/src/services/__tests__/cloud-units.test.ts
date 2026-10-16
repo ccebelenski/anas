@@ -133,6 +133,36 @@ describe('cloud sync units (rclone.2)', () => {
     })
   })
 
+  // cr.51 (defensive — the cloud name is a BackupName slug and the schedule a
+  // SingleLine today): the unit file is a boundary in its own right, so the
+  // writer refuses control characters exactly like the snapshot writer's C1 fix.
+  describe('unit injection refused (cr.51)', () => {
+    const evil = { ...TASK, name: 'x\n[Service]\nExecStartPre=/bin/touch /root/pwned' } as CloudSyncTask
+
+    it('both renderers throw on an injected name', () => {
+      assert.throws(() => renderServiceUnit(evil), /control characters/)
+      assert.throws(() => renderTimerUnit(evil), /control characters/)
+    })
+
+    it('a raw-schedule expression with a newline throws from the timer renderer', () => {
+      const evilSchedule = { ...TASK, schedule: 'daily\nExecStartPre=/bin/touch /root/pwned' } as CloudSyncTask
+      assert.throws(() => renderTimerUnit(evilSchedule), /control characters/)
+    })
+
+    it('writeTaskUnits with an injected name writes NOTHING', async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'anas-cloudunits-evil-'))
+      try {
+        const mock = systemctlMock()
+        await assert.rejects(() => writeTaskUnits(mock, dir, evil), /control characters/)
+        assert.deepEqual(await readdir(dir), [])
+        assert.deepEqual(mock.calls, [])
+      }
+      finally {
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
+  })
+
   describe('parse (the marker is the only source of truth)', () => {
     it('round-trips every field of a task through the unit text', () => {
       const parsed = parseServiceUnit(renderServiceUnit(TASK))

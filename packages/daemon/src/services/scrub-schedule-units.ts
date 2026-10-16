@@ -6,7 +6,7 @@ import { AhrScrubSchedule as AhrScrubScheduleSchema } from '@anas/shared'
 import { parseSystemdTimestamp } from './systemd-status.js'
 // The unit-store plumbing (marker parse, unlink, systemctl) is the ONE shared
 // copy in systemd-unit-store.ts — this store was its fourth hand-copy.
-import { parseMarkedJson, readUnitFile, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
+import { parseMarkedJson, quoteExecArg, readUnitFile, refuseControlChars, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
 import { readTimerNextRaw } from './unit-run-status.js'
 
 /**
@@ -128,7 +128,11 @@ export function scrubCadenceToOnCalendar(cadence: ScrubCadence): string {
  * actually run and is never parsed by us.
  */
 export function renderScrubServiceUnit(schedule: AhrScrubSchedule): string {
-  const execStart = [RUNNER_NODE, RUNNER_SCRIPT, ...schedule.pools].join(' ')
+  // cr.51 defensive mirror of the snapshot writer's C1 guard: every pool is an
+  // ExecStart token and the cadence lands in the Description. Both are a slug /
+  // closed enum today, but the unit file is a boundary in its own right.
+  refuseControlChars(schedule.cadence, 'scrub cadence')
+  const execStart = [RUNNER_NODE, RUNNER_SCRIPT, ...schedule.pools.map(quoteExecArg)].join(' ')
   return [
     '[Unit]',
     `Description=ANAS periodic AHR scrub (${schedule.cadence}) — md parity, then btrfs checksums`,
@@ -150,6 +154,7 @@ export function renderScrubServiceUnit(schedule: AhrScrubSchedule): string {
  * `removeScrubUnits`.
  */
 export function renderScrubTimerUnit(schedule: AhrScrubSchedule): string {
+  refuseControlChars(schedule.cadence, 'scrub cadence')
   return [
     '[Unit]',
     'Description=ANAS periodic AHR scrub timer',
@@ -235,14 +240,18 @@ export async function writeScrubUnits(
       + 'not an ANAS unit; ANAS will not overwrite it',
     )
   }
+  // Render BOTH before touching anything (cr.51): an injection refusal must
+  // leave the unit dir exactly as it was — no write, no rollback dance.
+  const service = renderScrubServiceUnit(schedule)
+  const timer = renderScrubTimerUnit(schedule)
   const timerWasEnabled = await readScrubTimerEnabled(executor)
   const previous = {
     [SCRUB_SERVICE_NAME]: await readUnitFile(dir, SCRUB_SERVICE_NAME),
     [SCRUB_TIMER_NAME]: await readUnitFile(dir, SCRUB_TIMER_NAME),
   }
   try {
-    await writeFile(join(dir, SCRUB_SERVICE_NAME), renderScrubServiceUnit(schedule), 'utf-8')
-    await writeFile(join(dir, SCRUB_TIMER_NAME), renderScrubTimerUnit(schedule), 'utf-8')
+    await writeFile(join(dir, SCRUB_SERVICE_NAME), service, 'utf-8')
+    await writeFile(join(dir, SCRUB_TIMER_NAME), timer, 'utf-8')
     await runSystemctl(executor, ['daemon-reload'])
     await runSystemctl(executor, ['enable', '--now', SCRUB_TIMER_NAME])
   }

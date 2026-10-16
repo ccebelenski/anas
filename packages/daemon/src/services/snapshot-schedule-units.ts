@@ -9,6 +9,8 @@ import { DISABLED_HISTORY_NOTE } from './systemd-status.js'
 import {
   listServiceUnitsChecked,
   parseMarkedJson,
+  quoteExecArg,
+  refuseControlChars,
   runSystemctl,
   systemdTimersStampDir,
   unlinkQuiet,
@@ -111,9 +113,18 @@ export function runnerArgs(schedule: SnapshotSchedule): string[] {
  * schedule JSON (single line) — the ONLY thing the parser reads back. ExecStart
  * is for systemd to actually run; it is never parsed by us. `Environment=TZ=UTC`
  * matches the snapshot naming's UTC stamp so a fire's clock is unambiguous.
+ *
+ * Injection refusal (cr.51 / review C1): every interpolated value is asked
+ * before anything is rendered. `name` lands in `Description=` (systemd merges
+ * repeated sections, so a newline there forges a directive — the C1 proof ran
+ * `ExecStartPre=` as root); `id` lands in ExecStart via {@link quoteExecArg}.
+ * The marker JSON is safe by construction (`JSON.stringify` escapes every
+ * control character onto its one line), and `cadence` is a closed enum mapped
+ * to fixed calendar strings — no free text reaches `OnCalendar=`.
  */
 export function renderServiceUnit(schedule: SnapshotSchedule): string {
-  const execStart = [RUNNER_NODE, RUNNER_SCRIPT, ...runnerArgs(schedule)].join(' ')
+  refuseControlChars(schedule.name, 'schedule name')
+  const execStart = [RUNNER_NODE, RUNNER_SCRIPT, ...runnerArgs(schedule).map(quoteExecArg)].join(' ')
   // An EMPTY exclude list is the plain `-r` and is stored as no list at all, so
   // a recursive schedule saved by a UI that always sends the key (`[]` when
   // none) keeps a unit byte-identical to one that never had the field.
@@ -132,8 +143,9 @@ export function renderServiceUnit(schedule: SnapshotSchedule): string {
   ].join('\n')
 }
 
-/** Render the `.timer` unit for a schedule's cadence. */
+/** Render the `.timer` unit for a schedule's cadence (same name refusal — cr.51). */
 export function renderTimerUnit(schedule: SnapshotSchedule): string {
+  refuseControlChars(schedule.name, 'schedule name')
   return [
     '[Unit]',
     `Description=ANAS snapshot timer ${schedule.name}`,
@@ -239,8 +251,12 @@ export async function writeScheduleUnits(
   dir: string,
   schedule: SnapshotSchedule,
 ): Promise<void> {
-  await writeFile(join(dir, serviceUnitName(schedule.id)), renderServiceUnit(schedule), 'utf-8')
-  await writeFile(join(dir, timerUnitName(schedule.id)), renderTimerUnit(schedule), 'utf-8')
+  // Render BOTH before writing anything (cr.51): a refusal must leave the unit
+  // dir exactly as it was — no half-written pair.
+  const serviceText = renderServiceUnit(schedule)
+  const timerText = renderTimerUnit(schedule)
+  await writeFile(join(dir, serviceUnitName(schedule.id)), serviceText, 'utf-8')
+  await writeFile(join(dir, timerUnitName(schedule.id)), timerText, 'utf-8')
 
   await runSystemctl(executor, ['daemon-reload'])
   const timer = timerUnitName(schedule.id)

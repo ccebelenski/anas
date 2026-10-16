@@ -2,6 +2,7 @@ import type { ZodType } from 'zod'
 import type { CommandExecutor } from '../executor/types.js'
 import { readdir, readFile, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
+import { hasControlChars } from '@anas/shared'
 
 /**
  * The ONE systemd unit-store helper module — the plumbing every ANAS unit-store
@@ -55,6 +56,39 @@ export function parseMarkedJson<T>(content: string, marker: string, schema: ZodT
     }
   }
   return null
+}
+
+// --- Injection guards (cr.51 / review C1) ------------------------------------
+
+/**
+ * Refuse a value that would break out of its unit line. A control character in
+ * ANY interpolated value (a `Description=`, an `ExecStart=` token) ends that
+ * line and forges the next one — systemd merges repeated sections, so a
+ * newline in a task/schedule name injects a directive (`ExecStartPre=`) the
+ * daemon then runs as root. The shared schemas forbid such values at the
+ * boundary; the unit file is a security boundary in its own right, so every
+ * writer asks again before rendering. Throws — the caller writes NOTHING.
+ */
+export function refuseControlChars(value: string, field: string): void {
+  if (hasControlChars(value))
+    throw new Error(`Unit ${field} must not contain control characters (newline, carriage return, NUL, …)`)
+}
+
+const WHITESPACE_RE = /\s/
+const DQUOTE_RE = /"/g
+
+/**
+ * Quote an ExecStart token so systemd's own splitter round-trips it (empty
+ * strings and any whitespace get double-quoted; ZFS/pool names are otherwise
+ * quote-free). The control-character refusal (cr.51, was replication's
+ * private `quoteExecArg`) covers NUL and TAB too — exactly what the shared
+ * schemas reject, so the writer and the schema draw the same line.
+ */
+export function quoteExecArg(a: string): string {
+  refuseControlChars(a, 'ExecStart argument')
+  if (a === '' || WHITESPACE_RE.test(a))
+    return `"${a.replace(DQUOTE_RE, '\\"')}"`
+  return a
 }
 
 /** Read one unit file as utf-8 text; null when absent or unreadable. */

@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { DatasetPath, ISODateTime, NotifyMode, PoolName } from './common.js'
+import { DatasetPath, ISODateTime, NotifyMode, PoolName, SingleLine } from './common.js'
 import { ScanFunction } from './zfs.js'
 
 // ============================================================================
@@ -101,8 +101,14 @@ export type ScheduleId = z.infer<typeof ScheduleId>
 export const SnapshotSchedule = z.object({
   /** Stable identifier (also the systemd unit instance name, later stage). */
   id: ScheduleId,
-  /** Human label shown in the grid. */
-  name: z.string().min(1),
+  /**
+   * Human label shown in the grid. `SingleLine` (cr.51/C1): the name is
+   * interpolated into the `Description=` line of the schedule's service AND
+   * timer units, and systemd merges repeated sections — a newline in the name
+   * would forge an extra directive (an `ExecStartPre=` run as root). No control
+   * characters; spaces and printable text stay legal.
+   */
+  name: SingleLine.min(1),
   target: SnapshotTarget,
   /** How often a snapshot is taken (placeholder descriptor — see SnapshotCadence). */
   cadence: SnapshotCadence,
@@ -176,8 +182,14 @@ export type SnapshotSource = z.infer<typeof SnapshotSource>
  * for an `other` snapshot `bucket` is null (it belongs to no ANAS period).
  */
 export const ScheduledSnapshot = z.object({
-  /** Snapshot label (ZFS: the part after `@`; AHR: the `@snapshots/` child name). */
-  name: z.string().min(1),
+  /**
+   * Snapshot label (ZFS: the part after `@`; AHR: the `@snapshots/` child
+   * name). `SingleLine` (cr.51, defensive like the schedule name above): the
+   * label rides line-based plumbing (run results, journald lines, unit text),
+   * and a control character there forges a line. ZFS labels cannot contain one
+   * anyway (`[\w:.-]+` at the filesystem); this fences the AHR side too.
+   */
+  name: SingleLine.min(1),
   target: SnapshotTarget,
   /** ANAS retention period from the name, or null for `other` snapshots. */
   bucket: RetentionBucket.nullable(),

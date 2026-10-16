@@ -17,6 +17,7 @@ import { DISABLED_HISTORY_NOTE, parseSystemdTimestamp } from './systemd-status.j
 // parse, dir read, write + enable/disable). What stays HERE is what is
 // genuinely cloud sync's — the unit TEXT this store renders and the
 // CloudSyncTask schema it parses back.
+import { quoteExecArg, refuseControlChars } from './systemd-unit-store.js'
 import {
   buildTaskWarnings,
   clearCancelledRunFailedState as clearCancelledRunFailedStateGeneric,
@@ -134,7 +135,10 @@ export function runnerArgs(task: { name: string }): string[] {
  * nobody needs is a knob nobody should be able to set.
  */
 export function renderServiceUnit(task: CloudSyncTask): string {
-  const execStart = [RUNNER_NODE, CLOUD_UNIT_KIND.runnerScript, ...runnerArgs(task)].join(' ')
+  // cr.51 defensive mirror of the snapshot writer's C1 guard: the name is a
+  // slug today (BackupName), but the unit file is a boundary in its own right.
+  refuseControlChars(task.name, 'task name')
+  const execStart = [RUNNER_NODE, CLOUD_UNIT_KIND.runnerScript, ...runnerArgs(task).map(quoteExecArg)].join(' ')
   return [
     '[Unit]',
     `Description=ANAS cloud sync task ${task.name}`,
@@ -160,12 +164,17 @@ export function effectiveSchedule(task: CloudSyncTask): string {
 
 /** Render the `.timer` unit for a task's schedule. */
 export function renderTimerUnit(task: CloudSyncTask): string {
+  // cr.51: name and the raw-schedule expression both land on their own lines;
+  // the schema keeps them single-line, the writer asks again.
+  refuseControlChars(task.name, 'task name')
+  const onCalendar = effectiveSchedule(task)
+  refuseControlChars(onCalendar, 'OnCalendar expression')
   return [
     '[Unit]',
     `Description=ANAS cloud sync timer ${task.name}`,
     '',
     '[Timer]',
-    `OnCalendar=${effectiveSchedule(task)}`,
+    `OnCalendar=${onCalendar}`,
     'Persistent=true',
     '',
     '[Install]',

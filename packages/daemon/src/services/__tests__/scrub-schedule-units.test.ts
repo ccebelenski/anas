@@ -116,6 +116,18 @@ describe('scrub schedule units — CRUD lifecycle (temp dir + mocked systemctl)'
     assert.ok(cmds.includes(`enable --now ${SCRUB_TIMER_NAME}`))
   })
 
+  // cr.51 (defensive — pools are PoolName slugs and cadence a closed enum
+  // today): the pool list lands in ExecStart and the cadence in the
+  // Description; the writer refuses control characters like every other one.
+  it('an injected pool name throws and NOTHING is written', async () => {
+    const evil = schedule({ pools: ['ahr0\nExecStartPre=/bin/touch /root/pwned'] })
+    assert.throws(() => renderScrubServiceUnit(evil), /control characters/)
+    await assert.rejects(() => writeScrubUnits(mock, dir, evil), /control characters/)
+    assert.deepEqual(await readdir(dir), [])
+    // The refusal precedes every read, write and systemctl call.
+    assert.deepEqual(mock.calls, [])
+  })
+
   it('removeScrubUnits disables the timer, deletes stamp + both files, resets failed, reloads', async () => {
     // The stamp is systemd's own bookkeeping — a leftover one makes the next
     // enable start the whole scrub immediately (review R10).

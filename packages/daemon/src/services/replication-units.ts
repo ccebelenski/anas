@@ -8,7 +8,7 @@ import { isTransientRunSnapshot } from './snapshot-naming.js'
 // The unit-store plumbing (marker regex, unlink, systemctl, unit-dir listing)
 // is the ONE shared copy in systemd-unit-store.ts — this store was its fourth
 // hand-copy and its last private leftovers (third pass).
-import { listServiceUnitsChecked, markerRegex, readUnitFile, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
+import { listServiceUnitsChecked, markerRegex, quoteExecArg, readUnitFile, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
 import { deriveUnitRunStatus, toSystemdRunResult } from './unit-run-status.js'
 
 /**
@@ -45,8 +45,6 @@ const UNIT_PREFIX = 'anas-repl-'
 export const REPLICATION_UNIT_PREFIX = UNIT_PREFIX
 /** The service-file line that carries the canonical task JSON (as a comment). */
 const TASK_MARKER = 'X-ANAS-Task='
-const WHITESPACE_RE = /\s/
-const DQUOTE_RE = /"/g
 
 /** Default systemd unit directory; overridable (env/dep) for tests. */
 export const DEFAULT_SYSTEMD_DIR = process.env.ANAS_SYSTEMD_DIR ?? '/etc/systemd/system'
@@ -110,26 +108,10 @@ export function runnerArgs(task: ReplicationTask): string[] {
   return args
 }
 
-/**
- * Quote an ExecStart token so systemd's own splitter round-trips it (empty
- *  strings and any whitespace get double-quoted; ZFS/pool names are otherwise
- *  quote-free).
- *
- * Belt-and-suspenders: a newline or carriage return in a token would end the
- * `ExecStart=` line and inject an arbitrary systemd directive. The shared
- * schemas now forbid such values from ever reaching here, but this writer
- * refuses them unconditionally — the unit file is a security boundary in its own
- * right.
- */
-function quoteExecArg(a: string): string {
-  if (a.includes('\n') || a.includes('\r'))
-    throw new Error('ExecStart argument must not contain a newline or carriage return')
-  if (a === '' || WHITESPACE_RE.test(a))
-    return `"${a.replace(DQUOTE_RE, '\\"')}"`
-  return a
-}
-
 // --- Unit rendering ----------------------------------------------------------
+// (The ExecStart quoting + control-character refusal moved to
+// systemd-unit-store.ts `quoteExecArg` — cr.51 lifted it so the snapshot,
+// cloud and scrub writers refuse the same thing the same way.)
 
 /**
  * Render the `.service` unit. The `X-ANAS-Task=` comment embeds the canonical

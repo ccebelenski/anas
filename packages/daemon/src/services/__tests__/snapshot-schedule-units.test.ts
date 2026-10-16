@@ -166,6 +166,27 @@ describe('snapshot schedule units — CRUD lifecycle (temp dir + mocked systemct
     })
   })
 
+  // cr.51 / review C1: the reviewer ran `POST /v1/schedules` with
+  // name = "x\n[Service]\nExecStartPre=/bin/touch /root/pwned" and the written
+  // unit carried the injected directive (systemd merges repeated [Service]
+  // sections) — root code execution when the timer first fires. The schema now
+  // refuses it at the route; this proves the WRITER is a hard boundary too.
+  it('an injected name throws from both renderers and NOTHING is written', async () => {
+    const evil = makeSchedule({ name: 'x\n[Service]\nExecStartPre=/bin/touch /root/pwned' })
+    assert.throws(() => renderServiceUnit(evil), /control characters/)
+    assert.throws(() => renderTimerUnit(evil), /control characters/)
+    await assert.rejects(() => writeScheduleUnits(mock, dir, evil), /control characters/)
+    assert.deepEqual(await readdir(dir), [])
+    // Not one systemctl call either — the refusal precedes every side effect.
+    assert.deepEqual(mock.calls, [])
+    // NUL truncates a unit line in C-land — refused too, as in the schemas.
+    const nul = makeSchedule({ name: 'x\0y' })
+    assert.throws(() => renderServiceUnit(nul), /control characters/)
+    // A CR alone (line-ending spoof) is refused as well.
+    const cr = makeSchedule({ name: 'x\ry' })
+    assert.throws(() => renderTimerUnit(cr), /control characters/)
+  })
+
   it('readAllSchedules parses valid units and skips invalid ones (fail-open)', async () => {
     await writeScheduleUnits(mock, dir, makeSchedule({ id: 'one' }))
     await writeScheduleUnits(mock, dir, makeSchedule({ id: 'two' }))
