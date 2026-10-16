@@ -8,7 +8,7 @@ import { PRUNED_NAMES_PER_DATASET, ScheduleId, SnapshotSchedule } from '@anas/sh
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { guardCheck, guarded, scheduleClaim, sendRefusal } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
-import { loadPveFootprint, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
+import { loadPveFootprint, ownershipRefusal, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { notifyScheduleRun } from '../services/snapshot-notify.js'
 import { effectiveRetention } from '../services/snapshot-retention.js'
 import {
@@ -157,7 +157,10 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       const pve = await pveFootprint()
       const owned = pve.ownershipOf(target.dataset)
       if (owned) {
-        reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `Cannot schedule snapshots of '${target.dataset}' — ${owned.reason}` } })
+        // cr.47b (review of 8ce39eb0): a schedule's target is the same
+        // ownership fact as the snapshot door's — 409 PVE_MANAGED, one answer;
+        // the config-unreadable verdict keeps its 400.
+        reply.send(sendRefusal(reply, ownershipRefusal(owned, `Cannot schedule snapshots of '${target.dataset}' — ${owned.reason}`)))
         return false
       }
       if (!(await zfsDatasetExists(target.dataset))) {
@@ -181,7 +184,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
         const swept = sweepSet({ target, recursive: true, exclude }, descendants)
         const descendant = pve.ownedDescendant(swept, target.dataset)
         if (descendant) {
-          reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: ownedDescendantRefusal('Snapshot schedule', target.dataset, descendant) } })
+          reply.send(sendRefusal(reply, ownershipRefusal(descendant.ownership, ownedDescendantRefusal('Snapshot schedule', target.dataset, descendant))))
           return false
         }
       }

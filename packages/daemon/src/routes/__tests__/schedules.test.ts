@@ -549,7 +549,8 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       try {
         // The sentence names the storage AND the dataset — never "this pool".
         const res = await create({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'testpool' } })
-        assert.equal(res.statusCode, 400)
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.json().error.code, 'PVE_MANAGED')
         const msg = (res.json() as { error: { message: string } }).error.message
         assert.match(msg, /local-zfs/)
         assert.match(msg, /testpool as a storage root/)
@@ -570,7 +571,8 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       process.env.ANAS_STORAGE_CFG = join(cfgdir, 'storage.cfg')
       try {
         const res = await create({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'testpool/vm-100-disk-0' } })
-        assert.equal(res.statusCode, 400)
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.json().error.code, 'PVE_MANAGED')
         const msg = (res.json() as { error: { message: string } }).error.message
         assert.match(msg, /guest volume/)
         assert.match(msg, /testpool\/vm-100-disk-0/)
@@ -600,7 +602,8 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       })
       try {
         const res = await create({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'testpool/x' }, recursive: true })
-        assert.equal(res.statusCode, 400)
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.json().error.code, 'PVE_MANAGED')
         const msg = (res.json() as { error: { message: string } }).error.message
         assert.match(msg, /Snapshot schedule of 'testpool\/x' would include testpool\/x\/data/)
         assert.match(msg, /local-zfs/)
@@ -830,7 +833,8 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       try {
         armTree()
         const res = await create({ ...X, exclude: ['testpool/x/media'] })
-        assert.equal(res.statusCode, 400)
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.json().error.code, 'PVE_MANAGED')
         const msg = res.json().error.message as string
         assert.match(msg, /Snapshot schedule of 'testpool\/x' would include testpool\/x\/data/)
         assert.match(msg, /local-zfs/)
@@ -846,7 +850,8 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
       try {
         armTree()
         const res = await create({ ...X, exclude: ['testpool/x/data/vm-100-disk-0'] })
-        assert.equal(res.statusCode, 400)
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.json().error.code, 'PVE_MANAGED')
         assert.match(res.json().error.message, /would include testpool\/x\/data /)
       }
       finally {
