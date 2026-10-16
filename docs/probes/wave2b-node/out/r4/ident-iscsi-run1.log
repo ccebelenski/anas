@@ -1,0 +1,34 @@
+(node:274962) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:275044) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  1 [integration] › tests/integration/ident-iscsi.spec.ts:202:3 › ident.2 — the served device is the LUN's identity › rename-and-recreate a zvol under a live LUN: resize and delete-with-destroy refuse 409 (52ms)
+  -  2 [integration] › tests/integration/ident-iscsi.spec.ts:241:3 › ident.2 — the served device is the LUN's identity › delete + add within the confirm TTL: replaying the old code is a fresh challenge, never a delete
+  -  3 [integration] › tests/integration/ident-iscsi.spec.ts:279:3 › ident.2 — the served device is the LUN's identity › whole-image restore to a re-created LUN refuses
+
+
+  1) [integration] › tests/integration/ident-iscsi.spec.ts:202:3 › ident.2 — the served device is the LUN's identity › rename-and-recreate a zvol under a live LUN: resize and delete-with-destroy refuse 409 
+
+    Error: {"error":{"code":"CONFLICT","reason":"lio-not-installed","message":"The LIO iSCSI target stack is not present on this node, so nothing can be created: install 'targetcli-fb python3-rtslib-fb' first. The packages enable and start the restore service themselves, and the kernel modules load on the first targetcli call — nothing else has to be arranged."}}
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m202[39m
+    Received: [31m409[39m
+
+      115 |     data: { name: TARGET_NAME, portals: [{ address: STUNT_HOST }], acls: [{ initiatorIqn: DUMMY_INITIATOR }] },
+      116 |   })
+    > 117 |   expect(res.status(), await res.text()).toBe(202)
+          |                                          ^
+      118 |   expect((await awaitJob(ctx, (await res.json()).job.id)).status).toBe('completed')
+      119 |   const iqn = await targetIqn(ctx)
+      120 |   expect(iqn).toBeTruthy()
+        at createTarget (/home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/ident-iscsi.spec.ts:117:42)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/ident-iscsi.spec.ts:203:17
+
+  1 failed
+    [integration] › tests/integration/ident-iscsi.spec.ts:202:3 › ident.2 — the served device is the LUN's identity › rename-and-recreate a zvol under a live LUN: resize and delete-with-destroy refuse 409 
+  2 did not run

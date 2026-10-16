@@ -1,0 +1,14 @@
+(node:250675) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 5 tests using 1 worker
+
+(node:250742) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/datasets-api.spec.ts:66:3 › Dataset read model (4.1–4.4) › GET /pools/testpool/datasets → 200 { data: [] } that includes testpool itself (770ms)
+  ✓  2 [integration] › tests/integration/datasets-api.spec.ts:82:3 › Dataset read model (4.1–4.4) › GET /identity/users → 200 non-empty array including root (430ms)
+  ✓  3 [integration] › tests/integration/datasets-api.spec.ts:98:3 › Dataset read model (4.1–4.4) › GET /identity/groups → 200 non-empty array including root (415ms)
+  ✓  4 [integration] › tests/integration/datasets-api.spec.ts:123:3 › Dataset lifecycle: create → detail → modify → permissions → destroy (4.5–4.8) › full lifecycle through the API, verified against the real system (2.5s)
+  ✓  5 [integration] › tests/integration/datasets-api.spec.ts:229:3 › Dataset destroy with children — plain fails, recursive succeeds (4.8) › a plain destroy of a parent with children fails; ?recursive=true removes the tree (2.0s)
+
+  5 passed (7.0s)

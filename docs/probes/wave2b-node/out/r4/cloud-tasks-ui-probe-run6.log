@@ -1,0 +1,63 @@
+(node:733732) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+(node:733802) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
++74ms SEL rows=0 sel=[]
++1878ms REQ GET /cloud/tasks
++1894ms RES 200 GET /cloud/tasks
++4566ms REQ POST /cloud/tasks
++4664ms RES 202 POST /cloud/tasks
++5171ms REQ GET /jobs/e4484a3e-0efd-404a-bb5b-b89cd0791be3
++5197ms RES 200 GET /jobs/e4484a3e-0efd-404a-bb5b-b89cd0791be3
++9971ms REQ GET /cloud/tasks
++10057ms RES 200 GET /cloud/tasks
++10117ms SEL rows=1 sel=[]
++19971ms REQ GET /cloud/tasks
++20052ms RES 200 GET /cloud/tasks
+  ✘  1 [integration] › tests/integration/cloud-tasks-ui.spec.ts:443:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 1 — create through the wizard: empty-remotes toast, nested note, sync sentence, Copy default, the row lands selected (28.4s)
+
+
+  1) [integration] › tests/integration/cloud-tasks-ui.spec.ts:443:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 1 — create through the wizard: empty-remotes toast, nested note, sync sentence, Copy default, the row lands selected 
+
+    Error: [2mexpect([22m[31mlocator[39m[2m).[22mtoHaveClass[2m([22m[32mexpected[39m[2m)[22m failed
+
+    Locator: locator('.anas-grid-cloud-tasks').locator('.x-grid-row').filter({ has: locator('.x-grid-cell-inner').filter({ hasText: /^pictures-offsite$/ }) }).first().locator('xpath=ancestor::table[1]')
+    Expected pattern: [32m/x-grid-item-selected/[39m
+    Received string:  [31m"x-grid-item"[39m
+    Timeout: 15000ms
+
+    Call log:
+    [2m  - Expect "toHaveClass" with timeout 15000ms[22m
+    [2m  - waiting for locator('.anas-grid-cloud-tasks').locator('.x-grid-row').filter({ has: locator('.x-grid-cell-inner').filter({ hasText: /^pictures-offsite$/ }) }).first().locator('xpath=ancestor::table[1]')[22m
+    [2m    13 × locator resolved to <table cellpadding="0" cellspacing="0" role="presentation" data-recordid="844" class="x-grid-item" data-recordindex="0" id="gridview-1191-record-844" data-boundview="gridview-1191">…</table>[22m
+    [2m       - unexpected value "x-grid-item"[22m
+    [2m    6 × locator resolved to <table cellpadding="0" cellspacing="0" role="presentation" data-recordid="969" class="x-grid-item" data-recordindex="0" id="gridview-1191-record-969" data-boundview="gridview-1191">…</table>[22m
+    [2m      - unexpected value "x-grid-item"[22m
+
+
+      540 |     await expect(row).toBeVisible({ timeout: 45_000 })
+      541 |     await expect(row.locator('xpath=ancestor::table[1]'))
+    > 542 |       .toHaveClass(/x-grid-item-selected/, { timeout: 15_000 })
+          |        ^
+      543 |     await expect(row).toContainText('gt:pictures')
+      544 |
+      545 |     // The stored side of the contract: the task's unit pair exists and
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/cloud-tasks-ui.spec.ts:542:8
+
+    [31mTest timeout of 30000ms exceeded.[39m
+
+    attachment #1: w2b (text/plain) ────────────────────────────────────────────────────────────────
+    probe armed
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    attachment #2: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-tasks-ui-rclone-3-—--429a9-ault-the-row-lands-selected-integration/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-tasks-ui-rclone-3-—--429a9-ault-the-row-lands-selected-integration/error-context.md
+
+  1 failed
+    [integration] › tests/integration/cloud-tasks-ui.spec.ts:443:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 1 — create through the wizard: empty-remotes toast, nested note, sync sentence, Copy default, the row lands selected 

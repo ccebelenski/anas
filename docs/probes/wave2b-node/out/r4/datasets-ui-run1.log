@@ -1,0 +1,14 @@
+(node:258247) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 5 tests using 1 worker
+
+(node:258321) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/datasets-ui.spec.ts:40:3 › ANAS Datasets panel (stunt node) › Datasets renders a native grid containing testpool, with no iframe (2.5s)
+  ✓  2 [integration] › tests/integration/datasets-ui.spec.ts:60:3 › ANAS Datasets panel (stunt node) › the Datasets toolbar exposes create/detail/edit/perms/destroy buttons (1.8s)
+  ✓  3 [integration] › tests/integration/datasets-ui.spec.ts:79:3 › ANAS Datasets panel (stunt node) › selecting an ANAS pool ROOT enables the dataset toolbar (story 3.26) (2.2s)
+  ✓  4 [integration] › tests/integration/datasets-ui.spec.ts:98:3 › ANAS Datasets panel (stunt node) › the Create button opens the .anas-win-dataset-create window (1.9s)
+  ✓  5 [integration] › tests/integration/datasets-ui.spec.ts:124:3 › ANAS dataset create via UI (throwaway dataset) › filling the create window makes the dataset appear on the real system (2.9s)
+
+  5 passed (12.2s)

@@ -1,0 +1,10 @@
+4148f8499823762ae4fbca812cb2985ea5e8a6502530f6a39a51b256529a54f0  /etc/pve/storage.cfg
+  Inside VM: /dev/sde  (by-id: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3)
+  Inside VM: /dev/sdr  (by-id: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT16)
+datapool        zfspool     active          851968             118          851849    0.01%
+datapool
+gtbackup
+gtiscsi
+pvfix
+sysfix
+testpool

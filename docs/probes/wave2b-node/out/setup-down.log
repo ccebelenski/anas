@@ -1,0 +1,13 @@
+
+### tasks, repo
+HTTP 202 0.040599
+{"job":{"id":"ff71b95c-7a13-4c83-8218-b366ecaf804c","status":"running","operation":"backup.task.remove","createdAt":"2026-10-16T06:02:58.139Z","createdBy":"root@pam"}}
+[t+0s] completed |  | {"removed": "w2bt4"} | 
+HTTP 202 0.026143
+{"job":{"id":"bce3968d-700b-47e9-b922-ae53218912a8","status":"running","operation":"backup.repo.remove","createdAt":"2026-10-16T06:02:58.898Z","createdBy":"root@pam"}}
+[t+0s] completed |  | {"removed": "w2bbh", "version": 5} | 
+
+### dataset
+[t+1s] completed |  | {"destroyed": "gtbackup/w2bsrc"} | 
+gtbackup
+no w2b units

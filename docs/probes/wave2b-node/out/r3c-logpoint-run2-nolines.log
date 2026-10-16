@@ -1,0 +1,26 @@
+            const unlocked = unlockedSourcesLine(source.unlocked);
+            if (unlocked)
+                updateProgress(`backup task '${name}': ${unlocked}`);
+1
+{"breakpointId":"2:1082:0:routes/backup\\.js$","locations":[{"scriptId":"151","lineNumber":1082,"columnNumber":12}]}
+
+### [R] direct run of w2bt4 over the socket
+submit: {"job":{"id":"23368bf9-4893-4361-8599-e89dea87e530","status":"running","operation":"backup.task.run","createdAt"
+job 23368bf9-4893-4361-8599-e89dea87e530 ended
+
+### [A] direct run of w2bt4 over the socket
+submit: {"job":{"id":"fe96ab33-a0bb-4747-b689-9328ca35db1b","status":"running","operation":"backup.task.run","createdAt"
+job fe96ab33-a0bb-4747-b689-9328ca35db1b ended
+bind mount removed
+
+### [B] direct run of w2bt4 over the socket
+submit: {"job":{"id":"9b0ef978-38a7-4963-a926-3eb7b56623ed","status":"running","operation":"backup.task.run","createdAt"
+job 9b0ef978-38a7-4963-a926-3eb7b56623ed ended
+bind mount removed
+bab911d1970826c6  /usr/sbin/mdadm
+bab911d1970826c6  /var/tmp/w2b/mdadm.real
+
+### the logpoint's journal lines (R, A, B in order)
+(no W2B-LOGPOINT line in the anasd journal)
+{"breakpointId":"2:1082:0:routes/backup\\.js$","locations":[{"scriptId":"151","lineNumber":1082,"columnNumber":12}]}
+logpoint removed

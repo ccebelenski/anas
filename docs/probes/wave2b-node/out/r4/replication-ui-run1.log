@@ -1,0 +1,16 @@
+(node:315806) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 7 tests using 1 worker
+
+(node:316108) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/replication-ui.spec.ts:115:3 › ANAS replication view — grid, toolbar, once dialog (stunt node) › menu shows Replication; grid + toolbar render (2.1s)
+  ✓  2 [integration] › tests/integration/replication-ui.spec.ts:127:3 › ANAS replication view — grid, toolbar, once dialog (stunt node) › the Replicate Once dialog opens, source is pickable, plan resolves (5.6s)
+  ✓  3 [integration] › tests/integration/replication-ui.spec.ts:158:3 › ANAS replication view — grid, toolbar, once dialog (stunt node) › the Datasets view carries NO replication surface (1.9s)
+  ✓  4 [integration] › tests/integration/replication-ui.spec.ts:196:3 › ANAS Replicate Once runs a send | recv job (stunt node) › replicating share1 into testpool/replspec materialises the dataset (6.6s)
+  ✓  5 [integration] › tests/integration/replication-ui.spec.ts:262:3 › ANAS replication task CRUD (stunt node) › create a task, see its row, then delete it (8.8s)
+  ✓  6 [integration] › tests/integration/replication-ui.spec.ts:377:3 › ANAS replication Remotes manager (stunt node) › the Remotes manager opens and shows the cluster public key (2.3s)
+  ✓  7 [integration] › tests/integration/replication-ui.spec.ts:435:3 › ANAS self-remote replication E2E (stunt node) › register selfbox via the wizard, then Replicate Once to it (14.9s)
+
+  7 passed (43.5s)

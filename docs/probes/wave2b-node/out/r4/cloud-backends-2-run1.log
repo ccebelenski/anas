@@ -1,0 +1,27 @@
+(node:107503) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:107571) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/cloud-backends-2.spec.ts:316:5 › cloud sync live proofs over emulated stores and an encrypted wrapper (cloudproof.2) › azure — create, Test ok, copy run lands 12 files (verified through the backend), sync run deletes, wrong-credential verdict, remove-guard (33.0s)
+  ✓  2 [integration] › tests/integration/cloud-backends-2.spec.ts:316:5 › cloud sync live proofs over emulated stores and an encrypted wrapper (cloudproof.2) › gcs — create, Test ok, copy run lands 12 files (verified through the backend), sync run deletes, wrong-credential verdict, remove-guard (32.1s)
+=== cloud backends fixture — down azure ===
+✓ anas-gt-azure stopped and gone
+✓ /opt/anas-test/azurite-data removed (the npm tree /opt/anas-test/azurite stays)
+✓ no leftover azurite process
+✓ /var/tmp/anas-gtcloud-src removed
+=== cloud backends fixture — down gcs ===
+✓ anas-gt-gcs stopped and gone
+✓ /opt/anas-test/gcs-data removed (the binary /opt/anas-test/fake-gcs-server/fake-gcs-server stays)
+✓ no leftover fake-gcs-server process
+✓ /var/tmp/anas-gtcloud-src removed
+=== cloud backends fixture — down crypt ===
+✓ gtcryptsftp removed (with its home)
+✓ /var/tmp/anas-gtcrypt removed
+✓ /var/tmp/anas-gtcloud-src removed
+
+  ✓  3 [integration] › tests/integration/cloud-backends-2.spec.ts:316:5 › cloud sync live proofs over emulated stores and an encrypted wrapper (cloudproof.2) › crypt — create, Test ok, copy run lands 12 files (verified through the backend), sync run deletes, wrong-credential verdict, remove-guard (36.6s)
+
+  3 passed (2.0m)

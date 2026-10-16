@@ -1,0 +1,4 @@
+pool-composer.spec.ts rc=0 12s  2 passed (11.6s);
+pools-act-api.spec.ts rc=0 29s  9 passed (28.1s);
+pools-act-ui.spec.ts rc=0 20s  6 passed (18.7s);
+pve-managed-pools.spec.ts rc=0 11s  3 passed (10.3s);

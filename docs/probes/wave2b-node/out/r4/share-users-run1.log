@@ -1,0 +1,12 @@
+(node:348717) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:348785) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/share-users.spec.ts:87:3 › ANAS Share Users view (stunt node) › renders both grids, lists real login users, and hides service accounts (2.1s)
+  ✓  2 [integration] › tests/integration/share-users.spec.ts:113:3 › ANAS Share Users view (stunt node) › per-selection actions are disabled until a LOCAL user is selected (1.7s)
+  ✓  3 [integration] › tests/integration/share-users.spec.ts:162:3 › ANAS Share Users create → SMB password → group → disable via UI › creates a group, then a user with SMB password + that group, disables/enables it, and re-sets its SMB password (11.4s)
+
+  3 passed (16.2s)

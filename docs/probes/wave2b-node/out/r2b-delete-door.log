@@ -1,0 +1,113 @@
+
+### A — w2bt2: a unit systemd cannot load (ExecStart= removed)
+[Unit]
+Description=ANAS backup task w2bt2
+# X-ANAS-Task={"name":"w2bt2","repository":"w2bbh","backupId":"w2bt2","archives":[{"name":"w2bdata","path":"/gtbackup/w2bsrc","excludes":[]}],"changeDetectionMode":"default","notify":"on-failure","schedule":"2030-01-01 00:00:00","enabled":true,"limitNofile":1024}
+
+[Service]
+Type=oneshot
+# per-task file-handle backpressure (pbc hoards fds, worst in metadata mode)
+LimitNOFILE=1024
+# a deliberate skip (biweekly off week) is a success, not a failure
+SuccessExitStatus=75
+LoadState=bad-setting
+ActiveState=inactive
+LoadError=org.freedesktop.systemd1.BadUnitSetting "Unit anas-backup-w2bt2.service has a bad unit file setting."
+exit 0
+
+### GET /backup/tasks (names)
+HTTP 200 0.056312
+['w2bt1', 'w2bt2', 'w2bt3']
+warnings: None
+
+### GET /backup/tasks/w2bt2
+HTTP 200 0.054029
+{"data":{"task":{"name":"w2bt2","repository":"w2bbh","backupId":"w2bt2","archives":[{"name":"w2bdata","path":"/gtbackup/w2bsrc","excludes":[]}],"changeDetectionMode":"default","notify":"on-failure","schedule":"2030-01-01 00:00:00","enabled":true,"limitNofile":1024,"legacyImgArchives":false,"datastore":"w2bnone"},"lastRunResult":"never-run","lastRunAt":null,"nextRunAt":"2030-01-01T00:00:00.000Z","o
+-rw-r--r-- 1 root root  596 Oct 16 05:44 anas-backup-w2bt1.service
+-rw-r--r-- 1 root root  133 Oct 16 05:44 anas-backup-w2bt1.timer
+-rw-r--r-- 1 root root  513 Oct 16 05:44 anas-backup-w2bt2.service
+-rw-r--r-- 1 root root  133 Oct 16 05:44 anas-backup-w2bt2.timer
+-rw-r--r-- 1 root root  596 Oct 16 05:44 anas-backup-w2bt3.service
+-rw-r--r-- 1 root root  133 Oct 16 05:44 anas-backup-w2bt3.timer
+
+### DELETE /backup/tasks/w2bt2
+HTTP 202 0.048348
+{"job":{"id":"fcf96e28-9bd5-4a4a-865b-36e741c1c312","status":"running","operation":"backup.task.remove","createdAt":"2026-10-16T05:44:47.732Z","createdBy":"root@pam"}}
+[t+0s] running |  |  | 
+[t+1s] completed |  | {"removed": "w2bt2"} | 
+final: {"job":{"id":"fcf96e28-9bd5-4a4a-865b-36e741c1c312","status":"completed","operation":"backup.task.remove","progress":null,"createdAt":"2026-10-16T05:44:47.732Z","createdBy":"root@pam","startedAt":"2026-10-16T05:44:47.732Z","completedAt":"2026-10-16T05:44:48.236Z","result":{"removed":"w2bt2"},"error":null,"detail":null}}
+-rw-r--r-- 1 root root  596 Oct 16 05:44 anas-backup-w2bt1.service
+-rw-r--r-- 1 root root  133 Oct 16 05:44 anas-backup-w2bt1.timer
+-rw-r--r-- 1 root root  596 Oct 16 05:44 anas-backup-w2bt3.service
+-rw-r--r-- 1 root root  133 Oct 16 05:44 anas-backup-w2bt3.timer
+{"level":30,"time":1792129479395,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.completed","user":"root@pam","uid":0,"operation":"backup.task.create","params":{"task":"w2bt2"},"requestId":"2b8c87f5-3ddd-45b2-8b26-487a9e2ec734","durationMs":248,"msg":"audit: backup.task.create completed (248ms)"}
+{"level":30,"time":1792129487439,"pid":220746,"hostname":"anas-pve","reqId":"req-1k","req":{"method":"GET","url":"/v1/backup/tasks/w2bt2","host":"localhost"},"msg":"incoming request"}
+{"level":30,"time":1792129487706,"pid":220746,"hostname":"anas-pve","reqId":"req-1l","req":{"method":"DELETE","url":"/v1/backup/tasks/w2bt2","host":"localhost"},"msg":"incoming request"}
+{"level":30,"time":1792129487732,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.remove","params":{"task":"w2bt2"},"requestId":"83359b24-ad67-4ae6-a670-ee1e701c3da6","msg":"audit: root@pam submitted backup.task.remove"}
+{"level":30,"time":1792129488236,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.completed","user":"root@pam","uid":0,"operation":"backup.task.remove","params":{"task":"w2bt2"},"requestId":"83359b24-ad67-4ae6-a670-ee1e701c3da6","durationMs":504,"msg":"audit: backup.task.remove completed (504ms)"}
+
+### B — w2bt3: X-ANAS-Task hand-corrupted
+# X-ANAS-Task={name:"w2bt3","repository":"w2bbh","backupId":"w2bt3","archives":[
+LoadState=loaded
+ActiveState=inactive
+exit 0
+
+### GET /backup/tasks (names)
+HTTP 200 0.059117
+['w2bt1']
+warnings: None
+
+### GET /backup/tasks/w2bt3
+HTTP 404 0.008231
+{"error":{"code":"NOT_FOUND","message":"Backup task 'w2bt3' not found"}}
+-rw-r--r-- 1 root root  596 Oct 16 05:44 anas-backup-w2bt1.service
+-rw-r--r-- 1 root root  133 Oct 16 05:44 anas-backup-w2bt1.timer
+-rw-r--r-- 1 root root  594 Oct 16 05:44 anas-backup-w2bt3.service
+-rw-r--r-- 1 root root  133 Oct 16 05:44 anas-backup-w2bt3.timer
+
+### DELETE /backup/tasks/w2bt3
+HTTP 202 0.030340
+{"job":{"id":"c7ba7851-f791-444b-9c13-0b0fc7bbef35","status":"running","operation":"backup.task.remove","createdAt":"2026-10-16T05:44:49.333Z","createdBy":"root@pam"}}
+[t+0s] running |  |  | 
+[t+0s] completed |  | {"removed": "w2bt3"} | 
+final: {"job":{"id":"c7ba7851-f791-444b-9c13-0b0fc7bbef35","status":"completed","operation":"backup.task.remove","progress":null,"createdAt":"2026-10-16T05:44:49.333Z","createdBy":"root@pam","startedAt":"2026-10-16T05:44:49.333Z","completedAt":"2026-10-16T05:44:49.663Z","result":{"removed":"w2bt3"},"error":null,"detail":null}}
+-rw-r--r-- 1 root root  596 Oct 16 05:44 anas-backup-w2bt1.service
+-rw-r--r-- 1 root root  133 Oct 16 05:44 anas-backup-w2bt1.timer
+[backup] skipping anas-backup-w2bt3.service: no valid X-ANAS-Task JSON
+{"level":30,"time":1792129489160,"pid":220746,"hostname":"anas-pve","reqId":"req-1q","req":{"method":"GET","url":"/v1/backup/tasks/w2bt3","host":"localhost"},"msg":"incoming request"}
+{"level":30,"time":1792129489324,"pid":220746,"hostname":"anas-pve","reqId":"req-1r","req":{"method":"DELETE","url":"/v1/backup/tasks/w2bt3","host":"localhost"},"msg":"incoming request"}
+{"level":30,"time":1792129489333,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.remove","params":{"task":"w2bt3"},"requestId":"a64f83dc-1f14-4757-b697-e43876191d31","msg":"audit: root@pam submitted backup.task.remove"}
+{"level":30,"time":1792129489663,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.completed","user":"root@pam","uid":0,"operation":"backup.task.remove","params":{"task":"w2bt3"},"requestId":"a64f83dc-1f14-4757-b697-e43876191d31","durationMs":330,"msg":"audit: backup.task.remove completed (330ms)"}
+
+### C — the fail-closed refusal, injected (systemctl show of anas-backup-w2bt1.service exits 1)
+Failed to get properties: injected by the w2b node pass
+wrapped show exit 1
+active
+pass-through exit 0
+
+### DELETE /backup/tasks/w2bt1 (systemctl show refuses)
+HTTP 409 0.018200
+{"error":{"code":"CONFLICT","message":"Could not read Backup task 'w2bt1' run state from systemd — refusing to delete; nothing was deleted"}}
+bind mount removed
+848c70d7e2c2f43f  /usr/bin/systemctl
+848c70d7e2c2f43f  /var/tmp/w2b/systemctl.real
+{"level":30,"time":1792129465490,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.remove","params":{"task":"w2bt1"},"requestId":"4fa7ec55-e59d-42fd-92ba-36e88a4b31ad","msg":"audit: root@pam submitted backup.task.remove"}
+{"level":30,"time":1792129465898,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.completed","user":"root@pam","uid":0,"operation":"backup.task.remove","params":{"task":"w2bt1"},"requestId":"4fa7ec55-e59d-42fd-92ba-36e88a4b31ad","durationMs":408,"msg":"audit: backup.task.remove completed (408ms)"}
+{"level":30,"time":1792129478472,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.create","params":{"task":"w2bt1"},"requestId":"f02c400d-7bd7-4971-9988-8bcf3e023f95","msg":"audit: root@pam submitted backup.task.create"}
+{"level":30,"time":1792129478735,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.completed","user":"root@pam","uid":0,"operation":"backup.task.create","params":{"task":"w2bt1"},"requestId":"f02c400d-7bd7-4971-9988-8bcf3e023f95","durationMs":262,"msg":"audit: backup.task.create completed (262ms)"}
+{"level":30,"time":1792129490516,"pid":220746,"hostname":"anas-pve","reqId":"req-1v","req":{"method":"DELETE","url":"/v1/backup/tasks/w2bt1","host":"localhost"},"msg":"incoming request"}
+-rw-r--r-- 1 root root  596 Oct 16 05:44 anas-backup-w2bt1.service
+-rw-r--r-- 1 root root  133 Oct 16 05:44 anas-backup-w2bt1.timer
+
+### DELETE /backup/tasks/w2bt1
+HTTP 202 0.040454
+{"job":{"id":"2c197ca9-c12c-46ce-8bdc-0188d4582448","status":"running","operation":"backup.task.remove","createdAt":"2026-10-16T05:44:51.082Z","createdBy":"root@pam"}}
+[t+0s] running |  |  | 
+[t+0s] completed |  | {"removed": "w2bt1"} | 
+final: {"job":{"id":"2c197ca9-c12c-46ce-8bdc-0188d4582448","status":"completed","operation":"backup.task.remove","progress":null,"createdAt":"2026-10-16T05:44:51.082Z","createdBy":"root@pam","startedAt":"2026-10-16T05:44:51.082Z","completedAt":"2026-10-16T05:44:51.487Z","result":{"removed":"w2bt1"},"error":null,"detail":null}}
+  (no anas-backup-w2bt* units)
+
+### GET /backup/tasks (names)
+HTTP 200 0.014406
+[]
+warnings: None

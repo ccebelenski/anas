@@ -173,7 +173,7 @@ test.describe('Passdb entry matches the account exactly (identity.3, #68)', () =
       const since = await sshExec('date -Is')
 
       const result = await runJob(ctx, 'post', `${V1}/identity/users`, { name: USER, smbPassword: PW })
-      expect(result).toEqual({ created: USER, smbEnabled: true, smbEntryReplaced: LOWER })
+      expect(result).toEqual({ created: USER, smbEnabled: true, smbEntryReplaced: LOWER, uid: expect.any(Number) })
 
       const uid = await sshExec(`id -u ${USER}`)
       expect(await passdbLines()).toEqual([`${USER}:${uid}:`])
@@ -286,7 +286,7 @@ test.describe('Passdb entry matches the account exactly (identity.3, #68)', () =
       await stageOrphan()
 
       const result = await deleteViaApi(ctx, `${V1}/identity/users/${USER}`)
-      expect(result).toEqual({ deleted: USER, smbEntryRemoved: true })
+      expect(result).toEqual({ deleted: USER, smbEntryRemoved: true, groupRemoved: null })
       expect(await passdbLines()).toEqual([])
       expect(await sshExec(`getent passwd ${USER} >/dev/null && echo present || echo gone`)).toBe('gone')
     }

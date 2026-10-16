@@ -1,0 +1,35 @@
+(node:342304) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 7 tests using 1 worker
+
+(node:342386) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  1 [integration] › tests/integration/schedules-exclude-api.spec.ts:152:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › a recursive schedule over a nested storage root is refused and told to exclude it (107ms)
+  -  2 [integration] › tests/integration/schedules-exclude-api.spec.ts:160:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › exclude on a non-recursive schedule, and a non-descendant exclude, are 400s that name the problem
+  -  3 [integration] › tests/integration/schedules-exclude-api.spec.ts:170:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › the same schedule with the storage root and one child excluded is accepted
+  -  4 [integration] › tests/integration/schedules-exclude-api.spec.ts:186:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › one run snapshots the target and the kept sibling only
+  -  5 [integration] › tests/integration/schedules-exclude-api.spec.ts:202:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › two more runs complete and prune the target to its retention (excluded datasets never block the prune)
+  -  6 [integration] › tests/integration/schedules-exclude-api.spec.ts:219:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › snapprune.1: one run clears droppings on excluded datasets, converges the sibling, keeps a held snapshot
+  -  7 [integration] › tests/integration/schedules-exclude-api.spec.ts:268:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › provenance: a RECEIVED snapshot carrying the schedule's name on an excluded dataset survives, noted
+
+
+  1) [integration] › tests/integration/schedules-exclude-api.spec.ts:152:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › a recursive schedule over a nested storage root is refused and told to exclude it 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m400[39m
+    Received: [31m409[39m
+
+      152 |   test('a recursive schedule over a nested storage root is refused and told to exclude it', async () => {
+      153 |     const res = await ctx.post(`${V1}/schedules`, { data: scheduleBody({ recursive: true }) })
+    > 154 |     expect(res.status()).toBe(400)
+          |                          ^
+      155 |     const body = await res.json() as { error: { message: string } }
+      156 |     expect(body.error.message).toContain(NESTED_ROOT)
+      157 |     expect(body.error.message).toMatch(/[Ee]xclude/)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/schedules-exclude-api.spec.ts:154:26
+
+  1 failed
+    [integration] › tests/integration/schedules-exclude-api.spec.ts:152:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › a recursive schedule over a nested storage root is refused and told to exclude it 
+  6 did not run

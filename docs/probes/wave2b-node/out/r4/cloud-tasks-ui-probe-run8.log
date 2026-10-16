@@ -1,0 +1,65 @@
+(node:754467) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+(node:754579) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
++80ms SEL rows=0 sel=[]
++1857ms REQ GET /cloud/tasks
++1872ms RES 200 GET /cloud/tasks
++4387ms REQ POST /cloud/tasks
++4505ms RES 202 POST /cloud/tasks
++5017ms REQ GET /jobs/72447a4d-62ec-43d9-87e1-63e5ed0cbc7b
++5055ms RES 200 GET /jobs/72447a4d-62ec-43d9-87e1-63e5ed0cbc7b
++5055ms JOBBODY {"job":{"id":"72447a4d-62ec-43d9-87e1-63e5ed0cbc7b","status":"completed","operation":"cloud.task.create","progress":null,"createdAt":"2026-10-16T07:45:22.695Z","createdBy":"root@pam","startedAt":"2026-10-16T07:45:22.695Z","completedAt":"2026-10-16T07:45:23.041Z","result":{"created":"pictures-offsite
++5100ms PAGEERROR TypeError: Cannot read properties of null (reading 'items') TypeError: Cannot read properties of null (reading 'items') |     at ctor.getRefItems (https://192.168.200.50:8006/pve2/ext6/ext-all.js?ver=7.0.0:22:1228685) |     at ctor.getRefItems (https://192.168.200.50:8006/pve2/ext6/ext-all.js?ver=7.0.0:22:1409260) |     at g (https://192.168.200.50:8006/pve2/ext6/ext-all.js?ver=7.0.0:22:219319) |     at constructor._execute (https://192.168.200.50:8006/pve2/ext6/ext-all.js?ver=7.0.0:22:221564) |     at constructor.execute (https://192.168.200.50:8006/pve2/ext6/ext-all.js?ver=7.0.0:22:221286) |     at ctor.query (https://192.168.200.50:8006/pve2/ext6/ext-all.js?ver=7.0.0:22:223483) |     at ctor.query (https://192.168.200.50:8006/pve2/ext6/ext-all.js?ver=7.0.0:22:897915) |     at ctor.down (https://192.168.200.50:8006/pve2/ext6/ext-all.js?ver=7.0.0:22:898470) |     at setPreviewCancel (https://192.168.200.50:8006/pve2/js/anas.js?v=08d64cd10f2c:48496:26) |     at abandonPreview (https://192.168.200.50:8006/pve2/js/anas.js?v=08d64cd10f2c:48516:9)
++9961ms REQ GET /cloud/tasks
++10045ms RES 200 GET /cloud/tasks
++10103ms SEL rows=1 sel=[]
++19963ms REQ GET /cloud/tasks
++20036ms RES 200 GET /cloud/tasks
+  ✘  1 [integration] › tests/integration/cloud-tasks-ui.spec.ts:443:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 1 — create through the wizard: empty-remotes toast, nested note, sync sentence, Copy default, the row lands selected (28.3s)
+
+
+  1) [integration] › tests/integration/cloud-tasks-ui.spec.ts:443:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 1 — create through the wizard: empty-remotes toast, nested note, sync sentence, Copy default, the row lands selected 
+
+    Error: [2mexpect([22m[31mlocator[39m[2m).[22mtoHaveClass[2m([22m[32mexpected[39m[2m)[22m failed
+
+    Locator: locator('.anas-grid-cloud-tasks').locator('.x-grid-row').filter({ has: locator('.x-grid-cell-inner').filter({ hasText: /^pictures-offsite$/ }) }).first().locator('xpath=ancestor::table[1]')
+    Expected pattern: [32m/x-grid-item-selected/[39m
+    Received string:  [31m"x-grid-item"[39m
+    Timeout: 15000ms
+
+    Call log:
+    [2m  - Expect "toHaveClass" with timeout 15000ms[22m
+    [2m  - waiting for locator('.anas-grid-cloud-tasks').locator('.x-grid-row').filter({ has: locator('.x-grid-cell-inner').filter({ hasText: /^pictures-offsite$/ }) }).first().locator('xpath=ancestor::table[1]')[22m
+    [2m    13 × locator resolved to <table cellpadding="0" cellspacing="0" role="presentation" data-recordid="844" class="x-grid-item" data-recordindex="0" id="gridview-1191-record-844" data-boundview="gridview-1191">…</table>[22m
+    [2m       - unexpected value "x-grid-item"[22m
+    [2m    6 × locator resolved to <table cellpadding="0" cellspacing="0" role="presentation" data-recordid="955" class="x-grid-item" data-recordindex="0" id="gridview-1191-record-955" data-boundview="gridview-1191">…</table>[22m
+    [2m      - unexpected value "x-grid-item"[22m
+
+
+      543 |     await expect(row).toBeVisible({ timeout: 45_000 })
+      544 |     await expect(row.locator('xpath=ancestor::table[1]'))
+    > 545 |       .toHaveClass(/x-grid-item-selected/, { timeout: 15_000 })
+          |        ^
+      546 |     await expect(row).toContainText('gt:pictures')
+      547 |
+      548 |     // The stored side of the contract: the task's unit pair exists and
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/cloud-tasks-ui.spec.ts:545:8
+
+    [31mTest timeout of 30000ms exceeded.[39m
+
+    attachment #1: w2b (text/plain) ────────────────────────────────────────────────────────────────
+    probe armed
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    attachment #2: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-tasks-ui-rclone-3-—--429a9-ault-the-row-lands-selected-integration/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-tasks-ui-rclone-3-—--429a9-ault-the-row-lands-selected-integration/error-context.md
+
+  1 failed
+    [integration] › tests/integration/cloud-tasks-ui.spec.ts:443:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 1 — create through the wizard: empty-remotes toast, nested note, sync sentence, Copy default, the row lands selected 

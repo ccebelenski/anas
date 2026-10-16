@@ -1,0 +1,14 @@
+
+### schedules
+"id":"pvepool-proof"
+HTTP 202 0.063185
+{"job":{"id":"51dae934-3a00-422d-8e18-e299d0382d5a","status":"running","operation":"schedule.remove","createdAt":"2026-10-16T06:41:33.558Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"removed": "pvepool-proof"} | 
+
+### cloud remotes
+HTTP 202 0.078351
+{"job":{"id":"92296b04-c1c0-47b4-a49f-578ee9c41f15","status":"running","operation":"cloud.remote.remove","createdAt":"2026-10-16T06:41:34.655Z","createdBy":"root@pam"}}
+
+### node
+0
+no task/schedule units

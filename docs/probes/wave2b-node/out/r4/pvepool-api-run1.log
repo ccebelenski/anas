@@ -1,0 +1,137 @@
+(node:305958) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 12 tests using 1 worker
+
+(node:306043) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓   1 [integration] › tests/integration/pvepool-api.spec.ts:110:3 › Per-dataset ownership stamps (list) › pvfix: storage root, guest volumes and dir-storage stamped; siblings clean (840ms)
+  ✓   2 [integration] › tests/integration/pvepool-api.spec.ts:158:3 › Per-dataset ownership stamps (list) › sysfix: boot tree system-owned; nested storage root and its guest stamped; sibling clean (504ms)
+  ✓   3 [integration] › tests/integration/pvepool-api.spec.ts:216:3 › Dataset create on a PVE pool › a child of the storage root outside PVE's footprint is created and destroyed (3) (1.9s)
+  ✓   4 [integration] › tests/integration/pvepool-api.spec.ts:243:3 › Dataset create on a PVE pool › naming guard: a guest-named direct child is refused; deeper in the tree it is allowed (4) (2.2s)
+  ✘   5 [integration] › tests/integration/pvepool-api.spec.ts:283:3 › Owned-dataset mutations refused › destroy vm-100-disk-0 → 400 naming storage + dataset (422ms)
+(node:307551) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘   6 [integration] › tests/integration/pvepool-api.spec.ts:298:3 › Owned-dataset mutations refused › property set on subvol-101-disk-0 → 400 naming storage + dataset (707ms)
+(node:307746) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘   7 [integration] › tests/integration/pvepool-api.spec.ts:314:3 › Owned-dataset mutations refused › snapshot create on the storage root pvfix → 400 naming storage + dataset (722ms)
+(node:308361) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘   8 [integration] › tests/integration/pvepool-api.spec.ts:333:3 › Owned-dataset mutations refused › destroy sysfix/ROOT/pve-1 → 400 with the system reason (702ms)
+(node:308534) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘   9 [integration] › tests/integration/pvepool-api.spec.ts:365:3 › Snapshot schedules › a schedule on the sibling is accepted (and deleted again); one on a guest volume is refused (890ms)
+(node:308728) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  10 [integration] › tests/integration/pvepool-api.spec.ts:407:3 › System-pool hard refusals (sysfix) › change mount, export and destroy are hard-refused with the boot filesystem named (1.0s)
+  ✘  11 [integration] › tests/integration/pvepool-api.spec.ts:503:3 › iSCSI add-LUN on a PVE pool › a zvol on the sibling is accepted; a PVE guest volume is refused with the guest sentence (897ms)
+(node:310318) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  12 [integration] › tests/integration/pvepool-api.spec.ts:586:3 › Backup consistency derivation › preview-nested: sibling source gets a snapshot; guest subvol is live with the reason (742ms)
+
+
+  1) [integration] › tests/integration/pvepool-api.spec.ts:283:3 › Owned-dataset mutations refused › destroy vm-100-disk-0 → 400 naming storage + dataset 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m400[39m
+    Received: [31m409[39m
+
+      285 |     try {
+      286 |       const res = await ctx.delete(`${V1}/pools/${PVE_POOL}/datasets/vm-100-disk-0`)
+    > 287 |       expect(res.status()).toBe(400)
+          |                            ^
+      288 |       const err = (await res.json()).error
+      289 |       expect(err.code).toBe('VALIDATION_ERROR')
+      290 |       expect(err.message).toBe(`PVE storage '${PVE_POOL}' owns ${PVE_POOL}/vm-100-disk-0 as a guest volume`)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pvepool-api.spec.ts:287:28
+
+  2) [integration] › tests/integration/pvepool-api.spec.ts:298:3 › Owned-dataset mutations refused › property set on subvol-101-disk-0 → 400 naming storage + dataset 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m400[39m
+    Received: [31m409[39m
+
+      302 |         data: { properties: { compression: 'lz4' } },
+      303 |       })
+    > 304 |       expect(res.status()).toBe(400)
+          |                            ^
+      305 |       const err = (await res.json()).error
+      306 |       expect(err.code).toBe('VALIDATION_ERROR')
+      307 |       expect(err.message).toBe(`PVE storage '${PVE_POOL}' owns ${PVE_POOL}/subvol-101-disk-0 as a guest volume`)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pvepool-api.spec.ts:304:28
+
+  3) [integration] › tests/integration/pvepool-api.spec.ts:314:3 › Owned-dataset mutations refused › snapshot create on the storage root pvfix → 400 naming storage + dataset 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m400[39m
+    Received: [31m409[39m
+
+      318 |         data: { name: 'proof-snap' },
+      319 |       })
+    > 320 |       expect(res.status()).toBe(400)
+          |                            ^
+      321 |       const err = (await res.json()).error
+      322 |       expect(err.code).toBe('VALIDATION_ERROR')
+      323 |       expect(err.message).toContain(`PVE storage '${PVE_POOL}' owns ${PVE_POOL}`)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pvepool-api.spec.ts:320:28
+
+  4) [integration] › tests/integration/pvepool-api.spec.ts:333:3 › Owned-dataset mutations refused › destroy sysfix/ROOT/pve-1 → 400 with the system reason 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m400[39m
+    Received: [31m409[39m
+
+      335 |     try {
+      336 |       const res = await ctx.delete(`${V1}/pools/${SYS_POOL}/datasets/ROOT/pve-1`)
+    > 337 |       expect(res.status()).toBe(400)
+          |                            ^
+      338 |       const err = (await res.json()).error
+      339 |       expect(err.code).toBe('VALIDATION_ERROR')
+      340 |       expect(err.message).toBe(`${SYS_POOL}/ROOT/pve-1 is the boot filesystem of pool ${SYS_POOL}`)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pvepool-api.spec.ts:337:28
+
+  5) [integration] › tests/integration/pvepool-api.spec.ts:365:3 › Snapshot schedules › a schedule on the sibling is accepted (and deleted again); one on a guest volume is refused 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m400[39m
+    Received: [31m409[39m
+
+      381 |         },
+      382 |       })
+    > 383 |       expect(refused.status()).toBe(400)
+          |                                ^
+      384 |       const err = (await refused.json()).error
+      385 |       expect(err.code).toBe('VALIDATION_ERROR')
+      386 |       expect(err.message).toBe(`Cannot schedule snapshots of '${PVE_POOL}/vm-100-disk-0' — PVE storage '${PVE_POOL}' owns ${PVE_POOL}/vm-100-disk-0 as a guest volume`)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pvepool-api.spec.ts:383:32
+
+  6) [integration] › tests/integration/pvepool-api.spec.ts:503:3 › iSCSI add-LUN on a PVE pool › a zvol on the sibling is accepted; a PVE guest volume is refused with the guest sentence 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m202[39m
+    Received: [31m409[39m
+
+      521 |         },
+      522 |       })
+    > 523 |       expect(createRes.status()).toBe(202)
+          |                                  ^
+      524 |       const createJob = await awaitJob(ctx, (await createRes.json()).job.id)
+      525 |       expect(createJob.status).toBe('completed')
+      526 |       const list = await ctx.get(`${V1}/iscsi/targets`)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pvepool-api.spec.ts:523:34
+
+  6 failed
+    [integration] › tests/integration/pvepool-api.spec.ts:283:3 › Owned-dataset mutations refused › destroy vm-100-disk-0 → 400 naming storage + dataset 
+    [integration] › tests/integration/pvepool-api.spec.ts:298:3 › Owned-dataset mutations refused › property set on subvol-101-disk-0 → 400 naming storage + dataset 
+    [integration] › tests/integration/pvepool-api.spec.ts:314:3 › Owned-dataset mutations refused › snapshot create on the storage root pvfix → 400 naming storage + dataset 
+    [integration] › tests/integration/pvepool-api.spec.ts:333:3 › Owned-dataset mutations refused › destroy sysfix/ROOT/pve-1 → 400 with the system reason 
+    [integration] › tests/integration/pvepool-api.spec.ts:365:3 › Snapshot schedules › a schedule on the sibling is accepted (and deleted again); one on a guest volume is refused 
+    [integration] › tests/integration/pvepool-api.spec.ts:503:3 › iSCSI add-LUN on a PVE pool › a zvol on the sibling is accepted; a PVE guest volume is refused with the guest sentence 
+  6 passed (16.9s)

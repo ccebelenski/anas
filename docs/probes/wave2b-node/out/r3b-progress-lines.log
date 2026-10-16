@@ -1,0 +1,26 @@
+
+### [R] direct run of w2bt4 over the socket, progress read back-to-back
+submit: {"job":{"id":"59c44da0-9272-49c3-a931-7632fdb4de95","status":"running","operation":"backup.task.run","createdAt":"2026-10-16T05:48:48.599Z","createdBy":"root@pam"}}
+  [+52 ms, read 1] running | starting backup w2bt4 -> w2bbh:w2bnone
+  [+151 ms, read 3] running | snapshotting AHR pool 'w2bahr' as @snapshots/anas-backup-w2bt4-1792129728
+  [+194 ms, read 4] running | archive 'w2bdata' <- /run/anas-ahr/w2bahr.toplevel/@snapshots/anas-backup-w2bt4-1792129728
+  [+10265 ms, read 203] running | Starting backup: host/w2bt4/2026-10-16T05:48:48Z
+  end: {"job":{"id":"59c44da0-9272-49c3-a931-7632fdb4de95","status":"failed","operation":"backup.task.run","progress":"Starting backup: host/w2bt4/2026-10-16T05:48:48Z","createdAt":"2026-10-16T05:48:48.599Z","createdBy":"root@pam","startedAt":"2026-10-16T05:48:48.599Z","completedAt":"2026-10-16T05:48:58.997Z","result":null,"error":{"code":"JOB_FAILED","message":"Error: client error (Connect)"},"detail":n
+
+### [A] direct run of w2bt4 over the socket, progress read back-to-back
+submit: {"job":{"id":"ca4b1073-f661-48cf-b864-9e9b78440045","status":"running","operation":"backup.task.run","createdAt":"2026-10-16T05:49:00.209Z","createdBy":"root@pam"}}
+  [+56 ms, read 1] running | starting backup w2bt4 -> w2bbh:w2bnone
+  [+169 ms, read 3] running | archive 'w2bdata': live - /mnt/anas-ahr/w2bahr is on a btrfs filesystem (/dev/mapper/w2bahr-w2bahr--vol[/@data]) that is not an ANAS AHR pool - ANAS does not snapshot filesystems it does not manage, so the backup is live
+  [+10209 ms, read 210] running | Starting backup: host/w2bt4/2026-10-16T05:49:00Z
+  end: {"job":{"id":"ca4b1073-f661-48cf-b864-9e9b78440045","status":"failed","operation":"backup.task.run","progress":"Starting backup: host/w2bt4/2026-10-16T05:49:00Z","createdAt":"2026-10-16T05:49:00.209Z","createdBy":"root@pam","startedAt":"2026-10-16T05:49:00.209Z","completedAt":"2026-10-16T05:49:10.560Z","result":null,"error":{"code":"JOB_FAILED","message":"Error: client error (Connect)"},"detail":n
+bind mount removed
+
+### [B] direct run of w2bt4 over the socket, progress read back-to-back
+submit: {"job":{"id":"6f00a4c2-d342-4140-9a95-53a958887311","status":"running","operation":"backup.task.run","createdAt":"2026-10-16T05:49:12.057Z","createdBy":"root@pam"}}
+  [+36 ms, read 1] running | starting backup w2bt4 -> w2bbh:w2bnone
+  [+71 ms, read 2] running | archive 'w2bdata': live - /mnt/anas-ahr/w2bahr is on a btrfs filesystem (/dev/mapper/w2bahr-w2bahr--vol[/@data]) and the AHR topology could not be read, so it cannot be told whether it is an ANAS AHR pool - the backup is live
+  [+10101 ms, read 216] running | Starting backup: host/w2bt4/2026-10-16T05:49:12Z
+  end: {"job":{"id":"6f00a4c2-d342-4140-9a95-53a958887311","status":"failed","operation":"backup.task.run","progress":"Starting backup: host/w2bt4/2026-10-16T05:49:12Z","createdAt":"2026-10-16T05:49:12.057Z","createdBy":"root@pam","startedAt":"2026-10-16T05:49:12.057Z","completedAt":"2026-10-16T05:49:22.292Z","result":null,"error":{"code":"JOB_FAILED","message":"Error: client error (Connect)"},"detail":n
+bind mount removed
+bab911d1970826c6  /usr/sbin/mdadm
+bab911d1970826c6  /var/tmp/w2b/mdadm.real

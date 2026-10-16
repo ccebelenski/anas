@@ -1,0 +1,13 @@
+(node:276393) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 4 tests using 1 worker
+
+(node:276536) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/ident-mounts-repl.spec.ts:159:3 › ident.4 — act on what is actually there (live) › (a) two replication tasks on one source keep BOTH incremental bases held, each under its own tag (1.0m)
+  ✓  2 [integration] › tests/integration/ident-mounts-repl.spec.ts:229:3 › ident.4 — act on what is actually there (live) › (e) a local filesystem at a failed CIFS line's target survives Remove — 409 naming what is there (2.9s)
+  ✓  3 [integration] › tests/integration/ident-mounts-repl.spec.ts:278:3 › ident.4 — act on what is actually there (live) › (b) a remote PUT changing the endpoint answers 409 + confirm naming the tasks, direct and through a wrapper (4.6s)
+  ✓  4 [integration] › tests/integration/ident-mounts-repl.spec.ts:332:3 › ident.4 — act on what is actually there (live) › (f) a #recycle replaced by a symlink is skipped by the purge with a note (1.6s)
+
+  4 passed (1.3m)

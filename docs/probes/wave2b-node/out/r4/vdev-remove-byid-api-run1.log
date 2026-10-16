@@ -1,0 +1,15 @@
+(node:388748) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 6 tests using 1 worker
+
+(node:388821) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/vdev-remove-byid-api.spec.ts:182:3 › Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #66) › all six classes sit on partitions of ONE disk — the ids collide (429ms)
+  ✓  2 [integration] › tests/integration/vdev-remove-byid-api.spec.ts:200:3 › Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #66) › the special partition joins the dashboard with role special, not data (1.2s)
+  ✓  3 [integration] › tests/integration/vdev-remove-byid-api.spec.ts:222:3 › Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #66) › the STRIPPED disk id is refused as ambiguous — nothing comes out (157ms)
+  ✓  4 [integration] › tests/integration/vdev-remove-byid-api.spec.ts:240:3 › Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #66) › the cache partition comes out and the LOG is untouched (1.6s)
+  ✓  5 [integration] › tests/integration/vdev-remove-byid-api.spec.ts:267:3 › Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #66) › a section with TWO cache leaves is one vdev, and they come out one at a time (3.0s)
+  ✓  6 [integration] › tests/integration/vdev-remove-byid-api.spec.ts:315:3 › Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #66) › the LOG partition is replaced by its basename — the stripped id is refused (2.1s)
+
+  6 passed (16.3s)

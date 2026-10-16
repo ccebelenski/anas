@@ -1,0 +1,26 @@
+(node:324370) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:324506) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/sched-stamps.spec.ts:361:3 › Scheduled-task timer stamps (sched.stamps) › the daemon start sweeps orphan task stamps of all four prefixes and leaves the rest alone (5.2s)
+GT-23 backup --- list-units --failed BEFORE the delete ---
+● anas-backup-gtstampbk.service    loaded failed failed ANAS backup task gtstampbk
+● zfs-import@anasactimport.service loaded failed failed Import ZFS pool anasactimport
+● zfs-import@anascomp.service      loaded failed failed Import ZFS pool anascomp
+GT-23 backup --- list-units --failed AFTER the delete ---
+● zfs-import@anasactimport.service loaded failed failed Import ZFS pool anasactimport
+● zfs-import@anascomp.service      loaded failed failed Import ZFS pool anascomp
+  ✓  2 [integration] › tests/integration/sched-stamps.spec.ts:410:3 › Scheduled-task timer stamps (sched.stamps) › a backup task: delete clears stamp and failed state, and a re-used name does not run itself (1.1m)
+GT-23 cloud --- list-units --failed BEFORE the delete ---
+● anas-cloud-gtstampcl.service     loaded failed failed ANAS cloud sync task gtstampcl
+● zfs-import@anasactimport.service loaded failed failed Import ZFS pool anasactimport
+● zfs-import@anascomp.service      loaded failed failed Import ZFS pool anascomp
+GT-23 cloud --- list-units --failed AFTER the delete ---
+● zfs-import@anasactimport.service loaded failed failed Import ZFS pool anasactimport
+● zfs-import@anascomp.service      loaded failed failed Import ZFS pool anascomp
+  ✓  3 [integration] › tests/integration/sched-stamps.spec.ts:423:3 › Scheduled-task timer stamps (sched.stamps) › a cloud task: the same three facts under the anas-cloud- prefix (1.1m)
+
+  3 passed (2.7m)

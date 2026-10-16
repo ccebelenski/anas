@@ -1,0 +1,16 @@
+(node:91182) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 7 tests using 1 worker
+
+(node:91257) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/gateway.spec.ts:24:3 › Gateway API › rejects requests without a PVE cookie (401) (3.0s)
+  ✓  2 [integration] › tests/integration/gateway.spec.ts:32:3 › Gateway API › serves the health probe with the PVE cookie (200) (164ms)
+  ✓  3 [integration] › tests/integration/gateway.spec.ts:39:3 › Gateway API › returns the pool list for the local node with the PVE cookie (200) (118ms)
+  ✓  4 [integration] › tests/integration/gateway.spec.ts:49:3 › Gateway API › rejects a malformed node name (400) (20ms)
+  ✓  5 [integration] › tests/integration/gateway.spec.ts:57:3 › Gateway API › surfaces a node outside the cluster membership as 502 NODE_UNRESOLVED (35ms)
+  ✓  6 [integration] › tests/integration/gateway.spec.ts:68:3 › Gateway API › emits no CORS headers for a preflight from the PVE UI origin (23ms)
+  ✓  7 [integration] › tests/integration/gateway.spec.ts:87:3 › Gateway API › does not emit CORS allow headers for a disallowed origin (20ms)
+
+  7 passed (4.4s)

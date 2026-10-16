@@ -1,0 +1,17 @@
+(node:344909) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 8 tests using 1 worker
+
+(node:345017) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/shares.spec.ts:78:3 › ANAS Shares view (stunt node) › renders a native grid listing SMB shares and the NFS export with protocol badges (2.6s)
+  ✓  2 [integration] › tests/integration/shares.spec.ts:106:3 › ANAS Shares view (stunt node) › the toolbar exposes SMB add / NFS add / SMB settings, and per-selection edit/remove (2.0s)
+  ✓  3 [integration] › tests/integration/shares.spec.ts:130:3 › ANAS Shares view (stunt node) › the + SMB Share button opens the .anas-win-smb-share window (2.0s)
+  ✓  4 [integration] › tests/integration/shares.spec.ts:136:3 › ANAS Shares view (stunt node) › the + NFS Export button opens the .anas-win-nfs-export window (1.9s)
+  ✓  5 [integration] › tests/integration/shares.spec.ts:159:3 › ANAS SMB share create + remove via UI (throwaway share) › creating an SMB share adds a row, then the confirm-gated remove deletes it (5.1s)
+  ✓  6 [integration] › tests/integration/shares.spec.ts:216:3 › ANAS NFS export create + remove via UI (throwaway export) › creating an NFS export adds a row, then the confirm-gated remove deletes it (5.2s)
+  ✓  7 [integration] › tests/integration/shares.spec.ts:281:3 › ANAS SMB Settings round-trip (reversible) › SMB Settings loads workgroup=WORKGROUP and persists a server-string edit (4.7s)
+  ✓  8 [integration] › tests/integration/shares.spec.ts:325:3 › ANAS contextual Share… from a dataset (stunt node) › Share… → SMB pre-fills the create window with the dataset mountpoint (2.5s)
+
+  8 passed (27.2s)

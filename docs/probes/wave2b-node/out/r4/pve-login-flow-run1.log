@@ -1,0 +1,10 @@
+(node:301888) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+(node:301974) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/pve-login-flow.spec.ts:22:3 › PVE login flow › logging into the PVE UI authenticates the user to the gateway (1.6s)
+
+  1 passed (2.5s)

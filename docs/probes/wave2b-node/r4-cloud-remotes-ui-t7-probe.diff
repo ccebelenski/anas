@@ -1,0 +1,19 @@
+diff --git a/tests/integration/cloud-remotes-ui.spec.ts b/tests/integration/cloud-remotes-ui.spec.ts
+index f557c584..f77cf9c5 100644
+--- a/tests/integration/cloud-remotes-ui.spec.ts
++++ b/tests/integration/cloud-remotes-ui.spec.ts
+@@ -431,6 +431,14 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
+   })
+ 
+   test('7 — an injected failure before Save: the failure surfaces AND the grid still reloads', async ({ page, playwright }) => {
++    // W2B PROBE (wave-2b row 4, never committed)
++    const w2t0 = Date.now()
++    const w2log: string[] = []
++    page.on('response', async (r) => { const u = r.url(); if (/\/v1\/(cloud\/remotes|jobs\/)/.test(u)) { let b = ''; try { b = (await r.text()).slice(0, 300) } catch { /* gone */ } w2log.push(`+${Date.now() - w2t0}ms RES ${r.status()} ${r.request().method()} ${u.replace(/^.*\/v1/, '')} ${b}`) } })
++    page.on('pageerror', (e) => { w2log.push(`+${Date.now() - w2t0}ms PAGEERROR ${String(e).slice(0, 300)} ${(e.stack || '').split('\n').slice(0, 14).join(' | ')}`) })
++    page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') w2log.push(`+${Date.now() - w2t0}ms CONSOLE ${m.type()} ${m.text().slice(0, 300)}`) })
++    const w2timer = setInterval(async () => { try { const t = await page.evaluate(() => Array.from(document.querySelectorAll('.x-message-box')).filter(e => (e as HTMLElement).offsetParent).map(e => (e.textContent || '').slice(0, 160)).join(' || ')); if (t) w2log.push(`+${Date.now() - w2t0}ms MSGBOX ${t}`) } catch { /* closing */ } }, 250)
++    page.on('close', () => { clearInterval(w2timer); console.log([...new Set(w2log)].join('\n')) })
+     // A remote to edit (test 6 removed it) — through the API door.
+     const ctx = await apiContext(playwright)
+     try {

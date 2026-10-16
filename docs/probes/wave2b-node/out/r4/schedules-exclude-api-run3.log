@@ -1,0 +1,17 @@
+(node:586543) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 7 tests using 1 worker
+
+(node:586623) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/schedules-exclude-api.spec.ts:152:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › a recursive schedule over a nested storage root is refused and told to exclude it (165ms)
+  ✓  2 [integration] › tests/integration/schedules-exclude-api.spec.ts:160:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › exclude on a non-recursive schedule, and a non-descendant exclude, are 400s that name the problem (87ms)
+  ✓  3 [integration] › tests/integration/schedules-exclude-api.spec.ts:170:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › the same schedule with the storage root and one child excluded is accepted (1.2s)
+  ✓  4 [integration] › tests/integration/schedules-exclude-api.spec.ts:186:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › one run snapshots the target and the kept sibling only (1.3s)
+  ✓  5 [integration] › tests/integration/schedules-exclude-api.spec.ts:202:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › two more runs complete and prune the target to its retention (excluded datasets never block the prune) (4.9s)
+  ✓  6 [integration] › tests/integration/schedules-exclude-api.spec.ts:219:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › snapprune.1: one run clears droppings on excluded datasets, converges the sibling, keeps a held snapshot (4.9s)
+provenance: pvfix/media/keep@anas-hourly-2026-10-16T071501Z createtxg=481 creation=1792134901; pvfix/media/child/replica@anas-hourly-2026-10-16T071501Z createtxg=496 creation=1792134901
+  ✓  7 [integration] › tests/integration/schedules-exclude-api.spec.ts:268:3 › snapx.1 — exclude on a recursive schedule, through the API (stunt node fixture) › provenance: a RECEIVED snapshot carrying the schedule's name on an excluded dataset survives, noted (3.6s)
+
+  7 passed (23.3s)

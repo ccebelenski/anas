@@ -1,0 +1,48 @@
+(node:620218) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 7 tests using 1 worker
+
+(node:620284) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/cloud-remotes-ui.spec.ts:251:3 › rclone.1 — Remotes manager window (stunt node UI) › 1 — add through the dialog: Test says Reachable, the row lists pass (secret), the file holds an obscured value (10.7s)
+  ✓  2 [integration] › tests/integration/cloud-remotes-ui.spec.ts:285:3 › rclone.1 — Remotes manager window (stunt node UI) › 2 — edit keeps the secret: blank "(unchanged)" box, the file's pass line untouched (7.9s)
+  ✓  3 [integration] › tests/integration/cloud-remotes-ui.spec.ts:344:3 › rclone.1 — Remotes manager window (stunt node UI) › 3 — toolbar Test: the saved remote by name says Reachable (5.3s)
+  ✓  4 [integration] › tests/integration/cloud-remotes-ui.spec.ts:358:3 › rclone.1 — Remotes manager window (stunt node UI) › 4 — a wrong password in an UNSAVED dialog: the Authentication-failed verdict (8.9s)
+  ✓  5 [integration] › tests/integration/cloud-remotes-ui.spec.ts:375:3 › rclone.1 — Remotes manager window (stunt node UI) › 5 — the S3 form shows exactly ONE region row once a provider is picked (4.6s)
+  ✓  6 [integration] › tests/integration/cloud-remotes-ui.spec.ts:417:3 › rclone.1 — Remotes manager window (stunt node UI) › 6 — remove: the confirm, then the row is gone (5.5s)
+  ✘  7 [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads (1.1m)
+
+
+  1) [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads 
+
+    Error: [2mexpect([22m[31mlocator[39m[2m).[22mtoBeVisible[2m([22m[2m)[22m failed
+
+    Locator: locator('.x-message-box:visible').filter({ hasText: 'Save failed' }).first()
+    Expected: visible
+    Timeout: 60000ms
+    Error: element(s) not found
+
+    Call log:
+    [2m  - Expect "toBeVisible" with timeout 60000ms[22m
+    [2m  - waiting for locator('.x-message-box:visible').filter({ hasText: 'Save failed' }).first()[22m
+
+
+      460 |     // sentence in the body — never a bare "failed" and never some other modal.
+      461 |     const failAlert = page.locator('.x-message-box:visible').filter({ hasText: 'Save failed' })
+    > 462 |     await expect(failAlert.first()).toBeVisible({ timeout: 60_000 })
+          |                                     ^
+      463 |     const failBody = ((await failAlert.first().textContent()) ?? '').replace(/Save failed|OK|Cancel/g, '').trim()
+      464 |     expect(failBody.length, `the save-failure alert body was: ${failBody}`).toBeGreaterThan(10)
+      465 |
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/cloud-remotes-ui.spec.ts:462:37
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-remotes-ui-rclone-1--c79a2--AND-the-grid-still-reloads-integration/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-remotes-ui-rclone-1--c79a2--AND-the-grid-still-reloads-integration/error-context.md
+
+  1 failed
+    [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads 
+  6 passed (1.9m)

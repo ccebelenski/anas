@@ -1,0 +1,12 @@
+(node:365260) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:365382) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/snapshots-api.spec.ts:79:3 › Snapshot lifecycle: create → list → dup → rename → destroy (5.1–5.6) › create → list (newest-first, typed fields) → duplicate 409 → rename → PLAIN destroy (3.5s)
+  ✓  2 [integration] › tests/integration/snapshots-api.spec.ts:168:3 › Snapshot rollback — confirmation-gated, verified against the real system (5.5) › rollback demands x-anas-confirm (409 + code), then rolls back on resend (3.4s)
+  ✓  3 [integration] › tests/integration/snapshots-api.spec.ts:232:3 › Snapshot nesting — a dataset lists only its OWN snapshots, not children's › a recursive snapshot of the parent does not leak the child snapshot into the parent list (1.7s)
+
+  3 passed (9.5s)

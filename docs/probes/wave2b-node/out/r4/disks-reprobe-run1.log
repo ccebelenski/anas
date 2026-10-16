@@ -1,0 +1,20 @@
+(node:263912) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 5 tests using 1 worker
+
+(node:263983) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+[disks.1] cadence 2000 ms, loads 3 s apart: /dev/sda=2 /dev/sdb=2 /dev/sdc=2
+  ✓  1 [integration] › tests/integration/disks-reprobe.spec.ts:264:3 › disks.1 — SMART readings age out (stunt node) › a reading older than the cadence is re-probed: two loads 3 s apart, two probes per disk (6.5s)
+[disks.1] cadence 2000 ms, loads 1 s apart: /dev/sda=1 /dev/sdb=1 /dev/sdc=1
+  ✓  2 [integration] › tests/integration/disks-reprobe.spec.ts:296:3 › disks.1 — SMART readings age out (stunt node) › a reading younger than the cadence is a hit: two loads 1 s apart, one probe per disk (4.4s)
+[disks.1] default cadence (no drop-in), loads 3 s apart: /dev/sda=1 /dev/sdb=1 /dev/sdc=1
+  ✓  3 [integration] › tests/integration/disks-reprobe.spec.ts:330:3 › disks.1 — SMART readings age out (stunt node) › control: without the drop-in the shipped 30-minute cadence holds — two loads 3 s apart, one probe per disk (6.4s)
+[disks.1] detail reading line: SMART read 19s ago
+  ✓  4 [integration] › tests/integration/disks-reprobe.spec.ts:355:3 › disks.1 — SMART readings age out (stunt node) › the disk detail dates the reading and shows no power-mode row for a disk that reports none (15.0s)
+[disks.1] dashboard version label: "ANAS 0.4.3" (/v1/health: 0.4.3)
+[disks.1] teardown — anasd/anas: active active
+  ✓  5 [integration] › tests/integration/disks-reprobe.spec.ts:408:3 › disks.1 — SMART readings age out (stunt node) › the dashboard header shows "ANAS <version>", the version /v1/health reports (1.5s)
+
+  5 passed (41.8s)

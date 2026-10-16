@@ -1,0 +1,13 @@
+(node:248046) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 4 tests using 1 worker
+
+(node:248182) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/dataset-permissions.spec.ts:138:3 › ANAS layered permissions editor (throwaway dataset) › the Permissions action opens the layered editor with the base rows, named grid, and Advanced panel (3.1s)
+  ✓  2 [integration] › tests/integration/dataset-permissions.spec.ts:167:3 › ANAS layered permissions editor (throwaway dataset) › with acl installed but posixacl not yet enabled, the add button is enabled and the enable-posixacl note shows (2.6s)
+  ✓  3 [integration] › tests/integration/dataset-permissions.spec.ts:185:3 › ANAS layered permissions editor (throwaway dataset) › a base-only change persists as mode bits and reloads (4.5s)
+  ✓  4 [integration] › tests/integration/dataset-permissions.spec.ts:208:3 › ANAS layered permissions editor (throwaway dataset) › adding a named user writes a POSIX ACL entry; removing it cleans the mode (5.8s)
+
+  4 passed (19.2s)

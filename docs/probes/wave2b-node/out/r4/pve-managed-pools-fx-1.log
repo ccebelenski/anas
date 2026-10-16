@@ -1,0 +1,12 @@
+(node:856170) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:856237) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/pve-managed-pools.spec.ts:30:3 › ANAS PVE-managed pools (stunt node) › Pools: the PVE pool is badged and its structural actions are disabled (2.8s)
+  ✓  2 [integration] › tests/integration/pve-managed-pools.spec.ts:56:3 › ANAS PVE-managed pools (stunt node) › Datasets: PVE pool root is banded + gated; ANAS pool root is not (2.8s)
+  ✓  3 [integration] › tests/integration/pve-managed-pools.spec.ts:93:3 › ANAS PVE-managed pools (stunt node) › Datasets: an ANAS sibling under the PVE storage root is manageable; a guest-named child is not (3.9s)
+
+  3 passed (10.3s)

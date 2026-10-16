@@ -1,0 +1,129 @@
+zfs zfs-2.4.4-pve1, kernel 7.0.14-23-pve
+
+==================== (a1) zfs destroy -r of a tree whose child w2bz/t/o@s is the origin of w2bz/c (outside the tree)
+before:
+  | w2bz	filesystem	-
+  | w2bz/c	filesystem	w2bz/t/o@s
+  | w2bz/t	filesystem	-
+  | w2bz/t@s	snapshot	-
+  | w2bz/t/a	filesystem	-
+  | w2bz/t/a@s	snapshot	-
+  | w2bz/t/o	filesystem	-
+  | w2bz/t/o@s	snapshot	-
+  | w2bz/t/o/g	filesystem	-
+  | w2bz/t/o/g@s	snapshot	-
+  | w2bz/t/z	filesystem	-
+  | w2bz/t/z@s	snapshot	-
+$ zfs destroy -r w2bz/t
+exit code: 1
+stdout:
+stderr:
+  | cannot destroy 'w2bz/t': filesystem has dependent clones
+  | use '-R' to destroy the following datasets:
+  | w2bz/c
+zfs list -t all -r -o name,type,origin w2bz  (after):
+  | w2bz	filesystem	-
+  | w2bz/c	filesystem	w2bz/t/o@s
+  | w2bz/t	filesystem	-
+  | w2bz/t@s	snapshot	-
+  | w2bz/t/a	filesystem	-
+  | w2bz/t/a@s	snapshot	-
+  | w2bz/t/o	filesystem	-
+  | w2bz/t/o@s	snapshot	-
+  | w2bz/t/o/g	filesystem	-
+  | w2bz/t/o/g@s	snapshot	-
+  | w2bz/t/z	filesystem	-
+  | w2bz/t/z@s	snapshot	-
+
+==================== (a2) the same tree, dry run: zfs destroy -rnv w2bz/t
+$ zfs destroy -rnv w2bz/t
+exit code: 1
+stdout:
+stderr:
+  | cannot destroy 'w2bz/t': filesystem has dependent clones
+  | use '-R' to destroy the following datasets:
+  | w2bz/c
+zfs list -t all -r -o name,type,origin w2bz  (after):
+  | w2bz	filesystem	-
+  | w2bz/c	filesystem	w2bz/t/o@s
+  | w2bz/t	filesystem	-
+  | w2bz/t@s	snapshot	-
+  | w2bz/t/a	filesystem	-
+  | w2bz/t/a@s	snapshot	-
+  | w2bz/t/o	filesystem	-
+  | w2bz/t/o@s	snapshot	-
+  | w2bz/t/o/g	filesystem	-
+  | w2bz/t/o/g@s	snapshot	-
+  | w2bz/t/z	filesystem	-
+  | w2bz/t/z@s	snapshot	-
+
+==================== (a3) the clone INSIDE the tree (w2bz/t/k = clone of w2bz/t/o@s): zfs destroy -r w2bz/t
+before:
+  | w2bz	filesystem	-
+  | w2bz/t	filesystem	-
+  | w2bz/t@s	snapshot	-
+  | w2bz/t/a	filesystem	-
+  | w2bz/t/a@s	snapshot	-
+  | w2bz/t/k	filesystem	w2bz/t/o@s
+  | w2bz/t/o	filesystem	-
+  | w2bz/t/o@s	snapshot	-
+  | w2bz/t/o/g	filesystem	-
+  | w2bz/t/o/g@s	snapshot	-
+  | w2bz/t/z	filesystem	-
+  | w2bz/t/z@s	snapshot	-
+$ zfs destroy -r w2bz/t
+exit code: 0
+stdout:
+stderr:
+zfs list -t all -r -o name,type,origin w2bz  (after):
+  | w2bz	filesystem	-
+
+==================== (b0) a zvol child with a snapshot: the sweep ANAS reads
+before:
+  | w2bz	filesystem	-
+  | w2bz/t	filesystem	-
+  | w2bz/t@s	snapshot	-
+  | w2bz/t/a	filesystem	-
+  | w2bz/t/a@s	snapshot	-
+  | w2bz/t/v	volume	-
+  | w2bz/t/v@s	snapshot	-
+  | w2bz/t/z	filesystem	-
+  | w2bz/t/z@s	snapshot	-
+$ zfs list -H -t snapshot -r -o name -- w2bz/t
+exit code: 0
+stdout:
+  | w2bz/t@s
+  | w2bz/t/a@s
+  | w2bz/t/v@s
+  | w2bz/t/z@s
+stderr:
+
+==================== (b1) zfs destroy -r w2bz/t (zvol child w2bz/t/v with w2bz/t/v@s)
+$ zfs destroy -r w2bz/t
+exit code: 0
+stdout:
+stderr:
+zfs list -t all -r -o name,type,origin w2bz  (after):
+  | w2bz	filesystem	-
+
+==================== (b2) the same with the zvol's snapshot HELD (zfs hold keep w2bz/t/v@s)
+$ zfs holds -H w2bz/t@s w2bz/t/a@s w2bz/t/v@s w2bz/t/z@s
+exit code: 0
+stdout:
+  | w2bz/t/v@s	keep	Fri Oct 16 05:41 2026
+stderr:
+$ zfs destroy -r w2bz/t
+exit code: 1
+stdout:
+stderr:
+  | cannot destroy snapshot w2bz/t/v@s: it's being held. Run 'zfs holds -r w2bz/t/v@s' to see holders.
+  | cannot destroy 'w2bz/t': dataset already exists
+zfs list -t all -r -o name,type,origin w2bz  (after):
+  | w2bz	filesystem	-
+  | w2bz/t	filesystem	-
+  | w2bz/t/v	volume	-
+  | w2bz/t/v@s	snapshot	-
+
+==================== cleanup
+  pool: gtbackup
+  pool: gtiscsi

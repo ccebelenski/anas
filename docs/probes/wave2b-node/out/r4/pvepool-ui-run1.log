@@ -1,0 +1,16 @@
+(node:310791) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 7 tests using 1 worker
+
+(node:310857) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/pvepool-ui.spec.ts:114:3 › pvepool.2 — Datasets on per-dataset PVE ownership (stunt node fixture) › badges per ownership kind; siblings carry none (2.9s)
+  ✓  2 [integration] › tests/integration/pvepool-ui.spec.ts:156:3 › pvepool.2 — Datasets on per-dataset PVE ownership (stunt node fixture) › toolbar gates per node kind, with the reason on the disabled buttons (2.7s)
+  ✓  3 [integration] › tests/integration/pvepool-ui.spec.ts:190:3 › pvepool.2 — Datasets on per-dataset PVE ownership (stunt node fixture) › create on the storage root: note, guard, reload-with-selection, destroy (happy path) (7.6s)
+  ✓  4 [integration] › tests/integration/pvepool-ui.spec.ts:242:3 › pvepool.2 — Datasets on per-dataset PVE ownership (stunt node fixture) › naming guard fires in the dialog before submit, and clears on a clean name (3.2s)
+  ✓  5 [integration] › tests/integration/pvepool-ui.spec.ts:271:3 › pvepool.2 — Datasets on per-dataset PVE ownership (stunt node fixture) › reload after a failed job: the daemon sentence shows, the tree refreshes (4.3s)
+  ✓  6 [integration] › tests/integration/pvepool-ui.spec.ts:308:3 › pvepool.2 — Datasets on per-dataset PVE ownership (stunt node fixture) › skew: per-node ownership stripped from the payload ⇒ the whole-pool rule (2.7s)
+  ✓  7 [integration] › tests/integration/pvepool-ui.spec.ts:352:3 › pvepool.2 — Datasets on per-dataset PVE ownership (stunt node fixture) › replication and snapshot-schedule pickers: PVE pools in, owned datasets out (3.5s)
+
+  7 passed (27.8s)

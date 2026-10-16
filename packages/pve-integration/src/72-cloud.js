@@ -3674,7 +3674,7 @@
     }
 
     function setPreviewCancel(win, busy, cancelling) {
-        var cancel = win.down('#cloudPreviewCancel');
+        var cancel = null; try { cancel = win.down('#cloudPreviewCancel'); } catch (e0) { return; } // wave-2b D13: on 'destroy' the window's items are gone and down() throws
         if (!cancel) {
             return;
         }

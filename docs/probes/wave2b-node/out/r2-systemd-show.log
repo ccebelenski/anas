@@ -1,0 +1,193 @@
+systemd systemd 257 (257.13-1~deb13u1)
+
+==================== (i) a stored, loadable ANAS task unit
+$ env TZ=UTC systemctl show anas-backup-w2bt1.service -p ActiveState,InactiveExitTimestamp
+exit code: 0
+stdout:
+  | ActiveState=inactive
+  | InactiveExitTimestamp=
+stderr:
+$ systemctl show anas-backup-w2bt1.service -p ActiveState
+exit code: 0
+stdout:
+  | ActiveState=inactive
+stderr:
+$ systemctl show anas-backup-w2bt1.service -p LoadState,LoadError
+exit code: 0
+stdout:
+  | LoadState=loaded
+  | LoadError=
+stderr:
+
+==================== (ii-a) [Service] Type=oneshot ExecStart=true  [file]
+$ env TZ=UTC systemctl show w2bbad-a.service -p ActiveState,InactiveExitTimestamp
+exit code: 0
+stdout:
+  | ActiveState=inactive
+  | InactiveExitTimestamp=
+stderr:
+$ systemctl show w2bbad-a.service -p ActiveState
+exit code: 0
+stdout:
+  | ActiveState=inactive
+stderr:
+$ systemctl show w2bbad-a.service -p LoadState,LoadError
+exit code: 0
+stdout:
+  | LoadState=loaded
+  | LoadError=
+stderr:
+
+==================== (ii-b) [Service] Type=oneshot  [file]
+$ env TZ=UTC systemctl show w2bbad-b.service -p ActiveState,InactiveExitTimestamp
+exit code: 0
+stdout:
+  | ActiveState=inactive
+  | InactiveExitTimestamp=
+stderr:
+$ systemctl show w2bbad-b.service -p ActiveState
+exit code: 0
+stdout:
+  | ActiveState=inactive
+stderr:
+$ systemctl show w2bbad-b.service -p LoadState,LoadError
+exit code: 0
+stdout:
+  | LoadState=bad-setting
+  | LoadError=org.freedesktop.systemd1.BadUnitSetting "Unit w2bbad-b.service has a bad unit file setting."
+stderr:
+
+==================== (ii-c) [Service Type=oneshot ExecStart=/bin/true  [file]
+$ env TZ=UTC systemctl show w2bbad-c.service -p ActiveState,InactiveExitTimestamp
+exit code: 0
+stdout:
+  | ActiveState=inactive
+  | InactiveExitTimestamp=
+stderr:
+$ systemctl show w2bbad-c.service -p ActiveState
+exit code: 0
+stdout:
+  | ActiveState=inactive
+stderr:
+$ systemctl show w2bbad-c.service -p LoadState,LoadError
+exit code: 0
+stdout:
+  | LoadState=error
+  | LoadError=org.freedesktop.DBus.Error.InconsistentMessage "Unit w2bbad-c.service failed to load properly, please adjust/correct and reload service manager: Bad message"
+stderr:
+
+==================== (ii-d) [Service] Type=w2bnope ExecStart=/bin/true  [file]
+$ env TZ=UTC systemctl show w2bbad-d.service -p ActiveState,InactiveExitTimestamp
+exit code: 0
+stdout:
+  | ActiveState=inactive
+  | InactiveExitTimestamp=
+stderr:
+$ systemctl show w2bbad-d.service -p ActiveState
+exit code: 0
+stdout:
+  | ActiveState=inactive
+stderr:
+$ systemctl show w2bbad-d.service -p LoadState,LoadError
+exit code: 0
+stdout:
+  | LoadState=loaded
+  | LoadError=
+stderr:
+
+==================== (ii-e)  [file]
+$ env TZ=UTC systemctl show w2bbad-e.service -p ActiveState,InactiveExitTimestamp
+exit code: 0
+stdout:
+  | ActiveState=inactive
+  | InactiveExitTimestamp=
+stderr:
+$ systemctl show w2bbad-e.service -p ActiveState
+exit code: 0
+stdout:
+  | ActiveState=inactive
+stderr:
+$ systemctl show w2bbad-e.service -p LoadState,LoadError
+exit code: 0
+stdout:
+  | LoadState=masked
+  | LoadError=org.freedesktop.systemd1.UnitMasked "Unit w2bbad-e.service is masked."
+stderr:
+
+==================== (ii-f)  [/dev/null]
+$ env TZ=UTC systemctl show w2bbad-f.service -p ActiveState,InactiveExitTimestamp
+exit code: 0
+stdout:
+  | ActiveState=inactive
+  | InactiveExitTimestamp=
+stderr:
+$ systemctl show w2bbad-f.service -p ActiveState
+exit code: 0
+stdout:
+  | ActiveState=inactive
+stderr:
+$ systemctl show w2bbad-f.service -p LoadState,LoadError
+exit code: 0
+stdout:
+  | LoadState=masked
+  | LoadError=org.freedesktop.systemd1.UnitMasked "Unit w2bbad-f.service is masked."
+stderr:
+
+==================== (ii) the journal's view of the bad units (daemon-reload)
+  | /run/systemd/system/w2bbad-c.service:1: Invalid section header '[Service'
+  | /run/systemd/system/w2bbad-d.service:2: Failed to parse Type=w2bnope, ignoring: Invalid argument
+  | w2bbad-b.service: Service has no ExecStart=, ExecStop=, or SuccessAction=. Refusing.
+
+==================== (iii) a nonexistent unit
+$ env TZ=UTC systemctl show anas-backup-w2bnope.service -p ActiveState,InactiveExitTimestamp
+exit code: 0
+stdout:
+  | ActiveState=inactive
+  | InactiveExitTimestamp=
+stderr:
+$ systemctl show anas-backup-w2bnope.service -p ActiveState
+exit code: 0
+stdout:
+  | ActiveState=inactive
+stderr:
+$ systemctl show anas-backup-w2bnope.service -p LoadState,LoadError
+exit code: 0
+stdout:
+  | LoadState=not-found
+  | LoadError=org.freedesktop.systemd1.NoSuchUnit "Unit anas-backup-w2bnope.service not found."
+stderr:
+
+==================== (iv) a template name with no instance
+$ env TZ=UTC systemctl show anas-backup-@.service -p ActiveState,InactiveExitTimestamp
+exit code: 1
+stdout:
+stderr:
+  | Failed to get properties: Unit name anas-backup-@.service is neither a valid invocation ID nor unit name.
+$ systemctl show anas-backup-@.service -p ActiveState
+exit code: 1
+stdout:
+stderr:
+  | Failed to get properties: Unit name anas-backup-@.service is neither a valid invocation ID nor unit name.
+$ systemctl show anas-backup-@.service -p LoadState,LoadError
+exit code: 1
+stdout:
+stderr:
+  | Failed to get properties: Unit name anas-backup-@.service is neither a valid invocation ID nor unit name.
+$ env TZ=UTC systemctl show w2bbad@.service -p ActiveState,InactiveExitTimestamp
+exit code: 1
+stdout:
+stderr:
+  | Failed to get properties: Unit name w2bbad@.service is neither a valid invocation ID nor unit name.
+$ systemctl show w2bbad@.service -p ActiveState
+exit code: 1
+stdout:
+stderr:
+  | Failed to get properties: Unit name w2bbad@.service is neither a valid invocation ID nor unit name.
+$ systemctl show w2bbad@.service -p LoadState,LoadError
+exit code: 1
+stdout:
+stderr:
+  | Failed to get properties: Unit name w2bbad@.service is neither a valid invocation ID nor unit name.
+
+==================== cleanup
+no w2bbad units left

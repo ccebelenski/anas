@@ -1,0 +1,56 @@
+(node:293467) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 2 tests using 1 worker
+
+(node:293554) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  1 [integration] › tests/integration/pool-composer.spec.ts:57:3 › ANAS Pool Composer (stunt node) › launches from the Pools grid and gates Create on draft validity (1.0s)
+(node:293922) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  2 [integration] › tests/integration/pool-composer.spec.ts:127:3 › ANAS Pool Composer create (throwaway pool) › builds a mirror in the composer and creates the pool for real (1.5s)
+
+
+  1) [integration] › tests/integration/pool-composer.spec.ts:57:3 › ANAS Pool Composer (stunt node) › launches from the Pools grid and gates Create on draft validity 
+
+    Error: fixture required (ANAS_REQUIRE_FIXTURES=1): need >= 2 spare disks — attach with add-disk.sh
+
+       at integration/fixtures/stunt-node.ts:52
+
+      50 |     return
+      51 |   if (fixturesRequired())
+    > 52 |     throw new Error(`fixture required (ANAS_REQUIRE_FIXTURES=1): ${reason}`)
+         |           ^
+      53 |   test.skip(true, reason)
+      54 | }
+      55 |
+        at skipIfFixtureMissing (/home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/fixtures/stunt-node.ts:52:11)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pool-composer.spec.ts:59:5
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/pool-composer-ANAS-Pool-Co-42d40-es-Create-on-draft-validity-integration/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [integration] › tests/integration/pool-composer.spec.ts:127:3 › ANAS Pool Composer create (throwaway pool) › builds a mirror in the composer and creates the pool for real 
+
+    Error: fixture required (ANAS_REQUIRE_FIXTURES=1): need >= 2 spare disks — attach with add-disk.sh
+
+       at integration/fixtures/stunt-node.ts:52
+
+      50 |     return
+      51 |   if (fixturesRequired())
+    > 52 |     throw new Error(`fixture required (ANAS_REQUIRE_FIXTURES=1): ${reason}`)
+         |           ^
+      53 |   test.skip(true, reason)
+      54 | }
+      55 |
+        at skipIfFixtureMissing (/home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/fixtures/stunt-node.ts:52:11)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pool-composer.spec.ts:129:5
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/pool-composer-ANAS-Pool-Co-8017c-d-creates-the-pool-for-real-integration/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2 failed
+    [integration] › tests/integration/pool-composer.spec.ts:57:3 › ANAS Pool Composer (stunt node) › launches from the Pools grid and gates Create on draft validity 
+    [integration] › tests/integration/pool-composer.spec.ts:127:3 › ANAS Pool Composer create (throwaway pool) › builds a mirror in the composer and creates the pool for real 

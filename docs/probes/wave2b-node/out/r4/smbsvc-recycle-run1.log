@@ -1,0 +1,14 @@
+(node:351289) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 5 tests using 1 worker
+
+(node:351391) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/smbsvc-recycle.spec.ts:286:3 › Recycle bin on SMB shares (smbsvc.2) › 1 — enable through the API: detail shows the purge age; the stanza carries the composed VFS line, the four recycle keys, and the marker (6.9s)
+  ✓  2 [integration] › tests/integration/smbsvc-recycle.spec.ts:331:3 › Recycle bin on SMB shares (smbsvc.2) › 2 — smbclient on the node: del lands in #recycle with ctime = now, versions collide as "Copy #1 of", deleting from the bin is real, deltree empties, the bin is recreated (4.3s)
+  ✓  3 [integration] › tests/integration/smbsvc-recycle.spec.ts:376:3 › Recycle bin on SMB shares (smbsvc.2) › 3 — purge through the unit: young files are kept; with the age at 7 a file whose ctime is 8 days old is removed, its emptied dir pruned, a young file beside it kept, the bin kept — the node clock never moves (7.7s)
+  ✓  4 [integration] › tests/integration/smbsvc-recycle.spec.ts:459:3 › Recycle bin on SMB shares (smbsvc.2) › 4 — never and off: purgeDays null writes the `never` marker and the runner skips the share; recycle null restores the stanza byte-identically and leaves #recycle on disk (4.5s)
+  ✓  5 [integration] › tests/integration/smbsvc-recycle.spec.ts:497:3 › Recycle bin on SMB shares (smbsvc.2) › 5 — refusal: a share with a custom vfs objects line cannot enable the recycle bin (400, share named) (2.8s)
+
+  5 passed (30.4s)

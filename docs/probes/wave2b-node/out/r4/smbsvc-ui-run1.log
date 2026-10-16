@@ -1,0 +1,15 @@
+(node:360443) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 6 tests using 1 worker
+
+(node:360511) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/smbsvc-ui.spec.ts:251:3 › smbsvc.1 — Self-service on SMB shares (stunt node UI) › 1 — create through the dialog: Self-service fieldset, Previous Versions unticked, no note (5.9s)
+  ✓  2 [integration] › tests/integration/smbsvc-ui.spec.ts:277:3 › smbsvc.1 — Self-service on SMB shares (stunt node UI) › 2 — edit: tick → the empty-until-a-schedule-runs note → detail reads "on — daily schedule" (4.0s)
+  ✓  3 [integration] › tests/integration/smbsvc-ui.spec.ts:309:3 › smbsvc.1 — Self-service on SMB shares (stunt node UI) › 3 — untouched edit: the PUT body carries no previousVersions key and the stanza round-trips byte-identically (3.8s)
+  ✓  4 [integration] › tests/integration/smbsvc-ui.spec.ts:344:3 › smbsvc.1 — Self-service on SMB shares (stunt node UI) › 4 — untick: detail reads "off"; the stanza loses every shadow: key (4.0s)
+  ✓  5 [integration] › tests/integration/smbsvc-ui.spec.ts:374:3 › smbsvc.1 — Self-service on SMB shares (stunt node UI) › 5 — a custom vfs objects line greys the row with its reason; the line is removed again (4.0s)
+  ✓  6 [integration] › tests/integration/smbsvc-ui.spec.ts:423:3 › smbsvc.1 — Self-service on SMB shares (stunt node UI) › 6 — failed save: the failure alert shows the sentence AND the grid reloads; the row survives (2.8s)
+
+  6 passed (30.8s)

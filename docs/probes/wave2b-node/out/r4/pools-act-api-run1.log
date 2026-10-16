@@ -1,0 +1,94 @@
+(node:295323) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 9 tests using 1 worker
+
+(node:295390) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/pools-act-api.spec.ts:65:3 › Pool safety confirmation — challenge (no mutation) › export without a confirm code → 409 CONFIRMATION_REQUIRED + code header (734ms)
+  ✓  2 [integration] › tests/integration/pools-act-api.spec.ts:81:3 › Pool safety confirmation — challenge (no mutation) › destroy without a confirm code → 409 CONFIRMATION_REQUIRED + code header (437ms)
+  ✓  3 [integration] › tests/integration/pools-act-api.spec.ts:96:3 › Pool safety confirmation — challenge (no mutation) › destroy with a WRONG confirm code → 409 again (code not honoured) (455ms)
+  ✓  4 [integration] › tests/integration/pools-act-api.spec.ts:111:3 › Pool safety confirmation — challenge (no mutation) › destroying the boot/root pool → 409 Level-1 refusal with NO code header (930ms)
+  ✓  5 [integration] › tests/integration/pools-act-api.spec.ts:149:3 › Pool property modify (3.9) › PUT /pools/testpool changing a property → 202 { job } (808ms)
+  ✘  6 [integration] › tests/integration/pools-act-api.spec.ts:196:3 › Pool create / destroy / export / import (spare disks) › creates a pool via the API, then destroys it through the confirmation flow (3.8, 3.14) (3.2s)
+(node:296680) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  7 [integration] › tests/integration/pools-act-api.spec.ts:242:3 › Pool create / destroy / export / import (spare disks) › exports a pool through the confirmation flow (3.13) (3.4s)
+(node:297335) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  8 [integration] › tests/integration/pools-act-api.spec.ts:271:3 › Pool create / destroy / export / import (spare disks) › imports a known (exported) pool (3.7) (3.3s)
+(node:298008) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  9 [integration] › tests/integration/pools-act-api.spec.ts:293:3 › Pool create / destroy / export / import (spare disks) › adds a vdev to a pool (3.11) (3.2s)
+
+
+  1) [integration] › tests/integration/pools-act-api.spec.ts:196:3 › Pool create / destroy / export / import (spare disks) › creates a pool via the API, then destroys it through the confirmation flow (3.8, 3.14) 
+
+    Error: fixture required (ANAS_REQUIRE_FIXTURES=1): no spare disks — attach one with add-disk.sh
+
+       at integration/fixtures/stunt-node.ts:52
+
+      50 |     return
+      51 |   if (fixturesRequired())
+    > 52 |     throw new Error(`fixture required (ANAS_REQUIRE_FIXTURES=1): ${reason}`)
+         |           ^
+      53 |   test.skip(true, reason)
+      54 | }
+      55 |
+        at skipIfFixtureMissing (/home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/fixtures/stunt-node.ts:52:11)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pools-act-api.spec.ts:197:5
+
+  2) [integration] › tests/integration/pools-act-api.spec.ts:242:3 › Pool create / destroy / export / import (spare disks) › exports a pool through the confirmation flow (3.13) 
+
+    Error: fixture required (ANAS_REQUIRE_FIXTURES=1): no spare disks — attach one with add-disk.sh
+
+       at integration/fixtures/stunt-node.ts:52
+
+      50 |     return
+      51 |   if (fixturesRequired())
+    > 52 |     throw new Error(`fixture required (ANAS_REQUIRE_FIXTURES=1): ${reason}`)
+         |           ^
+      53 |   test.skip(true, reason)
+      54 | }
+      55 |
+        at skipIfFixtureMissing (/home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/fixtures/stunt-node.ts:52:11)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pools-act-api.spec.ts:243:5
+
+  3) [integration] › tests/integration/pools-act-api.spec.ts:271:3 › Pool create / destroy / export / import (spare disks) › imports a known (exported) pool (3.7) 
+
+    Error: fixture required (ANAS_REQUIRE_FIXTURES=1): no spare disks — attach one with add-disk.sh
+
+       at integration/fixtures/stunt-node.ts:52
+
+      50 |     return
+      51 |   if (fixturesRequired())
+    > 52 |     throw new Error(`fixture required (ANAS_REQUIRE_FIXTURES=1): ${reason}`)
+         |           ^
+      53 |   test.skip(true, reason)
+      54 | }
+      55 |
+        at skipIfFixtureMissing (/home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/fixtures/stunt-node.ts:52:11)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pools-act-api.spec.ts:272:5
+
+  4) [integration] › tests/integration/pools-act-api.spec.ts:293:3 › Pool create / destroy / export / import (spare disks) › adds a vdev to a pool (3.11) 
+
+    Error: fixture required (ANAS_REQUIRE_FIXTURES=1): need 2 spare disks — attach more with add-disk.sh
+
+       at integration/fixtures/stunt-node.ts:52
+
+      50 |     return
+      51 |   if (fixturesRequired())
+    > 52 |     throw new Error(`fixture required (ANAS_REQUIRE_FIXTURES=1): ${reason}`)
+         |           ^
+      53 |   test.skip(true, reason)
+      54 | }
+      55 |
+        at skipIfFixtureMissing (/home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/fixtures/stunt-node.ts:52:11)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pools-act-api.spec.ts:294:5
+
+  4 failed
+    [integration] › tests/integration/pools-act-api.spec.ts:196:3 › Pool create / destroy / export / import (spare disks) › creates a pool via the API, then destroys it through the confirmation flow (3.8, 3.14) 
+    [integration] › tests/integration/pools-act-api.spec.ts:242:3 › Pool create / destroy / export / import (spare disks) › exports a pool through the confirmation flow (3.13) 
+    [integration] › tests/integration/pools-act-api.spec.ts:271:3 › Pool create / destroy / export / import (spare disks) › imports a known (exported) pool (3.7) 
+    [integration] › tests/integration/pools-act-api.spec.ts:293:3 › Pool create / destroy / export / import (spare disks) › adds a vdev to a pool (3.11) 
+  5 passed (19.9s)

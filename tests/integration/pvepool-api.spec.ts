@@ -284,9 +284,9 @@ test.describe('Owned-dataset mutations refused', () => {
     const ctx = await apiContext(playwright)
     try {
       const res = await ctx.delete(`${V1}/pools/${PVE_POOL}/datasets/vm-100-disk-0`)
-      expect(res.status()).toBe(400)
+      expect(res.status()).toBe(409)
       const err = (await res.json()).error
-      expect(err.code).toBe('VALIDATION_ERROR')
+      expect(err.code).toBe('PVE_MANAGED')
       expect(err.message).toBe(`PVE storage '${PVE_POOL}' owns ${PVE_POOL}/vm-100-disk-0 as a guest volume`)
       expect(await datasetExists(`${PVE_POOL}/vm-100-disk-0`)).toBe(true)
     }
@@ -301,9 +301,9 @@ test.describe('Owned-dataset mutations refused', () => {
       const res = await ctx.put(`${V1}/pools/${PVE_POOL}/datasets/subvol-101-disk-0`, {
         data: { properties: { compression: 'lz4' } },
       })
-      expect(res.status()).toBe(400)
+      expect(res.status()).toBe(409)
       const err = (await res.json()).error
-      expect(err.code).toBe('VALIDATION_ERROR')
+      expect(err.code).toBe('PVE_MANAGED')
       expect(err.message).toBe(`PVE storage '${PVE_POOL}' owns ${PVE_POOL}/subvol-101-disk-0 as a guest volume`)
     }
     finally {
@@ -317,9 +317,9 @@ test.describe('Owned-dataset mutations refused', () => {
       const res = await ctx.post(`${V1}/pools/${PVE_POOL}/datasets//snapshots`, {
         data: { name: 'proof-snap' },
       })
-      expect(res.status()).toBe(400)
+      expect(res.status()).toBe(409)
       const err = (await res.json()).error
-      expect(err.code).toBe('VALIDATION_ERROR')
+      expect(err.code).toBe('PVE_MANAGED')
       expect(err.message).toContain(`PVE storage '${PVE_POOL}' owns ${PVE_POOL}`)
       // The storage root really has no such snapshot (source of truth).
       const snaps = await sshExec(`zfs list -H -o name -t snapshot -d 1 ${PVE_POOL} 2>/dev/null || true`)
@@ -334,9 +334,9 @@ test.describe('Owned-dataset mutations refused', () => {
     const ctx = await apiContext(playwright)
     try {
       const res = await ctx.delete(`${V1}/pools/${SYS_POOL}/datasets/ROOT/pve-1`)
-      expect(res.status()).toBe(400)
+      expect(res.status()).toBe(409)
       const err = (await res.json()).error
-      expect(err.code).toBe('VALIDATION_ERROR')
+      expect(err.code).toBe('PVE_MANAGED')
       expect(err.message).toBe(`${SYS_POOL}/ROOT/pve-1 is the boot filesystem of pool ${SYS_POOL}`)
       expect(await datasetExists(`${SYS_POOL}/ROOT/pve-1`)).toBe(true)
     }
@@ -380,9 +380,9 @@ test.describe('Snapshot schedules', () => {
           target: { kind: 'zfs', dataset: `${PVE_POOL}/vm-100-disk-0` },
         },
       })
-      expect(refused.status()).toBe(400)
+      expect(refused.status()).toBe(409)
       const err = (await refused.json()).error
-      expect(err.code).toBe('VALIDATION_ERROR')
+      expect(err.code).toBe('PVE_MANAGED')
       expect(err.message).toBe(`Cannot schedule snapshots of '${PVE_POOL}/vm-100-disk-0' — PVE storage '${PVE_POOL}' owns ${PVE_POOL}/vm-100-disk-0 as a guest volume`)
 
       // Clean up the accepted schedule through its own door.

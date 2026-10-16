@@ -1,0 +1,8 @@
+  Logical volume "w2bahr-vol" successfully removed.
+  Volume group "w2bahr" successfully removed
+  Labels on physical volume "/dev/md/w2bahr-r1" successfully wiped.
+mdadm: stopped /dev/md/w2bahr-r1
+Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] 
+unused devices: <none>
+✓ hot20 (SCSI) detached
+✓ hot21 (SCSI) detached

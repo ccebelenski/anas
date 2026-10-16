@@ -1,0 +1,19 @@
+(node:253304) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 5 tests using 1 worker
+
+(node:253405) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/datasets-hero.spec.ts:81:3 › dshero.1 — Pool space hero bounded on a PVE-storage pool (#70) › guest volumes fold into ONE legend row; the legend stays capped (2.8s)
+dshero.1 @2560x1080 tree body 471px of panel 758px = 62.1%
+  ✓  2 [integration] › tests/integration/datasets-hero.spec.ts:101:3 › dshero.1 — Pool space hero bounded on a PVE-storage pool (#70) › the tree keeps at least half the Datasets panel height (2.6s)
+dshero.1 @2560x1080 tree body 399px of panel 758px = 52.6%
+  ✓  3 [integration] › tests/integration/datasets-hero.spec.ts:158:3 › dshero.1 — the cap on a pool with many datasets (#70) › 18 datasets: the legend rolls up past 6 into one "n more" row and the tree keeps half (2.2s)
+dshero.1 @1366x768 tree body 295px of panel 446px = 66.1%
+dshero.1 @1366x768 shown: legend rows hero-12 | hero-11 | 11 more | Proxmox storage | Free; tree body 156px
+  ✓  4 [integration] › tests/integration/datasets-hero.spec.ts:199:5 › dshero.1 — the cap on a pool with many datasets (#70) › at 1366x768 › 18 datasets at 1366x768: the hero starts collapsed and the tree keeps half; Show chart reveals the compact legend (2.7s)
+dshero.1 @1366x768 toggle: tree body 156px shown -> 295px hidden
+  ✓  5 [integration] › tests/integration/datasets-hero.spec.ts:216:5 › dshero.1 — the cap on a pool with many datasets (#70) › at 1366x768 › the choice is the user's: Show chart and Hide chart each survive a reload (4.8s)
+
+  5 passed (18.4s)

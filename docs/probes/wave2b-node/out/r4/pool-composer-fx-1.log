@@ -1,0 +1,11 @@
+(node:847323) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 2 tests using 1 worker
+
+(node:847453) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/pool-composer.spec.ts:57:3 › ANAS Pool Composer (stunt node) › launches from the Pools grid and gates Create on draft validity (4.4s)
+  ✓  2 [integration] › tests/integration/pool-composer.spec.ts:127:3 › ANAS Pool Composer create (throwaway pool) › builds a mirror in the composer and creates the pool for real (6.3s)
+
+  2 passed (11.6s)

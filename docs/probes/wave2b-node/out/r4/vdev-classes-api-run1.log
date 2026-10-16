@@ -1,0 +1,12 @@
+(node:382426) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:382523) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/vdev-classes-api.spec.ts:75:3 › vdevs.1 — pool-level vdev classes (stunt node fixture) › GET /v1/pools/gtvdev lists all six vdev classes in fixed order (1.6s)
+  ✓  2 [integration] › tests/integration/vdev-classes-api.spec.ts:120:3 › vdevs.1 — pool-level vdev classes (stunt node fixture) › GET /v1/telemetry resolves the kernel-named partition leaves to the disk id the Disks list carries (1.3s)
+  ✓  3 [integration] › tests/integration/vdev-classes-api.spec.ts:159:5 › vdevs.1 — pool-level vdev classes (stunt node fixture) › UI › the pool detail topology shows Log, Special and Dedup nodes (2.6s)
+
+  3 passed (12.8s)

@@ -1,0 +1,23 @@
+
+### DELETE /pools/pvfix/datasets/vm-100-disk-0
+HTTP 409 0.039846
+{"error":{"code":"PVE_MANAGED","message":"PVE storage 'pvfix' owns pvfix/vm-100-disk-0 as a guest volume","reason":"pve-managed"}}
+
+### PUT /pools/pvfix/datasets/subvol-101-disk-0 {compression}
+HTTP 409 0.064871
+{"error":{"code":"PVE_MANAGED","message":"PVE storage 'pvfix' owns pvfix/subvol-101-disk-0 as a guest volume","reason":"pve-managed"}}
+
+### POST /pools/pvfix/datasets//snapshots
+HTTP 409 0.083722
+{"error":{"code":"PVE_MANAGED","message":"PVE storage 'pvfix' owns pvfix as a storage root","reason":"pve-managed"}}
+
+### DELETE /pools/sysfix/datasets/ROOT/pve-1
+HTTP 409 0.107722
+{"error":{"code":"PVE_MANAGED","message":"sysfix/ROOT/pve-1 is the boot filesystem of pool sysfix","reason":"pve-managed"}}
+
+### POST /schedules on pvfix/vm-100-disk-0
+HTTP 409 0.095141
+{"error":{"code":"PVE_MANAGED","message":"Cannot schedule snapshots of 'pvfix/vm-100-disk-0' — PVE storage 'pvfix' owns pvfix/vm-100-disk-0 as a guest volume","reason":"pve-managed"}}
+
+### node after
+0

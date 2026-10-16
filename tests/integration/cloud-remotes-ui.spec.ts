@@ -367,7 +367,7 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     await expect(dlg.locator('.anas-cloud-test-verdict')).toContainText('Authentication failed', { timeout: 60_000 })
 
     // Nothing was written: the wrong remote never reaches the grid or the file.
-    await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
+    await dlg.getByRole('button', { name: 'Cancel', exact: true }).click()
     await expect(dlg).toBeHidden({ timeout: 20_000 })
     await expect(remoteRow(page, win, 'gt-wrongpass')).toHaveCount(0)
   })
@@ -410,7 +410,7 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     const why = `region examples after picking AWS: ${regionAfter.join(',')}`
     expect(regionAfter, why).not.toContain('other-v2-signature')
 
-    await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
+    await dlg.getByRole('button', { name: 'Cancel', exact: true }).click()
     await expect(dlg).toBeHidden({ timeout: 20_000 })
   })
 
@@ -493,7 +493,7 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     // be retried — a failed save must not throw away what was typed. Only a
     // completed job closes it. Close it by hand, the way the user would.
     await expect(dlg).toBeVisible()
-    await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
+    await dlg.getByRole('button', { name: 'Cancel', exact: true }).click()
     await expect(dlg).toBeHidden({ timeout: 20_000 })
     expect(await storeSection(REMOTE)).not.toBe('')
   })

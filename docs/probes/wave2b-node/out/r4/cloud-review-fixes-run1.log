@@ -1,0 +1,40 @@
+(node:180360) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:180427) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  1 [integration] › tests/integration/cloud-review-fixes.spec.ts:249:3 › cloud review-fix live proofs — token paste (rclone.1) + Run-now gate/progress (rclone.3) › 1 — token paste in the Add dialog: markers stripped, quotes unwrapped, a plain word marked with Test/Save disabled, and a Test of the object answers a verdict (5.3s)
+  -  2 [integration] › tests/integration/cloud-review-fixes.spec.ts:307:3 › cloud review-fix live proofs — token paste (rclone.1) + Run-now gate/progress (rclone.3) › 2 — token paste at the API: the test door refuses a non-JSON token with the sentence and normalises the marker-wrapped paste
+  -  3 [integration] › tests/integration/cloud-review-fixes.spec.ts:334:3 › cloud review-fix live proofs — token paste (rclone.1) + Run-now gate/progress (rclone.3) › 3 — Run now gates a running run with 409, runningProgress rides the row past the supervision ceiling, and Run now comes back when the run ends
+
+
+  1) [integration] › tests/integration/cloud-review-fixes.spec.ts:249:3 › cloud review-fix live proofs — token paste (rclone.1) + Run-now gate/progress (rclone.3) › 1 — token paste in the Add dialog: markers stripped, quotes unwrapped, a plain word marked with Test/Save disabled, and a Test of the object answers a verdict 
+
+    Error: locator.click: Error: strict mode violation: locator('.anas-win-cloud-remote-edit').locator('.x-btn').filter({ hasText: 'Cancel' }) resolved to 2 elements:
+        1) <a role="button" hidefocus="on" id="button-1249" unselectable="on" aria-hidden="true" aria-disabled="true" data-componentid="button-1249" class="x-btn anas-btn-cloud-test-cancel x-unselectable x-box-item x-btn-default-small x-item-disabled x-btn-disabled">…</a> aka locator('#button-1249')
+        2) <a tabindex="0" role="button" hidefocus="on" id="button-1253" unselectable="on" aria-hidden="false" aria-disabled="false" data-componentid="button-1253" class="x-btn x-unselectable x-box-item x-toolbar-item x-btn-default-small">…</a> aka getByRole('button', { name: 'Cancel', exact: true })
+
+    Call log:
+    [2m  - waiting for locator('.anas-win-cloud-remote-edit').locator('.x-btn').filter({ hasText: 'Cancel' })[22m
+
+
+      300 |     expect(verdictText, `verdict was: ${verdictText}`).not.toContain('cannot unmarshal')
+      301 |
+    > 302 |     await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
+          |                                                        ^
+      303 |     await expect(dlg).toBeHidden({ timeout: 20_000 })
+      304 |     await expect(win.locator('.x-grid-row', { hasText: /^gtdrive-paste/ })).toHaveCount(0)
+      305 |   })
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/cloud-review-fixes.spec.ts:302:56
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-review-fixes-cloud-r-71fef-he-object-answers-a-verdict-integration/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-review-fixes-cloud-r-71fef-he-object-answers-a-verdict-integration/error-context.md
+
+  1 failed
+    [integration] › tests/integration/cloud-review-fixes.spec.ts:249:3 › cloud review-fix live proofs — token paste (rclone.1) + Run-now gate/progress (rclone.3) › 1 — token paste in the Add dialog: markers stripped, quotes unwrapped, a plain word marked with Test/Save disabled, and a Test of the object answers a verdict 
+  2 did not run

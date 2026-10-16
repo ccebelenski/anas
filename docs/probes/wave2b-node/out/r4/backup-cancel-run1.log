@@ -1,0 +1,57 @@
+(node:93601) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 2 tests using 1 worker
+
+(node:93670) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  1 [integration] › tests/integration/backup-cancel.spec.ts:306:3 › backup cancel live proof — the rclone.5 backup half › 1 — the cancel ladder: 409 + code, replay 202, the pbc child stopped (gone, exit 130), cancelled row with its note, no new snapshot on PBS, no transient left, no notification, no prune (11.0s)
+  -  2 [integration] › tests/integration/backup-cancel.spec.ts:459:3 › backup cancel live proof — the rclone.5 backup half › 2 — the dialog: Cancel run enabled only on a running row, the daemon words the window, Keep running sends nothing, confirming cancels and the row reads cancelled
+
+
+  1) [integration] › tests/integration/backup-cancel.spec.ts:306:3 › backup cancel live proof — the rclone.5 backup half › 1 — the cancel ladder: 409 + code, replay 202, the pbc child stopped (gone, exit 130), cancelled row with its note, no new snapshot on PBS, no transient left, no notification, no prune 
+
+    Error: Command failed: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 root@192.168.200.50 registry=/etc/pve/anas/backup-repos.json
+    repo=$(python3 -c "import json;r=[x for x in json.load(open('$registry'))['repos'] if x['name']=='pbsgt'][0];print(f\"{r['tokenId']}@{r['host']}:{r['port']}:{r['datastore']}\")")
+    fp=$(python3 -c "import json;r=[x for x in json.load(open('$registry'))['repos'] if x['name']=='pbsgt'][0];print(r['fingerprint'])")
+    PBS_REPOSITORY=$repo PBS_FINGERPRINT=$fp PBS_PASSWORD=$(cat /etc/anas/creds/backup-repo-pbsgt.secret) \
+      proxmox-backup-client snapshot list --output-format json 2>/dev/null
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+
+
+    Error: gtest untouched
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoEqual[2m([22m[32mexpected[39m[2m) // deep equality[22m
+
+    [32m- Expected  - 6[39m
+    [31m+ Received  + 7[39m
+
+    [32m- ObjectContaining {[39m
+    [32m-   "data": ObjectContaining {[39m
+    [32m-     "remotes": ArrayContaining [[39m
+    [32m-       ObjectContaining {[39m
+    [32m-         "name": "gtest",[39m
+    [31m+ Object {[39m
+    [31m+   "data": Object {[39m
+    [31m+     "rclone": Object {[39m
+    [31m+       "configFile": "/etc/anas/rclone.conf",[39m
+    [31m+       "encrypted": false,[39m
+    [31m+       "version": "1.60.1",[39m
+    [2m      },[22m
+    [32m-     ],[39m
+    [31m+     "remotes": Array [],[39m
+    [2m    },[22m
+    [2m  }[22m
+
+      287 |     try {
+      288 |       expect(await (await ctx2.get(`${V1}/cloud/remotes`)).json(), 'gtest untouched')
+    > 289 |         .toEqual(expect.objectContaining({ data: expect.objectContaining({
+          |          ^
+      290 |           remotes: expect.arrayContaining([expect.objectContaining({ name: 'gtest' })]),
+      291 |         }) }))
+      292 |       expect(await (await ctx2.get(`${V1}/cloud/tasks`)).json(), 'testoff untouched')
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/backup-cancel.spec.ts:289:10
+
+  1 failed
+    [integration] › tests/integration/backup-cancel.spec.ts:306:3 › backup cancel live proof — the rclone.5 backup half › 1 — the cancel ladder: 409 + code, replay 202, the pbc child stopped (gone, exit 130), cancelled row with its note, no new snapshot on PBS, no transient left, no notification, no prune 
+  1 did not run

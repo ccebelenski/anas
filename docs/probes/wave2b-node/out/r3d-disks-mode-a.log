@@ -1,0 +1,18 @@
+
+### [R] GET /disks — the two member disks
+HTTP 200 0.166987
+  {"name": "sdd", "serial": "ANAS_HOT20", "status": "ahr_member", "poolName": "w2bahr", "vdevRole": null, "partitions": [{"name": "sdd1", "size": 1072676352, "fstype": "linux_raid_member", "mountpoint": null}]}
+  {"name": "sde", "serial": "ANAS_HOT21", "status": "ahr_member", "poolName": "w2bahr", "vdevRole": null, "partitions": [{"name": "sde1", "size": 1072676352, "fstype": "linux_raid_member", "mountpoint": null}]}
+
+### [A] GET /disks — the two member disks
+HTTP 200 0.039230
+  {"name": "sdd", "serial": "ANAS_HOT20", "status": "other", "poolName": null, "vdevRole": null, "partitions": [{"name": "sdd1", "size": 1072676352, "fstype": "linux_raid_member", "mountpoint": null}]}
+  {"name": "sde", "serial": "ANAS_HOT21", "status": "other", "poolName": null, "vdevRole": null, "partitions": [{"name": "sde1", "size": 1072676352, "fstype": "linux_raid_member", "mountpoint": null}]}
+bind mount removed
+bab911d1970826c6  /usr/sbin/mdadm
+bab911d1970826c6  /var/tmp/w2b/mdadm.real
+
+### [R2] GET /disks — the two member disks
+HTTP 200 0.128949
+  {"name": "sdd", "serial": "ANAS_HOT20", "status": "ahr_member", "poolName": "w2bahr", "vdevRole": null, "partitions": [{"name": "sdd1", "size": 1072676352, "fstype": "linux_raid_member", "mountpoint": null}]}
+  {"name": "sde", "serial": "ANAS_HOT21", "status": "ahr_member", "poolName": "w2bahr", "vdevRole": null, "partitions": [{"name": "sde1", "size": 1072676352, "fstype": "linux_raid_member", "mountpoint": null}]}

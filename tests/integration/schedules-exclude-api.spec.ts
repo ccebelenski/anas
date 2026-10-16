@@ -151,7 +151,7 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
 
   test('a recursive schedule over a nested storage root is refused and told to exclude it', async () => {
     const res = await ctx.post(`${V1}/schedules`, { data: scheduleBody({ recursive: true }) })
-    expect(res.status()).toBe(400)
+    expect(res.status()).toBe(409)
     const body = await res.json() as { error: { message: string } }
     expect(body.error.message).toContain(NESTED_ROOT)
     expect(body.error.message).toMatch(/[Ee]xclude/)

@@ -299,7 +299,7 @@ test.describe.serial('cloud review-fix live proofs — token paste (rclone.1) + 
     const verdictText = (await verdict.textContent()) ?? ''
     expect(verdictText, `verdict was: ${verdictText}`).not.toContain('cannot unmarshal')
 
-    await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
+    await dlg.getByRole('button', { name: 'Cancel', exact: true }).click()
     await expect(dlg).toBeHidden({ timeout: 20_000 })
     await expect(win.locator('.x-grid-row', { hasText: /^gtdrive-paste/ })).toHaveCount(0)
   })

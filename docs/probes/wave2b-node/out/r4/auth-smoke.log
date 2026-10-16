@@ -1,0 +1,13 @@
+(node:90227) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 4 tests using 1 worker
+
+(node:90300) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/auth.spec.ts:12:3 › Authentication › can obtain PVE auth ticket (191ms)
+  ✓  2 [integration] › tests/integration/auth.spec.ts:18:3 › Authentication › PVE web UI is accessible (80ms)
+  ✓  3 [integration] › tests/integration/auth.spec.ts:27:3 › Authentication › the gateway rejects unauthenticated API requests (3.0s)
+  ✓  4 [integration] › tests/integration/auth.spec.ts:35:3 › Authentication › the gateway accepts the PVE auth cookie (44ms)
+
+  4 passed (4.2s)

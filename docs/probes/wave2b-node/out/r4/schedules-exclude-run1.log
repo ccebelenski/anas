@@ -1,0 +1,10 @@
+(node:343552) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+(node:343623) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/schedules-exclude.spec.ts:88:3 › snapx.1 — exclude datasets from a recursive snapshot schedule (stunt node fixture) › Recursive reveals the Exclude picker; a picked child saves as "1 excluded" (5.9s)
+
+  1 passed (6.9s)

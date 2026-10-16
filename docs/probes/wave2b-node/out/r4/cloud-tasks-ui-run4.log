@@ -1,0 +1,55 @@
+(node:693503) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 8 tests using 1 worker
+
+(node:693569) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  1 [integration] › tests/integration/cloud-tasks-ui.spec.ts:443:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 1 — create through the wizard: empty-remotes toast, nested note, sync sentence, Copy default, the row lands selected (28.1s)
+(node:699121) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  2 [integration] › tests/integration/cloud-tasks-ui.spec.ts:532:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 2 — run now: the job rides the strip, the Last run pill refreshes to success (19.0s)
+  ✓  3 [integration] › tests/integration/cloud-tasks-ui.spec.ts:562:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 3 — the empty-source sync refusal: the daemon's sentence in the dialog (17.7s)
+  ✓  4 [integration] › tests/integration/cloud-tasks-ui.spec.ts:597:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 4 — a stand-in rclone exiting 7: the failure surfaces, the grid still reloads (30.6s)
+  ✓  5 [integration] › tests/integration/cloud-tasks-ui.spec.ts:655:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 5 — Remotes… opens the rclone.1 window (2.6s)
+  ✓  6 [integration] › tests/integration/cloud-tasks-ui.spec.ts:665:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 6 — removing a referenced remote is refused, the task named (3.4s)
+  ✓  7 [integration] › tests/integration/cloud-tasks-ui.spec.ts:699:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 7 — a disabled task's detail shows the history note (3.6s)
+  ✓  8 [integration] › tests/integration/cloud-tasks-ui.spec.ts:732:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 8 — preview: the wizard names the deleted file, the toolbar previews the saved task (18.3s)
+
+
+  1) [integration] › tests/integration/cloud-tasks-ui.spec.ts:443:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 1 — create through the wizard: empty-remotes toast, nested note, sync sentence, Copy default, the row lands selected 
+
+    Error: [2mexpect([22m[31mlocator[39m[2m).[22mtoHaveClass[2m([22m[32mexpected[39m[2m)[22m failed
+
+    Locator: locator('.anas-grid-cloud-tasks').locator('.x-grid-row').filter({ has: locator('.x-grid-cell-inner').filter({ hasText: /^pictures-offsite$/ }) }).first().locator('xpath=ancestor::table[1]')
+    Expected pattern: [32m/x-grid-item-selected/[39m
+    Received string:  [31m"x-grid-item"[39m
+    Timeout: 15000ms
+
+    Call log:
+    [2m  - Expect "toHaveClass" with timeout 15000ms[22m
+    [2m  - waiting for locator('.anas-grid-cloud-tasks').locator('.x-grid-row').filter({ has: locator('.x-grid-cell-inner').filter({ hasText: /^pictures-offsite$/ }) }).first().locator('xpath=ancestor::table[1]')[22m
+    [2m    13 × locator resolved to <table cellpadding="0" cellspacing="0" role="presentation" data-recordid="844" class="x-grid-item" data-recordindex="0" id="gridview-1191-record-844" data-boundview="gridview-1191">…</table>[22m
+    [2m       - unexpected value "x-grid-item"[22m
+    [2m    6 × locator resolved to <table cellpadding="0" cellspacing="0" role="presentation" data-recordid="955" class="x-grid-item" data-recordindex="0" id="gridview-1191-record-955" data-boundview="gridview-1191">…</table>[22m
+    [2m      - unexpected value "x-grid-item"[22m
+
+
+      520 |     await expect(row).toBeVisible({ timeout: 45_000 })
+      521 |     await expect(row.locator('xpath=ancestor::table[1]'))
+    > 522 |       .toHaveClass(/x-grid-item-selected/, { timeout: 15_000 })
+          |        ^
+      523 |     await expect(row).toContainText('gt:pictures')
+      524 |
+      525 |     // The stored side of the contract: the task's unit pair exists and
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/cloud-tasks-ui.spec.ts:522:8
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-tasks-ui-rclone-3-—--429a9-ault-the-row-lands-selected-integration/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-tasks-ui-rclone-3-—--429a9-ault-the-row-lands-selected-integration/error-context.md
+
+  1 failed
+    [integration] › tests/integration/cloud-tasks-ui.spec.ts:443:3 › rclone.3 — Cloud Sync tasks (stunt node UI) › 1 — create through the wizard: empty-remotes toast, nested note, sync sentence, Copy default, the row lands selected 
+  7 passed (3.1m)

@@ -1,0 +1,16 @@
+(node:521572) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 7 tests using 1 worker
+
+(node:521640) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/cloud-remotes-ui.spec.ts:251:3 › rclone.1 — Remotes manager window (stunt node UI) › 1 — add through the dialog: Test says Reachable, the row lists pass (secret), the file holds an obscured value (10.5s)
+  ✓  2 [integration] › tests/integration/cloud-remotes-ui.spec.ts:285:3 › rclone.1 — Remotes manager window (stunt node UI) › 2 — edit keeps the secret: blank "(unchanged)" box, the file's pass line untouched (7.1s)
+  ✓  3 [integration] › tests/integration/cloud-remotes-ui.spec.ts:344:3 › rclone.1 — Remotes manager window (stunt node UI) › 3 — toolbar Test: the saved remote by name says Reachable (5.3s)
+  ✓  4 [integration] › tests/integration/cloud-remotes-ui.spec.ts:358:3 › rclone.1 — Remotes manager window (stunt node UI) › 4 — a wrong password in an UNSAVED dialog: the Authentication-failed verdict (8.6s)
+  ✓  5 [integration] › tests/integration/cloud-remotes-ui.spec.ts:375:3 › rclone.1 — Remotes manager window (stunt node UI) › 5 — the S3 form shows exactly ONE region row once a provider is picked (4.9s)
+  ✓  6 [integration] › tests/integration/cloud-remotes-ui.spec.ts:417:3 › rclone.1 — Remotes manager window (stunt node UI) › 6 — remove: the confirm, then the row is gone (6.5s)
+  ✓  7 [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads (8.6s)
+
+  7 passed (56.5s)

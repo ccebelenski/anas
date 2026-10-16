@@ -1,0 +1,14 @@
+(node:630739) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:630834) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/cloud-review-fixes.spec.ts:249:3 › cloud review-fix live proofs — token paste (rclone.1) + Run-now gate/progress (rclone.3) › 1 — token paste in the Add dialog: markers stripped, quotes unwrapped, a plain word marked with Test/Save disabled, and a Test of the object answers a verdict (4.3s)
+  ✓  2 [integration] › tests/integration/cloud-review-fixes.spec.ts:307:3 › cloud review-fix live proofs — token paste (rclone.1) + Run-now gate/progress (rclone.3) › 2 — token paste at the API: the test door refuses a non-JSON token with the sentence and normalises the marker-wrapped paste (1.1s)
+  ✓  3 [integration] › tests/integration/cloud-review-fixes.spec.ts:334:3 › cloud review-fix live proofs — token paste (rclone.1) + Run-now gate/progress (rclone.3) › 3 — Run now gates a running run with 409, runningProgress rides the row past the supervision ceiling, and Run now comes back when the run ends (10.4m)
+
+  Slow test file: [integration] › tests/integration/cloud-review-fixes.spec.ts (10.5m)
+  Consider running tests from slow files in parallel. See: https://playwright.dev/docs/test-parallel
+  3 passed (10.8m)

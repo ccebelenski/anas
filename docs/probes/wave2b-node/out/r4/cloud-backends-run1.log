@@ -1,0 +1,35 @@
+(node:122323) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 4 tests using 1 worker
+
+(node:122391) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  1 [integration] › tests/integration/cloud-backends.spec.ts:223:5 › cloud sync live proofs over real backends (cloudproof.1) › s3 — curated create, Test ok, copy run lands 12 files, sync run deletes, wrong-credential verdict, remove-guard (0ms)
+  -  2 [integration] › tests/integration/cloud-backends.spec.ts:223:5 › cloud sync live proofs over real backends (cloudproof.1) › smb — curated create, Test ok, copy run lands 12 files, sync run deletes, wrong-credential verdict, remove-guard
+  -  3 [integration] › tests/integration/cloud-backends.spec.ts:223:5 › cloud sync live proofs over real backends (cloudproof.1) › webdav — curated create, Test ok, copy run lands 12 files, sync run deletes, wrong-credential verdict, remove-guard
+  -  4 [integration] › tests/integration/cloud-backends.spec.ts:223:5 › cloud sync live proofs over real backends (cloudproof.1) › ftp — curated create, Test ok, copy run lands 12 files, sync run deletes, wrong-credential verdict, remove-guard
+
+
+  1) [integration] › tests/integration/cloud-backends.spec.ts:223:5 › cloud sync live proofs over real backends (cloudproof.1) › s3 — curated create, Test ok, copy run lands 12 files, sync run deletes, wrong-credential verdict, remove-guard 
+
+    Error: Command failed: /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/test/stunt-node/cloud-backends-fixture.sh up s3 smb webdav ftp
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+    Running as unit: anas-gt-s3.service; invocation ID: 103e77b4c2124c21a51f830ff01a71a7
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+    Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+    ERROR: API post /identity/users answered 401: {"error":{"code":"UNAUTHORIZED","message":"Permission denied - invalid csrf token"}}
+
+
+  1 failed
+    [integration] › tests/integration/cloud-backends.spec.ts:223:5 › cloud sync live proofs over real backends (cloudproof.1) › s3 — curated create, Test ok, copy run lands 12 files, sync run deletes, wrong-credential verdict, remove-guard 
+  3 did not run

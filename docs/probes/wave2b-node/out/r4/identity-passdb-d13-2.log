@@ -1,0 +1,14 @@
+(node:799562) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 5 tests using 1 worker
+
+(node:799628) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/identity-passdb.spec.ts:169:3 › Passdb entry matches the account exactly (identity.3, #68) › 1 — create over a staged case-mismatched orphan repairs it: Idpcase:<uid> exact, smbEnabled, one journal line (3.1s)
+  ✓  2 [integration] › tests/integration/identity-passdb.spec.ts:196:3 › Passdb entry matches the account exactly (identity.3, #68) › 2 — smbclient as Idpcase lists and writes on a valid-users share (no guest), Windows-shaped login too (1.8s)
+  ✓  3 [integration] › tests/integration/identity-passdb.spec.ts:219:3 › Passdb entry matches the account exactly (identity.3, #68) › 3 — a mismatched entry planted after create: API and grid show the stored name, smbclient is refused (3.2s)
+  ✓  4 [integration] › tests/integration/identity-passdb.spec.ts:256:3 › Passdb entry matches the account exactly (identity.3, #68) › 4 — set password repairs the mismatch: exact entry again, smbclient lists (1.4s)
+  ✓  5 [integration] › tests/integration/identity-passdb.spec.ts:278:3 › Passdb entry matches the account exactly (identity.3, #68) › 5 — delete on a mismatched entry succeeds and leaves nothing behind (2.8s)
+
+  5 passed (15.9s)

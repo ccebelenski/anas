@@ -1,0 +1,41 @@
+(node:838131) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+(node:838203) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
++3033ms MSGBOX No valid subscriptionYou do not have a valid subscription for this server. Please visit www.proxmox.com to get a list of available options.0%0%OKYesNoCancel
++3284ms MSGBOX No valid subscriptionYou do not have a valid subscription for this server. Please visit www.proxmox.com to get a list of available options.0%0%OKYesNoCancel
++3521ms MSGBOX No valid subscriptionYou do not have a valid subscription for this server. Please visit www.proxmox.com to get a list of available options.0%0%OKYesNoCancel
++3533ms RES 200 GET /cloud/remotes {"data":{"rclone":{"version":"1.60.1","configFile":"/etc/anas/rclone.conf","encrypted":false},"remotes":[{"name":"gt","type":"sftp","options":{"host":"127.0.0.1","user":"rclonegt"},"secretsSet":["pass"]}]}}
++3815ms MSGBOX No valid subscriptionYou do not have a valid subscription for this server. Please visit www.proxmox.com to get a list of available options.0%0%OKYesNoCancel
++4021ms MSGBOX No valid subscriptionYou do not have a valid subscription for this server. Please visit www.proxmox.com to get a list of available options.0%0%OKYesNoCancel
++4267ms MSGBOX No valid subscriptionYou do not have a valid subscription for this server. Please visit www.proxmox.com to get a list of available options.0%0%OKYesNoCancel
++4323ms CONSOLE error Failed to load resource: the server responded with a status of 500 (Internal Server Error)
++4357ms RES 500 PUT /cloud/remotes/gt {"statusCode":500,"code":"EISDIR","error":"Internal Server Error","message":"EISDIR: illegal operation on a directory, read"}
++4528ms MSGBOX Save failedInternal Server Error0%0%OKYesNoCancel
++4530ms CONSOLE error Failed to load resource: the server responded with a status of 500 (Internal Server Error)
++4533ms CONSOLE warning [ANAS] cloud remotes load failed: Internal Server Error
++4553ms RES 500 GET /cloud/remotes {"statusCode":500,"code":"EISDIR","error":"Internal Server Error","message":"EISDIR: illegal operation on a directory, read"}
++4788ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++5018ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++5296ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++5532ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++5786ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++6048ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++6275ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++6537ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++6788ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++7016ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++7280ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++7510ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
+  ✘  1 [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads (12.5s)
+
+
+  1) [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads 
+
+    [31mTest timeout of 30000ms exceeded.[39m
+
+  1 failed
+    [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads 

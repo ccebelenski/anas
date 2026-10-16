@@ -1,0 +1,104 @@
+
+### A — recursive destroy over a clone origin (w2bz/c is a clone of w2bz/t/o@s)
+zfs list -t all -r -o name,type,origin w2bz (before):
+  | w2bz	filesystem	-
+  | w2bz/c	filesystem	w2bz/t/o@s
+  | w2bz/t	filesystem	-
+  | w2bz/t@s	snapshot	-
+  | w2bz/t/a	filesystem	-
+  | w2bz/t/a@s	snapshot	-
+  | w2bz/t/o	filesystem	-
+  | w2bz/t/o@s	snapshot	-
+  | w2bz/t/o/g	filesystem	-
+  | w2bz/t/o/g@s	snapshot	-
+  | w2bz/t/z	filesystem	-
+  | w2bz/t/z@s	snapshot	-
+
+### DELETE /pools/w2bz/datasets/t?recursive=true (challenge)
+HTTP 409 0.203946
+X-Anas-Confirm-Code: 0258c7a0b636
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Destroying dataset 'w2bz/t' permanently erases its data","warnings":["Destroying 'w2bz/t' is irreversible — all data in the dataset is permanently lost.","4 child dataset(s) will also be destroyed.","1 snapshot(s) of 'w2bz/t' will also be destroyed.","Child datasets destroyed with it: w2bz/t/a, w2bz/t/o, w2bz/t/o/g, w2bz/t/z."]}}
+
+### DELETE /pools/w2bz/datasets/t?recursive=true (resend with x-anas-confirm)
+HTTP 202 0.132573
+{"job":{"id":"386ffece-ac86-4e81-9988-8994ed65fc6f","status":"running","operation":"zfs.destroy","createdAt":"2026-10-16T05:41:51.800Z","createdBy":"root@pam"}}
+
+### job 386ffece-ac86-4e81-9988-8994ed65fc6f
+[t+0s] failed |  |  | {"code": "JOB_FAILED", "message": "cannot destroy 'w2bz/t': filesystem has dependent clones\nuse '-R' to destroy the following datasets:\nw2bz/c"}
+final: {"job":{"id":"386ffece-ac86-4e81-9988-8994ed65fc6f","status":"failed","operation":"zfs.destroy","progress":null,"createdAt":"2026-10-16T05:41:51.800Z","createdBy":"root@pam","startedAt":"2026-10-16T05:41:51.801Z","completedAt":"2026-10-16T05:41:51.866Z","result":null,"error":{"code":"JOB_FAILED","message":"cannot destroy 'w2bz/t': filesystem has dependent clones\nuse '-R' to destroy the following datasets:\nw2bz/c"},"detail":null}}
+zfs list -t all -r -o name,type,origin w2bz (after):
+  | w2bz	filesystem	-
+  | w2bz/c	filesystem	w2bz/t/o@s
+  | w2bz/t	filesystem	-
+  | w2bz/t@s	snapshot	-
+  | w2bz/t/a	filesystem	-
+  | w2bz/t/a@s	snapshot	-
+  | w2bz/t/o	filesystem	-
+  | w2bz/t/o@s	snapshot	-
+  | w2bz/t/o/g	filesystem	-
+  | w2bz/t/o/g@s	snapshot	-
+  | w2bz/t/z	filesystem	-
+  | w2bz/t/z@s	snapshot	-
+
+### B — recursive destroy over a tree whose ZVOL snapshot w2bz/t/v@s is held
+w2bz/t/v@s	keep	Fri Oct 16 05:41 2026
+zfs list -t all -r -o name,type,origin w2bz (before):
+  | w2bz	filesystem	-
+  | w2bz/t	filesystem	-
+  | w2bz/t@s	snapshot	-
+  | w2bz/t/a	filesystem	-
+  | w2bz/t/a@s	snapshot	-
+  | w2bz/t/v	volume	-
+  | w2bz/t/v@s	snapshot	-
+  | w2bz/t/z	filesystem	-
+  | w2bz/t/z@s	snapshot	-
+
+### DELETE /pools/w2bz/datasets/t?recursive=true
+HTTP 409 0.069212
+{"error":{"code":"CONFLICT","message":"A recursive destroy of 'w2bz/t' is refused: it would destroy held snapshots, and ZFS stops at a held snapshot only after destroying the unheld ones — nothing was done. w2bz/t/v@s held by 'keep'.","reason":"snapshot-held"}}
+
+### DELETE /pools/w2bz/datasets/t?recursive=true with a made-up confirm code (does the gate still answer first?)
+HTTP 409 0.072192
+{"error":{"code":"CONFLICT","message":"A recursive destroy of 'w2bz/t' is refused: it would destroy held snapshots, and ZFS stops at a held snapshot only after destroying the unheld ones — nothing was done. w2bz/t/v@s held by 'keep'.","reason":"snapshot-held"}}
+zfs list -t all -r -o name,type,origin w2bz (after):
+  | w2bz	filesystem	-
+  | w2bz/t	filesystem	-
+  | w2bz/t@s	snapshot	-
+  | w2bz/t/a	filesystem	-
+  | w2bz/t/a@s	snapshot	-
+  | w2bz/t/v	volume	-
+  | w2bz/t/v@s	snapshot	-
+  | w2bz/t/z	filesystem	-
+  | w2bz/t/z@s	snapshot	-
+
+### C — the same zvol tree, hold released
+zfs list -t all -r -o name,type,origin w2bz (before):
+  | w2bz	filesystem	-
+  | w2bz/t	filesystem	-
+  | w2bz/t@s	snapshot	-
+  | w2bz/t/a	filesystem	-
+  | w2bz/t/a@s	snapshot	-
+  | w2bz/t/v	volume	-
+  | w2bz/t/v@s	snapshot	-
+  | w2bz/t/z	filesystem	-
+  | w2bz/t/z@s	snapshot	-
+
+### DELETE /pools/w2bz/datasets/t?recursive=true (challenge)
+HTTP 409 0.125756
+X-Anas-Confirm-Code: da11c2d1e452
+{"error":{"code":"CONFIRMATION_REQUIRED","message":"Destroying dataset 'w2bz/t' permanently erases its data","warnings":["Destroying 'w2bz/t' is irreversible — all data in the dataset is permanently lost.","3 child dataset(s) will also be destroyed.","1 snapshot(s) of 'w2bz/t' will also be destroyed.","Child datasets destroyed with it: w2bz/t/a, w2bz/t/v, w2bz/t/z."]}}
+
+### DELETE /pools/w2bz/datasets/t?recursive=true (resend with x-anas-confirm)
+HTTP 202 0.125424
+{"job":{"id":"8f1d4adb-d2db-4269-8fa7-6046b16345a1","status":"running","operation":"zfs.destroy","createdAt":"2026-10-16T05:41:54.156Z","createdBy":"root@pam"}}
+
+### job 8f1d4adb-d2db-4269-8fa7-6046b16345a1
+[t+0s] running |  |  | 
+[t+0s] completed |  | {"destroyed": "w2bz/t"} | 
+final: {"job":{"id":"8f1d4adb-d2db-4269-8fa7-6046b16345a1","status":"completed","operation":"zfs.destroy","progress":null,"createdAt":"2026-10-16T05:41:54.156Z","createdBy":"root@pam","startedAt":"2026-10-16T05:41:54.157Z","completedAt":"2026-10-16T05:41:54.343Z","result":{"destroyed":"w2bz/t"},"error":null,"detail":null}}
+zfs list -t all -r -o name,type,origin w2bz (after):
+  | w2bz	filesystem	-
+
+### cleanup
+gtbackup
+gtiscsi

@@ -1,0 +1,35 @@
+(node:508476) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 5 tests using 1 worker
+
+(node:508554) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/cloud-guided-viewer.spec.ts:376:3 › cloud guided form (rclone.4) + run viewer (rclone.6) live proofs › 1 — rclone.4 drive form: OAuth sentence alone, token in the primary container, own-client pair collapsed with its sentence, scope/service-account in More options, root_folder_id behind the advanced toggle (3.6s)
+  ✓  2 [integration] › tests/integration/cloud-guided-viewer.spec.ts:449:3 › cloud guided form (rclone.4) + run viewer (rclone.6) live proofs › 2 — rclone.4 s3 form: the five primary fields in order after picking a provider, env_auth in More options, no own-client group, the access-key-page sentence (3.6s)
+  ✓  3 [integration] › tests/integration/cloud-guided-viewer.spec.ts:486:3 › cloud guided form (rclone.4) + run viewer (rclone.6) live proofs › 3 — rclone.4 uncurated backend (koofr): no guide note, no fieldsets, the primary container reads provider/user/password, setmtime behind the advanced toggle (3.4s)
+  ✓  4 [integration] › tests/integration/cloud-guided-viewer.spec.ts:521:3 › cloud guided form (rclone.4) + run viewer (rclone.6) live proofs › 4 — rclone.6 viewer live: bars/spark/figures, transferring climbs, tiny + small sparks, stalled via SIGSTOP/CONT, newest-first Recent, result banner, polling stops (1.5m)
+  ✘  5 [integration] › tests/integration/cloud-guided-viewer.spec.ts:714:3 › cloud guided form (rclone.4) + run viewer (rclone.6) live proofs › 5 — rclone.6 404 terminal: a job that left the queue (daemon restart) turns the viewer to the no-detail sentence and no polling continues (25.4s)
+
+
+  1) [integration] › tests/integration/cloud-guided-viewer.spec.ts:714:3 › cloud guided form (rclone.4) + run viewer (rclone.6) live proofs › 5 — rclone.6 404 terminal: a job that left the queue (daemon restart) turns the viewer to the no-detail sentence and no polling continues 
+
+    Error: remotes after teardown: []
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoContain[2m([22m[32mexpected[39m[2m) // indexOf[22m
+
+    Expected value: [32m"gtest"[39m
+    Received array: [31m[][39m
+
+      365 |     try {
+      366 |       expect(await remoteNames(ctx2), `remotes after teardown: ${JSON.stringify(await remoteNames(ctx2))}`)
+    > 367 |         .toContain('gtest')
+          |          ^
+      368 |       expect(await taskNames(ctx2), `tasks after teardown: ${JSON.stringify(await taskNames(ctx2))}`)
+      369 |         .toContain('testoff')
+      370 |     }
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/cloud-guided-viewer.spec.ts:367:10
+
+  1 failed
+    [integration] › tests/integration/cloud-guided-viewer.spec.ts:714:3 › cloud guided form (rclone.4) + run viewer (rclone.6) live proofs › 5 — rclone.6 404 terminal: a job that left the queue (daemon restart) turns the viewer to the no-detail sentence and no polling continues 
+  4 passed (2.3m)

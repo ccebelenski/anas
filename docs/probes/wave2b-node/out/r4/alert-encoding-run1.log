@@ -1,0 +1,11 @@
+(node:92164) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 2 tests using 1 worker
+
+(node:92234) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/alert-encoding.spec.ts:58:3 › cr.11 — failure alerts show daemon text as text › a refused request (400) echoing <b>x</b> shows the literal text (1.7s)
+  ✓  2 [integration] › tests/integration/alert-encoding.spec.ts:74:3 › cr.11 — failure alerts show daemon text as text › a failed job whose error carries <b>x</b> shows the literal text (3.1s)
+
+  2 passed (6.0s)

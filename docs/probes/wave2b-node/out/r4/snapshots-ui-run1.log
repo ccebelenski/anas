@@ -1,0 +1,15 @@
+(node:367222) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 6 tests using 1 worker
+
+(node:367292) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/snapshots-ui.spec.ts:83:3 › ANAS snapshots appear under a dataset (stunt node) › expanding the share1 dataset reveals its snapshot leaf rows (3.5s)
+  ✓  2 [integration] › tests/integration/snapshots-ui.spec.ts:97:3 › ANAS snapshots appear under a dataset (stunt node) › the snapshot toolbar exposes create/rollback/rename/destroy buttons (3.0s)
+  ✓  3 [integration] › tests/integration/snapshots-ui.spec.ts:116:3 › ANAS snapshots appear under a dataset (stunt node) › selecting a snapshot row enables the per-snapshot actions (3.3s)
+  ✓  4 [integration] › tests/integration/snapshots-ui.spec.ts:129:3 › ANAS snapshots appear under a dataset (stunt node) › the Create Snapshot dialog pre-fills a snapshot-<datetime> name (3.5s)
+  ✓  5 [integration] › tests/integration/snapshots-ui.spec.ts:163:3 › ANAS snapshot overflow node (many snapshots) › a dataset with >5 snapshots shows the .anas-snap-more overflow node (5.8s)
+  ✓  6 [integration] › tests/integration/snapshots-ui.spec.ts:173:3 › ANAS snapshot overflow node (many snapshots) › clicking the "show all" overflow row opens the popup listing every snapshot (6.1s)
+
+  6 passed (26.4s)

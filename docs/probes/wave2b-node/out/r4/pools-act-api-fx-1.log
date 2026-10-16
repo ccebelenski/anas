@@ -1,0 +1,18 @@
+(node:849103) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 9 tests using 1 worker
+
+(node:849170) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/pools-act-api.spec.ts:65:3 › Pool safety confirmation — challenge (no mutation) › export without a confirm code → 409 CONFIRMATION_REQUIRED + code header (793ms)
+  ✓  2 [integration] › tests/integration/pools-act-api.spec.ts:81:3 › Pool safety confirmation — challenge (no mutation) › destroy without a confirm code → 409 CONFIRMATION_REQUIRED + code header (470ms)
+  ✓  3 [integration] › tests/integration/pools-act-api.spec.ts:96:3 › Pool safety confirmation — challenge (no mutation) › destroy with a WRONG confirm code → 409 again (code not honoured) (570ms)
+  ✓  4 [integration] › tests/integration/pools-act-api.spec.ts:111:3 › Pool safety confirmation — challenge (no mutation) › destroying the boot/root pool → 409 Level-1 refusal with NO code header (963ms)
+  ✓  5 [integration] › tests/integration/pools-act-api.spec.ts:149:3 › Pool property modify (3.9) › PUT /pools/testpool changing a property → 202 { job } (938ms)
+  ✓  6 [integration] › tests/integration/pools-act-api.spec.ts:196:3 › Pool create / destroy / export / import (spare disks) › creates a pool via the API, then destroys it through the confirmation flow (3.8, 3.14) (6.2s)
+  ✓  7 [integration] › tests/integration/pools-act-api.spec.ts:242:3 › Pool create / destroy / export / import (spare disks) › exports a pool through the confirmation flow (3.13) (5.8s)
+  ✓  8 [integration] › tests/integration/pools-act-api.spec.ts:271:3 › Pool create / destroy / export / import (spare disks) › imports a known (exported) pool (3.7) (5.5s)
+  ✓  9 [integration] › tests/integration/pools-act-api.spec.ts:293:3 › Pool create / destroy / export / import (spare disks) › adds a vdev to a pool (3.11) (5.9s)
+
+  9 passed (28.1s)

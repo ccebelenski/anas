@@ -1,0 +1,8 @@
+7fca764cbdfc5de3bdaccd494adf07eafde8c17475ae3e028b387bc06dc29e80  /etc/pve/storage.cfg
+gtbackup
+gtiscsi
+pvfix
+sysfix
+testpool
+✓ hot3 (SCSI) detached
+✓ hot16 (SCSI) detached

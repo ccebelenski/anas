@@ -441,7 +441,7 @@ test.describe.serial('cloud guided form (rclone.4) + run viewer (rclone.6) live 
     expect(rootHome.exists, 'root_folder_id built after the toggle').toBe(true)
     expect(rootHome.inAdvanced, 'root_folder_id under the advanced toggle').toBe(true)
 
-    await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
+    await dlg.getByRole('button', { name: 'Cancel', exact: true }).click()
     await expect(dlg).toBeHidden({ timeout: 20_000 })
     await expect(win.locator('.x-grid-row', { hasText: /^gtdrive-form/ })).toHaveCount(0)
   })
@@ -479,7 +479,7 @@ test.describe.serial('cloud guided form (rclone.4) + run viewer (rclone.6) live 
       'endpoint',
     ])
 
-    await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
+    await dlg.getByRole('button', { name: 'Cancel', exact: true }).click()
     await expect(dlg).toBeHidden({ timeout: 20_000 })
   })
 
@@ -514,7 +514,7 @@ test.describe.serial('cloud guided form (rclone.4) + run viewer (rclone.6) live 
     expect(setmtime.exists, 'setmtime built after the toggle').toBe(true)
     expect(setmtime.inAdvanced, 'setmtime under the advanced toggle').toBe(true)
 
-    await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
+    await dlg.getByRole('button', { name: 'Cancel', exact: true }).click()
     await expect(dlg).toBeHidden({ timeout: 20_000 })
   })
 

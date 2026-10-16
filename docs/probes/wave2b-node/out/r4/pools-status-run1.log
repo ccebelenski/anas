@@ -1,0 +1,11 @@
+(node:301059) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 2 tests using 1 worker
+
+(node:301129) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/pools-status.spec.ts:30:3 › ANAS pools status graphics (stunt node) › renders gfx capacity bar + state pill in the Pools grid (2.2s)
+  ✓  2 [integration] › tests/integration/pools-status.spec.ts:45:3 › ANAS pools status graphics (stunt node) › renders skeuomorphic topology + retains the error-count tree in Detail (2.5s)
+
+  2 passed (5.7s)

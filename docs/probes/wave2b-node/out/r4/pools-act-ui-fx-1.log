@@ -1,0 +1,15 @@
+(node:853743) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 6 tests using 1 worker
+
+(node:853821) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/pools-act-ui.spec.ts:56:3 › ANAS pool action toolbar (stunt node) › exposes create/import always, and per-selection actions on the Pools grid (2.3s)
+  ✓  2 [integration] › tests/integration/pools-act-ui.spec.ts:87:3 › ANAS pool action toolbar (stunt node) › gates Trim by device capability and Upgrade by availability (story 4.12) (2.4s)
+  ✓  3 [integration] › tests/integration/pools-act-ui.spec.ts:111:3 › ANAS pool action toolbar (stunt node) › the Create button opens the Pool Composer window (2.1s)
+  ✓  4 [integration] › tests/integration/pools-act-ui.spec.ts:122:3 › ANAS pool action toolbar (stunt node) › the Add Vdevs button opens the Pool Composer in expand mode (2.4s)
+  ✓  5 [integration] › tests/integration/pools-act-ui.spec.ts:140:3 › ANAS pool action toolbar (stunt node) › the Modify button opens the .anas-win-modify window for the selected pool (2.2s)
+  ✓  6 [integration] › tests/integration/pools-act-ui.spec.ts:181:3 › ANAS pool export safety (throwaway pool) › exporting via the toolbar shows an Ext.Msg.confirm and exports the pool (6.2s)
+
+  6 passed (18.7s)

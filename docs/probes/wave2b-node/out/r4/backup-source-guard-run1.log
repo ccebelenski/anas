@@ -1,0 +1,36 @@
+(node:97349) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 5 tests using 1 worker
+
+(node:97449) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/backup-source-guard.spec.ts:325:3 › Backup source guard (backup2.11) › preview-nested carries the unmounted fact for the tmpfs line, and nothing for a mounted source (918ms)
+  ✓  2 [integration] › tests/integration/backup-source-guard.spec.ts:350:3 › Backup source guard (backup2.11) › the wizard row warns on the unmounted path and is silent on a mounted one (4.8s)
+  ✓  3 [integration] › tests/integration/backup-source-guard.spec.ts:378:3 › Backup source guard (backup2.11) › Run now on an archive under the unmounted tmpfs line FAILS with the sentence, notifies, and shows as a backup warning (20.4s)
+  ✓  4 [integration] › tests/integration/backup-source-guard.spec.ts:445:3 › Backup source guard (backup2.11) › the CIFS line is refused the same way, naming the CIFS source (13.4s)
+  ✘  5 [integration] › tests/integration/backup-source-guard.spec.ts:464:3 › Backup source guard (backup2.11) › mounting it makes the SAME task run: the backup completes and PBS lists the snapshot (13.7s)
+
+
+  1) [integration] › tests/integration/backup-source-guard.spec.ts:464:3 › Backup source guard (backup2.11) › mounting it makes the SAME task run: the backup completes and PBS lists the snapshot 
+
+    Error: Error: client error (Connect)
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m"[7mcomplet[27med"[39m
+    Received: [31m"[7mfail[27med"[39m
+
+      149 |   const { id } = (await res.json()).job
+      150 |   const job = await awaitJob(ctx, id, timeout)
+    > 151 |   expect(job.status, job.error?.message).toBe('completed')
+          |                                          ^
+      152 |   return job.result
+      153 | }
+      154 |
+        at runJob (/home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/backup-source-guard.spec.ts:151:42)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/backup-source-guard.spec.ts:477:22
+
+  1 failed
+    [integration] › tests/integration/backup-source-guard.spec.ts:464:3 › Backup source guard (backup2.11) › mounting it makes the SAME task run: the backup completes and PBS lists the snapshot 
+  4 passed (1.4m)

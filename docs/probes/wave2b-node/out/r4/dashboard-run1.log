@@ -1,0 +1,11 @@
+(node:246819) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 2 tests using 1 worker
+
+(node:246886) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/dashboard.spec.ts:36:3 › ANAS dashboard (stunt node) › renders the dashboard panel with its sections and Refresh (4.5s)
+  ✓  2 [integration] › tests/integration/dashboard.spec.ts:147:3 › ANAS dashboard (stunt node) › survives leaving and returning (poll teardown, no broken UI) (1.9s)
+
+  2 passed (7.4s)

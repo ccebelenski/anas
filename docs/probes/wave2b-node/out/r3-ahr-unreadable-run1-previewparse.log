@@ -1,0 +1,281 @@
+1
+array: /dev/md/w2bahr-r1 -> /dev/md127
+
+### [R] GET /ahr (pool names)
+HTTP 200 0.091820
+[('w2bahr', None)]
+
+### [R] GET /ahr/w2bahr
+HTTP 200 0.064337
+{"data":{"name":"w2bahr","ahrType":"ahr1","mountpoint":"/mnt/anas-ahr/w2bahr","mounted":true,"mountedReadOnly":false,"disks":[{"id":"scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20","sizeBytes":1073741824,"usableBytes":1073741824,"model":"QEMU HARDDISK","serial":"ANAS_HOT20","role":"member","partitions":[{"devi
+
+### [R] POST /backup/tasks/preview-nested {path: /mnt/anas-ahr/w2bahr}
+HTTP 200 0.154933
+  path: None | consistency: null
+
+### [R] POST /backup/tasks/w2bt4/run {direct:true}
+HTTP 202 0.096301
+{"job":{"id":"77b8ed6e-47a1-4cef-8b77-71eef8eea3a1","status":"running","operation":"backup.task.run","createdAt":"2026-10-16T05:47:25.511Z","createdBy":"root@pam"}}
+live lock table at t+3 s:
+  {
+    "at": "2026-10-16T05:47:29.320Z",
+    "held": [
+      {
+        "key": "ahr:NyqTmR-dpxU-sNQ2-y1fC-iScS-r346-bapFbv",
+        "mode": "shared",
+        "holders": [
+          {
+            "id": "77b8ed6e-47a1-4cef-8b77-71eef8eea3a1",
+            "operation": "backup.task.run",
+            "status": "running"
+          }
+        ]
+      },
+      {
+        "key": "ahrname:w2bahr",
+        "mode": "shared",
+        "holders": [
+          {
+            "id": "77b8ed6e-47a1-4cef-8b77-71eef8eea3a1",
+            "operation": "backup.task.run",
+            "status": "running"
+          }
+        ]
+      },
+      {
+        "key": "mount:/mnt/anas-ahr/w2bahr",
+        "mode": "shared",
+        "holders": [
+          {
+            "id": "77b8ed6e-47a1-4cef-8b77-71eef8eea3a1",
+            "operation": "backup.task.run",
+            "status": "running"
+          }
+        ]
+      },
+      {
+        "key": "task:backup:w2bt4",
+        "mode": "shared",
+        "holders": [
+          {
+            "id": "77b8ed6e-47a1-4cef-8b77-71eef8eea3a1",
+            "operation": "backup.task.run",
+            "status": "running"
+          }
+        ]
+      }
+    ]
+  }
+[t+0s] running | archive 'w2bdata' <- /run/anas-ahr/w2bahr.toplevel/@snapshots/anas-backup-w2bt4-1792129645 |  | 
+[t+7s] failed | Starting backup: host/w2bt4/2026-10-16T05:47:25Z |  | {"code": "JOB_FAILED", "message": "Error: client error (Connect)"}
+final: {"job":{"id":"77b8ed6e-47a1-4cef-8b77-71eef8eea3a1","status":"failed","operation":"backup.task.run","progress":"Starting backup: host/w2bt4/2026-10-16T05:47:25Z","createdAt":"2026-10-16T05:47:25.511Z","createdBy":"root@pam","startedAt":"2026-10-16T05:47:25.511Z","completedAt":"2026-10-16T05:47:35.886Z","result":null,"error":{"code":"JOB_FAILED","message":"Error: client error (Connect)"},"detail":null}}
+{"level":30,"time":1792129642453,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.create","params":{"task":"w2bt4"},"requestId":"22587600-91b1-48ea-92a8-662f74fd70e2","msg":"audit: root@pam submitted backup.task.create"}
+{"level":30,"time":1792129642803,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.completed","user":"root@pam","uid":0,"operation":"backup.task.create","params":{"task":"w2bt4"},"requestId":"22587600-91b1-48ea-92a8-662f74fd70e2","durationMs":350,"msg":"audit: backup.task.create completed (350ms)"}
+{"level":30,"time":1792129645511,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"a247cf55-e2f9-4980-bb42-1f95085f215b","msg":"audit: root@pam submitted backup.task.run"}
+{"level":50,"time":1792129655886,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.failed","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"a247cf55-e2f9-4980-bb42-1f95085f215b","durationMs":10375,"error":"Error: client error (Connect)","msg":"audit: backup.task.run failed (10375ms)"}
+
+### mode A: mdadm --detail --export /dev/md127 exits 1
+#!/bin/sh
+if [ "$*" = "--detail --export /dev/md127" ]; then echo "mdadm: cannot open /dev/md127: injected by the w2b node pass" >&2; exit 1; fi
+exec /var/tmp/w2b/mdadm.real "$@"
+wrapped exit 1
+mdadm: cannot open /dev/md127: injected by the w2b node pass
+MD_LEVEL=raid1
+MD_DEVICES=2
+other argv exit 0
+
+### [A] GET /ahr (pool names)
+HTTP 200 0.032995
+[]
+
+### [A] GET /ahr/w2bahr
+HTTP 404 0.024332
+{"error":{"code":"NOT_FOUND","message":"AHR pool 'w2bahr' not found"}}
+
+### [A] POST /backup/tasks/preview-nested {path: /mnt/anas-ahr/w2bahr}
+HTTP 200 0.082811
+  path: None | consistency: null
+
+### [A] POST /backup/tasks/w2bt4/run {direct:true}
+HTTP 202 0.058972
+{"job":{"id":"b9eed511-1908-4aeb-af47-110f0f21ec2d","status":"running","operation":"backup.task.run","createdAt":"2026-10-16T05:47:36.988Z","createdBy":"root@pam"}}
+live lock table at t+3 s:
+  {
+    "at": "2026-10-16T05:47:40.773Z",
+    "held": [
+      {
+        "key": "mount:/mnt/anas-ahr/w2bahr",
+        "mode": "shared",
+        "holders": [
+          {
+            "id": "b9eed511-1908-4aeb-af47-110f0f21ec2d",
+            "operation": "backup.task.run",
+            "status": "running"
+          }
+        ]
+      },
+      {
+        "key": "task:backup:w2bt4",
+        "mode": "shared",
+        "holders": [
+          {
+            "id": "b9eed511-1908-4aeb-af47-110f0f21ec2d",
+            "operation": "backup.task.run",
+            "status": "running"
+          }
+        ]
+      }
+    ]
+  }
+[t+0s] running | archive 'w2bdata': live - /mnt/anas-ahr/w2bahr is on a btrfs filesystem (/dev/mapper/w2bahr-w2bahr--vol[/@data]) that is not an ANAS AHR pool - ANAS does not snapshot filesystems it does not manage, so the backup is live |  | 
+[t+7s] running | Starting backup: host/w2bt4/2026-10-16T05:47:37Z |  | 
+[t+7s] failed | Starting backup: host/w2bt4/2026-10-16T05:47:37Z |  | {"code": "JOB_FAILED", "message": "Error: client error (Connect)"}
+final: {"job":{"id":"b9eed511-1908-4aeb-af47-110f0f21ec2d","status":"failed","operation":"backup.task.run","progress":"Starting backup: host/w2bt4/2026-10-16T05:47:37Z","createdAt":"2026-10-16T05:47:36.988Z","createdBy":"root@pam","startedAt":"2026-10-16T05:47:36.988Z","completedAt":"2026-10-16T05:47:47.250Z","result":null,"error":{"code":"JOB_FAILED","message":"Error: client error (Connect)"},"detail":null}}
+{"level":30,"time":1792129642453,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.create","params":{"task":"w2bt4"},"requestId":"22587600-91b1-48ea-92a8-662f74fd70e2","msg":"audit: root@pam submitted backup.task.create"}
+{"level":30,"time":1792129642803,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.completed","user":"root@pam","uid":0,"operation":"backup.task.create","params":{"task":"w2bt4"},"requestId":"22587600-91b1-48ea-92a8-662f74fd70e2","durationMs":350,"msg":"audit: backup.task.create completed (350ms)"}
+{"level":30,"time":1792129645511,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"a247cf55-e2f9-4980-bb42-1f95085f215b","msg":"audit: root@pam submitted backup.task.run"}
+{"level":50,"time":1792129655886,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.failed","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"a247cf55-e2f9-4980-bb42-1f95085f215b","durationMs":10375,"error":"Error: client error (Connect)","msg":"audit: backup.task.run failed (10375ms)"}
+{"level":30,"time":1792129656988,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"b3fdfa99-7684-44d2-9c99-eb62f2280dd1","msg":"audit: root@pam submitted backup.task.run"}
+{"level":50,"time":1792129667250,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.failed","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"b3fdfa99-7684-44d2-9c99-eb62f2280dd1","durationMs":10262,"error":"Error: client error (Connect)","msg":"audit: backup.task.run failed (10262ms)"}
+bind mount removed
+
+### mode B: /usr/sbin/mdadm not executable (EACCES)
+exec exit 126
+bash: line 2: /usr/sbin/mdadm: Permission denied
+
+### [B] GET /ahr (pool names)
+HTTP 500 0.035001
+{'statusCode': 500, 'code': 'EACCES', 'error': 'Internal Server Error', 'message': 'spawn /usr/sbin/mdadm EACCES'}
+
+### [B] GET /ahr/w2bahr
+HTTP 500 0.026136
+{"statusCode":500,"code":"EACCES","error":"Internal Server Error","message":"spawn /usr/sbin/mdadm EACCES"}
+
+### [B] POST /backup/tasks/preview-nested {path: /mnt/anas-ahr/w2bahr}
+HTTP 200 0.080621
+  path: None | consistency: null
+
+### [B] POST /backup/tasks/w2bt4/run {direct:true}
+HTTP 202 0.037934
+{"job":{"id":"99a16848-2a7c-4225-95e4-15853fb2e72b","status":"running","operation":"backup.task.run","createdAt":"2026-10-16T05:47:48.574Z","createdBy":"root@pam"}}
+live lock table at t+3 s:
+  {
+    "at": "2026-10-16T05:47:52.379Z",
+    "held": [
+      {
+        "key": "mount:/mnt/anas-ahr/w2bahr",
+        "mode": "shared",
+        "holders": [
+          {
+            "id": "99a16848-2a7c-4225-95e4-15853fb2e72b",
+            "operation": "backup.task.run",
+            "status": "running"
+          }
+        ]
+      },
+      {
+        "key": "task:backup:w2bt4",
+        "mode": "shared",
+        "holders": [
+          {
+            "id": "99a16848-2a7c-4225-95e4-15853fb2e72b",
+            "operation": "backup.task.run",
+            "status": "running"
+          }
+        ]
+      }
+    ]
+  }
+[t+0s] running | archive 'w2bdata': live - /mnt/anas-ahr/w2bahr is on a btrfs filesystem (/dev/mapper/w2bahr-w2bahr--vol[/@data]) and the AHR topology could not be read, so it cannot be told whether it is an ANAS AHR pool - the backup is live |  | 
+[t+6s] running | Starting backup: host/w2bt4/2026-10-16T05:47:48Z |  | 
+[t+7s] failed | Starting backup: host/w2bt4/2026-10-16T05:47:48Z |  | {"code": "JOB_FAILED", "message": "Error: client error (Connect)"}
+final: {"job":{"id":"99a16848-2a7c-4225-95e4-15853fb2e72b","status":"failed","operation":"backup.task.run","progress":"Starting backup: host/w2bt4/2026-10-16T05:47:48Z","createdAt":"2026-10-16T05:47:48.574Z","createdBy":"root@pam","startedAt":"2026-10-16T05:47:48.574Z","completedAt":"2026-10-16T05:47:58.824Z","result":null,"error":{"code":"JOB_FAILED","message":"Error: client error (Connect)"},"detail":null}}
+{"level":30,"time":1792129656988,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"b3fdfa99-7684-44d2-9c99-eb62f2280dd1","msg":"audit: root@pam submitted backup.task.run"}
+{"level":50,"time":1792129667250,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.failed","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"b3fdfa99-7684-44d2-9c99-eb62f2280dd1","durationMs":10262,"error":"Error: client error (Connect)","msg":"audit: backup.task.run failed (10262ms)"}
+{"level":50,"time":1792129668315,"pid":220746,"hostname":"anas-pve","reqId":"req-34","req":{"method":"GET","url":"/v1/ahr","host":"localhost"},"res":{"statusCode":500},"err":{"type":"Error","message":"spawn /usr/sbin/mdadm EACCES","stack":"Error: spawn /usr/sbin/mdadm EACCES\n    at ChildProcess._handle.onexit (node:internal/child_process:285:19)\n    at onErrorNT (node:internal/child_process:483:16)\n    at process.processTicksAndRejections (node:internal/process/task_queues:89:21)","errno":-13,"code":"EACCES","syscall":"spawn /usr/sbin/mdadm","path":"/usr/sbin/mdadm","spawnargs":["--detail","--export","/dev/md127"]},"msg":"spawn /usr/sbin/mdadm EACCES"}
+{"level":50,"time":1792129668394,"pid":220746,"hostname":"anas-pve","reqId":"req-35","req":{"method":"GET","url":"/v1/ahr/w2bahr","host":"localhost"},"res":{"statusCode":500},"err":{"type":"Error","message":"spawn /usr/sbin/mdadm EACCES","stack":"Error: spawn /usr/sbin/mdadm EACCES\n    at ChildProcess._handle.onexit (node:internal/child_process:285:19)\n    at onErrorNT (node:internal/child_process:483:16)\n    at process.processTicksAndRejections (node:internal/process/task_queues:89:21)","errno":-13,"code":"EACCES","syscall":"spawn /usr/sbin/mdadm","path":"/usr/sbin/mdadm","spawnargs":["--detail","--export","/dev/md127"]},"msg":"spawn /usr/sbin/mdadm EACCES"}
+{"level":30,"time":1792129668574,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"82a69de0-8f23-4242-90ce-d3ba628b76e4","msg":"audit: root@pam submitted backup.task.run"}
+{"level":50,"time":1792129678823,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.failed","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"82a69de0-8f23-4242-90ce-d3ba628b76e4","durationMs":10249,"error":"Error: client error (Connect)","msg":"audit: backup.task.run failed (10249ms)"}
+bind mount removed
+
+### restore check
+bab911d1970826c6  /usr/sbin/mdadm
+bab911d1970826c6  /var/tmp/w2b/mdadm.real
+-rwxr-xr-x 1 root root 654312 Apr 25  2025 /usr/sbin/mdadm
+b86d1eddd7fc3619d0a7608bc4010fe603578894ec305e017036d45e4c646fa1  /etc/mdadm/mdadm.conf
+57
+
+### [R2] GET /ahr (pool names)
+HTTP 200 0.100969
+[('w2bahr', None)]
+
+### [R2] GET /ahr/w2bahr
+HTTP 200 0.095200
+{"data":{"name":"w2bahr","ahrType":"ahr1","mountpoint":"/mnt/anas-ahr/w2bahr","mounted":true,"mountedReadOnly":false,"disks":[{"id":"scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20","sizeBytes":1073741824,"usableBytes":1073741824,"model":"QEMU HARDDISK","serial":"ANAS_HOT20","role":"member","partitions":[{"devi
+
+### [R2] POST /backup/tasks/preview-nested {path: /mnt/anas-ahr/w2bahr}
+HTTP 200 0.160042
+  path: None | consistency: null
+
+### [R2] POST /backup/tasks/w2bt4/run {direct:true}
+HTTP 202 0.130641
+{"job":{"id":"f9f78e10-2e04-464d-8904-927e30a86b47","status":"running","operation":"backup.task.run","createdAt":"2026-10-16T05:48:00.614Z","createdBy":"root@pam"}}
+live lock table at t+3 s:
+  {
+    "at": "2026-10-16T05:48:04.299Z",
+    "held": [
+      {
+        "key": "ahr:NyqTmR-dpxU-sNQ2-y1fC-iScS-r346-bapFbv",
+        "mode": "shared",
+        "holders": [
+          {
+            "id": "f9f78e10-2e04-464d-8904-927e30a86b47",
+            "operation": "backup.task.run",
+            "status": "running"
+          }
+        ]
+      },
+      {
+        "key": "ahrname:w2bahr",
+        "mode": "shared",
+        "holders": [
+          {
+            "id": "f9f78e10-2e04-464d-8904-927e30a86b47",
+            "operation": "backup.task.run",
+            "status": "running"
+          }
+        ]
+      },
+      {
+        "key": "mount:/mnt/anas-ahr/w2bahr",
+        "mode": "shared",
+        "holders": [
+          {
+            "id": "f9f78e10-2e04-464d-8904-927e30a86b47",
+            "operation": "backup.task.run",
+            "status": "running"
+          }
+        ]
+      },
+      {
+        "key": "task:backup:w2bt4",
+        "mode": "shared",
+        "holders": [
+          {
+            "id": "f9f78e10-2e04-464d-8904-927e30a86b47",
+            "operation": "backup.task.run",
+            "status": "running"
+          }
+        ]
+      }
+    ]
+  }
+[t+0s] running | archive 'w2bdata' <- /run/anas-ahr/w2bahr.toplevel/@snapshots/anas-backup-w2bt4-1792129680 |  | 
+[t+7s] failed | Starting backup: host/w2bt4/2026-10-16T05:48:00Z |  | {"code": "JOB_FAILED", "message": "Error: client error (Connect)"}
+final: {"job":{"id":"f9f78e10-2e04-464d-8904-927e30a86b47","status":"failed","operation":"backup.task.run","progress":"Starting backup: host/w2bt4/2026-10-16T05:48:00Z","createdAt":"2026-10-16T05:48:00.614Z","createdBy":"root@pam","startedAt":"2026-10-16T05:48:00.614Z","completedAt":"2026-10-16T05:48:10.987Z","result":null,"error":{"code":"JOB_FAILED","message":"Error: client error (Connect)"},"detail":null}}
+{"level":50,"time":1792129668315,"pid":220746,"hostname":"anas-pve","reqId":"req-34","req":{"method":"GET","url":"/v1/ahr","host":"localhost"},"res":{"statusCode":500},"err":{"type":"Error","message":"spawn /usr/sbin/mdadm EACCES","stack":"Error: spawn /usr/sbin/mdadm EACCES\n    at ChildProcess._handle.onexit (node:internal/child_process:285:19)\n    at onErrorNT (node:internal/child_process:483:16)\n    at process.processTicksAndRejections (node:internal/process/task_queues:89:21)","errno":-13,"code":"EACCES","syscall":"spawn /usr/sbin/mdadm","path":"/usr/sbin/mdadm","spawnargs":["--detail","--export","/dev/md127"]},"msg":"spawn /usr/sbin/mdadm EACCES"}
+{"level":50,"time":1792129668394,"pid":220746,"hostname":"anas-pve","reqId":"req-35","req":{"method":"GET","url":"/v1/ahr/w2bahr","host":"localhost"},"res":{"statusCode":500},"err":{"type":"Error","message":"spawn /usr/sbin/mdadm EACCES","stack":"Error: spawn /usr/sbin/mdadm EACCES\n    at ChildProcess._handle.onexit (node:internal/child_process:285:19)\n    at onErrorNT (node:internal/child_process:483:16)\n    at process.processTicksAndRejections (node:internal/process/task_queues:89:21)","errno":-13,"code":"EACCES","syscall":"spawn /usr/sbin/mdadm","path":"/usr/sbin/mdadm","spawnargs":["--detail","--export","/dev/md127"]},"msg":"spawn /usr/sbin/mdadm EACCES"}
+{"level":30,"time":1792129668574,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"82a69de0-8f23-4242-90ce-d3ba628b76e4","msg":"audit: root@pam submitted backup.task.run"}
+{"level":50,"time":1792129678823,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.failed","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"82a69de0-8f23-4242-90ce-d3ba628b76e4","durationMs":10249,"error":"Error: client error (Connect)","msg":"audit: backup.task.run failed (10249ms)"}
+{"level":30,"time":1792129680614,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.submitted","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"1e05c988-b770-4388-bb9a-6b9860b55005","msg":"audit: root@pam submitted backup.task.run"}
+{"level":50,"time":1792129690987,"pid":220746,"hostname":"anas-pve","audit":true,"event":"job.failed","user":"root@pam","uid":0,"operation":"backup.task.run","params":{"task":"w2bt4","direct":true},"requestId":"1e05c988-b770-4388-bb9a-6b9860b55005","durationMs":10373,"error":"Error: client error (Connect)","msg":"audit: backup.task.run failed (10373ms)"}

@@ -1,0 +1,39 @@
+(node:485140) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 5 tests using 1 worker
+
+(node:485206) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/identity-passdb.spec.ts:169:3 › Passdb entry matches the account exactly (identity.3, #68) › 1 — create over a staged case-mismatched orphan repairs it: Idpcase:<uid> exact, smbEnabled, one journal line (3.3s)
+  ✓  2 [integration] › tests/integration/identity-passdb.spec.ts:196:3 › Passdb entry matches the account exactly (identity.3, #68) › 2 — smbclient as Idpcase lists and writes on a valid-users share (no guest), Windows-shaped login too (1.7s)
+  ✓  3 [integration] › tests/integration/identity-passdb.spec.ts:219:3 › Passdb entry matches the account exactly (identity.3, #68) › 3 — a mismatched entry planted after create: API and grid show the stored name, smbclient is refused (3.4s)
+  ✓  4 [integration] › tests/integration/identity-passdb.spec.ts:256:3 › Passdb entry matches the account exactly (identity.3, #68) › 4 — set password repairs the mismatch: exact entry again, smbclient lists (1.5s)
+  ✘  5 [integration] › tests/integration/identity-passdb.spec.ts:278:3 › Passdb entry matches the account exactly (identity.3, #68) › 5 — delete on a mismatched entry succeeds and leaves nothing behind (2.4s)
+
+
+  1) [integration] › tests/integration/identity-passdb.spec.ts:278:3 › Passdb entry matches the account exactly (identity.3, #68) › 5 — delete on a mismatched entry succeeds and leaves nothing behind 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoEqual[2m([22m[32mexpected[39m[2m) // deep equality[22m
+
+    [32m- Expected  - 0[39m
+    [31m+ Received  + 1[39m
+
+    [2m  Object {[22m
+    [2m    "deleted": "Idpcase",[22m
+    [31m+   "groupRemoved": null,[39m
+    [2m    "smbEntryRemoved": true,[22m
+    [2m  }[22m
+
+      287 |
+      288 |       const result = await deleteViaApi(ctx, `${V1}/identity/users/${USER}`)
+    > 289 |       expect(result).toEqual({ deleted: USER, smbEntryRemoved: true })
+          |                      ^
+      290 |       expect(await passdbLines()).toEqual([])
+      291 |       expect(await sshExec(`getent passwd ${USER} >/dev/null && echo present || echo gone`)).toBe('gone')
+      292 |     }
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/identity-passdb.spec.ts:289:22
+
+  1 failed
+    [integration] › tests/integration/identity-passdb.spec.ts:278:3 › Passdb entry matches the account exactly (identity.3, #68) › 5 — delete on a mismatched entry succeeds and leaves nothing behind 
+  4 passed (16.0s)

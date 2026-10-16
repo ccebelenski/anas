@@ -1,0 +1,12 @@
+(node:252204) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:252271) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/datasets-gfx-ui.spec.ts:35:3 › ANAS Datasets enriched tree — Epic 15.4 gfx retrofit › the tree is still the native treepanel, now enriched with gfx columns (2.8s)
+  ✓  2 [integration] › tests/integration/datasets-gfx-ui.spec.ts:57:3 › ANAS Datasets enriched tree — Epic 15.4 gfx retrofit › the pool root has a distinct row band and a pool/folder object icon (2.3s)
+  ✓  3 [integration] › tests/integration/datasets-gfx-ui.spec.ts:76:5 › ANAS Datasets enriched tree — Epic 15.4 gfx retrofit › full hero › the pool-space donut hero appears above the tree (2.3s)
+
+  3 passed (8.4s)

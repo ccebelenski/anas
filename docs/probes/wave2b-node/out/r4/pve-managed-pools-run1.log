@@ -1,0 +1,68 @@
+(node:302342) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:302433) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  1 [integration] › tests/integration/pve-managed-pools.spec.ts:30:3 › ANAS PVE-managed pools (stunt node) › Pools: the PVE pool is badged and its structural actions are disabled (160ms)
+(node:302569) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  2 [integration] › tests/integration/pve-managed-pools.spec.ts:56:3 › ANAS PVE-managed pools (stunt node) › Datasets: PVE pool root is banded + gated; ANAS pool root is not (222ms)
+(node:302670) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  3 [integration] › tests/integration/pve-managed-pools.spec.ts:93:3 › ANAS PVE-managed pools (stunt node) › Datasets: an ANAS sibling under the PVE storage root is manageable; a guest-named child is not (213ms)
+
+
+  1) [integration] › tests/integration/pve-managed-pools.spec.ts:30:3 › ANAS PVE-managed pools (stunt node) › Pools: the PVE pool is badged and its structural actions are disabled 
+
+    Error: fixture required (ANAS_REQUIRE_FIXTURES=1): datapool (PVE-managed) not present — add a zfspool storage
+
+       at integration/fixtures/stunt-node.ts:52
+
+      50 |     return
+      51 |   if (fixturesRequired())
+    > 52 |     throw new Error(`fixture required (ANAS_REQUIRE_FIXTURES=1): ${reason}`)
+         |           ^
+      53 |   test.skip(true, reason)
+      54 | }
+      55 |
+        at skipIfFixtureMissing (/home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/fixtures/stunt-node.ts:52:11)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pve-managed-pools.spec.ts:23:3
+
+  2) [integration] › tests/integration/pve-managed-pools.spec.ts:56:3 › ANAS PVE-managed pools (stunt node) › Datasets: PVE pool root is banded + gated; ANAS pool root is not 
+
+    Error: fixture required (ANAS_REQUIRE_FIXTURES=1): datapool (PVE-managed) not present — add a zfspool storage
+
+       at integration/fixtures/stunt-node.ts:52
+
+      50 |     return
+      51 |   if (fixturesRequired())
+    > 52 |     throw new Error(`fixture required (ANAS_REQUIRE_FIXTURES=1): ${reason}`)
+         |           ^
+      53 |   test.skip(true, reason)
+      54 | }
+      55 |
+        at skipIfFixtureMissing (/home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/fixtures/stunt-node.ts:52:11)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pve-managed-pools.spec.ts:23:3
+
+  3) [integration] › tests/integration/pve-managed-pools.spec.ts:93:3 › ANAS PVE-managed pools (stunt node) › Datasets: an ANAS sibling under the PVE storage root is manageable; a guest-named child is not 
+
+    Error: fixture required (ANAS_REQUIRE_FIXTURES=1): datapool (PVE-managed) not present — add a zfspool storage
+
+       at integration/fixtures/stunt-node.ts:52
+
+      50 |     return
+      51 |   if (fixturesRequired())
+    > 52 |     throw new Error(`fixture required (ANAS_REQUIRE_FIXTURES=1): ${reason}`)
+         |           ^
+      53 |   test.skip(true, reason)
+      54 | }
+      55 |
+        at skipIfFixtureMissing (/home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/fixtures/stunt-node.ts:52:11)
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/pve-managed-pools.spec.ts:23:3
+
+  3 failed
+    [integration] › tests/integration/pve-managed-pools.spec.ts:30:3 › ANAS PVE-managed pools (stunt node) › Pools: the PVE pool is badged and its structural actions are disabled 
+    [integration] › tests/integration/pve-managed-pools.spec.ts:56:3 › ANAS PVE-managed pools (stunt node) › Datasets: PVE pool root is banded + gated; ANAS pool root is not 
+    [integration] › tests/integration/pve-managed-pools.spec.ts:93:3 › ANAS PVE-managed pools (stunt node) › Datasets: an ANAS sibling under the PVE storage root is manageable; a guest-named child is not 

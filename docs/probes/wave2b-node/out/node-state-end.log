@@ -1,0 +1,84 @@
+--- date
+Fri Oct 16 08:04:17 UTC 2026
+authkey mtime 1792085540 now 1792137857
+--- ls /anas /adock
+ls: cannot access '/anas': No such file or directory
+ls: cannot access '/adock': No such file or directory
+--- pct list
+VMID       Status     Lock         Name                
+9900       stopped                 ingress-default     
+status: stopped
+description: adock network=default id=f6b01496-c8d1-4055-bc70-55590827a632 ingress instance=c62f44aa-043e-4875-b02e-5a8b04b9f7fd%0A
+hostname: ingress-default
+onboot: 0
+protection: 1
+tags: adock;adock-ingress;adock-net-default
+--- adock units
+active
+active
+  adock.service  loaded active running ADOCK API Gateway
+  adockd.service loaded active running ADOCK Daemon
+--- zpool
+gtbackup	ONLINE
+gtiscsi	ONLINE
+2
+--- lvm/md/loop/dm
+No devices found
+--- /etc/lvm/archive count
+56
+--- mdadm.conf (full sha256 + ARRAY lines)
+b86d1eddd7fc3619d0a7608bc4010fe603578894ec305e017036d45e4c646fa1  /etc/mdadm/mdadm.conf
+2
+ARRAY /dev/md/gtcache-r1 metadata=1.2 UUID=9ad0ac41:f5a3cb5f:04fd4100:1291b8d0
+ARRAY /dev/md/ahrpv-r1 metadata=1.2 UUID=d43a67e8:ab525844:13d802b2:45c224a6
+--- disks
+NAME SERIAL
+sda  drive-scsi0-0-0-0
+sr0  QM00003
+--- remote mounts / nft / exports
+/testpool/share1
+		192.168.200.0/24(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+--- config hashes
+b3c85fb4d426 /etc/fstab
+f1e3ca20fe45 /etc/exports
+46779719d6d6 /etc/samba/smb.conf
+7f6d05dde411 /etc/udev/rules.d/99-anas-cache.rules
+0aad11027013 /usr/share/perl5/PVE/APIServer/AnyEvent.pm
+sha256sum: / /usr/share/perl5/PVE/APIServer/AnasProxy.pm
+0637b14f7746 /usr/share/pve-manager/index.html.tpl
+ed65c5823807 /etc/pve/user.cfg
+--- pve users
+['root@pam']
+--- local accounts in the share band
+debian:x:1000:1000:Debian:/home/debian:/bin/bash
+debian:x:1000:
+--- misc
+ls: cannot access '/etc/exports.d': No such file or directory
+/mnt:
+anas-ahr
+anas-ahr-snapshots
+vzsnap0
+
+/srv:
+failed units:
+● zfs-import@anasactimport.service loaded failed failed Import ZFS pool anasactimport
+● zfs-import@anascomp.service      loaded failed failed Import ZFS pool anascomp
+0
+--- services
+active
+active
+active
+active
+active
+active
+MainPID=81382
+NRestarts=0
+
+MainPID=81384
+NRestarts=0
+
+MainPID=1676
+NRestarts=0
+{"status":"ok","version":"0.4.3","abandonedCommands":[]}
+anas 401
+adock 401

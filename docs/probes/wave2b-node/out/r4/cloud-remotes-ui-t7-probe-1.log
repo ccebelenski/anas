@@ -1,0 +1,297 @@
+(node:819471) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+(node:819547) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
++2925ms MSGBOX No valid subscriptionYou do not have a valid subscription for this server. Please visit www.proxmox.com to get a list of available options.0%0%OKYesNoCancel
++3041ms MSGBOX No valid subscriptionYou do not have a valid subscription for this server. Please visit www.proxmox.com to get a list of available options.0%0%OKYesNoCancel
++3275ms MSGBOX No valid subscriptionYou do not have a valid subscription for this server. Please visit www.proxmox.com to get a list of available options.0%0%OKYesNoCancel
++3428ms RES 200 GET /cloud/remotes {"data":{"rclone":{"version":"1.60.1","configFile":"/etc/anas/rclone.conf","encrypted":false},"remotes":[{"name":"gt","type":"sftp","options":{"host":"127.0.0.1","user":"rclonegt"},"secretsSet":["pass"]}]}}
++3563ms MSGBOX No valid subscriptionYou do not have a valid subscription for this server. Please visit www.proxmox.com to get a list of available options.0%0%OKYesNoCancel
++3772ms MSGBOX No valid subscriptionYou do not have a valid subscription for this server. Please visit www.proxmox.com to get a list of available options.0%0%OKYesNoCancel
++4039ms MSGBOX No valid subscriptionYou do not have a valid subscription for this server. Please visit www.proxmox.com to get a list of available options.0%0%OKYesNoCancel
++4276ms CONSOLE error Failed to load resource: the server responded with a status of 500 (Internal Server Error)
++4319ms RES 500 PUT /cloud/remotes/gt {"statusCode":500,"code":"EISDIR","error":"Internal Server Error","message":"EISDIR: illegal operation on a directory, read"}
++4338ms MSGBOX Save failedInternal Server Error0%0%OKYesNoCancel
++4428ms CONSOLE error Failed to load resource: the server responded with a status of 500 (Internal Server Error)
++4429ms CONSOLE warning [ANAS] cloud remotes load failed: Internal Server Error
++4436ms RES 500 GET /cloud/remotes {"statusCode":500,"code":"EISDIR","error":"Internal Server Error","message":"EISDIR: illegal operation on a directory, read"}
++4528ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++4783ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++5038ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++5284ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++5532ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++5778ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++6036ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++6308ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++6514ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++6784ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++7039ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++7285ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++7542ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++7769ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++8041ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++8290ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++8518ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++8786ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++9035ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++9303ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++9546ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++9780ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++10030ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++10286ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++10528ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++10780ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++11029ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++11278ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++11529ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++11780ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++12030ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++12280ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++12541ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++12786ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++13036ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++13267ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++13535ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++13783ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++14030ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++14286ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++14537ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++14786ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++15046ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++15278ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++15536ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++15798ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++16016ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++16287ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++16538ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++16783ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++17033ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++17272ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++17536ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++17789ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++18026ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++18286ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++18554ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++18792ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++19050ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++19289ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++19535ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++19777ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++20041ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++20280ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++20531ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++20771ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++21043ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++21285ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++21530ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++21800ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++22031ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++22281ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++22532ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++22776ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++23036ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++23290ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++23517ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++23789ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++24039ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++24281ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++24542ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++24773ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++25036ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++25298ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++25533ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++25790ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++26040ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++26271ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++26533ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++26792ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++27040ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++27293ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++27522ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++27791ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++28062ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++28281ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++28532ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++28789ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++29040ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++29292ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++29533ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++29784ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++30034ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++30272ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++30546ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++30785ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++31055ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++31287ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++31543ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++31773ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++32042ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++32279ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++32535ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++32785ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++33033ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++33283ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++33534ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++33791ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++34040ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++34296ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++34540ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++34786ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++35024ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++35288ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++35536ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++35772ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++36022ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++36288ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++36535ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++36791ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++37029ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++37314ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++37543ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++37784ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++38044ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++38286ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++38536ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++38785ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++39042ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++39293ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++39541ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++39776ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++40042ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++40308ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++40530ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++40779ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++41051ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++41296ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++41547ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++41788ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++42041ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++42289ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++42541ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++42791ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++43042ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++43278ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++43555ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++43781ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++44047ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++44299ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++44532ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++44804ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++45049ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++45291ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++45548ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++45798ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++46030ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++46304ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++46556ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++46791ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++47048ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++47300ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++47555ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++47799ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++48042ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++48298ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++48529ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++48788ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++49048ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++49292ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++49558ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++49813ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++50040ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++50297ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++50554ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++50779ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++51050ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++51301ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++51528ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++51799ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++52049ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++52300ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++52556ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++52786ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++53056ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++53301ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++53530ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++53800ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++54050ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++54298ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++54551ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++54789ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++55049ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++55299ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++55542ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++55794ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++56068ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++56284ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++56550ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++56798ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++57050ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++57301ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++57535ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++57796ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++58051ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++58280ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++58534ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++58798ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++59054ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++59304ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++59545ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++59798ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++60047ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++60294ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++60551ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++60801ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++61040ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++61305ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++61545ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++61782ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++62060ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++62281ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++62553ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++62803ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++63043ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++63304ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++63543ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++63800ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++64056ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++64364ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
++64530ms MSGBOX Load failedFailed to load the rclone remotes: Internal Server Error0%0%OKYesNoCancel
+  ✘  1 [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads (1.2m)
+
+
+  1) [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads 
+
+    Error: [2mexpect([22m[31mlocator[39m[2m).[22mtoBeVisible[2m([22m[2m)[22m failed
+
+    Locator: locator('.x-message-box:visible').filter({ hasText: 'Save failed' }).first()
+    Expected: visible
+    Timeout: 60000ms
+    Error: element(s) not found
+
+    Call log:
+    [2m  - Expect "toBeVisible" with timeout 60000ms[22m
+    [2m  - waiting for locator('.x-message-box:visible').filter({ hasText: 'Save failed' }).first()[22m
+
+
+      468 |     // sentence in the body — never a bare "failed" and never some other modal.
+      469 |     const failAlert = page.locator('.x-message-box:visible').filter({ hasText: 'Save failed' })
+    > 470 |     await expect(failAlert.first()).toBeVisible({ timeout: 60_000 })
+          |                                     ^
+      471 |     const failBody = ((await failAlert.first().textContent()) ?? '').replace(/Save failed|OK|Cancel/g, '').trim()
+      472 |     expect(failBody.length, `the save-failure alert body was: ${failBody}`).toBeGreaterThan(10)
+      473 |
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/cloud-remotes-ui.spec.ts:470:37
+
+    [31mTest timeout of 30000ms exceeded.[39m
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-remotes-ui-rclone-1--c79a2--AND-the-grid-still-reloads-integration/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-remotes-ui-rclone-1--c79a2--AND-the-grid-still-reloads-integration/error-context.md
+
+  1 failed
+    [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads 

@@ -1,0 +1,15 @@
+(node:302861) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 6 tests using 1 worker
+
+(node:302937) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/pve-native-ui.spec.ts:34:3 › ANAS native panels (stunt node) › the node menu shows the ANAS group with Dashboard, Pools, Disks (1.8s)
+  ✓  2 [integration] › tests/integration/pve-native-ui.spec.ts:46:3 › ANAS native panels (stunt node) › Pools renders a native grid containing testpool, with no iframe (2.1s)
+  ✓  3 [integration] › tests/integration/pve-native-ui.spec.ts:62:3 › ANAS native panels (stunt node) › Start Scrub on testpool posts a 202 job and runs a real scrub (2.3s)
+  ✓  4 [integration] › tests/integration/pve-native-ui.spec.ts:97:3 › ANAS native panels (stunt node) › Dashboard renders and mentions testpool (2.1s)
+  ✓  5 [integration] › tests/integration/pve-native-ui.spec.ts:109:3 › ANAS native panels (stunt node) › Disks lists disks and opens a SMART window (1.9s)
+  ✓  6 [integration] › tests/integration/pve-native-ui.spec.ts:158:3 › ANAS not installed (service stopped) › opening an ANAS item shows the not-installed panel (2.2s)
+
+  6 passed (13.4s)

@@ -1,0 +1,131 @@
+(node:145629) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 7 tests using 1 worker
+
+(node:145710) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/cloud-remotes-ui.spec.ts:251:3 › rclone.1 — Remotes manager window (stunt node UI) › 1 — add through the dialog: Test says Reachable, the row lists pass (secret), the file holds an obscured value (9.6s)
+  ✓  2 [integration] › tests/integration/cloud-remotes-ui.spec.ts:285:3 › rclone.1 — Remotes manager window (stunt node UI) › 2 — edit keeps the secret: blank "(unchanged)" box, the file's pass line untouched (6.8s)
+  ✓  3 [integration] › tests/integration/cloud-remotes-ui.spec.ts:344:3 › rclone.1 — Remotes manager window (stunt node UI) › 3 — toolbar Test: the saved remote by name says Reachable (5.1s)
+  ✘  4 [integration] › tests/integration/cloud-remotes-ui.spec.ts:358:3 › rclone.1 — Remotes manager window (stunt node UI) › 4 — a wrong password in an UNSAVED dialog: the Authentication-failed verdict (8.1s)
+(node:149755) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  5 [integration] › tests/integration/cloud-remotes-ui.spec.ts:375:3 › rclone.1 — Remotes manager window (stunt node UI) › 5 — the S3 form shows exactly ONE region row once a provider is picked (7.2s)
+(node:151063) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  6 [integration] › tests/integration/cloud-remotes-ui.spec.ts:417:3 › rclone.1 — Remotes manager window (stunt node UI) › 6 — remove: the confirm, then the row is gone (4.0m)
+(node:172980) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  7 [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads (1.1m)
+
+
+  1) [integration] › tests/integration/cloud-remotes-ui.spec.ts:358:3 › rclone.1 — Remotes manager window (stunt node UI) › 4 — a wrong password in an UNSAVED dialog: the Authentication-failed verdict 
+
+    Error: locator.click: Error: strict mode violation: locator('.anas-win-cloud-remote-edit').locator('.x-btn').filter({ hasText: 'Cancel' }) resolved to 2 elements:
+        1) <a role="button" hidefocus="on" id="button-1160" unselectable="on" aria-hidden="true" aria-disabled="true" data-componentid="button-1160" class="x-btn anas-btn-cloud-test-cancel x-unselectable x-box-item x-btn-default-small x-item-disabled x-btn-disabled">…</a> aka locator('#button-1160')
+        2) <a tabindex="0" role="button" hidefocus="on" id="button-1164" unselectable="on" aria-hidden="false" aria-disabled="false" data-componentid="button-1164" class="x-btn x-unselectable x-box-item x-toolbar-item x-btn-default-small">…</a> aka getByRole('button', { name: 'Cancel' })
+
+    Call log:
+    [2m  - waiting for locator('.anas-win-cloud-remote-edit').locator('.x-btn').filter({ hasText: 'Cancel' })[22m
+
+
+      368 |
+      369 |     // Nothing was written: the wrong remote never reaches the grid or the file.
+    > 370 |     await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
+          |                                                        ^
+      371 |     await expect(dlg).toBeHidden({ timeout: 20_000 })
+      372 |     await expect(remoteRow(page, win, 'gt-wrongpass')).toHaveCount(0)
+      373 |   })
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/cloud-remotes-ui.spec.ts:370:56
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-remotes-ui-rclone-1--586aa-thentication-failed-verdict-integration/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-remotes-ui-rclone-1--586aa-thentication-failed-verdict-integration/error-context.md
+
+  2) [integration] › tests/integration/cloud-remotes-ui.spec.ts:375:3 › rclone.1 — Remotes manager window (stunt node UI) › 5 — the S3 form shows exactly ONE region row once a provider is picked 
+
+    Error: locator.click: Error: strict mode violation: locator('.anas-win-cloud-remote-edit').locator('.x-btn').filter({ hasText: 'Cancel' }) resolved to 2 elements:
+        1) <a tabindex="0" role="button" hidefocus="on" id="button-1160" unselectable="on" aria-hidden="true" aria-disabled="false" data-componentid="button-1160" class="x-btn anas-btn-cloud-test-cancel x-unselectable x-box-item x-btn-default-small">…</a> aka locator('#button-1160')
+        2) <a tabindex="0" role="button" hidefocus="on" id="button-1164" unselectable="on" aria-hidden="false" aria-disabled="false" data-componentid="button-1164" class="x-btn x-unselectable x-box-item x-toolbar-item x-btn-default-small">…</a> aka getByRole('button', { name: 'Cancel' })
+
+    Call log:
+    [2m  - waiting for locator('.anas-win-cloud-remote-edit').locator('.x-btn').filter({ hasText: 'Cancel' })[22m
+
+
+      411 |     expect(regionAfter, why).not.toContain('other-v2-signature')
+      412 |
+    > 413 |     await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
+          |                                                        ^
+      414 |     await expect(dlg).toBeHidden({ timeout: 20_000 })
+      415 |   })
+      416 |
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/cloud-remotes-ui.spec.ts:413:56
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-remotes-ui-rclone-1--7a7f7-w-once-a-provider-is-picked-integration/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-remotes-ui-rclone-1--7a7f7-w-once-a-provider-is-picked-integration/error-context.md
+
+  3) [integration] › tests/integration/cloud-remotes-ui.spec.ts:417:3 › rclone.1 — Remotes manager window (stunt node UI) › 6 — remove: the confirm, then the row is gone 
+
+    [31mTest timeout of 240000ms exceeded.[39m
+
+    Error: locator.click: Test timeout of 240000ms exceeded.
+    Call log:
+    [2m  - waiting for locator('.anas-win-cloud-remotes').locator('.x-grid-row').filter({ has: locator('.x-grid-cell-inner').filter({ hasText: /^gt$/ }) }).first()[22m
+
+
+      417 |   test('6 — remove: the confirm, then the row is gone', async ({ page }) => {
+      418 |     const win = await openRemotesWindow(page)
+    > 419 |     await remoteRow(page, win, REMOTE).click()
+          |                                        ^
+      420 |     await win.locator('.anas-btn-cloud-remote-remove').click()
+      421 |
+      422 |     // ExtJS 7's message box is `.x-message-box` — the class every other spec
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/cloud-remotes-ui.spec.ts:419:40
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-remotes-ui-rclone-1--49c95-onfirm-then-the-row-is-gone-integration/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-remotes-ui-rclone-1--49c95-onfirm-then-the-row-is-gone-integration/error-context.md
+
+  4) [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads 
+
+    Error: [2mexpect([22m[31mlocator[39m[2m).[22mtoBeVisible[2m([22m[2m)[22m failed
+
+    Locator: locator('.x-message-box:visible').filter({ hasText: 'Save failed' }).first()
+    Expected: visible
+    Timeout: 60000ms
+    Error: element(s) not found
+
+    Call log:
+    [2m  - Expect "toBeVisible" with timeout 60000ms[22m
+    [2m  - waiting for locator('.x-message-box:visible').filter({ hasText: 'Save failed' }).first()[22m
+
+
+      460 |     // sentence in the body — never a bare "failed" and never some other modal.
+      461 |     const failAlert = page.locator('.x-message-box:visible').filter({ hasText: 'Save failed' })
+    > 462 |     await expect(failAlert.first()).toBeVisible({ timeout: 60_000 })
+          |                                     ^
+      463 |     const failBody = ((await failAlert.first().textContent()) ?? '').replace(/Save failed|OK|Cancel/g, '').trim()
+      464 |     expect(failBody.length, `the save-failure alert body was: ${failBody}`).toBeGreaterThan(10)
+      465 |
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/cloud-remotes-ui.spec.ts:462:37
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/cloud-remotes-ui-rclone-1--c79a2--AND-the-grid-still-reloads-integration/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/cloud-remotes-ui-rclone-1--c79a2--AND-the-grid-still-reloads-integration/error-context.md
+
+  4 failed
+    [integration] › tests/integration/cloud-remotes-ui.spec.ts:358:3 › rclone.1 — Remotes manager window (stunt node UI) › 4 — a wrong password in an UNSAVED dialog: the Authentication-failed verdict 
+    [integration] › tests/integration/cloud-remotes-ui.spec.ts:375:3 › rclone.1 — Remotes manager window (stunt node UI) › 5 — the S3 form shows exactly ONE region row once a provider is picked 
+    [integration] › tests/integration/cloud-remotes-ui.spec.ts:417:3 › rclone.1 — Remotes manager window (stunt node UI) › 6 — remove: the confirm, then the row is gone 
+    [integration] › tests/integration/cloud-remotes-ui.spec.ts:433:3 › rclone.1 — Remotes manager window (stunt node UI) › 7 — an injected failure before Save: the failure surfaces AND the grid still reloads 
+  3 passed (6.0m)

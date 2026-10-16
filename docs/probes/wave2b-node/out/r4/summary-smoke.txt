@@ -1,0 +1,2 @@
+auth.spec.ts rc=0 5s  4 passed (4.2s);
+gateway.spec.ts rc=0 5s  7 passed (4.4s);

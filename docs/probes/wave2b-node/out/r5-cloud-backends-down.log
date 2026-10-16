@@ -1,0 +1,83 @@
+=== cloud backends fixture — down s3 ===
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ anas-gt-s3 stopped and gone
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /opt/anas-test/s3-data removed (the binary /opt/anas-test/versitygw stays)
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ no leftover versitygw process
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /var/tmp/anas-gtcloud-src removed
+=== cloud backends fixture — down smb ===
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ share gtsmbshare removed (absent from smb.conf)
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ user gtsmbuser removed (passwd + passdb)
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /var/tmp/anas-gtsmb removed
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /var/tmp/anas-gtcloud-src removed
+=== cloud backends fixture — down webdav ===
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ anas-gt-webdav stopped and gone
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /var/tmp/anas-gtwebdav removed
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ no leftover webdav server process
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /var/tmp/anas-gtcloud-src removed
+=== cloud backends fixture — down ftp ===
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ anas-gt-ftp stopped and gone
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /var/tmp/anas-gtftp removed
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ no leftover ftp server process
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /var/tmp/anas-gtcloud-src removed
+=== cloud backends fixture — down azure ===
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ anas-gt-azure stopped and gone
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /opt/anas-test/azurite-data removed (the npm tree /opt/anas-test/azurite stays)
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ no leftover azurite process
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /var/tmp/anas-gtcloud-src removed
+=== cloud backends fixture — down gcs ===
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ anas-gt-gcs stopped and gone
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /opt/anas-test/gcs-data removed (the binary /opt/anas-test/fake-gcs-server/fake-gcs-server stays)
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ no leftover fake-gcs-server process
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /var/tmp/anas-gtcloud-src removed
+=== cloud backends fixture — down crypt ===
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ gtcryptsftp not present (skipping)
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /var/tmp/anas-gtcrypt removed
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+✓ /var/tmp/anas-gtcloud-src removed

@@ -1,0 +1,34 @@
+diff --git a/tests/integration/cloud-tasks-ui.spec.ts b/tests/integration/cloud-tasks-ui.spec.ts
+index d1e6ef60..be1e9bcd 100644
+--- a/tests/integration/cloud-tasks-ui.spec.ts
++++ b/tests/integration/cloud-tasks-ui.spec.ts
+@@ -442,6 +442,29 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
+ 
+   test('1 — create through the wizard: empty-remotes toast, nested note, sync sentence, Copy default, the row lands selected', async ({ page, playwright }) => {
+     const grid = await openTasksView(page)
++    // W2B PROBE (wave-2b row 4, never committed): every /cloud/tasks + job request with its
++    // time, and a 50 ms sampler of the tasks grid's selection, printed at the end.
++    const w2t0 = Date.now()
++    const w2log: string[] = []
++    page.on('request', (r) => { const u = r.url(); if (/\/v1\/(cloud\/tasks|jobs\/)/.test(u)) w2log.push(`+${Date.now() - w2t0}ms REQ ${r.method()} ${u.replace(/^.*\/v1/, '')}`) })
++    page.on('response', (r) => { const u = r.url(); if (/\/v1\/(cloud\/tasks|jobs\/)/.test(u)) w2log.push(`+${Date.now() - w2t0}ms RES ${r.status()} ${r.request().method()} ${u.replace(/^.*\/v1/, '')}`) })
++    page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') w2log.push(`+${Date.now() - w2t0}ms CONSOLE ${m.type()} ${m.text().slice(0, 400)}`) })
++    page.on('pageerror', (e) => { w2log.push(`+${Date.now() - w2t0}ms PAGEERROR ${String(e).slice(0, 600)} ${(e.stack || '').split('\n').slice(0, 25).join(' | ')}`) })
++    page.on('response', async (r) => { if (/\/v1\/jobs\//.test(r.url())) { try { w2log.push(`+${Date.now() - w2t0}ms JOBBODY ${(await r.text()).slice(0, 300)}`) } catch { /* gone */ } } })
++    let w2last = ''
++    const w2timer = setInterval(async () => {
++      try {
++        const sel = await page.evaluate(() => {
++          const g = (window as any).Ext?.ComponentQuery?.query('#cloudView grid')?.[0]
++          if (!g) return 'no-grid'
++          return `rows=${g.getStore().getCount()} sel=[${g.getSelectionModel().getSelection().map((x: any) => x.get('name')).join(',')}]`
++        })
++        if (sel !== w2last) { w2log.push(`+${Date.now() - w2t0}ms SEL ${sel}`); w2last = sel }
++      } catch { /* page closing */ }
++    }, 50)
++    test.info().attach('w2b', { body: 'probe armed' })
++    process.on('exit', () => {})
++    page.on('close', () => { clearInterval(w2timer); console.log(w2log.join('\n')) })
+ 
+     // The empty-remotes toast: a create with no remote saved never opens the
+     // wizard — it points at Remotes… instead.

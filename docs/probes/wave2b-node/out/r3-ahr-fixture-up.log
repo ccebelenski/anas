@@ -1,0 +1,29 @@
+  Inside VM: /dev/sdv  (by-id: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT20)
+  Inside VM: /dev/sdw  (by-id: scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT21)
+mdadm: array /dev/md/w2bahr-r1 started.
+  Physical volume "/dev/md/w2bahr-r1" successfully created.
+  Volume group "w2bahr" successfully created
+  WARNING: This metadata update is NOT backed up.
+  Logical volume "w2bahr-vol" created.
+  WARNING: This metadata update is NOT backed up.
+Create subvolume '/mnt/anas-ahr/w2bahr/@data'
+Create subvolume '/mnt/anas-ahr/w2bahr/@snapshots'
+Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] 
+md127 : active raid1 sdc1[1] sdb1[0]
+      1046464 blocks super 1.2 [2/2] [UU]
+      [===>.................]  resync = 19.1% (200320/1046464) finish=0.0min speed=200320K/sec
+      bitmap: 1/1 pages [4KB], 65536KB chunk
+
+unused devices: <none>
+TARGET               SOURCE                                 FSTYPE OPTIONS
+/mnt/anas-ahr/w2bahr /dev/mapper/w2bahr-w2bahr--vol[/@data] btrfs  rw,relatime,discard=async,space_cache=v2,subvolid=256,subvol=/@data
+MD_LEVEL=raid1
+MD_DEVICES=2
+MD_METADATA=1.2
+MD_UUID=f6e98ea4:0d7ff096:bceff1b8:55801a45
+MD_DEVNAME=w2bahr-r1
+MD_NAME=anas-pve:w2bahr-r1
+MD_DEVICE_dev_sdc1_ROLE=1
+MD_DEVICE_dev_sdc1_DEV=/dev/sdc1
+MD_DEVICE_dev_sdb1_ROLE=0
+MD_DEVICE_dev_sdb1_DEV=/dev/sdb1

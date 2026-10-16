@@ -1,0 +1,40 @@
+            const unlocked = unlockedSourcesLine(source.unlocked);
+            if (unlocked)
+                updateProgress(`backup task '${name}': ${unlocked}`);
+1
+
+### [R] direct run of w2bt4 over the socket, logpoint armed for this run only
+submit: {"job":{"id":"f41278fc-24ad-4a8c-804d-39bdf8ff34ff","status":"running","operation":"backup.task.run","createdAt"
+job f41278fc-24ad-4a8c-804d-39bdf8ff34ff ended
+2026-10-16T06:00:45.293Z W2B-LOGPOINT {"unlocked":null,"sourceUnlocked":[]}
+{"breakpointId":"2:1082:0:routes/backup\\.js$","locations":[{"scriptId":"151","lineNumber":1082,"columnNumber":12}]}
+2026-10-16T06:00:47.271Z W2B-LOGPOINT {"unlocked":null,"sourceUnlocked":[]}
+logpoint removed
+
+### [A] direct run of w2bt4 over the socket, logpoint armed for this run only
+submit: {"job":{"id":"61685ff0-3856-4573-aac2-14cf2decd840","status":"running","operation":"backup.task.run","createdAt"
+job 61685ff0-3856-4573-aac2-14cf2decd840 ended
+2026-10-16T06:01:03.044Z W2B-LOGPOINT {"unlocked":null,"sourceUnlocked":[]}
+2026-10-16T06:01:03.044Z W2B-LOGPOINT {"unlocked":null,"sourceUnlocked":[]}
+{"breakpointId":"2:1082:0:routes/backup\\.js$","locations":[{"scriptId":"151","lineNumber":1082,"columnNumber":12}]}
+2026-10-16T06:01:04.999Z W2B-LOGPOINT {"unlocked":null,"sourceUnlocked":[]}
+logpoint removed
+bind mount removed
+
+### [B] direct run of w2bt4 over the socket, logpoint armed for this run only
+submit: {"job":{"id":"2675f856-1f48-42a5-93db-74a75344579b","status":"running","operation":"backup.task.run","createdAt"
+job 2675f856-1f48-42a5-93db-74a75344579b ended
+2026-10-16T06:01:19.870Z W2B-LOGPOINT {"unlocked":null,"sourceUnlocked":[]}
+2026-10-16T06:01:19.870Z W2B-LOGPOINT {"unlocked":null,"sourceUnlocked":[]}
+2026-10-16T06:01:19.870Z W2B-LOGPOINT {"unlocked":null,"sourceUnlocked":[]}
+{"breakpointId":"2:1082:0:routes/backup\\.js$","locations":[{"scriptId":"151","lineNumber":1082,"columnNumber":12}]}
+2026-10-16T06:01:21.802Z W2B-LOGPOINT {"unlocked":"/mnt/anas-ahr/w2bahr: no lock on the source - the AHR topology could not be read, so it is unknown whether the filesystem is an ANAS AHR pool","sourceUnlocked":["/mnt/anas-ahr/w2bahr: no lock on the source - the AHR topology could not be read, so it is unknown whether the filesystem is an ANAS AHR pool"]}
+logpoint removed
+bind mount removed
+bab911d1970826c6  /usr/sbin/mdadm
+bab911d1970826c6  /var/tmp/w2b/mdadm.real
+
+### the logpoint's lines in the anasd journal (R, A, B in order)
+2026-10-16T06:00:47+00:00 anas-pve node[220746]: W2B-LOGPOINT {"unlocked":null,"sourceUnlocked":[]}
+2026-10-16T06:01:04+00:00 anas-pve node[220746]: W2B-LOGPOINT {"unlocked":null,"sourceUnlocked":[]}
+2026-10-16T06:01:21+00:00 anas-pve node[220746]: W2B-LOGPOINT {"unlocked":"/mnt/anas-ahr/w2bahr: no lock on the source - the AHR topology could not be read, so it is unknown whether the filesystem is an ANAS AHR pool","sourceUnlocked":["/mnt/anas-ahr/w2bahr: no lock on the source - the AHR topology could not be read, so it is unknown whether the filesystem is an ANAS AHR pool"]}

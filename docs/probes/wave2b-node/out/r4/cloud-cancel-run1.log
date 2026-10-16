@@ -1,0 +1,34 @@
+(node:123077) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 4 tests using 1 worker
+
+(node:123164) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/cloud-cancel.spec.ts:265:3 › cloud cancel live proofs — the rclone.5 cancel ladder + the runner-poll restart fix › 1 — the cancel ladder: 409 + code, replay 202, SIGINT lands (child gone, exit 130), cancelled row with its note, a partial destination, and no notification (24.4s)
+  ✓  2 [integration] › tests/integration/cloud-cancel.spec.ts:370:3 › cloud cancel live proofs — the rclone.5 cancel ladder + the runner-poll restart fix › 2 — the refusals: a finished job, the supervising job, and a consumed code answered with a fresh one (21.6s)
+  ✓  3 [integration] › tests/integration/cloud-cancel.spec.ts:415:3 › cloud cancel live proofs — the rclone.5 cancel ladder + the runner-poll restart fix › 3 — the dialog: the daemon words the confirm window, Keep running sends nothing, confirming cancels and the row reads cancelled (24.8s)
+  ✘  4 [integration] › tests/integration/cloud-cancel.spec.ts:475:3 › cloud cancel live proofs — the rclone.5 cancel ladder + the runner-poll restart fix › 4 — the runner-poll fix: a daemon restart mid-run ends the unit failed with the interruption sentence, and Run now comes back (22.6s)
+
+
+  1) [integration] › tests/integration/cloud-cancel.spec.ts:475:3 › cloud cancel live proofs — the rclone.5 cancel ladder + the runner-poll restart fix › 4 — the runner-poll fix: a daemon restart mid-run ends the unit failed with the interruption sentence, and Run now comes back 
+
+    Error: remotes after teardown: ["gtcancelsftp"]
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoContain[2m([22m[32mexpected[39m[2m) // indexOf[22m
+
+    Expected value: [32m"gtest"[39m
+    Received array: [31m["gtcancelsftp"][39m
+
+      254 |     try {
+      255 |       expect(await remoteNames(ctx2), `remotes after teardown: ${JSON.stringify(await remoteNames(ctx2))}`)
+    > 256 |         .toContain('gtest')
+          |          ^
+      257 |       expect(await taskNames(ctx2), `tasks after teardown: ${JSON.stringify(await taskNames(ctx2))}`)
+      258 |         .toContain('testoff')
+      259 |     }
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/cloud-cancel.spec.ts:256:10
+
+  1 failed
+    [integration] › tests/integration/cloud-cancel.spec.ts:475:3 › cloud cancel live proofs — the rclone.5 cancel ladder + the runner-poll restart fix › 4 — the runner-poll fix: a daemon restart mid-run ends the unit failed with the interruption sentence, and Run now comes back 
+  3 passed (2.1m)

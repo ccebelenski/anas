@@ -1,0 +1,16 @@
+(node:386481) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 7 tests using 1 worker
+
+(node:386548) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/vdev-remove-api.spec.ts:133:3 › Remove a cache, log or spare vdev (story vdevs.2) › the fixture pool starts with all six vdev classes (368ms)
+  ✓  2 [integration] › tests/integration/vdev-remove-api.spec.ts:145:3 › Remove a cache, log or spare vdev (story vdevs.2) › a cache leaf comes out — zpool status and the API agree (1.0s)
+  ✓  3 [integration] › tests/integration/vdev-remove-api.spec.ts:163:3 › Remove a cache, log or spare vdev (story vdevs.2) › a spare comes out (956ms)
+  ✓  4 [integration] › tests/integration/vdev-remove-api.spec.ts:181:3 › Remove a cache, log or spare vdev (story vdevs.2) › a single log leaf comes out (1.1s)
+  ✓  5 [integration] › tests/integration/vdev-remove-api.spec.ts:199:3 › Remove a cache, log or spare vdev (story vdevs.2) › a MIRRORED log added on the command line comes out by its mirror-N name (1.4s)
+  ✓  6 [integration] › tests/integration/vdev-remove-api.spec.ts:227:3 › Remove a cache, log or spare vdev (story vdevs.2) › special, dedup and a data leaf are refused with the evacuation sentence (486ms)
+  ✓  7 [integration] › tests/integration/vdev-remove-api.spec.ts:251:3 › Remove a cache, log or spare vdev (story vdevs.2) › a vdev the pool does not carry is refused by name (64ms)
+
+  7 passed (18.4s)

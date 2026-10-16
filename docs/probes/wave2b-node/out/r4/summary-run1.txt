@@ -1,0 +1,54 @@
+ahr-cache-api.spec.ts BLOCKED
+ahr-cache-review.spec.ts BLOCKED
+ahr-cache-ui.spec.ts BLOCKED
+ahr-expand-zero-gain.spec.ts BLOCKED
+alert-encoding.spec.ts rc=0 7s  2 passed (6.0s);
+auth.spec.ts rc=0 5s  4 passed (4.0s);
+backup-cancel.spec.ts rc=1 24s  1 failed; 1 did not run;
+backup-source-guard.spec.ts rc=1 84s  1 failed; 4 passed (1.4m);
+cloud-backends-2.spec.ts rc=0 120s  3 passed (2.0m);
+cloud-backends.spec.ts rc=1 8s  1 failed; 3 did not run;
+cloud-cancel.spec.ts rc=1 127s  1 failed; 3 passed (2.1m);
+cloud-guided-viewer.spec.ts rc=1 19s  1 failed; 4 did not run;
+cloud-remotes-api.spec.ts rc=0 36s  10 passed (35.2s);
+cloud-remotes-ui.spec.ts rc=1 362s  4 failed; 3 passed (6.0m);
+cloud-review-fixes.spec.ts rc=1 19s  1 failed; 2 did not run;
+cloud-tasks-api.spec.ts rc=0 283s  9 passed (4.7m);
+cloud-tasks-ui.spec.ts rc=1 178s  1 failed; 7 passed (3.0m);
+dashboard.spec.ts rc=0 8s  2 passed (7.4s);
+dataset-permissions.spec.ts rc=0 20s  4 passed (19.2s);
+datasets-api.spec.ts rc=0 8s  5 passed (7.0s);
+datasets-gfx-ui.spec.ts rc=0 9s  3 passed (8.4s);
+datasets-hero.spec.ts rc=0 19s  5 passed (18.4s);
+datasets-ui.spec.ts rc=0 13s  5 passed (12.2s);
+disks-reprobe.spec.ts rc=0 43s  5 passed (41.8s);
+gateway.spec.ts rc=0 5s  7 passed (4.3s);
+ident-iscsi.spec.ts rc=1 2s  1 failed; 2 did not run;
+identity-passdb.spec.ts rc=1 8s  1 failed; 4 did not run;
+ident-mounts-repl.spec.ts rc=0 78s  4 passed (1.3m);
+ident-zfs.spec.ts rc=0 25s  5 passed (23.9s);
+pool-composer.spec.ts rc=1 5s  2 failed;
+pools-act-api.spec.ts rc=1 21s  4 failed; 5 passed (19.9s);
+pools-act-ui.spec.ts rc=1 14s  1 failed; 5 passed (13.7s);
+pools-status.spec.ts rc=0 7s  2 passed (5.7s);
+pve-login-flow.spec.ts rc=0 3s  1 passed (2.5s);
+pve-managed-pools.spec.ts rc=1 4s  3 failed;
+pve-native-ui.spec.ts rc=0 14s  6 passed (13.4s);
+pvepool-api.spec.ts rc=1 18s  6 failed; 6 passed (16.9s);
+pvepool-ui.spec.ts rc=0 28s  7 passed (27.8s);
+replication-ui.spec.ts rc=0 44s  7 passed (43.5s);
+sched-stamps.spec.ts rc=0 164s  3 passed (2.7m);
+schedules-exclude-api.spec.ts rc=1 7s  1 failed; 6 did not run;
+schedules-exclude.spec.ts rc=0 8s  1 passed (6.9s);
+shares.spec.ts rc=0 28s  8 passed (27.2s);
+share-users.spec.ts rc=0 17s  3 passed (16.2s);
+smbsvc-api.spec.ts BLOCKED
+smbsvc-recycle.spec.ts rc=0 31s  5 passed (30.4s);
+smbsvc-ui.spec.ts rc=0 31s  6 passed (30.8s);
+snapshots-api.spec.ts rc=0 11s  3 passed (9.5s);
+snapshots-ui.spec.ts rc=0 27s  6 passed (26.4s);
+task-status-reboot.spec.ts rc=0 91s  2 passed (1.5m);
+vdev-classes-api.spec.ts rc=0 14s  3 passed (12.8s);
+vdev-consumers-api.spec.ts rc=0 17s  3 passed (16.9s);
+vdev-remove-api.spec.ts rc=0 20s  7 passed (18.4s);
+vdev-remove-byid-api.spec.ts rc=0 17s  6 passed (16.3s);

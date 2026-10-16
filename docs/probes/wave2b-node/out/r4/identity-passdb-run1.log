@@ -1,0 +1,40 @@
+(node:275362) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 5 tests using 1 worker
+
+(node:275443) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  1 [integration] › tests/integration/identity-passdb.spec.ts:169:3 › Passdb entry matches the account exactly (identity.3, #68) › 1 — create over a staged case-mismatched orphan repairs it: Idpcase:<uid> exact, smbEnabled, one journal line (2.5s)
+  -  2 [integration] › tests/integration/identity-passdb.spec.ts:196:3 › Passdb entry matches the account exactly (identity.3, #68) › 2 — smbclient as Idpcase lists and writes on a valid-users share (no guest), Windows-shaped login too
+  -  3 [integration] › tests/integration/identity-passdb.spec.ts:219:3 › Passdb entry matches the account exactly (identity.3, #68) › 3 — a mismatched entry planted after create: API and grid show the stored name, smbclient is refused
+  -  4 [integration] › tests/integration/identity-passdb.spec.ts:256:3 › Passdb entry matches the account exactly (identity.3, #68) › 4 — set password repairs the mismatch: exact entry again, smbclient lists
+  -  5 [integration] › tests/integration/identity-passdb.spec.ts:278:3 › Passdb entry matches the account exactly (identity.3, #68) › 5 — delete on a mismatched entry succeeds and leaves nothing behind
+
+
+  1) [integration] › tests/integration/identity-passdb.spec.ts:169:3 › Passdb entry matches the account exactly (identity.3, #68) › 1 — create over a staged case-mismatched orphan repairs it: Idpcase:<uid> exact, smbEnabled, one journal line 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoEqual[2m([22m[32mexpected[39m[2m) // deep equality[22m
+
+    [32m- Expected  - 0[39m
+    [31m+ Received  + 1[39m
+
+    [2m  Object {[22m
+    [2m    "created": "Idpcase",[22m
+    [2m    "smbEnabled": true,[22m
+    [2m    "smbEntryReplaced": "idpcase",[22m
+    [31m+   "uid": 1001,[39m
+    [2m  }[22m
+
+      174 |
+      175 |       const result = await runJob(ctx, 'post', `${V1}/identity/users`, { name: USER, smbPassword: PW })
+    > 176 |       expect(result).toEqual({ created: USER, smbEnabled: true, smbEntryReplaced: LOWER })
+          |                      ^
+      177 |
+      178 |       const uid = await sshExec(`id -u ${USER}`)
+      179 |       expect(await passdbLines()).toEqual([`${USER}:${uid}:`])
+        at /home/ccebelenski/projects/anas/.claude/worktrees/agent-ad2110ee756b875e9/tests/integration/identity-passdb.spec.ts:176:22
+
+  1 failed
+    [integration] › tests/integration/identity-passdb.spec.ts:169:3 › Passdb entry matches the account exactly (identity.3, #68) › 1 — create over a staged case-mismatched orphan repairs it: Idpcase:<uid> exact, smbEnabled, one journal line 
+  4 did not run

@@ -375,6 +375,7 @@ export function runStateUnreadableRefusal(what: string): Refusal {
   return {
     status: 409,
     code: 'CONFLICT',
+    reason: 'run-state-unreadable',
     message: `Could not read ${what} run state from systemd — refusing to delete; nothing was deleted`,
   }
 }

@@ -1,0 +1,40 @@
+
+### dataset gtbackup/w2bsrc
+HTTP 202 0.087149
+{"job":{"id":"fd36e6a9-88b5-409a-a2e7-0d1a6bc42ccf","status":"running","operation":"zfs.create","createdAt":"2026-10-16T05:43:13.013Z","createdBy":"root@pam"}}
+[t+0s] completed |  | {"created": "gtbackup/w2bsrc"} | 
+2.0K	/gtbackup/w2bsrc
+
+### nft blackhole for 192.0.2.10
+table inet w2bbh {
+	chain out {
+		type filter hook output priority filter; policy accept;
+		ip daddr 192.0.2.10 drop
+	}
+}
+
+### backup repo w2bbh
+HTTP 202 0.024177
+{"job":{"id":"96d91f2e-ede9-4916-a972-aadd52ba369a","status":"running","operation":"backup.repo.create","createdAt":"2026-10-16T05:43:14.746Z","createdBy":"root@pam"}}
+[t+0s] completed |  | {"created": "w2bbh", "version": 4} | 
+
+### backup task w2bt1
+HTTP 202 0.023051
+{"job":{"id":"2f06d44a-3b9b-4060-a8ba-1e13e24f0418","status":"running","operation":"backup.task.create","createdAt":"2026-10-16T05:43:14.888Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"created": "w2bt1"} | 
+
+### backup task w2bt2
+HTTP 202 0.030147
+{"job":{"id":"ddd04ccb-3f74-4d81-b9c0-3b2c64862806","status":"running","operation":"backup.task.create","createdAt":"2026-10-16T05:43:15.602Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"created": "w2bt2"} | 
+
+### backup task w2bt3
+HTTP 202 0.031435
+{"job":{"id":"39c54ce0-73e5-494b-b364-8cb2da82de5c","status":"running","operation":"backup.task.create","createdAt":"2026-10-16T05:43:16.327Z","createdBy":"root@pam"}}
+[t+1s] completed |  | {"created": "w2bt3"} | 
+-rw-r--r-- 1 root root  596 Oct 16 05:43 anas-backup-w2bt1.service
+-rw-r--r-- 1 root root  133 Oct 16 05:43 anas-backup-w2bt1.timer
+-rw-r--r-- 1 root root  596 Oct 16 05:43 anas-backup-w2bt2.service
+-rw-r--r-- 1 root root  133 Oct 16 05:43 anas-backup-w2bt2.timer
+-rw-r--r-- 1 root root  596 Oct 16 05:43 anas-backup-w2bt3.service
+-rw-r--r-- 1 root root  133 Oct 16 05:43 anas-backup-w2bt3.timer

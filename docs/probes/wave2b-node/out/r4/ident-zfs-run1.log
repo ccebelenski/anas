@@ -1,0 +1,14 @@
+(node:288477) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 5 tests using 1 worker
+
+(node:288566) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 [integration] › tests/integration/ident-zfs.spec.ts:169:3 › ident.1 — ZFS ownership stamps, stable-id confirms, wipe-by-identity, reserved names (stunt node) › 1. a schedule take stamps anas:schedule=<id> (source local) on every snapshot it created (3.1s)
+  ✓  2 [integration] › tests/integration/ident-zfs.spec.ts:191:3 › ident.1 — ZFS ownership stamps, stable-id confirms, wipe-by-identity, reserved names (stunt node) › 2. two schedules on one dataset (standard + minimal) each keep the other's buckets (7.3s)
+  ✓  3 [integration] › tests/integration/ident-zfs.spec.ts:238:3 › ident.1 — ZFS ownership stamps, stable-id confirms, wipe-by-identity, reserved names (stunt node) › 3. a pool swapped under the same name between challenge and resend → 409 IDENTITY_MISMATCH, nothing destroyed (1.8s)
+  ✓  4 [integration] › tests/integration/ident-zfs.spec.ts:261:3 › ident.1 — ZFS ownership stamps, stable-id confirms, wipe-by-identity, reserved names (stunt node) › 4. an existing dataset named <pool>/snapshots/x is destroyed as a dataset — <pool>@x survives; a new reserved name is 400 (1.2s)
+  ✓  5 [integration] › tests/integration/ident-zfs.spec.ts:275:3 › ident.1 — ZFS ownership stamps, stable-id confirms, wipe-by-identity, reserved names (stunt node) › 5. destroy with cleanup on a by-partuuid leaf wipes only that partition; the sibling partition keeps its filesystem (3.7s)
+
+  5 passed (23.9s)
