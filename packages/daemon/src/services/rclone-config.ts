@@ -605,7 +605,8 @@ const OBSCURE_B64_RE = /^[\w-]+$/
  * rclone's raw-URL-safe base64 alphabet (so a stored name-rule PLAIN value with
  * `+`, `/`, `=` or whitespace is not even attempted), has a base64 length Go's
  * decoder rejects (`x % 4 === 1` — a trailing 2-bit group), decodes to fewer
- * than 16 bytes (an obscuring is always IV + at least one plaintext byte), or
+ * than 16 bytes (shorter than the IV; exactly 16 is rclone's own obscuring of
+ * the EMPTY string and decodes to `''`, which the mask ignores), or
  * its plaintext is not valid UTF-8 (Go's `string(buf)` is byte-loose; the
  * secrets ANAS stores are request strings, always UTF-8 — any other bytes are
  * a corrupt/hand-edited value, and the plaintext that would ride the mask must

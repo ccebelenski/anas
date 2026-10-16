@@ -539,6 +539,20 @@ describe('cr.48f — the SUCCESS-path extraction is masked against the run secre
     assert.ok(raw.target?.includes(ECHO))
   })
 
+  it('cr.48f review (ai1): a secret that STRADDLES the root/relative join of a skipped path is masked on the joined path, not only on its halves', () => {
+    // `joinUnder(root, relative)` over two already-masked halves let a value
+    // equal to `<root tail>/<relative head>` through whole; the join is masked
+    // after it is made.
+    const stderr = [
+      'Upload directory \'/srv\' to \'repo\' as data.pxar.didx',
+      'skipping mount point: "x/mnt"',
+    ].join('\n')
+    const p = parseBackupProgress(stderr, ['srv/x'])
+    assert.equal(p.skipped.length, 1)
+    assert.equal(p.skipped[0]!.path, '/[secret]/mnt')
+    assert.equal(JSON.stringify(p).includes('srv/x'), false)
+  })
+
   it('progressSummary of the masked parse carries [secret] and no value (the job progress line)', () => {
     const p = parseBackupProgress(LEAKY_STDERR, [ECHO])
     const s = progressSummary(p)

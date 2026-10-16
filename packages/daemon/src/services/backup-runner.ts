@@ -380,7 +380,10 @@ export function parseBackupProgress(stderr: string, secretValues: string[] = [])
         ...(currentArchive ? { archive: mask(currentArchive) } : {}),
         ...(root ? { root } : {}),
         relativePath,
-        path: root ? joinUnder(root, relativePath) : relativePath,
+        // The joined path is masked AFTER the join (cr.48f review): joining
+        // two already-masked parts lets a value that straddles the join
+        // boundary (root tail + `/` + relative head) through whole.
+        path: currentRoot ? mask(joinUnder(currentRoot, skip[1])) : relativePath,
       })
       continue
     }

@@ -1094,8 +1094,11 @@ function unitLineRegex(prefix: string): RegExp {
  * verbatim `Error:` line (or one of the kind's own cause hints), then a
  * failure-ish line, and finally the last line the UNIT itself printed. systemd's
  * own lines about the unit are skipped at every step — they say a run failed,
- * never why. Never contains a secret (the tools ANAS runs keep credentials off
- * stderr, and secrets never reach an argv).
+ * never why. Carries no RAW secret because the only tool output that reaches a
+ * task unit's journal is the runner's own, already masked at its boundary
+ * (cr.48b–f: a backend CAN echo the credential it was handed; the runners
+ * mask before printing, and secrets never reach an argv) — this reader holds
+ * no secret and is not a mask door.
  */
 export function failureDetailFromJournal(kind: TaskUnitKind, journal: string): string | null {
   const msgs = journal.split('\n').map(messageFromJournalLine).filter(Boolean)
