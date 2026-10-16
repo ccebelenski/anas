@@ -8,7 +8,8 @@ import { parseExports } from '../parsers/exports.js'
 import { isFindmntTable } from '../parsers/findmnt.js'
 import { isMutableShareId, parseGroups, parsePasswd } from '../parsers/getent.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
-import { findPathPattern, walkScopeFrom } from './access-walk.js'
+import { findPathPattern, walkArgs, walkScopeFrom } from './access-walk.js'
+import { readAhrPools } from './ahr-topology.js'
 import { isUnwalkableKind, kindOfMount, mountIndex, normalizePath } from './nested-filesystems.js'
 import { probeSharePath } from './share-path.js'
 
@@ -61,6 +62,15 @@ import { probeSharePath } from './share-path.js'
 //     share list's own `timeout stat -f` probe, C locale) and ENOENT/ENOTDIR
 //     — `missing` — counts as an answer, "nothing here". Any other failure
 //     (permission, I/O, a stale handle, no answer in time) still refuses.
+//  3. cr.59 (review 2026-10-16 M6): an id a POSIX ACL entry names, access or
+//     default, owns that grant — given to a new account it would be
+//     inherited (EPICS §2 "Shares & identities"). Read once per guard run
+//     under every share/export path, every mounted ZFS filesystem whose
+//     `acltype` is posix and every mounted AHR pool (the access editor's
+//     targets), bounded by root exactly as (2) is, with
+//     `find … ! -type l -exec getfacl -n -p -c -E -s {} + | sort -u` —
+//     {@link aclFindArgs}. One getfacl per file: ~4x the no-match find on
+//     the same tree (dev host, 440k entries: 1.9 s against 0.5 s warm).
 //
 // The whole check shares one deadline per guard run ({@link ID_CHECK_BUDGET_MS}),
 // so the route answers well inside the gateway's 20 s (cr.35 ladder: 10 s +
@@ -72,6 +82,8 @@ const ZFS = '/usr/sbin/zfs'
 const FIND = '/usr/bin/find'
 const FINDMNT = '/usr/bin/findmnt'
 const GETENT = '/usr/bin/getent'
+const GETFACL = '/usr/bin/getfacl'
+const SORT = '/usr/bin/sort'
 
 /** Which number: a user's uid or a group's gid. */
 export type IdKind = 'uid' | 'gid'
@@ -104,6 +116,11 @@ export interface OwnershipReadOpts {
   smbConf: () => Promise<string | null>
   /** /etc/exports' text; null when it could not be read (an absent file reads as ''). */
   exports: () => Promise<string | null>
+  /**
+   * cr.59: the AHR pools (the access editor's AHR targets are their mounts);
+   * `readAhrPools` over the executor when absent — a test serves its own.
+   */
+  ahrPools?: () => Promise<{ mountpoint: string, mounted: boolean }[]>
   /** Clock and budget, injectable for the deadline test. */
   now?: () => number
   budgetMs?: number
@@ -174,8 +191,18 @@ function mountOf(path: string, mounts: Map<string, FindmntNode>): FindmntNode | 
  * A root another root already reaches on the same filesystem is dropped.
  */
 export function shareWalkRoots(sharePaths: string[], mounts: Map<string, FindmntNode>): WalkRoot[] {
+  return walkRootsWhere(sharePaths, mounts, node => node.fstype !== 'zfs' && !isUnwalkableKind(kindOfMount(node)))
+}
+
+/**
+ * The walk roots for a set of start paths: each start on a filesystem
+ * `walkable` accepts is a root bounded as nf.1's walk is, and every local
+ * mount below a start (walked or not) is looked at the same way, so one that
+ * `walkable` accepts becomes a root of its own.
+ */
+function walkRootsWhere(paths: string[], mounts: Map<string, FindmntNode>, walkable: (node: FindmntNode) => boolean): WalkRoot[] {
   // Two steps on an array we own (`toSorted()` is ES2023; this package targets ES2022).
-  const pending = [...new Set(sharePaths.filter(p => p.startsWith('/')).map(normalizePath))]
+  const pending = [...new Set(paths.filter(p => p.startsWith('/')).map(normalizePath))]
   pending.sort()
   const seen = new Set<string>()
   const roots: WalkRoot[] = []
@@ -185,13 +212,18 @@ export function shareWalkRoots(sharePaths: string[], mounts: Map<string, Findmnt
       continue
     seen.add(path)
     const own = mountOf(path, mounts)
-    if (!own || own.fstype === 'zfs' || isUnwalkableKind(kindOfMount(own)))
+    if (!own || isUnwalkableKind(kindOfMount(own)))
       continue
     const scope = walkScopeFrom(path, mounts, [])
-    roots.push(scope.roots[0])
+    if (walkable(own))
+      roots.push(scope.roots[0])
+    // cr.59: a local filesystem below is looked at even when this one is not
+    // walked (a ZFS share left to the accounting, a ZFS filesystem with POSIX
+    // ACLs off): an ext4 or btrfs mount under it still holds share files.
+    // Network filesystems and automounts are never entered (nf.1).
     for (const ex of scope.excluded) {
       const node = mounts.get(ex.target)
-      if (node && node.fstype !== 'zfs' && !isUnwalkableKind(kindOfMount(node)))
+      if (node && !isUnwalkableKind(kindOfMount(node)))
         pending.push(ex.target)
     }
   }
@@ -249,26 +281,40 @@ export function readOwnershipSources(o: OwnershipReadOpts): Promise<OwnershipSou
     if ('unreadable' in datasets)
       return datasets
 
+    const paths = await readSharePaths(o)
+    if ('unreadable' in paths)
+      return paths
+    if (paths.length === 0)
+      return { datasets, roots: [] }
+
+    const mounts = await readMounts(o)
+    if ('unreadable' in mounts)
+      return mounts
+    return { datasets, roots: shareWalkRoots(paths, mounts) }
+  })
+}
+
+/** Every SMB share path and NFS export path, read once per guard run. */
+function readSharePaths(o: OwnershipReadOpts): Promise<string[] | { unreadable: string }> {
+  return o.reads.once('idcheck:paths', async () => {
     const smbConf = await o.smbConf()
     if (smbConf === null)
       return { unreadable: 'smb.conf (the SMB share paths)' }
     const exportsText = await o.exports()
     if (exportsText === null)
       return { unreadable: '/etc/exports (the NFS export paths)' }
-    const paths = [...parseSmbConf(smbConf).shares.map(s => s.path), ...parseExports(exportsText).map(e => e.path)]
-    if (paths.length === 0)
-      return { datasets, roots: [] }
-
-    const mounts = await withinDeadline(o, 'the mount table', async (timeoutMs) => {
-      const r = await o.executor.exec(FINDMNT, ['--json'], { timeoutMs })
-      if (r.exitCode !== 0 || !isFindmntTable(r.stdout))
-        return failed('the mount table', 'findmnt', r.exitCode !== 0 ? r : { stderr: 'answered in an unknown shape', exitCode: r.exitCode })
-      return mountIndex(r.stdout)
-    })
-    if ('unreadable' in mounts)
-      return mounts
-    return { datasets, roots: shareWalkRoots(paths, mounts) }
+    return [...parseSmbConf(smbConf).shares.map(s => s.path), ...parseExports(exportsText).map(e => e.path)]
   })
+}
+
+/** The mount table (`findmnt --json`), read once per guard run. */
+function readMounts(o: OwnershipReadOpts): Promise<Map<string, FindmntNode> | { unreadable: string }> {
+  return o.reads.once('idcheck:mounts', () => withinDeadline(o, 'the mount table', async (timeoutMs) => {
+    const r = await o.executor.exec(FINDMNT, ['--json'], { timeoutMs })
+    if (r.exitCode !== 0 || !isFindmntTable(r.stdout))
+      return failed('the mount table', 'findmnt', r.exitCode !== 0 ? r : { stderr: 'answered in an unknown shape', exitCode: r.exitCode })
+    return mountIndex(r.stdout)
+  }))
 }
 
 /** Every id ZFS accounts for on any filesystem → the first filesystem it was seen on. */
@@ -341,7 +387,174 @@ export async function idOwnership(kind: IdKind, id: number, o: OwnershipReadOpts
     if (hit)
       return { owns: true, where: `'${hit}'` }
   }
+
+  // cr.59: an id a POSIX ACL entry names (access or default) "owns" that
+  // grant — a new account given the number would inherit it.
+  const named = await aclNamedIds(o)
+  if ('unreadable' in named)
+    return named
+  const under = named[kind].get(id)
+  if (under !== undefined)
+    return { owns: true, where: `an ACL entry under '${under}'` }
   return { owns: false }
+}
+
+// ----------------------------------------------------------------------------
+// cr.59 — ids named by POSIX ACL entries
+// ----------------------------------------------------------------------------
+
+/** `zfs get -H -p -o name,value -t filesystem acltype` — every filesystem's ACL switch in one call. */
+export const ACLTYPE_ARGS = ['get', '-H', '-p', '-o', 'name,value', '-t', 'filesystem', 'acltype']
+
+/**
+ * `name<TAB>value` lines → the filesystems with POSIX ACLs on (`posix`, or
+ * `posixacl` as older releases print it — access.ts's `isPosixAcl` reads the
+ * same two). Any other line shape is unreadable (null).
+ */
+export function parsePosixAclFilesystems(stdout: string): Set<string> | null {
+  const posix = new Set<string>()
+  for (const raw of stdout.split('\n')) {
+    if (!raw.trim())
+      continue
+    const fields = raw.split('\t')
+    if (fields.length !== 2 || !fields[0] || !fields[1].trim())
+      return null
+    const value = fields[1].trim()
+    if (value === 'posix' || value === 'posixacl')
+      posix.add(fields[0])
+  }
+  return posix
+}
+
+/**
+ * The ACL walk's roots: every share and export path, every mounted ZFS
+ * filesystem whose POSIX ACLs are on and every mounted AHR pool (the access
+ * editor's targets) — bounded as the ownership walk is (nf.1: `-xdev` except
+ * on btrfs, every mount below a root pruned and looked at on its own, network
+ * filesystems and automounts never entered). A ZFS filesystem with ACLs off
+ * is not walked: the kernel applies no POSIX ACL there, so nothing on it can
+ * be inherited (an access-editor grant switches `acltype` on first).
+ */
+export function aclWalkRoots(starts: string[], mounts: Map<string, FindmntNode>, posixAcl: Set<string>): WalkRoot[] {
+  const zfsRoots = [...mounts.values()].filter(n => n.fstype === 'zfs' && posixAcl.has(n.source)).map(n => n.target)
+  return walkRootsWhere([...starts, ...zfsRoots], mounts, node => node.fstype !== 'zfs' || posixAcl.has(node.source))
+}
+
+/**
+ * The producer of one root's ACL read: nf.1's bounded `find` (`-P`, `-xdev`,
+ * the mounts below pruned), symlinks filtered out (getfacl follows a link it
+ * is handed: a dangling one fails the walk, one pointing out of the tree
+ * reads a foreign ACL; Linux links carry no ACL), then
+ * `getfacl -n -p -c -E -s {} +` — getfacl(1), acl 2.3: `-n` "List numeric
+ * user and group IDs", `-p` absolute names (no "Removing leading '/'" on
+ * stderr), `-c` "Do not display the comment header" (no file names, owners),
+ * `-E` "Do not print effective rights comments", `-s` "Skip files that only
+ * have the base ACL entries". The consumer is `sort -u`, so a recursive grant
+ * over a million files arrives as a handful of distinct lines instead of
+ * going over the executor's 10 MiB buffer.
+ */
+export function aclFindArgs(root: WalkRoot): string[] {
+  return walkArgs(root, ['!', '-type', 'l'], [GETFACL, '-n', '-p', '-c', '-E', '-s'])
+}
+
+/** `[default:]user|group|mask|other:<qualifier>:<perms>` — one getfacl entry line (`-E`: no comment). */
+const ACL_ENTRY_RE = /^(?:default:)?(user|group|mask|other):([^:]*):[-rwx]{3}$/
+
+/**
+ * The deduplicated `getfacl -n -c -E -s` lines → the uids named by `user:`
+ * and the gids named by `group:` entries, access and default alike. The base
+ * entries (empty qualifier), `mask::` and `other::` name nobody. Any other
+ * line — or a named entry that is not a number, which `-n` never prints — is
+ * a shape we do not know: null, never "no grants".
+ */
+export function parseAclIds(stdout: string): { uid: Set<number>, gid: Set<number> } | null {
+  const out = { uid: new Set<number>(), gid: new Set<number>() }
+  for (const line of stdout.split('\n')) {
+    if (line === '')
+      continue
+    const m = ACL_ENTRY_RE.exec(line)
+    if (!m)
+      return null
+    const [, tag, qualifier] = m
+    if (qualifier === '')
+      continue
+    if ((tag !== 'user' && tag !== 'group') || !ID_LINE_RE.test(qualifier))
+      return null
+    out[tag === 'user' ? 'uid' : 'gid'].add(Number(qualifier))
+  }
+  return out
+}
+
+/** The ACL walk's roots, read once per guard run. */
+function readAclRoots(o: OwnershipReadOpts): Promise<WalkRoot[] | { unreadable: string }> {
+  return o.reads.once('idcheck:acl-roots', async () => {
+    const paths = await readSharePaths(o)
+    if ('unreadable' in paths)
+      return paths
+    const what = 'the ACL setting (acltype) of every ZFS filesystem'
+    const posix = await withinDeadline(o, what, async (timeoutMs) => {
+      const r = await o.executor.exec(ZFS, ACLTYPE_ARGS, { timeoutMs })
+      if (r.exitCode !== 0)
+        return failed(what, 'zfs get acltype', r)
+      return parsePosixAclFilesystems(r.stdout) ?? { unreadable: `${what} (zfs get answered in an unknown shape)` }
+    })
+    if ('unreadable' in posix)
+      return posix
+    const ahr = await withinDeadline(o, 'the AHR pools', async () => {
+      const pools = await (o.ahrPools ?? (() => readAhrPools(o.executor)))()
+      return pools.filter(p => p.mounted).map(p => p.mountpoint)
+    })
+    if ('unreadable' in ahr)
+      return ahr
+    const mounts = await readMounts(o)
+    if ('unreadable' in mounts)
+      return mounts
+    return aclWalkRoots([...paths, ...ahr], mounts, posix)
+  })
+}
+
+/**
+ * Every uid and gid a POSIX ACL entry names under the managed roots → the
+ * first root it was seen under. One walk per root and guard run, shared by
+ * every candidate the pick checks.
+ */
+function aclNamedIds(o: OwnershipReadOpts): Promise<Record<IdKind, Map<number, string>> | { unreadable: string }> {
+  return o.reads.once('idcheck:acl', async () => {
+    const roots = await readAclRoots(o)
+    if ('unreadable' in roots)
+      return roots
+    const named: Record<IdKind, Map<number, string>> = { uid: new Map(), gid: new Map() }
+    for (const root of roots) {
+      const what = `the ACLs under '${root.path}'`
+      const text = await withinDeadline(o, what, async (timeoutMs) => {
+        const r = await o.executor.pipeline(FIND, aclFindArgs(root), SORT, ['-u'], { timeoutMs })
+        // Only a walk that examined everything is an answer (find(1): "if
+        // the return value is non-zero, you should not rely on the
+        // correctness of the results"); a root that does not exist holds
+        // nothing (cr.29b's probe).
+        if (r.leftExitCode !== 0) {
+          return r.rightExitCode === 0 && (await rootIsMissing(o, root.path))
+            ? ''
+            : failed(what, 'find … getfacl', { stderr: r.leftStderr, exitCode: r.leftExitCode })
+        }
+        if (r.rightExitCode !== 0)
+          return failed(what, 'sort', { stderr: r.rightStderr, exitCode: r.rightExitCode })
+        return r.stdout
+      })
+      if (typeof text !== 'string')
+        return text
+      const ids = parseAclIds(text)
+      if (!ids)
+        return { unreadable: `${what} (getfacl answered in an unknown shape)` }
+      for (const kind of ['uid', 'gid'] as const) {
+        for (const id of ids[kind]) {
+          if (!named[kind].has(id))
+            named[kind].set(id, root.path)
+        }
+      }
+    }
+    return named
+  })
 }
 
 /**

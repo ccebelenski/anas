@@ -1,4 +1,5 @@
-import type { ExecOptions, ExecResult } from '../../executor/types.js'
+import type { ExecOptions, ExecResult, PipelineOptions, PipelineResult } from '../../executor/types.js'
+import type { FindmntNode } from '../../parsers/findmnt.js'
 import type { OwnershipReadOpts, PickReservations } from '../identity-ids.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -10,10 +11,15 @@ import { MockExecutor } from '../../executor/mock.js'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { GuardReads } from '../../safety/guard.js'
 import {
+  aclFindArgs,
+  ACLTYPE_ARGS,
+  aclWalkRoots,
   ID_PICK_TRIES,
   idHolder,
   idOwnership,
   ownerFindArgs,
+  parseAclIds,
+  parsePosixAclFilesystems,
   parseSpaceIds,
   pickId,
   shareWalkRoots,
@@ -45,12 +51,65 @@ import { mountIndex } from '../nested-filesystems.js'
  *    `mockFixtures.statF` — "ext4 root (healthy local)" for a root that
  *    exists, "nonexistent path" for one that does not, the ESTALE case for
  *    one that cannot be read.
+ *  - cr.59 `find … -exec getfacl -n -p -c -E -s {} + | sort -u`:
+ *    {@link GETFACL_CAPTURE}, captured 2026-10-16 on the development host
+ *    (Fedora, acl 2.4.0 — the node runs 2.3.2, same entry format — GNU
+ *    findutils 4.10.0) over a scratch tree made for it: a directory given
+ *    `setfacl -m u:1005:r-x` and `setfacl -d -m u:1005:r-x,g:1005:r-x` (the
+ *    access editor's access + default grant), a file created after it (it
+ *    inherits both), a file below given `setfacl -m g:1007:rw-`, a plain
+ *    file, and a dangling symlink. Verbatim stdout of
+ *    `find -P <dir> -xdev '!' -type l -exec getfacl -n -p -c -E -s {} + |
+ *    LC_ALL=C sort -u`; the blank line is getfacl's record separator. The
+ *    same tree without `! -type l`: getfacl on the dangling link printed
+ *    `getfacl: <dir>/dangling: No such file or directory`, exit 1 — why links
+ *    are filtered. A walk into a mode-000 directory: find printed
+ *    `/usr/bin/find: ‘locked’: Permission denied`, exit 1 (path rewritten
+ *    below to the test's root).
+ *  - `zfs get -H -p -o name,value -t filesystem acltype`: no capture; one
+ *    `name<TAB>value` line per filesystem (zfs-get(8) `-H`: "tab-delimited",
+ *    no header), value `off` unless a test switches a filesystem to `posix`.
+ *  - `cat /proc/mdstat` (the AHR pool read): `fixtures/ahr/mdstat-clean.txt`
+ *    with its md lines dropped — a node with no arrays (its Personalities
+ *    and `unused devices: <none>` lines).
  */
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const FIXTURES = join(__dirname, '../../fixtures')
 const P06 = readFileSync(join(__dirname, '../../../../../docs/probes/wave2/06-identity-allocation.txt'), 'utf-8')
 const FINDMNT_FULL = readFileSync(join(FIXTURES, 'mounts/findmnt-full.json'), 'utf-8')
+const FINDMNT_NESTED = readFileSync(join(FIXTURES, 'backup/findmnt-nested.json'), 'utf-8')
+const FINDMNT_AHR0 = readFileSync(join(FIXTURES, 'ahr/findmnt-ahr0.json'), 'utf-8')
+const MDSTAT_NO_ARRAYS = readFileSync(join(FIXTURES, 'ahr/mdstat-clean.txt'), 'utf-8')
+  .split('\n')
+  .filter(l => l.startsWith('Personalities') || l.startsWith('unused devices'))
+  .map(l => `${l}\n`)
+  .join('')
+
+/** cr.59: the captured `getfacl -n -p -c -E -s | sort -u` lines (see FIXTURES above). */
+const GETFACL_CAPTURE = [
+  '',
+  'default:group:1005:r-x',
+  'default:group::r-x',
+  'default:mask::r-x',
+  'default:other::r-x',
+  'default:user:1005:r-x',
+  'default:user::rwx',
+  'group:1005:r-x',
+  'group:1007:rw-',
+  'group::r--',
+  'group::r-x',
+  'mask::r--',
+  'mask::r-x',
+  'mask::rw-',
+  'other::r--',
+  'other::r-x',
+  'user:1005:r-x',
+  'user::rw-',
+  'user::rwx',
+].map(l => `${l}\n`).join('')
+/** The capture's lines without a named entry other than `default:group:1005` (a default-only grant). */
+const DEFAULT_GROUP_ONLY = GETFACL_CAPTURE.split('\n').filter(l => !/^(?:user|group):\d/.test(l) && !/^default:user:\d/.test(l)).join('\n')
 
 /** The captured `zfs userspace -Hpn` row, and its name column (the `-o name` form). */
 const USERSPACE_ROW = P06.split('\n').find(l => l.startsWith('POSIX User\t'))!
@@ -67,6 +126,8 @@ const FIND = '/usr/bin/find'
 const FINDMNT = '/usr/bin/findmnt'
 const GETENT = '/usr/bin/getent'
 const TIMEOUT = '/usr/bin/timeout'
+const SORT = '/usr/bin/sort'
+const CAT = '/usr/bin/cat'
 const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
 
 /** The smb.conf of these tests: one share on ext4 `/srv/smb/share1` (the 18.1 Samba share), one on ZFS. */
@@ -85,6 +146,14 @@ interface Node {
   /** cr.29b: walk roots that do not exist (find fails; stat says ENOENT). */
   missing?: string[]
   fail?: (command: string, args: string[]) => ExecResult | 'timeout' | undefined
+  /** cr.59: dataset → its `acltype` (absent = `off`). */
+  acltype?: Record<string, string>
+  /** cr.59: ACL walk root → what `getfacl … | sort -u` prints there (absent = nothing). */
+  acls?: Record<string, string>
+  /** cr.59: a failing ACL walk (the pipeline's answer). */
+  aclFail?: (root: string) => PipelineResult | undefined
+  /** The mount table findmnt prints (default findmnt-full.json). */
+  findmnt?: string
 }
 
 function fakeNode(node: Node): { executor: MockExecutor, calls: { command: string, args: string[], timeoutMs?: number }[] } {
@@ -101,8 +170,12 @@ function fakeNode(node: Node): { executor: MockExecutor, calls: { command: strin
       return ok(node.datasets.map(d => `${d}\n`).join(''))
     if (command === ZFS && (args[0] === 'userspace' || args[0] === 'groupspace'))
       return ok(spaceOutput(node.userspace[args.at(-1)!] ?? []))
+    if (command === ZFS && args[0] === 'get')
+      return ok(node.datasets.map(d => `${d}\t${node.acltype?.[d] ?? 'off'}\n`).join(''))
+    if (command === CAT && args[0] === '/proc/mdstat')
+      return ok(MDSTAT_NO_ARRAYS)
     if (command === FINDMNT)
-      return ok(FINDMNT_FULL)
+      return ok(node.findmnt ?? FINDMNT_FULL)
     if (command === TIMEOUT && args.includes('-f')) {
       // `timeout -k 1 2 stat -f -c %t -- <path>` (services/share-path.ts).
       return node.missing?.includes(args.at(-1)!)
@@ -130,6 +203,17 @@ function fakeNode(node: Node): { executor: MockExecutor, calls: { command: strin
       return holder ? ok(`${holder}:x:${args[1]}:100::/home/${holder}:/usr/sbin/nologin\n`) : { stdout: '', stderr: '', exitCode: 2 }
     }
     return { stdout: '', stderr: `unexpected ${command}`, exitCode: 127 }
+  }
+  // cr.59: the ACL walk, `find … -exec getfacl … {} + | sort -u`.
+  executor.pipeline = async (cmd1: string, args1: string[], cmd2: string, args2: string[], opts?: PipelineOptions): Promise<PipelineResult> => {
+    calls.push({ command: `${cmd1} | ${cmd2}`, args: [...args1, '|', ...args2], timeoutMs: opts?.timeoutMs ?? undefined })
+    const root = args1[1]
+    const failed = node.aclFail?.(root)
+    if (failed)
+      return failed
+    if (node.missing?.includes(root))
+      return { leftExitCode: 1, rightExitCode: 0, leftStderr: `/usr/bin/find: ‘${root}’: No such file or directory\n`, rightStderr: '', stdout: '' }
+    return { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: node.acls?.[root] ?? '' }
   }
   return { executor, calls }
 }
@@ -205,7 +289,7 @@ describe('cr.29 — which share roots are walked (findmnt-full.json)', () => {
 })
 
 describe('cr.29 — does an id own anything?', () => {
-  it('nothing anywhere → owns: false, one zfs list, one findmnt, one userspace per dataset, one find per walked root', async () => {
+  it('nothing anywhere → owns: false, one zfs list, one findmnt, one userspace per dataset, one find per walked root (then cr.59\'s ACL read)', async () => {
     const { executor, calls } = fakeNode(BASE)
     assert.deepEqual(await idOwnership('uid', 1005, opts(executor)), { owns: false })
     assert.deepEqual(calls.map(c => `${c.command} ${c.args[0]}`), [
@@ -214,6 +298,11 @@ describe('cr.29 — does an id own anything?', () => {
       `${ZFS} userspace`,
       `${ZFS} userspace`,
       `${FIND} -P`,
+      // cr.59: the acltype of every filesystem, the AHR pools, one ACL walk
+      // per root (the ZFS share has ACLs off, so only the ext4 one).
+      `${ZFS} get`,
+      `${CAT} /proc/mdstat`,
+      `${FIND} | ${SORT} -P`,
     ])
     assert.deepEqual(calls[0].args, ['list', '-H', '-o', 'name', '-t', 'filesystem'])
     assert.deepEqual(calls[4].args, ['-P', '/srv/smb/share1', '-xdev', '-uid', '1005', '-print', '-quit'])
@@ -421,5 +510,159 @@ describe('cr.29 — the pick', () => {
   it('the band is full above the top account: refused, not wrapped into a hole or past UID_MAX 60000', async () => {
     const { executor } = fakeNode(BASE)
     assert.deepEqual(await pickId('uid', [1000, 60000, 60001], reservations(), opts(executor)), { refusal: 'band-full', from: 60001 })
+  })
+})
+
+describe('cr.59 — ids a POSIX ACL entry names are skipped too', () => {
+  /** BASE with the ZFS share's filesystem switched to POSIX ACLs (what the access editor's first named grant does). */
+  const POSIX: Node = { ...BASE, acltype: { 'mnttest/data': 'posix' } }
+
+  it('argv: every acltype in one zfs get; the walk is nf.1\'s bounded find, links filtered, into getfacl -n -p -c -E -s, then sort -u', async () => {
+    assert.deepEqual(ACLTYPE_ARGS, ['get', '-H', '-p', '-o', 'name,value', '-t', 'filesystem', 'acltype'])
+    assert.deepEqual(
+      aclFindArgs({ path: '/srv/share', xdev: true, prune: ['/srv/share/nfs'] }),
+      ['-P', '/srv/share', '-xdev', '(', '-path', '/srv/share/nfs', ')', '-prune', '-o', '!', '-type', 'l', '-exec', '/usr/bin/getfacl', '-n', '-p', '-c', '-E', '-s', '{}', '+'],
+    )
+    // btrfs (AHR): no -xdev, as nf.1.
+    assert.deepEqual(aclFindArgs({ path: '/mnt/anas-ahr/ahr0', xdev: false, prune: [] }).slice(0, 3), ['-P', '/mnt/anas-ahr/ahr0', '!'])
+    const { executor, calls } = fakeNode(POSIX)
+    await idOwnership('uid', 1005, opts(executor))
+    const pipe = calls.find(c => c.command === `${FIND} | ${SORT}`)!
+    assert.deepEqual(pipe.args.slice(pipe.args.indexOf('|')), ['|', '-u'])
+  })
+
+  it('parses the captured getfacl lines: user: and group: entries, access and default, name ids; base entries, mask and other name nobody', () => {
+    const ids = parseAclIds(GETFACL_CAPTURE)!
+    assert.deepEqual(ids.uid, new Set([1005]))
+    assert.deepEqual(ids.gid, new Set([1005, 1007]))
+    assert.deepEqual(parseAclIds(DEFAULT_GROUP_ONLY), { uid: new Set(), gid: new Set([1005]) })
+    assert.deepEqual(parseAclIds(''), { uid: new Set(), gid: new Set() })
+    // A shape -n -c -E never prints is unknown, never "no grants".
+    assert.equal(parseAclIds('user:alice:r-x\n'), null)
+    assert.equal(parseAclIds('# file: /srv/x\nuser:1005:r-x\n'), null)
+    assert.equal(parseAclIds('user:1005:r-x\t#effective:r--\n'), null)
+  })
+
+  it('reads posix / posixacl as ACLs on, anything else off; an unknown line shape is null', () => {
+    assert.deepEqual(parsePosixAclFilesystems('tank\toff\ntank/a\tposix\ntank/b\tposixacl\ntank/c\tnfsv4\n'), new Set(['tank/a', 'tank/b']))
+    assert.equal(parsePosixAclFilesystems('NAME\tPROPERTY\tVALUE\tSOURCE\n'), null)
+  })
+
+  it('which roots the ACL walk reads (captured mount tables): ZFS filesystems with ACLs on (shared or not), never one with ACLs off, never NFS/CIFS/automounts', () => {
+    // findmnt-nested.json: gtbackup and gtbackup/cdm are posixacl, gtiscsi noacl; the .zfs snapshot automount is dropped by mountIndex.
+    const nested = mountIndex(FINDMNT_NESTED)
+    assert.deepEqual(aclWalkRoots([], nested, new Set(['gtbackup', 'gtbackup/cdm'])), [
+      { path: '/gtbackup', xdev: true, prune: ['/gtbackup/.zfs', '/gtbackup/cdm'] },
+      { path: '/gtbackup/cdm', xdev: true, prune: ['/gtbackup/cdm/.zfs'] },
+    ])
+    // A share on a ZFS filesystem with ACLs off is not walked; the ext4 share is.
+    const full = mountIndex(FINDMNT_FULL)
+    assert.deepEqual(aclWalkRoots(['/srv/smb/share1', '/mnttest/data', '/mnt/anas-nfs', '/mnt/anas-cifs', '/mnt/anas-auto'], full, new Set()), [
+      { path: '/srv/smb/share1', xdev: true, prune: [] },
+    ])
+    // Switched on, the same filesystem is walked (with its .zfs pruned).
+    assert.deepEqual(aclWalkRoots([], full, new Set(['mnttest/data'])), [{ path: '/mnttest/data', xdev: true, prune: ['/mnttest/data/.zfs'] }])
+    // An AHR pool's btrfs mount (findmnt-ahr0.json): walked without -xdev.
+    assert.deepEqual(aclWalkRoots(['/mnt/anas-ahr/ahr0'], mountIndex(FINDMNT_AHR0), new Set()), [{ path: '/mnt/anas-ahr/ahr0', xdev: false, prune: [] }])
+  })
+
+  it('a local filesystem mounted below a share that is not itself walked is still reached (ownership and ACL walks alike)', () => {
+    // findmnt-full.json's ZFS and ext4 rows, the ext4 one re-targeted below the ZFS share.
+    const full = mountIndex(FINDMNT_FULL)
+    const ext4 = full.get('/')!
+    const mounts = new Map<string, FindmntNode>([
+      ['/', ext4],
+      ['/mnttest', full.get('/mnttest')!],
+      ['/mnttest/data', full.get('/mnttest/data')!],
+      ['/mnttest/data/scratch', { ...ext4, target: '/mnttest/data/scratch' }],
+    ])
+    assert.deepEqual(shareWalkRoots(['/mnttest/data'], mounts), [{ path: '/mnttest/data/scratch', xdev: true, prune: [] }])
+    assert.deepEqual(aclWalkRoots(['/mnttest/data'], mounts, new Set()), [{ path: '/mnttest/data/scratch', xdev: true, prune: [] }])
+  })
+
+  it('a root with user:1005 and default:group:1005 entries: uid 1005 and gid 1005 are skipped and the next free id is picked', async () => {
+    const { executor } = fakeNode({ ...POSIX, acls: { '/mnttest/data': GETFACL_CAPTURE } })
+    assert.deepEqual(await pickId('uid', [1000, 1004], reservations(), opts(executor)), {
+      id: 1006,
+      skipped: [{ id: 1005, where: `an ACL entry under '/mnttest/data'` }],
+    })
+    // A DEFAULT entry alone is enough (new files inherit it).
+    const def = fakeNode({ ...POSIX, acls: { '/mnttest/data': DEFAULT_GROUP_ONLY } })
+    assert.deepEqual(await pickId('gid', [100, 1004], reservations(), opts(def.executor)), {
+      id: 1006,
+      skipped: [{ id: 1005, where: `an ACL entry under '/mnttest/data'` }],
+    })
+    // The number spaces stay apart: a group: entry does not hold a uid.
+    const groupOnly = fakeNode({ ...POSIX, acls: { '/mnttest/data': DEFAULT_GROUP_ONLY } })
+    assert.deepEqual(await pickId('uid', [1004], reservations(), opts(groupOnly.executor)), { id: 1005, skipped: [] })
+  })
+
+  it('the review\'s scenario (M6): alice (uid 1005, top of the band) holds u:1005:r-x + a default ACL on a share and owns no file; after her delete, bob is not given 1005', async () => {
+    // The access editor's grant on the shared directory: the captured
+    // directory's own two named entries, nothing else named anywhere.
+    const grant = 'user::rwx\nuser:1005:r-x\ngroup::r-x\nmask::r-x\nother::r-x\ndefault:user::rwx\ndefault:user:1005:r-x\ndefault:group::r-x\ndefault:mask::r-x\ndefault:other::r-x\n'
+    for (const line of grant.trim().split('\n'))
+      assert.ok(GETFACL_CAPTURE.split('\n').includes(line), `${line} is a captured line`)
+    const node: Node = { ...POSIX, acls: { '/mnttest/data': grant } }
+    // alice is gone: the accounts are 1000 and 1004; ZFS accounts uid 0 only (she never wrote a file).
+    const { executor } = fakeNode(node)
+    const r = await pickId('uid', [0, 1000, 1004], reservations(), opts(executor))
+    assert.deepEqual(r, { id: 1006, skipped: [{ id: 1005, where: `an ACL entry under '/mnttest/data'` }] })
+    // The job door's re-check (idOwnership) sees the grant as well.
+    assert.deepEqual(await idOwnership('uid', 1005, opts(fakeNode(node).executor)), { owns: true, where: `an ACL entry under '/mnttest/data'` })
+  })
+
+  it('the access editor\'s roots: a ZFS filesystem with ACLs on is walked though nothing shares it, and a mounted AHR pool; an unmounted pool is not', async () => {
+    const { executor, calls } = fakeNode({ ...BASE, acltype: { mnttest: 'posix' }, acls: { '/mnttest': 'user:1005:r-x\n' } })
+    const noShares = opts(executor, { smbConf: async () => '' })
+    assert.deepEqual(await idOwnership('uid', 1005, noShares), { owns: true, where: `an ACL entry under '/mnttest'` })
+    assert.deepEqual(calls.filter(c => c.command === `${FIND} | ${SORT}`).map(c => c.args[1]), ['/mnttest'])
+    const ahr = fakeNode({ ...BASE, findmnt: FINDMNT_AHR0, acls: { '/mnt/anas-ahr/ahr0': 'default:group:1009:rwx\n' } })
+    const pools = async () => [{ mountpoint: '/mnt/anas-ahr/ahr0', mounted: true }, { mountpoint: '/dev/ahr1/ahr1-vol', mounted: false }]
+    assert.deepEqual(await idOwnership('gid', 1009, opts(ahr.executor, { smbConf: async () => '', ahrPools: pools })), { owns: true, where: `an ACL entry under '/mnt/anas-ahr/ahr0'` })
+    assert.deepEqual(ahr.calls.filter(c => c.command === `${FIND} | ${SORT}`).map(c => c.args[1]), ['/mnt/anas-ahr/ahr0'])
+  })
+
+  it('one ACL walk per root and guard run, however many candidates the pick checks', async () => {
+    const owners = [1005, 1006, 1007]
+    const { executor, calls } = fakeNode({ ...POSIX, userspace: { 'mnttest': owners, 'mnttest/data': [0] }, acls: { '/mnttest/data': GETFACL_CAPTURE } })
+    const r = await pickId('uid', [1004], reservations(), opts(executor))
+    assert.deepEqual('id' in r && r.id, 1008)
+    // Roots: the ext4 share and the posix ZFS share, once each.
+    assert.deepEqual(calls.filter(c => c.command === `${FIND} | ${SORT}`).map(c => c.args[1]).sort(), ['/mnttest/data', '/srv/smb/share1'])
+  })
+
+  it('an ACL read that fails refuses the pick, named (the route answers id-check-unreadable): the walk, sort, an unknown shape, zfs get, the AHR pools', async () => {
+    const denied = `/usr/bin/find: ‘/mnttest/data/locked’: Permission denied\n`
+    const cases: [Partial<Node>, Partial<OwnershipReadOpts>, string][] = [
+      [{ aclFail: root => root === '/mnttest/data' ? { leftExitCode: 1, rightExitCode: 0, leftStderr: denied, rightStderr: '', stdout: 'user:1005:r-x\n' } : undefined }, {}, `the ACLs under '/mnttest/data' (find … getfacl: /usr/bin/find: ‘/mnttest/data/locked’: Permission denied)`],
+      [{ aclFail: () => ({ leftExitCode: 0, rightExitCode: 2, leftStderr: '', rightStderr: 'sort: write failed: /tmp/sortXYZ: No space left on device\n', stdout: '' }) }, {}, `the ACLs under '/mnttest/data' (sort: sort: write failed: /tmp/sortXYZ: No space left on device)`],
+      [{ acls: { '/mnttest/data': 'user:alice:r-x\n' } }, {}, `the ACLs under '/mnttest/data' (getfacl answered in an unknown shape)`],
+      [{ fail: (c, a) => c === ZFS && a[0] === 'get' ? { stdout: '', stderr: 'internal error', exitCode: 1 } : undefined }, {}, 'the ACL setting (acltype) of every ZFS filesystem (zfs get acltype: internal error)'],
+      [{}, { ahrPools: async () => {
+        throw new Error('the AHR topology could not be read (cat /proc/mdstat exited 1: cat: /proc/mdstat: Permission denied)')
+      } }, 'the AHR pools (the AHR topology could not be read (cat /proc/mdstat exited 1: cat: /proc/mdstat: Permission denied))'],
+    ]
+    for (const [node, extra, want] of cases) {
+      const { executor } = fakeNode({ ...POSIX, ...node })
+      assert.deepEqual(await pickId('uid', [1004], reservations(), opts(executor, { smbConf: async () => '[data]\npath = /mnttest/data\n', ...extra })), { refusal: 'unreadable', unreadable: want })
+    }
+  })
+
+  it('a walk root that does not exist holds no grant (cr.29b\'s probe), and the ACL walk runs inside the check\'s one deadline', async () => {
+    const { executor, calls } = fakeNode({ ...POSIX, missing: ['/mnttest/data'] })
+    assert.deepEqual(await idOwnership('uid', 1005, opts(executor, { smbConf: async () => '[data]\npath = /mnttest/data\n' })), { owns: false })
+    assert.ok(calls.some(c => c.command === TIMEOUT && c.args.at(-1) === '/mnttest/data'))
+    // A pipeline that does not finish in time is the deadline's sentence.
+    let clock = 5_000_000
+    const slow = fakeNode({ ...POSIX, fail: () => {
+      clock += 1_000
+      return undefined
+    }, aclFail: () => {
+      throw new CommandTimeoutError(FIND, [], 'request', 1, false)
+    } })
+    const r = await idOwnership('uid', 1005, opts(slow.executor, { now: () => clock, budgetMs: 10_000 }))
+    assert.ok('unreadable' in r && /^the ACLs under '.*' \(the check did not finish within 10 s\)$/.test(r.unreadable), JSON.stringify(r))
+    assert.ok(slow.calls.filter(c => c.command === `${FIND} | ${SORT}`).every(c => (c.timeoutMs ?? 0) > 0 && (c.timeoutMs ?? 0) < 10_000))
   })
 })

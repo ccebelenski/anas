@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify'
 import type { ExecOptions, ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -50,6 +50,20 @@ const JSON_HEADERS = { ...IDENTITY_HEADERS, 'content-type': 'application/json' }
 
 /** No /etc/exports: an absent file reads as no exports (cr.29's share roots). */
 const ABSENT_EXPORTS = join(tmpdir(), `anas-test-absent-exports-${process.pid}`)
+
+/**
+ * cr.59: the uid/gid pick also reads which ZFS filesystems have POSIX ACLs on
+ * (none here), the AHR pools (no arrays: fixtures/ahr/mdstat-clean.txt's
+ * Personalities and `unused devices` lines) and the mount table
+ * (fixtures/mounts/findmnt-root.json) — nothing to walk.
+ */
+function aclReadFixtures(executor: MockExecutor): void {
+  const fixtures = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures')
+  const mdstat = readFileSync(join(fixtures, 'ahr/mdstat-clean.txt'), 'utf-8').split('\n').filter(l => l.startsWith('Personalities') || l.startsWith('unused devices')).map(l => `${l}\n`).join('')
+  executor.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-H', '-p', '-o', 'name,value', '-t', 'filesystem', 'acltype'], result: { stdout: '', stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat, stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: readFileSync(join(fixtures, 'mounts/findmnt-root.json'), 'utf-8'), stderr: '', exitCode: 0 } })
+}
 
 async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
   for (let i = 0; i < 50; i++) {
@@ -518,6 +532,7 @@ describe('share-identity routes', () => {
       executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: { stdout: 'root:x:0:\nusers:x:100:\n', stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/getent', args: ['group', '1000'], result: { stdout: '', stderr: '', exitCode: 2 } })
       executor.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name', '-t', 'filesystem'], result: { stdout: '', stderr: '', exitCode: 0 } })
+      aclReadFixtures(executor)
       const res = await app.inject({
         method: 'POST',
         url: '/v1/identity/users',
@@ -994,6 +1009,7 @@ describe('share-identity routes', () => {
       // cr.29: no dataset, no share path; `getent passwd <n>` for a number
       // nobody holds is exit 2 (getent(1)) — the create picks uid 1007.
       executor.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name', '-t', 'filesystem'], result: ok('') })
+      aclReadFixtures(executor)
       executor.addFixture({ command: '/usr/bin/getent', argsMatch: a => a.length === 2 && a[0] === 'passwd' && Number(a[1]) >= 1007, result: NOT_FOUND })
       // cr.29c: the pick and the same-number check look gid 1007 up too (free).
       executor.addFixture({ command: '/usr/bin/getent', argsMatch: a => a.length === 2 && a[0] === 'group' && Number(a[1]) >= 1007, result: NOT_FOUND })
