@@ -5,15 +5,18 @@ import type {
   BackupRestoreTargetMode,
 } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { Refusal } from '../safety/guard.js'
 import type { BrowseArchiveDeps } from './backup-catalog.js'
 import type { BackupReadDeps } from './backup-reads.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'node:fs'
-import { open, unlink } from 'node:fs/promises'
+import { open, readFile, unlink } from 'node:fs/promises'
 import { isPathWithin, restorePatternsFor } from '@anas/shared'
+import { parsePveMountPaths } from '../parsers/pve-storage.js'
 import { isHardlinkStat, statArchivePaths } from './backup-catalog.js'
 import { classifyBackupReadVerdict } from './backup-reads.js'
 import { buildBackupEnv, PBC } from './backup-runner.js'
+import { ownershipRefusal, pveManagedRefusal } from './pve-footprint.js'
 import { maskSecretValues } from './secret-argv.js'
 
 /**
@@ -1021,6 +1024,55 @@ export function pveTerritoryReason(
     }
   }
   return null
+}
+
+/**
+ * storage.cfg's PVE-owned paths for the restore's territory check, FAIL-CLOSED
+ * (story cr.54, review H3): `null` when the file exists but cannot be read, so
+ * the check refuses instead of passing. `readPveMountPaths` (the Mounts
+ * inventory's tagger) fails OPEN on every error and stays that way for its
+ * own callers; a restore that `--overwrite`s into whatever the check let
+ * through may not. ENOENT is a READ answer — no storages — exactly as the PVE
+ * footprint's `readPveStorages` takes it (a node off PVE has no file at all).
+ */
+export async function readPveMountPathsStrict(path: string): Promise<Map<string, string> | null> {
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  }
+  catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return new Map()
+    return null
+  }
+  return parsePveMountPaths(text)
+}
+
+/**
+ * The restore's PVE-territory gate (cr.54), one answer per fact — cr.47(b)'s
+ * spelling: a path PVE owns is 409 `PVE_MANAGED` reason `pve-managed`
+ * ({@link pveManagedRefusal}); a storage.cfg that cannot be read is the
+ * `config-unreadable` verdict ({@link ownershipRefusal}, 400 — the different
+ * fact every other door answers with). The fixed PVE paths (`/mnt/pve`,
+ * `/etc/pve`) need no file, so they are answered first, whatever the read did.
+ */
+export function restoreTerritoryRefusal(
+  target: string,
+  pveMountPaths: Map<string, string> | null,
+  storageCfg: string,
+): Refusal | null {
+  const fixed = pveTerritoryReason(target, [])
+  if (fixed)
+    return pveManagedRefusal(fixed)
+  if (pveMountPaths === null) {
+    return ownershipRefusal({
+      kind: 'config-unreadable',
+      reason: `PVE storage configuration is unreadable (${storageCfg}) — '${target}' cannot be checked against `
+        + 'the paths PVE storage claims, so the restore is refused until it can be read',
+    })
+  }
+  const reason = pveTerritoryReason(target, [...pveMountPaths.keys()])
+  return reason ? pveManagedRefusal(reason) : null
 }
 
 /** What the catalog `stat` pass concluded about a restore's selection. */

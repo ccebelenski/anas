@@ -20,14 +20,19 @@ import type {
 } from '@anas/shared'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
+import type { LockClaim } from '../jobs/locks.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
+import type { Gate, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { ConsistencyFacts } from '../services/backup-consistency.js'
 import type { BackupReposPaths } from '../services/backup-repos.js'
-import type { ResolvedBacking } from '../services/iscsi-mutate.js'
+import type { SelectionFacts } from '../services/backup-restore-files.js'
+import type { TargetObject } from '../services/iscsi-guard.js'
+import type { BackingRefusal, ResolvedAhrPool, ResolvedBacking } from '../services/iscsi-mutate.js'
 import type { IscsiPaths, IscsiReadContext } from '../services/iscsi.js'
+import type { SourceClaims } from '../services/source-claims.js'
 import type { UnitTaskObject } from '../services/task-units.js'
+import { createHash } from 'node:crypto'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
   BackupBrowseRequest,
@@ -52,9 +57,10 @@ import {
 import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
 import { READ_JOB_OPERATIONS, readJobCancel } from '../jobs/read-jobs.js'
-import { readPbsStorages, readPveMountPaths } from '../parsers/pve-storage.js'
+import { readPbsStorages } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
-import { guardCheck, guarded, GuardReads, GuardRefusalError, iscsiTargetClaim, sendRefusal, taskClaim } from '../safety/guard.js'
+import { guardCheck, guardConfirm, guarded, GuardReads, GuardRefusalError, iscsiTargetClaim, reverify, sendRefusal, taskClaim, zfsDatasetClaims } from '../safety/guard.js'
+import { readPoolGuid } from '../safety/stable-id.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { browseArchiveLevel } from '../services/backup-catalog.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
@@ -82,8 +88,9 @@ import {
   estimateSpace,
   parentDirectory,
   pathKind,
-  pveTerritoryReason,
+  readPveMountPathsStrict,
   readSelectionFacts,
+  restoreTerritoryRefusal,
   runFileRestore,
   writeTestDirectory,
 } from '../services/backup-restore-files.js'
@@ -131,7 +138,7 @@ import {
   writeTaskUnits,
 } from '../services/backup-units.js'
 import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
-import { foreignGate, lunClaims, lunNameFreeGate, refreshTarget, saveableGate } from '../services/iscsi-guard.js'
+import { conflict, foreignGate, lunClaims, lunNameFreeGate, saveableGate, targetView } from '../services/iscsi-guard.js'
 import { createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import {
   assertInstalled,
@@ -2180,7 +2187,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     return { job }
   }
 
-  // --- The restore-as-a-NEW-LUN branch (story backup2.10) ------------------
+  // --- The restore-as-a-NEW-LUN branch (story backup2.10; guard: cr.54) ----
   //
   // Its own pre-flight, because it checks different facts: there is NO source
   // LUN to look up, NO size equality to prove (the new backing is created at
@@ -2194,6 +2201,17 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   //   4. the backing storage resolves onto ANAS-managed storage
   //   5. the snapshot exists and the manifest knows the image's size
   //   6. the confirm gate (409 + X-Anas-Confirm-Code)
+  //
+  // cr.54 (review H3, ruling (j)): 1–4 are the gates of ONE guard spec — the
+  // add-LUN door's (iscsi-mutate.ts), with the restore's backing resolver —
+  // run at the request, again when the queue starts the job, and again under
+  // the iSCSI lock right before the map; the resolved backing PATH is bound
+  // by the confirm and re-compared by a gate, so a dataset whose mountpoint
+  // moved while the job waited fails it STATE_CHANGED instead of writing an
+  // image somewhere else. 5 is a
+  // fact about the immutable PBS snapshot the confirm signs by name. The
+  // confirm signs the whole validated request: target, name, backing (kind
+  // and pool/dataset), repository, namespace, snapshot, archive, rate.
   //
   // Only then is a job submitted, and only inside that job does anything change.
   async function restoreNewLunImage(
@@ -2210,74 +2228,107 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const newLun = req.target
     if (!newLun || newLun.mode !== 'newLun')
       return reply
-
-    // (2) The destination target — a LUN is added to it, so it must be ANAS's.
-    const target = state.targets.find(t => t.iqn === newLun.targetIqn)
-    if (!target) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `iSCSI target '${newLun.targetIqn}' not found` } }
-    }
-    if (target.ownership !== 'anas') {
-      reply.code(409)
-      return {
-        error: {
-          code: 'CONFLICT',
-          reason: 'foreign-target',
-          message: `Target '${target.iqn}' is not managed by ANAS and is hands-off: ${target.ownershipDetail}`,
-        },
-      }
-    }
-
-    // (3) The name. The backstore name is a NODE-GLOBAL namespace in LIO, not
-    // per-target, and it is the SCSI model string every initiator sees (GT-15)
-    // — the same reason the add-LUN door checks it node-wide, so the same
-    // refusal wording rides here.
-    const nameTaken = state.targets.some(t => t.luns.some(l => l.name === newLun.name))
-    if (nameTaken) {
-      reply.code(409)
-      return {
-        error: {
-          code: 'CONFLICT',
-          reason: 'name-taken',
-          message: `A LUN named '${newLun.name}' already exists on this node. The name is the SCSI model string `
-            + 'initiators see, so it has to be unique.',
-        },
-      }
-    }
+    const iqn = newLun.targetIqn
+    const guardDeps = { executor, paths: iscsiPaths }
 
     // (4) The backing storage — resolved exactly the way the add-LUN door
     // resolves it, because a restore's new backing is one of its two kinds:
     // a zvol is the pool's volume named after the LUN, a file is the image
     // `<dir>/<name>.raw` on a dataset or an AHR pool. Everything not
-    // ANAS-managed is refused by the same helper, with its own wording.
-    let backing: ResolvedBacking
-    let ahr: { name: string, mountpoint: string } | undefined
-    if (newLun.backing.kind === 'zvol') {
-      const dataset = `${newLun.backing.pool}/${newLun.name}`
-      const resolved = resolveZvolBacking(dataset, state.ctx)
-      if ('refusal' in resolved) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', reason: resolved.refusal.reason, message: resolved.refusal.message } }
-      }
-      backing = resolved.ok
+    // ANAS-managed is refused by the same helper, with its own wording. Read
+    // once per guard run: the gate, the scope, the locks and the job body
+    // share it.
+    const backingOf = (o: TargetObject, reads: GuardReads): Promise<{ ok: NewLunBacking } | { refusal: BackingRefusal }> =>
+      reads.once('restore:new-lun:backing', async () => {
+        if (newLun.backing.kind === 'zvol') {
+          const resolved = resolveZvolBacking(`${newLun.backing.pool}/${newLun.name}`, o.state.ctx)
+          return 'refusal' in resolved ? { refusal: resolved.refusal } : { ok: { backing: resolved.ok } }
+        }
+        const dir = await resolveFileBackingDir(executor, newLun.backing.dataset ?? newLun.backing.ahrPool ?? '', o.state.ctx)
+        if ('refusal' in dir)
+          return { refusal: dir.refusal }
+        return {
+          ok: {
+            backing: {
+              path: imageFilePath(dir.ok.dir, newLun.name),
+              plugin: 'fileio',
+              ...(dir.ok.dataset ? { dataset: dir.ok.dataset } : {}),
+            },
+            dir: dir.ok.dir,
+            ...(dir.ok.ahr ? { ahr: dir.ok.ahr } : {}),
+          },
+        }
+      })
+    let routeBacking: NewLunBacking | undefined
+    const backingGate: Gate<TargetObject> = async (o, reads) => {
+      const b = await backingOf(o, reads)
+      if ('refusal' in b)
+        return conflict(b.refusal)
+      // The route door's run is the first; its answer is what the confirm shows.
+      routeBacking ??= b.ok
+      return null
     }
-    else {
-      const dir = await resolveFileBackingDir(
-        executor,
-        newLun.backing.dataset ?? newLun.backing.ahrPool ?? '',
-        state.ctx,
-      )
-      if ('refusal' in dir) {
-        reply.code(409)
-        return { error: { code: 'CONFLICT', reason: dir.refusal.reason, message: dir.refusal.message } }
+    // The backing PATH the operator was shown (and the confirm signed) is
+    // where the image goes. A dataset whose mountpoint moved while the job
+    // waited resolves elsewhere: that is no refusal of the backing itself
+    // (the gate above passed), it is a different restore than the one
+    // confirmed. At the route this compares the run with itself.
+    const backingUnmovedGate: Gate<TargetObject> = async (o, reads) => {
+      const b = await backingOf(o, reads)
+      if ('refusal' in b || !routeBacking || b.ok.backing.path === routeBacking.backing.path)
+        return null
+      return {
+        status: 409,
+        code: 'STATE_CHANGED',
+        message: `The new LUN's backing changed since you confirmed (was: ${routeBacking.backing.path}; `
+          + `now: ${b.ok.backing.path}) — nothing was done; confirm again`,
       }
-      backing = {
-        path: imageFilePath(dir.ok.dir, newLun.name),
-        plugin: 'fileio',
-        ...(dir.ok.dataset ? { dataset: dir.ok.dataset } : {}),
-      }
-      ahr = dir.ok.ahr
     }
+
+    const spec: GuardSpec<TargetObject> = {
+      operation: 'backup.restore.image',
+      // No revision: like an add, the restore is placed into whatever the
+      // target is when it runs (the index and the grants are read under the
+      // lock at the map). The backing path is bound by the confirm
+      // (`confirmScope`) and compared by the job through its own gate, so a
+      // backing the job's re-run REFUSES answers with the refusal's sentence.
+      object: targetView(guardDeps, iqn, {
+        seed: state,
+        revision: false,
+        scopeLabels: { backing: 'the new LUN\'s backing' },
+      }),
+      // (2) target there and ANAS's, (3) the name free node-wide, (4) the
+      // backing resolves onto ANAS storage — at the path that was confirmed.
+      gates: [saveableGate, foreignGate, lunNameFreeGate(newLun.name), backingGate, backingUnmovedGate],
+      // §4.2: the target's key (the LUN set and the grants change) and the
+      // keys the sibling verb that creates this backing takes — a zvol is a
+      // dataset CREATE (its own key exclusive, every ancestor and the pool
+      // shared, as `zfs.create`); an image file lands on a filesystem a data
+      // mover writes into (`pathSourceClaims` of its directory, shared). All
+      // of them go back at the map (`mapped` → `ctx.release()`): from there on
+      // the LUN holds its backing, and every destroy refuses a held backing.
+      locks: async (o, _bound, reads) => {
+        const claims = [iscsiTargetClaim(iqn)]
+        const b = await backingOf(o, reads)
+        if ('refusal' in b)
+          return claims
+        if (newLun.backing.kind === 'zvol') {
+          const pool = newLun.backing.pool
+          const guid = await readPoolGuid(executor, pool).catch(() => null)
+          claims.push(...zfsDatasetClaims(guid?.guid, b.ok.backing.dataset ?? `${pool}/${newLun.name}`, 'exclusive'))
+        }
+        else if (b.ok.dir) {
+          claims.push(...(await pathSourceClaims(executor, [b.ok.dir], readAhrPools)).claims)
+        }
+        return claims
+      },
+    }
+
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const target = pre.object.target
+    const { backing } = routeBacking as NewLunBacking
 
     // (5) The snapshot, and the manifest's size of the image inside it — the
     // FIRST PBS contact, through the same read as the picker (backup2.5). The
@@ -2327,9 +2378,23 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
 
     // (6) The confirm gate. The warnings say exactly what this is and is not:
     // a NEW disk, nothing existing touched, the source stays where it is.
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'backup.restore.image',
-      params: { target: target.iqn, lun: newLun.name, mode: 'newLun' },
+    // cr.54: the code signs the whole validated request and the backing path —
+    // a resend with another archive, snapshot, namespace or backing is 409
+    // CONFIRM_SCOPE_CHANGED naming the field.
+    if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: {
+        target: iqn,
+        mode: 'newLun',
+        name: newLun.name,
+        backing: newLun.backing,
+        repo: req.repo,
+        ns: deps.namespace ?? null,
+        snapshot: req.snapshot,
+        archive: req.archive,
+        rate: req.rate ?? null,
+      },
+      address: ['target'],
+      confirmScope: { backing: backing.path },
       message: `Restoring ${req.archive} from ${req.snapshot} as a NEW LUN '${newLun.name}' on ${target.iqn}`,
       warnings: [
         `This creates a NEW LUN '${newLun.name}' backed by ${backing.path} at exactly the image's size `
@@ -2372,42 +2437,62 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       // both hold the node's only iSCSI mutex for that whole time and deadlock
       // against the service's own acquisitions (the mutex is a plain chain, not
       // reentrant) — the same fix #52 applied to the in-place door.
-      async (updateProgress, ctx) => runNewLunImageRestore(
-        executor,
-        {
-          repo,
-          secret,
-          ...(deps.namespace ? { namespace: deps.namespace } : {}),
-          snapshot: req.snapshot,
-          archive: req.archive,
-          imageSize,
-          target,
-          // cr.40 (audit #34): the destination re-read in the job, with the
-          // route's own gates — the index and the grants come from this read.
-          refresh: () => refreshTarget(
-            { executor, paths: iscsiPaths },
-            target.iqn,
-            [saveableGate, foreignGate, lunNameFreeGate(newLun.name)],
-          ),
-          name: newLun.name,
-          backing,
-          ...(ahr ? { ahr: { fstabPath, pool: ahr } } : {}),
-          ...(req.rate ? { rate: req.rate } : {}),
-          env: buildBackupEnv(repo, secret),
-          mutate: {
-            executor,
-            configfsRoot: iscsiPaths.configfsRoot ?? CONFIGFS_TARGET_ROOT,
-            progress: updateProgress,
+      //
+      // cr.54: the job door (`guarded`) re-reads the target and re-runs every
+      // gate above — the backing resolution included — before the body; the
+      // body acts on the backing as THIS run resolved it (the unmoved gate
+      // proved its path unchanged).
+      guarded(spec, pre, async (now, ctx) => {
+        const fresh = await backingOf(now, ctx.reads)
+        // Unreachable: the job door's backing gate resolved the SAME memoised
+        // read and would have thrown its refusal; kept as the type-narrower,
+        // throwing the gate's own refusal if the memo invariant ever breaks.
+        if ('refusal' in fresh)
+          throw new GuardRefusalError(conflict(fresh.refusal))
+        // The job door just re-proved the target; the service's own step-0
+        // re-read takes that answer, and its re-read under the lock before
+        // the map runs the whole spec again (the id and every gate).
+        let proved: IscsiTargetDetail | undefined = now.target
+        return runNewLunImageRestore(
+          executor,
+          {
+            repo,
+            secret,
+            ...(deps.namespace ? { namespace: deps.namespace } : {}),
+            snapshot: req.snapshot,
+            archive: req.archive,
+            imageSize,
+            target: now.target,
+            // cr.40 (audit #34): the destination re-read in the job, with the
+            // route's own gates — the index and the grants come from this read.
+            refresh: async () => {
+              if (proved) {
+                const first = proved
+                proved = undefined
+                return first
+              }
+              return (await reverify(spec, pre.bound)).object.target
+            },
+            name: newLun.name,
+            backing: fresh.ok.backing,
+            ...(fresh.ok.ahr ? { ahr: { fstabPath, pool: fresh.ok.ahr } } : {}),
+            ...(req.rate ? { rate: req.rate } : {}),
+            env: buildBackupEnv(repo, secret),
+            mutate: {
+              executor,
+              configfsRoot: iscsiPaths.configfsRoot ?? CONFIGFS_TARGET_ROOT,
+              progress: ctx.updateProgress,
+            },
+            // cr.38: the keys go back the moment the LUN is mapped, and are
+            // taken again before a failed run's undo unmaps it.
+            mapped: ctx.release,
+            beforeUndo: ctx.reacquire,
           },
-          // cr.38: the target's key goes back the moment the LUN is mapped,
-          // and is taken again before a failed run's undo unmaps it.
-          mapped: ctx.release,
-          beforeUndo: ctx.reacquire,
-        },
-        updateProgress,
-      ).then((result) => {
-        auditParams.bytesWritten = result.bytesWritten
-        return result
+          ctx.updateProgress,
+        ).then((result) => {
+          auditParams.bytesWritten = result.bytesWritten
+          return result
+        })
       }),
       // cr.33 (§4.3): a restore is a data mover — the long lane. cr.38 session
       // B (cr.40's intent): it holds the target's key (`iscsi-target:<iqn>`)
@@ -2416,30 +2501,44 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       // the image stream (`mapped`), so a verb on a target that stays online
       // (adding an ACL, deleting another LUN) waits only until the map, never
       // for the hours the image takes. A failed run takes the key again before
-      // its undo unmaps the LUN (`beforeUndo`).
-      { lane: 'long', locks: [iscsiTargetClaim(target.iqn)] },
+      // its undo unmaps the LUN (`beforeUndo`). cr.54: plus the new backing's
+      // own keys (the spec's `locks`), on the same release/reacquire.
+      { lane: 'long', locks: pre.locks },
     )
 
     reply.code(202)
     return { job }
   }
 
-  // --- The SELECTIVE FILE branch (story backup2.6) -------------------------
+  // --- The SELECTIVE FILE branch (story backup2.6; on the guard since cr.54) -
   //
   // The pre-flight order below is an order, not a set: every refusal happens
   // before the client is called at all, and the cheapest, most local checks
   // come first. Each one exists because the client fails LATE, DESTRUCTIVELY
   // or SILENTLY without it:
   //
-  //   1. whose storage is this?  PVE territory, and a live LUN's backing
-  //   2. a newLocation directory is NEW — unless the operator confirmed
-  //      MERGING into one that exists (409 + confirm code, like in-place)
+  //   1. whose storage is this?  PVE territory (a storage.cfg that cannot be
+  //      read REFUSES — cr.54), and a live LUN's backing
+  //   2. a newLocation path that exists and is NOT a directory is refused
   //   3. what IS the selection?  hardlink groups completed, trees identified,
   //      file sizes read — ONE catalog-shell session                 <- GT-25/24
   //   4. can we write there?     a read-only target fails at the FIRST file
   //                                                                  <- GT-56 F8
   //   5. does it fit?            ENOSPC leaves a half-written tree
-  //   6. the confirm gate, for an IN-PLACE restore of a TREE and nothing else
+  //   6. the confirm gate, for a MERGE into an existing newLocation directory
+  //      or an IN-PLACE restore of a TREE, and nothing else
+  //
+  // cr.54 (review H3, ruling (j)): 1–5 are the gates of ONE guard spec, run at
+  // the request and again in the job when the queue starts it — the long lane
+  // can hold a restore for hours behind other data movers, and every one of
+  // them is a fact about a destination that may have changed meanwhile. The
+  // confirm signs the whole validated request (destination, mode, repository,
+  // namespace, snapshot, archive, every selection, the options) plus the
+  // destination's revision: what kind of thing is at the path and which
+  // filesystem it is on. The job holds the destination's `zfs:`/`ahr:`/`mount:`
+  // keys SHARED (the data movers' `pathSourceClaims`), so a destroy, rollback
+  // or unmount of the filesystem it writes into waits for it, and one accepted
+  // before it ran is seen by its re-read.
   //
   // Only then is a job submitted, and only inside that job does anything change.
   async function restoreFiles(
@@ -2491,9 +2590,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // `newLocation` (backup2.10) is the exception to "home": its `path` IS the
     // destination directory, not the archive's live home — the schema made it
     // required for that mode, so the task lookup below never runs for it.
-    const isNewLocation = req.target.mode === 'newLocation'
+    const mode = req.target.mode
     let home = req.target.path
-    if (!home && !isNewLocation && req.task) {
+    if (!home && mode !== 'newLocation' && req.task) {
       const task = await readTask(systemdDir, req.task)
       home = task?.archives.find(a => a.name === bareArchiveName(req.archive))?.path
     }
@@ -2513,156 +2612,190 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // write all see one spelling — `/mnt//pve/x` is `/mnt/pve/x` and cannot
     // slip past the territory refusal on a trailing-slash-only strip.
     const target = normalizeMountpointPath(home)
-
-    // --- Pre-flight 1: whose storage is this? --------------------------------
-    // Two hard refusals with no override.
-    //
-    // PVE's territory is read-only and hands-off, always.
-    const pveMountPaths = await readPveMountPaths(paths.pveStorageCfg).catch(() => new Map<string, string>())
-    const pveReason = pveTerritoryReason(target, [...pveMountPaths.keys()])
-    if (pveReason) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: pveReason } }
-    }
-    // And a live iSCSI LUN's backing object is a block device somebody else has
-    // open. `heldByLun` is the ONE question iscsi.6 established for exactly this
-    // — it catches the backing path itself AND any directory that CONTAINS one,
-    // which is the real hazard here: a file-backed LUN is an ordinary file, so
-    // an in-place `--overwrite` restore into its directory would rewrite it
-    // silently while initiators are mid-write. Fail-open: no LIO, nothing held.
-    const held = await heldByLun(
-      createIscsiClaimCache(executor, iscsiPaths),
-      { path: target },
-    )
-    if (held) {
-      const refusal = heldByLunRefusal(`'${target}'`, 'Restoring files into', held)
-      reply.code(409)
-      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
-    }
-
-    // --- Pre-flight 2: a newLocation into a directory that EXISTS -------------
-    // is the operator's choice, not a refusal — but it is overwriting live
-    // data with the same shape as in-place, so it earns the same 409 +
-    // X-Anas-Confirm-Code gate (ruling 2026-08-29: no "refuse, pick another
-    // path" here; a merge into a known directory is legitimate). A path that
-    // exists and is NOT a directory is a plain refusal — there is nothing to
-    // merge into it. `pathKind` answers `null` both for a missing path and for
-    // a probe that could not finish (timeout): both fall through to the write
-    // test below, which asks again. `inPlace` is never probed this way — its
-    // target is the live home, and the hasDirectory gate in pre-flight 6 is
-    // its ask.
-    let mergeIntoExisting = false
-    if (isNewLocation) {
-      const kind = await pathKind(executor, target)
-      if (kind === 'directory') {
-        mergeIntoExisting = true
-        // The plain confirm dialog renders the warnings, not the error
-        // message — so the one sentence rides in BOTH, said identically,
-        // nothing invented for either.
-        const message = `'${target}' already exists: restoring into it overwrites files with the same names and keeps everything else. Confirm to proceed.`
-        if (!confirmGate(confirmStore, request, reply, {
-          operation: 'backup.restore.files',
-          params: { target, snapshot: req.snapshot, archive: req.archive, mode: 'newLocation' },
-          message,
-          warnings: [message],
-        })) {
-          return reply
-        }
-      }
-      else if (kind !== null) {
-        reply.code(400)
-        return {
-          error: {
-            code: 'VALIDATION_ERROR',
-            message: `'${target}' already exists and is not a directory - a restore needs a directory. Remove it or choose another path.`,
-          },
-        }
-      }
-    }
-
-    // --- Pre-flight 3: what IS the selection? --------------------------------
-    // One catalog-shell session: hardlink groups completed (a partly-named
-    // group fails the whole job), directories identified (the gate's only
-    // trigger), file sizes read (the exact space figure).
     const browseDeps = { ...deps, snapshot: req.snapshot, archive: req.archive, path: '/' }
-    const facts = await readSelectionFacts(executor, browseDeps, req.selections)
-    if (facts.unknown.length) {
-      reply.code(400)
+
+    /**
+     * The destination as ONE guard run reads it. Every fact is lazy and read
+     * once per run through that run's {@link GuardReads}, so a refusal early in
+     * the gate list never pays for the later reads (a path under /mnt/pve is
+     * refused before anything stats it), and the route's run and the job's
+     * never share a fact.
+     */
+    const readDestination = (reads: GuardReads): RestoreDestination => {
+      // What is at the path: 'directory', another kind, or null (absent — or a
+      // probe that could not finish; the write test then asks again).
+      const kind = (): Promise<string | null> => reads.once('restore:kind', () => pathKind(executor, target))
+      // In place is ALWAYS a merge; a newLocation merges only into a directory
+      // that already exists — the shape that earns the confirm.
+      const merge = async (): Promise<boolean> => mode === 'inPlace' || (await kind()) === 'directory'
+      // A newLocation directory that does NOT exist yet is created by the
+      // client, so the write and space probes go where it will be created.
+      const writeDir = async (): Promise<string> => (await merge()) ? target : parentDirectory(target)
+      const selection = (): Promise<SelectionFacts> => reads.once('restore:selection', () => readSelectionFacts(executor, browseDeps, req.selections))
+      // The exact sum of the picked files when every selection is a file, else
+      // the manifest's logical archive size (GT-4) — an upper bound, and the
+      // refusal says which figure it used.
+      const space = (): Promise<{ refusal: string | null, warnings: string[] }> => reads.once('restore:space', async () => {
+        const facts = await selection()
+        const warnings = [...facts.warnings]
+        let archiveBytes: number | null = null
+        const group = groupOfSnapshotId(req.snapshot)
+        if (facts.exactBytes === null && group) {
+          const listing = await listSnapshots(executor, deps, group)
+          if (listing.ok) {
+            const snap = listing.data.find(s => s.snapshot === req.snapshot)
+            const file = snap?.files.find(f => f.archive === req.archive)
+            archiveBytes = typeof file?.size === 'number' ? file.size : null
+          }
+          if (archiveBytes === null)
+            warnings.push('The archive size could not be read, so the restore ran without a space check.')
+        }
+        const dir = await writeDir()
+        const available = await availableBytes(executor, dir)
+        const estimate = estimateSpace(facts.exactBytes ?? archiveBytes, facts.exactBytes !== null, available, dir)
+        return { refusal: estimate.refuse ? `Not enough free space for this restore. ${estimate.detail}` : null, warnings }
+      })
+      // The filesystem the destination is on, as the lock keys name it.
+      const claims = (): Promise<SourceClaims> => reads.once('restore:claims', () => pathSourceClaims(executor, [target], readAhrPools))
+      return { target, kind, merge, writeDir, selection, space, claims }
+    }
+
+    // --- The gates: each one function, run by both doors ---------------------
+
+    // (1) PVE's territory is read-only and hands-off, always — no override. An
+    // unreadable storage.cfg is not "no storages": it refuses (cr.54).
+    const territoryGate: Gate<RestoreDestination> = async (o, reads) => {
+      const pvePaths = await reads.once('restore:pve-paths', () => readPveMountPathsStrict(paths.pveStorageCfg))
+      return restoreTerritoryRefusal(o.target, pvePaths, paths.pveStorageCfg)
+    }
+    // (1b) A live iSCSI LUN's backing object is a block device somebody else
+    // has open. `heldByLun` is the ONE question iscsi.6 established for exactly
+    // this — it catches the backing path itself AND any directory that CONTAINS
+    // one, which is the real hazard here: a file-backed LUN is an ordinary
+    // file, so an in-place `--overwrite` restore into its directory would
+    // rewrite it silently while initiators are mid-write. Fail-open: no LIO,
+    // nothing held.
+    const heldGate: Gate<RestoreDestination> = async (o) => {
+      const held = await heldByLun(createIscsiClaimCache(executor, iscsiPaths), { path: o.target })
+      if (!held)
+        return null
+      const refusal = heldByLunRefusal(`'${o.target}'`, 'Restoring files into', held)
+      return { status: 409, code: 'CONFLICT', reason: refusal.reason, message: refusal.message }
+    }
+    // (2) A newLocation into a path that exists and is NOT a directory: there
+    // is nothing to merge into. (One that IS a directory is the operator's
+    // choice — ruling 2026-08-29 — and earns the confirm below.)
+    const kindGate: Gate<RestoreDestination> = async (o) => {
+      if (mode !== 'newLocation')
+        return null
+      const kind = await o.kind()
+      if (kind === null || kind === 'directory')
+        return null
       return {
-        error: {
-          code: 'VALIDATION_ERROR',
-          message: `This snapshot's '${req.archive}' does not hold ${facts.unknown.join(', ')} - `
-            + 'the client would report success and restore nothing for those, so the restore is refused instead.',
-        },
+        status: 400,
+        code: 'VALIDATION_ERROR',
+        message: `'${o.target}' already exists and is not a directory - a restore needs a directory. Remove it or choose another path.`,
       }
     }
-
-    // --- Pre-flight 4: can we write there at all? ----------------------------
-    // A read-only or dead target does not fail at the start: the client enters
-    // the directory happily and dies at the FIRST FILE. For a restore into a
-    // newLocation directory that does NOT exist yet the directory is created
-    // by the client, so the test goes where it will be created; a confirmed
-    // merge into an existing directory tests the directory itself.
-    const writeDir = req.target.mode === 'inPlace' || mergeIntoExisting
-      ? target
-      : parentDirectory(target)
-    const writable = await writeTestDirectory(executor, writeDir)
-    if (!writable.ok) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: writable.detail } }
-    }
-
-    // --- Pre-flight 5: does it fit? ------------------------------------------
-    // The exact sum of the picked files when every selection is a file, else
-    // the manifest's logical archive size (GT-4) — an upper bound, and the
-    // refusal says which figure it used.
-    const warnings = [...facts.warnings]
-    let archiveBytes: number | null = null
-    const group = groupOfSnapshotId(req.snapshot)
-    if (facts.exactBytes === null && group) {
-      const listing = await listSnapshots(executor, deps, group)
-      if (listing.ok) {
-        const snap = listing.data.find(s => s.snapshot === req.snapshot)
-        const file = snap?.files.find(f => f.archive === req.archive)
-        archiveBytes = typeof file?.size === 'number' ? file.size : null
+    // (3) One catalog-shell session: hardlink groups completed (a partly-named
+    // group fails the whole job), directories identified (the confirm's only
+    // in-place trigger), file sizes read (the exact space figure).
+    const selectionGate: Gate<RestoreDestination> = async (o) => {
+      const facts = await o.selection()
+      if (!facts.unknown.length)
+        return null
+      return {
+        status: 400,
+        code: 'VALIDATION_ERROR',
+        message: `This snapshot's '${req.archive}' does not hold ${facts.unknown.join(', ')} - `
+          + 'the client would report success and restore nothing for those, so the restore is refused instead.',
       }
-      if (archiveBytes === null)
-        warnings.push('The archive size could not be read, so the restore ran without a space check.')
     }
-    const available = await availableBytes(executor, writeDir)
-    const space = estimateSpace(
-      facts.exactBytes ?? archiveBytes,
-      facts.exactBytes !== null,
-      available,
-      writeDir,
-    )
-    if (space.refuse) {
-      reply.code(409)
-      return { error: { code: 'CONFLICT', message: `Not enough free space for this restore. ${space.detail}` } }
+    // (4) A read-only or dead target does not fail at the start: the client
+    // enters the directory happily and dies at the FIRST FILE.
+    const writableGate: Gate<RestoreDestination> = async (o) => {
+      const writable = await writeTestDirectory(executor, await o.writeDir())
+      return writable.ok ? null : { status: 409, code: 'CONFLICT', message: writable.detail }
+    }
+    // (5) ENOSPC leaves a half-written tree.
+    const spaceGate: Gate<RestoreDestination> = async (o) => {
+      const { refusal } = await o.space()
+      return refusal ? { status: 409, code: 'CONFLICT', message: refusal } : null
     }
 
-    // --- Pre-flight 6: the confirm gate, and ONLY here -----------------------
-    // An in-place restore of a TREE is the one shape that can rewrite an
-    // unbounded amount of live data, so it is the one shape that asks. A single
-    // explicitly picked file restored in place is NOT gated: the operator
-    // pointed at that file and ticked the in-place box, and that IS the
-    // consent. A newLocation restore into a directory the restore will CREATE
-    // is never gated here — it writes only into a directory that did not exist
-    // a moment ago; its existing-directory gate is pre-flight 2, where the
-    // path was already known to exist.
-    if (req.target.mode === 'inPlace' && facts.hasDirectory) {
-      if (!confirmGate(confirmStore, request, reply, {
-        operation: 'backup.restore.files',
-        params: { target, snapshot: req.snapshot, archive: req.archive, mode: 'inPlace' },
+    const what = `Restore destination '${target}'`
+    const spec: GuardSpec<RestoreDestination> = {
+      operation: 'backup.restore.files',
+      object: {
+        what,
+        read: async reads => readDestination(reads),
+        id: async o => ({ path: o.target }),
+        // Same destination STATE? What is at the path (a newLocation directory
+        // created while the job waited would turn a fresh restore into an
+        // unconfirmed merge) and the filesystem it is on (a dataset unmounted
+        // or destroyed meanwhile leaves the path on its parent's).
+        revision: async o => restoreDestinationRevision(await o.kind(), (await o.claims()).claims),
+        unbound: () => `Could not read ${what} — refusing a restore that cannot be bound to it`,
+      },
+      gates: [territoryGate, heldGate, kindGate, selectionGate, writableGate, spaceGate],
+      locks: async o => (await o.claims()).claims,
+    }
+
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    const merge = await pre.object.merge()
+    const facts = await pre.object.selection()
+
+    // --- (6) The confirm gate, and ONLY for two shapes -----------------------
+    // A MERGE into a newLocation directory that EXISTS overwrites live data
+    // with the same shape as in-place, so it earns the same 409 +
+    // X-Anas-Confirm-Code (ruling 2026-08-29: no "refuse, pick another path";
+    // a merge into a known directory is legitimate). An in-place restore of a
+    // TREE is the one shape that can rewrite an unbounded amount of live data.
+    // A single explicitly picked file restored in place is NOT gated: the
+    // operator pointed at that file and ticked the in-place box, and that IS
+    // the consent. A newLocation restore into a directory the restore will
+    // CREATE is never gated — it writes only into a directory that did not
+    // exist a moment ago (and the job refuses STATE_CHANGED if one appears).
+    //
+    // cr.54: the code signs the WHOLE validated request — a resend with
+    // another archive, another selection or another option is 409
+    // CONFIRM_SCOPE_CHANGED naming the field — and the destination's revision.
+    let confirm: { message: string, warnings: string[] } | null = null
+    if (mode === 'newLocation' && merge) {
+      // The plain confirm dialog renders the warnings, not the error message —
+      // so the one sentence rides in BOTH, said identically.
+      const message = `'${target}' already exists: restoring into it overwrites files with the same names and keeps everything else. Confirm to proceed.`
+      confirm = { message, warnings: [message] }
+    }
+    else if (mode === 'inPlace' && facts.hasDirectory) {
+      confirm = {
         message: `Restore a directory from ${req.snapshot} INTO '${target}', over the live data`,
         warnings: [
           `Files in the snapshot will replace the ones in '${target}' that have the same names.`,
           'This is a MERGE, never a sync: anything under the target that is not in the archive is left exactly as it is.',
           'A directory selection restores the whole tree below it.',
         ],
-      })) {
-        return reply
       }
+    }
+    if (confirm && !guardConfirm(confirmStore, request, reply, spec, pre, {
+      validated: {
+        target,
+        mode,
+        repo: req.repo,
+        ns: deps.namespace ?? null,
+        task: req.task ?? null,
+        snapshot: req.snapshot,
+        archive: req.archive,
+        selections: req.selections,
+        options: req.options,
+        rate: req.rate ?? null,
+      },
+      address: ['target'],
+      ...confirm,
+    })) {
+      return reply
     }
 
     const job = jobQueue.submit(
@@ -2677,11 +2810,20 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           archive: req.archive,
           selections: facts.selections.length,
           target,
-          mode: req.target.mode,
-          merge: req.target.mode === 'inPlace' || mergeIntoExisting,
+          mode,
+          merge,
         },
       },
-      async (updateProgress) => {
+      // The job door: every gate above runs again against facts read NOW —
+      // and the selection, the merge decision and the space warnings the
+      // restore acts on are the job's own reads, never the request's.
+      guarded(spec, pre, async (now, ctx) => {
+        const unlocked = unlockedSourcesLine((await now.claims()).unlocked)
+        if (unlocked)
+          ctx.updateProgress(`restore into '${target}': ${unlocked}`)
+        const fresh = await now.selection()
+        const { warnings } = await now.space()
+        const mergeNow = await now.merge()
         const result = await runFileRestore(
           executor,
           {
@@ -2689,15 +2831,15 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
             snapshot: req.snapshot,
             archive: req.archive,
             target,
-            mode: req.target.mode,
-            merge: req.target.mode === 'inPlace' || mergeIntoExisting,
-            selections: facts.selections,
-            addedForHardlinks: facts.addedForHardlinks,
+            mode,
+            merge: mergeNow,
+            selections: fresh.selections,
+            addedForHardlinks: fresh.addedForHardlinks,
             options: req.options,
             ...(req.rate ? { rate: req.rate } : {}),
             warnings,
           },
-          updateProgress,
+          ctx.updateProgress,
         )
         // The audit record the job queue writes names the operation and its
         // params; the BYTES are only known when the client has finished, so
@@ -2709,10 +2851,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
             user: identity.user,
             snapshot: req.snapshot,
             archive: req.archive,
-            selections: facts.selections.length,
+            selections: fresh.selections.length,
             target,
-            mode: req.target.mode,
-            merge: req.target.mode === 'inPlace' || mergeIntoExisting,
+            mode,
+            merge: mergeNow,
             status: result.status,
             bytes: result.bytes ?? 0,
             restored: result.restored.length,
@@ -2720,16 +2862,57 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           },
           `audit: restored ${result.restored.length}/${result.selections.length} selection(s) of `
           + `${req.archive} from ${req.snapshot} into ${target} `
-          + `(${req.target.mode}${req.target.mode === 'inPlace' || mergeIntoExisting ? ', merge' : ''}, ${result.bytes ?? 0} bytes)`,
+          + `(${mode}${mergeNow ? ', merge' : ''}, ${result.bytes ?? 0} bytes)`,
         )
         return result
-      },
-      // cr.33 (§4.3): a restore is a data mover — the long lane.
-      { lane: 'long' },
+      }),
+      // cr.33 (§4.3): a restore is a data mover — the long lane. cr.54: it
+      // holds its destination's filesystem keys shared for the run.
+      { lane: 'long', locks: pre.locks },
     )
     reply.code(202)
     return { job }
   }
+}
+
+/** The new-LUN restore's backing as one guard run resolves it (cr.54). */
+interface NewLunBacking {
+  backing: ResolvedBacking
+  /** The directory an image file is created in (file backings only). */
+  dir?: string
+  /** Set when the image lands on an AHR pool — the boot-ordering half (iscsi.8). */
+  ahr?: ResolvedAhrPool
+}
+
+/**
+ * The file restore's destination as one guard run reads it (cr.54): the path,
+ * and every fact a gate, the revision or the job body asks of it, each read
+ * lazily and once per run.
+ */
+interface RestoreDestination {
+  target: string
+  /** `stat -c %F`: 'directory', another kind, or null (absent, or no answer). */
+  kind: () => Promise<string | null>
+  /** Does the restore MERGE into an existing directory (in place, or a newLocation that exists)? */
+  merge: () => Promise<boolean>
+  /** Where the write and space probes go: the target, or the parent a new directory is created in. */
+  writeDir: () => Promise<string>
+  selection: () => Promise<SelectionFacts>
+  space: () => Promise<{ refusal: string | null, warnings: string[] }>
+  /** The destination filesystem's keys (`pathSourceClaims`), shared. */
+  claims: () => Promise<SourceClaims>
+}
+
+/**
+ * The file restore destination's revision (cr.54): what is at the path and
+ * the filesystem it sits on, as the lock keys name it (`zfs:<pool guid>/…`,
+ * `ahr:<vg uuid>`, `mount:<target>`). A directory that appears under a
+ * newLocation path, a dataset unmounted from under the path, or a pool
+ * re-created under the same name all move it.
+ */
+function restoreDestinationRevision(kind: string | null, claims: LockClaim[]): string {
+  const keys = claims.map(c => `${c.key}:${c.mode}`).sort()
+  return createHash('sha256').update(JSON.stringify({ kind, keys })).digest('hex')
 }
 
 /**

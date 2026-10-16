@@ -1,11 +1,15 @@
 import type { BackupFilesRestoreResult, Job } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
+import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
+import { mountClaim } from '../../safety/guard.js'
 import { createServer } from '../../server.js'
 import { CATALOG_PREFLIGHT_TIMEOUT_S } from '../../services/backup-catalog.js'
 
@@ -961,5 +965,296 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     assert.match(job.error!.message, /\[secret\]/)
     assert.ok(!job.error!.message.includes('token-secret-value'), job.error!.message)
     assert.ok(!JSON.stringify(job).includes('token-secret-value'), 'no plain secret anywhere in the job record')
+  })
+
+  // --- cr.54 (review H3): the file restore is on the guard ------------------
+  //
+  // The confirm signs the whole validated request; the job re-reads its
+  // destination and re-runs every route gate when the queue starts it; the
+  // territory check refuses on an unreadable storage.cfg; the job holds the
+  // destination filesystem's keys shared.
+
+  describe('cr.54 — bound confirm, job-time re-gate, fail-closed territory, destination locks', () => {
+    function queue(): JobQueue {
+      return (server as unknown as { jobQueue: JobQueue }).jobQueue
+    }
+
+    /** One `stat` block per path, the catalog shell's answer for a several-path selection. */
+    function treeStats(paths: string[]): string {
+      return paths.map(p => statBlock(p, 0, 'directory', '755', 'drwxr-xr-x')).join('\n')
+    }
+
+    /** An in-place TREE restore of HOME up to its confirm: catalog, manifest size, space, all answered. */
+    function seedInPlaceTree(archive = 'data.pxar', paths = ['/docs', '/etc']): void {
+      const mock = mockOf(server)
+      mock.addFixture({
+        command: TIMEOUT,
+        args: [String(CATALOG_PREFLIGHT_TIMEOUT_S), PBC, 'catalog', 'shell', SNAP, archive, '--ns', 'gtrestore'],
+        result: { stdout: treeStats(paths), stderr: '', exitCode: 0 },
+      })
+      mock.addFixture({
+        command: PBC,
+        args: ['snapshot', 'list', 'host/gtrestore', '--ns', 'gtrestore', '--output-format', 'json'],
+        result: {
+          stdout: JSON.stringify([{
+            'backup-id': 'gtrestore',
+            'backup-time': 1787685405,
+            'backup-type': 'host',
+            'files': [
+              { 'crypt-mode': 'none', 'filename': 'data.pxar.didx', 'size': 2607 },
+              { 'crypt-mode': 'none', 'filename': 'etc.pxar.didx', 'size': 2607 },
+            ],
+          }]),
+          stderr: '',
+          exitCode: 0,
+        },
+      })
+      mock.addFixture({
+        command: TIMEOUT,
+        args: ['10', '/usr/bin/stat', '-f', '-c', '%S %a', HOME],
+        result: { stdout: '4096 1000000\n', stderr: '', exitCode: 0 },
+      })
+    }
+
+    /** Mint a code for `payload` (asserting the first answer is the plain challenge). */
+    async function mint(payload: Record<string, unknown>): Promise<string> {
+      const first = await post(payload)
+      assert.equal(first.statusCode, 409, first.body)
+      assert.equal((first.json() as { error: { code: string } }).error.code, 'CONFIRMATION_REQUIRED')
+      const code = first.headers['x-anas-confirm-code'] as string
+      assert.ok(code)
+      return code
+    }
+
+    function assertScopeChanged(res: Awaited<ReturnType<typeof post>>, field: string): void {
+      assert.equal(res.statusCode, 409, res.body)
+      const err = (res.json() as { error: { code: string, message: string, changed: string[] } }).error
+      assert.equal(err.code, 'CONFIRM_SCOPE_CHANGED')
+      assert.ok(err.changed.includes(field), `the 409 names '${field}': ${JSON.stringify(err.changed)}`)
+      assert.match(err.message, new RegExp(`You confirmed with ${field} `))
+      assert.ok(res.headers['x-anas-confirm-code'], 'a fresh code for the request as it is now')
+      assert.equal(restoreRan(), false)
+    }
+
+    it('the H3 probe: a code minted for an in-place restore of /docs replayed with /docs AND /etc is 409 CONFIRM_SCOPE_CHANGED naming the selections — no restore argv', async () => {
+      seedInPlaceTree()
+      const code = await mint(body({ selections: ['/docs'], target: { mode: 'inPlace' } }))
+      const res = await post(body({ selections: ['/docs', '/etc'], target: { mode: 'inPlace' } }), { 'x-anas-confirm': code })
+      assertScopeChanged(res, 'selections')
+    })
+
+    it('a code minted for archive data.pxar replayed with etc.pxar is 409 CONFIRM_SCOPE_CHANGED naming the archive', async () => {
+      seedInPlaceTree('data.pxar', ['/docs'])
+      seedInPlaceTree('etc.pxar', ['/docs'])
+      // The path is named: `etc` is no archive of the task, so its home cannot be looked up.
+      const code = await mint(body({ selections: ['/docs'], target: { mode: 'inPlace', path: HOME } }))
+      const res = await post(body({ archive: 'etc.pxar', selections: ['/docs'], target: { mode: 'inPlace', path: HOME } }), { 'x-anas-confirm': code })
+      assertScopeChanged(res, 'archive')
+    })
+
+    it('a code minted without options replayed with --ignore-ownership is 409 CONFIRM_SCOPE_CHANGED naming the options', async () => {
+      seedInPlaceTree('data.pxar', ['/docs'])
+      const code = await mint(body({ selections: ['/docs'], target: { mode: 'inPlace' } }))
+      const res = await post(body({ selections: ['/docs'], target: { mode: 'inPlace' }, options: { ignoreOwnership: true } }), { 'x-anas-confirm': code })
+      assertScopeChanged(res, 'options')
+    })
+
+    it('a code minted for namespace gtrestore replayed with another namespace is 409 CONFIRM_SCOPE_CHANGED naming ns', async () => {
+      seedInPlaceTree('data.pxar', ['/docs'])
+      // The other namespace's catalog answers the same tree (the gates pass; only the binding refuses).
+      mockOf(server).addFixture({
+        command: TIMEOUT,
+        args: [String(CATALOG_PREFLIGHT_TIMEOUT_S), PBC, 'catalog', 'shell', SNAP, 'data.pxar', '--ns', 'other'],
+        result: { stdout: treeStats(['/docs']), stderr: '', exitCode: 0 },
+      })
+      const code = await mint(body({ selections: ['/docs'], target: { mode: 'inPlace' } }))
+      const res = await post(body({ ns: 'other', selections: ['/docs'], target: { mode: 'inPlace' } }), { 'x-anas-confirm': code })
+      assertScopeChanged(res, 'ns')
+    })
+
+    it('the exact request replayed with its code still runs — the binding refuses changes, not the confirm', async () => {
+      seedInPlaceTree('data.pxar', ['/docs'])
+      const mock = mockOf(server)
+      mock.addFixture({
+        command: TIMEOUT,
+        args: ['30', '/usr/bin/find', '-P', `${HOME}/docs`, '-maxdepth', '0', '-printf', '%p\n'],
+        result: { stdout: `${HOME}/docs\n`, stderr: '', exitCode: 0 },
+      })
+      mock.addFixture({
+        command: PBC,
+        args: ['restore', SNAP, 'data.pxar', HOME, '--ns', 'gtrestore', '--pattern', '/docs', '--allow-existing-dirs', '--overwrite'],
+        result: { stdout: '', stderr: 'restore complete (2.546 KiB processed in <0.1s, average 1 MiB/s)\r', exitCode: 0 },
+      })
+      const payload = body({ selections: ['/docs'], target: { mode: 'inPlace' } })
+      const code = await mint(payload)
+      const res = await post(payload, { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    })
+
+    // --- Job time --------------------------------------------------------------
+
+    /**
+     * `/gtbackup` as a ZFS filesystem: the captured `findmnt-full.json` with its
+     * `mnttest` row re-pointed (ruling (l): a captured line, renamed), and the
+     * pool's guid — so the destination resolves to `gtbackup` and the restore
+     * claims `zfs:<guid>`, the pool and `mount:/gtbackup`, all shared.
+     */
+    function seedZfsDestination(): void {
+      const findmnt = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/mounts/findmnt-full.json'), 'utf8')
+      assert.equal(findmnt.split('"/mnttest"').length, 2)
+      assert.equal(findmnt.split('"mnttest"').length, 2)
+      const mock = mockOf(server)
+      mock.prependFixture({
+        command: '/usr/bin/findmnt',
+        args: ['--json'],
+        result: { stdout: findmnt.replace('"/mnttest"', '"/gtbackup"').replace('"mnttest"', '"gtbackup"'), stderr: '', exitCode: 0 },
+      })
+      mock.prependFixture({
+        command: '/usr/sbin/zpool',
+        args: ['get', '-H', '-o', 'value', 'guid', '--', 'gtbackup'],
+        result: { stdout: '5823146802312415237\n', stderr: '', exitCode: 0 },
+      })
+    }
+
+    /**
+     * A job that holds `mount:/gtbackup` EXCLUSIVE (what an unmount of the
+     * destination's filesystem takes) until `release()` — the queue parks the
+     * restore behind it, and the node changes while it waits.
+     */
+    function holdDestinationMount(): { id: string, release: () => void } {
+      let release!: () => void
+      const held = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const job = queue().submit('mount.unmount', { user: 'test', uid: 0 }, () => held, { locks: [mountClaim('/gtbackup')] })
+      return { id: job.id, release }
+    }
+
+    async function waitingBehind(id: string, blocker: string): Promise<void> {
+      for (let i = 0; i < 200 && queue().get(id)?.status !== 'queued'; i++)
+        await new Promise(resolve => setTimeout(resolve, 5))
+      assert.equal(queue().get(id)?.status, 'queued', 'the restore waits')
+      assert.equal(queue().get(id)?.progress, `waiting for mount.unmount (job ${blocker}) on the mount at /gtbackup`)
+    }
+
+    it('a newLocation directory that APPEARS while the job waits fails the job STATE_CHANGED — the fresh restore never becomes an unconfirmed merge, no restore argv', async () => {
+      seedHappyPath()
+      seedZfsDestination()
+      const blocker = holdDestinationMount()
+      const res = await post(body())
+      assert.equal(res.statusCode, 202, res.body)
+      const id = (res.json() as { job: { id: string } }).job.id
+      await waitingBehind(id, blocker.id)
+
+      // Someone creates the directory while the restore waits.
+      mockOf(server).prependFixture({
+        command: TIMEOUT,
+        args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
+        result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
+      })
+      blocker.release()
+      const job = await waitForJob(server, id)
+      assert.equal(job.status, 'failed')
+      assert.equal(job.error?.code, 'STATE_CHANGED')
+      assert.match(job.error!.message, /Restore destination '\/gtbackup\/elsewhere' changed since you confirmed — nothing was done/)
+      assert.equal(restoreRan(), false, 'no restore argv')
+    })
+
+    it('a destination whose filesystem goes away while the job waits (the dataset unmounted: the path is on / now) fails STATE_CHANGED — no restore argv', async () => {
+      seedHappyPath()
+      seedZfsDestination()
+      const blocker = holdDestinationMount()
+      const res = await post(body())
+      assert.equal(res.statusCode, 202, res.body)
+      const id = (res.json() as { job: { id: string } }).job.id
+      await waitingBehind(id, blocker.id)
+
+      // The unmount the blocker stands for ran: the captured table without the gtbackup row.
+      mockOf(server).prependFixture({
+        command: '/usr/bin/findmnt',
+        args: ['--json'],
+        result: { stdout: readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/mounts/findmnt-full.json'), 'utf8'), stderr: '', exitCode: 0 },
+      })
+      blocker.release()
+      const job = await waitForJob(server, id)
+      assert.equal(job.status, 'failed')
+      assert.equal(job.error?.code, 'STATE_CHANGED')
+      assert.equal(restoreRan(), false, 'no restore argv')
+    })
+
+    it('a path PVE claims while the job waits fails the job PVE_MANAGED — the route\'s territory gate runs again at its turn', async () => {
+      seedHappyPath()
+      seedZfsDestination()
+      const blocker = holdDestinationMount()
+      const res = await post(body())
+      assert.equal(res.statusCode, 202, res.body)
+      const id = (res.json() as { job: { id: string } }).job.id
+      await waitingBehind(id, blocker.id)
+
+      await writeFile(join(dir, 'storage.cfg'), 'dir: extra\n\tpath /gtbackup\n\tcontent iso\n')
+      blocker.release()
+      const job = await waitForJob(server, id)
+      assert.equal(job.status, 'failed')
+      assert.equal(job.error?.code, 'PVE_MANAGED')
+      assert.match(job.error!.message, /storage\.cfg claims/)
+      assert.equal(restoreRan(), false, 'no restore argv')
+    })
+
+    it('an UNREADABLE storage.cfg refuses the territory check at the route (the config-unreadable verdict) — never passes, nothing ran', async () => {
+      await rm(join(dir, 'storage.cfg'))
+      await mkdir(join(dir, 'storage.cfg'))
+      seedHappyPath()
+      const res = await post(body())
+      assert.equal(res.statusCode, 400, res.body)
+      const err = (res.json() as { error: { code: string, message: string } }).error
+      assert.equal(err.code, 'VALIDATION_ERROR')
+      assert.match(err.message, /PVE storage configuration is unreadable .* cannot be checked against the paths PVE storage claims/)
+      assert.equal(restoreRan(), false)
+      // Refused before anything touched the destination.
+      assert.ok(!mockOf(server).calls.some(c => c.args.includes(NEWLOC) || c.args.some(a => a.startsWith('/gtbackup'))))
+    })
+
+    it('a storage.cfg that becomes unreadable while the job waits fails the job — never passes, no restore argv', async () => {
+      seedHappyPath()
+      seedZfsDestination()
+      const blocker = holdDestinationMount()
+      const res = await post(body())
+      assert.equal(res.statusCode, 202, res.body)
+      const id = (res.json() as { job: { id: string } }).job.id
+      await waitingBehind(id, blocker.id)
+
+      await rm(join(dir, 'storage.cfg'))
+      await mkdir(join(dir, 'storage.cfg'))
+      blocker.release()
+      const job = await waitForJob(server, id)
+      assert.equal(job.status, 'failed')
+      assert.equal(job.error?.code, 'VALIDATION_ERROR')
+      assert.match(job.error!.message, /PVE storage configuration is unreadable/)
+      assert.equal(restoreRan(), false, 'no restore argv')
+    })
+
+    it('a path in PVE territory answers cr.47(b)\'s one fact: 409 PVE_MANAGED, reason pve-managed', async () => {
+      const res = await post(body({ task: undefined, target: { mode: 'inPlace', path: '/mnt/pve/backups' } }))
+      assert.equal(res.statusCode, 409)
+      const err = (res.json() as { error: { code: string, reason: string } }).error
+      assert.equal(err.code, 'PVE_MANAGED')
+      assert.equal(err.reason, 'pve-managed')
+    })
+
+    it('the job holds the destination filesystem\'s keys SHARED for the run, and the restore completes once the blocker is done', async () => {
+      seedHappyPath()
+      seedZfsDestination()
+      const blocker = holdDestinationMount()
+      const res = await post(body())
+      assert.equal(res.statusCode, 202, res.body)
+      const id = (res.json() as { job: { id: string } }).job.id
+      await waitingBehind(id, blocker.id)
+      blocker.release()
+      const job = await waitForJob(server, id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.ok(restoreRan())
+    })
   })
 })

@@ -1,6 +1,7 @@
 import type { Job } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import type { ExecStreamResult } from '../../executor/types.js'
+import type { LockClaim } from '../../jobs/locks.js'
 import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { constants } from 'node:fs'
@@ -10,7 +11,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { anasIqn } from '@anas/shared'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
-import { iscsiTargetClaim } from '../../safety/guard.js'
+import { iscsiTargetClaim, znameClaim } from '../../safety/guard.js'
 import { createServer } from '../../server.js'
 import { volsizeArgs } from '../../services/backup-restore.js'
 import { PBC } from '../../services/backup-runner.js'
@@ -1311,6 +1312,140 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         mock.calls.filter(c => c.command === TARGETCLI && (c.args.includes('disable') || c.args.includes('enable'))),
         [],
       )
+    })
+
+    // --- cr.54 (review H3): the new-LUN restore is on the guard ------------
+
+    describe('cr.54 — the confirm binds the whole request; the job re-reads and re-gates; the backing\'s keys', () => {
+      function queueOf(): JobQueue {
+        return (server as unknown as { jobQueue: JobQueue }).jobQueue
+      }
+
+      /** Mint a code for `payload`, asserting the first answer is the plain challenge. */
+      async function mint(payload: unknown): Promise<string> {
+        const first = await restore(payload)
+        assert.equal(first.statusCode, 409, JSON.stringify(first.body))
+        assert.equal(first.body.error!.code, 'CONFIRMATION_REQUIRED')
+        return String(first.headers['x-anas-confirm-code'])
+      }
+
+      function assertScopeChanged(res: Res, field: string): void {
+        assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+        const err = res.body.error as { code: string, message: string, changed?: string[] }
+        assert.equal(err.code, 'CONFIRM_SCOPE_CHANGED')
+        assert.ok(err.changed?.includes(field), `the 409 names '${field}': ${JSON.stringify(err.changed)}`)
+        assert.ok(res.headers['x-anas-confirm-code'], 'a fresh code for the request as it is now')
+        assertNothingDestructive()
+        assert.ok(!mockOf().calls.some(c => c.command === ZFS && c.args[0] === 'create'), 'no volume created')
+      }
+
+      it('the H3 probe: a code minted for archive vol.img replayed with lun.img is 409 CONFIRM_SCOPE_CHANGED naming the archive — no restore argv', async () => {
+        await serveAnas()
+        const code = await mint(newLunBody())
+        const res = await restore(newLunBody({ archive: 'lun.img' }), { 'x-anas-confirm': code })
+        assertScopeChanged(res, 'archive')
+      })
+
+      it('a code minted for one snapshot replayed with another is 409 CONFIRM_SCOPE_CHANGED naming the snapshot', async () => {
+        await serveAnas()
+        const code = await mint(newLunBody())
+        // The manifest lists the second group's snapshot too (gtsmall); its archive is the same name.
+        const res = await restore(newLunBody({ snapshot: 'host/gtsmall/2026-08-25T19:26:40Z' }), { 'x-anas-confirm': code })
+        assertScopeChanged(res, 'snapshot')
+      })
+
+      it('a code minted for namespace gtrestore replayed with another namespace is 409 CONFIRM_SCOPE_CHANGED naming ns', async () => {
+        await serveAnas()
+        const code = await mint(newLunBody())
+        const res = await restore(newLunBody({ ns: 'other' }), { 'x-anas-confirm': code })
+        assertScopeChanged(res, 'ns')
+      })
+
+      it('a code minted for a zvol on tank replayed with a file backing is 409 CONFIRM_SCOPE_CHANGED naming the backing (kind and pool are signed)', async () => {
+        await serveAnas()
+        mockOf().addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: 'tank\t/tank\ntank/images\t/tank/images\n', stderr: '', exitCode: 0 } })
+        const code = await mint(newLunBody())
+        const res = await restore(newLunBody(targetWith({ backing: { kind: 'file', dataset: 'tank/images' } })), { 'x-anas-confirm': code })
+        assertScopeChanged(res, 'backing')
+      })
+
+      /** A job holding `claim` until released — the restore queues behind it while the node changes. */
+      function hold(operation: string, claim: LockClaim): { id: string, release: () => void } {
+        let release!: () => void
+        const held = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        latches.push(release)
+        const job = queueOf().submit(operation, { user: 'test', uid: 0 }, () => held, { locks: [claim] })
+        return { id: job.id, release }
+      }
+
+      async function queuedBehind(id: string, progress: string): Promise<void> {
+        for (let i = 0; i < 200 && queueOf().get(id)?.status !== 'queued'; i++)
+          await new Promise(resolve => setTimeout(resolve, 5))
+        assert.equal(queueOf().get(id)?.status, 'queued', 'the restore waits')
+        assert.equal(queueOf().get(id)?.progress, progress)
+      }
+
+      it('a file backing whose dataset MOVED while the job waited fails the job STATE_CHANGED naming both paths — no volume, no targetcli, no stream', async () => {
+        await serveAnas()
+        const mock = mockOf()
+        mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: 'tank\t/tank\ntank/images\t/tank/images\n', stderr: '', exitCode: 0 } })
+        const payload = newLunBody(targetWith({ backing: { kind: 'file', dataset: 'tank/images' } }))
+        const code = await mint(payload)
+        const blocker = hold('iscsi.acl.add', iscsiTargetClaim(ANAS_IQN))
+        const res = await restore(payload, { 'x-anas-confirm': code })
+        assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+        const id = res.body.job!.id
+        await queuedBehind(id, `waiting for iscsi.acl.add (job ${blocker.id}) on iSCSI target ${ANAS_IQN}`)
+
+        // The dataset's mountpoint changed while the restore waited.
+        mock.prependFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: 'tank\t/tank\ntank/images\t/srv/images\n', stderr: '', exitCode: 0 } })
+        blocker.release()
+        const job = await waitForJob(id)
+        assert.equal(job.status, 'failed')
+        assert.equal(job.error?.code, 'STATE_CHANGED')
+        assert.match(job.error!.message, /was: \/tank\/images\/newvol\.raw; now: \/srv\/images\/newvol\.raw/)
+        assertNothingDestructive()
+      })
+
+      it('a pool PVE claims while the job waits refuses the guest-named backing IN THE JOB (the backing gate runs again) — no zfs create, no targetcli, no stream', async () => {
+        await serveAnas()
+        const payload = newLunBody(targetWith({ name: 'vm-101-disk-0' }))
+        const code = await mint(payload)
+        const blocker = hold('iscsi.acl.add', iscsiTargetClaim(ANAS_IQN))
+        const res = await restore(payload, { 'x-anas-confirm': code })
+        assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+        const id = res.body.job!.id
+        await queuedBehind(id, `waiting for iscsi.acl.add (job ${blocker.id}) on iSCSI target ${ANAS_IQN}`)
+
+        await writeFile(process.env.ANAS_STORAGE_CFG!, 'zfspool: local-zfs\n\tpool tank\n\tcontent images,rootdir\n')
+        blocker.release()
+        const job = await waitForJob(id)
+        assert.equal(job.status, 'failed')
+        assert.equal(job.error?.code, 'CONFLICT')
+        assert.match(job.error!.message, /guest volume/)
+        assertNothingDestructive()
+        assert.ok(!mockOf().calls.some(c => c.command === ZFS && c.args[0] === 'create'), 'no volume created')
+      })
+
+      it('a zvol restore holds the new volume\'s dataset keys (as a dataset create): a pool-namespace verb holding tank makes it wait, named', async () => {
+        await serveAnas()
+        mockOf().addFixture({ command: ZFS, args: volsizeArgs('tank/newvol'), result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
+        const code = await mint(newLunBody())
+        // The pool's guid cannot be read in this harness, so the volume's
+        // claims fall back to the pool's name key (§4.2) — what a destroy or
+        // export of `tank` holds.
+        const blocker = hold('zfs.pool.destroy', znameClaim('tank'))
+        const res = await restore(newLunBody(), { 'x-anas-confirm': code })
+        assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+        const id = res.body.job!.id
+        await queuedBehind(id, `waiting for zfs.pool.destroy (job ${blocker.id}) on the pool name 'tank'`)
+        assert.ok(!mockOf().calls.some(c => c.command === ZFS && c.args[0] === 'create'), 'nothing created while it waits')
+        blocker.release()
+        const job = await waitForJob(id)
+        assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      })
     })
   })
 })

@@ -234,8 +234,8 @@ file protects a pool [R].
 | backup repo create / update / delete (`backup.ts:348, 395, 471`) | none | CAS; delete IN_USE | CAS | the secret is written **before** the CAS can fail; IN_USE not re-run |
 | backup / cloud task run (`backup.ts:1200`, `cloud.ts:928`) | none | exists, run active (non-direct) | the direct run re-reads task, repo, source guard | — for direct runs |
 | image restore in place (`backup.ts:1643`) | `{target, serial, repo, snapshot, archive}` | served device, size, **sessions** | `reverifyServedLun` + size + sessions under the lock | **`target.enabled` comes from the RT object** and decides whether the target is disabled for the stream (`services/backup-restore.ts:639`) [C] |
-| image restore as a new LUN | `{target, lun, mode}`; snapshot, archive, backing unbound | target, name, backing | nothing | stale index and ACLs (audit #34) |
-| file restore | `{target, snapshot, archive, mode}`; **selections unbound** | PVE territory, LUN-held, writable, space | nothing | everything |
+| image restore as a new LUN | `{target, lun, mode}`; snapshot, archive, backing unbound | target, name, backing | nothing | stale index and ACLs (audit #34) — **closed by cr.40 (fresh target) and cr.54 (2026-10-16): one guard spec; the confirm signs the whole request + the backing path; LIO, target, name, backing and an unmoved-backing gate re-run in the job and under the lock before the map; the new volume's dataset keys (or the image directory's filesystem keys) beside the target key until the map** |
+| file restore | `{target, snapshot, archive, mode}`; **selections unbound** | PVE territory, LUN-held, writable, space | nothing | everything — **closed by cr.54 (2026-10-16): one guard spec; the confirm signs the whole request (selections, options, repo, namespace …) + the destination's revision (kind at the path, filesystem keys); territory (storage.cfg read fail-closed), LUN-held, kind, selection, writable and space re-run in the job; destination `zfs:`/`ahr:`/`mount:` keys shared** |
 | cloud remote update / delete (`cloud.ts:390, 485`) | retarget: `{remote, changes}` | encrypted, exists, references | existence/type under the lock | the retarget decision and references are not re-run |
 
 ### 2.5 Mounts, shares, identity
@@ -422,7 +422,11 @@ A job holds its locks only while ANAS itself is changing the object. Kernel-driv
   cache steps (`ahr:`) — the operator gets "waiting for zfs.replicate (job …)" instead of a send that dies
   mid-stream. *Restores are not claim holders: a file restore takes no source key (it is `{ lane: 'long' }`
   with no locks, routes/backup.ts:2728) and an image restore holds only its iSCSI keys — so nothing waits
-  on (or re-gates behind) one.*
+  on (or re-gates behind) one.* *(cr.54, 2026-10-16 — superseded for the DESTINATION: a restore still holds
+  no key on the PBS side, but the file restore holds its destination filesystem's `zfs:`/`ahr:`/`mount:` keys
+  shared for the run (`pathSourceClaims`, as a mover's source), and the new-LUN restore holds the new volume's
+  dataset keys (as `zfs.create`) or its image directory's filesystem keys beside `iscsi-target:<iqn>` until
+  the map. A destroy, rollback or unmount of the destination waits for the restore and re-gates after it.)*
 
 Locks do not fix a different starvation: four long data movers fill all 4 slots and a short destroy waits
 for a slot, not for a lock (Run Now holds two: the supervisor and the direct run, `queue.ts:147-151`). **Recommendation:** a
