@@ -142,9 +142,13 @@ describe('periodic scrub routes — ZFS property (Epic 17.5)', () => {
     mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['tank', 'rpool']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'org.debian:periodic-scrub', '--', 'tank'], result: { stdout: '-\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'org.debian:periodic-scrub', '--', 'rpool'], result: { stdout: 'disable\n', stderr: '', exitCode: 0 } })
-    // zfs set + any other zfs: command-only success. AHR reads fail (unmocked) →
-    // ahrPoolNames fail-opens to [] so GET returns only the ZFS pools.
+    // zfs set + any other zfs: command-only success.
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+    // An md-less node: /proc/mdstat ABSENT — coreutils cat's ENOENT line, exit 1,
+    // the one failed read that is honestly "no md arrays" (cr.33e) — so GET
+    // returns only the ZFS pools. (Since cr.63 any OTHER failed AHR read is a
+    // 503, never an empty list; see the AHR block.)
+    mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'cat: /proc/mdstat: No such file or directory', exitCode: 1 } })
   })
 
   afterEach(async () => {
@@ -227,7 +231,7 @@ describe('periodic scrub routes — ZFS property (Epic 17.5)', () => {
     assert.equal(res.statusCode, 400)
   })
 
-  it('PUT /scrub/ahr/:pool for an unknown AHR pool → 404 (AHR reads fail-open to [])', async () => {
+  it('PUT /scrub/ahr/:pool for an unknown AHR pool → 404 (an md-less node honestly has no AHR pools)', async () => {
     const res = await server.inject({ method: 'PUT', url: '/v1/scrub/ahr/ghost', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: true }) })
     assert.equal(res.statusCode, 404)
   })
@@ -379,6 +383,53 @@ describe('periodic scrub routes — AHR node-level anas-scrub timer (selfheal.4)
     })
     // Still no COMPLETION record — live progress does not create one.
     assert.equal(ahr.lastScrub, null)
+    await bare.close()
+  })
+
+  /**
+   * cr.63 (review L15): the dev-mock topology with ONE array's `mdadm --detail
+   * --export` exiting non-zero — the cr.33d failure mode (the stderr is
+   * injected and only echoed, never parsed; the exit code is the fact). The
+   * failing fixture is registered FIRST, so it wins over the captured r2 export.
+   */
+  function unreadableDetailServer() {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: { stdout: '', stderr: 'mdadm: cannot open /dev/md126: injected', exitCode: 1 } })
+    mockAhrTopologyExecutor(executor, mockFixtures.ahrMdstat())
+    executor.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
+    return { executor, server: Fastify({ logger: false }) }
+  }
+
+  it('cr.63 L15: GET /scrub with an unreadable AHR topology answers 503 naming the read — never a list without the AHR pool', async () => {
+    const { executor, server: bare } = unreadableDetailServer()
+    await bare.register(scrubRoutes, { prefix: '/v1', executor, jobQueue: new JobQueue(), systemdDir: unitDir })
+    const res = await bare.inject({ method: 'GET', url: '/v1/scrub' })
+    assert.equal(res.statusCode, 503, res.body)
+    assert.equal(res.json().error.code, 'UNAVAILABLE')
+    assert.equal(res.json().error.message, 'the AHR topology could not be read (mdadm --detail --export /dev/md126 exited 1: mdadm: cannot open /dev/md126: injected)')
+    await bare.close()
+  })
+
+  it('cr.63 L15: PUT /scrub/ahr/:pool with an unreadable AHR topology answers 503 naming the read — never 404 for a live pool, and no job', async () => {
+    const { executor, server: bare } = unreadableDetailServer()
+    const jobQueue = new JobQueue()
+    await bare.register(scrubRoutes, { prefix: '/v1', executor, jobQueue, systemdDir: unitDir })
+    const res = await bare.inject({ method: 'PUT', url: '/v1/scrub/ahr/ahr0', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: true }) })
+    assert.equal(res.statusCode, 503, res.body)
+    assert.equal(res.json().error.code, 'UNAVAILABLE')
+    assert.match(res.json().error.message, /^the AHR topology could not be read \(mdadm --detail --export \/dev\/md126 exited 1/)
+    assert.deepEqual(jobQueue.list(), [])
+    await bare.close()
+  })
+
+  it('cr.63 L15: a PERMISSION-DENIED /proc/mdstat is 503 too; only the absent file is "no AHR pools"', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'cat: /proc/mdstat: Permission denied', exitCode: 1 } })
+    const bare = Fastify({ logger: false })
+    await bare.register(scrubRoutes, { prefix: '/v1', executor, jobQueue: new JobQueue(), systemdDir: unitDir })
+    const res = await bare.inject({ method: 'PUT', url: '/v1/scrub/ahr/ahr0', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: true }) })
+    assert.equal(res.statusCode, 503, res.body)
+    assert.match(res.json().error.message, /cat \/proc\/mdstat exited 1: cat: \/proc\/mdstat: Permission denied/)
     await bare.close()
   })
 })

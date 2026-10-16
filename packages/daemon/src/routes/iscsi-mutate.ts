@@ -55,6 +55,7 @@ import {
   deleteIscsiTarget,
   growZvolLun,
   imageFilePath,
+  lunBackingClaims,
   newSerial,
   newTargetIqn,
   readIscsiState,
@@ -738,7 +739,18 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       operation: 'iscsi.lun.add',
       object: targetView(guardDeps, iqn, { seed: state, revision: false }),
       gates: [saveableGate, foreignGate, lunNameFreeGate(req.name), backingGate],
-      locks: async () => [iscsiTargetClaim(iqn)],
+      // §4.2 + cr.63 (review L17): the target's key, and the BACKING's keys
+      // shared — the zvol's dataset keys, or the keys of the filesystem the
+      // image lands on — so a dataset destroy, a pool export or destroy, an
+      // unmount of that filesystem waits for the add (and re-gates on a LUN
+      // that now holds it), and the add waits for any of them already running.
+      locks: async (o: TargetObject, _bound: unknown, reads: GuardReads) => {
+        const b = await backingOf(o, reads)
+        return [
+          iscsiTargetClaim(iqn),
+          ...('refusal' in b ? [] : await lunBackingClaims(executor, { kind: req.kind, backingPath: b.ok.path, ...(b.ok.dataset ? { dataset: b.ok.dataset } : {}) }, 'shared')),
+        ]
+      },
     }
     const pre = await guardCheck(spec)
     if ('refusal' in pre)
@@ -1042,8 +1054,10 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         }
       }),
       // cr.40 (§4.2): the target's key and the LUN's (a fileio resize unmaps
-      // and re-maps it in the target).
-      { locks: lunClaims(iqn, lun.serial) },
+      // and re-maps it in the target). cr.63 (review L17): and the backing's
+      // — a zvol grow is a `zfs set volsize` on the volume (exclusive, as the
+      // Datasets door's grow of the same volume), anything else shared.
+      { locks: [...lunClaims(iqn, lun.serial), ...await lunBackingClaims(executor, lun, zvolSizeGrow ? 'exclusive' : 'shared')] },
     )
 
     reply.code(202)
@@ -1088,7 +1102,13 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     // is bound as the scope: the object the operator agreed to destroy.
     const spec = lunDeleteSpec(guardDeps, iqn, index, destroyBacking, {
       seed: state,
-      locks: async ({ lun }) => lunClaims(iqn, lun?.serial ?? null),
+      // cr.63 (review L17): beside the target's and the LUN's keys, the
+      // backing's — EXCLUSIVE on the zvol for `destroyBacking` (it is a `zfs
+      // destroy` of the volume, as `zfs.destroy` takes it), shared otherwise.
+      locks: async ({ lun }) => [
+        ...lunClaims(iqn, lun?.serial ?? null),
+        ...(lun ? await lunBackingClaims(executor, lun, destroyBacking && lun.kind === 'zvol' ? 'exclusive' : 'shared') : []),
+      ],
     })
     const pre = await guardCheck(spec)
     if ('refusal' in pre)

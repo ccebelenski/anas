@@ -147,6 +147,8 @@ describe('cr.38 — the short AHR verbs re-gate in the job (ruling (j))', () => 
   let findmnt = FINDMNT_AHR0
   /** A command (by basename) that does not return until `until` settles — to look at a job mid-act. */
   let pauseAt: { command: string, until: Promise<void> } | null = null
+  /** Awaited before the AHR-shape `findmnt` answers (cr.63: hold a route between its gates and its submit). */
+  let beforeFindmnt: (() => Promise<void>) | null = null
 
   const ENV_KEYS = ['ANAS_ISCSI_CONFIGFS', 'ANAS_ISCSI_SYS_BLOCK', 'ANAS_ISCSI_SAVECONFIG', 'ANAS_STORAGE_CFG', 'ANAS_FSTAB_PATH', 'ANAS_AHR_INTENT_DIR'] as const
   const savedEnv: Partial<Record<typeof ENV_KEYS[number], string | undefined>> = {}
@@ -177,6 +179,7 @@ describe('cr.38 — the short AHR verbs re-gate in the job (ruling (j))', () => 
   /** The dev mock, its LIO tree the LUN-less capture, the AHR mount table routed through `findmnt`. */
   async function serve(initialFindmnt = FINDMNT_AHR0): Promise<void> {
     findmnt = initialFindmnt
+    beforeFindmnt = null
     await rm(configfs, { recursive: true, force: true })
     await materializeConfigfsManifest(LIO_NO_LUNS, configfs)
     await writeFile(fstab, `/dev/ahr0/ahr0-vol ${MOUNTPOINT} btrfs nofail 0 0\n`)
@@ -192,8 +195,11 @@ describe('cr.38 — the short AHR verbs re-gate in the job (ruling (j))', () => 
     calls = []
     mock.exec = async (command, args, opts) => {
       calls.push({ command, args })
-      if (basename(command) === 'findmnt' && args.join(' ') === AHR_FINDMNT_ARGS.join(' '))
+      if (basename(command) === 'findmnt' && args.join(' ') === AHR_FINDMNT_ARGS.join(' ')) {
+        if (beforeFindmnt)
+          await beforeFindmnt()
         return ok(findmnt)
+      }
       if (pauseAt && basename(command) === pauseAt.command)
         await pauseAt.until
       return orig(command, args, opts)
@@ -310,14 +316,68 @@ describe('cr.38 — the short AHR verbs re-gate in the job (ruling (j))', () => 
     await refusedInJob(id, release, 'CONFLICT', /expansion being driven right now/)
   })
 
-  it('destroy: an AHR job submitted on the pool between the confirm and the job refuses it (never its own record) — no mutating argv', async () => {
+  it('cr.63 L18: an AHR job submitted on the pool AFTER the confirmed destroy (a timer\'s scrub while it waits for a slot) does not refuse it — the destroy runs', async () => {
+    // Review L18: the job's re-check used to count every AHR job in flight on
+    // the pool but itself, so a scrub a timer submitted while the confirmed
+    // destroy waited for a slot failed the destroy "has a ahr.scrub job in
+    // flight". Only a job submitted BEFORE it is in its way now (the queue's
+    // own order, `findActive`'s `before:`). The newer job is the one that
+    // must lose: here it is a raw record that would sit in flight forever.
     await serve()
     const { id, release } = await confirmBehindFullQueue(DESTROY)
     let endScrub!: () => void
     const scrub = queue().submit('ahr.scrub', { user: 'u', uid: 0, params: { name: 'ahr0' } }, () => new Promise<void>((resolve) => {
       endScrub = resolve
     }))
-    const job = await refusedInJob(id, release, 'CONFLICT', new RegExp(`has a ahr\\.scrub job in flight \\(job ${scrub.id}\\)`))
+    release()
+    const job = await finished(id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(calls.some(isAhrMutation), 'the destroy acted')
+    assert.ok(['queued', 'running'].includes(queue().get(scrub.id)!.status), 'the newer job was in flight the whole time')
+    endScrub?.()
+  })
+
+  it('cr.63 L18: an AHR job submitted BEFORE the destroy\'s job — in the window after its route gates passed — still refuses it in the job, naming that job; never its own record', async () => {
+    await serve()
+    const first = await server!.inject({ method: DESTROY.method, url: DESTROY.url, headers: DESTROY.headers })
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED', first.body)
+    // Hold the four slots, then the confirmed resend between its gates and
+    // its submit: the route's last AHR-shape findmnt (the warnings' read, the
+    // second of the resend — the system-pool gate's is the first) waits until
+    // the older job exists.
+    let releaseSlots!: () => void
+    const held = new Promise<void>((resolve) => {
+      releaseSlots = resolve
+    })
+    for (let i = 0; i < 4; i++)
+      queue().submit('test.hold', { user: 'test', uid: 0 }, () => held)
+    let reads = 0
+    let openWindow!: () => void
+    const window = new Promise<void>((resolve) => {
+      openWindow = resolve
+    })
+    let letGo!: () => void
+    const go = new Promise<void>((resolve) => {
+      letGo = resolve
+    })
+    beforeFindmnt = async () => {
+      if (++reads === 2) {
+        openWindow()
+        await go
+      }
+    }
+    const resend = server!.inject({ method: DESTROY.method, url: DESTROY.url, headers: { ...DESTROY.headers, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string } })
+    await window
+    let endScrub!: () => void
+    const scrub = queue().submit('ahr.scrub', { user: 'u', uid: 0, params: { name: 'ahr0' } }, () => new Promise<void>((resolve) => {
+      endScrub = resolve
+    }))
+    letGo()
+    const res = await resend
+    assert.equal(res.statusCode, 202, res.body)
+    const id = (res.json() as JobAccepted).job.id
+    assert.equal(queue().get(id)?.status, 'queued')
+    const job = await refusedInJob(id, releaseSlots, 'CONFLICT', new RegExp(`^AHR pool 'ahr0' has a ahr\\.scrub job in flight \\(job ${scrub.id}\\)`))
     assert.ok(!job.error!.message.includes(id), 'the destroy never counts itself')
     endScrub?.()
   })

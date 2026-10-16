@@ -1,12 +1,12 @@
 import type { AhrPool, LastScrub, PeriodicScrubState, ScrubRunning } from '@anas/shared'
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import { AhrScrubToggleRequest, PoolName, ScrubToggleRequest } from '@anas/shared'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseScrubScans } from '../parsers/zpool-status.js'
-import { readAhrPools } from '../services/ahr-topology.js'
+import { AhrTopologyUnreadableError, readAhrPools } from '../services/ahr-topology.js'
 import { ForeignUnitError, scrubUnitsAreForeign } from '../services/scrub-schedule-units.js'
 import {
   ahrScrubRunning,
@@ -75,19 +75,23 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
     }
   }
 
-  /** Live AHR pools, topology and all (fail-open to []). */
+  /**
+   * Live AHR pools, topology and all. A topology that could not be READ throws
+   * {@link AhrTopologyUnreadableError} through to the caller, which answers 503
+   * (cr.63, review L15; cr.35's "unreadable is never empty"): before, a failed
+   * read was an empty list, so `GET /scrub` silently dropped every AHR pool and
+   * `PUT /scrub/ahr/:pool` answered 404 for a live one. A readable topology
+   * that names no AHR array — and an absent /proc/mdstat (cr.33e) — is still
+   * honestly no pools.
+   */
   async function ahrPools(): Promise<AhrPool[]> {
-    try {
-      return await readAhrPools(executor)
-    }
-    catch {
-      return []
-    }
+    return readAhrPools(executor)
   }
 
-  /** Live AHR pool names (fail-open to []). */
-  async function ahrPoolNames(): Promise<string[]> {
-    return (await ahrPools()).map(p => p.name)
+  /** The 503 a read that could not see the AHR topology answers (the routes/ahr.ts sentence). */
+  function ahrUnreadable(reply: FastifyReply, err: AhrTopologyUnreadableError): { error: { code: 'UNAVAILABLE', message: string } } {
+    reply.code(503)
+    return { error: { code: 'UNAVAILABLE', message: err.message } }
   }
 
   /**
@@ -108,10 +112,18 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
   }
 
   // --- GET /scrub — uniform periodic-scrub state across ZFS + AHR pools ------
-  server.get('/scrub', async () => {
-    const [zfsPools, ahr, scans, mdstat] = await Promise.all([
+  server.get('/scrub', async (_request, reply) => {
+    let ahr: AhrPool[]
+    try {
+      ahr = await ahrPools()
+    }
+    catch (err) {
+      if (err instanceof AhrTopologyUnreadableError)
+        return ahrUnreadable(reply, err)
+      throw err
+    }
+    const [zfsPools, scans, mdstat] = await Promise.all([
       zfsPoolNames(),
-      ahrPools(),
       zfsScrubScans(),
       // The node's md arrays — diffed against the AHR bands so a foreign array
       // (one ANAS's scrub never covers) is said in the note, never silent.
@@ -191,7 +203,16 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
     if (!identity)
       return
 
-    if (!(await ahrPoolNames()).includes(pool)) {
+    let ahr: AhrPool[]
+    try {
+      ahr = await ahrPools()
+    }
+    catch (err) {
+      if (err instanceof AhrTopologyUnreadableError)
+        return ahrUnreadable(reply, err)
+      throw err
+    }
+    if (!ahr.some(p => p.name === pool)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `AHR pool '${pool}' not found` } }
     }

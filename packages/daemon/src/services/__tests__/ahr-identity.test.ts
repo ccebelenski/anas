@@ -28,6 +28,7 @@ import {
   requireOwnedVgPvs,
   requirePoolVg,
 } from '../ahr-identity.js'
+import { AhrTopologyUnreadableError } from '../ahr-topology.js'
 
 /** The shipped lvm captures under `fixtures/ahr` — provenance in NOTES.md. */
 const AHR_FIXTURES = join(fileURLToPath(new URL('.', import.meta.url)), '../../fixtures/ahr')
@@ -648,6 +649,76 @@ describe('ahrNameOccupancy — create refuses an occupied name', () => {
     executor.addFixture({ command: '/usr/bin/lsblk', args: ['-J', '-o', 'NAME,PARTLABEL'], result: { stdout: JSON.stringify({ blockdevices: [] }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: { stdout: report('vg', []), stderr: '', exitCode: 0 } })
     assert.match((await ahrNameOccupancy(executor, 'anyname', { mdadmConfPath: conf })).join(' | '), /cannot read \/proc\/mdstat/)
+  })
+})
+
+/**
+ * cr.63 (review L15): the array list itself is never "nothing there" when its
+ * read failed. The world is the CAPTURED stage-0 node — `mdstat-clean.txt`
+ * (md126 + md127) and the two `--detail --export` captures (`ahr0-r2` on
+ * md126, `ahr0-r1` on md127); the one rewrite is the failure itself, a
+ * non-zero exit with an injected stderr that is echoed, never parsed.
+ */
+describe('cr.63 L15 — readNamedMdArrays: a read that could not see throws, never "no arrays"', () => {
+  let dir: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-l15-'))
+    await writeFile(join(dir, 'mdadm.conf'), '')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  const DETAIL_FAILED = { stdout: '', stderr: 'mdadm: cannot open /dev/md126: injected', exitCode: 1 }
+
+  /** The captured node; `detail126` answers md126's `--detail --export`, `mdstat` the cat. */
+  function capturedNode(opts: { detail126?: { stdout: string, stderr: string, exitCode: number }, mdstat?: { stdout: string, stderr: string, exitCode: number } } = {}): MockExecutor {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: opts.mdstat ?? { stdout: loadFixture('mdstat-clean.txt'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: opts.detail126 ?? { stdout: loadFixture('mdadm-export-r2.txt'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: { stdout: loadFixture('mdadm-export-r1.txt'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: { stdout: loadFixture('lvm-pvs.json'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: { stdout: loadFixture('lvm-vgs.json'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/lsblk', args: ['-J', '-o', 'NAME,PARTLABEL'], result: { stdout: JSON.stringify({ blockdevices: [] }), stderr: '', exitCode: 0 } })
+    return executor
+  }
+
+  it('control: the captured node reads both of ahr0\'s arrays', async () => {
+    const id = await readAhrPoolIdentity(capturedNode(), 'ahr0', { mdadmConfPath: join(dir, 'mdadm.conf') })
+    assert.deepEqual(id.arrays.map(a => `${a.kernelName}:r${a.band}`).sort(), ['md126:r2', 'md127:r1'])
+  })
+
+  it('a `--detail --export` that exits non-zero for ONE array throws the typed error naming it — the array is not silently left out of the pool', async () => {
+    await assert.rejects(
+      readAhrPoolIdentity(capturedNode({ detail126: DETAIL_FAILED }), 'ahr0', { mdadmConfPath: join(dir, 'mdadm.conf') }),
+      (err: unknown) => err instanceof AhrTopologyUnreadableError
+        && err.command === 'mdadm --detail --export /dev/md126'
+        && err.message === 'the AHR topology could not be read (mdadm --detail --export /dev/md126 exited 1: mdadm: cannot open /dev/md126: injected)',
+    )
+  })
+
+  it('an mdstat read that exits non-zero (Permission denied) throws — the pool is not "no arrays"', async () => {
+    await assert.rejects(
+      readAhrPoolIdentity(capturedNode({ mdstat: { stdout: '', stderr: 'cat: /proc/mdstat: Permission denied', exitCode: 1 } }), 'ahr0', { mdadmConfPath: join(dir, 'mdadm.conf') }),
+      (err: unknown) => err instanceof AhrTopologyUnreadableError && err.command === 'cat /proc/mdstat',
+    )
+  })
+
+  it('an ABSENT /proc/mdstat (cat\'s ENOENT line) is honestly no arrays (cr.33e) — no throw', async () => {
+    const id = await readAhrPoolIdentity(capturedNode({ mdstat: { stdout: '', stderr: 'cat: /proc/mdstat: No such file or directory', exitCode: 1 } }), 'ahr0', { mdadmConfPath: join(dir, 'mdadm.conf') })
+    assert.deepEqual(id.arrays, [])
+  })
+
+  it('ahrNameOccupancy: a superblock that could not be read REFUSES the name, naming the read — before, the name read free', async () => {
+    // Both arrays unreadable: nothing else on the node carries `ahr0`'s name
+    // (no pin, no label, and the captured VG list is swapped for an empty
+    // one), so a skipped read used to answer "free".
+    const executor = capturedNode({ detail126: DETAIL_FAILED })
+      .prependFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: { stdout: '', stderr: 'mdadm: cannot open /dev/md127: injected', exitCode: 1 } })
+      .prependFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: { stdout: report('vg', []), stderr: '', exitCode: 0 } })
+    const reasons = await ahrNameOccupancy(executor, 'ahr0', { mdadmConfPath: join(dir, 'mdadm.conf') })
+    assert.equal(reasons.length, 1, reasons.join(' | '))
+    assert.ok(reasons.some(r => r.endsWith('— the name cannot be confirmed free') && r.includes('could not be read (mdadm --detail --export /dev/md126 exited 1')), reasons.join(' | '))
   })
 })
 

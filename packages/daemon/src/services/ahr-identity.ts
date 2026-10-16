@@ -12,6 +12,10 @@ import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { isMdPvName, matchCachePartitionLabel, poolOfCacheLabel, UNKNOWN_PV_NAME } from './ahr-cache-state.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
 import { ahrArrayLinePool, DEFAULT_MDADM_CONF } from './ahr-mdadm-conf.js'
+// A runtime import cycle (ahr-topology imports this module too): safe, because
+// neither module touches the other's bindings at load time — the class is only
+// constructed inside readNamedMdArrays, long after both modules evaluated.
+import { AhrTopologyUnreadableError } from './ahr-topology.js'
 import { readConfig } from './config-writer.js'
 import { BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures } from './partition-device.js'
 
@@ -39,6 +43,10 @@ import { BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures } from './partition-
  *
  * Every reader fails CLOSED toward "not ours": an unreadable mdadm.conf is no
  * pins, an unreadable `pvs` is no PVs, an unreadable superblock is no UUID.
+ * The one exception is the ARRAY list itself (cr.63, review L15): an mdstat or
+ * `--detail` read that fails throws {@link AhrTopologyUnreadableError} rather
+ * than reading as "no arrays" — an array nobody could see is not an array that
+ * is not there, and a teardown that skipped it would act around a live array.
  * Destroy, cache detach, the boot recovery ladder and the topology merge all
  * go through here; create asks {@link ahrNameOccupancy} so a name that is
  * already in use on the node is never handed out twice.
@@ -60,6 +68,13 @@ const LSBLK_LABEL_ARGS = ['-J', '-o', 'NAME,PARTLABEL']
 
 /** mdadm UUID: four colon-separated groups of eight hex digits. */
 const MD_UUID_RE = /^[0-9a-f]{8}(?::[0-9a-f]{8}){3}$/i
+
+/**
+ * coreutils cat's line for an ABSENT /proc/mdstat — the one failed read that is
+ * honestly "no md arrays" (cr.33e). The twin of `CAT_MISSING_RE` in
+ * ahr-topology.ts (not exported there); the two must say the same.
+ */
+const MDSTAT_MISSING_RE = /No such file or directory/
 
 /** mdadm UUIDs compare case-insensitively; the canonical form is lowercase. */
 export function normalizeMdUuid(uuid: string): string {
@@ -165,20 +180,33 @@ export interface NamedMdArray {
 /**
  * Every live md array (mdstat discovers, `--detail --export` identifies —
  * GT-2/GT-3) whose superblock name matches `<pool>-r<N>`, foreign ones
- * included: callers filter with {@link isOwnedArray}. An unreadable mdstat is
- * an empty list.
+ * included: callers filter with {@link isOwnedArray}.
+ *
+ * A read that could not SEE never answers "nothing there" (cr.63, review L15 —
+ * the cr.33d rule `readAhrPools` already follows): a `/proc/mdstat` read that
+ * exits non-zero, or a `--detail --export` that exits non-zero for ANY array,
+ * throws {@link AhrTopologyUnreadableError} naming the read. Before, the first
+ * read an empty list and the second skipped the array — its empty detail
+ * matched no AHR name — so destroy, the create rollback, resume and the name
+ * check all saw a live array as absent. An ABSENT `/proc/mdstat` (cat's ENOENT
+ * line) is the one failed read that is honestly no arrays (cr.33e).
  */
 export async function readNamedMdArrays(executor: CommandExecutor, mdstatText?: string): Promise<NamedMdArray[]> {
   let text = mdstatText
   if (text === undefined) {
     const mdstatRes = await executor.exec(CAT, MDSTAT_CAT_ARGS)
-    if (mdstatRes.exitCode !== 0)
-      return []
+    if (mdstatRes.exitCode !== 0) {
+      if (MDSTAT_MISSING_RE.test(mdstatRes.stderr))
+        return []
+      throw new AhrTopologyUnreadableError('cat /proc/mdstat', mdstatRes.exitCode, mdstatRes.stderr)
+    }
     text = mdstatRes.stdout
   }
   const out: NamedMdArray[] = []
   for (const md of parseMdstat(text)) {
     const res = await executor.exec(MDADM, mdadmDetailExportArgs(`/dev/${md.kernelName}`))
+    if (res.exitCode !== 0)
+      throw new AhrTopologyUnreadableError(`mdadm --detail --export /dev/${md.kernelName}`, res.exitCode, res.stderr)
     const detail = parseMdadmDetailExport(res.stdout)
     const named = matchAhrArrayName(detail.name ?? detail.devName ?? '')
     if (!named)
@@ -663,7 +691,18 @@ export async function ahrNameOccupancy(
     reasons.push('cannot read /proc/mdstat — the name cannot be confirmed free')
   }
   else {
-    const arrays = (await readNamedMdArrays(executor, mdstatRes.stdout)).filter(a => a.pool === name)
+    // cr.63 (L15): an array whose superblock could not be read may carry the
+    // name — the name cannot be confirmed free (fail closed per source).
+    let named: NamedMdArray[] | null = null
+    try {
+      named = await readNamedMdArrays(executor, mdstatRes.stdout)
+    }
+    catch (err) {
+      if (!(err instanceof AhrTopologyUnreadableError))
+        throw err
+      reasons.push(`${err.message} — the name cannot be confirmed free`)
+    }
+    const arrays = (named ?? []).filter(a => a.pool === name)
     if (arrays.length > 0) {
       const list = arrays.map(a => `${a.pool}-r${a.band} (/dev/${a.kernelName})`).join(', ')
       reasons.push(`md array${arrays.length === 1 ? '' : 's'} ${list} already ${arrays.length === 1 ? 'uses' : 'use'} the name`)

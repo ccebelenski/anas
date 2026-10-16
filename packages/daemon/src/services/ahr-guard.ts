@@ -193,8 +193,18 @@ export function ahrGuard(deps: AhrGuardDeps) {
   /**
    * Every AHR job in flight on the pool, by operation family: destroy refuses
    * while any of them is queued or running (story ident.3 (d)) — at the route
-   * and, since cr.38, again in its own job. The job's own record is in
-   * flight too; it is recognised by the job id its lane carries and skipped.
+   * and, since cr.38, again in its own job.
+   *
+   * In the job only a job submitted BEFORE it counts (cr.63, review L18): the
+   * queue's own submission order (`findActive`'s `before:` option, cr.38 —
+   * the order the queue grants in, never wall time), the question the repair
+   * family's re-check already asks. A job submitted AFTER the destroy passed
+   * its route — a timer's scrub while the confirmed destroy waits for a slot —
+   * is not in the destroy's way: it queues behind the destroy's exclusive key
+   * and its own re-check finds the pool gone. Counting it refused a confirmed
+   * destroy for a job that could not have run first. The job's own record is
+   * never the answer either: the scan stops at it. At the route there is no
+   * job yet, so every job in flight counts.
    */
   function inFlightGate(operations: readonly string[]): Gate<AhrPool> {
     return async (pool) => {
@@ -204,8 +214,8 @@ export function ahrGuard(deps: AhrGuardDeps) {
       const self = currentLane().jobId
       for (const operation of operations) {
         for (const key of ['name', 'pool']) {
-          const busy = queue.findActive(operation, pool.name, key)
-          if (busy && busy.id !== self) {
+          const busy = queue.findActive(operation, pool.name, key, undefined, self ? { before: self } : {})
+          if (busy) {
             return {
               status: 409,
               code: 'CONFLICT',

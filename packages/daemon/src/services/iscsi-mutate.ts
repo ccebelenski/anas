@@ -45,18 +45,22 @@ import type {
   UpdateIscsiTargetRequest,
 } from '@anas/shared'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
+import type { LockClaim, LockMode } from '../jobs/locks.js'
 import type { IscsiPaths, IscsiReadContext } from './iscsi.js'
 import { randomUUID } from 'node:crypto'
 import { open, unlink, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { anasIqn, IscsiIqn } from '@anas/shared'
+import { zfsDatasetClaims } from '../safety/guard.js'
+import { readPoolGuid } from '../safety/stable-id.js'
 import { readAhrPools } from './ahr-topology.js'
 import { CONFIGFS_TARGET_ROOT, describeLunHolder, readMappedLuns } from './iscsi-configfs.js'
 import { computeIscsiHealth } from './iscsi-health.js'
 import { classifyBacking, ownershipFromInputs } from './iscsi-ownership.js'
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from './iscsi.js'
 import { assertNoSecretArgs as assertSecretArgShape, SecretOnArgvError } from './secret-argv.js'
+import { pathSourceClaims } from './source-claims.js'
 
 export { SecretOnArgvError }
 
@@ -1451,6 +1455,55 @@ export async function setLunWriteBack(
     'attribute',
     `emulate_write_cache=${writeBack ? 1 : 0}`,
   ])
+}
+
+// ---------------------------------------------------------------------------
+// The backing's lock keys (story cr.63, review L17)
+// ---------------------------------------------------------------------------
+
+/**
+ * The keys a LUN verb holds on its BACKING, beside its own `iscsi-target:`/
+ * `iscsi-lun:` keys (WAVE3-DESIGN §4.2: `zfs:` is taken by every verb on a
+ * dataset, `ahr:` by every verb on an AHR pool). Without them a LUN add, grow
+ * or delete and a dataset or pool verb on the same backing shared no key: a
+ * dataset destroy's LUN-held gate could pass before the add mapped the volume,
+ * and an export or destroy of the pool ran beside a LUN create on it.
+ *
+ *  - a zvol: the volume's dataset keys (`zfs:<pool guid>/<vol>` in `mode`, its
+ *    ancestors and the pool shared, the pool's name key shared — or, when the
+ *    pool guid cannot be read, the name key exclusive: §4.2's fallback, the
+ *    dataset verbs' own rule, {@link zfsDatasetClaims}). The caller passes
+ *    `exclusive` for the verbs that change the volume itself — a grow (`zfs
+ *    set volsize`, X at the Datasets door too) and `destroyBacking` (`zfs
+ *    destroy`, as `zfs.destroy`) — and `shared` for an add, a write-cache
+ *    change and a delete that keeps the volume;
+ *  - an image file: the keys of the filesystem it lives on, SHARED — the
+ *    dataset's `zfs:` keys or the AHR pool's `ahr:` key, and the `mount:` key
+ *    of its mount — through the data movers' one resolver ({@link
+ *    pathSourceClaims} of its directory, as the new-LUN image restore does,
+ *    cr.54). Shared even for `destroyBacking`: unlinking one file is a write
+ *    INSIDE the filesystem, like a mover's, and the verbs that must wait for it
+ *    (destroy, export, rollback, unmount of that filesystem) take its keys
+ *    exclusive already; an exclusive `ahr:` key would make deleting a LUN wait
+ *    for every backup of the whole pool. A path whose filesystem cannot be
+ *    resolved takes no key (the movers' fail-open; the backing gates have
+ *    already refused anything that is not ANAS storage);
+ *  - any other backing (a foreign block device LIO was pointed at): no key —
+ *    it is no object ANAS locks.
+ */
+export async function lunBackingClaims(
+  executor: CommandExecutor,
+  backing: { kind: string, backingPath: string, dataset?: string },
+  mode: LockMode,
+): Promise<LockClaim[]> {
+  if (backing.kind === 'zvol') {
+    const dataset = backing.dataset ?? zvolDataset(backing.backingPath)
+    const guid = await readPoolGuid(executor, dataset.split('/')[0]).catch(() => null)
+    return zfsDatasetClaims(guid?.guid, dataset, mode)
+  }
+  if (backing.kind === 'file')
+    return (await pathSourceClaims(executor, [dirname(backing.backingPath)], readAhrPools)).claims
+  return []
 }
 
 // ---------------------------------------------------------------------------

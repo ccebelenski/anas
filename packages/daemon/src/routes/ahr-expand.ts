@@ -3,13 +3,12 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { GuardSpec } from '../safety/guard.js'
+import type { GuardPass, GuardSpec } from '../safety/guard.js'
 import type { PlanBundle } from '../services/ahr-expand-resume.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { randomUUID } from 'node:crypto'
 import { AhrExpandRequest, AhrReplaceRequest, DiskId, PoolName } from '@anas/shared'
-import { confirmGate } from '../safety/gate.js'
-import { guardCheck, guardConfirm, guarded, refusalBody, sendRefusal } from '../safety/guard.js'
+import { guardCheck, guardConfirm, guarded, GuardReads, refusalBody, sendRefusal } from '../safety/guard.js'
 import { executeReadd } from '../services/ahr-expand-exec.js'
 // The §5.3 recompute-and-continue core is shared with the daemon boot scan
 // (services/ahr-boot-scan.ts) — ONE implementation, no drift (single source).
@@ -29,6 +28,15 @@ export const AHR_ABANDON_PRESENTATION_ONLY: Record<string, string> = {}
 
 /** The fields the re-add confirm leaves out of its signature (cr.38 session B): none. */
 export const AHR_READD_PRESENTATION_ONLY: Record<string, string> = {}
+
+/**
+ * Story cr.63 (review L21): the expand, replace and resume confirms left the
+ * legacy `confirmGate` — none of them leaves a request field out. A test lists
+ * them.
+ */
+export const AHR_EXPAND_PRESENTATION_ONLY: Record<string, string> = {}
+export const AHR_REPLACE_PRESENTATION_ONLY: Record<string, string> = {}
+export const AHR_EXPAND_RESUME_PRESENTATION_ONLY: Record<string, string> = {}
 
 export interface AhrExpandRouteOptions {
   executor: CommandExecutor
@@ -65,6 +73,26 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
   const guard = ahrGuard({ executor, intentDir, iscsiPaths: () => ({}) })
 
   // ---- shared helpers ------------------------------------------------------
+
+  /**
+   * The bound confirm of a door whose job runs on the expansion job's own
+   * guard (`expansionGuard`) rather than on `guarded` (story cr.63, review
+   * L21): the pool the route already read, bound to its IDENTITY — the
+   * family's `poolView` id, its sorted band array UUIDs plus its VG UUID — so a
+   * code minted for this pool is no code for a same-name pool destroyed and
+   * re-created inside the TTL (409 IDENTITY_MISMATCH), and `guardConfirm`
+   * signs the whole validated request beside it, naming a changed field in a
+   * 409 CONFIRM_SCOPE_CHANGED. `revision` binds a fact the request was
+   * computed from (resume: the intent it continues). The route's own reads
+   * and refusals stand as they were; nothing is re-read here.
+   */
+  async function boundPass(pool: AhrPool, operation: string, noun: string, revision?: string): Promise<{ spec: GuardSpec<AhrPool>, pre: GuardPass<AhrPool> } | { refusal: string }> {
+    const spec: GuardSpec<AhrPool> = { operation, object: guard.poolView(pool.name, noun), gates: [] }
+    const id = await spec.object.id(pool, new GuardReads())
+    if (!id)
+      return { refusal: spec.object.unbound('id') }
+    return { spec, pre: { object: pool, bound: { id, ...(revision !== undefined ? { revision } : {}) }, advisories: [], locks: [] } }
+  }
 
   async function loadPool(rawName: string, reply: FastifyReply): Promise<AhrPool | null> {
     const parsed = PoolName.safeParse(rawName)
@@ -310,9 +338,17 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     // operator may still want (replacing a failing disk with one of the same
     // size) — the gate itself is unchanged, only its message.
     const zeroGain = gainFor(pool, bundle, replace).zeroGain
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'ahr.expand',
-      params: { pool: pool.name, addDisks: body.addDisks ?? [], replace: replace ?? null },
+    // cr.63 (review L21): the bound confirm — the pool's identity and the whole
+    // validated request (`addDisks` absent ≡ [], `replace` absent ≡ null).
+    const bound = await boundPass(pool, 'ahr.expand', 'an expansion')
+    if ('refusal' in bound) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: bound.refusal } }
+    }
+    if (!guardConfirm(confirmStore, request, reply, bound.spec, bound.pre, {
+      validated: { pool: pool.name, addDisks: body.addDisks ?? [], replace: replace ?? null },
+      address: ['pool'],
+      presentationOnly: AHR_EXPAND_PRESENTATION_ONLY,
       message: zeroGain
         ? zeroGain.shortfall
         : `Expanding AHR pool '${pool.name}' starts an online reshape`,
@@ -375,9 +411,19 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       return { error: { code: 'CONFLICT', message: `${problems.join('; ')} — a missing disk is never treated as intent (§5.3); reattach it or Abandon the expansion.` } }
     }
     const joining = intent.approvedDisks.filter(id => !pool.disks.some(d => d.id === id))
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'ahr.expand.resume',
-      params: { pool: pool.name, intent: intent.id, approvedDisks: intent.approvedDisks },
+    // cr.63 (review L21): the request is the pool alone (no body); the pool's
+    // identity is the bound id and the intent it continues the revision —
+    // the intent carries the approved disks the warnings list, so another
+    // intent (another disk set) answers 409 STATE_CHANGED.
+    const bound = await boundPass(pool, 'ahr.expand.resume', 'a resume', intent.id)
+    if ('refusal' in bound) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: bound.refusal } }
+    }
+    if (!guardConfirm(confirmStore, request, reply, bound.spec, bound.pre, {
+      validated: { pool: pool.name },
+      address: ['pool'],
+      presentationOnly: AHR_EXPAND_RESUME_PRESENTATION_ONLY,
       message: `Resume the halted expansion of pool '${pool.name}'`,
       warnings: [
         ...joining.map(id => `${id} joins the pool: it is partitioned with the pool's band slices, and anything else on it is lost`),
@@ -526,9 +572,19 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     // not a mistake. The zero-gain fact is stated ONCE, as a warning, and the
     // headline swap stays on ahr.expand where growth IS the intent.
     const zeroGain = gainFor(pool, bundle, replace).zeroGain
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'ahr.replace',
-      params: { pool: pool.name, oldDiskId: replace.oldDiskId, newDiskId: replace.newDiskId },
+    // cr.63 (review L21): the pool's identity is the bound id; the request is
+    // the pool and the outgoing disk (the path, the object addressed) and the
+    // incoming disk (the body) — a resend naming another incoming disk is 409
+    // CONFIRM_SCOPE_CHANGED naming `newDiskId`.
+    const bound = await boundPass(pool, 'ahr.replace', 'a replace')
+    if ('refusal' in bound) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: bound.refusal } }
+    }
+    if (!guardConfirm(confirmStore, request, reply, bound.spec, bound.pre, {
+      validated: { pool: pool.name, oldDiskId: replace.oldDiskId, newDiskId: replace.newDiskId },
+      address: ['pool', 'oldDiskId'],
+      presentationOnly: AHR_REPLACE_PRESENTATION_ONLY,
       message: `Replacing disk '${replace.oldDiskId}' in pool '${pool.name}'`,
       warnings: [
         ...(zeroGain ? [zeroGain.shortfall] : []),

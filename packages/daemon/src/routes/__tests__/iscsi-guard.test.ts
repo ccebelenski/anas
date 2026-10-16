@@ -548,7 +548,7 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
     assert.deepEqual(calls.filter(isMutation), [])
   })
 
-  it('LUN delete: the job holds the target\'s key and the LUN\'s serial key, exclusive, while it runs', async () => {
+  it('LUN delete: the job holds the target\'s key and the LUN\'s serial key, exclusive, while it runs — and its backing\'s key (cr.63)', async () => {
     await serve(LIVE)
     const go = pauseTargetcli()
     const first = await inject(DELETE_LUN)
@@ -559,6 +559,11 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
     assert.deepEqual(queue().heldLocks(), [
       { key: `iscsi-target:${IQN}`, mode: 'exclusive', holders: [id] },
       { key: `iscsi-lun:${LUN0_SERIAL}`, mode: 'exclusive', holders: [id] },
+      // cr.63 (review L17): the zvol's keys. This harness answers no `zpool
+      // get guid` for gtiscsi, so the volume's pool is locked by its name key
+      // alone, exclusive — §4.2's guid fallback (cr.33b), the dataset verbs'
+      // own rule. The guid-keyed set is pinned in iscsi-backing-locks.test.ts.
+      { key: 'zname:gtiscsi', mode: 'exclusive', holders: [id] },
     ])
     go()
     assert.equal((await finished(id)).status, 'completed')

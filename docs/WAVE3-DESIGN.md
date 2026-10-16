@@ -396,7 +396,7 @@ serialise even though they have different guids.
 | `zname:<pool name>`, `ahrname:<name>` | create, import, export, destroy (both families) | X |
 | `ahr:<vg uuid>` | every AHR verb | X for destroy, mountpoint, remount, expand step, replace step, readd step, cache attach/detach, spare add/remove, snapshot rollback; S for scrub, repair block, snapshot create/delete, access, runs reading it |
 | `disk:<inventory by-id>` | every verb that writes a disk: ZFS create/add/attach/replace/cleanup, AHR create/expand/replace/spare/cache | X |
-| `iscsi-target:<iqn>`, `iscsi-lun:<serial>` | target and LUN verbs, image restore | X (the existing `withIscsiLock` stays inside for the `targetcli` section) |
+| `iscsi-target:<iqn>`, `iscsi-lun:<serial>` | target and LUN verbs, image restore | X (the existing `withIscsiLock` stays inside for the `targetcli` section). *(cr.63, review L17: LUN add, grow / write-cache change and delete ALSO hold their backing's keys — a zvol's `zfs:` dataset keys, X for a zvol grow and for `destroyBacking` on a zvol, S otherwise; an image file's filesystem keys (`zfs:`/`ahr:` and `mount:` of its directory, as a mover's source) always S — so a LUN verb and a dataset or pool verb on the same backing serialise)* |
 | `mount:<target path>` | mount verbs | X |
 | `share:smb:<section, case-folded>`, `share:nfs:<path>` | share verbs | X |
 | `uid:<n>`, `gid:<n>`, `idname:<name>` | identity verbs (`idname` for create) | X |

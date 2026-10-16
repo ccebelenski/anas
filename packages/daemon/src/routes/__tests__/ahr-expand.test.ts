@@ -17,7 +17,14 @@ import { diskLsblkArgs } from '../../services/ahr-expand-exec.js'
 import { readIntent, writeIntent } from '../../services/ahr-intent.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
-import { AHR_ABANDON_PRESENTATION_ONLY, AHR_READD_PRESENTATION_ONLY, ahrExpansionRoutes } from '../ahr-expand.js'
+import {
+  AHR_ABANDON_PRESENTATION_ONLY,
+  AHR_EXPAND_PRESENTATION_ONLY,
+  AHR_EXPAND_RESUME_PRESENTATION_ONLY,
+  AHR_READD_PRESENTATION_ONLY,
+  AHR_REPLACE_PRESENTATION_ONLY,
+  ahrExpansionRoutes,
+} from '../ahr-expand.js'
 
 const GIB = 1024 ** 3
 const MIB = 1024 ** 2
@@ -1018,5 +1025,155 @@ describe('cr.38 session B — expand, resume, replace and readd re-gate in the j
 
   it('the re-add confirm signs the whole request — no presentation-only fields', () => {
     assert.deepEqual(AHR_READD_PRESENTATION_ONLY, {})
+  })
+})
+
+/**
+ * Story cr.63 (review L21) — the expand, replace and resume confirms leave the
+ * legacy `confirmGate` for `guardConfirm`: the code is bound to the pool's
+ * IDENTITY (its band array UUIDs and its VG UUID, the family's `poolView` id)
+ * and signs the whole validated request, so a same-name pool destroyed and
+ * re-created inside the TTL is 409 IDENTITY_MISMATCH and a resend with any
+ * body field changed is 409 CONFIRM_SCOPE_CHANGED naming it — each with a
+ * fresh code and nothing submitted. Fixtures: this file's synthetic `tank`;
+ * the flips are md127/md126 answering new array UUIDs (re-created) and the
+ * harness's `vgs` answer carrying a `vg_uuid` that changes (a new VG under
+ * the same name, arrays unchanged).
+ */
+describe('cr.63 L21 — the expand, replace and resume confirms are bound', () => {
+  let dir: string
+  let executor: MockExecutor
+  let jobQueue: JobQueue
+  let server: ReturnType<typeof Fastify>
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-cr63-l21-'))
+    executor = buildExecutor()
+    jobQueue = new JobQueue()
+    server = Fastify({ logger: false })
+    await server.register(ahrExpansionRoutes, { prefix: '/v1', executor, jobQueue, confirmStore: new ConfirmStore(), diskIdentityCache: new DiskIdentityCache(executor), intentDir: dir })
+  })
+  afterEach(async () => {
+    await server?.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  function post(url: string, payload?: Record<string, unknown>, code?: string) {
+    return server.inject({ method: 'POST', url, headers: code ? { ...IDENTITY_HEADERS, 'x-anas-confirm': code } : IDENTITY_HEADERS, ...(payload ? { payload } : {}) })
+  }
+
+  /** Challenge `url`/`payload`; returns the minted code. */
+  async function challenge(url: string, payload?: Record<string, unknown>): Promise<string> {
+    const first = await post(url, payload)
+    assert.equal(first.statusCode, 409, first.body)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED', first.body)
+    return first.headers['x-anas-confirm-code'] as string
+  }
+
+  /** The resend was answered `code`, with a fresh code, and nothing was submitted or persisted. */
+  async function refusedResend(res: Awaited<ReturnType<typeof post>>, code: string): Promise<void> {
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, code, res.body)
+    assert.ok(res.headers['x-anas-confirm-code'], 'a fresh code')
+    assert.deepEqual(jobQueue.list(), [], 'no job')
+  }
+
+  /** `tank` destroyed and re-created under its name: both band arrays answer new UUIDs. */
+  function tankRecreated(): void {
+    executor.prependFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: exportFor('tank-r1', 'raid5', 3, 'dddddddd:dddddddd:dddddddd:dddddddd'), stderr: '', exitCode: 0 } })
+    executor.prependFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md126'], result: { stdout: exportFor('tank-r2', 'raid1', 2, 'eeeeeeee:eeeeeeee:eeeeeeee:eeeeeeee'), stderr: '', exitCode: 0 } })
+  }
+
+  /** The harness's `vgs` answer, with `tank`'s VG carrying `uuid`. */
+  function tankVgUuid(uuid: string): void {
+    executor.prependFixture({ command: '/usr/sbin/vgs', args: [...VGS_ARGS], result: { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', vg_uuid: uuid, pv_count: '2', lv_count: '1', vg_size: String(LV_SIZE), vg_free: '0' }, { vg_name: 'quad', pv_count: '1', lv_count: '1', vg_size: String(LV_QUAD_SIZE), vg_free: '0' }] }] }), stderr: '', exitCode: 0 } })
+  }
+
+  const EXPAND_URL = '/v1/ahr/tank/expand'
+  const REPLACE_URL = `/v1/ahr/tank/disk/${X}/replace`
+  const RESUME_URL = '/v1/ahr/tank/expand/resume'
+
+  it('expand: a resend with another disk set is 409 CONFIRM_SCOPE_CHANGED naming `addDisks` — nothing submitted', async () => {
+    const code = await challenge(EXPAND_URL, { addDisks: [S] })
+    const res = await post(EXPAND_URL, { addDisks: [W] }, code)
+    await refusedResend(res, 'CONFIRM_SCOPE_CHANGED')
+    assert.deepEqual(res.json().error.changed, ['addDisks'])
+    assert.equal(res.json().error.message, `You confirmed with addDisks ["${S}"]; this request has addDisks ["${W}"] — confirm again`)
+    assert.equal(await readIntent('tank', dir), null, 'no intent persisted')
+  })
+
+  it('expand: a resend that adds a declared replacement is 409 CONFIRM_SCOPE_CHANGED naming `replace`', async () => {
+    const code = await challenge(EXPAND_URL, { addDisks: [W] })
+    const res = await post(EXPAND_URL, { addDisks: [W], replace: { oldDiskId: X, newDiskId: E } }, code)
+    await refusedResend(res, 'CONFIRM_SCOPE_CHANGED')
+    assert.deepEqual(res.json().error.changed, ['replace'])
+  })
+
+  it('expand: the pool destroyed and re-created under its name between the challenge and the resend is 409 IDENTITY_MISMATCH — the code is no code for it', async () => {
+    const code = await challenge(EXPAND_URL, { addDisks: [S] })
+    tankRecreated()
+    await refusedResend(await post(EXPAND_URL, { addDisks: [S] }, code), 'IDENTITY_MISMATCH')
+    assert.equal(await readIntent('tank', dir), null, 'no intent persisted')
+  })
+
+  it('expand: a NEW volume group under the same name (the VG UUID alone moved) is 409 IDENTITY_MISMATCH', async () => {
+    tankVgUuid('aaaaaa-aaaa-aaaa-aaaa-aaaa-aaaa-aaaaaa')
+    const code = await challenge(EXPAND_URL, { addDisks: [S] })
+    tankVgUuid('bbbbbb-bbbb-bbbb-bbbb-bbbb-bbbb-bbbbbb')
+    const res = await post(EXPAND_URL, { addDisks: [S] }, code)
+    await refusedResend(res, 'IDENTITY_MISMATCH')
+    assert.equal(res.json().error.confirmed.vgUuid, 'aaaaaa-aaaa-aaaa-aaaa-aaaa-aaaa-aaaaaa')
+    assert.equal(res.json().error.current.vgUuid, 'bbbbbb-bbbb-bbbb-bbbb-bbbb-bbbb-bbbbbb')
+  })
+
+  it('expand: control — the unchanged resend is accepted (202)', async () => {
+    tankVgUuid('aaaaaa-aaaa-aaaa-aaaa-aaaa-aaaa-aaaaaa')
+    const code = await challenge(EXPAND_URL, { addDisks: [S] })
+    const res = await post(EXPAND_URL, { addDisks: [S] }, code)
+    assert.equal(res.statusCode, 202, res.body)
+    await waitForJob(jobQueue, res.json().job.id)
+  })
+
+  it('replace: a resend naming another incoming disk is 409 CONFIRM_SCOPE_CHANGED naming `newDiskId`', async () => {
+    const code = await challenge(REPLACE_URL, { newDiskId: W })
+    const res = await post(REPLACE_URL, { newDiskId: E }, code)
+    await refusedResend(res, 'CONFIRM_SCOPE_CHANGED')
+    assert.deepEqual(res.json().error.changed, ['newDiskId'])
+    assert.equal(res.json().error.message, `You confirmed with newDiskId "${W}"; this request has newDiskId "${E}" — confirm again`)
+  })
+
+  it('replace: the pool re-created under its name between the challenge and the resend is 409 IDENTITY_MISMATCH', async () => {
+    const code = await challenge(REPLACE_URL, { newDiskId: W })
+    tankRecreated()
+    await refusedResend(await post(REPLACE_URL, { newDiskId: W }, code), 'IDENTITY_MISMATCH')
+  })
+
+  it('replace: another OUTGOING disk (the path) is another object — a fresh challenge, not a run', async () => {
+    const code = await challenge(REPLACE_URL, { newDiskId: W })
+    await refusedResend(await post(`/v1/ahr/tank/disk/${Y}/replace`, { newDiskId: W }, code), 'CONFIRMATION_REQUIRED')
+  })
+
+  it('resume: the halted intent replaced by another expansion\'s between the challenge and the resend is 409 STATE_CHANGED — the other intent untouched', async () => {
+    await writeIntent('tank', mkIntent('halted'), { dir })
+    const code = await challenge(RESUME_URL)
+    const other = mkIntent('halted')
+    await writeIntent('tank', other, { dir })
+    await refusedResend(await post(RESUME_URL, undefined, code), 'STATE_CHANGED')
+    assert.equal((await readIntent('tank', dir))?.id, other.id)
+    assert.equal((await readIntent('tank', dir))?.state, 'halted', 'nothing flipped it to running')
+  })
+
+  it('resume: the pool re-created under its name between the challenge and the resend is 409 IDENTITY_MISMATCH', async () => {
+    await writeIntent('tank', mkIntent('halted'), { dir })
+    const code = await challenge(RESUME_URL)
+    tankRecreated()
+    await refusedResend(await post(RESUME_URL, undefined, code), 'IDENTITY_MISMATCH')
+    assert.equal((await readIntent('tank', dir))?.state, 'halted')
+  })
+
+  it('none of the three confirms leaves a request field out of the signature', () => {
+    assert.deepEqual(AHR_EXPAND_PRESENTATION_ONLY, {})
+    assert.deepEqual(AHR_REPLACE_PRESENTATION_ONLY, {})
+    assert.deepEqual(AHR_EXPAND_RESUME_PRESENTATION_ONLY, {})
   })
 })
