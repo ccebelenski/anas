@@ -418,6 +418,30 @@ describe('readAhrPools', () => {
     )
   })
 
+  it('an ABSENT /proc/mdstat (coreutils cat ENOENT, exit 1) is honestly no arrays, not unreadable (F1)', async () => {
+    // cat prints `cat: /proc/mdstat: No such file or directory` for a missing
+    // /proc/mdstat — the node has no md stack. PVE kernels build md in and the
+    // file exists (reads exit 0 with "unused devices: <none>" when there are no
+    // arrays), so this is belt-and-braces; a guest with no md reports none.
+    const noMd = new MockExecutor()
+    noMd.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'cat: /proc/mdstat: No such file or directory', exitCode: 1 } })
+    assert.deepEqual(await readAhrPools(noMd), [])
+  })
+
+  it('an EACCES-style mdstat read (Permission denied, exit 1) is UNREADABLE — only the absent-file shape is empty (F1)', async () => {
+    // The file EXISTS but could not be read: that is a failed read, not an
+    // absent md — "no pools" is a lie the topology cannot back.
+    const denied = new MockExecutor()
+    denied.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'cat: /proc/mdstat: Permission denied', exitCode: 1 } })
+    await assert.rejects(
+      readAhrPools(denied),
+      (err: unknown) => err instanceof AhrTopologyUnreadableError
+        && /cat \/proc\/mdstat/.test((err as AhrTopologyUnreadableError).command)
+        && (err as AhrTopologyUnreadableError).exitCode === 1
+        && /Permission denied/.test((err as Error).message),
+    )
+  })
+
   it('returns [] when the mdstat read answers and no array carries an AHR name (foreign, not ours)', async () => {
     const foreign = new MockExecutor()
     foreign.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: ok(loadFixture('mdstat-clean.txt')) })

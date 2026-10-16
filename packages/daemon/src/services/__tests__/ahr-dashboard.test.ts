@@ -14,7 +14,7 @@ import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { writeIntent } from '../ahr-intent.js'
-import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, buildAhrCapacityWarnings, buildAhrPoolBriefs, buildAhrWarnings, collectAhrPoolBriefs, collectAhrWarnings, readAhrPools } from '../ahr-topology.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, AhrTopologyUnreadableError, buildAhrCapacityWarnings, buildAhrPoolBriefs, buildAhrWarnings, collectAhrPoolBriefs, collectAhrWarnings, readAhrPools } from '../ahr-topology.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/ahr')
@@ -242,6 +242,18 @@ describe('collectAhrWarnings (fail-open source for GET /v1/status)', () => {
       },
     }
     assert.deepEqual(await collectAhrWarnings(throwing), [])
+  })
+
+  it('an UNREADABLE mdstat THROWS, never a silent no-warnings (F3)', async () => {
+    // No fixtures → cat answers `command not found`, exit 127: a topology that
+    // could not be seen. The typed error propagates so the route marks the
+    // 'ahr' section unavailable — "no warnings" would read as a healthy node
+    // (cr.35); the EVERY-OTHER-failure fail-open stays the test above.
+    await assert.rejects(
+      collectAhrWarnings(new MockExecutor()),
+      (err: unknown) => err instanceof AhrTopologyUnreadableError
+        && /cat \/proc\/mdstat/.test((err as AhrTopologyUnreadableError).command),
+    )
   })
 
   it('joins the persisted halted intent onto the live pool (one card)', async () => {
@@ -492,9 +504,24 @@ describe('collectAhrPoolBriefs (fail-open source for GET /v1/status)', () => {
     assert.deepEqual(await collectAhrPoolBriefs(throwing), [])
   })
 
-  it('reports [] when there are no AHR pools', async () => {
-    // An executor with no mdstat match → readAhrPools bails early → no pools.
-    assert.deepEqual(await collectAhrPoolBriefs(new MockExecutor()), [])
+  it('an UNREADABLE mdstat (no match → command-not-found 127) THROWS, never a silent [] (F3)', async () => {
+    // An executor with no fixtures answers cat `command not found`, exit 127:
+    // that is a read that could not see, not "no AHR pools" — the typed error
+    // must propagate so the route marks the section unavailable (cr.35).
+    await assert.rejects(
+      collectAhrPoolBriefs(new MockExecutor()),
+      (err: unknown) => err instanceof AhrTopologyUnreadableError
+        && /cat \/proc\/mdstat/.test((err as AhrTopologyUnreadableError).command),
+    )
+  })
+
+  it('reports [] when the READABLE topology has no AHR arrays — the read answered, empty', async () => {
+    // An md-less read that ANSWERED is honestly no pools: cat exits 0 with
+    // "unused devices: <none>" (the coordinator-proven md-less shape). Never a
+    // typed error, never a card — the readable-empty control to the throw above.
+    const noAhr = new MockExecutor()
+    noAhr.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: 'unused devices: <none>\n', stderr: '', exitCode: 0 } })
+    assert.deepEqual(await collectAhrPoolBriefs(noAhr), [])
   })
 
   it('derives briefs from the live healthy pool end to end', async () => {

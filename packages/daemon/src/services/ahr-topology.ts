@@ -46,8 +46,12 @@ import { isSubvolLayoutMount } from './ahr-snapshots.js'
  * sanctioned text exception) and identified via `--detail --export`
  * KEY=VALUE, tolerating both the bare and homehost-prefixed name forms.
  *
- * Everything is fail-open per pool: a missing layer (VG, LV, mount) degrades
- * that pool's report with advisories; it never throws the whole read away.
+ * Fail-open per pool: a missing layer below a discovered pool (VG, LV, mount)
+ * degrades that pool's report with advisories and never throws the read away.
+ * The one read that DOES fail the whole pass is the enumeration itself — a
+ * `cat /proc/mdstat` / `mdadm --detail --export` that could not see (D12) —
+ * except an ABSENT `/proc/mdstat`, which honestly means "no md arrays" (see
+ * {@link readAhrPools}).
  */
 
 const CAT = '/usr/bin/cat'
@@ -62,6 +66,9 @@ const FINDMNT = '/usr/bin/findmnt'
 const DMSETUP = '/usr/sbin/dmsetup'
 
 const MIB = 1024 ** 2
+
+/** coreutils `cat`'s stderr line for an ABSENT file — the md-stack-less /proc/mdstat shape (F1). */
+const CAT_MISSING_RE = /No such file or directory/
 
 /**
  * lsblk args for the AHR stack view: the FULL device tree (partitions → md →
@@ -455,7 +462,10 @@ function arrayState(md: MdstatArray): ArrayState {
  * READ (mode A) is the same fact and now rides the same typed error, so every
  * existing fail-open caller keeps working and the readers answer a sentence.
  * It is deliberately NOT thrown for a topology that IS readable but names no
- * AHR array (a foreign md): that is honestly "no pools", an empty list.
+ * AHR array (a foreign md): that is honestly "no pools", an empty list. An
+ * ABSENT `/proc/mdstat` (coreutils cat's ENOENT line, exit 1) is also NOT this
+ * error — no md stack is honestly "no arrays"; only a read that could not SEE
+ * throws.
  */
 export class AhrTopologyUnreadableError extends Error {
   constructor(
@@ -471,18 +481,33 @@ export class AhrTopologyUnreadableError extends Error {
 
 /**
  * Read every AHR pool from the live system. Returns schema-validated
- * {@link AhrPool} records; an empty list when no AHR arrays exist (or md is
- * absent entirely — the read answered and there is nothing, a guest). Throws
- * {@link AhrTopologyUnreadableError} when the topology could not be READ — a
- * non-zero exit of `cat /proc/mdstat` or of `mdadm --detail --export` for any
- * array (D12): a read that cannot see cannot assert "no ANAS pools". A
- * readable topology that names no AHR array (a foreign md) stays "not ours"
- * and returns `[]` — only a FAILED read is unreadable.
+ * {@link AhrPool} records; an empty list when no AHR arrays exist, when the
+ * readable topology names none (a foreign md — not ours), and when
+ * `/proc/mdstat` is ABSENT: the node has no md stack, honestly "no arrays".
+ * Throws {@link AhrTopologyUnreadableError} on every OTHER failed read — a
+ * non-zero exit of `cat /proc/mdstat` (Permission denied, an I/O error) or of
+ * `mdadm --detail --export` for any array (D12): a read that cannot see
+ * cannot assert "no ANAS pools"; only a FAILED read is unreadable. The absent
+ * case is belt-and-braces — PVE kernels build md in, so `/proc/mdstat`
+ * exists and reads exit 0 with "unused devices: <none>" when there are no
+ * arrays (coordinator-proven on the stunt node and the dev box).
  */
 export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: string): Promise<AhrPool[]> {
   const mdstatRes = await executor.exec(CAT, MDSTAT_CAT_ARGS)
-  if (mdstatRes.exitCode !== 0)
+  if (mdstatRes.exitCode !== 0) {
+    // An ABSENT /proc/mdstat — coreutils cat exits 1 printing
+    // `cat: /proc/mdstat: No such file or directory`, nothing else — is
+    // honestly "no md arrays": the node has no md stack, and a guest with no
+    // arrays reports none. PVE kernels build md IN, so on a real node the file
+    // exists and reads exit 0 with "unused devices: <none>" when there are no
+    // arrays (coordinator-proven on the stunt node and the dev box); this
+    // branch is belt-and-braces. EVERY other failed read — Permission denied,
+    // an I/O error — is a topology that could not be seen: it must not read
+    // as "no pools" either (D12).
+    if (CAT_MISSING_RE.test(mdstatRes.stderr))
+      return []
     throw new AhrTopologyUnreadableError('cat /proc/mdstat', mdstatRes.exitCode, mdstatRes.stderr)
+  }
   const mdArrays = parseMdstat(mdstatRes.stdout)
   if (mdArrays.length === 0)
     return []
@@ -1169,10 +1194,13 @@ export function buildAhrWarnings(pools: AhrPool[]): DashboardWarning[] {
 
 /**
  * Collect the dashboard 'ahr' warnings from the live topology + the per-pool
- * expansion intent, fail-open (mirrors how replication/mount/backup warnings
- * are wired into GET /v1/status): an AHR read error degrades this source to no
- * warnings, never the dashboard; an unreadable intent file degrades only that
- * pool's halted-expansion card.
+ * expansion intent. Fail-open per pool: an unreadable intent file degrades
+ * only that pool's halted-expansion card. The D12 topology-read failure — an
+ * unreadable mdstat / `--detail` — PROPAGATES as
+ * {@link AhrTopologyUnreadableError} so the route marks the 'ahr' section
+ * unavailable: a topology that could not be seen is never "no warnings"
+ * (cr.35). Every other read error keeps its fail-open — one source's failure
+ * never turns the dashboard into a 503 or a red section.
  */
 export async function collectAhrWarnings(
   executor: CommandExecutor,
@@ -1192,7 +1220,9 @@ export async function collectAhrWarnings(
     }))
     return buildAhrWarnings(withIntents)
   }
-  catch {
+  catch (err) {
+    if (err instanceof AhrTopologyUnreadableError)
+      throw err
     return []
   }
 }
@@ -1293,10 +1323,13 @@ export function buildAhrCapacityWarnings(briefs: AhrPoolBrief[]): DashboardWarni
 }
 
 /**
- * Collect the dashboard AHR pool briefs from the live topology, fail-open
- * (mirrors {@link collectAhrWarnings} and every other GET /v1/status source):
- * any AHR read error degrades this source to `[]`, never the dashboard. The
- * dashboard must never degrade because AHR is unreadable.
+ * Collect the dashboard AHR pool briefs from the live topology, fail-open for
+ * ordinary read errors (mirrors {@link collectAhrWarnings} and every other
+ * GET /v1/status source). The D12 topology-read failure PROPAGATES as
+ * {@link AhrTopologyUnreadableError} so the route marks the 'ahrPools'
+ * section unavailable — an empty Pools section must never read as "no AHR
+ * pools" when the topology could not be seen (cr.35). Every other read error
+ * still degrades this source to `[]`.
  */
 export async function collectAhrPoolBriefs(
   executor: CommandExecutor,
@@ -1306,7 +1339,9 @@ export async function collectAhrPoolBriefs(
   try {
     return buildAhrPoolBriefs((await readAhrPools(executor, mdadmConfPath)).map(decorate))
   }
-  catch {
+  catch (err) {
+    if (err instanceof AhrTopologyUnreadableError)
+      throw err
     return []
   }
 }

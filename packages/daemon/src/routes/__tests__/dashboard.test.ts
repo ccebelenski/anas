@@ -407,17 +407,15 @@ describe('GET /v1/status — AHR warnings (story 11.10, AHR-DESIGN §10)', () =>
     assert.ok(ahr[0].message.includes('Abandon'), 'names the Abandon verb')
   })
 
-  it('an AHR read error degrades the AHR source, never the dashboard (fail-open)', async () => {
+  it('an AHR topology read that could not see CARDS the AHR sections unavailable, never the dashboard (F3)', async () => {
     dir = mkdtempSync(join(tmpdir(), 'anas-ahr-dash-'))
-    // The AHR reader's first read (cat /proc/mdstat) THROWS; ZFS reads work.
-    class ThrowOnMdstat extends MockExecutor {
-      async exec(command: string, args: string[], opts?: Parameters<MockExecutor['exec']>[2]) {
-        if (command === '/usr/bin/cat')
-          throw new Error('boom')
-        return super.exec(command, args, opts)
-      }
-    }
-    const mock = new ThrowOnMdstat()
+    // The AHR reader's first read (cat /proc/mdstat) fails with the honest
+    // non-zero-exit shape of an unreadable topology — a real cat never throws,
+    // it exits 1 (EACCES-style stderr). The typed error must surface as the
+    // unavailable mark for both AHR sections, not as a silent empty source;
+    // ZFS reads work.
+    const mock = new MockExecutor()
+    mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'cat: /proc/mdstat: Permission denied', exitCode: 1 } })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
 
@@ -425,10 +423,34 @@ describe('GET /v1/status — AHR warnings (story 11.10, AHR-DESIGN §10)', () =>
     const summary = await fetchStatus(server)
     // The rest of the aggregate is intact — pools still reported…
     assert.ok(summary.pools.some(p => p.name === 'testpool'))
-    // …and the AHR source degraded to nothing, without failing the request.
+    // …and the AHR sources degraded to their empty shape, without failing the
+    // request — but no longer in silence: cr.35 says unreadable is never empty.
     assert.equal(summary.warnings.filter(w => w.category === 'ahr').length, 0)
-    // Both AHR sources fail-open independently — ahrPools is [], never absent.
     assert.deepEqual(summary.ahrPools, [])
+    const unavailable = summary.unavailable ?? []
+    assert.ok(unavailable.includes('ahr'), 'names the ahr section unavailable')
+    assert.ok(unavailable.includes('ahrPools'), 'names the ahrPools section unavailable')
+    // …and the card carries the "could not be read" sentence naming the read.
+    const card = summary.warnings.find(w => w.category === 'unavailable')
+    assert.ok(card && /AHR/.test(card.message), card?.message)
+    assert.ok(card && /could not be read/.test(card.message), card?.message)
+  })
+
+  it('an ABSENT /proc/mdstat is readable-empty at /status — no unavailable card for an md-less node (F1/F3)', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'anas-ahr-dash-'))
+    // coreutils cat's ENOENT shape: the node has no md stack, honestly no
+    // arrays. That is an empty read, not an unreadable one — it must never
+    // card as "unavailable" (a liar's card for an honest md-less node).
+    const mock = new MockExecutor()
+    mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'cat: /proc/mdstat: No such file or directory', exitCode: 1 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
+
+    server = await bareDashboardServer(mock, dir)
+    const summary = await fetchStatus(server)
+    assert.deepEqual(summary.ahrPools, [])
+    assert.deepEqual(summary.unavailable ?? [], [], 'an md-less node lists nothing as unavailable')
+    assert.equal(summary.warnings.filter(w => w.category === 'ahr').length, 0)
   })
 })
 
