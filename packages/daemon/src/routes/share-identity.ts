@@ -62,6 +62,47 @@ const NOLOGIN = '/usr/sbin/nologin'
 const SYSTEM_IDS = `uid/gid below ${SHARE_ID_MIN} or above ${SHARE_ID_MAX}`
 
 /**
+ * cr.58 (review L2, the §2 "System accounts … are never mutable" rule read
+ * for ACCOUNTS, not only numbers): the band alone let the node's own admin
+ * logins through — an operator's `adduser chris; usermod -aG sudo chris`
+ * account sits in the band, and disable (expiry locks its ssh and PVE @pam
+ * login), delete and an SMB password all ran on it. An account is also a
+ * system account when it administers the node: a member (primary or
+ * supplementary) of the root group or of a group named here — Debian's
+ * sudoers grants `%sudo`, `adm` is Debian's admin log group, `wheel` /
+ * `admin` the other distributions' spelling of the same — or a Proxmox VE
+ * login of the `pam` realm (`user:<name>@pam:` in /etc/pve/user.cfg; §2:
+ * ANAS-created users are "never PVE users"). The login SHELL is not a
+ * criterion: the common Samba recipe (`adduser bob; smbpasswd -a bob`)
+ * makes /bin/bash share users, and refusing them would strand every share
+ * user that predates ANAS while telling an admin login apart from them no
+ * better than these two facts do.
+ */
+const ADMIN_GROUPS = new Set(['root', 'sudo', 'adm', 'wheel', 'admin'])
+
+/** PVE's user list (pmxcfs); read, never written (§2 Shares & identities). */
+const PVE_USER_CFG = '/etc/pve/user.cfg'
+
+/** The user refusals' description of a system account (cr.58). */
+const SYSTEM_ACCOUNTS = `${SYSTEM_IDS}, members of an administrative group (${[...ADMIN_GROUPS].join(', ')}), and Proxmox VE @pam logins`
+
+/**
+ * The account names that are `pam`-realm PVE logins in a user.cfg text: its
+ * `user:<userid>:<enable>:…` lines whose userid ends in `@pam` (PVE allows
+ * one realm of type pam, named `pam`). Disabled logins count — they are the
+ * operator's records all the same.
+ */
+export function pamLogins(userCfg: string): Set<string> {
+  const names = new Set<string>()
+  for (const line of userCfg.split('\n')) {
+    const [kind, userid] = line.split(':')
+    if (kind === 'user' && userid !== undefined && userid.endsWith('@pam') && userid.length > '@pam'.length)
+      names.add(userid.slice(0, -'@pam'.length))
+  }
+  return names
+}
+
+/**
  * The primary gid of a user ANAS creates without naming one: with `-N`,
  * useradd(8) (shadow-utils 4.x) adds "the user to the group specified by the
  * -g option or by the GROUP variable in /etc/default/useradd", and
@@ -224,6 +265,13 @@ export interface ShareIdentityRouteOptions {
    */
   loginDefsPath?: string
   /**
+   * Absolute path to PVE's /etc/pve/user.cfg (default: that path): every
+   * user verb reads its `@pam` logins, which are system accounts (cr.58, L2).
+   * An ABSENT file (a node without pmxcfs, the dev mock) holds no login; one
+   * that cannot be read refuses 503.
+   */
+  pveUserCfgPath?: string
+  /**
    * Is `smbpasswd` present and executable on this node? Defaults to a real
    * access(X_OK) probe. The dev mock overrides it to `true` (nothing is ever
    * really spawned there), and tests override it to `false` to prove the
@@ -231,6 +279,9 @@ export interface ShareIdentityRouteOptions {
    */
   smbpasswdAvailable?: () => Promise<boolean>
 }
+
+/** A strict passdb read (cr.58): the entries, or why `pdbedit -L` could not list them. */
+type PassdbRead = { entries: PassdbEntry[] } | { unreadable: string }
 
 export async function shareIdentityRoutes(
   server: FastifyInstance,
@@ -302,6 +353,12 @@ export async function shareIdentityRoutes(
    * would otherwise 500 the whole Share Users list (issue #6). No passdb means
    * nobody holds an SMB password, and `smbEnabled: false` for everyone is the
    * honest answer.
+   *
+   * The LIST GETs only (`GET /identity/users`, `GET /identity/users/:name`;
+   * cr.58, review M4): a gate or a job that read this would take a transient
+   * `pdbedit` failure for "no entry" and skip `smbpasswd -d`, skip the
+   * `pdbedit -x` before `userdel`, or let a password land on another
+   * account's entry. Gates and jobs read {@link passdbForGuard}.
    */
   async function smbEntries(): Promise<PassdbEntry[]> {
     try {
@@ -309,6 +366,43 @@ export async function shareIdentityRoutes(
     }
     catch {
       return []
+    }
+  }
+
+  /**
+   * The Samba passdb as a gate or a job reads it (cr.58, review M4): STRICT.
+   * A `pdbedit -L` that ran and failed (exit non-zero — "tdb locked", a
+   * corrupt tdb — even with some lines printed, which would be a partial
+   * list) is `{ unreadable }`, never "no entries"; the gate that needs it
+   * refuses 503 and names the read. There is no passdb to keep consistent
+   * only when Samba is not installed: `smbAvailable()` false (the routes'
+   * issue #6 preflight), or `pdbedit` itself missing (ENOENT — it ships in
+   * the `samba` package with smbd, so nothing serves SMB logons without it;
+   * a missing binary is not a transient failure).
+   */
+  async function passdbForGuard(): Promise<PassdbRead> {
+    if (!(await smbAvailable()))
+      return { entries: [] }
+    let r: ExecResult
+    try {
+      r = await executor.exec(PDBEDIT, ['-L'])
+    }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+        return { entries: [] }
+      return { unreadable: err instanceof Error ? err.message : String(err) }
+    }
+    if (r.exitCode !== 0)
+      return { unreadable: r.stderr.trim() || `exit code ${r.exitCode}` }
+    return { entries: parsePdbeditEntries(r.stdout) }
+  }
+
+  /** The 503 of a gate that could not read the passdb (cr.58): names the read and what it could not check. */
+  function passdbUnreadable(detail: string, check: string): Refusal {
+    return {
+      status: 503,
+      code: 'UNAVAILABLE',
+      message: `ANAS could not read Samba's password database (pdbedit -L: ${detail}), so it cannot check ${check} — nothing was done`,
     }
   }
 
@@ -476,7 +570,8 @@ export async function shareIdentityRoutes(
       const r = await executor.exec(GETENT, ['group'])
       return r.exitCode !== 0 && !r.stdout.trim() ? null : parseGroups(r.stdout)
     }),
-    passdb: (reads: GuardReads) => reads.once('passdb', () => smbEntries()),
+    /** The Samba passdb, STRICT (cr.58, {@link passdbForGuard}): a gate never reads the fail-open list. */
+    passdb: (reads: GuardReads) => reads.once('passdb', () => passdbForGuard()),
     /** smb.conf's text; null when it could not be read (an ABSENT file reads as ''). */
     smbConf: (reads: GuardReads) => reads.once('smb.conf', async (): Promise<string | null> => {
       try {
@@ -490,6 +585,15 @@ export async function shareIdentityRoutes(
     exports: (reads: GuardReads) => reads.once('exports', async (): Promise<string | null> => {
       try {
         return await readConfig(exportsPath)
+      }
+      catch {
+        return null
+      }
+    }),
+    /** cr.58 (L2): the `@pam` PVE logins; null when user.cfg could not be read (an ABSENT file holds none). */
+    pveLogins: (reads: GuardReads) => reads.once('user.cfg', async (): Promise<Set<string> | null> => {
+      try {
+        return pamLogins(await readConfig(opts.pveUserCfgPath ?? PVE_USER_CFG))
       }
       catch {
         return null
@@ -536,6 +640,13 @@ export async function shareIdentityRoutes(
     local: boolean
     /** The delete only (cr.29d): the group userdel will remove with the user. */
     fate?: UserGroupFate
+    /**
+     * Enable, disable and delete (cr.58): the passdb as this guard run read
+     * it — the SMB half of the verb acts on it (`smbpasswd -d/-e`, `pdbedit
+     * -x`), and {@link passdbReadGate} refuses before the first act when it
+     * is unreadable.
+     */
+    passdb?: PassdbRead
   }
 
   /** {@link groupRemovedWithUser} on what the node has now (cr.29d). */
@@ -648,9 +759,58 @@ export async function shareIdentityRoutes(
 
   const localUserGate: Gate<UserObject> = async o => o.local ? null : directoryRefusal('user', o.name)
 
-  /** cr.3: the uid must be in the mutable share band (`isMutableShareId`). */
-  const mutableUserGate: Gate<UserObject> = async o =>
-    isMutableShareId(o.entry.uid) ? null : systemAccountRefusal('user', o.name, o.entry.uid)
+  /**
+   * What makes an in-band account a system account anyway (cr.58, L2; see
+   * {@link ADMIN_GROUPS}): `{ system }` the reason, `{ unreadable }` the
+   * database that could not be read (the caller refuses 503 — fail closed),
+   * null an account ANAS may change. The group database is read through
+   * NSS (initgroups does): a directory group can make a local account an
+   * administrator too.
+   */
+  async function adminAccountFact(entry: PasswdEntry, reads: GuardReads): Promise<{ system: string } | { unreadable: string } | null> {
+    const groups = await idReads.groupsStrict(reads)
+    if (groups === null)
+      return { unreadable: 'the group database (getent group)' }
+    const admin = groups.filter(g => (g.gid === 0 || ADMIN_GROUPS.has(g.name)) && (g.gid === entry.gid || g.members.includes(entry.name)))
+    if (admin.length > 0)
+      return { system: `it is a member of ${admin.map(g => `'${g.name}' (gid ${g.gid})`).join(', ')}, so it administers this node` }
+    const logins = await idReads.pveLogins(reads)
+    if (logins === null)
+      return { unreadable: `Proxmox VE's user list (${opts.pveUserCfgPath ?? PVE_USER_CFG})` }
+    if (logins.has(entry.name))
+      return { system: `it is a Proxmox VE login ('${entry.name}@pam')` }
+    return null
+  }
+
+  /**
+   * Is this account a system account (cr.3 band, cr.58 admin)? The refusal
+   * when it is — or a 503 when what decides it cannot be read. `act` is
+   * appended to the sentence when the refused account is not the verb's own
+   * object (a group member, L1).
+   */
+  async function systemUserRefusal(entry: PasswdEntry, reads: GuardReads, act = ''): Promise<Refusal | null> {
+    if (!isMutableShareId(entry.uid)) {
+      const band = systemAccountRefusal('user', entry.name, entry.uid)
+      return act ? { ...band, message: `${band.message}${act}` } : band
+    }
+    const fact = await adminAccountFact(entry, reads)
+    if (fact === null)
+      return null
+    if ('unreadable' in fact)
+      return { status: 503, code: 'UNAVAILABLE', message: `ANAS could not read ${fact.unreadable}, so it cannot check that user '${entry.name}' is not a system account — nothing was done` }
+    return {
+      status: 409,
+      code: 'SYSTEM_ACCOUNT',
+      message: `User '${entry.name}' (uid ${entry.uid}) is a system account: ${fact.system}. System accounts (${SYSTEM_ACCOUNTS}) are managed outside ANAS.${act}`,
+    }
+  }
+
+  /**
+   * cr.3: the uid must be in the mutable share band (`isMutableShareId`);
+   * cr.58 (L2): and the account must not administer the node — every user
+   * verb (SMB password, enable, disable, delete), at both doors.
+   */
+  const mutableUserGate: Gate<UserObject> = async (o, reads) => systemUserRefusal(o.entry, reads)
 
   /**
    * identity.3: smbpasswd lands on the entry Samba finds case-folded — when
@@ -659,7 +819,12 @@ export async function shareIdentityRoutes(
    * waits would otherwise take the password.
    */
   const passdbNotOwnedGate: Gate<UserObject> = async (o, reads) => {
-    const existing = passdbEntry(await idReads.passdb(reads), o.name)
+    // cr.58 (M4): an unreadable passdb is not "no entry" — smbpasswd would
+    // land on whatever entry Samba finds, another account's included.
+    const passdb = await idReads.passdb(reads)
+    if ('unreadable' in passdb)
+      return passdbUnreadable(passdb.unreadable, `that the SMB entry '${o.name}' would write is not another account's. The password was NOT changed`)
+    const existing = passdbEntry(passdb.entries, o.name)
     if (!existing || !passdbOwnedByOther(existing, o.entry.uid))
       return null
     return {
@@ -668,6 +833,28 @@ export async function shareIdentityRoutes(
       reason: 'passdb-entry-owned',
       message: `Samba's password database entry for '${o.name}' is stored as '${existing.stored}', which belongs to another account (uid ${existing.uid}). Samba matches user names case-insensitively, so '${o.name}' cannot hold its own SMB password. The password was NOT changed.`,
     }
+  }
+
+  /**
+   * cr.58 (review M4): enable, disable and delete act on the user's SMB entry
+   * (`smbpasswd -e/-d`, `pdbedit -x` before `userdel`), so a passdb that
+   * cannot be read refuses before the first act — at the route a 503, in the
+   * job a failed job with the same sentence — never a skipped SMB step.
+   */
+  function passdbReadGate(check: string): Gate<UserObject> {
+    return async o => o.passdb && 'unreadable' in o.passdb ? passdbUnreadable(o.passdb.unreadable, check) : null
+  }
+
+  /**
+   * The user's own SMB entry in a strict read: found case-folded the way
+   * smbpasswd / Samba find it (identity.1b), never one that belongs to
+   * another live account (identity.3). Null: none (or the read refused).
+   */
+  function ownSmbEntry(o: UserObject): PassdbEntry | null {
+    if (!o.passdb || 'unreadable' in o.passdb)
+      return null
+    const smb = passdbEntry(o.passdb.entries, o.name)
+    return smb && !passdbOwnedByOther(smb, o.entry.uid) ? smb : null
   }
 
   /** identity.1d / cr.30: a name a share still carries in any user-list parameter (hard, no bypass). */
@@ -768,17 +955,38 @@ export async function shareIdentityRoutes(
     return { status: 503, code: 'UNAVAILABLE', message: `ANAS could not read the account database (getent passwd), so it cannot check ${check} — nothing was done` }
   }
 
-  /** Members being ADDED must resolve (getent); removals need not. */
-  function membersResolveGate(add: string[]): Gate<GroupObject> {
-    return async (_o, reads) => {
-      if (add.length === 0)
+  /**
+   * Members being ADDED must resolve (getent); removals need not (a stale
+   * member line is removed by name). cr.58 (review L1): the group's gid is
+   * not the only id a members edit changes — every member that resolves,
+   * added or removed, passes the user verbs' system-account test on ITS
+   * account ({@link systemUserRefusal}: the band, an administrative group,
+   * a PVE @pam login). `gpasswd -a www-data media` handed pveproxy's account
+   * the share group's files; `gpasswd -d` of a service's or an admin's
+   * membership is the same system management, from the other side. A
+   * member is looked up by its exact name in `getent passwd` — what gpasswd
+   * resolves it to.
+   */
+  function membersGate(add: string[], remove: string[]): Gate<GroupObject> {
+    return async (o, reads) => {
+      if (add.length === 0 && remove.length === 0)
         return null
       const users = await idReads.users(reads)
       if (users === null)
-        return accountsUnreadable(`that ${add.join(', ')} exist`)
-      const known = new Set(users.map(u => u.name))
-      const missing = add.filter(u => !known.has(u))
-      return missing.length > 0 ? { status: 400, code: 'VALIDATION_ERROR', message: `Unknown user(s): ${missing.join(', ')}` } : null
+        return accountsUnreadable(`that ${[...add, ...remove].join(', ')} exist and are not system accounts`)
+      const byName = new Map(users.map(u => [u.name, u]))
+      const missing = add.filter(u => !byName.has(u))
+      if (missing.length > 0)
+        return { status: 400, code: 'VALIDATION_ERROR', message: `Unknown user(s): ${missing.join(', ')}` }
+      for (const [member, verb] of [...add.map(u => [u, 'added to'] as const), ...remove.map(u => [u, 'removed from'] as const)]) {
+        const entry = byName.get(member)
+        if (!entry)
+          continue
+        const refused = await systemUserRefusal(entry, reads, ` It cannot be ${verb} group '${o.name}' here.`)
+        if (refused)
+          return refused
+      }
+      return null
     }
   }
 
@@ -826,8 +1034,10 @@ export async function shareIdentityRoutes(
     const gates: Gate<UserObject>[] = [localUserGate, mutableUserGate]
     if (verb === 'smb-password')
       gates.push(sambaInstalledGate('The password was NOT changed.'), passdbNotOwnedGate)
+    if (verb === 'enable' || verb === 'disable')
+      gates.push(passdbReadGate(`whether '${name}' has SMB access to ${verb}`))
     if (verb === 'delete')
-      gates.push(userNotReferencedGate, userGroupGate)
+      gates.push(userNotReferencedGate, userGroupGate, passdbReadGate(`whether '${name}' has an SMB password entry to remove before userdel`))
     const goingGroup = (o: UserObject): GroupEntry | null => o.fate && 'group' in o.fate ? o.fate.group : null
     return {
       operation: verb === 'smb-password' ? 'identity.smbpasswd.set' : `identity.user.${verb}`,
@@ -840,6 +1050,8 @@ export async function shareIdentityRoutes(
           const object: UserObject = { name, entry, local: await isLocalUser(name) }
           if (verb === 'delete')
             object.fate = await userGroupFate(entry, reads)
+          if (verb !== 'smb-password')
+            object.passdb = await idReads.passdb(reads)
           return object
         },
         notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `User '${name}' not found` }),
@@ -884,14 +1096,14 @@ export async function shareIdentityRoutes(
 
   /**
    * The guard spec of a verb on an existing group: id the gid; gates local,
-   * band, then the added members resolve (members) or the primary-group use
-   * and the share references (delete); locks `gid:<n>`, the delete also the
-   * name key.
+   * band, then the added members resolve and no member added or removed is
+   * a system account (members, cr.58 L1) or the primary-group use and the
+   * share references (delete); locks `gid:<n>`, the delete also the name key.
    */
-  function groupGuardSpec(name: string, verb: GroupVerb, add: string[] = []): GuardSpec<GroupObject> {
+  function groupGuardSpec(name: string, verb: GroupVerb, add: string[] = [], remove: string[] = []): GuardSpec<GroupObject> {
     const gates: Gate<GroupObject>[] = [localGroupGate, mutableGroupGate]
     if (verb === 'members')
-      gates.push(membersResolveGate(add))
+      gates.push(membersGate(add, remove))
     if (verb === 'delete')
       gates.push(notPrimaryGroupGate, groupNotReferencedGate)
     return {
@@ -1442,7 +1654,12 @@ export async function shareIdentityRoutes(
       // another live account is never touched. Re-run in the job (cr.42): an
       // entry that appears while the job waits refuses before useradd.
       async (s, reads) => {
-        const existing = passdbEntry(await idReads.passdb(reads), s.name)
+        // cr.58 (M4): unreadable is not "no entry" — the new account could
+        // inherit an entry this gate never saw.
+        const passdb = await idReads.passdb(reads)
+        if ('unreadable' in passdb)
+          return passdbUnreadable(passdb.unreadable, `whether an SMB entry already answers to '${s.name}'. The user was NOT created`)
+        const existing = passdbEntry(passdb.entries, s.name)
         if (existing && passdbOwnedByOther(existing, null)) {
           return {
             status: 409,
@@ -1451,12 +1668,24 @@ export async function shareIdentityRoutes(
             message: `Samba's password database already holds an entry stored as '${existing.stored}', which belongs to another account (uid ${existing.uid}). Samba matches user names case-insensitively, so '${s.name}' could never hold its own SMB password. Pick a different name. The user was NOT created.`,
           }
         }
-        if (existing && existing.stored !== s.name && req.smbPassword === undefined) {
+        // cr.58 (review M5, audit #24): what is left is an orphan — no
+        // account answers to its stored name (uid unmapped) — WHATEVER its
+        // case. An exact-case one is worse than a guest session: the new
+        // account maps to it and logs in with the deleted account's SMB
+        // password. Refused (not purged in the job): the same rule and outs
+        // as the other-case orphan, and a create never removes a passdb
+        // record the operator did not name. With an SMB password the job
+        // replaces it (setSmbPasswordVerified; exact case: smbpasswd -a sets
+        // the new hash on that entry).
+        if (existing && req.smbPassword === undefined) {
+          const consequence = existing.stored === s.name
+            ? `A new account named '${s.name}' would take it over, and log in over SMB with the deleted account's password`
+            : `Samba would match it to '${s.name}' and turn its logons into guest sessions`
           return {
             status: 409,
             code: 'CONFLICT',
             reason: 'passdb-orphan',
-            message: `Samba's password database holds an orphan entry stored as '${existing.stored}' (its account no longer exists), which Samba would match to '${s.name}' and turn into a guest session. Set an SMB password in this dialog to replace it, or remove it first with: pdbedit -x -u ${existing.stored}. The user was NOT created.`,
+            message: `Samba's password database holds an orphan entry stored as '${existing.stored}' (its account no longer exists). ${consequence}. Set an SMB password in this dialog to replace it, or remove it first with: pdbedit -x -u ${existing.stored}. The user was NOT created.`,
           }
         }
         return null
@@ -1641,14 +1870,17 @@ export async function shareIdentityRoutes(
 
         // Toggle the SMB side only if the user actually has a passdb entry —
         // smbpasswd -d/-e errors on users with no entry, which is normal for a
-        // share user that never had an SMB password. On a node without samba
-        // smbEntries() fails open to empty, so this is skipped entirely.
+        // share user that never had an SMB password. The entry is the one
+        // this job's guard run read STRICTLY before usermod (cr.58, M4): an
+        // unreadable passdb refused the job there, so a transient pdbedit
+        // failure can no longer leave SMB live on a user the panel shows
+        // locked. Only a node without samba has no entries (skipped).
         // Found case-FOLDED (identity.1b) the way smbpasswd finds it — but an
         // entry that belongs to another live account is that account's to
         // toggle, never this one's (identity.3). The uid is the one the job
         // read (cr.42), never the request's.
-        const smb = passdbEntry(await smbEntries(), name)
-        if (smb && !passdbOwnedByOther(smb, o.entry.uid)) {
+        const smb = ownSmbEntry(o)
+        if (smb) {
           updateProgress(`${enabled ? 'Enabling' : 'Disabling'} SMB access for '${name}'`)
           const smb = await execSmbpasswd([enabled ? '-e' : '-d', name])
           if (smb.exitCode !== 0)
@@ -1736,9 +1968,11 @@ export async function shareIdentityRoutes(
 
     // exists → local → band (cr.3: `gpasswd -a <u> sudo` hands `u` the sudo
     // group — membership edits of system groups are system management,
-    // outside ANAS) → the members being added resolve — at the route and
-    // again in the job.
-    const spec = groupGuardSpec(name, 'members', add)
+    // outside ANAS) → the members being added resolve → no member added or
+    // removed is a system account (cr.58, L1: `gpasswd -a root media` /
+    // `gpasswd -a www-data media` changed system accounts through a share
+    // group) — at the route and again in the job.
+    const spec = groupGuardSpec(name, 'members', add, remove)
     const pre = await guardCheck(spec)
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
@@ -1801,10 +2035,10 @@ export async function shareIdentityRoutes(
     const goingGroup = fate && 'group' in fate ? fate.group : null
 
     // The passdb check is route-time for the WARNING (it describes what will
-    // happen); the job re-checks live so the `pdbedit -x` side stays honest
-    // if the passdb moves between the two.
-    const routeSmb = passdbEntry(await smbEntries(), name)
-    const hasSmb = routeSmb !== null && !passdbOwnedByOther(routeSmb, entry.uid)
+    // happen), read strictly by the guard run (cr.58: an unreadable passdb
+    // refused above); the job re-reads it so the `pdbedit -x` side stays
+    // honest if the passdb moves between the two.
+    const hasSmb = ownSmbEntry(pre.object) !== null
     const warnings = [
       `User '${name}' (uid ${entry.uid}) will be removed from the system`,
       leftOnFiles('uid', entry.uid),
@@ -1855,11 +2089,14 @@ export async function shareIdentityRoutes(
         // Unix account and fails on an orphan or case-mismatched entry, which
         // then blocked the delete. The entry is found case-folded (the one
         // Samba would use for this account); an absent one is skipped, and one
-        // that belongs to another live account is left alone. On a node
-        // without samba smbEntries() fails open to empty, so this is skipped.
+        // that belongs to another live account is left alone. The passdb is
+        // the one this job's guard run read STRICTLY (cr.58, M4): an
+        // unreadable one refused the job before this line, so userdel never
+        // runs past an SMB entry nobody saw (the orphan that M5's create
+        // would then inherit). Only a node without samba has no entries.
         let smbEntryRemoved = false
-        const smb = passdbEntry(await smbEntries(), name)
-        if (smb && !passdbOwnedByOther(smb, o.entry.uid)) {
+        const smb = ownSmbEntry(o)
+        if (smb) {
           updateProgress(`Removing SMB password entry for '${name}' (stored as '${smb.stored}')`)
           const dropped = await executor.exec(PDBEDIT, ['-x', '-u', smb.stored])
           if (dropped.exitCode !== 0)

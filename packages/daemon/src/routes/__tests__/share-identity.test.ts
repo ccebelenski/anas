@@ -534,6 +534,10 @@ describe('share-identity routes', () => {
       const line = 'media:*:1000:1000:Media User:/home/media:/usr/sbin/nologin\n'
       executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'media'], result: { stdout: line, stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd', 'media'], result: { stdout: line, stderr: '', exitCode: 0 } })
+      // cr.58 (L2): every user verb reads the group database (is media an
+      // administrator?) before the Samba preflight — the same lines the
+      // create test above serves.
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: { stdout: 'root:x:0:\nusers:x:100:\n', stderr: '', exitCode: 0 } })
       const res = await app.inject({
         method: 'POST',
         url: '/v1/identity/users/media/smb-password',

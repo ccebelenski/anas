@@ -131,6 +131,12 @@ numbered finding in this audit.
     Samba merges; ANAS can neither show nor delete it. Fix: reserve case-insensitively.
 24. #68 gap: an orphan passdb entry with the SAME case is inherited after `userdel` at the CLI.
     Fix: any folded entry with `uid===null` is an orphan; refuse or `pdbedit -x` before useradd.
+    **Closed 2026-10-16: cr.58 (review 2026-10-16 M5): a create with no SMB password refuses
+    409 `passdb-orphan` over an orphan of ANY case (the exact-case sentence names the takeover of
+    the deleted account's SMB password; the outs are an SMB password in the same dialog, which the
+    job sets on that entry, or `pdbedit -x -u <stored>`), at the route and again in the job; the
+    passdb read behind it is strict (M4), and the user delete no longer skips `pdbedit -x` on a
+    failed read, which is how ANAS itself left such orphans.**
 25. User/group delete never checks POSIX ACL grants (contrary to DESIGN.md); uid reuse inherits
     `u:<uid>` grants; `sharesReferencing` ignores `+group`, `write list`, `admin users`,
     `force user/group`. Fix: `getfacl -n` over managed mountpoints → 409.
