@@ -1,7 +1,8 @@
 import type { CloudProvider, CloudProviderOption, CloudRemote } from '@anas/shared'
 import type { CommandExecutor } from '../../executor/types.js'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -27,6 +28,7 @@ import {
   RemoteNotFoundError,
   remotesReferencing,
   removeRemote,
+  revealObscured,
   trimProviders,
   writeConfigFileAtomic,
   writeRemote,
@@ -483,6 +485,82 @@ describe('rclone-config: obscure (rclone.1)', () => {
     const mock = new MockExecutor()
     mock.addFixture({ command: RCLONE, args: [...rcloneBaseArgs('/etc/anas/rclone.conf'), 'obscure', '-'], result: { stdout: '', stderr: 'obscure: nope\n', exitCode: 1 } })
     await assert.rejects(obscure(mock, 'hunter2secret'), /rclone obscure failed: obscure: nope/)
+  })
+})
+
+// ── Reveal, IN PROCESS (cr.48f) ────────────────────────────────────────────
+//
+// `rclone reveal` takes its input only as a command-line argument (GT
+// 2026-09-23), so a subprocess reveal would put the value it decodes in `ps`
+// for the call's lifetime — `reveal -` does not read stdin (checked on the
+// local rclone and the node's: it decodes the literal `-` and fails). The
+// saved-remote probe therefore recovers the IsPassword plain text IN PROCESS
+// through `revealObscured` — rclone's `Reveal` reimplemented (the OBSCURE_KEY
+// table and the raw-URL-safe base64 + AES-256-CTR shape are read from
+// fs/config/obscure/obscure.go). These known-answer tests pin it to the REAL
+// binary's output so a drift in the key or the format fails here, never as a
+// silently-unmasked credential.
+
+describe('rclone-config: revealObscured — rclone\'s obscure format decoded IN PROCESS (cr.48f)', () => {
+  it('decodes real v1.74.3 obscurings — the coordinator\'s capture and the fresh plain shapes (space `+`, UTF-8)', () => {
+    // Each spelling is a REAL `rclone obscure -` output (the IV is random per
+    // run, so a captured spelling is deterministic); every one must recover its
+    // input exactly.
+    const pinned: [string, string][] = [
+      ['topsecret1', 'Sp0SC2lTn1lEc3b6AhZl7HttaRoEDLZhQgk'],
+      // A space AND a `+` — both raw in the plain, while the obscured spelling
+      // carries only rclone's URL-safe alphabet.
+      ['a space + plus', 'qEDCQLltGCnP2RUzZEnB8CKd37U_118zEwby8c36'],
+      // Multi-byte UTF-8 (ö, ✓).
+      ['héllo wörld ✓', '-EWXFNVdyMHBQm2tE2HKAq_nb03yQ_icDBQR9hX49C-0'],
+    ]
+    for (const [plain, obscured] of pinned)
+      assert.equal(revealObscured(obscured), plain, `the ${obscured} spelling must recover ${JSON.stringify(plain)}`)
+  })
+
+  it('rclone\'s OWN fixed-IV test vectors (fs/config/obscure/obscure_test.go, v1.74.3) — the empty value and `potato`', () => {
+    // The upstream suite's `TestReveal` cases, spelled exactly as the Go tests
+    // bind them: the empty plaintext and `potato` under two IVs.
+    for (const [plain, obscured] of [
+      ['', 'YWFhYWFhYWFhYWFhYWFhYQ'],
+      ['potato', 'YWFhYWFhYWFhYWFhYWFhYXMaGgIlEQ'],
+      ['potato', 'YmJiYmJiYmJiYmJiYmJiYp3gcEWbAw'],
+    ] as [string, string][])
+      assert.equal(revealObscured(obscured), plain)
+  })
+
+  it('a FRESH `rclone obscure -` round-trips IN PROCESS — every output decodes back to its input (skipped when the binary is absent)', (t) => {
+    if (!existsSync(RCLONE))
+      t.skip(`${RCLONE} is not on this host — the captured KATs above still pin the decoder`)
+    for (const value of ['topsecret1', 'second secret + value', 'münchen ✓', 'a'.repeat(64)]) {
+      const obscured = execFileSync(RCLONE, ['obscure', '-'], { input: value, encoding: 'utf-8' }).trim()
+      assert.equal(revealObscured(obscured), value, `a fresh obscuring of ${JSON.stringify(value)} must recover the plain`)
+    }
+  })
+
+  it('a value that is not a well-formed obscuring decodes to NOTHING, never a wrong plain', () => {
+    // Each arms one door of rclone's `Reveal`:
+    //  - the EMPTY value,
+    assert.equal(revealObscured(''), undefined)
+    //  - a character OUTSIDE the raw-URL-safe alphabet (`+`, `/`, `=`, a
+    //    space) is rejected before decode, so a stored name-rule PLAIN value
+    //    carrying one contributes nothing,
+    assert.equal(revealObscured('ab+/cd'), undefined)
+    assert.equal(revealObscured('ab/=cd'), undefined)
+    assert.equal(revealObscured('a b'), undefined)
+    //  - a base64 length Go's decoder rejects (x % 4 === 1 — a trailing 2-bit
+    //    group cannot express a whole byte),
+    assert.equal(revealObscured('aaaaa'), undefined)
+    //  - fewer than 16 decoded bytes (an obscuring is always IV + a plaintext
+    //    byte): a stored PLAIN s3 secret_access_key like `s3secretkeyvalue`
+    //    (16 chars → 12 bytes) never reaches the decrypt,
+    assert.equal(revealObscured('s3secretkeyvalue'), undefined)
+    //  - a plaintext that is NOT valid UTF-8 (Go's `string(buf)` is
+    //    byte-loose; the secrets ANAS stores are request strings, always
+    //    UTF-8): a REAL obscuring of the three invalid bytes ff 80 80,
+    //    captured from v1.74.3 — its plaintext is unprintable, so it must
+    //    contribute nothing rather than ride the mask as U+FFFD garbage.
+    assert.equal(revealObscured('_9nzU3FNEkRzuyl7H0khwKXEkA'), undefined)
   })
 })
 

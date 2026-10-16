@@ -992,6 +992,54 @@ describe('backup Run-Now supervision (Fix 1 — through the unit)', () => {
     assert.equal(failureDetailFromJournal(FAILED_JOURNAL), 'Error: permission check failed.')
   })
 
+  // cr.48f rule 2 — the supervisor/journal door. The backup unit's journal is
+  // written ONLY by the backup-task runner's own stdout/stderr: the `{task,
+  // result}` JSON on success/skipped, the error line on failure. The unit
+  // carries NO PBS secret in its environment (`renderServiceUnit` has no
+  // Environment line — the daemon resolves the credential at exec time), so
+  // the doctrine's "a pbc line echoing the credential it was handed" cannot be
+  // triggered AT this door, and the MASKED result (cr.48f rule 1) is exactly
+  // what the runner prints. The readers (parseHelperResult, superviseRun,
+  // failureDetailFromJournal, readRecentJournal) take the journal VERBATIM —
+  // they hold no secret at read time (it is read at run time, readRepoSecret),
+  // so they are not, and cannot be, a masking boundary. The residual is
+  // exactly that, and this test pins BOTH halves: the masked form round-trips
+  // to a [secret]-carrying supervised result, and a raw echo that ever reached
+  // the journal would surface unmasked (why the runner being the sole writer
+  // is the load-bearing fact).
+  it('cr.48f: a masked result round-trips the supervised Run-Now with no value, and the readers are verbatim, not a mask door', async () => {
+    const journal = [
+      '2026-10-16T01:00:00+0000 anas-pve anas-backup-nightly-etc[999]: {"task":"nightly-etc","result":{"status":"success","archives":["etc.pxar: had to backup 1.5 MiB (echoed [secret]) in 0.01 s"],"nofileWarning":"resource limit for open file handles low: 1024 ([secret])"}}',
+      '2026-10-16T01:00:00+0000 anas-pve systemd[1]: anas-backup-nightly-etc.service: Deactivated successfully.',
+    ].join('\n')
+    const exec = new ScriptedExecutor({
+      shows: [
+        { ActiveState: 'inactive', Result: 'success', InvocationID: 'OLD' },
+        { ActiveState: 'inactive', Result: 'success', ExecMainStatus: '0', InvocationID: 'NEW' },
+      ],
+      journal,
+    })
+    const res = await superviseRun(exec, 'nightly-etc', FAST)
+    assert.equal(res.status, 'success')
+    assert.ok(res.archives?.[0].includes('[secret]'))
+    assert.equal(res.archives?.[0].includes('run-side-secret'), false)
+    assert.ok(res.nofileWarning?.includes('[secret]'))
+    assert.equal(res.nofileWarning?.includes('run-side-secret'), false)
+    assert.equal(JSON.stringify(res).includes('run-side-secret'), false)
+
+    // The other half, pinned as the residual: the journal is returned AS-IS —
+    // a raw echo that ever reached it would surface unmasked, because the
+    // reader holds no secret to mask against.
+    assert.equal(
+      failureDetailFromJournal('2026-10-16T01:00:00+0000 anas-pve anas-backup-nightly-etc[999]: Error: authentication failed - echoed run-side-secret'),
+      'Error: authentication failed - echoed run-side-secret',
+    )
+    assert.equal(
+      parseHelperResult('2026-10-16T01:00:00+0000 anas-pve anas-backup-nightly-etc[999]: {"task":"nightly-etc","result":{"status":"success","archives":["docs.pxar: had to backup run-side-secret in 0.01 s"]}}')?.archives?.[0],
+      'docs.pxar: had to backup run-side-secret in 0.01 s',
+    )
+  })
+
   it('running → success: starts the unit, polls to completion, recovers stats', async () => {
     const exec = new ScriptedExecutor({
       shows: [

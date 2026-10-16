@@ -469,6 +469,52 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(JSON.stringify(job).includes('token-secret-value'), false)
   })
 
+  // cr.48f — the last sweep: the SUCCESS-path strings `parseBackupProgress`
+  // extracts (the archive stats, the nofile warning, the target line, image
+  // sources, skip paths) land in job.result, the progress line and the 16.12
+  // notification body. A backend that quotes the credential it was handed into
+  // ONE of them must meet `[secret]` in EVERY one, from the single masking pass
+  // at the parser — cr.48b/c/d/e masked the read results, the errors and the
+  // failure detail; this is the first run whose `completed` record is checked
+  // end to end. No retention on the task: a prune's own progress lines would
+  // overwrite the summary line the assertion reads.
+  it('cr.48f: a run whose SUCCESS stderr echoes the repo secret leaves [secret] in job.result and the progress line — the whole job record and the notification body carry no value', async () => {
+    await createRepo()
+    await createTaskPayload(TASK)
+    const leakedStderr = [
+      'Starting backup: [anastest]:host/anas-pve/2026-07-19T01:07:07Z',
+      'Upload directory \'/etc\' to \'root@pam@localhost:8007:anastest-store\' as etc.pxar.didx',
+      'etc.pxar: had to backup 82.957 KiB of 82.957 KiB (echoed token-secret-value) in 0.01 s',
+      'resource limit for open file handles low: 1024 (remember token-secret-value)',
+      'Duration: 0.12s',
+    ].join('\n')
+    const mock = mockOf(server)
+    mock.addFixture({ command: '/usr/bin/prlimit', args: RETAINED_BACKUP_ARGS, result: { stdout: '', stderr: leakedStderr, exitCode: 0 } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    const result = job.result as { archives?: string[], nofileWarning?: string }
+    assert.match(result.archives?.[0] ?? '', /etc\.pxar: had to backup.*\[secret\]/)
+    assert.equal(result.archives?.[0].includes('token-secret-value'), false, result.archives?.[0])
+    assert.match(result.nofileWarning ?? '', /\[secret\]/)
+    assert.equal((result.nofileWarning ?? '').includes('token-secret-value'), false)
+    // The job's LAST progress line is the parser's summary — the no-retention
+    // task has no prune progress to overwrite it with.
+    assert.match(job.progress ?? '', /\[secret\]/)
+    assert.equal((job.progress ?? '').includes('token-secret-value'), false, job.progress ?? '')
+    // The WHOLE job record — result, progress, params, everything — carries no value.
+    assert.equal(JSON.stringify(job).includes('token-secret-value'), false)
+
+    // The notification builder embeds the archives, the Note (nofile) and the
+    // Snapshot target verbatim; with the parser's single pass the body the
+    // operator would receive is clean too.
+    const detailRes = await server.inject({ method: 'GET', url: '/v1/backup/tasks/nightly-etc', headers: IDENTITY })
+    const task = (detailRes.json() as { data: { task: BackupTask } }).data.task
+    const body = buildBackupNotifyBody({ task, result: result as BackupNotifyResult })
+    assert.match(body, /\[secret\]/)
+    assert.equal(body.includes('token-secret-value'), false)
+  })
+
   it('a task with NO retention never invokes prune at all', async () => {
     await createRepo()
     await createTask()

@@ -612,3 +612,116 @@ describe('rclone-probe: the crypt captures (cloudproof.2, 0.4.1)', () => {
     assert.ok(!CRYPT_UNDECRYPTABLE_RE.test(EMPTY_STDERR), 'the empty-base capture does not')
   })
 })
+
+// ── cr.48f rule 3: a SAVED remote's own credentials seed the probe's mask ──
+//
+// The cr.48b blind spot: the saved branch ran the mask empty because its
+// credentials live in rclone.conf and were never loaded. The daemon CAN
+// recover the plain values cheaply, IN PROCESS — name-rule secrets are stored
+// plain, and an IsPassword value is `rclone obscure`'d, the plain text
+// recovered through `revealObscured` (rclone's own `Reveal` reimplemented
+// beside the write path, KAT-pinned in rclone-config.test.ts; `rclone reveal
+// <value>` — which takes its input ONLY as an argument — is the OPERATOR's
+// door, module-header GT fact 3, never a door this daemon opens) — so the
+// stored section seeds the mask + argv guard at probe time. NO new rclone
+// invocation rides the request path: the decode is in-process, so no stored or
+// recovered credential ever touches an argv — pinned below by recording every
+// executor call and grepping it for each stored and decoded value.
+
+describe('rclone-probe: the saved-remote probe masks against its own stored credentials (cr.48f)', () => {
+  let dir: string
+  let configFile: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(TMP_BASE, 'cr48f-store-'))
+    configFile = join(dir, 'rclone.conf')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('an IsPassword value is decoded IN PROCESS, and the stored + decoded forms both leave nothing — no executor call carries either on its argv', async () => {
+    // A REAL obscuring of `topsecret1` (captured from rclone v1.74.3 — the IV
+    // is random per run, but the spelling as written is deterministic, and the
+    // KAT pins `revealObscured` against it; here the saved section stores it
+    // and the probe's mask must cover BOTH spellings rclone could echo).
+    const obscuredSpelling = 'Sp0SC2lTn1lEc3b6AhZl7HttaRoEDLZhQgk'
+    const plain = 'topsecret1'
+    await writeFile(configFile, `[gtsftp]\ntype = sftp\nhost = 127.0.0.1\nuser = u\npass = ${obscuredSpelling}\n`, 'utf-8')
+    // The backend quotes the PLAIN credential it was handed — exactly the echo
+    // cr.48b masked for the dialog's values and rule 3 now masks for a saved
+    // remote's.
+    const echo = `Failed to create file system for "gtsftp:": NewFs: couldn't connect SSH: 401 Unauthorized (token ${plain})`
+    const calls: { command: string, args: string[] }[] = []
+    const exec = async (command: string, args: string[]): Promise<ExecResult> => {
+      calls.push({ command, args })
+      if (command === '/usr/bin/timeout')
+        return { stdout: '', stderr: `${echo}\n`, exitCode: 1 }
+      throw new Error(`unexpected call: ${command} ${args.join(' ')}`)
+    }
+    const r = await testRemote(stubExecutor(exec), { configFile }, { name: 'gtsftp' })
+    assert.equal(r.verdict, 'auth', 'the taxonomy still ran on the raw text')
+    assert.ok(r.message.includes('[secret]'), r.message)
+    assert.ok(!r.message.includes(plain), r.message)
+    // The decode is IN PROCESS: the probe is the ONE executor call, and no
+    // call — stored form or decoded form — rides an argv.
+    assert.equal(calls.length, 1)
+    for (const c of calls) {
+      for (const a of c.args)
+        assert.ok(!a.includes(obscuredSpelling) && !a.includes(plain), `a credential rode an argv token: ${a}`)
+    }
+  })
+
+  it('a name-rule secret stored PLAIN (s3 secret_access_key) is masked from the stored value alone — a value that is not a well-formed obscuring decodes to NOTHING', async () => {
+    await writeFile(configFile, '[gt]\ntype = s3\nsecret_access_key = s3secretkeyvalue\n', 'utf-8')
+    const echo = 'AccessDenied: the access key s3secretkeyvalue is not valid'
+    const calls: { command: string, args: string[] }[] = []
+    const exec = async (command: string, args: string[]): Promise<ExecResult> => {
+      calls.push({ command, args })
+      if (command === '/usr/bin/timeout')
+        return { stdout: '', stderr: `${echo}\n`, exitCode: 1 }
+      throw new Error(`unexpected call: ${command} ${args.join(' ')}`)
+    }
+    const r = await testRemote(stubExecutor(exec), { configFile }, { name: 'gt' })
+    assert.equal(r.verdict, 'auth')
+    assert.ok(r.message.includes('[secret]'), r.message)
+    assert.ok(!r.message.includes('s3secretkeyvalue'), r.message)
+    // `s3secretkeyvalue` is inside rclone's raw-URL-safe base64 alphabet, so it
+    // reaches the decode — but it is 16 chars → 12 bytes, fewer than the 16-byte
+    // IV, so `revealObscured` returns nothing and the STORED text does the
+    // masking. The probe stays the only call, nothing on an argv.
+    assert.equal(calls.length, 1)
+    for (const c of calls) {
+      for (const a of c.args)
+        assert.ok(!a.includes('s3secretkeyvalue'), `a credential rode an argv token: ${a}`)
+    }
+  })
+
+  it('a boolean option (ask_password = true) is never a secret — the word `true` is not shredded, the decoded IsPassword still is', async () => {
+    // A REAL obscuring of `gtpass` (captured from rclone v1.74.3): the decoded
+    // plain is the form the mask must cover, the boolean literal must not.
+    await writeFile(configFile, '[gtsftp]\ntype = sftp\nhost = h\nuser = u\npass = -UHN1nBu7Yj3jQ11eG7NixuTyxrbmw\nask_password = true\n', 'utf-8')
+    const echo = 'Failed to create file system for "gtsftp:": NewFs: couldn\'t connect SSH: ssh: handshake failed: "the server asks for a password" is true, but none provided (gtpass)'
+    const calls: { command: string, args: string[] }[] = []
+    const exec = async (command: string, args: string[]): Promise<ExecResult> => {
+      calls.push({ command, args })
+      if (command === '/usr/bin/timeout')
+        return { stdout: '', stderr: `${echo}\n`, exitCode: 1 }
+      throw new Error(`unexpected call: ${command} ${args.join(' ')}`)
+    }
+    const r = await testRemote(stubExecutor(exec), { configFile }, { name: 'gtsftp' })
+    assert.equal(r.verdict, 'auth')
+    // If `true` had been put in the mask as ask_password's value, ordinary
+    // text like "… is true, but …" would be shredded — it is not.
+    assert.ok(r.message.includes('is true, but none provided'), r.message)
+    // The decoded IsPassword plain IS masked (4-char floor cleared).
+    assert.equal(r.message.includes('gtpass'), false, r.message)
+    assert.ok(r.message.includes('[secret]'), r.message)
+    // Only the probe runs; the decoded plain `gtpass` never rides an argv.
+    assert.equal(calls.length, 1)
+    for (const c of calls) {
+      for (const a of c.args)
+        assert.ok(!a.includes('gtpass') && !a.includes('-UHN1nBu7Yj3jQ11eG7NixuTyxrbmw'), `a credential rode an argv token: ${a}`)
+    }
+  })
+})

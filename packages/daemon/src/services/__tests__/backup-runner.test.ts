@@ -494,3 +494,55 @@ describe('cr.48e — the test verdict\'s detail is masked against the secret the
     assert.match(raw.detail ?? '', /probe-side-secret/)
   })
 })
+
+describe('cr.48f — the SUCCESS-path extraction is masked against the run secret (the ONE seam)', () => {
+  // cr.48e closed every failure-path carrier; this is the success half — the
+  // strings `parseBackupProgress` extracts ride job.result, the progress line
+  // and the notification body. A backend that echoes the credential it was
+  // handed into ANY of them must meet `[secret]`, from ONE masking pass at the
+  // parser: the parsing ran on the RAW stderr (regexes, percentages, verdicts
+  // untouched) and only the stored strings are masked.
+  const ECHO = 'run-side-secret'
+  const LEAKY_STDERR = [
+    'Starting backup: [beans]:host/boo/2026-07-19T01:07:07Z (run-side-secret)',
+    'Upload directory \'/root/mydata\' to \'root@pam@localhost:8007:store1\' as docs.pxar.didx',
+    'docs.pxar: had to backup 82.957 KiB of 82.957 KiB (echoed run-side-secret) in 0.01 s',
+    'resource limit for open file handles low: 1024 (run-side-secret)',
+    'Upload image \'/dev/run-side-secret/zvol\' to \'repo\' as lun0.img.fidx',
+    'Duration: run-side-secret 0.58s',
+    'Change detection summary:',
+    ' - 2 files changed (run-side-secret), 10 files unchanged',
+    'skipping mount point: "run-side-secret/photos"',
+  ].join('\n')
+
+  it('every extracted string meets [secret]; without values the parse is verbatim', () => {
+    const p = parseBackupProgress(LEAKY_STDERR, [ECHO])
+    assert.match(p.target ?? '', /\[secret\]/)
+    assert.equal((p.target ?? '').includes(ECHO), false)
+    assert.ok(p.archiveStats.some(l => l.includes('[secret]') && !l.includes(ECHO)), JSON.stringify(p.archiveStats))
+    assert.ok(p.nofileWarning && p.nofileWarning.includes('[secret]') && !p.nofileWarning.includes(ECHO), p.nofileWarning ?? '')
+    assert.ok(p.duration && p.duration.includes('[secret]') && !p.duration.includes(ECHO), p.duration ?? '')
+    assert.ok(p.images.some(i => i.source.includes('[secret]') && !i.source.includes(ECHO)), JSON.stringify(p.images))
+    assert.ok(p.changeDetectionSummary.every(l => !l.includes(ECHO)) && p.changeDetectionSummary.some(l => l.includes('[secret]')), JSON.stringify(p.changeDetectionSummary))
+    // The skip path and root are masked BEFORE the join, so `path` is clean too.
+    assert.deepEqual(p.skipped, [{
+      archive: 'docs',
+      root: '/root/mydata',
+      relativePath: '[secret]/photos',
+      path: '/root/mydata/[secret]/photos',
+    }])
+
+    // The pre-cr.48f contract every other caller still has: no secret values →
+    // the extraction is byte-for-byte the stderr text.
+    const raw = parseBackupProgress(LEAKY_STDERR)
+    assert.ok(raw.archiveStats.some(l => l.includes(ECHO)))
+    assert.ok(raw.target?.includes(ECHO))
+  })
+
+  it('progressSummary of the masked parse carries [secret] and no value (the job progress line)', () => {
+    const p = parseBackupProgress(LEAKY_STDERR, [ECHO])
+    const s = progressSummary(p)
+    assert.match(s, /\[secret\]/)
+    assert.equal(s.includes(ECHO), false)
+  })
+})

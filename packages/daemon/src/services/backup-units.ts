@@ -430,9 +430,14 @@ export function parseHelperResult(journal: string): HelperResult | null {
 }
 
 /**
- * The client-safe failure detail from the unit journal: prefer pbc's verbatim
- * `Error:` line (or the runner's thrown owner/failed message), else the last
- * non-JSON message line. Never contains a secret (pbc's stderr never does).
+ * The client-safe failure detail from the unit journal: prefer the runner's
+ * verbatim `Error:` line (or the thrown owner/failed message), else the last
+ * non-JSON message line. Carries no RAW secret: pbc's stderr *could* quote a
+ * credential a backend echoed back, but the only stderr that ever reaches the
+ * journal is what the `backup-task` runner prints — the job's error line,
+ * already masked as `[secret]` (cr.48e), and the result JSON, already masked
+ * at parseBackupProgress (cr.48f) — so this reader, which holds no secret at
+ * read time and is not a mask door, can see the marker but never the value.
  */
 export function failureDetailFromJournal(journal: string): string | null {
   return failureDetailFromJournalGeneric(BACKUP_UNIT_KIND, journal)

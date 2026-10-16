@@ -29,6 +29,7 @@
 
 import type { CloudProvider, CloudProviderOption, CloudRemote, CloudRemoteWrite } from '@anas/shared'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
+import { createDecipheriv } from 'node:crypto'
 import { chmod, mkdir, readFile, rm } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { CLOUD_BACKEND_GUIDES, CloudProvider as CloudProviderSchema } from '@anas/shared'
@@ -533,6 +534,106 @@ export async function obscure(
   if (result.exitCode !== 0)
     throw new Error(`rclone obscure failed: ${lastOutputLine(result) || `exit ${result.exitCode}`}`)
   return result.stdout.trim()
+}
+
+/**
+ * rclone's FIXED, public obscure key — `cryptKey` in
+ * fs/config/obscure/obscure.go, byte-for-byte the same 32 bytes in every build
+ * (fetched from v1.74.3; the KAT decodes a real obscuring, so a drift in this
+ * table would fail the tests, not silently mis-mask). Obscure is NOT
+ * cryptography — rclone's own `obscure` help says it only stops a value being
+ * read off the config page — so recovering the plain text needs no secret the
+ * daemon holds.
+ */
+const OBSCURE_KEY = Buffer.from([
+  0x9C,
+  0x93,
+  0x5B,
+  0x48,
+  0x73,
+  0x0A,
+  0x55,
+  0x4D,
+  0x6B,
+  0xFD,
+  0x7C,
+  0x63,
+  0xC8,
+  0x86,
+  0xA9,
+  0x2B,
+  0xD3,
+  0x90,
+  0x19,
+  0x8E,
+  0xB8,
+  0x12,
+  0x8A,
+  0xFB,
+  0xF4,
+  0xDE,
+  0x16,
+  0x2B,
+  0x8B,
+  0x95,
+  0xF6,
+  0x38,
+])
+
+/** The URL-safe base64 WITHOUT padding `base64.RawURLEncoding` writes — rclone's `obscure` alphabet. */
+const OBSCURE_B64_RE = /^[\w-]+$/
+
+/**
+ * Recover the plain text of an `rclone obscure`'d value, IN PROCESS — rclone's
+ * own `Reveal` reimplemented (fs/config/obscure/obscure.go): the stored value
+ * is the random 16-byte AES-IV followed by the AES-256-CTR ciphertext under
+ * {@link OBSCURE_KEY}, base64 URL-safe without padding.
+ *
+ * This is the mirror of {@link obscure}: the write path hands the plain text to
+ * `rclone obscure -` over STDIN to get the file spelling, and whoever reads the
+ * file back and needs the plain form (the saved-remote probe's mask + argv
+ * guard, cr.48f) recovers it HERE. The recovery is in-process precisely so no
+ * credential ever rides an argv: `rclone reveal` takes its input only as a
+ * command-line argument (GT 2026-09-23 — and `reveal -` does NOT read stdin,
+ * checked on the local rclone and the node's), so a subprocess reveal would put
+ * the value it decodes in `ps` for the call's lifetime, the exact exposure the
+ * write path's stdin-only `obscure` was built to avoid.
+ *
+ * Fail-safe: a value that is not a well-formed obscured spelling decodes to
+ * NOTHING (undefined), so a hand-edited or foreign stored value contributes no
+ * plain form. Undefined when the value is empty, contains a character outside
+ * rclone's raw-URL-safe base64 alphabet (so a stored name-rule PLAIN value with
+ * `+`, `/`, `=` or whitespace is not even attempted), has a base64 length Go's
+ * decoder rejects (`x % 4 === 1` — a trailing 2-bit group), decodes to fewer
+ * than 16 bytes (an obscuring is always IV + at least one plaintext byte), or
+ * its plaintext is not valid UTF-8 (Go's `string(buf)` is byte-loose; the
+ * secrets ANAS stores are request strings, always UTF-8 — any other bytes are
+ * a corrupt/hand-edited value, and the plaintext that would ride the mask must
+ * not).
+ */
+export function revealObscured(value: string): string | undefined {
+  if (value === '' || value.length % 4 === 1 || !OBSCURE_B64_RE.test(value))
+    return undefined
+  let ciphertext: Buffer
+  try {
+    ciphertext = Buffer.from(value, 'base64url')
+  }
+  catch {
+    return undefined
+  }
+  if (ciphertext.length < 16)
+    return undefined
+  try {
+    const decipher = createDecipheriv('aes-256-ctr', OBSCURE_KEY, ciphertext.subarray(0, 16))
+    // CTR has no padding, so `final()` adds nothing to the plaintext — it is
+    // still called to run the object out (Go's stream cipher deciphers in one
+    // pass the same way, `crypt`).
+    const plain = Buffer.concat([decipher.update(ciphertext.subarray(16)), decipher.final()])
+    return new TextDecoder('utf-8', { fatal: true }).decode(plain)
+  }
+  catch {
+    return undefined
+  }
 }
 
 /**

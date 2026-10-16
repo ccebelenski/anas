@@ -97,8 +97,9 @@ import {
   providerOption,
   RCLONE,
   rcloneBaseArgs,
-
   RemoteNotFoundError,
+
+  revealObscured,
 } from './rclone-config.js'
 import { assertNoSecretValues, maskSecretValues } from './secret-argv.js'
 
@@ -351,6 +352,69 @@ async function storedRemoteType(configFile: string, name: string): Promise<strin
 }
 
 /**
+ * A stored `true`/`false` is a BOOL option (`sftp.ask_password`,
+ * `ftp.ask_password`) — never a secret (rclone-config's rule). Excluding the
+ * two literals by VALUE is what lets the saved-remote mask below run without
+ * the provider catalogue: they are the only name-rule-matching keys whose
+ * stored value is one of these, and masking `true`/`false` would shred
+ * ordinary probe text.
+ */
+const BOOL_LITERAL_RE = /^(?:true|false|1|0)$/i
+
+/**
+ * The plain secret values of a SAVED remote's stored section, for the probe's
+ * mask + argv guard (cr.48f). cr.48b masked every value a probe HANDS the
+ * child — an unsaved dialog's values are in scope — but a SAVED remote's
+ * credentials live in rclone.conf and were never loaded, so its probe ran with
+ * an EMPTY mask, and a backend echoing a STORED credential rode the message
+ * unmasked. The daemon CAN recover the plain value cheaply, IN PROCESS: the
+ * write path stores name-rule secrets PLAIN, and an IsPassword value is
+ * `rclone obscure`'d — reversed here through {@link revealObscured} (rclone's
+ * own `Reveal` reimplemented beside the write path, KAT-pinned against the
+ * real binary; the module header's GT fact 3 names `rclone reveal` as the
+ * OPERATOR's door, never a door this daemon opens). Every secret-rule value is
+ * returned: the stored bytes (the name-rule plain text AND the obscured
+ * spellings rclone's own crypt debug echoes), plus the DECODED output of the
+ * values that recover (the IsPassword plain text). Bool-typed values are
+ * skipped. NO new rclone invocation rides the request path — the recovery is
+ * in-process, so no stored or recovered credential ever touches an argv
+ * (`obscure` stays the only secret the daemon hands rclone, over stdin, on the
+ * write path). Fail-open by design: an unreadable file or an absent section
+ * return nothing (the probe then fails loudly as it would have), and a stored
+ * value that fails to decode contributes no plain form.
+ */
+async function savedSectionPlainSecrets(
+  configFile: string,
+  name: string,
+): Promise<string[]> {
+  let text: string
+  try {
+    text = await readFile(configFile, 'utf-8')
+  }
+  catch {
+    return []
+  }
+  const section = listSections(parseRcloneConf(text)).find(s => s.name === name)
+  if (!section)
+    return []
+  const out: string[] = []
+  for (const [key, value] of Object.entries(section.values)) {
+    if (value === '' || BOOL_LITERAL_RE.test(value) || !isSecretKey(key))
+      continue
+    // The stored bytes: a name-rule secret IS the plain text, an IsPassword
+    // secret is the obscured spelling (which rclone's own debug echoes).
+    out.push(value)
+    // The IsPassword plain text, when the stored spelling is a well-formed
+    // obscuring. The generator filters the same way the old subprocess did — a
+    // decode of an empty/short/identical value adds nothing to the mask.
+    const plain = revealObscured(value)
+    if (plain !== undefined && plain !== '' && plain !== value && plain.length >= 4)
+      out.push(plain)
+  }
+  return out
+}
+
+/**
  * Run the bounded `lsjson` probe and classify it.
  *
  *  - a SAVED target probes `<name>:<path>` straight from ANAS's own file (the
@@ -401,6 +465,13 @@ export async function testRemote(
   if (target.name !== undefined) {
     fs = `${target.name}:${path}`
     namedFs = fs
+    // cr.48f: a SAVED remote's credentials live in rclone.conf and were never
+    // loaded — recover them at probe time so the mask (and the argv guard)
+    // cover a backend echoing a STORED credential, exactly as cr.48b covered
+    // the values a dialog hands over. The recovery is IN-PROCESS
+    // (`savedSectionPlainSecrets` → `revealObscured`) — no rclone call carries
+    // a stored or recovered value on its argv.
+    secretValues.push(...await savedSectionPlainSecrets(paths.configFile, target.name))
   }
   else {
     const remote = target.remote!

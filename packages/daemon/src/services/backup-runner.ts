@@ -319,8 +319,24 @@ export interface BackupProgress {
   skipped: SkippedMountPoint[]
 }
 
-/** Parse pbc STDERR into the progress units (per-archive stats + summary block). */
-export function parseBackupProgress(stderr: string): BackupProgress {
+/**
+ * Parse pbc STDERR into the progress units (per-archive stats + summary block).
+ *
+ * cr.48f — the LAST boundary of the secret-echo doctrine: every string this
+ * parser EXTRACTS from stderr is masked against the `secretValues` the run
+ * handed pbc before it leaves. One seam covers every consumer of the parsed
+ * structure — the job result's target / archives / nofile warning / duration /
+ * image sources, the progress summary line that becomes the job's progress,
+ * the skipped-mount notices that ride the result and the notification body.
+ * The parsing itself still reads the RAW stderr (numbers, percentages, the
+ * archive-name regexes and the verdict keywords all run on the verbatim text);
+ * only what is stored is masked, so classification elsewhere stays on the raw
+ * chunks exactly as before. With no `secretValues` the parse is verbatim.
+ */
+export function parseBackupProgress(stderr: string, secretValues: string[] = []): BackupProgress {
+  // A per-call mask over the caller's own list — the pattern is built from it
+  // and can never live at module scope (maskSecretValues). Empty-list no-ops.
+  const mask = (s: string): string => maskSecretValues(s, secretValues)
   const progress: BackupProgress = {
     target: null,
     archiveStats: [],
@@ -353,40 +369,41 @@ export function parseBackupProgress(stderr: string): BackupProgress {
       // An image archive has no tree, so no `skipping mount point:` line can
       // belong to it — the skip attribution is deliberately left where the last
       // DIRECTORY upload put it rather than pointed at an image.
-      progress.images.push({ archive: image[2], source: image[1] })
+      progress.images.push({ archive: mask(image[2]), source: mask(image[1]) })
       continue
     }
     const skip = trimmed.match(SKIPPING_MOUNT_RE)
     if (skip) {
-      const relativePath = skip[1]
+      const relativePath = mask(skip[1])
+      const root = currentRoot ? mask(currentRoot) : undefined
       progress.skipped.push({
-        ...(currentArchive ? { archive: currentArchive } : {}),
-        ...(currentRoot ? { root: currentRoot } : {}),
+        ...(currentArchive ? { archive: mask(currentArchive) } : {}),
+        ...(root ? { root } : {}),
         relativePath,
-        path: currentRoot ? joinUnder(currentRoot, relativePath) : relativePath,
+        path: root ? joinUnder(root, relativePath) : relativePath,
       })
       continue
     }
     if (STARTING_RE.test(trimmed))
-      progress.target = trimmed
+      progress.target = mask(trimmed)
     if (NOFILE_WARNING_RE.test(trimmed))
-      progress.nofileWarning = trimmed
+      progress.nofileWarning = mask(trimmed)
     if (DURATION_RE.test(trimmed))
-      progress.duration = trimmed
+      progress.duration = mask(trimmed)
     if (trimmed.startsWith('Change detection summary:')) {
       inSummary = true
-      progress.changeDetectionSummary.push(trimmed)
+      progress.changeDetectionSummary.push(mask(trimmed))
       continue
     }
     if (inSummary) {
       if (trimmed.startsWith('-')) {
-        progress.changeDetectionSummary.push(trimmed)
+        progress.changeDetectionSummary.push(mask(trimmed))
         continue
       }
       inSummary = false
     }
     if (ARCHIVE_LINE_RE.test(trimmed))
-      progress.archiveStats.push(trimmed)
+      progress.archiveStats.push(mask(trimmed))
   }
   return progress
 }
@@ -590,7 +607,9 @@ export function unmountedArchiveRefusal(archive: string, path: string, mount: Un
  * (feeding `updateProgress`), and classify. Returns a result for success /
  * benign too-soon; THROWS on a real failure (so the job fails and systemd's
  * last-result is truthful). Secrets are env-only and never appear in the thrown
- * message or the returned result.
+ * message or the returned result — the failure detail is masked (cr.48e),
+ * and every success-path string `parseBackupProgress` extracts is masked
+ * against this run's secret (cr.48f).
  */
 export async function runBackup(
   executor: CommandExecutor,
@@ -810,7 +829,13 @@ export async function runBackup(
     }
   }
 
-  const progress = parseBackupProgress(r.stderr)
+  // cr.48f: the SUCCESS-path extraction is masked in ONE pass, against the very
+  // secret this run handed pbc — the archive stats, the target line and the
+  // nofile warning land in job.result, the progress summary and any journal line
+  // built from them, so a backend echoing the credential into any of those lines
+  // meets `[secret]` everywhere it would otherwise ride a reply. The parser kept
+  // the raw text for its extraction; only the strings it stores are masked.
+  const progress = parseBackupProgress(r.stderr, [secret])
   const summary = progressSummary(progress)
   if (summary)
     updateProgress(summary)
