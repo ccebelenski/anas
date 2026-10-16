@@ -100,7 +100,7 @@ import {
 
   RemoteNotFoundError,
 } from './rclone-config.js'
-import { assertNoSecretValues } from './secret-argv.js'
+import { assertNoSecretValues, maskSecretValues } from './secret-argv.js'
 
 /** `timeout` binary — wraps the probe so a dead network can never hang us. */
 const TIMEOUT = '/usr/bin/timeout'
@@ -445,13 +445,16 @@ export async function testRemote(
       ...(opts.onSpawn ? { onSpawn: opts.onSpawn } : {}),
     })
     const verdict = classifyProbe(result.exitCode, result.stderr)
+    // cr.48b: whatever rclone echoed is replaced at the RESULT, after the
+    // classifier read the raw text — a secret value this probe handed the
+    // child (on the env) must never ride the message a backend echoed.
     if (isCrypt && verdict.verdict === 'ok') {
       if (CRYPT_UNDECRYPTABLE_RE.test(result.stderr))
-        return { verdict: 'auth', message: cryptWrongPasswordMessage(namedFs) }
+        return { verdict: 'auth', message: maskSecretValues(cryptWrongPasswordMessage(namedFs), secretValues) }
       if (isEmptyListing(result.stdout))
-        return { verdict: 'ok', message: CRYPT_NOTHING_STORED_MESSAGE }
+        return { verdict: 'ok', message: maskSecretValues(CRYPT_NOTHING_STORED_MESSAGE, secretValues) }
     }
-    return verdict
+    return { ...verdict, message: maskSecretValues(verdict.message, secretValues) }
   }
   finally {
     // The copy must not outlive the probe — and a cleanup failure must not

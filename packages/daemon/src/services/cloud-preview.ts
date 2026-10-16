@@ -13,7 +13,7 @@ import {
   rcloneRunCompleted,
 } from './cloud-runner.js'
 import { RCLONE } from './rclone-config.js'
-import { assertNoSecretValues } from './secret-argv.js'
+import { assertNoSecretValues, maskSecretValues } from './secret-argv.js'
 import { guardSourcePath, readSourceGuardFacts } from './source-guard.js'
 
 /**
@@ -220,6 +220,11 @@ export async function runPreview(
   )
   const stats = finalStats(log)
   const truncated = exitCode === TIMEOUT_EXIT_CODE
+  // cr.48b: the errors are rclone's own stderr lines — the one stderr-derived
+  // string in the answer. Whatever the child echoed of a secret value this
+  // preview handed it is replaced AT the result, after the parsing read the
+  // raw text (only what leaves is masked).
+  const secrets = deps.secrets ?? []
   return {
     transfers: stats.transfers,
     bytes: stats.bytes,
@@ -229,7 +234,7 @@ export async function runPreview(
     // against a future caller handing over a state built some other way.
     deletedFiles: log.skippedDeletes.slice(0, DELETED_FILES_CAP),
     deletedTotal: log.skippedDeleteCount,
-    errors: previewErrors(task.mode, exitCode, truncated, log),
+    errors: previewErrors(task.mode, exitCode, truncated, log).map(e => maskSecretValues(e, secrets)),
     truncated,
   }
 }

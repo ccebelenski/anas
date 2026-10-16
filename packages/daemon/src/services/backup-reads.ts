@@ -13,6 +13,7 @@ import {
   snapshotTimeIso,
 } from '@anas/shared'
 import { buildBackupEnv, classifyPermissionFailure, firstErrorLine, PBC } from './backup-runner.js'
+import { maskSecretValues } from './secret-argv.js'
 
 /**
  * Backup RESTORE READS (story backup2.5) — the point-in-time and group listings
@@ -79,6 +80,20 @@ export function classifyBackupReadVerdict(
   exitCode: number,
   stderr: string,
   timedOut = false,
+  secretValues: string[] = [],
+): { verdict: BackupReadVerdict, detail: string } {
+  // cr.48b: the verdict is classified over the RAW stderr; the detail string
+  // that leaves is masked against the secret values the read handed pbc (the
+  // proguard against a pbc line echoing the repo password or token secret).
+  const raw = rawClassifyBackupReadVerdict(exitCode, stderr, timedOut)
+  return { verdict: raw.verdict, detail: maskSecretValues(raw.detail, secretValues) }
+}
+
+/** The classification itself — over the raw stderr, unmasked ({@link classifyBackupReadVerdict}). */
+function rawClassifyBackupReadVerdict(
+  exitCode: number,
+  stderr: string,
+  timedOut: boolean,
 ): { verdict: BackupReadVerdict, detail: string } {
   if (timedOut) {
     return {
@@ -387,11 +402,17 @@ async function runRead(
   try {
     const r = await executor.exec(PBC, args, { env: buildBackupEnv(deps.repo, deps.secret) })
     if (r.exitCode !== 0)
-      return { ok: false, ...classifyBackupReadVerdict(r.exitCode, r.stderr) }
+      return { ok: false, ...classifyBackupReadVerdict(r.exitCode, r.stderr, false, [deps.secret]) }
     return { ok: true, data: r.stdout }
   }
   catch (err) {
-    return { ok: false, verdict: 'error', detail: err instanceof Error ? err.message : String(err) }
+    // cr.48b: a thrown error's message (an executor rejection) must be masked
+    // too — pbc's secret rides the child env and can be echoed by anyone.
+    return {
+      ok: false,
+      verdict: 'error',
+      detail: maskSecretValues(err instanceof Error ? err.message : String(err), [deps.secret]),
+    }
   }
 }
 

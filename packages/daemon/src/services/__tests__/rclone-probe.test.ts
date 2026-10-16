@@ -472,6 +472,32 @@ describe('rclone-probe: testRemote (rclone.1)', () => {
     const r = await testRemote(stubExecutor(exec), PATHS, { name: 'gt' })
     assert.deepEqual(r, { verdict: 'unreachable', message: '' })
   })
+
+  it('cr.48b: a stderr line echoing a secret value the dialog handed over is masked in the message, the verdict unchanged', async () => {
+    // The bad credential's 401 line echoes the pass value verbatim — the exact
+    // leak the review proved. The verdict is still `auth` (the classifier read
+    // the RAW text); only the message that leaves carries `[secret]`.
+    const echo = 'Failed to create file system for "anastest:": NewFs: couldn\'t connect SSH: 401 Unauthorized (token gtpass)'
+    const { exec } = lsjsonResult(`${PROBE_REMOTE_NAME}:`, { stdout: '', stderr: `${echo}\n`, exitCode: 1 })
+    const r = await testRemote(stubExecutor(exec), PATHS, {
+      remote: { name: 'draft', type: 'sftp', options: { host: '127.0.0.1', user: 'rclonegt', pass: 'gtpass' } },
+    }, { providers, tmpBase: TMP_BASE })
+    assert.equal(r.verdict, 'auth')
+    assert.ok(r.message.includes('[secret]'), r.message)
+    assert.ok(!r.message.includes('gtpass'), r.message)
+  })
+
+  it('cr.48b: a URL-echoed secret (its encodeURIComponent form) is masked too', async () => {
+    const echo = 'Failed to access https://user:gt%20secret@example.com/x: 401 Unauthorized'
+    const { exec } = lsjsonResult(`${PROBE_REMOTE_NAME}:`, { stdout: '', stderr: `${echo}\n`, exitCode: 1 })
+    const r = await testRemote(stubExecutor(exec), PATHS, {
+      remote: { name: 'draft', type: 'sftp', options: { host: 'h', user: 'u', pass: 'gt secret' } },
+    }, { providers, tmpBase: TMP_BASE })
+    assert.equal(r.verdict, 'auth')
+    assert.ok(r.message.includes('[secret]'), r.message)
+    assert.ok(!r.message.includes('gt%20secret'), r.message)
+    assert.ok(!r.message.includes('gt secret'), r.message)
+  })
 })
 
 // ── sweepStaleProbeDirs: what a killed daemon left behind ──────────────────

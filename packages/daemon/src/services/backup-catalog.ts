@@ -8,6 +8,7 @@ import type { BackupReadDeps } from './backup-reads.js'
 import { classifyArchiveFile, isBrowsableArchive } from '@anas/shared'
 import { classifyBackupReadVerdict } from './backup-reads.js'
 import { buildBackupEnv, PBC } from './backup-runner.js'
+import { maskSecretValues } from './secret-argv.js'
 
 /**
  * The ARCHIVE BROWSER (story backup2.5) — `proxmox-backup-client catalog shell`
@@ -340,14 +341,21 @@ async function runShell(
       env: buildBackupEnv(deps.repo, deps.secret),
       ...(deps.onSpawn ? { onSpawn: deps.onSpawn } : {}),
     })
+    // cr.48b: the classified detail is masked against the repo secret (pbc's
+    // own word can echo the password or token secret the env carried).
     if (r.exitCode === TIMEOUT_EXIT)
-      return { ok: false, ...classifyBackupReadVerdict(r.exitCode, r.stderr, true) }
+      return { ok: false, ...classifyBackupReadVerdict(r.exitCode, r.stderr, true, [deps.secret]) }
     if (r.exitCode !== 0)
-      return { ok: false, ...classifyBackupReadVerdict(r.exitCode, r.stderr) }
+      return { ok: false, ...classifyBackupReadVerdict(r.exitCode, r.stderr, false, [deps.secret]) }
     return { ok: true, stdout: r.stdout, stderr: r.stderr }
   }
   catch (err) {
-    return { ok: false, verdict: 'error', detail: err instanceof Error ? err.message : String(err) }
+    // cr.48b: a thrown error's message carries the same fight — mask it too.
+    return {
+      ok: false,
+      verdict: 'error',
+      detail: maskSecretValues(err instanceof Error ? err.message : String(err), [deps.secret]),
+    }
   }
 }
 

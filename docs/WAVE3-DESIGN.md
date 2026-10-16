@@ -546,7 +546,9 @@ socket hop (F8). Four gaps the executor default alone cannot close:
    the rclone remote test (once 45 s) and the PBS catalog shell (once 30 s) could all exceed it. All
    three now answer synchronously under a 12 s `timeout` wrapper (lowered at the cr.35 merge; see
    `command-budgets.ts` for the ladder: budget + 5 s TERM grace + 2 s KILL grace < the gateway's 20 s);
-   making them jobs stays the open Q3.
+   making them jobs stays the open Q3. *(cr.48, closed 2026-10-15: the preview, the remote test and the
+   catalog listing run as cancellable read jobs now — `timeout 600` / `timeout 120` / `timeout 300`; the
+   12 s shape above was the pre-cr.48 state.)*
 
 ### 6.2 Design
 

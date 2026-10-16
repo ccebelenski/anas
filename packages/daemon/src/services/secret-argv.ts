@@ -22,6 +22,10 @@
  *    `--ask-password=false` base, where a small secret value like `false` or
  *    a path letter may legally match) and are never checked; only the
  *    dynamic tail is.
+ *  - {@link maskSecretValues} — the OUTPUT-side mirror (cr.48b), for a child
+ *    that echoed a secret back instead of carrying it on argv: replaces the
+ *    plain and URL-encoded forms of every in-scope value in a result string
+ *    with the literal `[secret]`, so a secret still never rides in a reply.
  *
  * Extracted 2026-09-23 from the two private copies (story rclone.1: "the
  * iscsi-mutate argv guard is reused as the executor-side backstop").
@@ -76,4 +80,60 @@ export function assertNoSecretValues(args: string[], secretValues: string[], ski
     if (nonEmpty.some(s => a.includes(s)))
       throw new SecretOnArgvError()
   }
+}
+
+/**
+ * Mask every occurrence of every secret value in `text` with the literal
+ * `[secret]` — the OUTPUT-side mirror of {@link assertNoSecretValues}: the argv
+ * guard refuses a secret ON a command line, this masks one a child may have
+ * ECHOED into its output (cr.48b: a backend that answers a bad credential with
+ * the value verbatim, or an rclone/pbc line that echoes the URL it was pointed
+ * at). A secret never rides in a reply, whatever a tool answers.
+ *
+ * Both the plain value and its `encodeURIComponent` form are masked (rclone and
+ * pbc echo URLs, where the value is percent-encoded). Values are matched
+ * LONGEST FIRST, so a secret value that contains another is masked whole. A
+ * value SHORTER than 4 characters is not masked: replacing so short a string
+ * would shred ordinary text (it could be any word). Empty values cannot match
+ * anything and are ignored.
+ *
+ * The verdict classifiers never see the masked text — the classification runs
+ * on the RAW output and only what leaves in the result is masked.
+ */
+export function maskSecretValues(text: string, secretValues: string[]): string {
+  const forms = new Set<string>()
+  for (const value of secretValues) {
+    // The 4-character floor guards the plain value; the encoded form of an
+    // eligible value is always at least as long (encoding never shrinks).
+    if (value === '' || value.length < 4)
+      continue
+    forms.add(value)
+    let encoded: string
+    try {
+      encoded = encodeURIComponent(value)
+    }
+    catch {
+      encoded = value // a lone surrogate in a stored value masks nothing extra
+    }
+    if (encoded !== value)
+      forms.add(encoded)
+  }
+  if (forms.size === 0)
+    return text
+  // eslint-disable-next-line e18e/prefer-array-to-sorted -- toSorted() is ES2023; this package targets ES2022 (no such lib member)
+  const longestFirst = [...forms].sort((a, b) => b.length - a.length)
+  // The pattern is built from the CALLER'S secret values — any two calls can
+  // differ, so it can never live at module scope.
+  const pattern = new RegExp(longestFirst.map(escapeRegExp).join('|'), 'g')
+  // A function replacement, not a string: `[secret]` has no `$` of its own, but
+  // a `$&` in the match must never slip through as a replacement directive.
+  return text.replace(pattern, () => '[secret]')
+}
+
+/** Every character a RegExp literal could interpret — escaped by {@link escapeRegExp}. */
+const REGEX_METACHARS_RE = /[.*+?^${}()|[\]\\]/g
+
+/** Escape every character a RegExp literal could interpret, verbatim. */
+function escapeRegExp(s: string): string {
+  return s.replace(REGEX_METACHARS_RE, '\\$&')
 }

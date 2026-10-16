@@ -292,6 +292,18 @@ describe('backup restore reads — failure taxonomy (verbatim stderr)', () => {
     assert.equal(v.verdict, 'error')
     assert.equal(v.detail, 'Error: something entirely new')
   })
+
+  it('cr.48b: a stderr line echoing the repo secret is masked in the detail, the verdict unchanged', () => {
+    const v = classifyBackupReadVerdict(
+      255,
+      'Error: proxmox-backup-client could not connect to token-secret-value\n',
+      false,
+      ['token-secret-value'],
+    )
+    assert.equal(v.verdict, 'error')
+    assert.equal(v.detail, 'Error: proxmox-backup-client could not connect to [secret]')
+    assert.ok(!v.detail.includes('token-secret-value'))
+  })
 })
 
 describe('backup restore reads — the runners', () => {
@@ -346,5 +358,26 @@ describe('backup restore reads — the runners', () => {
     const out = await listSnapshots(throwing as never, { repo: makeRepo(), secret: 'x' })
     assert.equal(out.ok, false)
     assert.ok(out.ok === false && out.detail.includes('ENOENT'))
+  })
+
+  it('cr.48b: a pbc failure echoing the repo secret masks it in the verdict detail', async () => {
+    const exec = new MockExecutor()
+    exec.addFixture({ command: PBC, result: { stdout: '', stderr: 'Error: proxmox-backup-client rejected super-secret-token\n', exitCode: 255 } })
+    const out = await listSnapshots(exec, { repo: makeRepo(), secret: 'super-secret-token', namespace: 'ns' })
+    assert.equal(out.ok, false)
+    assert.equal(out.ok === false && out.verdict, 'error')
+    assert.ok(out.ok === false && out.detail.includes('[secret]'), out.ok === false ? out.detail : '')
+    assert.ok(out.ok === false && !out.detail.includes('super-secret-token'))
+  })
+
+  it('cr.48b: a thrown executor error echoing the secret is masked too', async () => {
+    const throwing = {
+      exec: async () => { throw new Error('spawn ENOENT with super-secret-token on the line') },
+      pipeline: async () => { throw new Error('unused') },
+    }
+    const out = await listSnapshots(throwing as never, { repo: makeRepo(), secret: 'super-secret-token' })
+    assert.equal(out.ok, false)
+    assert.ok(out.ok === false && out.detail.includes('[secret]'), out.ok === false ? out.detail : '')
+    assert.ok(out.ok === false && !out.detail.includes('super-secret-token'))
   })
 })

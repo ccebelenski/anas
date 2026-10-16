@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { AbandonedRegistry } from '../../executor/deadline.js'
+import { AbandonedRegistry, CommandTimeoutError } from '../../executor/deadline.js'
 import { ProdExecutor } from '../../executor/prod.js'
 import { READ_CANCEL_WAIT_MS } from '../../jobs/child-cancel.js'
 import { isReadOnlyOperation, READ_JOB_OPERATIONS, READ_JOB_PREFIX } from '../../jobs/read-jobs.js'
@@ -318,6 +318,49 @@ describe('cr.48 the cloud reads as jobs (preview, remote test)', () => {
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.message, RCLONE_NOT_INSTALLED)
   })
+
+  it('remote test: an UNSAVED dialog whose stderr echoes its pass value masks it in the verdict message, the verdict unchanged', async () => {
+    // The review's proven leak: a backend answers the bad credential with the
+    // token verbatim. The whole job record must never carry the plain value.
+    const mock = mockOf(server)
+    mock.addFixture({
+      command: TIMEOUT,
+      argsMatch: isRclone,
+      result: {
+        stdout: '[]',
+        stderr: 'Failed to create file system for "anastest:": NewFs: couldn\'t connect SSH: ssh: handshake failed: ssh: unable to authenticate: 401 Unauthorized (token gtpass)\n',
+        exitCode: 1,
+      },
+    })
+    const job = await waitForJob(server, await accept(server, '/v1/cloud/remotes/test', {
+      remote: { name: 'draft', type: 'sftp', options: { host: '127.0.0.1', user: 'rclonegt', pass: 'gtpass' } },
+    }, READ_JOB_OPERATIONS.cloudRemoteTest))
+    assert.equal(job.status, 'completed')
+    const r = job.result as CloudRemoteTestResult
+    assert.equal(r.verdict, 'auth', 'the classifier still read the RAW text')
+    assert.ok(r.message.includes('[secret]'), r.message)
+    assert.ok(!JSON.stringify(job).includes('gtpass'), 'no plain value anywhere in the job record')
+  })
+
+  it('remote test: a hung child fails the job with the TIMEOUT sentence — no stderr, and no secret, ever reaches job.error', async () => {
+    // The wrapper's own deadline (the executor's margin above `timeout 120`)
+    // threw: the CommandTimeoutError names the command that hung, never its
+    // output — a stderr echo of a dialog secret must not ride `job.error`.
+    const mock = mockOf(server)
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (cmd: string, args: string[], opts?: ExecOptions): Promise<ExecResult> => {
+      if (cmd === TIMEOUT && isRclone(args))
+        throw new CommandTimeoutError(TIMEOUT, [String(PROBE_TIMEOUT_S), RCLONE], 'job', 125_000, false)
+      return orig(cmd, args, opts)
+    }
+    const job = await waitForJob(server, await accept(server, '/v1/cloud/remotes/test', {
+      remote: { name: 'draft', type: 'sftp', options: { host: '127.0.0.1', user: 'rclonegt', pass: 'gtpass' } },
+    }, READ_JOB_OPERATIONS.cloudRemoteTest))
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'TIMEOUT')
+    assert.match(job.error?.message ?? '', /did not finish within/)
+    assert.ok(!JSON.stringify(job).includes('gtpass'), 'the hung-command sentence carries no secret')
+  })
 })
 
 describe('cr.48 the PBS catalog listing as a job', () => {
@@ -444,5 +487,22 @@ describe('cr.48 the PBS catalog listing as a job', () => {
     const job = await waitForJob(server, await accept(server, '/v1/backup/restore/browse', BODY, READ_JOB_OPERATIONS.backupCatalog))
     assert.equal(job.status, 'completed')
     assert.equal((job.result as BackupBrowseResult).verdict, 'permission')
+  })
+
+  it('cr.48b: a pbc stderr line echoing the repo secret masks it in the level detail, the verdict unchanged', async () => {
+    // The review's second proven leak: pbc echoes the repo password/token
+    // secret in a generic failure line. The whole job record must not carry it.
+    const mock = mockOf(server)
+    mock.addFixture({
+      command: TIMEOUT,
+      argsMatch: isShell,
+      result: { stdout: '', stderr: 'Error: proxmox-backup-client rejected token-secret-value\n', exitCode: 255 },
+    })
+    const job = await waitForJob(server, await accept(server, '/v1/backup/restore/browse', BODY, READ_JOB_OPERATIONS.backupCatalog))
+    assert.equal(job.status, 'completed')
+    const r = job.result as BackupBrowseResult
+    assert.equal(r.verdict, 'error', 'the classifier still read the RAW text')
+    assert.ok(r.detail?.includes('[secret]'), r.detail)
+    assert.ok(!JSON.stringify(job).includes('token-secret-value'), 'no plain value anywhere in the job record')
   })
 })

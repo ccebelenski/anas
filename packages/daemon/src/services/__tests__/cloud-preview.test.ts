@@ -336,6 +336,52 @@ describe('previewCloudSync — the captured 1.60.1 dry-run logs', () => {
       await h.cleanup()
     }
   })
+
+  it('cr.48b: rclone echoing a secret value in its stderr is masked in the errors, the exit facts unchanged', async () => {
+    const h = await harness()
+    try {
+      // The pre-logger line echoes the exact secret the preview "handed"
+      // rclone (injected through deps.secrets — the same list the argv guard
+      // owns, normally empty because credentials live in the config file).
+      replayRclone(h.mock, '2026/09/25 12:00:00 Failed to create file system for "gtbad:dst/fail": 401 Unauthorized: hunter2\n', 1)
+      const result = await previewCloudSync(h.mock, deps(h, { secrets: ['hunter2'] }))
+      assert.equal(result.errors.length, 1)
+      assert.ok(result.errors[0]!.includes('[secret]'), result.errors[0])
+      assert.ok(!result.errors[0]!.includes('hunter2'), result.errors[0])
+      // The failure still reads as itself: the exit-1 sentence and rclone's
+      // own line, minus the value. The verdict could not be the only-masked
+      // change — a real secret echo must never soften the failure.
+      assert.match(result.errors[0]!, /^rclone copy failed \(exit 1\): /)
+      assert.match(result.errors[0]!, /401 Unauthorized/)
+      assert.equal(result.transfers, 0)
+      assert.equal(result.truncated, false)
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('cr.48b: a JSON error line echoing the secret is masked there too', async () => {
+    const h = await harness()
+    try {
+      // The post-logger form: a JSON `level: error` object whose msg echoes
+      // the value — the errorLines path, not the raw-line fallback.
+      const line = JSON.stringify({
+        level: 'error',
+        msg: 'Failed to copy: open remote path: 401 Unauthorized for hunter2',
+        source: 'operations/operations.go:2404',
+        time: '2026-09-25T12:00:00.000000+00:00',
+      })
+      replayRclone(h.mock, `${line}\n`, 1)
+      const result = await previewCloudSync(h.mock, deps(h, { secrets: ['hunter2'] }))
+      assert.ok(result.errors.length >= 1)
+      assert.ok(!JSON.stringify(result.errors).includes('hunter2'))
+      assert.ok(result.errors.some(e => e.includes('[secret]')))
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
