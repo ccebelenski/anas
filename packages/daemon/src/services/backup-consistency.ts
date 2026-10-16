@@ -81,8 +81,19 @@ const ZFS_SNAPDIR_RE = /(?:^|\/)\.zfs\/snapshot(?:\/|$)/
 export interface ConsistencyFacts {
   /** findmnt targets → their mount rows. */
   mounts: Map<string, FindmntNode>
-  /** Live AHR topology (empty when it could not be read). */
+  /**
+   * Live AHR topology (empty when it could not be read — read why with
+   * {@link ahrUnreadable}).
+   */
   ahrPools: AhrPool[]
+  /**
+   * The AHR topology read FAILED (unreadable, not "no AHR pools"). While true
+   * every btrfs source derives `live` with a reason that says the topology
+   * could not be read — a btrfs mount cannot be confirmed as (or excluded
+   * from being) an ANAS AHR pool (cr.33c F1). Absent/`false` when the read
+   * succeeded, or when the caller built the facts without one.
+   */
+  ahrUnreadable?: boolean
   /**
    * PVE footprint refs per pool root, from `storage.cfg` WITH the ZFS
    * mountpoint map (pvepool.1 — a `dir` storage's path resolves onto its
@@ -121,7 +132,7 @@ export async function readConsistencyFacts(
   readAhrPools: (executor: CommandExecutor) => Promise<AhrPool[]>,
   opts: { pveStorageCfg?: string } = {},
 ): Promise<ConsistencyFacts> {
-  const { mounts, ahrPools } = await readFilesystemFacts(executor, readAhrPools)
+  const { mounts, ahrPools, ahrUnreadable } = await readFilesystemFacts(executor, readAhrPools)
   // Per-source ownership is the ONE footprint service's answer (pvepool.1
   // review fixes): it assembles storage.cfg + the ZFS mountpoint list (with the
   // ANAS_STORAGE_CFG env override this route honours everywhere else) + the
@@ -135,19 +146,30 @@ export async function readConsistencyFacts(
   // toward hands-off through the whole-pool fallback, exactly like the
   // footprint service does.
   const systemFacts = pve.systemFactsUnavailable ? null : pve.systemFacts
-  return { mounts, ahrPools, pveStorages: pve.storagesByPool, storagesUnavailable: pve.storagesUnavailable, systemFacts }
+  return { mounts, ahrPools, ahrUnreadable, pveStorages: pve.storagesByPool, storagesUnavailable: pve.storagesUnavailable, systemFacts }
 }
 
 /** The two facts that say which filesystem a path lives on (the mount table, the AHR pools). */
 export interface FilesystemFacts {
+  /** findmnt targets → their mount rows (empty when the table could not be read). */
   mounts: Map<string, FindmntNode>
+  /** Live AHR topology (empty when it could not be read — see {@link ahrUnreadable}). */
   ahrPools: AhrPool[]
+  /**
+   * The AHR topology read FAILED (unreadable, not "no AHR pools"). While true
+   * a btrfs mount cannot be confirmed as an ANAS pool, so the source-claim
+   * builder takes no `ahr:` key and says why (cr.33c F1).
+   */
+  ahrUnreadable?: boolean
 }
 
 /**
- * Read the mount table and the AHR topology. Both fail OPEN to empty (the
- * derivation then says `live` and names why; the source-claim builder takes no
- * key and says why) — never an exception that fails a run.
+ * Read the mount table and the AHR topology. Both fail OPEN to empty, and
+ * {@link FilesystemFacts.ahrUnreadable} says which of the two could not be
+ * read — the derivation then says `live` and names why, and the source-claim
+ * builder takes no key and says why (the mount-table sentence; or the AHR
+ * sentence for a btrfs mount it cannot confirm as an ANAS pool) — never an
+ * exception that fails a run.
  */
 export async function readFilesystemFacts(
   executor: CommandExecutor,
@@ -163,13 +185,15 @@ export async function readFilesystemFacts(
     // fail open — derivation says `live` and names the reason
   }
   let ahrPools: AhrPool[] = []
+  let ahrUnreadable = false
   try {
     ahrPools = await readAhrPools(executor)
   }
   catch {
     ahrPools = []
+    ahrUnreadable = true
   }
-  return { mounts, ahrPools }
+  return { mounts, ahrPools, ahrUnreadable }
 }
 
 /** The ANAS AHR pool mounted at a btrfs mount's target, or undefined (a btrfs volume ANAS does not manage). */
@@ -366,6 +390,16 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
 
   // --- AHR (btrfs) -------------------------------------------------------
   if (node.fstype === 'btrfs') {
+    // cr.33c F1: the AHR topology is UNREADABLE, so this btrfs mount cannot be
+    // confirmed as (nor excluded from being) an ANAS pool — the honest reason,
+    // the twin to the claims builder's sentence, never "not an ANAS AHR pool"
+    // (which the empty-list–but-readable case gets to assert).
+    if (facts.ahrUnreadable) {
+      return {
+        consistency: 'live',
+        reason: `${source} is on a btrfs filesystem (${node.source}) and the AHR topology could not be read, so it cannot be told whether it is an ANAS AHR pool - the backup is live`,
+      }
+    }
     const pool = ahrPoolMountedAt(node.target, facts.ahrPools)
     if (!pool) {
       return {

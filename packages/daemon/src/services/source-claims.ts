@@ -33,6 +33,10 @@ import { normalizeMountpointPath } from './mounts.js'
  * target containing the path) — one resolver, not a second one. A path whose
  * filesystem cannot be identified (unreadable mount table, no row contains it)
  * takes no key; the run says so in its progress line ({@link SourceClaims.unlocked}).
+ * The AHR read is the same fail-open (cr.33c F1): when the topology cannot be
+ * read, a path on a btrfs mount keeps the mount key — claimed by what it could
+ * read — but holds no `ahr:` key, and says so, because it cannot be told
+ * whether that btrfs mount is an ANAS pool a destroy might take.
  *
  * What these claims do NOT cover, by design of this story: the filesystems
  * NESTED under a backup source that the run expands into child archives
@@ -116,6 +120,14 @@ export async function pathSourceClaims(
         ? `${path}: no lock on the source - the mount table could not be read, so its filesystem is unknown`
         : `${path}: no lock on the source - no mount table entry contains it, so its filesystem is unknown`)
       continue
+    }
+    // cr.33c F1: an unreadable AHR topology leaves a btrfs mount unresolved to
+    // `other` (its pool cannot be named) — the run keeps the mount key, holds
+    // no `ahr:` key, and says so, exactly like the mount-table failure: the
+    // btrfs mount might be ANAS's, and an `ahr:` key it should have held would
+    // have made a destroy accepted beside the run wait for it.
+    if (facts.ahrUnreadable && fs.kind === 'other' && facts.mounts.get(fs.mountpoint)?.fstype === 'btrfs') {
+      unlocked.push(`${path}: no lock on the source - the AHR topology could not be read, so it is unknown whether the filesystem is an ANAS AHR pool`)
     }
     if (fs.kind === 'zfs')
       claims.push(...zfsDatasetClaims(guids.get(poolOf(fs.dataset)), fs.dataset, 'shared'))

@@ -460,6 +460,9 @@ zfs list -t all -r w3s7/a -> w3s7/a, w3s7/a@s1, w3s7/a/b      (s2, s3 and #bm3 g
 | **D6** | cosmetic | "Lost contact with the node while The job was running" — the default subject is capitalised mid-sentence (every caller without `what`) | N7 lost | `packages/pve-integration/src/10-api.js:285` with `:376-378` |
 | **D7** | cosmetic | The scope-change sentence runs the two sets together: "(w3s7/a/b (createtxg 133) then, w3s7/a/b (createtxg 133), w3s7/a/c (createtxg 615) now)" | N2a | `safety/guard.ts:425` (route), `:219` (job) |
 | **D8** | design gap (not built) | Data movers take no lock claims: a replication/backup/cloud run holds nothing on its source, so a destroy, rollback or rename confirmed during a run does not wait for it (§4.3 "data movers hold shared claims", N1's premise) | N1 above: `zfs.replicate` running, lock table `[]` | `routes/replication.ts:479`, `routes/cloud.ts:1053`, `routes/backup.ts:1375, 2557` |
+
+*Shipped as cr.33b (c95b21c): data movers hold shared claims on their source, so the wait described here is what a destroy, rollback or rename now does.*
+
 | **D9** | minor (inference, [U] on the log content) | A cloud preview against a wrong credential now ends at 15 s as `truncated:true, errors:[]`: rclone's own error lines are dropped whenever the run was truncated, so the operator sees "cut short", not "couldn't connect SSH", even when rclone had already logged it | cloud-tasks-api wrong-password preview | `services/cloud-preview.ts:73` (15 s), `:198-201` (`truncated` ⇒ no errors) |
 
 ---
@@ -490,6 +493,8 @@ zfs list -t all -r w3s7/a -> w3s7/a, w3s7/a@s1, w3s7/a/b      (s2, s3 and #bm3 g
 |---|---|---|
 | R0 deploy | PROVEN | `9d3817b` deployed, dist hashes match, anasd/anas active |
 | N1 | PROVEN (holder: a snapshot job) | destroy waited behind `zpool:<guid>` S, re-ran the LUN gate in the job and refused; abandoned child listed, locks held until it exited; a replication run holds no claim (D8) |
+
+*The "replication run holds no claim" finding shipped as cr.33b (c95b21c); the lock-wait row here is the D8 gap now exercised by a real `zfs.replicate`.*
 | N2 | PROVEN | resend after a new child → 409 `CONFIRM_SCOPE_CHANGED` naming it; held behind a lock → job `STATE_CHANGED`, nothing destroyed |
 | N3 / cr.25a | PROVEN | ticking Clean up re-challenges in place, wipe line + by-id before OK, OK sends the second code; CSRF header on every mutation |
 | N4 | PARTLY PROVEN | gateway 504 at 20 s in the ANAS envelope (anasd frozen); job-lane deadline + abandoned registry (N1); no request-path read blocks on a stuck pool device on ZFS 2.4.4, so the 503 `TIMEOUT` GET path was not provoked |

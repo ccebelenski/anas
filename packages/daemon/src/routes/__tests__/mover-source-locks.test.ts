@@ -11,7 +11,10 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { BackupTask, CloudSyncTask, SnapshotSchedule } from '@anas/shared'
 import { currentLane } from '../../executor/deadline.js'
+import { VGS_ARGS } from '../../parsers/lvm-report.js'
+import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { createServer } from '../../server.js'
+import { AHR_FINDMNT_ARGS } from '../../services/ahr-topology.js'
 import { writeTaskUnits as writeBackupTask } from '../../services/backup-units.js'
 import { writeTaskUnits as writeCloudTask } from '../../services/cloud-units.js'
 import { writeScheduleUnits } from '../../services/snapshot-schedule-units.js'
@@ -29,6 +32,12 @@ import { writeScheduleUnits } from '../../services/snapshot-schedule-units.js'
  * after the run's last command — against the state as it is NOW, and refuses
  * with no mutating argv. One control shows a verb whose gates still pass runs
  * after the run (it waited, it was not refused).
+ *
+ * cr.33c adds the two races the cr.33b review found missing: an AHR-pool
+ * source (the ahr: + mount keys, with an AHR destroy waiting, plus the
+ * cr.33c-F1 case where an unreadable AHR topology leaves the run claimed by
+ * its mount only and says so), and a SNAPSHOT rename of the source dataset
+ * (rename is X on the dataset key, §4.2).
  *
  * FIXTURES (ruling (l): fakes print captured output):
  *  - the dev mock's ZFS world (testpool, testpool/media with snap1/snap2, the
@@ -48,6 +57,9 @@ const fixture = (rel: string): string => readFileSync(join(__dirname, '../../fix
 
 const ZFS = '/usr/sbin/zfs'
 const FINDMNT = '/usr/bin/findmnt'
+const CAT = '/usr/bin/cat'
+const VGS = '/usr/sbin/vgs'
+const PRLIMIT = '/usr/bin/prlimit'
 const TESTPOOL_GUID = '5823146802312415237'
 
 /** Replace exactly `count` occurrences of `from` in a capture. */
@@ -58,6 +70,49 @@ function rewrite(text: string, from: string, to: string, count = 1): string {
 
 const FINDMNT_MEDIA = rewrite(rewrite(fixture('mounts/findmnt-full.json'), '"/mnttest/data"', '"/testpool/media"'), '"mnttest/data"', '"testpool/media"')
 const STORAGE_ON_MEDIA = rewrite(rewrite(fixture('pve/storage.cfg'), '\tpool datapool\n', '\tpool testpool/media\n'), '\tmountpoint /datapool\n', '\tmountpoint /testpool/media\n')
+
+// --- cr.33c F4: the AHR world ------------------------------------------------
+// The dev mock's AHR pool `ahr0` replayed as a BACKUP SOURCE. The dev cap
+// seeds the same answers the real node has (mdstat, mdadm exports, lsblk,
+// vgs/lvs/pvs, findmnt, btrfs usage); the two pieces only THIS file supplies
+// are the VG UUID — the cap's `lvm-vgs.json` comes without the `vg_uuid`
+// column, leaving the pool's live `ahr:` key unset — and the mount TABLE the
+// source PATH resolves through (`findmnt-full.json` has no ahr0 btrfs row).
+const AHR_VG_UUID = 'c4Wd2E-1lQp-KdV8-fQ2k-3HbN-9zQe-Lx7T9a'
+const AHR_SOURCE = '/mnt/anas-ahr/ahr0/shares/media'
+const AHR_VGS_WITH_UUID = ((): string => {
+  const parsed = JSON.parse(fixture('ahr/lvm-vgs.json')) as {
+    report: { vg: { vg_name: string, vg_uuid?: string }[] }[]
+  }
+  const row = parsed.report[0].vg.find(v => v.vg_name === 'ahr0')
+  assert.ok(row, 'the dev mock lvm-vgs.json has an ahr0 VG')
+  row.vg_uuid = AHR_VG_UUID
+  return JSON.stringify(parsed)
+})()
+
+/** `findmnt-full` with the AHR pool's btrfs row added — a source path on the pool resolves. */
+const FINDMNT_AHR = ((): string => {
+  const parsed = JSON.parse(FINDMNT_MEDIA) as { filesystems: { children?: { target: string, source: string, fstype: string, options: string }[] }[] }
+  parsed.filesystems[0].children!.push({
+    target: '/mnt/anas-ahr/ahr0',
+    source: '/dev/mapper/ahr0-ahr0--vol',
+    fstype: 'btrfs',
+    options: 'rw,relatime,space_cache=v2,subvolid=5,subvol=/',
+  })
+  return JSON.stringify(parsed)
+})()
+
+/** The dev mock's backup registry + secret, so a direct run can genuinely COMPLETE. */
+async function registerBackupRepo(): Promise<void> {
+  await writeFile(process.env.ANAS_BACKUP_REPOS_FILE!, JSON.stringify({
+    version: 1,
+    updatedBy: 'root@pam',
+    updatedAt: '2026-10-15T10:00:00Z',
+    repos: [{ name: 'pbs-main', host: 'localhost', port: 8007, datastore: 'store', authType: 'token', tokenId: 'any' }],
+  }))
+  await mkdir(process.env.ANAS_BACKUP_CREDS_DIR!, { recursive: true })
+  await writeFile(join(process.env.ANAS_BACKUP_CREDS_DIR!, 'backup-repo-pbs-main.secret'), 'token-secret\n')
+}
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -81,6 +136,8 @@ const DESTROY_RECURSIVE: Verb = { name: 'recursive destroy', operation: 'zfs.des
 const ROLLBACK: Verb = { name: 'rollback', operation: 'zfs.rollback', method: 'POST', url: '/v1/pools/testpool/datasets/media/snapshots/snap2/rollback' }
 const ROLLBACK_FORCE: Verb = { name: 'forced rollback', operation: 'zfs.rollback', method: 'POST', url: '/v1/pools/testpool/datasets/media/snapshots/snap1/rollback?force=true' }
 const RENAME_SNAP1: Verb = { name: 'rename', operation: 'zfs.rename', method: 'PUT', url: '/v1/pools/testpool/datasets/media/snapshots/snap1', payload: { newName: 'renamed' } }
+/** The AHR pool destroy — X on `ahr:<vg uuid>` and `ahrname:<name>`. */
+const AHR_DESTROY: Verb = { name: 'AHR destroy', operation: 'ahr.destroy', method: 'DELETE', url: '/v1/ahr/ahr0' }
 
 /** A store writer's executor: every systemctl the writer runs succeeds. */
 const QUIET: CommandExecutor = { exec: async () => ok('') } as unknown as CommandExecutor
@@ -98,6 +155,14 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
   let unpark: () => void = () => {}
   /** What `findmnt --json` answers; null = the read fails. */
   let findmnt: string | null = FINDMNT_MEDIA
+  /** What the AHR topology read's `findmnt --json --real` answers; undefined = the mock cap, null = the read fails. */
+  let ahrFindmnt: string | null | undefined
+  /** `cat /proc/mdstat` THROWS — `readAhrPools` fails open (cr.33c F1). */
+  let ahrBroken = false
+  /** The ahr0 VG answers WITH its UUID — the pool's live `ahr:<uuid>` key. */
+  let ahrUuid = false
+  /** `prlimit` answers success — the direct backup's pbc run completes. */
+  let prlimitOk = false
   const saved: Record<string, string | undefined> = {}
 
   function setEnv(k: string, v: string): void {
@@ -139,11 +204,24 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     return (server as unknown as { jobQueue: JobQueue }).jobQueue
   }
 
-  /** The dev mock, its findmnt the re-pointed capture, every command recorded, the mover's job bodies parkable. */
-  async function serve(mover: string, table: string | null = FINDMNT_MEDIA): Promise<void> {
+  /**
+   * The dev mock, its findmnt the re-pointed capture, every command recorded,
+   * the mover's job bodies parkable. The AHR world follows the ahr0 cap: the
+   * VG UUID answer and the pbc completion are opt-in (`ahrUuid`, `prlimitOk`),
+   * and `ahrBroken` makes `readAhrPools` fail open (cr.33c F1).
+   */
+  async function serve(
+    mover: string,
+    table: string | null = FINDMNT_MEDIA,
+    opts: { ahrFindmnt?: string | null, ahrBroken?: boolean, ahrUuid?: boolean, prlimitOk?: boolean } = {},
+  ): Promise<void> {
     calls = []
     findmnt = table
     parkedOp = mover
+    ahrFindmnt = opts.ahrFindmnt
+    ahrBroken = opts.ahrBroken ?? false
+    ahrUuid = opts.ahrUuid ?? false
+    prlimitOk = opts.prlimitOk ?? false
     park = new Promise<void>((resolve) => {
       unpark = resolve
     })
@@ -159,6 +237,17 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
       calls.push({ op, command, args })
       if (command === FINDMNT && args.length === 1 && args[0] === '--json')
         return findmnt === null ? { stdout: '', stderr: 'findmnt: cannot read /proc/self/mountinfo', exitCode: 1 } : ok(findmnt)
+      if (command === FINDMNT && args.length === AHR_FINDMNT_ARGS.length && args.every((a, i) => a === AHR_FINDMNT_ARGS[i])) {
+        return ahrFindmnt === null
+          ? { stdout: '', stderr: 'findmnt: cannot read /proc/self/mountinfo', exitCode: 1 }
+          : (ahrFindmnt !== undefined ? ok(ahrFindmnt) : orig(command, args, opts))
+      }
+      if (command === CAT && ahrBroken && args.length === MDSTAT_CAT_ARGS.length && args.every((a, i) => a === MDSTAT_CAT_ARGS[i]))
+        throw new Error('mock: /proc/mdstat is unreadable')
+      if (command === VGS && ahrUuid && args.length === VGS_ARGS.length && args.every((a, i) => a === VGS_ARGS[i]))
+        return ok(AHR_VGS_WITH_UUID)
+      if (command === PRLIMIT && prlimitOk)
+        return ok('')
       return orig(command, args, opts)
     }
     await server.ready()
@@ -414,5 +503,90 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
       'schedule:nightly-media shared',
     ])
     assertRefusedByPve(job, ROLLBACK_FORCE)
+  })
+
+  it('cr.33c F5: a SNAPSHOT rename of the SOURCE dataset — rename is X on the dataset key (§4.2) — accepted while a replication send reads it waits for the send and re-gates — no zfs rename', async () => {
+    await serve('zfs.replicate')
+    const res = await inject({ method: 'POST', url: '/v1/pools/testpool/datasets/media/replicate', payload: { target: { pool: 'testpool', dataset: 'replica/media' } } })
+    assert.equal(res.statusCode, 202, res.body)
+    const runId = (res.json() as JobAccepted).job.id
+    const job = await race(runId, 'zfs.replicate', RENAME_SNAP1, pveClaimsMedia)
+    // The claims the run held (pinned after the race, so a run that holds none fails on the race itself).
+    const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[] }> }).jobs.get(runId)!
+    assert.deepEqual(record.claims.map(c => `${c.key} ${c.mode}`), [
+      `zfs:${TESTPOOL_GUID}/media shared`,
+      `zfs:${TESTPOOL_GUID} shared`,
+      `zpool:${TESTPOOL_GUID} shared`,
+      'zname:testpool shared',
+    ])
+    assertRefusedByPve(job, RENAME_SNAP1)
+  })
+
+  it('cr.33c F4 (a): the direct backup run on an AHR-pool source holds its ahr: keys and mount shared; an AHR destroy accepted meanwhile waits for the run and re-gates (an unreadable mount table reads as a system pool) — the pool survives', async () => {
+    await writeBackupTask(QUIET, systemdDir, BackupTask.parse({
+      name: 'media-nightly',
+      repository: 'pbs-main',
+      backupId: 'anas-pve',
+      archives: [{ name: 'media', path: AHR_SOURCE, excludes: [] }],
+      schedule: '*-*-* 02:00:00',
+      enabled: true,
+    }))
+    await serve('backup.task.run', FINDMNT_AHR, { ahrUuid: true })
+    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true } })
+    assert.equal(res.statusCode, 202, res.body)
+    const runId = (res.json() as JobAccepted).job.id
+    await until(() => queue().get(runId)?.status === 'running')
+    const id = await accept(AHR_DESTROY)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(queue().get(id)?.status, 'queued', 'the AHR destroy waits for the backup run')
+    assert.equal(queue().get(id)?.progress, `waiting for backup.task.run (job ${runId}) on AHR pool 'ahr0'`)
+    // The flip: cr.23 — an UNREADABLE mount table reads as a system pool, so
+    // the destroy's job-time re-gate refuses instead of tearing the pool down.
+    ahrFindmnt = null
+    unpark()
+    const job = await finished(id)
+    assert.ok(['completed', 'failed'].includes((await finished(runId)).status))
+    // The claims the run held (pinned after the race, so a run that holds none fails on the race itself).
+    const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[] }> }).jobs.get(runId)!
+    assert.deepEqual(record.claims.map(c => `${c.key} ${c.mode}`), [
+      `ahr:${AHR_VG_UUID} shared`,
+      'ahrname:ahr0 shared',
+      'mount:/mnt/anas-ahr/ahr0 shared',
+      'task:backup:media-nightly shared',
+    ])
+    assert.equal(job.status, 'failed', JSON.stringify(job.error))
+    assert.equal(job.error?.code, 'CONFLICT')
+    assert.match(job.error!.message, /treated as a system pool/)
+    // It WAITED: every command the destroy's job ran came after the run's last.
+    const lastRun = calls.map(c => c.op).lastIndexOf('backup.task.run')
+    const firstVerb = calls.findIndex(c => c.op === 'ahr.destroy')
+    assert.ok(lastRun >= 0 && firstVerb > lastRun, `the destroy's job-time reads (${firstVerb}) come after the run's last command (${lastRun})`)
+  })
+
+  it('cr.33c F4 (b): an UNREADABLE AHR topology (cr.33c F1) leaves the direct run claimed by its mount only — the unlocked sentence names the AHR topology, the claim set has no ahr: key, and the run still completes', async () => {
+    await registerBackupRepo()
+    await writeBackupTask(QUIET, systemdDir, BackupTask.parse({
+      name: 'media-nightly',
+      repository: 'pbs-main',
+      backupId: 'anas-pve',
+      archives: [{ name: 'media', path: AHR_SOURCE, excludes: [] }],
+      schedule: '*-*-* 02:00:00',
+      enabled: true,
+    }))
+    await serve('backup.task.run', FINDMNT_AHR, { ahrBroken: true, prlimitOk: true })
+    const res = await inject({ method: 'POST', url: '/v1/backup/tasks/media-nightly/run', payload: { direct: true } })
+    assert.equal(res.statusCode, 202, res.body)
+    const runId = (res.json() as JobAccepted).job.id
+    await until(() => queue().get(runId)?.status === 'running')
+    // Only the mount the path sits on and the task's own key — the ahr: lock
+    // could not be taken, and the progress line says exactly why.
+    const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string }[] }> }).jobs.get(runId)!
+    assert.deepEqual(record.claims.map(c => c.key), ['mount:/mnt/anas-ahr/ahr0', 'task:backup:media-nightly'])
+    assert.equal(
+      queue().get(runId)?.progress,
+      `backup task 'media-nightly': ${AHR_SOURCE}: no lock on the source - the AHR topology could not be read, so it is unknown whether the filesystem is an ANAS AHR pool`,
+    )
+    unpark()
+    assert.equal((await finished(runId)).status, 'completed')
   })
 })

@@ -108,6 +108,22 @@ describe('cr.33b — pathSourceClaims: the keys the destructive verbs take, shar
     assert.deepEqual(unlocked, ['/mnttest/data/photos: no lock on the source - the mount table could not be read, so its filesystem is unknown'])
   })
 
+  it('cr.33c F1: an unreadable AHR topology keeps the mount key, takes no ahr: key, and says why — like the mount-table failure', async () => {
+    const { claims, unlocked } = await pathSourceClaims(
+      executor({ findmnt: AHR }),
+      ['/mnt/anas-ahr/ahr0/shares/media'],
+      async () => { throw new Error('mdstat did not answer') },
+    )
+    assert.deepEqual(short(claims), ['mount:/mnt/anas-ahr/ahr0 shared'])
+    assert.deepEqual(unlocked, ['/mnt/anas-ahr/ahr0/shares/media: no lock on the source - the AHR topology could not be read, so it is unknown whether the filesystem is an ANAS AHR pool'])
+  })
+
+  it('a btrfs mount that a READABLE topology names no ANAS pool is just a mount — no unlocked sentence', async () => {
+    const { claims, unlocked } = await pathSourceClaims(executor({ findmnt: AHR }), ['/mnt/anas-ahr/ahr0/shares'], async () => [])
+    assert.deepEqual(short(claims), ['mount:/mnt/anas-ahr/ahr0 shared'])
+    assert.deepEqual(unlocked, [])
+  })
+
   it('a replication source or a schedule target: the dataset\'s keys, shared', async () => {
     assert.deepEqual(short(await datasetSourceClaims(executor(), ['mnttest/data'])), [
       `zfs:${GUID}/data shared`,

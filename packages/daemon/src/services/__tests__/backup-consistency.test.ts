@@ -229,8 +229,17 @@ describe('backup consistency derivation (backup2.3)', () => {
       throw new Error('lvm is unhappy')
     })
     assert.deepEqual(facts.ahrPools, [])
-    // A btrfs pool with no topology to identify it degrades to live, not a crash.
-    assert.equal(deriveConsistency('/mnt/ahr1', facts).consistency, 'live')
+    // cr.33c F1: the facts SAY the AHR read failed — a btrfs pool with no
+    // topology degrades to live, not a crash, and the reason names the
+    // unreadable topology instead of claiming "not an ANAS AHR pool".
+    assert.equal(facts.ahrUnreadable, true)
+    const c = deriveConsistency('/mnt/ahr1', facts)
+    assert.equal(c.consistency, 'live')
+    assert.match(c.reason, /the AHR topology could not be read/)
+    // The same facts object answered a MOUNTED anas pool before (the readable
+    // twin: a Readable-but-empty AHR list is "no pools", never "unreadable").
+    const readable = await readConsistencyFacts(new MockExecutor(), async () => [])
+    assert.equal(readable.ahrUnreadable, false)
   })
 
   it('derives a whole archive list in order from ONE fact read', async () => {
