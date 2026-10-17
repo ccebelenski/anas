@@ -118,8 +118,10 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
     )
 
     assert.deepEqual(result, { created: 't2', mountpoint: join(mountBase, 't2'), arrays: ['t2-r1'] })
-    // The two MOUNT calls additionally carry the inherited O_PATH fd (cr.52r D3)
-    // — compare command+args here, and pin the fd's resolved path below.
+    // The two MOUNT calls additionally carry the inherited pin fd —
+    // O_RDONLY|O_DIRECTORY|O_NOFOLLOW, not O_PATH (cr.52r D3; cr.52s-f F4:
+    // fs.constants.O_PATH is undefined on node 22 and 26) — compare
+    // command+args here, and pin the fd's resolved path below.
     assert.deepEqual(executor.calls.map(c => ({ command: c.command, args: c.args })), [
       // Job-time name re-check (ident.3, H6): no live `t2-r<N>` array, no pin,
       // no `t2-*` partition label, no VG named `t2` — read before the first
@@ -183,7 +185,8 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       // §12 subvolume layout: mount the top-level, carve @data + @snapshots,
       // unmount — then the pool mounts subvol=@data. cr.52r D3: both mounts go
       // through the daemon-OPENED directory (target /proc/self/fd/3, `-c`), with
-      // the child inheriting the O_PATH fd.
+      // the child inheriting the pin fd (O_RDONLY|O_DIRECTORY|O_NOFOLLOW, not
+      // O_PATH — cr.52s-f F4: fs.constants.O_PATH is undefined on node 22/26).
       { command: '/usr/bin/mount', args: ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/t2/t2-vol', '/proc/self/fd/3/.'] },
       { command: '/usr/bin/btrfs', args: ['subvolume', 'create', join(mountBase, 't2', '@data')] },
       { command: '/usr/bin/btrfs', args: ['subvolume', 'create', join(mountBase, 't2', '@snapshots')] },

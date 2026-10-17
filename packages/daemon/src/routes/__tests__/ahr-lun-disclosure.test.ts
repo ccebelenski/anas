@@ -53,8 +53,10 @@ const Z = 'ata-TANK_Z'
 const SIZE = 2 * GIB + 8 * MIB
 const B1 = 2 * GIB - MIB
 const LV_SIZE = 4 * GIB
-// cr.52r D3: an AHR remount/rollback opens the pool's mountpoint O_PATH before
-// the mount — the stored mountpoint must be a REAL directory, so it is a
+// cr.52r D3: an AHR remount/rollback pins the pool's mountpoint before the
+// mount — an O_RDONLY|O_DIRECTORY|O_NOFOLLOW open, not O_PATH (cr.52s-f F4:
+// fs.constants.O_PATH is undefined on node 22 and 26; the readlink proof is
+// the guarantee) — so the stored mountpoint must be a REAL directory, hence a
 // per-process tmpdir the harness creates and removes itself.
 const MOUNTPOINT = join(tmpdir(), `anas-cr38r-tank-${process.pid}`)
 /** The move's target, under the test's TMPDIR — the move job creates it for real. */

@@ -10,8 +10,11 @@ import { mountThroughOpenedDir, openMountTarget } from '../mounts.js'
 
 /**
  * Story cr.52s-a (cr.52r review defect 4): `openMountTarget` lstat-walks the
- * mountpoint's parents and then opens the leaf O_PATH|O_DIRECTORY|O_NOFOLLOW —
- * two separate syscalls, and O_NOFOLLOW guards only the LAST component. A
+ * mountpoint's parents and then opens the leaf `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`
+ * (cr.52s-f F4: fs.constants.O_PATH is undefined on node 22 and 26 — the
+ * written O_PATH flag folds to 0, and the probe showed a real O_PATH would
+ * buy nothing) — two separate syscalls, and O_NOFOLLOW guards only the LAST
+ * component. A
  * parent exchanged for a symlink between the walk and the open used to be
  * followed: under the flip loop below, 19,596 of 70,972 opens landed on the
  * victim directory. The fix proves after the open that the pinned inode IS

@@ -25,9 +25,11 @@ const FSTAB_FIXTURE = readFileSync(join(fixturesDir, 'fstab-anas-managed'), 'utf
 const STORAGE_CFG = join(fixturesDir, 'storage.cfg')
 
 /**
- * cr.52r D3: a daemon-run mount(8) now opens the mountpoint's final directory
- * O_PATH BEFORE the syscall, so a mount the test EXPECTS to succeed needs a
- * REAL directory. The fixture fstab's fixed `/mnt/…` mountpoints are mapped to
+ * cr.52r D3: a daemon-run mount(8) now pins the mountpoint's final directory
+ * BEFORE the syscall (an O_RDONLY|O_DIRECTORY|O_NOFOLLOW open — cr.52s-f F4:
+ * fs.constants.O_PATH is undefined on node 22 and 26, so the open is not
+ * O_PATH; the readlink proof is the guarantee), so a mount the test EXPECTS
+ * to succeed needs a REAL directory. The fixture fstab's fixed `/mnt/…` mountpoints are mapped to
  * a real, writable base under the per-test tmpdir (`mountBase`, set by the
  * shared beforeEach); `/mnt/…` itself is not writable to a non-root test.
  */

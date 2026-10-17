@@ -53,8 +53,11 @@ const Y = 'ata-TANK_Y'
 const DISK_SIZE = 2 * GIB + 8 * MIB
 const BAND_SIZE = 2 * GIB - MIB
 const LV_SIZE = 2143289344
-// cr.52r D3: the remount's mount opens the pool's mountpoint O_PATH — it must
-// be a REAL directory, so the stored mountpoint is a per-process tmpdir.
+// cr.52r D3: the remount's mount pins the pool's mountpoint with an
+// O_RDONLY|O_DIRECTORY|O_NOFOLLOW open (not O_PATH — cr.52s-f F4:
+// fs.constants.O_PATH is undefined on node 22 and 26; the readlink proof is
+// the guarantee) — it must be a REAL directory, so the stored mountpoint is
+// a per-process tmpdir.
 const MOUNTPOINT = join(tmpdir(), `anas-ahr-remount-mp-${process.pid}`)
 const DM_NAME = 'tank-tank--vol'
 

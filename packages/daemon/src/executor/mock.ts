@@ -17,8 +17,10 @@ import { CommandTimeoutError, resolveDeadline } from './deadline.js'
  * One recorded exec()/execToStream() call. cr.52r D3 adds the inherited
  * descriptors: `inheritedFds` are the raw fds handed to the child at 3, 4, …,
  * and `fdPaths` their BEST-EFFORT resolve (`readlink /proc/self/fd/N`, in THIS
- * process — a test's daemon-opened O_PATH descriptor reads back honestly, so a
- * test pins exactly which directory the daemon opened). `null` per fd when the
+ * process — a test's daemon-opened pin descriptor (`O_RDONLY|O_DIRECTORY|
+ * O_NOFOLLOW`, not O_PATH: cr.52s-f F4, fs.constants.O_PATH is undefined on
+ * node 22 and 26) reads back honestly, so a test pins exactly which directory
+ * the daemon opened). `null` per fd when the
  * readlink fails (a closed fd, a non-path descriptor).
  */
 export interface MockExecCall {

@@ -66,8 +66,11 @@ function rewrite(text: string, from: string, to: string): string {
   return text.replace(from, to)
 }
 
-// cr.52r D3: a daemon-run AHR remount opens the mountpoint's directory O_PATH
-// BEFORE the mount, so the pool's stored mountpoint must be a REAL directory.
+// cr.52r D3: a daemon-run AHR remount pins the mountpoint's directory
+// (O_RDONLY|O_DIRECTORY|O_NOFOLLOW — cr.52s-f F4: fs.constants.O_PATH is
+// undefined on node 22 and 26, so the open is not O_PATH; the readlink proof
+// in openMountTarget is the guarantee) BEFORE the mount, so the pool's stored
+// mountpoint must be a REAL directory.
 // The stage-0 capture above the OS's unwritable /mnt is re-pointed at a
 // per-process tmpdir the harness creates (and rms) itself.
 const MOUNTPOINT = join(tmpdir(), `anas-cr38-ahr0-${process.pid}`)

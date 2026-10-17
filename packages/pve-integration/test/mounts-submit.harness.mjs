@@ -222,7 +222,7 @@ function makeStore() {
 
 // ---- The ANAS stub ----------------------------------------------------------
 
-const captured = { jobs: [], posts: [], alerts: [] }
+const captured = { jobs: [], posts: [], alerts: [], msgAlerts: [], gets: [] }
 
 // Queued responses for POST /mounts/test (shifted one per test post; the
 // default — an `ok` verdict — applies when the queue is empty).
@@ -263,6 +263,7 @@ function loadUi() {
     fmtMode: () => ({ valid: true, symbolic: 'rw-r--r--', gloss: '' }),
     api: {
       get(_node, path) {
+        captured.gets.push(path)
         if (path === '/identity/users') { return Promise.resolve({ data: [{ name: 'smbuser', uid: 1000 }] }) }
         if (path === '/identity/groups') { return Promise.resolve({ data: [{ name: 'users', gid: 100 }] }) }
         if (path === `/mounts/${encodeURIComponent(MOUNTPOINT)}`) { return Promise.resolve({ data: DETAIL }) }
@@ -278,6 +279,9 @@ function loadUi() {
       },
     },
     runJob(opts) { captured.jobs.push(opts) },
+    // Captured the same way as runJob: the confirm dialog lives in 10-api.js,
+    // not in the panel — the row drives the captured opts.onComplete directly.
+    confirmAndRun(opts) { captured.jobs.push(opts) },
   }
   const sandbox = {
     window: win,
@@ -297,7 +301,8 @@ function loadUi() {
         }
         throw new Error(`unexpected Ext.create(${xclass})`)
       },
-      Msg: { alert() {} },
+      // Recorded, not swallowed: the Disable-warnings rows below consume these.
+      Msg: { alert(title, msg) { captured.msgAlerts.push({ title, msg }) } },
     },
   }
   vm.runInNewContext(readFileSync(join(SRC, '67-mounts.js'), 'utf8'), sandbox, { filename: '67-mounts.js' })
@@ -548,6 +553,56 @@ check(fullJob && fullJob.method === 'post', 'a filled-credentials CIFS create PO
 check(fullJob && fullJob.body.credentials && fullJob.body.credentials.username === 'smbuser', `the username travels (got ${JSON.stringify(fullJob && fullJob.body.credentials)})`)
 check(fullJob && fullJob.body.credentials && fullJob.body.credentials.password === 's3cret', 'the password travels')
 check(fullJob && fullJob.body.credentials && fullJob.body.credentials.domain === 'WORKGROUP', 'the domain rides along')
+
+// ---- 7. DISABLE: the completed job's warnings reach the operator (cr.69 (b)) --
+//
+// A disable whose `.automount` unit would not stop carries that failure in the
+// COMPLETED job's result.warnings (daemon routes/mounts.ts) — the panel must
+// surface it the way Remove does, and reload either way.
+
+function fireDisable() {
+  const view = makeView()
+  const cfg = ANAS.views.mounts.factory('node1')
+  const btn = toolbarButton(cfg, 'Disable')
+  check(!!btn, "the 'Disable' toolbar button exists")
+  captured.jobs.length = 0
+  captured.msgAlerts.length = 0
+  captured.gets.length = 0
+  btn.handler({ up: () => view })
+  return captured.jobs[0]
+}
+
+const disableOpts = fireDisable()
+check(!!disableOpts, 'the Disable button fires a job')
+check(
+  disableOpts && disableOpts.method === 'post'
+  && disableOpts.path === `/mounts/${encodeURIComponent(MOUNTPOINT)}/state`
+  && disableOpts.body && disableOpts.body.action === 'disable',
+  `the Disable job posts the state action (got ${JSON.stringify(disableOpts && disableOpts.path)})`,
+)
+check(typeof (disableOpts && disableOpts.onComplete) === 'function', 'the disable opts carry an onComplete')
+
+// The job COMPLETED carrying the daemon's warning (the failed automount stop).
+disableOpts.onComplete({ result: { warnings: ['Could not stop the automount unit — x-anas-automount… (exit 5)'] } })
+await flush()
+check(captured.msgAlerts.length === 1, `the warnings-bearing job fires exactly one alert (got ${captured.msgAlerts.length})`)
+const wa = captured.msgAlerts[0]
+check(wa && wa.title === 'Mount disabled', `the alert is titled for the case (got ${JSON.stringify(wa && wa.title)})`)
+check(wa && String(wa.msg).indexOf('Could not stop the automount unit') !== -1, `the alert body carries the warning text (got ${JSON.stringify(wa && wa.msg)})`)
+check(
+  captured.gets.includes('/mounts') && captured.gets.includes(`/mounts/${encodeURIComponent(MOUNTPOINT)}`),
+  `the warning-bearing disable still reloads grid and detail (got ${JSON.stringify(captured.gets)})`,
+)
+
+// A completed job with NO warnings: no alert at all, the reloads still run.
+const disableOpts2 = fireDisable()
+disableOpts2.onComplete({ result: {} })
+await flush()
+check(captured.msgAlerts.length === 0, `a warnings-free job fires no alert (got ${JSON.stringify(captured.msgAlerts)})`)
+check(
+  captured.gets.includes('/mounts') && captured.gets.includes(`/mounts/${encodeURIComponent(MOUNTPOINT)}`),
+  `the clean disable still reloads grid and detail (got ${JSON.stringify(captured.gets)})`,
+)
 
 // ---- Report -----------------------------------------------------------------
 

@@ -313,7 +313,7 @@
         armed: { color: 'var(--anas-accent,#3468c0)', label: 'Automount (armed)',
             title: 'An automount placeholder — mounts on first access. Not an error.' },
         disabled: { color: 'var(--anas-muted,gray)', label: 'Disabled',
-            title: 'Deliberately disabled — the fstab entry is commented with the #ANAS marker. Enable restores it (mounts at next boot or via Mount).' },
+            title: 'Deliberately disabled — the fstab line is kept, marked noauto,x-anas.disabled (an automount line is parked too). Enable removes the marker; the mount returns at the next boot or via Mount.' },
     };
 
     function statePill(state) {
@@ -676,7 +676,7 @@
         } catch (e) {
             // non-fatal
         }
-        // Disable/Enable (the #ANAS fstab marker) — config-level, so only
+        // Disable/Enable (the noauto,x-anas.disabled marker since cr.6) — config-level, so only
         // fstab-persisted, non-PVE rows. The button label follows the state.
         var isOff = has && ('' + rec.get('state')).toLowerCase() === 'disabled';
         var persisted = has && first(rec.get('persistent'), rec.get('inFstab')) === true;
@@ -984,12 +984,16 @@
         }
     }
 
-    // ---- Disable / Enable (the #ANAS fstab marker; config-level) -----------
+    // ---- Disable / Enable (the noauto,x-anas.disabled marker; config-level) --
     //
     // disable = unmount now (busy → the standard 409 holder-list confirm) and
-    // comment the fstab line as '#ANAS <original>'; credentials are kept.
-    // enable = strip the marker ONLY (byte-identical restore) — it does not
-    // mount; the row shows 'unmounted' until Mount or the next boot.
+    // keep the fstab line LIVE with a noauto,x-anas.disabled marker appended
+    // (the operator's own noauto is kept; an automount line parks its
+    // x-systemd.automount as x-anas.disabled-automount, cr.19); credentials
+    // are kept. Legacy '#ANAS'-commented lines still read as disabled and
+    // convert only when ANAS next writes the line.
+    // enable = drop the marker options ONLY — it does not mount; the row
+    // shows 'unmounted' until Mount or the next boot.
 
     function mountEnableDisable(view, node, rec) {
         if (!rec) {
@@ -1006,7 +1010,28 @@
             view: grid,
             failTitle: disabling ? 'Disable failed' : 'Enable failed',
             successMsg: (disabling ? t('Disabled') : t('Enabled')) + ' ' + mp,
-            onComplete: function () {
+            onComplete: function (job) {
+                // cr.69 (b): a disable whose `.automount` unit would not stop
+                // rides the COMPLETED job as a warning (the daemon pushes it
+                // there) — show it like Remove shows its warnings, so the
+                // failed stop reaches the operator and not only the job record.
+                var warnings = [];
+                try {
+                    var result = (job && job.result) || {};
+                    if (isArray(result.warnings)) {
+                        warnings = result.warnings;
+                    }
+                } catch (eRes) {
+                    warnings = [];
+                }
+                if (warnings.length) {
+                    try {
+                        Ext.Msg.alert(disabling ? t('Mount disabled') : t('Mount enabled'),
+                            ANAS.warningsHtml(warnings));
+                    } catch (eMsg) {
+                        ANAS.warn(warnings.join(' '));
+                    }
+                }
                 loadMounts(view, node);
                 loadMountDetail(view, node, mp);
             },

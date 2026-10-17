@@ -16,8 +16,10 @@ import { credsFilePath } from '../../services/mounts.js'
 
 /**
  * Story cr.52s-c (a): the remote-mount CREATE job creates its mountpoint
- * THROUGH THE OPENED PARENT (the O_PATH pin + readlink proof — never
- * `mkdir(recursive)` on a path a non-root user can re-point), and the MOUNT
+ * THROUGH THE OPENED PARENT (the pin — `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`, not
+ * O_PATH: cr.52s-f F4, fs.constants.O_PATH is undefined on node 22 and 26 —
+ * plus the readlink proof — never `mkdir(recursive)` on a path a non-root
+ * user can re-point), and the MOUNT
  * runs before the fstab line is written: a refused or failed mount leaves no
  * line and no credentials file (what the create does write, it removes again
  * when a later step fails).
@@ -29,9 +31,12 @@ import { credsFilePath } from '../../services/mounts.js'
  * lstat of it and hides the swap from exactly the two lstat calls that walk
  * makes (the `realLongestExistingAncestor` probe and the symlink walk — the
  * `fakeRootOwnedChain` idiom, same file), so the gate passes. What must refuse
- * now is the OPEN itself: `O_PATH | O_DIRECTORY | O_NOFOLLOW` cannot follow a
- * symlink, and only a syscall sees the truth — an argv through the fd, not a
- * string mkdir through the link. The fake is undone in a `finally`.
+ * now is the OPEN itself: the pin open `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`
+ * cannot follow a final symlink (cr.52s-f F4: fs.constants.O_PATH is
+ * undefined on node 22 and 26, so the written O_PATH flag folds to 0 — and
+ * the probe showed a real O_PATH would buy nothing), and only a syscall sees
+ * the truth — an argv through the fd, not a string mkdir through the link.
+ * The fake is undone in a `finally`.
  *
  * cr.52s-f F3 adds the ROLLBACK half: a failed create at a leaf THIS JOB
  * created rmdir's it through the opened parent (a pre-existing directory

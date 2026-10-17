@@ -73,8 +73,11 @@ const FUSER_ONE_HOLDER = rewrite(FUSER_TWO_HOLDERS, ' 483285', '')
 const SYSTEMCTL = '/usr/bin/systemctl'
 
 // cr.52r D3: every mount verb that ACTS mounts/unmounts through a REAL
-// directory (the daemon opens the mountpoint O_PATH first), so the harness's
-// mountpoints map into a per-test tmpdir — never the OS's unwritable /mnt.
+// directory (the daemon pins the mountpoint first — an O_RDONLY|O_DIRECTORY|
+// O_NOFOLLOW open, not O_PATH: fs.constants.O_PATH is undefined on node 22
+// and 26, cr.52s-f F4, with the readlink proof as the guarantee), so the
+// harness's mountpoints map into a per-test tmpdir — never the OS's
+// unwritable /mnt.
 // Resolved per-test: `mountBase` is set by the shared beforeEach.
 let mountBase = ''
 const NFS_MP = (): string => join(mountBase, 'anas-nfs')
