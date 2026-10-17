@@ -854,7 +854,10 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     // §12 subvol-layout pool and falls through to the options-less lsblk
     // fallback below, which reads subvolLayout false. Strip the suffix so the
     // real mount (carrying subvol=@data) is found and its options preserved.
-    const mount = mounts.find(m => stripSubvolSuffix(m.source) === mapperPath)
+    // A daemon-run `mount -c` (cr.52r's fd-pinned direct mount) records the LV
+    // path AS GIVEN — `/dev/<vg>/<lv>`, never canonicalised to the mapper name
+    // (stunt node, 2026-10-17) — so both spellings name the pool's mount.
+    const mount = mounts.find(m => [mapperPath, `/dev/${poolName}/${lvName}`].includes(stripSubvolSuffix(m.source)))
       ?? (lsblk.lvmByDmName.get(dmName(poolName, lvName))?.mountpoint
         ? { target: lsblk.lvmByDmName.get(dmName(poolName, lvName))!.mountpoint!, source: mapperPath, fstype: 'btrfs', options: '' }
         : null)

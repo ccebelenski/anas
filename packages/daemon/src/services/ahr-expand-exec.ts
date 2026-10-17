@@ -1182,7 +1182,9 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       // findmnt appends the mounted subvolume to a btrfs source
       // (`…-vol[/@data]`) — strip before matching, else every §12
       // subvol-layout pool's fs-grow halts here.
-      const mount = mounts.find(m => stripSubvolSuffix(m.source) === mapperPath)
+      // A daemon-run `mount -c` records `/dev/<vg>/<lv>` as given, so both
+      // spellings name the pool's mount (stunt node, 2026-10-17).
+      const mount = mounts.find(m => [mapperPath, `/dev/${pool.name}/${pool.lv.name}`].includes(stripSubvolSuffix(m.source)))
       if (!mount)
         throw new Error(`pool '${pool.name}' filesystem is not mounted — btrfs can only be resized mounted`)
       const usageRes = await executor.exec(BTRFS, btrfsUsageArgs(mount.target))

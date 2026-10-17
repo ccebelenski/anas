@@ -379,6 +379,25 @@ describe('readAhrPools', () => {
     assert.ok(pools[0].advisories.some(a => a.includes('READ-ONLY')))
   })
 
+  it('finds the pool mount under the LV path a daemon-run `mount -c` records (not only the mapper name)', async () => {
+    // Stunt node 2026-10-17: the fd-pinned direct mount (`mount -c … -- /dev/<vg>/<lv>
+    // /proc/self/fd/3/.`) does not canonicalise the source, so findmnt reports
+    // `/dev/ahr0/ahr0-vol[/@data]`; a mapper-only match read the pool flat and
+    // read-write, refusing snapshots and Remount.
+    const findmnt = JSON.stringify({
+      filesystems: [{
+        target: '/mnt/anas-ahr/ahr0',
+        source: '/dev/ahr0/ahr0-vol[/@data]',
+        fstype: 'btrfs',
+        options: 'ro,relatime,space_cache=v2,subvolid=256,subvol=/@data',
+      }],
+    })
+    const pools = await readAhrPools(healthyExecutor({ findmnt }))
+    assert.equal(pools[0].subvolLayout, true)
+    assert.equal(pools[0].state, 'readonly')
+    assert.equal(pools[0].mountedReadOnly, true)
+  })
+
   it('subvolLayout follows the mount subvol= option (§12)', async () => {
     // The stage-0 fixture is FLAT (subvol=/): pre-§12, snapshots unavailable.
     const flat = await readAhrPools(healthyExecutor())
