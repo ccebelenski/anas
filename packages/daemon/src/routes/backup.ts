@@ -2202,7 +2202,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // CONFIRM_SCOPE_CHANGED naming the field, while another LUN (target or
     // serial — the address) is a fresh challenge, as before.
     if (!guardConfirm(confirmStore, request, reply, imageRestoreConfirmSpec(`LUN ${lun.index} of ${target.iqn}`), CONFIRM_ONLY_PASS, {
-      validated: { target: target.iqn, serial: lun.serial, repo: req.repo, ns: deps.namespace ?? null, snapshot: req.snapshot, archive: req.archive },
+      // `rate` is written to pbc (the restore's bandwidth cap) and is signed
+      // like its new-LUN twin's — a replay that changes it re-challenges
+      // (parity table 2026-10-17, §2 Safety altitudes: every written field by name).
+      validated: { target: target.iqn, serial: lun.serial, repo: req.repo, ns: deps.namespace ?? null, snapshot: req.snapshot, archive: req.archive, rate: req.rate ?? null },
       address: ['target', 'serial'],
       message: `Restoring ${req.archive} from ${req.snapshot} over LUN ${lun.index} of ${target.iqn}`,
       warnings: [

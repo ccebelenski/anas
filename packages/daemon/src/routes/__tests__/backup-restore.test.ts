@@ -784,6 +784,18 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assertNothingDestructive()
     })
 
+    it('parity table 2026-10-17: the code binds the RATE — the in-place door writes it to pbc, so a replay that changes it is 409 CONFIRM_SCOPE_CHANGED naming rate (its new-LUN twin already signed it)', async () => {
+      await serveAnas()
+      const first = await restore()
+      assert.equal(first.body.error!.code, 'CONFIRMATION_REQUIRED')
+      const code = String(first.headers['x-anas-confirm-code'])
+      const res = await restore(body({ rate: '10MB' }), { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+      assert.equal(res.body.error!.code, 'CONFIRM_SCOPE_CHANGED')
+      assert.deepEqual((res.body.error as { changed?: string[] }).changed, ['rate'])
+      assertNothingDestructive()
+    })
+
     it('cr.56 (H3, folded from cr.54): the code binds the NAMESPACE — a code minted for ns gtrestore replayed with another ns is 409 CONFIRM_SCOPE_CHANGED naming ns, and nothing runs', async () => {
       await serveAnas()
       const first = await restore()
