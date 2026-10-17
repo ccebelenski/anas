@@ -709,7 +709,9 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       guarded(spec, pre, async (_slot, { updateProgress }) => {
         updateProgress(`Creating mountpoint ${req.mountpoint}`)
         // cr.52s-c: the mountpoint is created THROUGH THE OPENED PARENT (the
-        // O_PATH|O_NOFOLLOW pin + readlink proof, the leaf mkdir'd at
+        // pinned read-only-handle + O_NOFOLLOW open — `fs.constants.O_PATH` is
+        // undefined on every node measured, see services/mounts.ts and
+        // cr.52s-f F4 — plus the readlink proof, the leaf mkdir'd at
         // `/proc/self/fd/<fd>/<leaf>`) — never `mkdir(recursive)` on a textual
         // path a non-root user can re-point between this job's re-gate and the
         // mkdir (the old call followed every symlink it met and created
@@ -724,13 +726,18 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         // mount.cifs reads the file AT mount time — the same reason the
         // mount-test probe writes its own temp creds file before the probe
         // mount), and goes again when the mount or the line fails.
+        // cr.52s-f F8(d): the WRITE itself runs INSIDE the rollback try — a
+        // write that fails (the atomic helper leaves no partial file) still
+        // removes the leaf this job made, and reports through the same
+        // sentence as any other failure, not a raw error over a stranded
+        // directory.
         let credsFile: string | undefined
-        if (req.type === 'cifs' && req.credentials && (req.persistent || req.mountNow)) {
-          updateProgress('Writing credentials file')
-          credsFile = await writeCredentialsFile(credsDir, req.mountpoint, req.credentials)
-        }
         let mounted = false
         try {
+          if (req.type === 'cifs' && req.credentials && (req.persistent || req.mountNow)) {
+            updateProgress('Writing credentials file')
+            credsFile = await writeCredentialsFile(credsDir, req.mountpoint, req.credentials)
+          }
           if (req.mountNow) {
             updateProgress(`Mounting ${req.mountpoint}`)
             // cr.52r D3: mount DIRECTLY from the entry through a directory the
@@ -763,16 +770,35 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           const state: string[] = []
           let leftBehind: string | undefined
           if (mounted) {
-            const u = await executor.exec(UMOUNT, ['--', req.mountpoint])
-            state.push(u.exitCode === 0
-              ? `'${req.mountpoint}' was mounted by this job and has been unmounted`
-              // A rollback unmount that itself failed is the one state the
-              // operator must act on — say so, with the reason.
-              : `'${req.mountpoint}' was mounted by this job and the rollback unmount FAILED (${cleanMountStderr(u.stderr) || `umount exited ${u.exitCode}`}) — it is left MOUNTED and must be unmounted by hand`)
+            // cr.52s-f F8(a): a rollback umount that cannot even spawn (the
+            // binary absent, the executor rejecting) is a FAILED rollback
+            // exactly like a non-zero exit — caught HERE, so the credentials
+            // removal and the leaf rmdir still run and the operator hears the
+            // STILL MOUNTED clause with the thrown reason, never the raw
+            // spawn error escaping the catch.
+            try {
+              const u = await executor.exec(UMOUNT, ['--', req.mountpoint])
+              state.push(u.exitCode === 0
+                ? `'${req.mountpoint}' was mounted by this job and has been unmounted`
+                // A rollback unmount that itself failed is the one state the
+                // operator must act on — say so, with the reason.
+                : `'${req.mountpoint}' was mounted by this job and the rollback unmount FAILED (${cleanMountStderr(u.stderr) || `umount exited ${u.exitCode}`}) — it is left MOUNTED and must be unmounted by hand`)
+            }
+            catch (umountErr) {
+              state.push(`'${req.mountpoint}' was mounted by this job and the rollback unmount FAILED (${umountErr instanceof Error ? umountErr.message : String(umountErr)}) — it is left MOUNTED and must be unmounted by hand`)
+            }
           }
           if (credsFile !== undefined) {
-            await rm(credsFile, { force: true }).catch(() => {})
-            state.push('the credentials file was removed')
+            // cr.52s-f F8(b): the sentence says REMOVED only when the rm
+            // actually did (`force: true` already covers the file being gone
+            // before the rollback ran); a real failure names the secret left
+            // on disk instead of claiming the opposite.
+            const rmFailure = await rm(credsFile, { force: true })
+              .then(() => null)
+              .catch((e: unknown) => (e as NodeJS.ErrnoException).code ?? String(e))
+            state.push(rmFailure === null
+              ? 'the credentials file was removed'
+              : `the credentials file '${credsFile}' could not be removed (${rmFailure}) and is left on disk`)
           }
           if (leafCreatedByThisJob) {
             const whyLeft = await removeMountpointLeafThroughOpenedParent(req.mountpoint)
@@ -794,9 +820,23 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         if (req.persistent) {
           // The reload follows the WRITTEN line. A failed reload leaves the
           // line (the config is the state) and the live mount — only systemd's
-          // units are stale — so nothing rolls back here.
+          // units are stale — so nothing rolls back here (the documented
+          // decision). cr.52s-f F8(c): the job failure then NAMES that
+          // surviving state — what is up, where the line is, what to run —
+          // instead of throwing the raw reload error out of the job.
           updateProgress('Reloading systemd (daemon-reload)')
-          await daemonReload(executor)
+          try {
+            await daemonReload(executor)
+          }
+          catch (reloadErr) {
+            const why = reloadErr instanceof Error ? reloadErr.message : String(reloadErr)
+            const survivors: string[] = []
+            if (mounted)
+              survivors.push(`the mount is up at '${req.mountpoint}'`)
+            survivors.push(`the line is written in ${fstabPath}`)
+            survivors.push('systemd\'s units are stale — run \'systemctl daemon-reload\'')
+            throw new Error(`Mount create '${req.mountpoint}' failed — ${[why, ...survivors].join('; ')}; nothing was rolled back`)
+          }
         }
         return { created: req.mountpoint, warnings }
       }),

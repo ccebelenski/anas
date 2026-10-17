@@ -2014,7 +2014,13 @@ export const FD_MOUNT_TARGET = '/proc/self/fd/3/.' as const
 /** The child's fd the daemon-opened directory is handed at (the first inherited fd). */
 export const FD_MOUNT_SLOT = 3
 
-/** A mount-target directory the daemon opened O_PATH — a pin the kernel resolves, not a path string. */
+/**
+ * A mount-target directory the daemon opened as a pinned read-only directory
+ * handle — the pin the kernel resolves, not a path string. (cr.52s-f F4: on
+ * every node version measured — 22 and 26 — `fs.constants.O_PATH` is
+ * undefined, so the handle is an `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` open; the
+ * readlink proof in {@link openMountTarget} is the guarantee.)
+ */
 export interface OpenedMountTarget {
   /** The child's fd number (its `/proc/self/fd/<n>` path). */
   fd: number
@@ -2025,9 +2031,13 @@ export interface OpenedMountTarget {
 /**
  * Open `mountpoint` as a mount target the DAEMON pinned (cr.52r D3): lstat
  * every component (a symlink anywhere in the existing part refuses), then open
- * the final directory `O_PATH | O_DIRECTORY | O_NOFOLLOW` so a parent swapped
- * AFTER the open cannot move what mount(8) will land on (`/proc/self/fd/N`
- * resolves in the child to exactly this directory). Throws when a component is
+ * the final directory `O_PATH | O_DIRECTORY | O_NOFOLLOW` as written — but on
+ * every node version measured (22, 26) `fs.constants.O_PATH` is UNDEFINED, so
+ * the open is really `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` and the readlink proof
+ * below is what makes the pin a guarantee (cr.52s-f F4). Either way a parent
+ * swapped AFTER the open cannot move what mount(8) will land on
+ * (`/proc/self/fd/N` resolves in the child to exactly this directory).
+ * Throws when a component is
  * a symlink or the final directory is missing — callers MKDIR the mountpoint
  * first, and the re-mount verbs' job refuses before they get here.
  */
@@ -2045,10 +2055,19 @@ export async function openMountTarget(mountpoint: string): Promise<OpenedMountTa
   }
   let handle: Awaited<ReturnType<typeof open>>
   try {
-    // O_PATH|O_DIRECTORY|O_NOFOLLOW: an O_PATH descriptor pins the directory
-    // for the kernel, O_DIRECTORY refuses non-dirs, O_NOFOLLOW refuses a final
-    // symlink (the lstat walk above already covered the parents). Some @types
-    // fail to list O_PATH in `constants`' union — it exists at runtime on Linux.
+    // O_PATH|O_DIRECTORY|O_NOFOLLOW as written. cr.52s-f F4 (node probe
+    // 2026-10-17): `fs.constants.O_PATH` is UNDEFINED on every node version
+    // measured (22.23.3 and 26.12), so this lookup yields undefined, the
+    // bitwise OR folds it to 0, and the open the kernel sees (strace) is
+    // `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` — a plain read-only directory
+    // descriptor, and the readlink proof below is the guarantee. Nothing is
+    // lost by the flag being absent: the probe found an O_PATH open of an
+    // autofs trigger FIRES the automount exactly as the plain open does, and
+    // a plain open of an unreadable directory answers EACCES, which never
+    // happens for the root daemon. O_DIRECTORY refuses non-dirs, O_NOFOLLOW
+    // refuses a final symlink (the lstat walk above already covered the
+    // parents). The cast stays for the @types union; do NOT "fix" the
+    // undefined with `?? 0o10000000` — the probe showed it buys nothing.
     const O_PATH = (FS_CONSTANTS as Record<string, number>).O_PATH
     handle = await open(mp, O_PATH | FS_CONSTANTS.O_DIRECTORY | FS_CONSTANTS.O_NOFOLLOW)
   }
@@ -2106,7 +2125,9 @@ export async function openMountTarget(mountpoint: string): Promise<OpenedMountTa
 
 /**
  * Run `mount <...argv> /proc/self/fd/3/.` through a directory the daemon opened
- * (cr.52r D3): open the final directory O_PATH, hand its fd to the mount child
+ * (cr.52r D3): open the final directory as a pinned read-only handle (the flag
+ * the code writes is O_PATH, undefined in node — see {@link openMountTarget}
+ * and cr.52s-f F4), hand its fd to the mount child
  * (`exec`'s {@link ExecOptions.inheritedFds}), target the fd path, close the
  * fd when the child has exited. `-c` (--no-canonicalize) is REQUIRED on every
  * fd-pinned mount: without it util-linux canonicalises `/proc/self/fd/3` to a
@@ -2135,10 +2156,11 @@ export async function mountThroughOpenedDir(
 /**
  * Create the mountpoint directory of a remote-mount create THROUGH ITS OPENED
  * PARENT (cr.52s-c): the parent is opened exactly the way {@link
- * openMountTarget} opens a target (`O_PATH | O_DIRECTORY | O_NOFOLLOW` plus the
+ * openMountTarget} opens a target (its flag set — `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`
+ * on every node measured, cr.52s-f F4 — plus the
  * readlink proof that the pinned inode IS the checked path), and the leaf is
- * created at `/proc/self/fd/<parentFd>/<leaf>` — node has no mkdirat(2), but an
- * O_PATH descriptor is resolvable THROUGH `/proc/self/fd` by the kernel, so the
+ * created at `/proc/self/fd/<parentFd>/<leaf>` — node has no mkdirat(2), but the
+ * pinned descriptor is resolvable THROUGH `/proc/self/fd` by the kernel, so the
  * mkdir lands IN the pinned directory however the textual path moves
  * afterwards. `mkdir(path, { recursive: true })` on the textual path is exactly
  * what this replaces: it follows every symlink it meets, so a parent swapped

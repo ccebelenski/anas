@@ -262,7 +262,12 @@ describe('POST /v1/ahr/:name/remount (ahrcache.1 slice 2)', () => {
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-ahr-remount-'))
     await mkdir(MOUNTPOINT, { recursive: true })
-    await writeFile(join(dir, 'fstab'), `/dev/tank/tank-vol ${MOUNTPOINT} btrfs subvol=@data,nofail 0 0\n`)
+    // cr.52s-f F9: the line carries `noatime` — a real KERNEL option ANAS's
+    // no-line defaults do NOT produce — so the remount argv pin below fails
+    // loudly if the route ever drops its `fstabPath` (the fallback would
+    // mount `subvol=@data` alone, and the old pin could not tell the two
+    // apart; the snapshot route's pin already worked this way).
+    await writeFile(join(dir, 'fstab'), `/dev/tank/tank-vol ${MOUNTPOINT} btrfs noatime,subvol=@data,nofail 0 0\n`)
   })
 
   afterEach(async () => {
@@ -382,7 +387,7 @@ describe('POST /v1/ahr/:name/remount (ahrcache.1 slice 2)', () => {
   })
 
   it('cr.52s-f F7 — a line WITHOUT ro whose mount is read-only still meets the door (btrfs forced it)', async () => {
-    // The beforeEach line is `subvol=@data,nofail` — no `ro` — so the read-only
+    // The beforeEach line is `noatime,subvol=@data,nofail` — no `ro` — so the read-only
     // the mount table shows is the btrfs-forced kind this verb exists for: the
     // door opens (confirm challenge, then the completing pair).
     await build('ro')
@@ -411,16 +416,18 @@ describe('POST /v1/ahr/:name/remount (ahrcache.1 slice 2)', () => {
     // an invented mount at the typed path. cr.52s-c: the route hands the service
     // the SERVER's fstabPath — the harness's own `build()` registers
     // `fstabPath: join(dir, 'fstab')` (a non-default path) and beforeEach writes
-    // the pool's line `subvol=@data,nofail` there, so the argv carries THAT
-    // line's kernel option (the `subvol=@data` passthrough token; the common
-    // `nofail` flag is userspace-only and dropped from the argv, cr.52s-e) —
-    // proof the service read the route's
-    // file, not its ANAS_FSTAB_PATH//etc/fstab fallback (which has no line for
-    // this pool, and would re-mount with ANAS's defaults, iSCSI ordering pair
-    // included).
+    // the pool's line `noatime,subvol=@data,nofail` there, so the argv carries
+    // THAT line's kernel options (`noatime` + the `subvol=@data` passthrough
+    // token, serializer order; the common `nofail` flag is userspace-only and
+    // dropped from the argv, cr.52s-e) — proof the service read the route's
+    // file, not its ANAS_FSTAB_PATH//etc/fstab fallback. cr.52s-f F9: the
+    // fallback for a pool with no line re-mounts with ANAS's defaults (its
+    // `subvol=@data` plus the iSCSI pair, userspace tokens dropped) — which
+    // would print `-o subvol=@data`, exactly the old pin's expectation; the
+    // line's `noatime` is what a DROPPED `fstabPath` now fails on.
     const m = mountCalls[1]!
     assert.equal(m.command, '/usr/bin/mount')
-    assert.deepEqual(m.args, ['-c', '-t', 'btrfs', '-o', 'subvol=@data', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
+    assert.deepEqual(m.args, ['-c', '-t', 'btrfs', '-o', 'noatime,subvol=@data', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
     assert.equal(m.fdPaths?.[0], MOUNTPOINT, 'the fd resolves to the pool mountpoint')
     // GT-20's negative: `mount -o remount,rw` is refused after an error, so it
     // must never be what this verb reaches for.
@@ -436,11 +443,11 @@ describe('POST /v1/ahr/:name/remount (ahrcache.1 slice 2)', () => {
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     // THE LINE is untouched — the beforeEach line keeps its `nofail`.
     const line = (await readFile(join(dir, 'fstab'), 'utf8')).split('\n').find(l => l.includes('/dev/tank/tank-vol'))!
-    assert.equal(line, `/dev/tank/tank-vol ${MOUNTPOINT} btrfs subvol=@data,nofail 0 0`)
-    // THE DIRECT MOUNT carries only the line's kernel option — `nofail` would
+    assert.equal(line, `/dev/tank/tank-vol ${MOUNTPOINT} btrfs noatime,subvol=@data,nofail 0 0`)
+    // THE DIRECT MOUNT carries only the line's kernel options — `nofail` would
     // land in /run/mount/utab under the fd target (cr.52s-d's node fact).
     const m = executor.calls.filter(c => c.command === '/usr/bin/mount').at(-1)!
-    assert.deepEqual(m.args, ['-c', '-t', 'btrfs', '-o', 'subvol=@data', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
+    assert.deepEqual(m.args, ['-c', '-t', 'btrfs', '-o', 'noatime,subvol=@data', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
   })
 
   it('FAILS the job when the pool comes back read-only anyway', async () => {

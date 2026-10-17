@@ -946,7 +946,7 @@ export function createServer(opts?: ServerOptions) {
   // AHR btrfs snapshots (story 11.12, AHR-DESIGN §12) — list/create/delete/
   // rollback over the @data/@snapshots subvolume layout; delete/rollback
   // confirm-gated. Refused on flat-layout pools (no migration verb).
-  server.register(ahrSnapshotRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, intentDir: ahrIntentDir })
+  server.register(ahrSnapshotRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, intentDir: ahrIntentDir, fstabPath })
   // AHR permissions editor (story access.2) — the datasets editor's writer on
   // the pool's mount, through the shared access service.
   server.register(ahrAccessRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, iscsiPaths, accessService })

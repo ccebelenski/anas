@@ -39,6 +39,17 @@ import { credsFilePath } from '../../services/mounts.js'
  * rmdir failure makes the sentence name the directory left behind instead of
  * "Nothing else was written". The rmdir fake rides the same `fsp` +
  * `syncBuiltinESMExports` seam the lstat flip uses.
+ *
+ * cr.52s-f F8 pins the rollback's OWN failure branches: a rollback umount
+ * whose EXEC THROWS (spawn ENOENT — the executor rejecting) is a failed
+ * rollback like any non-zero exit (STILL MOUNTED with the thrown reason, and
+ * the credentials removal + leaf rmdir still run); the credentials `rm`
+ * result feeds the sentence (REMOVED only when it was, else the file named
+ * and left on disk); a `daemon-reload` failure after the written line names
+ * the surviving state (mounted, line kept, units stale, what to run) instead
+ * of the raw reload error; and a failed credentials WRITE runs INSIDE the
+ * rollback try, so the leaf this job made goes too and the failure reports
+ * through the same sentence. The write/rename seams ride the same fsp idiom.
  */
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures')
@@ -338,6 +349,219 @@ describe('cr.52s-c (a) — the create job pins its parent, mounts before the lin
     }
     // The real rmdir never ran — the directory is honestly there.
     assert.equal(await fsp.lstat(mp).then(() => true, () => false), true, 'the leaf is left behind, named in the sentence')
+  })
+
+  it('(F8a) a rollback umount whose exec THROWS is a failed rollback — STILL MOUNTED with the thrown reason, the removals still run', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    // The rollback umount cannot even spawn (the binary absent — the shape of
+    // the executor rejecting with spawn ENOENT, exactly the case that used to
+    // escape the catch and take the credentials removal and the leaf rmdir
+    // down with it).
+    mock.prependFixture({ command: UMOUNT, throws: Object.assign(new Error('spawn /usr/bin/umount ENOENT'), { code: 'ENOENT' }) })
+    const parent = join(dir, 'parent')
+    await mkdir(parent)
+    const mp = join(parent, 'umountthrows')
+
+    // The failure being rolled back: the fstab WRITE after the successful
+    // mount — seam: the atomic replace's rename refuses to land on the fstab
+    // (the shape a read-only mount or a broken path gives). Nothing else in
+    // the job renames onto the fstab path.
+    const realRename = fsp.rename
+    const fakedRename = async (from: string, to: string): Promise<void> => {
+      if (to === fstabPath)
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+      await realRename(from, to)
+    }
+    ;(fsp as unknown as { rename: unknown }).rename = fakedRename
+    syncBuiltinESMExports()
+    try {
+      const res = await create({
+        type: 'cifs',
+        server: 'nas.example.com',
+        remotePath: 'media',
+        mountpoint: mp,
+        persistent: true,
+        mountNow: true,
+        credentials: { username: 'smbuser', password: 's3cret' },
+      })
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed', JSON.stringify(job))
+      // The EXACT sentence: the failed line-write as the reason, the STILL
+      // MOUNTED clause carrying the THROWN message (never the raw spawn error
+      // escaping the catch), then the two removals — both still ran.
+      assert.equal(job.error!.message, `Mount create '${mp}' failed — EACCES: permission denied; `
+      + `'${mp}' was mounted by this job and the rollback unmount FAILED (spawn /usr/bin/umount ENOENT) — it is left MOUNTED and must be unmounted by hand; `
+      + 'the credentials file was removed; '
+      + `'${mp}' was created by this job and has been removed again. `
+      + 'Nothing else was written (no /etc/fstab line)', JSON.stringify(job.error))
+      // The argv: the rollback umount was attempted exactly once, on the path.
+      const umounts = mock.calls.filter(c => c.command === UMOUNT)
+      assert.equal(umounts.length, 1, 'the rollback attempted the umount once')
+      assert.deepEqual(umounts[0]!.args, ['--', mp])
+      // The state the sentence describes: no line (the rename never landed),
+      // no credentials file, no leaf.
+      assert.equal(await readFile(fstabPath, 'utf8'), '', 'no fstab line')
+      assert.equal(await readFile(credsFilePath(credsDir, mp), 'utf8').catch(() => null), null, 'the credentials removal still ran')
+      assert.equal(await fsp.lstat(mp).then(() => true, () => false), false, 'the leaf rmdir still ran')
+    }
+    finally {
+      ;(fsp as unknown as { rename: unknown }).rename = realRename
+      syncBuiltinESMExports()
+    }
+  })
+
+  it('(F8b) a credentials removal that fails names the file left on disk instead of claiming removal', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    mock.prependFixture({ command: MOUNT, result: {
+      stdout: '',
+      stderr: 'mount error(13): Permission denied\nRefer to the mount.cifs(8) manual page (mount.cifs -h)\n',
+      exitCode: 32,
+    } })
+    const parent = join(dir, 'parent')
+    await mkdir(parent)
+    const mp = join(parent, 'rmfails')
+    const creds = credsFilePath(credsDir, mp)
+
+    // The seam: exactly the rollback's `rm` of the credentials file fails
+    // (EPERM — the shape a busy or pinned file gives); every other rm (the
+    // atomic-writer temp unlink, the afterEach cleanup) is honest.
+    const realRm = fsp.rm
+    const fakedRm = async (p: Parameters<typeof fsp.rm>[0], opts?: Parameters<typeof fsp.rm>[1]): Promise<void> => {
+      if (p === creds)
+        throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+      await realRm(p, opts as never)
+    }
+    ;(fsp as unknown as { rm: unknown }).rm = fakedRm
+    syncBuiltinESMExports()
+    try {
+      const res = await create({
+        type: 'cifs',
+        server: 'nas.example.com',
+        remotePath: 'media',
+        mountpoint: mp,
+        persistent: true,
+        mountNow: true,
+        credentials: { username: 'smbuser', password: 's3cret' },
+      })
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed', JSON.stringify(job))
+      // The sentence names the secret LEFT ON DISK with the reason — and never
+      // claims it was removed.
+      assert.ok(job.error!.message.includes(`the credentials file '${creds}' could not be removed (EPERM) and is left on disk`), job.error!.message)
+      assert.ok(!job.error!.message.includes('the credentials file was removed'), job.error!.message)
+      // The rest of the rollback still ran: leaf gone, no line, no umount
+      // (the mount itself failed, so nothing was mounted).
+      assert.ok(job.error!.message.includes(`'${mp}' was created by this job and has been removed again`), job.error!.message)
+      assert.ok(job.error!.message.includes('Nothing else was written (no /etc/fstab line)'), job.error!.message)
+      assert.equal(await readFile(fstabPath, 'utf8'), '', 'no fstab line')
+      assert.equal(await fsp.lstat(mp).then(() => true, () => false), false, 'the leaf was removed')
+      assert.ok(!mock.calls.some(c => c.command === UMOUNT), 'no rollback umount for a mount that never happened')
+    }
+    finally {
+      ;(fsp as unknown as { rm: unknown }).rm = realRm
+      syncBuiltinESMExports()
+    }
+    // The file is honestly still there (the fake rm never ran the unlink).
+    assert.equal(await readFile(creds, 'utf8').then(() => true, () => false), true, 'the credentials file is left on disk, named in the sentence')
+    await realRm(creds, { force: true }) // honest cleanup of the named secret
+  })
+
+  it('(F8c) a daemon-reload failure AFTER the written line names the surviving state — nothing rolled back', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    // Exact args match — the fixture only answers `daemon-reload`, so the
+    // argv is pinned by the match itself.
+    mock.prependFixture({ command: '/usr/bin/systemctl', args: ['daemon-reload'], result: {
+      stdout: '',
+      stderr: 'Failed to reload daemon: too many concurrent reloads',
+      exitCode: 1,
+    } })
+    const parent = join(dir, 'parent')
+    await mkdir(parent)
+    const mp = join(parent, 'reloadfails')
+
+    const res = await create({
+      type: 'cifs',
+      server: 'nas.example.com',
+      remotePath: 'media',
+      mountpoint: mp,
+      persistent: true,
+      mountNow: true,
+      credentials: { username: 'smbuser', password: 's3cret' },
+    })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    // The EXACT sentence (the documented decision stands — nothing rolls back;
+    // only the sentence changes): the reload reason, then the surviving state
+    // with what to run, then the no-rollback word. No raw reload error.
+    assert.equal(job.error!.message, `Mount create '${mp}' failed — Failed to reload daemon: too many concurrent reloads; `
+    + `the mount is up at '${mp}'; the line is written in ${fstabPath}; `
+    + 'systemd\'s units are stale — run \'systemctl daemon-reload\'; nothing was rolled back', JSON.stringify(job.error))
+    // The surviving state is honestly what the sentence says: the line IS in
+    // the fstab, the credentials file stands, the leaf stands, and NOTHING
+    // was unmounted or removed.
+    const fstabAfter = await readFile(fstabPath, 'utf8')
+    assert.equal(fstabAfter.split('\n').filter(l => l.includes(mp)).length, 1, `the written line survives: ${fstabAfter}`)
+    assert.equal(await readFile(credsFilePath(credsDir, mp), 'utf8').then(() => true, () => false), true, 'the credentials file stands')
+    assert.equal(await fsp.lstat(mp).then(() => true, () => false), true, 'the leaf stands')
+    assert.ok(!mock.calls.some(c => c.command === UMOUNT), 'nothing was rolled back — no umount ran')
+  })
+
+  it('(F8d) a failed credentials WRITE still rolls back the leaf it made — same sentence, nothing else was written', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    const parent = join(dir, 'parent')
+    await mkdir(parent)
+    const mp = join(parent, 'credwrite')
+
+    // The seam: the credentials atomic write cannot open its temp in the
+    // creds dir (EACCES — the shape a broken/mis-mounted creds dir gives).
+    // Every other open (the mount pin, the fstab writer's temp under `dir`)
+    // is honest.
+    const realOpen = fsp.open
+    const fakedOpen = async (p: Parameters<typeof fsp.open>[0], ...rest: unknown[]): Promise<unknown> => {
+      if (typeof p === 'string' && p.startsWith(`${credsDir}/`))
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+      return (realOpen as unknown as (...a: unknown[]) => unknown)(p, ...rest)
+    }
+    ;(fsp as unknown as { open: unknown }).open = fakedOpen
+    syncBuiltinESMExports()
+    try {
+      const res = await create({
+        type: 'cifs',
+        server: 'nas.example.com',
+        remotePath: 'media',
+        mountpoint: mp,
+        persistent: true,
+        mountNow: true,
+        credentials: { username: 'smbuser', password: 's3cret' },
+      })
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed', JSON.stringify(job))
+      // The write failure reports through the SAME sentence as any other
+      // rollback (not a raw error over a stranded leaf): the leaf this job
+      // made is gone, and the closing clause is the exact one.
+      assert.ok(job.error!.message.includes('EACCES: permission denied'), job.error!.message)
+      assert.ok(job.error!.message.includes(`'${mp}' was created by this job and has been removed again`), job.error!.message)
+      assert.ok(job.error!.message.includes('Nothing else was written (no /etc/fstab line)'), job.error!.message)
+      // The state: leaf gone, no line, no credentials file, and NOTHING ran
+      // past the write — no mount attempt, no umount.
+      assert.equal(await fsp.lstat(mp).then(() => true, () => false), false, 'the leaf this job created was removed again')
+      assert.equal(await readFile(fstabPath, 'utf8'), '', 'no fstab line')
+      assert.equal(await readFile(credsFilePath(credsDir, mp), 'utf8').catch(() => null), null, 'no credentials file')
+      assert.ok(!mock.calls.some(c => c.command === MOUNT), 'the write failure precedes the mount — no mount argv ran')
+      assert.ok(!mock.calls.some(c => c.command === UMOUNT), 'nothing was mounted — no umount ran')
+    }
+    finally {
+      ;(fsp as unknown as { open: unknown }).open = realOpen
+      syncBuiltinESMExports()
+    }
   })
 
   it('(iii) the happy path mounts through the fd BEFORE the line exists; then the line is written', async () => {
