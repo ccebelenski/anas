@@ -1,12 +1,14 @@
 import type { BackupRepoResponse, BackupTask, BackupTaskDetail, BackupTaskEntry, Job } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
+import type { JobQueue } from '../../jobs/queue.js'
 import type { BackupNotifyResult } from '../../services/backup-notify.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { TASK_RUNNER_USER } from '../../runner-poll.js'
 import { createServer } from '../../server.js'
 import { isoWeekParity } from '../../services/backup-cadence.js'
@@ -1102,6 +1104,119 @@ describe('backup routes (Epic 16)', () => {
     assert.deepEqual(result.snapshots?.map(s => s.full), [`mnttest@${label}`])
     assert.equal(result.snapshots?.[0].recursive, true)
     assert.equal(result.expansion?.[0].root, `/mnttest/.zfs/snapshot/${label}`)
+  })
+
+  // cr.64b2-iii (O): the lock derivation realpaths the archive path (cr.64b1
+  // (H)) — the consistency derivation must snapshot the SAME resolved path,
+  // not the text. The world: the dataset's mountpoint is a REAL directory
+  // under the temp dir (the captured `backup/findmnt-nested.json` with its
+  // `/gtbackup` row re-pointed at it — the one-row adaptation the restore
+  // tests make), and the task's archive path is a SYMLINK into it. The text
+  // path sits under `/tmp` (the table's tmpfs row) — what the derivation
+  // answered on the text alone, while the keys were already taken on gtbackup.
+  it('cr.64b2-iii (O): a symlinked archive is snapshotted on the dataset its locks were taken on, and the sentence keeps the configured path', async () => {
+    await createRepo()
+    const base = await realpath(dir)
+    const realDir = join(base, 'gtbackup-real')
+    const linkPath = join(base, 'gtbackup-link')
+    await mkdir(realDir, { recursive: true })
+    await symlink(realDir, linkPath)
+
+    const mock = mockOf(server)
+    const mounts = await readFile(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/backup/findmnt-nested.json'), 'utf-8')
+    assert.equal(mounts.split('"/gtbackup"').length, 2, 'the captured row exists exactly once')
+    mock.prependFixture({
+      command: '/usr/bin/findmnt',
+      args: ['--json'],
+      result: { stdout: mounts.replace('"target": "/gtbackup"', `"target": ${JSON.stringify(realDir)}`), stderr: '', exitCode: 0 },
+    })
+    // The pool's guid, TYPED as in backup-restore-files.test.ts's seedZfsDestination.
+    const GTBACKUP_GUID = '5823146802312415237'
+    mock.prependFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'value', 'guid', '--', 'gtbackup'], result: { stdout: `${GTBACKUP_GUID}\n`, stderr: '', exitCode: 0 } })
+    // The zfs verbs: the stale sweep's list (empty) on its exact argv, then every verb succeeds.
+    mock.addFixture({ command: ZFS_BIN, args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', '--', 'gtbackup'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS_BIN, result: { stdout: '', stderr: '', exitCode: 0 } })
+    // The boundary scan runs on the CONFIGURED path (the text, as the task says it).
+    mock.addFixture({ command: '/usr/bin/timeout', args: walkArgs(linkPath, 60), result: { stdout: `66\t${linkPath}\n`, stderr: '', exitCode: 0 } })
+
+    await createTaskPayload({ ...NESTED_TASK, name: 'snap-symlink', archives: [{ name: 'pool', path: linkPath, excludes: [] }] })
+    mock.calls.length = 0
+
+    // Hold the job AT the pbc exec: keys held, snapshot taken, upload waiting.
+    let arrive!: () => void
+    const reached = new Promise<void>((resolve) => {
+      arrive = resolve
+    })
+    let release!: () => void
+    const go = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const inner = mock.exec.bind(mock)
+    mock.exec = async (command, args, opts) => {
+      if (command === '/usr/bin/prlimit') {
+        arrive()
+        await go
+      }
+      return inner(command, args, opts)
+    }
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/snap-symlink/run',
+      headers: RUNNER_HEADERS,
+      payload: { direct: true },
+    })
+    const id = await jobIdFrom(res)
+    await reached
+
+    const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+    // Mid-run, the run is about to hand pbc the snapshot of the REAL dataset.
+    const mid = (await server.inject({ method: 'GET', url: `/v1/jobs/${id}`, headers: IDENTITY })).json() as { job: Job }
+    assert.match(mid.job.progress ?? '', new RegExp(`archive 'pool' <- ${realDir.replace(/[/.]/g, '\\$&')}/\\.zfs/snapshot/`), mid.job.progress ?? '')
+    const held = queue.heldLocks().filter(l => l.holders.includes(id)).map(l => ({ key: l.key, mode: l.mode }))
+    // The keys the route took are the RESOLVED filesystem's — the dataset, the
+    // pool, the name and the mount of the dir the symlink points INTO. Nothing
+    // is held on the tmpfs row the TEXT path sits under.
+    assert.deepEqual(held, [
+      { key: `zfs:${GTBACKUP_GUID}`, mode: 'shared' },
+      { key: `zpool:${GTBACKUP_GUID}`, mode: 'shared' },
+      { key: 'zname:gtbackup', mode: 'shared' },
+      { key: `mount:${realDir}`, mode: 'shared' },
+      { key: 'task:backup:snap-symlink', mode: 'shared' },
+    ])
+
+    release()
+    const job = await waitForJob(server, id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+
+    // The snapshot lands on the REAL dataset — the one the keys name.
+    const snapshots = zfsArgs(mock, 'snapshot')
+    assert.equal(snapshots.length, 1, JSON.stringify(snapshots))
+    assert.equal(snapshots[0][1], '-r')
+    assert.match(snapshots[0].at(-1)!, /^gtbackup@anas-backup-snap-symlink-\d+$/)
+    const label = snapshots[0].at(-1)!.split('@')[1]
+    assert.deepEqual(zfsArgs(mock, 'destroy'), [['destroy', '-r', '--', `gtbackup@${label}`]])
+
+    // pbc reads the snapshot of the REAL dataset.
+    const args = pbcArgs(mock)
+    assert.ok(archiveTokens(args).every(tok => tok.includes(`${realDir}/.zfs/snapshot/${label}`)), args.join(' '))
+
+    // The record says so, while the progress sentence opens with the path the
+    // OPERATOR configured (the "backs up from" half names the real snapshot
+    // location — that is a fact about the run, not the configured path).
+    const result = job.result as {
+      consistency?: { consistency: string, backend?: string, target?: string, reason?: string }[]
+      expansion?: { root: string }[]
+    }
+    assert.equal(result.consistency?.[0].consistency, 'snapshot')
+    assert.equal(result.consistency?.[0].backend, 'zfs')
+    assert.equal(result.consistency?.[0].target, 'gtbackup')
+    assert.equal(result.expansion?.[0].root, `${realDir}/.zfs/snapshot/${label}`)
+    // The reason — printed verbatim into the progress line (runner line
+    // `archive '<name>': <consistency> - <reason>`) — opens with the path the
+    // OPERATOR configured. (The "backs up from" half names the real snapshot
+    // location: that is a fact about the run, not the configured path.)
+    assert.ok(result.consistency?.[0].reason?.startsWith(`${linkPath} is on the ZFS dataset gtbackup`), result.consistency?.[0].reason)
   })
 
   it('the ROOT archive name and the --backup-id are IDENTICAL between live and snapshot mode', async () => {

@@ -67,6 +67,13 @@ export interface SourceClaims {
    * as the source having moved.
    */
   unread: string[]
+  /**
+   * Each requested path mapped to the REAL path it was resolved through
+   * ({@link realSourcePath}) — cr.64b2-iii (O): the mover's consistency
+   * derivation consumes this instead of resolving again, so the keys and the
+   * snapshot are derived from the SAME resolved path, resolved once.
+   */
+  resolved: Map<string, string>
 }
 
 const POOL_PART_END = /[/@#]/
@@ -124,9 +131,13 @@ export async function pathSourceClaims(
   readAhrPools: (executor: CommandExecutor) => Promise<AhrPool[]>,
 ): Promise<SourceClaims> {
   if (paths.length === 0)
-    return { claims: [], unlocked: [], unread: [] }
+    return { claims: [], unlocked: [], unread: [], resolved: new Map() }
   const facts = await readFilesystemFacts(executor, readAhrPools)
-  const resolved = await Promise.all(paths.map(async path => ({ path, fs: sourceFilesystemOf(await realSourcePath(path), facts) })))
+  const resolved = await Promise.all(paths.map(async (path) => {
+    const real = await realSourcePath(path)
+    return { path, real, fs: sourceFilesystemOf(real, facts) }
+  }))
+  const realOf = new Map(resolved.map(r => [r.path, r.real]))
   const guids = await poolGuids(executor, resolved.flatMap(r => (r.fs?.kind === 'zfs' ? [r.fs.dataset] : [])))
   const claims: LockClaim[] = []
   const unlocked: string[] = []
@@ -169,7 +180,7 @@ export async function pathSourceClaims(
     if (fs.mountpoint !== undefined)
       claims.push(mountClaim(normalizeMountpointPath(fs.mountpoint), 'shared'))
   }
-  return { claims, unlocked, unread }
+  return { claims, unlocked, unread, resolved: realOf }
 }
 
 /**

@@ -16,7 +16,7 @@ import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { LVM_MIXED_BLOCK_ARGS, UPDATE_INITRAMFS_BUDGET_MS } from './ahr-exec.js'
 import { ahrDataOffsetArg, ahrDataOffsetBytes, planDiskPartitions } from './ahr-geometry.js'
-import { classifyRetiredPartition, examineMember, mayZapRetiredDisk, readAhrPoolIdentity, requirePoolVg, retiredDiskKeptSentence } from './ahr-identity.js'
+import { classifyRetiredPartitionWithReason, examineMember, mayZapRetiredDisk, readAhrPoolIdentity, requirePoolVg, retiredDiskKeptSentence } from './ahr-identity.js'
 import { clearIntent, defaultAhrIntentDir, writeIntent } from './ahr-intent.js'
 import { AHR_SIZE_GRANULARITY_BYTES, floorToGranularity, fmtBytes, isPvUnderSized } from './ahr-layout.js'
 import { pinArrays } from './ahr-mdadm-conf.js'
@@ -1539,10 +1539,10 @@ export async function executeReplace(
         // Since nf.1 a partition the operator cut in the disk's free tail can
         // be a ZFS leaf; zapping the table erased it.
         const identity = await readAhrPoolIdentity(executor, pool.name)
-        const facts: { path: string, verdict: RetireVerdict }[] = []
+        const facts: { path: string, verdict: RetireVerdict, reason: string | null }[] = []
         for (const part of oldDisk.parts) {
           const path = part.number !== null ? partByIdPath(oldDiskId, part.number) : `/dev/${part.name}`
-          facts.push({ path, verdict: await classifyRetiredPartition(executor, identity, pool.name, path, part.partlabel) })
+          facts.push({ path, ...await classifyRetiredPartitionWithReason(executor, identity, pool.name, path, part.partlabel) })
         }
         updateProgress(`retiring ${oldDiskId} (zero superblocks, zap GPT)`)
         for (const f of facts) {
@@ -1554,9 +1554,14 @@ export async function executeReplace(
           log(`ahr.replace pool=${pool.name} disk=${oldDiskId} status=retired`)
         }
         else {
+          // cr.64b2-iii (K): a `foreign` that came from a read that could not
+          // see carries its sentence — the retire says so in the progress and
+          // the log, not just the path.
           const kept = retiredDiskKeptSentence(oldDiskId, facts.filter(f => f.verdict === 'foreign').map(f => f.path))
-          updateProgress(kept)
-          log(`ahr.replace pool=${pool.name} disk=${oldDiskId} status=retired-table-kept detail=${kept}`)
+          const unread = facts.filter(f => f.verdict === 'foreign' && f.reason !== null).map(f => f.reason as string)
+          const detail = unread.length > 0 ? `${kept} ${unread.join(' ')}` : kept
+          updateProgress(detail)
+          log(`ahr.replace pool=${pool.name} disk=${oldDiskId} status=retired-table-kept detail=${detail}`)
         }
       }
       else {

@@ -207,22 +207,44 @@ describe('readAhrPoolIdentity / classifyPartition', () => {
       assert.equal(await classifyPartition(executor, id, '/dev/sdz4'), 'foreign')
     })
 
-    it('blkid exit 2 (nothing found) is blank; a probe that FAILED is foreign (fail closed)', async () => {
+    // cr.64b2-iii (K) changed this invariant (the brief directs it): exit 2
+    // with NO output is not the captured blank shape — a readable blank slice
+    // answers exit 0 with its PART_ENTRY_* keys (the fixture below). Silence
+    // on a partition device is blkid failing to read it (util-linux 2.41
+    // exits 2 silently for a vanished path), so it fails closed as foreign.
+    it('blkid exit 2 with no output is foreign (a silent probe could not read the device); a probe that FAILED is foreign too', async () => {
       const executor = world()
       executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs('/dev/sdz5'), result: { stdout: '', stderr: 'mdadm: No md superblock detected on /dev/sdz5.', exitCode: 1 } })
       executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sdz5'], result: { stdout: '', stderr: '', exitCode: 2 } })
       executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs('/dev/sdz6'), result: { stdout: '', stderr: 'mdadm: No md superblock detected on /dev/sdz6.', exitCode: 1 } })
       executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sdz6'], result: { stdout: '', stderr: 'blkid: error: /dev/sdz6: Input/output error', exitCode: 4 } })
       const id = await readAhrPoolIdentity(executor, 'media', { mdadmConfPath: join(dir, 'mdadm.conf') })
-      assert.equal(await classifyPartition(executor, id, '/dev/sdz5'), 'blank')
+      assert.equal(await classifyPartition(executor, id, '/dev/sdz5'), 'foreign')
       assert.equal(await classifyPartition(executor, id, '/dev/sdz6'), 'foreign')
+    })
+
+    // cr.64b2-iii (K): the probe never RAN — the executor throws (the binary
+    // could not be spawned). A read that never happened never says `blank`.
+    it('cr.64b2-iii: an executor that THROWS on blkid answers foreign with its own sentence, never blank', async () => {
+      const executor = world()
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs('/dev/sdz8'), result: { stdout: '', stderr: 'mdadm: No md superblock detected on /dev/sdz8.', exitCode: 1 } })
+      executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sdz8'], throws: new Error('spawn /usr/sbin/blkid ENOENT') })
+      const id = await readAhrPoolIdentity(executor, 'media', { mdadmConfPath: join(dir, 'mdadm.conf') })
+      assert.deepEqual(await classifyPartitionWithReason(executor, id, '/dev/sdz8'), {
+        verdict: 'foreign',
+        reason: '/dev/sdz8 could not be probed by blkid -p (the probe could not run: spawn /usr/sbin/blkid ENOENT) — a partition whose content cannot be read is not judged blank',
+      })
     })
 
     // cr.64cr (review of cr.64c, possible 1): blkid exits 2 for "nothing found"
     // AND for "could not open the device" — the second with a stderr line
     // (captured: fixtures/ahr/blkid-p-permission-denied.stderr.txt, util-linux
-    // 2.41.5 as a non-root reader). The two must not read alike.
-    it('cr.64cr: blkid exit 2 WITH stderr (could not open) is FOREIGN with a sentence naming the read; exit 2 with no output stays blank', async () => {
+    // 2.41.5 as a non-root reader). The two must not read alike. cr.64b2-iii
+    // (K) then moved the silent half too: exit 2 with NO output on a partition
+    // device is the util-linux shape for a path that is GONE (the captured
+    // blank shape is exit 0 with PART_ENTRY_* keys), so both halves of exit 2
+    // are foreign now — with different sentences.
+    it('cr.64cr: blkid exit 2 WITH stderr (could not open) is FOREIGN with a sentence naming the read; cr.64b2-iii: exit 2 with no output is foreign with the silence sentence', async () => {
       const executor = world()
       const denied = loadFixture('blkid-p-permission-denied.stderr.txt').replace('/dev/nvme0n1p1', '/dev/sdz7')
       executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmExamineExportArgs('/dev/sdz7'), result: { stdout: '', stderr: 'mdadm: cannot open /dev/sdz7: Permission denied', exitCode: 1 } })
@@ -235,7 +257,10 @@ describe('readAhrPoolIdentity / classifyPartition', () => {
         verdict: 'foreign',
         reason: '/dev/sdz7 could not be read by blkid -p (blkid: error: /dev/sdz7: Permission denied) — a partition whose content cannot be read is not judged blank',
       })
-      assert.deepEqual(await classifyPartitionWithReason(executor, id, '/dev/sdz5'), { verdict: 'blank', reason: null })
+      assert.deepEqual(await classifyPartitionWithReason(executor, id, '/dev/sdz5'), {
+        verdict: 'foreign',
+        reason: '/dev/sdz5 answered blkid -p with nothing at all (exit 2, no output) — a partition that shows no entry and no signature is a device that could not be read, not a blank slice',
+      })
     })
 
     it('cr.64cr: a probe that failed outright names its exit in the sentence; content found carries no sentence', async () => {

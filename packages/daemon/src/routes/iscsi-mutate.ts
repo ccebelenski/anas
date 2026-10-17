@@ -996,10 +996,46 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       )
     }
 
+    // cr.64b2-iii (N, cr.64b1 report): the backing's keys move onto a guard
+    // spec's `locks` derivation — the LUN delete/add doors' idiom — instead of
+    // being computed here and passed outside any spec. Before, the guard's
+    // job-time recompute never covered them, and a mount-table (findmnt)
+    // failure at the route locked NOTHING for the backing: the job read the
+    // table fine and its recompute then refused "changed while this run
+    // waited" — a sentence that was false. Now the route door answers 503
+    // UNAVAILABLE naming the read (cr.64b1 (B)), and the job re-derives the
+    // claims at its own turn through the same spec.
+    const spec = {
+      operation: 'iscsi.lun.update',
+      object: targetView(guardDeps, iqn, { seed: state, revision: false }),
+      // The door's own gates (size direction, foreign backing, served device,
+      // sessions) stay where they are — the route asks them in its order, and
+      // the job asks them again under the mutex in its body (`reverifyServed-
+      // Lun`, the session rule re-asked); this spec exists for the identity
+      // re-read and the claim derivation.
+      gates: [],
+      // cr.40 (§4.2) + cr.63 (review L17): the target's key, the LUN's by
+      // serial, and the backing's — a zvol grow EXCLUSIVE (a `zfs set
+      // volsize`, as the Datasets door's grow of the same volume), anything
+      // else SHARED. Read from the object, so the job's recompute sees the
+      // LUN as it is when the job runs.
+      locks: async (o: TargetObject) => {
+        const now = o.target.luns.find(l => l.index === index)
+        return [
+          ...lunClaims(iqn, now?.serial ?? null),
+          ...(now ? await lunBackingClaims(executor, now, zvolSizeGrow ? 'exclusive' : 'shared') : []),
+        ]
+      },
+    }
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendGuardRefusal(reply, pre.refusal)
+
     const job = jobQueue.submit(
       'iscsi.lun.update',
       { ...identity, params: { target: iqn, lun: index, serial: lun.serial, backstore: lun.name, ...(req.size !== undefined ? { size: req.size } : {}), ...(req.writeBack !== undefined ? { writeBack: req.writeBack } : {}) } },
-      async updateProgress => withIscsiLock(async () => {
+      iscsiGuarded(spec, pre, async (_now, ctx) => {
+        const { updateProgress } = ctx
         // ident.2 (audit #8/#9): the job may run long after the request. Under
         // the lock, the LUN at this index must still be the same serial, the
         // same backstore, the same path and — for a size change — the same
@@ -1060,11 +1096,9 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
           warnings,
         }
       }),
-      // cr.40 (§4.2): the target's key and the LUN's (a fileio resize unmaps
-      // and re-maps it in the target). cr.63 (review L17): and the backing's
-      // — a zvol grow is a `zfs set volsize` on the volume (exclusive, as the
-      // Datasets door's grow of the same volume), anything else shared.
-      { locks: [...lunClaims(iqn, lun.serial), ...await lunBackingClaims(executor, lun, zvolSizeGrow ? 'exclusive' : 'shared')] },
+      // The claims the spec derived at the route door; the job's recompute
+      // (cr.64b1 (D)) checks its own re-read against exactly these.
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -1222,8 +1256,19 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       statDeviceFrom(paths),
     )
     const refusal = assertRepairable(plan)
-    if (refusal)
+    if (refusal) {
+      // cr.64b2-iii (I): when THIS request's read just quarantined a
+      // placeholder, the plain "backing still absent" sentence reads as if
+      // nothing happened — but something did: the stub was taken offline and
+      // the persisted record kept (the quarantine never saves). Say what the
+      // code did, so the operator knows the hole they see now is the one the
+      // placeholder became, and the next Repair will replay the record.
+      const tookOffline = state.outcomes.filter(o => o.quarantined)
+      if (tookOffline.length > 0 && refusal.reason === 'backing-absent') {
+        refusal.message += ` This request took ${tookOffline.length === 1 ? 'the 0-byte placeholder' : `${tookOffline.length} 0-byte placeholders`} the restore service had left behind offline — the LUN${tookOffline.length === 1 ? '' : 's'} no longer served by LIO — and kept the persisted record, so run Repair again once the real backing is back.`
+      }
       return sendRefusal(reply, refusal)
+    }
 
     const job = jobQueue.submit(
       'iscsi.health.repair',

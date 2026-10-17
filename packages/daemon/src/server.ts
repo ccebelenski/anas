@@ -78,6 +78,9 @@ export interface ServerOptions {
 /** Longest path param a route accepts: PATH_MAX (4096), percent-encoded. */
 export const PATH_PARAM_MAX = 3 * 4096
 
+/** A partition device path in the mock world: by-id `-partN`, `sdXN`, or an nvme `…nNpN`. */
+const MOCK_PARTITION_RE = /(?:-part\d+|\/[sv]d[a-z]+\d+|n\d+p\d+)$/
+
 export function createServer(opts?: ServerOptions) {
   const server = Fastify({
     logger: opts?.logger ?? true,
@@ -329,9 +332,17 @@ export function createServer(opts?: ServerOptions) {
     // only when it matches.
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'value', 'guid', '--', 'testpool'], result: { stdout: '5823146802312415237\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/blkid', result: { stdout: '5823146802312415237\n', stderr: '', exitCode: 0 } })
+    // `blkid -p <partition>` (the retire/destroy classifiers, cr.57): a blank
+    // SLICE answers exit 0 with only its PART_ENTRY_* keys — the captured shape
+    // (fixtures/zfs/NOTES.md). Since cr.64b2-iii (K) exit 2 with no output on a
+    // partition reads as a device that could not be read (foreign, table kept),
+    // so the mock world answers the real blank line here. Registered before the
+    // whole-disk answer below: the first matching fixture wins.
+    mock.addFixture({ command: '/usr/sbin/blkid', argsMatch: a => a.length === 2 && a[0] === '-p' && MOCK_PARTITION_RE.test(a[1]!), result: mockFixtures.blkidPBlankPartition() })
     // The AHR cache attach's signature probe (`blkid -p <dev>`, cr.38): a blank
-    // disk answers exit 2 with no output (captured semantics), so mock mode can
-    // attach a cache — the command-only answer above would read as a signature.
+    // WHOLE DISK answers exit 2 with no output (captured semantics, fixtures/ahr/
+    // NOTES.md), so mock mode can attach a cache — the command-only answer above
+    // would read as a signature.
     mock.addFixture({ command: '/usr/sbin/blkid', argsMatch: a => a.length === 2 && a[0] === '-p', result: { stdout: '', stderr: '', exitCode: 2 } })
     // Import scan (story 3.7): `zpool import` with no args lists one pool.
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['import'], result: {

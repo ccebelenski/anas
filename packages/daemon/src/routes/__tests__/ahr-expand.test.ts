@@ -254,7 +254,7 @@ function mdstatQuadSwapped(newPartKernel: string): string {
   return MDSTAT_BASE.replace('md125 : active raid5 sda1[3]', `md125 : active raid5 ${newPartKernel}[3]`)
 }
 
-function buildExecutor(opts: { mdstat?: string, driveReplaceOf?: string } = {}): MockExecutor {
+function buildExecutor(opts: { mdstat?: string, driveReplaceOf?: string, retireTreeEmpty?: string } = {}): MockExecutor {
   // The incoming disk is the one whose slice md125 ends up carrying.
   const incoming = DISKS.find(d => d.id === opts.driveReplaceOf)
   const executor = incoming
@@ -269,6 +269,13 @@ function buildExecutor(opts: { mdstat?: string, driveReplaceOf?: string } = {}):
       const parts = d.id === incoming.id
         ? [{ name: `${d.kernel}1`, size: B1_CLAMPED_2G, label: QUAD_NEW_SLICE_LABEL }]
         : d.parts.map(p => ({ name: p.name, size: p.size, label: p.label }))
+      // cr.64b2-iii (J): `retireTreeEmpty` answers that disk's SECOND tree
+      // read (the retire's) with no partitions at all — the swap itself sees
+      // the normal tree.
+      if (d.id === opts.retireTreeEmpty) {
+        executor.addFixture({ command: '/usr/bin/lsblk', args: diskLsblkArgs(`/dev/disk/by-id/${d.id}`), results: [{ stdout: diskTreeJson(d.kernel, d.size, parts), stderr: '', exitCode: 0 }, { stdout: diskTreeJson(d.kernel, d.size, []), stderr: '', exitCode: 0 }] })
+        continue
+      }
       executor.addFixture({ command: '/usr/bin/lsblk', args: diskLsblkArgs(`/dev/disk/by-id/${d.id}`), result: { stdout: diskTreeJson(d.kernel, d.size, parts), stderr: '', exitCode: 0 } })
     }
     executor.addFixture({ command: '/usr/bin/lsblk', args: ['-Jb', '-o', 'NAME,TYPE,SIZE,PARTLABEL'], result: { stdout: ahrLsblkJson(), stderr: '', exitCode: 0 } })
@@ -318,7 +325,7 @@ describe('AHR expansion routes (Epic 11.6)', () => {
   let jobQueue: JobQueue
   let server: ReturnType<typeof Fastify>
 
-  async function build(opts: { mdstat?: string, driveReplaceOf?: string } = {}) {
+  async function build(opts: { mdstat?: string, driveReplaceOf?: string, retireTreeEmpty?: string } = {}) {
     executor = buildExecutor(opts)
     jobQueue = new JobQueue()
     server = Fastify({ logger: false })
@@ -610,6 +617,67 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       assert.ok(warnings.some(w => w.includes('retired')))
       assert.ok(res.headers['x-anas-confirm-code'])
       assert.deepEqual(mutatingCalls(executor), [])
+    })
+
+    // cr.64b2-iii (K, cr.64cr residual): the retire classifies the outgoing
+    // disk's slices before zeroing anything. Here the low-level probe never
+    // RUNS — the executor throws on `blkid -p` for the slice (the binary is
+    // gone). A read that never happened must not call the slice `blank`
+    // (blank zaps): the verdict is foreign, the table stays, and the
+    // sentence naming what happened rides the job's progress.
+    it('cr.64b2-iii: a blkid that cannot spawn keeps the retired disk\'s table — no zap argv, the sentence in the progress', async () => {
+      await build({ driveReplaceOf: F })
+      executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', `/dev/disk/by-id/${D1}-part1`], throws: new Error('spawn /usr/sbin/blkid ENOENT') })
+      const first = await server.inject({ method: 'POST', url: `/v1/ahr/quad/disk/${D1}/replace`, headers: IDENTITY_HEADERS, payload: { newDiskId: F } })
+      const code = first.headers['x-anas-confirm-code'] as string
+      assert.ok(code, first.body)
+      const second = await server.inject({ method: 'POST', url: `/v1/ahr/quad/disk/${D1}/replace`, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code }, payload: { newDiskId: F } })
+      assert.equal(second.statusCode, 202, second.body)
+      const job = await waitForJob(jobQueue, second.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      // Nothing was zapped or zeroed on the outgoing disk.
+      const zaps = executor.calls.filter(c => (c.command === '/usr/sbin/sgdisk' && c.args.includes('--zap-all')) || c.command === '/usr/sbin/wipefs' || (c.command === '/usr/sbin/mdadm' && c.args.includes('--zero-superblock')))
+      assert.deepEqual(zaps, [], JSON.stringify(zaps))
+      // The probe's own sentence, naming what happened, in the progress.
+      assert.match(job.progress ?? '', /could not be probed by blkid -p \(the probe could not run: spawn \/usr\/sbin\/blkid ENOENT\) — a partition whose content cannot be read is not judged blank/)
+    })
+
+    // cr.64b2-iii (J, cr.57 (b)): the retire's kept-table sentence with an
+    // EMPTY foreign list — reached when the disk's tree names no partitions
+    // at all — must still read as a sentence. Before, it printed `()` and
+    // claimed slices were cleared when nothing was.
+    it('cr.64b2-iii: a retire finding no partitions keeps the table with a sentence that names the case, logged once', async () => {
+      await build({ driveReplaceOf: F, retireTreeEmpty: D1 })
+      // The retire's log line goes to the daemon's stdout (no log sink is
+      // wired through submitExpansion) — capture it for the "once" count.
+      const written: string[] = []
+      const origWrite = process.stdout.write.bind(process.stdout)
+      process.stdout.write = ((chunk: any): boolean => {
+        written.push(String(chunk))
+        return true
+      }) as typeof process.stdout.write
+      let job: Job
+      try {
+        const first = await server.inject({ method: 'POST', url: `/v1/ahr/quad/disk/${D1}/replace`, headers: IDENTITY_HEADERS, payload: { newDiskId: F } })
+        const code = first.headers['x-anas-confirm-code'] as string
+        assert.ok(code, first.body)
+        const second = await server.inject({ method: 'POST', url: `/v1/ahr/quad/disk/${D1}/replace`, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code }, payload: { newDiskId: F } })
+        assert.equal(second.statusCode, 202, second.body)
+        job = await waitForJob(jobQueue, second.json().job.id)
+      }
+      finally {
+        process.stdout.write = origWrite
+      }
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const kept = job.progress ?? ''
+      assert.match(kept, /^Leaving the partition table on ata-QUAD_D1 — no partition on it is provably this pool's, so nothing was cleared and the table stays$/)
+      assert.ok(!kept.includes('()'), 'the empty list must not print empty parens')
+      const logged = written.filter(l => l.includes('status=retired-table-kept'))
+      assert.equal(logged.length, 1, `logged once: ${logged.join(' | ')}`)
+      assert.match(logged[0], /detail=Leaving the partition table on ata-QUAD_D1 — no partition on it is provably this pool's/)
+      // Nothing was zapped or zeroed.
+      const zaps = executor.calls.filter(c => (c.command === '/usr/sbin/sgdisk' && c.args.includes('--zap-all')) || c.command === '/usr/sbin/wipefs' || (c.command === '/usr/sbin/mdadm' && c.args.includes('--zero-superblock')))
+      assert.deepEqual(zaps, [], JSON.stringify(zaps))
     })
   })
 

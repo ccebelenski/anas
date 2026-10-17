@@ -1410,7 +1410,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const sourceTask = direct ? await readTask(systemdDir, name) : null
     const source = sourceTask
       ? await pathSourceClaims(executor, sourceTask.archives.map(a => a.path), readAhrPools)
-      : { claims: [], unlocked: [], unread: [] }
+      : { claims: [], unlocked: [], unread: [], resolved: new Map() }
     // cr.41 (§4.2 task key, cr.33b constraint): ONLY the DIRECT run holds the
     // task's key — shared — because it is the one that reads the task and does
     // the work. The Run-Now SUPERVISOR holds NO task key (and no source claim):
@@ -1520,8 +1520,12 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
             // The consistency derivation reads the SAME storage.cfg the rest of
             // the backup routes do (the zvol branch's PVE hands-off guard), and
             // the source guard (backup2.11) reads the SAME fstab the Mounts
-            // routes and `preview-nested` do.
-            { task, repo, secret, fstabPath, consistencyOptions: { pveStorageCfg: paths.pveStorageCfg }, onSpawn: cancel.onSpawn, checkCancel: next => assertRunNotCancelled(cancel, next) },
+            // routes and `preview-nested` do. cr.64b2-iii (O): it also derives
+            // from the SAME resolved paths the claim recompute just used — the
+            // resolution `needed` already read, not a second one — so a
+            // symlinked archive is snapshotted on the filesystem its keys were
+            // taken on, while the sentences keep the configured path.
+            { task, repo, secret, fstabPath, archiveRealPaths: needed.resolved, consistencyOptions: { pveStorageCfg: paths.pveStorageCfg }, onSpawn: cancel.onSpawn, checkCancel: next => assertRunNotCancelled(cancel, next) },
             updateProgress,
           )
           // A cancel never prunes and never notifies (rclone.5): the operator
@@ -2151,6 +2155,38 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       }
     }
 
+    // cr.64b2-iii (N, cr.64b1 report): the backing's keys move onto a guard
+    // spec's `locks` derivation — the new-LUN branch's idiom below — instead
+    // of being computed at the route and passed outside any spec. Before, the
+    // guard's job-time recompute never covered them, and a mount-table
+    // (findmnt) failure at the route locked NOTHING for the backing: the job
+    // read the table fine and its recompute then refused "changed while this
+    // run waited" — a sentence that was false. Now the route door answers 503
+    // UNAVAILABLE naming the read (cr.64b1 (B)), and the job door re-derives
+    // the claims at its own turn through the same spec. The door's own gates
+    // (1)–(6) stay above in their order; this spec carries the identity
+    // re-read and the claim derivation.
+    const spec: GuardSpec<TargetObject> = {
+      operation: 'backup.restore.image',
+      object: targetView({ executor, paths: iscsiPaths }, target.iqn, { seed: state, revision: false }),
+      gates: [],
+      // cr.64a (item 2): the target's key, the LUN's by serial, and the
+      // backing's SHARED — an in-place restore rewrites the backing object's
+      // bytes and changes nothing about the volume or filesystem underneath,
+      // exactly like a LUN add. Read from the object, so the job's recompute
+      // sees the LUN as it is when the job runs.
+      locks: async (o: TargetObject) => {
+        const now = o.target.luns.find(l => l.index === lun.index)
+        return [
+          ...lunClaims(target.iqn, now?.serial ?? null),
+          ...(now ? await lunBackingClaims(executor, now, 'shared') : []),
+        ]
+      },
+    }
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+
     // (7) The confirm gate. Everything above is a refusal; this is the one
     // choice the operator is allowed to make, and the warnings say exactly what
     // it costs.
@@ -2194,17 +2230,6 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // `restoreDepsNow`), and neither ever leaves this scope.
     const { repo } = deps
 
-    // cr.64a (item 2): the backing's keys beside the target's and the LUN's —
-    // the LUN verbs' one builder (cr.63 L17), in its SHARED mode: an in-place
-    // restore rewrites the backing object's bytes and changes nothing about
-    // the volume or the filesystem underneath, exactly like a LUN add. A
-    // dataset or pool verb that DESTROYS, renames or rolls back that backing,
-    // or unmounts its filesystem (all exclusive on these keys) now waits for
-    // the restore and re-gates after it — before, it could `zfs destroy` the
-    // object the image was streaming into. The guid fallback and the
-    // movers' path resolution are `lunBackingClaims'` own (cr.63's rule).
-    const backingKeys = await lunBackingClaims(executor, lun, 'shared')
-
     // The journald audit params: what was restored, from where, onto which LUN.
     // No secret and no repository credential ever rides here.
     //
@@ -2235,7 +2260,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       // stream, which can run for hours. Wrapping the call would both hold the
       // node's only iSCSI mutex for that whole time and deadlock against the
       // service's own acquisition (the mutex is a plain chain, not reentrant).
-      async updateProgress => runImageRestore(
+      // cr.64b2-iii (N): the job door (`guarded`) re-reads the target and
+      // re-derives the claims through the spec above before the body — the
+      // service's own `reverify` (under the mutex, right before the disable)
+      // still asks its identity and size questions.
+      guarded(spec, pre, async (_now, ctx) => runImageRestore(
         executor,
         {
           ...(await restoreDepsNow(req.repo, repo).then(now => ({ ...now, env: buildBackupEnv(now.repo, now.secret) }))),
@@ -2279,19 +2308,20 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           mutate: {
             executor,
             configfsRoot: iscsiPaths.configfsRoot ?? CONFIGFS_TARGET_ROOT,
-            progress: updateProgress,
+            progress: ctx.updateProgress,
           },
         },
-        updateProgress,
+        ctx.updateProgress,
       ).then((result) => {
         auditParams.bytesWritten = result.bytesWritten
         return result
-      }),
+      })),
       // cr.33 (§4.3): a restore is a data mover — the long lane. cr.40: it
       // holds the target's key and the LUN's for the run — the whole target
       // is disabled while the image streams. cr.64a: and the backing's keys,
-      // shared, for the same duration.
-      { lane: 'long', locks: [...lunClaims(target.iqn, lun.serial), ...backingKeys] },
+      // shared, for the same duration — now the spec's `locks` above, so the
+      // job's recompute (cr.64b1 (D)) checks its own re-read against them.
+      { lane: 'long', locks: pre.locks },
     )
 
     reply.code(202)

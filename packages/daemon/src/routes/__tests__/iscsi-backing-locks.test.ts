@@ -374,7 +374,12 @@ describe('cr.63 L17 — a LUN verb and a dataset verb on the same backing serial
   // from answers 503 UNAVAILABLE naming the read. Before, the route locked
   // nothing for the backing, the job read the table fine, and the recompute
   // refused "changed while this run waited" — a sentence that was false.
-  describe('cr.64b1 (B) — the LUN delete when the mount table cannot be read', () => {
+  //
+  // cr.64b2-iii (N): the same rule now reaches the LUN UPDATE too — its
+  // backing claims only moved onto the guard spec's `locks` in this story
+  // (they used to be computed at the route outside any spec, so the recompute
+  // never covered them and a findmnt failure at the route locked nothing).
+  describe('cr.64b1 (B) / cr.64b2-iii (N) — the LUN delete and update when the mount table cannot be read', () => {
     /** `findmnt --json` exits 1 (its own unreadable-mountinfo sentence) where `fails(inJob)` says so. */
     function findmntFails(fails: (inJob: boolean) => boolean): void {
       const mock = (server as unknown as { executor: { exec: (c: string, a: string[], o?: unknown) => Promise<ExecResult> } }).executor
@@ -405,6 +410,30 @@ describe('cr.63 L17 — a LUN verb and a dataset verb on the same backing serial
       mountTable = MOUNTS_WITH_GTISCSI
       findmntFails(inJob => inJob)
       const id = await accept({ method: 'DELETE', url: `${targetUrl}/luns/1` })
+      const job = await finished(id)
+      assert.equal(job.status, 'failed', JSON.stringify(job.result))
+      assert.equal(job.error?.code, 'UNAVAILABLE')
+      assert.ok(job.error!.message.endsWith(`: ${UNREADABLE}`), job.error!.message)
+      assert.ok(!calls.some(c => c.command === TARGETCLI), 'no targetcli')
+    })
+
+    it('cr.64b2-iii (N) failing at the ROUTE only: the UPDATE of the image LUN answers 503 UNAVAILABLE naming the read — no job, no targetcli', async () => {
+      await serve(LIVE)
+      mountTable = MOUNTS_WITH_GTISCSI
+      findmntFails(inJob => !inJob)
+      const res = await inject({ method: 'PUT', url: `${targetUrl}/luns/1`, payload: { writeBack: false } })
+      assert.equal(res.statusCode, 503, res.body)
+      assert.equal(res.json().error.code, 'UNAVAILABLE')
+      assert.ok((res.json().error.message as string).endsWith(`: ${UNREADABLE}`), res.json().error.message)
+      assert.deepEqual(queue().list(), [], 'no job was submitted')
+      assert.ok(!calls.some(c => c.command === TARGETCLI), 'no targetcli')
+    })
+
+    it('cr.64b2-iii (N) failing in the JOB only: the accepted update refuses UNAVAILABLE naming the read — no targetcli', async () => {
+      await serve(LIVE)
+      mountTable = MOUNTS_WITH_GTISCSI
+      findmntFails(inJob => inJob)
+      const id = await accept({ method: 'PUT', url: `${targetUrl}/luns/1`, payload: { writeBack: false } })
       const job = await finished(id)
       assert.equal(job.status, 'failed', JSON.stringify(job.result))
       assert.equal(job.error?.code, 'UNAVAILABLE')

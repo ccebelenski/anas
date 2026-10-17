@@ -5,12 +5,13 @@ import type { LockClaim } from '../../jobs/locks.js'
 import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { constants, readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { anasIqn } from '@anas/shared'
+import { currentLane } from '../../executor/deadline.js'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { iscsiTargetClaim, zfsDatasetClaims, znameClaim } from '../../safety/guard.js'
 import { createServer } from '../../server.js'
@@ -95,10 +96,16 @@ Session State: TARG_SESS_STATE_LOGGED_IN
 CID: 0  Connection State: TARG_CONN_STATE_LOGGED_IN
    Address 192.168.200.60 TCP  StatSN: 0x6916c3e9`
 
-/** SYNTHETIC configfs: one ANAS target, one zvol LUN, one ACL. */
-function anasManifest(opts: { session?: boolean } = {}): string {
+/**
+ * SYNTHETIC configfs: one ANAS target, one zvol LUN, one ACL. With
+ * `fileLunPath`, a SECOND LUN — fileio, an image file at that path (the
+ * cr.64b2-iii (N) mount-table tests; the path is a real file under the
+ * test's temp dir because the restore door's size gate stats it).
+ */
+function anasManifest(opts: { session?: boolean, fileLunPath?: string } = {}): string {
   const tpg = `iscsi/${ANAS_IQN}/tpgt_1`
   const acl = `${tpg}/acls/${INITIATOR}`
+  const p = opts.fileLunPath
   return `${[
     'D core',
     'D core/iblock_0',
@@ -116,6 +123,21 @@ function anasManifest(opts: { session?: boolean } = {}): string {
     'F core/iblock_0/vmdisk1/wwn/vpd_unit_serial = T10 VPD Unit Serial Number: 9bc6e907-6015-4267-be4f-5a0617cb3d71',
     'F core/iblock_0/vmdisk1/wwn/product_id = vmdisk1',
     'F core/iblock_0/vmdisk1/wwn/vendor_id = LIO-ORG',
+    ...(p
+      ? [
+          'D core/fileio_0',
+          'D core/fileio_0/lun2',
+          `F core/fileio_0/lun2/udev_path = ${p}`,
+          'F core/fileio_0/lun2/enable = 1',
+          // The captured fileio info shape (iscsi/configfs-live.manifest): the
+          // Size field is what the restore door's size equality reads.
+          `F core/fileio_0/lun2/info = Status: ACTIVATED  Max Queue Depth: 128  SectorSize: 512  HwMaxSectors: 16384\\n        TCM FILEIO ID: 0        File: ${p}  Size: ${IMAGE_SIZE}  Mode: O_DSYNC Async: 0`,
+          'D core/fileio_0/lun2/wwn',
+          'F core/fileio_0/lun2/wwn/vpd_unit_serial = T10 VPD Unit Serial Number: 689844a4-1d20-4cba-8516-bdc52a402645',
+          'F core/fileio_0/lun2/wwn/product_id = lun2',
+          'F core/fileio_0/lun2/wwn/vendor_id = LIO-ORG',
+        ]
+      : []),
     'D iscsi',
     `D iscsi/${ANAS_IQN}`,
     `D ${tpg}`,
@@ -130,6 +152,12 @@ function anasManifest(opts: { session?: boolean } = {}): string {
     `D ${tpg}/lun`,
     `D ${tpg}/lun/lun_0`,
     `L ${tpg}/lun/lun_0/6847ded961 -> ../../../../../../target/core/iblock_0/vmdisk1`,
+    ...(p
+      ? [
+          `D ${tpg}/lun/lun_1`,
+          `L ${tpg}/lun/lun_1/6847ded962 -> ../../../../../../target/core/fileio_0/lun2`,
+        ]
+      : []),
     `D ${tpg}/acls`,
     `D ${acl}`,
     `D ${acl}/auth`,
@@ -147,8 +175,11 @@ function anasManifest(opts: { session?: boolean } = {}): string {
   ].join('\n')}\n`
 }
 
-/** SYNTHETIC saveconfig matching the manifest; `hole` adds a GT-21 restore hole. */
-function anasSaveconfig(hole = false): string {
+/**
+ * SYNTHETIC saveconfig matching the manifest; `hole` adds a GT-21 restore
+ * hole; `fileLunPath` the fileio LUN 1 of the extended manifest.
+ */
+function anasSaveconfig(hole = false, fileLunPath?: string): string {
   const storageObjects: unknown[] = [{
     name: 'vmdisk1',
     plugin: 'block',
@@ -160,6 +191,20 @@ function anasSaveconfig(hole = false): string {
     alua_tpgs: [],
   }]
   const luns: unknown[] = [{ index: 0, storage_object: '/backstores/block/vmdisk1', alias: '6847ded961' }]
+  if (fileLunPath) {
+    storageObjects.push({
+      name: 'lun2',
+      plugin: 'fileio',
+      dev: fileLunPath,
+      size: IMAGE_SIZE,
+      wwn: '689844a4-1d20-4cba-8516-bdc52a402645',
+      readonly: false,
+      write_back: false,
+      attributes: {},
+      alua_tpgs: [],
+    })
+    luns.push({ index: 1, storage_object: '/backstores/fileio/lun2', alias: '6847ded962' })
+  }
   if (hole) {
     storageObjects.push({
       name: 'ghost',
@@ -230,6 +275,8 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
     storageCfg?: string
     /** ident.2: what the LUN's path names, as the stat seam's env form. */
     deviceStat?: string
+    /** Override the backing-present seam (colon-separated paths). */
+    backingPresent?: string
   } = {}) {
     if (opts.manifest) {
       const root = join(dir, 'target')
@@ -256,7 +303,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
     else {
       setEnv('ANAS_STORAGE_CFG', join(dir, 'absent-storage.cfg'))
     }
-    setEnv('ANAS_ISCSI_BACKING_PRESENT', opts.present === false ? '' : ZVOL_PATH)
+    setEnv('ANAS_ISCSI_BACKING_PRESENT', opts.backingPresent ?? (opts.present === false ? '' : ZVOL_PATH))
     // ident.2: by default the path names the device the LUN serves (configfs
     // Major 230 Minor 16) — the healthy case every other gate test runs on.
     setEnv('ANAS_ISCSI_DEVICE_STAT', opts.deviceStat ?? `${ZVOL_PATH}=230:16`)
@@ -764,8 +811,15 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       await lock.held
       const job = await waitForJob(res.body.job!.id)
       assert.equal(job.status, 'failed')
-      assert.match(job.error!.message, /no longer the LUN this request was accepted for/)
-      assert.match(job.error!.message, /unit serial is now 11111111-2222-3333-4444-555555555555/)
+      // cr.64b2-iii (N): the LUN's serial key is now derived by the spec's
+      // `locks`, so the guard's job-time recompute (cr.64b1 (D)) catches the
+      // re-created LUN at the job door — the run needs a key the route was
+      // never granted — before the service's own reverify ever runs. The
+      // sentence names the exact key that moved. (INVARIANT CHANGE: this test
+      // used to pin the service's reverify sentence, "no longer the LUN this
+      // request was accepted for"; the refusal moved earlier, not softer.)
+      assert.match(job.error!.message, /changed while this run waited/)
+      assert.match(job.error!.message, /the run holds no lock on iSCSI LUN 11111111-2222-3333-4444-555555555555/)
       assertNothingDestructive()
     })
 
@@ -921,6 +975,140 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       for (let i = 0; i < 200 && queue.get(probe.id)?.status !== 'completed'; i++)
         await new Promise(resolve => setTimeout(resolve, 5))
       assert.equal(queue.get(probe.id)?.status, 'completed', JSON.stringify(queue.get(probe.id)?.error))
+      assert.deepEqual(queue.heldLocks(), [])
+    })
+  })
+
+  // cr.64b2-iii (N): the in-place restore's backing claims now ride a guard
+  // spec's `locks` (the new-LUN branch's idiom), so the guard's job-time
+  // recompute covers them and a mount-table failure refuses the door 503
+  // UNAVAILABLE naming the read instead of locking nothing. The world adds a
+  // SECOND LUN — fileio, an image file — because the claim reader that fails
+  // closed on the mount table is the image's (`pathSourceClaims`); the zvol
+  // LUN's keys derive from the pool guid, not the table. The image lives under
+  // the test's temp dir because the door's size gate stats the REAL file; the
+  // mount table is the captured `backup/findmnt-nested.json` with its
+  // `/gtiscsi/images` row re-pointed at that dir (the same one-row adaptation
+  // the new-LUN backing-moved test makes at findmnt-full.json).
+  describe('cr.64b2-iii (N) — the in-place restore of an IMAGE LUN and the mount table', () => {
+    const ZPOOL = '/usr/sbin/zpool'
+    /** TYPED, as in iscsi-backing-locks.test.ts: the gtiscsi pool's guid. */
+    const GTISCSI_POOL_GUID = '7395061128366427419'
+    const IMAGE_LUN_SERIAL = '689844a4-1d20-4cba-8516-bdc52a402645'
+
+    /** `findmnt --json` exits 1 (its unreadable-mountinfo line) where `fails(inJob)` says so. */
+    function findmntFails(fails: (inJob: boolean) => boolean): void {
+      const mock = mockOf()
+      const inner = mock.exec.bind(mock)
+      mock.exec = async (command, args, opts) => {
+        if (command === '/usr/bin/findmnt' && args.join(' ') === '--json' && fails(currentLane().jobId !== undefined))
+          return { stdout: '', stderr: 'findmnt: cannot read /proc/self/mountinfo\n', exitCode: 1 }
+        return inner(command, args, opts)
+      }
+    }
+    const UNREADABLE = /the mount table could not be read \(findmnt --json exited 1: findmnt: cannot read \/proc\/self\/mountinfo\), so the filesystem .+ lives on cannot be locked — nothing was done; try again/
+
+    /** The image LUN's world: the extended manifest, the real sparse file, the re-pointed table. */
+    async function serveImageLun(): Promise<{ imageDir: string, imagePath: string }> {
+      const imageDir = join(dir, 'gtiscsi', 'images')
+      const imagePath = join(imageDir, 'lun2.raw')
+      await mkdir(imageDir, { recursive: true })
+      // A REAL sparse file at the image's size: the door's size equality
+      // stats it, and the served-device seam must name a regular file.
+      await writeFile(imagePath, '')
+      await truncate(imagePath, IMAGE_SIZE)
+
+      // serve() directly, not serveAnas(): serveAnas builds its own manifest
+      // and saveconfig and would drop the fileio LUN 1.
+      await serve({
+        manifest: anasManifest({ fileLunPath: imagePath }),
+        saveconfigText: anasSaveconfig(false, imagePath),
+        backingPresent: `${ZVOL_PATH}:${imagePath}`,
+        deviceStat: `${ZVOL_PATH}=230:16;${imagePath}=file:66306:4242`,
+      })
+      const mock = mockOf()
+      const mounts = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/backup/findmnt-nested.json'), 'utf-8')
+        .replace('"target": "/gtiscsi/images"', `"target": ${JSON.stringify(imageDir)}`)
+      mock.prependFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: mounts, stderr: '', exitCode: 0 } })
+      // The ZFS mountpoint list the iSCSI read classifies the image path by.
+      mock.prependFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: `gtiscsi\t${join(dir, 'gtiscsi')}\ngtiscsi/images\t${imageDir}\n`, stderr: '', exitCode: 0 } })
+      mock.prependFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', 'gtiscsi'], result: { stdout: `${GTISCSI_POOL_GUID}\n`, stderr: '', exitCode: 0 } })
+      return { imageDir, imagePath }
+    }
+
+    const imageBody = () => body({ lun: { targetIqn: ANAS_IQN, index: 1 } })
+
+    it('findmnt failing at the ROUTE: the restore of the image LUN answers 503 UNAVAILABLE naming the read — no confirm minted, no job, nothing destructive', async () => {
+      await serveImageLun()
+      findmntFails(inJob => !inJob)
+      const res = await restore(imageBody())
+      assert.equal(res.statusCode, 503, JSON.stringify(res.body))
+      assert.equal(res.body.error!.code, 'UNAVAILABLE')
+      assert.match(res.body.error!.message, UNREADABLE)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined, 'the door refuses before it asks to confirm')
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      assert.deepEqual(queue.list(), [], 'no job was submitted')
+      assertNothingDestructive()
+    })
+
+    it('findmnt failing in the JOB only: the accepted restore refuses UNAVAILABLE naming the read — nothing disabled, nothing streamed', async () => {
+      await serveImageLun()
+      findmntFails(inJob => inJob)
+      const first = await restore(imageBody())
+      assert.equal(first.statusCode, 409, JSON.stringify(first.body))
+      const code = String(first.headers['x-anas-confirm-code'])
+      const res = await restore(imageBody(), { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'failed', JSON.stringify(job.result))
+      assert.equal(job.error!.code, 'UNAVAILABLE')
+      assert.match(job.error!.message, UNREADABLE)
+      assertNothingDestructive()
+    })
+
+    it('findmnt fine: the running restore holds the image filesystem\'s keys beside the target and LUN — the set the route computed before, now re-derived by the job door', async () => {
+      const { imageDir } = await serveImageLun()
+      const mock = mockOf()
+      // Hold the job AT the image stream: keys held, target disabled, waiting.
+      let arrive!: () => void
+      const reached = new Promise<void>((resolve) => {
+        arrive = resolve
+      })
+      let release!: () => void
+      const go = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const toStream = mock.execToStream.bind(mock)
+      mock.execToStream = async (command, args, target, opts) => {
+        arrive()
+        await go
+        return toStream(command, args, target, opts)
+      }
+
+      const code = String((await restore(imageBody())).headers['x-anas-confirm-code'])
+      const res = await restore(imageBody(), { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      const id = res.body.job!.id
+      await reached
+
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      const held = queue.heldLocks().filter(l => l.holders.includes(id)).map(l => ({ key: l.key, mode: l.mode }))
+      // The same set the route computed before this story (cr.64a): the
+      // target, the LUN by serial, and the image filesystem's keys SHARED —
+      // the dataset's, the pool's, the name's, and the mount's.
+      assert.deepEqual(held, [
+        { key: `iscsi-target:${ANAS_IQN}`, mode: 'exclusive' },
+        { key: `iscsi-lun:${IMAGE_LUN_SERIAL}`, mode: 'exclusive' },
+        { key: `zfs:${GTISCSI_POOL_GUID}/images`, mode: 'shared' },
+        { key: `zfs:${GTISCSI_POOL_GUID}`, mode: 'shared' },
+        { key: `zpool:${GTISCSI_POOL_GUID}`, mode: 'shared' },
+        { key: 'zname:gtiscsi', mode: 'shared' },
+        { key: `mount:${imageDir}`, mode: 'shared' },
+      ])
+
+      release()
+      const job = await waitForJob(id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
       assert.deepEqual(queue.heldLocks(), [])
     })
   })

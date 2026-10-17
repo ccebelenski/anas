@@ -21,6 +21,8 @@ function fixtureResult(subdir: string, filename: string): ExecResult {
 /** Fixture results keyed by command signature, for registering with MockExecutor. */
 export const mockFixtures = {
   zpoolList: () => fixtureResult('zfs', 'zpool-list.json'),
+  /** `blkid -p <partition>` on a blank slice: exit 0, only PART_ENTRY_* keys (fixtures/zfs/NOTES.md). */
+  blkidPBlankPartition: () => fixtureResult('zfs', 'blkid-p-blank-partition.txt'),
   zpoolStatus: () => fixtureResult('zfs', 'zpool-status-online.json'),
   zpoolGetAll: (_pool: string) => fixtureResult('zfs', 'zpool-get-all.json'),
   zfsList: () => fixtureResult('zfs', 'zfs-list.json'),

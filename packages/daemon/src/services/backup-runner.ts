@@ -487,6 +487,15 @@ export interface BackupRunDeps {
    */
   fstabPath: string
   /**
+   * cr.64b2-iii (O): each archive path mapped to the REAL path the run's lock
+   * derivation resolved it through (`pathSourceClaims`' read — resolved once,
+   * where the keys are taken). The consistency derivation snapshots THAT —
+   * the same filesystem the run holds its shared claims on — while every
+   * sentence keeps the configured path. Absent (or a path missing from the
+   * map) = derive from the path as written, as before.
+   */
+  archiveRealPaths?: ReadonlyMap<string, string>
+  /**
    * backup2.3 test seam: the clock the transient snapshot's name and the stale
    * sweep's cutoff are read from, and the AHR runtime dir. Absent = real time
    * and the real `/run/anas-ahr`.
@@ -686,7 +695,11 @@ export async function runBackup(
   // open to `live` with a stated reason, so a derivation that cannot see the
   // system NEVER claims a snapshot it did not take.
   const facts = await readConsistencyFacts(executor, readAhrPools, deps.consistencyOptions ?? {})
-  const consistency = task.archives.map(a => deriveConsistency(a.path, facts))
+  // cr.64b2-iii (O): derive on the REAL path the run's lock derivation resolved
+  // (the same read, resolved once where the keys are taken), and print the
+  // configured one — a symlinked archive is snapshotted on the filesystem its
+  // shared claims were taken on, never on the one its text names.
+  const consistency = task.archives.map(a => deriveConsistency(deps.archiveRealPaths?.get(a.path) ?? a.path, facts, a.path))
   // The scans carry it to the screens (one endpoint, not two — the two answers
   // come from the same mount table).
   const scans = resolution.scans.map((scan, i) => ({ ...scan, consistency: consistency[i] }))

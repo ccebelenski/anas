@@ -84,6 +84,9 @@ export function defaultRcloneConfigPaths(): RcloneConfigPaths {
  *   not:     `access_key_id`, `key_file`, `sse_kms_key_id`, `pubkey_file`,
  *            `key_use_agent`
  *
+ * Plus an explicit NAME set beside the regex ({@link SECRET_NAMES}) for
+ * credential values the suffix shape misses — azureblob's `sas_url`.
+ *
  * rclone 1.60 has no `Sensitive` flag, so this rule stands in for it — it is
  * a heuristic and is stated as one. `option` (when known) makes rclone's own
  * `IsPassword`/secret fact authoritative: `option.secret` wins either way.
@@ -96,12 +99,33 @@ export function defaultRcloneConfigPaths(): RcloneConfigPaths {
  */
 const SECRET_SUFFIX_RE = /(?:^|_)(?:pass|password|secret|token|key)$/
 
+/**
+ * Secret NAMES the suffix rule misses, stated one per line with the backend
+ * that needs each (cr.64b2-iii M, from the cr.64c review). A name joins this
+ * set only when its VALUE is the credential itself and rclone's own backend
+ * option table names it — citable, not remembered:
+ *
+ *  - azureblob `sas_url` (providers-1.60.1.json:757, `IsPassword: false`,
+ *    Type string): a SAS URL carries the container's signature — the whole
+ *    credential in one value — but its name ends in neither `pass` nor
+ *    `key`, so the suffix rule let it show in a reply, ride the argv guard
+ *    blind, and enter the identity facts. rclone stores it in PLAIN text.
+ *
+ * Credential-SHAPED names in the capture that stay out on purpose:
+ * `access_key_id`, `client_id`, `application_credential_id`/`_name`,
+ * `account` (identifiers, not secrets), `auth_url`, `api_url`, `endpoint`
+ * (endpoints), `authorization` (a header name, not a value). From memory of
+ * rclone's backends, `ftp`/`sftp`-style `ask_password` already matches the
+ * suffix rule, and no other missed name is citable from this capture.
+ */
+const SECRET_NAMES: ReadonlySet<string> = new Set(['sas_url'])
+
 export function isSecretKey(key: string, option?: Partial<Pick<CloudProviderOption, 'secret' | 'type'>>): boolean {
   if (option?.secret)
     return true
   if (option?.type === 'bool')
     return false
-  return SECRET_SUFFIX_RE.test(key)
+  return SECRET_SUFFIX_RE.test(key) || SECRET_NAMES.has(key)
 }
 
 // ── The OAuth token paste ──────────────────────────────────────────────────
@@ -834,9 +858,12 @@ function withoutInlineSecrets(value: string): string {
  *    against it. The secret-rule values (the name rule, the IsPassword keys
  *    outside it, the secret parameters inline in a reference option's
  *    connection string — the same set {@link sectionSecretValues} masks)
- *    are left out of the digest, and the digest is keyed: even a value the
- *    name rule misses (azureblob `sas_url`, cr.64b2 (M)) is not testable
- *    offline, because the key never leaves this process.
+ *    are left out of the digest, and the digest is keyed: a value the name
+ *    rule still misses is not testable offline either, because the key
+ *    never leaves this process. (cr.64b2-iii (M) closed the citable miss —
+ *    azureblob `sas_url` — and the keyed-ness is pinned by a test, so
+ *    swapping the HMAC for a plain sha256 fails loudly instead of turning
+ *    the identity back into an offline oracle.)
  *  - A secret ROTATION is the same object. The section's type, provider,
  *    endpoint, bucket, account and every other non-secret key decide whether
  *    a re-created section is "the same remote"; a new key under the same

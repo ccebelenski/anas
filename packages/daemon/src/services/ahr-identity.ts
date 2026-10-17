@@ -1,5 +1,5 @@
 import type { AhrExpansionIntent, AhrPool } from '@anas/shared'
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { LvmPv, LvmVg } from '../parsers/lvm-report.js'
 import type { MdadmConfDoc } from '../parsers/mdadm-conf.js'
 import type { MdadmDetailExport } from '../parsers/mdadm-detail.js'
@@ -334,9 +334,21 @@ export type PartitionVerdict = 'ours' | 'foreign' | 'blank'
  * stderr.txt`) and exits 2 all the same. cr.64c's destroy dropped the udev
  * FSTYPE witness that used to stand beside it, so exit 2 WITH stderr now
  * reads as a probe that could not see — `foreign`, with
- * {@link classifyPartitionWithReason}'s sentence naming the read; exit 2 with
- * no output stays `blank`. (A device path that does not exist at all also
- * exits 2 silently with util-linux 2.41 — indistinguishable here.)
+ * {@link classifyPartitionWithReason}'s sentence naming the read.
+ *
+ * cr.64b2-iii (K, cr.64cr residual): the two remaining ways the probe itself
+ * fails now answer `foreign` too, never `blank` — `blank` zaps.
+ *  - The executor THROWS (the binary could not be spawned, ENOENT): the
+ *    probe never ran, so nothing was seen.
+ *  - Exit 2 with NO output: on a PARTITION device this is not the captured
+ *    blank shape — a readable blank slice answers exit 0 carrying its
+ *    `PART_ENTRY_*` keys (`zfs/blkid-p-blank-partition.txt`). Silence means
+ *    blkid could not read the device at all: util-linux 2.41 exits 2
+ *    silently for a path that is GONE, so a slice that vanished between the
+ *    listing and this probe (the cr.64cr note's "pool-labelled slice on a
+ *    vanished device") reads `foreign` and keeps the table instead of being
+ *    zapped on the listing's word alone.
+ * Exit 0 with no content keys stays `blank` — that is the captured shape.
  */
 export async function classifyPartition(
   executor: CommandExecutor,
@@ -360,11 +372,26 @@ export async function classifyPartitionWithReason(
   const { uuid } = await examineMember(executor, device)
   if (uuid !== null)
     return { verdict: ownsUuid(identity, uuid) ? 'ours' : 'foreign', reason: null }
-  const sig = await executor.exec(BLKID, ['-p', device])
+  let sig: ExecResult
+  try {
+    sig = await executor.exec(BLKID, ['-p', device])
+  }
+  catch (err) {
+    // cr.64b2-iii (K): the probe never RAN (spawn failed — the binary is
+    // gone, the fork failed). A read that never happened cannot call a
+    // partition blank; blank zaps.
+    const why = err instanceof Error ? err.message : String(err)
+    return { verdict: 'foreign', reason: `${device} could not be probed by blkid -p (the probe could not run: ${why}) — a partition whose content cannot be read is not judged blank` }
+  }
   const said = sig.stderr.trim().split('\n')[0] ?? ''
   if (sig.exitCode === BLKID_NOTHING) {
-    if (said === '')
-      return { verdict: 'blank', reason: null }
+    if (said === '') {
+      // cr.64b2-iii (K): silence on a partition device is not the captured
+      // blank shape (that is exit 0 with PART_ENTRY_* keys) — it is blkid
+      // failing to read the device at all, the util-linux 2.41 shape for a
+      // path that vanished since the listing. Fail closed.
+      return { verdict: 'foreign', reason: `${device} answered blkid -p with nothing at all (exit 2, no output) — a partition that shows no entry and no signature is a device that could not be read, not a blank slice` }
+    }
     return { verdict: 'foreign', reason: `${device} could not be read by blkid -p (${said}) — a partition whose content cannot be read is not judged blank` }
   }
   if (sig.exitCode === BLKID_FOUND)
@@ -417,11 +444,27 @@ export async function classifyRetiredPartition(
   device: string,
   partlabel: string | null,
 ): Promise<RetireVerdict> {
-  const verdict = await classifyPartition(executor, identity, device)
+  return (await classifyRetiredPartitionWithReason(executor, identity, pool, device, partlabel)).verdict
+}
+
+/**
+ * {@link classifyRetiredPartition} carrying {@link classifyPartitionWithReason}'s
+ * sentence when the verdict is a `foreign` that came from a read that could
+ * not see (cr.64b2-iii K) — a retire that keeps the table can say WHY the
+ * slice was not judged blank, not just name its path.
+ */
+export async function classifyRetiredPartitionWithReason(
+  executor: CommandExecutor,
+  identity: Pick<AhrPoolIdentity, 'uuids'>,
+  pool: string,
+  device: string,
+  partlabel: string | null,
+): Promise<{ verdict: RetireVerdict, reason: string | null }> {
+  const { verdict, reason } = await classifyPartitionWithReason(executor, identity, device)
   if (verdict === 'ours')
-    return 'ours'
+    return { verdict: 'ours', reason: null }
   const labelled = partlabel !== null && (matchPartitionLabel(pool, partlabel) !== null || matchCachePartitionLabel(pool, partlabel) !== null)
-  return verdict === 'blank' && labelled ? 'blank-ours' : 'foreign'
+  return verdict === 'blank' && labelled ? { verdict: 'blank-ours', reason: null } : { verdict: 'foreign', reason }
 }
 
 /**
@@ -435,9 +478,18 @@ export function mayZapRetiredDisk(verdicts: readonly RetireVerdict[]): boolean {
   return verdicts.length > 0 && verdicts.every(v => v !== 'foreign')
 }
 
-/** The sentence a retire says when it keeps a disk's partition table (destroy's wording, with the partitions). */
+/**
+ * The sentence a retire says when it keeps a disk's partition table
+ * (destroy's wording, with the partitions). cr.64b2-iii (J): the EMPTY list
+ * is its own case — the retire reaches the kept branch with no foreign
+ * partition only when the disk's tree named no partitions at all, and the
+ * named-list wording printed `()` and claimed slices were cleared when
+ * nothing was.
+ */
 export function retiredDiskKeptSentence(diskId: string, foreign: readonly string[]): string {
-  return `Leaving the partition table on ${diskId} — it carries partitions that are not this pool's (${foreign.join(', ')}); only the pool's own slices were cleared`
+  return foreign.length === 0
+    ? `Leaving the partition table on ${diskId} — no partition on it is provably this pool's, so nothing was cleared and the table stays`
+    : `Leaving the partition table on ${diskId} — it carries partitions that are not this pool's (${foreign.join(', ')}); only the pool's own slices were cleared`
 }
 
 // ---- The LVM gates: is the VG the pool's, ON THE DISKS? (H6, cr.22) --------

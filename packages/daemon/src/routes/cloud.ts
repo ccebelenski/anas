@@ -1222,7 +1222,7 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     const sourceTask = direct ? await readTask(systemdDir, name) : null
     const source = sourceTask
       ? await pathSourceClaims(executor, [sourceTask.source], readAhrPools)
-      : { claims: [], unlocked: [], unread: [] }
+      : { claims: [], unlocked: [], unread: [], resolved: new Map() }
     // cr.41 (§4.2 task key, cr.33b constraint): ONLY the DIRECT run holds the
     // task's key — shared — because it is the one that reads the task and does
     // the work. The Run-Now SUPERVISOR holds NO task key (and no source claim).

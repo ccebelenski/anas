@@ -76,12 +76,24 @@ function dumpResult(obj: unknown): { stdout: string, stderr: string, exitCode: n
 
 describe('rclone-config: the secret-key rule (rclone.1)', () => {
   it('the name rule: whole key or whole suffix at an _ boundary', () => {
-    const secret = ['key', 'pass', 'password', 'token', 'secret', 'secret_access_key', 'client_secret', 'sse_customer_key', 'key_file_pass', 'access_token']
-    const notSecret = ['access_key_id', 'key_file', 'sse_kms_key_id', 'pubkey_file', 'key_use_agent', 'endpoint', 'host', 'password2', 'mykey', 'bypass']
+    const secret = ['key', 'pass', 'password', 'token', 'secret', 'secret_access_key', 'client_secret', 'sse_customer_key', 'key_file_pass', 'access_token', 'sas_url']
+    const notSecret = ['access_key_id', 'key_file', 'sse_kms_key_id', 'pubkey_file', 'key_use_agent', 'endpoint', 'host', 'password2', 'mykey', 'bypass', 'auth_url', 'account']
     for (const k of secret)
       assert.equal(isSecretKey(k), true, `expected '${k}' secret`)
     for (const k of notSecret)
       assert.equal(isSecretKey(k), false, `expected '${k}' NOT secret`)
+  })
+
+  it('cr.64b2-iii (M): the explicit name set — azureblob sas_url is secret, its neighbours are not', () => {
+    // sas_url carries the container's signature (providers-1.60.1.json:757,
+    // IsPassword false, stored PLAIN) but matches no suffix; the identifier
+    // and endpoint neighbours of the same backend stay visible in the reply.
+    assert.equal(isSecretKey('sas_url'), true)
+    // an option saying otherwise is not trusted over the name set either —
+    // the rule stays a union
+    assert.equal(isSecretKey('sas_url', mkOption({ name: 'sas_url', secret: false })), true)
+    assert.equal(isSecretKey('account'), false)
+    assert.equal(isSecretKey('auth_url'), false)
   })
 
   it('a known provider option makes rclone\'s own fact authoritative', () => {
@@ -606,6 +618,24 @@ describe('rclone-config: remoteSectionIdentity — the retarget confirm\'s bound
     const lines = text.trimEnd().split('\n')
     for (const candidate of [lines.join('\n'), text, lines.filter(l => !l.startsWith('secret_access_key')).join('\n')])
       assert.notEqual(createHash('sha256').update(candidate).digest('hex'), id)
+  })
+
+  it('cr.64cr (M2): keyed to the CORE — the identity is not a plain sha256 of the exact input the HMAC is fed', () => {
+    // The review's refactor proof: swapping createHmac for createHash over
+    // the SAME update() input survives every assertion above (none of those
+    // candidates is that input), and would turn the identity back into an
+    // offline oracle. Pin the keyed-ness itself: the unkeyed digest over
+    // JSON.stringify([name, facts]) — facts being the section's non-secret
+    // keys sorted with their values, exactly what remoteSectionIdentity
+    // feeds its HMAC — must differ from the identity.
+    const id = remoteSectionIdentity(S3('hunter2'), 's3a')
+    const facts: [string, string][] = [
+      ['access_key_id', 'AKIAEXAMPLE'],
+      ['endpoint', 'http://10.0.0.5:9000'],
+      ['provider', 'Minio'],
+      ['type', 's3'],
+    ]
+    assert.notEqual(createHash('sha256').update(JSON.stringify(['s3a', facts])).digest('hex'), id)
   })
 })
 

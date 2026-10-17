@@ -7,6 +7,7 @@ import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { run } from './ahr-exec.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { SUBVOL_DATA, subvolFromMountOptions } from './ahr-snapshots.js'
+import { AhrTopologyUnreadableError } from './ahr-topology.js'
 import { pveNotify } from './pve-notify.js'
 import { mismatchCntArgs } from './scrub-schedules.js'
 import {
@@ -82,6 +83,9 @@ import {
 const BTRFS = '/usr/bin/btrfs'
 const MDADM = '/usr/sbin/mdadm'
 const CAT = '/usr/bin/cat'
+// The absent-file shape of a failed `cat /proc/mdstat`, copied from
+// `readAhrPools` (ahr-topology.ts) — the two readers must treat ENOENT alike.
+const CAT_MISSING_RE = /No such file or directory/
 const REALPATH = '/usr/bin/realpath'
 const JOURNALCTL = '/usr/bin/journalctl'
 const STAT = '/usr/bin/stat'
@@ -389,6 +393,14 @@ async function cancelBandCheck(
  * is read ONCE and every AHR band on the node is matched against it.
  *
  * A DELAYED or PENDING check counts: md has it queued and it will fire.
+ *
+ * cr.64b2-iii (Q): a FAILED mdstat read never answers "no check running". The
+ * rule is `readAhrPools`' (ahr-topology.ts): an ABSENT `/proc/mdstat`
+ * (coreutils cat's ENOENT line, exit 1) is honestly "no md arrays" — no check
+ * can run on a node with no md — but EVERY other non-zero exit (Permission
+ * denied, an I/O error) throws the same typed {@link AhrTopologyUnreadableError}
+ * the topology readers throw, so the gate's route answers 503 UNAVAILABLE
+ * naming the read instead of passing a scrub beside a check it could not see.
  */
 export async function runningAhrCheck(
   executor: CommandExecutor,
@@ -403,7 +415,16 @@ export async function runningAhrCheck(
   }
   if (labels.size === 0)
     return null
-  const mdstat = parseMdstat((await executor.exec(CAT, MDSTAT_CAT_ARGS)).stdout)
+  const mdstatRes = await executor.exec(CAT, MDSTAT_CAT_ARGS)
+  if (mdstatRes.exitCode !== 0) {
+    // The ENOENT rule copied from `readAhrPools` (ahr-topology.ts): cat's
+    // `No such file or directory` line means no md stack — honestly "no
+    // arrays", no check. Every other failed read could not SEE the checks.
+    if (CAT_MISSING_RE.test(mdstatRes.stderr))
+      return null
+    throw new AhrTopologyUnreadableError('cat /proc/mdstat', mdstatRes.exitCode, mdstatRes.stderr)
+  }
+  const mdstat = parseMdstat(mdstatRes.stdout)
   for (const md of mdstat) {
     const label = labels.get(md.kernelName)
     if (!label)

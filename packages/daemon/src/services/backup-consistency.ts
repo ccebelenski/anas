@@ -265,7 +265,8 @@ export function sourceFilesystemOf(path: string, facts: FilesystemFacts): Source
  * lives on. Pure prefix arithmetic over the table; the path itself is never
  * touched — so a symlink is followed by nobody here. The lock-claim readers
  * hand it the path's REAL path (`realSourcePath`, services/source-claims.ts,
- * cr.64b1 (H)); the consistency derivation still hands it the path's text.
+ * cr.64b1 (H)), and since cr.64b2-iii (O) so does the consistency derivation —
+ * both sides of a mover see the same resolved path.
  */
 export function filesystemOf(path: string, mounts: Map<string, FindmntNode>): FindmntNode | null {
   let best: FindmntNode | null = null
@@ -286,9 +287,22 @@ export function filesystemOf(path: string, mounts: Map<string, FindmntNode>): Fi
  * Derive one source path's consistency from the facts. PURE — every test case in
  * the matrix (dataset root / dataset subdirectory / AHR subvol pool / flat AHR /
  * remote mount / plain path) is expressible as a mount table plus a pool list.
+ *
+ * cr.64b2-iii (O): `path` is the path the run READS — the mover's callers hand
+ * it the REAL path (`realSourcePath`, the same resolution the lock derivation
+ * performs), so a symlinked source is snapshotted on the filesystem it actually
+ * lives on, the same one its keys were taken on. `displayPath` is the path as
+ * the operator configured it — every sentence prints THAT, so the progress line
+ * and the record name what the task says, not what it resolves to. Absent =
+ * `path` (the pure-fact callers, whose path is already the whole story).
  */
-export function deriveConsistency(path: string, facts: ConsistencyFacts): BackupArchiveConsistency {
+export function deriveConsistency(
+  path: string,
+  facts: ConsistencyFacts,
+  displayPath: string = path,
+): BackupArchiveConsistency {
   const source = normalizePath(path)
+  const shown = normalizePath(displayPath)
 
   // The ONE ownership answer, assembled once from the facts (the same
   // composition {@link loadPveFootprint} performs) — every judgement below,
@@ -305,7 +319,7 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
   if (ZFS_SNAPDIR_RE.test(source)) {
     return {
       consistency: 'live',
-      reason: `${source} is already inside a ZFS snapshot - it is read-only and unchanging, so nothing is snapshotted for it`,
+      reason: `${shown} is already inside a ZFS snapshot - it is read-only and unchanging, so nothing is snapshotted for it`,
     }
   }
 
@@ -325,18 +339,18 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
     if (owned?.kind === 'guest-volume') {
       return {
         consistency: 'live',
-        reason: `${source} is a PVE guest volume - PVE owns its guests' disks and their snapshots, so ANAS takes none and the image is read live (crash-consistent)`,
+        reason: `${shown} is a PVE guest volume - PVE owns its guests' disks and their snapshots, so ANAS takes none and the image is read live (crash-consistent)`,
       }
     }
     if (owned) {
       return {
         consistency: 'live',
-        reason: `${source} is inside PVE's footprint - ${owned.reason} - so the run takes no snapshot and the image is read live (crash-consistent)`,
+        reason: `${shown} is inside PVE's footprint - ${owned.reason} - so the run takes no snapshot and the image is read live (crash-consistent)`,
       }
     }
     return {
       consistency: 'snapshot',
-      reason: `${source} is the ZFS volume ${zvol}; the run snapshots the volume and reads the snapshot's own read-only device node (snapdev is published for the run and restored afterwards)`,
+      reason: `${shown} is the ZFS volume ${zvol}; the run snapshots the volume and reads the snapshot's own read-only device node (snapdev is published for the run and restored afterwards)`,
       backend: 'zfs',
       target: zvol,
       zvolDevice: zvolDevicePath(zvol),
@@ -345,7 +359,7 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
   if (source.startsWith('/dev/')) {
     return {
       consistency: 'live',
-      reason: `${source} is a block device ANAS does not manage - only a ZFS volume can be snapshotted, so the image is read live (crash-consistent: whatever the device holds while the run reads it)`,
+      reason: `${shown} is a block device ANAS does not manage - only a ZFS volume can be snapshotted, so the image is read live (crash-consistent: whatever the device holds while the run reads it)`,
     }
   }
 
@@ -355,7 +369,7 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
     return {
       consistency: 'live',
       reason: facts.mounts.size
-        ? `no mount table entry contains ${source} - the filesystem it sits on could not be identified, so the backup is live`
+        ? `no mount table entry contains ${shown} - the filesystem it sits on could not be identified, so the backup is live`
         : 'the mount table could not be read, so no snapshot capability could be derived - the backup is live',
     }
   }
@@ -368,7 +382,7 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
     if (ZFS_SNAPSHOT_SOURCE_RE.test(node.source)) {
       return {
         consistency: 'live',
-        reason: `${source} is already inside a ZFS snapshot (${node.source}) - it is read-only and unchanging, so nothing is snapshotted for it`,
+        reason: `${shown} is already inside a ZFS snapshot (${node.source}) - it is read-only and unchanging, so nothing is snapshotted for it`,
       }
     }
     // pvepool.1: an OWNED hosting dataset is not snapshotted — a storage-root
@@ -379,7 +393,7 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
     if (owned) {
       return {
         consistency: 'live',
-        reason: `${source} is inside PVE's footprint - ${owned.reason} - so the run takes no snapshot and reads the live tree`,
+        reason: `${shown} is inside PVE's footprint - ${owned.reason} - so the run takes no snapshot and reads the live tree`,
       }
     }
     // pvepool.1 review fix 2: the run snapshots RECURSIVELY, so an UNOWNED
@@ -402,12 +416,12 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
     if (descendant) {
       return {
         consistency: 'live',
-        reason: `${source} is on the ZFS dataset ${node.source}, which has PVE-owned ${descendant.name} beneath it - a recursive snapshot would include it (${descendant.ownership.reason}) - so the run takes no snapshot and reads the live tree`,
+        reason: `${shown} is on the ZFS dataset ${node.source}, which has PVE-owned ${descendant.name} beneath it - a recursive snapshot would include it (${descendant.ownership.reason}) - so the run takes no snapshot and reads the live tree`,
       }
     }
     return {
       consistency: 'snapshot',
-      reason: `${source} is on the ZFS dataset ${node.source}; the run takes a recursive snapshot and backs up from ${node.target}/.zfs/snapshot/<snapshot>`,
+      reason: `${shown} is on the ZFS dataset ${node.source}; the run takes a recursive snapshot and backs up from ${node.target}/.zfs/snapshot/<snapshot>`,
       backend: 'zfs',
       target: node.source,
       mountpoint: node.target,
@@ -424,14 +438,14 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
     if (facts.ahrUnreadable) {
       return {
         consistency: 'live',
-        reason: `${source} is on a btrfs filesystem (${node.source}) and the AHR topology could not be read, so it cannot be told whether it is an ANAS AHR pool - the backup is live`,
+        reason: `${shown} is on a btrfs filesystem (${node.source}) and the AHR topology could not be read, so it cannot be told whether it is an ANAS AHR pool - the backup is live`,
       }
     }
     const pool = ahrPoolMountedAt(node.target, facts.ahrPools)
     if (!pool) {
       return {
         consistency: 'live',
-        reason: `${source} is on a btrfs filesystem (${node.source}) that is not an ANAS AHR pool - ANAS does not snapshot filesystems it does not manage, so the backup is live`,
+        reason: `${shown} is on a btrfs filesystem (${node.source}) that is not an ANAS AHR pool - ANAS does not snapshot filesystems it does not manage, so the backup is live`,
       }
     }
     if (!pool.subvolLayout) {
@@ -448,7 +462,7 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
     }
     return {
       consistency: 'snapshot',
-      reason: `${source} is on AHR pool '${pool.name}'; the run takes a read-only btrfs snapshot of @data (and of every nested subvolume it backs up) and backs up from it`,
+      reason: `${shown} is on AHR pool '${pool.name}'; the run takes a read-only btrfs snapshot of @data (and of every nested subvolume it backs up) and backs up from it`,
       backend: 'ahr',
       target: pool.name,
       mountpoint: normalizePath(pool.mountpoint),
@@ -457,7 +471,7 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
   }
 
   // --- Everything else ---------------------------------------------------
-  return { consistency: 'live', reason: liveReason(source, node) }
+  return { consistency: 'live', reason: liveReason(shown, node) }
 }
 
 /** The honest one-liner for a source that cannot be snapshotted. */

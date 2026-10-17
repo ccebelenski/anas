@@ -253,6 +253,47 @@ describe('cloud remotes routes (rclone.1)', () => {
       assert.ok(!get.payload.includes('gtpass'), 'no secret value in any response')
     })
 
+    it('cr.64b2-iii (M): azureblob sas_url — the reply masks it, the value never rides an argv', async () => {
+      // sas_url is the whole credential (a signed container URL) but is
+      // `IsPassword: false` in the capture and matches no name suffix —
+      // the explicit name set (SECRET_NAMES) is what makes it secret.
+      const SAS = 'https://gtacct.blob.core.windows.net/container?sv=2021-08-06&sig=dummy-signature-value'
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/remotes',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'az', type: 'azureblob', options: { account: 'gtacct', sas_url: SAS } }),
+      })
+      assert.equal(res.statusCode, 202, res.body)
+      const { job } = res.json() as JobAccepted
+      const done = await waitForJob(server, job.id)
+      assert.equal(done.status, 'completed', done.error?.message)
+
+      // The module's EXISTING handling for a name-rule secret that is not
+      // IsPassword: stored PLAIN, never obscured (azureblob `sas_url` is
+      // IsPassword false in providers-1.60.1.json — `rclone obscure -`
+      // rides only the password-typed keys).
+      const text = await readFile(configFile, 'utf-8')
+      assert.ok(text.includes(`sas_url = ${SAS}`), 'stored plain, like every name-rule secret')
+
+      // The reply masks it: the value never comes back, only the NAME.
+      const get = await server.inject({ method: 'GET', url: '/v1/cloud/remotes', headers: IDENTITY })
+      const { data } = get.json() as { data: CloudRemotesResponse }
+      assert.deepEqual(data.remotes, [{
+        name: 'az',
+        type: 'azureblob',
+        options: { account: 'gtacct' },
+        secretsSet: ['sas_url'],
+      }])
+      assert.ok(!get.payload.includes(SAS), 'no secret value in any response')
+
+      // The argv rule treats it as secret: the write's secret-value set
+      // carries it, so it never rides a spawned argv — no call, in any
+      // position, contains it.
+      for (const c of mockOf(server).calls)
+        assert.ok(!c.args.some(a => a.includes(SAS)), `sas_url value rode the argv of ${c.command} ${c.args.join(' ')}`)
+    })
+
     it('a duplicate name → 409, no job', async () => {
       await writeFile(configFile, GT_SECTION, 'utf-8')
       const res = await server.inject({
