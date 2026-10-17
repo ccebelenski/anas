@@ -152,7 +152,7 @@ re-read myself are [R].
 | set access → `fs.setAccess` (`:1221`) | only recursive: `{dataset}` (`services/access.ts:613-618`); owner, group, mode, entries unbound | ownership, recursive refusal, plan from live `getfacl` | nothing | **all**; the plan is Cap (F4) |
 | dataset destroy → `zfs.destroy` (`:1290`) | `{dataset}` + guid; **`recursive` unbound** (`:1428-1431`) [C] | exists, ownership, owned descendants, LUN-held | guid + `recheckDestroyGates` (`:1461-1462`) [C] | — for gates; **the child set is not bound** (children created after the challenge are swept) |
 | snapshot destroy → `zfs.destroy` (`:1659`, same op name) | none, by design | exists, ownership | nothing | ownership |
-| ZFS scrub toggle → `scrub.zfs.toggle` (`scrub.ts:140`) | none | exists | nothing | — |
+| ZFS scrub toggle → `scrub.zfs.toggle` (`scrub.ts:140`) | none | exists | nothing | — **cr.64c (2026-10-16): a `zpool list -j` that fails is a 503 naming the read at `GET /scrub` and `PUT /scrub/zfs/:pool`, never a 404 for a live pool or a list without its ZFS rows** |
 
 Not in H8 but found: **pool export and destroy have no PVE-ownership gate** (`ownershipOf` is called in
 pools.ts only by `poolStamp`, `:584`, and `vdevTopologyGate`, `:810`), although the `vdevTopologyGate`
@@ -222,7 +222,7 @@ file protects a pool [R].
 | target update (`:314`) | only when a live ACL/portal is removed: `{target}`; the removed set unbound | preflight, foreign, CHAP merge, sessions/portals | nothing | **revision** (F4); sessions |
 | target enable/disable (`:465`) | none | preflight, foreign, already in state | nothing | Cap target |
 | target delete (`:516`) | none (ruling: refuse, never confirm) | **live sessions 409**, **has LUNs 409** | nothing | **sessions, LUN count** |
-| LUN add (`:583`) | none | preflight, foreign, name taken, backing resolve/ownership/already mapped | nothing | **index and ACL grants from the RT target** (audit #34); backing |
+| LUN add (`:583`) | none | preflight, foreign, name taken, backing resolve/ownership/already mapped | nothing | **index and ACL grants from the RT target** (audit #34); backing — **cr.64c + cr.64cr (2026-10-16): an image backing whose AHR topology cannot be read is refused with the read's sentence (it used to read as "not on an AHR pool"); a zvol backing is proved with `zfs list -H -t volume -o name -- <pool>/<vol>` before the job's first targetcli act and OUTSIDE its backstore undo, so a refusal deletes nothing: "does not exist" only on zfs's `dataset does not exist`, "not a volume" for a filesystem, "could not be read (<stderr>)" for any other failure** |
 | LUN update (`:698`) | none (shrink is a hard 409) | served device, size, shrink, **sessions** | `reverifyServedLun` + size/shrink | **sessions** |
 | LUN delete (`:926`) | `{target, serial, backstore}`; **`destroyBacking` unbound** (deliberate, `:1007-1013`) | **sessions**, served device, zvol snapshots when destroying the backing | `reverifyServedLun` | **sessions**, snapshot check |
 | health repair (`:1083`) | none | plan guard | fresh state + `guardRepairPlan` under the lock | — (the model) |
@@ -236,7 +236,7 @@ file protects a pool [R].
 | image restore in place (`backup.ts:1643`) | `{target, serial, repo, snapshot, archive}` | served device, size, **sessions** | `reverifyServedLun` + size + sessions under the lock | **`target.enabled` comes from the RT object** and decides whether the target is disabled for the stream (`services/backup-restore.ts:639`) [C] |
 | image restore as a new LUN | `{target, lun, mode}`; snapshot, archive, backing unbound | target, name, backing | nothing | stale index and ACLs (audit #34) — **closed by cr.40 (fresh target) and cr.54 (2026-10-16): one guard spec; the confirm signs the whole request + the backing path; LIO, target, name, backing and an unmoved-backing gate re-run in the job and under the lock before the map; the new volume's dataset keys (or the image directory's filesystem keys) beside the target key until the map** |
 | file restore | `{target, snapshot, archive, mode}`; **selections unbound** | PVE territory, LUN-held, writable, space | nothing | everything — **closed by cr.54 (2026-10-16): one guard spec; the confirm signs the whole request (selections, options, repo, namespace …) + the destination's revision (kind at the path, filesystem keys); territory (storage.cfg read fail-closed), LUN-held, kind, selection, writable and space re-run in the job; destination `zfs:`/`ahr:`/`mount:` keys shared** |
-| cloud remote update / delete (`cloud.ts:390, 485`) | retarget: `{remote, changes}` | encrypted, exists, references | existence/type under the lock | the retarget decision and references are not re-run |
+| cloud remote update / delete (`cloud.ts:390, 485`) | retarget: `{remote, changes}` | encrypted, exists, references | existence/type under the lock | the retarget decision and references are not re-run — **retarget closed by cr.64c + cr.64cr (2026-10-16): the confirm rides `guardConfirm` bound to `{remote, section}`, where `section` is an HMAC-SHA256 under a per-process random key over the section's non-secret keys and values (no digest of a plaintext secret ever reaches a reply; a secret rotation is the same remote, a changed type, provider or endpoint is not), and the job re-gates that identity through `guarded` and again under the rclone.conf file lock: a section deleted or re-created while the job waits fails `IDENTITY_MISMATCH` and nothing is written** |
 
 ### 2.5 Mounts, shares, identity
 
@@ -545,8 +545,8 @@ and `?force=true` on rollback (`60-datasets.js:2972-2974`) [C].
 | c | Mint one code per option combination | Leaks the option space into the store; rejected |
 
 Option (b) is safe only for a verb whose daemon confirm is **unconditional** — an unconfirmed request
-must never act. Pool destroy, dataset destroy and rollback always challenge today (`confirmGateBound`
-on every path) [C]; a daemon test per route pins "no code ⇒ 409 for every combination of the bound
+must never act. Pool destroy, dataset destroy and rollback always challenge today (`guardConfirm` on
+every path; its predecessor `confirmGateBound` was deleted in cr.64c, its own test its only caller) [C]; a daemon test per route pins "no code ⇒ 409 for every combination of the bound
 flags", so a later change that makes one of them conditional fails CI before the UI can act on a
 re-challenge. The window treats any answer other than a 409 with a code as an error shown in the window
 (OK stays disabled). The generic piece lives in `confirmWindow` (`10-api.js:337-374`): an `extraItems`
@@ -863,6 +863,11 @@ become unnecessary but harmless. `casWrite`'s inner `pollJob` (`10-api.js:477-48
   be submitted as jobs with claims (cr.38 covers the cache rung; the rest is grooming).
 - `withFileLock`'s map never drops a key (`file-lock.ts:15-22` [C]); harmless at today's key counts,
   but the lock table in cr.33 must delete idle keys.
+- The recycle-bin purge (`recycle-purge.ts`, the 2026-10-14 §4 / 2026-10-16 L27 residue) is closed by
+  cr.64c and cr.64cr: the bin is `lstat`ed and then opened `O_DIRECTORY | O_NOFOLLOW` before anything is
+  listed, and the walk acts only through directory handles (`/proc/self/fd/<dirfd>/<name>` for every
+  `lstat`, `unlink` and `rmdir`, each subdirectory opened no-follow through its parent), so a bin or a
+  directory under it swapped for a symlink after its open re-points only the path, never the purge.
 - Review M2's "add vdev and raidz expansion have no confirm" stays M2's: irreversible is not
   data-destroying, so EPICS' Safety altitudes would make it an advisory amber gate, not a confirm. The
   guard makes either a one-line change.

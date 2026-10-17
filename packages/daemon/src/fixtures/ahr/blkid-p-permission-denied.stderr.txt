@@ -1,0 +1,1 @@
+blkid: error: /dev/nvme0n1p1: Permission denied

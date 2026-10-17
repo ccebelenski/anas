@@ -2,6 +2,7 @@ import type { CloudProvider, CloudProviderOption, CloudRemote } from '@anas/shar
 import type { CommandExecutor } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -28,6 +29,7 @@ import {
   RemoteExistsError,
   RemoteNotFoundError,
   remoteSecretValues,
+  remoteSectionIdentity,
   remotesReferencing,
   removeRemote,
   revealObscured,
@@ -566,6 +568,47 @@ describe('rclone-config: revealObscured — rclone\'s obscure format decoded IN 
   })
 })
 
+describe('rclone-config: remoteSectionIdentity — the retarget confirm\'s bound identity (cr.64cr)', () => {
+  const S3 = (secret: string, extra = ''): string => `[s3a]\ntype = s3\nprovider = Minio\naccess_key_id = AKIAEXAMPLE\nsecret_access_key = ${secret}\nendpoint = http://10.0.0.5:9000\n${extra}`
+
+  it('null for a section that is not there', () => {
+    assert.equal(remoteSectionIdentity(S3('a'), 'other'), null)
+    assert.equal(remoteSectionIdentity('', 's3a'), null)
+  })
+
+  it('a secret rotation is the SAME remote: name-rule secrets, IsPassword keys outside the rule, inline connection-string secrets', () => {
+    assert.equal(remoteSectionIdentity(S3('minioadmin'), 's3a'), remoteSectionIdentity(S3('rotated'), 's3a'))
+    const crypt = (pw: string, salt: string): string => `[c]\ntype = crypt\nremote = s3a:bucket\npassword = ${pw}\npassword2 = ${salt}\n`
+    assert.equal(remoteSectionIdentity(crypt('AAAA', 'BBBB'), 'c'), remoteSectionIdentity(crypt('CCCC', 'DDDD'), 'c'))
+    const wrapper = (sk: string): string => `[w]\ntype = crypt\nremote = :s3,access_key_id=AK,secret_access_key=${sk}:bucket\npassword = x\n`
+    assert.equal(remoteSectionIdentity(wrapper('one'), 'w'), remoteSectionIdentity(wrapper('two'), 'w'))
+  })
+
+  it('a changed type, provider, endpoint, access key id or wrapped remote is a DIFFERENT remote', () => {
+    const base = remoteSectionIdentity(S3('s'), 's3a')
+    assert.notEqual(remoteSectionIdentity(S3('s').replace('type = s3', 'type = sftp'), 's3a'), base)
+    assert.notEqual(remoteSectionIdentity(S3('s').replace('Minio', 'AWS'), 's3a'), base)
+    assert.notEqual(remoteSectionIdentity(S3('s').replace('10.0.0.5', '10.0.0.6'), 's3a'), base)
+    assert.notEqual(remoteSectionIdentity(S3('s').replace('AKIAEXAMPLE', 'AKIAOTHER'), 's3a'), base)
+    assert.notEqual(remoteSectionIdentity(S3('s', 'region = eu-west-1\n'), 's3a'), base)
+    const wrapper = (target: string): string => `[w]\ntype = crypt\nremote = :s3,secret_access_key=k:${target}\npassword = x\n`
+    assert.notEqual(remoteSectionIdentity(wrapper('one'), 'w'), remoteSectionIdentity(wrapper('two'), 'w'))
+  })
+
+  it('comments, blank lines and key order are not facts of the remote', () => {
+    const reordered = '# hand note\n[s3a]\nendpoint = http://10.0.0.5:9000\ntype = s3\n\naccess_key_id = AKIAEXAMPLE\nprovider = Minio\nsecret_access_key = s\n'
+    assert.equal(remoteSectionIdentity(reordered, 's3a'), remoteSectionIdentity(S3('s'), 's3a'))
+  })
+
+  it('keyed: no plain digest of the section — its lines, its text, or its non-secret lines — equals it (no offline oracle)', () => {
+    const text = S3('hunter2')
+    const id = remoteSectionIdentity(text, 's3a')
+    const lines = text.trimEnd().split('\n')
+    for (const candidate of [lines.join('\n'), text, lines.filter(l => !l.startsWith('secret_access_key')).join('\n')])
+      assert.notEqual(createHash('sha256').update(candidate).digest('hex'), id)
+  })
+})
+
 describe('rclone-config: writeRemote (rclone.1)', () => {
   let dir: string
   let cfg: string
@@ -676,6 +719,40 @@ describe('rclone-config: writeRemote (rclone.1)', () => {
       writeRemote(paths, mock, { name: 'homelab', type: 'webdav', options: {} }, { providers, mode: 'update' }),
       /the type is immutable/,
     )
+  })
+
+  it('cr.64cr: expectSection — a section that is not the bound one is IDENTITY_MISMATCH under the lock, and nothing is written', async () => {
+    const seed = '[homelab]\ntype = sftp\nhost = 127.0.0.1\nuser = root\npass = OBSCURED-orig\n'
+    await mkdir(dirname(cfg), { recursive: true })
+    await writeFile(cfg, seed, { encoding: 'utf-8', mode: 0o600 })
+    mock.addFixture({ command: RCLONE, args: [...base(), 'config', 'dump'], result: dumpResult({ homelab: { type: 'sftp', host: '127.0.0.1', user: 'root', pass: 'OBSCURED-orig' } }) })
+    // Bound to a DIFFERENT section of the same name (another host).
+    const bound = remoteSectionIdentity('[homelab]\ntype = sftp\nhost = 198.51.100.7\nuser = root\npass = x\n', 'homelab')!
+    await assert.rejects(
+      writeRemote(paths, mock, { name: 'homelab', type: 'sftp', options: { host: '10.0.0.9' } }, { providers, mode: 'update', expectSection: bound }),
+      (err: Error & { jobErrorCode?: string }) => {
+        assert.equal(err.jobErrorCode, 'IDENTITY_MISMATCH')
+        assert.match(err.message, /^remote 'homelab' is not the one that was confirmed/)
+        return true
+      },
+    )
+    assert.equal(await readFile(cfg, 'utf-8'), seed)
+  })
+
+  it('cr.64cr: expectSection equal to the section as it stands — the update goes through', async () => {
+    const seed = '[homelab]\ntype = sftp\nhost = 127.0.0.1\nuser = root\npass = OBSCURED-orig\n'
+    await mkdir(dirname(cfg), { recursive: true })
+    await writeFile(cfg, seed, { encoding: 'utf-8', mode: 0o600 })
+    mock.addFixture({
+      command: RCLONE,
+      args: [...base(), 'config', 'dump'],
+      results: [
+        dumpResult({ homelab: { type: 'sftp', host: '127.0.0.1', user: 'root', pass: 'OBSCURED-orig' } }),
+        dumpResult({ homelab: { type: 'sftp', host: '10.0.0.9', user: 'root', pass: 'OBSCURED-orig' } }),
+      ],
+    })
+    await writeRemote(paths, mock, { name: 'homelab', type: 'sftp', options: { host: '10.0.0.9' } }, { providers, mode: 'update', expectSection: remoteSectionIdentity(seed, 'homelab')! })
+    assert.ok((await readFile(cfg, 'utf-8')).includes('host = 10.0.0.9'))
   })
 
   it('update of an absent remote throws RemoteNotFoundError', async () => {

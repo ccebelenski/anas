@@ -1264,20 +1264,70 @@ export async function createAndMapLun(
   return { index, attributes: attrs }
 }
 
+/** zfs's stderr for a named dataset that is not there (captured `fixtures/iscsi/zfs-list-t-volume-absent.stderr.txt`). */
+const ZFS_DATASET_ABSENT_RE = /dataset does not exist/
+/** zfs's stderr for a named dataset of another type under `-t volume` (captured `…-filesystem.stderr.txt`). */
+const ZFS_WRONG_TYPE_RE = /operation not applicable to datasets of this type/
+
+/** The argv {@link proveZvolBacking} reads: a VOLUME of exactly that name, or nothing. */
+export function zvolExistsArgs(dataset: string): string[] {
+  return ['list', '-H', '-t', 'volume', '-o', 'name', '--', dataset]
+}
+
+/**
+ * The zvol a `kind:zvol` LUN add maps must EXIST and be a VOLUME — proved
+ * before the job's first targetcli act (cr.64c item 8, corrected by cr.64cr).
+ *
+ * `classifyBacking` calls any `/dev/zvol/<pool>/<vol>` path a zvol — it must,
+ * to read ownership for LUNs that already exist — so a request naming a
+ * volume that was never created (or was destroyed since the gate read) passed
+ * every gate and reached targetcli, which failed mid-sequence with an opaque
+ * "no such device" AFTER the backstore create. A precondition is checked
+ * before the first act, not discovered by the act. (The restore path creates
+ * its own backing with a checked `zfs create`, so it needs nothing here.)
+ *
+ * cr.64cr (review of cr.64c):
+ *  - the CALLER runs this OUTSIDE (ahead of) the add route's backstore-undo
+ *    try: a refusal here must never fire `removeOrphanedBackstore`, a
+ *    targetcli delete of a namesake backstore this job never created;
+ *  - the read is `zfs list -H -t volume -o name -- <dataset>`: a name-only
+ *    list exits 0 for a FILESYSTEM too, and a filesystem is not a block device
+ *    — with `-t volume` zfs refuses it (exit 1, `operation not applicable to
+ *    datasets of this type`, captured `fixtures/iscsi/zfs-list-t-volume-
+ *    filesystem.stderr.txt`), refused here as "not a volume" (an exit 0 that
+ *    names nothing reads the same);
+ *  - the sentence follows zfs's stderr: only `dataset does not exist` says
+ *    "does not exist"; any other failure (a suspended pool, a permission
+ *    error) says the volume "could not be read" with zfs's own line — a read
+ *    that could not see never answers "nothing there" (§2).
+ *
+ * Throws a plain Error (the job fails with the sentence); no-op for a backing
+ * that is not a zvol.
+ */
+export async function proveZvolBacking(
+  executor: CommandExecutor,
+  backing: Pick<ResolvedBacking, 'path' | 'plugin' | 'dataset'>,
+): Promise<void> {
+  if (backing.plugin !== 'block' || !backing.path.startsWith('/dev/zvol/'))
+    return
+  const dataset = backing.dataset ?? backing.path.slice('/dev/zvol/'.length)
+  // cr.21: `--` ahead of the derived operand.
+  const r = await executor.exec(ZFS, zvolExistsArgs(dataset))
+  if (r.exitCode === 0 && r.stdout.split('\n').some(l => l.trim() === dataset))
+    return
+  const tail = 'a zvol LUN is backed by an existing ZFS volume; nothing was done'
+  const stderr = r.stderr.trim().split('\n')[0] ?? ''
+  if (r.exitCode === 0 || ZFS_WRONG_TYPE_RE.test(stderr))
+    throw new Error(`'${dataset}' is not a volume — a filesystem or snapshot is not a block device${stderr ? ` (${stderr})` : ''}; ${tail}`)
+  if (ZFS_DATASET_ABSENT_RE.test(stderr))
+    throw new Error(`volume '${dataset}' does not exist (${stderr}); ${tail}`)
+  throw new Error(`volume '${dataset}' could not be read (${stderr || `zfs list exited ${r.exitCode}`}); nothing was done`)
+}
+
 /**
  * Add a LUN to an existing target: the shared create-and-map step, then the
- * save — add-LUN persists the moment the LUN is mapped.
- *
- * cr.64c: the zvol's EXISTENCE is proved here, before the first targetcli act.
- * `classifyBacking` calls any `/dev/zvol/<pool>/<vol>` path a zvol — it must,
- * to read ownership for LUNs that already exist — so a request naming a volume
- * that was never created (or was destroyed since the gate read) passed every
- * gate and reached targetcli, which failed mid-sequence with an opaque
- * "no such device" AFTER the backstore create. A precondition is checked
- * before the first act, not discovered by the act. (The request-time 409
- * would need the same check in the route's backing gate; this is the one
- * place every add-LUN job passes through, and the restore path creates its
- * own backing with a checked `zfs create`, so it needs nothing here.)
+ * save — add-LUN persists the moment the LUN is mapped. The caller has proved
+ * a zvol backing with {@link proveZvolBacking} first, outside its undo.
  */
 export async function addIscsiLun(
   opts: IscsiMutateOptions,
@@ -1287,19 +1337,6 @@ export async function addIscsiLun(
   size: number | null,
   serial: string,
 ): Promise<{ index: number, name: string, serial: string, backingPath: string, attributes: IscsiBackstoreAttributes }> {
-  if (backing.plugin === 'block' && backing.path.startsWith('/dev/zvol/')) {
-    const dataset = backing.dataset ?? backing.path.slice('/dev/zvol/'.length)
-    // cr.21: `--` ahead of the derived operand. Anything but the dataset's own
-    // name in the output — a failed read included — is "not there": the add
-    // refuses rather than let targetcli discover it mid-sequence.
-    const r = await opts.executor.exec(ZFS, ['list', '-H', '-o', 'name', '--', dataset])
-    if (!(r.exitCode === 0 && r.stdout.split('\n').some(l => l.trim() === dataset))) {
-      const why = r.exitCode !== 0
-        ? (r.stderr.trim().split('\n')[0] || `zfs list exited ${r.exitCode}`)
-        : 'zfs list named no such volume'
-      throw new Error(`volume '${dataset}' does not exist — a zvol LUN is backed by an existing ZFS volume (${why}); nothing was done`)
-    }
-  }
   const { index, attributes } = await createAndMapLun(
     opts,
     target,

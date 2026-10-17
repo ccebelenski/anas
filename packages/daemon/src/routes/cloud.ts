@@ -12,10 +12,9 @@ import type {
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
-import type { GuardPass, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
-import type { RcloneConfigPaths } from '../services/rclone-config.js'
+import type { GuardPass, GuardReads, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
+import type { RcloneConfigPaths, RcloneConfigRead } from '../services/rclone-config.js'
 import type { UnitTaskObject } from '../services/task-units.js'
-import { createHash } from 'node:crypto'
 import { access, constants } from 'node:fs/promises'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
@@ -32,7 +31,6 @@ import {
 import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
 import { READ_JOB_OPERATIONS, readJobCancel } from '../jobs/read-jobs.js'
-import { parseRcloneConf } from '../parsers/rclone-conf.js'
 import { directFromClientRefusal, TASK_RUNNER_USER } from '../runner-poll.js'
 import { ConfirmStore } from '../safety/confirm.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, sendRefusal, sourcePathsMoved, taskClaim, unheldClaimsRefusal } from '../safety/guard.js'
@@ -68,7 +66,7 @@ import {
 } from '../services/cloud-units.js'
 import { ConfigConflictError } from '../services/config-writer.js'
 import { scanNestedFilesystems } from '../services/nested-filesystems.js'
-import { normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, remotesReferencing, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
+import { normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, remoteSectionIdentity, remotesReferencing, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
 import { testRemote } from '../services/rclone-probe.js'
 import { pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
 import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision, taskRunInFlight } from '../services/task-units.js'
@@ -152,26 +150,28 @@ class RcloneNotInstalledError extends Error {
 }
 
 /**
- * The identity of a remote's stored section (cr.64c, cr.63 (j)): the sha256 of
- * the section's own lines in rclone.conf — header through one-before-next, the
- * smb/nfs stanza precedent — or null when the section is gone. A remote deleted
- * and re-created under the same name inside a confirm's TTL hashes differently,
- * so a code minted for the old section cannot carry the update through.
+ * The retarget door's object view (cr.64c, cr.63 (j); cr.64cr): the remote as
+ * rclone.conf holds it NOW, bound by its name + {@link remoteSectionIdentity}
+ * (a keyed digest of the section's non-secret facts — nothing derivable from a
+ * secret, and a secret rotation is the same remote). Both doors read through
+ * it: the route binds what it read, and the job — `guarded`, ruling (j) —
+ * re-reads and compares before it writes, so a section deleted and re-created
+ * while the job waited is IDENTITY_MISMATCH and nothing is written.
  */
-function remoteSectionHash(text: string, name: string): string | null {
-  const doc = parseRcloneConf(text)
-  const span = doc.sections.find(s => s.name === name)
-  if (!span)
-    return null
-  return createHash('sha256').update(doc.lines.slice(span.start, span.end).join('\n')).digest('hex')
-}
-
-/** The retarget door's object view: the remote as read, bound by name + section hash. */
-function remoteView(name: string, existing: CloudRemote, section: string): ObjectView<CloudRemote> {
+function remoteView(name: string, readCurrent: () => Promise<RcloneConfigRead>): ObjectView<CloudRemote> {
+  const current = (reads: GuardReads): Promise<RcloneConfigRead> => reads.once('rclone.conf', readCurrent)
   return {
     what: `remote '${name}'`,
-    read: async () => existing,
-    id: async () => ({ remote: name, section }),
+    read: async (reads) => {
+      const now = await current(reads)
+      if (now.encrypted)
+        throw new Error(CONFIG_ENCRYPTED_ERROR)
+      return now.remotes.find(r => r.name === name) ?? null
+    },
+    id: async (_remote, reads) => {
+      const section = remoteSectionIdentity((await current(reads)).text, name)
+      return section === null ? null : { remote: name, section }
+    },
     unbound: () => `remote '${name}' could not be bound to its section in rclone.conf — refusing the retarget`,
   }
 }
@@ -458,7 +458,8 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     if (!identity)
       return
 
-    const precheck = await guard503(reply, async (): Promise<{ catalog: CloudProvider[], type: string } | null> => {
+    interface Retarget { spec: GuardSpec<CloudRemote>, pass: GuardPass<CloudRemote>, section: string }
+    const precheck = await guard503(reply, async (): Promise<{ catalog: CloudProvider[], type: string, retarget: Retarget | null } | null> => {
       await requireRclone()
       const catalog = await providers()
       const current = await readConfig(paths, executor, catalog)
@@ -483,26 +484,31 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       // the legacy confirmGate signed only {remote, changes} — a same-name
       // remote deleted and re-created inside the TTL replayed the code onto a
       // different remote. The code now rides guardConfirm, bound to the
-      // remote's identity: its name plus the sha256 of its own section lines
-      // in rclone.conf (the smb/nfs stanza precedent), so a re-created or
-      // edited section is 409 IDENTITY_MISMATCH, and a replay with different
-      // changes is 409 CONFIRM_SCOPE_CHANGED naming the field. `options`
+      // remote's identity: its name plus remoteSectionIdentity — cr.64cr: a
+      // keyed digest of the section's NON-secret facts, never a hash over
+      // its plaintext secrets (cr.64c's sha256 was an offline oracle in the
+      // IDENTITY_MISMATCH reply), and a secret rotation is the same remote —
+      // so a re-created section (another type, provider or endpoint) is 409
+      // IDENTITY_MISMATCH, and a replay with different changes is 409
+      // CONFIRM_SCOPE_CHANGED naming the field. The job re-gates the bound
+      // identity (guarded, and again under writeRemote's file lock). `options`
       // itself is not a signed field: it carries the secret option NAMES and
       // describeField would echo values into the 409 — the destination-
       // relevant half, with values the retarget rule keeps non-secret, is
       // exactly `changes`.
       const changes = destinationChanges(existing, input.options, catalog)
+      let retarget: Retarget | null = null
       if (changes.length > 0) {
         const tasks = await tasksReachingRemote(current.remotes, name, referencingTasks)
         if (tasks.length > 0) {
-          const section = remoteSectionHash(current.text, name)
+          const section = remoteSectionIdentity(current.text, name)
           if (section === null) {
             reply.code(409).send({ error: { code: 'CONFLICT', message: `remote '${name}' could not be bound to its section in rclone.conf — refusing the retarget` } })
             return null
           }
           const spec: GuardSpec<CloudRemote> = {
             operation: 'cloud.remote.retarget',
-            object: remoteView(name, existing, section),
+            object: remoteView(name, () => readConfig(paths, executor, catalog)),
             gates: [],
           }
           const pass: GuardPass<CloudRemote> = {
@@ -523,9 +529,10 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
           })) {
             return null
           }
+          retarget = { spec, pass, section }
         }
       }
-      return { catalog, type: existing.type }
+      return { catalog, type: existing.type, retarget }
     })
     if (precheck === undefined || precheck === null)
       return undefined
@@ -533,10 +540,23 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     // The write needs a CloudRemoteWrite: the name + the EXISTING type (the
     // service re-checks it under the lock — a drift cannot slip through).
     const write: CloudRemoteWrite = { name, type: precheck.type, options: input.options }
+    const { retarget } = precheck
+    const update = (): Promise<CloudRemote> => writeRemote(paths, executor, write, {
+      providers: precheck.catalog,
+      mode: 'update',
+      ...(retarget ? { expectSection: retarget.section } : {}),
+    })
+    // cr.64cr item 5 (ruling (j)): a confirmed retarget's job re-reads the
+    // remote and re-gates the identity the confirm was bound to before it
+    // writes (`guarded`), and writeRemote compares it once more under the
+    // per-file lock — the job can wait behind a delete + re-create of the
+    // same name for the queue or for that lock.
     const job = jobQueue.submit(
       'cloud.remote.update',
       { ...identity, params: { remote: name } },
-      async () => rcloneJob(() => writeRemote(paths, executor, write, { providers: precheck.catalog, mode: 'update' })),
+      retarget
+        ? async (updateProgress, ctx) => rcloneJob(() => guarded(retarget.spec, retarget.pass, async () => update())(updateProgress, ctx))
+        : async () => rcloneJob(update),
     )
     reply.code(202)
     return { job }

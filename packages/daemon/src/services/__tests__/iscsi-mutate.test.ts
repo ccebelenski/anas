@@ -1,6 +1,7 @@
 import type { IscsiTargetDetail } from '@anas/shared'
 import type { IscsiReadContext } from '../iscsi.js'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -33,6 +34,7 @@ import {
   newSerial,
   newTargetIqn,
   nextLunIndex,
+  proveZvolBacking,
   replayAttributes,
   resizeFileLun,
   resolveFileBackingDir,
@@ -46,6 +48,7 @@ import {
   withIscsiLock,
   zvolDataset,
   zvolDevicePath,
+  zvolExistsArgs,
 } from '../iscsi-mutate.js'
 
 /**
@@ -78,12 +81,10 @@ function targetcliCalls(mock: MockExecutor): string[] {
   return mock.calls.filter(c => c.command === TARGETCLI).map(c => c.args.join(' '))
 }
 
-/** A MockExecutor whose targetcli always succeeds (and whose `tank/vol1` exists). */
+/** A MockExecutor whose targetcli always succeeds. */
 function okExecutor(): MockExecutor {
   const mock = new MockExecutor()
   mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
-  // cr.64c: addIscsiLun proves the zvol exists before the first targetcli act.
-  mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name', '--', 'tank/vol1'], result: { stdout: 'tank/vol1\n', stderr: '', exitCode: 0 } })
   return mock
 }
 
@@ -495,6 +496,58 @@ describe('the backstore attribute set ANAS puts on every LUN (GT-18, GT-26, GT-2
   })
 })
 
+describe('proveZvolBacking — the zvol a LUN add maps exists and IS a volume (cr.64c item 8, cr.64cr)', () => {
+  // `classifyBacking` calls any /dev/zvol/<p>/<v> path a zvol, so a request
+  // naming a volume that is not there used to sail through every gate and die
+  // mid-sequence in targetcli, after the backstore create. The route runs this
+  // ahead of its backstore undo (routes/__tests__/iscsi-lun-add-zvol.test.ts).
+  // stderr lines: the captured fixtures/iscsi/zfs-list-t-volume-*.stderr.txt.
+  const fixture = (name: string): string => readFileSync(new URL(`../../fixtures/iscsi/${name}`, import.meta.url), 'utf-8')
+  const zvol = (dataset: string): { path: string, plugin: 'block', dataset: string } => ({ path: `/dev/zvol/${dataset}`, plugin: 'block', dataset })
+  function answering(dataset: string, result: { stdout: string, stderr: string, exitCode: number }): MockExecutor {
+    const mock = new MockExecutor()
+    mock.addFixture({ command: '/usr/sbin/zfs', args: zvolExistsArgs(dataset), result })
+    return mock
+  }
+
+  it('reads `zfs list -H -t volume -o name -- <dataset>` and passes when it names the volume', async () => {
+    const mock = answering('tank/vol1', { stdout: 'tank/vol1\n', stderr: '', exitCode: 0 })
+    await proveZvolBacking(mock, zvol('tank/vol1'))
+    assert.deepEqual(mock.calls.map(c => [c.command, ...c.args]), [['/usr/sbin/zfs', 'list', '-H', '-t', 'volume', '-o', 'name', '--', 'tank/vol1']])
+  })
+
+  it('a volume that does not exist: "does not exist", with zfs\'s line', async () => {
+    const stderr = fixture('zfs-list-t-volume-absent.stderr.txt').replace('zfspool/anas-cr64cr-nonexistent', 'tank/gone')
+    await assert.rejects(proveZvolBacking(answering('tank/gone', { stdout: '', stderr, exitCode: 1 }), zvol('tank/gone')), {
+      message: 'volume \'tank/gone\' does not exist (cannot open \'tank/gone\': dataset does not exist); a zvol LUN is backed by an existing ZFS volume; nothing was done',
+    })
+  })
+
+  it('a FILESYSTEM of that name: "not a volume" (zfs refuses the type), never "does not exist"', async () => {
+    const stderr = fixture('zfs-list-t-volume-filesystem.stderr.txt').replace('zfspool', 'tank/images')
+    await assert.rejects(proveZvolBacking(answering('tank/images', { stdout: '', stderr, exitCode: 1 }), zvol('tank/images')), (err: Error) => {
+      assert.match(err.message, /^'tank\/images' is not a volume — a filesystem or snapshot is not a block device \(cannot open 'tank\/images': operation not applicable to datasets of this type\)/)
+      return true
+    })
+    // An exit 0 that names nothing reads the same.
+    await assert.rejects(proveZvolBacking(answering('tank/images', { stdout: '', stderr: '', exitCode: 0 }), zvol('tank/images')), /is not a volume/)
+  })
+
+  it('a read that could not see (SYNTHETIC: a suspended pool) says "could not be read" with the stderr', async () => {
+    const stderr = 'cannot open \'tank/vol1\': pool I/O is currently suspended\n'
+    await assert.rejects(proveZvolBacking(answering('tank/vol1', { stdout: '', stderr, exitCode: 1 }), zvol('tank/vol1')), {
+      message: 'volume \'tank/vol1\' could not be read (cannot open \'tank/vol1\': pool I/O is currently suspended); nothing was done',
+    })
+  })
+
+  it('a backing that is not a zvol reads nothing', async () => {
+    const mock = new MockExecutor()
+    await proveZvolBacking(mock, { path: '/tank/images/a.raw', plugin: 'fileio' })
+    await proveZvolBacking(mock, { path: '/dev/sdb', plugin: 'block' })
+    assert.deepEqual(mock.calls, [])
+  })
+})
+
 describe('addIscsiLun — wwn at create, attributes before the map, then the grant', () => {
   it('a zvol LUN: block backstore with wwn=, attributes, map, saveconfig', async () => {
     const mock = okExecutor()
@@ -524,34 +577,6 @@ describe('addIscsiLun — wwn at create, attributes before the map, then the gra
     // The backstore points at the STABLE path — a zdN name moves across a
     // reboot and is never stored or matched (GT-48).
     assert.ok(!JSON.stringify(mock.calls).includes('/dev/zd1'))
-  })
-
-  it('cr.64c: a zvol that does not exist is refused before the first targetcli act', async () => {
-    // `classifyBacking` calls any /dev/zvol/<p>/<v> path a zvol, so a request
-    // naming a volume that is not there used to sail through every gate and die
-    // mid-sequence in targetcli, after the backstore create.
-    const mock = okExecutor()
-    mock.addFixture({
-      command: '/usr/sbin/zfs',
-      args: ['list', '-H', '-o', 'name', '--', 'tank/gone'],
-      result: { stdout: '', stderr: 'dataset does not exist\n', exitCode: 1 },
-    })
-    await assert.rejects(
-      addIscsiLun(
-        { executor: mock },
-        target(),
-        { name: 'vmdisk1', kind: 'zvol', backing: 'tank/gone' },
-        { path: '/dev/zvol/tank/gone', plugin: 'block', dataset: 'tank/gone' },
-        null,
-        newSerial(),
-      ),
-      (err: Error) => {
-        assert.match(err.message, /volume 'tank\/gone' does not exist/)
-        assert.match(err.message, /dataset does not exist/)
-        return true
-      },
-    )
-    assert.deepEqual(targetcliCalls(mock), [], 'nothing was handed to targetcli')
   })
 
   it('an image LUN: fileio backstore with size, write_back=false and wwn=', async () => {

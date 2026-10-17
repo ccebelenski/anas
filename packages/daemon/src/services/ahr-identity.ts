@@ -17,7 +17,7 @@ import { ahrArrayLinePool, DEFAULT_MDADM_CONF } from './ahr-mdadm-conf.js'
 // constructed inside readNamedMdArrays, long after both modules evaluated.
 import { AhrTopologyUnreadableError } from './ahr-topology.js'
 import { readConfig } from './config-writer.js'
-import { BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures } from './partition-device.js'
+import { BLKID_AMBIVALENT, BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures } from './partition-device.js'
 
 /**
  * "Is this array / partition / slice OURS?" — the ONE answer every AHR verb
@@ -327,21 +327,51 @@ export type PartitionVerdict = 'ours' | 'foreign' | 'blank'
  * partition (the captured `zfs/blkid-p-blank-partition.txt`), 0 with any other
  * key = content, 8 = more than one signature; any other exit is a probe that
  * failed, and fails CLOSED as `foreign` with the rest of this module.
+ *
+ * cr.64cr (review of cr.64c, possible 1): blkid's exit 2 is BOTH "nothing
+ * found" and "could not open the device" — the second prints `blkid: error:
+ * <device>: Permission denied` (the captured `ahr/blkid-p-permission-denied.
+ * stderr.txt`) and exits 2 all the same. cr.64c's destroy dropped the udev
+ * FSTYPE witness that used to stand beside it, so exit 2 WITH stderr now
+ * reads as a probe that could not see — `foreign`, with
+ * {@link classifyPartitionWithReason}'s sentence naming the read; exit 2 with
+ * no output stays `blank`. (A device path that does not exist at all also
+ * exits 2 silently with util-linux 2.41 — indistinguishable here.)
  */
 export async function classifyPartition(
   executor: CommandExecutor,
   identity: Pick<AhrPoolIdentity, 'uuids'>,
   device: string,
 ): Promise<PartitionVerdict> {
+  return (await classifyPartitionWithReason(executor, identity, device)).verdict
+}
+
+/**
+ * {@link classifyPartition} with the sentence behind a `foreign` that came
+ * from a READ that could not see (blkid could not open the device, or failed
+ * outright) rather than from content found — null for every other verdict.
+ * A caller that reports the partitions it leaves alone can say why.
+ */
+export async function classifyPartitionWithReason(
+  executor: CommandExecutor,
+  identity: Pick<AhrPoolIdentity, 'uuids'>,
+  device: string,
+): Promise<{ verdict: PartitionVerdict, reason: string | null }> {
   const { uuid } = await examineMember(executor, device)
   if (uuid !== null)
-    return ownsUuid(identity, uuid) ? 'ours' : 'foreign'
+    return { verdict: ownsUuid(identity, uuid) ? 'ours' : 'foreign', reason: null }
   const sig = await executor.exec(BLKID, ['-p', device])
-  if (sig.exitCode === BLKID_NOTHING)
-    return 'blank'
-  if (sig.exitCode === BLKID_FOUND && blkidContentSignatures(sig.stdout).length === 0)
-    return 'blank'
-  return 'foreign'
+  const said = sig.stderr.trim().split('\n')[0] ?? ''
+  if (sig.exitCode === BLKID_NOTHING) {
+    if (said === '')
+      return { verdict: 'blank', reason: null }
+    return { verdict: 'foreign', reason: `${device} could not be read by blkid -p (${said}) — a partition whose content cannot be read is not judged blank` }
+  }
+  if (sig.exitCode === BLKID_FOUND)
+    return { verdict: blkidContentSignatures(sig.stdout).length === 0 ? 'blank' : 'foreign', reason: null }
+  if (sig.exitCode === BLKID_AMBIVALENT)
+    return { verdict: 'foreign', reason: null }
+  return { verdict: 'foreign', reason: `${device} could not be probed by blkid -p (exit ${sig.exitCode}${said ? `: ${said}` : ''}) — a partition whose content cannot be read is not judged blank` }
 }
 
 /** The member-label shape with its pool prefix captured; {@link matchPartitionLabel} confirms it. */

@@ -58,6 +58,7 @@ import {
   lunBackingClaims,
   newSerial,
   newTargetIqn,
+  proveZvolBacking,
   readIscsiState,
   replayAttributes,
   resizeFileLun,
@@ -800,6 +801,12 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         // persisted), a delete that finds nothing — the first targetcli may
         // itself be the one that died — is tolerated, and the job still fails
         // with the original error.
+        //
+        // cr.64cr: the zvol's existence (and that it IS a volume) is proved
+        // HERE, before the undo's flag goes up — a refusal from inside the try
+        // fired `removeOrphanedBackstore`, a targetcli delete of a namesake
+        // backstore this job never created (review of cr.64c, P8a).
+        await proveZvolBacking(executor, { path: backingPath, plugin, ...(dataset ? { dataset } : {}) })
         let backstoreTouched = false
         try {
           backstoreTouched = true

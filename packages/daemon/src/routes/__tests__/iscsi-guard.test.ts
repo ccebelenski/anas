@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { zfsSnapshotListArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
-import { TARGETCLI, ZFS } from '../../services/iscsi-mutate.js'
+import { TARGETCLI, ZFS, zvolExistsArgs } from '../../services/iscsi-mutate.js'
 
 /**
  * Story cr.40 — the iSCSI verbs on the guard (docs/WAVE3-DESIGN.md §2.4, §8.2).
@@ -210,11 +210,11 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
           return { stdout: '', stderr: fail.stderr, exitCode: 1 }
         return ok('')
       }
-      // cr.64c item 8: the LUN add proves the zvol exists before its first targetcli act.
-      // cr.64c item 8: the LUN add proves the zvol exists before its first targetcli act — every
-      // volume these tests add lives on the fixture pool, so the pool's volumes all exist.
-      if (command === ZFS && args[0] === 'list' && args[3] === 'name' && args[5]?.startsWith('gtiscsi/'))
-        return { stdout: `${args[5]}\n`, stderr: '', exitCode: 0 }
+      // cr.64c item 8 / cr.64cr: the LUN add proves the zvol exists (`zvolExistsArgs`) before its
+      // first targetcli act — every volume these tests add lives on the fixture pool, so the
+      // pool's volumes all exist.
+      if (command === ZFS && args.slice(0, -1).join(' ') === zvolExistsArgs('').slice(0, -1).join(' ') && args.at(-1)?.startsWith('gtiscsi/'))
+        return { stdout: `${args.at(-1)}\n`, stderr: '', exitCode: 0 }
       if (command === ZFS && args.join(' ') === zfsSnapshotListArgs(ZVOL_DATASET).join(' '))
         return ok(snapshots)
       if (command === ZFS && args[0] === 'destroy')

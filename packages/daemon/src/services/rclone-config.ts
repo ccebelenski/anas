@@ -31,12 +31,13 @@
 
 import type { CloudProvider, CloudProviderOption, CloudRemote, CloudRemoteWrite } from '@anas/shared'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
-import { createDecipheriv } from 'node:crypto'
+import { createDecipheriv, createHmac, randomBytes } from 'node:crypto'
 import { chmod, mkdir, readFile, rm } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { CLOUD_BACKEND_GUIDES, CloudProvider as CloudProviderSchema } from '@anas/shared'
 import { z } from 'zod'
 import { listSections, parseRcloneConf, removeSection, upsertSection } from '../parsers/rclone-conf.js'
+import { IdentityMismatchError } from '../safety/stable-id.js'
 import { ConfigConflictError, sha256, writeFileAtomic } from './config-writer.js'
 import { withFileLock } from './file-lock.js'
 import { assertNoSecretValues, maskSecretValues } from './secret-argv.js'
@@ -792,6 +793,77 @@ function connectionStringSecrets(value: string): string[] {
   return found
 }
 
+// ── A remote section's identity, for the retarget confirm (cr.64c → cr.64cr) ──
+
+/**
+ * The per-process key of {@link remoteSectionIdentity}. A confirm code lives
+ * in this process's memory only (`ConfirmStore`), so an identity that changes
+ * across a daemon restart costs nothing: no code minted before the restart
+ * survives it either.
+ */
+const SECTION_IDENTITY_KEY = randomBytes(32)
+
+/**
+ * A reference option's connection string with every secret-rule parameter's
+ * VALUE dropped (`:s3,secret_access_key=SK:b` → `:s3,secret_access_key=:b`):
+ * the parameter's presence stays, its value never enters an identity.
+ */
+function withoutInlineSecrets(value: string): string {
+  return value.replace(CONNECTION_PARAM_RE, (whole: string, key: string, raw: string) => {
+    const bare = raw.replace(QUOTE_RE, '')
+    return bare !== '' && !BOOL_LITERAL_RE.test(bare) && isSecretKey(key)
+      ? whole.slice(0, whole.length - raw.length)
+      : whole
+  })
+}
+
+/**
+ * The identity of a remote's stored section — what the cloud retarget confirm
+ * binds beside the remote's name (cr.64c item 5, corrected by cr.64cr): an
+ * HMAC-SHA256 under a per-process random key ({@link SECTION_IDENTITY_KEY})
+ * over the section's NON-SECRET facts — its keys, sorted, with their values —
+ * or null when no section of that name exists.
+ *
+ * Two rules, from the review of cr.64c:
+ *
+ *  - NOTHING derivable from a secret leaves the daemon. cr.64c bound a plain
+ *    sha256 over the section's raw lines, and rclone stores
+ *    `secret_access_key` (and every name-rule secret that is not IsPassword)
+ *    in PLAIN text, so the digest an IDENTITY_MISMATCH reply echoed was an
+ *    offline oracle: anyone holding the other lines could test a dictionary
+ *    against it. The secret-rule values (the name rule, the IsPassword keys
+ *    outside it, the secret parameters inline in a reference option's
+ *    connection string — the same set {@link sectionSecretValues} masks)
+ *    are left out of the digest, and the digest is keyed: even a value the
+ *    name rule misses (azureblob `sas_url`, cr.64b2 (M)) is not testable
+ *    offline, because the key never leaves this process.
+ *  - A secret ROTATION is the same object. The section's type, provider,
+ *    endpoint, bucket, account and every other non-secret key decide whether
+ *    a re-created section is "the same remote"; a new key under the same
+ *    remote is not a retarget, and the confirm still carries it.
+ *
+ * Comments, blank lines and key order are not facts of the remote and do not
+ * move the identity.
+ */
+export function remoteSectionIdentity(text: string, name: string): string | null {
+  const section = listSections(parseRcloneConf(text)).find(s => s.name === name)
+  if (!section)
+    return null
+  const outside = PASSWORD_KEYS_OUTSIDE_NAME_RULE[section.values.type ?? ''] ?? []
+  const facts: [string, string][] = []
+  for (const key of Object.keys(section.values).sort()) {
+    const value = section.values[key]!
+    if (REMOTE_REFERENCE_OPTIONS.includes(key)) {
+      facts.push([key, withoutInlineSecrets(value)])
+      continue
+    }
+    if (value !== '' && !BOOL_LITERAL_RE.test(value) && (isSecretKey(key) || outside.includes(key)))
+      continue
+    facts.push([key, value])
+  }
+  return createHmac('sha256', SECTION_IDENTITY_KEY).update(JSON.stringify([name, facts])).digest('hex')
+}
+
 /**
  * THE secret list of a remote, for the output mask (cr.55, review 2026-10-16
  * M1 — the ONE builder; the remote Test, the task preview and the task run
@@ -1043,7 +1115,18 @@ export async function writeRemote(
   paths: RcloneConfigPaths,
   executor: CommandExecutor,
   input: CloudRemoteWrite,
-  opts: { providers: CloudProvider[], mode: 'create' | 'update' },
+  opts: {
+    providers: CloudProvider[]
+    mode: 'create' | 'update'
+    /**
+     * The {@link remoteSectionIdentity} a confirmed retarget was bound to
+     * (cr.64cr item 5, ruling (j)): compared UNDER the per-file lock, against
+     * the bytes this write edits, so a section deleted and re-created while
+     * the job waited — for the queue or for this lock — fails
+     * IDENTITY_MISMATCH and nothing is written.
+     */
+    expectSection?: string
+  },
 ): Promise<CloudRemote> {
   return withFileLock(paths.configFile, async () => {
     // The argv-guard set is the SECRET values of this write ONLY (the
@@ -1067,6 +1150,16 @@ export async function writeRemote(
       throw new RemoteExistsError(input.name)
     if (opts.mode === 'update' && !existing)
       throw new RemoteNotFoundError(input.name)
+    if (opts.expectSection !== undefined) {
+      const now = remoteSectionIdentity(current.text, input.name)
+      if (now !== opts.expectSection) {
+        throw new IdentityMismatchError(
+          `remote '${input.name}'`,
+          { remote: input.name, section: opts.expectSection },
+          now === null ? null : { remote: input.name, section: now },
+        )
+      }
+    }
 
     // The type: set from the request on create, kept on update (immutable).
     const type = opts.mode === 'create' ? input.type : existing!.type

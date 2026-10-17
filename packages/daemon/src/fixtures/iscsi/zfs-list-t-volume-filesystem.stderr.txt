@@ -1,0 +1,1 @@
+cannot open 'zfspool': operation not applicable to datasets of this type

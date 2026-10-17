@@ -2,7 +2,7 @@ import type { CloudProvider, CloudRemotesResponse, Job, JobAccepted } from '@ana
 import type { FastifyInstance } from 'fastify'
 import type { ExecOptions, ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -780,17 +780,19 @@ password = mock-obscured
     let executor: MockExecutor
     let bareDir: string
     let bareFile: string
+    let bareQueue: JobQueue
 
-    async function bare(opts: { rcloneAvailable?: () => Promise<boolean>, referencingTasks?: (name: string) => Promise<string[]> } = {}): Promise<void> {
+    async function bare(opts: { rcloneAvailable?: () => Promise<boolean>, referencingTasks?: (name: string) => Promise<string[]>, concurrency?: number } = {}): Promise<void> {
       bareDir = await mkdtemp(join(tmpdir(), 'anas-cloudbare-'))
       bareFile = join(bareDir, 'rclone.conf')
       executor = new MockExecutor()
       installRcloneFixtures(executor, bareFile)
       app = Fastify({ logger: false })
+      bareQueue = new JobQueue(opts.concurrency ? { concurrency: opts.concurrency } : undefined)
       await app.register(cloudRoutes, {
         prefix: '/v1',
         executor,
-        jobQueue: new JobQueue(),
+        jobQueue: bareQueue,
         paths: { configFile: bareFile },
         rcloneAvailable: opts.rcloneAvailable ?? (async () => true),
         ...(opts.referencingTasks ? { referencingTasks: opts.referencingTasks } : {}),
@@ -930,6 +932,145 @@ password = mock-obscured
         // Nothing was written: the new section still holds its own host.
         assert.ok((await readFile(bareFile, 'utf-8')).includes('host = 198.51.100.7'))
         assert.equal((await readFile(bareFile, 'utf-8')).includes('host = 10.0.0.99'), false)
+      })
+
+      // cr.64cr — the review of cr.64c: an S3 remote, whose `secret_access_key`
+      // rclone stores in PLAIN text (it is not IsPassword) — the shape that
+      // made cr.64c's sha256-over-the-section-lines an offline secret oracle.
+      describe('cr.64cr: the bound identity carries nothing derivable from a secret, and the job re-gates it', () => {
+        const S3_LINES = (secret: string, over: Partial<Record<'type' | 'provider' | 'endpoint', string>> = {}): string[] => [
+          '[s3a]',
+          `type = ${over.type ?? 's3'}`,
+          `provider = ${over.provider ?? 'Minio'}`,
+          'access_key_id = AKIAEXAMPLE',
+          `secret_access_key = ${secret}`,
+          `endpoint = ${over.endpoint ?? 'http://10.0.0.5:9000'}`,
+        ]
+        const s3 = (secret: string, over: Partial<Record<'type' | 'provider' | 'endpoint', string>> = {}): string => `${S3_LINES(secret, over).join('\n')}\n`
+        const putS3 = async (options: Record<string, string>, confirm?: string) => app.inject({
+          method: 'PUT',
+          url: '/v1/cloud/remotes/s3a',
+          headers: { ...JSON_HEADERS, ...(confirm ? { 'x-anas-confirm': confirm } : {}) },
+          payload: JSON.stringify({ options }),
+        })
+        const usedByNightly = { referencingTasks: async (name: string) => (name === 's3a' ? ['nightly'] : []) }
+        async function mint(): Promise<string> {
+          const res = await putS3({ endpoint: 'http://10.0.0.9:9000' })
+          assert.equal(res.statusCode, 409, res.payload)
+          const code = res.headers['x-anas-confirm-code'] as string
+          assert.ok(code)
+          return code
+        }
+        async function finished(id: string): Promise<Job> {
+          for (let i = 0; i < 400; i++) {
+            const job = bareQueue.get(id)
+            if (job && (job.status === 'completed' || job.status === 'failed'))
+              return job
+            await new Promise(resolve => setTimeout(resolve, 5))
+          }
+          throw new Error('job did not finish')
+        }
+
+        it('the IDENTITY_MISMATCH reply carries no digest a dictionary of secrets can hit (review C2 / probe-hash)', async () => {
+          await bare(usedByNightly)
+          await writeFile(bareFile, s3('minioadmin'), 'utf-8')
+          const code = await mint()
+          // The remote re-created under the same name: another endpoint, and a weak secret.
+          const recreated = s3('hunter2', { endpoint: 'http://10.0.0.6:9000' })
+          await writeFile(bareFile, recreated, 'utf-8')
+          const replay = await putS3({ endpoint: 'http://10.0.0.9:9000' }, code)
+          assert.equal(replay.statusCode, 409)
+          assert.equal(replay.json().error.code, 'IDENTITY_MISMATCH')
+          const body = replay.payload
+          assert.equal(body.includes('hunter2'), false)
+          // The attacker knows every other line (they are readable through the
+          // API) and tries a dictionary — over the exact lines (cr.64c's
+          // formula), over the whole section text, and over the non-secret
+          // lines alone. The real secret is in the dictionary.
+          const digests = new Set(body.match(/[0-9a-f]{64}/g) ?? [])
+          assert.ok(digests.size > 0, 'the reply still names both identities')
+          for (const guess of ['password', 'changeme', 'minioadmin', 'hunter2']) {
+            const lines = S3_LINES(guess, { endpoint: 'http://10.0.0.6:9000' })
+            for (const candidate of [lines.join('\n'), `${lines.join('\n')}\n`, lines.filter(l => !l.startsWith('secret_access_key')).join('\n')]) {
+              const h = createHash('sha256').update(candidate).digest('hex')
+              assert.equal(digests.has(h), false, `offline dictionary hit: ${guess}`)
+            }
+          }
+        })
+
+        it('a secret ROTATION alone is the same remote — the confirmed code still carries the retarget (review POSSIBLE 2)', async () => {
+          await bare(usedByNightly)
+          await writeFile(bareFile, s3('minioadmin'), 'utf-8')
+          const code = await mint()
+          await writeFile(bareFile, s3('rotated-secret-value'), 'utf-8')
+          const ok = await putS3({ endpoint: 'http://10.0.0.9:9000' }, code)
+          assert.equal(ok.statusCode, 202, ok.payload)
+          const job = await finished((ok.json() as JobAccepted).job.id)
+          assert.equal(job.status, 'completed', JSON.stringify(job.error))
+          const text = await readFile(bareFile, 'utf-8')
+          assert.ok(text.includes('endpoint = http://10.0.0.9:9000'), text)
+          assert.ok(text.includes('secret_access_key = rotated-secret-value'), 'the rotated secret is kept as written')
+        })
+
+        for (const [what, over] of [
+          ['provider', { provider: 'AWS' }],
+          ['endpoint', { endpoint: 'http://10.0.0.6:9000' }],
+          ['type', { type: 'sftp' }],
+        ] as const) {
+          it(`a changed ${what} (same secret) reads as a different remote — 409 IDENTITY_MISMATCH, nothing written`, async () => {
+            await bare(usedByNightly)
+            await writeFile(bareFile, s3('minioadmin'), 'utf-8')
+            const code = await mint()
+            const changed = s3('minioadmin', over)
+            await writeFile(bareFile, changed, 'utf-8')
+            const replay = await putS3({ endpoint: 'http://10.0.0.9:9000' }, code)
+            assert.equal(replay.statusCode, 409, replay.payload)
+            assert.equal(replay.json().error.code, 'IDENTITY_MISMATCH')
+            assert.equal(await readFile(bareFile, 'utf-8'), changed)
+          })
+        }
+
+        /** Hold the bare app's single job slot until the returned release is called. */
+        function holdTheQueue(): () => void {
+          let release!: () => void
+          const held = new Promise<void>((resolve) => {
+            release = resolve
+          })
+          bareQueue.submit('test.hold', { user: 'test', uid: 0 }, () => held)
+          return release
+        }
+
+        it('ruling (j): a section RE-CREATED while the confirmed job waits fails IDENTITY_MISMATCH at the job\'s turn — no write (review C5)', async () => {
+          await bare({ ...usedByNightly, concurrency: 1 })
+          await writeFile(bareFile, s3('minioadmin'), 'utf-8')
+          const code = await mint()
+          const release = holdTheQueue()
+          const accepted = await putS3({ endpoint: 'http://10.0.0.9:9000' }, code)
+          assert.equal(accepted.statusCode, 202, accepted.payload)
+          const recreated = '[s3a]\ntype = s3\nprovider = AWS\naccess_key_id = AKIAOTHER\nsecret_access_key = other\nregion = us-east-1\n'
+          await writeFile(bareFile, recreated, 'utf-8')
+          release()
+          const job = await finished((accepted.json() as JobAccepted).job.id)
+          assert.equal(job.status, 'failed')
+          assert.equal(job.error!.code, 'IDENTITY_MISMATCH')
+          assert.match(job.error!.message, /^remote 's3a' is not the one that was confirmed .* — nothing was done; confirm again$/)
+          assert.equal(await readFile(bareFile, 'utf-8'), recreated, 'the re-created remote is untouched')
+        })
+
+        it('ruling (j): the section DELETED while the confirmed job waits is IDENTITY_MISMATCH too (the guard\'s re-read), not a write', async () => {
+          await bare({ ...usedByNightly, concurrency: 1 })
+          await writeFile(bareFile, `${s3('minioadmin')}\n${GT_SECTION}`, 'utf-8')
+          const code = await mint()
+          const release = holdTheQueue()
+          const accepted = await putS3({ endpoint: 'http://10.0.0.9:9000' }, code)
+          assert.equal(accepted.statusCode, 202, accepted.payload)
+          await writeFile(bareFile, GT_SECTION, 'utf-8')
+          release()
+          const job = await finished((accepted.json() as JobAccepted).job.id)
+          assert.equal(job.status, 'failed')
+          assert.equal(job.error!.code, 'IDENTITY_MISMATCH')
+          assert.equal(await readFile(bareFile, 'utf-8'), GT_SECTION)
+        })
       })
 
       it('a task reaching the remote THROUGH a wrapper is named, with the wrapper', async () => {

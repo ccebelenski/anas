@@ -1,6 +1,8 @@
 import type { Stats } from 'node:fs'
-import { lstat, readdir, readFile, realpath, rmdir, unlink } from 'node:fs/promises'
-import { join, sep } from 'node:path'
+import type { FileHandle } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { lstat, open, readdir, readFile, rmdir, unlink } from 'node:fs/promises'
+import { join } from 'node:path'
 import { recyclePurgeTargets } from './parsers/smb-conf.js'
 
 /**
@@ -53,15 +55,24 @@ export interface RecyclePurgeOutcome {
 }
 
 /**
- * The filesystem calls the containment checks make — injectable so a test can
- * swap the bin for a symlink BETWEEN two checks (the race ident.4 (f) closes).
+ * The filesystem calls the purge's containment rests on — injectable so a
+ * test can swap the bin (or a directory under it) for a symlink BETWEEN two
+ * calls: after a check (the race ident.4 (f) closes) or after an open (the
+ * race the dirfd walk closes, cr.64cr).
  */
 export interface PurgeFs {
   lstat: (path: string) => Promise<Stats>
-  realpath: (path: string) => Promise<string>
+  /**
+   * Open a DIRECTORY without following a final symlink
+   * (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`): a link fails ELOOP, a
+   * non-directory ENOTDIR. The handle pins the directory itself.
+   */
+  openDir: (path: string) => Promise<FileHandle>
 }
 
-const NODE_FS: PurgeFs = { lstat: p => lstat(p), realpath: p => realpath(p) }
+const OPEN_DIR_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+
+const NODE_FS: PurgeFs = { lstat: p => lstat(p), openDir: p => open(p, OPEN_DIR_FLAGS) }
 
 export interface RecyclePurgeOptions {
   smbConfPath?: string
@@ -84,57 +95,107 @@ export function isPurgeable(ageMs: number, days: number): boolean {
   return Math.floor(ageMs / DAY_MS) > days
 }
 
-/** Recursively list every regular file under `dir` (relative paths resolved). */
-async function listFiles(dir: string): Promise<string[]> {
-  const files: string[] = []
-  async function walk(current: string): Promise<void> {
-    const entries = await readdir(current, { withFileTypes: true })
-    for (const entry of entries) {
-      const full = join(current, entry.name)
-      if (entry.isDirectory())
-        await walk(full)
-      else if (entry.isFile())
-        files.push(full)
-    }
-  }
-  await walk(dir)
-  return files
+/**
+ * A path INSIDE the directory an open handle pins: Linux's `/proc/self/fd/<fd>`
+ * is a magic link to the opened directory itself, so a name resolved through
+ * it is resolved in THAT directory — wherever it now sits, whatever its old
+ * path now names. `lstat`, `unlink` and `rmdir` never follow the final
+ * component, so an act through this path is the `fstatat`/`unlinkat` of a
+ * native binding, with no binding (cr.64cr; the review of cr.64c proved the
+ * shape).
+ */
+function inDir(dirFd: number, name?: string): string {
+  return name === undefined ? `/proc/self/fd/${dirFd}` : `/proc/self/fd/${dirFd}/${name}`
 }
 
-/** Every directory under `dir` (exclusive), deepest first — for pruning. */
-async function listDirsDeepestFirst(dir: string): Promise<string[]> {
-  const dirs: string[] = []
-  async function walk(current: string): Promise<void> {
-    const entries = await readdir(current, { withFileTypes: true })
-    for (const entry of entries) {
-      if (!entry.isDirectory())
-        continue
-      const full = join(current, entry.name)
-      dirs.push(full)
-      await walk(full)
-    }
-  }
-  await walk(dir)
-  return dirs.reverse()
+/** An errno a race with a share user produces: the entry moved, or became something else. */
+function swapped(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code
+  return code === 'ELOOP' || code === 'ENOTDIR' || code === 'EISDIR'
 }
 
-/** Is `p` strictly inside `root` (both already resolved)? */
-function isInside(root: string, p: string): boolean {
-  return p.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)
+/** The counts one sweep accumulates. */
+interface SweepCounts {
+  removed: number
+  prunedDirs: number
+  refused: number
 }
 
 /**
- * Does `p` still resolve inside the bin? A share user can swap a directory
- * under the bin for a symlink between the walk listing it and the purge
- * acting on it; the resolved path is the only honest answer (story ident.4
- * (f), audit #19). An unresolvable path is not inside.
+ * Sweep one OPENED directory: every regular file past its purge age is
+ * unlinked, every real subdirectory is opened (no-follow), swept, and then
+ * pruned if it emptied. Every act goes through the pinned handle
+ * ({@link inDir}), never through a path a share user can re-point.
  */
-async function resolvesInside(fs: PurgeFs, realBin: string, p: string): Promise<boolean> {
-  try {
-    return isInside(realBin, await fs.realpath(p))
-  }
-  catch {
-    return false
+async function sweepDir(
+  fs: PurgeFs,
+  dirFd: number,
+  days: number,
+  ageOf: (stats: Stats) => number,
+  counts: SweepCounts,
+): Promise<void> {
+  for (const entry of await readdir(inDir(dirFd), { withFileTypes: true })) {
+    const at = inDir(dirFd, entry.name)
+    if (entry.isDirectory()) {
+      let sub: FileHandle
+      try {
+        sub = await fs.openDir(at)
+      }
+      catch (err) {
+        // Swapped for a link (or a file) since the listing: refused, never followed.
+        if (swapped(err)) {
+          counts.refused++
+          continue
+        }
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+          continue
+        throw err
+      }
+      try {
+        await sweepDir(fs, sub.fd, days, ageOf, counts)
+      }
+      finally {
+        await sub.close()
+      }
+      try {
+        await rmdir(at)
+        counts.prunedDirs++
+      }
+      catch (err) {
+        // Still holding files (young ones, or an age race), already gone, or
+        // swapped for a link after the sweep (rmdir never follows it).
+        const code = (err as NodeJS.ErrnoException).code
+        if (code === 'ENOTDIR')
+          counts.refused++
+        else if (code !== 'ENOTEMPTY' && code !== 'ENOENT')
+          throw err
+      }
+      continue
+    }
+    // Symlinks, sockets, fifos, devices: never purged, never followed (ident.4 (f)).
+    if (!entry.isFile())
+      continue
+    try {
+      const stats = await fs.lstat(at)
+      if (!stats.isFile()) {
+        counts.refused++
+        continue
+      }
+      if (isPurgeable(ageOf(stats), days)) {
+        await unlink(at)
+        counts.removed++
+      }
+    }
+    catch (err) {
+      // The file vanished between listing and stat/unlink — nothing to purge;
+      // or became a directory (EISDIR) — not a file, left in place.
+      if (swapped(err)) {
+        counts.refused++
+        continue
+      }
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+        throw err
+    }
   }
 }
 
@@ -161,25 +222,20 @@ export class BinNotPlainError extends Error {
  * — `rmdir` on the only-just-emptied parents succeeds, a still-populated one
  * fails with ENOTEMPTY and stays).
  *
- * Containment is anchored at the SHARE: the bin's resolved path is the share's
- * realpath (read once) joined with the single-segment repository — never the
- * realpath of the bin itself, which a user who swapped the bin for a symlink
- * would choose. The bin is lstat'ed before the walk and again after it, before
- * anything is unlinked (a bin that is or became a link or a non-directory
- * throws {@link BinNotPlainError}); every file and directory is then acted on
- * only while its resolved path stays inside that anchored bin and it is what
- * it was listed as (`lstat`: a regular file, a real directory) — never through
- * a symlink (ident.4 (f)). `refused` counts what was left for failing that
- * check.
- *
- * The residual window, stated (cr.64c, 2026-10-14 §4 / 2026-10-16 L27): the
- * check and the act are separate syscalls, and Node's `fs` has no
- * `openat`/`unlinkat` — a dirfd-relative purge (the review's fix) needs a
- * native binding, which the no-new-dependencies ruling forbids. What a share
- * user can still attempt is swapping a DIRECTORY component between the
- * containment check and the `unlink`; `unlink` itself never follows the final
- * component, so a swapped FILE (symlink or otherwise) is only ever removed as
- * itself, never through. The window is the residue; the checks bound it.
+ * Containment (ident.4 (f), cr.64c, cr.64cr): the bin is `lstat`ed (a link or
+ * a non-directory throws {@link BinNotPlainError}), then OPENED no-follow
+ * (`O_DIRECTORY | O_NOFOLLOW`: a bin swapped for a link after the check fails
+ * the open the same way). From that open on, the walk never uses a path again:
+ * every subdirectory is opened no-follow through its parent's handle, and
+ * every `lstat`, `unlink` and `rmdir` names its entry inside an opened
+ * directory as `/proc/self/fd/<dirfd>/<name>` — the dirfd-relative purge the
+ * 2026-10-14 review asked for, without a native binding (the
+ * no-new-dependencies ruling). A share user who swaps the bin, or any
+ * directory under it, for a symlink after it was opened re-points only the
+ * PATH: the walk keeps acting in the directory it opened, and the link's
+ * target is never read, listed or unlinked. `refused` counts the entries left
+ * because they changed kind under the walk (a directory that became a link, a
+ * file that became a directory).
  */
 export async function purgeBin(
   sharePath: string,
@@ -191,59 +247,32 @@ export async function purgeBin(
   const now = opts.now ?? Date.now
   const ageOf = opts.ageOf ?? ((stats: Stats) => now() - stats.ctimeMs)
   const bin = join(sharePath, repository)
-  const realBin = join(await fs.realpath(sharePath), repository)
   // cr.64c (cr.53's L27 half, 2026-10-14 §4): the bin is judged BEFORE it is
-  // listed — `readdir` follows a symlink, so listing first walked through a
-  // swapped bin (harmlessly: nothing was acted on before the old after-walk
-  // check threw, but the walk itself followed a link this file refuses
-  // everywhere else). The after-walk re-check below stays: the walk is long,
-  // and the bin can still be swapped during it.
+  // opened or listed — the lstat names what it is, for the skip line.
   const before = binSkipReason(await fs.lstat(bin), repository)
   if (before)
     throw new BinNotPlainError(before)
-  const files = await listFiles(bin)
-  const reason = binSkipReason(await fs.lstat(bin), repository)
-  if (reason)
-    throw new BinNotPlainError(reason)
-  let removed = 0
-  let refused = 0
-  for (const file of files) {
-    try {
-      const stats = await fs.lstat(file)
-      if (!stats.isFile() || !(await resolvesInside(fs, realBin, file))) {
-        refused++
-        continue
-      }
-      if (isPurgeable(ageOf(stats), days)) {
-        await unlink(file)
-        removed++
-      }
-    }
-    catch (err) {
-      // The file vanished between listing and stat/unlink — nothing to purge.
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
-        throw err
-    }
+  let binDir: FileHandle
+  try {
+    binDir = await fs.openDir(bin)
   }
-
-  let prunedDirs = 0
-  for (const dir of await listDirsDeepestFirst(bin)) {
-    try {
-      const stats = await fs.lstat(dir)
-      if (!stats.isDirectory() || !(await resolvesInside(fs, realBin, dir))) {
-        refused++
-        continue
-      }
-      await rmdir(dir)
-      prunedDirs++
-    }
-    catch (err) {
-      // Still holding files (young ones, or an age race) or already gone.
-      if ((err as NodeJS.ErrnoException).code !== 'ENOTEMPTY' && (err as NodeJS.ErrnoException).code !== 'ENOENT')
-        throw err
-    }
+  catch (err) {
+    // Swapped between the lstat and the open: the no-follow open refuses a
+    // link (Linux answers ENOTDIR or ELOOP for O_DIRECTORY|O_NOFOLLOW on one,
+    // by kernel), and a non-directory. A second lstat only names which.
+    if (!swapped(err))
+      throw err
+    const now = await fs.lstat(bin).catch(() => null)
+    throw new BinNotPlainError((now && binSkipReason(now, repository)) ?? `${repository} changed while it was being opened - not followed`)
   }
-  return { removed, prunedDirs, refused }
+  const counts: SweepCounts = { removed: 0, prunedDirs: 0, refused: 0 }
+  try {
+    await sweepDir(fs, binDir.fd, days, ageOf, counts)
+  }
+  finally {
+    await binDir.close()
+  }
+  return counts
 }
 
 /**
@@ -297,7 +326,7 @@ export async function runRecyclePurge(opts: RecyclePurgeOptions = {}): Promise<R
       // lstat, never stat: a share user can replace the bin with a symlink to
       // anywhere, and a purge that followed it would delete files the user
       // could never have recycled (ident.4 (f), audit #19). purgeBin checks
-      // again before it unlinks anything.
+      // again and opens the bin no-follow before it reads anything (cr.64cr).
       const reason = binSkipReason(await fs.lstat(bin), target.repository)
       if (reason) {
         log(`anas-recycle: share=${target.share} skipped (${reason})`)

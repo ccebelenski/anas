@@ -13,7 +13,7 @@ import { currentLane } from '../../executor/deadline.js'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { zfsListArgs, zfsSnapshotListArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
-import { TARGETCLI, ZFS } from '../../services/iscsi-mutate.js'
+import { TARGETCLI, ZFS, zvolExistsArgs } from '../../services/iscsi-mutate.js'
 
 /**
  * Story cr.63 (review L17, WAVE3-DESIGN §4.2) — a LUN verb holds its BACKING's
@@ -184,8 +184,8 @@ describe('cr.63 L17 — a LUN verb and a dataset verb on the same backing serial
         return ok(`${GTISCSI_POOL_GUID}\n`)
       if (command === ZFS && argv === `get -H -o value guid -- ${ZVOL_DATASET}`)
         return ok(`${VOL1_GUID}\n`)
-      // cr.64c item 8: the LUN add proves the zvol exists before its first targetcli act.
-      if (command === ZFS && argv === `list -H -o name -- ${ZVOL_DATASET}`)
+      // cr.64c item 8 / cr.64cr: the LUN add proves the zvol exists before its first targetcli act.
+      if (command === ZFS && argv === zvolExistsArgs(ZVOL_DATASET).join(' '))
         return ok(`${ZVOL_DATASET}\n`)
       if (command === ZFS && args.join('\0') === listArgs)
         return ok(VOLUMES)
