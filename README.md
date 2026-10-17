@@ -48,8 +48,9 @@ every node.
   per-bay disk health, device errors and properties. A drag-to-build vdev
   composer shows capacity and redundancy as you go, and a rules-based advisor
   warns about layouts with no redundancy or wasted space before you build them.
-  Special/dedup vdevs and RAIDZ expansion are supported; PVE-owned pools are
-  tagged and left alone.
+  Special/dedup vdevs and RAIDZ expansion are supported. PVE-owned pools are
+  tagged; the pool itself stays hands-off, while datasets you create beside it
+  are managed like any others.
 - **Hybrid RAID (AHR)** — Synology-SHR-style pools from **mismatched disk
   sizes**, using every drive's full height (a 12 TB next to 8 TBs contributes
   all 12, not 8): disks are sliced into size-matched bands, each band is its own
@@ -60,6 +61,14 @@ every node.
   and what stays locked until a matching disk arrives. Expansion is a resumable
   multi-layer job; power loss mid-reshape is survivable. **Hot spares** are
   full-coverage — sliced into every band so md owns failover.
+- **AHR self-heal** — a scrub attributes a checksum error to the exact member
+  holding the bad copy, and a repair job rebuilds it from the good copies
+  while the pool keeps serving; a mirror that has drifted between copies is
+  reconciled the same way.
+- **AHR read cache** — attach SSDs as a writethrough read cache: the cache
+  never holds the only copy, mounts, shares and LUNs are untouched by it, a
+  failed or pulled cache disk unattaches itself, and detaching hands the disks
+  back.
 
 ### Data
 
@@ -86,6 +95,11 @@ every node.
   that preserves your comments and formatting; per-share access control (valid
   users, browseable, read-only, allowed/denied hosts) and a connection-details
   view.
+- **Self-service on shares** — Previous Versions built from the dataset's own
+  snapshot schedules; a recycle bin per share with an age-based purge, which
+  users empty themselves; and a Time Machine target (beta) with a capacity
+  cap. All of it Samba's own capability, wired into the share's stanza from
+  the share dialog.
 - **NFS exports** — the same treatment for `/etc/exports`.
 - **iSCSI target** — manages LIO (targetcli) natively: targets with a stable
   ANAS-generated IQN, portals, initiator ACLs with one-way or mutual CHAP
@@ -120,6 +134,10 @@ every node.
   serial on any target, leaving the source untouched. There's one Restore
   dialog, reachable from the LUN toolbar, the task grid or the repository, and
   it only asks for what it can't work out from where you opened it.
+- **Cloud sync** — copy or mirror a local dataset, pool or mounted path to
+  off-node storage — object stores and the other remotes rclone speaks — on
+  the same timer machinery as any other ANAS task. A preview shows what will
+  change before a run; every run is a job you can watch and cancel.
 - **Disk health** — SMART and ZFS fused into a single per-disk status, with
   pool and vdev membership.
 
@@ -140,12 +158,21 @@ every node.
   appear only when something is running or wrong.
 - **Jobs** — every change is a queued job you can watch through to its result,
   including the multi-hour ones.
-- **Notifications** — unattended runs (backup, snapshot schedules, replication)
-  report through **PVE's own notification system**, per task: always, or on
-  failure only.
+- **Notifications** — unattended runs (backup, snapshot schedules,
+  replication, cloud sync) and AHR array events report through **PVE's own
+  notification system**, per task: always, or on failure only.
 - **Cluster** — cross-node traffic goes through each node's `:8006`: no extra
   port, no extra certificate. A version-skew banner names the versions when a
   newer UI meets an older daemon.
+- **Access follows PVE** — ANAS brings no accounts and no permission matrix:
+  your PVE user opens the panels, `Sys.Audit` to look and `Sys.Modify` to
+  change, and the roles and groups you already maintain decide which is which.
+- **Native to the PVE UI** — every ANAS screen is a panel inside the PVE web
+  UI, per node: no second console to run, reach, or secure.
+- **Install** — a release tarball and a transactional installer: daemon,
+  panels and the packages the features need land on a stock PVE node together,
+  or not at all; removing ANAS takes its own files and units back out and
+  leaves the packages and your data where they are.
 
 ## What ANAS is not
 
@@ -192,7 +219,7 @@ ANAS treats your system as the source of truth and itself as a **guest**:
 - Proxmox VE node (single node or cluster)
 - Node.js ≥ 20 (installer can provide via `--install-deps` — the only thing that
   flag gates)
-- ZFS ≥ 2.2 (ANAS uses `zpool`'s JSON output)
+- ZFS ≥ 2.3 (ANAS uses `zfs`/`zpool`'s JSON output — the `-j` flag, introduced in OpenZFS 2.3)
 - `mdadm` + `btrfs-progs` for Hybrid RAID, `samba` for SMB shares and share
   users, `nfs-kernel-server` for NFS exports, `acl` for permissions,
   `targetcli-fb` + `python3-rtslib-fb` for serving iSCSI block storage — the

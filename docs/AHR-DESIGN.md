@@ -1,6 +1,6 @@
 # AHR (ANAS Hybrid RAID) — Design
 
-> Design draft for the V2 headline (Epic 11 + AHR). No code yet. Ground truth still to be captured by BUILDING the stack on the stunt node (see EPICS Epic 11 kickoff notes); this document is the plan that capture will confirm or correct. Reference: the OpenMediaVault "build an SHR on plain Linux" howto + Synology's published SHR behavior. Everything here is subordinate to docs/PRINCIPLES.md and the guest philosophy — deviations are allowed only deliberately and with knowledge, and this doc names each one where it occurs.
+> The ORIGINAL design draft for the V2 headline (Epic 11 + AHR). Built and shipped since — the implementation is `routes/ahr-*.ts` / `services/ahr-*.ts` (EPICS §1, "AHR"). The ground truth this draft planned to capture was captured by BUILDING the stack on the stunt node (`AHR-GROUND-TRUTH.md`); sections below marked "Resolved"/"Built" (and §13, the read cache, whose resolution and shipped live proofs are recorded there) supersede the plan text they amend. Reference: the OpenMediaVault "build an SHR on plain Linux" howto + Synology's published SHR behavior. Everything here is subordinate to docs/PRINCIPLES.md and the guest philosophy — deviations are allowed only deliberately and with knowledge, and this doc names each one where it occurs.
 >
 > **Naming:** the feature is **AHR — ANAS Hybrid RAID** (tiers AHR-1 / AHR-2). "SHR" is Synology's name and is used below only when referring to Synology's implementation as the reference model. UI labels lead with what the tier *means* — "1-disk fault tolerance" / "2-disk fault tolerance" — the tier acronym is API vocabulary.
 >
@@ -532,7 +532,9 @@ slices) → `pvcreate` → `vgextend <pool>` → `lvcreate -n <pool>-cache` (lin
 across all cache slices — a writethrough cache is never the only copy, so it
 needs no redundancy) → `lvconvert --type cache --cachevol <pool>-cache
 --cachemode writethrough <pool>/<pool>-vol`. Policy `smq` (kernel default;
-sequential I/O bypasses). The pool LV keeps its name and mapper path, so
+the draft's aside "sequential I/O bypasses" is superseded by the §13
+resolution — that note was an `mq` property and is dropped). The pool LV keeps
+its name and mapper path, so
 mounts, shares, LUNs and the fstab line are untouched. Detach = `lvconvert
 --uncache` (drops the cache volume) → `vgreduce` → `pvremove` → wipe the slice.
 **Writeback and `--type writecache` are not exposed** (EPICS §2 ruling).
@@ -574,7 +576,8 @@ non-zero is a bug). **Wear: the Disks tab (SMART), not repeated here** — wear
 is a per-disk fact the disk inventory already owns (`disks.1`), and a second
 rendering of it in the Cache block is the same number in two places, free to
 diverge. One place. Advisory states two facts once: hotspot cache
-(repeated random reads benefit, sequential I/O bypasses), and the SSD is a
+(repeated random reads benefit; "sequential I/O bypasses" here is superseded
+by the §13 resolution — the policy wording is `lvs` truth), and the SSD is a
 consumable (cached blocks are rewritten as the working set rotates).
 
 **Resolved 2026-09-24 (GT-18…GT-24, `AHR-GROUND-TRUTH.md` §18).** (a) **dm-cache does NOT

@@ -259,7 +259,7 @@ Identity is the URL-encoded mountpoint (the NFS-exports precedent). Pure managem
 | `GET` | `/v1/mounts/:mountpoint` | Detail: fstab line as written, effective options, health, capacity | `200` |
 | `PUT` | `/v1/mounts/:mountpoint` | Edit options/credentials → fstab rewrite + remount | `202` with job |
 | `DELETE` | `/v1/mounts/:mountpoint` | Unmount + drop fstab entry; busy → 409 listing holding processes, force/lazy behind confirm. Optional `?removeMountpointDir=true` (default false — an older client is unchanged) also removes the mountpoint DIRECTORY with **rmdir semantics only**: empty, never recursive, never a still-mounted path. A dir that stayed rides the completed job's `warnings[]` — never a failure | `202`/`409` |
-| `POST` | `/v1/mounts/:mountpoint/state` | `{action: mount\|unmount\|disable\|enable}` — kernel-state and boot-config toggles WITHOUT deleting the entry. `unmount` = kernel now, returns at boot; `disable` = unmount + comment the fstab line as `#ANAS <original line verbatim>` (survives reboot as off, credentials kept, byte-identical restore on `enable`); busy-unmount → 409 as above. Added at Stage-2/3 reconciliation 2026-07-18 (operator: "deleting the mount entry and unmounting are two different things" + the `#ANAS` disable marker). Pools action-subresource idiom. | `202`/`409` |
+| `POST` | `/v1/mounts/:mountpoint/state` | `{action: mount\|unmount\|disable\|enable}` — kernel-state and boot-config toggles WITHOUT deleting the entry. `unmount` = kernel now, returns at boot; `disable` = unmount + mark the line disabled in its OPTIONS column (cr.6, ruling 2026-10-14, replacing the original `#ANAS <original line verbatim>` comment marker): `noauto,x-anas.disabled` appended, or `x-anas.disabled=kept-noauto` when the operator's own `noauto` is already on the line, and an `x-systemd.automount` parked in place as `x-anas.disabled-automount` (cr.19; the legacy `comment=systemd.automount` spelling parks as `x-anas.disabled-automount=comment`, cr.70) — survives reboot as off, credentials kept, byte-identical restore on `enable`; a hand-written `#ANAS ` line is still READ as disabled and converted to the option form only when ANAS next changes it (no bulk migration); busy-unmount → 409 as above. Added at Stage-2/3 reconciliation 2026-07-18 (operator: "deleting the mount entry and unmounting are two different things" + the then-`#ANAS` disable marker, retired by cr.6). Pools action-subresource idiom. | `202`/`409` |
 | `POST` | `/v1/mounts/test` | Preflight diagnosis: the typed server/share is normalised first (empty CIFS share or unusable server → `400` with the guiding sentence, never a probe) → DNS → port (2049/445) → timeout-guarded probe mount (no-credentials CIFS probes as `guest`, so they never prompt) → unreachable / auth / not-found / protocol / **invalid** (EINVAL — malformed server or share, e.g. the kernel's "Malformed UNC in devname") / OK | `200`/`400` |
 
 Key decisions: **status never touches a mountpoint synchronously** (dead NFS server hangs `stat()`; all liveness/capacity via `timeout`-guarded `stat -f` in a child process → ok/stale/unreachable/unmounted). CIFS credentials in per-mount 0600 root-only files under `/etc/anas/creds/` (local, not pmxcfs — mounts are per-node and boot must not depend on pmxcfs), write-only through the API. Defaults: boot mount with `nofail` forced; `x-systemd.automount` an exposed toggle; `nosuid,nodev` on remote mounts; NFS `vers=4.2`/`hard`, CIFS `vers=3.1.1` (1.0 behind a loud warning). Options are a structured known tier + verbatim passthrough for everything else. An **armed** row (an `x-systemd.automount` placeholder whose mount has idled away) takes its identity — type, remote, source, server/share — from the fstab entry, never from the `autofs`/`systemd-1` placeholder findmnt reports; only the STATE comes from the live table (issue #35). Dashboard warning category `mount`, failures only.
@@ -708,7 +708,7 @@ anasd does NOT accept arbitrary commands. It maps structured operations to speci
 | `zpool.export` | `zpool export <name>` |
 | `zpool.import-unit` | `systemctl enable\|disable zfs-import@<escaped-pool>.service` (boot-import; side effect of create/import/destroy) |
 | `disk.wipe` | `wipefs -a --force <device>` (optional cleanup after pool destroy) |
-| `zfs.list` | `zfs list -j -t all` (JSON — Principle 13, matches the pool parsers; ZFS 2.3+) |
+| `zfs.list` | `zfs list -j -p -r -o <props> -t filesystem,volume -- <pool>` (JSON — Principle 13, matches the pool parsers; snapshot listings take `-t snapshot`; `-j` needs ZFS 2.3+ — the code never runs `-t all`) |
 | `zfs.create` | `zfs create [opts] <dataset>` |
 | `zfs.destroy` | `zfs destroy <dataset>` |
 | `zfs.set` | `zfs set <prop>=<val> <dataset>` |
@@ -749,7 +749,7 @@ The base three principals (owner / owning-group / everyone) are **mode bits** (`
 ### SMB Operations
 | Operation | Command |
 |-----------|---------|
-| `smb.config.get` | Read smb.conf (or `net conf list`) |
+| `smb.config.get` | Read smb.conf through the round-trip parser in `parsers/smb-conf.ts` (no `net` call — the `net conf` registry was considered and rejected, see Config File Management) |
 | `smb.config.set` | Write smb.conf section |
 | `smb.share.add` | Add share to smb.conf |
 | `smb.share.remove` | Remove share from smb.conf |
@@ -829,6 +829,51 @@ Every call carries `--config /etc/anas/rclone.conf --ask-password=false` (ANAS's
 - `rclone copy|sync <source> <remote>:<path> --use-json-log -v --stats 5s --stats-log-level NOTICE [--bwlimit <rate>] [--exclude <pattern>]…` — the run; never `--max-delete`, never `--dry-run` in v1 (the preview shares the argv and ignores the per-file events)
 - `systemctl` / `systemd-analyze calendar` for the `anas-cloud-<name>` units, `journalctl -u` for recent runs — as backup
 
+### AHR, replication transport, mounts & helper binaries (added by the cr.71 docs-vs-code pass)
+
+The tables above were written before the AHR, mounts, replication and schedule epics shipped; these are the other
+binaries anasd runs — same rule throughout: mapped operations, `execFile` with array args, no shell. Each row names
+the family that runs it.
+
+| Binary | Why (family) |
+|--------|---------|
+| `mdadm` | AHR: create/grow/rebuild/re-add/spare management, detail/examine reads (md's event hook is an ANAS script wired into `mdadm.conf`'s `PROGRAM` line — not a daemon call) |
+| `sgdisk`, `partx` | AHR: GPT band-slice tables by the by-id convention; partition-table re-read after slice changes |
+| `pvcreate`, `vgcreate`, `vgextend`, `vgreduce`, `vgremove`, `vgchange`, `pvremove`, `pvresize`, `lvcreate`, `lvremove`, `lvextend`, `lvconvert` | AHR: the LVM layer between md and btrfs — create/destroy, cache attach/detach (`lvconvert --type cache` / `--uncache`), expansion |
+| `pvs`, `vgs`, `lvs` | AHR: LVM inventory reads (machine-readable report) — band layout, cache state, expand previews |
+| `dmsetup` | AHR: device-mapper mapping and cache-status truth (a cache block is gated on `dmsetup status`) |
+| `mkfs.btrfs`, `btrfs` | AHR: filesystem over the pool LV; mount, subvolume create/show/list, usage reads |
+| `ssh`, `ssh-keygen`, `ssh-keyscan` | replication transport: remote `zfs send/recv` and remote `zpool/zfs` reads over the pinned root trust; the ANAS ed25519 keypair and host-key capture for pinning |
+| `mount`, `umount` | mounts: the kernel actions behind the verb ladder; the AHR `@snapshots` read-only mount; a failed-remount recovery |
+| `findmnt` | mounts/backup: the live mount table behind every inventory and nested-boundary read (`--json`) |
+| `systemd-escape` | mounts: a mountpoint escaped into its `.mount`/`.automount` unit name (the ZFS import-instance name is escaped in-process — no shell-out there) |
+| `systemd-analyze` | schedules/replication/cloud: `calendar` — validate a schedule before writing a unit |
+| `journalctl` | schedules/scrub/AHR: recent runs of ANAS-owned units (the last-scrub verdict, run viewers) |
+| `node` | the `ExecStart` interpreter of the runner units the schedule/backup/replication/cloud verbs write |
+| `timeout` | probes: every hang-prone guard — dead NFS/CIFS `stat -f`, write tests, remote probes (the budget ladder in `executor/command-budgets.ts`) |
+| `stat` | probes: capacity/type/ino reads behind `timeout` — a mountpoint is never touched unguarded |
+| `find` | ACL recursive walks and the backup2.2 nested-filesystem detect, both bounded (`-xdev`, `-prune`) |
+| `sort` | probes: dedup in a composed pipeline (identity scans via `executor.pipeline`) |
+| `cat` | AHR/scrub: read `/proc/mdstat` (md state) |
+| `touch`, `rm` | probes: guarded write-capability test on a restore/backup target |
+| `dd`, `sync` | AHR self-heal: `O_DIRECT` read sweeps and the one arbitrated repair write (`conv=fsync`), and the cache-drop sequence a cold read needs |
+| `blkid` | pools/AHR/cache: filesystem/RAID signature reads (wipe guards, slice identity, composable-disk facts) |
+| `mkdir` | mounts/shares: the mountpoint directory of a created mount or the `@snapshots` helper mount |
+| `mv` | AHR: rollback's instant subvolume swap — `@data` is preserved as `@snapshots/pre-rollback-<ts>`, nothing destroyed |
+| `testparm` | SMB: the post-write config gate — a failing result rolls the stanza back byte-identically |
+| `ip` | iSCSI: `ip -j addr` — the portal addresses offered to initiators |
+| `udevadm` | AHR: settle after disk/slice changes before re-reading by-id paths |
+| `lsof`, `fuser` | mounts/busy diagnosis: which processes hold a mount (the 409 that names them) |
+| `prlimit` | backup restore: the fd ceiling around one `proxmox-backup-client` run (it execs the client in place, so the cancel hook signals the real pid) |
+| `pve-firewall` | iSCSI: the firewall advisory read |
+| `perl` | notifications: one `perl -e 'use PVE::Notify; …'` call per event (the PVE stack, not ours) |
+| `update-initramfs` | AHR expansion: refresh the boot image after the disk layout changes |
+| `wipefs` | (listed above under `disk.wipe`) also AHR detach: clear a released slice so the disk reads `available` |
+
+No whitelist name above lacks a caller; conversely, binaries that appear in old drafts but no longer run were
+dropped — there is no `base64` call (base64 is a Node `Buffer` transform, never a child process), and the daemon
+never runs `net`, `systemd-escape` for ZFS import names, or `sanoid`.
+
 ### Parameter validation
 
 Every operation has a schema defining valid parameters. anasd validates before execution:
@@ -888,7 +933,12 @@ Both services run as root — no dedicated service user.
 *(Operator ruling 2026-10-14, built by cr.27; replaces "auth is binary".)* ANAS asks PVE the question PVE asks for
 its own ZFS, LVM and directory disk verbs: **`Sys.Audit` on `/` to read, `Sys.Modify` on `/` to change.**
 - **The rule is the method:** GET and HEAD need `Sys.Audit`; POST, PUT, DELETE and PATCH need `Sys.Modify`. No
-  exceptions and no route table — a new route needs no row. `GET /installed` is the only unauthenticated route.
+  route table — a new route needs no row. One exception (cr.67, operator ruling 2026-10-17): a POST whose
+  daemon-side path starts a READ job — `/cloud/tasks/preview`, `/cloud/remotes/test`, `/backup/restore/browse`,
+  and `POST /jobs/<id>/cancel` (job id matched, never a bare wildcard) — needs `Sys.Audit` at the gateway; the
+  daemon's job queue (`jobs/authority.ts`) stays the authority on a cancel, so cancelling a non-read job still
+  answers 403 naming `Sys.Modify` from the daemon, which no gateway-side rule could know. `GET /installed` is
+  the only unauthenticated route.
 - **PVE answers, the gateway decides:** the privileges come from PVE's `$rpcenv->check` inside pveproxy (roles,
   groups, `--propagate 0`, pools — PVE's compile, PVE's definedness rule); the gateway applies the rule once.
 - **A refusal is a 403 `FORBIDDEN`** naming the privilege and the path: "Permission check failed (/, Sys.Modify):
@@ -1012,17 +1062,19 @@ sudo systemctl enable --now anasd anas
 
 ### systemd units
 
-**anasd.service**
+**anasd.service** — the shipped unit, `packaging/systemd/anasd.service` (the original draft's `After=zfs.target` was corrected at install design: the daemon needs the cluster filesystem up, and a pool's presence is discovered at run time, never unit-ordered):
 ```ini
 [Unit]
-Description=ANAS Storage Management Daemon
-After=zfs.target
+Description=ANAS Daemon
+After=network.target pve-cluster.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/node /path/to/anasd/index.js
-User=root
-RuntimeDirectory=anas
+ExecStartPre=/bin/mkdir -p /run/anas
+ExecStart=/usr/bin/node /opt/anas/packages/daemon/dist/index.js
+Environment=ANASD_SOCKET=/run/anas/anasd.sock
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -1071,16 +1123,21 @@ WantedBy=multi-user.target
 Shared schemas mean validation is defined once and enforced at both boundaries.
 
 ### Authentication & audit chain
+The identity headers anasd accepts are exactly `RequestHeaders` in `packages/shared/src/schemas/api.ts` (the
+original design named `X-Anas-UID` / `X-Anas-Groups` — there is no groups header; `x-anas-privileges` was added
+by cr.28):
 ```
-Browser ──cookie──→ gateway ──X-Anas-User──→ anasd ──audit log──→ syslog/file
-                           X-Anas-UID
-                           X-Anas-Groups
-                           X-Anas-Request-ID
+Browser ──cookie──→ gateway ──x-anas-user──────→ anasd ──audit log──→ journald
+                           x-anas-user-uid
+                           x-anas-privileges
+                           x-anas-request-id
 ```
-- User identity propagated on every request to anasd
+- User identity and the PVE grants propagated on every request to anasd
+- `x-anas-privileges` is REQUIRED (cr.28): a request without it, or with one that does not parse, is refused —
+  fail closed, no "absent means trusted"; the Unix socket's access control bounds who can send it, it does not
+  make the headers trusted by presence
 - anasd logs every mutating operation with user, operation, params, and result
 - Request ID enables end-to-end correlation across both services
-- anasd trusts identity headers because the Unix socket is access-controlled
 
 ### Command injection prevention
 - `execFile` (not `exec`) — no shell interpretation
@@ -1192,11 +1249,11 @@ Job queue is in-memory. Jobs are lost on restart — this is acceptable because:
 - Survives restarts, managed by system log rotation
 - No custom log files to manage
 
-**Proxmox notification system** — investigate for V1 or early V2. Proxmox has a flexible notification framework (email, Gotify, etc.) that users already configure. Surfacing events like "scrub completed," "pool degraded," or "disk error" through it would be valuable and avoids building our own notification system.
+**Proxmox notification system** — built (the client shipped with AHR — AHR-DESIGN §7.2, cr.35 — and its event kinds were extended by 11.4, 9.4, 16.12 and rclone.2). `packages/daemon/src/services/pve-notify.ts` calls PVE's own `PVE::Notify` with ANAS-shipped `.hbs` templates (installed under PVE's template directory) and routes through the operator's already-configured notification matchers and targets — ANAS emits, PVE delivers. Delivery is best-effort: a broken mail target never fails the job that emitted the notification.
 
 ### 5. Config File Management: Surgical, Non-Destructive Editing
 
-**ANAS is a guest on the system, not the owner.** We do not own smb.conf or /etc/exports. We do not overwrite them. We do not use marker comments.
+**ANAS is a guest on the system, not the owner.** We do not own smb.conf or /etc/exports. We do not overwrite them. The original rule — "we do not use marker comments" — has three named exceptions, each where the config file is the only store and the marker is ANAS's own line the parser preserves byte-for-byte: the `# anas:recycle-purge-days = <n>` line inside an SMB share stanza (written and preserved by `parsers/smb-conf.ts`), the `X-ANAS-Schedule=` comment in an ANAS-owned snapshot/scrub `.service` unit (rendered and parsed by `services/snapshot-schedule-units.ts` / `services/scrub-schedule-units.ts`), and the legacy `#ANAS ` fstab disable marker — READ-ONLY since cr.6 retired it in favour of the option form (kept in `parsers/fstab.ts` so existing lines keep parsing, converted only when ANAS next changes the line). Nothing else carries an ANAS marker, and no marker hides state a tool should own.
 
 The approach:
 - **Parse** the full config file, understanding its complete structure
@@ -1264,5 +1321,5 @@ ANAS does not manage sessions. PVEAuthCookie is the only credential, validated o
 
 ## Remaining Open Questions
 
-1. **Proxmox notification integration** — V1 scope. Need to research the Proxmox notification API/CLI for surfacing operation results, pool health events, etc.
-2. **Config file parsers** — Need to identify or build robust parsers for smb.conf and /etc/exports that can round-trip (parse → modify → write) without losing comments, whitespace, or unknown directives.
+1. **Proxmox notification integration** — ANSWERED and shipped: `packages/daemon/src/services/pve-notify.ts` emits through PVE's `PVE::Notify` with shipped `.hbs` templates into the operator's own matchers/targets (see "Proxmox notification system" above).
+2. **Config file parsers** — ANSWERED and shipped: `packages/daemon/src/parsers/smb-conf.ts` and `packages/daemon/src/parsers/exports.ts` round-trip smb.conf and /etc/exports with comments, whitespace and unknown directives preserved byte-for-byte (`parsers/__tests__/smb-conf.test.ts`, `parsers/__tests__/exports.test.ts`).
