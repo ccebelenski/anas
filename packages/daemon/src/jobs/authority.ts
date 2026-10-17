@@ -13,8 +13,8 @@ import { isReadOnlyOperation } from './read-jobs.js'
  * sending the header — without a second copy of the method rule.
  *
  * THE RULE. A job needs `Sys.Modify` on `/`; a job that only reads (a `read.*`
- * operation, cr.48) needs `Sys.Audit` (operator ruling 2026-10-15, EPICS
- * cr.28); the cancel of a read job needs `Sys.Audit`, any other cancel
+ * operation, cr.48) needs `Sys.Audit` (operator ruling 2026-10-17, EPICS
+ * cr.28 / §2 Authorization; the gateway's per-route exception is cr.67); the cancel of a read job needs `Sys.Audit`, any other cancel
  * `Sys.Modify`. {@link requiredPrivilege} is the whole rule.
  *
  * WHOSE PRIVILEGES. Not the submitter object a route passes — a route could

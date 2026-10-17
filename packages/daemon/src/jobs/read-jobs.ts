@@ -13,7 +13,7 @@ import { assertRunNotCancelled, ChildCancel } from './child-cancel.js'
  *  - the cancel door (`POST /v1/jobs/:id/cancel`) stops one without the
  *    confirm a run's cancel asks for — a cancelled read has no consequence;
  *  - cr.28 (the queue refusing work without Sys.Modify) admits them on
- *    Sys.Audit, the read privilege (EPICS cr.28 note).
+ *    Sys.Audit, the read privilege (operator ruling 2026-10-17, EPICS cr.28).
  *
  * The marker is an OPERATION-NAME convention, not a submit flag: every
  * read-only job's operation starts with {@link READ_JOB_PREFIX}. The name is

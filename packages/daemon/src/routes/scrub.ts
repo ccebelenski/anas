@@ -150,9 +150,11 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
   // DeepSeek 2026-10-17, probe q3a): the pools.ts scrub verb on a PVE-managed
   // pool answers 202 (a scrub is maintenance PVE does not do for us), and the
   // toggle shipped without one before cr.64b2-ii; the gate the first cut added
-  // refused both PVE shapes and broke parity with its own verb. Whether a
-  // `zfs set` of the pool's periodic-scrub property on a PVE pool should be
-  // hands-off is an operator ruling, recorded on the EPICS line, not a door.
+  // refused both PVE shapes and broke parity with its own verb. Operator
+  // ruling 2026-10-17 (EPICS §2 Scrubs): NOT hands-off — the property is a
+  // Debian convention PVE reads and never writes, and a scrub is maintenance
+  // PVE does not do for us; the toggle and the scrub verb are gated together
+  // or not at all.
 
   /**
    * The ZFS toggle as a guard door (cr.64b2-ii, review L22 — it used to take
