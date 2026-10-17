@@ -1112,6 +1112,58 @@ password = mock-obscured
           assert.equal(job.error!.code, 'IDENTITY_MISMATCH')
           assert.equal(await readFile(bareFile, 'utf-8'), GT_SECTION)
         })
+
+        // cr.66 — the OPERATOR ruling 2026-10-17 (§2 Safety altitudes): a
+        // confirm signs the NAME of every field it writes and never a secret
+        // value. The retarget confirm's `validated` now carries `optionKeys`
+        // (sorted, names only) next to `remote` and `changes`, so a replay
+        // inside the TTL that adds/removes/renames an option answers 409
+        // CONFIRM_SCOPE_CHANGED naming the field, while the VALUES stay
+        // unsigned — a secret rotation with the same keys is the same request,
+        // and no reply or recorded line ever carries a secret value.
+        it('cr.66: a replay inside the TTL with ONE MORE option key is 409 CONFIRM_SCOPE_CHANGED naming the field — nothing written, no secret in the reply', async () => {
+          await bare({ ...usedByNightly })
+          const secret = 'cr66-sekrit-minio'
+          await writeFile(bareFile, s3(secret), 'utf-8')
+          const code = await mint()
+          assert.ok(code)
+          // The SAME destination change, one MORE option (s3's non-destination
+          // `upload_concurrency`) — the update would now write it.
+          const replay = await putS3({ endpoint: 'http://10.0.0.9:9000', upload_concurrency: '4' }, code)
+          assert.equal(replay.statusCode, 409)
+          assert.equal(replay.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+          assert.deepEqual(replay.json().error.changed, ['optionKeys'])
+          assert.match(replay.json().error.message, /You confirmed with optionKeys \["endpoint"\]; this request has optionKeys \["endpoint","upload_concurrency"\] — confirm again/, replay.json().error.message)
+          // The rclone.conf write never happened: the file is still its pre-confirm bytes.
+          assert.equal(await readFile(bareFile, 'utf-8'), s3(secret))
+          // The 409 names the option KEYS, never a value — and no exec the
+          // harness recorded carries the secret either.
+          assert.equal(replay.payload.includes(secret), false, replay.payload)
+          for (const call of executor.calls)
+            assert.equal(JSON.stringify(call).includes(secret), false, JSON.stringify(call))
+        })
+
+        it('cr.66: a secret VALUE rotation with the same keys is the same request — it passes, no reply or job record carries the value, and the written file is byte-identical', async () => {
+          await bare({ ...usedByNightly })
+          const before = 'cr66-sekrit-before'
+          await writeFile(bareFile, s3(before), 'utf-8')
+          const code = await mint()
+          assert.ok(code)
+          const rotated = 'cr66-sekrit-after'
+          await writeFile(bareFile, s3(rotated), 'utf-8')
+          const ok = await putS3({ endpoint: 'http://10.0.0.9:9000' }, code)
+          assert.equal(ok.statusCode, 202, ok.payload)
+          const job = await finished((ok.json() as JobAccepted).job.id)
+          assert.equal(job.status, 'completed', JSON.stringify(job.error))
+          // The happy path pinned byte-for-byte, like the suite's other
+          // section writes: the same section re-rendered with exactly the new
+          // endpoint, the rotated secret kept as written.
+          assert.equal(await readFile(bareFile, 'utf-8'), s3(rotated, { endpoint: 'http://10.0.0.9:9000' }))
+          // Values are not signed: the 202 reply, the job record and every
+          // recorded exec argv carry neither the minted nor the rotated value.
+          for (const [label, text] of [['payload', ok.payload], ['job', JSON.stringify(job)], ...executor.calls.map((c, i) => [`exec ${i}`, JSON.stringify(c)])] as const)
+            assert.equal(text.includes(before) || text.includes(rotated), false, `${label} carried a secret value`)
+        })
       })
 
       // cr.64b2-ii step 4 — the NON-retarget update path (no destination

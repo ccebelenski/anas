@@ -507,11 +507,17 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       // so a re-created section (another type, provider or endpoint) is 409
       // IDENTITY_MISMATCH, and a replay with different changes is 409
       // CONFIRM_SCOPE_CHANGED naming the field. The job re-gates the bound
-      // identity (guarded, and again under writeRemote's file lock). `options`
-      // itself is not a signed field: it carries the secret option NAMES and
-      // describeField would echo values into the 409 — the destination-
-      // relevant half, with values the retarget rule keeps non-secret, is
-      // exactly `changes`.
+      // identity (guarded, and again under writeRemote's file lock). A confirm
+      // signs the NAME of every field it writes, never a value (operator
+      // ruling 2026-10-17, §2 Safety altitudes): `optionKeys` signs the sorted
+      // names of the options this update will write — a replay inside the TTL
+      // that adds, removes or renames an option answers 409 CONFIRM_SCOPE_CHANGED
+      // naming the field, and describeField prints only the NAMES
+      // (`optionKeys ["endpoint"]`), never a value. The VALUES are not signed:
+      // `changes` keeps the destination half (by the retarget rule its values
+      // stay non-secret), the rest of the option values would be secrets, and
+      // signing one would echo it into the 409 — so a secret rotation with the
+      // same keys is the same request.
       const changes = destinationChanges(existing, input.options, catalog)
       const pass: GuardPass<CloudRemote> = {
         object: existing,
@@ -529,7 +535,13 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
             gates: [],
           }
           if (!guardConfirm(confirmStore, request, reply, retargetSpec, pass, {
-            validated: { remote: name, changes: changes.map(c => [c.key, c.to]) },
+            validated: {
+              remote: name,
+              changes: changes.map(c => [c.key, c.to]),
+              // The options the update will write, NAMES only, sorted — the
+              // values stay unsigned by the ruling (cr.66).
+              optionKeys: Object.keys(input.options).sort(),
+            },
             address: ['remote'],
             message: `Changing where remote '${name}' points re-points cloud sync task(s): ${describeTasks(tasks)}`,
             warnings: [
