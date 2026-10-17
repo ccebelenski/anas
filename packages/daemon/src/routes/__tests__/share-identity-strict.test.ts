@@ -107,6 +107,8 @@ const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
 const ABSENT: ExecResult = { stdout: '', stderr: '', exitCode: 2 }
 /** The review's probe: `pdbedit -L` exits 1 "tdb locked" (no capture of a failing pdbedit exists). */
 const PDBEDIT_LOCKED: ExecResult = { stdout: '', stderr: 'tdb locked\n', exitCode: 1 }
+/** cr.58r P1: the same transient tdb lock, hitting `smbpasswd -d/-e` instead. */
+const SMBPASSWD_LOCKED: ExecResult = { stdout: '', stderr: 'tdb locked\n', exitCode: 1 }
 
 interface Call { command: string, args: string[] }
 
@@ -134,6 +136,12 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
   let pdbedit = ''
   /** `pdbedit -L` fails (exit 1, `tdb locked`). */
   let pdbeditFails = false
+  /** `smbpasswd -d/-e` fails (exit 1, `tdb locked`) — cr.58r P1. */
+  let smbpasswdFails = false
+  /** `getent group` exits non-zero with PARTIAL stdout — cr.58r P2 (the review's EXTRA1 shape). */
+  let groupsPartial: string | undefined
+  /** `pdbedit -x` fails (exit 1) — cr.58r P3. */
+  let pdbeditXFails = false
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-cr58-'))
@@ -163,6 +171,9 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
     groups = [ROOT_GROUP, SUDO, USERS, ACCGROUP]
     pdbedit = `${PDBEDIT_ACCUSER}\n`
     pdbeditFails = false
+    smbpasswdFails = false
+    groupsPartial = undefined
+    pdbeditXFails = false
     calls = []
     const smbConfPath = join(dir, 'smb.conf')
     await writeFile(smbConfPath, '[global]\n\tworkgroup = WORKGROUP\n')
@@ -176,14 +187,25 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
         const a = args[0] === '-s' ? args.slice(2) : args
         if (a[0] === 'passwd')
           return getent(passwd, a[1])
-        if (a[0] === 'group')
+        if (a[0] === 'group') {
+          // cr.58r P2: a `getent group` that ran and exited non-zero with a
+          // PARTIAL listing (the review's EXTRA1: the sudo line cut off
+          // mid-members-list, so the admin's membership is missing from what
+          // was printed).
+          if (groupsPartial !== undefined && a[1] === undefined)
+            return { stdout: groupsPartial, stderr: '', exitCode: 1 }
           return getent(groups, a[1])
+        }
         return ok('')
       }
       if (command === FINDMNT)
         return ok(FINDMNT_FULL)
       if (command === PDBEDIT && args[0] === '-L')
         return pdbeditFails ? PDBEDIT_LOCKED : ok(pdbedit)
+      if (command === PDBEDIT && args[0] === '-x' && pdbeditXFails)
+        return { stdout: '', stderr: 'tdb locked\n', exitCode: 1 }
+      if (command === SMBPASSWD && smbpasswdFails)
+        return SMBPASSWD_LOCKED
       if (command === USERADD) {
         // The account now exists (useradd -u <uid> … <name>), and `pdbedit -L`
         // prints the uid Samba resolves for a stored name AT LISTING TIME
@@ -423,7 +445,7 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
     assert.deepEqual(calls.filter(isMutation), [])
   })
 
-  it('M5: with an SMB password the create goes ahead and sets the NEW password on that entry (useradd, then smbpasswd -a; verified exact-case)', async () => {
+  it('M5: with an SMB password the create goes ahead and sets the NEW password on a FRESH entry (useradd, pdbedit -x of the orphan, then smbpasswd -a; verified exact-case)', async () => {
     await serve()
     passwd = [ROOT]
     pdbedit = ORPHAN_ACCUSER
@@ -431,8 +453,14 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
     assert.equal(res.statusCode, 202, res.body)
     const job = await finished((res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.deepEqual(calls.filter(isMutation).map(c => c.command), [USERADD, SMBPASSWD])
-    assert.deepEqual(calls.find(c => c.command === SMBPASSWD)?.args, ['-a', '-s', 'accuser'])
+    // cr.58r P3: the orphan is DROPPED before smbpasswd -a — `smbpasswd -a`
+    // on the existing entry would have kept its old attributes (a `D` flag
+    // included), leaving the new account's SMB entry disabled.
+    const muts = calls.filter(isMutation).map(c => [c.command, ...c.args])
+    assert.deepEqual(muts.map(m => m[0]), [USERADD, PDBEDIT, SMBPASSWD])
+    assert.deepEqual(muts[1], [PDBEDIT, '-x', '-u', 'accuser'])
+    assert.deepEqual(muts[2], [SMBPASSWD, '-a', '-s', 'accuser'])
+    assert.equal((job.result as { smbEntryReplaced?: string }).smbEntryReplaced, 'accuser')
   })
 
   // --- L2 -------------------------------------------------------------------
@@ -570,6 +598,128 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
     const res = await send(DISABLE_USER)
     assert.equal(res.statusCode, 503)
     assert.equal(res.json().error.message, `ANAS could not read Proxmox VE's user list (${cfg}), so it cannot check that user 'accuser' is not a system account — nothing was done`)
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  // --- cr.58r (the review's four possibles, fixed) --------------------------
+
+  it('cr.58r P1: a failing smbpasswd -d/-e fails the job BEFORE usermod — no half-done disable/enable', async () => {
+    // The §2 no-partial-op ruling: the SMB step (the one that can fail on a
+    // transient tdb lock) runs FIRST, so its failure leaves both halves
+    // untouched. The old order ran usermod --expiredate first: a locked tdb
+    // then left the unix account disabled with its SMB access live.
+    for (const [req, smbArgv, usermodArgs] of [
+      [DISABLE_USER, ['-d', 'accuser'], ['--expiredate', '1', 'accuser']],
+      [ENABLE_USER, ['-e', 'accuser'], ['--expiredate', '', 'accuser']],
+    ] as const) {
+      await serve()
+      const { id, release } = await behindFullQueue(req)
+      smbpasswdFails = true
+      release()
+      const job = await finished(id)
+      assert.equal(job.status, 'failed', `${req.method} ${req.url}`)
+      assert.match(job.error?.message ?? '', /tdb locked/, 'the job names the failing step')
+      assert.deepEqual(
+        calls.filter(isMutation).map(c => [c.command, ...c.args]),
+        [[SMBPASSWD, ...smbArgv]],
+        `only smbpasswd ran — no usermod ${usermodArgs.join(' ')}`,
+      )
+      await app!.close()
+      app = undefined
+    }
+  })
+
+  it('cr.58r P1 (delete, the order that was already right): pdbedit -x before userdel — a failed drop runs no userdel', async () => {
+    await serve()
+    const { id, release } = await behindFullQueue(DELETE_USER)
+    pdbeditXFails = true
+    release()
+    const job = await finished(id)
+    assert.equal(job.status, 'failed')
+    assert.match(job.error?.message ?? '', /tdb locked/)
+    assert.deepEqual(
+      calls.filter(isMutation).map(c => [c.command, ...c.args]),
+      [[PDBEDIT, '-x', '-u', 'accuser']],
+      'pdbedit -x ran and failed; userdel never ran',
+    )
+  })
+
+  /**
+   * The review's EXTRA1 shape: `getent group` ran and exited non-zero with a
+   * PARTIAL listing — the sudo line cut off mid-members-list (`accuse`), so
+   * accuser's membership is missing from what was printed. A fail-open read
+   * (the old `exitCode !== 0 && !stdout`) parses it and the admin reads as
+   * nobody; the strict read answers null and the gate refuses 503 naming the
+   * database, like `passdbForGuard` does for a failed `pdbedit -L`.
+   */
+  const GROUPS_CUT = `${ROOT_GROUP}\n${rewrite(SUDO, 'sudo:x:27:', 'sudo:x:27:accuse')}`
+
+  it('cr.58r P2: a getent group exiting non-zero with partial output is unreadable — 503 at the route, no mutation', async () => {
+    await serve()
+    groupsPartial = GROUPS_CUT
+    const res = await send(DISABLE_USER)
+    assert.equal(res.statusCode, 503, res.body)
+    assert.equal(res.json().error.code, 'UNAVAILABLE')
+    assert.equal(res.json().error.message, `ANAS could not read the group database (getent group), so it cannot check that user 'accuser' is not a system account — nothing was done`)
+    assert.equal(queue.list().length, 0)
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  it('cr.58r P2: the partial getent group appearing while the disable waits fails the job UNAVAILABLE, no usermod', async () => {
+    await serve()
+    const { id, release } = await behindFullQueue(DISABLE_USER)
+    groupsPartial = GROUPS_CUT
+    release()
+    const job = await finished(id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'UNAVAILABLE')
+    assert.match(job.error!.message, /^ANAS could not read the group database \(getent group\), so it cannot check that user 'accuser' is not a system account/)
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  it('cr.58r P3: a failed pdbedit -x of the orphan fails the create job BEFORE smbpasswd -a — no password written on the stale entry', async () => {
+    await serve()
+    passwd = [ROOT]
+    pdbedit = ORPHAN_ACCUSER
+    pdbeditXFails = true
+    const res = await send({ ...CREATE_ACCUSER, body: { name: 'accuser', smbPassword: 'Acc-proof-1' } })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await finished((res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.match(
+      job.error?.message ?? '',
+      /was created, but setting the SMB password failed: removing the orphan SMB entry stored as 'accuser' failed: tdb locked/,
+    )
+    const muts = calls.filter(isMutation).map(c => [c.command, ...c.args])
+    assert.deepEqual(muts.map(m => m[0]), [USERADD, PDBEDIT], 'smbpasswd never ran on the stale entry')
+    assert.deepEqual(muts[1], [PDBEDIT, '-x', '-u', 'accuser'])
+  })
+
+  it('cr.58r P4 (the review\'s EXTRA3): create refuses a name that is a @pam login in user.cfg with no unix account — 409 SYSTEM_ACCOUNT, no useradd', async () => {
+    await serve({ userCfg: USER_CFG_ACCUSER })
+    // The dormant shape: the login exists in user.cfg, the account does not.
+    passwd = [ROOT]
+    pdbedit = ''
+    const res = await send(CREATE_ACCUSER)
+    assert.equal(res.statusCode, 409, res.body)
+    const { error } = res.json() as { error: { code: string, message: string } }
+    assert.equal(error.code, 'SYSTEM_ACCOUNT')
+    assert.equal(error.message, `'accuser' is a Proxmox VE login ('accuser@pam' in ${join(dir, 'user.cfg')}) with no Unix account — a dormant PVE admin login. Creating the Unix account it maps to is PVE user management, outside ANAS. The user was NOT created.`)
+    assert.equal(queue.list().length, 0)
+    assert.deepEqual(calls.filter(isMutation), [])
+  })
+
+  it('cr.58r P4: the @pam login appearing in user.cfg while the create waits fails the job SYSTEM_ACCOUNT, no useradd', async () => {
+    await serve()
+    passwd = [ROOT]
+    pdbedit = ''
+    const { id, release } = await behindFullQueue(CREATE_ACCUSER)
+    await writeFile(join(dir, 'user.cfg'), USER_CFG_ACCUSER)
+    release()
+    const job = await finished(id)
+    assert.equal(job.status, 'failed')
+    assert.equal(job.error?.code, 'SYSTEM_ACCOUNT')
+    assert.match(job.error!.message, /^'accuser' is a Proxmox VE login \('accuser@pam'/)
     assert.deepEqual(calls.filter(isMutation), [])
   })
 })

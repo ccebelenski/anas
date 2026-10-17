@@ -1114,8 +1114,11 @@ describe('share-identity routes', () => {
       assert.equal(executor.calls.some(c => c.args.includes('hunter2')), false)
     })
 
-    it('create over a case-mismatched orphan: repairs it (pdbedit -x → smbpasswd -a → verify) and logs one line', async () => {
-      await boot({ pdbedit: [ORPHAN, ORPHAN, ORPHAN, FIXED], namePasswd: [NOT_FOUND, NOT_FOUND, ok(NAME_LINE)] })
+    it('create over a case-mismatched orphan: DROPS it (pdbedit -x) before smbpasswd -a, then verifies exact-case (cr.58r P3)', async () => {
+      // cr.58r: the orphan is dropped BEFORE `smbpasswd -a` — writing the new
+      // password onto the existing entry would have kept its old attributes
+      // (a `D` flag included), so the entry is removed and written fresh.
+      await boot({ pdbedit: [ORPHAN, ORPHAN, FIXED], namePasswd: [NOT_FOUND, NOT_FOUND, ok(NAME_LINE)] })
       const res = await post('/v1/identity/users', { name: 'Name', smbPassword: 'hunter2' })
       assert.equal(res.statusCode, 202)
       const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
@@ -1123,17 +1126,12 @@ describe('share-identity routes', () => {
       assert.deepEqual(job.result, { created: 'Name', uid: 1007, smbEnabled: true, smbEntryReplaced: 'name' })
       assert.deepEqual(sequenceFrom(c => c.command === '/usr/sbin/useradd'), [
         USERADD_NAME,
+        PDBEDIT_DROP_ORPHAN,
         SMBPASSWD_NAME,
         GETENT_NAME,
         PDBEDIT_LIST,
-        PDBEDIT_DROP_ORPHAN,
-        SMBPASSWD_NAME,
-        PDBEDIT_LIST,
       ])
       assert.equal(executor.calls.some(c => c.args.includes('hunter2')), false)
-      const replacedLines = logLines.filter(l => l.includes('replaced it'))
-      assert.equal(replacedLines.length, 1)
-      assert.match(replacedLines[0], /stored as 'name' did not match account 'Name'/)
     })
 
     it('create: a repair that still does not verify fails the job naming the stored entry', async () => {
@@ -1356,14 +1354,21 @@ describe('share-identity routes', () => {
       return executor.calls.filter(c => MUTATORS.includes(c.command) || (c.command === '/usr/bin/pdbedit' && c.args[0] === '-x'))
     }
 
-    async function boot(opts: { sharePasswd?: ExecResult[], pdblist?: ExecResult } = {}) {
+    async function boot(opts: { sharePasswd?: ExecResult[], pdblist?: ExecResult, groupsResult?: ExecResult, userCfg?: string } = {}) {
       tmpDir = await mkdtemp(join(tmpdir(), 'anas-identity-cr3-'))
       const smbConfPath = join(tmpDir, 'smb.conf')
       writeFileSync(smbConfPath, '[global]\nworkgroup = WORKGROUP\n')
+      // cr.58r P4: a user.cfg for the create's @pam-login gate (unset: the
+      // default path, absent on a dev host = no logins).
+      let pveUserCfgPath: string | undefined
+      if (opts.userCfg !== undefined) {
+        pveUserCfgPath = join(tmpDir, 'user.cfg')
+        writeFileSync(pveUserCfgPath, opts.userCfg)
+      }
       executor = new MockExecutor()
       queue = new JobQueue()
       executor.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: ok(PASSWD) })
-      executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: ok(GROUPS) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: opts.groupsResult ?? ok(GROUPS) })
       executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd'], result: ok(PASSWD) })
       executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group'], result: ok(GROUPS) })
       const userFixtures: Array<[string, string]> = [
@@ -1406,6 +1411,7 @@ describe('share-identity routes', () => {
         confirmStore: new ConfirmStore(),
         smbConfPath,
         exportsPath: ABSENT_EXPORTS,
+        ...(pveUserCfgPath !== undefined ? { pveUserCfgPath } : {}),
         smbpasswdAvailable: async () => true,
       })
     }
@@ -1556,6 +1562,48 @@ describe('share-identity routes', () => {
       assert.equal(job.error?.code, 'IDENTITY_MISMATCH')
       assert.match(job.error?.message ?? '', /User 'shareuser' is not the one that was confirmed \(uid 1001 at the confirmation, uid 999 now\)/)
       assert.deepEqual(mutatorCalls(), [])
+    })
+
+    // cr.58r (the cr.58 review's four possibles): one pin per behaviour here
+    // too — the review found every cr.58 behaviour covered only by
+    // share-identity-strict.test.ts. The full scenarios live there; these are
+    // the same refusals on this older harness.
+
+    it('cr.58r P1: a failing smbpasswd -d fails the disable BEFORE usermod — no half-done disable', async () => {
+      await boot({ pdblist: ok('shareuser:1001:\n') })
+      executor.addFixture({ command: '/usr/bin/smbpasswd', args: ['-d', 'shareuser'], result: { stdout: '', stderr: 'tdb locked\n', exitCode: 1 } })
+      const res = await put('/v1/identity/users/shareuser', { enabled: false })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error?.message ?? '', /tdb locked/)
+      // The SMB step (the transient-failure one) runs first; its failure
+      // leaves the unix half untouched — no half-disabled account.
+      assert.equal(find(executor.calls, '/usr/sbin/usermod', () => true), undefined, 'usermod never ran')
+      assert.deepEqual(find(executor.calls, '/usr/bin/smbpasswd', () => true), ['-d', 'shareuser'])
+    })
+
+    it('cr.58r P2: a getent group that exits non-zero with PARTIAL output is unreadable — 503, not "not an admin"', async () => {
+      // The review's EXTRA1 shape: the sudo line cut off mid-members-list.
+      await boot({ groupsResult: { stdout: 'root:x:0:\nsudo:x:27:shareuse', stderr: '', exitCode: 1 } })
+      const res = await put('/v1/identity/users/shareuser', { enabled: false })
+      assert.equal(res.statusCode, 503, res.body)
+      assert.equal((res.json() as { error: { code: string } }).error.code, 'UNAVAILABLE')
+      assert.match((res.json() as { error: { message: string } }).error.message, /could not read the group database \(getent group\)/)
+      assert.deepEqual(mutatorCalls(), [])
+    })
+
+    it('cr.58r P4: create refuses a name that is a @pam login in user.cfg with no unix account — 409 SYSTEM_ACCOUNT, no useradd', async () => {
+      await boot({ userCfg: 'user:bob@pam:1:1:::::,,,\n' })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'bob'], result: NOT_FOUND })
+      const res = await post('/v1/identity/users', { name: 'bob' })
+      assert.equal(res.statusCode, 409, res.body)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'SYSTEM_ACCOUNT')
+      assert.match(error.message, /'bob' is a Proxmox VE login \('bob@pam'/)
+      assert.match(error.message, /NOT created/)
+      assert.equal(queue.list().length, 0)
+      assert.equal(executor.calls.some(c => c.command === '/usr/sbin/useradd'), false)
     })
   })
 

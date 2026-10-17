@@ -266,9 +266,11 @@ export interface ShareIdentityRouteOptions {
   loginDefsPath?: string
   /**
    * Absolute path to PVE's /etc/pve/user.cfg (default: that path): every
-   * user verb reads its `@pam` logins, which are system accounts (cr.58, L2).
-   * An ABSENT file (a node without pmxcfs, the dev mock) holds no login; one
-   * that cannot be read refuses 503.
+   * user verb reads its `@pam` logins, which are system accounts (cr.58, L2)
+   * — and the user CREATE refuses a name that is such a login with no unix
+   * account, the dormant-admin case (cr.58r, review P4). An ABSENT file (a
+   * node without pmxcfs, the dev mock) holds no login; one that cannot be
+   * read refuses 503.
    */
   pveUserCfgPath?: string
   /**
@@ -559,16 +561,21 @@ export async function shareIdentityRoutes(
     /**
      * Every account (`getent passwd`), STRICT: null when the database could
      * not be read. The list GETs fail open (`allUsers`); a gate never does.
+     * cr.58r (review P2, the rule {@link passdbForGuard} already applies to
+     * `pdbedit -L`): a non-zero exit is unreadable EVEN WITH partial stdout —
+     * an NSS module that died mid-listing prints what it got, and a listing
+     * missing lines is not a fact a gate may decide on (a cut-off `sudo:x:27:`
+     * membership line would read the admin as nobody).
      */
     users: (reads: GuardReads) => reads.once('passwd', async (): Promise<PasswdEntry[] | null> => {
       const r = await executor.exec(GETENT, ['passwd'])
-      return r.exitCode !== 0 && !r.stdout.trim() ? null : parsePasswd(r.stdout)
+      return r.exitCode !== 0 ? null : parsePasswd(r.stdout)
     }),
     groups: (reads: GuardReads) => reads.once('group', () => allGroups()),
-    /** Every group (`getent group`), STRICT: null when the database could not be read. */
+    /** Every group (`getent group`), STRICT: null when the database could not be read (cr.58r: any non-zero exit, partial output or not). */
     groupsStrict: (reads: GuardReads) => reads.once('group:strict', async (): Promise<GroupEntry[] | null> => {
       const r = await executor.exec(GETENT, ['group'])
-      return r.exitCode !== 0 && !r.stdout.trim() ? null : parseGroups(r.stdout)
+      return r.exitCode !== 0 ? null : parseGroups(r.stdout)
     }),
     /** The Samba passdb, STRICT (cr.58, {@link passdbForGuard}): a gate never reads the fail-open list. */
     passdb: (reads: GuardReads) => reads.once('passdb', () => passdbForGuard()),
@@ -612,19 +619,20 @@ export async function shareIdentityRoutes(
       }
       return userdelRemovesUserGroup(text)
     }),
-    /** Every LOCAL group (`getent -s files group`), STRICT: null when it could not be read. */
+    /** Every LOCAL group (`getent -s files group`), STRICT: null when it could not be read (cr.58r: any non-zero exit, partial output or not). */
     localGroupsStrict: (reads: GuardReads) => reads.once('group:files:strict', async (): Promise<GroupEntry[] | null> => {
       const r = await executor.exec(GETENT, ['-s', 'files', 'group'])
-      return r.exitCode !== 0 && !r.stdout.trim() ? null : parseGroups(r.stdout)
+      return r.exitCode !== 0 ? null : parseGroups(r.stdout)
     }),
     /**
      * Every LOCAL account (`getent -s files passwd`), STRICT: null when it
      * could not be read. cr.29e: the userdel mirror's "another account's
      * primary group" check reads the files source only — userdel does.
+     * cr.58r: any non-zero exit is unreadable, partial output or not.
      */
     localUsersStrict: (reads: GuardReads) => reads.once('passwd:files:strict', async (): Promise<PasswdEntry[] | null> => {
       const r = await executor.exec(GETENT, ['-s', 'files', 'passwd'])
-      return r.exitCode !== 0 && !r.stdout.trim() ? null : parsePasswd(r.stdout)
+      return r.exitCode !== 0 ? null : parsePasswd(r.stdout)
     }),
   }
 
@@ -1586,6 +1594,33 @@ export async function shareIdentityRoutes(
       async (s, reads) => (await idReads.user(reads, s.name))
         ? { status: 409, code: 'CONFLICT', message: `User '${s.name}' already exists` }
         : null,
+      // cr.58r (review P4): a name that is a `@pam` login in PVE's user.cfg
+      // but resolves to NO unix account is a DORMANT PVE admin login — the
+      // login PVE's own auth maps to a `getpwnam` that currently fails.
+      // Creating the unix account here hands that dormant admin login its
+      // account (its ssh/PVE surface appears the moment the account exists),
+      // and §2 (Shares & identities) says ANAS-created users are never PVE
+      // users. The cr.58 (L2) code for a @pam login being a system account,
+      // at the create's name gate; an unreadable user.cfg is 503 like every
+      // other verb's read of it (an ABSENT file holds none). Exact-case:
+      // user.cfg userids are case-sensitive, and so is the login.
+      async (s, reads) => {
+        const logins = await idReads.pveLogins(reads)
+        if (logins === null) {
+          return {
+            status: 503,
+            code: 'UNAVAILABLE',
+            message: `ANAS could not read Proxmox VE's user list (${opts.pveUserCfgPath ?? PVE_USER_CFG}), so it cannot check that the name '${s.name}' is not a Proxmox VE login — nothing was done`,
+          }
+        }
+        if (!logins.has(s.name))
+          return null
+        return {
+          status: 409,
+          code: 'SYSTEM_ACCOUNT',
+          message: `'${s.name}' is a Proxmox VE login ('${s.name}@pam' in ${opts.pveUserCfgPath ?? PVE_USER_CFG}) with no Unix account — a dormant PVE admin login. Creating the Unix account it maps to is PVE user management, outside ANAS. The user was NOT created.`,
+        }
+      },
       // Referenced supplementary groups must exist.
       async (_s, reads) => {
         if (groups.length === 0)
@@ -1675,8 +1710,9 @@ export async function shareIdentityRoutes(
         // password. Refused (not purged in the job): the same rule and outs
         // as the other-case orphan, and a create never removes a passdb
         // record the operator did not name. With an SMB password the job
-        // replaces it (setSmbPasswordVerified; exact case: smbpasswd -a sets
-        // the new hash on that entry).
+        // replaces it: it drops the entry the guard run read (`pdbedit -x -u
+        // <stored>`, cr.58r — `smbpasswd -a` on an existing entry would keep
+        // its old attributes, a `D` flag included) and writes a fresh one.
         if (existing && req.smbPassword === undefined) {
           const consequence = existing.stored === s.name
             ? `A new account named '${s.name}' would take it over, and log in over SMB with the deleted account's password`
@@ -1739,7 +1775,7 @@ export async function shareIdentityRoutes(
       // Ruling (j): the name is still free, the groups still exist and are
       // in band, Samba is still there, no passdb entry claims the name, and
       // the uid is still free (a picked one still owns nothing).
-      guarded(spec, pre, async (_slot, { updateProgress, newAdvisories }) => {
+      guarded(spec, pre, async (_slot, { updateProgress, newAdvisories, reads }) => {
         refuseNewSameNumber(newAdvisories)
         updateProgress(`Creating share user '${req.name}' with uid ${uid}${skippedNote(idState)}`)
         const created = await executor.exec(USERADD, args)
@@ -1748,11 +1784,32 @@ export async function shareIdentityRoutes(
 
         let replaced: string | undefined
         if (smbPassword !== undefined) {
+          // cr.58r (review P3): the passdb gate admitted this create over an
+          // orphan entry precisely because the job would replace it — but
+          // `smbpasswd -a` on an EXISTING entry rewrites only the password:
+          // the entry keeps its old attributes, including a `D` (disabled)
+          // flag, so the new account would log in over SMB DISABLED. Drop the
+          // entry the job's guard run read (`pdbedit -x -u <stored>`,
+          // identity.3's by-stored-name verb) BEFORE `smbpasswd -a`, so the
+          // account's entry is fresh. After the gate passed, any folded entry
+          // is an orphan: another live account's was refused, and none is
+          // none. A failed drop fails the job before any smbpasswd — the
+          // half-state stays the one the halfCreated wording names.
+          const passdb = await idReads.passdb(reads)
+          const orphan = 'entries' in passdb ? passdbEntry(passdb.entries, req.name) : null
+          if (orphan) {
+            updateProgress(`Removing the orphan SMB entry stored as '${orphan.stored}' before setting the new password`)
+            const dropped = await executor.exec(PDBEDIT, ['-x', '-u', orphan.stored])
+            if (dropped.exitCode !== 0) {
+              throw new Error(halfCreated(req.name, `removing the orphan SMB entry stored as '${orphan.stored}' failed: ${dropped.stderr.trim() || `pdbedit exited with code ${dropped.exitCode}`}`))
+            }
+            replaced = orphan.stored
+          }
           updateProgress(`Setting SMB password for '${req.name}'`)
           try {
             // Password on stdin (smbpasswd -s), never argv — never logged;
             // verified exact-case afterwards, a stale entry replaced.
-            replaced = await setSmbPasswordVerified(req.name, smbPassword, updateProgress)
+            replaced = await setSmbPasswordVerified(req.name, smbPassword, updateProgress) ?? replaced
           }
           catch (err) {
             // Any failure here (a spawn failure because samba went away since
@@ -1863,15 +1920,22 @@ export async function shareIdentityRoutes(
       { ...identity, params: { user: name, enabled } },
       // Ruling (j): the same uid, every gate again, before the first usermod.
       guarded(spec, pre, async (o, { updateProgress }) => {
-        updateProgress(`${enabled ? 'Enabling' : 'Disabling'} account '${name}'`)
-        const r = await executor.exec(USERMOD, usermodArgs)
-        if (r.exitCode !== 0)
-          throw new Error(r.stderr.trim() || `usermod exited with code ${r.exitCode}`)
-
+        // cr.58r (review P1, the §2 no-partial-op ruling): the SMB step runs
+        // FIRST. `smbpasswd -d/-e` is the act that can fail transiently (the
+        // tdb locked at that instant); `usermod --expiredate` on an account
+        // whose uid the guard run just read, under the held `uid:` key,
+        // essentially cannot. With the SMB step first, a failed smbpasswd
+        // leaves BOTH halves untouched — the consistent state the ruling
+        // demands — where the old order left the unix account disabled with
+        // its SMB access live. The residual half (smbpasswd done, usermod
+        // failed) leaves the SMB side in the target state and is the rare
+        // direction. Delete already orders this way (`pdbedit -x` before
+        // `userdel`, identity.2).
+        //
         // Toggle the SMB side only if the user actually has a passdb entry —
         // smbpasswd -d/-e errors on users with no entry, which is normal for a
         // share user that never had an SMB password. The entry is the one
-        // this job's guard run read STRICTLY before usermod (cr.58, M4): an
+        // this job's guard run read STRICTLY before any act (cr.58, M4): an
         // unreadable passdb refused the job there, so a transient pdbedit
         // failure can no longer leave SMB live on a user the panel shows
         // locked. Only a node without samba has no entries (skipped).
@@ -1879,13 +1943,17 @@ export async function shareIdentityRoutes(
         // entry that belongs to another live account is that account's to
         // toggle, never this one's (identity.3). The uid is the one the job
         // read (cr.42), never the request's.
-        const smb = ownSmbEntry(o)
-        if (smb) {
+        const entry = ownSmbEntry(o)
+        if (entry) {
           updateProgress(`${enabled ? 'Enabling' : 'Disabling'} SMB access for '${name}'`)
           const smb = await execSmbpasswd([enabled ? '-e' : '-d', name])
           if (smb.exitCode !== 0)
             throw new Error(smb.stderr.trim() || `smbpasswd exited with code ${smb.exitCode}`)
         }
+        updateProgress(`${enabled ? 'Enabling' : 'Disabling'} account '${name}'`)
+        const r = await executor.exec(USERMOD, usermodArgs)
+        if (r.exitCode !== 0)
+          throw new Error(r.stderr.trim() || `usermod exited with code ${r.exitCode}`)
         return { user: name, enabled }
       }),
       { locks: pre.locks },
