@@ -1,10 +1,12 @@
 import type { Job, JobAccepted } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import type { ExecResult } from '../../executor/types.js'
+import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
+import { serveBlankInventoryDisks } from './inventory-stub.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -12,6 +14,10 @@ const IDENTITY_HEADERS = {
   'x-anas-privileges': 'Sys.Audit,Sys.Modify',
   'x-anas-request-id': randomUUID(),
 }
+const JSON_HEADERS = { ...IDENTITY_HEADERS, 'content-type': 'application/json' }
+
+/** The disks the create-behind-import test needs the inventory to serve as blank. */
+const ALL_DISKS = ['d1', 'd2']
 
 /** Poll a job until it reaches a terminal state. */
 async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
@@ -284,5 +290,131 @@ describe('import pool endpoint: /v1/pools/import', () => {
 
     assert.equal(res.statusCode, 401)
     assert.equal(res.json().error.code, 'UNAUTHORIZED')
+  })
+})
+
+/**
+ * cr.64b2-i (P): an import by GUID holds the NAME the pool will carry beside
+ * the guid key. The name comes from the `zpool import` scan the GET scanner
+ * reads (`parseImportScan`); the dev mock's own scan names `oldtank` for guid
+ * 9876543210987654321 (packages/daemon/src/server.ts, the pinned dev-mock
+ * answer the commit extends), so the by-guid import must hold `zname:oldtank`
+ * exclusive beside `zpool:9876543210987654321` — a create of that name queues
+ * behind it. An unreadable scan refuses 503 at the door, never "no name".
+ */
+describe('cr.64b2-i — the by-guid import\'s name key', () => {
+  let server: ReturnType<typeof createServer> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  function queue(): JobQueue {
+    return (server as unknown as { jobQueue: JobQueue }).jobQueue
+  }
+
+  /**
+   * Pause every real `zpool import <target>` exec (never the one-arg scan) on
+   * ONE gate: the first `-N` import stalls the job while its locks are held,
+   * and once the gate is opened every later exec (the mounted re-import)
+   * passes without re-pausing.
+   */
+  function pauseImportExecs(): { importExecs: () => number, release: () => void } {
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    const orig = mock.exec.bind(mock)
+    let count = 0
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    mock.exec = async (command: string, args: string[]): Promise<ExecResult> => {
+      if (command === '/usr/sbin/zpool' && args.length > 1 && args[0] === 'import') {
+        count++
+        await gate
+      }
+      return orig(command, args)
+    }
+    return { importExecs: () => count, release: () => release() }
+  }
+
+  async function untilSatisfied(cond: () => boolean, what: string): Promise<void> {
+    for (let i = 0; i < 400; i++) {
+      if (cond())
+        return
+      await new Promise(r => setTimeout(r, 5))
+    }
+    throw new Error(`timed out waiting for ${what}`)
+  }
+
+  it('holds zpool:<guid> AND the scanned zname:<name> exclusive while it runs — no name key, a same-name create would not serialise', async () => {
+    server = createServer({ mock: true, logger: false })
+    const paused = pauseImportExecs()
+
+    const res = await server.inject({ method: 'POST', url: '/v1/pools/import', headers: JSON_HEADERS, payload: JSON.stringify({ guid: '9876543210987654321' }) })
+    assert.equal(res.statusCode, 202, res.body)
+    const importId = (res.json() as JobAccepted).job.id
+
+    // The `-N` import is paused mid-run: the guid key AND the scanned name key
+    // are held. (The job then fails on the unmocked `zfs get` of the pool's
+    // stored mountpoints — the same end the existing by-guid test runs to.)
+    await untilSatisfied(() => paused.importExecs() > 0, 'the -N import exec')
+    assert.deepEqual(paused.importExecs(), 1)
+    assert.deepEqual(queue().heldLocks().map(l => [l.key, l.mode]), [
+      ['zpool:9876543210987654321', 'exclusive'],
+      ['zname:oldtank', 'exclusive'],
+    ])
+    assert.equal(queue().get(importId)?.status, 'running')
+
+    paused.release()
+    await waitForJob(server, importId)
+  })
+
+  it('a create of the scanned name queues behind the by-guid import: "waiting for zpool.import (job …) on the pool name"', async () => {
+    server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
+    const paused = pauseImportExecs()
+
+    const importRes = await server.inject({ method: 'POST', url: '/v1/pools/import', headers: JSON_HEADERS, payload: JSON.stringify({ guid: '9876543210987654321' }) })
+    assert.equal(importRes.statusCode, 202, importRes.body)
+    const importId = (importRes.json() as JobAccepted).job.id
+    await untilSatisfied(() => paused.importExecs() > 0, 'the -N import exec')
+
+    // The create of the pool's scanned name claims `zname:oldtank` — the very
+    // key the import holds — so it waits, naming the import (cr.33 §4.1).
+    // The progress line names the job's OPERATION (`zpool.import`, per §4.1):
+    // the same line the queue writes for any job waiting behind another.
+    const createRes = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ name: 'oldtank', dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }] }),
+    })
+    assert.equal(createRes.statusCode, 202, createRes.body)
+    const createId = (createRes.json() as JobAccepted).job.id
+    await untilSatisfied(() => queue().get(createId)?.progress?.includes(`waiting for zpool.import (job ${importId}) on the pool name 'oldtank'`) === true, 'the create waiting behind the import')
+    assert.deepEqual(queue().get(createId)?.status, 'queued')
+
+    paused.release()
+    await waitForJob(server, importId)
+    const created = await waitForJob(server, createId)
+    assert.equal(created.status, 'completed', `the create ran once the import's name key was released: ${JSON.stringify(created.error)}`)
+  })
+
+  it('an unreadable import scan refuses the by-guid import 503 UNAVAILABLE — no job, no zpool import', async () => {
+    server = createServer({ mock: true, logger: false })
+    const executor = (server as unknown as { executor: MockExecutor }).executor
+    executor.prependFixture({ command: '/usr/sbin/zpool', args: ['import'], result: { stdout: '', stderr: 'zpool: cannot read configuration: access denied', exitCode: 127 } })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({ method: 'POST', url: '/v1/pools/import', headers: JSON_HEADERS, payload: JSON.stringify({ guid: '9876543210987654321' }) })
+    assert.equal(res.statusCode, 503, res.body)
+    const err = res.json() as { error: { code: string, message: string } }
+    assert.equal(err.error.code, 'UNAVAILABLE')
+    assert.match(err.error.message, /importable pools could not be listed/)
+    assert.match(err.error.message, /9876543210987654321/)
+    assert.equal(importCall(calls), undefined, 'no zpool import with a target ever ran')
+    assert.deepEqual(queue().heldLocks(), [], 'the refused door took no lock')
+    assert.ok(!zpoolCalls(calls).some(c => c[0] === 'import' && c.length > 1), 'no import argv at all')
   })
 })

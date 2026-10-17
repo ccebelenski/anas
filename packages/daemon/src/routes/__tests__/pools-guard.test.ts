@@ -434,6 +434,10 @@ describe('cr.32 — pool export and destroy re-gate in the job (ruling (j))', ()
       { key: 'disk:scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1', mode: 'exclusive', holders: [id] },
       { key: 'disk:scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2', mode: 'exclusive', holders: [id] },
     ])
+    // cr.57 (e): the `disk:` keys are the disks' INVENTORY ids, never the
+    // kernel names the same by-ids resolve to (`sdb`/`sdc` — the dev mock's
+    // own by-id listing, fixtures/ahr/disk-by-id-ahr.txt).
+    assert.ok(!queue().heldLocks().some(l => l.key === 'disk:sdb' || l.key === 'disk:sdc'), 'no kernel-named disk key')
     releaseDestroy()
     const job = await finished(id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))

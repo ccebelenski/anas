@@ -18,7 +18,7 @@ import { parseZpoolFeature, parseZpoolGet } from '../parsers/zpool-get.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parsePoolBusyState, parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
 import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
-import { diskClaim, guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, poolClaims, sendRefusal, znameClaim, zpoolClaim } from '../safety/guard.js'
+import { diskClaim, guardCheck, guardConfirm, guarded, GuardRefusalError, LockClaimsUnreadableError, mountClaim, poolClaims, sendRefusal, znameClaim, zpoolClaim } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
 import { ahrSliceLabelOwner } from '../services/ahr-identity.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
@@ -477,6 +477,24 @@ function byIdPath(id: string): string {
 function firstStderrLine(stderr: string): string {
   const line = stderr.trim().split('\n')[0]
   return line ? `: ${line}` : ''
+}
+
+/**
+ * Whether a `zpool list -j` answer is one a door can act on, or a read that
+ * could not see the pool set (cr.64b2). `null` = the answer seen (an exit-0
+ * listing, or the HONEST empty — zpool's non-zero exit with its "no pools
+ * available" stderr, the shape the GET /pools empty check documents below);
+ * anything else is the sentence saying the listing could not be read, which the
+ * door refuses 503 UNAVAILABLE with. A create is never told a name is free, and
+ * a live pool never 404s, by a listing that failed to read (L22 + the cr.64c
+ * review's L: a failed list read as `[]` made a pool verb answer "not found").
+ */
+function listUnreadable(list: { exitCode: number, stdout: string, stderr: string }): string | null {
+  if (list.exitCode === 0)
+    return null
+  if (list.stdout.trim() === '' && list.stderr.trim() === 'no pools available')
+    return null
+  return `zpool list -j could not be read (exit ${list.exitCode}${firstStderrLine(list.stderr)})`
 }
 
 /**
@@ -1019,6 +1037,8 @@ export async function poolRoutes(
     composable: (reads: GuardReads, ids: string[]) => reads.once(`composable:${ids.join(' ')}`, () => composableDiskProblems(ids)),
     /** The partition pre-flight (story nf.1) — fresh at each door, like every read here. */
     partition: (reads: GuardReads, id: string) => reads.once(`partition:${id}`, () => partitionDeviceProblems(id)),
+    /** The `zpool import` scan — the name an importable guid will carry (cr.64b2-i (P)). */
+    importScan: (reads: GuardReads) => reads.once('zpool-import-scan', () => executor.exec(ZPOOL, ['import'])),
     mountpoints: (reads: GuardReads) => reads.once('pool-mountpoints', () => readPoolMountpoints(executor)),
     // cr.60 (review L26): the WHOLE table (a tmpfs or an armed automount at
     // the path is a mountpoint too — `--real` hid both), read strictly: null
@@ -1347,7 +1367,10 @@ export async function poolRoutes(
       what: `Pool '${poolName}'`,
       read: async (reads) => {
         const list = await poolReads.list(reads)
-        const pools = list.exitCode === 0 ? parseZpoolList(list.stdout) : []
+        const unreadable = listUnreadable(list)
+        if (unreadable)
+          throw new LockClaimsUnreadableError(unreadable)
+        const pools = parseZpoolList(list.stdout)
         if (!pools.some(p => p.name === poolName))
           return null
         return { name: poolName, ...(extend ? await extend(reads) : {}) } as PoolObject & X
@@ -1476,10 +1499,18 @@ export async function poolRoutes(
   /** A pool that does not exist yet: the name a create claims. */
   interface NewPool { name: string }
 
-  /** The create's name gate: no imported pool carries the name (the system is the source of truth). */
+  /**
+   * The create's name gate: no imported pool carries the name (the system is
+   * the source of truth). A listing that could not be read refuses 503 (L22) —
+   * a failed `zpool list` is never "the name is free"; only zpool's own
+   * "no pools available" empty keeps its honest-empty pass.
+   */
   const poolNameFreeGate: Gate<NewPool> = async (pool, reads) => {
     const list = await poolReads.list(reads)
-    const pools = list.exitCode === 0 ? parseZpoolList(list.stdout) : []
+    const unreadable = listUnreadable(list)
+    if (unreadable)
+      return { status: 503, code: 'UNAVAILABLE', message: `Could not verify that the name '${pool.name}' is free: ${unreadable} — refusing a create that must never be told a name is free by a read that could not see` }
+    const pools = parseZpoolList(list.stdout)
     return pools.some(p => p.name === pool.name)
       ? { status: 409, code: 'CONFLICT', message: `Pool '${pool.name}' already exists` }
       : null
@@ -1521,10 +1552,10 @@ export async function poolRoutes(
 
   /**
    * The import's guard spec (cr.36): no gate beyond the schema (§2.1), but
-   * the job holds the namespace — the name key for an import by name, the
-   * guid key for an import by guid (the key the pool carries once imported),
-   * so an import serialises with an export, destroy or create of the same
-   * pool or name.
+   * the job holds the namespace — the name key for an import by name; for an
+   * import by guid, the guid key (the key the pool carries once imported)
+   * BESIDE the name key the pool will carry, so an import serialises with an
+   * export, destroy or create of the same pool or name (cr.64b2-i (P)).
    */
   function importSpec(req: ImportPoolRequest): GuardSpec<{ target: string }> {
     const target = req.name ?? req.guid!
@@ -1545,7 +1576,27 @@ export async function poolRoutes(
         mountTargetGate<{ target: string }>(req.altroot),
         swapStageGate<{ target: string }>(req.altroot),
       ],
-      locks: async () => req.name ? [znameClaim(req.name)] : [zpoolClaim(target, 'exclusive', target)],
+      locks: async (_object, _bound, reads) => {
+        if (req.name)
+          return [znameClaim(req.name)]
+        // cr.64b2-i (P): read the NAME the guid will carry from the `zpool
+        // import` scan (the same listing GET /pools/import reads) and hold it
+        // exclusive beside the guid key — a create or an import of that name
+        // must serialise with this import. A scan with nothing parseable and a
+        // non-zero exit is a read that could not see the importable set (a
+        // pool locked by another host blocks the scan while ZFS still prints
+        // the other pools); the door refuses 503 rather than claim the guid
+        // alone. A scan that names no pool for the guid holds the guid key
+        // only — the import cannot follow a name this listing can show, and
+        // the job's re-read refuses STATE_CHANGED if one appears by its turn.
+        const scan = await poolReads.importScan(reads)
+        if (scan.exitCode !== 0 && !scan.stdout.trim())
+          throw new LockClaimsUnreadableError(`the importable pools could not be listed (zpool import: ${scan.stderr.trim() || `exit ${scan.exitCode}`}), so the name the pool with guid ${target} will carry cannot be locked against`)
+        const name = parseImportScan(scan.stdout).find(p => p.guid === target)?.name
+        return name
+          ? [zpoolClaim(target, 'exclusive', name), znameClaim(name)]
+          : [zpoolClaim(target, 'exclusive', target)]
+      },
     }
   }
 

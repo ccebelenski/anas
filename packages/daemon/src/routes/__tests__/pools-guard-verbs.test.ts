@@ -226,7 +226,11 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
         return ok(`${guid}\n`)
       if (command === ZFS && argv === 'list -H -o name,mountpoint,mounted' && zfsMountRows !== null)
         return ok(zfsMountRows)
-      const hold = command === ZPOOL ? paused.get(args[0]) : command === ZFS ? paused.get(`zfs:${args[0]}`) : undefined
+      // The one-arg `zpool import` is the ROUTE door's import scan (cr.64b2-i
+      // (P) reads the name a guid will carry before the job exists) — never a
+      // job verb to pause; `pause('import')` pauses the real `import <target>`.
+      const verbKey = command === ZPOOL && args.length === 1 && args[0] === 'import' ? 'import-scan' : args[0]
+      const hold = command === ZPOOL ? paused.get(verbKey) : command === ZFS ? paused.get(`zfs:${args[0]}`) : undefined
       if (hold)
         await hold
       return orig(command, args, opts)
@@ -518,16 +522,21 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
     assert.deepEqual(calls.filter(isMutation), [])
   })
 
-  it('import: by name the job holds the name key, by guid the guid key', async () => {
-    for (const [payload, key] of [
-      [{ name: 'oldtank' }, 'zname:oldtank'],
-      [{ guid: '9876543210987654321' }, 'zpool:9876543210987654321'],
+  it('import: by name the job holds the name key; by guid the guid key BESIDE the scanned name key (cr.64b2-i (P))', async () => {
+    for (const [payload, keys] of [
+      [{ name: 'oldtank' }, ['zname:oldtank']],
+      // The dev mock's own `zpool import` scan names oldtank for this guid
+      // (server.ts); cr.64b2-i (P) holds the scanned name key beside the guid
+      // key, so a create or import of that name serialises with the import.
+      [{ guid: '9876543210987654321' }, ['zpool:9876543210987654321', 'zname:oldtank']],
     ] as const) {
       await serve()
+      // `pause('import')` holds the real `zpool import <target>` (the one-arg
+      // route scan is excluded in the exec wrapper, cr.64b2-i (P)).
       const release = pause('import')
       const id = ((await send({ method: 'POST', url: '/v1/pools/import', payload })).json() as JobAccepted).job.id
       await until(() => calls.some(c => c.command === ZPOOL && c.args[0] === 'import' && c.args.length > 1))
-      assert.deepEqual(queue().heldLocks(), [{ key, mode: 'exclusive', holders: [id] }])
+      assert.deepEqual(queue().heldLocks(), keys.map(key => ({ key, mode: 'exclusive', holders: [id] })))
       release()
       assert.equal((await finished(id)).status, 'completed')
       await server!.close()

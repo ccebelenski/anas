@@ -2,7 +2,7 @@ import type { MountEntry, MountOptions, MountRequestOptions, MountSummary } from
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
-import type { ConfirmStore } from '../safety/confirm.js'
+import type { BoundId, ConfirmStore } from '../safety/confirm.js'
 import type { Advisory, Gate, GuardReads, GuardSpec, Refusal } from '../safety/guard.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import type { LiveAtTarget } from '../services/mount-match.js'
@@ -13,7 +13,6 @@ import { CommandTimeoutError } from '../executor/deadline.js'
 import { classifyKind, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
 import { addMount, carriesAutomount, disableMount, enableMount, getMount, hasMount, mountOptionTokens, removeMount, replaceMount } from '../parsers/fstab.js'
 import { PVE_STORAGE_CFG, readPveMountPaths, readPveTerritoryClaims, readZfsMountpoints } from '../parsers/pve-storage.js'
-import { confirmGate } from '../safety/gate.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, sendRefusal } from '../safety/guard.js'
 import { diagnoseBusyPath, enrichBusyError, formatHolders, runFuser, toolNotFound } from '../services/busy-diagnosis.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
@@ -466,14 +465,21 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
    * not, because the credentials file is named by the mountpoint; cr.39 runs
    * it in the job too, so a line added while a non-persistent create waited
    * refuses before its credentials are written over that line's.
+   *
+   * The object's identity (cr.64b2) is the fstab line the create WRITES —
+   * source + target + fstype, `identity` built from the one request — so the
+   * non-empty-mountpoint confirm binds the mount the operator is climbing the
+   * ruling over: a replay that would write another line (another share, server
+   * or target) is 409 IDENTITY_MISMATCH, and the whole request is signed so a
+   * changed body is CONFIRM_SCOPE_CHANGED naming the field.
    */
-  function createGuardSpec(mp: string): GuardSpec<MountSlot> {
+  function createGuardSpec(mp: string, identity: BoundId): GuardSpec<MountSlot> {
     return {
       operation: 'mount.create',
       object: {
         what: `Mountpoint '${mp}'`,
         read: async reads => ({ mountpoint: mp, fstabText: await mountReads.fstab(reads) }),
-        id: async () => ({ mountpoint: mp }),
+        id: async () => identity,
         unbound: () => `Could not read the mountpoint '${mp}' — refusing`,
       },
       gates: [
@@ -625,35 +631,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       return { error: { code: 'VALIDATION_ERROR', message: target.problems.join('; ') } }
     }
 
-    // Story cr.39: the mountpoint-safety gates, run here and again in the job.
-    const spec = createGuardSpec(req.mountpoint)
-    const pre = await guardCheck(spec)
-    if ('refusal' in pre)
-      return sendRefusal(reply, pre.refusal)
-
-    // Empty-dir / shadow check (L4, cr.52): §2 Mounts says "Mountpoint must be
-    // an empty dir" — a non-empty directory honest with that ruling is refused
-    // without a confirm by nothing; the CONFIRM is the explicit exception the
-    // operator climbs over, and its sentence names the ruling so the two never
-    // contradict (the panel's Proceed is the other story — cr.52 reports the
-    // panel half's needs).
-    const contents = await dirContents(req.mountpoint)
-    if (contents !== null && contents.length > 0) {
-      if (!confirmGate(confirmStore, request, reply, {
-        operation: 'mount.create',
-        params: { mountpoint: req.mountpoint },
-        message: `'${req.mountpoint}' is not empty — a mountpoint must be an empty directory (§2 Mounts), so confirming will hide the ${contents.length} item(s) already there`,
-        warnings: [
-          `'${req.mountpoint}' is not empty — the mount will hide its current contents until unmounted.`,
-        ],
-      })) {
-        return reply
-      }
-    }
-
     // The request schema already validated `extraOptions`; this re-check turns
     // any wayward value at the daemon's write door into a 400 (cr.2 — defence
-    // in depth, Principle 6) rather than a fstab line.
+    // in depth, Principle 6) rather than an fstab line. THE entry is computed
+    // up front because the create confirm binds the line this create writes
+    // (cr.64b2): the entry IS the mount's identity, source + target + fstype.
     let entry: MountEntry
     let warnings: string[]
     try {
@@ -665,6 +647,47 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         return { error: { code: 'VALIDATION_ERROR', message: `Invalid extra mount options: ${err.message}` } }
       }
       throw err
+    }
+
+    // Story cr.39: the mountpoint-safety gates, run here and again in the job.
+    const spec = createGuardSpec(req.mountpoint, { spec: entry.spec, target: entry.mountpoint, fstype: entry.fstype })
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+
+    // Empty-dir / shadow check (L4, cr.52): §2 Mounts says "Mountpoint must be
+    // an empty dir" — a non-empty directory honest with that ruling is refused
+    // without a confirm by nothing; the CONFIRM is the explicit exception the
+    // operator climbs over, and its sentence names the ruling so the two never
+    // contradict (the panel's Proceed is the other story — cr.52 reports the
+    // panel half's needs). The confirm is a guard door (cr.64b2), not the
+    // legacy hand-picked-subset gate: the code signs the line the create
+    // writes (the bound identity) and the WHOLE validated request — a replay
+    // after the line changed is 409 IDENTITY_MISMATCH, a changed body is 409
+    // CONFIRM_SCOPE_CHANGED naming the field.
+    const contents = await dirContents(req.mountpoint)
+    if (contents !== null && contents.length > 0) {
+      if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+        validated: {
+          type: req.type,
+          server: req.server,
+          remotePath: req.remotePath,
+          mountpoint: req.mountpoint,
+          persistent: req.persistent,
+          automount: req.automount,
+          mountNow: req.mountNow,
+          ...(req.options ? { options: req.options } : {}),
+          ...(req.extraOptions !== undefined ? { extraOptions: req.extraOptions } : {}),
+          ...(req.credentials ? { credentials: req.credentials } : {}),
+        },
+        address: ['mountpoint'],
+        message: `'${req.mountpoint}' is not empty — a mountpoint must be an empty directory (§2 Mounts), so confirming will hide the ${contents.length} item(s) already there`,
+        warnings: [
+          `'${req.mountpoint}' is not empty — the mount will hide its current contents until unmounted.`,
+        ],
+      })) {
+        return reply
+      }
     }
 
     const job = jobQueue.submit(

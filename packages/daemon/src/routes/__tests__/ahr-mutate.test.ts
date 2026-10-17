@@ -236,6 +236,10 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
       exitCode: 0,
     } })
     ex.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    // cr.64b2 (k): the mountpoint-collision gate reads the table STRICTLY — a
+    // readable empty table (the shape ahr-access.test.ts pins) is honestly "no
+    // mountpoint", so the create moves on.
+    ex.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
     // H6: the create name check reads mdstat, the partition labels and LVM VGs
     // at request time AND inside the job. Empty mdstat, no labels, no VGs.
     // Command-only so a test's exact-args fixture (a live mdstat, a labelled
@@ -1444,6 +1448,11 @@ describe('DELETE /v1/ahr/:name — identity doors (ident.3)', () => {
       mdadmConfPath: join(dir, 'mdadm.conf'),
       mountBase: join(dir, 'mnt'),
       intentDir,
+      // story cr.24 reference sources, from the same env overrides createServer
+      // honours (a test sets them to name a share/export/task on the pool).
+      ...(process.env.SMB_CONF_PATH ? { smbConfPath: process.env.SMB_CONF_PATH } : {}),
+      ...(process.env.ANAS_EXPORTS_PATH ? { exportsPath: process.env.ANAS_EXPORTS_PATH } : {}),
+      ...(process.env.ANAS_SYSTEMD_DIR ? { systemdDir: process.env.ANAS_SYSTEMD_DIR } : {}),
     })
     return { server: app as unknown as TestServer, jobQueue }
   }
@@ -1565,6 +1574,62 @@ describe('DELETE /v1/ahr/:name — identity doors (ident.3)', () => {
     const warnings = res.json().error.warnings as string[]
     assert.ok(!warnings.some(w => w.includes('will be unmounted')), warnings.join(' | '))
     assert.ok(warnings.includes('The pool\'s filesystem is not mounted. An /etc/fstab line for its volume \'/dev/ahr0/ahr0-vol\' is removed with the pool'), warnings.join(' | '))
+    await server.close()
+  })
+
+  it('cr.57 (f): an UNMOUNTED pool\'s CONFIGURED mountpoint is still a reference — the confirm lists the share that names it', async () => {
+    // The pool is not mounted (its topology `mountpoint` is the LV device
+    // path); its CONFIGURED mountpoint is the target of its OWN fstab line
+    // (the persistence line, `services/ahr-fstab.ts`). A share served from
+    // that configured path references the pool even though nothing is mounted
+    // now — the reference is the configuration, not the mount.
+    await writeFile(join(dir, 'fstab'), [
+      'UUID=abc / ext4 errors=remount-ro 0 1',
+      '/dev/ahr0/ahr0-vol /mnt/anas-ahr/ahr0 btrfs nofail,subvol=@data 0 0',
+      '',
+    ].join('\n'))
+    const smbConfPath = join(dir, 'smb.conf')
+    await writeFile(smbConfPath, `
+[global]
+  workgroup = WORKGROUP
+
+[media]
+  path = /mnt/anas-ahr/ahr0/media
+  read only = no
+`, 'utf-8')
+    process.env.SMB_CONF_PATH = smbConfPath
+    try {
+      const { server } = await build(ahr0World(undefined, undefined, { unmounted: true }))
+      const res = await server.inject({ method: 'DELETE', url: '/v1/ahr/ahr0', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 409, res.body)
+      const warnings = res.json().error.warnings as string[]
+      assert.ok(warnings.some(w => /SMB share 'media'/.test(w)), `an unmounted pool's CONFIGURED path is a reference the confirm lists: ${warnings.join(' | ')}`)
+      await server.close()
+    }
+    finally {
+      delete process.env.SMB_CONF_PATH
+    }
+  })
+
+  it('cr.64b2 (k): a FAILED findmnt refuses the mountpoint move 503 UNAVAILABLE — never "no collision", no job', async () => {
+    // cr.60's strict reader (`readFindmntTable`) makes the collision gate fail
+    // CLOSED on the mount table: a move must not read a dead table as "the
+    // path is free to claim".
+    const ex = ahr0World()
+    ex.prependFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: { stdout: '', stderr: 'findmnt: cannot read: permission denied', exitCode: 127 } })
+    const { server } = await build(ex)
+    const first = await server.inject({
+      method: 'PUT',
+      url: '/v1/ahr/ahr0/mountpoint',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ mountpoint: '/mnt/anas-ahr/newpool' }),
+    })
+    assert.equal(first.statusCode, 503, first.body)
+    const err = first.json() as { error: { code: string, message: string } }
+    assert.equal(err.error.code, 'UNAVAILABLE')
+    assert.match(err.error.message, /could not read the kernel mount table/)
+    assert.match(err.error.message, /already a mountpoint/)
+    assert.equal(first.headers['x-anas-confirm-code'], undefined, 'no confirm for a read that could not see')
     await server.close()
   })
 })

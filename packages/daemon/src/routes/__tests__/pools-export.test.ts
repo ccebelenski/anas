@@ -126,6 +126,27 @@ describe('export endpoint: POST /v1/pools/:name/export', () => {
     assert.equal(job.status, 'completed')
   })
 
+  it('cr.64b2 (L): a FAILED pool list answers 503 UNAVAILABLE for a pool verb — a live pool never 404s by a read that could not see', async () => {
+    server = createServer({ mock: true, logger: false })
+    // The object view reads the pool list to confirm the pool EXISTS before
+    // any gate runs; a listing that failed is not "the pool is not there"
+    // (the cr.64c review's L — the ZFS twin of the AHR 404). zpool's own
+    // "no pools available" empty stays the honest 404, not this read.
+    ;(server as unknown as { executor: MockExecutor }).executor.prependFixture({
+      command: '/usr/sbin/zpool',
+      args: ['list', '-j'],
+      result: { stdout: '', stderr: 'zpool: access denied', exitCode: 127 },
+    })
+
+    const res = await server.inject({ method: 'POST', url: '/v1/pools/testpool/export', headers: IDENTITY_HEADERS })
+
+    assert.equal(res.statusCode, 503, res.body)
+    const err = res.json() as { error: { code: string, message: string } }
+    assert.equal(err.error.code, 'UNAVAILABLE')
+    assert.match(err.error.message, /zpool list -j could not be read/)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no confirm is offered for a failed existence read')
+  })
+
   it('rejects a wrong confirm code with 409 and a fresh code', async () => {
     server = createServer({ mock: true, logger: false })
 

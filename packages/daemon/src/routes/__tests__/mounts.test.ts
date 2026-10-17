@@ -218,6 +218,80 @@ describe('mount routes (Epic 18)', () => {
       assert.equal(job.status, 'completed')
     })
 
+    it('cr.64b2: the non-empty confirm is bound to the line it writes — a replay for another share/server is 409 IDENTITY_MISMATCH', async () => {
+      const mountpoint = join(dir, 'shadowed-id')
+      await mkdir(mountpoint)
+      await writeFile(join(mountpoint, 'existing.txt'), 'data')
+      const base = JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export1', mountpoint, persistent: true })
+
+      const first = await server!.inject({ method: 'POST', url: '/v1/mounts', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: base })
+      assert.equal(first.statusCode, 409, first.body)
+      const code = first.headers['x-anas-confirm-code'] as string
+
+      // Same mountpoint, another export — the fstab line the code was minted
+      // for (source + target + fstype) no longer is the one this request writes.
+      const resend = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json', 'x-anas-confirm': code },
+        payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export2', mountpoint, persistent: true }),
+      })
+      assert.equal(resend.statusCode, 409, resend.body)
+      const err = resend.json() as { error: { code: string, message: string } }
+      assert.equal(err.error.code, 'IDENTITY_MISMATCH', resend.body)
+      assert.match(err.error.message, /is not the one that was confirmed/)
+      assert.ok(resend.headers['x-anas-confirm-code'], 'a fresh code is offered for the real mount the operator means')
+    })
+
+    it('cr.64b2: the non-empty confirm signs the whole request — a changed body field is 409 CONFIRM_SCOPE_CHANGED naming it', async () => {
+      const mountpoint = join(dir, 'shadowed-scope')
+      await mkdir(mountpoint)
+      await writeFile(join(mountpoint, 'existing.txt'), 'data')
+      const first = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export1', mountpoint, persistent: true }),
+      })
+      assert.equal(first.statusCode, 409, first.body)
+      const code = first.headers['x-anas-confirm-code'] as string
+
+      // Same line, a different persistence flag — the bound identity is
+      // unchanged, so the FIELD is named (the code is not portable to a
+      // different request, cr.32 §5.2).
+      const resend = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json', 'x-anas-confirm': code },
+        payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export1', mountpoint, persistent: false }),
+      })
+      assert.equal(resend.statusCode, 409, resend.body)
+      const err = resend.json() as { error: { code: string, changed: string[], message: string } }
+      assert.equal(err.error.code, 'CONFIRM_SCOPE_CHANGED', resend.body)
+      assert.deepEqual(err.error.changed, ['persistent'])
+    })
+
+    it('cr.64b2: the happy path resend is byte-unchanged — the mount argv stays the direct mount through /proc/self/fd/3 (cr.52r D3)', async () => {
+      const mountpoint = join(dir, 'shadowed-argv')
+      await mkdir(mountpoint)
+      await writeFile(join(mountpoint, 'existing.txt'), 'data')
+      const payload = JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export1', mountpoint, persistent: true })
+
+      const first = await server!.inject({ method: 'POST', url: '/v1/mounts', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload })
+      assert.equal(first.statusCode, 409, first.body)
+      const code = first.headers['x-anas-confirm-code'] as string
+
+      const res = await server!.inject({ method: 'POST', url: '/v1/mounts', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json', 'x-anas-confirm': code }, payload })
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const mock = (server as unknown as { executor: { calls: Array<{ command: string, args: string[], fdPaths?: (string | null)[] }> } }).executor
+      const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount')
+      assert.ok(mountCall, 'the mountNow path ran a mount argv')
+      assert.equal(mountCall!.args.at(-1), '/proc/self/fd/3', 'the direct-mount argv is byte-identical to cr.52r\'s pin')
+      assert.equal(mountCall!.fdPaths?.[0], mountpoint, 'the inherited fd resolves to the opened mountpoint directory')
+    })
+
     it('rejects a PVE-territory mountpoint (cr.52r doc ruling: the ONE 409, PVE sentence)', async () => {
       // `/mnt/pve/*` answers the shared refusal — 409 reason system-mount-target
       // with the PVE-territory sentence (this door's old pre-check answered 400).

@@ -10,8 +10,8 @@ import type { IscsiPaths } from '../services/iscsi.js'
 import { relative, resolve as resolvePath } from 'node:path'
 import { AhrCreateRequest, AhrMirrorReconcileRequest, AhrMountpointRequest, AhrParityRewriteRequest, AhrRepairRequest, isComposableDisk, PoolName } from '@anas/shared'
 import { currentLane } from '../executor/deadline.js'
-import { parseFindmnt } from '../parsers/findmnt.js'
-import { hasMount } from '../parsers/fstab.js'
+import { parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
+import { hasMount, parseFstab } from '../parsers/fstab.js'
 import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
 import { ahrnameClaim, diskClaim, guardCheck, guardConfirm, guarded, mountClaim, sendRefusal } from '../safety/guard.js'
 import { changeAhrMountpoint, createAhrPool, remountAhrPool } from '../services/ahr-create.js'
@@ -387,15 +387,40 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
   const intentDir = opts.intentDir ?? defaultAhrIntentDir()
 
   /**
+   * An AHR pool's CONFIGURED mountpoint (cr.57 (f)): the target of the pool's
+   * OWN /etc/fstab line — the persistence line whose spec is the pool's volume
+   * (`services/ahr-fstab.ts`'s `ahrFstabEntry`, the same spec destroyAhrPool
+   * matches). A reference is the CONFIGURATION, not the mount: an unmounted
+   * pool still owns its configured path — destroying it invalidates a share
+   * served from there even though nothing is mounted now. `undefined` when
+   * fstab cannot be read or names no such line: the configured path is then
+   * simply not knowable, and only the name-matched kinds stay in scope.
+   */
+  async function ahrConfiguredMountpoint(poolName: string): Promise<string | undefined> {
+    if (!fstabPath)
+      return undefined
+    const fstabText = await readConfig(fstabPath)
+    for (const entry of parseFstab(fstabText)) {
+      if (entry.spec === ahrLvPath(poolName) && entry.mountpoint.startsWith('/'))
+        return entry.mountpoint
+    }
+    return undefined
+  }
+
+  /**
    * The ONE "what references this pool" answer (story cr.24). The AHR pool owns
-   * its MOUNTED `@data` path and is matched by name for replication/snapshot/
-   * scrub references; an unmounted pool (`mountpoint` under /dev/) owns no path
-   * a reference could point at, so only the name-matched kinds are in scope.
-   * The pool's own fstab line at that path is the pool itself, never a "mount
-   * beneath this pool" (cr.31 D3).
+   * its `@data` path and is matched by name for replication/snapshot/scrub
+   * references. When the pool is UNMOUNTED the topology's `mountpoint` is its
+   * LV device path — but its CONFIGURED mountpoint (the target of its own
+   * fstab line, cr.57 (f)) is still a path its storage is served from, so it
+   * is a reference path too: an unmounted pool is never "owns no path" while
+   * its configured path exists. The pool's own fstab line at that path is the
+   * pool itself, never a "mount beneath this pool" (cr.31 D3).
    */
   async function ahrPoolReferences(pool: { name: string, mountpoint: string }) {
-    const mountedPath = pool.mountpoint.startsWith('/dev/') ? [] : [pool.mountpoint]
+    const mountedPath = pool.mountpoint.startsWith('/dev/')
+      ? [await ahrConfiguredMountpoint(pool.name)].filter((p): p is string => p !== undefined)
+      : [pool.mountpoint]
     return readPoolReferences({
       executor,
       pool: pool.name,
@@ -470,18 +495,20 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
 
   /**
    * The MOUNTPOINT-COLLISION gates (§2.6, at both doors since cr.38): `mp` is
-   * not a live mountpoint and not claimed in fstab. The live table read keeps
-   * its fail-open shape (an unreadable table finds no collision — the
-   * system-pool gate is the one that fails closed on it); the job asks again,
-   * so an fstab line added while the job waited refuses before the wipe or the
-   * unmount instead of after it.
+   * not a live mountpoint and not claimed in fstab. The live table goes
+   * through cr.60's STRICT reader (cr.64b2 (k)) — an unreadable table refuses
+   * 503 UNAVAILABLE naming the read, never "no collision" from a read that
+   * could not see (a failed findmnt must not hand the mountpoint to a create
+   * or move); the job asks again, so an fstab line added while the job waited
+   * refuses before the wipe or the unmount instead of after it.
    */
   function mountpointCollisionGates<O>(mp: string): Gate<O>[] {
     return [
       async (_o, reads) => {
-        const res = await guard.reads.findmnt(reads)
-        const mounts = res.exitCode === 0 ? parseFindmnt(res.stdout) : []
-        return mounts.some(m => m.target === mp)
+        const table = await reads.once('ahr-mount-collision', () => readFindmntTable(executor, AHR_FINDMNT_ARGS))
+        if (table === null)
+          return { status: 503, code: 'UNAVAILABLE', message: `ANAS could not read the kernel mount table (findmnt), so it cannot check whether '${mp}' is already a mountpoint — nothing was done` }
+        return parseFindmnt(table).some(m => m.target === mp)
           ? { status: 409, code: 'CONFLICT', message: `'${mp}' is already a mountpoint. Pick an unused path` }
           : null
       },

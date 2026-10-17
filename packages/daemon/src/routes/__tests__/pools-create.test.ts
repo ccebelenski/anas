@@ -295,6 +295,72 @@ describe('create pool endpoint: POST /v1/pools', () => {
     assert.equal(res.json().error.code, 'CONFLICT')
   })
 
+  it('cr.64b2 (L22): a FAILED zpool list refuses the create 503 UNAVAILABLE — never "name free", no zpool create', async () => {
+    server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
+    // A real read failure (not zpool's "no pools available" empty): the one
+    // non-`no pools available` stderr shape cr.64b2-i's honest-empty ruling
+    // reserves for the empty case only.
+    ;(server as unknown as { executor: MockExecutor }).executor.prependFixture({
+      command: '/usr/sbin/zpool',
+      args: ['list', '-j'],
+      result: { stdout: '', stderr: 'zpool: access denied', exitCode: 127 },
+    })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'newpool',
+        dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }],
+      }),
+    })
+
+    assert.equal(res.statusCode, 503, res.body)
+    const err = res.json() as { error: { code: string, message: string } }
+    assert.equal(err.error.code, 'UNAVAILABLE')
+    assert.match(err.error.message, /zpool list -j could not be read/)
+    assert.match(err.error.message, /'newpool' is free/)
+    assert.equal(createCall(calls), undefined, 'a create never runs behind a listing that could not see')
+  })
+
+  it('cr.64b2 (L22): zpool\'s own "no pools available" empty is the honest empty — the name is still free', async () => {
+    server = createServer({ mock: true, logger: false })
+    serveBlankInventoryDisks(server, ALL_DISKS)
+    ;(server as unknown as { executor: MockExecutor }).executor.prependFixture({
+      command: '/usr/sbin/zpool',
+      args: ['list', '-j'],
+      result: { stdout: '', stderr: 'no pools available', exitCode: 1 },
+    })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'newpool',
+        dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }],
+      }),
+    })
+
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed')
+    assert.deepEqual(createCall(calls), [
+      'create',
+      '-o',
+      'autoexpand=on',
+      '--',
+      'newpool',
+      'mirror',
+      '/dev/disk/by-id/d1',
+      '/dev/disk/by-id/d2',
+    ])
+  })
+
   it('returns 400 for a request with too few disks', async () => {
     server = createServer({ mock: true, logger: false })
     serveBlankInventoryDisks(server, ALL_DISKS)
