@@ -3,7 +3,7 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { Gate, GuardSpec } from '../safety/guard.js'
-import { AhrScrubToggleRequest, PoolName, pveStoragePath, ScrubToggleRequest } from '@anas/shared'
+import { AhrScrubToggleRequest, PoolName, ScrubToggleRequest } from '@anas/shared'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseScrubScans } from '../parsers/zpool-status.js'
@@ -11,7 +11,6 @@ import { ahrPoolClaims, guardCheck, guarded, poolClaims, sendRefusal } from '../
 import { readPoolGuid } from '../safety/stable-id.js'
 import { poolArrayUuids } from '../services/ahr-guard.js'
 import { AhrTopologyUnreadableError, readAhrPools } from '../services/ahr-topology.js'
-import { loadPveFootprint } from '../services/pve-footprint.js'
 import { ForeignUnitError, scrubUnitsAreForeign } from '../services/scrub-schedule-units.js'
 import {
   ahrScrubRunning,
@@ -147,33 +146,13 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
     }
   }
 
-  /**
-   * The PVE-territory gate (cr.64b2-ii, WAVE3-DESIGN §4.2): a pool PVE
-   * manages answers 409 PVE_MANAGED, no confirm bypass — the one answer every
-   * pool-level verb gives ("PVE territory is read-only and hands-off"). Built
-   * LOCALLY here from the same fact source (`loadPveFootprint`, the one
-   * ownership answer, memoised per guard run) as the pool verbs' own gate;
-   * pools.ts is another story's file, so the twin lives here and quotes the
-   * footprint directly. The verdict tightening on an unreadable storage.cfg is
-   * the footprint's own rule (missing facts may only tighten).
-   */
-  function pveManagedGate(pool: string): Gate<{ name: string }> {
-    return async (_object, reads) => {
-      const pve = await reads.once('pve-footprint', () => loadPveFootprint(executor))
-      const storagePaths = (pve.storagesByPool.get(pool) ?? [])
-        .map(ref => pveStoragePath(ref, pool))
-        .filter((path): path is string => path !== undefined)
-      const owned = pve.ownershipOf(pool) ?? pve.ownedDescendant(storagePaths, pool)?.ownership ?? null
-      if (!owned)
-        return null
-      return {
-        status: 409,
-        code: 'PVE_MANAGED',
-        reason: 'pve-managed',
-        message: `Pool '${pool}' is PVE territory: ${owned.reason}. Running the periodic scrub of a pool PVE uses is left to PVE. This refusal has no confirm bypass.`,
-      }
-    }
-  }
+  // The periodic-scrub toggle takes NO PVE-territory gate (cr.64b2-ii review,
+  // DeepSeek 2026-10-17, probe q3a): the pools.ts scrub verb on a PVE-managed
+  // pool answers 202 (a scrub is maintenance PVE does not do for us), and the
+  // toggle shipped without one before cr.64b2-ii; the gate the first cut added
+  // refused both PVE shapes and broke parity with its own verb. Whether a
+  // `zfs set` of the pool's periodic-scrub property on a PVE pool should be
+  // hands-off is an operator ruling, recorded on the EPICS line, not a door.
 
   /**
    * The ZFS toggle as a guard door (cr.64b2-ii, review L22 — it used to take
@@ -199,7 +178,7 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
         notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `ZFS pool '${pool}' not found` }),
         unbound: () => `Could not read the guid of pool '${pool}' — refusing a periodic-scrub toggle that cannot be bound to it`,
       },
-      gates: [pveManagedGate(pool)],
+      gates: [],
       locks: async (_o, bound) => poolClaims(pool, bound.id.guid, 'shared'),
     }
   }
@@ -227,7 +206,7 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
         notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `AHR pool '${pool}' not found` }),
         unbound: () => `Could not read the identity of AHR pool '${pool}' — refusing a periodic-scrub toggle that cannot be bound to it`,
       },
-      gates: [pveManagedGate(pool)],
+      gates: [],
       locks: async (p, bound) => ahrPoolClaims(pool, bound.id.vgUuid ?? p.vg.uuid ?? null, 'shared'),
     }
   }

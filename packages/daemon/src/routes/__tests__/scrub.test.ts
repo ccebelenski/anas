@@ -301,9 +301,10 @@ describe('periodic scrub routes — ZFS property (Epic 17.5)', () => {
     assert.ok(!mock.calls.some(c => c.command === ZFS && c.args[0] === 'set'), 'zfs set never ran')
   })
 
-  it('cr.64b2-ii (L22): a pool PVE\'s storage.cfg uses → 409 PVE_MANAGED at the door, no job, zfs set never runs', async () => {
-    // The same hands-off answer every pool-level verb gives ("PVE territory is
-    // read-only and hands-off"), with no confirm bypass.
+  it('cr.64b2-ii review (q3a): a pool PVE\'s storage.cfg uses is toggled like the pools.ts scrub verb scrubs it — 202, the zfs set runs (no PVE gate on the toggle)', async () => {
+    // Parity with POST /v1/pools/:name/scrub, which answers 202 on a
+    // PVE-managed pool (a scrub is maintenance PVE does not do for us): the
+    // first cut's PVE gate refused both shapes and was dropped.
     const dir = await mkdtemp(join(tmpdir(), 'anas-scrub-pvegate-'))
     const cfg = join(dir, 'storage.cfg')
     const saved = process.env.ANAS_STORAGE_CFG
@@ -312,10 +313,10 @@ describe('periodic scrub routes — ZFS property (Epic 17.5)', () => {
       process.env.ANAS_STORAGE_CFG = cfg
       mockOf(server).calls.length = 0
       const res = await server.inject({ method: 'PUT', url: '/v1/scrub/zfs/tank', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: false }) })
-      assert.equal(res.statusCode, 409, res.body)
-      assert.equal((res.json() as { error: { code: string } }).error.code, 'PVE_MANAGED')
-      assert.match((res.json() as { error: { message: string } }).error.message, /no confirm bypass/)
-      assert.ok(!mockOf(server).calls.some(c => c.command === ZFS && c.args[0] === 'set'), 'zfs set never ran')
+      assert.equal(res.statusCode, 202, res.body)
+      const done = await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
+      assert.equal(done.status, 'completed', JSON.stringify(done.error))
+      assert.ok(mockOf(server).calls.some(c => c.command === ZFS && c.args[0] === 'set' && c.args.includes('tank')), 'the zfs set ran')
     }
     finally {
       if (saved === undefined)
