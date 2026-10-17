@@ -1,7 +1,7 @@
 import type { AhrPool, SnapshotSchedule } from '@anas/shared'
 import type { SelfServiceTarget } from '../share-selfservice.js'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -323,37 +323,81 @@ describe('ensureAhrSnapshotsMount — ONE fstab line, mounted once (smbsvc.1)', 
   let dir: string
   let fstabPath: string
 
+  let savedBase: string | undefined
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-ss-fstab-'))
     fstabPath = join(dir, 'fstab')
     await writeFile(fstabPath, '# anas test fstab\n', 'utf8')
+    // cr.52s-a: the mount runs through a directory the daemon OPENS (fd pin),
+    // so the snapshots base is a real directory under the tempdir — the mkdir
+    // itself is a mocked command, so the test makes the directory.
+    savedBase = process.env.ANAS_AHR_SNAPSHOTS_MOUNT_BASE
+    process.env.ANAS_AHR_SNAPSHOTS_MOUNT_BASE = join(dir, 'snaps')
   })
   afterEach(async () => {
+    if (savedBase === undefined)
+      delete process.env.ANAS_AHR_SNAPSHOTS_MOUNT_BASE
+    else
+      process.env.ANAS_AHR_SNAPSHOTS_MOUNT_BASE = savedBase
     await rm(dir, { recursive: true, force: true })
   })
 
-  it('writes the read-only @snapshots line, makes the mountpoint dir, and mounts it now', async () => {
+  it('writes the read-only @snapshots line, makes the mountpoint dir, and mounts it now — through the opened directory (cr.52s-a P3)', async () => {
+    const mp = ahrSnapshotsMountpoint('tank')
+    await mkdir(mp, { recursive: true })
     const mock = new MockExecutor()
-    mock.addFixture({ command: FINDMNT, args: ['-n', '-o', 'TARGET', ahrSnapshotsMountpoint('tank')], result: { stdout: '', stderr: '', exitCode: 1 } })
+    mock.addFixture({ command: FINDMNT, args: ['-n', '-o', 'TARGET', mp], result: { stdout: '', stderr: '', exitCode: 1 } })
     mock.addFixture({ command: '/usr/bin/mkdir', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/mount', result: { stdout: '', stderr: '', exitCode: 0 } })
     await ensureAhrSnapshotsMount(mock, fstabPath, 'tank')
     const fstab = await readFile(fstabPath, 'utf8')
-    const line = fstab.split('\n').find(l => l.includes('anas-ahr-snapshots/tank'))
+    const line = fstab.split('\n').find(l => l.includes(mp))
     assert.ok(line, 'the @snapshots mount line exists')
-    assert.match(line!, /^\/dev\/tank\/tank-vol\s+\/mnt\/anas-ahr-snapshots\/tank\s+btrfs\s+ro,nofail,subvol=@snapshots\s+0 0$/)
+    assert.equal(line, `/dev/tank/tank-vol ${mp} btrfs ro,nofail,subvol=@snapshots 0 0`)
     // The mountpoint directory was made (mount does not create it — the live
     // proof caught the silent failure this was) and the mount happened NOW,
-    // via the fstab entry.
-    assert.deepEqual(mock.calls.find(c => c.command === '/usr/bin/mkdir'), { command: '/usr/bin/mkdir', args: ['-p', ahrSnapshotsMountpoint('tank')] })
-    const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount')
-    assert.deepEqual(mountCall, { command: '/usr/bin/mount', args: [ahrSnapshotsMountpoint('tank')] })
+    // DIRECTLY from the line through the daemon-opened directory (cr.52s-a:
+    // `mount <mountpoint>` resolved the path string instead).
+    assert.deepEqual(mock.calls.find(c => c.command === '/usr/bin/mkdir'), { command: '/usr/bin/mkdir', args: ['-p', mp] })
+    const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount')!
+    assert.deepEqual(mountCall.args, ['-c', '-t', 'btrfs', '-o', 'ro,nofail,subvol=@snapshots', '--', '/dev/tank/tank-vol', '/proc/self/fd/3'])
+    assert.deepEqual(mountCall.fdPaths, [mp])
+  })
+
+  it('an EXISTING line is mounted as stored (an operator\'s edit of it is the configuration)', async () => {
+    const mp = ahrSnapshotsMountpoint('tank')
+    await mkdir(mp, { recursive: true })
+    await writeFile(fstabPath, `/dev/tank/tank-vol ${mp} btrfs ro,noatime,nofail,subvol=@snapshots 0 0\n`)
+    const mock = new MockExecutor()
+    mock.addFixture({ command: FINDMNT, args: ['-n', '-o', 'TARGET', mp], result: { stdout: '', stderr: '', exitCode: 1 } })
+    mock.addFixture({ command: '/usr/bin/mkdir', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/mount', result: { stdout: '', stderr: '', exitCode: 0 } })
+    await ensureAhrSnapshotsMount(mock, fstabPath, 'tank')
+    const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount')!
+    assert.equal(mountCall.args[mountCall.args.indexOf('-o') + 1], 'ro,noatime,nofail,subvol=@snapshots')
+  })
+
+  it('a mountpoint that is a SYMLINK when the mount runs fails with the sentence — nothing mounted through it', async () => {
+    const mp = ahrSnapshotsMountpoint('tank')
+    await mkdir(join(dir, 'snaps'), { recursive: true })
+    await symlink(join(dir, 'elsewhere'), mp)
+    await mkdir(join(dir, 'elsewhere'))
+    const mock = new MockExecutor()
+    mock.addFixture({ command: FINDMNT, args: ['-n', '-o', 'TARGET', mp], result: { stdout: '', stderr: '', exitCode: 1 } })
+    mock.addFixture({ command: '/usr/bin/mkdir', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/mount', result: { stdout: '', stderr: '', exitCode: 0 } })
+    await assert.rejects(
+      ensureAhrSnapshotsMount(mock, fstabPath, 'tank'),
+      (err: Error) => err.message.includes(`'${mp}' failed to mount`) && err.message.includes('symlink'),
+    )
+    assert.ok(!mock.calls.some(c => c.command === '/usr/bin/mount'), 'no mount argv')
   })
 
   it('a FAILED mount fails loudly with the sentence (never a completed job over a missing mount)', async () => {
     // The live-proof finding: `mount` says "mount point does not exist" and the
     // old code completed the job anyway — the feature enabled against a snapdir
     // that was never mounted. The mount's stderr must surface.
+    await mkdir(ahrSnapshotsMountpoint('tank'), { recursive: true })
     const mock = new MockExecutor()
     mock.addFixture({ command: FINDMNT, args: ['-n', '-o', 'TARGET', ahrSnapshotsMountpoint('tank')], result: { stdout: '', stderr: '', exitCode: 1 } })
     mock.addFixture({ command: '/usr/bin/mkdir', result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -371,7 +415,7 @@ describe('ensureAhrSnapshotsMount — ONE fstab line, mounted once (smbsvc.1)', 
     await ensureAhrSnapshotsMount(mock, fstabPath, 'tank')
     // The line is added; findmnt says it is mounted → no mount command.
     const once = await readFile(fstabPath, 'utf8')
-    assert.match(once, /anas-ahr-snapshots\/tank/)
+    assert.ok(once.includes(ahrSnapshotsMountpoint('tank')), once)
     assert.equal(mock.calls.filter(c => c.command === '/usr/bin/mount').length, 0)
 
     await ensureAhrSnapshotsMount(mock, fstabPath, 'tank')
@@ -386,6 +430,6 @@ describe('ensureAhrSnapshotsMount — ONE fstab line, mounted once (smbsvc.1)', 
     mock.addFixture({ command: FINDMNT, result: { stdout: `${ahrSnapshotsMountpoint('tank')}\n`, stderr: '', exitCode: 0 } })
     await ensureAhrSnapshotsMount(mock, fstabPath, 'tank')
     const after = await readFile(fstabPath, 'utf8')
-    assert.match(after, /anas-ahr-snapshots\/tank/)
+    assert.ok(after.includes(ahrSnapshotsMountpoint('tank')), after)
   })
 })

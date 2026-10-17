@@ -1,5 +1,6 @@
 import type { MountEntry } from '@anas/shared'
-import { mountOptionTokens } from '../parsers/fstab.js'
+import { readFile } from 'node:fs/promises'
+import { mountOptionTokens, parseFstab } from '../parsers/fstab.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { mountThroughOpenedDir } from './mounts.js'
 
@@ -46,10 +47,11 @@ export const AHR_ISCSI_DEVICE_TIMEOUT_OPTION = 'x-systemd.device-timeout=45s'
  * that silently is not, without letting a pool that will never assemble stall
  * the boot for the full 90 s default.
  *
- * cr.52r D3: this entry is ALSO what the daemon mounts DIRECTLY (through an
- * opened directory, `mountThroughOpenedDir`) when a verb re-mounts a pool — the
- * remount, a snapshot rollback's remount and the boot re-attach mount the pool's
- * own configured line, never an invented mount.
+ * cr.52s-a: this is the line ANAS WRITES (pool create, or a move of a pool
+ * that had no line). A verb that re-mounts a pool (the remount, a snapshot
+ * rollback's remount, the boot re-attach, a move) mounts the pool's line AS
+ * STORED instead (`mountAhrPool`'s `line`) — these defaults stand in only for a
+ * pool with no line, and the caller says so.
  */
 export function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: boolean): MountEntry {
   return {
@@ -79,22 +81,79 @@ export function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: bo
   }
 }
 
+/** The fstab the daemon was configured with when a caller has no path to hand (the server's own default). */
+export function defaultAhrFstabPath(): string {
+  return process.env.ANAS_FSTAB_PATH ?? '/etc/fstab'
+}
+
 /**
- * Mount a pool DIRECTLY from its configured fstab entry (cr.52r D3), through a
- * directory the daemon itself opened — the kernel resolves `/proc/self/fd/3` to
- * exactly the directory, so a parent swapped after the open cannot redirect the
- * mount. The spec and options are the pool's own line re-serialized
- * (`mountOptionTokens`), so the daemon never invents a mount: it re-runs the
- * one the node has. Rejects when the caller's job gate did not refuse first but
- * the directory is missing/broken at argv time. Throws on a failed mount.
+ * The pool's OWN fstab line as stored, three-valued (cr.52s-a): `line` — the
+ * active line whose spec is the pool's LV path; `none` — the file was read and
+ * carries no such active line; `unreadable` — the file could not be read, which
+ * is never reported as "no line" (a read that could not see never answers
+ * "nothing there").
+ */
+export type AhrPoolLine
+  = | { kind: 'line', entry: MountEntry }
+    | { kind: 'none' }
+    | { kind: 'unreadable', detail: string }
+
+export async function readAhrPoolLine(fstabPath: string, name: string): Promise<AhrPoolLine> {
+  let text: string
+  try {
+    text = await readFile(fstabPath, 'utf8')
+  }
+  catch (err) {
+    return { kind: 'unreadable', detail: err instanceof Error ? err.message : String(err) }
+  }
+  const spec = ahrLvPath(name)
+  const entry = parseFstab(text).find(e => e.spec === spec && !e.disabled)
+  return entry ? { kind: 'line', entry } : { kind: 'none' }
+}
+
+/**
+ * Mount a pool DIRECTLY (cr.52r D3), through a directory the daemon itself
+ * opened — the kernel resolves `/proc/self/fd/3` to exactly the directory, so a
+ * parent swapped after the open cannot redirect the mount — at `pool.mountpoint`
+ * (the path the caller's gate checked).
+ *
+ * The spec, type and options are the pool's OWN fstab line AS STORED
+ * (`mountOptionTokens(line)`, cr.52s-a review defect 6): the operator's
+ * `noatime`, `compress=`, … ride the argv exactly as the line carries them, the
+ * way `mount -- <lv>` took them from fstab before cr.52r. `ahrFstabEntry` (ANAS's
+ * defaults) is used ONLY when the pool has no line (`line === null`) — the
+ * caller says so in its progress/log. Throws on a failed mount (and when the
+ * directory is missing/broken at argv time).
  */
 export async function mountAhrPool(
   executor: Parameters<typeof mountThroughOpenedDir>[0],
   pool: { name: string, mountpoint: string, subvolLayout: boolean },
+  line: MountEntry | null,
 ): Promise<void> {
-  const entry = ahrFstabEntry(pool.name, pool.mountpoint, pool.subvolLayout)
+  const entry = line ?? ahrFstabEntry(pool.name, pool.mountpoint, pool.subvolLayout)
   const args = ['-c', '-t', entry.fstype, '-o', mountOptionTokens(entry), '--', entry.spec]
   const r = await mountThroughOpenedDir(executor, pool.mountpoint, args)
   if (r.exitCode !== 0)
     throw new Error(r.stderr.trim() || `mount exited ${r.exitCode}`)
+}
+
+/**
+ * Read the pool's line for a verb that UNMOUNTS and then re-mounts it (the
+ * remount, the snapshot rollback): call BEFORE the unmount, so an unreadable
+ * fstab refuses while nothing has been done. Returns the stored line, or null
+ * (no line: ANAS's defaults) after saying so through `say`.
+ */
+export async function ahrPoolLineForRemount(
+  fstabPath: string,
+  name: string,
+  say: (message: string) => void,
+): Promise<MountEntry | null> {
+  const line = await readAhrPoolLine(fstabPath, name)
+  if (line.kind === 'unreadable')
+    throw new Error(`could not read ${fstabPath} for pool '${name}''s own mount line (${line.detail}) — nothing was unmounted`)
+  if (line.kind === 'none') {
+    say(`Pool '${name}' has no line in ${fstabPath} — re-mounting with ANAS's default options`)
+    return null
+  }
+  return line.entry
 }

@@ -1,22 +1,20 @@
-import type { AhrPool, MountEntry } from '@anas/shared'
+import type { AhrPool } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { LvmPv } from '../parsers/lvm-report.js'
 import type { GuardSpec } from '../safety/guard.js'
 import type { NamedMdArray } from './ahr-identity.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
-import { readFile } from 'node:fs/promises'
-import { mountOptionTokens, parseFstab } from '../parsers/fstab.js'
+import { mountOptionTokens } from '../parsers/fstab.js'
 import { parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { guardCheck, guarded, GuardRefusalError } from '../safety/guard.js'
 import { IdentityMismatchError } from '../safety/stable-id.js'
 import { cachedVgNames, notifyCacheRecoveryFailed, recoverFailedAhrCache } from './ahr-cache.js'
 import { resumeExpansion } from './ahr-expand-resume.js'
-import { mountAhrPool } from './ahr-fstab.js'
+import { defaultAhrFstabPath, mountAhrPool, readAhrPoolLine } from './ahr-fstab.js'
 import { ahrGuard } from './ahr-guard.js'
 import { isIntentStale, isOwnedArray, normalizeMdUuid, pinnedUuids, poolPvNames, readAhrPoolIdentity, readMdadmConfDoc, readNamedMdArrays } from './ahr-identity.js'
 import { defaultAhrIntentDir, listIntents, writeIntent } from './ahr-intent.js'
-import { ahrLvPath } from './ahr-paths.js'
 import { isSubvolLayoutMount } from './ahr-snapshots.js'
 import { AhrTopologyUnreadableError, readAhrPools } from './ahr-topology.js'
 import { mountTargetRefusal } from './mounts.js'
@@ -143,30 +141,6 @@ function haltBody(pool: string, reason?: string): string {
   return reason
     ? `${base} ANAS tried to re-attach automatically after the restart but could not proceed: ${reason}`
     : base
-}
-
-/** The fstab the daemon was configured with (mirrors the pve mounts door's default). */
-function defaultFstabPath(): string {
-  return process.env.ANAS_FSTAB_PATH ?? '/etc/fstab'
-}
-
-/**
- * The pool's OWN fstab entry — the line ANAS wrote at creation, and therefore
- * the real configured mountpoint of a pool that is DOWN (when its topology
- * mountpoint reads as the LV device path). Null when the file is unreadable or
- * carries no line for the pool — the rung must then leave the pool alone
- * rather than invent a mount.
- */
-async function ahrPoolFstabEntry(fstabPath: string, name: string): Promise<MountEntry | null> {
-  let text: string
-  try {
-    text = await readFile(fstabPath, 'utf8')
-  }
-  catch {
-    return null
-  }
-  const spec = ahrLvPath(name)
-  return parseFstab(text).find(e => e.spec === spec) ?? null
 }
 
 /** One daemon-start pass over md state + the intent store. */
@@ -391,23 +365,56 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
           // directly, so the kernel neither pivots a device-path lookup nor mounts
           // at a place the gate never checked. No line: never invent a mount —
           // log and leave the pool for the operator.
-          const fstabPath = opts.fstabPath ?? defaultFstabPath()
-          const entry = await ahrPoolFstabEntry(fstabPath, target.name)
-          if (!entry) {
+          //
+          // cr.52s-a (review defect 7): EVERY outcome of this mount step is
+          // logged and kept here — nothing it does throws into the
+          // cache-recover catch below. By now the cache WAS dropped (uncache +
+          // removemissing succeeded), so the recovery is reported as done; a
+          // pool left unmounted gets its own notice naming the mount step,
+          // never "could not drop the cache". And an fstab that could not be
+          // READ is said so (P1), never reported as "no line".
+          const fstabPath = opts.fstabPath ?? defaultAhrFstabPath()
+          const line = await readAhrPoolLine(fstabPath, target.name)
+          const leftUnmounted = async (why: string): Promise<void> => {
+            await pveNotify(
+              executor,
+              'warning',
+              `AHR pool not re-mounted: ${target.name}`,
+              `ANAS dropped pool '${target.name}''s failed read cache at start-up (the pool now runs uncached), but did not mount the pool: ${why} `
+              + `The pool's data is intact; it serves nothing until it is mounted — check its line in ${fstabPath} and mount it from the Hybrid RAID view.`,
+            )
+          }
+          if (line.kind === 'unreadable') {
+            log(`ahr.boot pool=${target.name} rung=mount result=skipped fstab=unreadable read=${line.detail}`)
+            await leftUnmounted(`${fstabPath} could not be read (${line.detail}), so the pool's configured mountpoint is unknown.`)
+          }
+          else if (line.kind === 'none') {
             log(`ahr.boot pool=${target.name} rung=mount result=no-fstab-entry`)
+            await leftUnmounted(`${fstabPath} has no active line for the pool, and ANAS never invents a mount.`)
           }
           else {
+            const entry = line.entry
             const refusal = await mountTargetRefusal(entry.mountpoint)
             if (refusal) {
               log(`ahr.boot pool=${target.name} rung=mount result=refused detail=${refusal.message}`)
+              await leftUnmounted(`${refusal.message}.`)
             }
             else {
-              await mountAhrPool(executor, {
-                name: target.name,
-                mountpoint: entry.mountpoint,
-                subvolLayout: isSubvolLayoutMount(mountOptionTokens(entry)),
-              })
-              log(`ahr.boot pool=${target.name} rung=mount result=ok`)
+              try {
+                // cr.52s-a: the line AS STORED rides the argv (its spec, type and
+                // every option the operator gave it), never ANAS's rebuilt defaults.
+                await mountAhrPool(executor, {
+                  name: target.name,
+                  mountpoint: entry.mountpoint,
+                  subvolLayout: isSubvolLayoutMount(mountOptionTokens(entry)),
+                }, entry)
+                log(`ahr.boot pool=${target.name} rung=mount result=ok`)
+              }
+              catch (err) {
+                const detail = err instanceof Error ? err.message : String(err)
+                log(`ahr.boot pool=${target.name} rung=mount result=failed detail=${detail}`)
+                await leftUnmounted(`mounting it at '${entry.mountpoint}' failed: ${detail}.`)
+              }
             }
           }
         }

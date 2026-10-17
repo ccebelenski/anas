@@ -739,7 +739,7 @@ const MOUNT_BIN = '/usr/bin/mount'
 function wrapAhrFindmnt(mock: MockExecutor, opts: { subvol?: string } = {}): void {
   const subvol = opts.subvol ?? 'subvolid=256,subvol=/@data'
   const orig = mock.exec.bind(mock)
-  mock.exec = async (command: string, args: string[]) => {
+  mock.exec = async (command: string, args: string[], opts?: Parameters<MockExecutor['exec']>[2]) => {
     if (command === '/usr/bin/findmnt' && args[0] === '--json' && args[1] === '--real') {
       return { stdout: JSON.stringify({ filesystems: [{
         target: '/',
@@ -753,7 +753,8 @@ function wrapAhrFindmnt(mock: MockExecutor, opts: { subvol?: string } = {}): voi
         options: `rw,relatime,space_cache=v2,${subvol}`,
       }] }), stderr: '', exitCode: 0 }
     }
-    return orig(command, args)
+    // The options ride through (cr.52s-a: a mount's inherited fd is recorded from them).
+    return orig(command, args, opts)
   }
 }
 
@@ -763,7 +764,9 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
   let confPath: string | undefined
   let fstabPath: string | undefined
   let schedDir: string | undefined
-  let savedEnv: { systemd?: string, fstab?: string } = {}
+  let savedEnv: { systemd?: string, fstab?: string, snapBase?: string } = {}
+  /** The pool's `@snapshots` mountpoint — a REAL directory under the tempdir (cr.52s-a: the mount opens it). */
+  let snapMp = ''
 
   const ZFS_SHARE_CONF = [
     '[global]',
@@ -816,9 +819,14 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
         '',
       ].join('\n'), 'utf8')
     }
-    savedEnv = { systemd: process.env.ANAS_SYSTEMD_DIR, fstab: process.env.ANAS_FSTAB_PATH }
+    savedEnv = { systemd: process.env.ANAS_SYSTEMD_DIR, fstab: process.env.ANAS_FSTAB_PATH, snapBase: process.env.ANAS_AHR_SNAPSHOTS_MOUNT_BASE }
     process.env.ANAS_SYSTEMD_DIR = schedDir
     process.env.ANAS_FSTAB_PATH = fstabPath
+    // cr.52s-a (review P3): the `@snapshots` mount runs through a directory the
+    // daemon OPENS, so its base is a real tempdir (the mkdir is a mocked command).
+    process.env.ANAS_AHR_SNAPSHOTS_MOUNT_BASE = join(dir, 'snaps')
+    snapMp = join(dir, 'snaps', 'ahr0')
+    mkdirSync(snapMp, { recursive: true })
     confPath = join(dir, 'smb.conf')
     writeFileSync(confPath, conf, 'utf8')
     server = createServer({ mock: true, logger: false, smbConfPath: confPath })
@@ -834,7 +842,7 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
     mock.addFixture({ command: TESTPARM, result: { stdout: 'Loaded services file OK.', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
     // The AHR `@snapshots` mount probe (not mounted yet → dir + mount run).
-    mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'TARGET', '/mnt/anas-ahr-snapshots/ahr0'], result: { stdout: '', stderr: '', exitCode: 1 } })
+    mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'TARGET', snapMp], result: { stdout: '', stderr: '', exitCode: 1 } })
     mock.addFixture({ command: '/usr/bin/mkdir', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: MOUNT_BIN, result: { stdout: '', stderr: '', exitCode: 0 } })
     if (opts.ahr)
@@ -853,6 +861,10 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
       delete process.env.ANAS_FSTAB_PATH
     else
       process.env.ANAS_FSTAB_PATH = savedEnv.fstab
+    if (savedEnv.snapBase === undefined)
+      delete process.env.ANAS_AHR_SNAPSHOTS_MOUNT_BASE
+    else
+      process.env.ANAS_AHR_SNAPSHOTS_MOUNT_BASE = savedEnv.snapBase
     savedEnv = {}
     if (dir) {
       rmSync(dir, { recursive: true, force: true })
@@ -949,14 +961,15 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
     const written = readFileSync(confPath!, 'utf8')
     const stanza = written.slice(written.indexOf('[media]'))
     assert.ok(stanza.includes('\tvfs objects = shadow_copy2\n'), written)
-    assert.ok(stanza.includes('\tshadow:snapdir = /mnt/anas-ahr-snapshots/ahr0\n'), written)
+    assert.ok(stanza.includes(`\tshadow:snapdir = ${snapMp}\n`), written)
     assert.ok(stanza.includes('\tshadow:snapdirseverywhere = no\n'), written)
     // The ONE fstab line, read-only, nofail, subvol=@snapshots — and the mount NOW.
     const fstab = readFileSync(fstabPath!, 'utf8')
-    assert.equal(fstab.split('\n').filter(l => l.includes('/mnt/anas-ahr-snapshots/ahr0')).length, 1, fstab)
-    assert.match(fstab, /^\/dev\/ahr0\/ahr0-vol\s+\/mnt\/anas-ahr-snapshots\/ahr0\s+btrfs\s+ro,nofail,subvol=@snapshots\s+0 0$/m)
-    assert.ok((s as unknown as { executor: MockExecutor }).executor.calls
-      .some(c => c.command === MOUNT_BIN && c.args[0] === '/mnt/anas-ahr-snapshots/ahr0'))
+    assert.equal(fstab.split('\n').filter(l => l.includes(snapMp)).length, 1, fstab)
+    assert.ok(fstab.split('\n').includes(`/dev/ahr0/ahr0-vol ${snapMp} btrfs ro,nofail,subvol=@snapshots 0 0`), fstab)
+    // cr.52s-a (review P3): mounted DIRECTLY from the line through the opened directory.
+    const snapMount = (s as unknown as { executor: MockExecutor }).executor.calls.find(c => c.command === MOUNT_BIN && c.fdPaths?.[0] === snapMp)
+    assert.deepEqual(snapMount?.args, ['-c', '-t', 'btrfs', '-o', 'ro,nofail,subvol=@snapshots', '--', '/dev/ahr0/ahr0-vol', '/proc/self/fd/3'])
   })
 
   it('a second enable on the same AHR pool writes NO second fstab line and does not mount again', async () => {
@@ -969,10 +982,10 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
     }
     const fstab = readFileSync(fstabPath!, 'utf8')
-    assert.equal(fstab.split('\n').filter(l => l.includes('/mnt/anas-ahr-snapshots/ahr0')).length, 1, fstab)
+    assert.equal(fstab.split('\n').filter(l => l.includes(snapMp)).length, 1, fstab)
     const mock = (s as unknown as { executor: MockExecutor }).executor
     // The probe fixture answers "not mounted" (exit 1) — matched twice max.
-    const mountCalls = mock.calls.filter(c => c.command === MOUNT_BIN && c.args[0] === '/mnt/anas-ahr-snapshots/ahr0')
+    const mountCalls = mock.calls.filter(c => c.command === MOUNT_BIN && c.fdPaths?.[0] === snapMp)
     assert.ok(mountCalls.length >= 1, 'the first enable mounts the snapshots subvolume')
     assert.ok(mountCalls.length <= 2, 'no mount storm on repeat enables')
   })

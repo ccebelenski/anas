@@ -1,4 +1,4 @@
-import type { AhrType } from '@anas/shared'
+import type { AhrType, MountEntry } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { MdadmArrayPin } from '../parsers/mdadm-conf.js'
 import type { AhrBandSlice } from './ahr-geometry.js'
@@ -12,7 +12,7 @@ import { ROLLED_BACK_MARKER } from './ahr-create-status.js'
 import { destroyAhrPool } from './ahr-destroy.js'
 import { requireComposableNow } from './ahr-disk-recheck.js'
 import { LVM_MIXED_BLOCK_ARGS, run, UPDATE_INITRAMFS_BUDGET_MS } from './ahr-exec.js'
-import { AHR_ISCSI_DEVICE_TIMEOUT_OPTION, AHR_ISCSI_ORDERING_OPTION, ahrFstabEntry, mountAhrPool } from './ahr-fstab.js'
+import { AHR_ISCSI_DEVICE_TIMEOUT_OPTION, AHR_ISCSI_ORDERING_OPTION, ahrFstabEntry, ahrPoolLineForRemount, defaultAhrFstabPath, mountAhrPool } from './ahr-fstab.js'
 import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
 import { ahrNameOccupancy } from './ahr-identity.js'
 import { clearIntent } from './ahr-intent.js'
@@ -422,16 +422,17 @@ async function executeCreate(
 
   // --- Mountpoint + fstab persistence + mount (subvol=@data) -------------------
   updateProgress(`Mounting at ${mountpoint}`)
+  const written = ahrFstabEntry(name, mountpoint, true)
   await editConfig(opts.fstabPath, (current) => {
     if (hasMount(current, mountpoint))
       throw new Error(`Mount '${mountpoint}' is already in /etc/fstab`)
-    return addMount(current, ahrFstabEntry(name, mountpoint, true))
+    return addMount(current, written)
   })
   await run(executor, SYSTEMCTL, ['daemon-reload'])
   // cr.52r D3: the pool mounts DIRECTLY from the entry just written, through
   // the daemon-opened directory (the fd pins the mount; `-c` keeps the kernel
   // target as `/proc/self/fd/3`).
-  await mountAhrPool(executor, { name, mountpoint, subvolLayout: true })
+  await mountAhrPool(executor, { name, mountpoint, subvolLayout: true }, written)
 
   // Initial resync is NOT awaited — the pool is usable now; the read layer
   // shows the build progress as `resyncing`.
@@ -571,9 +572,13 @@ export async function createAhrPool(
  * filesystem — is the only recovery there is. That cost is what the route's
  * confirm gate is for.
  *
- * The mount is by MOUNTPOINT, so fstab supplies the spec and every option the
- * pool's line carries (`subvol=@data`, `nofail`, the iSCSI ordering pair) —
- * this verb never invents a mount, it re-runs the one the node already has.
+ * The mount carries the pool's OWN fstab line as stored — its spec and every
+ * option it has (`subvol=@data`, `nofail`, the iSCSI ordering pair, and whatever
+ * the operator added: `noatime`, `compress=`, …), mounted directly through the
+ * daemon-opened directory (cr.52r D3, cr.52s-a). The line is read BEFORE the
+ * unmount, so an unreadable fstab refuses with nothing done; a pool with no line
+ * re-mounts with ANAS's defaults and the progress says so. This verb never
+ * invents a mount, it re-runs the one the node already has.
  *
  * The result is VERIFIED, never assumed: `mount` can succeed and land read-only
  * again when the underlying cause is still there, and reporting that as success
@@ -583,14 +588,15 @@ export async function remountAhrPool(
   executor: CommandExecutor,
   pool: { name: string, mountpoint: string, subvolLayout: boolean },
   updateProgress: (message: string) => void,
+  opts: { fstabPath?: string } = {},
 ): Promise<{ mountpoint: string, readOnly: boolean }> {
+  const line = await ahrPoolLineForRemount(opts.fstabPath ?? defaultAhrFstabPath(), pool.name, updateProgress)
+
   updateProgress(`Unmounting ${pool.mountpoint}`)
   await run(executor, UMOUNT, ['--', pool.mountpoint], { busyPath: pool.mountpoint })
 
   updateProgress(`Mounting ${pool.mountpoint}`)
-  // cr.52r D3: through the daemon-opened directory (directly from the pool's
-  // own fstab entry — the remount re-runs the mount the node has).
-  await mountAhrPool(executor, pool)
+  await mountAhrPool(executor, pool, line)
 
   const readOnly = await isAhrMountReadOnly(executor, pool.mountpoint)
   if (readOnly) {
@@ -625,6 +631,7 @@ export async function changeAhrMountpoint(
   }
 
   updateProgress('Rewriting the fstab entry (surgical)')
+  let moved: MountEntry | undefined
   await editConfig(opts.fstabPath, (current) => {
     // The pool's line is found by mountpoint OR by LV spec (an unmounted or
     // hand-edited pool still gets its line replaced, never duplicated). The
@@ -633,14 +640,22 @@ export async function changeAhrMountpoint(
     // fabricates a subvolume option the filesystem does not have.
     const existing = parseFstab(current).find(e => e.mountpoint === pool.mountpoint || e.spec === lvPath)
     const without = existing ? removeMount(current, existing.mountpoint) : current
-    return addMount(without, ahrFstabEntry(name, newMountpoint, pool.subvolLayout))
+    // cr.52s-a: the pool's OWN active line moves with only its mountpoint
+    // changed — the operator's options (`noatime`, `compress=`, …) stay;
+    // ANAS's defaults are written only when the pool had no line of its own (or
+    // the line found by mountpoint names another device).
+    moved = existing && existing.spec === lvPath && !existing.disabled
+      ? { ...existing, mountpoint: newMountpoint }
+      : ahrFstabEntry(name, newMountpoint, pool.subvolLayout)
+    return addMount(without, moved)
   })
   await run(executor, SYSTEMCTL, ['daemon-reload'])
 
   updateProgress(`Mounting at ${newMountpoint}`)
   await mkdir(newMountpoint, { recursive: true })
-  // cr.52r D3: the move's mount, through the daemon-opened directory.
-  await mountAhrPool(executor, { name, mountpoint: newMountpoint, subvolLayout: pool.subvolLayout })
+  // cr.52r D3: the move's mount, through the daemon-opened directory — the
+  // line just written, as written.
+  await mountAhrPool(executor, { name, mountpoint: newMountpoint, subvolLayout: pool.subvolLayout }, moved ?? null)
   // The old mountpoint directory stays (plain umount semantics — the mounts
   // feature's recorded decision).
 

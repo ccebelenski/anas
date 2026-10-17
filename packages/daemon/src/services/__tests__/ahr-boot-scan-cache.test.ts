@@ -296,6 +296,18 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
     assert.equal(mountCall.fdPaths?.[0], realMp)
   })
 
+  it('cr.52s-a (review defect 6) — the re-attach mounts with the line\'s OWN options, not ANAS\'s defaults', async () => {
+    // The operator's line carries noatime and compression; cr.52r's rung
+    // rebuilt ANAS's default entry and mounted without them (the pre-cr.52r
+    // `mount -- <lv>` took them from fstab).
+    await writeFile(process.env.ANAS_FSTAB_PATH!, `${AHR_LV_PATH} ${realMp} btrfs noatime,compress=zstd:3,subvol=@data 0 0\n`)
+    const executor = buildExecutor('missing')
+    await ahrBootScan(executor, { intentDir: dir, log: () => {} })
+    const mountCall = executor.calls.find(c => c.command === '/usr/bin/mount')!
+    assert.deepEqual(mountCall.args, ['-c', '-t', 'btrfs', '-o', 'noatime,compress=zstd:3,subvol=@data', '--', AHR_LV_PATH, '/proc/self/fd/3'])
+    assert.equal(mountCall.fdPaths?.[0], realMp)
+  })
+
   it('cr.52r P2 — a pool whose STORED mountpoint now resolves into /etc: the boot re-attach REFUSES, logs and leaves it — no mount', async () => {
     // The pool's own fstab line says its mountpoint is `realMp`; the tree
     // swerved since it was written — `realMp` is now a symlink to /etc. The
@@ -316,6 +328,63 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
       ['/usr/sbin/vgchange', '-ay', 'tank'],
     ])
     assert.ok(lines.some(l => l.includes('rung=mount result=refused')), lines.join('\n'))
+  })
+
+  /** Every notification the scan emitted, as [severity, title, body]. */
+  function notices(executor: MockExecutor): string[][] {
+    return executor.calls.filter(c => c.command === '/usr/bin/perl').map(c => c.args.slice(2, 5))
+  }
+
+  it('cr.52s-a (review defect 7) — a re-attach whose mountpoint directory is MISSING logs the mount failure; the cache recovery stays reported as done', async () => {
+    // The pool's line names a directory that does not exist (the open throws).
+    // cr.52r threw this into the cache-recover catch: "cache recovery FAILED …
+    // Detach the cache" after the cache had already been dropped.
+    const gone = join(dir, 'gone', 'tank')
+    await writeFile(process.env.ANAS_FSTAB_PATH!, `${AHR_LV_PATH} ${gone} btrfs nofail,subvol=@data 0 0\n`)
+    const lines: string[] = []
+    const executor = buildExecutor('missing')
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.deepEqual(report.cacheRecovered, ['tank'], 'the cache WAS dropped — reported as recovered')
+    assert.ok(lines.some(l => l.startsWith('ahr.boot pool=tank rung=mount result=failed detail=') && l.includes('does not exist as a directory')), lines.join('\n'))
+    assert.ok(!lines.some(l => l.includes('rung=cache-recover result=failed')), lines.join('\n'))
+    const titles = notices(executor).map(n => n[1])
+    assert.ok(!titles.some(t => /cache recovery FAILED/.test(t!)), titles.join(' | '))
+    const unmounted = notices(executor).find(n => n[1] === 'AHR pool not re-mounted: tank')
+    assert.ok(unmounted, titles.join(' | '))
+    assert.match(unmounted![2]!, /dropped pool 'tank''s failed read cache/)
+    assert.match(unmounted![2]!, /mounting it at '.*gone\/tank' failed: Mountpoint .* does not exist as a directory/)
+  })
+
+  it('cr.52s-a (review defect 7) — mount(8) exiting non-zero is the same: logged as the mount\'s failure, recovery reported done', async () => {
+    const lines: string[] = []
+    const executor = buildExecutor('missing')
+    executor.prependFixture({ command: '/usr/bin/mount', result: { stdout: '', stderr: 'mount: wrong fs type, bad option, bad superblock', exitCode: 32 } })
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.deepEqual(report.cacheRecovered, ['tank'])
+    assert.ok(lines.includes('ahr.boot pool=tank rung=mount result=failed detail=mount: wrong fs type, bad option, bad superblock'), lines.join('\n'))
+    assert.ok(!notices(executor).some(n => /cache recovery FAILED/.test(n[1]!)))
+  })
+
+  it('cr.52s-a (P1) — an UNREADABLE fstab logs its own reason, never no-fstab-entry, and mounts nothing', async () => {
+    await rm(process.env.ANAS_FSTAB_PATH!)
+    await mkdir(process.env.ANAS_FSTAB_PATH!) // EISDIR on read
+    const lines: string[] = []
+    const executor = buildExecutor('missing')
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.deepEqual(report.cacheRecovered, ['tank'])
+    assert.ok(lines.some(l => l.startsWith('ahr.boot pool=tank rung=mount result=skipped fstab=unreadable read=')), lines.join('\n'))
+    assert.ok(!lines.some(l => l.includes('no-fstab-entry')), lines.join('\n'))
+    assert.ok(!executor.calls.some(c => c.command === '/usr/bin/mount'), 'no mount')
+    assert.ok(notices(executor).some(n => n[1] === 'AHR pool not re-mounted: tank' && /could not be read/.test(n[2]!)))
+  })
+
+  it('cr.52s-a — a readable fstab with NO line for the pool logs no-fstab-entry and invents no mount', async () => {
+    await writeFile(process.env.ANAS_FSTAB_PATH!, `/dev/other/other-vol ${join(dir, 'other')} btrfs nofail 0 0\n`)
+    const lines: string[] = []
+    const executor = buildExecutor('missing')
+    await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.ok(lines.includes('ahr.boot pool=tank rung=mount result=no-fstab-entry'), lines.join('\n'))
+    assert.ok(!executor.calls.some(c => c.command === '/usr/bin/mount'), 'no mount')
   })
 
   it('notifies that the pool came up uncached', async () => {

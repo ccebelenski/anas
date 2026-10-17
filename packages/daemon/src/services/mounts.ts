@@ -20,7 +20,7 @@ import type { Gate, Refusal } from '../safety/guard.js'
 import { createHash } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
 import { constants as FS_CONSTANTS } from 'node:fs'
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readlink, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, normalize, resolve } from 'node:path'
@@ -1877,21 +1877,36 @@ export const GROUP_OTHER_WRITE_MODE = 0o022
 /** The sticky bit — a 1777-style tree where only the owner of a name may rename or unlink it. */
 export const STICKY_MODE = 0o1000
 
+/** The file-type bits of an lstat mode, and the symlink type (S_IFMT / S_IFLNK). */
+const S_IFMT_MODE = 0o170000
+const S_IFLNK_MODE = 0o120000
+
 /**
  * cr.52r D3's ZFS half. The daemon cannot fd-pin a mountpoint ZFS mounts by
  * itself (`zpool create -m`, `zpool import`, `zfs create -o mountpoint`, a
  * `zfs set mountpoint`): the window between the gate and ZFS's own `mount` is
- * ZFS's, and a swap (rename the directory away, plant a symlink) inside it
+ * ZFS's, and a swap (rename a directory away, plant a symlink) inside it
  * would redirect the kernel mount at a tree the gate never re-checked. The
  * residual cannot be eliminated — document it, and close the avenue that makes
- * it practical: every EXISTING ancestor of the mountpoint must be root-owned
- * and not group/other-writable (a non-root writer's swap would need write on
- * the parent chain). A sticky directory (1777 — `/tmp`, `/var/tmp`) is the one
- * exception: in it only the owner can rename away the root's directory, so a
- * missing intermediate or the root's own dir cannot be swapped by someone else.
- * Refuses naming the offending directory; null when the chain is safe (or
- * nothing exists yet — the missing components are created by root at mount
- * time).
+ * it practical: nobody but root may be able to rename, replace or CREATE any
+ * name on the mountpoint's path. Concretely (cr.52s-a, review defect 5):
+ *
+ *  - every EXISTING component, the LEAF included, is root-owned (the owner of a
+ *    name can always rename it, even inside a sticky directory);
+ *  - every existing component that is the PARENT of another existing component
+ *    is not group/other-writable — unless it is sticky (1777 — `/tmp`,
+ *    `/var/tmp`): there only a name's owner can rename it away, and the child
+ *    is root-owned by the rule above;
+ *  - when the mountpoint does not fully exist, the deepest existing component
+ *    is the would-be parent of a name ZFS will create: it must be root-owned
+ *    and not group/other-writable, with NO sticky exception — in a sticky
+ *    directory anyone can create (squat) a missing name first.
+ *
+ * So `/tmp/alice` (user-owned) and `/tmp/newpool` (missing under 1777) refuse,
+ * `/tmp/rootdir` (existing, root-owned) passes, `/srv/newpool` (missing under a
+ * root-owned 0755) passes. A symlink component is refused here too (the
+ * mount-target refusal that runs first names it more precisely). Refuses
+ * naming the offending directory; null when the path is safe.
  *
  * The residual this leaves (documented for the operator): a ROOT-authorized
  * actor still can swap the tree after this check, and a swap in the instant
@@ -1903,23 +1918,46 @@ export async function swapStageRefusal(
   deps: SwapStageRefusalDeps = { longestExistingAncestor: realLongestExistingAncestor, dirAttr: realDirAttr },
 ): Promise<Refusal | null> {
   const mp = normalizeMountpointPath(mountpoint)
-  const ancestors = descendantPrefixes(await deps.longestExistingAncestor(dirname(mp)))
-  for (const comp of ancestors) {
+  const existing = await deps.longestExistingAncestor(mp)
+  const missing = existing !== mp
+  const chain = descendantPrefixes(existing)
+  const say = (comp: string, why: string): Refusal => ({
+    status: 409,
+    code: 'CONFLICT',
+    reason: SWAP_STAGE_REFUSAL_REASON,
+    message: `Mountpoint '${mp}' is refused — ${comp === mp ? 'the mountpoint directory itself' : `its ancestor directory '${comp}'`} ${why}. `
+      + 'ZFS mounts there by itself, and a path on which a non-root user could rename, replace or create a name would let that mount be redirected.'
+      + ` Make '${comp}' root-owned and not group/other-writable, or choose another mountpoint`,
+  })
+  for (let i = 0; i < chain.length; i++) {
+    const comp = chain[i]!
     const attr = await deps.dirAttr(comp)
+    // Gone since the walk found it: the path is changing under the check —
+    // fail closed rather than pass a chain that was never fully seen.
     if (attr === null)
-      continue // vanished since the walk — the deeper check would have caught the swap
+      return say(comp, 'vanished while it was being checked')
+    if ((attr.mode & S_IFMT_MODE) === S_IFLNK_MODE)
+      return say(comp, 'is a symlink')
     const writableByOthers = (attr.mode & GROUP_OTHER_WRITE_MODE) !== 0
     const sticky = (attr.mode & STICKY_MODE) !== 0
-    if (attr.uid !== 0 || (writableByOthers && !sticky)) {
-      return {
-        status: 409,
-        code: 'CONFLICT',
-        reason: SWAP_STAGE_REFUSAL_REASON,
-        message: `Mountpoint '${mp}' is refused — its ancestor directory '${comp}' is${attr.uid !== 0 ? ' not root-owned' : ''}`
-          + `${writableByOthers ? ' group/other-writable' : ''}. ZFS mounts there by itself, and a directory a non-root writer could swap would let that mount be redirected.`
-          + ` Make '${comp}' root-owned and not group/other-writable, or choose another mountpoint`,
+    const notRoot = attr.uid !== 0
+    const isLast = i === chain.length - 1
+    // The would-be parent of a name ZFS will create: no sticky exception.
+    if (isLast && missing) {
+      if (notRoot || writableByOthers) {
+        const why = [
+          notRoot ? 'not root-owned' : '',
+          writableByOthers ? `group/other-writable${sticky ? ' (sticky does not stop another user creating the missing name first)' : ''}` : '',
+        ].filter(Boolean).join(' and ')
+        return say(comp, `is ${why}`)
       }
+      continue
     }
+    if (notRoot)
+      return say(comp, 'is not root-owned')
+    // A parent of an existing (root-owned) component: writable only if sticky.
+    if (!isLast && writableByOthers && !sticky)
+      return say(comp, 'is group/other-writable')
   }
   return null
 }
@@ -1989,8 +2027,14 @@ export async function openMountTarget(mountpoint: string): Promise<OpenedMountTa
   }
   catch (err) {
     const e = err as NodeJS.ErrnoException
-    if (e.code === 'ENOTDIR' || e.code === 'ENOENT')
+    if (e.code === 'ENOTDIR' || e.code === 'ENOENT') {
+      // O_DIRECTORY|O_NOFOLLOW on a symlinked LEAF answers ENOTDIR on Linux,
+      // not ELOOP — name the symlink rather than "does not exist".
+      const leaf = await lstat(mp).catch(() => null)
+      if (leaf?.isSymbolicLink())
+        throw new Error(`Mountpoint '${mp}' is a symlink — a mount over a symlinked directory is refused; nothing was mounted`)
       throw new Error(`Mountpoint '${mp}' does not exist as a directory — the component above it is missing or the path is broken; nothing was mounted`)
+    }
     if (e.code === 'ELOOP')
       throw new Error(`Mountpoint '${mp}' is a symlink (or its chain loops) — a mount over a symlinked directory is refused`)
     throw err
@@ -1999,6 +2043,33 @@ export async function openMountTarget(mountpoint: string): Promise<OpenedMountTa
   if (fd === undefined) {
     await handle.close()
     throw new Error(`Could not open mountpoint '${mp}' as a mount target`)
+  }
+  // cr.52s-a (review defect 4): the lstat walk above and the open are separate
+  // syscalls, and O_NOFOLLOW guards only the LAST component — an intermediate
+  // exchanged for a symlink between the two is followed by the open (measured:
+  // 19,596 of 70,972 opens under a renameat2 flip loop landed on the victim).
+  // So prove, AFTER the open, that the inode the descriptor pins IS the
+  // checked path: the kernel's own name for it (`/proc/self/fd/N`, the
+  // dentry's path at this instant) must equal the normalised mountpoint.
+  // Why this closes the race: a descriptor that landed on `/etc/<leaf>` reads
+  // back as `/etc/<leaf>`, and only someone who can write `/etc` could move
+  // that directory to the checked name — a non-root writer on the mountpoint's
+  // parent chain cannot. What it does NOT close: a root-owned path re-pointed by
+  // root itself (the operator's own act), and a swap that renames the CHECKED
+  // directory away after the open — that one only refuses here (the name no
+  // longer matches) or, after this check, moves a pin that still names the
+  // directory the walk checked.
+  let pinned: string | null
+  try {
+    pinned = await readlink(`/proc/self/fd/${fd}`)
+  }
+  catch {
+    pinned = null
+  }
+  if (pinned !== mp) {
+    await handle.close()
+    throw new Error(`Mountpoint '${mp}' is refused — the directory opened for the mount is ${pinned === null ? 'unnamed' : `'${pinned}'`}, not the checked path: `
+      + 'a component of the path was swapped between the symlink check and the open (a planted symlink must not redirect the mount); nothing was mounted')
   }
   return {
     fd,
@@ -2013,7 +2084,10 @@ export async function openMountTarget(mountpoint: string): Promise<OpenedMountTa
  * fd when the child has exited. `-c` (--no-canonicalize) is REQUIRED on every
  * fd-pinned mount: without it util-linux canonicalises `/proc/self/fd/3` to a
  * real path string and mounts onto THAT — the very redirect the pin exists to
- * stop (the fd path resolves in the kernel, a path string does not).
+ * stop (the fd path resolves in the kernel, a path string does not). The
+ * callers pass `-c` as their first token; this helper also guarantees it
+ * (cr.52s-a: the comment used to say so while the helper did not), adding it
+ * in front when an argv lacks it.
  */
 export async function mountThroughOpenedDir(
   executor: CommandExecutor,
@@ -2021,9 +2095,10 @@ export async function mountThroughOpenedDir(
   argv: readonly string[],
   opts?: ExecOptions,
 ): Promise<ExecResult> {
+  const args = argv.includes('-c') || argv.includes('--no-canonicalize') ? [...argv] : ['-c', ...argv]
   const open = await openMountTarget(mountpoint)
   try {
-    return await executor.exec(MOUNT, [...argv, FD_MOUNT_TARGET], { ...opts, inheritedFds: [open.fd] })
+    return await executor.exec(MOUNT, [...args, FD_MOUNT_TARGET], { ...opts, inheritedFds: [open.fd] })
   }
   finally {
     await open.close()

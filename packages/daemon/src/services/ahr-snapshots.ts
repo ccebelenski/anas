@@ -11,7 +11,7 @@ import {
   parseBtrfsSubvolList,
 } from '../parsers/btrfs-subvol-list.js'
 import { run } from './ahr-exec.js'
-import { mountAhrPool, SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-fstab.js'
+import { ahrPoolLineForRemount, defaultAhrFstabPath, mountAhrPool, SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-fstab.js'
 import { diagnoseBusyPath, formatHolders } from './busy-diagnosis.js'
 import { mountThroughOpenedDir } from './mounts.js'
 
@@ -55,6 +55,8 @@ export const DEFAULT_SUBVOL_RUNTIME_DIR = '/run/anas-ahr'
 export interface AhrSnapshotOptions {
   /** Base dir for the on-demand top-level mountpoint. Default: env / /run/anas-ahr. */
   runtimeDir?: string
+  /** The fstab holding the pool's own line (the rollback's remount). Default: env / /etc/fstab. */
+  fstabPath?: string
 }
 
 function runtimeBase(opts?: AhrSnapshotOptions): string {
@@ -428,6 +430,11 @@ export async function rollbackAhrSnapshot(
 ): Promise<{ pool: string, rolledBackTo: string, preserved: string }> {
   const snapName = AhrSnapshotName.parse(name)
   const preserved = preRollbackName(opts?.now ?? new Date())
+  // cr.52s-a: the remount below carries the pool's OWN fstab line as stored —
+  // read now, before anything is unmounted, so an unreadable fstab refuses
+  // with nothing done (a pool with no line re-mounts with ANAS's defaults, and
+  // the progress says so).
+  const line = await ahrPoolLineForRemount(opts?.fstabPath ?? defaultAhrFstabPath(), pool.name, updateProgress)
 
   if (pool.mounted) {
     updateProgress(`Unmounting ${pool.mountpoint}`)
@@ -453,7 +460,7 @@ export async function rollbackAhrSnapshot(
     // never leave the pool offline (fstab still has the subvol=@data entry).
     updateProgress(`Remounting ${pool.mountpoint}`)
     // cr.52r D3: through the daemon-opened directory, the pool's own entry.
-    await mountAhrPool(executor, pool)
+    await mountAhrPool(executor, pool, line)
   }
   return { pool: pool.name, rolledBackTo: snapName, preserved }
 }

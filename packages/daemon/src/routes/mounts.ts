@@ -347,6 +347,13 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         async o => mountTargetRefusal(o.mountpoint),
       )
     }
+    // cr.52s-a (review P6): an edit RE-MOUNTS the stored path (`remountEntry`:
+    // umount + a direct mount, or the busy `-o remount` fallback), so it asks
+    // the same refusal — as a gate, so it answers at the route and again in
+    // the job BEFORE the fstab line is rewritten (a refusal after the edit
+    // would leave the op half-done).
+    if (verb === 'update')
+      gates.push(async o => mountTargetRefusal(o.mountpoint))
     if (verb === 'enable') {
       gates.push(
         stateGate(o => !!o.entry, { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${mp}' is not in /etc/fstab` }),
@@ -1174,6 +1181,20 @@ async function remountEntry(executor: CommandExecutor, entry: MountEntry): Promi
   const mp = entry.mountpoint
   const u = await executor.exec(UMOUNT, [mp])
   if (u.exitCode !== 0 && (await readEffectiveOptions(executor, mp)) !== undefined) {
+    // cr.52s-a (review P3): this ONE daemon-run mount(8) stays path-based, by
+    // decision. A `remount` attaches no filesystem anywhere — it changes the
+    // flags of the mount ALREADY at `mp`, and util-linux finds that mount and
+    // merges the edited line's options by looking the TARGET up in fstab and
+    // the mount table; a `/proc/self/fd/3` target appears in neither table, so
+    // the remount would lose the edited options it exists to apply (a node
+    // question this change does not measure — it keeps the known-good argv).
+    // What guards it
+    // instead: the update verb's gate ran the mount-target refusal on `mp`
+    // (route and job), and the kernel mount table is read at `mp` before and
+    // after — an edit is complete only when the options seen THERE match the
+    // line. The residual is a swap of a parent in the instants between that
+    // read and mount(8)'s own lookup, which can retarget only the flags of
+    // another EXISTING mount, never place a filesystem.
     const r = await executor.exec(MOUNT, ['-o', 'remount', '--', mp])
     const effective = await readEffectiveOptions(executor, mp)
     if (effective !== undefined) {

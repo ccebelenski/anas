@@ -6,7 +6,8 @@ import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, rmdir, symlink, writeFile } from 'node:fs/promises'
+import fsp, { mkdir, mkdtemp, readFile, rm, rmdir, symlink, writeFile } from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -77,6 +78,31 @@ function spyExecutor(server: ReturnType<typeof createServer>): Array<{ command: 
     return orig(command, args)
   }
   return calls
+}
+
+/**
+ * Make `dest` and every ancestor of it read as ROOT-OWNED and not
+ * group/other-writable to the daemon's lstat (the swap-stage rule's input), as
+ * a real root-owned tree would — the test user cannot chown, so the ownership
+ * is faked at the one call the rule reads (cr.52s-a). `node:fs/promises` is
+ * patched and the builtin's ESM bindings re-synced so the daemon's named
+ * `lstat` import sees it; a symlink keeps its type bits. Returns the undo.
+ */
+function fakeRootOwnedChain(dest: string): () => void {
+  const real = fsp.lstat
+  const covered = (p: unknown): boolean => typeof p === 'string' && p !== '/' && (dest === p || dest.startsWith(`${p}/`))
+  const faked = async (p: Parameters<typeof fsp.lstat>[0], opts?: Parameters<typeof fsp.lstat>[1]): Promise<unknown> => {
+    const st = await real(p, opts as never)
+    if (!covered(p))
+      return st
+    return Object.assign(Object.create(Object.getPrototypeOf(st) as object) as object, st, { uid: 0, mode: Number(st.mode) & ~0o022 })
+  }
+  ;(fsp as unknown as { lstat: unknown }).lstat = faked
+  syncBuiltinESMExports()
+  return () => {
+    ;(fsp as unknown as { lstat: unknown }).lstat = real
+    syncBuiltinESMExports()
+  }
 }
 
 function mountpointReservedByPveFirst(res: Awaited<ReturnType<FastifyInstance['inject']>>): void {
@@ -514,6 +540,66 @@ describe('cr.52 — one shared mountTargetRefusal at every mountpoint door', () 
       assert.match(message, /parent path is a symlink/)
       assert.ok(!calls.some(c => c.command === MOUNT), 'no mount argv')
     })
+
+    it('cr.52s-a (review P6) — an EDIT of a stored entry whose parent is now a symlink to /etc → 409 at the route, fstab untouched, no umount/mount', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      const stored = join(dir, 'stored-edit')
+      await mkdir(stored)
+      const mp = join(stored, 'share')
+      const line = `10.0.0.9:/export ${mp} nfs4 vers=4.2,nofail 0 0\n`
+      await writeFile(fstabPath, line)
+      await rmdir(stored)
+      await symlink('/etc', stored)
+      const res = await server.inject({
+        method: 'PUT',
+        url: `/v1/mounts/${encodeURIComponent(mp)}`,
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ options: { ro: true } }),
+      })
+      const message = refusalIs(res)
+      assert.match(message, /parent path is a symlink/)
+      assert.equal(await readFile(fstabPath, 'utf8'), line, 'the line is not rewritten')
+      assert.ok(!calls.some(c => c.command === MOUNT || c.command === '/usr/bin/umount'), 'no umount, no mount')
+    })
+
+    it('cr.52s-a (review P6) — an edit whose stored path flips to a symlink while QUEUED refuses in the job BEFORE the line is rewritten', async () => {
+      server = createServer({ mock: true, logger: false })
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      const calls = spyExecutor(server)
+      const stored = join(dir, 'stored-queued')
+      await mkdir(join(stored, 'share'), { recursive: true })
+      const mp = join(stored, 'share')
+      const line = `10.0.0.9:/export ${mp} nfs4 vers=4.2,nofail 0 0\n`
+      await writeFile(fstabPath, line)
+
+      let release!: () => void
+      const held = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      for (let i = 0; i < 4; i++)
+        queue.submit('test.hold', { user: 'root@pam', uid: 0 }, () => held)
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: `/v1/mounts/${encodeURIComponent(mp)}`,
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ options: { ro: true } }),
+      })
+      assert.equal(res.statusCode, 202, res.body)
+      const id = (res.json() as JobAccepted).job.id
+      assert.equal(queue.get(id)?.status, 'queued')
+
+      await rm(stored, { recursive: true })
+      await symlink('/etc', stored)
+      release()
+      const job = await waitForJob(server, id)
+      assert.equal(job.status, 'failed', JSON.stringify(job))
+      assert.equal(job.error?.code, 'CONFLICT', JSON.stringify(job.error))
+      assert.match(job.error!.message, /parent path is a symlink/)
+      assert.equal(await readFile(fstabPath, 'utf8'), line, 'the job refused before rewriting the line')
+      assert.ok(!calls.some(c => c.command === MOUNT || c.command === '/usr/bin/umount'), 'no umount, no mount')
+    })
   })
 
   // --- P1: the four new entries ride the remote door too --------------------
@@ -539,19 +625,29 @@ describe('cr.52 — one shared mountTargetRefusal at every mountpoint door', () 
     const DISK_IDS = ['d1', 'd2']
 
     /**
-     * The swap-STAGE gate (cr.52r D3's ZFS half) demands root-owned,
-     * non-writable ancestors — a user-owned tmpdir SUBDIR refuses before the
-     * job. A bare `mkdtemp` root rides the sticky `/tmp` exception (parent
-     * `/tmp`, 1777), so it passes both gates at the route; the flip replaces
-     * the mountpoint ITSELF with a symlink to `/etc`, which the job's re-run
-     * then refuses (the leaf is a symlink). Each test cleans its own temp in a
-     * `finally` — after a flip it is exactly one symlink, which `rm` unlinks
-     * without following (the same call the shared afterEach makes on a flipped
-     * `mnt`). The base is a literal `/tmp`, NOT `os.tmpdir()`: the harness runs
-     * with `TMPDIR` inside the worktree, whose user-owned `/home/...` ancestors
-     * trip the same refuse-before-the-job gate the test has to get past.
+     * The swap-STAGE gate (cr.52r D3's ZFS half) demands a mountpoint path on
+     * which no non-root user can rename, replace or create a name. cr.52r's
+     * version of these tests rode a hole: a user-owned `mkdtemp` LEAF under the
+     * sticky `/tmp` passed — exactly the shape a non-root swapper can flip, and
+     * the test user IS that swapper (cr.52s-a, review defect 5). The fixture is
+     * now ROOT-OWNED through a faked lstat (`fakeRootOwnedChain`), so the
+     * route's gates pass as they would on a root-owned tree, and the flip — the
+     * mountpoint ITSELF replaced with a symlink to `/etc` while the job waits —
+     * is what the job's re-run must refuse (the leaf is a symlink). Each test
+     * cleans its own temp in a `finally` — after a flip it is exactly one
+     * symlink, which `rm` unlinks without following — and the fake is undone
+     * after each test. The base is `os.tmpdir()` again (no literal `/tmp`).
      */
-    const flippedDest = async (): Promise<string> => mkdtemp(join('/tmp', 'anas-cr52d-'))
+    let restoreOwnership: (() => void) | undefined
+    afterEach(() => {
+      restoreOwnership?.()
+      restoreOwnership = undefined
+    })
+    const flippedDest = async (): Promise<string> => {
+      const dest = await mkdtemp(join(tmpdir(), 'anas-cr52d-'))
+      restoreOwnership = fakeRootOwnedChain(dest)
+      return dest
+    }
 
     it('a pool create whose mountpoint is swapped while QUEUED refuses the job — no zpool create (mutation M14)', async () => {
       const dest = await flippedDest()
