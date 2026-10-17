@@ -1589,11 +1589,14 @@ export async function datasetRoutes(
     return createSnapshot(poolName, tail.datasetPath, request, reply)
   })
 
-  // --- PUT /pools/:name/datasets/*path — update props OR permissions ------
+  // --- PUT /pools/:name/datasets/*path — update props, rename, set access --
   // find-my-way only permits a wildcard as the final segment, so a nested
-  // dataset path plus a `/permissions` suffix cannot be two routes. We branch
-  // here: a wildcard ending in `/permissions` is the SetPermissions action,
-  // otherwise it is a property update.
+  // dataset path plus a sub-resource suffix cannot be two routes. We branch
+  // here: an existing dataset is a property update whatever segment it
+  // carries (ident.1), a snapshots tail is a rename, and a wildcard ending
+  // in `/access` is the set-access action — the `/permissions` suffix and
+  // its SetPermissions branch are gone (removed by cr.4; `access` is the
+  // one permissions editor).
   server.put<{ Params: { 'name': string, '*': string } }>('/pools/:name/datasets/*', async (request, reply) => {
     const nameParsed = PoolName.safeParse(request.params.name)
     if (!nameParsed.success) {

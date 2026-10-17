@@ -12,6 +12,15 @@ export half shipped in pools.r1 (`79aaad7`), the boot-scan warn half is the open
 EPICS §3. cr.3 (`022fab2`, system accounts not mutable through the identity API) closes no
 numbered finding in this audit.
 
+**Progress (2026-10-17), review W2:** the line above stands as written, with one correction —
+"#21–#47 stay open except where marked" was already incomplete when written: cr.20 (2026-10-14)
+closed #23 and #46 the same day but carried no mark. Closures since, marks now
+below: #45 closed by cr.27 (2026-10-15 — the gateway carries the full PVE user id, realm
+included, from pveproxy's signed assertion), #24 closed by cr.58 (2026-10-16, review M5), #25
+partly — the uid-reuse ACL half closed by cr.59 (2026-10-16, review M6) and the smb.conf
+name-reference half by cr.30 (2026-10-15), the delete-side POSIX-ACL-grant check itself still
+open. #21–#47 otherwise stay open except where marked.
+
 ## Cross-cutting patterns
 
 - **P1. Confirm codes and queued jobs are keyed by name, and the job never re-checks.**
@@ -129,6 +138,9 @@ numbered finding in this audit.
     pools.r1 rider).**
 23. SMB share named `global`/`homes`/`printers` accepted; POST appends a second `[global]` that
     Samba merges; ANAS can neither show nor delete it. Fix: reserve case-insensitively.
+    **Closed 2026-10-14: cr.20 — `NewShareName` reserves the three names in any case (Samba
+    section names are matched case-insensitively and the parser already folds them); existing
+    stanzas stay listed and manageable.**
 24. #68 gap: an orphan passdb entry with the SAME case is inherited after `userdel` at the CLI.
     Fix: any folded entry with `uid===null` is an orphan; refuse or `pdbedit -x` before useradd.
     **Closed 2026-10-16: cr.58 (review 2026-10-16 M5): a create with no SMB password refuses
@@ -140,6 +152,12 @@ numbered finding in this audit.
 25. User/group delete never checks POSIX ACL grants (contrary to DESIGN.md); uid reuse inherits
     `u:<uid>` grants; `sharesReferencing` ignores `+group`, `write list`, `admin users`,
     `force user/group`. Fix: `getfacl -n` over managed mountpoints → 409.
+    **Partly closed: cr.30 (2026-10-15) — delete now refuses every smb.conf name reference (all
+    user-list parameters, `@`/`+`/`&` forms, read the way Samba does); cr.59 (2026-10-16, review
+    M6; walk narrowed to directories by the 2026-10-16 ruling) — the automatic uid/gid pick now
+    skips every id a POSIX ACL entry names under the managed roots, so a picked id cannot
+    inherit a deleted account's grant. The delete-side ACL-grant check itself stays open: cr.30
+    records ACL references as not read on delete.**
 26. iSCSI `dynamic_sessions` parsed but never counted by the delete/resize/restore gates.
 27. Cluster-wide registries (`/etc/pve/anas/remotes.json`, `backup-repos.json`) vs per-node tasks
     and secrets: delete-and-recreate under the same name on node A is followed silently by
@@ -177,8 +195,14 @@ numbered finding in this audit.
     check), suppressing "configured but not mounted".
 45. Gateway drops the PVE realm: `alice@pve` and `alice@pam` both become `alice`; uid from
     `id -u` of an unrelated local account; lands in the audit trail. No authorization depends on it.
+    **Closed 2026-10-15: cr.27 — the identity now comes from pveproxy's signed assertion and the
+    gateway forwards the full PVE user id, realm included (`packages/gateway/src/proxy.ts`:
+    `alice@pve` is not the local `alice`; the uid is taken only for a `@pam` user, −1
+    otherwise).**
 46. Two same-cadence schedules collide on `anas-<bucket>-<UTC second>` (no RandomizedDelaySec);
     the parent's atomic `-r` fails "dataset already exists" and the pool misses that hour.
+    **Closed 2026-10-14: cr.20 — a same-second collision retries once under `-2`, which the
+    retention grammar accepts at the same instant, so the snapshot stays owned and pruned.**
 47. A retarget edit keeps the unit birth, so history and the cadence gate carry to the new target.
 
 ### Cosmetic / low

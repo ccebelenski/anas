@@ -92,6 +92,12 @@ export async function pveNotify(
     return
   }
   try {
+    // The severity, title and body ride perl's argv — visible in the process
+    // table for the life of the spawn. They are masked BEFORE they get here:
+    // callers build their text through `maskSecretValues` (secret-argv.ts)
+    // where that text is made (cr.55: the cloud run's failure message and
+    // rclone's error lines; cr.48b-e for pbc), so a stored credential reaches
+    // this argv only as `[secret]`.
     const result = await executor.exec('/usr/bin/perl', ['-e', perlNotifyBody(template), severity, title, message], { timeoutMs: PVE_NOTIFY_BUDGET_MS })
     if (result.exitCode !== 0)
       console.error(`pve-notify: delivery failed (exit ${result.exitCode}): ${result.stderr.trim()}`)

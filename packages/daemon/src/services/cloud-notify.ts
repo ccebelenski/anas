@@ -95,8 +95,14 @@ export function cloudConsistencyLine(ctx: CloudNotifyContext): string | null {
 
 /**
  * The notification BODY — plain text, scannable, and detailed enough to read
- * INSTEAD of the run. Nothing here can carry a secret: every credential lives
- * in the config file, never in an argv and never in rclone's log.
+ * INSTEAD of the run. It carries rclone's own error lines and the run's
+ * failure message, and rclone CAN echo a stored credential in such a line —
+ * the claim this docstring used to make ("every credential lives in the
+ * config file, never in rclone's log") was false until cr.55. What keeps the
+ * body clean is the mask, not the pipeline: those lines are masked where
+ * they are MADE, against the remote's stored secret values
+ * (`remoteSecretValues` + `maskSecretValues`, cloud-runner.ts), so a
+ * credential rclone echoed reads `[secret]` by the time it arrives here.
  */
 export function buildCloudNotifyBody(ctx: CloudNotifyContext): string {
   const outcome = cloudNotifyOutcome(ctx)

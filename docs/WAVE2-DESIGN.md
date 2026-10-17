@@ -390,7 +390,7 @@ index lists `GET /v1/iscsi/targets/:iqn/luns/:lun`, which no route registers (al
 | `GET` | `/v1/disks` | Sys.Audit | `disks.ts:444` |  |
 | `GET` | `/v1/disks/:id` | Sys.Audit | `disks.ts:449` |  |
 | `GET` | `/v1/disks/:id/smart` | Sys.Audit | `disks.ts:462` | runs smartctl (may wake a spun-down disk) |
-| `GET` | `/v1/fs/browse` | Sys.Audit | `fs.ts:17` | cr.62 (review L11): without Sys.Modify, only inside an SMB share, NFS export or ZFS dataset mountpoint (never `/`, real path) — else 403 naming Sys.Modify; Sys.Modify is unbounded (the pickers are mutation dialogs) |
+| `GET` | `/v1/fs/browse` | Sys.Audit | `fs.ts:104` | cr.62 (review L11): without Sys.Modify, only inside an SMB share, NFS export or ZFS dataset mountpoint (never `/`, real path) — else 403 naming Sys.Modify; Sys.Modify is unbounded (the pickers are mutation dialogs) |
 | `GET` | `/v1/health` | Sys.Audit | `health.ts:5` | the panels' install probe (`20-notinstalled.js:135`): a 403 must not read as "not installed" |
 | `POST` | `/v1/iscsi/targets` | Sys.Modify | `iscsi-mutate.ts:248` |  |
 | `PUT` | `/v1/iscsi/targets/:iqn` | Sys.Modify | `iscsi-mutate.ts:314` |  |
@@ -403,7 +403,7 @@ index lists `GET /v1/iscsi/targets/:iqn/luns/:lun`, which no route registers (al
 | `GET` | `/v1/iscsi/claims` | Sys.Audit | `iscsi-mutate.ts:1140` |  |
 | `GET` | `/v1/iscsi/targets` | Sys.Audit | `iscsi.ts:41` |  |
 | `GET` | `/v1/iscsi/sessions` | Sys.Audit | `iscsi.ts:60` |  |
-| `GET` | `/v1/iscsi/health` | Sys.Audit | `iscsi.ts:76` | a pure read since cr.62 (review L9): a placeholder LUN is reported, still served; `POST /v1/iscsi/health/repair` (and the daemon start) takes it offline |
+| `GET` | `/v1/iscsi/health` | Sys.Audit | `iscsi.ts:81` | a pure read since cr.62 (review L9): a placeholder LUN is reported, still served; `POST /v1/iscsi/health/repair` (and the daemon start) takes it offline |
 | `GET` | `/v1/iscsi/targets/:iqn` | Sys.Audit | `iscsi.ts:85` |  |
 | `GET` | `/v1/jobs` | Sys.Audit | `jobs.ts:62` | every user's jobs, with createdBy |
 | `GET` | `/v1/jobs/:id` | Sys.Audit | `jobs.ts:84` |  |
@@ -431,16 +431,16 @@ index lists `GET /v1/iscsi/targets/:iqn/luns/:lun`, which no route registers (al
 | `POST` | `/v1/pools/:name/attach` | Sys.Modify | `pools.ts:1847` |  |
 | `POST` | `/v1/pools/:name/export` | Sys.Modify | `pools.ts:2046` |  |
 | `DELETE` | `/v1/pools/:name` | Sys.Modify | `pools.ts:2190` |  |
-| `GET` | `/v1/replication/remotes` | Sys.Audit | `replication-remotes.ts:79` | a pure read since cr.62 (review L9): `publicKey` is `''` until the key exists; it no longer runs `ssh-keygen` |
-| `POST` | `/v1/replication/remotes/keypair` | Sys.Modify | `replication-remotes.ts` | cr.62: creates the cluster replication key (a job; never regenerates an existing one) |
-| `POST` | `/v1/replication/remotes` | Sys.Modify | `replication-remotes.ts:88` |  |
-| `PUT` | `/v1/replication/remotes/:name` | Sys.Modify | `replication-remotes.ts:123` |  |
-| `DELETE` | `/v1/replication/remotes/:name` | Sys.Modify | `replication-remotes.ts:169` |  |
-| `POST` | `/v1/replication/remotes/test` | Sys.Modify | `replication-remotes.ts:365` | `?pin=true` WRITES known_hosts |
-| `POST` | `/v1/replication/remotes/:name/test` | Sys.Modify | `replication-remotes.ts:385` | `?pin` / `?retrust` WRITE known_hosts |
-| `GET` | `/v1/replication/locations` | Sys.Audit | `replication-remotes.ts:416` |  |
-| `GET` | `/v1/replication/remotes/:name/pools` | Sys.Audit | `replication-remotes.ts:422` | outbound: ssh as root with the cluster key, constant `zpool list` |
-| `GET` | `/v1/replication/peers/:name/pools` | Sys.Audit | `replication-remotes.ts:439` | outbound: ssh as root to a cluster peer, constant `zpool list` |
+| `GET` | `/v1/replication/remotes` | Sys.Audit | `replication-remotes.ts:99` | a pure read since cr.62 (review L9): `publicKey` is `''` until the key exists; it no longer runs `ssh-keygen` |
+| `POST` | `/v1/replication/remotes/keypair` | Sys.Modify | `replication-remotes.ts:112` | cr.62: creates the cluster replication key (a job; never regenerates an existing one) |
+| `POST` | `/v1/replication/remotes` | Sys.Modify | `replication-remotes.ts:126` |  |
+| `PUT` | `/v1/replication/remotes/:name` | Sys.Modify | `replication-remotes.ts:161` |  |
+| `DELETE` | `/v1/replication/remotes/:name` | Sys.Modify | `replication-remotes.ts:207` |  |
+| `POST` | `/v1/replication/remotes/test` | Sys.Modify | `replication-remotes.ts:474` | `?pin=true` WRITES known_hosts |
+| `POST` | `/v1/replication/remotes/:name/test` | Sys.Modify | `replication-remotes.ts:508` | `?pin` / `?retrust` WRITE known_hosts |
+| `GET` | `/v1/replication/locations` | Sys.Audit | `replication-remotes.ts:563` |  |
+| `GET` | `/v1/replication/remotes/:name/pools` | Sys.Audit | `replication-remotes.ts:569` | outbound: ssh as root with the cluster key, constant `zpool list` |
+| `GET` | `/v1/replication/peers/:name/pools` | Sys.Audit | `replication-remotes.ts:586` | outbound: ssh as root to a cluster peer, constant `zpool list` |
 | `GET` | `/v1/replication/tasks` | Sys.Audit | `replication-tasks.ts:162` |  |
 | `POST` | `/v1/replication/tasks` | Sys.Modify | `replication-tasks.ts:167` |  |
 | `PUT` | `/v1/replication/tasks/:name` | Sys.Modify | `replication-tasks.ts:208` |  |

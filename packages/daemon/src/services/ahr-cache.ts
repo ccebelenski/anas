@@ -472,14 +472,18 @@ export async function uncacheAhrLv(executor: CommandExecutor, vg: string, lvName
 }
 
 /**
- * `vgreduce --removemissing <vg>` — behind the ONE guard that makes it safe.
+ * `vgreduce --removemissing <vg>` — with a first-pass count, and LVM's own
+ * refusal behind it.
  *
  * `--removemissing` drops EVERY absent PV, not the one we mean. A stopped band
  * md array reads `[unknown]` in `pvs` exactly as a dead cache device does
- * (GT-19), so without this test the recovery for a failed cache would quietly
- * evict a band's PV from a pool that was merely not assembled. The
- * discriminator is the same one `buildAhrCacheState` uses: every band must
- * already be accounted for by its own named md PV.
+ * (GT-19), so this test refuses when a band's named PV is missing while its
+ * array is listed. Be honest about its reach: `pool.arrays` comes from
+ * `/proc/mdstat`, so an array that is STOPPED is in neither count — this test
+ * cannot see that shape. The real protection there is LVM's own: plain
+ * `--removemissing` (never `--force`) refuses while a missing PV still carries
+ * extents of a listed LV, and succeeds only once no LV needs it (proven on
+ * real LVM, wave1b R2).
  *
  * Extracted because detach is no longer its only caller — the udev auto-uncache
  * rung and the boot rung (slice 2) run the same drop, and a second copy of this
