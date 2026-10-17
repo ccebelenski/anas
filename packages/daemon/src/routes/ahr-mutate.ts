@@ -911,7 +911,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       'ahr.remount',
       { ...identity, params: { name } },
       guarded(spec, pre, async (live, { updateProgress, newAdvisories }) => {
-        const result = await remountAhrPool(executor, { name: live.name, mountpoint: live.mountpoint, subvolLayout: live.subvolLayout }, updateProgress)
+        // cr.52s-c: the server's fstab — the file whose line this re-mount
+        // carries — reaches the service (it used to fall back to
+        // ANAS_FSTAB_PATH//etc/fstab, which a mock server reads as the host's).
+        const result = await remountAhrPool(executor, { name: live.name, mountpoint: live.mountpoint, subvolLayout: live.subvolLayout }, updateProgress, { fstabPath })
         // D3 (cr.38r): a claims read that broke since the confirm rides the
         // result (the remount's own post-mount check may fail first — the
         // advisory is dropped then, as the report of the run's outcome must).

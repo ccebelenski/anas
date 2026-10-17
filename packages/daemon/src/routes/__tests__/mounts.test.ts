@@ -1973,7 +1973,12 @@ describe('mount Create — a failed fstab edit leaves no credentials behind (cr.
   })
 
   it('a persistent CIFS create whose fstab edit fails leaves no credentials file', { skip: AS_ROOT && 'running as root — read-only directories do not stop root' }, async () => {
+    // cr.52s-c: the create job no longer creates a MISSING parent (it refuses
+    // naming it), so the parent is made here — the job must reach the mount
+    // (the mock answers success) and the failing fstab WRITE, where the
+    // rollback (unmount + remove the credentials file) is what this proves.
     const mountpoint = join(dir, 'mnt', 'editfail-cifs')
+    await mkdir(join(dir, 'mnt'), { recursive: true })
     const res = await server!.inject({
       method: 'POST',
       url: '/v1/mounts',
@@ -1991,7 +1996,9 @@ describe('mount Create — a failed fstab edit leaves no credentials behind (cr.
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server!, res.json().job.id)
     assert.equal(job.status, 'failed', 'the read-only fstab directory must fail the job')
-    // No secret survives the failed edit: the creds dir was never even created.
+    // No secret survives the failed edit: cr.52s-c writes the credentials file
+    // BEFORE the mount and the fstab line, and the rollback of the failed line
+    // write removes it again — the creds dir ends up empty.
     const left = await readdir(credsDir).catch(() => [] as string[])
     assert.deepEqual(left, [])
     // And the request-time reads still worked — the failure is the WRITE.

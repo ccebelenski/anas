@@ -35,6 +35,12 @@ export interface AhrSnapshotRouteOptions {
   intentDir: string
   /** On-demand top-level mount base override (tests point at a temp dir). */
   subvolRuntimeDir?: string
+  /**
+   * The server's fstab (cr.52s-c): the rollback's remount carries the pool's
+   * OWN line from THIS file. Unset, the service falls back to the daemon
+   * default (ANAS_FSTAB_PATH then /etc/fstab) exactly as before.
+   */
+  fstabPath?: string
   /** iSCSI read-layer path overrides (story iscsi.6) — the rollback refusal. */
   iscsiPaths?: IscsiPaths
 }
@@ -56,8 +62,8 @@ export interface AhrSnapshotRouteOptions {
  * mutations are jobs (202); delete/rollback are confirm-gated (Principle 14).
  */
 export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapshotRouteOptions) {
-  const { executor, jobQueue, confirmStore, intentDir, subvolRuntimeDir } = opts
-  const svc = { runtimeDir: subvolRuntimeDir }
+  const { executor, jobQueue, confirmStore, intentDir, subvolRuntimeDir, fstabPath } = opts
+  const svc = { runtimeDir: subvolRuntimeDir, ...(fstabPath !== undefined ? { fstabPath } : {}) }
 
   /**
    * The iSCSI read-layer paths for the rollback refusal: the explicit test

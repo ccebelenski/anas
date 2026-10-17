@@ -7,7 +7,7 @@ import type { Advisory, Gate, GuardReads, GuardSpec, Refusal } from '../safety/g
 import type { IscsiPaths } from '../services/iscsi.js'
 import type { LiveAtTarget } from '../services/mount-match.js'
 import type { MountTestStages } from '../services/mounts.js'
-import { mkdir, readdir } from 'node:fs/promises'
+import { readdir, rm } from 'node:fs/promises'
 import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, UpdateMountRequest } from '@anas/shared'
 import { CommandTimeoutError } from '../executor/deadline.js'
 import { classifyKind, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
@@ -25,6 +25,7 @@ import {
   buildBaseInventory,
   buildMountDetail,
   cleanMountStderr,
+  createMountpointThroughOpenedParent,
   credsFilePath,
   deliveredMatchesIntent,
   entryFromRequest,
@@ -698,38 +699,74 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       // be re-checked only inside the persistent path's fstab edit).
       guarded(spec, pre, async (_slot, { updateProgress }) => {
         updateProgress(`Creating mountpoint ${req.mountpoint}`)
-        await mkdir(req.mountpoint, { recursive: true })
+        // cr.52s-c: the mountpoint is created THROUGH THE OPENED PARENT (the
+        // O_PATH|O_NOFOLLOW pin + readlink proof, the leaf mkdir'd at
+        // `/proc/self/fd/<fd>/<leaf>`) — never `mkdir(recursive)` on a textual
+        // path a non-root user can re-point between this job's re-gate and the
+        // mkdir (the old call followed every symlink it met and created
+        // directories through a planted link as root).
+        await createMountpointThroughOpenedParent(req.mountpoint)
 
-        if (req.persistent) {
-          updateProgress('Writing /etc/fstab entry')
-          await editConfig(fstabPath, (current) => {
-            if (hasMount(current, req.mountpoint))
-              throw new Error(`Mount '${req.mountpoint}' is already in /etc/fstab`)
-            return addMount(current, entry)
-          })
-          updateProgress('Reloading systemd (daemon-reload)')
-          await daemonReload(executor)
-        }
-
-        // cr.18 (review M7.2): credentials land only once nothing that can
-        // still refuse stands before them — for a persistent mount AFTER the
-        // fstab edit that names the file, for a non-persistent mount
-        // immediately before the `mount` that consumes it. A request refused
-        // or a job step that fails earlier leaves no secrets on disk. A
-        // non-persistent mount that is never mounted writes nothing: nothing
-        // is left on the system that would ever reference the file.
+        // cr.52s-c restates cr.18 (review M7.2): the MOUNT runs before the
+        // fstab line is written — a refused or failed mount leaves no line —
+        // and every artifact this create wrote is removed again if a later
+        // step fails. The credentials file lands just before the mount that
+        // consumes it (the direct argv carries `credentials=<file>` and
+        // mount.cifs reads the file AT mount time — the same reason the
+        // mount-test probe writes its own temp creds file before the probe
+        // mount), and goes again when the mount or the line fails.
+        let credsFile: string | undefined
         if (req.type === 'cifs' && req.credentials && (req.persistent || req.mountNow)) {
           updateProgress('Writing credentials file')
-          await writeCredentialsFile(credsDir, req.mountpoint, req.credentials)
+          credsFile = await writeCredentialsFile(credsDir, req.mountpoint, req.credentials)
         }
-
-        if (req.mountNow) {
-          updateProgress(`Mounting ${req.mountpoint}`)
-          // cr.52r D3: mount DIRECTLY from the entry through a directory the
-          // daemon opened — persistently too, so the argv targets the fd- pinned
-          // `/proc/self/fd/3` (the entry IS the line just written, so the
-          // mounted options are the line's own).
-          await doMount(executor, entry, req.mountpoint)
+        let mounted = false
+        try {
+          if (req.mountNow) {
+            updateProgress(`Mounting ${req.mountpoint}`)
+            // cr.52r D3: mount DIRECTLY from the entry through a directory the
+            // daemon opened — persistently too, so the argv targets the fd- pinned
+            // `/proc/self/fd/3` (the entry IS the line this create writes
+            // below, so the mounted options are the line's own).
+            await doMount(executor, entry, req.mountpoint)
+            mounted = true
+          }
+          if (req.persistent) {
+            updateProgress('Writing /etc/fstab entry')
+            await editConfig(fstabPath, (current) => {
+              if (hasMount(current, req.mountpoint))
+                throw new Error(`Mount '${req.mountpoint}' is already in /etc/fstab`)
+              return addMount(current, entry)
+            })
+          }
+        }
+        catch (err) {
+          // No partial create: the mount this job ran is unmounted (checked)
+          // and the credentials file removed, and the failure names the state
+          // left behind — the invariant is that a refused or failed mount
+          // leaves no fstab line and no credentials file.
+          const reason = err instanceof Error ? err.message : String(err)
+          const state: string[] = []
+          if (mounted) {
+            const u = await executor.exec(UMOUNT, ['--', req.mountpoint])
+            state.push(u.exitCode === 0
+              ? `'${req.mountpoint}' was mounted by this job and has been unmounted`
+              // A rollback unmount that itself failed is the one state the
+              // operator must act on — say so, with the reason.
+              : `'${req.mountpoint}' was mounted by this job and the rollback unmount FAILED (${cleanMountStderr(u.stderr) || `umount exited ${u.exitCode}`}) — it is left MOUNTED and must be unmounted by hand`)
+          }
+          if (credsFile !== undefined) {
+            await rm(credsFile, { force: true }).catch(() => {})
+            state.push('the credentials file was removed')
+          }
+          throw new Error(`Mount create '${req.mountpoint}' failed — ${[reason, ...state].join('; ')}. Nothing else was written${req.persistent ? ' (no /etc/fstab line)' : ''}`)
+        }
+        if (req.persistent) {
+          // The reload follows the WRITTEN line. A failed reload leaves the
+          // line (the config is the state) and the live mount — only systemd's
+          // units are stale — so nothing rolls back here.
+          updateProgress('Reloading systemd (daemon-reload)')
+          await daemonReload(executor)
         }
         return { created: req.mountpoint, warnings }
       }),

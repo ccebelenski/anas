@@ -2,7 +2,7 @@ import type { AhrExpansionIntent, Job } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, rmdir, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, rmdir, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -176,7 +176,7 @@ describe('AHR snapshot routes (story 11.12)', () => {
   let jobQueue: JobQueue
   let server: ReturnType<typeof Fastify>
 
-  async function build(opts: { subvol?: string, lvAttr?: string } = {}) {
+  async function build(opts: { subvol?: string, lvAttr?: string, fstabPath?: string } = {}) {
     // cr.52r D3: the pool's mountpoint must exist for the fd-pinned remount a
     // rollback runs in its finally — the pool fixture needs a real directory.
     // It sits one level deep (under `stored`) so a P2 probe can swap the parent
@@ -195,6 +195,9 @@ describe('AHR snapshot routes (story 11.12)', () => {
       confirmStore: new ConfirmStore(),
       intentDir: dir,
       subvolRuntimeDir: runtimeDir,
+      // cr.52s-c: the server's fstab, as registered on the route — the
+      // rollback's remount reads the pool's line from THIS file.
+      ...(opts.fstabPath !== undefined ? { fstabPath: opts.fstabPath } : {}),
     })
   }
 
@@ -295,6 +298,30 @@ describe('AHR snapshot routes (story 11.12)', () => {
     const result = job.result as { rolledBackTo: string, preserved: string }
     assert.equal(result.rolledBackTo, 'nightly')
     assert.match(result.preserved, /^pre-rollback-/)
+  })
+
+  it('cr.52s-c — the rollback remount carries the line from the fstab the ROUTE was registered with (the server fstabPath, not the service fallback)', async () => {
+    // A fixture fstab under the temp dir — the pool's line with an option
+    // (`noatime`) ANAS's defaults do NOT write, and WITHOUT the nofail +
+    // iSCSI-ordering defaults the no-line fallback carries: if the service
+    // read its ANAS_FSTAB_PATH//etc/fstab fallback instead of the route's,
+    // the argv would carry those defaults and never `noatime`.
+    const fstabPath = join(dir, 'server-fstab')
+    await writeFile(fstabPath, `/dev/tank/tank-vol ${join(dir, 'stored', 'pool')} btrfs subvol=@data,noatime 0 0\n`)
+    await build({ fstabPath })
+    const first = await server.inject({ method: 'POST', url: '/v1/ahr/tank/snapshots/nightly/rollback', headers: JSON_HEADERS, payload: '{}' })
+    assert.equal(first.statusCode, 409)
+    const code = first.headers['x-anas-confirm-code'] as string
+    const second = await server.inject({ method: 'POST', url: '/v1/ahr/tank/snapshots/nightly/rollback', headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload: '{}' })
+    assert.equal(second.statusCode, 202)
+    const job = await waitForJob(jobQueue, second.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    // The pool's remount (the finally's fd-pinned mount, spec = the LV): the
+    // stored line's options in the serializer's order (the common `noatime`
+    // flag, then the `subvol=@data` passthrough token).
+    const remount = executor.calls.filter(c => c.command === '/usr/bin/mount' && c.args.at(-1) === '/proc/self/fd/3/.' && c.args.includes('/dev/tank/tank-vol')).at(-1)
+    assert.ok(remount, 'the rollback re-mounted the pool through the fd')
+    assert.deepEqual(remount!.args, ['-c', '-t', 'btrfs', '-o', 'noatime,subvol=@data', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
   })
 
   it('a rollback whose STORED path now resolves through a symlinked parent refuses BEFORE the swap (cr.52r P2)', async () => {

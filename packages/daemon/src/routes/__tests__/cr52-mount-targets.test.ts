@@ -5,7 +5,7 @@ import type { ExecResult } from '../../executor/types.js'
 import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readlinkSync } from 'node:fs'
 import fsp, { mkdir, mkdtemp, readFile, rm, rmdir, symlink, writeFile } from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -68,14 +68,33 @@ async function waitForJob(server: ReturnType<typeof createServer>, id: string): 
   throw new Error(`Job ${id} did not finish`)
 }
 
-/** Record every command the mock executor issues. */
-function spyExecutor(server: ReturnType<typeof createServer>): Array<{ command: string, args: string[] }> {
+/**
+ * Record every command the mock executor issues. cr.52s-c: exec `opts` ride
+ * through to the mock AND into the record (the fd path of an inherited
+ * descriptor, resolved the same best-effort way the mock records it) — the old
+ * spy dropped the third argument, so an `fdPaths` assertion over a spied call
+ * could never see the fd, and the mock never recorded it either.
+ */
+function spyExecutor(server: ReturnType<typeof createServer>): Array<{ command: string, args: string[], fdPaths?: (string | null)[] }> {
   const mock = (server as unknown as { executor: MockExecutor }).executor
-  const calls: Array<{ command: string, args: string[] }> = []
+  const calls: Array<{ command: string, args: string[], fdPaths?: (string | null)[] }> = []
   const orig = mock.exec.bind(mock)
-  mock.exec = async (command: string, args: string[]): Promise<ExecResult> => {
-    calls.push({ command, args })
-    return orig(command, args)
+  mock.exec = async (command: string, args: string[], opts?: Parameters<typeof orig>[2]): Promise<ExecResult> => {
+    calls.push({
+      command,
+      args,
+      ...(opts?.inheritedFds && opts.inheritedFds.length > 0
+        ? { fdPaths: opts.inheritedFds.map((fd) => {
+            try {
+              return readlinkSync(`/proc/self/fd/${fd}`)
+            }
+            catch {
+              return null
+            }
+          }) }
+        : {}),
+    })
+    return orig(command, args, opts)
   }
   return calls
 }
@@ -188,6 +207,10 @@ describe('cr.52 — one shared mountTargetRefusal at every mountpoint door', () 
       const mountCall = calls.find(c => c.command === MOUNT)
       assert.ok(mountCall, 'the mountNow path ran the mount argv')
       assert.equal(mountCall!.args[0], '-c', 'cr.52: the mount job runs mount -c (canonicalised target)')
+      // cr.52s-c (item c): the spied call now sees the fd too — the inherited
+      // descriptor resolves to the opened mountpoint directory (the old spy
+      // dropped exec's opts, so this could never read the fd).
+      assert.equal(mountCall!.fdPaths?.[0], mp, 'the spied call records the opened directory as fdPaths[0]')
     })
 
     it('cr.52r D3 — the mountNow job mounts DIRECTLY through the daemon-opened dir: argv carries /proc/self/fd/3, fdPaths records the directory', async () => {

@@ -23,7 +23,7 @@ import { constants as FS_CONSTANTS } from 'node:fs'
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, readlink, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
-import { dirname, join, normalize, resolve } from 'node:path'
+import { basename, dirname, join, normalize, resolve } from 'node:path'
 import { CIFS_CREDENTIAL_OPTION_KEYS, MountCifsSec, MountExtraOptions, MountNfsSec, normalizeMountTarget, unescapeFstabField } from '@anas/shared'
 import { classifyKind, effectiveMountAt, effectiveMounts, isIgnoredMount, optionsReadOnly, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
 import { cifsAuthToken, getMount, inlineCommentIndex, parseFstab, parseFstabDoc } from '../parsers/fstab.js'
@@ -2123,6 +2123,68 @@ export async function mountThroughOpenedDir(
   const open = await openMountTarget(mountpoint)
   try {
     return await executor.exec(MOUNT, [...args, FD_MOUNT_TARGET], { ...opts, inheritedFds: [open.fd] })
+  }
+  finally {
+    await open.close()
+  }
+}
+
+/**
+ * Create the mountpoint directory of a remote-mount create THROUGH ITS OPENED
+ * PARENT (cr.52s-c): the parent is opened exactly the way {@link
+ * openMountTarget} opens a target (`O_PATH | O_DIRECTORY | O_NOFOLLOW` plus the
+ * readlink proof that the pinned inode IS the checked path), and the leaf is
+ * created at `/proc/self/fd/<parentFd>/<leaf>` — node has no mkdirat(2), but an
+ * O_PATH descriptor is resolvable THROUGH `/proc/self/fd` by the kernel, so the
+ * mkdir lands IN the pinned directory however the textual path moves
+ * afterwards. `mkdir(path, { recursive: true })` on the textual path is exactly
+ * what this replaces: it follows every symlink it meets, so a parent swapped
+ * for a link between the job's re-gate and the mkdir used to create directories
+ * THROUGH the link as root.
+ *
+ * The parent must EXIST: no recursive creation of a chain a non-root user could
+ * re-point (a missing parent is refused naming it). An existing leaf directory
+ * is success (what `mkdir(recursive)` treated as success still is); an existing
+ * non-directory is refused. Throws with the state named — "nothing was
+ * created" — on every refusal; the caller has nothing to roll back.
+ */
+export async function createMountpointThroughOpenedParent(mountpoint: string): Promise<void> {
+  const mp = normalizeMountpointPath(mountpoint)
+  const parent = dirname(mp)
+  const leaf = basename(mp)
+  // The parent must already exist. (The remote-create door's gates never
+  // create chains — unlike the ZFS doors, swapStageRefusal is not one of them,
+  // so no existing rule answers this case; the refusal is this function's.)
+  const parentExists = await lstat(parent).then(() => true, () => false)
+  if (!parentExists)
+    throw new Error(`Mountpoint '${mp}' cannot be created — its parent '${parent}' does not exist (ANAS creates the mountpoint only inside an existing parent; it never creates a chain of directories a user could re-point); nothing was created`)
+  let open: OpenedMountTarget
+  try {
+    // The same pin + proof the mount itself will use — a parent swapped for a
+    // symlink (or a component swapped under the open) refuses HERE, naming the
+    // swapped path, before a leaf is created anywhere.
+    open = await openMountTarget(parent)
+  }
+  catch (err) {
+    throw new Error(`Mountpoint '${mp}' cannot be created — ${err instanceof Error ? err.message : String(err)}; nothing was created`)
+  }
+  try {
+    // The fd path, not the textual path: the kernel resolves it to the pinned
+    // inode, so this mkdir cannot land through a swapped link.
+    await mkdir(`/proc/self/fd/${open.fd}/${leaf}`)
+  }
+  catch (err) {
+    const e = err as NodeJS.ErrnoException
+    if (e.code === 'EEXIST') {
+      // mkdir(recursive) treated an existing DIRECTORY as success — keep that,
+      // but prove it (a leaf swapped for a symlink must NOT become success; the
+      // fd-pinned mount that follows refuses it, and the operator hears why).
+      const leafSt = await lstat(join(parent, leaf)).catch(() => null)
+      if (leafSt !== null && !leafSt.isSymbolicLink() && leafSt.isDirectory())
+        return
+      throw new Error(`Mountpoint '${mp}' already exists and is not a directory — refused; nothing was created`)
+    }
+    throw new Error(`Mountpoint '${mp}' cannot be created — ${e.code ?? String(err)}; nothing was created`)
   }
   finally {
     await open.close()

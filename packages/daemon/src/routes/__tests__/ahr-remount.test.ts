@@ -373,12 +373,19 @@ describe('POST /v1/ahr/:name/remount (ahrcache.1 slice 2)', () => {
     assert.equal(mountCalls[0]!.command, '/usr/bin/umount')
     assert.deepEqual(mountCalls[0]!.args, ['--', MOUNTPOINT])
     // cr.52r D3: mounted DIRECTLY from the pool's OWN fstab entry (the spec and
-    // every option its line carries — subvol=@data, nofail, the iSCSI ordering
-    // pair) through the daemon-opened directory, never an invented mount at the
-    // typed path.
+    // every option its line carries) through the daemon-opened directory, never
+    // an invented mount at the typed path. cr.52s-c: the route hands the service
+    // the SERVER's fstabPath — the harness's own `build()` registers
+    // `fstabPath: join(dir, 'fstab')` (a non-default path) and beforeEach writes
+    // the pool's line `subvol=@data,nofail` there, so the argv carries THAT
+    // line's options (the serialized order: the common `nofail` flag, then the
+    // `subvol=@data` passthrough token) — proof the service read the route's
+    // file, not its ANAS_FSTAB_PATH//etc/fstab fallback (which has no line for
+    // this pool, and would re-mount with ANAS's defaults, iSCSI ordering pair
+    // included).
     const m = mountCalls[1]!
     assert.equal(m.command, '/usr/bin/mount')
-    assert.deepEqual(m.args, ['-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
+    assert.deepEqual(m.args, ['-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
     assert.equal(m.fdPaths?.[0], MOUNTPOINT, 'the fd resolves to the pool mountpoint')
     // GT-20's negative: `mount -o remount,rw` is refused after an error, so it
     // must never be what this verb reaches for.
