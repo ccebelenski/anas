@@ -226,7 +226,7 @@ describe('cr.64b1 (A) / cr.64b1r — the job door\'s lock recompute: dominance, 
       assert.equal(job.status, 'failed', JSON.stringify(job.result))
       assert.equal(job.error?.code, 'UNAVAILABLE')
       assert.equal(job.error?.message, `Dataset 'testpool/media': the guid of pool 'testpool' could not be read when the run was requested, `
-      + `so the run holds a lock on the pool name 'testpool' instead, which does not cover Pool 'testpool' while another job holds it without that name `
+      + `so the run holds a lock on the pool name 'testpool' instead, which does not cover Pool 'testpool' while another job holds or waits for it without that name `
       + `— nothing was done; try again`)
       assert.deepEqual(snapshotArgv('zfs.snapshot'), [])
       unpark()

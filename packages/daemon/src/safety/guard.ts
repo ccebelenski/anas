@@ -605,7 +605,7 @@ export function unheldClaimsRefusal(
     if (routeUnread.length > 0) {
       const uncovered = missing.filter(c => routeUnread.some(h => h.key === c.within))
       why.push(`${reads(routeUnread)} could not be read when the run was requested, so the run holds a lock on ${objects(routeUnread)} instead, `
-        + `which does not cover ${objects(uncovered)} while another job holds ${uncovered.length === 1 ? 'it' : 'them'} without that name`)
+        + `which does not cover ${objects(uncovered)} while another job holds or waits for ${uncovered.length === 1 ? 'it' : 'them'} without that name`)
     }
     return { status: 503, code: 'UNAVAILABLE', message: `${what}: ${why.join('; ')} — nothing was done; try again` }
   }
