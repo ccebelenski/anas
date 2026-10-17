@@ -201,6 +201,15 @@ async function dragDiskIntoBay(page: Page, diskSel: string, baySel: string): Pro
   await expect(disk).toBeVisible({ timeout: 20_000 })
   const bay = page.locator(baySel).first()
   await expect(bay).toBeVisible({ timeout: 20_000 })
+  // `toBeVisible` passes a CLIPPED box: the Available tray can overflow the
+  // viewport, and a card pinned at the tray's edge has a bounding box the
+  // mouse never truly reaches — pointerdown grabs the edge, not the card,
+  // and the drag never starts (cr.68 node run: the bay stayed empty, the
+  // HDD hint never appeared, and Exec answered "Drag at least one disk into
+  // the cache bay."). Scroll both ends into view before reading the
+  // geometry; the pointer-drag mechanics below are unchanged.
+  await disk.scrollIntoViewIfNeeded()
+  await bay.scrollIntoViewIfNeeded()
   const box = await disk.boundingBox()
   const bayBox = await bay.boundingBox()
   if (!box || !bayBox)

@@ -1,5 +1,6 @@
-import type { Locator, Page } from '@playwright/test'
+import type { Locator, Page, PlaywrightWorkerArgs } from '@playwright/test'
 import { expect, test } from '@playwright/test'
+import { apiContext } from './fixtures/auth'
 import { GATEWAY_URL, loginToPve, NODE_NAME, openAnasItem } from './fixtures/pve-ui'
 import {
   createSnapshot,
@@ -371,18 +372,62 @@ async function deauthorizeKey(): Promise<void> {
     .catch(() => {})
 }
 
+/**
+ * Make sure the node HAS a cluster key before the Remotes window reads one
+ * (cr.68 — cr.62 made GET /replication/remotes a pure read: the key is now
+ * created by POST /replication/remotes/keypair — no body, no confirm gate,
+ * idempotent, `ensureKeypair` never regenerates an existing one). The route
+ * offers no DELETE for the key, so a key created here stays on the node —
+ * that is the product's own steady state once anyone presses Create cluster
+ * key; a key that was already there is left exactly as found.
+ */
+async function ensureClusterKey(playwright: PlaywrightWorkerArgs['playwright']): Promise<void> {
+  const V1 = `${GATEWAY_URL}/api/nodes/${NODE_NAME}/v1`
+  const ctx = await apiContext(playwright)
+  try {
+    const res = await ctx.get(`${V1}/replication/remotes`)
+    expect(res.status(), await res.text()).toBe(200)
+    const publicKey = ((await res.json()).data as { publicKey?: string })?.publicKey
+    if (publicKey?.trim())
+      return
+    const created = await ctx.post(`${V1}/replication/remotes/keypair`)
+    expect(created.status(), await created.text()).toBe(202)
+    const jobId = (await created.json()).job.id as string
+    const deadline = Date.now() + 60_000
+    for (;;) {
+      const jobRes = await ctx.get(`${V1}/jobs/${jobId}`)
+      expect(jobRes.status()).toBe(200)
+      const job = (await jobRes.json()).job as { status: string, error?: { message?: string } }
+      if (job.status === 'completed')
+        return
+      if (job.status === 'failed')
+        throw new Error(`keypair create job failed: ${JSON.stringify(job.error)}`)
+      if (Date.now() > deadline)
+        throw new Error(`keypair create job still '${job.status}' after 60s`)
+      await new Promise(resolve => setTimeout(resolve, 500))
+    }
+  }
+  finally {
+    await ctx.dispose()
+  }
+}
+
 test.describe('ANAS replication Remotes manager (stunt node)', () => {
   test.setTimeout(120_000)
 
-  test('the Remotes manager opens and shows the cluster public key', async ({ page }) => {
+  test('the Remotes manager opens and shows the cluster public key', async ({ page, playwright }) => {
+    // The key must already exist for the window to show one — put it there
+    // through the product's own verb (cr.62: the GET no longer creates it).
+    await ensureClusterKey(playwright)
     await openReplication(page)
     await page.locator('.anas-btn-repl-remotes').click()
 
     const win = page.locator('.anas-win-repl-remotes')
     await expect(win).toBeVisible({ timeout: 20_000 })
 
-    // The public-key panel shows a real key (the daemon generates one on first
-    // GET /replication/remotes). ExtJS renders the field as a <textarea>.
+    // The public-key panel shows a real key — ensureClusterKey above put one
+    // on the node through POST /replication/remotes/keypair if the GET
+    // answered none. ExtJS renders the field as a <textarea>.
     const keyField = win.locator('.anas-repl-pubkey-text textarea')
     await expect(keyField).toBeVisible({ timeout: 20_000 })
     await expect

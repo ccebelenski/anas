@@ -287,9 +287,14 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       expect(lvsA).toContain(`${POOL}-vol`)
       expect(lvsA).toContain(`[${POOL}-vol_corig]`)
       expect(lvsA).toMatch(/Cwi-a.C/)
-      // The pool LV keeps its name and its mapper path across the attach
-      // (GT-18) — mounts, shares, LUNs and the fstab line are untouched.
-      expect(await sshExec(`findmnt -n -o SOURCE ${MOUNT}`)).toContain(`/dev/mapper/${DM_NAME}`)
+      // The pool LV keeps its name across the attach (GT-18) — mounts, shares,
+      // LUNs and the fstab line are untouched. WHICH path findmnt prints for
+      // SOURCE depends on who mounted the pool: a boot-time (fstab) mount
+      // reports the mapper name, while a pool the daemon mounted goes through
+      // `mount -c … /dev/<vg>/<lv>` — not canonicalised — and reports the LV
+      // path (b7d06dbf4). Same device spelled two ways, so accept either.
+      expect(await sshExec(`findmnt -n -o SOURCE ${MOUNT}`))
+        .toMatch(new RegExp(`/dev/(mapper/${DM_NAME}|${POOL}/${POOL}-vol)`))
 
       // --- 2. The API's view -----------------------------------------------
       const cached = await poolDetail(ctx)

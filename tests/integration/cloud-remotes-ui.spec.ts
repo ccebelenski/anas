@@ -463,13 +463,18 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     const failBody = ((await failAlert.first().textContent()) ?? '').replace(/Save failed|OK|Cancel/g, '').trim()
     expect(failBody.length, `the save-failure alert body was: ${failBody}`).toBeGreaterThan(10)
 
-    // …and the manager grid STILL reloads. The counter is fed by an async
-    // route handler, so it is polled, not read once.
+    // …and the manager grid STILL reloads — but only once the refusal alert
+    // is DISMISSED (cr.48g: jobRejected runs the panel's onFailed in the
+    // alert's dismiss callback, so the reload starts when the operator
+    // closes the box, never while it stands). Dismiss it the way the user
+    // would, then poll the counter (it is fed by an async route handler, so
+    // it is polled, not read once).
+    await failAlert.first().getByRole('button', { name: 'OK' }).click()
     await expect.poll(() => fetches.count(), { timeout: 60_000 }).toBeGreaterThan(before)
 
-    // Restore, then dismiss every stacked failure alert (the save's refusal
-    // and the reload's own load failure — the reload path re-probed the store
-    // while it was still broken).
+    // Restore, then dismiss the remaining stacked failure alert (the
+    // reload's own load failure — the dismissal-triggered reload above
+    // re-probed the store while it was still broken).
     await sshExec(`rmdir ${RCLONE_CONF} && mv ${RCLONE_CONF}.failing ${RCLONE_CONF}`)
     // They do NOT arrive together — the reload's own "Load failed" lands a
     // moment after the save's refusal — so the sweep runs until the screen has
