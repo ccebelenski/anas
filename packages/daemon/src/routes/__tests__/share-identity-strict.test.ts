@@ -134,6 +134,8 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
   let passwd: string[] = []
   let groups: string[] = []
   let pdbedit = ''
+  /** Everything the server's pino logger wrote (JSON lines). */
+  let logLines: string[] = []
   /** `pdbedit -L` fails (exit 1, `tdb locked`). */
   let pdbeditFails = false
   /** `smbpasswd -d/-e` fails (exit 1, `tdb locked`) — cr.58r P1. */
@@ -218,7 +220,15 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
       return ok('')
     }
     queue = new JobQueue()
-    app = Fastify({ logger: false })
+    // A capturing logger: the identity.3 journal line is the one thing the
+    // orphan pre-drop path (M5) promises that no argv can show.
+    logLines = []
+    const stream = {
+      write: (line: string) => {
+        logLines.push(line)
+      },
+    } as unknown as NodeJS.WritableStream
+    app = Fastify({ logger: { level: 'info', stream } })
     await app.register(shareIdentityRoutes, {
       prefix: '/v1',
       executor,
@@ -461,6 +471,13 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
     assert.deepEqual(muts[1], [PDBEDIT, '-x', '-u', 'accuser'])
     assert.deepEqual(muts[2], [SMBPASSWD, '-a', '-s', 'accuser'])
     assert.equal((job.result as { smbEntryReplaced?: string }).smbEntryReplaced, 'accuser')
+    // a639a58c3 (node pass F2): the pre-drop journals the identity.3 replace
+    // sentence EXACTLY ONCE — cr.58r's drop ahead of `smbpasswd -a` made
+    // setSmbPasswordVerified's own mismatch branch unreachable on this path,
+    // so without this line a removed entry left no journal record at all.
+    const identityLines = logLines.filter(l => l.includes('identity: SMB passdb entry'))
+    assert.equal(identityLines.length, 1, logLines.join(''))
+    assert.match(identityLines[0], /identity: SMB passdb entry stored as 'accuser' did not match account 'accuser' \(uid \d+\); replaced it \(pdbedit -x -u accuser, then smbpasswd -a accuser\)/)
   })
 
   // --- L2 -------------------------------------------------------------------

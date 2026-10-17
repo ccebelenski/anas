@@ -180,8 +180,11 @@ export function buildBaseInventory(
     const entry = entryByMount.get(row.mountpoint)
     // Tag AHR pool persistence hands-off — match on the LV SPEC (never the
     // mountpoint, which is operator-configurable). The fstab entry spec is the
-    // reliable identity; a mounted pool's findmnt `source` is the /dev/mapper
-    // name, so consult the configured spec too.
+    // reliable identity; a mounted pool's findmnt `source` carries the btrfs
+    // fsroot suffix (`[/@data]`) and, since cr.52r's direct mount, is the LV
+    // path for a daemon-mounted pool and the /dev/mapper name for a boot-time
+    // one — so the source-side test rarely hits and the configured spec is
+    // the match that counts.
     if (ahrSpecs.size > 0 && (ahrSpecs.has(row.source) || (entry && ahrSpecs.has(entry.spec))))
       row.ahrManaged = true
     // Reflect fstab automount even where findmnt shows a plain nfs4 (already

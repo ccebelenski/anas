@@ -795,6 +795,35 @@ unused devices: <none>
       assert.equal(outcome.ok, true, outcome.error) // before the fix: halts "not mounted"
       assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/bin/btrfs', 'filesystem', 'resize', 'max', '/mnt/anas-ahr/tank']])
     })
+
+    it('fs-grow matches a pool the DAEMON mounted, whose findmnt source is the LV path (b7d06dbf4, node pass F1)', async () => {
+      // cr.52r's fd-pinned direct mount (`mount -c … -- /dev/<vg>/<lv>`) does
+      // not canonicalise its source, so findmnt reports `/dev/tank/tank-vol`
+      // where a boot-time mount reports the mapper name; the grow must find
+      // the mount under either spelling (before the fix: "not mounted").
+      const usage = (deviceSize: number): string => [
+        'Overall:',
+        `    Device size:\t\t${deviceSize}`,
+        '    Used:\t\t1024',
+        `    Free (estimated):\t\t${deviceSize - 4096}\t(min: ${deviceSize - 8192})`,
+        '',
+      ].join('\n')
+      const executor = world()
+      executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: vgsJson(0), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: lvsJson(5 * GIB), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/findmnt', result: { stdout: JSON.stringify({ filesystems: [{
+        target: '/mnt/anas-ahr/tank',
+        source: '/dev/tank/tank-vol[/@data]', // the daemon-mounted spelling
+        fstype: 'btrfs',
+        options: 'rw,relatime,subvolid=256,subvol=/@data',
+      }] }), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: usage(3 * GIB), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+
+      const outcome = await run(executor, mkPlan([B1, B2], [{ kind: 'fs-grow', target: 'tank-vol' }]), [X, Y, Z])
+      assert.equal(outcome.ok, true, outcome.error)
+      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/bin/btrfs', 'filesystem', 'resize', 'max', '/mnt/anas-ahr/tank']])
+    })
   })
 
   describe('completion bookkeeping', () => {
