@@ -569,8 +569,15 @@ export function parsePveMountPaths(text: string, liveDatasetMounts?: ReadonlyMap
     if (current?.type === 'zfspool' && current.pool) {
       if (current.mountpoint === undefined)
         claim(`/${current.pool}`, current.id)
-      for (const live of liveDatasetMounts?.get(stripTrailingSlash(current.pool)) ?? [])
-        claim(live, current.id)
+      // Never `/` (cr.60r review): a zfspool stanza naming the ROOT dataset
+      // (`pool rpool/ROOT/pve-1`, or any dataset an operator set mountpoint=/)
+      // would otherwise claim the whole filesystem and every restore target on
+      // the node would answer 409 PVE_MANAGED "inside '/'". The root FS is not
+      // storage territory; the config default `/<dataset>` still claims.
+      for (const live of liveDatasetMounts?.get(stripTrailingSlash(current.pool)) ?? []) {
+        if (live !== '/')
+          claim(live, current.id)
+      }
     }
     current = null
   }

@@ -79,6 +79,12 @@ describe('the zfspool claim covers the dataset\'s LIVE targets too (cr.60r, revi
     assert.deepEqual(map, new Map([['/var/lib/vz', 'local'], ['/rpool/data', 'local-zfs'], ['/mnt/zp2', 'local-zfs'], ['/srv/bind', 'local-zfs']]))
   })
 
+  it('a zfspool stanza whose OWN dataset is live at `/` never claims `/` (cr.60r review edge) — the config default still claims', () => {
+    const rootStanza = 'zfspool: tankroot\n\tpool rpool/ROOT/pve-1\n\tcontent images\n'
+    const map = parsePveMountPaths(rootStanza, new Map([['rpool/ROOT/pve-1', ['/']]]))
+    assert.deepEqual(map, new Map([['/rpool/ROOT/pve-1', 'tankroot']]))
+  })
+
   it('an explicit `mountpoint` keeps its claim beside the live one', () => {
     const map = parsePveMountPaths(loadFixture('storage.cfg'), new Map([['datapool', ['/mnt/dp']]]))
     assert.equal(map.get('/datapool'), 'datapool')
