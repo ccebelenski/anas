@@ -2367,6 +2367,20 @@ export async function poolRoutes(
           const scan = await poolReads.importScan(ctx.reads)
           const scanName = parseImportScan(scan.stdout).find(p => p.guid === target)?.name
           pools = scanName ? [scanName] : imported
+          // cr.52s-b review (Opus 2026-10-17): with no scan name the diff must
+          // name EXACTLY one newcomer. None is a listing that did not see the
+          // pool the `-N` import just made — gating over nothing would run the
+          // real (mounting) import with no gate read. Two or more is another
+          // import or create landing in the same window (it holds other keys):
+          // gating and exporting them all would export a pool this job never
+          // imported and leave it exported. Either way no name is known for the
+          // guid, so nothing is exported and the job refuses naming the state.
+          if (pools.length !== 1) {
+            const seen = pools.length === 0
+              ? 'the post-import listing names no new pool'
+              : `the post-import listing names ${pools.length} new pools (${pools.map(p => `'${p}'`).join(', ')}) and which one carries the guid cannot be told`
+            throw new Error(`Import refused — the pool with guid ${target} was imported unmounted (-N), but the import scan named no pool for the guid and ${seen}, so its stored mountpoints could not be gated and nothing was mounted or exported. It is still imported unmounted; run \`zpool list -o name,guid\`, find the pool with guid ${target}, and export it with \`zpool export <name>\` before retrying`)
+          }
         }
 
         // Gate every dataset's effective mountpoint BEFORE any mount — the

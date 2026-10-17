@@ -565,3 +565,78 @@ describe('cr.52s-b (4): a failed `zfs get` after `-N` exports and refuses', () =
     assert.ok(!importZpoolCalls(ex).some(c => c[0] === 'import' && c.includes('oldtank') && !c.includes('-N')), 'the mounted import never ran')
   })
 })
+
+/**
+ * cr.52s-b review (Opus 2026-10-17): a by-guid import whose import scan named
+ * no pool for the guid learns the name from the post-import diff, and that
+ * diff must name EXACTLY one newcomer. An empty diff once let the gate loop
+ * run over nothing and the real (mounting) `zpool import <guid>` ran with no
+ * `zfs get` at all; a two-name diff (another import or create landing in the
+ * same window under other lock keys) gated both, and on a pass exported the
+ * foreign pool and never re-imported it. Both now refuse naming the state,
+ * with no export and no mounted import.
+ */
+describe('cr.52s-b review: a by-guid import with no scan name needs exactly one newcomer', () => {
+  let server: ReturnType<typeof Fastify> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  const GUID = '9876543210987654321'
+
+  async function importByGuid(ex: MockExecutor): Promise<Job> {
+    const built = await build(ex)
+    server = built.server
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ guid: GUID }),
+    })
+    assert.equal(res.statusCode, 202, res.payload)
+    return waitForJob(built.jobQueue, (res.json() as { job: { id: string } }).job.id)
+  }
+
+  it('an empty diff refuses — no mounted import runs without a gate read', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: ZPOOL, args: ['list', '-j'], results: [listResult('testpool'), listResult('testpool')] })
+    // The scan exits 0 and names nothing for the guid.
+    ex.addFixture({ command: ZPOOL, args: ['import'], result: OK })
+    ex.addFixture({ command: ZPOOL, result: OK })
+    ex.addFixture({ command: SYSTEMCTL, result: OK })
+
+    const job = await importByGuid(ex)
+
+    assert.equal(job.status, 'failed', JSON.stringify(job.error))
+    assert.match(job.error!.message, new RegExp(`the pool with guid ${GUID} was imported unmounted \\(-N\\)`))
+    assert.match(job.error!.message, /the post-import listing names no new pool/)
+    assert.match(job.error!.message, /run `zpool list -o name,guid`/)
+    assert.deepEqual(
+      importZpoolCalls(ex).filter(c => c[0] === 'import' && c.length > 1),
+      [['import', '-N', '--', GUID]],
+      'only the -N import ran — never the mounted one',
+    )
+    assert.ok(!importZpoolCalls(ex).some(c => c[0] === 'export'), 'nothing is exported')
+    assert.ok(!ex.calls.some(c => c.command === SYSTEMCTL), 'no boot-import unit is enabled')
+  })
+
+  it('a two-name diff refuses — a pool another job created or imported meanwhile is never exported', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: ZPOOL, args: ['list', '-j'], results: [listResult('testpool'), listResult('testpool', 'oldtank', 'other')] })
+    ex.addFixture({ command: ZPOOL, args: ['import'], result: OK })
+    ex.addFixture(zfsStoredMountpoints('oldtank'))
+    ex.addFixture(zfsStoredMountpoints('other'))
+    ex.addFixture({ command: ZPOOL, result: OK })
+    ex.addFixture({ command: SYSTEMCTL, result: OK })
+
+    const job = await importByGuid(ex)
+
+    assert.equal(job.status, 'failed', JSON.stringify(job.error))
+    assert.match(job.error!.message, /the post-import listing names 2 new pools \('oldtank', 'other'\)/)
+    assert.ok(!importZpoolCalls(ex).some(c => c[0] === 'export'), 'neither newcomer is exported')
+    assert.ok(!importZpoolCalls(ex).some(c => c[0] === 'import' && !c.includes('-N') && c.length > 1), 'the mounted import never ran')
+    assert.ok(!ex.calls.some(c => c.command === SYSTEMCTL), 'no boot-import unit is enabled')
+  })
+})
