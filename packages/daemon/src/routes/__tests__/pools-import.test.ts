@@ -80,6 +80,9 @@ describe('import pool endpoint: /v1/pools/import', () => {
 
   it('POST with a name returns 202, completes, and builds import args', async () => {
     server = createServer({ mock: true, logger: false })
+    // cr.70 (b): the gate read must NAME the pool root's mountpoint (an exit-0
+    // read that sees nothing refuses); the dev mock seeds that read for
+    // oldtank (server.ts), so a completing import answers the gate here.
     const calls = spyExecutor(server)
 
     const res = await server.inject({
@@ -132,6 +135,9 @@ describe('import pool endpoint: /v1/pools/import', () => {
 
   it('POST with force resent with the confirm code proceeds, and the argv carries -f (cr.12)', async () => {
     server = createServer({ mock: true, logger: false })
+    // cr.70 (b): the gate read must NAME the pool root's mountpoint (an exit-0
+    // read that sees nothing refuses); the dev mock seeds that read for
+    // oldtank (server.ts), so a completing import answers the gate here.
     const calls = spyExecutor(server)
 
     const first = await server.inject({
@@ -266,8 +272,9 @@ describe('import pool endpoint: /v1/pools/import', () => {
     server = createServer({ mock: true, logger: false })
     // The imported pool's own stored mountpoint — knowable only once imported —
     // answers on a protected path. Override the exact `zfs get` read the job
-    // gates against.
-    ;(server as unknown as { executor: { addFixture: (f: object) => void } }).executor.addFixture({
+    // gates against: the dev mock seeds the same read at a SAFE mountpoint
+    // (server.ts, cr.70 (b)) and fixtures are first-wins, so this one PREPENDS.
+    ;(server as unknown as { executor: { prependFixture: (f: object) => void } }).executor.prependFixture({
       command: '/usr/sbin/zfs',
       // cr.52s-b (5): `canmount` rides the same read — a row per property.
       args: ['get', '-H', '-r', '-o', 'name,property,value', 'mountpoint,canmount', '--', 'oldtank'],

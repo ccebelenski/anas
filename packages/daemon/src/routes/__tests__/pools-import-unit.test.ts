@@ -567,6 +567,85 @@ describe('cr.52s-b (4): a failed `zfs get` after `-N` exports and refuses', () =
 })
 
 /**
+ * cr.70 (b): the same door as cr.52s-b (4) arrived at by another way — a
+ * `zfs get` that EXITS 0 but sees nothing. Empty stdout, or rows for children
+ * only, leaves the gate loop nothing to check and the mounting import would
+ * run ungated. A read that could not see never says safe: real zfs always
+ * prints the pool root's two rows, so this output is the blind-read case —
+ * export the pool again (checked) and refuse naming the read.
+ */
+describe('cr.70: an exit-0 `zfs get` that names no mountpoint for the pool root exports and refuses', () => {
+  let server: ReturnType<typeof Fastify> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  it('exit 0 with EMPTY stdout → the pool is exported again (checked) and the job refuses naming the blind read — nothing mounted', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: ZPOOL, args: ['list', '-j'], results: [listResult('testpool'), listResult('testpool', 'oldtank')] })
+    ex.addFixture({
+      command: ZFS,
+      args: ['get', '-H', '-r', '-o', 'name,property,value', 'mountpoint,canmount', '--', 'oldtank'],
+      result: { stdout: '', stderr: '', exitCode: 0 },
+    })
+    ex.addFixture({ command: ZPOOL, result: OK })
+
+    const built = await build(ex)
+    server = built.server
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'oldtank' }),
+    })
+    assert.equal(res.statusCode, 202, res.payload)
+    const job = await waitForJob(built.jobQueue, (res.json() as { job: { id: string } }).job.id)
+
+    assert.equal(job.status, 'failed', JSON.stringify(job.error))
+    const message = job.error!.message
+    assert.match(message, /could not read the stored mountpoints of 'oldtank' before mounting it/)
+    assert.match(message, /named no mountpoint for 'oldtank' itself/)
+    assert.match(message, /was exported again, so nothing was left half-imported/)
+    // The export ran and was CHECKED (it succeeded here).
+    assert.deepEqual(importZpoolCalls(ex).filter(c => c[0] === 'export'), [['export', 'oldtank']])
+    // Nothing mounted: the mounted re-import never ran.
+    assert.ok(!importZpoolCalls(ex).some(c => c[0] === 'import' && c.includes('oldtank') && !c.includes('-N')), 'the mounted import never ran')
+  })
+
+  it('exit 0 with CHILD-ONLY rows → the same refusal: children cannot stand in for the root whose mountpoint the gate must read', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: ZPOOL, args: ['list', '-j'], results: [listResult('testpool'), listResult('testpool', 'oldtank')] })
+    ex.addFixture({
+      command: ZFS,
+      args: ['get', '-H', '-r', '-o', 'name,property,value', 'mountpoint,canmount', '--', 'oldtank'],
+      result: { stdout: 'oldtank/data\tmountpoint\t/mnt/pve/oldtank/data\noldtank/data\tcanmount\ton\n', stderr: '', exitCode: 0 },
+    })
+    ex.addFixture({ command: ZPOOL, result: OK })
+
+    const built = await build(ex)
+    server = built.server
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'oldtank' }),
+    })
+    assert.equal(res.statusCode, 202, res.payload)
+    const job = await waitForJob(built.jobQueue, (res.json() as { job: { id: string } }).job.id)
+
+    assert.equal(job.status, 'failed', JSON.stringify(job.error))
+    const message = job.error!.message
+    assert.match(message, /could not read the stored mountpoints of 'oldtank' before mounting it/)
+    assert.match(message, /named no mountpoint for 'oldtank' itself/)
+    assert.match(message, /was exported again, so nothing was left half-imported/)
+    assert.deepEqual(importZpoolCalls(ex).filter(c => c[0] === 'export'), [['export', 'oldtank']])
+    assert.ok(!importZpoolCalls(ex).some(c => c[0] === 'import' && c.includes('oldtank') && !c.includes('-N')), 'the mounted import never ran')
+  })
+})
+
+/**
  * cr.52s-b review (Opus 2026-10-17): a by-guid import whose import scan named
  * no pool for the guid learns the name from the post-import diff, and that
  * diff must name EXACTLY one newcomer. An empty diff once let the gate loop

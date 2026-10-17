@@ -551,6 +551,16 @@ export function createServer(opts?: ServerOptions) {
     // does NOT resolve as a valid passwd/group line, so `resolveUser`/`resolveGroup`
     // still return null for unknown names → the 404/409 paths behave correctly.
     mock.addFixture({ command: '/usr/bin/getent', result: { stdout: 'x\n', stderr: '', exitCode: 0 } })
+    // The import gate's stored-mountpoint read for the importable sample pool
+    // (cr.52r D4 / cr.52s-b (5)): the root's two rows, at a safe mountpoint.
+    // cr.70 (b) refuses an exit-0 read that names no root mountpoint, so the
+    // command-only zfs fallback below (empty stdout) would otherwise make every
+    // dev-mode import refuse. Registered BEFORE the fallback so it wins.
+    mock.addFixture({
+      command: '/usr/sbin/zfs',
+      args: ['get', '-H', '-r', '-o', 'name,property,value', 'mountpoint,canmount', '--', 'oldtank'],
+      result: { stdout: 'oldtank\tmountpoint\t/mnt/anas-oldtank\noldtank\tcanmount\ton\n', stderr: '', exitCode: 0 },
+    })
     // Dynamic-arg zfs mutations (create/set/destroy) — command-only fallback,
     // taking effect only when no exact read fixture above matches.
     mock.addFixture({ command: '/usr/sbin/zfs', result: { stdout: '', stderr: '', exitCode: 0 } })

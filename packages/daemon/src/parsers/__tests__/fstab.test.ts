@@ -790,6 +790,94 @@ describe('cr.19 — disable parks x-systemd.automount in place; enable restores 
   })
 })
 
+// cr.70 (a) (cr.19 follow-up): systemd-fstab-generator still honours the LEGACY
+// `comment=systemd.automount` spelling beside `x-systemd.automount` (the string
+// is in the PVE 9 generator binary — stunt-node check 2026-10-17), so a
+// hand-written legacy line ANAS only noauto'd kept its `.automount` armed at
+// boot — the D1 class cr.19 closed for the `x-systemd` spelling only. Disable
+// parks the legacy token IN PLACE as `x-anas.disabled-automount=comment` (the
+// value records which spelling it replaced, so the enable round trip stays
+// byte-identical); the reader reads the legacy token as the operator's
+// automount and never shows it in the passthrough.
+describe('cr.70 — disable also parks the legacy comment=systemd.automount spelling; enable restores it', () => {
+  it('legacy line WITHOUT the operator noauto: parks in place with =comment, disable token bare, enable byte-identical', () => {
+    const before = 'h:/e /mnt/legacy nfs4 defaults,nofail,comment=systemd.automount,_netdev 0 0\n'
+    const disabled = disableMount(before, '/mnt/legacy')
+    assert.equal(disabled, 'h:/e /mnt/legacy nfs4 defaults,nofail,x-anas.disabled-automount=comment,_netdev,noauto,x-anas.disabled 0 0\n')
+    const entry = getMount(disabled, '/mnt/legacy')!
+    assert.equal(entry.disabled, true)
+    assert.equal(entry.options.common.automount, true) // the operator's automount, parked
+    assert.equal(entry.options.common.noauto, false) // bare form: ANAS forced the noauto
+    assert.equal(entry.options.passthrough, 'defaults') // the parked token never passthrough
+    assert.equal(enableMount(disabled, '/mnt/legacy'), before) // byte-identical, legacy spelling restored
+  })
+
+  it('legacy line WITH the operator noauto: parked with =comment + kept-noauto token, noauto survives, round trip byte-identical', () => {
+    const before = 'h:/e /mnt/legacy-noauto nfs4 nofail,noauto,comment=systemd.automount 0 0\n'
+    const disabled = disableMount(before, '/mnt/legacy-noauto')
+    assert.equal(disabled, `h:/e /mnt/legacy-noauto nfs4 nofail,noauto,x-anas.disabled-automount=comment,${X_ANAS_DISABLED_KEPT_TOKEN} 0 0\n`)
+    const entry = getMount(disabled, '/mnt/legacy-noauto')!
+    assert.equal(entry.options.common.noauto, true) // the operator's own noauto stays
+    assert.equal(entry.options.common.automount, true)
+    assert.equal(enableMount(disabled, '/mnt/legacy-noauto'), before)
+  })
+
+  it('a live legacy line reads automount=true with the token out of the passthrough; any other comment= value still round-trips there', () => {
+    const { options } = classifyOptions('nfs4', 'defaults,nofail,comment=systemd.automount,x-systemd.idle-timeout=60'.split(','))
+    assert.equal(options.common.automount, true)
+    assert.equal(options.passthrough, 'defaults')
+    assert.equal(options.common.automountIdleTimeout, 60)
+    const entry = getMount('h:/e /mnt/lread nfs4 nofail,comment=systemd.automount 0 0\n', '/mnt/lread')!
+    assert.equal(entry.options.common.automount, true)
+    assert.equal(entry.options.passthrough, '')
+    // The map matches the generator's EXACT option; the operator's own `comment=`
+    // (udisks annotations and the like) stays verbatim passthrough.
+    const other = classifyOptions('nfs4', 'comment=my-annotation'.split(','))
+    assert.equal(other.options.common.automount, false)
+    assert.equal(other.options.passthrough, 'comment=my-annotation')
+  })
+
+  it('a mixed line carrying both spellings: disable parks both in place, enable restores both byte-identically', () => {
+    const before = 'h:/e /mnt/both nfs4 comment=systemd.automount,nofail,x-systemd.automount 0 0\n'
+    const disabled = disableMount(before, '/mnt/both')
+    assert.equal(disabled, 'h:/e /mnt/both nfs4 x-anas.disabled-automount=comment,nofail,x-anas.disabled-automount,noauto,x-anas.disabled 0 0\n')
+    assert.equal(getMount(disabled, '/mnt/both')!.options.common.automount, true)
+    assert.equal(enableMount(disabled, '/mnt/both'), before)
+  })
+
+  it('a differently-cased COMMENT=SYSTEMD.AUTOMOUNT is not the generator\'s option: left alone as passthrough (cr.19 symmetry)', () => {
+    const before = 'h:/e /mnt/lcase nfs4 nofail,COMMENT=SYSTEMD.AUTOMOUNT 0 0\n'
+    const disabled = disableMount(before, '/mnt/lcase')
+    assert.equal(disabled, 'h:/e /mnt/lcase nfs4 nofail,COMMENT=SYSTEMD.AUTOMOUNT,noauto,x-anas.disabled 0 0\n')
+    assert.equal(enableMount(disabled, '/mnt/lcase'), before)
+  })
+
+  it('carriesAutomount: a live legacy line and its parked form count, so Disable/Remove stop the .automount unit for them too', () => {
+    const live = 'h:/e /mnt/lcar nfs4 nofail,comment=systemd.automount 0 0\n'
+    assert.equal(carriesAutomount(live, '/mnt/lcar'), true)
+    assert.equal(carriesAutomount(disableMount(live, '/mnt/lcar'), '/mnt/lcar'), true)
+  })
+
+  it('repair: re-disabling a line already disabled that still carries a LIVE legacy automount parks it in place', () => {
+    const cr6 = 'h:/e /mnt/lrepair nfs4 nofail,_netdev,comment=systemd.automount,noauto,x-anas.disabled 0 0\n'
+    const repaired = disableMount(cr6, '/mnt/lrepair')
+    assert.equal(repaired, 'h:/e /mnt/lrepair nfs4 nofail,_netdev,x-anas.disabled-automount=comment,noauto,x-anas.disabled 0 0\n')
+    // ...and enable un-parks the legacy spelling onto the enabled line.
+    assert.equal(enableMount(repaired, '/mnt/lrepair'), 'h:/e /mnt/lrepair nfs4 nofail,_netdev,comment=systemd.automount 0 0\n')
+  })
+
+  it('an edit of a live legacy line normalises it to the canonical spelling (the line re-serializes anyway): no pair beside it, never dropped', () => {
+    const before = 'h:/e /mnt/ledit nfs4 nofail,comment=systemd.automount 0 0\n'
+    const entry = getMount(before, '/mnt/ledit')!
+    entry.options.common.noatime = true
+    const after = replaceMount(before, '/mnt/ledit', entry)
+    const line = after.trimEnd()
+    assert.ok(!line.includes('comment=systemd.automount'), line)
+    assert.ok(line.includes('x-systemd.automount'), line)
+    assert.equal(getMount(after, '/mnt/ledit')!.options.common.automount, true)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // cr.60r (the cr.60 review's DEFECT + possible 2): a hand-written CIFS line
 // with a username and NO password keeps the username through a save — it

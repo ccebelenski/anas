@@ -2414,6 +2414,18 @@ export async function poolRoutes(
               row.canmount = value?.trim() ?? ''
             datasets.set(name, row)
           }
+          // cr.70 (b): a read that could not see never says safe. An exit-0
+          // `zfs get` that names no mountpoint row for the POOL ROOT itself
+          // (empty stdout, or rows for children only) gates NOTHING — the loop
+          // below would find nothing to check and the mounting import would
+          // run. Real zfs always prints the root's two rows, so this output
+          // means the read did not see the pool it was asked about: it is the
+          // cr.52s-b (4) case arrived at by another door — export the pool
+          // again (CHECKED, item 2) and refuse, naming the read.
+          if (!datasets.get(pool)?.mountpoint) {
+            await exportImportedAgain(pool, [])
+            throw new Error(`could not read the stored mountpoints of '${pool}' before mounting it (zfs get exited 0 but its output named no mountpoint for '${pool}' itself) — the pool was exported again, so nothing was left half-imported; fix the reason the read came back blind and retry`)
+          }
           for (const [, row] of datasets) {
             if (row.canmount === 'off')
               continue

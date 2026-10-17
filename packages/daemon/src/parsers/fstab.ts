@@ -309,9 +309,29 @@ function optionKey(token: string): string {
   return eq === -1 ? t : t.slice(0, eq)
 }
 
-/** Is `token` the LIVE `x-systemd.automount` (exact, as the generator matches it)? */
+/**
+ * The LEGACY automount spelling (cr.70). systemd-fstab-generator still honours
+ * `comment=systemd.automount` beside `x-systemd.automount` — the string is in
+ * the PVE 9 generator binary (stunt-node check 2026-10-17) — so it arms the
+ * line's `.automount` at boot exactly like the modern spelling: a hand-written
+ * legacy line ANAS merely disabled would keep arming (the cr.19 D1 class).
+ * Matched EXACTLY, as the generator matches it.
+ */
+const LEGACY_AUTOMOUNT_TOKEN = 'comment=systemd.automount'
+
+/**
+ * The parked form of a LEGACY live token: the bare parked token keeps meaning
+ * `x-systemd.automount` (so every existing park round trip stays byte-
+ * identical), so the legacy spelling parks with a value naming which spelling
+ * it replaced. The reader matches the parked token by KEY (cr.19), so the
+ * value rides through the read untouched.
+ */
+const PARKED_LEGACY_AUTOMOUNT_TOKEN = `${X_ANAS_DISABLED_AUTOMOUNT_TOKEN}=comment`
+
+/** Is `token` a LIVE automount — `x-systemd.automount` or the legacy `comment=systemd.automount` (cr.70)? Exact, as the generator matches each. */
 function isLiveAutomountToken(token: string): boolean {
-  return token.trim() === X_SYSTEMD_AUTOMOUNT_TOKEN
+  const t = token.trim()
+  return t === X_SYSTEMD_AUTOMOUNT_TOKEN || t === LEGACY_AUTOMOUNT_TOKEN
 }
 
 /**
@@ -331,18 +351,41 @@ function swapTokenText(token: string, to: string): string {
 }
 
 /**
- * Park every live `x-systemd.automount` in an OPTIONS column IN PLACE (cr.19,
- * §2 Mounts automount ruling): the token keeps its position, every other
- * token keeps its exact bytes. Returns the column unchanged when it carries
- * no live automount.
+ * Park every live automount in an OPTIONS column IN PLACE (cr.19, §2 Mounts
+ * automount ruling; cr.70 adds the legacy spelling): the token keeps its
+ * position, every other token keeps its exact bytes. The parked form records
+ * which spelling it replaced — `x-systemd.automount` parks bare, the legacy
+ * `comment=systemd.automount` parks as `x-anas.disabled-automount=comment` —
+ * so Enable restores the spelling the operator wrote. Returns the column
+ * unchanged when it carries no live automount.
  */
 function parkAutomount(opts: string): string {
-  return opts.split(',').map(t => (isLiveAutomountToken(t) ? swapTokenText(t, X_ANAS_DISABLED_AUTOMOUNT_TOKEN) : t)).join(',')
+  return opts.split(',')
+    .map(t => (isLiveAutomountToken(t)
+      ? swapTokenText(t, t.trim() === LEGACY_AUTOMOUNT_TOKEN ? PARKED_LEGACY_AUTOMOUNT_TOKEN : X_ANAS_DISABLED_AUTOMOUNT_TOKEN)
+      : t))
+    .join(',')
 }
 
-/** The inverse of {@link parkAutomount}: every parked token back to `x-systemd.automount`, in place. */
+/** Does a parked automount token carry the legacy spelling (the `=comment` value)? */
+function parkedAutomountIsLegacy(token: string): boolean {
+  const t = token.trim()
+  const eq = t.indexOf('=')
+  return eq !== -1 && t.slice(eq + 1).toLowerCase() === 'comment'
+}
+
+/**
+ * The inverse of {@link parkAutomount}: every parked token back to the spelling
+ * it replaced, in place — bare parked ⇒ `x-systemd.automount`, `=comment` ⇒
+ * the legacy `comment=systemd.automount` (cr.70). A hand-written value on the
+ * parked key other than `comment` restores the canonical spelling.
+ */
 function unparkAutomount(opts: string): string {
-  return opts.split(',').map(t => (isParkedAutomountToken(t) ? swapTokenText(t, X_SYSTEMD_AUTOMOUNT_TOKEN) : t)).join(',')
+  return opts.split(',')
+    .map(t => (isParkedAutomountToken(t)
+      ? swapTokenText(t, parkedAutomountIsLegacy(t) ? LEGACY_AUTOMOUNT_TOKEN : X_SYSTEMD_AUTOMOUNT_TOKEN)
+      : t))
+    .join(',')
 }
 
 /** An OPTIONS column without any parked automount token (every other token byte-identical). */
@@ -392,7 +435,9 @@ function disabledSerialization(entry: MountEntry, comment: string): string {
  * `x-anas.disabled=kept-noauto` when the operator's own `noauto` is already on
  * the line), byte-surgically, so enabling later removes exactly these and the
  * line returns BYTE-IDENTICAL. An `x-systemd.automount` on the line is swapped
- * IN PLACE for `x-anas.disabled-automount` (cr.19, §2 Mounts automount ruling):
+ * IN PLACE for `x-anas.disabled-automount`, and the legacy
+ * `comment=systemd.automount` for `x-anas.disabled-automount=comment` (cr.19,
+ * cr.70, §2 Mounts automount ruling):
  * `noauto` alone does not stop systemd-fstab-generator arming the line's
  * `.automount` at boot (node pass R1-D1). A line already disabled in the
  * option form is left alone — except that a live `x-systemd.automount` still
@@ -440,7 +485,8 @@ export function disableMount(text: string, mountpoint: string): string {
  * `x-anas.disabled` (meaning disable also added the `noauto`), the `noauto`
  * too. The kept-noauto form removes only its own token, leaving the operator's
  * `noauto` alone. A parked `x-anas.disabled-automount` goes back IN PLACE to
- * `x-systemd.automount` (cr.19).
+ * `x-systemd.automount`, and a parked `x-anas.disabled-automount=comment` to
+ * the legacy `comment=systemd.automount` it replaced (cr.19, cr.70).
  */
 export function enableMount(text: string, mountpoint: string): string {
   const doc = parseFstabDoc(text)
@@ -879,6 +925,14 @@ const COMMON_TRUE_FLAGS: Record<string, keyof MountCommonOptions> = {
   'noexec': 'noexec',
   '_netdev': 'netdev',
   'x-systemd.automount': 'automount',
+  // cr.70: systemd-fstab-generator still honours the LEGACY spelling of the same
+  // option (the string is in the PVE 9 generator binary, stunt-node check
+  // 2026-10-17), so the reader reads it as the operator's automount too —
+  // consumed here exactly like the modern token, never shown in the
+  // passthrough. Matched EXACTLY, as the generator matches it; any other
+  // `comment=` value is the operator's own and stays passthrough. ANAS's next
+  // write of the line emits the canonical `x-systemd.automount`.
+  'comment=systemd.automount': 'automount',
 }
 
 /** Apply a common-tier token; returns true when consumed. */
