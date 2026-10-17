@@ -74,21 +74,39 @@ export function refuseControlChars(value: string, field: string): void {
     throw new Error(`Unit ${field} must not contain control characters (newline, carriage return, NUL, …)`)
 }
 
-const WHITESPACE_RE = /\s/
+// A token carrying one of these needs double quotes: systemd's splitter ends
+// an argument on whitespace, `;` starts a SECOND command, and a bare quote
+// character opens/closes quoting (systemd.service(5) "Command lines").
+const NEEDS_QUOTE_RE = /["';\s]/
+const BACKSLASH_RE = /\\/g
+const SPECIFIER_RE = /%/g
+const DOLLAR_RE = /\$/g
 const DQUOTE_RE = /"/g
 
 /**
- * Quote an ExecStart token so systemd's own splitter round-trips it (empty
- * strings and any whitespace get double-quoted; ZFS/pool names are otherwise
- * quote-free). The control-character refusal (cr.51, was replication's
- * private `quoteExecArg`) covers NUL and TAB too — exactly what the shared
- * schemas reject, so the writer and the schema draw the same line.
+ * Quote an ExecStart token so systemd's own splitter round-trips it — the
+ * token as written parses back to EXACTLY the input string (cr.51r made this
+ * true; before it, only whitespace and empty strings were handled and
+ * systemd's own syntax passed through raw). Per systemd.service(5) "Command
+ * lines": `%` (specifier), `$` (variable) and `\` (escape) are doubled —
+ * `%%`, `$$` and `\\` are how systemd spells those literals — and a token
+ * carrying a quote or command-separator character (`"`, `'`, `;`) or
+ * whitespace is double-quoted, with inner `"` and `\` escaped. Slug tokens —
+ * every token our writers emit today — pass through byte-identical, so no
+ * existing unit changes. The control-character refusal (cr.51, was
+ * replication's private `quoteExecArg`) covers NUL and TAB too — exactly what
+ * the shared schemas reject, so the writer and the schema draw the same line.
  */
 export function quoteExecArg(a: string): string {
   refuseControlChars(a, 'ExecStart argument')
-  if (a === '' || WHITESPACE_RE.test(a))
-    return `"${a.replace(DQUOTE_RE, '\\"')}"`
-  return a
+  // systemd's own metacharacters first; the quoting pass below then escapes
+  // the token's `"` without touching the backslashes already doubled. (The
+  // `$` pass uses a function: `$$` in a replacement string is itself an
+  // escape for a single `$`.)
+  let out = a.replace(BACKSLASH_RE, '\\\\').replace(SPECIFIER_RE, '%%').replace(DOLLAR_RE, () => '$$')
+  if (a === '' || NEEDS_QUOTE_RE.test(a))
+    out = `"${out.replace(DQUOTE_RE, '\\"')}"`
+  return out
 }
 
 /** Read one unit file as utf-8 text; null when absent or unreadable. */

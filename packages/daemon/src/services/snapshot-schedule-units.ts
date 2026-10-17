@@ -8,6 +8,7 @@ import { DISABLED_HISTORY_NOTE } from './systemd-status.js'
 // ONE shared copy in systemd-unit-store.ts — snapshot was its second hand-copy.
 import {
   listServiceUnitsChecked,
+  markerRegex,
   parseMarkedJson,
   quoteExecArg,
   refuseControlChars,
@@ -96,7 +97,15 @@ const CADENCE_ONCALENDAR: Record<SnapshotCadence, string> = {
 }
 
 export function cadenceToOnCalendar(cadence: SnapshotCadence): string {
-  return CADENCE_ONCALENDAR[cadence]
+  const expr: string | undefined = CADENCE_ONCALENDAR[cadence]
+  // Fail loud on a cadence outside the enum (cr.51r): the schema fences it at
+  // the boundary, so reaching here with one means a corrupt in-memory
+  // schedule — and rendering `OnCalendar=undefined` would write a timer
+  // systemd rejects at every daemon-reload, silently never firing. The writer
+  // refuses BEFORE the first write instead.
+  if (expr === undefined)
+    throw new Error(`Unknown snapshot cadence: ${String(cadence)}`)
+  return expr
 }
 
 // --- Runner argv -------------------------------------------------------------
@@ -173,13 +182,37 @@ export function parseServiceUnit(content: string): SnapshotSchedule | null {
 // --- Store: read ------------------------------------------------------------
 
 /**
+ * An `anas-snap-*.service` file the store could NOT read back (cr.51r / review
+ * possible 1): no marker, a marker whose JSON does not parse or validate, a
+ * marker naming an id that does not match the file, or a file that could not
+ * be read. Such a unit is invisible to the parsed list while its timer keeps
+ * firing (the C1 proof's poisoned unit did exactly this) — so it is COLLECTED
+ * and surfaced, never silently skipped (the cr.35 unreadable-is-never-empty
+ * convention).
+ */
+export interface UnparseableScheduleUnit {
+  /** The unit file's NAME, as listed in the unit dir. */
+  file: string
+  /** Why it could not be read back — one clause, fits the card and the journal line. */
+  reason: string
+}
+
+/**
  * The schedule store as read, with whether the read was COMPLETE: false when
  * the unit dir could not be listed or any `anas-snap-*.service` file could not
- * be read or parsed. `schedules` holds every valid one either way.
+ * be read or parsed. `schedules` holds every valid one either way, and
+ * `unparseable` names every file that did not parse back, with its reason.
  */
 export interface ScheduleListRead {
   schedules: SnapshotSchedule[]
   complete: boolean
+  unparseable: UnparseableScheduleUnit[]
+}
+
+/** Does the content carry a marker line at all (the reason text says which half failed)? */
+function hasMarkerLine(content: string): boolean {
+  const re = markerRegex(SCHEDULE_MARKER)
+  return content.split('\n').some(line => re.test(line))
 }
 
 /**
@@ -187,30 +220,49 @@ export interface ScheduleListRead {
  * A destroy decision that rests on what other schedules say (who covers a
  * dataset, the most generous count) must not be made on a partial list — the
  * recursive prune checks `complete` and prunes only the target when it is false.
- * The skipped files still get their stderr note.
+ * The skipped files still get their stderr note, and (cr.51r) every one of
+ * them is also RETURNED as an `unparseable` entry so the dashboard and the
+ * daemon-start journal can name it — a unit we cannot read is never silently
+ * empty. A marker whose id does not match the file name is one of them: the
+ * unit claims to be a schedule the file name contradicts, so neither the list
+ * nor a delete-by-id can be trusted to own it.
  */
 export async function readScheduleList(dir: string): Promise<ScheduleListRead> {
   const listed = await listServiceUnitsChecked(dir, UNIT_PREFIX)
   let complete = listed.complete
   const schedules: SnapshotSchedule[] = []
+  const unparseable: UnparseableScheduleUnit[] = []
   for (const file of listed.files) {
     try {
       const content = await readFile(join(dir, file), 'utf-8')
       const schedule = parseServiceUnit(content)
       if (schedule) {
-        schedules.push(schedule)
-      }
-      else {
+        const expectedId = file.slice(UNIT_PREFIX.length, -'.service'.length)
+        if (schedule.id === expectedId) {
+          schedules.push(schedule)
+          continue
+        }
         complete = false
-        process.stderr.write(`[schedules] skipping ${file}: no valid X-ANAS-Schedule JSON\n`)
+        const reason = `its X-ANAS-Schedule id '${schedule.id}' does not match the file name`
+        unparseable.push({ file, reason })
+        process.stderr.write(`[schedules] skipping ${file}: ${reason}\n`)
+        continue
       }
+      complete = false
+      const reason = hasMarkerLine(content)
+        ? 'its X-ANAS-Schedule JSON does not parse or validate'
+        : 'no X-ANAS-Schedule marker'
+      unparseable.push({ file, reason })
+      process.stderr.write(`[schedules] skipping ${file}: ${reason}\n`)
     }
     catch (err) {
       complete = false
-      process.stderr.write(`[schedules] skipping ${file}: ${err instanceof Error ? err.message : String(err)}\n`)
+      const reason = err instanceof Error ? err.message : String(err)
+      unparseable.push({ file, reason })
+      process.stderr.write(`[schedules] skipping ${file}: ${reason}\n`)
     }
   }
-  return { schedules, complete }
+  return { schedules, complete, unparseable }
 }
 
 /** All valid schedules parsed from `anas-snap-*.service` files (invalid → skipped). */
@@ -475,15 +527,37 @@ export function buildScheduleWarnings(statuses: SnapshotScheduleStatus[]): Dashb
 }
 
 /**
+ * cr.51r (review possible 1): one card per `anas-snap-*.service` the store
+ * could not read back. The unit is invisible to the Schedules view (it does
+ * not parse) while its timer keeps firing — the card names the FILE (the only
+ * handle the operator has) and says how to get rid of it. `DELETE
+ * /schedules/:id` still removes such a unit (cr.41b binds the delete to the
+ * unit on disk, not the parsed schedule), so the Schedules view's delete can
+ * reach it when the id is readable; "or by hand" covers the rest.
+ */
+export function buildUnparseableScheduleWarnings(units: UnparseableScheduleUnit[]): DashboardWarning[] {
+  return units.map(u => ({
+    level: 'warning',
+    category: 'schedule',
+    message: `Schedule unit ${u.file} could not be read (${u.reason}); its timer may still fire. Delete it from the Schedules view or by hand`,
+    ref: u.file,
+  }))
+}
+
+/**
  * Collect the dashboard 'schedule' warnings from the store, fail-open. Mirrors
  * how replication/backup warnings are wired into the dashboard aggregate.
+ * One store read feeds both halves (cr.51r): the failed/overdue cards over the
+ * parsed schedules, and one card per unparseable unit file.
  */
 export async function collectScheduleWarnings(
   executor: CommandExecutor,
   dir: string,
 ): Promise<DashboardWarning[]> {
   try {
-    return buildScheduleWarnings(await collectScheduleStatuses(executor, dir))
+    const read = await readScheduleList(dir)
+    const statuses = await Promise.all(read.schedules.map(s => deriveScheduleStatus(executor, s)))
+    return [...buildScheduleWarnings(statuses), ...buildUnparseableScheduleWarnings(read.unparseable)]
   }
   catch {
     return []

@@ -455,6 +455,41 @@ describe('backup units — CRUD lifecycle (temp dir + mocked systemctl)', () => 
     const names = (await readAllTasks(dir)).map(t => t.name).sort()
     assert.deepEqual(names, ['one', 'two'])
   })
+
+  // cr.51r (review possible 1): backup had NO writer-side refusal — the cr.51
+  // review's probe called these renderers directly with a newline name and got
+  // forged lines. The schemas fence the fields at the route; the unit file is a
+  // boundary in its own right, so the writer asks again and writes NOTHING.
+  it('cr.51r: an injected name throws from both renderers and NOTHING is written', async () => {
+    const evil = makeTask({ name: 'x\n[Service]\nExecStartPre=/bin/touch /root/pwned' })
+    assert.throws(() => renderServiceUnit(evil), /control characters/)
+    assert.throws(() => renderTimerUnit(evil), /control characters/)
+    await assert.rejects(() => writeTaskUnits(mock, dir, evil), /control characters/)
+    assert.deepEqual(await readdir(dir), [])
+    // Not one systemctl call either — the refusal precedes every side effect.
+    assert.deepEqual(mock.calls, [])
+  })
+
+  it('cr.51r: a raw schedule that fails the timer renderer leaves no service file', async () => {
+    // The service renderer accepts this task (clean name, clean argv) — only
+    // the raw OnCalendar expression is refused. Both units render before the
+    // first write, so the pair is never half-written.
+    const evil = makeTask({ schedule: 'daily\n[Install]\nWantedBy=multi-user.target' })
+    assert.doesNotThrow(() => renderServiceUnit(evil))
+    assert.throws(() => renderTimerUnit(evil), /control characters/)
+    await assert.rejects(() => writeTaskUnits(mock, dir, evil), /control characters/)
+    assert.deepEqual(await readdir(dir), [])
+    assert.deepEqual(mock.calls, [])
+  })
+
+  it('cr.51r: the --name ExecStart token is quoted (was unquoted before cr.51r)', () => {
+    // A name with whitespace or a command separator survives as ONE argv
+    // token; systemd's own syntax is doubled — and the slug names every real
+    // task carries stay byte-identical (goldens above).
+    assert.match(renderServiceUnit(makeTask({ name: 'nightly etc' })), /ExecStart=\/usr\/bin\/node \S+ --name "nightly etc"/)
+    assert.match(renderServiceUnit(makeTask({ name: 'a;b' })), /--name "a;b"/)
+    assert.match(renderServiceUnit(makeTask({ name: '100%' })), /--name 100%%/)
+  })
 })
 
 describe('backup units — LOCAL-ONLY status derivation', () => {

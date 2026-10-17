@@ -8,7 +8,7 @@ import { isTransientRunSnapshot } from './snapshot-naming.js'
 // The unit-store plumbing (marker regex, unlink, systemctl, unit-dir listing)
 // is the ONE shared copy in systemd-unit-store.ts — this store was its fourth
 // hand-copy and its last private leftovers (third pass).
-import { listServiceUnitsChecked, markerRegex, quoteExecArg, readUnitFile, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
+import { listServiceUnitsChecked, markerRegex, quoteExecArg, readUnitFile, refuseControlChars, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
 import { deriveUnitRunStatus, toSystemdRunResult } from './unit-run-status.js'
 
 /**
@@ -117,8 +117,15 @@ export function runnerArgs(task: ReplicationTask): string[] {
  * Render the `.service` unit. The `X-ANAS-Task=` comment embeds the canonical
  * task JSON (single line) — the ONLY thing the parser reads back. ExecStart is
  * for systemd to actually run; it is never parsed by us.
+ *
+ * Injection refusal (cr.51r / review C1 possibles): the ExecStart tokens have
+ * refused control characters since cr.51 (via {@link quoteExecArg}); `name`
+ * lands in `Description=` and now asks too — the unit file is a security
+ * boundary in its own right, so a direct renderer call refuses like the route
+ * does. Throws — the caller writes NOTHING.
  */
 export function renderServiceUnit(task: ReplicationTask): string {
+  refuseControlChars(task.name, 'task name')
   const execStart = [RUNNER_NODE, RUNNER_SCRIPT, ...runnerArgs(task).map(quoteExecArg)].join(' ')
   return [
     '[Unit]',
@@ -132,8 +139,15 @@ export function renderServiceUnit(task: ReplicationTask): string {
   ].join('\n')
 }
 
-/** Render the `.timer` unit for a task's schedule. */
+/**
+ * Render the `.timer` unit for a task's schedule. Same refusals as the service
+ * (cr.51r): `name` in `Description=`, and the raw OnCalendar expression — the
+ * route validates it with `systemd-analyze calendar`, but the writer asks
+ * again about control characters before it lands on its line.
+ */
 export function renderTimerUnit(task: ReplicationTask): string {
+  refuseControlChars(task.name, 'task name')
+  refuseControlChars(task.schedule, 'OnCalendar expression')
   return [
     '[Unit]',
     `Description=ANAS replication timer ${task.name}`,
@@ -282,8 +296,14 @@ export async function writeTaskUnits(
   dir: string,
   task: ReplicationTask,
 ): Promise<void> {
-  await writeFile(join(dir, serviceUnitName(task.name)), renderServiceUnit(task), 'utf-8')
-  await writeFile(join(dir, timerUnitName(task.name)), renderTimerUnit(task), 'utf-8')
+  // Render BOTH before writing either (cr.51r / review possible 3): the service
+  // used to be written before the timer was even rendered, so a timer-render
+  // refusal left a half-written pair — a service whose timer no longer matches
+  // it (or, on a first create, a service with no timer at all).
+  const serviceText = renderServiceUnit(task)
+  const timerText = renderTimerUnit(task)
+  await writeFile(join(dir, serviceUnitName(task.name)), serviceText, 'utf-8')
+  await writeFile(join(dir, timerUnitName(task.name)), timerText, 'utf-8')
 
   await runSystemctl(executor, ['daemon-reload'])
   const timer = timerUnitName(task.name)

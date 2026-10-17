@@ -184,12 +184,15 @@ export type SnapshotSource = z.infer<typeof SnapshotSource>
 export const ScheduledSnapshot = z.object({
   /**
    * Snapshot label (ZFS: the part after `@`; AHR: the `@snapshots/` child
-   * name). `SingleLine` (cr.51, defensive like the schedule name above): the
-   * label rides line-based plumbing (run results, journald lines, unit text),
-   * and a control character there forges a line. ZFS labels cannot contain one
-   * anyway (`[\w:.-]+` at the filesystem); this fences the AHR side too.
+   * name). cr.51r: this was `SingleLine` — a TYPE-only fence that nothing
+   * ever parses at runtime (the cr.51 review named it drift), so it enforced
+   * nothing. The honest picture: ZFS labels cannot carry a control character
+   * (`[\w:.-]+` at the filesystem); an AHR label comes from the btrfs
+   * `@snapshots/` listing and rides JSON-escaped run results and the UI —
+   * never a unit line, where the real fence is the writers'
+   * `refuseControlChars` (cr.51), not this type.
    */
-  name: SingleLine.min(1),
+  name: z.string().min(1),
   target: SnapshotTarget,
   /** ANAS retention period from the name, or null for `other` snapshots. */
   bucket: RetentionBucket.nullable(),

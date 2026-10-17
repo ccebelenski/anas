@@ -277,6 +277,33 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
     it('readAllTasks on a missing dir returns []', async () => {
       assert.deepEqual(await readAllTasks(join(dir, 'does-not-exist')), [])
     })
+
+    // cr.51r (review possibles 1 + 3): the name in BOTH Description= lines and
+    // the raw OnCalendar expression now carry the writer-side refusal cr.51
+    // gave the other writers, and writeTaskUnits renders BOTH units before
+    // writing either — a refusal leaves the unit dir exactly as it was.
+    it('cr.51r: an injected name throws from both renderers and NOTHING is written', async () => {
+      const evil = makeTask({ name: 'x\n[Service]\nExecStartPre=/bin/touch /root/pwned' })
+      assert.throws(() => renderServiceUnit(evil), /control characters/)
+      assert.throws(() => renderTimerUnit(evil), /control characters/)
+      await assert.rejects(() => writeTaskUnits(mock, dir, evil), /control characters/)
+      assert.deepEqual(await readdir(dir), [])
+      // Not one systemctl call either — the refusal precedes every side effect.
+      assert.deepEqual(mock.calls, [])
+    })
+
+    it('cr.51r: a schedule that fails the timer renderer leaves no service file', async () => {
+      // The service renderer accepts this task (clean name, clean argv) — only
+      // the raw OnCalendar expression is refused. Before cr.51r the service
+      // was written BEFORE the timer was rendered, so this exact input left a
+      // service file with no timer beside it.
+      const evil = makeTask({ schedule: 'daily\n[Install]\nWantedBy=multi-user.target' })
+      assert.doesNotThrow(() => renderServiceUnit(evil))
+      assert.throws(() => renderTimerUnit(evil), /control characters/)
+      await assert.rejects(() => writeTaskUnits(mock, dir, evil), /control characters/)
+      assert.deepEqual(await readdir(dir), [])
+      assert.deepEqual(mock.calls, [])
+    })
   })
 
   // --- status derivation ---------------------------------------------------

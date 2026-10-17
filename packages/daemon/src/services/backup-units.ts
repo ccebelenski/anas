@@ -6,6 +6,9 @@ import type { RunActiveState, SuperviseRunOptions, TaskUnitKind } from './task-u
 import type { TaskHelperResult } from './unit-run-status.js'
 import { BACKUP_SKIP_EXIT_CODE, BackupTask as BackupTaskSchema } from '@anas/shared'
 import { DISABLED_HISTORY_NOTE, parseSystemdTimestamp } from './systemd-status.js'
+// The writer-side injection guards (cr.51 / cr.51r) — the ONE copy in
+// systemd-unit-store.ts, shared with the snapshot, cloud and scrub writers.
+import { quoteExecArg, refuseControlChars } from './systemd-unit-store.js'
 // The systemd/journald half — status derivation, journal reads, the cadence
 // gate, Run-Now supervision, dashboard warnings — and the store plumbing (the
 // marked-JSON parse, the dir read, the write + enable/disable) are the ONE
@@ -122,9 +125,18 @@ export function runnerArgs(task: BackupTask): string[] {
  * (no dashboard warning, no failed unit) while `ExecMainStatus` still tells the
  * status derivation that no backup was taken. Emitted for every task so the unit
  * shape stays uniform — pbc itself only ever exits 0 or 255.
+ *
+ * Injection refusal (cr.51r / review C1 possibles — the snapshot, cloud and
+ * scrub writers asked since cr.51; backup now asks the same): `name` lands in
+ * both `Description=` lines (systemd merges repeated sections, so a newline
+ * there forges a directive), and EVERY ExecStart token goes through
+ * {@link quoteExecArg} — the `--name` value was unquoted until cr.51r. The
+ * marker JSON is safe by construction (`JSON.stringify` escapes every control
+ * character onto its one line). Throws — the caller writes NOTHING.
  */
 export function renderServiceUnit(task: BackupTask): string {
-  const execStart = [RUNNER_NODE, BACKUP_UNIT_KIND.runnerScript, ...runnerArgs(task)].join(' ')
+  refuseControlChars(task.name, 'task name')
+  const execStart = [RUNNER_NODE, BACKUP_UNIT_KIND.runnerScript, ...runnerArgs(task).map(quoteExecArg)].join(' ')
   return [
     '[Unit]',
     `Description=ANAS backup task ${task.name}`,
@@ -150,14 +162,22 @@ export function effectiveSchedule(task: BackupTask): string {
   return effectiveScheduleGeneric(task)
 }
 
-/** Render the `.timer` unit for a task's schedule. */
+/**
+ * Render the `.timer` unit for a task's schedule. Same refusals as the service
+ * (cr.51r): `name` in `Description=`, and the raw OnCalendar expression — a
+ * cadence-generated one is safe by construction, a hand-written one is free
+ * text the route validated but the writer asks again about.
+ */
 export function renderTimerUnit(task: BackupTask): string {
+  refuseControlChars(task.name, 'task name')
+  const onCalendar = effectiveSchedule(task)
+  refuseControlChars(onCalendar, 'OnCalendar expression')
   return [
     '[Unit]',
     `Description=ANAS backup timer ${task.name}`,
     '',
     '[Timer]',
-    `OnCalendar=${effectiveSchedule(task)}`,
+    `OnCalendar=${onCalendar}`,
     'Persistent=true',
     '',
     '[Install]',
@@ -210,6 +230,8 @@ export async function writeTaskUnits(
   dir: string,
   task: BackupTask,
 ): Promise<void> {
+  // Render BOTH before writing anything (cr.51r): a refusal must leave the unit
+  // dir exactly as it was — no half-written pair.
   return writeTaskUnitFiles(BACKUP_UNIT_KIND, executor, dir, task, {
     service: renderServiceUnit(task),
     timer: renderTimerUnit(task),

@@ -13,7 +13,7 @@ import { iscsiStubBootScan } from './services/iscsi-quarantine.js'
 import { PROBE_TMP_BASE, sweepStaleProbeDirs } from './services/rclone-probe.js'
 import { REPLICATION_UNIT_PREFIX } from './services/replication-units.js'
 import { reconcileSelfhealState, reconcileWasQuiet } from './services/selfheal-reconcile.js'
-import { DEFAULT_SYSTEMD_DIR, SNAPSHOT_UNIT_PREFIX } from './services/snapshot-schedule-units.js'
+import { DEFAULT_SYSTEMD_DIR, readScheduleList, SNAPSHOT_UNIT_PREFIX } from './services/snapshot-schedule-units.js'
 import { sweepOrphanTaskStamps } from './services/task-units.js'
 
 // Default to the same socket the gateway expects (/run/anas/anasd.sock). A
@@ -167,6 +167,20 @@ async function main() {
         // constants, never literals; a stamp whose task still exists is the
         // missed-run heal and stays, and a stamp written during this boot is
         // skipped (possibly a create in flight). Non-blocking, fail-open.
+        // Unparseable schedule units (cr.51r / review possible 1): an
+        // `anas-snap-*.service` whose X-ANAS-Schedule marker is missing,
+        // malformed, or names an id the file contradicts is invisible to the
+        // Schedules view while its timer keeps firing as root — a unit written
+        // by a vulnerable build or a hand edit. The dashboard cards each one;
+        // this names them in the journal at start too, where an operator sees
+        // them without opening the UI. One store read, non-blocking, fail-open.
+        void readScheduleList(DEFAULT_SYSTEMD_DIR).then(({ unparseable }) => {
+          for (const u of unparseable)
+            server.log.warn(`schedule unit ${u.file} could not be read (${u.reason}); its timer may still fire — delete it from the Schedules view or by hand`)
+        }).catch((err) => {
+          server.log.warn(`schedule unit scan failed: ${err instanceof Error ? err.message : String(err)}`)
+        })
+
         void sweepOrphanTaskStamps([
           BACKUP_UNIT_KIND,
           CLOUD_UNIT_KIND,

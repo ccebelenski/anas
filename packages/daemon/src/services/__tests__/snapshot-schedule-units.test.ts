@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import {
   buildScheduleWarnings,
+  buildUnparseableScheduleWarnings,
   cadenceToOnCalendar,
   deriveScheduleDetail,
   deriveScheduleStatus,
@@ -187,6 +188,22 @@ describe('snapshot schedule units — CRUD lifecycle (temp dir + mocked systemct
     assert.throws(() => renderTimerUnit(cr), /control characters/)
   })
 
+  // cr.51r (review doc-drift): the test above cannot fail on the render-both
+  // hoist — the name is refused by BOTH renderers, so the service renderer
+  // throws first either way. This is the input that makes the hoist testable:
+  // the service renderer ACCEPTS it (clean name, clean id) and only the timer
+  // renderer refuses. With the hoist nothing is written; without it (the
+  // pre-cr.51 shape — write the service, then render the timer) a service
+  // file with no timer beside it is left on disk.
+  it('cr.51r: a cadence only the timer renderer refuses leaves no service file', async () => {
+    const evil = makeSchedule({ cadence: 'bogus' as SnapshotCadence })
+    assert.doesNotThrow(() => renderServiceUnit(evil))
+    assert.throws(() => renderTimerUnit(evil), /Unknown snapshot cadence/)
+    await assert.rejects(() => writeScheduleUnits(mock, dir, evil), /Unknown snapshot cadence/)
+    assert.deepEqual(await readdir(dir), [])
+    assert.deepEqual(mock.calls, [])
+  })
+
   it('readAllSchedules parses valid units and skips invalid ones (fail-open)', async () => {
     await writeScheduleUnits(mock, dir, makeSchedule({ id: 'one' }))
     await writeScheduleUnits(mock, dir, makeSchedule({ id: 'two' }))
@@ -210,7 +227,57 @@ describe('snapshot schedule units — CRUD lifecycle (temp dir + mocked systemct
     assert.equal(partial.complete, false)
     assert.deepEqual(partial.schedules.map(s => s.id), ['one'])
     // An unlistable dir is not an empty store.
-    assert.deepEqual(await readScheduleList(join(dir, 'does-not-exist')), { schedules: [], complete: false })
+    assert.deepEqual(await readScheduleList(join(dir, 'does-not-exist')), { schedules: [], complete: false, unparseable: [] })
+  })
+
+  // cr.51r (review possible 1): the C1 proof's poisoned unit — written by a
+  // pre-cr.51 build, marker JSON that fails the SingleLine fence — was
+  // INVISIBLE: the list 404'd it, only a stderr line said so, and its timer
+  // kept firing ExecStartPre as root. It must now be collected and named.
+  it('cr.51r: the poisoned unit from the C1 proof is surfaced, not silently skipped', async () => {
+    await writeScheduleUnits(mock, dir, makeSchedule({ id: 'one' }))
+    const evil = makeSchedule({ id: 'evil', name: 'x\n[Service]\nExecStartPre=/bin/touch /root/pwned' })
+    // Byte-for-byte what the vulnerable build's renderServiceUnit produced
+    // (the cr.51 review probe, cr51-probe.test.ts Q2-migration): the raw
+    // newline in Description= forged the [Service]/ExecStartPre lines, and the
+    // marker JSON — control characters escaped onto one line — parses but
+    // fails the schema.
+    const svc = [
+      '[Unit]',
+      `Description=ANAS snapshot schedule ${evil.name}`,
+      `# X-ANAS-Schedule=${JSON.stringify(evil)}`,
+      '',
+      '[Service]',
+      'Type=oneshot',
+      'Environment=TZ=UTC',
+      'ExecStart=/usr/bin/node /opt/anas/packages/daemon/dist/snapshot-task.js --id evil',
+      '',
+    ].join('\n')
+    await writeFile(join(dir, serviceUnitName('evil')), svc)
+    const read = await readScheduleList(dir)
+    assert.deepEqual(read.schedules.map(s => s.id), ['one'])
+    assert.equal(read.complete, false)
+    assert.deepEqual(read.unparseable, [{ file: 'anas-snap-evil.service', reason: 'its X-ANAS-Schedule JSON does not parse or validate' }])
+    // The dashboard card names the file, the reason, and the way out.
+    const cards = buildUnparseableScheduleWarnings(read.unparseable)
+    assert.equal(cards.length, 1)
+    assert.equal(cards[0].level, 'warning')
+    assert.equal(cards[0].category, 'schedule')
+    assert.equal(cards[0].message, 'Schedule unit anas-snap-evil.service could not be read (its X-ANAS-Schedule JSON does not parse or validate); its timer may still fire. Delete it from the Schedules view or by hand')
+  })
+
+  it('cr.51r: a unit with no marker and a unit whose marker id contradicts the file are both surfaced', async () => {
+    await writeFile(join(dir, serviceUnitName('nomarker')), '[Unit]\nDescription=broken\n')
+    // A readable marker naming an id the file contradicts: neither the parsed
+    // list nor a delete-by-id can be trusted to own this unit, so it is not
+    // adopted — it is named.
+    await writeFile(join(dir, serviceUnitName('mismatch')), `# X-ANAS-Schedule=${JSON.stringify(makeSchedule({ id: 'other' }))}\n`)
+    const read = await readScheduleList(dir)
+    assert.deepEqual(read.schedules, [])
+    assert.equal(read.complete, false)
+    const byFile = new Map(read.unparseable.map(u => [u.file, u.reason]))
+    assert.equal(byFile.get('anas-snap-nomarker.service'), 'no X-ANAS-Schedule marker')
+    assert.equal(byFile.get('anas-snap-mismatch.service'), 'its X-ANAS-Schedule id \'other\' does not match the file name')
   })
 })
 

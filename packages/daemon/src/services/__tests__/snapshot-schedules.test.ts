@@ -393,7 +393,7 @@ function flatSched(over: Partial<SnapshotSchedule> = {}): SnapshotSchedule {
   }
 }
 
-const ALONE = { schedules: [], complete: true }
+const ALONE = { schedules: [], complete: true, unparseable: [] }
 
 describe('pruneZfsSchedule (non-recursive) — ZFS held-skip + source-filter', () => {
   it('destroys over-retention anas snapshots, SKIPS the held one, leaves manual untouched', async () => {
@@ -547,7 +547,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     return planZfsSchedulePrune({
       schedule,
       inventory: parseZfsTreeSnapshots(stdout, parseZfsStampSources(stampsOf(stdout))),
-      others: { schedules: others, complete },
+      others: { schedules: others, complete, unparseable: [] },
       now: PRUNE_NOW,
     })
   }
@@ -602,7 +602,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     assert.deepEqual(byDs(plans, 'tank/media')!.prune.map(s => s.name).sort(), [H1, H2])
     assert.equal(byDs(plans, 'tank/media')!.note, undefined)
     // The child schedule's own run, symmetric: its own three, keep 2, the parent's untouched.
-    const own = planZfsSchedulePrune({ schedule: other, inventory: parseZfsTreeSnapshots(stdout, parseZfsStampSources(stampsOf(stdout))), others: { schedules: [sched()], complete: true }, now: PRUNE_NOW })
+    const own = planZfsSchedulePrune({ schedule: other, inventory: parseZfsTreeSnapshots(stdout, parseZfsStampSources(stampsOf(stdout))), others: { schedules: [sched()], complete: true, unparseable: [] }, now: PRUNE_NOW })
     assert.deepEqual(own.map(p => p.dataset), ['tank/media'])
     assert.deepEqual(own[0].prune.map(s => s.name), [M1])
   })
@@ -679,7 +679,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
 
   it('a refused destroy on an excluded dataset (PVE-owned or not) is noted and the run goes on', async () => {
     const res = await pruneZfsSchedule(armRefusing(tree(['tank', 'tank/guests']), [`tank/guests@${H1}`]), sched({ exclude: ['tank/guests'] }), {
-      others: { schedules: [], complete: true },
+      others: { schedules: [], complete: true, unparseable: [] },
       now: PRUNE_NOW,
     })
     const guests = res.datasets.find(d => d.dataset === 'tank/guests')!
@@ -692,7 +692,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     // A clone made from tank/a@H1 — refused every run until the clone goes.
     const executor = armRefusing(tree(['tank', 'tank/a', 'tank/b']), [`tank/a@${H1}`])
     const res = await pruneZfsSchedule(executor, sched(), {
-      others: { schedules: [], complete: true },
+      others: { schedules: [], complete: true, unparseable: [] },
       now: PRUNE_NOW,
     })
     const a = res.datasets.find(d => d.dataset === 'tank/a')!
@@ -712,7 +712,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
   it('a refused destroy on the TARGET still fails the run', async () => {
     await assert.rejects(
       () => pruneZfsSchedule(armRefusing(tree(['tank', 'tank/a']), [`tank@${H1}`]), sched(), {
-        others: { schedules: [], complete: true },
+        others: { schedules: [], complete: true, unparseable: [] },
         now: PRUNE_NOW,
       }),
       /dependent clones/,
@@ -727,7 +727,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     const a = byDs(plans, 'tank/a')!
     assert.deepEqual(a.skippedHeld, [])
     assert.deepEqual(a.prune.map(s => s.name), [H1])
-    const res = await pruneZfsSchedule(armRefusing(stdout, []), sched(), { others: { schedules: [], complete: true }, now: PRUNE_NOW })
+    const res = await pruneZfsSchedule(armRefusing(stdout, []), sched(), { others: { schedules: [], complete: true, unparseable: [] }, now: PRUNE_NOW })
     assert.deepEqual(res.skippedHeld, [])
     assert.equal(snapshotNotifyOutcome({ schedule: sched(), result: zfsRunResult(sched(), H3, res) }), 'success')
   })
@@ -761,7 +761,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
       labels.forEach((l, i) => lines.push(row(ds, l, 1000 + i)))
     const progress: string[] = []
     const res = await pruneZfsSchedule(armRefusing(lines.join('\n'), []), sched(), {
-      others: { schedules: [], complete: true },
+      others: { schedules: [], complete: true, unparseable: [] },
       now: PRUNE_NOW,
       updateProgress: m => progress.push(m),
     })
@@ -799,7 +799,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
     const progress: string[] = []
     const res = await pruneZfsSchedule(executor, sched(), {
-      others: { schedules: [], complete: true },
+      others: { schedules: [], complete: true, unparseable: [] },
       now: PRUNE_NOW,
       updateProgress: m => progress.push(m),
     })
@@ -851,7 +851,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
       assert.ok(!p.prune.some(s => s.name === P1), ds)
     }
     // The covering schedule's own run plans only its own stamp in its sweep.
-    const own = planZfsSchedulePrune({ schedule: projects, inventory: parseZfsTreeSnapshots(stdout, parseZfsStampSources(stampsOf(stdout))), others: { schedules: [sched({ exclude: ['tank/projects'] })], complete: true }, now: PRUNE_NOW })
+    const own = planZfsSchedulePrune({ schedule: projects, inventory: parseZfsTreeSnapshots(stdout, parseZfsStampSources(stampsOf(stdout))), others: { schedules: [sched({ exclude: ['tank/projects'] })], complete: true, unparseable: [] }, now: PRUNE_NOW })
     assert.ok(own.every(p => p.prune.every(s => s.name === P1)))
   })
   it('an INCOMPLETE schedule list still clears this schedule\'s STAMPED snapshots on excluded datasets; unstamped stay', () => {
@@ -882,7 +882,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     assert.deepEqual(byDs(whole, 'tank/media')!.prune.map(s => s.name).sort(), [OLD, H1, H2].sort())
     assert.equal(byDs(whole, 'tank/media')!.note, undefined)
     // The fail-safe note makes the run a warning.
-    const res = await pruneZfsSchedule(armRefusing(stdout, []), sched(), { others: { schedules: [], complete: false }, now: PRUNE_NOW })
+    const res = await pruneZfsSchedule(armRefusing(stdout, []), sched(), { others: { schedules: [], complete: false, unparseable: [] }, now: PRUNE_NOW })
     assert.equal(snapshotNotifyOutcome({ schedule: sched(), result: zfsRunResult(sched(), H3, res) }), 'warning')
   })
   it('ident.1: a snapshot stamped with ANOTHER id is never a candidate, on any scope — even a deleted schedule\'s', () => {
@@ -932,7 +932,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     }
     executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
     const res = await pruneZfsSchedule(executor, sched({ exclude: ['tank/guests'] }), {
-      others: { schedules: [], complete: true },
+      others: { schedules: [], complete: true, unparseable: [] },
       now: PRUNE_NOW,
     })
     const guests = res.datasets.find(d => d.dataset === 'tank/guests')!
@@ -965,7 +965,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
   it('C3: an already-gone destroy is pruned in EVERY scope — target, swept, excluded — no error, no note, no warning', async () => {
     const gone = [`tank@${H1}`, `tank/a@${H1}`, `tank/backup@${H1}`]
     const res = await pruneZfsSchedule(armGone(tree(['tank', 'tank/a', 'tank/backup']), gone), sched({ exclude: ['tank/backup'] }), {
-      others: { schedules: [], complete: true },
+      others: { schedules: [], complete: true, unparseable: [] },
       now: PRUNE_NOW,
     })
     const by = (ds: string) => res.datasets.find(d => d.dataset === ds)!
@@ -1012,7 +1012,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     for (const ds of datasets)
       labels.forEach((l, i) => lines.push(row(ds, l, 1000 + i)))
     const res = await pruneZfsSchedule(armRefusing(lines.join('\n'), []), sched(), {
-      others: { schedules: [], complete: true },
+      others: { schedules: [], complete: true, unparseable: [] },
       now: PRUNE_NOW,
     })
     assert.equal(res.pruned.length, 41 * 99)
@@ -1063,7 +1063,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
       exitCode: 0,
     } })
     executor.addFixture({ command: ZFS, result: { stdout: '0\n', stderr: '', exitCode: 0 } })
-    const res = await pruneZfsSchedule(executor, child, { others: { schedules: [parent], complete: true }, now: PRUNE_NOW })
+    const res = await pruneZfsSchedule(executor, child, { others: { schedules: [parent], complete: true, unparseable: [] }, now: PRUNE_NOW })
     assert.deepEqual(res.pruned, [])
     assert.equal(executor.calls.filter(c => c.args[0] === 'destroy').length, 0)
   })
@@ -1080,8 +1080,8 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
       ...days.map((l, i) => row('tank', l, 100 + i, 0, 1769385600, 'min')),
     ].join('\n')
     const inventory = parseZfsTreeSnapshots(stdout)
-    const byStd = planZfsSchedulePrune({ schedule: standard, inventory, others: { schedules: [minimal], complete: true }, now: new Date('2026-07-27T00:00:00Z') })
-    const byMin = planZfsSchedulePrune({ schedule: minimal, inventory, others: { schedules: [standard], complete: true }, now: new Date('2026-07-27T00:00:00Z') })
+    const byStd = planZfsSchedulePrune({ schedule: standard, inventory, others: { schedules: [minimal], complete: true, unparseable: [] }, now: new Date('2026-07-27T00:00:00Z') })
+    const byMin = planZfsSchedulePrune({ schedule: minimal, inventory, others: { schedules: [standard], complete: true, unparseable: [] }, now: new Date('2026-07-27T00:00:00Z') })
     // Standard: 40 hourlies, keep 36 → its 4 oldest; never a daily.
     assert.deepEqual(byStd[0].prune.map(s => s.name).sort(), hours.slice(0, 4))
     // Minimal: 9 dailies, keep 7 → its 2 oldest; never an hourly.
@@ -1115,7 +1115,7 @@ describe('planZfsSchedulePrune / pruneZfsSchedule (snapprune.1 + ident.1 stamps)
     assert.deepEqual(byDs(plans, 'tank/b')!.prune, [])
     // Through the executor: the stamp source is read with zfs get, and the received one is never destroyed.
     const ex = armRefusing(stdout, [])
-    const res = await pruneZfsSchedule(ex, sched(), { others: { schedules: [], complete: true }, now: PRUNE_NOW })
+    const res = await pruneZfsSchedule(ex, sched(), { others: { schedules: [], complete: true, unparseable: [] }, now: PRUNE_NOW })
     assert.ok(ex.calls.some(c => c.args.join(' ') === 'get -Hp -t snapshot -r -o name,value,source anas:schedule -- tank'))
     assert.ok(!ex.calls.some(c => c.args.join(' ') === `destroy -- tank/a@${H1}`))
     assert.ok(ex.calls.some(c => c.args.join(' ') === `destroy -- tank/a@${H2}`))

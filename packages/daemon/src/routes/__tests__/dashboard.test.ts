@@ -1,10 +1,10 @@
 import type { AhrCapacity, AhrExpansionIntent, JobBrief, PoolTelemetry, StatusSummary, Telemetry } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { afterEach, describe, it } from 'node:test'
+import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
@@ -748,5 +748,89 @@ describe('GET /v1/status — iSCSI warnings (story iscsi.5)', () => {
     assert.equal(serving.length, 1)
     assert.equal(serving[0].level, 'critical')
     assert.match(serving[0].message, /accepting logins with no disks behind it/)
+  })
+})
+
+// cr.51r (review possible 1): a unit file the schedule store cannot read back
+// was INVISIBLE — the list 404'd it, only a stderr line said so, and its
+// timer kept firing as root. The cr.35 convention says unreadable is never
+// empty: the list still answers with what parses, and ONE card per bad file
+// names it, with the way out. DELETE still reaches it (cr.41b binds the
+// delete to the unit on disk, not the parsed schedule).
+describe('GET /v1/status — cr.51r: an unparseable schedule unit cards by file name', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string
+  let prevEnv: string | undefined
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'anas-dash-sched-'))
+    prevEnv = process.env.ANAS_SYSTEMD_DIR
+    process.env.ANAS_SYSTEMD_DIR = dir
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    mock.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // A valid schedule's pair, as the store writes it…
+    const good = { id: 'good', name: 'Good', target: { kind: 'zfs', dataset: 'testpool/media' }, cadence: 'daily', retention: { daily: 7 }, recursive: false, enabled: true, notify: 'on-failure' }
+    writeFileSync(join(dir, 'anas-snap-good.service'), `# X-ANAS-Schedule=${JSON.stringify(good)}\n`)
+    writeFileSync(join(dir, 'anas-snap-good.timer'), '[Timer]\nOnCalendar=daily\n')
+    // …and the C1 proof's poisoned unit, byte-for-byte as the vulnerable build
+    // wrote it (the cr.51 review probe): forged lines in Description=, marker
+    // JSON that parses but fails the SingleLine fence.
+    const evil = { ...good, id: 'evil', name: 'x\n[Service]\nExecStartPre=/bin/touch /root/pwned' }
+    writeFileSync(join(dir, 'anas-snap-evil.service'), [
+      '[Unit]',
+      `Description=ANAS snapshot schedule ${evil.name}`,
+      `# X-ANAS-Schedule=${JSON.stringify(evil)}`,
+      '',
+      '[Service]',
+      'Type=oneshot',
+      'Environment=TZ=UTC',
+      'ExecStart=/usr/bin/node /opt/anas/packages/daemon/dist/snapshot-task.js --id evil',
+      '',
+    ].join('\n'))
+    writeFileSync(join(dir, 'anas-snap-evil.timer'), '[Timer]\nOnCalendar=daily\n')
+  })
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    if (prevEnv === undefined)
+      delete process.env.ANAS_SYSTEMD_DIR
+    else process.env.ANAS_SYSTEMD_DIR = prevEnv
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('GET /schedules answers 200 with the parsed schedule; the poisoned one is not in the list', async () => {
+    const res = await server!.inject({ method: 'GET', url: '/v1/schedules', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 200)
+    const statuses = (res.json() as { data: { schedule: { id: string } }[] }).data
+    assert.deepEqual(statuses.map(s => s.schedule.id), ['good'])
+  })
+
+  it('GET /status cards the poisoned unit, naming the file and the way out', async () => {
+    const res = await server!.inject({ method: 'GET', url: '/v1/status', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 200)
+    const warnings = (res.json() as { data: StatusSummary }).data.warnings
+    const card = warnings.find(w => w.message.includes('anas-snap-evil.service'))
+    assert.ok(card, `card present among: ${JSON.stringify(warnings.map(w => w.message))}`)
+    assert.equal(card.level, 'warning')
+    assert.match(card.message, /Schedule unit anas-snap-evil\.service could not be read \(its X-ANAS-Schedule JSON does not parse or validate\); its timer may still fire\. Delete it from the Schedules view or by hand/)
+  })
+
+  it('DELETE /schedules/evil still removes both files (cr.41b)', async () => {
+    const del = await server!.inject({ method: 'DELETE', url: '/v1/schedules/evil', headers: IDENTITY_HEADERS })
+    assert.equal(del.statusCode, 202)
+    const jobId = (del.json() as { job: { id: string } }).job.id
+    let status = ''
+    for (let i = 0; i < 100 && status !== 'completed' && status !== 'failed'; i++) {
+      const job = await server!.inject({ method: 'GET', url: `/v1/jobs/${jobId}`, headers: IDENTITY_HEADERS })
+      status = (job.json() as { job: { status: string } }).job.status
+      if (status === '' || status === 'queued' || status === 'running')
+        await new Promise(r => setTimeout(r, 10))
+    }
+    assert.equal(status, 'completed')
+    assert.ok(!existsSync(join(dir, 'anas-snap-evil.service')), 'service file removed')
+    assert.ok(!existsSync(join(dir, 'anas-snap-evil.timer')), 'timer file removed')
+    // The good pair is untouched.
+    assert.ok(existsSync(join(dir, 'anas-snap-good.service')))
   })
 })
