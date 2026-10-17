@@ -87,6 +87,19 @@ case "$LABEL" in
     ;;
 esac
 
+# The kernel name ($2, udev's %k) rides the journal line as a KEY=VALUE token
+# and the JSON body (cr.61r): a space or quote would break the line and a `/`
+# would be no device name at all. A kernel device name is `[A-Za-z0-9_-]+` —
+# checked as "no character outside the set", the POOL rule's shape; the empty
+# value (the argument is optional) passes.
+case "$KERNEL" in
+  *[!A-Za-z0-9_-]*)
+    # The bad value is NOT echoed: that is the very line this guards.
+    logger -t "$TAG" -p daemon.info "EVENT=CacheEventIgnored LABEL=${LABEL} REASON=bad-argument"
+    exit 0
+    ;;
+esac
+
 LOGLINE="EVENT=CacheDeviceRemoved POOL=${POOL} SLICE=${LABEL}"
 [ -n "$KERNEL" ] && LOGLINE="${LOGLINE} KERNEL=${KERNEL}"
 logger -t "$TAG" -p daemon.warning "$LOGLINE"
@@ -124,7 +137,10 @@ BODY=$(printf '{"event":"device-removed","slice":"%s","kernel":"%s"}' "$LABEL" "
 # the boot rung at the next daemon start); a curl failure with no HTTP answer
 # at all (the daemon died mid-request, the timeout) is logged with curl's exit
 # status. The reply body is read into the journal line, flattened to one line
-# and cut, never evaluated.
+# and cut, never evaluated. Flattening maps EVERY control character — tab,
+# newline, CR and the rest, octal \0-\37 plus DEL — to a space, not just the
+# newlines (cr.61r): a tab in the body would otherwise sit inside the line and
+# break the KEY=VALUE shape of everything after it.
 RESP=$(curl --silent --show-error --max-time 10 \
   --unix-socket "$SOCKET" \
   --header 'content-type: application/json' \
@@ -137,7 +153,7 @@ RESP=$(curl --silent --show-error --max-time 10 \
   "http://localhost/v1/ahr/${POOL}/cache/event" 2>/dev/null)
 CURL_RC=$?
 HTTP_CODE=$(printf '%s\n' "$RESP" | tail -n 1)
-REPLY=$(printf '%s\n' "$RESP" | sed '$d' | tr '\n\r' '  ' | cut -c1-300)
+REPLY=$(printf '%s\n' "$RESP" | sed '$d' | tr '\0-\37\177' ' ' | cut -c1-300)
 
 case "$HTTP_CODE" in
   2[0-9][0-9])

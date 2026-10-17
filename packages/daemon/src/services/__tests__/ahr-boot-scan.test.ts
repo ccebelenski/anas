@@ -146,6 +146,54 @@ describe('ahr-boot-scan (GT-8 recovery + orphaned intents + reshape observation)
     assert.ok(!executor.calls.some(c => c.command === MDADM && c.args[0] === '--run'))
   })
 
+  it('(a) an unreadable `--detail` skips the WHOLE md pass with a line naming the read — never "not our array" (cr.61r)', async () => {
+    // md127 is the pinned inactive all-spares array the ladder WOULD
+    // force-start; md126's `--detail` fails with an I/O error. The old direct
+    // mdadm call read that failed detail as an empty export, matched no AHR
+    // name, and laddered md127 on a half-seen md view. Through cr.63's typed
+    // reader the pass cannot see, so it skips everything — loudly, naming the
+    // read — and the (b) gate finds no healthy pool.
+    const executor = new MockExecutor()
+    mdstatFixture(executor, `Personalities : [raid1] [raid5]
+md127 : inactive sdd1[3](S) sdc1[1](S)
+      4179968 blocks super 1.2
+
+md126 : active raid1 sdb1[0] sda1[1]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+unused devices: <none>
+`)
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_R1, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md126'], result: { stdout: '', stderr: 'mdadm: cannot open /dev/md126: Input/output error\n', exitCode: 1 } })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/vgchange', result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    const lines: string[] = []
+
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+
+    assert.deepEqual(report.recovered, [], 'no force-start on a half-seen md view')
+    assert.ok(!executor.calls.some(c => c.command === MDADM && (c.args[0] === '--run' || c.args[0] === '--readwrite')), 'the ladder never ran')
+    assert.equal(executor.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'no notification claims a recovery that did not run')
+    assert.ok(
+      lines.some(l => /md-arrays=unreadable read=mdadm --detail --export \/dev\/md126/.test(l) && /Input\/output error/.test(l)),
+      lines.join('\n'),
+    )
+  })
+
+  it('an unreadable /proc/mdstat skips the md pass with a line naming the read (cr.61r)', async () => {
+    // The mdstat branch of the same rule: a read that could not SEE is logged
+    // with the command that failed, not swallowed.
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: { stdout: '', stderr: 'cat: /proc/mdstat: Input/output error\n', exitCode: 1 } })
+    const lines: string[] = []
+
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+
+    assert.deepEqual(report.recovered, [])
+    assert.ok(lines.some(l => /md-arrays=unreadable read=cat \/proc\/mdstat/.test(l)), lines.join('\n'))
+  })
+
   it('(b) a running intent that recorded ANOTHER pool\'s arrays is stale — ignored, never halted (ident.3)', async () => {
     // `tank` was destroyed and recreated under the same name; the old intent
     // recorded the old pool's array UUID, which nothing on the node carries.

@@ -791,9 +791,17 @@ export async function detachAhrCache(
  * cache rung?" for the price of one command, and the expensive read happens
  * only when the answer is yes.
  *
- * Fail-open with an EMPTY list: an unreadable `lvs` at daemon start is not
- * evidence of a failed cache, and the rung it gates is a repair, not an alarm —
- * the udev event and the next start both get another chance.
+ * Fail-open with an EMPTY list, deliberately (cr.61r: said so, not closed).
+ * An unreadable `lvs` at daemon start is not evidence of a failed cache, and
+ * the rung this gates is a repair, not an alarm: the honest consequence is
+ * that the boot rung does not run for this start and NOTHING warns — the retry
+ * doors are the udev event on the next device change and the next daemon
+ * start. The strict alternative (warn when `lvs` fails) does not fit the
+ * warning the scan has: `notifyCacheUnchecked` is per-VG and names the VG that
+ * carries a cache, and an unreadable `lvs` cannot name any VG — closing this
+ * door open would mean inventing a node-wide "cache state unchecked" alarm for
+ * a gate that only decides whether a repair may be needed. A topology that IS
+ * readable but fails later still warns per cached VG (cr.61, review M8).
  */
 export async function cachedVgNames(executor: CommandExecutor): Promise<Set<string>> {
   const res = await executor.exec(LVS, LVS_STATE_ARGS)

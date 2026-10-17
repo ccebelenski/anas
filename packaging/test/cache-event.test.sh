@@ -16,6 +16,11 @@
 #      REASON=http-<code> with the daemon's sentence; no answer at all is
 #      CacheEventUndelivered REASON=curl-exit-<n>. Before cr.61 every one of
 #      them logged CacheEventDelivered.
+#   5d-5f. the kernel name ($2) is validated as a kernel device name before it
+#      rides the journal line or the body; a bad one is REASON=bad-argument
+#      and the bad value is never echoed (cr.61r).
+#   5g.  a reply body with tabs and newlines is flattened to one printable
+#      line (cr.61r).
 #
 set -uo pipefail
 
@@ -112,6 +117,55 @@ RC=$?
 check "exit 0" test "$RC" -eq 0
 check "logger has Ignored" grep -q 'EVENT=CacheEventIgnored' "${TMP}/logger.log"
 check "curl not called" [ ! -s "${TMP}/curl.log" ]
+
+echo "== 5d. a bad kernel name ('sdd 1\"x') is ignored, REASON=bad-argument (cr.61r) =="
+run_hook 'tank-cache1' 'sdd 1"x'
+RC=$?
+check "exit 0" test "$RC" -eq 0
+check "logger has Ignored REASON=bad-argument" grep -q 'EVENT=CacheEventIgnored LABEL=tank-cache1 REASON=bad-argument' "${TMP}/logger.log"
+check "the bad value is not echoed into the line" bash -c "! grep -q '1\"x' '${TMP}/logger.log'"
+check "curl not called" [ ! -s "${TMP}/curl.log" ]
+
+echo "== 5e. a kernel name with a slash is ignored too (cr.61r) =="
+run_hook 'tank-cache1' 'sdd/../x'
+RC=$?
+check "exit 0" test "$RC" -eq 0
+check "logger has Ignored REASON=bad-argument" grep -q 'EVENT=CacheEventIgnored LABEL=tank-cache1 REASON=bad-argument' "${TMP}/logger.log"
+check "curl not called" [ ! -s "${TMP}/curl.log" ]
+
+echo "== 5f. a plain kernel name (sdd1) still posts with KERNEL= (cr.61r regression) =="
+run_hook 'tank-cache1' 'sdd1'
+RC=$?
+check "exit 0" test "$RC" -eq 0
+check "logger has KERNEL=sdd1" grep -q 'EVENT=CacheDeviceRemoved POOL=tank SLICE=tank-cache1 KERNEL=sdd1' "${TMP}/logger.log"
+check "curl called" [ -s "${TMP}/curl.log" ]
+
+echo "== 5g. a reply body with tabs and newlines is flattened to one printable line (cr.61r) =="
+# A daemon sentence containing a TAB and an embedded newline: every control
+# character must become a space, so the Undelivered record stays ONE line of
+# KEY=VALUE tokens. (The stub curl stands in for the daemon's answer here; the
+# real-curl cases 6-9 below keep their own bodies.)
+cat > "${TMP}/bin/curl" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "${TMP}/curl.log"
+printf '{"error":{"message":"bad\treq\nuest"}}\n409'
+exit 0
+EOF
+run_hook 'tank-cache1' 'sdd1'
+RC=$?
+check "exit 0" test "$RC" -eq 0
+check "Undelivered REASON=http-409 logged" grep -q 'EVENT=CacheEventUndelivered POOL=tank SLICE=tank-cache1 REASON=http-409' "${TMP}/logger.log"
+check "the body rode flattened with spaces" grep -q 'DETAIL={"error":{"message":"bad req uest"}}' "${TMP}/logger.log"
+check "no tab survives in the journal log" bash -c "! grep -q \"$(printf '\t')\" '${TMP}/logger.log'"
+check "the Undelivered record is exactly one line" bash -c "[ \$(grep -c 'CacheEventUndelivered' '${TMP}/logger.log') -eq 1 ]"
+# restore the success stub for anything that runs the shim curl after this
+cat > "${TMP}/bin/curl" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "${TMP}/curl.log"
+# simulate success: a 202 body, then the --write-out status line
+printf '{"job":{"id":"j1"}}\n202'
+exit 0
+EOF
 
 # ---- 6-9: the delivery verdict, real curl against a fake anasd ------------
 # Only `logger` is shimmed here; curl is the node's own. The fake daemon is a

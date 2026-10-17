@@ -151,7 +151,12 @@ done
 # (test/stunt-node/deploy-anas.sh), never from a tarball. Pruned for --dev
 # builds too: a dev tarball is a release candidate, and the prune must be
 # what the boot smoke below runs against. The check after the prune fails the
-# build if anything is left, so a renamed directory cannot slip through.
+# build if anything is left — but it matches NAMES (directories named
+# __tests__, files named selfheal-* under dist/bin): it catches a prune that
+# missed a path, NOT a test directory renamed out of both lists (cr.61r —
+# widening it beyond names would mean content heuristics that can
+# false-positive on shipped files). Keep the prune's and the check's name
+# lists in step with the build's test layout.
 for p in "${WORKSPACES[@]}"; do
   find "${APP}/packages/${p}/dist" -type d -name __tests__ -prune -exec rm -rf {} +
 done

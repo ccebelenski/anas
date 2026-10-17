@@ -3,19 +3,18 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { LvmPv } from '../parsers/lvm-report.js'
 import type { GuardSpec } from '../safety/guard.js'
+import type { NamedMdArray } from './ahr-identity.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
 import { parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
-import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
-import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { guardCheck, guarded, GuardRefusalError } from '../safety/guard.js'
 import { IdentityMismatchError } from '../safety/stable-id.js'
 import { cachedVgNames, notifyCacheRecoveryFailed, recoverFailedAhrCache } from './ahr-cache.js'
 import { resumeExpansion } from './ahr-expand-resume.js'
 import { ahrGuard } from './ahr-guard.js'
-import { isIntentStale, isOwnedArray, normalizeMdUuid, pinnedUuids, poolPvNames, readAhrPoolIdentity, readMdadmConfDoc } from './ahr-identity.js'
+import { isIntentStale, isOwnedArray, normalizeMdUuid, pinnedUuids, poolPvNames, readAhrPoolIdentity, readMdadmConfDoc, readNamedMdArrays } from './ahr-identity.js'
 import { defaultAhrIntentDir, listIntents, writeIntent } from './ahr-intent.js'
 import { ahrLvPath } from './ahr-paths.js'
-import { readAhrPools } from './ahr-topology.js'
+import { AhrTopologyUnreadableError, readAhrPools } from './ahr-topology.js'
 import { pveNotify } from './pve-notify.js'
 
 /**
@@ -76,7 +75,6 @@ import { pveNotify } from './pve-notify.js'
  *      cache it tells the operator the cache went unchecked (cr.61).
  */
 
-const CAT = '/usr/bin/cat'
 const MDADM = '/usr/sbin/mdadm'
 const VGCHANGE = '/usr/sbin/vgchange'
 const MOUNT = '/usr/bin/mount'
@@ -175,75 +173,89 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
     }
     return lvm
   }
-  const mdstatRes = await executor.exec(CAT, MDSTAT_CAT_ARGS)
-  if (mdstatRes.exitCode === 0) {
-    const vgActivated = new Set<string>()
-    for (const md of parseMdstat(mdstatRes.stdout)) {
-      const detail = parseMdadmDetailExport((await executor.exec(MDADM, mdadmDetailExportArgs(`/dev/${md.kernelName}`))).stdout)
-      const named = matchAhrArrayName(detail.name ?? detail.devName ?? '')
-      if (!named)
-        continue // foreign array — not ours to touch (guest philosophy)
-      const label = `${named.pool}-r${named.band}`
-      const pinned = pinnedUuids(confDoc, named.pool)
-      const facts = { pool: named.pool, band: named.band, uuid: detail.uuid, kernelName: md.kernelName }
-      const vouched = detail.uuid !== null && pinned.has(normalizeMdUuid(detail.uuid))
-      const owned = vouched || await lvmFacts().then(f => isOwnedArray(facts, pinned, poolPvNames(f.pvs, named.pool), f.vgNames.has(named.pool)))
-      if (!owned) {
-        log(`ahr.boot array=${label} kernel=${md.kernelName} uuid=${detail.uuid ?? 'unknown'} action=ignored reason=not-pinned-not-in-vg`)
-        continue
-      }
-
-      // Classify this array's health for the (b) re-attach gate. Inactive OR
-      // count-degraded (activeDevices < raidDevices) OR any faulted member ⇒
-      // not healthy. An active reshaping/auto-read-only array is healthy.
-      const countDegraded = md.raidDevices !== null && md.activeDevices !== null && md.activeDevices < md.raidDevices
-      const faulted = md.members.some(m => m.faulty)
-      noteArrayHealth(named.pool, md.active && !countDegraded && !faulted)
-
-      if (!md.active && md.members.length > 0 && md.members.every(m => m.spare)) {
-        // (a) GT-8: inactive, all-spares. Drive the verified ladder — but only
-        // on a PINNED array: a PV-of-VG proof needs the array active, and an
-        // unpinned inactive array is exactly the shape a foreign one has.
-        if (detail.uuid === null || !pinned.has(normalizeMdUuid(detail.uuid))) {
-          log(`ahr.boot array=${label} state=inactive-all-spares action=skipped reason=not-pinned`)
-          continue
-        }
-        log(`ahr.boot array=${label} state=inactive-all-spares action=recovery-ladder`)
-        const run = await executor.exec(MDADM, ['--run', `/dev/${md.kernelName}`])
-        if (run.exitCode !== 0) {
-          log(`ahr.boot array=${label} rung=mdadm-run result=failed detail=${run.stderr.trim()}`)
-          await pveNotify(executor, 'error', `AHR boot recovery FAILED: ${label}`, `Array ${label} assembled inactive (all members as spares — the post-power-loss degraded-reshape state, GT-8) and 'mdadm --run' failed: ${run.stderr.trim() || `exit ${run.exitCode}`}. The pool's data is intact on disk but the array needs manual attention.`)
-          continue
-        }
-        log(`ahr.boot array=${label} rung=mdadm-run result=ok`)
-        const rw = await executor.exec(MDADM, ['--readwrite', `/dev/${md.kernelName}`])
-        log(`ahr.boot array=${label} rung=mdadm-readwrite result=${rw.exitCode === 0 ? 'ok' : `failed detail=${rw.stderr.trim()}`}`)
-        if (!vgActivated.has(named.pool)) {
-          vgActivated.add(named.pool)
-          const vg = await executor.exec(VGCHANGE, ['-ay', named.pool])
-          log(`ahr.boot pool=${named.pool} rung=vgchange-ay result=${vg.exitCode === 0 ? 'ok' : `failed detail=${vg.stderr.trim()}`}`)
-        }
-        await pveNotify(
-          executor,
-          'warning',
-          `AHR boot recovery: ${label}`,
-          `Array ${label} assembled INACTIVE after an interrupted degraded reshape (all members listed as spares — GT-8). `
-          + `ANAS ran the recovery ladder: mdadm --run (array started, degraded), mdadm --readwrite (reshape resumes from `
-          + `its kernel checkpoint), vgchange -ay ${named.pool}. Replace the failed disk once the reshape completes.`,
-        )
-        report.recovered.push(label)
-        continue
-      }
-
-      if (md.active && md.sync?.action === 'reshape') {
-        // (c) Kernel-owned reshape in flight — observe, never re-issue (§5.1).
-        log(`ahr.boot array=${label} state=reshaping progress=${md.sync.percent.toFixed(1)}% action=observe-only`)
-        report.observedReshapes.push(label)
-      }
-    }
+  // The array list comes from cr.63's typed reader (cr.61r): a `/proc/mdstat`
+  // or `--detail` read that could not SEE throws AhrTopologyUnreadableError
+  // rather than reading as "no arrays" — or, as the old direct `mdadm` call
+  // did, as "not our array" (an empty detail matches no AHR name). The ladder
+  // force-starts arrays, so it must never run on a half-seen md view: the
+  // whole pass skips, with a journald line naming the read (the shape the
+  // unreadable-mdstat case always had), and the (b) gate then finds no healthy
+  // pool — the fail-closed direction. An ABSENT /proc/mdstat is honestly "no
+  // md arrays" (cr.33e) and the reader returns empty for it.
+  let namedArrays: NamedMdArray[]
+  try {
+    namedArrays = await readNamedMdArrays(executor)
   }
-  else {
-    log(`ahr.boot mdstat=unreadable detail=${mdstatRes.stderr.trim()}`)
+  catch (err) {
+    const read = err instanceof AhrTopologyUnreadableError ? err.command : 'md view'
+    log(`ahr.boot md-arrays=unreadable read=${read} detail=${err instanceof Error ? err.message : String(err)}`)
+    namedArrays = []
+  }
+  const vgActivated = new Set<string>()
+  for (const arr of namedArrays) {
+    const md = arr.mdstat
+    const detail = arr.detail
+    const named = { pool: arr.pool, band: arr.band }
+    const label = `${named.pool}-r${named.band}`
+    const pinned = pinnedUuids(confDoc, named.pool)
+    const facts = { pool: named.pool, band: named.band, uuid: detail.uuid, kernelName: md.kernelName }
+    const vouched = detail.uuid !== null && pinned.has(normalizeMdUuid(detail.uuid))
+    const owned = vouched || await lvmFacts().then(f => isOwnedArray(facts, pinned, poolPvNames(f.pvs, named.pool), f.vgNames.has(named.pool)))
+    if (!owned) {
+      // A named-but-not-ours array (a hand-built `media-r1`): not ours to
+      // touch (guest philosophy) — but its detail ANSWERED, unlike the
+      // unreadable case above, which threw.
+      log(`ahr.boot array=${label} kernel=${md.kernelName} uuid=${detail.uuid ?? 'unknown'} action=ignored reason=not-pinned-not-in-vg`)
+      continue
+    }
+
+    // Classify this array's health for the (b) re-attach gate. Inactive OR
+    // count-degraded (activeDevices < raidDevices) OR any faulted member ⇒
+    // not healthy. An active reshaping/auto-read-only array is healthy.
+    const countDegraded = md.raidDevices !== null && md.activeDevices !== null && md.activeDevices < md.raidDevices
+    const faulted = md.members.some(m => m.faulty)
+    noteArrayHealth(named.pool, md.active && !countDegraded && !faulted)
+
+    if (!md.active && md.members.length > 0 && md.members.every(m => m.spare)) {
+      // (a) GT-8: inactive, all-spares. Drive the verified ladder — but only
+      // on a PINNED array: a PV-of-VG proof needs the array active, and an
+      // unpinned inactive array is exactly the shape a foreign one has.
+      if (detail.uuid === null || !pinned.has(normalizeMdUuid(detail.uuid))) {
+        log(`ahr.boot array=${label} state=inactive-all-spares action=skipped reason=not-pinned`)
+        continue
+      }
+      log(`ahr.boot array=${label} state=inactive-all-spares action=recovery-ladder`)
+      const run = await executor.exec(MDADM, ['--run', `/dev/${md.kernelName}`])
+      if (run.exitCode !== 0) {
+        log(`ahr.boot array=${label} rung=mdadm-run result=failed detail=${run.stderr.trim()}`)
+        await pveNotify(executor, 'error', `AHR boot recovery FAILED: ${label}`, `Array ${label} assembled inactive (all members as spares — the post-power-loss degraded-reshape state, GT-8) and 'mdadm --run' failed: ${run.stderr.trim() || `exit ${run.exitCode}`}. The pool's data is intact on disk but the array needs manual attention.`)
+        continue
+      }
+      log(`ahr.boot array=${label} rung=mdadm-run result=ok`)
+      const rw = await executor.exec(MDADM, ['--readwrite', `/dev/${md.kernelName}`])
+      log(`ahr.boot array=${label} rung=mdadm-readwrite result=${rw.exitCode === 0 ? 'ok' : `failed detail=${rw.stderr.trim()}`}`)
+      if (!vgActivated.has(named.pool)) {
+        vgActivated.add(named.pool)
+        const vg = await executor.exec(VGCHANGE, ['-ay', named.pool])
+        log(`ahr.boot pool=${named.pool} rung=vgchange-ay result=${vg.exitCode === 0 ? 'ok' : `failed detail=${vg.stderr.trim()}`}`)
+      }
+      await pveNotify(
+        executor,
+        'warning',
+        `AHR boot recovery: ${label}`,
+        `Array ${label} assembled INACTIVE after an interrupted degraded reshape (all members listed as spares — GT-8). `
+        + `ANAS ran the recovery ladder: mdadm --run (array started, degraded), mdadm --readwrite (reshape resumes from `
+        + `its kernel checkpoint), vgchange -ay ${named.pool}. Replace the failed disk once the reshape completes.`,
+      )
+      report.recovered.push(label)
+      continue
+    }
+
+    if (md.active && md.sync?.action === 'reshape') {
+      // (c) Kernel-owned reshape in flight — observe, never re-issue (§5.1).
+      log(`ahr.boot array=${label} state=reshaping progress=${md.sync.percent.toFixed(1)}% action=observe-only`)
+      report.observedReshapes.push(label)
+    }
   }
 
   // ---- (b): expansions orphaned by a daemon death -------------------------
