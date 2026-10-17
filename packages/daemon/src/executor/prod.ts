@@ -415,7 +415,16 @@ export class ProdExecutor implements CommandExecutor {
       const tee = opts?.onStderr ? new StderrTee(opts.onStderr) : null
       const child = spawn(command, args, {
         detached: true,
-        stdio: [tee && opts?.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+        // cr.52r D3: inherited fds ride positions 3, 4, … (after the three
+        // stdio slots), so the child's fd 3 is the caller's descriptor and
+        // `/proc/self/fd/3` in the child resolves to whatever the caller
+        // opened. The caller owns the fd — the executor never closes it.
+        stdio: [
+          tee && opts?.stdin === undefined ? 'ignore' : 'pipe',
+          'pipe',
+          'pipe',
+          ...(opts?.inheritedFds ?? []),
+        ],
         // Merge secret env (e.g. pbc's PBS_PASSWORD, Epic 16) over the
         // daemon's own environment for the child only — never on argv.
         ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),

@@ -11,7 +11,9 @@ import {
   parseBtrfsSubvolList,
 } from '../parsers/btrfs-subvol-list.js'
 import { run } from './ahr-exec.js'
+import { mountAhrPool, SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-fstab.js'
 import { diagnoseBusyPath, formatHolders } from './busy-diagnosis.js'
+import { mountThroughOpenedDir } from './mounts.js'
 
 /**
  * AHR btrfs subvolume snapshots (story 11.12, docs/AHR-DESIGN.md §12).
@@ -33,7 +35,6 @@ import { diagnoseBusyPath, formatHolders } from './busy-diagnosis.js'
  */
 
 const BTRFS = '/usr/bin/btrfs'
-const MOUNT = '/usr/bin/mount'
 const UMOUNT = '/usr/bin/umount'
 const MV = '/usr/bin/mv'
 const FINDMNT = '/usr/bin/findmnt'
@@ -45,10 +46,7 @@ const ISO_MILLIS_RE = /\.\d+Z$/
 /** Colons in an ISO timestamp (stripped for a filesystem-safe path segment). */
 const COLON_RE = /:/g
 
-/** The `@data` subvolume — mounted at the pool mountpoint via `subvol=@data`. */
-export const SUBVOL_DATA = '@data'
-/** The `@snapshots` subvolume — the snapshot home, outside the mounted tree. */
-export const SUBVOL_SNAPSHOTS = '@snapshots'
+export { SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-fstab.js'
 
 /** Default runtime base for the on-demand top-level mount (/run = tmpfs). */
 export const DEFAULT_SUBVOL_RUNTIME_DIR = '/run/anas-ahr'
@@ -176,7 +174,11 @@ export async function withTopLevelMount<T>(
   const mnt = topLevelMountPath(pool, opts)
   return serializeOnPath(mnt, async () => {
     await mkdir(mnt, { recursive: true })
-    await run(executor, MOUNT, ['-t', 'btrfs', '-o', 'subvolid=5', lvDevice(pool), mnt])
+    // cr.52r D3: mounted through the runtime directory the daemon opened — the
+    // kernel resolves `/proc/self/fd/3`, so a swapped parent cannot redirect it.
+    const m = await mountThroughOpenedDir(executor, mnt, ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', lvDevice(pool)])
+    if (m.exitCode !== 0)
+      throw new Error(m.stderr.trim() || `mount exited ${m.exitCode}`)
 
     let opError: unknown
     let result!: T
@@ -450,7 +452,8 @@ export async function rollbackAhrSnapshot(
     // Remount the pool mountpoint no matter what — a half-done rollback must
     // never leave the pool offline (fstab still has the subvol=@data entry).
     updateProgress(`Remounting ${pool.mountpoint}`)
-    await executor.exec(MOUNT, ['--', pool.mountpoint])
+    // cr.52r D3: through the daemon-opened directory, the pool's own entry.
+    await mountAhrPool(executor, pool)
   }
   return { pool: pool.name, rolledBackTo: snapName, preserved }
 }

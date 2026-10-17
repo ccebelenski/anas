@@ -1,7 +1,7 @@
 import type { Job } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, rmdir, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -53,7 +53,9 @@ const Y = 'ata-TANK_Y'
 const DISK_SIZE = 2 * GIB + 8 * MIB
 const BAND_SIZE = 2 * GIB - MIB
 const LV_SIZE = 2143289344
-const MOUNTPOINT = '/mnt/anas-ahr/tank'
+// cr.52r D3: the remount's mount opens the pool's mountpoint O_PATH — it must
+// be a REAL directory, so the stored mountpoint is a per-process tmpdir.
+const MOUNTPOINT = join(tmpdir(), `anas-ahr-remount-mp-${process.pid}`)
 const DM_NAME = 'tank-tank--vol'
 
 const MDSTAT = `Personalities : [raid1]
@@ -182,9 +184,9 @@ const BY_ID_LISTING = [
  * because `mount` succeeds and lands read-only again when the fault is still
  * there.
  */
-function findmntResults(world: World, healAfter: boolean) {
+function findmntResults(world: World, healAfter: boolean, target: string = MOUNTPOINT) {
   const table = (options: string) => ok(JSON.stringify({
-    filesystems: [{ target: MOUNTPOINT, source: `/dev/mapper/${DM_NAME}`, fstype: 'btrfs', options }],
+    filesystems: [{ target, source: `/dev/mapper/${DM_NAME}`, fstype: 'btrfs', options }],
   }))
   if (world === 'unmounted')
     return [ok(JSON.stringify({ filesystems: [] }))]
@@ -202,7 +204,7 @@ function findmntResults(world: World, healAfter: boolean) {
     : [table(RO_OPTIONS)]
 }
 
-function buildExecutor(world: World, healAfter = true): MockExecutor {
+function buildExecutor(world: World, healAfter = true, target: string = MOUNTPOINT): MockExecutor {
   const executor = new MockExecutor()
   executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: ok(MDSTAT) })
   executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: ok(MD_EXPORT) })
@@ -213,8 +215,8 @@ function buildExecutor(world: World, healAfter = true): MockExecutor {
   executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: ok(lvsJson(world)) })
   executor.addFixture({ command: '/usr/sbin/pvs', args: [...PVS_ARGS], result: ok(pvsJson(world)) })
   executor.addFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs(DM_NAME), result: ok(DM_STATUS[world]) })
-  executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], results: findmntResults(world, healAfter) })
-  executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', MOUNTPOINT], result: ok(BTRFS_USAGE) })
+  executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], results: findmntResults(world, healAfter, target) })
+  executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', target], result: ok(BTRFS_USAGE) })
   executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: '', exitCode: 1 } })
   executor.addFixture({ command: '/usr/bin/perl', result: ok('') })
   executor.addFixture({ command: '/usr/bin/umount', result: ok('') })
@@ -238,8 +240,8 @@ describe('POST /v1/ahr/:name/remount (ahrcache.1 slice 2)', () => {
   let jobQueue: JobQueue
   let server: ReturnType<typeof Fastify>
 
-  async function build(world: World, healAfter = true) {
-    executor = buildExecutor(world, healAfter)
+  async function build(world: World, healAfter = true, target: string = MOUNTPOINT) {
+    executor = buildExecutor(world, healAfter, target)
     jobQueue = new JobQueue()
     server = Fastify({ logger: false })
     await server.register(jobRoutes, { prefix: '/v1', jobQueue })
@@ -259,12 +261,14 @@ describe('POST /v1/ahr/:name/remount (ahrcache.1 slice 2)', () => {
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-ahr-remount-'))
+    await mkdir(MOUNTPOINT, { recursive: true })
     await writeFile(join(dir, 'fstab'), `/dev/tank/tank-vol ${MOUNTPOINT} btrfs subvol=@data,nofail 0 0\n`)
   })
 
   afterEach(async () => {
     await server?.close()
     await rm(dir, { recursive: true, force: true })
+    await rm(MOUNTPOINT, { recursive: true, force: true })
   })
 
   function post(headers: Record<string, string> = IDENTITY_HEADERS) {
@@ -332,6 +336,30 @@ describe('POST /v1/ahr/:name/remount (ahrcache.1 slice 2)', () => {
     assert.equal(executor.calls.filter(c => c.command === '/usr/bin/umount').length, 0)
   })
 
+  it('cr.52r P2 — a pool whose STORED mountpoint now resolves through a symlinked parent: 409 before any umount/mount', async () => {
+    // The remount verb MOUNTS the stored path again, so the stored path runs
+    // the mount-target refusal. Build the pool mounted at a real, once-legal
+    // path, then swap its parent the way a rebuilt tree (or the operator)
+    // could — the verb must refuse at the route, naming the stored path.
+    const stored = join(dir, 'stored')
+    const poolMountpoint = join(stored, 'pool')
+    await mkdir(poolMountpoint, { recursive: true })
+    await build('ro', true, poolMountpoint)
+    await rm(poolMountpoint, { recursive: true, force: true })
+    await rmdir(stored)
+    await symlink('/etc', stored)
+
+    const res = await post()
+    assert.equal(res.statusCode, 409, res.body)
+    const err = res.json().error
+    assert.equal(err.code, 'CONFLICT')
+    assert.equal(err.reason, 'system-mount-target', JSON.stringify(err))
+    assert.ok(err.message.includes(poolMountpoint), `names the stored path: ${err.message}`)
+    assert.match(err.message, /symlink/)
+    assert.equal(executor.calls.filter(c => c.command === '/usr/bin/umount').length, 0, 'no unmount before the refusal')
+    assert.equal(executor.calls.filter(c => c.command === '/usr/bin/mount').length, 0, 'no mount')
+  })
+
   it('unmounts and mounts — never `remount,rw`, which btrfs refuses', async () => {
     await build('ro')
     const code = (await post()).headers['x-anas-confirm-code'] as string
@@ -342,13 +370,16 @@ describe('POST /v1/ahr/:name/remount (ahrcache.1 slice 2)', () => {
     assert.deepEqual((job.result as { mountpoint: string, readOnly: boolean }), { mountpoint: MOUNTPOINT, readOnly: false })
 
     const mountCalls = executor.calls.filter(c => c.command === '/usr/bin/umount' || c.command === '/usr/bin/mount')
-    assert.deepEqual(mountCalls, [
-      { command: '/usr/bin/umount', args: ['--', MOUNTPOINT] },
-      // By MOUNTPOINT, so fstab supplies the spec and every option the pool's
-      // line carries (subvol=@data, nofail, the iSCSI ordering pair). The verb
-      // never invents a mount.
-      { command: '/usr/bin/mount', args: ['--', MOUNTPOINT] },
-    ])
+    assert.equal(mountCalls[0]!.command, '/usr/bin/umount')
+    assert.deepEqual(mountCalls[0]!.args, ['--', MOUNTPOINT])
+    // cr.52r D3: mounted DIRECTLY from the pool's OWN fstab entry (the spec and
+    // every option its line carries — subvol=@data, nofail, the iSCSI ordering
+    // pair) through the daemon-opened directory, never an invented mount at the
+    // typed path.
+    const m = mountCalls[1]!
+    assert.equal(m.command, '/usr/bin/mount')
+    assert.deepEqual(m.args, ['-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s', '--', '/dev/tank/tank-vol', '/proc/self/fd/3'])
+    assert.equal(m.fdPaths?.[0], MOUNTPOINT, 'the fd resolves to the pool mountpoint')
     // GT-20's negative: `mount -o remount,rw` is refused after an error, so it
     // must never be what this verb reaches for.
     assert.ok(!executor.calls.some(c => c.args.includes('remount,rw')))

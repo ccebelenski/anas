@@ -185,7 +185,12 @@ describe('takeSnapshot — uniform, dispatches by target.kind', () => {
       const res = await takeSnapshot(executor, AHR_TARGET, 'daily', { now: NOW, pool: mkPool(), runtimeDir })
       assert.deepEqual(res, { target: AHR_TARGET, name: `anas-daily-${STAMP}`, bucket: 'daily' })
       const top = join(runtimeDir, 'tank.toplevel')
-      assert.deepEqual(executor.calls[0], { command: MOUNT, args: ['-t', 'btrfs', '-o', 'subvolid=5', '/dev/tank/tank-vol', top] })
+      // cr.52r D3: the top-level opens DIRECTLY through a directory the daemon
+      // opened — the argv carries /proc/self/fd/3 and the fd records the dir.
+      const m = executor.calls[0]
+      assert.equal(m.command, MOUNT)
+      assert.deepEqual(m.args, ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/tank/tank-vol', '/proc/self/fd/3'])
+      assert.equal(m.fdPaths?.[0], top, 'the fd resolves to the opened top-level')
       assert.deepEqual(executor.calls[1], {
         command: BTRFS,
         args: ['subvolume', 'snapshot', '-r', join(top, '@data'), join(top, '@snapshots', `anas-daily-${STAMP}`)],

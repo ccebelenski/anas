@@ -500,6 +500,17 @@ export function serializeMountLine(entry: MountEntry): string {
   return `${escapeFstabField(entry.spec)} ${escapeFstabField(entry.mountpoint)} ${entry.fstype} ${opts} ${entry.dump} ${entry.pass}`
 }
 
+/**
+ * The option string to mount an entry DIRECTLY with `mount(8)` (cr.52r D3):
+ * exactly the token list the fstab serializer would write, so a mount the
+ * daemon runs through an opened directory (`/proc/self/fd/3`) carries the same
+ * spec and options the entry's fstab line configures — the single source of
+ * the option columns both writers share.
+ */
+export function mountOptionTokens(entry: MountEntry): string {
+  return buildOptionTokens(entry).join(',')
+}
+
 // --- Internals --------------------------------------------------------------
 
 /**

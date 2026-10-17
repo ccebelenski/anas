@@ -66,7 +66,11 @@ function rewrite(text: string, from: string, to: string): string {
   return text.replace(from, to)
 }
 
-const MOUNTPOINT = '/mnt/anas-ahr/ahr0'
+// cr.52r D3: a daemon-run AHR remount opens the mountpoint's directory O_PATH
+// BEFORE the mount, so the pool's stored mountpoint must be a REAL directory.
+// The stage-0 capture above the OS's unwritable /mnt is re-pointed at a
+// per-process tmpdir the harness creates (and rms) itself.
+const MOUNTPOINT = join(tmpdir(), `anas-cr38-ahr0-${process.pid}`)
 
 const LIO_NO_LUNS = fixture('iscsi/configfs-restore-empty.manifest')
 const LIO_LUN_ON_AHR0 = rewrite(
@@ -75,7 +79,7 @@ const LIO_LUN_ON_AHR0 = rewrite(
   `udev_path = ${MOUNTPOINT}/images/lun2.raw`,
 )
 
-const FINDMNT_AHR0 = fixture('ahr/findmnt-ahr0.json')
+const FINDMNT_AHR0 = fixture('ahr/findmnt-ahr0.json').replaceAll('"target": "/mnt/anas-ahr/ahr0"', `"target": "${MOUNTPOINT}"`)
 const FINDMNT_AHR0_AT_VAR = rewrite(FINDMNT_AHR0, `"target": "${MOUNTPOINT}"`, '"target": "/var"')
 const RW_OPTIONS = '"options": "rw,relatime,space_cache=v2,subvolid=5,subvol=/"'
 const RO_OPTIONS = '"options": "ro,relatime,space_cache=v2,subvolid=5,subvol=/"'
@@ -167,6 +171,7 @@ describe('cr.38 — the short AHR verbs re-gate in the job (ruling (j))', () => 
     server = undefined
     await rm(dir, { recursive: true, force: true })
     await rm(NEW_MP, { recursive: true, force: true })
+    await rm(MOUNTPOINT, { recursive: true, force: true })
     for (const key of ENV_KEYS) {
       const value = savedEnv[key]
       if (value === undefined)
@@ -182,6 +187,9 @@ describe('cr.38 — the short AHR verbs re-gate in the job (ruling (j))', () => 
     beforeFindmnt = null
     await rm(configfs, { recursive: true, force: true })
     await materializeConfigfsManifest(LIO_NO_LUNS, configfs)
+    // cr.52r D3: the pool's stored mountpoint must exist for the fd-pinned
+    // remount the controls and the LUN/system-pool job tests run.
+    await mkdir(MOUNTPOINT, { recursive: true })
     await writeFile(fstab, `/dev/ahr0/ahr0-vol ${MOUNTPOINT} btrfs nofail 0 0\n`)
     process.env.ANAS_ISCSI_CONFIGFS = configfs
     process.env.ANAS_ISCSI_SAVECONFIG = join(dir, 'absent-saveconfig.json')

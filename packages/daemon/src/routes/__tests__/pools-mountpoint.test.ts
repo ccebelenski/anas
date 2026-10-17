@@ -118,7 +118,7 @@ describe('create pool: mountpoint override (3.27)', () => {
     assert.ok(!args.includes('-m'), 'no -m flag')
   })
 
-  it('rejects a /mnt/pve mountpoint (reserved) with 400 — never creates', async () => {
+  it('rejects a /mnt/pve mountpoint with the ONE shared 409 — never creates (cr.52r)', async () => {
     server = createServer({ mock: true, logger: false })
     const calls = spyExecutor(server)
     const res = await server.inject({
@@ -127,8 +127,10 @@ describe('create pool: mountpoint override (3.27)', () => {
       headers: JSON_HEADERS,
       payload: JSON.stringify({ name: 'newpool', dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }], mountpoint: '/mnt/pve/foo' }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.equal(res.json().error.reason, 'system-mount-target')
+    assert.match(res.json().error.message, /PVE territory/)
     assert.equal(createCall(calls), undefined)
   })
 
@@ -165,7 +167,7 @@ describe('create pool: mountpoint override (3.27)', () => {
 
   // cr.36r: the mountpoint is canonicalised once at the door (the lock key's
   // own normaliser), so every check below it sees one spelling.
-  it('rejects the `/mnt//pve` spelling of the reserved namespace with 400 — never creates', async () => {
+  it('rejects the `/mnt//pve` spelling of the reserved namespace with the ONE shared 409 — never creates (cr.52r)', async () => {
     server = createServer({ mock: true, logger: false })
     // Composable disks: the ONLY thing that may refuse this request is the
     // reserved check (without the inventory stub the disk gate 400s for a
@@ -178,9 +180,10 @@ describe('create pool: mountpoint override (3.27)', () => {
       headers: JSON_HEADERS,
       payload: JSON.stringify({ name: 'newpool', dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }], mountpoint: '/mnt//pve' }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
-    assert.match(res.json().error.message, /reserved/)
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.equal(res.json().error.reason, 'system-mount-target')
+    assert.match(res.json().error.message, /PVE territory/)
     assert.equal(createCall(calls), undefined)
   })
 
@@ -235,7 +238,7 @@ describe('change pool mountpoint: PUT /v1/pools/:name/mountpoint (3.27)', () => 
     assert.equal(res.json().error.code, 'NOT_FOUND')
   })
 
-  it('400 for a reserved /mnt/pve mountpoint', async () => {
+  it('the ONE shared 409 for a reserved /mnt/pve mountpoint (cr.52r)', async () => {
     server = createServer({ mock: true, logger: false })
     const res = await server.inject({
       method: 'PUT',
@@ -243,13 +246,15 @@ describe('change pool mountpoint: PUT /v1/pools/:name/mountpoint (3.27)', () => 
       headers: JSON_HEADERS,
       payload: JSON.stringify({ mountpoint: '/mnt/pve/x' }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.equal(res.json().error.reason, 'system-mount-target')
+    assert.match(res.json().error.message, /PVE territory/)
   })
 
   // cr.36r: the mountpoint is canonicalised once at the door (the lock key's
   // own normaliser), so every check below it sees one spelling.
-  it('400 for the `/mnt//pve` spelling of the reserved namespace', async () => {
+  it('the `/mnt//pve` spelling of the reserved namespace answers the ONE shared 409', async () => {
     server = createServer({ mock: true, logger: false })
     const res = await server.inject({
       method: 'PUT',
@@ -257,9 +262,10 @@ describe('change pool mountpoint: PUT /v1/pools/:name/mountpoint (3.27)', () => 
       headers: JSON_HEADERS,
       payload: JSON.stringify({ mountpoint: '/mnt//pve' }),
     })
-    assert.equal(res.statusCode, 400)
-    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
-    assert.match(res.json().error.message, /reserved/)
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.equal(res.json().error.reason, 'system-mount-target')
+    assert.match(res.json().error.message, /PVE territory/)
   })
 
   it('`/mnt/anas-ahr//ahr0` meets the live mount at `/mnt/anas-ahr/ahr0` — 409, never a zfs set', async () => {

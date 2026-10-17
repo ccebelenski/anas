@@ -938,6 +938,10 @@ export function createServer(opts?: ServerOptions) {
   // re-attach an interrupted expansion after a restart (issue #1).
   server.decorate('diskIdentityCache', diskIdentityCache)
   server.decorate('ahrIntentDir', ahrIntentDir)
+  // Exposed for the boot scan's cache-recover re-attach: an unmounted pool's
+  // real configured mountpoint lives in the pool's OWN fstab line (cr.52r
+  // D3/P2) — the same injectable path every mounts route uses.
+  server.decorate('fstabPath', fstabPath)
   // Exposed for the iSCSI stub quarantine at daemon start (index.ts): the same
   // injectable paths every iSCSI route uses, so the boot pass reads the fixture
   // tree under test and the real one in production — never a mix (story

@@ -140,9 +140,11 @@ describe('cr.52 — one shared mountTargetRefusal at every mountpoint door', () 
       const mnt = join(dir, 'mnt')
       await mkdir(mnt)
       await symlink('/etc', join(mnt, 'laundered'))
+      // cr.52r D2/D3: a symlink ANYWHERE in the existing parent chain is
+      // refused outright (the flyleaf is named), not only when it launders.
       const message = refusalIs(await create(join(mnt, 'laundered', 'data')))
-      assert.match(message, /resolves via the symlink/)
-      assert.match(message, /\/etc/)
+      assert.match(message, /laundered/)
+      assert.match(message, /is a symlink/)
     })
 
     it('a legal (tmpdir-mounted) mountpoint still 202s and completes', async () => {
@@ -160,6 +162,20 @@ describe('cr.52 — one shared mountTargetRefusal at every mountpoint door', () 
       const mountCall = calls.find(c => c.command === MOUNT)
       assert.ok(mountCall, 'the mountNow path ran the mount argv')
       assert.equal(mountCall!.args[0], '-c', 'cr.52: the mount job runs mount -c (canonicalised target)')
+    })
+
+    it('cr.52r D3 — the mountNow job mounts DIRECTLY through the daemon-opened dir: argv carries /proc/self/fd/3, fdPaths records the directory', async () => {
+      server = createServer({ mock: true, logger: false })
+      const mp = join(dir, 'anas-d3-legal')
+      const res = await create(mp, true)
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      const mountCall = mock.calls.find(c => c.command === MOUNT)
+      assert.ok(mountCall, 'the mountNow job ran a mount argv')
+      assert.equal(mountCall!.args.at(-1), '/proc/self/fd/3')
+      assert.equal(mountCall!.fdPaths?.[0], mp, 'the inherited fd resolves to the opened mountpoint directory')
     })
 
     it('a non-empty existing directory confirms exactly as before (L4: sentence names §2)', async () => {
@@ -323,7 +339,7 @@ describe('cr.52 — one shared mountTargetRefusal at every mountpoint door', () 
       const job = await waitForJob(server, id)
       assert.equal(job.status, 'failed', JSON.stringify(job))
       assert.equal(job.error?.code, 'CONFLICT', JSON.stringify(job.error))
-      assert.match(job.error!.message, /resolves via the symlink/)
+      assert.match(job.error!.message, /parent path is a symlink/)
       assert.ok(!calls.some(c => c.command === MOUNT), 'no mount argv ran')
       // The flip swapped the parent for a symlink to /etc, so the job's mkdir
       // would have created /etc/target. The refusal stopped the job BEFORE the
@@ -331,6 +347,422 @@ describe('cr.52 — one shared mountTargetRefusal at every mountpoint door', () 
       const fsProbe = await import('node:fs/promises')
       const lstatTarget = await fsProbe.lstat('/etc/target').then(() => true, () => false)
       assert.equal(lstatTarget, false, 'the refused job never mkdir\'d through the planted symlink')
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // cr.52r — the refined rules, probed at the real doors
+  // ---------------------------------------------------------------------------
+
+  // --- D1: an ANCESTOR of a protected root refuses at every door ------------
+  describe('cr.52r D1 — an ancestor of a protected root refuses at every door', () => {
+    // `/var/spool` is strictly ABOVE `/var/spool/cron` — a mount there would
+    // hide the subtree the protected root guards (cr.52r D1: only the
+    // "at or under" rule existed before, so `/home/alice`, `/var/spool`,
+    // `/var/lib` and `/mnt` all slipped through).
+    const ANCESTOR = '/var/spool'
+    const ancestorSentence = (message: string): void => assert.match(message, /an ancestor of the protected '/)
+
+    it('remote mount at an ancestor of a protected root → 409', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      ancestorSentence(refusalIs(await server.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/export', mountpoint: ANCESTOR, persistent: false }),
+      })))
+      assert.deepEqual(calls.filter(c => c.command === MOUNT), [])
+    })
+
+    it('every one of the four pre-D1 ancestors refuses at the remote door — /home/alice, /var/spool, /var/lib, /mnt', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      for (const ancestor of ['/home/alice', '/var/spool', '/var/lib', '/mnt']) {
+        const message = refusalIs(await server.inject({
+          method: 'POST',
+          url: '/v1/mounts',
+          headers: JSON_HEADERS,
+          payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/export', mountpoint: ancestor, persistent: false }),
+        }))
+        ancestorSentence(message)
+      }
+      assert.deepEqual(calls.filter(c => c.command === MOUNT), [])
+    })
+
+    it('pool create at an ancestor → 409, never a zpool create', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      ancestorSentence(refusalIs(await server.inject({
+        method: 'POST',
+        url: '/v1/pools',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'ancpool', dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }], mountpoint: ANCESTOR }),
+      })))
+      assert.ok(!calls.some(c => c.command === ZPOOL && c.args[0] === 'create'))
+    })
+
+    it('pool mountpoint change to an ancestor → 409, no zfs set', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      ancestorSentence(refusalIs(await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/mountpoint',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ mountpoint: ANCESTOR }),
+      })))
+      assert.ok(!calls.some(c => c.command === ZFS && c.args[0] === 'set'))
+    })
+
+    it('dataset create at an ancestor → 409, no zfs create', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      ancestorSentence(refusalIs(await server.inject({
+        method: 'POST',
+        url: '/v1/pools/testpool/datasets',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ path: 'ancds', properties: { mountpoint: ANCESTOR } }),
+      })))
+      assert.ok(!calls.some(c => c.command === ZFS && c.args[0] === 'create'))
+    })
+
+    it('AHR create at an ancestor → 409 before any disk is touched', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      ancestorSentence(refusalIs(await server.inject({
+        method: 'POST',
+        url: '/v1/ahr',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'ancpool', tier: 'ahr1', disks: ['d1'], mountpoint: ANCESTOR }),
+      })))
+      assert.ok(!calls.some(c => ['/usr/sbin/wipefs', '/usr/sbin/sgdisk'].includes(c.command)))
+    })
+
+    it('AHR mountpoint change to an ancestor → 409, not a confirm', async () => {
+      server = createServer({ mock: true, logger: false })
+      ancestorSentence(refusalIs(await server.inject({
+        method: 'PUT',
+        url: '/v1/ahr/ahr0/mountpoint',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ mountpoint: ANCESTOR }),
+      })))
+    })
+  })
+
+  // --- D2: a MISSING intermediate never skips the walk ----------------------
+  describe('cr.52r D2 — a missing intermediate under a symlinked parent refuses', () => {
+    it('remote mount where the symlink points to /etc and TWO levels below it are missing → 409', async () => {
+      server = createServer({ mock: true, logger: false })
+      const mnt = join(dir, 'mnt')
+      await mkdir(mnt)
+      await symlink('/etc', join(mnt, 'laundered'))
+      // `laundered` exists (the symlink); `newdir` and `data` below it do not.
+      // cr.52's realpath-diff only refused when the missing part was BELOW a
+      // lexically-laundered resolved path; cr.52r's walk stops at `laundered`
+      // (lstat succeeds on a symlink) and refuses it regardless of the gap.
+      const message = refusalIs(await server.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/export', mountpoint: join(mnt, 'laundered', 'newdir', 'data'), persistent: false }),
+      }))
+      assert.match(message, /laundered/)
+      assert.match(message, /is a symlink/)
+      // Nothing was ever created through the planted link.
+      const e = await import('node:fs/promises')
+      assert.equal(await e.lstat('/etc/newdir').then(() => true, () => false), false)
+    })
+  })
+
+  // --- D5: a pool created WITHOUT -m defaulting to a protected /<name> ------
+  describe('cr.52r D5 — a pool created without -m is gated at /<name>', () => {
+    it('`name: home` (ZFS default mountpoint /home) → 409, never a zpool create', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/pools',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'home', dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }] }),
+      })
+      refusalIs(res)
+      assert.match(res.json().error.message, /system path|protected/)
+      assert.ok(!calls.some(c => c.command === ZPOOL && c.args[0] === 'create'), 'no zpool create')
+    })
+  })
+
+  // --- P2: a STORED path that now resolves through a swapped parent ---------
+  describe('cr.52r P2 — the mount-state verb re-gates a stored path that now resolves into /etc', () => {
+    it('state mount of an existing entry whose parent is now a symlink to /etc → 409, no mount', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      // A stored entry at a once-real path whose parent is swapped AFTER the
+      // entry was written (the operator moved it, or a rebuild relinked it).
+      const stored = join(dir, 'stored')
+      await mkdir(stored)
+      const mp = join(stored, 'share')
+      await writeFile(fstabPath, `//10.0.0.9/export ${mp} cifs credentials=/etc/anas/creds/p2.cred,vers=3.1.1,nofail 0 0\n`)
+      await rmdir(stored)
+      await symlink('/etc', stored)
+      const res = await server.inject({
+        method: 'POST',
+        url: `/v1/mounts/${encodeURIComponent(mp)}/state`,
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ action: 'mount' }),
+      })
+      const message = refusalIs(res)
+      assert.match(message, /parent path is a symlink/)
+      assert.ok(!calls.some(c => c.command === MOUNT), 'no mount argv')
+    })
+  })
+
+  // --- P1: the four new entries ride the remote door too --------------------
+  describe('cr.52r P1 — the four state trees an operator could hide a mount in refuse', () => {
+    it('remote mount at each of vz / ceph / dpkg / log → the ONE shared 409', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      for (const mp of ['/var/lib/vz', '/var/lib/vz/112', '/var/lib/ceph', '/var/lib/dpkg', '/var/log', '/var/log/journal']) {
+        const message = refusalIs(await server.inject({
+          method: 'POST',
+          url: '/v1/mounts',
+          headers: JSON_HEADERS,
+          payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/export', mountpoint: mp, persistent: false }),
+        }))
+        assert.match(message, /protected/, mp)
+      }
+      assert.deepEqual(calls.filter(c => c.command === MOUNT), [])
+    })
+  })
+
+  // --- P3: the job re-runs the refusal under its lock at the pool doors -----
+  describe('cr.52r P3 — the job re-runs the refusal at the pool and dataset doors (paused-queue)', () => {
+    const DISK_IDS = ['d1', 'd2']
+
+    /**
+     * The swap-STAGE gate (cr.52r D3's ZFS half) demands root-owned,
+     * non-writable ancestors — a user-owned tmpdir SUBDIR refuses before the
+     * job. A bare `mkdtemp` root rides the sticky `/tmp` exception (parent
+     * `/tmp`, 1777), so it passes both gates at the route; the flip replaces
+     * the mountpoint ITSELF with a symlink to `/etc`, which the job's re-run
+     * then refuses (the leaf is a symlink). Each test cleans its own temp in a
+     * `finally` — after a flip it is exactly one symlink, which `rm` unlinks
+     * without following (the same call the shared afterEach makes on a flipped
+     * `mnt`). The base is a literal `/tmp`, NOT `os.tmpdir()`: the harness runs
+     * with `TMPDIR` inside the worktree, whose user-owned `/home/...` ancestors
+     * trip the same refuse-before-the-job gate the test has to get past.
+     */
+    const flippedDest = async (): Promise<string> => mkdtemp(join('/tmp', 'anas-cr52d-'))
+
+    it('a pool create whose mountpoint is swapped while QUEUED refuses the job — no zpool create (mutation M14)', async () => {
+      const dest = await flippedDest()
+      try {
+        server = createServer({ mock: true, logger: false })
+        serveBlankInventoryDisks(server, DISK_IDS)
+        const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+        const calls = spyExecutor(server)
+
+        let release!: () => void
+        const held = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        for (let i = 0; i < 4; i++)
+          queue.submit('test.hold', { user: 'root@pam', uid: 0 }, () => held)
+
+        const res = await server.inject({
+          method: 'POST',
+          url: '/v1/pools',
+          headers: JSON_HEADERS,
+          payload: JSON.stringify({ name: 'tank', dataVdevs: [{ type: 'mirror', disks: DISK_IDS }], mountpoint: dest }),
+        })
+        assert.equal(res.statusCode, 202, res.body)
+        const id = (res.json() as JobAccepted).job.id
+        assert.equal(queue.get(id)?.status, 'queued', 'the create waits behind the held slots')
+
+        await rmdir(dest)
+        await symlink('/etc', dest)
+
+        release()
+        const job = await waitForJob(server, id)
+        assert.equal(job.status, 'failed', JSON.stringify(job))
+        assert.equal(job.error?.code, 'CONFLICT', JSON.stringify(job.error))
+        assert.match(job.error!.message, /symlink/)
+        assert.ok(!calls.some(c => c.command === ZPOOL && c.args[0] === 'create'), 'no zpool create argv')
+      }
+      finally {
+        await rm(dest, { recursive: true, force: true })
+      }
+    })
+
+    it('a pool mountpoint change whose target is swapped while QUEUED refuses the job — no zfs set (mutation M14)', async () => {
+      const dest = await flippedDest()
+      try {
+        server = createServer({ mock: true, logger: false })
+        const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+        const calls = spyExecutor(server)
+
+        let release!: () => void
+        const held = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        for (let i = 0; i < 4; i++)
+          queue.submit('test.hold', { user: 'root@pam', uid: 0 }, () => held)
+
+        // A legal move is confirm-gated (cr.36) — answer the challenge first.
+        const first = await server.inject({
+          method: 'PUT',
+          url: '/v1/pools/testpool/mountpoint',
+          headers: JSON_HEADERS,
+          payload: JSON.stringify({ mountpoint: dest }),
+        })
+        assert.equal(first.statusCode, 409, first.body)
+        assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED', first.body)
+        const code = first.headers['x-anas-confirm-code'] as string
+
+        const res = await server.inject({
+          method: 'PUT',
+          url: '/v1/pools/testpool/mountpoint',
+          headers: { ...JSON_HEADERS, 'x-anas-confirm': code },
+          payload: JSON.stringify({ mountpoint: dest }),
+        })
+        assert.equal(res.statusCode, 202, res.body)
+        const id = (res.json() as JobAccepted).job.id
+        assert.equal(queue.get(id)?.status, 'queued', 'the move waits behind the held slots')
+
+        await rmdir(dest)
+        await symlink('/etc', dest)
+
+        release()
+        const job = await waitForJob(server, id)
+        assert.equal(job.status, 'failed', JSON.stringify(job))
+        assert.equal(job.error?.code, 'CONFLICT', JSON.stringify(job.error))
+        assert.match(job.error!.message, /symlink/)
+        assert.ok(!calls.some(c => c.command === ZFS && c.args[0] === 'set'), 'no zfs set argv')
+      }
+      finally {
+        await rm(dest, { recursive: true, force: true })
+      }
+    })
+
+    it('a dataset create whose mountpoint is swapped while QUEUED refuses the job — no zfs create (mutation M14)', async () => {
+      const dest = await flippedDest()
+      try {
+        server = createServer({ mock: true, logger: false })
+        const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+        const calls = spyExecutor(server)
+
+        let release!: () => void
+        const held = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        for (let i = 0; i < 4; i++)
+          queue.submit('test.hold', { user: 'root@pam', uid: 0 }, () => held)
+
+        const res = await server.inject({
+          method: 'POST',
+          url: '/v1/pools/testpool/datasets',
+          headers: JSON_HEADERS,
+          payload: JSON.stringify({ path: 'queued-ds', properties: { mountpoint: dest } }),
+        })
+        assert.equal(res.statusCode, 202, res.body)
+        const id = (res.json() as JobAccepted).job.id
+        assert.equal(queue.get(id)?.status, 'queued', 'the create waits behind the held slots')
+
+        await rmdir(dest)
+        await symlink('/etc', dest)
+
+        release()
+        const job = await waitForJob(server, id)
+        assert.equal(job.status, 'failed', JSON.stringify(job))
+        assert.equal(job.error?.code, 'CONFLICT', JSON.stringify(job.error))
+        assert.match(job.error!.message, /symlink/)
+        assert.ok(!calls.some(c => c.command === ZFS && c.args[0] === 'create'), 'no zfs create argv')
+      }
+      finally {
+        await rm(dest, { recursive: true, force: true })
+      }
+    })
+
+    it('an AHR create whose mountpoint is swapped while QUEUED refuses the job — no wipe, no vgcreate (mutation M14)', async () => {
+      const dest = await flippedDest()
+      try {
+        server = createServer({ mock: true, logger: false })
+        serveBlankInventoryDisks(server, DISK_IDS)
+        const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+        const calls = spyExecutor(server)
+
+        let release!: () => void
+        const held = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        for (let i = 0; i < 4; i++)
+          queue.submit('test.hold', { user: 'root@pam', uid: 0 }, () => held)
+
+        // An AHR create is confirm-gated (it wipes disks) — answer it first.
+        const payload = JSON.stringify({ name: 'tank', tier: 'ahr1', disks: DISK_IDS, mountpoint: dest })
+        const first = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload })
+        assert.equal(first.statusCode, 409, first.body)
+        assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED', first.body)
+        const code = first.headers['x-anas-confirm-code'] as string
+
+        const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload })
+        assert.equal(res.statusCode, 202, res.body)
+        const id = (res.json() as JobAccepted).job.id
+        assert.equal(queue.get(id)?.status, 'queued', 'the create waits behind the held slots')
+
+        await rmdir(dest)
+        await symlink('/etc', dest)
+
+        release()
+        const job = await waitForJob(server, id)
+        assert.equal(job.status, 'failed', JSON.stringify(job))
+        assert.equal(job.error?.code, 'CONFLICT', JSON.stringify(job.error))
+        assert.match(job.error!.message, /symlink/)
+        assert.ok(!calls.some(c => ['/usr/sbin/wipefs', '/usr/sbin/sgdisk', '/usr/sbin/vgcreate'].includes(c.command)), 'no wipe/no vgcreate argv')
+      }
+      finally {
+        await rm(dest, { recursive: true, force: true })
+      }
+    })
+
+    it('an AHR mountpoint move whose target is swapped while QUEUED refuses the job — no fstab rewrite, no mount (mutation M14)', async () => {
+      const dest = await flippedDest()
+      try {
+        server = createServer({ mock: true, logger: false })
+        const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+        const calls = spyExecutor(server)
+
+        let release!: () => void
+        const held = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        for (let i = 0; i < 4; i++)
+          queue.submit('test.hold', { user: 'root@pam', uid: 0 }, () => held)
+
+        // The move is confirm-gated (it unmounts the pool) — answer it first.
+        const payload = JSON.stringify({ mountpoint: dest })
+        const first = await server.inject({ method: 'PUT', url: '/v1/ahr/ahr0/mountpoint', headers: JSON_HEADERS, payload })
+        assert.equal(first.statusCode, 409, first.body)
+        assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED', first.body)
+        const code = first.headers['x-anas-confirm-code'] as string
+
+        const res = await server.inject({ method: 'PUT', url: '/v1/ahr/ahr0/mountpoint', headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload })
+        assert.equal(res.statusCode, 202, res.body)
+        const id = (res.json() as JobAccepted).job.id
+        assert.equal(queue.get(id)?.status, 'queued', 'the move waits behind the held slots')
+
+        await rmdir(dest)
+        await symlink('/etc', dest)
+
+        release()
+        const job = await waitForJob(server, id)
+        assert.equal(job.status, 'failed', JSON.stringify(job))
+        assert.equal(job.error?.code, 'CONFLICT', JSON.stringify(job.error))
+        assert.match(job.error!.message, /symlink/)
+        assert.ok(!calls.some(c => c.command === MOUNT && c.args[0] === '-c'), 'no mount argv ran')
+      }
+      finally {
+        await rm(dest, { recursive: true, force: true })
+      }
     })
   })
 })

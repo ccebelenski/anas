@@ -17,6 +17,7 @@ import {
 } from '../services/ahr-snapshots.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { lioUnreadableAdvisory } from '../services/iscsi-held.js'
+import { mountTargetRefusal } from '../services/mounts.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -268,7 +269,16 @@ export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapsh
     const spec: GuardSpec<AhrPool> = {
       operation: 'ahr.snapshot.rollback',
       object: guard.poolView(poolName, 'a rollback'),
-      gates: [...SNAPSHOT_GATES, guard.systemPoolGate, guard.lunGate('Rolling back'), snapshotExistsGate(snap)],
+      gates: [
+        ...SNAPSHOT_GATES,
+        guard.systemPoolGate,
+        guard.lunGate('Rolling back'),
+        snapshotExistsGate(snap),
+        // cr.52r P2: the rollback REMOUNTS the pool's stored path in its finally
+        // — the stored path runs the mount-target refusal before the swap, at
+        // the route and again in the job.
+        async pool => mountTargetRefusal(pool.mountpoint),
+      ],
       // D3, cr.38r: the system-pool and LUN gates just ran on a claims read
       // that may have FAILED OPEN — warn, never refuse; the job reports any
       // the confirm did not list.

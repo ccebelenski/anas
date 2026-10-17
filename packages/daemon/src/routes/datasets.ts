@@ -23,7 +23,7 @@ import { readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { readIscsiState, withIscsiLock } from '../services/iscsi-mutate.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
-import { mountTargetGate } from '../services/mounts.js'
+import { mountTargetGate, swapStageGate } from '../services/mounts.js'
 import { loadPveFootprint, ownershipRefusal, pveDescendantsUnlistedMessage, pveManagedRefusal, pveNamingGuardMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { describeHolds, readLocalHoldsChecked } from '../services/replication-holds.js'
 import { createZfsSnapshot, destroyZfsSnapshot } from '../services/zfs-snapshot.js'
@@ -1061,6 +1061,9 @@ export async function datasetRoutes(
         namingGate<CreateObject>(o => o.name),
         ownedGate<CreateObject>(o => o.name),
         mountTargetGate<CreateObject>(mountpoint),
+        // cr.52r D3's ZFS half: `zfs create -o mountpoint=` mounts by itself, so
+        // every existing ancestor must be root-owned and not group/other-writable.
+        swapStageGate<CreateObject>(mountpoint),
       ],
       // §4.2: the new name's key exclusive, its ancestors' shared — a destroy
       // of the parent (exclusive on it) and this create serialise.

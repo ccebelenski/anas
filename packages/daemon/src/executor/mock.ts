@@ -10,7 +10,25 @@ import type {
   PipelineResult,
   SpawnedChild,
 } from './types.js'
+import { readlinkSync } from 'node:fs'
 import { CommandTimeoutError, resolveDeadline } from './deadline.js'
+
+/**
+ * One recorded exec()/execToStream() call. cr.52r D3 adds the inherited
+ * descriptors: `inheritedFds` are the raw fds handed to the child at 3, 4, …,
+ * and `fdPaths` their BEST-EFFORT resolve (`readlink /proc/self/fd/N`, in THIS
+ * process — a test's daemon-opened O_PATH descriptor reads back honestly, so a
+ * test pins exactly which directory the daemon opened). `null` per fd when the
+ * readlink fails (a closed fd, a non-path descriptor).
+ */
+export interface MockExecCall {
+  command: string
+  args: string[]
+  /** Inherited descriptors (cr.52r D3) — the fd the child got at /proc/self/fd/3. */
+  inheritedFds?: number[]
+  /** readlink of each inherited fd, best-effort, in order. */
+  fdPaths?: (string | null)[]
+}
 
 /** A canned response for a specific command + args pattern. */
 export interface MockFixture {
@@ -88,6 +106,26 @@ export interface MockLiveChild {
   onSignal?: ExecResult
 }
 
+/** Resolve a caller-opened fd to the path it opens, best-effort (cr.52r D3). */
+function resolveFdPath(fd: number): string | null {
+  try {
+    return readlinkSync(`/proc/self/fd/${fd}`)
+  }
+  catch {
+    return null
+  }
+}
+
+/** The inherited-fd record an exec call is stored with (absent when none were passed). */
+function inheritedFdRecord(opts?: ExecOptions): Pick<MockExecCall, 'inheritedFds' | 'fdPaths'> {
+  if (!opts?.inheritedFds || opts.inheritedFds.length === 0)
+    return {}
+  return {
+    inheritedFds: [...opts.inheritedFds],
+    fdPaths: opts.inheritedFds.map(resolveFdPath),
+  }
+}
+
 /** A canned response for a specific pipeline (cmd1 | cmd2) pattern. */
 export interface MockPipelineFixture {
   cmd1: string
@@ -140,7 +178,7 @@ export class MockExecutor implements CommandExecutor {
   private streamFixtures: MockStreamFixture[] = []
 
   /** Every exec() call made, in order — tests assert the exact argv here. */
-  readonly calls: { command: string, args: string[] }[] = []
+  readonly calls: MockExecCall[] = []
 
   /** Every pipeline() call made, in order — tests assert the exact argv here. */
   readonly pipelineCalls: MockPipelineCall[] = []
@@ -286,7 +324,7 @@ export class MockExecutor implements CommandExecutor {
 
   async exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
     // Record for test assertions on the exact argv (e.g. the zfs hold calls).
-    this.calls.push({ command, args })
+    this.calls.push({ command, args, ...inheritedFdRecord(opts) })
     const deadline = this.recordDeadline(command, args, opts)
     // stdin (opts.stdin) and maxBuffer (opts.maxBuffer) are accepted for
     // interface parity but ignored — mock matching is by command + args only,

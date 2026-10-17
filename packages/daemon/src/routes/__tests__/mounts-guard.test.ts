@@ -72,8 +72,19 @@ const FUSER_TWO_HOLDERS = fixture('busy/fuser-m-holders.txt')
 const FUSER_ONE_HOLDER = rewrite(FUSER_TWO_HOLDERS, ' 483285', '')
 const SYSTEMCTL = '/usr/bin/systemctl'
 
-const NFS_MP = '/mnt/anas-nfs'
-const CIFS_MP = '/mnt/anas-cifs'
+// cr.52r D3: every mount verb that ACTS mounts/unmounts through a REAL
+// directory (the daemon opens the mountpoint O_PATH first), so the harness's
+// mountpoints map into a per-test tmpdir — never the OS's unwritable /mnt.
+// Resolved per-test: `mountBase` is set by the shared beforeEach.
+let mountBase = ''
+const NFS_MP = (): string => join(mountBase, 'anas-nfs')
+const CIFS_MP = (): string => join(mountBase, 'anas-cifs')
+/** The fstab/fixture texts carrying `/mnt/<x>` mounted onto the tmpdir base. */
+function mappedFstab(text: string): string {
+  return text
+    .replaceAll('/mnt/anas-nfs', NFS_MP())
+    .replaceAll('/mnt/anas-cifs', CIFS_MP())
+}
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -94,15 +105,22 @@ const enc = (path: string): string => encodeURIComponent(path)
 const FSTAB = fixture('mounts/fstab-anas-managed')
 const NFS_LINE = '127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,nofail  0  0'
 /** The NFS line as an operator hand-edited it (one option added). */
-const FSTAB_NFS_HAND_EDITED = rewrite(FSTAB, NFS_LINE, NFS_LINE.replace('defaults,nofail', 'defaults,nofail,noatime'))
+// The mountpoint-mapped variants, resolved per-test (mountBase is unset at
+// module load): the fixture texts carry `/mnt/…` until `mappedFstab` maps them.
+const FSTAB_NFS_HAND_EDITED = (): string => mappedFstab(rewrite(FSTAB, NFS_LINE, NFS_LINE.replace('defaults,nofail', 'defaults,nofail,noatime')))
 /** The NFS line disabled the way the daemon disables it. */
-const FSTAB_NFS_DISABLED = disableMount(FSTAB, NFS_MP)
+const FSTAB_NFS_DISABLED = (): string => disableMount(mappedFstab(FSTAB), NFS_MP())
 
 const FINDMNT_FULL = fixture('mounts/findmnt-full.json')
+function mappedFindmnt(): string {
+  return FINDMNT_FULL
+    .replaceAll('/mnt/anas-nfs', NFS_MP())
+    .replaceAll('/mnt/anas-cifs', CIFS_MP())
+}
 
 const LIO_NO_LUNS = fixture('iscsi/configfs-restore-empty.manifest')
 /** The capture's fileio LUN, its image moved under the NFS mount. */
-const LIO_LUN_UNDER_NFS = fixture('iscsi/configfs-live.manifest').split('/gtiscsi/images/lun2.raw').join(`${NFS_MP}/lun2.raw`)
+const LIO_LUN_UNDER_NFS = (): string => fixture('iscsi/configfs-live.manifest').split('/gtiscsi/images/lun2.raw').join(`${NFS_MP()}/lun2.raw`)
 
 /** The `lsof +f -- /mnt/anas-cifs` block of the busy-unmount capture (header + two holders). */
 const LSOF_TWO_HOLDERS = (() => {
@@ -116,19 +134,21 @@ const LSOF_TWO_HOLDERS = (() => {
 const LSOF_ONE_HOLDER = LSOF_TWO_HOLDERS.split('\n').filter(l => !l.includes(' 5961 ')).join('\n')
 
 /** `[media]` of the smb.conf capture, re-pointed at a directory on the NFS mount. */
-const SMB_MEDIA_ON_NFS = rewrite(fixture('samba/smb.conf'), 'path = /tank/media', `path = ${NFS_MP}/media`)
+const SMB_MEDIA_ON_NFS = (): string => rewrite(fixture('samba/smb.conf'), 'path = /tank/media', `path = ${NFS_MP()}/media`)
 
 /** A backup task whose source is on the NFS mount — written by the daemon's own unit writer. */
-const BACKUP_ON_NFS: BackupTask = {
-  name: 'nas-media',
-  repository: 'pve:local',
-  backupId: 'nas-media',
-  archives: [{ name: 'media', path: `${NFS_MP}/media`, excludes: [] }],
-  changeDetectionMode: 'default',
-  notify: 'always',
-  schedule: '*-*-* 02:00:00',
-  enabled: true,
-  limitNofile: 1024,
+function BACKUP_ON_NFS(): BackupTask {
+  return {
+    name: 'nas-media',
+    repository: 'pve:local',
+    backupId: 'nas-media',
+    archives: [{ name: 'media', path: `${NFS_MP()}/media`, excludes: [] }],
+    changeDetectionMode: 'default',
+    notify: 'always',
+    schedule: '*-*-* 02:00:00',
+    enabled: true,
+    limitNofile: 1024,
+  }
 }
 
 const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
@@ -175,6 +195,11 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-cr39-'))
+    mountBase = join(dir, 'mnt')
+    // Real mountpoint dirs for the fd-pinned mounts the acting verbs run
+    // (cr.52r D3: the daemon opens the mountpoint before the argv).
+    await mkdir(NFS_MP(), { recursive: true })
+    await mkdir(CIFS_MP(), { recursive: true })
     paths = {
       fstab: join(dir, 'fstab'),
       creds: join(dir, 'creds'),
@@ -200,12 +225,15 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
   })
 
   /** The dev mock over private copies of the captures; reads routed through the flippable state. */
-  async function serve(fstab = FSTAB): Promise<void> {
+  async function serve(fstab: string = mappedFstab(FSTAB)): Promise<void> {
     lsof = null
     lsofFails = null
     fuser = null
     fuserMissing = false
     paused.clear()
+    // Callers pass ALREADY-mapped fstab (a mappedFstab(FSTAB) default, or the
+    // mapped function variants); never re-map here — a mapped path contains the
+    // `/mnt/…` literal as a substring and would be corrupted by a second pass.
     await writeFile(paths.fstab, fstab)
     await writeFile(paths.smb, fixture('samba/smb.conf'))
     await writeFile(paths.exports, fixture('nfs/etc-exports'))
@@ -232,7 +260,7 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     mock.exec = async (command, args, opts) => {
       calls.push({ command, args })
       if (command === FINDMNT && args.length === 1 && args[0] === '--json')
-        return ok(FINDMNT_FULL)
+        return ok(mappedFindmnt())
       if (command === LSOF && lsofFails === 'missing')
         throw enoent(LSOF)
       if (command === LSOF && lsofFails === 'hung')
@@ -320,12 +348,12 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
 
   it('control: with nothing changed every held verb runs and acts — the harness does not refuse on its own', async () => {
     const cases: Array<{ fstab?: string, req: Req, acted: (c: { command: string, args: string[] }) => boolean }> = [
-      { req: state(NFS_MP, 'unmount'), acted: c => c.command === UMOUNT },
-      { req: state(NFS_MP, 'disable'), acted: c => c.command === UMOUNT },
-      { req: remove(NFS_MP), acted: c => c.command === UMOUNT },
-      { req: state(NFS_MP, 'mount'), acted: c => c.command === MOUNT },
-      { fstab: FSTAB_NFS_DISABLED, req: state(NFS_MP, 'enable'), acted: c => c.command === SYSTEMCTL && c.args[0] === 'daemon-reload' },
-      { req: update(NFS_MP, { noatime: true }), acted: c => c.command === UMOUNT },
+      { req: state(NFS_MP(), 'unmount'), acted: c => c.command === UMOUNT },
+      { req: state(NFS_MP(), 'disable'), acted: c => c.command === UMOUNT },
+      { req: remove(NFS_MP()), acted: c => c.command === UMOUNT },
+      { req: state(NFS_MP(), 'mount'), acted: c => c.command === MOUNT },
+      { fstab: FSTAB_NFS_DISABLED(), req: state(NFS_MP(), 'enable'), acted: c => c.command === SYSTEMCTL && c.args[0] === 'daemon-reload' },
+      { req: update(NFS_MP(), { noatime: true }), acted: c => c.command === UMOUNT },
     ]
     for (const { fstab, req, acted } of cases) {
       await serve(fstab)
@@ -344,19 +372,19 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
   // -------------------------------------------------------------------------
 
   it('a LUN whose image appears under the mount after the request refuses unmount, disable AND remove — no umount, fstab untouched', async () => {
-    for (const req of [state(NFS_MP, 'unmount'), state(NFS_MP, 'disable'), remove(NFS_MP)]) {
+    for (const req of [state(NFS_MP(), 'unmount'), state(NFS_MP(), 'disable'), remove(NFS_MP())]) {
       await serve()
       const { id, release } = await acceptedBehindFullQueue(req)
       // A file LUN is created on the mount while the job waits.
       await rm(paths.configfs, { recursive: true, force: true })
-      await materializeConfigfsManifest(LIO_LUN_UNDER_NFS, paths.configfs)
+      await materializeConfigfsManifest(LIO_LUN_UNDER_NFS(), paths.configfs)
       release()
       const job = await finished(id)
       assert.equal(job.status, 'failed', req.url)
       assert.equal(job.error?.code, 'CONFLICT', req.url)
-      assert.match(job.error!.message, /mount '\/mnt\/anas-nfs' is refused: it is held by iSCSI LUN \d+ 'gtiscsi_lun2'/)
+      assert.match(job.error!.message, new RegExp(`mount '${NFS_MP()}' is refused: it is held by iSCSI LUN \\d+ 'gtiscsi_lun2'`))
       assert.deepEqual(calls.filter(isMutation), [], `${req.method} ${req.url}: no mutating argv`)
-      assert.equal(await readFile(paths.fstab, 'utf8'), FSTAB, 'fstab untouched')
+      assert.equal(await readFile(paths.fstab, 'utf8'), mappedFstab(FSTAB), 'fstab untouched')
       await server!.close()
       server = undefined
     }
@@ -365,8 +393,8 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
   it('the same LUN at the request is the route\'s hard 409 — the route and the job share the gate', async () => {
     await serve()
     await rm(paths.configfs, { recursive: true, force: true })
-    await materializeConfigfsManifest(LIO_LUN_UNDER_NFS, paths.configfs)
-    for (const req of [state(NFS_MP, 'unmount'), state(NFS_MP, 'disable'), remove(NFS_MP)]) {
+    await materializeConfigfsManifest(LIO_LUN_UNDER_NFS(), paths.configfs)
+    for (const req of [state(NFS_MP(), 'unmount'), state(NFS_MP(), 'disable'), remove(NFS_MP())]) {
       const res = await send(req)
       assert.equal(res.statusCode, 409, req.url)
       assert.equal(res.json().error.reason, 'held-by-lun')
@@ -381,26 +409,26 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
 
   it('a line disabled after a Mount was accepted refuses the job ("enable it first") — no mount', async () => {
     await serve()
-    const { id, release } = await acceptedBehindFullQueue(state(NFS_MP, 'mount'))
-    await writeFile(paths.fstab, FSTAB_NFS_DISABLED)
+    const { id, release } = await acceptedBehindFullQueue(state(NFS_MP(), 'mount'))
+    await writeFile(paths.fstab, FSTAB_NFS_DISABLED())
     release()
     const job = await finished(id)
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'VALIDATION_ERROR')
-    assert.equal(job.error?.message, `Mount '${NFS_MP}' is disabled — enable it first`)
+    assert.equal(job.error?.message, `Mount '${NFS_MP()}' is disabled — enable it first`)
     assert.ok(!calls.some(c => c.command === MOUNT), 'mount never ran')
   })
 
   it('a line enabled by hand after an Enable was accepted refuses the job ("not disabled") — fstab not rewritten', async () => {
-    await serve(FSTAB_NFS_DISABLED)
-    const { id, release } = await acceptedBehindFullQueue(state(NFS_MP, 'enable'))
-    await writeFile(paths.fstab, FSTAB)
+    await serve(FSTAB_NFS_DISABLED())
+    const { id, release } = await acceptedBehindFullQueue(state(NFS_MP(), 'enable'))
+    await writeFile(paths.fstab, mappedFstab(FSTAB))
     release()
     const job = await finished(id)
     assert.equal(job.status, 'failed')
-    assert.equal(job.error?.message, `Mount '${NFS_MP}' is not disabled`)
+    assert.equal(job.error?.message, `Mount '${NFS_MP()}' is not disabled`)
     assert.deepEqual(calls.filter(isMutation), [])
-    assert.equal(await readFile(paths.fstab, 'utf8'), FSTAB)
+    assert.equal(await readFile(paths.fstab, 'utf8'), mappedFstab(FSTAB))
   })
 
   // -------------------------------------------------------------------------
@@ -420,7 +448,7 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     const theirs = credsFilePath(paths.creds, mp)
     await mkdir(paths.creds, { recursive: true })
     await writeFile(theirs, fixture('mounts/creds-anastest.cred'), { mode: 0o600 })
-    await writeFile(paths.fstab, rewrite(rewrite(FSTAB, '/mnt/anas-cifs ', `${mp} `), 'credentials=/etc/anas/creds/anastest.cred', `credentials=${theirs}`))
+    await writeFile(paths.fstab, mappedFstab(rewrite(rewrite(FSTAB, '/mnt/anas-cifs ', `${mp} `), 'credentials=/etc/anas/creds/anastest.cred', `credentials=${theirs}`)))
     release()
     const job = await finished(id)
     assert.equal(job.status, 'failed')
@@ -438,21 +466,21 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
 
   it('an edit whose line is hand-edited while it waits fails STATE_CHANGED — the hand edit survives, nothing remounted', async () => {
     await serve()
-    const { id, release } = await acceptedBehindFullQueue(update(NFS_MP, { ro: true }))
-    await writeFile(paths.fstab, FSTAB_NFS_HAND_EDITED)
+    const { id, release } = await acceptedBehindFullQueue(update(NFS_MP(), { ro: true }))
+    await writeFile(paths.fstab, FSTAB_NFS_HAND_EDITED())
     release()
     const job = await finished(id)
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'STATE_CHANGED')
-    assert.equal(job.error?.message, `Mount '${NFS_MP}' changed since you confirmed — nothing was done; reload and confirm again`)
+    assert.equal(job.error?.message, `Mount '${NFS_MP()}' changed since you confirmed — nothing was done; reload and confirm again`)
     assert.deepEqual(calls.filter(isMutation), [])
-    assert.equal(await readFile(paths.fstab, 'utf8'), FSTAB_NFS_HAND_EDITED, 'the operator\'s edit is not overwritten by a merge of the old line')
+    assert.equal(await readFile(paths.fstab, 'utf8'), FSTAB_NFS_HAND_EDITED(), 'the operator\'s edit is not overwritten by a merge of the old line')
   })
 
   it('an edit whose line is replaced by another share while it waits fails IDENTITY_MISMATCH', async () => {
     await serve()
-    const { id, release } = await acceptedBehindFullQueue(update(NFS_MP, { ro: true }))
-    await writeFile(paths.fstab, rewrite(FSTAB, NFS_LINE, NFS_LINE.replace('127.0.0.1:/srv/nfs/export1', '127.0.0.1:/srv/nfs/backups')))
+    const { id, release } = await acceptedBehindFullQueue(update(NFS_MP(), { ro: true }))
+    await writeFile(paths.fstab, mappedFstab(rewrite(FSTAB, NFS_LINE, NFS_LINE.replace('127.0.0.1:/srv/nfs/export1', '127.0.0.1:/srv/nfs/backups'))))
     release()
     const job = await finished(id)
     assert.equal(job.status, 'failed')
@@ -468,11 +496,11 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
   it('a forced remove detaches only the holders it confirmed: a new holder before the job refuses it — no umount -l', async () => {
     await serve()
     lsof = LSOF_ONE_HOLDER
-    const first = await send(remove(CIFS_MP))
+    const first = await send(remove(CIFS_MP()))
     assert.equal(first.statusCode, 409)
     assert.deepEqual(first.json().error.warnings.filter((w: string) => w.startsWith('sleep')), ['sleep (pid 5960)'])
     const release = holdSlots()
-    const res = await send(remove(CIFS_MP), first.headers['x-anas-confirm-code'] as string)
+    const res = await send(remove(CIFS_MP()), first.headers['x-anas-confirm-code'] as string)
     assert.equal(res.statusCode, 202, res.body)
     const id = (res.json() as JobAccepted).job.id
     lsof = LSOF_TWO_HOLDERS // a second process opens the mount
@@ -482,18 +510,18 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     assert.equal(job.error?.code, 'STATE_CHANGED')
     assert.match(job.error!.message, /holders the confirmation did not name \(sleep \(pid 5961\)\)/)
     assert.deepEqual(calls.filter(isMutation), [])
-    assert.equal(await readFile(paths.fstab, 'utf8'), FSTAB)
+    assert.equal(await readFile(paths.fstab, 'utf8'), mappedFstab(FSTAB))
   })
 
   it('a forced remove whose confirmed holders are still the ones there unmounts lazily (and one that left is no reason to stop)', async () => {
     await serve()
     lsof = LSOF_TWO_HOLDERS
-    const { id, release } = await acceptedBehindFullQueue(remove(CIFS_MP))
+    const { id, release } = await acceptedBehindFullQueue(remove(CIFS_MP()))
     lsof = LSOF_ONE_HOLDER // pid 5961 exits
     release()
     const job = await finished(id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.ok(calls.some(c => c.command === UMOUNT && c.args[0] === '-l' && c.args[1] === CIFS_MP))
+    assert.ok(calls.some(c => c.command === UMOUNT && c.args[0] === '-l' && c.args[1] === CIFS_MP()))
   })
 
   // -------------------------------------------------------------------------
@@ -515,22 +543,22 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     await seedFuserHolders()
     lsofFails = 'missing'
     fuser = FUSER_TWO_HOLDERS
-    const first = await send(state(NFS_MP, 'unmount'))
+    const first = await send(state(NFS_MP(), 'unmount'))
     assert.equal(first.statusCode, 409, first.body)
-    assert.equal(first.json().error.message, `'${NFS_MP}' is busy — 2 process(es) are holding it`)
+    assert.equal(first.json().error.message, `'${NFS_MP()}' is busy — 2 process(es) are holding it`)
     assert.deepEqual(first.json().error.warnings, [
-      `Unmounting '${NFS_MP}' will be forced (lazy unmount); these holders lose access:`,
+      `Unmounting '${NFS_MP()}' will be forced (lazy unmount); these holders lose access:`,
       ...FUSER_HOLDER_LINES,
     ])
     const release = holdSlots()
-    const res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    const res = await send(state(NFS_MP(), 'unmount'), first.headers['x-anas-confirm-code'] as string)
     assert.equal(res.statusCode, 202, res.body)
     const before = fuserCalls()
     release()
     const job = await finished((res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.equal(fuserCalls(), before + 1, 'the job re-lists the holders with fuser before the forced unmount')
-    assert.deepEqual(calls.filter(isMutation), [{ command: UMOUNT, args: ['-l', NFS_MP] }])
+    assert.deepEqual(calls.filter(isMutation), [{ command: UMOUNT, args: ['-l', NFS_MP()] }])
   })
 
   it('D3: without lsof, a holder fuser finds that the confirm did not name refuses the forced remove — no umount -l', async () => {
@@ -538,11 +566,11 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     await seedFuserHolders()
     lsofFails = 'missing'
     fuser = FUSER_ONE_HOLDER
-    const first = await send(remove(NFS_MP))
+    const first = await send(remove(NFS_MP()))
     assert.equal(first.statusCode, 409)
     assert.deepEqual(first.json().error.warnings.filter((w: string) => w.startsWith('sleep')), ['sleep (pid 483284)'])
     const release = holdSlots()
-    const res = await send(remove(NFS_MP), first.headers['x-anas-confirm-code'] as string)
+    const res = await send(remove(NFS_MP()), first.headers['x-anas-confirm-code'] as string)
     assert.equal(res.statusCode, 202, res.body)
     fuser = FUSER_TWO_HOLDERS // a second process opens the mount
     release()
@@ -551,12 +579,12 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     assert.equal(job.error?.code, 'STATE_CHANGED')
     assert.match(job.error!.message, /holders the confirmation did not name \(sleep \(pid 483285\)\)/)
     assert.deepEqual(calls.filter(isMutation), [])
-    assert.equal(await readFile(paths.fstab, 'utf8'), FSTAB)
+    assert.equal(await readFile(paths.fstab, 'utf8'), mappedFstab(FSTAB))
   })
 
   it('D3: when neither lsof nor fuser answers, unmount, disable and remove confirm that the holders could not be listed, and the job does not force the unmount', async () => {
-    const unknownLine = `The processes holding '${NFS_MP}' could not be listed (neither lsof nor fuser answered). The unmount is not forced: if '${NFS_MP}' is busy, the job fails and nothing else is changed.`
-    for (const req of [state(NFS_MP, 'unmount'), state(NFS_MP, 'disable'), remove(NFS_MP)]) {
+    const unknownLine = `The processes holding '${NFS_MP()}' could not be listed (neither lsof nor fuser answered). The unmount is not forced: if '${NFS_MP()}' is busy, the job fails and nothing else is changed.`
+    for (const req of [state(NFS_MP(), 'unmount'), state(NFS_MP(), 'disable'), remove(NFS_MP())]) {
       await serve()
       lsofFails = 'missing'
       fuserMissing = true
@@ -564,13 +592,13 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
       assert.equal(first.statusCode, 409, `${req.method} ${req.url}: ${first.body}`)
       assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
       if (req.method === 'POST')
-        assert.equal(first.json().error.message, `'${NFS_MP}' may be busy — its holders could not be listed`)
+        assert.equal(first.json().error.message, `'${NFS_MP()}' may be busy — its holders could not be listed`)
       assert.ok(first.json().error.warnings.includes(unknownLine), `${req.method} ${req.url}: ${JSON.stringify(first.json().error.warnings)}`)
       const res = await send(req, first.headers['x-anas-confirm-code'] as string)
       assert.equal(res.statusCode, 202, res.body)
       const job = await finished((res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
-      assert.deepEqual(calls.filter(c => c.command === UMOUNT), [{ command: UMOUNT, args: [NFS_MP] }], 'a plain umount: unknown holders are never force-detached')
+      assert.deepEqual(calls.filter(c => c.command === UMOUNT), [{ command: UMOUNT, args: [NFS_MP()] }], 'a plain umount: unknown holders are never force-detached')
       await server!.close()
       server = undefined
     }
@@ -580,9 +608,9 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     await serve()
     lsofFails = 'hung'
     fuser = FUSER_TWO_HOLDERS
-    const first = await send(state(NFS_MP, 'unmount'))
+    const first = await send(state(NFS_MP(), 'unmount'))
     assert.equal(first.statusCode, 409, first.body)
-    assert.equal(first.json().error.message, `'${NFS_MP}' may be busy — its holders could not be listed`)
+    assert.equal(first.json().error.message, `'${NFS_MP()}' may be busy — its holders could not be listed`)
     assert.equal(fuserCalls(), 0)
   })
 
@@ -591,13 +619,13 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     await seedFuserHolders()
     lsofFails = 'missing'
     fuser = FUSER_TWO_HOLDERS
-    const { id, release } = await acceptedBehindFullQueue(state(NFS_MP, 'unmount'))
+    const { id, release } = await acceptedBehindFullQueue(state(NFS_MP(), 'unmount'))
     fuserMissing = true // fuser is gone before the job runs
     release()
     const job = await finished(id)
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'STATE_CHANGED')
-    assert.equal(job.error?.message, `The holders of mount '${NFS_MP}' could not be listed again before the forced unmount — nothing was done; confirm again`)
+    assert.equal(job.error?.message, `The holders of mount '${NFS_MP()}' could not be listed again before the forced unmount — nothing was done; confirm again`)
     assert.deepEqual(calls.filter(isMutation), [])
   })
 
@@ -611,7 +639,7 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     `the holders a forced unmount detaches changed since you confirmed (was: ${was}; now: ${now}) — confirm again`
 
   it('nf.3 D10: unmount, disable and remove — a holder that appears between the challenge and the resend is 409 CONFIRM_SCOPE_CHANGED naming it, and nothing runs', async () => {
-    for (const req of [state(CIFS_MP, 'unmount'), state(CIFS_MP, 'disable'), remove(CIFS_MP)]) {
+    for (const req of [state(CIFS_MP(), 'unmount'), state(CIFS_MP(), 'disable'), remove(CIFS_MP())]) {
       await serve()
       lsof = LSOF_ONE_HOLDER
       const first = await send(req)
@@ -634,7 +662,7 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
       assert.equal(again.statusCode, 202, again.body)
       const job = await finished((again.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
-      assert.ok(calls.some(c => c.command === UMOUNT && c.args[0] === '-l' && c.args[1] === CIFS_MP))
+      assert.ok(calls.some(c => c.command === UMOUNT && c.args[0] === '-l' && c.args[1] === CIFS_MP()))
       await server!.close()
       server = undefined
     }
@@ -645,10 +673,10 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     await seedFuserHolders()
     lsofFails = 'missing'
     fuser = FUSER_ONE_HOLDER
-    const first = await send(state(NFS_MP, 'unmount'))
+    const first = await send(state(NFS_MP(), 'unmount'))
     assert.equal(first.statusCode, 409, first.body)
     fuser = FUSER_TWO_HOLDERS
-    const res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    const res = await send(state(NFS_MP(), 'unmount'), first.headers['x-anas-confirm-code'] as string)
     assert.equal(res.statusCode, 409, res.body)
     assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
     assert.equal(res.json().error.message, HOLDERS_SENTENCE('sleep (pid 483284)', 'sleep (pid 483284), sleep (pid 483285)'))
@@ -660,18 +688,18 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     await seedFuserHolders()
     lsofFails = 'missing'
     fuserMissing = true
-    let first = await send(state(NFS_MP, 'unmount'))
+    let first = await send(state(NFS_MP(), 'unmount'))
     assert.equal(first.statusCode, 409, first.body)
     fuserMissing = false
     fuser = FUSER_ONE_HOLDER
-    let res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    let res = await send(state(NFS_MP(), 'unmount'), first.headers['x-anas-confirm-code'] as string)
     assert.equal(res.statusCode, 409, res.body)
     assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
     assert.equal(res.json().error.message, HOLDERS_SENTENCE('unknown', 'sleep (pid 483284)'))
 
     first = res
     fuserMissing = true
-    res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    res = await send(state(NFS_MP(), 'unmount'), first.headers['x-anas-confirm-code'] as string)
     assert.equal(res.statusCode, 409, res.body)
     assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
     assert.equal(res.json().error.message, HOLDERS_SENTENCE('sleep (pid 483284)', 'unknown'))
@@ -680,12 +708,12 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
 
   it('nf.3 D10: a holder appearing where the challenge showed none (a confirm for a reference only) is CONFIRM_SCOPE_CHANGED — never a forced unmount nobody was shown', async () => {
     await serve()
-    await writeFile(paths.smb, SMB_MEDIA_ON_NFS) // the confirm is for the share riding the path
-    const first = await send(state(NFS_MP, 'unmount'))
+    await writeFile(paths.smb, SMB_MEDIA_ON_NFS()) // the confirm is for the share riding the path
+    const first = await send(state(NFS_MP(), 'unmount'))
     assert.equal(first.statusCode, 409, first.body)
     assert.equal(first.json().error.warnings.some((w: string) => w.includes('lose access')), false, 'no holders at the challenge')
     lsof = LSOF_ONE_HOLDER
-    const res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    const res = await send(state(NFS_MP(), 'unmount'), first.headers['x-anas-confirm-code'] as string)
     assert.equal(res.statusCode, 409, res.body)
     assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
     assert.equal(res.json().error.message, HOLDERS_SENTENCE('none', 'sleep (pid 5960)'))
@@ -699,16 +727,16 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     lsof = LSOF_ONE_HOLDER.replace('sleep   5960', 'systemd-j 5960')
     await mkdir(join(dir, 'proc', '5960'), { recursive: true })
     await writeFile(join(dir, 'proc', '5960', 'comm'), 'systemd-journal\n')
-    const first = await send(state(NFS_MP, 'unmount'))
+    const first = await send(state(NFS_MP(), 'unmount'))
     assert.equal(first.statusCode, 409, first.body)
     assert.ok(first.json().error.warnings.includes('systemd-j (pid 5960)'), first.body)
     lsofFails = 'missing'
     fuser = rewrite(FUSER_ONE_HOLDER, '483284', '5960') // the fuser capture, the same pid
-    const res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    const res = await send(state(NFS_MP(), 'unmount'), first.headers['x-anas-confirm-code'] as string)
     assert.equal(res.statusCode, 202, res.body)
     const job = await finished((res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.deepEqual(calls.filter(isMutation), [{ command: UMOUNT, args: ['-l', NFS_MP] }])
+    assert.deepEqual(calls.filter(isMutation), [{ command: UMOUNT, args: ['-l', NFS_MP()] }])
   })
 
   // -------------------------------------------------------------------------
@@ -723,10 +751,10 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     // detaching a set nobody confirmed against.
     await serve()
     lsof = LSOF_TWO_HOLDERS
-    const first = await send(state(CIFS_MP, 'unmount'))
+    const first = await send(state(CIFS_MP(), 'unmount'))
     assert.equal(first.statusCode, 409, first.body)
     lsof = LSOF_ONE_HOLDER // pid 5961 exited before the resend
-    const res = await send(state(CIFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    const res = await send(state(CIFS_MP(), 'unmount'), first.headers['x-anas-confirm-code'] as string)
     assert.equal(res.statusCode, 409, res.body)
     const error = res.json().error
     assert.equal(error.code, 'CONFIRM_SCOPE_CHANGED')
@@ -741,10 +769,10 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     // pid running another program is not the holder the operator saw.
     await serve()
     lsof = LSOF_ONE_HOLDER
-    const first = await send(state(CIFS_MP, 'unmount'))
+    const first = await send(state(CIFS_MP(), 'unmount'))
     assert.equal(first.statusCode, 409, first.body)
     lsof = LSOF_ONE_HOLDER.replace('sleep   5960', 'rsync   5960') // the pid now runs rsync
-    const res = await send(state(CIFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    const res = await send(state(CIFS_MP(), 'unmount'), first.headers['x-anas-confirm-code'] as string)
     assert.equal(res.statusCode, 409, res.body)
     assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
     assert.equal(res.json().error.message, HOLDERS_SENTENCE('sleep (pid 5960)', 'rsync (pid 5960)'))
@@ -757,10 +785,10 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     server = undefined
     await serve()
     lsof = LSOF_ONE_HOLDER
-    const challenge = await send(state(CIFS_MP, 'unmount'))
+    const challenge = await send(state(CIFS_MP(), 'unmount'))
     assert.equal(challenge.statusCode, 409, challenge.body)
     const release = holdSlots()
-    const accepted = await send(state(CIFS_MP, 'unmount'), challenge.headers['x-anas-confirm-code'] as string)
+    const accepted = await send(state(CIFS_MP(), 'unmount'), challenge.headers['x-anas-confirm-code'] as string)
     assert.equal(accepted.statusCode, 202, accepted.body)
     const id = (accepted.json() as JobAccepted).job.id
     lsof = LSOF_ONE_HOLDER.replace('sleep   5960', 'rsync   5960') // recycled while the job waits
@@ -776,26 +804,26 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     await serve()
     lsofFails = 'missing'
     fuserMissing = true
-    const first = await send(state(NFS_MP, 'unmount'))
+    const first = await send(state(NFS_MP(), 'unmount'))
     assert.equal(first.statusCode, 409, first.body)
     assert.match(first.json().error.message, /could not be listed/)
-    const res = await send(state(NFS_MP, 'unmount'), first.headers['x-anas-confirm-code'] as string)
+    const res = await send(state(NFS_MP(), 'unmount'), first.headers['x-anas-confirm-code'] as string)
     assert.equal(res.statusCode, 202, res.body)
     const job = await finished((res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.deepEqual(calls.filter(c => c.command === UMOUNT).map(c => c.args), [[NFS_MP]], 'plain umount, never -l: an unknown holder set is never force-detached; the kernel refuses a busy one before any config change')
+    assert.deepEqual(calls.filter(c => c.command === UMOUNT).map(c => c.args), [[NFS_MP()]], 'plain umount, never -l: an unknown holder set is never force-detached; the kernel refuses a busy one before any config change')
   })
 
   it('remove ALWAYS confirms — an idle, unreferenced mount too — and the challenge names what it deletes', async () => {
     await serve()
-    const res = await send(remove(NFS_MP, '?removeMountpointDir=true'))
+    const res = await send(remove(NFS_MP(), '?removeMountpointDir=true'))
     assert.equal(res.statusCode, 409)
     assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
     assert.ok(res.headers['x-anas-confirm-code'])
     assert.deepEqual(res.json().error.warnings, [
-      `The /etc/fstab line for '${NFS_MP}' is deleted; the mount does not come back at boot.`,
-      `'${NFS_MP}' is unmounted now.`,
-      `The mountpoint directory '${NFS_MP}' is removed if it is empty (never its contents).`,
+      `The /etc/fstab line for '${NFS_MP()}' is deleted; the mount does not come back at boot.`,
+      `'${NFS_MP()}' is unmounted now.`,
+      `The mountpoint directory '${NFS_MP()}' is removed if it is empty (never its contents).`,
     ])
     assert.deepEqual(calls.filter(isMutation), [])
   })
@@ -806,8 +834,8 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
       ['', '?removeMountpointDir=true', 'You confirmed with removeMountpointDir off; this request has removeMountpointDir on — confirm again'],
       ['?removeMountpointDir=true', '?removeMountpointDir=false', 'You confirmed with removeMountpointDir on; this request has removeMountpointDir off — confirm again'],
     ] as const) {
-      const first = await send(remove(NFS_MP, from))
-      const res = await send(remove(NFS_MP, to), first.headers['x-anas-confirm-code'] as string)
+      const first = await send(remove(NFS_MP(), from))
+      const res = await send(remove(NFS_MP(), to), first.headers['x-anas-confirm-code'] as string)
       assert.equal(res.statusCode, 409)
       assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
       assert.deepEqual(res.json().error.changed, ['removeMountpointDir'])
@@ -818,8 +846,8 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
 
   it('remove binds the credentials file it deletes: a line re-pointed at another file before the job fails STATE_CHANGED naming both', async () => {
     await serve()
-    const { id, release } = await acceptedBehindFullQueue(remove(CIFS_MP))
-    await writeFile(paths.fstab, rewrite(FSTAB, 'credentials=/etc/anas/creds/anastest.cred', `credentials=${join(paths.creds, 'other.cred')}`))
+    const { id, release } = await acceptedBehindFullQueue(remove(CIFS_MP()))
+    await writeFile(paths.fstab, mappedFstab(rewrite(FSTAB, 'credentials=/etc/anas/creds/anastest.cred', `credentials=${join(paths.creds, 'other.cred')}`)))
     release()
     const job = await finished(id)
     assert.equal(job.status, 'failed')
@@ -834,13 +862,13 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
 
   it('unmount, disable and remove name the SMB share and the backup task riding the path in the confirm — and never refuse', async () => {
     await serve()
-    await writeFile(paths.smb, SMB_MEDIA_ON_NFS)
-    await writeFile(join(paths.systemd, 'anas-backup-nas-media.service'), renderBackupService(BACKUP_ON_NFS))
+    await writeFile(paths.smb, SMB_MEDIA_ON_NFS())
+    await writeFile(join(paths.systemd, 'anas-backup-nas-media.service'), renderBackupService(BACKUP_ON_NFS()))
     const expected = [
-      `SMB share 'media' serves '${NFS_MP}/media', which is on this mount, and stops working while it is not mounted`,
-      `Backup task 'nas-media' backs up '${NFS_MP}/media', which is on this mount - its source is missing while it is not mounted`,
+      `SMB share 'media' serves '${NFS_MP()}/media', which is on this mount, and stops working while it is not mounted`,
+      `Backup task 'nas-media' backs up '${NFS_MP()}/media', which is on this mount - its source is missing while it is not mounted`,
     ]
-    for (const req of [state(NFS_MP, 'unmount'), state(NFS_MP, 'disable'), remove(NFS_MP)]) {
+    for (const req of [state(NFS_MP(), 'unmount'), state(NFS_MP(), 'disable'), remove(NFS_MP())]) {
       const res = await send(req)
       assert.equal(res.statusCode, 409, `${req.url}: an idle unmount now confirms because something rides the path`)
       assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
@@ -853,37 +881,37 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
       assert.equal((job.result as { warnings?: string[] }).warnings, undefined, 'a reference the confirm listed is not repeated')
       // Put the line back for the next verb.
-      await writeFile(paths.fstab, FSTAB)
+      await writeFile(paths.fstab, mappedFstab(FSTAB))
     }
   })
 
   it('an idle unmount with nothing riding the path still runs without a confirm (wire-compatible)', async () => {
     await serve()
-    const res = await send(state(NFS_MP, 'unmount'))
+    const res = await send(state(NFS_MP(), 'unmount'))
     assert.equal(res.statusCode, 202, res.body)
   })
 
   it('a share that appears on the path after the unmount was accepted is reported on the COMPLETED job, not refused', async () => {
     await serve()
-    const { id, release } = await acceptedBehindFullQueue(state(NFS_MP, 'unmount'))
-    await writeFile(paths.smb, SMB_MEDIA_ON_NFS)
+    const { id, release } = await acceptedBehindFullQueue(state(NFS_MP(), 'unmount'))
+    await writeFile(paths.smb, SMB_MEDIA_ON_NFS())
     release()
     const job = await finished(id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.deepEqual((job.result as { warnings?: string[] }).warnings, [
-      `SMB share 'media' serves '${NFS_MP}/media', which is on this mount, and stops working while it is not mounted`,
+      `SMB share 'media' serves '${NFS_MP()}/media', which is on this mount, and stops working while it is not mounted`,
     ])
-    assert.ok(calls.some(c => c.command === UMOUNT && c.args[0] === NFS_MP))
+    assert.ok(calls.some(c => c.command === UMOUNT && c.args[0] === NFS_MP()))
   })
 
   it('a reference source that cannot be read is disclosed in the confirm, never read as "nothing there"', async () => {
     await serve()
     await rm(paths.smb)
     await mkdir(paths.smb) // smb.conf is a directory: readConfig fails, not ENOENT
-    const res = await send(state(NFS_MP, 'unmount'))
+    const res = await send(state(NFS_MP(), 'unmount'))
     assert.equal(res.statusCode, 409)
     assert.ok((res.json().error.warnings as string[]).includes(
-      `ANAS could not read smb.conf, so it could not check whether an SMB share serves a path on '${NFS_MP}'. If this node has SMB shares, verify their paths before confirming.`,
+      `ANAS could not read smb.conf, so it could not check whether an SMB share serves a path on '${NFS_MP()}'. If this node has SMB shares, verify their paths before confirming.`,
     ))
   })
 
@@ -893,12 +921,12 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
 
   it('every verb holds mount:<path> exclusive while it acts', async () => {
     const cases: Array<{ fstab?: string, req: Req, command: string, key: string }> = [
-      { req: state(NFS_MP, 'unmount'), command: UMOUNT, key: `mount:${NFS_MP}` },
-      { req: state(NFS_MP, 'disable'), command: UMOUNT, key: `mount:${NFS_MP}` },
-      { req: remove(NFS_MP), command: UMOUNT, key: `mount:${NFS_MP}` },
-      { req: state(NFS_MP, 'mount'), command: MOUNT, key: `mount:${NFS_MP}` },
-      { fstab: FSTAB_NFS_DISABLED, req: state(NFS_MP, 'enable'), command: SYSTEMCTL, key: `mount:${NFS_MP}` },
-      { req: update(NFS_MP, { noatime: true }), command: UMOUNT, key: `mount:${NFS_MP}` },
+      { req: state(NFS_MP(), 'unmount'), command: UMOUNT, key: `mount:${NFS_MP()}` },
+      { req: state(NFS_MP(), 'disable'), command: UMOUNT, key: `mount:${NFS_MP()}` },
+      { req: remove(NFS_MP()), command: UMOUNT, key: `mount:${NFS_MP()}` },
+      { req: state(NFS_MP(), 'mount'), command: MOUNT, key: `mount:${NFS_MP()}` },
+      { fstab: FSTAB_NFS_DISABLED(), req: state(NFS_MP(), 'enable'), command: SYSTEMCTL, key: `mount:${NFS_MP()}` },
+      { req: update(NFS_MP(), { noatime: true }), command: UMOUNT, key: `mount:${NFS_MP()}` },
     ]
     for (const { fstab, req, command, key } of cases) {
       await serve(fstab)
@@ -920,7 +948,7 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
   it('a create at `<mp>/` meets the fstab line for `<mp>` — 409, no second line for one directory (cr.39 review)', async () => {
     await serve()
     const mp = join(dir, 'slashed')
-    const withLine = rewrite(FSTAB, '/mnt/anas-cifs ', `${mp} `)
+    const withLine = mappedFstab(rewrite(FSTAB, '/mnt/anas-cifs ', `${mp} `))
     await writeFile(paths.fstab, withLine)
     const res = await send({ method: 'POST', url: '/v1/mounts', payload: { type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export1', mountpoint: `${mp}/`, persistent: true, mountNow: false } })
     assert.equal(res.statusCode, 409, res.body)
@@ -948,11 +976,11 @@ describe('cr.39 — mount verbs re-gate in the job (ruling (j))', () => {
     paused.set(UMOUNT, new Promise<void>((resolve) => {
       releaseUmount = resolve
     }))
-    const unmountId = await accepted(state(NFS_MP, 'unmount'))
+    const unmountId = await accepted(state(NFS_MP(), 'unmount'))
     await until(() => calls.some(c => c.command === UMOUNT))
-    const disableId = await accepted(state(NFS_MP, 'disable'))
+    const disableId = await accepted(state(NFS_MP(), 'disable'))
     assert.equal(queue().get(disableId)?.status, 'queued')
-    assert.equal(queue().get(disableId)?.progress, `waiting for mount.unmount (job ${unmountId}) on the mount at ${NFS_MP}`)
+    assert.equal(queue().get(disableId)?.progress, `waiting for mount.unmount (job ${unmountId}) on the mount at ${NFS_MP()}`)
     assert.equal(queue().list('running').length, 1, 'the waiting disable holds none of the free slots')
     paused.clear()
     releaseUmount()

@@ -6,6 +6,10 @@ import { dirname, join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
+/** The longest Unix-socket path Linux accepts (sockaddr_un.sun_path ≈ 108 bytes). */
+const SOCK_PATH_SLACK = 24
+const SOCK_MAX = 108 - SOCK_PATH_SLACK
+
 /**
  * The anasd Unix socket IS the trust boundary (Principle 9): the daemon trusts
  * the X-Anas-* identity headers precisely because only local root can reach the
@@ -22,7 +26,13 @@ describe('anasd socket permissions', () => {
   let sockPath: string
 
   before(() => {
-    dir = mkdtempSync(join(tmpdir(), 'anasd-sock-'))
+    // The harness runs tests with TMPDIR inside a deep worktree, whose
+    // `join(tmpdir(), 'anasd-sock-')` alone would pass the Unix-socket length
+    // cap — `listen` then answers EINVAL and the daemon dies before the chmod.
+    // Fall back to /tmp (shorter than the cap on every Linux box ANAS runs) so
+    // the socket path can never silently exceed it.
+    const base = join(tmpdir(), 'anasd-sock-')
+    dir = mkdtempSync(join(base.length < SOCK_MAX ? tmpdir() : '/tmp', 'anasd-sock-'))
     sockPath = join(dir, 'anasd.sock')
   })
 

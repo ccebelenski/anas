@@ -388,11 +388,13 @@ describe('AHR transient snapshots (backup2.3, GT-52)', () => {
       assert.deepEqual(mock.calls.filter(c => c.command === BTRFS).map(c => c.args), [
         ['subvolume', 'snapshot', '-r', join(top, '@data'), join(top, '@snapshots', LABEL)],
       ])
-      // Mounted top-level for the op, and unmounted again — nothing stays mounted.
-      assert.deepEqual(
-        mock.calls.filter(c => c.command === MOUNT).map(c => c.args),
-        [['-t', 'btrfs', '-o', 'subvolid=5', '/dev/ahr1/data', top]],
-      )
+      // Mounted top-level DIRECTLY through a directory the daemon opened
+      // (cr.52r D3) — the argv carries the fd target — and unmounted again.
+      const mountCalls = mock.calls.filter(c => c.command === MOUNT)
+      assert.deepEqual(mountCalls.map(c => c.args), [
+        ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/ahr1/data', '/proc/self/fd/3'],
+      ])
+      assert.equal(mountCalls[0]!.fdPaths?.[0], top, 'the fd resolves to the opened top-level')
       assert.deepEqual(mock.calls.filter(c => c.command === UMOUNT).map(c => c.args), [['--', top]])
       assert.equal(taken.backend, 'ahr')
       assert.equal(taken.full, `ahr1:@snapshots/${LABEL}`)
@@ -459,7 +461,9 @@ describe('AHR transient snapshots (backup2.3, GT-52)', () => {
         return [...byPool.values()]
       }, { runtimeDir })
       assert.deepEqual(seen, [join(runtimeDir, 'ahr1.toplevel'), join(runtimeDir, 'ahr2.toplevel')])
-      assert.deepEqual(mock.calls.filter(c => c.command === MOUNT).map(c => c.args.at(-1)), [
+      // cr.52r D3: each mount is DIRECT through the opened dir — the fd
+      // resolves to that pool's top-level.
+      assert.deepEqual(mock.calls.filter(c => c.command === MOUNT).map(c => c.fdPaths?.[0]), [
         join(runtimeDir, 'ahr1.toplevel'),
         join(runtimeDir, 'ahr2.toplevel'),
       ])

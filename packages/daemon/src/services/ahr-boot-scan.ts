@@ -1,20 +1,25 @@
-import type { AhrPool } from '@anas/shared'
+import type { AhrPool, MountEntry } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { LvmPv } from '../parsers/lvm-report.js'
 import type { GuardSpec } from '../safety/guard.js'
 import type { NamedMdArray } from './ahr-identity.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
+import { readFile } from 'node:fs/promises'
+import { mountOptionTokens, parseFstab } from '../parsers/fstab.js'
 import { parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { guardCheck, guarded, GuardRefusalError } from '../safety/guard.js'
 import { IdentityMismatchError } from '../safety/stable-id.js'
 import { cachedVgNames, notifyCacheRecoveryFailed, recoverFailedAhrCache } from './ahr-cache.js'
 import { resumeExpansion } from './ahr-expand-resume.js'
+import { mountAhrPool } from './ahr-fstab.js'
 import { ahrGuard } from './ahr-guard.js'
 import { isIntentStale, isOwnedArray, normalizeMdUuid, pinnedUuids, poolPvNames, readAhrPoolIdentity, readMdadmConfDoc, readNamedMdArrays } from './ahr-identity.js'
 import { defaultAhrIntentDir, listIntents, writeIntent } from './ahr-intent.js'
 import { ahrLvPath } from './ahr-paths.js'
+import { isSubvolLayoutMount } from './ahr-snapshots.js'
 import { AhrTopologyUnreadableError, readAhrPools } from './ahr-topology.js'
+import { mountTargetRefusal } from './mounts.js'
 import { pveNotify } from './pve-notify.js'
 
 /**
@@ -77,7 +82,6 @@ import { pveNotify } from './pve-notify.js'
 
 const MDADM = '/usr/sbin/mdadm'
 const VGCHANGE = '/usr/sbin/vgchange'
-const MOUNT = '/usr/bin/mount'
 const PVS = '/usr/sbin/pvs'
 const VGS = '/usr/sbin/vgs'
 
@@ -99,6 +103,14 @@ export interface BootScanOptions {
   diskCache?: DiskIdentityCache
   /** mdadm.conf override (else ANAS_MDADM_CONF / the Debian default) — the pins the ladder is gated on. */
   mdadmConfPath?: string
+  /**
+   * fstab path override (else ANAS_FSTAB_PATH / /etc/fstab). The cache-recover
+   * rung re-mounts a pool that came up DOWN — and a down pool's topology
+   * mountpoint reads as its LV device path, not the directory it mounts at. The
+   * pool's OWN fstab line is where its real configured mountpoint lives; the
+   * rung read it here, gates it and mounts DIRECTLY through it (cr.52r D3/P2).
+   */
+  fstabPath?: string
 }
 
 export interface BootScanReport {
@@ -131,6 +143,30 @@ function haltBody(pool: string, reason?: string): string {
   return reason
     ? `${base} ANAS tried to re-attach automatically after the restart but could not proceed: ${reason}`
     : base
+}
+
+/** The fstab the daemon was configured with (mirrors the pve mounts door's default). */
+function defaultFstabPath(): string {
+  return process.env.ANAS_FSTAB_PATH ?? '/etc/fstab'
+}
+
+/**
+ * The pool's OWN fstab entry — the line ANAS wrote at creation, and therefore
+ * the real configured mountpoint of a pool that is DOWN (when its topology
+ * mountpoint reads as the LV device path). Null when the file is unreadable or
+ * carries no line for the pool — the rung must then leave the pool alone
+ * rather than invent a mount.
+ */
+async function ahrPoolFstabEntry(fstabPath: string, name: string): Promise<MountEntry | null> {
+  let text: string
+  try {
+    text = await readFile(fstabPath, 'utf8')
+  }
+  catch {
+    return null
+  }
+  const spec = ahrLvPath(name)
+  return parseFstab(text).find(e => e.spec === spec) ?? null
 }
 
 /** One daemon-start pass over md state + the intent store. */
@@ -336,14 +372,44 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
           { log },
         )
         // The volume could not activate while the cache metadata was missing, so
-        // the pool is almost certainly down: activate it, then let fstab supply
-        // the spec and every option the pool's own line carries.
+        // the pool is almost certainly down: activate it, then mount the pool's
+        // own configured entry directly through a directory the daemon opened
+        // (cr.52r D3) — the kernel resolves /proc/self/fd/3, so a swapped parent
+        // cannot redirect the boot mount either.
         if (!target.mounted) {
           const vg = await executor.exec(VGCHANGE, ['-ay', target.name])
           log(`ahr.boot pool=${target.name} rung=vgchange-ay result=${vg.exitCode === 0 ? 'ok' : `failed detail=${vg.stderr.trim()}`}`)
-          const mp = ahrLvPath(target.name)
-          const mounted = await executor.exec(MOUNT, ['--', mp])
-          log(`ahr.boot pool=${target.name} rung=mount result=${mounted.exitCode === 0 ? 'ok' : `failed detail=${mounted.stderr.trim()}`}`)
+          // cr.52r P2: the boot re-attach MOUNTS the stored path again — the
+          // refusal runs on it first. The boot path must never take the daemon
+          // down: a refused (or otherwise unmountable) pool is logged and left
+          // for the operator, never thrown.
+          //
+          // A DOWN pool reads its mountpoint as its LV device path (ahr-topology's
+          // honest "where the filesystem lives" fallback) — not a directory, and
+          // not the path the refusal can gate. The pool's OWN fstab line is where
+          // its real configured mountpoint lives; the rung mounts that line
+          // directly, so the kernel neither pivots a device-path lookup nor mounts
+          // at a place the gate never checked. No line: never invent a mount —
+          // log and leave the pool for the operator.
+          const fstabPath = opts.fstabPath ?? defaultFstabPath()
+          const entry = await ahrPoolFstabEntry(fstabPath, target.name)
+          if (!entry) {
+            log(`ahr.boot pool=${target.name} rung=mount result=no-fstab-entry`)
+          }
+          else {
+            const refusal = await mountTargetRefusal(entry.mountpoint)
+            if (refusal) {
+              log(`ahr.boot pool=${target.name} rung=mount result=refused detail=${refusal.message}`)
+            }
+            else {
+              await mountAhrPool(executor, {
+                name: target.name,
+                mountpoint: entry.mountpoint,
+                subvolLayout: isSubvolLayoutMount(mountOptionTokens(entry)),
+              })
+              log(`ahr.boot pool=${target.name} rung=mount result=ok`)
+            }
+          }
         }
         log(`ahr.boot pool=${target.name} rung=cache-recover uncached=${outcome.uncached} vgreduced=${outcome.vgReduced}`)
         report.cacheRecovered.push(target.name)

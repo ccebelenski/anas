@@ -2,7 +2,7 @@ import type { AhrExpansionIntent, Job } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, rmdir, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -93,8 +93,8 @@ const DISKS = [
   { kernel: 'sds', id: Z, part: 'sds1' },
 ]
 
-function ahrLsblkJson(): string {
-  const lvmNode = { name: 'tank-tank--vol', type: 'lvm', size: LV_SIZE, fstype: 'btrfs', mountpoint: '/mnt/anas-ahr/tank', partlabel: null }
+function ahrLsblkJson(mountpoint: string): string {
+  const lvmNode = { name: 'tank-tank--vol', type: 'lvm', size: LV_SIZE, fstype: 'btrfs', mountpoint, partlabel: null }
   return JSON.stringify({ blockdevices: DISKS.map(d => ({
     name: d.kernel,
     type: 'disk',
@@ -117,9 +117,9 @@ function ahrLsblkJson(): string {
 }
 
 /** subvolLayout is derived from the mount subvol= option (§12). */
-function findmntJson(subvol: string): string {
+function findmntJson(subvol: string, mountpoint: string): string {
   return JSON.stringify({ filesystems: [{
-    target: '/mnt/anas-ahr/tank',
+    target: mountpoint,
     source: '/dev/mapper/tank-tank--vol',
     fstype: 'btrfs',
     options: `rw,relatime,space_cache=v2,${subvol}`,
@@ -132,21 +132,25 @@ function findmntJson(subvol: string): string {
  * evidence, and the cheapest way to put this pool's read layer into the state
  * the mutation gate has to refuse.
  */
-function buildExecutor(opts: { subvol?: string, lvAttr?: string } = {}): MockExecutor {
+function buildExecutor(opts: { subvol?: string, lvAttr?: string, mountpoint?: string } = {}): MockExecutor {
   const executor = new MockExecutor()
+  // The pool's mountpoint must be a REAL directory when a rollback's fd-pinned
+  // remount opens it (cr.52r D3) — callers override `mountpoint` with a temp
+  // path and mkdir it; the default matches the pre-cr.52r fixtures.
+  const mp = opts.mountpoint ?? '/mnt/anas-ahr/tank'
   executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: { stdout: MDSTAT, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: 'MD_LEVEL=raid5\nMD_DEVICES=3\nMD_METADATA=1.2\nMD_UUID=aaaa:aaaa:aaaa:aaaa\nMD_DEVNAME=tank-r1\nMD_NAME=anas-test:tank-r1\n', stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/bin/lsblk', args: [...AHR_LSBLK_ARGS], result: { stdout: ahrLsblkJson(), stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/lsblk', args: [...AHR_LSBLK_ARGS], result: { stdout: ahrLsblkJson(mp), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: `${DISKS.map(d => `lrwxrwxrwx 1 root root 9 Jul 23 10:00 ${d.id} -> ../../${d.kernel}`).join('\n')}\n`, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/vgs', args: [...VGS_ARGS], result: { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '1', lv_count: '1', vg_size: String(LV_SIZE), vg_free: '0' }] }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: { stdout: JSON.stringify({ report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: opts.lvAttr ?? '-wi-ao----', lv_size: String(LV_SIZE) }] }] }), stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: findmntJson(opts.subvol ?? 'subvolid=256,subvol=/@data'), stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: BTRFS_USAGE, stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: findmntJson(opts.subvol ?? 'subvolid=256,subvol=/@data', mp), stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', mp], result: { stdout: BTRFS_USAGE, stderr: '', exitCode: 0 } })
   // Snapshot listing against the live @data mount: the plain list is the
   // membership source; `-s` supplies otime, `-r` the readonly set.
-  executor.addFixture({ command: '/usr/bin/btrfs', args: ['subvolume', 'list', '/mnt/anas-ahr/tank'], result: { stdout: SUBVOL_LIST_ALL, stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/bin/btrfs', args: ['subvolume', 'list', '-s', '/mnt/anas-ahr/tank'], result: { stdout: SUBVOL_LIST_S, stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/bin/btrfs', args: ['subvolume', 'list', '-r', '/mnt/anas-ahr/tank'], result: { stdout: SUBVOL_LIST_R, stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/btrfs', args: ['subvolume', 'list', mp], result: { stdout: SUBVOL_LIST_ALL, stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/btrfs', args: ['subvolume', 'list', '-s', mp], result: { stdout: SUBVOL_LIST_S, stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/btrfs', args: ['subvolume', 'list', '-r', mp], result: { stdout: SUBVOL_LIST_R, stderr: '', exitCode: 0 } })
   // Mutation plumbing — the on-demand top-level mount + btrfs + rename succeed.
   executor.addFixture({ command: '/usr/bin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/mount', result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -173,7 +177,14 @@ describe('AHR snapshot routes (story 11.12)', () => {
   let server: ReturnType<typeof Fastify>
 
   async function build(opts: { subvol?: string, lvAttr?: string } = {}) {
-    executor = buildExecutor(opts)
+    // cr.52r D3: the pool's mountpoint must exist for the fd-pinned remount a
+    // rollback runs in its finally — the pool fixture needs a real directory.
+    // It sits one level deep (under `stored`) so a P2 probe can swap the parent
+    // (rc.52r P2: a STORED path whose parent becomes a symlink refuses).
+    await mkdir(join(dir, 'stored'), { recursive: true }).catch(() => {})
+    const poolMountpoint = join(dir, 'stored', 'pool')
+    await mkdir(poolMountpoint, { recursive: true }).catch(() => {})
+    executor = buildExecutor({ ...opts, mountpoint: poolMountpoint })
     jobQueue = new JobQueue()
     server = Fastify({ logger: false })
     await server.register(jobRoutes, { prefix: '/v1', jobQueue })
@@ -286,6 +297,29 @@ describe('AHR snapshot routes (story 11.12)', () => {
     assert.match(result.preserved, /^pre-rollback-/)
   })
 
+  it('a rollback whose STORED path now resolves through a symlinked parent refuses BEFORE the swap (cr.52r P2)', async () => {
+    await build()
+    const stored = join(dir, 'stored')
+    const poolMountpoint = join(stored, 'pool')
+    // The stored-path gate (`mountTargetRefusal(pool.mountpoint)`) reads the
+    // path as it is NOW: swap the parent the way a rebuilt tree (or the
+    // operator) could, and the rollback must refuse before any btrfs/mv.
+    await rm(join(stored, 'pool'), { recursive: true, force: true })
+    await rmdir(stored)
+    await symlink('/etc', stored)
+
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/snapshots/nightly/rollback', headers: JSON_HEADERS, payload: '{}' })
+    assert.equal(res.statusCode, 409, res.body)
+    const err = res.json().error
+    assert.equal(err.code, 'CONFLICT')
+    assert.equal(err.reason, 'system-mount-target')
+    assert.ok(err.message.includes(poolMountpoint), `names the stored path: ${err.message}`)
+    assert.match(err.message, /symlink/)
+    assert.equal(mutatingCalls().length, 0, 'no btrfs/mv ran')
+    // No confirm offered — a hard refusal, nothing to sign.
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+  })
+
   it('flat-layout pool: GET is empty and every mutation is refused (no migration)', async () => {
     await build({ subvol: 'subvolid=5,subvol=/' })
     const list = await server.inject({ method: 'GET', url: '/v1/ahr/tank/snapshots', headers: IDENTITY })
@@ -357,13 +391,20 @@ describe('AHR snapshot routes (story 11.12)', () => {
 describe('cr.38 — the AHR snapshot verbs re-gate in the job (ruling (j))', () => {
   const ISCSI_FIXTURES = join(fileURLToPath(new URL('.', import.meta.url)), '../../fixtures/iscsi')
   const LIO_NO_LUNS = readFileSync(join(ISCSI_FIXTURES, 'configfs-restore-empty.manifest'), 'utf-8')
-  const LIO_LUN_ON_TANK = readFileSync(join(ISCSI_FIXTURES, 'configfs-live.manifest'), 'utf-8')
-    .replace('udev_path = /gtiscsi/images/lun2.raw', 'udev_path = /mnt/anas-ahr/tank/images/lun2.raw')
+  /**
+   * The LUN-image manifest, ON the pool (cr.52r: the pool lives at the temp
+   * mountpoint, so the image path rides it — the LUN-held gate checks the
+   * image's path against the pool's mountpoint).
+   */
+  const lioLunOnTank = (mp: string): string =>
+    readFileSync(join(ISCSI_FIXTURES, 'configfs-live.manifest'), 'utf-8')
+      .replace('udev_path = /gtiscsi/images/lun2.raw', `udev_path = ${mp}/images/lun2.raw`)
   const LIST_WITHOUT_NIGHTLY = SUBVOL_LIST_ALL.replace('ID 258 gen 42 top level 257 path @snapshots/nightly\n', '')
 
   let dir: string
   let runtimeDir: string
   let configfs: string
+  let poolMountpoint: string
   let executor: MockExecutor
   let jobQueue: JobQueue
   let server: ReturnType<typeof Fastify>
@@ -385,12 +426,16 @@ describe('cr.38 — the AHR snapshot verbs re-gate in the job (ruling (j))', () 
 
   async function build() {
     await materializeConfigfsManifest(LIO_NO_LUNS, configfs)
-    executor = buildExecutor()
+    // cr.52r D3: the pool's mountpoint must exist for a rollback's fd-pinned
+    // remount — the pool fixture needs a real directory.
+    poolMountpoint = join(dir, 'pool')
+    await mkdir(poolMountpoint, { recursive: true })
+    executor = buildExecutor({ mountpoint: poolMountpoint })
     const orig = executor.exec.bind(executor)
     executor.exec = async (command, args, opts) => {
       if (command === '/usr/bin/findmnt' && findmnt !== null && args.join(' ') === AHR_FINDMNT_ARGS.join(' '))
         return { stdout: findmnt, stderr: '', exitCode: 0 }
-      if (command === '/usr/bin/btrfs' && subvolList !== null && args.join(' ') === 'subvolume list /mnt/anas-ahr/tank')
+      if (command === '/usr/bin/btrfs' && subvolList !== null && args.join(' ') === `subvolume list ${poolMountpoint}`)
         return { stdout: subvolList, stderr: '', exitCode: 0 }
       return orig(command, args, opts)
     }
@@ -466,14 +511,14 @@ describe('cr.38 — the AHR snapshot verbs re-gate in the job (ruling (j))', () 
     await build()
     const { id, release } = await queued('POST', ROLLBACK, true)
     await rm(configfs, { recursive: true, force: true })
-    await materializeConfigfsManifest(LIO_LUN_ON_TANK, configfs)
+    await materializeConfigfsManifest(lioLunOnTank(poolMountpoint), configfs)
     await refused(id, release, 'CONFLICT', /^Rolling back AHR pool 'tank' is refused: it is held by iSCSI LUN/)
   })
 
   it('rollback: the pool mounted at a system path between the confirm and the job refuses it (cr.38 adds the gate) — no mutating argv', async () => {
     await build()
     const { id, release } = await queued('POST', ROLLBACK, true)
-    findmnt = findmntJson('subvolid=256,subvol=/@data').replace('"target":"/mnt/anas-ahr/tank"', '"target":"/var"')
+    findmnt = findmntJson('subvolid=256,subvol=/@data', poolMountpoint).replace(`"target":"${poolMountpoint}"`, '"target":"/var"')
     assert.match(findmnt, /"target":"\/var"/)
     await refused(id, release, 'CONFLICT', /mounted at \/var — ANAS never destroys or remounts a system pool/)
   })

@@ -114,7 +114,9 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
     )
 
     assert.deepEqual(result, { created: 't2', mountpoint: join(mountBase, 't2'), arrays: ['t2-r1'] })
-    assert.deepEqual(executor.calls, [
+    // The two MOUNT calls additionally carry the inherited O_PATH fd (cr.52r D3)
+    // — compare command+args here, and pin the fd's resolved path below.
+    assert.deepEqual(executor.calls.map(c => ({ command: c.command, args: c.args })), [
       // Job-time name re-check (ident.3, H6): no live `t2-r<N>` array, no pin,
       // no `t2-*` partition label, no VG named `t2` — read before the first
       // destructive command.
@@ -175,15 +177,21 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       // what keeps a mixed-block-size LV mountable).
       { command: '/usr/sbin/mkfs.btrfs', args: ['-L', 't2', '-d', 'single', '-m', 'dup', '--sectorsize', '4096', '/dev/t2/t2-vol'] },
       // §12 subvolume layout: mount the top-level, carve @data + @snapshots,
-      // unmount — then the pool mounts subvol=@data.
-      { command: '/usr/bin/mount', args: ['-t', 'btrfs', '-o', 'subvolid=5', '/dev/t2/t2-vol', join(mountBase, 't2')] },
+      // unmount — then the pool mounts subvol=@data. cr.52r D3: both mounts go
+      // through the daemon-OPENED directory (target /proc/self/fd/3, `-c`), with
+      // the child inheriting the O_PATH fd.
+      { command: '/usr/bin/mount', args: ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/t2/t2-vol', '/proc/self/fd/3'] },
       { command: '/usr/bin/btrfs', args: ['subvolume', 'create', join(mountBase, 't2', '@data')] },
       { command: '/usr/bin/btrfs', args: ['subvolume', 'create', join(mountBase, 't2', '@snapshots')] },
       { command: '/usr/bin/umount', args: ['--', join(mountBase, 't2')] },
       { command: '/usr/bin/systemctl', args: ['daemon-reload'] },
-      { command: '/usr/bin/mount', args: ['--', join(mountBase, 't2')] },
+      { command: '/usr/bin/mount', args: ['-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s', '--', '/dev/t2/t2-vol', '/proc/self/fd/3'] },
       executor.calls.at(-1)!, // perl notify — argv asserted below
     ])
+    // cr.52r D3: the inherited fd of BOTH mounts resolves to the pool's
+    // mountpoint directory (the kernel target /proc/self/fd/3 is that dir).
+    for (const m of executor.calls.filter(c => c.command === '/usr/bin/mount'))
+      assert.equal(m.fdPaths?.[0], join(mountBase, 't2'), 'mount fd resolves to the pool mountpoint')
     const notify = executor.calls.at(-1)!
     assert.equal(notify.command, '/usr/bin/perl')
     assert.equal(notify.args[2], 'info')

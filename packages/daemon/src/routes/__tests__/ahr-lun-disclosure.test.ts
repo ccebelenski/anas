@@ -4,7 +4,7 @@ import type { ZfsMountpoint } from '../../parsers/pve-storage.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -53,7 +53,10 @@ const Z = 'ata-TANK_Z'
 const SIZE = 2 * GIB + 8 * MIB
 const B1 = 2 * GIB - MIB
 const LV_SIZE = 4 * GIB
-const MOUNTPOINT = '/mnt/anas-ahr/tank'
+// cr.52r D3: an AHR remount/rollback opens the pool's mountpoint O_PATH before
+// the mount — the stored mountpoint must be a REAL directory, so it is a
+// per-process tmpdir the harness creates and removes itself.
+const MOUNTPOINT = join(tmpdir(), `anas-cr38r-tank-${process.pid}`)
 /** The move's target, under the test's TMPDIR — the move job creates it for real. */
 const MOVE_BASE = join(tmpdir(), `anas-cr38r-move-${process.pid}`)
 const NEW_MOUNTPOINT = join(MOVE_BASE, 'tank-other')
@@ -251,6 +254,7 @@ describe('cr.38r — the lio-unreadable advisory on AHR mountpoint, remount and 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-cr38r-disclose-'))
     configfs = join(dir, 'target')
+    await mkdir(MOUNTPOINT, { recursive: true })
     await writeFile(join(dir, 'fstab'), `/dev/tank/tank-vol ${MOUNTPOINT} btrfs subvol=@data,nofail 0 0\n`)
     await rm(MOVE_BASE, { recursive: true, force: true })
   })
@@ -259,6 +263,7 @@ describe('cr.38r — the lio-unreadable advisory on AHR mountpoint, remount and 
     server = undefined
     await rm(dir, { recursive: true, force: true })
     await rm(MOVE_BASE, { recursive: true, force: true })
+    await rm(MOUNTPOINT, { recursive: true, force: true })
   })
 
   it('the mountpoint confirm lists the lio-unreadable advisory when the claims read broke (D3)', async () => {

@@ -14,15 +14,16 @@ import type {
   MountType,
   MountUnit,
 } from '@anas/shared'
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, ExecOptions, ExecResult } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
 import type { Gate, Refusal } from '../safety/guard.js'
 import { createHash } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
+import { constants as FS_CONSTANTS } from 'node:fs'
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, normalize, resolve } from 'node:path'
+import { dirname, join, normalize, resolve } from 'node:path'
 import { CIFS_CREDENTIAL_OPTION_KEYS, MountCifsSec, MountExtraOptions, MountNfsSec, normalizeMountTarget, unescapeFstabField } from '@anas/shared'
 import { classifyKind, effectiveMountAt, effectiveMounts, isIgnoredMount, optionsReadOnly, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
 import { cifsAuthToken, getMount, inlineCommentIndex, parseFstab, parseFstabDoc } from '../parsers/fstab.js'
@@ -1522,9 +1523,22 @@ export function mountpointReservedByPve(mountpoint: string): boolean {
  *    `/etc/x`, `/lib64/y`…)
  *
  * Allowed: UNDER `/srv`, `/home`, `/opt` and `/var` — `/srv/backup`,
- * `/var/lib/remote`, `/home/shares/nas` are ordinary remote-mount shapes.
- * `/opt` is deliberately NOT in the list: nothing ships there that a mount
- * could hide, and it is the conventional third-party mount root.
+ * `/var/lib/remote`, `/home/shares/nas` are ordinary remote-mount
+ * shapes. `/opt` is deliberately NOT in the list: nothing ships there that a
+ * mount could hide, and it is the conventional third-party mount root.
+ *
+ * The cr.52r refinements narrow the two broad "allowed under" trees:
+ *  - under `/home`, a mountpoint at or above a `<user>/.ssh` directory is
+ *    refused (the protected root) AND any mountpoint that is an ANCESTOR of
+ *    one is refused (a mount at `/home` or at `/home/alice` hides the `.ssh`
+ *    directory below it). A mount at least two segments below the home root
+ *    that is not itself `.ssh` (`/home/alice/Documents`, `/home/shares/nas`)
+ *    is still allowed.
+ *  - under `/var`, the protected roots at or under which a mount is refused
+ *    (`/var/spool/cron`, `/var/lib/pve*`, `/var/lib/vz`, `/var/lib/ceph`,
+ *    `/var/lib/dpkg`, `/var/log`) have the same ancestor rule: `/var/spool`,
+ *    `/var/lib` and `/var/log`'s parents are refused, while an unrelated
+ *    `/var/lib/remote` or `/var/x` stays allowed.
  */
 export const SYSTEM_MOUNT_TARGETS = [
   '/',
@@ -1606,7 +1620,14 @@ export const MOUNT_TARGET_REFUSALS: ReadonlyArray<MountTargetRefusalRule> = [
   { root: '/home/*/.ssh', reason: 'an SSH key directory (authorized_keys and any private keys)' },
   { root: '/var/spool/cron', reason: 'the system cron jobs' },
   { root: '/var/lib/pve*', reason: 'PVE\'s cluster filesystem and state under /var/lib/pve' },
+  // cr.52r P1: four more state trees a mount can hide in the way pve* already
+  // could — a guest rootfs tree, Ceph's local state, dpkg's ledger and the logs.
+  { root: '/var/lib/vz', reason: 'PVE\'s container and VM rootfs trees (vz)' },
+  { root: '/var/lib/ceph', reason: 'Ceph\'s local cluster state on a node' },
+  { root: '/var/lib/dpkg', reason: 'dpkg\'s installed-package database' },
+  { root: '/var/log', reason: 'the system logs' },
   { root: '/mnt/pve', reason: 'PVE territory — the §2 Mounts ruling reserves /mnt/pve' },
+  { root: '/etc/pve', reason: 'PVE territory — /etc/pve is PVE\'s cluster filesystem (pmxcfs)' },
 ]
 
 /** Escape one literal path segment for the protected-root matcher's regex. */
@@ -1628,11 +1649,37 @@ function atOrUnderProtectedRoot(mp: string, root: string): boolean {
 }
 
 /**
+ * Is `mp` an ANCESTOR of a protected root (cr.52r D1)? A mount at an ancestor
+ * hides the protected path below it: a mount at `/home` or `/home/alice` hides
+ * any `/home/<user>/.ssh`, at `/var/spool` it hides `cron`, at `/var/lib` the
+ * `pve*`/`vz`/`ceph`/`dpkg` roots, at `/mnt` the `pve` ruling's territory.
+ * `mp` is an ancestor when the protected root's pattern is STRICTLY longer
+ * than `mp` and `mp`'s segments match the pattern's leading segments (a `*`
+ * matches exactly one segment, as it does at/under). A trailing `*` is
+ * ignored here — the at-or-under rule already covers everything at or under
+ * its fixed prefix, so only strict prefixes of it are discovered by this walk.
+ */
+function ancestorOfProtectedRoot(mp: string, root: string): boolean {
+  const pattern = root.endsWith('*') ? root.slice(0, -1) : root
+  const m = mp.split('/').filter(Boolean)
+  const p = pattern.split('/').filter(Boolean)
+  if (m.length >= p.length)
+    return false
+  for (let i = 0; i < m.length; i++) {
+    if (p[i] !== '*' && p[i] !== m[i])
+      return false
+  }
+  return true
+}
+
+/**
  * The sentence's reason clause for a NORMALIZED mountpoint the lexical rules
  * refuse, or null. The three shapes cr.18 defines (equal to a system target,
  * a strict `/`-boundary ancestor of one, inside a never-mount-under subtree)
- * plus the cr.52 protected rules. Named the same path resolution the refusal
- * applies to the resolved mountpoint after a symlinked parent.
+ * plus the cr.52 protected rules, at/under a protected root OR at an ancestor
+ * of one (cr.52r D1 — a mount that would sit above the protected path and hide
+ * it is refused with the protected path named). Named the same path resolution
+ * the refusal applies to the resolved mountpoint after a symlinked parent.
  */
 export function lexicalMountTargetReason(mp: string): string | null {
   for (const entry of SYSTEM_MOUNT_TARGETS) {
@@ -1643,35 +1690,61 @@ export function lexicalMountTargetReason(mp: string): string | null {
     if (entry.startsWith(`${mp}/`))
       return `an ancestor of the system path '${entry}'`
   }
-  for (const entry of NEVER_MOUNT_UNDER) {
-    if (mp.startsWith(`${entry}/`))
-      return `inside the system path '${entry}'`
-  }
+  // The protected rules run BEFORE the never-mount-under loop so a path inside
+  // BOTH (only `/etc/pve`: `/etc` is never-mount-under AND its own protected
+  // root) answers with the PVE-territory sentence (cr.52r doc ruling: `/mnt/pve`
+  // and `/etc/pve` answer one code — 409 system-mount-target — with the PVE
+  // reason kept in the sentence).
   for (const rule of MOUNT_TARGET_REFUSALS) {
     if (atOrUnderProtectedRoot(mp, rule.root))
       return `at or under the protected '${rule.root}' tree (${rule.reason})`
+    // cr.52r D1: an ancestor hides the protected path it would sit above —
+    // the existing at-or-under rule only named paths AT or BELOW the root.
+    if (ancestorOfProtectedRoot(mp, rule.root))
+      return `an ancestor of the protected '${rule.root}' tree (${rule.reason})`
+  }
+  for (const entry of NEVER_MOUNT_UNDER) {
+    if (mp.startsWith(`${entry}/`))
+      return `inside the system path '${entry}'`
   }
   return null
 }
 
 /** The filesystem answers {@link mountTargetRefusal} needs: real fs in production, injected in tests. */
 export interface MountTargetRefusalDeps {
-  /** The real path of a directory, resolved through symlinks; null when any component is missing. */
-  realpathDir: (path: string) => Promise<string | null>
-  /** Whether the path's final component is a symlink; false when the path does not exist. */
-  leafIsSymlink: (path: string) => Promise<boolean>
+  /**
+   * The LONGEST ancestor of `path` that exists (lstat-based walk up, never
+   * skipping on an intermediate ENOENT — cr.52r D2). `/` when nothing below
+   * it exists.
+   */
+  longestExistingAncestor: (path: string) => Promise<string>
+  /** Is `path` a symlink (lstat — intermediates followed, the leaf not)? false when it does not exist. */
+  pathIsSymlink: (path: string) => Promise<boolean>
+  /** The real path of `path`, resolved through symlinks; null when any component is missing. */
+  realpath: (path: string) => Promise<string | null>
+}
+
+/** The real `longestExistingAncestor` — a plain lstat walk to `/` (cr.52r D2). */
+async function realLongestExistingAncestor(path: string): Promise<string> {
+  let p = path
+  for (;;) {
+    try {
+      await lstat(p)
+      return p
+    }
+    catch {
+      /* fall through to the parent */
+    }
+    const parent = dirname(p)
+    if (parent === p)
+      return '/' // reached the root
+    p = parent
+  }
 }
 
 const REAL_FS_DEPS: MountTargetRefusalDeps = {
-  async realpathDir(path) {
-    try {
-      return await realpath(path)
-    }
-    catch {
-      return null
-    }
-  },
-  async leafIsSymlink(path) {
+  longestExistingAncestor: realLongestExistingAncestor,
+  async pathIsSymlink(path) {
     try {
       return (await lstat(path)).isSymbolicLink()
     }
@@ -1679,6 +1752,25 @@ const REAL_FS_DEPS: MountTargetRefusalDeps = {
       return false
     }
   },
+  async realpath(path) {
+    try {
+      return await realpath(path)
+    }
+    catch {
+      return null
+    }
+  },
+}
+
+/** Every `/`-separated descendant prefix of `path` (`/a/b` → `/a`, `/a/b`); none for `/`. */
+function descendantPrefixes(path: string): string[] {
+  const out: string[] = []
+  let cur = ''
+  for (const seg of path.split('/').filter(Boolean)) {
+    cur += `/${seg}`
+    out.push(cur)
+  }
+  return out
 }
 
 /**
@@ -1693,11 +1785,18 @@ export function mountTargetGate<O>(mountpoint: string | undefined): Gate<O> {
 
 /**
  * Why a mountpoint is refused, asked at every door that sets one (cr.52,
- * review H1): the typed path against cr.18's system targets, then the RESOLVED
- * path — a planted symlink in the parent chain must not launder the target past
- * the lexical list — then the final component, refused outright when it is
- * itself a symlink (a `mkdir`/`mount` over it would land wherever the link
- * points, not where the operator typed).
+ * review H1; cr.52r D1/D2):
+ *
+ *  1. the typed path against cr.18's system targets (equal, a strict ancestor
+ *     of one, inside a never-mount-under subtree) and the protected roots,
+ *     at/under them AND at an ANCESTOR of one (D1 — a mount at `/home/alice`
+ *     hides that user's `.ssh`, at `/var/spool` the cron tree, ...);
+ *  2. the mountpoint RESOLVED against the longest EXISTING ancestor (D2): walk
+ *     up until a component exists — an ENOENT on an intermediate never skips
+ *     the step — lstat every existing component and refuse ANY symlink in it
+ *     (a planted link must not launder the target past the lexical list), then
+ *     realpath the existing ancestor and re-run the lexical list at the
+ *     mountpoint as resolved.
  *
  * ONE code and ONE sentence shape everywhere: the caller returns this object
  * straight off a gate, so the route's 409 and the job's failure carry the same
@@ -1716,36 +1815,219 @@ export async function mountTargetRefusal(
     message,
   })
 
-  // (1) The typed path, as typed: equal to a system target, an ancestor of
-  // one, inside a never-mount-under subtree, or at/under a protected rule.
+  // (1) The typed path, as typed.
   const typed = lexicalMountTargetReason(mp)
   if (typed)
     return say(`Mountpoint '${mp}' is ${typed} — a mount there is refused`)
 
-  // (2) The PARENT resolved. `mount` over a directory hides everything below
-  // it, so a path whose parent chain a symlink redirects into a protected tree
-  // is the same hiding the lexical list refuses — only when the parent
-  // resolves to somewhere DIFFERENT (a symlink was traversed) does the RESOLVED
-  // mountpoint get the lexical list again.
-  const parent = dirname(mp)
-  const resolvedParent = await deps.realpathDir(parent)
-  if (resolvedParent !== null && resolvedParent !== parent) {
-    const resolved = normalizeMountpointPath(join(resolvedParent, basename(mp)))
-    const laundered = lexicalMountTargetReason(resolved)
-    if (laundered)
-      return say(`Mountpoint '${mp}' resolves via the symlink '${parent}' to '${resolved}', ${laundered} — a mount there is refused`)
+  // (2) Resolved against the LONGEST EXISTING ancestor (cr.52r D2). The empty
+  // segments an intermediate ENOENT would once have skipped are walked now:
+  // every component that EXISTS below `/` is lstat'd, and a symlink anywhere
+  // in the existing part is refused outright (the same rule the mount-side
+  // fd-pin enforces, cr.52r D3) — a symlinked parent `l -> /etc` is refused
+  // whether or not `l/newdir` exists yet. Then the existing ancestor is
+  // realpath'd and the resolved mountpoint gets the lexical list again.
+  const ancestor = await deps.longestExistingAncestor(mp)
+  // The leaf check has its own sentence; the walk here covers everything above
+  // it (when the whole path exists, that is exactly its parents).
+  const existingParents = ancestor === mp ? dirname(ancestor) : ancestor
+  for (const comp of descendantPrefixes(existingParents)) {
+    if (await deps.pathIsSymlink(comp))
+      return say(`Mountpoint '${mp}' is refused — '${comp}' in its parent path is a symlink (a planted symlink must not redirect the mount)`)
   }
-
-  // (3) The FINAL component: a symlink is refused outright, whether or not it
+  // The FINAL component: a symlink is refused outright, whether or not it
   // resolves somewhere protected — the mount would land at the link's target,
   // not where the operator typed (lstat: the component itself is not followed).
-  const leafPath = resolvedParent !== null && resolvedParent !== parent
-    ? join(resolvedParent, basename(mp))
-    : mp
-  if (await deps.leafIsSymlink(leafPath))
+  if (ancestor === mp && await deps.pathIsSymlink(mp))
     return say(`Mountpoint '${mp}' ends in a symlink — a mount over a symlinked directory is refused`)
 
+  // The compare: an existing ancestor that RESOLVES somewhere different must
+  // not slip the resolved mountpoint past the lexical list (with every symlink
+  // already refused above this only ever confirms, but an ENOENT intermediate
+  // can no longer skip it — the no-symlink check and the resolve share the
+  // walk to the same ancestor).
+  const resolvedAncestor = await deps.realpath(ancestor)
+  if (resolvedAncestor !== null && resolvedAncestor !== ancestor) {
+    const resolved = normalizeMountpointPath(resolvedAncestor + mp.slice(ancestor.length))
+    const laundered = lexicalMountTargetReason(resolved)
+    if (laundered)
+      return say(`Mountpoint '${mp}' resolves via '${ancestor}' to '${resolved}', ${laundered} — a mount there is refused`)
+  }
+
   return null
+}
+
+// ============================================================================
+// Mountpoint-tree swapping: where ZFS mounts for itself (cr.52r D3)
+// ============================================================================
+
+/** The machine-readable reason of a refusal for a mountpoint tree a non-root writer could swap. */
+export const SWAP_STAGE_REFUSAL_REASON = 'mount-target-swap-unsafe' as const
+
+/** The filesystem answers {@link swapStageRefusal}: real fs in production, injected in tests. */
+export interface SwapStageRefusalDeps {
+  /** The LONGEST existing ancestor of `path` (as {@link MountTargetRefusalDeps}). */
+  longestExistingAncestor: (path: string) => Promise<string>
+  /** lstat attributes of `path`; null when it does not exist. */
+  dirAttr: (path: string) => Promise<{ uid: number, mode: number } | null>
+}
+
+/** The mode bits that let someone OTHER than the owner rename a directory in place. */
+export const GROUP_OTHER_WRITE_MODE = 0o022
+/** The sticky bit — a 1777-style tree where only the owner of a name may rename or unlink it. */
+export const STICKY_MODE = 0o1000
+
+/**
+ * cr.52r D3's ZFS half. The daemon cannot fd-pin a mountpoint ZFS mounts by
+ * itself (`zpool create -m`, `zpool import`, `zfs create -o mountpoint`, a
+ * `zfs set mountpoint`): the window between the gate and ZFS's own `mount` is
+ * ZFS's, and a swap (rename the directory away, plant a symlink) inside it
+ * would redirect the kernel mount at a tree the gate never re-checked. The
+ * residual cannot be eliminated — document it, and close the avenue that makes
+ * it practical: every EXISTING ancestor of the mountpoint must be root-owned
+ * and not group/other-writable (a non-root writer's swap would need write on
+ * the parent chain). A sticky directory (1777 — `/tmp`, `/var/tmp`) is the one
+ * exception: in it only the owner can rename away the root's directory, so a
+ * missing intermediate or the root's own dir cannot be swapped by someone else.
+ * Refuses naming the offending directory; null when the chain is safe (or
+ * nothing exists yet — the missing components are created by root at mount
+ * time).
+ *
+ * The residual this leaves (documented for the operator): a ROOT-authorized
+ * actor still can swap the tree after this check, and a swap in the instant
+ * between the check and ZFS's mount resolves to wherever the new path points.
+ * Both are outside ANAS's reach — the daemon does not own ZFS's mount window.
+ */
+export async function swapStageRefusal(
+  mountpoint: string,
+  deps: SwapStageRefusalDeps = { longestExistingAncestor: realLongestExistingAncestor, dirAttr: realDirAttr },
+): Promise<Refusal | null> {
+  const mp = normalizeMountpointPath(mountpoint)
+  const ancestors = descendantPrefixes(await deps.longestExistingAncestor(dirname(mp)))
+  for (const comp of ancestors) {
+    const attr = await deps.dirAttr(comp)
+    if (attr === null)
+      continue // vanished since the walk — the deeper check would have caught the swap
+    const writableByOthers = (attr.mode & GROUP_OTHER_WRITE_MODE) !== 0
+    const sticky = (attr.mode & STICKY_MODE) !== 0
+    if (attr.uid !== 0 || (writableByOthers && !sticky)) {
+      return {
+        status: 409,
+        code: 'CONFLICT',
+        reason: SWAP_STAGE_REFUSAL_REASON,
+        message: `Mountpoint '${mp}' is refused — its ancestor directory '${comp}' is${attr.uid !== 0 ? ' not root-owned' : ''}`
+          + `${writableByOthers ? ' group/other-writable' : ''}. ZFS mounts there by itself, and a directory a non-root writer could swap would let that mount be redirected.`
+          + ` Make '${comp}' root-owned and not group/other-writable, or choose another mountpoint`,
+      }
+    }
+  }
+  return null
+}
+
+/** lstat mode + owner of `path` for {@link swapStageRefusal}; null when absent. */
+async function realDirAttr(path: string): Promise<{ uid: number, mode: number } | null> {
+  try {
+    const st = await lstat(path)
+    return { uid: st.uid, mode: st.mode }
+  }
+  catch {
+    return null
+  }
+}
+
+/** The swap-stage refusal as a guard gate (cr.52r D3's ZFS half) — a gate, so it re-runs in the job. */
+export function swapStageGate<O>(mountpoint: string | undefined): Gate<O> {
+  return async () => (mountpoint === undefined ? null : swapStageRefusal(mountpoint))
+}
+
+// ============================================================================
+// Mounting through a directory the daemon itself opened (cr.52r D3)
+// ============================================================================
+
+/** The target every daemon-run `mount(8)` gets: the kernel resolves it to the opened directory. */
+export const FD_MOUNT_TARGET = '/proc/self/fd/3' as const
+/** The child's fd the daemon-opened directory is handed at (the first inherited fd). */
+export const FD_MOUNT_SLOT = 3
+
+/** A mount-target directory the daemon opened O_PATH — a pin the kernel resolves, not a path string. */
+export interface OpenedMountTarget {
+  /** The child's fd number (its `/proc/self/fd/<n>` path). */
+  fd: number
+  /** Close the descriptor, once the mount child has exited. */
+  close: () => Promise<void>
+}
+
+/**
+ * Open `mountpoint` as a mount target the DAEMON pinned (cr.52r D3): lstat
+ * every component (a symlink anywhere in the existing part refuses), then open
+ * the final directory `O_PATH | O_DIRECTORY | O_NOFOLLOW` so a parent swapped
+ * AFTER the open cannot move what mount(8) will land on (`/proc/self/fd/N`
+ * resolves in the child to exactly this directory). Throws when a component is
+ * a symlink or the final directory is missing — callers MKDIR the mountpoint
+ * first, and the re-mount verbs' job refuses before they get here.
+ */
+export async function openMountTarget(mountpoint: string): Promise<OpenedMountTarget> {
+  const mp = normalizeMountpointPath(mountpoint)
+  // The symlink walk mirrors the refusal's step (2), run again HERE — the
+  // instant of the mount — so a link planted between the gate and the argv
+  // cannot launder the target past the check that just passed.
+  const ancestor = await realLongestExistingAncestor(mp)
+  const existingParents = ancestor === mp ? dirname(ancestor) : ancestor
+  for (const comp of descendantPrefixes(existingParents)) {
+    const st = await lstat(comp).catch(() => null)
+    if (st?.isSymbolicLink())
+      throw new Error(`Mountpoint '${mp}' is refused — '${comp}' in its parent path is a symlink (a planted symlink must not redirect the mount)`)
+  }
+  let handle: Awaited<ReturnType<typeof open>>
+  try {
+    // O_PATH|O_DIRECTORY|O_NOFOLLOW: an O_PATH descriptor pins the directory
+    // for the kernel, O_DIRECTORY refuses non-dirs, O_NOFOLLOW refuses a final
+    // symlink (the lstat walk above already covered the parents). Some @types
+    // fail to list O_PATH in `constants`' union — it exists at runtime on Linux.
+    const O_PATH = (FS_CONSTANTS as Record<string, number>).O_PATH
+    handle = await open(mp, O_PATH | FS_CONSTANTS.O_DIRECTORY | FS_CONSTANTS.O_NOFOLLOW)
+  }
+  catch (err) {
+    const e = err as NodeJS.ErrnoException
+    if (e.code === 'ENOTDIR' || e.code === 'ENOENT')
+      throw new Error(`Mountpoint '${mp}' does not exist as a directory — the component above it is missing or the path is broken; nothing was mounted`)
+    if (e.code === 'ELOOP')
+      throw new Error(`Mountpoint '${mp}' is a symlink (or its chain loops) — a mount over a symlinked directory is refused`)
+    throw err
+  }
+  const fd = handle.fd
+  if (fd === undefined) {
+    await handle.close()
+    throw new Error(`Could not open mountpoint '${mp}' as a mount target`)
+  }
+  return {
+    fd,
+    close: () => handle.close(),
+  }
+}
+
+/**
+ * Run `mount <...argv> /proc/self/fd/3` through a directory the daemon opened
+ * (cr.52r D3): open the final directory O_PATH, hand its fd to the mount child
+ * (`exec`'s {@link ExecOptions.inheritedFds}), target the fd path, close the
+ * fd when the child has exited. `-c` (--no-canonicalize) is REQUIRED on every
+ * fd-pinned mount: without it util-linux canonicalises `/proc/self/fd/3` to a
+ * real path string and mounts onto THAT — the very redirect the pin exists to
+ * stop (the fd path resolves in the kernel, a path string does not).
+ */
+export async function mountThroughOpenedDir(
+  executor: CommandExecutor,
+  mountpoint: string,
+  argv: readonly string[],
+  opts?: ExecOptions,
+): Promise<ExecResult> {
+  const open = await openMountTarget(mountpoint)
+  try {
+    return await executor.exec(MOUNT, [...argv, FD_MOUNT_TARGET], { ...opts, inheritedFds: [open.fd] })
+  }
+  finally {
+    await open.close()
+  }
 }
 
 /** Does the fstab already define this mountpoint? */

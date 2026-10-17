@@ -873,8 +873,17 @@ describe('removeEmptyMountpointDir', () => {
 // symlink branches — the lexical shapes here inject a filesystem where nothing
 // is a symlink, so the host's own `/srv`/`/home` layout can never affect them.
 describe('mountTargetRefusal — system paths, the protected credential/login trees, and symlinks', () => {
-  /** A filesystem where nothing is launderable: no symlink resolves, no leaf follows. */
-  const NEUTRAL_DEPS: MountTargetRefusalDeps = { realpathDir: async () => null, leafIsSymlink: async () => false }
+  /**
+   * A filesystem where nothing can swerve the gate: every component exists
+   * (the longest existing ancestor is the path itself), nothing is a symlink
+   * and realpath confirms the path (cr.52r's deps: longestExistingAncestor,
+   * pathIsSymlink, realpath).
+   */
+  const NEUTRAL_DEPS: MountTargetRefusalDeps = {
+    longestExistingAncestor: async p => p,
+    pathIsSymlink: async () => false,
+    realpath: async p => p,
+  }
 
   it('refuses every list entry, exactly, with the ONE 409 code', async () => {
     // The full list: `/` and all 16 top-level system roots.
@@ -923,6 +932,15 @@ describe('mountTargetRefusal — system paths, the protected credential/login tr
       '/var/lib/pve-cluster/config',
       '/mnt/pve',
       '/mnt/pve/anastest',
+      // cr.52r P1: the four state trees added to the list.
+      '/var/lib/vz',
+      '/var/lib/vz/112',
+      '/var/lib/ceph',
+      '/var/lib/ceph/mon0',
+      '/var/lib/dpkg',
+      '/var/lib/dpkg/status',
+      '/var/log',
+      '/var/log/journal',
     ]) {
       const refusal = await mountTargetRefusal(mp, NEUTRAL_DEPS)
       assert.ok(refusal, `${mp} must be refused`)
@@ -967,33 +985,64 @@ describe('mountTargetRefusal — system paths, the protected credential/login tr
     assert.equal(normalizeMountpointPath('/'), '/')
   })
 
-  it('refuses a symlinked parent that would launder a legal-looking mountpoint into a system path', async () => {
-    // The flyleaf: `/mnt/anas-x` resolves to `/etc`, so the mountpoint's real
-    // target is `/etc/data` — the refusal names the laundering chain.
+  it('refuses a symlink ANYWHERE in the existing parent chain (cr.52r D2/D3) — even one that would resolve to a legal directory', async () => {
+    // The flyleaf `/mnt/anas-x -> /etc`: the typed path trips nothing, the
+    // parent is a symlink — refused outright with the component named. The
+    // cr.52 laundering check used to let a parent symlink to a LEGAL
+    // directory through; cr.52r refuses every planted symlink.
     const refusal = await mountTargetRefusal('/mnt/anas-x/data', {
-      realpathDir: async p => (p === '/mnt/anas-x' ? '/etc' : null),
-      leafIsSymlink: async () => false,
+      longestExistingAncestor: async p => (p === '/mnt/anas-x/data' || p === '/mnt/anas-x' ? '/mnt/anas-x' : '/'),
+      pathIsSymlink: async p => p === '/mnt/anas-x',
+      realpath: async () => null,
     })
     assert.ok(refusal)
-    assert.match(refusal!.message, /resolves via the symlink/)
-    assert.match(refusal!.message, /\/etc/)
+    assert.match(refusal!.message, /is a symlink/)
+    assert.match(refusal!.message, /\/mnt\/anas-x/)
+    assert.equal(refusal!.reason, 'system-mount-target')
   })
 
   it('refuses a symlinked final component outright, wherever it points', async () => {
     const refusal = await mountTargetRefusal('/srv/mnt/data', {
-      realpathDir: async () => null,
-      leafIsSymlink: async p => p === '/srv/mnt/data',
+      ...NEUTRAL_DEPS,
+      pathIsSymlink: async p => p === '/srv/mnt/data',
     })
     assert.ok(refusal)
     assert.match(refusal!.message, /ends in a symlink/)
   })
 
-  it('a symlinked parent that resolves to a LEGAL directory is not refused by the laundering check', async () => {
-    const refusal = await mountTargetRefusal('/mnt/anas-x/data', {
-      realpathDir: async p => (p === '/mnt/anas-x' ? '/srv/real' : null),
-      leafIsSymlink: async () => false,
+  it('refuses a symlink in the existing part even through a MISSING intermediate (cr.52r D2)', async () => {
+    // `l -> /etc`, mountpoint `l/newdir/data`: `/l/newdir` does not exist, so
+    // the pre-cr.52r realpath of the PARENT skipped the step and the mount
+    // landed under /etc. The walk up to the longest EXISTING ancestor (`/l`)
+    // refuses now.
+    const refusal = await mountTargetRefusal('/l/newdir/data', {
+      longestExistingAncestor: async (p) => {
+        if (p === '/l/newdir/data' || p === '/l/newdir')
+          return '/l'
+        if (p === '/l')
+          return '/l'
+        return '/'
+      },
+      pathIsSymlink: async p => p === '/l',
+      realpath: async () => null,
     })
-    assert.equal(refusal, null)
+    assert.ok(refusal)
+    assert.match(refusal!.message, /\/l/)
+    assert.match(refusal!.message, /is a symlink/)
+  })
+
+  it('realpath of the LONGEST existing ancestor re-checks the resolved mountpoint (cr.52r D2)', async () => {
+    // No symlink is present (so the walk passes), but the notch resolves `/x`
+    // to `/etc`: the RESOLVED mountpoint `/etc/data` refuses with the
+    // laundering sentence.
+    const refusal = await mountTargetRefusal('/x/data', {
+      longestExistingAncestor: async p => (p === '/x/data' || p === '/x' ? '/x' : '/'),
+      pathIsSymlink: async () => false,
+      realpath: async p => (p === '/x' ? '/etc' : p),
+    })
+    assert.ok(refusal)
+    assert.match(refusal!.message, /resolves via/)
+    assert.match(refusal!.message, /\/etc/)
   })
 
   it('lexicalMountTargetReason is the sentence clause both doors compose from', () => {

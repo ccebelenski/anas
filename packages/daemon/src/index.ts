@@ -82,13 +82,14 @@ async function main() {
     // default). No store would mean background too; saying it is the point.
     if (!MOCK) {
       runInLane({ lane: 'background' }, () => {
-        const decorated = server as unknown as { executor: CommandExecutor, jobQueue: JobQueue, diskIdentityCache: DiskIdentityCache, ahrIntentDir: string, iscsiPaths: IscsiPaths }
+        const decorated = server as unknown as { executor: CommandExecutor, jobQueue: JobQueue, diskIdentityCache: DiskIdentityCache, ahrIntentDir: string, fstabPath: string, iscsiPaths: IscsiPaths }
         // cr.35: the boot work gets the same per-command budgets as the routes.
         const bootExecutor = new CommandBudgetExecutor(decorated.executor)
         void ahrBootScan(bootExecutor, {
           intentDir: decorated.ahrIntentDir,
           jobQueue: decorated.jobQueue,
           diskCache: decorated.diskIdentityCache,
+          fstabPath: decorated.fstabPath,
         }).then((report) => {
           if (report.recovered.length || report.cacheRecovered.length || report.haltedIntents.length || report.reattached.length || report.observedReshapes.length)
             server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] cacheRecovered=[${report.cacheRecovered.join(',')}] reattached=[${report.reattached.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)

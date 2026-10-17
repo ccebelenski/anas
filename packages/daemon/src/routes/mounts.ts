@@ -11,7 +11,7 @@ import { mkdir, readdir } from 'node:fs/promises'
 import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, UpdateMountRequest } from '@anas/shared'
 import { CommandTimeoutError } from '../executor/deadline.js'
 import { classifyKind, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
-import { addMount, carriesAutomount, cifsAuthToken, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
+import { addMount, carriesAutomount, disableMount, enableMount, getMount, hasMount, mountOptionTokens, removeMount, replaceMount } from '../parsers/fstab.js'
 import { PVE_STORAGE_CFG, readPveMountPaths, readPveMountPathsStrict, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, sendRefusal } from '../safety/guard.js'
@@ -36,6 +36,7 @@ import {
   isRemoteKind,
   mountpointReservedByPve,
   mountTargetRefusal,
+  mountThroughOpenedDir,
   normalizeMountpointPath,
   probeInventoryHealth,
   pveStorageFor,
@@ -339,6 +340,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       gates.push(
         stateGate(o => !!o.entry || o.mounted, { status: 404, code: 'NOT_FOUND', message: `Mount '${mp}' is not configured and not mounted` }),
         stateGate(o => !o.entry?.disabled, { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${mp}' is disabled — enable it first` }),
+        // cr.52r P2: this verb MOUNTS the stored path again, so the stored
+        // path runs the mount-target refusal like every setting door — a path
+        // that has since resolved into a protected tree (a swapped parent, a
+        // new symlink) refuses here, at the route and again in the job.
+        async o => mountTargetRefusal(o.mountpoint),
       )
     }
     if (verb === 'enable') {
@@ -448,9 +454,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         unbound: () => `Could not read the mountpoint '${mp}' — refusing`,
       },
       gates: [
-        async s => mountpointReservedByPve(s.mountpoint)
-          ? { status: 400, code: 'VALIDATION_ERROR', message: `Mountpoint '${s.mountpoint}' is PVE territory and off-limits to ANAS` }
-          : null,
+        // cr.52r doc ruling: /mnt/pve and /etc/pve answer through the shared
+        // refusal below — the ONE 409 (reason system-mount-target, the
+        // PVE-territory sentence named in the refusal's own reason), not this
+        // door's old 400. The pveGate (PVE-owned mount verbs) is unchanged.
         // cr.52 (review H1): one shared system-path refusal at every door that
         // sets a mountpoint — the mount takes the 409 with the shared code and
         // sentence, and the job re-runs the gate under its lock.
@@ -670,7 +677,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
 
         if (req.mountNow) {
           updateProgress(`Mounting ${req.mountpoint}`)
-          await doMount(executor, req.persistent ? undefined : entry, req.mountpoint)
+          // cr.52r D3: mount DIRECTLY from the entry through a directory the
+          // daemon opened — persistently too, so the argv targets the fd- pinned
+          // `/proc/self/fd/3` (the entry IS the line just written, so the
+          // mounted options are the line's own).
+          await doMount(executor, entry, req.mountpoint)
         }
         return { created: req.mountpoint, warnings }
       }),
@@ -821,10 +832,13 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       const job = jobQueue.submit(
         'mount.mount',
         { ...identity, params: { mountpoint: mp } },
-        guarded(spec, pre, async (_o, { updateProgress }) => {
+        guarded(spec, pre, async (o, { updateProgress }) => {
           updateProgress(`Mounting ${mp}`)
-          // Mounted from its fstab line (`mount -- <mp>`).
-          await doMount(executor, undefined, mp)
+          // cr.52r D3: mounted DIRECTLY from the line the job re-read, through
+          // the fd-pinned directory (the kernel resolves `/proc/self/fd/3`).
+          if (!o.entry)
+            throw new Error(`Mount '${mp}' is not configured in /etc/fstab — nothing to mount`)
+          await doMount(executor, o.entry, mp)
           return { mounted: mp }
         }),
         { locks: pre.locks },
@@ -1124,22 +1138,24 @@ async function daemonReload(executor: CommandExecutor): Promise<void> {
 }
 
 /**
- * Mount a filesystem. When `entry` is undefined the mount resolves from the
- * fstab line (`mount <mountpoint>`); otherwise it is mounted directly from the
- * entry's fields (the non-persistent path). Throws on failure.
+ * Mount a filesystem DIRECTLY from its entry (cr.52r D3): the spec and options
+ * the entry configures, through a directory the daemon itself opened
+ * (`/proc/self/fd/3`, {@link mountThroughOpenedDir}) — the kernel resolves the
+ * fd path to exactly that directory, so a parent swapped after the open cannot
+ * redirect the mount to a place the gate never looked.
  *
- * `-c` (cr.52, review H1) canonicalises the target paths so `mount(8)` resolves
- * the mountpoint the same way the target refusal did — a symlink that lands
- * after the job's own gate re-runs cannot redirect the kernel mount to a place
- * the gate never looked.
+ * `-c` is `--no-canonicalize` (cr.52r D3's comment fix): it is REQUIRED, not
+ * optional — without it util-linux canonicalises `/proc/self/fd/3` to a real
+ * path string and mounts onto THAT, which is precisely the redirect the pin
+ * exists to stop. (cr.52's rationale claimed the opposite was true; it was a
+ * confirmation error.) The `--` ends option parsing so the positional spec can
+ * never be read as a `mount` flag (defence in depth; the schema already rejects
+ * control chars). Throws on failure.
  */
-async function doMount(executor: CommandExecutor, entry: MountEntry | undefined, mountpoint: string): Promise<void> {
-  // `--` ends option parsing so the positional spec/mountpoint can never be read
-  // as a `mount` flag (defence in depth; the schema already rejects control chars).
-  const args = entry
-    ? ['-c', '-t', entry.fstype, '-o', serializeInlineOptions(entry), '--', entry.spec, mountpoint]
-    : ['-c', '--', mountpoint]
-  const r = await executor.exec(MOUNT, args)
+async function doMount(executor: CommandExecutor, entry: MountEntry, mountpoint: string): Promise<void> {
+  const args = ['-c', '-t', entry.fstype, '-o', mountOptionTokens(entry), '--', entry.spec]
+  const mp = normalizeMountpointPath(mountpoint)
+  const r = await mountThroughOpenedDir(executor, mp, args)
   if (r.exitCode !== 0)
     throw new Error(r.stderr.trim() || `mount exited ${r.exitCode}`)
 }
@@ -1167,7 +1183,7 @@ async function remountEntry(executor: CommandExecutor, entry: MountEntry): Promi
     }
     // Gone after all — fall through and mount it as written.
   }
-  await doMount(executor, undefined, mp)
+  await doMount(executor, entry, mp)
 }
 
 /**
@@ -1188,92 +1204,6 @@ async function remountRefusedError(
   const base = `Could not remount '${mountpoint}' — still mounted with previous options${detail ? ` (${detail})` : ''}`
   const holders = formatHolders(await diagnoseBusyPath(executor, mountpoint))
   return holders ? `${base}, ${holders}` : base
-}
-
-/** Build a `-o` option string for a direct (non-fstab) mount of an entry. */
-function serializeInlineOptions(entry: MountEntry): string {
-  const t: string[] = []
-  const c = entry.options.common
-  t.push(c.readOnly ? 'ro' : 'rw')
-  if (entry.fstype === 'nfs4' || entry.fstype === 'nfs') {
-    const n = entry.options.nfs
-    if (n?.vers)
-      t.push(`vers=${n.vers}`)
-    if (n?.hard === false)
-      t.push('soft')
-    if (n?.proto)
-      t.push(`proto=${n.proto}`)
-    if (n?.sec)
-      t.push(`sec=${n.sec}`)
-    if (n?.timeo !== undefined)
-      t.push(`timeo=${n.timeo}`)
-    if (n?.retrans !== undefined)
-      t.push(`retrans=${n.retrans}`)
-    if (n?.rsize !== undefined)
-      t.push(`rsize=${n.rsize}`)
-    if (n?.wsize !== undefined)
-      t.push(`wsize=${n.wsize}`)
-    if (n?.actimeo !== undefined)
-      t.push(`actimeo=${n.actimeo}`)
-    if (n?.nconnect !== undefined)
-      t.push(`nconnect=${n.nconnect}`)
-    if (n?.lookupcache)
-      t.push(`lookupcache=${n.lookupcache}`)
-    if (n?.noac === true)
-      t.push('noac')
-    if (n?.bg === true)
-      t.push('bg')
-  }
-  if (entry.fstype === 'cifs') {
-    const cf = entry.options.cifs
-    if (cf?.vers)
-      t.push(`vers=${cf.vers}`)
-    // The SAME auth token the fstab line and the preflight probe carry
-    // (parsers/fstab.js): a credential-less CIFS mounts `guest`, never a
-    // prompt.
-    t.push(cifsAuthToken(entry.credentialsFile))
-    if (cf?.domain)
-      t.push(`domain=${cf.domain}`)
-    if (cf?.uid !== undefined)
-      t.push(`uid=${cf.uid}`)
-    if (cf?.gid !== undefined)
-      t.push(`gid=${cf.gid}`)
-    if (cf?.fileMode)
-      t.push(`file_mode=${cf.fileMode}`)
-    if (cf?.dirMode)
-      t.push(`dir_mode=${cf.dirMode}`)
-    if (cf?.cache)
-      t.push(`cache=${cf.cache}`)
-    if (cf?.sec)
-      t.push(`sec=${cf.sec}`)
-    if (cf?.rsize !== undefined)
-      t.push(`rsize=${cf.rsize}`)
-    if (cf?.wsize !== undefined)
-      t.push(`wsize=${cf.wsize}`)
-    if (cf?.actimeo !== undefined)
-      t.push(`actimeo=${cf.actimeo}`)
-    if (cf?.iocharset)
-      t.push(`iocharset=${cf.iocharset}`)
-    if (cf?.mfsymlinks === true)
-      t.push('mfsymlinks')
-    if (cf?.forceuid === true)
-      t.push('forceuid')
-    if (cf?.forcegid === true)
-      t.push('forcegid')
-    if (cf?.noserverino === true)
-      t.push('noserverino')
-    if (cf?.nobrl === true)
-      t.push('nobrl')
-  }
-  if (c.nosuid)
-    t.push('nosuid')
-  if (c.nodev)
-    t.push('nodev')
-  if (c.noexec)
-    t.push('noexec')
-  if (entry.options.passthrough)
-    t.push(...entry.options.passthrough.split(','))
-  return t.join(',')
 }
 
 /**

@@ -148,6 +148,15 @@ export interface ExecBaseOptions {
    */
   env?: Record<string, string>
   /**
+   * File descriptors the CHILD inherits, in order, at fd 3, 4, … (the fd a
+   * caller opened itself — cr.52r D3). Handed to `spawn`'s `stdio` array as
+   * raw fds, so the child's `/proc/self/fd/3` IS the caller's descriptor; the
+   * caller owns the fd's lifetime and closes it once the child has exited.
+   * The mount paths use this to pin a mountpoint: the kernel resolves
+   * `/proc/self/fd/3` in the child to exactly the directory the caller opened.
+   */
+  inheritedFds?: number[]
+  /**
    * Cap on what `exec` retains from the child, in bytes — the same meaning
    * execFile's option has (exceeding it kills the child rather than growing
    * without bound). Default 10 MiB.

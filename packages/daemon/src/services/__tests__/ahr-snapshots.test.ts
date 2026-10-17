@@ -1,4 +1,5 @@
 import type { AhrPool } from '@anas/shared'
+import type { MockExecCall } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -55,7 +56,7 @@ function mkPool(over: Partial<AhrPool> = {}): AhrPool {
 }
 
 /** Indices of a matching call in the recorded argv (for ordering assertions). */
-function callIndex(executor: MockExecutor, pred: (c: { command: string, args: string[] }) => boolean): number {
+function callIndex(executor: MockExecutor, pred: (c: MockExecCall) => boolean): number {
   return executor.calls.findIndex(pred)
 }
 
@@ -164,8 +165,13 @@ describe('createAhrSnapshot', () => {
     assert.deepEqual(res, { pool: 'tank', snapshot: 'nightly' })
 
     const top = join(runtimeDir, 'tank.toplevel')
-    // top-level mount (subvolid=5), then the -r snapshot, then the unmount.
-    assert.deepEqual(executor.calls[0], { command: MOUNT, args: ['-t', 'btrfs', '-o', 'subvolid=5', '/dev/tank/tank-vol', top] })
+    // top-level mount (subvolid=5) through the daemon-opened dir (cr.52r D3),
+    // then the -r snapshot, then the unmount. The mount child inherits the
+    // fd the daemon opened on `top` and targets /proc/self/fd/3.
+    assert.equal(executor.calls[0].command, MOUNT)
+    assert.deepEqual(executor.calls[0].args, ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/tank/tank-vol', '/proc/self/fd/3'])
+    assert.equal(executor.calls[0].inheritedFds?.length, 1, 'the mount child inherits the daemon-opened fd')
+    assert.equal(executor.calls[0].fdPaths?.[0], top, 'the inherited fd resolves to the opened top-level directory')
     assert.deepEqual(executor.calls[1], { command: BTRFS, args: ['subvolume', 'snapshot', '-r', join(top, '@data'), join(top, '@snapshots', 'nightly')] })
     assert.deepEqual(executor.calls[2], { command: UMOUNT, args: ['--', top] })
   })
@@ -222,6 +228,17 @@ describe('rollbackAhrSnapshot', () => {
 
   const NOW = new Date('2026-07-24T09:00:00.000Z')
 
+  /**
+   * A pool whose mountpoint is a REAL directory under the tempdir (cr.52r D3's
+   * fd-pin opens it — the mocked pool fixtures' `/mnt/anas-ahr/tank` does not
+   * exist on the test host).
+   */
+  async function mkRealPool(): Promise<AhrPool> {
+    const pool = mkPool({ mountpoint: join(runtimeDir, 'tank') })
+    await mkdir(pool.mountpoint, { recursive: true })
+    return pool
+  }
+
   it('preserves @data BEFORE the swap and remounts the pool in a finally', async () => {
     const executor = new MockExecutor()
     executor.addFixture({ command: MOUNT, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -229,12 +246,13 @@ describe('rollbackAhrSnapshot', () => {
     executor.addFixture({ command: MV, result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: BTRFS, result: { stdout: '', stderr: '', exitCode: 0 } })
 
-    const res = await rollbackAhrSnapshot(executor, mkPool(), 'good', () => {}, { runtimeDir, now: NOW })
+    const pool = await mkRealPool()
+    const res = await rollbackAhrSnapshot(executor, pool, 'good', () => {}, { runtimeDir, now: NOW })
     assert.deepEqual(res, { pool: 'tank', rolledBackTo: 'good', preserved: 'pre-rollback-2026-07-24T090000Z' })
 
     const top = join(runtimeDir, 'tank.toplevel')
     // 1) the pool mountpoint is unmounted first.
-    const poolUmount = callIndex(executor, c => c.command === UMOUNT && c.args[1] === '/mnt/anas-ahr/tank')
+    const poolUmount = callIndex(executor, c => c.command === UMOUNT && c.args[1] === pool.mountpoint)
     // 2) the preserve RENAME (mv @data → @snapshots/pre-rollback-<ts>).
     const mvIdx = callIndex(executor, c => c.command === MV
       && c.args[1] === join(top, '@data')
@@ -243,13 +261,20 @@ describe('rollbackAhrSnapshot', () => {
     const swapIdx = callIndex(executor, c => c.command === BTRFS
       && c.args[0] === 'subvolume' && c.args[1] === 'snapshot'
       && c.args[2] === join(top, '@snapshots', 'good') && c.args[3] === join(top, '@data'))
-    // 4) the pool is remounted at the end.
-    const poolRemount = callIndex(executor, c => c.command === MOUNT && c.args[0] === '--' && c.args[1] === '/mnt/anas-ahr/tank')
+    // 4) the pool is remounted DIRECTLY through the daemon-opened dir (cr.52r
+    // D3) — the POOL's remount (its fd resolves to the pool mountpoint), not
+    // the on-demand TOP-LEVEL mount (whose fd resolves to `top`).
+    const poolRemount = callIndex(executor, c => c.command === MOUNT
+      && c.args.at(-1) === '/proc/self/fd/3'
+      && c.fdPaths?.[0] === pool.mountpoint)
 
     assert.ok(poolUmount >= 0 && mvIdx >= 0 && swapIdx >= 0 && poolRemount >= 0)
     assert.ok(poolUmount < mvIdx, 'pool unmounted before the swap')
     assert.ok(mvIdx < swapIdx, 'preserve-rename happens BEFORE the swap (nothing destroyed)')
     assert.ok(swapIdx < poolRemount, 'remount is last')
+    // The remount's fd resolves to the pool's own mountpoint directory.
+    const remountCall = executor.calls[poolRemount]
+    assert.equal(remountCall.fdPaths?.[0], pool.mountpoint)
   })
 
   it('remounts the pool even when the swap fails (finally)', async () => {
@@ -260,11 +285,12 @@ describe('rollbackAhrSnapshot', () => {
     // The writable snapshot swap fails after the preserve-rename already ran.
     executor.addFixture({ command: BTRFS, result: { stdout: '', stderr: 'swap failed', exitCode: 1 } })
 
-    await assert.rejects(rollbackAhrSnapshot(executor, mkPool(), 'good', () => {}, { runtimeDir, now: NOW }))
+    const pool = await mkRealPool()
+    await assert.rejects(rollbackAhrSnapshot(executor, pool, 'good', () => {}, { runtimeDir, now: NOW }))
     // The preserve-rename ran (nothing destroyed) AND the pool got remounted.
     assert.ok(executor.calls.some(c => c.command === MV), 'preserve-rename ran before the failure')
     assert.ok(
-      executor.calls.some(c => c.command === MOUNT && c.args[0] === '--' && c.args[1] === '/mnt/anas-ahr/tank'),
+      executor.calls.some(c => c.command === MOUNT && c.args.includes('btrfs')),
       'pool remounted in the finally despite the failure',
     )
   })

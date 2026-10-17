@@ -1,4 +1,4 @@
-import type { AhrType, MountEntry } from '@anas/shared'
+import type { AhrType } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { MdadmArrayPin } from '../parsers/mdadm-conf.js'
 import type { AhrBandSlice } from './ahr-geometry.js'
@@ -12,6 +12,7 @@ import { ROLLED_BACK_MARKER } from './ahr-create-status.js'
 import { destroyAhrPool } from './ahr-destroy.js'
 import { requireComposableNow } from './ahr-disk-recheck.js'
 import { LVM_MIXED_BLOCK_ARGS, run, UPDATE_INITRAMFS_BUDGET_MS } from './ahr-exec.js'
+import { AHR_ISCSI_DEVICE_TIMEOUT_OPTION, AHR_ISCSI_ORDERING_OPTION, ahrFstabEntry, mountAhrPool } from './ahr-fstab.js'
 import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
 import { ahrNameOccupancy } from './ahr-identity.js'
 import { clearIntent } from './ahr-intent.js'
@@ -21,9 +22,11 @@ import { ahrLvPath, ahrMountBase } from './ahr-paths.js'
 import { SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-snapshots.js'
 import { isAhrMountReadOnly } from './ahr-topology.js'
 import { editConfig } from './config-writer.js'
+import { mountThroughOpenedDir } from './mounts.js'
 import { pveNotify } from './pve-notify.js'
 import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
 
+export { AHR_ISCSI_DEVICE_TIMEOUT_OPTION, AHR_ISCSI_ORDERING_OPTION } from './ahr-fstab.js'
 export { ahrLvPath, ahrMountBase, DEFAULT_AHR_MOUNT_BASE } from './ahr-paths.js'
 
 /**
@@ -61,7 +64,6 @@ const MKFS_BTRFS = '/usr/sbin/mkfs.btrfs'
 const BTRFS = '/usr/bin/btrfs'
 const UPDATE_INITRAMFS = '/usr/sbin/update-initramfs'
 const SYSTEMCTL = '/usr/bin/systemctl'
-const MOUNT = '/usr/bin/mount'
 const UMOUNT = '/usr/bin/umount'
 
 const WHITESPACE_RE = /\s+/
@@ -131,105 +133,9 @@ export async function clearGhostMdSignatures(
   await run(executor, UDEVADM, udevSettleArgs(), { timeoutMs: UDEVADM_SETTLE_BUDGET_MS })
 }
 
-/**
- * The ONE fstab option that keeps an AHR pool ahead of the LIO restore service
- * (story `iscsi.8`, promoted from the standing `iscsi.5` candidate).
- *
- * `rtslib-fb-targetctl.service` gets an ordering drop-in from `install.sh` that
- * names every ZFS anchor there is — and there is no equivalent for AHR. An AHR
- * pool comes up as md assembly (udev) → LVM activation (udev) → an ordinary
- * fstab mount, with no ANAS unit anywhere in that path, and the generated mount
- * unit is named after the pool's mountpoint, so no static `After=` in a drop-in
- * can name it. Worse, ANAS writes AHR entries with `nofail` (a pool must never
- * hold the host's boot hostage), and systemd deliberately does NOT order a
- * `nofail` mount before `local-fs.target` — so even the weak anchor the drop-in
- * has does not cover it.
- *
- * `x-systemd.before=` on the fstab line is the mechanism that does: the fstab
- * generator turns it into a `Before=` on THAT mount unit, which is the only
- * place the pool's identity exists. It was a candidate until live-proof F2
- * showed what losing the race actually costs — not a missing LUN, which is
- * visible, but a LUN serving zeros, which is not.
- *
- * The flip side of that ordering edge is what live-proof O3 measured: if the
- * pool's LV device NEVER appears (its disks were pulled), the `nofail` mount
- * does not fail the boot, but its `.device` job runs the full
- * `DefaultTimeoutStartSec` (~90 s) before giving up — and because
- * `rtslib-fb-targetctl.service` (and `multi-user.target`) are ordered behind
- * the mount, every iSCSI LUN on the node comes back ~90 s late for a reason
- * nothing announces. {@link AHR_ISCSI_DEVICE_TIMEOUT_OPTION} bounds that wait.
- */
-export const AHR_ISCSI_ORDERING_OPTION = 'x-systemd.before=rtslib-fb-targetctl.service'
-
-/**
- * The bound on how long the AHR mount waits for its BACKING DEVICE at boot
- * (live-proof O3). The 90 s stall O3 measured is not the mount's own timeout —
- * it is the `.device` job the mount waits on, so `x-systemd.device-timeout=` is
- * the knob that bounds it (`x-systemd.mount-timeout` would not: the mount never
- * gets far enough to time out, it is blocked waiting for a device that will
- * never come). The fstab generator turns this option into
- * `JobTimeoutSec=`/`TimeoutStartSec=` on the generated `.device` unit, so a
- * permanently-absent pool gives up here instead of at the 90 s default and
- * releases `rtslib-fb-targetctl.service` (and `multi-user.target`) that much
- * sooner.
- *
- * The value is a floor over realistic PRESENT-device readiness, not an
- * aggressively short one: AHR pools are typically spinning disks, and staggered
- * spin-up + md assembly + LVM activation can take tens of seconds on a cold
- * boot even when every disk is there. Abandoning a slow-but-present pool would
- * be the WORSE bug — LIO would restore before the mount is up and place the
- * 0-byte placeholder {@link AHR_ISCSI_ORDERING_OPTION} exists to prevent. 45 s
- * halves the absent-device stall while staying comfortably above any legitimate
- * present-device readiness, so the success path is unchanged; only a device
- * that is genuinely never coming gives up sooner.
- */
-export const AHR_ISCSI_DEVICE_TIMEOUT_OPTION = 'x-systemd.device-timeout=45s'
-
-/**
- * The canonical fstab entry for a pool: LV device, btrfs, nofail. When
- * `subvolLayout` is true (every pool created since §12) the entry carries
- * `subvol=@data` so the mountpoint mounts the data subvolume, not the
- * top-level — snapshots live under `@snapshots`, outside the mounted tree. A
- * pre-§12 flat pool has no `@data` subvolume, so its entry omits the option;
- * `changeAhrMountpoint` MUST pass the pool's real layout so a mountpoint move
- * never rewrites a flat pool's line to reference a subvolume it lacks.
- *
- * Every pool created from now on also carries {@link AHR_ISCSI_ORDERING_OPTION}
- * and {@link AHR_ISCSI_DEVICE_TIMEOUT_OPTION}, whether or not it will ever hold
- * a LUN. Together they cost a boot-time ordering edge on a service that is
- * usually not installed (systemd ignores a `Before=` on a unit that does not
- * exist) plus a bound on how long an absent device holds the boot (O3); they
- * are the difference between a pool that is mounted when LIO restores and one
- * that silently is not, without letting a pool that will never assemble stall
- * the boot for the full 90 s default.
- */
-function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: boolean): MountEntry {
-  return {
-    spec: ahrLvPath(name),
-    mountpoint,
-    fstype: 'btrfs',
-    options: {
-      common: {
-        readOnly: false,
-        // nofail mirrors the mounts precedent: a pool that cannot assemble
-        // must never hold the host's boot hostage (guest philosophy).
-        nofail: true,
-        noauto: false,
-        automount: false,
-        noatime: false,
-        nosuid: false,
-        nodev: false,
-        noexec: false,
-        netdev: false,
-      },
-      passthrough: subvolLayout
-        ? `subvol=${SUBVOL_DATA},${AHR_ISCSI_ORDERING_OPTION},${AHR_ISCSI_DEVICE_TIMEOUT_OPTION}`
-        : `${AHR_ISCSI_ORDERING_OPTION},${AHR_ISCSI_DEVICE_TIMEOUT_OPTION}`,
-    },
-    dump: 0,
-    pass: 0,
-  }
-}
+// The AHR pool's fstab entry, its two option constants and the pool-mount
+// helper live in services/ahr-fstab.ts (shared by ahr-create, ahr-snapshots
+// and ahr-boot-scan — the entry is the mount's identity everywhere).
 
 /**
  * Add {@link AHR_ISCSI_ORDERING_OPTION} and
@@ -500,7 +406,12 @@ async function executeCreate(
   const { mountpoint } = ledger
   await mkdir(mountpoint, { recursive: true })
   updateProgress('Creating btrfs subvolume layout (@data, @snapshots)')
-  await run(executor, MOUNT, ['-t', 'btrfs', '-o', 'subvolid=5', lvPath, mountpoint])
+  // cr.52r D3: mounted through the DIRECTORY the daemon opened (the top-level
+  // btrfs pool's subvolid=5 mount); the kernel resolves `/proc/self/fd/3`, so a
+  // parent swapped after the open cannot redirect the mount.
+  const topLevel = await mountThroughOpenedDir(executor, mountpoint, ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', lvPath])
+  if (topLevel.exitCode !== 0)
+    throw new Error(topLevel.stderr.trim() || `mount exited ${topLevel.exitCode}`)
   try {
     await run(executor, BTRFS, ['subvolume', 'create', join(mountpoint, SUBVOL_DATA)])
     await run(executor, BTRFS, ['subvolume', 'create', join(mountpoint, SUBVOL_SNAPSHOTS)])
@@ -517,7 +428,10 @@ async function executeCreate(
     return addMount(current, ahrFstabEntry(name, mountpoint, true))
   })
   await run(executor, SYSTEMCTL, ['daemon-reload'])
-  await run(executor, MOUNT, ['--', mountpoint])
+  // cr.52r D3: the pool mounts DIRECTLY from the entry just written, through
+  // the daemon-opened directory (the fd pins the mount; `-c` keeps the kernel
+  // target as `/proc/self/fd/3`).
+  await mountAhrPool(executor, { name, mountpoint, subvolLayout: true })
 
   // Initial resync is NOT awaited — the pool is usable now; the read layer
   // shows the build progress as `resyncing`.
@@ -667,14 +581,16 @@ export async function createAhrPool(
  */
 export async function remountAhrPool(
   executor: CommandExecutor,
-  pool: { name: string, mountpoint: string },
+  pool: { name: string, mountpoint: string, subvolLayout: boolean },
   updateProgress: (message: string) => void,
 ): Promise<{ mountpoint: string, readOnly: boolean }> {
   updateProgress(`Unmounting ${pool.mountpoint}`)
   await run(executor, UMOUNT, ['--', pool.mountpoint], { busyPath: pool.mountpoint })
 
   updateProgress(`Mounting ${pool.mountpoint}`)
-  await run(executor, MOUNT, ['--', pool.mountpoint])
+  // cr.52r D3: through the daemon-opened directory (directly from the pool's
+  // own fstab entry — the remount re-runs the mount the node has).
+  await mountAhrPool(executor, pool)
 
   const readOnly = await isAhrMountReadOnly(executor, pool.mountpoint)
   if (readOnly) {
@@ -723,7 +639,8 @@ export async function changeAhrMountpoint(
 
   updateProgress(`Mounting at ${newMountpoint}`)
   await mkdir(newMountpoint, { recursive: true })
-  await run(executor, MOUNT, ['--', newMountpoint])
+  // cr.52r D3: the move's mount, through the daemon-opened directory.
+  await mountAhrPool(executor, { name, mountpoint: newMountpoint, subvolLayout: pool.subvolLayout })
   // The old mountpoint directory stays (plain umount semantics — the mounts
   // feature's recorded decision).
 

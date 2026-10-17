@@ -99,11 +99,15 @@ describe('AHR mutation routes — validation & 404s (stock dev mock)', () => {
     assert.equal(res.statusCode, 401)
   })
 
-  it('POST /v1/ahr — mountpoint override: /mnt/pve namespace and relative paths are rejected', async () => {
+  it('POST /v1/ahr — mountpoint override: /mnt/pve namespace and / are refused and relative paths rejected', async () => {
+    // cr.52r doc ruling: /mnt/pve, /mnt/pve/x and / answer the ONE 409
+    // (reason system-mount-target, PVE-territory sentence) at the create door.
     for (const mountpoint of ['/mnt/pve', '/mnt/pve/x', '/']) {
       const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'newpool', tier: 'ahr1', disks: ['ata-x'], mountpoint }) })
-      assert.equal(res.statusCode, 400, mountpoint)
-      assert.equal(res.json().error.code, 'VALIDATION_ERROR', mountpoint)
+      assert.equal(res.statusCode, 409, mountpoint)
+      const body = res.json() as { error: { code: string, reason: string } }
+      assert.equal(body.error.code, 'CONFLICT', mountpoint)
+      assert.equal(body.error.reason, 'system-mount-target', mountpoint)
     }
     const rel = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'newpool', tier: 'ahr1', disks: ['ata-x'], mountpoint: 'not/absolute' }) })
     assert.equal(rel.statusCode, 400)
@@ -112,8 +116,10 @@ describe('AHR mutation routes — validation & 404s (stock dev mock)', () => {
   it('PUT /v1/ahr/:name/mountpoint — 404 unknown pool; reserved and same-path rejected; confirm shape on a valid move', async () => {
     const gone = await server.inject({ method: 'PUT', url: '/v1/ahr/nosuch/mountpoint', headers: JSON_HEADERS, payload: JSON.stringify({ mountpoint: '/srv/x' }) })
     assert.equal(gone.statusCode, 404)
+    // cr.52r doc ruling: /mnt/pve/* answers the ONE 409, not the old 400.
     const reserved = await server.inject({ method: 'PUT', url: '/v1/ahr/ahr0/mountpoint', headers: JSON_HEADERS, payload: JSON.stringify({ mountpoint: '/mnt/pve/x' }) })
-    assert.equal(reserved.statusCode, 400)
+    assert.equal(reserved.statusCode, 409)
+    assert.equal((reserved.json() as { error: { reason: string } }).error.reason, 'system-mount-target')
     const same = await server.inject({ method: 'PUT', url: '/v1/ahr/ahr0/mountpoint', headers: JSON_HEADERS, payload: JSON.stringify({ mountpoint: '/mnt/anas-ahr/ahr0' }) })
     assert.equal(same.statusCode, 400)
     assert.ok(same.json().error.message.includes('already'))
@@ -121,6 +127,24 @@ describe('AHR mutation routes — validation & 404s (stock dev mock)', () => {
     assert.equal(move.statusCode, 409)
     assert.ok(move.headers['x-anas-confirm-code'])
     assert.ok(move.json().error.warnings.some((w: string) => w.includes('/mnt/anas-ahr/ahr0')))
+  })
+
+  it('cr.52r D3 — a confirmed move mounts DIRECTLY through the daemon-opened dir: argv carries /proc/self/fd/3, fdPaths records the new directory', async () => {
+    const newMp = join(dir, 'mnt', 'newhome')
+    const payload = JSON.stringify({ mountpoint: newMp })
+    const first = await server.inject({ method: 'PUT', url: '/v1/ahr/ahr0/mountpoint', headers: JSON_HEADERS, payload })
+    assert.equal(first.statusCode, 409, first.body)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED', first.body)
+    const code = first.headers['x-anas-confirm-code'] as string
+    const res = await server.inject({ method: 'PUT', url: '/v1/ahr/ahr0/mountpoint', headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount' && c.args.at(-1) === '/proc/self/fd/3')
+    assert.ok(mountCall, 'the move mounted through the daemon-opened directory')
+    assert.equal(mountCall!.args[0], '-c')
+    assert.equal(mountCall!.fdPaths?.[0], newMp, 'the inherited fd resolves to the new mountpoint directory')
   })
 
   it('POST /v1/ahr — 409 CONFLICT when the pool name already exists', async () => {

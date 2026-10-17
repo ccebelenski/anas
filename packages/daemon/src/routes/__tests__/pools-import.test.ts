@@ -39,7 +39,13 @@ function spyExecutor(server: ReturnType<typeof createServer>): Array<{ command: 
 
 function importCall(calls: Array<{ command: string, args: string[] }>): string[] | undefined {
   // The scan uses ['import']; the actual import has a target after 'import'.
+  // cr.52r D4 imports `-N` FIRST (no mount), then on success exports and
+  // re-imports — the FIRST import call with a target is the pinned `-N` one.
   return calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'import' && c.args.length > 1)?.args
+}
+
+function zpoolCalls(calls: Array<{ command: string, args: string[] }>): string[][] {
+  return calls.filter(c => c.command === '/usr/sbin/zpool').map(c => c.args)
 }
 
 describe('import pool endpoint: /v1/pools/import', () => {
@@ -84,7 +90,15 @@ describe('import pool endpoint: /v1/pools/import', () => {
     const job = await waitForJob(server, body.job.id)
     assert.equal(job.status, 'completed')
 
-    assert.deepEqual(importCall(calls), ['import', '--', 'oldtank'])
+    // cr.52r D4 — the pinned argv sequence: `-N` import (no mount), then on
+    // success export + a mounted `import` (so ZFS mounts the pool's datasets
+    // exactly as the single import always did).
+    assert.deepEqual(importCall(calls), ['import', '-N', '--', 'oldtank'])
+    assert.deepEqual(zpoolCalls(calls).filter(c => c[0] === 'export'), [['export', 'oldtank']])
+    assert.deepEqual(zpoolCalls(calls).filter(c => c[0] === 'import' && c.includes('oldtank')), [
+      ['import', '-N', '--', 'oldtank'],
+      ['import', '--', 'oldtank'],
+    ])
   })
 
   it('POST with force without a confirm code is a 409 naming the cross-host risk, and no zpool command runs (cr.12)', async () => {
@@ -133,7 +147,12 @@ describe('import pool endpoint: /v1/pools/import', () => {
     const body = res.json() as JobAccepted
     const job = await waitForJob(server, body.job.id)
     assert.equal(job.status, 'completed')
-    assert.deepEqual(importCall(calls), ['import', '-f', '--', 'oldtank'])
+    // The `-f` rides BOTH imports (the -N gate and the mounted re-import).
+    assert.deepEqual(importCall(calls), ['import', '-N', '-f', '--', 'oldtank'])
+    assert.deepEqual(zpoolCalls(calls).filter(c => c[0] === 'import' && c.includes('oldtank')), [
+      ['import', '-N', '-f', '--', 'oldtank'],
+      ['import', '-f', '--', 'oldtank'],
+    ])
   })
 
   it('rejects a hostile pool name with 400 and no zpool command (cr.12)', async () => {
@@ -186,7 +205,57 @@ describe('import pool endpoint: /v1/pools/import', () => {
     const body = res.json() as JobAccepted
     await waitForJob(server, body.job.id)
 
-    assert.deepEqual(importCall(calls), ['import', '--', '9876543210987654321'])
+    assert.deepEqual(importCall(calls), ['import', '-N', '--', '9876543210987654321'])
+  })
+
+  it('refuses an import with altroot on a protected path — the ONE 409, no zpool command (cr.52r D4)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'oldtank', altroot: '/etc' }),
+    })
+
+    assert.equal(res.statusCode, 409, res.body)
+    const err = res.json().error
+    assert.equal(err.code, 'CONFLICT')
+    assert.equal(err.reason, 'system-mount-target')
+    assert.match(err.message, /system path|protected|PVE/)
+    assert.equal(importCall(calls), undefined, 'no zpool command ever ran')
+  })
+
+  it('a stored mountpoint on a protected path fails the job AFTER `-N` and BEFORE any mount, exporting the pool again (cr.52r D4)', async () => {
+    server = createServer({ mock: true, logger: false })
+    // The imported pool's own stored mountpoint — knowable only once imported —
+    // answers on a protected path. Override the exact `zfs get` read the job
+    // gates against.
+    ;(server as unknown as { executor: { addFixture: (f: object) => void } }).executor.addFixture({
+      command: '/usr/sbin/zfs',
+      args: ['get', '-H', '-r', '-o', 'name,value', 'mountpoint', '--', 'oldtank'],
+      result: { stdout: 'oldtank\t/mnt/pve/oldtank\n', stderr: '', exitCode: 0 },
+    })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'oldtank' }),
+    })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    assert.match(job.error!.message, /protected or system path/)
+    assert.match(job.error!.message, /exported again/)
+    // The pinned argv: the `-N` import ran, the refusal exported the pool, and
+    // the MOUNTED re-import (without -N) NEVER ran — nothing was mounted.
+    assert.deepEqual(importCall(calls), ['import', '-N', '--', 'oldtank'])
+    assert.deepEqual(zpoolCalls(calls).filter(c => c[0] === 'export'), [['export', 'oldtank']])
+    assert.ok(!zpoolCalls(calls).some(c => c[0] === 'import' && !c.includes('-N')), 'the mounted import never ran')
   })
 
   it('returns 400 when neither name nor guid is given', async () => {

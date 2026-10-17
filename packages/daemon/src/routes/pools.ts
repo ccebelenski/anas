@@ -25,7 +25,7 @@ import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal, LIO_UNREADABLE_KEY, lioUnreadableAdvisory } from '../services/iscsi-held.js'
-import { mountTargetGate, normalizeMountpointPath } from '../services/mounts.js'
+import { mountTargetGate, mountTargetRefusal, normalizeMountpointPath, swapStageGate, swapStageRefusal } from '../services/mounts.js'
 import { BLKID_AMBIVALENT, BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures, blkidPartEntryName, LSBLK_NONE_FOUND, parsePartitionProbe, PART_BY_ID_RE, PARTITION_PROBE_ARGS } from '../services/partition-device.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
 import { loadPveFootprint, systemPoolRefusalFrom } from '../services/pve-footprint.js'
@@ -1157,6 +1157,12 @@ export async function poolRoutes(
     // under its lock before the argv reaches `zpool`.
     gates.push(
       mountTargetGate<O>(mp),
+      // cr.52r D3's ZFS half: ZFS mounts for itself here, so the swap-stage
+      // check closes the practical avenue — every existing ancestor of the
+      // mountpoint must be root-owned and not group/other-writable. Applied to
+      // the pool create + mountpoint change doors (and the dataset + import
+      // doors); for AHR (btrfs) the daemon's own mount is fd-pinned instead.
+      swapStageGate<O>(mp),
       async (_object, reads) => {
         const live = await poolReads.liveMounts(reads)
         if (live === null)
@@ -1486,6 +1492,12 @@ export async function poolRoutes(
    */
   function createSpec(req: CreatePoolRequest): GuardSpec<NewPool> {
     const ids = createRequestDiskIds(req)
+    // cr.52r D5: a pool created WITHOUT `-m` mounts at ZFS's own default,
+    // `/<name>` — the refusal and the collision gates run on that effective
+    // mountpoint, never on "none" (a pool named `home` would silently mount at
+    // `/home` otherwise). The mountpoint-change door's explicit `mp` is
+    // unchanged (`mountpointGates(mp, self)`).
+    const mountpoint = req.mountpoint ?? `/${req.name}`
     return {
       operation: 'zpool.create',
       object: {
@@ -1496,12 +1508,12 @@ export async function poolRoutes(
       },
       gates: [
         poolNameFreeGate,
-        ...(req.mountpoint !== undefined ? mountpointGates<NewPool>(req.mountpoint) : []),
+        ...mountpointGates<NewPool>(mountpoint),
         composableGate<NewPool>(ids, 'refusing to compose disks it cannot identify'),
       ],
       locks: async () => [
         znameClaim(req.name),
-        ...(req.mountpoint !== undefined ? [mountClaim(normalizeMountpointPath(req.mountpoint))] : []),
+        mountClaim(normalizeMountpointPath(mountpoint)),
         ...diskClaims(ids),
       ],
     }
@@ -1524,7 +1536,15 @@ export async function poolRoutes(
         id: async object => ({ target: object.target }),
         unbound: () => `Could not bind the import of '${target}'`,
       },
-      gates: [],
+      // cr.52r D4: the altroot itself runs the mount-target refusal (a `-R /etc`
+      // import would land the root dataset's default at `/etc`) AND the
+      // swap-stage ancestor check (ZFS mounts for itself after the import). The
+      // STORED mountpoints are gated in the job (they are only knowable once
+      // the pool is imported), which exports the pool again if any is refused.
+      gates: [
+        mountTargetGate<{ target: string }>(req.altroot),
+        swapStageGate<{ target: string }>(req.altroot),
+      ],
       locks: async () => req.name ? [znameClaim(req.name)] : [zpoolClaim(target, 'exclusive', target)],
     }
   }
@@ -1987,12 +2007,10 @@ export async function poolRoutes(
     // directory, so the reserved check, every collision gate, the confirm
     // signature, the lock key and the `zfs set` argv all carry one spelling.
     const mp = normalizeMountpointPath(bodyParsed.data.mountpoint)
-    // Request-only (WAVE3-DESIGN §3.2: about the value typed, not the pool):
-    // /mnt/pve belongs to PVE (story 3.25) and / is no pool's mountpoint.
-    if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${bodyParsed.data.mountpoint}' is reserved — /mnt/pve belongs to PVE (story 3.25) and / is not a pool mountpoint` } }
-    }
+    // cr.52r doc ruling: /mnt/pve and / answer through the shared refusal —
+    // the ONE 409 code (reason system-mount-target, the PVE-territory sentence
+    // for /mnt/pve), like every other door that sets a mountpoint, instead of
+    // this request-only 400.
 
     // Story cr.36 (§2.1 "pool mountpoint": every gate was request-time only).
     // One gate list at both doors: the system-pool hard 409 (pvepool.1 +
@@ -2104,10 +2122,8 @@ export async function poolRoutes(
     if (req.mountpoint !== undefined) {
       const raw = req.mountpoint
       const mp = normalizeMountpointPath(raw)
-      if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${raw}' is reserved — /mnt/pve belongs to PVE (story 3.25) and / is not a pool mountpoint` } }
-      }
+      // cr.52r doc ruling: /mnt/pve and / answer through the shared refusal
+      // (ONE 409, reason system-mount-target) like every other setting door.
       req.mountpoint = mp
     }
 
@@ -2231,7 +2247,7 @@ export async function poolRoutes(
       }
     }
 
-    const args = ['import']
+    const args = ['import', '-N']
     if (req.force)
       args.push('-f')
     if (req.altroot)
@@ -2242,12 +2258,13 @@ export async function poolRoutes(
       'zpool.import',
       { ...identity, params: { target, force: req.force ?? false } },
       guarded(spec, pre, async () => {
-        // PVE parity (PVE/API2/Disks/ZFS.pm, their fix for Proxmox bug #2554) and
-        // issue #22: an imported pool needs its zfs-import@<pool>.service enabled
-        // too — zpool.cache alone is not a reliable boot import. The request may
-        // target a name OR a guid, and a guid import never tells us the name, so
-        // the newly imported pool(s) are the DIFF of the pool list across the
-        // import (falling back to the requested name if the diff comes up empty).
+        // cr.52r D4: the import is done as `zpool import -N` FIRST (import, no
+        // mount); the pool's STORED mountpoints are read with
+        // `zfs get -H -r -o name,value mountpoint <pool>` (the value is already
+        // altroot-prefixed by the `-R`), and every dataset whose effective
+        // mountpoint the refusal refuses FAILS the job BEFORE any dataset is
+        // mounted — the pool is exported again so nothing is left half-imported.
+        // This argv sequence is pinned by the cr.52r tests.
         const before = await listPoolNames()
 
         const result = await executor.exec('/usr/sbin/zpool', args)
@@ -2259,7 +2276,52 @@ export async function poolRoutes(
         const imported = after.filter(name => !before.includes(name))
         const pools = imported.length > 0 ? imported : (req.name ? [req.name] : [])
 
-        // Best-effort — the pool is imported, so a systemctl hiccup only warns.
+        // Gate every dataset's effective mountpoint BEFORE any mount — the
+        // refusal (D1/D2) and the swap-stage ancestor-perm check (D3's ZFS
+        // half) both apply, because ZFS itself will mount these.
+        const refused: string[] = []
+        for (const pool of pools) {
+          const z = await executor.exec('/usr/sbin/zfs', ['get', '-H', '-r', '-o', 'name,value', 'mountpoint', '--', pool])
+          if (z.exitCode !== 0)
+            throw new Error(`could not read the stored mountpoints of '${pool}' before mounting it (zfs get: ${z.stderr.trim() || `exit ${z.exitCode}`}) — the pool is imported unmounted; export and re-import after checking it`)
+          for (const line of z.stdout.split('\n')) {
+            const value = line.split('\t').pop()?.trim() ?? ''
+            if (value === '' || value === 'none' || value === 'legacy' || value === '-')
+              continue
+            const refusal = (await mountTargetRefusal(value)) ?? (await swapStageRefusal(value))
+            if (refusal)
+              refused.push(`'${value}' ${refusal.message}`)
+          }
+        }
+        if (refused.length > 0) {
+          for (const pool of pools)
+            await executor.exec('/usr/sbin/zpool', ['export', pool]).catch(() => {})
+          throw new Error(`Import refused — the pool's stored mountpoints land on a protected or system path: ${refused.join('; ')}. `
+            + `The pool was imported unmounted (-N) and exported again, so nothing was mounted and nothing was left half-imported. `
+            + `Set a safe mountpoint on the pool while it is imported with \`-R\` (or fix the parent perms) and retry`)
+        }
+
+        // All effective mountpoints passed: export and re-import WITHOUT `-N`
+        // (the original argv) so ZFS mounts the pool's datasets exactly as the
+        // request meant — the same behavior the single non-`-N` import had.
+        for (const pool of pools) {
+          const e = await executor.exec('/usr/sbin/zpool', ['export', pool])
+          if (e.exitCode !== 0)
+            throw new Error(`could not re-export '${pool}' for a mounted import: ${e.stderr.trim() || `exit ${e.exitCode}`}`)
+        }
+        const mountArgs = ['import']
+        if (req.force)
+          mountArgs.push('-f')
+        if (req.altroot)
+          mountArgs.push('-R', req.altroot)
+        mountArgs.push('--', target)
+        const mountResult = await executor.exec('/usr/sbin/zpool', mountArgs)
+        if (mountResult.exitCode !== 0)
+          throw new Error(mountResult.stderr.trim() || `zpool import exited with code ${mountResult.exitCode}`)
+
+        // PVE parity (PVE/API2/Disks/ZFS.pm, their fix for Proxmox bug #2554) and
+        // issue #22: an imported pool needs its zfs-import@<pool>.service enabled
+        // too — zpool.cache alone is not a reliable boot import.
         const warnings: string[] = []
         for (const pool of pools) {
           const warning = await syncZfsImportUnit(executor, pool, 'enable')

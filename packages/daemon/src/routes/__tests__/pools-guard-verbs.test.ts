@@ -475,8 +475,11 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
     const res = await send(create())
     const id = (res.json() as JobAccepted).job.id
     await until(() => calls.some(c => c.command === ZPOOL && c.args[0] === 'create'))
+    // cr.52r D5: a create's effective mountpoint (`/<name>` when no -m) is
+    // locked like every mount-setting mutation.
     assert.deepEqual(queue().heldLocks(), [
       { key: 'zname:newpool', mode: 'exclusive', holders: [id] },
+      { key: 'mount:/newpool', mode: 'exclusive', holders: [id] },
       { key: `disk:${NEW_DISK}`, mode: 'exclusive', holders: [id] },
     ])
     release()

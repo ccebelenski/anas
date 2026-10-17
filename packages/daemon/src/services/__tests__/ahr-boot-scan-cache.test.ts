@@ -1,6 +1,6 @@
 import type { AhrCapacity } from '@anas/shared'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -48,6 +48,8 @@ const LV_SIZE = 2143289344
 const BAND_SIZE = 2 * GIB - MIB
 const DISK_SIZE = 2 * GIB + 8 * MIB
 const MOUNTPOINT = '/mnt/anas-ahr/tank'
+/** The pool's LV device path — the fstab spec of the pool's OWN line. */
+const AHR_LV_PATH = '/dev/tank/tank-vol'
 const DM_NAME = 'tank-tank--vol'
 const LVS_STATE_ARGS = ['--reportformat', 'json', '--units', 'b', '--nosuffix']
 
@@ -245,6 +247,7 @@ function rungCalls(executor: MockExecutor): string[][] {
 
 describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing', () => {
   let dir: string
+  let realMp: string
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-ahr-boot-cache-'))
@@ -252,9 +255,20 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
     // their pinned UUIDs).
     process.env.ANAS_MDADM_CONF = join(dir, 'mdadm.conf')
     await writeFile(process.env.ANAS_MDADM_CONF, 'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa\n')
+    // cr.52r D3: the cache-recover rung mounts a DOWN pool DIRECTLY through the
+    // pool's REAL mountpoint, which it reads from the pool's OWN fstab line
+    // (the topology can only report the LV device path while unmounted). The
+    // test pool therefore has a real line at a real directory under the
+    // tmpdir — the exact pool line ANAS writes at creation (ahrFstabEntry).
+    realMp = join(dir, 'tank')
+    await mkdir(realMp, { recursive: true })
+    const poolLine = `${AHR_LV_PATH} ${realMp} btrfs nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s 0 0\n`
+    process.env.ANAS_FSTAB_PATH = join(dir, 'fstab')
+    await writeFile(process.env.ANAS_FSTAB_PATH, poolLine)
   })
   afterEach(async () => {
     delete process.env.ANAS_MDADM_CONF
+    delete process.env.ANAS_FSTAB_PATH
     await rm(dir, { recursive: true, force: true })
   })
 
@@ -271,10 +285,37 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
       // LVM refused to activate the partial LV, so the volume has to be brought
       // up now that it is whole again.
       ['/usr/sbin/vgchange', '-ay', 'tank'],
-      // By LV device path: fstab supplies the mountpoint and every option the
-      // pool's own line carries. The rung never invents a mount.
-      ['/usr/bin/mount', '--', '/dev/tank/tank-vol'],
+      // cr.52r D3: the pool's OWN fstab line is mounted DIRECTLY through a
+      // directory the daemon opened — the kernel resolves /proc/self/fd/3 to
+      // the pool's real mountpoint. The rung never invents a mount.
+      ['/usr/bin/mount', '-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s', '--', AHR_LV_PATH, '/proc/self/fd/3'],
     ])
+    // The inherited fd resolves to the pool's REAL mountpoint directory from
+    // its own fstab line — never the LV device path the topology read.
+    const mountCall = executor.calls.find(c => c.command === '/usr/bin/mount')!
+    assert.equal(mountCall.fdPaths?.[0], realMp)
+  })
+
+  it('cr.52r P2 — a pool whose STORED mountpoint now resolves into /etc: the boot re-attach REFUSES, logs and leaves it — no mount', async () => {
+    // The pool's own fstab line says its mountpoint is `realMp`; the tree
+    // swerved since it was written — `realMp` is now a symlink to /etc. The
+    // boot re-attach must gate the stored path like any door, and a refusal on
+    // the boot path is a log, never a throw — the daemon must not take itself
+    // down over one bad re-attach.
+    await rm(realMp, { recursive: true, force: true })
+    await symlink('/etc', realMp)
+
+    const lines: string[] = []
+    const executor = buildExecutor('missing')
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.deepEqual(report.cacheRecovered, ['tank'], 'the rung still reports the pool')
+    // uncache, removemissing, activate — and NO mount (the path refused).
+    assert.deepEqual(rungCalls(executor), [
+      ['/usr/sbin/lvconvert', '--config', 'devices/allow_mixed_block_sizes=1', '-y', '--uncache', 'tank/tank-vol'],
+      ['/usr/sbin/vgreduce', '--config', 'devices/allow_mixed_block_sizes=1', '--removemissing', 'tank'],
+      ['/usr/sbin/vgchange', '-ay', 'tank'],
+    ])
+    assert.ok(lines.some(l => l.includes('rung=mount result=refused')), lines.join('\n'))
   })
 
   it('notifies that the pool came up uncached', async () => {

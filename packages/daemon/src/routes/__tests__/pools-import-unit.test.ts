@@ -22,8 +22,22 @@ import { capturedRootMountTable } from './pool-guard-reads.js'
  */
 
 const ZPOOL = '/usr/sbin/zpool'
+const ZFS = '/usr/sbin/zfs'
 const SYSTEMCTL = '/usr/bin/systemctl'
 const OK: ExecResult = { stdout: '', stderr: '', exitCode: 0 }
+
+/**
+ * cr.52r D4: the import job reads the imported pool's stored mountpoints with
+ * `zfs get -H -r -o name,value mountpoint <pool>` — a safe effective
+ * mountpoint (`/tank`, under `/mnt`, not `/mnt/pve`) lets the import proceed.
+ */
+function zfsStoredMountpoints(pool: string): { command: string, args: string[], result: ExecResult } {
+  return {
+    command: ZFS,
+    args: ['get', '-H', '-r', '-o', 'name,value', 'mountpoint', '--', pool],
+    result: { stdout: `${pool}\t/mnt/anas-${pool}\n`, stderr: '', exitCode: 0 },
+  }
+}
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -78,6 +92,11 @@ describe('boot-import unit: create enables zfs-import@<pool>.service (issue #22)
   })
 
   async function createPool(ex: MockExecutor, name: string): Promise<Job> {
+    // cr.52r D5: a create without a mountpoint is checked at its default
+    // `/<name>`, so the live-mount collision gate reads the mount table here
+    // too (cr.60: unreadable fails closed). A test that registered its own
+    // findmnt answer keeps it (fixtures are first-wins).
+    ex.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: capturedRootMountTable(), stderr: '', exitCode: 0 } })
     const built = await build(ex)
     server = built.server
     const res = await server.inject({
@@ -86,7 +105,7 @@ describe('boot-import unit: create enables zfs-import@<pool>.service (issue #22)
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify({ name, dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }] }),
     })
-    assert.equal(res.statusCode, 202)
+    assert.equal(res.statusCode, 202, res.payload)
     return waitForJob(built.jobQueue, (res.json() as { job: { id: string } }).job.id)
   }
 
@@ -150,7 +169,7 @@ describe('boot-import unit: import enables the unit for the pool(s) that appeare
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
       payload: JSON.stringify(body),
     })
-    assert.equal(res.statusCode, 202)
+    assert.equal(res.statusCode, 202, res.payload)
     return waitForJob(built.jobQueue, (res.json() as { job: { id: string } }).job.id)
   }
 
@@ -158,6 +177,7 @@ describe('boot-import unit: import enables the unit for the pool(s) that appeare
     const ex = new MockExecutor()
     // Before → after: `oldtank` appears across the import.
     ex.addFixture({ command: ZPOOL, args: ['list', '-j'], results: [listResult(), listResult('oldtank')] })
+    ex.addFixture(zfsStoredMountpoints('oldtank'))
     ex.addFixture({ command: ZPOOL, result: OK })
     ex.addFixture({ command: SYSTEMCTL, args: ['enable', 'zfs-import@oldtank.service'], result: OK })
 
@@ -173,6 +193,7 @@ describe('boot-import unit: import enables the unit for the pool(s) that appeare
     // A guid import never tells us the name — an already-imported pool is in
     // both listings, and only the newcomer is the one we just imported.
     ex.addFixture({ command: ZPOOL, args: ['list', '-j'], results: [listResult('testpool'), listResult('testpool', 'oldtank')] })
+    ex.addFixture(zfsStoredMountpoints('oldtank'))
     ex.addFixture({ command: ZPOOL, result: OK })
     ex.addFixture({ command: SYSTEMCTL, result: OK })
 
@@ -191,6 +212,7 @@ describe('boot-import unit: import enables the unit for the pool(s) that appeare
     // Same listing before and after (e.g. the listing failed) — a by-name
     // import still knows what it asked for.
     ex.addFixture({ command: ZPOOL, args: ['list', '-j'], result: listResult('testpool') })
+    ex.addFixture(zfsStoredMountpoints('oldtank'))
     ex.addFixture({ command: ZPOOL, result: OK })
     ex.addFixture({ command: SYSTEMCTL, result: OK })
 
@@ -202,6 +224,7 @@ describe('boot-import unit: import enables the unit for the pool(s) that appeare
   it('reports a systemctl failure as a job warning, not a failed import', async () => {
     const ex = new MockExecutor()
     ex.addFixture({ command: ZPOOL, args: ['list', '-j'], results: [listResult(), listResult('oldtank')] })
+    ex.addFixture(zfsStoredMountpoints('oldtank'))
     ex.addFixture({ command: ZPOOL, result: OK })
     // No systemctl fixture — 127.
 
@@ -231,7 +254,7 @@ describe('boot-import unit: destroy disables the unit', () => {
       url: `/v1/pools/${pool}`,
       headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string },
     })
-    assert.equal(res.statusCode, 202)
+    assert.equal(res.statusCode, 202, res.payload)
     return waitForJob(built.jobQueue, (res.json() as { job: { id: string } }).job.id)
   }
 

@@ -30,7 +30,7 @@ import { AHR_FINDMNT_ARGS } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
 import { heldByLun, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
-import { mountTargetGate, normalizeMountpointPath } from '../services/mounts.js'
+import { mountTargetGate, mountTargetRefusal, normalizeMountpointPath } from '../services/mounts.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
 import { mdSysPath, readMdAttrOrNull } from '../services/selfheal-io.js'
 import { readMdGeometry } from '../services/selfheal-map.js'
@@ -633,15 +633,11 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       return
 
     // Request-only (WAVE3-DESIGN §3.2: about the value typed, not the node):
-    // never in PVE's namespace, never `/`.
+    // normalised here; /mnt/pve and / answer through the create's shared
+    // refusal gate (cr.52r doc ruling — ONE 409, reason system-mount-target).
     let mountpoint: string | undefined
     if (req.mountpoint !== undefined) {
-      const mp = req.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
-      if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${req.mountpoint}' is reserved. /mnt/pve belongs to PVE, and / is not a pool mountpoint` } }
-      }
-      mountpoint = mp
+      mountpoint = req.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
     }
 
     const spec = createSpec({ name: req.name, tier: req.tier, disks: req.disks, mountpoint })
@@ -709,12 +705,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!identity)
       return
 
-    // Request-only (about the value typed): never PVE's namespace, never `/`.
+    // Request-only (about the value typed): normalised here; /mnt/pve and /
+    // answer through the move's shared refusal gate (cr.52r doc ruling — ONE
+    // 409, reason system-mount-target, PVE-territory sentence for /mnt/pve).
     const mp = parsed.data.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
-    if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${parsed.data.mountpoint}' is reserved. /mnt/pve belongs to PVE, and / is not a pool mountpoint` } }
-    }
 
     // Story cr.38 (§2.3 "mountpoint": every gate was request-time only, and
     // there was no system-pool gate). One gate list at both doors: not
@@ -855,6 +849,11 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
           : null,
         guard.systemPoolGate,
         guard.lunGate('Remounting'),
+        // cr.52r P2: this verb MOUNTS the stored path again, so the STORED
+        // path runs the mount-target refusal before the unmount/mount — a path
+        // that has since resolved into a protected tree refuses here, at the
+        // route and again in the job.
+        async pool => mountTargetRefusal(pool.mountpoint),
       ],
       // D3, cr.38r: the LUN gate above FAILED OPEN on a broken claims read —
       // warn, never refuse; the job reports any the confirm did not list.
@@ -885,7 +884,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       'ahr.remount',
       { ...identity, params: { name } },
       guarded(spec, pre, async (live, { updateProgress, newAdvisories }) => {
-        const result = await remountAhrPool(executor, { name: live.name, mountpoint: live.mountpoint }, updateProgress)
+        const result = await remountAhrPool(executor, { name: live.name, mountpoint: live.mountpoint, subvolLayout: live.subvolLayout }, updateProgress)
         // D3 (cr.38r): a claims read that broke since the confirm rides the
         // result (the remount's own post-mount check may fail first — the
         // advisory is dropped then, as the report of the run's outcome must).

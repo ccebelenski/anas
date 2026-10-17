@@ -1,13 +1,14 @@
 import type { AhrPool, SelfhealStepName } from '@anas/shared'
 import type {
   CommandExecutor,
+  ExecOptions,
   ExecResult,
   ExecStreamResult,
   PipelineResult,
 } from '../../executor/types.js'
 import type { SelfhealRepairOptions } from '../selfheal-repair.js'
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
@@ -226,7 +227,7 @@ class FakeNode implements CommandExecutor {
     writeFileSync(join(this.sys, key), `${value}\n`)
   }
 
-  async exec(command: string, args: string[]): Promise<ExecResult> {
+  async exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
     this.calls.push({ command, args })
     const ok = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 })
 
@@ -247,7 +248,16 @@ class FakeNode implements CommandExecutor {
       return ok('/dev/mapper/gtsh-data\n')
     }
     if (command === '/usr/bin/mount') {
-      this.mounted.add(lastArg(args))
+      const dest = lastArg(args)
+      // cr.52r D3: a DIRECT mount targets the daemon-opened fd
+      // (`/proc/self/fd/3` on the CHILD). Resolve the inherited fd in THIS
+      // process so the mounted set holds the REAL directory the engine's
+      // umount will name — the fd is open here while the mount runs, so
+      // readlink answers honestly.
+      const inherited = opts?.inheritedFds?.[0]
+      this.mounted.add(dest.startsWith('/proc/self/fd/') && inherited !== undefined
+        ? readlinkSync(`/proc/self/fd/${inherited}`)
+        : dest)
       this.mountLog.push(`mount ${args.join(' ')}`)
       return ok('')
     }
