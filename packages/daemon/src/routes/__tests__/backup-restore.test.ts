@@ -11,7 +11,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { anasIqn } from '@anas/shared'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
-import { iscsiTargetClaim, znameClaim } from '../../safety/guard.js'
+import { iscsiTargetClaim, zfsDatasetClaims, znameClaim } from '../../safety/guard.js'
 import { createServer } from '../../server.js'
 import { volsizeArgs } from '../../services/backup-restore.js'
 import { PBC } from '../../services/backup-runner.js'
@@ -857,6 +857,70 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
     })
   })
 
+  // --- cr.64a: the in-place restore's backing keys (beside target + LUN) ----
+
+  describe('cr.64a — the in-place restore holds its backing\'s keys beside the target\'s', () => {
+    const ZPOOL = '/usr/sbin/zpool'
+    /** TYPED (this harness reads no real pool): the pool guid of tank/vol1. */
+    const TANK_GUID = '6915264936287318418'
+
+    /** Opened by afterEach if a test failed part-way, so no job parks in the stream. */
+    let openStream: (() => void) | undefined
+    afterEach(() => {
+      openStream?.()
+      openStream = undefined
+    })
+
+    it('a dataset destroy on the backing waits for the running restore — named — and runs once the stream ends', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      // The pool's guid IS readable here, so the backing's keys are the
+      // volume's real dataset keys, not §4.2's name-key fallback.
+      mock.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', 'tank'], result: { stdout: `${TANK_GUID}\n`, stderr: '', exitCode: 0 } })
+      // Hold the job AT the image stream: keys held, target disabled, waiting.
+      let arrive!: () => void
+      const reached = new Promise<void>((resolve) => {
+        arrive = resolve
+      })
+      let release!: () => void
+      const go = new Promise<void>((resolve) => {
+        release = resolve
+        openStream = resolve
+      })
+      const toStream = mock.execToStream.bind(mock)
+      mock.execToStream = async (command, args, target, opts) => {
+        arrive()
+        await go
+        return toStream(command, args, target, opts)
+      }
+
+      const code = String((await restore()).headers['x-anas-confirm-code'])
+      const res = await restore(body(), { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      const id = res.body.job!.id
+      await reached
+
+      // A destroy of the LUN's backing dataset, claiming it as `zfs destroy`
+      // does (its own key exclusive, ancestors and the pool shared). Before
+      // cr.64a the restore held only the iSCSI keys and this ran beside the
+      // stream, destroying the object the image was landing in.
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      const probe = queue.submit('zfs.destroy', { user: 'test', uid: 0 }, async () => null, { locks: zfsDatasetClaims(TANK_GUID, 'tank/vol1', 'exclusive') })
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(queue.get(probe.id)?.status, 'queued', 'the destroy waits for the restore, not for a slot')
+      assert.equal(queue.get(probe.id)?.progress, `waiting for backup.restore.image (job ${id}) on Dataset 'tank/vol1'`)
+
+      release()
+      openStream = undefined
+      const job = await waitForJob(id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      for (let i = 0; i < 200 && queue.get(probe.id)?.status !== 'completed'; i++)
+        await new Promise(resolve => setTimeout(resolve, 5))
+      assert.equal(queue.get(probe.id)?.status, 'completed', JSON.stringify(queue.get(probe.id)?.error))
+      assert.deepEqual(queue.heldLocks(), [])
+    })
+  })
+
   // --- (8) the confirm gate + the job --------------------------------------
 
   describe('the confirm gate, and only then the job', () => {
@@ -1464,6 +1528,22 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         mockOf().addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: 'tank\t/tank\ntank/images\t/tank/images\n', stderr: '', exitCode: 0 } })
         const code = await mint(newLunBody())
         const res = await restore(newLunBody(targetWith({ backing: { kind: 'file', dataset: 'tank/images' } })), { 'x-anas-confirm': code })
+        assertScopeChanged(res, 'backing')
+      })
+
+      // cr.64a (item 4a, the cr.54 review's coverage item): the request body
+      // NEVER changes — only the dataset's mountpoint does. Nothing but the
+      // confirm's bound `confirmScope` backing path can tell the operator
+      // that the image now lands somewhere other than where they confirmed.
+      it('cr.54\'s confirmScope pin: the backing dataset\'s mountpoint MOVES between mint and resend — same body — 409 CONFIRM_SCOPE_CHANGED naming the backing', async () => {
+        await serveAnas()
+        const mock = mockOf()
+        mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: 'tank\t/tank\ntank/images\t/tank/images\n', stderr: '', exitCode: 0 } })
+        const payload = newLunBody(targetWith({ backing: { kind: 'file', dataset: 'tank/images' } }))
+        const code = await mint(payload)
+        // The dataset's mountpoint moves BEFORE the resend; the body is identical.
+        mock.prependFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: 'tank\t/tank\ntank/images\t/srv/images\n', stderr: '', exitCode: 0 } })
+        const res = await restore(payload, { 'x-anas-confirm': code })
         assertScopeChanged(res, 'backing')
       })
 

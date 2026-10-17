@@ -127,6 +127,15 @@ export function verifyAssertion(
   const userid = unescapeUser(user)
   if (userid === undefined || userid === '')
     return { ok: false, reason: 'proxy assertion carries an undecodable user id' }
+  // cr.64a: ANAS's own check behind PVE's rule. A PVE user id is always
+  // `name@realm`, and PVE refuses `:` in the name — so an id that breaks
+  // either shape is not a user pveproxy could ever have signed. This is what
+  // keeps cr.56's `system:task-runner` identity runner-only all the way
+  // through: the daemon trusts that name on its Unix socket because the
+  // runners print it themselves, and this gateway refuses it (or any other
+  // `:`-bearing, realm-less id) even if the MAC were ever valid for it.
+  if (userid.includes(':') || !userid.includes('@'))
+    return { ok: false, reason: `proxy assertion carries a user id PVE cannot have: '${userid}' has no realm, or a ':' in the name` }
 
   const list = privs === '' ? [] : privs.split(',')
   const privileges: Privilege[] = []

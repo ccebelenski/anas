@@ -144,6 +144,7 @@ import {
   assertInstalled,
   assertSaveable,
   imageFilePath,
+  lunBackingClaims,
   readIscsiState,
   resolveFileBackingDir,
   resolveZvolBacking,
@@ -2186,6 +2187,17 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // `restoreDepsNow`), and neither ever leaves this scope.
     const { repo } = deps
 
+    // cr.64a (item 2): the backing's keys beside the target's and the LUN's —
+    // the LUN verbs' one builder (cr.63 L17), in its SHARED mode: an in-place
+    // restore rewrites the backing object's bytes and changes nothing about
+    // the volume or the filesystem underneath, exactly like a LUN add. A
+    // dataset or pool verb that DESTROYS, renames or rolls back that backing,
+    // or unmounts its filesystem (all exclusive on these keys) now waits for
+    // the restore and re-gates after it — before, it could `zfs destroy` the
+    // object the image was streaming into. The guid fallback and the
+    // movers' path resolution are `lunBackingClaims'` own (cr.63's rule).
+    const backingKeys = await lunBackingClaims(executor, lun, 'shared')
+
     // The journald audit params: what was restored, from where, onto which LUN.
     // No secret and no repository credential ever rides here.
     //
@@ -2270,8 +2282,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       }),
       // cr.33 (§4.3): a restore is a data mover — the long lane. cr.40: it
       // holds the target's key and the LUN's for the run — the whole target
-      // is disabled while the image streams.
-      { lane: 'long', locks: lunClaims(target.iqn, lun.serial) },
+      // is disabled while the image streams. cr.64a: and the backing's keys,
+      // shared, for the same duration.
+      { lane: 'long', locks: [...lunClaims(target.iqn, lun.serial), ...backingKeys] },
     )
 
     reply.code(202)
@@ -2412,6 +2425,19 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           claims.push(...(await pathSourceClaims(executor, [b.ok.dir], readAhrPools)).claims)
         }
         return claims
+      },
+      // cr.64a: when the guard's job-time recompute finds the job needs keys
+      // the route was never granted, say what moved in the operator's own
+      // terms — the backing. (The unmoved gate above usually answers first;
+      // this is the sentence for a backing that still RESOLVES but whose
+      // filesystem keys moved.)
+      locksMoved: async (o, reads) => {
+        const b = await backingOf(o, reads)
+        if ('refusal' in b || !routeBacking)
+          return 'the new LUN\'s backing changed'
+        return routeBacking.backing.path === b.ok.backing.path
+          ? `the new LUN's backing ${b.ok.backing.path} now lives on a different filesystem`
+          : `the new LUN's backing was ${routeBacking.backing.path}; now ${b.ok.backing.path}`
       },
     }
 

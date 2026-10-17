@@ -20,9 +20,11 @@ import { describeBound, IDENTITY_MISMATCH, IdentityMismatchError, identityMismat
  *    validated request plus id, revision and scope into the confirm code
  *    ({@link guardConfirm});
  *  - the JOB runs {@link guarded}: read → id → revision → scope → every gate →
- *    advisories → body, each step against facts read NOW (a fresh
- *    {@link GuardReads}; nothing read at the request reaches the job's gates).
- *    A refusal fails the job with the gate's own error code and sentence.
+ *    the lock recompute (cr.64a: the claims recomputed from the job's own
+ *    re-read must all be keys the queue granted) → advisories → body, each
+ *    step against facts read NOW (a fresh {@link GuardReads}; nothing read at
+ *    the request reaches the job's gates). A refusal fails the job with the
+ *    gate's own error code and sentence.
  *
  * A gate is written once and called from both doors; nothing else may
  * re-implement it.
@@ -138,6 +140,16 @@ export interface GuardSpec<O> {
    * builders below. Absent = the job takes no lock.
    */
   locks?: (object: O, bound: GuardBound, reads: GuardReads) => Promise<LockClaim[]>
+  /**
+   * The sentence naming what moved for the job door's lock recompute
+   * ({@link guarded}, cr.64a): called only when the claims recomputed from the
+   * job's own re-read need a key the run was not granted, with the re-read
+   * object and the run's read cache (the spec's own reads, so the facts the
+   * `locks` builder just used are memoised). A door whose claim-bearing field
+   * has a name the operator knows (a backing, a source) gives one naming it;
+   * absent, the recompute names the two claim-key sets.
+   */
+  locksMoved?: (object: O, reads: GuardReads) => Promise<string> | string
 }
 
 /** What the confirm binds beside the request, and what the job compares. */
@@ -303,6 +315,28 @@ export type GuardedBody<O> = (object: O, ctx: GuardedContext<O>) => Promise<unkn
 export function guarded<O>(spec: GuardSpec<O>, pass: GuardPass<O>, body: GuardedBody<O>): JobHandler {
   return async (updateProgress, jobCtx) => {
     const { object, reads } = await reverify(spec, pass.bound)
+    // cr.64a: the guard's own lock recompute — cr.56's rule at its three mover
+    // doors, now the guard's rule for EVERY spec. The queue granted exactly the
+    // claims the ROUTE computed from the ROUTE's read; the job acts on what its
+    // OWN re-read says, so every key the re-read needs must be among the ones
+    // granted — else a destroy, rollback, rename or mount accepted in between
+    // is not serialised against this run. A held exclusive covers a needed
+    // shared; needing FEWER keys than held is fine (the extra keys only make
+    // other verbs wait). `locksMoved` names what moved in the operator's own
+    // terms when the spec knows; the refusal names the objects it holds no key
+    // for. (The three cr.56 doors keep their in-body checks; where this one
+    // fires first the refusal carries this sentence.)
+    if (spec.locks) {
+      const needed = await spec.locks(object, pass.bound, reads)
+      const refusal = unheldClaimsRefusal(
+        spec.object.what,
+        spec.locksMoved ? await spec.locksMoved(object, reads) : claimsMoved(pass.locks, needed),
+        pass.locks,
+        needed,
+      )
+      if (refusal)
+        throw new GuardRefusalError(refusal)
+    }
     const listed = new Set(pass.advisories.map(a => a.key))
     const fresh = spec.advisories ? await spec.advisories(object, reads) : []
     const newAdvisories = fresh.filter(a => !listed.has(a.key)).map(a => a.warning)
@@ -364,6 +398,18 @@ export function unheldClaimsRefusal(
     code: 'STATE_CHANGED',
     message: `${what} changed while this run waited (${moved}) — the run holds no lock on ${objects}, so nothing was done; run it again`,
   }
+}
+
+/**
+ * The generic `moved` for the guard's lock recompute ({@link guarded},
+ * cr.64a), when the spec does not name the field that moved: the two claim-key
+ * sets as keys — precise and machine-readable, the sentence's tail names the
+ * objects in the operator's words.
+ */
+function claimsMoved(held: readonly LockClaim[], needed: readonly LockClaim[]): string {
+  const keys = (claims: readonly LockClaim[]): string =>
+    claims.length ? claims.map(c => c.key).join(', ') : 'none'
+  return `lock claims were ${keys(held)}; now ${keys(needed)}`
 }
 
 /** A list of source paths as a refusal names it. */

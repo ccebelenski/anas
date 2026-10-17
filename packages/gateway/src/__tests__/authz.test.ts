@@ -159,6 +159,25 @@ describe('X-Anas-Auth: freshness and shape', () => {
   })
 })
 
+// cr.64a: ANAS's own shape rule behind PVE's: a user id is `name@realm` and
+// never contains `:` — the runner identity `system:task-runner` is refused
+// even correctly signed. (The known-answer vectors cover the ids PVE does
+// sign, all of them realm-suffixed; these are the negatives.)
+describe('X-Anas-Auth: the user id must be one PVE can have (cr.64a)', () => {
+  const path = '/api/health'
+  for (const user of ['system:task-runner', 'root', 'a:b@c', 'noRealm']) {
+    it(`refuses '${user}' even with a valid MAC`, () => {
+      const r = verifyAssertion(KEY, sign(user, ['Sys.Audit'], 'GET', path), { method: 'GET', path, nowS: NOW })
+      assert.equal(r.ok, false, user)
+      assert.match(r.ok ? '' : r.reason, /user id PVE cannot have/, user)
+    })
+  }
+  it('accepts the shapes PVE really signs', () => {
+    for (const user of ['alice@pve', 'root@pam', 'svc_backup.1@ldap-corp', 'jörg@pam', 'a;b=c,d@pve'])
+      assert.ok(verifyAssertion(KEY, sign(user, ['Sys.Audit'], 'GET', path), { method: 'GET', path, nowS: NOW }).ok, user)
+  })
+})
+
 describe('the one rule: GET/HEAD → Sys.Audit, everything else → Sys.Modify', () => {
   it('maps every method', () => {
     assert.equal(requiredPrivilege('GET'), 'Sys.Audit')
@@ -267,6 +286,25 @@ describe('the gateway with the pve provider (end to end)', () => {
       assert.equal(res.json().error.message, NOT_THROUGH_PVEPROXY)
       assert.equal(logs.length, 1)
       assert.match(logs[0]!, re)
+    }
+    assert.equal(received.length, 0)
+    await s.close()
+  })
+
+  // cr.64a: cr.56's runner-only identity (`system:task-runner` — no realm, a
+  // `:` in the name, printed by the task runners themselves on the daemon's
+  // Unix socket) must never arrive through the gateway. pveproxy cannot sign
+  // it (PVE has no such user), and ANAS now refuses the shape itself even if
+  // the MAC is valid for it — the check is the verifier's, not PVE's alone.
+  it('cr.64a: a VALID signature naming system:task-runner (or any `:`-bearing, realm-less id) → 401, logged, nothing forwarded', async () => {
+    const s = gateway()
+    for (const user of ['system:task-runner', 'root']) {
+      logs.length = 0
+      const res = await s.inject({ method: 'GET', url: POOLS, headers: { 'x-anas-auth': sign(user, ['Sys.Audit', 'Sys.Modify'], 'GET', POOLS) } })
+      assert.equal(res.statusCode, 401, user)
+      assert.equal(res.json().error.message, NOT_THROUGH_PVEPROXY)
+      assert.equal(logs.length, 1, user)
+      assert.match(logs[0]!, /user id PVE cannot have/, user)
     }
     assert.equal(received.length, 0)
     await s.close()

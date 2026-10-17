@@ -149,8 +149,11 @@ describe('ident.2 — one PBS group per backup task', () => {
     // Moving documents into pictures' group: refused.
     const into = await server.inject({ method: 'PUT', url: '/v1/backup/tasks/documents', headers: JSON_HEADERS, payload: task({ name: 'documents', backupId: 'nas' }) })
     assert.equal(into.statusCode, 409)
-    // An edit of pictures that keeps its own group: accepted.
+    // An edit of pictures that keeps its own group: accepted — and WAITED
+    // (cr.64a): the job writes the task's units into `dir`, which afterEach
+    // rm()s — returning from the 202 raced the write (ENOTEMPTY under load).
     const keep = await server.inject({ method: 'PUT', url: '/v1/backup/tasks/pictures', headers: JSON_HEADERS, payload: task({ backupId: 'nas', schedule: '*-*-* 03:00:00' }) })
     assert.equal(keep.statusCode, 202, keep.body)
+    assert.equal((await waitForJob(server, (keep.json() as { job: { id: string } }).job.id)).status, 'completed')
   })
 })

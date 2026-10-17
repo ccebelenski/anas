@@ -780,8 +780,15 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     const job = await finished(runId)
     assert.equal(job.status, 'failed', JSON.stringify(job.result))
     assert.equal(job.error?.code, 'STATE_CHANGED')
-    assert.equal(job.error?.message, `Snapshot schedule 'nightly-media' changed while this run waited (target was zfs:testpool/media; `
-    + `now zfs:testpool/vm-100-disk-0) — the run holds no lock on Dataset 'testpool/vm-100-disk-0', so nothing was done; run it again`)
+    // cr.64a: the GUARD's own lock recompute answers this race before the
+    // door's in-body check does — same STATE_CHANGED, same unheld-object tail,
+    // no snapshot argv — so the parenthetical is the guard's claim-set
+    // sentence, not the door's bespoke `target was …; now …` one (which stays
+    // as the door's own dead-if-reached check until schedules.ts folds).
+    assert.equal(job.error?.message, `Snapshot schedule 'nightly-media' changed while this run waited (lock claims were `
+    + `zfs:${TESTPOOL_GUID}/media, zfs:${TESTPOOL_GUID}, zpool:${TESTPOOL_GUID}, zname:testpool, schedule:nightly-media; `
+    + `now zfs:${TESTPOOL_GUID}/vm-100-disk-0, zfs:${TESTPOOL_GUID}, zpool:${TESTPOOL_GUID}, zname:testpool, schedule:nightly-media) `
+    + `— the run holds no lock on Dataset 'testpool/vm-100-disk-0', so nothing was done; run it again`)
     assert.equal(moverRan('schedule.run'), false, 'no zfs snapshot argv')
   })
 })

@@ -8,6 +8,7 @@ import {
   diskClaim,
   guardCheck,
   guarded,
+  mountClaim,
   poolClaims,
   smbShareClaim,
   sourcePathsMoved,
@@ -302,5 +303,144 @@ describe('cr.56 (review M2) — unheldClaimsRefusal: the claims a run needs now 
     assert.equal(sourcePathsMoved({ name: 'archive paths', plural: true }, ['/a', '/b'], ['/a']), 'archive paths were /a, /b; now /a')
     assert.equal(sourcePathsMoved({ name: 'source', plural: false }, [], ['/x']), 'source was none; now /x')
     assert.equal(sourcePathsMoved({ name: 'source', plural: false }, ['/x'], ['/x']), 'source /x now resolves to a different filesystem')
+  })
+})
+
+describe('cr.64a — the job door recomputes spec.locks from the job\'s own re-read', () => {
+  // The paused-queue pattern (mover-source-locks.test.ts): the guarded job is
+  // queued behind a holder, the world moves while it waits, the holder lets
+  // go — and the job's recompute of ITS OWN re-read finds keys the queue never
+  // granted. `world` stands for the facts the spec's `locks` builder reads.
+  const GUID2 = '2000000000000000001'
+
+  it('the new-LUN image backing, whose dataset moves while the job waits: STATE_CHANGED naming the backing, and no body', async () => {
+    const world = { mount: '/tank/iscsi', guid: GUID }
+    const routeMount = world.mount
+    const spec: GuardSpec<{ name: string }> = {
+      operation: 'backup.restore.image',
+      object: {
+        what: 'the new LUN\'s backing',
+        read: async () => ({ name: 'lun-1' }),
+        id: async () => ({ backing: 'tank/iscsi' }),
+        unbound: () => 'Could not read the backing — refusing',
+      },
+      gates: [],
+      // The new-LUN door's image-file shape (cr.54): the backing dataset's
+      // keys beside the mount its mountpoint resolves to — derived from reads.
+      locks: async () => [
+        ...zfsDatasetClaims(world.guid, 'tank/iscsi', 'shared'),
+        mountClaim(world.mount, 'shared'),
+      ],
+      locksMoved: () => `the backing dataset 'tank/iscsi' moved: was mounted at ${routeMount}; now at ${world.mount}`,
+    }
+    const queue = new JobQueue()
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      assert.fail(`route door refused: ${JSON.stringify(pre.refusal)}`)
+    // Park the restore behind an unmount of the mount it waits on.
+    const unmount = held(queue, 'mount.umount', [mountClaim(world.mount)])
+    let bodyRan = false
+    const job = queue.submit(
+      'backup.restore.image',
+      SUBMITTER,
+      guarded(spec, pre, async () => {
+        bodyRan = true
+      }),
+      { locks: pre.locks },
+    )
+    await tick()
+    assert.equal(queue.get(job.id)?.status, 'queued', 'the restore waits for the unmount')
+    // The dataset's mountpoint moves (another filesystem under the name).
+    world.mount = '/mnt/rescue'
+    world.guid = GUID2
+    unmount.end()
+    await tick()
+    const rec = queue.get(job.id)
+    assert.equal(rec?.status, 'failed', JSON.stringify(rec?.error))
+    assert.equal(rec?.error?.code, 'STATE_CHANGED')
+    assert.equal(rec?.error?.message, `the new LUN's backing changed while this run waited (the backing dataset 'tank/iscsi' moved: was mounted at `
+    + `/tank/iscsi; now at /mnt/rescue) — the run holds no lock on Dataset 'tank/iscsi', Dataset 'tank', Pool 'tank', `
+    + `the mount at /mnt/rescue, so nothing was done; run it again`)
+    assert.equal(bodyRan, false, 'the body ran')
+  })
+
+  it('a dataset verb whose pool is re-created under its name while the job waits: STATE_CHANGED naming the claim sets (no locksMoved), and no body', async () => {
+    const world = { guid: GUID }
+    const spec: GuardSpec<{ name: string }> = {
+      operation: 'zfs.destroy',
+      object: {
+        what: 'Dataset \'tank/data\'',
+        read: async () => ({ name: 'tank/data' }),
+        // A name-bound id: the identity door cannot see the pool swap — the
+        // recompute is the backstop for a verb whose keys derive from reads.
+        id: async o => ({ dataset: o.name }),
+        unbound: () => 'Could not read the dataset — refusing',
+      },
+      gates: [],
+      locks: async () => zfsDatasetClaims(world.guid, 'tank/data', 'exclusive'),
+    }
+    const queue = new JobQueue()
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      assert.fail(`route door refused: ${JSON.stringify(pre.refusal)}`)
+    // Park the destroy behind a namespace verb on the name (an import), as a
+    // pool re-create takes it.
+    const importing = held(queue, 'zpool.import', [znameClaim('tank')])
+    let bodyRan = false
+    const job = queue.submit(
+      'zfs.destroy',
+      SUBMITTER,
+      guarded(spec, pre, async () => {
+        bodyRan = true
+      }),
+      { locks: pre.locks },
+    )
+    await tick()
+    assert.equal(queue.get(job.id)?.status, 'queued', 'the destroy waits for the import')
+    // A different pool now answers to the name.
+    world.guid = GUID2
+    importing.end()
+    await tick()
+    const rec = queue.get(job.id)
+    assert.equal(rec?.status, 'failed', JSON.stringify(rec?.error))
+    assert.equal(rec?.error?.code, 'STATE_CHANGED')
+    assert.equal(rec?.error?.message, `Dataset 'tank/data' changed while this run waited (lock claims were zfs:${GUID}/data, zfs:${GUID}, zpool:${GUID}, `
+    + `zname:tank; now zfs:${GUID2}/data, zfs:${GUID2}, zpool:${GUID2}, zname:tank) — the run holds no lock on `
+    + `Dataset 'tank/data', Dataset 'tank', Pool 'tank', so nothing was done; run it again`)
+    assert.equal(bodyRan, false, 'the body ran')
+  })
+
+  it('control: a job that now needs FEWER keys than it holds runs (the extra keys only make others wait)', async () => {
+    const world = { shrunk: false }
+    const spec: GuardSpec<{ name: string }> = {
+      operation: 'zfs.snapshot',
+      object: {
+        what: 'Dataset \'tank/data\'',
+        read: async () => ({ name: 'tank/data' }),
+        id: async o => ({ dataset: o.name }),
+        unbound: () => 'Could not read the dataset — refusing',
+      },
+      gates: [],
+      locks: async () => (world.shrunk
+        ? [znameClaim('tank', 'shared')]
+        : zfsDatasetClaims(GUID, 'tank/data', 'exclusive')),
+    }
+    const queue = new JobQueue()
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      assert.fail(`route door refused: ${JSON.stringify(pre.refusal)}`)
+    const blocker = held(queue, 'zpool.import', [znameClaim('tank')])
+    const job = queue.submit(
+      'zfs.snapshot',
+      SUBMITTER,
+      guarded(spec, pre, async () => ({ done: true })),
+      { locks: pre.locks },
+    )
+    await tick()
+    assert.equal(queue.get(job.id)?.status, 'queued')
+    world.shrunk = true
+    blocker.end()
+    await tick()
+    assert.equal(queue.get(job.id)?.status, 'completed', JSON.stringify(queue.get(job.id)?.error))
   })
 })

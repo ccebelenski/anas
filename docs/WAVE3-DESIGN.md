@@ -433,6 +433,13 @@ A job holds its locks only while ANAS itself is changing the object. Kernel-driv
   onto another filesystem, a schedule re-created under its id on another target, a pool or mount that moved under an
   unchanged path) — "holds its source for the run" is true for the source the run actually reads. Only the task's own
   runner (`system:task-runner`) may send the direct run.)*
+  *(cr.64a, 2026-10-16 — that recompute is now the GUARD's own rule, not the movers' courtesy: `guarded` recomputes
+  `spec.locks` from the job's own re-read for EVERY spec and refuses `STATE_CHANGED` (via `unheldClaimsRefusal`) before
+  the body when the run needs a key the queue did not grant it — a held exclusive covers a needed shared, and needing
+  fewer keys than held is fine. The sentence names what moved: a spec with a named claim-bearing field (the new-LUN
+  restore's backing) says so through `locksMoved`, and the generic fallback names the two claim-key sets. The three
+  cr.56 doors keep their in-body checks — the backup and cloud runs are raw submits the guard never wraps, and the
+  schedule fire's own refusal is reached only if the guard's is somehow not.)*
 
 Locks do not fix a different starvation: four long data movers fill all 4 slots and a short destroy waits
 for a slot, not for a lock (Run Now holds two: the supervisor and the direct run, `queue.ts:147-151`). **Recommendation:** a
