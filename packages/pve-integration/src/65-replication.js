@@ -15,7 +15,7 @@
  *       A 409 CONFLICT on any write = the registry moved under us: reload +
  *       toast + re-prompt, NEVER blind-retry.
  *     POST   /replication/remotes/test       body {host,port?,user?}   (pre-registration)
- *     POST   /replication/remotes/:name/test  ?pin=true / ?retrust=true optional
+ *     POST   /replication/remotes/:name/test  plain probe (no pin flag)
  *       → { data:{ stage:'unreachable'|'hostkey-unknown'|'hostkey-changed'
  *                        |'auth-failed'|'no-zfs'|'ok',
  *                  zfsVersion?, fingerprint?, knownFingerprint?, detail? } }
@@ -24,12 +24,22 @@
  *       fingerprints and is repaired only through the deliberate re-trust:
  *       show pinned vs presented, confirm, then re-test with ?retrust=true,
  *       which REPLACES the pinned key. Never automatic.
+ *     cr.64b2-ii: ?pin=true / ?retrust=true REQUIRE body { fingerprint } — the
+ *       one the operator was SHOWN (the probe's own answer, never a typed
+ *       value) — and answer 202 { job } to poll: the job re-probes and writes
+ *       known_hosts only while the host still presents that key. Its result is
+ *       the same stage object (+ warnings? when the registry mirror failed); a
+ *       different presented or already-pinned key FAILS the job STATE_CHANGED
+ *       naming both fingerprints, known_hosts untouched — the panel re-renders
+ *       the two fingerprints with that sentence and keeps the connection
+ *       untrusted.
  *   Target locations:
  *     GET    /replication/locations          → { data:{ peers:string[], remotes:string[] } }
  *     GET    /replication/peers/:name/pools   → { data:string[] }
  *     GET    /replication/remotes/:name/pools → { data:string[] }
  *   Task / once bodies carry target.location = { kind:'local'|'peer'|'remote', name? }
- *   (omitted for local); plan/run endpoints are otherwise unchanged.
+ *   (omitted for local); plan endpoints are otherwise unchanged, and run is
+ *   now a 202 job like every other mutation (cr.64b2-ii).
  *
  * Remotes test hooks: toolbar 'anas-btn-repl-remotes'; manager window
  * 'anas-win-repl-remotes'; add/edit wizard 'anas-win-repl-remote-edit' with
@@ -68,7 +78,7 @@
  *                                          unflagged move — an edit dialog may
  *                                          never substitute a stored endpoint)
  *   DELETE /replication/tasks/:name      → removes the schedule (units) only
- *   POST   /replication/tasks/:name/run  → { started: true }
+ *   POST   /replication/tasks/:name/run  → 202 { job } (cr.64b2-ii — poll it)
  *
  * One-shot (story 5.5.1):
  *   GET    /pools                                     → { data: PoolSummary[] }
@@ -1398,7 +1408,10 @@
                         + 'Afterwards ANAS trusts the new key for every replication to this host.')),
                 function (btn) {
                     if (btn === 'yes') {
-                        runRemoteTest(win, node, { retrust: true });
+                        // cr.64b2-ii: the re-trust job is bound to the fingerprint
+                        // just SHOWN in this dialog — the probe's own answer,
+                        // never a typed value.
+                        runRemoteTest(win, node, { retrust: true, fingerprint: data.fingerprint });
                     }
                 }
             );
@@ -1419,6 +1432,9 @@
         data = data || {};
         var stage = data.stage || 'unreachable';
         win._tested = (stage === 'ok');
+        // What the probe showed, kept so a FAILED pin job can put the two
+        // fingerprints back on screen with its own sentence (cr.64b2-ii).
+        win._lastTestStage = data;
         // Remember what the probe found pinned, so a save can record it (the
         // Host key column reads this) — never a not-yet-trusted key.
         if (data.fingerprint && stage !== 'hostkey-unknown' && stage !== 'hostkey-changed') {
@@ -1430,7 +1446,11 @@
                 xtype: 'component',
                 html: '<div style="color:var(--anas-warn,#b06a12);font-weight:600;">'
                     + enc(t('Unknown host key — confirm the fingerprint before trusting:')) + '</div>'
-                    + fingerprintBox(data.fingerprint),
+                    + fingerprintBox(data.fingerprint)
+                    // A failed pin job re-renders this stage with the job's own
+                    // sentence (cr.64b2-ii) — show it, it names the keys.
+                    + (data.detail ? '<div style="font-size:12px;color:var(--anas-muted,gray);">'
+                        + enc(data.detail) + '</div>' : ''),
             });
             items.push({
                 xtype: 'button',
@@ -1438,7 +1458,8 @@
                 text: t('Confirm & trust this host'),
                 iconCls: 'fa fa-check',
                 margin: '2 0 0 0',
-                handler: function () { runRemoteTest(win, node, { pin: true }); },
+                // The pin is bound to the fingerprint just shown (cr.64b2-ii).
+                handler: function () { runRemoteTest(win, node, { pin: true, fingerprint: data.fingerprint }); },
             });
         } else if (stage === 'hostkey-changed') {
             // The remote answered with a key that is NOT the pinned one. Show
@@ -1457,7 +1478,11 @@
                         + 'regenerated. If nothing like that happened, something else is '
                         + 'answering on this address — verify the new fingerprint on the '
                         + 'remote itself (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub) '
-                        + 'before replacing the pinned key.')) + '</div>',
+                        + 'before replacing the pinned key.')) + '</div>'
+                    // A failed re-trust job re-renders this stage with the job's
+                    // STATE_CHANGED sentence (cr.64b2-ii) — it names both keys.
+                    + (data.detail ? '<div style="font-size:12px;color:var(--anas-muted,gray);margin-top:4px;">'
+                        + enc(data.detail) + '</div>' : ''),
             });
             items.push({
                 xtype: 'button',
@@ -1497,6 +1522,20 @@
                     + enc(data.detail || t('Host is unreachable.')) + '</span>',
             });
         }
+        // cr.64b2-ii: a pin job's warnings (the registry mirror failing under
+        // another node's write) are operator-visible — logged AND shown in the
+        // result area, never dropped.
+        if (data.warnings && data.warnings.length) {
+            for (var wi = 0; wi < data.warnings.length; wi++) {
+                var w = '' + data.warnings[wi];
+                ANAS.warn('remote test: ' + w);
+                items.push({
+                    xtype: 'component',
+                    html: '<div style="color:var(--anas-warn,#b06a12);font-size:12px;">'
+                        + enc(w) + '</div>',
+                });
+            }
+        }
         try {
             area.removeAll();
             area.add(items);
@@ -1525,7 +1564,11 @@
 
     // Drive the pre-registration staged test with the values typed in the dialog.
     // opts.pin re-runs after the operator confirms an unknown host key;
-    // opts.retrust after they confirm REPLACING a changed one.
+    // opts.retrust after they confirm REPLACING a changed one. cr.64b2-ii: a
+    // pin/retrust is a JOB bound to opts.fingerprint — the one the probe just
+    // SHOWN (carried from renderTestStage's data, never a typed value); the
+    // door answers 202 { job }, the job re-probes and pins only while the host
+    // still presents that key, and its RESULT is the stage object to render.
     function runRemoteTest(win, node, opts) {
         opts = opts || {};
         var host = ('' + (valOf(win, '#host') || '')).trim();
@@ -1537,14 +1580,58 @@
         if (isNaN(port) || port <= 0) { port = 22; }
         var user = ('' + (valOf(win, '#user') || 'root')).trim() || 'root';
         var body = { host: host, port: port, user: user };
+        var pinning = !!(opts.pin || opts.retrust);
         var path = '/replication/remotes/test'
             + (opts.retrust ? '?retrust=true' : (opts.pin ? '?pin=true' : ''));
+        if (pinning) {
+            if (!opts.fingerprint) {
+                // No shown fingerprint to bind the job to — the daemon would
+                // refuse with 400 anyway; say it in the result area instead.
+                renderTestStage(win, node, { stage: 'unreachable',
+                    detail: t('No fingerprint was shown to confirm — run Test connection again first.') });
+                return;
+            }
+            body.fingerprint = opts.fingerprint;
+        }
         setTestBusy(win);
         ANAS.api.post(node, path, body).then(function (res) {
             if (win.destroyed || win.destroying) {
                 return;
             }
-            renderTestStage(win, node, (res && res.data) || {});
+            if (!pinning) {
+                renderTestStage(win, node, (res && res.data) || {});
+                return;
+            }
+            var job = res && res.job;
+            if (!job || !job.id) {
+                renderTestStage(win, node, { stage: 'unreachable',
+                    detail: t('The trust request did not return a job to follow.') });
+                return;
+            }
+            ANAS.pollJob(node, job.id, {
+                view: win,
+                what: t('Host key trust'),
+                // The result area carries the outcome inline — no modal on top.
+                alerts: false,
+                onComplete: function (j) {
+                    renderTestStage(win, node, (j && j.result) || {});
+                },
+                onFailed: function (j) {
+                    // STATE_CHANGED (or a job lost to a daemon restart): put the
+                    // fingerprints back with the job's own sentence. Nothing is
+                    // treated as usable — renderTestStage keeps _tested false.
+                    var last = win._lastTestStage || {};
+                    var stage = (last.stage === 'hostkey-changed' || last.stage === 'hostkey-unknown')
+                        ? last.stage : 'unreachable';
+                    renderTestStage(win, node, {
+                        stage: stage,
+                        fingerprint: last.fingerprint,
+                        knownFingerprint: last.knownFingerprint,
+                        detail: (j && j.error && j.error.message)
+                            || t('The trust request could not be followed to its end.'),
+                    });
+                },
+            });
         }, function (err) {
             if (win.destroyed || win.destroying) {
                 return;
@@ -2145,15 +2232,43 @@
 
     // ---- Run Now -----------------------------------------------------------
 
+    // cr.64b2-ii: the run door answers its job like every other mutation —
+    // poll it, and the grid reloads at the run's END (the last-run column reads
+    // the outcome), not at its acceptance.
     function runTask(node, grid, rec) {
         if (!rec) {
             return;
         }
         var name = rec.get('name');
         ANAS.api.post(node, '/replication/tasks/' + encodeURIComponent(name) + '/run', {}).then(
-            function () {
-                ANAS.toast(t('Replication started') + ': ' + name);
-                loadTasks(grid, node);
+            function (res) {
+                var job = res && res.job;
+                if (!job || !job.id) {
+                    // An older daemon's { started: true } — the old behaviour.
+                    ANAS.toast(t('Replication started') + ': ' + name);
+                    loadTasks(grid, node);
+                    return;
+                }
+                ANAS.pollJob(node, job.id, {
+                    view: grid,
+                    what: t('Replication'),
+                    // The toast/alert below carry the task's name — no modal
+                    // from pollJob on top of them.
+                    alerts: false,
+                    onComplete: function () {
+                        ANAS.toast(t('Replication finished') + ': ' + name);
+                        loadTasks(grid, node);
+                    },
+                    // Failed OR lost: the job's own sentence, then the reload —
+                    // one handler covers both (pollJob calls onFailed(null)
+                    // for lost when there is no onLost).
+                    onFailed: function (j) {
+                        ANAS.alertMsg('Run failed', t('Replication run failed') + ': '
+                            + ((j && j.error && j.error.message)
+                                || t('the job was lost before it finished.')));
+                        loadTasks(grid, node);
+                    },
+                });
             },
             function (err) {
                 ANAS.warn('replication run failed: ' + ANAS.errText(err));

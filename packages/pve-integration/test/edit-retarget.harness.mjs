@@ -17,7 +17,10 @@
  *   • a schedule's stored KIND survives an inventory that came back empty (the
  *     AHR branch now reads exactly like the ZFS one — parallel construction);
  *   • a deliberate retarget still works, and declares itself with ?retarget=true;
- *   • CREATE is unchanged: it still defaults to the first available pool.
+ *   • CREATE is unchanged: it still defaults to the first available pool;
+ *   • the remote wizard's staged host-key test, and cr.64b2-ii's pin/retrust
+ *     JOB: the shown fingerprint rides the POST body, the 202 job's result (or
+ *     its STATE_CHANGED failure) is what the panel renders.
  *
  *   node packages/pve-integration/test/edit-retarget.harness.mjs
  *
@@ -50,6 +53,10 @@ const state = {
   confirmAnswer: 'yes',
   /** Paths whose promise is held open until release() is called. */
   hold: null,
+  /** Every ANAS.pollJob a flow started: { jobId, opts } (cr.64b2-ii pin jobs). */
+  polls: [],
+  /** The job the fake pollJob hands to onComplete/onFailed (null = no poll). */
+  job: null,
 }
 
 function reset() {
@@ -61,6 +68,8 @@ function reset() {
   state.confirms = []
   state.confirmAnswer = 'yes'
   state.hold = null
+  state.polls = []
+  state.job = null
 }
 
 // ---- ExtJS stub -------------------------------------------------------------
@@ -250,7 +259,18 @@ function loadUi() {
     alertMsg: (title, msg) => state.alerts.push({ title, msg }),
     errorPanel: m => ({ html: m }),
     tbar: items => ({ xtype: 'toolbar', items }), // real 00-core.js helper
-    pollJob: () => Promise.resolve({}),
+    // cr.64b2-ii: pin/retrust became a 202 job the panel polls. The REAL
+    // pollJob reaches the daemon through 10-api.js's internal fetch-based api
+    // (not the ANAS.api stub overridden here), so this harness fakes it the way
+    // poll-job.harness.mjs fakes /jobs/:id — record the poll, answer from
+    // state.job, and drive the same onComplete/onFailed contract.
+    pollJob(node, jobId, opts) {
+      state.polls.push({ jobId, opts })
+      const job = typeof state.job === 'function' ? state.job() : state.job
+      if (!job) { return }
+      if (job.status === 'completed' && opts.onComplete) { opts.onComplete(job) }
+      else if (job.status === 'failed' && opts.onFailed) { opts.onFailed(job) }
+    },
     gfx: { ready: () => false },
     sched: { absTime: v => String(v || ''), fsTag: kind => `[${kind}] ` },
     notifyMode: {
@@ -646,13 +666,17 @@ async function openRemotes() {
 }
 
 // --- 13. A changed host key shows BOTH fingerprints and offers re-trust ---------
+// cr.64b2-ii wire: the confirmed re-trust POSTs ?retrust=true WITH the shown
+// fingerprint in the body, gets 202 { job }, and the panel polls that job —
+// its RESULT is the stage object the old synchronous answer used to be.
 {
   reset()
   state.get = { '/replication/remotes': REGISTRY }
   state.post = {
     '/replication/remotes/test': { data: { stage: 'hostkey-changed', knownFingerprint: OLD_FP, fingerprint: NEW_FP, detail: 'Host key verification failed.' } },
-    '/replication/remotes/test?retrust=true': { data: { stage: 'ok', fingerprint: NEW_FP, zfsVersion: 'zfs-2.2.3' } },
+    '/replication/remotes/test?retrust=true': { job: { id: 'j1' } },
   }
+  state.job = { id: 'j1', status: 'completed', result: { stage: 'ok', fingerprint: NEW_FP, zfsVersion: 'zfs-2.2.3' } }
   const mgr = await openRemotes()
   click(mgr, 'anas-btn-remote-add')
   const wizard = lastWindow
@@ -678,8 +702,13 @@ async function openRemotes() {
   ok('and repeats both fingerprints in the question',
     question.includes(OLD_FP) && question.includes(NEW_FP), question)
   await settle()
-  eq('the confirmed re-trust is the only request that asks to replace',
-    state.posts.filter(p => /retrust=true/.test(p.path)).length, 1)
+  const retrustPosts = state.posts.filter(p => /retrust=true/.test(p.path))
+  eq('the confirmed re-trust is the only request that asks to replace', retrustPosts.length, 1)
+  eq('and it carries the SHOWN fingerprint in the body',
+    (retrustPosts[0] || {}).body && retrustPosts[0].body.fingerprint, NEW_FP)
+  eq('the panel polls the job the door named', state.polls.map(p => p.jobId).join(','), 'j1')
+  await settle()
+  ok('the job result renders as ok — the connection is usable', wizard._tested === true)
 
   // ...and the newly pinned key rides along when the remote is saved, so the
   // Host key column stops saying "not pinned".
@@ -687,6 +716,47 @@ async function openRemotes() {
   eq('the save went out', state.requests.length, 1)
   const saved = state.requests[0] || { body: { remote: {} } }
   eq('carrying the pinned fingerprint', saved.body.remote.hostKeyFingerprint, NEW_FP)
+}
+
+// --- 13b. cr.64b2-ii: a re-trust job that FAILS STATE_CHANGED shows both keys ----
+// The host stopped presenting the key the operator confirmed. The job refuses
+// with both fingerprints in its error; the panel puts them back on screen with
+// that sentence, keeps the connection untrusted, and a save sends no fingerprint.
+{
+  reset()
+  state.get = { '/replication/remotes': REGISTRY }
+  state.post = {
+    '/replication/remotes/test': { data: { stage: 'hostkey-changed', knownFingerprint: OLD_FP, fingerprint: NEW_FP } },
+    '/replication/remotes/test?retrust=true': { job: { id: 'j2' } },
+  }
+  state.job = {
+    id: 'j2',
+    status: 'failed',
+    error: { code: 'STATE_CHANGED', message: `Host '10.0.0.9' presents ${NEW_FP}, not the confirmed fingerprint ${OLD_FP} — known_hosts untouched` },
+  }
+  const mgr = await openRemotes()
+  click(mgr, 'anas-btn-remote-add')
+  const wizard = lastWindow
+  wizard.down('#name').setValue('nas1')
+  wizard.down('#host').setValue('10.0.0.9')
+  click(wizard, 'anas-btn-remote-testconn')
+  await settle()
+  click(wizard.down('#testResult'), 'anas-btn-remote-retrust')
+  await settle()
+  const retrustPosts = state.posts.filter(p => /retrust=true/.test(p.path))
+  eq('the re-trust POST carries the shown fingerprint',
+    (retrustPosts[0] || {}).body && retrustPosts[0].body.fingerprint, NEW_FP)
+  eq('the panel polls the job', state.polls.map(p => p.jobId).join(','), 'j2')
+  const shown = wizard.down('#testResult')._children.map(c => c.html || '').join('')
+  ok('the pinned fingerprint is shown again', shown.includes(OLD_FP), shown)
+  ok('so is the one the host presents', shown.includes(NEW_FP), shown)
+  ok('the job\'s own sentence is on screen', /not the confirmed fingerprint/.test(shown), shown)
+  ok('the connection is still not treated as usable', wizard._tested !== true)
+  click(wizard, 'anas-btn-remote-save')
+  eq('the save went out', state.requests.length, 1)
+  const saved = state.requests[0] || { body: { remote: {} } }
+  ok('no save sends a fingerprint after a failed pin',
+    !('hostKeyFingerprint' in saved.body.remote), JSON.stringify(saved.body.remote))
 }
 
 // --- 14. A declined re-trust replaces nothing ----------------------------------
