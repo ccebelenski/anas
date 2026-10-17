@@ -98,7 +98,7 @@ export function createServer(opts: ServerOptions = {}) {
       })
     }
 
-    const missing = missingPrivilege(result.user, request.method)
+    const missing = missingPrivilege(result.user, request.method, path)
     if (missing !== undefined) {
       request.log.warn(`[authz] forbidden: ${result.user.name} ${request.method} ${path} lacks ${missing} on /`)
       return reply.code(403).send({

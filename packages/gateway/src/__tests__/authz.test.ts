@@ -186,6 +186,35 @@ describe('the one rule: GET/HEAD → Sys.Audit, everything else → Sys.Modify',
       assert.equal(requiredPrivilege(m), 'Sys.Modify', m)
   })
 
+  // cr.67 (operator ruling 2026-10-17): the one exception to the method rule —
+  // a POST whose daemon-side path is EXACTLY a shared READ_JOB_ROUTES entry.
+  // The match is on the raw path (cr.62's rule): trailing slashes, percent-
+  // encodings, longer names and dot segments are not the exception.
+  it('cr.67: POST on an exact read-job path (or a shaped cancel) is Sys.Audit; near-misses are Sys.Modify', () => {
+    const G = '/api/nodes/testnode/v1'
+    for (const p of ['/cloud/tasks/preview', '/cloud/remotes/test', '/backup/restore/browse']) {
+      assert.equal(requiredPrivilege('POST', `${G}${p}`), 'Sys.Audit', p)
+      assert.equal(requiredPrivilege('GET', `${G}${p}`), 'Sys.Audit', `GET ${p}`)
+      for (const m of ['PUT', 'DELETE'])
+        assert.equal(requiredPrivilege(m, `${G}${p}`), 'Sys.Modify', `${m} ${p}`)
+      assert.equal(requiredPrivilege('POST', `${G}${p}/`), 'Sys.Modify', `trailing slash on ${p}`)
+      assert.equal(requiredPrivilege('POST', `${G}${p}%2F..`), 'Sys.Modify', `%2F.. on ${p}`)
+    }
+    assert.equal(requiredPrivilege('POST', `${G}/cloud/remotes/test2`), 'Sys.Modify', 'a longer name is not the path')
+
+    // The cancel door: shape-matched, the id segment validated by the job-id
+    // rule (a UUID) — never a bare wildcard.
+    const ID = '550e8400-e29b-41d4-a716-446655440000'
+    assert.equal(requiredPrivilege('POST', `${G}/jobs/${ID}/cancel`), 'Sys.Audit')
+    for (const bad of ['not-a-uuid', '..', '550e8400-e29b-41d4-a716-44665544000', `${ID}%2Fx`, `${ID}/x`, ''])
+      assert.equal(requiredPrivilege('POST', `${G}/jobs/${bad}/cancel`), 'Sys.Modify', `malformed id segment '${bad}'`)
+
+    // A `..` segment is a literal path segment of the raw line: not normalised,
+    // so it is not one of the exception paths — Sys.Modify; the gateway would
+    // forward it verbatim and the daemon's router would match nothing.
+    assert.equal(requiredPrivilege('POST', `${G}/../v1/cloud/tasks/preview`), 'Sys.Modify')
+  })
+
   it('the 403 sentence names the path, the privilege and the user', () => {
     assert.equal(
       forbiddenMessage('alice@pve', 'Sys.Modify'),
@@ -360,6 +389,59 @@ describe('the gateway with the pve provider (end to end)', () => {
       assert.deepEqual(logs, [`[authz] forbidden: anas-audit@pve ${method} ${SCRUB} lacks Sys.Modify on /`])
     }
     assert.equal(received.length, 0)
+    await s.close()
+  })
+
+  // cr.67 (operator ruling 2026-10-17): the read-job doors and a cancel go
+  // through for a Sys.Audit-only user; everything merely shaped like them
+  // keeps row 11 (403 naming Sys.Modify, nothing reaches the daemon).
+  it('cr.67: a reader POSTs the three read doors and a cancel through; near-misses 403 Sys.Modify', async () => {
+    const s = gateway()
+    const ID = '11111111-2222-4333-8444-555555555555'
+    const PASS = [
+      '/api/nodes/testnode/v1/cloud/tasks/preview',
+      '/api/nodes/testnode/v1/cloud/remotes/test',
+      '/api/nodes/testnode/v1/backup/restore/browse',
+      `/api/nodes/testnode/v1/jobs/${ID}/cancel`,
+    ]
+    for (const url of PASS) {
+      const res = await s.inject({ method: 'POST', url, headers: { 'x-anas-auth': sign('anas-audit@pve', ['Sys.Audit'], 'POST', url) } })
+      assert.equal(res.statusCode, 200, url)
+    }
+    assert.deepEqual(received.map(r => r.method), PASS.map(() => 'POST'))
+
+    const MISS = [
+      '/api/nodes/testnode/v1/cloud/tasks/preview/',
+      '/api/nodes/testnode/v1/cloud/remotes/test%2F..',
+      '/api/nodes/testnode/v1/cloud/remotes/test2',
+      '/api/nodes/testnode/v1/jobs/not-a-uuid/cancel',
+      // `…/v1/../v1/cloud/tasks/preview` is pinned at the policy level, not
+      // here: inject's URL parser normalises the dot segment away before the
+      // hook sees the line (a header signed for the raw `..` path would fail
+      // the MAC), so through this transport the case cannot arrive intact.
+      // Node's real HTTP parser keeps the raw line as sent, and the policy
+      // rule for it (requiredPrivilege, test above) is Sys.Modify — never
+      // normalised into the exception, forwarded verbatim for the daemon's
+      // router to miss.
+    ]
+    for (const url of MISS) {
+      const res = await s.inject({ method: 'POST', url, headers: { 'x-anas-auth': sign('anas-audit@pve', ['Sys.Audit'], 'POST', url) } })
+      assert.equal(res.statusCode, 403, url)
+      assert.match(res.json().error.message, /^Permission check failed \(\/, Sys\.Modify\): anas-audit@pve does not have it\./, url)
+    }
+    assert.equal(received.length, PASS.length, 'the near-misses reached nothing')
+
+    // The exception is POST-shaped only: a GET of an exception path stays the
+    // read it always was, a PUT/DELETE of it needs Sys.Modify.
+    for (const url of [PASS[0]!, PASS[3]!]) {
+      const res = await s.inject({ method: 'GET', url, headers: { 'x-anas-auth': sign('anas-audit@pve', ['Sys.Audit'], 'GET', url) } })
+      assert.equal(res.statusCode, 200, `GET ${url}`)
+      for (const m of ['PUT', 'DELETE'] as const) {
+        const r = await s.inject({ method: m, url, headers: { 'x-anas-auth': sign('anas-audit@pve', ['Sys.Audit'], m, url) } })
+        assert.equal(r.statusCode, 403, `${m} ${url}`)
+        assert.match(r.json().error.message, /Sys\.Modify/, `${m} ${url}`)
+      }
+    }
     await s.close()
   })
 

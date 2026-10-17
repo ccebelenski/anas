@@ -364,17 +364,17 @@ index lists `GET /v1/iscsi/targets/:iqn/luns/:lun`, which no route registers (al
 | `POST` | `/v1/backup/tasks/:name/prune-preview` | Sys.Modify | `backup.ts:1382` | reads (PBS dry run with the stored secret) |
 | `GET` | `/v1/backup/tasks/:name/snapshots` | Sys.Audit | `backup.ts:1522` | outbound: PBS listing with the stored repo secret |
 | `GET` | `/v1/backup/repos/:name/groups` | Sys.Audit | `backup.ts:1568` | outbound: PBS listing with the stored repo secret |
-| `POST` | `/v1/backup/restore/browse` | Sys.Modify | `backup.ts:1611` | reads backup CONTENT (file names inside a PBS snapshot) |
+| `POST` | `/v1/backup/restore/browse` | Sys.Audit | `backup.ts:1872` | read job (operator ruling 2026-10-17) — reads backup CONTENT (file names inside a PBS snapshot) |
 | `POST` | `/v1/backup/restore` | Sys.Modify | `backup.ts:1643` |  |
 | `GET` | `/v1/cloud/providers` | Sys.Audit | `cloud.ts:315` |  |
 | `GET` | `/v1/cloud/remotes` | Sys.Audit | `cloud.ts:323` |  |
 | `POST` | `/v1/cloud/remotes` | Sys.Modify | `cloud.ts:340` |  |
 | `PUT` | `/v1/cloud/remotes/:name` | Sys.Modify | `cloud.ts:390` |  |
 | `DELETE` | `/v1/cloud/remotes/:name` | Sys.Modify | `cloud.ts:485` |  |
-| `POST` | `/v1/cloud/remotes/test` | Sys.Modify | `cloud.ts:543` | diagnosis; runs rclone with caller-supplied or stored secrets |
+| `POST` | `/v1/cloud/remotes/test` | Sys.Audit | `cloud.ts:672` | read job (operator ruling 2026-10-17) — diagnosis; runs rclone with caller-supplied or stored secrets |
 | `GET` | `/v1/cloud/tasks` | Sys.Audit | `cloud.ts:667` |  |
 | `POST` | `/v1/cloud/tasks` | Sys.Modify | `cloud.ts:698` |  |
-| `POST` | `/v1/cloud/tasks/preview` | Sys.Modify | `cloud.ts:736` | rclone dry run against the remote (outbound, stored secrets) |
+| `POST` | `/v1/cloud/tasks/preview` | Sys.Audit | `cloud.ts:963` | read job (operator ruling 2026-10-17) — rclone dry run against the remote (outbound, stored secrets) |
 | `GET` | `/v1/cloud/tasks/:name` | Sys.Audit | `cloud.ts:803` |  |
 | `PUT` | `/v1/cloud/tasks/:name` | Sys.Modify | `cloud.ts:852` |  |
 | `DELETE` | `/v1/cloud/tasks/:name` | Sys.Modify | `cloud.ts:893` |  |
@@ -407,7 +407,7 @@ index lists `GET /v1/iscsi/targets/:iqn/luns/:lun`, which no route registers (al
 | `GET` | `/v1/iscsi/targets/:iqn` | Sys.Audit | `iscsi.ts:85` |  |
 | `GET` | `/v1/jobs` | Sys.Audit | `jobs.ts:62` | every user's jobs, with createdBy |
 | `GET` | `/v1/jobs/:id` | Sys.Audit | `jobs.ts:84` |  |
-| `POST` | `/v1/jobs/:id/cancel` | Sys.Modify | `jobs.ts:116` | confirm-gated control job |
+| `POST` | `/v1/jobs/:id/cancel` | Sys.Audit | `jobs.ts:131` | read job (operator ruling 2026-10-17): the gateway admits the cancel on `Sys.Audit` (`id` matched by the job-id rule) — the daemon's `jobs/authority.ts` decides, so a cancel of a non-read job still answers 403 naming Sys.Modify; confirm-gated control job |
 | `GET` | `/v1/mounts` | Sys.Audit | `mounts.ts:190` |  |
 | `GET` | `/v1/mounts/:mountpoint` | Sys.Audit | `mounts.ts:207` |  |
 | `POST` | `/v1/mounts` | Sys.Modify | `mounts.ts:220` |  |
@@ -515,6 +515,7 @@ them as ANAS answers (`proxy.ts:54-89`).
 | 14 | daemon | mutation with a non-JSON `Content-Type`, or a body without one | 415 `UNSUPPORTED_MEDIA_TYPE` naming the type | method, path, type |
 | 15 | UI | 403 on the install probe (`/v1/health`) | a panel "You need Sys.Audit on / to view ANAS on this node" — **not** the not-installed panel (today any probe failure renders "ANAS is not installed", `20-notinstalled.js:177-183`) | console warn |
 | 16 | UI | 403 on a mutation | the refusal sentence in the alert; no retry | — |
+| 17 | gateway | an Audit-only user POSTs a route NOT on the shared read-job exception list (cr.67) — the exact-match rule's near-misses included (`…test/`, `…test%2F..`, `…test2`, a cancel with a malformed id) | 403 `FORBIDDEN` naming `Sys.Modify` (unchanged from row 11) | user, method, path, missing privilege |
 
 `FORBIDDEN` and `UNSUPPORTED_MEDIA_TYPE` join the shared `ErrorCode` enum (`shared/schemas/api.ts:13`).
 

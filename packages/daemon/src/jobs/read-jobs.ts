@@ -26,7 +26,12 @@ import { assertRunNotCancelled, ChildCancel } from './child-cancel.js'
  */
 export const READ_JOB_PREFIX = 'read.'
 
-/** The read-only jobs, one constant each — the routes submit these names. */
+/**
+ * The read-only jobs, one constant each — the routes submit these names.
+ * The gateway's POST exception for these routes is the @anas/shared
+ * `READ_JOB_ROUTES` list (cr.67); `__tests__/read-job-routes.test.ts` pins
+ * the two against each other.
+ */
 export const READ_JOB_OPERATIONS = Object.freeze({
   /** POST /v1/cloud/tasks/preview — the rclone dry run. */
   cloudPreview: 'read.cloud.preview',

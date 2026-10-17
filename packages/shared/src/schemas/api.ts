@@ -151,6 +151,43 @@ export function forbiddenMessage(user: string, privilege: Privilege): string {
     + 'ANAS asks the privilege PVE asks for its own disk and ZFS operations.'
 }
 
+/**
+ * The gateway's only exceptions to the method rule (cr.67, operator ruling
+ * 2026-10-17, EPICS §2 "Authorization follows PVE"): the POSTs that start one
+ * of the jobs that only READ (cr.48, the daemon's `jobs/read-jobs.ts`) need
+ * `Sys.Audit`, not `Sys.Modify`. Paths are exactly as the daemon registers
+ * them, behind its `/v1`; the gateway's match is EXACT on the raw request
+ * line (cr.62's rule): no query, no trailing slash, nothing percent-decoded
+ * (`%2F` stays `%2F`), and a path that only LOOKS like one of these after
+ * decoding or normalising (`…/test2`, `…/test/`, `…/test%2F..`, a `..`
+ * segment) is not the exception.
+ *
+ * A cancel is listed by shape because the gateway cannot know a job's
+ * operation: the cancel of ANY job whose id is a single job-id segment (the
+ * job-id rule — `z.string().uuid()`, the shape `Job.id` uses in
+ * schemas/jobs.ts) is admitted on `Sys.Audit`, and the daemon's
+ * `jobs/authority.ts` stays the authority for the cancel — cancelling a
+ * non-read job still answers 403 naming `Sys.Modify` from the daemon, which
+ * no gateway-side rule could know. A daemon test
+ * (`jobs/__tests__/read-job-routes.test.ts`) pins that every
+ * `READ_JOB_OPERATIONS` route is registered at one of these paths and every
+ * non-cancel entry here is a registered read-job route, so the two lists
+ * cannot drift.
+ */
+export const READ_JOB_ROUTES = Object.freeze({
+  /** Exact daemon paths (after `/v1`) that start a read job. */
+  exact: Object.freeze([
+    '/cloud/tasks/preview',
+    '/cloud/remotes/test',
+    '/backup/restore/browse',
+  ] as const),
+  /** `POST /v1/jobs/<job id>/cancel` — id matched, never a bare `*`. */
+  cancel: Object.freeze({
+    prefix: '/jobs/',
+    suffix: '/cancel',
+  } as const),
+})
+
 // --- Request identity headers (anas → anasd) ---
 
 /**
