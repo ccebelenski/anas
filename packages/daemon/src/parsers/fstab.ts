@@ -266,7 +266,8 @@ export function addMountOption(text: string, mountpoint: string, token: string):
 
 /**
  * Does the line for `mountpoint` carry an automount — a LIVE
- * `x-systemd.automount` or a PARKED `x-anas.disabled-automount` (cr.19)? Read
+ * `x-systemd.automount` (or its legacy `comment=systemd.automount` spelling,
+ * cr.70) or a PARKED `x-anas.disabled-automount[=comment]` (cr.19)? Read
  * from the raw option tokens, not the structured entry, so a parked token on a
  * line whose disable token a hand edit removed still counts: the routes use
  * this to decide whether the line's `.automount` unit may be armed and must be
