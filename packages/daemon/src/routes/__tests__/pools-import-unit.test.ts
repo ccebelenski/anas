@@ -28,14 +28,19 @@ const OK: ExecResult = { stdout: '', stderr: '', exitCode: 0 }
 
 /**
  * cr.52r D4: the import job reads the imported pool's stored mountpoints with
- * `zfs get -H -r -o name,value mountpoint <pool>` — a safe effective
- * mountpoint (`/tank`, under `/mnt`, not `/mnt/pve`) lets the import proceed.
+ * `zfs get -H -r -o name,property,value mountpoint,canmount <pool>` (cr.52s-b
+ * (5)) — a safe effective mountpoint (`/tank`, under `/mnt`, not `/mnt/pve`)
+ * lets the import proceed; its dataset's `canmount` row rides the same read.
  */
 function zfsStoredMountpoints(pool: string): { command: string, args: string[], result: ExecResult } {
   return {
     command: ZFS,
-    args: ['get', '-H', '-r', '-o', 'name,value', 'mountpoint', '--', pool],
-    result: { stdout: `${pool}\t/mnt/anas-${pool}\n`, stderr: '', exitCode: 0 },
+    args: ['get', '-H', '-r', '-o', 'name,property,value', 'mountpoint,canmount', '--', pool],
+    result: {
+      stdout: `${pool}\tmountpoint\t/mnt/anas-${pool}\n${pool}\tcanmount\ton\n`,
+      stderr: '',
+      exitCode: 0,
+    },
   }
 }
 
@@ -81,6 +86,11 @@ async function waitForJob(jobQueue: JobQueue, id: string): Promise<Job> {
 /** The systemctl argv issued for a pool's boot-import unit, if any. */
 function unitCall(ex: MockExecutor, pool: string): string[] | undefined {
   return ex.calls.find(c => c.command === SYSTEMCTL && c.args[1] === `zfs-import@${pool}.service`)?.args
+}
+
+/** Every zpool argv this executor saw, in order. */
+function importZpoolCalls(ex: MockExecutor): string[][] {
+  return ex.calls.filter(c => c.command === ZPOOL).map(c => c.args)
 }
 
 describe('boot-import unit: create enables zfs-import@<pool>.service (issue #22)', () => {
@@ -316,5 +326,242 @@ describe('boot-import unit: destroy disables the unit', () => {
     assert.match(res.json().error.message, /boot filesystem \(rpool\/ROOT\/pve-1\)/)
     assert.equal(res.headers['x-anas-confirm-code'], undefined, 'a hard refusal never offers a confirm code')
     assert.equal(ex.calls.filter(c => c.command === SYSTEMCTL).length, 0)
+  })
+})
+
+/**
+ * cr.52s-b (5): the import gate skips datasets whose `canmount` is `off` — such
+ * a dataset never mounts at import, so its stored mountpoint (however dangerous)
+ * is not a path ZFS will take. `canmount` rides the SAME `zfs get` as
+ * `mountpoint` (`-o name,property,value` over `mountpoint,canmount`, one row per
+ * property per dataset), so the read stays a single call.
+ */
+describe('cr.52s-b (5): the import gate and canmount=off', () => {
+  let server: ReturnType<typeof Fastify> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  async function importPool(ex: MockExecutor, body: Record<string, unknown>): Promise<Job> {
+    const built = await build(ex)
+    server = built.server
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify(body),
+    })
+    assert.equal(res.statusCode, 202, res.payload)
+    return waitForJob(built.jobQueue, (res.json() as { job: { id: string } }).job.id)
+  }
+
+  /** The `zfs get` answer: the pool root safe, `oldtank/etc` at `/etc` with the given canmount. */
+  function etcDataset(canmount: string): { command: string, args: string[], result: ExecResult } {
+    return {
+      command: ZFS,
+      args: ['get', '-H', '-r', '-o', 'name,property,value', 'mountpoint,canmount', '--', 'oldtank'],
+      result: {
+        stdout: 'oldtank\tmountpoint\t/mnt/anas-oldtank\noldtank\tcanmount\ton\n'
+          + `oldtank/etc\tmountpoint\t/etc\noldtank/etc\tcanmount\t${canmount}\n`,
+        stderr: '',
+        exitCode: 0,
+      },
+    }
+  }
+
+  it('a canmount=off dataset whose stored mountpoint is /etc lets the import proceed — the full pinned argv runs', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: ZPOOL, args: ['list', '-j'], results: [listResult(), listResult('oldtank')] })
+    ex.addFixture(etcDataset('off'))
+    ex.addFixture({ command: ZPOOL, result: OK })
+    ex.addFixture({ command: SYSTEMCTL, result: OK })
+
+    const job = await importPool(ex, { name: 'oldtank' })
+
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    // The whole sequence: the -N gate import, the checked export, the mounted
+    // re-import — the pool's own mountpoint (/mnt/anas-oldtank) is safe and the
+    // /etc dataset is skipped, so nothing refuses.
+    assert.deepEqual(
+      ex.calls.filter(c => c.command === ZPOOL && c.args[0] === 'import' && c.args.length > 1).map(c => c.args),
+      [['import', '-N', '--', 'oldtank'], ['import', '--', 'oldtank']],
+    )
+    assert.deepEqual(ex.calls.filter(c => c.command === ZPOOL && c.args[0] === 'export').map(c => c.args), [['export', 'oldtank']])
+  })
+
+  it('the same dataset with canmount=on still refuses at /etc — canmount rides the read, the skip is only off', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: ZPOOL, args: ['list', '-j'], results: [listResult(), listResult('oldtank')] })
+    ex.addFixture(etcDataset('on'))
+    ex.addFixture({ command: ZPOOL, result: OK })
+
+    const job = await importPool(ex, { name: 'oldtank' })
+
+    assert.equal(job.status, 'failed', JSON.stringify(job.error))
+    assert.match(job.error!.message, /stored mountpoints land on a protected or system path/)
+    assert.match(job.error!.message, /'\/etc' /)
+    // The refusal exported the pool again; the mounted re-import NEVER ran.
+    assert.deepEqual(ex.calls.filter(c => c.command === ZPOOL && c.args[0] === 'export').map(c => c.args), [['export', 'oldtank']])
+    assert.ok(!ex.calls.some(c => c.command === ZPOOL && c.args[0] === 'import' && !c.args.includes('-N')), 'the mounted import never ran')
+  })
+})
+
+/**
+ * cr.52s-b (1): the pool the import gates (and, on a refusal, exports again)
+ * is ONLY the pool this job imported — never "everything the second listing
+ * names that the first did not". A by-name import knows its pool (the request);
+ * a by-guid import takes the name the post-import listing gives it, with the
+ * cr.64b2-i scan's predicted name as the fallback.
+ */
+describe('cr.52s-b (1): the gated/exported set is the imported pool only', () => {
+  let server: ReturnType<typeof Fastify> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  async function importPool(ex: MockExecutor, body: Record<string, unknown>): Promise<Job> {
+    const built = await build(ex)
+    server = built.server
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify(body),
+    })
+    assert.equal(res.statusCode, 202, res.payload)
+    return waitForJob(built.jobQueue, (res.json() as { job: { id: string } }).job.id)
+  }
+
+  it('a refusal after `-N` exports ONLY the imported pool — a second pool present in BOTH listings is never touched', async () => {
+    const ex = new MockExecutor()
+    // testpool is imported before AND after; only oldtank appears across the
+    // import. The pre-cr.52s-b diff (`after - before`) reads the same, but the
+    // gate/export set is now the REQUESTED pool, so testpool can never be
+    // exported by an oldtank import.
+    ex.addFixture({ command: ZPOOL, args: ['list', '-j'], results: [listResult('testpool'), listResult('testpool', 'oldtank')] })
+    ex.addFixture({
+      command: ZFS,
+      args: ['get', '-H', '-r', '-o', 'name,property,value', 'mountpoint,canmount', '--', 'oldtank'],
+      result: { stdout: 'oldtank\tmountpoint\t/mnt/pve/oldtank\noldtank\tcanmount\ton\n', stderr: '', exitCode: 0 },
+    })
+    ex.addFixture({ command: ZPOOL, result: OK })
+
+    const job = await importPool(ex, { name: 'oldtank' })
+
+    assert.equal(job.status, 'failed', JSON.stringify(job.error))
+    assert.match(job.error!.message, /stored mountpoints land on a protected or system path/)
+    assert.deepEqual(importZpoolCalls(ex).filter(c => c[0] === 'export'), [['export', 'oldtank']])
+    assert.ok(!importZpoolCalls(ex).some(c => c[0] === 'export' && c[1] === 'testpool'), 'the pre-existing pool is never exported')
+    assert.ok(!importZpoolCalls(ex).some(c => c[0] === 'import' && c.includes('oldtank') && !c.includes('-N')), 'the mounted import never ran')
+  })
+})
+
+/**
+ * cr.52s-b (2): the `zpool export` that undoes a refused `-N` import CHECKS
+ * its exit. The pre-cr.52r code swallowed it (`.catch(() => {})` on an exec
+ * that resolves with an exit code) and the job still said the pool was
+ * "exported again" — it stayed imported-unmounted. A failed export now fails
+ * the job with the export's stderr, that the pool is STILL imported, at which
+ * mountpoint it would mount, and what to run.
+ */
+describe('cr.52s-b (2): the undo export after a refusal checks its exit', () => {
+  let server: ReturnType<typeof Fastify> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  it('a failed export after a refusal fails the job with its stderr and the STILL-imported sentence — no mounted import', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: ZPOOL, args: ['list', '-j'], results: [listResult('testpool'), listResult('testpool', 'oldtank')] })
+    ex.addFixture({
+      command: ZFS,
+      args: ['get', '-H', '-r', '-o', 'name,property,value', 'mountpoint,canmount', '--', 'oldtank'],
+      result: { stdout: 'oldtank\tmountpoint\t/mnt/pve/oldtank\noldtank\tcanmount\ton\n', stderr: '', exitCode: 0 },
+    })
+    // The export's stderr is the captured busy-export shape — iscsi/error-texts.txt
+    // §10's `cannot unmount '<dataset mountpoint>': pool or dataset is busy`
+    // (a real `zpool export gtiscsi` failure captured on the stunt node) with the
+    // pool's refused mountpoint in place of the capture's `/gtiscsi/images`.
+    ex.addFixture({ command: ZPOOL, args: ['export', 'oldtank'], result: { stdout: '', stderr: 'cannot unmount \'/mnt/pve/oldtank\': pool or dataset is busy', exitCode: 1 } })
+    ex.addFixture({ command: ZPOOL, result: OK })
+
+    const built = await build(ex)
+    server = built.server
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'oldtank' }),
+    })
+    assert.equal(res.statusCode, 202, res.payload)
+    const job = await waitForJob(built.jobQueue, (res.json() as { job: { id: string } }).job.id)
+
+    assert.equal(job.status, 'failed', JSON.stringify(job.error))
+    const message = job.error!.message
+    // The export's own stderr is pasted.
+    assert.match(message, /could not export 'oldtank': cannot unmount '\/mnt\/pve\/oldtank': pool or dataset is busy/)
+    // The pool is STILL imported — never the old "exported again" sentence.
+    assert.match(message, /STILL IMPORTED/)
+    assert.match(message, /with -N it was imported unmounted/)
+    assert.match(message, /would mount at '\/mnt\/pve\/oldtank'/)
+    assert.match(message, /run `zpool export oldtank` once nothing holds it and retry/)
+    assert.doesNotMatch(message, /exported again/)
+    // No second import — the mounted re-import never ran.
+    assert.ok(!importZpoolCalls(ex).some(c => c[0] === 'import' && c.includes('oldtank') && !c.includes('-N')), 'the mounted import never ran')
+  })
+})
+
+/**
+ * cr.52s-b (4): a failed `zfs get` after the `-N` import exports the pool
+ * again (CHECKED, item 2) and refuses naming the read — the op is never left
+ * half-imported (the pool was imported unmounted and stayed that way before).
+ */
+describe('cr.52s-b (4): a failed `zfs get` after `-N` exports and refuses', () => {
+  let server: ReturnType<typeof Fastify> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  it('zfs get exit 1 → the pool is exported again (checked) and the job refuses naming the read — no mounted import', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: ZPOOL, args: ['list', '-j'], results: [listResult('testpool'), listResult('testpool', 'oldtank')] })
+    // The failing `zfs get` stderr is the captured zfs shape
+    // (iscsi/zfs-list-t-volume-absent.stderr.txt: `cannot open '<dataset>':
+    // dataset does not exist`, exit 1) re-pointed at the pool under test.
+    ex.addFixture({
+      command: ZFS,
+      args: ['get', '-H', '-r', '-o', 'name,property,value', 'mountpoint,canmount', '--', 'oldtank'],
+      result: { stdout: '', stderr: 'cannot open \'oldtank\': dataset does not exist', exitCode: 1 },
+    })
+    ex.addFixture({ command: ZPOOL, result: OK })
+
+    const built = await build(ex)
+    server = built.server
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'oldtank' }),
+    })
+    assert.equal(res.statusCode, 202, res.payload)
+    const job = await waitForJob(built.jobQueue, (res.json() as { job: { id: string } }).job.id)
+
+    assert.equal(job.status, 'failed', JSON.stringify(job.error))
+    const message = job.error!.message
+    assert.match(message, /could not read the stored mountpoints of 'oldtank' before mounting it/)
+    assert.match(message, /cannot open 'oldtank': dataset does not exist/)
+    assert.match(message, /was exported again, so nothing was left half-imported/)
+    // The export ran and was CHECKED (it succeeded here).
+    assert.deepEqual(importZpoolCalls(ex).filter(c => c[0] === 'export'), [['export', 'oldtank']])
+    // No mounted re-import ever ran.
+    assert.ok(!importZpoolCalls(ex).some(c => c[0] === 'import' && c.includes('oldtank') && !c.includes('-N')), 'the mounted import never ran')
   })
 })

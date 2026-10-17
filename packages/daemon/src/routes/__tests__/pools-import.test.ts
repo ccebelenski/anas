@@ -5,6 +5,7 @@ import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
+import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
 import { serveBlankInventoryDisks } from './inventory-stub.js'
 
@@ -233,6 +234,34 @@ describe('import pool endpoint: /v1/pools/import', () => {
     assert.equal(importCall(calls), undefined, 'no zpool command ever ran')
   })
 
+  it('a failing first `zpool list` refuses the import JOB 503 UNAVAILABLE naming the read — nothing imported (cr.52s-b (1))', async () => {
+    server = createServer({ mock: true, logger: false })
+    // The pinned cr.64b2-i failure line (`zpool: cannot read configuration:
+    // access denied`, exit 127) is exactly what `zpool list` prints when the
+    // config cannot be read — it refuses the by-guid SCAN door there and the
+    // import's own BEFORE listing here. The listing happens inside the job (the
+    // guarded body), so the refusal is the JOB's, before the `-N` import runs.
+    const executor = (server as unknown as { executor: MockExecutor }).executor
+    executor.prependFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: { stdout: '', stderr: 'zpool: cannot read configuration: access denied', exitCode: 127 } })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/import',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'oldtank' }),
+    })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    assert.equal(job.error!.code, 'UNAVAILABLE')
+    assert.match(job.error!.message, /the currently imported pools could not be listed for the import of 'oldtank'/)
+    assert.match(job.error!.message, /zpool: cannot read configuration: access denied/)
+    // Nothing imported — the -N gate import never ran.
+    assert.equal(importCall(calls), undefined, 'no zpool import with a target ever ran')
+  })
+
   it('a stored mountpoint on a protected path fails the job AFTER `-N` and BEFORE any mount, exporting the pool again (cr.52r D4)', async () => {
     server = createServer({ mock: true, logger: false })
     // The imported pool's own stored mountpoint — knowable only once imported —
@@ -240,8 +269,9 @@ describe('import pool endpoint: /v1/pools/import', () => {
     // gates against.
     ;(server as unknown as { executor: { addFixture: (f: object) => void } }).executor.addFixture({
       command: '/usr/sbin/zfs',
-      args: ['get', '-H', '-r', '-o', 'name,value', 'mountpoint', '--', 'oldtank'],
-      result: { stdout: 'oldtank\t/mnt/pve/oldtank\n', stderr: '', exitCode: 0 },
+      // cr.52s-b (5): `canmount` rides the same read — a row per property.
+      args: ['get', '-H', '-r', '-o', 'name,property,value', 'mountpoint,canmount', '--', 'oldtank'],
+      result: { stdout: 'oldtank\tmountpoint\t/mnt/pve/oldtank\noldtank\tcanmount\ton\n', stderr: '', exitCode: 0 },
     })
     const calls = spyExecutor(server)
 
@@ -399,6 +429,35 @@ describe('cr.64b2-i — the by-guid import\'s name key', () => {
     await waitForJob(server, importId)
     const created = await waitForJob(server, createId)
     assert.equal(created.status, 'completed', `the create ran once the import's name key was released: ${JSON.stringify(created.error)}`)
+  })
+
+  it('a by-guid import whose post-`-N` listing cannot be read exports (checked) and refuses UNAVAILABLE naming the read — no mounted import without a gate read (cr.52s-b (3))', async () => {
+    server = createServer({ mock: true, logger: false })
+    const executor = (server as unknown as { executor: MockExecutor }).executor
+    // The BEFORE listing reads the dev-mock captured zpool-list.json (testpool);
+    // the AFTER listing fails with the pinned cr.64b2-i "cannot read
+    // configuration" line. The by-guid import has no req.name to fall back to:
+    // the exported pool is the name the `zpool import` scan predicted (oldtank).
+    executor.prependFixture({
+      command: '/usr/sbin/zpool',
+      args: ['list', '-j'],
+      results: [mockFixtures.zpoolList(), { stdout: '', stderr: 'zpool: cannot read configuration: access denied', exitCode: 127 }],
+    })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({ method: 'POST', url: '/v1/pools/import', headers: JSON_HEADERS, payload: JSON.stringify({ guid: '9876543210987654321' }) })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    assert.equal(job.error!.code, 'UNAVAILABLE')
+    assert.match(job.error!.message, /could not be listed after importing by guid 9876543210987654321/)
+    assert.match(job.error!.message, /zpool: cannot read configuration: access denied/)
+    // The imported-unmounted pool was exported again — the CHECKED undo ran.
+    assert.deepEqual(zpoolCalls(calls).filter(c => c[0] === 'export'), [['export', 'oldtank']])
+    // Only the -N gate import ever ran; the mounted re-import NEVER did.
+    assert.deepEqual(importCall(calls), ['import', '-N', '--', '9876543210987654321'])
+    assert.ok(!zpoolCalls(calls).some(c => c[0] === 'import' && c.includes('oldtank') && !c.includes('-N')), 'no mounted import of oldtank')
   })
 
   it('an unreadable import scan refuses the by-guid import 503 UNAVAILABLE — no job, no zpool import', async () => {

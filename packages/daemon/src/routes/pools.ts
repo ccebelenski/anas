@@ -2308,45 +2308,118 @@ export async function poolRoutes(
     const job = jobQueue.submit(
       'zpool.import',
       { ...identity, params: { target, force: req.force ?? false } },
-      guarded(spec, pre, async () => {
+      guarded(spec, pre, async (_object, ctx) => {
         // cr.52r D4: the import is done as `zpool import -N` FIRST (import, no
         // mount); the pool's STORED mountpoints are read with
-        // `zfs get -H -r -o name,value mountpoint <pool>` (the value is already
-        // altroot-prefixed by the `-R`), and every dataset whose effective
-        // mountpoint the refusal refuses FAILS the job BEFORE any dataset is
-        // mounted — the pool is exported again so nothing is left half-imported.
-        // This argv sequence is pinned by the cr.52r tests.
-        const before = await listPoolNames()
+        // `zfs get -H -r -o name,property,value mountpoint,canmount <pool>`
+        // (the value is already altroot-prefixed by the `-R`), and every
+        // dataset whose effective mountpoint the refusal refuses FAILS the job
+        // BEFORE any dataset is mounted — the pool is exported again so nothing
+        // is left half-imported. This argv sequence is pinned by the cr.52r
+        // tests.
+        // cr.52s-b (1): a `zpool list` the job cannot read before the `-N`
+        // import refuses the job 503 UNAVAILABLE naming the read and nothing is
+        // imported — never "no pools" (a failed BEFORE listing would turn
+        // `after - before` into every pool the second listing names, and a
+        // refusal would then export them all — cr.52r defect 1).
+        const before = await importListedNames(`the currently imported pools could not be listed for the import of '${target}'`)
 
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {
           throw new Error(result.stderr.trim() || `zpool import exited with code ${result.exitCode}`)
         }
 
-        const after = await listPoolNames()
-        const imported = after.filter(name => !before.includes(name))
-        const pools = imported.length > 0 ? imported : (req.name ? [req.name] : [])
+        // The ONLY pool this job imported — by name the request's pool (a
+        // `zpool import <name>` imports exactly it); by guid the name the
+        // post-import listing gives, falling back to the name the cr.64b2-i
+        // scan predicted for the guid. Never "everything the second listing
+        // names that the first did not" (cr.52r defect 1).
+        let pools: string[]
+        if (req.name) {
+          pools = [req.name]
+        }
+        else {
+          let after: string[]
+          try {
+            after = await importListedNames(`the imported pools could not be listed after importing by guid ${target}`)
+          }
+          catch (readFailed) {
+            // cr.52s-b (3): an import by GUID whose post-import listing cannot
+            // be read fails CLOSED — there is no `zpool import` (the real one)
+            // without a gate read. The imported-unmounted pool is exported
+            // again (CHECKED, item 2) so the op is never left half-done, then
+            // the read's refusal is the job's. The name to export is the one the
+            // `zpool import` scan the job door read predicted the guid would
+            // carry; a guid the scan named nothing for has no name to export,
+            // and the refusal says the state the node is in.
+            const scan = await poolReads.importScan(ctx.reads)
+            const scanName = parseImportScan(scan.stdout).find(p => p.guid === target)?.name
+            if (!scanName) {
+              throw new Error(`${(readFailed as Error).message}. The pool imported by guid ${target} could not be exported because a name to export could not be read (the import scan listed no pool for the guid) — it is still imported unmounted; run \`zpool list\`, find the pool, and export it manually`)
+            }
+            await exportImportedAgain(scanName, [])
+            throw readFailed
+          }
+          const imported = after.filter(name => !before.includes(name))
+          // The guid's name is only knowable once the pool is imported; the
+          // `zpool import` scan the job door read (cr.64b2-i) names exactly it,
+          // and the diff answers when the scan named nothing.
+          const scan = await poolReads.importScan(ctx.reads)
+          const scanName = parseImportScan(scan.stdout).find(p => p.guid === target)?.name
+          pools = scanName ? [scanName] : imported
+        }
 
         // Gate every dataset's effective mountpoint BEFORE any mount — the
         // refusal (D1/D2) and the swap-stage ancestor-perm check (D3's ZFS
-        // half) both apply, because ZFS itself will mount these.
+        // half) both apply, because ZFS itself will mount these. cr.52s-b (5):
+        // `canmount` rides the SAME `zfs get` — one read, `-o
+        // name,property,value` over `mountpoint,canmount` (a row per property
+        // per dataset), and a dataset whose `canmount` is `off` is SKIPPED: it
+        // never mounts at import, so its stored mountpoint (however dangerous)
+        // is not a path ZFS will take.
         const refused: string[] = []
+        const refusedMountpoints: string[] = []
         for (const pool of pools) {
-          const z = await executor.exec('/usr/sbin/zfs', ['get', '-H', '-r', '-o', 'name,value', 'mountpoint', '--', pool])
-          if (z.exitCode !== 0)
-            throw new Error(`could not read the stored mountpoints of '${pool}' before mounting it (zfs get: ${z.stderr.trim() || `exit ${z.exitCode}`}) — the pool is imported unmounted; export and re-import after checking it`)
+          const z = await executor.exec(ZFS, ['get', '-H', '-r', '-o', 'name,property,value', 'mountpoint,canmount', '--', pool])
+          if (z.exitCode !== 0) {
+            // cr.52s-b (4): a failed `zfs get` after the `-N` import exports the
+            // pool again (CHECKED, item 2) and refuses naming the read — the op
+            // is never left half-imported.
+            await exportImportedAgain(pool, [])
+            throw new Error(`could not read the stored mountpoints of '${pool}' before mounting it (zfs get: ${z.stderr.trim() || `exit ${z.exitCode}`}) — the pool was exported again, so nothing was left half-imported; fix the reason the read failed and retry`)
+          }
+          const datasets = new Map<string, { mountpoint: string, canmount: string }>()
           for (const line of z.stdout.split('\n')) {
-            const value = line.split('\t').pop()?.trim() ?? ''
+            const [name, property, value] = line.split('\t')
+            if (!name || (property !== 'mountpoint' && property !== 'canmount'))
+              continue
+            const row = datasets.get(name) ?? { mountpoint: '', canmount: '' }
+            if (property === 'mountpoint')
+              row.mountpoint = value?.trim() ?? ''
+            else
+              row.canmount = value?.trim() ?? ''
+            datasets.set(name, row)
+          }
+          for (const [, row] of datasets) {
+            if (row.canmount === 'off')
+              continue
+            const value = row.mountpoint
             if (value === '' || value === 'none' || value === 'legacy' || value === '-')
               continue
             const refusal = (await mountTargetRefusal(value)) ?? (await swapStageRefusal(value))
-            if (refusal)
+            if (refusal) {
               refused.push(`'${value}' ${refusal.message}`)
+              refusedMountpoints.push(value)
+            }
           }
         }
         if (refused.length > 0) {
+          // cr.52s-b (2): the undo export CHECKS its exit — a failed export
+          // fails the job with the export's stderr, that the pool is STILL
+          // imported (with -N, unmounted), at which mountpoint it would mount,
+          // and what to run — never "exported again".
           for (const pool of pools)
-            await executor.exec('/usr/sbin/zpool', ['export', pool]).catch(() => {})
+            await exportImportedAgain(pool, refusedMountpoints)
           throw new Error(`Import refused — the pool's stored mountpoints land on a protected or system path: ${refused.join('; ')}. `
             + `The pool was imported unmounted (-N) and exported again, so nothing was mounted and nothing was left half-imported. `
             + `Set a safe mountpoint on the pool while it is imported with \`-R\` (or fix the parent perms) and retry`)
@@ -2388,11 +2461,42 @@ export async function poolRoutes(
     return { job }
   })
 
-  /** Names of the currently imported pools ([] when the listing fails). */
-  async function listPoolNames(): Promise<string[]> {
-    const listResult = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
-    const pools = listResult.exitCode === 0 ? parseZpoolList(listResult.stdout) : []
-    return pools.map(p => p.name)
+  /**
+   * The names of the currently imported pools — the read behind the import's
+   * before/after listing. A listing that could not be seen NEVER answers "no
+   * pools": it refuses 503 UNAVAILABLE naming the `zpool list` read
+   * (cr.52s-b (1)(3)) — "nothing there" from a failed BEFORE listing would
+   * turn `after - before` into every pool the second listing names and a
+   * refusal would then export them all (cr.52r defect 1).
+   */
+  async function importListedNames(what: string): Promise<string[]> {
+    const listResult = await executor.exec(ZPOOL, ['list', '-j'])
+    if (listResult.exitCode !== 0) {
+      throw new GuardRefusalError({
+        status: 503,
+        code: 'UNAVAILABLE',
+        message: `${what} (zpool list: ${listResult.stderr.trim() || `exit ${listResult.exitCode}`})`,
+      })
+    }
+    return parseZpoolList(listResult.stdout).map(p => p.name)
+  }
+
+  /**
+   * The CHECKED undo of an import the gate refused (cr.52s-b (2)): the pool the
+   * job left imported-unmounted (`-N`) is exported again, and an export that
+   * exits non-zero FAILS the job with the export's stderr and a sentence that
+   * says the pool is STILL imported (with `-N`, unmounted), at which mountpoint
+   * it would mount, and what to run — never the old "exported again". `mounts`
+   * are the refused stored mountpoints the gate just read; a pool whose
+   * mountpoints were never read (the ZFS get failed too) names none, and the
+   * sentence says the state it is in.
+   */
+  async function exportImportedAgain(pool: string, mounts: readonly string[]): Promise<void> {
+    const e = await executor.exec(ZPOOL, ['export', pool])
+    if (e.exitCode === 0)
+      return
+    const at = mounts.length > 0 ? ` and would mount at ${mounts.map(m => `'${m}'`).join(' and ')}` : ''
+    throw new Error(`could not export '${pool}': ${e.stderr.trim() || `exit ${e.exitCode}`}. The pool is STILL IMPORTED (with -N it was imported unmounted${at}); run \`zpool export ${pool}\` once nothing holds it and retry`)
   }
 
   // Add a vdev to an existing pool (stories 3.11, 3.21, 3.22). Expands the pool
