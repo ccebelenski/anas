@@ -1114,6 +1114,88 @@ password = mock-obscured
         })
       })
 
+      // cr.64b2-ii step 4 — the NON-retarget update path (no destination
+      // change, no confirm) re-gates the same identity in its job: the route
+      // binds name + remoteSectionIdentity, `guarded` re-reads and compares
+      // before writeRemote, which compares once more under the per-file lock.
+      describe('cr.64b2-ii step 4: the plain update job re-gates the remote identity too', () => {
+        const s3 = (secret: string, over: Partial<Record<'type' | 'provider', string>> = {}): string =>
+          `${[
+            '[s3a]',
+            `type = ${over.type ?? 's3'}`,
+            `provider = ${over.provider ?? 'Minio'}`,
+            'access_key_id = AKIAEXAMPLE',
+            `secret_access_key = ${secret}`,
+            'endpoint = http://10.0.0.5:9000',
+          ].join('\n')}\n`
+        const putS3 = async (options: Record<string, string>) => app.inject({
+          method: 'PUT',
+          url: '/v1/cloud/remotes/s3a',
+          headers: JSON_HEADERS,
+          payload: JSON.stringify({ options }),
+        })
+        async function finished(id: string): Promise<Job> {
+          for (let i = 0; i < 400; i++) {
+            const job = bareQueue.get(id)
+            if (job && (job.status === 'completed' || job.status === 'failed'))
+              return job
+            await new Promise(resolve => setTimeout(resolve, 5))
+          }
+          throw new Error('job did not finish')
+        }
+        function holdTheQueue(): () => void {
+          let release!: () => void
+          const held = new Promise<void>((resolve) => {
+            release = resolve
+          })
+          bareQueue.submit('test.hold', { user: 'test', uid: 0 }, () => held)
+          return release
+        }
+
+        it('an options-only update with the section UNCHANGED completes and writes (the expectSection the plain path now carries)', async () => {
+          await bare()
+          await writeFile(bareFile, s3('minioadmin'), 'utf-8')
+          const accepted = await putS3({ upload_concurrency: '4' })
+          assert.equal(accepted.statusCode, 202, accepted.payload)
+          assert.equal((accepted.json() as JobAccepted).job.operation, 'cloud.remote.update')
+          const job = await finished((accepted.json() as JobAccepted).job.id)
+          assert.equal(job.status, 'completed', JSON.stringify(job.error))
+          assert.ok((await readFile(bareFile, 'utf-8')).includes('upload_concurrency = 4'))
+        })
+
+        it('a remote RE-CREATED (type changed) while the plain job waits fails IDENTITY_MISMATCH at the job\'s turn — no write', async () => {
+          await bare({ concurrency: 1 })
+          await writeFile(bareFile, s3('minioadmin'), 'utf-8')
+          const release = holdTheQueue()
+          const accepted = await putS3({ upload_concurrency: '4' })
+          assert.equal(accepted.statusCode, 202, accepted.payload)
+          // Same name, re-created as another type while the job waits.
+          const recreated = s3('minioadmin', { type: 'sftp' })
+          await writeFile(bareFile, recreated, 'utf-8')
+          release()
+          const job = await finished((accepted.json() as JobAccepted).job.id)
+          assert.equal(job.status, 'failed')
+          assert.equal(job.error!.code, 'IDENTITY_MISMATCH')
+          const text = await readFile(bareFile, 'utf-8')
+          assert.equal(text, recreated, 'the re-created remote is untouched — no upload_concurrency landed on it')
+          assert.equal(text.includes('upload_concurrency'), false)
+        })
+
+        it('the section DELETED while the plain job waits is IDENTITY_MISMATCH too — no write, no re-create', async () => {
+          await bare({ concurrency: 1 })
+          await writeFile(bareFile, `${s3('minioadmin')}\n${GT_SECTION}`, 'utf-8')
+          const release = holdTheQueue()
+          const accepted = await putS3({ upload_concurrency: '4' })
+          assert.equal(accepted.statusCode, 202, accepted.payload)
+          await writeFile(bareFile, GT_SECTION, 'utf-8')
+          release()
+          const job = await finished((accepted.json() as JobAccepted).job.id)
+          assert.equal(job.status, 'failed')
+          assert.equal(job.error!.code, 'IDENTITY_MISMATCH')
+          assert.equal(await readFile(bareFile, 'utf-8'), GT_SECTION, 'the deleted remote was not written back into existence')
+        })
+      })
+
       it('a task reaching the remote THROUGH a wrapper is named, with the wrapper', async () => {
         await bare({ referencingTasks: async name => (name === 'gtcrypt' ? ['offsite'] : []) })
         await writeFile(bareFile, `${GT_SECTION}

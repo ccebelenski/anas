@@ -771,3 +771,142 @@ describe('snapshotFirst ownership — the in-job re-check (review fixes 1 + 4)',
     assert.match(sent[0].body, /is PVE-owned/)
   })
 })
+
+// ============================================================================
+// cr.64b2-ii step 5 — the target guard runs again at the JOB's turn, and a
+// LOCAL target holds the `zfs:` claim §4.2 lists for a replication target.
+// The receive WRITES the target dataset, so the claim is EXCLUSIVE (the
+// table's write-side entry is "clone target"); a remote target takes none
+// (that test lives in replication-remote-target.test.ts, where the ssh
+// harness already exists).
+// ============================================================================
+
+describe('cr.64b2-ii step 5 — the target guard at the job\'s turn, the local target claim', () => {
+  let server: ReturnType<typeof createServer> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  /**
+   * The pool guid — the exact line the dev server's mock already pins
+   * (server.ts, story ident.1), so the claim key is the guid, not the name.
+   */
+  const TESTPOOL_GUID = '5823146802312415237'
+
+  /** A storage.cfg pointing ANAS_STORAGE_CFG at a temp file (null = absent). */
+  async function storageCfg(text: string | null): Promise<{ cfg: string, restore: () => Promise<void> }> {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-repl-step5-'))
+    const prev = process.env.ANAS_STORAGE_CFG
+    const cfg = join(dir, 'storage.cfg')
+    if (text !== null)
+      await writeFile(cfg, text, 'utf8')
+    process.env.ANAS_STORAGE_CFG = text === null ? join(dir, 'absent-storage.cfg') : cfg
+    return {
+      cfg,
+      restore: async () => {
+        if (prev === undefined)
+          delete process.env.ANAS_STORAGE_CFG
+        else
+          process.env.ANAS_STORAGE_CFG = prev
+        await rm(dir, { recursive: true, force: true })
+      },
+    }
+  }
+
+  /** A run that completes: source testpool/share1, target pool testpool2. */
+  function armRun(): MockExecutor {
+    const mock = mockOf(server!)
+    mock.clearFixtures()
+    mock.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool', 'testpool2']), stderr: '', exitCode: 0 } })
+    // The target dataset is ABSENT (a full send creates it — a present target
+    // with no common snapshot would read as diverged).
+    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
+    // The guid — the dev mock's own pinned line (server.ts, ident.1).
+    mock.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', 'testpool'], result: { stdout: `${TESTPOOL_GUID}\n`, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '--', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+    return mock
+  }
+
+  async function runShare1(target: Record<string, unknown>): Promise<{ id: string, status: number }> {
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/share1/replicate',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ target }),
+    })
+    return { id: (res.json() as JobAccepted).job?.id ?? '', status: res.statusCode }
+  }
+
+  it('a LOCAL target holds its zfs: dataset key EXCLUSIVE for the run (queue state)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = armRun()
+    const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+    // Park the job on the dry-run exec (a live child that ignores signals),
+    // read the lock table while it runs, then release it.
+    mock.prependFixture({ command: ZFS, args: ['send', '-nvP', '--', 'testpool/share1@repl-base'], live: { signalsToExit: Number.POSITIVE_INFINITY }, result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
+
+    // Same pool, a sibling dataset — the guid-keyed claim, not the fallback.
+    const { id } = await runShare1({ pool: 'testpool', dataset: 'backup' })
+    for (let i = 0; i < 50 && queue.get(id)?.status !== 'running'; i++)
+      await new Promise(r => setTimeout(r, 10))
+    assert.equal(queue.get(id)?.status, 'running', 'the run job never started')
+
+    const held = queue.heldLocks()
+    // The target: its dataset key, EXCLUSIVE (the recv writes it).
+    assert.ok(held.some(h => h.key === `zfs:${TESTPOOL_GUID}/backup` && h.mode === 'exclusive' && h.holders.includes(id)), `target key missing from ${JSON.stringify(held)}`)
+    // The source: shared, as cr.33b had it.
+    assert.ok(held.some(h => h.key === `zfs:${TESTPOOL_GUID}/share1` && h.mode === 'shared' && h.holders.includes(id)), `source key missing from ${JSON.stringify(held)}`)
+
+    // Release only once the dry-run child is actually live (the call is
+    // recorded in the same tick the child registers).
+    for (let i = 0; i < 50 && !mock.calls.some(c => c.command === ZFS && c.args[0] === 'send' && c.args[1] === '-nvP'); i++)
+      await new Promise(r => setTimeout(r, 10))
+    mock.finishLive({ stdout: FULL_DRYRUN, stderr: '', exitCode: 0 })
+    const done = await waitForJob(server, id)
+    assert.equal(done.status, 'completed', JSON.stringify(done.error))
+  })
+
+  it('a target that moves under PVE between the route and the job → the job refuses, no zfs send ever runs', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = armRun()
+    // The route's world: storage.cfg absent (the pvepool.1 fail-open posture),
+    // so the target guard passes and the run is accepted.
+    const { cfg, restore } = await storageCfg(null)
+    try {
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      let release!: () => void
+      const held = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      for (let i = 0; i < 4; i++)
+        queue.submit('test.hold', { user: 'root@pam', uid: 0 }, () => held)
+
+      const { id, status } = await runShare1({ pool: 'testpool2' })
+      assert.equal(status, 202)
+      assert.equal(queue.get(id)?.status, 'queued', 'the run waits behind the held slots')
+
+      // PVE claims the TARGET dataset while the job waits (the pvepool.1
+      // timer-recheck pattern: write the cfg, THEN point the env at it).
+      await writeFile(cfg, 'zfspool: local-zfs\n\tpool testpool2/share1\n\tcontent images,rootdir\n\n', 'utf8')
+      process.env.ANAS_STORAGE_CFG = cfg
+      release()
+
+      const done = await waitForJob(server, id)
+      assert.equal(done.status, 'failed', JSON.stringify(done))
+      assert.equal(done.error?.code, 'STATE_CHANGED', JSON.stringify(done.error))
+      assert.match(done.error?.message ?? '', /Replication target 'testpool2\/share1' is PVE-owned/)
+      // Nothing was sent: no pipeline, and no `zfs send` argv at all.
+      assert.equal(mock.pipelineCalls.length, 0, JSON.stringify(mock.pipelineCalls))
+      assert.ok(!mock.calls.some(c => c.command === ZFS && c.args[0] === 'send'), 'a zfs send ran anyway')
+    }
+    finally {
+      await restore()
+    }
+  })
+})

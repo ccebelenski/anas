@@ -342,12 +342,16 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     const runId = (res.json() as JobAccepted).job.id
     const job = await race(runId, 'zfs.replicate', ROLLBACK, pveClaimsMedia)
     // The claims the run held (pinned after the race, so a run that holds none fails on the race itself).
+    // cr.64b2-ii step 5: the LOCAL target rides too — its dataset key EXCLUSIVE
+    // (the recv writes it) beside its ancestor, the guid and name keys shared.
     const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[] }> }).jobs.get(runId)!
     assert.deepEqual(record.claims.map(c => `${c.key} ${c.mode}`), [
       `zfs:${TESTPOOL_GUID}/media shared`,
       `zfs:${TESTPOOL_GUID} shared`,
       `zpool:${TESTPOOL_GUID} shared`,
       'zname:testpool shared',
+      `zfs:${TESTPOOL_GUID}/replica/media exclusive`,
+      `zfs:${TESTPOOL_GUID}/replica shared`,
     ])
     assertRefusedByPve(job, ROLLBACK)
   })
@@ -567,12 +571,16 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     const runId = (res.json() as JobAccepted).job.id
     const job = await race(runId, 'zfs.replicate', RENAME_SNAP1, pveClaimsMedia)
     // The claims the run held (pinned after the race, so a run that holds none fails on the race itself).
+    // cr.64b2-ii step 5: the LOCAL target rides too — its dataset key EXCLUSIVE
+    // (the recv writes it) beside its ancestor, the guid and name keys shared.
     const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[] }> }).jobs.get(runId)!
     assert.deepEqual(record.claims.map(c => `${c.key} ${c.mode}`), [
       `zfs:${TESTPOOL_GUID}/media shared`,
       `zfs:${TESTPOOL_GUID} shared`,
       `zpool:${TESTPOOL_GUID} shared`,
       'zname:testpool shared',
+      `zfs:${TESTPOOL_GUID}/replica/media exclusive`,
+      `zfs:${TESTPOOL_GUID}/replica shared`,
     ])
     assertRefusedByPve(job, RENAME_SNAP1)
   })

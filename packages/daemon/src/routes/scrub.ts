@@ -2,11 +2,16 @@ import type { AhrPool, LastScrub, PeriodicScrubState, ScrubRunning } from '@anas
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
-import { AhrScrubToggleRequest, PoolName, ScrubToggleRequest } from '@anas/shared'
+import type { Gate, GuardSpec } from '../safety/guard.js'
+import { AhrScrubToggleRequest, PoolName, pveStoragePath, ScrubToggleRequest } from '@anas/shared'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseScrubScans } from '../parsers/zpool-status.js'
+import { ahrPoolClaims, guardCheck, guarded, poolClaims, sendRefusal } from '../safety/guard.js'
+import { readPoolGuid } from '../safety/stable-id.js'
+import { poolArrayUuids } from '../services/ahr-guard.js'
 import { AhrTopologyUnreadableError, readAhrPools } from '../services/ahr-topology.js'
+import { loadPveFootprint } from '../services/pve-footprint.js'
 import { ForeignUnitError, scrubUnitsAreForeign } from '../services/scrub-schedule-units.js'
 import {
   ahrScrubRunning,
@@ -66,7 +71,11 @@ class ZfsPoolListUnreadableError extends Error {
  * screen are a second door to `POST /v1/pools/:name/scrub` and
  * `POST /v1/ahr/:name/scrub`.
  *
- * Toggles are jobs (Principle 4). ANAS deliberately does NOT touch the (disabled)
+ * Toggles are jobs (Principle 4), and since cr.64b2-ii guard doors: the pool
+ * as the live list names it now, bound to its guid / array+VG identity, the
+ * PVE-territory gate, the pool's shared keys (§4.2), and the same checks
+ * re-run by the job at its turn (the toggles used to take no lock, no PVE
+ * gate and no job re-read — L22). ANAS deliberately does NOT touch the (disabled)
  * systemd `zfs-scrub-*@.timer` for ZFS, so the property remains the single lever
  * and there is no double-scrub (GT-4). The AHR toggle edits the node-level
  * timer's embedded schedule (selfheal.4) — its `note` stays honest about an
@@ -138,6 +147,91 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
     }
   }
 
+  /**
+   * The PVE-territory gate (cr.64b2-ii, WAVE3-DESIGN §4.2): a pool PVE
+   * manages answers 409 PVE_MANAGED, no confirm bypass — the one answer every
+   * pool-level verb gives ("PVE territory is read-only and hands-off"). Built
+   * LOCALLY here from the same fact source (`loadPveFootprint`, the one
+   * ownership answer, memoised per guard run) as the pool verbs' own gate;
+   * pools.ts is another story's file, so the twin lives here and quotes the
+   * footprint directly. The verdict tightening on an unreadable storage.cfg is
+   * the footprint's own rule (missing facts may only tighten).
+   */
+  function pveManagedGate(pool: string): Gate<{ name: string }> {
+    return async (_object, reads) => {
+      const pve = await reads.once('pve-footprint', () => loadPveFootprint(executor))
+      const storagePaths = (pve.storagesByPool.get(pool) ?? [])
+        .map(ref => pveStoragePath(ref, pool))
+        .filter((path): path is string => path !== undefined)
+      const owned = pve.ownershipOf(pool) ?? pve.ownedDescendant(storagePaths, pool)?.ownership ?? null
+      if (!owned)
+        return null
+      return {
+        status: 409,
+        code: 'PVE_MANAGED',
+        reason: 'pve-managed',
+        message: `Pool '${pool}' is PVE territory: ${owned.reason}. Running the periodic scrub of a pool PVE uses is left to PVE. This refusal has no confirm bypass.`,
+      }
+    }
+  }
+
+  /**
+   * The ZFS toggle as a guard door (cr.64b2-ii, review L22 — it used to take
+   * no lock, no PVE gate and no job re-read): the object is the pool the LIVE
+   * `zpool list` names now, bound to its guid (an export/re-create under the
+   * same name is a different pool), the PVE gate at both doors, and the job
+   * holds `zpool:<guid>` + `zname:<pool>` SHARED (§4.2 — a property set
+   * changes nothing about the pool's shape, and cr.36's pool scrub verb takes
+   * the same shared key). `zpool list` that cannot read throws from the
+   * object's own read and the route answers its 503, exactly as the doors
+   * already did before the guard (cr.64c).
+   */
+  function zfsScrubToggleSpec(pool: string): GuardSpec<{ name: string }> {
+    const guid = async (reads: Parameters<Gate<{ name: string }>>[1]) =>
+      reads.once(`pool-guid:${pool}`, () => readPoolGuid(executor, pool))
+    return {
+      operation: 'scrub.zfs.toggle',
+      object: {
+        what: `ZFS pool '${pool}'`,
+        read: async () => (await zfsPoolNames()).includes(pool) ? { name: pool } : null,
+        id: async (_o, reads) => await guid(reads),
+        revision: async (_o, reads) => (await guid(reads))?.guid ?? null,
+        notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `ZFS pool '${pool}' not found` }),
+        unbound: () => `Could not read the guid of pool '${pool}' — refusing a periodic-scrub toggle that cannot be bound to it`,
+      },
+      gates: [pveManagedGate(pool)],
+      locks: async (_o, bound) => poolClaims(pool, bound.id.guid, 'shared'),
+    }
+  }
+
+  /**
+   * The AHR toggle as a guard door (cr.64b2-ii): the object is the AHR pool AS
+   * THE TOPOLOGY NAMES IT NOW, bound to the identity routes/ahr*.ts bind to
+   * (the band array UUIDs + the VG UUID, the ahr-guard poolView's own answer),
+   * the PVE gate at both doors, and the job holds `ahr:<vg uuid>` +
+   * `ahrname:<pool>` SHARED (§4.2 — the toggle edits the node timer's pool
+   * list; it never reshapes the pool). An unreadable topology throws from the
+   * object's read → the route's 503 (cr.63 L15, unchanged).
+   */
+  function ahrScrubToggleSpec(pool: string): GuardSpec<AhrPool> {
+    return {
+      operation: 'scrub.ahr.toggle',
+      object: {
+        what: `AHR pool '${pool}'`,
+        read: async () => (await ahrPools()).find(p => p.name === pool) ?? null,
+        id: async p => ({
+          arrays: poolArrayUuids(p).join(','),
+          ...(p.vg.uuid ? { vgUuid: p.vg.uuid } : {}),
+        }),
+        revision: async p => [poolArrayUuids(p).join(','), p.vg.uuid ?? ''].join('/'),
+        notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `AHR pool '${pool}' not found` }),
+        unbound: () => `Could not read the identity of AHR pool '${pool}' — refusing a periodic-scrub toggle that cannot be bound to it`,
+      },
+      gates: [pveManagedGate(pool)],
+      locks: async (p, bound) => ahrPoolClaims(pool, bound.id.vgUuid ?? p.vg.uuid ?? null, 'shared'),
+    }
+  }
+
   // --- GET /scrub — uniform periodic-scrub state across ZFS + AHR pools ------
   server.get('/scrub', async (_request, reply) => {
     let ahr: AhrPool[]
@@ -202,27 +296,30 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
     if (!identity)
       return
 
-    let zfsNames: string[]
+    // cr.64b2-ii (L22): the guard door — object as the live list names it
+    // now (404 gone, 503 unreadable), the PVE gate, the shared pool keys, and
+    // the SAME checks re-run by the job at its turn before the `zfs set`.
+    const spec = zfsScrubToggleSpec(pool)
+    let pre
     try {
-      zfsNames = await zfsPoolNames()
+      pre = await guardCheck(spec)
     }
     catch (err) {
       if (err instanceof ZfsPoolListUnreadableError)
         return zfsUnreadable(reply, err)
       throw err
     }
-    if (!zfsNames.includes(pool)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `ZFS pool '${pool}' not found` } }
-    }
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     const job = jobQueue.submit(
       'scrub.zfs.toggle',
       { ...identity, params: { pool, enabled: String(enabled) } },
-      async () => {
+      guarded(spec, pre, async () => {
         await setZfsScrubEnabled(executor, pool, enabled)
         return { pool, periodicScrub: enabled }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }
@@ -247,19 +344,21 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
     if (!identity)
       return
 
-    let ahr: AhrPool[]
+    // cr.64b2-ii (L22): the guard door (see ahrScrubToggleSpec) — 404 gone,
+    // 503 unreadable topology, the PVE gate, the shared ahr keys; the job
+    // re-gates the identity at its turn before touching any unit.
+    const spec = ahrScrubToggleSpec(pool)
+    let pre
     try {
-      ahr = await ahrPools()
+      pre = await guardCheck(spec)
     }
     catch (err) {
       if (err instanceof AhrTopologyUnreadableError)
         return ahrUnreadable(reply, err)
       throw err
     }
-    if (!ahr.some(p => p.name === pool)) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `AHR pool '${pool}' not found` } }
-    }
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
 
     // A unit file on ANAS's fixed anas-scrub names WITHOUT our marker is not
     // ours to rewrite (enable) or delete (disable) — refuse at the door, 409,
@@ -278,7 +377,7 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
     const job = jobQueue.submit(
       'scrub.ahr.toggle',
       { ...identity, params: { pool, enabled: String(enabled), ...(cadence ? { cadence } : {}) } },
-      async () => {
+      guarded(spec, pre, async () => {
         // Node-level: edits the ONE anas-scrub timer's pool list; enabling also
         // takes mdcheck over (disable) — ANAS owns md checks on this node.
         try {
@@ -297,7 +396,8 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
           )
         }
         return { pool, periodicScrub: enabled, ...(cadence ? { cadence } : {}), scope: 'node-level' }
-      },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
     return { job }

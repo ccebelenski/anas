@@ -121,6 +121,21 @@ function mockOf(server: ReturnType<typeof createServer>): MockExecutor {
   return (server as unknown as { executor: MockExecutor }).executor
 }
 
+function jobQueueOf(server: ReturnType<typeof createServer>): JobQueue {
+  return (server as unknown as { jobQueue: JobQueue }).jobQueue
+}
+
+/** The ZFS toggle's guid binding reads (cr.64b2-ii) — the mock pins them exactly. */
+const TANK_GUID = '17389218961908081526'
+const RPOOL_GUID = '2305843009213693951'
+function guidFixture(pool: string, guid: string) {
+  return {
+    command: ZPOOL,
+    args: ['get', '-H', '-o', 'value', 'guid', '--', pool],
+    result: { stdout: `${guid}\n`, stderr: '', exitCode: 0 },
+  }
+}
+
 async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
   for (let i = 0; i < 50; i++) {
     const res = await server.inject({ method: 'GET', url: `/v1/jobs/${id}`, headers: IDENTITY })
@@ -142,6 +157,9 @@ describe('periodic scrub routes — ZFS property (Epic 17.5)', () => {
     mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['tank', 'rpool']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'org.debian:periodic-scrub', '--', 'tank'], result: { stdout: '-\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'org.debian:periodic-scrub', '--', 'rpool'], result: { stdout: 'disable\n', stderr: '', exitCode: 0 } })
+    // cr.64b2-ii: the toggle is a guard door bound to the pool's guid.
+    mock.addFixture(guidFixture('tank', TANK_GUID))
+    mock.addFixture(guidFixture('rpool', RPOOL_GUID))
     // zfs set + any other zfs: command-only success.
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     // An md-less node: /proc/mdstat ABSENT — coreutils cat's ENOENT line, exit 1,
@@ -219,6 +237,93 @@ describe('periodic scrub routes — ZFS property (Epic 17.5)', () => {
     assert.equal(done.status, 'completed', JSON.stringify(done.error))
     const setCall = mockOf(server).calls.find(c => c.args[0] === 'set')
     assert.ok(setCall && setCall.args.includes('org.debian:periodic-scrub=disable') && setCall.args.includes('tank'))
+  })
+
+  it('cr.64b2-ii (L22): the toggle job holds zpool:<guid> + zname:<pool> SHARED (queue state)', async () => {
+    const mock = mockOf(server)
+    const queue = jobQueueOf(server)
+    // Park the job mid-`zfs set` with a live child, read the lock table while
+    // it runs, then release it. (Before cr.64b2-ii the toggle held NOTHING.)
+    mock.addFixture({ command: ZFS, args: ['set', '--', 'org.debian:periodic-scrub=disable', 'tank'], live: { signalsToExit: Number.POSITIVE_INFINITY } })
+    const res = await server.inject({ method: 'PUT', url: '/v1/scrub/zfs/tank', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: false }) })
+    assert.equal(res.statusCode, 202)
+    const id = (res.json() as { job: { id: string } }).job.id
+    for (let i = 0; i < 50 && !mock.calls.some(c => c.command === ZFS && c.args[0] === 'set'); i++)
+      await new Promise(r => setTimeout(r, 10))
+    assert.equal(queue.get(id)?.status, 'running', 'the toggle job never reached its zfs set')
+    // A property set changes nothing about the pool's shape → the SHARED pair,
+    // exactly what cr.36's pool-scrub verb and the props verb hold.
+    assert.deepEqual(queue.heldLocks(), [
+      { key: `zpool:${TANK_GUID}`, mode: 'shared', holders: [id] },
+      { key: 'zname:tank', mode: 'shared', holders: [id] },
+    ])
+    mock.finishLive()
+    const done = await waitForJob(server, id)
+    assert.equal(done.status, 'completed', JSON.stringify(done.error))
+  })
+
+  it('cr.64b2-ii (L22): a pool gone from `zpool list` between the route and the job → the job fails IDENTITY_MISMATCH, zfs set never ran', async () => {
+    const mock = mockOf(server)
+    const queue = jobQueueOf(server)
+    // The job re-runs the door at its turn: script the pool list so `tank`
+    // stands at the route and is gone by the job's re-read.
+    mock.clearFixtures()
+    mock.addFixture({
+      command: ZPOOL,
+      args: ['list', '-j'],
+      results: [
+        { stdout: zpoolListJson(['tank', 'rpool']), stderr: '', exitCode: 0 },
+        { stdout: zpoolListJson(['rpool']), stderr: '', exitCode: 0 },
+      ],
+    })
+    mock.addFixture(guidFixture('tank', TANK_GUID))
+    mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'cat: /proc/mdstat: No such file or directory', exitCode: 1 } })
+    // Paused-queue pattern (cr.33): the slots are held, so the toggle sits
+    // QUEUED after its route gate passed; the pool disappears behind it.
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (let i = 0; i < 4; i++)
+      queue.submit('test.hold', { user: 'root@pam', uid: 0 }, () => held)
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'PUT', url: '/v1/scrub/zfs/tank', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: false }) })
+    assert.equal(res.statusCode, 202, res.body)
+    const id = (res.json() as { job: { id: string } }).job.id
+    assert.equal(queue.get(id)?.status, 'queued', 'the toggle waits behind the held slots')
+    release()
+    const done = await waitForJob(server, id)
+    assert.equal(done.status, 'failed', JSON.stringify(done))
+    assert.equal(done.error?.code, 'IDENTITY_MISMATCH', JSON.stringify(done.error))
+    assert.match(done.error?.message ?? '', /ZFS pool 'tank' is not the one that was confirmed/)
+    assert.match(done.error?.message ?? '', /nothing was done/)
+    assert.ok(!mock.calls.some(c => c.command === ZFS && c.args[0] === 'set'), 'zfs set never ran')
+  })
+
+  it('cr.64b2-ii (L22): a pool PVE\'s storage.cfg uses → 409 PVE_MANAGED at the door, no job, zfs set never runs', async () => {
+    // The same hands-off answer every pool-level verb gives ("PVE territory is
+    // read-only and hands-off"), with no confirm bypass.
+    const dir = await mkdtemp(join(tmpdir(), 'anas-scrub-pvegate-'))
+    const cfg = join(dir, 'storage.cfg')
+    const saved = process.env.ANAS_STORAGE_CFG
+    try {
+      await writeFile(cfg, 'zfspool: local-zfs\n\tpool tank\n\tcontent images,rootdir\n', 'utf-8')
+      process.env.ANAS_STORAGE_CFG = cfg
+      mockOf(server).calls.length = 0
+      const res = await server.inject({ method: 'PUT', url: '/v1/scrub/zfs/tank', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: false }) })
+      assert.equal(res.statusCode, 409, res.body)
+      assert.equal((res.json() as { error: { code: string } }).error.code, 'PVE_MANAGED')
+      assert.match((res.json() as { error: { message: string } }).error.message, /no confirm bypass/)
+      assert.ok(!mockOf(server).calls.some(c => c.command === ZFS && c.args[0] === 'set'), 'zfs set never ran')
+    }
+    finally {
+      if (saved === undefined)
+        delete process.env.ANAS_STORAGE_CFG
+      else
+        process.env.ANAS_STORAGE_CFG = saved
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('PUT /scrub/zfs/:pool for an unknown pool → 404', async () => {
@@ -319,6 +424,77 @@ describe('periodic scrub routes — AHR node-level anas-scrub timer (selfheal.4)
     const done = await waitForJob(server, res.json().job.id)
     assert.equal(done.status, 'completed', JSON.stringify(done.error))
     assert.match(await readFile(join(unitDir, 'anas-scrub.timer'), 'utf-8'), /OnCalendar=Sun \*-01,04,07,10-01\.\.07 03:00:00/)
+  })
+
+  it('cr.64b2-ii (L22): the AHR toggle job holds ahr:<vg uuid> + ahrname:<pool> SHARED (queue state)', async () => {
+    const mock = mockOf(server)
+    const queue = jobQueueOf(server)
+    // Park the job mid-`systemctl enable --now` (its last act), read the lock
+    // table, release. (Before cr.64b2-ii the AHR toggle held NOTHING.)
+    mock.addFixture({ command: SYSTEMCTL, args: ['enable', '--now', 'anas-scrub.timer'], live: { signalsToExit: Number.POSITIVE_INFINITY } })
+    const res = await server.inject({ method: 'PUT', url: '/v1/scrub/ahr/ahr0', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: true }) })
+    assert.equal(res.statusCode, 202)
+    const id = (res.json() as { job: { id: string } }).job.id
+    for (let i = 0; i < 50 && !mock.calls.some(c => c.command === SYSTEMCTL && c.args.join(' ') === 'enable --now anas-scrub.timer'); i++)
+      await new Promise(r => setTimeout(r, 10))
+    assert.equal(queue.get(id)?.status, 'running', 'the toggle job never reached the timer enable')
+    // The toggle edits the node timer's pool list — it never reshapes the
+    // pool → ahrPoolClaims(…, 'shared'). The captured `vgs` (fixtures/ahr)
+    // carries no vg_uuid column (ahr-guard-verbs.test.ts says why), so the
+    // route holds §4.2's fallback — the name key, exclusive — exactly as the
+    // other AHR verbs do over this world; the uuid pair is pinned on the
+    // builder in ahr-guard-verbs.test.ts (cr.38).
+    assert.deepEqual(queue.heldLocks(), [
+      { key: 'ahrname:ahr0', mode: 'exclusive', holders: [id] },
+    ])
+    mock.finishLive()
+    const done = await waitForJob(server, id)
+    assert.equal(done.status, 'completed', JSON.stringify(done.error))
+  })
+
+  it('cr.64b2-ii (L22): the pool gone from the topology between the route and the job → IDENTITY_MISMATCH, no unit written', async () => {
+    // A bare server so the mdstat read can be scripted [present, absent] —
+    // registered FIRST, it wins over every later /proc/mdstat fixture.
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: '/usr/bin/cat',
+      args: MDSTAT_CAT_ARGS,
+      results: [
+        mockFixtures.ahrMdstat(),
+        { stdout: '', stderr: 'cat: /proc/mdstat: No such file or directory', exitCode: 1 },
+      ],
+    })
+    mockAhrTopologyExecutor(executor, mockFixtures.ahrMdstat())
+    executor.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
+    const queue = new JobQueue()
+    const bare = Fastify({ logger: false })
+    await bare.register(scrubRoutes, { prefix: '/v1', executor, jobQueue: queue, systemdDir: unitDir })
+    try {
+      let release!: () => void
+      const held = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      for (let i = 0; i < 4; i++)
+        queue.submit('test.hold', { user: 'root@pam', uid: 0 }, () => held)
+      const res = await bare.inject({ method: 'PUT', url: '/v1/scrub/ahr/ahr0', headers: JSON_HEADERS, payload: JSON.stringify({ enabled: true }) })
+      assert.equal(res.statusCode, 202, res.body)
+      const id = (res.json() as { job: { id: string } }).job.id
+      assert.equal(queue.get(id)?.status, 'queued', 'the toggle waits behind the held slots')
+      release()
+      for (let i = 0; i < 50 && queue.get(id)?.status !== 'failed'; i++)
+        await new Promise(r => setTimeout(r, 10))
+      const done = queue.get(id)
+      assert.equal(done?.status, 'failed', JSON.stringify(done))
+      assert.equal(done?.error?.code, 'IDENTITY_MISMATCH', JSON.stringify(done?.error))
+      assert.match(done?.error?.message ?? '', /AHR pool 'ahr0' is not the one that was confirmed/)
+      assert.match(done?.error?.message ?? '', /nothing was done/)
+      // The job door refused before any unit file touched the disk.
+      const { readdir } = await import('node:fs/promises')
+      assert.deepEqual(await readdir(unitDir), [], 'no anas-scrub units were written')
+    }
+    finally {
+      await bare.close()
+    }
   })
 
   it('PUT /scrub/ahr/ahr0 with a bad cadence → 400', async () => {

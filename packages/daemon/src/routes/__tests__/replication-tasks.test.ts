@@ -1,5 +1,6 @@
 import type { Job, ReplicationTaskStatus } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
+import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
@@ -320,21 +321,85 @@ describe('replication task routes (Epic 5.5.3)', () => {
     assert.equal(res.statusCode, 404)
   })
 
-  it('run fires the real unit and returns { started: true }', async () => {
+  const RUN_ARGV = 'start --no-block anas-repl-nightly-media.service'
+
+  it('cr.64b2-ii: run answers its job reference like the file\'s other 202s and the job fires the unit', async () => {
     await waitForJob(server, (await create()).json().job.id)
     const mock = mockOf(server)
     mock.calls.length = 0
     const res = await server.inject({ method: 'POST', url: '/v1/replication/tasks/nightly-media/run', headers: IDENTITY })
     assert.equal(res.statusCode, 202)
-    assert.deepEqual(res.json(), { started: true })
-    // Give the quick job a tick to fire systemctl start.
-    await new Promise(r => setTimeout(r, 20))
-    assert.ok(mock.calls.some(c => c.command === SYSTEMCTL && c.args.join(' ') === 'start --no-block anas-repl-nightly-media.service'))
+    // The SAME reply shape as create/update/delete: { job } with a pollable id.
+    const { job } = res.json() as { job: { id: string } }
+    assert.ok(job?.id, `202 body: ${res.body}`)
+    const done = await waitForJob(server, job.id)
+    assert.equal(done.status, 'completed', JSON.stringify(done.error))
+    assert.ok(mock.calls.some(c => c.command === SYSTEMCTL && c.args.join(' ') === RUN_ARGV))
+  })
+
+  it('cr.64b2-ii: the run job holds task:replication:<name> SHARED (queue state)', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const mock = mockOf(server)
+    const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+    // Park the job mid-`systemctl start` with a live child, read the lock
+    // table while it runs, then release it.
+    mock.addFixture({ command: SYSTEMCTL, args: ['start', '--no-block', 'anas-repl-nightly-media.service'], live: { signalsToExit: Number.POSITIVE_INFINITY } })
+    const res = await server.inject({ method: 'POST', url: '/v1/replication/tasks/nightly-media/run', headers: IDENTITY })
+    assert.equal(res.statusCode, 202)
+    const id = (res.json() as { job: { id: string } }).job.id
+    for (let i = 0; i < 50 && queue.get(id)?.status !== 'running'; i++)
+      await new Promise(r => setTimeout(r, 10))
+    assert.equal(queue.get(id)?.status, 'running', 'the run job never started')
+    // Queue state while the run job is in flight:
+    //   heldLocks() → [{ key: 'task:replication:nightly-media', mode: 'shared', holders: ['<run job id>'] }]
+    const held = queue.heldLocks().filter(h => h.key.startsWith('task:'))
+    assert.deepEqual(held, [{ key: 'task:replication:nightly-media', mode: 'shared', holders: [id] }])
+    // The live child spawns only after the job door's re-checks — release
+    // only once it is actually running, or finishLive ends nothing.
+    for (let i = 0; i < 50 && !mock.calls.some(c => c.args.join(' ') === RUN_ARGV); i++)
+      await new Promise(r => setTimeout(r, 10))
+    mock.finishLive()
+    const done = await waitForJob(server, id)
+    assert.equal(done.status, 'completed', JSON.stringify(done.error))
+  })
+
+  it('cr.64b2-ii: a task deleted between the route and the job → the job refuses, systemctl start never ran', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const mock = mockOf(server)
+    const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+    // Paused-queue pattern (cr.33): the four slots are held, so the run job
+    // sits QUEUED after its route gate passed; the unit files go behind it.
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (let i = 0; i < 4; i++)
+      queue.submit('test.hold', { user: 'root@pam', uid: 0 }, () => held)
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'POST', url: '/v1/replication/tasks/nightly-media/run', headers: IDENTITY })
+    assert.equal(res.statusCode, 202)
+    const id = (res.json() as { job: { id: string } }).job.id
+    assert.equal(queue.get(id)?.status, 'queued', 'the run waits behind the held slots')
+
+    await rm(join(dir, 'anas-repl-nightly-media.service'), { force: true })
+    await rm(join(dir, 'anas-repl-nightly-media.timer'), { force: true })
+    release()
+    const done = await waitForJob(server, id)
+    assert.equal(done.status, 'failed', JSON.stringify(done))
+    // The guard's gone-object answer (stable-id.ts): a task that existed at
+    // the route and not at the job is an identity mismatch, refused with
+    // "nothing was done" — the code every other gone-while-queued door gives.
+    assert.equal(done.error?.code, 'IDENTITY_MISMATCH', JSON.stringify(done.error))
+    assert.match(done.error?.message ?? '', /Replication task 'nightly-media' is not the one that was confirmed/)
+    assert.match(done.error?.message ?? '', /unreadable now/)
+    assert.match(done.error?.message ?? '', /nothing was done/)
+    assert.ok(!mock.calls.some(c => c.command === SYSTEMCTL && c.args.join(' ') === RUN_ARGV), 'systemctl start never ran')
   })
 
   it('run a non-existent task → 404', async () => {
     const res = await server.inject({ method: 'POST', url: '/v1/replication/tasks/ghost/run', headers: IDENTITY })
     assert.equal(res.statusCode, 404)
+    assert.equal(res.json().error.code, 'NOT_FOUND')
   })
 })
 

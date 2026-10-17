@@ -145,6 +145,25 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
     assert.throws(() => renderServiceUnit(evilNul), /control characters/)
   })
 
+  // cr.64b2-ii step 6: the NAME interpolated into `Description=` rides the SAME
+  // cr.51 helper (refuseControlChars, lifted to systemd-unit-store.ts — not a
+  // copy): a newline in the name is refused before any unit text is rendered,
+  // and the writer (which renders both units before writing either) leaves the
+  // directory untouched.
+  it('a newline in the task NAME is refused before any unit text is rendered', async () => {
+    const evil = makeTask({ name: 'nightly\nExecStart=/bin/sh -c id' })
+    assert.throws(() => renderServiceUnit(evil), /control characters/)
+    assert.throws(() => renderTimerUnit(evil), /control characters/)
+    const evilDir = await mkdtemp(join(tmpdir(), 'anas-repl-units-evil-'))
+    try {
+      await assert.rejects(() => writeTaskUnits(new MockExecutor(), evilDir, evil), /control characters/)
+      assert.deepEqual(await readdir(evilDir), [], 'nothing was written')
+    }
+    finally {
+      await rm(evilDir, { recursive: true, force: true })
+    }
+  })
+
   it('parseServiceUnit returns null for invalid task JSON', () => {
     assert.equal(parseServiceUnit('# X-ANAS-Task={"name":"BAD NAME","schedule":""}\n'), null)
   })

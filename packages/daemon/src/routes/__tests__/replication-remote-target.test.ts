@@ -1,5 +1,6 @@
 import type { Job, ReplicatePlan } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
+import type { JobQueue } from '../../jobs/queue.js'
 import type { RemotesPaths } from '../../services/replication-remotes.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
@@ -180,5 +181,40 @@ describe('replication to a REMOTE target (Epic 5.5.2)', () => {
     const result = done.result as { holdTag?: string, warnings?: string[] }
     assert.equal(result.holdTag, TAG)
     assert.equal(result.warnings, undefined, JSON.stringify(result.warnings))
+  })
+
+  it('cr.64b2-ii step 5: a REMOTE target takes no claim — the run holds source keys only (queue state)', async () => {
+    // Park the run on the LOCAL dry-run exec (the estimate is always local),
+    // read the lock table while it runs, then release it.
+    const mock = mockOf(server)
+    mock.prependFixture({ command: ZFS, args: ['send', '-nvP', '--', `${SOURCE}@${SNAP}`], live: { signalsToExit: Number.POSITIVE_INFINITY }, result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
+    const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+
+    const res = await server.inject({
+      method: 'POST',
+      url: `/v1/pools/testpool/datasets/media/replicate`,
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ target: { pool: 'backup', location: { kind: 'remote', name: 'nas1' } } }),
+    })
+    assert.equal(res.statusCode, 202)
+    const id = res.json().job.id
+    for (let i = 0; i < 50 && queue.get(id)?.status !== 'running'; i++)
+      await new Promise(r => setTimeout(r, 10))
+    assert.equal(queue.get(id)?.status, 'running', 'the run job never started')
+
+    // The remote target is not ours to lock: no key names the remote's pool.
+    // The source's claim is the §4.2 fallback — this fixture set carries no
+    // `zpool get guid` line, so the guid is unread and the pool's NAME key
+    // is held, exclusive.
+    const held = queue.heldLocks().filter(h => h.holders.includes(id))
+    assert.deepEqual(held, [{ key: 'zname:testpool', mode: 'exclusive', holders: [id] }])
+    assert.equal(held.some(h => h.key.includes('backup')), false, JSON.stringify(held))
+
+    // Release only once the dry-run child is actually live.
+    for (let i = 0; i < 50 && !mock.calls.some(c => c.command === ZFS && c.args[0] === 'send' && c.args[1] === '-nvP'); i++)
+      await new Promise(r => setTimeout(r, 10))
+    mock.finishLive({ stdout: FULL_DRYRUN, stderr: '', exitCode: 0 })
+    const done = await waitForJob(server, id)
+    assert.equal(done.status, 'completed', JSON.stringify(done.error))
   })
 })

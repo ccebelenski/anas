@@ -8,6 +8,7 @@ import type { UnitTaskObject } from '../services/task-units.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { ReplicationTask, ReplicationTaskName } from '@anas/shared'
+import { currentLane } from '../executor/deadline.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { guardCheck, guarded, sendRefusal, taskClaim } from '../safety/guard.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
@@ -18,7 +19,6 @@ import {
   removeTaskUnits,
   resolveTaskDatasets,
   serviceUnitName,
-  taskFileExists,
   timerUnitName,
   validateSchedule,
   writeTaskUnits,
@@ -44,8 +44,9 @@ const SYSTEMCTL = '/usr/bin/systemctl'
  * These are CONFIG mutations (surgical unit-file writes), not storage mutations.
  * They are identity-gated and journald-audited exactly like the share routes:
  * each write runs through the job queue as a quick job (202 → { job }); the
- * run trigger returns { started: true }. Reads are plain (no job, no identity),
- * and every guard reuses the stage-1 reasoning.
+ * run trigger answers its job reference the same way (cr.64b2-ii — it used to
+ * answer { started: true } with nothing to poll). Reads are plain (no job, no
+ * identity), and every guard reuses the stage-1 reasoning.
  */
 export interface ReplicationTaskRouteOptions {
   executor: CommandExecutor
@@ -203,8 +204,12 @@ export async function replicationTaskRoutes(
    * `zfs.replicate` send can run for hours and shows only as the unit), because
    * an unreadable run state is not evidence the run is over.
    */
-  async function replicationTaskActiveRunRefusal(name: string): Promise<Refusal | null> {
-    const runJob = jobQueue.findActive('replication.task.run', name, 'task')
+  async function replicationTaskActiveRunRefusal(name: string, selfJobId?: string): Promise<Refusal | null> {
+    // `selfJobId` (cr.64b2-ii): the RUN door's own job re-runs this gate, and
+    // the operation it asks about is the one it IS. Only a job submitted
+    // BEFORE it counts (ahr-mutate's cr.38 idiom) — one that counted itself
+    // would refuse every run. At the route there is no own job yet.
+    const runJob = jobQueue.findActive('replication.task.run', name, 'task', undefined, selfJobId ? { before: selfJobId } : {})
     if (runJob)
       return activeRunDeleteRefusal(`Replication task '${name}'`, { job: runJob })
     try {
@@ -243,26 +248,47 @@ export async function replicationTaskRoutes(
     }
   }
 
+  /**
+   * The unit AS STORED — the stores' own existence (a `.service` on disk),
+   * never the parsed task. A unit whose X-ANAS-Task no longer parses (a hand
+   * edit; a task an older ANAS wrote) is skipped by the list AND by a
+   * parsed-object read, which would answer 404 on exactly the unit the
+   * operator needs to remove — this read makes it deletable (cr.41b). The
+   * UPDATE spec above stays bound to the parsed object: an edit cannot be
+   * bound to bytes that do not parse — 404 not-found is right there. The
+   * DELETE and RUN doors ride this one view (cr.64b2-ii: the run is a
+   * mutation of the task like the delete is, judged against the same fact —
+   * the unit on disk — so a task removed while the run waited is refused).
+   */
+  const replicationTaskStoreView = (name: string): ObjectView<{ unit: string, timer: string }> => ({
+    what: `Replication task '${name}'`,
+    read: () => readUnitStoreEntry(readReplicationUnitText, systemdDir, name),
+    id: async () => ({ task: name }),
+    notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `Replication task '${name}' not found` }),
+    unbound: () => `Could not read replication task '${name}' — refusing`,
+  })
+
   function replicationTaskDeleteSpec(name: string): GuardSpec<{ unit: string, timer: string }> {
     return {
       operation: 'replication.task.remove',
-      // cr.41b: the delete's object is the unit AS STORED — the stores' own
-      // existence (a `.service` on disk), never the parsed task. A unit whose
-      // X-ANAS-Task no longer parses (a hand edit; a task an older ANAS wrote)
-      // is skipped by the list AND by a parsed-object read, which would answer
-      // 404 on exactly the unit the operator needs to remove — this read makes
-      // it deletable. The UPDATE spec above stays bound to the parsed object:
-      // an edit cannot be bound to bytes that do not parse — 404 not-found is
-      // right there.
-      object: {
-        what: `Replication task '${name}'`,
-        read: () => readUnitStoreEntry(readReplicationUnitText, systemdDir, name),
-        id: async () => ({ task: name }),
-        notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `Replication task '${name}' not found` }),
-        unbound: () => `Could not read replication task '${name}' — refusing`,
-      },
+      object: replicationTaskStoreView(name),
       gates: [async () => replicationTaskActiveRunRefusal(name)],
       locks: async () => [taskClaim('replication', name, 'exclusive')],
+    }
+  }
+
+  /**
+   * The run trigger's spec (cr.64b2-ii): the delete door's object and gates,
+   * with the SHARED task claim §4.2 gives the direct run — the trigger and a
+   * queued delete serialise, and the job re-gates at its turn, so a task
+   * deleted (or a run started) between the route and the job is seen.
+   */
+  function replicationTaskRunSpec(name: string): GuardSpec<{ unit: string, timer: string }> {
+    return {
+      operation: 'replication.task.run',
+      object: replicationTaskStoreView(name),
+      gates: [async () => replicationTaskActiveRunRefusal(name, currentLane().jobId)],
+      locks: async () => [taskClaim('replication', name, 'shared')],
     }
   }
 
@@ -442,27 +468,32 @@ export async function replicationTaskRoutes(
     if (!identity)
       return
 
-    if (!(await taskFileExists(systemdDir, name))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Replication task '${name}' not found` } }
-    }
-
     // Fire-and-return: `--no-block` starts the oneshot without waiting for it to
-    // finish, so the trigger is instant and systemd owns the run. Audited via the
-    // quick job below. cr.41: the trigger holds the task's key briefly (shared),
-    // so a delete queued between the trigger and the run it starts serialises.
-    jobQueue.submit(
+    // finish, so the trigger is instant and systemd owns the run. cr.41: the
+    // trigger holds the task's key briefly (shared), so a delete queued between
+    // the trigger and the run it starts serialises. cr.64b2-ii (L22): the door
+    // rides the delete door's spec — the unit as stored, the active-run gate,
+    // re-gated in the job — and answers its job reference like every other 202
+    // here, so the operator has the job to poll and the run is audited through
+    // it. Before, a task deleted between this route and the trigger simply
+    // started, and `{ started: true }` named nothing.
+    const spec = replicationTaskRunSpec(name)
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+
+    const job = jobQueue.submit(
       'replication.task.run',
       { ...identity, params: { task: name } },
-      async () => {
+      guarded(spec, pre, async () => {
         const r = await executor.exec(SYSTEMCTL, ['start', '--no-block', serviceUnitName(name)])
         if (r.exitCode !== 0)
           throw new Error(r.stderr.trim() || `systemctl start ${serviceUnitName(name)} exited with code ${r.exitCode}`)
         return { started: name }
-      },
-      { locks: [taskClaim('replication', name, 'shared')] },
+      }),
+      { locks: pre.locks },
     )
     reply.code(202)
-    return { started: true }
+    return { job }
   })
 }

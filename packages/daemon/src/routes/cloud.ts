@@ -150,13 +150,15 @@ class RcloneNotInstalledError extends Error {
 }
 
 /**
- * The retarget door's object view (cr.64c, cr.63 (j); cr.64cr): the remote as
- * rclone.conf holds it NOW, bound by its name + {@link remoteSectionIdentity}
- * (a keyed digest of the section's non-secret facts — nothing derivable from a
- * secret, and a secret rotation is the same remote). Both doors read through
- * it: the route binds what it read, and the job — `guarded`, ruling (j) —
- * re-reads and compares before it writes, so a section deleted and re-created
- * while the job waited is IDENTITY_MISMATCH and nothing is written.
+ * The remote update door's object view (cr.64c, cr.63 (j); cr.64cr;
+ * cr.64b2-ii step 4): the remote as rclone.conf holds it NOW, bound by its
+ * name + {@link remoteSectionIdentity} (a keyed digest of the section's
+ * non-secret facts — nothing derivable from a secret, and a secret rotation
+ * is the same remote). Both the confirmed retarget and the plain options-only
+ * update read through it: the route binds what it read, and the job —
+ * `guarded`, ruling (j) — re-reads and compares before it writes, so a
+ * section deleted and re-created while the job waited is IDENTITY_MISMATCH
+ * and nothing is written.
  */
 function remoteView(name: string, readCurrent: () => Promise<RcloneConfigRead>): ObjectView<CloudRemote> {
   const current = (reads: GuardReads): Promise<RcloneConfigRead> => reads.once('rclone.conf', readCurrent)
@@ -172,7 +174,7 @@ function remoteView(name: string, readCurrent: () => Promise<RcloneConfigRead>):
       const section = remoteSectionIdentity((await current(reads)).text, name)
       return section === null ? null : { remote: name, section }
     },
-    unbound: () => `remote '${name}' could not be bound to its section in rclone.conf — refusing the retarget`,
+    unbound: () => `remote '${name}' could not be bound to its section in rclone.conf — refusing the update`,
   }
 }
 
@@ -458,8 +460,8 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     if (!identity)
       return
 
-    interface Retarget { spec: GuardSpec<CloudRemote>, pass: GuardPass<CloudRemote>, section: string }
-    const precheck = await guard503(reply, async (): Promise<{ catalog: CloudProvider[], type: string, retarget: Retarget | null } | null> => {
+    interface UpdateDoor { spec: GuardSpec<CloudRemote>, pass: GuardPass<CloudRemote>, section: string }
+    const precheck = await guard503(reply, async (): Promise<{ catalog: CloudProvider[], type: string, door: UpdateDoor } | null> => {
       await requireRclone()
       const catalog = await providers()
       const current = await readConfig(paths, executor, catalog)
@@ -476,6 +478,20 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       const ownClient = ownClientRefusal(existing.type, input.options)
       if (ownClient !== null) {
         reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: ownClient } })
+        return null
+      }
+      // cr.64b2-ii step 4: EVERY update job — retarget or plain — is bound to
+      // the section the route read: name + remoteSectionIdentity. The route
+      // binds it, the job's `guarded` re-reads and compares before it writes,
+      // and writeRemote compares once more under the per-file lock
+      // (expectSection) — a section deleted or re-created while the job waits
+      // is IDENTITY_MISMATCH with nothing written, never an update of a
+      // namesake. (cr.64cr covered the confirmed retarget half; the plain
+      // options-only path re-checked nothing and could land its options on a
+      // re-created remote of another type.)
+      const section = remoteSectionIdentity(current.text, name)
+      if (section === null) {
+        reply.code(409).send({ error: { code: 'CONFLICT', message: `remote '${name}' could not be bound to its section in rclone.conf — refusing the update` } })
         return null
       }
       // Story ident.4 (b), audit #15: an update that changes WHERE the remote
@@ -497,27 +513,22 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       // relevant half, with values the retarget rule keeps non-secret, is
       // exactly `changes`.
       const changes = destinationChanges(existing, input.options, catalog)
-      let retarget: Retarget | null = null
+      const pass: GuardPass<CloudRemote> = {
+        object: existing,
+        bound: { id: { remote: name, section } },
+        advisories: [],
+        locks: [],
+      }
+      let retargetSpec: GuardSpec<CloudRemote> | null = null
       if (changes.length > 0) {
         const tasks = await tasksReachingRemote(current.remotes, name, referencingTasks)
         if (tasks.length > 0) {
-          const section = remoteSectionIdentity(current.text, name)
-          if (section === null) {
-            reply.code(409).send({ error: { code: 'CONFLICT', message: `remote '${name}' could not be bound to its section in rclone.conf — refusing the retarget` } })
-            return null
-          }
-          const spec: GuardSpec<CloudRemote> = {
+          retargetSpec = {
             operation: 'cloud.remote.retarget',
             object: remoteView(name, () => readConfig(paths, executor, catalog)),
             gates: [],
           }
-          const pass: GuardPass<CloudRemote> = {
-            object: existing,
-            bound: { id: { remote: name, section } },
-            advisories: [],
-            locks: [],
-          }
-          if (!guardConfirm(confirmStore, request, reply, spec, pass, {
+          if (!guardConfirm(confirmStore, request, reply, retargetSpec, pass, {
             validated: { remote: name, changes: changes.map(c => [c.key, c.to]) },
             address: ['remote'],
             message: `Changing where remote '${name}' points re-points cloud sync task(s): ${describeTasks(tasks)}`,
@@ -529,10 +540,18 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
           })) {
             return null
           }
-          retarget = { spec, pass, section }
         }
       }
-      return { catalog, type: existing.type, retarget }
+      const door: UpdateDoor = {
+        spec: retargetSpec ?? {
+          operation: 'cloud.remote.update',
+          object: remoteView(name, () => readConfig(paths, executor, catalog)),
+          gates: [],
+        },
+        pass,
+        section,
+      }
+      return { catalog, type: existing.type, door }
     })
     if (precheck === undefined || precheck === null)
       return undefined
@@ -540,23 +559,23 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     // The write needs a CloudRemoteWrite: the name + the EXISTING type (the
     // service re-checks it under the lock — a drift cannot slip through).
     const write: CloudRemoteWrite = { name, type: precheck.type, options: input.options }
-    const { retarget } = precheck
+    const { door } = precheck
     const update = (): Promise<CloudRemote> => writeRemote(paths, executor, write, {
       providers: precheck.catalog,
       mode: 'update',
-      ...(retarget ? { expectSection: retarget.section } : {}),
+      expectSection: door.section,
     })
-    // cr.64cr item 5 (ruling (j)): a confirmed retarget's job re-reads the
-    // remote and re-gates the identity the confirm was bound to before it
-    // writes (`guarded`), and writeRemote compares it once more under the
-    // per-file lock — the job can wait behind a delete + re-create of the
-    // same name for the queue or for that lock.
+    // cr.64cr item 5 (ruling (j)) and cr.64b2-ii step 4: the job re-reads the
+    // remote and re-gates the bound identity before it writes (`guarded`), and
+    // writeRemote compares it once more under the per-file lock — the job can
+    // wait behind a delete + re-create of the same name for the queue or for
+    // that lock. The confirmed retarget rode this door since cr.64cr; the
+    // plain options-only update rides it too now, without a confirm (it is
+    // not a dangerous op — only the identity binding is shared).
     const job = jobQueue.submit(
       'cloud.remote.update',
       { ...identity, params: { remote: name } },
-      retarget
-        ? async (updateProgress, ctx) => rcloneJob(() => guarded(retarget.spec, retarget.pass, async () => update())(updateProgress, ctx))
-        : async () => rcloneJob(update),
+      async (updateProgress, ctx) => rcloneJob(() => guarded(door.spec, door.pass, async () => update())(updateProgress, ctx)),
     )
     reply.code(202)
     return { job }

@@ -327,6 +327,18 @@ export const TestRemoteRequest = z.object({
   host: RemoteHost,
   port: z.number().int().min(1).max(65535).default(22),
   user: RemoteUser.default('root'),
+  /**
+   * The fingerprint the operator was SHOWN — REQUIRED (enforced by the test
+   * route, hence optional in the shape) whenever `?pin=true` / `?retrust=true`
+   * asks to trust a key (cr.64b2-ii). The pin becomes a job bound to exactly
+   * this string: it re-probes and writes known_hosts only if the host still
+   * presents it; a different key → 409 STATE_CHANGED, nothing written. Before,
+   * pin accepted whatever the host presented at that moment — the value the
+   * operator confirmed was never checked. The registered-remote route
+   * (`/:name/test`, no body schema of its own) validates this SAME field with
+   * `TestRemoteRequest.pick({ fingerprint: true })`.
+   */
+  fingerprint: z.string().min(1).refine(s => !hasControlChars(s), 'Control characters are not allowed').optional(),
 })
 export type TestRemoteRequest = z.infer<typeof TestRemoteRequest>
 

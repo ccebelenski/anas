@@ -7,7 +7,8 @@ import type { ReplicationNotifyContext } from '../services/replication-notify.js
 import type { TargetPlacement } from '../services/replication-target.js'
 import type { Transport } from '../services/replication-transport.js'
 import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
-import { GuardRefusalError, sendRefusal } from '../safety/guard.js'
+import { GuardRefusalError, sendRefusal, zfsDatasetClaims } from '../safety/guard.js'
+import { readPoolGuid } from '../safety/stable-id.js'
 import { ownershipRefusal } from '../services/pve-footprint.js'
 import { legacyReleasableOnSource, replicationHoldTag, settleReplicationHolds } from '../services/replication-holds.js'
 import { notifyReplicationRun } from '../services/replication-notify.js'
@@ -341,10 +342,27 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     // the send ("waiting for zfs.replicate (job …)") and re-gates after it,
     // instead of pulling the dataset out from under the stream. Shared, so
     // snapshots of the source (and other sends from it) still run beside it.
-    // The target is not claimed: §4.2 lists a replication target as a `zfs:`
-    // claim too, but cr.33b is the source's story (a remote target is not
-    // ours to lock in any case).
+    // cr.64b2-ii step 5 (§4.2): a LOCAL target holds its `zfs:` claim too —
+    // the receive WRITES the target dataset, so the claim is EXCLUSIVE (the
+    // table's write-side entry is "clone target": a full recv creates the
+    // dataset, an incremental recv rewrites it). A destroy, rollback, rename
+    // or snapshot of the target accepted meanwhile waits for the stream
+    // ("waiting for zfs.replicate (job …)") instead of racing the recv, and
+    // two replications into one target serialise. A peer/remote target is
+    // not ours to lock — the key table is this node's. The guid read is the
+    // dataset verbs' own fallback: an unread guid locks the pool's name key,
+    // exclusive.
     const locks = await datasetSourceClaims(executor, [source])
+    if (!loc.isRemote) {
+      let targetGuid: string | null = null
+      try {
+        targetGuid = (await readPoolGuid(executor, target.pool))?.guid ?? null
+      }
+      catch {
+        targetGuid = null
+      }
+      locks.push(...zfsDatasetClaims(targetGuid, targetFull, 'exclusive'))
+    }
 
     const job = jobQueue.submit(
       'zfs.replicate',
@@ -358,6 +376,23 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
         // a good replication into a failed job.
         const startedAt = Date.now()
         try {
+          // cr.64b2-ii step 5: the TARGET guard runs again at the job's turn
+          // (the same fireSchedule pattern as the snapshotFirst source check
+          // below): the location may have been deregistered, the target pool
+          // exported, or a LOCAL target moved under PVE — storage.cfg is live
+          // — while the job waited behind the queue or the locks. The refusal
+          // is the guard's own sentence, carried as a job failure (the 9.4
+          // notification below reports it); nothing is sent and no snapshot
+          // is taken. ONE fresh footprint load feeds this guard and the
+          // snapshotFirst check (pvepool.1 review fix 4's rule, job-side).
+          const pveNow = snapshotFirst || !loc.isRemote ? await deps.pveFootprint() : undefined
+          const guardNow = await guardReplicationTarget(
+            pveNow ? { ...guardDeps, pveFootprintPreloaded: pveNow } : guardDeps,
+            { target, sourceFull: source, targetFull },
+          )
+          if (!guardNow.ok)
+            throw new GuardRefusalError({ status: 409, code: 'STATE_CHANGED', message: guardNow.message })
+
           // 1) Optional snapshot-first — create a fresh, sortable snapshot to send up to.
           let snapName = snapshot
           if (snapshotFirst) {
@@ -368,7 +403,9 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             // FAILS the job with the reason (the 9.4 notification carries
             // it); the request-level 400 is the fast path only, exactly the
             // fireSchedule pattern.
-            const owned = (await deps.pveFootprint()).ownershipOf(source)
+            // The job's fresh footprint — the SAME load the target-guard
+            // re-check above just took (one fresh load per job run).
+            const owned = pveNow!.ownershipOf(source)
             if (owned)
               throw new GuardRefusalError(ownershipRefusal(owned, `Snapshot-first replication refused: '${source}' is PVE-owned — ${owned.reason}`))
             const name = defaultSnapName()

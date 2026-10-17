@@ -4,9 +4,10 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { RemotesPaths } from '../services/replication-remotes.js'
 import type { ResolvedRemote, Transport } from '../services/replication-transport.js'
-import { readFile } from 'node:fs/promises'
+import { readFile, rm } from 'node:fs/promises'
 import { ReplicationTaskName, TestRemoteRequest, UpsertRemoteRequest } from '@anas/shared'
 import { GuardRefusalError } from '../safety/guard.js'
+import { writeFileAtomic } from '../services/config-writer.js'
 import {
   ensureKeypair,
   fingerprintOf,
@@ -40,6 +41,15 @@ import { requireIdentity } from './identity.js'
  * remote). They are separate flags on purpose: an ordinary pin can never
  * overwrite an existing pin, and a re-trust is only ever sent after the operator
  * has been shown the old and the new fingerprint.
+ *
+ * cr.64b2-ii (L22): with either flag the request also CARRIES the shown
+ * `fingerprint` and becomes a JOB bound to it — the job re-probes and writes
+ * known_hosts only if the host still presents that exact key, and refuses
+ * 409 STATE_CHANGED (known_hosts untouched) when a different one does. Without
+ * the flags a probe stays the synchronous read it was; inside the pin job the
+ * registry mirror stays best-effort, but a failed mirror lands in the job
+ * result's `warnings` instead of being swallowed, and the job IS the audit
+ * (the old empty audit job is gone).
  *
  * Registry writes are COMPARE-AND-SWAP: the pre-check 409s on a stale version or
  * a duplicate name, and the write itself (inside the quick audit job, matching
@@ -283,40 +293,26 @@ export async function replicationRemotesRoutes(
   }
 
   /**
-   * Probe a remote in three stages, reporting WHAT failed (RemoteTestResult):
+   * Probe a remote in three stages, reporting WHAT failed (RemoteTestResult).
+   * A PURE READ — it writes nothing (cr.64b2-ii: the pinning this used to do
+   * inline when a pin intent was present lives in the pin job, bound to the
+   * fingerprint the operator was shown):
    *   1) host key known to our known_hosts? if not → keyscan → 'hostkey-unknown'
-   *      + fingerprint (the UI confirms → re-run with pin to trust it).
+   *      + fingerprint (the UI confirms → pin it with a job).
    *   2) `ssh … true` → 'auth-failed' vs 'unreachable' (from stderr / exit), or
    *      'hostkey-changed' when ssh says the presented key is not the pinned one
    *      (rebuilt/rekeyed remote — repairable through the explicit re-trust flow
    *      rather than by hand-editing known_hosts).
    *   3) `ssh … zfs --version` → 'no-zfs' vs 'ok' + zfsVersion.
    */
-  async function diagnose(host: string, port: number, resolved: ResolvedRemote, intent: PinIntent): Promise<RemoteTestResult> {
-    let known = await fingerprintOf(paths, host, port)
-    if (known && intent.retrust) {
-      // Deliberate re-trust: swap the stale pin for what the host presents now.
-      // A scan that comes back empty changes nothing (pinHostKey leaves the file
-      // alone), so a flaky network cannot silently un-trust a good remote.
-      const fp = await pinHostKey(executor, paths, host, port, { replace: true })
-      if (!fp)
-        return { stage: 'unreachable', detail: 'ssh-keyscan returned no host key (host unreachable or port closed)', knownFingerprint: known }
-      known = fp
-    }
+  async function diagnose(host: string, port: number, resolved: ResolvedRemote): Promise<RemoteTestResult> {
+    const known = await fingerprintOf(paths, host, port)
     if (!known) {
-      if (intent.pin || intent.retrust) {
-        const fp = await pinHostKey(executor, paths, host, port)
-        if (!fp)
-          return { stage: 'unreachable', detail: 'ssh-keyscan returned no host key (host unreachable or port closed)' }
-        known = fp
-      }
-      else {
-        const keys = await scanHostKeys(executor, host, port)
-        const chosen = keys.find(k => k.keyType === 'ssh-ed25519') ?? keys[0]
-        if (!chosen)
-          return { stage: 'unreachable', detail: 'ssh-keyscan returned no host key (host unreachable or port closed)' }
-        return { stage: 'hostkey-unknown', fingerprint: chosen.fingerprint }
-      }
+      const keys = await scanHostKeys(executor, host, port)
+      const chosen = keys.find(k => k.keyType === 'ssh-ed25519') ?? keys[0]
+      if (!chosen)
+        return { stage: 'unreachable', detail: 'ssh-keyscan returned no host key (host unreachable or port closed)' }
+      return { stage: 'hostkey-unknown', fingerprint: chosen.fingerprint }
     }
 
     const auth = await transport.sshExec(resolved, ['true'])
@@ -367,36 +363,106 @@ export async function replicationRemotesRoutes(
    * show the real key. known_hosts stays the source of truth; this is the
    * readable copy, refreshed whenever a probe resolved what is actually pinned
    * (the stages that report a not-yet-trusted key are excluded — nothing is
-   * pinned then). Best-effort by contract: a CAS conflict or write failure is
-   * swallowed, because a diagnostic probe must never fail on bookkeeping.
+   * pinned then). Best-effort by contract — a diagnostic probe must never fail
+   * on bookkeeping — but (cr.64b2-ii) the failure is RETURNED, not swallowed:
+   * the pin job reports it as a warning in its result; the plain probe
+   * ignores it exactly as it always did.
    */
-  async function mirrorFingerprint(name: string, result: RemoteTestResult): Promise<void> {
+  async function mirrorFingerprint(name: string, result: RemoteTestResult): Promise<string | null> {
     if (!result.fingerprint || result.stage === 'hostkey-unknown' || result.stage === 'hostkey-changed')
-      return
+      return null
     try {
       const reg = await readRemotes(paths)
       const row = reg.remotes.find(r => r.name === name)
       if (!row || row.hostKeyFingerprint === result.fingerprint)
-        return
+        return null
       await writeRemotes(
         paths,
         reg.version,
         reg.remotes.map(r => (r.name === name ? { ...r, hostKeyFingerprint: result.fingerprint } : r)),
       )
+      return null
     }
-    catch {
+    catch (err) {
       // Another node moved the registry, or the store is unwritable — the probe
       // result is still correct and known_hosts is still authoritative.
+      return `could not mirror the pinned fingerprint onto remote '${name}' in the registry: ${err instanceof Error ? err.message : String(err)}`
     }
   }
 
-  /** Fire-and-forget audit job for a test-connection probe (journald record). */
-  function auditTest(identity: NonNullable<ReturnType<typeof requireIdentity>>, params: Record<string, unknown>, result: RemoteTestResult): void {
-    jobQueue.submit(
-      'replication.remote.test',
-      { ...identity, params },
-      async () => ({ stage: result.stage }),
-    )
+  /**
+   * The pin/retrust JOB body (cr.64b2-ii, review L22): before, `?pin=true`
+   * trusted whatever key the host presented at that moment and the write
+   * happened inline at the route — the fingerprint the operator was shown was
+   * never checked. The job re-probes and writes known_hosts ONLY while the
+   * host still presents exactly that fingerprint; a different key → 409
+   * STATE_CHANGED naming both, known_hosts untouched. An ordinary pin never
+   * replaces an existing pin (a different key is already trusted here →
+   * STATE_CHANGED, the re-trust flow is the way); a re-trust REPLACES, and the
+   * write re-verifies: pinHostKey re-scans to write, so if the host flips its
+   * key between the two scans the write is undone byte-for-byte from the
+   * snapshot and the job refuses — a key nobody confirmed is never left
+   * pinned. The job IS the audit record (the old empty audit job is gone).
+   */
+  async function pinProbe(input: { host: string, port: number, user: string, registryName?: string, intent: PinIntent, fingerprint: string }): Promise<Record<string, unknown>> {
+    const pinnedNow = await fingerprintOf(paths, input.host, input.port)
+    const keys = await scanHostKeys(executor, input.host, input.port)
+    const chosen = keys.find(k => k.keyType === 'ssh-ed25519') ?? keys[0]
+    if (!chosen)
+      return { stage: 'unreachable', detail: 'ssh-keyscan returned no host key (host unreachable or port closed)', ...(pinnedNow ? { knownFingerprint: pinnedNow } : {}) }
+    if (chosen.fingerprint !== input.fingerprint) {
+      throw new GuardRefusalError({
+        status: 409,
+        code: 'STATE_CHANGED',
+        message: `Host '${input.host}' presents ${chosen.fingerprint}, not the confirmed fingerprint ${input.fingerprint} — known_hosts untouched`,
+      })
+    }
+    if (pinnedNow && pinnedNow !== input.fingerprint && !input.intent.retrust) {
+      throw new GuardRefusalError({
+        status: 409,
+        code: 'STATE_CHANGED',
+        message: `Host '${input.host}' already pins ${pinnedNow}, not the confirmed fingerprint ${input.fingerprint} — an ordinary pin never replaces a key; use the re-trust flow`,
+      })
+    }
+    if (pinnedNow !== input.fingerprint) {
+      let previous: string | null = null
+      try {
+        previous = await readFile(paths.knownHostsFile, 'utf-8')
+      }
+      catch {
+        // No known_hosts yet — the undo is removing the file.
+      }
+      const wrote = await pinHostKey(executor, paths, input.host, input.port, { replace: input.intent.retrust })
+      if (wrote !== input.fingerprint) {
+        if (previous === null)
+          await rm(paths.knownHostsFile, { force: true })
+        else
+          await writeFileAtomic(paths.knownHostsFile, previous, { mode: 0o600 })
+        throw new GuardRefusalError({
+          status: 409,
+          code: 'STATE_CHANGED',
+          message: `Host '${input.host}' presented ${wrote ?? 'no key'} while its key was being pinned, not the confirmed fingerprint ${input.fingerprint} — known_hosts left as it was`,
+        })
+      }
+    }
+    const result = await diagnose(input.host, input.port, resolvedRemoteFields(paths, input.host, input.port, input.user))
+    const warnings: string[] = []
+    if (input.registryName) {
+      const warn = await mirrorFingerprint(input.registryName, result)
+      if (warn)
+        warnings.push(warn)
+    }
+    return { ...result, ...(warnings.length ? { warnings } : {}) }
+  }
+
+  /** The 400 both test routes answer when pin/retrust arrives without the shown fingerprint. */
+  function missingFingerprintBody(): { error: { code: 'VALIDATION_ERROR', message: string } } {
+    return {
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'pin/retrust requires the \'fingerprint\' the operator was shown — resend with the fingerprint from the hostkey-unknown (or hostkey-changed) answer',
+      },
+    }
   }
 
   // --- POST /replication/remotes/test — PRE-registration probe ---------------
@@ -411,17 +477,31 @@ export async function replicationRemotesRoutes(
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid test request: ${parsed.error.issues[0]?.message}` } }
     }
-    const { host, port, user } = parsed.data
+    const { host, port, user, fingerprint } = parsed.data
 
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
 
     const intent = pinIntent(request.query)
+    if (intent.pin || intent.retrust) {
+      if (!fingerprint) {
+        reply.code(400)
+        return missingFingerprintBody()
+      }
+      // cr.64b2-ii: pinning is a mutation — a job bound to the shown
+      // fingerprint, journald-audited through the queue, answering 202 with
+      // the job to poll. The probe it runs is the read below, plus the write.
+      const job = jobQueue.submit(
+        'replication.remote.test',
+        { ...identity, params: { host, port, user, pin: intent.pin, retrust: intent.retrust, fingerprint } },
+        () => pinProbe({ host, port, user, intent, fingerprint }),
+      )
+      reply.code(202)
+      return { job }
+    }
     const resolved = resolvedRemoteFields(paths, host, port, user)
-    const result = await diagnose(host, port, resolved, intent)
-    auditTest(identity, { host, port, user, ...intent }, result)
-    return { data: result }
+    return { data: await diagnose(host, port, resolved) }
   })
 
   // --- POST /replication/remotes/:name/test — registered-remote probe --------
@@ -439,6 +519,15 @@ export async function replicationRemotesRoutes(
       if (!identity)
         return
 
+      // The registered route has no body schema of its own; the pin field is
+      // the SAME shared one (TestRemoteRequest's), picked, so it validates in
+      // exactly one place.
+      const pinBody = TestRemoteRequest.pick({ fingerprint: true }).safeParse(request.body ?? {})
+      if (!pinBody.success) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Invalid test request: ${pinBody.error.issues[0]?.message}` } }
+      }
+
       const reg = await readRemotes(paths)
       const remote = reg.remotes.find(r => r.name === name)
       if (!remote) {
@@ -447,10 +536,25 @@ export async function replicationRemotesRoutes(
       }
 
       const intent = pinIntent(request.query)
+      if (intent.pin || intent.retrust) {
+        if (!pinBody.data.fingerprint) {
+          reply.code(400)
+          return missingFingerprintBody()
+        }
+        const fingerprint = pinBody.data.fingerprint
+        const job = jobQueue.submit(
+          'replication.remote.test',
+          { ...identity, params: { remote: name, pin: intent.pin, retrust: intent.retrust, fingerprint } },
+          () => pinProbe({ host: remote.host, port: remote.port, user: remote.user, registryName: name, intent, fingerprint }),
+        )
+        reply.code(202)
+        return { job }
+      }
       const resolved = resolvedRemoteFields(paths, remote.host, remote.port, remote.user)
-      const result = await diagnose(remote.host, remote.port, resolved, intent)
+      const result = await diagnose(remote.host, remote.port, resolved)
+      // Best-effort bookkeeping on a read; a failure here keeps meaning what it
+      // always did on the plain probe (nothing to show the operator yet).
       await mirrorFingerprint(name, result)
-      auditTest(identity, { remote: name, ...intent }, result)
       return { data: result }
     },
   )

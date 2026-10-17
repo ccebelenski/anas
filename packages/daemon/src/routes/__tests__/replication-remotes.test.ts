@@ -1,9 +1,10 @@
 import type { Job } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
+import type { JobQueue } from '../../jobs/queue.js'
 import type { RemotesPaths } from '../../services/replication-remotes.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -252,17 +253,42 @@ describe('replication remotes routes (Epic 5.5.2)', () => {
     assert.equal(data.fingerprint, fingerprintFromBlob(ED_BLOB))
   })
 
-  it('test with ?pin=true pins the host key, then advances to ok + zfsVersion', async () => {
+  // --- cr.64b2-ii (L22): pin/retrust are jobs BOUND to the shown fingerprint -
+  it('cr.64b2-ii: pin without a fingerprint → 400 VALIDATION_ERROR naming it, ssh never executed', async () => {
+    const mock = mockOf(server)
+    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/test?pin=true', headers: JSON_HEADERS, payload: JSON.stringify({ host: REMOTE.host }) })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res.json().error.message, /fingerprint/)
+    await createRemote(0)
+    const res2 = await server.inject({ method: 'POST', url: '/v1/replication/remotes/nas1/test?retrust=true', headers: JSON_HEADERS, payload: '{}' })
+    assert.equal(res2.statusCode, 400)
+    assert.equal(res2.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res2.json().error.message, /fingerprint/)
+    assertNoSsh(mock)
+  })
+
+  it('cr.64b2-ii: ?pin=true is a JOB that pins ONLY the shown fingerprint, then advances to ok + zfsVersion', async () => {
     const mock = mockOf(server)
     mock.addFixture({ command: SSH_KEYSCAN, args: ['-T', '10', '-p', '22', '--', REMOTE.host], result: { stdout: `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, stderr: '', exitCode: 0 } })
     sshFix(mock, ['true'], { stdout: '', stderr: '', exitCode: 0 })
     sshFix(mock, ['zfs', '--version'], { stdout: 'zfs-2.2.3\nzfs-kmod-2.2.3\n', stderr: '', exitCode: 0 })
-    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/test?pin=true', headers: JSON_HEADERS, payload: JSON.stringify({ host: REMOTE.host }) })
-    assert.equal(res.statusCode, 200)
-    const { data } = res.json()
-    assert.equal(data.stage, 'ok')
-    assert.equal(data.zfsVersion, 'zfs-2.2.3')
-    assert.equal(data.fingerprint, fingerprintFromBlob(ED_BLOB))
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/replication/remotes/test?pin=true',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ host: REMOTE.host, fingerprint: fingerprintFromBlob(ED_BLOB) }),
+    })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const result = job.result as { stage?: string, zfsVersion?: string, fingerprint?: string, warnings?: string[] }
+    assert.equal(result.stage, 'ok')
+    assert.equal(result.zfsVersion, 'zfs-2.2.3')
+    assert.equal(result.fingerprint, fingerprintFromBlob(ED_BLOB))
+    // The known_hosts write landed inside the job, byte for byte the pinned line:
+    //   10.0.0.9 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExamp1
+    assert.equal(await readFile(paths.knownHostsFile, 'utf-8'), `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`)
   })
 
   it('test: auth-failed vs no-zfs distinguished from stderr/exit', async () => {
@@ -375,18 +401,49 @@ describe('replication remotes routes (Epic 5.5.2)', () => {
     assert.equal(await readFile(paths.knownHostsFile, 'utf-8'), `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`)
   })
 
-  it('an ordinary ?pin=true never overwrites an existing pin', async () => {
+  it('cr.64b2-ii: a pin whose shown fingerprint the host no longer presents → job refuses STATE_CHANGED naming both, known_hosts untouched', async () => {
     const mock = mockOf(server)
     await writeFile(paths.knownHostsFile, `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, 'utf-8')
     mock.addFixture({ command: SSH_KEYSCAN, args: ['-T', '10', '-p', '22', '--', REMOTE.host], result: { stdout: `${REMOTE.host} ssh-ed25519 ${NEW_BLOB}\n`, stderr: '', exitCode: 0 } })
-    sshFix(mock, ['true'], { stdout: '', stderr: CHANGED_STDERR, exitCode: 255 })
 
-    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/test?pin=true', headers: JSON_HEADERS, payload: JSON.stringify({ host: REMOTE.host }) })
-    assert.equal(res.json().data.stage, 'hostkey-changed')
+    // The operator was shown the OLD key (or any string that is not what the
+    // host now presents) — before cr.64b2-ii this request pinned NEW_BLOB
+    // whatever it was; now it is a refusal.
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/replication/remotes/test?pin=true',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ host: REMOTE.host, fingerprint: fingerprintFromBlob(ED_BLOB) }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, res.json().job.id)
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    assert.equal(job.error?.code, 'STATE_CHANGED', JSON.stringify(job.error))
+    assert.ok((job.error?.message ?? '').includes(fingerprintFromBlob(NEW_BLOB)), 'names the presented fingerprint')
+    assert.ok((job.error?.message ?? '').includes(fingerprintFromBlob(ED_BLOB)), 'names the confirmed fingerprint')
     assert.equal(await readFile(paths.knownHostsFile, 'utf-8'), `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`)
   })
 
-  it('?retrust=true REPLACES the pinned key (other hosts untouched) and the probe then completes', async () => {
+  it('cr.64b2-ii: an ordinary pin never replaces an existing pin — shown key IS presented but another is pinned → STATE_CHANGED', async () => {
+    const mock = mockOf(server)
+    await writeFile(paths.knownHostsFile, `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, 'utf-8')
+    mock.addFixture({ command: SSH_KEYSCAN, args: ['-T', '10', '-p', '22', '--', REMOTE.host], result: { stdout: `${REMOTE.host} ssh-ed25519 ${NEW_BLOB}\n`, stderr: '', exitCode: 0 } })
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/replication/remotes/test?pin=true',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ host: REMOTE.host, fingerprint: fingerprintFromBlob(NEW_BLOB) }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, res.json().job.id)
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    assert.equal(job.error?.code, 'STATE_CHANGED', JSON.stringify(job.error))
+    assert.match(job.error?.message ?? '', /never replaces a key/)
+    assert.equal(await readFile(paths.knownHostsFile, 'utf-8'), `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`)
+  })
+
+  it('cr.64b2-ii: ?retrust=true REPLACES the pinned key (other hosts untouched) in a job, and the probe completes', async () => {
     await createRemote(0)
     const mock = mockOf(server)
     await writeFile(
@@ -398,11 +455,22 @@ describe('replication remotes routes (Epic 5.5.2)', () => {
     sshFix(mock, ['true'], { stdout: '', stderr: '', exitCode: 0 })
     sshFix(mock, ['zfs', '--version'], { stdout: 'zfs-2.2.3\n', stderr: '', exitCode: 0 })
 
-    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/nas1/test?retrust=true', headers: JSON_HEADERS, payload: '{}' })
-    const { data } = res.json()
-    assert.equal(data.stage, 'ok')
-    assert.equal(data.fingerprint, fingerprintFromBlob(NEW_BLOB))
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/replication/remotes/nas1/test?retrust=true',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ fingerprint: fingerprintFromBlob(NEW_BLOB) }),
+    })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const result = job.result as { stage?: string, fingerprint?: string }
+    assert.equal(result.stage, 'ok')
+    assert.equal(result.fingerprint, fingerprintFromBlob(NEW_BLOB))
 
+    // known_hosts after the job (pasted):
+    //   other.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExamp1
+    //   10.0.0.9 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIRebuiltRebuiltRebuiltRebuiltRebuiltReb2
     const known = await readFile(paths.knownHostsFile, 'utf-8')
     assert.ok(known.includes(`${REMOTE.host} ssh-ed25519 ${NEW_BLOB}`), 'the new key is pinned')
     assert.ok(!known.includes(`${REMOTE.host} ssh-ed25519 ${ED_BLOB}`), 'the stale key is gone — replaced, not appended')
@@ -413,15 +481,60 @@ describe('replication remotes routes (Epic 5.5.2)', () => {
     assert.equal(reg.data.remotes[0].hostKeyFingerprint, fingerprintFromBlob(NEW_BLOB))
   })
 
-  it('a re-trust whose keyscan comes back empty changes nothing — a flaky network cannot un-trust a host', async () => {
+  it('cr.64b2-ii: a re-trust whose keyscan comes back empty changes nothing — a flaky network cannot un-trust a host', async () => {
     const mock = mockOf(server)
     await writeFile(paths.knownHostsFile, `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, 'utf-8')
     mock.addFixture({ command: SSH_KEYSCAN, args: ['-T', '10', '-p', '22', '--', REMOTE.host], result: { stdout: '', stderr: 'timed out', exitCode: 1 } })
 
-    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/test?retrust=true', headers: JSON_HEADERS, payload: JSON.stringify({ host: REMOTE.host }) })
-    assert.equal(res.json().data.stage, 'unreachable')
-    assert.equal(res.json().data.knownFingerprint, fingerprintFromBlob(ED_BLOB))
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/replication/remotes/test?retrust=true',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ host: REMOTE.host, fingerprint: fingerprintFromBlob(ED_BLOB) }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const result = job.result as { stage?: string, knownFingerprint?: string }
+    assert.equal(result.stage, 'unreachable')
+    assert.equal(result.knownFingerprint, fingerprintFromBlob(ED_BLOB))
     assert.equal(await readFile(paths.knownHostsFile, 'utf-8'), `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`)
+  })
+
+  it('cr.64b2-ii: a failed registry mirror lands in the job result\'s warnings, not swallowed', async () => {
+    await createRemote(0)
+    const mock = mockOf(server)
+    const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+    await writeFile(paths.knownHostsFile, `other.example ssh-ed25519 ${ED_BLOB}\n${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, 'utf-8')
+    mock.addFixture({ command: SSH_KEYSCAN, args: ['-T', '10', '-p', '22', '--', REMOTE.host], result: { stdout: `${REMOTE.host} ssh-ed25519 ${NEW_BLOB}\n`, stderr: '', exitCode: 0 } })
+    sshFix(mock, ['true'], { stdout: '', stderr: '', exitCode: 0 })
+    sshFix(mock, ['zfs', '--version'], { stdout: 'zfs-2.2.3\n', stderr: '', exitCode: 0 })
+
+    // Paused-queue pattern: the route reads the registry (fine), the job waits
+    // behind the held slots; while it waits the registry store goes unreadable,
+    // so the job's mirror write must report, not swallow.
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (let i = 0; i < 4; i++)
+      queue.submit('test.hold', { user: 'root@pam', uid: 0 }, () => held)
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/replication/remotes/nas1/test?retrust=true',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ fingerprint: fingerprintFromBlob(NEW_BLOB) }),
+    })
+    assert.equal(res.statusCode, 202)
+    const id = res.json().job.id
+    await chmod(paths.registryFile, 0o000)
+    release()
+    const job = await waitForJob(server, id)
+    await chmod(paths.registryFile, 0o600)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const result = job.result as { stage?: string, warnings?: string[] }
+    assert.equal(result.stage, 'ok', 'the probe itself succeeded; only the bookkeeping failed')
+    assert.ok(result.warnings?.some(w => /mirror/.test(w)), JSON.stringify(result))
   })
 
   // --- locations + pool pickers ---------------------------------------------
