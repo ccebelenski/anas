@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { currentLane } from '../../executor/deadline.js'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { zfsListArgs, zfsSnapshotListArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
@@ -365,5 +366,50 @@ describe('cr.63 L17 — a LUN verb and a dataset verb on the same backing serial
       await server!.close()
       server = undefined
     }
+  })
+
+  // cr.64b1 (B): `pathSourceClaims` fails OPEN on an unreadable mount table
+  // (cr.33b: a mover's run door must not 503 over a lock key). Inside a guard
+  // door it now fails CLOSED: a mutation that cannot read what its keys derive
+  // from answers 503 UNAVAILABLE naming the read. Before, the route locked
+  // nothing for the backing, the job read the table fine, and the recompute
+  // refused "changed while this run waited" — a sentence that was false.
+  describe('cr.64b1 (B) — the LUN delete when the mount table cannot be read', () => {
+    /** `findmnt --json` exits 1 (its own unreadable-mountinfo sentence) where `fails(inJob)` says so. */
+    function findmntFails(fails: (inJob: boolean) => boolean): void {
+      const mock = (server as unknown as { executor: { exec: (c: string, a: string[], o?: unknown) => Promise<ExecResult> } }).executor
+      const inner = mock.exec
+      mock.exec = async (command, args, opts) => {
+        if (command === '/usr/bin/findmnt' && args.join(' ') === '--json' && fails(currentLane().jobId !== undefined))
+          return { stdout: '', stderr: 'findmnt: cannot read /proc/self/mountinfo\n', exitCode: 1 }
+        return inner(command, args, opts)
+      }
+    }
+    const UNREADABLE = `the mount table could not be read (findmnt --json exited 1: findmnt: cannot read /proc/self/mountinfo), `
+      + `so the filesystem /gtiscsi/images lives on cannot be locked — nothing was done; try again`
+
+    it('failing at the ROUTE only: the delete of the image LUN answers 503 UNAVAILABLE naming the read — no job, no targetcli', async () => {
+      await serve(LIVE)
+      mountTable = MOUNTS_WITH_GTISCSI
+      findmntFails(inJob => !inJob)
+      const res = await inject({ method: 'DELETE', url: `${targetUrl}/luns/1` })
+      assert.equal(res.statusCode, 503, res.body)
+      assert.equal(res.json().error.code, 'UNAVAILABLE')
+      assert.ok((res.json().error.message as string).endsWith(`: ${UNREADABLE}`), res.json().error.message)
+      assert.deepEqual(queue().list(), [], 'no job was submitted')
+      assert.ok(!calls.some(c => c.command === TARGETCLI), 'no targetcli')
+    })
+
+    it('failing in the JOB only: the accepted delete refuses UNAVAILABLE naming the read, never a "changed while this run waited" — no targetcli', async () => {
+      await serve(LIVE)
+      mountTable = MOUNTS_WITH_GTISCSI
+      findmntFails(inJob => inJob)
+      const id = await accept({ method: 'DELETE', url: `${targetUrl}/luns/1` })
+      const job = await finished(id)
+      assert.equal(job.status, 'failed', JSON.stringify(job.result))
+      assert.equal(job.error?.code, 'UNAVAILABLE')
+      assert.ok(job.error!.message.endsWith(`: ${UNREADABLE}`), job.error!.message)
+      assert.ok(!calls.some(c => c.command === TARGETCLI), 'no targetcli')
+    })
   })
 })

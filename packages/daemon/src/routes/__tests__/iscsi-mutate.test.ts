@@ -1093,6 +1093,15 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
         stderr: '',
         exitCode: 0,
       } })
+      // cr.64b1 (B): the LUN add's backing keys resolve the image directory
+      // through the WHOLE mount table (`findmnt --json`), and inside a guard
+      // door an unreadable table now refuses 503 instead of locking nothing —
+      // so the cleared mock answers it too, with the same pool row.
+      mock.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: {
+        stdout: JSON.stringify({ filesystems: [{ target: mountDir, source: '/dev/mapper/ahr0-ahr0--vol', fstype: 'btrfs', options: 'rw,relatime,subvolid=5,subvol=/' }] }),
+        stderr: '',
+        exitCode: 0,
+      } })
 
       const res = await call('POST', `${targetUrl()}/luns`, {
         name: 'ahrimg',

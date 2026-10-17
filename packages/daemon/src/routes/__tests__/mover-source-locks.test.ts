@@ -5,7 +5,7 @@ import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -491,6 +491,48 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     assertRefusedByPve(job, RENAME_SNAP1)
   })
 
+  // cr.64b1 (H), the cr.56 review's possible: the claim reader resolved a
+  // source path TEXTUALLY over the mount table, so a source that is a symlink
+  // into another filesystem held the keys its text named while the run read
+  // bytes elsewhere. A real symlink in a temp tree: `<tmp>/plain/link` →
+  // `<tmp>/media`, and the mount table mounts `testpool/media` at
+  // `<tmp>/media` (the re-pointed capture's row, moved into the tree). By
+  // its text the source is on `/`; by its real path it is testpool/media.
+  it('cr.64b1 (H) cloud: a source SYMLINKED into another dataset holds THAT dataset\'s keys; a recursive destroy of it waits for the run and re-gates — no zfs destroy', async () => {
+    const base = await realpath(await mkdtemp(join(tmpdir(), 'anas-cr64b1h-')))
+    try {
+      await mkdir(join(base, 'media'), { recursive: true })
+      await mkdir(join(base, 'plain'), { recursive: true })
+      await symlink(join(base, 'media'), join(base, 'plain', 'link'))
+      const table = rewrite(FINDMNT_MEDIA, '"/testpool/media"', JSON.stringify(join(base, 'media')))
+      await writeCloudTask(QUIET, systemdDir, CloudSyncTask.parse({
+        name: 'offsite',
+        source: join(base, 'plain', 'link'),
+        remote: 'gt',
+        path: 'pve1/media',
+        schedule: 'Tue *-*-* 02:00:00',
+      }))
+      await serve('cloud.task.run', table)
+      const res = await inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', payload: { direct: true }, runner: true })
+      assert.equal(res.statusCode, 202, res.body)
+      const runId = (res.json() as JobAccepted).job.id
+      const job = await race(runId, 'cloud.task.run', DESTROY_RECURSIVE, pveClaimsMedia)
+      const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string, mode: string }[] }> }).jobs.get(runId)!
+      assert.deepEqual(record.claims.map(c => `${c.key} ${c.mode}`), [
+        `zfs:${TESTPOOL_GUID}/media shared`,
+        `zfs:${TESTPOOL_GUID} shared`,
+        `zpool:${TESTPOOL_GUID} shared`,
+        'zname:testpool shared',
+        `mount:${join(base, 'media')} shared`,
+        'task:cloud:offsite shared',
+      ])
+      assertRefusedByPve(job, DESTROY_RECURSIVE)
+    }
+    finally {
+      await rm(base, { recursive: true, force: true })
+    }
+  })
+
   it('snapshot schedule: the fire holds its target shared; a forced rollback accepted meanwhile waits and re-gates — no zfs rollback', async () => {
     await writeScheduleUnits(QUIET, systemdDir, SnapshotSchedule.parse({
       id: 'nightly-media',
@@ -733,6 +775,42 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     assert.match(pbc[0].args[4], /^media\.pxar:\/testpool\/media\/\.zfs\/snapshot\/anas-backup-media-nightly-\d+\/music$/)
   })
 
+  it('cr.64b1 (B) backup: a mount table unreadable at the ROUTE only — the run took no source key and said so (cr.33b\'s fail-open); its job reads the table fine and the run backs up, never a false "changed while this run waited"', async () => {
+    await registerBackupRepo()
+    await backupTask('/testpool/media/photos')
+    await serve('none', null, { prlimitOk: true })
+    const release = holdKey(taskClaim('backup', 'media-nightly', 'exclusive'))
+    const runId = await directRunWaiting('/v1/backup/tasks/media-nightly/run')
+    const record = (queue() as unknown as { jobs: Map<string, { claims: { key: string }[] }> }).jobs.get(runId)!
+    assert.deepEqual(record.claims.map(c => c.key), ['task:backup:media-nightly'], 'the route locked no source')
+    // The table answers again by the time the job reads it.
+    findmnt = FINDMNT_MEDIA
+    release()
+    const job = await finished(runId)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal(calls.filter(c => c.op === 'backup.task.run' && c.command === PRLIMIT).length, 1, 'pbc ran')
+  })
+
+  it('cr.64b1 (B) cloud: the same route-only unreadable mount table — the job reads it fine and the run goes past the recompute to the runner, never a false STATE_CHANGED', async () => {
+    await writeCloudTask(QUIET, systemdDir, CloudSyncTask.parse({
+      name: 'offsite',
+      source: '/testpool/media',
+      remote: 'gt',
+      path: 'pve1/media',
+      schedule: 'Tue *-*-* 02:00:00',
+    }))
+    await serve('none', null)
+    const release = holdKey(taskClaim('cloud', 'offsite', 'exclusive'))
+    const runId = await directRunWaiting('/v1/cloud/tasks/offsite/run')
+    findmnt = FINDMNT_MEDIA
+    release()
+    const job = await finished(runId)
+    assert.notEqual(job.error?.code, 'STATE_CHANGED', JSON.stringify(job.error))
+    // Past the recompute: the runner's own pre-flight is what answers (the
+    // dev mock has no /testpool/media directory to copy).
+    assert.match(job.progress ?? '', /^starting cloud sync offsite: \/testpool\/media/, JSON.stringify(job))
+  })
+
   it('cr.56 M2 cloud: the source edited onto another filesystem while the direct run waits → STATE_CHANGED naming the source and the unheld mount, and no rclone copy/sync', async () => {
     const task = (source: string) => writeCloudTask(QUIET, systemdDir, CloudSyncTask.parse({
       name: 'offsite',
@@ -755,7 +833,7 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     assert.equal(moverRan('cloud.task.run'), false, 'no rclone copy/sync argv')
   })
 
-  it('cr.56 M2 schedule: the schedule deleted and re-created under its id onto another dataset while the fire waits → STATE_CHANGED naming the target and the unheld dataset, and no zfs snapshot', async () => {
+  it('cr.56 M2 schedule: the schedule deleted and re-created under its id onto another dataset while the fire waits → STATE_CHANGED naming the target and the unheld dataset, and no zfs snapshot — and (cr.64b1 (F)) the refused fire NOTIFIES, once', async () => {
     const schedule = (dataset: string) => writeScheduleUnits(QUIET, systemdDir, SnapshotSchedule.parse({
       id: 'nightly-media',
       name: 'Nightly media',
@@ -780,15 +858,18 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
     const job = await finished(runId)
     assert.equal(job.status, 'failed', JSON.stringify(job.result))
     assert.equal(job.error?.code, 'STATE_CHANGED')
-    // cr.64a: the GUARD's own lock recompute answers this race before the
-    // door's in-body check does — same STATE_CHANGED, same unheld-object tail,
-    // no snapshot argv — so the parenthetical is the guard's claim-set
-    // sentence, not the door's bespoke `target was …; now …` one (which stays
-    // as the door's own dead-if-reached check until schedules.ts folds).
-    assert.equal(job.error?.message, `Snapshot schedule 'nightly-media' changed while this run waited (lock claims were `
-    + `zfs:${TESTPOOL_GUID}/media, zfs:${TESTPOOL_GUID}, zpool:${TESTPOOL_GUID}, zname:testpool, schedule:nightly-media; `
-    + `now zfs:${TESTPOOL_GUID}/vm-100-disk-0, zfs:${TESTPOOL_GUID}, zpool:${TESTPOOL_GUID}, zname:testpool, schedule:nightly-media) `
-    + `— the run holds no lock on Dataset 'testpool/vm-100-disk-0', so nothing was done; run it again`)
+    // cr.64a moved this check into the guard (its job door's recompute);
+    // cr.64b1 (F): the door's in-body copy is gone and the spec's `locksMoved`
+    // gives the guard's refusal the door's own cr.56 sentence again.
+    assert.equal(job.error?.message, `Snapshot schedule 'nightly-media' changed while this run waited (target was zfs:testpool/media; `
+    + `now zfs:testpool/vm-100-disk-0) — the run holds no lock on Dataset 'testpool/vm-100-disk-0', so nothing was done; run it again`)
     assert.equal(moverRan('schedule.run'), false, 'no zfs snapshot argv')
+    // cr.64b1 (F), the cr.64a review's defect (2): the refusal now happens in
+    // the guard, before the body's notify wrapper — the door's `refused` hook
+    // notifies it (the schedule's default mode, on-failure), as the in-body
+    // check did before cr.64a: one PVE notification, carrying the sentence.
+    const perl = calls.filter(c => c.op === 'schedule.run' && c.command === '/usr/bin/perl')
+    assert.equal(perl.length, 1, 'one notification for the refused fire')
+    assert.ok(perl[0].args.some(a => a.includes('target was zfs:testpool/media; now zfs:testpool/vm-100-disk-0')), JSON.stringify(perl[0].args.slice(1)))
   })
 })

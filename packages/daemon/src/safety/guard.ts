@@ -3,6 +3,8 @@ import type { FastifyReply, FastifyRequest } from 'fastify'
 import type { LockClaim, LockMode } from '../jobs/locks.js'
 import type { JobContext, JobHandler } from '../jobs/queue.js'
 import type { BoundId, ConfirmMismatch, ConfirmStore } from './confirm.js'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { covers } from '../jobs/locks.js'
 import { describeBound, IDENTITY_MISMATCH, IdentityMismatchError, identityMismatchMessage, sameBound } from './stable-id.js'
 
 /**
@@ -21,10 +23,16 @@ import { describeBound, IDENTITY_MISMATCH, IdentityMismatchError, identityMismat
  *    ({@link guardConfirm});
  *  - the JOB runs {@link guarded}: read → id → revision → scope → every gate →
  *    the lock recompute (cr.64a: the claims recomputed from the job's own
- *    re-read must all be keys the queue granted) → advisories → body, each
- *    step against facts read NOW (a fresh {@link GuardReads}; nothing read at
- *    the request reaches the job's gates). A refusal fails the job with the
- *    gate's own error code and sentence.
+ *    re-read must be COVERED by the keys the queue granted — the lock table's
+ *    own rule, cr.64b1 (A); the same re-check runs again for `reguard` and
+ *    for a second spec's {@link reverify}, cr.64b1 (D)) → advisories → body,
+ *    each step against facts read NOW (a fresh {@link GuardReads}; nothing
+ *    read at the request reaches the job's gates). A refusal fails the job
+ *    with the gate's own error code and sentence.
+ *
+ * Both doors' checks run inside the guard door ({@link insideGuardDoor},
+ * cr.64b1 (B)): a lock-claim reader that cannot read the fact its keys derive
+ * from refuses 503 UNAVAILABLE naming the read instead of locking nothing.
  *
  * A gate is written once and called from both doors; nothing else may
  * re-implement it.
@@ -71,6 +79,43 @@ export class GuardRefusalError extends Error {
     this.name = 'GuardRefusalError'
     this.jobErrorCode = refusal.code
   }
+}
+
+/**
+ * A lock-claim builder could not read the fact its keys derive from (cr.64b1
+ * (B)): the mount table or the AHR topology a source path is resolved
+ * through. Thrown by the claim readers (services/source-claims.ts) only INSIDE
+ * a guard door ({@link insideGuardDoor}); the door answers it as a 503
+ * UNAVAILABLE refusal naming the read. The message names the read and what it
+ * would have locked.
+ */
+export class LockClaimsUnreadableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'LockClaimsUnreadableError'
+  }
+}
+
+/**
+ * The guard's doors run their checks inside this context (cr.64b1 (B)): a
+ * claim reader that fails OPEN elsewhere — a data mover's run door, which must
+ * not turn into a 503 over a lock key (cr.33b) — fails CLOSED here, because a
+ * mutation that cannot read what its keys derive from cannot lock what it is
+ * about to change (the Gate contract: a fact it cannot read is a refusal,
+ * never a pass). Without it the route locked nothing for the object, the job
+ * read it fine, and the recompute refused with "changed while this run
+ * waited" — a false sentence (the cr.64a review's possible).
+ */
+const guardDoor = new AsyncLocalStorage<true>()
+
+/** True while a guard door's checks run (route or job): a claim reader must not fail open here. */
+export function insideGuardDoor(): boolean {
+  return guardDoor.getStore() === true
+}
+
+/** The 503 a guard door answers when a claim reader could not read its fact. */
+function claimsUnreadableRefusal(what: string, err: LockClaimsUnreadableError): Refusal {
+  return { status: 503, code: 'UNAVAILABLE', message: `${what}: ${err.message} — nothing was done; try again` }
 }
 
 /**
@@ -142,14 +187,18 @@ export interface GuardSpec<O> {
   locks?: (object: O, bound: GuardBound, reads: GuardReads) => Promise<LockClaim[]>
   /**
    * The sentence naming what moved for the job door's lock recompute
-   * ({@link guarded}, cr.64a): called only when the claims recomputed from the
-   * job's own re-read need a key the run was not granted, with the re-read
-   * object and the run's read cache (the spec's own reads, so the facts the
-   * `locks` builder just used are memoised). A door whose claim-bearing field
-   * has a name the operator knows (a backing, a source) gives one naming it;
-   * absent, the recompute names the two claim-key sets.
+   * ({@link guarded}, {@link reverify}, `reguard`; cr.64a): called ONLY when
+   * the claims recomputed from the job's own re-read are not covered by the
+   * ones the run was granted — the comparison runs first, on every job, and
+   * this runs on a refusal (cr.64b1 (G)) — with the re-read object, the run's
+   * read cache (the spec's own reads, so the facts the `locks` builder just
+   * used are memoised) and, from the job door, the object the ROUTE read
+   * (`was`; absent for a {@link reverify} of a second spec). A door whose
+   * claim-bearing field has a name the operator knows (a backing, a source, a
+   * schedule's target) gives one naming it; absent, the recompute names the
+   * two claim-key sets, or only the modes when only a mode moved.
    */
-  locksMoved?: (object: O, reads: GuardReads) => Promise<string> | string
+  locksMoved?: (object: O, reads: GuardReads, was?: O) => Promise<string> | string
 }
 
 /** What the confirm binds beside the request, and what the job compares. */
@@ -157,6 +206,14 @@ export interface GuardBound {
   id: BoundId
   revision?: string
   scope?: BoundId
+  /**
+   * The lock claims the route door computed with this bound (cr.64b1 (D)) —
+   * what the job is submitted with. Never signed into the confirm; the job
+   * door's lock recompute compares against it, so a {@link reverify} of a
+   * SECOND spec (the SMB grant binding) checks its keys as the job door does.
+   * Absent when the spec takes no lock.
+   */
+  locks?: readonly LockClaim[]
 }
 
 /** The route door passed: the object, what it was bound to, and the advisories it listed. */
@@ -187,6 +244,17 @@ function unboundRefusal<O>(view: ObjectView<O>, part: BoundPart): Refusal {
  * a pass goes to {@link guardConfirm} and then {@link guarded}.
  */
 export async function guardCheck<O>(spec: GuardSpec<O>): Promise<GuardPass<O> | { refusal: Refusal }> {
+  try {
+    return await guardDoor.run(true, () => routeDoor(spec))
+  }
+  catch (err) {
+    if (err instanceof LockClaimsUnreadableError)
+      return { refusal: claimsUnreadableRefusal(spec.object.what, err) }
+    throw err
+  }
+}
+
+async function routeDoor<O>(spec: GuardSpec<O>): Promise<GuardPass<O> | { refusal: Refusal }> {
   const view = spec.object
   const reads = new GuardReads()
   const object = await view.read(reads)
@@ -216,6 +284,8 @@ export async function guardCheck<O>(spec: GuardSpec<O>): Promise<GuardPass<O> | 
 
   const advisories = spec.advisories ? await spec.advisories(object, reads) : []
   const locks = spec.locks ? await spec.locks(object, bound, reads) : []
+  if (spec.locks)
+    bound.locks = locks
   return { object, bound, advisories, locks }
 }
 
@@ -247,19 +317,58 @@ function scopeChangedMessage<O>(view: ObjectView<O>, confirmed: BoundId | undefi
 /**
  * Re-read the object and re-run every check of the spec against facts read
  * now. Throws {@link IdentityMismatchError} (gone or a different object) or
- * {@link GuardRefusalError} (state or scope changed, or a gate refused).
+ * {@link GuardRefusalError} (state or scope changed, a gate refused, or the
+ * claims recomputed from this read need a key the route's did not cover).
  *
  * Exported for a job that binds a SECOND spec (cr.43 step 5: the SMB verbs
  * bind their ACL grant's spec beside the share's own): the job door runs the
  * verb's spec, and the body re-runs the second spec's checks here before its
- * first act.
+ * first act. cr.64b1 (D): the lock recompute runs here too, against the
+ * claims the route computed with this bound ({@link GuardBound.locks}), so a
+ * second spec whose keys moved while the job waited refuses as the first
+ * spec would.
  */
 export async function reverify<O>(spec: GuardSpec<O>, confirmed: GuardBound): Promise<{ object: O, reads: GuardReads }> {
+  return jobDoor(spec, () => recheck(spec, confirmed, confirmed.locks))
+}
+
+/**
+ * Run job-door checks inside the guard door (cr.64b1 (B)): a claim reader
+ * that cannot read its fact refuses the job 503 UNAVAILABLE naming the read.
+ */
+async function jobDoor<O, T>(spec: GuardSpec<O>, checks: () => Promise<T>): Promise<T> {
+  try {
+    return await guardDoor.run(true, checks)
+  }
+  catch (err) {
+    if (err instanceof LockClaimsUnreadableError)
+      throw new GuardRefusalError(claimsUnreadableRefusal(spec.object.what, err))
+    throw err
+  }
+}
+
+/**
+ * Every job-door check, in order: read → id → revision → scope → every gate →
+ * the lock recompute (cr.64a; cr.64b1 (D): for EVERY re-check — the first
+ * run, a `reguard` after a release, a second spec's `reverify` — so a re-read
+ * never acts on keys it was not granted). `held` is what the job was granted
+ * for this spec (absent: a bound built without the route door, which has no
+ * claims to compare); `was` is the route's object, for `locksMoved`;
+ * `found` hears the re-read object as soon as there is one.
+ */
+async function recheck<O>(
+  spec: GuardSpec<O>,
+  confirmed: GuardBound,
+  held: readonly LockClaim[] | undefined,
+  was?: O,
+  found?: (object: O) => void,
+): Promise<{ object: O, reads: GuardReads }> {
   const view = spec.object
   const reads = new GuardReads()
   const object = await view.read(reads)
   if (object === null)
     throw new IdentityMismatchError(view.what, confirmed.id, null)
+  found?.(object)
 
   const id = await view.id(object, reads)
   if (!id || !sameBound(confirmed.id, id))
@@ -286,6 +395,24 @@ export async function reverify<O>(spec: GuardSpec<O>, confirmed: GuardBound): Pr
   const refused = await runGates(spec.gates, object, reads)
   if (refused)
     throw new GuardRefusalError(refused)
+
+  // cr.64a: the guard's own lock recompute — cr.56's rule at its three mover
+  // doors, the guard's rule for EVERY spec. The queue granted exactly the
+  // claims the ROUTE computed from the ROUTE's read; the job acts on what its
+  // OWN re-read says, so every key the re-read needs must be covered by the
+  // ones granted ({@link unheldClaimsRefusal}: the lock table's own rule,
+  // cr.64b1 (A)) — else a destroy, rollback, rename or mount accepted in
+  // between is not serialised against this run. Needing FEWER keys than held
+  // is fine (the extra keys only make other verbs wait). `locksMoved` names
+  // what moved in the operator's own terms when the spec knows; the refusal
+  // names the objects it holds no key (or only a shared key) for.
+  if (spec.locks && held) {
+    const needed = await spec.locks(object, confirmed, reads)
+    if (unheldClaimsRefusal(view.what, '', held, needed)) {
+      const moved = spec.locksMoved ? await spec.locksMoved(object, reads, was) : claimsMoved(held, needed)
+      throw new GuardRefusalError(unheldClaimsRefusal(view.what, moved, held, needed)!)
+    }
+  }
   return { object, reads }
 }
 
@@ -300,43 +427,49 @@ export interface GuardedContext<O> extends JobContext {
   newAdvisories: string[]
   /**
    * Re-acquire the job's locks if it released them (cr.38), then re-run read →
-   * id → revision → scope → gates now (a long job calls it before each act
-   * step). Returns the fresh object; throws like the first run does.
+   * id → revision → scope → gates → the lock recompute now (a long job calls
+   * it before each act step). Returns the fresh object; throws like the first
+   * run does.
    */
   reguard: () => Promise<O>
 }
 
 export type GuardedBody<O> = (object: O, ctx: GuardedContext<O>) => Promise<unknown>
 
+/** The job door's options. */
+export interface GuardedOpts<O> {
+  /**
+   * Called when the job door's FIRST run refuses after its re-read found the
+   * object (a gate, a revision or scope change, the lock recompute, an
+   * unreadable claim fact — every {@link GuardRefusalError}), with the
+   * refusal and the re-read object, before the job fails with it. A door
+   * whose body reports its own outcome (the schedule fire's notify, cr.64b1
+   * (F)) reports the guard's refusal here, since it happens before any body
+   * runs. A refusal before the read found anything (the object gone or
+   * another one) is an identity question and is not reported here.
+   */
+  refused?: (refusal: Refusal, object: O) => Promise<void>
+}
+
 /**
  * The job door: the handler `jobQueue.submit` runs. Every check of the spec
  * runs again before the body; the body runs only when all pass.
  */
-export function guarded<O>(spec: GuardSpec<O>, pass: GuardPass<O>, body: GuardedBody<O>): JobHandler {
+export function guarded<O>(spec: GuardSpec<O>, pass: GuardPass<O>, body: GuardedBody<O>, opts: GuardedOpts<O> = {}): JobHandler {
   return async (updateProgress, jobCtx) => {
-    const { object, reads } = await reverify(spec, pass.bound)
-    // cr.64a: the guard's own lock recompute — cr.56's rule at its three mover
-    // doors, now the guard's rule for EVERY spec. The queue granted exactly the
-    // claims the ROUTE computed from the ROUTE's read; the job acts on what its
-    // OWN re-read says, so every key the re-read needs must be among the ones
-    // granted — else a destroy, rollback, rename or mount accepted in between
-    // is not serialised against this run. A held exclusive covers a needed
-    // shared; needing FEWER keys than held is fine (the extra keys only make
-    // other verbs wait). `locksMoved` names what moved in the operator's own
-    // terms when the spec knows; the refusal names the objects it holds no key
-    // for. (The three cr.56 doors keep their in-body checks; where this one
-    // fires first the refusal carries this sentence.)
-    if (spec.locks) {
-      const needed = await spec.locks(object, pass.bound, reads)
-      const refusal = unheldClaimsRefusal(
-        spec.object.what,
-        spec.locksMoved ? await spec.locksMoved(object, reads) : claimsMoved(pass.locks, needed),
-        pass.locks,
-        needed,
-      )
-      if (refusal)
-        throw new GuardRefusalError(refusal)
+    let seen: { object: O } | undefined
+    let checked: { object: O, reads: GuardReads }
+    try {
+      checked = await jobDoor(spec, () => recheck(spec, pass.bound, pass.locks, pass.object, (o) => {
+        seen = { object: o }
+      }))
     }
+    catch (err) {
+      if (err instanceof GuardRefusalError && seen && opts.refused)
+        await opts.refused(err.refusal, seen.object)
+      throw err
+    }
+    const { object, reads } = checked
     const listed = new Set(pass.advisories.map(a => a.key))
     const fresh = spec.advisories ? await spec.advisories(object, reads) : []
     const newAdvisories = fresh.filter(a => !listed.has(a.key)).map(a => a.warning)
@@ -347,10 +480,11 @@ export function guarded<O>(spec: GuardSpec<O>, pass: GuardPass<O>, body: Guarded
       reads,
       newAdvisories,
       // cr.38: a job that gave its locks back (`release()`) takes them again
-      // through the queue's FIFO before anything is re-read.
+      // through the queue's FIFO before anything is re-read — and (cr.64b1
+      // (D)) the re-read's claims are recomputed against the ones it holds.
       reguard: async () => {
         await jobCtx.reacquire()
-        return (await reverify(spec, pass.bound)).object
+        return (await jobDoor(spec, () => recheck(spec, pass.bound, pass.locks, pass.object))).object
       },
     })
   }
@@ -367,11 +501,15 @@ export function guarded<O>(spec: GuardSpec<O>, pass: GuardPass<O>, body: Guarded
  * holds no key for — a destroy, rollback, rename or unmount accepted meanwhile
  * is not serialised against it. So the job recomputes the claims from its own
  * re-read, with the route's builder, and this compares them with the set it
- * holds: every claim it needs must be held (a held exclusive claim covers a
- * needed shared one). A run that now needs FEWER keys (an archive removed)
+ * holds: every claim it needs must be COVERED by the held set — the lock
+ * table's own rule ({@link covers}, jobs/locks.ts, cr.64b1 (A)): the same key
+ * in a mode that excludes as much (a held exclusive covers a needed shared),
+ * or the pool's name key held exclusive for any guid-keyed claim of that pool
+ * (cr.33b's fallback). A run that now needs FEWER keys (an archive removed)
  * holds everything it acts on and proceeds — the extra keys only make other
  * verbs wait for it. `moved` names the claim-bearing field that moved, as the
- * door reads it; the refusal names the objects it holds no lock on.
+ * door reads it; the refusal names the objects it holds no lock on, and those
+ * it holds only a shared lock on where it now needs exclusive (cr.64b1 (C)).
  *
  * Returns the STATE_CHANGED refusal, or null when every needed claim is held.
  */
@@ -381,22 +519,27 @@ export function unheldClaimsRefusal(
   held: readonly LockClaim[],
   needed: readonly LockClaim[],
 ): Refusal | null {
-  const holds = new Map<string, LockMode>()
-  for (const c of held) {
-    if (holds.get(c.key) !== 'exclusive')
-      holds.set(c.key, c.mode)
-  }
-  const missing = needed.filter((c) => {
-    const mode = holds.get(c.key)
-    return mode === undefined || (mode === 'shared' && c.mode === 'exclusive')
-  })
+  // cr.64b1 (A): the lock table's own rule (`covers`, jobs/locks.ts), never
+  // a key-by-key comparison of its own — so a held exclusive name key (the
+  // cr.33b fallback a route took when the pool's guid could not be read)
+  // covers every guid-keyed claim of that pool the job's re-read now needs.
+  const missing = needed.filter(c => !covers(held, c))
   if (missing.length === 0)
     return null
-  const objects = [...new Set(missing.map(c => c.what))].join(', ')
+  // cr.64b1 (C): a needed claim whose KEY is held (shared, where exclusive is
+  // needed now) is not "no lock" — the sentence says which it is.
+  const heldKeys = new Set(held.map(c => c.key))
+  const objects = (claims: LockClaim[]): string => [...new Set(claims.map(c => c.what))].join(', ')
+  const none = missing.filter(c => !heldKeys.has(c.key))
+  const weak = missing.filter(c => heldKeys.has(c.key))
+  const holds = [
+    ...(none.length ? [`no lock on ${objects(none)}`] : []),
+    ...(weak.length ? [`only a shared lock on ${objects(weak)}`] : []),
+  ].join(' and ')
   return {
     status: 409,
     code: 'STATE_CHANGED',
-    message: `${what} changed while this run waited (${moved}) — the run holds no lock on ${objects}, so nothing was done; run it again`,
+    message: `${what} changed while this run waited (${moved}) — the run holds ${holds}, so nothing was done; run it again`,
   }
 }
 
@@ -409,6 +552,23 @@ export function unheldClaimsRefusal(
 function claimsMoved(held: readonly LockClaim[], needed: readonly LockClaim[]): string {
   const keys = (claims: readonly LockClaim[]): string =>
     claims.length ? claims.map(c => c.key).join(', ') : 'none'
+  // cr.64b1 (C): the same keys, so only a MODE moved — name the keys whose
+  // mode did, in both modes (the two key lists alone would read identical).
+  const modes = (claims: readonly LockClaim[]): Map<string, LockMode> => {
+    const out = new Map<string, LockMode>()
+    for (const c of claims) {
+      if (out.get(c.key) !== 'exclusive')
+        out.set(c.key, c.mode)
+    }
+    return out
+  }
+  const was = modes(held)
+  const now = modes(needed)
+  if (was.size === now.size && [...now.keys()].every(k => was.has(k))) {
+    const moved = [...now].filter(([k, m]) => was.get(k) !== m).map(([k]) => k)
+    if (moved.length > 0)
+      return `lock modes were ${moved.map(k => `${k} ${was.get(k)}`).join(', ')}; now ${moved.map(k => `${k} ${now.get(k)}`).join(', ')}`
+  }
   return `lock claims were ${keys(held)}; now ${keys(needed)}`
 }
 
@@ -643,6 +803,15 @@ function claim(key: string, mode: LockMode, what: string): LockClaim {
 }
 
 /**
+ * A guid- or VG-UUID-keyed claim that rides with its pool's name key (cr.33b),
+ * saying so (`within`, jobs/locks.ts): the lock recompute's {@link covers}
+ * then knows a held exclusive name key covers it (cr.64b1 (A)).
+ */
+function within(c: LockClaim, nameKey: LockClaim): LockClaim {
+  return { ...c, within: nameKey.key }
+}
+
+/**
  * `zpool:<guid>` — every ZFS verb on the pool or on anything in it: exclusive
  * for the pool-structural verbs (destroy, export, upgrade, mountpoint, add or
  * remove a vdev, attach, replace, raidz expand, cleanup), shared for
@@ -670,7 +839,8 @@ export function znameClaim(pool: string, mode: LockMode = 'exclusive'): LockClai
 export function poolClaims(pool: string, guid: string | null | undefined, mode: LockMode, opts: { namespace?: boolean } = {}): LockClaim[] {
   if (!guid)
     return [znameClaim(pool)]
-  return [zpoolClaim(guid, mode, pool), znameClaim(pool, opts.namespace ? 'exclusive' : 'shared')]
+  const name = znameClaim(pool, opts.namespace ? 'exclusive' : 'shared')
+  return [within(zpoolClaim(guid, mode, pool), name), name]
 }
 
 const SNAPSHOT_OR_BOOKMARK = /[@#]/
@@ -705,11 +875,12 @@ export function zfsClaims(poolGuid: string, dataset: string, mode: LockMode): Lo
     const rel = parts.slice(1, depth).join('/')
     return rel ? `zfs:${poolGuid}/${rel}` : `zfs:${poolGuid}`
   }
-  const claims: LockClaim[] = [claim(key(parts.length), mode, `Dataset '${name}'`)]
+  const poolName = znameClaim(parts[0], 'shared')
+  const claims: LockClaim[] = [within(claim(key(parts.length), mode, `Dataset '${name}'`), poolName)]
   for (let depth = parts.length - 1; depth >= 1; depth--)
-    claims.push(claim(key(depth), 'shared', `Dataset '${parts.slice(0, depth).join('/')}'`))
-  claims.push(zpoolClaim(poolGuid, 'shared', parts[0]))
-  claims.push(znameClaim(parts[0], 'shared'))
+    claims.push(within(claim(key(depth), 'shared', `Dataset '${parts.slice(0, depth).join('/')}'`), poolName))
+  claims.push(within(zpoolClaim(poolGuid, 'shared', parts[0]), poolName))
+  claims.push(poolName)
   return claims
 }
 
@@ -819,5 +990,6 @@ export function scheduleClaim(id: string, mode: LockMode): LockClaim {
 export function ahrPoolClaims(pool: string, vgUuid: string | null | undefined, mode: LockMode, opts: { namespace?: boolean } = {}): LockClaim[] {
   if (!vgUuid)
     return [ahrnameClaim(pool)]
-  return [ahrClaim(vgUuid, mode, pool), ahrnameClaim(pool, opts.namespace ? 'exclusive' : 'shared')]
+  const name = ahrnameClaim(pool, opts.namespace ? 'exclusive' : 'shared')
+  return [within(ahrClaim(vgUuid, mode, pool), name), name]
 }

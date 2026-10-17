@@ -1202,7 +1202,7 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     const sourceTask = direct ? await readTask(systemdDir, name) : null
     const source = sourceTask
       ? await pathSourceClaims(executor, [sourceTask.source], readAhrPools)
-      : { claims: [], unlocked: [] }
+      : { claims: [], unlocked: [], unread: [] }
     // cr.41 (§4.2 task key, cr.33b constraint): ONLY the DIRECT run holds the
     // task's key — shared — because it is the one that reads the task and does
     // the work. The Run-Now SUPERVISOR holds NO task key (and no source claim).
@@ -1257,7 +1257,14 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
           // by THIS read must be among the ones the queue granted from the
           // route's read — recomputed, not bound as a revision, because the
           // keys also move when the filesystem under an unchanged path moves.
-          const needed = await pathSourceClaims(executor, [task.source], readAhrPools)
+          //
+          // cr.64b1 (B): a path the ROUTE could not resolve because a read
+          // failed (`source.unread`) was never locked — the run said so in its
+          // progress line, cr.33b's fail-open — so it is left out of the
+          // recompute: a read that succeeds now is not that path having moved.
+          // An EDITED path is another path, and still recomputed.
+          const routeUnread = new Set(source.unread)
+          const needed = await pathSourceClaims(executor, [task.source].filter(p => !routeUnread.has(p)), readAhrPools)
           const moved = unheldClaimsRefusal(
             `Cloud sync task '${name}'`,
             sourcePathsMoved({ name: 'source', plural: false }, sourceTask ? [sourceTask.source] : [], [task.source]),

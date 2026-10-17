@@ -26,11 +26,48 @@ export interface LockClaim {
   mode: LockMode
   /** How a waiting job's progress line names the object: `Pool 'tank'`. */
   what: string
+  /**
+   * The key of a claim EVERY claim set holding this key also holds, at least
+   * shared (cr.33b: every guid-keyed `zpool:`/`zfs:` claim rides with its
+   * pool's `zname:` key, every `ahr:` claim with its `ahrname:` key). The
+   * builders in `safety/guard.ts` set it, {@link normaliseClaims} refuses a
+   * set that names it without carrying it, and {@link covers} reads it: a
+   * held exclusive `zname:<pool>` excludes every job holding a claim on that
+   * pool's guid keys, so it covers them (cr.64b1 (A)).
+   */
+  within?: string
 }
 
 /** Two claims on the same key conflict unless both are shared. */
 export function conflicts(a: LockMode, b: LockMode): boolean {
   return a === 'exclusive' || b === 'exclusive'
+}
+
+const MODES: readonly LockMode[] = ['shared', 'exclusive']
+
+/** Holding a key in `held` excludes every claim on it that holding it in `needed` would exclude ({@link conflicts}, per mode). */
+function excludesAsMuch(held: LockMode, needed: LockMode): boolean {
+  return MODES.every(other => !conflicts(needed, other) || conflicts(held, other))
+}
+
+/**
+ * Does holding `held` exclude every job that holding `needed` would exclude?
+ * The lock table's own rule ({@link conflicts}) asked of a whole held set
+ * (cr.64b1 (A)) — the job door's lock recompute (`unheldClaimsRefusal`,
+ * safety/guard.ts) asks it, so the recompute and the table cannot disagree:
+ *
+ *  - a claim on the SAME key whose mode excludes at least as much — the same
+ *    mode, or exclusive held for a needed shared;
+ *  - a held claim on the needed claim's {@link LockClaim.within} key whose
+ *    mode excludes EVERY mode (exclusive): every job holding the needed key
+ *    holds the `within` key too (shared or exclusive), so none can run beside
+ *    it — the cr.33b fallback (`zname:<pool>` exclusive, taken when the pool's
+ *    guid could not be read) covers every `zpool:<guid>` and `zfs:<guid>/…`
+ *    claim of that pool.
+ */
+export function covers(held: readonly LockClaim[], needed: LockClaim): boolean {
+  return held.some(h => (h.key === needed.key && excludesAsMuch(h.mode, needed.mode))
+    || (needed.within !== undefined && h.key === needed.within && excludesAsMuch(h.mode, 'exclusive')))
 }
 
 /**
@@ -47,6 +84,13 @@ export function normaliseClaims(claims: readonly LockClaim[]): LockClaim[] {
       byKey.set(claim.key, { ...claim })
     else if (claim.mode === 'exclusive')
       byKey.set(claim.key, { ...seen, mode: 'exclusive' })
+  }
+  // cr.64b1 (A): `within` is a promise {@link covers} relies on — a set that
+  // names it must carry that key. A programming error, refused before the
+  // job is recorded (as a conflicting grant is).
+  for (const claim of byKey.values()) {
+    if (claim.within !== undefined && !byKey.has(claim.within))
+      throw new TypeError(`lock claim '${claim.key}' rides with '${claim.within}', which its claim set does not carry`)
   }
   return [...byKey.values()]
 }

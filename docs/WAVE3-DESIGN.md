@@ -427,6 +427,10 @@ A job holds its locks only while ANAS itself is changing the object. Kernel-driv
   shared for the run (`pathSourceClaims`, as a mover's source), and the new-LUN restore holds the new volume's
   dataset keys (as `zfs.create`) or its image directory's filesystem keys beside `iscsi-target:<iqn>` until
   the map. A destroy, rollback or unmount of the destination waits for the restore and re-gates after it.)*
+  *(cr.64a/cr.64b1, 2026-10-16 — retired for the in-place image restore too: "an image restore holds only its
+  iSCSI keys" no longer holds for either image door. The in-place image restore holds its LUN backing's keys
+  (`lunBackingClaims`: a zvol's `zfs:` keys, an image file's filesystem `zfs:`/`ahr:`/`mount:` keys, shared)
+  beside `iscsi-target:` and `iscsi-lun:`, so a dataset destroy on the backing waits for it.)*
   *(cr.56, 2026-10-16 — the claims a mover holds are the ROUTE's, computed from the route's read of its task or
   schedule; the job re-reads the object and recomputes them from that read with the same builder, and refuses
   `STATE_CHANGED` before any mover argv when it needs a key it does not hold (an archive path or a cloud source edited
@@ -440,6 +444,23 @@ A job holds its locks only while ANAS itself is changing the object. Kernel-driv
   restore's backing) says so through `locksMoved`, and the generic fallback names the two claim-key sets. The three
   cr.56 doors keep their in-body checks — the backup and cloud runs are raw submits the guard never wraps, and the
   schedule fire's own refusal is reached only if the guard's is somehow not.)*
+  *(cr.64b1, 2026-10-16 — the recompute's second pass. (A) It compares by DOMINANCE, with the lock table's own rule:
+  `covers` (jobs/locks.ts) is built from `conflicts`, and every guid- or VG-UUID-keyed claim names the pool's name
+  key it rides with (`within`, set by `zfsClaims`/`poolClaims`/`ahrPoolClaims`; the queue refuses a set that names
+  it without carrying it), so the cr.33b fallback a route took when its guid read failed — `zname:<pool>` or
+  `ahrname:<pool>` exclusive — covers every guid-keyed claim of that pool the job's re-read needs, and the job runs.
+  (B) Inside a guard door (both doors' checks) a claim reader that cannot read the mount table or the AHR topology
+  refuses 503 `UNAVAILABLE` naming the read, instead of locking nothing at the route and refusing "changed while this
+  run waited" in the job; the backup and cloud run doors keep cr.33b's fail-open and leave the paths their route
+  could not read (`unread`) out of their recompute. (C) A mode-only move reads `lock modes were …; now …`, and a key
+  held shared where exclusive is needed is named "only a shared lock on". (D) The recompute is part of the guard's
+  one re-check: `reguard` after a release and a second spec's `reverify` (the SMB grant binding) run it against the
+  claims the route computed (`GuardBound.locks`). (F) The schedule fire's in-body copy is gone: its spec's
+  `locksMoved` gives the guard's refusal the door's `target was …; now …` sentence, and `guarded`'s `refused` hook
+  notifies the refused fire as the body would have. (H) The mover claim readers resolve a source path with realpath
+  over every existing component (the missing tail appended; a `/dev/zvol/…` path kept as written) before deriving
+  keys, so a source that is a symlink into another filesystem holds that filesystem's keys. The consistency
+  derivation (`deriveConsistency`) still resolves the path's TEXT — see EPICS cr.64b1's residuals.)*
 
 Locks do not fix a different starvation: four long data movers fill all 4 slots and a short destroy waits
 for a slot, not for a lock (Run Now holds two: the supervisor and the direct run, `queue.ts:147-151`). **Recommendation:** a

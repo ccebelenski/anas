@@ -1,10 +1,14 @@
 import type { AhrPool } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { LockClaim } from '../jobs/locks.js'
-import { ahrPoolClaims, mountClaim, zfsDatasetClaims } from '../safety/guard.js'
+import { realpath } from 'node:fs/promises'
+import { posix } from 'node:path'
+import { zvolDatasetFromPath } from '@anas/shared'
+import { ahrPoolClaims, insideGuardDoor, LockClaimsUnreadableError, mountClaim, zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
 import { readFilesystemFacts, sourceFilesystemOf } from './backup-consistency.js'
 import { normalizeMountpointPath } from './mounts.js'
+import { normalizePath } from './nested-filesystems.js'
 
 /**
  * The SHARED claims a data mover holds on its source for the run (story
@@ -30,7 +34,10 @@ import { normalizeMountpointPath } from './mounts.js'
  * A PATH is resolved to its filesystem the way the backup consistency
  * derivation already does it (`sourceFilesystemOf` beside `deriveConsistency`
  * in backup-consistency.ts: the zvol device form, then the longest mount-table
- * target containing the path) — one resolver, not a second one. A path whose
+ * target containing the path) — one resolver, not a second one — but over the
+ * path's REAL path ({@link realSourcePath}, cr.64b1 (H)): the mover reads
+ * through symlinks, so a source that is a symlink into another filesystem
+ * holds THAT filesystem's keys, never the ones its text names. A path whose
  * filesystem cannot be identified (unreadable mount table, no row contains it)
  * takes no key; the run says so in its progress line ({@link SourceClaims.unlocked}).
  * The AHR read is the same fail-open (cr.33c F1): when the topology cannot be
@@ -51,6 +58,15 @@ export interface SourceClaims {
   claims: LockClaim[]
   /** One sentence per source the run holds no key on (empty when every source resolved). */
   unlocked: string[]
+  /**
+   * The sources whose keys were NOT READ (cr.64b1 (B)): a read the
+   * resolution needs failed (the mount table; the AHR topology for a path on
+   * a btrfs mount), so the set is missing keys it would have had. A mover's
+   * job recompute treats these as not read at the route — they were never
+   * locked, and the run said so — instead of reading a later, successful read
+   * as the source having moved.
+   */
+  unread: string[]
 }
 
 const POOL_PART_END = /[/@#]/
@@ -108,13 +124,30 @@ export async function pathSourceClaims(
   readAhrPools: (executor: CommandExecutor) => Promise<AhrPool[]>,
 ): Promise<SourceClaims> {
   if (paths.length === 0)
-    return { claims: [], unlocked: [] }
+    return { claims: [], unlocked: [], unread: [] }
   const facts = await readFilesystemFacts(executor, readAhrPools)
-  const resolved = paths.map(path => ({ path, fs: sourceFilesystemOf(path, facts) }))
+  const resolved = await Promise.all(paths.map(async path => ({ path, fs: sourceFilesystemOf(await realSourcePath(path), facts) })))
   const guids = await poolGuids(executor, resolved.flatMap(r => (r.fs?.kind === 'zfs' ? [r.fs.dataset] : [])))
   const claims: LockClaim[] = []
   const unlocked: string[] = []
+  const unread: string[] = []
+  // cr.64b1 (B): inside a guard door (a mutation's route or job checks) a
+  // failed read is a refusal, never a lock on nothing — the door answers 503
+  // UNAVAILABLE naming the read. Outside one (the mover run doors) it stays
+  // cr.33b's fail-open: no key, and the run says so.
+  const failClosed = insideGuardDoor()
   for (const { path, fs } of resolved) {
+    if (!fs && facts.mountsUnreadable !== undefined) {
+      if (failClosed)
+        throw new LockClaimsUnreadableError(`the mount table could not be read (${facts.mountsUnreadable}), so the filesystem ${path} lives on cannot be locked`)
+      unread.push(path)
+    }
+    const ahrUnread = facts.ahrUnreadable === true && fs?.kind === 'other' && facts.mounts.get(fs.mountpoint)?.fstype === 'btrfs'
+    if (ahrUnread) {
+      if (failClosed)
+        throw new LockClaimsUnreadableError(`the AHR topology could not be read (${facts.ahrUnreadableReason ?? 'unreadable'}), so it is unknown whether the btrfs filesystem ${path} lives on is an ANAS AHR pool to lock`)
+      unread.push(path)
+    }
     if (!fs) {
       unlocked.push(facts.mounts.size === 0
         ? `${path}: no lock on the source - the mount table could not be read, so its filesystem is unknown`
@@ -126,7 +159,7 @@ export async function pathSourceClaims(
     // no `ahr:` key, and says so, exactly like the mount-table failure: the
     // btrfs mount might be ANAS's, and an `ahr:` key it should have held would
     // have made a destroy accepted beside the run wait for it.
-    if (facts.ahrUnreadable && fs.kind === 'other' && facts.mounts.get(fs.mountpoint)?.fstype === 'btrfs') {
+    if (ahrUnread) {
       unlocked.push(`${path}: no lock on the source - the AHR topology could not be read, so it is unknown whether the filesystem is an ANAS AHR pool`)
     }
     if (fs.kind === 'zfs')
@@ -136,7 +169,43 @@ export async function pathSourceClaims(
     if (fs.mountpoint !== undefined)
       claims.push(mountClaim(normalizeMountpointPath(fs.mountpoint), 'shared'))
   }
-  return { claims, unlocked }
+  return { claims, unlocked, unread }
+}
+
+/**
+ * The path the kernel reaches for `path` (cr.64b1 (H)): realpath over every
+ * component that EXISTS — the longest existing ancestor, resolved through its
+ * symlinks, with the missing tail appended as written (a source that does not
+ * exist yet still names the filesystem it would be created on). The shape
+ * cr.52r gives the mount-target refusal: walk up until a component exists,
+ * never skip the step on ENOENT.
+ *
+ * A zvol device path (`/dev/zvol/<pool>/<vol>`) is kept as written: it IS the
+ * volume's name, and its realpath (`/dev/zdN`) would lose the dataset. A path
+ * that cannot be resolved for another reason (a symlink loop, EACCES) is kept
+ * as written — the mover cannot read through it either.
+ *
+ * `real` is node's realpath; a test hands its own.
+ */
+export async function realSourcePath(path: string, real: (p: string) => Promise<string> = realpath): Promise<string> {
+  const text = normalizePath(path)
+  if (zvolDatasetFromPath(text))
+    return text
+  const tail: string[] = []
+  let head = text
+  for (;;) {
+    try {
+      const resolved = await real(head)
+      return tail.length ? posix.join(resolved, ...tail.reverse()) : resolved
+    }
+    catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if ((code !== 'ENOENT' && code !== 'ENOTDIR') || head === '/' || !head.startsWith('/'))
+        return text
+      tail.push(posix.basename(head))
+      head = posix.dirname(head)
+    }
+  }
 }
 
 /** The progress line a run writes when some source holds no key (null when all do). */

@@ -7,7 +7,7 @@ import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { UnitTaskObject } from '../services/task-units.js'
 import { PRUNED_NAMES_PER_DATASET, ScheduleId, SnapshotSchedule } from '@anas/shared'
 import { parseZpoolList } from '../parsers/zpool-list.js'
-import { guardCheck, guarded, GuardRefusalError, scheduleClaim, sendRefusal, unheldClaimsRefusal } from '../safety/guard.js'
+import { guardCheck, guarded, scheduleClaim, sendRefusal } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { loadPveFootprint, ownershipRefusal, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { notifyScheduleRun } from '../services/snapshot-notify.js'
@@ -309,7 +309,19 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     }
   }
 
-  /** A fire's object is the schedule itself, re-read in the job (Cap → re-read, §2.4). */
+  /**
+   * A fire's object is the schedule itself, re-read in the job (Cap → re-read, §2.4).
+   *
+   * cr.56 (review M2) → cr.64a → cr.64b1 (F): the claim-bearing field is the
+   * TARGET (kind + dataset or AHR pool, resolved to the pool's guid / VG
+   * UUID). An edit cannot move it (PUT refuses a retarget), but a delete and a
+   * re-create under the same id can, and so can a pool re-created under its
+   * name: the guard's job door recomputes `locks` from its own re-read and
+   * refuses STATE_CHANGED when the fire needs a key the queue did not grant —
+   * the guard's rule, so the door's own in-body copy of it is gone, and
+   * `locksMoved` gives that refusal the door's sentence (`target was …; now
+   * …`, or the same target on another pool).
+   */
   function scheduleRunSpec(id: string): GuardSpec<SnapshotScheduleT> {
     return {
       operation: 'schedule.run',
@@ -322,14 +334,15 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       },
       gates: [],
       locks: async o => scheduleRunClaims(o),
+      locksMoved: (o, _reads, was) => (was ? targetMoved(was.target, o.target) : `target ${targetKey(o.target)} moved`),
     }
   }
 
   /**
    * A fire's claims (cr.33b): its target shared — the dataset (its ancestors
    * and the pool shared) or the AHR pool — and its own `schedule:<id>` shared.
-   * The ONE builder the route (the spec's `locks`) and the job's cr.56
-   * re-check both call.
+   * The ONE builder; the guard calls it at the route door and again in the
+   * job door's recompute.
    */
   async function scheduleRunClaims(o: SnapshotScheduleT): Promise<LockClaim[]> {
     return [
@@ -626,44 +639,43 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
 
+    // cr.64b1 (F): a fire the GUARD refuses (its lock recompute, before any
+    // body runs) is a failed fire like any other, so it notifies — the
+    // schedule's own mode, the re-read schedule, the refusal's sentence —
+    // exactly as the in-body check did before cr.64a moved it into the guard.
+    let firedAt = 0
+    const fire = guarded(spec, pre, async (schedule, { updateProgress }) => {
+      // 9.4: this job is the ONE place every fire converges (the timer's
+      // runner and a UI Run Now both submit it), so it is also the one place
+      // a run notification is emitted — success, warning (a prune that had to
+      // skip held snapshots) or failure, gated by the SCHEDULE'S OWN mode
+      // (`schedule.notify`, which rode in with the unit JSON). Best-effort by
+      // contract: notifyScheduleRun never throws, so a broken mail target
+      // cannot turn a good snapshot into a failed job.
+      const startedAt = Date.now()
+      try {
+        const result = await fireSchedule(schedule, updateProgress)
+        await notifyScheduleRun(executor, { schedule, result, elapsedMs: Date.now() - startedAt })
+        return result
+      }
+      catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        await notifyScheduleRun(executor, { schedule, error: message, elapsedMs: Date.now() - startedAt })
+        throw err
+      }
+    }, {
+      refused: async (refusal, schedule) => {
+        await notifyScheduleRun(executor, { schedule, error: refusal.message, elapsedMs: Date.now() - firedAt })
+      },
+    })
+
     const job = jobQueue.submit(
       'schedule.run',
       { ...identity, params: { schedule: id } },
-      guarded(spec, pre, async (schedule, { updateProgress }) => {
-        // 9.4: this job is the ONE place every fire converges (the timer's
-        // runner and a UI Run Now both submit it), so it is also the one place
-        // a run notification is emitted — success, warning (a prune that had to
-        // skip held snapshots) or failure, gated by the SCHEDULE'S OWN mode
-        // (`schedule.notify`, which rode in with the unit JSON). Best-effort by
-        // contract: notifyScheduleRun never throws, so a broken mail target
-        // cannot turn a good snapshot into a failed job.
-        const startedAt = Date.now()
-        try {
-          // cr.56 (review M2): the claim-bearing field is the TARGET (kind +
-          // dataset or AHR pool, resolved to the pool's guid / VG UUID). An
-          // edit cannot move it (PUT refuses a retarget), but a delete and a
-          // re-create under the same id can, and so can a pool re-created
-          // under its name: the job re-read the schedule (guarded), so it
-          // recomputes the claims from that read with the spec's own builder
-          // and refuses when it needs a key the queue did not grant it.
-          const moved = unheldClaimsRefusal(
-            `Snapshot schedule '${id}'`,
-            targetMoved(pre.object.target, schedule.target),
-            pre.locks,
-            await scheduleRunClaims(schedule),
-          )
-          if (moved)
-            throw new GuardRefusalError(moved)
-          const result = await fireSchedule(schedule, updateProgress)
-          await notifyScheduleRun(executor, { schedule, result, elapsedMs: Date.now() - startedAt })
-          return result
-        }
-        catch (err) {
-          const message = err instanceof Error ? err.message : String(err)
-          await notifyScheduleRun(executor, { schedule, error: message, elapsedMs: Date.now() - startedAt })
-          throw err
-        }
-      }),
+      (updateProgress, ctx) => {
+        firedAt = Date.now()
+        return fire(updateProgress, ctx)
+      },
       // cr.33b (§4.2 "schedule fire", S): the fire holds a SHARED claim on its
       // target — the dataset (its ancestors and the pool shared) or the AHR
       // pool — so a destroy, rename or rollback of the target accepted while it

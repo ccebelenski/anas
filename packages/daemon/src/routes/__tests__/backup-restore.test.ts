@@ -4,11 +4,12 @@ import type { ExecStreamResult } from '../../executor/types.js'
 import type { LockClaim } from '../../jobs/locks.js'
 import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
-import { constants } from 'node:fs'
+import { constants, readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { anasIqn } from '@anas/shared'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { iscsiTargetClaim, zfsDatasetClaims, znameClaim } from '../../safety/guard.js'
@@ -16,6 +17,9 @@ import { createServer } from '../../server.js'
 import { volsizeArgs } from '../../services/backup-restore.js'
 import { PBC } from '../../services/backup-runner.js'
 import { withIscsiLock } from '../../services/iscsi-mutate.js'
+
+/** The captured mount trees (`findmnt --json`). */
+const MOUNTS_FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/mounts')
 
 /**
  * backup2.7 — `POST /v1/backup/restore` (kind `image`): EVERY GATE BEFORE THE JOB.
@@ -1585,6 +1589,38 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         assert.equal(job.error?.code, 'STATE_CHANGED')
         assert.match(job.error!.message, /was: \/tank\/images\/newvol\.raw; now: \/srv\/images\/newvol\.raw/)
         assertNothingDestructive()
+      })
+
+      // cr.64b1 (E): the new-LUN door's own `locksMoved` sentence, emitted by
+      // the real route. The backing PATH does not move (the unmoved gate
+      // passes) — the filesystem under it does: the dev mock's mount table has
+      // no row for /tank/images (the image directory sits on `/`), and while
+      // the restore waits the dataset is mounted there (findmnt-full.json's
+      // `mnttest/data` row re-pointed, as mover-source-locks.test.ts does).
+      it('cr.64b1 (E): the backing path unchanged but its FILESYSTEM moved while the job waited — STATE_CHANGED with the door\'s own sentence naming the backing; no volume, no targetcli, no stream', async () => {
+        await serveAnas()
+        const mock = mockOf()
+        mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: 'tank\t/tank\ntank/images\t/tank/images\n', stderr: '', exitCode: 0 } })
+        const payload = newLunBody(targetWith({ backing: { kind: 'file', dataset: 'tank/images' } }))
+        const code = await mint(payload)
+        const blocker = hold('iscsi.acl.add', iscsiTargetClaim(ANAS_IQN))
+        const res = await restore(payload, { 'x-anas-confirm': code })
+        assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+        const id = res.body.job!.id
+        await queuedBehind(id, `waiting for iscsi.acl.add (job ${blocker.id}) on iSCSI target ${ANAS_IQN}`)
+
+        const mounted = readFileSync(join(MOUNTS_FIXTURES, 'findmnt-full.json'), 'utf8')
+          .replace('"target": "/mnttest/data"', '"target": "/tank/images"')
+          .replace('"source": "mnttest/data"', '"source": "tank/images"')
+        mock.prependFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: mounted, stderr: '', exitCode: 0 } })
+        blocker.release()
+        const job = await waitForJob(id)
+        assert.equal(job.status, 'failed')
+        assert.equal(job.error?.code, 'STATE_CHANGED')
+        assert.match(job.error!.message, / changed while this run waited \(the new LUN's backing \/tank\/images\/newvol\.raw now lives on a different filesystem\) — the run holds no lock on /)
+        assert.match(job.error!.message, /the mount at \/tank\/images/)
+        assertNothingDestructive()
+        assert.ok(!mockOf().calls.some(c => c.command === ZFS && c.args[0] === 'create'), 'no volume created')
       })
 
       it('cr.56: a credential DELETED while the new-LUN restore waits fails the job naming it — the job reads the repository and its secret again; no volume, no targetcli, no stream', async () => {

@@ -1,6 +1,7 @@
 import type { GuardSpec } from '../guard.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { covers, normaliseClaims } from '../../jobs/locks.js'
 import { JobQueue } from '../../jobs/queue.js'
 import {
   ahrClaim,
@@ -10,6 +11,7 @@ import {
   guarded,
   mountClaim,
   poolClaims,
+  reverify,
   smbShareClaim,
   sourcePathsMoved,
   unheldClaimsRefusal,
@@ -47,10 +49,11 @@ async function tick(): Promise<void> {
 describe('cr.33 — lock key builders (§4.2)', () => {
   it('a dataset claims its own key in the verb\'s mode, every ancestor and the pool shared — keyed below the pool by guid', () => {
     assert.deepEqual(zfsClaims(GUID, 'tank/a/b', 'exclusive'), [
-      { key: `zfs:${GUID}/a/b`, mode: 'exclusive', what: `Dataset 'tank/a/b'` },
-      { key: `zfs:${GUID}/a`, mode: 'shared', what: `Dataset 'tank/a'` },
-      { key: `zfs:${GUID}`, mode: 'shared', what: `Dataset 'tank'` },
-      { key: `zpool:${GUID}`, mode: 'shared', what: `Pool 'tank'` },
+      // cr.64b1 (A): every guid key says it rides with the pool's name key.
+      { key: `zfs:${GUID}/a/b`, mode: 'exclusive', what: `Dataset 'tank/a/b'`, within: 'zname:tank' },
+      { key: `zfs:${GUID}/a`, mode: 'shared', what: `Dataset 'tank/a'`, within: 'zname:tank' },
+      { key: `zfs:${GUID}`, mode: 'shared', what: `Dataset 'tank'`, within: 'zname:tank' },
+      { key: `zpool:${GUID}`, mode: 'shared', what: `Pool 'tank'`, within: 'zname:tank' },
       { key: 'zname:tank', mode: 'shared', what: `the pool name 'tank'` },
     ])
     assert.deepEqual(zfsClaims(GUID, 'tank', 'exclusive').map(c => [c.key, c.mode]), [
@@ -70,10 +73,10 @@ describe('cr.33 — lock key builders (§4.2)', () => {
 
   it('a pool verb: the guid key, plus the name key (exclusive for a namespace verb, shared otherwise — cr.33b); an unreadable guid falls back to the name key, exclusive', () => {
     assert.deepEqual(poolClaims('tank', GUID, 'exclusive', { namespace: true }), [
-      { key: `zpool:${GUID}`, mode: 'exclusive', what: `Pool 'tank'` },
+      { key: `zpool:${GUID}`, mode: 'exclusive', what: `Pool 'tank'`, within: 'zname:tank' },
       { key: 'zname:tank', mode: 'exclusive', what: `the pool name 'tank'` },
     ])
-    assert.deepEqual(poolClaims('tank', GUID, 'shared'), [zpoolClaim(GUID, 'shared', 'tank'), znameClaim('tank', 'shared')])
+    assert.deepEqual(poolClaims('tank', GUID, 'shared'), [{ ...zpoolClaim(GUID, 'shared', 'tank'), within: 'zname:tank' }, znameClaim('tank', 'shared')])
     assert.deepEqual(poolClaims('tank', null, 'shared'), [{ key: 'zname:tank', mode: 'exclusive', what: `the pool name 'tank'` }])
   })
 
@@ -287,15 +290,19 @@ describe('cr.56 (review M2) — unheldClaimsRefusal: the claims a run needs now 
   })
 
   it('a needed claim not held, or held shared where exclusive is needed → STATE_CHANGED naming the field and each unheld object once', () => {
-    const r = unheldClaimsRefusal('Backup task \'t\'', 'archive paths were /a; now /b', held, [
+    // A mover's own set (the name key SHARED, as `zfsClaims` builds it) — cr.64b1
+    // (A): with the name key held EXCLUSIVE the guid keys of tank/other would be
+    // covered (the dominance describe below).
+    const r = unheldClaimsRefusal('Backup task \'t\'', 'archive paths were /a; now /b', zfsClaims(GUID, 'tank/media', 'shared'), [
       ...zfsClaims(GUID, 'tank/other', 'shared'),
       zpoolClaim(GUID, 'exclusive', 'tank'),
     ])
     assert.deepEqual(r, {
       status: 409,
       code: 'STATE_CHANGED',
+      // cr.64b1 (C): the pool's key IS held — shared — so it is named as such, not as "no lock".
       message: `Backup task 't' changed while this run waited (archive paths were /a; now /b) — the run holds no lock on `
-        + `Dataset 'tank/other', Pool 'tank', so nothing was done; run it again`,
+        + `Dataset 'tank/other' and only a shared lock on Pool 'tank', so nothing was done; run it again`,
     })
   })
 
@@ -442,5 +449,194 @@ describe('cr.64a — the job door recomputes spec.locks from the job\'s own re-r
     blocker.end()
     await tick()
     assert.equal(queue.get(job.id)?.status, 'completed', JSON.stringify(queue.get(job.id)?.error))
+  })
+})
+
+describe('cr.64b1 (A) — `covers`: the lock table\'s own rule, asked of a held set', () => {
+  const UUID = 'Xa3k-1lQp-KdV8'
+
+  it('the same key: a mode that excludes at least as much — same mode, or exclusive held for shared needed; never shared for exclusive', () => {
+    assert.equal(covers([znameClaim('tank', 'shared')], znameClaim('tank', 'shared')), true)
+    assert.equal(covers([znameClaim('tank', 'exclusive')], znameClaim('tank', 'shared')), true)
+    assert.equal(covers([znameClaim('tank', 'exclusive')], znameClaim('tank', 'exclusive')), true)
+    assert.equal(covers([znameClaim('tank', 'shared')], znameClaim('tank', 'exclusive')), false)
+    assert.equal(covers([], znameClaim('tank', 'shared')), false)
+  })
+
+  it('the name key EXCLUSIVE (cr.33b\'s fallback) covers every guid-keyed claim of ITS pool in either mode — and only of its pool, and only exclusive', () => {
+    const fallback = zfsDatasetClaims(null, 'tank/a', 'exclusive')
+    for (const c of [...zfsClaims(GUID, 'tank/a/b', 'exclusive'), ...poolClaims('tank', GUID, 'exclusive')])
+      assert.equal(covers(fallback, c), true, c.key)
+    // Another pool's guid keys: its name key is another key.
+    for (const c of zfsClaims('2000000000000000001', 'other/a', 'shared').filter(c => c.key !== 'zname:other'))
+      assert.equal(covers(fallback, c), false, c.key)
+    // The name key held SHARED excludes nothing a shared guid claim would.
+    for (const c of zfsClaims(GUID, 'tank/a', 'shared').filter(c => c.key !== 'zname:tank'))
+      assert.equal(covers([znameClaim('tank', 'shared')], c), false, c.key)
+    // A bare `zpool:<guid>` (the import by guid, pools.ts) promises no name key, so nothing covers it but itself.
+    assert.equal(covers(fallback, zpoolClaim(GUID, 'shared', 'tank')), false)
+  })
+
+  it('the AHR twin: `ahrname:` exclusive covers the pool\'s `ahr:<vg uuid>` claim', () => {
+    const [ahr] = ahrPoolClaims('media', UUID, 'exclusive')
+    assert.equal(covers(ahrPoolClaims('media', null, 'shared'), ahr), true)
+    assert.equal(covers([ahrClaim(UUID, 'shared', 'media')], ahr), false)
+  })
+
+  it('unheldClaimsRefusal asks `covers`: the fallback held, the guid keys needed → null', () => {
+    assert.equal(unheldClaimsRefusal('Dataset \'tank/a\'', 'x', zfsDatasetClaims(null, 'tank/a', 'shared'), zfsDatasetClaims(GUID, 'tank/a', 'shared')), null)
+  })
+
+  it('the queue refuses a claim set that names a `within` key it does not carry (the promise `covers` relies on)', () => {
+    assert.throws(() => normaliseClaims(zfsClaims(GUID, 'tank/a', 'shared').filter(c => c.key !== 'zname:tank')), /rides with 'zname:tank'/)
+    assert.doesNotThrow(() => normaliseClaims(zfsClaims(GUID, 'tank/a', 'shared')))
+  })
+
+  it('through the queue: what `covers` says the fallback covers, the table makes wait — a guid-keyed snapshot waits for the fallback holder', async () => {
+    const queue = new JobQueue()
+    const fallback = held(queue, 'zfs.snapshot', zfsDatasetClaims(null, 'tank/a', 'shared'))
+    const guidKeyed = held(queue, 'zfs.destroy', zfsDatasetClaims(GUID, 'tank/a', 'exclusive'))
+    await tick()
+    assert.equal(queue.get(guidKeyed.id)?.status, 'queued')
+    fallback.end()
+    guidKeyed.end()
+  })
+})
+
+describe('cr.64b1 (C, E) — the mode rule: a key held shared where the re-read needs it exclusive', () => {
+  it('through the queue: STATE_CHANGED whose sentence names the MODE that moved and the shared lock it holds — no body', async () => {
+    const world = { mode: 'shared' as 'shared' | 'exclusive' }
+    const spec: GuardSpec<{ name: string }> = {
+      operation: 'zfs.set',
+      object: {
+        what: 'Dataset \'tank/data\'',
+        read: async () => ({ name: 'tank/data' }),
+        id: async o => ({ dataset: o.name }),
+        unbound: () => 'Could not read the dataset — refusing',
+      },
+      gates: [],
+      locks: async () => zfsDatasetClaims(GUID, 'tank/data', world.mode),
+    }
+    const queue = new JobQueue()
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      assert.fail(`route door refused: ${JSON.stringify(pre.refusal)}`)
+    const blocker = held(queue, 'zfs.destroy', zfsDatasetClaims(GUID, 'tank/data', 'exclusive'))
+    let bodyRan = false
+    const job = queue.submit('zfs.set', SUBMITTER, guarded(spec, pre, async () => {
+      bodyRan = true
+    }), { locks: pre.locks })
+    await tick()
+    assert.equal(queue.get(job.id)?.status, 'queued')
+    world.mode = 'exclusive'
+    blocker.end()
+    await tick()
+    const rec = queue.get(job.id)
+    assert.equal(rec?.status, 'failed', JSON.stringify(rec?.error))
+    assert.equal(rec?.error?.code, 'STATE_CHANGED')
+    assert.equal(rec?.error?.message, `Dataset 'tank/data' changed while this run waited (lock modes were zfs:${GUID}/data shared; `
+    + `now zfs:${GUID}/data exclusive) — the run holds only a shared lock on Dataset 'tank/data', so nothing was done; run it again`)
+    assert.equal(bodyRan, false, 'the body ran')
+  })
+
+  it('unheldClaimsRefusal: shared held, exclusive needed refuses; exclusive held, shared needed does not', () => {
+    const shared = zfsClaims(GUID, 'tank/data', 'shared')
+    const exclusive = zfsClaims(GUID, 'tank/data', 'exclusive')
+    assert.ok(unheldClaimsRefusal('x', 'y', shared, exclusive))
+    assert.equal(unheldClaimsRefusal('x', 'y', exclusive, shared), null)
+  })
+})
+
+describe('cr.64b1 (D) — every re-check recomputes the claims: `reguard` after a release, and a second spec\'s `reverify`', () => {
+  const GUID2 = '2000000000000000001'
+
+  /** A dataset verb whose keys follow `world.guid` (the pool under the name). */
+  function datasetSpec(world: { guid: string }, dataset: string): GuardSpec<{ name: string }> {
+    return {
+      operation: 'zfs.set',
+      object: {
+        what: `Dataset '${dataset}'`,
+        read: async () => ({ name: dataset }),
+        id: async o => ({ dataset: o.name }),
+        unbound: () => 'Could not read the dataset — refusing',
+      },
+      gates: [],
+      locks: async () => zfsDatasetClaims(world.guid, dataset, 'shared'),
+    }
+  }
+
+  it('reguard (cr.38\'s release/reacquire loop): the pool re-created under its name while the job had released → STATE_CHANGED from the reguard, and the next act never runs', async () => {
+    const world = { guid: GUID }
+    const spec = datasetSpec(world, 'tank/data')
+    const queue = new JobQueue()
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      assert.fail(`route door refused: ${JSON.stringify(pre.refusal)}`)
+    const steps: string[] = []
+    let released!: () => void
+    const waiting = new Promise<void>((resolve) => {
+      released = resolve
+    })
+    let goOn!: () => void
+    const resume = new Promise<void>((resolve) => {
+      goOn = resolve
+    })
+    const job = queue.submit('zfs.set', SUBMITTER, guarded(spec, pre, async (_o, ctx) => {
+      steps.push('first act')
+      ctx.release()
+      released()
+      await resume
+      await ctx.reguard()
+      steps.push('second act')
+    }), { locks: pre.locks })
+    await waiting
+    world.guid = GUID2
+    goOn()
+    await tick()
+    const rec = queue.get(job.id)
+    assert.equal(rec?.status, 'failed', JSON.stringify(rec?.error))
+    assert.equal(rec?.error?.code, 'STATE_CHANGED')
+    assert.match(rec!.error!.message, new RegExp(`now zfs:${GUID2}/data`))
+    assert.deepEqual(steps, ['first act'])
+  })
+
+  it('reverify of a SECOND spec bound beside the verb\'s own (the SMB grant shape): its keys moved while the job waited → STATE_CHANGED from the reverify, before the act', async () => {
+    const share = { guid: GUID }
+    const grant = { guid: GUID }
+    const verb = datasetSpec(share, 'tank/share')
+    const second = datasetSpec(grant, 'tank/grant')
+    const queue = new JobQueue()
+    const pre = await guardCheck(verb)
+    const pre2 = await guardCheck(second)
+    if ('refusal' in pre || 'refusal' in pre2)
+      assert.fail('route door refused')
+    const blocker = held(queue, 'zpool.import', [znameClaim('tank')])
+    let acted = false
+    const job = queue.submit('zfs.set', SUBMITTER, guarded(verb, pre, async () => {
+      await reverify(second, pre2.bound)
+      acted = true
+    }), { locks: [...pre.locks, ...pre2.locks] })
+    await tick()
+    assert.equal(queue.get(job.id)?.status, 'queued')
+    // Only the second spec's object moved (a pool under ITS name would be the
+    // same here; the point is the second spec's own recompute).
+    grant.guid = GUID2
+    blocker.end()
+    await tick()
+    const rec = queue.get(job.id)
+    assert.equal(rec?.status, 'failed', JSON.stringify(rec?.error))
+    assert.equal(rec?.error?.code, 'STATE_CHANGED')
+    assert.match(rec!.error!.message, /^Dataset 'tank\/grant' changed while this run waited/)
+    assert.equal(acted, false, 'the act ran')
+  })
+
+  it('control: the same reverify with nothing moved passes, and the route\'s claims ride on the bound', async () => {
+    const world = { guid: GUID }
+    const spec = datasetSpec(world, 'tank/data')
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      assert.fail('route door refused')
+    assert.deepEqual(pre.bound.locks, pre.locks)
+    assert.equal((await reverify(spec, pre.bound)).object.name, 'tank/data')
   })
 })

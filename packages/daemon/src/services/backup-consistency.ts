@@ -161,6 +161,19 @@ export interface FilesystemFacts {
    * builder takes no `ahr:` key and says why (cr.33c F1).
    */
   ahrUnreadable?: boolean
+  /**
+   * Why the mount table could not be read (the exit status and stderr), when
+   * it could not — `mounts` is then empty. The source-claim builder names it
+   * when a guard door must refuse rather than lock nothing (cr.64b1 (B)).
+   */
+  mountsUnreadable?: string
+  /** Why the AHR topology could not be read, beside {@link ahrUnreadable}. */
+  ahrUnreadableReason?: string
+}
+
+/** A command's stderr or an error's message, first line — how a sentence names a failed read. */
+function firstLine(text: string): string {
+  return text.trim().split('\n')[0] || 'no stderr'
 }
 
 /**
@@ -176,24 +189,36 @@ export async function readFilesystemFacts(
   readAhrPools: (executor: CommandExecutor) => Promise<AhrPool[]>,
 ): Promise<FilesystemFacts> {
   let mounts = new Map<string, FindmntNode>()
+  let mountsUnreadable: string | undefined
   try {
     const r = await executor.exec(FINDMNT, ['--json'])
     if (r.exitCode === 0)
       mounts = mountIndex(r.stdout)
+    else
+      mountsUnreadable = `findmnt --json exited ${r.exitCode}: ${firstLine(r.stderr)}`
   }
-  catch {
+  catch (err) {
     // fail open — derivation says `live` and names the reason
+    mountsUnreadable = `findmnt --json failed: ${firstLine(err instanceof Error ? err.message : String(err))}`
   }
   let ahrPools: AhrPool[] = []
   let ahrUnreadable = false
+  let ahrUnreadableReason: string | undefined
   try {
     ahrPools = await readAhrPools(executor)
   }
-  catch {
+  catch (err) {
     ahrPools = []
     ahrUnreadable = true
+    ahrUnreadableReason = firstLine(err instanceof Error ? err.message : String(err))
   }
-  return { mounts, ahrPools, ahrUnreadable }
+  return {
+    mounts,
+    ahrPools,
+    ahrUnreadable,
+    ...(mountsUnreadable !== undefined ? { mountsUnreadable } : {}),
+    ...(ahrUnreadableReason !== undefined ? { ahrUnreadableReason } : {}),
+  }
 }
 
 /** The ANAS AHR pool mounted at a btrfs mount's target, or undefined (a btrfs volume ANAS does not manage). */
@@ -238,7 +263,9 @@ export function sourceFilesystemOf(path: string, facts: FilesystemFacts): Source
 /**
  * The longest findmnt target that CONTAINS `path` — the filesystem the path
  * lives on. Pure prefix arithmetic over the table; the path itself is never
- * touched.
+ * touched — so a symlink is followed by nobody here. The lock-claim readers
+ * hand it the path's REAL path (`realSourcePath`, services/source-claims.ts,
+ * cr.64b1 (H)); the consistency derivation still hands it the path's text.
  */
 export function filesystemOf(path: string, mounts: Map<string, FindmntNode>): FindmntNode | null {
   let best: FindmntNode | null = null
