@@ -211,8 +211,10 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
         return ok('')
       }
       // cr.64c item 8: the LUN add proves the zvol exists before its first targetcli act.
-      if (command === ZFS && args.join(' ') === `list -H -o name -- ${ZVOL_DATASET}`)
-        return { stdout: `${ZVOL_DATASET}\n`, stderr: '', exitCode: 0 }
+      // cr.64c item 8: the LUN add proves the zvol exists before its first targetcli act — every
+      // volume these tests add lives on the fixture pool, so the pool's volumes all exist.
+      if (command === ZFS && args[0] === 'list' && args[3] === 'name' && args[5]?.startsWith('gtiscsi/'))
+        return { stdout: `${args[5]}\n`, stderr: '', exitCode: 0 }
       if (command === ZFS && args.join(' ') === zfsSnapshotListArgs(ZVOL_DATASET).join(' '))
         return ok(snapshots)
       if (command === ZFS && args[0] === 'destroy')
