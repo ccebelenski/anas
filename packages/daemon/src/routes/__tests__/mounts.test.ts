@@ -271,6 +271,63 @@ describe('mount routes (Epic 18)', () => {
       assert.deepEqual(err.error.changed, ['persistent'])
     })
 
+    // cr.66r (2) — the ruling (§2 Safety altitudes): a confirm signs the
+    // NAMES of every field it writes, never a secret value. The create
+    // confirm used to sign `credentials` itself: describeField JSON-echoes
+    // a field whose value changed, so a replay that touched any credential
+    // printed the whole object — username, password, domain, credential and
+    // all — into the CONFIRM_SCOPE_CHANGED sentence and into the store. The
+    // code now signs the sorted NAMES of the credential fields present.
+    it('cr.66r (2): the non-empty create confirm signs credential NAMES, not values — adding a field re-challenges, rotating the password does not, and no 409 carries the password', async () => {
+      const mountpoint = join(dir, 'shadowed-creds')
+      await mkdir(mountpoint)
+      await writeFile(join(mountpoint, 'existing.txt'), 'data')
+      const PW = 'cr66r-cifs-pass-4127'
+      const create = (credentials: Record<string, string>, confirm?: string) => server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json', ...(confirm ? { 'x-anas-confirm': confirm } : {}) },
+        payload: JSON.stringify({ type: 'cifs', server: '127.0.0.1', remotePath: 'share', mountpoint, persistent: true, credentials }),
+      })
+
+      const first = await create({ username: 'smbuser', password: PW })
+      assert.equal(first.statusCode, 409, first.body)
+      assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+      const code = first.headers['x-anas-confirm-code'] as string
+      assert.ok(code)
+
+      // A replay that adds `domain`: same line, one MORE credential field —
+      // the names are signed, so the field is named.
+      const widened = await create({ username: 'smbuser', password: PW, domain: 'WORKGROUP' }, code)
+      assert.equal(widened.statusCode, 409, widened.body)
+      assert.equal(widened.json().error.code, 'CONFIRM_SCOPE_CHANGED', widened.body)
+      assert.deepEqual(widened.json().error.changed, ['credentialFields'])
+      // The password is absent from BOTH 409s (challenge and mismatch
+      // sentence) — pre-fix this is exactly where the object rode out.
+      for (const res of [first, widened])
+        assert.equal(res.body.includes(PW), false, res.body)
+
+      // A rotation with the SAME fields is the same request (values are
+      // never signed): a fresh code, then the resend passes.
+      const code2 = (await create({ username: 'smbuser', password: PW })).headers['x-anas-confirm-code'] as string
+      assert.ok(code2)
+      const rotated = await create({ username: 'smbuser', password: 'rotated-cifs-9' }, code2)
+      assert.equal(rotated.statusCode, 202, rotated.body)
+      const job = await waitForJob(server!, (rotated.json() as { job: { id: string } }).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+
+      // The argv is unchanged by the credentials: the secret rides the 0600
+      // creds file the mount reads, never the argv — no recorded exec and
+      // no job record carries either password.
+      const mock = (server as unknown as { executor: { calls: Array<{ command: string, args: string[] }> } }).executor
+      const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount')
+      assert.ok(mountCall, 'the mount ran its argv')
+      for (const [label, text] of [['job', JSON.stringify(job)], ...mock.calls.map((c, i) => [`exec ${i}`, JSON.stringify(c)])] as const) {
+        assert.equal(text.includes(PW), false, `${label} carried the minted password`)
+        assert.equal(text.includes('rotated-cifs-9'), false, `${label} carried the rotated password`)
+      }
+    })
+
     it('cr.64b2: the happy path resend is byte-unchanged — the mount argv stays the direct mount through /proc/self/fd/3 (cr.52r D3)', async () => {
       const mountpoint = join(dir, 'shadowed-argv')
       await mkdir(mountpoint)

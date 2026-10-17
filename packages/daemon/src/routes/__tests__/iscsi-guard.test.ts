@@ -348,20 +348,46 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
     assert.deepEqual(calls.filter(isMutation), [])
   })
 
-  it('update: the confirm binds the edit — a resend with another ACL set is 409 CONFIRM_SCOPE_CHANGED naming it, with no secret in the 409', async () => {
+  // cr.66r (3) — the ruling (§2 Safety altitudes): a confirm signs the NAMES
+  // of every field it writes, never a secret value. cr.40 signed the CHAP
+  // area as a single `credentials` BOOLEAN and then dropped that boolean as
+  // presentation-only, so a replay that swapped credentials rode the old
+  // code unsigned and unchallenged. The signature now carries `credentialFields`:
+  // per ACL, in canonical initiator order, the sorted NAMES of the credential
+  // fields the edit writes — NAMES re-challenge on a field added or removed,
+  // VALUES stay unsigned (a rotation with the same fields is the same
+  // request), and no 409 sentence or store entry ever carries a secret.
+  it('update: the confirm binds the edit — a resend with another ACL set is 409 CONFIRM_SCOPE_CHANGED naming it, credentials ride by NAME, no secret in the 409 (cr.66r)', async () => {
     await serve(loggedIn(LIVE))
     // Removing the logged-in ACL is the challenged edit.
     const first = await inject(UPDATE_KEEP_ALLOWED2)
     assert.equal(first.statusCode, 409, first.body)
     assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    // The mint wrote NO credential field; a replay that SETS a secret on the
+    // same ACL set changes the signed names — it re-challenges, naming
+    // credentialFields and printing names only. (Pre-cr.66r this answerd 202:
+    // the credential field set was not signed at all.)
     const other: Req = { method: 'PUT', url: targetUrl, payload: { auth: 'none', acls: [{ initiatorIqn: ALLOWED2, chapUserid: 'operator', chapSecret: 'sekrit-pass12' }] } }
     const res = await inject(other, { 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string })
-    // Same initiator set, other credentials: the credentials are
-    // presentation-only, so this verifies (the code was for this ACL set).
-    assert.equal(res.statusCode, 202, res.body)
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.deepEqual(res.json().error.changed, ['credentialFields'])
+    assert.match(res.json().error.message, /credentialFields \{"iqn\.2026-08\.dev\.anas\.gtiscsi:allowed2":\[\]\}; this request has credentialFields \{"iqn\.2026-08\.dev\.anas\.gtiscsi:allowed2":\["chapSecret","chapUserid"\]\} — confirm again/, res.json().error.message)
+    assert.equal(res.body.includes('sekrit-pass12'), false, res.body)
 
-    // A resend that also adds a portal (and carries a secret) is another edit.
-    const again = await inject(UPDATE_KEEP_ALLOWED2)
+    // A different secret VALUE on the same ACL and the same fields is the
+    // same request (the names match): a fresh code, then the rotation passes.
+    const code2 = (await inject(other)).headers['x-anas-confirm-code'] as string
+    assert.ok(code2)
+    const rotated: Req = { method: 'PUT', url: targetUrl, payload: { auth: 'none', acls: [{ initiatorIqn: ALLOWED2, chapUserid: 'operator', chapSecret: 'sekrit-rotated-9' }] } }
+    const pass = await inject(rotated, { 'x-anas-confirm': code2 })
+    assert.equal(pass.statusCode, 202, pass.body)
+
+    // A resend that also adds a portal (and carries a secret) is another
+    // edit — minted from the SAME credential-bearing request, so only the
+    // portal names differ (cr.66r: credentialFields is signed too, and here
+    // it matches).
+    const again = await inject(other)
     const widened: Req = {
       method: 'PUT',
       url: targetUrl,
@@ -376,7 +402,8 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
     assert.equal(scope.json().error.code, 'CONFIRM_SCOPE_CHANGED')
     assert.deepEqual(scope.json().error.changed, ['portals'])
     assert.equal(scope.json().error.message, 'You confirmed with portals "unchanged"; this request has portals "10.99.99.1:3260, 192.168.200.50:3260" — confirm again')
-    assert.ok(!scope.body.includes('sekrit'), 'no secret in the 409')
+    for (const body of [first.body, res.body, pass.body, again.body, scope.body])
+      assert.equal(body.includes('sekrit'), false, body)
     assert.ok(scope.headers['x-anas-confirm-code'])
   })
 

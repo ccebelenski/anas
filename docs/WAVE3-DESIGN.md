@@ -542,7 +542,11 @@ That is a UI constraint, solved in §5.3, not a reason to leave the flag out.
    query flags. A field may be left out only by naming it in `presentationOnly` with a one-line reason
    (none in the inventory qualifies today except the SMB binding values, where the confirm is about live
    connections, not the values). A unit test lists every `presentationOnly` entry per route, so adding
-   one is a visible diff.
+   one is a visible diff. A confirm signs the NAMES of every field it writes and never a secret value
+   (ruling 2026-10-17, §2 Safety altitudes; cr.66r re-pinned this on four doors — the cloud retarget
+   confirm, where `destinationChanges` now excludes every secret key by name, the mount create
+   (`credentialFields`), the iSCSI target update (per-ACL `credentialFields`) and the share-user create
+   (`smbPasswordSet`) — while the secret VALUES stay presentation-only).
 2. **Bind the derived set, not only the flag.** `scope` (§3.3) goes into the bound id: a recursive destroy
    binds the sorted descendant guids, so a child created after the challenge makes the resend answer 409
    and the job (if the child appears while it waits) fail `STATE_CHANGED`. The warnings list the same set,

@@ -138,18 +138,35 @@ export interface IscsiMutateRouteOptions extends IscsiPaths {
 /**
  * Story cr.40 (WAVE3-DESIGN §5.2 rule 1): the fields of the target-update
  * confirm left out of the signature, each with its reason. A test lists them.
+ *
+ * cr.66r (§2 Safety altitudes): what is unsigned are the credential VALUES —
+ * they never enter the signed record at all, only their NAMES do, per ACL, as
+ * `credentialFields` (a confirm signs the NAMES of every field it writes and
+ * never a secret value, because describeField JSON-echoes a signed field
+ * whose value changed into the CONFIRM_SCOPE_CHANGED sentence).
  */
 export const ISCSI_TARGET_UPDATE_PRESENTATION_ONLY: Record<string, string> = {
-  credentials: 'CHAP user ids and secrets decide no session\'s fate (the ACL set does), and a signed field is echoed in the 409 that names a changed one',
+  credentials: 'CHAP credential VALUES (chapUserid/chapSecret/mutualUserid/mutualSecret) are never signed or echoed — the code signs the per-ACL field NAMES (`credentialFields`), so a rotation with the same fields is the same request and a changed field set re-challenges',
 }
 
 /** Story cr.40: the LUN-delete confirm signs everything — `destroyBacking` included. */
 export const ISCSI_LUN_DELETE_PRESENTATION_ONLY: Record<string, string> = {}
 
+/** The credential fields an ACL edit can carry (cr.66r: signed by NAME, never by value). */
+const ACL_CREDENTIAL_FIELDS = ['chapUserid', 'chapSecret', 'mutualUserid', 'mutualSecret'] as const
+
 /**
  * The target-update request as the confirm signs it: the desired portal and
  * ACL sets in canonical order (a reordered list is the same edit), the auth
  * mode, `unchanged` for a field the edit leaves alone — and no secret.
+ *
+ * cr.66r (§2 Safety altitudes): the credential fields ride as NAMES, per ACL
+ * — for each initiator in canonical (sorted) order, the sorted names of the
+ * credential fields this update writes (`null` counts: it writes the field
+ * off). cr.40 signed this as a single `credentials` boolean and then dropped
+ * it as presentation-only, so nothing about the credentials was signed at
+ * all; the NAMES are what the ruling demands, the VALUES stay unsigned (a
+ * rotation with the same fields is the same request).
  */
 export function targetUpdateSignature(iqn: string, req: UpdateIscsiTargetRequest): Record<string, unknown> {
   const canon = (items: string[]): string => {
@@ -162,8 +179,19 @@ export function targetUpdateSignature(iqn: string, req: UpdateIscsiTargetRequest
     auth: req.auth ?? 'unchanged',
     portals: req.portals ? canon(req.portals.map(portalKey)) : 'unchanged',
     acls: req.acls ? canon(req.acls.map(a => a.initiatorIqn)) : 'unchanged',
-    credentials: (req.acls ?? []).some(a => a.chapUserid !== undefined || a.chapSecret !== undefined
-      || a.mutualUserid !== undefined || a.mutualSecret !== undefined),
+    // Per-ACL credential NAMES, in the same canonical initiator order as
+    // `acls`; presence only, never a value (the values never enter this
+    // record — describeField would echo a changed signed value into the 409).
+    credentialFields: req.acls
+      ? Object.fromEntries(
+          // eslint-disable-next-line e18e/prefer-array-to-sorted -- Set → sorted list
+          [...new Set(req.acls.map(a => a.initiatorIqn))].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+            .map(initiator => [
+              initiator,
+              ACL_CREDENTIAL_FIELDS.filter(f => req.acls!.some(a => a.initiatorIqn === initiator && a[f] !== undefined)).sort(),
+            ]),
+        )
+      : 'unchanged',
   }
 }
 
@@ -497,8 +525,10 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       // portal sets and the auth mode — plus the target's revision and the
       // sessions it drops, so a resend with another edit is 409
       // CONFIRM_SCOPE_CHANGED and a target that moved is 409 STATE_CHANGED.
-      // CHAP user ids and secrets are the one presentation-only field: they
-      // decide no session's fate, and a signed field is echoed in the 409.
+      // cr.66r (§2 Safety altitudes): the CHAP credential fields ride by
+      // NAME per ACL (`credentialFields`); their VALUES are the
+      // presentation-only thing — a signed field is echoed in the 409 that
+      // names a changed one, so a secret must never be a signed field.
       if (!guardConfirm(confirmStore, request, reply, spec, pre, {
         validated: targetUpdateSignature(iqn, req),
         address: ['target'],

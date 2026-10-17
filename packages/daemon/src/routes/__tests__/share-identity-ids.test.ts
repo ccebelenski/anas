@@ -96,6 +96,8 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
   /** What the node answers right now; a test changes these. */
   let passwd: string[]
   let groups: string[]
+  /** `pdbedit -L` answers (`name:uid:comment` lines); empty = no entry. */
+  let passdb: string[]
   /** `zfs userspace|groupspace` per dataset. */
   let space: Record<string, number[]>
   /** find root → id → first path. */
@@ -113,6 +115,7 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
     await writeFile(join(dir, 'exports'), EXPORTS)
     passwd = ['root:x:0:0:root:/root:/bin/bash', ACCUSER]
     groups = ['root:x:0:', USERS, ACCGROUP]
+    passdb = []
     space = { 'mnttest': [0], 'mnttest/data': [0] }
     owned = {}
     broken = () => undefined
@@ -147,7 +150,7 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
         return ok(hit ? `${hit}\n` : '')
       }
       if (command === '/usr/bin/pdbedit')
-        return ok('')
+        return args[0] === '-L' ? ok(passdb.map(l => `${l}\n`).join('')) : ok('')
       return ok('')
     }
     logLines = []
@@ -363,7 +366,10 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
     assert.deepEqual(argvOf(USERADD), [])
   })
 
-  it('cr.29c (2): the SMB password is the one unsigned field of the user create confirm, and never reaches its sentences', async () => {
+  it('cr.29c (2): the SMB password VALUE is the one unsigned field of the user create confirm, and never reaches its sentences', async () => {
+    // cr.66r re-pins the title: what stays unsigned is the VALUE; the signed
+    // request carries `smbPasswordSet` (the presence) beside it — see the
+    // cr.66r test below for that half.
     assert.deepEqual(Object.keys(USER_CREATE_PRESENTATION_ONLY), ['smbPassword'])
     assert.deepEqual(GROUP_CREATE_PRESENTATION_ONLY, {})
     const first = await post('/v1/identity/users', { name: 'alice', uid: 1005, smbPassword: 'Secret-one-1' })
@@ -375,6 +381,56 @@ describe('cr.29 — create passes an explicit uid / gid', () => {
     assert.equal(again.json().error.code, 'CONFIRM_SCOPE_CHANGED')
     assert.match(again.json().error.message, /fullName/)
     assert.equal(again.body.includes('Secret-'), false, again.body)
+  })
+
+  // cr.66r (4) — the ruling (§2 Safety altitudes): a confirm signs the NAMES
+  // of every field it writes, never a secret value. The create signed the
+  // request with the password dropped; nothing about the password was signed
+  // at all. The signed request now carries `smbPasswordSet` beside it: adding
+  // a password to a create minted without one re-challenges by NAME, and a
+  // rotation with the same presence stays the same request.
+  it('cr.66r (4): a resend that ADDS an SMB password re-challenges naming smbPasswordSet; a rotation with the same presence passes; no 409 carries a password', async () => {
+    const first = await post('/v1/identity/users', { name: 'alice', uid: 1005 })
+    assert.equal(first.statusCode, 409, first.body)
+    const code = first.headers['x-anas-confirm-code'] as string
+    assert.ok(code)
+    // The mint wrote no SMB password; this resend writes one — a field added
+    // is a scope change, named by NAME.
+    const added = await postConfirmed('/v1/identity/users', { name: 'alice', uid: 1005, smbPassword: 'Secret-added-1' }, code)
+    assert.equal(added.statusCode, 409, added.body)
+    assert.equal(added.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+    assert.deepEqual(added.json().error.changed, ['smbPasswordSet'])
+    assert.match(added.json().error.message, /You confirmed with smbPasswordSet off; this request has smbPasswordSet on — confirm again/, added.json().error.message)
+    for (const res of [first, added])
+      assert.equal(res.body.includes('Secret-added-1'), false, res.body)
+
+    // A rotation with the SAME presence: the values are never signed, so the
+    // fresh code passes and the job runs (smbpasswd gets the password on
+    // stdin, never argv). The static mock only knows what it was handed, so
+    // the gate hook simulates what useradd and smbpasswd bring to the node —
+    // the job's identity.3 verification must see the new account and its
+    // fresh passdb entry.
+    gate = async (c) => {
+      if (c.command === USERADD)
+        passwd = [...passwd, 'alice:x:1005:1005::/home/alice:/usr/sbin/nologin']
+      if (c.command === '/usr/bin/smbpasswd')
+        passdb = ['alice:1005:alice']
+    }
+    const code2 = (await post('/v1/identity/users', { name: 'alice', uid: 1005, smbPassword: 'Secret-one-1' })).headers['x-anas-confirm-code'] as string
+    assert.ok(code2)
+    const rotated = await postConfirmed('/v1/identity/users', { name: 'alice', uid: 1005, smbPassword: 'Secret-two-2' }, code2)
+    assert.equal(rotated.statusCode, 202, rotated.body)
+    const job = await finished((rotated.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(argvOf(USERADD), [['-N', '-M', '-s', '/usr/sbin/nologin', '-u', '1005', 'alice']])
+    // No reply, job record or recorded argv carries either password.
+    for (const [label, text] of [
+      [`job`, JSON.stringify(job)],
+      ...calls.map((c, i) => [`exec ${i}`, JSON.stringify(c)] as const),
+    ] as const) {
+      assert.equal(text.includes('Secret-one-1'), false, `${label} carried the minted password`)
+      assert.equal(text.includes('Secret-two-2'), false, `${label} carried the rotated password`)
+    }
   })
 
   // --- cr.29c (3): an explicit primary group on Add -------------------------

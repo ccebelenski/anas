@@ -1166,6 +1166,99 @@ password = mock-obscured
         })
       })
 
+      // cr.66r (1) — the cr.66 review reproduced the one pre-existing hole:
+      // azureblob `sas_url` is SECRET by name (cr.64b2-iii's list) and
+      // DESTINATION by its `_url` suffix, and cr.64c's `changes` half excluded
+      // a secret only when `stored.secretsSet` already carried it — so an
+      // update that SETS sas_url on a section without one rode the whole
+      // credential into the 409 warning, the confirm store and the replay.
+      // destinationChanges now skips every key the secret rule names; a
+      // secret's NAME rides the confirm only inside `optionKeys`.
+      describe('cr.66r (1): azureblob sas_url never rides changes', () => {
+        const SAS = 'sv=2021-08-06&ss=b&srt=sco&sig=cr66r-distinctive-sas-value-9f3a'
+        const az = (over: Partial<Record<'account', string>> = {}): string =>
+          `[az]\ntype = azureblob\naccount = ${over.account ?? 'gtacct'}\n`
+        const putAz = async (options: Record<string, string>, confirm?: string) => app.inject({
+          method: 'PUT',
+          url: '/v1/cloud/remotes/az',
+          headers: { ...JSON_HEADERS, ...(confirm ? { 'x-anas-confirm': confirm } : {}) },
+          payload: JSON.stringify({ options }),
+        })
+        const usedByNightlyAz = { referencingTasks: async (name: string) => (name === 'az' ? ['nightly'] : []) }
+        async function finished(id: string): Promise<Job> {
+          for (let i = 0; i < 400; i++) {
+            const job = bareQueue.get(id)
+            if (job && (job.status === 'completed' || job.status === 'failed'))
+              return job
+            await new Promise(resolve => setTimeout(resolve, 5))
+          }
+          throw new Error('job did not finish')
+        }
+
+        it('a sas_url SET on a section without one: the 409 and its CONFIRM_SCOPE_CHANGED replays name optionKeys and account only, never the value', async () => {
+          await bare(usedByNightlyAz)
+          await writeFile(bareFile, az(), 'utf-8')
+          // One non-secret destination change (account) carries the request
+          // into the retarget confirm; sas_url is written alongside it.
+          const first = await putAz({ sas_url: SAS, account: 'acct-new' })
+          assert.equal(first.statusCode, 409, first.payload)
+          assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+          assert.ok(first.json().error.warnings.includes('account: gtacct -> acct-new'), JSON.stringify(first.json().error.warnings))
+          // The whole credential: absent from the challenge body (warning,
+          // message and headers) — before the fix it rode `sas_url: (unset)
+          // -> <value>` straight through here.
+          assert.equal(first.payload.includes(SAS), false, first.payload)
+          const code = first.headers['x-anas-confirm-code'] as string
+          assert.ok(code)
+
+          // A replay that adds an option: optionKeys names it; the names both
+          // sides print include sas_url (a NAME, signed by optionKeys) — the
+          // value appears nowhere in the reply.
+          const scope = await putAz({ sas_url: SAS, account: 'acct-new', upload_concurrency: '4' }, code)
+          assert.equal(scope.statusCode, 409, scope.payload)
+          assert.equal(scope.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+          assert.deepEqual(scope.json().error.changed, ['optionKeys'])
+          assert.match(scope.json().error.message, /You confirmed with optionKeys \["account","sas_url"\]; this request has optionKeys \["account","sas_url","upload_concurrency"\] — confirm again/, scope.json().error.message)
+          assert.equal(scope.payload.includes(SAS), false, scope.payload)
+
+          // A replay of a changed destination VALUE (a fresh mint — the code
+          // a CONFIRM_SCOPE_CHANGED consumes is spent, cr.32 §5.2): changes
+          // names `account` (non-secret, described as always); the sas_url
+          // value stays out.
+          const code2 = (await putAz({ sas_url: SAS, account: 'acct-new' })).headers['x-anas-confirm-code'] as string
+          assert.ok(code2)
+          const again = await putAz({ sas_url: SAS, account: 'acct-other' }, code2)
+          assert.equal(again.statusCode, 409, again.payload)
+          assert.equal(again.json().error.code, 'CONFIRM_SCOPE_CHANGED')
+          assert.deepEqual(again.json().error.changed, ['changes'])
+          assert.equal(again.payload.includes(SAS), false, again.payload)
+
+          // Nothing was ever written, and no recorded exec carries the value.
+          assert.equal(await readFile(bareFile, 'utf-8'), az())
+          for (const call of executor.calls)
+            assert.equal(JSON.stringify(call).includes(SAS), false, JSON.stringify(call))
+        })
+
+        it('sas_url as the ONLY change is NOT a destination change: no retarget confirm at all, 202 straight to the job, which writes it', async () => {
+          await bare(usedByNightlyAz)
+          await writeFile(bareFile, az(), 'utf-8')
+          const res = await putAz({ sas_url: SAS })
+          // The task reaches the remote, but no destination option changed —
+          // the confirm door never opens (a secret is not a destination we
+          // can describe by value; its name was signed by nothing here, and
+          // no retarget is claimed).
+          assert.equal(res.statusCode, 202, res.payload)
+          assert.equal((res.json() as JobAccepted).job.operation, 'cloud.remote.update')
+          const job = await finished((res.json() as JobAccepted).job.id)
+          assert.equal(job.status, 'completed', JSON.stringify(job.error))
+          // The job writes it — rclone stores sas_url in plain text, and this
+          // is the operator's own credential in the operator's own config.
+          // The section re-rendered byte-for-byte: the two lines kept, the
+          // secret appended plain (rclone stores azureblob sas_url plain).
+          assert.equal(await readFile(bareFile, 'utf-8'), `[az]\ntype = azureblob\naccount = gtacct\nsas_url = ${SAS}\n`)
+        })
+      })
+
       // cr.64b2-ii step 4 — the NON-retarget update path (no destination
       // change, no confirm) re-gates the same identity in its job: the route
       // binds name + remoteSectionIdentity, `guarded` re-reads and compares

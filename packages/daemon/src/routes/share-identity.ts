@@ -201,9 +201,15 @@ export function groupRemovedWithUser(user: PasswdEntry, group: GroupEntry | unde
 /**
  * The create confirms' unsigned fields (cr.29c; WAVE3-DESIGN §5.2: each named
  * with its reason, and a test lists them).
+ *
+ * cr.66r (§2 Safety altitudes): what is unsigned here is the password VALUE.
+ * The signed request carries `smbPasswordSet` — the presence of the field —
+ * beside it: a confirm signs the NAMES of every field it writes, never a
+ * secret value, so a create that adds an SMB password to one minted without
+ * re-challenges, while a rotation with the same presence is the same request.
  */
 export const USER_CREATE_PRESENTATION_ONLY: Record<string, string> = {
-  smbPassword: 'a secret: never kept in the confirm store or named in a mismatch sentence; the confirm is about the uid, which no password changes',
+  smbPassword: 'a secret VALUE: never kept in the confirm store or named in a mismatch sentence (its presence rides the signed smbPasswordSet); the confirm is about the uid, which no password changes',
 }
 export const GROUP_CREATE_PRESENTATION_ONLY: Record<string, string> = {}
 
@@ -1732,7 +1738,10 @@ export async function shareIdentityRoutes(
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
     const uid = idState.id!
-    if (!createConfirm(request, reply, spec, pre, idState, { ...req }, USER_CREATE_PRESENTATION_ONLY, `Create user '${req.name}' with uid ${uid}?`))
+    // The whole validated request signs as-is EXCEPT the SMB password value
+    // (presentation-only, named below); its PRESENCE rides `smbPasswordSet`
+    // — cr.66r, §2 Safety altitudes.
+    if (!createConfirm(request, reply, spec, pre, idState, { ...req, smbPasswordSet: req.smbPassword !== undefined }, USER_CREATE_PRESENTATION_ONLY, `Create user '${req.name}' with uid ${uid}?`))
       return reply
 
     // useradd -N -M -s /usr/sbin/nologin -u <uid> [-g <gid>] [-c <fullName>] [-G <groups>] <name>

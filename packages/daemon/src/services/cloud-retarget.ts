@@ -1,5 +1,5 @@
 import type { CloudProvider, CloudRemote } from '@anas/shared'
-import { remotesReferencing } from './rclone-config.js'
+import { isSecretKey, remotesReferencing } from './rclone-config.js'
 
 /**
  * Cloud remote RETARGET guard (story ident.4 (b), audit #15).
@@ -63,8 +63,13 @@ export interface DestinationChange {
 /**
  * The destination options an update changes against the STORED remote. The
  * update contract: a non-secret key with '' is removed, an absent key is
- * unchanged, a value replaces. Secret keys never appear in `stored.options`
- * and are never destination options, so they are ignored.
+ * unchanged, a value replaces. Secret keys never enter `changes` (cr.66r,
+ * §2 Safety altitudes): a secret is never described with a value here, even
+ * when its NAME is also destination-shaped — azureblob `sas_url` ends in
+ * `_url` AND is secret by the name rule, and cr.64c's `changes` half would
+ * otherwise ride the whole credential into the 409 warning, the confirm
+ * store and the CONFIRM_SCOPE_CHANGED replay. `changes` describes non-secret
+ * destinations; a secret's NAME rides the confirm as one of its `optionKeys`.
  */
 export function destinationChanges(
   stored: CloudRemote,
@@ -73,7 +78,10 @@ export function destinationChanges(
 ): DestinationChange[] {
   const out: DestinationChange[] = []
   for (const [key, value] of Object.entries(update)) {
-    if (stored.secretsSet.includes(key) || !isDestinationOption(key, stored.type, providers))
+    // The option resolves exactly as isDestinationOption resolves it (the
+    // provider's own facts decide both the secret flag and the bool type).
+    const option = providers.find(p => p.name === stored.type)?.options.find(o => o.name === key)
+    if (stored.secretsSet.includes(key) || isSecretKey(key, option) || !isDestinationOption(key, stored.type, providers))
       continue
     const from = stored.options[key] ?? ''
     if (value !== from)

@@ -679,7 +679,15 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           mountNow: req.mountNow,
           ...(req.options ? { options: req.options } : {}),
           ...(req.extraOptions !== undefined ? { extraOptions: req.extraOptions } : {}),
-          ...(req.credentials ? { credentials: req.credentials } : {}),
+          // cr.66r (§2 Safety altitudes): a confirm signs the NAMES of every
+          // field it writes, never a value — CIFS credentials are write-only
+          // and the password must never ride the confirm store or the
+          // CONFIRM_SCOPE_CHANGED sentence (describeField would JSON-echo the
+          // whole object), so the code signs the sorted NAMES of the
+          // credential fields present: a replay that adds or removes a field
+          // re-challenges, one that rotates the password with the same fields
+          // is the same request.
+          ...(req.credentials ? { credentialFields: Object.keys(req.credentials).sort() } : {}),
         },
         address: ['mountpoint'],
         message: `'${req.mountpoint}' is not empty — a mountpoint must be an empty directory (§2 Mounts), so confirming will hide the ${contents.length} item(s) already there`,
