@@ -288,7 +288,9 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
       // cr.52r D3: the pool's OWN fstab line is mounted DIRECTLY through a
       // directory the daemon opened — the kernel resolves /proc/self/fd/3 to
       // the pool's real mountpoint. The rung never invents a mount.
-      ['/usr/bin/mount', '-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s', '--', AHR_LV_PATH, '/proc/self/fd/3/.'],
+      // cr.52s-e: the line (written above) keeps `nofail` and the iSCSI
+      // ordering pair; the direct mount's `-o` carries only `subvol=@data`.
+      ['/usr/bin/mount', '-c', '-t', 'btrfs', '-o', 'subvol=@data', '--', AHR_LV_PATH, '/proc/self/fd/3/.'],
     ])
     // The inherited fd resolves to the pool's REAL mountpoint directory from
     // its own fstab line — never the LV device path the topology read.

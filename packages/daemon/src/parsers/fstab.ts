@@ -511,7 +511,51 @@ export function mountOptionTokens(entry: MountEntry): string {
   return buildOptionTokens(entry).join(',')
 }
 
+/**
+ * The option string for a DIRECT `mount(8)` of an entry (cr.52s-e): the
+ * kernel/helper tokens of {@link mountOptionTokens} with the userspace-only
+ * ones dropped — every `x-*` token (`x-systemd.*`, `x-anas.*`, `x-initrd.*`),
+ * `_netdev`, `nofail`, `noauto`, `auto`, `comment=*`. mount(8) ignores them,
+ * but with `-c` libmount records them in `/run/mount/utab` under the fd
+ * target (cr.52s-d's node fact), one stale entry per mount. The fstab LINE
+ * keeps every token — only the direct mount's argv is stripped. Surviving
+ * tokens keep their exact bytes and order. Empty when nothing survives: the
+ * caller then passes NO `-o` at all (`mount -o ''` is not the same as none).
+ */
+export function directMountOptionTokens(entry: MountEntry): string {
+  return buildOptionTokens(entry)
+    .filter(t => !isUserspaceOnlyOption(t))
+    .join(',')
+}
+
+/**
+ * The `-o` argv fragment for a direct mount: `['-o', tokens]`, or NOTHING
+ * when every token is userspace-only (cr.52s-e) — so the three direct-mount
+ * argv builders share the empty-means-no-`-o` rule instead of each
+ * re-deciding it.
+ */
+export function directMountOptionArgs(entry: MountEntry): string[] {
+  const opts = directMountOptionTokens(entry)
+  return opts === '' ? [] : ['-o', opts]
+}
+
 // --- Internals --------------------------------------------------------------
+
+/**
+ * Whole-token test for the userspace-only options cr.52s-e drops from a
+ * direct mount. Matched on the TRIMMED, lower-cased key (the same shape as
+ * the disable-token test in the ops above) so a hand-spaced passthrough
+ * token still goes; every SURVIVING token keeps its exact bytes.
+ */
+function isUserspaceOnlyOption(token: string): boolean {
+  const key = token.trim().split('=')[0].toLowerCase()
+  return key.startsWith('x-')
+    || key === '_netdev'
+    || key === 'nofail'
+    || key === 'noauto'
+    || key === 'auto'
+    || key === 'comment'
+}
 
 /**
  * Parse one raw line into a structured entry, or null for comments, blanks, and

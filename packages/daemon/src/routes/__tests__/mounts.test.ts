@@ -292,6 +292,38 @@ describe('mount routes (Epic 18)', () => {
       assert.equal(mountCall!.fdPaths?.[0], mountpoint, 'the inherited fd resolves to the opened mountpoint directory')
     })
 
+    it('cr.52s-e: the direct mount drops the userspace tokens the WRITTEN LINE keeps (argv `-o` vs line, side by side)', async () => {
+      const mountpoint = join(dir, 'strip-argv')
+      await mkdir(mountpoint)
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export1', mountpoint, persistent: true, mountNow: true, extraOptions: 'noatime,_netdev,x-systemd.device-timeout=10' }),
+      })
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+
+      // THE LINE keeps every token: the request's `_netdev` and device-timeout,
+      // and the forced `nofail` (§2 Mounts ruling).
+      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(mountpoint))!
+      const lineOpts = line.split(/\s+/)[3].split(',')
+      for (const tok of ['noatime', 'nofail', '_netdev', 'x-systemd.device-timeout=10'])
+        assert.ok(lineOpts.includes(tok), `${tok} must stay on the line: ${line}`)
+
+      // THE DIRECT MOUNT carries the entry's kernel/helper options (the create
+      // defaults vers/hard/nosuid/nodev plus the request's noatime) in the
+      // serialized order — and NONE of the userspace tokens (they would land
+      // in /run/mount/utab under the fd target, cr.52s-d's node fact).
+      const mock = (server as unknown as { executor: { calls: Array<{ command: string, args: string[] }> } }).executor
+      const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount')!
+      assert.equal(mountCall.args[0], '-c')
+      assert.equal(mountCall.args.at(-1), '/proc/self/fd/3/.')
+      assert.equal(mountCall.args[mountCall.args.indexOf('-o') + 1], 'vers=4.2,hard,nosuid,nodev,noatime')
+      assert.ok(!mountCall.args.some(a => a.includes('nofail') || a.includes('_netdev') || a.includes('x-systemd')), JSON.stringify(mountCall.args))
+    })
+
     it('rejects a PVE-territory mountpoint (cr.52r doc ruling: the ONE 409, PVE sentence)', async () => {
       // `/mnt/pve/*` answers the shared refusal — 409 reason system-mount-target
       // with the PVE-territory sentence (this door's old pre-check answered 400).

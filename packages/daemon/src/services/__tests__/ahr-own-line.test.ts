@@ -24,7 +24,6 @@ const UMOUNT = '/usr/bin/umount'
 const FINDMNT = '/usr/bin/findmnt'
 const SYSTEMCTL = '/usr/bin/systemctl'
 const OPERATOR_OPTIONS = 'noatime,compress=zstd:3,subvol=@data'
-const ANAS_DEFAULTS = 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s'
 const GIB = 1024 ** 3
 
 function mkPool(mountpoint: string): AhrPool {
@@ -86,7 +85,11 @@ describe('AHR re-mounts use the pool\'s own fstab line as stored (cr.52s-a, revi
     const executor = okExecutor()
     const progress: string[] = []
     await remountAhrPool(executor, { name: 'tank', mountpoint: mp, subvolLayout: true }, m => progress.push(m), { fstabPath })
-    assert.equal(poolMountOptions(executor, mp), ANAS_DEFAULTS)
+    // cr.52s-e: ANAS's default entry carries `nofail` and the iSCSI ordering
+    // pair (nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,
+    // x-systemd.device-timeout=45s); the direct mount's `-o` carries only the
+    // kernel/helper tokens that survive the strip.
+    assert.equal(poolMountOptions(executor, mp), 'subvol=@data')
     assert.ok(progress.some(m => /has no line in .* re-mounting with ANAS's default options/.test(m)), progress.join(' | '))
   })
 

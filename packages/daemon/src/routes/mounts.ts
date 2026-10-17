@@ -11,7 +11,7 @@ import { readdir, rm } from 'node:fs/promises'
 import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, UpdateMountRequest } from '@anas/shared'
 import { CommandTimeoutError } from '../executor/deadline.js'
 import { classifyKind, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
-import { addMount, carriesAutomount, disableMount, enableMount, getMount, hasMount, mountOptionTokens, removeMount, replaceMount } from '../parsers/fstab.js'
+import { addMount, carriesAutomount, directMountOptionArgs, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
 import { PVE_STORAGE_CFG, readPveMountPaths, readPveTerritoryClaims, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, sendRefusal } from '../safety/guard.js'
 import { diagnoseBusyPath, enrichBusyError, formatHolders, runFuser, toolNotFound } from '../services/busy-diagnosis.js'
@@ -1233,8 +1233,10 @@ async function daemonReload(executor: CommandExecutor): Promise<void> {
 }
 
 /**
- * Mount a filesystem DIRECTLY from its entry (cr.52r D3): the spec and options
- * the entry configures, through a directory the daemon itself opened
+ * Mount a filesystem DIRECTLY from its entry (cr.52r D3): the spec and the
+ * KERNEL/HELPER options the entry configures — the userspace-only fstab
+ * tokens (`nofail`, `_netdev`, `x-*`) stay on the LINE and off the argv
+ * (cr.52s-e) — through a directory the daemon itself opened
  * (`/proc/self/fd/3`, {@link mountThroughOpenedDir}) — the kernel resolves the
  * fd path to exactly that directory, so a parent swapped after the open cannot
  * redirect the mount to a place the gate never looked.
@@ -1248,7 +1250,7 @@ async function daemonReload(executor: CommandExecutor): Promise<void> {
  * control chars). Throws on failure.
  */
 async function doMount(executor: CommandExecutor, entry: MountEntry, mountpoint: string): Promise<void> {
-  const args = ['-c', '-t', entry.fstype, '-o', mountOptionTokens(entry), '--', entry.spec]
+  const args = ['-c', '-t', entry.fstype, ...directMountOptionArgs(entry), '--', entry.spec]
   const mp = normalizeMountpointPath(mountpoint)
   const r = await mountThroughOpenedDir(executor, mp, args)
   if (r.exitCode !== 0)

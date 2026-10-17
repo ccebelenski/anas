@@ -10,11 +10,14 @@ import {
   ANAS_MARKER,
   carriesAutomount,
   classifyOptions,
+  directMountOptionArgs,
+  directMountOptionTokens,
   disableMount,
   enableMount,
   getMount,
   hasMount,
   inlineCommentIndex,
+  mountOptionTokens,
   parseFstab,
   parseFstabDoc,
   removeMount,
@@ -889,5 +892,46 @@ describe('cr.60r — fstab octal escapes across the migration seam (possible 2)'
     const { secretOptions, options } = classifyOptions('cifs', ['password2=a\\054b', 'x-fer=q\\040r'])
     assert.deepEqual(secretOptions, ['password2=a\\054b'])
     assert.equal(options.passthrough, 'x-fer=q\\040r')
+  })
+})
+
+describe('cr.52s-e — the direct mount carries only kernel/helper options; the LINE keeps the rest', () => {
+  // The option strings are ones the commit this extends already pins: the
+  // AHR iSCSI pair (ahr-create.test.ts, ahr-own-line.test.ts,
+  // ahr-boot-scan-cache.test.ts) and the cr.52s-e story line's
+  // `nofail,x-systemd.device-timeout=10,noatime`.
+  const entryFor = (fstype: string, opts: string) => {
+    const entries = parseFstab(`/dev/tank/tank-vol /mnt/strip ${fstype} ${opts} 0 0\n`)
+    assert.equal(entries.length, 1)
+    return entries[0]
+  }
+
+  it('nofail, x-systemd.* and _netdev drop; noatime rides the argv; the LINE keeps every token', () => {
+    const entry = entryFor('nfs4', 'nofail,x-systemd.device-timeout=10,noatime,_netdev')
+    assert.equal(directMountOptionTokens(entry), 'noatime')
+    assert.equal(mountOptionTokens(entry), 'noatime,nofail,_netdev,x-systemd.device-timeout=10')
+    assert.deepEqual(directMountOptionArgs(entry), ['-o', 'noatime'])
+  })
+
+  it('the AHR iSCSI line: only subvol=@data reaches the direct mount', () => {
+    const entry = entryFor('btrfs', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s')
+    assert.equal(directMountOptionTokens(entry), 'subvol=@data')
+    assert.equal(mountOptionTokens(entry), 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s')
+  })
+
+  it('`defaults` is a mount(8) option, not userspace bookkeeping — it stays', () => {
+    const entry = entryFor('ext4', 'defaults')
+    assert.equal(directMountOptionTokens(entry), 'defaults')
+    assert.deepEqual(directMountOptionArgs(entry), ['-o', 'defaults'])
+  })
+
+  it('a line whose ONLY options are userspace-only yields NO `-o` at all (mount -o "" is not the same as none)', () => {
+    assert.equal(directMountOptionTokens(entryFor('btrfs', 'nofail')), '')
+    assert.deepEqual(directMountOptionArgs(entryFor('btrfs', 'nofail')), [])
+    // `auto` and `comment=` are fstab/systemd bookkeeping too (passthrough).
+    assert.equal(directMountOptionTokens(entryFor('ext4', 'auto,comment=anas')), '')
+    assert.deepEqual(directMountOptionArgs(entryFor('ext4', 'auto,comment=anas')), [])
+    // …while the LINE keeps them all.
+    assert.equal(mountOptionTokens(entryFor('ext4', 'auto,comment=anas')), 'auto,comment=anas')
   })
 })

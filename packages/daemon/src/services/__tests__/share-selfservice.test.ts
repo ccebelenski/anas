@@ -360,7 +360,8 @@ describe('ensureAhrSnapshotsMount — ONE fstab line, mounted once (smbsvc.1)', 
     // `mount <mountpoint>` resolved the path string instead).
     assert.deepEqual(mock.calls.find(c => c.command === '/usr/bin/mkdir'), { command: '/usr/bin/mkdir', args: ['-p', mp] })
     const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount')!
-    assert.deepEqual(mountCall.args, ['-c', '-t', 'btrfs', '-o', 'ro,nofail,subvol=@snapshots', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
+    // cr.52s-e: the LINE above keeps `nofail`; the direct mount's `-o` does not.
+    assert.deepEqual(mountCall.args, ['-c', '-t', 'btrfs', '-o', 'ro,subvol=@snapshots', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
     assert.deepEqual(mountCall.fdPaths, [mp])
   })
 
@@ -374,7 +375,9 @@ describe('ensureAhrSnapshotsMount — ONE fstab line, mounted once (smbsvc.1)', 
     mock.addFixture({ command: '/usr/bin/mount', result: { stdout: '', stderr: '', exitCode: 0 } })
     await ensureAhrSnapshotsMount(mock, fstabPath, 'tank')
     const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount')!
-    assert.equal(mountCall.args[mountCall.args.indexOf('-o') + 1], 'ro,noatime,nofail,subvol=@snapshots')
+    // cr.52s-e: mounted from the line's KERNEL options — `noatime` and the
+    // subvol ride the argv, the line's userspace `nofail` does not.
+    assert.equal(mountCall.args[mountCall.args.indexOf('-o') + 1], 'ro,noatime,subvol=@snapshots')
   })
 
   it('a mountpoint that is a SYMLINK when the mount runs fails with the sentence — nothing mounted through it', async () => {

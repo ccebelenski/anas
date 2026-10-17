@@ -2,7 +2,7 @@ import type { AhrPool, CreateSmbShareRequest, MountEntry, SnapshotSchedule } fro
 import type { CommandExecutor } from '../executor/types.js'
 import type { SelfServiceKeys } from '../parsers/smb-conf.js'
 import { isPathWithin, RetentionBucket } from '@anas/shared'
-import { addMount, getMount, mountOptionTokens } from '../parsers/fstab.js'
+import { addMount, directMountOptionArgs, getMount } from '../parsers/fstab.js'
 import { matchMountpoint, readZfsMountpointsFull } from '../parsers/pve-storage.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { SUBVOL_SNAPSHOTS } from './ahr-snapshots.js'
@@ -305,7 +305,7 @@ export async function ensureAhrSnapshotsMount(
     // new filesystem; `mount <mountpoint>` resolved the path string instead.
     let mounted: { exitCode: number, stderr: string }
     try {
-      mounted = await mountThroughOpenedDir(executor, mountpoint, ['-c', '-t', line.fstype, '-o', mountOptionTokens(line), '--', line.spec])
+      mounted = await mountThroughOpenedDir(executor, mountpoint, ['-c', '-t', line.fstype, ...directMountOptionArgs(line), '--', line.spec])
     }
     catch (err) {
       mounted = { exitCode: 1, stderr: err instanceof Error ? err.message : String(err) }

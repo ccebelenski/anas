@@ -185,7 +185,9 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       { command: '/usr/bin/btrfs', args: ['subvolume', 'create', join(mountBase, 't2', '@snapshots')] },
       { command: '/usr/bin/umount', args: ['--', join(mountBase, 't2')] },
       { command: '/usr/bin/systemctl', args: ['daemon-reload'] },
-      { command: '/usr/bin/mount', args: ['-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s', '--', '/dev/t2/t2-vol', '/proc/self/fd/3/.'] },
+      // cr.52s-e: the ANAS-default LINE (asserted below) carries `nofail` and
+      // the iSCSI ordering pair; the direct mount's `-o` carries only `subvol=@data`.
+      { command: '/usr/bin/mount', args: ['-c', '-t', 'btrfs', '-o', 'subvol=@data', '--', '/dev/t2/t2-vol', '/proc/self/fd/3/.'] },
       executor.calls.at(-1)!, // perl notify — argv asserted below
     ])
     // cr.52r D3: the inherited fd of BOTH mounts resolves to the pool's

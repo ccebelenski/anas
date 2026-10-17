@@ -1,6 +1,6 @@
 import type { MountEntry } from '@anas/shared'
 import { readFile } from 'node:fs/promises'
-import { mountOptionTokens, parseFstab } from '../parsers/fstab.js'
+import { directMountOptionArgs, parseFstab } from '../parsers/fstab.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { mountThroughOpenedDir } from './mounts.js'
 
@@ -118,9 +118,11 @@ export async function readAhrPoolLine(fstabPath: string, name: string): Promise<
  * (the path the caller's gate checked).
  *
  * The spec, type and options are the pool's OWN fstab line AS STORED
- * (`mountOptionTokens(line)`, cr.52s-a review defect 6): the operator's
+ * (`directMountOptionTokens(line)`, cr.52s-a review defect 6): the operator's
  * `noatime`, `compress=`, … ride the argv exactly as the line carries them, the
- * way `mount -- <lv>` took them from fstab before cr.52r. `ahrFstabEntry` (ANAS's
+ * way `mount -- <lv>` took them from fstab before cr.52r — minus the
+ * userspace-only tokens (`nofail`, `x-systemd.*`, …), which the LINE keeps but
+ * the direct mount drops (cr.52s-e, the utab fact from cr.52s-d). `ahrFstabEntry` (ANAS's
  * defaults) is used ONLY when the pool has no line (`line === null`) — the
  * caller says so in its progress/log. Throws on a failed mount (and when the
  * directory is missing/broken at argv time).
@@ -131,7 +133,7 @@ export async function mountAhrPool(
   line: MountEntry | null,
 ): Promise<void> {
   const entry = line ?? ahrFstabEntry(pool.name, pool.mountpoint, pool.subvolLayout)
-  const args = ['-c', '-t', entry.fstype, '-o', mountOptionTokens(entry), '--', entry.spec]
+  const args = ['-c', '-t', entry.fstype, ...directMountOptionArgs(entry), '--', entry.spec]
   const r = await mountThroughOpenedDir(executor, pool.mountpoint, args)
   if (r.exitCode !== 0)
     throw new Error(r.stderr.trim() || `mount exited ${r.exitCode}`)
