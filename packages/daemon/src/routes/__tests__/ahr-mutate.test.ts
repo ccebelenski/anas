@@ -77,6 +77,10 @@ describe('AHR mutation routes — validation & 404s (stock dev mock)', () => {
     process.env.ANAS_FSTAB_PATH = join(dir, 'fstab')
     process.env.ANAS_MDADM_CONF = join(dir, 'mdadm.conf')
     process.env.ANAS_AHR_MOUNT_BASE = join(dir, 'mnt')
+    // cr.52s-f F6: the doors never mkdir -p a chain — the mount base (the
+    // parent of every default-path mountpoint, and of the D3 move's new home)
+    // has to exist up front, exactly as /mnt/anas-ahr does on a node.
+    await mkdir(join(dir, 'mnt'))
     await writeFile(join(dir, 'fstab'), '# empty\n')
     server = createServer({ mock: true, logger: false })
   })
@@ -280,6 +284,9 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-ahr-create-route-'))
+    // cr.52s-f F6: the create door refuses a missing parent (it never chains) —
+    // the mount base parent of the default <base>/tpool exists up front.
+    await mkdir(join(dir, 'mnt'))
     await writeFile(join(dir, 'fstab'), '# empty\n')
     executor = controlledExecutor()
     server = await buildServer(executor)

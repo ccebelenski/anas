@@ -48,6 +48,7 @@ import { nfsExportRoutes } from './routes/shares-nfs.js'
 import { smbShareRoutes } from './routes/shares-smb.js'
 import { ConfirmStore } from './safety/confirm.js'
 import { createAccessService } from './services/access.js'
+import { ahrMountBase as resolveAhrMountBase } from './services/ahr-paths.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, AhrTopologyUnreadableError } from './services/ahr-topology.js'
 import { defaultBackupReposPaths } from './services/backup-repos.js'
 import { DiskIdentityCache } from './services/disk-identity-cache.js'
@@ -237,6 +238,21 @@ export function createServer(opts?: ServerOptions) {
     ?? (opts?.mock ? join(tmpdir(), `anas-mock-mdadm-${process.pid}.conf`) : undefined)
   const ahrMountBase = process.env.ANAS_AHR_MOUNT_BASE
     ?? (opts?.mock ? join(tmpdir(), `anas-mock-ahr-${process.pid}`) : undefined)
+  // cr.52s-f F6 made the AHR create door refuse a mountpoint whose parent does
+  // not exist (a mountpoint is made inside an existing parent, never as a
+  // recursive chain a user could re-point), so the DEFAULT base must exist
+  // before the first pool is created on a fresh node: the daemon makes it at
+  // startup — ONE level, never a chain (`/mnt` is the distribution's; a
+  // missing one is logged, not made). Root-owned 0755 under a root-owned
+  // parent, which is what the swap-stage rule asks of an ancestor.
+  try {
+    mkdirSync(resolveAhrMountBase(ahrMountBase))
+  }
+  catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code !== 'EEXIST')
+      server.log.warn(`AHR mount base '${resolveAhrMountBase(ahrMountBase)}' could not be created (${code ?? String(err)}) — the first AHR pool create will refuse until its parent exists`)
+  }
   const credsDir = process.env.ANAS_CREDS_DIR
     ?? (opts?.mock ? join(tmpdir(), `anas-mock-creds-${process.pid}`) : '/etc/anas/creds')
   // The node's storage.cfg for EVERY reader wired below (mounts tagging, the

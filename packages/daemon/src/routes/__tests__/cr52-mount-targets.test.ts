@@ -399,6 +399,94 @@ describe('cr.52 — one shared mountTargetRefusal at every mountpoint door', () 
     })
   })
 
+  // --- cr.52s-f F6: the AHR create and move doors never mkdir -p a chain ----
+  describe('cr.52s-f F6 — the AHR doors refuse a missing parent naming it', () => {
+    it('AHR create at a mountpoint whose parent is missing → 409 naming the parent — no wipe, no chain', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      const mp = join(dir, 'no-base-f6', 'apro')
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/ahr',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'apro', tier: 'ahr1', disks: ['d1'], mountpoint: mp }),
+      })
+      assert.equal(res.statusCode, 409, res.body)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'CONFLICT', res.body)
+      assert.ok(error.message.includes(join(dir, 'no-base-f6')), `names the missing parent: ${error.message}`)
+      assert.match(error.message, /does not exist/)
+      assert.ok(!calls.some(c => ['/usr/sbin/wipefs', '/usr/sbin/sgdisk'].includes(c.command)), 'no disk touched')
+      assert.equal(await fsp.lstat(join(dir, 'no-base-f6')).then(() => true, () => false), false, 'the missing parent was NOT created')
+    })
+
+    it('AHR move to a path whose parent is missing → 409 naming the parent — no confirm, nothing unmounted, no chain', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      const mp = join(dir, 'no-base-move', 'newhome')
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/ahr/ahr0/mountpoint',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ mountpoint: mp }),
+      })
+      assert.equal(res.statusCode, 409, res.body)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'CONFLICT', res.body)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no confirm is offered for a move with nowhere to go')
+      assert.ok(error.message.includes(join(dir, 'no-base-move')), `names the missing parent: ${error.message}`)
+      assert.match(error.message, /does not exist/)
+      assert.equal(calls.filter(c => c.command === '/usr/bin/umount').length, 0, 'nothing was unmounted')
+      assert.equal(await fsp.lstat(join(dir, 'no-base-move')).then(() => true, () => false), false, 'no chain was created')
+    })
+
+    it('AHR move whose new parent is a planted symlink → refused at the route, nothing created through the link', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      const mnt = join(dir, 'mnt-f6')
+      const victim = join(dir, 'victim-f6')
+      await mkdir(mnt)
+      await mkdir(victim)
+      await symlink(victim, join(mnt, 'laundered'))
+      const message = refusalIs(await server.inject({
+        method: 'PUT',
+        url: '/v1/ahr/ahr0/mountpoint',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ mountpoint: join(mnt, 'laundered', 'newhome') }),
+      }))
+      assert.match(message, /laundered/)
+      assert.match(message, /is a symlink/)
+      assert.equal(calls.filter(c => c.command === '/usr/bin/umount').length, 0, 'nothing was unmounted')
+      assert.equal(await fsp.lstat(join(victim, 'newhome')).then(() => true, () => false), false, 'nothing was created through the planted link')
+    })
+
+    it('AHR move to an EXISTING empty leaf proceeds — the job mounts at the leaf it did not have to make', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = spyExecutor(server)
+      const parent = join(dir, 'exists-f6')
+      const leaf = join(parent, 'home')
+      await mkdir(parent)
+      await mkdir(leaf) // the operator's own directory — an existing leaf is success
+      const payload = JSON.stringify({ mountpoint: leaf })
+      const first = await server.inject({ method: 'PUT', url: '/v1/ahr/ahr0/mountpoint', headers: JSON_HEADERS, payload })
+      assert.equal(first.statusCode, 409, first.body)
+      assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED', first.body)
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/ahr/ahr0/mountpoint',
+        headers: { ...JSON_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string },
+        payload,
+      })
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const mountCall = calls.find(c => c.command === '/usr/bin/mount' && c.args.at(-1) === '/proc/self/fd/3/.')
+      assert.ok(mountCall, 'the move mounted through the daemon-opened directory')
+      assert.equal(mountCall!.fdPaths?.[0], leaf, 'the fd resolves to the existing leaf')
+      assert.equal(await fsp.lstat(leaf).then(() => true, () => false), true, 'the existing leaf stands')
+    })
+  })
+
   // ---------------------------------------------------------------------------
   // cr.52r — the refined rules, probed at the real doors
   // ---------------------------------------------------------------------------

@@ -44,6 +44,7 @@ import {
   readMdadmConfText,
   removeCredentialsFileIfUnreferenced,
   removeEmptyMountpointDir,
+  removeMountpointLeafThroughOpenedParent,
   rotateCredentialsFile,
   runMountTest,
   stopAutomountUnit,
@@ -713,7 +714,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         // path a non-root user can re-point between this job's re-gate and the
         // mkdir (the old call followed every symlink it met and created
         // directories through a planted link as root).
-        await createMountpointThroughOpenedParent(req.mountpoint)
+        const { created: leafCreatedByThisJob } = await createMountpointThroughOpenedParent(req.mountpoint)
 
         // cr.52s-c restates cr.18 (review M7.2): the MOUNT runs before the
         // fstab line is written — a refused or failed mount leaves no line —
@@ -749,12 +750,18 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           }
         }
         catch (err) {
-          // No partial create: the mount this job ran is unmounted (checked)
-          // and the credentials file removed, and the failure names the state
+          // No partial create: the mount this job ran is unmounted (checked),
+          // the credentials file removed, and — cr.52s-f F3 — the mountpoint
+          // leaf this job created is rmdir'd through its opened parent (never a
+          // directory that already existed, never through a textual path; the
+          // rmdir itself refuses a non-empty leaf, and nothing was mounted, so
+          // the leaf is empty when we created it). The failure names the state
           // left behind — the invariant is that a refused or failed mount
-          // leaves no fstab line and no credentials file.
+          // leaves no fstab line, no credentials file, and no directory it
+          // made.
           const reason = err instanceof Error ? err.message : String(err)
           const state: string[] = []
+          let leftBehind: string | undefined
           if (mounted) {
             const u = await executor.exec(UMOUNT, ['--', req.mountpoint])
             state.push(u.exitCode === 0
@@ -767,7 +774,22 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
             await rm(credsFile, { force: true }).catch(() => {})
             state.push('the credentials file was removed')
           }
-          throw new Error(`Mount create '${req.mountpoint}' failed — ${[reason, ...state].join('; ')}. Nothing else was written${req.persistent ? ' (no /etc/fstab line)' : ''}`)
+          if (leafCreatedByThisJob) {
+            const whyLeft = await removeMountpointLeafThroughOpenedParent(req.mountpoint)
+            if (whyLeft === null)
+              state.push(`'${req.mountpoint}' was created by this job and has been removed again`)
+            else
+              leftBehind = whyLeft
+          }
+          // The closing clause: the directory this job made is gone, so the
+          // sentence stays the plain one — but if the rmdir failed, the
+          // directory is NAMED as the thing left behind instead (the operator
+          // must remove it by hand; an empty directory is harmless, and
+          // naming it is why "Nothing else was written" stays true elsewhere).
+          const closing = leftBehind === undefined
+            ? `Nothing else was written${req.persistent ? ' (no /etc/fstab line)' : ''}`
+            : `the mountpoint directory '${req.mountpoint}' was created by this job and its removal failed (${leftBehind}) — it is left behind and must be removed by hand${req.persistent ? '; no /etc/fstab line was written' : ''}`
+          throw new Error(`Mount create '${req.mountpoint}' failed — ${[reason, ...state].join('; ')}. ${closing}`)
         }
         if (req.persistent) {
           // The reload follows the WRITTEN line. A failed reload leaves the

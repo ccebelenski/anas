@@ -2150,8 +2150,13 @@ export async function mountThroughOpenedDir(
  * is success (what `mkdir(recursive)` treated as success still is); an existing
  * non-directory is refused. Throws with the state named — "nothing was
  * created" — on every refusal; the caller has nothing to roll back.
+ *
+ * Reports whether the leaf was CREATED here (cr.52s-f F3): a create job whose
+ * later steps fail must remove only a leaf it made itself — never a directory
+ * that already existed — so the caller learns the difference from the return
+ * value, and {@link removeMountpointLeafThroughOpenedParent} can undo it.
  */
-export async function createMountpointThroughOpenedParent(mountpoint: string): Promise<void> {
+export async function createMountpointThroughOpenedParent(mountpoint: string): Promise<{ created: boolean }> {
   const mp = normalizeMountpointPath(mountpoint)
   const parent = dirname(mp)
   const leaf = basename(mp)
@@ -2184,10 +2189,53 @@ export async function createMountpointThroughOpenedParent(mountpoint: string): P
       // fd-pinned mount that follows refuses it, and the operator hears why).
       const leafSt = await lstat(join(parent, leaf)).catch(() => null)
       if (leafSt !== null && !leafSt.isSymbolicLink() && leafSt.isDirectory())
-        return
+        return { created: false }
       throw new Error(`Mountpoint '${mp}' already exists and is not a directory — refused; nothing was created`)
     }
     throw new Error(`Mountpoint '${mp}' cannot be created — ${e.code ?? String(err)}; nothing was created`)
+  }
+  finally {
+    await open.close()
+  }
+  return { created: true }
+}
+
+/**
+ * Undo a leaf {@link createMountpointThroughOpenedParent} created (cr.52s-f F3):
+ * rmdir the mountpoint THROUGH ITS OPENED PARENT (the parent is opened the same
+ * way — pin + readlink proof — and the leaf removed at
+ * `/proc/self/fd/<parentFd>/<leaf>`), never on a textual path a swapped
+ * component could redirect. Call it ONLY when the create reported
+ * `created: true` — a directory that existed before the job is never removed.
+ * `rmdir(2)` itself enforces the "only if it is empty" half of the rule: a
+ * non-empty or swapped leaf answers ENOTEMPTY/ENOTDIR and stays untouched (the
+ * create's failure path has mounted nothing, so an empty leaf is the only
+ * honest state), and a leaf that already vanished reads as success — there is
+ * nothing to undo and nothing to name. Returns null when the leaf is gone, or
+ * the one clause naming why the directory is left behind.
+ */
+export async function removeMountpointLeafThroughOpenedParent(mountpoint: string): Promise<string | null> {
+  const mp = normalizeMountpointPath(mountpoint)
+  const parent = dirname(mp)
+  const leaf = basename(mp)
+  let open: OpenedMountTarget
+  try {
+    open = await openMountTarget(parent)
+  }
+  catch (err) {
+    // The parent itself is gone or swapped — the leaf cannot be reached through
+    // it; name the state rather than pretend the removal ran.
+    return err instanceof Error ? err.message : String(err)
+  }
+  try {
+    await rmdir(`/proc/self/fd/${open.fd}/${leaf}`)
+    return null
+  }
+  catch (err) {
+    const e = err as NodeJS.ErrnoException
+    if (e.code === 'ENOENT')
+      return null // already gone — nothing to undo, nothing to name
+    return e.code ?? String(err)
   }
   finally {
     await open.close()

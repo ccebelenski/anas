@@ -257,6 +257,10 @@ describe('cr.38r — the lio-unreadable advisory on AHR mountpoint, remount and 
     await mkdir(MOUNTPOINT, { recursive: true })
     await writeFile(join(dir, 'fstab'), `/dev/tank/tank-vol ${MOUNTPOINT} btrfs subvol=@data,nofail 0 0\n`)
     await rm(MOVE_BASE, { recursive: true, force: true })
+    // cr.52s-f F6: the move door now refuses a MISSING parent (it never mkdir -p's
+    // a chain). These tests are about the LIO advisory on the confirm, not about
+    // the chain, so the move's parent exists up front — as it does on a node.
+    await mkdir(MOVE_BASE, { recursive: true })
   })
   afterEach(async () => {
     await server?.close()

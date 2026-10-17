@@ -4,7 +4,6 @@ import type { MdadmArrayPin } from '../parsers/mdadm-conf.js'
 import type { AhrBandSlice } from './ahr-geometry.js'
 import type { AhrLayoutDisk } from './ahr-layout.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
-import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { addMount, addMountOption, hasMount, parseFstab, removeMount } from '../parsers/fstab.js'
 import { mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
@@ -22,7 +21,7 @@ import { ahrLvPath, ahrMountBase } from './ahr-paths.js'
 import { SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-snapshots.js'
 import { isAhrMountReadOnly } from './ahr-topology.js'
 import { editConfig } from './config-writer.js'
-import { mountThroughOpenedDir } from './mounts.js'
+import { createMountpointThroughOpenedParent, mountThroughOpenedDir } from './mounts.js'
 import { pveNotify } from './pve-notify.js'
 import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
 
@@ -404,7 +403,13 @@ async function executeCreate(
   // subvolumes, unmount — the pool then mounts `subvol=@data`, so snapshots
   // live OUTSIDE the operator's tree and rollback is a subvolume swap.
   const { mountpoint } = ledger
-  await mkdir(mountpoint, { recursive: true })
+  // cr.52s-f F6: the mountpoint is created THROUGH ITS OPENED PARENT (the pin +
+  // readlink proof, the leaf mkdir'd at `/proc/self/fd/<fd>/<leaf>`) — never
+  // `mkdir(recursive)` on a textual path (the cr.52s-c swap: a parent exchanged
+  // for a symlink between the door's re-gate and the mkdir created directories
+  // THROUGH the link as root). A missing parent is refused naming it — the
+  // create door's gate refuses it before the wipe; this is the second door.
+  await createMountpointThroughOpenedParent(mountpoint)
   updateProgress('Creating btrfs subvolume layout (@data, @snapshots)')
   // cr.52r D3: mounted through the DIRECTORY the daemon opened (the top-level
   // btrfs pool's subvolid=5 mount); the kernel resolves `/proc/self/fd/3`, so a
@@ -611,9 +616,12 @@ export async function remountAhrPool(
 
 /**
  * Change a pool's mountpoint (route-validated: absolute, not reserved, no
- * collisions). Brief service interruption at the old path: umount → surgical
- * fstab rewrite → mount at the new path. The only mutable identity an AHR
- * pool has — everything else (md names, VG/LV) is fixed at creation.
+ * collisions — and cr.52s-f F6: the new mountpoint's PARENT must exist, refused
+ * at the gate (route and job) before anything is unmounted, never a recursive
+ * chain a user could re-point). Brief service interruption at the old path:
+ * umount → surgical fstab rewrite → mount at the new path. The only mutable
+ * identity an AHR pool has — everything else (md names, VG/LV) is fixed at
+ * creation.
  */
 export async function changeAhrMountpoint(
   executor: CommandExecutor,
@@ -652,7 +660,11 @@ export async function changeAhrMountpoint(
   await run(executor, SYSTEMCTL, ['daemon-reload'])
 
   updateProgress(`Mounting at ${newMountpoint}`)
-  await mkdir(newMountpoint, { recursive: true })
+  // cr.52s-f F6: through the opened parent, same rule as the create (no chain
+  // ever mkdir'd through a planted link). The move's GATE — route and job
+  // re-run, BEFORE the unmount — already refuses a missing parent naming it,
+  // so a pool is never unmounted toward nowhere; this is the second door.
+  await createMountpointThroughOpenedParent(newMountpoint)
   // cr.52r D3: the move's mount, through the daemon-opened directory — the
   // line just written, as written.
   await mountAhrPool(executor, { name, mountpoint: newMountpoint, subvolLayout: pool.subvolLayout }, moved ?? null)

@@ -32,6 +32,13 @@ import { credsFilePath } from '../../services/mounts.js'
  * now is the OPEN itself: `O_PATH | O_DIRECTORY | O_NOFOLLOW` cannot follow a
  * symlink, and only a syscall sees the truth — an argv through the fd, not a
  * string mkdir through the link. The fake is undone in a `finally`.
+ *
+ * cr.52s-f F3 adds the ROLLBACK half: a failed create at a leaf THIS JOB
+ * created rmdir's it through the opened parent (a pre-existing directory
+ * survives untouched; the rmdir itself insists the leaf is empty), and only an
+ * rmdir failure makes the sentence name the directory left behind instead of
+ * "Nothing else was written". The rmdir fake rides the same `fsp` +
+ * `syncBuiltinESMExports` seam the lstat flip uses.
  */
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures')
@@ -213,6 +220,124 @@ describe('cr.52s-c (a) — the create job pins its parent, mounts before the lin
     assert.equal(await readFile(credsFilePath(credsDir, mp), 'utf8').catch(() => null), null, 'no credentials file behind the failed mount')
     // Nothing was unmounted — nothing was ever mounted (the mount itself failed).
     assert.ok(!mock.calls.some(c => c.command === UMOUNT), 'no rollback umount for a mount that never happened')
+  })
+
+  it('(F3) a failed mount at a NEW leaf removes the directory this job created — and the sentence stays exact', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    mock.prependFixture({ command: MOUNT, result: {
+      stdout: '',
+      stderr: 'mount error(13): Permission denied\nRefer to the mount.cifs(8) manual page (mount.cifs -h)\n',
+      exitCode: 32,
+    } })
+    const parent = join(dir, 'parent')
+    await mkdir(parent)
+    const mp = join(parent, 'newleaf')
+
+    const res = await create({
+      type: 'cifs',
+      server: 'nas.example.com',
+      remotePath: 'media',
+      mountpoint: mp,
+      persistent: true,
+      mountNow: true,
+      credentials: { username: 'smbuser', password: 's3cret' },
+    })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    // The directory this job created is GONE (rmdir'd through the opened
+    // parent, the leaf empty because nothing was ever mounted), so the closing
+    // clause stays the exact one — the wrong-password create leaves nothing.
+    assert.equal(await fsp.lstat(mp).then(() => true, () => false), false, 'the leaf this job created was removed again')
+    assert.ok(job.error!.message.includes(`'${mp}' was created by this job and has been removed again`), job.error!.message)
+    assert.ok(job.error!.message.includes('Nothing else was written (no /etc/fstab line)'), job.error!.message)
+    assert.equal(await readFile(fstabPath, 'utf8'), '', 'no fstab line')
+  })
+
+  it('(F3) the same failure at an EXISTING empty directory leaves the directory standing', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    mock.prependFixture({ command: MOUNT, result: {
+      stdout: '',
+      stderr: 'mount error(13): Permission denied\nRefer to the mount.cifs(8) manual page (mount.cifs -h)\n',
+      exitCode: 32,
+    } })
+    const parent = join(dir, 'parent')
+    await mkdir(parent)
+    const mp = join(parent, 'preexisting')
+    await mkdir(mp) // the operator's own empty directory
+
+    const res = await create({
+      type: 'cifs',
+      server: 'nas.example.com',
+      remotePath: 'media',
+      mountpoint: mp,
+      persistent: true,
+      mountNow: true,
+      credentials: { username: 'smbuser', password: 's3cret' },
+    })
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed', JSON.stringify(job))
+    // A directory that existed before the job is never the rollback's to
+    // remove — the failed create still leaves it exactly as it found it.
+    assert.equal(await fsp.lstat(mp).then(() => true, () => false), true, 'the pre-existing directory survives the rollback')
+    assert.ok(!job.error!.message.includes('has been removed again'), job.error!.message)
+    assert.ok(job.error!.message.includes('Nothing else was written (no /etc/fstab line)'), job.error!.message)
+  })
+
+  it('(F3) an rmdir failure names the directory left behind instead of the closing clause', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    mock.prependFixture({ command: MOUNT, result: {
+      stdout: '',
+      stderr: 'mount error(13): Permission denied\nRefer to the mount.cifs(8) manual page (mount.cifs -h)\n',
+      exitCode: 32,
+    } })
+    const parent = join(dir, 'parent')
+    await mkdir(parent)
+    const mp = join(parent, 'unremovable')
+
+    // The seam: the rollback rmdirs the leaf at `/proc/self/fd/<parentFd>/unremovable`;
+    // this fake answers exactly that call with EACCES (the shape a hostile or
+    // mis-mounted parent gives). The same `fsp` patch + `syncBuiltinESMExports`
+    // idiom the swap-race test above uses for lstat — the service's named
+    // `rmdir` import sees it. Nothing else in this job calls rmdir.
+    const real = fsp.rmdir
+    const faked = async (p: Parameters<typeof fsp.rmdir>[0]): Promise<void> => {
+      if (typeof p === 'string' && p.includes('/proc/self/fd/') && p.endsWith('/unremovable'))
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+      await real(p)
+    }
+    ;(fsp as unknown as { rmdir: unknown }).rmdir = faked
+    syncBuiltinESMExports()
+    try {
+      const res = await create({
+        type: 'cifs',
+        server: 'nas.example.com',
+        remotePath: 'media',
+        mountpoint: mp,
+        persistent: true,
+        mountNow: true,
+        credentials: { username: 'smbuser', password: 's3cret' },
+      })
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed', JSON.stringify(job))
+      // Instead of "Nothing else was written", the sentence NAMES the directory
+      // left behind, with the failed reason — the operator removes it by hand.
+      assert.ok(job.error!.message.includes(`the mountpoint directory '${mp}' was created by this job and its removal failed (EACCES)`), job.error!.message)
+      assert.ok(job.error!.message.includes('it is left behind and must be removed by hand'), job.error!.message)
+      assert.ok(!job.error!.message.includes('Nothing else was written'), job.error!.message)
+      assert.ok(job.error!.message.includes('no /etc/fstab line was written'), job.error!.message)
+    }
+    finally {
+      ;(fsp as unknown as { rmdir: unknown }).rmdir = real
+      syncBuiltinESMExports()
+    }
+    // The real rmdir never ran — the directory is honestly there.
+    assert.equal(await fsp.lstat(mp).then(() => true, () => false), true, 'the leaf is left behind, named in the sentence')
   })
 
   it('(iii) the happy path mounts through the fd BEFORE the line exists; then the line is written', async () => {

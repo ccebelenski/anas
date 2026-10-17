@@ -1,14 +1,15 @@
 import type { MockFixture } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { VGS_ARGS } from '../../parsers/lvm-report.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
-import { AHR_ISCSI_DEVICE_TIMEOUT_OPTION, AHR_ISCSI_ORDERING_OPTION, createAhrPool, ensureAhrTargetOrdering } from '../ahr-create.js'
+import { AHR_ISCSI_DEVICE_TIMEOUT_OPTION, AHR_ISCSI_ORDERING_OPTION, changeAhrMountpoint, createAhrPool, ensureAhrTargetOrdering, remountAhrPool } from '../ahr-create.js'
 import { LVM_MIXED_BLOCK_ARGS } from '../ahr-exec.js'
+import { AHR_FINDMNT_ARGS } from '../ahr-topology.js'
 
 /**
  * AHR create — exact command-sequence (argv) regression against the small
@@ -47,6 +48,9 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
     fstabPath = join(dir, 'fstab')
     confPath = join(dir, 'mdadm.conf')
     mountBase = join(dir, 'mnt')
+    // cr.52s-f F6: the create makes the mountpoint THROUGH ITS OPENED PARENT and
+    // never chains — the base exists up front, as /mnt/anas-ahr does on a node.
+    await mkdir(mountBase)
     await writeFile(fstabPath, FSTAB_SEED)
     progress.length = 0
   })
@@ -635,6 +639,56 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
     })
   })
+
+  // cr.52s-f F6: the service-side half of the no-chain rule (the route gate is
+  // the first door; this is the second — the same `createMountpointThrough-
+  // OpenedParent` the remote create uses, through the opened parent fd).
+  it('refuses a mountpoint whose PARENT is missing — never a mkdir chain (cr.52s-f F6)', async () => {
+    const executor = creationExecutor()
+    executor.addFixture({
+      command: '/usr/sbin/mdadm',
+      args: ['--detail', '--export', '/dev/md/t2-r1'],
+      result: { stdout: `MD_NAME=t2-r1\nMD_UUID=${UUID_R1}\n`, stderr: '', exitCode: 0 },
+    })
+    executor.addFixture({ command: '/usr/bin/realpath', args: [`/dev/disk/by-id/${SMALL}-part1`], result: { stdout: '/dev/sdx1\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/realpath', args: [`/dev/disk/by-id/${BIG}-part1`], result: { stdout: '/dev/sdy1\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/ls', result: { stdout: '', stderr: '', exitCode: 0 } })
+    const missingBase = join(dir, 'no-base')
+    await assert.rejects(
+      createAhrPool(
+        executor,
+        { name: 't2', tier: 'ahr1', disks: [{ id: BIG, usableBytes: 3 * GIB }, { id: SMALL, usableBytes: 2 * GIB }] },
+        m => progress.push(m),
+        { fstabPath, mdadmConfPath: confPath, mountBase: missingBase },
+      ),
+      /parent '.*no-base' does not exist/,
+    )
+    // The refusal is the whole point: NO chain of directories was made (the
+    // `mkdir(recursive)` this call replaced would have built `no-base` and the
+    // leaf — through any symlink someone had planted at `no-base`).
+    assert.equal(await stat(missingBase).then(() => true, () => false), false, 'no chain was created')
+    assert.equal(executor.calls.some(c => c.command === '/usr/bin/mount'), false, 'nothing was ever mounted at the refused path')
+  })
+
+  it('an EXISTING leaf directory is success, not a re-create (cr.52s-f F6)', async () => {
+    const executor = creationExecutor()
+    executor.addFixture({
+      command: '/usr/sbin/mdadm',
+      args: ['--detail', '--export', '/dev/md/t2-r1'],
+      result: { stdout: `MD_NAME=t2-r1\nMD_UUID=${UUID_R1}\n`, stderr: '', exitCode: 0 },
+    })
+    executor.addFixture({ command: '/usr/bin/realpath', args: [`/dev/disk/by-id/${SMALL}-part1`], result: { stdout: '/dev/sdx1\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/realpath', args: [`/dev/disk/by-id/${BIG}-part1`], result: { stdout: '/dev/sdy1\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/ls', result: { stdout: '', stderr: '', exitCode: 0 } })
+    await mkdir(join(mountBase, 't2')) // an empty leaf the operator (or an old attempt) left
+    const result = await createAhrPool(
+      executor,
+      { name: 't2', tier: 'ahr1', disks: [{ id: BIG, usableBytes: 3 * GIB }, { id: SMALL, usableBytes: 2 * GIB }] },
+      m => progress.push(m),
+      { fstabPath, mdadmConfPath: confPath, mountBase },
+    )
+    assert.equal(result.mountpoint, join(mountBase, 't2'), 'the create proceeds at an existing directory leaf')
+  })
 })
 
 /**
@@ -725,5 +779,95 @@ describe('ensureAhrTargetOrdering - the surgical add for a pool that predates is
   it('an unreadable fstab is not fatal - adding a LUN must not fail over ordering', async () => {
     const changed = await ensureAhrTargetOrdering(executor, join(dir, 'no-such-file'), { name: 'lpahr', mountpoint: '/x' })
     assert.equal(changed, false)
+  })
+})
+
+describe('changeAhrMountpoint — the move never chains a missing parent (cr.52s-f F6)', () => {
+  let dir: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-move-'))
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('refuses a new mountpoint whose parent is missing — no chain, and it never mounts at one', async () => {
+    const moveFstab = join(dir, 'fstab')
+    await writeFile(moveFstab, '/dev/tank/tank-vol /mnt/old-here btrfs nofail 0 0\n')
+    const executor = new MockExecutor()
+    for (const command of ['/usr/bin/umount', '/usr/bin/mount', '/usr/bin/systemctl'])
+      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+    await assert.rejects(
+      changeAhrMountpoint(
+        executor,
+        { name: 'tank', mountpoint: '/mnt/old-here', mounted: true, subvolLayout: true },
+        join(dir, 'no-parent', 'moved'),
+        () => {},
+        { fstabPath: moveFstab },
+      ),
+      /parent '.*no-parent' does not exist/,
+    )
+    // The old `mkdir(recursive)` built the whole chain (through a planted
+    // symlink at `no-parent` as root); the opened-parent rule builds none of it.
+    assert.equal(await stat(join(dir, 'no-parent')).then(() => true, () => false), false, 'no chain was created')
+    assert.equal(executor.calls.some(c => c.command === '/usr/bin/mount'), false, 'the refused move never mounted at a path it could not make')
+  })
+})
+
+describe('remountAhrPool — the result is VERIFIED, never assumed (cr.52s-f F7)', () => {
+  // The umount/mount pair can SUCCEED and still land read-only (the fault is
+  // still there); until now nothing in the suite pinned either half of that
+  // check — the exact fault-attributed sentence, or the clean rw resolution.
+  let dir: string
+  let mp: string
+  let fstabPath: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-remount-verify-'))
+    // The remount mounts through the daemon-opened directory — a real dir.
+    mp = join(dir, 'mnt')
+    await mkdir(mp)
+    // A file that READS and holds no line for the pool (an unreadable fstab
+    // would refuse before the unmount — that half is pinned in ahr-own-line).
+    fstabPath = join(dir, 'fstab')
+    await writeFile(fstabPath, '# nothing for tank\n')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  /** A verb that works (umount/mount exit 0) and a mount table answering with `options`. */
+  function verifyExecutor(options: string): MockExecutor {
+    const executor = new MockExecutor()
+    for (const command of ['/usr/bin/umount', '/usr/bin/mount'])
+      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({
+      command: '/usr/bin/findmnt',
+      args: [...AHR_FINDMNT_ARGS],
+      result: { stdout: JSON.stringify({ filesystems: [{ target: mp, source: '/dev/tank/tank-vol', fstype: 'btrfs', options }] }), stderr: '', exitCode: 0 },
+    })
+    return executor
+  }
+
+  it('the remount that lands read-only again fails with the exact STILL-read-only sentence', async () => {
+    const executor = verifyExecutor('ro,relatime,space_cache=v2,subvol=/@data')
+    await assert.rejects(
+      remountAhrPool(executor, { name: 'tank', mountpoint: mp, subvolLayout: true }, () => {}, { fstabPath }),
+      (err: Error) => {
+        assert.equal(
+          err.message,
+          'pool \'tank\' mounted again but is STILL read-only. btrfs re-applies the flag when the fault that caused it is still present — check the pool\'s read cache and its band arrays in the Hybrid RAID view, and `dmesg` for the BTRFS error that names the device',
+          err.message,
+        )
+        return true
+      },
+    )
+  })
+
+  it('the remount that lands read-write resolves readOnly: false', async () => {
+    const executor = verifyExecutor('rw,relatime,space_cache=v2,subvol=/@data')
+    const result = await remountAhrPool(executor, { name: 'tank', mountpoint: mp, subvolLayout: true }, () => {}, { fstabPath })
+    assert.deepEqual(result, { mountpoint: mp, readOnly: false })
+    // The pair it ran: the umount, then the direct mount of the pool's LV.
+    assert.deepEqual(executor.calls.filter(c => c.command === '/usr/bin/umount' || c.command === '/usr/bin/mount').map(c => c.command), ['/usr/bin/umount', '/usr/bin/mount'])
   })
 })

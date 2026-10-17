@@ -360,6 +360,39 @@ describe('POST /v1/ahr/:name/remount (ahrcache.1 slice 2)', () => {
     assert.equal(executor.calls.filter(c => c.command === '/usr/bin/mount').length, 0, 'no mount')
   })
 
+  it('cr.52s-f F7 — a pool whose OWN fstab line carries ro: 409 naming the option and the file, never unmounted', async () => {
+    // The pool reads read-only because the operator (or an old ANAS) WROTE
+    // `ro` into the line — the door used to admit it (it IS mountedReadOnly),
+    // unmount it, re-run its own line, land read-only again, and then call it
+    // a fault btrfs "re-applies". Refuse first; nothing gets unmounted.
+    await build('ro')
+    await writeFile(join(dir, 'fstab'), `/dev/tank/tank-vol ${MOUNTPOINT} btrfs ro,subvol=@data,nofail 0 0\n`)
+    const res = await post()
+    assert.equal(res.statusCode, 409, res.body)
+    const err = res.json().error
+    assert.equal(err.code, 'CONFLICT', JSON.stringify(err))
+    assert.ok(err.message.includes('ro'), `names the option: ${err.message}`)
+    assert.ok(err.message.includes(join(dir, 'fstab')), `names the file: ${err.message}`)
+    assert.match(err.message, /own line/)
+    // No confirm is offered for a move that cannot succeed, and the verb never
+    // reaches its unmount.
+    assert.equal(res.headers['x-anas-confirm-code'], undefined, res.body)
+    assert.equal(executor.calls.filter(c => c.command === '/usr/bin/umount').length, 0, 'never unmounts a line-set read-only pool')
+    assert.equal(executor.calls.filter(c => c.command === '/usr/bin/mount').length, 0, 'no mount either')
+  })
+
+  it('cr.52s-f F7 — a line WITHOUT ro whose mount is read-only still meets the door (btrfs forced it)', async () => {
+    // The beforeEach line is `subvol=@data,nofail` — no `ro` — so the read-only
+    // the mount table shows is the btrfs-forced kind this verb exists for: the
+    // door opens (confirm challenge, then the completing pair).
+    await build('ro')
+    const res = await post()
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED', res.body)
+    assert.ok(!res.json().error.message.includes('own line'), res.json().error.message)
+    assert.ok(res.headers['x-anas-confirm-code'], 'the door opens as before')
+  })
+
   it('unmounts and mounts — never `remount,rw`, which btrfs refuses', async () => {
     await build('ro')
     const code = (await post()).headers['x-anas-confirm-code'] as string

@@ -7,7 +7,8 @@ import type { Advisory, Gate, GuardReads, GuardSpec, ObjectView, Refusal } from 
 import type { AhrLayoutDisk } from '../services/ahr-layout.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
-import { relative, resolve as resolvePath } from 'node:path'
+import { lstat } from 'node:fs/promises'
+import { dirname, join, relative, resolve as resolvePath } from 'node:path'
 import { AhrCreateRequest, AhrMirrorReconcileRequest, AhrMountpointRequest, AhrParityRewriteRequest, AhrRepairRequest, isComposableDisk, PoolName } from '@anas/shared'
 import { currentLane } from '../executor/deadline.js'
 import { parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
@@ -16,13 +17,14 @@ import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
 import { ahrnameClaim, diskClaim, guardCheck, guardConfirm, guarded, mountClaim, sendRefusal } from '../safety/guard.js'
 import { changeAhrMountpoint, createAhrPool, remountAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
+import { readAhrPoolLine } from '../services/ahr-fstab.js'
 import { ahrGuard, ahrPoolHeldByLun } from '../services/ahr-guard.js'
 import { ahrNameOccupancy, isIntentStaleForPool } from '../services/ahr-identity.js'
 import { defaultAhrIntentDir, readIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
 import { mirrorReconcileArray, mirrorReconcileArrayRefusal, mirrorReconcileEvidence, mirrorReconcileWarnings, reconcileMirrorBand } from '../services/ahr-mirror-reconcile.js'
 import { parityRewriteArray, parityRewriteArrayRefusal, parityRewriteEvidence, parityRewriteWarnings, rewriteBandParity } from '../services/ahr-parity-rewrite.js'
-import { ahrLvPath } from '../services/ahr-paths.js'
+import { ahrLvPath, ahrMountBase } from '../services/ahr-paths.js'
 import { repairAhrFiles } from '../services/ahr-repair.js'
 import { attributeScrub, pathExists, runningAhrCheck, scrubAhrPool } from '../services/ahr-scrub.js'
 import { topLevelMountPath } from '../services/ahr-snapshots.js'
@@ -518,6 +520,28 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     ]
   }
 
+  /**
+   * cr.52s-f F6: a mountpoint door NEVER MAKES A CHAIN — the new mountpoint's
+   * parent must already exist, the rule the remote-create door has carried since
+   * cr.52s-c. `mkdir(path, { recursive: true })` on a textual path follows every
+   * symlink it meets, so a parent a non-root user can re-point between the gate
+   * and the mkdir turned the chain into a redirect (the AHR create/move doors
+   * were the last such call; the service now mirrors this rule through the
+   * opened parent). Refused at the route and again in the job — for the move,
+   * BEFORE the unmount: a pool is never left unmounted with nowhere to go.
+   */
+  function mountpointParentGate<O>(mountpoint: string): Gate<O> {
+    return async () => {
+      const parent = dirname(mountpoint)
+      const st = await lstat(parent).catch(() => null)
+      if (st === null)
+        return { status: 409, code: 'CONFLICT', message: `Mountpoint '${mountpoint}' cannot be used — its parent '${parent}' does not exist. ANAS creates the mountpoint only inside an existing parent; it never creates a chain of directories a user could re-point` }
+      if (!st.isDirectory())
+        return { status: 409, code: 'CONFLICT', message: `Mountpoint '${mountpoint}' cannot be used — its parent '${parent}' is not a directory` }
+      return null
+    }
+  }
+
   /** A pool that does not exist yet, with the disks it would be built on as the inventory reads them now. */
   interface NewAhrPool {
     name: string
@@ -625,6 +649,12 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         // The mountpoint override (§2.6) must not shadow or fight anything
         // that exists — at the route and again right before the wipe.
         ...(req.mountpoint !== undefined ? mountpointCollisionGates<NewAhrPool>(req.mountpoint) : []),
+        // cr.52s-f F6: the mountpoint — typed or the default <base>/<name>,
+        // the same path the job will build — must sit inside an EXISTING
+        // parent (the service creates the leaf through its opened parent and
+        // never a chain; refusing a missing parent here puts the 409 before
+        // the confirm and the wipe, and the job's re-run before the build).
+        mountpointParentGate<NewAhrPool>(req.mountpoint ?? join(ahrMountBase(mountBase), req.name)),
         async o => o.problems.length > 0
           ? { status: 400, code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${o.problems.join('; ')}` }
           : null,
@@ -755,6 +785,11 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         // TARGET, re-run in the job under the pool's key.
         mountTargetGate<AhrPool>(mp),
         ...mountpointCollisionGates<AhrPool>(mp),
+        // cr.52s-f F6: the TARGET's parent must already exist — refused at the
+        // route, and re-run in the job BEFORE the body, so a pool is never
+        // unmounted toward a path that has nowhere to be made. (After the
+        // collision gates: an unreadable findmnt answers 503 first, as ever.)
+        mountpointParentGate<AhrPool>(mp),
         guard.systemPoolGate,
         guard.lunGate('Changing', pool => `the mountpoint of AHR pool '${pool.name}'`),
       ],
@@ -830,6 +865,9 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
    * Four gates, at the route and again in the job (cr.38), cheapest first:
    *  - not mounted read-only ⇒ 409. There is nothing to remount, and running an
    *    unmount/mount cycle "just in case" would cost the handles for nothing.
+   *  - read-only because its OWN fstab line carries `ro` ⇒ 409 naming the
+   *    option and the file (cr.52s-f F7) — that read-only is configuration,
+   *    not a fault to clear, and re-running the line lands it read-only again.
    *  - the read cache is still FAILED ⇒ 409. Every read on the pool returns EIO
    *    while the dead cache is in front of it (GT-19), so a remount would land
    *    a filesystem that cannot serve a byte and btrfs would force it read-only
@@ -853,15 +891,40 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       operation: 'ahr.remount',
       object: guard.poolView(name, 'a remount'),
       gates: [
-        async pool => !pool.mountedReadOnly
-          ? {
+        async (pool) => {
+          if (!pool.mountedReadOnly) {
+            return pool.mounted
+              ? {
+                  status: 409,
+                  code: 'CONFLICT',
+                  message: `AHR pool '${pool.name}' is mounted read-write — there is nothing to remount. Remount exists to clear a btrfs forced-readonly filesystem, which is what an I/O error leaves behind`,
+                }
+              : {
+                  status: 409,
+                  code: 'CONFLICT',
+                  message: `AHR pool '${pool.name}' is not mounted, so there is nothing to remount. Bring the pool online first — see the Hybrid RAID view`,
+                }
+          }
+          // cr.52s-f F7: read-only BY CONFIGURATION is not a btrfs fault. A
+          // pool whose own fstab line carries `ro` mounts read-only every
+          // boot; this verb's whole mechanism is re-running the pool's line
+          // AS STORED, so it would break every open handle to land read-only
+          // again — and the verify step then mis-attributed the operator's
+          // hand-written `ro` to "btrfs re-applies the flag when the fault is
+          // still present". Refuse at the door, name the option and the file,
+          // and never unmount such a pool. An unreadable fstab passes HERE —
+          // the service still refuses before the unmount when it needs the
+          // line (and re-mounts its own defaults for a pool with no line).
+          const line = await readAhrPoolLine(fstabPath, pool.name)
+          if (line.kind === 'line' && line.entry.options.common.readOnly) {
+            return {
               status: 409,
               code: 'CONFLICT',
-              message: pool.mounted
-                ? `AHR pool '${pool.name}' is mounted read-write — there is nothing to remount. Remount exists to clear a btrfs forced-readonly filesystem, which is what an I/O error leaves behind`
-                : `AHR pool '${pool.name}' is not mounted, so there is nothing to remount. Bring the pool online first — see the Hybrid RAID view`,
+              message: `AHR pool '${pool.name}' is mounted read-only by its own line in '${fstabPath}' — the line's options carry 'ro', so this read-only is the configuration, not a btrfs fault. Remount would unmount every open handle and re-run that same line, landing read-only again; nothing was unmounted. Remove 'ro' from that line if the pool should be writable`,
             }
-          : null,
+          }
+          return null
+        },
         // The dead cache must go FIRST. Remounting over it lands a filesystem
         // that returns EIO on every read, and btrfs forces it read-only again
         // on the first error — the operator would have broken every open
