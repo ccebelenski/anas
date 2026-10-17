@@ -2,12 +2,29 @@ import type { Job, JobRef, JobStatus } from '@anas/shared'
 import type { AuditLogger } from '../audit/logger.js'
 import type { AbandonedRegistry } from '../executor/deadline.js'
 import type { LockClaim, LockMode } from './locks.js'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import { abandonedChildren, runInLane } from '../executor/deadline.js'
 import { runAsDaemon, submitRefusal } from './authority.js'
 import { conflicts, LockTable, normaliseClaims } from './locks.js'
 
 export type { LockClaim, LockMode } from './locks.js'
+
+/** The running job's view of the OTHER jobs' claims (cr.64b1r (1)); set by `execute` around the handler. */
+const otherClaimsScope = new AsyncLocalStorage<() => LockClaim[][]>()
+
+/**
+ * The claim sets of every OTHER job the queue that runs the caller knows —
+ * holding its keys, released (cr.38, it will take them again), or waiting in
+ * the lock FIFO (cr.64b1r (1)). Read-only: the job door's lock recompute
+ * (`covers`, jobs/locks.ts) asks it whether a `within` cover is real — a
+ * held exclusive name key does not cover a guid key that another job holds
+ * without the name key. Empty outside a job body (nothing the caller could
+ * run beside).
+ */
+export function otherJobsClaims(): LockClaim[][] {
+  return otherClaimsScope.getStore()?.() ?? []
+}
 
 /**
  * How long a job runs, and what it does meanwhile (cr.33, WAVE3-DESIGN §4.3).
@@ -540,6 +557,22 @@ export class JobQueue {
     return this.locks.held()
   }
 
+  /**
+   * The claim sets of every job but `self` that holds keys now, has released
+   * them and will take them again, or waits for them (cr.64b1r (1),
+   * {@link otherJobsClaims}). A read; scheduling is untouched.
+   */
+  private claimsBesides(self: JobRecord): LockClaim[][] {
+    const out: LockClaim[][] = []
+    for (const record of this.jobs.values()) {
+      if (record === self || record.claims.length === 0)
+        continue
+      if (record.lockState === 'held' || record.job.status === 'queued' || record.job.status === 'running')
+        out.push(record.claims.map(c => ({ ...c })))
+    }
+    return out
+  }
+
   /** Evict oldest completed/failed jobs when over maxRetained. */
   private evict(): void {
     if (this.jobs.size <= this.maxRetained)
@@ -784,7 +817,9 @@ export class JobQueue {
       // cr.28: the body is the daemon's own work — it was authorised at its
       // submit, and a body `drain` starts would otherwise run under whichever
       // request triggered the drain (jobs/authority.ts).
-      outcome = { ok: true, result: await runInLane({ lane: 'job', jobId: job.id }, () => runAsDaemon(() => handler(updateProgress, ctx))) }
+      // cr.64b1r (1): the body may ask which claims the other jobs hold
+      // (`otherJobsClaims`, read-only — the lock recompute's cover check).
+      outcome = { ok: true, result: await runInLane({ lane: 'job', jobId: job.id }, () => runAsDaemon(() => otherClaimsScope.run(() => this.claimsBesides(record), () => handler(updateProgress, ctx)))) }
     }
     catch (err) {
       outcome = { ok: false, err }

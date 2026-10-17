@@ -406,6 +406,13 @@ A pool whose key cannot be read (VG unreadable, `zpool get guid` fails) is locke
 X — the conservative fallback, and its gates will refuse anyway when they cannot read their facts. So that
 the fallback meets the verbs that did read the key (cr.33b), every guid- or VG-UUID-keyed claim set also
 carries the pool's name key (`zname:`/`ahrname:`) in S — X for the namespace verbs, as in the table.
+*(cr.64b1r, 2026-10-16 — "every" is true of the sets the guard's builders make, not of every set a door submits:
+the import by guid holds a bare `zpool:<guid>` X with no name key (pools.ts; cr.64b2-i (P) adds one). So the job
+door's recompute no longer trusts the promise: a held X name key covers a guid key only while no OTHER job the
+queue knows (holding, released or waiting) holds that guid key, in a conflicting mode, without the name key —
+the queue answers that read-only (`otherJobsClaims`), and a property sweep checks `covers` against `conflicts`
+over every builder shape, the bare one included. A fallback claim also names the read that failed (`unread`),
+so a job whose own guid read failed refuses 503 `UNAVAILABLE` "could not be read", never `STATE_CHANGED`.)*
 
 ### 4.3 Long jobs and the 4 slots
 
@@ -461,6 +468,18 @@ A job holds its locks only while ANAS itself is changing the object. Kernel-driv
   over every existing component (the missing tail appended; a `/dev/zvol/…` path kept as written) before deriving
   keys, so a source that is a symlink into another filesystem holds that filesystem's keys. The consistency
   derivation (`deriveConsistency`) still resolves the path's TEXT — see EPICS cr.64b1's residuals.)*
+  *(cr.64b1r, 2026-10-16 — two of those sentences were false and are corrected here. (A) "covers every guid-keyed
+  claim of that pool" held only while every holder of a guid key also held the name key; the import by guid does
+  not, so a dataset snapshot whose route took the fallback RAN beside a running import (the cr.64b1 review's sweep).
+  Now the cover is void while another job holds the guid key without the name key, and the run refuses 503
+  `UNAVAILABLE` naming the route's failed read (§4.2's note). (B) "a claim reader that cannot read … the AHR
+  topology refuses 503 `UNAVAILABLE`" held for the mover claim readers' `LockClaimsUnreadableError`, not for the
+  schedule fire's AHR target, whose builder throws the topology's own `AhrTopologyUnreadableError`: in the job that
+  escaped the guard as a bare `JOB_FAILED` and the fire did not notify. Now that typed error from a spec's claim
+  builder in the job is a 503 `UNAVAILABLE` guard refusal naming the read, the `refused` hook hears it, and the
+  route still answers the server handler's 503 with the error's sentence. And the recompute's sentence follows the
+  cause: a guid or VG UUID the JOB could not read (the fallback a fail-open builder takes) is "could not be read",
+  503; only keys that really moved are `STATE_CHANGED` "changed while this run waited".)*
 
 Locks do not fix a different starvation: four long data movers fill all 4 slots and a short destroy waits
 for a slot, not for a lock (Run Now holds two: the supervisor and the direct run, `queue.ts:147-151`). **Recommendation:** a

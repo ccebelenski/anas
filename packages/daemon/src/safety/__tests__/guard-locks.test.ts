@@ -77,7 +77,8 @@ describe('cr.33 — lock key builders (§4.2)', () => {
       { key: 'zname:tank', mode: 'exclusive', what: `the pool name 'tank'` },
     ])
     assert.deepEqual(poolClaims('tank', GUID, 'shared'), [{ ...zpoolClaim(GUID, 'shared', 'tank'), within: 'zname:tank' }, znameClaim('tank', 'shared')])
-    assert.deepEqual(poolClaims('tank', null, 'shared'), [{ key: 'zname:tank', mode: 'exclusive', what: `the pool name 'tank'` }])
+    // cr.64b1r (3): the fallback says what could not be read.
+    assert.deepEqual(poolClaims('tank', null, 'shared'), [{ key: 'zname:tank', mode: 'exclusive', what: `the pool name 'tank'`, unread: `the guid of pool 'tank'` }])
   })
 
   it('the other families: stable ids, and an SMB section case-folded as Samba matches it', () => {
@@ -598,6 +599,59 @@ describe('cr.64b1 (D) — every re-check recomputes the claims: `reguard` after 
     assert.equal(rec?.error?.code, 'STATE_CHANGED')
     assert.match(rec!.error!.message, new RegExp(`now zfs:${GUID2}/data`))
     assert.deepEqual(steps, ['first act'])
+  })
+
+  it('cr.64b1r (3) reguard: the pool guid could not be read at the REGUARD only (the route and the first run read it) → 503 UNAVAILABLE "could not be read" from the reguard, never STATE_CHANGED, and the next act never runs', async () => {
+    const world: { guid: string | null } = { guid: GUID }
+    const spec: GuardSpec<{ name: string }> = {
+      ...datasetSpec({ guid: GUID }, 'tank/data'),
+      locks: async () => zfsDatasetClaims(world.guid, 'tank/data', 'shared'),
+    }
+    const queue = new JobQueue()
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      assert.fail(`route door refused: ${JSON.stringify(pre.refusal)}`)
+    const steps: string[] = []
+    let released!: () => void
+    const waiting = new Promise<void>((resolve) => {
+      released = resolve
+    })
+    let goOn!: () => void
+    const resume = new Promise<void>((resolve) => {
+      goOn = resolve
+    })
+    const job = queue.submit('zfs.set', SUBMITTER, guarded(spec, pre, async (_o, ctx) => {
+      steps.push('first act')
+      ctx.release()
+      released()
+      await resume
+      await ctx.reguard()
+      steps.push('second act')
+    }), { locks: pre.locks })
+    await waiting
+    world.guid = null
+    goOn()
+    await tick()
+    const rec = queue.get(job.id)
+    assert.equal(rec?.status, 'failed', JSON.stringify(rec?.error))
+    assert.equal(rec?.error?.code, 'UNAVAILABLE')
+    assert.equal(rec?.error?.message, `Dataset 'tank/data': the guid of pool 'tank' could not be read in the job, so the run cannot tell which locks it needs — nothing was done; try again`)
+    assert.deepEqual(steps, ['first act'])
+  })
+
+  it('cr.64b1r (3) unheldClaimsRefusal: a fallback needed where the guid keys are held is UNAVAILABLE naming the read; the guid keys of ANOTHER pool needed are STATE_CHANGED', () => {
+    const heldSet = zfsDatasetClaims(GUID, 'tank/data', 'shared')
+    const unread = unheldClaimsRefusal('x', 'y', heldSet, zfsDatasetClaims(null, 'tank/data', 'shared'), [])
+    assert.equal(unread?.status, 503)
+    assert.equal(unread?.code, 'UNAVAILABLE')
+    assert.match(unread!.message, /^x: the guid of pool 'tank' could not be read in the job/)
+    const moved = unheldClaimsRefusal('x', 'y', heldSet, zfsDatasetClaims(GUID2, 'tank/data', 'shared'), [])
+    assert.equal(moved?.code, 'STATE_CHANGED')
+    // Both at once — a mount appeared under the path AND the guid could not be
+    // read: the move is a known fact, so the move is the sentence.
+    const both = unheldClaimsRefusal('x', 'y', heldSet, [...zfsDatasetClaims(null, 'tank/data', 'shared'), mountClaim('/tank/data', 'shared')], [])
+    assert.equal(both?.code, 'STATE_CHANGED')
+    assert.match(both!.message, /no lock on the mount at \/tank\/data/)
   })
 
   it('reverify of a SECOND spec bound beside the verb\'s own (the SMB grant shape): its keys moved while the job waited → STATE_CHANGED from the reverify, before the act', async () => {

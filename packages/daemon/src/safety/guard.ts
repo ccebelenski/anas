@@ -5,6 +5,8 @@ import type { JobContext, JobHandler } from '../jobs/queue.js'
 import type { BoundId, ConfirmMismatch, ConfirmStore } from './confirm.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { covers } from '../jobs/locks.js'
+import { otherJobsClaims } from '../jobs/queue.js'
+import { AhrTopologyUnreadableError } from '../services/ahr-topology.js'
 import { describeBound, IDENTITY_MISMATCH, IdentityMismatchError, identityMismatchMessage, sameBound } from './stable-id.js'
 
 /**
@@ -114,8 +116,33 @@ export function insideGuardDoor(): boolean {
 }
 
 /** The 503 a guard door answers when a claim reader could not read its fact. */
-function claimsUnreadableRefusal(what: string, err: LockClaimsUnreadableError): Refusal {
+function claimsUnreadableRefusal(what: string, err: Error): Refusal {
   return { status: 503, code: 'UNAVAILABLE', message: `${what}: ${err.message} — nothing was done; try again` }
+}
+
+/**
+ * The job door's lock recompute (cr.64b1r (2)): the spec's claim builder run
+ * on the job's own re-read. A builder that THROWS the AHR topology's typed
+ * unreadable error ({@link AhrTopologyUnreadableError}: `cat /proc/mdstat`
+ * or an `mdadm --detail --export` that exited non-zero — a schedule fire's
+ * AHR target resolved to its VG UUID) is a guard refusal, 503 UNAVAILABLE
+ * naming the read, so it fails the job with that code and the door's
+ * `refused` hook hears it (a scheduled fire notifies). Before cr.64a that read
+ * sat inside the fire's body, whose notify wrapper caught it; since the
+ * recompute moved into the guard it escaped both as a bare JOB_FAILED. At the
+ * ROUTE the same throw leaves `guardCheck` and the server's error handler
+ * answers it 503 UNAVAILABLE with the error's own sentence (cr.64c), as every
+ * AHR mutation route's topology read does.
+ */
+async function recomputedClaims<O>(spec: GuardSpec<O>, object: O, confirmed: GuardBound, reads: GuardReads): Promise<LockClaim[]> {
+  try {
+    return await spec.locks!(object, confirmed, reads)
+  }
+  catch (err) {
+    if (err instanceof AhrTopologyUnreadableError)
+      throw new GuardRefusalError(claimsUnreadableRefusal(spec.object.what, err))
+    throw err
+  }
 }
 
 /**
@@ -190,7 +217,8 @@ export interface GuardSpec<O> {
    * ({@link guarded}, {@link reverify}, `reguard`; cr.64a): called ONLY when
    * the claims recomputed from the job's own re-read are not covered by the
    * ones the run was granted — the comparison runs first, on every job, and
-   * this runs on a refusal (cr.64b1 (G)) — with the re-read object, the run's
+   * this runs on a STATE_CHANGED refusal (cr.64b1 (G)), never on one whose
+   * cause is a read that failed (cr.64b1r (3)) — with the re-read object, the run's
    * read cache (the spec's own reads, so the facts the `locks` builder just
    * used are memoised) and, from the job door, the object the ROUTE read
    * (`was`; absent for a {@link reverify} of a second spec). A door whose
@@ -407,10 +435,16 @@ async function recheck<O>(
   // what moved in the operator's own terms when the spec knows; the refusal
   // names the objects it holds no key (or only a shared key) for.
   if (spec.locks && held) {
-    const needed = await spec.locks(object, confirmed, reads)
-    if (unheldClaimsRefusal(view.what, '', held, needed)) {
+    const needed = await recomputedClaims(spec, object, confirmed, reads)
+    const others = otherJobsClaims()
+    const refusal = unheldClaimsRefusal(view.what, '', held, needed, others)
+    if (refusal) {
+      // cr.64b1r (3): a read that failed is not a move — `locksMoved` names
+      // what moved, so it runs only for a STATE_CHANGED refusal.
+      if (refusal.code !== 'STATE_CHANGED')
+        throw new GuardRefusalError(refusal)
       const moved = spec.locksMoved ? await spec.locksMoved(object, reads, was) : claimsMoved(held, needed)
-      throw new GuardRefusalError(unheldClaimsRefusal(view.what, moved, held, needed)!)
+      throw new GuardRefusalError(unheldClaimsRefusal(view.what, moved, held, needed, others) ?? refusal)
     }
   }
   return { object, reads }
@@ -440,13 +474,23 @@ export type GuardedBody<O> = (object: O, ctx: GuardedContext<O>) => Promise<unkn
 export interface GuardedOpts<O> {
   /**
    * Called when the job door's FIRST run refuses after its re-read found the
-   * object (a gate, a revision or scope change, the lock recompute, an
-   * unreadable claim fact — every {@link GuardRefusalError}), with the
-   * refusal and the re-read object, before the job fails with it. A door
-   * whose body reports its own outcome (the schedule fire's notify, cr.64b1
-   * (F)) reports the guard's refusal here, since it happens before any body
-   * runs. A refusal before the read found anything (the object gone or
-   * another one) is an identity question and is not reported here.
+   * object, with the refusal and the re-read object, before the job fails
+   * with it. It hears every {@link GuardRefusalError}: a gate, a revision or
+   * scope change, the lock recompute (STATE_CHANGED, or cr.64b1r (3)'s 503
+   * UNAVAILABLE when a claim fact could not be read), and a claim builder
+   * that could not read its fact — the claim readers'
+   * {@link LockClaimsUnreadableError} and (cr.64b1r (2)) the AHR topology's
+   * typed {@link AhrTopologyUnreadableError}, both turned into 503
+   * UNAVAILABLE refusals naming the read before this runs. (cr.64b1 said
+   * "an unreadable claim fact" here while only GuardRefusalError reached
+   * it, so an AHR fire whose topology read failed in the job ended
+   * JOB_FAILED and was never reported.) Any OTHER throw is not a refusal —
+   * the job fails with it and this is not called. A door whose body reports
+   * its own outcome (the schedule fire's notify, cr.64b1 (F)) reports the
+   * guard's refusal here, since it happens before any body runs. A refusal
+   * before the read found anything (the object gone or another one) is an
+   * identity question and is not reported here; nor is a `reguard`'s (the
+   * body is running then, and reports its own failure).
    */
   refused?: (refusal: Refusal, object: O) => Promise<void>
 }
@@ -505,31 +549,69 @@ export function guarded<O>(spec: GuardSpec<O>, pass: GuardPass<O>, body: Guarded
  * table's own rule ({@link covers}, jobs/locks.ts, cr.64b1 (A)): the same key
  * in a mode that excludes as much (a held exclusive covers a needed shared),
  * or the pool's name key held exclusive for any guid-keyed claim of that pool
- * (cr.33b's fallback). A run that now needs FEWER keys (an archive removed)
+ * (cr.33b's fallback) while no other job holds that guid key without the name
+ * key (cr.64b1r (1): `others`, the queue's {@link otherJobsClaims} by default
+ * — every other job it knows, so the cover is checked against the real
+ * table). A run that now needs FEWER keys (an archive removed)
  * holds everything it acts on and proceeds — the extra keys only make other
  * verbs wait for it. `moved` names the claim-bearing field that moved, as the
  * door reads it; the refusal names the objects it holds no lock on, and those
  * it holds only a shared lock on where it now needs exclusive (cr.64b1 (C)).
  *
- * Returns the STATE_CHANGED refusal, or null when every needed claim is held.
+ * cr.64b1r (3): when the sets differ because a READ failed — a needed claim
+ * is a fallback ({@link LockClaim.unread}: the job could not read the pool's
+ * guid or VG UUID), or the route's fallback no longer covers because another
+ * job holds the guid key without the name key — and EVERY claim the run
+ * lacks is so explained, the refusal is 503 UNAVAILABLE "<the read> could not
+ * be read …", since nothing is known to have moved. A claim lacked for no
+ * failed read is a move, and the refusal stays STATE_CHANGED.
+ *
+ * Returns the STATE_CHANGED (or UNAVAILABLE) refusal, or null when every
+ * needed claim is held.
  */
 export function unheldClaimsRefusal(
   what: string,
   moved: string,
   held: readonly LockClaim[],
   needed: readonly LockClaim[],
+  others: readonly (readonly LockClaim[])[] = otherJobsClaims(),
 ): Refusal | null {
   // cr.64b1 (A): the lock table's own rule (`covers`, jobs/locks.ts), never
   // a key-by-key comparison of its own — so a held exclusive name key (the
   // cr.33b fallback a route took when the pool's guid could not be read)
-  // covers every guid-keyed claim of that pool the job's re-read now needs.
-  const missing = needed.filter(c => !covers(held, c))
+  // covers every guid-keyed claim of that pool the job's re-read now needs,
+  // unless another job holds that key without the name key (cr.64b1r (1)).
+  const missing = needed.filter(c => !covers(held, c, others))
   if (missing.length === 0)
     return null
+  const objects = (claims: LockClaim[]): string => [...new Set(claims.map(c => c.what))].join(', ')
+  const reads = (claims: LockClaim[]): string => [...new Set(claims.map(c => c.unread!))].join(' and ')
+  // cr.64b1r (3): the sentence says WHY the two sets differ. A needed claim
+  // that is a FALLBACK (`unread`: the job's own read of the guid or VG UUID
+  // failed) did not move — the job could not see — and a held fallback whose
+  // cover another job voided (the ROUTE's read failed; cr.64b1r (1)) did not
+  // move either. Both are 503 UNAVAILABLE "could not be read", never
+  // STATE_CHANGED "changed while this run waited", which a scheduled fire
+  // would mail. Only when EVERY missing claim is so explained: a claim that
+  // is missing for no failed read (a mount that appeared under the path, a
+  // pool re-created under the name) is a move, and the move is the sentence.
+  const routeUnread = held.filter(h => h.unread !== undefined && missing.some(c => c.within === h.key))
+  const jobUnread = missing.filter(c => c.unread !== undefined)
+  const explained = (c: LockClaim): boolean => c.unread !== undefined || routeUnread.some(h => h.key === c.within)
+  if (missing.every(explained)) {
+    const why: string[] = []
+    if (jobUnread.length > 0)
+      why.push(`${reads(jobUnread)} could not be read in the job, so the run cannot tell which locks it needs`)
+    if (routeUnread.length > 0) {
+      const uncovered = missing.filter(c => routeUnread.some(h => h.key === c.within))
+      why.push(`${reads(routeUnread)} could not be read when the run was requested, so the run holds a lock on ${objects(routeUnread)} instead, `
+        + `which does not cover ${objects(uncovered)} while another job holds ${uncovered.length === 1 ? 'it' : 'them'} without that name`)
+    }
+    return { status: 503, code: 'UNAVAILABLE', message: `${what}: ${why.join('; ')} — nothing was done; try again` }
+  }
   // cr.64b1 (C): a needed claim whose KEY is held (shared, where exclusive is
   // needed now) is not "no lock" — the sentence says which it is.
   const heldKeys = new Set(held.map(c => c.key))
-  const objects = (claims: LockClaim[]): string => [...new Set(claims.map(c => c.what))].join(', ')
   const none = missing.filter(c => !heldKeys.has(c.key))
   const weak = missing.filter(c => heldKeys.has(c.key))
   const holds = [
@@ -812,6 +894,16 @@ function within(c: LockClaim, nameKey: LockClaim): LockClaim {
 }
 
 /**
+ * The §4.2 fallback for a pool whose stable id could not be read: its name
+ * key exclusive, saying WHAT could not be read (`unread`, jobs/locks.ts), so
+ * the lock recompute can tell a read that failed from an object that moved
+ * (cr.64b1r (3)).
+ */
+function fallback(nameKey: LockClaim, unread: string): LockClaim {
+  return { ...nameKey, unread }
+}
+
+/**
  * `zpool:<guid>` — every ZFS verb on the pool or on anything in it: exclusive
  * for the pool-structural verbs (destroy, export, upgrade, mountpoint, add or
  * remove a vdev, attach, replace, raidz expand, cleanup), shared for
@@ -838,7 +930,7 @@ export function znameClaim(pool: string, mode: LockMode = 'exclusive'): LockClai
  */
 export function poolClaims(pool: string, guid: string | null | undefined, mode: LockMode, opts: { namespace?: boolean } = {}): LockClaim[] {
   if (!guid)
-    return [znameClaim(pool)]
+    return [fallback(znameClaim(pool), `the guid of pool '${pool}'`)]
   const name = znameClaim(pool, opts.namespace ? 'exclusive' : 'shared')
   return [within(zpoolClaim(guid, mode, pool), name), name]
 }
@@ -893,7 +985,8 @@ export function zfsClaims(poolGuid: string, dataset: string, mode: LockMode): Lo
 export function zfsDatasetClaims(poolGuid: string | null | undefined, dataset: string, mode: LockMode): LockClaim[] {
   if (poolGuid)
     return zfsClaims(poolGuid, dataset, mode)
-  return [znameClaim(datasetOf(dataset).split('/')[0])]
+  const pool = datasetOf(dataset).split('/')[0]
+  return [fallback(znameClaim(pool), `the guid of pool '${pool}'`)]
 }
 
 /**
@@ -989,7 +1082,7 @@ export function scheduleClaim(id: string, mode: LockMode): LockClaim {
  */
 export function ahrPoolClaims(pool: string, vgUuid: string | null | undefined, mode: LockMode, opts: { namespace?: boolean } = {}): LockClaim[] {
   if (!vgUuid)
-    return [ahrnameClaim(pool)]
+    return [fallback(ahrnameClaim(pool), `the VG UUID of AHR pool '${pool}'`)]
   const name = ahrnameClaim(pool, opts.namespace ? 'exclusive' : 'shared')
   return [within(ahrClaim(vgUuid, mode, pool), name), name]
 }
