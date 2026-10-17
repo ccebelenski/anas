@@ -1,0 +1,10 @@
+npimp	mountpoint	/npimp
+npimp	canmount	on
+npimp/child	mountpoint	/npimp/child
+npimp/child	canmount	on
+npimp/child@snap1	mountpoint	-
+npimp/child@snap1	canmount	-
+npimp/quiet	mountpoint	/npimp/quiet
+npimp/quiet	canmount	noauto
+npimp/vol1	mountpoint	-
+npimp/vol1	canmount	-

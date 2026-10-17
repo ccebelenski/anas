@@ -254,6 +254,28 @@ print headers, use tab-delimited output", so `routes/__tests__/datasets-guard.te
 the header dropped and the columns tab-joined (the shape `replication-holds.ts parseHolds` has read live
 since ident.4). Capture `zfs holds -H` itself, with its exit code, at the next node pass.
 
+## Real capture — the import gate's mountpoint read (cr.52s-b review P-e, wave-4 node pass, 2026-10-17)
+
+`zfs-get-mountpoint-canmount.txt` is the verbatim stdout of
+`zfs get -H -r -o name,property,value mountpoint,canmount -- npimp` on the stunt node
+(`zfs-2.4.4-pve1`, kernel `7.0.14-23-pve`), exit code 0, over a throwaway mirror pool
+built for the capture: the root filesystem, a child filesystem (`npimp/child`), a
+snapshot of it (`npimp/child@snap1`), a 16M zvol (`npimp/vol1`) and a `canmount=noauto`
+filesystem (`npimp/quiet`). This is the exact argv the pool import's `-N` gate runs
+(`routes/pools.ts`).
+
+What it settles:
+
+- One row PER PROPERTY PER DATASET, three tab-separated columns (`name`, `property`,
+  `value`), no header, no trailing tab, `\n` after every row; rows come in dataset
+  order, `mountpoint` before `canmount` within a dataset (the order of the `-o`
+  property list).
+- `-r` includes SNAPSHOTS: `npimp/child@snap1` prints both rows with the value `-`.
+- A ZVOL prints both rows too, each with the value `-` (mountpoint and canmount do
+  not apply to a volume) — so `-` must read as "nothing to gate", never as a path.
+- `canmount=noauto` prints `noauto` (only `off` is the value the gate skips; a
+  `noauto` dataset's stored mountpoint is still gated).
+
 ## Pre-existing fixtures — synthetic
 
 Everything here that is NOT in the zoo table above and not one of the two iscsi.3
