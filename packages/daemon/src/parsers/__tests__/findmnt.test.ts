@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
-import { classifyKind, effectiveMountAt, effectiveMounts, isFindmntTable, isPseudoFstype, isSystemMountTarget, optionsReadOnly, parseFindmnt, parseFindmntTable, readFindmntTable } from '../findmnt.js'
+import { classifyKind, effectiveMountAt, effectiveMounts, isFindmntTable, isPseudoFstype, isSystemMountTarget, optionsReadOnly, parseFindmnt, parseFindmntTable, readFindmntTable, zfsLiveDatasetMounts } from '../findmnt.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/mounts')
@@ -126,6 +126,70 @@ describe('effectiveMounts / effectiveMountAt — the ONE stacked-mount rule (cr.
     const armed = parseFindmnt(loadFixture('findmnt-automount-armed.json'))
     assert.equal(effectiveMounts(armed).get('/mnt/anas-auto')!.fstype, 'autofs')
     assert.equal(effectiveMountAt(armed, '/mnt/anas-auto'), undefined)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// cr.60r item 4: the flatten of a stack is bottom-first because findmnt's
+// `--json` is a TREE — the over-mount is nested inside the covered mount's
+// object, so the parent structurally cannot print after its child.
+// ---------------------------------------------------------------------------
+
+describe('cr.60r item 4 — the stack order is structural (the capture is a tree, not a list)', () => {
+  it('captured: the nfs4 row at /mnt/anas-auto is the autofs row\'s CHILD object, and the flatten is parent-then-child', () => {
+    const raw = JSON.parse(loadFixture('findmnt-full.json')) as { filesystems: unknown[] }
+    const walk = (fs: unknown): unknown => {
+      const row = fs as { target?: string, fstype?: string, children?: unknown[] }
+      if (row.target === '/mnt/anas-auto' && row.fstype === 'autofs')
+        return row
+      return (row.children ?? []).map(walk).find(x => x !== undefined)
+    }
+    const autofs = raw.filesystems.map(walk).find(x => x !== undefined) as { children?: Array<{ target: string, fstype: string }> }
+    assert.ok(autofs, 'the autofs row exists')
+    assert.ok(autofs.children!.find(c => c.target === '/mnt/anas-auto' && c.fstype === 'nfs4'), 'the over-mount is nested INSIDE the covered mount — the tree is the capture\'s shape')
+    // The flatten keeps that order: bottom (autofs) first, the TOP (nfs4) last.
+    const at = parseFindmnt(loadFixture('findmnt-full.json')).filter(n => n.target === '/mnt/anas-auto')
+    assert.deepEqual(at.map(n => n.fstype), ['autofs', 'nfs4'])
+    assert.equal(effectiveMountAt(parseFindmnt(loadFixture('findmnt-full.json')), '/mnt/anas-auto')!.fstype, 'nfs4')
+  })
+
+  it('a three-row stack (autofs → nfs4 → cifs): the flatten stays bottom-first and the TOP is the second real row', () => {
+    const top = { target: '/mnt/anas-nfs', source: '//h/top', fstype: 'cifs', options: 'rw' }
+    const mid = { target: '/mnt/anas-nfs', source: '127.0.0.1:/srv/nfs/export1', fstype: 'nfs4', options: 'rw,vers=4.2', children: [top] }
+    const bottom = { target: '/mnt/anas-nfs', source: 'systemd-1', fstype: 'autofs', options: 'rw', children: [mid] }
+    const nodes = parseFindmnt(JSON.stringify({ filesystems: [bottom] }))
+    // Bottom-first, structurally: the JSON nests top inside mid inside bottom.
+    assert.deepEqual(nodes.map(n => n.fstype), ['autofs', 'nfs4', 'cifs'])
+    // The second REAL row (the cifs on top) is the target\'s row — the last at the target wins.
+    assert.equal(effectiveMountAt(nodes, '/mnt/anas-nfs')!.fstype, 'cifs')
+    assert.equal(effectiveMounts(nodes).get('/mnt/anas-nfs')!.source, '//h/top')
+  })
+})
+
+describe('zfsLiveDatasetMounts — live dataset → every target it is mounted at (cr.60r)', () => {
+  it('the captured table: zfs rows only, keyed by the dataset (the source)', () => {
+    const live = zfsLiveDatasetMounts(parseFindmnt(loadFixture('findmnt-full.json')))
+    assert.deepEqual(live, new Map([['mnttest', ['/mnttest']], ['mnttest/data', ['/mnttest/data']]]))
+  })
+
+  it('a bind row\'s `[/sub]` suffix is stripped (cr.60 L23\'s rule): the bind\'s target is one more path of the dataset, beside its own mount', () => {
+    const live = zfsLiveDatasetMounts(parseFindmnt(JSON.stringify({
+      filesystems: [{ target: '/mnt/ds', source: 'tank', fstype: 'zfs', options: 'rw', children: [{ target: '/srv/home', source: 'tank[/home]', fstype: 'zfs', options: 'rw' }] }],
+    })))
+    assert.deepEqual(live.get('tank'), ['/mnt/ds', '/srv/home'])
+    assert.equal(live.has('tank[/home]'), false)
+  })
+
+  it('snapshot rows key their own name, and rows with no dataset or no absolute target are not facts', () => {
+    const live = zfsLiveDatasetMounts(parseFindmnt(JSON.stringify({
+      filesystems: [
+        { target: '/tank/.zfs/snapshot/s1', source: 'tank@s1', fstype: 'zfs', options: 'ro' },
+        { target: '/x', source: '[/x]', fstype: 'zfs', options: 'rw' },
+        { target: 'rel', source: 'tank', fstype: 'zfs', options: 'rw' },
+        { target: '/y', source: 'tank', fstype: 'ext4', options: 'rw' },
+      ],
+    })))
+    assert.deepEqual([...live.keys()], ['tank@s1'])
   })
 })
 

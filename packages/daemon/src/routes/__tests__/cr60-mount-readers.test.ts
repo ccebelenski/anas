@@ -150,6 +150,10 @@ describe('cr.60 — the mount-family findmnt readers (review L26) and the strict
   })
 
   it('enable touches fstab alone and is not refused by an unreadable table', async () => {
+    // cr.60r: with no zfspool storage the table decides nothing about PVE
+    // territory either — the captured pve/storage.cfg minus its zfspool stanza.
+    await writeFile(join(dir, 'storage.cfg'), fixture('pve/storage.cfg').split('\n\n').filter(st => !st.startsWith('zfspool:')).join('\n\n'))
+    process.env.ANAS_STORAGE_CFG = join(dir, 'storage.cfg')
     const s = serve()
     // Disable the line first (a readable table), then lose the table.
     const disable = async (code?: string) => s.inject({ method: 'POST', url: `/v1/mounts/${enc(NFS_MP)}/state`, headers: { ...JSON_HEADERS, ...(code ? { 'x-anas-confirm': code } : {}) }, payload: JSON.stringify({ action: 'disable' }) })
@@ -162,6 +166,56 @@ describe('cr.60 — the mount-family findmnt readers (review L26) and the strict
     const on = await s.inject({ method: 'POST', url: `/v1/mounts/${enc(NFS_MP)}/state`, headers: JSON_HEADERS, payload: JSON.stringify({ action: 'enable' }) })
     assert.equal(on.statusCode, 202, on.body)
     assert.equal((await waitForJob(s, (on.json() as JobAccepted).job.id)).status, 'completed')
+  })
+
+  // --- cr.60r (review possible 3): a zfspool dataset's LIVE mountpoint is PVE
+  // territory at the mount doors too, read from the verbs' one strict table.
+
+  /** The captured full table plus one zfs row cloned from its `mnttest` row: local-zfs's dataset moved to /mnt/zp2. */
+  function movedLocalZfs(): string {
+    const t = JSON.parse(fixture('mounts/findmnt-full.json')) as { filesystems: Array<{ children?: Array<Record<string, unknown>> }> }
+    const captured = t.filesystems[0].children!.find(c => c.fstype === 'zfs' && c.source === 'mnttest')!
+    t.filesystems[0].children!.push({ target: '/mnt/zp2', source: 'rpool/data', fstype: 'zfs', options: captured.options })
+    return JSON.stringify(t)
+  }
+
+  it('cr.60r: the create door refuses the LIVE path of a zfspool dataset, and a hand-written line there is hands-off', async () => {
+    // The mount doors match a claim EXACTLY (pveStorageFor — the inventory's
+    // tagging rule); the restore's territory gate is the prefix door.
+    process.env.ANAS_STORAGE_CFG = join(FIXTURES, 'pve/storage-zfsroot.cfg')
+    await writeFile(join(dir, 'fstab'), `${fixture('mounts/fstab-anas-managed')}127.0.0.1:/srv/nfs/export1  /mnt/zp2  nfs4  defaults,nofail  0  0\n`)
+    table = () => ({ stdout: movedLocalZfs(), stderr: '', exitCode: 0 })
+    const s = serve()
+    const create = await s.inject({ method: 'POST', url: '/v1/mounts', headers: JSON_HEADERS, payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/export', mountpoint: '/mnt/zp2', persistent: false }) })
+    assert.equal(create.statusCode, 400, create.body)
+    assert.match((create.json() as { error: { message: string } }).error.message, /belongs to a PVE storage/)
+    const disable = await s.inject({ method: 'POST', url: `/v1/mounts/${enc('/mnt/zp2')}/state`, headers: JSON_HEADERS, payload: JSON.stringify({ action: 'disable' }) })
+    assert.equal(disable.statusCode, 400, disable.body)
+    assert.match((disable.json() as { error: { message: string } }).error.message, /PVE-owned \(hands-off\)/)
+    // The config default stays claimed beside the live path.
+    const atDefault = await s.inject({ method: 'POST', url: '/v1/mounts', headers: JSON_HEADERS, payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/export', mountpoint: '/rpool/data', persistent: false }) })
+    assert.equal(atDefault.statusCode, 400, atDefault.body)
+    assert.match((atDefault.json() as { error: { message: string } }).error.message, /belongs to a PVE storage/)
+    assert.equal(calls.filter(c => c.command === FINDMNT).length > 0, true, 'the claim came from the table')
+    assert.ok(!calls.some(c => c.command === MOUNT || c.command === UMOUNT), 'nothing was mounted or unmounted')
+  })
+
+  it('cr.60r: with a zfspool configured, an unreadable table refuses the create door and enable 503 naming the read', async () => {
+    process.env.ANAS_STORAGE_CFG = join(FIXTURES, 'pve/storage-zfsroot.cfg')
+    table = () => ({ stdout: movedLocalZfs(), stderr: 'findmnt: failed', exitCode: 1 })
+    const s = serve()
+    const reqs = [
+      { url: '/v1/mounts', payload: { type: 'nfs', server: '127.0.0.1', remotePath: '/export', mountpoint: '/mnt/zp2', persistent: false } },
+      { url: `/v1/mounts/${enc(NFS_MP)}/state`, payload: { action: 'enable' } },
+    ]
+    for (const r of reqs) {
+      const res = await s.inject({ method: 'POST', url: r.url, headers: JSON_HEADERS, payload: JSON.stringify(r.payload) })
+      assert.equal(res.statusCode, 503, `${r.url}: ${res.body}`)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'UNAVAILABLE')
+      assert.match(error.message, /could not read the kernel mount table \(findmnt\).*PVE's ZFS storage datasets/)
+    }
+    assert.ok(!calls.some(c => c.command === MOUNT || c.command === UMOUNT), 'nothing was mounted or unmounted')
   })
 
   // --- folded from cr.54's report: the mount verbs' PVE gate reads storage.cfg

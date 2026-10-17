@@ -12,7 +12,7 @@ import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, Mount
 import { CommandTimeoutError } from '../executor/deadline.js'
 import { classifyKind, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
 import { addMount, carriesAutomount, disableMount, enableMount, getMount, hasMount, mountOptionTokens, removeMount, replaceMount } from '../parsers/fstab.js'
-import { PVE_STORAGE_CFG, readPveMountPaths, readPveMountPathsStrict, readZfsMountpoints } from '../parsers/pve-storage.js'
+import { PVE_STORAGE_CFG, readPveMountPaths, readPveTerritoryClaims, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, sendRefusal } from '../safety/guard.js'
 import { diagnoseBusyPath, enrichBusyError, formatHolders, runFuser, toolNotFound } from '../services/busy-diagnosis.js'
@@ -31,7 +31,6 @@ import {
   entryFromRequest,
   fstabHasMount,
   fstabLineRevision,
-  hasInlineCredentials,
   InvalidExtraOptionsError,
   isRemoteKind,
   mountpointReservedByPve,
@@ -175,8 +174,13 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     findmnt: (reads: GuardReads) => reads.once('findmnt', () => readFindmntTable(executor)),
     fstab: (reads: GuardReads) => reads.once('fstab', () => readConfig(fstabPath)),
     // cr.60 (from cr.54's report): the STRICT reader — an unreadable
-    // storage.cfg is null, and the PVE gates refuse on it (never an empty map).
-    pvePaths: (reads: GuardReads) => reads.once('pve-mount-paths', () => readPveMountPathsStrict(storagePath ?? PVE_STORAGE_CFG)),
+    // storage.cfg refuses, never an empty map. cr.60r (review possible 3):
+    // the claims also cover every path a zfspool dataset is LIVE at, derived
+    // from the SAME per-run strict table read the target gates share (no
+    // second findmnt); an unreadable table, when a zfspool needs it, is its
+    // own refusal — never "no live claim".
+    pvePaths: (reads: GuardReads) => reads.once('pve-mount-paths', () =>
+      readPveTerritoryClaims(storagePath ?? PVE_STORAGE_CFG, () => mountReads.findmnt(reads))),
     ahrSpecs: (reads: GuardReads) => reads.once('ahr-specs', () => readAhrSpecs()),
     claims: (reads: GuardReads) => reads.once('iscsi-claims', async () => createIscsiClaimCache(executor, iscsiPaths)),
   }
@@ -211,9 +215,21 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (mountpointReservedByPve(o.mountpoint))
       return pveOwnedRefusal(o.mountpoint)
     const paths = await mountReads.pvePaths(reads)
-    if (paths === null)
+    if (paths === 'storage-cfg')
       return pveConfigUnreadable(o.mountpoint)
+    if (paths === 'findmnt')
+      return pveLiveUnreadable(o.mountpoint)
     return pveStorageFor(o.mountpoint, paths) ? pveOwnedRefusal(o.mountpoint) : null
+  }
+
+  /**
+   * cr.60r: a zfspool storage's dataset claims the paths it is LIVE at, so
+   * with the mount table unreadable the daemon cannot see whether the path is
+   * PVE's — the verb (enable and the create door included: neither has
+   * another table gate) refuses 503 naming the read, never "not PVE's".
+   */
+  function pveLiveUnreadable(mountpoint: string): Refusal {
+    return { status: 503, code: 'UNAVAILABLE', message: `ANAS could not read the kernel mount table (findmnt), so it cannot check '${mountpoint}' against the paths PVE's ZFS storage datasets are mounted at — nothing was done` }
   }
 
   function pveOwnedRefusal(mountpoint: string): Refusal {
@@ -471,8 +487,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         async s => mountTargetRefusal(s.mountpoint),
         async (s, reads) => {
           const paths = await mountReads.pvePaths(reads)
-          if (paths === null)
+          if (paths === 'storage-cfg')
             return pveConfigUnreadable(s.mountpoint)
+          if (paths === 'findmnt')
+            return pveLiveUnreadable(s.mountpoint)
           return pveStorageFor(s.mountpoint, paths)
             ? { status: 400, code: 'VALIDATION_ERROR', message: `Mountpoint '${s.mountpoint}' belongs to a PVE storage (hands-off)` }
             : null
@@ -743,7 +761,13 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     // MIGRATED on this operator-initiated save — the secret moves to the protected
     // 0600 creds file and the rewritten fstab line carries `credentials=<file>`
     // with NO inline username/password/domain.
-    const migrating = hasInlineCredentials(existing)
+    // cr.60r (the review's DEFECT): there is something to migrate only when the
+    // line carries a PASSWORD. A username-only line has none, and moving it is
+    // not the alternative — an empty `password=` in a creds file is a real
+    // credential shape (an empty password / a prompt) and would CHANGE the
+    // mount. So the username stays where it is: the serializer re-emits the
+    // `user=` token (never `guest`), and the line keeps the account it named.
+    const migrating = existing.inlineCredentials?.password !== undefined
 
     const job = jobQueue.submit(
       'mount.update',
@@ -772,9 +796,13 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
             ...(existing.inlineCredentials.domain !== undefined ? { domain: existing.inlineCredentials.domain } : {}),
           })
         }
-        if (migrating) {
-          // Drop the inline tokens from the serialized entry (buildOptionTokens
-          // already ignores inlineCredentials; also drop the now-migrated domain
+        // cr.60r: rotated credentials REPLACE the line's inline identity too —
+        // the new file names the account, so a username-only line's `user=bob`
+        // must not ride on beside it (the pre-cr.60r save dropped it here; only
+        // a save that leaves the credentials alone keeps the token).
+        if (migrating || (body.credentials && existing.inlineCredentials?.username !== undefined)) {
+          // Drop the inline tokens from the serialized entry (the serializer
+          // re-emits a lifted username, cr.60r; also drop the now-migrated domain
           // option so it is not re-emitted inline).
           delete merged.inlineCredentials
           if (merged.options.cifs)

@@ -74,6 +74,30 @@ export function unescapeFstabField(s: string): string {
   return s.replace(FSTAB_OCTAL_ESCAPE_RE, (_m, oct: string) => String.fromCharCode(Number.parseInt(oct, 8)))
 }
 
+/**
+ * The OPTIONS-column counterpart of {@link escapeFstabField} (cr.60r): a token
+ * value DECODED by {@link unescapeFstabField} on the way into a credential
+ * channel returns to the OPTIONS column through here. The set is the
+ * field-breaking characters PLUS the option-list comma (a raw comma would
+ * split the token); every one becomes its three-digit octal escape, the exact
+ * form {@link unescapeFstabField} and getmntent(3) read back. Backslash first,
+ * so its own escape is never re-escaped.
+ */
+const FSTAB_OPTION_VALUE_ESCAPES: Record<string, string> = {
+  '\\': '\\134',
+  ' ': '\\040',
+  '\t': '\\011',
+  '\n': '\\012',
+  ',': '\\054',
+}
+
+const FSTAB_OPTION_VALUE_ESCAPE_RE = /[\\ \t\n,]/g
+
+/** Re-encode one decoded option VALUE for writing back into an OPTIONS column. */
+export function escapeFstabOptionValue(s: string): string {
+  return s.replace(FSTAB_OPTION_VALUE_ESCAPE_RE, c => FSTAB_OPTION_VALUE_ESCAPES[c] ?? c)
+}
+
 /** A single fstab option token name: letters, digits, `_ . -` (the word set). */
 const FSTAB_OPTION_NAME_RE = /^[\w.-]+$/
 

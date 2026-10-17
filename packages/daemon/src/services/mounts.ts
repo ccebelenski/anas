@@ -1336,7 +1336,14 @@ export function entryForResponse(entry: MountEntry): MountEntry {
   return rest
 }
 
-/** True when an entry carries inline plaintext credentials (username or password inline). */
+/**
+ * True when an entry carries inline credentials in the transient channel — a
+ * lifted username, a password, or both. The reader fills the channel for a
+ * username-only line too, so this is NOT the migration test: the detail uses
+ * it to show the username/domain, and the save migrates only a line that
+ * carries a PASSWORD (cr.60r — routes/mounts.ts tests `password` directly; a
+ * username-only line keeps its token on the line).
+ */
 export function hasInlineCredentials(entry: MountEntry | undefined): boolean {
   const inline = entry?.inlineCredentials
   return !!inline && (inline.username !== undefined || inline.password !== undefined)
@@ -1426,13 +1433,17 @@ export async function buildMountDetail(
       // Inline plaintext credentials found (18.5 anti-pattern): reflect their
       // presence + non-secret metadata (username/domain), NEVER the password, and
       // guide the operator that a save migrates them to the protected creds file.
+      // cr.60r: the migration advisory belongs to the SECRET only — a line with
+      // a username and no password migrates nothing (the username stays on the
+      // line by design), so it earns no "saving migrates them" hint.
       const inline = entry!.inlineCredentials!
       detail.credentials = {
         set: true,
         ...(inline.username ? { username: inline.username } : {}),
         ...(inline.domain ? { domain: inline.domain } : {}),
       }
-      detail.warnings.push(INLINE_CREDS_WARNING)
+      if (inline.password !== undefined)
+        detail.warnings.push(INLINE_CREDS_WARNING)
     }
     else {
       // The fstab line names its file; a line that names none falls back to

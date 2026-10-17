@@ -577,6 +577,45 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     assert.equal(restoreRan(), false)
   })
 
+  /**
+   * cr.60r (review possible 3): the captured full table (mounts/findmnt-full.json)
+   * plus ONE zfs row cloned from its captured `mnttest` row, re-pointed at
+   * local-zfs's dataset after `zfs set mountpoint=/mnt/zp2 rpool/data`.
+   */
+  function tableWithMovedLocalZfs(): string {
+    const table = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/mounts/findmnt-full.json'), 'utf8')) as { filesystems: Array<{ children?: Array<Record<string, unknown>> }> }
+    const root = table.filesystems[0]
+    const captured = root.children!.find(c => c.fstype === 'zfs' && c.source === 'mnttest')!
+    root.children!.push({ target: '/mnt/zp2', source: 'rpool/data', fstype: 'zfs', options: captured.options })
+    return JSON.stringify(table)
+  }
+
+  it('cr.60r: a local-zfs dataset LIVE at /mnt/zp2 makes a restore into /mnt/zp2/subvol-… 409 PVE_MANAGED, and the config default /rpool/data stays claimed', async () => {
+    await writeFile(join(dir, 'storage.cfg'), readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/pve/storage-zfsroot.cfg'), 'utf8'))
+    mockOf(server).prependFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: tableWithMovedLocalZfs(), stderr: '', exitCode: 0 } })
+    for (const path of ['/mnt/zp2/subvol-100-disk-0/root', '/rpool/data/subvol-100-disk-0/root']) {
+      const res = await post(body({ task: undefined, target: { mode: 'inPlace', path } }))
+      assert.equal(res.statusCode, 409, `${path}: ${res.body}`)
+      const err = (res.json() as { error: { code: string, reason: string, message: string } }).error
+      assert.equal(err.code, 'PVE_MANAGED')
+      assert.equal(err.reason, 'pve-managed')
+      assert.ok(err.message.includes(`inside '${path.split('/subvol-')[0]}'`), err.message)
+    }
+    assert.equal(restoreRan(), false)
+  })
+
+  it('cr.60r: with a zfspool configured, a findmnt that fails refuses the restore 503 naming the read — never "no live claim"', async () => {
+    await writeFile(join(dir, 'storage.cfg'), readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/pve/storage-zfsroot.cfg'), 'utf8'))
+    // Exit 1 with the captured table still on stdout: the exit status decides (cr.60 L26).
+    mockOf(server).prependFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: tableWithMovedLocalZfs(), stderr: 'findmnt: failed', exitCode: 1 } })
+    const res = await post(body({ task: undefined, target: { mode: 'inPlace', path: '/mnt/zp2/subvol-100-disk-0/root' } }))
+    assert.equal(res.statusCode, 503, res.body)
+    const err = (res.json() as { error: { code: string, message: string } }).error
+    assert.equal(err.code, 'UNAVAILABLE')
+    assert.match(err.message, /could not read the kernel mount table \(findmnt\)/)
+    assert.equal(restoreRan(), false)
+  })
+
   it('refuses a selection this archive does not hold — a silent success is worse (GT-24)', async () => {
     const mock = mockOf(server)
     mock.addFixture({

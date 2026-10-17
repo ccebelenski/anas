@@ -255,17 +255,26 @@ export type MountCifsOptions = z.infer<typeof MountCifsOptions>
  * parser lifts them OUT of `passthrough` into this structured channel so the
  * plaintext password never rides the verbatim passthrough into a response.
  *
- * Held TRANSIENTLY, daemon-side only: it is NEVER serialized back into an fstab
- * line (`buildOptionTokens` ignores it) and the `password` is REDACTED (or the
- * whole channel dropped) before any value crosses the API boundary. Its sole
- * purpose is to MIGRATE the secret to the protected 0600 creds file on the next
- * operator-initiated save. `password` present ⇒ the plaintext secret still lives
- * inline and should be migrated.
+ * Held TRANSIENTLY, daemon-side only: no field of it ever crosses the API
+ * boundary (the whole channel is dropped before any response) and no request
+ * carries it. Its purposes: MIGRATE a plaintext secret to the protected 0600
+ * creds file on the next operator-initiated save (`password` present ⇒ the
+ * secret still lives inline), and — cr.60r — let a username with NO password
+ * survive every rewrite of the line: `buildOptionTokens` re-emits it under its
+ * original key.
  */
 export const MountInlineCredentials = z.object({
   username: z.string().optional(),
   password: z.string().optional(),
   domain: z.string().optional(),
+  /**
+   * The KEY the lifted username was written under (cr.60r: config files are
+   * the API — the operator's spelling is theirs). `user=bob` and `username=bob`
+   * mean the same to mount.cifs but are different bytes on the line, and a
+   * username-only line keeps its token, so the serializer re-emits THIS key.
+   * Absent only when the channel was built by hand (no line, no spelling).
+   */
+  usernameKey: z.string().optional(),
 })
 export type MountInlineCredentials = z.infer<typeof MountInlineCredentials>
 
@@ -297,9 +306,10 @@ export const MountEntry = z.object({
   credentialsFile: z.string().optional(),
   /**
    * Inline plaintext CIFS credentials lifted out of a hand-written fstab options
-   * list (`username=`/`password=`/`domain=`). TRANSIENT, daemon-only — never
-   * serialized back to fstab, password REDACTED/stripped before any response.
-   * Drives one-time migration to the protected creds file on the next save.
+   * list (`username=`/`password=`/`domain=`). TRANSIENT, daemon-only — the whole
+   * channel is dropped before any response. Drives one-time migration to the
+   * protected creds file on the next save, and (cr.60r) keeps a username-only
+   * line's account on the line through every rewrite.
    */
   inlineCredentials: MountInlineCredentials.optional(),
   /**

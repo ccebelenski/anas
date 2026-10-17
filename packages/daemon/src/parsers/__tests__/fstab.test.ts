@@ -124,7 +124,7 @@ describe('classifyOptions — inline plaintext CIFS credentials (BUG-1 security)
     for (const [u, p, d] of [['user', 'pass', 'dom'], ['USERNAME', 'PASSWORD', 'WORKGROUP'], ['User', 'Pass', 'workgroup']]) {
       const spelled = tokens.map(t => t.replace(/^username=/, `${u}=`).replace(/^password=/, `${p}=`).replace(/^domain=/, `${d}=`))
       const { options, inlineCredentials, secretOptions } = classifyOptions('cifs', spelled)
-      assert.deepEqual(inlineCredentials, { username: 'ccebelenski', password: 'Xy#zzy!$', domain: 'CORP' }, spelled.join(','))
+      assert.deepEqual(inlineCredentials, { username: 'ccebelenski', usernameKey: u, password: 'Xy#zzy!$', domain: 'CORP' }, spelled.join(','))
       assert.equal(options.cifs?.domain, 'CORP')
       assert.equal(options.passthrough, '')
       assert.equal(secretOptions, undefined)
@@ -784,5 +784,110 @@ describe('cr.19 — disable parks x-systemd.automount in place; enable restores 
     assert.equal(carriesAutomount(fixture, '/mnt/nowhere'), false)
     assert.equal(carriesAutomount('h:/e /mnt/orphan nfs4 nofail,x-anas.disabled-automount,noauto 0 0\n', '/mnt/orphan'), true)
     assert.equal(carriesAutomount(`${ANAS_MARKER}h:/e /mnt/old nfs4 nofail,x-systemd.automount 0 0\n`, '/mnt/old'), true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// cr.60r (the cr.60 review's DEFECT + possible 2): a hand-written CIFS line
+// with a username and NO password keeps the username through a save — it
+// never becomes a `guest` mount — and octal escapes decode into the migrated
+// credential, re-encoding if a token returns to the line. Probe line `i` and
+// probe line `g` from the review, constructed over the real routes.
+// ---------------------------------------------------------------------------
+
+describe('cr.60r — a username with no password is never lost and never becomes guest (DEFECT)', () => {
+  const lineI = '//h/s /mnt/q1i cifs user=bob,vers=3.0 0 0'
+
+  it('probe i parses: the username lifts into the transient channel, the line keeps its other options', () => {
+    const entry = parseFstab(`${lineI}\n`)[0]
+    assert.deepEqual(entry.inlineCredentials, { username: 'bob', usernameKey: 'user' })
+    assert.equal(entry.options.cifs?.vers, '3.0')
+    assert.equal(entry.options.passthrough, '')
+    assert.equal(entry.credentialsFile, undefined)
+  })
+
+  it('probe i serializes with `user=bob` on the line and NO `guest` (the DEFECT: the save wrote `guest`)', () => {
+    const entry = parseFstab(`${lineI}\n`)[0]
+    // The PUT merge's shape: ro set, no credentials supplied — nothing to migrate.
+    const merged = { ...entry, options: { ...entry.options, common: { ...entry.options.common, readOnly: true, nofail: true } } }
+    const line = serializeMountLine(merged)
+    assert.ok(line.includes('user=bob'), `the username must ride the written line: ${line}`)
+    assert.ok(!line.includes('guest'), `the line must not become a guest mount: ${line}`)
+    assert.ok(!line.includes('credentials='), `no creds file was written, none may be named: ${line}`)
+  })
+
+  it('item 1b: `username=bob` stays spelled `username=bob` — never normalized to `user=bob` (config files are the API)', () => {
+    const entry = parseFstab('//h/s /mnt/q1i cifs username=bob,vers=3.0 0 0\n')[0]
+    assert.deepEqual(entry.inlineCredentials, { username: 'bob', usernameKey: 'username' })
+    const line = serializeMountLine(entry)
+    assert.ok(line.includes('username=bob'), `the operator's spelling must survive: ${line}`)
+    assert.ok(!line.includes('user=bob'), `must not normalize to the short alias: ${line}`)
+    assert.ok(!line.includes('guest'), line)
+  })
+
+  it('item 1b: `user=bob` stays `user=bob` — the short alias is not expanded', () => {
+    const entry = parseFstab('//h/s /mnt/q1i cifs user=bob,vers=3.0 0 0\n')[0]
+    const line = serializeMountLine(entry)
+    assert.ok(line.includes('user=bob'), line)
+    assert.ok(!line.includes('username='), `must not grow the long spelling: ${line}`)
+  })
+
+  it('item 1b: mixed case is the operator\'s too — `USERNAME=bob` is re-emitted as written', () => {
+    const entry = parseFstab('//h/s /mnt/q1i cifs USERNAME=bob,vers=3.0 0 0\n')[0]
+    assert.deepEqual(entry.inlineCredentials, { username: 'bob', usernameKey: 'USERNAME' })
+    assert.ok(serializeMountLine(entry).includes('USERNAME=bob'))
+  })
+
+  it('item 1b: a credentials FILE plus a hand-written `username=bob` keeps the file spelling AND the long username token', () => {
+    const entry = parseFstab('//h/s /mnt/q1i cifs credentials=/etc/x.cred,username=bob,vers=3.0 0 0\n')[0]
+    const line = serializeMountLine(entry)
+    assert.ok(line.includes('credentials=/etc/x.cred'), line)
+    assert.ok(line.includes('username=bob'), line)
+    assert.ok(!line.includes('guest'), line)
+  })
+
+  it('an EMPTY `user=` is not a username — the line falls back to guest, as a credential-less line does', () => {
+    const entry = parseFstab('//h/s /mnt/q1e cifs user=,vers=3.0 0 0\n')[0]
+    assert.ok(!serializeMountLine(entry).includes('user='), serializeMountLine(entry))
+    assert.ok(serializeMountLine(entry).includes('guest'))
+  })
+
+  it('a username alongside a credentials FILE survives the rewrite (both stay; the file wins the auth slot)', () => {
+    const entry = parseFstab('//h/s /mnt/q1f cifs credentials=/etc/x.cred,user=bob,vers=3.0 0 0\n')[0]
+    assert.equal(entry.credentialsFile, '/etc/x.cred')
+    assert.deepEqual(entry.inlineCredentials, { username: 'bob', usernameKey: 'user' })
+    const line = serializeMountLine(entry)
+    assert.ok(line.includes('credentials=/etc/x.cred'), line)
+    assert.ok(line.includes('user=bob'), line)
+    assert.ok(!line.includes('guest'), line)
+  })
+})
+
+describe('cr.60r — fstab octal escapes across the migration seam (possible 2)', () => {
+  it('probe g: a `\\054`-escaped secret decodes on the way into the creds channel', () => {
+    const { inlineCredentials } = classifyOptions('cifs', ['pass=wo\\054rds'])
+    assert.equal(inlineCredentials!.password, 'wo,rds')
+  })
+
+  it('every fstab octal escape decodes in the lifted credential — `\\040` space, `\\011` tab, `\\134` backslash', () => {
+    const { inlineCredentials } = classifyOptions('cifs', ['user=a\\040b\\011c\\134d', 'pass=p\\134\\040q', 'dom=D\\040X'])
+    assert.equal(inlineCredentials!.username, 'a b\tc\\d')
+    assert.equal(inlineCredentials!.password, 'p\\ q')
+    assert.equal(inlineCredentials!.domain, 'D X')
+  })
+
+  it('an escaped username with no password round-trips the ESCAPE byte-for-byte (decode → re-encode on the way back to the line)', () => {
+    const line = '//h/s /mnt/q1r cifs user=bob\\054weird,vers=3.0 0 0'
+    const entry = parseFstab(`${line}\n`)[0]
+    assert.equal(entry.inlineCredentials!.username, 'bob,weird') // decoded in the channel
+    const written = serializeMountLine(entry)
+    assert.ok(written.includes('user=bob\\054weird'), `the comma must go back escaped: ${written}`)
+    assert.ok(!written.includes('user=bob,weird'), `a raw comma would split the option list: ${written}`)
+  })
+
+  it('secretOptions and passthrough tokens are NOT decoded — they stay byte-identical (they never left the line)', () => {
+    const { secretOptions, options } = classifyOptions('cifs', ['password2=a\\054b', 'x-fer=q\\040r'])
+    assert.deepEqual(secretOptions, ['password2=a\\054b'])
+    assert.equal(options.passthrough, 'x-fer=q\\040r')
   })
 })

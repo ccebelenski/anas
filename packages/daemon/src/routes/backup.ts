@@ -57,7 +57,8 @@ import {
 import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
 import { READ_JOB_OPERATIONS, readJobCancel } from '../jobs/read-jobs.js'
-import { readPbsStorages } from '../parsers/pve-storage.js'
+import { readFindmntTable } from '../parsers/findmnt.js'
+import { readPbsStorages, readPveTerritoryClaims } from '../parsers/pve-storage.js'
 import { directFromClientRefusal, TASK_RUNNER_USER } from '../runner-poll.js'
 import { guardCheck, guardConfirm, guarded, GuardReads, GuardRefusalError, iscsiTargetClaim, reverify, sendRefusal, sourcePathsMoved, taskClaim, unheldClaimsRefusal, zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
@@ -88,7 +89,6 @@ import {
   estimateSpace,
   parentDirectory,
   pathKind,
-  readPveMountPathsStrict,
   readSelectionFacts,
   restoreTerritoryRefusal,
   runFileRestore,
@@ -2802,9 +2802,25 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
 
     // (1) PVE's territory is read-only and hands-off, always — no override. An
     // unreadable storage.cfg is not "no storages": it refuses (cr.54).
+    // cr.60r (review possible 3): the claims include every path a zfspool
+    // dataset is LIVE at (the strict findmnt read, {@link
+    // readPveTerritoryClaims}) — a dataset moved with `zfs set mountpoint=`
+    // moves PVE's subvolumes with it, and a restore into the new path is PVE
+    // territory whatever the config names. An unreadable table is NOT "no
+    // live mountpoints" (cr.60's fail-closed rule): it refuses 503 naming the
+    // read.
     const territoryGate: Gate<RestoreDestination> = async (o, reads) => {
-      const pvePaths = await reads.once('restore:pve-paths', () => readPveMountPathsStrict(paths.pveStorageCfg))
-      return restoreTerritoryRefusal(o.target, pvePaths, paths.pveStorageCfg)
+      const claims = await reads.once('restore:pve-paths', () => readPveTerritoryClaims(paths.pveStorageCfg, () => readFindmntTable(executor)))
+      if (claims === 'storage-cfg')
+        return restoreTerritoryRefusal(o.target, null, paths.pveStorageCfg)
+      if (claims === 'findmnt') {
+        return {
+          status: 503,
+          code: 'UNAVAILABLE',
+          message: `ANAS could not read the kernel mount table (findmnt), so it cannot check which PVE storage mountpoints are live at '${o.target}' — no restore was done`,
+        }
+      }
+      return restoreTerritoryRefusal(o.target, claims, paths.pveStorageCfg)
     }
     // (1b) A live iSCSI LUN's backing object is a block device somebody else
     // has open. `heldByLun` is the ONE question iscsi.6 established for exactly

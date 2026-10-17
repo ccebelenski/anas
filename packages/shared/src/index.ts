@@ -43,6 +43,7 @@ export {
   CIFS_CREDENTIAL_OPTION_KEYS,
   cifsCredentialKeyKind,
   escapeFstabField,
+  escapeFstabOptionValue,
   FstabOptionList,
   FstabOptionToken,
   fstabOptionTokens,

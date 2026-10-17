@@ -908,6 +908,91 @@ describe('mount routes (Epic 18)', () => {
       assert.ok(creds.includes(`password=${PASSWORD}`), creds)
       assert.ok(creds.includes('username=ccebelenski'), creds)
     })
+
+    // cr.60r (the review's DEFECT): a hand-written CIFS line with a username
+    // and NO password. There is nothing to migrate, and `guest` is a LIE —
+    // the save used to drop bob and write `guest`, silently turning the mount
+    // anonymous. The username rides the rewritten line instead.
+    // cr.52r D3: the save re-mounts through a directory the daemon opens, so
+    // the mountpoints are REAL directories under the per-test tmpdir (MP maps
+    // after the shared beforeEach has set `mountBase`).
+    const userOnlyMp = (): string => MP('/mnt/q1i')
+    const userOnlyLine = (): string => `//h/s ${userOnlyMp()} cifs user=bob,vers=3.0 0 0\n`
+    beforeEach(async () => {
+      await mkdir(MP('/mnt/q1i'), { recursive: true })
+      await mkdir(MP('/mnt/q1g'), { recursive: true })
+    })
+
+    it('cr.60r DEFECT: PUT of a username-only line keeps `user=bob` and never writes `guest`', async () => {
+      await writeFile(fstabPath, FSTAB_FIXTURE + userOnlyLine())
+      const res = await server!.inject({ method: 'PUT', url: `/v1/mounts/${enc(userOnlyMp())}`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ options: { ro: true } }) })
+      assert.equal(res.statusCode, 202, res.payload)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+
+      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(userOnlyMp()))!
+      assert.ok(line.includes('user=bob'), `the username must survive the save: ${line}`)
+      assert.ok(!line.includes('guest'), `the line must not become a guest mount: ${line}`)
+      assert.ok(!line.includes('credentials='), `no creds file exists to name: ${line}`)
+      // And no creds file was created for a line with no password.
+      const meta = await stat(join(dir, 'creds', credsFileName(userOnlyMp()))).catch(() => null)
+      assert.equal(meta, null, 'a username-only save writes no credentials file')
+    })
+
+    it('cr.60r item 1b: PUT of a `username=bob` line keeps the LONG spelling — the save never normalizes the operator\'s token', async () => {
+      await writeFile(fstabPath, `${FSTAB_FIXTURE}//h/s ${userOnlyMp()} cifs username=bob,vers=3.0 0 0\n`)
+      const res = await server!.inject({ method: 'PUT', url: `/v1/mounts/${enc(userOnlyMp())}`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ options: { ro: true } }) })
+      assert.equal(res.statusCode, 202, res.payload)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(userOnlyMp()))!
+      assert.ok(line.includes('username=bob'), `the operator's spelling must survive the save: ${line}`)
+      assert.ok(!line.includes('user=bob'), `never normalized to the short alias: ${line}`)
+      assert.ok(!line.includes('guest'), line)
+    })
+
+    it('cr.60r: PUT with NEW credentials on a username-only line drops the old inline username — the rotated file names the account, the line carries no stale `user=bob`', async () => {
+      await writeFile(fstabPath, FSTAB_FIXTURE + userOnlyLine())
+      const res = await server!.inject({ method: 'PUT', url: `/v1/mounts/${enc(userOnlyMp())}`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ credentials: { username: 'alice', password: 'pw' } }) })
+      assert.equal(res.statusCode, 202, res.payload)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(userOnlyMp()))!
+      assert.ok(line.includes('credentials='), `the rotated file is the auth: ${line}`)
+      assert.ok(!/(?:^|,)user(?:name)?=/i.test(line.split(/\s+/)[3]), `no stale username token beside the rotated file: ${line}`)
+      assert.ok(!line.includes('guest'), line)
+      assert.match(await readFile(join(dir, 'creds', credsFileName(userOnlyMp())), 'utf8'), /^username=alice$/m)
+    })
+
+    it('cr.60r: the detail of a username-only line shows the username, without a migration advisory', async () => {
+      await writeFile(fstabPath, FSTAB_FIXTURE + userOnlyLine())
+      const res = await server!.inject({ method: 'GET', url: `/v1/mounts/${enc(userOnlyMp())}`, headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 200, res.payload)
+      const { data } = res.json() as { data: MountDetail }
+      assert.equal(data.credentials?.set, true)
+      assert.equal(data.credentials?.username, 'bob')
+      // Nothing migrates (no password), so the "saving migrates them" hint
+      // must not stand — and no secret rides any field.
+      assert.ok(!data.warnings.some(w => w.includes('migrates')), JSON.stringify(data.warnings))
+    })
+
+    // cr.60r (possible 2): the review's probe line `g` — the secret carries an
+    // fstab octal escape (`\054` = `,`); the creds file must hold the REAL
+    // character, and the rewritten line must name the file.
+    it('cr.60r: a `\\054`-escaped secret migrates DECODED to the creds file', async () => {
+      await writeFile(fstabPath, `${FSTAB_FIXTURE}//h/s ${MP('/mnt/q1g')} cifs user=bob,pass=wo\\054rds,vers=3.0 0 0\n`)
+      const res = await server!.inject({ method: 'PUT', url: `/v1/mounts/${enc(MP('/mnt/q1g'))}`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ options: { ro: true } }) })
+      assert.equal(res.statusCode, 202, res.payload)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const creds = await readFile(join(dir, 'creds', credsFileName(MP('/mnt/q1g'))), 'utf8')
+      assert.ok(creds.includes('password=wo,rds'), `the escape must decode into the creds file: ${creds}`)
+      assert.ok(!creds.includes('\\054'), creds)
+      assert.ok(creds.includes('username=bob'), creds)
+      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(MP('/mnt/q1g')))!
+      assert.ok(line.includes('credentials='), line)
+      assert.ok(!line.includes('pass='), line)
+    })
   })
 
   describe('POST /v1/mounts/:mountpoint/state — disable / enable (cr.6 option form)', () => {

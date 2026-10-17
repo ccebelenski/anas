@@ -32,7 +32,7 @@ import type { PveStorageRef } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from './findmnt.js'
 import { readFile } from 'node:fs/promises'
-import { parseFindmntTable, readFindmntTable } from './findmnt.js'
+import { parseFindmntTable, readFindmntTable, zfsLiveDatasetMounts } from './findmnt.js'
 
 /** Default location of the PVE storage config on a Proxmox host. */
 export const PVE_STORAGE_CFG = '/etc/pve/storage.cfg'
@@ -64,6 +64,14 @@ export interface ZfsMountpoint {
 
 /** A stanza header line: `<type>: <id>` at column 0 (not indented). */
 const HEADER_RE = /^(\w+):\s+(\S+)\s*$/
+
+/**
+ * Does the config carry a `zfspool` stanza header ({@link HEADER_RE}'s shape
+ * for that one type, any line)? Only those make the territory read ask for
+ * the mount table (cr.60r). Loose on purpose: a false match costs one
+ * findmnt, a miss would skip a live claim.
+ */
+const ZFSPOOL_HEADER_RE = /^zfspool:\s+\S/m
 
 /**
  * An indented `key value` line: first token is the key, the rest the value.
@@ -532,10 +540,21 @@ export async function readZfsMountpoints(exec: CommandExecutor): Promise<ZfsMoun
  * The footprint's ZFS doors answer the same storage by dataset
  * (`ownershipOf`); this is its path form for the path-only doors.
  *
+ * cr.60r (review possible 3): `/<pool dataset>` and the config `mountpoint`
+ * are the CONFIG claims. Pass `liveDatasetMounts` (dataset → every live
+ * target, from the strict findmnt read — `zfsLiveDatasetMounts`) and every
+ * zfspool's dataset ALSO claims the paths it is live at: a dataset moved with
+ * `zfs set mountpoint=` moves PVE's subvolumes with it, and a restore into
+ * `/new/mount/point/subvol-…` must read as PVE territory too. The config
+ * claim stays (the plugin default is territory whether or not the dataset is
+ * mounted); the live ones are added. Only the storage's OWN dataset is
+ * looked up, never its descendants: a `pool rpool` storage would otherwise
+ * claim `/` through `rpool/ROOT/pve-1`.
+ *
  * Pure and total: commented-out lines are skipped, malformed input yields an
  * empty map, never throws.
  */
-export function parsePveMountPaths(text: string): Map<string, string> {
+export function parsePveMountPaths(text: string, liveDatasetMounts?: ReadonlyMap<string, readonly string[]>): Map<string, string> {
   const byPath = new Map<string, string>()
   let current: { type: string, id: string, pool?: string, mountpoint?: string } | null = null
 
@@ -543,10 +562,16 @@ export function parsePveMountPaths(text: string): Map<string, string> {
     if (path.startsWith('/'))
       byPath.set(stripTrailingSlash(path), id)
   }
-  // A zfspool without its own `mountpoint` claims `/<pool dataset>`.
+  // A zfspool without its own `mountpoint` claims `/<pool dataset>`, and every
+  // zfspool's dataset claims its LIVE mountpoint too when one is known
+  // (cr.60r — added, never replacing the config claim).
   const flush = (): void => {
-    if (current?.type === 'zfspool' && current.mountpoint === undefined && current.pool)
-      claim(`/${current.pool}`, current.id)
+    if (current?.type === 'zfspool' && current.pool) {
+      if (current.mountpoint === undefined)
+        claim(`/${current.pool}`, current.id)
+      for (const live of liveDatasetMounts?.get(stripTrailingSlash(current.pool)) ?? [])
+        claim(live, current.id)
+    }
     current = null
   }
 
@@ -592,7 +617,7 @@ export function parsePveMountPaths(text: string): Map<string, string> {
  * through this; {@link readPveMountPaths} stays fail-open for the Mounts
  * inventory's display tags only.
  */
-export async function readPveMountPathsStrict(path: string): Promise<Map<string, string> | null> {
+export async function readPveMountPathsStrict(path: string, liveDatasetMounts?: ReadonlyMap<string, readonly string[]>): Promise<Map<string, string> | null> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
@@ -602,7 +627,44 @@ export async function readPveMountPathsStrict(path: string): Promise<Map<string,
       return new Map()
     return null
   }
-  return parsePveMountPaths(text)
+  return parsePveMountPaths(text, liveDatasetMounts)
+}
+
+/**
+ * THE territory doors' read (cr.60r): the strict claims map, ENRICHED with
+ * every zfspool dataset's live targets from the strict mount-table read —
+ * `readTable` is the door's own {@link readFindmntTable} result (the mount
+ * verbs pass their shared per-run read, so the gate costs no second
+ * findmnt). Three answers, because the doors refuse with a different
+ * sentence per UNREADABLE fact: the map; `'storage-cfg'` (the file exists but
+ * cannot be read — cr.54's `config-unreadable` verdict); `'findmnt'` (the
+ * table could not be read, and a zfspool storage needed it — an unreadable
+ * table is NEVER "no live mountpoints"). storage.cfg is read first, so an
+ * unreadable file refuses without paying for the table; ENOENT is the strict
+ * reader's own READ answer (no storages). A config with no zfspool stanza
+ * has no dataset the table could move, so it never asks for the table and an
+ * unreadable one refuses nothing there.
+ */
+export async function readPveTerritoryClaims(
+  storageCfgPath: string,
+  readTable: () => Promise<string | null>,
+): Promise<Map<string, string> | 'storage-cfg' | 'findmnt'> {
+  let text: string
+  try {
+    text = await readFile(storageCfgPath, 'utf8')
+  }
+  catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return new Map()
+    return 'storage-cfg'
+  }
+  if (!ZFSPOOL_HEADER_RE.test(text))
+    return parsePveMountPaths(text)
+  const table = await readTable()
+  const nodes = table === null ? null : parseFindmntTable(table)
+  if (nodes === null)
+    return 'findmnt'
+  return parsePveMountPaths(text, zfsLiveDatasetMounts(nodes))
 }
 
 /**

@@ -1,5 +1,5 @@
 import type { MountCifsOptions, MountCommonOptions, MountEntry, MountInlineCredentials, MountNfsOptions, MountOptions } from '@anas/shared'
-import { cifsCredentialKeyKind, escapeFstabField, MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec, unescapeFstabField, X_ANAS_DISABLED_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_KEPT_TOKEN, X_ANAS_DISABLED_TOKEN, X_SYSTEMD_AUTOMOUNT_TOKEN } from '@anas/shared'
+import { cifsCredentialKeyKind, escapeFstabField, escapeFstabOptionValue, MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec, unescapeFstabField, X_ANAS_DISABLED_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_KEPT_TOKEN, X_ANAS_DISABLED_TOKEN, X_SYSTEMD_AUTOMOUNT_TOKEN } from '@anas/shared'
 
 /** Recognized enum-value sets, mirrored from the shared schema (never drift). */
 const CIFS_CACHE_VALUES = new Set<string>(MountCifsCache.options)
@@ -706,9 +706,11 @@ export function classifyOptions(
         continue
       }
       // `guest` is STRUCTURAL, like `credentials=`: the serializer re-derives
-      // it from the ABSENCE of a credentials file (cifsAuthToken), so a
-      // credential-less line round-trips exactly one `guest` — consumed here,
-      // never parked in passthrough (where it would come back a second time).
+      // the auth token from the entry (cifsAuthToken — file, else the lifted
+      // username, else `guest`), so a credential-less line round-trips exactly
+      // one `guest` — consumed here, never parked in passthrough (where it
+      // would come back a second time). A `guest` on a line that also carries
+      // a username loses to the username (cr.60r).
       if (key === 'guest')
         continue
       // SECURITY (BUG-1, cr.60 M7): inline credential tokens are NOT
@@ -718,8 +720,27 @@ export function classifyOptions(
       // migrated to the protected 0600 creds file on the next save. Every
       // spelling of the shared list counts, in any case: `pass=` and
       // `PASSWORD=` are `password=`, `user=` is `username=`.
+      // cr.60r (the review's DEFECT): a lifted username with NO password is
+      // not migratable (an empty `password=` in a creds file is a real
+      // credential shape and would change the mount), and it must never be
+      // replaced by `guest` — the serializer re-emits the username token from
+      // the channel (cifsAuthToken) under its ORIGINAL key (item 1b), so the
+      // account the operator named survives every rewrite of the line spelled
+      // the way they spelled it.
+      // cr.60r (review possible 2): the lifted VALUE decodes as getmntent(3)
+      // reads it — a hand-written `pass=wo\054rds` is the secret `wo,rds`, and
+      // the creds file must hold the real characters, not the escape. The
+      // decoded value leaves the fstab line only through the serializer's
+      // `user=` token (buildOptionTokens), which re-encodes it; passthrough
+      // and secretOptions tokens were never decoded, so they stay verbatim.
       if (eq !== -1 && credKind === 'username') {
-        inline.username = value
+        inline.username = unescapeFstabField(value)
+        // cr.60r item 1b: keep the operator's SPELLING. `username=bob` and
+        // `user=bob` are the same account to mount.cifs but different bytes on
+        // the line, and config files are the API — the line was hand-written,
+        // the spelling is theirs. The serializer re-emits this exact key.
+        if (value !== '')
+          inline.usernameKey = key
         continue
       }
       if (eq !== -1 && credKind === 'secret') {
@@ -728,7 +749,7 @@ export function classifyOptions(
         if (key.toLowerCase() === 'password2')
           secretOptions.push(token)
         else
-          inline.password = value
+          inline.password = unescapeFstabField(value)
         continue
       }
       // `domain=` (and `dom=`/`workgroup=`) is a credential-set token too;
@@ -738,7 +759,7 @@ export function classifyOptions(
       // username/password are ALSO present is it treated as an inline-
       // credential domain (migrated to the creds file, stripped inline).
       if (eq !== -1 && credKind === 'domain') {
-        inline.domain = value
+        inline.domain = unescapeFstabField(value)
         applyCifsToken(cifs, 'domain', value, passthrough)
         continue
       }
@@ -975,17 +996,30 @@ function applyCifsToken(cifs: MountCifsOptions, key: string, value: string, pass
 
 /**
  * The auth token a CIFS entry carries in its option list: its credentials
- * FILE when there is one, `guest` when there is not. Stated ONCE and taken by
- * every writer of a CIFS option list — the fstab serializer (below), the
- * daemon's immediate non-fstab mount (routes/mounts.js), and the preflight
- * probe (services/mounts.js) — so the three can never drift apart. Without
- * one of the two, `mount.cifs` PROMPTS for a password on stdin ("Password for
+ * FILE when there is one; else the entry's lifted `username=` (cr.60r — a
+ * hand-written username with NO password, re-encoded for the line) so the
+ * operator's named user survives a rewrite instead of silently becoming an
+ * anonymous mount; else `guest`. Stated ONCE and taken by every writer of a
+ * CIFS option list — the fstab serializer (below), the daemon's immediate
+ * non-fstab mount (routes/mounts.js), and the preflight probe
+ * (services/mounts.js) — so the three can never drift apart. Without one of
+ * the three, `mount.cifs` PROMPTS for a password on stdin ("Password for
  * root@//host/share:"); a boot mount (or a `mountNow` with no terminal) then
  * hangs until `nofail` hides it. `guest` makes the request anonymous instead:
  * an auth-requiring share answers EACCES, which is honest.
  */
-export function cifsAuthToken(credentialsFile: string | undefined): string {
-  return credentialsFile ? `credentials=${credentialsFile}` : 'guest'
+export function cifsAuthToken(credentialsFile: string | undefined, username?: string, usernameTokenKey?: string): string {
+  if (credentialsFile)
+    return `credentials=${credentialsFile}`
+  // cr.60r (the review's DEFECT): a username is NEVER lost and NEVER replaced
+  // by `guest`. An empty username is no username — the line is credential-less
+  // and `guest` is right. cr.60r item 1b: the fstab serializer passes the
+  // token's ORIGINAL key (a hand-written `username=bob` stays spelled
+  // `username=bob`); the mount-argument callers have no line to be faithful
+  // to and get mount.cifs' short alias.
+  if (username)
+    return `${usernameTokenKey ?? 'user'}=${escapeFstabOptionValue(username)}`
+  return 'guest'
 }
 
 /** Build the canonical, ordered option-token list for a serialized entry. */
@@ -1031,7 +1065,13 @@ function buildOptionTokens(entry: MountEntry): string[] {
     const cifs = entry.options.cifs
     if (cifs?.vers !== undefined)
       t.push(`vers=${cifs.vers}`)
-    t.push(cifsAuthToken(entry.credentialsFile))
+    t.push(cifsAuthToken(entry.credentialsFile, entry.inlineCredentials?.username, entry.inlineCredentials?.usernameKey))
+    // A hand-written line carrying BOTH a credentials file and a bare
+    // `user=`/`username=` keeps both (cr.60r: the username is never lost),
+    // spelled as it was written (item 1b); with no file the auth token above
+    // already carries the username.
+    if (entry.credentialsFile && entry.inlineCredentials?.username)
+      t.push(`${entry.inlineCredentials.usernameKey ?? 'user'}=${escapeFstabOptionValue(entry.inlineCredentials.username)}`)
     if (cifs?.domain !== undefined)
       t.push(`domain=${cifs.domain}`)
     if (cifs?.uid !== undefined)

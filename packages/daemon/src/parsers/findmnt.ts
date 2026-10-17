@@ -218,6 +218,20 @@ export async function readFindmntTable(executor: CommandExecutor, args: readonly
  * target's row only when no real filesystem sits there (an armed automount);
  * stacked with a real one it is never the identity. `liveAtTarget`
  * (services/mount-match) answers the same rule for one target.
+ *
+ * Why bottom-first is STRUCTURAL, not row-order luck (cr.60r, review
+ * possible 4): the full-table `findmnt --json` every caller of this rule
+ * reads is a TREE (util-linux prints the tree by default; captured on the
+ * stunt node with util-linux 2.41) — a mount over-mounted at the same target
+ * is the over-mount's PARENT, so the over-mount sits INSIDE the covered
+ * mount's object as one of its `children`. Ground truth:
+ * `fixtures/mounts/findmnt-full.json`, where the real nfs4 row at
+ * `/mnt/anas-auto` is the child of the autofs row at that target (the
+ * captured `/proc/sys/fs/binfmt_misc` autofs → binfmt_misc pair is the same
+ * shape). A child's JSON is nested in its parent's, so no output order can
+ * put the covered mount after the one on top: the depth-first flatten lists
+ * every stack bottom-first, and the LAST row at a target is the top. A
+ * filtered or `--list` read would lose that guarantee; none feeds this rule.
  */
 export function effectiveMounts(nodes: FindmntNode[]): Map<string, FindmntNode> {
   const byTarget = new Map<string, FindmntNode>()
@@ -228,6 +242,45 @@ export function effectiveMounts(nodes: FindmntNode[]): Map<string, FindmntNode> 
     byTarget.set(node.target, node)
   }
   return byTarget
+}
+
+/**
+ * findmnt's bind suffix on a mount source: a trailing `[/dir]` carries the
+ * bound directory (`tank[/home]`). A copy of ahr-topology's
+ * `SUBVOL_SOURCE_SUFFIX_RE` (behind `stripSubvolSuffix`) — keep the two one rule.
+ */
+const FINDMNT_BIND_SUFFIX_RE = /\[[^\]]*\]$/
+
+/**
+ * Live ZFS dataset → every path it is mounted at (cr.60r, review possible 3):
+ * a zfspool's dataset can be LIVE-mounted where storage.cfg never mentions it
+ * (`zfs set mountpoint=` moves it, and PVE's subvolumes move with it), and the
+ * path-only territory doors need the live path to claim. Derived from the
+ * SAME strict findmnt read every door already makes — no new reader, no new
+ * subprocess. Rows of `fstype` `zfs`: the source is the dataset name, with
+ * findmnt's bind suffix `[/sub]` stripped exactly as services/system-mounts
+ * strips it (cr.60 review L23, through ahr-topology's `stripSubvolSuffix`; the
+ * one-line regex is copied here because a parser does not import a service —
+ * the two must stay one rule). Every target is kept, not one per dataset: the
+ * dataset's own mount and any bind of it (or of a directory in it) are all
+ * PVE's ground, and a territory claim is safest when it names every path the
+ * kernel serves the dataset at. Snapshot rows (`pool/ds@snap`) key their own
+ * name and so never match a storage's dataset.
+ */
+export function zfsLiveDatasetMounts(nodes: FindmntNode[]): Map<string, string[]> {
+  const byDataset = new Map<string, string[]>()
+  for (const node of nodes) {
+    if (node.fstype !== 'zfs')
+      continue
+    const dataset = node.source.replace(FINDMNT_BIND_SUFFIX_RE, '')
+    if (dataset === '' || !node.target.startsWith('/'))
+      continue
+    const targets = byDataset.get(dataset) ?? []
+    if (!targets.includes(node.target))
+      targets.push(node.target)
+    byDataset.set(dataset, targets)
+  }
+  return byDataset
 }
 
 /** The effective REAL (non-`autofs`) row at `target` by {@link effectiveMounts}' rule; undefined when none. */
