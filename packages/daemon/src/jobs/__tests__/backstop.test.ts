@@ -18,7 +18,8 @@ import { READ_JOB_OPERATIONS } from '../read-jobs.js'
 
 /**
  * cr.28 — the job queue refuses work without Sys.Modify (WAVE2-DESIGN A3.1),
- * and a read job (cr.48, `read.*`) on Sys.Audit (operator ruling 2026-10-15).
+ * and a read job (cr.48, `read.*`) on Sys.Audit (operator ruling 2026-10-17;
+ * the gateway's matching per-route exception is cr.67).
  * The gateway's method rule (cr.27) stays the primary gate; these prove the
  * backstop behind it on the REAL daemon (createServer: its onRequest hooks,
  * its error handler, its queue), with test-only routes standing in for the

@@ -77,7 +77,9 @@ export function createServer(opts: ServerOptions = {}) {
   // Auth (cr.27, docs/WAVE2-DESIGN.md A2-A3): PVE decided who the user is and
   // what it holds on `/` inside pveproxy and signed the answer (X-Anas-Auth);
   // the provider verifies that statement. Then the one rule: GET/HEAD need
-  // Sys.Audit, every other method Sys.Modify. Every refusal is logged with its
+  // Sys.Audit, every other method Sys.Modify — except a POST on a shared
+  // READ_JOB_ROUTES path (the jobs that only read; cr.67, operator ruling
+  // 2026-10-17), which needs Sys.Audit. Every refusal is logged with its
   // reason (journal unit anas) — a gate that can refuse everyone must never do
   // it silently.
   server.addHook('onRequest', async (request, reply) => {
