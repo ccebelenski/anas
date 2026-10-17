@@ -338,7 +338,7 @@ describe('cr.52s-c (a) — the create job pins its parent, mounts before the lin
       assert.equal(job.status, 'failed', JSON.stringify(job))
       // Instead of "Nothing else was written", the sentence NAMES the directory
       // left behind, with the failed reason — the operator removes it by hand.
-      assert.ok(job.error!.message.includes(`the mountpoint directory '${mp}' was created by this job and its removal failed (EACCES)`), job.error!.message)
+      assert.ok(job.error!.message.includes(`The mountpoint directory '${mp}' was created by this job and its removal failed (EACCES)`), job.error!.message)
       assert.ok(job.error!.message.includes('it is left behind and must be removed by hand'), job.error!.message)
       assert.ok(!job.error!.message.includes('Nothing else was written'), job.error!.message)
       assert.ok(job.error!.message.includes('no /etc/fstab line was written'), job.error!.message)
@@ -500,7 +500,7 @@ describe('cr.52s-c (a) — the create job pins its parent, mounts before the lin
     // only the sentence changes): the reload reason, then the surviving state
     // with what to run, then the no-rollback word. No raw reload error.
     assert.equal(job.error!.message, `Mount create '${mp}' failed — Failed to reload daemon: too many concurrent reloads; `
-    + `the mount is up at '${mp}'; the line is written in ${fstabPath}; `
+    + `the mount is up at '${mp}'; the line is written in ${fstabPath}; the credentials file '${credsFilePath(credsDir, mp)}' is in place; `
     + 'systemd\'s units are stale — run \'systemctl daemon-reload\'; nothing was rolled back', JSON.stringify(job.error))
     // The surviving state is honestly what the sentence says: the line IS in
     // the fstab, the credentials file stands, the leaf stands, and NOTHING

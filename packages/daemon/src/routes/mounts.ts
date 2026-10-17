@@ -814,7 +814,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           // naming it is why "Nothing else was written" stays true elsewhere).
           const closing = leftBehind === undefined
             ? `Nothing else was written${req.persistent ? ' (no /etc/fstab line)' : ''}`
-            : `the mountpoint directory '${req.mountpoint}' was created by this job and its removal failed (${leftBehind}) — it is left behind and must be removed by hand${req.persistent ? '; no /etc/fstab line was written' : ''}`
+            : `The mountpoint directory '${req.mountpoint}' was created by this job and its removal failed (${leftBehind}) — it is left behind and must be removed by hand${req.persistent ? '; no /etc/fstab line was written' : ''}`
           throw new Error(`Mount create '${req.mountpoint}' failed — ${[reason, ...state].join('; ')}. ${closing}`)
         }
         if (req.persistent) {
@@ -834,6 +834,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
             if (mounted)
               survivors.push(`the mount is up at '${req.mountpoint}'`)
             survivors.push(`the line is written in ${fstabPath}`)
+            // The credentials file survives too (the line references it) —
+            // named, as the rollback path names it (cr.52s-f review).
+            if (credsFile !== undefined)
+              survivors.push(`the credentials file '${credsFile}' is in place`)
             survivors.push('systemd\'s units are stale — run \'systemctl daemon-reload\'')
             throw new Error(`Mount create '${req.mountpoint}' failed — ${[why, ...survivors].join('; ')}; nothing was rolled back`)
           }
