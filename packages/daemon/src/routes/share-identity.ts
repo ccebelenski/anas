@@ -1804,6 +1804,7 @@ export async function shareIdentityRoutes(
               throw new Error(halfCreated(req.name, `removing the orphan SMB entry stored as '${orphan.stored}' failed: ${dropped.stderr.trim() || `pdbedit exited with code ${dropped.exitCode}`}`))
             }
             replaced = orphan.stored
+            server.log.info(`identity: SMB passdb entry stored as '${orphan.stored}' did not match account '${req.name}' (uid ${uid}); replaced it (pdbedit -x -u ${orphan.stored}, then smbpasswd -a ${req.name})`)
           }
           updateProgress(`Setting SMB password for '${req.name}'`)
           try {
