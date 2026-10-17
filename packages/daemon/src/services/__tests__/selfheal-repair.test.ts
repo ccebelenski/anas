@@ -250,7 +250,7 @@ class FakeNode implements CommandExecutor {
     if (command === '/usr/bin/mount') {
       const dest = lastArg(args)
       // cr.52r D3: a DIRECT mount targets the daemon-opened fd
-      // (`/proc/self/fd/3` on the CHILD). Resolve the inherited fd in THIS
+      // (`/proc/self/fd/3/.` on the CHILD). Resolve the inherited fd in THIS
       // process so the mounted set holds the REAL directory the engine's
       // umount will name — the fd is open here while the mount runs, so
       // readlink answers honestly.

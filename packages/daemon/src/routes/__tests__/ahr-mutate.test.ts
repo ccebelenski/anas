@@ -141,7 +141,7 @@ describe('AHR mutation routes — validation & 404s (stock dev mock)', () => {
     const job = await waitForJob(server, res.json().job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     const mock = (server as unknown as { executor: MockExecutor }).executor
-    const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount' && c.args.at(-1) === '/proc/self/fd/3')
+    const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount' && c.args.at(-1) === '/proc/self/fd/3/.')
     assert.ok(mountCall, 'the move mounted through the daemon-opened directory')
     assert.equal(mountCall!.args[0], '-c')
     assert.equal(mountCall!.fdPaths?.[0], newMp, 'the inherited fd resolves to the new mountpoint directory')

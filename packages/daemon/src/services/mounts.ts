@@ -1993,8 +1993,21 @@ export function swapStageGate<O>(mountpoint: string | undefined): Gate<O> {
 // Mounting through a directory the daemon itself opened (cr.52r D3)
 // ============================================================================
 
-/** The target every daemon-run `mount(8)` gets: the kernel resolves it to the opened directory. */
-export const FD_MOUNT_TARGET = '/proc/self/fd/3' as const
+/**
+ * The target every daemon-run `mount(8)` gets: the kernel resolves it to the
+ * opened directory. The trailing `/.` is load-bearing (stunt node, util-linux
+ * 2.41.5 / kernel 7.0, 2026-10-17): libmount's new-API path ends in
+ * `move_mount(fs, "", AT_FDCWD, target, MOVE_MOUNT_F_EMPTY_PATH)`, and
+ * `move_mount` does NOT follow a trailing symlink — a bare `/proc/self/fd/3`
+ * IS the magic link, so the kernel answered EINVAL ("wrong fs type, bad
+ * option, bad superblock") for every fd-pinned mount, btrfs and ext4 alike,
+ * while the classic `mount(2)` path (LIBMOUNT_FORCE_MOUNT2) accepted it. With
+ * `/.` the magic link is a middle component, which every path walk follows,
+ * and the final `.` is the opened directory itself: proven on the node with
+ * `-c` for btrfs and ext4, and still race-free (the walk goes through the fd,
+ * never through a textual path).
+ */
+export const FD_MOUNT_TARGET = '/proc/self/fd/3/.' as const
 /** The child's fd the daemon-opened directory is handed at (the first inherited fd). */
 export const FD_MOUNT_SLOT = 3
 
@@ -2089,7 +2102,7 @@ export async function openMountTarget(mountpoint: string): Promise<OpenedMountTa
 }
 
 /**
- * Run `mount <...argv> /proc/self/fd/3` through a directory the daemon opened
+ * Run `mount <...argv> /proc/self/fd/3/.` through a directory the daemon opened
  * (cr.52r D3): open the final directory O_PATH, hand its fd to the mount child
  * (`exec`'s {@link ExecOptions.inheritedFds}), target the fd path, close the
  * fd when the child has exited. `-c` (--no-canonicalize) is REQUIRED on every

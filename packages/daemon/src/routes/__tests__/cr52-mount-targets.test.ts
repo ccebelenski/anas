@@ -200,7 +200,7 @@ describe('cr.52 — one shared mountTargetRefusal at every mountpoint door', () 
       const mock = (server as unknown as { executor: MockExecutor }).executor
       const mountCall = mock.calls.find(c => c.command === MOUNT)
       assert.ok(mountCall, 'the mountNow job ran a mount argv')
-      assert.equal(mountCall!.args.at(-1), '/proc/self/fd/3')
+      assert.equal(mountCall!.args.at(-1), '/proc/self/fd/3/.')
       assert.equal(mountCall!.fdPaths?.[0], mp, 'the inherited fd resolves to the opened mountpoint directory')
     })
 

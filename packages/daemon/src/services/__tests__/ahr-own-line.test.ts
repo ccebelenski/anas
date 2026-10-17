@@ -54,7 +54,7 @@ function okExecutor(): MockExecutor {
 
 /** The pool mount (target fd resolves to `mp`), as `-o` option string. */
 function poolMountOptions(executor: MockExecutor, mp: string): string | undefined {
-  const call = executor.calls.find(c => c.command === MOUNT && c.args.at(-1) === '/proc/self/fd/3' && c.fdPaths?.[0] === mp)
+  const call = executor.calls.find(c => c.command === MOUNT && c.args.at(-1) === '/proc/self/fd/3/.' && c.fdPaths?.[0] === mp)
   return call ? call.args[call.args.indexOf('-o') + 1] : undefined
 }
 
@@ -78,7 +78,7 @@ describe('AHR re-mounts use the pool\'s own fstab line as stored (cr.52s-a, revi
     await remountAhrPool(executor, { name: 'tank', mountpoint: mp, subvolLayout: true }, () => {}, { fstabPath })
     assert.equal(poolMountOptions(executor, mp), OPERATOR_OPTIONS)
     const call = executor.calls.find(c => c.command === MOUNT)!
-    assert.deepEqual(call.args, ['-c', '-t', 'btrfs', '-o', OPERATOR_OPTIONS, '--', '/dev/tank/tank-vol', '/proc/self/fd/3'])
+    assert.deepEqual(call.args, ['-c', '-t', 'btrfs', '-o', OPERATOR_OPTIONS, '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
   })
 
   it('the remount of a pool with NO line uses ANAS\'s defaults and the progress says so', async () => {

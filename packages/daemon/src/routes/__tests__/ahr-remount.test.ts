@@ -378,7 +378,7 @@ describe('POST /v1/ahr/:name/remount (ahrcache.1 slice 2)', () => {
     // typed path.
     const m = mountCalls[1]!
     assert.equal(m.command, '/usr/bin/mount')
-    assert.deepEqual(m.args, ['-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s', '--', '/dev/tank/tank-vol', '/proc/self/fd/3'])
+    assert.deepEqual(m.args, ['-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
     assert.equal(m.fdPaths?.[0], MOUNTPOINT, 'the fd resolves to the pool mountpoint')
     // GT-20's negative: `mount -o remount,rw` is refused after an error, so it
     // must never be what this verb reaches for.

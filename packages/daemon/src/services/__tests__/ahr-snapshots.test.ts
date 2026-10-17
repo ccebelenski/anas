@@ -169,7 +169,7 @@ describe('createAhrSnapshot', () => {
     // then the -r snapshot, then the unmount. The mount child inherits the
     // fd the daemon opened on `top` and targets /proc/self/fd/3.
     assert.equal(executor.calls[0].command, MOUNT)
-    assert.deepEqual(executor.calls[0].args, ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/tank/tank-vol', '/proc/self/fd/3'])
+    assert.deepEqual(executor.calls[0].args, ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
     assert.equal(executor.calls[0].inheritedFds?.length, 1, 'the mount child inherits the daemon-opened fd')
     assert.equal(executor.calls[0].fdPaths?.[0], top, 'the inherited fd resolves to the opened top-level directory')
     assert.deepEqual(executor.calls[1], { command: BTRFS, args: ['subvolume', 'snapshot', '-r', join(top, '@data'), join(top, '@snapshots', 'nightly')] })
@@ -265,7 +265,7 @@ describe('rollbackAhrSnapshot', () => {
     // D3) — the POOL's remount (its fd resolves to the pool mountpoint), not
     // the on-demand TOP-LEVEL mount (whose fd resolves to `top`).
     const poolRemount = callIndex(executor, c => c.command === MOUNT
-      && c.args.at(-1) === '/proc/self/fd/3'
+      && c.args.at(-1) === '/proc/self/fd/3/.'
       && c.fdPaths?.[0] === pool.mountpoint)
 
     assert.ok(poolUmount >= 0 && mvIdx >= 0 && swapIdx >= 0 && poolRemount >= 0)

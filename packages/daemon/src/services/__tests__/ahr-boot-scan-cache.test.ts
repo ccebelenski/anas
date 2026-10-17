@@ -288,7 +288,7 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
       // cr.52r D3: the pool's OWN fstab line is mounted DIRECTLY through a
       // directory the daemon opened — the kernel resolves /proc/self/fd/3 to
       // the pool's real mountpoint. The rung never invents a mount.
-      ['/usr/bin/mount', '-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s', '--', AHR_LV_PATH, '/proc/self/fd/3'],
+      ['/usr/bin/mount', '-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s', '--', AHR_LV_PATH, '/proc/self/fd/3/.'],
     ])
     // The inherited fd resolves to the pool's REAL mountpoint directory from
     // its own fstab line — never the LV device path the topology read.
@@ -304,7 +304,7 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
     const executor = buildExecutor('missing')
     await ahrBootScan(executor, { intentDir: dir, log: () => {} })
     const mountCall = executor.calls.find(c => c.command === '/usr/bin/mount')!
-    assert.deepEqual(mountCall.args, ['-c', '-t', 'btrfs', '-o', 'noatime,compress=zstd:3,subvol=@data', '--', AHR_LV_PATH, '/proc/self/fd/3'])
+    assert.deepEqual(mountCall.args, ['-c', '-t', 'btrfs', '-o', 'noatime,compress=zstd:3,subvol=@data', '--', AHR_LV_PATH, '/proc/self/fd/3/.'])
     assert.equal(mountCall.fdPaths?.[0], realMp)
   })
 

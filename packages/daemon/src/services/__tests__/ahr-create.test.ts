@@ -180,12 +180,12 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       // unmount — then the pool mounts subvol=@data. cr.52r D3: both mounts go
       // through the daemon-OPENED directory (target /proc/self/fd/3, `-c`), with
       // the child inheriting the O_PATH fd.
-      { command: '/usr/bin/mount', args: ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/t2/t2-vol', '/proc/self/fd/3'] },
+      { command: '/usr/bin/mount', args: ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/t2/t2-vol', '/proc/self/fd/3/.'] },
       { command: '/usr/bin/btrfs', args: ['subvolume', 'create', join(mountBase, 't2', '@data')] },
       { command: '/usr/bin/btrfs', args: ['subvolume', 'create', join(mountBase, 't2', '@snapshots')] },
       { command: '/usr/bin/umount', args: ['--', join(mountBase, 't2')] },
       { command: '/usr/bin/systemctl', args: ['daemon-reload'] },
-      { command: '/usr/bin/mount', args: ['-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s', '--', '/dev/t2/t2-vol', '/proc/self/fd/3'] },
+      { command: '/usr/bin/mount', args: ['-c', '-t', 'btrfs', '-o', 'nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s', '--', '/dev/t2/t2-vol', '/proc/self/fd/3/.'] },
       executor.calls.at(-1)!, // perl notify — argv asserted below
     ])
     // cr.52r D3: the inherited fd of BOTH mounts resolves to the pool's

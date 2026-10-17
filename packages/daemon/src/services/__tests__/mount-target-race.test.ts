@@ -116,8 +116,8 @@ describe('openMountTarget — the walk/open race (cr.52s-a, review defect 4)', (
       await mountThroughOpenedDir(executor, mp, ['-t', 'nfs4', '--', 'h:/x'])
       await mountThroughOpenedDir(executor, mp, ['-c', '-t', 'nfs4', '--', 'h:/x'])
       assert.deepEqual(executor.calls.map(c => c.args), [
-        ['-c', '-t', 'nfs4', '--', 'h:/x', '/proc/self/fd/3'],
-        ['-c', '-t', 'nfs4', '--', 'h:/x', '/proc/self/fd/3'],
+        ['-c', '-t', 'nfs4', '--', 'h:/x', '/proc/self/fd/3/.'],
+        ['-c', '-t', 'nfs4', '--', 'h:/x', '/proc/self/fd/3/.'],
       ])
     }
     finally {

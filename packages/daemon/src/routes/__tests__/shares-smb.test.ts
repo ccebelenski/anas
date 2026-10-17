@@ -969,7 +969,7 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
     assert.ok(fstab.split('\n').includes(`/dev/ahr0/ahr0-vol ${snapMp} btrfs ro,nofail,subvol=@snapshots 0 0`), fstab)
     // cr.52s-a (review P3): mounted DIRECTLY from the line through the opened directory.
     const snapMount = (s as unknown as { executor: MockExecutor }).executor.calls.find(c => c.command === MOUNT_BIN && c.fdPaths?.[0] === snapMp)
-    assert.deepEqual(snapMount?.args, ['-c', '-t', 'btrfs', '-o', 'ro,nofail,subvol=@snapshots', '--', '/dev/ahr0/ahr0-vol', '/proc/self/fd/3'])
+    assert.deepEqual(snapMount?.args, ['-c', '-t', 'btrfs', '-o', 'ro,nofail,subvol=@snapshots', '--', '/dev/ahr0/ahr0-vol', '/proc/self/fd/3/.'])
   })
 
   it('a second enable on the same AHR pool writes NO second fstab line and does not mount again', async () => {

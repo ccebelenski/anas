@@ -288,7 +288,7 @@ describe('mount routes (Epic 18)', () => {
       const mock = (server as unknown as { executor: { calls: Array<{ command: string, args: string[], fdPaths?: (string | null)[] }> } }).executor
       const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount')
       assert.ok(mountCall, 'the mountNow path ran a mount argv')
-      assert.equal(mountCall!.args.at(-1), '/proc/self/fd/3', 'the direct-mount argv is byte-identical to cr.52r\'s pin')
+      assert.equal(mountCall!.args.at(-1), '/proc/self/fd/3/.', 'the direct-mount argv is byte-identical to cr.52r\'s pin')
       assert.equal(mountCall!.fdPaths?.[0], mountpoint, 'the inherited fd resolves to the opened mountpoint directory')
     })
 
@@ -1658,12 +1658,12 @@ describe('PUT /v1/mounts — credentials are proven before anything is committed
     assert.ok(line.includes(`credentials=${credsPath}`), line)
     assert.ok(line.split(/\s+/)[3].split(',').includes('ro'), line)
     // cr.52r D3: mounted DIRECTLY through the daemon-opened dir — the argv
-    // carries the rotated spec and `/proc/self/fd/3`, never the old `mount <mp>`.
+    // carries the rotated spec and `/proc/self/fd/3/.`, never the old `mount <mp>`.
     const m = h!.executor.calls.find(c => c.command === MOUNT && c.args[0] === '-c')
     assert.ok(m, 'the edit mounted with `-c`')
     assert.equal(m!.args[1], '-t')
     assert.equal(m!.args[2], 'cifs')
-    assert.equal(m!.args.at(-1), '/proc/self/fd/3')
+    assert.equal(m!.args.at(-1), '/proc/self/fd/3/.')
     assert.equal(m!.fdPaths?.[0], CIFS_MP())
     // The empty table meant no live entry to remount — never a `-o remount`.
     assert.ok(!called(h!.executor, MOUNT, ['-o', 'remount', '--', CIFS_MP()]))
@@ -1747,7 +1747,7 @@ describe('PUT /v1/mounts — a completed edit means the new options are LIVE (is
     assert.ok(m, 'the edit mounted with `-c`')
     assert.equal(m!.args[1], '-t')
     assert.equal(m!.args[2], 'nfs4')
-    assert.equal(m!.args.at(-1), '/proc/self/fd/3')
+    assert.equal(m!.args.at(-1), '/proc/self/fd/3/.')
     assert.equal(m!.fdPaths?.[0], NFS_MP())
     assert.ok(!called(h.executor, MOUNT, ['-o', 'remount', '--', NFS_MP()]))
   })

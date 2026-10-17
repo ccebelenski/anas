@@ -189,7 +189,7 @@ describe('takeSnapshot — uniform, dispatches by target.kind', () => {
       // opened — the argv carries /proc/self/fd/3 and the fd records the dir.
       const m = executor.calls[0]
       assert.equal(m.command, MOUNT)
-      assert.deepEqual(m.args, ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/tank/tank-vol', '/proc/self/fd/3'])
+      assert.deepEqual(m.args, ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
       assert.equal(m.fdPaths?.[0], top, 'the fd resolves to the opened top-level')
       assert.deepEqual(executor.calls[1], {
         command: BTRFS,

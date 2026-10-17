@@ -392,7 +392,7 @@ describe('AHR transient snapshots (backup2.3, GT-52)', () => {
       // (cr.52r D3) — the argv carries the fd target — and unmounted again.
       const mountCalls = mock.calls.filter(c => c.command === MOUNT)
       assert.deepEqual(mountCalls.map(c => c.args), [
-        ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/ahr1/data', '/proc/self/fd/3'],
+        ['-c', '-t', 'btrfs', '-o', 'subvolid=5', '--', '/dev/ahr1/data', '/proc/self/fd/3/.'],
       ])
       assert.equal(mountCalls[0]!.fdPaths?.[0], top, 'the fd resolves to the opened top-level')
       assert.deepEqual(mock.calls.filter(c => c.command === UMOUNT).map(c => c.args), [['--', top]])

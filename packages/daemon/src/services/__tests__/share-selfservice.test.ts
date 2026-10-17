@@ -360,7 +360,7 @@ describe('ensureAhrSnapshotsMount — ONE fstab line, mounted once (smbsvc.1)', 
     // `mount <mountpoint>` resolved the path string instead).
     assert.deepEqual(mock.calls.find(c => c.command === '/usr/bin/mkdir'), { command: '/usr/bin/mkdir', args: ['-p', mp] })
     const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount')!
-    assert.deepEqual(mountCall.args, ['-c', '-t', 'btrfs', '-o', 'ro,nofail,subvol=@snapshots', '--', '/dev/tank/tank-vol', '/proc/self/fd/3'])
+    assert.deepEqual(mountCall.args, ['-c', '-t', 'btrfs', '-o', 'ro,nofail,subvol=@snapshots', '--', '/dev/tank/tank-vol', '/proc/self/fd/3/.'])
     assert.deepEqual(mountCall.fdPaths, [mp])
   })
 
