@@ -60,11 +60,17 @@ check "service runs the compiled purge runner" \
 echo "== 2. systemd-analyze verify (when available) =="
 # On a dev host, verify also walks unrelated system units it cannot read (and
 # the runner path under /opt/anas does not exist) — only complaints naming OUR
-# unit count. Syntax/unknown-key problems always do.
+# unit count. Syntax/unknown-key problems always do. The one environmental
+# complaint about our unit is the ExecStart interpreter: a box without
+# /usr/bin/node (the GitHub ubuntu-24.04 image from 20261012 on provides Node
+# only through the tool cache) reports "Command /usr/bin/node is not
+# executable" — the unit is still well-formed, so that line is excused like
+# the /opt/anas path; anything else naming the unit is printed and fails.
 if command -v systemd-analyze >/dev/null 2>&1; then
   for u in anas-recycle.timer anas-recycle.service; do
-    out="$(systemd-analyze verify "${SYSTEMD_SRC}/${u}" 2>&1 | grep -F "${u}" | grep -v 'recycle-purge.js' || true)"
+    out="$(systemd-analyze verify "${SYSTEMD_SRC}/${u}" 2>&1 | grep -F "${u}" | grep -v 'recycle-purge.js' | grep -v 'Command /usr/bin/node is not executable' || true)"
     check "${u} verifies (modulo dev-host noise)" "[ -z \"\$(printf '%s' \"\${out}\")\" ]"
+    [ -n "${out}" ] && printf '       verify said: %s\n' "${out}"
   done
 else
   echo "  skip systemd-analyze not available (shape checks above stand)"
