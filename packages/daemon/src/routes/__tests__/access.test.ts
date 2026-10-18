@@ -798,15 +798,26 @@ describe('access routes', () => {
       }
     })
 
-    it('setfacl -P refuses a symlinked operand — a swapped-in link fails the job, never follows', () => {
+    // Captured on both acl generations (2026-10-18, the first CI run carrying
+    // this test): Debian 13 / acl 2.3.2 (PVE 9 and the ubuntu-latest runner)
+    // SKIPS a symlink operand under -P — exit 0, nothing on stderr, no ACL on
+    // the link or the target; Fedora 44 / acl 2.4.0 REFUSES it (exit 1). The
+    // property the walk relies on is the same on both: the referent is never
+    // touched. Only that is pinned; the exit status is recorded, not asserted.
+    it('setfacl -P never follows a symlinked operand — a swapped-in link is skipped or refused, the target untouched', () => {
       const base = mkdtempSync(join(tmpdir(), 'anas-h2p-'))
       try {
         writeFileSync(join(base, 'victim'), 'secret\n', { mode: 0o600 })
         symlinkSync(join(base, 'victim'), join(base, 'link'))
         const r = spawnSync('/usr/bin/setfacl', ['-P', '-b', '-m', 'u:nobody:rwx', '--', join(base, 'link')], { encoding: 'utf-8' })
-        assert.notEqual(r.status, 0, '-P refuses the link operand')
+        if (r.status === 0)
+          assert.equal(r.stderr, '', 'acl 2.3.2 skips the link silently (exit 0, no stderr)')
+        else
+          assert.equal(r.status, 1, 'acl 2.4.0 refuses the link operand (exit 1)')
         const live = spawnSync('/usr/bin/getfacl', ['-pcE', join(base, 'victim')], { encoding: 'utf-8' })
         assert.equal(live.stdout.includes('nobody'), false, 'the target was never touched')
+        const link = spawnSync('/usr/bin/getfacl', ['-pcEP', join(base, 'link')], { encoding: 'utf-8' })
+        assert.equal(link.stdout.includes('nobody'), false, 'nothing was written through the link either')
       }
       finally {
         rmSync(base, { recursive: true, force: true })

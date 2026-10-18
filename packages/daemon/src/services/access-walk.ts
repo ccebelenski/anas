@@ -39,9 +39,12 @@ import { normalizePath } from './nested-filesystems.js'
 //   - chown(1) `-h, --no-dereference`: "affect … the symbolic link itself
 //     rather than the file to which the link refers" — what `chown -R`'s
 //     default `-P` did to a link it met, and never the referent;
-//   - setfacl(1) `-P, --physical`: do not follow symbolic-link operands —
-//     one is REFUSED (an error, so a swapped-in link fails the job loudly
-//     instead of being followed);
+//   - setfacl(1) `-P, --physical`: do not follow symbolic-link operands.
+//     What happens to the operand itself is the acl version's: acl 2.3.2
+//     (Debian 13 / PVE 9) skips it silently with exit 0, acl 2.4.0 refuses
+//     it with exit 1 (both captured 2026-10-18). Either way the referent is
+//     never touched, which is the property the walk needs; "a swapped-in
+//     link fails the job loudly" held only on the 2.4.0 dev box;
 //   - chmod has no operand no-follow option on Linux (GNU chmod's `-h`
 //     affects only the `-R` traversal — and there is no lchmod here anyway),
 //     so a chmod batch's members are filtered by find's OWN type test,

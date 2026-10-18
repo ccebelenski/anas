@@ -1108,9 +1108,10 @@ export function createAccessService(opts: AccessServiceOptions) {
       // execute from every file in the tree.
       const spec = buildAclSpec(base, named, recursive)
       if (walk) {
-        // Links filtered out at the listing (`! -type l`) AND refused at
-        // the operand (`-P`, --physical): a link swapped in between the two
-        // fails the job instead of being followed (H2).
+        // Links filtered out at the listing (`! -type l`) AND never followed
+        // at the operand (`-P`, --physical): a link swapped in between the
+        // two is skipped (acl 2.3.2, PVE 9) or refused (acl 2.4.0) — never
+        // followed (H2; see access-walk.ts for the captured behaviours).
         await walkStep('setfacl -b -m', ['!', '-type', 'l'], [SETFACL, '-P', '-b', '-m', spec, '--'])
       }
       else {
