@@ -218,7 +218,8 @@ ANAS treats your system as the source of truth and itself as a **guest**:
 
 - Proxmox VE node (single node or cluster)
 - Node.js ≥ 20 (installer can provide via `--install-deps` — the only thing that
-  flag gates)
+  flag gates; it installs 22 and leaves any newer Node already on the node, such
+  as 24, as it is)
 - ZFS ≥ 2.3 (ANAS uses `zfs`/`zpool`'s JSON output — the `-j` flag, introduced in OpenZFS 2.3)
 - `mdadm` + `btrfs-progs` for Hybrid RAID, `samba` for SMB shares and share
   users, `nfs-kernel-server` for NFS exports, `acl` for permissions,
