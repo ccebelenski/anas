@@ -366,7 +366,9 @@
         var def = DEFAULT_PRIMARY_GROUP;
         for (i = 0; i < rows.length; i++) {
             if (rows[i].gid === DEFAULT_PRIMARY_GID && rows[i].name) {
+                // First wins, as nsswitch resolves a gid listed by two sources.
                 def = rows[i].name;
+                break;
             }
         }
         var data = [{ name: def }];
