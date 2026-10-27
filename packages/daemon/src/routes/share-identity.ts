@@ -22,7 +22,9 @@ import {
   UpdateGroupMembersRequest,
 } from '@anas/shared'
 import {
+  DEFAULT_PRIMARY_GID,
   isExpired,
+  isListedGroup,
   isMutableShareId,
   isShareRelevant,
   parseGroups,
@@ -101,14 +103,6 @@ export function pamLogins(userCfg: string): Set<string> {
   }
   return names
 }
-
-/**
- * The primary gid of a user ANAS creates without naming one: with `-N`,
- * useradd(8) (shadow-utils 4.x) adds "the user to the group specified by the
- * -g option or by the GROUP variable in /etc/default/useradd", and
- * `useradd -D` on PVE 9.2 says `GROUP=100` (probe P06) — `users`.
- */
-const DEFAULT_PRIMARY_GID = 100
 
 /** A login.defs `USERGROUPS_ENAB <rest>` line: the rest of the line after the key. */
 const USERGROUPS_ENAB_RE = /^\s*USERGROUPS_ENAB\s+(\S(?:.*\S)?)\s*$/
@@ -1538,8 +1532,10 @@ export async function shareIdentityRoutes(
   // --- GET /identity/groups — enriched ShareGroup list ----------------------
   server.get('/identity/groups', async () => {
     const [groups, users, local] = await Promise.all([allGroups(), allUsers(), localGroupNames()])
+    // #78: the band and root as the user list draws them, plus the default
+    // primary group `users` (gid 100) — listed, never mutable (isListedGroup).
     const data: ShareGroup[] = groups
-      .filter(g => isShareRelevant(g.gid))
+      .filter(g => isListedGroup(g.gid))
       .map((g) => {
         // identity.1c: explain an existing user-private group — a user with
         // the SAME NAME whose PRIMARY gid is this group. Exact match: both

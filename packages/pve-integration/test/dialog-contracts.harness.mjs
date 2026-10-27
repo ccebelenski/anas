@@ -9964,9 +9964,11 @@ const GROUP_ROWS = [
   { name: 'alice', gid: 2000, members: ['Alice'], local: true, privateGroupOf: 'Alice' },
   { name: 'smbusers', gid: 1001, members: ['Alice', 'backup-svc'], local: true },
   { name: 'adgroup', gid: 6001, members: ['aduser'], local: false },
-  // GET /identity/groups keeps gid 0 (isShareRelevant: root owns files);
-  // `users` (gid 100) is outside the band it lists, so it is never here.
+  // GET /identity/groups keeps gid 0 (isShareRelevant: root owns files) and,
+  // since #78, the default primary group `users` (gid 100): both listed,
+  // neither mutable (the daemon refuses SYSTEM_ACCOUNT).
   { name: 'root', gid: 0, members: [], local: true },
+  { name: 'users', gid: 100, members: [], local: true },
 ]
 const USER_ROUTES = {
   'GET /identity/users': { data: USER_ROWS },
@@ -10068,11 +10070,15 @@ async function shareUsersChecks() {
     ok('create (cr.29c): the primary-group choice is a combobox in the same section', !!pg && pg.xtype === 'combobox' && pg.parent === adv, pg && pg.xtype)
     eq('create (cr.29c): it is labelled plainly and says the default', pg && [pg.fieldLabel, pg.emptyText, pg.forceSelection], ['Primary group', '(optional — default: users)', true])
     // cr.29b: only the groups the daemon accepts as a primary group — `users`
-    // (gid 100, the default; the list never carries it) first, then every
+    // (gid 100, the default; since #78 the list carries it) first, then every
     // listed group in the share band [1000, 60000]. root (gid 0) would be a
     // SYSTEM_ACCOUNT 409, so it is not offered.
     eq('create (cr.29b): it offers users, then the band groups the node lists — never root',
       pg && pg.store.getRange().map(r => r.get('name')), ['users', 'alice', 'smbusers', 'adgroup'])
+    // #78: the supplementary Groups picker stays the band alone — `users` is
+    // listed now, yet a membership edit of it is a SYSTEM_ACCOUNT 409.
+    eq('create (#78): the supplementary Groups picker offers the band only — neither root nor users',
+      win.down('#groups').store.getRange().map(r => r.get('name')), ['alice', 'smbusers', 'adgroup'])
     ok('create (cr.29b): …a directory group in the band is offered (the daemon resolves it through getent)',
       !!pg && pg.store.findExact('name', 'adgroup') >= 0)
     eq('create (cr.29b): users is shown as the default', pg && pg.getValue(), 'users')
@@ -10216,6 +10222,18 @@ async function shareUsersChecks() {
   groupsGrid.selectRow(1)
   state = toolbarState(groupsGrid, ['groupDelete'])
   ok('delete(group): a local group — Delete is enabled', state.groupDelete.disabled === false)
+  // #78: the listed-not-mutable rows — root (gid 0) and users (gid 100) —
+  // have dead Members and Delete doors, as a directory group has: the daemon
+  // would refuse SYSTEM_ACCOUNT. A local band row keeps both live.
+  groupsGrid.selectRow(3)
+  state = toolbarState(groupsGrid, ['groupMembers', 'groupDelete'])
+  ok('groups (#78): root (gid 0) — Members and Delete are disabled', state.groupMembers.disabled === true && state.groupDelete.disabled === true, JSON.stringify(state))
+  groupsGrid.selectRow(4)
+  state = toolbarState(groupsGrid, ['groupMembers', 'groupDelete'])
+  ok('groups (#78): users (gid 100) is listed and its Members and Delete are disabled', state.groupMembers.disabled === true && state.groupDelete.disabled === true, JSON.stringify(state))
+  groupsGrid.selectRow(1)
+  state = toolbarState(groupsGrid, ['groupMembers', 'groupDelete'])
+  ok('groups (#78): a local band group keeps Members and Delete live', state.groupMembers.disabled === false && state.groupDelete.disabled === false, JSON.stringify(state))
 
   jobs.length = 0
   groupsGrid.down('#groupDelete').handler(groupsGrid.down('#groupDelete'))

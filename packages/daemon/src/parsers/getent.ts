@@ -56,6 +56,30 @@ export function isMutableShareId(id: number): boolean {
 }
 
 /**
+ * The primary gid of a user ANAS creates without naming one: with `-N`,
+ * useradd(8) (shadow-utils 4.x) adds "the user to the group specified by the
+ * -g option or by the GROUP variable in /etc/default/useradd", and
+ * `useradd -D` on PVE 9.2 says `GROUP=100` (probe P06) — `users`.
+ */
+export const DEFAULT_PRIMARY_GID = 100
+
+/**
+ * The groups the identity list SHOWS (`GET /identity/groups`; GitHub #78):
+ * root and the share band, as {@link isShareRelevant} draws them for either
+ * kind of id, plus the default primary group ({@link DEFAULT_PRIMARY_GID},
+ * `users`). Every user ANAS creates has it as its primary group and the user
+ * rows name it, a share's `valid users` and an ACL may grant to it, and the
+ * create dialog offers it as the primary group — a list that hid it sent the
+ * operator to type `@users` by hand. Listed is not mutable: like root it is
+ * outside {@link isMutableShareId}, so a membership edit or a delete still
+ * refuses SYSTEM_ACCOUNT. GROUPS ONLY — uid 100 stays a service account and
+ * every other service-range gid stays out.
+ */
+export function isListedGroup(gid: number): boolean {
+  return isShareRelevant(gid) || gid === DEFAULT_PRIMARY_GID
+}
+
+/**
  * Parse `getent passwd` into entries. Lines are
  * `name:passwd:uid:gid:gecos:home:shell`; blank lines and malformed lines
  * (missing name / non-numeric uid or gid) are skipped. The gecos field is kept

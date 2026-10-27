@@ -145,10 +145,20 @@ describe('share-identity routes', () => {
       assert.equal(res.statusCode, 200)
       const { data } = res.json() as { data: ShareGroup[] }
       const names = data.map(g => g.name).sort()
-      assert.deepEqual(names, ['media', 'root', 'smbusers'])
+      assert.deepEqual(names, ['media', 'root', 'smbusers', 'users'])
       const smb = data.find(g => g.name === 'smbusers')!
       assert.deepEqual(smb.members, ['media', 'backup-svc'])
       assert.equal(smb.local, true)
+    })
+
+    it('#78: the default primary group `users` (gid 100) is listed beside root — every ANAS user\'s primary group, never a band group', async () => {
+      server = createServer({ mock: true, logger: false })
+      const res = await server.inject({ method: 'GET', url: '/v1/identity/groups' })
+      const { data } = res.json() as { data: ShareGroup[] }
+      const users = data.find(g => g.name === 'users')
+      assert.deepEqual(users, { name: 'users', gid: 100, members: [], local: true })
+      // The other side of the exception: no other service-range group leaks in.
+      assert.deepEqual(data.filter(g => g.gid > 0 && g.gid < 1000).map(g => g.gid), [100])
     })
   })
 
@@ -1496,6 +1506,17 @@ describe('share-identity routes', () => {
       await boot()
       const res = await del('/v1/identity/groups/sudo')
       assertRefusal(res, 'sudo')
+    })
+
+    it('#78: `users` (gid 100) is LISTED yet, like root, refuses a membership edit and a delete — listed is not mutable', async () => {
+      await boot()
+      const list = await app!.inject({ method: 'GET', url: '/v1/identity/groups', headers: IDENTITY_HEADERS })
+      assert.deepEqual((list.json() as { data: ShareGroup[] }).data.map(g => g.name).sort(), ['root', 'sharegrp', 'users'])
+      const members = await put('/v1/identity/groups/users/members', { add: ['shareuser'] })
+      assertRefusal(members, 'users')
+      assert.match((members.json() as { error: { message: string } }).error.message, /gid 100/)
+      assertRefusal(await del('/v1/identity/groups/users'), 'users')
+      assert.equal(mutatorCalls().length, 0)
     })
 
     it('create with a system group in `groups` refuses naming the group, no useradd', async () => {

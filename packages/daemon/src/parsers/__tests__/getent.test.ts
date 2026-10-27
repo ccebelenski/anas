@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  DEFAULT_PRIMARY_GID,
   isExpired,
+  isListedGroup,
   isMutableShareId,
   isShareRelevant,
   parseGroups,
@@ -77,6 +79,24 @@ describe('isShareRelevant', () => {
     // High dynamically-allocated system accounts are noise, not share users.
     assert.equal(isShareRelevant(64045), false) // ceph
     assert.equal(isShareRelevant(65534), false) // nobody
+  })
+})
+
+describe('isListedGroup', () => {
+  it('#78: isShareRelevant plus the default primary group (gid 100) — the one service-range id the group list shows', () => {
+    assert.equal(isListedGroup(DEFAULT_PRIMARY_GID), true)
+    assert.equal(DEFAULT_PRIMARY_GID, 100)
+    assert.equal(isListedGroup(0), true)
+    assert.equal(isListedGroup(1000), true)
+    assert.equal(isListedGroup(60000), true)
+    // Its neighbours in the service range stay out, as does everything isShareRelevant drops.
+    assert.equal(isListedGroup(99), false)
+    assert.equal(isListedGroup(101), false)
+    assert.equal(isListedGroup(27), false) // sudo
+    assert.equal(isListedGroup(60001), false)
+    assert.equal(isListedGroup(65534), false) // nogroup
+    // Listed is not mutable: the exception never reaches the band test.
+    assert.equal(isMutableShareId(DEFAULT_PRIMARY_GID), false)
   })
 })
 
