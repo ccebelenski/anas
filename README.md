@@ -126,7 +126,9 @@ every node.
   multi-hour run captures one instant; sources that can't be snapshotted (remote
   mounts, for instance) are backed up live and labeled as such. Nested
   filesystems under a source are detected and listed, and you choose which
-  ones to include.
+  ones to include. If the PBS server itself starts refusing backups with its
+  root disk full, see [`docs/PBS-TASK-LOGS.md`](docs/PBS-TASK-LOGS.md): a PBS
+  behaviour, with the cleanup.
 - **Restore** — selective file restore with a picker that browses the live tree
   and the archive catalog side by side, restoring **into the original**
   (matching files overwritten, the rest kept) or **somewhere else**. Whole-image

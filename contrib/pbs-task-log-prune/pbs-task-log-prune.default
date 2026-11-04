@@ -1,0 +1,5 @@
+# /etc/default/pbs-task-log-prune — knobs for pbs-task-log-prune.service.
+# NOT SUPPORTED — USE AT YOUR OWN RISK (see the ANAS repo, contrib/pbs-task-log-prune/README.md).
+# Task logs older than AGE_DAYS days AND larger than MIN_SIZE are removed.
+AGE_DAYS=30
+MIN_SIZE=1M

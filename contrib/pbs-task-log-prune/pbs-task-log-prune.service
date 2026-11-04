@@ -1,0 +1,9 @@
+[Unit]
+Description=Remove oversized, aged Proxmox Backup Server task logs (NOT SUPPORTED, use at your own risk)
+Documentation=https://github.com/ccebelenski/anas/tree/main/contrib/pbs-task-log-prune
+After=proxmox-backup-proxy.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/pbs-task-log-prune
+ExecStart=/usr/local/sbin/pbs-task-log-prune.sh

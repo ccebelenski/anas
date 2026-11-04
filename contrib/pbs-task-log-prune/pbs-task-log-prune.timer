@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily run of pbs-task-log-prune (NOT SUPPORTED, use at your own risk)
+
+[Timer]
+# After PBS's own 00:00 log rotation; spread so a fleet does not run in lockstep.
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
