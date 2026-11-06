@@ -179,11 +179,76 @@ the message as tooltip, that a later completed scrub displaces it, and that a pa
 from the previous completed pass stays on the row beside it. The notification is the one
 `AHR scrub failed` warning; the per-band rot warning is the only other notice a scrub sends.
 
+## 4. The finding path through the new phase 2: one rotted block beneath md, found, attributed, repaired (main at 77a0cfc98, 2026-11-06 10:43–10:45 EST)
+
+scrub.r1 changed how phase 2's verdict is read (a non-zero exit of the blocking `scrub start -B`
+is a finding, not a failure), and the production node's hand-run checksum pass had meanwhile
+found exactly that: one uncorrectable csum error in a plot file, 4 KiB, with the band's
+`mismatch_cnt` still at 8 sectors from the earlier parity check — one member rotted beneath md.
+The rig reproduced that shape on the same pool, with no throttle (operator: "you can actually test
+the corruption on the stunt node by manipulating the bytes on the backing virtual disk files").
+
+**Injection.** `fill2.bin`'s 4 KiB block at file offset 512 MiB (block 131072) was read through
+btrfs and located on the members by a byte scan: `/dev/sdd1` at byte 1274019840, 4 KiB aligned
+(not on sdb1/sdc1). Its sha256 and the file's were kept. 4 KiB of urandom were written ON THE
+MEMBER at that offset (`dd … oflag=direct`, `drop_caches`), bypassing md: parity now disagrees
+with the data on that stripe, and btrfs's stored csum disagrees with what md returns.
+
+```
+$ POST /v1/ahr/sr1/scrub {}                                   job 78787b03
+10:43:45 running | md check on sr1-r1 (0.1%) … (95.5%)
+10:44:11 running | btrfs scrub running (status unreadable: WARNING: failed to open status file: Resource temporarily unavailable)
+10:44:15 completed | Attributing scrub errors: 1/1 (/mnt/anas-ahr/sr1/fill2.bin)
+result: btrfsErrors "csum=1", parityMismatches [{band sr1-r1, mismatchCnt 8, raid5}],
+        findings [{path /mnt/anas-ahr/sr1/fill2.bin, subvolume @data, inode 258,
+                   stripes [{logical 2261778432, offset 536870912, length 4096}], badBlocks [131072]}],
+        errorsReported 1, errorsAttributed 1, unattributed 0
+
+$ POST /v1/ahr/sr1/repair {"files":[{"path":"/mnt/anas-ahr/sr1/fill2.bin","blocks":[131072]}]}
+409 CONFIRMATION_REQUIRED, x-anas-confirm-code (six warnings: the snapshot, the md knobs, the one
+   4 KiB write through md after the reconstruction matches the stored csum, the cost, nothing
+   else touched, an unprovable block left alone)
+replay with x-anas-confirm                                    job 6fee09be, 202
+10:44:16 running | Repairing /mnt/anas-ahr/sr1/fill2.bin block 131072 (1/1)
+10:44:33 completed | block 131072: repaired — "reconstructed from the XOR of the other 2 members of
+         stripe 2422 and verified against the stored csum 0xb92c3c27"
+result: repaired 1, unrepairable 0, aboveMd 0, mappingAbort 0, parityResiduals []
+
+verify (drop_caches first):
+  sha256 fill2.bin  85d5b07f…6f25  == the hash taken before the injection
+  /dev/sdd1 @ 1274019840 read O_DIRECT == the original block (cmp)
+  /sys/block/md127/md/mismatch_cnt = 0 (the repair's bounded postcheck)
+$ POST /v1/ahr/sr1/scrub {}                                   job 2, 10:44:40 → 10:45:10
+result: btrfsErrors null, bandsChecked [sr1-r1], no parityMismatches, no findings
+btrfs scrub status: finished, no errors found; mismatch_cnt 0
+notifications: three `notified via target mail-to-root` lines — the band's parity warning and
+  "AHR scrub found errors" from the first scrub, the repair's info notice; audit job.completed
+  for ahr.scrub and ahr.repair.
+```
+
+The whole R2 tree of `AHR-SELF-HEAL-DECISION-TREE.md` ran on the fixed phase 2: the scrub's
+non-zero exit became the finding, the kernel line was attributed to the file and block, the
+band's mismatch rode the same result, the Repair door reconstructed the block from parity and
+proved it against the stored csum before the one write, and the next scrub was clean. This is
+the shape the production node will present on its first ANAS scrub of the release.
+
+One cosmetic residual, seen once in three polls: while the blocking `scrub start -B` holds the
+status file's lock, a progress poll reads `WARNING: failed to open status file: Resource
+temporarily unavailable` and the progress text shows that sentence until the next poll. Progress
+only (r1 fold) — the verdict is the final read, retried. A rider: keep the last good percentage
+on a transient read failure instead of showing the warning text.
+
 ## Residuals
 
-- The fleet proof — the production node completing a full ANAS scrub of both pools on the
-  build — is owed before the release; its hand-run checksum passes (the #81 workaround) have to
-  finish first, and its first-band parity mismatch from 2026-11-02 is attributed by that run.
+- The fleet proof — the production node completing a full ANAS scrub of both pools — moves to
+  AFTER the release (operator 2026-11-06, away for the week: "those scrubs will complete while
+  I'm gone — we can pick up on them next week"; the pre-release stand-in is §4, the same shape
+  the node will present). Its hand-run checksum passes (the #81 workaround) finish first (one has
+  already found a single uncorrectable 4 KiB csum error in a plot file, beside a band's 8-sector
+  mismatch from 2026-11-02 — almost certainly the same block), then the node upgrades to the
+  released build and its first ANAS scrub attributes and repairs it through the product.
+- Progress text during phase 2 can show the status file's transient lock warning for one poll
+  (§4); cosmetic, a rider.
 - The 300 s budget is the job lane's default; nothing else in the daemon forks a child that
   keeps the caller's pipes (sweep of every executor call site, scrub.r1 report).
 - An `ahr.scrub` job has no cancel hook; the Scrubs screen's Stop posts the ZFS action only.
