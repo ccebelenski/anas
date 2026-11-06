@@ -24,6 +24,7 @@ import {
 import {
   DEFAULT_PRIMARY_GID,
   isExpired,
+  isJoinableGroup,
   isListedGroup,
   isMutableShareId,
   isShareRelevant,
@@ -64,29 +65,30 @@ const NOLOGIN = '/usr/sbin/nologin'
 const SYSTEM_IDS = `uid/gid below ${SHARE_ID_MIN} or above ${SHARE_ID_MAX}`
 
 /**
- * cr.58 (review L2, the §2 "System accounts … are never mutable" rule read
- * for ACCOUNTS, not only numbers): the band alone let the node's own admin
- * logins through — an operator's `adduser chris; usermod -aG sudo chris`
- * account sits in the band, and disable (expiry locks its ssh and PVE @pam
- * login), delete and an SMB password all ran on it. An account is also a
- * system account when it administers the node: a member (primary or
- * supplementary) of the root group or of a group named here — Debian's
- * sudoers grants `%sudo`, `adm` is Debian's admin log group, `wheel` /
- * `admin` the other distributions' spelling of the same — or a Proxmox VE
- * login of the `pam` realm (`user:<name>@pam:` in /etc/pve/user.cfg; §2:
- * ANAS-created users are "never PVE users"). The login SHELL is not a
- * criterion: the common Samba recipe (`adduser bob; smbpasswd -a bob`)
- * makes /bin/bash share users, and refusing them would strand every share
- * user that predates ANAS while telling an admin login apart from them no
- * better than these two facts do.
+ * identity.5 (#78, ruled 2026-10-29): a system account is an out-of-band id
+ * or a Proxmox VE login of the `pam` realm (`user:<name>@pam:` in
+ * /etc/pve/user.cfg; §2: ANAS-created users are "never PVE users"), nothing
+ * else. cr.58 (L2) also counted a member of the root group or of a group
+ * NAMED root/sudo/adm/wheel/admin, whatever its gid — so a share group an
+ * operator created as `admin` (gid 3000) froze every member it was given.
+ * Group membership is not a criterion, gid 0 included: an in-band account
+ * is a share account whatever groups it sits in, and an in-band group is a
+ * share group whatever it is called. sudo membership does nothing for an
+ * account that cannot run a process (ANAS-created users are nologin, with
+ * no home). A hand-made admin login (`adduser chris; usermod -aG sudo
+ * chris`) is listed in Share Users and can be disabled there — reversible,
+ * root@pam's shell recovers it — and deleting it asks for the confirm code
+ * like any user. The PVE web login is the one login class where a disable
+ * bites, and that is the @pam test, keyed by name as PVE keys it.
+ * The login SHELL is not a criterion either: the common Samba recipe
+ * (`adduser bob; smbpasswd -a bob`) makes /bin/bash share users.
  */
-const ADMIN_GROUPS = new Set(['root', 'sudo', 'adm', 'wheel', 'admin'])
 
 /** PVE's user list (pmxcfs); read, never written (§2 Shares & identities). */
 const PVE_USER_CFG = '/etc/pve/user.cfg'
 
-/** The user refusals' description of a system account (cr.58). */
-const SYSTEM_ACCOUNTS = `${SYSTEM_IDS}, members of an administrative group (${[...ADMIN_GROUPS].join(', ')}), and Proxmox VE @pam logins`
+/** The user refusals' description of a system account (cr.58; identity.5: the id band and @pam logins, nothing else). */
+const SYSTEM_ACCOUNTS = `${SYSTEM_IDS}, or a Proxmox VE @pam login`
 
 /**
  * The account names that are `pam`-realm PVE logins in a user.cfg text: its
@@ -768,20 +770,14 @@ export async function shareIdentityRoutes(
   const localUserGate: Gate<UserObject> = async o => o.local ? null : directoryRefusal('user', o.name)
 
   /**
-   * What makes an in-band account a system account anyway (cr.58, L2; see
-   * {@link ADMIN_GROUPS}): `{ system }` the reason, `{ unreadable }` the
-   * database that could not be read (the caller refuses 503 — fail closed),
-   * null an account ANAS may change. The group database is read through
-   * NSS (initgroups does): a directory group can make a local account an
-   * administrator too.
+   * What makes an in-band account a system account anyway (cr.58 L2, as
+   * identity.5 left it): a Proxmox VE @pam login of the same name. `{ system }`
+   * the reason, `{ unreadable }` user.cfg could not be read (the caller
+   * refuses 503 — fail closed: an unread list is never "not a login"), null
+   * an account ANAS may change. No group is read: membership is not a
+   * criterion (identity.5).
    */
-  async function adminAccountFact(entry: PasswdEntry, reads: GuardReads): Promise<{ system: string } | { unreadable: string } | null> {
-    const groups = await idReads.groupsStrict(reads)
-    if (groups === null)
-      return { unreadable: 'the group database (getent group)' }
-    const admin = groups.filter(g => (g.gid === 0 || ADMIN_GROUPS.has(g.name)) && (g.gid === entry.gid || g.members.includes(entry.name)))
-    if (admin.length > 0)
-      return { system: `it is a member of ${admin.map(g => `'${g.name}' (gid ${g.gid})`).join(', ')}, so it administers this node` }
+  async function pamLoginFact(entry: PasswdEntry, reads: GuardReads): Promise<{ system: string } | { unreadable: string } | null> {
     const logins = await idReads.pveLogins(reads)
     if (logins === null)
       return { unreadable: `Proxmox VE's user list (${opts.pveUserCfgPath ?? PVE_USER_CFG})` }
@@ -791,7 +787,7 @@ export async function shareIdentityRoutes(
   }
 
   /**
-   * Is this account a system account (cr.3 band, cr.58 admin)? The refusal
+   * Is this account a system account (cr.3 band, cr.58 @pam login)? The refusal
    * when it is — or a 503 when what decides it cannot be read. `act` is
    * appended to the sentence when the refused account is not the verb's own
    * object (a group member, L1).
@@ -801,7 +797,7 @@ export async function shareIdentityRoutes(
       const band = systemAccountRefusal('user', entry.name, entry.uid)
       return act ? { ...band, message: `${band.message}${act}` } : band
     }
-    const fact = await adminAccountFact(entry, reads)
+    const fact = await pamLoginFact(entry, reads)
     if (fact === null)
       return null
     if ('unreadable' in fact)
@@ -815,8 +811,8 @@ export async function shareIdentityRoutes(
 
   /**
    * cr.3: the uid must be in the mutable share band (`isMutableShareId`);
-   * cr.58 (L2): and the account must not administer the node — every user
-   * verb (SMB password, enable, disable, delete), at both doors.
+   * cr.58 (L2): and the account must not be a Proxmox VE @pam login — every
+   * user verb (SMB password, enable, disable, delete), at both doors.
    */
   const mutableUserGate: Gate<UserObject> = async (o, reads) => systemUserRefusal(o.entry, reads)
 
@@ -875,8 +871,19 @@ export async function shareIdentityRoutes(
 
   const localGroupGate: Gate<GroupObject> = async o => o.local ? null : directoryRefusal('group', o.name)
 
+  /** cr.3: the delete door's band. gid 100 (`users`) is outside it, so it is never deleted (identity.5). */
   const mutableGroupGate: Gate<GroupObject> = async o =>
     isMutableShareId(o.entry.gid) ? null : systemAccountRefusal('group', o.name, o.entry.gid)
+
+  /**
+   * The Members door's band (identity.5, #78): the share band plus the
+   * default primary group `users` (gid 100, {@link isJoinableGroup}) — a
+   * user whose primary group is another one can join it, so a share's
+   * `@users` grant reaches them too. root and every other system group stay
+   * refused; who is added or removed is {@link membersGate}'s question.
+   */
+  const joinableGroupGate: Gate<GroupObject> = async o =>
+    isJoinableGroup(o.entry.gid) ? null : systemAccountRefusal('group', o.name, o.entry.gid)
 
   /**
    * groupdel cannot run while the group is ANY account's primary group (the
@@ -968,10 +975,10 @@ export async function shareIdentityRoutes(
    * member line is removed by name). cr.58 (review L1): the group's gid is
    * not the only id a members edit changes — every member that resolves,
    * added or removed, passes the user verbs' system-account test on ITS
-   * account ({@link systemUserRefusal}: the band, an administrative group,
-   * a PVE @pam login). `gpasswd -a www-data media` handed pveproxy's account
-   * the share group's files; `gpasswd -d` of a service's or an admin's
-   * membership is the same system management, from the other side. A
+   * account ({@link systemUserRefusal}: the band, a PVE @pam login).
+   * `gpasswd -a www-data media` handed pveproxy's account the share group's
+   * files; `gpasswd -d` of a service's or a PVE login's membership is the
+   * same system management, from the other side. A
    * member is looked up by its exact name in `getent passwd` — what gpasswd
    * resolves it to.
    */
@@ -1104,12 +1111,13 @@ export async function shareIdentityRoutes(
 
   /**
    * The guard spec of a verb on an existing group: id the gid; gates local,
-   * band, then the added members resolve and no member added or removed is
+   * band (members: the band plus `users`, identity.5; delete: the band
+   * alone), then the added members resolve and no member added or removed is
    * a system account (members, cr.58 L1) or the primary-group use and the
    * share references (delete); locks `gid:<n>`, the delete also the name key.
    */
   function groupGuardSpec(name: string, verb: GroupVerb, add: string[] = [], remove: string[] = []): GuardSpec<GroupObject> {
-    const gates: Gate<GroupObject>[] = [localGroupGate, mutableGroupGate]
+    const gates: Gate<GroupObject>[] = [localGroupGate, verb === 'members' ? joinableGroupGate : mutableGroupGate]
     if (verb === 'members')
       gates.push(membersGate(add, remove))
     if (verb === 'delete')
@@ -1533,7 +1541,8 @@ export async function shareIdentityRoutes(
   server.get('/identity/groups', async () => {
     const [groups, users, local] = await Promise.all([allGroups(), allUsers(), localGroupNames()])
     // #78: the band and root as the user list draws them, plus the default
-    // primary group `users` (gid 100) — listed, never mutable (isListedGroup).
+    // primary group `users` (gid 100) — listed, membership editable, never
+    // deleted (isListedGroup; identity.5).
     const data: ShareGroup[] = groups
       .filter(g => isListedGroup(g.gid))
       .map((g) => {
@@ -1633,20 +1642,22 @@ export async function shareIdentityRoutes(
       },
       // cr.3 (review C3): existing ≠ mutable. `useradd -G sudo` would hand the
       // new account the sudo group; membership of anything outside the share
-      // band is system management, so name the group and refuse.
+      // band is system management, so name the group and refuse. identity.5:
+      // the default primary group (gid 100, `users`) is taken here exactly as
+      // the primary-group gate below takes it ({@link isJoinableGroup}).
       async (_s, reads) => {
         if (groups.length === 0)
           return null
         const byName = new Map((await idReads.groups(reads)).map(g => [g.name, g]))
         const systemGroups = groups.filter((g) => {
           const entry = byName.get(g)
-          return entry !== undefined && !isMutableShareId(entry.gid)
+          return entry !== undefined && !isJoinableGroup(entry.gid)
         })
         return systemGroups.length > 0
           ? {
               status: 409,
               code: 'SYSTEM_ACCOUNT',
-              message: `Group(s) ${systemGroups.map(g => `'${g}' (gid ${byName.get(g)?.gid})`).join(', ')} are system groups. System accounts (${SYSTEM_IDS}) are managed outside ANAS.`,
+              message: `Group(s) ${systemGroups.map(g => `'${g}' (gid ${byName.get(g)?.gid})`).join(', ')} are system groups. System accounts (${SYSTEM_IDS}) are managed outside ANAS; the default primary group (gid ${DEFAULT_PRIMARY_GID}) is the one exception.`,
             }
           : null
       },
@@ -1662,7 +1673,7 @@ export async function shareIdentityRoutes(
         const entry = await idReads.group(reads, req.primaryGroup)
         if (!entry)
           return { status: 400, code: 'VALIDATION_ERROR', message: `Unknown primary group: ${req.primaryGroup}` }
-        if (!isMutableShareId(entry.gid) && entry.gid !== DEFAULT_PRIMARY_GID) {
+        if (!isJoinableGroup(entry.gid)) {
           return {
             status: 409,
             code: 'SYSTEM_ACCOUNT',
@@ -2042,7 +2053,8 @@ export async function shareIdentityRoutes(
 
     // exists → local → band (cr.3: `gpasswd -a <u> sudo` hands `u` the sudo
     // group — membership edits of system groups are system management,
-    // outside ANAS) → the members being added resolve → no member added or
+    // outside ANAS; identity.5: the default primary group `users`, gid 100,
+    // takes members) → the members being added resolve → no member added or
     // removed is a system account (cr.58, L1: `gpasswd -a root media` /
     // `gpasswd -a www-data media` changed system accounts through a share
     // group) — at the route and again in the job.

@@ -350,11 +350,21 @@
     // cr.29b: the default primary group of a user ANAS creates (useradd -N →
     // /etc/default/useradd GROUP=100, probe P06). The daemon accepts it by name
     // as the one primary group outside the share band, and since #78
-    // GET /identity/groups lists it beside root (gid 100: listed, never
-    // mutable). The name is what the combo shows before the list loads and
-    // the fallback when the load fails; a loaded list names the gid-100 row.
+    // GET /identity/groups lists it beside root (gid 100: listed, membership
+    // editable since identity.5, never deleted). The name is what the combo
+    // shows before the list loads and the fallback when the load fails; a
+    // loaded list names the gid-100 row.
     var DEFAULT_PRIMARY_GROUP = 'users';
     var DEFAULT_PRIMARY_GID = 100;
+
+    // identity.5 (#78): a gid a share user may belong to — the share band
+    // plus the default primary group, keyed by gid 100, never by the name
+    // `users` (the daemon's isJoinableGroup). root (gid 0) and every other
+    // system group stay out: the daemon refuses them SYSTEM_ACCOUNT.
+    function isJoinableGid(gid) {
+        return typeof gid === 'number'
+            && ((gid >= ID_MIN && gid <= ID_MAX) || gid === DEFAULT_PRIMARY_GID);
+    }
 
     // cr.29b/#78: the primary groups the daemon accepts — the default first
     // (the listed gid-100 row by its own name; the seed when the list has
@@ -392,12 +402,12 @@
             }
             // Supplementary groups: the daemon refuses membership of any
             // group outside the share band with SYSTEM_ACCOUNT (cr.3 review
-            // C3), so root (gid 0, listed because it owns files) and any
-            // other system group are not offered here either.
+            // C3), the default primary group (gid 100) excepted since
+            // identity.5 — so it is offered, and root (gid 0, listed because
+            // it owns files) and any other system group are not.
             var data = [];
             for (var i = 0; i < rows.length; i++) {
-                var gid = rows[i].gid;
-                if (typeof gid === 'number' && gid >= ID_MIN && gid <= ID_MAX) {
+                if (isJoinableGid(rows[i].gid)) {
                     data.push({ name: rows[i].name });
                 }
             }
@@ -451,11 +461,11 @@
         }
     }
 
-    // A group ANAS can change: a LOCAL row in the share band. root (gid 0)
+    // A group ANAS can delete: a LOCAL row in the share band. root (gid 0)
     // and the default primary group `users` (gid 100) are listed because
     // they own files and are every ANAS user's primary group (#78), and the
-    // daemon refuses every mutation of them (SYSTEM_ACCOUNT, cr.3) — so the
-    // doors are dead on those rows, as they are on a directory group.
+    // daemon refuses to delete them (SYSTEM_ACCOUNT, cr.3) — so Delete is
+    // dead on those rows, as it is on a directory group.
     function isManagedGroup(rec) {
         if (!isLocal(rec)) {
             return false;
@@ -464,13 +474,20 @@
         return typeof gid === 'number' && gid >= ID_MIN && gid <= ID_MAX;
     }
 
+    // A group whose members ANAS can edit: a LOCAL row ANAS may delete, plus
+    // the gid-100 row (identity.5: listed, membership editable, never
+    // deleted). root's Members door stays dead.
+    function isMemberEditableGroup(rec) {
+        return isLocal(rec) && isJoinableGid(rec.get('gid'));
+    }
+
     function updateGroupButtons(grid) {
         if (!grid) {
             return;
         }
-        var managed = isManagedGroup(selectedRow(grid));
-        setDisabled(grid, 'groupMembers', !managed);
-        setDisabled(grid, 'groupDelete', !managed);
+        var rec = selectedRow(grid);
+        setDisabled(grid, 'groupMembers', !isMemberEditableGroup(rec));
+        setDisabled(grid, 'groupDelete', !isManagedGroup(rec));
     }
 
     // ---- New user window (anas-win-user-create) ----------------------------

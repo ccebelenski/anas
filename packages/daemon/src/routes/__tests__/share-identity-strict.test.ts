@@ -30,8 +30,11 @@ import { shareIdentityRoutes } from '../share-identity.js'
  *    list GETs keep failing open;
  *  - M5: a SAME-case orphan entry refuses a create that sets no SMB password;
  *  - L1: a members edit gates each MEMBER, not only the group;
- *  - L2: an administrative login (an `@pam` PVE login, a member of root /
- *    sudo / adm / wheel / admin) is a system account at every user door.
+ *  - L2: a Proxmox VE `@pam` login is a system account at every user door.
+ *    identity.5 (#78, ruled 2026-10-29) re-pinned cr.58's other criterion:
+ *    membership of root / sudo / adm / wheel / admin made an in-band account
+ *    a system account; it no longer does — an in-band account is a share
+ *    account whatever groups it sits in.
  *
  * FIXTURES (ruling (l)): the account and passdb lines are the stunt-node
  * capture in docs/LIVE-PROOF-0.4.3-access.md §1 (`id accuser; pdbedit -L |
@@ -125,7 +128,7 @@ const DISABLE_USER: Req = { method: 'PUT', url: '/v1/identity/users/accuser', bo
 const ENABLE_USER: Req = { method: 'PUT', url: '/v1/identity/users/accuser', body: { enabled: true } }
 const SET_PASSWORD: Req = { method: 'POST', url: '/v1/identity/users/accuser/smb-password', body: { password: 'Acc-proof-1' } }
 
-describe('cr.58 — identity gates and jobs read strictly; member and admin accounts are system accounts', () => {
+describe('cr.58 — identity gates and jobs read strictly; a members edit gates each member; @pam logins are system accounts', () => {
   let dir: string
   let app: FastifyInstance | undefined
   let queue: JobQueue
@@ -482,25 +485,43 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
 
   // --- L2 -------------------------------------------------------------------
 
-  /** `usermod -aG sudo accuser`: the operator's admin login, still uid 1004 (in the band). */
+  /** `usermod -aG sudo accuser`: a hand-made admin login, still uid 1004 (in the band). */
   const SUDO_ACCUSER = rewrite(SUDO, 'sudo:x:27:', 'sudo:x:27:accuser')
   /** The captured user.cfg with accuser made a PVE login: its root@pam line rewritten, appended. */
   const ROOT_PAM = USER_CFG.split('\n').find(l => l.startsWith('user:root@pam:'))!
   const USER_CFG_ACCUSER = `${USER_CFG}${rewrite(ROOT_PAM, 'user:root@pam:', 'user:accuser@pam:')}\n`
   const USER_VERBS = [DISABLE_USER, ENABLE_USER, DELETE_USER, SET_PASSWORD]
-  const SUFFIX = `System accounts (uid/gid below 1000 or above 60000, members of an administrative group (root, sudo, adm, wheel, admin), and Proxmox VE @pam logins) are managed outside ANAS.`
+  const SUFFIX = `System accounts (uid/gid below 1000 or above 60000, or a Proxmox VE @pam login) are managed outside ANAS.`
 
-  it('L2: an in-band admin login (a sudo member) is a system account — disable, enable, delete and SMB password all 409 SYSTEM_ACCOUNT, no job, no confirm code', async () => {
-    for (const req of USER_VERBS) {
+  /** Send a verb through to its job (a delete through its confirm code); the finished job. */
+  async function run(req: Req): Promise<Job> {
+    let code: string | undefined
+    if (req.confirm) {
+      const first = await send(req)
+      assert.equal(first.statusCode, 409, first.body)
+      assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+      code = first.headers['x-anas-confirm-code'] as string
+    }
+    const res = await send(req, code)
+    assert.equal(res.statusCode, 202, `${req.method} ${req.url}: ${res.body}`)
+    return finished((res.json() as JobAccepted).job.id)
+  }
+
+  /** The act each user verb ends in (the passdb holds accuser, so the SMB steps run too). */
+  const VERB_ACT: Array<[Req, string[]]> = [
+    [DISABLE_USER, [USERMOD, '--expiredate', '1', 'accuser']],
+    [ENABLE_USER, [USERMOD, '--expiredate', '', 'accuser']],
+    [DELETE_USER, [USERDEL, 'accuser']],
+    [SET_PASSWORD, [SMBPASSWD, '-a', '-s', 'accuser']],
+  ]
+
+  it('identity.5 (#78): an in-band sudo member is a share account — disable, enable, delete and SMB password all run', async () => {
+    for (const [req, act] of VERB_ACT) {
       await serve()
       groups = [ROOT_GROUP, SUDO_ACCUSER, USERS, ACCGROUP]
-      const res = await send(req)
-      assert.equal(res.statusCode, 409, `${req.method} ${req.url}: ${res.body}`)
-      assert.equal(res.json().error.code, 'SYSTEM_ACCOUNT')
-      assert.equal(res.json().error.message, `User 'accuser' (uid 1004) is a system account: it is a member of 'sudo' (gid 27), so it administers this node. ${SUFFIX}`)
-      assert.equal(res.headers['x-anas-confirm-code'], undefined)
-      assert.equal(queue.list().length, 0)
-      assert.deepEqual(calls.filter(isMutation), [])
+      const job = await run(req)
+      assert.equal(job.status, 'completed', `${req.method} ${req.url}: ${JSON.stringify(job.error)}`)
+      assert.ok(calls.filter(isMutation).some(c => [c.command, ...c.args].join(' ') === act.join(' ')), `${act.join(' ')} ran: ${JSON.stringify(calls.filter(isMutation))}`)
       await app!.close()
       app = undefined
     }
@@ -523,23 +544,34 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
     assert.equal(res.statusCode, 202, res.body)
   })
 
-  it('L2: a root-group PRIMARY gid makes an in-band account a system account too', async () => {
+  it('identity.5: a root-group PRIMARY gid no longer makes an in-band account a system account — gid 0 included, the disable runs', async () => {
     await serve()
     passwd = [ROOT, rewrite(ACCUSER, ':1004:100:', ':1004:0:')]
-    const res = await send(DISABLE_USER)
-    assert.equal(res.statusCode, 409)
-    assert.match(res.json().error.message, /is a member of 'root' \(gid 0\), so it administers this node/)
+    const job = await run(DISABLE_USER)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(calls.filter(c => c.command === USERMOD).map(c => c.args), [['--expiredate', '1', 'accuser']])
   })
 
-  it('L2: the account becoming an admin while the delete waits refuses the job SYSTEM_ACCOUNT — no pdbedit -x, no userdel', async () => {
+  it('identity.5: the account becoming a @pam login while the delete waits refuses the job SYSTEM_ACCOUNT — no pdbedit -x, no userdel; joining sudo while it waits does not', async () => {
     await serve()
     const { id, release } = await behindFullQueue(DELETE_USER)
-    groups = [ROOT_GROUP, SUDO_ACCUSER, USERS, ACCGROUP]
+    await writeFile(join(dir, 'user.cfg'), USER_CFG_ACCUSER)
     release()
     const job = await finished(id)
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'SYSTEM_ACCOUNT')
+    assert.equal(job.error?.message, `User 'accuser' (uid 1004) is a system account: it is a Proxmox VE login ('accuser@pam'). ${SUFFIX}`)
     assert.deepEqual(calls.filter(isMutation), [])
+    await app!.close()
+    app = undefined
+
+    await serve()
+    const sudo = await behindFullQueue(DELETE_USER)
+    groups = [ROOT_GROUP, SUDO_ACCUSER, USERS, ACCGROUP]
+    sudo.release()
+    const done = await finished(sudo.id)
+    assert.equal(done.status, 'completed', JSON.stringify(done.error))
+    assert.deepEqual(calls.filter(c => c.command === USERDEL).map(c => c.args), [['accuser']])
   })
 
   // --- L1 -------------------------------------------------------------------
@@ -567,13 +599,15 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
     }
   })
 
-  it('L1 + L2: adding an in-band sudo member to a share group is 409 SYSTEM_ACCOUNT; removing root from it too; a stale unresolvable name is still removable', async () => {
+  it('identity.5 (L1 re-pinned): an in-band sudo member is added to a share group (gpasswd -a); removing root from it is still 409; a stale unresolvable name is still removable', async () => {
     await serve()
     groups = [ROOT_GROUP, SUDO_ACCUSER, USERS, ACCGROUP]
     const sudoer = await send(members({ add: ['accuser'] }))
-    assert.equal(sudoer.statusCode, 409)
-    assert.equal(sudoer.json().error.code, 'SYSTEM_ACCOUNT')
-    assert.equal(sudoer.json().error.message, `User 'accuser' (uid 1004) is a system account: it is a member of 'sudo' (gid 27), so it administers this node. ${SUFFIX}${MEMBERS_SUFFIX('added to')}`)
+    assert.equal(sudoer.statusCode, 202, sudoer.body)
+    const added = await finished((sudoer.json() as JobAccepted).job.id)
+    assert.equal(added.status, 'completed', JSON.stringify(added.error))
+    assert.deepEqual(calls.filter(isMutation).map(c => [c.command, ...c.args]), [[GPASSWD, '-a', 'accuser', 'accgroup']])
+    calls = []
 
     groups = [ROOT_GROUP, SUDO, USERS, rewrite(ACCGROUP, 'accgroup:x:1005:', 'accgroup:x:1005:root,gone')]
     const root = await send(members({ remove: ['root'] }))
@@ -589,7 +623,7 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
     assert.deepEqual(calls.filter(isMutation).map(c => [c.command, ...c.args]), [[GPASSWD, '-d', 'gone', 'accgroup']])
   })
 
-  it('L1 control: a plain share user is still added (gpasswd -a); and the member turning admin while the edit waits refuses the job, no gpasswd', async () => {
+  it('identity.5 (L1 control re-pinned): a plain share user is still added (gpasswd -a); and the member becoming a @pam login while the edit waits refuses the job, no gpasswd', async () => {
     await serve()
     const res = await send(members({ add: ['accuser'] }))
     assert.equal(res.statusCode, 202, res.body)
@@ -599,7 +633,7 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
 
     calls = []
     const { id, release } = await behindFullQueue(members({ add: ['accuser'] }))
-    groups = [ROOT_GROUP, SUDO_ACCUSER, USERS, ACCGROUP]
+    await writeFile(join(dir, 'user.cfg'), USER_CFG_ACCUSER)
     release()
     const job = await finished(id)
     assert.equal(job.status, 'failed')
@@ -663,35 +697,53 @@ describe('cr.58 — identity gates and jobs read strictly; member and admin acco
 
   /**
    * The review's EXTRA1 shape: `getent group` ran and exited non-zero with a
-   * PARTIAL listing — the sudo line cut off mid-members-list (`accuse`), so
-   * accuser's membership is missing from what was printed. A fail-open read
-   * (the old `exitCode !== 0 && !stdout`) parses it and the admin reads as
-   * nobody; the strict read answers null and the gate refuses 503 naming the
-   * database, like `passdbForGuard` does for a failed `pdbedit -L`.
+   * PARTIAL listing — the sudo line cut off mid-members-list (`accuse`). A
+   * fail-open read (the old `exitCode !== 0 && !stdout`) parses what was
+   * printed; the strict read answers null and the gate refuses 503 naming
+   * the database, like `passdbForGuard` does for a failed `pdbedit -L`.
+   *
+   * identity.5 moved what this pins: group membership is no longer a
+   * system-account criterion, so the user verbs read no group listing at all
+   * (disable, enable, delete and SMB password: the band, the account, the
+   * passdb and user.cfg). The strict read remains where the listing still
+   * decides something — a create's uid pick steps around every gid
+   * (cr.29c) — and that is where P2 now refuses.
    */
   const GROUPS_CUT = `${ROOT_GROUP}\n${rewrite(SUDO, 'sudo:x:27:', 'sudo:x:27:accuse')}`
 
-  it('cr.58r P2: a getent group exiting non-zero with partial output is unreadable — 503 at the route, no mutation', async () => {
+  /** A full `getent group` listing (with or without `-s files`) — not a by-name lookup. */
+  const isGroupListing = (c: Call): boolean => c.command === GETENT && (c.args.join(' ') === 'group' || c.args.join(' ') === '-s files group')
+
+  it('cr.58r P2 (identity.5 re-pinned): a getent group exiting non-zero with partial output is unreadable — a create 503s at its uid pick; the disable reads no group listing and runs', async () => {
     await serve()
+    passwd = [ROOT]
+    pdbedit = ''
     groupsPartial = GROUPS_CUT
-    const res = await send(DISABLE_USER)
-    assert.equal(res.statusCode, 503, res.body)
-    assert.equal(res.json().error.code, 'UNAVAILABLE')
-    assert.equal(res.json().error.message, `ANAS could not read the group database (getent group), so it cannot check that user 'accuser' is not a system account — nothing was done`)
+    const create = await send(CREATE_ACCUSER)
+    assert.equal(create.statusCode, 503, create.body)
+    assert.equal(create.json().error.code, 'UNAVAILABLE')
+    assert.equal(create.json().error.message, 'ANAS could not read the group database (getent group), so it cannot check which uid no group holds as its gid — nothing was done')
     assert.equal(queue.list().length, 0)
     assert.deepEqual(calls.filter(isMutation), [])
+    await app!.close()
+    app = undefined
+
+    await serve()
+    groupsPartial = GROUPS_CUT
+    const job = await run(DISABLE_USER)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(calls.filter(isGroupListing), [], 'no user verb reads the group listing')
   })
 
-  it('cr.58r P2: the partial getent group appearing while the disable waits fails the job UNAVAILABLE, no usermod', async () => {
+  it('cr.58r P2 (identity.5 re-pinned): the partial getent group appearing while the disable waits does not fail it — the job reads no group listing, usermod runs', async () => {
     await serve()
     const { id, release } = await behindFullQueue(DISABLE_USER)
     groupsPartial = GROUPS_CUT
     release()
     const job = await finished(id)
-    assert.equal(job.status, 'failed')
-    assert.equal(job.error?.code, 'UNAVAILABLE')
-    assert.match(job.error!.message, /^ANAS could not read the group database \(getent group\), so it cannot check that user 'accuser' is not a system account/)
-    assert.deepEqual(calls.filter(isMutation), [])
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(calls.filter(isGroupListing), [])
+    assert.deepEqual(calls.filter(c => c.command === USERMOD).map(c => c.args), [['--expiredate', '1', 'accuser']])
   })
 
   it('cr.58r P3: a failed pdbedit -x of the orphan fails the create job BEFORE smbpasswd -a — no password written on the stale entry', async () => {

@@ -64,16 +64,30 @@ export function isMutableShareId(id: number): boolean {
 export const DEFAULT_PRIMARY_GID = 100
 
 /**
+ * A gid a share account may belong to (identity.5, #78): the share band
+ * ({@link isMutableShareId}) plus the default primary group
+ * ({@link DEFAULT_PRIMARY_GID}, `users`). The one test for a create's
+ * primary group (cr.29c), a create's supplementary groups (cr.3) and the
+ * group Members door — `users` takes members like a band group does, yet
+ * it stays outside the band, so it is never deleted. root (gid 0) and every
+ * other system group stay out.
+ */
+export function isJoinableGroup(gid: number): boolean {
+  return isMutableShareId(gid) || gid === DEFAULT_PRIMARY_GID
+}
+
+/**
  * The groups the identity list SHOWS (`GET /identity/groups`; GitHub #78):
  * root and the share band, as {@link isShareRelevant} draws them for either
  * kind of id, plus the default primary group ({@link DEFAULT_PRIMARY_GID},
  * `users`). Every user ANAS creates has it as its primary group and the user
  * rows name it, a share's `valid users` and an ACL may grant to it, and the
  * create dialog offers it as the primary group — a list that hid it sent the
- * operator to type `@users` by hand. Listed is not mutable: like root it is
- * outside {@link isMutableShareId}, so a membership edit or a delete still
- * refuses SYSTEM_ACCOUNT. GROUPS ONLY — uid 100 stays a service account and
- * every other service-range gid stays out.
+ * operator to type `@users` by hand. Listed, membership editable, never
+ * deleted (identity.5): it takes members ({@link isJoinableGroup}) but, like
+ * root, sits outside {@link isMutableShareId}, so a delete still refuses
+ * SYSTEM_ACCOUNT. GROUPS ONLY — uid 100 stays a service account and every
+ * other service-range gid stays out.
  */
 export function isListedGroup(gid: number): boolean {
   return isShareRelevant(gid) || gid === DEFAULT_PRIMARY_GID

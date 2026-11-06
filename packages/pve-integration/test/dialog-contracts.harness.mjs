@@ -183,7 +183,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { AttachAhrCacheRequest, BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncPreviewRequest, CloudSyncTaskRequest, CreateGroupRequest, CreateShareUserRequest, CreateSmbShareRequest, deriveArchiveName, lunBackupId, SetAccessRequest } from '@anas/shared'
+import { AttachAhrCacheRequest, BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncPreviewRequest, CloudSyncTaskRequest, CreateGroupRequest, CreateShareUserRequest, CreateSmbShareRequest, deriveArchiveName, lunBackupId, SetAccessRequest, UpdateGroupMembersRequest } from '@anas/shared'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = join(HERE, '..', 'src')
@@ -10196,7 +10196,8 @@ const GROUP_ROWS = [
   { name: 'adgroup', gid: 6001, members: ['aduser'], local: false },
   // GET /identity/groups keeps gid 0 (isShareRelevant: root owns files) and,
   // since #78, the default primary group `users` (gid 100): both listed,
-  // neither mutable (the daemon refuses SYSTEM_ACCOUNT).
+  // neither deleted (the daemon refuses SYSTEM_ACCOUNT); since identity.5
+  // `users` takes members, root does not.
   { name: 'root', gid: 0, members: [], local: true },
   { name: 'users', gid: 100, members: [], local: true },
 ]
@@ -10305,10 +10306,11 @@ async function shareUsersChecks() {
     // SYSTEM_ACCOUNT 409, so it is not offered.
     eq('create (cr.29b): it offers users, then the band groups the node lists — never root',
       pg && pg.store.getRange().map(r => r.get('name')), ['users', 'alice', 'smbusers', 'adgroup'])
-    // #78: the supplementary Groups picker stays the band alone — `users` is
-    // listed now, yet a membership edit of it is a SYSTEM_ACCOUNT 409.
-    eq('create (#78): the supplementary Groups picker offers the band only — neither root nor users',
-      win.down('#groups').store.getRange().map(r => r.get('name')), ['alice', 'smbusers', 'adgroup'])
+    // identity.5 (#78): the supplementary Groups picker offers the band and
+    // the gid-100 row — the daemon takes `useradd -G users` like the primary
+    // group; root (gid 0) is still a SYSTEM_ACCOUNT 409, so it is not offered.
+    eq('create (identity.5): the supplementary Groups picker offers the band and users (gid 100) — never root',
+      win.down('#groups').store.getRange().map(r => r.get('name')), ['alice', 'smbusers', 'adgroup', 'users'])
     ok('create (cr.29b): …a directory group in the band is offered (the daemon resolves it through getent)',
       !!pg && pg.store.findExact('name', 'adgroup') >= 0)
     eq('create (cr.29b): users is shown as the default', pg && pg.getValue(), 'users')
@@ -10452,15 +10454,35 @@ async function shareUsersChecks() {
   groupsGrid.selectRow(1)
   state = toolbarState(groupsGrid, ['groupDelete'])
   ok('delete(group): a local group — Delete is enabled', state.groupDelete.disabled === false)
-  // #78: the listed-not-mutable rows — root (gid 0) and users (gid 100) —
-  // have dead Members and Delete doors, as a directory group has: the daemon
-  // would refuse SYSTEM_ACCOUNT. A local band row keeps both live.
+  // #78: the listed rows outside the band — root (gid 0) and users (gid 100).
+  // root has dead Members and Delete doors, as a directory group has: the
+  // daemon would refuse SYSTEM_ACCOUNT. identity.5: users is "listed,
+  // membership editable, never deleted" — its Members door is live, Delete
+  // stays dead. A local band row keeps both live.
   groupsGrid.selectRow(3)
   state = toolbarState(groupsGrid, ['groupMembers', 'groupDelete'])
   ok('groups (#78): root (gid 0) — Members and Delete are disabled', state.groupMembers.disabled === true && state.groupDelete.disabled === true, JSON.stringify(state))
   groupsGrid.selectRow(4)
   state = toolbarState(groupsGrid, ['groupMembers', 'groupDelete'])
-  ok('groups (#78): users (gid 100) is listed and its Members and Delete are disabled', state.groupMembers.disabled === true && state.groupDelete.disabled === true, JSON.stringify(state))
+  ok('groups (identity.5): users (gid 100) — Members is live, Delete stays disabled', state.groupMembers.disabled === false && state.groupDelete.disabled === true, JSON.stringify(state))
+  // The live door sends the daemon's members verb for `users`.
+  jobs.length = 0
+  created.windows.length = 0
+  groupsGrid.down('#groupMembers').handler(groupsGrid.down('#groupMembers'))
+  await settle()
+  let membersWin = openWindow()
+  eq('groups (identity.5): the users Members dialog opens on users', membersWin && membersWin.title, 'Group Members: users')
+  if (membersWin) {
+    membersWin.down('#addUsers').setValue(['Name'])
+    findCmp(membersWin, 'anas-btn-group-member-add').handler(null)
+    membersWin.buttonCmps.find(b => b.cls === 'anas-btn-group-members-submit').handler(null)
+    await settle()
+  }
+  eq('groups (identity.5): adding a user to users PUTs its members verb',
+    jobs[0] && [jobs[0].door, jobs[0].method, jobs[0].path, jobs[0].body],
+    ['runJob', 'put', '/identity/groups/users/members', { add: ['Name'] }])
+  validates('groups (identity.5): the members body parses as UpdateGroupMembersRequest', UpdateGroupMembersRequest, jobs[0] && jobs[0].body)
+  membersWin = null
   groupsGrid.selectRow(1)
   state = toolbarState(groupsGrid, ['groupMembers', 'groupDelete'])
   ok('groups (#78): a local band group keeps Members and Delete live', state.groupMembers.disabled === false && state.groupDelete.disabled === false, JSON.stringify(state))
@@ -10475,6 +10497,37 @@ async function shareUsersChecks() {
   ok('delete(group): it goes through the confirm-code flow with the widget window too',
     jobs[0] && 'confirmWindow' in jobs[0] && jobs[0].confirmWindow === true,
     JSON.stringify(jobs[0] || {}))
+
+  // identity.5: a user's Edit Groups picker offers users (gid 100) too — a
+  // user whose primary group is another one can join it — and never root.
+  created.windows.length = 0
+  usersGrid.selectRow(0)
+  usersGrid.down('#userGroups').handler(usersGrid.down('#userGroups'))
+  await settle()
+  const groupsWin = openWindow()
+  eq('edit groups (identity.5): the picker offers the band and users (gid 100) — never root',
+    groupsWin && groupsWin.down('#groups').store.getRange().map(r => r.get('name')), ['alice', 'smbusers', 'adgroup', 'users'])
+  if (groupsWin && !groupsWin.destroyed) { groupsWin.close() }
+}
+
+/**
+ * identity.5: the supplementary picker keys the default primary group on
+ * gid 100, never on the name `users` (as cr.29b's primary list does): a node
+ * whose gid-100 group is named otherwise offers that name.
+ */
+async function joinableGid100Checks() {
+  const renamed = GROUP_ROWS.map(g => g.gid === 100 ? { ...g, name: 'staff' } : g)
+  const { usersGrid, groupsGrid } = await openUsersView({ ...USER_ROUTES, 'GET /identity/groups': { data: renamed } })
+  created.windows.length = 0
+  findCmp(usersGrid, 'anas-btn-user-add').handler(null)
+  await settle()
+  const win = openWindow()
+  eq('create (identity.5): a gid-100 group named staff is offered by its own name in the supplementary picker',
+    win && win.down('#groups').store.getRange().map(r => r.get('name')), ['alice', 'smbusers', 'adgroup', 'staff'])
+  if (win && !win.destroyed) { win.close() }
+  groupsGrid.selectRow(4)
+  const state = toolbarState(groupsGrid, ['groupMembers', 'groupDelete'])
+  ok('groups (identity.5): the gid-100 row named staff — Members live, Delete dead (keyed by gid)', state.groupMembers.disabled === false && state.groupDelete.disabled === true, JSON.stringify(state))
 }
 
 /**
@@ -10845,6 +10898,7 @@ await disksReadAgeChecks()
 warnings.length = 0
 created.windows.length = 0
 await shareUsersChecks()
+await joinableGid100Checks()
 
 // ============================================================================
 //  SMB Self-service (smbsvc.1) — the Previous Versions row: what the dialog

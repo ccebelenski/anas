@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 import {
   DEFAULT_PRIMARY_GID,
   isExpired,
+  isJoinableGroup,
   isListedGroup,
   isMutableShareId,
   isShareRelevant,
@@ -95,8 +96,24 @@ describe('isListedGroup', () => {
     assert.equal(isListedGroup(27), false) // sudo
     assert.equal(isListedGroup(60001), false)
     assert.equal(isListedGroup(65534), false) // nogroup
-    // Listed is not mutable: the exception never reaches the band test.
+    // Listed is not in the band: the exception never reaches the band test (a delete still refuses it).
     assert.equal(isMutableShareId(DEFAULT_PRIMARY_GID), false)
+  })
+})
+
+describe('isJoinableGroup', () => {
+  it('identity.5 (#78): the share band plus the default primary group (gid 100) — what a share account may belong to; root and the service range stay out', () => {
+    assert.equal(isJoinableGroup(DEFAULT_PRIMARY_GID), true)
+    assert.equal(isJoinableGroup(1000), true)
+    assert.equal(isJoinableGroup(3000), true) // the reporter's `admin` group: a gid, never a name
+    assert.equal(isJoinableGroup(60000), true)
+    assert.equal(isJoinableGroup(0), false) // root
+    assert.equal(isJoinableGroup(27), false) // sudo
+    assert.equal(isJoinableGroup(99), false)
+    assert.equal(isJoinableGroup(101), false)
+    assert.equal(isJoinableGroup(999), false)
+    assert.equal(isJoinableGroup(60001), false)
+    assert.equal(isJoinableGroup(65534), false) // nogroup
   })
 })
 

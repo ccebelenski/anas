@@ -559,10 +559,8 @@ describe('share-identity routes', () => {
       const line = 'media:*:1000:1000:Media User:/home/media:/usr/sbin/nologin\n'
       executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'media'], result: { stdout: line, stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd', 'media'], result: { stdout: line, stderr: '', exitCode: 0 } })
-      // cr.58 (L2): every user verb reads the group database (is media an
-      // administrator?) before the Samba preflight — the same lines the
-      // create test above serves.
-      executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: { stdout: 'root:x:0:\nusers:x:100:\n', stderr: '', exitCode: 0 } })
+      // identity.5: no user verb reads the group database any more (cr.58's
+      // admin-group test is gone), so no `getent group` fixture is needed.
       const res = await app.inject({
         method: 'POST',
         url: '/v1/identity/users/media/smb-password',
@@ -1356,7 +1354,7 @@ describe('share-identity routes', () => {
     const nobodyLine = 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n'
     const SHARE_LINE = 'shareuser:x:1001:100:Share User:/home/shareuser:/usr/sbin/nologin\n'
     const PASSWD = [rootLine.trimEnd(), svcLine.trimEnd(), nobodyLine.trimEnd(), SHARE_LINE.trimEnd(), ''].join('\n')
-    const GROUPS = ['root:x:0:', 'sudo:x:27:', 'users:x:100:', 'sharegrp:x:1002:shareuser', ''].join('\n')
+    const GROUP_LINES = ['root:x:0:', 'sudo:x:27:', 'users:x:100:', 'sharegrp:x:1002:shareuser']
 
     /** Every command that would change the system (pdbedit -x is the carve-out). */
     const MUTATORS = ['/usr/sbin/usermod', '/usr/sbin/userdel', '/usr/sbin/groupdel', '/usr/bin/gpasswd', '/usr/bin/smbpasswd', '/usr/sbin/useradd']
@@ -1364,7 +1362,14 @@ describe('share-identity routes', () => {
       return executor.calls.filter(c => MUTATORS.includes(c.command) || (c.command === '/usr/bin/pdbedit' && c.args[0] === '-x'))
     }
 
-    async function boot(opts: { sharePasswd?: ExecResult[], pdblist?: ExecResult, groupsResult?: ExecResult, userCfg?: string } = {}) {
+    /**
+     * `accounts`: more passwd lines (each also served by name); `groupLines`:
+     * the group database in place of GROUP_LINES (each served by name).
+     */
+    async function boot(opts: { sharePasswd?: ExecResult[], pdblist?: ExecResult, groupsResult?: ExecResult, userCfg?: string, accounts?: string[], groupLines?: string[] } = {}) {
+      const passwdText = `${PASSWD}${(opts.accounts ?? []).map(l => `${l}\n`).join('')}`
+      const groupLines = opts.groupLines ?? GROUP_LINES
+      const groupsText = [...groupLines, ''].join('\n')
       tmpDir = await mkdtemp(join(tmpdir(), 'anas-identity-cr3-'))
       const smbConfPath = join(tmpDir, 'smb.conf')
       writeFileSync(smbConfPath, '[global]\nworkgroup = WORKGROUP\n')
@@ -1377,14 +1382,15 @@ describe('share-identity routes', () => {
       }
       executor = new MockExecutor()
       queue = new JobQueue()
-      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: ok(PASSWD) })
-      executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: opts.groupsResult ?? ok(GROUPS) })
-      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd'], result: ok(PASSWD) })
-      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group'], result: ok(GROUPS) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: ok(passwdText) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group'], result: opts.groupsResult ?? ok(groupsText) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd'], result: ok(passwdText) })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group'], result: ok(groupsText) })
       const userFixtures: Array<[string, string]> = [
         ['root', rootLine],
         ['svcbackup', svcLine],
         ['nobody', nobodyLine],
+        ...(opts.accounts ?? []).map((l): [string, string] => [l.split(':')[0]!, `${l}\n`]),
       ]
       for (const [name, line] of userFixtures) {
         executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', name], result: ok(line) })
@@ -1394,12 +1400,7 @@ describe('share-identity routes', () => {
       executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'shareuser'], results: opts.sharePasswd ?? [ok(SHARE_LINE)] })
       executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd', 'shareuser'], result: ok(SHARE_LINE) })
       executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'newbie'], result: NOT_FOUND })
-      const groupFixtures: Array<[string, string]> = [
-        ['root', 'root:x:0:\n'],
-        ['sudo', 'sudo:x:27:\n'],
-        ['users', 'users:x:100:\n'],
-        ['sharegrp', 'sharegrp:x:1002:shareuser\n'],
-      ]
+      const groupFixtures = groupLines.map((l): [string, string] => [l.split(':')[0]!, `${l}\n`])
       for (const [name, line] of groupFixtures) {
         executor.addFixture({ command: '/usr/bin/getent', args: ['group', name], result: ok(line) })
         executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group', name], result: ok(line) })
@@ -1508,15 +1509,97 @@ describe('share-identity routes', () => {
       assertRefusal(res, 'sudo')
     })
 
-    it('#78: `users` (gid 100) is LISTED yet, like root, refuses a membership edit and a delete — listed is not mutable', async () => {
-      await boot()
+    it('identity.5 (#78): `users` (gid 100) is listed, its membership editable, never deleted — an in-band member is added and removed with gpasswd; the delete still 409s', async () => {
+      await boot({ groupLines: ['root:x:0:', 'sudo:x:27:', 'users:x:100:shareuser', 'sharegrp:x:1002:shareuser'] })
       const list = await app!.inject({ method: 'GET', url: '/v1/identity/groups', headers: IDENTITY_HEADERS })
       assert.deepEqual((list.json() as { data: ShareGroup[] }).data.map(g => g.name).sort(), ['root', 'sharegrp', 'users'])
-      const members = await put('/v1/identity/groups/users/members', { add: ['shareuser'] })
-      assertRefusal(members, 'users')
-      assert.match((members.json() as { error: { message: string } }).error.message, /gid 100/)
-      assertRefusal(await del('/v1/identity/groups/users'), 'users')
-      assert.equal(mutatorCalls().length, 0)
+      // The delete first: still the hard 409, no code, no job, no command.
+      const deleted = await del('/v1/identity/groups/users')
+      assertRefusal(deleted, 'users')
+      assert.match((deleted.json() as { error: { message: string } }).error.message, /gid 100/)
+
+      const added = await put('/v1/identity/groups/users/members', { add: ['shareuser'] })
+      assert.equal(added.statusCode, 202, added.body)
+      assert.equal((await waitForQueueJob((added.json() as JobAccepted).job.id)).status, 'completed')
+      const removed = await put('/v1/identity/groups/users/members', { remove: ['shareuser'] })
+      assert.equal(removed.statusCode, 202, removed.body)
+      assert.equal((await waitForQueueJob((removed.json() as JobAccepted).job.id)).status, 'completed')
+      assert.deepEqual(mutatorCalls().map(c => [c.command, ...c.args]), [
+        ['/usr/bin/gpasswd', '-a', 'shareuser', 'users'],
+        ['/usr/bin/gpasswd', '-d', 'shareuser', 'users'],
+      ])
+    })
+
+    it('identity.5: the `users` Members door still refuses an out-of-band member (root) and a @pam login; root\'s own Members door (gid 0) and delete stay refused', async () => {
+      await boot({ userCfg: 'user:shareuser@pam:1:0:::::,,,\n' })
+      const rootMember = await put('/v1/identity/groups/users/members', { add: ['root'] })
+      assertRefusal(rootMember, 'root')
+      assert.match((rootMember.json() as { error: { message: string } }).error.message, /^User 'root' \(uid 0\) is a system account\..* It cannot be added to group 'users' here\.$/)
+      const pamMember = await put('/v1/identity/groups/users/members', { add: ['shareuser'] })
+      assertRefusal(pamMember, 'shareuser')
+      assert.match((pamMember.json() as { error: { message: string } }).error.message, /it is a Proxmox VE login \('shareuser@pam'\)\..* It cannot be added to group 'users' here\.$/)
+      const rootGroup = await put('/v1/identity/groups/root/members', { add: ['svcbackup'] })
+      assertRefusal(rootGroup, 'root')
+      assert.match((rootGroup.json() as { error: { message: string } }).error.message, /^Group 'root' \(gid 0\) is a system account/)
+      assertRefusal(await del('/v1/identity/groups/root'), 'root')
+    })
+
+    it('identity.5 (#78): create with `groups: [\'users\']` runs useradd with -G users, as the primary group is taken', async () => {
+      await boot()
+      // An explicit uid: the id is not walked for files, so the create needs
+      // only the by-number lookups (nothing holds 1500).
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', '1500'], result: NOT_FOUND })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['group', '1500'], result: NOT_FOUND })
+      const res = await post('/v1/identity/users', { name: 'newbie', uid: 1500, groups: ['users'] })
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.deepEqual(find(executor.calls, '/usr/sbin/useradd', () => true), ['-N', '-M', '-s', '/usr/sbin/nologin', '-u', '1500', '-G', 'users', 'newbie'])
+    })
+
+    it('identity.5: create with `groups: [\'root\']` still 409s SYSTEM_ACCOUNT naming root (gid 0) — `users` beside it is not named; no useradd', async () => {
+      await boot()
+      const res = await post('/v1/identity/users', { name: 'newbie', groups: ['users', 'root'] })
+      assert.equal(res.statusCode, 409, res.body)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'SYSTEM_ACCOUNT')
+      assert.equal(error.message, `Group(s) 'root' (gid 0) are system groups. System accounts (uid/gid below 1000 or above 60000) are managed outside ANAS; the default primary group (gid 100) is the one exception.`)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
+      assert.equal(queue.list().length, 0)
+      assert.equal(executor.calls.some(c => c.command === '/usr/sbin/useradd'), false)
+    })
+
+    it('identity.5 (#78, the reporter\'s shape): a user whose primary group is an in-band group named `admin` and who is listed in sudo is a share account — disable, enable, SMB password, delete and both Members doors run', async () => {
+      const CHRIS = 'chris:x:1010:3000::/home/chris:/usr/sbin/nologin'
+      const DANA = 'dana:x:1011:100::/home/dana:/usr/sbin/nologin'
+      await boot({
+        accounts: [CHRIS, DANA],
+        groupLines: ['root:x:0:', 'sudo:x:27:chris', 'users:x:100:', 'admin:x:3000:dana', 'sharegrp:x:1002:shareuser'],
+        pdblist: ok('chris:1010:\n'),
+      })
+      for (const [req, act] of [
+        [() => put('/v1/identity/users/chris', { enabled: false }), ['/usr/sbin/usermod', '--expiredate', '1', 'chris']],
+        [() => put('/v1/identity/users/chris', { enabled: true }), ['/usr/sbin/usermod', '--expiredate', '', 'chris']],
+        [() => post('/v1/identity/users/chris/smb-password', { password: 'hunter2' }), ['/usr/bin/smbpasswd', '-a', '-s', 'chris']],
+        // The reporter's re-group: the `admin` group's own Members door, and chris into a band group.
+        [() => put('/v1/identity/groups/admin/members', { add: ['shareuser'], remove: ['dana'] }), ['/usr/bin/gpasswd', '-d', 'dana', 'admin']],
+        [() => put('/v1/identity/groups/sharegrp/members', { add: ['chris'] }), ['/usr/bin/gpasswd', '-a', 'chris', 'sharegrp']],
+      ] as const) {
+        const res = await req()
+        assert.equal(res.statusCode, 202, res.body)
+        const job = await waitForQueueJob((res.json() as JobAccepted).job.id)
+        assert.equal(job.status, 'completed', JSON.stringify(job.error))
+        assert.ok(mutatorCalls().some(c => [c.command, ...c.args].join(' ') === act.join(' ')), `${act.join(' ')} ran`)
+      }
+      assert.ok(mutatorCalls().some(c => [c.command, ...c.args].join(' ') === '/usr/bin/gpasswd -a shareuser admin'))
+
+      const challenged = await del('/v1/identity/users/chris')
+      assert.equal(challenged.statusCode, 409, challenged.body)
+      assert.equal((challenged.json() as { error: { code: string } }).error.code, 'CONFIRMATION_REQUIRED')
+      const confirmed = await del('/v1/identity/users/chris', challenged.headers['x-anas-confirm-code'] as string)
+      assert.equal(confirmed.statusCode, 202, confirmed.body)
+      assert.equal((await waitForQueueJob((confirmed.json() as JobAccepted).job.id)).status, 'completed')
+      assert.deepEqual(find(executor.calls, '/usr/sbin/userdel', () => true), ['chris'])
     })
 
     it('create with a system group in `groups` refuses naming the group, no useradd', async () => {
@@ -1604,14 +1687,25 @@ describe('share-identity routes', () => {
       assert.deepEqual(find(executor.calls, '/usr/bin/smbpasswd', () => true), ['-d', 'shareuser'])
     })
 
-    it('cr.58r P2: a getent group that exits non-zero with PARTIAL output is unreadable — 503, not "not an admin"', async () => {
+    it('cr.58r P2 (identity.5 re-pinned): a getent group that exits non-zero with PARTIAL output is unreadable where it is still read — a create 503s; the disable reads no group listing and runs', async () => {
       // The review's EXTRA1 shape: the sudo line cut off mid-members-list.
+      // identity.5: membership is no longer a system-account criterion, so
+      // the user verbs never read the listing; a create's uid pick does.
       await boot({ groupsResult: { stdout: 'root:x:0:\nsudo:x:27:shareuse', stderr: '', exitCode: 1 } })
-      const res = await put('/v1/identity/users/shareuser', { enabled: false })
-      assert.equal(res.statusCode, 503, res.body)
-      assert.equal((res.json() as { error: { code: string } }).error.code, 'UNAVAILABLE')
-      assert.match((res.json() as { error: { message: string } }).error.message, /could not read the group database \(getent group\)/)
+      const create = await post('/v1/identity/users', { name: 'newbie' })
+      assert.equal(create.statusCode, 503, create.body)
+      assert.equal((create.json() as { error: { code: string } }).error.code, 'UNAVAILABLE')
+      assert.match((create.json() as { error: { message: string } }).error.message, /could not read the group database \(getent group\)/)
       assert.deepEqual(mutatorCalls(), [])
+
+      const listings = () => executor.calls.filter(c => c.command === '/usr/bin/getent' && ['group', '-s files group'].includes(c.args.join(' '))).length
+      const before = listings()
+      assert.ok(before > 0, 'the create read the listing')
+      const res = await put('/v1/identity/users/shareuser', { enabled: false })
+      assert.equal(res.statusCode, 202, res.body)
+      assert.equal((await waitForQueueJob((res.json() as JobAccepted).job.id)).status, 'completed')
+      assert.deepEqual(find(executor.calls, '/usr/sbin/usermod', () => true), ['--expiredate', '1', 'shareuser'])
+      assert.equal(listings(), before, 'the disable (route and job) read no group listing')
     })
 
     it('cr.58r P4: create refuses a name that is a @pam login in user.cfg with no unix account — 409 SYSTEM_ACCOUNT, no useradd', async () => {
