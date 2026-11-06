@@ -1366,6 +1366,11 @@ function skippedBody(skipped: { band: string, reason: string }[]): string {
   }\nThe unchecked bands have no verdict from this scrub. Run Scrub again once the cause has passed.`
 }
 
+/** First line of an error's message, for progress lines and verdict sentences. */
+function firstErrorLine(err: unknown): string {
+  return (err instanceof Error ? err.message : String(err)).trim().split('\n')[0] ?? ''
+}
+
 /** One btrfs scrub pass over a filesystem — the scrub's phase 2, on its own. */
 export interface BtrfsScrubPass {
   /**
@@ -1398,19 +1403,98 @@ export async function btrfsScrubPass(
   pollIntervalMs: number,
 ): Promise<BtrfsScrubPass> {
   const startedAt = new Date()
-  await run(executor, BTRFS, ['scrub', 'start', mountpoint])
+  // scrub.r1 (#81): `-B` keeps `btrfs scrub start` in the FOREGROUND for the
+  // whole pass. Without it btrfs-progs forks a background child that keeps the
+  // parent's pipes and process group (no setsid, no stdio redirect): the
+  // command returns at once but the executor waits for the pipes, the 300 s
+  // job deadline (cr.34) signals the group at its expiry, the signal reaches
+  // the scrub child, and every pool whose checksum pass takes over five
+  // minutes ends `interrupted` at exactly 300 s. With `-B` the command
+  // OUTLIVING the budget is the normal case, so it runs with no deadline at
+  // all, and `btrfs scrub status` is polled BESIDE it for progress only —
+  // the pass ends when the COMMAND returns, never when a poll reads
+  // `finished` while the child is still up.
+  let commandSettled = false
+  let spawnError: unknown
+  const pass = executor.exec(BTRFS, ['scrub', 'start', '-B', mountpoint], {
+    timeoutMs: null,
+    longRunning: 'btrfs scrub: a verify pass over the whole filesystem, hours to days on a large pool',
+  })
+  pass.then(
+    () => { commandSettled = true },
+    (err: unknown) => {
+      spawnError = err
+      commandSettled = true
+    },
+  )
   for (;;) {
-    const st = parseBtrfsScrubStatus((await run(executor, BTRFS, ['scrub', 'status', mountpoint])).stdout)
-    if (st.status === 'running') {
-      updateProgress(`btrfs scrub running${st.percent !== null ? ` (${st.percent.toFixed(1)}%)` : ''}`)
-      await sleep(pollIntervalMs)
-      continue
+    if (commandSettled)
+      break
+    // The poll is for PROGRESS ONLY (#81): a status read that fails — a
+    // transient ioctl error, a status file that will not open, a read that
+    // hangs to the lane deadline — must never decide the pass's verdict. A
+    // throw here failed the job while the `-B` child kept reading the array
+    // with nobody holding it (the story ships no cancel hook), and let a
+    // retry start a second scrub beside the first. Say so on the progress
+    // line, sleep the interval like any other poll, keep waiting for the
+    // COMMAND — the verdict comes from the final read below.
+    try {
+      const st = parseBtrfsScrubStatus((await run(executor, BTRFS, ['scrub', 'status', mountpoint])).stdout)
+      if (st.status === 'running')
+        updateProgress(`btrfs scrub running${st.percent !== null ? ` (${st.percent.toFixed(1)}%)` : ''}`)
     }
-    if (st.status === 'aborted')
-      throw new Error(`btrfs scrub on '${label}' was aborted${isCleanSummary(st.errorSummary) ? '' : ` (${st.errorSummary})`}`)
-    // finished — or no Status line at all (nothing to report): done either way.
-    return { startedAt, btrfsErrors: isCleanSummary(st.errorSummary) ? null : st.errorSummary }
+    catch (err) {
+      updateProgress(`btrfs scrub running (status unreadable: ${firstErrorLine(err)})`)
+    }
+    // A fast pass can settle DURING the poll — then the verdict read follows
+    // immediately; sleeping a full interval first only delays the job.
+    if (commandSettled)
+      break
+    await sleep(pollIntervalMs)
   }
+  // The exec promise REJECTS only when the process could not start (ENOENT,
+  // EACCES) — there is no deadline to fire any more. That is a failure, and
+  // it is reported with the SPAWN error's own message even when the status
+  // read fails too (the ordinary consequence of the same cause: btrfs missing
+  // means ENOENT on both calls) — the loop above can no longer throw past
+  // this check.
+  if (spawnError !== undefined)
+    throw spawnError instanceof Error ? spawnError : new Error(String(spawnError))
+  // Verdict from ONE final read — RETRIED while it lags (#81): the status
+  // file can still read `running` for a moment after `-B` returned, and a
+  // read that throws would lose the verdict of a scrub that finished fine.
+  // Up to 3 attempts, one pollIntervalMs apart, while the read throws or
+  // says `running`; whatever the LAST attempt produced is the verdict, under
+  // the existing rules. The exit code is NOT the verdict: btrfs-progs exits
+  // non-zero when the pass FINISHED WITH ERRORS, which is a finding for
+  // phase 2's attribution, not a failure.
+  const verdictAttempts = 3
+  let attemptResult: { verdict?: BtrfsScrubStatus, error?: unknown } = {}
+  for (let attempt = 1; attempt <= verdictAttempts; attempt++) {
+    try {
+      const v = parseBtrfsScrubStatus((await run(executor, BTRFS, ['scrub', 'status', mountpoint])).stdout)
+      attemptResult = { verdict: v }
+      if (v.status !== 'running')
+        break
+    }
+    catch (err) {
+      attemptResult = { error: err }
+    }
+    if (attempt < verdictAttempts)
+      await sleep(pollIntervalMs)
+  }
+  if (attemptResult.verdict === undefined)
+    throw new Error(`btrfs scrub on '${label}' finished but its status could not be read: ${firstErrorLine(attemptResult.error)}`)
+  const verdict = attemptResult.verdict
+  if (verdict.status === 'aborted')
+    throw new Error(`btrfs scrub on '${label}' was aborted${isCleanSummary(verdict.errorSummary) ? '' : ` (${verdict.errorSummary})`}`)
+  // finished — or no Status line at all (nothing to report): done either way.
+  if (verdict.status === 'finished' || verdict.status === null)
+    return { startedAt, btrfsErrors: isCleanSummary(verdict.errorSummary) ? null : verdict.errorSummary }
+  // The command returned but the pass has no verdict (scrub.r1): a signal
+  // reached the child some other way, it crashed, or the status says
+  // something we do not know — the pass is NOT complete, say so plainly.
+  throw new Error(`btrfs scrub on '${label}' ended without finishing (status: ${verdict.status})`)
 }
 
 /**

@@ -13,6 +13,7 @@ import {
   AHR_SCRUB_FINDINGS_CAP,
   AHR_SCRUB_JOURNAL_LINE_CAP,
   attributeScrubErrors,
+  btrfsScrubPass,
   correctedReadsFromMessages,
   countErrorSummary,
   findingPath,
@@ -230,10 +231,46 @@ function probeArgs(path: string, block: number): string[] {
   return [`if=${path}`, 'iflag=direct', 'bs=4096', `skip=${block}`, 'count=1', 'of=/dev/null', 'status=none']
 }
 
+/** How many `btrfs scrub status` reads the call log has recorded so far. */
+function statusPolls(executor: MockExecutor): number {
+  return executor.calls.filter(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'status').length
+}
+
+/** Wait (1 ms steps — the tests' own poll cadence) until `predicate` holds. */
+async function until(predicate: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 5000; i++) {
+    if (predicate())
+      return
+    await new Promise(r => setTimeout(r, 1))
+  }
+  throw new Error(`timed out waiting for ${what}`)
+}
+
+/**
+ * scrub.r1 (#81): `btrfs scrub start -B` is a LIVE child — the pass ends when
+ * the COMMAND returns, not when a poll reads `finished`. Every test that
+ * drives a real phase 2 hands its pass promise here: once the status poll
+ * BESIDE the child has recorded two reads, `finishLive` ends the child (the
+ * command exits 0), and the pass is awaited. Two polls is the shape the order
+ * asserts check: at least one status read while the child is open, the final
+ * read after it settled. A scrub that refuses or fails BEFORE phase 2 never
+ * spawns the child — if the pass settles first, `finishLive` ends nothing
+ * and the pass is returned with its own result or rejection.
+ */
+async function liveScrubPass<T>(executor: MockExecutor, pass: Promise<T>): Promise<T> {
+  const passSettledFirst = Symbol('pass settled first')
+  await Promise.race([
+    pass.then(() => passSettledFirst, () => passSettledFirst),
+    until(() => statusPolls(executor) >= 2, 'two btrfs scrub status polls beside the live child'),
+  ])
+  executor.finishLive()
+  return pass
+}
+
 describe('scrubAhrPool (Epic 11 + AHR)', () => {
   it('runs btrfs scrub to completion, THEN per-array checks sequentially; clean → silent', async () => {
     const executor = cleanCounters(baseExecutor(), 'md127', 'md126')
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], results: [
       { stdout: scrubStatus('running', { percent: '42.50' }), stderr: '', exitCode: 0 },
       { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 },
@@ -247,7 +284,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     ] })
 
     const progress: string[] = []
-    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     // D8: checkedArrays counts bands ACTUALLY checked, and the record names them.
     assert.deepEqual(result, { scrubbed: 't2', btrfsErrors: null, checkedArrays: 2, bandsChecked: ['t2-r1', 't2-r2'] })
 
@@ -284,7 +321,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
   // mismatching band; phase 2 proceeds either way.
   it('phase 1 rot: a mismatch_cnt > 0 warns before phase 2 starts — and phase 2 still runs', async () => {
     const executor = cleanCounters(baseExecutor(), 'md126')
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], results: [
       { stdout: mdstat([{ kernel: 'md127', checkPercent: 10 }, { kernel: 'md126' }]), stderr: '', exitCode: 0 },
@@ -295,7 +332,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     // md counted 8 parity mismatches on r1; r2 came back clean.
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/mismatch_cnt'], result: { stdout: '8\n', stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.btrfsErrors, null, 'checksums can be clean while parity rots — both stories are told')
     // D1: the mismatch rides the result, and the band counts as checked.
     assert.deepEqual(result.parityMismatches, [{ band: 't2-r1', bandIndex: 1, array: '/dev/md/t2-r1', mismatchCnt: 8, level: 'raid1' }])
@@ -340,14 +377,14 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
 
   it('every mismatching band warns; an unreadable counter warns about nothing', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/mismatch_cnt'], result: { stdout: '3\n', stderr: '', exitCode: 0 } })
     // md126's counter unreadable — fail-open to silence, never a false "rot".
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md126/md/mismatch_cnt'], result: { stdout: '', stderr: 'No such file', exitCode: 1 } })
 
-    await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     const warns = executor.calls.filter(c => c.command === '/usr/bin/perl')
     // The per-band warning plus the parity-only closing notification (phase 2
     // was clean), both about t2-r1 only.
@@ -376,7 +413,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
   // point-of-use and ignore the route-time value.
   it('ignores a STALE route-time array.kernelName — resolves fresh via the pin symlink', async () => {
     const executor = cleanCounters(baseExecutor(), 'md127', 'md126')
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     // r1's check runs one poll then finishes; then r2's. The realpath fixtures
     // (baseExecutor) map t2-r1→md127, t2-r2→md126 — the ONLY correct handles.
@@ -394,7 +431,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     stale.arrays[0].kernelName = 'md0'
     stale.arrays[1].kernelName = 'md1'
 
-    const result = await scrubAhrPool(executor, stale, () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, stale, () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.checkedArrays, 2)
 
     const calls = executor.calls
@@ -411,14 +448,14 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
 
   it('btrfs findings → PVE warning notification', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=2' }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     // A journal with nothing in the window: the count still notifies, and the
     // body says so rather than printing an empty file list (selfheal.3).
     executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: '', stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.btrfsErrors, 'csum=2')
     assert.equal(result.errorsReported, 2)
     assert.deepEqual(result.findings, [])
@@ -437,7 +474,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
   // breaking the strictly-sequential guarantee (§4).
   it('treats a resync=PENDING md check as in-flight — waits it out before the next band', async () => {
     const executor = cleanCounters(baseExecutor(), 'md127', 'md126')
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
 
     // md127's check parks as PENDING first, then runs, then finishes; only then
@@ -462,7 +499,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
       { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 }, // r2 done
     ] })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.checkedArrays, 2)
 
     const calls = executor.calls
@@ -484,7 +521,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
    */
   it('waits for the check to START before waiting for it to finish', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     // mdstat never shows the check at all (the poll that lands between the
     // kernel starting and finishing it is the case this guards).
@@ -498,7 +535,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     ] })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/mismatch_cnt'], result: { stdout: '8\n', stderr: '', exitCode: 0 } })
 
-    await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 500 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 500 }))
 
     const calls = executor.calls
     const actionReads = calls.map((c, i) => (c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/sync_action' ? i : -1)).filter(i => i >= 0)
@@ -516,7 +553,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
 
   it('records a band whose check md NEVER started, and reads no stale counter for it', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     // md stays idle: it never took the check.
@@ -525,7 +562,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/mismatch_cnt'], result: { stdout: '8\n', stderr: '', exitCode: 0 } })
 
     const progress: string[] = []
-    await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
 
     // The pre-issue snapshot is read (T2 needs it); nothing is read AFTER the
     // check was issued, so no number is ever taken as this band's verdict.
@@ -561,7 +598,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
    */
   it('a check that finished before the first poll is not "never started" — its MOVED counter is the verdict', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     // The band is a tiny one: mdstat never names a check and sysfs reads idle
     // from the very first poll — the check is over before anything looks.
@@ -580,7 +617,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     ] })
 
     const progress: string[] = []
-    await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
 
     const calls = executor.calls
     const priorRead = calls.findIndex(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/last_sync_action')
@@ -615,7 +652,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
    */
   it('a check that aborted (idle + a persistent last_sync_action=check, counter unmoved) is UNKNOWN, not a verdict', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'idle\n', stderr: '', exitCode: 0 } })
@@ -625,7 +662,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '8\n', stderr: '', exitCode: 0 } })
 
     const progress: string[] = []
-    await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
 
     assert.ok(
       progress.some(m => m.startsWith('check state unknown on t2-r1. Not counted')),
@@ -648,7 +685,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
    */
   it('a genuine fast check whose counter was ZEROED is counted — and reported clean', async () => {
     const executor = cleanCounters(baseExecutor(), 'md126')
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'idle\n', stderr: '', exitCode: 0 } })
@@ -659,7 +696,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     ] })
 
     const progress: string[] = []
-    await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
 
     assert.ok(progress.some(m => m.includes('finished before the first poll') && m.includes('counter moved from 8 to 0')), progress.join(' | '))
     assert.ok(!progress.some(m => m.includes('check state unknown')), progress.join(' | '))
@@ -684,7 +721,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
   for (const takeover of ['frozen', 'recover'] as const) {
     it(`stops waiting on a band whose check became '${takeover}', and checks the next band`, async () => {
       const executor = cleanCounters(baseExecutor(), 'md126')
-      executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
       executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
       // Idle at the PRE-ISSUE read (S3), our check starts, then md is doing
@@ -698,7 +735,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
       executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '8\n', stderr: '', exitCode: 0 } })
 
       const progress: string[] = []
-      const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+      const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
 
       assert.equal(result.btrfsErrors, null)
       assert.deepEqual(
@@ -742,7 +779,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
    */
   it('a frozen band that refuses idle is said so — the scrub carries on', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], results: [
@@ -756,7 +793,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--action=idle', '/dev/md/t2-r1'], result: { stdout: '', stderr: 'mdadm: failed to set action for /dev/md/t2-r1: Device or resource busy', exitCode: 1 } })
 
     const progress: string[] = []
-    await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
 
     assert.ok(
       progress.some(m => m.includes('could not drop this scrub\'s check on t2-r1') && m.includes('may still run when it thaws')),
@@ -769,7 +806,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
 
   it('a long check is waited out — polled for as long as md says `check`, then the counter', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], results: [
       ...Array.from({ length: 13 }).fill({ stdout: mdstat([{ kernel: 'md127', checkPercent: 3 }, { kernel: 'md126' }]), stderr: '', exitCode: 0 }) as ExecResult[],
@@ -784,7 +821,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '0\n', stderr: '', exitCode: 0 } })
 
     const progress: string[] = []
-    await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
 
     const actionReads = executor.calls.filter(c => c.command === '/usr/bin/cat' && c.args[0] === '/sys/block/md127/md/sync_action').length
     assert.ok(actionReads >= 12, `the check was polled through, not cut short (saw ${actionReads} reads)`)
@@ -795,7 +832,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
 
   it('the absolute ceiling is the last resort — a band that never goes idle stops being waited on', async () => {
     const executor = cleanCounters(baseExecutor(), 'md126')
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127', checkPercent: 1 }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     // Idle at the pre-issue read (S3), then md says `check` for ever — the one
@@ -808,7 +845,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '8\n', stderr: '', exitCode: 0 } })
 
     const progress: string[] = []
-    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20, checkFinishCeilingMs: 5 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20, checkFinishCeilingMs: 5 }))
 
     assert.equal(result.checkedArrays, 1, 't2-r1 was abandoned — it is not coverage')
     assert.deepEqual(result.bandsSkipped, [{ band: 't2-r1', reason: 'still not idle after the 5ms ceiling: the check may still be running' }])
@@ -847,7 +884,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/md/t2-r1'], result: { stdout: '', stderr: 'realpath: No such file or directory', exitCode: 1 } })
     executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/md/t2-r2'], result: { stdout: '/dev/md126\n', stderr: '', exitCode: 0 } })
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -856,7 +893,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     executor.addFixture({ command: '/usr/bin/cat', result: { stdout: mdstat([]), stderr: '', exitCode: 0 } })
 
     const progress: string[] = []
-    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
 
     assert.ok(
       progress.includes('Cannot resolve /dev/md/t2-r1 to a kernel device. Not waiting on its check'),
@@ -890,14 +927,14 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
    */
   it('does not ISSUE a check on a band md is already recovering — it skips it', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     // A member failed between the route's read and this band's turn.
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'recover\n', stderr: '', exitCode: 0 } })
 
     const progress: string[] = []
-    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
 
     assert.ok(
       progress.includes('t2-r1 was not checked. md is running recover on that band, and a parity check would fight it'),
@@ -921,12 +958,12 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/md/t2-r1'], result: { stdout: '/dev/md127\n', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/md/t2-r2'], result: { stdout: '/dev/md126\n', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', result: { stdout: mdstat([]), stderr: '', exitCode: 0 } })
 
     const progress: string[] = []
-    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
 
     assert.ok(
       progress.some(m => m.startsWith('t2-r1 was not checked (mdadm --action=check exited 1')),
@@ -954,14 +991,14 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
 
     try {
       const executor = baseExecutor()
-      executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
       executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'idle\n', stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '0\n', stderr: '', exitCode: 0 } })
 
       const progress: string[] = []
-      await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+      await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
 
       const widened = progress.findIndex(m => m.includes('t2-r1: sync window was bounded to 6272..6400') && m.includes('restored to 0..max'))
       assert.ok(widened >= 0, progress.join(' | '))
@@ -987,6 +1024,200 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     const executor = baseExecutor()
     await assert.rejects(scrubAhrPool(executor, pool('/dev/t2/t2-vol'), () => {}), /not mounted/)
     assert.equal(executor.calls.length, 0)
+  })
+})
+
+/**
+ * scrub.r1 (#81) — the pass outlives the command deadline on purpose.
+ *
+ * `btrfs scrub start -B` is ONE foreground command for the whole checksum
+ * pass: it runs with NO deadline (a days-long verify on a big pool), the
+ * status poll runs BESIDE it for progress only, and the verdict comes from
+ * ONE final status read AFTER the command returned. These drive
+ * `btrfsScrubPass` directly — that is the unit both callers (the scrub's
+ * phase 2 and the parity rewrite) share.
+ */
+describe('btrfsScrubPass — the blocking start (scrub.r1)', () => {
+  it('phase 2 holds `btrfs scrub start -B` open with NO deadline and polls status beside it', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], results: [
+      { stdout: scrubStatus('running', { percent: '42.50' }), stderr: '', exitCode: 0 },
+      { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 },
+    ] })
+
+    const progress: string[] = []
+    const pass = btrfsScrubPass(executor, MOUNTPOINT, 't2', m => progress.push(m), 1)
+    // The boundary is the test's OWN clock: the moment two status polls are
+    // logged AND the percentage line was reported, the child is still open
+    // (finishLive has not run) — everything before is "while it was live".
+    let boundary = -1
+    await until(() => {
+      if (statusPolls(executor) >= 2 && progress.some(m => m.includes('42.5'))) {
+        boundary = executor.calls.length
+        return true
+      }
+      return false
+    }, 'two status polls and a percentage progress line beside the live child')
+    const progressWhileLive = progress.filter(m => m === 'btrfs scrub running (42.5%)').length
+    executor.finishLive()
+    const result = await pass
+
+    assert.equal(result.btrfsErrors, null)
+    assert.ok(result.startedAt instanceof Date)
+    // The start call carries NO deadline and names the reason (cr.34).
+    const startDeadline = executor.deadlines.find(d => d.command === '/usr/bin/btrfs' && d.args[1] === 'start')
+    assert.equal(startDeadline?.budgetMs, null, 'the blocking start runs with no deadline')
+    assert.equal(startDeadline?.source, 'call')
+    assert.match(startDeadline?.longRunning ?? '', /^btrfs scrub: /)
+    // A progress line with a percentage was reported WHILE the command lived.
+    assert.ok(progressWhileLive >= 1, progress.join(' | '))
+    // Order from the call log: at least one status poll was recorded BEFORE
+    // the child was ended, and the final read came AFTER — the pass ends on
+    // the command, not on a poll.
+    const statuses = executor.calls
+      .map((c, i) => (c.command === '/usr/bin/btrfs' && c.args[1] === 'status' ? i : -1))
+      .filter(i => i >= 0)
+    assert.ok(statuses.some(i => i < boundary), 'a status poll ran beside the live command')
+    assert.ok(statuses.some(i => i >= boundary), 'the final status read followed the command')
+    assert.equal(statuses.filter(i => i >= boundary).length, 1, 'exactly ONE status read after settlement')
+  })
+
+  it('a non-zero exit from the blocking start with a `finished` status is a finding, not a failure', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
+
+    const pass = btrfsScrubPass(executor, MOUNTPOINT, 't2', () => {}, 1)
+    await until(() => statusPolls(executor) >= 1, 'a status poll beside the live child')
+    // btrfs-progs exits non-zero when the pass FINISHED WITH ERRORS — the
+    // verdict is the final status, the exit code is noise.
+    executor.finishLive({ stdout: '', stderr: 'ERROR: there are uncorrectable errors', exitCode: 3 })
+    const result = await pass
+    assert.equal(result.btrfsErrors, 'csum=1', 'the Error summary rides the result for phase 2 attribution')
+  })
+
+  it('a status that is neither finished nor aborted after the command returned is a failure', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('interrupted'), stderr: '', exitCode: 0 } })
+
+    const pass = btrfsScrubPass(executor, MOUNTPOINT, 't2', () => {}, 1)
+    await until(() => executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start'), 'the start call')
+    // The command returned (cleanly) but the kernel never finished the pass —
+    // the #81 shape: `scrub: not finished on devid 1 with status: -4`.
+    executor.finishLive()
+    await assert.rejects(pass, /btrfs scrub on 't2' ended without finishing \(status: interrupted\)/)
+  })
+
+  it('the aborted status still fails the pass with its existing sentence', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('aborted', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
+
+    const pass = btrfsScrubPass(executor, MOUNTPOINT, 't2', () => {}, 1)
+    await until(() => executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start'), 'the start call')
+    executor.finishLive()
+    await assert.rejects(pass, /btrfs scrub on 't2' was aborted \(csum=1\)/)
+  })
+
+  // The review of #81 (probe 1): one transient `btrfs scrub status` failure
+  // must not fail the JOB while the `-B` child is still reading the array —
+  // nothing ends that child (no cancel hook), so the job record said "failed"
+  // beside a live scrub and a retry could start a second one beside it.
+  it('a failing status poll is progress, not a verdict: the pass keeps waiting for the command', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], results: [
+      { stdout: '', stderr: 'ERROR: cannot open scrub status', exitCode: 1 },
+      { stdout: scrubStatus('running', { percent: '42.50' }), stderr: '', exitCode: 0 },
+      { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 },
+    ] })
+
+    let settled = false
+    const markSettled = (): void => {
+      settled = true
+    }
+    const progress: string[] = []
+    const pass = btrfsScrubPass(executor, MOUNTPOINT, 't2', m => progress.push(m), 1)
+    pass.then(markSettled, markSettled)
+    // The FIRST poll fails (run() throws on exit 1) — the pass reports it on
+    // the progress line and STAYS PENDING beside the live child.
+    await until(() => progress.some(m => m.includes('status unreadable')), 'a `status unreadable` progress line')
+    assert.equal(settled, false, 'a failing status poll does not settle the pass')
+    assert.ok(
+      progress.includes('btrfs scrub running (status unreadable: ERROR: cannot open scrub status)'),
+      progress.join(' | '),
+    )
+    // And polling continues on the normal interval (a failing poll does not
+    // spin): the next read is an ordinary progress line, the pass STILL waits
+    // for the command.
+    await until(() => progress.includes('btrfs scrub running (42.5%)'), 'the next (successful) progress poll')
+    assert.equal(settled, false, 'the pass waits for the COMMAND, not for a poll')
+    executor.finishLive()
+    const result = await pass
+    assert.equal(result.btrfsErrors, null)
+  })
+
+  // Probe 2: when the exec rejects AND the status read fails too — the
+  // ordinary consequence of the SAME cause (btrfs missing: ENOENT on the
+  // start, no fixture → exit 127 on the status) — the pass must throw the
+  // SPAWN error, with its message, not the status read's.
+  it('a spawn failure throws the spawn error even when the status read fails too', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], throws: new Error('ENOENT: no such file or directory, spawn /usr/bin/btrfs') })
+    // NO status fixture — the mock answers every status read with its
+    // exit-127 "command not found" fallback, as the real ENOENT would.
+
+    const pass = btrfsScrubPass(executor, MOUNTPOINT, 't2', () => {}, 1)
+    await assert.rejects(pass, /spawn|ENOENT|EACCES/)
+    const err = await pass.then(() => null, (e: unknown) => e)
+    assert.ok(err instanceof Error)
+    assert.ok(
+      !err.message.includes('command not found'),
+      `the STATUS error surfaced instead of the spawn error: ${err.message}`,
+    )
+  })
+
+  // Probe 3 (POSSIBLE): a status file that still reads `running` in the
+  // instant after `-B` returned must not fail a clean multi-hour pass.
+  it('the verdict read retries a lagging `running` status before giving up', async () => {
+    const lagging = new MockExecutor()
+    lagging.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
+    lagging.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], results: [
+      { stdout: scrubStatus('running', { percent: '99.90' }), stderr: '', exitCode: 0 },
+      { stdout: scrubStatus('running'), stderr: '', exitCode: 0 },
+      { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 },
+    ] })
+    const laggingPass = btrfsScrubPass(lagging, MOUNTPOINT, 't2', () => {}, 1)
+    await until(() => statusPolls(lagging) >= 1, 'the first status poll beside the live child')
+    lagging.finishLive()
+    const result = await laggingPass
+    assert.equal(result.btrfsErrors, null)
+    assert.ok(statusPolls(lagging) >= 3, `the lagging verdict was not retried — ${statusPolls(lagging)} status reads`)
+
+    // A status that never leaves `running` exhausts the three attempts and
+    // fails with the EXISTING sentence.
+    const stuck = new MockExecutor()
+    stuck.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
+    stuck.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('running'), stderr: '', exitCode: 0 } })
+    const stuckPass = btrfsScrubPass(stuck, MOUNTPOINT, 't2', () => {}, 1)
+    await until(() => statusPolls(stuck) >= 1, 'the first status poll beside the live child')
+    stuck.finishLive()
+    await assert.rejects(stuckPass, /btrfs scrub on 't2' ended without finishing \(status: running\)/)
+  })
+
+  // Probe 3 (NOTICED): the scrub finished and only the VERDICT read fails —
+  // say so, instead of failing the pass with the status command's stderr.
+  it('a verdict read that keeps throwing says the status could not be read', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: '', stderr: 'ERROR: cannot open scrub status', exitCode: 1 } })
+
+    const pass = btrfsScrubPass(executor, MOUNTPOINT, 't2', () => {}, 1)
+    await until(() => statusPolls(executor) >= 1, 'the first status poll beside the live child')
+    executor.finishLive()
+    await assert.rejects(pass, /btrfs scrub on 't2' finished but its status could not be read: ERROR: cannot open scrub status/)
   })
 })
 
@@ -1218,7 +1449,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     if (journalResults)
       executor.addFixture({ command: '/usr/bin/journalctl', results: journalResults })
     executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real', MOUNTPOINT], result: { stdout: findmnt('/@data'), stderr: '', exitCode: 0 } })
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=2' }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal([...GT3_LINES, ...GT6_LINES]), stderr: '', exitCode: 0 } })
@@ -1258,7 +1489,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     bothPresent(executor)
     badBlock300(executor)
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
 
     assert.equal(result.errorsReported, 2)
     assert.equal(result.errorsAttributed, 2)
@@ -1305,7 +1536,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     bothPresent(executor)
     badBlock300(executor)
 
-    await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
 
     const notifies = executor.calls.filter(c => c.command === '/usr/bin/perl')
     assert.equal(notifies.length, 1, 'one event, one notification')
@@ -1321,7 +1552,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     executor.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', F1], result: { stdout: '4194304\n', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', F2], result: { stdout: '', stderr: 'No such file or directory', exitCode: 1 } })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.findings?.[1].missing, true)
     assert.deepEqual(result.findings?.[1].badBlocks, [])
     // Nothing was probed for it — a missing path is never dd'd sixteen times.
@@ -1333,12 +1564,12 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
 
   it('an unreadable journal never fails the scrub — the count still stands', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=2' }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: '', stderr: 'Failed to open journal', exitCode: 1 } })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.btrfsErrors, 'csum=2')
     assert.equal(result.errorsReported, 2)
     assert.equal(result.findings, undefined, 'no attribution rather than an invented one')
@@ -1356,7 +1587,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     bothPresent(executor)
     badBlock300(executor)
 
-    await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
 
     const call = executor.calls.find(c => c.command === '/usr/bin/journalctl')!
     assert.deepEqual(call.args.slice(0, 4), ['-k', '-o', 'json', '-S'])
@@ -1377,7 +1608,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     bothPresent(executor)
     badBlock300(executor)
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     const calls = executor.calls.filter(c => c.command === '/usr/bin/journalctl')
     // The attribution's pair (-g failing, the plain re-read answering) plus
     // the corrected-metadata read of the same window (selfheal.12) — whose -g
@@ -1399,7 +1630,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     const executor = findingsExecutor([{ stdout: journal(lines), stderr: '', exitCode: 0 }])
     bothPresent(executor)
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.truncated, true)
     assert.equal(result.unattributed, AHR_SCRUB_JOURNAL_LINE_CAP)
     const body = executor.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
@@ -1408,11 +1639,11 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
 
   it('a clean scrub probes nothing, and reads the journal only for the corrected-metadata window', async () => {
     const clean = cleanCounters(baseExecutor(), 'md127', 'md126')
-    clean.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    clean.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     clean.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     clean.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(clean, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(clean, scrubAhrPool(clean, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     // Read off BEFORE the deepEqual below: strict deepEqual asserts the actual
     // against the expected literal, which narrows the static type to the four
     // fields that literal carries.
@@ -1438,7 +1669,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
 
   it('a NESTED subvolume keeps its remainder, and a SNAPSHOT is reported outside the mount', async () => {
     const e = baseExecutor()
-    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=2' }), stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real', MOUNTPOINT], result: { stdout: findmnt('/@data'), stderr: '', exitCode: 0 } })
@@ -1453,7 +1684,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     e.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', NESTED], result: { stdout: '4194304\n', stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/dd', result: { stdout: '', stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(e, scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
 
     // `@data/photos` under a mounted `@data` is <mountpoint>/photos — the PATH
     // is what this case is about. No mapping is wired, so the blocks inside it
@@ -1478,7 +1709,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
 
   it('a FLAT pool mounts the top level — the resolved subvolume IS a directory under it', async () => {
     const e = baseExecutor()
-    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real', MOUNTPOINT], result: { stdout: findmnt('/'), stderr: '', exitCode: 0 } })
@@ -1491,7 +1722,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
 
     const flat = pool()
     flat.subvolLayout = false
-    const result = await scrubAhrPool(e, flat, () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(e, scrubAhrPool(e, flat, () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.findings?.[0].path, FLAT)
     assert.equal(result.findings?.[0].outsideMount, undefined)
     // The path is the subject here; with no mapping wired the blocks inside it
@@ -1505,7 +1736,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
 
   it('an unreadable mount table falls back to the pool\'s own subvolLayout reading', async () => {
     const e = baseExecutor()
-    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/realpath', args: ['/dev/t2/t2-vol'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
@@ -1517,7 +1748,7 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     e.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', F1], result: { stdout: '4194304\n', stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/dd', result: { stdout: '', stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(e, scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.findings?.[0].path, F1)
   })
 })
@@ -1693,7 +1924,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
   function compressedExecutor(dm?: { table: string, bands: { majmin: string, kernel: string }[] }): MockExecutor {
     useKernelRoot()
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal(COMPRESSED_DMESG), stderr: '', exitCode: 0 } })
     // The pool LV resolves to the rig's loop device — the device the kernel
@@ -1728,7 +1959,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     const executor = compressedExecutor()
     corruptExtent(executor)
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     const finding = result.findings?.[0]
     assert.equal(finding?.path, F)
     assert.deepEqual(finding?.stripes, [{ logical: 13631488, offset: 0, length: 4096 }])
@@ -1759,7 +1990,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     corruptExtent(executor)
     writeFileSync(join(kernelRoot!, 'proc/sys/vm/drop_caches'), '0')
 
-    await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
 
     // btrfs cannot do direct I/O on COMPRESSED data — the read falls back to
     // the buffered path, and a warm page would answer every probe "fine". The
@@ -1778,7 +2009,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
 
   it('an all-UNCOMPRESSED stripe never drops the page cache — O_DIRECT is enough there (D9)', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real', MOUNTPOINT], result: { stdout: findmntJson('/@data'), stderr: '', exitCode: 0 } })
@@ -1788,7 +2019,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     executor.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', F], result: { stdout: '2097152\n', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/dd', result: { stdout: '', stderr: '', exitCode: 0 } })
 
-    await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
 
     assert.equal(executor.calls.filter(c => c.command === '/usr/bin/sync').length, 0)
   })
@@ -1796,7 +2027,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
   it('nothing in the resolved range failing is said plainly — never an empty badBlocks that reads as nothing found', async () => {
     const executor = compressedExecutor()
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     const finding = result.findings?.[0]
     assert.deepEqual(finding?.badBlocks, [])
     assert.equal(finding?.unidentified, true)
@@ -1831,7 +2062,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
    */
   it('a stripe whose mapping is unavailable is still probed at the kernel offset — a block that EIOs there is real, and the window is marked unverified', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal([SCRUB_LINE]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/t2/t2-vol'], result: { stdout: '/dev/loop0\n', stderr: '', exitCode: 0 } })
@@ -1845,7 +2076,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
       result: { stdout: '', stderr: 'dd: error reading', exitCode: 1 },
     })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     const finding = result.findings?.[0]
     assert.equal(finding?.path, F)
     assert.deepEqual(finding?.badBlocks, [5], 'the failing block of the named stripe is reported')
@@ -1871,7 +2102,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
   // error rather than an empty badBlocks that reads as "nothing wrong here".
   it('unresolvable AND nothing failing → unidentified, with the mapping error as the reason', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal([SCRUB_LINE]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/t2/t2-vol'], result: { stdout: '/dev/loop0\n', stderr: '', exitCode: 0 } })
@@ -1880,7 +2111,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     executor.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', F], result: { stdout: '2097152\n', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/dd', result: { stdout: '', stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     const finding = result.findings?.[0]
     assert.deepEqual(finding?.badBlocks, [])
     assert.equal(finding?.unidentified, true)
@@ -1912,7 +2143,7 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     })
     corruptExtent(executor)
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     const finding = result.findings?.[0]
     assert.equal(finding?.path, F)
     assert.equal(finding?.unidentified, undefined, 'the mapping still answered for this stripe')
@@ -2042,7 +2273,7 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
   /** Phase 1 on t2-r1 counts 8 mismatches; t2-r2 is clean. */
   function rotExecutor(btrfsSummary?: string): MockExecutor {
     const executor = cleanCounters(baseExecutor(), 'md126')
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', btrfsSummary ? { summary: btrfsSummary } : undefined), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/mismatch_cnt'], result: { stdout: '8\n', stderr: '', exitCode: 0 } })
@@ -2067,7 +2298,7 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
     const executor = rotExecutor('csum=2')
     namedFinding(executor)
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
 
     // The record carries the parity mismatch even though a file was named —
     // with the band's LEVEL, which is what says whether Rewrite parity applies
@@ -2090,7 +2321,7 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
     // Errors reported (csum=2) but the journal gives nothing to attribute.
     executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: '', stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.btrfsErrors, 'csum=2')
 
     const warns = executor.calls.filter(c => c.command === '/usr/bin/perl')
@@ -2117,7 +2348,7 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'idle\n', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/last_sync_action'], result: { stdout: 'resync\n', stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
 
     assert.equal(result.checkedArrays, 1, 'one band checked, not two')
     assert.deepEqual(result.bandsChecked, ['t2-r2'])
@@ -2135,14 +2366,14 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
     // Counting it in `checkedArrays` is the same false assurance D8 closed for
     // the bands that were never checked at all.
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '', stderr: 'No such file', exitCode: 1 } })
     cleanCounters(executor, 'md126')
 
     const progress: string[] = []
-    const result = await scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1 }))
 
     assert.equal(result.checkedArrays, 1, 'only the band with a verdict counts')
     assert.deepEqual(result.bandsChecked, ['t2-r2'])
@@ -2162,11 +2393,11 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
     // next thing to ask would have written `idle` over it.
     forgetIssuedChecks()
     const executor = cleanCounters(baseExecutor(), 'md127', 'md126')
-    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.checkedArrays, 2, 'a clean two-band scrub — the ordinary success path')
     assert.equal(hasIssuedCheck('md127'), false, 'the token does not outlive the band that took it')
     assert.equal(hasIssuedCheck('md126'), false)
@@ -2184,7 +2415,7 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: 'idle\n', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/last_sync_action'], result: { stdout: 'resync\n', stderr: '', exitCode: 0 } })
 
-    await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 })
+    await liveScrubPass(executor, scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
     assert.equal(hasIssuedCheck('md127'), false)
     assert.equal(hasIssuedCheck('md126'), false)
   })
@@ -2259,7 +2490,7 @@ describe('corrected metadata reads (selfheal.12, GT-20)', () => {
 
   it('a clean scrub that corrected metadata says so — result and notification', async () => {
     const e = cleanCounters(baseExecutor(), 'md127', 'md126')
-    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/realpath', args: ['/dev/t2/t2-vol'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal([
@@ -2267,7 +2498,7 @@ describe('corrected metadata reads (selfheal.12, GT-20)', () => {
       'BTRFS info (device dm-9): read error corrected: ino 0 off 1 (dev /dev/mapper/other sector 2)',
     ]), stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(e, scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     // The exact GT-20 shape: a CLEAN scrub (no findings, no parity, no skips)
     // whose journal window carries the only rot evidence there is.
     assert.deepEqual(result.metadataCorrected, { count: 1, devices: ['/dev/mapper/gtsh-data'] })
@@ -2284,11 +2515,11 @@ describe('corrected metadata reads (selfheal.12, GT-20)', () => {
 
   it('no corrected reads: no count on the result, no sentence anywhere', async () => {
     const e = cleanCounters(baseExecutor(), 'md127', 'md126')
-    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal([GT3_LINES[0]]), stderr: '', exitCode: 0 } })
 
-    const result = await scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(e, scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.metadataCorrected, undefined)
     assert.equal(e.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'a truly clean scrub stays silent (§7.3)')
     assert.equal(metadataCorrectedSentence({ count: 3, devices: [] }).includes('btrfs corrected 3 metadata read(s)'), true)
@@ -2296,13 +2527,13 @@ describe('corrected metadata reads (selfheal.12, GT-20)', () => {
 
   it('the sentence rides the EXISTING notification when the scrub already found errors', async () => {
     const e = baseExecutor()
-    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
     e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/realpath', args: ['/dev/t2/t2-vol'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
     e.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal([GT3_LINES[0], GT20_CORRECTED]), stderr: '', exitCode: 0 } })
     // No mapping wired: the finding is unidentified, the notification stands.
 
-    const result = await scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    const result = await liveScrubPass(e, scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.metadataCorrected?.count, 1)
     const body = e.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
     assert.ok(body.includes('csum=1'), 'the findings notification is unchanged')

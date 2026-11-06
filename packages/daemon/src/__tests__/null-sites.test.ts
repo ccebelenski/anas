@@ -24,6 +24,7 @@ const SRC = fileURLToPath(new URL('..', import.meta.url))
 const NULL_SITES: { file: string, reason: string }[] = [
   { file: 'routes/replication.ts', reason: 'zfs send | zfs recv: a data mover, hours for a large send' },
   { file: 'services/access.ts', reason: 'recursive chown/setfacl/chmod/find over a whole tree: hours on a large dataset' },
+  { file: 'services/ahr-scrub.ts', reason: 'btrfs scrub: a verify pass over the whole filesystem, hours to days on a large pool' },
   { file: 'services/backup-restore-files.ts', reason: 'proxmox-backup-client file restore: a data mover, hours for a large tree' },
   { file: 'services/backup-restore.ts', reason: 'proxmox-backup-client image restore in place: a data mover, hours for a large image' },
   { file: 'services/backup-restore.ts', reason: 'proxmox-backup-client image restore to a new backing: a data mover, hours for a large image' },
