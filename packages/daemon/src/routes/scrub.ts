@@ -11,6 +11,7 @@ import { ahrPoolClaims, guardCheck, guarded, poolClaims, sendRefusal } from '../
 import { readPoolGuid } from '../safety/stable-id.js'
 import { poolArrayUuids } from '../services/ahr-guard.js'
 import { AhrTopologyUnreadableError, readAhrPools } from '../services/ahr-topology.js'
+import { btrfsScrubRunning } from '../services/btrfs-scrub-running.js'
 import { ForeignUnitError, scrubUnitsAreForeign } from '../services/scrub-schedule-units.js'
 import {
   ahrScrubRunning,
@@ -252,8 +253,21 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
         scans.get(p)?.running ?? null,
       ))),
       // The AHR running check comes out of the topology read this route already
-      // makes to enumerate the pools — no extra mdstat read for it.
-      ...await Promise.all(ahr.map(p => readAhrScrubState(executor, p.name, ahrScrubRunning(p), ctx))),
+      // makes to enumerate the pools — no extra mdstat read for it. Only when
+      // NO band is checking does the route ask btrfs whether the checksum pass
+      // (phase 2, or a scrub started outside ANAS) is running (scrub.r2,
+      // GitHub #82 — phase 2 used to read idle); md keeps precedence, and one
+      // `btrfs scrub status` per mounted AHR pool per `GET /scrub` is the
+      // accepted cost. The reads stay parallel across pools.
+      ...await Promise.all(ahr.map(async (p) => {
+        const md = ahrScrubRunning(p)
+        const running = md
+          ? { ...md, phase: 'md-parity' as const }
+          : p.mounted
+            ? await btrfsScrubRunning(executor, p.mountpoint)
+            : null
+        return readAhrScrubState(executor, p.name, running, ctx)
+      })),
     ]
     return { data: states }
   })

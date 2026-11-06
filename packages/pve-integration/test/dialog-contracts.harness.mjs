@@ -8110,6 +8110,12 @@ async function taskDoorOnDoneCheck() {
 // wins, everything that is not a completed AHR scrub WITH findings is ignored,
 // the indicator is the one door to the one window, and a jobs list that cannot
 // be read costs the indicator and nothing else.
+//
+// scrub.r2 (GitHub #82) widened "the newest job": the view reads the FAILED
+// list beside the completed one, and the newest `ahr.scrub` per pool wins
+// ACROSS both statuses — a failed scrub (no result; the pool only in the job's
+// `detail`) says so on the row until a completed pass displaces it, and the
+// running cell names WHICH pass is in flight.
 
 const SCRUB_STATES = {
   data: [
@@ -8130,6 +8136,18 @@ const SCRUB_STATES = {
     // selfheal.12 (GT-20): ahr5's newest scrub was CLEAN and its only signal
     // is the corrected-metadata count — the row must not read as a clean bill.
     { target: { kind: 'ahr', pool: 'ahr5' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'a clean scrub that corrected metadata', lastScrub: null, running: null },
+    // scrub.r2 (#82): ahr6's ONLY scrub job FAILED — the #82 shape itself: a
+    // stopped pass the row used to describe as never scrubbed.
+    { target: { kind: 'ahr', pool: 'ahr6' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'the scrub that failed and used to be invisible', lastScrub: null, running: null },
+    // scrub.r2 (#82): the two running cells — ahr7's pass may be phase 2 of an
+    // ANAS scrub OR a `btrfs scrub` started outside ANAS; ahr8's is phase 1.
+    { target: { kind: 'ahr', pool: 'ahr7' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'phase 2 in flight', lastScrub: null, running: { phase: 'btrfs-checksums', percent: 12.5 } },
+    { target: { kind: 'ahr', pool: 'ahr8' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'phase 1 in flight', lastScrub: null, running: { phase: 'md-parity', percent: 3 } },
+    // scrub.r2 FOLD (review NOTICED 3): ahr9's completed pass counted parity
+    // mismatches, then a NEWER scrub FAILED. The failed pass verified nothing
+    // and wrote nothing — the parity fact and its Rewrite-parity door must
+    // still read on the row beside the failure.
+    { target: { kind: 'ahr', pool: 'ahr9' }, enabled: true, cadence: 'monthly', mechanism: 'anas-scrub-timer', nextRun: null, phases: ['md-parity', 'btrfs-checksums'], note: 'parity counted, then the next scrub died', lastScrub: null, running: null },
   ],
 }
 
@@ -8190,10 +8208,14 @@ const SCRUB_JOBS = {
       at: '2026-09-10T09:00:00.000Z',
       result: { scrubbed: 'ahr0', btrfsErrors: 'csum=9', checkedArrays: 3, findings: [FINDING_A], errorsReported: 9, errorsAttributed: 1, unattributed: 0, truncated: false },
     }),
-    // A FAILED scrub that still carries findings — never the row's answer.
+    // A FAILED scrub that still carries findings — never the row's answer:
+    // its findings are ignored (those belong to a completed result), and the
+    // completed j2 ran AFTER it, so it is not even the newest. (scrub.r2
+    // moved it behind j2: across both statuses the NEWEST job wins, and j2's
+    // findings row is what the older assertions read.)
     scrubJob({
       id: 'j3',
-      at: '2026-09-11T10:00:00.000Z',
+      at: '2026-09-11T07:00:00.000Z',
       result: { scrubbed: 'ahr0', btrfsErrors: 'csum=3', checkedArrays: 3, findings: [FINDING_A] },
       extra: { status: 'failed' },
     }),
@@ -8265,12 +8287,100 @@ const SCRUB_JOBS = {
         metadataCorrected: { count: 2, devices: ['/dev/mapper/gtsh-data'] },
       },
     }),
+    // The fold (review NOTICED 3) — ahr9's COMPLETED pass: parity mismatches
+    // and no corrupt file (the parity-only shape). Its reading must SURVIVE
+    // the failed scrub that ran after it.
+    scrubJob({
+      id: 'j11',
+      at: '2026-09-13T08:00:00.000Z',
+      result: {
+        scrubbed: 'ahr9',
+        btrfsErrors: null,
+        checkedArrays: 2,
+        bandsChecked: ['ahr9-r1', 'ahr9-r2'],
+        parityMismatches: [{ band: 'ahr9-r1', bandIndex: 1, array: '/dev/md/ahr9-r1', mismatchCnt: 7 }],
+        findings: [],
+      },
+    }),
+  ],
+}
+
+// scrub.r2 (GitHub #82): the panel reads `/jobs?status=failed` beside the
+// completed list, and a failed scrub job carries NO result — the pool lives
+// only in the `detail` the job publishes while it runs. The message is #82's
+// own sentence: cr.34's 300 s deadline stopping the orphaned btrfs child.
+const SCRUB_FAIL_MSG = '\'btrfs scrub\' did not finish within 300 s and was stopped'
+
+function failedScrubJob(id, at, pool) {
+  return {
+    id,
+    status: 'failed',
+    operation: 'ahr.scrub',
+    progress: null,
+    createdAt: at,
+    createdBy: 'harness',
+    startedAt: at,
+    completedAt: at,
+    result: null,
+    error: { code: 'TIMEOUT', message: SCRUB_FAIL_MSG },
+    detail: { pool },
+  }
+}
+
+const SCRUB_FAILED_JOBS = {
+  data: [
+    // ahr6's ONLY scrub job: failed, and the newest for that pool (it has no
+    // completed jobs at all) — the row must say the scrub FAILED.
+    failedScrubJob('jf1', '2026-09-12T12:00:00.000Z', 'ahr6'),
+    // ahr5 ALSO failed — but its completed j10 ran later, so the completed
+    // verdict wins the row and the failure is history.
+    failedScrubJob('jf2', '2026-09-12T09:00:00.000Z', 'ahr5'),
+    // ahr9's NEWEST scrub job: failed, AFTER its completed j11 counted parity
+    // mismatches (the fold, review NOTICED 3) — the failure says so on the
+    // row, and the parity reading survives beside it.
+    //
+    // And it CARRIES `result.findings` (the shape j3 had before its move) —
+    // a real failure has no result, but a newest-job-wins rule has to be
+    // proven against the shape that could leak a dead pass's file list: the
+    // failed entry drops the result, so the findings name nothing and the
+    // failure cell never grows a findings link.
+    {
+      id: 'jf3',
+      status: 'failed',
+      operation: 'ahr.scrub',
+      progress: null,
+      createdAt: '2026-09-13T12:00:00.000Z',
+      createdBy: 'harness',
+      startedAt: '2026-09-13T12:00:00.000Z',
+      completedAt: '2026-09-13T12:00:00.000Z',
+      result: { scrubbed: 'ahr9', btrfsErrors: 'csum=3', checkedArrays: 2, findings: [FINDING_A] },
+      error: { code: 'TIMEOUT', message: SCRUB_FAIL_MSG },
+      detail: { pool: 'ahr9' },
+    },
+    // A failed REPAIR NEWER than jf3: no result, so it names no pool — it
+    // displaces neither the failed scrub's cell nor the completed pass's
+    // parity reading. A failed job changes nothing anyone can see.
+    {
+      id: 'jr1',
+      status: 'failed',
+      operation: 'ahr.repair',
+      progress: null,
+      createdAt: '2026-09-13T14:00:00.000Z',
+      createdBy: 'harness',
+      startedAt: '2026-09-13T14:00:00.000Z',
+      completedAt: '2026-09-13T14:00:00.000Z',
+      result: null,
+      error: { code: 'CONFLICT', message: 'a check is running on ahr9-r1' },
+      detail: null,
+    },
   ],
 }
 
 const SCRUB_ROUTES = {
   'GET /scrub': SCRUB_STATES,
-  'GET /jobs': SCRUB_JOBS,
+  // One key, two answers (scrub.r2): the stub resolves route values by path,
+  // and the panel now asks for both statuses.
+  'GET /jobs': path => (path.includes('status=failed') ? SCRUB_FAILED_JOBS : SCRUB_JOBS),
 }
 
 function scrubCell(grid, rec) {
@@ -8298,10 +8408,12 @@ async function scrubFindingsChecks() {
   view.fireEvent('afterrender', view)
   await settle()
 
-  // --- The two reads ---------------------------------------------------------
+  // --- The three reads -------------------------------------------------------
   ok('scrubs: reads the uniform scrub state', apiGets.includes('/scrub'))
   ok('scrubs: reads the daemon\'s COMPLETED jobs for the findings (no new endpoint)',
     apiGets.includes('/jobs?status=completed'))
+  ok('scrubs: reads the daemon\'s FAILED jobs too — a failed scrub used to be invisible (scrub.r2)',
+    apiGets.includes('/jobs?status=failed'))
 
   // --- The indicator ---------------------------------------------------------
   const ahr0 = rowFor(grid, 'ahr0')
@@ -8365,6 +8477,120 @@ async function scrubFindingsChecks() {
     !/anas-scrub-findings-link/.test(correctedCell), correctedCell)
   ok('scrubs: …and it still says the record is the last completed scrub since the daemon started',
     /last completed scrub since the daemon started/.test(correctedCell), correctedCell)
+  // scrub.r2 (#82), the SAME row seen the other way: ahr5 ALSO failed (jf2) —
+  // but its completed j10 ran LATER, so the completed verdict wins and the
+  // failure is history. Newest-per-pool wins ACROSS both statuses.
+  eq('scrubs: a completed scrub NEWER than a failed one clears the failure',
+    ahr5.get('lastFailed'), null)
+  ok('scrubs: …the completed verdict renders, not the older failure',
+    !/last scrub failed/.test(correctedCell), correctedCell)
+
+  // --- scrub.r2 (GitHub #82): a failed scrub is NOT invisible ----------------
+  // ahr6's only scrub job failed: no result, the pool only in the job's own
+  // `detail`. Until this story the row read "phase 1 → phase 2 (md keeps no
+  // completion record)" — a pool whose last verification attempt died mid-run.
+  const ahr6 = rowFor(grid, 'ahr6')
+  ok('scrubs: a pool whose only scrub failed is still a row', !!ahr6)
+  if (ahr6) {
+    eq('scrubs: …and its newest scrub is the failed one', !!ahr6.get('lastFailed'), true)
+    // Retitled by the fold: ahr6's failed job carries NO result, so this
+    // proved nothing about findings on a failure — the real claim (a failed
+    // job's findings must not ride the row) is proven on ahr9, whose failed
+    // jf3 DOES carry them.
+    eq('scrubs: …a failed job with no result names no findings', ahr6.get('findings'), null)
+    const failCell = scrubCell(grid, ahr6)
+    ok('scrubs: the row says the LAST SCRUB FAILED, with the time',
+      /last scrub failed/.test(failCell), failCell)
+    ok('scrubs: …in warn colour, never the muted idle wording',
+      /var\(--anas-warn/.test(failCell) && !/md keeps no completion record/.test(failCell), failCell)
+    ok('scrubs: …and carries the job\'s own error as the tooltip',
+      failCell.includes('did not finish within 300 s'), failCell)
+    ok('scrubs: …with no findings link — a failed job verified nothing to name',
+      !/anas-scrub-findings-link/.test(failCell), failCell)
+    ok('scrubs: …and the honest scope, reworded for a pass that did not complete',
+      /· last scrub since the daemon started/.test(failCell)
+      && !/last completed scrub since the daemon started/.test(failCell), failCell)
+    // A pass in flight OUTRANKS even the failure: it is what is true now.
+    ahr6.set('running', { phase: 'btrfs-checksums', percent: 2 })
+    ok('scrubs: a running pass outranks even the failed-scrub cell',
+      !/last scrub failed/.test(scrubCell(grid, ahr6)), scrubCell(grid, ahr6))
+    ahr6.set('running', null)
+  }
+
+  // --- scrub.r2 FOLD (review NOTICED 3): a failed scrub does NOT erase ------
+  // the previous pass's parity reading. ahr9: completed j11 counted parity
+  // mismatches, THEN jf3 failed. The failed pass verified nothing and wrote
+  // nothing, so the parity fact still stands — and its Rewrite-parity door
+  // must stay open, not hide for a month until the next completed scrub.
+  const ahr9 = rowFor(grid, 'ahr9')
+  ok('scrubs: a pool whose scrub failed after a parity-counting pass is still a row', !!ahr9)
+  if (ahr9) {
+    const failParityCell = scrubCell(grid, ahr9)
+    eq('scrubs: …its newest scrub is the failed one', !!ahr9.get('lastFailed'), true)
+    ok('scrubs: the failed cell still says the LAST SCRUB FAILED',
+      /last scrub failed/.test(failParityCell), failParityCell)
+    // The failed jf3 CARRIES result.findings (the shape j3 had before its
+    // move) — and the row says nothing of them: the failed entry drops the
+    // result, so the dead pass's file list names nothing and the cell grows
+    // no findings link.
+    const jf3 = SCRUB_FAILED_JOBS.data.find(j => j.id === 'jf3')
+    ok('scrubs: …the failed jf3 really does carry findings in its result',
+      !!jf3.result && jf3.result.findings.length === 1, JSON.stringify(jf3.result))
+    eq('scrubs: …yet findings on a FAILED newest job ride nothing', ahr9.get('findings'), null)
+    ok('scrubs: …and the failed cell grows NO findings link, only the parity door',
+      !/anas-scrub-findings-link/.test(failParityCell), failParityCell)
+    ok('scrubs: …and the completed pass\'s parity reading SURVIVES beside it',
+      /parity mismatch on ahr9-r1 \(7\)/.test(failParityCell), failParityCell)
+    ok('scrubs: …as the same amber link — the Rewrite-parity door stays open from the failed cell',
+      /class="anas-scrub-parity-link"/.test(failParityCell)
+      && /Click to rewrite that band's parity/.test(failParityCell), failParityCell)
+    eq('scrubs: …the parity field on the row is the completed pass\'s rows',
+      ahr9.get('parity') && ahr9.get('parity').length, 1)
+    // The failed REPAIR (jr1) ran NEWER than jf3: no result, so it names no
+    // pool — neither the failure cell nor the parity reading moves for it.
+    eq('scrubs: …and a newer failed repair displaces neither the failure nor the reading',
+      ahr9.get('lastFailed').message, SCRUB_FAIL_MSG)
+    // The door works from the failed cell: same class, same handler, the
+    // window opens off rec.get('parity') with no findings to refuse the verb.
+    created.windows.length = 0
+    grid.fireEvent('itemclick', grid, ahr9, null, 0, onParityLink)
+    await settle()
+    const pWin = openWindow()
+    ok('scrubs: …whose click opens the parity window from the failed cell',
+      !!pWin && pWin.cls === 'anas-win-scrub-parity')
+    if (pWin) {
+      const pGrid = pWin.down('#parityGrid')
+      ok('scrubs: …listing the surviving band',
+        !!pGrid && pGrid.getStore().getCount() === 1 && pGrid.getStore().getAt(0).get('band') === 'ahr9-r1')
+    }
+    created.windows.length = 0
+  }
+
+  // --- scrub.r2 (#82): the running cell names WHICH pass is in flight ---------
+  // Phase 2 (ahr7) may be the ANAS scrub's checksum pass OR a `btrfs scrub`
+  // started outside ANAS — both read idle until this story, because only md
+  // was consulted. Phase 1 (ahr8) is md's own check.
+  const ahr7 = rowFor(grid, 'ahr7')
+  if (ahr7) {
+    const btCell = scrubCell(grid, ahr7)
+    ok('scrubs: a btrfs checksum pass in flight is named as such',
+      /btrfs checksum scrub running/.test(btCell), btCell)
+    ok('scrubs: …with btrfs\'s own percentage', /12\.5%/.test(btCell), btCell)
+    ok('scrubs: …and the tooltip says it may be a scrub ANAS did not start',
+      /phase 2 of the AHR scrub, or a scrub started outside ANAS/.test(btCell), btCell)
+  } else {
+    ok('scrubs: the running-phase rows exist', false)
+  }
+  const ahr8 = rowFor(grid, 'ahr8')
+  if (ahr8) {
+    const mdCell = scrubCell(grid, ahr8)
+    ok('scrubs: an md parity pass in flight is named as such',
+      /md parity check running/.test(mdCell), mdCell)
+    ok('scrubs: …and keeps the md tooltip (the ETA-floor caveat)',
+      /an md check is running/.test(mdCell), mdCell)
+  } else {
+    ok('scrubs: the running-phase rows exist', false)
+  }
 
   const cell = scrubCell(grid, ahr0)
   ok('scrubs: the row says how many files, labelled', /3 files with checksum errors/.test(cell), cell)
@@ -8380,6 +8606,10 @@ async function scrubFindingsChecks() {
   ahr0.set('running', { percent: 12.5 })
   ok('scrubs: a running pass outranks the findings cell',
     !/anas-scrub-findings-link/.test(scrubCell(grid, ahr0)))
+  // The skew rule (scrub.r2): a daemon too old to send `phase` keeps the old
+  // generic label — the phase wording appears only when the daemon names one.
+  ok('scrubs: …and a running record WITHOUT a phase keeps the pre-scrub.r2 label',
+    /check running/.test(scrubCell(grid, ahr0)), scrubCell(grid, ahr0))
   ahr0.set('running', null)
 
   // --- The one window --------------------------------------------------------

@@ -9,7 +9,7 @@ import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { lstat } from 'node:fs/promises'
 import { dirname, join, relative, resolve as resolvePath } from 'node:path'
-import { AhrCreateRequest, AhrMirrorReconcileRequest, AhrMountpointRequest, AhrParityRewriteRequest, AhrRepairRequest, isComposableDisk, PoolName } from '@anas/shared'
+import { AhrCreateRequest, AhrMirrorReconcileRequest, AhrMountpointRequest, AhrParityRewriteRequest, AhrRepairRequest, AhrScrubJobDetail, isComposableDisk, PoolName } from '@anas/shared'
 import { currentLane } from '../executor/deadline.js'
 import { parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
 import { hasMount, parseFstab } from '../parsers/fstab.js'
@@ -34,6 +34,7 @@ import { heldByLun, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
 import { mountTargetGate, mountTargetRefusal, normalizeMountpointPath } from '../services/mounts.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
+import { pveNotify } from '../services/pve-notify.js'
 import { mdSysPath, readMdAttrOrNull } from '../services/selfheal-io.js'
 import { readMdGeometry } from '../services/selfheal-map.js'
 import { collectDisks } from './disks.js'
@@ -1258,10 +1259,55 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
 
+    const run = guarded(spec, pre, async (live, ctx) => {
+      try {
+        return await scrubAhrPool(executor, live, ctx.updateProgress, { pollIntervalMs: opts.scrubPollIntervalMs })
+      }
+      catch (err) {
+        // ONE PVE notification per failed scrub (scrub.r2): the only other
+        // notice in the sequence is the per-band rot warning, so a scrub
+        // that never finished was silent. A run stopped on purpose is what
+        // the operator asked for, not a failure — no notification. (No
+        // cancel can reach this body today — ahr.scrub registers no cancel
+        // hook, so `cancelTarget` refuses it — but the rclone.5 semantics
+        // are respected here so a future hook cannot make this notify on a
+        // cancel.) A guard re-check refusal never reaches here either: the
+        // body runs only after the job door passes, and a job that never
+        // started scrubbing is not a scrub failure — so it notifies nothing
+        // (its pool is still published, by the handler below).
+        if (!ctx.cancellation()) {
+          const message = err instanceof Error ? err.message : String(err)
+          try {
+            await pveNotify(executor, 'warning', 'AHR scrub failed', `AHR scrub on pool '${name}' failed: ${message}. The pool was not fully verified. Run Scrub again once the cause has passed.`)
+          }
+          catch (notifyErr) {
+            // The notification must never mask the scrub's own failure.
+            console.error(`ahr.scrub: could not send the failure notification for pool '${name}': ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
+          }
+        }
+        // The ORIGINAL error is what fails the job — the queue records it
+        // verbatim and the Scrubs row shows its message.
+        throw err
+      }
+    })
+
+    // Publish the pool the moment the job starts (scrub.r2, GitHub #82): a
+    // FAILED job carries `result: null` and the public Job carries no params,
+    // so without this detail a failed scrub cannot be attributed to the pool
+    // it was scrubbing — the Scrubs row then renders that pool as never
+    // scrubbed. It is published OUTSIDE the `guarded` body, before the job
+    // door's re-check runs, because a job refused THERE (the pool moved, a
+    // lock refusal, an unreadable topology in the job) is just as much a
+    // failed `ahr.scrub` and must appear on the row too — the class this
+    // story exists to close. Parse through the schema so the contract is
+    // enforced at this boundary.
     const job = jobQueue.submit(
       'ahr.scrub',
       { ...identity, params: { name } },
-      guarded(spec, pre, async (live, ctx) => scrubAhrPool(executor, live, ctx.updateProgress, { pollIntervalMs: opts.scrubPollIntervalMs })),
+      async (updateProgress, jobCtx) => {
+        jobCtx.updateDetail(AhrScrubJobDetail.parse({ pool: name }))
+        return run(updateProgress, jobCtx)
+      },
       { locks: pre.locks, lane: 'long' },
     )
     reply.code(202)

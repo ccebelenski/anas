@@ -206,6 +206,71 @@ describe('AHR mutation routes — validation & 404s (stock dev mock)', () => {
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.deepEqual(job.result, { scrubbed: 'ahr0', btrfsErrors: null, checkedArrays: 2, bandsChecked: ['ahr0-r1', 'ahr0-r2'] })
   })
+
+  // scrub.r2 (GitHub #82): the job publishes its pool the moment it starts, so
+  // even a FAILED scrub is attributable — and a clean one sends no warning.
+  it('POST /v1/ahr/:name/scrub — the job publishes its pool as `detail`, running and completed', async () => {
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    // Hold phase 2's `btrfs scrub start` as a live child (rclone.5 machinery):
+    // the job stays observably RUNNING until the test releases it.
+    mock.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '/mnt/anas-ahr/ahr0'], result: { stdout: '', stderr: '', exitCode: 0 }, live: { signalsToExit: Infinity } })
+    mock.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', '/mnt/anas-ahr/ahr0'], result: { stdout: 'Status:           finished\nError summary:    no errors found\n', stderr: '', exitCode: 0 } })
+
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 202)
+    const id = res.json().job.id
+    let published: Job | null = null
+    for (let i = 0; i < 200 && !published; i++) {
+      const r = await server.inject({ method: 'GET', url: `/v1/jobs/${id}`, headers: IDENTITY_HEADERS })
+      const { job } = r.json() as { job: Job }
+      assert.notEqual(job.status, 'failed', JSON.stringify(job.error))
+      if (job.status === 'running' && job.detail)
+        published = job
+      else
+        await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    assert.ok(published, 'the scrub stayed running long enough to read its detail')
+    assert.deepEqual(published.detail, { pool: 'ahr0' })
+
+    // Wait until phase 2 has actually SPAWNED its held child (phase 1 still
+    // runs when the detail first reads), then release it: phase 2 finishes,
+    // and the COMPLETED job keeps the detail beside its result.
+    for (let i = 0; i < 500; i++) {
+      if (mock.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[0] === 'scrub' && c.args[1] === 'start'))
+        break
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    mock.finishLive()
+    const job = await waitForJob(server, id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(job.detail, { pool: 'ahr0' })
+    // A clean scrub sends no failure notification (the only perl notice in
+    // the sequence is scrubAhrPool's own, and this scrub found nothing).
+    assert.ok(!mock.calls.some(c => c.command === '/usr/bin/perl' && c.args[3] === 'AHR scrub failed'))
+  })
+
+  it('POST /v1/ahr/:name/scrub — a failed scrub sends ONE warning notification and keeps the original error', async () => {
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    // scrub.r1 made a non-zero `scrub start -B` exit a FINDING, not a failure,
+    // so the failure here is the one both stories agree on: the final status
+    // read says the pass was aborted.
+    mock.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', '/mnt/anas-ahr/ahr0'], result: { stdout: 'UUID: 1111\nStatus:           aborted\nError summary:    no errors found\n', stderr: '', exitCode: 0 } })
+
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, res.json().job.id)
+    assert.equal(job.status, 'failed')
+    // The ORIGINAL error is what fails the job — the notify never masks it.
+    assert.match(job.error?.message ?? '', /^btrfs scrub on 'ahr0' was aborted$/)
+    // The failure still names its pool — this is what makes it visible.
+    assert.deepEqual(job.detail, { pool: 'ahr0' })
+
+    const notifies = mock.calls.filter(c => c.command === '/usr/bin/perl')
+    assert.equal(notifies.length, 1, JSON.stringify(notifies))
+    assert.equal(notifies[0].args[2], 'warning')
+    assert.equal(notifies[0].args[3], 'AHR scrub failed')
+    assert.equal(notifies[0].args[4], `AHR scrub on pool 'ahr0' failed: btrfs scrub on 'ahr0' was aborted. The pool was not fully verified. Run Scrub again once the cause has passed.`)
+  })
 })
 
 describe('POST /v1/ahr — create success path (controlled inventory)', () => {
@@ -776,6 +841,65 @@ describe('POST /v1/ahr/:name/{scrub,repair} — the in-flight exclusion', () => 
       assert.match(message, /^an md check is running on ahr0-r\d/)
       assert.match(message, /started outside this job or by a previous daemon/)
       assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no bypass for "unsafe now"')
+    }
+    finally {
+      await app.close()
+    }
+  })
+
+  // scrub.r2 fold (GitHub #82 review, POSSIBLE 1): the pool detail is published
+  // BEFORE the job door's re-check, so a scrub refused THERE — the same md
+  // check gate, fired by a read that changed between the two doors — is a
+  // failed `ahr.scrub` the Scrubs row can still attribute to its pool. Each
+  // door reads /proc/mdstat twice (the topology, then the foreign-check
+  // gate's own read), so the FOURTH read is the job door's gate: the route
+  // saw idle, the job finds the check. A guard refusal is not a scrub
+  // failure — the body never runs, so the failure notification must not fire.
+  it('a scrub whose JOB-time re-check refuses still publishes its pool detail, and notifies nothing', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, results: [
+      mockFixtures.ahrMdstat(),
+      mockFixtures.ahrMdstat(),
+      mockFixtures.ahrMdstat(),
+      { stdout: readFileSync(join(AHR_FIXTURES, 'mdstat-check.txt'), 'utf-8'), stderr: '', exitCode: 0 },
+    ] })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+    executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+    executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+
+    const app = Fastify({ logger: false })
+    const queue = new JobQueue()
+    await app.register(jobRoutes, { prefix: '/v1', jobQueue: queue })
+    await app.register(ahrMutationRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue: queue,
+      confirmStore: new ConfirmStore(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      fstabPath: join(dir, 'fstab'),
+      mdadmConfPath: join(dir, 'mdadm.conf'),
+      mountBase: join(dir, 'mnt'),
+    })
+    try {
+      const res = await app.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob(app as unknown as TestServer, res.json().job.id)
+      assert.equal(job.status, 'failed')
+      // The refusal is the job door's own sentence — the gate list, re-run.
+      assert.equal(job.error?.code, 'CONFLICT', JSON.stringify(job.error))
+      assert.match(job.error?.message ?? '', /an md check is running on ahr0-r\d/)
+      // The pool is named despite the refusal — this is what makes the
+      // failure visible on the Scrubs row.
+      assert.deepEqual(job.detail, { pool: 'ahr0' })
+      // A guard refusal is not a scrub failure: nothing notified, nothing
+      // started — the body never ran.
+      assert.ok(!executor.calls.some(c => c.command === '/usr/bin/perl' && c.args[3] === 'AHR scrub failed'), JSON.stringify(executor.calls.filter(c => c.command === '/usr/bin/perl')))
+      assert.ok(!executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[0] === 'scrub'), 'no btrfs scrub was started')
     }
     finally {
       await app.close()

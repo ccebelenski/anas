@@ -136,6 +136,7 @@ export {
   AhrReplacePair,
   AhrReplaceRequest,
   AhrScrubFinding,
+  AhrScrubJobDetail,
   AhrScrubParityMismatch,
   AhrScrubResult,
   AhrScrubSkippedBand,

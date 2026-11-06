@@ -574,14 +574,97 @@ describe('periodic scrub routes — AHR node-level anas-scrub timer (selfheal.4)
     const ahr = (res.json() as { data: PeriodicScrubState[] }).data.find(s => s.target.kind === 'ahr')
     assert.ok(ahr, 'expected an AHR scrub state')
     // Least-advanced band (r1 at 12.4%), both bands' throughput summed, the
-    // longer of the two ETAs (1.2min) — see `ahrScrubRunning`.
+    // longer of the two ETAs (1.2min) — see `ahrScrubRunning`. scrub.r2: the
+    // md check in flight names its phase, and it outranks the btrfs status read.
     assert.deepEqual(ahr.running, {
+      phase: 'md-parity',
       percent: 12.4,
       speedBytesSec: (64800 + 53973) * 1024,
       etaSeconds: 72,
     })
     // Still no COMPLETION record — live progress does not create one.
     assert.equal(ahr.lastScrub, null)
+    await bare.close()
+  })
+
+  // ── scrub.r2 (GitHub #82): the btrfs half of "is a scrub running" ──────────
+  // Phase 2 of the ANAS scrub — and a `btrfs scrub` started by hand — both read
+  // IDLE before this story, because `running` consulted the md checks only. The
+  // real capture below is the production node's own `btrfs scrub status`, read
+  // while the #81 run's orphaned phase 2 was still going.
+
+  const BTRFS = '/usr/bin/btrfs'
+  const AHR0_MP = '/mnt/anas-ahr/ahr0'
+  const BTRFS_RUNNING_GT = [
+    'UUID:             bbdda205-bc4a-418d-808f-763278b2e6f5',
+    'Scrub started:    Fri Nov  6 00:36:16 2026',
+    'Status:           running',
+    'Duration:         0:00:05',
+    'Time left:        45:59:25',
+    'ETA:              Sat Nov  7 22:35:46 2026',
+    'Total to scrub:   66.63TiB',
+    'Bytes scrubbed:   2.06GiB  (0.00%)',
+    'Rate:             422.00MiB/s',
+    'Error summary:    no errors found',
+    '',
+  ].join('\n')
+
+  /**
+   * A bare server on the dev-mock AHR topology whose `btrfs scrub status` read
+   * the test controls (exact args, so it outranks everything else). `zpool
+   * list` honestly returns no ZFS pools (a successful empty read, cr.64c) so
+   * the AHR row stands alone.
+   */
+  async function btrfsRunningServer(mdstat: ExecResult, status: ExecResult) {
+    const executor = mockAhrTopologyExecutor(new MockExecutor(), mdstat)
+    executor.addFixture({ command: BTRFS, args: ['scrub', 'status', AHR0_MP], result: status })
+    executor.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson([]), stderr: '', exitCode: 0 } })
+    const bare = Fastify({ logger: false })
+    await bare.register(scrubRoutes, { prefix: '/v1', executor, jobQueue: new JobQueue() })
+    return { bare, executor }
+  }
+
+  function ahrRow(res: { json: () => { data: PeriodicScrubState[] } }): PeriodicScrubState {
+    const ahr = res.json().data.find(s => s.target.kind === 'ahr')
+    assert.ok(ahr, 'expected an AHR scrub state')
+    return ahr
+  }
+
+  it('scrub.r2: an AHR pool with no md check and a running btrfs status reports the btrfs phase', async () => {
+    const { bare } = await btrfsRunningServer(mockFixtures.ahrMdstat(), { stdout: BTRFS_RUNNING_GT, stderr: '', exitCode: 0 })
+    const res = await bare.inject({ method: 'GET', url: '/v1/scrub' })
+    assert.equal(res.statusCode, 200)
+    // The #82 cell, fixed: phase 2 — or a scrub started outside ANAS — reads
+    // running, with btrfs's own percentage (0.00% of the real capture).
+    assert.deepEqual(ahrRow(res).running, { phase: 'btrfs-checksums', percent: 0 })
+    await bare.close()
+  })
+
+  it('scrub.r2: with an md check in flight the md figures win and no btrfs status is read', async () => {
+    const { bare, executor } = await btrfsRunningServer(mockFixtures.ahrMdstatCheck(), { stdout: BTRFS_RUNNING_GT, stderr: '', exitCode: 0 })
+    const res = await bare.inject({ method: 'GET', url: '/v1/scrub' })
+    assert.equal(res.statusCode, 200)
+    // One pass at a time: the route reads the btrfs status only when no band
+    // array is checking, so the md figures are the whole truth and the
+    // accepted per-pool status read did not even happen.
+    assert.deepEqual(ahrRow(res).running, {
+      phase: 'md-parity',
+      percent: 12.4,
+      speedBytesSec: (64800 + 53973) * 1024,
+      etaSeconds: 72,
+    })
+    assert.equal(executor.calls.some(c => c.command === BTRFS && c.args[0] === 'scrub' && c.args[1] === 'status'), false)
+    await bare.close()
+  })
+
+  it('scrub.r2: with the btrfs status read failing there is no running key (fail-open)', async () => {
+    const { bare } = await btrfsRunningServer(mockFixtures.ahrMdstat(), { stdout: '', stderr: 'ERROR: not mounted', exitCode: 1 })
+    const res = await bare.inject({ method: 'GET', url: '/v1/scrub' })
+    assert.equal(res.statusCode, 200)
+    // A status read that could not be made costs the running state and nothing
+    // else — the row still answers, and reads idle rather than erroring.
+    assert.equal('running' in ahrRow(res), false)
     await bare.close()
   })
 

@@ -1148,3 +1148,16 @@ export const AhrScrubResult = z.object({
   metadataCorrected: AhrMetadataCorrected.optional(),
 })
 export type AhrScrubResult = z.infer<typeof AhrScrubResult>
+
+/**
+ * The `detail` an `ahr.scrub` job publishes on itself the moment it starts
+ * (the rclone.6 mechanism). A FAILED job carries `result: null`, and the
+ * public `Job` carries no params — without this, a failed scrub cannot be
+ * attributed to the pool it was scrubbing, and the Scrubs screen renders the
+ * pool as never-scrubbed. A completed job also carries `result.scrubbed`;
+ * this is what survives the failure.
+ */
+export const AhrScrubJobDetail = z.object({
+  pool: PoolName,
+})
+export type AhrScrubJobDetail = z.infer<typeof AhrScrubJobDetail>

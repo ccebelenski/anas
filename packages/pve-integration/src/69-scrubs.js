@@ -274,6 +274,12 @@
             // GT-20) — the one rot signal a CLEAN scrub can hold, so it reads
             // on the row even when nothing else was found.
             metadataCorrected: (kind === 'ahr' && findingsByPool) ? correctedFor(findingsByPool, target.pool) : null,
+            // The NEWEST AHR scrub job for this pool FAILED (scrub.r2, #82) —
+            // { at, message }, or null when the newest job completed. A failed
+            // job has no result, so the four readers above answer null for it;
+            // a later completed scrub displaces this exactly as it displaces
+            // findings, and vice versa.
+            lastFailed: (kind === 'ahr' && findingsByPool) ? failedFor(findingsByPool, target.pool) : null,
             // A stable per-row key (kind+pool) so selection survives a poll.
             rowKey: kind + ':' + (target.pool || '')
         };
@@ -294,6 +300,15 @@
     // already ruled out. The row shows the entry only when that newest job
     // actually carries findings, so a clean scrub clears the indicator.
     //
+    // scrub.r2 (GitHub #82): FAILED `ahr.scrub` jobs count too, and the newest
+    // job per pool wins ACROSS both statuses. A failed job's entry is
+    // { at, failed: { at, message } } and carries no findings/parity/skipped/
+    // corrected — those belong to a completed result, and the entry DROPS the
+    // result even if the failure somehow carried one (the fold tested exactly
+    // that shape: a newest failed job WITH result.findings still names
+    // nothing). A later clean scrub displaces an earlier failure just as a
+    // clean scrub displaces findings, and vice versa.
+    //
     // The job queue is IN MEMORY: it holds what has run since anasd started and
     // nothing older, and ANAS keeps no scrub history of its own (stateless — no
     // shadow state). So the row says exactly that and never implies a record
@@ -303,25 +318,44 @@
         return isFinite(t) ? t : 0;
     }
 
+    // The pool a scrub job ran on: its result when it has one (completed),
+    // else the detail the job publishes while it runs (scrub.r2 — a failed
+    // job normally has no result to name its pool, so the detail is its only
+    // attribution; a failure that did carry a result names it from there).
+    // A job with neither names no pool and is skipped.
+    function scrubJobPool(job) {
+        return (job.result && job.result.scrubbed) || (job.detail && job.detail.pool) || null;
+    }
+
     function latestScrubByPool(res) {
         var byPool = {};
         var list = (res && res.data) || [];
         for (var i = 0; i < list.length; i++) {
             var job = list[i] || {};
-            if (job.operation !== 'ahr.scrub' || job.status !== 'completed') {
+            if (job.operation !== 'ahr.scrub' || (job.status !== 'completed' && job.status !== 'failed')) {
                 continue;
             }
-            var result = job.result;
-            var pool = result && result.scrubbed;
+            var pool = scrubJobPool(job);
             if (!pool) {
                 continue;
             }
             var prior = byPool[pool];
             if (!prior || jobTime(job) >= prior.at) {
-                byPool[pool] = { at: jobTime(job), result: result };
+                byPool[pool] = job.status === 'failed'
+                    ? { at: jobTime(job), failed: failedEntryOf(job) }
+                    : { at: jobTime(job), result: job.result };
             }
         }
         return byPool;
+    }
+
+    /** The failed entry of a failed scrub job: when it ended, and what it said. */
+    function failedEntryOf(job) {
+        var err = job.error || {};
+        return {
+            at: job.completedAt || job.startedAt || job.createdAt || '',
+            message: err.message || err.code || ''
+        };
     }
 
     /** The findings entry for a row — null when the pool's newest scrub was clean. */
@@ -333,6 +367,12 @@
         return entry;
     }
 
+    /** The failure entry for a row — null when the pool's newest scrub completed. */
+    function failedFor(byPool, pool) {
+        var entry = byPool[pool];
+        return (entry && entry.failed) ? entry.failed : null;
+    }
+
     // The newest scrub's phase-1 parity verdicts (D1) — present even when the
     // scrub attributed no corrupt file, because THAT is the parity-only-rot
     // case: data checksums all passed, the parity member disagrees.
@@ -342,21 +382,31 @@
     // still counting the stripe is a parity residual on that band, reported in
     // the SAME row shape. The newest of the two wins, for the same reason the
     // newest scrub does: the older reading describes a pool that has changed.
+    //
+    // scrub.r2 fold (coordinator ruling on review NOTICED 3): a FAILED job
+    // counts HERE not at all. A failed scrub verified nothing and WROTE
+    // nothing, so the last COMPLETED pass's parity fact still stands — and
+    // clearing it hid that durable warning (and its Rewrite-parity door)
+    // until the next completed scrub, a month on the periodic cadence. Only
+    // a completed scrub or a completed repair moves this reading. (A failed
+    // scrub still wins the failure cell — that is `latestScrubByPool`, which
+    // keeps `scrubJobPool` for its own pool attribution; a failed REPAIR has
+    // no result and so named no pool here even before this.)
     function latestParityByPool(res) {
         var byPool = {};
         var list = (res && res.data) || [];
         for (var i = 0; i < list.length; i++) {
             var job = list[i] || {};
-            if (job.status !== 'completed' || !job.result) {
+            if (job.status !== 'completed') {
                 continue;
             }
             var rows = null;
             var pool = null;
             if (job.operation === 'ahr.scrub') {
-                pool = job.result.scrubbed;
+                pool = scrubJobPool(job);
                 rows = job.result.parityMismatches;
             } else if (job.operation === 'ahr.repair') {
-                pool = job.result.pool;
+                pool = job.result && job.result.pool;
                 rows = job.result.parityResiduals;
             } else {
                 continue;
@@ -411,15 +461,27 @@
 
     // What the running pass is called. ZFS names it in the scan record (a
     // RESILVER is never called a scrub); md's check has no such name, so an AHR
-    // row says "check running" — the words md itself uses.
-    function runningLabel(kind, fn) {
+    // row says which phase is in flight — scrub.r2 (GitHub #82) made the two
+    // phases of an AHR scrub distinguishable (`phase`): "md parity check" or
+    // "btrfs checksum scrub". Phase absent = a daemon too old to report it
+    // (the skew rule) → the old generic words.
+    function runningLabel(kind, fn, phase) {
         if (fn === 'RESILVER') {
             return t('resilvering');
         }
         if (fn === 'SCRUB') {
             return t('scrubbing');
         }
-        return kind === 'ahr' ? t('check running') : t('scrubbing');
+        if (kind === 'ahr') {
+            if (phase === 'md-parity') {
+                return t('md parity check running');
+            }
+            if (phase === 'btrfs-checksums') {
+                return t('btrfs checksum scrub running');
+            }
+            return t('check running');
+        }
+        return t('scrubbing');
     }
 
     // The live pass, rendered IN PLACE of the verdict — while a pass runs there
@@ -450,15 +512,78 @@
         if (eta) {
             parts.push(t('ETA') + ' ' + eta);
         }
-        var title = kind === 'ahr'
-            ? t('an md check is running. The figures cover the bands checking right now. '
-                + 'Any ETA is a floor, because bands still queued behind them are not counted')
-            : t('a verify pass is running. ZFS records its progress but neither a rate nor a '
+        var title;
+        if (kind === 'ahr' && running.phase === 'btrfs-checksums') {
+            // scrub.r2 (#82): the checksum pass is NOT the md check, and it can
+            // be in flight without ANAS having started it (a hand-run
+            // `btrfs scrub`). The percentage is btrfs's, not a derivation.
+            title = t('the btrfs checksum scrub is running (phase 2 of the AHR scrub, or a scrub '
+                + 'started outside ANAS). The percentage is btrfs\'s own figure');
+        } else if (kind === 'ahr') {
+            title = t('an md check is running. The figures cover the bands checking right now. '
+                + 'Any ETA is a floor, because bands still queued behind them are not counted');
+        } else {
+            title = t('a verify pass is running. ZFS records its progress but neither a rate nor a '
                 + 'time-to-go, so only the percentage is shown');
+        }
         return '<span title="' + enc(title) + '" style="color:var(--anas-accent,#3468c0);">'
             + '<i class="fa fa-refresh" aria-hidden="true" style="margin-right:5px;"></i>'
-            + enc(runningLabel(kind, running.function))
+            + enc(runningLabel(kind, running.function, running.phase))
             + (parts.length ? enc(': ' + parts.join(' · ')) : '')
+            + '</span>';
+    }
+
+    // The amber parity span: the fact (which bands, how many mismatches) and
+    // the door (Rewrite parity / reconcile the mirror) in one clickable
+    // statement. Built ONCE here and shared by the completed branch and the
+    // failed cell (scrub.r2 fold, GitHub #82 review NOTICED 3) so the door
+    // never exists in one branch and not the other. `findings` only selects
+    // the tooltip — with corrupt files on the pool the rewrite verb is
+    // refused and the tip says so; the failed branch passes null (a failed
+    // job carries no result, so no findings ride it) and gets the
+    // data-intact text its own completed pass established.
+    function paritySpanHtml(parity, findings) {
+        var bands = [];
+        // A mismatch on a RAID1 band is legs disagreeing with each
+        // other, not parity disagreeing with data, and it has no
+        // Rewrite-parity verb (sixth pass). The tooltip offers the verb
+        // unless EVERY mismatching band is a known mirror — a result
+        // from an older daemon carries no level, and the daemon is the
+        // authority either way (409 `not-a-parity-band`).
+        var rewritable = false;
+        for (var p = 0; p < parity.length; p++) {
+            bands.push(parity[p].band + ' (' + parity[p].mismatchCnt + ')');
+            if (parity[p].level !== 'raid1') {
+                rewritable = true;
+            }
+        }
+        // selfheal.10 — the indicator is now a DOOR as well as a
+        // statement: the data-intact/parity-wrong case has a verb
+        // (Rewrite parity), and it lives where the fact is told. With
+        // corrupt files also on the pool the verb is refused (md
+        // repair would bless that rot), and the window says so on a
+        // disabled button rather than hiding the door.
+        var parityTip = findings
+            ? t('md counted parity mismatches on these bands. The file list names what the checksum '
+                + 'scrub attributed. A mismatch it cannot attribute is PARITY-ONLY rot: the parity (or Q) '
+                + 'member disagrees while every file\'s checksum passes. Repair the named files first. '
+                + 'Rewriting parity now would recompute it from corrupt data.')
+            : (rewritable
+                ? t('md counted parity mismatches on these bands, but the checksum scrub found no corrupt '
+                    + 'files. Every file\'s checksum passes. On a parity band the rot is in the PARITY (or Q) '
+                    + 'member. At the next disk failure md would reconstruct from the wrong parity. '
+                    + 'Click to rewrite that band\'s parity from the data as it stands.')
+                : t('md counted mismatches on these bands, but the checksum scrub found no corrupt files. '
+                    + 'No band here is a parity band, so there is no parity to rewrite: a RAID1 mirror\'s '
+                    + 'legs disagree with each other, and one leg holds something btrfs has never been asked '
+                    + 'to read. md\'s repair on a mirror copies the first in-sync leg over the others without '
+                    + 'looking at which one is right, so do not run md repair on a mirror. '
+                    + 'Click to reconcile the mirror: ANAS re-scrubs first, then compares the legs row by row '
+                    + 'and writes back the one the checksum vouches for.'));
+        return '<span class="anas-scrub-parity-link" style="color:var(--anas-warn,#b06a12);'
+            + 'cursor:pointer;text-decoration:underline;" title="' + enc(parityTip) + '">'
+            + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
+            + enc(t('parity mismatch on') + ' ' + bands.join(', '))
             + '</span>';
     }
 
@@ -479,6 +604,34 @@
         var running = rec.get('running');
         if (running) {
             return renderRunning(running, rec.get('kind'));
+        }
+
+        // A scrub that FAILED (scrub.r2, GitHub #82) is the one thing this cell
+        // has to say: the pool was NOT fully verified, and until now the row
+        // read as never scrubbed (the panel only ever looked at completed jobs).
+        // Before the findings block by construction — the reducer's failed
+        // entry drops the job's result, so even a failure that carried
+        // findings names none (the fold's jf3) — and displaced by any
+        // completed scrub that ran after it, the reducer's newest-wins rule.
+        var lastFailed = rec.get('lastFailed');
+        if (lastFailed) {
+            var failTip = lastFailed.message
+                || t('the scrub stopped before it finished, so the pool was not fully verified');
+            // The last COMPLETED pass's parity reading still rides the cell
+            // (fold, GitHub #82 review NOTICED 3): the failed pass verified
+            // nothing and WROTE nothing, so parity mismatches counted before
+            // it are still true, and their Rewrite-parity door must stay open
+            // — clearing it hid a durable warning for a month on the
+            // periodic cadence. Findings never ride a failed job — the
+            // reducer drops a failed entry's result even when the failure
+            // carried one — hence the null.
+            var failParity = rec.get('parity');
+            var failHtml = '<span style="color:var(--anas-warn,#b06a12);" title="' + enc(failTip) + '">'
+                + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
+                + enc(t('last scrub failed') + ' · ' + absTime(lastFailed.at))
+                + ' <span style="color:var(--anas-muted,gray);">'
+                + enc(t('· last scrub since the daemon started')) + '</span></span>';
+            return failParity ? failHtml + ' ' + paritySpanHtml(failParity, null) : failHtml;
         }
 
         // An AHR scrub that FOUND something — or whose phase 1 counted parity
@@ -509,48 +662,7 @@
                     + '</span>');
             }
             if (parity) {
-                var bands = [];
-                // A mismatch on a RAID1 band is legs disagreeing with each
-                // other, not parity disagreeing with data, and it has no
-                // Rewrite-parity verb (sixth pass). The tooltip offers the verb
-                // unless EVERY mismatching band is a known mirror — a result
-                // from an older daemon carries no level, and the daemon is the
-                // authority either way (409 `not-a-parity-band`).
-                var rewritable = false;
-                for (var p = 0; p < parity.length; p++) {
-                    bands.push(parity[p].band + ' (' + parity[p].mismatchCnt + ')');
-                    if (parity[p].level !== 'raid1') {
-                        rewritable = true;
-                    }
-                }
-                // selfheal.10 — the indicator is now a DOOR as well as a
-                // statement: the data-intact/parity-wrong case has a verb
-                // (Rewrite parity), and it lives where the fact is told. With
-                // corrupt files also on the pool the verb is refused (md
-                // repair would bless that rot), and the window says so on a
-                // disabled button rather than hiding the door.
-                var parityTip = findings
-                    ? t('md counted parity mismatches on these bands. The file list names what the checksum '
-                        + 'scrub attributed. A mismatch it cannot attribute is PARITY-ONLY rot: the parity (or Q) '
-                        + 'member disagrees while every file\'s checksum passes. Repair the named files first. '
-                        + 'Rewriting parity now would recompute it from corrupt data.')
-                    : (rewritable
-                        ? t('md counted parity mismatches on these bands, but the checksum scrub found no corrupt '
-                            + 'files. Every file\'s checksum passes. On a parity band the rot is in the PARITY (or Q) '
-                            + 'member. At the next disk failure md would reconstruct from the wrong parity. '
-                            + 'Click to rewrite that band\'s parity from the data as it stands.')
-                        : t('md counted mismatches on these bands, but the checksum scrub found no corrupt files. '
-                            + 'No band here is a parity band, so there is no parity to rewrite: a RAID1 mirror\'s '
-                            + 'legs disagree with each other, and one leg holds something btrfs has never been asked '
-                            + 'to read. md\'s repair on a mirror copies the first in-sync leg over the others without '
-                            + 'looking at which one is right, so do not run md repair on a mirror. '
-                            + 'Click to reconcile the mirror: ANAS re-scrubs first, then compares the legs row by row '
-                            + 'and writes back the one the checksum vouches for.'));
-                spans.push('<span class="anas-scrub-parity-link" style="color:var(--anas-warn,#b06a12);'
-                    + 'cursor:pointer;text-decoration:underline;" title="' + enc(parityTip) + '">'
-                    + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
-                    + enc(t('parity mismatch on') + ' ' + bands.join(', '))
-                    + '</span>');
+                spans.push(paritySpanHtml(parity, findings));
             }
             if (skipped) {
                 var why = [];
@@ -661,15 +773,22 @@
         // cloud preview (72-cloud.js). The grid comes from this closure, never
         // a ComponentQuery: two Scrub windows can be open.
         var seq = (scrubGrid._loadSeq = (scrubGrid._loadSeq || 0) + 1);
-        // Two reads, one render: the uniform scrub state, and the daemon's
-        // completed jobs for the last AHR scrub findings (selfheal.3). The jobs
-        // read is FAIL-OPEN — an older daemon, or a list that cannot be read,
-        // costs the indicator and nothing else.
-        var jobsRead = ANAS.api.get(node, '/jobs?status=completed').then(
+        // Three reads, one render: the uniform scrub state, and the daemon's
+        // completed AND failed jobs for the last AHR scrub (selfheal.3, and
+        // scrub.r2 #82 — a failed scrub used to be invisible here, no result
+        // to attribute it to a pool). EACH jobs read is FAIL-OPEN — an older
+        // daemon, or a list that cannot be read, costs the indicator and
+        // nothing else — and the two lists are concatenated for the reducers,
+        // which pick the newest job per pool across both statuses.
+        var completedRead = ANAS.api.get(node, '/jobs?status=completed').then(
             function (r) { return r; },
             function () { return null; }
         );
-        Promise.all([ANAS.api.get(node, '/scrub'), jobsRead]).then(function (both) {
+        var failedRead = ANAS.api.get(node, '/jobs?status=failed').then(
+            function (r) { return r; },
+            function () { return null; }
+        );
+        Promise.all([ANAS.api.get(node, '/scrub'), completedRead, failedRead]).then(function (both) {
             var res = both[0];
             // Drop a response older than the newest request: its rows, its
             // mask and — below all else — its idea of what was selected.
@@ -693,11 +812,16 @@
             // (setLoading(false) is a no-op when no mask is up). Applies to
             // error alike, below; only a STALE response keeps its hands off.
             try { scrubGrid.setLoading(false); } catch (e) { /* non-fatal */ }
+            // One list for both reducers: completed first, failed second; the
+            // newest job per pool wins by time regardless of the order here.
+            var jobsRes = {
+                data: ((both[1] && both[1].data) || []).concat((both[2] && both[2].data) || []),
+            };
             var findingsByPool = {};
             var parityByPool = {};
             try {
-                findingsByPool = latestScrubByPool(both[1]);
-                parityByPool = latestParityByPool(both[1]);
+                findingsByPool = latestScrubByPool(jobsRes);
+                parityByPool = latestParityByPool(jobsRes);
             } catch (eJ) {
                 ANAS.warn('scrub findings read failed: ' + ANAS.errText(eJ));
             }
@@ -2069,7 +2193,8 @@
                 { name: 'findings', type: 'auto' },
                 { name: 'parity', type: 'auto' },
                 { name: 'skipped', type: 'auto' },
-                { name: 'metadataCorrected', type: 'auto' }],
+                { name: 'metadataCorrected', type: 'auto' },
+                { name: 'lastFailed', type: 'auto' }],
             data: [],
             sorters: [{ property: 'kind', direction: 'ASC' }, { property: 'pool', direction: 'ASC' }]
         });

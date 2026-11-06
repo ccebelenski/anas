@@ -516,6 +516,7 @@ export type LastScrub = z.infer<typeof LastScrub>
  *   | field         | ZFS (`zpool status -jv` scan_stats)      | AHR (/proc/mdstat) |
  *   |---------------|------------------------------------------|--------------------|
  *   | function      | SCRUB or RESILVER (the record names it)   | absent (md's check is not a ZFS scan) |
+ *   | phase         | ABSENT (ZFS names the pass in `function`) | `md-parity` or `btrfs-checksums` |
  *   | percent       | examined ÷ to_examine                     | the progress line's `check = N%` |
  *   | speedBytesSec | ABSENT — scan_stats has no rate field      | `speed=NK/sec` |
  *   | etaSeconds    | ABSENT — scan_stats has no ETA field       | `finish=N.Nmin` |
@@ -531,6 +532,12 @@ export type LastScrub = z.infer<typeof LastScrub>
 export const ScrubRunning = z.object({
   /** Which pass is running, where the filesystem names it (ZFS only). */
   function: ScanFunction.optional(),
+  /**
+   * Which AHR pass is running — `md-parity` while a band array checks,
+   * `btrfs-checksums` while the btrfs scrub runs. AHR only; absent from an
+   * older daemon (additive-field version-skew rule).
+   */
+  phase: AhrScrubPhase.optional(),
   /** Progress 0–100, when the filesystem reports enough to compute it. */
   percent: z.number().min(0).max(100).optional(),
   /** Current throughput in bytes/second, when reported. */
