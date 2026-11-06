@@ -9,6 +9,15 @@
 # on as a workflow artifact. Only `publish` holds `contents: write`, on a fresh
 # runner that installs and runs nothing from npm — so no dependency's code ever
 # runs beside the write token. Actions are pinned to commits, as in ci.yml.
+#
+# THE GATES ARE NOT RE-RUN HERE (release.1, 0.4.4 retrospective ruling (p)):
+# `build` looks up the CI workflow's conclusion for the tagged commit and
+# refuses unless one completed run on that exact sha concluded `success`.
+# Ruling (n) is what this enforces mechanically — main is pushed, CI passes
+# on the exact commit, then the tag is cut; a tag on a commit CI never ran
+# cannot release. CI runs on every push to main, never on a tag push, so the
+# run this step finds is main's. Ruling (k) still holds: the tests gate the
+# tag, through that run.
 name: Release
 
 on:
@@ -23,6 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read   # to list the CI runs for the tagged commit
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -41,6 +51,31 @@ jobs:
             exit 1
           fi
 
+      # release.1: the tagged commit must have a completed, successful CI
+      # run. HEAD after the checkout is the commit the tag points to (an
+      # annotated tag is peeled by the checkout), and only runs whose
+      # head_sha is exactly that commit count — a green run on a parent is
+      # not a green run on this commit. The gh CLI is preinstalled on the
+      # runner and reads with the job's own token (actions: read).
+      - name: Require a green CI run on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          SHA="$(git rev-parse HEAD)"
+          RUNS="$(gh api "repos/${GH_REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&per_page=50" \
+            --jq '.workflow_runs[] | [.status, (.conclusion // "none"), .html_url] | @tsv')"
+          if [ -z "${RUNS}" ]; then
+            echo "ERROR: no CI run exists for commit ${SHA} (tag ${GITHUB_REF_NAME}) — push main, let CI pass on this exact commit, then tag it (ruling (n))." >&2
+            exit 1
+          fi
+          echo "CI runs on ${SHA}:"
+          echo "${RUNS}"
+          if ! printf '%s\n' "${RUNS}" | grep -q $'^completed\tsuccess\t'; then
+            echo "ERROR: no completed CI run on commit ${SHA} concluded success — refusing to release ${GITHUB_REF_NAME}." >&2
+            exit 1
+          fi
+
       - run: npm ci --ignore-scripts
 
       # make-release's tag step needs a git identity if it ever creates the
@@ -51,15 +86,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      # Ruling (k): tests gate the release; the CI gates are repeated here so a
-      # tag cannot publish a commit whose CI is not green.
-      - name: Install Perl dependencies for tests
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwww-perl liburi-perl
+      # Ruling (k) via ruling (p): the tests gated this commit in the CI run
+      # checked above; they are not repeated here. Build and package only.
       - run: npm run build
-      - run: npx tsc -p tests/integration/tsconfig.json
-      - run: npm run test:unit
-      - run: TZ=Pacific/Kiritimati npm run test:unit:daemon
-      - run: npm run lint
 
       - name: Build release (make-release.sh)
         run: ./packaging/make-release.sh
