@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read   # to list the CI runs for the tagged commit
+      actions: read # to list the CI runs for the tagged commit
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
