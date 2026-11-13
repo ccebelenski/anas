@@ -63,6 +63,19 @@ const ACLTYPE_MEDIA = ['get', '-Hp', '-o', 'value', 'acltype', '--', 'testpool/m
 /** The mountpoint table the path resolver reads (the default mock has none). */
 const MOUNTPOINTS = 'testpool\t/testpool\ntestpool/media\t/testpool/media\ntestpool/x\t/testpool/x\ntestpool/x/data\t/testpool/x/data\n'
 
+/**
+ * #85: `resolveShareTarget` (the share's home) now asks the SERVING filesystem
+ * from `findmnt --json` — the SAME read the recursive walk takes (the dev
+ * mock's default tree has nothing at or under /testpool, so a readable table
+ * answers "no ZFS" and every testpool path resolves onto NO dataset). Merge
+ * ONE agreeing row — the pool's own mount, `/testpool` (the shape of every
+ * findmnt entry) — into the default tree: the gate opens for everything below
+ * it, and no walk scope changes (a walk rooted under /testpool/media still
+ * finds no mount at or under its own root; its longest containing mount is
+ * `/testpool`, not a mount of its own, so no `.zfs` prune and no new roots).
+ */
+const TESTPOOL_ROW = { target: '/testpool', source: 'testpool', fstype: 'zfs', options: 'rw' }
+
 const BASE_CONF = [
   '[global]',
   '\tworkgroup = WORKGROUP',
@@ -134,7 +147,20 @@ describe('access.1 — the share-path grant', () => {
       calls.push({ command, args })
       const stub = all.find(s => s.command === command
         && (s.args === undefined || (s.args.length === args.length && s.args.every((a, i) => a === args[i]))))
-      return stub ? stub.result : orig(command, args)
+      if (stub)
+        return stub.result
+      // The #85 row MERGED into (never replacing) the default mount table —
+      // the walk's scope must keep reading the real mock mounts.
+      if (command === '/usr/bin/findmnt' && args.length === 1 && args[0] === '--json') {
+        const base = await orig(command, args)
+        if (base.exitCode !== 0)
+          return base
+        const table = JSON.parse(base.stdout) as { filesystems?: unknown[] }
+        if (!Array.isArray(table.filesystems))
+          return base
+        return { ...base, stdout: JSON.stringify({ ...table, filesystems: [...table.filesystems, TESTPOOL_ROW] }) }
+      }
+      return orig(command, args)
     }
     return { calls }
   }

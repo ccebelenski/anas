@@ -47,6 +47,7 @@
  */
 
 import type { IscsiLunKind, IscsiOwnershipTag, PveOwnership, PveStorageRef, SystemPoolFacts } from '@anas/shared'
+import type { FindmntNode } from '../parsers/findmnt.js'
 import type { ZfsMountpoint } from '../parsers/pve-storage.js'
 import { isAnasIqn, ZVOL_PATH_PREFIX, zvolDatasetFromPath } from '@anas/shared'
 import { matchMountpoint } from '../parsers/pve-storage.js'
@@ -95,6 +96,15 @@ export interface OwnershipInputs {
   pveStorages: Map<string, PveStorageRef[]> | null
   /** ZFS mountpoints, from `readZfsMountpoints()` — resolves a file onto a dataset. */
   zfsMountpoints: ZfsMountpoint[]
+  /**
+   * The findmnt table of the SAME read (`readZfsMountpointsFull`) — the #85
+   * gate on that resolution: a file whose SERVING filesystem (the longest-
+   * prefix mount in this table) is not ZFS sits on no dataset, which is what
+   * makes the AHR branch of {@link classifyBacking} reachable on a ZFS-root
+   * node. `null`/omitted is UNREADABLE: the mountpoint match answers as
+   * before, which can only tighten, never loosen.
+   */
+  findmntNodes?: FindmntNode[] | null
   /** AHR pool mountpoints (`name -> mountpoint`); an AHR pool's only block kind is a file. */
   ahrMountpoints?: Map<string, string>
   /**
@@ -224,7 +234,7 @@ export function classifyBacking(
   // parser never emits an empty dataset (`parseZfsMountpoints` skips rows
   // without one) — so an `mp` always carries the dataset it matched, and there
   // is no "mountpoint without a dataset" shape to answer.
-  const mp = matchMountpoint(devPath, inputs.zfsMountpoints)
+  const mp = matchMountpoint(devPath, inputs.zfsMountpoints, inputs.findmntNodes ?? null)
   if (mp) {
     const owned = ownershipOf(inputs, mp.dataset)
     return {

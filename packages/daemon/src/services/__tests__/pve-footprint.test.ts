@@ -708,3 +708,129 @@ describe('sharePathClaim — dataset claims first, then the unresolvable-dir pat
     assert.deepEqual(claim, { kind: 'dir-path', storage: 'zstore', path: '/srv/other/sub' })
   })
 })
+
+// --- #85: the captured ZFS-root node, end to end through the footprint --------
+// GitHub #85: on this node `rpool/ROOT/pve-1` mounts at `/`, so until the ONE
+// resolver was gated on the SERVING filesystem, every path not under a deeper
+// ZFS mount longest-prefix-matched the BOOT dataset — a `dir` storage on ext4
+// (`/mnt/pve/virtssd`) was refused as PVE-managed. Reproduced live on PVE
+// 9.2.2 / ANAS 0.4.5; every fixture below is the node's captured bytes.
+
+describe('the captured ZFS-root node — an ext4 dir storage no longer lands on the boot dataset (#85)', () => {
+  // `/etc/pve/storage.cfg` (ZFS-root stunt node, PVE 9.2.2, 2026-11-13).
+  const ZFS_ROOT_CFG = 'dir: local\n\tpath /var/lib/vz\n\tcontent import,iso,backup,vztmpl\n\n'
+    + 'zfspool: local-zfs\n\tpool rpool/data\n\tcontent rootdir,images\n\tsparse 1\n\n'
+    + 'dir: virtssd\n\tpath /mnt/pve/virtssd\n\tcontent images,backup,iso,snippets,vztmpl,rootdir\n\tis_mountpoint 1\n\tnodes anas-zfs\n\n'
+  // `zfs list -H -o name,mountpoint`.
+  const ZFS_ROOT_LIST = 'rpool\t/rpool\nrpool/ROOT\t/rpool/ROOT\nrpool/ROOT/pve-1\t/\nrpool/data\t/rpool/data\nrpool/var-lib-vz\t/var/lib/vz\n'
+  // `findmnt --json` (exact bytes: fixtures/mounts/findmnt-zfs-root.json).
+  const ZFS_ROOT_TABLE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/mounts/findmnt-zfs-root.json'), 'utf-8')
+  let dir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-pve-zfsroot-'))
+    await writeFile(join(dir, 'storage.cfg'), ZFS_ROOT_CFG, 'utf8')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  /**
+   * The captured node's boot facts: rpool's bootfs, and `/` served by zfs.
+   * `findmntTable: false` drops the `findmnt --json` fixture — the mock then
+   * answers exit 127, i.e. the mount table is UNREADABLE (null), not empty.
+   */
+  function capturedNodeMock(opts: { findmntTable?: boolean } = {}): MockExecutor {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: '/usr/sbin/zpool',
+      args: ['get', '-H', '-o', 'name,value', 'bootfs'],
+      result: { stdout: 'rpool\trpool/ROOT/pve-1\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/bin/findmnt',
+      args: ['-n', '-o', 'SOURCE,FSTYPE', '/'],
+      result: { stdout: 'rpool/ROOT/pve-1 zfs\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/sbin/zfs',
+      args: ['list', '-H', '-o', 'name,mountpoint'],
+      result: { stdout: ZFS_ROOT_LIST, stderr: '', exitCode: 0 },
+    })
+    if (opts.findmntTable !== false) {
+      mock.addFixture({
+        command: '/usr/bin/findmnt',
+        args: ['--json'],
+        result: { stdout: ZFS_ROOT_TABLE, stderr: '', exitCode: 0 },
+      })
+    }
+    return mock
+  }
+
+  it('local resolves onto rpool/var-lib-vz; virtssd is no ref and no unresolved dir either', async () => {
+    const fp = await loadPveFootprint(capturedNodeMock(), { pveStorageCfg: join(dir, 'storage.cfg') })
+    // `local`'s path IS the rpool/var-lib-vz dataset's mountpoint — a ZFS
+    // answer, so it is a ref like it always was. `local-zfs` is the zfspool.
+    const rpool = fp.storagesByPool.get('rpool')!
+    assert.deepEqual(rpool.map(r => r.storage), ['local', 'local-zfs'])
+    assert.equal(rpool.find(r => r.storage === 'local')!.dataset, 'rpool/var-lib-vz')
+    // `virtssd` is served by ext4: no dataset match (that was #85), and the
+    // load-time caveat-emptor filter (`pathOnZfsFilesystem(...) !== false`,
+    // the READ answer ext4) drops it from `unresolvedDirPaths` too — a share
+    // on a non-ZFS filesystem is ALLOWED (EPICS §2, ruled 2026-09-22), so the
+    // share-path backstop must not carry the path either.
+    assert.deepEqual(fp.unresolvedDirPaths, [])
+  })
+
+  it('sharePathClaim: the ext4 storage path is claimed by NOTHING — not even the boot dataset (#85)', async () => {
+    const fp = await loadPveFootprint(capturedNodeMock(), { pveStorageCfg: join(dir, 'storage.cfg') })
+    // The defect itself: before the resolver was gated, the `/` mount
+    // (rpool/ROOT/pve-1) longest-prefix-matched these paths and the boot
+    // dataset "owned" them — a 409 PVE_MANAGED refusal on a share outside
+    // any dataset. The findmnt table READS ext4 at both; no dataset hosts
+    // them.
+    assert.equal(fp.sharePathClaim('/mnt/pve/virtssd'), null)
+    assert.equal(fp.sharePathClaim('/mnt/pve/virtssd/template/iso'), null)
+    assert.equal(fp.sharePathClaim('/mnt/extra'), null)
+    assert.equal(fp.sharePathClaim('/mnt/extra/data'), null)
+    // datasetOfPath answers the same way (one expression, never a second copy).
+    assert.equal(fp.datasetOfPath('/mnt/pve/virtssd'), null)
+    assert.equal(fp.datasetOfPath('/mnt/extra'), null)
+  })
+
+  it('sharePathClaim: a path really ON the boot dataset is still claimed, system-owned', async () => {
+    const fp = await loadPveFootprint(capturedNodeMock(), { pveStorageCfg: join(dir, 'storage.cfg') })
+    // The other half of #85: the gate gates on the SERVING filesystem, not on
+    // the path's shape. `/root/onboot` is served by `/` — zfs — so the boot
+    // dataset hosts it, exactly as it should be (the capture's bootfs facts
+    // make the verdict `system`).
+    const claim = fp.sharePathClaim('/root/onboot')!
+    assert.equal(claim.kind, 'dataset')
+    if (claim.kind !== 'dataset')
+      throw new Error('unreachable')
+    assert.equal(claim.dataset, 'rpool/ROOT/pve-1')
+    assert.equal(claim.ownership.kind, 'system')
+    assert.equal(fp.datasetOfPath('/root/onboot'), 'rpool/ROOT/pve-1')
+    // A deeper ZFS mount still wins over the root mount.
+    assert.equal(fp.datasetOfPath('/var/lib/vz/template'), 'rpool/var-lib-vz')
+  })
+
+  it('sharePathClaim: with the findmnt read UNREADABLE the dataset claim answers as before (missing facts tighten)', async () => {
+    // null table = UNKNOWN, and a missing fact may only TIGHTEN: the whole
+    // pre-#85 answer comes back, at the parse too — `virtssd` longest-prefix-
+    // matches the `/` mount again and joins the boot dataset's REFS (not the
+    // unresolved dirs — it "resolved"), and every ext4 path under it is
+    // claimed against the boot dataset again.
+    const fp = await loadPveFootprint(capturedNodeMock({ findmntTable: false }), { pveStorageCfg: join(dir, 'storage.cfg') })
+    const rpool = fp.storagesByPool.get('rpool')!
+    assert.deepEqual(rpool.map(r => r.storage), ['local', 'local-zfs', 'virtssd'])
+    assert.equal(rpool.find(r => r.storage === 'virtssd')!.dataset, 'rpool/ROOT/pve-1')
+    assert.deepEqual(fp.unresolvedDirPaths, [])
+    const claim = fp.sharePathClaim('/mnt/extra')!
+    assert.equal(claim.kind, 'dataset')
+    if (claim.kind !== 'dataset')
+      throw new Error('unreachable')
+    assert.equal(claim.dataset, 'rpool/ROOT/pve-1')
+    assert.deepEqual(fp.sharePathClaim('/mnt/pve/virtssd'), { kind: 'dataset', dataset: 'rpool/ROOT/pve-1', ownership: claim.ownership })
+  })
+})

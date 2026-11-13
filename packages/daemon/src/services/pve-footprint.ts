@@ -353,11 +353,14 @@ export interface PveFootprint {
    */
   claimedByPve: (dataset: string) => { storage: string } | null
   /**
-   * The ONE longest-prefix path → dataset resolver (pvepool.1 review fixes):
-   * the ZFS dataset whose mountpoint hosts `path`, or null when the path is on
-   * no ZFS dataset (a non-ZFS path — nothing here is PVE's to refuse) or the
-   * mountpoint read was unavailable. Share create/edit ask it, then
-   * {@link PveFootprint.ownershipOf} on the answer — the share-path backstop.
+   * The ONE path → dataset resolver (pvepool.1 review fixes, gated for #85):
+   * the ZFS dataset that SERVES `path` — the longest-prefix mount must be ZFS
+   * (a readable findmnt table answering otherwise means no dataset hosts the
+   * path; an unreadable one is unknown, and the mountpoint match answers as
+   * before). Null when the path is on no ZFS dataset (nothing here is PVE's
+   * to refuse) or the mountpoint read was unavailable. Share create/edit ask
+   * it, then {@link PveFootprint.ownershipOf} on the answer — the share-path
+   * backstop.
    */
   datasetOfPath: (path: string) => string | null
   /**
@@ -418,7 +421,7 @@ export async function loadPveFootprint(
   const [readStorages, readFacts, readMountFacts] = await Promise.all([
     // Explicit override, then the daemon-wide env override, then the real path
     // — the same resolution server.ts hands the route-level consumers.
-    readPveStorages(opts.pveStorageCfg ?? process.env.ANAS_STORAGE_CFG ?? PVE_STORAGE_CFG, zfsMountpoints),
+    readPveStorages(opts.pveStorageCfg ?? process.env.ANAS_STORAGE_CFG ?? PVE_STORAGE_CFG, zfsMountpoints, findmntNodes),
     readSystemPoolFacts(executor),
     // cr.23: the system-path mount facts ride the findmnt table this request
     // already read (zero extra I/O); when that table did not make it through
@@ -477,6 +480,16 @@ export async function loadPveFootprint(
     return { ...owned, childrenManageable: rawOwnershipOf(`${dataset}/${CHILDREN_PROBE_BASENAME}`) === null }
   }
 
+  // The ONE path → dataset resolution, asked with this request's findmnt read
+  // as the #85 gate: a path is hosted by a ZFS dataset only if the filesystem
+  // that actually serves it (the longest-prefix mount in that table) is ZFS;
+  // a readable table answering NOT zfs means no dataset hosts the path, and a
+  // null table is unknown — the mountpoint match answers as before, which can
+  // only tighten the gates below, never loosen one. Both surfaces of the
+  // resolver read this ONE expression (single source of truth).
+  const datasetOf = (path: string): string | null =>
+    matchMountpoint(path, zfsMountpoints ?? [], findmntNodes)?.dataset ?? null
+
   return {
     storagesByPool,
     unresolvedDirPaths,
@@ -486,20 +499,22 @@ export async function loadPveFootprint(
     storagesUnavailable,
     ownershipOf,
     ownedDescendant: (candidates, dataset) => ownedDescendantIn(candidates, dataset, ownershipOf),
-    // The ONE path → dataset resolver (pvepool.1 review fixes): longest-prefix
-    // over the mountpoint table, one exported matcher shared with the parser.
-    // Null opens the share-path gate ONLY for a path on no known ZFS dataset —
-    // when the mountpoint read itself failed the answer is equally null, and
-    // the shares routes' sentence never fires; storage.cfg's own unreadable
-    // verdict still tightens ownershipOf for every path that DOES resolve.
-    datasetOfPath: (path: string) => matchMountpoint(path, zfsMountpoints ?? [])?.dataset ?? null,
+    // The ONE path → dataset resolver (pvepool.1 review fixes) — the closure
+    // above. Null opens the share-path gate ONLY for a path on no known ZFS
+    // dataset — including #85's shape: a readable table that says the serving
+    // filesystem is NOT ZFS. When the mountpoint read itself failed the answer
+    // is equally null, and the shares routes' sentence never fires;
+    // storage.cfg's own unreadable verdict still tightens ownershipOf for
+    // every path that DOES resolve.
+    datasetOfPath: datasetOf,
     // The share-path backstop (pvepool.1 review fixes): the dataset answer
-    // first, then — only for a path on no known dataset — the unresolvable-dir
-    // path rule. `unresolvedDirPaths` is already the ZFS-BACKED subset (the
-    // caveat-emptor ruling dropped the non-ZFS paths at load time; a null
-    // findmnt table kept them all), so missing facts here may only tighten.
+    // first (the same `datasetOf` expression, never a second copy), then —
+    // only for a path on no known dataset — the unresolvable-dir path rule.
+    // `unresolvedDirPaths` is already the ZFS-BACKED subset (the caveat-
+    // emptor ruling dropped the non-ZFS paths at load time; a null findmnt
+    // table kept them all), so missing facts here may only tighten.
     sharePathClaim: (path: string): SharePathClaim | null => {
-      const dataset = matchMountpoint(path, zfsMountpoints ?? [])?.dataset
+      const dataset = datasetOf(path)
       if (dataset) {
         const owned = ownershipOf(dataset)
         return owned ? { kind: 'dataset', dataset, ownership: owned } : null

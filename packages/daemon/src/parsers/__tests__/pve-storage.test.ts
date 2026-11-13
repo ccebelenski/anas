@@ -5,7 +5,8 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { runInLane } from '../../executor/deadline.js'
 import { MockExecutor } from '../../executor/mock.js'
-import { parsePbsStorages, parsePveStorageCfg, parseZfsMountpoints, pathOnZfsFilesystem, readPbsStorages, readPveStorages, readZfsMountpoints, readZfsMountpointsFull, zfsMountTargets } from '../pve-storage.js'
+import { parseFindmntTable } from '../findmnt.js'
+import { matchMountpoint, parsePbsStorages, parsePveStorageCfg, parseZfsMountpoints, pathOnZfsFilesystem, readPbsStorages, readPveStorages, readZfsMountpoints, readZfsMountpointsFull, zfsMountTargets } from '../pve-storage.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/pve')
@@ -537,5 +538,96 @@ describe('pathOnZfsFilesystem — the longest-prefix findmnt mount decides (cave
 
   it('a trailing slash on either side changes nothing', () => {
     assert.equal(pathOnZfsFilesystem('/srv/dump/', [{ target: '/srv/dump/', source: 'tank/dump', fstype: 'zfs', options: 'rw' }]), true)
+  })
+})
+
+// Captured bytes from the ZFS-root stunt node (PVE 9.2.2, 2026-11-13) — the
+// shape that broke #85: `rpool/ROOT/pve-1` mounts at `/`, so every path not
+// under a deeper ZFS mountpoint longest-prefix-matched the BOOT dataset, even
+// where ext4 is mounted above it. Shared by the #85 describes below.
+
+/** `zfs list -H -o name,mountpoint`. */
+const ZFS_ROOT_LIST = 'rpool\t/rpool\nrpool/ROOT\t/rpool/ROOT\nrpool/ROOT/pve-1\t/\nrpool/data\t/rpool/data\nrpool/var-lib-vz\t/var/lib/vz\n'
+/** `findmnt --json` (exact bytes: fixtures/mounts/findmnt-zfs-root.json). */
+const ZFS_ROOT_TABLE = readFileSync(join(__dirname, '../../fixtures/mounts/findmnt-zfs-root.json'), 'utf-8')
+/** `/etc/pve/storage.cfg`. */
+const ZFS_ROOT_CFG = 'dir: local\n\tpath /var/lib/vz\n\tcontent import,iso,backup,vztmpl\n\n'
+  + 'zfspool: local-zfs\n\tpool rpool/data\n\tcontent rootdir,images\n\tsparse 1\n\n'
+  + 'dir: virtssd\n\tpath /mnt/pve/virtssd\n\tcontent images,backup,iso,snippets,vztmpl,rootdir\n\tis_mountpoint 1\n\tnodes anas-zfs\n\n'
+
+const zfsRootMountpoints = parseZfsMountpoints(ZFS_ROOT_LIST)
+const zfsRootNodes = parseFindmntTable(ZFS_ROOT_TABLE)!
+
+describe('matchMountpoint — the serving filesystem gates the dataset answer (#85)', () => {
+  it('a path on a non-ZFS filesystem is on no dataset, however deep the ZFS mount above it (/mnt/pve/virtssd, ext4)', () => {
+    assert.equal(matchMountpoint('/mnt/pve/virtssd', zfsRootMountpoints, zfsRootNodes), null)
+  })
+
+  it('a hand-mounted ext4 disk is on no dataset (/mnt/extra)', () => {
+    assert.equal(matchMountpoint('/mnt/extra', zfsRootMountpoints, zfsRootNodes), null)
+  })
+
+  it('a path really on the boot dataset still resolves (/root/onboot)', () => {
+    assert.equal(matchMountpoint('/root/onboot', zfsRootMountpoints, zfsRootNodes)?.dataset, 'rpool/ROOT/pve-1')
+  })
+
+  it('a deeper ZFS mount still wins over the root mount (/var/lib/vz/template)', () => {
+    assert.equal(matchMountpoint('/var/lib/vz/template', zfsRootMountpoints, zfsRootNodes)?.dataset, 'rpool/var-lib-vz')
+  })
+
+  it('a path under a dataset mountpoint resolves inside the pool (/rpool/data/x)', () => {
+    assert.equal(matchMountpoint('/rpool/data/x', zfsRootMountpoints, zfsRootNodes)?.dataset, 'rpool/data')
+  })
+
+  it('an UNREADABLE table is unknown — the ZFS-mountpoint match answers, tightening the gate', () => {
+    assert.equal(matchMountpoint('/mnt/pve/virtssd', zfsRootMountpoints, null)?.dataset, 'rpool/ROOT/pve-1')
+  })
+
+  // shares.r1 review (DeepSeek, probe 1): `findmnt --json` exiting 0 with a
+  // well-formed table of ZERO rows parsed to `[]`, which read as "no mount
+  // contains the path, so not ZFS" and opened the gate. findmnt on a real host
+  // always lists `/`; a table that contains nothing is a read that did not see.
+  it('a table with NO containing mount is unknown, never "not ZFS" (zero rows)', () => {
+    assert.deepEqual(parseFindmntTable('{"filesystems":[]}'), [])
+    assert.equal(pathOnZfsFilesystem('/mnt/extra', []), null)
+    assert.equal(matchMountpoint('/mnt/extra', zfsRootMountpoints, [])?.dataset, 'rpool/ROOT/pve-1')
+  })
+
+  it('a table whose only rows are elsewhere and carry no root is unknown for a path they do not contain', () => {
+    const nodes = [{ target: '/somewhere/else', source: '/dev/sdz1', fstype: 'ext4', options: 'rw' }] as unknown as Parameters<typeof pathOnZfsFilesystem>[1]
+    assert.equal(pathOnZfsFilesystem('/mnt/extra', nodes), null)
+    assert.equal(matchMountpoint('/mnt/extra', zfsRootMountpoints, nodes)?.dataset, 'rpool/ROOT/pve-1')
+  })
+})
+
+describe('parsePveStorageCfg — the serving filesystem gates a dir path (#85)', () => {
+  it('on the captured node: local resolves onto rpool/var-lib-vz, virtssd onto NOTHING', () => {
+    const parse = parsePveStorageCfg(ZFS_ROOT_CFG, zfsRootMountpoints, zfsRootNodes)
+    // `local` sits on the rpool/var-lib-vz dataset's mountpoint (a ZFS READ).
+    const rpool = parse.byPool.get('rpool')!
+    assert.deepEqual(rpool.map(r => r.storage), ['local', 'local-zfs'])
+    assert.deepEqual(rpool[0], {
+      storage: 'local',
+      type: 'dir',
+      dataset: 'rpool/var-lib-vz',
+      content: ['import', 'iso', 'backup', 'vztmpl'],
+    })
+    // `virtssd` is served by ext4 — the boot dataset does NOT host it. The
+    // parser is TOTAL over it: it lands in unresolvedDirs with its configured
+    // path; the footprint's caveat-emptor filter then drops it (a share on a
+    // non-ZFS filesystem is allowed).
+    assert.deepEqual(parse.unresolvedDirs, [{ storage: 'virtssd', path: '/mnt/pve/virtssd' }])
+  })
+
+  it('without the findmnt table the mountpoint match answers as before: virtssd lands on the boot dataset', () => {
+    // UNKNOWN tightens — this is the #85 behavior, kept ONLY for the case
+    // where the serving filesystem cannot be read. `local` resolves either
+    // way (its path IS a dataset mountpoint); `virtssd` wrongly longest-
+    // prefixes the `/` mount and joins the boot dataset's refs.
+    const parse = parsePveStorageCfg(ZFS_ROOT_CFG, zfsRootMountpoints)
+    assert.deepEqual(parse.unresolvedDirs, [])
+    const rpool = parse.byPool.get('rpool')!
+    assert.deepEqual(rpool.map(r => r.storage), ['local', 'local-zfs', 'virtssd'])
+    assert.equal(rpool[2].dataset, 'rpool/ROOT/pve-1')
   })
 })

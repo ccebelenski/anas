@@ -1,11 +1,14 @@
 import type { AhrPool, SnapshotSchedule } from '@anas/shared'
 import type { SelfServiceTarget } from '../share-selfservice.js'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
+import { parseFindmntTable } from '../../parsers/findmnt.js'
 import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
@@ -94,10 +97,21 @@ describe('touchesSelfService', () => {
 const ZFS = '/usr/sbin/zfs'
 const FINDMNT = '/usr/bin/findmnt'
 
-/** The reads the mountpoint resolver needs: the `zfs list` table + findmnt (for legacy/none targets). */
+/**
+ * The reads the mountpoint resolver needs: the `zfs list` table + findmnt (for
+ * legacy/none targets). Since #85 the findmnt table is DERIVED from the ZFS
+ * table so the two always agree: the resolver asks the SERVING filesystem, and
+ * a readable table missing a dataset's mount would read "not ZFS there" and
+ * open the very gate the datasets are supposed to hold.
+ */
 function addZfsFootprintFixtures(mock: MockExecutor, table: string): void {
   mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: table, stderr: '', exitCode: 0 } })
-  mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
+  mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: JSON.stringify({
+    filesystems: table.split('\n').filter(Boolean).map((line) => {
+      const [name, target] = line.split('\t')
+      return { target, source: name, fstype: 'zfs', options: 'rw' }
+    }),
+  }), stderr: '', exitCode: 0 } })
 }
 
 // The single-band raid5×3 pool "tank" recipe (mirrors ahr-snapshots.test.ts):
@@ -156,6 +170,14 @@ function addAhrPoolFixtures(mock: MockExecutor, opts: { subvol?: string, lvAttr?
   mock.addFixture({ command: '/usr/bin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
 }
 
+// The captured ZFS-root node (ZFS-root stunt node, PVE 9.2.2, 2026-11-13) —
+// #85's shape: `/` IS a ZFS dataset mount (the boot dataset), so an ungated
+// mountpoint match claimed every path below it. Exact capture bytes:
+// fixtures/mounts/findmnt-zfs-root.json + the node's `zfs list`.
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const ZFS_ROOT_LIST = 'rpool\t/rpool\nrpool/ROOT\t/rpool/ROOT\nrpool/ROOT/pve-1\t/\nrpool/data\t/rpool/data\nrpool/var-lib-vz\t/var/lib/vz\n'
+const ZFS_ROOT_TABLE = readFileSync(join(__dirname, '../../fixtures/mounts/findmnt-zfs-root.json'), 'utf-8')
+
 describe('resolveSelfServiceTarget (smbsvc.1)', () => {
   it('a share path under a ZFS dataset mountpoint resolves to that dataset', async () => {
     const mock = new MockExecutor()
@@ -179,6 +201,30 @@ describe('resolveSelfServiceTarget (smbsvc.1)', () => {
     // loud (D12), never claim the path is off both stacks.
     mock.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: { stdout: 'Personalities : [raid1]\nunused devices: <none>\n', stderr: '', exitCode: 0 } })
     assert.equal(await resolveSelfServiceTarget(mock, '/srv/scratch'), null)
+  })
+
+  it('a ZFS-root node: an AHR pool path resolves to the POOL, not the boot dataset (#85)', async () => {
+    const mock = new MockExecutor()
+    // The captured node exactly: its `zfs list` (the boot dataset mounts at
+    // `/`) and its real mount table. Ungated, the boot dataset matched
+    // '/mnt/anas-ahr/tank/media' (the root mount is a prefix of everything)
+    // and the AHR branch below was unreachable — an AHR share on a ZFS-root
+    // node resolved to the WRONG stack (#85's consequence).
+    mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: ZFS_ROOT_LIST, stderr: '', exitCode: 0 } })
+    // The capture is from a node with no AHR pool, so the table lacks the
+    // pool's mount row. That ONE btrfs node is built by copying the shape of
+    // the captured ext4 entry (`/mnt/extra`: target/source/fstype/options);
+    // a real ZFS-root node hosting a pool carries exactly such a row, and it
+    // is the serving-filesystem fact the #85 gate reads.
+    const nodes = parseFindmntTable(ZFS_ROOT_TABLE)!
+    nodes.push({ target: '/mnt/anas-ahr/tank', source: '/dev/mapper/tank-tank--vol', fstype: 'btrfs', options: 'rw,relatime' })
+    mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: JSON.stringify({ filesystems: nodes }), stderr: '', exitCode: 0 } })
+    addAhrPoolFixtures(mock)
+    const tank = (await readAhrPools(mock)).find(p => p.name === 'tank')!
+    assert.deepEqual(
+      await resolveSelfServiceTarget(mock, '/mnt/anas-ahr/tank/media'),
+      { kind: 'ahr', pool: 'tank', poolRecord: tank },
+    )
   })
 })
 

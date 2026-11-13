@@ -120,7 +120,8 @@ function isUnder(path: string, mp: string): boolean {
  * LONGEST-PREFIX mount containing the path decides — the filesystem actually
  * serving the path (a nested non-ZFS mount shadows the ZFS mount above it).
  *
- * Returns `null` when the table is unavailable — UNKNOWN, and the caller
+ * Returns `null` when the table is unavailable, or holds no mount that
+ * contains the path (zero rows: a read that did not see) — UNKNOWN, and the caller
  * tightens whatever gate this feeds (missing facts may only tighten). A
  * READABLE table that answers ext4 (e.g. `/` over `/var/lib/vz`) is a READ
  * answer — the path is on no ZFS filesystem, and the 2026-09-22 caveat-emptor
@@ -148,27 +149,49 @@ export function pathOnZfsFilesystem(path: string, nodes: FindmntNode[] | null): 
       zfs = true
     }
   }
-  // A readable table that names no containing mount (unreachable on a real
-  // host — findmnt always lists `/`) answers "no ZFS filesystem here".
-  return bestLen < 0 ? false : zfs
+  // A table in which NO mount contains the path is not a reading of this
+  // host — findmnt always lists `/`, so a zero-row table (or one whose rows
+  // carry no target) is a read that did not see. It answers unknown, like the
+  // null table: a read that could not see never says "not ZFS" (shares.r1
+  // review, #85 — "not ZFS" opens the share-path and LUN-backing gates).
+  return bestLen < 0 ? null : zfs
 }
 
 /**
  * The ONE longest-prefix path → dataset resolver: resolve an absolute path
- * onto the ZFS dataset that hosts it. A path is on ZFS iff it sits at or under
- * a dataset's mountpoint; when several datasets nest (e.g. `/tank` and
- * `/tank/backups`), the LONGEST matching mountpoint — the most specific
- * dataset — wins. Returns the winning mountpoint entry, or `null` when the
- * path is on no ZFS dataset (e.g. `/var/lib/vz`).
+ * onto the ZFS dataset that hosts it. A path is hosted by a ZFS dataset only
+ * if the filesystem that actually serves the path — the longest-prefix mount
+ * in the findmnt table (`nodes`) — is ZFS. A readable table that says the
+ * serving filesystem is not ZFS means NO dataset hosts the path. An
+ * UNREADABLE table (`null`) is unknown: the resolver answers as it did before
+ * (the ZFS-mountpoint match), because a missing fact may only tighten a gate,
+ * never loosen one.
  *
- * Three consumers ask it (pvepool.1 review fixes): `parsePveStorageCfg`
- * resolves a `dir` storage's path, {@link readZfsMountpoints}' callers resolve
- * an iSCSI file backing, and the footprint service's `datasetOfPath` resolves
- * a share path — there is no second copy of this loop anywhere (the
- * single-source-of-truth rule; iscsi-ownership's private copy was folded into
- * this one).
+ * #85: on a node that boots from ZFS, `rpool/ROOT/pve-1` mounts at `/`, so
+ * the mountpoint match alone claimed the boot dataset for every path not
+ * under a deeper ZFS mountpoint — including paths an ext4/btrfs/nfs mount
+ * serves at or above them. Where the table does gate ZFS in, the longest
+ * matching mountpoint (the most specific dataset, e.g. `/tank/backups` over
+ * `/tank`) wins. Returns the winning mountpoint entry, or `null` when the
+ * path is on no ZFS dataset (e.g. `/var/lib/vz` on an ext4 root).
+ *
+ * Consumers: `parsePveStorageCfg` resolves a `dir` storage's path; the
+ * footprint service's `datasetOfPath` and `sharePathClaim` resolve a share
+ * path; `resolveSelfServiceTarget` resolves a share's snapshot home;
+ * `classifyBacking` resolves an iSCSI file backing's dataset — there is no
+ * second copy of this loop anywhere (the single-source-of-truth rule;
+ * iscsi-ownership's private copy was folded into this one).
  */
-export function matchMountpoint(path: string, mountpoints: ZfsMountpoint[]): ZfsMountpoint | null {
+export function matchMountpoint(
+  path: string,
+  mountpoints: ZfsMountpoint[],
+  nodes: FindmntNode[] | null,
+): ZfsMountpoint | null {
+  // The serving filesystem decides: a readable non-ZFS answer rules the
+  // dataset out; an unreadable table (null) keeps today's mountpoint match,
+  // which can only tighten the gates this feeds.
+  if (pathOnZfsFilesystem(path, nodes) === false)
+    return null
   const target = stripTrailingSlash(path)
   let best: ZfsMountpoint | null = null
   let bestLen = -1
@@ -214,11 +237,16 @@ export interface PveStorageParse {
  * resolves onto a ZFS dataset's mountpoint. Resolution needs the mountpoint
  * table, so it only happens when `mountpoints` is supplied — WITHOUT it, dir
  * stanzas are ignored (the original zfspool-only behavior, unchanged) and
- * `unresolvedDirs` stays empty. When a dir path matches, the ref is
- * `{ type:'dir', dataset:<matched dataset> }` keyed by that dataset's pool
- * root; when it matches NOTHING (a `legacy`/`none` dataset with no live mount,
- * or a path on a non-ZFS filesystem — e.g. `/var/lib/vz`), the dir lands in
- * `unresolvedDirs` with its configured `path` (pvepool.1 review fix 5).
+ * `unresolvedDirs` stays empty. Pass `findmntNodes` (the findmnt table beside
+ * the mountpoints, from one {@link readZfsMountpointsFull}) and the resolution
+ * gains its #85 gate: a path SERVED by a non-ZFS filesystem resolves to
+ * nothing even when a ZFS mount (e.g. `/` on a ZFS-root node) contains it;
+ * omitted/`null` is unknown and the mountpoint match answers as before. When
+ * a dir path matches, the ref is `{ type:'dir', dataset:<matched dataset> }`
+ * keyed by that dataset's pool root; when it matches NOTHING (a
+ * `legacy`/`none` dataset with no live mount, or a path on a non-ZFS
+ * filesystem — e.g. `/var/lib/vz`), the dir lands in `unresolvedDirs` with
+ * its configured `path` (pvepool.1 review fix 5).
  *
  * Edge cases:
  *  - Commented-out lines (leading `#`, after trimming) are skipped, so a
@@ -234,6 +262,7 @@ export interface PveStorageParse {
 export function parsePveStorageCfg(
   text: string,
   mountpoints?: ZfsMountpoint[],
+  findmntNodes?: FindmntNode[] | null,
 ): PveStorageParse {
   const byPool = new Map<string, PveStorageRef[]>()
   const unresolvedDirs: { storage: string, path: string }[] = []
@@ -267,7 +296,7 @@ export function parsePveStorageCfg(
     // matches no dataset keeps its configured path in `unresolvedDirs` instead
     // of vanishing — the share-path backstop needs it (pvepool.1 review fix 5).
     else if (current.type === 'dir' && current.path && mountpoints) {
-      const match = matchMountpoint(current.path, mountpoints)
+      const match = matchMountpoint(current.path, mountpoints, findmntNodes ?? null)
       if (match) {
         pushRef(poolRoot(match.pool), {
           storage: current.id,
@@ -340,13 +369,17 @@ export function parsePveStorageCfg(
  * storages that live on a ZFS dataset (secondary signal) and to report the
  * ones that do not resolve ({@link PveStorageParse.unresolvedDirs}). `null`
  * (that read failed) resolves dir stanzas the same way as omitting it — they
- * are skipped. Omit it for the original zfspool-only behavior.
+ * are skipped. Omit it for the original zfspool-only behavior. Pass
+ * `findmntNodes` (the findmnt table from the same
+ * {@link readZfsMountpointsFull} read) to gate that resolution on the
+ * serving filesystem (#85); omitted/`null` answers as before.
  */
 let storagesReadWarned = false
 
 export async function readPveStorages(
   path: string = PVE_STORAGE_CFG,
   mountpoints?: ZfsMountpoint[] | null,
+  findmntNodes?: FindmntNode[] | null,
 ): Promise<PveStorageParse | null> {
   let text: string
   try {
@@ -365,7 +398,7 @@ export async function readPveStorages(
     return null
   }
   try {
-    return parsePveStorageCfg(text, mountpoints ?? undefined)
+    return parsePveStorageCfg(text, mountpoints ?? undefined, findmntNodes ?? null)
   }
   catch (err: unknown) {
     console.warn(`anasd: could not parse ${path} for PVE storage detection:`, err)

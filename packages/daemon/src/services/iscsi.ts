@@ -39,7 +39,7 @@ import type { StubVerdict } from './iscsi-stub.js'
 import { stat } from 'node:fs/promises'
 import { anasTargetName } from '@anas/shared'
 import { LIO_SAVECONFIG_PATH, readLioSaveconfig, storageObjectsByName } from '../parsers/lio-saveconfig.js'
-import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
+import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpointsFull } from '../parsers/pve-storage.js'
 import { readAhrPools } from './ahr-topology.js'
 import { filesystemOf } from './backup-consistency.js'
 import { CONFIGFS_TARGET_ROOT, normalizePlugin, readConfigfs } from './iscsi-configfs.js'
@@ -354,23 +354,35 @@ export async function readIscsiContext(
   if (!hasTargets)
     return empty
 
-  const [readMountpoints, nodeAddresses] = await Promise.all([
-    paths.zfsMountpoints ? paths.zfsMountpoints() : readZfsMountpoints(executor),
+  const [mountRead, nodeAddresses] = await Promise.all([
+    // The seam (a test host has no ZFS) answers the mountpoint half only; its
+    // findmnt half is UNREADABLE (`null`), which keeps the #85 gate at the
+    // pre-existing behaviour for every seam-driven test.
+    paths.zfsMountpoints
+      ? paths.zfsMountpoints().then(mountpoints => ({ mountpoints, findmntNodes: null }))
+      : readZfsMountpointsFull(executor),
     readNodeAddresses(executor),
   ])
   // A null mountpoint read (zfs list failed) only disables file→dataset
   // resolution — the parser's secondary signal — never the storage.cfg
   // verdict itself, which rides in `pveStorages` (null = UNREADABLE).
-  const zfsMountpoints = readMountpoints ?? []
+  const zfsMountpoints = mountRead?.mountpoints ?? []
+  // #85: the SAME read's findmnt table rides into the ownership inputs, so a
+  // LUN file under a non-ZFS serving mount resolves onto no dataset — which
+  // is what makes the AHR branch of `classifyBacking` reachable on a ZFS-root
+  // node (on one, an ungated match claimed the boot dataset for every file).
+  const findmntNodes = mountRead?.findmntNodes ?? null
   // The ownership predicate only needs the pool-keyed refs; the unresolvable
-  // dir storages (pvepool.1 review fix 5) are the share-path backstop's.
-  const pveStorages = (await readPveStorages(paths.pveStorageCfg ?? PVE_STORAGE_CFG, zfsMountpoints))?.byPool ?? null
+  // dir storages (pvepool.1 review fix 5) are the share-path backstop's. The
+  // same findmnt table gates the dir-path → dataset resolution here and in
+  // the footprint service — one rule, one read, no divergence.
+  const pveStorages = (await readPveStorages(paths.pveStorageCfg ?? PVE_STORAGE_CFG, zfsMountpoints, findmntNodes))?.byPool ?? null
   // Boot facts for the system rule of the footprint predicate — null when the
   // probe fails (UNREADABLE), so the ownership answer tightens toward
   // hands-off via the whole-pool fallback (pvepool.1).
   const systemFacts = await readSystemPoolFacts(executor)
 
-  const inputs: OwnershipInputs = { pveStorages, zfsMountpoints, systemFacts }
+  const inputs: OwnershipInputs = { pveStorages, zfsMountpoints, findmntNodes, systemFacts }
   const backingPaths = collectBackingPaths(live, persisted)
 
   // AHR topology is the expensive read (mdstat + LVM + btrfs), so it happens

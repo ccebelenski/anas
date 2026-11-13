@@ -17,11 +17,11 @@ import { readAllSchedules } from './snapshot-schedule-units.js'
  * shares"); `parsers/smb-conf.ts` holds only the composer + managed keys.
  *
  * The decisions:
- *   - WHERE the share lives: ZFS dataset (the ONE longest-prefix resolver,
- *     `matchMountpoint` over the mountpoint table — exactly what the footprint
- *     service's `datasetOfPath` asks, without the storage.cfg/boot reads this
- *     decision has no use for) or AHR pool (longest match over the pools'
- *     `@data` mountpoints) — never a new resolver.
+ *   - WHERE the share lives: ZFS dataset (the ONE resolver, `matchMountpoint`
+ *     over the mountpoint table gated on the SERVING filesystem (#85) —
+ *     exactly what the footprint service's `datasetOfPath` asks, without the
+ *     storage.cfg/boot reads this decision has no use for) or AHR pool (longest
+ *     match over the pools' `@data` mountpoints) — never a new resolver.
  *   - WHICH bucket Previous Versions exposes: the finest cadence among the
  *     ENABLED snapshot schedules targeting that dataset/pool (a disabled
  *     schedule takes nothing, so it exposes nothing); `daily` when none —
@@ -61,14 +61,18 @@ export type SelfServiceTarget
 
 /**
  * Resolve a share path to its snapshot-bearing home. ZFS first (the ONE
- * longest-prefix resolver, `matchMountpoint`, over the mountpoint table — the
- * cheap read, not the full footprint load), then AHR (longest mountpoint
- * match over the live pools). `null` = neither — nothing here is snapshotted,
- * and Previous Versions has nothing to expose.
+ * resolver, `matchMountpoint`, over the mountpoint table with its #85 gate —
+ * the findmnt table rides the SAME read, and a path served by a non-ZFS
+ * filesystem is on no dataset — the cheap read, not the full footprint
+ * load), then AHR (longest mountpoint match over the live pools). `null` =
+ * neither — nothing here is snapshotted, and Previous Versions has nothing
+ * to expose. The gate matters here as much as in the share-path backstop: on
+ * a ZFS-root node an ungated match claimed the boot dataset for ANY path and
+ * could never fall through to the AHR branch (#85's shape).
  */
 export async function resolveSelfServiceTarget(executor: CommandExecutor, path: string): Promise<SelfServiceTarget | null> {
   const mountRead = await readZfsMountpointsFull(executor)
-  const dataset = matchMountpoint(path, mountRead?.mountpoints ?? [])?.dataset ?? null
+  const dataset = matchMountpoint(path, mountRead?.mountpoints ?? [], mountRead?.findmntNodes ?? null)?.dataset ?? null
   if (dataset)
     return { kind: 'zfs', dataset }
 

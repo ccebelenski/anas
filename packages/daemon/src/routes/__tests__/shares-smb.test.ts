@@ -510,6 +510,14 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
   // testpool is the storage ROOT (mountpoint /testpool, owned) and
   // testpool/media the sibling this story exists to unlock (/testpool/media).
   const MOUNTPOINTS = 'testpool\t/testpool\ntestpool/media\t/testpool/media\n'
+  // The findmnt table behind those mountpoints (see startServer for why).
+  const TESTPOOL_MOUNT_TABLE = JSON.stringify({
+    filesystems: [
+      { target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' },
+      { target: '/testpool', source: 'testpool', fstype: 'zfs', options: 'rw' },
+      { target: '/testpool/media', source: 'testpool/media', fstype: 'zfs', options: 'rw' },
+    ],
+  })
 
   function startServer(conf = SAMPLE_CONF): ReturnType<typeof createServer> {
     dir = mkdtempSync(join(tmpdir(), 'anas-smb-pve-'))
@@ -528,6 +536,18 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE,FSTYPE', '/'], result: { stdout: '/dev/sda1\text4\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // A findmnt table that AGREES with that `zfs list` (#85): the dataset
+    // answer is now gated on the SERVING filesystem, and the server's default
+    // sample tree (no testpool mounts) would READ "no zfs serves /testpool"
+    // and contradict the node this describe models. Wrapped, not
+    // re-registered — the first exact fixture wins, and the server registers
+    // its own `findmnt --json` before this describe runs.
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command: string, args: string[]) => {
+      if (command === '/usr/bin/findmnt' && args.join(' ') === '--json')
+        return { stdout: TESTPOOL_MOUNT_TABLE, stderr: '', exitCode: 0 }
+      return orig(command, args)
+    }
     return server
   }
 
@@ -720,6 +740,120 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
   })
 })
 
+// --- #85: the captured ZFS-root node at the create door ----------------------
+//
+// The SMB twin of the NFS proof: byte-identical captures of a ZFS-root node
+// (ZFS-root stunt node, PVE 9.2.2, 2026-11-13), where `rpool/ROOT/pve-1` is
+// mounted at `/` and the pre-#85 mountpoint-only resolution claimed the boot
+// dataset for EVERY path the `zfs list` did not cover more specifically —
+// PVE's own ext4 dir storage at `/mnt/pve/virtssd` included, refused 409
+// PVE_MANAGED with the wrong dataset in the sentence. `/root/onboot` must
+// keep being refused for real.
+describe('SMB share path vs the PVE footprint on the captured ZFS-root node (#85)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string | undefined
+  let prevCfg: string | undefined
+
+  // The captured node's `zfs list -H -o name,mountpoint`, byte-identical.
+  const ZFS_ROOT_LIST = 'rpool\t/rpool\nrpool/ROOT\t/rpool/ROOT\nrpool/ROOT/pve-1\t/\nrpool/data\t/rpool/data\nrpool/var-lib-vz\t/var/lib/vz\n'
+  // The captured `storage.cfg`, minus its node-list line (node-specific, and
+  // the storage parser does not read it).
+  const CAPTURED_CFG = [
+    'dir: local',
+    '\tpath /var/lib/vz',
+    '\tcontent import,iso,backup,vztmpl',
+    '',
+    'zfspool: local-zfs',
+    '\tpool rpool/data',
+    '\tcontent rootdir,images',
+    '\tsparse 1',
+    '',
+    'dir: virtssd',
+    '\tpath /mnt/pve/virtssd',
+    '\tcontent images,backup,iso,snippets,vztmpl,rootdir',
+    '\tis_mountpoint 1',
+    '',
+  ].join('\n')
+  // The captured `findmnt --json` — the committed byte-identical fixture.
+  const ZFS_ROOT_TABLE = readFileSync(new URL('../../fixtures/mounts/findmnt-zfs-root.json', import.meta.url), 'utf-8')
+
+  function startServer(): ReturnType<typeof createServer> {
+    dir = mkdtempSync(join(tmpdir(), 'anas-smb-zfsroot-'))
+    prevCfg = process.env.ANAS_STORAGE_CFG
+    const cfg = join(dir, 'storage.cfg')
+    writeFileSync(cfg, CAPTURED_CFG, 'utf8')
+    process.env.ANAS_STORAGE_CFG = cfg
+    const confPath = join(dir, 'smb.conf')
+    writeFileSync(confPath, SAMPLE_CONF, 'utf8')
+    server = createServer({ mock: true, logger: false, smbConfPath: confPath })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: ZFS_ROOT_LIST, stderr: '', exitCode: 0 } })
+    // The captured boot facts: the pool's bootfs IS the dataset mounted at `/`.
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'rpool\trpool/ROOT/pve-1\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE,FSTYPE', '/'], result: { stdout: 'rpool/ROOT/pve-1\tzfs\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // The captured mount table REPLACES the server's default sample tree
+    // (wrapped, not re-registered — the first exact fixture wins).
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command: string, args: string[]) => {
+      if (command === '/usr/bin/findmnt' && args.join(' ') === '--json')
+        return { stdout: ZFS_ROOT_TABLE, stderr: '', exitCode: 0 }
+      return orig(command, args)
+    }
+    return server
+  }
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    if (prevCfg === undefined)
+      delete process.env.ANAS_STORAGE_CFG
+    else
+      process.env.ANAS_STORAGE_CFG = prevCfg
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true })
+      dir = undefined
+    }
+  })
+
+  it('a share on the captured ext4 dir storage is NOT refused PVE_MANAGED (#85)', async () => {
+    // `/mnt/pve/virtssd` is ext4 in the captured table: no dataset serves it,
+    // the footprint claim is silent (caveat-emptor), and the create reaches
+    // the job like any other non-ZFS path. Pre-#85 this was a 409 PVE_MANAGED
+    // naming `rpool/ROOT/pve-1` for a path that is not on ZFS at all.
+    const s = startServer()
+    const res = await s.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'virtshare', path: '/mnt/pve/virtssd' }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(readFileSync(join(dir!, 'smb.conf'), 'utf8').includes('[virtshare]'))
+  })
+
+  it('a share under the boot dataset is STILL refused 409 PVE_MANAGED naming the boot dataset (#85)', async () => {
+    // `/root` has no mount of its own — the serving filesystem is the ZFS `/`,
+    // so the gate answers "ZFS", the match resolves `rpool/ROOT/pve-1`, and
+    // the boot facts make it PVE's system tree. The gate opens only what the
+    // table PROVES non-ZFS; the true refusal stands exactly as strict.
+    const s = startServer()
+    const res = await s.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'bootshare', path: '/root/onboot' }),
+    })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'PVE_MANAGED')
+    assert.match(res.json().error.message, /rpool\/ROOT\/pve-1/)
+    // Nothing was written to smb.conf.
+    assert.ok(!readFileSync(join(dir!, 'smb.conf'), 'utf8').includes('[bootshare]'))
+  })
+})
+
 // ============================================================================
 // Self-service on SMB shares — slice 1 (smbsvc.1): Previous Versions enable /
 // disable round-trips on a mock ZFS share and a mock AHR share, the refusals,
@@ -835,7 +969,26 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: opts.zfsTable ?? '', stderr: '', exitCode: 0 } })
     // The dataset's free space (smbsvc.3): the capacity read the detail serves.
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'available', '--', 'testpool/media'], result: { stdout: `${opts.availableBytes ?? 1_099_511_627_776}\n`, stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
+    // #85: the resolver now asks the SERVING filesystem from `findmnt --json`,
+    // and the mock server seeds its OWN default table at createServer — the
+    // first exact fixture wins, so a later addFixture can never override it.
+    // Wrap exec with a table that AGREES with this test's `zfs list` instead:
+    // every dataset mount there appears as a zfs mount, and the empty table
+    // (the AHR/plain shares) reads "no ZFS here" — exactly what those tests
+    // want. (A readable table that contradicts the dataset it is asked about
+    // would resolve the path onto NO dataset and fail the enable.)
+    const selfSvcMountTable = JSON.stringify({
+      filesystems: (opts.zfsTable ?? '').split('\n').filter(Boolean).map((line) => {
+        const [name, target] = line.split('\t')
+        return { target, source: name, fstype: 'zfs', options: 'rw' }
+      }),
+    })
+    const origExec = mock.exec.bind(mock)
+    mock.exec = async (command: string, args: string[], execOpts?: Parameters<MockExecutor['exec']>[2]) => {
+      if (command === '/usr/bin/findmnt' && args.length === 1 && args[0] === '--json')
+        return { stdout: selfSvcMountTable, stderr: '', exitCode: 0 }
+      return origExec(command, args, execOpts)
+    }
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE,FSTYPE', '/'], result: { stdout: '/dev/sda1\text4\n', stderr: '', exitCode: 0 } })
     // testparm gate + reload.

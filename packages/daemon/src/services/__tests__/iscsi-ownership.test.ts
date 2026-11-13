@@ -2,9 +2,13 @@ import type { SystemPoolFacts } from '@anas/shared'
 import type { ZfsMountpoint } from '../../parsers/pve-storage.js'
 import type { OwnershipInputs } from '../iscsi-ownership.js'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { anasIqn, anasIqnAuthority, anasTargetName, isAnasIqn, IscsiIqn, PVE_GUEST_VOLUME_RE } from '@anas/shared'
-import { parsePveStorageCfg } from '../../parsers/pve-storage.js'
+import { parseFindmntTable } from '../../parsers/findmnt.js'
+import { parsePveStorageCfg, parseZfsMountpoints } from '../../parsers/pve-storage.js'
 import { classifyBacking, deriveOwnership } from '../iscsi-ownership.js'
 
 // A stock PVE storage.cfg: `datapool` is PVE's, `tank` is not mentioned at all.
@@ -212,6 +216,61 @@ describe('classifyBacking — where a LUN\'s backing object actually lives', () 
   it('a nested-name pool does not swallow a sibling', () => {
     const mps: ZfsMountpoint[] = [{ mountpoint: '/tank', dataset: 'tank', pool: 'tank' }]
     assert.equal(classifyBacking('/tank-other/lun.raw', inputs({ zfsMountpoints: mps })).kind, 'foreign')
+  })
+})
+
+// #85 — the captured ZFS-root node (ZFS-root stunt node, PVE 9.2.2, 2026-11-13):
+// `rpool/ROOT/pve-1` is mounted at `/`, so the pre-#85 mountpoint-only match
+// claimed the boot dataset for EVERY path the ZFS table did not cover more
+// specifically. The table below is the byte-identical `findmnt --json` capture
+// (fixtures/mounts/findmnt-zfs-root.json — `/` zfs, `/mnt/pve/virtssd` and
+// `/mnt/extra` ext4); the mountpoint half is the same node's `zfs list`.
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const ZFS_ROOT_LIST = 'rpool\t/rpool\nrpool/ROOT\t/rpool/ROOT\nrpool/ROOT/pve-1\t/\nrpool/data\t/rpool/data\nrpool/var-lib-vz\t/var/lib/vz\n'
+const ZFS_ROOT_TABLE = readFileSync(join(__dirname, '../../fixtures/mounts/findmnt-zfs-root.json'), 'utf-8')
+
+describe('classifyBacking on the captured ZFS-root node (#85)', () => {
+  // The captured node's facts as inputs: its mountpoint table, its mount table,
+  // and its boot facts (the pool's bootfs IS the dataset mounted at `/`).
+  const CAPTURED: Partial<OwnershipInputs> = {
+    zfsMountpoints: parseZfsMountpoints(ZFS_ROOT_LIST),
+    findmntNodes: parseFindmntTable(ZFS_ROOT_TABLE)!,
+    systemFacts: [{ pool: 'rpool', bootfs: 'rpool/ROOT/pve-1', rootDataset: 'rpool/ROOT/pve-1' }],
+  }
+
+  it('a LUN file on a captured non-ZFS mount is foreign, not the boot dataset', () => {
+    // `/mnt/extra` is ext4 in the captured table, so the SERVING filesystem is
+    // not ZFS and NO dataset hosts the file. Pre-#85 this classified as `file`
+    // on `rpool/ROOT/pve-1` — and, owned as the system tree, it handed an ANAS
+    // target a wrong hands-off badge (and made the AHR branch of the classifier
+    // unreachable on this node shape).
+    const c = classifyBacking('/mnt/extra/lun.raw', inputs(CAPTURED))
+    assert.equal(c.kind, 'foreign')
+    assert.equal(c.dataset, null)
+    assert.equal(c.pveOwned, false)
+  })
+
+  it('a LUN file under the boot dataset is still the boot dataset', () => {
+    // `/root` has no mount of its own: the longest-prefix serving mount is the
+    // ZFS `/`, so the read answers "ZFS" and the mountpoint match stands — a
+    // file there sits on `rpool/ROOT/pve-1`, inside PVE's system tree. The gate
+    // opens exactly what the table PROVES non-ZFS, nothing more.
+    const c = classifyBacking('/root/onboot/lun.raw', inputs(CAPTURED))
+    assert.equal(c.kind, 'file')
+    assert.equal(c.dataset, 'rpool/ROOT/pve-1')
+    assert.equal(c.pveOwned, true)
+    assert.equal(c.pveOwnership?.kind, 'system')
+  })
+
+  it('an UNREADABLE table answers as before — a missing fact may only tighten', () => {
+    // `null` is the findmnt read failing. The match then falls back to the
+    // mountpoint table, which still names the boot dataset for `/mnt/extra` —
+    // the pre-#85 verdict, kept deliberately: unknown may only tighten a gate,
+    // never loosen one.
+    const c = classifyBacking('/mnt/extra/lun.raw', inputs({ ...CAPTURED, findmntNodes: null }))
+    assert.equal(c.kind, 'file')
+    assert.equal(c.dataset, 'rpool/ROOT/pve-1')
+    assert.equal(c.pveOwned, true)
   })
 })
 
