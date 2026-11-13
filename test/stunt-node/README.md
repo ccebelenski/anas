@@ -145,3 +145,26 @@ sudo virsh net-destroy anas-test && sudo virsh net-undefine anas-test
 - Root password is `anas-test` — test credential only
 - VM is on an isolated NAT network (host-only access)
 - `config.local` is gitignored (developer-specific paths)
+
+## The ZFS-root node (`STUNT_NODE=zfs`)
+
+The node above is a Debian cloud image with PVE installed on top, so its root
+filesystem is ext4. A second node, `anas-zfs` (192.168.200.52), is installed
+from the Proxmox VE ISO by its automated installer onto a ZFS root pool and has
+the installer's own layout: `rpool/ROOT/pve-1` at `/`, `rpool/data`,
+`rpool/var-lib-vz`. Code that resolves a path against ZFS mountpoints behaves
+differently there (GitHub #85).
+
+```bash
+./create-zfs-vm.sh                 # ISO download + verify, answer file, unattended install, deps, `bare` snapshot
+STUNT_NODE=zfs ./start.sh
+STUNT_NODE=zfs ./deploy-anas.sh
+STUNT_NODE=zfs ./add-disk.sh 1     # every other script takes the same selector
+```
+
+`create-zfs-vm.sh --post` re-runs only the post-install half (repository,
+packages, Node.js, snapshot) on an installed VM. Preparing the ISO needs
+`podman`: `proxmox-auto-install-assistant` comes from the PVE repository and is
+run in a Debian container. Both nodes sit on the `anas-test` network and can
+run at the same time, which gives node-to-node replication a real second end.
+The API path names the node: `/anas/api/nodes/anas-zfs/v1/...`.
