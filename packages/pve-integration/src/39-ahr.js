@@ -49,6 +49,159 @@
         }
     }
 
+    // ---- facts read off the pool record (cr3) -------------------------------
+
+    // cr3 (AHR-PANEL-M3): the daemon's "a btrfs scrub is running on this
+    // pool" fact. During a scrub's btrfs pass no md check runs, so the fused
+    // `state` alone reads healthy and the bands read idle. ONE field name and
+    // ONE accessor: true = running, false = not running, null = absent (an
+    // older daemon) or unknown (the read failed). Only `true` changes what is
+    // shown; absent and null render exactly what the record says without it.
+    var BTRFS_SCRUB_FIELD = 'btrfsScrubRunning';
+    // cr3: the one sentence for the `unknown` pool state — on the detail and
+    // on every verb the daemon refuses in it (expand, scrub, snapshots).
+    var STATE_UNKNOWN_REASON = 'The pool\'s mount state could not be read (the kernel mount table), so whether '
+        + 'its filesystem is read-only is not known. Expand, Scrub, Attach cache, Remount and snapshot actions wait until it can be read.';
+    function recField(rec, key) {
+        try {
+            return (rec && typeof rec.get === 'function') ? rec.get(key) : (rec ? rec[key] : undefined);
+        } catch (e) {
+            return undefined;
+        }
+    }
+    function btrfsScrubRunning(rec) {
+        var v = recField(rec, BTRFS_SCRUB_FIELD);
+        return typeof v === 'boolean' ? v : null;
+    }
+    // The state the State column, the detail header and the toolbar act on:
+    // the daemon's fused state, with a running btrfs pass shown as the
+    // `scrubbing` it is. Only `healthy` is lifted: every state the daemon's
+    // ladder ranks above `scrubbing` (ahr-topology.ts) keeps its own badge.
+    function effectivePoolState(state, rec) {
+        return (state === 'healthy' && btrfsScrubRunning(rec) === true) ? 'scrubbing' : state;
+    }
+
+    // cr3 (AHR-PANEL-M2): an AHR pool's `mountpoint` is the LV device path
+    // while it is not mounted (shared ahr.ts AhrPool.mountpoint), and its
+    // used/free figures are only read off a mounted filesystem. Every mount,
+    // used, free and fullness rendering is gated on BOTH: `mounted === true`
+    // and the value being a number. Anything else reads "unknown", never 0.
+    function poolMounted(rec) {
+        return recField(rec, 'mounted') === true;
+    }
+    function knownBytes(v) {
+        return (typeof v === 'number' && isFinite(v)) ? v : null;
+    }
+    function fsBytes(rec, cap, key) {
+        return (poolMounted(rec) && cap) ? knownBytes(cap[key]) : null;
+    }
+
+    // cr3 (AHR-PANEL-M1): a band's RAID slots, counted as the daemon counts
+    // them. A hot spare rides on an active array as a member row with
+    // memberState `spare` (ahr-topology.ts buildAhrPoolBriefs, ahr-expand.ts
+    // memberIds: "never counts toward band member totals"), and an
+    // `mdadm --replace` target in flight is the row memberState `rebuilding`
+    // (ahr-topology.ts maps mdstat's (R) there and nowhere else); neither is a
+    // slot, which is how the daemon's own capacity math reads mdstat
+    // (`!m.spare && !m.replacement`). Every member count and every usable
+    // figure this file derives goes through this one function.
+    function slotMembers(array) {
+        var out = [];
+        var members = (array && array.members) || [];
+        for (var i = 0; i < members.length; i++) {
+            var st = members[i] && members[i].memberState;
+            if (st !== 'spare' && st !== 'rebuilding') {
+                out.push(members[i]);
+            }
+        }
+        return out;
+    }
+    // A band array that CANNOT START (ArrayState `inactive`: mdstat's
+    // inactive, the GT-8 shape) lists EVERY member device as `(S)`, so every
+    // row arrives memberState `spare`. Those are not hot spares and the
+    // array has no running slots: its rows are never classified, it reads
+    // "N member devices · not running", and no usable figure is derived for
+    // it. Keyed on the daemon's array state (ahr-topology.ts arrayState: the
+    // same `md.active === false` its spare mapping and the pool's offline
+    // verdict read), never on the count.
+    function arrayNotRunning(array) {
+        return !!array && array.state === 'inactive';
+    }
+    function memberDevicesText(n) {
+        return n + ' ' + t(n === 1 ? 'member device' : 'member devices');
+    }
+    // cr3: a band's SLOT count. md's own `raidDevices` (the n of mdstat's
+    // [n/m]) when the daemon sends it: during a spare failover the spare being
+    // rebuilt onto carries no marker and the failed member keeps its row, so
+    // rows over-count. Absent (an inactive array, an older daemon): the rows
+    // rule above.
+    function slotCount(array) {
+        var n = array ? array.raidDevices : undefined;
+        return (typeof n === 'number' && isFinite(n) && n > 0) ? n : slotMembers(array).length;
+    }
+    // In-sync rows, capped at the slot count.
+    function inSyncCount(array) {
+        return Math.min(countMembers(array, 'in_sync'), slotCount(array));
+    }
+    function countMembers(array, memberState) {
+        var n = 0;
+        var members = (array && array.members) || [];
+        for (var i = 0; i < members.length; i++) {
+            if (members[i] && members[i].memberState === memberState) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    // cr3 (AHR-PANEL-L6): the disk ids serving any band of the pool, exactly
+    // the daemon's membership test for expand and replace (ahr-expand.ts
+    // memberIds: every array member row that is not a spare). A cache disk is
+    // never in an array; a hot spare's rows are all `spare`.
+    function poolMemberIds(d) {
+        var out = {};
+        var arrays = (d && d.arrays) || [];
+        for (var i = 0; i < arrays.length; i++) {
+            var members = arrays[i].members || [];
+            for (var j = 0; j < members.length; j++) {
+                if (members[j].memberState !== 'spare') {
+                    out[members[j].disk] = true;
+                }
+            }
+        }
+        return out;
+    }
+    function poolMemberDisks(d) {
+        var ids = poolMemberIds(d);
+        var out = [];
+        var pd = (d && d.disks) || [];
+        for (var i = 0; i < pd.length; i++) {
+            if (ids[pd[i].id] === true) {
+                out.push({ id: pd[i].id, model: pd[i].model, size: pd[i].sizeBytes });
+            }
+        }
+        return out;
+    }
+
+    // cr3 (AHR-PANEL-L5): THE panel's disk-candidacy predicate, mirroring
+    // the shared `isComposableDisk` (shared/schemas/disks.ts) condition for
+    // condition: available, and not hands-off (an iSCSI LUN this node serves
+    // to itself reads as a blank available disk, GT-43). Every AHR picker
+    // filters through it — the spare, cache, expand and replace pickers here
+    // and the create composer's tray (as ANAS.ahr.isComposableDisk).
+    function composable(disk) {
+        return !!disk && disk.status === 'available' && disk.handsOff === undefined;
+    }
+    function composableDisks(all) {
+        var out = [];
+        for (var i = 0; i < (all || []).length; i++) {
+            if (composable(all[i])) {
+                out.push(all[i]);
+            }
+        }
+        return out;
+    }
+
     // ---- vocabulary ---------------------------------------------------------
 
     // Tier labels lead with the MEANING; the acronym is API vocabulary.
@@ -73,7 +226,12 @@
     // reduced-redundancy-but-functioning while the data was unreachable. WHICH
     // bands cannot start comes from the daemon's advisory, rendered verbatim by
     // advisoriesHtml() like every other pool advisory.
+    // cr3 (INVENTED-STATE-H3, the daemon's tenth state): `unknown` — the
+    // kernel mount table could not be read, so whether btrfs forced the
+    // filesystem read-only is not known. A NEUTRAL pill: never healthy's
+    // green, never an error colour (nothing is known to be wrong).
     var POOL_STATES = {
+        unknown: { token: '', label: 'unknown' },
         healthy: { token: 'ONLINE', label: 'healthy' },
         building: { token: '', label: 'building' },
         degraded: { token: 'DEGRADED', label: 'degraded' },
@@ -85,8 +243,10 @@
         readonly: { token: 'FAULTED', label: 'read-only' },
     };
 
+    // A state this panel does not know falls to a neutral pill carrying the
+    // daemon's word — never healthy's green, never blank while a value exists.
     function renderPoolState(value) {
-        var meta = POOL_STATES[value] || { token: '', label: '' + (value || '') };
+        var meta = POOL_STATES.hasOwnProperty(value) ? POOL_STATES[value] : { token: '', label: '' + (value || '') };
         try {
             var gfx = ANAS.gfx;
             if (gfx && typeof gfx.statePill === 'function' && value) {
@@ -216,13 +376,24 @@
         }
     }
 
+    // A filesystem figure, or "unknown" (M2: never a placeholder 0).
+    function fsFigure(bytes) {
+        return bytes === null ? t('unknown') : fmtBytes(bytes);
+    }
+    var UNKNOWN_CELL_STYLE = 'color:var(--anas-muted)';
+    function unknownCell(rec) {
+        return '<span style="' + UNKNOWN_CELL_STYLE + '" title="'
+            + enc(poolMounted(rec) ? t('usage unknown') : t('not mounted — usage unknown')) + '">'
+            + enc(t('unknown')) + '</span>';
+    }
+
     // One-line labelled breakdown for tooltips.
-    function capTooltip(cap) {
+    function capTooltip(cap, rec) {
         if (!cap) {
             return '';
         }
         var parts = [
-            t('Usable') + ' ' + fmtBytes(cap.usableBytes),
+            t('Usable') + ' ' + fsFigure(knownBytes(cap.usableBytes)),
             t('Raw') + ' ' + fmtBytes(cap.rawBytes),
             t('Redundancy overhead') + ' ' + fmtBytes(cap.redundancyOverheadBytes),
             t('Unprotected (wasted)') + ' ' + fmtBytes(cap.unprotectedWastedBytes),
@@ -230,8 +401,8 @@
         if (Number(cap.pendingBytes) > 0) {
             parts.push(t('Pending (locked)') + ' ' + fmtBytes(cap.pendingBytes));
         }
-        parts.push(t('Used') + ' ' + fmtBytes(cap.usedBytes));
-        parts.push(t('Free') + ' ' + fmtBytes(cap.freeBytes));
+        parts.push(t('Used') + ' ' + fsFigure(fsBytes(rec, cap, 'usedBytes')));
+        parts.push(t('Free') + ' ' + fsFigure(fsBytes(rec, cap, 'freeBytes')));
         return parts.join('  ·  ');
     }
 
@@ -242,14 +413,19 @@
         if (!cap) {
             return '';
         }
-        var html = '<span style="font-weight:650">' + enc(fmtBytes(cap.usableBytes)) + '</span>';
+        // cr3: `usableBytes` is null when there is no LV or mounted
+        // filesystem to measure — "unknown", never blank, never 0.
+        var usableKnown = knownBytes(cap.usableBytes);
+        var html = usableKnown === null
+            ? '<span style="' + UNKNOWN_CELL_STYLE + '">' + enc(t('unknown')) + '</span>'
+            : '<span style="font-weight:650">' + enc(fmtBytes(usableKnown)) + '</span>';
         if (Number(cap.pendingBytes) > 0) {
             html += ' <span style="color:var(--anas-warn);font-size:11px">+'
                 + enc(fmtBytes(cap.pendingBytes) + ' ' + t('pending')) + '</span>';
         }
         try {
             if (meta) {
-                meta.tdAttr = 'title="' + enc(capTooltip(cap)) + '"';
+                meta.tdAttr = 'title="' + enc(capTooltip(cap, record)) + '"';
             }
         } catch (e) {
             // tooltip optional
@@ -260,15 +436,24 @@
     // Grid Used / Free columns: the two numbers an operator checks free space
     // with, first-class beside Usable exactly as the ZFS Pools grid carries
     // Allocated/Free (issue #28 — capacity display is not a place AHR and ZFS
-    // diverge). Blank when capacity is absent, matching renderUsable.
+    // diverge). Blank when capacity is absent, matching renderUsable; an
+    // unmounted pool or an unread figure reads "unknown" (cr3 M2).
     function renderUsed(value, meta, record) {
         var cap = capOf(record);
-        return cap ? enc(fmtBytes(cap.usedBytes)) : '';
+        if (!cap) {
+            return '';
+        }
+        var used = fsBytes(record, cap, 'usedBytes');
+        return used === null ? unknownCell(record) : enc(fmtBytes(used));
     }
 
     function renderFree(value, meta, record) {
         var cap = capOf(record);
-        return cap ? enc(fmtBytes(cap.freeBytes)) : '';
+        if (!cap) {
+            return '';
+        }
+        var free = fsBytes(record, cap, 'freeBytes');
+        return free === null ? unknownCell(record) : enc(fmtBytes(free));
     }
 
     // Grid Capacity column: used ÷ usable through the shared gfx bar — the same
@@ -279,9 +464,12 @@
         if (!cap) {
             return '';
         }
-        var usable = Number(cap.usableBytes);
-        var used = Number(cap.usedBytes);
-        if (!(usable > 0) || isNaN(used)) {
+        var usable = knownBytes(cap.usableBytes);
+        var used = fsBytes(record, cap, 'usedBytes');
+        if (used === null || usable === null) {
+            return unknownCell(record);
+        }
+        if (!(usable > 0)) {
             return '';
         }
         var frac = used / usable;
@@ -298,6 +486,25 @@
             // fall through to text
         }
         return enc(ANAS.formatPercent(frac * 100));
+    }
+
+    // Grid Mount column. The shared gfx column prints `mountpoint` with a
+    // "(not mounted)" suffix — right for ZFS, whose unmounted mountpoint is
+    // still the configured directory. An unmounted AHR pool's `mountpoint`
+    // is its LV device path (cr3 M2), so that row says "not mounted" alone.
+    function renderMount(value, meta, record) {
+        if (poolMounted(record)) {
+            return enc(value || '');
+        }
+        return '<span style="color:var(--anas-warn);font-size:11px">('
+            + enc(t('not mounted')) + ')</span>';
+    }
+    function ahrMountColumn() {
+        var col = (ANAS.gfx && typeof ANAS.gfx.mountColumn === 'function')
+            ? ANAS.gfx.mountColumn()
+            : { text: t('Mount'), dataIndex: 'mountpoint', flex: 1, minWidth: 180, sortable: false, menuDisabled: true };
+        col.renderer = renderMount;
+        return col;
     }
 
     // ---- arrays / sync helpers ---------------------------------------------
@@ -321,17 +528,46 @@
         return out;
     }
 
+    function activityHtml(frac, label, text) {
+        try {
+            var gfx = ANAS.gfx;
+            if (gfx && typeof gfx.activity === 'function') {
+                var html = gfx.activity(frac, { label: label });
+                if (html) {
+                    return html;
+                }
+            }
+        } catch (e) {
+            // fall through
+        }
+        return enc(text);
+    }
+
+    // Grid State column: the fused state, with a running btrfs pass read as
+    // the scrub it is (cr3 M3).
+    function renderGridState(value, meta, record) {
+        return renderPoolState(effectivePoolState(value, record));
+    }
+
     // Grid Activity column: an activity strip while any band array syncs
-    // (percent from the busiest array), else a muted Idle.
+    // (percent from the busiest array), a btrfs scrub pass when the daemon
+    // says one runs (no percent: the record carries none), else a muted Idle.
     function renderActivity(value, meta, record) {
         var syncing = syncingArrays(arraysOf(record));
+        var btrfsScrub = btrfsScrubRunning(record) === true;
         if (!syncing.length) {
+            if (btrfsScrub) {
+                return activityHtml(null, t('scrubbing (btrfs)'), t('scrubbing (btrfs)'));
+            }
             return '<span style="color:var(--anas-muted)">' + enc(t('Idle')) + '</span>';
         }
         var a = syncing[0];
         var label = syncLabel(a.sync.action) + ' ' + t('band') + ' ' + a.band;
         if (syncing.length > 1) {
             label += ' (+' + (syncing.length - 1) + ')';
+        }
+        if (btrfsScrub) {
+            label += ' · ' + t('scrubbing (btrfs)');
         }
         var pc = Number(a.sync.percent);
         try {
@@ -371,7 +607,7 @@
         + 'letter-spacing:.5px;color:var(--anas-muted)';
 
     function headerHtml(d) {
-        var pill = renderPoolState(d.state);
+        var pill = renderPoolState(effectivePoolState(d.state, d));
         var tier = '<span style="font-size:12px;color:var(--anas-muted)">'
             + enc(tierLabel(d.ahrType)) + '</span>';
         return '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px">'
@@ -400,23 +636,32 @@
 
     function capacityHtml(d) {
         var cap = d.capacity || {};
-        var usable = Number(cap.usableBytes) || 0;
-        var used = Number(cap.usedBytes) || 0;
-        var frac = usable > 0 ? used / usable : 0;
+        var usableKnown = knownBytes(cap.usableBytes);
+        var usable = usableKnown === null ? 0 : usableKnown;
+        // cr3 M2: the gauge is filesystem usage, read only off a mounted
+        // pool; without that figure there is no gauge and the line says why.
+        var used = fsBytes(d, cap, 'usedBytes');
         var gauge = '';
-        try {
-            var gfx = ANAS.gfx;
-            if (gfx && typeof gfx.gauge === 'function') {
-                gauge = gfx.gauge(frac, {
-                    label: fmtBytes(used) + ' ' + t('used of') + ' ' + fmtBytes(usable) + ' ' + t('usable'),
-                    title: t('Filesystem usage'),
-                }) || '';
+        if (used !== null && usable > 0) {
+            try {
+                var gfx = ANAS.gfx;
+                if (gfx && typeof gfx.gauge === 'function') {
+                    gauge = gfx.gauge(used / usable, {
+                        label: fmtBytes(used) + ' ' + t('used of') + ' ' + fmtBytes(usable) + ' ' + t('usable'),
+                        title: t('Filesystem usage'),
+                    }) || '';
+                }
+            } catch (e) {
+                gauge = '';
             }
-        } catch (e) {
-            gauge = '';
         }
-        var rows = capRow(t('Usable'), fmtBytes(cap.usableBytes), true)
-            + capRow(t('Free'), fmtBytes(cap.freeBytes))
+        var usageNote = used === null
+            ? '<div style="margin-bottom:8px;color:var(--anas-muted)">'
+                + enc(poolMounted(d) ? t('Filesystem usage unknown') : t('Not mounted — usage unknown'))
+                + '</div>'
+            : '';
+        var rows = capRow(t('Usable'), fsFigure(usableKnown), true)
+            + capRow(t('Free'), fsFigure(fsBytes(d, cap, 'freeBytes')))
             + capRow(t('Raw (all member disks)'), fmtBytes(cap.rawBytes))
             + capRow(t('Redundancy overhead'), fmtBytes(cap.redundancyOverheadBytes))
             + capRow(t('Unprotected (wasted)'), fmtBytes(cap.unprotectedWastedBytes));
@@ -425,7 +670,7 @@
         }
         return '<div style="max-width:420px">'
             + (gauge ? '<div style="margin-bottom:8px">' + gauge + '</div>' : '')
-            + rows + '</div>';
+            + usageNote + rows + '</div>';
     }
 
     // §5.2 pending-capacity unlock explanation — the single most confusing
@@ -713,6 +958,19 @@
         return '<span style="' + css + '">' + enc(t(meta.label)) + '</span>';
     }
 
+    // ", 1 spare" / ", 2 spares" / ", 1 replacing" — the rows on a band that
+    // are not slots. Nothing on an array that is not running (its rows are
+    // not classified, see arrayNotRunning).
+    function extraRowsText(a) {
+        if (arrayNotRunning(a)) {
+            return '';
+        }
+        var spares = countMembers(a, 'spare');
+        var replacing = countMembers(a, 'rebuilding');
+        return (spares ? ', ' + spares + ' ' + t(spares === 1 ? 'spare' : 'spares') : '')
+            + (replacing ? ', ' + replacing + ' ' + t('replacing') : '');
+    }
+
     // Which partitions actually form this band (11.18). Collapsed by default so
     // the array row keeps its shape; a native <details> carries the open state,
     // so there is no bespoke expander machinery and nothing to lose across a
@@ -723,19 +981,31 @@
         if (!members.length) {
             return '';
         }
+        var notRunning = arrayNotRunning(a);
         var lines = '';
         for (var i = 0; i < members.length; i++) {
             var m = members[i];
+            // An array that cannot start labels every row (S): that is the
+            // array's state, not a hot spare (cr3 review follow-up 1).
+            var rowState = (notRunning && m.memberState === 'spare')
+                ? '<span style="font-size:11px;flex:0 0 auto;color:var(--anas-muted)">'
+                    + enc(t('not running')) + '</span>'
+                : memberStateHtml(m.memberState);
             // NEVER truncated: the by-id embeds the disk identity, which is the
             // entire reason to show it. Long ids wrap instead of being clipped.
             lines += '<div style="display:flex;gap:8px;align-items:baseline;padding:2px 0">'
                 + '<span style="font-size:11.5px;color:var(--anas-ink);word-break:break-all">'
                 + enc(m.partition || m.disk || '—') + '</span>'
                 + '<span style="flex:1"></span>'
-                + memberStateHtml(m.memberState) + '</div>';
+                + rowState + '</div>';
         }
-        var count = members.length + ' '
-            + t(members.length === 1 ? 'member' : 'members');
+        // cr3 M1: the count is the band's slots; spare and replacement rows
+        // are listed (each wears its own state) and counted apart. An array
+        // that is not running has member devices, not slots.
+        var slots = slotCount(a);
+        var count = notRunning
+            ? memberDevicesText(members.length)
+            : slots + ' ' + t(slots === 1 ? 'member' : 'members') + extraRowsText(a);
         return '<details class="anas-ahr-mem" style="margin-top:7px">'
             + '<summary><span class="anas-ahr-mem-c">' + enc(count) + '</span>'
             + '<span class="anas-ahr-mem-o">' + enc(t('members')) + '</span></summary>'
@@ -759,21 +1029,22 @@
         var rows = '';
         for (var i = 0; i < arrays.length; i++) {
             var a = arrays[i];
-            var members = a.members || [];
-            var inSync = 0;
-            for (var j = 0; j < members.length; j++) {
-                if (members[j].memberState === 'in_sync') {
-                    inSync++;
-                }
-            }
+            // cr3 M1: level × SLOTS, "n in sync" (in-sync rows, capped at the
+            // slot count).
+            var slots = slotCount(a);
+            var inSync = inSyncCount(a);
             var sw = '<span style="width:11px;height:11px;border-radius:3px;flex:0 0 auto;'
                 + 'background:' + bandColor(a.band) + '"></span>';
             var head = sw
                 + '<span style="font-weight:650;font-variant-numeric:tabular-nums">'
                 + enc(a.device || (t('band') + ' ' + a.band)) + '</span>'
                 + '<span style="color:var(--anas-muted);font-size:12px">'
-                + enc((a.level || '') + ' × ' + members.length
-                    + (inSync < members.length ? ' (' + inSync + ' ' + t('in sync') + ')' : '')
+                + enc((arrayNotRunning(a)
+                    ? (a.level || '') + ' · ' + memberDevicesText((a.members || []).length)
+                        + ' · ' + t('not running')
+                    : (a.level || '') + ' × ' + slots
+                        + (inSync < slots ? ' (' + inSync + ' ' + t('in sync') + ')' : '')
+                        + extraRowsText(a))
                     + ' · ' + t('height') + ' ' + fmtBytes(a.heightBytes)) + '</span>'
                 + '<span style="flex:1"></span>'
                 + arrayStatePill(a.state, d.state === 'building');
@@ -826,18 +1097,21 @@
         return '<div style="' + SEC + '">' + enc(t('Volume (LVM)')) + '</div>'
             + '<div style="font-size:12.5px;color:var(--anas-ink)">'
             + enc(t('VG') + ' ' + (vg.name || '—')
-                + '  ·  ' + t('LV') + ' ' + (lv.name || '—') + ' — ' + fmtBytes(lv.sizeBytes))
+                + '  ·  ' + t('LV') + ' ' + (lv.name || '—') + ' — ' + fsFigure(knownBytes(lv.sizeBytes)))
             + '</div>';
     }
 
+    // cr3 M2: "mounted at" only for a mounted pool — an unmounted pool's
+    // `mountpoint` is its LV device path, not a directory.
     function fsHtml(d) {
         var cap = d.capacity || {};
+        var line = poolMounted(d)
+            ? 'btrfs — ' + t('mounted at') + ' ' + (d.mountpoint || '—')
+                + '  ·  ' + fsFigure(fsBytes(d, cap, 'usedBytes')) + ' ' + t('used') + ', '
+                + fsFigure(fsBytes(d, cap, 'freeBytes')) + ' ' + t('free')
+            : 'btrfs — ' + t('not mounted — usage unknown');
         return '<div style="' + SEC + '">' + enc(t('Filesystem (btrfs)')) + '</div>'
-            + '<div style="font-size:12.5px;color:var(--anas-ink)">'
-            + enc('btrfs — ' + t('mounted at') + ' ' + (d.mountpoint || '—')
-                + '  ·  ' + fmtBytes(cap.usedBytes) + ' ' + t('used') + ', '
-                + fmtBytes(cap.freeBytes) + ' ' + t('free'))
-            + '</div>';
+            + '<div style="font-size:12.5px;color:var(--anas-ink)">' + enc(line) + '</div>';
     }
 
     // ---- read cache (ahrcache.1, AHR-DESIGN §13) ----------------------------
@@ -974,20 +1248,67 @@
         var bands = [];
         var start = 0;
         var i;
+        var anyNotRunning = false;
+        var anyReshaping = false;
+        var bandUsable = 0;
         for (i = 0; i < arrays.length; i++) {
             var a = arrays[i];
             var h = snapUp(Number(a.heightBytes) || 0);
-            var mc = (a.members || []).length;
+            if (arrayNotRunning(a)) {
+                // cr3 review follow-up 1: no slots, so no usable figure — the
+                // legend reads "not running", never "usable 0 B".
+                anyNotRunning = true;
+                bands.push({
+                    band: a.band,
+                    range: { startBytes: start, endBytes: start + h },
+                    memberCount: (a.members || []).length,
+                    level: a.level,
+                    heightBytes: h,
+                    usableBytes: null,
+                    notRunning: true,
+                    'protected': true,
+                });
+                start += h;
+                continue;
+            }
+            if (a.state === 'reshaping') {
+                anyReshaping = true;
+            }
+            var mc = slotCount(a);   // cr3 M1: slots, not rows (md's own count when sent)
+            var usable = h * Math.max(0, mc - (a.level === 'raid6' ? 2 : 1));
+            bandUsable += usable;
             bands.push({
                 band: a.band,
                 range: { startBytes: start, endBytes: start + h },
                 memberCount: mc,
                 level: a.level,
                 heightBytes: h,
-                usableBytes: h * Math.max(0, mc - (a.level === 'raid6' ? 2 : 1)),
+                usableBytes: usable,
                 'protected': true,
             });
             start += h;
+        }
+        // cr3 review follow-up 5 (second round): the legend's usable is BAND
+        // MATH; the Capacity block's is the LV the filesystem sits on. Growth
+        // is NEVER inferred from the difference — md's data offset (256 MiB a
+        // slot on members of 128 GiB and more, ahr-geometry.ts) makes band
+        // math run over the LV on every healthy pool. Only a structured signal
+        // from the daemon says "grown, volume not yet": an array `reshaping`,
+        // or an `expansion` intent on the record. (The stranded-capacity fact
+        // is a sentence in `advisories` today, not a field; it is not read.)
+        // Without a signal, a band figure that differs from the LV at the
+        // precision shown says what it is: band capacity before md and volume
+        // overhead — so the two never read as one fact disagreeing.
+        var lvUsable = knownBytes(d && d.capacity ? d.capacity.usableBytes : null);
+        var growPending = !anyNotRunning && (anyReshaping || !!(d && d.expansion));
+        var beforeOverhead = !anyNotRunning && !growPending && lvUsable !== null
+            && fmtBytes(bandUsable) !== fmtBytes(lvUsable);
+        for (i = 0; i < bands.length; i++) {
+            if (growPending) {
+                bands[i].usableOnceGrown = true;
+            } else if (beforeOverhead) {
+                bands[i].usableBeforeOverhead = true;
+            }
         }
         // The unprotected pseudo-band is band GEOMETRY: capacity that sits
         // above the top array on a disk the bands are cut from. A cache disk
@@ -1050,7 +1371,10 @@
     // a payload that says read-only WITHOUT the advisory gets the short line
     // here; the two never print together.
     function readOnlyLineHtml(d) {
-        if (d.mountedReadOnly !== true) {
+        // cr3: in the `unknown` state the read-only flag is the very thing
+        // that could not be read — the unknown line says so; this one never
+        // prints beside it, whatever the field says.
+        if (d.mountedReadOnly !== true || d.state === 'unknown') {
             return '';
         }
         var adv = d.advisories || [];
@@ -1064,10 +1388,22 @@
             + '</div>';
     }
 
+    // cr3: the `unknown` state on the detail, in the panel's words — what it
+    // means for the verbs; the daemon's advisory (rendered below) names the
+    // read that failed.
+    function unknownStateLineHtml(d) {
+        if (d.state !== 'unknown') {
+            return '';
+        }
+        return '<div style="font-size:12.5px;font-weight:700;color:var(--anas-muted);margin:2px 0 10px">'
+            + enc(t(STATE_UNKNOWN_REASON)) + '</div>';
+    }
+
     function detailHtml(d) {
         return '<div class="anas-ahr-detail-body" style="padding:12px 14px;color:var(--anas-ink);'
             + 'font:12.5px/1.45 -apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif">'
             + headerHtml(d)
+            + unknownStateLineHtml(d)
             + readOnlyLineHtml(d)
             + advisoriesHtml(d)
             + pendingHtml(d)
@@ -1131,7 +1467,10 @@
             return;
         }
         ANAS.api.get(node, '/ahr/' + encodeURIComponent(name)).then(function (res) {
-            var current = (res && res.data && res.data.mountpoint) || '';
+            // cr3 M2: prefill only a real mountpoint — an unmounted pool's
+            // `mountpoint` is its LV device path, never a place to mount at.
+            var d = (res && res.data) || null;
+            var current = (poolMounted(d) && d.mountpoint) || '';
             ANAS.changeMountpointFlow({
                 node: node,
                 resourcePath: '/ahr/' + encodeURIComponent(name),
@@ -1227,7 +1566,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-ahr-detail',
-                title: t('Hybrid RAID pool') + ': ' + name,
+                title: t('Hybrid RAID pool') + ': ' + enc(name),
                 modal: false,
                 width: 780,
                 height: 540,
@@ -1314,7 +1653,9 @@
         } catch (e) {
             // fall through
         }
-        return '' + iso;
+        // cr3 review follow-up 3: a grid renderer's output is HTML — the
+        // unparsed string from the daemon is encoded like every other value.
+        return enc('' + iso);
     }
 
     function openSnapshotManager(node, name) {
@@ -1510,7 +1851,7 @@
             });
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-ahr-snapshots',
-                title: t('Snapshots') + ': ' + name,
+                title: t('Snapshots') + ': ' + enc(name),
                 modal: true,
                 width: 640,
                 height: 460,
@@ -1657,8 +1998,10 @@
             if (!btn || typeof btn.setTooltip !== 'function') {
                 return;
             }
+            // cr3 L9: the tip is HTML (QuickTip) and `detail` carries a
+            // configfs backing path — encoded like every value into HTML.
             btn.setTooltip(held
-                ? (t('Disabled — this pool is ') + held.detail
+                ? enc(t('Disabled — this pool is ') + held.detail
                     + t('. Delete the LUN from the iSCSI screen first.'))
                 : '');
         } catch (e) {
@@ -1669,7 +2012,9 @@
     function updateButtons(grid) {
         var sel = grid.getSelection();
         var has = sel && sel.length > 0;
-        var state = has ? sel[0].get('state') : '';
+        // cr3 M3: a running btrfs scrub pass reads `scrubbing` here too, so
+        // Scrub (409 "already in flight") and Expand are not offered on it.
+        var state = has ? effectivePoolState(sel[0].get('state'), sel[0]) : '';
         // Story iscsi.6: an iSCSI LUN's image file on this pool makes Destroy
         // and Change mount hard 409s at the daemon (no confirm bypass) — a file
         // on the btrfs volume IS the AHR block object, and an unmount pulls it
@@ -1701,11 +2046,15 @@
         }
         // 11.12: Snapshots needs the §12 @data/@snapshots layout — a flat pool
         // stays disabled and says why (same wording the detail view carried).
+        // cr3: in the `unknown` state the daemon refuses every snapshot verb,
+        // and `subvolLayout` reads false only because the mount options could
+        // not be read — so the reason is the state, never "predates the layout".
         var snapBtn = grid.down('#snapshots');
         if (snapBtn) {
             var layout = has && !!sel[0].get('subvolLayout');
-            snapBtn.setDisabled(!layout);
-            snapBtn.setTooltip(has ? snapshotsTooltip(layout) : '');
+            var stateUnknown = has && state === 'unknown';
+            snapBtn.setDisabled(!layout || stateUnknown);
+            snapBtn.setTooltip(!has ? '' : (stateUnknown ? t(STATE_UNKNOWN_REASON) : snapshotsTooltip(layout)));
         }
         // Resume/Abandon only exist for a halted expansion (§6.2) — and while
         // one is halted, a fresh Expand/Replace would 409 anyway, so swap them.
@@ -1717,13 +2066,22 @@
         // don't offer a dead button.
         // Resume/Abandon cover the halted case.
         var healthyIdle = has && state === 'healthy' && !halted;
+        // cr3: `unknown` is not healthy, so both stay off — and say why.
+        var unknownTip = has && state === 'unknown' ? t(STATE_UNKNOWN_REASON) : '';
         var expandBtn = grid.down('#expand');
         if (expandBtn) {
             expandBtn.setDisabled(!healthyIdle);
+            if (typeof expandBtn.setTooltip === 'function') {
+                expandBtn.setTooltip(unknownTip);
+            }
         }
         var scrubBtn = grid.down('#scrub');
         if (scrubBtn) {
             scrubBtn.setDisabled(!healthyIdle);
+            if (typeof scrubBtn.setTooltip === 'function') {
+                scrubBtn.setTooltip(has && state === 'scrubbing'
+                    ? t('A scrub is already running on this pool') : unknownTip);
+            }
         }
         var resumeBtn = grid.down('#resumeExpand');
         var abandonBtn = grid.down('#abandonExpand');
@@ -1742,8 +2100,10 @@
             // daemon) leaves the button live — the route 404s there and the
             // dialog says "not available in this build", the file's standing
             // 404 treatment.
+            // cr3: the daemon refuses attach in the `unknown` state too.
             var absentish = !cache || cache.state === 'absent';
-            var cacheable = has && absentish && state !== 'offline' && state !== 'failed';
+            var cacheable = has && absentish && state !== 'offline' && state !== 'failed'
+                && state !== 'unknown';
             cacheBtn.setDisabled(!cacheable);
             cacheBtn.setTooltip(!has
                 ? ''
@@ -1751,7 +2111,7 @@
                     ? t('This pool already has a read cache — detach it first')
                     : (state === 'offline' || state === 'failed')
                         ? t('The pool\'s volume is not assembled — there is nothing to cache')
-                        : ''));
+                        : state === 'unknown' ? t(STATE_UNKNOWN_REASON) : ''));
         }
         // Detach is live for TWO shapes (the route's own test): a live cache
         // target in any state, and a leftover <pool>-cache<n> slice on a
@@ -1788,7 +2148,9 @@
         // disabled with the reason on the button rather than offered.
         var remountBtn = grid.down('#remount');
         if (remountBtn) {
-            var readOnly = has && sel[0].get('mountedReadOnly') === true;
+            // cr3: hidden in the `unknown` state whatever the field says —
+            // the read-only flag is exactly what could not be read.
+            var readOnly = has && sel[0].get('mountedReadOnly') === true && state !== 'unknown';
             var cacheFailed = !!(cache && cache.state === 'failed');
             remountBtn.setHidden(!readOnly);
             remountBtn.setDisabled(!readOnly || cacheFailed);
@@ -1981,7 +2343,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-ahr-spare',
-                title: t('Add hot spare') + ': ' + pool,
+                title: t('Add hot spare') + ': ' + enc(pool),
                 modal: true,
                 width: 620,
                 height: 440,
@@ -2078,13 +2440,9 @@
             if (!win || win.destroyed || win.destroying) {
                 return;
             }
-            var all = (res && res.data) || [];
-            var avail = [];
-            for (var i = 0; i < all.length; i++) {
-                if (all[i].status === 'available') {
-                    avail.push(all[i]);
-                    diskById[all[i].id] = all[i];
-                }
+            var avail = composableDisks((res && res.data) || []);   // cr3 L5
+            for (var i = 0; i < avail.length; i++) {
+                diskById[avail[i].id] = avail[i];
             }
             ANAS.api.get(node, '/ahr/' + encodeURIComponent(pool)).then(function (res2) {
                 if (!win || win.destroyed || win.destroying) {
@@ -2254,7 +2612,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-ahr-cache-attach',
-                title: t('Attach read cache') + ': ' + pool,
+                title: t('Attach read cache') + ': ' + enc(pool),
                 modal: true,
                 width: 620,
                 height: 480,
@@ -2371,9 +2729,11 @@
                         reclaimable[c.devices[i]] = true;
                     }
                 }
+                // cr3 L5: the route's own test (ahr-cache.ts pickCacheDisks):
+                // composable, or the pool's own leftover cache slice.
                 var candidates = [];
                 for (i = 0; i < all.length; i++) {
-                    if (all[i].status === 'available' || reclaimable[all[i].id]) {
+                    if (composable(all[i]) || reclaimable[all[i].id] === true) {
                         candidates.push(all[i]);
                     }
                 }
@@ -2388,12 +2748,7 @@
                 // No pool detail → no reclaimable set; the available list is
                 // still offerable (the route re-checks authoritatively).
                 win.setLoading(false);
-                var fallback = [];
-                for (i = 0; i < all.length; i++) {
-                    if (all[i].status === 'available') {
-                        fallback.push(all[i]);
-                    }
-                }
+                var fallback = composableDisks(all);   // cr3 L5
                 fallback.sort(function (a, b) {
                     return (a.rotational === true ? 1 : 0) - (b.rotational === true ? 1 : 0);
                 });
@@ -2577,6 +2932,7 @@
     // Expose for the composer (mirror of ANAS.pools.reload).
     ANAS.ahr = ANAS.ahr || {};
     ANAS.ahr.reload = loadPools;
+    ANAS.ahr.isComposableDisk = composable;   // cr3 L5: the composer's tray
     ANAS.ahr.selectedPool = selectedPool;
     // The expansion wizard's plan panel, exposed so the dialog-contracts
     // harness can pin what the Change row says for a positive gain, a
@@ -2721,7 +3077,11 @@
             // there is, and it stays.
             var hasGain = plan && typeof plan.usableGain === 'number';
             var zg = (plan && plan.zeroGain) || null;
-            if (hasGain || before) {
+            // cr3: before/after usable can be null (AhrPoolCapacity) — the
+            // fallback subtraction runs only on two known figures.
+            var canSubtract = !!before && knownBytes(before.usableBytes) !== null
+                && knownBytes(after.usableBytes) !== null;
+            if (hasGain || canSubtract) {
                 var gain = hasGain
                     ? Number(plan.usableGain)
                     : (Number(after.usableBytes) || 0) - (Number(before.usableBytes) || 0);
@@ -2794,6 +3154,30 @@
             // fall through
         }
         return out;
+    }
+
+    // cr3 L7: the expand confirm names every disk it wipes, read from the
+    // request body it signs (addDisks, or the replace pair's incoming disk) —
+    // like the create, spare and resume confirms. ONLY that: the daemon's 409
+    // carries the headline ("Expanding AHR pool '<name>' starts an online
+    // reshape", or the zero-gain shortfall), which the shared confirm shows
+    // under this intro since cr3.core, and its warnings carry the reshape
+    // facts (online, hours to days, not cancellable). Saying either again
+    // here would put the same sentence in the dialog twice.
+    function expandConfirmIntro(pool, body) {
+        var b = body || {};
+        if (b.replace) {
+            return t('Replacing') + ' <b>' + enc(b.replace.oldDiskId) + '</b> ' + t('in') + ' <b>'
+                + enc(pool) + '</b> ' + t('with') + ' <b>' + enc(b.replace.newDiskId) + '</b>, '
+                + t('which is WIPED:');
+        }
+        var names = [];
+        var add = b.addDisks || [];
+        for (var i = 0; i < add.length; i++) {
+            names.push('<b>' + enc(add[i]) + '</b>');
+        }
+        return t('Adding to') + ' <b>' + enc(pool) + '</b>' + (names.length ? ', ' + t('WIPES') + ' '
+            + names.join(', ') : '') + ':';
     }
 
     // Expansion wizard (§6.3): pick add-disks OR a replace pair; the plan
@@ -3054,8 +3438,7 @@
                 body: planBody,
                 view: grid,
                 confirmTitle: 'Expand pool',
-                confirmIntro: t('Expanding') + ' <b>' + enc(pool) + '</b> '
-                    + t('starts a multi-hour, non-cancellable reshape:'),
+                confirmIntro: expandConfirmIntro(pool, planBody),
                 failTitle: 'Expand failed',
                 successMsg: t('Expansion started on') + ' ' + pool,
                 // The reshape runs for hours — close the dialog the moment the
@@ -3070,10 +3453,16 @@
                     loadPools(grid, node);
                 },
             };
-            // Story 11.16: fold any advisory warnings into the existing reshape
-            // confirm — amber section prepended, button reads "Expand anyway".
-            if (ANAS.gfx && ANAS.gfx.warnGate) {
-                ANAS.gfx.warnGate.applyToConfirm(opts, (plan && plan.warnings) || [], t('Expand anyway'));
+            // Story 11.16: advisory warnings make the reshape confirm a
+            // window whose button reads "Expand anyway". The amber section
+            // warnGate.applyToConfirm would prepend is NOT used here: the
+            // plan's warnings are the planner's preview warnings, and the
+            // daemon's 409 lists those same sentences verbatim
+            // (ahr-expand.ts expansionWarnings `...plan.preview.warnings`),
+            // so the section printed each one twice (cr3 review follow-up 6b).
+            if ((plan && plan.warnings && plan.warnings.length) > 0) {
+                opts.confirmWindow = true;
+                opts.confirmButtonText = t('Expand anyway');
             }
             ANAS.confirmAndRun(opts);
         }
@@ -3081,7 +3470,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-ahr-expand',
-                title: t('Expand Hybrid RAID pool') + ': ' + pool,
+                title: t('Expand Hybrid RAID pool') + ': ' + enc(pool),
                 modal: true,
                 width: 660,
                 height: 620,
@@ -3128,29 +3517,16 @@
         }
         // Load available disks + the pool's members, then render the form.
         ANAS.api.get(node, '/disks').then(function (res) {
-            var all = (res && res.data) || [];
-            var avail = [];
-            for (var i = 0; i < all.length; i++) {
-                if (all[i].status === 'available') {
-                    avail.push(all[i]);
-                }
-            }
+            var avail = composableDisks((res && res.data) || []);   // cr3 L5
             ANAS.api.get(node, '/ahr/' + encodeURIComponent(pool)).then(function (res2) {
                 if (!win || win.destroyed || win.destroying) {
                     return;
                 }
                 win.setLoading(false);
-                var d = (res2 && res2.data) || {};
-                var members = [];
-                var pd = d.disks || [];
-                for (var j = 0; j < pd.length; j++) {
-                    members.push({
-                        id: pd[j].id,
-                        model: pd[j].model,
-                        size: pd[j].sizeBytes,
-                    });
-                }
-                renderForm(avail, members);
+                // cr3 L6: members are the disks serving a band (the route's
+                // memberIds) — never a spare or the cache disk, which the
+                // replace list would offer and the band picture would paint.
+                renderForm(avail, poolMemberDisks((res2 && res2.data) || {}));
             }, function (err2) {
                 if (!win || win.destroyed || win.destroying) {
                     return;
@@ -3228,7 +3604,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-ahr-replace',
-                title: t('Replace disk') + ': ' + pool,
+                title: t('Replace disk') + ': ' + enc(pool),
                 modal: true,
                 width: 620,
                 height: 500,
@@ -3265,24 +3641,14 @@
             // non-fatal
         }
         ANAS.api.get(node, '/ahr/' + encodeURIComponent(pool)).then(function (res) {
-            var d = (res && res.data) || {};
-            var members = [];
-            var pd = d.disks || [];
-            for (var i = 0; i < pd.length; i++) {
-                members.push({ id: pd[i].id, model: pd[i].model, size: pd[i].sizeBytes });
-            }
+            // cr3 L6: the route's members only (no spare, no cache disk).
+            var members = poolMemberDisks((res && res.data) || {});
             ANAS.api.get(node, '/disks').then(function (res2) {
                 if (!win || win.destroyed || win.destroying) {
                     return;
                 }
                 win.setLoading(false);
-                var all = (res2 && res2.data) || [];
-                var avail = [];
-                for (var j = 0; j < all.length; j++) {
-                    if (all[j].status === 'available') {
-                        avail.push(all[j]);
-                    }
-                }
+                var avail = composableDisks((res2 && res2.data) || []);   // cr3 L5
                 var p = win.down('#ahrReplaceBody');
                 if (p) {
                     p.setHtml('<div style="padding:12px;font-size:12.5px;color:var(--anas-ink)">'
@@ -3345,6 +3711,9 @@
                 // daemon that predates the story means "cannot tell", and the
                 // toolbar gates nothing off it (the routes 404 there anyway).
                 'cache',
+                // cr3 M3: the btrfs-scrub-running fact. AUTO field — absent
+                // or null changes nothing (read through btrfsScrubRunning).
+                BTRFS_SCRUB_FIELD,
             ],
             data: [],
             sorters: [{ property: 'name', direction: 'ASC' }],
@@ -3386,7 +3755,7 @@
                             text: t('State'),
                             dataIndex: 'state',
                             width: 140,
-                            renderer: renderPoolState,
+                            renderer: renderGridState,
                         },
                         {
                             text: t('Usable'),
@@ -3422,8 +3791,9 @@
                             menuDisabled: true,
                             renderer: renderCapacityPct,
                         },
-                        // Shared Mount column — identical to the Pools grid's.
-                        ANAS.gfx.mountColumn(),
+                        // Shared Mount column — the Pools grid's, with the AHR
+                        // renderer (cr3 M2: no LV path shown as a mount).
+                        ahrMountColumn(),
                         {
                             text: t('Activity'),
                             dataIndex: 'arrays',

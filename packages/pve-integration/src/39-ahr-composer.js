@@ -59,10 +59,44 @@
     };
 
     // Mirrors the shared PoolName schema (packages/shared/src/schemas/common.ts):
-    // letter first, then alphanumeric/underscore/hyphen, ≤ 255.
+    // letter first, then alphanumeric/underscore/hyphen — AND, as
+    // AhrCreateRequest refines it (cr3 L8), no longer than
+    // ahrMaxPoolNameLength(disk count) (shared/schemas/ahr.ts): the derived
+    // md array and GPT labels are capped at 32/36 characters. That is 29 for
+    // 1-9 disks, 28 for 10-99.
     var NAME_RE = /^[a-z][\w-]*$/i;
-    function nameValid(name) {
-        return !!name && name.length <= 255 && NAME_RE.test(name);
+    function ahrMaxPoolNameLength(diskCount) {
+        var d = String(Math.max(1, Number(diskCount) || 0)).length;
+        return Math.min(32 - 2 * d, 30 - d);
+    }
+    function nameValid(name, diskCount) {
+        return !!name && name.length <= ahrMaxPoolNameLength(diskCount) && NAME_RE.test(name);
+    }
+
+    // cr3 L5: the tray offers only what the shared `isComposableDisk`
+    // accepts — through the ONE panel copy of it, ANAS.ahr.isComposableDisk
+    // (39-ahr.js, which every other AHR picker uses too). Read at call time;
+    // without it nothing is offered.
+    function isComposableDisk(disk) {
+        var a = ANAS.ahr;
+        return !!(a && typeof a.isComposableDisk === 'function' && a.isComposableDisk(disk));
+    }
+
+    // cr3 L4: "Mount at" sends what was typed, trimmed at the ends only, and
+    // refuses (red border, Create disabled) what the daemon's AbsolutePath
+    // refuses — not absolute, a `..`, a control character — plus `/` and
+    // PVE's /mnt/pve namespace. The create route refuses those two as well,
+    // through its shared system-path gate (ahr-mutate.ts createSpec →
+    // mountTargetGate → services/mounts.ts mountTargetRefusal: 409, reason
+    // system-mount-target), and much more besides; this field is the hint.
+    var CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
+    function trimEnds(s) {
+        return ('' + (s || '')).replace(/^\s+|\s+$/g, '');
+    }
+    function mountpointBad(v) {
+        return v !== '' && (v.charAt(0) !== '/' || v === '/'
+            || v.indexOf('..') !== -1 || CONTROL_CHAR_RE.test(v)
+            || v === '/mnt/pve' || v.indexOf('/mnt/pve/') === 0);
     }
 
     function bandColor(band) {
@@ -86,8 +120,9 @@
             name: '',
             mountpoint: '',
             mountBad: false,
+            nameTouched: false, // cr3 L8: the name field was typed in
             tier: 'ahr1',
-            disks: [],          // available disks (from /disks, status 'available')
+            disks: [],          // composable disks (from /disks, isComposableDisk)
             diskById: {},
             assigned: {},       // diskId -> 'pool' when dragged into the bay
             drag: null,         // the shared drag-select controller
@@ -337,6 +372,34 @@
     // Shared core — also drives the expansion wizard's before→after picture
     // (exported as ANAS.ahr.bandBarsHtml; this file loads before 39-ahr.js).
     // diskList = [{id, size}] in any order.
+    // The live pool view (39-ahr.js poolBands) marks two band shapes the
+    // planner's bands never carry (cr3 review follow-ups 1 and 5):
+    //   notRunning      — the array cannot start: member devices, not slots,
+    //                     and no usable figure (unknown, never 0 B);
+    //   usableBeforeOverhead — no growth signal, and the band math differs
+    //                     from the LV at the precision shown: the figure is
+    //                     named as band capacity before md and volume overhead;
+    //   usableOnceGrown — the arrays have grown and LVM has not: the band
+    //                     math figure is what the band provides once the
+    //                     volume is grown, not what the pool has now.
+    function bandLegendHead(b) {
+        if (b.notRunning === true) {
+            return (b.level || '') + ' · ' + b.memberCount + ' '
+                + t(b.memberCount === 1 ? 'member device' : 'member devices') + ' · ' + t('not running');
+        }
+        return (b.level || '') + ' × ' + b.memberCount;
+    }
+    function bandLegendUsable(b) {
+        if (b.notRunning === true || typeof b.usableBytes !== 'number') {
+            return t('usable unknown');
+        }
+        if (b.usableBeforeOverhead === true) {
+            return t('band capacity') + ' ' + fmtBytes(b.usableBytes) + ' ' + t('before md and volume overhead');
+        }
+        return t('usable') + ' ' + fmtBytes(b.usableBytes)
+            + (b.usableOnceGrown === true ? ' ' + t('once the volume is grown') : '');
+    }
+
     function bandBarsHtml(bands, diskList) {
         bands = bands || [];
         if (!bands.length) {
@@ -380,7 +443,9 @@
                     : (w > 14 ? t('unprotected') : (w > 7 ? '✕' : ''));
                 segs += '<span title="' + enc(t('band') + ' ' + band.band + ' — '
                     + fmtBytes(h) + (prot
-                        ? ' (' + (band.level || '') + ' × ' + band.memberCount + ')'
+                        ? (band.notRunning === true
+                            ? ' (' + (band.level || '') + ', ' + t('not running') + ')'
+                            : ' (' + (band.level || '') + ' × ' + band.memberCount + ')')
                         : ' (' + t('unprotected — wasted with this disk set') + ')'))
                     + '" style="display:inline-flex;align-items:center;justify-content:center;'
                     + 'width:' + w.toFixed(2) + '%;height:100%;' + style + ';'
@@ -409,9 +474,9 @@
                 + (prot2 ? bandColor(b2.band) : HATCH) + '"></span>'
                 + '<span>' + enc(t('Band') + ' ' + b2.band + ' — '
                     + (prot2
-                        ? ((b2.level || '') + ' × ' + b2.memberCount + ' · '
+                        ? (bandLegendHead(b2) + ' · '
                             + t('height') + ' ' + fmtBytes(b2.heightBytes) + ' · '
-                            + t('usable') + ' ' + fmtBytes(b2.usableBytes))
+                            + bandLegendUsable(b2))
                         : (t('unprotected') + ' · ' + fmtBytes(b2.heightBytes) + ' × '
                             + b2.memberCount + ' ' + t('disk(s) — wasted'))))
                 + '</span></div>';
@@ -452,7 +517,10 @@
         if (!cap) {
             return '';
         }
-        var html = capRow(t('Usable'), fmtBytes(cap.usableBytes), true)
+        // cr3: the expansion plan's capacity is AhrPoolCapacity — its usable
+        // can be null (no LV to measure): "unknown", never blank, never 0.
+        var html = capRow(t('Usable'), typeof cap.usableBytes === 'number'
+            ? fmtBytes(cap.usableBytes) : t('unknown'), true)
             + capRow(t('Raw (selected disks)'), fmtBytes(cap.rawBytes))
             + capRow(t('Redundancy overhead'), fmtBytes(cap.redundancyOverheadBytes))
             + capRow(t('Unprotected (wasted)'), fmtBytes(cap.unprotectedWastedBytes));
@@ -561,11 +629,31 @@
         el.innerHTML = html;
     }
 
+    // cr3 L8: the name is judged against the cap for the disks placed NOW, so
+    // its border moves when a disk is dropped as well as when it is typed.
+    // A name never typed stays neutral (Create is disabled without one).
+    function syncNameField(state) {
+        var nameInput = (state.root && typeof state.root.querySelector === 'function')
+            ? state.root.querySelector('#ahrc-name') : null;
+        if (!nameInput) {
+            return;
+        }
+        var n = selectedIds(state).length;
+        var max = ahrMaxPoolNameLength(n);
+        var bad = (state.nameTouched || !!state.name) && !nameValid(state.name, n);
+        nameInput.style.borderColor = bad ? 'var(--anas-danger)' : 'var(--anas-card-edge)';
+        nameInput.title = (state.name && state.name.length > max)
+            ? t('Too long: at most') + ' ' + max + ' ' + t('characters for') + ' ' + Math.max(1, n) + ' '
+                + t('disk(s) — the derived md array and partition labels are length-capped')
+            : '';
+    }
+
     function syncCreateButton(state) {
+        syncNameField(state);
         if (!state.createBtn) {
             return;
         }
-        var ok = nameValid(state.name)
+        var ok = nameValid(state.name, selectedIds(state).length)
             && !state.mountBad
             && state.previewFresh
             && !!state.preview
@@ -748,8 +836,9 @@
         if (nameInput) {
             nameInput.addEventListener('input', function () {
                 state.name = nameInput.value;
-                nameInput.style.borderColor = nameValid(state.name)
-                    ? 'var(--anas-card-edge)' : 'var(--anas-danger)';
+                state.nameTouched = true;
+                // The border is set by syncCreateButton → syncNameField: the
+                // length cap moves with the disk count (cr3 L8).
                 // Keep the mountpoint placeholder tracking the default.
                 if (mountInput) {
                     mountInput.placeholder = '/mnt/anas-ahr/' + (state.name || '<name>');
@@ -759,12 +848,10 @@
         }
         if (mountInput) {
             mountInput.addEventListener('input', function () {
-                state.mountpoint = mountInput.value.replace(/\s+/g, '');
+                state.mountpoint = trimEnds(mountInput.value);
                 // Optional field: empty = default. When set it must be an
                 // absolute path outside PVE's namespace (daemon re-validates).
-                var v = state.mountpoint;
-                var bad = v !== '' && (v.charAt(0) !== '/' || v === '/'
-                    || v === '/mnt/pve' || v.indexOf('/mnt/pve/') === 0);
+                var bad = mountpointBad(state.mountpoint);
                 mountInput.style.borderColor = bad ? 'var(--anas-danger)' : 'var(--anas-card-edge)';
                 state.mountBad = bad;
                 syncCreateButton(state);
@@ -777,13 +864,18 @@
 
     function commit(state) {
         var ids = selectedIds(state);
-        if (!ids.length || !nameValid(state.name) || state.mountBad) {
+        if (!ids.length || !nameValid(state.name, ids.length) || state.mountBad) {
             return;
         }
         var body = { name: state.name, tier: state.tier, disks: ids };
         if (state.mountpoint) {
             body.mountpoint = state.mountpoint;
         }
+        // cr3 L4: the confirm names where the pool is built and mounted —
+        // the typed path, or the default the field's placeholder shows.
+        var mountHtml = state.mountpoint
+            ? '<b>' + enc(state.mountpoint) + '</b>'
+            : '<b>' + enc('/mnt/anas-ahr/' + state.name) + '</b> ' + enc(t('(the default)'));
         var opts = {
             node: state.node,
             method: 'post',
@@ -791,10 +883,14 @@
             body: body,
             view: state.win,
             confirmTitle: 'Create Hybrid RAID pool',
-            // The daemon's 409 warnings list EVERY disk that will be wiped;
-            // confirmAndRun renders them under this intro. Say it plainly.
-            confirmIntro: '<b>' + enc(t('Creating this pool PERMANENTLY ERASES the disks below.'))
-                + '</b> ' + enc(t('All data on them is destroyed:')),
+            // The intro names what the operator typed — the pool and where it
+            // mounts (cr3 L4) — and nothing the daemon says itself: its 409
+            // headline ("Creating AHR pool '<name>' will WIPE n disk(s). All
+            // data on them will be permanently erased"), shown under this
+            // intro since cr3.core, and its warnings, which list EVERY disk
+            // that will be wiped (cr3 review follow-up 6b: no sentence twice).
+            confirmIntro: enc(t('Creating pool')) + ' <b>' + enc(state.name) + '</b>, '
+                + enc(t('mounted at')) + ' ' + mountHtml + ':',
             failTitle: 'Create failed',
             successMsg: t('Hybrid RAID pool created') + ': ' + state.name,
             onComplete: function () {
@@ -825,7 +921,7 @@
             state.disks = [];
             state.diskById = {};
             for (var i = 0; i < all.length; i++) {
-                if (all[i].status === 'available') {
+                if (isComposableDisk(all[i])) {   // cr3 L5
                     state.disks.push(all[i]);
                     state.diskById[all[i].id] = all[i];
                 }
