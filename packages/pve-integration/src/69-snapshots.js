@@ -596,6 +596,10 @@
     }
 
     ANAS.schedules = ANAS.schedules || {};
+    // cr3: the read-back comparison, for cr3-datasets.harness.mjs.
+    ANAS.schedules.fireFieldsNotStored = fireFieldsNotStored;
+    ANAS.schedules.loadDatasetOptions = loadDatasetOptions;
+    ANAS.schedules.loadZfsPools = loadZfsPools;
     ANAS.schedules.reload = loadSchedules;
     // The schedule dialog's entry point, exposed so the edit-guard harness
     // (test/edit-retarget.harness.mjs) can open a real edit against stubbed
@@ -662,12 +666,21 @@
     // omitted — skew tightens, never loosens.
 
     // Every ZFS pool summary (PVE's included); never rejects.
+    // cr3: a list that could not be read is an empty array CARRYING
+    // `unreadable` (the reason), so the dialog can say so instead of reading
+    // it as "nothing to pick".
+    function unreadableList(err) {
+        var list = [];
+        list.unreadable = ANAS.errText(err) || t('unknown error');
+        return list;
+    }
+
     function loadZfsPools(node) {
         return ANAS.api.get(node, '/pools').then(function (res) {
             return (res && res.data) || [];
         }, function (err) {
             ANAS.warn('schedules ZFS pools load failed: ' + ANAS.errText(err));
-            return [];
+            return unreadableList(err);
         });
     }
 
@@ -685,7 +698,7 @@
             return names;
         }, function (err) {
             ANAS.warn('schedules AHR pools load failed: ' + ANAS.errText(err));
-            return [];
+            return unreadableList(err);
         });
     }
 
@@ -774,18 +787,11 @@
             },
             function (err) {
                 ANAS.warn('schedules datasets load failed for ' + pool + ': ' + ANAS.errText(err));
-                // A PVE pool offers NOTHING on failure: its root is owned
-                // (a `pve` verdict on the summary, or pveStorages on any
-                // daemon), so surfacing "(pool root)" would hand the operator
-                // a target the daemon refuses. Tighten on failure, never loosen.
-                var rootOwned = false;
-                try {
-                    rootOwned = ANAS.pve.isOwned(poolSummary, poolSummary, false);
-                } catch (eFail) {
-                    // a malformed summary cannot be classified — the old
-                    // behaviour (offer the root) stands; the daemon refuses
-                }
-                return { opts: rootOwned ? [] : rootOpt, rows: [] };
+                // cr3 (review fold of INVENTED-STATE-L15): the choices could
+                // not be read — offer NONE and say so (`unreadable`); the
+                // dialog marks the picker and refuses to save a ZFS target or
+                // an exclude list chosen from a list it never saw.
+                return { opts: [], rows: [], unreadable: ANAS.errText(err) || t('unknown error') };
             }
         );
     }
@@ -938,12 +944,28 @@
                 zfsPools.push(zfsSummaries[i].name);
             }
             var ahrPools = r[1] || [];
+            // cr3: an inventory that could not be read is said, never read as
+            // "no pool".
+            var unreadable = [];
+            if (r[0] && r[0].unreadable) {
+                unreadable.push(t('ZFS pools') + ': ' + r[0].unreadable);
+            }
+            if (r[1] && r[1].unreadable) {
+                unreadable.push(t('AHR pools') + ': ' + r[1].unreadable);
+            }
             // Nothing to point a NEW schedule at. An EDIT still opens: the
             // schedule already has a target, and the dialog's job is then to say
             // that the inventory is missing — not to disappear.
             if (!zfsPools.length && !ahrPools.length && !existing) {
+                if (unreadable.length) {
+                    ANAS.alertMsg('Cannot load targets', t('The pools could not be read') + ' — ' + unreadable.join('; '));
+                    return;
+                }
                 ANAS.toast(t('No ZFS pool or AHR pool is available to schedule.'));
                 return;
+            }
+            if (unreadable.length) {
+                ANAS.toast(t('Some targets could not be read') + ' — ' + unreadable.join('; '));
             }
             buildScheduleWindow(node, grid, existing || null, zfsPools, ahrPools, zfsSummaries);
         });
@@ -1011,7 +1033,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-sched',
-                title: isEdit ? (t('Edit Snapshot Schedule') + ': ' + (sched.name || sched.id || ''))
+                title: isEdit ? (t('Edit Snapshot Schedule') + ': ' + enc(sched.name || sched.id || ''))
                     : t('New Snapshot Schedule'),
                 modal: true,
                 width: 540,
@@ -1406,6 +1428,9 @@
                     return;
                 }
                 var opts = res.opts;
+                // cr3: remembered for the save, which refuses a ZFS target
+                // or an exclude list picked from a list that was never read.
+                win.anasDatasetsUnreadable = res.unreadable || null;
                 excluder.setRows(res.rows);
                 zfsDsStore.loadData(opts);
                 var fld = win.down('#zfsDataset');
@@ -1413,6 +1438,14 @@
                     var want = preselectRel !== undefined ? preselectRel
                         : (opts.length ? opts[0].rel : '');
                     fld.setValue(want);
+                    if (res.unreadable) {
+                        try {
+                            // markInvalid renders HTML in its tip: encoded.
+                            fld.markInvalid(enc(t('The datasets of this pool could not be read') + ': ' + res.unreadable));
+                        } catch (eMark) {
+                            // the save still refuses
+                        }
+                    }
                 }
                 refreshExclude();
             });
@@ -1543,6 +1576,12 @@
                 ANAS.alertMsg('Invalid input', t('Select a ZFS pool.'));
                 return;
             }
+            if (win.anasDatasetsUnreadable) {
+                ANAS.alertMsg('Cannot save', t('The datasets of pool') + ' ' + zfsPool + ' '
+                    + t('could not be read, so neither the dataset nor what to exclude can be chosen') + ': '
+                    + win.anasDatasetsUnreadable + '. ' + t('Close the dialog and try again.'));
+                return;
+            }
             var rel = ('' + (valOf(win, '#zfsDataset') || '')).replace(/^\/+|\/+$/g, '');
             target = { kind: 'zfs', dataset: rel ? (zfsPool + '/' + rel) : zfsPool };
         }
@@ -1614,12 +1653,21 @@
             body.exclude = (valOf(win, '#exclude') || []).slice();
         }
 
-        ANAS.runJob({
+        // cr3 H2: a CREATE whose id is already stamped on snapshots under the
+        // target (left by a deleted schedule of that id) is confirm-gated by
+        // the daemon — its warnings say how many it would own and that an
+        // excluded dataset's are destroyed. cr3 review fold: so is an EDIT
+        // that newly excludes datasets carrying this schedule's own
+        // snapshots (destroyed at its next run). confirmAndRun asks in both.
+        ANAS.confirmAndRun({
             node: node,
             method: isEdit ? 'put' : 'post',
             path: isEdit ? ('/schedules/' + encodeURIComponent(id)) : '/schedules',
             body: body,
             view: win,
+            confirmTitle: isEdit ? 'Destroy snapshots on excluded datasets?' : 'Adopt existing snapshots?',
+            confirmIntro: isEdit ? t('This edit excludes datasets that hold snapshots this schedule took:')
+                : t('Snapshots with this schedule id already exist:'),
             failTitle: isEdit ? 'Save failed' : 'Create failed',
             successMsg: isEdit ? (t('Schedule saved') + ': ' + name)
                 : (t('Schedule created') + ': ' + name),
@@ -1628,8 +1676,55 @@
                     win.close();
                 }
                 loadSchedules(grid, node);
+                verifyFireFieldsStored(node, id, body);
             }
         });
+    }
+
+    // The fire fields the daemon did NOT store, of those this save sent
+    // (cr3, the version-skew could-not-verify item): an ANAS daemon older than
+    // snaptime.1 parses the body with a schema that has no time / weekday /
+    // dayOfMonth / month and drops them SILENTLY — the job completes and the
+    // toast says saved, while the timer fires at the cadence's default. A
+    // stored field equal to its default is stored as absence, so absence
+    // compares as the default. Pure: (sent body, stored schedule) → names.
+    function fireFieldsNotStored(sent, stored) {
+        var missing = [];
+        var fields = ['time', 'weekday', 'dayOfMonth', 'month'];
+        for (var i = 0; i < fields.length; i++) {
+            var f = fields[i];
+            if (!sent || !Object.prototype.hasOwnProperty.call(sent, f)) {
+                continue;
+            }
+            var had = (stored && stored[f] !== undefined && stored[f] !== null) ? stored[f] : FIRE_DEFAULTS[f];
+            if (String(had) !== String(sent[f])) {
+                missing.push(f);
+            }
+        }
+        return missing;
+    }
+
+    // After a save, read the schedule back and SAY when the node did not keep
+    // what was sent. Fail-open: a read that fails says nothing (the grid's own
+    // reload already shows what the node holds).
+    function verifyFireFieldsStored(node, id, sent) {
+        try {
+            ANAS.api.get(node, '/schedules/' + encodeURIComponent(id)).then(function (res) {
+                var stored = res && res.data && res.data.schedule;
+                if (!stored) {
+                    return;
+                }
+                var missing = fireFieldsNotStored(sent, stored);
+                if (missing.length) {
+                    ANAS.alertMsg('Saved without the fire time',
+                        t('The node saved this schedule without') + ' ' + missing.join(', ') + '. '
+                        + t('Its ANAS daemon is older than this page, so the schedule fires at its cadence\'s default time. '
+                            + 'Upgrade ANAS on that node, then edit the schedule again.'));
+                }
+            }, function () { /* fail-open: the grid reload shows what is stored */ });
+        } catch (e) {
+            ANAS.warn('schedule read-back failed: ' + ANAS.errText(e));
+        }
     }
 
     // ---- Run Now (take + prune; surfaces held-and-retained) ----------------
@@ -1965,7 +2060,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-sched-detail',
-                title: t('Snapshot Schedule') + ': ' + (name || id),
+                title: t('Snapshot Schedule') + ': ' + enc(name || id),
                 modal: false,
                 width: 720,
                 height: 500,

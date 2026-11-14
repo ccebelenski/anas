@@ -11,9 +11,9 @@ import { parseBtrfsScrubStatus } from './ahr-scrub.js'
  * checking. One `btrfs scrub status` per mounted AHR pool per `GET /scrub`
  * is the accepted cost.
  *
- * Fail-open: a status read that cannot be made (non-zero exit, a throw) costs
- * the running state and nothing else — a row that reads idle must never be
- * the reason a whole `GET /scrub` fails.
+ * A status read that cannot be made (non-zero exit, a throw, the deadline)
+ * answers {@link BTRFS_SCRUB_UNKNOWN} (cr3): the row says the running state is
+ * unknown, never idle — and the whole `GET /scrub` still answers.
  *
  * The read carries its own 3 s deadline (`timeoutMs`) because the fail-open
  * above only holds for the ANSWER, not for the latency: with no deadline of
@@ -34,20 +34,27 @@ import { parseBtrfsScrubStatus } from './ahr-scrub.js'
 /** The btrfs utility — module-private here, exactly as it is in `ahr-scrub.ts`. */
 const BTRFS = '/usr/bin/btrfs'
 
+/**
+ * The answer when the status read could not be made (cr3, AHR-HEAL "other
+ * doors": a failed or hung read used to answer null, which the row rendered
+ * as "not running" — a scrub in flight shown idle). The row says unknown.
+ */
+export const BTRFS_SCRUB_UNKNOWN = 'unknown' as const
+
 export async function btrfsScrubRunning(
   executor: CommandExecutor,
   mountpoint: string,
-): Promise<ScrubRunning | null> {
+): Promise<ScrubRunning | null | typeof BTRFS_SCRUB_UNKNOWN> {
   try {
     const r = await executor.exec(BTRFS, ['scrub', 'status', mountpoint], { timeoutMs: 3000 })
     if (r.exitCode !== 0)
-      return null
+      return BTRFS_SCRUB_UNKNOWN
     const st = parseBtrfsScrubStatus(r.stdout)
     if (st.status !== 'running')
       return null
     return { phase: 'btrfs-checksums', ...(st.percent !== null && { percent: st.percent }) }
   }
   catch {
-    return null
+    return BTRFS_SCRUB_UNKNOWN
   }
 }

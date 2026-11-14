@@ -975,7 +975,7 @@ export function createServer(opts?: ServerOptions) {
   // fire (take + prune). AHR targets mount @data on demand at subvolRuntimeDir.
   const subvolRuntimeDir = process.env.ANAS_AHR_SUBVOL_RUNTIME_DIR
     ?? (opts?.mock ? join(tmpdir(), `anas-mock-ahr-subvol-${process.pid}`) : undefined)
-  server.register(scheduleRoutes, { prefix: '/v1', executor, jobQueue, systemdDir, subvolRuntimeDir })
+  server.register(scheduleRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, systemdDir, subvolRuntimeDir })
   // Periodic scrub (Epic 17.5 + selfheal.4) — uniform on/off surface; ZFS
   // property + the node-level anas-scrub timer (same unit dir as schedules).
   server.register(scrubRoutes, { prefix: '/v1', executor, jobQueue, systemdDir })

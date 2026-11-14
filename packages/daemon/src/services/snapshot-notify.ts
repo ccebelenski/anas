@@ -2,7 +2,7 @@ import type { RetentionBucket, RetentionPolicy, SnapshotSchedule, SnapshotSchedu
 import type { CommandExecutor } from '../executor/types.js'
 import type { NotifyOutcome, UnattendedNotifyBase } from './unattended-notify.js'
 import { ANAS_SNAPSHOT_NOTIFY_TEMPLATE, pveNotify } from './pve-notify.js'
-import { SCHEDULE_LIST_UNREADABLE } from './snapshot-schedules.js'
+import { PVE_OWNED_LEFT, SCHEDULE_LIST_UNREADABLE } from './snapshot-schedules.js'
 import {
   elapsedLine,
   notifySeverity,
@@ -74,7 +74,8 @@ export interface SnapshotNotifyContext extends UnattendedNotifyBase {
  * the target keeps growing until the hold is released. So is a destroy ZFS
  * refused on a swept or excluded dataset (snapprune.1: a clone depends on the
  * snapshot). So is the schedule-list fail-safe (any dataset noted
- * {@link SCHEDULE_LIST_UNREADABLE}): retention was not applied to the swept
+ * {@link SCHEDULE_LIST_UNREADABLE}), and so is a PVE-owned dataset the prune
+ * left alone ({@link PVE_OWNED_LEFT}, cr3 L3): retention was not applied to the swept
  * children that run, and a quiet success would hide it until they piled up.
  * All are warnings, not failures — and precisely what an `on-failure`
  * operator asked to hear.
@@ -84,7 +85,7 @@ function fireHasWarnings(ctx: SnapshotNotifyContext): boolean {
   if (!result)
     return false
   return heldTotal(result) > 0
-    || (result.datasets ?? []).some(d => (d.refused ?? 0) > 0 || (d.note ?? '').includes(SCHEDULE_LIST_UNREADABLE))
+    || (result.datasets ?? []).some(d => (d.refused ?? 0) > 0 || (d.note ?? '').includes(SCHEDULE_LIST_UNREADABLE) || (d.note ?? '').includes(PVE_OWNED_LEFT))
 }
 
 /** Classify a finished schedule fire into the shared four-outcome vocabulary. */

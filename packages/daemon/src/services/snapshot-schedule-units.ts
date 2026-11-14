@@ -1,6 +1,6 @@
 import type { DashboardWarning, SnapshotCadence, SnapshotFireShape, SnapshotSchedule, SnapshotScheduleDetail, SnapshotScheduleStatus } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { SNAPSHOT_FIRE_DEFAULTS, SnapshotDayOfMonth, snapshotFireShapeIssues, SnapshotMonth, SnapshotSchedule as SnapshotScheduleSchema, TaskTimeOfDay, TaskWeekday } from '@anas/shared'
 import { DISABLED_HISTORY_NOTE } from './systemd-status.js'
@@ -54,6 +54,27 @@ const UNIT_PREFIX = 'anas-snap-'
 export const SNAPSHOT_UNIT_PREFIX = UNIT_PREFIX
 /** The service-file line that carries the canonical schedule JSON (as a comment). */
 const SCHEDULE_MARKER = 'X-ANAS-Schedule='
+
+/** Every `%` in a unit value (systemd expands `%n`, `%H`, ... as specifiers). */
+const PERCENT_RE = /%/g
+/** The run of backslashes a value ends with. */
+const TRAILING_BACKSLASHES_RE = /\\+$/
+
+/**
+ * The schedule name as a unit-file `Description=` value (cr3
+ * DATASETS-SCHEDULES-L8): systemd expands `%` specifiers there (`100%n`
+ * rendered as `100anas-snap-<id>.service`), so `%` is written `%%`; and a
+ * line that ends in an odd number of backslashes CONTINUES onto the next
+ * line (the marker comment below it was swallowed into the description), so
+ * one more backslash is added — an even run is not a continuation (checked
+ * with `systemd-analyze verify`, systemd 262). The JSON marker keeps the name
+ * exactly as typed; only the human description is escaped.
+ */
+export function unitDescriptionText(name: string): string {
+  const escaped = name.replace(PERCENT_RE, '%%')
+  const run = escaped.match(TRAILING_BACKSLASHES_RE)?.[0].length ?? 0
+  return run % 2 === 1 ? `${escaped}\\` : escaped
+}
 
 /** Default systemd unit directory; overridable (env/dep) for tests. */
 export const DEFAULT_SYSTEMD_DIR = process.env.ANAS_SYSTEMD_DIR ?? '/etc/systemd/system'
@@ -303,7 +324,7 @@ export function renderServiceUnit(schedule: SnapshotSchedule): string {
   const stored = exclude && exclude.length > 0 ? normalized : withoutExclude
   return [
     '[Unit]',
-    `Description=ANAS snapshot schedule ${schedule.name}`,
+    `Description=ANAS snapshot schedule ${unitDescriptionText(schedule.name)}`,
     `# ${SCHEDULE_MARKER}${JSON.stringify(stored)}`,
     '',
     '[Service]',
@@ -325,7 +346,7 @@ export function renderTimerUnit(schedule: SnapshotSchedule): string {
   refuseControlChars(schedule.name, 'schedule name')
   return [
     '[Unit]',
-    `Description=ANAS snapshot timer ${schedule.name}`,
+    `Description=ANAS snapshot timer ${unitDescriptionText(schedule.name)}`,
     '',
     '[Timer]',
     ...cadenceToOnCalendar(schedule).map(line => `OnCalendar=${line}`),
@@ -713,21 +734,31 @@ export function buildUnparseableScheduleWarnings(units: UnparseableScheduleUnit[
 }
 
 /**
- * Collect the dashboard 'schedule' warnings from the store, fail-open. Mirrors
- * how replication/backup warnings are wired into the dashboard aggregate.
- * One store read feeds both halves (cr.51r): the failed/overdue cards over the
+ * Collect the dashboard 'schedule' warnings from the store. Mirrors how
+ * replication/backup warnings are wired into the dashboard aggregate. One
+ * store read feeds both halves (cr.51r): the failed/overdue cards over the
  * parsed schedules, and one card per unparseable unit file.
+ *
+ * cr3 INVENTED-STATE-H1: a read that failed THROWS, so the dashboard marks
+ * the section unavailable (`readDashboardSection` marks only a throw or a
+ * timeout). It used to catch everything and answer `[]` — "no schedule
+ * warning" — as a successful read: a failed schedule's card disappeared. The
+ * unit directory that could not be listed throws too (a per-file failure is
+ * already its own card).
  */
 export async function collectScheduleWarnings(
   executor: CommandExecutor,
   dir: string,
 ): Promise<DashboardWarning[]> {
-  try {
-    const read = await readScheduleList(dir)
-    const statuses = await Promise.all(read.schedules.map(s => deriveScheduleStatus(executor, s)))
-    return [...buildScheduleWarnings(statuses), ...buildUnparseableScheduleWarnings(read.unparseable)]
+  const read = await readScheduleList(dir)
+  if (!read.complete && read.unparseable.length === 0) {
+    // The directory itself could not be listed. One that does not EXIST
+    // holds no unit (an absent store is an empty one); any other failure is
+    // a read that did not see.
+    const absent = await stat(dir).then(() => false, (err: NodeJS.ErrnoException) => err.code === 'ENOENT')
+    if (!absent)
+      throw new Error(`the schedule unit directory ${dir} could not be listed`)
   }
-  catch {
-    return []
-  }
+  const statuses = await Promise.all(read.schedules.map(s => deriveScheduleStatus(executor, s)))
+  return [...buildScheduleWarnings(statuses), ...buildUnparseableScheduleWarnings(read.unparseable)]
 }

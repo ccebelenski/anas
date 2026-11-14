@@ -4,7 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { LockClaim, LockMode } from '../jobs/locks.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { Advisory, Gate, GuardReads, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
+import type { Advisory, Gate, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { AccessObject, AccessService, SetAccessPlan } from '../services/access.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
@@ -15,7 +15,7 @@ import { parseSmbConf } from '../parsers/smb-conf.js'
 import { parseZfsJson } from '../parsers/utils.js'
 import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs, zfsSweepSnapshotListArgs } from '../parsers/zfs-list.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
-import { guardCheck, guardConfirm, guarded, sendRefusal, zfsDatasetClaims } from '../safety/guard.js'
+import { guardCheck, guardConfirm, guarded, GuardReads, sendRefusal, zfsDatasetClaims } from '../safety/guard.js'
 import { readDatasetGuid, readPoolGuid, readRollbackIds } from '../safety/stable-id.js'
 import { createAccessService, SET_ACCESS_PRESENTATION_ONLY, signedAccessRequest } from '../services/access.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
@@ -52,6 +52,32 @@ const TXG_RE = /^\d+$/
  */
 export const DATASET_DESTROY_PRESENTATION_ONLY: Record<string, string> = {}
 export const SNAPSHOT_ROLLBACK_PRESENTATION_ONLY: Record<string, string> = {}
+
+/**
+ * A pool's dataset list could not be READ (`zfs list` exited non-zero) —
+ * cr3 INVENTED-STATE-L15: it used to answer an empty list, so an existing
+ * pool read "no datasets" and a live dataset "not found". The routes here
+ * answer 503 UNAVAILABLE with its sentence; a caller elsewhere (replication's
+ * `datasetExists`) gets the throw, never a false "does not exist".
+ */
+export class DatasetListUnreadableError extends Error {
+  constructor(readonly pool: string, exitCode: number, stderr: string) {
+    super(`The dataset list of pool '${pool}' could not be read (zfs list exited ${exitCode}: ${stderr.trim().split('\n')[0] || 'no stderr'})`)
+    this.name = 'DatasetListUnreadableError'
+  }
+}
+
+/**
+ * A dataset's snapshot list could not be READ (`zfs list -t snapshot`
+ * exited non-zero) — thrown by the `listSnapshotsDetail` dependency other
+ * routes take, never an empty list (cr3).
+ */
+export class SnapshotListUnreadableError extends Error {
+  constructor(readonly dataset: string, exitCode: number, stderr: string) {
+    super(`The snapshots of '${dataset}' could not be read (zfs list exited ${exitCode}: ${stderr.trim().split('\n')[0] || 'no stderr'})`)
+    this.name = 'SnapshotListUnreadableError'
+  }
+}
 
 /**
  * A wildcard path whose reading (dataset or snapshot sub-route) could not be
@@ -428,7 +454,16 @@ export async function datasetRoutes(
     poolName: string,
   ): Promise<{ datasets: Dataset[], defaults: DatasetListDefaults }> {
     const r = await executor.exec(ZFS, zfsListArgs(poolName))
-    if (r.exitCode !== 0 || !r.stdout.trim())
+    // cr3 L15: a read that FAILED throws; only a successful read with no
+    // rows is "no datasets". ZFS's own "dataset does not exist" (the pool is
+    // not there) is an ANSWER, not a failed read (second review): no rows, so
+    // the callers answer 404.
+    if (r.exitCode !== 0) {
+      if (DATASET_ABSENT_RE.test(r.stderr))
+        return { datasets: [], defaults: { volblocksize: null } }
+      throw new DatasetListUnreadableError(poolName, r.exitCode, r.stderr)
+    }
+    if (!r.stdout.trim())
       return { datasets: [], defaults: { volblocksize: null } }
     return {
       datasets: parseZfsList(r.stdout),
@@ -436,15 +471,34 @@ export async function datasetRoutes(
     }
   }
 
-  /** The pool's flat dataset list (filesystems + volumes). */
+  /** The pool's flat dataset list (filesystems + volumes); throws {@link DatasetListUnreadableError} when it could not be read. */
   async function listDatasets(poolName: string): Promise<Dataset[]> {
     return (await listDatasetsAndDefaults(poolName)).datasets
   }
 
-  /** Snapshot names below a dataset (for destroy warnings). */
-  async function snapshotNames(fullName: string): Promise<string[]> {
+  /** The 503 a dataset list that could not be read answers (cr3 L15). */
+  function datasetListUnreadable(reply: FastifyReply, err: DatasetListUnreadableError): { error: { code: 'UNAVAILABLE', message: string } } {
+    reply.code(503)
+    return { error: { code: 'UNAVAILABLE', message: err.message } }
+  }
+
+  /**
+   * Snapshot names of a dataset (for destroy warnings): its own (`-r` false)
+   * or every snapshot `destroy -r` sweeps, its descendants' included. Null
+   * when the read FAILED (cr3 INVENTED-STATE-M9: it used to be [], so the
+   * destroy confirm left out "N snapshot(s) will also be destroyed").
+   */
+  async function snapshotNames(fullName: string, recursive = false): Promise<string[] | null> {
+    if (recursive) {
+      const r = await executor.exec(ZFS, zfsSweepSnapshotListArgs(fullName))
+      if (r.exitCode !== 0)
+        return null
+      return r.stdout.split('\n').map(line => line.trim()).filter(Boolean)
+    }
     const r = await executor.exec(ZFS, zfsSnapshotListArgs(fullName))
-    if (r.exitCode !== 0 || !r.stdout.trim())
+    if (r.exitCode !== 0)
+      return DATASET_ABSENT_RE.test(r.stderr) ? [] : null
+    if (!r.stdout.trim())
       return []
     return parseSnapshotNames(r.stdout)
   }
@@ -513,7 +567,13 @@ export async function datasetRoutes(
     return tails[0]
   }
 
-  /** Does the named dataset (or pool-root dataset) exist? */
+  /**
+   * Does the named dataset (or pool-root dataset) exist? A dataset list that
+   * could not be READ throws {@link DatasetListUnreadableError} (cr3 L15) —
+   * never `false`, so no caller (replication's source and target checks
+   * among them) answers "not found" for a dataset that exists. The routes
+   * here answer it 503 through `datasetExistsOr503`.
+   */
   async function datasetExists(poolName: string, fullName: string): Promise<boolean> {
     const datasets = await listDatasets(poolName)
     return datasets.some(d => d.name === fullName)
@@ -600,11 +660,13 @@ export async function datasetRoutes(
     listing: (reads: GuardReads, pool: string) => reads.once(`zfs-list:${pool}`, () => readPoolListing(pool)),
     footprint: (reads: GuardReads) => reads.once('pve-footprint', () => pveFootprint()),
     claims: (reads: GuardReads) => reads.once('iscsi-claims', async () => createIscsiClaimCache(executor, iscsiPaths)),
-    snapshots: (reads: GuardReads, dataset: string) => reads.once(`snapshots:${dataset}`, () => listSnapshotsDetail(dataset)),
+    /** A dataset's snapshots, or null when the read FAILED (cr3: never "none"). */
+    snapshots: (reads: GuardReads, dataset: string) => reads.once(`snapshots:${dataset}`, () => readSnapshotsDetail(dataset)),
     poolGuid: (reads: GuardReads, pool: string) => reads.once(`pool-guid:${pool}`, () => readPoolGuid(executor, pool)),
     rollbackIds: (reads: GuardReads, dataset: string, snapshot: string) =>
       reads.once(`rollback-ids:${snapshot}`, () => readRollbackIds(executor, dataset, snapshot)),
     bookmarks: (reads: GuardReads, dataset: string) => reads.once(`bookmarks:${dataset}`, () => readBookmarks(dataset)),
+    snapshotTxgs: (reads: GuardReads, dataset: string) => reads.once(`snapshot-txgs:${dataset}`, () => readSnapshotTxgs(dataset)),
   }
 
   /** The pool a dataset, snapshot (`@`) or bookmark (`#`) name lives in. */
@@ -868,12 +930,19 @@ export async function datasetRoutes(
 
   function snapshotView(fullName: string, snap: string, extra: Partial<ObjectView<SnapshotObject>> = {}): ObjectView<SnapshotObject> {
     const snapName = `${fullName}@${snap}`
+    // cr3: a snapshot listing that could not be read is not "no such
+    // snapshot" — the route door answers 503 naming the read, not 404.
+    let unreadable = false
     return {
       what: `Snapshot '${snapName}'`,
       read: async (reads) => {
         const snapshots = await dsReads.snapshots(reads, fullName)
-        return snapshots.some(s => s.name === snapName) ? { dataset: fullName, snap, snapName, snapshots } : null
+        unreadable = snapshots === null
+        return snapshots?.some(s => s.name === snapName) ? { dataset: fullName, snap, snapName, snapshots } : null
       },
+      notFound: () => (unreadable
+        ? { status: 503, code: 'UNAVAILABLE', message: `The snapshots of '${fullName}' could not be read — nothing was done; try again` }
+        : { status: 404, code: 'NOT_FOUND', message: `Snapshot '${snapName}' not found` }),
       id: nameId('snapshot', snapName),
       unbound: () => `Could not read snapshot '${snapName}' — refusing a change that cannot be bound to it`,
       ...extra,
@@ -900,19 +969,56 @@ export async function datasetRoutes(
   }
 
   /**
-   * What `zfs rollback -r` destroys: every snapshot newer than the target (the
-   * listing is newest first) and every bookmark created after it. Null when a
-   * read failed. Sorted, so the bound string compares.
+   * A dataset's own snapshots with their createtxg (`zfs list -Hp -o
+   * name,createtxg -d 1`, the argv `readRollbackIds` binds), or null when the
+   * read failed or printed no row it could parse.
+   */
+  async function readSnapshotTxgs(dataset: string): Promise<{ name: string, txg: bigint }[] | null> {
+    const r = await executor.exec(ZFS, ['list', '-t', 'snapshot', '-Hp', '-o', 'name,createtxg', '-d', '1', '--', dataset])
+    if (r.exitCode !== 0)
+      return null
+    const out: { name: string, txg: bigint }[] = []
+    for (const line of r.stdout.split('\n')) {
+      const [name, txg] = line.trim().split('\t')
+      if (!name || !txg || !name.startsWith(`${dataset}@`) || !TXG_RE.test(txg))
+        continue
+      out.push({ name, txg: BigInt(txg) })
+    }
+    return out.length > 0 ? out : null
+  }
+
+  /**
+   * The snapshots `zfs rollback -r` destroys: every snapshot of the dataset
+   * whose createtxg is greater than the target's (cr3 DATASETS-SCHEDULES-H1).
+   * ZFS orders by createtxg, never by the `creation` time: a received snapshot
+   * keeps its sender's creation time and a stepped clock reorders the times,
+   * so the time-sorted listing is not what ZFS sweeps. The one answer for the
+   * confirm's scope, the hold gate and the warning. Null when the read failed
+   * or the target is not in it (a read that could not see never says
+   * "nothing newer"). Sorted by name.
+   */
+  async function rollbackSwept(o: SnapshotObject, reads: GuardReads): Promise<string[] | null> {
+    const txgs = await dsReads.snapshotTxgs(reads, o.dataset)
+    const target = txgs?.find(s => s.name === o.snapName)
+    if (!txgs || !target)
+      return null
+    return txgs.filter(s => s.txg > target.txg).map(s => s.name).sort()
+  }
+
+  /**
+   * What `zfs rollback -r` destroys: every snapshot and every bookmark created
+   * after the target (createtxg greater than the target's). Null when a read
+   * failed. Sorted, so the bound string compares.
    */
   async function forceDestroys(o: SnapshotObject, reads: GuardReads): Promise<string[] | null> {
     const ids = await dsReads.rollbackIds(reads, o.dataset, o.snapName)
     const bookmarks = await dsReads.bookmarks(reads, o.dataset)
-    const index = o.snapshots.findIndex(s => s.name === o.snapName)
-    if (!ids || !bookmarks || index < 0)
+    const swept = await rollbackSwept(o, reads)
+    if (!ids || !bookmarks || !swept)
       return null
     const target = BigInt(ids.snapshotTxg)
     const names = [
-      ...o.snapshots.slice(0, index).map(s => s.name),
+      ...swept,
       ...bookmarks.filter(b => b.txg > target).map(b => b.name),
     ]
     names.sort()
@@ -958,7 +1064,12 @@ export async function datasetRoutes(
    * is exactly the case this gate exists for. Bookmarks carry no holds.
    */
   const rollbackHoldGate: Gate<SnapshotObject> = async (o, reads) => {
-    const swept = o.snapshots.slice(0, o.snapshots.findIndex(s => s.name === o.snapName)).map(s => s.name)
+    // cr3 H1: the swept set by createtxg, the set ZFS destroys.
+    const swept = await rollbackSwept(o, reads)
+    if (!swept) {
+      return conflict(`Could not read which snapshots a forced rollback of '${o.dataset}' to '${o.snap}' destroys — `
+        + 'refusing: their holds cannot be checked', 'snapshot-holds-unreadable')
+    }
     if (swept.length === 0)
       return null
     const holds = await reads.once(`holds:${swept.join('\0')}`, () => readLocalHoldsChecked(executor, swept))
@@ -1075,6 +1186,8 @@ export async function datasetRoutes(
   function snapshotCollisionGate(snapName: string): Gate<DatasetObject> {
     return async (o, reads) => {
       const existing = await dsReads.snapshots(reads, o.name)
+      if (existing === null)
+        return conflict(`Could not read the snapshots of '${o.name}' — refusing a snapshot whose name cannot be checked`, 'snapshots-unreadable')
       return existing.some(s => s.name === snapName) ? conflict(`Snapshot '${snapName}' already exists`) : null
     }
   }
@@ -1233,12 +1346,33 @@ export async function datasetRoutes(
     }
   }
 
-  /** A dataset's snapshots, newest-first (empty when it has none). */
+  /** A dataset's snapshots, newest-first; null when the read FAILED (cr3: never "none"). */
+  async function readSnapshotsDetail(fullName: string): Promise<Snapshot[] | null> {
+    const r = await executor.exec(ZFS, zfsSnapshotDetailArgs(fullName))
+    // ZFS's "dataset does not exist" is an answer: a dataset that is not
+    // there has no snapshots (its verbs then answer not-found).
+    if (r.exitCode !== 0)
+      return DATASET_ABSENT_RE.test(r.stderr) ? [] : null
+    return r.stdout.trim() ? parseSnapshotList(r.stdout) : []
+  }
+
+  /**
+   * A dataset's snapshots, newest-first (createtxg order); `[]` only when the
+   * read SUCCEEDED and found none. A read that FAILED throws
+   * {@link SnapshotListUnreadableError} (cr3, handed from the replication
+   * review: it used to answer `[]`, so a plan said "has no snapshots — create
+   * a snapshot first" and a target read as diverged). The signature is
+   * unchanged so `ReplicationDeps.listSnapshotsDetail` keeps compiling; the
+   * routes here use the nullable {@link readSnapshotsDetail} instead.
+   */
   async function listSnapshotsDetail(fullName: string): Promise<Snapshot[]> {
     const r = await executor.exec(ZFS, zfsSnapshotDetailArgs(fullName))
-    if (r.exitCode !== 0 || !r.stdout.trim())
-      return []
-    return parseSnapshotList(r.stdout)
+    if (r.exitCode !== 0) {
+      if (DATASET_ABSENT_RE.test(r.stderr))
+        return []
+      throw new SnapshotListUnreadableError(fullName, r.exitCode, r.stderr)
+    }
+    return r.stdout.trim() ? parseSnapshotList(r.stdout) : []
   }
 
   /**
@@ -1348,7 +1482,16 @@ export async function datasetRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
-    const { datasets, defaults } = await listDatasetsAndDefaults(poolName)
+    let listed: { datasets: Dataset[], defaults: DatasetListDefaults }
+    try {
+      listed = await listDatasetsAndDefaults(poolName)
+    }
+    catch (err) {
+      if (err instanceof DatasetListUnreadableError)
+        return datasetListUnreadable(reply, err)
+      throw err
+    }
+    const { datasets, defaults } = listed
 
     // Enrich the flat feed so the UI can light up share badges + a snapshot
     // count on collapsed rows (Epic 4.4 / 15.4). Both sources are gathered ONCE
@@ -1910,7 +2053,23 @@ export async function datasetRoutes(
     const datasets = pre.object.listing?.datasets ?? []
 
     const children = datasets.filter(d => d.name.startsWith(`${fullName}/`))
+    // cr3 INVENTED-STATE-M9: every precondition read before the confirm — a
+    // snapshot count that could not be read refuses the destroy rather than
+    // leave "N snapshot(s) will also be destroyed" out of what is confirmed.
+    // The dataset's own snapshots (the non-recursive guidance) and, recursive,
+    // every snapshot the sweep erases.
     const snapshots = await snapshotNames(fullName)
+    const swept = recursive ? await snapshotNames(fullName, true) : []
+    if (snapshots === null || swept === null) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          message: `Could not read the snapshots of '${fullName}' — refusing a destroy whose confirm cannot say what it erases`,
+          reason: 'snapshot-count-unreadable',
+        },
+      }
+    }
     // Shares serving this dataset's mountpoint will break when it's destroyed
     // (Epic 4.4) — warn, but do not block (like the children/snapshots warnings).
     const shares = targetDataset.type === 'filesystem' && targetDataset.mountpoint
@@ -1924,6 +2083,10 @@ export async function datasetRoutes(
       warnings.push(`${children.length} child dataset(s) will also be destroyed.`)
     if (snapshots.length > 0)
       warnings.push(`${snapshots.length} snapshot(s) of '${fullName}' will also be destroyed.`)
+    // cr3 M9: a recursive destroy erases its descendants' snapshots too.
+    const childSnapshots = swept.filter(name => !name.startsWith(`${fullName}@`)).length
+    if (childSnapshots > 0)
+      warnings.push(`${childSnapshots} snapshot(s) of its child datasets will also be destroyed.`)
     // What is bound is what was shown (WAVE3-DESIGN §5.2 rule 2): a recursive
     // destroy names every child dataset its code is bound to.
     if (recursive && children.length > 0)
@@ -2015,22 +2178,53 @@ export async function datasetRoutes(
     const fullName = resolveDatasetName(poolName, datasetPath, reply)
     if (!fullName)
       return reply
-    if (!(await datasetExists(poolName, fullName))) {
+    const exists = await datasetExistsOr503(poolName, fullName, reply)
+    if (exists === null)
+      return reply
+    if (!exists) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
     }
-    return { data: await listSnapshotsDetail(fullName) }
+    // cr3: a snapshot read that failed is not "no snapshots".
+    const snapshots = await readSnapshotsDetail(fullName)
+    if (snapshots === null) {
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `The snapshots of '${fullName}' could not be read` } }
+    }
+    return { data: snapshots }
+  }
+
+  /** {@link datasetExists}, answering 503 itself (and returning null) when the list could not be read. */
+  async function datasetExistsOr503(poolName: string, fullName: string, reply: FastifyReply): Promise<boolean | null> {
+    try {
+      return await datasetExists(poolName, fullName)
+    }
+    catch (err) {
+      if (err instanceof DatasetListUnreadableError) {
+        reply.send(datasetListUnreadable(reply, err))
+        return null
+      }
+      throw err
+    }
   }
 
   async function snapshotDetail(poolName: string, datasetPath: string, snap: string, reply: FastifyReply) {
     const fullName = resolveDatasetName(poolName, datasetPath, reply)
     if (!fullName)
       return reply
-    if (!(await datasetExists(poolName, fullName))) {
+    const exists = await datasetExistsOr503(poolName, fullName, reply)
+    if (exists === null)
+      return reply
+    if (!exists) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
     }
-    const snapshot = (await listSnapshotsDetail(fullName)).find(s => s.snapshotName === snap)
+    const snapshots = await readSnapshotsDetail(fullName)
+    if (snapshots === null) {
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `The snapshots of '${fullName}' could not be read` } }
+    }
+    const snapshot = snapshots.find(s => s.snapshotName === snap)
     if (!snapshot) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Snapshot '${fullName}@${snap}' not found` } }
@@ -2204,10 +2398,10 @@ export async function datasetRoutes(
       return sendRefusal(reply, pre.refusal)
 
     // Snapshots newer than the target block a plain rollback; ZFS needs `-r`
-    // (force) to destroy them. The listing is newest-first, so "newer" are the
-    // ones ahead of the target in the list.
-    const snapshots = pre.object.snapshots
-    const laterSnapshots = snapshots.slice(0, snapshots.findIndex(s => s.name === snapName)).map(s => s.snapshotName)
+    // (force) to destroy them. "Newer" is ZFS's own order, createtxg (cr3
+    // H1), read here rather than taken from the time-sorted listing.
+    const swept = force ? [] : await rollbackSwept(pre.object, new GuardReads())
+    const laterSnapshots = (swept ?? []).map(n => n.slice(n.indexOf('@') + 1))
 
     const warnings = [
       `Rolling back discards all changes to '${fullName}' since snapshot '${snap}'.`,
@@ -2223,6 +2417,9 @@ export async function datasetRoutes(
         : `Force destroys nothing here: no snapshot or bookmark is newer than '${snap}'.`)
       if (count > 0)
         warnings.push(`Destroyed by force: ${destroys}.`)
+    }
+    else if (swept === null) {
+      warnings.push(`Could not read which snapshots are newer than '${snap}'; if any exist, rollback requires force to destroy them, and doing so is irreversible.`)
     }
     else if (laterSnapshots.length > 0) {
       warnings.push(`${laterSnapshots.length} more recent snapshot(s) exist (${laterSnapshots.join(', ')}); rollback requires force to destroy them, and doing so is irreversible.`)

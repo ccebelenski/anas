@@ -1,6 +1,7 @@
 import type { AhrPool, LastScrub, PeriodicScrubState, ScrubRunning } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
+import type { LockClaim } from '../jobs/locks.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { Gate, GuardSpec } from '../safety/guard.js'
 import { AhrScrubToggleRequest, PoolName, ScrubToggleRequest } from '@anas/shared'
@@ -25,6 +26,17 @@ import { requireIdentity } from './identity.js'
 
 const ZPOOL = '/usr/sbin/zpool'
 const CAT = '/usr/bin/cat'
+
+/**
+ * The node-level `anas-scrub` units' lock key (cr3 POOLS-DISKS-M5): every
+ * AHR periodic-scrub toggle read-modify-writes the ONE pool list in
+ * `anas-scrub.service`, whichever pool it names, and each toggle job used to
+ * hold only its own pool's keys SHARED — two toggles for different pools ran
+ * together and the last writer's list won (a lost update). Every write of the
+ * units claims this key EXCLUSIVE, so they serialise; the job reads the list
+ * only once it holds the key.
+ */
+const SCRUB_UNITS_CLAIM: LockClaim = { key: 'unit:anas-scrub', mode: 'exclusive', what: 'the node\'s anas-scrub timer' }
 
 /**
  * The ZFS pool list could not be READ: `zpool list -j` exited non-zero, so
@@ -134,16 +146,19 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
    * Each ZFS pool's scan-derived scrub facts — the last COMPLETED verify pass
    * and the one running now — from the one `zpool status` ZFS already reports
    * them in (no new source, one read for every pool, both halves of the same
-   * record). Fail-open to an empty map: an unreadable status means "no record",
-   * which is exactly how an idle, never-scrubbed pool reads.
+   * record). Null when the read FAILED (cr3 POOLS-DISKS-M3): it used to be an
+   * empty map, and every row then read "never scrubbed" and a running scrub
+   * idle; the rows now say both facts are unknown.
    */
-  async function zfsScrubScans(): Promise<Map<string, { lastScrub: LastScrub | null, running: ScrubRunning | null }>> {
+  async function zfsScrubScans(): Promise<Map<string, { lastScrub: LastScrub | null, running: ScrubRunning | null }> | null> {
     try {
       const r = await executor.exec(ZPOOL, ['status', '-jv'])
-      return r.exitCode === 0 && r.stdout.trim() ? parseScrubScans(r.stdout) : new Map()
+      if (r.exitCode !== 0 || !r.stdout.trim())
+        return null
+      return parseScrubScans(r.stdout)
     }
     catch {
-      return new Map()
+      return null
     }
   }
 
@@ -210,7 +225,8 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
         unbound: () => `Could not read the identity of AHR pool '${pool}' — refusing a periodic-scrub toggle that cannot be bound to it`,
       },
       gates: [],
-      locks: async (p, bound) => ahrPoolClaims(pool, bound.id.vgUuid ?? p.vg.uuid ?? null, 'shared'),
+      // cr3 POOLS-DISKS-M5: plus the node's anas-scrub units, exclusive.
+      locks: async (p, bound) => [...ahrPoolClaims(pool, bound.id.vgUuid ?? p.vg.uuid ?? null, 'shared'), SCRUB_UNITS_CLAIM],
     }
   }
 
@@ -249,8 +265,9 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
       ...await Promise.all(zfsPools.map(p => readZfsScrubState(
         executor,
         p,
-        scans.get(p)?.lastScrub ?? null,
-        scans.get(p)?.running ?? null,
+        scans?.get(p)?.lastScrub ?? null,
+        scans?.get(p)?.running ?? null,
+        scans === null,
       ))),
       // The AHR running check comes out of the topology read this route already
       // makes to enumerate the pools — no extra mdstat read for it. Only when
@@ -258,7 +275,9 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
       // (phase 2, or a scrub started outside ANAS) is running (scrub.r2,
       // GitHub #82 — phase 2 used to read idle); md keeps precedence, and one
       // `btrfs scrub status` per mounted AHR pool per `GET /scrub` is the
-      // accepted cost. The reads stay parallel across pools.
+      // accepted cost. The reads stay parallel across pools. A btrfs read
+      // that failed is 'unknown' (cr3), never "not running"; an UNMOUNTED
+      // pool runs no btrfs scrub, so null there is a fact.
       ...await Promise.all(ahr.map(async (p) => {
         const md = ahrScrubRunning(p)
         const running = md

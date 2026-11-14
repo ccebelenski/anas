@@ -247,7 +247,9 @@ describe('cr.47e — a recursive dataset destroy is refused over a held snapshot
     assert.deepEqual(destruction().map(c => c.args), [['destroy', '-r', '--', 'testpool/media']], 'the same destroy argv as before the gate')
     // The gate is in the spec list, so it re-ran at every door: the route on the
     // challenge, the route again on the resend, and the job before `zfs destroy`.
-    assert.equal(sweepCalls().length, 3, 'the sweep list at the route (twice) and in the job')
+    // cr3 INVENTED-STATE-M9: the route also counts the sweep for the
+    // confirm's "snapshot(s) of its child datasets" line (once per request).
+    assert.equal(sweepCalls().length, 5, 'the sweep list at the route (gate + count, twice) and in the job (gate)')
     assert.equal(holdsCalls().length, 3, 'the holds at the route (twice) and in the job')
   })
 })

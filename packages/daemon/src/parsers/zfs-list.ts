@@ -233,9 +233,16 @@ export function parseSnapshotNames(json: string | ZfsListOutput): string[] {
 /**
  * Parse `zfs list -j -t snapshot` output into the Snapshot read model, sorted
  * newest-first. `created` comes from the human `creation` string (→ ISO);
- * `used`/`referenced` from the human sizes. Ordering is by creation time
- * descending, with the monotonic `createtxg` breaking ties (and standing in
- * when a creation string fails to parse).
+ * `used`/`referenced` from the human sizes.
+ *
+ * Ordering is ZFS's own: `createtxg` descending (cr3 DATASETS-SCHEDULES-H1).
+ * Every reader of this order asks "newer than" the way ZFS does — `zfs
+ * rollback -r` destroys the snapshots with a greater createtxg, `zfs send -i`
+ * needs a base with a smaller one — and the `creation` TIME can disagree: a
+ * received snapshot keeps its sender's creation time, and a stepped clock
+ * reorders the times. Only when a row carries no createtxg (never in `zfs
+ * list -j` output) does the whole list fall back to creation time, createtxg
+ * breaking ties.
  */
 export function parseSnapshotList(json: string | ZfsListOutput): Snapshot[] {
   const data: ZfsListOutput = parseZfsJson(json, { datasets: {} })
@@ -263,11 +270,16 @@ export function parseSnapshotList(json: string | ZfsListOutput): Snapshot[] {
     })
   }
 
-  result.sort((a, b) => {
-    if (a.created !== b.created)
-      return a.created < b.created ? 1 : -1
-    return b._createtxg - a._createtxg
-  })
+  if (result.every(r => r._createtxg > 0)) {
+    result.sort((a, b) => b._createtxg - a._createtxg)
+  }
+  else {
+    result.sort((a, b) => {
+      if (a.created !== b.created)
+        return a.created < b.created ? 1 : -1
+      return b._createtxg - a._createtxg
+    })
+  }
 
   return result.map(({ _createtxg, ...snap }) => snap)
 }

@@ -670,6 +670,17 @@ export const PeriodicScrubState = z.object({
    * only cell it renders today (the additive-field version-skew rule).
    */
   running: ScrubRunning.optional(),
+  /**
+   * The facts of this row whose READ FAILED this time (cr3: a read that
+   * failed never reads as absent, idle or "never scrubbed"): `enabled` (the
+   * ZFS property, the AHR unit or timer state could not be read — `enabled`
+   * then carries no meaning), `lastScrub` (the `zpool status` read failed —
+   * `lastScrub: null` is not "never scrubbed") and `running` (the status
+   * read failed — an absent `running` is not "idle"). Absent or empty: every
+   * fact was read. Optional + additive: an older daemon omits it, an older
+   * panel ignores it.
+   */
+  unknown: z.array(z.enum(['enabled', 'lastScrub', 'running'])).optional(),
 })
 export type PeriodicScrubState = z.infer<typeof PeriodicScrubState>
 

@@ -445,8 +445,10 @@ describe('periodic scrub routes — AHR node-level anas-scrub timer (selfheal.4)
     // route holds §4.2's fallback — the name key, exclusive — exactly as the
     // other AHR verbs do over this world; the uuid pair is pinned on the
     // builder in ahr-guard-verbs.test.ts (cr.38).
+    // cr3 POOLS-DISKS-M5: plus the node's anas-scrub units, exclusive.
     assert.deepEqual(queue.heldLocks(), [
       { key: 'ahrname:ahr0', mode: 'exclusive', holders: [id] },
+      { key: 'unit:anas-scrub', mode: 'exclusive', holders: [id] },
     ])
     mock.finishLive()
     const done = await waitForJob(server, id)

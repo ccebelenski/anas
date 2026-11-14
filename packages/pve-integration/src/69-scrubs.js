@@ -135,6 +135,14 @@
     // shared schemas; it must stay identical to the constant in
     // packages/shared/src/schemas/selfheal.ts.
     var CSUM_UNREADABLE = 'csum-unreadable';
+    // A run that stopped before examining or writing a block (a gate refused,
+    // a foreign md operation, a read failed). Such a block is NOT EXAMINED:
+    // nothing is known about it, so it never carries restore advice.
+    var RUN_STOPPED = 'run-stopped';
+    // The not-examined reason codes said in words; others read as their code.
+    var NOT_EXAMINED_WORDS = {
+        'run-stopped': 'the run stopped before reaching them'
+    };
 
     // Shared schedules helpers (fs-tag chip, pills, poll loop) — ONE copy in
     // 69-schedules-common.js, used by both this view and the Snapshots view.
@@ -150,6 +158,15 @@
 
     function pillHtml(label, color, title) {
         return sched.pillHtml(label, color, title);
+    }
+
+    // A cell tooltip as a `data-qtip` attribute (cr3 DATASETS-SCHEDULES-L5):
+    // QuickTip reads the DECODED attribute and renders it as HTML, so a value
+    // is encoded twice — once for the tip, once for the attribute (PVE's own
+    // idiom). Once was not enough: a file path or a repair detail carrying
+    // markup rendered as markup in the tip.
+    function qtipAttr(text) {
+        return 'data-qtip="' + enc(enc(text)) + '"';
     }
 
     function softPill(label, color, title) {
@@ -194,8 +211,9 @@
     // out belongs ON the button, never in a silent absence (the 30-pools idiom).
     function btnSetTip(btn, msg) {
         try {
+            // cr3: the tip is HTML (QuickTip), so the text is encoded for it.
             if (btn && typeof btn.setTooltip === 'function') {
-                btn.setTooltip(msg || '');
+                btn.setTooltip(msg ? enc(msg) : '');
             }
         } catch (e) {
             // non-fatal
@@ -257,6 +275,10 @@
             // The pass running RIGHT NOW, or null when the pool is idle (and
             // always null against a daemon too old to report it).
             running: state.running || null,
+            // cr3: the facts whose READ failed this poll ('enabled',
+            // 'lastScrub', 'running') — each renders as unknown, never as off,
+            // never scrubbed or idle. Absent from an older daemon.
+            unknown: (state.unknown && state.unknown.slice) ? state.unknown.slice() : [],
             // The findings of this pool's NEWEST COMPLETED AHR scrub job, when
             // that job found something (selfheal.3). Null for ZFS, and null for
             // an AHR pool whose newest scrub was CLEAN — a clean pass displaces
@@ -452,7 +474,17 @@
             + '<span style="font-family:monospace;font-size:0.92em;">' + enc(rec.get('pool')) + '</span>';
     }
 
+    // Did this poll fail to read `fact` for the row? (cr3)
+    function isUnknown(rec, fact) {
+        var u = rec ? rec.get('unknown') : null;
+        return !!(u && u.indexOf && u.indexOf(fact) >= 0);
+    }
+
     function renderScrubEnabled(v, meta, rec) {
+        if (isUnknown(rec, 'enabled')) {
+            return softPill(t('Unknown'), 'var(--anas-warn,#b06a12)',
+                t('the periodic-scrub setting could not be read; see the note'));
+        }
         if (rec.get('enabled')) {
             return pillHtml(t('On'), 'var(--anas-ok,#1f9c56)', t('periodic scrub is enabled'));
         }
@@ -604,6 +636,15 @@
         var running = rec.get('running');
         if (running) {
             return renderRunning(running, rec.get('kind'));
+        }
+        // cr3: a status read that failed is said, never rendered as "never
+        // scrubbed" or as an idle pool.
+        if (isUnknown(rec, 'lastScrub') || isUnknown(rec, 'running')) {
+            var unknownTip = isUnknown(rec, 'lastScrub')
+                ? t('zpool status could not be read: whether a scrub ran or is running now is unknown')
+                : t('btrfs scrub status could not be read: whether a scrub is running now is unknown');
+            return '<span title="' + enc(unknownTip) + '" style="color:var(--anas-warn,#b06a12);">'
+                + enc(t('unknown (status could not be read)')) + '</span>';
         }
 
         // A scrub that FAILED (scrub.r2, GitHub #82) is the one thing this cell
@@ -877,9 +918,15 @@
         var isAhr = !!rec && kind === 'ahr';
 
         var btn = scrubGrid.down('#scrubToggle');
+        var enabledUnknown = !!rec && isUnknown(rec, 'enabled');
         if (btn) {
-            btn.setDisabled(!rec);
-            if (rec) {
+            btn.setDisabled(!rec || enabledUnknown);
+            if (enabledUnknown) {
+                // cr3: which way the toggle would flip is unknown.
+                btn.setText(t('Enable scrub'));
+                btn.setIconCls('fa fa-play');
+                btnSetTip(btn, t('the periodic-scrub setting could not be read, so the toggle is off until it can'));
+            } else if (rec) {
                 var on = rec.get('enabled');
                 btn.setText(on ? t('Disable scrub') : t('Enable scrub'));
                 btn.setIconCls(on ? 'fa fa-pause' : 'fa fa-play');
@@ -933,6 +980,8 @@
             var reason = '';
             if (!rec) {
                 reason = '';
+            } else if (!running && isUnknown(rec, 'running')) {
+                reason = t('whether a scrub is running could not be read');
             } else if (!running) {
                 reason = t('nothing is running on this pool');
             } else if (kind === 'ahr') {
@@ -979,7 +1028,8 @@
             var store = scrubGrid.getStore();
             var others = 0;
             store.each(function (r) {
-                if (r !== rec && r.get('kind') === 'ahr' && r.get('enabled')) {
+                // cr3: a row whose state could not be read may be enabled.
+                if (r !== rec && r.get('kind') === 'ahr' && (r.get('enabled') || isUnknown(r, 'enabled'))) {
                     others += 1;
                 }
             });
@@ -990,7 +1040,8 @@
     }
 
     function toggleScrub(node, scrubGrid, rec) {
-        if (!rec) {
+        // cr3: never flip a setting whose current value could not be read.
+        if (!rec || isUnknown(rec, 'enabled')) {
             return;
         }
         var kind = rec.get('kind');
@@ -1082,7 +1133,7 @@
     function renderFindingPath(v, meta, rec) {
         var title = t('inode') + ' ' + rec.get('inode')
             + (rec.get('subvolume') ? (' · ' + t('subvolume') + ' ' + rec.get('subvolume')) : '');
-        meta.tdAttr = 'data-qtip="' + enc(title) + '"';
+        meta.tdAttr = qtipAttr(title);
         return '<span style="font-family:monospace;font-size:0.92em;">' + enc(rec.get('path')) + '</span>';
     }
 
@@ -1133,7 +1184,7 @@
             var n = Number(rec.get('extentCount')) || 0;
             var tip = t('one corrupt sector of a compressed extent takes out the whole extent. Its failing 4 KiB file blocks')
                 + ': ' + (rec.get('blockList') || '');
-            meta.tdAttr = 'data-qtip="' + enc(tip) + '"';
+            meta.tdAttr = qtipAttr(tip);
             return '<span style="color:var(--anas-warn,#b06a12);">'
                 + enc(t('compressed extent: ') + n + t(' blocks')) + '</span>'
                 + unverifiedSuffix(rec);
@@ -1143,7 +1194,7 @@
         var tip = n
             ? (t('failing 4 KiB file blocks') + ': ' + list)
             : t('no block failed on re-read: either the file changed since the scrub, or the read was served from cache');
-        meta.tdAttr = 'data-qtip="' + enc(tip) + '"';
+        meta.tdAttr = qtipAttr(tip);
         return (n
             ? '<span style="color:var(--anas-warn,#b06a12);">' + n + '</span>'
             : muted('0'))
@@ -1254,13 +1305,13 @@
         var blocked = repairBlockedReason(rec);
         if (!v) {
             if (blocked) {
-                meta.tdAttr = 'data-qtip="' + enc(blocked) + '"';
+                meta.tdAttr = qtipAttr(blocked);
                 return muted(enc(t('cannot be repaired')));
             }
             return muted('—');
         }
         var color = v.level === 'ok' ? 'var(--anas-ok,#1f9c56)' : 'var(--anas-warn,#b06a12)';
-        meta.tdAttr = 'data-qtip="' + enc(v.detail || v.text) + '"';
+        meta.tdAttr = qtipAttr(v.detail || v.text);
         return '<span style="color:' + color + ';">' + enc(v.text) + '</span>';
     }
 
@@ -1357,11 +1408,17 @@
             // per-file rule the daemon's notification uses (ahr-repair.ts).
             var csumFiles = [];
             var restoreFiles = 0;
+            var sawRunStopped = false;
             for (var f = 0; f < files.length; f++) {
                 var bad = [];
                 var fb = files[f].blocks || [];
                 for (var b = 0; b < fb.length; b++) {
-                    if (fb[b].outcome === 'unrepairable') {
+                    // Restore advice rides only a block that was EXAMINED and
+                    // proven lost: a `run-stopped` code means it never was,
+                    // whatever bucket it arrived in.
+                    if (fb[b].outcome === 'unrepairable' && fb[b].reasonCode === RUN_STOPPED) {
+                        sawRunStopped = true;
+                    } else if (fb[b].outcome === 'unrepairable') {
                         bad.push(fb[b]);
                     }
                 }
@@ -1381,7 +1438,9 @@
                     restoreFiles += 1;
                 }
             }
-            if (restoreFiles > 0 || !csumFiles.length) {
+            // A result without per-block detail keeps the count's advice, as
+            // before — unless a run-stopped block shows the count is not proof.
+            if (restoreFiles > 0 || (!csumFiles.length && !sawRunStopped)) {
                 lines.push(enc(t('Unrepairable: nothing below the checksum tree can be proven right for '
                     + 'those blocks. Restore this file from backup.')));
             }
@@ -1413,7 +1472,7 @@
             var why = [];
             for (var code in whys) {
                 if (Object.prototype.hasOwnProperty.call(whys, code)) {
-                    why.push(code);
+                    why.push(NOT_EXAMINED_WORDS[code] ? t(NOT_EXAMINED_WORDS[code]) : code);
                 }
             }
             lines.push(enc(Number(res.notExamined || 0) + ' ' + t('block(s) could not be EXAMINED')
@@ -1753,6 +1812,11 @@
         if (skipped.length) {
             lines.push(enc(t('Not decided') + ': ' + skipped.join(' · ')));
         }
+        // Rows for which no verdict about the data could be reached (additive
+        // field; an older daemon omits it). They were never written.
+        if (Number(res.undecidedRows || 0) > 0) {
+            lines.push(enc(Number(res.undecidedRows) + ' ' + t('row(s) not decided: no verdict about their data, nothing written')));
+        }
         if (res.outcome === 'reconciled') {
             lines.push(enc(t('The legs agree again, and the verifying check counted 0.')));
         } else if (res.outcome === 'residual') {
@@ -1876,7 +1940,7 @@
 
         var win = Ext.create('Ext.window.Window', {
             cls: 'anas-win-scrub-parity',
-            title: t('Parity mismatch') + ': ' + pool,
+            title: t('Parity mismatch') + ': ' + enc(pool),
             modal: true,
             width: 660,
             height: 340,
@@ -2031,7 +2095,7 @@
 
         var win = Ext.create('Ext.window.Window', {
             cls: 'anas-win-scrub-findings',
-            title: t('Scrub findings') + ': ' + pool,
+            title: t('Scrub findings') + ': ' + enc(pool),
             modal: true,
             width: 720,
             height: 420,
@@ -2190,6 +2254,7 @@
                 { name: 'phases', type: 'auto' },
                 { name: 'lastScrub', type: 'auto' },
                 { name: 'running', type: 'auto' },
+                { name: 'unknown', type: 'auto' },
                 { name: 'findings', type: 'auto' },
                 { name: 'parity', type: 'auto' },
                 { name: 'skipped', type: 'auto' },
@@ -2353,6 +2418,16 @@
     // — the mask/sequence rule is only provable from the call site.
     ANAS.scrubs = ANAS.scrubs || {};
     ANAS.scrubs.reload = loadScrub;
+    // cr3: the row shape, the cells and the toolbar rule, for
+    // cr3-datasets.harness.mjs (unknown state, double-encoded tips).
+    ANAS.scrubs.scrubRow = scrubRow;
+    ANAS.scrubs.renderEnabled = renderScrubEnabled;
+    ANAS.scrubs.renderLastScrub = renderLastScrub;
+    ANAS.scrubs.renderFindingPath = renderFindingPath;
+    ANAS.scrubs.renderRepairOutcome = renderRepairOutcome;
+    ANAS.scrubs.updateButtons = updateScrubButtons;
+    ANAS.scrubs.showRepairResult = showRepairResult;
+    ANAS.scrubs.showMirrorResult = showMirrorResult;
 
     ANAS.views['scrubs'] = {
         itemId: 'anas-scrubs',

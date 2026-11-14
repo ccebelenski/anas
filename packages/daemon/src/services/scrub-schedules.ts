@@ -1,6 +1,8 @@
-import type { AhrPool, LastScrub, PeriodicScrubState, ScrubCadence, ScrubRunning } from '@anas/shared'
+import type { AhrPool, AhrScrubSchedule, LastScrub, PeriodicScrubState, ScrubCadence, ScrubRunning } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
-import { ForeignUnitError, readScrubSchedule, readScrubTimerNext, removeScrubUnits, SCRUB_TIMER_NAME, scrubUnitsAreForeign, writeScrubUnits } from './scrub-schedule-units.js'
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { ForeignUnitError, parseScrubServiceUnit, readScrubTimerNext, removeScrubUnits, SCRUB_SERVICE_NAME, SCRUB_TIMER_NAME, scrubUnitsAreForeign, writeScrubUnits } from './scrub-schedule-units.js'
 // The ONE systemd unit dir constant (env-overridable for tests) — reused, not
 // duplicated: the snapshot store owns it.
 import { DEFAULT_SYSTEMD_DIR } from './snapshot-schedule-units.js'
@@ -47,8 +49,43 @@ export const SYSTEMCTL = '/usr/bin/systemctl'
 const SCRUB_PROPERTY = 'org.debian:periodic-scrub'
 /** The mdadm timers ANAS takes over (`start` fires the check, `continue` resumes it). */
 const MDCHECK_TIMERS = ['mdcheck_start.timer', 'mdcheck_continue.timer']
+/** `systemctl is-enabled` on a unit with no unit file (stderr). */
+const UNIT_FILE_ABSENT_RE = /No such file or directory|not found/i
 /** The one we READ mdcheck state from (`Also=` keeps them in lockstep). */
 export const MDCHECK_PRIMARY = 'mdcheck_start.timer'
+
+// --- The node's scrub schedule, read with its verdict (cr3 L6) ----------------
+
+/**
+ * The node's scrub schedule with the read's own verdict (cr3
+ * DATASETS-SCHEDULES-L6): `absent` only when the service file does not exist
+ * (ENOENT); `unreadable` when it exists but could not be read, or carries no
+ * schedule that parses — never "no pools", because a toggle that read it as
+ * `[]` rewrote the unit with its one pool and dropped every other pool's
+ * periodic scrub.
+ */
+type ScrubScheduleRead
+  = | { state: 'absent' }
+    | { state: 'ok', schedule: AhrScrubSchedule }
+    | { state: 'unreadable', reason: string }
+
+// Module-private (not in scrub-schedule-units.ts): an export there is an
+// "action" the self-heal decision tree's checker counts.
+async function readScrubScheduleChecked(dir: string): Promise<ScrubScheduleRead> {
+  let content: string
+  try {
+    content = await readFile(join(dir, SCRUB_SERVICE_NAME), 'utf-8')
+  }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return { state: 'absent' }
+    return { state: 'unreadable', reason: `${SCRUB_SERVICE_NAME} could not be read (${(err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err))})` }
+  }
+  const schedule = parseScrubServiceUnit(content)
+  return schedule
+    ? { state: 'ok', schedule }
+    : { state: 'unreadable', reason: `${SCRUB_SERVICE_NAME} carries no schedule that parses` }
+}
 
 // --- ZFS: org.debian:periodic-scrub property --------------------------------
 
@@ -74,36 +111,46 @@ export function zfsScrubSetArgs(pool: string, enabled: boolean): string[] {
 }
 
 /**
- * Read a ZFS pool's periodic-scrub state (fail-open to enabled = the distro
- * default, so an unreadable property never falsely claims scrubbing is off).
+ * Read a ZFS pool's periodic-scrub state. A property read that failed is
+ * `unknown: ['enabled']` (cr3 DATASETS-SCHEDULES-L7: it used to read as
+ * enabled, the distro default — a state no read supplied); `enabled` then
+ * carries the distro default only so an older panel still parses the row.
  *
  * `lastScrub` is the pool's last COMPLETED pass and `running` the pass in
  * flight, both read by the caller from the `zpool status` it already runs (see
  * `parseScrubScans`) and passed in so one status read serves every pool. Null =
- * no completed pass on record / nothing running.
+ * no completed pass on record / nothing running. `scanUnreadable` (cr3
+ * POOLS-DISKS-M3): that status read FAILED, so both are unknown — never
+ * "never scrubbed", never idle.
  */
 export async function readZfsScrubState(
   executor: CommandExecutor,
   pool: string,
   lastScrub: LastScrub | null = null,
   running: ScrubRunning | null = null,
+  scanUnreadable = false,
 ): Promise<PeriodicScrubState> {
-  let enabled = true
+  let enabled: boolean | null = null
   try {
     const r = await executor.exec(ZFS, zfsScrubGetArgs(pool))
-    if (r.exitCode === 0)
+    if (r.exitCode === 0 && r.stdout.trim() !== '')
       enabled = parseZfsScrubEnabled(r.stdout)
   }
   catch {
-    // fail-open to the distro default (on)
+    enabled = null
   }
+  const unknown: NonNullable<PeriodicScrubState['unknown']> = [
+    ...(enabled === null ? ['enabled' as const] : []),
+    ...(scanUnreadable ? ['lastScrub' as const, 'running' as const] : []),
+  ]
   return {
     target: { kind: 'zfs', pool },
-    enabled,
+    enabled: enabled ?? true,
     cadence: 'monthly',
     mechanism: 'zfs-property',
-    lastScrub,
-    ...(running && { running }),
+    lastScrub: scanUnreadable ? null : lastScrub,
+    ...(running && !scanUnreadable && { running }),
+    ...(unknown.length > 0 && { unknown }),
   }
 }
 
@@ -159,24 +206,24 @@ export function mdcheckToggleArgs(enabled: boolean): string[] {
   return [enabled ? 'enable' : 'disable', '--now', ...MDCHECK_TIMERS]
 }
 
-async function isMdcheckEnabled(executor: CommandExecutor): Promise<boolean> {
+/**
+ * `systemctl is-enabled <unit>` as on/off, or null when it could not be read
+ * (cr3: a throw, or no word printed — `is-enabled` exits non-zero for
+ * `disabled`/`static` but still prints the word; with nothing printed there
+ * is no answer, never "off").
+ */
+async function readIsEnabled(executor: CommandExecutor, unit: string): Promise<boolean | null> {
   try {
-    const r = await executor.exec(SYSTEMCTL, isEnabledArgs(MDCHECK_PRIMARY))
-    // is-enabled exits nonzero for `disabled`/`static` but still prints the word.
-    return parseMdcheckEnabled(r.stdout)
+    const r = await executor.exec(SYSTEMCTL, isEnabledArgs(unit))
+    if (r.stdout.trim() !== '')
+      return parseIsEnabled(r.stdout)
+    // A unit that does not exist is not enabled (older systemd says so on
+    // stderr only: "Failed to get unit file state for X: No such file or
+    // directory"; newer prints `not-found` on stdout, handled above).
+    return UNIT_FILE_ABSENT_RE.test(r.stderr) ? false : null
   }
   catch {
-    return false
-  }
-}
-
-async function isTimerEnabled(executor: CommandExecutor): Promise<boolean> {
-  try {
-    const r = await executor.exec(SYSTEMCTL, isEnabledArgs(SCRUB_TIMER_NAME))
-    return parseIsEnabled(r.stdout)
-  }
-  catch {
-    return false
+    return null
   }
 }
 
@@ -251,21 +298,36 @@ export function foreignMdArrays(
 export async function readAhrScrubState(
   executor: CommandExecutor,
   pool: string,
-  running: ScrubRunning | null = null,
+  running: ScrubRunning | null | 'unknown' = null,
   ctx?: AhrScrubContext,
 ): Promise<PeriodicScrubState> {
-  const schedule = ctx ? await readScrubSchedule(ctx.dir) : null
-  const [timerEnabled, mdcheckOn, nextRun] = await Promise.all([
-    isTimerEnabled(executor),
-    isMdcheckEnabled(executor),
+  const read = ctx ? await readScrubScheduleChecked(ctx.dir) : { state: 'absent' as const }
+  const schedule = read.state === 'ok' ? read.schedule : null
+  const [timerOn, mdcheckRead, nextRun] = await Promise.all([
+    readIsEnabled(executor, SCRUB_TIMER_NAME),
+    readIsEnabled(executor, MDCHECK_PRIMARY),
     readScrubTimerNext(executor),
   ])
-  const enabled = timerEnabled && (schedule?.pools.includes(pool) ?? false)
+  const timerEnabled = timerOn === true
+  const mdcheckOn = mdcheckRead === true
+  // cr3: the pool's state is unknown when the unit that lists it, or the
+  // timer's enablement, could not be read — never "off".
+  const enabledUnknown = read.state === 'unreadable' || (timerOn === null && read.state === 'ok')
+  const enabled = !enabledUnknown && timerEnabled && (schedule?.pools.includes(pool) ?? false)
   const foreign = ctx ? foreignMdArrays(ctx.mdKernelNames, ctx.ahrKernelNames) : []
   // The LEGACY state (review F1/F4): no ANAS units exist and mdadm's mdcheck is
   // what runs. Reported as the mechanism it IS — never as ANAS's timer sitting
   // disabled, and never adopted onto ANAS's timer at daemon start.
-  const legacy = mdcheckOn && !timerEnabled && schedule === null
+  const legacy = mdcheckOn && !timerEnabled && read.state === 'absent'
+  const notes = [
+    ahrScrubNote(mdcheckOn, foreign, timerEnabled),
+    ...(read.state === 'unreadable' ? [`the anas-scrub unit could not be read: ${read.reason}`] : []),
+    ...(mdcheckRead === null ? ['whether mdcheck is on could not be read'] : []),
+  ]
+  const unknown: NonNullable<PeriodicScrubState['unknown']> = [
+    ...(enabledUnknown ? ['enabled' as const] : []),
+    ...(running === 'unknown' ? ['running' as const] : []),
+  ]
   return {
     target: { kind: 'ahr', pool },
     enabled,
@@ -273,9 +335,10 @@ export async function readAhrScrubState(
     mechanism: legacy ? 'mdcheck-timer' : 'anas-scrub-timer',
     nextRun: enabled ? nextRun : null,
     phases: ['md-parity', 'btrfs-checksums'],
-    note: ahrScrubNote(mdcheckOn, foreign, timerEnabled),
+    note: notes.join('; '),
     lastScrub: null,
-    ...(running && { running }),
+    ...(running && running !== 'unknown' && { running }),
+    ...(unknown.length > 0 && { unknown }),
   }
 }
 
@@ -313,7 +376,16 @@ export async function setAhrScrubEnabled(
   // R10). The route surfaces this before the job even starts (409).
   if (await scrubUnitsAreForeign(dir))
     throw new ForeignUnitError(`an anas-scrub unit without an X-ANAS-Schedule marker exists in ${dir}. It is not an ANAS unit. Nothing was changed`)
-  const current = await readScrubSchedule(dir)
+  // cr3 DATASETS-SCHEDULES-L6: the pool list is read with its verdict. A unit
+  // that exists but cannot be read or parsed is NOT "no pools": rewriting it
+  // from `[]` would drop every other pool's periodic scrub. Refused, naming
+  // the file and the way out; nothing is changed.
+  const read = await readScrubScheduleChecked(dir)
+  if (read.state === 'unreadable') {
+    throw new Error(`the node's ${SCRUB_SERVICE_NAME} in ${dir} could not be read (${read.reason}), so the pools it scrubs are unknown — `
+      + `refusing to rewrite it, which would drop the others. Nothing was changed. Fix or remove ${SCRUB_SERVICE_NAME} and ${SCRUB_TIMER_NAME}, then turn periodic scrub on again for each pool`)
+  }
+  const current = read.state === 'ok' ? read.schedule : null
   const pools = current?.pools ?? []
   const cadence: ScrubCadence = opts?.cadence ?? current?.cadence ?? 'monthly'
 

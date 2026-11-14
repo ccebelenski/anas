@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
-import { btrfsScrubRunning } from '../btrfs-scrub-running.js'
+import { BTRFS_SCRUB_UNKNOWN, btrfsScrubRunning } from '../btrfs-scrub-running.js'
 
 // scrub.r2 (GitHub #82): phase 2 of the AHR scrub — a day or more on a real
 // pool — and a `btrfs scrub` started outside ANAS both read idle, because only
@@ -41,11 +41,12 @@ describe('btrfsScrubRunning — the checksum pass in flight (scrub.r2)', () => {
     assert.equal(await btrfsScrubRunning(statusExecutor({ stdout, exitCode: 0 }), MP), null)
   })
 
-  it('a status read that fails answers null, not a throw (fail-open)', async () => {
-    assert.equal(await btrfsScrubRunning(statusExecutor({ stdout: '', stderr: 'ERROR: not mounted', exitCode: 1 }), MP), null)
+  // cr3: a read that failed is 'unknown', never null ("not running").
+  it('a status read that fails answers unknown, not a throw and not "not running"', async () => {
+    assert.equal(await btrfsScrubRunning(statusExecutor({ stdout: '', stderr: 'ERROR: not mounted', exitCode: 1 }), MP), BTRFS_SCRUB_UNKNOWN)
     const throwing = new MockExecutor()
     throwing.addFixture({ command: BTRFS, args: ['scrub', 'status', MP], throws: new Error('ENOENT: no btrfs') })
-    assert.equal(await btrfsScrubRunning(throwing, MP), null)
+    assert.equal(await btrfsScrubRunning(throwing, MP), BTRFS_SCRUB_UNKNOWN)
   })
 
   // The fold of review POSSIBLE 2: with no deadline of its own this
@@ -63,10 +64,10 @@ describe('btrfsScrubRunning — the checksum pass in flight (scrub.r2)', () => {
     assert.equal(call.source, 'call')
   })
 
-  it('a hung status read answers null, like any other failed read', async () => {
+  it('a hung status read answers unknown, like any other failed read', async () => {
     const hung = new MockExecutor()
     hung.addFixture({ command: BTRFS, args: ['scrub', 'status', MP], timesOut: {} })
-    assert.equal(await btrfsScrubRunning(hung, MP), null)
+    assert.equal(await btrfsScrubRunning(hung, MP), BTRFS_SCRUB_UNKNOWN)
   })
 
   it('a running scrub whose status names no percentage still reports the phase', async () => {

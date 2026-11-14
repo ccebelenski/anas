@@ -5,9 +5,11 @@ import type { LockClaim } from '../jobs/locks.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { UnitTaskObject } from '../services/task-units.js'
+import { createHash } from 'node:crypto'
 import { PRUNED_NAMES_PER_DATASET, ScheduleId, snapshotFireShapeIssues, SnapshotSchedule } from '@anas/shared'
 import { parseZpoolList } from '../parsers/zpool-list.js'
-import { guardCheck, guarded, scheduleClaim, sendRefusal } from '../safety/guard.js'
+import { ConfirmStore } from '../safety/confirm.js'
+import { guardCheck, guardConfirm, guarded, scheduleClaim, sendRefusal } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { loadPveFootprint, ownershipRefusal, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { notifyScheduleRun } from '../services/snapshot-notify.js'
@@ -22,11 +24,11 @@ import {
   serviceUnitName,
   writeScheduleUnits,
 } from '../services/snapshot-schedule-units.js'
-import { pruneSnapshots, pruneZfsSchedule, takeSnapshot, zfsRunResult } from '../services/snapshot-schedules.js'
+import { parseZfsStampSources, pruneSnapshots, pruneZfsSchedule, takeSnapshot, zfsRunResult, zfsStampSourceArgs } from '../services/snapshot-schedules.js'
 import { ahrSourceClaims, datasetSourceClaims } from '../services/source-claims.js'
 import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision } from '../services/task-units.js'
 import { isRunActive, showUnitPropsStrict } from '../services/unit-run-status.js'
-import { sweepSet, zfsTreeListArgs } from '../services/zfs-snapshot.js'
+import { inSweep, isAtOrUnder, sweepSet, zfsTreeListArgs } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
 const ZFS = '/usr/sbin/zfs'
@@ -104,10 +106,61 @@ export interface ScheduleRouteOptions {
   systemdDir: string
   /** On-demand AHR top-level mount base (tests point at a temp dir). */
   subvolRuntimeDir?: string
+  /**
+   * The daemon's confirm store (cr3 H2: a create that adopts stamped
+   * snapshots is confirm-gated). Absent = a store of this route's own (the
+   * only route that mints or verifies `schedule.create` codes).
+   */
+  confirmStore?: ConfirmStore
+}
+
+/**
+ * The snapshots under a ZFS target that already carry a schedule id as a
+ * LOCAL `anas:schedule` stamp (cr3 DATASETS-SCHEDULES-H2) — the ones a new
+ * schedule of that id would own from its first prune. `names` sorted.
+ */
+interface AdoptedStamps {
+  names: string[]
+  /** dataset → how many of `names` sit on it. */
+  perDataset: Map<string, number>
+}
+
+/** The confirm-scope string of an adopted set: the counts plus a digest of the names (the set itself is bound, not only its size). */
+function adoptedScope(adopted: AdoptedStamps): string {
+  if (adopted.names.length === 0)
+    return 'none'
+  const digest = createHash('sha256').update(adopted.names.join('\n')).digest('hex').slice(0, 16)
+  return `${adopted.names.length} snapshot(s) on ${adopted.perDataset.size} dataset(s), set ${digest}`
 }
 
 export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRouteOptions) {
   const { executor, jobQueue, systemdDir, subvolRuntimeDir } = opts
+  const confirmStore = opts.confirmStore ?? new ConfirmStore()
+
+  /**
+   * cr3 H2: the snapshots anywhere under `dataset` stamped LOCALLY with
+   * `id`, read with the prune's own reader (`zfsStampSourceArgs` +
+   * `parseZfsStampSources`, the read that decides what a prune owns), always
+   * recursive: a schedule made recursive later reaches the whole tree. Null
+   * when the read failed — a create that cannot see what it would adopt is
+   * refused, never read as "nothing stamped".
+   */
+  async function readAdoptedStamps(dataset: string, id: string): Promise<AdoptedStamps | null> {
+    const r = await executor.exec(ZFS, zfsStampSourceArgs(dataset, true))
+    if (r.exitCode !== 0)
+      return null
+    const names: string[] = []
+    const perDataset = new Map<string, number>()
+    for (const [name, stamp] of parseZfsStampSources(r.stdout)) {
+      if (stamp.value !== id || stamp.source !== 'local')
+        continue
+      names.push(name)
+      const ds = name.slice(0, name.indexOf('@'))
+      perDataset.set(ds, (perDataset.get(ds) ?? 0) + 1)
+    }
+    names.sort()
+    return { names, perDataset }
+  }
 
   /** Does the named ZFS pool exist? (source of truth is `zpool list`). */
   async function zpoolExists(poolName: string): Promise<boolean> {
@@ -301,35 +354,198 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     }
   }
 
-  /** A create's object is the id SLOT (the mounts/shares create precedent): existence is a gate, not the read-null. */
-  function scheduleCreateSpec(id: string): GuardSpec<{ existing: SnapshotScheduleT | null }> {
+  /**
+   * A create's object is the id SLOT (the mounts/shares create precedent):
+   * existence is a gate, not the read-null.
+   *
+   * cr3 DATASETS-SCHEDULES-H2: the id is an operator-typed slug and the
+   * `anas:schedule=<id>` stamps a deleted schedule left on its snapshots
+   * outlive it ("the snapshots it already took are kept"); a NEW schedule of
+   * that id owns them from its first prune — retention cuts them to its
+   * policy, and on a dataset it excludes it destroys them all. So a ZFS
+   * create reads the stamps under its target (the prune's reader) as part of
+   * the object: an unreadable read refuses; a non-empty set is the confirm's
+   * SCOPE (the counts and a digest of the names), so the job, re-reading,
+   * refuses a set that changed after the confirm.
+   *
+   * Accepted residual (coordinator ruling): snapshots carrying the id that a
+   * `zfs rename` moves INTO the target's tree after the create are adopted
+   * without a confirm — the stamp travels with the snapshot, and nothing
+   * ANAS does is involved in the move.
+   */
+  function scheduleCreateSpec(id: string, target: SnapshotTarget): GuardSpec<{ existing: SnapshotScheduleT | null, adopted: AdoptedStamps | null }> {
     return {
       operation: 'schedule.create',
       object: {
         what: `Snapshot schedule '${id}'`,
-        read: async () => ({ existing: await readSchedule(systemdDir, id) }),
+        read: async () => ({
+          existing: await readSchedule(systemdDir, id),
+          adopted: target.kind === 'zfs' ? await readAdoptedStamps(target.dataset, id) : { names: [], perDataset: new Map() },
+        }),
         id: async () => ({ schedule: id }),
-        unbound: () => `Could not read snapshot schedules — refusing`,
+        scope: async o => (o.adopted ? { adopts: adoptedScope(o.adopted) } : null),
+        scopeLabels: { adopts: 'the snapshots already stamped with this id' },
+        unbound: part => part === 'scope'
+          ? `Could not read which snapshots carry the schedule id '${id}' — refusing`
+          : `Could not read snapshot schedules — refusing`,
       },
       gates: [
         async o => (o.existing
           ? { status: 409, code: 'CONFLICT', message: `Snapshot schedule '${id}' already exists` }
           : null),
+        async o => (o.adopted
+          ? null
+          : {
+              status: 409,
+              code: 'CONFLICT',
+              message: `Could not read the snapshots under '${target.kind === 'zfs' ? target.dataset : target.pool}' that carry the schedule id '${id}' — `
+                + 'refusing: a new schedule owns every snapshot already stamped with its id, and that cannot be checked',
+              reason: 'schedule-stamps-unreadable',
+            }),
       ],
       locks: async () => [scheduleClaim(id, 'exclusive')],
     }
   }
 
-  function scheduleUpdateSpec(id: string): GuardSpec<UnitTaskObject<SnapshotScheduleT>> {
+  /** The confirm's warnings for an edit that newly excludes datasets carrying this schedule's stamped snapshots (cr3 review fold). */
+  function exclusionWarnings(schedule: SnapshotScheduleT, doomed: AdoptedStamps): string[] {
+    const datasets = [...doomed.perDataset.keys()]
+    datasets.sort()
+    const listed = datasets.slice(0, 10).map(ds => `${ds} (${doomed.perDataset.get(ds)})`)
+    const more = datasets.length > 10 ? ` and ${datasets.length - 10} more dataset(s)` : ''
+    return [
+      `${doomed.names.length} snapshot(s) this schedule took on ${datasets.length} dataset(s) it will now exclude will be destroyed at its next run: ${listed.join(', ')}${more}.`,
+      'Held snapshots and PVE-owned datasets are left alone. Snapshots on those datasets that this schedule did not take are never touched.',
+      `To keep them, cancel, or leave those datasets in the schedule.`,
+    ]
+  }
+
+  /** The confirm's warnings for a create that adopts stamped snapshots (cr3 H2). */
+  function adoptionWarnings(schedule: SnapshotScheduleT, adopted: AdoptedStamps): string[] {
+    const dataset = schedule.target.kind === 'zfs' ? schedule.target.dataset : ''
+    const onTarget = adopted.perDataset.get(dataset) ?? 0
+    const below = adopted.names.length - onTarget
+    const datasets = [...adopted.perDataset.keys()]
+    datasets.sort()
+    const listed = datasets.slice(0, 10).map(ds => `${ds} (${adopted.perDataset.get(ds)})`)
+    const more = adopted.perDataset.size > 10 ? ` and ${adopted.perDataset.size - 10} more dataset(s)` : ''
+    return [
+      `${adopted.names.length} snapshot(s) on ${adopted.perDataset.size} dataset(s) under '${dataset}' already carry the schedule id '${schedule.id}' — left by an earlier schedule of that id: ${listed.join(', ')}${more}.`,
+      `This schedule's retention will apply to them from its first run: on every dataset it snapshots it destroys those beyond its policy, and on a dataset it excludes it destroys all of them (held snapshots and PVE-owned datasets are left alone).${
+        below > 0 && schedule.recursive !== true ? ` ${below} of them are below '${dataset}', which this schedule reaches only if it is made recursive.` : ''}`,
+      `To leave them alone, cancel and choose another id.`,
+    ]
+  }
+
+  /**
+   * The update spec. `merged` turns the stored schedule into the schedule
+   * this PUT would write (the body with the PUT contract applied).
+   *
+   * cr3 (review fold, coordinator ruling): an edit that NEWLY EXCLUDES a
+   * dataset — puts it in the prune's excluded scope, where this schedule's
+   * own stamped snapshots are destroyed outright at the next fire — is a
+   * destructive consequence of a PUT. The snapshots stamped with this id on
+   * the newly excluded datasets are the confirm's SCOPE (counts and a digest
+   * of the names, as the create's), so the job refuses a set that changed; a
+   * read that fails refuses (unbound). An edit that newly excludes nothing
+   * reads nothing and binds 'none'.
+   */
+  function scheduleUpdateSpec(
+    id: string,
+    merged?: (stored: SnapshotScheduleT) => SnapshotScheduleT,
+    seen?: (doomed: AdoptedStamps) => void,
+  ): GuardSpec<UnitTaskObject<SnapshotScheduleT>> {
     return {
       operation: 'schedule.update',
       object: {
         ...scheduleUnitView(id),
         revision: async o => serviceUnitRevision(o.unit),
+        ...(merged
+          ? {
+              scope: async (o: UnitTaskObject<SnapshotScheduleT>) => {
+                const doomed = await readNewlyExcludedStamps(o.task, merged(o.task))
+                if (doomed)
+                  seen?.(doomed)
+                return doomed ? { excludes: adoptedScope(doomed) } : null
+              },
+              scopeLabels: { excludes: 'this schedule\'s snapshots on the datasets the edit newly excludes' },
+              unbound: () => `Could not read the snapshots this edit of snapshot schedule '${id}' would destroy — refusing`,
+            }
+          : {}),
       },
       gates: [],
       locks: async () => [scheduleClaim(id, 'exclusive')],
     }
+  }
+
+  /**
+   * Is `dataset` in a schedule's EXCLUDED prune scope — under the target of a
+   * recursive schedule and outside its sweep (planZfsSchedulePrune's own
+   * rule)? Only there are its stamped snapshots destroyed outright.
+   */
+  function inExcludedScope(s: SnapshotScheduleT, dataset: string): boolean {
+    return s.target.kind === 'zfs' && s.recursive === true && dataset.startsWith(`${s.target.dataset}/`) && !inSweep(s, dataset)
+  }
+
+  /**
+   * Could the edit put any dataset newly in the excluded scope? Only a
+   * recursive result can; a stored recursive schedule whose every new exclude
+   * entry is at or under an old one excludes nothing new. Avoids the stamp
+   * read for the common edit (cadence, retention, a toggle).
+   */
+  function mayNewlyExclude(stored: SnapshotScheduleT, next: SnapshotScheduleT): boolean {
+    if (next.target.kind !== 'zfs' || next.recursive !== true || targetKey(stored.target) !== targetKey(next.target))
+      return false
+    // A recursive schedule with no exclude list sweeps everything under its
+    // target: nothing is outside its sweep (second review (4)).
+    if ((next.exclude ?? []).length === 0)
+      return false
+    if (stored.recursive !== true)
+      return true
+    const old = stored.exclude ?? []
+    return (next.exclude ?? []).some(ex => !old.some(o => isAtOrUnder(ex, o)))
+  }
+
+  /**
+   * The snapshots stamped (locally) with this schedule's id on the datasets
+   * the edit newly excludes — empty when it excludes nothing new; null when
+   * the read failed.
+   */
+  async function readNewlyExcludedStamps(stored: SnapshotScheduleT, next: SnapshotScheduleT): Promise<AdoptedStamps | null> {
+    const none: AdoptedStamps = { names: [], perDataset: new Map() }
+    if (!mayNewlyExclude(stored, next) || next.target.kind !== 'zfs')
+      return none
+    const all = await readAdoptedStamps(next.target.dataset, next.id)
+    if (!all)
+      return null
+    const names: string[] = []
+    const perDataset = new Map<string, number>()
+    for (const name of all.names) {
+      const ds = name.slice(0, name.indexOf('@'))
+      if (!inExcludedScope(next, ds) || inExcludedScope(stored, ds))
+        continue
+      names.push(name)
+      perDataset.set(ds, (perDataset.get(ds) ?? 0) + 1)
+    }
+    return { names, perDataset }
+  }
+
+  /** The PUT contract applied: the stored exclude list and fire fields kept where the body omits them. */
+  function mergeForUpdate(schedule: SnapshotScheduleT, stored: SnapshotScheduleT, body: Record<string, unknown> | null | undefined): SnapshotScheduleT {
+    // Mixed-version safety (0.4.2): a 0.4.1 UI knows nothing of `exclude`, and
+    // its toggle/edit PUT rebuilds the body without the key — on a full
+    // replace that silently dropped the stored list. An ABSENT key therefore
+    // keeps the stored list (a recursive ZFS schedule only — the only kind
+    // that can carry one); a PRESENT key, `[]` included, is the new list. The
+    // 0.4.2 UI always sends the key on a recursive ZFS schedule.
+    let next = schedule
+    const excludeAbsent = !body || typeof body !== 'object' || !Object.hasOwn(body, 'exclude')
+    if (excludeAbsent && next.recursive === true && next.target.kind === 'zfs' && stored.exclude?.length)
+      next = { ...next, exclude: stored.exclude }
+    // snaptime.1 (#83): the fire fields follow the same contract just above —
+    // an absent key keeps the stored value where the NEW cadence allows the
+    // field and drops it silently where it does not; a present `null` clears.
+    return mergeFireFields(next, stored, body && typeof body === 'object' ? body : {})
   }
 
   function scheduleDeleteSpec(id: string): GuardSpec<{ unit: string, timer: string }> {
@@ -389,6 +605,17 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
    * and the pool shared) or the AHR pool — and its own `schedule:<id>` shared.
    * The ONE builder; the guard calls it at the route door and again in the
    * job door's recompute.
+   *
+   * A recursive schedule claims its TARGET, not each descendant it sweeps —
+   * deliberately (cr3, coordinator 2026-11-14, after a measured trial of the
+   * per-descendant claims): accepted residual, a scheduled snapshot taken in
+   * the moment between a forced child rollback's re-read and its `zfs
+   * rollback -r` is destroyed unconfirmed — a snapshot of data the operator is
+   * discarding anyway; claiming every swept child instead made one long
+   * exclusive job on ONE child (a replication receive, a set-access, a LUN
+   * restore: hours) stall every fire of the parent, and the FIFO lock table
+   * then queued unrelated verbs on other children behind the waiting fire. Do
+   * not re-add the per-descendant claims without weighing that stall.
    */
   async function scheduleRunClaims(o: SnapshotScheduleT): Promise<LockClaim[]> {
     return [
@@ -421,8 +648,11 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     // Reads/footprint may fail closed (unreadable storage.cfg = everything
     // owned) exactly like the create guard. An AHR target is not PVE-footprint
     // territory.
+    let pveOwned: ((dataset: string) => string | null) | undefined
     if (schedule.target.kind === 'zfs') {
       const pve = await pveFootprint()
+      // cr3 L3: the prune asks the same footprint for every dataset it reaches.
+      pveOwned = dataset => pve.ownershipOf(dataset)?.reason ?? null
       const owned = pve.ownershipOf(schedule.target.dataset)
       if (owned)
         throw new Error(`Snapshot run refused: '${schedule.target.dataset}' is PVE-owned — ${owned.reason}`)
@@ -462,6 +692,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       const prune = await pruneZfsSchedule(executor, schedule, {
         others: await readScheduleList(systemdDir),
         updateProgress,
+        ...(pveOwned ? { pveOwned } : {}),
       })
       return zfsRunResult(schedule, take.name, prune)
     }
@@ -500,12 +731,37 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     // truth at the route, and the create job re-runs the same gate under its
     // `schedule:<id>` name key (cr.41: two creates of one id cannot both pass
     // a check made before either wrote).
-    const spec = scheduleCreateSpec(schedule.id)
+    //
+    // cr3 (review fold): "already exists" answers first, as before H2 — a
+    // plain read of the store ahead of the target check. The spec's read
+    // (which the job repeats) lists the stamps under the target, so it runs
+    // only AFTER the target check: a target that does not exist answers its
+    // own 400, never "could not read the stamps".
+    if (await readSchedule(systemdDir, schedule.id)) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `Snapshot schedule '${schedule.id}' already exists` } }
+    }
+    if (!(await guardTarget(schedule.target, schedule.recursive === true, reply, schedule.exclude)))
+      return reply
+    const spec = scheduleCreateSpec(schedule.id, schedule.target)
     const pre = await guardCheck(spec)
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
-    if (!(await guardTarget(schedule.target, schedule.recursive === true, reply, schedule.exclude)))
-      return reply
+
+    // cr3 H2: snapshots already stamped with this id are adopted — said, and
+    // confirmed, before anything is written. The code binds the whole body
+    // (the id among it) and the adopted set (the scope).
+    const adopted = pre.object.adopted
+    if (adopted && adopted.names.length > 0) {
+      if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+        validated: { ...schedule },
+        address: ['id'],
+        message: `Snapshot schedule id '${schedule.id}' is already stamped on existing snapshots — this schedule will own them`,
+        warnings: adoptionWarnings(schedule, adopted),
+      })) {
+        return reply
+      }
+    }
 
     const job = jobQueue.submit(
       'schedule.create',
@@ -552,7 +808,8 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid snapshot schedule: ${bodyParsed.error.issues[0]?.message}` } }
     }
-    let schedule = bodyParsed.data
+    const parsed = bodyParsed.data
+    let schedule = parsed
     // The URL is the identity; a body renaming the id is rejected (rename =
     // delete + create, not an in-place edit).
     if (schedule.id !== id) {
@@ -570,7 +827,13 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     // an update can never resurrect a deleted schedule. The id and rev are
     // read here and RE-READ in the job (guarded). The TARGET checks below use
     // the same re-read as `stored`.
-    const spec = scheduleUpdateSpec(id)
+    const body = request.body as Record<string, unknown> | null | undefined
+    // The set the route door's scope read: the warnings name exactly what the
+    // confirm binds (one read, not two).
+    let doomed: AdoptedStamps = { names: [], perDataset: new Map() }
+    const spec = scheduleUpdateSpec(id, stored => mergeForUpdate(parsed, stored, body), (d) => {
+      doomed = d
+    })
     const pre = await guardCheck(spec)
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
@@ -594,23 +857,27 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
         },
       }
     }
-    // Mixed-version safety (0.4.2): a 0.4.1 UI knows nothing of `exclude`, and
-    // its toggle/edit PUT rebuilds the body without the key — on a full
-    // replace that silently dropped the stored list. An ABSENT key therefore
-    // keeps the stored list (a recursive ZFS schedule only — the only kind
-    // that can carry one); a PRESENT key, `[]` included, is the new list. The
-    // 0.4.2 UI always sends the key on a recursive ZFS schedule.
-    const body = request.body as Record<string, unknown> | null | undefined
-    const excludeAbsent = !body || typeof body !== 'object' || !Object.hasOwn(body, 'exclude')
-    if (excludeAbsent && schedule.recursive === true && schedule.target.kind === 'zfs' && stored.exclude?.length)
-      schedule = { ...schedule, exclude: stored.exclude }
-    // snaptime.1 (#83): the fire fields follow the same contract just above —
-    // an absent key keeps the stored value where the NEW cadence allows the
-    // field and drops it silently where it does not; a present `null` clears.
-    schedule = mergeFireFields(schedule, stored, body && typeof body === 'object' ? body as Record<string, unknown> : {})
+    // The PUT contract (exclude and the fire fields kept where the body
+    // omits them) — the same function the spec's scope reads.
+    schedule = mergeForUpdate(schedule, stored, body)
 
     if (!(await guardTarget(schedule.target, schedule.recursive === true, reply, schedule.exclude, stored.exclude)))
       return reply
+
+    // cr3 (review fold): an edit that newly excludes datasets carrying this
+    // schedule's own stamped snapshots destroys them at the next fire — said,
+    // and confirmed, before anything is written. The code binds the whole
+    // merged schedule and the set (the spec's scope).
+    if (doomed.names.length > 0) {
+      if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+        validated: { ...schedule },
+        address: ['id'],
+        message: `This edit excludes datasets that carry snapshots snapshot schedule '${id}' took — they will be destroyed at its next run`,
+        warnings: exclusionWarnings(schedule, doomed),
+      })) {
+        return reply
+      }
+    }
 
     const job = jobQueue.submit(
       'schedule.update',
@@ -684,10 +951,31 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     // ITSELF, so a fire whose schedule was deleted while it waited refuses
     // not-found, and the run reads a fresh one (a re-created schedule with the
     // same id is the current schedule).
+    // cr3 (second review (5)): a fire refused at the ROUTE — a read its lock
+    // claims need could not be made (an AHR topology that cannot be read
+    // throws past the guard into the server's 503), or any refusal — is a
+    // failed fire like one refused in the job, so the schedule's own
+    // notification says why. The timer's runner gets the HTTP answer and no
+    // job, so this is the only place it can be said. Best-effort; a schedule
+    // that cannot be read (404 / unreadable) has no one to notify.
+    const notifyRefused = async (message: string): Promise<void> => {
+      const schedule = await readSchedule(systemdDir, id).catch(() => null)
+      if (schedule)
+        await notifyScheduleRun(executor, { schedule, error: message, elapsedMs: 0 })
+    }
     const spec = scheduleRunSpec(id)
-    const pre = await guardCheck(spec)
-    if ('refusal' in pre)
+    let pre: Awaited<ReturnType<typeof guardCheck<SnapshotScheduleT>>>
+    try {
+      pre = await guardCheck(spec)
+    }
+    catch (err) {
+      await notifyRefused(err instanceof Error ? err.message : String(err))
+      throw err
+    }
+    if ('refusal' in pre) {
+      await notifyRefused(pre.refusal.message)
       return sendRefusal(reply, pre.refusal)
+    }
 
     // cr.64b1 (F): a fire the GUARD refuses (its lock recompute, before any
     // body runs) is a failed fire like any other, so it notifies — the
@@ -732,7 +1020,8 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       // takes and prunes waits for it and re-gates after; other snapshots of
       // the target still run beside it. A recursive schedule claims its target
       // (whose recursive destroy or rename takes it exclusive), not each
-      // descendant it sweeps.
+      // descendant it sweeps — see scheduleRunClaims for the accepted residual
+      // and the measured stall that keeps it that way.
       { locks: pre.locks },
     )
     reply.code(202)

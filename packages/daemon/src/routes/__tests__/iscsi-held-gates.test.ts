@@ -718,6 +718,9 @@ describe('the disclosure — a failed claims read is named at the confirm doors 
     for (const pool of [POOL, UNSERVED_POOL])
       executor.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', pool], result: { stdout: '4242\n', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: ZFS, args: ['get', '-H', '-o', 'value', 'guid', '--', ZVOL], result: { stdout: '4343\n', stderr: '', exitCode: 0 } })
+    // cr3 INVENTED-STATE-M9: the destroy confirm counts the volume's
+    // snapshots before it is minted (an unreadable count refuses) — none here.
+    executor.addFixture({ command: ZFS, args: ['list', '-j', '-o', 'name', '-t', 'snapshot', '--', ZVOL], result: { stdout: '{"output_version":{"command":"zfs list","vers_major":0,"vers_minor":1},"datasets":{}}\n', stderr: '', exitCode: 0 } })
     // cr.23: destroy/export now ask the system-pool rule before the confirm
     // gate. Seed BOTH fact sources readable (no bootfs anywhere, an ordinary
     // ext4-root mount table) so these tests keep testing the claims

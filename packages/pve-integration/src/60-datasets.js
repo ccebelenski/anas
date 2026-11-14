@@ -618,7 +618,11 @@
                 var children = [];
                 var poolMap = {};
                 for (var j = 0; j < results.length; j++) {
-                    children.push(buildPoolNode(results[j].pool, results[j].datasets));
+                    var poolNode = buildPoolNode(results[j].pool, results[j].datasets);
+                    if (results[j].unreadable) {
+                        markDatasetsUnreadable(poolNode, results[j].unreadable);
+                    }
+                    children.push(poolNode);
                     if (results[j].pool && results[j].pool.name) {
                         poolMap[results[j].pool.name] = results[j].pool;
                     }
@@ -773,8 +777,24 @@
         });
     }
 
-    // Resolve to { pool, datasets } and never reject — a single pool's failure
-    // must not blank the whole tree.
+    // A pool whose dataset list could not be read (cr3): one info row under it
+    // saying so, with the daemon's reason — never an empty pool. The row is not
+    // a dataset (kind 'unreadable'), so no verb acts on it.
+    function markDatasetsUnreadable(poolNode, reason) {
+        poolNode.datasetsUnreadable = reason;
+        poolNode.leaf = false;
+        poolNode.expanded = true;
+        poolNode.children = [{
+            name: t('Datasets could not be read') + ': ' + reason,
+            pool: poolNode.pool,
+            kind: 'unreadable',
+            iconCls: 'fa fa-exclamation-triangle',
+            leaf: true,
+        }];
+    }
+
+    // Resolve to { pool, datasets[, unreadable] } and never reject — a single
+    // pool's failure must not blank the whole tree.
     function loadPoolDatasets(node, pool) {
         return ANAS.api.get(node, '/pools/' + encodeURIComponent(pool.name) + '/datasets').then(
             function (res) {
@@ -788,14 +808,21 @@
                 };
             },
             function (err) {
+                // cr3 (INVENTED-STATE-L15, review fold): a list that could not
+                // be read is SAID on the pool's row, never rendered as a pool
+                // with no datasets.
                 ANAS.warn('datasets load failed for ' + pool.name + ': ' + ANAS.errText(err));
-                return { pool: pool, datasets: [], defaults: null };
+                return { pool: pool, datasets: [], defaults: null, unreadable: ANAS.errText(err) || t('unknown error') };
             }
         );
     }
 
     ANAS.datasets = ANAS.datasets || {};
     ANAS.datasets.reload = loadTree;
+    // cr3: for cr3-datasets.harness.mjs (unreadable lists said, not emptied).
+    ANAS.datasets.loadSnapshotsForNode = function (node, tree, dsNode, force) {
+        return loadSnapshotsForNode(node, tree, dsNode, force);
+    };
 
     // ---- Selection + button state -----------------------------------------
 
@@ -957,10 +984,14 @@
             if (!btn) {
                 return;
             }
+            // cr3: a tooltip is HTML (QuickTip renders the attribute), and a
+            // reason can carry data — a LUN's held.detail, a dataset name — so
+            // the text is encoded for the tip.
+            var tipHtml = text ? enc(text) : undefined;
             if (typeof btn.setTooltip === 'function') {
-                btn.setTooltip(text || undefined);
+                btn.setTooltip(tipHtml);
             }
-            btn.tooltip = text || undefined;
+            btn.tooltip = tipHtml;
         } catch (e) {
             // a missing tooltip never breaks the toolbar
         }
@@ -1992,7 +2023,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-dataset-detail',
-                title: t('Dataset') + ': ' + fullName,
+                title: t('Dataset') + ': ' + enc(fullName),
                 modal: true,
                 width: 640,
                 height: 560,
@@ -2249,7 +2280,7 @@
 
         ANAS.editWindow({
             cls: 'anas-win-dataset-edit',
-            title: t('Edit Dataset') + ': ' + fullName,
+            title: t('Edit Dataset') + ': ' + enc(fullName),
             submitText: 'Save',
             submitCls: 'anas-btn-dataset-edit-submit',
             width: 480,
@@ -2400,7 +2431,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-volume-resize',
-                title: t('Resize Volume') + ': ' + fullName,
+                title: t('Resize Volume') + ': ' + enc(fullName),
                 modal: true,
                 width: 480,
                 resizable: false,
@@ -2709,7 +2740,7 @@
         var kids = dsNode.childNodes.slice();
         for (var i = 0; i < kids.length; i++) {
             var k = kids[i].get('kind');
-            if (k === 'snapshot' || k === 'snapshots-more') {
+            if (k === 'snapshot' || k === 'snapshots-more' || k === 'snapshots-unreadable') {
                 dsNode.removeChild(kids[i], true);
             }
         }
@@ -2765,10 +2796,30 @@
             removeSnapshotChildren(dsNode);
             appendSnapshotChildren(dsNode, (res && res.data) || []);
         }, function (err) {
-            // Fail-open: no snapshot children. Clear the guard so a later
-            // collapse/expand can retry rather than staying permanently empty.
+            // cr3: a snapshot list that could not be read is SAID under the
+            // dataset (one info row with the reason), never shown as a dataset
+            // with no snapshots. Clear the guard so a later collapse/expand
+            // retries.
             if (!dsNode.destroyed) {
                 dsNode.anasSnapsLoaded = false;
+                try {
+                    removeSnapshotChildren(dsNode);
+                    var row = {
+                        name: t('Snapshots could not be read') + ': ' + (ANAS.errText(err) || t('unknown error')),
+                        pool: pool,
+                        dataset: fullName,
+                        kind: 'snapshots-unreadable',
+                        iconCls: 'fa fa-exclamation-triangle',
+                        leaf: true,
+                    };
+                    if (dsNode.firstChild) {
+                        dsNode.insertBefore(row, dsNode.firstChild);
+                    } else {
+                        dsNode.appendChild(row);
+                    }
+                } catch (eRow) {
+                    // the warn below still records it
+                }
             }
             ANAS.warn('snapshots load failed for ' + fullName + ': ' + ANAS.errText(err));
         });
@@ -2839,7 +2890,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-snap-create',
-                title: t('Create Snapshot') + ': ' + fullName,
+                title: t('Create Snapshot') + ': ' + enc(fullName),
                 modal: true,
                 width: 460,
                 resizable: false,
@@ -2983,7 +3034,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-snap-rename',
-                title: t('Rename Snapshot') + ': ' + ctx.fullName,
+                title: t('Rename Snapshot') + ': ' + enc(ctx.fullName),
                 modal: true,
                 width: 460,
                 resizable: false,
@@ -3082,7 +3133,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-snap-clone',
-                title: t('Clone Snapshot') + ': ' + ctx.fullName,
+                title: t('Clone Snapshot') + ': ' + enc(ctx.fullName),
                 modal: true,
                 width: 480,
                 resizable: false,
@@ -3264,7 +3315,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-snapshots',
-                title: t('Snapshots') + ': ' + datasetFullName,
+                title: t('Snapshots') + ': ' + enc(datasetFullName),
                 modal: true,
                 width: 760,
                 height: 520,

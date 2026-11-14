@@ -66,6 +66,9 @@ import { probeMount } from './mounts.js'
 /** Trailing slashes on an absolute path (`/` itself is preserved). */
 const TRAILING_SLASHES_RE = /\/+$/
 
+/** The characters `find -path` reads as a glob (fnmatch without FNM_NOESCAPE): `\`, `*`, `?`, `[`. */
+const FIND_GLOB_CHARS_RE = /[\\*?[]/g
+
 const FIND = '/usr/bin/find'
 const BTRFS = '/usr/bin/btrfs'
 /** `timeout` binary — the same hang guard the mounts family uses. */
@@ -148,6 +151,17 @@ export function relativeTo(root: string, child: string): string {
 }
 
 /**
+ * A path as a `find -path` pattern that matches exactly that path (cr3
+ * DATASETS-SCHEDULES-L4): `-path` takes a GLOB, so a mount point named
+ * `/srv/[nas]` or `/srv/a*b` matched nothing (or something else) and the walk
+ * went into the very mount it was told to prune — the hang guard void. Every
+ * glob character is backslash-escaped (GNU find's fnmatch honours `\`).
+ */
+export function findPathLiteral(path: string): string {
+  return path.replace(FIND_GLOB_CHARS_RE, '\\$&')
+}
+
+/**
  * The argv for the walk. `-P` (never follow symlinks) + `-xdev` (stop at every
  * `st_dev` boundary, but PRINT the boundary directory) + `-type d` (directories
  * only — a 10 TB tree is never file-stat'ed) + `-printf '%D\t%p\n'` (the device
@@ -160,7 +174,7 @@ export function buildWalkArgs(path: string, prune: string[], maxDepth: number): 
   const args = ['-P', normalizePath(path), '-xdev', '-maxdepth', String(maxDepth)]
   const pruneTerms: string[] = ['-name', '.zfs']
   for (const p of prune)
-    pruneTerms.push('-o', '-path', normalizePath(p))
+    pruneTerms.push('-o', '-path', findPathLiteral(normalizePath(p)))
   args.push('(', ...pruneTerms, ')', '-prune', '-o', '-type', 'd', '-printf', '%D\\t%p\\n')
   return args
 }

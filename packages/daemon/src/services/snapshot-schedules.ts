@@ -321,7 +321,12 @@ export async function pruneSnapshots(
 // property (`zfs get … source` — a received snapshot carries its sender's
 // stamp with source `received`, and the sender's schedule may share this id;
 // such a snapshot is noted `N left: received`). A snapshot stamped with any
-// other id (another schedule, a deleted one) is never a candidate. An UNSTAMPED `anas-<bucket>-*`
+// other id (another schedule, a deleted one) is never a candidate. The stamp
+// is the id, not the incarnation: a deleted schedule's snapshots keep its id,
+// and a NEW schedule created later under the same id owns them from its first
+// prune (cr3 DATASETS-SCHEDULES-H2) — which is why a create over snapshots
+// already stamped with its id is confirm-gated (routes/schedules.ts), naming
+// how many it adopts. An UNSTAMPED `anas-<bucket>-*`
 // snapshot (taken before 0.4.2, or by hand) is a candidate only where this
 // schedule is the ONLY enabled schedule covering the dataset — the legacy
 // convergence case; anywhere else it is left with a per-dataset note. That
@@ -339,9 +344,16 @@ export async function pruneSnapshots(
 //                never this schedule's to prune.
 //   - excluded — a dataset under the target outside the sweep: the snapshots
 //                this schedule stamped there before the exclude are destroyed
-//                outright (held ones reported), PVE-owned or not — they are
-//                ANAS's own leftovers. Unstamped ones are left with a note: the
-//                stamp replaces the name + txg + creation witness rule.
+//                outright (held ones reported). Unstamped ones are left with a
+//                note: the stamp replaces the name + txg + creation witness rule.
+//
+// PVE territory (EPICS §2: read-only and hands-off; cr3 DATASETS-SCHEDULES-L3):
+// a dataset off the target that PVE owns — or that cannot be judged, since an
+// unreadable storage.cfg answers every dataset owned — is never pruned, in any
+// scope; its stamped snapshots are left with the note {@link PVE_OWNED_LEFT}
+// and the run completes with warnings. (The run already refuses a PVE-owned
+// target or swept dataset; an EXCLUDED subtree is the one the take skips and
+// the prune still reached.)
 //
 // Buckets: a bucket absent from the policy is left alone (planRetention), and
 // the schedule's own cadence bucket is always present (effectiveRetention).
@@ -373,6 +385,9 @@ export const UNSTAMPED_SHARED = 'unstamped, more than one schedule here'
  * schedule's, never pruned by it.
  */
 export const STAMP_RECEIVED = 'received'
+
+/** The note for this schedule's snapshots left on a PVE-owned dataset (cr3 L3). */
+export const PVE_OWNED_LEFT = 'PVE-owned, hands-off'
 
 /** The note for unstamped snapshots on a dataset outside this schedule's sweep. */
 export const UNSTAMPED_OUTSIDE = 'unstamped, outside this schedule\'s sweep'
@@ -487,6 +502,12 @@ export interface ZfsSchedulePruneInput {
    */
   others: ScheduleListRead
   now: Date
+  /**
+   * PVE's ownership answer for a dataset (cr3 L3): a non-null reason means the
+   * dataset is PVE's (or cannot be judged) and is never pruned. Absent = no
+   * dataset is PVE-owned (pure planning tests).
+   */
+  pveOwned?: (dataset: string) => string | null
 }
 
 /**
@@ -519,7 +540,15 @@ export function planZfsSchedulePrune(input: ZfsSchedulePruneInput): DatasetPrune
     const scope: PruneScope = dataset === target ? 'target' : inSweep(schedule, dataset) ? 'sweep' : 'excluded'
 
     let plan: DatasetPrunePlan
-    if (scope === 'excluded') {
+    const pveReason = scope === 'target' ? null : (input.pveOwned?.(dataset) ?? null)
+    if (pveReason !== null) {
+      // PVE territory is read-only and hands-off (EPICS §2): nothing here is
+      // destroyed, whatever stamp it carries; said so.
+      plan = { dataset, scope, prune: [], skippedHeld: [] }
+      if (stamped.length > 0)
+        plan.note = `${stamped.length} left: ${PVE_OWNED_LEFT} (${pveReason})`
+    }
+    else if (scope === 'excluded') {
       // Outside the sweep: this schedule's own stamped leftovers go outright.
       plan = {
         dataset,
@@ -613,6 +642,8 @@ export async function pruneZfsSchedule(
     others: ScheduleListRead
     now?: Date
     updateProgress?: (message: string) => void
+    /** PVE's ownership answer per dataset (cr3 L3); see {@link ZfsSchedulePruneInput.pveOwned}. */
+    pveOwned?: (dataset: string) => string | null
   },
 ): Promise<RecursivePruneResult> {
   if (schedule.target.kind !== 'zfs')
@@ -628,6 +659,7 @@ export async function pruneZfsSchedule(
     inventory: parseZfsTreeSnapshots(r.stdout, parseZfsStampSources(stamps.stdout)),
     others: opts.others,
     now: opts.now ?? new Date(),
+    ...(opts.pveOwned ? { pveOwned: opts.pveOwned } : {}),
   })
 
   const datasets: DatasetPruneResult[] = []

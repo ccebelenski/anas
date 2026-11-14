@@ -1101,13 +1101,15 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
           args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg,anas:schedule', '-r', '--', 'testpool/x'],
           result: { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 },
         })
-        stampSources(mock, 'testpool/x', true, `${rows.join('\n')}\n`)
         mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', '--', 'testpool/x'], result: { stdout: 'testpool/x\ntestpool/x/data\ntestpool/x/media\n', stderr: '', exitCode: 0 } })
         const media = await create({ ...SCHEDULE, id: 'daily-media', target: { kind: 'zfs', dataset: 'testpool/x/media' }, retention: { daily: 30 } })
         await waitForJob(server, media.json().job.id)
         const created = await create({ ...X, id: 'daily-x', cadence: 'daily', retention: { daily: 1 }, exclude: ['testpool/x/media'] })
         assert.equal(created.statusCode, 202, created.body)
         await waitForJob(server, created.json().job.id)
+        // cr3 H2: the stamps are armed AFTER the create — they are this
+        // schedule's own runs' (a create over stamps already there is confirm-gated).
+        stampSources(mock, 'testpool/x', true, `${rows.join('\n')}\n`)
 
         const run = await server.inject({ method: 'POST', url: '/v1/schedules/daily-x/run', headers: JSON_HEADERS, payload: '{}' })
         const done = await waitForJob(server, run.json().job.id)
@@ -1143,11 +1145,13 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
           args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg,anas:schedule', '-r', '--', 'testpool/x'],
           result: { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 },
         })
-        stampSources(mock, 'testpool/x', true, `${rows.join('\n')}\n`)
         mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name', '-r', '-t', 'filesystem,volume', '--', 'testpool/x'], result: { stdout: 'testpool/x\ntestpool/x/data\ntestpool/x/media\n', stderr: '', exitCode: 0 } })
         const created = await create({ ...X, id: 'daily-x', cadence: 'daily', retention: { daily: 1 }, exclude: ['testpool/x/media'] })
         assert.equal(created.statusCode, 202, created.body)
         await waitForJob(server, created.json().job.id)
+        // cr3 H2: the stamps are armed AFTER the create — they are this
+        // schedule's own runs' (a create over stamps already there is confirm-gated).
+        stampSources(mock, 'testpool/x', true, `${rows.join('\n')}\n`)
         // A unit whose schedule JSON cannot be parsed — it may be a schedule
         // that also covers testpool/x/data.
         await writeFile(join(dir, 'anas-snap-broken.service'), '[Unit]\n# X-ANAS-Schedule={not json\n')
@@ -1274,13 +1278,15 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
           args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name,creation,userrefs,createtxg,anas:schedule', '-r', '--', 'testpool/x'],
           result: { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 },
         })
-        stampSources(mock, 'testpool/x', true, `${rows.join('\n')}\n`)
         const GONE = { stdout: '', stderr: 'could not find any snapshots to destroy; check snapshot names.\n', exitCode: 1 }
         mock.addFixture({ command: ZFS, args: ['destroy', '--', `testpool/x@${D1}`], result: GONE })
         mock.addFixture({ command: ZFS, args: ['destroy', '--', `testpool/x/data@${D1}`], result: GONE })
         const created = await create({ ...X, id: 'daily-x', cadence: 'daily', retention: { daily: 1 } })
         assert.equal(created.statusCode, 202, created.body)
         await waitForJob(server, created.json().job.id)
+        // cr3 H2: the stamps are armed AFTER the create — they are this
+        // schedule's own runs' (a create over stamps already there is confirm-gated).
+        stampSources(mock, 'testpool/x', true, `${rows.join('\n')}\n`)
 
         const run = await server.inject({ method: 'POST', url: '/v1/schedules/daily-x/run', headers: JSON_HEADERS, payload: '{}' })
         const done = await waitForJob(server, run.json().job.id)
