@@ -1476,7 +1476,11 @@ describe('selfheal repair — md\'s cached view versus the member rows (GT-23)',
       node.setKnob('mismatch_cnt', '0')
       const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
       assert.equal(outcome.outcome, 'above-md')
-      assert.match(outcome.reason, /implicates something other than the disks/)
+      // cr3.sentences: the operator's approved sentence, word for word.
+      assert.equal(outcome.reason, `${node.file} block 300 fails its stored checksum. `
+      + 'md\'s check over stripe 49 counts no mismatch and a direct read of all 6 member rows of stripe 49: the XOR of the 5 data rows IS the P row on /dev/loop4, so parity agrees with the bad bytes. '
+      + 'No copy on the array holds a good version of this block, so the repair cannot fix it and running it again will not change that. '
+      + 'Parity that agrees with bad data points to a cause above the disks: memory, the controller or software. Check those before trusting new writes. The file is damaged at this block unless the checksum record is what is wrong. Restore it from a backup if one exists. Nothing was written.')
       // The claim now names both readings, not just md's counter.
       assert.match(outcome.reason, /the XOR of the 5 data rows IS the P row/)
       assert.equal(outcome.diagnostics?.staleCache, undefined, 'nothing stale here')
@@ -1496,10 +1500,14 @@ describe('selfheal repair — md\'s cached view versus the member rows (GT-23)',
       // changes that: its own `unrepairable` code, and the sentence says so.
       assert.equal(outcome.outcome, 'unrepairable')
       assert.equal(outcome.reasonCode, SELFHEAL_ARRAY_REBUILDS_ROT)
-      assert.match(outcome.reason, /fails its stored checksum, and the parity reconstruction of this row gives back the same failing bytes/)
+      // cr3.sentences: the operator's approved sentence, word for word.
+      assert.equal(outcome.reason, `${node.file} block 300 fails its stored checksum. `
+      + 'Rebuilding this row from parity gives the same failing bytes (a direct read of all 6 member rows of stripe 49: the XOR of the 5 data rows IS the P row on /dev/loop4), and md\'s check counts 8 mismatch(es) elsewhere in its window. '
+      + 'No copy on the array holds a good version of this block, so the repair cannot fix it and running it again will not change that. '
+      + 'Disks that agree on bytes that fail their checksum point to a cause above the disks: memory, the controller or software. Check those before trusting new writes. The file is damaged at this block unless the checksum record is what is wrong. Restore it from a backup if one exists. Nothing was written.')
       assert.match(outcome.reason, /counts 8 mismatch\(es\)/)
-      assert.match(outcome.reason, /running the repair again will not change that/)
-      assert.match(outcome.reason, /Restore the file from a backup if one exists/)
+      assert.match(outcome.reason, /running it again will not change that/)
+      assert.match(outcome.reason, /Restore it from a backup if one exists/)
       assert.equal(node.wroteThroughMd, null)
       assertKnobsRestored()
     })
@@ -2148,7 +2156,7 @@ describe('selfheal repair — RAID6 with both syndromes agreeing with the rot (G
     // cr3 review item 1 (E05e on RAID6).
     assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
     assert.equal(outcome.reasonCode, SELFHEAL_ARRAY_REBUILDS_ROT)
-    assert.match(outcome.reason, /the parity reconstruction of this row gives back the same failing bytes/)
+    assert.match(outcome.reason, /Rebuilding this row from parity gives the same failing bytes \(.*P on \/dev\/loop4 IS the XOR of the data rows, Q on \/dev\/loop5 IS their syndrome\)/)
     assert.equal(r6.wroteThroughMd, null)
   })
 })
@@ -2192,10 +2200,12 @@ describe('selfheal repair — every mirror leg fails the csum (F4)', () => {
       mirror.setKnob('mismatch_cnt', '0')
       const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
       assert.equal(outcome.outcome, 'above-md', outcome.reason)
-      assert.match(outcome.reason, /the legs AGREE with each other and are both wrong/)
-      assert.match(outcome.reason, /every leg holds the same bytes/)
-      assert.match(outcome.reason, /implicates something other than the disks/)
-      assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
+      // cr3.sentences: the operator's approved sentence, word for word. It
+      // carries the restore advice now (if one exists), as array-rebuilds-rot does.
+      assert.equal(outcome.reason, `${mirror.file} block 300 fails its stored checksum. `
+      + 'md\'s check over /dev/md126 counts no mismatch and a direct read of all 2 mirror legs at their own offsets: every leg holds the same bytes, so the mirror legs agree with each other and with the bad bytes. '
+      + 'No copy on the array holds a good version of this block, so the repair cannot fix it and running it again will not change that. '
+      + 'Legs that agree on bad data point to a cause above the disks: memory, the controller or software. Check those before trusting new writes. The file is damaged at this block unless the checksum record is what is wrong. Restore it from a backup if one exists. Nothing was written.')
       assert.equal(outcome.diagnostics?.staleCache, undefined)
       assert.equal(mirror.wroteThroughMd, null)
     })
@@ -2208,8 +2218,12 @@ describe('selfheal repair — every mirror leg fails the csum (F4)', () => {
       // cr3 review item 1 (E04f4): every leg holds the same failing bytes.
       assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
       assert.equal(outcome.reasonCode, SELFHEAL_ARRAY_REBUILDS_ROT)
-      assert.match(outcome.reason, /fails its stored checksum, and every mirror leg holds the same failing bytes/)
-      assert.match(outcome.reason, /running the repair again will not change that/)
+      // cr3.sentences: the operator's approved sentence, word for word.
+      assert.equal(outcome.reason, `${mirror.file} block 300 fails its stored checksum. `
+      + 'Every mirror leg holds the same failing bytes (a direct read of all 2 mirror legs at their own offsets: every leg holds the same bytes), and md\'s check counts 6 mismatch(es) elsewhere in its window. '
+      + 'No copy on the array holds a good version of this block, so the repair cannot fix it and running it again will not change that. '
+      + 'Disks that agree on bytes that fail their checksum point to a cause above the disks: memory, the controller or software. Check those before trusting new writes. The file is damaged at this block unless the checksum record is what is wrong. Restore it from a backup if one exists. Nothing was written.')
+      assert.match(outcome.reason, /running it again will not change that/)
       assert.equal(mirror.wroteThroughMd, null)
     })
   })
@@ -2617,6 +2631,8 @@ describe('selfheal repair — the parity row agrees with the failing block (cr3 
       assert.doesNotMatch(body, /run the repair again/i)
       assert.match(body, /every copy the array holds of this block gives the same failing bytes/)
       assert.match(body, /restore this file from a backup if one exists/)
+      // cr3.sentences: the job says the cause above the disks too.
+      assert.match(body, /Disks that agree on bytes that fail their checksum point to a cause above the disks: memory, the controller or software\. Check those before trusting new writes\./)
       assert.equal(node.wroteThroughMd, null)
     }
   })

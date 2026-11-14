@@ -1117,14 +1117,16 @@ export async function repairBlock(
       const mirrorAgreement = parityAgreement(mirrorDirect.consistent, legs)
       note(`mismatch_cnt=${legs}; ${mirrorDirect.detail}`)
       if (mirrorAgreement === 'consistent') {
-        fail('above-md', `${verdict.abort.reason} md's own bounded check over ${mirrorGeo.device} reports mismatch_cnt=0 and ${mirrorDirect.detail}, so the legs AGREE with each other and are both wrong — parity already agreed with the bad data, which implicates something other than the disks (memory, controller, software). Nothing was written.`)
+        // cr3.sentences: the operator's sentence, which REPLACES the re-verify's
+        // "every mirror leg fails the stored csum" (its first sentence says it).
+        fail('above-md', aboveMdSentence(file, request.block, 'mirror', mirrorGeo.device, mirrorDirect.detail))
       }
       if (mirrorAgreement === 'disagree') {
         // cr3 review item 1 (E04f4) — the block WAS examined: it fails its
         // checksum and every leg holds the same failing bytes. md counting a
         // mismatch elsewhere in its window changes nothing about this row,
         // and no rerun will: its own `unrepairable` code and sentence.
-        fail('unrepairable', arrayRebuildsRotSentence(file, request.block, 'mirror', mirrorDirect.detail, `md's bounded check over ${mirrorGeo.device} counts ${legs} mismatch(es)`), SELFHEAL_ARRAY_REBUILDS_ROT)
+        fail('unrepairable', arrayRebuildsRotSentence(file, request.block, 'mirror', mirrorDirect.detail, legs), SELFHEAL_ARRAY_REBUILDS_ROT)
       }
       if (mirrorAgreement === 'stale-cache') {
         diagnostics.staleCache = true
@@ -1164,7 +1166,7 @@ export async function repairBlock(
     const agreement = parityAgreement(direct.consistent, before)
     note(`mismatch_cnt=${before}; ${direct.detail}`)
     if (agreement === 'consistent') {
-      fail('above-md', `the bounded md check over stripe ${stripe} reports mismatch_cnt=${before} and ${direct.detail}, while the block fails its stored csum — parity agrees with the bad data, which implicates something other than the disks. Nothing was written.`)
+      fail('above-md', aboveMdSentence(file, request.block, 'parity', String(stripe), direct.detail))
     }
     if (agreement === 'disagree') {
       // md counts the chunk window while the members' own row agrees with
@@ -1175,7 +1177,7 @@ export async function repairBlock(
       // cr3 review item 1 (E05e) — the block WAS examined: it fails its
       // checksum and the parity group agrees with the failing bytes, so a
       // reconstruction gives them back. That is the same answer on every run.
-      fail('unrepairable', arrayRebuildsRotSentence(file, request.block, 'parity', direct.detail, `md's bounded check over stripe ${stripe} counts ${before} mismatch(es)`), SELFHEAL_ARRAY_REBUILDS_ROT)
+      fail('unrepairable', arrayRebuildsRotSentence(file, request.block, 'parity', direct.detail, before), SELFHEAL_ARRAY_REBUILDS_ROT)
     }
     if (agreement === 'stale-cache') {
       // Exactly GT-23's shape: md answered from its cache, the members say
@@ -2311,18 +2313,49 @@ async function readBadBlockLists(geo: MdGeometry): Promise<MdGeometry['badBlocks
   return out
 }
 
+/*
+ * The two verdicts that rest on the same evidence (cr3.sentences): every copy
+ * the array holds of the block gives the same bytes, and those bytes fail the
+ * stored checksum. `array-rebuilds-rot` (md counts a mismatch elsewhere in its
+ * window) and `above-md` (md counts none) each say BOTH facts: there is no
+ * good copy to restore from on the array, and agreeing copies of bad bytes
+ * point above the disks. The wording is the operator's (approved 2026-11-14);
+ * the sentences after the second are shared, word for word.
+ */
+const NO_GOOD_COPY_SENTENCE = 'No copy on the array holds a good version of this block, '
+  + 'so the repair cannot fix it and running it again will not change that.'
+const CHECK_AND_RESTORE_SENTENCES = 'memory, the controller or software. Check those before trusting new writes. '
+  + 'The file is damaged at this block unless the checksum record is what is wrong. '
+  + 'Restore it from a backup if one exists. Nothing was written.'
+
 /**
  * The `array-rebuilds-rot` sentence (cr3 review item 1) — what was read, and
- * why a rerun cannot change it. The operator approves this wording.
+ * why a rerun cannot change it. `mdMismatch` is md's bounded-check count.
  */
-function arrayRebuildsRotSentence(file: string, block: number, shape: 'parity' | 'mirror', directDetail: string, mdDetail: string): string {
+function arrayRebuildsRotSentence(file: string, block: number, shape: 'parity' | 'mirror', directDetail: string, mdMismatch: number): string {
   const copies = shape === 'parity'
-    ? 'the parity reconstruction of this row gives back the same failing bytes'
-    : 'every mirror leg holds the same failing bytes'
-  return `${file} block ${block} fails its stored checksum, and ${copies} (${directDetail}), while ${mdDetail} elsewhere in its window. `
-    + 'The array holds no other copy of this block, so it cannot rebuild it, and running the repair again will not change that. '
-    + 'The file is damaged at this block unless the checksum record itself is what is wrong. '
-    + 'Restore the file from a backup if one exists. Nothing was written.'
+    ? `Rebuilding this row from parity gives the same failing bytes (${directDetail})`
+    : `Every mirror leg holds the same failing bytes (${directDetail})`
+  return `${file} block ${block} fails its stored checksum. `
+    + `${copies}, and md's check counts ${mdMismatch} mismatch(es) elsewhere in its window. `
+    + `${NO_GOOD_COPY_SENTENCE} `
+    + `Disks that agree on bytes that fail their checksum point to a cause above the disks: ${CHECK_AND_RESTORE_SENTENCES}`
+}
+
+/**
+ * The `above-md` sentence — md counts no mismatch AND the direct read says the
+ * copies agree (GT-23: only both readings together carry this verdict, so "no
+ * mismatch" is exactly what {@link parityAgreement} returned `consistent` on).
+ * `where` is the stripe number on a parity band, the md device on a mirror.
+ */
+function aboveMdSentence(file: string, block: number, shape: 'parity' | 'mirror', where: string, directDetail: string): string {
+  const reading = shape === 'parity'
+    ? `md's check over stripe ${where} counts no mismatch and ${directDetail}, so parity agrees with the bad bytes.`
+    : `md's check over ${where} counts no mismatch and ${directDetail}, so the mirror legs agree with each other and with the bad bytes.`
+  const cause = shape === 'parity'
+    ? 'Parity that agrees with bad data points to a cause above the disks: '
+    : 'Legs that agree on bad data point to a cause above the disks: '
+  return `${file} block ${block} fails its stored checksum. ${reading} ${NO_GOOD_COPY_SENTENCE} ${cause}${CHECK_AND_RESTORE_SENTENCES}`
 }
 
 /** What to say about the bad-blocked members — the operator's own sentence. */

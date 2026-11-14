@@ -227,7 +227,7 @@ describe('AHR repair job — the one notification', () => {
     assert.match(notify.body, /\/a\.bin: 2 repaired/)
     // Nothing to act on, so neither piece of advice appears.
     assert.doesNotMatch(notify.body, /restore this file from backup/)
-    assert.doesNotMatch(notify.body, /implicates something other than the disks/)
+    assert.doesNotMatch(notify.body, /cause above the disks/)
   })
 
   it('anything unrepairable or above md notifies at warning, in the epic\'s words', async () => {
@@ -248,10 +248,55 @@ describe('AHR repair job — the one notification', () => {
     )
     const notify = notification(exec)!
     assert.equal(notify.severity, 'warning')
-    assert.match(notify.body, /restore this file from backup/)
-    assert.match(notify.body, /parity already agreed with the bad data. This implicates something other than the disks \(memory, controller, software\)/)
+    assert.match(notify.body, /\/a\.bin: restore this file from backup/)
+    // cr3.sentences: the above-md file is on the restore list, with "if one
+    // exists", and the cause above the disks is said for the job.
+    assert.match(notify.body, /\/b\.bin: every copy the array holds of this block gives the same failing bytes, .*restore this file from a backup if one exists/)
+    assert.match(notify.body, /Every copy the array holds of 1 block\(s\) gives the same bytes, and those bytes fail the stored checksum\. Nothing was written to them\. Disks that agree on bytes that fail their checksum point to a cause above the disks: memory, the controller or software\. Check those before trusting new writes\./)
     // An implication, never a certainty.
     assert.doesNotMatch(notify.body, /proves|definitely/)
+  })
+
+  it('cr3.sentences: an above-md block is on the restore list, "if one exists", and nothing beside it says not to restore', async () => {
+    const exec = executor()
+    const result = await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/b.bin', blocks: [7] }],
+      () => {},
+      { repair: async (_e, req) => outcome(req.file, req.block, 'above-md', 'the per-block sentence') },
+    )
+    assert.equal(result.aboveMd, 1)
+    assert.equal(result.unrepairable, 0)
+    const notify = notification(exec)!
+    assert.equal(notify.severity, 'warning')
+    assert.equal(notify.title, 'AHR repair from parity left blocks unrepaired')
+    assert.ok(notify.body.includes('Above-md blocks have no source of truth left below the checksum tree. What to restore, per file:\n'
+      + '  /b.bin: every copy the array holds of this block gives the same failing bytes, so the repair cannot fix it and '
+      + 'running it again will not change that. The file is damaged at this block unless the checksum record is what is wrong: '
+      + 'restore this file from a backup if one exists'), notify.body)
+    assert.match(notify.body, /point to a cause above the disks: memory, the controller or software/)
+    assert.doesNotMatch(notify.body, /reason to restore|need no restore|Unrepairable blocks/, notify.body)
+  })
+
+  it('cr3.sentences: an above-md block of a LUN image gets the LUN restore sentence, "if one exists"', async () => {
+    const LUN = `${MOUNTPOINT}/lun-images/win.lun`
+    const exec = executor()
+    await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: LUN, blocks: [4] }],
+      () => {},
+      {
+        repair: async (_e, req) => outcome(req.file, req.block, 'above-md', 'the per-block sentence'),
+        lunHeld: async path => path === LUN
+          ? { targetIqn: 'iqn.2026-01.org.anas:storage.tank', index: 3, name: 'win-lun-3', backingPath: LUN, connectedInitiators: [], detail: 'held' }
+          : null,
+      },
+    )
+    const notify = notification(exec)!
+    assert.match(notify.body, /this block backs iSCSI LUN iqn\.2026-01\.org\.anas:storage\.tank\/3\. Restore the LUN image from a PBS backup \(Backup → Restore as new LUN\) or the guest's own backup, if one exists: every copy the array holds of this block gives the same failing bytes/)
+    assert.doesNotMatch(notify.body, /restore this file from/)
   })
 
   it('a mapping-abort is never told to restore from backup — it means the block is FINE (selfheal.7 F2, R9)', async () => {

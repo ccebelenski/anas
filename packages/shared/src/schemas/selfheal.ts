@@ -27,8 +27,10 @@ import { AbsolutePath } from './common.js'
  *   a post-check that did not come back clean). Restore from backup.
  * - `above-md` — the stripe's parity AGREES with the bad data, so the
  *   corruption did not arrive from a disk. Nothing is written. The wording is
- *   deliberately "implicates something other than the disks", never a
- *   certainty: md only reports that parity and data are consistent.
+ *   deliberately "points to a cause above the disks", never a certainty: md
+ *   only reports that parity and data are consistent. No copy on the array
+ *   holds a good version, so the file is restored from a backup if one exists
+ *   (cr3.sentences: the same advice `array-rebuilds-rot` gets).
  * - `mapping-abort` — the bytes at the computed member location were READ and
  *   still pass their stored csum. Either the mapping is wrong or the block was
  *   already repaired; either way the engine refuses to write. "Not corrupt
@@ -484,7 +486,8 @@ export type AhrRepairFileOutcome = z.infer<typeof AhrRepairFileOutcome>
  *    block (two bad blocks in one stripe, an extent with no csum at all, a
  *    post-check whose cold read did not come back clean). Restore the file from
  *    backup.
- *  - `aboveMd` — parity already agreed with the bad data. Nothing was written.
+ *  - `aboveMd` — parity already agreed with the bad data. Nothing was written;
+ *    restore the file from a backup if one exists.
  *  - `mappingAbort` — the block was NOT CORRUPT AT THE MAPPED LOCATION: the
  *    bytes there were READ and still pass their stored csum, so the engine
  *    refused to write. Nothing was written, nothing to restore — the finding no

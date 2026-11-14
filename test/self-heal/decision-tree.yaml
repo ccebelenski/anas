@@ -1127,7 +1127,7 @@ nodes:
     next: [E04f1, E04f2]
   - id: E04f1
     kind: decision
-    label: 'mismatch_cnt = 0 AND a direct read of the legs at their own offsets shows every leg holding the same bytes: the legs AGREE and are both wrong - `above-md`, the same diagnosis a parity band gets from the same fault, in the same words. Parallel construction: one fault, one reading, on both band types'
+    label: 'mismatch_cnt = 0 AND a direct read of the legs at their own offsets shows every leg holding the same bytes: the legs AGREE and are both wrong - `above-md`, the same diagnosis a parity band gets from the same fault. Parallel construction: one fault, one reading, on both band types. The sentence carries both facts (cr3.sentences): no copy on the array holds a good version, so restore the file from a backup if one exists; legs that agree on bad data point to a cause above the disks (memory, the controller or software), checked before trusting new writes. Nothing written'
     code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 — the legs AGREE and are both wrong: ABOVE MD'
     gt: GT-16
@@ -1148,7 +1148,7 @@ nodes:
     next: [J40]
   - id: E04f4
     kind: refusal
-    label: 'mismatch_cnt > 0 while every leg holds the SAME failing bytes: `unrepairable` / `array-rebuilds-rot` - every copy the array holds of the block gives the same failing bytes, so the array cannot rebuild it and a rerun will not change that; the file is damaged unless the checksum record is what is wrong: restore it from a backup if one exists. Nothing written, and NEVER `above-md` (which md''s own count denies)'
+    label: 'mismatch_cnt > 0 while every leg holds the SAME failing bytes: `unrepairable` / `array-rebuilds-rot` - no copy on the array holds a good version, so the repair cannot fix it and a rerun will not change that; disks that agree on bytes that fail their checksum point to a cause above the disks (memory, the controller or software), checked before trusting new writes; the file is damaged unless the checksum record is what is wrong: restore it from a backup if one exists. Nothing written, and NEVER `above-md` (which md''s own count denies)'
     code: 'packages/daemon/src/services/selfheal-repair.ts:arrayRebuildsRotSentence'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 over legs that hold the SAME bytes: md and the direct read disagree (GT-23)'
     gt: GT-23
@@ -1183,14 +1183,14 @@ nodes:
     next: [E06]
   - id: E05b
     kind: decision
-    label: 'mismatch_cnt = 0 AND the direct member read says the parity group agrees with itself, while the block fails its stored csum: `above-md` — parity agrees with the bad data, which implicates something other than the disks. Nothing written.'
+    label: 'mismatch_cnt = 0 AND the direct member read says the parity group agrees with itself, while the block fails its stored csum: `above-md` — parity agrees with the bad bytes, so no copy on the array holds a good version and the repair cannot fix it; parity that agrees with bad data points to a cause above the disks (memory, the controller or software), checked before trusting new writes; the file is damaged unless the checksum record is what is wrong: restore it from a backup if one exists (cr3.sentences). Nothing written.'
     code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when parity agrees with the bad data'
     gt: GT-6
     next: [J43]
   - id: E05e
     kind: refusal
-    label: 'md counts the stripe while the direct member read says the row agrees with itself: `unrepairable` / `array-rebuilds-rot` - the parity reconstruction of the row gives back the same failing bytes, so the array cannot rebuild the block and a rerun will not change that; restore the file from a backup if one exists. Nothing written, and NEVER `above-md` (which md''s own count denies)'
+    label: 'md counts the stripe while the direct member read says the row agrees with itself: `unrepairable` / `array-rebuilds-rot` - rebuilding the row from parity gives the same failing bytes, so no copy on the array holds a good version and a rerun will not change that; disks that agree on bytes that fail their checksum point to a cause above the disks (memory, the controller or software), checked before trusting new writes; restore the file from a backup if one exists. Nothing written, and NEVER `above-md` (which md''s own count denies)'
     code: 'packages/daemon/src/services/selfheal-repair.ts:arrayRebuildsRotSentence'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES when md counts the stripe and the member rows agree — never above-md'
     gt: GT-23
@@ -1438,7 +1438,7 @@ nodes:
     next: [J47, J53]
   - id: J40
     kind: refusal
-    label: 'the `unrepairable` bucket, advised per file: "restore this file from backup"; a file whose unrepairable blocks are ALL `array-rebuilds-rot` gets the cause ("every copy the array holds of this block gives the same failing bytes, so the array cannot rebuild it and running the repair again will not change that. The file is damaged at this block unless the checksum record itself is what is wrong") and "restore this file from a backup if one exists"; a LUN image gets the LUN restore sentence plus ", if one exists: <cause>"'
+    label: 'the restore list, advised per file: the `unrepairable` bucket and (cr3.sentences) every `above-md` block. "restore this file from backup"; a file whose restore-list blocks are ALL `array-rebuilds-rot` or `above-md` gets the cause ("every copy the array holds of this block gives the same failing bytes, so the repair cannot fix it and running it again will not change that. The file is damaged at this block unless the checksum record is what is wrong") and "restore this file from a backup if one exists"; a LUN image gets the LUN restore sentence plus ", if one exists: <cause>". The job says once, for every such block, that disks agreeing on bytes that fail their checksum point to a cause above the disks: memory, the controller or software'
     action: restore-from-backup-advice
     code: 'packages/daemon/src/services/ahr-repair.ts:RESTORE_FILE_SENTENCE'
     test: "packages/daemon/src/services/__tests__/ahr-repair.test.ts:anything unrepairable or above md notifies at warning, in the epic's words"
@@ -1461,11 +1461,11 @@ nodes:
     next: [J50]
   - id: J43
     kind: decision
-    label: 'the `above-md` bucket: "parity already agreed with the bad data — this implicates something other than the disks (memory, controller, software)", which stays an implication'
-    code: 'packages/daemon/src/services/ahr-repair.ts:ABOVE_MD_SENTENCE'
-    test: "packages/daemon/src/services/__tests__/ahr-repair.test.ts:anything unrepairable or above md notifies at warning, in the epic's words"
+    label: 'the `above-md` count: its blocks go on the restore list with "if one exists" (cr3.sentences: the same evidence and advice as `array-rebuilds-rot`), and the job says "disks that agree on bytes that fail their checksum point to a cause above the disks: memory, the controller or software. Check those before trusting new writes", which stays an implication'
+    code: 'packages/daemon/src/services/ahr-repair.ts:ABOVE_DISKS_SENTENCE'
+    test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:cr3.sentences: an above-md block is on the restore list, "if one exists", and nothing beside it says not to restore'
     gt: GT-6
-    next: [J50]
+    next: [J40]
   - id: J44
     kind: refusal
     label: 'ForeignSyncOpError before the write, at the job level: `not-examined` / `run-stopped`, "array state changed mid-repair", with the operation named - never `unrepairable`'

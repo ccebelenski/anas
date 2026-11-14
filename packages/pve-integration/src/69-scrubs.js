@@ -150,6 +150,8 @@
     var NO_CHECKSUM = 'no-checksum';
     // `array-rebuilds-rot`: an unrepairable block every copy in the array
     // gives back as the same failing bytes. Restore, and the daemon says why.
+    // An `above-md` block rests on the same evidence and gets the same
+    // treatment (cr3.sentences): on the restore list, in the daemon's words.
     var ARRAY_REBUILDS_ROT = 'array-rebuilds-rot';
     // `scrub-unproven`: Rewrite parity / Reconcile mirror refused because the
     // checksum pass they stand on delivered no verdict.
@@ -1570,10 +1572,10 @@
             + ' (' + t('of') + ' ' + Number(res.blocks || 0) + ' ' + t('4 KiB block(s)') + ')';
         var lines = [enc(counts)];
         // Each bucket reads its own count (review R9): "restore from backup"
-        // rides only the TRUE unrepairable. A mapping-abort block was never
-        // corrupt at the mapped location — the engine wrote nothing, and the
-        // advice is the opposite of a restore.
-        if (Number(res.unrepairable || 0) > 0) {
+        // rides only the TRUE unrepairable and (cr3.sentences) above md. A
+        // mapping-abort block was never corrupt at the mapped location — the
+        // engine wrote nothing, and the advice is the opposite of a restore.
+        if (Number(res.unrepairable || 0) > 0 || Number(res.aboveMd || 0) > 0) {
             // D3/D10 — the advice splits on the engine's reason CODE, not on
             // the reason text: a file whose unrepairable blocks ALL read
             // `csum-unreadable` had nothing to arbitrate against yet (the
@@ -1586,7 +1588,10 @@
             var sawRunStopped = false;
             // cr3.followup: the daemon's own sentence for each block the array
             // rebuilds as the same failing bytes: it says why the restore.
+            // cr3.sentences: an above-md block's sentence rides here too, and
+            // such a block needs no generic "Unrepairable:" line beside it.
             var rotReasons = [];
+            var plainRestore = 0;
             for (var f = 0; f < files.length; f++) {
                 var bad = [];
                 var fb = files[f].blocks || [];
@@ -1597,10 +1602,12 @@
                     // whatever bucket it arrived in.
                     if (fb[b].outcome === 'unrepairable' && NOT_EXAMINED_CODES[fb[b].reasonCode] === true) {
                         sawRunStopped = true;
-                    } else if (fb[b].outcome === 'unrepairable') {
+                    } else if (fb[b].outcome === 'unrepairable' || fb[b].outcome === 'above-md') {
                         bad.push(fb[b]);
-                        if (fb[b].reasonCode === ARRAY_REBUILDS_ROT && fb[b].reason) {
+                        if ((fb[b].outcome === 'above-md' || fb[b].reasonCode === ARRAY_REBUILDS_ROT) && fb[b].reason) {
                             rotReasons.push(String(fb[b].reason));
+                        } else if (fb[b].reasonCode !== CSUM_UNREADABLE) {
+                            plainRestore += 1;
                         }
                     }
                 }
@@ -1622,7 +1629,10 @@
             }
             // A result without per-block detail keeps the count's advice, as
             // before — unless a run-stopped block shows the count is not proof.
-            if (restoreFiles > 0 || (!csumFiles.length && !sawRunStopped)) {
+            // A file whose restore blocks all carry the daemon's own sentence
+            // (array-rebuilds-rot, above md) is advised by that sentence alone.
+            if (plainRestore > 0 || (Number(res.unrepairable || 0) > 0 && !restoreFiles
+                && !rotReasons.length && !csumFiles.length && !sawRunStopped)) {
                 lines.push(enc(t('Unrepairable: nothing below the checksum tree can be proven right for '
                     + 'those blocks. Restore this file from backup.')));
             }
@@ -1682,10 +1692,6 @@
                     + 'not be confirmed: the bytes, checked against the stored checksum, may or may not have landed. '
                     + 'The next scrub decides: a block it still names is repaired again. This is not a reason to restore.')));
             }
-        }
-        if (Number(res.aboveMd || 0) > 0) {
-            lines.push(enc(t('Above md: parity already agreed with the bad data. This implicates '
-                + 'something other than the disks (memory, controller, software). Nothing was written.')));
         }
         // cr3.followup: blocks written with bytes proven against their stored
         // checksum whose confirmation after the write (post-check, cold read)

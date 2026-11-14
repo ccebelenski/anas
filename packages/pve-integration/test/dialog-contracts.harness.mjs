@@ -9737,7 +9737,7 @@ async function repairFromParityChecks() {
       { path: FINDING_A.path, blocks: [{ block: 300, outcome: 'repaired', reason: 'reconstructed from parity' }] },
       { path: FINDING_D.path, blocks: [
         { block: 12, outcome: 'unrepairable', reason: 'two bad blocks in one stripe' },
-        { block: 13, outcome: 'above-md', reason: 'parity agrees with the bad data' },
+        { block: 13, outcome: 'above-md', reason: 'block 13 fails its stored checksum. Parity that agrees with bad data points to a cause above the disks: memory, the controller or software. Restore it from a backup if one exists. Nothing was written.' },
       ] },
     ],
     repaired: 1,
@@ -9749,8 +9749,10 @@ async function repairFromParityChecks() {
   eq('repair: the result appears in the window the request was made from', panel.hidden, false)
   ok('repair: the three buckets are counted', /1 repaired · 1 unrepairable · 1 above md/.test(panel.html), panel.html)
   ok('repair: unrepairable says restore from backup', /Restore this file from backup/.test(panel.html), panel.html)
-  ok('repair: above md implicates something other than the disks, as an implication',
-    /implicates something other than the disks/.test(panel.html) && !/proves/.test(panel.html), panel.html)
+  // cr3.sentences: the panel shows the daemon's own above-md sentence (no copy
+  // of its own), and it is an implication, never a proof.
+  ok('repair: above md says the daemon\'s sentence, a cause above the disks, as an implication',
+    /points to a cause above the disks/.test(panel.html) && /Restore it from a backup if one exists/.test(panel.html) && !/proves/.test(panel.html), panel.html)
   ok('repair: a repaired file carries its verdict on its own row', /repaired/.test(repairCell(0)), repairCell(0))
   ok('repair: a mixed file says BOTH of its outcomes',
     /1 unrepairable/.test(repairCell(3)) && /1 above-md/.test(repairCell(3)), repairCell(3))

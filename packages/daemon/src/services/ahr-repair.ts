@@ -74,9 +74,15 @@ export interface AhrRepairOptions {
 /** Files listed in the notification body before it says "…and N more". */
 const NOTIFY_FILE_LIMIT = 20
 
-/** Above-md wording — an implication, never a certainty (GT-5/GT-6). */
-const ABOVE_MD_SENTENCE = 'parity already agreed with the bad data. This implicates something '
-  + 'other than the disks (memory, controller, software)'
+/**
+ * The cause above the disks (GT-5/GT-6), said once per job for every block
+ * whose copies on the array all agree on bytes that fail their checksum —
+ * `above-md` and `array-rebuilds-rot` alike (cr3.sentences: the two verdicts
+ * rest on the same evidence, and each block's own sentence carries this too).
+ * "Point to", never a certainty: md only reports that the copies agree.
+ */
+const ABOVE_DISKS_SENTENCE = 'Disks that agree on bytes that fail their checksum point to a cause above the disks: '
+  + 'memory, the controller or software. Check those before trusting new writes.'
 
 /**
  * Unrepairable wording (design review 2026-09-14, D10) — there is one action
@@ -96,14 +102,15 @@ const CSUM_UNREADABLE_SENTENCE = 'the file\'s checksum could not be read reliabl
   + 'Re-scrub after the metadata is repaired. A btrfs scrub repairs metadata copies'
 
 /**
- * `array-rebuilds-rot` (cr3 review item 1): the block was read, fails its
- * checksum, and every copy the array holds of it gives the same bytes. A
- * restore IS the advice — with the reason, and "if one exists", because a
- * rerun cannot change it and the checksum record itself may be what is wrong.
+ * `array-rebuilds-rot` (cr3 review item 1) and `above-md` (cr3.sentences): the
+ * block was read, fails its checksum, and every copy the array holds of it
+ * gives the same bytes. A restore IS the advice — with the reason, and "if one
+ * exists", because a rerun cannot change it and the checksum record itself may
+ * be what is wrong. The clauses are the per-block sentence's own.
  */
 const ARRAY_REBUILDS_ROT_CAUSE = 'every copy the array holds of this block gives the same failing bytes, '
-  + 'so the array cannot rebuild it and running the repair again will not change that. '
-  + 'The file is damaged at this block unless the checksum record itself is what is wrong'
+  + 'so the repair cannot fix it and running it again will not change that. '
+  + 'The file is damaged at this block unless the checksum record is what is wrong'
 const ARRAY_REBUILDS_ROT_SENTENCE = `${ARRAY_REBUILDS_ROT_CAUSE}: restore this file from a backup if one exists`
 
 function lunRestoreSentence(held: IscsiHeldByLun): string {
@@ -230,7 +237,7 @@ function fileLine(file: AhrRepairFileOutcome): string {
 function repairBody(
   pool: string,
   result: AhrRepairResult,
-  unrepairableFiles: { path: string, advice: string }[],
+  restoreFiles: { path: string, advice: string }[],
   notExaminedFiles: { path: string, advice: string }[],
   unconfirmedFiles: { path: string, count: number }[] = [],
 ): string {
@@ -244,14 +251,17 @@ function repairBody(
     lines.push(`  …and ${result.files.length - NOTIFY_FILE_LIMIT} more`)
   const tail: string[] = []
   // Each bucket reads ITS OWN count (review R9) — "restore from backup" rides
-  // only the true `unrepairable`, never the mapping-aborts that mean the block
-  // was fine all along.
-  if (result.unrepairable > 0) {
-    const advice = unrepairableFiles.slice(0, NOTIFY_FILE_LIMIT)
+  // only the true `unrepairable` and (cr3.sentences) `above-md`, never the
+  // mapping-aborts that mean the block was fine all along.
+  if (restoreFiles.length > 0) {
+    const advice = restoreFiles.slice(0, NOTIFY_FILE_LIMIT)
       .map(f => `  ${f.path}: ${f.advice}`)
-    if (unrepairableFiles.length > NOTIFY_FILE_LIMIT)
-      advice.push(`  …and ${unrepairableFiles.length - NOTIFY_FILE_LIMIT} more`)
-    tail.push('Unrepairable blocks have no source of truth left below the checksum tree. '
+    if (restoreFiles.length > NOTIFY_FILE_LIMIT)
+      advice.push(`  …and ${restoreFiles.length - NOTIFY_FILE_LIMIT} more`)
+    const which = result.unrepairable > 0 && result.aboveMd > 0
+      ? 'Unrepairable and above-md blocks'
+      : result.aboveMd > 0 ? 'Above-md blocks' : 'Unrepairable blocks'
+    tail.push(`${which} have no source of truth left below the checksum tree. `
       + `What to restore, per file:\n${advice.join('\n')}`)
   }
   if (result.mappingAbort > 0)
@@ -269,8 +279,14 @@ function repairBody(
       : 'Blocks that could not be EXAMINED were not written, and nothing is known about their bytes. '
     }This is neither a clean bill of health nor a reason to restore:\n${advice.join('\n')}`)
   }
-  if (result.aboveMd > 0)
-    tail.push(`Blocks diagnosed above md were not written: ${ABOVE_MD_SENTENCE}.`)
+  // cr3.sentences: above md, or rebuilt by the array as the same failing
+  // bytes — the same evidence, so the same cause, said once for the job.
+  const agreeingBad = result.files.reduce((n, f) => n + f.blocks.filter(b => b.outcome === 'above-md'
+    || (b.outcome === 'unrepairable' && b.reasonCode === SELFHEAL_ARRAY_REBUILDS_ROT)).length, 0)
+  if (agreeingBad > 0) {
+    tail.push(`Every copy the array holds of ${agreeingBad} block(s) gives the same bytes, and those bytes fail `
+      + `the stored checksum. Nothing was written to them. ${ABOVE_DISKS_SENTENCE}`)
+  }
   // cr3 review item 5 — written with bytes proven against the stored
   // checksum, but the confirmation after the write never ran.
   if (unconfirmedFiles.length > 0) {
@@ -319,7 +335,7 @@ export async function repairAhrFiles(
   // metadata reads (selfheal.12) are counted in at the end.
   const startedAt = new Date()
   // The LUN lookup (D10). Only asked for files that actually came back
-  // unrepairable — the one bucket whose advice names a restore verb.
+  // unrepairable or above md — the buckets whose advice names a restore verb.
   const lunHeld = options?.lunHeld ?? (async (path: string): Promise<IscsiHeldByLun | null> => {
     try {
       return await heldByLunOnce(executor, { path })
@@ -331,7 +347,7 @@ export async function repairAhrFiles(
   const total = files.reduce((n, f) => n + f.blocks.length, 0)
   const outcomes: AhrRepairFileOutcome[] = []
   /** Per-file restore advice for the notification (D10), in request order. */
-  const unrepairableFiles: { path: string, advice: string }[] = []
+  const restoreFiles: { path: string, advice: string }[] = []
   /** Per-file "what could not be examined, and why" (seventh pass, F3). */
   const notExaminedFiles: { path: string, advice: string }[] = []
   /** Per-file count of blocks written whose confirmation never ran (cr3 review item 5). */
@@ -473,16 +489,19 @@ export async function repairAhrFiles(
       }
       notExaminedFiles.push({ path: file.path, advice: sentences.join(' ') })
     }
-    const unrepairableBlocks = blocks.filter(b => b.outcome === 'unrepairable')
-    if (unrepairableBlocks.length > 0) {
+    // cr3.sentences: an `above-md` block is on the restore list too. Every
+    // copy the array holds of it agrees on the failing bytes, exactly as with
+    // `array-rebuilds-rot`, so it takes that block's advice and its reason.
+    const restoreBlocks = blocks.filter(b => b.outcome === 'unrepairable' || b.outcome === 'above-md')
+    if (restoreBlocks.length > 0) {
       const held = await lunHeld(file.path)
-      const allCsumUnreadable = unrepairableBlocks
+      const allCsumUnreadable = restoreBlocks
         .every(b => b.reasonCode === SELFHEAL_CSUM_UNREADABLE)
-      // cr3 review item 1: every unrepairable block of the file is one the
-      // array rebuilds as the same failing bytes — the restore says why.
-      const allRebuildRot = unrepairableBlocks
-        .every(b => b.reasonCode === SELFHEAL_ARRAY_REBUILDS_ROT)
-      unrepairableFiles.push({
+      // cr3 review item 1: every restore-list block of the file is one the
+      // array gives back as the same failing bytes — the restore says why.
+      const allRebuildRot = restoreBlocks
+        .every(b => b.outcome === 'above-md' || b.reasonCode === SELFHEAL_ARRAY_REBUILDS_ROT)
+      restoreFiles.push({
         path: file.path,
         advice: allCsumUnreadable
           ? (held ? csumUnreadableLunSentence(held) : CSUM_UNREADABLE_SENTENCE)
@@ -548,7 +567,7 @@ export async function repairAhrFiles(
       : unrepaired === 0 && residuals.size === 0
         ? 'AHR repair from parity completed; re-scrub to confirm'
         : 'AHR repair from parity left blocks unrepaired',
-    repairBody(pool.name, result, unrepairableFiles, notExaminedFiles, unconfirmedFiles),
+    repairBody(pool.name, result, restoreFiles, notExaminedFiles, unconfirmedFiles),
   )
 
   return result

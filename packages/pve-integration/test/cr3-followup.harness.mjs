@@ -270,8 +270,23 @@ function panelWin(id) {
 
     // ---- (e) array-rebuilds-rot --------------------------------------------------
     const rot = repair([{ block: 9, outcome: 'unrepairable', reasonCode: 'array-rebuilds-rot', reason: `/f block 9 fails its stored checksum ${XSS}. Restore the file from a backup if one exists.` }], { unrepairable: 1 })
-    ok('(e) array-rebuilds-rot is on the restore list', /Restore this file from backup/.test(rot), rot)
+    // cr3.sentences: the daemon's sentence IS the restore advice ("if one
+    // exists"); the generic "Restore this file from backup" no longer rides
+    // beside it and contradicts it.
+    ok('(e) array-rebuilds-rot is on the restore list, in the daemon\'s words', /Restore the file from a backup if one exists/.test(rot) && !/Restore this file from backup/.test(rot), rot)
     ok('(e) ...with the daemon\'s sentence, encoded', /block 9 fails its stored checksum/.test(rot) && rot.includes(XSS_ENC) && !rot.includes('<img'), rot)
+    // ---- (e2) above-md, the same evidence (cr3.sentences) -------------------------
+    const amd = repair([{ block: 7, outcome: 'above-md', reason: `/f block 7 fails its stored checksum ${XSS}. Parity that agrees with bad data points to a cause above the disks: memory, the controller or software. Restore it from a backup if one exists. Nothing was written.` }], { aboveMd: 1 })
+    ok('(e2) above-md is on the restore list, in the daemon\'s words', /block 7 fails its stored checksum/.test(amd) && /Restore it from a backup if one exists/.test(amd), amd)
+    ok('(e2) ...encoded', amd.includes(XSS_ENC) && !amd.includes('<img'), amd)
+    ok('(e2) ...with no panel-side copy of the sentence and no "Unrepairable:" label', !/implicates|Above md:|Unrepairable:/.test(amd), amd)
+    const amdRot = repair([
+      { block: 7, outcome: 'above-md', reason: 'above-md sentence for 7' },
+      { block: 8, outcome: 'unrepairable', reasonCode: 'array-rebuilds-rot', reason: 'rot sentence for 8' },
+      { block: 9, outcome: 'unrepairable', reason: 'two bad blocks in one stripe' },
+    ], { aboveMd: 1, unrepairable: 2 })
+    ok('(e2) a mix: both daemon sentences, and the generic restore line for the plain unrepairable block',
+      /above-md sentence for 7/.test(amdRot) && /rot sentence for 8/.test(amdRot) && /Restore this file from backup/.test(amdRot), amdRot)
   }
 
   // ---- (f) scrub-unproven refusals; (g) writtenAt ---------------------------
