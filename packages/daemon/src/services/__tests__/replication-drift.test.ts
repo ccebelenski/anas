@@ -9,12 +9,14 @@ import {
   classifyTargetState,
   exposedSentence,
   formatSize,
+  judgeTargetState,
   modifiedSentence,
   nextIncrementalBase,
   parsePropertyRows,
   parseWrittenValue,
   readBaseHeld,
   readTargetState,
+  sealTarget,
   snapshotHeldBy,
   snapshotHoldTags,
   targetStateArgs,
@@ -210,8 +212,8 @@ describe('repl.drift sentences', () => {
     }
   })
 
-  it('the exposed sentence, nothing received: not read-only, the next send seals it, the way back now, that it undoes nothing, and the promoted-copy case', () => {
-    assert.equal(exposedSentence({ target: 'backup/data', where: ' on remote \'nas1\'', base: 'S1', readonly: 'off', readonlySource: 'local' }), 'Target \'backup/data\' on remote \'nas1\' is not read-only (readonly=off, local): replication into it keeps working only while nothing touches it, and with access-time updates on, even reading a file there counts as a change. The next send sets it read-only again; \'zfs set readonly=on backup/data\' on the target does it now, and neither undoes a change already made. A replication task keeps its target read-only: to use this copy as a live dataset, remove the replication task into it.')
+  it('the exposed sentence, nothing received: not read-only, the next run that completes seals it (behind or up to date), the way back now, that it undoes nothing, and the promoted-copy case', () => {
+    assert.equal(exposedSentence({ target: 'backup/data', where: ' on remote \'nas1\'', base: 'S1', readonly: 'off', readonlySource: 'local' }), 'Target \'backup/data\' on remote \'nas1\' is not read-only (readonly=off, local): a write there, or a read with access-time updates on, stops the next send. The next replication run that completes sets it read-only again: its receive does when the copy is behind, and the run itself when the copy is up to date. \'zfs set readonly=on backup/data\' on the target does it now, and neither undoes a change already made. A replication task keeps its target read-only: to use this copy as a live dataset, remove the replication task into it.')
   })
 
   it('the exposed sentence when this run\'s receive sealed it (ruling 1)', () => {
@@ -264,6 +266,39 @@ describe('repl.drift check: the whole detection for one dataset', () => {
     assert.equal(await snapshotHeldBy(async () => ({ stdout: '', stderr: 'x', exitCode: 1 }), 'a@b', 'tag'), null)
     assert.equal(await snapshotHeldBy(async () => ok('a@b\ttag\tMon Jul 13 10:00 2026\n'), 'a@b', 'tag'), true)
     assert.equal(await snapshotHeldBy(async () => ok('a@b\tother\tMon Jul 13 10:00 2026\n'), 'a@b', 'tag'), false)
+  })
+})
+
+// Review P3: the run's own set of an up-to-date exposed target.
+describe('repl.drift review P3 — setting a target read-only', () => {
+  it('the argv, an answer that failed, and a set that threw: never a throw, always a reason', async () => {
+    const seen: string[][] = []
+    assert.deepEqual(await sealTarget(async (args) => {
+      seen.push(args)
+      return ok('')
+    }, 'backup/data'), { ok: true })
+    assert.deepEqual(seen, [['set', '--', 'readonly=on', 'backup/data']])
+    assert.deepEqual(await sealTarget(async () => ({ stdout: '', stderr: 'cannot set property for \'backup/data\': permission denied\n', exitCode: 1 }), 'backup/data'), { ok: false, reason: 'cannot set property for \'backup/data\': permission denied' })
+    assert.deepEqual(await sealTarget(async () => {
+      throw new Error('zfs set: had not answered after 30 s')
+    }, 'backup/data'), { ok: false, reason: 'zfs set: had not answered after 30 s' })
+  })
+
+  it('judgeTargetState asks the set only for an up-to-date exposed target', async () => {
+    let asked = 0
+    const seal = async () => {
+      asked++
+      return { ok: true as const }
+    }
+    const input = { target: 'backup/data', where: '', base: 'S1', targetSnaps: ['S1'], seal }
+    await judgeTargetState({ ok: true, written: 0, readonly: 'off', readonlySource: 'local' }, { ...input, sends: true })
+    await judgeTargetState({ ok: true, written: 12288, readonly: 'off' }, input)
+    await judgeTargetState({ ok: false, reason: 'x' }, input)
+    await judgeTargetState({ ok: true, written: 0, readonly: 'on' }, input)
+    assert.equal(asked, 0)
+    const d = await judgeTargetState({ ok: true, written: 0, readonly: 'off', readonlySource: 'local' }, input)
+    assert.equal(asked, 1)
+    assert.equal(d.message, 'Target \'backup/data\' was not read-only (readonly=off, local); this run set it read-only on \'backup/data\' itself (\'zfs set readonly=on backup/data\'); datasets below it that inherit the property are read-only too. A replication task keeps its target read-only: to use this copy as a live dataset, remove the replication task into it.')
   })
 })
 

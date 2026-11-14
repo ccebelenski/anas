@@ -219,6 +219,60 @@ describe('repl.drift — recursive runs', () => {
     assert.equal(notifications().length, 1)
   })
 
+  // Review P3 (proposed; its own commit): a copy already at S and not
+  // read-only receives nothing, so the run sets it read-only itself, once
+  // every refusal is behind it.
+  const VOL_AT_S2 = `datapool/rrdst/vol@${S2}\t1794618284\t6649807706641108662\n`
+  it('an up-to-date child that is not read-only is SET read-only by the run (after the gate), said once, nothing recorded', async () => {
+    targetReads({ extraSnaps: VOL_AT_S2, edit: w => w.replace('datapool/rrdst/vol\treadonly\ton', 'datapool/rrdst/vol\treadonly\toff') })
+    const res = await post()
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const sets = mock.calls.filter(c => c.command === ZFS && c.args[0] === 'set')
+    assert.deepEqual(sets.map(c => c.args), [['set', '--', 'readonly=on', 'datapool/rrdst/vol']])
+    const result = job.result as { warnings?: string[], targetDrift?: unknown, upToDate?: string[] }
+    assert.deepEqual(result.upToDate, ['rpool/rrsrc/vol'])
+    assert.deepEqual((result.warnings ?? []).filter(w => w.includes('read-only')), ['Target \'datapool/rrdst/vol\' was not read-only (readonly=off); this run set it read-only on \'datapool/rrdst/vol\' itself (\'zfs set readonly=on datapool/rrdst/vol\'); datasets below it that inherit the property are read-only too. A replication task keeps its target read-only: to use this copy as a live dataset, remove the replication task into it.'])
+    assert.equal(result.targetDrift, undefined)
+    assert.equal(notifications().length, 1)
+  })
+
+  // Review 2, defect 2 (t/review2/p1.out, last scenario): a run that set a
+  // copy read-only and then failed at a later send said only what it sent.
+  it('a run that set an up-to-date copy read-only and then FAILED at a later send names the set copy in its failure and its notification', async () => {
+    targetReads({ extraSnaps: VOL_AT_S2, edit: w => w.replace('datapool/rrdst/vol\treadonly\ton', 'datapool/rrdst/vol\treadonly\toff') })
+    mock.addPipelineFixture({ cmd1: ZFS, args1: ['send', '-i', `@${S1}`, '--', `rpool/rrsrc/a/deep@${S2}`], cmd2: ZFS, result: { leftExitCode: 0, rightExitCode: 1, leftStderr: '', rightStderr: 'cannot receive incremental stream: probe failure', stdout: '' } })
+    const res = await post()
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.deepEqual(mock.calls.filter(c => c.command === ZFS && c.args[0] === 'set').map(c => c.args), [['set', '--', 'readonly=on', 'datapool/rrdst/vol']])
+    const sentence = 'Replication failed at \'rpool/rrsrc/a/deep\' — recv: cannot receive incremental stream: probe failure; already sent this run: rpool/rrsrc, rpool/rrsrc/a; set read-only this run (up to date, nothing to send): datapool/rrdst/vol; the next run continues from each dataset\'s own base'
+    assert.equal(job.error?.message, sentence)
+    assert.equal(notifications().length, 1)
+    assert.ok(notifications()[0].args[4].includes(sentence), notifications()[0].args[4])
+  })
+
+  it('a run that set nothing read-only and failed: the failure sentence is as before', async () => {
+    targetReads()
+    mock.addPipelineFixture({ cmd1: ZFS, args1: ['send', '-i', `@${S1}`, '--', `rpool/rrsrc/a/deep@${S2}`], cmd2: ZFS, result: { leftExitCode: 0, rightExitCode: 1, leftStderr: '', rightStderr: 'cannot receive incremental stream: probe failure', stdout: '' } })
+    const res = await post()
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.error?.message, 'Replication failed at \'rpool/rrsrc/a/deep\' — recv: cannot receive incremental stream: probe failure; already sent this run: rpool/rrsrc, rpool/rrsrc/a; the next run continues from each dataset\'s own base')
+  })
+
+  it('a changed child elsewhere in the tree refuses the run BEFORE any set (no act after a refusal)', async () => {
+    targetReads({
+      extraSnaps: VOL_AT_S2,
+      edit: w => w.replace('datapool/rrdst/vol\treadonly\ton', 'datapool/rrdst/vol\treadonly\toff').replace('datapool/rrdst/a\twritten\t0', `datapool/rrdst/a\twritten\t${DRIFT_WRITE}`),
+    })
+    const res = await post()
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.deepEqual(mock.calls.filter(c => c.command === ZFS && c.args[0] === 'set'), [])
+  })
+
   it('every receive, first or incremental, the root\'s and each child\'s, passes -o readonly=on (ruling 1)', async () => {
     targetReads()
     const res = await post()

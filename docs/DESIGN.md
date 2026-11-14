@@ -365,7 +365,7 @@ A recursive dataset destroy and a forced rollback whose sweep includes a held sn
 | State | Read | A run with something to send | A run that is up to date |
 |-------|------|------------------------------|--------------------------|
 | `clean` | `written@<base>` = 0, `readonly` on | sends | settles holds, nothing said |
-| `exposed` | 0, `readonly` off | sends; warning that the receive set it read-only again | warning; recorded in the result |
+| `exposed` | 0, `readonly` off | sends; warning that the receive set it read-only again | the run sets it read-only itself (`zfs set -- readonly=on <target>`, over ssh for a peer or remote; in a recursive run after every refusal and before the first send), warns once and records nothing; if the set fails the warning says so and the state stays recorded |
 | `modified` | > 0 | refused before any snapshot, hold or send; the job fails and records it | completes with the warning; notified at error severity (`completed, target changed`) |
 | `unknown` | the read failed, timed out or did not parse | sends, with a note that ZFS refuses it if the target was changed | note only |
 
