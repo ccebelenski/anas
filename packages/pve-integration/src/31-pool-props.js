@@ -131,6 +131,9 @@
 
     // ---- Pool property edit -----------------------------------------------
 
+    // The shared PoolProperties.failmode values.
+    var FAILMODES = { wait: true, continue: true, panic: true };
+
     // Editable pool properties. ashift is creation-only and is shown read-only
     // for context (the daemon rejects any attempt to change it).
     function editableFields() {
@@ -184,7 +187,9 @@
 
         ANAS.editWindow({
             cls: 'anas-win-modify',
-            title: ANAS.t('Edit Pool') + ': ' + poolName,
+            // editWindow passes the title through ANAS.t only; a window title
+            // is HTML and the name is data (cr3, POOLS-PANEL-L8).
+            title: ANAS.t('Edit Pool') + ': ' + ANAS.enc(poolName),
             submitText: 'Save',
             submitCls: 'anas-btn-modify-submit',
             width: 480,
@@ -197,11 +202,19 @@
                 }
                 ANAS.api.get(node, '/pools/' + encodeURIComponent(poolName)).then(function (res) {
                     var p = (res && res.data && res.data.properties) || {};
+                    // cr3: the form shows the pool's REAL values or does not
+                    // open. A property the answer did not carry used to show
+                    // as "off" / "wait" — a fallback read as the pool's state.
+                    if (typeof p.autoexpand !== 'boolean' || typeof p.autoreplace !== 'boolean'
+                        || typeof p.autotrim !== 'boolean' || !FAILMODES.hasOwnProperty(p.failmode)) {
+                        done(ANAS.t('The pool properties could not be read; nothing can be edited until they are.'));
+                        return;
+                    }
                     original = {
-                        autoexpand: !!p.autoexpand,
-                        autoreplace: !!p.autoreplace,
-                        autotrim: !!p.autotrim,
-                        failmode: p.failmode || 'wait',
+                        autoexpand: p.autoexpand,
+                        autoreplace: p.autoreplace,
+                        autotrim: p.autotrim,
+                        failmode: p.failmode,
                     };
                     form.setValues({
                         ashift: (p.ashift === undefined || p.ashift === null) ? '—' : p.ashift,

@@ -71,10 +71,16 @@
     // failed (smartHealthy === false) and 'unknown' for disks not in any pool.
     // PoolDetail carries neither SMART nor out-of-pool disks, so those branches
     // do not apply here — every topology disk is a live pool member.
+    // An error counter as read, or null when the record does not carry it
+    // (cr3: absent is unknown, never 0).
+    function errCounter(v) {
+        return (typeof v === 'number' && isFinite(v)) ? v : null;
+    }
+
     function diskHealthLevel(state, read, write, cksum) {
-        var r = Number(read) || 0;
-        var w = Number(write) || 0;
-        var c = Number(cksum) || 0;
+        var r = errCounter(read);
+        var w = errCounter(write);
+        var c = errCounter(cksum);
         if (state === 'FAULTED' || state === 'UNAVAIL' || state === 'REMOVED'
             || r > 0 || w > 0) {
             return 'critical';
@@ -82,19 +88,29 @@
         if (state === 'OFFLINE' || state === 'DEGRADED' || c > 0) {
             return 'warning';
         }
-        return 'healthy';
+        // cr3: healthy only for a state that says so (a spare reads AVAIL or
+        // INUSE) AND all three counters read as zero; an absent or
+        // unrecognised state, or an absent counter, is 'unknown', never a
+        // healthy default.
+        if ((state === 'ONLINE' || state === 'AVAIL' || state === 'INUSE')
+            && r === 0 && w === 0 && c === 0) {
+            return 'healthy';
+        }
+        return 'unknown';
     }
 
     var HEALTH_LABELS = {
         healthy: 'Healthy',
         warning: 'Warning',
         critical: 'Critical',
+        unknown: 'Unknown',
     };
 
     var HEALTH_ICONS = {
         healthy: 'check-circle',
         warning: 'exclamation-circle',
         critical: 'times-circle',
+        unknown: 'question-circle',
     };
 
     // Colored dot + label for the topology Health column. Carries the
@@ -193,7 +209,9 @@
         if (level === 'warning') {
             return 'degraded';
         }
-        return 'online';
+        // cr3: the green tick only for a derived 'healthy'; an unknown level
+        // (or a derivation that threw) draws no status dot.
+        return level === 'healthy' ? 'online' : undefined;
     }
 
     // by-id identifiers can be long (scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1). Keep a
@@ -210,11 +228,13 @@
     // secondary descriptor is the live signal: a compact error summary when any
     // counter is nonzero, otherwise the raw ZFS state (lowercased).
     function diskSub(disk) {
-        var r = Number(disk.readErrors) || 0;
-        var w = Number(disk.writeErrors) || 0;
-        var c = Number(disk.checksumErrors) || 0;
-        if (r || w || c) {
-            return 'R:' + r + ' W:' + w + ' C:' + c;
+        var r = errCounter(disk.readErrors);
+        var w = errCounter(disk.writeErrors);
+        var c = errCounter(disk.checksumErrors);
+        // A counter the record does not carry shows '?' (cr3), never a 0.
+        if (r !== 0 || w !== 0 || c !== 0) {
+            return 'R:' + (r === null ? '?' : r) + ' W:' + (w === null ? '?' : w)
+                + ' C:' + (c === null ? '?' : c);
         }
         return ('' + (disk.state || '')).toLowerCase();
     }
@@ -234,6 +254,18 @@
             // fall through
         }
         return ANAS.renderState(value);
+    }
+
+    // A grid renderer that shows a muted dash for a value the row does not
+    // carry (cr3: unknown, never 0 B / 0%), else `fn(value)`.
+    var UNKNOWN_CELL = '<span class="anas-cell-unknown" style="color:gray;">—</span>';
+    function renderKnown(fn) {
+        return function (value, meta, record) {
+            if (value === undefined || value === null || (typeof value === 'number' && isNaN(value))) {
+                return UNKNOWN_CELL;
+            }
+            return fn(value, meta, record);
+        };
     }
 
     // Grid Capacity column: render capacity% (0–100) as a fullness-coloured gfx
@@ -256,8 +288,8 @@
         return ANAS.formatPercent(value);
     }
 
-    // Build one skeuomorphic disk card from a PoolDisk. kind defaults to 'hdd'
-    // (PoolDetail has no kind; gfx.icon also defaults unknown → hdd).
+    // Build one skeuomorphic disk card from a PoolDisk. PoolDetail carries no
+    // disk kind, so the card draws the neutral 'disk' shape (cr3).
     function diskCardHtml(gfx, disk) {
         var level;
         try {
@@ -267,11 +299,12 @@
             level = '';
         }
         var card = gfx.diskCard({
-            kind: 'hdd',
+            // PoolDetail carries no disk kind: the neutral shape (cr3).
+            kind: 'disk',
             state: gfxDiskState(level),
             id: shortDiskId(disk.id),
             sub: diskSub(disk),
-            title: disk.id + ' — ' + disk.state,
+            title: disk.id + ' — ' + (disk.state || ANAS.t('state unknown')),
         });
         return { html: card || '', level: level };
     }
@@ -335,6 +368,7 @@
             var groups = d.vdevGroups || [];
             var faulted = [];
             var warned = [];
+            var unknownIds = [];    // members whose state did not say (cr3)
             var body = '';
             var gi;
             for (gi = 0; gi < groups.length; gi++) {
@@ -355,6 +389,8 @@
                             faulted.push(disk.id);
                         } else if (res.level === 'warning') {
                             warned.push(disk.id);
+                        } else if (res.level !== 'healthy') {
+                            unknownIds.push(disk.id);
                         }
                     }
                     // Structural vdev with no leaf disks — render the vdev itself
@@ -368,11 +404,11 @@
                             vlvl = '';
                         }
                         cardsHtml += gfx.diskCard({
-                            kind: 'hdd',
+                            kind: 'disk',
                             state: gfxDiskState(vlvl),
                             id: v.name,
                             sub: ('' + (v.state || '')).toLowerCase(),
-                            title: v.name + ' — ' + v.state,
+                            title: v.name + ' — ' + (v.state || ANAS.t('state unknown')),
                         }) || '';
                     }
                     var bay = gfx.bay(v.name || '', cardsHtml);
@@ -424,6 +460,14 @@
                             + ' ' + encHtml(ANAS.t('reporting errors.')))
                         : encHtml(ANAS.t('Pool is degraded.'));
                     callout = gfx.callout(wmsg, { level: 'warn' });
+                } else if (unknownIds.length) {
+                    // cr3: never "healthy" over a member whose state is unknown.
+                    var unames = [];
+                    for (var ui = 0; ui < unknownIds.length; ui++) {
+                        unames.push('<b>' + encHtml(shortDiskId(unknownIds[ui])) + '</b>');
+                    }
+                    callout = gfx.callout(encHtml(ANAS.t('State unknown')) + ' — ' + unames.join(', ')
+                        + ' ' + encHtml(ANAS.t('— the state or error counters could not be read.')), { level: 'warn' });
                 } else if (state === 'ONLINE') {
                     callout = gfx.callout(encHtml(ANAS.t('Pool is healthy.')),
                         { level: 'ok' });
@@ -537,6 +581,15 @@
     // foundation degrades to just the encoded name.
     function renderPoolName(value, meta, record) {
         var name = encHtml(value);
+        // cr3: a not-managed pool is listed and visibly marked, with the
+        // daemon's sentence (encoded: it names the pool, which may carry a
+        // space or markup).
+        var um = poolUnmanaged(record);
+        if (um) {
+            return '<span class="anas-pool-unmanaged" title="' + encHtml(unmanagedMessage(um)) + '">'
+                + name + ' <span class="anas-gfx-badge" style="opacity:.8">'
+                + encHtml(ANAS.t('NOT MANAGED')) + '</span></span>';
+        }
         try {
             var manageable = ' '
                 + ANAS.t('Datasets outside PVE\'s footprint are manageable in Datasets.');
@@ -597,8 +650,12 @@
 
     // The one sentence a greyed button carries. Built from the daemon's own
     // `detail` so the tooltip and the 409 say the same thing.
+    //
+    // cr3 (POOLS-PANEL-L8): the tip is HTML (setTooltip stores the string
+    // raw and the QuickTip renders it), and `detail` is daemon text naming a
+    // LUN, a target IQN and a backing path: it is encoded.
     function lunHeldTip(held) {
-        return ANAS.t('Disabled — this pool is ') + held.detail
+        return ANAS.t('Disabled — this pool is ') + ANAS.enc(held.detail)
             + ANAS.t('. Delete the LUN from the iSCSI screen first.');
     }
 
@@ -640,10 +697,14 @@
         }
     }
 
-    // A capability flag from the selected pool record, tri-state:
-    //   true / false when the field is present, null when ABSENT (old daemon).
-    // Callers must treat null as "unknown → do not gate" so an old daemon keeps
-    // today's behavior (no gating regression).
+    // A flag from the selected pool record, tri-state: true / false when the
+    // field is present, null when ABSENT or null.
+    //
+    // cr3 (INVENTED-STATE-L12): null is UNKNOWN — the daemon could not read it
+    // (a failed probe) or never sent it. Callers never read it as false: an
+    // action that depends on it is not offered, and its tooltip says why. (It
+    // used to mean "old daemon, do not gate"; the panel and the daemon ship in
+    // one tarball, and a failed read said "false".)
     function capFlag(rec, field) {
         try {
             var v = rec.get(field);
@@ -654,6 +715,94 @@
         } catch (e) {
             return null;
         }
+    }
+
+    // cr3 daemon contract: `unmanaged` ({ reason: 'pool-name', message }) on a
+    // pool row ANAS does not manage (a name ZFS allows and PoolName refuses:
+    // `.`, `:`, a space). The row is listed and marked; NO verb is offered on
+    // it. Answers the marker or null.
+    function poolUnmanaged(rec) {
+        try {
+            var u = rec && (typeof rec.get === 'function' ? rec.get('unmanaged') : rec.unmanaged);
+            return (u && typeof u === 'object') ? u : null;
+        } catch (e) {
+            return null;
+        }
+    }
+    // The sentence a not-managed row carries (daemon text: callers encode).
+    function unmanagedMessage(u) {
+        return (u && typeof u.message === 'string' && u.message)
+            || ANAS.t('ANAS does not manage this pool.');
+    }
+    // A verb reached on a not-managed row (a stale button, a double-click)
+    // says why and does nothing. Answers true when it refused.
+    function refuseUnmanaged(grid) {
+        var sel = grid && grid.getSelection ? grid.getSelection() : [];
+        var u = (sel && sel.length) ? poolUnmanaged(sel[0]) : null;
+        if (!u) {
+            return false;
+        }
+        ANAS.alertMsg('Not managed by ANAS', unmanagedMessage(u));
+        return true;
+    }
+
+    // The node-level "ZFS is not available here" sentence from a list
+    // envelope (GET /pools, GET /pools/import) or the /v1/status summary, or
+    // null (cr3 daemon contract).
+    function zfsUnavailableOf(res) {
+        var v = res ? res.zfsUnavailable : null;
+        return (typeof v === 'string' && v) ? v : null;
+    }
+    // A grid's empty-state text, encoded (daemon text). Guarded: a view
+    // without setEmptyText takes the property, read at its next refresh.
+    function setGridEmptyText(grid, text) {
+        try {
+            var view = grid && typeof grid.getView === 'function' ? grid.getView() : null;
+            var html = '<div class="anas-grid-empty">' + ANAS.enc(text) + '</div>';
+            if (view && typeof view.setEmptyText === 'function') {
+                view.setEmptyText(html);
+            } else if (view) {
+                view.emptyText = html;
+            }
+        } catch (e) {
+            // non-fatal — the toolbar reason still says it
+        }
+    }
+    ANAS.pools.zfsUnavailableOf = zfsUnavailableOf;
+    ANAS.pools.setGridEmptyText = setGridEmptyText;
+
+    // ONE accessor per pool field a failed read can leave unknown (the field
+    // name written once, here). Each answers true / false / null (unknown).
+    function poolScanRunning(rec) { return capFlag(rec, 'scanRunning'); }
+    function poolTrimSupported(rec) { return capFlag(rec, 'trimSupported'); }
+    function poolUpgradeAvailable(rec) { return capFlag(rec, 'upgradeAvailable'); }
+
+    // The Scan column (cr3, POOLS-PANEL-L7): a RESILVER says "Resilvering",
+    // not "Scrubbing"; a running scan of no stated kind says "Scanning"; an
+    // unread scan state says "Unknown", never "Idle".
+    function renderScan(value, meta, record) {
+        var running = (value === undefined || value === null) ? null : !!value;
+        if (running === null) {
+            return '<span class="anas-pool-scan-unknown" style="color:var(--anas-muted,gray)" title="'
+                + ANAS.enc(ANAS.t('The scan state could not be read.')) + '">'
+                + ANAS.enc(ANAS.t('Unknown')) + '</span>';
+        }
+        if (!running) {
+            return ANAS.enc(ANAS.t('Idle'));
+        }
+        var fn = null;
+        try {
+            fn = record && typeof record.get === 'function' ? record.get('scanFunction') : null;
+        } catch (e) {
+            fn = null;
+        }
+        if (fn === 'RESILVER') {
+            return ANAS.enc(ANAS.t('Resilvering'));
+        }
+        if (fn === 'SCRUB') {
+            return ANAS.enc(ANAS.t('Scrubbing'));
+        }
+        return ANAS.enc(ANAS.t('Scanning'));
     }
 
     // ---- Grid --------------------------------------------------------------
@@ -670,6 +819,12 @@
             }
             grid.setLoading(false);
             var rows = (res && res.data) || [];
+            // cr3 daemon contract: `zfsUnavailable` rides the ENVELOPE (next to
+            // `data`) when ZFS is not available on this node: the empty list is
+            // an answer, said in place of an empty grid; Create and Import are
+            // not offered (updateButtons).
+            grid._anasZfsUnavailable = zfsUnavailableOf(res);
+            setGridEmptyText(grid, grid._anasZfsUnavailable || ANAS.t('No pools'));
             grid.getStore().loadData(rows);
             updateButtons(grid);
         }, function (err) {
@@ -709,9 +864,15 @@
         // it is the normal "Start Scrub". An old daemon omits scanFunction, so a
         // running scan of unknown type keeps today's behavior: disabled, no flip.
         if (scrubBtn) {
-            var scanning = has && rec.get('scanRunning');
+            var scanning = has ? poolScanRunning(rec) : false;
             var fn = has ? rec.get('scanFunction') : null;
-            if (scanning && fn === 'SCRUB') {
+            if (has && scanning === null) {
+                // cr3: whether a scan runs could not be read — neither Start
+                // nor Stop is offered, and the tooltip says why.
+                scrubBtn.setDisabled(true);
+                btnSetText(scrubBtn, 'Start Scrub');
+                btnSetTip(scrubBtn, ANAS.t('The scan state could not be read; reload to try again'));
+            } else if (scanning && fn === 'SCRUB') {
                 scrubBtn.setDisabled(!has);
                 btnSetText(scrubBtn, 'Stop Scrub');
                 btnSetTip(scrubBtn, '');
@@ -738,28 +899,30 @@
         // supports discard. Deliberately NOT composed with the PVE hands-off
         // gate — the 3.25 decision keeps maintenance ops (Scrub/Trim/Upgrade/
         // Detail) available on PVE-managed pools; only structural mutations are
-        // hands-off. Absent trimSupported (old daemon ⇒ capFlag null) does NOT
-        // gate, preserving today's behavior.
+        // hands-off. cr3 (INVENTED-STATE-L12): an unread trimSupported (null
+        // or absent) is UNKNOWN — Trim is not offered and the tooltip says so.
         if (trimBtn) {
-            var trimCap = capFlag(rec, 'trimSupported');
-            var noTrim = has && trimCap === false;
-            trimBtn.setDisabled(!has || noTrim);
-            if (noTrim) {
+            var trimCap = has ? poolTrimSupported(rec) : null;
+            trimBtn.setDisabled(!has || trimCap !== true);
+            if (has && trimCap === false) {
                 btnSetTip(trimBtn, ANAS.t('No devices in this pool support TRIM'));
+            } else if (has && trimCap === null) {
+                btnSetTip(trimBtn, ANAS.t('Whether this pool\'s devices support TRIM could not be read; reload to try again'));
             } else {
                 btnSetTip(trimBtn, '');
             }
         }
         // Upgrade is availability-gated (story 4.12): disabled unless the pool
         // has supported-but-disabled features. Like Trim, stays available on
-        // PVE-managed pools (3.25 maintenance carve-out). Absent
-        // upgradeAvailable (old daemon ⇒ null) does NOT gate.
+        // PVE-managed pools (3.25 maintenance carve-out). An unread
+        // upgradeAvailable is UNKNOWN (cr3): not offered, and said.
         if (upgradeBtn) {
-            var upgCap = capFlag(rec, 'upgradeAvailable');
-            var noUpg = has && upgCap === false;
-            upgradeBtn.setDisabled(!has || noUpg);
-            if (noUpg) {
+            var upgCap = has ? poolUpgradeAvailable(rec) : null;
+            upgradeBtn.setDisabled(!has || upgCap !== true);
+            if (has && upgCap === false) {
                 btnSetTip(upgradeBtn, ANAS.t('All supported features are already enabled'));
+            } else if (has && upgCap === null) {
+                btnSetTip(upgradeBtn, ANAS.t('Whether this pool has features to enable could not be read; reload to try again'));
             } else {
                 btnSetTip(upgradeBtn, '');
             }
@@ -770,7 +933,9 @@
         // Attach/Modify) are disabled with an explanatory tooltip; Scrub/Trim/
         // Upgrade/Detail (base toolbar) and Refresh stay enabled. Create/Import
         // are not selection-bound (needsSelection false) so the loop skips them.
-        var scanningSel = has && rec.get('scanRunning');
+        // An unread scan state counts as scanning for an action that must not
+        // run during one (fail closed: cr3).
+        var scanningSel = has && poolScanRunning(rec) !== false;
         var held = has ? heldByLun(rec) : null;
         var actions = ANAS.pools.actions;
         for (var i = 0; i < actions.length; i++) {
@@ -792,6 +957,42 @@
                 setPveTooltip(btn, pveBlock);
             }
         }
+        // cr3 daemon contract: ZFS not available on this node — Create and
+        // Import would be refused (409 zfs-unavailable): off, with the
+        // node's sentence as the reason. Absent: as before (enabled).
+        var zfsNo = grid._anasZfsUnavailable || null;
+        for (var zi = 0; zi < actions.length; zi++) {
+            var za = actions[zi];
+            var zb = (!za.needsSelection && za.itemId) ? grid.down('#' + za.itemId) : null;
+            if (zb) {
+                zb.setDisabled(!!zfsNo);
+                btnSetTip(zb, zfsNo ? ANAS.enc(zfsNo) : '');
+            }
+        }
+        // cr3: a not-managed pool offers NO verb — every selection-bound
+        // button, the base toolbar's included, is off and carries the
+        // daemon's sentence (encoded: the tip renders HTML and the sentence
+        // names the pool).
+        var unmanaged = has ? poolUnmanaged(rec) : null;
+        if (unmanaged) {
+            var uTip = ANAS.enc(unmanagedMessage(unmanaged));
+            var baseIds = ['detail', 'scrub', 'trim', 'upgrade'];
+            for (var bi = 0; bi < baseIds.length; bi++) {
+                var bb = grid.down('#' + baseIds[bi]);
+                if (bb) {
+                    bb.setDisabled(true);
+                    btnSetTip(bb, uTip);
+                }
+            }
+            for (var ui = 0; ui < actions.length; ui++) {
+                var ua = actions[ui];
+                var ub = (ua.needsSelection && ua.itemId) ? grid.down('#' + ua.itemId) : null;
+                if (ub) {
+                    ub.setDisabled(true);
+                    btnSetTip(ub, uTip);
+                }
+            }
+        }
     }
 
     function selectedPool(grid) {
@@ -802,6 +1003,16 @@
     // Expose helpers for per-operation action files.
     ANAS.pools.selectedPool = selectedPool;
     ANAS.pools.reload = loadPools;
+    // The pure parts, exported so a harness can drive them without an ExtJS
+    // grid (cr3 pins the Scan column, the unknown-flag gating, the derived
+    // disk health and the encoded tooltip on this seam).
+    ANAS.pools.renderScan = renderScan;
+    ANAS.pools.updateButtons = updateButtons;
+    ANAS.pools.diskHealthLevel = diskHealthLevel;
+    ANAS.pools.topologyGfxHtml = topologyGfxHtml;
+    ANAS.pools.summaryHtml = summaryHtml;
+    ANAS.pools.propsHtml = propsHtml;
+    ANAS.pools.showPoolDetail = showPoolDetail;
 
     // Scrub via the shared runJob helper (submit 202 → poll job → refresh).
     // This is the start/stop TOGGLE handler (story 4.12): if the selected pool
@@ -817,7 +1028,7 @@
             return;
         }
         var rec = (sel && sel.length) ? sel[0] : null;
-        var stopping = !!(rec && rec.get('scanRunning')
+        var stopping = !!(rec && poolScanRunning(rec) === true
             && rec.get('scanFunction') === 'SCRUB');
         var action = stopping ? 'stop' : 'start';
         ANAS.runJob({
@@ -872,7 +1083,8 @@
             path: '/pools/' + encodeURIComponent(pool) + '/upgrade',
             view: grid,
             confirmTitle: 'Upgrade pool',
-            confirmIntro: ANAS.t('Upgrade') + ' ' + pool + '?',
+            // The intro is HTML (Ext.Msg.confirm): the name is data (cr3 L8).
+            confirmIntro: ANAS.t('Upgrade') + ' ' + ANAS.enc(pool) + '?',
             successMsg: ANAS.t('Pool') + ' ' + pool + ' ' + ANAS.t('upgraded'),
             failTitle: 'Upgrade failed',
             onComplete: function () {
@@ -891,6 +1103,13 @@
             disabled: !!spec.needsSelection,
             handler: function (btn) {
                 var grid = btn.up('grid');
+                if (spec.needsSelection && refuseUnmanaged(grid)) {
+                    return;
+                }
+                if (grid && grid._anasZfsUnavailable) {
+                    ANAS.alertMsg('ZFS is not available', grid._anasZfsUnavailable);
+                    return;
+                }
                 try {
                     spec.handler(node, grid, selectedPool(grid));
                 } catch (e) {
@@ -904,18 +1123,20 @@
         var store = Ext.create('Ext.data.Store', {
             fields: [
                 'name', 'state',
-                { name: 'size', type: 'int' },
-                { name: 'allocated', type: 'int' },
-                { name: 'free', type: 'int' },
-                { name: 'capacity', type: 'float' },
-                { name: 'fragmentation', type: 'float' },
-                { name: 'dedupRatio', type: 'float' },
-                { name: 'scanRunning', type: 'boolean' },
+                // cr3: allowNull — a typed field coerced an absent value to 0
+                // ("0 B", "0%"); null renders as unknown (renderKnown).
+                { name: 'size', type: 'int', allowNull: true },
+                { name: 'allocated', type: 'int', allowNull: true },
+                { name: 'free', type: 'int', allowNull: true },
+                { name: 'capacity', type: 'float', allowNull: true },
+                { name: 'fragmentation', type: 'float', allowNull: true },
+                { name: 'dedupRatio', type: 'float', allowNull: true },
+                // cr3: an AUTO field — a typed boolean coerced an unread
+                // (null / absent) scan state to false, i.e. "Idle".
+                'scanRunning',
                 // story 4.12 gating: keep these as AUTO fields (no type coercion)
-                // so an old daemon that omits them leaves get() === undefined —
-                // the button logic then falls back to today's behavior (no
-                // regression). A typed boolean would coerce absent → false and
-                // wrongly disable Trim.
+                // so an omitted or null value leaves get() undefined / null —
+                // UNKNOWN to the button logic (cr3), never coerced to false.
                 //   scanFunction    — 'SCRUB'|'RESILVER', present only while scanning
                 //   trimSupported   — any member device supports discard
                 //   upgradeAvailable— pool has supported-but-disabled features
@@ -936,6 +1157,8 @@
                 // something on this pool. AUTO field — absent on old daemons
                 // leaves get() undefined and nothing is gated (version skew).
                 'heldByLun',
+                // cr3: the not-managed marker ({ reason, message }); auto.
+                'unmanaged',
             ],
             data: [],
             sorters: [{ property: 'name', direction: 'ASC' }],
@@ -961,7 +1184,7 @@
                 handler: function (btn) {
                     var grid = btn.up('grid');
                     var pool = selectedPool(grid);
-                    if (pool) {
+                    if (pool && !refuseUnmanaged(grid)) {
                         showPoolDetail(node, pool);
                     }
                 },
@@ -973,7 +1196,9 @@
                 iconCls: 'fa fa-check-circle',
                 disabled: true,
                 handler: function (btn) {
-                    startScrub(btn.up('grid'), node);
+                    if (!refuseUnmanaged(btn.up('grid'))) {
+                        startScrub(btn.up('grid'), node);
+                    }
                 },
             },
             {
@@ -983,7 +1208,9 @@
                 iconCls: 'fa fa-eraser',
                 disabled: true,
                 handler: function (btn) {
-                    startTrim(btn.up('grid'), node);
+                    if (!refuseUnmanaged(btn.up('grid'))) {
+                        startTrim(btn.up('grid'), node);
+                    }
                 },
             },
             {
@@ -993,7 +1220,9 @@
                 iconCls: 'fa fa-arrow-circle-up',
                 disabled: true,
                 handler: function (btn) {
-                    upgradePool(btn.up('grid'), node);
+                    if (!refuseUnmanaged(btn.up('grid'))) {
+                        upgradePool(btn.up('grid'), node);
+                    }
                 },
             },
         ];
@@ -1035,25 +1264,25 @@
                     text: ANAS.t('Size'),
                     dataIndex: 'size',
                     width: 110,
-                    renderer: ANAS.formatBytes,
+                    renderer: renderKnown(ANAS.formatBytes),
                 },
                 {
                     text: ANAS.t('Allocated'),
                     dataIndex: 'allocated',
                     width: 110,
-                    renderer: ANAS.formatBytes,
+                    renderer: renderKnown(ANAS.formatBytes),
                 },
                 {
                     text: ANAS.t('Free'),
                     dataIndex: 'free',
                     width: 110,
-                    renderer: ANAS.formatBytes,
+                    renderer: renderKnown(ANAS.formatBytes),
                 },
                 {
                     text: ANAS.t('Capacity'),
                     dataIndex: 'capacity',
                     width: 150,
-                    renderer: renderCapacityBar,
+                    renderer: renderKnown(renderCapacityBar),
                 },
                 // story 3.27: shared Mount column — identical to the AHR grid's.
                 ANAS.gfx.mountColumn(),
@@ -1061,15 +1290,13 @@
                     text: ANAS.t('Fragmentation'),
                     dataIndex: 'fragmentation',
                     width: 120,
-                    renderer: ANAS.formatPercent,
+                    renderer: renderKnown(ANAS.formatPercent),
                 },
                 {
                     text: ANAS.t('Scan'),
                     dataIndex: 'scanRunning',
                     width: 110,
-                    renderer: function (value) {
-                        return value ? ANAS.t('Scrubbing') : ANAS.t('Idle');
-                    },
+                    renderer: renderScan,
                 },
             ],
             tbar: ANAS.tbar(tbar),
@@ -1084,6 +1311,12 @@
                     updateButtons(this);
                 },
                 itemdblclick: function (grid, record) {
+                    // A not-managed pool opens nothing (cr3): its sentence.
+                    var u = poolUnmanaged(record);
+                    if (u) {
+                        ANAS.alertMsg('Not managed by ANAS', unmanagedMessage(u));
+                        return;
+                    }
                     showPoolDetail(node, record.get('name'));
                 },
             },
@@ -1117,7 +1350,9 @@
             + kv(ANAS.t('Free'), enc(ANAS.formatBytes(d.free)))
             + kv(ANAS.t('Capacity'), enc(ANAS.formatPercent(d.capacity)))
             + kv(ANAS.t('Fragmentation'), enc(ANAS.formatPercent(d.fragmentation)))
-            + kv(ANAS.t('Dedup ratio'), enc((Number(d.dedupRatio || 0)).toFixed(2) + 'x'))
+            // cr3: an absent ratio is a dash, never "0.00x" (1.00x = no dedup).
+            + kv(ANAS.t('Dedup ratio'), enc((typeof d.dedupRatio === 'number' && isFinite(d.dedupRatio))
+                ? d.dedupRatio.toFixed(2) + 'x' : '—'))
             + kv(ANAS.t('Errors'), enc(d.errorCount))
             + kv(ANAS.t('GUID'), enc(d.guid));
         if (d.health && (d.health.status || d.health.action)) {
@@ -1134,12 +1369,20 @@
     function propsHtml(p) {
         var enc = ANAS.enc;
         p = p || {};
+        // cr3 daemon contract: each property is null when the read did not
+        // return it — "unknown", never "null" or a "No" from a falsy value.
+        function known(v) {
+            return v !== null && v !== undefined && v !== '';
+        }
+        function boolCell(v) {
+            return (v === true || v === false) ? enc(ANAS.formatBool(v)) : enc(ANAS.t('unknown'));
+        }
         var rows = ''
-            + kv(ANAS.t('ashift'), enc(p.ashift))
-            + kv(ANAS.t('autoexpand'), enc(ANAS.formatBool(p.autoexpand)))
-            + kv(ANAS.t('autoreplace'), enc(ANAS.formatBool(p.autoreplace)))
-            + kv(ANAS.t('autotrim'), enc(ANAS.formatBool(p.autotrim)))
-            + kv(ANAS.t('failmode'), enc(p.failmode));
+            + kv(ANAS.t('ashift'), enc(known(p.ashift) ? p.ashift : ANAS.t('unknown')))
+            + kv(ANAS.t('autoexpand'), boolCell(p.autoexpand))
+            + kv(ANAS.t('autoreplace'), boolCell(p.autoreplace))
+            + kv(ANAS.t('autotrim'), boolCell(p.autotrim))
+            + kv(ANAS.t('failmode'), enc(known(p.failmode) ? p.failmode : ANAS.t('unknown')));
         return '<table style="border-collapse:collapse;">' + rows + '</table>';
     }
 
@@ -1384,7 +1627,8 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-view-pool-detail',
-                title: ANAS.t('Pool') + ': ' + poolName,
+                // A window title is HTML; the name is data (cr3 L8).
+                title: ANAS.t('Pool') + ': ' + ANAS.enc(poolName),
                 modal: true,
                 width: 820,
                 height: 640,
@@ -1409,6 +1653,10 @@
                         disabled: true,
                         handler: function () {
                             var d = win._poolDetail;
+                            if (d && poolUnmanaged(d)) {
+                                ANAS.alertMsg('Not managed by ANAS', unmanagedMessage(poolUnmanaged(d)));
+                                return;
+                            }
                             if (d) {
                                 changeMountpoint(win, node, poolName, d.mountpoint);
                             }
@@ -1450,13 +1698,17 @@
                 try {
                     var mbtn = win.down('#changeMount');
                     if (mbtn) {
-                        var canMove = !!d && !isPveManaged(d)
+                        // cr3 daemon contract: a not-managed pool's detail is
+                        // read-only — no action, its sentence as the reason.
+                        var um = d ? poolUnmanaged(d) : null;
+                        var canMove = !!d && !um && !isPveManaged(d)
                             && isMovableMountpoint(d.mountpoint);
                         mbtn.setDisabled(!canMove);
-                        mbtn.setTooltip(
-                            (d && isPveManaged(d))
+                        mbtn.setTooltip(um
+                            ? ANAS.enc(unmanagedMessage(um))
+                            : ((d && isPveManaged(d))
                                 ? ANAS.t('Disabled — PVE manages this pool')
-                                : (canMove ? '' : ANAS.t('The pool root is not mounted at a movable path')));
+                                : (canMove ? '' : ANAS.t('The pool root is not mounted at a movable path'))));
                     }
                 } catch (eg) {
                     // non-fatal — the button simply stays disabled

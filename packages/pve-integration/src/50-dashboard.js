@@ -146,6 +146,50 @@
         return isNaN(n) ? 0 : n;
     }
 
+    // ---- Payload accessors (cr3) --------------------------------------------
+    //
+    // A field a failed daemon read can leave unknown is read through ONE
+    // accessor, its name written once, here. Each answers the value or null;
+    // null means the daemon could not read it (or never sent it) and every
+    // caller renders that as unknown, never as a healthy, idle or zero
+    // default ("Hard-coded values that don't derive from actual state are
+    // worrisome", operator, cr3).
+    function knownString(o, field) {
+        var v = o ? o[field] : null;
+        return (typeof v === 'string' && v !== '') ? v : null;
+    }
+    function knownNumber(o, field) {
+        var v = o ? o[field] : null;
+        return (typeof v === 'number' && isFinite(v)) ? v : null;
+    }
+    function knownBool(o, field) {
+        var v = o ? o[field] : null;
+        return typeof v === 'boolean' ? v : null;
+    }
+    // /v1/telemetry vdev: state (ONLINE/DEGRADED/...) and role (data/log/...).
+    function vdevStateOf(vdev) { return knownString(vdev, 'state'); }
+    function vdevRoleOf(vdev) { return knownString(vdev, 'role'); }
+    // /v1/status pool brief: is a scrub/resilver running.
+    function poolScanRunningOf(p) { return knownBool(p, 'scanRunning'); }
+    // /v1/status disk health counts (healthy/warning/critical/unknown/total).
+    function diskCountOf(counts, key) { return knownNumber(counts, key); }
+    // /v1/telemetry ARC block: null when absent, null, or missing a figure the
+    // gauge needs (hit ratio, size, target).
+    function arcOf(tel) {
+        var a = tel ? tel.arc : null;
+        if (!a || typeof a !== 'object') { return null; }
+        if (knownNumber(a, 'hitRatio') === null || knownNumber(a, 'size') === null
+            || knownNumber(a, 'target') === null) {
+            return null;
+        }
+        return a;
+    }
+
+    // A byte figure, or "unknown" when the payload does not carry it (cr3).
+    function bytesOrUnknown(v) {
+        return (typeof v === 'number' && isFinite(v)) ? ANAS.formatBytes(v) : t('unknown');
+    }
+
     function clamp01(f) {
         f = Number(f);
         if (isNaN(f) || f < 0) { return 0; }
@@ -735,12 +779,16 @@
             var finished = toMs(j.finishedAt);
             var running = isNaN(finished)
                 && (st === 'running' || st === 'active' || st === 'in_progress'
-                    || st === 'pending' || st === '');
+                    || st === 'pending');
+            // cr3: a queued job waits (accent, not the green of a completed
+            // one); a job with no status reads "unknown" in the neutral class —
+            // it used to read "running" (no finishedAt) or a green "done".
+            var queued = isNaN(finished) && st === 'queued';
 
             var when = '';
             var durPart = '';
             var outCls = 'anas-dash-job-ok';
-            var outTxt = st || t('done');
+            var outTxt = st || t('unknown');
             if (running) {
                 outCls = 'anas-dash-job-run';
                 outTxt = t('running');
@@ -748,12 +796,19 @@
                 if (!isNaN(started)) {
                     durPart = t('elapsed') + ' ' + fmtDur(Date.now() - started);
                 }
+            } else if (queued) {
+                outCls = 'anas-dash-job-run';
+                outTxt = t('queued');
+                when = t('queued');
             } else {
                 if (st === 'failed' || st === 'error') {
                     outCls = 'anas-dash-job-bad';
                 } else if (st === 'cancelled' || st === 'canceled') {
                     outCls = 'anas-dash-job-cancel';
                     outTxt = t('cancelled');
+                } else if (st !== 'completed' && st !== 'done') {
+                    // Anything the strip does not know is not a success.
+                    outCls = 'anas-dash-job-cancel';
                 }
                 when = !isNaN(finished) ? relAgo(finished) : (!isNaN(started) ? relAgo(started) : '');
                 var dur = j.durationMs;
@@ -813,16 +868,24 @@
     // unknown count tiles + total, with the recent-activity strip alongside.
     function renderFleet(status, jobDetails) {
         var d = (status && status.disks) || {};
+        // cr3: a count the daemon could not read shows a dash in a muted
+        // tile, never a 0 in the tile's colour (a 0 under "Critical" reads as
+        // "no failing disks").
+        function countTile(key, label, color) {
+            var n = diskCountOf(d, key);
+            return n === null ? statTile('—', label, MUTED_COLOR) : statTile(n, label, color);
+        }
+        var total = diskCountOf(d, 'total');
         var tiles = sectionUnavailable(status, 'disks')
             ? muted(t('Disk health is unavailable: a read did not answer in time. See the warning above.'))
             : '<div class="anas-dash-stats">'
-            + statTile(num(d.healthy), t('Healthy'), OK_COLOR)
-            + statTile(num(d.warning), t('Warning'), WARN_COLOR)
-            + statTile(num(d.critical), t('Critical'), BAD_COLOR)
-            + statTile(num(d.unknown), t('Unknown'), MUTED_COLOR)
+            + countTile('healthy', t('Healthy'), OK_COLOR)
+            + countTile('warning', t('Warning'), WARN_COLOR)
+            + countTile('critical', t('Critical'), BAD_COLOR)
+            + countTile('unknown', t('Unknown'), MUTED_COLOR)
             + '</div>'
             + '<div class="anas-dash-muted" style="margin-top:8px">'
-            + enc(num(d.total) + ' ' + t('disks total')) + '</div>';
+            + enc(total === null ? t('Disk count unknown') : (total + ' ' + t('disks total'))) + '</div>';
         return '<div class="anas-dash-row">'
             + '<div class="anas-dash-col" style="flex:1 1 340px">'
             + heading(t('Disk Fleet')) + tiles + '</div>'
@@ -837,10 +900,14 @@
     // 2.7 — ARC hit ratio gauge + size/target + max, L2ARC line when present.
     // Hit ratio is a natural 0..1 fullness, so the gauge already reads clearly —
     // no time chart here (a sparkline earned no axes).
+    //
+    // cr3 (INVENTED-STATE-L11): an ARC block the daemon could not read (null,
+    // absent, or missing a figure) renders "ARC unavailable", never a 0 % gauge
+    // over "0 B / 0 B" under a fresh "Live telemetry" line.
     function renderArc(view, tel) {
-        var arc = tel && tel.arc;
+        var arc = arcOf(tel);
         if (!arc) {
-            return heading(t('ARC')) + muted(t('No ARC data.'));
+            return heading(t('ARC')) + muted(t('ARC unavailable: the ARC statistics could not be read.'));
         }
         var hr = clamp01(arc.hitRatio);
         var gaugeHtml = '';
@@ -860,13 +927,18 @@
                 + enc(Math.round(hr * 100) + '% · ' + ANAS.formatBytes(arc.size)
                     + ' / ' + ANAS.formatBytes(arc.target)) + '</div>';
         }
+        var arcMax = knownNumber(arc, 'max');
         var maxLine = '<div class="anas-dash-muted" style="margin-top:4px">'
-            + enc(t('Max') + ' ' + ANAS.formatBytes(arc.max)) + '</div>';
+            + enc(t('Max') + ' ' + (arcMax === null ? t('unknown') : ANAS.formatBytes(arcMax))) + '</div>';
         var l2 = '';
         if (arc.l2) {
+            // cr3: an absent L2ARC figure reads unknown, never "0% hit" / "0 B".
+            var l2Hit = knownNumber(arc.l2, 'hitRatio');
+            var l2Size = knownNumber(arc.l2, 'size');
             l2 = '<div class="anas-dash-muted" style="margin-top:6px">'
-                + enc('L2ARC: ' + Math.round(clamp01(arc.l2.hitRatio) * 100) + '% '
-                    + t('hit') + ' · ' + ANAS.formatBytes(arc.l2.size)) + '</div>';
+                + enc('L2ARC: ' + (l2Hit === null ? t('hit ratio unknown')
+                    : Math.round(clamp01(l2Hit) * 100) + '% ' + t('hit'))
+                    + ' · ' + (l2Size === null ? t('size unknown') : ANAS.formatBytes(l2Size))) + '</div>';
         }
         return heading(t('ARC — Adaptive Replacement Cache'))
             + '<div class="anas-dash-row">'
@@ -921,7 +993,8 @@
 
     function ahrStatePill(state) {
         var token = AHR_PILL_TOKEN.hasOwnProperty(state) ? AHR_PILL_TOKEN[state] : '';
-        var label = t(AHR_PILL_LABEL.hasOwnProperty(state) ? AHR_PILL_LABEL[state] : ('' + (state || '')));
+        // cr3: an absent state is labelled "unknown" (neutral), never blank.
+        var label = t(AHR_PILL_LABEL.hasOwnProperty(state) ? AHR_PILL_LABEL[state] : ('' + (state || 'unknown')));
         try {
             if (gfx && typeof gfx.statePill === 'function') {
                 var html = gfx.statePill(token, { label: label });
@@ -1031,17 +1104,19 @@
             }
             return '';
         }
-        var pc = num(sync.percent);
+        // cr3: a sync with no percent is drawn indeterminate and states no
+        // figure — never "0.0%".
+        var pc = knownNumber(sync, 'percent');
         var strip = '';
         try {
             if (gfx && typeof gfx.activity === 'function') {
-                strip = gfx.activity(pc > 0 ? pc / 100 : null,
+                strip = gfx.activity(pc !== null && pc > 0 ? pc / 100 : null,
                     { label: t(AHR_SYNC_LABELS[sync.action] || ('' + sync.action)) }) || '';
             }
         } catch (e) {
             strip = '';
         }
-        var stats = [pc.toFixed(1) + '%'];
+        var stats = pc === null ? [] : [pc.toFixed(1) + '%'];
         if (num(sync.speedBytesSec) > 0) { stats.push(bps(sync.speedBytesSec)); }
         var eta = ahrEta(sync.etaSeconds);
         if (eta) { stats.push(t('ETA') + ' ' + eta); }
@@ -1061,7 +1136,12 @@
         var iconHtml = '';
         try {
             if (gfx && typeof gfx.icon === 'function') {
-                iconHtml = gfx.icon('hdd', { state: spare ? 'spare' : 'online', title: id }) || '';
+                // cr3 (POOLS-PANEL-M2): the brief carries no per-member health,
+                // so a member draws NO status dot. A spare's grey "S" is its
+                // role (it sits in `spares[]`), not a health claim.
+                // The brief carries no disk kind: the neutral shape (cr3), never
+                // a spinning platter for every SSD and NVMe.
+                iconHtml = gfx.icon('disk', spare ? { state: 'spare', title: id } : { title: id }) || '';
             }
         } catch (e) {
             iconHtml = '';
@@ -1081,9 +1161,10 @@
             + '<div style="min-width:0;flex:1 1 auto">'
             + '<div class="anas-dash-disk-id" title="' + enc(id) + '">' + enc(id) + '</div>'
             + '<div class="anas-dash-disk-sub">'
+            // cr3: an absent size reads unknown, never "0 B".
             + enc(sliceBytes != null
-                ? t('Slice') + ' ' + ANAS.formatBytes(num(sliceBytes))
-                : t('Size') + ' ' + ANAS.formatBytes(num(sizeBytes))) + '</div>'
+                ? t('Slice') + ' ' + bytesOrUnknown(sliceBytes)
+                : t('Size') + ' ' + bytesOrUnknown(sizeBytes)) + '</div>'
             + ioHtml
             + '</div></div>';
     }
@@ -1104,7 +1185,9 @@
     function renderAhrBand(view, poolName, band, tband, chartW, poolBuilding, solo) {
         band = band || {};
         var n = num(band.band);
-        var desc = '— ' + ahrLevelLabel(band.level) + ' × ' + num(band.memberCount);
+        // cr3: an absent member count is "?", never "× 0".
+        var mc = knownNumber(band, 'memberCount');
+        var desc = '— ' + ahrLevelLabel(band.level) + ' × ' + (mc === null ? '?' : mc);
         // 11.19: the band's height, the same figure the Details view shows, so
         // the two AHR surfaces describe a band identically. Omitted entirely on
         // a pre-0.2.4 daemon rather than guessed.
@@ -1198,7 +1281,9 @@
         var poolW = dims.pool > 0 ? dims.pool : 620;
         var bandW = dims.vdev > 0 ? dims.vdev : 560;
         var name = ap.name || 'pool';
-        var usable = num(ap.usableBytes);
+        // cr3: an absent usable size is unknown (no donut, a dash), never 0 B.
+        var usableKnown = knownNumber(ap, 'usableBytes');
+        var usable = usableKnown === null ? 0 : usableKnown;
         var hasUsed = ap.usedBytes !== undefined && ap.usedBytes !== null && !isNaN(Number(ap.usedBytes));
         var used = hasUsed ? num(ap.usedBytes) : 0;
         var free = Math.max(usable - used, 0);
@@ -1232,7 +1317,7 @@
         } else {
             capBlock = '<div class="anas-dash-pool-cap">'
                 + '<div class="anas-dash-stat-n" style="color:' + MUTED_COLOR + '">'
-                + enc(ANAS.formatBytes(usable)) + '</div>'
+                + enc(usableKnown === null ? '—' : ANAS.formatBytes(usable)) + '</div>'
                 + '<div class="anas-dash-muted" style="margin-top:4px">' + enc(t('Usable')) + '</div></div>';
         }
 
@@ -1245,7 +1330,9 @@
             badge = '';
         }
 
-        var mountState = ap.mounted ? t('mounted') : t('not mounted');
+        var mountedKnown = knownBool(ap, 'mounted');
+        var mountState = mountedKnown === null ? t('mount state unknown')
+            : (mountedKnown ? t('mounted') : t('not mounted'));
         var mountHtml = '<div class="anas-dash-muted" style="margin-top:4px">'
             + enc(t('Mount') + ': ' + (ap.mountpoint || '—') + ' (' + mountState + ')') + '</div>';
 
@@ -1443,15 +1530,19 @@
     // A telemetry device tile: disk object + live throughput numbers + latency +
     // a slim activity bar (combined throughput relative to the busiest sibling
     // device in this vdev — a live, stateless "how busy" read; no sparkline, it
-    // earned no axes). Kind defaults to 'hdd', state to 'online' (telemetry
-    // carries no per-disk health) — scoped to its vdev by nesting.
+    // earned no axes). Telemetry carries no disk kind, so the tile draws the
+    // neutral 'disk' shape (cr3), and no per-disk health, so it draws NO status
+    // dot (cr3, POOLS-PANEL-M2: it used to
+    // draw a constant green tick, a FAULTED leaf included); the vdev's own
+    // state pill above it is the health the payload actually reports.
     function renderDevice(view, dev, refMax) {
         dev = dev || {};
         var id = dev.id || 'disk';
         var iconHtml = '';
         try {
             if (gfx && typeof gfx.icon === 'function') {
-                iconHtml = gfx.icon('hdd', { state: 'online', title: id }) || '';
+                // Telemetry carries no disk kind: the neutral shape (cr3).
+                iconHtml = gfx.icon('disk', { title: id }) || '';
             }
         } catch (e) {
             iconHtml = '';
@@ -1530,24 +1621,32 @@
     // tiles below are untouched either way.
     function renderVdev(view, vdev, poolName, chartW, solo) {
         vdev = vdev || {};
+        var vState = vdevStateOf(vdev);
         var lvl = '';
         try {
-            if (gfx && typeof gfx.pillLevel === 'function') {
-                lvl = gfx.pillLevel(vdev.state) || '';
+            if (gfx && typeof gfx.pillLevel === 'function' && vState) {
+                lvl = gfx.pillLevel(vState) || '';
             }
         } catch (eL) {
             lvl = '';
         }
+        // cr3 (INVENTED-STATE-H2): a vdev whose state the daemon could not
+        // read carries none; it renders a neutral "unknown" pill, never the
+        // green ONLINE one.
+        var pillState = vState || '';
+        var pillLabel = vState || t('unknown');
+        var pillOpts = vState ? { label: pillLabel }
+            : { label: pillLabel, title: t('The vdev state could not be read.') };
         var pill = '';
         try {
-            if (gfx && typeof gfx.statePill === 'function' && vdev.state) {
-                pill = gfx.statePill(vdev.state, { label: vdev.state }) || '';
+            if (gfx && typeof gfx.statePill === 'function') {
+                pill = gfx.statePill(pillState, pillOpts) || '';
             }
         } catch (eP) {
             pill = '';
         }
-        if (!pill && vdev.state) {
-            pill = '<span class="anas-dash-muted">' + enc('' + vdev.state) + '</span>';
+        if (!pill) {
+            pill = '<span class="anas-dash-muted">' + enc(pillLabel) + '</span>';
         }
         // Self-describing identity: a literal "VDEV" tag, the vdev name (omitted
         // for a single-disk vdev, whose raw name IS the disk id the device card
@@ -1559,7 +1658,9 @@
         var isSingle = ty === 'disk' || ty === 'file';
         var nDev = (vdev.disks || []).length;
         var descParts = [];
-        var roleL = vdevRoleLabel(vdev.role);
+        // An unreadable role says so; it never reads as a plain data vdev.
+        var vRole = vdevRoleOf(vdev);
+        var roleL = vRole ? vdevRoleLabel(vRole) : t('role unknown');
         if (roleL) { descParts.push(roleL); }
         descParts.push(vdevTypeLabel(vdev.type));
         if (!isSingle) {
@@ -1643,13 +1744,14 @@
                         { label: t('Used'), value: alloc },
                         { label: t('Free'), value: free, free: true }
                     ],
-                    { size: 104, center: { big: Math.round(cap) + '%', sm: ANAS.formatBytes(size) } }
+                    // cr3: an absent capacity is a dash in the centre, never 0%.
+                    { size: 104, center: { big: knownNumber(p, 'capacity') === null ? '—' : Math.round(cap) + '%', sm: ANAS.formatBytes(size) } }
                 ) || '';
             }
         } catch (eD) {
             donut = '';
         }
-        if (!donut && p.capacity !== undefined) {
+        if (!donut && knownNumber(p, 'capacity') !== null) {
             // gfx unavailable — a plain fullness bar still conveys capacity.
             donut = fallbackBar(cap / 100, cap >= 90 ? BAD_COLOR : (cap >= 75 ? WARN_COLOR : OK_COLOR))
                 + '<div class="anas-dash-muted" style="margin-top:4px">' + enc(Math.round(cap) + '%') + '</div>';
@@ -1692,17 +1794,23 @@
                 chartOpts(view, pKey, poolW, 160, t('Pool I/O'))
             ) + '</div>';
         } else {
-            chartHtml = '<div class="anas-dash-pool-io">' + muted(t('Live I/O collecting…')) + '</div>';
+            // cr3 daemon contract: `Telemetry.poolsUnavailable` says the pool
+            // I/O sample could not be read — say so with the reason, never
+            // "collecting" for ever.
+            chartHtml = '<div class="anas-dash-pool-io">' + (dims.ioUnavailable
+                ? muted(t('Live I/O unavailable') + ': ' + dims.ioUnavailable)
+                : muted(t('Live I/O collecting...'))) + '</div>';
         }
 
         var capBlock = donut
             ? '<div class="anas-dash-pool-cap">' + donut
                 + '<div class="anas-dash-muted" style="margin-top:6px">'
-                + enc(ANAS.formatBytes(alloc) + ' / ' + ANAS.formatBytes(size)) + '</div></div>'
+                + enc(bytesOrUnknown(p.allocated) + ' / ' + bytesOrUnknown(p.size)) + '</div></div>'
             : '';
 
         var scan = '';
-        if (p.scanRunning) {
+        var scanRunning = poolScanRunningOf(p);
+        if (scanRunning === true) {
             try {
                 if (gfx && typeof gfx.activity === 'function') {
                     scan = '<div style="margin-top:10px">'
@@ -1712,6 +1820,10 @@
             } catch (eA) {
                 scan = '';
             }
+        } else if (scanRunning === null) {
+            // cr3: an unread scan state is said, never drawn as idle.
+            scan = '<div class="anas-dash-muted anas-dash-scan-unknown" style="margin-top:10px">'
+                + enc(t('Scan state unknown: it could not be read.')) + '</div>';
         }
 
         var vdevs = (tp && tp.vdevs) || [];
@@ -1723,12 +1835,22 @@
             vdevHtml += renderVdev(view, vdevs[i], name, vdevW, solo);
         }
 
+        // cr3 daemon contract: a pool ANAS does not manage carries
+        // `unmanaged` ({ reason, message }); its block says so (daemon text,
+        // encoded).
+        var unmanagedHtml = '';
+        if (p.unmanaged && typeof p.unmanaged === 'object') {
+            unmanagedHtml = '<div class="anas-dash-muted anas-dash-pool-unmanaged" style="margin-top:4px">'
+                + enc(t('Not managed by ANAS') + ': '
+                    + (p.unmanaged.message || t('ANAS does not manage this pool.'))) + '</div>';
+        }
         return '<div class="anas-dash-pool">'
             + '<div class="anas-dash-pool-head">'
             + capBlock
             + '<div class="anas-dash-pool-main">'
             + '<div class="anas-dash-pool-name">' + poolGlyph()
             + '<span>' + enc(name) + '</span>' + pill + '</div>'
+            + unmanagedHtml
             + summaryHtml
             + '</div></div>'
             + chartHtml
@@ -1744,7 +1866,10 @@
         var st = view && view._anasStatus;
         var tel = view && view._anasTelemetry;
         var statusPools = (st && st.pools) || [];
-        var telPools = (tel && tel.pools) || [];
+        // cr3 daemon contract: when the pool I/O sample could not be read,
+        // `pools` is not an observation: no I/O and no vdevs come from it.
+        var ioUnavailable = knownString(tel, 'poolsUnavailable');
+        var telPools = ioUnavailable ? [] : ((tel && tel.pools) || []);
         // AHR pools ride the SAME headline section (11.13), rendered AFTER the
         // ZFS pools; [] fail-open so a ZFS-only node is visually unchanged.
         var ahrPools = (st && st.ahrPools) || [];
@@ -1779,6 +1904,21 @@
                     ? t('ZFS pool status is unavailable: a read did not answer in time. See the warning above.')
                     : t('AHR pool status is unavailable: a read did not answer in time. See the warning above.'));
         }
+        // cr3 (POOLS-PANEL-L9): the last /v1/status failed. What renders below
+        // is the last good read (or telemetry alone): say so, with its age.
+        if (view && view._anasStatusErrAt) {
+            unavailableNote += muted(st && view._anasStatusOkAt
+                ? t('Pool states and capacity are from the last good status read') + ', '
+                    + relAgo(view._anasStatusOkAt) + '.'
+                : t('Pool status is unavailable: the status summary could not be read.'));
+        }
+        // cr3 daemon contract: ZFS is not available on this node — a plain
+        // statement (not an error card, not "unavailable"); AHR pools render
+        // as usual.
+        var zfsNo = knownString(st, 'zfsUnavailable');
+        if (zfsNo) {
+            unavailableNote = muted(zfsNo) + unavailableNote;
+        }
         if (!list.length && !ahrPools.length) {
             return heading(t('Pools')) + (unavailableNote || muted(t('No pools.')));
         }
@@ -1790,7 +1930,7 @@
         var secW = sectionWidth(view, 'anasDashPools', 620);
         var poolW = Math.max(240, secW - 30);
         var vdevW = Math.max(220, poolW - 33);
-        var dims = { pool: poolW, vdev: vdevW };
+        var dims = { pool: poolW, vdev: vdevW, ioUnavailable: ioUnavailable };
 
         var body = '';
         for (var i = 0; i < list.length; i++) {
@@ -1815,8 +1955,12 @@
     // storage throughput above) plus a per-interface card.
     function renderNet(view, tel) {
         var net = tel && tel.net;
-        if (!net) {
-            return heading(t('Network')) + muted(t('No network telemetry.'));
+        // cr3 daemon contract: `net` is null when the network counters could
+        // not be read — "unavailable", never zeros or an empty chart that
+        // reads as no traffic. Missing totals count the same.
+        if (!net || typeof net !== 'object' || knownNumber(net, 'totalRxBytesPerSec') === null
+            || knownNumber(net, 'totalTxBytesPerSec') === null) {
+            return heading(t('Network')) + muted(t('Network unavailable: the network counters could not be read.'));
         }
         // Full-width bicolor rx/tx time chart for total link utilization.
         var secW = sectionWidth(view, 'anasDashNet', 620);
@@ -1854,11 +1998,60 @@
             + (perIf ? '<div class="anas-dash-cards">' + perIf + '</div>' : '');
     }
 
-    // Telemetry freshness line for the toolbar (live/unavailable + a dot).
-    function statusLine(ok, whenTxt) {
-        var color = ok ? OK_COLOR : BAD_COLOR;
-        var txt = ok ? (t('Live telemetry') + ' · ' + whenTxt) : t('Live telemetry unavailable');
+    // Freshness line for the toolbar (live/unavailable + a dot). `ok` is the
+    // telemetry tick that just answered (or failed). cr3 (POOLS-PANEL-L9): a
+    // failed /v1/status is said here too, so "just now" never stands over a
+    // status summary that is stale; the dot turns amber.
+    function statusLine(view, ok) {
+        // `ok` is tri-state: true = a telemetry sample just answered, false =
+        // the last one failed, anything else = none has answered yet (a
+        // neutral line — never "just now" before a first sample).
+        var staleAt = view && view._anasStatusErrAt;
+        var color;
+        var txt;
+        if (ok === true) {
+            color = staleAt ? WARN_COLOR : OK_COLOR;
+            txt = t('Live telemetry') + ' · ' + t('just now');
+        } else if (ok === false) {
+            color = BAD_COLOR;
+            txt = t('Live telemetry unavailable');
+        } else {
+            color = staleAt ? WARN_COLOR : MUTED_COLOR;
+            txt = t('Live telemetry: waiting for the first sample');
+        }
+        if (staleAt) {
+            txt += ' · ' + t('status unavailable');
+            if (view._anasStatusOkAt) {
+                txt += ' (' + t('last read') + ' ' + relAgo(view._anasStatusOkAt) + ')';
+            }
+        }
         return '<span class="dot" style="background:' + color + '"></span>' + enc(txt);
+    }
+
+    // cr3 (POOLS-PANEL-L9): the card a failed /v1/status puts at the top of the
+    // warnings. The last good read's warnings stay under it (a failed read
+    // never empties the banner, which reads as "nothing is wrong").
+    function statusUnavailableCard(view, errMsg) {
+        var body = warnIcon('unavailable')
+            + '<span class="anas-dash-warn-ref">' + enc(t('Status unavailable')) + '</span> '
+            + enc(t('The status summary could not be read') + (errMsg ? ' (' + errMsg + ')' : '') + '. '
+                + (view._anasStatusOkAt
+                    ? t('The warnings and pool states shown are from the last good read') + ', '
+                        + relAgo(view._anasStatusOkAt) + '.'
+                    : t('No status has been read yet.')));
+        var callout = '';
+        try {
+            if (gfx && typeof gfx.callout === 'function') {
+                callout = gfx.callout(body, { level: 'warn' }) || '';
+            }
+        } catch (e) {
+            callout = '';
+        }
+        if (!callout) {
+            callout = '<div class="anas-dash-cb anas-dash-cb-warn">'
+                + '<span aria-hidden="true">⚠</span><span>' + body + '</span></div>';
+        }
+        return '<div class="anas-dash-warn-cards anas-dash-status-unavailable">' + callout + '</div>';
     }
 
     // ---- Section plumbing --------------------------------------------------
@@ -1899,6 +2092,12 @@
             }
             var st = unwrap(res, 'pools');
             view._anasStatus = st; // cache for the composite (needs both endpoints)
+            view._anasStatusOkAt = Date.now();
+            var wasStale = !!view._anasStatusErrAt;
+            view._anasStatusErrAt = null;
+            if (wasStale) {
+                setSection(view, 'anasDashStatus', statusLine(view, view._anasTelOk));
+            }
             setSection(view, 'anasDashWarnings', renderWarnings(st));
             setSection(view, 'anasDashFleet', renderFleet(st, view._anasJobDetails));
             loadJobDetails(view, node, st);
@@ -1914,13 +2113,21 @@
                 return;
             }
             ANAS.warn('dashboard status failed: ' + ANAS.errText(err));
-            // Fail-open: degrade the status-fed sections to muted "unavailable".
-            setSection(view, 'anasDashWarnings', '');
+            // cr3 (POOLS-PANEL-L9): the failure is said, at the top: a
+            // "status unavailable" card over the LAST GOOD warnings (blanking
+            // them read as "nothing is wrong"), and the toolbar line says the
+            // summary is stale. The disk counts degrade to "unavailable"; the
+            // Pools composite keeps the last good states with a note saying
+            // how old they are.
+            view._anasStatusErrAt = Date.now();
+            setSection(view, 'anasDashWarnings',
+                statusUnavailableCard(view, ANAS.errText(err)) + renderWarnings(view._anasStatus));
             setSection(view, 'anasDashFleet', heading(t('Disk Fleet')) + muted(t('Status unavailable.')));
-            // Keep the composite if we've ever had status; otherwise show it as
-            // unavailable (telemetry-only pools may still fill in on a good tick).
+            setSection(view, 'anasDashStatus', statusLine(view, view._anasTelOk));
             if (!view._anasStatus) {
                 setSection(view, 'anasDashPools', heading(t('Pools')) + muted(t('Status unavailable.')));
+            } else {
+                setSection(view, 'anasDashPools', renderPoolsComposite(view));
             }
         });
     }
@@ -1979,7 +2186,8 @@
             // A new measurement — the rolling buffers accept exactly one sample
             // per key at this sequence, however many renders follow (pushBuf).
             view._anasSampleSeq = (view._anasSampleSeq || 0) + 1;
-            setSection(view, 'anasDashStatus', statusLine(true, t('just now')));
+            view._anasTelOk = true;
+            setSection(view, 'anasDashStatus', statusLine(view, true));
             setSection(view, 'anasDashArc', renderArc(view, tel));
             // Pool I/O now lives inside the composite — re-render it each tick.
             setSection(view, 'anasDashPools', renderPoolsComposite(view));
@@ -1991,7 +2199,8 @@
                 return;
             }
             ANAS.warn('dashboard telemetry failed: ' + ANAS.errText(err));
-            setSection(view, 'anasDashStatus', statusLine(false, ''));
+            view._anasTelOk = false;
+            setSection(view, 'anasDashStatus', statusLine(view, false));
             // Only blank the telemetry sections on the FIRST failure (no good
             // data yet). Once we've had a good sample, keep the last-good render
             // rather than flickering to "unavailable" on a transient blip. The

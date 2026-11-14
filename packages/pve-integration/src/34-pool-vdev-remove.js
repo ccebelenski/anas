@@ -205,7 +205,8 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-vdev-remove',
-                title: t('Remove vdev') + ': ' + poolName,
+                // A window title is HTML; the name is data (cr3, POOLS-PANEL-L8).
+                title: t('Remove vdev') + ': ' + ANAS.enc(poolName),
                 modal: true,
                 width: 680,
                 height: 380,

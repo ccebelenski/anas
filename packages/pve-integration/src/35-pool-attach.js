@@ -146,6 +146,12 @@
         return { byName: map, leaves: leaves };
     }
 
+    // A target is a drop zone only when the report SAYS it is allowed (cr3:
+    // an absent `allowed` is unknown and refuses, never a live drop zone).
+    function targetAllowed(target) {
+        return !!target && target.allowed === true;
+    }
+
     // ---- intent vocabulary --------------------------------------------------
 
     function intentTitle(target) {
@@ -383,7 +389,7 @@
         // ---- EXPAND mode render --------------------------------------------
 
         function targetCardHtml(target, bayId) {
-            var allowed = target.allowed !== false;
+            var allowed = targetAllowed(target);
             var head = '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px">'
                 + '<span style="font-weight:700;background:var(--anas-slot);'
                 + 'border:1px solid var(--anas-card-edge);border-radius:6px;padding:2px 9px">'
@@ -412,7 +418,9 @@
                 // and a refusing (non-live) drop zone with the ⛔ treatment. The
                 // "ineligible" label is supplied by bayEmpty() so it survives the
                 // makeDragSelect render() that fills this zone.
-                var why = target.reasonDetail || target.reason || t('This target is not eligible.');
+                var why = target.reasonDetail || target.reason || (target.allowed === false
+                    ? t('This target is not eligible.')
+                    : t('Whether this target is eligible could not be read.'));
                 info += '<div style="margin:2px 0 6px">' + refusalBlockHtml(why) + '</div>';
                 body = '<div class="anas-gfx-bay anas-grid-pex-bay" data-anas-zone="bay:' + enc(bayId) + '"'
                     + ' style="display:flex;align-items:center;justify-content:center;min-height:64px;'
@@ -649,7 +657,7 @@
                         vdevName: targets[i].vdevName,
                         existingDiskId: (leaf && leaf.firstLeaf) || targets[i].vdevName,
                         target: targets[i],
-                        allowed: targets[i].allowed !== false,
+                        allowed: targetAllowed(targets[i]),
                         reason: targets[i].reasonDetail || targets[i].reason || '',
                     };
                     targetsHtml += targetCardHtml(targets[i], bId);
@@ -806,7 +814,8 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-attach anas-win-pool-expand',
-                title: t('Expand / Replace') + ': ' + poolName,
+                // cr3 (POOLS-PANEL-L8): a window title is HTML; the name is data.
+                title: t('Expand / Replace') + ': ' + enc(poolName),
                 modal: true,
                 width: 900,
                 height: 660,
@@ -872,7 +881,9 @@
                     var all = (res && res.data) || [];
                     avail = [];
                     for (var i = 0; i < all.length; i++) {
-                        if (all[i].status === 'available') {
+                        // cr3 (POOLS-PANEL-M4): the shared isComposableDisk
+                        // rule — a hands-off disk is never offered.
+                        if (ANAS.gfx && ANAS.gfx.isComposableDisk(all[i])) {
                             avail.push(all[i]);
                         }
                     }

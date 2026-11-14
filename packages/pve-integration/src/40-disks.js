@@ -126,6 +126,11 @@
                 // <member>" pair to render honestly.
                 case 'ceph_osd':
                     return t('Ceph');
+                // cr3 daemon contract: `zpool status` could not be read, so
+                // pool membership is not known — its own group, never
+                // Available or Other.
+                case 'unknown':
+                    return t('Unknown');
                 default:
                     return t('Other');
             }
@@ -142,8 +147,10 @@
             return [{
                 ftype: 'grouping',
                 // Group header shows the pool/vdev label + a member count so a
-                // vdev's disk count is visible at a glance.
-                groupHeaderTpl: '{name} ({rows.length})',
+                // vdev's disk count is visible at a glance. The label is data
+                // (pool, vdev and AHR array names): the template encodes it
+                // (cr3, POOLS-PANEL-L8).
+                groupHeaderTpl: '{name:htmlEncode} ({rows.length})',
                 enableGroupingMenu: false,
                 collapsible: true,
             }];
@@ -162,21 +169,13 @@
     // the existing Disk cell; every column and behaviour is unchanged. Fail open:
     // any gfx trouble degrades silently to the original text.
 
-    // Map a disk record to a gfx object kind. NVMe wins on transport (or an nvmeN
-    // kernel name); otherwise the rotational flag decides SSD vs HDD. Unknown
-    // rotational falls back to 'hdd' (the safe, common default). Uses only fields
-    // the store already carries: transport, name, rotational.
+    // Map a disk record to a gfx object kind: the ONE shared mapping
+    // (ANAS.gfx.diskKindOf — NVMe on transport or an nvmeN kernel name, then the
+    // rotational flag). cr3: an unknown rotational flag is the neutral 'disk'
+    // shape, the same answer the composers give; it used to read HDD here and
+    // SSD there.
     function gfxKind(d) {
-        var tran = ('' + (d.transport || '')).toLowerCase();
-        var name = ('' + (d.name || '')).toLowerCase();
-        if (tran === 'nvme' || name.indexOf('nvme') === 0) {
-            return 'nvme';
-        }
-        if (d.rotational === false) {
-            return 'ssd';
-        }
-        // rotational === true → HDD; unknown/undefined → HDD default.
-        return 'hdd';
+        return ANAS.gfx.diskKindOf(d);
     }
 
     // Map the fused health signal to a gfx status state (drives the corner dot and
@@ -410,6 +409,10 @@
                 return t('System');
             case 'ceph_osd':
                 return t('Ceph OSD');
+            case 'unknown':
+                // cr3 daemon contract: membership could not be read.
+                return '<span style="color:' + COLOR_UNKNOWN + ';">'
+                    + enc(t('Unknown: pool membership could not be read')) + '</span>';
             case 'other':
             default:
                 if (d.partitions && d.partitions.length) {
@@ -419,6 +422,10 @@
         }
     }
 
+    function errCount(n) {
+        return (typeof n === 'number' && isFinite(n)) ? n : '?';
+    }
+
     // ZFS error counts "R/W/C" for a pool member; highlighted red when any are
     // non-zero (the triage signal). "—" when the disk is not a pool member.
     function renderZfsErrors(v, meta, rec) {
@@ -426,9 +433,10 @@
         if (!e) {
             return '<span style="color:' + COLOR_UNKNOWN + ';">&mdash;</span>';
         }
-        var r = e.read || 0;
-        var w = e.write || 0;
-        var c = e.checksum || 0;
+        // cr3: a counter the record does not carry is '?', never a 0.
+        var r = errCount(e.read);
+        var w = errCount(e.write);
+        var c = errCount(e.checksum);
         var text = r + '/' + w + '/' + c;
         if (r > 0 || w > 0 || c > 0) {
             return colored(text, COLOR_CRITICAL);
@@ -466,13 +474,16 @@
     function makeAttributeStore(attributes) {
         return Ext.create('Ext.data.Store', {
             fields: [
-                { name: 'id', type: 'number' },
+                // cr3: allowNull — a typed field coerced an absent number to
+                // 0 and an absent `failing` to false ("No"); null renders as
+                // unknown.
+                { name: 'id', type: 'number', allowNull: true },
                 { name: 'name', type: 'string' },
-                { name: 'value', type: 'number' },
-                { name: 'worst', type: 'number' },
-                { name: 'threshold', type: 'number' },
-                { name: 'rawValue', type: 'number' },
-                { name: 'failing', type: 'boolean' },
+                { name: 'value', type: 'number', allowNull: true },
+                { name: 'worst', type: 'number', allowNull: true },
+                { name: 'threshold', type: 'number', allowNull: true },
+                { name: 'rawValue', type: 'number', allowNull: true },
+                { name: 'failing', type: 'boolean', allowNull: true },
             ],
             data: attributes || [],
         });
@@ -511,6 +522,13 @@
             + ';padding:0 0 6px 2px;">' + parts.join(' &middot; ') + '</div>';
     }
 
+    function yesNoUnknown(v) {
+        if (v === true) {
+            return t('Yes');
+        }
+        return v === false ? t('No') : t('Unknown');
+    }
+
     // Name/value summary store for the NVMe / device shape (no attribute table)
     // — used when SmartData.attributes is empty.
     function makeSummaryStore(smart) {
@@ -527,9 +545,10 @@
                 data: rows,
             });
         }
-        push(t('Supported'), smart.supported ? t('Yes') : t('No'));
-        push(t('Enabled'), smart.enabled ? t('Yes') : t('No'));
-        push(t('Overall Health'), smart.overallHealth);
+        // cr3: a value the answer did not carry reads "Unknown", never "No".
+        push(t('Supported'), yesNoUnknown(smart.supported));
+        push(t('Enabled'), yesNoUnknown(smart.enabled));
+        push(t('Overall Health'), smart.overallHealth ? smart.overallHealth : t('Unknown'));
         if (smart.temperature !== null && smart.temperature !== undefined) {
             push(t('Temperature'), smart.temperature + ' °C');
         }
@@ -548,25 +567,37 @@
         });
     }
 
+    // A SMART attribute number, or a muted dash when the row does not carry it
+    // (cr3: never a 0, and never the text "null").
+    function renderAttrNum(v) {
+        if (typeof v !== 'number' || isNaN(v)) {
+            return '<span style="color:' + COLOR_UNKNOWN + ';">&mdash;</span>';
+        }
+        return enc('' + v);
+    }
+
     function attributeColumns() {
         return [
-            { text: t('ID'), dataIndex: 'id', width: 50, align: 'right' },
+            { text: t('ID'), dataIndex: 'id', width: 50, align: 'right', renderer: renderAttrNum },
             {
                 text: t('Attribute'),
                 dataIndex: 'name',
                 flex: 1,
                 renderer: Ext.String.htmlEncode,
             },
-            { text: t('Value'), dataIndex: 'value', width: 70, align: 'right' },
-            { text: t('Worst'), dataIndex: 'worst', width: 70, align: 'right' },
-            { text: t('Threshold'), dataIndex: 'threshold', width: 80, align: 'right' },
-            { text: t('Raw'), dataIndex: 'rawValue', width: 100, align: 'right', renderer: ANAS.enc },
+            { text: t('Value'), dataIndex: 'value', width: 70, align: 'right', renderer: renderAttrNum },
+            { text: t('Worst'), dataIndex: 'worst', width: 70, align: 'right', renderer: renderAttrNum },
+            { text: t('Threshold'), dataIndex: 'threshold', width: 80, align: 'right', renderer: renderAttrNum },
+            { text: t('Raw'), dataIndex: 'rawValue', width: 100, align: 'right', renderer: renderAttrNum },
             {
                 text: t('Failing'),
                 dataIndex: 'failing',
                 width: 70,
                 renderer: function (v) {
-                    return v ? colored(t('Yes'), COLOR_CRITICAL) : t('No');
+                    if (v === true) {
+                        return colored(t('Yes'), COLOR_CRITICAL);
+                    }
+                    return v === false ? t('No') : colored(t('Unknown'), COLOR_UNKNOWN);
                 },
             },
         ];
@@ -598,7 +629,8 @@
         var win;
         try {
             win = Ext.create('Ext.window.Window', {
-                title: t('S.M.A.R.T. Values') + ' (' + (disk.name || disk.id) + ')',
+                // A window title is HTML; the disk name is data (cr3 L8).
+                title: t('S.M.A.R.T. Values') + ' (' + enc(disk.name || disk.id) + ')',
                 modal: true,
                 width: 820,
                 height: 520,
@@ -694,7 +726,7 @@
                 ANAS.warn('smart load failed: ' + ANAS.errText(err));
                 content.add(ANAS.errorPanel(
                     t('Failed to load S.M.A.R.T. data') + ': ' + ANAS.errText(err)));
-            },
+            }
         );
     }
 
@@ -724,7 +756,7 @@
                 // Fail open: replace the whole view with an error panel.
                 view.removeAll();
                 view.add(ANAS.errorPanel(t('Failed to load disks') + ': ' + ANAS.errText(err)));
-            },
+            }
         );
     }
 
@@ -752,8 +784,10 @@
                 // both simply omitted when the daemon has no value.
                 'smartStale', 'smartStaleReason',
                 'smartMeasuredAt', 'powerMode',
-                { name: 'size', type: 'number' },
-                { name: 'rotational', type: 'boolean' },
+                // cr3: allowNull keeps an absent size / rotational null — a
+                // typed field coerced it to 0 ("0 B") and false (an SSD icon).
+                { name: 'size', type: 'number', allowNull: true },
+                { name: 'rotational', type: 'boolean', allowNull: true },
                 { name: 'smartHealthy' },
                 { name: 'zfsErrors' },
                 { name: 'partitions' },

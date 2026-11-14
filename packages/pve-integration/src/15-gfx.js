@@ -554,6 +554,15 @@
                 + '<line x1="13" y1="25" x2="24" y2="25"/></g>'
                 + screws([[9, 8], [37, 8], [9, 32], [37, 32]]));
         }
+        // cr3: a disk whose kind the payload does not carry — a plain neutral
+        // drive outline (no platter, no chip), so an unknown SSD or NVMe is
+        // never drawn as a spinning disk.
+        if (kind === 'disk') {
+            return wrapSvg(46, 40, scale,
+                '<rect x="6" y="5" width="34" height="30" rx="4" fill="' + body + '" stroke="#7c8a99" stroke-width="1"/>'
+                + '<rect x="6.6" y="5.6" width="32.8" height="6" rx="3" fill="#ffffff" opacity=".35"/>'
+                + '<line x1="12" y1="28" x2="34" y2="28" stroke="#aab4c0" stroke-width="1.2"/>');
+        }
         // HDD — 3.5" top view: chassis, mirror platter, spindle, actuator arm.
         var platter = dead ? '#b9a6a3' : 'url(#anasMPlatter)';
         return wrapSvg(48, 42, scale,
@@ -577,11 +586,17 @@
     };
 
     function kindLabel(k) {
-        return k === 'nvme' ? 'NVMe' : k === 'ssd' ? 'SSD' : 'HDD';
+        if (k === 'nvme') { return 'NVMe'; }
+        if (k === 'ssd') { return 'SSD'; }
+        return k === 'hdd' ? 'HDD' : ANAS.t('Disk');
+    }
+    // 'hdd' | 'ssd' | 'nvme', else 'disk' (kind not known: the neutral shape).
+    function knownKind(k) {
+        return (k === 'hdd' || k === 'ssd' || k === 'nvme') ? k : 'disk';
     }
 
     // icon(kind, opts) → skeuomorphic disk object SVG string.
-    //   kind : 'hdd' | 'ssd' | 'nvme'
+    //   kind : 'hdd' | 'ssd' | 'nvme'; anything else draws the neutral 'disk'
     //   opts : { state:'online'|'degraded'|'faulted'|'resilvering'|'spare',
     //            dead:bool, scale:Number (default 0.82), title:String }
     // A `state` renders the corner status dot; 'faulted' (or dead:true) applies
@@ -591,7 +606,7 @@
         try {
             ensureInjected();
             opts = opts || {};
-            kind = (kind === 'ssd' || kind === 'nvme') ? kind : 'hdd';
+            kind = knownKind(kind);
             var state = opts.state;
             var dead = opts.dead === true || state === 'faulted';
             var scale = (typeof opts.scale === 'number' && opts.scale > 0) ? opts.scale : 0.82;
@@ -1675,7 +1690,8 @@
     // diskCard(opts) → a skeuomorphic disk tile (object icon + id + size), the
     // read-only cousin of the composer's draggable disk. Carries the CONVENTION
     // class .anas-gfx-disk so the whole tile is targetable.
-    //   opts : { kind:'hdd'|'ssd'|'nvme', state:<health>, id:String top line,
+    //   opts : { kind:'hdd'|'ssd'|'nvme' (anything else: the neutral 'disk'),
+    //            state:<health>, id:String top line,
     //            sub:String bottom line (e.g. size), title:String }
     gfx.diskCard = function (opts) {
         try {
@@ -1696,21 +1712,40 @@
         }
     };
 
-    // diskKindOf(disk) → 'hdd' | 'ssd' | 'nvme' from an inventory Disk record
-    // (rotational → hdd; else transport 'nvme' → nvme; else ssd). The single
-    // shared mapping so the ZFS and AHR composers classify disks identically.
+    // diskKindOf(disk) → 'hdd' | 'ssd' | 'nvme' | 'disk' from an inventory Disk
+    // record (rotational → hdd; else transport 'nvme' → nvme; else rotational
+    // false → ssd; neither known → 'disk', the neutral shape — cr3: an unknown
+    // flag is never read as SSD here and HDD in the Disks view). The single
+    // shared mapping every disk view asks.
     function diskKindOf(d) {
         d = d || {};
         if (d.rotational === true) { return 'hdd'; }
         var tr = ('' + (d.transport || '')).toLowerCase();
-        return tr === 'nvme' ? 'nvme' : 'ssd';
+        var nm = ('' + (d.name || '')).toLowerCase();
+        if (tr === 'nvme' || nm.indexOf('nvme') === 0) { return 'nvme'; }
+        return d.rotational === false ? 'ssd' : 'disk';
     }
     gfx.diskKindOf = diskKindOf;
+
+    // isComposableDisk(disk) → may a picker offer this inventory Disk record
+    // for a pool, a vdev, an attach or a replace (cr3, POOLS-PANEL-M4). The
+    // SAME two conditions as the shared `isComposableDisk`
+    // (packages/shared/src/schemas/disks.ts), which the daemon's composable
+    // gate refuses on: status 'available' AND no hands-off tag. Every disk
+    // picker asks this one helper, so a hands-off disk (an iSCSI LUN served
+    // by this node, say) is never offered only to be refused at commit.
+    function isComposableDisk(d) {
+        return !!d && d.status === 'available' && d.handsOff === undefined;
+    }
+    gfx.isComposableDisk = isComposableDisk;
 
     // The kind badge used on a draggable disk card (filled pill: HDD/SSD/NVMe).
     // Kept private-but-shared so both composers render the same swatch.
     function dragKindBadge(kind) {
-        var colors = { hdd: 'var(--anas-series-5)', ssd: 'var(--anas-series-2)', nvme: 'var(--anas-series-3)' };
+        var colors = {
+            hdd: 'var(--anas-series-5)', ssd: 'var(--anas-series-2)', nvme: 'var(--anas-series-3)',
+            disk: 'var(--anas-muted)'
+        };
         var label = kindLabel(kind);
         return '<span style="font-size:10px;font-weight:800;letter-spacing:.3px;'
             + 'padding:1px 6px;border-radius:999px;color:#fff;background:'
@@ -1747,7 +1782,7 @@
         try {
             ensureInjected();
             opts = opts || {};
-            var kind = (opts.kind === 'ssd' || opts.kind === 'nvme') ? opts.kind : 'hdd';
+            var kind = knownKind(opts.kind);
             var id = opts.id == null ? '' : opts.id;
             var scale = (typeof opts.iconScale === 'number' && opts.iconScale > 0) ? opts.iconScale : 0.62;
             var icon = gfx.icon(kind, { scale: scale });
@@ -1921,10 +1956,17 @@
             renderer: function (v, meta, rec) {
                 var mounted = rec && rec.get('mounted');
                 var path = enc(v || '');
-                return mounted
-                    ? path
-                    : path + ' <span style="color:var(--anas-warn);font-size:11px">('
+                if (mounted === true) {
+                    return path;
+                }
+                if (mounted === false) {
+                    return path + ' <span style="color:var(--anas-warn);font-size:11px">('
                         + enc(ANAS.t('not mounted')) + ')</span>';
+                }
+                // cr3: no `mounted` on the row is UNKNOWN — never "(not
+                // mounted)". Nothing at all when there is no path either.
+                return v ? path + ' <span style="color:var(--anas-muted);font-size:11px">('
+                    + enc(ANAS.t('mount state unknown')) + ')</span>' : '';
             },
         };
     };

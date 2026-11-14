@@ -37,6 +37,12 @@
                 return;
             }
             poolGrid.setLoading(false);
+            // cr3 daemon contract: ZFS not available on this node — the
+            // node's sentence (encoded) in place of "No importable pools".
+            var zfsNo = ANAS.pools.zfsUnavailableOf ? ANAS.pools.zfsUnavailableOf(res) : null;
+            if (ANAS.pools.setGridEmptyText) {
+                ANAS.pools.setGridEmptyText(poolGrid, zfsNo || t('No importable pools found'));
+            }
             poolGrid.getStore().loadData((res && res.data) || []);
         }, function (err) {
             if (win.destroyed || win.destroying) {

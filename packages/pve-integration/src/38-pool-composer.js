@@ -27,8 +27,9 @@
  *   - a valid pool name,
  *   - >= 1 data vdev at/above its type minimum,
  *   - every non-empty vdev meets its min-disk count,
- *   - (hard rule, 3.22) log/special/dedup vdevs are redundant (mirror >=2 /
- *     raidzN at its min).
+ *   - (hard rule, 3.22) special/dedup vdevs are redundant (mirror >=2 /
+ *     raidzN at its min). A log is a mirror, or (cr3 ruling, POOLS-PANEL-L6)
+ *     an unmirrored log device, which WARNS but does not block.
  * Mixed data-vdev types WARN but don't block. Blocking reasons are shown.
  *
  * ALLOCATION CLASSES (story 3.22): CreatePoolRequest carries specialVdevs/
@@ -81,20 +82,40 @@
         raidz3: { label: 'raidz3', min: 5 },
         stripe: { label: 'stripe', min: 1 },
     };
+    // cr3 (POOLS-PANEL-L5): the shared PoolName rule
+    // (packages/shared/src/schemas/common.ts), exactly: 1 to 255 characters, a
+    // letter first, then letters, digits, `_` and `-`. The composer used to
+    // accept `.` and `:` too, which the daemon then refused with a 400.
+    var POOL_NAME_RE = /^[a-z][\w-]*$/i;
+    var POOL_NAME_MAX = 255;
+
     // Data-vdev type choices offered in the add-row + inline bay selector.
     var DATA_TYPES = ['mirror', 'raidz1', 'raidz2', 'raidz3', 'stripe'];
     // Redundant type choices for log/special/dedup (stripe excluded — must be
     // redundant per the hard rule).
     var REDUNDANT_TYPES = ['mirror', 'raidz1', 'raidz2', 'raidz3'];
+    // cr3 (POOLS-PANEL-L6, settled on a node with ZFS 2.4.2 `zpool create -n`):
+    // ZFS refuses a raidz log outright ("invalid vdev specification:
+    // unsupported 'log' device: raidz"), so the log role never offers raidz.
+    // special/dedup keep their raidz choices (accepted when the data vdevs are
+    // raidz too). Operator ruling on the single-disk log: "not a recommended
+    // thing, but allowable if ZFS allows it" (ZFS does, proven on a node) — the
+    // log role offers 'stripe' (unmirrored log devices) with an amber
+    // advisory warning that never blocks.
+    var LOG_TYPES = ['mirror', 'stripe'];
 
+    // `types` = the layouts a role may take (absent = DATA_TYPES).
     var ROLES = {
         data: { label: 'Data', individual: false, redundantRequired: false },
-        log: { label: 'Log (SLOG)', individual: false, redundantRequired: true },
+        log: { label: 'Log (SLOG)', individual: false, redundantRequired: false, types: LOG_TYPES },
         cache: { label: 'Cache (L2ARC)', individual: true, redundantRequired: false },
         spare: { label: 'Spare', individual: true, redundantRequired: false },
-        special: { label: 'Special (metadata)', individual: false, redundantRequired: true },
-        dedup: { label: 'Dedup (dedup table)', individual: false, redundantRequired: true },
+        special: { label: 'Special (metadata)', individual: false, redundantRequired: true, types: REDUNDANT_TYPES },
+        dedup: { label: 'Dedup (dedup table)', individual: false, redundantRequired: true, types: REDUNDANT_TYPES },
     };
+    function roleTypes(role) {
+        return (ROLES[role] && ROLES[role].types) || DATA_TYPES;
+    }
     // Roles offered in the add-vdev row, in presentation order. The same set
     // serves create and expand — every class can be created with a pool or added
     // to an existing one.
@@ -210,20 +231,12 @@
 
     // ---- disk kind mapping -------------------------------------------------
 
-    // Shared disk-kind mapping (ANAS.gfx.diskKindOf) — the advisor consumes it
-    // too, so keep a thin local alias with a fail-safe fallback.
+    // The ONE shared disk-kind mapping (ANAS.gfx.diskKindOf); the advisor
+    // consumes it too. No local fallback (cr3): the composer opens only when
+    // gfx is ready (openComposer checks gfxReady), and a second copy had
+    // already drifted (it lacked the nvmeN-name rule).
     function diskKind(d) {
-        if (ANAS.gfx && typeof ANAS.gfx.diskKindOf === 'function') {
-            return ANAS.gfx.diskKindOf(d);
-        }
-        if (d.rotational === true) {
-            return 'hdd';
-        }
-        var tr = ('' + (d.transport || '')).toLowerCase();
-        if (tr === 'nvme') {
-            return 'nvme';
-        }
-        return 'ssd';
+        return ANAS.gfx.diskKindOf(d);
     }
 
     // ======================================================================
@@ -249,6 +262,9 @@
             win: null,
             root: null,         // composer body DOM element
             createBtn: null,
+            committing: false,  // an expand "Add vdevs" sequence is in flight
+            abandoned: false,   // the operator closed the composer mid-sequence
+            commitNote: null,   // { tone, lines[] } — what the last commit did
         };
     }
 
@@ -287,7 +303,9 @@
             }
         }
         delete state.assigned[diskId];
-        if (targetVdevId) {
+        // Only a disk the picker offered (state.diskById holds exactly the
+        // composable ones, cr3 M4) can enter a bay.
+        if (targetVdevId && state.diskById[diskId]) {
             var tv = vdevById(state, targetVdevId);
             if (tv) {
                 tv.diskIds.push(diskId);
@@ -332,9 +350,14 @@
         var warnings = [];
         var v, i, n, min;
 
-        var nameOk = /^[A-Za-z][\w.:-]*$/.test(state.name || '');
+        // The create-name rule applies to the name being typed (create mode
+        // only); in expand mode the name is the EXISTING pool's, which ZFS may
+        // have allowed outside this rule, and there is no field to fix it in.
+        var name = state.name || '';
+        var nameOk = state.mode === 'expand'
+            || (POOL_NAME_RE.test(name) && name.length <= POOL_NAME_MAX);
         if (!nameOk) {
-            blocking.push(t('Enter a valid pool name (letter first; letters, digits, . : - _).'));
+            blocking.push(t('Enter a valid pool name (letter first; letters, digits, - _; at most 255).'));
         }
 
         var hasCompleteData = false;
@@ -347,8 +370,25 @@
                 blocking.push(word + ' ' + t('needs at least') + ' ' + min + ' '
                     + t(min === 1 ? 'disk' : 'disks') + ' (' + t('has') + ' ' + n + ').');
             }
-            if (ROLES[v.role] && ROLES[v.role].redundantRequired && n > 0 && !isRedundant(v)) {
+            var allowedTypes = roleTypes(v.role);
+            var typeAllowed = false;
+            for (var ti = 0; ti < allowedTypes.length; ti++) {
+                if (allowedTypes[ti] === v.type) {
+                    typeAllowed = true;
+                }
+            }
+            if (ROLES[v.role] && !ROLES[v.role].individual && !typeAllowed) {
+                // cr3 (POOLS-PANEL-L6): a layout ZFS refuses for this role is
+                // never sent (a raidz log fails at `zpool create/add`).
+                blocking.push(roleLabel(v.role) + ' ' + t('vdev cannot be') + ' '
+                    + (TYPES[v.type] ? TYPES[v.type].label : v.type) + ' ('
+                    + t('allowed') + ': ' + allowedTypes.join(', ') + ').');
+            } else if (ROLES[v.role] && ROLES[v.role].redundantRequired && n > 0 && !isRedundant(v)) {
                 blocking.push(roleLabel(v.role) + ' ' + t('vdev must be redundant (mirror ≥ 2, or a raidzN at its minimum) — losing it can lose the whole pool.'));
+            }
+            if (v.role === 'log' && v.type === 'stripe' && n > 0) {
+                // cr3 ruling (POOLS-PANEL-L6): allowed, said, never blocking.
+                warnings.push(t('An unmirrored log device: if it fails at the same moment as a crash or power loss, the last few seconds of synchronous writes are lost; the pool itself is not at risk.'));
             }
             if (v.role === 'data' && n >= min) {
                 hasCompleteData = true;
@@ -450,11 +490,14 @@
             if (state.assigned[d.id]) {
                 continue;
             }
-            if (diskKind(d) === 'hdd') {
+            var fk = diskKind(d);
+            if (fk === 'hdd') {
                 freeHDD++;
-            } else {
+            } else if (fk === 'ssd' || fk === 'nvme') {
                 freeFlash++;
             }
+            // A disk of unknown kind counts as neither (cr3): the advisor
+            // never suggests a special/cache/log from a guess.
         }
 
         // Roles already present — the STAGED vdevs and, in expand mode, the
@@ -550,7 +593,8 @@
         var stKey = state === 'online' ? 'online'
             : (state === 'degraded' ? 'degraded'
                 : (state === 'faulted' || state === 'unavail' || state === 'removed' ? 'faulted' : null));
-        var icon = ANAS.gfx.icon('hdd', stKey ? { state: stKey, scale: 0.6 } : { scale: 0.6 });
+        // PoolDetail carries no disk kind: the neutral shape (cr3).
+        var icon = ANAS.gfx.icon('disk', stKey ? { state: stKey, scale: 0.6 } : { scale: 0.6 });
         return '<div class="anas-composer-disk-ro" title="' + enc(disk.id) + '"'
             + ' style="width:216px;display:inline-flex;align-items:center;gap:9px;padding:7px 9px;margin:4px;'
             + 'border-radius:11px;box-sizing:border-box;opacity:.85;'
@@ -581,7 +625,7 @@
         var role = ROLES[v.role] || { individual: false };
         var n = v.diskIds.length;
         var min = typeMin(v.type);
-        var typeChoices = role.redundantRequired ? REDUNDANT_TYPES : DATA_TYPES;
+        var typeChoices = roleTypes(v.role);
         var typeSel = '';
         if (!role.individual) {
             var opts = '';
@@ -782,7 +826,20 @@
                 + '✓ ' + enc(t('Ready to create.')) + '</div>';
         }
 
-        el.innerHTML = '<div style="' + SEC + '">' + enc(t('Summary')) + '</div>'
+        // cr3 (POOLS-PANEL-M3): what the last "Add vdevs" did, vdev by vdev.
+        var note = '';
+        if (state.commitNote && state.commitNote.lines && state.commitNote.lines.length) {
+            var nl = '';
+            for (i = 0; i < state.commitNote.lines.length; i++) {
+                nl += '<div>' + enc(state.commitNote.lines[i]) + '</div>';
+            }
+            note = '<div class="anas-composer-commit-note" style="font-size:12px;padding:7px 9px;'
+                + 'border-radius:9px;margin-bottom:10px;'
+                + 'background:color-mix(in srgb,var(--anas-danger) 14%,transparent);color:var(--anas-danger)">'
+                + nl + '</div>';
+        }
+
+        el.innerHTML = note + '<div style="' + SEC + '">' + enc(t('Summary')) + '</div>'
             + '<div style="margin-bottom:10px">' + gauge + '</div>'
             + stat(t('Usable'), usable ? fmtBytes(usable) : '—')
             + stat(t('Raw data'), raw ? fmtBytes(raw) : '—')
@@ -835,7 +892,9 @@
             renderSummary(state, result);
             renderAdvisor(state, result);
             if (state.createBtn) {
-                state.createBtn.setDisabled(!result.valid);
+                // An "Add vdevs" sequence in flight keeps the button off: a
+                // second press would start a second sequence over the same draft.
+                state.createBtn.setDisabled(!result.valid || !!state.committing);
             }
             wireDynamic(state);
         } catch (e) {
@@ -1039,7 +1098,12 @@
         if (mountInput) {
             mountInput.addEventListener('input', function () {
                 // Optional field: empty = the default shown in the placeholder.
-                state.mountpoint = mountInput.value.replace(/\s+/g, '');
+                // cr3 (POOLS-PANEL-M1): send what was typed, trimmed at the
+                // ends only — a space inside a path is part of the path (the
+                // shared AbsolutePath allows it; the change-mount flow sends
+                // it as typed). Deleting every whitespace character sent
+                // "/srv/my pool" as "/srv/mypool".
+                state.mountpoint = String(mountInput.value || '').trim();
             });
         }
         var roleSel = root.querySelector('#anasc-role');
@@ -1052,7 +1116,7 @@
             }
             var role = roleSel.value;
             var meta = ROLES[role] || {};
-            var choices = meta.redundantRequired ? REDUNDANT_TYPES : DATA_TYPES;
+            var choices = roleTypes(role);
             typeSel.disabled = !!meta.individual;
             if (meta.individual) {
                 typeSel.innerHTML = '<option value="stripe">' + enc(t('individual disks')) + '</option>';
@@ -1181,9 +1245,103 @@
         return { role: v.role, vdev: toSpec(v) };
     }
 
+    // A staged vdev named for the operator: "Data mirror (ata-A, ata-B)".
+    function vdevWords(v) {
+        return roleLabel(v.role) + ' ' + (TYPES[v.type] ? TYPES[v.type].label : v.type)
+            + ' (' + v.diskIds.join(', ') + ')';
+    }
+
+    // Drop a vdev that is now IN the pool from the draft: the bay goes, and its
+    // disks leave the available list (they are pool members now, never offered
+    // again by a stale draft).
+    function dropCommitted(state, v) {
+        var kept = [];
+        var i;
+        for (i = 0; i < state.vdevs.length; i++) {
+            if (state.vdevs[i] !== v) {
+                kept.push(state.vdevs[i]);
+            }
+        }
+        state.vdevs = kept;
+        var gone = {};
+        for (i = 0; i < v.diskIds.length; i++) {
+            gone[v.diskIds[i]] = true;
+            delete state.assigned[v.diskIds[i]];
+            delete state.diskById[v.diskIds[i]];
+        }
+        var disks = [];
+        for (i = 0; i < state.disks.length; i++) {
+            if (!gone[state.disks[i].id]) {
+                disks.push(state.disks[i]);
+            }
+        }
+        state.disks = disks;
+    }
+
+    // Every staged vdev checked with what the panel already has BEFORE the
+    // first add (cr3, POOLS-PANEL-M3): the draft's own rules, and every disk
+    // still one the inventory offered as composable. A problem here adds
+    // nothing.
+    function precheckStaged(state, staged) {
+        var problems = [];
+        var r = validate(state);
+        for (var b = 0; b < r.blocking.length; b++) {
+            problems.push(r.blocking[b]);
+        }
+        for (var i = 0; i < staged.length; i++) {
+            for (var j = 0; j < staged[i].diskIds.length; j++) {
+                var d = state.diskById[staged[i].diskIds[j]];
+                if (!d || !ANAS.gfx.isComposableDisk(d)) {
+                    problems.push(t('Disk') + ' ' + staged[i].diskIds[j] + ' '
+                        + t('is no longer available to add.'));
+                }
+            }
+        }
+        return problems;
+    }
+
+    // After a stopped sequence: re-read the pool and the disks, then keep in
+    // the draft only what is still true. A staged disk the inventory no longer
+    // offers leaves its bay; a staged vdev none of whose disks is still
+    // available is dropped (its disks went somewhere — the pool, most likely,
+    // when the outcome was unknown).
+    function reloadAfterStop(state, done) {
+        loadExistingTopology(state, function () {
+            loadAvailableDisks(state, function (err) {
+                if (!err) {
+                    var kept = [];
+                    for (var i = 0; i < state.vdevs.length; i++) {
+                        var v = state.vdevs[i];
+                        var ids = [];
+                        for (var j = 0; j < v.diskIds.length; j++) {
+                            if (state.diskById[v.diskIds[j]]) {
+                                ids.push(v.diskIds[j]);
+                            } else {
+                                delete state.assigned[v.diskIds[j]];
+                            }
+                        }
+                        if (ids.length || !v.diskIds.length) {
+                            v.diskIds = ids;
+                            kept.push(v);
+                        }
+                    }
+                    state.vdevs = kept;
+                }
+                done();
+            });
+        });
+    }
+
     // Expand: add each staged vdev sequentially (one AddVdevRequest apiece), each
     // carrying its role so the daemon appends it in the right class (data/log/
     // cache/spare/special/dedup).
+    //
+    // cr3 (POOLS-PANEL-M3): OpenZFS has no atomic multi-vdev add, so each add
+    // that completes is dropped from the draft at once (a later retry never
+    // resends it — a raidz data vdev, once added, is permanent). The first add
+    // that fails, is cancelled or whose outcome is lost stops the sequence:
+    // the pool grid and the composer re-read what is true, and the composer
+    // says which vdevs were added and which were not.
     function commitExpand(state) {
         var staged = [];
         for (var i = 0; i < state.vdevs.length; i++) {
@@ -1191,15 +1349,82 @@
                 staged.push(state.vdevs[i]);
             }
         }
+        var problems = precheckStaged(state, staged);
+        if (problems.length) {
+            state.commitNote = { tone: 'danger', lines: [t('Nothing was added.')].concat(problems) };
+            refresh(state);
+            return;
+        }
+        state.commitNote = null;
+        state.committing = true;
+        refresh(state);
+        var added = [];
         var idx = 0;
+        function gone(c) {
+            return !c || !!c.destroyed || !!c.destroying;
+        }
+        // The poll's liveness view (cr3, second review): dead only when BOTH
+        // the composer window and the pool grid are gone. Polling on the grid
+        // alone stopped the sequence silently when the grid went (browser
+        // Back/Forward under the modal) while the composer stayed open;
+        // polling on the window alone stopped it when the composer closed.
+        var pollView = { destroying: false };
+        Object.defineProperty(pollView, 'destroyed', {
+            get: function () { return gone(state.win) && gone(state.grid); },
+        });
+        function reloadGrid() {
+            if (!gone(state.grid) && ANAS.pools && ANAS.pools.reload) {
+                ANAS.pools.reload(state.grid, state.node);
+            }
+        }
+        function winAlive() {
+            return !!(state.win && !state.win.destroyed && !state.win.destroying);
+        }
+        // The outcome, vdev by vdev: in the composer while it is open; as a
+        // notice once the operator closed it mid-sequence (cr3 review: the
+        // sequence used to stop silently on close). A notice, not an Ext.Msg:
+        // the box is one singleton and a job failure's own alert is up.
+        function report(lines) {
+            if (winAlive()) {
+                state.commitNote = { tone: 'danger', lines: lines };
+                reloadAfterStop(state, function () { refresh(state); });
+            } else if (lines.length) {
+                ANAS.toast(t('Add vdevs to') + ' ' + state.poolName + ': ' + lines.join('; '));
+            }
+        }
+        // Stop the sequence at `v` (null = before sending the next one).
+        function stop(v, why) {
+            state.committing = false;
+            var lines = [];
+            var a;
+            for (a = 0; a < added.length; a++) {
+                lines.push(t('Added') + ': ' + vdevWords(added[a]));
+            }
+            if (v) {
+                lines.push(why + ': ' + vdevWords(v));
+            }
+            for (a = idx; a < staged.length; a++) {
+                lines.push((state.abandoned ? t('Not added (the composer was closed)')
+                    : t('Not added (not attempted)')) + ': ' + vdevWords(staged[a]));
+            }
+            reloadGrid();
+            report(lines);
+        }
         function next() {
             if (idx >= staged.length) {
-                if (state.win && !state.win.destroyed && !state.win.destroying) {
+                state.committing = false;
+                if (winAlive()) {
                     state.win.close();
+                } else if (state.abandoned) {
+                    stop(null, '');
+                    return;
                 }
-                if (state.grid && ANAS.pools && ANAS.pools.reload) {
-                    ANAS.pools.reload(state.grid, state.node);
-                }
+                reloadGrid();
+                return;
+            }
+            if (state.abandoned) {
+                // Closed mid-sequence: what was sent finished; nothing more is.
+                stop(null, '');
                 return;
             }
             var v = staged[idx++];
@@ -1208,11 +1433,25 @@
                 method: 'post',
                 path: '/pools/' + encodeURIComponent(state.poolName) + '/vdevs',
                 body: toAddBody(v),
-                view: state.win,
+                // Alive while the composer OR the grid is (see pollView).
+                view: pollView,
                 confirmTitle: 'Add vdev',
                 failTitle: 'Add vdev failed',
                 successMsg: roleLabel(v.role) + ' ' + t('vdev added to') + ' ' + state.poolName,
-                onComplete: next,
+                onComplete: function () {
+                    added.push(v);
+                    dropCommitted(state, v);
+                    if (idx < staged.length && winAlive()) {
+                        refresh(state);
+                    }
+                    next();
+                },
+                onFailed: function () { stop(v, t('Not added (the add failed)')); },
+                onLost: function () { stop(v, t('Outcome unknown (check the pool)')); },
+                onCancelled: function () { stop(v, t('Not added (cancelled)')); },
+                // A confirm prompt answered No. confirmAndRun does not call
+                // this yet (handed to the core area); inert until it does.
+                onCancel: function () { stop(v, t('Not added (declined)')); },
             });
         }
         next();
@@ -1259,7 +1498,9 @@
             var avail = [];
             state.diskById = {};
             for (var i = 0; i < all.length; i++) {
-                if (all[i].status === 'available') {
+                // cr3 (POOLS-PANEL-M4): the shared isComposableDisk rule —
+                // a hands-off disk is never offered (the daemon refuses it).
+                if (ANAS.gfx.isComposableDisk(all[i])) {
                     avail.push(all[i]);
                     state.diskById[all[i].id] = all[i];
                 }
@@ -1337,8 +1578,9 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-view-composer anas-win-composer',
+                // cr3 (POOLS-PANEL-L8): a window title is HTML; the name is data.
                 title: state.mode === 'expand'
-                    ? (t('Expand Pool') + ': ' + state.poolName)
+                    ? (t('Expand Pool') + ': ' + enc(state.poolName))
                     : t('Create Pool'),
                 modal: true,
                 // Fill the ANAS content region (right-hand section), not the
@@ -1380,6 +1622,28 @@
                     },
                 ],
                 listeners: {
+                    // cr3 review: closing while "Add vdevs" runs is asked, never
+                    // silent. Yes = the add in flight finishes (polled on the
+                    // grid), nothing further is sent, and the outcome is said.
+                    beforeclose: function (w) {
+                        if (!state.committing || state.abandoned) {
+                            return true;
+                        }
+                        try {
+                            Ext.Msg.confirm(t('Add vdevs'),
+                                enc(t('Vdevs are still being added to') + ' ' + state.poolName + '. '
+                                    + t('Close anyway? The add in progress finishes on its own; the vdevs not yet sent are not added. The outcome is shown as a notice and in the pool grid.')),
+                                function (btn) {
+                                    if (btn === 'yes') {
+                                        state.abandoned = true;
+                                        w.close();
+                                    }
+                                });
+                        } catch (eC) {
+                            ANAS.warn('composer close confirm failed: ' + ANAS.errText(eC));
+                        }
+                        return false;
+                    },
                     afterrender: function (w) {
                         try {
                             var bodyPanel = w.down('#composerBody');
