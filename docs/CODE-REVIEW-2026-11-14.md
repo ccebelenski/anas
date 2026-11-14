@@ -8,8 +8,6 @@
 
 **Coverage is stated per area** (files read in full, in part, not reached). A file not reached was not reviewed.
 
-**Not yet in this document (reviews still running when it was first committed):** Cross-cutting: values shown as state that no read supplied.
-
 ---
 
 ## Settled in a browser (PVE 9.2, ExtJS 7.0.0.168)
@@ -295,3 +293,46 @@ Coverage: mounts — 9 daemon/shared files in full; 67-mounts.js mostly in full 
 
 Other doors: executor/prod.ts:422 stdin is an open pipe by default (any prompting tool waits for the deadline); SingleLine/AbsolutePath refuse only C0/DEL (check smb.conf/exports parsers for the same \s mismatch).
 Could not verify: armed automount Edit; `guest` added to sec=krb5 lines; H2 premise; systemd mount argv; mount.cifs without a TTY.
+
+## Cross-cutting: values shown as state that no read supplied
+
+Coverage: invented-state — cross-cutting sweep: 2,732 candidate lines; every state literal, switch default, placeholder zero and shared default judged; ~900 panel `|| ''` formatting defaults and ~520 daemon defaults with no state word judged by filter only.
+
+- **INVENTED-STATE-H1** DEFECT repro  routes/dashboard.ts:281-292, 296-310, 320-340, 244-253 (same pattern task-units.ts:1309, snapshot-schedule-units.ts:728, iscsi-warnings.ts:236, mounts.ts:387) — every /v1/status collector except AHR catches its own failure and returns the EMPTY shape as a successful read; readDashboardSection (:691) marks unavailable only on throw/timeout: failed `zpool list -j` => "No pools", no warning cards, a DEGRADED pool's critical card disappears; failed `zpool status -jv` => a FAULTED disk counts healthy. Probes dashboard-reads.mts, disks-status-fail.mts. Fix: collectors throw on a failed read (listUnreadable, pools.ts:492) so the section is unavailable. [owner: pools-disks; mounts.ts:387 -> mounts; iscsi-warnings.ts:236 -> iscsi; task-units.ts:1309 -> backup; snapshot-schedule-units.ts:728 -> datasets]
+- **INVENTED-STATE-H2** DEFECT repro  routes/dashboard.ts:519 — telemetry fills a vdev's `state: info?.state ?? 'ONLINE'` and `role ?? 'data'` when the zpool status join fails: green ONLINE pill (50-dashboard.js:1543) on a vdev that may be FAULTED. dashboard.test.ts ~:118 pins the invented value. Fix: VdevTelemetry.state optional; render no pill / unknown. [pools-disks + pools-panel]
+- **INVENTED-STATE-H3** DEFECT repro  services/ahr-topology.ts:549/556, 864-866 — findmnt exit code unchecked: an AHR pool btrfs put READ-ONLY after an I/O error reports state=healthy, mountedReadOnly=false, no advisory. Probe ahr-reads.mts. [ahr-core]
+- **INVENTED-STATE-M4** DEFECT repro  ahr-topology.ts:543-544, 860, 999-1000 — vgs/lvs exit codes unchecked: `failed` + "volume group not found" with a pin; pool VANISHES without a pin. (= AHR-CORE-M5) [ahr-core]
+- **INVENTED-STATE-M5** DEFECT repro  services/replication-units.ts:377-387 (421-447) — failed LOCAL target listing => never replicated, every snapshot behind. (= REPLICATION-L6) Probe repl-lag.mts. [replication]
+- **INVENTED-STATE-M6** DEFECT repro  70-shares.js:250-252, 389-397 — Shares grid "Active" column is ALWAYS 0: GET /shares/smb (routes/shares-smb.ts:429-441) sends neither activeConnections nor connections; normSmb falls back to 0. Probe smb-active.mjs. Fix: send the count or render a dash when absent. [shares]
+- **INVENTED-STATE-M7** DEFECT read  routes/scrub.ts:140-148 — (= POOLS-DISKS-M3) [datasets]
+- **INVENTED-STATE-M8** DEFECT read  routes/pools.ts:1750-1768 (GET /pools/:name), :2745 (expansion), :1655-1658 (GET /pools) — failed read => 404 "not found" / []. (= POOLS-DISKS-M4) [pools-disks]
+- **INVENTED-STATE-M9** DEFECT read  routes/datasets.ts:445-450, 1913-1927 — failed snapshotNames reads as no snapshots: the dataset-destroy confirm omits "N snapshot(s) will also be destroyed" (recursive destroy understated). [datasets]
+- **INVENTED-STATE-M10** DEFECT read  services/mounts.ts:399-401 (GET /mounts routes/mounts.ts:581, detail, dashboard) — unreadable findmnt table => '' => every fstab mount reads unmounted, others vanish. [mounts]
+- **INVENTED-STATE-L11** DEFECT read  routes/dashboard.ts:449-452, 658-667 — unreadable arcstats => ARC 0%, 0 B / 0 B under "Live telemetry · just now". Fix: arc nullable. [pools-disks + pools-panel]
+- **INVENTED-STATE-L12** DEFECT read  routes/pools.ts:1707, 1711, 1712 — failed probe => scanRunning false, trimSupported false, upgradeAvailable false. [pools-disks]
+- **INVENTED-STATE-L13** POSSIBLE  routes/shares-smb.ts:286-304, 475-477 — (= SHARES-L8) [shares]
+- **INVENTED-STATE-L14** DEFECT read  68-backup.js:4135, 4659, 4899 — repo-test stage defaults to 'ok' when absent ("verified — you can save"); any request error stored as 'tcp'. (= BACKUP-PANEL-L8 + new) [backup-panel]
+- **INVENTED-STATE-L15** DEFECT read  routes/datasets.ts:430-432, 1351 — failed zfs list => GET /pools/:name/datasets empty: an existing pool shows "no datasets". [datasets]
+
+TABLE — state fields that cannot say "unknown" although the read behind them can fail:
+| shared/schemas/dashboard.ts:263 VdevTelemetry.state | 'ONLINE' (dashboard.ts:519) | 50-dashboard.js:1536-1550 |
+| dashboard.ts:261 VdevTelemetry.role | 'data' (:518) | vdevRoleLabel |
+| dashboard.ts:224-229 ArcTelemetry.* | 0 (:451, :663) | 50-dashboard.js:845-864 |
+| dashboard.ts:53 DiskHealthCounts.* | 0 (:298-308) | Disk Fleet tiles |
+| dashboard.ts:63-64 ShareStatusBrief.smbCount/nfsCount | 0 (:322-339) | shares brief |
+| dashboard.ts:48 PoolStatusBrief.scanRunning | false (:281) | dashboard pools |
+| zfs.ts:231 PoolSummary.scanRunning | false (pools.ts:1707) | pools grid |
+| zfs.ts:238, :243 trimSupported, upgradeAvailable (.default(false)) | false (pools.ts:1711-1712) | Trim / Upgrade |
+| ahr.ts:513 AhrPool.state | failed / healthy on failed reads (ahr-topology.ts:999-1028) | 39-ahr.js, dashboard |
+| ahr.ts:496 AhrPool.mountedReadOnly | false (:864) | Remount gating |
+| ahr.ts:502-503, :510 vg.sizeBytes/freeBytes, lv.sizeBytes | 0 (:1047-1053) | 39-ahr.js |
+| ahr.ts:250, :252 AhrCapacity.usedBytes/freeBytes | 0 | 39-ahr.js |
+| ahr.ts:343 AhrCache.state (no unknown) | absent when lvs failed (ahr-cache-state.ts:240) | 39-ahr.js:880-897 |
+| disks.ts:8 Disk.status (no unknown) | other/available for a ZFS member when zpool status fails (lsblk.ts:103-119) | 40-disks.js |
+| schedules.ts:665 PeriodicScrubState.lastScrub (null = never only) | null (scrub.ts:142-147) | "never scrubbed" |
+| replication.ts:317 snapshotsBehind (null unused locally) | N (replication-units.ts:446) | "N behind" |
+| (missing) activeConnections on GET /shares/smb | 0 (70-shares.js:252) | Active column |
+Also: Disk.healthStatus has unknown, but computeHealth (disks.ts:173-185) answers healthy from SMART alone when the ZFS context could not be read.
+
+Clean: gfx primitives, Disks panel health, last-run pills on every task grid, PVE ownership config-unreadable, AHR md layer (throws), AHR cache counters, iSCSI carriedByInterface null, share-path probes, mount guards' tableUnreadable, cloud preview counts.
+Could not verify: iSCSI sessionCount when an ACL's configfs info is unreadable; shared/schemas/cloud.ts:438-441 doc claim about sub-second runs.
