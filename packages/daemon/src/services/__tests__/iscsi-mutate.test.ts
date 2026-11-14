@@ -1258,8 +1258,9 @@ describe('assertSaveable — never saveconfig over a degraded restore (GT-22)', 
     assert.equal(refusal!.reason, 'degraded-restore')
     assert.match(refusal!.message, /gtiscsi_vol1/)
     assert.match(refusal!.message, /saveconfig/)
-    // The refusal has to say what to DO, not merely that it refused.
-    assert.match(refusal!.message, /rtslib-fb-targetctl/)
+    // The refusal has to say what to DO, not merely that it refused — and
+    // (cr3 ISCSI-L8) that is Repair, never a restart of rtslib-fb-targetctl.
+    assert.match(refusal!.message, /use Repair/)
   })
 
   it('a healthy tree is saveable', () => {

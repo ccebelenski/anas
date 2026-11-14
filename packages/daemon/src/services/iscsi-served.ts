@@ -299,6 +299,17 @@ export async function reverifyServedLun(
   }
   if (opts.requireDevice && expected.device === null)
     throw new Error(`${head}: its served device was never verified. ${tail}`)
+  // cr3 (sessionCount): a mapped ACL whose session could not be read is not
+  // "nobody logged in".
+  if (opts.refuseSessions && lun.connectedInitiatorsUnknown === true) {
+    throw new GuardRefusalError({
+      status: 409,
+      code: 'CONFLICT',
+      reason: 'sessions-unknown',
+      message: `The session state of LUN ${expected.index} of '${expected.target}' could not be read now, so ANAS cannot tell `
+        + `whether an initiator is logged in, and LIO would act anyway. ${tail}`,
+    })
+  }
   if (opts.refuseSessions && lun.connectedInitiators.length > 0) {
     const n = lun.connectedInitiators.length
     throw new GuardRefusalError({

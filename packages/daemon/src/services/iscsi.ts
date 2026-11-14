@@ -27,18 +27,19 @@ import type {
   IscsiPortal,
   IscsiSession,
   IscsiTargetDetail,
+  IscsiTpgDetail,
 } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
-import type { LioSaveconfig, SaveconfigStorageObject } from '../parsers/lio-saveconfig.js'
+import type { LioSaveconfig, SaveconfigStorageObject, SaveconfigTpg } from '../parsers/lio-saveconfig.js'
 import type { ZfsMountpoint } from '../parsers/pve-storage.js'
-import type { ConfigfsAcl, ConfigfsBackstore, ConfigfsPortal, LioLiveState } from './iscsi-configfs.js'
+import type { ConfigfsAcl, ConfigfsBackstore, ConfigfsPortal, ConfigfsTpg, LioLiveState } from './iscsi-configfs.js'
 import type { OwnershipInputs, OwnershipLun } from './iscsi-ownership.js'
 import type { StatDevice } from './iscsi-served.js'
 import type { StubVerdict } from './iscsi-stub.js'
 import { stat } from 'node:fs/promises'
 import { anasTargetName } from '@anas/shared'
-import { LIO_SAVECONFIG_PATH, readLioSaveconfig, storageObjectsByName } from '../parsers/lio-saveconfig.js'
+import { LIO_SAVECONFIG_PATH, readLioSaveconfigState, storageObjectsByName } from '../parsers/lio-saveconfig.js'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpointsFull } from '../parsers/pve-storage.js'
 import { readAhrPools } from './ahr-topology.js'
 import { filesystemOf } from './backup-consistency.js'
@@ -109,7 +110,7 @@ export interface IscsiPaths {
    * (story `iscsi.8`). Without it the expected mount is always unknown and the
    * mount-mismatch signal can never be exercised end to end.
    */
-  zfsMountpoints?: () => Promise<ZfsMountpoint[]>
+  zfsMountpoints?: () => Promise<ZfsMountpoint[] | null>
   /**
    * One `stat` of a backing path for the served-device comparison (story
    * `ident.2`): its rdev for a zvol, its dev/ino for an image. Defaults to the
@@ -125,6 +126,13 @@ export interface IscsiReadContext {
   live: LioLiveState
   /** Null when saveconfig.json is absent or unparseable. */
   persisted: LioSaveconfig | null
+  /**
+   * cr3 (ISCSI-L15): why saveconfig.json could not be read, when it EXISTS
+   * but did not read or parse. `persisted` is then null for that reason and
+   * not because nothing is saved: the node is degraded and nothing may save.
+   * Absent/null = the file read cleanly, or is not there.
+   */
+  persistedUnreadable?: string | null
   inputs: OwnershipInputs
   /**
    * Addresses this node's interfaces currently carry. NULL means "could not be
@@ -195,7 +203,8 @@ export interface IscsiBackingProbe {
  */
 export function iscsiAvailability(ctx: IscsiReadContext): IscsiAvailability {
   const configfsPresent = ctx.live.present
-  const saveconfigPresent = ctx.persisted !== null
+  // An unreadable file is PRESENT (cr3, ISCSI-L15) — it is just not readable.
+  const saveconfigPresent = ctx.persisted !== null || (ctx.persistedUnreadable ?? null) !== null
   const installed = configfsPresent || saveconfigPresent
   if (installed)
     return { installed, configfsPresent, saveconfigPresent }
@@ -335,14 +344,17 @@ export async function readIscsiContext(
   executor: CommandExecutor,
   paths: IscsiPaths = {},
 ): Promise<IscsiReadContext> {
-  const [live, persisted] = await Promise.all([
+  const [live, saved] = await Promise.all([
     readConfigfs({ root: paths.configfsRoot ?? CONFIGFS_TARGET_ROOT, blockRoot: paths.blockRoot }),
-    readLioSaveconfig(paths.saveconfigPath ?? LIO_SAVECONFIG_PATH),
+    readLioSaveconfigState(paths.saveconfigPath ?? LIO_SAVECONFIG_PATH),
   ])
+  const persisted = saved.config
+  const persistedUnreadable = saved.unreadable
 
   const empty: IscsiReadContext = {
     live,
     persisted,
+    persistedUnreadable,
     inputs: { pveStorages: new Map(), zfsMountpoints: [] },
     nodeAddresses: null,
     backing: new Map(),
@@ -359,7 +371,7 @@ export async function readIscsiContext(
     // findmnt half is UNREADABLE (`null`), which keeps the #85 gate at the
     // pre-existing behaviour for every seam-driven test.
     paths.zfsMountpoints
-      ? paths.zfsMountpoints().then(mountpoints => ({ mountpoints, findmntNodes: null }))
+      ? paths.zfsMountpoints().then(mountpoints => (mountpoints === null ? null : { mountpoints, findmntNodes: null }))
       : readZfsMountpointsFull(executor),
     readNodeAddresses(executor),
   ])
@@ -376,13 +388,24 @@ export async function readIscsiContext(
   // dir storages (pvepool.1 review fix 5) are the share-path backstop's. The
   // same findmnt table gates the dir-path → dataset resolution here and in
   // the footprint service — one rule, one read, no divergence.
-  const pveStorages = (await readPveStorages(paths.pveStorageCfg ?? PVE_STORAGE_CFG, zfsMountpoints, findmntNodes))?.byPool ?? null
+  const storagesRead = await readPveStorages(paths.pveStorageCfg ?? PVE_STORAGE_CFG, zfsMountpoints, findmntNodes)
+  const pveStorages = storagesRead?.byPool ?? null
   // Boot facts for the system rule of the footprint predicate — null when the
   // probe fails (UNREADABLE), so the ownership answer tightens toward
   // hands-off via the whole-pool fallback (pvepool.1).
   const systemFacts = await readSystemPoolFacts(executor)
 
-  const inputs: OwnershipInputs = { pveStorages, zfsMountpoints, findmntNodes, systemFacts }
+  const inputs: OwnershipInputs = {
+    pveStorages,
+    zfsMountpoints,
+    findmntNodes,
+    systemFacts,
+    // cr3: a failed `zfs list` is not "no datasets" — a file LUN's PVE
+    // ownership is then unknown (see classifyBacking).
+    // (cr3 merge, pools): a dir storage whose dataset could not be placed
+    // leaves PVE's claim on a file LUN just as unknown.
+    ...(mountRead === null || (storagesRead?.unplacedDirs?.length ?? 0) > 0 ? { zfsMountpointsUnreadable: true } : {}),
+  }
   const backingPaths = collectBackingPaths(live, persisted)
 
   // AHR topology is the expensive read (mdstat + LVM + btrfs), so it happens
@@ -391,7 +414,8 @@ export async function readIscsiContext(
   const needsAhr = backingPaths.some((p) => {
     if (p.startsWith('/dev/'))
       return false
-    return classifyBacking(p, inputs).kind === 'foreign'
+    const c = classifyBacking(p, inputs)
+    return c.kind === 'foreign' || c.ownershipUnknown === true
   })
   if (needsAhr) {
     try {
@@ -419,6 +443,7 @@ export async function readIscsiContext(
   return {
     live,
     persisted,
+    persistedUnreadable,
     inputs,
     nodeAddresses,
     backing,
@@ -518,6 +543,222 @@ function buildAclFromLive(a: ConfigfsAcl): IscsiAcl {
   return acl
 }
 
+/** One TPG of a target, built from whichever sources have it. */
+interface TpgBuild {
+  tag: number
+  enabled: boolean
+  present: boolean
+  persisted: boolean
+  portals: IscsiPortal[]
+  acls: IscsiAcl[]
+  sessions: IscsiSession[]
+  luns: IscsiLun[]
+  /** A live ACL of this TPG whose session could not be read (cr3). */
+  sessionsUnknown: boolean
+}
+
+/** The live and persisted halves of one target, and the backstores both name. */
+interface TargetSources {
+  iqn: string
+  persistedStorage: Map<string, SaveconfigStorageObject>
+  liveStorage: Map<string, ConfigfsBackstore>
+}
+
+/**
+ * Build ONE TPG — its portals, ACLs, sessions and LUNs, each the union of the
+ * live and the persisted record. Every TPG of a target goes through here
+ * (cr3, ISCSI-H2): the read layer used to build the first TPG only, so a hole,
+ * a LUN or a logged-in initiator in any other TPG was invisible to the health
+ * diff, the held-by-LUN claims and every session gate.
+ */
+function buildTpg(
+  ctx: IscsiReadContext,
+  src: TargetSources,
+  tag: number,
+  liveTpg: ConfigfsTpg | undefined,
+  persistedTpg: SaveconfigTpg | undefined,
+): TpgBuild {
+  const { iqn, persistedStorage, liveStorage } = src
+
+  // --- portals: union, live first ---------------------------------------
+  const portals = new Map<string, IscsiPortal>()
+  for (const p of liveTpg?.portals ?? [])
+    portals.set(portalKey(p.address, p.port), buildPortal(p, ctx.nodeAddresses))
+  for (const p of persistedTpg?.portals ?? []) {
+    const key = portalKey(p.address, p.port)
+    if (!portals.has(key))
+      portals.set(key, buildPortal(p, ctx.nodeAddresses))
+  }
+
+  // --- ACLs: union, live first ------------------------------------------
+  const acls = new Map<string, IscsiAcl>()
+  for (const a of liveTpg?.acls ?? [])
+    acls.set(a.initiatorIqn, buildAclFromLive(a))
+  for (const a of persistedTpg?.acls ?? []) {
+    if (!acls.has(a.initiatorIqn)) {
+      acls.set(a.initiatorIqn, {
+        initiatorIqn: a.initiatorIqn,
+        chapUserid: a.chapUserid,
+        chapCredentialsSet: a.chapCredentialsSet,
+        mutualUserid: a.mutualUserid,
+        mutualCredentialsSet: a.mutualCredentialsSet,
+        mappedLuns: a.mappedLuns,
+      })
+    }
+  }
+
+  // --- sessions: from the live ACLs' `info` (GT-38) ----------------------
+  // An ACL whose `info` could not be read has a session nobody SAW (cr3): it
+  // is not counted as one, and it is not counted as none either — the TPG
+  // (and every LUN that ACL maps) says unknown, and the session gates refuse.
+  const sessions: IscsiSession[] = []
+  const unreadableAcls = (liveTpg?.acls ?? []).filter(a => a.sessionUnreadable === true)
+  for (const a of liveTpg?.acls ?? []) {
+    if (!a.session)
+      continue
+    sessions.push({
+      initiatorIqn: a.session.initiatorIqn,
+      initiatorAlias: a.session.initiatorAlias,
+      targetIqn: iqn,
+      tpgTag: tag,
+      sessionId: a.session.sessionId,
+      state: a.session.state,
+      connections: a.session.connections,
+      mappedLuns: a.mappedLuns,
+    })
+  }
+
+  // --- LUNs: union by index ---------------------------------------------
+  const lunIndexes = new Set<number>()
+  for (const l of liveTpg?.luns ?? [])
+    lunIndexes.add(l.index)
+  for (const l of persistedTpg?.luns ?? [])
+    lunIndexes.add(l.index)
+
+  const liveLunByIndex = new Map((liveTpg?.luns ?? []).map(l => [l.index, l]))
+  const persistedLunByIndex = new Map((persistedTpg?.luns ?? []).map(l => [l.index, l]))
+
+  const luns: IscsiLun[] = []
+  const sortedLunIndexes = [...lunIndexes]
+  sortedLunIndexes.sort((a, b) => a - b)
+  for (const index of sortedLunIndexes) {
+    const liveLun = liveLunByIndex.get(index)
+    const persistedLun = persistedLunByIndex.get(index)
+    const name = liveLun?.backstoreName ?? persistedLun?.backstoreName ?? ''
+    const liveBackstore = name ? liveStorage.get(name) : undefined
+    const persistedBackstore = name ? persistedStorage.get(name) : undefined
+
+    const plugin = normalizePlugin(
+      liveBackstore?.plugin ?? liveLun?.plugin ?? persistedBackstore?.plugin ?? persistedLun?.plugin ?? '',
+    )
+    const backingPath = liveBackstore?.udevPath || persistedBackstore?.dev || ''
+    // The existence check comes FIRST because the classification depends on
+    // it: a backing that resolves onto nothing ANAS manages is `foreign` only
+    // when it is actually THERE. When it is not, it is `unresolved` — the
+    // boot-restore hole — and that must not cost the target its ownership
+    // (story `iscsi.5`, live-proof F2).
+    const probe = (backingPath ? ctx.backing.get(backingPath) : undefined) ?? { exists: null, size: null }
+    const exists = probe.exists
+    const classification = classifyBacking(backingPath, ctx.inputs, exists)
+
+    // Is what LIO is serving the LUN's data, or a placeholder the restore
+    // service created for itself (story `iscsi.8`, live-proof F2)? The verdict
+    // is computed HERE, on the way in, because it changes the LUN's kind: a
+    // stub RESOLVES — the file is right there — so without this it classifies
+    // `foreign` and takes its target's ownership with it, which is precisely
+    // backwards. A placeholder is an ABSENCE dressed up as a file, so it gets
+    // the absence's answer: `unresolved`, ownership untouched, repairable.
+    const persistedSize = persistedBackstore?.size ?? liveBackstore?.size ?? null
+    const containingMount = backingPath ? filesystemOf(backingPath, ctx.mounts)?.target ?? null : null
+    const stub: IscsiLunStubFacts = {
+      ...fileStubVerdict({
+        backingPath,
+        plugin,
+        persistedSize,
+        exists: probe.exists,
+        actualSize: probe.size,
+        expectedMount: classification.mountpoint,
+        containingMount,
+      }),
+      persistedSize: persistedSize ?? 0,
+      actualSize: probe.size,
+      containingMount,
+      expectedMount: classification.mountpoint,
+    }
+    if (stub.stub && backingPath)
+      ctx.stubs.set(backingPath, stub)
+
+    const lun: IscsiLun = {
+      index,
+      name,
+      // A backing that positively resolves onto storage ANAS does not manage
+      // is `foreign`; one that resolves onto nothing at all is `unresolved`; a
+      // zvol/file whose path has merely gone stale keeps its kind and reports
+      // `backingExists: false` instead (GT-40). A STUB is `unresolved` too:
+      // the bytes the LUN is supposed to serve are not on this node.
+      // cr3 (review): only a ZERO-SIZE file is a placeholder (the F2 signal).
+      // A full-size image on an unexpected mount (a bind mount, an altroot)
+      // holds data: reported (`stubLuns`, wrongMount), never read as absent.
+      kind: stub.zeroSized ? 'unresolved' : classification.kind,
+      plugin,
+      backingPath,
+      size: liveBackstore?.size ?? persistedBackstore?.size ?? null,
+      // Serial: live first, but the persisted `wwn` is the SAME string — it is
+      // what a restore replays, which is why a reboot preserves identity for
+      // free (GT-19).
+      serial: liveBackstore?.serial ?? persistedBackstore?.wwn ?? null,
+      attributes: liveBackstore
+        ? attributesFromLive(liveBackstore)
+        : persistedBackstore
+          ? attributesFromPersisted(persistedBackstore)
+          : {},
+      // THIS TPG's sessions only: a LUN index is an address inside one TPG,
+      // and LUN 0 of another TPG is another disk.
+      connectedInitiators: sessions
+        .filter(s => s.mappedLuns.includes(index))
+        .map(s => s.initiatorIqn),
+      present: liveLun !== undefined && liveBackstore !== undefined,
+      // A stub reports its BACKING as absent, and it is not a lie: the file is
+      // there, but the LUN's data is not, and every consumer of this flag —
+      // Repair's "is it back yet", the image-restore door, the grid's tooltips
+      // — is asking about the data. Answering "present" because a 0-byte
+      // placeholder can be `stat`ed is how F2 let Repair re-create a LUN over
+      // the placeholder.
+      backingExists: stub.zeroSized ? false : exists,
+    }
+    // cr3 (review): an image that is not there (absent, or a placeholder) or
+    // a backing that resolves onto nothing carries NO pool or dataset — for a
+    // file the dataset was inferred from whatever serves the directory now,
+    // which with the image's own filesystem not mounted is the PARENT (on a
+    // ZFS-root node, the boot dataset): wrong on screen, and a held-by-LUN
+    // claim that over-refused a rollback or rename of it. A zvol path names
+    // its own dataset and keeps it.
+    const isFile = backingPath.startsWith('/') && !backingPath.startsWith('/dev/')
+    const placeless = lun.kind === 'unresolved' || (isFile && lun.backingExists === false)
+    if (classification.pool && !placeless)
+      lun.pool = classification.pool
+    if (classification.dataset && !placeless)
+      lun.dataset = classification.dataset
+    if (classification.ownershipUnknown)
+      lun.backingOwnershipUnknown = true
+    if (unreadableAcls.some(a => a.mappedLuns.includes(index)))
+      lun.connectedInitiatorsUnknown = true
+    luns.push(lun)
+  }
+
+  return {
+    tag,
+    enabled: liveTpg?.enabled ?? persistedTpg?.enable ?? false,
+    present: liveTpg !== undefined,
+    persisted: persistedTpg !== undefined,
+    portals: [...portals.values()],
+    acls: [...acls.values()],
+    sessions,
+    luns,
+    sessionsUnknown: unreadableAcls.length > 0,
+  }
+}
+
 /**
  * Build the full detail for every target either source knows about.
  *
@@ -525,6 +766,12 @@ function buildAclFromLive(a: ConfigfsAcl): IscsiAcl {
  * at the next boot, and a target that is persisted but not live is a restore
  * that did not happen. Both are things an operator needs to see, so neither is
  * silently dropped.
+ *
+ * EVERY TPG is built (cr3, ISCSI-H2). ANAS creates exactly one TPG per target
+ * and the target's own fields describe the lowest-tagged one — joined by TAG
+ * across the two sources, never by position — while every other TPG rides
+ * `otherTpgs`, its sessions ride `sessions` (each naming its tag) and its LUNs
+ * count toward ownership and the missing-LUN count.
  */
 export async function buildIscsiTargets(ctx: IscsiReadContext): Promise<IscsiTargetDetail[]> {
   const persistedByIqn = new Map((ctx.persisted?.targets ?? []).map(t => [t.iqn, t]))
@@ -539,198 +786,129 @@ export async function buildIscsiTargets(ctx: IscsiReadContext): Promise<IscsiTar
   for (const iqn of iqns) {
     const liveTarget = liveByIqn.get(iqn)
     const persistedTarget = persistedByIqn.get(iqn)
-    // ANAS creates exactly one TPG per target; a foreign target may have more,
-    // and the first (lowest tag) is the one the summary describes.
-    const liveTpg = liveTarget?.tpgs[0]
-    const persistedTpg = persistedTarget?.tpgs[0]
-    const tpgTag = liveTpg?.tag ?? persistedTpg?.tag ?? 1
+    const src: TargetSources = { iqn, persistedStorage, liveStorage }
 
-    // --- portals: union, live first ---------------------------------------
-    const portals = new Map<string, IscsiPortal>()
-    for (const p of liveTpg?.portals ?? [])
-      portals.set(portalKey(p.address, p.port), buildPortal(p, ctx.nodeAddresses))
-    for (const p of persistedTpg?.portals ?? []) {
-      const key = portalKey(p.address, p.port)
-      if (!portals.has(key))
-        portals.set(key, buildPortal(p, ctx.nodeAddresses))
-    }
-
-    // --- ACLs: union, live first ------------------------------------------
-    const acls = new Map<string, IscsiAcl>()
-    for (const a of liveTpg?.acls ?? [])
-      acls.set(a.initiatorIqn, buildAclFromLive(a))
-    for (const a of persistedTpg?.acls ?? []) {
-      if (!acls.has(a.initiatorIqn)) {
-        acls.set(a.initiatorIqn, {
-          initiatorIqn: a.initiatorIqn,
-          chapUserid: a.chapUserid,
-          chapCredentialsSet: a.chapCredentialsSet,
-          mutualUserid: a.mutualUserid,
-          mutualCredentialsSet: a.mutualCredentialsSet,
-          mappedLuns: a.mappedLuns,
-        })
-      }
-    }
-
-    // --- sessions: from the live ACLs' `info` (GT-38) ----------------------
-    const sessions: IscsiSession[] = []
-    for (const a of liveTpg?.acls ?? []) {
-      if (!a.session)
-        continue
-      sessions.push({
-        initiatorIqn: a.session.initiatorIqn,
-        initiatorAlias: a.session.initiatorAlias,
-        targetIqn: iqn,
-        tpgTag,
-        sessionId: a.session.sessionId,
-        state: a.session.state,
-        connections: a.session.connections,
-        mappedLuns: a.mappedLuns,
-      })
-    }
-
-    // --- LUNs: union by index ---------------------------------------------
-    const lunIndexes = new Set<number>()
-    for (const l of liveTpg?.luns ?? [])
-      lunIndexes.add(l.index)
-    for (const l of persistedTpg?.luns ?? [])
-      lunIndexes.add(l.index)
-
-    const liveLunByIndex = new Map((liveTpg?.luns ?? []).map(l => [l.index, l]))
-    const persistedLunByIndex = new Map((persistedTpg?.luns ?? []).map(l => [l.index, l]))
-
-    const luns: IscsiLun[] = []
-    const sortedLunIndexes = [...lunIndexes]
-    sortedLunIndexes.sort((a, b) => a - b)
-    for (const index of sortedLunIndexes) {
-      const liveLun = liveLunByIndex.get(index)
-      const persistedLun = persistedLunByIndex.get(index)
-      const name = liveLun?.backstoreName ?? persistedLun?.backstoreName ?? ''
-      const liveBackstore = name ? liveStorage.get(name) : undefined
-      const persistedBackstore = name ? persistedStorage.get(name) : undefined
-
-      const plugin = normalizePlugin(
-        liveBackstore?.plugin ?? liveLun?.plugin ?? persistedBackstore?.plugin ?? persistedLun?.plugin ?? '',
-      )
-      const backingPath = liveBackstore?.udevPath || persistedBackstore?.dev || ''
-      // The existence check comes FIRST because the classification depends on
-      // it: a backing that resolves onto nothing ANAS manages is `foreign` only
-      // when it is actually THERE. When it is not, it is `unresolved` — the
-      // boot-restore hole — and that must not cost the target its ownership
-      // (story `iscsi.5`, live-proof F2).
-      const probe = (backingPath ? ctx.backing.get(backingPath) : undefined) ?? { exists: null, size: null }
-      const exists = probe.exists
-      const classification = classifyBacking(backingPath, ctx.inputs, exists)
-
-      // Is what LIO is serving the LUN's data, or a placeholder the restore
-      // service created for itself (story `iscsi.8`, live-proof F2)? The verdict
-      // is computed HERE, on the way in, because it changes the LUN's kind: a
-      // stub RESOLVES — the file is right there — so without this it classifies
-      // `foreign` and takes its target's ownership with it, which is precisely
-      // backwards. A placeholder is an ABSENCE dressed up as a file, so it gets
-      // the absence's answer: `unresolved`, ownership untouched, repairable.
-      const persistedSize = persistedBackstore?.size ?? liveBackstore?.size ?? null
-      const containingMount = backingPath ? filesystemOf(backingPath, ctx.mounts)?.target ?? null : null
-      const stub: IscsiLunStubFacts = {
-        ...fileStubVerdict({
-          backingPath,
-          plugin,
-          persistedSize,
-          exists: probe.exists,
-          actualSize: probe.size,
-          expectedMount: classification.mountpoint,
-          containingMount,
-        }),
-        persistedSize: persistedSize ?? 0,
-        actualSize: probe.size,
-        containingMount,
-        expectedMount: classification.mountpoint,
-      }
-      if (stub.stub && backingPath)
-        ctx.stubs.set(backingPath, stub)
-
-      const lun: IscsiLun = {
-        index,
-        name,
-        // A backing that positively resolves onto storage ANAS does not manage
-        // is `foreign`; one that resolves onto nothing at all is `unresolved`; a
-        // zvol/file whose path has merely gone stale keeps its kind and reports
-        // `backingExists: false` instead (GT-40). A STUB is `unresolved` too:
-        // the bytes the LUN is supposed to serve are not on this node.
-        kind: stub.stub ? 'unresolved' : classification.kind,
-        plugin,
-        backingPath,
-        size: liveBackstore?.size ?? persistedBackstore?.size ?? null,
-        // Serial: live first, but the persisted `wwn` is the SAME string — it is
-        // what a restore replays, which is why a reboot preserves identity for
-        // free (GT-19).
-        serial: liveBackstore?.serial ?? persistedBackstore?.wwn ?? null,
-        attributes: liveBackstore
-          ? attributesFromLive(liveBackstore)
-          : persistedBackstore
-            ? attributesFromPersisted(persistedBackstore)
-            : {},
-        connectedInitiators: sessions
-          .filter(s => s.mappedLuns.includes(index))
-          .map(s => s.initiatorIqn),
-        present: liveLun !== undefined && liveBackstore !== undefined,
-        // A stub reports its BACKING as absent, and it is not a lie: the file is
-        // there, but the LUN's data is not, and every consumer of this flag —
-        // Repair's "is it back yet", the image-restore door, the grid's tooltips
-        // — is asking about the data. Answering "present" because a 0-byte
-        // placeholder can be `stat`ed is how F2 let Repair re-create a LUN over
-        // the placeholder.
-        backingExists: stub.stub ? false : exists,
-      }
-      if (classification.pool)
-        lun.pool = classification.pool
-      if (classification.dataset)
-        lun.dataset = classification.dataset
-      luns.push(lun)
-    }
+    const tags = [...new Set([
+      ...(liveTarget?.tpgs ?? []).map(t => t.tag),
+      ...(persistedTarget?.tpgs ?? []).map(t => t.tag),
+    ])]
+    tags.sort((a, b) => a - b)
+    // A target with no TPG at all is still described (tag 1, nothing in it),
+    // exactly as before.
+    const builds = (tags.length > 0 ? tags : [1]).map(tag => buildTpg(
+      ctx,
+      src,
+      tag,
+      liveTarget?.tpgs.find(t => t.tag === tag),
+      persistedTarget?.tpgs.find(t => t.tag === tag),
+    ))
+    const primary = builds[0]
+    const others = builds.slice(1)
+    const allLuns = builds.flatMap(b => b.luns)
+    const sessions = builds.flatMap(b => b.sessions)
 
     // --- ownership ---------------------------------------------------------
     // A stub LUN is handed to ownership as an ABSENCE (`backingExists: false`),
     // not as the resolvable file it physically is. That is the whole ownership
     // half of live-proof F2: the placeholder is real enough to `stat`, so the
     // honest-looking answer ("it resolves, and not onto ANAS storage") declares
-    // ANAS's own target hands-off at the exact moment it needs managing.
-    const ownershipLuns: OwnershipLun[] = luns.map(l => ({
+    // ANAS's own target hands-off at the exact moment it needs managing. Every
+    // TPG's LUNs count: a guest disk mapped in a second TPG is still a guest
+    // disk.
+    const ownershipLuns: OwnershipLun[] = allLuns.map(l => ({
       name: l.name,
       backingPath: l.backingPath,
       backingExists: l.backingExists,
     }))
     const ownership = deriveOwnership(iqn, ownershipLuns, ctx.inputs)
 
-    const portalList = [...portals.values()]
+    const allPortals = builds.flatMap(b => b.portals)
+    // cr3: a target directory that could not be listed hides ACLs, sessions
+    // and LUN mappings — every one of them is unknown, never "none".
+    const unreadable = liveTarget?.unreadable ?? []
+    if (unreadable.length > 0) {
+      for (const lun of allLuns)
+        lun.connectedInitiatorsUnknown = true
+    }
+    const sessionsUnknown = builds.some(b => b.sessionsUnknown) || unreadable.length > 0
     out.push({
       iqn,
       name: anasTargetName(iqn),
       ownership: ownership.ownership,
       ownershipReason: ownership.reason,
       ownershipDetail: ownership.detail,
-      tpgTag,
-      enabled: liveTpg?.enabled ?? persistedTpg?.enable ?? false,
-      portals: portalList,
-      lunCount: luns.length,
-      aclCount: acls.size,
+      tpgTag: primary.tag,
+      enabled: primary.enabled,
+      portals: primary.portals,
+      lunCount: primary.luns.length,
+      aclCount: primary.acls.length,
       sessionCount: sessions.length,
+      ...(sessionsUnknown ? { sessionsUnknown: true } : {}),
+      ...(unreadable.length > 0 ? { configfsUnreadable: [...unreadable] } : {}),
       security: {
-        authentication: liveTpg?.authentication ?? persistedTpg?.authentication ?? false,
-        generateNodeAcls: liveTpg?.generateNodeAcls ?? persistedTpg?.generateNodeAcls ?? false,
-        demoModeDiscovery: liveTpg?.demoModeDiscovery ?? persistedTpg?.demoModeDiscovery ?? false,
+        authentication: liveTarget?.tpgs.find(t => t.tag === primary.tag)?.authentication
+          ?? persistedTarget?.tpgs.find(t => t.tag === primary.tag)?.authentication ?? false,
+        generateNodeAcls: liveTarget?.tpgs.find(t => t.tag === primary.tag)?.generateNodeAcls
+          ?? persistedTarget?.tpgs.find(t => t.tag === primary.tag)?.generateNodeAcls ?? false,
+        demoModeDiscovery: liveTarget?.tpgs.find(t => t.tag === primary.tag)?.demoModeDiscovery
+          ?? persistedTarget?.tpgs.find(t => t.tag === primary.tag)?.demoModeDiscovery ?? false,
       },
       present: liveTarget !== undefined,
       persisted: persistedTarget !== undefined,
-      missingLunCount: luns.filter(l => !l.present).length,
-      portalsWithoutInterfaceCount: portalList.filter(p => p.carriedByInterface === false).length,
-      luns,
-      acls: [...acls.values()],
+      missingLunCount: allLuns.filter(l => !l.present).length,
+      portalsWithoutInterfaceCount: allPortals.filter(p => p.carriedByInterface === false).length,
+      luns: primary.luns,
+      acls: primary.acls,
       sessions,
+      ...(others.length > 0
+        ? {
+            otherTpgs: others.map(b => ({
+              tpgTag: b.tag,
+              enabled: b.enabled,
+              present: b.present,
+              persisted: b.persisted,
+              portals: b.portals,
+              luns: b.luns,
+              acls: b.acls,
+            })),
+          }
+        : {}),
     })
   }
 
   return out
+}
+
+/**
+ * Every TPG of a target as one list — the first (the target's own fields) and
+ * then `otherTpgs` (cr3, ISCSI-H2). The ONE way the health diff, the claims and
+ * the served serials walk a target, so none of them can look at the first TPG
+ * only again.
+ */
+export function targetTpgs(target: IscsiTargetDetail): IscsiTpgDetail[] {
+  return [
+    {
+      tpgTag: target.tpgTag,
+      enabled: target.enabled,
+      present: target.present,
+      persisted: target.persisted,
+      portals: target.portals,
+      luns: target.luns,
+      acls: target.acls,
+    },
+    ...(target.otherTpgs ?? []),
+  ]
+}
+
+/**
+ * Every configfs directory the live read could not list (cr3): the node-level
+ * ones and every target's. Empty when the whole tree read.
+ */
+export function liveUnreadablePaths(ctx: Pick<IscsiReadContext, 'live'>): string[] {
+  return [
+    ...(ctx.live.unreadable ?? []),
+    ...ctx.live.targets.flatMap(t => t.unreadable ?? []),
+  ]
 }
 
 /** Every live session on the node, flattened out of the target details. */
@@ -740,6 +918,6 @@ export function collectIscsiSessions(targets: IscsiTargetDetail[]): IscsiSession
 
 /** Drop the detail arrays — the grid row shape. */
 export function toTargetSummary(detail: IscsiTargetDetail) {
-  const { luns: _luns, acls: _acls, sessions: _sessions, ...summary } = detail
+  const { luns: _luns, acls: _acls, sessions: _sessions, otherTpgs: _otherTpgs, ...summary } = detail
   return summary
 }

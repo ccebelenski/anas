@@ -32,12 +32,13 @@
  *     instead of letting a broken read impersonate a node with no LIO.
  */
 
-import type { IscsiClaim, IscsiHeldByLun } from '@anas/shared'
+import type { IscsiClaim, IscsiHeldByLun, IscsiTargetDetail } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { Advisory } from '../safety/guard.js'
 import type { ConfigfsOptions } from './iscsi-configfs.js'
 import type { IscsiPaths } from './iscsi.js'
 import { iscsiClaims, readIscsiState } from './iscsi-mutate.js'
+import { liveUnreadablePaths, targetTpgs } from './iscsi.js'
 
 /** Trailing slashes, stripped before any path comparison. */
 const TRAILING_SLASH_RE = /\/+$/
@@ -171,11 +172,21 @@ export function toHeldByLun(claim: IscsiClaim): IscsiHeldByLun {
   return {
     targetIqn: claim.targetIqn,
     index: claim.lunIndex,
+    tpgTag: claim.tpgTag,
     name: claim.backstoreName,
     backingPath: claim.backingPath,
     connectedInitiators: claim.connectedInitiators,
+    ...(claim.connectedInitiatorsUnknown === true ? { connectedInitiatorsUnknown: true } : {}),
     detail: claim.detail,
   }
+}
+
+/**
+ * Might an initiator be using this LUN right now? A known session, OR one that
+ * could not be read (cr3) — the one test every "only with no session" gate asks.
+ */
+export function heldWithSessions(held: Pick<IscsiHeldByLun, 'connectedInitiators' | 'connectedInitiatorsUnknown'>): boolean {
+  return held.connectedInitiators.length > 0 || held.connectedInitiatorsUnknown === true
 }
 
 /**
@@ -192,7 +203,8 @@ export function pickHolder(claims: IscsiClaim[], subject: HeldByLunSubject): Isc
   for (const claim of claims) {
     if (!claimHoldsSubject(claim, subject))
       continue
-    if (claim.connectedInitiators.length > 0)
+    // cr3: a session that could not be read is named first too — it may be live.
+    if (claim.connectedInitiators.length > 0 || claim.connectedInitiatorsUnknown === true)
       return toHeldByLun(claim)
     first ??= claim
   }
@@ -288,19 +300,53 @@ export async function iscsiServedSerials(
 ): Promise<Set<string>> {
   try {
     const { targets } = await readIscsiState(executor, paths)
-    const serials = new Set<string>()
-    for (const target of targets) {
-      for (const lun of target.luns) {
-        if (lun.serial)
-          serials.add(normalizeSerial(lun.serial))
-      }
-    }
-    return serials
+    return servedSerialsOf(targets)
   }
   catch (err: unknown) {
     console.warn('anasd: could not read this node\'s LUN serials for the disk inventory:', err)
     return new Set<string>()
   }
+}
+
+/**
+ * {@link iscsiServedSerials} that says when it could not see (cr3, review):
+ * a LIO read that failed, or a configfs tree that could not be listed in
+ * full, is `{ unreadable }` — never an empty set, which a disk picker would
+ * read as "nothing loops back". The existing export keeps its shape for its
+ * current callers.
+ */
+export async function iscsiServedSerialsStrict(
+  executor: CommandExecutor,
+  paths: IscsiPaths = {},
+): Promise<{ serials: Set<string> } | { unreadable: string }> {
+  try {
+    const { ctx, targets } = await readIscsiState(executor, paths)
+    const unreadable = liveUnreadablePaths(ctx)
+    if (unreadable.length > 0)
+      return { unreadable: `the iSCSI configfs tree could not be listed in full (${unreadable.join(', ')})` }
+    return { serials: servedSerialsOf(targets) }
+  }
+  catch (err: unknown) {
+    return { unreadable: `this node's iSCSI LUNs could not be read (${err instanceof Error ? err.message : String(err)})` }
+  }
+}
+
+/**
+ * The pure half of {@link iscsiServedSerials}: every LUN serial of every
+ * target, of EVERY TPG (cr3, ISCSI-H2) — a LUN served through a second TPG
+ * loops back onto this node exactly as one in the first does.
+ */
+export function servedSerialsOf(targets: IscsiTargetDetail[]): Set<string> {
+  const serials = new Set<string>()
+  for (const target of targets) {
+    for (const tpg of targetTpgs(target)) {
+      for (const lun of tpg.luns) {
+        if (lun.serial)
+          serials.add(normalizeSerial(lun.serial))
+      }
+    }
+  }
+  return serials
 }
 
 /** A refusal built by {@link heldByLunRefusal} — 409, no confirm code. */
@@ -332,6 +378,8 @@ export function heldByLunRefusal(
   held: IscsiHeldByLun,
 ): HeldByLunRefusal {
   const sessions = held.connectedInitiators.length
+  // The unknown-session clause rides `held.detail` (the claim's one
+  // sentence) — said once there, never again here (cr3 review 2, L2).
   const live = sessions > 0
     ? ` ${sessions} initiator${sessions === 1 ? ' is' : 's are'} logged in right now (${held.connectedInitiators.join(', ')}) and would lose the disk mid-write.`
     : ''

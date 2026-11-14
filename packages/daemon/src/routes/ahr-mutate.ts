@@ -67,6 +67,16 @@ export const AHR_MIRROR_RECONCILE_PRESENTATION_ONLY: Record<string, string> = {}
 export { ahrHeldByLunConflict, ahrPoolHeldByLun } from '../services/ahr-guard.js'
 
 /**
+ * What the LUN disclosures say when no initiator is listed (cr3 merge, from
+ * the iSCSI lane): "none logged in" only when the session state was READ.
+ */
+function noSessionClause(held: IscsiHeldByLun): string {
+  return held.connectedInitiatorsUnknown === true
+    ? '. Its session state could not be read, so an initiator may be logged in right now.'
+    : '. No initiator is logged in right now.'
+}
+
+/**
  * The parity-rewrite confirm gate's LUN disclosure (seventh pass, F10), or no
  * line at all when nothing is served from the pool.
  *
@@ -82,7 +92,7 @@ export function rewriteLunWarnings(held: IscsiHeldByLun | null): string[] {
     `A guest's disk is live on this pool: iSCSI LUN ${held.index} ('${held.name}') of target ${held.targetIqn} is served from ${held.backingPath}${
       sessions > 0
         ? `, with ${sessions} initiator${sessions === 1 ? '' : 's'} logged in right now (${held.connectedInitiators.join(', ')}). Nothing this run writes is visible to them. It reads every member of the band twice and rewrites parity, and it writes no file. The array will be reading flat out underneath that disk for the duration`
-        : '. No initiator is logged in right now. Nothing this run writes is visible to a guest. It reads every member of the band twice and rewrites parity, and it writes no file'}`,
+        : `${noSessionClause(held)} Nothing this run writes is visible to a guest. It reads every member of the band twice and rewrites parity, and it writes no file`}`,
   ]
 }
 
@@ -104,7 +114,7 @@ export function reconcileLunWarnings(held: IscsiHeldByLun | null): string[] {
     `A guest's disk is live on this pool: iSCSI LUN ${held.index} ('${held.name}') of target ${held.targetIqn} is served from ${held.backingPath}${
       sessions > 0
         ? `, with ${sessions} initiator${sessions === 1 ? '' : 's'} logged in right now (${held.connectedInitiators.join(', ')}). Every row this run writes already matches the checksum btrfs stored for it, so what the guest reads does not change. The array will be reading both legs flat out underneath that disk for the duration`
-        : '. No initiator is logged in right now. Every row this run writes already matches the checksum btrfs stored for it, so what a guest reads does not change'}`,
+        : `${noSessionClause(held)} Every row this run writes already matches the checksum btrfs stored for it, so what a guest reads does not change`}`,
   ]
 }
 

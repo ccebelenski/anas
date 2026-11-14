@@ -150,15 +150,7 @@ import {
 import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
 import { conflict, foreignGate, lunClaims, lunNameFreeGate, saveableGate, targetView } from '../services/iscsi-guard.js'
 import { createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
-import {
-  assertInstalled,
-  assertSaveable,
-  imageFilePath,
-  lunBackingClaims,
-  readIscsiState,
-  resolveFileBackingDir,
-  resolveZvolBacking,
-} from '../services/iscsi-mutate.js'
+import { assertInstalled, assertSaveable, handsOffRefusal, imageFilePath, lunBackingClaims, readIscsiState, resolveFileBackingDir, resolveZvolBacking } from '../services/iscsi-mutate.js'
 import { classifyBacking } from '../services/iscsi-ownership.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from '../services/iscsi.js'
@@ -287,6 +279,11 @@ function imageRestoreConfirmSpec(what: string): GuardSpec<null> {
 
 /** The pass a confirm-only spec signs with: no id, revision or scope — the signed request fields carry the binding. */
 const CONFIRM_ONLY_PASS: GuardPass<null> = { object: null, bound: { id: {} }, advisories: [], locks: [] }
+
+/** cr3 (merge, iSCSI): a target whose initiator sessions could not be read is not a target with none. */
+function sessionsUnknownSentence(iqn: string): string {
+  return `The initiator sessions of target '${iqn}' could not be read, so whether a guest is using its LUNs is not known - nothing was changed; try again`
+}
 
 /**
  * What cancelling a backup run leaves behind — the confirm dialog's
@@ -2341,15 +2338,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `iSCSI target '${lunRef.targetIqn}' not found` } }
     }
-    if (target.ownership !== 'anas') {
+    // cr3 (merge, iSCSI): ONE hands-off rule with the iSCSI verbs: a foreign
+    // target, one with more than one TPG, or one whose backing ownership
+    // could not be read.
+    const handsOff = handsOffRefusal(target)
+    if (handsOff) {
       reply.code(409)
-      return {
-        error: {
-          code: 'CONFLICT',
-          reason: 'foreign-target',
-          message: `Target '${target.iqn}' is not managed by ANAS and is hands-off: ${target.ownershipDetail}`,
-        },
-      }
+      return { error: { code: 'CONFLICT', reason: handsOff.reason, message: handsOff.message } }
     }
     const lun = target.luns.find(l => l.index === lunRef.index)
     if (!lun) {
@@ -2469,6 +2464,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // four at a time and a restore can queue behind long backups), so
     // `runImageRestore` asks again under the iSCSI lock immediately before it
     // disables anything — with the same sentence, from the same helper.
+    if (target.sessionsUnknown === true) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'sessions-unknown', message: sessionsUnknownSentence(target.iqn) } }
+    }
     if (target.sessions.length > 0) {
       reply.code(409)
       return {
@@ -2622,7 +2621,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           // inventing a second story about it.
           readSessions: async (iqn) => {
             const now = await readIscsiState(executor, iscsiPaths)
-            return now.targets.find(t => t.iqn === iqn)?.sessions ?? []
+            const live = now.targets.find(t => t.iqn === iqn)
+            // cr3 (merge, iSCSI): sessions that could not be READ are not "none".
+            if (live?.sessionsUnknown === true)
+              throw new Error(sessionsUnknownSentence(iqn))
+            return live?.sessions ?? []
           },
           // ident.2: called under the lock by runImageRestore — same serial,
           // backstore, path and served device (throws otherwise), and the

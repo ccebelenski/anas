@@ -43,7 +43,12 @@
 
 import type { IscsiDisabledTarget, IscsiForeignChange, IscsiHealth, IscsiMissingLun, IscsiPortalWithoutInterface, IscsiStubLun, IscsiTargetDetail, IscsiTargetServingNothing } from '@anas/shared'
 import type { IscsiReadContext } from './iscsi.js'
-import { iscsiAvailability, normalizePlugin } from './iscsi.js'
+import { iscsiAvailability, liveUnreadablePaths, normalizePlugin, targetTpgs } from './iscsi.js'
+
+/** ` (TPG <n>)` for any TPG but the target's first — whose sentences stay as they were. */
+function tpgClause(tag: number, firstTag: number): string {
+  return tag === firstTag ? '' : ` (TPG ${tag})`
+}
 
 /** What the health diff needs beyond the gathered state. */
 export interface IscsiHealthOptions {
@@ -86,72 +91,181 @@ export function computeIscsiHealth(
   const persistedByIqn = new Map((ctx.persisted?.targets ?? []).map(t => [t.iqn, t]))
   const liveBackstoreNames = new Set(ctx.live.backstores.map(b => b.name))
   const persistedBackstores = new Map((ctx.persisted?.storageObjects ?? []).map(s => [s.name, s]))
+  const liveUnreadable = liveUnreadablePaths(ctx)
 
   for (const target of targets) {
-    // --- LUNs in saveconfig with no configfs counterpart: the restore hole ---
-    for (const lun of target.luns) {
-      if (lun.present)
-        continue
-      // Only a PERSISTED LUN can be a restore hole. A LUN that is in neither
-      // source cannot exist, and one that is live-only is a different finding.
-      const persistedTpg = persistedByIqn.get(target.iqn)?.tpgs.find(t => t.tag === target.tpgTag)
-      const persistedLun = persistedTpg?.luns.find(l => l.index === lun.index)
-      if (!persistedLun)
-        continue
-      const backstore = persistedLun.backstoreName ? persistedBackstores.get(persistedLun.backstoreName) : undefined
-      const backingPath = backstore?.dev ?? lun.backingPath
-      missingLuns.push({
+    // --- live/persisted divergences that are not a restore hole -------------
+    if (!target.persisted && target.present) {
+      foreignChanges.push({
+        kind: 'target-not-persisted',
         targetIqn: target.iqn,
-        tpgTag: target.tpgTag,
-        lunIndex: lun.index,
-        backstoreName: persistedLun.backstoreName ?? lun.name,
-        plugin: normalizePlugin(backstore?.plugin ?? persistedLun.plugin ?? lun.plugin),
-        backingPath,
-        backingExists: lun.backingExists,
-        // A hole whose path holds a placeholder is a DIFFERENT thing to fix, and
-        // the quarantine is what turned it into a hole in the first place. The
-        // fact is re-derived from the filesystem here, so it keeps being told
-        // for as long as it is true and stops the moment it is not.
-        ...(ctx.stubs.has(backingPath) ? { stubBacking: true } : {}),
+        detail: `Target ${target.iqn} is live but absent from the saved configuration — it will not come back after a reboot`,
+      })
+    }
+    else if (target.persisted && !target.present) {
+      foreignChanges.push({
+        kind: 'target-not-restored',
+        targetIqn: target.iqn,
+        detail: `Target ${target.iqn} is in the saved configuration but is not live — the restore did not bring it up`,
       })
     }
 
-    // --- LUNs being served over a PLACEHOLDER (story iscsi.8) ---------------
-    // Not a hole: the LUN is ACTIVATED, the right size, the right serial — and
-    // full of zeros, because `targetctl restore` CREATED the backing file when
-    // the filesystem that should hold it was not mounted (live-proof F2). The
-    // verdict was reached during the build (it decides the LUN's kind); this
-    // only reports it, with the numbers that produced it so the card can say
-    // WHY rather than just that something is wrong.
-    for (const lun of target.luns) {
-      const facts = lun.backingPath ? ctx.stubs.get(lun.backingPath) : undefined
-      if (!facts)
-        continue
-      // Only a LIVE LUN is serving anything, and only a live LUN can be
-      // quarantined. Once one has been, its persisted record still resolves onto
-      // the leftover placeholder — which keeps the LUN `unresolved` and keeps
-      // Repair refusing (that is deliberate) — but it is a `missingLuns` hole
-      // now, and re-reporting it here would have the quarantine chase a LUN that
-      // is already gone on every single health read.
-      if (!lun.present)
-        continue
-      const acted = opts.quarantined?.get(lun.backingPath)
-      stubLuns.push({
-        targetIqn: target.iqn,
-        tpgTag: target.tpgTag,
-        lunIndex: lun.index,
-        backstoreName: lun.name,
-        backingPath: lun.backingPath,
-        persistedSize: facts.persistedSize,
-        actualSize: facts.actualSize,
-        containingMount: facts.containingMount,
-        expectedMount: facts.expectedMount,
-        zeroSized: facts.zeroSized,
-        wrongMount: facts.wrongMount,
-        ownership: target.ownership,
-        quarantined: acted?.quarantined ?? false,
-        fileRemoved: acted?.fileRemoved ?? false,
-      })
+    // EVERY TPG (cr3, ISCSI-H2): a hole in a second TPG is as much a hole as
+    // one in the first — a save over it drops that LUN for good (GT-22) — so
+    // the diff walks them all, each against its own tag on both sides.
+    for (const tpg of targetTpgs(target)) {
+      const persistedTpg = persistedByIqn.get(target.iqn)?.tpgs.find(t => t.tag === tpg.tpgTag)
+      const liveTpg = liveByIqn.get(target.iqn)?.tpgs.find(t => t.tag === tpg.tpgTag)
+
+      // --- LUNs in saveconfig with no configfs counterpart: the restore hole ---
+      for (const lun of tpg.luns) {
+        if (lun.present)
+          continue
+        // cr3: a target whose configfs could not be listed has LUNs nobody
+        // SAW — not holes. Reporting them would point Repair at LUNs that may
+        // be live; the node is degraded by `configfsUnreadable` instead.
+        if ((target.configfsUnreadable ?? []).length > 0)
+          continue
+        // Only a PERSISTED LUN can be a restore hole. A LUN that is in neither
+        // source cannot exist, and one that is live-only is a different finding.
+        const persistedLun = persistedTpg?.luns.find(l => l.index === lun.index)
+        if (!persistedLun)
+          continue
+        const backstore = persistedLun.backstoreName ? persistedBackstores.get(persistedLun.backstoreName) : undefined
+        const backingPath = backstore?.dev ?? lun.backingPath
+        missingLuns.push({
+          targetIqn: target.iqn,
+          tpgTag: tpg.tpgTag,
+          lunIndex: lun.index,
+          backstoreName: persistedLun.backstoreName ?? lun.name,
+          plugin: normalizePlugin(backstore?.plugin ?? persistedLun.plugin ?? lun.plugin),
+          backingPath,
+          backingExists: lun.backingExists,
+          // A hole whose path holds a placeholder is a DIFFERENT thing to fix, and
+          // the quarantine is what turned it into a hole in the first place. The
+          // fact is re-derived from the filesystem here, so it keeps being told
+          // for as long as it is true and stops the moment it is not.
+          ...(ctx.stubs.has(backingPath) ? { stubBacking: true } : {}),
+          targetOwnership: target.ownership,
+        })
+      }
+
+      // --- LUNs being served over a PLACEHOLDER (story iscsi.8) ---------------
+      // Not a hole: the LUN is ACTIVATED, the right size, the right serial — and
+      // full of zeros, because `targetctl restore` CREATED the backing file when
+      // the filesystem that should hold it was not mounted (live-proof F2). The
+      // verdict was reached during the build (it decides the LUN's kind); this
+      // only reports it, with the numbers that produced it so the card can say
+      // WHY rather than just that something is wrong.
+      for (const lun of tpg.luns) {
+        const facts = lun.backingPath ? ctx.stubs.get(lun.backingPath) : undefined
+        if (!facts)
+          continue
+        // Only a LIVE LUN is serving anything, and only a live LUN can be
+        // quarantined. Once one has been, its persisted record still resolves onto
+        // the leftover placeholder — which keeps the LUN `unresolved` and keeps
+        // Repair refusing (that is deliberate) — but it is a `missingLuns` hole
+        // now, and re-reporting it here would have the quarantine chase a LUN that
+        // is already gone on every single health read.
+        if (!lun.present)
+          continue
+        const acted = opts.quarantined?.get(lun.backingPath)
+        stubLuns.push({
+          targetIqn: target.iqn,
+          tpgTag: tpg.tpgTag,
+          lunIndex: lun.index,
+          backstoreName: lun.name,
+          backingPath: lun.backingPath,
+          persistedSize: facts.persistedSize,
+          actualSize: facts.actualSize,
+          containingMount: facts.containingMount,
+          expectedMount: facts.expectedMount,
+          zeroSized: facts.zeroSized,
+          wrongMount: facts.wrongMount,
+          ownership: target.ownership,
+          quarantined: acted?.quarantined ?? false,
+          fileRemoved: acted?.fileRemoved ?? false,
+        })
+      }
+
+      // --- a TPG that restored with NONE of its LUNs (GT-21) ------------------
+      // Worse in kind than the holes it is made of: the target is live, the TPG is
+      // enabled and the portals are listening, so an initiator logs in
+      // successfully and sees no disks at all. systemd reported success.
+      {
+        const persistedLuns = persistedTpg?.luns ?? []
+        const liveLunCount = tpg.luns.filter(l => l.present).length
+        if (target.present && persistedLuns.length > 0 && liveLunCount === 0) {
+          targetsServingNothing.push({
+            targetIqn: target.iqn,
+            tpgTag: tpg.tpgTag,
+            persistedLunCount: persistedLuns.length,
+            enabled: tpg.enabled,
+          })
+        }
+      }
+
+      // --- portals bound to addresses no interface carries --------------------
+      if (ctx.nodeAddresses !== null) {
+        for (const portal of tpg.portals) {
+          if (portal.carriedByInterface === false) {
+            portalsWithoutInterface.push({
+              targetIqn: target.iqn,
+              tpgTag: tpg.tpgTag,
+              address: portal.address,
+              port: portal.port,
+            })
+          }
+        }
+      }
+
+      if (persistedTpg && liveTpg) {
+        const persistedLunIndexes = new Set(persistedTpg.luns.map(l => l.index))
+        for (const lun of liveTpg.luns) {
+          if (!persistedLunIndexes.has(lun.index)) {
+            foreignChanges.push({
+              kind: 'lun-not-persisted',
+              targetIqn: target.iqn,
+              detail: `LUN ${lun.index} (${lun.backstoreName ?? 'unnamed'}) of ${target.iqn}${tpgClause(tpg.tpgTag, target.tpgTag)} is live but not in the saved configuration — it will not come back after a reboot`,
+            })
+          }
+        }
+
+        const persistedPortals = new Set(persistedTpg.portals.map(p => `${p.address.toLowerCase()}:${p.port}`))
+        const livePortals = new Set(liveTpg.portals.map(p => `${p.address.toLowerCase()}:${p.port}`))
+        for (const p of liveTpg.portals) {
+          if (!persistedPortals.has(`${p.address.toLowerCase()}:${p.port}`)) {
+            foreignChanges.push({
+              kind: 'portal-not-persisted',
+              targetIqn: target.iqn,
+              detail: `Portal ${p.address}:${p.port} of ${target.iqn}${tpgClause(tpg.tpgTag, target.tpgTag)} is live but not in the saved configuration`,
+            })
+          }
+        }
+        for (const p of persistedTpg.portals) {
+          if (!livePortals.has(`${p.address.toLowerCase()}:${p.port}`)) {
+            foreignChanges.push({
+              kind: 'portal-not-restored',
+              targetIqn: target.iqn,
+              detail: `Portal ${p.address}:${p.port} of ${target.iqn}${tpgClause(tpg.tpgTag, target.tpgTag)} is in the saved configuration but is not live`,
+            })
+          }
+        }
+      }
+
+      // --- a backstore whose live backing path no longer matches the saved one -
+      for (const lun of tpg.luns) {
+        if (!lun.name || !liveBackstoreNames.has(lun.name))
+          continue
+        const persisted = persistedBackstores.get(lun.name)
+        if (persisted && persisted.dev !== lun.backingPath) {
+          foreignChanges.push({
+            kind: 'backing-path-changed',
+            targetIqn: target.iqn,
+            detail: `LUN ${lun.index} (${lun.name})${tpgClause(tpg.tpgTag, target.tpgTag)} is serving ${lun.backingPath} but the saved configuration says ${persisted.dev} — the next restore would use the saved path`,
+          })
+        }
+      }
     }
 
     // --- an ANAS target whose TPG is disabled (live-proof F12) --------------
@@ -169,104 +283,6 @@ export function computeIscsiHealth(
         lunCount: target.lunCount,
         ...(detail ? { detail } : {}),
       })
-    }
-
-    // --- a target that restored with NONE of its LUNs (GT-21) ---------------
-    // Worse in kind than the holes it is made of: the target is live, the TPG is
-    // enabled and the portals are listening, so an initiator logs in
-    // successfully and sees no disks at all. systemd reported success.
-    {
-      const persistedLuns = persistedByIqn.get(target.iqn)?.tpgs.find(t => t.tag === target.tpgTag)?.luns ?? []
-      const liveLunCount = target.luns.filter(l => l.present).length
-      if (target.present && persistedLuns.length > 0 && liveLunCount === 0) {
-        targetsServingNothing.push({
-          targetIqn: target.iqn,
-          tpgTag: target.tpgTag,
-          persistedLunCount: persistedLuns.length,
-          enabled: target.enabled,
-        })
-      }
-    }
-
-    // --- portals bound to addresses no interface carries --------------------
-    if (ctx.nodeAddresses !== null) {
-      for (const portal of target.portals) {
-        if (portal.carriedByInterface === false) {
-          portalsWithoutInterface.push({
-            targetIqn: target.iqn,
-            tpgTag: target.tpgTag,
-            address: portal.address,
-            port: portal.port,
-          })
-        }
-      }
-    }
-
-    // --- live/persisted divergences that are not a restore hole -------------
-    if (!target.persisted && target.present) {
-      foreignChanges.push({
-        kind: 'target-not-persisted',
-        targetIqn: target.iqn,
-        detail: `Target ${target.iqn} is live but absent from the saved configuration — it will not come back after a reboot`,
-      })
-    }
-    else if (target.persisted && !target.present) {
-      foreignChanges.push({
-        kind: 'target-not-restored',
-        targetIqn: target.iqn,
-        detail: `Target ${target.iqn} is in the saved configuration but is not live — the restore did not bring it up`,
-      })
-    }
-
-    const persistedTpg = persistedByIqn.get(target.iqn)?.tpgs.find(t => t.tag === target.tpgTag)
-    const liveTpg = liveByIqn.get(target.iqn)?.tpgs.find(t => t.tag === target.tpgTag)
-
-    if (persistedTpg && liveTpg) {
-      const persistedLunIndexes = new Set(persistedTpg.luns.map(l => l.index))
-      for (const lun of liveTpg.luns) {
-        if (!persistedLunIndexes.has(lun.index)) {
-          foreignChanges.push({
-            kind: 'lun-not-persisted',
-            targetIqn: target.iqn,
-            detail: `LUN ${lun.index} (${lun.backstoreName ?? 'unnamed'}) of ${target.iqn} is live but not in the saved configuration — it will not come back after a reboot`,
-          })
-        }
-      }
-
-      const persistedPortals = new Set(persistedTpg.portals.map(p => `${p.address.toLowerCase()}:${p.port}`))
-      const livePortals = new Set(liveTpg.portals.map(p => `${p.address.toLowerCase()}:${p.port}`))
-      for (const p of liveTpg.portals) {
-        if (!persistedPortals.has(`${p.address.toLowerCase()}:${p.port}`)) {
-          foreignChanges.push({
-            kind: 'portal-not-persisted',
-            targetIqn: target.iqn,
-            detail: `Portal ${p.address}:${p.port} of ${target.iqn} is live but not in the saved configuration`,
-          })
-        }
-      }
-      for (const p of persistedTpg.portals) {
-        if (!livePortals.has(`${p.address.toLowerCase()}:${p.port}`)) {
-          foreignChanges.push({
-            kind: 'portal-not-restored',
-            targetIqn: target.iqn,
-            detail: `Portal ${p.address}:${p.port} of ${target.iqn} is in the saved configuration but is not live`,
-          })
-        }
-      }
-    }
-
-    // --- a backstore whose live backing path no longer matches the saved one -
-    for (const lun of target.luns) {
-      if (!lun.name || !liveBackstoreNames.has(lun.name))
-        continue
-      const persisted = persistedBackstores.get(lun.name)
-      if (persisted && persisted.dev !== lun.backingPath) {
-        foreignChanges.push({
-          kind: 'backing-path-changed',
-          targetIqn: target.iqn,
-          detail: `LUN ${lun.index} (${lun.name}) is serving ${lun.backingPath} but the saved configuration says ${persisted.dev} — the next restore would use the saved path`,
-        })
-      }
     }
   }
 
@@ -288,8 +304,15 @@ export function computeIscsiHealth(
     // placeholder ANAS will never touch sits there accomplishes nothing but a
     // dead end (Repair answers nothing-to-repair; only hand-targetcli escapes).
     // The stub is still REPORTED as a health card either way.
-    degraded: missingLuns.length > 0 || stubLuns.some(s => s.ownership === 'anas'),
+    // cr3 (ISCSI-L15): an unreadable saveconfig.json is a diff against
+    // nothing — no hole can be SEEN, and a save would overwrite the file.
+    // cr3 (review): only a zero-size placeholder is about to be taken offline;
+    // a wrong-mount-only report holds data and is never acted on.
+    degraded: missingLuns.length > 0 || stubLuns.some(s => s.ownership === 'anas' && s.zeroSized) || !!ctx.persistedUnreadable
+      || liveUnreadable.length > 0,
     interfacesUnknown: ctx.nodeAddresses === null,
+    ...(ctx.persistedUnreadable ? { saveconfigUnreadable: ctx.persistedUnreadable } : {}),
+    ...(liveUnreadable.length > 0 ? { configfsUnreadable: liveUnreadable } : {}),
     checkedAt: now.toISOString(),
   }
 }

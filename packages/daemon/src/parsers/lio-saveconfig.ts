@@ -47,6 +47,7 @@
  */
 
 import { readFile } from 'node:fs/promises'
+import { lioAuthUnset } from '@anas/shared'
 
 /** Default location of LIO's persisted configuration on a Debian/PVE node. */
 export const LIO_SAVECONFIG_PATH = '/etc/rtslib-fb-target/saveconfig.json'
@@ -57,17 +58,15 @@ const BRACKETED_RE = /^\[(.+)\]$/
 /** A backstore reference: `/backstores/<plugin>/<name>`. */
 const STORAGE_OBJECT_RE = /^\/backstores\/([^/]+)\/(.+)$/
 
-/**
- * LIO's sentinel for a CHAP credential that is NOT set.
- *
- * The kernel's node-ACL auth store treats the literal string `NULL` as a clear
- * (it drops the `NAF_*_IN_SET` flag), so that is what ANAS writes to remove a
- * credential (`services/iscsi-mutate.ts`). rtslib normally converts it back to
- * an empty string when it saves, but a config written while a credential was
- * cleared can carry the sentinel through — and reporting `credentialsSet: true`
- * for a credential that is not set would be a lie in the one place it matters.
- */
-const LIO_AUTH_NULL = 'NULL'
+// LIO's sentinel for a CHAP credential that is NOT set.
+//
+// The kernel's node-ACL auth store treats the literal string `NULL` as a clear
+// (it drops the `NAF_*_IN_SET` flag), so that is what ANAS writes to remove a
+// credential (`services/iscsi-mutate.ts`). rtslib normally converts it back to
+// an empty string when it saves, but a config written while a credential was
+// cleared can carry the sentinel through — and reporting `credentialsSet: true`
+// for a credential that is not set would be a lie in the one place it matters.
+// The test is the shared `lioAuthUnset` (a PREFIX compare, as the kernel's).
 
 /** A persisted backstore (a `storage_objects[]` entry). */
 export interface SaveconfigStorageObject {
@@ -210,13 +209,16 @@ function asBoolean(v: unknown): boolean | null {
  * this is the only thing the parser is allowed to learn from a `chap_password`.
  */
 function secretPresent(v: unknown): boolean {
-  return typeof v === 'string' && v.length > 0 && v !== LIO_AUTH_NULL
+  return typeof v === 'string' && !lioAuthUnset(v)
 }
 
-/** A CHAP username, with LIO's `NULL` sentinel read as "not set". */
+/**
+ * A CHAP username, with LIO's `NULL` sentinel read as "not set" — the ONE rule
+ * (`lioAuthUnset`, cr3 ISCSI-L12) the configfs reader asks too.
+ */
 function authValue(v: unknown): string | null {
   const s = asString(v)
-  return s === null || s === LIO_AUTH_NULL ? null : s
+  return s === null || lioAuthUnset(s) ? null : s
 }
 
 /** A `1`/`0` attribute read as a boolean; null when absent or non-numeric. */
@@ -372,30 +374,52 @@ export function parseLioSaveconfig(text: string): LioSaveconfig {
 }
 
 /**
- * Read and parse LIO's persisted configuration, FAIL-OPEN.
- *
- * Returns `null` when the file is absent (no LIO on this node — the normal case
- * on most PVE hosts) or when its content will not parse. Never throws: every
- * iSCSI read must keep working on a node that serves no block storage.
+ * What reading saveconfig.json found (cr3, ISCSI-L15): the parsed config, or
+ * `null` with `unreadable` saying why — or both `null`, the file is simply not
+ * there (no LIO on this node, the normal case on most PVE hosts).
  */
-export async function readLioSaveconfig(path: string = LIO_SAVECONFIG_PATH): Promise<LioSaveconfig | null> {
+export interface LioSaveconfigRead {
+  config: LioSaveconfig | null
+  /** Set when the file EXISTS but could not be read or parsed. */
+  unreadable: string | null
+}
+
+/**
+ * Read and parse LIO's persisted configuration. Never throws.
+ *
+ * cr3 (ISCSI-L15): an ABSENT file and a file that could not be read or parsed
+ * used to be the same `null` — "nothing persisted" — so a garbled or
+ * unreadable saveconfig.json showed no holes and the next mutation's
+ * `saveconfig` overwrote whatever it held. They are told apart now.
+ */
+export async function readLioSaveconfigState(path: string = LIO_SAVECONFIG_PATH): Promise<LioSaveconfigRead> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
   }
   catch (err: unknown) {
     // ENOENT is the expected state on a node without targetcli-fb.
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
-      console.warn(`anasd: could not read ${path} for the iSCSI read layer:`, err)
-    return null
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return { config: null, unreadable: null }
+    console.warn(`anasd: could not read ${path} for the iSCSI read layer:`, err)
+    return { config: null, unreadable: `${path} could not be read (${err instanceof Error ? err.message : String(err)})` }
   }
   try {
-    return parseLioSaveconfig(text)
+    return { config: parseLioSaveconfig(text), unreadable: null }
   }
   catch (err: unknown) {
     console.warn(`anasd: could not parse ${path} for the iSCSI read layer:`, err)
-    return null
+    return { config: null, unreadable: `${path} is not valid JSON (${err instanceof Error ? err.message : String(err)})` }
   }
+}
+
+/**
+ * The config half of {@link readLioSaveconfigState}: `null` when the file is
+ * absent OR unreadable. A caller that must tell those apart (every one that
+ * can lead to a `saveconfig`) reads the state instead.
+ */
+export async function readLioSaveconfig(path: string = LIO_SAVECONFIG_PATH): Promise<LioSaveconfig | null> {
+  return (await readLioSaveconfigState(path)).config
 }
 
 /** Index a saveconfig's storage objects by backstore name. */

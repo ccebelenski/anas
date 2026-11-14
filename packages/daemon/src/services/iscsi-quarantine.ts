@@ -76,10 +76,12 @@
 
 import type { IscsiHealth, IscsiStubLun, IscsiTargetDetail } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { LioLiveState } from './iscsi-configfs.js'
 import type { IscsiPaths, IscsiReadContext } from './iscsi.js'
 import { stat, unlink } from 'node:fs/promises'
+import { lunsMappingBackstore } from './iscsi-configfs.js'
 import { computeIscsiHealth } from './iscsi-health.js'
-import { runTargetcli, tpgPath, withIscsiLock } from './iscsi-mutate.js'
+import { assertConfigshellArgs, runTargetcli, tpgPath, withIscsiLock } from './iscsi-mutate.js'
 import { buildIscsiTargets, readIscsiContext } from './iscsi.js'
 
 /** What one quarantine pass did, per stub. */
@@ -144,18 +146,28 @@ async function quarantineOne(
   executor: CommandExecutor,
   stub: IscsiStubLun,
   tpgTagged: { tpgTag: number },
+  live: LioLiveState,
 ): Promise<{ quarantined: boolean, fileRemoved: boolean, error?: string }> {
+  // cr3 (ISCSI-M6): a stub backstore another LUN also maps is unmapped HERE
+  // only — rtslib's backstore delete would take that other LUN with it, and
+  // it may sit on a target that is not ANAS's. The file stays with it.
+  const shared = lunsMappingBackstore(live, 'fileio', stub.backstoreName, { targetIqn: stub.targetIqn, tpgTag: tpgTagged.tpgTag, lunIndex: stub.lunIndex }).length > 0
   try {
+    // cr3 review 2 (L5): both lines checked before the unmap.
+    assertConfigshellArgs([`lun${stub.lunIndex}`, stub.backstoreName])
     await runTargetcli(executor, [
       `${tpgPath(stub.targetIqn, tpgTagged.tpgTag)}/luns`,
       'delete',
       `lun${stub.lunIndex}`,
     ])
-    await runTargetcli(executor, ['/backstores/fileio', 'delete', stub.backstoreName])
+    if (!shared)
+      await runTargetcli(executor, ['/backstores/fileio', 'delete', stub.backstoreName])
   }
   catch (err) {
     return { quarantined: false, fileRemoved: false, error: err instanceof Error ? err.message : String(err) }
   }
+  if (shared)
+    return { quarantined: true, fileRemoved: false }
 
   // The file goes only when BOTH signals agreed AND it is still 0 bytes right
   // now. The re-check costs one `stat` and is the difference between deleting a
@@ -229,6 +241,16 @@ export async function readIscsiHealthWithQuarantine(
         log(skipLine(stub, target))
         continue
       }
+      // cr3 (review): a FULL-SIZE image is never a placeholder. The wrong-
+      // mount signal alone (a bind mount, an altroot) is reported and left
+      // serving: unmapping it would take real data offline. Only the zero-
+      // size signal — LIO's own placeholder, F2 — is acted on.
+      if (!stub.zeroSized) {
+        log(`iscsi.quarantine target=${stub.targetIqn} lun=${stub.lunIndex} backstore=${stub.backstoreName} `
+          + `path=${stub.backingPath} result=reported detail=on ${stub.containingMount ?? 'unknown'} instead of `
+          + `${stub.expectedMount ?? 'unknown'} but not zero-size — it holds data; left serving`)
+        continue
+      }
       // RULING C2 (0.3.1 remediation, LP5): a stub on an ANAS-owned target is
       // torn down EVEN WHEN it has a live session. The quarantine does not check
       // for sessions and must not start: a stub serves a 0-byte placeholder
@@ -241,7 +263,9 @@ export async function readIscsiHealthWithQuarantine(
       // dashboard warning say so honestly — that the LUN was serving an empty
       // placeholder, not your data, and ANAS took it offline (see the stub card
       // in iscsi-warnings.ts). Foreign stubs are the one exception, gated above.
-      const result = await quarantineOne(executor, stub, { tpgTag: target.tpgTag })
+      // The stub's OWN TPG (cr3, ISCSI-H2): a placeholder in a second TPG is
+      // unmapped there, not at the same index of the first.
+      const result = await quarantineOne(executor, stub, { tpgTag: stub.tpgTag }, fresh.ctx.live)
       log(auditLine(stub, result))
       acted.set(stub.backingPath, { quarantined: result.quarantined, fileRemoved: result.fileRemoved })
       actedStubs.push({ ...stub, quarantined: result.quarantined, fileRemoved: result.fileRemoved })
@@ -285,7 +309,7 @@ export async function readIscsiHealthWithQuarantine(
     // stub, reported here but never acted on, must not put the node into the
     // refuse-all state — ANAS will never clear it (issue #54), so gating on it
     // only strands the operator.
-    health: { ...after.health, stubLuns, degraded: after.health.degraded || stubLuns.some(s => s.ownership === 'anas') },
+    health: { ...after.health, stubLuns, degraded: after.health.degraded || stubLuns.some(s => s.ownership === 'anas' && s.zeroSized) },
     outcomes,
   }
 }

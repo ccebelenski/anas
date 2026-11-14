@@ -1651,11 +1651,46 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       // Every other verb answers `degraded-restore` here. This one has to get
       // past that, or the node is stuck: the gate exists because a save over an
       // incomplete restore is permanent, and repair is what makes it complete.
+      // cr3 (ISCSI-L7): the hole's backing is a zvol on ANAS storage, reported
+      // present. It used to be a file in the test's temp directory — storage
+      // ANAS does not manage, which since the L7 ruling makes the target
+      // foreign and its hole never Repair's (the next test).
+      const savedPresent = process.env.ANAS_ISCSI_BACKING_PRESENT
+      process.env.ANAS_ISCSI_BACKING_PRESENT = '/dev/zvol/tank/gone'
+      try {
+        await serveAnas({ hole: true })
+        const res = await call('POST', '/v1/iscsi/health/repair')
+        assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+        assert.ok(res.body.job)
+      }
+      finally {
+        if (savedPresent === undefined)
+          delete process.env.ANAS_ISCSI_BACKING_PRESENT
+        else
+          process.env.ANAS_ISCSI_BACKING_PRESENT = savedPresent
+      }
+    })
+
+    it('cr3 ISCSI-L7: a hole in a FOREIGN target is never repaired — the 409 names it and the hand restore', async () => {
+      // The hole's backing is a present file on storage ANAS does not manage,
+      // so the target is foreign (a positive verdict). RED before: 202, and
+      // the job recreated the LUN on the hands-off target.
       await serveAnas({ hole: true, holeDev: join(dir, 'backing-present.img') })
       await writeFile(join(dir, 'backing-present.img'), 'x')
       const res = await call('POST', '/v1/iscsi/health/repair')
-      assert.equal(res.statusCode, 202)
-      assert.ok(res.body.job)
+      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+      assert.equal(res.body.error!.reason, 'foreign-holes-only')
+      assert.match(res.body.error!.message, /LUN 1 of .+ \(backstore 'ghost'/)
+      assert.match(res.body.error!.message, /ANAS never writes to a target it does not own/)
+      assert.match(res.body.error!.message, /systemctl restart rtslib-fb-targetctl' in a maintenance window/)
+      assert.match(res.body.error!.message, /stays degraded/)
+      assert.equal(mockOf().calls.filter(c => c.command === TARGETCLI).length, 0)
+      // Every other change names the foreign target as the reason — never
+      // "use Repair", which would only send the operator round again.
+      const other = await call('POST', '/v1/iscsi/targets', { name: 'other', portals: [{ address: '192.168.200.50' }], acls: [{ initiatorIqn: INITIATOR }] })
+      assert.equal(other.statusCode, 409)
+      assert.match(other.body.error!.message, /missing from a target ANAS does not manage/)
+      assert.doesNotMatch(other.body.error!.message, /use Repair/)
     })
 
     it('refuses with a 409 NAMING the paths while the backing is still absent', async () => {
@@ -1722,6 +1757,211 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       const data = res.body.data as IscsiClaimList
       assert.equal(data.installed, false)
       assert.deepEqual(data.claims, [])
+    })
+  })
+
+  // --- cr3.iscsi (the 2026-11-14 review) -----------------------------------
+
+  describe('cr3 ISCSI-M4 — the "could never log in" check runs on the merged ACL set', () => {
+    it('PUT {auth: chap} alone, with an ACL that has no credentials, is refused — it used to lock every initiator out', async () => {
+      // RED before: 202 and `authentication=1` set — the check ran only when
+      // the PUT carried `acls` (the panel's auth switch sends `{auth}` alone).
+      await serveAnas()
+      const res = await call('PUT', targetUrl(), { auth: 'chap' })
+      assert.equal(res.statusCode, 400, JSON.stringify(res.body))
+      assert.match(res.body.error!.message, new RegExp(`Initiator ${INITIATOR.replaceAll('.', '\\.')} would never be able to log in`))
+      assert.equal(mockOf().calls.filter(c => c.command === TARGETCLI).length, 0)
+    })
+
+    it('PUT {auth: chap} on an ACL that keeps a mutual credential is refused with how to turn mutual off', async () => {
+      // RED before: 202 and a silent no-op — the TPG flag was already on, and
+      // the mutual secret kept LIO authenticating the target.
+      const manifest = anasManifest()
+        .replace(/(auth\/userid = )\n/, '$1alice\n')
+        .replace(/(auth\/password = )\n/, '$1correcthorseba\n')
+        .replace(/(auth\/userid_mutual = )\n/, '$1target1\n')
+        .replace(/(auth\/password_mutual = )\n/, '$1batterystaple1\n')
+        .replace(/(tpgt_1\/attrib\/authentication = )0/, '$11')
+      await serve({ manifest, saveconfigText: anasSaveconfig() })
+      const bare = await call('PUT', targetUrl(), { auth: 'chap' })
+      assert.equal(bare.statusCode, 400, JSON.stringify(bare.body))
+      assert.match(bare.body.error!.message, /would still use mutual CHAP/)
+      // Clearing the mutual pair in the same edit is the way through.
+      const cleared = await call('PUT', targetUrl(), { auth: 'chap', acls: [{ initiatorIqn: INITIATOR, mutualUserid: null, mutualSecret: null }] })
+      assert.equal(cleared.statusCode, 202, JSON.stringify(cleared.body))
+    })
+
+    it('a mutual USERID alone (no mutual secret) does not refuse one-way CHAP — GT-32: only the secret turns it on (review)', async () => {
+      // RED before: 400 "would still use mutual CHAP".
+      const manifest = anasManifest()
+        .replace(/(auth\/userid = )\n/, '$1alice\n')
+        .replace(/(auth\/password = )\n/, '$1correcthorseba\n')
+        .replace(/(auth\/userid_mutual = )\n/, '$1target1\n')
+      await serve({ manifest, saveconfigText: anasSaveconfig() })
+      const res = await call('PUT', targetUrl(), { auth: 'chap' })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+    })
+
+    it('a portal-only edit is not refused over the stored credentials', async () => {
+      await serveAnas()
+      const res = await call('PUT', targetUrl(), { portals: [{ address: '192.168.200.50', port: 3261 }] })
+      assert.notEqual(res.statusCode, 400, JSON.stringify(res.body))
+    })
+  })
+
+  describe('cr3 ISCSI-M5 — the add-LUN undo acts only on what the job made', () => {
+    it('refuses a name an UNMAPPED live backstore already has, before any job', async () => {
+      // RED before: 202 — the gate looked at LUN names only, the create failed
+      // "exists", and the undo then deleted the namesake (the probe).
+      const manifest = `${anasManifest()}D core/iblock_7\nD core/iblock_7/vmdisk9\nF core/iblock_7/vmdisk9/udev_path = /dev/sdz\nD core/iblock_7/vmdisk9/wwn\n`
+      await serve({ manifest, saveconfigText: anasSaveconfig() })
+      const res = await call('POST', `${targetUrl()}/luns`, { name: 'vmdisk9', kind: 'zvol', backing: 'tank/vol2' })
+      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+      assert.equal(res.body.error!.reason, 'name-taken')
+      assert.match(res.body.error!.message, /A backstore named 'vmdisk9' already exists on this node, mapped as no LUN/)
+    })
+
+    it('refuses a name only the SAVED configuration has (it comes back at the next boot)', async () => {
+      const saved = JSON.parse(anasSaveconfig()) as { storage_objects: unknown[] }
+      saved.storage_objects.push({ name: 'vmdisk9', plugin: 'block', dev: '/dev/sdz', wwn: 'x', readonly: false, write_back: false, attributes: {}, alua_tpgs: [] })
+      await serve({ manifest: anasManifest(), saveconfigText: JSON.stringify(saved) })
+      const res = await call('POST', `${targetUrl()}/luns`, { name: 'vmdisk9', kind: 'zvol', backing: 'tank/vol2' })
+      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+      assert.match(res.body.error!.message, /in the saved configuration/)
+    })
+
+    /** The AHR file-LUN add of the test above, with targetcli's answers scripted. */
+    async function ahrFileAdd(failing: (args: string[]) => boolean): Promise<{ job: Job, mountDir: string, mock: MockExecutor }> {
+      const mountDir = join(dir, 'ahr0')
+      await mkdir(mountDir, { recursive: true })
+      process.env.ANAS_FSTAB_PATH = join(dir, 'fstab')
+      await writeFile(join(dir, 'fstab'), '')
+      await serveAnas()
+      const mock = mockOf()
+      mock.clearFixtures()
+      const lsblk = JSON.parse(mockFixtures.ahrLsblk().stdout) as { blockdevices: LsblkNode[] }
+      const pointMounts = (nodes: LsblkNode[]): void => {
+        for (const n of nodes) {
+          if (n.type === 'lvm')
+            n.mountpoint = mountDir
+          if (n.children)
+            pointMounts(n.children)
+        }
+      }
+      pointMounts(lsblk.blockdevices)
+      const table = { stdout: JSON.stringify({ filesystems: [{ target: mountDir, source: '/dev/mapper/ahr0-ahr0--vol', fstype: 'btrfs', options: 'rw,relatime,subvolid=5,subvol=/' }] }), stderr: '', exitCode: 0 }
+      mock.addFixture({ command: TARGETCLI, argsMatch: failing, result: { stdout: '', stderr: 'scripted failure', exitCode: 1 } })
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+      mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+      mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+      mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: { stdout: JSON.stringify(lsblk), stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+      mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+      mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+      mock.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: mockFixtures.ahrPvs() })
+      mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: table })
+      mock.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: table })
+      const res = await call('POST', `${targetUrl()}/luns`, { name: 'ahrimg', kind: 'file', backing: 'ahr0', size: 1024 * 1024 })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      return { job: await waitForJob(res.body.job!.id), mountDir, mock }
+    }
+
+    it('a backstore create that fails: no undo delete at all, and the image the job created is removed', async () => {
+      // RED before: the flag rose before the create, so the undo deleted
+      // `/backstores/fileio/ahrimg` (a namesake, had there been one), and the
+      // sparse image was created before the try and left behind.
+      const { job, mountDir, mock } = await ahrFileAdd(a => a[0] === '/backstores/fileio' && a[1] === 'create')
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /removed the image file .*ahrimg\.raw it had created/)
+      const argv = mock.calls.filter(c => c.command === TARGETCLI).map(c => c.args.join(' '))
+      assert.deepEqual(argv.filter(a => a.includes(' delete')), [], argv.join('\n'))
+      await assert.rejects(() => stat(join(mountDir, 'ahrimg.raw')))
+    })
+
+    it('a map that fails after the create: the parent-form delete of what it made, then the image', async () => {
+      const { job, mountDir, mock } = await ahrFileAdd(a => a[1] === 'create' && a[0].endsWith('/luns'))
+      assert.equal(job.status, 'failed')
+      const argv = mock.calls.filter(c => c.command === TARGETCLI).map(c => c.args.join(' '))
+      assert.ok(argv.includes('/backstores/fileio delete ahrimg'), argv.join('\n'))
+      assert.ok(!argv.includes('saveconfig'), argv.join('\n'))
+      assert.match(job.error!.message, /deleted the half-created backstore 'ahrimg'; removed the image file/)
+      await assert.rejects(() => stat(join(mountDir, 'ahrimg.raw')))
+    })
+  })
+
+  describe('cr3 ISCSI-L9 — a target name is taken whatever month its IQN was minted in', () => {
+    it('refuses a create whose name an ANAS target from another month already has', async () => {
+      // RED before: 202 — the guard compared the whole IQN, `yyyy-mm` included.
+      const older = ANAS_IQN.replace(/^iqn\.\d{4}-\d{2}\./, 'iqn.2020-01.')
+      assert.notEqual(older, ANAS_IQN)
+      await serve({ manifest: anasManifest().split(ANAS_IQN).join(older), saveconfigText: anasSaveconfig().split(ANAS_IQN).join(older) })
+      const res = await call('POST', '/v1/iscsi/targets', { name: 'vmstore', portals: [{ address: '192.168.200.50' }], acls: [{ initiatorIqn: INITIATOR }] })
+      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+      assert.equal(res.body.error!.reason, 'target-exists')
+    })
+  })
+
+  describe('cr3 ISCSI-L14 — only plain decimal digits address a LUN', () => {
+    it('400s an index Number() would have read as 0 or 1', async () => {
+      // RED before: '0x0' and '0e0' reached LUN 0 (the confirm challenge, 409).
+      await serveAnas()
+      for (const raw of ['0x0', '0e0', '%20', '00', '-0', '+0', '1.0']) {
+        const res = await call('DELETE', `${targetUrl()}/luns/${raw}`)
+        assert.equal(res.statusCode, 400, `${raw}: ${JSON.stringify(res.body)}`)
+      }
+      const ok = await call('DELETE', `${targetUrl()}/luns/0`)
+      assert.equal(ok.statusCode, 409)
+      assert.equal(ok.body.error!.code, 'CONFIRMATION_REQUIRED')
+    })
+  })
+
+  describe('cr3 ISCSI-L15 — an unreadable saveconfig.json refuses every change and Repair', () => {
+    it('a create and a Repair are refused with the reason, nothing runs', async () => {
+      // RED before: the garbled file read as "nothing persisted", the create
+      // was accepted and its saveconfig would have overwritten the file.
+      await serve({ manifest: anasManifest(), saveconfigText: '{"storage_objects": [' })
+      const create = await call('POST', '/v1/iscsi/targets', { name: 'other', portals: [{ address: '192.168.200.50' }], acls: [{ initiatorIqn: INITIATOR }] })
+      assert.equal(create.statusCode, 409, JSON.stringify(create.body))
+      assert.equal(create.body.error!.reason, 'saveconfig-unreadable')
+      const repair = await call('POST', '/v1/iscsi/health/repair')
+      assert.equal(repair.statusCode, 409, JSON.stringify(repair.body))
+      assert.equal(repair.body.error!.reason, 'saveconfig-unreadable')
+      assert.equal(mockOf().calls.filter(c => c.command === TARGETCLI).length, 0)
+    })
+  })
+
+  describe('cr3 ISCSI-L10 follow-up — a backing path targetcli would re-split is refused at the door', () => {
+    it('a zvol whose name has a space: 409 before any job', async () => {
+      await serveAnas()
+      const res = await call('POST', `${targetUrl()}/luns`, { name: 'spaced', kind: 'zvol', backing: 'tank/my vol' })
+      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+      assert.equal(res.body.error!.reason, 'backing-path-unsafe')
+      assert.ok(!res.body.job)
+    })
+  })
+
+  describe('cr3 ISCSI-H2 (review) — the already-exported gate walks every TPG', () => {
+    it('a zvol a FOREIGN target exports only through its second TPG cannot be exported again', async () => {
+      // RED before: 202 — the gate read `t.luns`, the first TPG only.
+      const F = 'iqn.2003-01.org.linux-iscsi.pve.x8664:sn.0123456789ab'
+      const extra = [
+        'D core/iblock_1',
+        'D core/iblock_1/foreignvol',
+        'F core/iblock_1/foreignvol/udev_path = /dev/zvol/tank/vol2',
+        'D core/iblock_1/foreignvol/wwn',
+        `D iscsi/${F}`,
+        `D iscsi/${F}/tpgt_1`,
+        `F iscsi/${F}/tpgt_1/enable = 1`,
+        `D iscsi/${F}/tpgt_2`,
+        `F iscsi/${F}/tpgt_2/enable = 1`,
+        `D iscsi/${F}/tpgt_2/lun/lun_0`,
+        `L iscsi/${F}/tpgt_2/lun/lun_0/aaaaaaaaaa -> ../../../../../../target/core/iblock_1/foreignvol`,
+      ].join('\n')
+      await serve({ manifest: `${anasManifest()}${extra}\n`, saveconfigText: anasSaveconfig() })
+      const res = await call('POST', `${targetUrl()}/luns`, { name: 'vmdisk9', kind: 'zvol', backing: 'tank/vol2' })
+      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+      assert.equal(res.body.error!.reason, 'backing-already-mapped')
     })
   })
 })

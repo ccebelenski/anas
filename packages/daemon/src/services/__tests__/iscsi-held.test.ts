@@ -196,6 +196,8 @@ describe('heldByLun — which holder is named (pickHolder)', () => {
     assert.deepEqual(held, {
       targetIqn: ZVOL_CLAIM.targetIqn,
       index: 0,
+      // cr3 (ISCSI-H2 review): the TPG travels with the index, additively.
+      tpgTag: ZVOL_CLAIM.tpgTag,
       name: 'vmdisk1',
       backingPath: '/dev/zvol/tank/vol1',
       connectedInitiators: [],

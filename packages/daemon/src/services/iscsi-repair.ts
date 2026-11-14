@@ -56,9 +56,14 @@ import type { StatDevice } from './iscsi-served.js'
 import type { IscsiReadContext } from './iscsi.js'
 import { storageObjectsByName } from '../parsers/lio-saveconfig.js'
 import {
+  aclNamesRefusal,
   attributeTokens,
+  backingPathRefusal,
   backstorePath,
+  configshellSafe,
+  foreignHolesSentence,
   grantLunsToAcl,
+  handsOffRefusal,
   ISCSI_DEFAULT_WRITE_BACK,
   replayAttributes,
   runTargetcli,
@@ -66,7 +71,7 @@ import {
   tpgPath,
 } from './iscsi-mutate.js'
 import { servedElsewhere } from './iscsi-served.js'
-import { attributesFromPersisted, normalizePlugin } from './iscsi.js'
+import { attributesFromPersisted, normalizePlugin, targetTpgs } from './iscsi.js'
 
 /** One hole, with everything the replay needs, read off the PERSISTED config. */
 export interface IscsiRepairItem {
@@ -111,6 +116,19 @@ export interface IscsiRepairItem {
    * backstore (ident.2). Blocked, with `blockedReason` saying which.
    */
   deviceServed?: boolean
+  /**
+   * cr3 (ISCSI-L7): the hole is in a target ANAS does not manage. Never
+   * repaired — ANAS does not write to a foreign target — and named, with the
+   * hand restore, wherever Repair reports.
+   */
+  foreignTarget?: boolean
+  /**
+   * cr3 review 2: the hole is in an ANAS target ANAS will not write to — a
+   * hand-added TPG, or an existing LUN whose backing's owner could not be
+   * judged. `blockedReason` is that target's own refusal (`handsOffRefusal`):
+   * one rule at the verbs' door and at Repair's.
+   */
+  handsOff?: boolean
   /** The persisted write-cache posture, replayed on the fileio create line. */
   writeBack: boolean
   /** The attribute set to replay after create, before the map. */
@@ -147,13 +165,17 @@ export function planIscsiRepair(
   const repairable: IscsiRepairItem[] = []
   const blocked: IscsiRepairItem[] = []
 
+  const handsOffOf = (iqn: string) => {
+    const t = targetByIqn.get(iqn)
+    return t ? handsOffRefusal(t) : null
+  }
   for (const missing of health.missingLuns) {
     const store = persistedStorage.get(missing.backstoreName)
     const plugin = normalizePlugin(store?.plugin ?? missing.plugin)
     const backingPath = store?.dev || missing.backingPath
     const attributes: IscsiLunAttributes = store
       ? attributesFromPersisted(store)
-      : targetByIqn.get(missing.targetIqn)?.luns.find(l => l.index === missing.lunIndex)?.attributes ?? {}
+      : tpgOf(targetByIqn.get(missing.targetIqn), missing.tpgTag)?.luns.find(l => l.index === missing.lunIndex)?.attributes ?? {}
 
     const item: IscsiRepairItem = {
       targetIqn: missing.targetIqn,
@@ -179,7 +201,31 @@ export function planIscsiRepair(
     // 0-byte file at the path and serves it: the very placeholder story
     // `iscsi.8` exists to take away, made this time by ANAS itself. So the hole
     // is BLOCKED and says what is missing.
-    if (item.plugin === 'fileio' && item.size === null) {
+    // cr3 (ISCSI-L7, operator ruling 2026-11-14): a hole in a FOREIGN target
+    // is never repaired by ANAS — hands-off holds for Repair as for every
+    // other write. It stays blocked (and the node degraded: a save would
+    // erase its saved record), and the sentence says how to restore it by hand.
+    if (missing.targetOwnership === 'foreign') {
+      item.foreignTarget = true
+      item.blockedReason = `target ${missing.targetIqn} is not managed by ANAS — ANAS never writes to it`
+    }
+    // cr3 (ISCSI-L10): a saved path targetcli would re-split cannot be put
+    // back by ANAS; blocked with the reason, before anything is created.
+    else if (handsOffOf(missing.targetIqn)) {
+      item.handsOff = true
+      item.blockedReason = handsOffOf(missing.targetIqn)!.message
+    }
+    // cr3 review 2 (L4/L5): every saved token that reaches a targetcli word
+    // (the name, the serial, the attributes) and every saved ACL name the
+    // re-grant addresses is checked here, before anything is created.
+    else if (repairTokensRefusal(item)) {
+      item.blockedReason = repairTokensRefusal(item)!
+    }
+    else if (backingPathRefusal(backingPath)) {
+      item.blockedReason = `the saved backing path ${JSON.stringify(backingPath)} contains a space, a quote or an '=', which `
+        + `targetcli cannot be handed — restore it by hand (bring the device back, then restart rtslib-fb-targetctl in a maintenance window)`
+    }
+    else if (item.plugin === 'fileio' && item.size === null) {
       item.blockedReason = `the saved configuration records no size for fileio backstore '${item.backstoreName}' `
         + `(${item.backingPath}) — recreating it without one would serve a 0-byte disk with the right serial`
     }
@@ -226,6 +272,33 @@ export async function guardRepairPlan(
   return { repairable, blocked }
 }
 
+/** The hole's own TPG of a built target (cr3, ISCSI-H2: never the first by default). */
+function tpgOf(target: IscsiTargetDetail | undefined, tag: number) {
+  return target ? targetTpgs(target).find(t => t.tpgTag === tag) : undefined
+}
+
+/**
+ * Why a hole's SAVED record cannot be replayed through targetcli (cr3 review
+ * 2): a backstore name, a serial or an attribute token configshell would
+ * re-split or read as a keyword, or an ACL name ANAS cannot address. Null when
+ * every one of them can be run.
+ */
+function repairTokensRefusal(item: IscsiRepairItem): string | null {
+  const tokens = [
+    `name=${item.backstoreName}`,
+    item.backstoreName,
+    ...(item.serial ? [`wwn=${item.serial}`] : []),
+    ...attributeTokens(item.attributes),
+  ]
+  const bad = tokens.find(t => !configshellSafe(t))
+  if (bad !== undefined) {
+    return `the saved record's ${JSON.stringify(bad)} cannot be handed to targetcli (a space, a quote or an '=' it would `
+      + `read as something else) — restore it by hand (bring the device back, then restart rtslib-fb-targetctl in a maintenance window)`
+  }
+  const acl = aclNamesRefusal(item.targetIqn, item.aclInitiators.map(initiatorIqn => ({ initiatorIqn })))
+  return acl ? acl.message : null
+}
+
 /** The initiators whose PERSISTED ACL maps this LUN index. */
 function persistedAclsMapping(ctx: IscsiReadContext, missing: IscsiMissingLun): string[] {
   const target = (ctx.persisted?.targets ?? []).find(t => t.iqn === missing.targetIqn)
@@ -254,13 +327,32 @@ export function assertRepairable(plan: IscsiRepairPlan): IscsiRefusal | null {
     }
   }
   if (plan.repairable.length === 0) {
+    // cr3 (ISCSI-L7): holes in foreign targets are never Repair's. When they
+    // are ALL there is, the refusal says so — and that the node stays
+    // degraded, and why — instead of an instruction to run Repair again.
+    const foreign = plan.blocked.filter(b => b.foreignTarget)
+    // cr3 review 2: holes of a target ANAS will not write to, named with that
+    // target's own refusal.
+    const handsOff = plan.blocked.filter(b => b.handsOff)
+    const foreignClause = (foreign.length > 0 ? ` ${foreignHolesSentence(foreign)}` : '')
+      + (handsOff.length > 0
+        ? ` ${handsOff.map(b => `LUN ${b.lunIndex} of ${b.targetIqn}`).join(', ')} ${handsOff.length === 1 ? 'is' : 'are'} not repaired: `
+        + `${[...new Set(handsOff.map(b => b.blockedReason))].join(' ')}`
+        : '')
+    const own = plan.blocked.filter(b => !b.foreignTarget && !b.handsOff)
+    if (own.length === 0) {
+      return {
+        reason: handsOff.length > 0 ? 'target-hands-off' : 'foreign-holes-only',
+        message: `Nothing here is ANAS's to repair.${foreignClause}`,
+      }
+    }
     // Two kinds of blocked hole, and they need different sentences: a backing
     // that is not on the node yet (bring it back), and a persisted record the
     // replay cannot be built from (C3 — nothing the operator does to the
     // storage will help, so "import the pool" would be a wrong instruction).
-    const absent = plan.blocked.filter(b => b.blockedReason === undefined)
-    const incomplete = plan.blocked.filter(b => b.blockedReason !== undefined && !b.deviceServed)
-    const served = plan.blocked.filter(b => b.deviceServed)
+    const absent = own.filter(b => b.blockedReason === undefined)
+    const incomplete = own.filter(b => b.blockedReason !== undefined && !b.deviceServed)
+    const served = own.filter(b => b.deviceServed)
     const incompleteClause = (incomplete.length === 0
       ? ''
       : ` ${incomplete.length === 1 ? 'One hole' : `${incomplete.length} holes`} cannot be repaired from the saved `
@@ -272,14 +364,14 @@ export function assertRepairable(plan: IscsiRepairPlan): IscsiRefusal | null {
     if (absent.length === 0 && incomplete.length === 0) {
       return {
         reason: 'served-device-mismatch',
-        message: `None of the missing LUNs can be repaired.${incompleteClause}`,
+        message: `None of the missing LUNs can be repaired.${incompleteClause}${foreignClause}`,
       }
     }
     if (absent.length === 0) {
       return {
         reason: 'record-incomplete',
         message: `None of the missing LUNs can be repaired — the saved configuration does not describe `
-          + `${incomplete.length === 1 ? 'it' : 'them'} completely.${incompleteClause}`,
+          + `${incomplete.length === 1 ? 'it' : 'them'} completely.${incompleteClause}${foreignClause}`,
       }
     }
     const named = absent
@@ -291,7 +383,7 @@ export function assertRepairable(plan: IscsiRepairPlan): IscsiRefusal | null {
       message: `None of the missing LUNs can be repaired yet — their backing objects are still not on `
         + `this node: ${named}. Bring the storage back first (import the pool, restore the image, mount `
         + `the filesystem) and run Repair again. Recreating a backstore over an absent device is what `
-        + `produced the hole.${stubs > 0 ? stubClause(stubs) : ''}${incompleteClause}`,
+        + `produced the hole.${stubs > 0 ? stubClause(stubs) : ''}${incompleteClause}${foreignClause}`,
     }
   }
   return null
@@ -330,6 +422,10 @@ export async function repairIscsiHoles(
   repaired: IscsiRepairOutcome[]
   stillMissing: IscsiRepairOutcome[]
   saved: boolean
+  /** cr3 (ISCSI-L7): the holes left alone because their target is not ANAS's. */
+  foreignUntouched: IscsiRepairOutcome[]
+  /** cr3 (ISCSI-L7): why the node is still degraded after this Repair, when it is. */
+  stillDegraded?: string
 }> {
   const { executor } = opts
   const repaired: IscsiRepairOutcome[] = []
@@ -405,7 +501,15 @@ export async function repairIscsiHoles(
   // GT-22: the save is the last step, and only when the tree is whole again.
   // Saving with a hole left in it writes the hole into saveconfig.json forever.
   let saved = false
-  if (stillMissing.length === 0) {
+  // cr3: a Repair that repaired NOTHING saves nothing. A save is a node-wide
+  // write of the live tree, and with nothing put back there is nothing to
+  // persist — the job used to save on an empty plan (a hole that healed
+  // between the request and the job, say), writing whatever the live tree
+  // held at that moment for no reason of its own.
+  if (repaired.length === 0) {
+    opts.progress?.('Nothing was repaired — the saved configuration is left as it is')
+  }
+  else if (stillMissing.length === 0) {
     opts.progress?.('Saving the LIO configuration')
     await saveIscsiConfig(executor)
     saved = true
@@ -417,7 +521,21 @@ export async function repairIscsiHoles(
     )
   }
 
-  return { repaired, stillMissing, saved }
+  const foreign = plan.blocked.filter(b => b.foreignTarget)
+  const foreignUntouched = foreign.map(outcome)
+  // cr3 review 2: holes of an ANAS target ANAS will not write to, named.
+  const handsOffItems = plan.blocked.filter(b => b.handsOff)
+  const handsOffClause = handsOffItems.length === 0
+    ? ''
+    : ` ${handsOffItems.map(b => `LUN ${b.lunIndex} of ${b.targetIqn}`).join(', ')} ${handsOffItems.length === 1 ? 'is' : 'are'} not repaired: `
+      + `${[...new Set(handsOffItems.map(b => b.blockedReason))].join(' ')}`
+  const stillDegraded = stillMissing.length === 0
+    ? undefined
+    : foreign.length === stillMissing.length
+      ? `This node stays degraded, and ANAS makes no iSCSI change: ${foreignHolesSentence(foreign)}`
+      : `This node stays degraded: ${stillMissing.length} LUN${stillMissing.length === 1 ? ' is' : 's are'} still missing, `
+        + `so nothing was saved.${foreign.length > 0 ? ` ${foreignHolesSentence(foreign)}` : ''}${handsOffClause}`
+  return { repaired, stillMissing, saved, foreignUntouched, ...(stillDegraded ? { stillDegraded } : {}) }
 }
 
 function outcome(item: IscsiRepairItem): IscsiRepairOutcome {

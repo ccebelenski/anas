@@ -193,6 +193,16 @@
         return ANAS.enc(s);
     }
 
+    // cr3: the default ExtJS BoundList renders a row's displayField as RAW
+    // HTML (settled in a browser on PVE 9.2), so every combo whose rows carry
+    // pool, dataset, address or interface text from the node encodes its list.
+    // A fresh object per combo: ExtJS merges listConfig into the list it makes.
+    function encodedList() {
+        return {
+            tpl: '<tpl for="."><div class="x-boundlist-item">{label:htmlEncode}</div></tpl>'
+        };
+    }
+
     function fmtBytes(v) {
         try {
             return ANAS.formatBytes(v);
@@ -342,8 +352,14 @@
             + enc(missing + ' ' + t('missing')) + '</span>';
     }
 
-    function renderSessions(v) {
+    function renderSessions(v, meta, rec) {
         var n = Number(v) || 0;
+        // cr3: a session the daemon could not read is UNKNOWN, never "0".
+        if (getf(rec, 'sessionsUnknown') === true) {
+            return pill('anas-iscsi-sessions anas-iscsi-sessions-unknown',
+                (n ? n + '+ ' : '') + t('sessions — unknown'), 'var(--anas-warning,#b8860b)',
+                t('The session state of an initiator could not be read; ANAS refuses changes that would drop a session until it reads back'));
+        }
         if (!n) {
             return '<span style="color:gray;" title="' + enc(t('No initiator is logged in')) + '">'
                 + enc('0 ' + t('sessions')) + '</span>';
@@ -425,6 +441,7 @@
             lunCount: Number(tg.lunCount) || 0,
             aclCount: Number(tg.aclCount) || 0,
             sessionCount: Number(tg.sessionCount) || 0,
+            sessionsUnknown: tg.sessionsUnknown === true,
             security: tg.security || {},
             present: tg.present !== false,
             persisted: tg.persisted !== false,
@@ -485,7 +502,20 @@
         var missing = (health && isArray(health.missingLuns)) ? health.missingLuns : [];
         var out = [];
         for (var i = 0; i < missing.length; i++) {
-            if (missing[i] && missing[i].backingExists === true) {
+            // cr3 (ISCSI-L7): a hole in a target ANAS does not manage is never
+            // Repair's, so it never makes the button live.
+            if (missing[i] && missing[i].backingExists === true && missing[i].targetOwnership !== 'foreign') {
+                out.push(missing[i]);
+            }
+        }
+        return out;
+    }
+
+    function foreignHoles(health) {
+        var missing = (health && isArray(health.missingLuns)) ? health.missingLuns : [];
+        var out = [];
+        for (var i = 0; i < missing.length; i++) {
+            if (missing[i] && missing[i].targetOwnership === 'foreign') {
                 out.push(missing[i]);
             }
         }
@@ -501,14 +531,16 @@
         var stubs = (health && isArray(health.stubLuns)) ? health.stubLuns : [];
         var out = [];
         for (var i = 0; i < stubs.length; i++) {
-            if (stubs[i] && stubs[i].ownership === 'anas' && stubs[i].quarantined !== true) {
+            // cr3 (review): only a zero-size placeholder is Repair's to take
+            // offline; a full-size image on an unexpected mount is reported only.
+            if (stubs[i] && stubs[i].ownership === 'anas' && stubs[i].quarantined !== true && stubs[i].zeroSized !== false) {
                 out.push(stubs[i]);
             }
         }
         return out;
     }
 
-    function applyHealth(view, health) {
+    function applyHealth(view, health, readError) {
         var grid = gridOf(view);
         if (!grid) {
             return;
@@ -522,12 +554,37 @@
         var stubs = servedStubs(health);
         setDisabled(grid, 'iscsiRepair', ready.length === 0 && stubs.length === 0);
         var tip;
-        if (stubs.length) {
+        if (!health) {
+            // cr3: a health read that FAILED is unknown — never "nothing to
+            // repair, the live configuration matches the saved one".
+            tip = t('The iSCSI health could not be read') + (readError ? ' (' + readError + ')' : '')
+                + t(' — refresh to try again.');
+        } else if (health.saveconfigUnreadable) {
+            // cr3 (ISCSI-L15): the saved configuration itself is unreadable.
+            tip = t('The saved iSCSI configuration cannot be read: ') + health.saveconfigUnreadable
+                + t('. Restore the file (targetcli keeps copies in /etc/rtslib-fb-target/backup/); Repair has nothing to replay until then.');
+        } else if (stubs.length) {
             tip = stubs.length + ' ' + (stubs.length === 1 ? t('LUN is') : t('LUNs are'))
                 + ' ' + t('serving a placeholder, not your data. Repair takes it offline first (the saved record is kept), '
                     + 'then puts back whatever LUN has its storage again.');
         } else if (!missing.length) {
             tip = t('Nothing to repair — the live configuration matches the saved one.');
+        } else if (!ready.length && foreignHoles(health).length === missing.length) {
+            // cr3 (ISCSI-L7): only foreign holes — Repair never touches them.
+            var fh = foreignHoles(health);
+            var names = [];
+            for (var j = 0; j < fh.length; j++) {
+                names.push('LUN ' + fh[j].lunIndex + ' ' + t('of') + ' ' + fh[j].targetIqn);
+            }
+            // cr3 review 2 (L7): the sentence agrees with how many are listed.
+            tip = names.join(', ') + ' '
+                + (fh.length === 1
+                    ? t('is missing from a target ANAS does not manage — Repair never writes to it. '
+                        + 'Bring its backing device back')
+                    : t('are missing from targets ANAS does not manage — Repair never writes to them. '
+                        + 'Bring their backing devices back'))
+                + t(', then run systemctl restart rtslib-fb-targetctl in a maintenance window '
+                    + '(it drops every iSCSI session on this node). Until then iSCSI changes stay refused.');
         } else if (!ready.length) {
             var paths = [];
             for (var i = 0; i < missing.length; i++) {
@@ -553,11 +610,11 @@
                 return;
             }
             applyHealth(view, (res && res.data) || null);
-        }, function () {
+        }, function (err) {
             // Fail-open: no health read means no Repair button, never a broken
-            // screen. The grid itself has already loaded.
+            // screen — and the button's tip says the read failed (cr3).
             if (!grid.destroyed && !grid.destroying) {
-                applyHealth(view, null);
+                applyHealth(view, null, ANAS.errText(err));
             }
         });
     }
@@ -691,6 +748,12 @@
     // applies it to the LUN it resolves, for EVERY door — the toolbar keeps
     // using this same function on its grid record. One source of truth.
     ANAS.iscsi.lunInPlace = lunInPlace;
+    // cr3: the session renderers and the LUN window's backup menu, exposed for
+    // the cr3 harness (pure: a value or a window stub in, HTML or items out).
+    ANAS.iscsi.renderSessions = renderSessions;
+    ANAS.iscsi.renderLunSessions = renderLunSessions;
+    ANAS.iscsi.lunBackupMenuItems = lunBackupMenuItems;
+    ANAS.iscsi.applyHealth = applyHealth;
 
     // ---- Toolbar state -----------------------------------------------------
 
@@ -709,9 +772,12 @@
         try {
             var btn = grid.down('#' + itemId);
             if (btn) {
-                btn.tooltip = msg || '';
+                // cr3: a tooltip is rendered as HTML by the QuickTip, and these
+                // carry data (an ownership derivation names paths and IQNs).
+                var tip = msg ? enc(msg) : '';
+                btn.tooltip = tip;
                 if (typeof btn.setTooltip === 'function') {
-                    btn.setTooltip(msg || '');
+                    btn.setTooltip(tip);
                 }
             }
         } catch (e) {
@@ -742,7 +808,10 @@
         // promising a delete it would get refused for.
         var sess = has ? (Number(rec.get('sessionCount')) || 0) : 0;
         var luns = has ? (Number(rec.get('lunCount')) || 0) : 0;
-        var deleteWhy = sess > 0
+        var sessUnknown = has && rec.get('sessionsUnknown') === true;
+        var deleteWhy = sessUnknown
+            ? t('The session state could not be read — refresh before deleting')
+            : sess > 0
             ? (sess + (sess === 1 ? ' initiator connected' : ' initiators connected')
                 + t(' — log them out first'))
             : (luns > 0
@@ -995,6 +1064,7 @@
                     queryMode: 'local',
                     displayField: 'label',
                     valueField: 'address',
+                    listConfig: encodedList(),
                     value: portal.address || ''
                 },
                 {
@@ -1100,7 +1170,8 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-iscsi-target',
-                title: isEdit ? (t('Edit iSCSI Target') + ': ' + (detail.name || detail.iqn)) : t('Create iSCSI Target'),
+                // cr3: a window title is HTML — every data value in it is encoded.
+                title: isEdit ? (t('Edit iSCSI Target') + ': ' + enc(detail.name || detail.iqn)) : t('Create iSCSI Target'),
                 modal: true,
                 width: 720,
                 maxHeight: 720,
@@ -1457,7 +1528,8 @@
                 typeof field.getValue === 'function' ? field.getValue() : '');
             field.anasAddressWarning = msg;
             if (typeof field.setTooltip === 'function') {
-                field.setTooltip(msg || '');
+                // cr3: the message carries the typed address — encoded for the tip.
+                field.setTooltip(msg ? enc(msg) : '');
             }
             if (typeof field.setFieldStyle === 'function') {
                 field.setFieldStyle(msg ? 'background-color:#fff8e1;' : '');
@@ -1998,8 +2070,13 @@
             + backingOwnerHtml(rec);
     }
 
-    function renderLunSessions(v) {
+    function renderLunSessions(v, meta, rec) {
         var list = isArray(v) ? v : [];
+        // cr3: an unreadable session is unknown, never "none".
+        if (getf(rec, 'connectedInitiatorsUnknown') === true) {
+            return '<span class="anas-lun-connected-unknown" style="color:var(--anas-warning,#b8860b);">'
+                + enc(t('unknown')) + '</span>';
+        }
         if (!list.length) {
             return '<span style="color:gray;">' + enc(t('none')) + '</span>';
         }
@@ -2038,6 +2115,19 @@
      * serial (backup2.9) — the backup-id match needs it, and a null/unknown
      * serial simply makes that match impossible (never a guess).
      */
+    function backupTaskByName(entries, name) {
+        if (!isArray(entries)) {
+            return null;
+        }
+        for (var i = 0; i < entries.length; i++) {
+            var e = entries[i] || {};
+            if (e.task && e.task.name === name) {
+                return e.task;
+            }
+        }
+        return null;
+    }
+
     function coveringTasks(entries, iqn, index, backingPath, serial) {
         var out = [];
         if (!isArray(entries)) {
@@ -2080,19 +2170,6 @@
     }
 
     /** The stored task object behind a list entry — what Edit pre-fills from. */
-    function backupTaskByName(entries, name) {
-        if (!isArray(entries)) {
-            return null;
-        }
-        for (var i = 0; i < entries.length; i++) {
-            var e = entries[i] || {};
-            if (e.task && e.task.name === name) {
-                return e.task;
-            }
-        }
-        return null;
-    }
-
     function backupResultText(result) {
         switch (result) {
             case 'success': return t('success');
@@ -2201,7 +2278,8 @@
             for (var i = 0; i < covering.length; i++) {
                 (function (entry) {
                     items.push({
-                        text: t('Run task ') + entry.name + t(' now'),
+                        // cr3: a menu item's text is HTML; the task name is data.
+                        text: t('Run task ') + enc(entry.name) + t(' now'),
                         cls: 'anas-lun-backup-run',
                         handler: function () {
                             if (ANAS.backup && ANAS.backup.runTaskNow) {
@@ -2210,14 +2288,17 @@
                         }
                     });
                     items.push({
-                        text: t('Edit task ') + entry.name + t('…'),
+                        text: t('Edit task ') + enc(entry.name) + t('…'),
                         cls: 'anas-lun-backup-edit',
                         handler: function () {
                             var task = backupTaskByName(entries, entry.name);
                             if (ANAS.backup && ANAS.backup.openEditTask && task) {
+                                // The task object as this window read it; the
+                                // backup dialog re-reads the STORED task by its
+                                // name when it opens (cr3, backup panel), so an
+                                // edit made elsewhere since is not overwritten.
                                 // U2: trailing onDone (contract added in
                                 // 68-backup.js) — a saved edit re-reads coverage.
-                                // An older wizard ignores it and nothing breaks.
                                 ANAS.backup.openEditTask(win.anasView, win.anasNode, task,
                                     afterBackupTaskSaved(win));
                             }
@@ -2328,6 +2409,7 @@
             serial: l.serial,
             attributes: l.attributes || {},
             connectedInitiators: isArray(l.connectedInitiators) ? l.connectedInitiators : [],
+            connectedInitiatorsUnknown: l.connectedInitiatorsUnknown === true,
             present: l.present !== false,
             backingExists: l.backingExists,
             pool: l.pool,
@@ -2377,7 +2459,8 @@
             : function (k) { return lun[k]; };
         var kind = '' + (get('kind') || '');
         var kindOk = kind !== 'foreign' && kind !== 'unresolved';
-        var live = (get('connectedInitiators') || []).length > 0;
+        // cr3: a session that could not be read counts as one (fail closed).
+        var live = (get('connectedInitiators') || []).length > 0 || get('connectedInitiatorsUnknown') === true;
         if (live) {
             return {
                 allowed: false,
@@ -2414,7 +2497,7 @@
         var foreign = win.anasForeign === true;
         var rec = selectedLun(win);
         var has = !!rec;
-        var live = has && (rec.get('connectedInitiators') || []).length > 0;
+        var live = has && ((rec.get('connectedInitiators') || []).length > 0 || rec.get('connectedInitiatorsUnknown') === true);
         // A resize needs a backing object ANAS manages AND one that is actually
         // there: an `unresolved` LUN's zvol or image is not on this node right
         // now, so there is nothing to grow (story iscsi.5).
@@ -2677,6 +2760,7 @@
                 'serial',
                 { name: 'attributes', type: 'auto' },
                 { name: 'connectedInitiators', type: 'auto' },
+                { name: 'connectedInitiatorsUnknown', type: 'auto' },
                 { name: 'present', type: 'auto' },
                 { name: 'backingExists', type: 'auto' },
                 { name: 'backupBy', type: 'auto' },
@@ -2691,7 +2775,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-iscsi-luns',
-                title: t('LUNs') + ': ' + label,
+                title: t('LUNs') + ': ' + enc(label),
                 modal: true,
                 width: 1000,
                 height: 560,
@@ -2988,6 +3072,7 @@
                             editable: true,
                             displayField: 'label',
                             valueField: 'name',
+                            listConfig: encodedList(),
                             store: Ext.create('Ext.data.Store', { fields: ['name', 'label'], data: [] }),
                             emptyText: t('pool/volume')
                         },
@@ -3002,8 +3087,18 @@
                             editable: true,
                             displayField: 'label',
                             valueField: 'name',
+                            listConfig: encodedList(),
                             store: Ext.create('Ext.data.Store', { fields: ['name', 'label'], data: [] }),
                             emptyText: t('pool/dataset')
+                        },
+                        {
+                            // cr3: a failed read of the choices is said here,
+                            // with its reason (showBackingProblems).
+                            xtype: 'component',
+                            itemId: 'backingChoicesNote',
+                            cls: 'anas-iscsi-backing-choices-note',
+                            hidden: true,
+                            style: 'color:var(--anas-warning,#b8860b);margin:0 0 6px 0;'
                         },
                         {
                             xtype: 'numberfield',
@@ -3175,7 +3270,51 @@
         apply('#newLunPool', pools);
     }
 
+    // cr3: a backing read that FAILED is said in the dialog, with its reason —
+    // an empty picker used to be all the operator saw (the failure only went
+    // to the console), which reads as "there is nothing to pick". The note is
+    // this file's add-LUN dialog's own component; every picker present in the
+    // window (the backup dialog's new-LUN pickers too) shows it as its empty
+    // text, so a dialog without the note still says it.
+    function showBackingProblems(win, problems) {
+        if (!problems.length || win.destroyed || win.destroying) {
+            return;
+        }
+        var text = t('Some choices could not be read, so the lists below may be incomplete') + ': '
+            + problems.join('; ');
+        try {
+            var note = win.down('#backingChoicesNote');
+            if (note) {
+                note.update(enc(text));
+                note.setHidden(false);
+            }
+        } catch (e) {
+            // non-fatal
+        }
+        var ids = ['#zvolPicker', '#filePicker', '#newLunPool'];
+        for (var i = 0; i < ids.length; i++) {
+            try {
+                var f = win.down(ids[i]);
+                if (f && typeof f.setEmptyText === 'function') {
+                    f.setEmptyText(t('could not read the choices — type the name'));
+                } else if (f) {
+                    f.emptyText = t('could not read the choices — type the name');
+                    if (typeof f.applyEmptyText === 'function') {
+                        f.applyEmptyText();
+                    }
+                }
+            } catch (e2) {
+                // non-fatal
+            }
+        }
+    }
+
     function loadBackingChoices(node, win) {
+        var problems = [];
+        var finish = function (zvols, dirs, anasPools) {
+            applyBackingStores(win, zvols, dirs, anasPools);
+            showBackingProblems(win, problems);
+        };
         ANAS.api.get(node, '/pools').then(function (res) {
             if (win.destroyed || win.destroying) {
                 return;
@@ -3185,7 +3324,13 @@
             var zvols = [];
             var dirs = [];
             var anasPools = [];
+            var ahrDone = false;
             var i;
+            var maybeFinish = function () {
+                if (pending <= 0 && ahrDone) {
+                    finish(zvols, dirs, anasPools);
+                }
+            };
             for (i = 0; i < pools.length; i++) {
                 var p = pools[i] || {};
                 // pvepool.2: PVE pools are candidates for the ZVOL and image
@@ -3199,11 +3344,12 @@
                     anasPools.push({ name: p.name, label: p.name });
                 }
                 pending++;
-                collectFromPool(node, win, p, zvols, dirs, function () {
+                collectFromPool(node, win, p, zvols, dirs, function (problem) {
                     pending--;
-                    if (pending <= 0) {
-                        applyBackingStores(win, zvols, dirs, anasPools);
+                    if (problem) {
+                        problems.push(problem);
                     }
+                    maybeFinish();
                 });
             }
             // AHR pools are a second, independent source for the image-file list
@@ -3222,19 +3368,20 @@
                         dirs.push({ name: a.name, label: a.name + ' (' + t('AHR pool') + ')', source: 'ahr' });
                     }
                 }
-                if (pending <= 0) {
-                    applyBackingStores(win, zvols, dirs, anasPools);
-                }
-            }, function () {
-                if (pending <= 0) {
-                    applyBackingStores(win, zvols, dirs, anasPools);
-                }
+                ahrDone = true;
+                maybeFinish();
+            }, function (aerr) {
+                problems.push(t('AHR pools') + ' (' + ANAS.errText(aerr) + ')');
+                ahrDone = true;
+                maybeFinish();
             });
-            if (!pools.length) {
-                applyBackingStores(win, zvols, dirs, anasPools);
-            }
         }, function (err) {
             ANAS.warn('iscsi backing choices failed: ' + ANAS.errText(err));
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            problems.push(t('pools') + ' (' + ANAS.errText(err) + ')');
+            finish([], [], []);
         });
     }
 
@@ -3310,8 +3457,8 @@
                 }
             }
             done();
-        }, function () {
-            done();
+        }, function (err) {
+            done(t('datasets of pool') + ' ' + pool.name + ' (' + ANAS.errText(err) + ')');
         });
     }
 
@@ -3401,7 +3548,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-iscsi-lun-resize',
-                title: t('Resize LUN') + ': ' + rec.get('name'),
+                title: t('Resize LUN') + ': ' + enc(rec.get('name')),
                 modal: true,
                 width: 560,
                 layout: 'fit',
@@ -3633,6 +3780,7 @@
                 { name: 'lunCount', type: 'auto' },
                 { name: 'aclCount', type: 'auto' },
                 { name: 'sessionCount', type: 'auto' },
+                { name: 'sessionsUnknown', type: 'auto' },
                 { name: 'security', type: 'auto' },
                 { name: 'present', type: 'auto' },
                 { name: 'persisted', type: 'auto' },

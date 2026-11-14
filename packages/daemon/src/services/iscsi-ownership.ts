@@ -83,6 +83,12 @@ export interface BackingClassification {
   pveOwnership: PveOwnership | null
   /** True when the backing dataset is owned as a PVE guest volume. */
   pveGuestVolume: boolean
+  /**
+   * cr3: a FILE path whose dataset could not be judged because the ZFS
+   * mountpoint table was unreadable (and no AHR pool holds it). Ownership is
+   * UNKNOWN: never "not PVE's", never "foreign".
+   */
+  ownershipUnknown?: boolean
 }
 
 /** The system facts ownership is derived from; both are already read elsewhere. */
@@ -96,6 +102,12 @@ export interface OwnershipInputs {
   pveStorages: Map<string, PveStorageRef[]> | null
   /** ZFS mountpoints, from `readZfsMountpoints()` — resolves a file onto a dataset. */
   zfsMountpoints: ZfsMountpoint[]
+  /**
+   * cr3: the mountpoint table could not be READ (`zfs list` failed) — the
+   * empty `zfsMountpoints` above is then not "no datasets", and a file's
+   * dataset (and so its PVE ownership) is unknown. Absent/false = it read.
+   */
+  zfsMountpointsUnreadable?: boolean
   /**
    * The findmnt table of the SAME read (`readZfsMountpointsFull`) — the #85
    * gate on that resolution: a file whose SERVING filesystem (the longest-
@@ -127,6 +139,11 @@ function isUnder(path: string, dir: string): boolean {
   if (dir === '/')
     return path.startsWith('/')
   return path === dir || path.startsWith(`${dir}/`)
+}
+
+/** An absolute path that is not a device node — an image file. */
+function isFilePath(path: string): boolean {
+  return path.startsWith('/') && !path.startsWith('/dev/')
 }
 
 /** The pool root of a dataset (`tank/data` → `tank`). */
@@ -266,6 +283,12 @@ export function classifyBacking(
       return { kind: 'file', pool: best.pool, dataset: null, mountpoint: best.mountpoint, pveOwned: false, pveOwnership: null, pveGuestVolume: false }
   }
 
+  // cr3: with the mountpoint table unreadable, "no dataset matched" proves
+  // nothing — the file may sit on a PVE storage's dataset. Unknown, never
+  // "foreign" (which would take the target away) and never "not PVE's".
+  if (inputs.zfsMountpointsUnreadable)
+    return { ...unmatched, kind: 'unresolved', ownershipUnknown: true }
+
   return unmatched
 }
 
@@ -333,6 +356,27 @@ export function deriveOwnership(
   const unresolved: OwnershipLun[] = []
   for (const lun of luns) {
     const c = classifyBacking(lun.backingPath, inputs, lun.backingExists)
+    // cr3 ISCSI-H1: an image FILE that is not there (or is a placeholder, which
+    // the read layer hands over as `backingExists: false`) says nothing about
+    // whose storage it is on. Its dataset was inferred from whatever filesystem
+    // serves the directory RIGHT NOW, and with the image's own filesystem not
+    // mounted that is the parent — on a node that boots from ZFS, the boot
+    // dataset, which PVE owns. Taking that as a positive foreign verdict handed
+    // ANAS's own target a hands-off badge and switched off the placeholder
+    // quarantine and the degraded mark. So an absent file is an absence, full
+    // stop: it can never take the target away. A `/dev/...` path is different —
+    // a zvol path NAMES its dataset, which is a fact about the name and stays.
+    // cr3: a file whose dataset could not be judged (the mountpoint table was
+    // unreadable) — the same answer as an absence: it never takes the target.
+    if (c.ownershipUnknown) {
+      unresolved.push(lun)
+      continue
+    }
+    if (lun.backingExists === false && isFilePath(lun.backingPath)) {
+      if (c.kind === 'unresolved' || c.pveOwnership !== null)
+        unresolved.push(lun)
+      continue
+    }
     if (c.pveGuestVolume) {
       return {
         ownership: 'foreign',

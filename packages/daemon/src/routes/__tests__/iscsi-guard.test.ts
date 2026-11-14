@@ -497,31 +497,29 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
     assert.equal(job.status, 'failed')
     assert.ok(job.error!.message.includes('fabric: mapping newlun at lun 0 failed'), job.error!.message)
     const argv = calls.filter(isMutation).map(c => c.args.join(' '))
-    assert.ok(argv.includes(`/backstores/block/newlun delete`), `no backstore-delete argv:\n${argv.join('\n')}`)
+    // cr3 ISCSI-M5: the parent form GT-42 proves, not the object-level one.
+    assert.ok(argv.includes(`/backstores/block delete newlun`), `no backstore-delete argv:\n${argv.join('\n')}`)
     assert.ok(argv.some(a => a.startsWith(`/iscsi/${IQN}/tpg1/luns create storage_object=/backstores/block/newlun`)), argv.join('\n'))
     assert.ok(!argv.includes('saveconfig'), `a half-created LUN must never be persisted:\n${argv.join('\n')}`)
   })
 
-  it('LUN add: the backstore CREATE itself fails — nothing existed, so the cleanup finds no object and deletes nothing, and the job error is the create\'s alone', async () => {
+  it('LUN add: the backstore CREATE itself fails — this job made nothing, so the undo deletes nothing, and the job error is the create\'s alone', async () => {
     await serve(HOLE)
     const { id, release } = await acceptBehindFullQueue(addLun('newlun', 'gtiscsi/vol9'))
-    // The flag is set BEFORE the create-and-map call (the restore's pattern),
-    // so the cleanup's delete still RUNS for a create failure — and proves it
-    // deletes nothing by finding no object: the injected "No such object" the
-    // delete returns is swallowed by the tolerance, the job error stays the
-    // create's, and nothing is mapped or persisted.
+    // cr3 ISCSI-M5: the undo's flag rises only when the create SUCCEEDED. It
+    // used to rise before the create, so the cleanup's delete ran here too —
+    // harmless when nothing of that name existed, and the deletion of somebody
+    // else's backstore when a namesake did ("exists" is a create failure).
     failTargetcli = [
       { argv: '/backstores/block create name=newlun', stderr: 'backport_create_simple: offlining non-existing object' },
-      { argv: '/backstores/block/newlun delete', stderr: 'No such object: /backstores/block/newlun' },
     ]
     release()
     const job = await finished(id)
     assert.equal(job.status, 'failed')
     assert.ok(job.error!.message.includes('backport_create_simple: offlining non-existing object'), job.error!.message)
-    assert.ok(!job.error!.message.includes('could not be deleted'), `the tolerance for a never-created backstore must swallow the no-such-object delete:\n${job.error!.message}`)
+    assert.ok(!job.error!.message.includes('could not be deleted'), job.error!.message)
     const argv = calls.filter(isMutation).map(c => c.args.join(' '))
-    const deleteRan = argv.filter(a => a.startsWith('/backstores/block/newlun delete'))
-    assert.equal(deleteRan.length, 1, `the cleanup must still try — and find nothing:\n${argv.join('\n')}`)
+    assert.deepEqual(argv.filter(a => a.includes(' delete')), [], `the undo must not run for a create that failed:\n${argv.join('\n')}`)
     assert.ok(!argv.some(a => a.startsWith(`/iscsi/${IQN}/tpg1/luns create`)), `nothing may be mapped:\n${argv.join('\n')}`)
     assert.ok(!argv.includes('saveconfig'), `a half-created LUN must never be persisted:\n${argv.join('\n')}`)
   })
@@ -549,14 +547,16 @@ describe('cr.40 — the iSCSI verbs re-gate in the job (ruling (j))', () => {
   const DELETE_LUN: Req = { method: 'DELETE', url: `${targetUrl}/luns/0` }
   const DELETE_LUN_AND_ZVOL: Req = { method: 'DELETE', url: `${targetUrl}/luns/0?destroyBacking=true` }
 
-  it('LUN delete: control — a confirmed destroyBacking with nothing changed unmaps, deletes the backstore, destroys the zvol, saves', async () => {
+  it('LUN delete: control — a confirmed destroyBacking with nothing changed unmaps, deletes the backstore, saves, destroys the zvol', async () => {
     const job = await race(DELETE_LUN_AND_ZVOL, LIVE, LIVE)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    // cr3 ISCSI-M3: the save comes BEFORE the destroy, so a destroy that
+    // fails can never leave the LUN persisted and gone (a restore hole).
     assert.deepEqual(calls.filter(isMutation).map(c => `${c.command} ${c.args.join(' ')}`), [
       `${TARGETCLI} /iscsi/${IQN}/tpg1/luns delete lun0`,
       `${TARGETCLI} /backstores/block delete gtiscsi_vol1`,
-      `${ZFS} destroy -- ${ZVOL_DATASET}`,
       `${TARGETCLI} saveconfig`,
+      `${ZFS} destroy -- ${ZVOL_DATASET}`,
     ])
   })
 

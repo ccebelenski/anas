@@ -1470,7 +1470,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         const res = await restore(newLunBody(targetWith({ name: 'newvol' })))
         assert.equal(res.statusCode, 409, JSON.stringify(res.body))
         assert.equal(res.body.error!.reason, 'name-taken', JSON.stringify(res.body))
-        assert.match(res.body.error!.message, /backstore named 'newvol' already exists on this node \(iblock, not mapped as a LUN\)/)
+        assert.match(res.body.error!.message, /backstore named 'newvol' already exists on this node, mapped as no LUN/)
         assertNothingDestructive()
       })
 

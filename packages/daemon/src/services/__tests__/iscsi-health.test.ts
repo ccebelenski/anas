@@ -289,6 +289,9 @@ describe('computeIscsiHealth — the restore hole (GT-20/GT-21)', () => {
       plugin: 'block',
       backingPath: '/dev/zvol/gtiscsi/vol1',
       backingExists: false,
+      // cr3 (ISCSI-L7): whose target the hole is in. The captured gtiscsi
+      // target's IQN is not ANAS's, so it is foreign — and still degrades.
+      targetOwnership: 'foreign',
     })
     // The guard: while this is true nothing may run `saveconfig` (GT-22).
     assert.equal(health.degraded, true)

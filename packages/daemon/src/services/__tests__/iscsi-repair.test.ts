@@ -41,7 +41,14 @@ import { buildIscsiTargets, readIscsiContext } from '../iscsi.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/iscsi')
-const IQN = 'iqn.2026-08.dev.anas.gtiscsi:target1'
+/**
+ * cr3 (ISCSI-L7, ruled 2026-11-14): Repair never writes to a target ANAS does
+ * not manage, and the captured `gtiscsi` target's IQN is not ANAS's. So the
+ * captures are relabelled IN MEMORY to an ANAS-shaped IQN (the files stay as
+ * captured); every other byte of them is the real restore-hole state.
+ */
+const GT_IQN = 'iqn.2026-08.dev.anas.gtiscsi:target1'
+const IQN = 'iqn.2026-08.dev.gtiscsi.anas:target1'
 
 function loadFixture(name: string): string {
   return readFileSync(join(fixturesDir, name), 'utf-8')
@@ -71,7 +78,9 @@ async function holeState(): Promise<{
 }> {
   const dir = await mkdtemp(join(tmpdir(), 'anas-iscsi-repair-'))
   const root = join(dir, 'target')
-  await materializeConfigfsManifest(loadFixture('configfs-restore-hole.manifest'), root)
+  await materializeConfigfsManifest(loadFixture('configfs-restore-hole.manifest').split(GT_IQN).join(IQN), root)
+  const saveconfigPath = join(dir, 'saveconfig.json')
+  await writeFile(saveconfigPath, loadFixture('saveconfig-final.json').split(GT_IQN).join(IQN))
   const blockRoot = join(dir, 'block')
   await mkdir(join(blockRoot, 'zd16'), { recursive: true })
   await writeFile(join(blockRoot, 'zd16', 'size'), '4194304\n')
@@ -79,8 +88,12 @@ async function holeState(): Promise<{
   const ctx = await readIscsiContext(new MockExecutor(), {
     configfsRoot: root,
     blockRoot,
-    saveconfigPath: join(fixturesDir, 'saveconfig-final.json'),
+    saveconfigPath,
     pveStorageCfg: join(fixturesDir, 'no-such-storage.cfg'),
+    // The read ANSWERED: no ZFS datasets here (cr3 review 2). An unanswered
+    // `zfs list` (the bare mock's) now means "the image's owner is unknown",
+    // and Repair rightly refuses such a target — not what these tests are about.
+    zfsMountpoints: async () => [],
   })
   const targets = await buildIscsiTargets(ctx)
   return { ctx, targets, health: computeIscsiHealth(ctx, targets), dir }
@@ -168,7 +181,7 @@ describe('assertRepairable — the guiding 409', () => {
     try {
       const refusal = assertRepairable(planIscsiRepair(s.ctx, s.health, s.targets))
       assert.equal(refusal?.reason, 'backing-absent')
-      assert.match(refusal!.message, /LUN 0 of iqn\.2026-08\.dev\.anas\.gtiscsi:target1/)
+      assert.match(refusal!.message, /LUN 0 of iqn\.2026-08\.dev\.gtiscsi\.anas:target1/)
       assert.match(refusal!.message, /gtiscsi_vol1/)
       assert.match(refusal!.message, /\/dev\/zvol\/gtiscsi\/vol1/)
       // …and says what to do about it.

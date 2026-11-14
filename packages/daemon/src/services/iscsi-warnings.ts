@@ -20,14 +20,16 @@
  * "which of my targets is lying to its initiators", not "how many LUNs are
  * missing".
  *
- * Healthy adds NOTHING, LIO-not-installed adds NOTHING, and every failure is
- * swallowed to `[]` — a node that serves no block storage must never see an
- * iSCSI card, and a broken iSCSI read must never blank the dashboard.
+ * Healthy adds NOTHING and LIO-not-installed adds NOTHING — a node that serves
+ * no block storage must never see an iSCSI card. A read that FAILED throws
+ * (cr3): the dashboard then marks the iSCSI section unavailable rather than
+ * reading the failure as "no warnings".
  */
 
 import type { DashboardWarning, IscsiHealth, IscsiTargetDetail } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { IscsiPaths } from './iscsi.js'
+import { foreignHolesSentence } from './iscsi-mutate.js'
 import { readIscsiHealth } from './iscsi-quarantine.js'
 
 /**
@@ -83,6 +85,20 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
   //     the right size, the right serial, and empty). This is the only card that
   //     can tell an operator their data was never being served.
   for (const stub of health.stubLuns) {
+    // cr3 (review): a full-size image on an unexpected mount is not a
+    // placeholder — it holds data, ANAS leaves it serving, and the card says
+    // so as a warning, never as an empty disk.
+    if (!stub.zeroSized) {
+      warnings.push({
+        level: 'warning',
+        category: 'iscsi',
+        message: `LUN ${stub.lunIndex} '${stub.backstoreName}' of target ${stub.targetIqn} is served from ${stub.backingPath}, `
+          + `which is on ${stub.containingMount} instead of ${stub.expectedMount}. The file is full-size, so it holds data `
+          + `and ANAS leaves it serving — check that this is the filesystem you meant (a bind mount or an altroot can do this).`,
+        ref: stub.targetIqn,
+      })
+      continue
+    }
     const why = stub.zeroSized && stub.wrongMount
       ? `it is 0 bytes where the saved configuration says ${stub.persistedSize}, and it is on ${stub.containingMount} instead of ${stub.expectedMount}`
       : stub.zeroSized
@@ -134,15 +150,19 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     const removedClause = ' That path is empty because ANAS REMOVED the placeholder it found there — it was 0 bytes and '
       + 'on the wrong filesystem, so nothing of yours was deleted. Mount the filesystem that should hold the image, then '
       + 'use Repair on the iSCSI menu to put the LUN back with its own serial.'
-    const backNow = lun.stubBacking
-      ? placeholderClause
-      : placeholderRemoved.has(`${lun.targetIqn}#${lun.lunIndex}`)
-        ? removedClause
-        : lun.backingExists === true
-          ? ' That path is available again — use Repair on the iSCSI menu to put the LUN back.'
-          : lun.backingExists === false
-            ? ' That path is still missing — bring the storage back (import the pool, restore the image) first.'
-            : ''
+    // cr3 (ISCSI-L7): a hole in a target ANAS does not manage is never
+    // Repair's — the card says whose it is and how to restore it by hand.
+    const backNow = lun.targetOwnership === 'foreign'
+      ? ` ${foreignHolesSentence([lun])}`
+      : lun.stubBacking
+        ? placeholderClause
+        : placeholderRemoved.has(`${lun.targetIqn}#${lun.lunIndex}`)
+          ? removedClause
+          : lun.backingExists === true
+            ? ' That path is available again — use Repair on the iSCSI menu to put the LUN back.'
+            : lun.backingExists === false
+              ? ' That path is still missing — bring the storage back (import the pool, restore the image) first.'
+              : ''
     warnings.push({
       level: 'warning',
       category: 'iscsi',
@@ -152,7 +172,30 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     })
   }
 
-  if (health.degraded) {
+  // cr3 (ISCSI-L15): the saved configuration could not be read. Its own card,
+  // not the "incomplete restore" one: nothing is known to be missing — the
+  // file that says what should exist is what is broken.
+  if (health.saveconfigUnreadable) {
+    warnings.push({
+      level: 'critical',
+      category: 'iscsi',
+      message: `The saved iSCSI configuration cannot be read: ${health.saveconfigUnreadable}. A save now would `
+        + `overwrite it with the live configuration, so iSCSI changes are refused until the file is restored `
+        + `(targetcli keeps copies in /etc/rtslib-fb-target/backup/).`,
+    })
+  }
+
+  // cr3: the live configuration could not be listed in full.
+  if (health.configfsUnreadable && health.configfsUnreadable.length > 0) {
+    warnings.push({
+      level: 'critical',
+      category: 'iscsi',
+      message: `The live iSCSI configuration could not be read in full (${health.configfsUnreadable.join(', ')} could not be listed), `
+        + `so the LUNs, initiators and sessions behind it are unknown. iSCSI changes and Repair are refused until it reads.`,
+    })
+  }
+
+  if (health.degraded && (health.missingLuns.length > 0 || health.stubLuns.length > 0)) {
     const n = health.missingLuns.length
     const stubs = health.stubLuns.length
     // The `incomplete restore (N LUN…)` phrasing is the one an operator has seen
@@ -164,12 +207,18 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     const headline = stubs > 0 && n > 0
       ? `${incomplete} AND ${placeholders}`
       : stubs > 0 ? placeholders : incomplete
+    // cr3 (ISCSI-L7): when the only holes are in foreign targets, "until this
+    // is repaired" would point at a Repair that never touches them.
+    const foreignOnly = stubs === 0 && n > 0 && health.missingLuns.every(l => l.targetOwnership === 'foreign')
     warnings.push({
       level: 'critical',
       category: 'iscsi',
       message: `The live iSCSI configuration ${headline}. Saving now would `
-        + `write the hole into /etc/rtslib-fb-target/saveconfig.json permanently, so iSCSI mutations are `
-        + `refused until this is repaired.`,
+        + `write the hole into /etc/rtslib-fb-target/saveconfig.json permanently, so iSCSI mutations are ${
+          foreignOnly
+            ? `refused until the missing LUNs are back — they are in targets ANAS does not manage, so Repair does not touch them; `
+            + `restore them by hand (their own cards say how).`
+            : `refused until this is repaired.`}`,
     })
   }
 
@@ -202,8 +251,9 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
 }
 
 /**
- * Collect the dashboard `iscsi` warnings, FAIL-OPEN — the same shape as
- * `collectScheduleWarnings` / `collectBackupWarnings` / `collectMountWarnings`.
+ * Collect the dashboard `iscsi` warnings. A failed read throws (cr3,
+ * INVENTED-STATE-H1) — the dashboard's section reader turns that into
+ * "iSCSI unavailable", never into "no warnings".
  *
  * Cost on a node that serves no block storage is two `stat` calls: with neither
  * a configfs target tree nor a `saveconfig.json`, `readIscsiContext` returns
@@ -214,16 +264,17 @@ export async function collectIscsiWarnings(
   paths: IscsiPaths = {},
   opts: { disabledDetail?: (target: IscsiTargetDetail) => string | undefined } = {},
 ): Promise<DashboardWarning[]> {
-  try {
-    // A pure read (cr.62, review L9): the dashboard REPORTS a placeholder LUN
-    // (the card above says it is still served and points at Repair); it never
-    // quarantines one — a GET must not act. One gather, no lock.
-    const { ctx, health } = await readIscsiHealth(executor, paths, opts)
-    if (!ctx.live.present && ctx.persisted === null)
-      return []
-    return buildIscsiWarnings(health)
-  }
-  catch {
+  // A pure read (cr.62, review L9): the dashboard REPORTS a placeholder LUN
+  // (the card above says it is still served and points at Repair); it never
+  // quarantines one — a GET must not act. One gather, no lock.
+  //
+  // cr3 (INVENTED-STATE-H1): a read that FAILED propagates. It used to be
+  // caught here and answered `[]` — "no iSCSI warnings", all clear — and the
+  // dashboard marks a section unavailable only on a throw or a timeout, so a
+  // broken read showed as a healthy node. The dashboard's section reader
+  // catches it and says the iSCSI section is unavailable.
+  const { ctx, health } = await readIscsiHealth(executor, paths, opts)
+  if (!ctx.live.present && ctx.persisted === null && !ctx.persistedUnreadable)
     return []
-  }
+  return buildIscsiWarnings(health)
 }

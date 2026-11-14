@@ -47,6 +47,7 @@
 
 import { readdir, readFile, readlink, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
+import { lioAuthUnset } from '@anas/shared'
 
 /** The configfs mount point of the LIO target core. */
 export const CONFIGFS_TARGET_ROOT = '/sys/kernel/config/target'
@@ -72,9 +73,13 @@ export const UNIT_SERIAL_PREFIX = 'T10 VPD Unit Serial Number: '
  */
 export const LIO_AUTH_NULL = 'NULL'
 
-/** Is this configfs auth value "not set" — empty, or LIO's `NULL` sentinel? */
+/**
+ * Is this configfs auth value "not set" — empty, or LIO's `NULL` sentinel?
+ * cr3 (ISCSI-L12): the kernel's compare is a PREFIX one (`strncmp(..., 4)`), so
+ * a value that starts with `NULL` was stored as unset and reads as unset here.
+ */
 export function authUnset(value: string): boolean {
-  return value === '' || value === LIO_AUTH_NULL
+  return lioAuthUnset(value)
 }
 
 /** A bracketed IPv6 np directory: `[fd00:6774:0:1::1]:3260` (GT-13). */
@@ -241,6 +246,14 @@ export interface ConfigfsAcl {
   mappedLuns: number[]
   /** The session on this ACL, or null when `info` says there is none. */
   session: ConfigfsSession | null
+  /**
+   * cr3: `info` could not be read, or did not say either thing it always says
+   * (a session block, or `No active iSCSI Session`). `session` is then null
+   * because nothing was SEEN, not because nothing is there — and a session
+   * gate must refuse rather than read it as "nobody logged in". Optional so
+   * a hand-built state (a test's) that never says reads as readable.
+   */
+  sessionUnreadable?: boolean
 }
 
 /** A live network portal (an `np/<addr>:<port>` directory). */
@@ -272,6 +285,12 @@ export interface ConfigfsTpg {
 export interface ConfigfsTarget {
   iqn: string
   tpgs: ConfigfsTpg[]
+  /**
+   * cr3: configfs directories of THIS target that exist and could not be
+   * listed (its TPGs, portals, LUNs, ACLs). What they hold is unknown — never
+   * "none". Absent when every directory read.
+   */
+  unreadable?: string[]
 }
 
 /** Everything live in the kernel target right now. */
@@ -280,6 +299,11 @@ export interface LioLiveState {
   present: boolean
   backstores: ConfigfsBackstore[]
   targets: ConfigfsTarget[]
+  /**
+   * cr3: node-level configfs directories (`core/`, a backstore plugin dir,
+   * `iscsi/`) that exist and could not be listed. Absent when all read.
+   */
+  unreadable?: string[]
 }
 
 /** The state of a node with no LIO stack. */
@@ -327,13 +351,25 @@ async function readNumber(path: string): Promise<number | null> {
   return Number.isFinite(n) ? n : null
 }
 
-/** List a directory's entries; [] on any failure (missing, unreadable). */
-async function listDir(path: string): Promise<string[]> {
+/**
+ * List a directory's entries. cr3: ONLY an absent directory (ENOENT/ENOTDIR)
+ * is empty. Any other failure is a read that did not see: with a `sink` the
+ * path is recorded there (the caller turns it into an unknown, never "none")
+ * and `[]` comes back; without one it throws.
+ */
+async function listDir(path: string, sink?: string[]): Promise<string[]> {
   try {
     return await readdir(path)
   }
-  catch {
-    return []
+  catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTDIR')
+      return []
+    if (sink) {
+      sink.push(path)
+      return []
+    }
+    throw new Error(`could not list ${path}: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
@@ -422,6 +458,19 @@ export function parseBackstoreInfo(text: string): BackstoreInfo {
  * anywhere: it reflects `authenticate_target`, not whether the initiator
  * authenticated, and a one-way-CHAP session prints it (GT-39).
  */
+/**
+ * Did an `info` block say ONE of the two things it always says (cr3)? A
+ * session block carries `Session State:`; no session is the single line
+ * `No active iSCSI Session ...`. Anything else — an empty read, a format this
+ * parser does not know — answers neither, and is an unreadable session, never
+ * "no session".
+ */
+export function aclInfoReadable(text: string | null): boolean {
+  if (text === null)
+    return false
+  return text.includes('No active iSCSI Session') || SESSION_STATE_RE.test(text)
+}
+
 export function parseAclInfo(text: string, fallbackIqn: string): ConfigfsSession | null {
   if (text.includes('No active iSCSI Session'))
     return null
@@ -581,14 +630,14 @@ async function readBackstore(
 }
 
 /** Read every backstore under `core/`, skipping the ALUA bookkeeping dir. */
-async function readBackstores(root: string, blockRoot: string): Promise<ConfigfsBackstore[]> {
+async function readBackstores(root: string, blockRoot: string, sink: string[]): Promise<ConfigfsBackstore[]> {
   const coreDir = join(root, 'core')
   const out: ConfigfsBackstore[] = []
-  for (const pluginDir of (await listDir(coreDir)).sort()) {
+  for (const pluginDir of (await listDir(coreDir, sink)).sort()) {
     // `core/alua` holds LU-group bookkeeping, not backstores.
     if (pluginDir === 'alua')
       continue
-    for (const name of (await listDir(join(coreDir, pluginDir))).sort()) {
+    for (const name of (await listDir(join(coreDir, pluginDir), sink)).sort()) {
       // `hba_info` / `hba_mode` are files beside the backstore directories.
       if (!(await exists(join(coreDir, pluginDir, name, 'wwn'))))
         continue
@@ -607,9 +656,11 @@ async function readBackstores(root: string, blockRoot: string): Promise<Configfs
  * LUN into every existing ACL by itself, so a set read BEFORE the mutation is
  * stale by the time the grant runs.
  */
-export async function readMappedLuns(aclDir: string): Promise<number[]> {
+export async function readMappedLuns(aclDir: string, sink?: string[]): Promise<number[]> {
   const out: number[] = []
-  for (const entry of await listDir(aclDir)) {
+  // cr3: without a sink (a grant at the point of use) an unreadable ACL
+  // directory THROWS — "nothing mapped yet" would map everything again.
+  for (const entry of await listDir(aclDir, sink)) {
     const m = LUN_DIR_RE.exec(entry)
     if (m)
       out.push(Number(m[1]))
@@ -618,7 +669,7 @@ export async function readMappedLuns(aclDir: string): Promise<number[]> {
 }
 
 /** Read one initiator ACL, including its session — and never its secrets. */
-async function readAcl(aclsDir: string, initiatorIqn: string): Promise<ConfigfsAcl> {
+async function readAcl(aclsDir: string, initiatorIqn: string, sink: string[]): Promise<ConfigfsAcl> {
   const dir = join(aclsDir, initiatorIqn)
   const authDir = join(dir, 'auth')
 
@@ -633,7 +684,7 @@ async function readAcl(aclsDir: string, initiatorIqn: string): Promise<ConfigfsA
       readTrimmed(join(authDir, 'password_mutual')),
       readFlag(join(authDir, 'authenticate_target')),
       readValue(join(dir, 'info')),
-      readMappedLuns(dir),
+      readMappedLuns(dir, sink),
     ])
 
   return {
@@ -645,12 +696,13 @@ async function readAcl(aclsDir: string, initiatorIqn: string): Promise<ConfigfsA
     authenticateTarget,
     mappedLuns,
     session: infoRaw !== null ? parseAclInfo(infoRaw, initiatorIqn) : null,
+    ...(aclInfoReadable(infoRaw) ? {} : { sessionUnreadable: true }),
   }
 }
 
 /** Read one TPG LUN: its index and the backstore its symlink points at. */
-async function readLun(lunDir: string, index: number): Promise<ConfigfsLun> {
-  for (const entry of await listDir(lunDir)) {
+async function readLun(lunDir: string, index: number, sink: string[]): Promise<ConfigfsLun> {
+  for (const entry of await listDir(lunDir, sink)) {
     let target: string
     try {
       target = await readlink(join(lunDir, entry))
@@ -666,7 +718,7 @@ async function readLun(lunDir: string, index: number): Promise<ConfigfsLun> {
 }
 
 /** Read one TPG. */
-async function readTpg(targetDir: string, tpgtDir: string, tag: number): Promise<ConfigfsTpg> {
+async function readTpg(targetDir: string, tpgtDir: string, tag: number, sink: string[]): Promise<ConfigfsTpg> {
   const dir = join(targetDir, tpgtDir)
 
   const [enabled, authentication, generateNodeAcls, demoModeDiscovery, dynamicSessionsRaw]
@@ -679,24 +731,24 @@ async function readTpg(targetDir: string, tpgtDir: string, tag: number): Promise
     ])
 
   const portals: ConfigfsPortal[] = []
-  for (const np of (await listDir(join(dir, 'np'))).sort()) {
+  for (const np of (await listDir(join(dir, 'np'), sink)).sort()) {
     const portal = parseNpDirName(np)
     if (portal)
       portals.push(portal)
   }
 
   const luns: ConfigfsLun[] = []
-  for (const entry of (await listDir(join(dir, 'lun'))).sort()) {
+  for (const entry of (await listDir(join(dir, 'lun'), sink)).sort()) {
     const m = LUN_DIR_RE.exec(entry)
     if (m)
-      luns.push(await readLun(join(dir, 'lun', entry), Number(m[1])))
+      luns.push(await readLun(join(dir, 'lun', entry), Number(m[1]), sink))
   }
   luns.sort((a, b) => a.index - b.index)
 
   const aclsDir = join(dir, 'acls')
   const acls: ConfigfsAcl[] = []
-  for (const initiator of (await listDir(aclsDir)).sort())
-    acls.push(await readAcl(aclsDir, initiator))
+  for (const initiator of (await listDir(aclsDir, sink)).sort())
+    acls.push(await readAcl(aclsDir, initiator, sink))
 
   return {
     tag,
@@ -712,48 +764,58 @@ async function readTpg(targetDir: string, tpgtDir: string, tag: number): Promise
 }
 
 /** Read every iSCSI target and its TPGs. */
-async function readTargets(root: string): Promise<ConfigfsTarget[]> {
+async function readTargets(root: string, nodeSink: string[]): Promise<ConfigfsTarget[]> {
   const iscsiDir = join(root, 'iscsi')
   const out: ConfigfsTarget[] = []
-  for (const entry of (await listDir(iscsiDir)).sort()) {
+  for (const entry of (await listDir(iscsiDir, nodeSink)).sort()) {
     // `iscsi/` also holds `discovery_auth/`, `lio_version`, `cpus_allowed_list`.
     // A target directory is exactly one whose name is an iSCSI node name.
     if (!(entry.startsWith('iqn.') || entry.startsWith('eui.') || entry.startsWith('naa.')))
       continue
     const targetDir = join(iscsiDir, entry)
     const tpgs: ConfigfsTpg[] = []
-    for (const tpgtDir of (await listDir(targetDir)).sort()) {
+    const sink: string[] = []
+    for (const tpgtDir of (await listDir(targetDir, sink)).sort()) {
       const m = TPGT_DIR_RE.exec(tpgtDir)
       if (m)
-        tpgs.push(await readTpg(targetDir, tpgtDir, Number(m[1])))
+        tpgs.push(await readTpg(targetDir, tpgtDir, Number(m[1]), sink))
     }
     tpgs.sort((a, b) => a.tag - b.tag)
-    out.push({ iqn: entry, tpgs })
+    out.push({ iqn: entry, tpgs, ...(sink.length > 0 ? { unreadable: sink } : {}) })
   }
   return out
 }
 
 /**
- * Read the whole live LIO state. FAIL-OPEN: a node without the target stack has
- * no `/sys/kernel/config/target`, and that returns {@link ABSENT_LIVE_STATE}
+ * Read the whole live LIO state. A node without the target stack has no
+ * `/sys/kernel/config/target`, and that returns {@link ABSENT_LIVE_STATE}
  * rather than throwing — `installed: false` is a first-class state.
+ *
+ * cr3 (INVENTED-STATE-H1): ONLY an absent tree is "not installed". A tree that
+ * is there and could not be read used to return the same ABSENT state, so every
+ * persisted LUN read as a restore hole and the held-by-LUN claims as "nothing
+ * held"; it now THROWS, which is what every caller already handles as a read
+ * that did not see (the claims cache's `readFailed`, the dashboard's
+ * unavailable section, the busy diagnosis's fall-through).
  */
 export async function readConfigfs(opts?: ConfigfsOptions): Promise<LioLiveState> {
   const root = opts?.root ?? CONFIGFS_TARGET_ROOT
   const blockRoot = opts?.blockRoot ?? SYS_CLASS_BLOCK
-  if (!(await exists(root)))
-    return { ...ABSENT_LIVE_STATE }
   try {
-    const [backstores, targets] = await Promise.all([
-      readBackstores(root, blockRoot),
-      readTargets(root),
-    ])
-    return { present: true, backstores, targets }
+    await stat(root)
   }
   catch (err: unknown) {
-    console.warn(`anasd: could not read ${root} for the iSCSI read layer:`, err)
-    return { ...ABSENT_LIVE_STATE }
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTDIR')
+      return { ...ABSENT_LIVE_STATE }
+    throw new Error(`could not read ${root} for the iSCSI read layer: ${err instanceof Error ? err.message : String(err)}`)
   }
+  const nodeSink: string[] = []
+  const [backstores, targets] = await Promise.all([
+    readBackstores(root, blockRoot, nodeSink),
+    readTargets(root, nodeSink),
+  ])
+  return { present: true, backstores, targets, ...(nodeSink.length > 0 ? { unreadable: nodeSink } : {}) }
 }
 
 // ---------------------------------------------------------------------------
@@ -836,6 +898,36 @@ export function findLunHolder(state: LioLiveState, devPath: string): LunHolder |
     }
   }
   return null
+}
+
+/**
+ * Every live LUN, in any target and any TPG, that maps the backstore `name`
+ * (cr3, ISCSI-M6). rtslib's backstore delete takes every LUN attached to it
+ * with it, so a backstore some OTHER LUN maps is not one LUN's to delete.
+ * `except` is the LUN being removed.
+ */
+export function lunsMappingBackstore(
+  state: LioLiveState,
+  plugin: string,
+  name: string,
+  except?: { targetIqn: string, tpgTag: number, lunIndex: number },
+): { targetIqn: string, tpgTag: number, lunIndex: number }[] {
+  // cr3 (review): a backstore is a PLUGIN and a name — fileio/x and block/x
+  // are two objects, and only the same one is "shared".
+  const wanted = normalizePlugin(plugin)
+  const out: { targetIqn: string, tpgTag: number, lunIndex: number }[] = []
+  for (const target of state.targets) {
+    for (const tpg of target.tpgs) {
+      for (const lun of tpg.luns) {
+        if (lun.backstoreName !== name || normalizePlugin(lun.plugin ?? '') !== wanted)
+          continue
+        if (except && except.targetIqn === target.iqn && except.tpgTag === tpg.tag && except.lunIndex === lun.index)
+          continue
+        out.push({ targetIqn: target.iqn, tpgTag: tpg.tag, lunIndex: lun.index })
+      }
+    }
+  }
+  return out
 }
 
 /**

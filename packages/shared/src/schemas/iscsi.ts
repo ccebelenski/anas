@@ -431,6 +431,21 @@ export const IscsiLun = z.object({
   pool: z.string().optional(),
   /** The ZFS dataset (zvol or the file's dataset), when it resolves onto one. */
   dataset: z.string().optional(),
+  /**
+   * cr3: true when an ACL that maps this LUN has a session that could not be
+   * read (its configfs `info` was unreadable or said neither thing it always
+   * says) — `connectedInitiators` is then a floor, not the answer, and every
+   * session gate refuses. Absent = every mapped ACL's session was read. An
+   * older panel ignores it.
+   */
+  connectedInitiatorsUnknown: z.boolean().optional(),
+  /**
+   * cr3: an image FILE whose dataset could not be judged — the ZFS mountpoint
+   * table could not be read, so whether the file sits inside PVE's footprint
+   * is unknown. Never "not PVE's" for a change to the backing (destroy,
+   * resize refuse) and never "foreign" for the target. An older panel ignores it.
+   */
+  backingOwnershipUnknown: z.boolean().optional(),
 })
 export type IscsiLun = z.infer<typeof IscsiLun>
 
@@ -558,6 +573,20 @@ export const IscsiTargetSummary = z.object({
   lunCount: z.number().int().nonnegative(),
   aclCount: z.number().int().nonnegative(),
   sessionCount: z.number().int().nonnegative(),
+  /**
+   * cr3: true when the session of at least one live ACL could not be read, so
+   * `sessionCount` is a floor, not the count — the panel shows it as unknown
+   * and every session gate refuses. Absent = every session was read. An older
+   * panel ignores it.
+   */
+  sessionsUnknown: z.boolean().optional(),
+  /**
+   * cr3: configfs directories of this target that exist and could not be
+   * listed (TPGs, portals, LUNs, ACLs) — what they hold is UNKNOWN, never
+   * "none". The node is degraded and no change is made until they read.
+   * Absent when every directory read. An older panel ignores it.
+   */
+  configfsUnreadable: z.array(z.string()).optional(),
   security: IscsiTargetSecurity,
   /** Live in configfs? False = persisted but not restored. */
   present: z.boolean(),
@@ -570,11 +599,37 @@ export const IscsiTargetSummary = z.object({
 })
 export type IscsiTargetSummary = z.infer<typeof IscsiTargetSummary>
 
+/**
+ * A target portal group BEYOND the first (cr3, ISCSI-H2). ANAS creates exactly
+ * one TPG per target, and the target's own fields describe the lowest-tagged
+ * one; a target given a second TPG by hand still has LUNs, holes and sessions
+ * there, and the health diff, the held-by-LUN claims, the served serials and
+ * every session gate must see them. ANAS refuses to change such a target.
+ */
+export const IscsiTpgDetail = z.object({
+  tpgTag: z.number().int().nonnegative(),
+  enabled: z.boolean(),
+  /** Live in configfs? */
+  present: z.boolean(),
+  /** In saveconfig.json? */
+  persisted: z.boolean(),
+  portals: z.array(IscsiPortal),
+  luns: z.array(IscsiLun),
+  acls: z.array(IscsiAcl),
+})
+export type IscsiTpgDetail = z.infer<typeof IscsiTpgDetail>
+
 /** The detail window: the summary plus everything hanging off the target. */
 export const IscsiTargetDetail = IscsiTargetSummary.extend({
   luns: z.array(IscsiLun),
   acls: z.array(IscsiAcl),
+  /** Every live session, of EVERY TPG (each names its `tpgTag`). */
   sessions: z.array(IscsiSession),
+  /**
+   * cr3 (ISCSI-H2): every TPG after the first, present only when the target
+   * has more than one. Optional and additive: an older panel ignores it.
+   */
+  otherTpgs: z.array(IscsiTpgDetail).optional(),
   /**
    * PVE-firewall advisory (story `iscsi.6`) — a portal can listen perfectly and
    * still be unreachable because `pve-firewall` drops 3260/tcp. ANAS reads the
@@ -661,6 +716,13 @@ export const IscsiMissingLun = z.object({
    * fresh from the filesystem on every read — no state is kept.
    */
   stubBacking: z.boolean().optional(),
+  /**
+   * cr3 (ISCSI-L7, ruled 2026-11-14): whose target the hole is in. A hole in
+   * a FOREIGN target still degrades the node (a save is node-wide and would
+   * erase that target's saved LUN), but Repair never writes to it. Absent
+   * from an older daemon. An older panel ignores it.
+   */
+  targetOwnership: IscsiOwnership.optional(),
 })
 export type IscsiMissingLun = z.infer<typeof IscsiMissingLun>
 
@@ -848,6 +910,20 @@ export const IscsiHealth = IscsiAvailability.extend({
    * `portalsWithoutInterface` is "unknown", not "none" (fail-open).
    */
   interfacesUnknown: z.boolean(),
+  /**
+   * cr3 (ISCSI-L15): saveconfig.json is there but could not be read or
+   * parsed — the reason. The diff above is then against NOTHING, not against
+   * an empty saved configuration: `degraded` is true (a save now would
+   * overwrite whatever the file holds) and Repair refuses. Absent when the
+   * file read cleanly or is simply not there. An older panel ignores it.
+   */
+  saveconfigUnreadable: z.string().optional(),
+  /**
+   * cr3: every configfs directory (node-level or a target's) that exists and
+   * could not be listed. The live side of the diff is then not known:
+   * `degraded` is true, every change and Repair refuse. Absent when all read.
+   */
+  configfsUnreadable: z.array(z.string()).optional(),
   checkedAt: ISODateTime,
 })
 export type IscsiHealth = z.infer<typeof IscsiHealth>
@@ -889,9 +965,30 @@ function utf8Length(s: string): number {
  * configfs file, and 16 characters of non-ASCII would overrun an initiator's
  * 16-byte field.
  */
+/**
+ * cr3 (ISCSI-L12): the kernel's ACL auth store compares the first four bytes
+ * of a written value against `NULL` (`strncmp("NULL", page, 4)` in
+ * iscsi_target_configfs.c) and CLEARS the credential when they match — so a
+ * username or secret that merely STARTS with `NULL` is stored as "not set",
+ * and CHAP login fails with nothing to say why. Refused at the boundary.
+ * (Read from the kernel source; a node check settles the exact compare.)
+ */
+const LIO_AUTH_NULL_PREFIX = 'NULL'
+/**
+ * THE one rule for "is this stored CHAP value unset?" (cr3, ISCSI-L12) — the
+ * kernel's own: empty, or anything that starts with `NULL`. The configfs
+ * reader and the saveconfig parser both ask it, so they cannot disagree.
+ */
+export function lioAuthUnset(value: string): boolean {
+  return value === '' || value.startsWith(LIO_AUTH_NULL_PREFIX)
+}
+
+const CHAP_NULL_PREFIX_MESSAGE = 'A CHAP username or secret may not start with \'NULL\' — LIO reads any value beginning with those four letters as "not set"'
+
 export const IscsiChapSecret = z
   .string()
   .refine(s => !hasControlChars(s), 'Control characters are not allowed in a CHAP secret')
+  .refine(s => !s.startsWith(LIO_AUTH_NULL_PREFIX), CHAP_NULL_PREFIX_MESSAGE)
   .refine(
     s => utf8Length(s) >= ISCSI_CHAP_SECRET_MIN_BYTES && utf8Length(s) <= ISCSI_CHAP_SECRET_MAX_BYTES,
     `A CHAP secret must be ${ISCSI_CHAP_SECRET_MIN_BYTES}–${ISCSI_CHAP_SECRET_MAX_BYTES} bytes (initiators enforce this range; the target does not)`,
@@ -909,6 +1006,7 @@ export const IscsiChapUserid = z
   // Printable ASCII, space excluded: U+0021 '!' through U+007E '~'. Spelled with
   // the escapes rather than the literal range so the bounds are unambiguous.
   .regex(/^[\u0021-\u007E]+$/, 'A CHAP username must be printable ASCII with no spaces')
+  .refine(s => !s.startsWith(LIO_AUTH_NULL_PREFIX), CHAP_NULL_PREFIX_MESSAGE)
 
 /**
  * How a target authenticates its initiators.
@@ -1400,6 +1498,12 @@ export const IscsiClaim = z.object({
   backstoreName: z.string(),
   /** Initiator IQNs with a live session mapping this LUN. */
   connectedInitiators: z.array(z.string()),
+  /**
+   * cr3: a session mapping this LUN could not be read — `connectedInitiators`
+   * is a floor, not the answer. Every session gate treats it as LIVE. Absent =
+   * every session was read. An older consumer ignores it.
+   */
+  connectedInitiatorsUnknown: z.boolean().optional(),
   /** One sentence naming the holder, ready to append to a refusal. */
   detail: z.string(),
 })
@@ -1427,12 +1531,23 @@ export const IscsiHeldByLun = z.object({
   targetIqn: z.string(),
   /** LUN number within that target's TPG. */
   index: z.number().int().nonnegative(),
+  /**
+   * cr3 (ISCSI-H2): the TPG the LUN is in — `index` is an address inside one
+   * TPG, so a lookup by index alone can find another TPG's LUN 0. Absent from
+   * an older daemon (then: the target's first TPG).
+   */
+  tpgTag: z.number().int().nonnegative().optional(),
   /** The backstore name = the SCSI model string initiators see. */
   name: z.string(),
   /** The backing object the LUN holds (`/dev/zvol/<pool>/<vol>` or the image). */
   backingPath: z.string(),
   /** Initiator IQNs with a live session mapping this LUN (may be empty). */
   connectedInitiators: z.array(z.string()),
+  /**
+   * cr3: a session mapping this LUN could not be read — treat as live (a gate
+   * that allows an act only with no session must refuse). Absent = all read.
+   */
+  connectedInitiatorsUnknown: z.boolean().optional(),
   /** The one holder sentence, ready for a tooltip or a refusal message. */
   detail: z.string(),
 })

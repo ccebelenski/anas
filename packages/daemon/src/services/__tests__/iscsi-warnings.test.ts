@@ -467,11 +467,11 @@ describe('collectIscsiWarnings — fail-open, against the real captures', () => 
     }
   })
 
-  it('a read that THROWS fails open to no cards, never to a broken dashboard', async () => {
-    // Every read INSIDE the layer already swallows its own errors, so the throw
-    // has to be forced from outside it — the guarantee under test is simply
-    // "this collector never propagates", the same contract every other
-    // dashboard source signs.
+  it('a read that THROWS propagates — the dashboard marks the section unavailable, never "no warnings"', async () => {
+    // cr3 INVENTED-STATE-H1: this used to assert the collector answered []
+    // (all clear) for a read that threw. The dashboard marks a section
+    // unavailable only on a throw or a timeout, so the throw is the honest
+    // answer now; routes/dashboard.ts's section reader catches it.
     const exploding: CommandExecutor = {
       async exec(): Promise<ExecResult> {
         throw new Error('boom')
@@ -489,7 +489,6 @@ describe('collectIscsiWarnings — fail-open, against the real captures', () => 
       },
     } as IscsiPaths
 
-    const w = await collectIscsiWarnings(exploding, hostile)
-    assert.deepEqual(w, [])
+    await assert.rejects(() => collectIscsiWarnings(exploding, hostile), /boom/)
   })
 })

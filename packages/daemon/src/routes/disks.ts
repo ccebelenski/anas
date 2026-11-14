@@ -10,8 +10,7 @@ import { isSmartctlProbeFailure, isSmartctlStandby, parseSmartctl, standbySmartD
 import { execZpool } from '../parsers/zpool-list.js'
 import { readZpoolStatusAnswer } from '../parsers/zpool-status.js'
 import { readAhrPools } from '../services/ahr-topology.js'
-import { normalizeSerial } from '../services/iscsi-held.js'
-import { readIscsiState } from '../services/iscsi-mutate.js'
+import { iscsiServedSerialsStrict, normalizeSerial } from '../services/iscsi-held.js'
 import { readSystemMountPools } from '../services/system-mounts.js'
 
 const BY_ID_PATH_RE = /^\/dev\/disk\/by-(?:id|partuuid)\/(.+)$/
@@ -296,23 +295,11 @@ async function readServedSerials(
   executor: CommandExecutor,
   iscsiPaths: IscsiPaths,
 ): Promise<{ serials: Set<string> } | { unreadable: string }> {
-  try {
-    const { targets } = await readIscsiState(executor, iscsiPaths)
-    const serials = new Set<string>()
-    for (const target of targets) {
-      for (const lun of target.luns) {
-        if (lun.serial)
-          serials.add(normalizeSerial(lun.serial))
-      }
-    }
-    return { serials }
-  }
-  catch (err: unknown) {
-    // A timeout is a failed read like any other (cr3 re-review item 7): it
-    // marks the iSCSI-transport disks `iscsi-unverified` and never fails the
-    // whole inventory.
-    return { unreadable: `this node's iSCSI LUNs could not be read (${err instanceof Error ? err.message : String(err)})` }
-  }
+  // cr3 (merge, iSCSI): the iSCSI lane's strict reader — every TPG, and a
+  // configfs tree that could not be listed in full is unreadable too. A
+  // timeout is a failed read like any other: it marks the iSCSI-transport
+  // disks `iscsi-unverified` and never fails the disk list.
+  return iscsiServedSerialsStrict(executor, iscsiPaths)
 }
 
 /** {@link collectDisks}, with the facts it could not read named (cr3). */

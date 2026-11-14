@@ -5,7 +5,7 @@ import type { IscsiPaths } from '../services/iscsi.js'
 import { IscsiIqn } from '@anas/shared'
 import { readNodeInitiatorName } from '../parsers/iscsi-initiator.js'
 import { readIscsiHealth } from '../services/iscsi-quarantine.js'
-import { buildIscsiTargets, collectIscsiSessions, iscsiAvailability, readIscsiContext, toTargetSummary } from '../services/iscsi.js'
+import { buildIscsiTargets, collectIscsiSessions, iscsiAvailability, readIscsiContext, targetTpgs, toTargetSummary } from '../services/iscsi.js'
 import { readPveFirewallAdvisory } from '../services/pve-firewall.js'
 
 /**
@@ -119,7 +119,8 @@ export async function iscsiRoutes(server: FastifyInstance, opts: IscsiRouteOptio
     // because PVE's firewall drops 3260/tcp — LIO will never say so, and neither
     // will `ss`. Read-only, fail-open, and NEVER a rule ANAS writes: the advisory
     // points at PVE. Absent (not null-filled) when there is nothing to say.
-    const firewall = await readPveFirewallAdvisory(executor, firewallDir === undefined ? {} : { firewallDir })
+    // cr3 (ISCSI-L11): every port this target's portals listen on, not 3260 alone.
+    const firewall = await readPveFirewallAdvisory(executor, firewallDir === undefined ? {} : { firewallDir }, targetTpgs(target).flatMap(t => t.portals.map(p => p.port)))
     return { data: { ...target, firewall } }
   })
 }

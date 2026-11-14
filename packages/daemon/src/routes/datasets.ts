@@ -23,6 +23,7 @@ import { readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { readIscsiState, withIscsiLock } from '../services/iscsi-mutate.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
+import { targetTpgs } from '../services/iscsi.js'
 import { mountTargetGate, swapStageGate } from '../services/mounts.js'
 import { loadPveFootprint, ownershipRefusal, pveDescendantsUnlistedMessage, pveManagedRefusal, pveNamingGuardMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { describeHolds, readLocalHoldsChecked } from '../services/replication-holds.js'
@@ -1841,7 +1842,11 @@ export async function datasetRoutes(
       // `served-device-mismatch` with ident.2's sentence; re-verified in the job.
       if (held !== null) {
         const { ctx, targets } = await readIscsiState(executor, iscsiPaths)
-        const lun = targets.find(t => t.iqn === held.targetIqn)?.luns.find(l => l.index === held.index)
+        // cr3 (merge, iSCSI): the holder may sit in a TPG other than the first.
+        const heldTarget = targets.find(t => t.iqn === held.targetIqn)
+        const lun = heldTarget
+          ? targetTpgs(heldTarget).find(g => g.tpgTag === (held.tpgTag ?? heldTarget.tpgTag))?.luns.find(l => l.index === held.index)
+          : undefined
         if (lun) {
           const verdict = await checkServedDevice(ctx.live, lun, statDeviceFrom(iscsiPaths))
           if (verdict.refusal) {

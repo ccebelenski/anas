@@ -42,8 +42,10 @@ import type { IscsiPaths, IscsiReadContext } from './iscsi.js'
 import { createHash } from 'node:crypto'
 import { parseSnapshotNames, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { guardCheck, guarded, GuardRefusalError, iscsiLunClaim, iscsiTargetClaim } from '../safety/guard.js'
-import { assertInstalled, assertSaveable, readIscsiState, withIscsiLock, ZFS, zvolDataset } from './iscsi-mutate.js'
+import { lunsMappingBackstore } from './iscsi-configfs.js'
+import { assertInstalled, assertSaveable, handsOffRefusal, ownershipUnknownRefusal, readIscsiState, withIscsiLock, ZFS, zvolDataset } from './iscsi-mutate.js'
 import { checkServedDevice, statDeviceFrom } from './iscsi-served.js'
+import { targetTpgs } from './iscsi.js'
 
 /** One whole read of the LIO tree: the context and the targets built from it. */
 export interface IscsiState {
@@ -152,21 +154,41 @@ export const saveableGate: Gate<TargetObject> = async ({ state }) => {
   return refused ? conflict(refused) : null
 }
 
-/** A foreign target is hands-off (3.25): the read layer says why. */
+/**
+ * Is this target ANAS's to change? — {@link handsOffRefusal}, defined beside
+ * `assertSaveable` in `iscsi-mutate.ts` (Repair's plan and the degraded
+ * refusal ask it too) and re-exported here for the verbs that import it.
+ */
+export { handsOffRefusal }
+
+/** A foreign or multi-TPG target is hands-off: {@link handsOffRefusal}. */
 export const foreignGate: Gate<TargetObject> = async ({ target }) => {
-  if (target.ownership === 'anas')
-    return null
-  return conflict({
-    reason: 'foreign-target',
-    message: `Target '${target.iqn}' is not managed by ANAS and is hands-off: ${target.ownershipDetail}`,
-  })
+  const refused = handsOffRefusal(target)
+  return refused ? conflict(refused) : null
+}
+
+/**
+ * cr3 (sessionCount): a session gate whose read did not see. An ACL whose
+ * configfs `info` could not be read is not "nobody logged in" — the verb that
+ * would drop such a session refuses until the read answers.
+ */
+export function sessionsUnreadableRefusal(what: string, action: string): IscsiRefusal {
+  return {
+    reason: 'sessions-unknown',
+    message: `The session state of ${what} could not be read (an initiator ACL's configfs 'info' was unreadable), so ANAS `
+      + `cannot tell whether an initiator is logged in. ${action} is refused until it reads back — a live initiator is never `
+      + `yanked on a guess. Refresh the iSCSI view and retry.`,
+  }
 }
 
 /**
  * A target with a live session is never deleted: every session drops and each
- * host keeps a stale device with no kernel message (GT-42).
+ * host keeps a stale device with no kernel message (GT-42). A session that
+ * could not be read refuses as well (cr3).
  */
 export const targetSessionsGate: Gate<TargetObject> = async ({ target }) => {
+  if (target.sessionsUnknown === true)
+    return conflict(sessionsUnreadableRefusal(`target '${target.iqn}'`, 'Deleting it'))
   if (target.sessions.length === 0)
     return null
   const initiators = target.sessions.map(s => s.initiatorIqn)
@@ -180,12 +202,14 @@ export const targetSessionsGate: Gate<TargetObject> = async ({ target }) => {
 
 /** A target with LUNs is never deleted: the LUNs go through their own door, where destroyBacking is the per-LUN choice. */
 export const targetLunsGate: Gate<TargetObject> = async ({ target }) => {
-  if (target.luns.length === 0)
+  // Every TPG's LUNs (cr3, ISCSI-H2): `/iscsi delete` takes them all.
+  const luns = targetTpgs(target).flatMap(t => t.luns)
+  if (luns.length === 0)
     return null
   return conflict({
     reason: 'target-has-luns',
-    message: `Target '${target.iqn}' still has ${target.luns.length} LUN${target.luns.length === 1 ? '' : 's'} `
-      + `(${target.luns.map(l => l.name).join(', ')}). Delete the LUNs first `
+    message: `Target '${target.iqn}' still has ${luns.length} LUN${luns.length === 1 ? '' : 's'} `
+      + `(${luns.map(l => l.name).join(', ')}). Delete the LUNs first `
       + `(their backing zvols/images are kept unless you choose destroyBacking on each). This refusal has no confirm bypass.`,
   })
 }
@@ -196,12 +220,28 @@ export const targetLunsGate: Gate<TargetObject> = async ({ target }) => {
  * (GT-15). The add-LUN door and the restore-as-a-new-LUN door both ask it.
  */
 export function lunNameFreeGate(name: string): Gate<TargetObject> {
-  return async ({ state }) => state.targets.some(t => t.luns.some(l => l.name === name))
-    ? conflict({
+  return async ({ state }) => {
+    if (state.targets.some(t => targetTpgs(t).some(g => g.luns.some(l => l.name === name)))) {
+      return conflict({
         reason: 'name-taken',
         message: `A LUN named '${name}' already exists on this node. The name is the SCSI model string initiators see, so it has to be unique.`,
       })
-    : null
+    }
+    // cr3 (ISCSI-M5): a BACKSTORE of that name that no LUN maps — live, or in
+    // the saved configuration — takes the name too. The create would fail
+    // ("exists") or, worse, the add's undo would delete a backstore this job
+    // never made; and a persisted one comes back at the next boot.
+    const live = state.ctx.live.backstores.some(b => b.name === name)
+    const persisted = (state.ctx.persisted?.storageObjects ?? []).some(o => o.name === name)
+    if (live || persisted) {
+      return conflict({
+        reason: 'name-taken',
+        message: `A backstore named '${name}' already exists on this node${live ? '' : ' in the saved configuration'}, mapped as no LUN. `
+          + `The name is the SCSI model string initiators see, so it has to be unique — pick another name, or remove that backstore with targetcli.`,
+      })
+    }
+    return null
+  }
 }
 
 /** Enable/disable refuses a no-op rather than pretending it did something. */
@@ -302,6 +342,25 @@ export function updateSessionScope(req: Pick<UpdateIscsiTargetRequest, 'acls' | 
   }
 }
 
+/**
+ * cr3 (sessionCount): a target edit that removes an ACL or a portal is
+ * confirmed by the sessions it drops or strands — and with a session that
+ * could not be read, that list is not known to be complete. Refused until the
+ * read answers; an edit that removes nothing (a secret rotation, an added ACL)
+ * touches no session and passes.
+ */
+export function updateSessionsReadableGate(req: Pick<UpdateIscsiTargetRequest, 'acls' | 'portals'>): Gate<TargetObject> {
+  return async ({ target }) => {
+    if (target.sessionsUnknown !== true)
+      return null
+    const removesAcl = req.acls !== undefined && target.acls.some(a => !req.acls?.some(w => w.initiatorIqn === a.initiatorIqn))
+    const removesPortal = req.portals !== undefined && target.portals.some(p => !req.portals?.some(w => portalKey(w) === portalKey(p)))
+    if (!removesAcl && !removesPortal)
+      return null
+    return conflict(sessionsUnreadableRefusal(`target '${target.iqn}'`, `An edit that removes ${removesAcl ? 'an initiator ACL' : 'a portal'}`))
+  }
+}
+
 export const UPDATE_SESSION_SCOPE_LABELS: Record<string, string> = {
   dropped: 'live sessions this edit drops',
   stranded: 'live connections on portals this edit removes',
@@ -361,21 +420,30 @@ export function lunWhat(iqn: string, index: number): string {
   return `LUN ${index} of '${iqn}'`
 }
 
+/** `zfs list` on a dataset that is not there (captured: zfs-list-t-volume-absent.stderr.txt). */
+const ZFS_DATASET_ABSENT_RE = /dataset does not exist/
+
 /**
  * A zvol's OWN snapshots, by name (story `iscsi.4`, M5) — the same argument
- * builder and parser the Datasets door uses, direct children only. Fail-open to
- * `[]`, as since M5: a `zfs list` that cannot run does not block the delete,
- * and the plain `zfs destroy` still refuses a volume that has snapshots.
+ * builder and parser the Datasets door uses, direct children only.
+ *
+ * cr3 (ISCSI-M3): FAIL-CLOSED. This used to answer `[]` for a `zfs list` that
+ * failed, so the gate passed and the plain `zfs destroy` was left to refuse
+ * inside the job. `null` now means "could not read" and the gate refuses with
+ * the reason. A volume that is not there has no snapshots (`[]`): what happens
+ * to an absent backing is the served-device gate's and the job's to say.
  */
-export async function zvolSnapshotNames(executor: CommandExecutor, dataset: string): Promise<string[]> {
+export async function zvolSnapshotNames(executor: CommandExecutor, dataset: string): Promise<string[] | null> {
   const r = await executor.exec(ZFS, zfsSnapshotListArgs(dataset))
-  if (r.exitCode !== 0 || !r.stdout.trim())
+  if (r.exitCode !== 0)
+    return ZFS_DATASET_ABSENT_RE.test(r.stderr) ? [] : null
+  if (!r.stdout.trim())
     return []
   try {
     return parseSnapshotNames(r.stdout)
   }
   catch {
-    return []
+    return null
   }
 }
 
@@ -405,6 +473,8 @@ export function lunDeleteSpec(
     : { status: 404, code: 'NOT_FOUND', message: `Target '${target.iqn}' has no LUN ${index}` }
 
   const sessions: Gate<LunObject> = async ({ target, lun }) => {
+    if (lun?.connectedInitiatorsUnknown === true)
+      return conflict(sessionsUnreadableRefusal(lunWhat(target.iqn, index), 'Deleting it'))
     if (!lun || lun.connectedInitiators.length === 0)
       return null
     return conflict({
@@ -432,6 +502,14 @@ export function lunDeleteSpec(
       return null
     const dataset = lun.dataset ?? zvolDataset(lun.backingPath)
     const names = await zvolSnapshotNames(deps.executor, dataset)
+    if (names === null) {
+      return conflict({
+        reason: 'snapshots-unreadable',
+        message: `The snapshots of the volume ${dataset} could not be listed, so ANAS cannot prove destroying it would `
+          + `not fail half-way (a volume with snapshots is never destroyed). Retry, or delete the LUN without "Also destroy" `
+          + `and keep the volume.`,
+      })
+    }
     if (names.length === 0)
       return null
     const shown = names.slice(0, 10).join(', ')
@@ -444,6 +522,27 @@ export function lunDeleteSpec(
         + `or delete the LUN without "Also destroy" and keep the volume. This refusal has no confirm bypass.`,
     })
   }
+
+  // cr3 (ISCSI-M6): destroying the backing of a backstore another LUN still
+  // maps would pull it from under that LUN (and any session on it).
+  const shared: Gate<LunObject> = async ({ state, target, lun }) => {
+    if (!lun)
+      return null
+    const others = lunsMappingBackstore(state.ctx.live, lun.plugin, lun.name, { targetIqn: target.iqn, tpgTag: target.tpgTag, lunIndex: lun.index })
+    if (others.length === 0)
+      return null
+    return conflict({
+      reason: 'backstore-shared',
+      message: `The backstore '${lun.name}' is also mapped as ${others.map(o => `LUN ${o.lunIndex} of '${o.targetIqn}'${o.tpgTag === 1 ? '' : ` (TPG ${o.tpgTag})`}`).join(', ')}. `
+        + `Destroying its backing would pull it from under that LUN too. Delete the LUN without "Also destroy" — ANAS then unmaps this LUN only and keeps the backstore. This refusal has no confirm bypass.`,
+    })
+  }
+
+  // cr3: an image whose dataset could not be judged (the mountpoint table was
+  // unreadable) is never destroyed — it may be inside PVE's footprint.
+  const ownerKnown: Gate<LunObject> = async ({ lun }) => lun?.backingOwnershipUnknown === true
+    ? conflict(ownershipUnknownRefusal(lun.backingPath))
+    : null
 
   return {
     operation: 'iscsi.lun.delete',
@@ -478,7 +577,7 @@ export function lunDeleteSpec(
       foreignGate,
       exists,
       sessions,
-      ...(destroyBacking ? [served, snapshots] : []),
+      ...(destroyBacking ? [ownerKnown, shared, served, snapshots] : []),
     ],
     ...(opts.locks ? { locks: opts.locks } : {}),
   }

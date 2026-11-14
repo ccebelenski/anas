@@ -547,14 +547,22 @@ describe('quarantine — unmap that LUN, delete the stub backstore, never saveco
     assert.match(logged[0], /lun=0 backstore=lpsmall/)
   })
 
-  it('NEVER removes a file with content, even when it unmaps the LUN', async () => {
+  it('NEVER acts on a file with content: the wrong mount alone is reported, the LUN keeps serving', async () => {
     const calls: string[][] = []
-    // Full size, wrong filesystem: one signal. Somebody's bytes are in there.
+    const logged: string[] = []
+    // Wrong filesystem, NOT zero-size: one signal, and somebody's bytes are in
+    // there. cr3 (review): this used to UNMAP the LUN (only the file was kept);
+    // a bind mount or an altroot puts a real image here, so only the zero-size
+    // signal (LIO's own placeholder, F2) is acted on now.
     const { image, paths: p } = await paths({ probe: { exists: true, size: IMAGE_SIZE }, childMounted: false, bytes: 4096 })
-    const { outcomes } = await readIscsiHealthWithQuarantine(recorder(calls), { ...p, log: () => {} })
-    assert.equal(outcomes[0].quarantined, true)
-    assert.equal(outcomes[0].fileRemoved, false)
+    const { outcomes, health } = await readIscsiHealthWithQuarantine(recorder(calls), { ...p, log: (l: string) => logged.push(l) })
+    assert.deepEqual(outcomes, [])
+    assert.deepEqual(calls, [], 'nothing unmapped, nothing deleted')
     assert.equal(existsSync(image), true)
+    assert.equal(health.stubLuns.length, 1, 'still reported')
+    assert.equal(health.stubLuns[0].wrongMount, true)
+    assert.equal(health.degraded, false)
+    assert.match(logged.join('\n'), /result=reported .* holds data; left serving/)
   })
 
   it('is idempotent — the second pass finds an ordinary hole and runs nothing', async () => {

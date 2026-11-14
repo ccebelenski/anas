@@ -47,7 +47,13 @@
  * filesystem is provably LIO's placeholder and nothing else; a 0-byte file on
  * the RIGHT filesystem could be an image an operator truncated, and a non-empty
  * file on the wrong filesystem holds bytes somebody wrote. Neither is ANAS's to
- * delete — quarantine still unmaps them, which costs nothing and loses nothing.
+ * delete.
+ *
+ * cr3 (review): and only the ZERO-SIZE signal is ever ACTED on. A non-empty
+ * file on an unexpected mount (a bind mount, an altroot) is reported
+ * (`stubLuns[]`, a warning card) and left serving — the read layer does not
+ * call it absent, it does not degrade the node, and the quarantine skips it:
+ * unmapping it would take real data offline.
  */
 
 /** Trailing slashes, stripped before any path comparison. */

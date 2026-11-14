@@ -495,6 +495,8 @@ export {
   IscsiTargetServingNothing,
   IscsiTargetStateRequest,
   IscsiTargetSummary,
+  IscsiTpgDetail,
+  lioAuthUnset,
   lunGrowGuidance,
   unbracketAddress,
   UpdateIscsiLunRequest,

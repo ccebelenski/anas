@@ -1,4 +1,4 @@
-import type { IscsiClaimList, IscsiLun, IscsiTargetDetail } from '@anas/shared'
+import type { IscsiAclRequest, IscsiClaimList, IscsiLun, IscsiTargetDetail } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
@@ -11,9 +11,11 @@ import {
   aclAuthRequirement,
   aclSatisfiesAuth,
   AddIscsiLunRequest,
+  anasTargetName,
   CreateIscsiTargetRequest,
   DeleteIscsiLunQuery,
   emptyAclsSentence,
+  isAnasIqn,
   IscsiIqn,
   IscsiTargetStateRequest,
   lunGrowGuidance,
@@ -23,10 +25,11 @@ import {
 import { readNodeInitiatorName } from '../parsers/iscsi-initiator.js'
 import { guardCheck, guardConfirm, GuardRefusalError, iscsiTargetClaim, sendRefusal as sendGuardRefusal } from '../safety/guard.js'
 import { ensureAhrTargetOrdering } from '../services/ahr-create.js'
-import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
+import { CONFIGFS_TARGET_ROOT, lunsMappingBackstore } from '../services/iscsi-configfs.js'
 import {
   conflict,
   foreignGate,
+  handsOffRefusal,
   iscsiGuarded,
   lunClaims,
   lunDeleteSpec,
@@ -35,19 +38,23 @@ import {
   portalKey,
   repairClaims,
   saveableGate,
+  sessionsUnreadableRefusal,
   targetLunsGate,
   targetSessionsGate,
   targetView,
   UPDATE_SESSION_SCOPE_LABELS,
   updateSessionImpact,
   updateSessionScope,
+  updateSessionsReadableGate,
 } from '../services/iscsi-guard.js'
 import { computeIscsiHealth } from '../services/iscsi-health.js'
 import {
+  aclNamesRefusal,
   addIscsiLun,
   assertInstalled,
+  assertPersistedReadable,
   assertSaveable,
-  backstorePath,
+  backingPathRefusal,
   claimsFromTargets,
   createIscsiTarget,
   createSparseImage,
@@ -58,8 +65,10 @@ import {
   lunBackingClaims,
   newSerial,
   newTargetIqn,
+  ownershipUnknownRefusal,
   proveZvolBacking,
   readIscsiState,
+  removeCreatedImage,
   replayAttributes,
   resizeFileLun,
   resolveFileBackingDir,
@@ -75,7 +84,7 @@ import {
 import { readIscsiHealthWithQuarantine } from '../services/iscsi-quarantine.js'
 import { assertRepairable, guardRepairPlan, planIscsiRepair, repairIscsiHoles } from '../services/iscsi-repair.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
-import { iscsiAvailability } from '../services/iscsi.js'
+import { iscsiAvailability, targetTpgs } from '../services/iscsi.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -196,11 +205,12 @@ export function targetUpdateSignature(iqn: string, req: UpdateIscsiTargetRequest
 }
 
 /**
- * targetcli's stderr for a delete that found no object — the backstore was
- * never created (the first targetcli of the create-and-map sequence is the one
- * that died). The new-LUN restore's cleanup matches the same line.
+ * targetcli's stderr for a delete that found no object. Since cr3 (ISCSI-M5)
+ * the undo runs only after this job's create SUCCEEDED, so this is a backstore
+ * that went away by itself in between. The parent form's sentence ("No storage
+ * object named <name>.", targetcli's ui_backstore) is unverified on a node.
  */
-const BACKSTORE_GONE_RE = /no such object/i
+const BACKSTORE_GONE_RE = /no such object|no storage object named/i
 
 /**
  * Delete a backstore an add-LUN job may have half-created when `createAndMapLun`
@@ -216,27 +226,25 @@ const BACKSTORE_GONE_RE = /no such object/i
  * to append to the job's failure, or '' when nothing was left behind (already
  * gone, or a delete that found no object).
  */
-async function removeOrphanedBackstore(executor: CommandExecutor, plugin: string, name: string): Promise<string> {
+async function removeOrphanedBackstore(executor: CommandExecutor, plugin: string, name: string): Promise<{ sentence: string, gone: boolean }> {
   try {
-    await runTargetcli(executor, [backstorePath(plugin, name), 'delete'])
-    return `deleted the half-created backstore '${name}'`
+    // cr3 (ISCSI-M5): the parent form GT-42 proves (`backstores/<plugin>
+    // delete <name>`), the one every other delete in this file uses.
+    await runTargetcli(executor, [`/backstores/${plugin}`, 'delete', name])
+    return { sentence: `deleted the half-created backstore '${name}'`, gone: true }
   }
   catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     if (BACKSTORE_GONE_RE.test(msg))
-      return ''
-    return `the half-created backstore '${name}' could not be deleted (${msg})`
+      return { sentence: '', gone: true }
+    return { sentence: `the half-created backstore '${name}' could not be deleted (${msg})`, gone: false }
   }
 }
 
 /**
  * Send an `IscsiRefusal` as a 409 with no confirm code (Principle 14, Level 1).
- *
- * It SENDS rather than returning a body, because two of its callers sit inside a
- * helper whose own return value is a null sentinel — a refusal that only built a
- * body there would leave the request hanging forever with a status and no
- * payload. Returning `reply` keeps `return sendRefusal(...)` working at the
- * call sites that are already inside a handler.
+ * Always called as `return sendRefusal(...)` from a handler (cr3: no helper
+ * sends one on a caller's behalf any more), so the request is answered once.
  */
 function sendRefusal(reply: FastifyReply, refusal: IscsiRefusal): FastifyReply {
   reply.code(409)
@@ -265,19 +273,14 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
    * would look "degraded" to a naive re-check, when in fact the only thing
    * missing is the one this code is in the middle of putting back.
    */
-  async function preflight(reply: FastifyReply): Promise<IscsiState | null> {
+  async function preflight(): Promise<{ state: IscsiState } | { refusal: IscsiRefusal }> {
+    // cr3: the refusal is RETURNED, never sent from in here. The old shape —
+    // send inside a helper whose return value is a null sentinel — leaves a
+    // caller that forgets `return reply` answering twice, or not at all (the
+    // EPICS rrep.2 candidate). Every caller now sends it itself.
     const state = await readIscsiState(executor, paths)
-    const notInstalled = assertInstalled(state.ctx)
-    if (notInstalled) {
-      sendRefusal(reply, notInstalled)
-      return null
-    }
-    const degraded = assertSaveable(state.ctx, state.targets)
-    if (degraded) {
-      sendRefusal(reply, degraded)
-      return null
-    }
-    return state
+    const refusal = assertInstalled(state.ctx) ?? assertSaveable(state.ctx, state.targets)
+    return refusal ? { refusal } : { state }
   }
 
   /** Parse + validate the `:iqn` path parameter. */
@@ -307,25 +310,6 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     return target
   }
 
-  /**
-   * A foreign target is hands-off, the same way a PVE-managed pool is (3.25).
-   * The verdict and the reason both come from the read layer, so the refusal
-   * says WHY rather than merely saying no.
-   */
-  function rejectForeign(target: IscsiTargetDetail, reply: FastifyReply): boolean {
-    if (target.ownership === 'anas')
-      return false
-    reply.code(409)
-    reply.send({
-      error: {
-        code: 'CONFLICT',
-        reason: 'foreign-target',
-        message: `Target '${target.iqn}' is not managed by ANAS and is hands-off: ${target.ownershipDetail}`,
-      },
-    })
-    return true
-  }
-
   /** The LUN at index `n`, or a 404. */
   function findLun(target: IscsiTargetDetail, index: number, reply: FastifyReply): IscsiLun | null {
     const lun = target.luns.find(l => l.index === index)
@@ -350,21 +334,26 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (!identity)
       return
 
-    const state = await preflight(reply)
-    if (!state)
-      return reply
+    const pre0 = await preflight()
+    if ('refusal' in pre0)
+      return sendRefusal(reply, pre0.refusal)
+    const state = pre0.state
 
     // The IQN is GENERATED, never supplied: LIO has no rename (GT-10), so it is
     // the target's identity for life and must follow the one convention the read
     // layer recognises.
     const iqn = newTargetIqn(req.name)
-    if (state.targets.some(t => t.iqn === iqn)) {
+    // cr3 (ISCSI-L9): the NAME is what must be free, not the whole IQN — the
+    // IQN carries this month's `yyyy-mm`, so comparing it let the same name be
+    // created again next month beside the first.
+    const namesake = state.targets.find(t => t.iqn === iqn || (isAnasIqn(t.iqn) && anasTargetName(t.iqn) === anasTargetName(iqn)))
+    if (namesake) {
       reply.code(409)
       return {
         error: {
           code: 'CONFLICT',
           reason: 'target-exists',
-          message: `A target named '${req.name}' already exists on this node (${iqn}). There is no rename in LIO — pick another name.`,
+          message: `A target named '${req.name}' already exists on this node (${namesake.iqn}). There is no rename in LIO — pick another name.`,
         },
       }
     }
@@ -424,9 +413,10 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (!identity)
       return
 
-    const state = await preflight(reply)
-    if (!state)
-      return reply
+    const pre0 = await preflight()
+    if ('refusal' in pre0)
+      return sendRefusal(reply, pre0.refusal)
+    const state = pre0.state
 
     // Story cr.40 (WAVE3-DESIGN §2.4 "target update", F4): the one guard spec
     // both doors run. The edit is a DIFF against the target as read now, so
@@ -444,7 +434,7 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         scope: updateSessionScope(req),
         scopeLabels: UPDATE_SESSION_SCOPE_LABELS,
       }),
-      gates: [saveableGate, foreignGate],
+      gates: [saveableGate, foreignGate, updateSessionsReadableGate(req)],
       locks: async () => [iscsiTargetClaim(iqn)],
     }
     const pre = await guardCheck(spec)
@@ -455,9 +445,16 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     // "CHAP is on but this initiator can never log in" is checked against the
     // MERGED state, not the request: an edit that only rotates one secret leaves
     // every other credential alone, and the stored ones still count.
+    //
+    // cr3 (ISCSI-M4): the merged ACL set is the request's when it carries
+    // one and the STORED one when it does not — `{auth: 'chap'}` alone used
+    // to skip the check entirely and lock out every initiator with no
+    // credentials. It runs whenever the edit touches auth or the ACLs (a
+    // portal-only edit changes neither, and is not refused over them).
     const auth = req.auth ?? (target.security.authentication ? 'chap' : 'none')
-    if (auth !== 'none' && req.acls !== undefined) {
-      for (const acl of req.acls) {
+    if (req.auth !== undefined || req.acls !== undefined) {
+      const desired: IscsiAclRequest[] = req.acls ?? target.acls.map(a => ({ initiatorIqn: a.initiatorIqn }))
+      for (const acl of desired) {
         const stored = target.acls.find(a => a.initiatorIqn === acl.initiatorIqn)
         const merged = {
           chapUserid: acl.chapUserid !== undefined ? acl.chapUserid : stored?.chapUserid ?? null,
@@ -471,6 +468,21 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
             error: {
               code: 'VALIDATION_ERROR',
               message: `Initiator ${acl.initiatorIqn} would never be able to log in: ${aclAuthRequirement(auth)}`,
+            },
+          }
+        }
+        // cr3 (ISCSI-M4): one-way CHAP asked for, but this ACL keeps a mutual
+        // SECRET — LIO authenticates the target to any initiator whose ACL
+        // carries one (GT-32: writing the mutual secret is what turns
+        // `authenticate_target` on; a mutual userid alone does not), so the
+        // edit would silently leave mutual CHAP on. Say how to turn it off.
+        if (req.auth === 'chap' && merged.mutualSecret) {
+          reply.code(400)
+          return {
+            error: {
+              code: 'VALIDATION_ERROR',
+              message: `Initiator ${acl.initiatorIqn} would still use mutual CHAP: its mutual credentials stay set, and LIO `
+                + `authenticates the target to it as long as they do. Clear its mutual username and secret to switch it to one-way CHAP.`,
             },
           }
         }
@@ -595,9 +607,10 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (!identity)
       return
 
-    const state = await preflight(reply)
-    if (!state)
-      return reply
+    const pre0 = await preflight()
+    if ('refusal' in pre0)
+      return sendRefusal(reply, pre0.refusal)
+    const state = pre0.state
 
     // Story cr.40 (§2.4 "target enable/disable"): the job acts on the target
     // as read under the lock, bound to the revision the request saw (an
@@ -619,7 +632,10 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     // between a control that works and a control that lies.
     const warnings = action === 'disable' && target.sessionCount > 0
       ? [`${target.sessionCount} session${target.sessionCount === 1 ? '' : 's'} stay connected — disabling a TPG refuses new logins and hides the target from discovery, but it does not close the portal or drop an established session`]
-      : []
+      : action === 'disable' && target.sessionsUnknown === true
+        // cr3: an unread session is not "no session" — the sentence says so.
+        ? ['The session state of this target could not be read — any initiator already logged in stays connected: disabling a TPG refuses new logins and hides the target from discovery, but it does not close the portal or drop an established session']
+        : []
 
     const job = jobQueue.submit(
       `iscsi.target.${action}`,
@@ -645,9 +661,10 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (!identity)
       return
 
-    const state = await preflight(reply)
-    if (!state)
-      return reply
+    const pre0 = await preflight()
+    if ('refusal' in pre0)
+      return sendRefusal(reply, pre0.refusal)
+    const state = pre0.state
 
     // A target with live sessions is REFUSED, not confirmed: deleting it drops
     // every session and leaves a stale device on each host with no kernel
@@ -702,9 +719,10 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (!identity)
       return
 
-    const state = await preflight(reply)
-    if (!state)
-      return reply
+    const pre0 = await preflight()
+    if ('refusal' in pre0)
+      return sendRefusal(reply, pre0.refusal)
+    const state = pre0.state
 
     /** The resolved backing of one guard run (the route's, then the job's). */
     interface AddBacking {
@@ -727,7 +745,14 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
           if ('refusal' in resolved)
             return { refusal: resolved.refusal }
           const path = resolved.ok.path
-          if (o.state.targets.some(t => t.luns.some(l => l.backingPath === path))) {
+          // cr3 (ISCSI-L10): a volume name targetcli would re-split (ZFS
+          // allows a space) is refused at the door, not by the job's create.
+          const unsafeZvol = backingPathRefusal(path)
+          if (unsafeZvol)
+            return { refusal: unsafeZvol }
+          // Every TPG of every target (cr3, ISCSI-H2 review): a zvol exported
+          // only by a foreign target's second TPG is exported all the same.
+          if (o.state.targets.some(t => targetTpgs(t).some(g => g.luns.some(l => l.backingPath === path)))) {
             return {
               refusal: {
                 reason: 'backing-already-mapped',
@@ -740,6 +765,11 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         const dir = await resolveFileBackingDir(executor, req.backing, o.state.ctx)
         if ('refusal' in dir)
           return { refusal: dir.refusal }
+        // cr3 (ISCSI-L10): a directory targetcli would re-split is refused at
+        // the door, not found by the job's create.
+        const unsafeFile = backingPathRefusal(imageFilePath(dir.ok.dir, req.name))
+        if (unsafeFile)
+          return { refusal: unsafeFile }
         return {
           ok: {
             path: imageFilePath(dir.ok.dir, req.name),
@@ -804,44 +834,42 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         if ('refusal' in resolved)
           throw new GuardRefusalError(conflict(resolved.refusal))
         const { path: backingPath, plugin, dataset, size, ahrPool } = resolved.ok
-        if (req.kind === 'file' && size !== null) {
-          updateProgress(`Creating sparse image ${backingPath}`)
-          await createSparseImage(backingPath, size)
-        }
-        // The moment an image LUN lands on an AHR pool, that pool's boot
-        // ordering starts to matter: a `nofail` fstab mount has no static anchor
-        // any drop-in can name, so without this the pool can lose the race to
-        // `rtslib-fb-targetctl` and LIO CREATES a 0-byte placeholder at the
-        // image's path — an empty disk with the right serial (live-proof F2).
-        // Surgical, byte-identical when already present, never fatal.
-        if (ahrPool) {
-          const added = await ensureAhrTargetOrdering(executor, fstabPath, ahrPool)
-          if (added)
-            updateProgress(`Ordered the mount of AHR pool '${ahrPool.name}' before the iSCSI restore service`)
-        }
+        // cr.64cr: the zvol's existence (and that it IS a volume) is proved
+        // HERE, before anything is made — a refusal must never fire the undo.
+        await proveZvolBacking(executor, { path: backingPath, plugin, ...(dataset ? { dataset } : {}) })
         // DEFECT-1 (cr.40r): the backstore this sequence creates is persisted
         // only when addIscsiLun finishes with a saveconfig. A targetcli that
         // dies after the backstore exists — the map, an ACL grant — used to
         // leave it live-only: present in the LIO tree, absent from
-        // `saveconfig.json`, owned by no job, and the state the health diff
-        // would name `lun-not-persisted` for as long as it sat there. The undo
-        // mirrors the new-LUN restore's cleanup (backup-restore.ts): the flag
-        // is set BEFORE the create-and-map sequence, a failure deletes the
-        // backstore WITHOUT saving (a half-created LUN must never be
-        // persisted), a delete that finds nothing — the first targetcli may
-        // itself be the one that died — is tolerated, and the job still fails
-        // with the original error.
+        // `saveconfig.json`, owned by no job. The undo deletes the backstore
+        // WITHOUT saving (a half-created LUN must never be persisted), and the
+        // job still fails with the original error.
         //
-        // cr.64cr: the zvol's existence (and that it IS a volume) is proved
-        // HERE, before the undo's flag goes up — a refusal from inside the try
-        // fired `removeOrphanedBackstore`, a targetcli delete of a namesake
-        // backstore this job never created (review of cr.64c, P8a).
-        await proveZvolBacking(executor, { path: backingPath, plugin, ...(dataset ? { dataset } : {}) })
-        let backstoreTouched = false
+        // cr3 (ISCSI-M5): the undo acts only on what THIS job made. The flag
+        // rises when the backstore `create` SUCCEEDED (it used to rise before
+        // the create, so a create that failed on a namesake — "exists" —
+        // deleted the namesake), and an image this job created is removed too
+        // once its backstore is known gone (it used to be left behind).
+        const made = { backstore: false, image: false }
         try {
-          backstoreTouched = true
+          if (req.kind === 'file' && size !== null) {
+            updateProgress(`Creating sparse image ${backingPath}`)
+            await createSparseImage(backingPath, size)
+            made.image = true
+          }
+          // The moment an image LUN lands on an AHR pool, that pool's boot
+          // ordering starts to matter: a `nofail` fstab mount has no static anchor
+          // any drop-in can name, so without this the pool can lose the race to
+          // `rtslib-fb-targetctl` and LIO CREATES a 0-byte placeholder at the
+          // image's path — an empty disk with the right serial (live-proof F2).
+          // Surgical, byte-identical when already present, never fatal.
+          if (ahrPool) {
+            const added = await ensureAhrTargetOrdering(executor, fstabPath, ahrPool)
+            if (added)
+              updateProgress(`Ordered the mount of AHR pool '${ahrPool.name}' before the iSCSI restore service`)
+          }
           const result = await addIscsiLun(
-            mutateOptions(updateProgress),
+            { ...mutateOptions(updateProgress), onBackstoreCreated: () => { made.backstore = true } },
             now.target,
             req,
             { path: backingPath, plugin, ...(dataset ? { dataset } : {}) },
@@ -852,9 +880,18 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         }
         catch (err) {
           const base = err instanceof Error ? err.message : String(err)
-          const cleanup = backstoreTouched ? await removeOrphanedBackstore(executor, plugin, req.name) : ''
-          if (cleanup)
-            throw new Error(`${base} ${cleanup}`)
+          const undone: string[] = []
+          let backstoreGone = true
+          if (made.backstore) {
+            const removed = await removeOrphanedBackstore(executor, plugin, req.name)
+            backstoreGone = removed.gone
+            if (removed.sentence)
+              undone.push(removed.sentence)
+          }
+          if (made.image && backstoreGone)
+            undone.push(await removeCreatedImage(backingPath))
+          if (undone.length > 0)
+            throw new Error(`${base} ${undone.join('; ')}`)
           throw err
         }
       }),
@@ -885,14 +922,17 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (!identity)
       return
 
-    const state = await preflight(reply)
-    if (!state)
-      return reply
+    const pre0 = await preflight()
+    if ('refusal' in pre0)
+      return sendRefusal(reply, pre0.refusal)
+    const state = pre0.state
     const target = findTarget(state.targets, iqn, reply)
     if (!target)
       return reply
-    if (rejectForeign(target, reply))
-      return reply
+    // The guard's one answer (foreign, or more than one TPG — cr3 ISCSI-H2).
+    const handsOff = handsOffRefusal(target)
+    if (handsOff)
+      return sendRefusal(reply, handsOff)
     const lun = findLun(target, index, reply)
     if (!lun)
       return reply
@@ -931,6 +971,15 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
           },
         }
       }
+      // cr3: a resize acts on the backing — never one whose owner is unknown
+      // (the mountpoint table was unreadable; it may be PVE's).
+      if (lun.backingOwnershipUnknown === true)
+        return sendRefusal(reply, ownershipUnknownRefusal(lun.backingPath))
+      // cr3 (ISCSI-L10): a FILE resize recreates the backstore on its path;
+      // one targetcli would re-split is refused here, before any act.
+      const unsafePath = lun.kind === 'file' ? backingPathRefusal(lun.backingPath) ?? aclNamesRefusal(iqn, target.acls) : null
+      if (unsafePath)
+        return sendRefusal(reply, unsafePath)
       if (lun.kind === 'foreign') {
         reply.code(409)
         return {
@@ -976,6 +1025,10 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       && req.size !== undefined
       && (lun.size === null || req.size > lun.size)
     const zvolGrow = zvolSizeGrow && req.writeBack === undefined
+    // cr3 (sessionCount): a mapped ACL whose session could not be read is
+    // not "nobody logged in" — anything not allowed under a session refuses.
+    if (lun.connectedInitiatorsUnknown === true && !zvolGrow)
+      return sendRefusal(reply, sessionsUnreadableRefusal(`LUN ${index} of '${iqn}'`, 'This change'))
     if (lun.connectedInitiators.length > 0 && !zvolGrow) {
       // The zvol clause is part of the sentence rather than appended to it: a
       // refusal that ends in "…and by the way this is allowed" reads as an
@@ -1042,8 +1095,12 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       // sessions) stay where they are — the route asks them in its order, and
       // the job asks them again under the mutex in its body (`reverifyServed-
       // Lun`, the session rule re-asked); this spec exists for the identity
-      // re-read and the claim derivation.
-      gates: [],
+      // re-read and the claim derivation. cr3: the two gates every other
+      // verb's job re-runs under the mutex ride here too — the job ends in a
+      // `saveconfig`, which a tree that went degraded while it waited must
+      // never get (GT-22), and a target that became foreign or gained a TPG
+      // is not ANAS's to change.
+      gates: [saveableGate, foreignGate],
       // cr.40 (§4.2) + cr.63 (review L17): the target's key, the LUN's by
       // serial, and the backing's — a zvol grow EXCLUSIVE (a `zfs set
       // volsize`, as the Datasets door's grow of the same volume), anything
@@ -1155,9 +1212,10 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (!identity)
       return
 
-    const state = await preflight(reply)
-    if (!state)
-      return reply
+    const pre0 = await preflight()
+    if ('refusal' in pre0)
+      return sendRefusal(reply, pre0.refusal)
+    const state = pre0.state
 
     // Story cr.40 (§2.4 "LUN delete"): the one guard spec both doors run.
     // Gates: LIO saveable, the target ANAS's, the LUN there, NO live session on
@@ -1228,8 +1286,11 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       { ...identity, params: { target: iqn, lun: index, serial: lun.serial, backstore: lun.name, destroyBacking } },
       // Ruling (j): act on what was just re-read and re-gated, never on the
       // request-time snapshot.
-      iscsiGuarded(spec, pre, async ({ target: now, lun: fresh }, ctx) => {
+      iscsiGuarded(spec, pre, async ({ state: freshState, target: now, lun: fresh }, ctx) => {
         const l = fresh as IscsiLun
+        // cr3 (ISCSI-M6): a backstore another LUN maps is not this LUN's to
+        // delete — rtslib would take that LUN (and its session) with it.
+        const keepBackstore = lunsMappingBackstore(freshState.ctx.live, l.plugin, l.name, { targetIqn: now.iqn, tpgTag: now.tpgTag, lunIndex: l.index }).length > 0
         return deleteIscsiLun(
           mutateOptions(ctx.updateProgress),
           now,
@@ -1242,6 +1303,7 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
             ...(l.dataset ? { dataset: l.dataset } : {}),
           },
           destroyBacking,
+          keepBackstore,
         )
       }),
       { locks: pre.locks },
@@ -1279,6 +1341,11 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     const notInstalled = assertInstalled(state.ctx)
     if (notInstalled)
       return sendRefusal(reply, notInstalled)
+    // cr3 (ISCSI-L15): Repair replays the SAVED record; an unreadable one is
+    // not "nothing to repair".
+    const unreadable = assertPersistedReadable(state.ctx)
+    if (unreadable)
+      return sendRefusal(reply, unreadable)
 
     const plan = await guardRepairPlan(
       planIscsiRepair(state.ctx, state.health, state.targets),
@@ -1316,6 +1383,11 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         // now names a device LIO already serves through another backstore is
         // blocked rather than given a second identity.
         const fresh = await readIscsiState(executor, paths)
+        // cr3 (ISCSI-L15): the job ends in a save; never over a file it
+        // could not read under the lock.
+        const freshUnreadable = assertPersistedReadable(fresh.ctx)
+        if (freshUnreadable)
+          throw new GuardRefusalError(conflict(freshUnreadable))
         const freshPlan = await guardRepairPlan(
           planIscsiRepair(fresh.ctx, computeIscsiHealth(fresh.ctx, fresh.targets), fresh.targets),
           fresh.ctx.live,
@@ -1349,9 +1421,16 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
   })
 }
 
-/** A LUN index path parameter: a plain non-negative integer. */
+/** Decimal digits, no sign, no leading zero, no space, no exponent (cr3, ISCSI-L14). */
+const LUN_INDEX_RE = /^(?:0|[1-9]\d{0,8})$/
+
+/**
+ * A LUN index path parameter: a plain non-negative integer. cr3 (ISCSI-L14):
+ * `Number()` accepted ' ', '0x1' and '1e0' as indexes (0, 1, 1), so a malformed
+ * path addressed a real LUN; only plain decimal digits are an index now.
+ */
 function parseLunIndex(raw: string, reply: FastifyReply): number | null {
-  const n = Number(raw)
+  const n = LUN_INDEX_RE.test(raw) ? Number(raw) : Number.NaN
   if (!Number.isInteger(n) || n < 0) {
     reply.code(400)
     reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid LUN index '${raw}' — a LUN is identified by its non-negative index within the target` } })

@@ -206,6 +206,13 @@ async function readFw(dir: string, name: string): Promise<string | null> {
 export async function readPveFirewallAdvisory(
   executor: CommandExecutor,
   opts: PveFirewallOptions = {},
+  /**
+   * cr3 (ISCSI-L11): the TCP ports the target's portals listen on. The
+   * advisory used to ask about 3260 only, so a portal on 3261 behind a
+   * firewall that admits 3260 read as reachable. Defaults to 3260 alone.
+   * `admits3260` keeps its name and its meaning (3260 alone).
+   */
+  ports: number[] = [ISCSI_PORT],
 ): Promise<IscsiFirewallAdvisory> {
   const dir = opts.firewallDir ?? PVE_FIREWALL_DIR
   let enabled: boolean | null = null
@@ -237,11 +244,15 @@ export async function readPveFirewallAdvisory(
     ...(hostText === null ? [] : rulesSection(hostText)),
   ]
   const admits = lines.some(line => ruleAdmitsPort(line, ISCSI_PORT))
+  const wanted = [...new Set(ports.length > 0 ? ports : [ISCSI_PORT])]
+  wanted.sort((a, b) => a - b)
+  const notAdmitted = wanted.filter(port => !lines.some(line => ruleAdmitsPort(line, port)))
+  const named = notAdmitted.map(p => `${p}/tcp`).join(', ')
   return {
     enabled: true,
     admits3260: admits,
-    advisory: admits
+    advisory: notAdmitted.length === 0
       ? null
-      : `PVE firewall is enabled and no rule admits ${ISCSI_PORT}/tcp — add one in PVE (Datacenter or Node → Firewall); ANAS never edits firewall rules.`,
+      : `PVE firewall is enabled and no rule admits ${named} — add one in PVE (Datacenter or Node → Firewall); ANAS never edits firewall rules.`,
   }
 }

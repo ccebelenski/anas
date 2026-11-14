@@ -41,6 +41,7 @@ import type {
   IscsiAclRequest,
   IscsiAuthMode,
   IscsiClaim,
+  IscsiMissingLun,
   IscsiTargetDetail,
   UpdateIscsiTargetRequest,
 } from '@anas/shared'
@@ -58,7 +59,7 @@ import { readAhrPools } from './ahr-topology.js'
 import { CONFIGFS_TARGET_ROOT, describeLunHolder, readMappedLuns } from './iscsi-configfs.js'
 import { computeIscsiHealth } from './iscsi-health.js'
 import { classifyBacking, ownershipFromInputs } from './iscsi-ownership.js'
-import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from './iscsi.js'
+import { buildIscsiTargets, iscsiAvailability, liveUnreadablePaths, readIscsiContext, targetTpgs } from './iscsi.js'
 import { assertNoSecretArgs as assertSecretArgShape, SecretOnArgvError } from './secret-argv.js'
 import { pathSourceClaims } from './source-claims.js'
 
@@ -235,11 +236,126 @@ export class TargetcliError extends Error {
  */
 export async function runTargetcli(executor: CommandExecutor, args: string[]): Promise<ExecResult> {
   assertNoSecretArgs(args)
+  assertConfigshellArgs(args)
   const result = await executor.exec(TARGETCLI, args)
   if (result.exitCode !== 0)
     throw new TargetcliError(args, result)
   return result
 }
+
+/**
+ * Characters that change how configshell splits the line targetcli rebuilds
+ * from its argv: whitespace separates tokens, and a quote opens a quoted one.
+ */
+const CONFIGSHELL_UNSAFE_RE = /[\s"']/
+
+/** A token that would not survive targetcli's re-parse as ONE token (cr3, ISCSI-L10). */
+export class TargetcliArgError extends Error {
+  constructor(readonly token: string) {
+    super(`Refusing to run targetcli with '${token}': targetcli re-joins its arguments with spaces and parses the `
+      + `line again, so a value containing a space, a quote or a second '=' would be read as something else. `
+      + `Nothing was run.`)
+    this.name = 'TargetcliArgError'
+  }
+}
+
+/**
+ * cr3 (ISCSI-L10): every token must reach configshell as the token it is.
+ * targetcli joins argv with spaces and re-parses, so `dev=/dev/zvol/a b` is two
+ * tokens and `file_or_dev=/x=y` is a parameter named `file_or_dev` with the
+ * value `/x=y` or a parse error, depending on configshell's grammar. Values
+ * ANAS builds are validated long before this; a STORED path (a foreign or
+ * hand-edited `udev_path` replayed by a resize or a repair) is not, so this is
+ * the one place every one of them passes.
+ */
+export function assertConfigshellArgs(args: string[]): void {
+  for (const token of args) {
+    if (!configshellSafe(token))
+      throw new TargetcliArgError(token)
+  }
+}
+
+/**
+ * The keyword parameters ANAS puts on a targetcli line (create lines, `set
+ * attribute`). Any other token is POSITIONAL, and configshell reads a
+ * positional token containing `=` as a keyword argument (cr3 review 2, L5: a
+ * hand-made backstore named `gt=vol1`) — refused, fail closed.
+ */
+const CONFIGSHELL_KEYWORDS = new Set([
+  'name',
+  'dev',
+  'file_or_dev',
+  'size',
+  'write_back',
+  'wwn',
+  'storage_object',
+  'lun',
+  'block_size',
+  'emulate_tpu',
+  'emulate_tpws',
+  'max_unmap_lba_count',
+  'emulate_write_cache',
+  'authentication',
+  'generate_node_acls',
+  'demo_mode_discovery',
+  'cache_dynamic_acls',
+])
+
+/**
+ * Would `token` reach configshell as itself? Whitespace, a quote, a second
+ * `=`, or an `=` in a token that is not one of ANAS's keyword parameters would
+ * not.
+ */
+export function configshellSafe(token: string): boolean {
+  if (CONFIGSHELL_UNSAFE_RE.test(token))
+    return false
+  const eq = token.indexOf('=')
+  if (eq === -1)
+    return true
+  return token.split('=').length === 2 && CONFIGSHELL_KEYWORDS.has(token.slice(0, eq))
+}
+
+/**
+ * cr3 review 2 (L1): every ACL the sequence will touch must be an iSCSI name
+ * BEFORE the first act — `aclDirPath` refuses anything else, and it used to
+ * be reached only after the LUN was unmapped, deleted, recreated and mapped.
+ */
+export function aclNamesRefusal(targetIqn: string, acls: { initiatorIqn: string }[]): IscsiRefusal | null {
+  const bad = acls.find(a => !IscsiIqn.safeParse(a.initiatorIqn).success || !configshellSafe(a.initiatorIqn))
+  if (!bad)
+    return null
+  return {
+    reason: 'acl-name-unsafe',
+    message: `The initiator ACL ${JSON.stringify(bad.initiatorIqn)} of target '${targetIqn}' is not an iSCSI name ANAS can `
+      + `address (configfs path, targetcli line), so this change cannot re-grant the LUN to it. Nothing was changed. `
+      + `Remove or recreate that ACL with targetcli, then retry.`,
+  }
+}
+
+/** Throw a refusal found before the first act, as the job's sentence. */
+function refuseBeforeFirstAct(refusal: IscsiRefusal | null): void {
+  if (refusal)
+    throw new Error(refusal.message)
+}
+
+/**
+ * The refusal for a backing PATH targetcli cannot be handed (cr3, ISCSI-L10
+ * follow-up) — asked BEFORE the first act of any sequence that would put the
+ * path on a `create` line, so a refusal never leaves a LUN half done.
+ */
+export function backingPathRefusal(path: string): IscsiRefusal | null {
+  if (configshellSafe(`dev=${path}`))
+    return null
+  return {
+    reason: 'backing-path-unsafe',
+    message: `The backing path ${JSON.stringify(path)} contains a space, a quote or an '=', and targetcli re-joins its `
+      + `arguments with spaces and parses the line again, so it would read the path as something else. ANAS cannot create `
+      + `a backstore on it; nothing was changed. Use a path without those characters (rename the dataset or move the mountpoint).`,
+  }
+}
+
+/** The wildcard listen addresses (GT-8: targetcli's default portal is `0.0.0.0:3260`). */
+const WILDCARD_PORTAL_ADDRESSES = new Set(['0.0.0.0', '::'])
 
 /** `/iscsi/<iqn>/tpg<tag>` — the configshell path of one TPG. */
 export function tpgPath(iqn: string, tag: number): string {
@@ -404,6 +520,59 @@ export function assertInstalled(ctx: IscsiReadContext): IscsiRefusal | null {
 }
 
 /**
+ * cr3 (ISCSI-L7, operator ruling 2026-11-14 "best practice prevails"): the one
+ * sentence for restore holes in targets ANAS does NOT manage. They keep the
+ * node degraded — a save is node-wide and would erase their saved LUNs — but
+ * Repair never writes to a foreign target. The hand restore is the proven one
+ * (GT-23: device back, then a restart of the restore service restores the
+ * whole saved configuration with the serial intact); it drops every session
+ * on the node, hence the maintenance window.
+ */
+export function foreignHolesSentence(holes: Pick<IscsiMissingLun, 'targetIqn' | 'lunIndex' | 'backstoreName' | 'backingPath'>[]): string {
+  const named = holes.map(h => `LUN ${h.lunIndex} of ${h.targetIqn} (backstore '${h.backstoreName}', ${h.backingPath})`).join('; ')
+  const one = holes.length === 1
+  return `${named} ${one ? 'is' : 'are'} missing from ${one ? 'a target' : 'targets'} ANAS does not manage. ANAS never `
+    + `writes to a target it does not own, so Repair leaves ${one ? 'it' : 'them'} alone. Restore ${one ? 'it' : 'them'} by hand: `
+    + `bring the backing device back, then run 'systemctl restart rtslib-fb-targetctl' in a maintenance window — it `
+    + `restores the whole saved configuration with the same serials, and drops every iSCSI session on this node while it `
+    + `does. Until then this node stays degraded and ANAS makes no iSCSI change: any save would erase ${one ? 'that LUN' : 'those LUNs'} `
+    + `from /etc/rtslib-fb-target/saveconfig.json. If ${one ? 'its device is' : 'a device is'} gone for good, the way out is your own `
+    + `'targetcli saveconfig', which writes the live configuration over the saved one and so ERASES ${one ? 'that LUN\'s' : 'those LUNs\''} `
+    + `record — a deliberate act, and not one ANAS takes.`
+}
+
+/**
+ * cr3 (ISCSI-L15): saveconfig.json exists but could not be read or parsed.
+ * Every mutation ends in `saveconfig`, which would write the live tree over
+ * whatever that file holds — and with the file unreadable, nothing can say
+ * what the live tree is missing. Refused, with the reason; Repair too (it
+ * replays the saved record, and there is none it can read).
+ */
+export function assertPersistedReadable(ctx: IscsiReadContext): IscsiRefusal | null {
+  // cr3: the LIVE side too — a configfs directory that could not be listed
+  // hides LUNs, ACLs and sessions, so no gate can be answered and no hole told
+  // from a LUN nobody saw.
+  const live = liveUnreadablePaths(ctx)
+  if (live.length > 0) {
+    return {
+      reason: 'configfs-unreadable',
+      message: `The live iSCSI configuration could not be read in full — ${live.join(', ')} could not be listed — so ANAS `
+        + `cannot see the LUNs, initiators or sessions behind it. Every iSCSI change and Repair is refused until it reads; `
+        + `check the kernel log for the configfs error, then refresh.`,
+    }
+  }
+  if (!ctx.persistedUnreadable)
+    return null
+  return {
+    reason: 'saveconfig-unreadable',
+    message: `The saved iSCSI configuration cannot be read: ${ctx.persistedUnreadable}. Every iSCSI change ends in `
+      + `'targetcli saveconfig', which would overwrite that file with the live configuration — and with the file `
+      + `unreadable, ANAS cannot tell which saved LUNs the live configuration lacks. Restore the file (targetcli keeps `
+      + `copies in /etc/rtslib-fb-target/backup/), then retry.`,
+  }
+}
+
+/**
  * The GT-22 guard: refuse every mutation while the live config is a KNOWN
  * incomplete restore.
  *
@@ -414,6 +583,9 @@ export function assertInstalled(ctx: IscsiReadContext): IscsiRefusal | null {
  * NAMES the holes so the operator knows what to bring back.
  */
 export function assertSaveable(ctx: IscsiReadContext, targets: IscsiTargetDetail[]): IscsiRefusal | null {
+  const unreadable = assertPersistedReadable(ctx)
+  if (unreadable)
+    return unreadable
   const health = computeIscsiHealth(ctx, targets)
   if (!health.degraded)
     return null
@@ -430,7 +602,7 @@ export function assertSaveable(ctx: IscsiReadContext, targets: IscsiTargetDetail
   // ANAS really does take offline itself, so "ANAS takes such a LUN offline …"
   // is true for each. (A foreign stub would make that promise a lie: after #54
   // ANAS never touches it, which is precisely why it no longer degrades.)
-  const ownedStubs = health.stubLuns.filter(s => s.ownership === 'anas')
+  const ownedStubs = health.stubLuns.filter(s => s.ownership === 'anas' && s.zeroSized)
   if (ownedStubs.length > 0) {
     const stubs = ownedStubs
       .map(l => `LUN ${l.lunIndex} of ${l.targetIqn} (backstore '${l.backstoreName}', ${l.backingPath})`)
@@ -446,16 +618,46 @@ export function assertSaveable(ctx: IscsiReadContext, targets: IscsiTargetDetail
     }
   }
 
-  const missing = health.missingLuns
+  // cr3 (ISCSI-L7): holes in foreign targets are named as such — Repair does
+  // not touch them, so "use Repair" would send the operator round in a loop.
+  const foreignHoles = health.missingLuns.filter(l => l.targetOwnership === 'foreign')
+  // cr3 review 2: holes of an ANAS target ANAS will not write to (a hand-added
+  // TPG, an owner that could not be judged) are not Repair's either — named
+  // with the target's own refusal, never "use Repair".
+  const targetByIqn = new Map(targets.map(t => [t.iqn, t]))
+  const handsOffOf = (iqn: string) => {
+    const t = targetByIqn.get(iqn)
+    return t ? handsOffRefusal(t) : null
+  }
+  const notRepairable = health.missingLuns.filter(l => l.targetOwnership !== 'foreign' && handsOffOf(l.targetIqn) !== null)
+  const ownHoles = health.missingLuns.filter(l => l.targetOwnership !== 'foreign' && handsOffOf(l.targetIqn) === null)
+  const handsOffClause = notRepairable.length === 0
+    ? ''
+    : ` ${notRepairable.map(l => `LUN ${l.lunIndex} of ${l.targetIqn} (backstore '${l.backstoreName}', ${l.backingPath})`).join('; ')} `
+      + `${notRepairable.length === 1 ? 'is' : 'are'} missing too, and Repair does not write to ${notRepairable.length === 1 ? 'that target' : 'those targets'}: `
+      + `${[...new Set(notRepairable.map(l => handsOffOf(l.targetIqn)!.message))].join(' ')}`
+  if (ownHoles.length === 0 && (foreignHoles.length > 0 || notRepairable.length > 0)) {
+    return {
+      reason: 'degraded-restore',
+      message: `The live iSCSI configuration is an INCOMPLETE restore, and every change is refused until it is whole:`
+        + `${foreignHoles.length > 0 ? ` ${foreignHolesSentence(foreignHoles)}` : ''}${handsOffClause}`,
+    }
+  }
+  const missing = ownHoles
     .map(l => `LUN ${l.lunIndex} of ${l.targetIqn} (backstore '${l.backstoreName}', ${l.backingPath})`)
     .join('; ')
+  const foreignClause = foreignHoles.length > 0 ? ` Besides: ${foreignHolesSentence(foreignHoles)}` : ''
   return {
     reason: 'degraded-restore',
     message: `The live iSCSI configuration is an INCOMPLETE restore — the saved configuration has `
-      + `${health.missingLuns.length} LUN${health.missingLuns.length === 1 ? '' : 's'} the kernel does not: ${missing}. `
+      + `${ownHoles.length} LUN${ownHoles.length === 1 ? '' : 's'} the kernel does not: ${missing}. `
       + `Every mutation ends in 'targetcli saveconfig', and saving now would write the hole into `
+      // cr3 (ISCSI-L8): the way back is Repair — a surgical replay of the
+      // saved record — never a restart of rtslib-fb-targetctl, which clears
+      // the whole live tree and drops every session on the node first
+      // (services/iscsi-repair.ts, and ANAS never issues it).
       + `/etc/rtslib-fb-target/saveconfig.json permanently. Bring the backing storage back (import the pool, `
-      + `restore the image) and restart rtslib-fb-targetctl, then retry.`,
+      + `restore the image), then use Repair on the iSCSI view, and retry.${foreignClause}${handsOffClause}`,
   }
 }
 
@@ -519,6 +721,12 @@ export interface IscsiMutateOptions {
   configfsRoot?: string
   /** Progress sink — the job's `updateProgress`. */
   progress?: (message: string) => void
+  /**
+   * Called by {@link createAndMapLun} the moment its backstore `create`
+   * SUCCEEDED (cr3, ISCSI-M5) — the add-LUN door's undo deletes a backstore
+   * only when this job made it, never a namesake that was already there.
+   */
+  onBackstoreCreated?: () => void
 }
 
 function report(opts: IscsiMutateOptions, message: string): void {
@@ -675,20 +883,61 @@ export async function updateIscsiTarget(
   if (req.portals !== undefined) {
     const wanted = new Map(req.portals.map(p => [portalKey(p.address, p.port), p]))
     const have = new Map(target.portals.map(p => [portalKey(p.address, p.port), p]))
-    for (const [key, p] of have) {
-      if (wanted.has(key))
-        continue
+    // cr3 (ISCSI-L13): the new portals are created FIRST. Removing first
+    // meant a create that failed (an address LIO refuses, GT-25) left the
+    // target listening on nothing at all; now it fails with the old portals
+    // still in place, and only a fully built new set retires them.
+    //
+    // ONE exception (review): a WILDCARD portal (`0.0.0.0` / `::`, the default
+    // targetcli leaves behind, GT-8) being removed on the SAME port as a
+    // portal being added goes first. A specific address may not bind while the
+    // wildcard listener holds that port (unverified on a node), and before
+    // L13 this edit — replace the wildcard with a real address — worked.
+    const toAdd = [...wanted].filter(([key]) => !have.has(key)).map(([, p]) => p)
+    const toRemove = [...have].filter(([key]) => !wanted.has(key)).map(([, p]) => p)
+    const addedPorts = new Set(toAdd.map(p => p.port))
+    const wildcardFirst = toRemove.filter(p => WILDCARD_PORTAL_ADDRESSES.has(p.address) && addedPorts.has(p.port))
+    const removeAfter = toRemove.filter(p => !wildcardFirst.includes(p))
+    const remove = async (p: { address: string, port: number }) => {
       report(opts, `Removing portal ${p.address}:${p.port}`)
       await runTargetcli(executor, [`${tpg}/portals`, 'delete', p.address, String(p.port)])
       portalsRemoved++
     }
-    for (const [key, p] of wanted) {
-      if (have.has(key))
-        continue
-      report(opts, `Creating portal ${p.address}:${p.port}`)
-      await runTargetcli(executor, [`${tpg}/portals`, 'create', p.address, String(p.port)])
-      portalsAdded++
+    for (const p of wildcardFirst)
+      await remove(p)
+    try {
+      for (const p of toAdd) {
+        report(opts, `Creating portal ${p.address}:${p.port}`)
+        await runTargetcli(executor, [`${tpg}/portals`, 'create', p.address, String(p.port)])
+        portalsAdded++
+      }
     }
+    catch (err) {
+      // cr3 review 2 (L3): a wildcard THIS edit removed is put back when a
+      // create after it fails — a rollback undoes only what this operation
+      // did. If the put-back fails too, the target may listen on no portal:
+      // the sentence says so and names the command that restores it.
+      if (wildcardFirst.length === 0)
+        throw err
+      const base = err instanceof Error ? err.message : String(err)
+      const failedUndo: string[] = []
+      for (const p of wildcardFirst) {
+        try {
+          await runTargetcli(executor, [`${tpg}/portals`, 'create', p.address, String(p.port)])
+        }
+        catch {
+          failedUndo.push(`targetcli ${tpg}/portals create ${p.address} ${p.port}`)
+        }
+      }
+      if (failedUndo.length === 0) {
+        throw new Error(`${base} The wildcard portal${wildcardFirst.length === 1 ? '' : 's'} this edit had removed `
+          + `(${wildcardFirst.map(p => `${p.address}:${p.port}`).join(', ')}) ${wildcardFirst.length === 1 ? 'was' : 'were'} put back; nothing else was changed.`)
+      }
+      throw new Error(`${base} The wildcard portal this edit had removed could not be put back either, so target '${iqn}' `
+        + `may now listen on NO portal. Restore it with: ${failedUndo.join('; ')} (the saved configuration still has it, so the next boot restores it too).`)
+    }
+    for (const p of removeAfter)
+      await remove(p)
   }
 
   let aclsAdded = 0
@@ -980,6 +1229,15 @@ export async function resolveFileBackingDir(
 ): Promise<{ ok: ResolvedFileDir } | { refusal: BackingRefusal }> {
   if (backing.startsWith('/')) {
     const c = classifyBacking(backing, ctx.inputs)
+    // cr3: the mountpoint table could not be read, so whether this directory
+    // is inside PVE's footprint is unknown — an AHR pool still answers for
+    // itself; anything else refuses rather than read unknown as "not PVE's".
+    if (c.ownershipUnknown) {
+      const ahr = await ahrPoolFor(executor, backing)
+      if (ahr)
+        return { ok: { dir: backing, pool: ahr.name, ahr } }
+      return { refusal: ownershipUnknownRefusal(backing) }
+    }
     if (c.kind === 'foreign') {
       const ahr = await ahrPoolFor(executor, backing)
       if (ahr)
@@ -1059,11 +1317,67 @@ export async function resolveFileBackingDir(
     return { ok: { dir: ahr.mountpoint, pool: ahr.name, ahr: { name: ahr.name, mountpoint: ahr.mountpoint } } }
   }
 
+  // cr3: with the mountpoint table unreadable, "not a dataset" is not known.
+  if (ctx.inputs.zfsMountpointsUnreadable)
+    return { refusal: ownershipUnknownRefusal(backing) }
   return {
     refusal: {
       reason: 'backing-not-found',
       message: `'${backing}' is neither a mounted ZFS dataset nor an AHR pool on this node`,
     },
+  }
+}
+
+/**
+ * Is this target ANAS's to change? The ONE answer every target and LUN verb
+ * asks — the guard's `foreignGate` and the LUN-update route alike.
+ *
+ *  - a foreign target is hands-off (3.25): the read layer says why;
+ *  - a target with more than one TPG (cr3, ISCSI-H2) is refused too. ANAS
+ *    creates exactly one TPG per target and every sequence addresses that one
+ *    (`tpgPath(iqn, target.tpgTag)`), so a second TPG — added by hand — would
+ *    be invisible to an ACL edit, deleted with its sessions by a target delete,
+ *    and left out of every per-TPG check a LUN verb makes. Rather than act
+ *    correctly on half the target, ANAS does not act on it at all;
+ *  - a target with an existing LUN whose backing's OWNER could not be judged
+ *    (cr3 review 2: the ZFS mountpoint table was unreadable) is refused. That
+ *    unknown never makes the target foreign — the quarantine and the degraded
+ *    mark keep working (the H1 rule) — and never makes it ANAS's own for a
+ *    write either: a good read may call it foreign.
+ */
+export function handsOffRefusal(target: IscsiTargetDetail): IscsiRefusal | null {
+  if (target.ownership !== 'anas') {
+    return {
+      reason: 'foreign-target',
+      message: `Target '${target.iqn}' is not managed by ANAS and is hands-off: ${target.ownershipDetail}`,
+    }
+  }
+  const others = target.otherTpgs ?? []
+  if (others.length > 0) {
+    const tags = [target.tpgTag, ...others.map(t => t.tpgTag)].join(', ')
+    return {
+      reason: 'multiple-tpgs',
+      message: `Target '${target.iqn}' has ${others.length + 1} target portal groups (TPG ${tags}). ANAS creates one TPG per `
+        + `target and changes only that one, so it does not change a target that was given more by hand — use targetcli `
+        + `for this target. This refusal has no confirm bypass.`,
+    }
+  }
+  const unknown = targetTpgs(target).flatMap(g => g.luns).find(l => l.backingOwnershipUnknown === true)
+  if (unknown)
+    return ownershipUnknownRefusal(unknown.backingPath)
+  return null
+}
+
+/**
+ * cr3: the ZFS mountpoint table could not be read, so a file backing's dataset
+ * — and whether PVE owns it — is unknown. Unknown never reads as "not PVE's"
+ * for a change to the backing.
+ */
+export function ownershipUnknownRefusal(path: string): { reason: string, message: string } {
+  return {
+    reason: 'backing-ownership-unknown',
+    message: `ANAS could not read the ZFS mountpoint table ('zfs list' failed), so it cannot tell whether '${path}' is inside `
+      + `PVE's footprint — refusing the change while its owner is unknown. Nothing was changed; retry once 'zfs list' answers.`,
   }
 }
 
@@ -1155,11 +1469,23 @@ export async function createSparseImage(path: string, size: number): Promise<voi
       throw new Error(`'${path}' already exists — refusing to overwrite it; pick another LUN name`)
     throw err
   }
+  // cr3 (review): a truncate that fails (no space, EFBIG) used to leave the
+  // 0-byte file this call created behind — and the add-LUN undo never saw it,
+  // since its flag rises only when this returns. The file was created here
+  // with O_EXCL, so it is this call's to remove.
+  let failed: unknown = null
   try {
     await fh.truncate(size)
   }
+  catch (err: unknown) {
+    failed = err
+  }
   finally {
     await fh.close()
+  }
+  if (failed !== null) {
+    await unlink(path).catch(() => {})
+    throw failed
   }
 }
 
@@ -1227,6 +1553,11 @@ export async function createAndMapLun(
   const attrs = defaultBackstoreAttributes(backing.plugin, blockSize !== undefined ? { blockSize } : {})
   const store = backstorePath(backing.plugin, name)
 
+  // cr3 review 2: every token and every ACL this sequence will reach is
+  // checked before the backstore exists.
+  assertConfigshellArgs([store, `name=${name}`, `wwn=${serial}`, ...attributeTokens(attrs)])
+  refuseBeforeFirstAct(aclNamesRefusal(target.iqn, target.acls))
+
   report(opts, `Creating ${backing.plugin} backstore ${name}`)
   if (backing.plugin === 'block') {
     await runTargetcli(executor, [
@@ -1248,6 +1579,8 @@ export async function createAndMapLun(
       `wwn=${serial}`,
     ])
   }
+
+  opts.onBackstoreCreated?.()
 
   // BEFORE the map — block_size is refused on an activated backstore (GT-27).
   for (const token of attributeTokens(attrs)) {
@@ -1451,8 +1784,16 @@ export async function growZvolLun(
  *
  * So the sequence replays both, and re-maps at the SAME LUN index:
  *
- *   unmap → delete backstore → grow the file → create with the SAME `wwn=` →
+ *   grow the file → unmap → delete backstore → create with the SAME `wwn=` →
  *   replay every attribute → map at the same index → re-grant to every ACL
+ *
+ * cr3 (ISCSI-M3): the grow comes FIRST. It used to run after the unmap and the
+ * backstore delete, so a grow that failed (no space, an unwritable file) left
+ * the LUN gone from the live tree and still in saveconfig.json — a restore
+ * hole, the node degraded and every iSCSI mutation refused, over a resize that
+ * never happened. Growing a file under its live backstore changes nothing LIO
+ * serves (the size is fixed at create, GT-29), so a failed grow now changes
+ * nothing at all.
  */
 export async function resizeFileLun(
   opts: IscsiMutateOptions,
@@ -1465,16 +1806,9 @@ export async function resizeFileLun(
   const tpg = tpgPath(target.iqn, tag)
   const store = backstorePath('fileio', lun.name)
 
-  report(opts, `Unmapping LUN ${lun.index}`)
-  await runTargetcli(executor, [`${tpg}/luns`, 'delete', `lun${lun.index}`])
-
-  report(opts, `Deleting backstore ${lun.name}`)
-  await runTargetcli(executor, ['/backstores/fileio', 'delete', lun.name])
-
-  report(opts, `Growing ${lun.backingPath} to ${size} bytes`)
-  await growImageFile(lun.backingPath, size)
-
-  report(opts, `Recreating backstore ${lun.name} with its original serial`)
+  // cr3 (ISCSI-L10): the recreate line is built and checked BEFORE the first
+  // act — a path targetcli would re-split must never be found after the LUN
+  // was already unmapped and its backstore deleted.
   const createArgs = [
     '/backstores/fileio',
     'create',
@@ -1488,6 +1822,22 @@ export async function resizeFileLun(
   // than pretending the disk came back the same.
   if (lun.serial)
     createArgs.push(`wwn=${lun.serial}`)
+  // cr3 review 2 (L1/L5): every line of the sequence, and every ACL it
+  // re-grants to, is checked here — nothing is grown, unmapped or deleted
+  // until all of them can be run.
+  assertConfigshellArgs([...createArgs, `lun${lun.index}`, lun.name, store, `storage_object=${store}`, `lun=${lun.index}`, ...attributeTokens(lun.attributes)])
+  refuseBeforeFirstAct(aclNamesRefusal(target.iqn, target.acls))
+
+  report(opts, `Growing ${lun.backingPath} to ${size} bytes`)
+  await growImageFile(lun.backingPath, size)
+
+  report(opts, `Unmapping LUN ${lun.index}`)
+  await runTargetcli(executor, [`${tpg}/luns`, 'delete', `lun${lun.index}`])
+
+  report(opts, `Deleting backstore ${lun.name}`)
+  await runTargetcli(executor, ['/backstores/fileio', 'delete', lun.name])
+
+  report(opts, `Recreating backstore ${lun.name} with its original serial`)
   await runTargetcli(executor, createArgs)
 
   for (const token of attributeTokens(lun.attributes)) {
@@ -1578,42 +1928,96 @@ export async function lunBackingClaims(
  * The two halves are genuinely different operations. Unmapping and deleting the
  * backstore is reversible: the zvol or image still holds the data and can be
  * exported again with the same serial. Destroying the backing object is not.
+ *
+ * cr3 (ISCSI-M3): the order is unmap → delete backstore → SAVE → destroy. The
+ * save used to come last, after the destroy; a `zfs destroy` or `unlink` that
+ * failed then left the LUN gone from the live tree and still in
+ * saveconfig.json — a restore hole, the node degraded, every iSCSI mutation
+ * refused, and Repair offering to bring back the LUN the operator had just
+ * deleted. Now the LUN's removal is persisted first, and a destroy that fails
+ * afterwards fails the job with "LUN deleted, backing kept: <reason>" — the
+ * truth, and a node that is not degraded.
  */
 export async function deleteIscsiLun(
   opts: IscsiMutateOptions,
   target: IscsiTargetDetail,
   lun: { index: number, name: string, plugin: string, kind: string, backingPath: string, dataset?: string },
   destroyBacking: boolean,
-): Promise<{ index: number, backstoreDeleted: string, backingDestroyed: string | null }> {
+  /**
+   * cr3 (ISCSI-M6): another LUN — another target, another TPG — maps the
+   * same backstore. rtslib's backstore delete takes every attached LUN with
+   * it, so only THIS LUN is unmapped and the backstore stays (destroyBacking
+   * is refused at the door in that case).
+   */
+  keepBackstore = false,
+): Promise<{ index: number, backstoreDeleted: string | null, backingDestroyed: string | null }> {
   const { executor } = opts
   const tpg = tpgPath(target.iqn, target.tpgTag)
+
+  // cr3 review 2 (L5): both lines are checked before the unmap — a backstore
+  // name configshell would read as a keyword must not strand the LUN unmapped.
+  assertConfigshellArgs([`lun${lun.index}`, lun.name])
 
   report(opts, `Unmapping LUN ${lun.index}`)
   await runTargetcli(executor, [`${tpg}/luns`, 'delete', `lun${lun.index}`])
 
-  report(opts, `Deleting backstore ${lun.name}`)
-  await runTargetcli(executor, [`/backstores/${lun.plugin}`, 'delete', lun.name])
-
-  let backingDestroyed: string | null = null
-  if (destroyBacking) {
-    if (lun.kind === 'zvol') {
-      const dataset = lun.dataset ?? zvolDataset(lun.backingPath)
-      report(opts, `Destroying volume ${dataset}`)
-      const r = await executor.exec(ZFS, ['destroy', '--', dataset])
-      if (r.exitCode !== 0)
-        throw new Error(r.stderr.trim() || `zfs destroy ${dataset} exited with code ${r.exitCode}`)
-      backingDestroyed = dataset
-    }
-    else if (lun.kind === 'file') {
-      report(opts, `Removing image file ${lun.backingPath}`)
-      await unlink(lun.backingPath)
-      backingDestroyed = lun.backingPath
-    }
+  if (keepBackstore) {
+    report(opts, `Keeping backstore ${lun.name}: another LUN still maps it`)
+  }
+  else {
+    report(opts, `Deleting backstore ${lun.name}`)
+    await runTargetcli(executor, [`/backstores/${lun.plugin}`, 'delete', lun.name])
   }
 
   report(opts, 'Saving the LIO configuration')
   await saveIscsiConfig(executor)
-  return { index: lun.index, backstoreDeleted: lun.name, backingDestroyed }
+
+  let backingDestroyed: string | null = null
+  if (destroyBacking) {
+    try {
+      if (lun.kind === 'zvol') {
+        const dataset = lun.dataset ?? zvolDataset(lun.backingPath)
+        report(opts, `Destroying volume ${dataset}`)
+        const r = await executor.exec(ZFS, ['destroy', '--', dataset])
+        if (r.exitCode !== 0)
+          throw new Error(r.stderr.trim() || `zfs destroy ${dataset} exited with code ${r.exitCode}`)
+        backingDestroyed = dataset
+      }
+      else if (lun.kind === 'file') {
+        report(opts, `Removing image file ${lun.backingPath}`)
+        await unlink(lun.backingPath)
+        backingDestroyed = lun.backingPath
+      }
+    }
+    catch (err) {
+      throw new Error(lunDeletedBackingKept(lun.index, lun.backingPath, err))
+    }
+  }
+
+  return { index: lun.index, backstoreDeleted: keepBackstore ? null : lun.name, backingDestroyed }
+}
+
+/**
+ * Remove an image file this job created, once nothing serves it (cr3,
+ * ISCSI-M5). The file was created with `O_EXCL` by this very job, so it is
+ * nobody else's; it is removed only when the backstore is known gone — an
+ * unlink under a live fileio backstore would leave LIO serving a deleted inode.
+ */
+export async function removeCreatedImage(path: string): Promise<string> {
+  try {
+    await unlink(path)
+    return `removed the image file ${path} it had created`
+  }
+  catch (err) {
+    return `the image file ${path} it had created could not be removed (${err instanceof Error ? err.message : String(err)})`
+  }
+}
+
+/** The one sentence for a LUN whose removal is saved but whose backing outlived it (cr3, ISCSI-M3). */
+export function lunDeletedBackingKept(index: number, backingPath: string, err: unknown): string {
+  const reason = err instanceof Error ? err.message : String(err)
+  return `LUN ${index} deleted, backing kept: ${reason}. The LUN is gone from the live and the saved configuration; `
+    + `${backingPath} is still there — remove it from the Datasets or storage screen once the cause is cleared.`
 }
 
 // ---------------------------------------------------------------------------
@@ -1637,34 +2041,44 @@ export async function deleteIscsiLun(
 export function claimsFromTargets(targets: IscsiTargetDetail[]): IscsiClaim[] {
   const claims: IscsiClaim[] = []
   for (const target of targets) {
-    for (const lun of target.luns) {
-      if (!lun.backingPath)
-        continue
-      const claim: IscsiClaim = {
-        backingPath: lun.backingPath,
-        kind: lun.kind,
-        targetIqn: target.iqn,
-        tpgTag: target.tpgTag,
-        lunIndex: lun.index,
-        backstoreName: lun.name,
-        connectedInitiators: lun.connectedInitiators,
-        // ONE phrasing, shared with `busy-diagnosis`'s LIO branch and every
-        // `iscsi.6` refusal body (describeLunHolder — single source).
-        detail: `${describeLunHolder({
+    // EVERY TPG (cr3, ISCSI-H2): a LUN in a second TPG holds its zvol or image
+    // exactly as one in the first does — `findLunHolder` (the busy diagnosis)
+    // always walked them all, and the two answers must not disagree.
+    for (const { tpgTag, luns } of targetTpgs(target)) {
+      for (const lun of luns) {
+        if (!lun.backingPath)
+          continue
+        const claim: IscsiClaim = {
+          backingPath: lun.backingPath,
+          kind: lun.kind,
+          targetIqn: target.iqn,
+          tpgTag,
           lunIndex: lun.index,
           backstoreName: lun.name,
-          targetIqn: target.iqn,
-          backingPath: lun.backingPath,
-        })}${
-          lun.connectedInitiators.length > 0
-            ? ` with ${lun.connectedInitiators.length} live session${lun.connectedInitiators.length === 1 ? '' : 's'}`
-            : ''}`,
+          connectedInitiators: lun.connectedInitiators,
+          // ONE phrasing, shared with `busy-diagnosis`'s LIO branch and every
+          // `iscsi.6` refusal body (describeLunHolder — single source).
+          detail: `${describeLunHolder({
+            lunIndex: lun.index,
+            backstoreName: lun.name,
+            targetIqn: target.iqn,
+            backingPath: lun.backingPath,
+          })}${
+            lun.connectedInitiators.length > 0
+              ? ` with ${lun.connectedInitiators.length} live session${lun.connectedInitiators.length === 1 ? '' : 's'}`
+              : ''}${
+            lun.connectedInitiatorsUnknown === true ? ' (its session state could not be read)' : ''}`,
+        }
+        // cr3 (review): the unknown session fact travels WITH the claim —
+        // dropped here, every other area's "no session" gate read it as none.
+        if (lun.connectedInitiatorsUnknown === true)
+          claim.connectedInitiatorsUnknown = true
+        if (lun.pool !== undefined)
+          claim.pool = lun.pool
+        if (lun.dataset !== undefined)
+          claim.dataset = lun.dataset
+        claims.push(claim)
       }
-      if (lun.pool !== undefined)
-        claim.pool = lun.pool
-      if (lun.dataset !== undefined)
-        claim.dataset = lun.dataset
-      claims.push(claim)
     }
   }
   return claims
@@ -1676,5 +2090,11 @@ export async function iscsiClaims(
   paths: IscsiPaths = {},
 ): Promise<{ installed: boolean, claims: IscsiClaim[] }> {
   const { ctx, targets } = await readIscsiState(executor, paths)
+  // cr3: claims built from a tree that could not be listed in full would say
+  // "nothing held" for a LUN nobody saw. Throwing is what the claims cache
+  // records as a failed read (`readFailed`), and the held-by-LUN doors refuse.
+  const unreadable = liveUnreadablePaths(ctx)
+  if (unreadable.length > 0)
+    throw new Error(`the iSCSI configfs tree could not be listed in full (${unreadable.join(', ')})`)
   return { installed: iscsiAvailability(ctx).installed, claims: claimsFromTargets(targets) }
 }
