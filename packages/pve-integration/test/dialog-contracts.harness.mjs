@@ -879,6 +879,26 @@ function loadRealReadJob(anas) {
   return readJob
 }
 
+/**
+ * cr3 (BACKUP-PANEL-M4): Edit and Enable/Disable re-read the stored task
+ * (GET /backup/tasks/:name) and refuse to act when that read fails. A route
+ * table with no explicit detail route answers it as the daemon does: the task
+ * the table's own task LIST holds under that name. Null when it cannot.
+ */
+function taskDetailFromList(routes, key) {
+  const detail = /^GET \/backup\/tasks\/([^/]+)$/.exec(key)
+  const listRoute = routes['GET /backup/tasks']
+  if (!detail || !listRoute || listRoute instanceof Error) { return null }
+  const list = typeof listRoute === 'function' ? listRoute('/backup/tasks') : listRoute
+  const name = decodeURIComponent(detail[1])
+  const entry = ((list && list.data) || []).find(e => e && (e.task || e).name === name)
+  // The revision rides along exactly as the daemon sends it (absent when the
+  // list entry carries none), so an edit here takes the door a real read gives.
+  return entry
+    ? { data: { task: entry.task || entry, ...(entry.revision ? { revision: entry.revision } : {}) } }
+    : null
+}
+
 function makeAnas(routes) {
   const anas = {
     views: {},
@@ -994,6 +1014,8 @@ function makeAnas(routes) {
         // the view (rclone.1: the 503 no-rclone door).
         apiGets.push(path)
         const key = `GET ${path.split('?')[0]}`
+        const fromList = key in routes ? null : taskDetailFromList(routes, key)
+        if (fromList) { return Promise.resolve(fromList) }
         if (!(key in routes)) { return Promise.reject(new Error(`unexpected ${key}`)) }
         const value = routes[key]
         if (value instanceof Error) { return Promise.reject(value) }
@@ -1006,7 +1028,9 @@ function makeAnas(routes) {
         return Promise.resolve(typeof routes[key] === 'function' ? routes[key](body) : routes[key])
       },
       put(_node, path, body) {
-        const key = `PUT ${path}`
+        // cr3 (BACKUP-PANEL-M4): a task PUT may carry ?expectedRevision=<hex>;
+        // the route is the path without it.
+        const key = `PUT ${path.split('?')[0]}`
         if (!(key in routes)) { return Promise.reject(new Error(`unexpected ${key}`)) }
         if (routes[key] instanceof Error) { return Promise.reject(routes[key]) }
         return Promise.resolve(typeof routes[key] === 'function' ? routes[key](body) : routes[key])
@@ -2156,11 +2180,13 @@ async function backupTaskKindChecks() {
   eq('kind: the files wizard opens on the suggested etc row', rows.length, 1)
   ok('kind: the archive name is shown, not typed', rows[0].down('#archName').readOnly === true)
 
-  // The suggested row came in NAMED: re-typing its path does not re-name it.
+  // cr3 (BACKUP-PANEL-L9): the suggested row is a NEW row, never a stored
+  // one: re-typing its path re-derives its name (a stored name never moves -
+  // section 3 below pins that on an edit).
   rows[0].down('#archPath').setValue('/var/log')
   await settle()
-  eq('kind: a named row keeps its name when its path moves',
-    rows[0].down('#archName').getValue(), 'etc')
+  eq('kind: the suggested row is a new row: its name follows its path',
+    rows[0].down('#archName').getValue(), 'log')
 
   const add = findCmp(wiz, 'anas-btn-backup-arch-add')
   add.handler(add)
@@ -2170,10 +2196,10 @@ async function backupTaskKindChecks() {
   r.down('#archPath').setValue('/mnt/pictures/raw')
   await settle()
   eq("kind: an unnamed row takes the path's last segment (shared deriveArchiveName)",
-    r.down('#archName').getValue(), deriveArchiveName('/mnt/pictures/raw', ['etc']))
-  r.down('#archPath').setValue('/etc')
+    r.down('#archName').getValue(), deriveArchiveName('/mnt/pictures/raw', ['log']))
+  r.down('#archPath').setValue('/var/log')
   await settle()
-  eq('kind: a taken name is auto-suffixed', r.down('#archName').getValue(), 'etc-2')
+  eq('kind: a taken name is auto-suffixed', r.down('#archName').getValue(), 'log-2')
 
   add.handler(add)
   await settle()
@@ -4775,7 +4801,9 @@ async function restoreDoorsLiveSessionChecks() {
     await settle()
     return jobs[0] || null
   }
-  const newLunBody = (snapshot, name, ns) => {
+  // cr3 (the daemon's review): a door opened FROM A TASK names the task in
+  // the image body (the daemon reads the task's stored namespace from it).
+  const newLunBody = (snapshot, name, ns, task) => {
     const body = {
       kind: 'image',
       repo: 'pbs-main',
@@ -4783,6 +4811,7 @@ async function restoreDoorsLiveSessionChecks() {
       archive: 'disk.img',
       target: { mode: 'newLun', targetIqn: ISCSI_IQN, name, backing: { kind: 'zvol', pool: 'tank' } },
     }
+    if (task) { body.task = task }
     if (ns) { body.ns = ns }
     return body
   }
@@ -4820,7 +4849,7 @@ async function restoreDoorsLiveSessionChecks() {
   const gridJob = await submitNewLun(gridDlg, 'grid', 'grid-live-new')
   eq('doors(live session, grid): the submitted body is the newLun shape',
     gridJob && gridJob.body,
-    newLunBody(`${LUN_GROUP}/2026-08-25T19:16:45Z`, 'grid-live-new'))
+    newLunBody(`${LUN_GROUP}/2026-08-25T19:16:45Z`, 'grid-live-new', undefined, LIVE_BLOCK_TASK.name))
   ok('doors(live session, grid): a newLun body never carries the in-place lun key',
     !!gridJob && !('lun' in gridJob.body), JSON.stringify((gridJob || {}).body))
 
@@ -4849,7 +4878,7 @@ async function restoreDoorsLiveSessionChecks() {
   const detailJob = await submitNewLun(detailDlg, 'detail', 'detail-live-new')
   eq('doors(live session, detail): the submitted body is the newLun shape',
     detailJob && detailJob.body,
-    newLunBody(`${LUN_GROUP}/2026-08-25T19:16:45Z`, 'detail-live-new'))
+    newLunBody(`${LUN_GROUP}/2026-08-25T19:16:45Z`, 'detail-live-new', undefined, LIVE_BLOCK_TASK.name))
   ok('doors(live session, detail): a newLun body never carries the in-place lun key',
     !!detailJob && !('lun' in detailJob.body), JSON.stringify((detailJob || {}).body))
 
@@ -4991,6 +5020,24 @@ async function iscsiRestoreDialogChecks() {
   ok('restore dialog: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
+/**
+ * cr3 (BACKUP-PANEL-M1): pick the point in time again through the shared
+ * picker, then the archive - what an operator does after a source change
+ * dropped the earlier pick.
+ */
+async function repickRestoreSnapshot(dlg, archive) {
+  const snapBtn = dlg.down('#restoreSnapPick')
+  snapBtn.handler(snapBtn)
+  await settle()
+  const snapWin = openWindow()
+  snapWin.down('#snapGrid').selectRow(0)
+  const snapSelect = snapWin.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
+  snapSelect.handler(snapSelect)
+  await settle()
+  dlg.down('#restoreArchive').setValue(archive)
+  await settle()
+}
+
 async function iscsiRestoreVerdictChecks() {
   // backup2.5's reads answer 200 with a VERDICT: a PBS-side problem is a
   // DIAGNOSIS the screen shows verbatim, never a bare failure.
@@ -5090,8 +5137,12 @@ async function iscsiRestoreSizeGateChecks() {
     jobs[0].confirmWindow === true)
 
   // A blank namespace sends NO key at all — the repository's own then stands.
-  jobs.length = 0
+  // cr3 (BACKUP-PANEL-M1): a namespace change drops the point in time picked
+  // in the old namespace, so it is picked again in the new one first.
   dlg.down('#restoreNs').setValue('')
+  await settle()
+  await repickRestoreSnapshot(dlg, 'disk.img')
+  jobs.length = 0
   submit.handler(submit)
   await settle()
   ok('restore: a blank namespace sends no ns key', !('ns' in jobs[0].body), JSON.stringify(jobs[0].body))
@@ -5315,7 +5366,12 @@ async function iscsiRestoreNewLunChecks() {
     })
 
   // A blank namespace still sends no ns key in the newLun body.
+  // cr3 (BACKUP-PANEL-M1): the namespace change drops the point in time, so it
+  // is picked again (and the new-LUN destination re-chosen) before the body.
   dlg.down('#restoreNs').setValue('')
+  await settle()
+  await repickRestoreSnapshot(dlg, 'small.img')
+  dlg.down('#restoreDest').setValue('newLun')
   await settle()
   jobs.length = 0
   submit.handler(submit)
@@ -6150,6 +6206,9 @@ function loadPickerSources(files) {
       return Promise.resolve(liveRoute(params.get('path') || '/', params.get('files') === '1'))
     }
     const key = `GET ${base}`
+    // cr3 (BACKUP-PANEL-M4): the edit's re-read of the stored task.
+    const fromList = key in PICKER_ROUTES ? null : taskDetailFromList(PICKER_ROUTES, key)
+    if (fromList) { return Promise.resolve(fromList) }
     return key in PICKER_ROUTES && PICKER_ROUTES[key]
       ? Promise.resolve(PICKER_ROUTES[key])
       : Promise.reject(new Error(`unexpected GET ${base}`))
@@ -7696,6 +7755,8 @@ async function restoreDoorChecks() {
       snapshot: `${LUN_GROUP}/2026-08-25T19:16:45Z`,
       archive: 'disk.img',
       lun: { targetIqn: ISCSI_IQN, index: 0 },
+      // cr3 (the daemon's review): opened from the task, the body names it.
+      task: LIVE_BLOCK_TASK.name,
     })
   ok('block restore: the in-place body carries NO target key',
     jobs.length && jobs[0].body && !('target' in jobs[0].body), JSON.stringify((jobs[0] || {}).body))
@@ -7733,6 +7794,8 @@ async function restoreDoorChecks() {
         name: 'stray-new',
         backing: { kind: 'zvol', pool: 'tank' },
       },
+      // cr3 (the daemon's review): opened from the task, the body names it.
+      task: STRAY_LUN_TASK.name,
     })
   ok('block restore(stray): a new-LUN body never carries the in-place lun key',
     jobs.length && jobs[0].body && !('lun' in jobs[0].body), JSON.stringify((jobs[0] || {}).body))

@@ -310,9 +310,11 @@
             + (wantFiles ? '&files=1' : '');
     }
 
-    // The archive body, built once so the harness can assert on it. `ns` is
-    // omitted entirely when absent — absent means "the repository's own", and
-    // sending an empty string would mean the datastore root instead.
+    // The archive body, built once so the harness can assert on it. A door
+    // opened from a task sends the task and the task's stored namespace
+    // exactly, the empty string included (the datastore root): the daemon
+    // reads in the task's namespace. With no task, `ns` is omitted when blank:
+    // absent means "the repository's own".
     function archiveBrowseBody(ctx, path) {
         var c = ctx || {};
         var body = {
@@ -321,7 +323,12 @@
             archive: c.archive,
             path: normalizePath(path),
         };
-        if (c.ns) {
+        if (c.task) {
+            body.task = c.task;
+            if (typeof c.ns === 'string') {
+                body.ns = c.ns;
+            }
+        } else if (c.ns) {
             body.ns = c.ns;
         }
         return body;

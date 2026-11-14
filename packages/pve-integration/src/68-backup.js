@@ -206,6 +206,19 @@
         return ANAS.enc(s);
     }
 
+    // cr3 (BACKUP-PANEL-M5): the DEFAULT ExtJS BoundList renders a combo's
+    // displayField as raw HTML (proven in a browser on PVE 9.2, ExtJS 7.0).
+    // Every combo in this file lists through this template instead: their rows
+    // carry PBS-server text (groups, archive names), config-file text
+    // (repository datastores) or node text (mountpoints, LUN targets, pools),
+    // and a fixed-word list costs nothing to encode the same way. The `label`
+    // field is every combo's displayField here.
+    var ENCODED_LIST_TPL = '<tpl for="."><div class="x-boundlist-item">{label:htmlEncode}</div></tpl>';
+
+    function encodedList() {
+        return { tpl: ENCODED_LIST_TPL };
+    }
+
     function gfxReady() {
         return ANAS.gfx && ANAS.gfx.ready ? ANAS.gfx.ready() : false;
     }
@@ -445,6 +458,29 @@
             win.anasIdSetting = false;
         } catch (e) {
             // the field stays as it was
+        }
+    }
+
+    /**
+     * cr3 (BACKUP-PANEL-L6): back on Files after a block pick, the id is the
+     * FILES task's again — the operator's typed id, else `<host>-<name>` —
+     * never the LUN's `lun-<serial>`, which names a LUN's PBS group (the
+     * daemon guards that id on block tasks only, so a files task would have
+     * written into the LUN's group).
+     */
+    function restoreFilesBackupId(win, node) {
+        try {
+            var f = win && win.down ? win.down('#backupId') : null;
+            if (!f) {
+                return;
+            }
+            win.anasIdSetting = true;
+            f.setValue(win.anasIdManual
+                ? (win.anasIdTyped || '')
+                : defaultFilesBackupId(node, trim(valOf(win, '#name'))));
+            win.anasIdSetting = false;
+        } catch (e) {
+            win.anasIdSetting = false;
         }
     }
 
@@ -1039,7 +1075,19 @@
         return {
             version: (data.version === undefined || data.version === null) ? 0 : data.version,
             repos: data.repos || [],
+            // cr3 (ADDITIVE): storage.cfg could not be read — the PVE-defined
+            // repositories are missing from `repos`, and this says why.
+            pveUnavailable: (typeof data.pveUnavailable === 'string') ? data.pveUnavailable : '',
         };
+    }
+
+    /** true | false | null (unknown) — the daemon's credentialsSet, alias credsSet. */
+    function credentialsStateOf(r) {
+        var v = (r && Object.prototype.hasOwnProperty.call(r, 'credentialsSet')) ? r.credentialsSet : (r && r.credsSet);
+        if (v === true) {
+            return true;
+        }
+        return v === null ? null : false;
     }
 
     function repoRow(r) {
@@ -1053,7 +1101,9 @@
             authType: ('' + (first(r.authType, r.auth) || 'token')).toLowerCase(),
             tokenId: first(r.tokenId, r.tokenid) || '',
             username: first(r.username, r.user) || '',
-            credentialsSet: first(r.credentialsSet, r.credsSet) === true,
+            // cr3: `null` = UNKNOWN (the secret file exists but could not be
+            // read) — kept as null, never folded into "not set".
+            credentialsSet: credentialsStateOf(r),
             fingerprint: first(r.fingerprint, r.certFingerprint) || '',
             // Tier: 'pve' = auto-discovered from storage.cfg (hands-off), else
             // 'anas' = registered. Drives the PVE badge + edit/delete lock-out.
@@ -1094,13 +1144,21 @@
             return env;
         }, function (err) {
             ANAS.warn('backup repos load failed: ' + ANAS.errText(err));
-            return { version: 0, repos: [] };
+            // cr3 (BACKUP-PANEL-L10): the failure rides the envelope. The
+            // grid's repo join stays fail-open (REPO_MAP keeps what it had);
+            // a door that needs the LIST reads `failed` and says so.
+            return { version: 0, repos: [], failed: ANAS.errText(err) || t('unknown error') };
         });
     }
 
     // Resolve to [{name, label}] repo options for the task wizard picker.
+    // cr3 (BACKUP-PANEL-L10): REJECTS when the list could not be read — an
+    // unreadable registry is never "no repositories registered".
     function loadRepoOptions(node) {
         return loadReposInto(node).then(function (env) {
+            if (env.failed) {
+                throw new Error(env.failed);
+            }
             var opts = [];
             for (var i = 0; i < env.repos.length; i++) {
                 var r = env.repos[i] || {};
@@ -1459,15 +1517,19 @@
             if (!win || win.destroyed || win.destroying) {
                 return;
             }
+            // cr3 (BACKUP-PANEL-M2): no record means no LUN identity — the
+            // index stays null rather than a made-up LUN 0.
             win.anasBlockLun = {
                 targetIqn: '' + (lun && lun.targetIqn ? lun.targetIqn : ''),
-                index: lun && lun.index !== undefined && lun.index !== null ? lun.index : 0,
+                index: lun && typeof lun.index === 'number' ? lun.index : null,
                 path: '' + (lun && lun.path ? lun.path : ''),
                 serial: (lun && lun.serial == null) ? null : ('' + lun.serial),
                 name: '' + (lun && lun.name ? lun.name : ''),
             };
             win.anasBlockConsistency = (lun && lun.consistency) ? lun.consistency : null;
             win.anasBlockStale = false;
+            win.anasBlockNotLun = false;
+            win.anasBlockReadError = '';
             if (fromPicker) {
                 renderBlockLun(win);
                 syncBlockIdValue(win);
@@ -1522,21 +1584,32 @@
                     };
                     win.anasBlockConsistency = match.consistency || null;
                     win.anasBlockStale = false;
-                } else if (seed && seed.path) {
+                    win.anasBlockNotLun = false;
+                } else if (seed && seed.targetIqn) {
                     // The list answered and does not hold the LUN: shown, amber.
                     win.anasBlockStale = true;
+                } else if (seed && seed.path) {
+                    // cr3 (BACKUP-PANEL-M2): an image archive with NO LUN
+                    // record whose path is not a LUN this node serves — a
+                    // device or image file typed in the files wizard. It is
+                    // not a LUN gone missing, and nothing refuses its save.
+                    win.anasBlockNotLun = true;
                 }
+                win.anasBlockReadError = '';
                 renderBlockLun(win);
                 syncBlockIdValue(win);
                 syncTaskKind(win);
             },
-            function () {
+            function (err) {
                 // Fail-open: the list could not answer — keep the known facts,
-                // no chip, and no stale claim (we cannot say either way).
+                // no chip, and no stale claim (we cannot say either way). The
+                // failed read is SAID (cr3: a read that failed never reads as
+                // a quiet absence).
                 if (win.destroyed || win.destroying) {
                     return;
                 }
                 win.anasBlockStale = false;
+                win.anasBlockReadError = ANAS.errText(err) || t('unknown error');
                 renderBlockLun(win);
                 syncBlockIdValue(win);
                 syncTaskKind(win);
@@ -1558,6 +1631,25 @@
             if (!lun || !lun.path) {
                 out.update('<div style="font-size:11px;color:var(--anas-muted,gray);">'
                     + enc(t('No LUN chosen.')) + '</div>');
+                return;
+            }
+            var readErr = win.anasBlockReadError
+                ? '<div style="font-size:11px;color:var(--anas-warn,#c9820b);margin-top:2px;">'
+                    + enc(t('Could not read this node\'s LUN list') + ': ' + win.anasBlockReadError) + '</div>'
+                : '';
+            if (!lun.targetIqn) {
+                // cr3 (BACKUP-PANEL-M2): an image source with no LUN record.
+                // Its path is the whole truth: no name, no target, no LUN
+                // number is shown, because none is known.
+                out.update('<div style="font-size:12px;">'
+                    + '<i class="fa fa-hdd-o" style="margin-right:5px;color:var(--anas-muted,gray);"></i>'
+                    + '<span style="font-family:monospace;">' + enc(lun.path) + '</span></div>'
+                    + '<div style="font-size:11px;color:var(--anas-muted,gray);margin-top:2px;">'
+                    + enc(win.anasBlockNotLun
+                        ? t('A block image of a device or an image file, not an iSCSI LUN this node serves. '
+                            + 'It is saved exactly as it is stored; choosing a LUN makes it a LUN backup.')
+                        : t('A block image with no LUN record. It is saved exactly as it is stored.'))
+                    + '</div>' + readErr);
                 return;
             }
             var html = '<div style="font-size:12px;">'
@@ -1586,7 +1678,7 @@
                         + 'refused until it resolves.'))
                     + '</div>';
             }
-            out.update(html);
+            out.update(html + readErr);
         } catch (e) {
             ANAS.warn('block LUN render failed: ' + ANAS.errText(e));
         }
@@ -1669,6 +1761,22 @@
         var lun = win.anasBlockLun;
         if (!lun || !lun.path) {
             return null;
+        }
+        if (!lun.targetIqn) {
+            // cr3 (BACKUP-PANEL-M2): no record to send. An edit sends its
+            // stored archive back verbatim (the shared schema refuses an
+            // empty record, so inventing one made the task uneditable); a
+            // new block task without a picked LUN has nothing to send.
+            var keep = win.anasBlockStored;
+            if (!keep) {
+                return null;
+            }
+            return {
+                name: keep.name || BLOCK_ARCHIVE_NAME,
+                path: keep.path,
+                excludes: [],
+                kind: 'img',
+            };
         }
         if (!win.anasBlockStored) {
             return {
@@ -1789,12 +1897,25 @@
                     }
                 }
                 grid.anasReloading = false;
+                // cr3: a good read retires any failure line and restores the
+                // grid's own empty sentence.
+                try {
+                    grid._lastLoadOkAt = new Date().toISOString();
+                } catch (eDate) {
+                    grid._lastLoadOkAt = ''; // the line then names no time
+                }
+                showTaskLoadFailure(view, grid, '');
                 updateButtons(grid);
             }, function (err) {
                 // Stale failure: the newer load owns the mask and the grid now.
                 if (grid.destroyed || grid.destroying || grid._loadSeq !== seq) {
                     return;
                 }
+                // cr3 (the review's "a failed read never reads as empty"): the
+                // rows stay as the last good read left them, and the view SAYS
+                // the list could not be read — never "No backup tasks defined"
+                // over a list nobody saw.
+                showTaskLoadFailure(view, grid, ANAS.errText(err) || t('unknown error'));
                 grid.anasReloading = false;
                 // The newest response clears the mask whether its own load was
                 // quiet or not (see the success branch) — a fresh FAILURE must
@@ -1809,12 +1930,88 @@
         });
     }
 
+    var TASKS_EMPTY_TEXT = 'No backup tasks defined';
+    var REPOS_EMPTY_TEXT = 'No repositories registered';
+
+    /**
+     * cr3: the task list's read state on screen. `reason` '' = the last read
+     * answered (the line hides, the empty text is the grid's own). Otherwise
+     * the line names the failure; the rows already shown are KEPT and marked
+     * as the last good read (with its time), and an empty grid says the list
+     * could not be read instead of "No backup tasks defined".
+     */
+    function showTaskLoadFailure(view, grid, reason) {
+        var note = null;
+        try {
+            note = view && view.down ? view.down('#backupLoadNote') : null;
+        } catch (e) {
+            note = null;
+        }
+        var count = 0;
+        try {
+            count = grid.getStore().getCount();
+        } catch (e2) {
+            count = 0;
+        }
+        if (note) {
+            try {
+                if (!reason) {
+                    note.update('');
+                    note.setHidden(true);
+                } else {
+                    var line = t('Could not read the backup tasks') + ': ' + reason + '.';
+                    if (count) {
+                        line += ' ' + (grid._lastLoadOkAt
+                            ? t('The rows below are the last list that was read') + ' (' + absTime(grid._lastLoadOkAt) + ')'
+                            : t('The rows below are the last list that was read'))
+                            + ' ' + t('and may be out of date.');
+                    }
+                    note.update('<div style="font-size:12px;color:var(--anas-danger,#c23b2c);">'
+                        + '<i class="fa fa-exclamation-triangle" style="margin-right:6px;"></i>'
+                        + enc(line) + '</div>');
+                    note.setHidden(false);
+                }
+            } catch (e3) {
+                ANAS.warn('backup load note render failed: ' + ANAS.errText(e3));
+            }
+        }
+        grid._loadFailed = !!reason;
+        setGridEmptyText(grid, reason
+            ? (t('The backup tasks could not be read') + ': ' + reason)
+            : t(TASKS_EMPTY_TEXT));
+    }
+
+    /** The grid's empty sentence, encoded (the grid view renders it as HTML). */
+    function setGridEmptyText(grid, text) {
+        try {
+            grid.emptyText = text;
+            var v = typeof grid.getView === 'function' ? grid.getView() : null;
+            if (!v) {
+                return;
+            }
+            var html = '<div class="x-grid-empty">' + enc(text) + '</div>';
+            if (typeof v.setEmptyText === 'function') {
+                v.setEmptyText(html);
+            } else {
+                v.emptyText = html;
+                if (typeof v.refresh === 'function') {
+                    v.refresh();
+                }
+            }
+        } catch (e) {
+            // non-fatal: the failure line above still says it
+        }
+    }
+
     ANAS.backup = ANAS.backup || {};
     ANAS.backup.reload = loadTasks;
     // The delete door, exposed for poll-job.harness.mjs (cr.45 review) — it
     // must go through runJob, and that is only provable from the call site.
     // (The toolbar's Delete button calls the same function directly.)
     ANAS.backup.deleteTask = deleteTask;
+    // The Enable/Disable door, exposed for cr3-backup-panel.harness.mjs (M4):
+    // the toolbar's toggle calls the same function directly.
+    ANAS.backup.toggleTask = toggleTask;
     // The grid's Last run cell, exposed for the pill harness (lastrun-pill.harness.mjs).
     ANAS.backup.renderLastRun = renderLastRun;
     // The second doors (a door opens the EXISTING dialog, never a second
@@ -2550,7 +2747,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-backup-detail',
-                title: t('Backup Task') + ': ' + name,
+                title: t('Backup Task') + ': ' + enc(name),
                 modal: false,
                 width: 760,
                 height: 520,
@@ -2682,6 +2879,7 @@
                         queryMode: 'local',
                         valueField: 'kind',
                         displayField: 'label',
+                        listConfig: encodedList(),
                         store: Ext.create('Ext.data.Store', {
                             fields: ['kind', 'label'],
                             data: [
@@ -2714,6 +2912,7 @@
                                 store: pathStore,
                                 valueField: 'path',
                                 displayField: 'label',
+                                listConfig: encodedList(),
                                 queryMode: 'local',
                                 editable: true,
                                 forceSelection: false,
@@ -2806,6 +3005,7 @@
                         queryMode: 'local',
                         valueField: 'mode',
                         displayField: 'label',
+                        listConfig: encodedList(),
                         store: Ext.create('Ext.data.Store', {
                             fields: ['mode', 'label'],
                             data: [
@@ -2863,6 +3063,11 @@
             ANAS.warn('archive row add failed: ' + ANAS.errText(e));
         }
         if (fs) {
+            // cr3 (review 3): the stored excludes, verbatim — an untouched
+            // textarea sends them back exactly (the line reader trims and
+            // drops blank lines, which would rewrite a stored pattern).
+            fs.anasStoredExcludes = isArray(data.excludes) ? data.excludes.slice() : null;
+            fs.anasStoredExcludesText = isArray(data.excludes) ? data.excludes.join('\n') : null;
             // The stored LUN record travels with the row and with the PATH it
             // was recorded at — see readArchives.
             fs.anasLun = lunRefOf(data);
@@ -3221,12 +3426,14 @@
             }
             var kindF = fs.down('#archKind');
             var img = kindF ? ('' + (kindF.getValue() || 'pxar')) === 'img' : false;
+            var exclText = exclF ? exclF.getValue() : '';
+            var untouchedExcl = fs.anasStoredExcludes && ('' + (exclText == null ? '' : exclText)) === fs.anasStoredExcludesText;
             var row = {
                 name: name,
                 path: path,
                 // A block image has no excludes — the daemon refuses them, so the
                 // (disabled) field's contents are never read for one.
-                excludes: img ? [] : splitLines(exclF ? exclF.getValue() : ''),
+                excludes: img ? [] : (untouchedExcl ? fs.anasStoredExcludes.slice() : splitLines(exclText)),
             };
             // backup2.2 — set / clear / keep: a chosen value is SENT, and None
             // is sent as NOTHING. Archives are replaced wholesale on every save,
@@ -3394,14 +3601,22 @@
         if (!hasKeeps(retention)) {
             return;
         }
+        var repository = valOf(win, '#repository');
         var body = {
-            repository: valOf(win, '#repository'),
+            repository: repository,
             backupId: trim(valOf(win, '#backupId')),
             retention: retention,
         };
-        var ns = trim(valOf(win, '#namespace'));
-        if (ns) {
-            body.namespace = ns;
+        // cr3 (BACKUP-PANEL-M3, and the daemon's review): the Preview names
+        // exactly the namespace the Save will store — the same rule, never the
+        // repository's own substituted for the task's: a typed value, a stored
+        // '' as '', a cleared stored value as null (the daemon's "the task's
+        // namespace cleared, the repository's is effective"), and nothing when
+        // the save would store nothing (the daemon then reads the stored task,
+        // else the repository).
+        var nsBody = taskNamespaceForBody(trim(valOf(win, '#namespace')), !!win.anasEditTask, win.anasEditTask);
+        if (nsBody.send) {
+            body.namespace = nsBody.value;
         }
         previewOut(win, '<div style="color:var(--anas-muted,gray);font-size:11px;">'
             + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
@@ -3446,16 +3661,226 @@
         var seed = (!isEdit && isArray(seedArchives) && seedArchives.length)
             ? archivesOf({ archives: seedArchives })
             : null;
-        loadRepoOptions(node).then(function (repoOpts) {
+        // cr3 (BACKUP-PANEL-M4): an edit starts from the STORED task, read
+        // when the dialog opens — never from the grid's last poll, which can
+        // be a whole edit behind (another admin, another tab). A PUT rewrites
+        // the whole task, so a stale start silently undoes that edit.
+        var taskRead = isEdit ? rereadTask(node, task) : Promise.resolve({ task: task, readError: '', revision: '' });
+        Promise.all([loadRepoOptions(node), taskRead]).then(function (both) {
+            var repoOpts = both[0];
+            var read = both[1];
+            if (read.gone) {
+                ANAS.alertMsg('Edit failed', t('The backup task') + ' "' + (task.name || '') + '" '
+                    + t('no longer exists on this node. Nothing was changed.'));
+                loadTasks(view, node);
+                return;
+            }
+            if (read.readError) {
+                // cr3 (BACKUP-PANEL-M4, coordinator ruling): fail CLOSED. The
+                // list's copy can be a whole edit behind, and a Save of it
+                // rewrites the whole task — no dialog opens on it.
+                ANAS.alertMsg('Edit failed', t('Could not read the backup task') + ' "' + (task.name || '')
+                    + '": ' + read.readError + '. ' + t('Nothing was opened; try again.'));
+                return;
+            }
             if (!isEdit && !repoOpts.length) {
                 ANAS.toast(t('Register a PBS repository first (Repositories…).'));
                 return;
             }
-            buildTaskWindow(view, node, isEdit, task, repoOpts, seed, preset, onDone);
+            buildTaskWindow(view, node, isEdit, read.task, repoOpts, seed, preset, onDone, read.revision);
+        }, function (err) {
+            // cr3 (BACKUP-PANEL-L10): the repository list could not be read.
+            // Said as that — never "register a repository first", never a
+            // dialog whose repository combo is silently empty.
+            ANAS.alertMsg(isEdit ? 'Edit failed' : 'New task failed',
+                t('Could not read the backup repositories') + ': ' + ANAS.errText(err));
         });
     }
 
-    function buildTaskWindow(view, node, isEdit, task, repoOpts, seedArchives, preset, onDone) {
+    /**
+     * cr3 (BACKUP-PANEL-M4): the stored task, re-read. Resolves
+     * `{ task, revision, readError }` — the fresh task and the revision the
+     * daemon answered with ('' from a daemon that sends none), or a non-empty
+     * `readError` (the caller refuses to act on it), or `{ gone: true }` when
+     * the daemon answers that the task no longer exists. Never rejects.
+     */
+    function rereadTask(node, snapshot) {
+        var name = '' + ((snapshot && snapshot.name) || '');
+        return ANAS.api.get(node, '/backup/tasks/' + encodeURIComponent(name)).then(function (res) {
+            var fresh = storedTaskOf(res, name);
+            return fresh
+                ? { task: fresh, revision: revisionOf(res), readError: '' }
+                : { task: snapshot, revision: '', readError: t('the node answered without the task') };
+        }, function (err) {
+            if (err && err.status === 404) {
+                return { gone: true, task: snapshot, revision: '', readError: '' };
+            }
+            return { task: snapshot, revision: '', readError: ANAS.errText(err) || t('unknown error') };
+        });
+    }
+
+    /**
+     * cr3 (BACKUP-PANEL-M4): the revision a GET /backup/tasks/:name answer
+     * carries (`data.revision`, the stored unit's hash), or '' when the
+     * daemon sends none — an older daemon then simply gets no
+     * `expectedRevision`, exactly today's request.
+     */
+    function revisionOf(res) {
+        var d = (res && res.data) || null;
+        var r = d && typeof d.revision === 'string' ? d.revision : '';
+        return /^[A-Za-z0-9._:-]{1,128}$/.test(r) ? r : '';
+    }
+
+    /**
+     * cr3 (BACKUP-PANEL-M4): the save was refused because the stored task
+     * changed after this dialog read it. Say so, and offer to reload it — a
+     * fresh dialog on the stored task; this one's unsaved edits are dropped.
+     */
+    function taskChangedSinceOpened(win, view, node, task, onDone, err) {
+        var msg = enc(t('This backup task was changed (another session or another admin) after this dialog '
+            + 'opened, so it was not saved.')) + '<br><br>'
+            + enc(ANAS.errText(err)) + '<br><br>'
+            + enc(t('Reload the stored task? Your changes in this dialog are discarded.'));
+        try {
+            Ext.Msg.confirm(t('Task changed'), msg, function (b) {
+                if (b !== 'yes') {
+                    return;
+                }
+                if (!win.destroyed && !win.destroying) {
+                    win.close();
+                }
+                loadTasks(view, node);
+                openTaskDialog(view, node, task, null, null, onDone);
+            });
+        } catch (e) {
+            ANAS.warn('backup task changed: ' + ANAS.errText(err));
+        }
+    }
+
+    /** The PUT path for a task, bound to the revision it was read at (when known). */
+    function taskPutPath(name, revision) {
+        return '/backup/tasks/' + encodeURIComponent(name)
+            + (revision ? ('?expectedRevision=' + encodeURIComponent(revision)) : '');
+    }
+
+    /**
+     * cr3 (review L): a whole-task PUT's job outcome. A job the daemon FAILED
+     * with STATE_CHANGED (the unit moved between the route and the job) goes to
+     * the same prompt as the route's 409, not to the generic alert; every other
+     * failure, and a job lost to a restart or lost contact, alerts here exactly
+     * as ANAS.pollJob would (its own modals are switched off for this). A
+     * refusal by the route was already alerted by the submit and only
+     * re-enables. `reenable` (may be null) gives Save back on any failure.
+     */
+    function withTaskJobOutcome(opts, reenable, onStateChanged) {
+        var failTitle = opts.failTitle || 'Operation failed';
+        opts.alerts = false;
+        opts.onFailed = function (job) {
+            if (reenable) {
+                reenable();
+            }
+            if (!job) {
+                return;
+            }
+            var jerr = job.error || {};
+            if (jerr.code === 'STATE_CHANGED' && onStateChanged) {
+                onStateChanged(new Error('' + (jerr.message || t('the task changed'))));
+                return;
+            }
+            try {
+                Ext.Msg.alert(t(failTitle), enc('' + (jerr.message || t('unknown error'))));
+            } catch (e) {
+                ANAS.warn('' + (jerr.message || ''));
+            }
+        };
+        // cr3 (review 3): a job that ended `cancelled` gives Save back too;
+        // the toast is the one pollJob shows when a caller has no handler.
+        opts.onCancelled = function (job) {
+            if (reenable) {
+                reenable();
+            }
+            var why = job && job.result && job.result.reason;
+            ANAS.toast(t('Cancelled') + (why ? ': ' + why : ''));
+        };
+        opts.onLost = function (err) {
+            if (reenable) {
+                reenable();
+            }
+            var gone = !!(err && err.status === 404);
+            try {
+                Ext.Msg.alert(t(gone ? 'Job lost' : 'Lost contact'), enc(gone
+                    ? t('The node no longer knows this job (the ANAS daemon restarted). Check the task before retrying.')
+                    : t('Lost contact with the node while the save was running; it may still be running. Refresh to see the result.')));
+            } catch (e2) {
+                ANAS.warn(ANAS.errText(err));
+            }
+        };
+        return opts;
+    }
+
+    /** The `code` of a daemon error answer, or ''. */
+    function errCodeOf(err) {
+        var b = err && err.body;
+        return (b && b.error && typeof b.error.code === 'string') ? b.error.code : '';
+    }
+
+    /**
+     * cr3 (BACKUP-PANEL-M4): a whole-task PUT. Without a revision it is
+     * ANAS.runJob, unchanged. With one, it is the same submit-then-poll, except
+     * that a 409 STATE_CHANGED — the stored task moved since it was read — goes
+     * to `onStateChanged(err)` instead of the generic failure alert (runJob
+     * routes a 409 elsewhere only when it carries a confirm code).
+     */
+    function runTaskPut(opts, revision, onStateChanged) {
+        if (!revision) {
+            ANAS.runJob(opts);
+            return;
+        }
+        ANAS.api.put(opts.node, opts.path, opts.body).then(function (res) {
+            var job = res && res.job;
+            if (!job || !job.id) {
+                if (opts.onComplete) {
+                    opts.onComplete(null);
+                }
+                return;
+            }
+            if (opts.onSubmitted) {
+                try { opts.onSubmitted(job); } catch (eSub) { ANAS.warn('onSubmitted failed: ' + ANAS.errText(eSub)); }
+            }
+            ANAS.pollJob(opts.node, job.id, opts);
+        }, function (err) {
+            if (err && err.status === 409 && errCodeOf(err) === 'STATE_CHANGED' && onStateChanged) {
+                onStateChanged(err);
+                return;
+            }
+            // The daemon's own sentence, encoded, then the recovery — the
+            // ordering runJob's own refusal path keeps.
+            try {
+                Ext.Msg.alert(t(opts.failTitle || 'Operation failed'), enc(ANAS.errText(err)), function () {
+                    if (opts.onFailed) {
+                        opts.onFailed(null);
+                    }
+                });
+            } catch (eMsg) {
+                ANAS.warn(ANAS.errText(err));
+                if (opts.onFailed) {
+                    opts.onFailed(null);
+                }
+            }
+        });
+    }
+
+    /** The task object of a GET /backup/tasks/:name answer, or null when it is not that task. */
+    function storedTaskOf(res, name) {
+        var d = (res && res.data) || null;
+        var task = (d && d.task && typeof d.task === 'object') ? d.task : d;
+        if (!task || typeof task !== 'object' || task.name !== name || !isArray(task.archives)) {
+            return null;
+        }
+        return task;
+    }
+
+    function buildTaskWindow(view, node, isEdit, task, repoOpts, seedArchives, preset, onDone, revision) {
         var repoStore = Ext.create('Ext.data.Store', {
             fields: ['name', 'label'], data: repoOpts,
         });
@@ -3500,7 +3925,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-backup-task',
-                title: isEdit ? (t('Edit Backup Task') + ': ' + (task.name || '')) : t('New Backup Task'),
+                title: isEdit ? (t('Edit Backup Task') + ': ' + enc(task.name || '')) : t('New Backup Task'),
                 modal: true,
                 width: 620,
                 height: 640,
@@ -3563,6 +3988,14 @@
                                     var g = win.down('#kindGroup');
                                     var v = g && g.getValue ? g.getValue() : null;
                                     win.anasTaskKind = (v && v.taskKind) || 'files';
+                                    if (win.anasTaskKind === 'files') {
+                                        restoreFilesBackupId(win, node);
+                                    } else {
+                                        // The mirror of L6: back on Block with
+                                        // a LUN still picked, the id is the
+                                        // LUN's again.
+                                        syncBlockIdValue(win);
+                                    }
                                     syncTaskKind(win);
                                 },
                             },
@@ -3575,6 +4008,7 @@
                             store: repoStore,
                             valueField: 'name',
                             displayField: 'label',
+                            listConfig: encodedList(),
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -3599,12 +4033,15 @@
                             value: defaultId,
                             emptyText: isEdit ? '' : (String(node || '').toLowerCase().split('.')[0] + '-<task name>'),
                             listeners: {
-                                change: function () {
+                                change: function (f, v) {
                                     // A value the operator typed is theirs; a
                                     // value set by the name tracking or the
                                     // block pick is not a choice.
                                     if (win && !win.anasIdSetting && win.anasTaskKind !== 'block') {
                                         win.anasIdManual = true;
+                                        // cr3 (BACKUP-PANEL-L6): remembered,
+                                        // so a block detour hands it back.
+                                        win.anasIdTyped = '' + (v == null ? '' : v);
                                     }
                                 },
                             },
@@ -3840,7 +4277,12 @@
                         text: isEdit ? t('Save') : t('Create'),
                         itemId: 'taskSubmitBtn',
                         cls: 'anas-btn-backup-task-submit',
-                        handler: function () {
+                        handler: function (btn) {
+                            // cr3 (review L): a save already in flight owns
+                            // the button — never a second PUT on the same read.
+                            if (btn && btn.disabled) {
+                                return;
+                            }
                             try {
                                 submitTask(win, view, node, isEdit, task, onDone);
                             } catch (e) {
@@ -3880,6 +4322,13 @@
         // backup2.9 — the kind state the panels and the save read. `win` must
         // exist before any of the syncs below (they look fields up off it).
         win.anasNode = node;
+        // cr3 (BACKUP-PANEL-M4): the revision this edit was read at ('' = none known).
+        win.anasRevision = revision || '';
+        win.anasTaskView = view;
+        win.anasOnDone = onDone;
+        // The stored task this dialog edits (null on create) — the Preview's
+        // namespace follows the Save's rule against it.
+        win.anasEditTask = isEdit ? task : null;
         win.anasTaskKind = initialKind;
         win.anasKindChoosable = kindChoosable;
         win.anasBlockNewId = !isEdit; // new: the id derives from the pick
@@ -3894,9 +4343,13 @@
         if (cont && initialKind === 'files') {
             var seed = archivesOf(task);
             if (!seed.length && !isEdit) {
+                // cr3 (BACKUP-PANEL-L9): the suggested row carries NO name —
+                // it is a new row like any other, so its name derives from
+                // the path (`etc` for /etc) and follows a retyped path. A
+                // seeded name would be a STORED name, never re-derived.
                 seed = (seedArchives && seedArchives.length)
                     ? seedArchives
-                    : [{ name: 'etc', path: '/etc', excludes: [] }];
+                    : [{ name: '', path: '/etc', excludes: [] }];
             }
             if (!seed.length) {
                 seed = [{ name: '', path: '', excludes: [] }];
@@ -3944,6 +4397,31 @@
             renderBlockLun(win);
         }
         syncTaskKind(win);
+    }
+
+    /** A task's STORED namespace: a string ('' included — the datastore root, stated) or undefined. */
+    function storedNamespaceOf(task) {
+        return (task && typeof task.namespace === 'string') ? task.namespace : undefined;
+    }
+
+    /**
+     * cr3: the namespace a task body carries, for the Save AND the retention
+     * Preview (one rule, so the preview names what the save will store).
+     * `field` is the trimmed field. A typed value is sent; on an EDIT a blank
+     * field sends back a stored '' as '' (untouched), and a stored value whose
+     * field was cleared as `null` (the keep-what-is-omitted PUT); a blank field
+     * over no stored namespace — and every blank on a create — is omitted.
+     * Never a truthiness test on the stored value: '' is a value.
+     */
+    function taskNamespaceForBody(field, isEdit, task) {
+        if (field) {
+            return { send: true, value: field };
+        }
+        var stored = isEdit ? storedNamespaceOf(task) : undefined;
+        if (stored === undefined) {
+            return { send: false, value: undefined };
+        }
+        return { send: true, value: stored === '' ? '' : null };
     }
 
     // `task` is the task being edited (empty on create): the source for every
@@ -4062,15 +4540,28 @@
             body.kind = task.kind;
         } else if (!isEdit && taskKind === 'block') {
             body.kind = 'block';
+        } else if (taskKind === 'files' && taskKindOf({ archives: archives }).kind === 'block') {
+            // cr3 (BACKUP-PANEL-M2): a FILES-panel task whose archives are
+            // exactly one image would otherwise DERIVE as a block task — and
+            // open in the block panel, which offers LUNs only. The kind it
+            // was built as is stored instead, so stored and derived never
+            // diverge silently (the shared schema's own rule).
+            body.kind = 'files';
         }
-        if (namespace) {
-            body.namespace = namespace;
+        var nsBody = taskNamespaceForBody(namespace, isEdit, task);
+        if (nsBody.send) {
+            body.namespace = nsBody.value;
         }
         // Retention rides the task config (16.11). All-blank = omitted entirely:
         // no policy stored, and ANAS never prunes.
         var retention = readRetention(win);
         if (hasKeeps(retention)) {
             body.retention = retention;
+        } else if (isEdit && hasKeeps(retentionOf(task))) {
+            // cr3 (the daemon's keep-what-is-omitted PUT): every keep field
+            // blanked on an edit is "stop pruning", said explicitly — an
+            // omitted retention would be KEPT and the backups pruned still.
+            body.retention = null;
         }
         // No dialog control for LimitNOFILE — carry the task's own value through
         // the save so an edit never resets a hand-raised limit to the default.
@@ -4079,11 +4570,23 @@
             body.limitNofile = limitNofile;
         }
 
-        var proceed = function () {
-            ANAS.runJob({
+        var proceed = function (reenable) {
+            // cr3 (review 3): a submit that THROWS (before any request left)
+            // gives Save back and says why — never a button dead forever.
+            try {
+                submitTaskJob(reenable);
+            } catch (eSubmit) {
+                if (reenable) {
+                    reenable();
+                }
+                ANAS.alertMsg(isEdit ? 'Save failed' : 'Create failed', ANAS.errText(eSubmit));
+            }
+        };
+        var submitTaskJob = function (reenable) {
+            runTaskPut(withTaskJobOutcome({
                 node: node,
                 method: isEdit ? 'put' : 'post',
-                path: isEdit ? ('/backup/tasks/' + encodeURIComponent(name)) : '/backup/tasks',
+                path: isEdit ? taskPutPath(name, win.anasRevision) : '/backup/tasks',
                 body: body,
                 view: win,
                 failTitle: isEdit ? 'Save failed' : 'Create failed',
@@ -4106,6 +4609,13 @@
                         }
                     }
                 },
+            }, reenable, function (err) {
+                taskChangedSinceOpened(win, view, node, task, onDone, err);
+            }), isEdit ? win.anasRevision : '', function (err) {
+                if (reenable) {
+                    reenable();
+                }
+                taskChangedSinceOpened(win, view, node, task, onDone, err);
             });
         };
 
@@ -4132,9 +4642,15 @@
         return ANAS.api.post(node, '/backup/repos/test', { name: repository, namespace: ns }).then(
             function (res) {
                 var d = (res && res.data) || {};
-                var stage = '' + (first(d.stage, d.verdict) || 'ok');
+                // cr3 (INVENTED-STATE-L14): an answer with no stage verified
+                // NOTHING — it is never read as 'ok'.
+                var stage = '' + (first(d.stage, d.verdict) || '');
                 if (stage === 'ok') {
                     return null;
+                }
+                if (!stage) {
+                    return t('Could not verify the namespace') + ' — '
+                        + t('the repository test reported no result') + '.';
                 }
                 if (stage === 'namespace') {
                     return t('The namespace') + ' "' + enc(ns) + '" '
@@ -4153,12 +4669,15 @@
     }
 
     // Browse each distinct archive path and collect the ones that do not exist on
-    // this node. Returns a Promise<string[]> (sorted); never rejects. Each browse
-    // is independently fail-open — a browse error skips that path silently (a
-    // broken validation must never block a save).
+    // this node. Returns a Promise<{missing, unchecked}> (both sorted); never
+    // rejects. Each browse is independently fail-open — a broken validation
+    // never blocks a save — but never SILENT (cr3): a path whose browse failed,
+    // or whose answer said neither yes nor no, is listed as not checked, with
+    // the reason, in the same confirm.
     function missingPathWarnings(node, archives) {
         var checks = [];
         var missing = [];
+        var unchecked = [];
         var seen = {};
         for (var i = 0; i < archives.length; i++) {
             var p = trim(archives[i] && archives[i].path);
@@ -4172,18 +4691,22 @@
                         var d = (res && res.data) || {};
                         if (d.exists === false) {
                             missing.push(path);
+                        } else if (d.exists !== true) {
+                            unchecked.push(path + ' (' + t('the node did not say whether it exists') + ')');
                         }
                     },
-                    function () { /* fail-open: skip this path */ }
+                    function (err) {
+                        unchecked.push(path + ' (' + (ANAS.errText(err) || t('unknown error')) + ')');
+                    }
                 ));
             }(p));
         }
-        return Promise.all(checks).then(function () {
+        var result = function () {
             missing.sort();
-            return missing;
-        }, function () {
-            return missing;
-        });
+            unchecked.sort();
+            return { missing: missing, unchecked: unchecked };
+        };
+        return Promise.all(checks).then(result, result);
     }
 
     // Run both checks in parallel, then either save or raise ONE combined confirm
@@ -4206,10 +4729,14 @@
                 return;
             }
             var nsWarn = results[0];
-            var missing = results[1] || [];
-            if (!nsWarn && !missing.length) {
-                reenable();
-                proceed();
+            var paths = results[1] || {};
+            var missing = paths.missing || [];
+            var unchecked = paths.unchecked || [];
+            // cr3 (review L): Save stays DISABLED from the press until the
+            // job ends — a second press would send a second PUT bound to the
+            // same read. `proceed` re-enables it when the save fails.
+            if (!nsWarn && !missing.length && !unchecked.length) {
+                proceed(reenable);
                 return;
             }
             var parts = [];
@@ -4224,24 +4751,34 @@
                 parts.push(t('These paths do not exist on this node:')
                     + '<div style="margin-top:4px;">' + list + '</div>');
             }
+            if (unchecked.length) {
+                var ulist = '';
+                for (var u = 0; u < unchecked.length; u++) {
+                    ulist += '<div style="font-family:monospace;">' + enc(unchecked[u]) + '</div>';
+                }
+                parts.push(t('These paths could not be checked:')
+                    + '<div style="margin-top:4px;">' + ulist + '</div>');
+            }
             var msg = parts.join('<br><br>') + '<br><br>' + t('Create the task anyway?');
-            reenable();
             try {
                 Ext.Msg.confirm(t('Verify before saving'), msg, function (b) {
-                    if (b === 'yes') { proceed(); }
+                    if (b === 'yes') {
+                        proceed(reenable);
+                    } else {
+                        reenable();
+                    }
                 });
             } catch (eMsg) {
                 // If the confirm dialog itself fails, do not block the save.
                 ANAS.warn('backup save-verify confirm failed: ' + ANAS.errText(eMsg));
-                proceed();
+                proceed(reenable);
             }
         }, function () {
             // The whole verification chain broke — fail-open, save anyway.
             if (win.destroyed || win.destroying) {
                 return;
             }
-            reenable();
-            proceed();
+            proceed(reenable);
         });
     }
 
@@ -4367,16 +4904,44 @@
             return;
         }
         var name = rec.get('name');
-        var raw = rec.get('raw') || taskFromRecord(rec);
+        // The operator's intent, from the row they pressed on.
         var next = !rec.get('enabled');
+        // cr3 (BACKUP-PANEL-M4): the toggle is a WHOLE-task PUT, so it is
+        // built from the stored task, read now — the grid's row can be a whole
+        // edit behind. There is no screen between the click and the PUT to
+        // warn on, so a read that failed sends NOTHING and says why.
+        ANAS.api.get(node, '/backup/tasks/' + encodeURIComponent(name)).then(function (res) {
+            var fresh = storedTaskOf(res, name);
+            if (!fresh) {
+                ANAS.alertMsg('Update failed', t('Could not re-read the backup task before changing it') + ' ("'
+                    + name + '"): ' + t('the node answered without the task. Nothing was changed.'));
+                return;
+            }
+            putToggle(view, node, name, fresh, next, revisionOf(res));
+        }, function (err) {
+            if (err && err.status === 404) {
+                ANAS.alertMsg('Update failed', t('The backup task') + ' "' + name + '" '
+                    + t('no longer exists on this node. Nothing was changed.'));
+                loadTasks(view, node);
+                return;
+            }
+            ANAS.alertMsg('Update failed', t('Could not re-read the backup task before changing it') + ' ("'
+                + name + '"): ' + ANAS.errText(err) + '. ' + t('Nothing was changed.'));
+        });
+    }
+
+    // cr3 (BACKUP-PANEL-M4): `raw` IS the stored task, read just now — no
+    // field falls back to the grid's row (a row value would re-instate what
+    // another admin cleared since the last poll).
+    function putToggle(view, node, name, raw, next, revision) {
         var body = {
             name: name,
-            repository: repoNameOf(raw) || rec.get('repository'),
-            backupId: backupIdOf(raw) || rec.get('backupId'),
+            repository: repoNameOf(raw),
+            backupId: backupIdOf(raw),
             archives: archivesOf(raw),
             mode: modeOf(raw),
             changeDetectionMode: modeOf(raw),
-            schedule: raw.schedule || rec.get('schedule'),
+            schedule: raw.schedule,
             // backup2.9 — the stored kind rides the whole-task PUT verbatim,
             // for the same reason the dialog sends it: a derived-block task
             // must not start claiming `block` on a toggle (its id and group
@@ -4387,9 +4952,9 @@
             notify: notifyOf(raw),
             enabled: next,
         };
-        var ns = first(raw.namespace, rec.get('namespace'));
-        if (ns) {
-            body.namespace = ns;
+        // Exactly as stored — a stored '' included (review 3).
+        if (typeof raw.namespace === 'string') {
+            body.namespace = raw.namespace;
         }
         // Carry the retention policy through an enable/disable — a toggle must
         // never silently drop it (the PUT rewrites the whole task).
@@ -4411,10 +4976,10 @@
         if (lim !== undefined) {
             body.limitNofile = lim;
         }
-        ANAS.runJob({
+        runTaskPut(withTaskJobOutcome({
             node: node,
             method: 'put',
-            path: '/backup/tasks/' + encodeURIComponent(name),
+            path: taskPutPath(name, revision),
             body: body,
             view: gridOf(view),
             failTitle: 'Update failed',
@@ -4422,7 +4987,30 @@
             onComplete: function () {
                 loadTasks(view, node);
             },
+        }, null, function (err) {
+            toggleChanged(view, node, err);
+        }), revision, function (err) {
+            toggleChanged(view, node, err);
         });
+    }
+
+    /** The toggle's STATE_CHANGED, whether the route or the job refused it. */
+    function toggleChanged(view, node, err) {
+        // The task moved between the read and the PUT: nothing changed;
+        // offer the fresh list.
+        try {
+            Ext.Msg.confirm(t('Task changed'),
+                enc(t('This backup task was changed (another session or another admin) just now, so it '
+                    + 'was not enabled or disabled.')) + '<br><br>' + enc(ANAS.errText(err)) + '<br><br>'
+                    + enc(t('Reload the task list?')),
+                function (b) {
+                    if (b === 'yes') {
+                        loadTasks(view, node);
+                    }
+                });
+        } catch (e) {
+            ANAS.warn('backup task changed: ' + ANAS.errText(err));
+        }
     }
 
     // ---- Delete (removes the units only; PBS data untouched) ---------------
@@ -4509,8 +5097,12 @@
         var type = ('' + (rec.get('authType') || 'token')).toLowerCase();
         var identity = type === 'token' ? rec.get('tokenId') : rec.get('username');
         var typeLabel = type === 'token' ? t('API token') : t('User/password');
-        var credOk = rec.get('credentialsSet') === true;
-        var credChip = credOk
+        var credState = rec.get('credentialsSet');
+        var credOk = credState === true;
+        var credChip = credState === null
+            ? '<span style="color:var(--anas-muted,gray);" title="'
+                + enc(t('unknown — a secret file is there but could not be read')) + '"><i class="fa fa-question-circle"></i></span>'
+            : credOk
             ? '<span style="color:var(--anas-ok,#1f9c56);" title="' + enc(t('a secret is stored')) + '">'
                 + '<i class="fa fa-key"></i></span>'
             : '<span style="color:var(--anas-warn,#b06a12);" title="'
@@ -4530,7 +5122,7 @@
             + enc(fpShort(fp)) + '</span>';
     }
 
-    function repoTestChip(stage) {
+    function repoTestChip(stage, detail) {
         stage = '' + (stage || '');
         if (!stage) {
             return '<span style="color:gray;">&mdash;</span>';
@@ -4538,16 +5130,22 @@
         var good = stage === 'ok';
         var color = good ? 'var(--anas-ok,#1f9c56)'
             : (stage === 'tls-fingerprint' || stage === 'datastore' || stage === 'namespace'
+                || stage === REPO_TEST_NO_RESULT
                 ? 'var(--anas-warn,#b06a12)' : 'var(--anas-danger,#c23b2c)');
-        var label = good ? t('ok') : stage;
-        return '<span title="' + enc(label) + '"'
+        // cr3 (BACKUP-PANEL-L8 / INVENTED-STATE-L14): the two states that are
+        // NOT a stage of the test say so in words, the reason in the tooltip.
+        var label = good ? t('ok')
+            : (stage === REPO_TEST_ERROR ? t('could not test')
+                : (stage === REPO_TEST_NO_RESULT ? t('no result') : stage));
+        var tip = label + (detail ? (': ' + detail) : '');
+        return '<span title="' + enc(tip) + '"'
             + ' style="display:inline-block;padding:1px 8px;border-radius:9px;font-size:0.82em;'
             + 'color:' + color + ';background:color-mix(in srgb,' + color + ' 15%,transparent);">'
             + enc(label) + '</span>';
     }
 
     function renderRepoTestChip(v, meta, rec) {
-        return repoTestChip(rec.get('testStage'));
+        return repoTestChip(rec.get('testStage'), rec.get('testDetail'));
     }
 
     // Name cell: the repo name, with a PVE badge for a tier-1 (hands-off) repo.
@@ -4605,12 +5203,26 @@
             }
             var env = reposEnvelope(res);
             win._registryVersion = env.version;
+            var pveNote = win.down('#reposPveNote');
+            if (pveNote) {
+                try {
+                    pveNote.update(env.pveUnavailable
+                        ? '<div style="font-size:12px;color:var(--anas-warn,#b06a12);">'
+                            + '<i class="fa fa-exclamation-triangle" style="margin-right:6px;"></i>'
+                            + enc(t('Repositories defined in Datacenter → Storage are not listed') + ': '
+                                + env.pveUnavailable) + '</div>'
+                        : '');
+                    pveNote.setHidden(!env.pveUnavailable);
+                } catch (ePve) {
+                    // non-fatal
+                }
+            }
             // Preserve per-row test results across a reload by name.
             var prev = {};
             try {
                 grid.getStore().each(function (r) {
                     if (r.get('testStage')) {
-                        prev[r.get('name')] = r.get('testStage');
+                        prev[r.get('name')] = { stage: r.get('testStage'), detail: r.get('testDetail') || '' };
                     }
                 });
             } catch (ePrev) {
@@ -4620,7 +5232,8 @@
             for (var i = 0; i < env.repos.length; i++) {
                 var row = repoRow(env.repos[i]);
                 if (prev[row.name]) {
-                    row.testStage = prev[row.name];
+                    row.testStage = prev[row.name].stage;
+                    row.testDetail = prev[row.name].detail;
                 }
                 rows.push(row);
             }
@@ -4629,6 +5242,7 @@
             } catch (eLoad) {
                 ANAS.warn('backup repos grid load failed: ' + ANAS.errText(eLoad));
             }
+            setGridEmptyText(grid, t(REPOS_EMPTY_TEXT));
             updateRepoButtons(grid);
         }, function (err) {
             if (win.destroyed || win.destroying) {
@@ -4638,6 +5252,8 @@
                 try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
             }
             ANAS.warn('backup repos load failed: ' + ANAS.errText(err));
+            // cr3: an unread registry never reads "No repositories registered".
+            setGridEmptyText(grid, t('The repositories could not be read') + ': ' + ANAS.errText(err));
             ANAS.alertMsg('Load failed', t('Failed to load the repositories registry') + ': ' + ANAS.errText(err));
         });
     }
@@ -4656,7 +5272,9 @@
                     return;
                 }
                 var d = (res && res.data) || {};
-                rec.set('testStage', '' + (first(d.stage, d.verdict) || 'ok'));
+                // cr3 (INVENTED-STATE-L14): no stage = no result, never 'ok'.
+                rec.set('testDetail', '');
+                rec.set('testStage', '' + (first(d.stage, d.verdict) || REPO_TEST_NO_RESULT));
             },
             function (err) {
                 try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
@@ -4664,7 +5282,11 @@
                     return;
                 }
                 ANAS.warn('backup repo test failed: ' + ANAS.errText(err));
-                rec.set('testStage', 'tcp');
+                // cr3 (BACKUP-PANEL-L8): the REQUEST failed (a 400, 403, 404,
+                // 500 or no answer) — the test never ran, so no stage of it is
+                // claimed; the reason rides the chip.
+                rec.set('testDetail', ANAS.errText(err) || t('unknown error'));
+                rec.set('testStage', REPO_TEST_ERROR);
             }
         );
     }
@@ -4716,7 +5338,7 @@
             fields: ['name', 'host', 'port', 'datastore', 'namespace', 'authType',
                 'tokenId', 'username', 'fingerprint', 'source',
                 { name: 'credentialsSet', type: 'auto' },
-                'testStage', { name: 'raw', type: 'auto' }],
+                'testStage', 'testDetail', { name: 'raw', type: 'auto' }],
             data: [],
             sorters: [{ property: 'name', direction: 'ASC' }],
         });
@@ -4730,15 +5352,26 @@
                 width: 760,
                 height: 460,
                 resizable: true,
-                layout: 'fit',
+                layout: { type: 'vbox', align: 'stretch' },
                 items: [{
+                    // cr3: the repositories list's `pveUnavailable` sentence —
+                    // storage.cfg could not be read, so PVE-defined repositories
+                    // are missing below.
+                    xtype: 'component',
+                    itemId: 'reposPveNote',
+                    cls: 'anas-backup-repos-pve-note',
+                    hidden: true,
+                    padding: '6 8',
+                    html: '',
+                }, {
                     xtype: 'gridpanel',
                     itemId: 'reposGrid',
+                    flex: 1,
                     cls: 'anas-grid-backup-repos',
                     border: false,
                     store: store,
                     selModel: { mode: 'SINGLE' },
-                    emptyText: t('No repositories registered'),
+                    emptyText: t(REPOS_EMPTY_TEXT),
                     columns: [
                         { text: t('Name'), dataIndex: 'name', width: 160, renderer: renderRepoName },
                         { text: t('Host:Port'), dataIndex: 'host', width: 190,
@@ -4827,8 +5460,17 @@
     //  Add / edit repository dialog — 'anas-win-backup-repo-edit'
     // ======================================================================
 
+    // cr3 (BACKUP-PANEL-L8 / INVENTED-STATE-L14): the two outcomes that are
+    // NOT a diagnosis — the test request itself failed (it never ran), or the
+    // answer named no stage (nothing was verified). Neither is a stage name
+    // the daemon sends.
+    var REPO_TEST_ERROR = 'test-error';
+    var REPO_TEST_NO_RESULT = 'no-result';
+
     // Distinct test verdicts (the diagnosis, not just pass/fail).
     var REPO_VERDICT = {
+        'test-error': { level: 'bad', msg: 'Could not run the test' },
+        'no-result': { level: 'warn', msg: 'The test did not report a result — nothing was verified.' },
         ok: { level: 'ok', msg: 'Reachable, authenticated, datastore and namespace verified — you can save.' },
         dns: { level: 'bad', msg: 'DNS — the hostname does not resolve.' },
         tcp: { level: 'bad', msg: 'TCP — cannot reach the host on that port (is PBS listening?).' },
@@ -4897,11 +5539,15 @@
             return;
         }
         data = data || {};
-        var stage = '' + (first(data.stage, data.verdict) || 'tcp');
+        // cr3 (INVENTED-STATE-L14): an answer with no stage is "no result",
+        // never a TCP failure nor a pass.
+        var stage = '' + (first(data.stage, data.verdict) || REPO_TEST_NO_RESULT);
         var spec = REPO_VERDICT[stage] || { level: 'warn', msg: stage };
         var color = spec.level === 'bad' ? 'var(--anas-danger,#c23b2c)'
             : spec.level === 'warn' ? 'var(--anas-warn,#b06a12)' : 'var(--anas-ok,#1f9c56)';
-        var text = t(spec.msg) + (data.detail ? (' — ' + data.detail) : '');
+        var text = t(spec.msg) + (data.detail
+            ? ((stage === REPO_TEST_ERROR ? ': ' : ' — ') + data.detail)
+            : '');
         var items = [];
         if (ANAS.gfx && gfxReady() && typeof ANAS.gfx.callout === 'function') {
             items.push({ xtype: 'component', html: ANAS.gfx.callout(enc(text), { level: spec.level }) });
@@ -4942,6 +5588,43 @@
         }
     }
 
+    /**
+     * cr3 (BACKUP-PANEL-L7): on an EDIT a blank secret means "keep the stored
+     * one" — which is only true while the secret still means what it meant.
+     * Switch token ↔ password, or name another token or user, and the stored
+     * secret belongs to the OLD identity: the daemon would keep it (save) or
+     * use it (Test) under the new one. Returns the sentence asking for the new
+     * secret, or '' when blank still means kept.
+     */
+    function secretNeededFor(win, repo) {
+        var stored = win.anasStoredRepo;
+        if (!stored || repo.secret) {
+            return '';
+        }
+        var storedAuth = ('' + (first(stored.authType, stored.auth) || 'token')).toLowerCase();
+        var storedId = repo.authType === 'token'
+            ? trim(first(stored.tokenId, stored.tokenid) || '')
+            : trim(first(stored.username, stored.user) || '');
+        var newId = repo.authType === 'token' ? (repo.tokenId || '') : (repo.username || '');
+        // cr3 (the daemon's R3): WHERE the secret is sent is part of it too — a
+        // moved host or port with a blank secret would send the stored one to
+        // the new server.
+        var storedHost = trim(stored.host || '');
+        var storedPort = Number(stored.port || PBS_PORT);
+        var moved = repo.host !== storedHost || Number(repo.port) !== storedPort;
+        if (moved) {
+            return repo.authType === 'token'
+                ? t('Enter the token secret: the stored secret is sent only to the server it was saved for, and the host or port changed.')
+                : t('Enter the password: the stored secret is sent only to the server it was saved for, and the host or port changed.');
+        }
+        if (repo.authType === storedAuth && newId === storedId) {
+            return '';
+        }
+        return repo.authType === 'token'
+            ? t('Enter the token secret: the stored secret belongs to the previous identity, so it cannot be kept for this token.')
+            : t('Enter the password: the stored secret belongs to the previous identity, so it cannot be kept for this user.');
+    }
+
     function runRepoTest(win, node) {
         var host = trim(valOf(win, '#host'));
         var datastore = trim(valOf(win, '#datastore'));
@@ -4950,6 +5633,24 @@
             return;
         }
         var area = win.down('#testResult');
+        var testBody = repoBodyFromDialog(win);
+        var needed = secretNeededFor(win, testBody);
+        if (needed) {
+            // Nothing is sent: the daemon would test the OLD secret under the
+            // new identity and report its auth verdict as this one's.
+            try {
+                if (area) {
+                    area.removeAll();
+                    area.add({
+                        xtype: 'component',
+                        html: '<span style="color:var(--anas-warn,#b06a12);">' + enc(needed) + '</span>',
+                    });
+                }
+            } catch (eN) {
+                // non-fatal
+            }
+            return;
+        }
         if (area) {
             try {
                 area.removeAll();
@@ -4963,7 +5664,7 @@
                 // non-fatal
             }
         }
-        ANAS.api.post(node, '/backup/repos/test', repoBodyFromDialog(win)).then(function (res) {
+        ANAS.api.post(node, '/backup/repos/test', testBody).then(function (res) {
             if (win.destroyed || win.destroying) {
                 return;
             }
@@ -4973,7 +5674,8 @@
                 return;
             }
             ANAS.warn('backup repo test failed: ' + ANAS.errText(err));
-            renderRepoTestResult(win, node, { stage: 'tcp', detail: ANAS.errText(err) });
+            // cr3 (BACKUP-PANEL-L8): the request failed — the test never ran.
+            renderRepoTestResult(win, node, { stage: REPO_TEST_ERROR, detail: ANAS.errText(err) || t('unknown error') });
         });
     }
 
@@ -4986,7 +5688,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-backup-repo-edit',
-                title: isEdit ? (t('Edit Repository') + ': ' + (r.name || '')) : t('Add Repository'),
+                title: isEdit ? (t('Edit Repository') + ': ' + enc(r.name || '')) : t('Add Repository'),
                 modal: true,
                 width: 520,
                 height: 640,
@@ -5204,6 +5906,8 @@
             ANAS.warn('backup repo edit window failed: ' + ANAS.errText(e));
             return;
         }
+        // cr3 (BACKUP-PANEL-L7): the identity the stored secret belongs to.
+        win.anasStoredRepo = isEdit ? r : null;
         win.show();
         applyAuthType(win, authType);
     }
@@ -5232,6 +5936,12 @@
         if (!isEdit && !repo.secret) {
             ANAS.alertMsg('Invalid input', repo.authType === 'token'
                 ? t('Enter the token secret.') : t('Enter the password.'));
+            return;
+        }
+        // And on an edit that changed the auth style or the identity.
+        var needed = secretNeededFor(win, repo);
+        if (needed) {
+            ANAS.alertMsg('Invalid input', needed);
             return;
         }
         var expectedVersion = mgrWin && mgrWin._registryVersion !== undefined
@@ -5500,6 +6210,16 @@
             border: false,
             items: [
                 {
+                    // cr3: the task list's read state — shown only while the
+                    // last read of GET /backup/tasks failed.
+                    xtype: 'component',
+                    itemId: 'backupLoadNote',
+                    cls: 'anas-backup-load-note',
+                    hidden: true,
+                    padding: '4 8',
+                    html: '',
+                },
+                {
                     xtype: 'gridpanel',
                     itemId: 'backupGrid',
                     cls: 'anas-grid-backup',
@@ -5507,7 +6227,7 @@
                     border: false,
                     store: store,
                     selModel: { mode: 'SINGLE' },
-                    emptyText: t('No backup tasks defined'),
+                    emptyText: t(TASKS_EMPTY_TEXT),
                     columns: [
                         {
                             text: t('Name'), dataIndex: 'name', width: 150,
@@ -5769,7 +6489,12 @@
             target: { mode: mode },
             options: {},
         };
-        if (trim(c.ns)) {
+        // cr3 (the daemon's review): a door opened FROM A TASK sends the
+        // task's STORED namespace exactly ('' — the datastore root — is a
+        // value, never dropped for the repository's own).
+        if (trim(c.task) && typeof c.taskNs === 'string') {
+            body.ns = c.taskNs;
+        } else if (trim(c.ns)) {
             body.ns = trim(c.ns);
         }
         if (trim(c.task)) {
@@ -5831,9 +6556,16 @@
         } else if (c.lun) {
             body.lun = { targetIqn: c.lun.targetIqn, index: c.lun.index };
         }
+        // cr3 (the daemon's review): opened FROM A TASK, the image body names
+        // the task and carries its stored namespace exactly ('' included).
+        if (trim(c.task)) {
+            body.task = trim(c.task);
+        }
         // `ns` stays LAST, exactly where backup2.7's dialog put it — the bodies
         // are byte-identical to the pre-unification shapes, key order included.
-        if (trim(c.ns)) {
+        if (trim(c.task) && typeof c.taskNs === 'string') {
+            body.ns = c.taskNs;
+        } else if (trim(c.ns)) {
             body.ns = trim(c.ns);
         }
         if (trim(c.rate)) {
@@ -5874,17 +6606,82 @@
         return 'newLocation';
     }
 
+    /**
+     * cr3 (BACKUP-PANEL-M1, review 3): the source a value of the restore
+     * dialog belongs to — repository, namespace, group (the picked point in
+     * time's own, else the source field's), archive, and the LUN of the LUN
+     * door. The original-location field is STAMPED with it whenever it gets a
+     * value (filled from the task or typed), and it counts only while the stamp
+     * is the current source.
+     */
+    function restoreSourceKey(win) {
+        var snap = trim(valOf(win, '#restoreSnapshot'));
+        var m = /^([^/]+\/[^/]+)\//.exec(snap);
+        var lun = win._prefillLun ? (('' + (win._prefillLun.targetIqn || '')) + '#' + win._prefillLun.index) : '';
+        return JSON.stringify([
+            trim(valOf(win, '#restoreRepo')),
+            trim(valOf(win, '#restoreNs')),
+            m ? m[1] : ('' + (win._group || '')),
+            trim(valOf(win, '#restoreArchive')),
+            lun,
+        ]);
+    }
+
+    /** The original location — only while it was set for the CURRENT source; else ''. */
+    function stampedHome(win) {
+        var home = trim(valOf(win, '#restoreHome'));
+        if (!home || !win._homeStamp || win._homeStamp !== restoreSourceKey(win)) {
+            return '';
+        }
+        return home;
+    }
+
+    /**
+     * A home stamped for another source is dropped: the field empties, the
+     * destination goes back to "somewhere else". True when it dropped one.
+     */
+    function dropStaleHome(win) {
+        var home = trim(valOf(win, '#restoreHome'));
+        if (!home || stampedHome(win)) {
+            return false;
+        }
+        win._homeStamp = '';
+        try {
+            var f = win.down('#restoreHome');
+            if (f) {
+                f.setValue('');
+            }
+        } catch (eH) {
+            // non-fatal
+        }
+        var tk = win.down('#restoreTargetKind');
+        if (tk) {
+            try { tk.setValue({ restoreTarget: 'newLocation' }); } catch (eTk) { /* non-fatal */ }
+        }
+        return true;
+    }
+
     /** The dialog's live context — every field read by itemId, never mirrored. */
     function restoreContext(win) {
         return {
             repo: trim(valOf(win, '#restoreRepo')),
             ns: trim(valOf(win, '#restoreNs')),
-            task: win._task || '',
+            // cr3 (BACKUP-PANEL-M1, review 2): the task rides the body only
+            // while the source is the task's own. The daemon fills an empty
+            // in-place path from the task's archive of the same name — after
+            // "Change source" that is ANOTHER source's archive.
+            task: restoreSourceIsDoors(win) ? (win._task || '') : '',
+            // The task's STORED namespace (a string, '' included, or undefined).
+            taskNs: restoreSourceIsDoors(win) && win._task ? storedNamespaceOf(win._taskObj) : undefined,
             snapshot: trim(valOf(win, '#restoreSnapshot')),
             archive: trim(valOf(win, '#restoreArchive')),
+            // cr3 (BACKUP-PANEL-M1, review 3): the original location counts
+            // only while its STAMP is the current source — evaluated here, as
+            // the body is built, so no handler ordering can leave a stale home
+            // sendable.
             selections: isArray(win._selections) ? win._selections : [],
             mode: restoreTargetMode(win),
-            home: trim(valOf(win, '#restoreHome')),
+            home: stampedHome(win),
             newPath: trim(valOf(win, '#restoreNewLocation')),
             ignoreOwnership: valOf(win, '#restoreIgnoreOwnership') === true,
             ignoreAcls: valOf(win, '#restoreIgnoreAcls') === true,
@@ -5911,8 +6708,31 @@
 
     /** Repaint the target line, the estimate and the selection summary. */
     function refreshRestore(win) {
+        dropStaleHome(win);
         var ctx = restoreContext(win);
         var rows = isArray(win._selectionRows) ? win._selectionRows : [];
+
+        // cr3 (BACKUP-PANEL-M1, review 2): "Into the original" is offered only
+        // while the original location is KNOWN — the task's home for its own
+        // source, or a Source directory the operator typed. Another source's
+        // original location is not known here, and an in-place restore is never
+        // sent with an empty path.
+        var originalKnown = !!ctx.home;
+        var ipRadio = radioOf(win.down('#restoreTargetKind'), 'inPlace');
+        if (ipRadio) {
+            try { ipRadio.setDisabled(!originalKnown); } catch (eIp) { /* non-fatal */ }
+        }
+        if (!originalKnown && ctx.mode === 'inPlace') {
+            try {
+                win.down('#restoreTargetKind').setValue({ restoreTarget: 'newLocation' });
+            } catch (eTk) {
+                // non-fatal
+            }
+            ctx = restoreContext(win);
+        }
+        restoreNote(win, 'restoreOriginalNote', originalKnown ? '' : mutedSpan(
+            t('Into the original needs the original directory of this archive. It is known for the task\'s own '
+                + 'source only; for another source, type it in Source directory or restore somewhere else.')));
 
         var selectionHtml;
         if (!ctx.selections.length) {
@@ -6017,6 +6837,14 @@
                 + enc(t('This snapshot has') + ' ' + data.length + ' '
                     + t('archives — pick one; the restore follows its kind.')) + '</span>');
         } else {
+            // cr3 (BACKUP-PANEL-M1, review 3): nothing to choose means nothing
+            // chosen — a same-named archive on the next source is a NEW pick.
+            try {
+                combo.setValue('');
+            } catch (e4) {
+                // non-fatal
+            }
+            win._archiveName = '';
             restoreNote(win, 'restoreArchiveNote', mutedSpan(
                 t('This snapshot holds no restorable archive.')));
         }
@@ -6046,6 +6874,12 @@
         var kind = currentArchiveKind(win);
         var previous = win._archiveKind || '';
         win._archiveKind = kind;
+        // cr3 (BACKUP-PANEL-M1): WHICH archive, not only which kind. The
+        // selections were picked inside the previous archive and its home is
+        // that archive's home: neither may ride a body for another one.
+        var archive = trim(valOf(win, '#restoreArchive'));
+        var archiveMoved = archive !== (win._archiveName || '');
+        win._archiveName = archive;
         if (kind === 'img') {
             // Entering the image half from a DIFFERENT kind (or from nothing):
             // the files state is dropped and the destination re-asks *This LUN*
@@ -6083,8 +6917,18 @@
                     try { dest.setValue({ restoreDest: 'inPlace' }); } catch (eD) { /* non-fatal */ }
                 }
                 clearNewLunFields(win);
+            } else if (archiveMoved) {
+                // Another file archive of the same point in time: its own
+                // selections, its own home, and the destination re-asked
+                // (an in-place choice named the other archive's home).
+                win._selections = [];
+                win._selectionRows = [];
+                var tk = win.down('#restoreTargetKind');
+                if (tk) {
+                    try { tk.setValue({ restoreTarget: 'newLocation' }); } catch (eTk) { /* non-fatal */ }
+                }
             }
-            applyArchiveHome(win);
+            applyArchiveHome(win, archiveMoved);
             refreshRestore(win);
             // Files restores validate on submit; the one dead-button case is a
             // `newLocation` restore without its directory (the gate checks it).
@@ -6114,20 +6958,159 @@
      * The field stays editable — a typed path is always first-class — but the
      * dialog never leaves a stale home pointing at a different archive.
      */
-    function applyArchiveHome(win) {
-        var map = win._homeByArchive || {};
+    function applyArchiveHome(win, archiveMoved) {
+        // cr3 (BACKUP-PANEL-M1): the task's archive homes describe the TASK'S
+        // source. Once "change source" names another repository, namespace or
+        // group, an archive of the same name there has no known home here.
+        var map = restoreSourceIsDoors(win) ? (win._homeByArchive || {}) : {};
         var home = map[bareArchive(trim(valOf(win, '#restoreArchive')))];
         if (!home) {
+            // cr3 (BACKUP-PANEL-M1): an archive with no known home (a
+            // backup2.3 expanded child, an archive the task no longer
+            // names) never keeps the PREVIOUS archive's home: the field
+            // empties and the operator names the directory.
+            if (archiveMoved) {
+                try {
+                    var f0 = win.down('#restoreHome');
+                    if (f0) {
+                        f0.setValue('');
+                    }
+                } catch (e0) {
+                    // non-fatal
+                }
+            }
             return;
         }
         try {
             var f = win.down('#restoreHome');
             if (f) {
+                // Stamped for the source it is filled for — also when the
+                // field already held this value (no change event then).
+                win._homeStamp = restoreSourceKey(win);
                 f.setValue(home);
             }
         } catch (e) {
             // non-fatal
         }
+    }
+
+    /**
+     * cr3 (BACKUP-PANEL-M1): drop everything picked inside a point in time —
+     * its archive list, the archive, the selections and the live home. A pick
+     * belongs to the source and the point in time it was read from; carried
+     * over to another, it restores one archive's files into another's home.
+     * `clearSnapshot` also empties the point-in-time field (a SOURCE change:
+     * the old point in time is not in the new group).
+     */
+    function clearRestorePick(win, clearSnapshot, note) {
+        win._selections = [];
+        win._selectionRows = [];
+        win._archives = [];
+        if (clearSnapshot) {
+            win._pickedSnapshot = '';
+            try {
+                var sf = win.down('#restoreSnapshot');
+                if (sf) {
+                    sf.setValue('');
+                }
+            } catch (eS) {
+                // non-fatal
+            }
+        }
+        var combo = win.down('#restoreArchive');
+        if (combo) {
+            try { combo.getStore().loadData([]); } catch (eL) { /* non-fatal */ }
+            try { combo.setValue(''); } catch (eV) { /* non-fatal */ }
+        }
+        win._archiveKind = '';
+        win._archiveName = '';
+        // The destination goes back to "somewhere else": an "into the
+        // original" choice named the old pick's home.
+        var tk = win.down('#restoreTargetKind');
+        if (tk) {
+            try { tk.setValue({ restoreTarget: 'newLocation' }); } catch (eTk) { /* non-fatal */ }
+        }
+        try {
+            var home = win.down('#restoreHome');
+            if (home) {
+                home.setValue('');
+            }
+        } catch (eH) {
+            // non-fatal
+        }
+        setRestorePartVisibility(win);
+        restoreNote(win, 'restoreArchiveNote', note ? mutedSpan(note) : '');
+        refreshRestore(win);
+    }
+
+    /**
+     * cr3: the optional `warnings` a PBS listing carries — rows or files the
+     * server returned that ANAS refused (a name outside PBS's own charset). One
+     * line each, encoded; hidden when there are none. The listing is short of
+     * those rows, and the screen says so.
+     */
+    function showListWarnings(cmp, warnings) {
+        if (!cmp) {
+            return;
+        }
+        var list = isArray(warnings) ? warnings : [];
+        var html = '';
+        for (var i = 0; i < list.length; i++) {
+            html += '<div style="font-size:11px;color:var(--anas-warn,#b06a12);">'
+                + '<i class="fa fa-exclamation-triangle" style="margin-right:5px;"></i>'
+                + enc('' + list[i]) + '</div>';
+        }
+        try {
+            cmp.update(html);
+            cmp.setHidden(!html);
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    /**
+     * The radio of `group` whose inputValue is `value`, or null. Through the
+     * group's `items` collection (ExtJS's own; `childCmps` is not an ExtJS
+     * method, and reading it alone found nothing in a browser).
+     */
+    function radioOf(group, value) {
+        var kids = [];
+        try {
+            if (group && group.items && typeof group.items.each === 'function') {
+                group.items.each(function (k) { kids.push(k); });
+            } else if (group && typeof group.childCmps === 'function') {
+                kids = group.childCmps();
+            }
+        } catch (e) {
+            kids = [];
+        }
+        for (var i = 0; i < kids.length; i++) {
+            if (kids[i] && kids[i].inputValue === value) {
+                return kids[i];
+            }
+        }
+        return null;
+    }
+
+    /** The point-in-time field changed: a value the picker did not hand is another point in time. */
+    function restoreSnapshotChanged(win) {
+        var v = trim(valOf(win, '#restoreSnapshot'));
+        if (v === (win._pickedSnapshot || '')) {
+            return;
+        }
+        win._pickedSnapshot = '';
+        if (!win._archives.length && !win._selections.length) {
+            return;
+        }
+        clearRestorePick(win, false,
+            t('The archive list belongs to the point in time the picker read. Pick this one with the point-in-time picker to list its archives.'));
+    }
+
+    /** A repository, namespace or group change: the old point in time is not in the new source. */
+    function restoreSourceChanged(win) {
+        // cr3 (BACKUP-PANEL-M1, review 3): UNCONDITIONAL — an empty pick still
+        // leaves a home and a target choice that belonged to the old source.
+        clearRestorePick(win, true, '');
     }
 
     /**
@@ -6145,6 +7128,9 @@
         var cfg = {
             node: node,
             onSelect: function (picked) {
+                // The point in time the archive list below is read for — a
+                // later TYPED value that differs is another point in time.
+                win._pickedSnapshot = '' + (picked.snapshot || '');
                 try {
                     var f = win.down('#restoreSnapshot');
                     if (f) {
@@ -6168,7 +7154,10 @@
                 restoreArchiveChanged(win, node);
             },
         };
-        if (win._task && !win._sourceExpanded) {
+        // cr3: the task's own listing (the daemon reads the task's stored
+        // namespace) while the source is the task's — also after "Change
+        // source" left it unchanged.
+        if (win._task && restoreSourceIsDoors(win)) {
             cfg.task = win._task;
         } else {
             var group = trim(valOf(win, '#restoreGroup'));
@@ -6212,7 +7201,10 @@
             title: t('Choose what to restore'),
             archive: {
                 repo: ctx.repo,
-                ns: ctx.ns,
+                // cr3: from a task, its STORED namespace exactly ('' included)
+                // and the task's id (12-picker.js forwards them — handed).
+                ns: (ctx.task && typeof ctx.taskNs === 'string') ? ctx.taskNs : ctx.ns,
+                task: ctx.task || undefined,
                 snapshot: ctx.snapshot,
                 archive: ctx.archive,
             },
@@ -6283,6 +7275,17 @@
         // directory — say it before the button is pressed, in the target line
         // (the button is already dead in this shape; this is the same rule
         // said where the operator is looking).
+        if (ctx.mode === 'inPlace' && !ctx.home) {
+            // cr3 (BACKUP-PANEL-M1, reviews 2 and 3): never an in-place
+            // restore with an empty path, nor with a path set for another
+            // source (`ctx.home` is the stamped one, read right now).
+            dropStaleHome(win);
+            refreshRestore(win);
+            restoreNote(win, 'restoreTargetNote',
+                '<span style="color:var(--anas-danger,#c23b2c);">'
+                + enc(t('Into the original needs the original directory (Source directory).')) + '</span>');
+            return;
+        }
         if (ctx.mode === 'newLocation' && !ctx.newPath) {
             restoreNote(win, 'restoreTargetNote',
                 '<span style="color:var(--anas-danger,#c23b2c);">'
@@ -6354,6 +7357,7 @@
         if (win._lunInventoryPromise) {
             return win._lunInventoryPromise;
         }
+        win._lunReadError = '';
         win._lunInventoryPromise = ANAS.api.get(node, '/iscsi/targets').then(function (res) {
             var targets = (res && res.data && isArray(res.data.targets)) ? res.data.targets : [];
             var reads = [];
@@ -6376,9 +7380,12 @@
             // resolve may be there now, so the whole half re-evaluates.
             resolveAndRefreshImage(win);
             return out;
-        }, function () {
+        }, function (err) {
             win._lunInventoryPromise = null;
             win._lunReceived = true;
+            // cr3 (BACKUP-PANEL-L12): the list could not be read — said on the
+            // in-place line, never a This LUN greyed out with no reason.
+            win._lunReadError = ANAS.errText(err) || t('unknown error');
             resolveAndRefreshImage(win);
             return [];
         });
@@ -6407,9 +7414,34 @@
                 });
             }
             return out;
-        }, function () {
+        }, function (err) {
+            // cr3 (BACKUP-PANEL-L12): one target's LUNs could not be read —
+            // the inventory is incomplete, and the dialog says which target.
+            if (!win.destroyed && !win.destroying) {
+                win._lunReadError = iqn + ': ' + (ANAS.errText(err) || t('unknown error'));
+            }
             return [];
         });
+    }
+
+    /**
+     * cr3 (BACKUP-PANEL-L11): is the restore source still the one the door
+     * pre-filled? The door's LUN and the task's `lun` record name the LUN OF
+     * THAT SOURCE; once "change source" points the dialog at another
+     * repository, namespace or group, only the group's own `lun-<serial>`
+     * identity can say which LUN its images belong to.
+     */
+    function restoreSourceIsDoors(win) {
+        if (!win._sourceExpanded) {
+            return true;
+        }
+        var s = win._sourceAtExpand;
+        if (!s) {
+            return true;
+        }
+        return trim(valOf(win, '#restoreRepo')) === s.repo
+            && trim(valOf(win, '#restoreNs')) === s.ns
+            && (win._group || '') === s.group;
     }
 
     /**
@@ -6426,10 +7458,11 @@
     function resolveThisLun(win) {
         var inv = isArray(win._lunInventory) ? win._lunInventory : [];
         var p = win._prefill && win._prefill.lun;
+        var doors = restoreSourceIsDoors(win);
         var cand = null;
-        if (p) {
+        if (p && doors) {
             cand = p;
-        } else if (win._taskLun) {
+        } else if (win._taskLun && doors) {
             cand = win._taskLun;
         } else if (win._group) {
             var serial = lunSerialOfGroup(win._group);
@@ -6579,7 +7612,12 @@
                 + 'that proof: a backing of the wrong size would be a LUN whose end does not match the image it holds.') };
         }
         if (!textOf(win, '#newLunTarget')) {
-            return { ok: false, reason: t('Pick the ANAS-managed target the new LUN appears on.') };
+            return {
+                ok: false,
+                reason: win._targetReadError
+                    ? (t('Could not list this node\'s iSCSI targets') + ' (' + win._targetReadError + ').')
+                    : t('Pick the ANAS-managed target the new LUN appears on.'),
+            };
         }
         var name = textOf(win, '#newLunName');
         if (!name) {
@@ -6677,6 +7715,13 @@
             html = '<span style="color:var(--anas-good,#2e7d32);">'
                 + enc(t('Restored as a NEW LUN: the backing is created at exactly the image\'s size ('))
                 + enc(fmtBytes(size)) + '). ' + enc(t('The source LUN is untouched and stays online.')) + '</span>';
+            if (win._lunReadError) {
+                // cr3 (BACKUP-PANEL-L12 class): the name check above read an
+                // inventory that could not be read — it checked nothing.
+                html += '<br><span style="color:var(--anas-warn,#b06a12);font-size:0.9em;">'
+                    + enc(t('The name could not be checked against this node\'s LUNs') + ' (' + win._lunReadError + ').')
+                    + '</span>';
+            }
         } else if (val.prompt) {
             html = '<span style="color:gray;font-size:0.9em;">' + enc(val.prompt) + '</span>';
         } else {
@@ -6725,12 +7770,7 @@
         if (dest) {
             var inPlaceRadio = null;
             try {
-                var kids = dest.childCmps ? dest.childCmps() : [];
-                for (var i = 0; i < kids.length; i++) {
-                    if (kids[i].inputValue === 'inPlace') {
-                        inPlaceRadio = kids[i];
-                    }
-                }
+                inPlaceRadio = radioOf(dest, 'inPlace');
             } catch (e) {
                 inPlaceRadio = null;
             }
@@ -6747,7 +7787,13 @@
         }
         var ipNote = win.down('#restoreInPlaceNote');
         if (ipNote) {
-            ipNote.update(refused ? enc(refused.reason) : '');
+            // cr3 (BACKUP-PANEL-L12): a This LUN that is off because the LUN
+            // list could not be read says so, with the reason.
+            ipNote.update(refused ? enc(refused.reason)
+                : ((!rl && win._lunReadError)
+                    ? enc(t('Could not read this node\'s LUN list') + ' (' + win._lunReadError + ') — '
+                        + t('This LUN cannot be offered; restore it as a new LUN, or reopen the dialog to read the list again.'))
+                    : ''));
         }
         var path = win.down('#restoreTargetPath');
         if (path) {
@@ -6898,8 +7944,17 @@
             if (win._archiveKind === 'img') {
                 updateRestoreSizes(win);
             }
-        }, function () {
-            // fail-open: the combo stays empty and the gate names the missing choice
+        }, function (err) {
+            // The combo stays empty and the gate stays shut — and it says the
+            // list could not be read (cr3, the L12 class), never just "pick a
+            // target" over a list that was never there.
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            win._targetReadError = ANAS.errText(err) || t('unknown error');
+            if (win._archiveKind === 'img') {
+                updateRestoreSizes(win);
+            }
         });
     }
 
@@ -6990,6 +8045,8 @@
         var ctx = {
             repo: textOf(win, '#restoreRepo'),
             ns: textOf(win, '#restoreNs'),
+            task: restoreSourceIsDoors(win) ? (win._task || '') : '',
+            taskNs: restoreSourceIsDoors(win) && win._task ? storedNamespaceOf(win._taskObj) : undefined,
             snapshot: snapshot,
             archive: archive,
             dest: dest,
@@ -7156,6 +8213,13 @@
                 scale: 'small',
                 margin: '0 0 6 0',
                 handler: function () {
+                    // cr3 (BACKUP-PANEL-L11): the source as the door left it —
+                    // while it is unchanged, the door's LUN still applies.
+                    win._sourceAtExpand = {
+                        repo: trim(valOf(win, '#restoreRepo')),
+                        ns: trim(valOf(win, '#restoreNs')),
+                        group: win._group || '',
+                    };
                     win._sourceExpanded = true;
                     applyRestoreSourceVisibility(win);
                     loadRestoreGroups(win, node);
@@ -7179,6 +8243,7 @@
                     fieldLabel: t('Repository'),
                     store: Ext.create('Ext.data.Store', { fields: ['name', 'label', 'namespace'], data: [] }),
                     displayField: 'label',
+                    listConfig: encodedList(),
                     valueField: 'name',
                     queryMode: 'local',
                     editable: true,
@@ -7187,6 +8252,7 @@
                         change: function () {
                             win._group = '';
                             win._groupKnown = false;
+                            restoreSourceChanged(win);
                             loadRestoreGroups(win, node);
                             updateRestoreSummary(win);
                             if (win._archiveKind === 'img') { resolveAndRefreshImage(win); }
@@ -7204,6 +8270,7 @@
                         change: function () {
                             win._group = '';
                             win._groupKnown = false;
+                            restoreSourceChanged(win);
                             loadRestoreGroups(win, node);
                             updateRestoreSummary(win);
                             if (win._archiveKind === 'img') { resolveAndRefreshImage(win); }
@@ -7222,6 +8289,7 @@
                     emptyText: 'host/<backup-id>',
                     store: Ext.create('Ext.data.Store', { fields: ['group', 'label'], data: [] }),
                     displayField: 'label',
+                    listConfig: encodedList(),
                     valueField: 'group',
                     queryMode: 'local',
                     editable: true,
@@ -7230,10 +8298,20 @@
                         change: function () {
                             win._group = trim(valOf(win, '#restoreGroup'));
                             win._groupKnown = !!win._group;
+                            restoreSourceChanged(win);
                             updateRestoreSummary(win);
                             if (win._archiveKind === 'img') { resolveAndRefreshImage(win); }
                         },
                     },
+                },
+                {
+                    // cr3 (the daemon's charset gate): group rows the server
+                    // returned and ANAS refused, one sentence each.
+                    xtype: 'component',
+                    itemId: 'restoreGroupWarnings',
+                    cls: 'anas-restore-group-warnings',
+                    hidden: true,
+                    html: '',
                 },
             ],
         });
@@ -7253,6 +8331,9 @@
                     // The full composed id is the value and is never truncated:
                     // a bare group path would silently restore the LATEST.
                     emptyText: 'host/<id>/<RFC3339>',
+                    listeners: {
+                        change: function () { restoreSnapshotChanged(win); },
+                    },
                 },
                 {
                     xtype: 'button',
@@ -7271,6 +8352,7 @@
             fieldLabel: t('Archive'),
             store: archiveStore,
             displayField: 'label',
+            listConfig: encodedList(),
             valueField: 'archive',
             queryMode: 'local',
             editable: false,
@@ -7321,7 +8403,14 @@
                     fieldLabel: t('Source directory'),
                     emptyText: '/srv/data',
                     value: '',
-                    listeners: { change: function () { refreshRestore(win); } },
+                    listeners: {
+                        change: function (f, v) {
+                            // cr3 (BACKUP-PANEL-M1, review 3): filled or typed,
+                            // the value belongs to the source current NOW.
+                            win._homeStamp = trim(v) ? restoreSourceKey(win) : '';
+                            refreshRestore(win);
+                        },
+                    },
                 },
                 // backup2.10 — the TWO-way destination choice (ruling
                 // 2026-08-29: the beside-the-original mode is dropped — no
@@ -7353,6 +8442,14 @@
                             }
                         }
                     }
+                },
+                {
+                    // cr3 (BACKUP-PANEL-M1, review 2): why "Into the original"
+                    // is off, when it is.
+                    xtype: 'component',
+                    itemId: 'restoreOriginalNote',
+                    padding: '0 0 4 130',
+                    html: '',
                 },
                 {
                     xtype: 'fieldcontainer',
@@ -7536,6 +8633,7 @@
                             store: Ext.create('Ext.data.Store', { fields: ['value', 'label'], data: [] }),
                             valueField: 'value',
                             displayField: 'label',
+                            listConfig: encodedList(),
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -7583,6 +8681,7 @@
                             editable: false,
                             forceSelection: true,
                             displayField: 'label',
+                            listConfig: encodedList(),
                             valueField: 'name',
                             store: Ext.create('Ext.data.Store', { fields: ['name', 'label'], data: [] }),
                             emptyText: t('(the ZFS pool the volume is created on)'),
@@ -7602,6 +8701,7 @@
                             disabled: true,
                             queryMode: 'local',
                             displayField: 'label',
+                            listConfig: encodedList(),
                             valueField: 'name',
                             store: Ext.create('Ext.data.Store', { fields: ['name', 'label', 'source'], data: [] }),
                             emptyText: t('pool/dataset'),
@@ -7691,6 +8791,9 @@
         win._selections = [];
         win._selectionRows = [];
         win._archives = [];
+        win._pickedSnapshot = '';
+        win._archiveName = '';
+        win._homeStamp = '';
         win._group = sourceGroup;
         win._groupKnown = !!(sourceGroup || o.group);
         win._sourceCollapsed = sourceCollapsed;
@@ -7900,6 +9003,7 @@
                 return;
             }
             var groups = isArray(d.groups) ? d.groups : [];
+            showListWarnings(win.down('#restoreGroupWarnings'), d.warnings);
             var autoId = (win._prefillLun && win._prefillLun.serial)
                 ? ('lun-' + win._prefillLun.serial)
                 : '';
@@ -7933,6 +9037,11 @@
                 }
                 win._group = found;
                 win._groupKnown = true;
+                // The door's own discovery, not an operator's change of source.
+                if (win._sourceAtExpand && !win._sourceAtExpand.group
+                    && repo === win._sourceAtExpand.repo && ns === win._sourceAtExpand.ns) {
+                    win._sourceAtExpand.group = found;
+                }
                 updateRestoreSummary(win);
                 if (win._archiveKind === 'img') {
                     resolveAndRefreshImage(win);
@@ -7948,6 +9057,13 @@
             }
         }, function (err) {
             ANAS.warn('restore group list failed: ' + ANAS.errText(err));
+            // cr3 (BACKUP-PANEL-L10 class): a group list that could not be
+            // read is said, never an empty combo.
+            if (!win.destroyed && !win.destroying) {
+                restoreNote(win, 'restoreArchiveNote',
+                    '<span style="color:var(--anas-warn,#b06a12);">'
+                    + enc(t('Could not list the backup groups') + ': ' + ANAS.errText(err)) + '</span>');
+            }
         });
     }
 
@@ -8005,6 +9121,13 @@
             loadRestoreGroups(win, node);
         }, function (err) {
             ANAS.warn('restore repo list failed: ' + ANAS.errText(err));
+            // cr3 (BACKUP-PANEL-L10): an unreadable list is said, never an
+            // empty repository combo with no reason.
+            if (!win.destroyed && !win.destroying) {
+                restoreNote(win, 'restoreArchiveNote',
+                    '<span style="color:var(--anas-warn,#b06a12);">'
+                    + enc(t('Could not read the backup repositories') + ': ' + ANAS.errText(err)) + '</span>');
+            }
         });
     }
 

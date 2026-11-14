@@ -201,18 +201,17 @@ describe('cr3.backup routes', () => {
     assert.equal(t.notify, 'on-failure')
     assert.equal(t.changeDetectionMode, 'metadata')
     assert.equal(t.limitNofile, 4096)
-    // The temporary exceptions (PUT_CLEARS_ON_OMIT: the released panel omits a
-    // blank namespace and an all-blank retention and means "none"): cleared.
-    assert.equal(t.retention, undefined)
-    assert.equal(t.namespace, undefined)
+    // No exceptions (PUT_CLEARS_ON_OMIT emptied at the cr3 merge): an omitted
+    // namespace and an omitted retention are kept like every other field.
+    assert.deepEqual(t.retention, STORED.retention)
+    assert.equal(t.namespace, STORED.namespace)
   })
 
-  it('cr3 review (1): the released panel\'s body with retention cleared STOPS pruning (omitted retention clears)', async () => {
+  it('cr3 review (1): the panel\'s body with retention cleared STOPS pruning (null clears; an omission keeps)', async () => {
     await submit('POST', '/v1/backup/tasks', STORED)
-    // Exactly what the released edit dialog sends when the five keep fields are
-    // blank: every field, and no `retention` key.
-    const { retention: _r, ...released } = STORED
-    const job = await submit('PUT', '/v1/backup/tasks/docs', { ...released, mode: 'metadata' })
+    // What the edit dialog sends when the five keep fields are blank: every
+    // field, and `retention: null`.
+    const job = await submit('PUT', '/v1/backup/tasks/docs', { ...STORED, retention: null, mode: 'metadata' })
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.equal((await stored()).retention, undefined, 'a cleared retention must not keep pruning')
   })

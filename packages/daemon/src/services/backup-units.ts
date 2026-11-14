@@ -237,7 +237,10 @@ export function parseServiceUnit(content: string): BackupTask | null {
  * enabled, schedule or cadence), sends exactly when stored (kind, limitNofile,
  * which no control can blank), or is a pair handled above (schedule/cadence).
  */
-export const PUT_CLEARS_ON_OMIT = ['namespace', 'retention'] as const
+// Emptied at the cr3 merge: the panel that ships with this daemon sends `null`
+// to clear a namespace or a retention, so an omission keeps them like every
+// other field.
+export const PUT_CLEARS_ON_OMIT: readonly string[] = []
 
 export function mergeBackupTaskUpdate(stored: BackupTask, body: unknown): unknown {
   if (!body || typeof body !== 'object' || Array.isArray(body))
