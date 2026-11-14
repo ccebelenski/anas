@@ -523,6 +523,30 @@ describe('replication task routes — NON-LOCAL targets (issue #46)', () => {
     assert.match(res.json().error.message, /Target pool 'backup' does not exist on remote 'nas1'/)
   })
 
+  // repl.r2: the remote's ssh did not answer — the task is refused with the
+  // remote's own line, never with a missing-pool sentence, and no unit is
+  // written.
+  it('repl.r2: an ssh that did not answer on the remote\'s pool listing refuses with its line; no unit is written', async () => {
+    const mock = mockOf(server)
+    const resolved = resolvedRemoteFields(
+      { registryFile: join(dir, 'remotes.json'), keyPath: join(dir, 'replication_key'), knownHostsFile: join(dir, 'known_hosts') },
+      REMOTE.host,
+      REMOTE.port,
+      REMOTE.user,
+    )
+    const argv = buildSshArgv(resolved, ['zpool', 'list', '-H', '-o', 'name'])
+    const line = 'root@10.0.0.9: Permission denied (publickey,password).'
+    mock.prependFixture({ command: argv[0], args: argv.slice(1), result: { stdout: '', stderr: `${line}\n`, exitCode: 255 } })
+    const before = await readdir(dir)
+
+    const res = await create(REMOTE_TASK)
+    assert.equal(res.statusCode, 400, res.body)
+    assert.equal(res.json().error.message, `Could not list the pools on remote 'nas1': ${line}`)
+    assert.doesNotMatch(res.json().error.message, /does not exist/)
+    assert.deepEqual(await readdir(dir), before, 'nothing was written')
+    assert.equal(mock.pipelineCalls.length, 0)
+  })
+
   it('POST a task to an unregistered remote → 400 (the location must resolve)', async () => {
     const res = await create({ ...REMOTE_TASK, target: { pool: 'tank', dataset: 'media', location: { kind: 'remote', name: 'ghost' } } })
     assert.equal(res.statusCode, 400)

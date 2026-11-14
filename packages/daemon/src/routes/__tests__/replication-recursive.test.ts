@@ -550,6 +550,36 @@ describe('recursive replication run (rrep.1b): the captured before-state', () =>
     assert.equal(mock.pipelineCalls.length, 0)
   })
 
+  // repl.r2: the target POOL listing over ssh, at the recursive door. A remote
+  // that did not answer is refused with its own line — and a route refusal of
+  // a recursive run notifies (fold N1), once, carrying that sentence.
+  it('repl.r2: an ssh that did not answer on the target POOL listing refuses with its line and notifies once', async () => {
+    arm(false)
+    const line = 'root@10.0.0.9: Permission denied (publickey,password).'
+    mock.prependFixture({ command: SSH, args: sshArgs(['zpool', 'list', '-H', '-o', 'name']), result: { stdout: '', stderr: `${line}\n`, exitCode: 255 } })
+    const target = { pool: TARGET_POOL, dataset: 'rrdst', location: { kind: 'remote', name: 'nas1' } }
+    const { res } = await run({}, target)
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.message, `Could not list the pools on remote 'nas1': ${line}`)
+    assert.doesNotMatch(res.json().error.message, /does not exist/)
+    assert.equal(mock.pipelineCalls.length, 0, 'nothing was sent')
+    const sent = notifications(mock)
+    assert.equal(sent.length, 1, JSON.stringify(sent))
+    assert.equal(sent[0].severity, 'error')
+    assert.ok(sent[0].body.includes(`Could not list the pools on remote 'nas1': ${line}`), sent[0].body)
+  })
+
+  it('repl.r2: a remote that ANSWERED without the pool keeps the does-not-exist sentence', async () => {
+    arm(false)
+    mock.prependFixture({ command: SSH, args: sshArgs(['zpool', 'list', '-H', '-o', 'name']), result: ok('otherpool\n') })
+    const target = { pool: TARGET_POOL, dataset: 'rrdst', location: { kind: 'remote', name: 'nas1' } }
+    const { res } = await run({}, target)
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.message, `Target pool 'datapool' does not exist on remote 'nas1'`)
+    assert.equal(mock.pipelineCalls.length, 0, 'nothing was sent')
+    assert.equal(notifications(mock).length, 1, 'the route refusal of a recursive run still notifies')
+  })
+
   it('a target pool listing that exits 0 but does not start with the pool is a 400, not six full sends (fold 1, review B1/B2)', async () => {
     for (const bad of ['', 'otherpool\notherpool/x\n']) {
       mock.clearFixtures()

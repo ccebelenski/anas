@@ -1,9 +1,9 @@
 import type { RemoteTestResult } from '@anas/shared'
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { RemotesPaths } from '../services/replication-remotes.js'
-import type { ResolvedRemote, Transport } from '../services/replication-transport.js'
+import type { RemotePoolList, ResolvedRemote, Transport } from '../services/replication-transport.js'
 import { readFile, rm } from 'node:fs/promises'
 import { ReplicationTaskName, TestRemoteRequest, UpsertRemoteRequest } from '@anas/shared'
 import { GuardRefusalError } from '../safety/guard.js'
@@ -33,8 +33,10 @@ import { requireIdentity } from './identity.js'
  *   POST   /v1/replication/remotes/test       → PRE-registration probe (host/port/user)
  *   POST   /v1/replication/remotes/:name/test → registered-remote probe (?pin=true)
  *   GET    /v1/replication/locations          → { peers, remotes } for the picker
- *   GET    /v1/replication/remotes/:name/pools→ remote zpool names (fail-open [])
- *   GET    /v1/replication/peers/:name/pools  → peer zpool names (fail-open [])
+ *   GET    /v1/replication/remotes/:name/pools→ remote zpool names
+ *   GET    /v1/replication/peers/:name/pools  → peer zpool names
+ *        (a listing that DID NOT ANSWER is 502 UPSTREAM_ERROR with the ssh
+ *         line, never an empty list — repl.r2)
  *
  * Both probes take ?pin=true (trust a first-contact key) and ?retrust=true
  * (REPLACE the pinned key of a host whose key changed — the rebuilt/rekeyed
@@ -565,6 +567,29 @@ export async function replicationRemotesRoutes(
     return { data: { peers, remotes: reg.remotes.map(r => r.name) } }
   })
 
+  /**
+   * The pools routes' answer (repl.r2). A listing that DID NOT ANSWER is a
+   * failed load the picker can act on — 502 UPSTREAM_ERROR carrying the ssh
+   * line — never `{ data: [] }`, which reads as "this host has no pools".
+   * The panel's loadLocationPools rejects on ANY non-2xx (10-api.js), warns
+   * with this sentence and falls back to free-text pool entry, so the
+   * operator is never shown an empty pick-list as if it were the truth. 502
+   * is the shared error enum's own meaning for "an upstream (a peer) refused
+   * or failed the read", as backup.ts's snapshot read answers it.
+   */
+  function poolListing(
+    reply: FastifyReply,
+    kind: 'remote' | 'peer',
+    name: string,
+    listed: RemotePoolList,
+  ): { data: string[] } | { error: { code: 'UPSTREAM_ERROR', message: string } } {
+    if (!listed.ok) {
+      reply.code(502)
+      return { error: { code: 'UPSTREAM_ERROR', message: `Could not list the pools on ${kind} '${name}': ${listed.error}` } }
+    }
+    return { data: listed.pools }
+  }
+
   // --- GET /replication/remotes/:name/pools — remote zpool names ------------
   server.get<{ Params: { name: string } }>('/replication/remotes/:name/pools', async (request, reply) => {
     const nameParsed = ReplicationTaskName.safeParse(request.params.name)
@@ -579,7 +604,7 @@ export async function replicationRemotesRoutes(
       return { error: { code: 'NOT_FOUND', message: `Remote '${nameParsed.data}' not found` } }
     }
     const resolved = resolvedRemoteFields(paths, remote.host, remote.port, remote.user)
-    return { data: await transport.remotePoolNames(resolved) }
+    return poolListing(reply, 'remote', nameParsed.data, await transport.remotePoolNames(resolved))
   })
 
   // --- GET /replication/peers/:name/pools — peer zpool names ----------------
@@ -590,6 +615,6 @@ export async function replicationRemotesRoutes(
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: res.error } }
     }
-    return { data: await transport.remotePoolNames(res.resolved) }
+    return poolListing(reply, 'peer', name, await transport.remotePoolNames(res.resolved))
   })
 }

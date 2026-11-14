@@ -546,16 +546,54 @@ describe('replication remotes routes (Epic 5.5.2)', () => {
     assert.deepEqual(data.remotes, ['nas1'])
   })
 
-  it('GET remote/peer pools → { data: string[] } (fail-open [])', async () => {
+  it('GET remote/peer pools: an ANSWERED listing is { data: string[] }; no pools at all is []', async () => {
     await createRemote(0)
     const mock = mockOf(server)
     sshFix(mock, ['zpool', 'list', '-H', '-o', 'name'], { stdout: 'backup\ntank\n', stderr: '', exitCode: 0 })
     const remotePools = await server.inject({ method: 'GET', url: '/v1/replication/remotes/nas1/pools', headers: IDENTITY })
+    assert.equal(remotePools.statusCode, 200)
     assert.deepEqual(remotePools.json().data, ['backup', 'tank'])
 
     const peerResolved = buildSshArgv({ kind: 'peer', host: 'node2' }, ['zpool', 'list', '-H', '-o', 'name'])
     mock.addFixture({ command: peerResolved[0], args: peerResolved.slice(1), result: { stdout: 'rpool\n', stderr: '', exitCode: 0 } })
     const peerPools = await server.inject({ method: 'GET', url: '/v1/replication/peers/node2/pools', headers: IDENTITY })
     assert.deepEqual(peerPools.json().data, ['rpool'])
+
+    // A host with no pools ANSWERED: an exit 0 with empty stdout is [], an
+    // answer — never the failure answer below.
+    const emptyResolved = buildSshArgv({ kind: 'peer', host: 'node3' }, ['zpool', 'list', '-H', '-o', 'name'])
+    mock.addFixture({ command: emptyResolved[0], args: emptyResolved.slice(1), result: { stdout: '', stderr: '', exitCode: 0 } })
+    const empty = await server.inject({ method: 'GET', url: '/v1/replication/peers/node3/pools', headers: IDENTITY })
+    assert.equal(empty.statusCode, 200)
+    assert.deepEqual(empty.json().data, [])
+  })
+
+  // repl.r2: a listing that did not answer is a FAILED LOAD the picker can act
+  // on (502 UPSTREAM_ERROR with the ssh line), never `{ data: [] }` — which
+  // reads as "this host has no pools".
+  it('repl.r2: a REMOTE whose ssh did not answer → 502 UPSTREAM_ERROR, never an empty list', async () => {
+    await createRemote(0)
+    const mock = mockOf(server)
+    const line = 'root@10.0.0.9: Permission denied (publickey,password).'
+    sshFix(mock, ['zpool', 'list', '-H', '-o', 'name'], { stdout: '', stderr: `${line}\n`, exitCode: 255 })
+    const res = await server.inject({ method: 'GET', url: '/v1/replication/remotes/nas1/pools', headers: IDENTITY })
+    assert.equal(res.statusCode, 502, res.body)
+    assert.deepEqual(res.json(), {
+      error: { code: 'UPSTREAM_ERROR', message: `Could not list the pools on remote 'nas1': ${line}` },
+    })
+    assert.equal(res.json().data, undefined, 'a failed listing is never spelled as an empty pool list')
+  })
+
+  it('repl.r2: a PEER whose ssh did not answer → 502 UPSTREAM_ERROR, never an empty list', async () => {
+    const mock = mockOf(server)
+    const line = 'ssh: connect to host node2 port 22: Connection timed out'
+    const argv = buildSshArgv({ kind: 'peer', host: 'node2' }, ['zpool', 'list', '-H', '-o', 'name'])
+    mock.addFixture({ command: argv[0], args: argv.slice(1), result: { stdout: '', stderr: `${line}\n`, exitCode: 255 } })
+    const res = await server.inject({ method: 'GET', url: '/v1/replication/peers/node2/pools', headers: IDENTITY })
+    assert.equal(res.statusCode, 502, res.body)
+    assert.deepEqual(res.json(), {
+      error: { code: 'UPSTREAM_ERROR', message: `Could not list the pools on peer 'node2': ${line}` },
+    })
+    assert.equal(res.json().data, undefined, 'a failed listing is never spelled as an empty pool list')
   })
 })

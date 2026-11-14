@@ -160,15 +160,111 @@ describe('replication transport (Epic 5.5.2 — remote SSH)', () => {
     assert.match((bad as { error: string }).error, /not registered/)
   })
 
-  it('remotePoolNames issues `ssh … zpool list -H -o name` and parses names (fail-open [])', async () => {
+  // repl.r2: a listing that did not answer is its own answer, decided by EXIT
+  // CODE only (stderr is quoted, never matched), so no caller can read it as
+  // "this host has no pools".
+  it('remotePoolNames issues `ssh ... zpool list -H -o name`; exit 0 lists the pools', async () => {
     const mock = new MockExecutor()
     const resolved: ResolvedLocation = { kind: 'peer', host: 'node2' }
     const argv = buildSshArgv(resolved, ['zpool', 'list', '-H', '-o', 'name'])
     mock.addFixture({ command: argv[0], args: argv.slice(1), result: { stdout: 'rpool\nbackup\n', stderr: '', exitCode: 0 } })
     const t = createTransport(mock, config)
-    assert.deepEqual(await t.remotePoolNames(resolved), ['rpool', 'backup'])
-    // A failing probe fails open to [].
-    assert.deepEqual(await t.remotePoolNames({ kind: 'peer', host: 'nohost' }), [])
+    assert.deepEqual(await t.remotePoolNames(resolved), { ok: true, pools: ['rpool', 'backup'] })
+  })
+
+  it('remotePoolNames: exit 0 with empty stdout is a host with no pools, not a failure', async () => {
+    const mock = new MockExecutor()
+    const resolved: ResolvedLocation = { kind: 'peer', host: 'node2' }
+    const argv = buildSshArgv(resolved, ['zpool', 'list', '-H', '-o', 'name'])
+    mock.addFixture({ command: argv[0], args: argv.slice(1), result: { stdout: '', stderr: '', exitCode: 0 } })
+    const t = createTransport(mock, config)
+    assert.deepEqual(await t.remotePoolNames(resolved), { ok: true, pools: [] })
+  })
+
+  it('remotePoolNames: exit 255 carries ssh\'s own line (a refused key)', async () => {
+    const mock = new MockExecutor()
+    const resolved: ResolvedLocation = { kind: 'peer', host: 'node2' }
+    const argv = buildSshArgv(resolved, ['zpool', 'list', '-H', '-o', 'name'])
+    mock.addFixture({
+      command: argv[0],
+      args: argv.slice(1),
+      // The real shape seen on the node pair: one line, trailing newline.
+      result: { stdout: '', stderr: 'root@node2: Permission denied (publickey,password).\n', exitCode: 255 },
+    })
+    const t = createTransport(mock, config)
+    assert.deepEqual(await t.remotePoolNames(resolved), {
+      ok: false,
+      error: 'root@node2: Permission denied (publickey,password).',
+    })
+  })
+
+  // Review of repl.r2: OpenSSH prints its decoration first and the reason
+  // last. RULE: for ssh's own failure (exit 255) the sentence carries the LAST
+  // non-empty line; for a failing remote command, the first.
+  it('remotePoolNames: exit 255 quotes the LAST line (changed host key, open key file, a banner), other exits the FIRST', async () => {
+    const peer: ResolvedLocation = { kind: 'peer', host: 'node2' }
+    const argv = buildSshArgv(peer, ['zpool', 'list', '-H', '-o', 'name'])
+    const answer = async (stderr: string, exitCode: number) => {
+      const m = new MockExecutor()
+      m.addFixture({ command: argv[0], args: argv.slice(1), result: { stdout: '', stderr, exitCode } })
+      return createTransport(m, config).remotePoolNames(peer)
+    }
+    const BOX = '@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@'
+    assert.deepEqual(await answer(`${BOX}\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n${BOX}\nOffending ED25519 key in /etc/pve/priv/anas/known_hosts:3\nHost key verification failed.\n`, 255), { ok: false, error: 'Host key verification failed.' })
+    assert.deepEqual(await answer(`${BOX}\n@         WARNING: UNPROTECTED PRIVATE KEY FILE!          @\n${BOX}\nroot@node2: Permission denied (publickey).\n\n`, 255), { ok: false, error: 'root@node2: Permission denied (publickey).' })
+    assert.deepEqual(await answer('*** Authorized use only ***\nroot@node2: Permission denied (publickey,password).\n', 255), { ok: false, error: 'root@node2: Permission denied (publickey,password).' })
+    assert.deepEqual(await answer('bash: line 1: zpool: command not found\nsecond line\n', 127), { ok: false, error: 'bash: line 1: zpool: command not found' })
+    // Text the far side controls: no control characters, and a bounded length.
+    const long = await answer(`${'x'.repeat(5000)}\u001B[31m\u0007\n`, 1)
+    assert.equal(long.ok, false)
+    if (!long.ok) {
+      assert.equal(long.error.length, 303)
+      assert.ok(long.error.endsWith('...'))
+    }
+    const esc = await answer('bad\u001B[31mred\u0007 line\n', 1)
+    // eslint-disable-next-line no-control-regex
+    assert.ok(!esc.ok && !/[\x00-\x1F\x7F]/.test(esc.error), JSON.stringify(esc))
+  })
+
+  it('remotePoolNames: exit 255 with empty stderr says `ssh exited 255`', async () => {
+    const mock = new MockExecutor()
+    const resolved: ResolvedLocation = { kind: 'peer', host: 'node2' }
+    const argv = buildSshArgv(resolved, ['zpool', 'list', '-H', '-o', 'name'])
+    mock.addFixture({ command: argv[0], args: argv.slice(1), result: { stdout: '', stderr: '', exitCode: 255 } })
+    const t = createTransport(mock, config)
+    assert.deepEqual(await t.remotePoolNames(resolved), { ok: false, error: 'ssh exited 255' })
+  })
+
+  it('remotePoolNames: a non-zero exit that is not 255 is still "did not answer"', async () => {
+    const mock = new MockExecutor()
+    const resolved: ResolvedLocation = { kind: 'peer', host: 'node2' }
+    const argv = buildSshArgv(resolved, ['zpool', 'list', '-H', '-o', 'name'])
+    mock.addFixture({ command: argv[0], args: argv.slice(1), result: { stdout: '', stderr: 'zpool: command not found\n', exitCode: 1 } })
+    const t = createTransport(mock, config)
+    assert.deepEqual(await t.remotePoolNames(resolved), { ok: false, error: 'zpool: command not found' })
+    // No fixture at all is still a non-zero exit (the mock's own 127), so a
+    // probe that never answered no longer reads as an empty pool list.
+    assert.deepEqual(await t.remotePoolNames({ kind: 'peer', host: 'nohost' }), {
+      ok: false,
+      error: 'mock: command not found: /usr/bin/ssh',
+    })
+  })
+
+  it('remotePoolExists answers yes, no, and "did not answer" with the same line', async () => {
+    const mock = new MockExecutor()
+    const resolved: ResolvedLocation = { kind: 'peer', host: 'node2' }
+    const argv = buildSshArgv(resolved, ['zpool', 'list', '-H', '-o', 'name'])
+    mock.addFixture({ command: argv[0], args: argv.slice(1), result: { stdout: 'rpool\nbackup\n', stderr: '', exitCode: 0 } })
+    const t = createTransport(mock, config)
+    assert.deepEqual(await t.remotePoolExists(resolved, 'backup'), { ok: true, exists: true })
+    assert.deepEqual(await t.remotePoolExists(resolved, 'tank'), { ok: true, exists: false })
+
+    mock.clearFixtures()
+    mock.addFixture({ command: argv[0], args: argv.slice(1), result: { stdout: '', stderr: 'root@node2: Permission denied (publickey,password).\n', exitCode: 255 } })
+    assert.deepEqual(await t.remotePoolExists(resolved, 'backup'), {
+      ok: false,
+      error: 'root@node2: Permission denied (publickey,password).',
+    })
   })
 
   it('remoteSnapshotNames extracts the names after @ from the -H list', async () => {

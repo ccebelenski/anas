@@ -53,6 +53,26 @@ export type ResolveResult
   = | { ok: true, resolved: ResolvedLocation }
     | { ok: false, error: string }
 
+/**
+ * The answer to "list this peer/remote's pools" (repl.r2).
+ *
+ * EXIT CODE decides, never stderr text: exit 0 is the host's answer, even when
+ * it prints nothing (`pools: []` — a host with no pools). Any non-zero exit is
+ * the host NOT ANSWERING — a refused key, a dead host, no `zpool` — and carries
+ * the first non-empty line of its stderr (trimmed), or `ssh exited <n>` when
+ * ssh said nothing. Before this, both cases collapsed into `[]`, and the target
+ * guard told the operator a pool was missing when the truth was that nobody had
+ * been asked (EPICS §2, "Guide, don't just warn").
+ */
+export type RemotePoolList
+  = | { ok: true, pools: string[] }
+    | { ok: false, error: string }
+
+/** The answer to "does this peer/remote have that pool": yes, no, or why it could not say. */
+export type PoolExistence
+  = | { ok: true, exists: boolean }
+    | { ok: false, error: string }
+
 /** PVE cluster membership: this node's name + every node in the cluster. */
 export interface PveMembers {
   nodename: string
@@ -193,6 +213,41 @@ export function resolvedRemoteFields(
   return { kind: 'remote', host, port, user, keyPath: paths.keyPath, knownHostsFile: paths.knownHostsFile }
 }
 
+/** ssh's exit status for its own failures (could not connect, refused the key, host key mismatch). */
+const SSH_OWN_EXIT = 255
+
+/** The longest failure line a sentence carries; the rest is the journal's. */
+const FAILURE_LINE_MAX = 300
+
+/** C0 control characters and DEL: a line bound for a JSON body, a job error and a mail body carries none. */
+// eslint-disable-next-line no-control-regex
+const FAILURE_CONTROL_RE = /[\x00-\x1F\x7F]/g
+
+/**
+ * What a FAILED ssh said, as one line for a sentence (repl.r2). Quoted, never
+ * matched on. WHICH line depends on who failed:
+ *
+ *   - exit 255 is ssh itself, and OpenSSH puts its decoration FIRST and the
+ *     reason LAST: a changed host key prints a box of `@@@@` and ends with
+ *     `Host key verification failed.`; a key file with open permissions does
+ *     the same and ends with `Permission denied (publickey).`; a remote sshd
+ *     Banner comes before the refusal. So for 255 it is the LAST non-empty
+ *     line (review of repl.r2: the first line was the `@@@@` row).
+ *   - any other exit is the remote command, whose first line names the
+ *     failure (`bash: line 1: zpool: command not found`).
+ *
+ * `ssh exited <n>` when stderr is empty. The line is stripped of control
+ * characters and cut at {@link FAILURE_LINE_MAX}: it is text the far side
+ * controls.
+ */
+function sshFailureLine(r: ExecResult): string {
+  const lines = r.stderr.split('\n').map(l => l.replace(FAILURE_CONTROL_RE, ' ').trim()).filter(Boolean)
+  const line = r.exitCode === SSH_OWN_EXIT ? lines.at(-1) : lines[0]
+  if (line === undefined)
+    return `ssh exited ${r.exitCode}`
+  return line.length > FAILURE_LINE_MAX ? `${line.slice(0, FAILURE_LINE_MAX)}...` : line
+}
+
 /** One snapshot name after the '@' of a `pool/ds@snap` line (or null). */
 function snapNameOf(fullSnap: string): string | null {
   const at = fullSnap.indexOf('@')
@@ -204,8 +259,8 @@ export interface Transport {
   listPeers: () => Promise<string[]>
   sshExec: (resolved: ResolvedLocation, cmd: string[]) => Promise<ExecResult>
   buildSshArgv: (resolved: ResolvedLocation, cmd: string[]) => string[]
-  remotePoolNames: (resolved: ResolvedLocation) => Promise<string[]>
-  remotePoolExists: (resolved: ResolvedLocation, pool: string) => Promise<boolean>
+  remotePoolNames: (resolved: ResolvedLocation) => Promise<RemotePoolList>
+  remotePoolExists: (resolved: ResolvedLocation, pool: string) => Promise<PoolExistence>
   remoteDatasetExists: (resolved: ResolvedLocation, ds: string) => Promise<boolean>
   /** Snapshot NAMES (after the '@') present on a remote dataset (fail-open []). */
   remoteSnapshotNames: (resolved: ResolvedLocation, ds: string) => Promise<string[]>
@@ -257,15 +312,20 @@ export function createTransport(executor: CommandExecutor, config: TransportConf
     return members.nodes.filter(n => n !== members.nodename)
   }
 
-  async function remotePoolNames(resolved: ResolvedLocation): Promise<string[]> {
+  async function remotePoolNames(resolved: ResolvedLocation): Promise<RemotePoolList> {
     const r = await sshExec(resolved, ['zpool', 'list', '-H', '-o', 'name'])
-    if (r.exitCode !== 0 || !r.stdout.trim())
-      return []
-    return r.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+    // repl.r2: the exit code alone separates "answered" from "did not answer".
+    // An exit 0 with empty stdout is a host with no pools — an answer.
+    if (r.exitCode !== 0)
+      return { ok: false, error: sshFailureLine(r) }
+    return { ok: true, pools: r.stdout.split('\n').map(l => l.trim()).filter(Boolean) }
   }
 
-  async function remotePoolExists(resolved: ResolvedLocation, pool: string): Promise<boolean> {
-    return (await remotePoolNames(resolved)).includes(pool)
+  async function remotePoolExists(resolved: ResolvedLocation, pool: string): Promise<PoolExistence> {
+    const listed = await remotePoolNames(resolved)
+    if (!listed.ok)
+      return listed
+    return { ok: true, exists: listed.pools.includes(pool) }
   }
 
   async function remoteDatasetExists(resolved: ResolvedLocation, ds: string): Promise<boolean> {

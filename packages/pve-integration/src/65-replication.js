@@ -793,12 +793,18 @@
             var names = (res && res.data) || [];
             return { names: names, freeText: !names.length };
         }, function (err) {
+            // repl.r2: a location that did not answer is not a location with
+            // no pools. The daemon's sentence (it carries the far side's own
+            // error) is kept for the operator, not only for the console.
             ANAS.warn('replication location pools failed for ' + loc.name + ': ' + ANAS.errText(err));
-            return { names: [], freeText: true };
+            return { names: [], freeText: true, error: ANAS.errText(err) };
         });
     }
 
-    var LOC_HINT = t('could not list pools — enter the pool name');
+    // Two different facts, two hints (repl.r2): the location answered and
+    // lists no pools; or it did not answer at all.
+    var LOC_HINT = t('this location lists no pools — enter the pool name');
+    var LOC_HINT_FAILED = t('could not reach this location — enter the pool name');
 
     // setEmptyText is version-dependent on ExtJS combos; guard it so a missing
     // method can never abort the surrounding repopulation logic.
@@ -858,7 +864,12 @@
                     // Editable free-text: the operator names a pool we can't list.
                     combo.forceSelection = false;
                     combo.setEditable(true);
-                    setEmpty(combo, LOC_HINT);
+                    setEmpty(combo, r.error ? LOC_HINT_FAILED : LOC_HINT);
+                    if (r.error) {
+                        // Said once, in view, when the location is picked — the
+                        // placeholder is too short to carry the reason.
+                        ANAS.toast(r.error);
+                    }
                     if (preselect) {
                         combo.setValue(preselect);
                     }

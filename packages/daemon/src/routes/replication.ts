@@ -5,7 +5,7 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
 import type { ReplicationNotifyContext } from '../services/replication-notify.js'
 import type { TargetPlacement } from '../services/replication-target.js'
-import type { Transport } from '../services/replication-transport.js'
+import type { PoolExistence, Transport } from '../services/replication-transport.js'
 import type { TreeGateRefusal } from '../services/replication-tree-gate.js'
 import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
 import { GuardRefusalError, sendRefusal, zfsDatasetClaims } from '../safety/guard.js'
@@ -182,7 +182,12 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
    * check — all live in services/replication-target.ts, shared verbatim with
    * the recurring-task routes (issue #46).
    */
-  const guardDeps = { transport, poolExists, pveFootprint: deps.pveFootprint }
+  // The LOCAL probe stays the boolean it always was (repl.r2 leaves the local
+  // branch alone); the guard deps speak the three-valued shape the remote
+  // transport answers in, so a local "no" can never be mistaken for a remote
+  // "did not answer" or the other way round.
+  const localPoolExists = async (pool: string): Promise<PoolExistence> => ({ ok: true, exists: await poolExists(pool) })
+  const guardDeps = { transport, poolExists: localPoolExists, pveFootprint: deps.pveFootprint }
 
   /**
    * The target dataset's snapshots (as minimal Snapshot records — only

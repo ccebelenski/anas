@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
-import type { Transport } from '../services/replication-transport.js'
+import type { PoolExistence, Transport } from '../services/replication-transport.js'
 import type { TargetNamesResolver } from '../services/replication-units.js'
 import type { UnitTaskObject } from '../services/task-units.js'
 import { readFile } from 'node:fs/promises'
@@ -118,6 +118,13 @@ export async function replicationTaskRoutes(
   }
 
   /**
+   * The LOCAL probe in the target guard's three-valued shape (repl.r2). A
+   * failed local `zpool list` keeps reading as "no" — the local branch is
+   * left as it was; the third value exists for the remote transport.
+   */
+  const localPoolExists = async (poolName: string): Promise<PoolExistence> => ({ ok: true, exists: await poolExists(poolName) })
+
+  /**
    * Story pvepool.1: the ONE footprint service answers "does PVE own this
    * dataset?" for the target guard — the target DATASET is judged, not the
    * pool (the old pool-level `isPveManagedPool` probe is gone).
@@ -157,7 +164,7 @@ export async function replicationTaskRoutes(
     }
     const { sourceFull, targetFull } = resolveTaskDatasets(task)
     const guard = await guardReplicationTarget(
-      { transport, poolExists, pveFootprint },
+      { transport, poolExists: localPoolExists, pveFootprint },
       { target: task.target, sourceFull, targetFull },
     )
     if (!guard.ok) {
@@ -256,7 +263,7 @@ export async function replicationTaskRoutes(
     // pass adds no second load, and (fold P2) the target pool's existence is
     // asked once for the pass, not once per swept dataset.
     if (localTarget) {
-      const guardDeps = memoisePoolExists({ transport, poolExists, pveFootprint, pveFootprintPreloaded: pve })
+      const guardDeps = memoisePoolExists({ transport, poolExists: localPoolExists, pveFootprint, pveFootprintPreloaded: pve })
       for (const dataset of sweep) {
         if (dataset === sourceFull)
           continue

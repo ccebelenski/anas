@@ -139,6 +139,44 @@ describe('replication to a REMOTE target (Epic 5.5.2)', () => {
     assert.equal(plan.estimatedBytes, 13424)
   })
 
+  // repl.r2: a remote that DID NOT ANSWER is its own refusal — never the
+  // missing-pool sentence, which would send the operator after a pool that is
+  // there (the shipped_path saw this three times on the node pair).
+  it('repl.r2: an ssh that did not answer refuses with its own line, not "pool does not exist"', async () => {
+    const mock = mockOf(server)
+    const argv = buildSshArgv(resolvedRemoteFields(paths, REMOTE.host, REMOTE.port, REMOTE.user), ['zpool', 'list', '-H', '-o', 'name'])
+    const line = 'root@10.0.0.9: Permission denied (publickey,password).'
+    mock.prependFixture({ command: argv[0], args: argv.slice(1), result: { stdout: '', stderr: `${line}\n`, exitCode: 255 } })
+
+    const res = await server.inject({
+      method: 'POST',
+      url: `/v1/pools/testpool/datasets/media/replicate`,
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ target: { pool: 'backup', location: { kind: 'remote', name: 'nas1' } } }),
+    })
+    assert.equal(res.statusCode, 400, res.body)
+    assert.equal(res.json().error.message, `Could not list the pools on remote 'nas1': ${line}`)
+    assert.doesNotMatch(res.json().error.message, /does not exist/)
+    assert.equal(mock.pipelineCalls.length, 0, 'nothing was sent')
+    assert.equal(mock.calls.some(c => c.command === '/usr/bin/ssh' && c.args.includes('hold')), false, 'nothing was held')
+  })
+
+  it('repl.r2: a remote that ANSWERED without the pool keeps the does-not-exist sentence', async () => {
+    const mock = mockOf(server)
+    const argv = buildSshArgv(resolvedRemoteFields(paths, REMOTE.host, REMOTE.port, REMOTE.user), ['zpool', 'list', '-H', '-o', 'name'])
+    mock.prependFixture({ command: argv[0], args: argv.slice(1), result: { stdout: 'tank\n', stderr: '', exitCode: 0 } })
+
+    const res = await server.inject({
+      method: 'POST',
+      url: `/v1/pools/testpool/datasets/media/replicate`,
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ target: { pool: 'backup', location: { kind: 'remote', name: 'nas1' } } }),
+    })
+    assert.equal(res.statusCode, 400, res.body)
+    assert.equal(res.json().error.message, `Target pool 'backup' does not exist on remote 'nas1'`)
+    assert.equal(mock.pipelineCalls.length, 0, 'nothing was sent')
+  })
+
   it('plan: unknown remote name → 400', async () => {
     const res = await server.inject({
       method: 'POST',

@@ -77,7 +77,7 @@ function guardSpy(pve: PveFootprint): GuardSpy {
       transport: {} as Transport,
       poolExists: async () => {
         calls++
-        return true
+        return { ok: true, exists: true }
       },
       pveFootprint: async () => pve,
     },
@@ -144,7 +144,7 @@ describe('the fixture run through the gates', () => {
       pve,
       guard: { transport: {} as Transport, poolExists: async () => {
         asked++
-        return false
+        return { ok: true, exists: false }
       }, pveFootprint: async () => pve },
     }, { facts: fixtureFacts(), target: TARGET_REQ })
     assert.equal(result.ok, false)

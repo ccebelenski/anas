@@ -1,6 +1,6 @@
 import type { ReplicationTarget } from '@anas/shared'
 import type { PveFootprint } from './pve-footprint.js'
-import type { ResolvedLocation, Transport } from './replication-transport.js'
+import type { PoolExistence, ResolvedLocation, Transport } from './replication-transport.js'
 import { pveNamingGuardMessage } from './pve-footprint.js'
 
 /**
@@ -54,13 +54,20 @@ export async function resolveTargetPlacement(
   return { ok: true, placement: { isRemote: true, resolved: res.resolved } }
 }
 
-/** Does the target pool exist — locally (`zpool list`) or on the peer/remote (`ssh zpool list`)? */
+/**
+ * Does the target pool exist — locally (`zpool list`) or on the peer/remote
+ * (`ssh zpool list`)? The answer is three-valued (repl.r2): the remote can say
+ * "yes", "no", or "I did not answer" with the ssh failure's own line, and the
+ * guard must keep the third apart from the second. The LOCAL probe is the
+ * boolean it always was — a failing local `zpool list` still reads as no pool,
+ * left to a later pass (EPICS §2, repl.r2).
+ */
 export async function targetPoolExists(
   transport: Transport,
   placement: TargetPlacement,
   pool: string,
-  localPoolExists: (pool: string) => Promise<boolean>,
-): Promise<boolean> {
+  localPoolExists: (pool: string) => Promise<PoolExistence>,
+): Promise<PoolExistence> {
   return placement.isRemote
     ? transport.remotePoolExists(placement.resolved, pool)
     : localPoolExists(pool)
@@ -69,8 +76,13 @@ export async function targetPoolExists(
 export interface TargetGuardDeps {
   /** Stage-3 SSH transport — location resolution + remote `zpool list`. */
   transport: Transport
-  /** Does this pool exist on THIS node (`zpool list`)? */
-  poolExists: (pool: string) => Promise<boolean>
+  /**
+   * Does this pool exist on THIS node (`zpool list`)? A local probe answers
+   * `{ ok: true, exists }`; `{ ok: false, error }` is the shape a probe that
+   * could not answer uses — today only the remote transport produces one
+   * (repl.r2), so the type keeps a guard from ever mistaking it for "absent".
+   */
+  poolExists: (pool: string) => Promise<PoolExistence>
   /**
    * PVE footprint ownership (story pvepool.1): the ONE service that answers
    * "is this dataset PVE's?", loaded fresh per guard run. Only consulted for a
@@ -92,11 +104,13 @@ export interface TargetGuardDeps {
  * returned deps, so a recursive pass over a tree of N datasets reads
  * `zpool list` once, not N times. The ANSWER is shared, failure included —
  * a read that said "no" (or threw) refuses every dataset of the pass, as it
- * refused the first (fail-closed). Make a fresh one per pass: a memo kept
+ * refused the first (fail-closed) — and a probe that DID NOT ANSWER
+ * (repl.r2) is stored as that answer, never retried into a different one and
+ * never turned into "does not exist". Make a fresh one per pass: a memo kept
  * across requests would be a cached fact.
  */
 export function memoisePoolExists(deps: TargetGuardDeps): TargetGuardDeps {
-  const asked = new Map<string, Promise<boolean>>()
+  const asked = new Map<string, Promise<PoolExistence>>()
   return {
     ...deps,
     poolExists: (pool: string) => {
@@ -139,10 +153,16 @@ export async function guardReplicationTarget(
 
   // We replicate INTO an existing pool, never create one — and "existing" is
   // asked of the machine the target lives on, not of this one.
-  if (!(await targetPoolExists(deps.transport, placement, target.pool, deps.poolExists))) {
-    const where = placement.isRemote ? ` on ${target.location?.kind} '${target.location?.name}'` : ''
-    return { ok: false, message: `Target pool '${target.pool}' does not exist${where}` }
+  const where = placement.isRemote ? ` on ${target.location?.kind} '${target.location?.name}'` : ''
+  const pool = await targetPoolExists(deps.transport, placement, target.pool, deps.poolExists)
+  if (!pool.ok) {
+    // repl.r2: a peer/remote that did not answer is NOT a missing pool. The
+    // refusal carries what its ssh said, so the operator is sent to the remote
+    // (its key, its sshd) rather than to look for a pool that is there.
+    return { ok: false, message: `Could not list the pools${where}: ${pool.error}` }
   }
+  if (!pool.exists)
+    return { ok: false, message: `Target pool '${target.pool}' does not exist${where}` }
 
   // PVE footprint ownership (story pvepool.1): never write into PVE's
   // territory — but ONLY the dataset itself is judged, not the pool. A target
