@@ -169,19 +169,39 @@ export async function writeRepoSecret(dir: string, name: string, secret: string)
   return path
 }
 
-/** Read a repo's stored secret, or null if none is set. */
-export async function readRepoSecret(dir: string, name: string): Promise<string | null> {
+/**
+ * cr3.backup L11: a secret file that is ABSENT is "no secret stored" (null); a
+ * file that exists but cannot be read (EACCES, EIO) is a FAILED read and
+ * throws a sentence naming the file — never "no secret stored", which would
+ * send the operator to re-enter a credential that is there.
+ */
+async function readSecretFile(path: string): Promise<string | null> {
   try {
-    return await readFile(repoSecretPath(dir, name), 'utf-8')
+    return await readFile(path, 'utf-8')
+  }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return null
+    throw new Error(`could not read the stored secret ${path} (${(err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err))})`)
+  }
+}
+
+/** Read a repo's stored secret, null if none is set; THROWS when the file cannot be read (L11). */
+export async function readRepoSecret(dir: string, name: string): Promise<string | null> {
+  return readSecretFile(repoSecretPath(dir, name))
+}
+
+/**
+ * Is a secret stored for this repo? (drives `credentialsSet` in responses).
+ * `null` = unknown: the file exists but could not be read (L11).
+ */
+export async function repoSecretSet(dir: string, name: string): Promise<boolean | null> {
+  try {
+    return (await readRepoSecret(dir, name)) !== null
   }
   catch {
     return null
   }
-}
-
-/** Is a secret stored for this repo? (drives `credentialsSet` in responses). */
-export async function repoSecretSet(dir: string, name: string): Promise<boolean> {
-  return (await readRepoSecret(dir, name)) !== null
 }
 
 /** Remove a repo's secret file (best-effort — the goal state is "absent"). */
@@ -254,16 +274,16 @@ export function pveSecretPath(privDir: string, id: string): string {
  * (rotation in PVE is instantly effective — ANAS holds no second copy).
  */
 export async function readPveSecret(privDir: string, id: string): Promise<string | null> {
+  const raw = await readSecretFile(pveSecretPath(privDir, id))
+  return raw === null ? null : raw.replace(PW_TRAILING_NEWLINE_RE, '')
+}
+
+/** Does this PVE storage have a secret file? (tier-1 `credentialsSet`; null = unreadable, L11). */
+export async function pveSecretSet(privDir: string, id: string): Promise<boolean | null> {
   try {
-    const raw = await readFile(pveSecretPath(privDir, id), 'utf-8')
-    return raw.replace(PW_TRAILING_NEWLINE_RE, '')
+    return (await readPveSecret(privDir, id)) !== null
   }
   catch {
     return null
   }
-}
-
-/** Does this PVE storage have a secret file? (drives tier-1 `credentialsSet`). */
-export async function pveSecretSet(privDir: string, id: string): Promise<boolean> {
-  return (await readPveSecret(privDir, id)) !== null
 }

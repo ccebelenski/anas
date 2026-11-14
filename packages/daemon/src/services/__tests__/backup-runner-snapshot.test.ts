@@ -264,6 +264,33 @@ describe('snapshot-consistent run — lifecycle (backup2.3)', () => {
     assert.ok(said, JSON.stringify(result.warnings))
   })
 
+  it('cr3.backup BACKUP-M5: a FAILED run whose destroy also fails names the transient left behind in its error', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: TABLE, stderr: '', exitCode: 0 } })
+    mock.addFixture({
+      command: TIMEOUT,
+      args: walkCall('/tank/media'),
+      result: { stdout: '66\t/tank/media\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({ command: ZFS, args: SWEEP_LIST, result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({
+      command: ZFS,
+      args: ['snapshot', '-r', '--', `tank/media@${LABEL}`],
+      result: { stdout: '', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: ZFS,
+      args: ['destroy', '-r', '--', `tank/media@${LABEL}`],
+      result: { stdout: '', stderr: 'cannot destroy: dataset is busy\n', exitCode: 1 },
+    })
+    mock.addFixture({ command: PRLIMIT, result: { stdout: '', stderr: 'Error: unable to open chunk store \'store1\'\n', exitCode: 255 } })
+    await assert.rejects(() => run(mock), (err: Error) => {
+      assert.match(err.message, /unable to open chunk store/)
+      assert.match(err.message, /could not be destroyed.*dataset is busy/)
+      return true
+    })
+  })
+
   it('a LIVE task takes no snapshot at all and keeps backup2.2 verbatim', async () => {
     const mock = wire()
     const result = await run(mock, {

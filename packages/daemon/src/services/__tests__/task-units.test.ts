@@ -912,7 +912,7 @@ describe('task units — dashboard warnings in the kind\'s own category', () => 
     assert.equal(warnings[1].message, 'Cloud sync task \'overdue\' is overdue — check the Cloud Sync view')
   })
 
-  it('collectTaskWarnings derives from the store\'s own reader, fail-open', async () => {
+  it('collectTaskWarnings derives from the store\'s own reader; a failed read throws (cr3 INVENTED-STATE-H1)', async () => {
     const mock = statusMock({ active: 'failed', result: 'exit-code', execStatus: '1', exitTs: 'Sun 2026-09-20 02:00:03 UTC' })
     const warnings = await collectTaskWarnings(
       CLOUD_UNIT_KIND,
@@ -924,11 +924,16 @@ describe('task units — dashboard warnings in the kind\'s own category', () => 
     assert.equal(warnings[0].category, 'cloud')
     assert.match(warnings[0].message, /last run failed/)
 
-    // A reader that throws yields no warnings rather than a broken dashboard.
-    const failOpen = await collectTaskWarnings(CLOUD_UNIT_KIND, mock, '/etc/systemd/system', async () => {
+    // cr3 INVENTED-STATE-H1: a reader that throws is a FAILED read, never "no
+    // warnings" — the dashboard's readDashboardSection marks the section
+    // unavailable on the throw.
+    await assert.rejects(collectTaskWarnings(CLOUD_UNIT_KIND, mock, '/etc/systemd/system', async () => {
       throw new Error('unit dir unreadable')
-    })
-    assert.deepEqual(failOpen, [])
+    }), /unit dir unreadable/)
+    // A unit directory that cannot be listed is the same failure (here: not a
+    // directory); an ABSENT one is an empty store, as before.
+    await assert.rejects(collectTaskWarnings(CLOUD_UNIT_KIND, mock, '/dev/null', async () => []), /could not be listed/)
+    assert.deepEqual(await collectTaskWarnings(CLOUD_UNIT_KIND, mock, '/nonexistent/anas-cr3/systemd', async () => []), [])
   })
 })
 
@@ -1059,6 +1064,9 @@ describe('task units — the store plumbing that is prefix-only', () => {
           result: { stdout: '', stderr: '', exitCode: 1 },
         })
         mock.addFixture({ command: SYSTEMCTL, args: ['daemon-reload'], result: ok('') })
+        // cr3.backup L10: a failed disable is now followed by the timer's
+        // state; systemd answers `inactive` (exit 0) for a unit that is gone.
+        mock.addFixture({ command: SYSTEMCTL, args: ['show', '-p', 'ActiveState', '--value', TIMER], result: ok('inactive\n') })
 
         await removeTaskUnits(CLOUD_UNIT_KIND, mock, dir, TASK)
         assert.deepEqual(await readdir(dir), [])

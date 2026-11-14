@@ -470,7 +470,7 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
         `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
         // The undo, in the REVERSE of the order the objects were made:
         `${TARGETCLI} /iscsi/${IQN}/tpg1/luns delete lun1`,
-        `${TARGETCLI} /backstores/block/newvol delete`,
+        `${TARGETCLI} /backstores/block delete newvol`,
         `${ZFS} destroy -- tank/newvol`,
       ])
 
@@ -478,6 +478,109 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
       // nothing existing was taken offline along the way.
       assert.ok(!mock.calls.some(c => c.args.includes('saveconfig')), 'a failed restore must not save the LIO configuration')
       assertSourceUntouched(mock)
+    })
+  })
+
+  it('cr3 review (8): a COMPLETE, verified stream whose only failure is the final saveconfig keeps the LUN, backstore and volume', async () => {
+    await withConfigfsRoot(async (configfsRoot) => {
+      const mock = new MockExecutor()
+      mock.addFixture({ command: TARGETCLI, args: ['saveconfig'], result: { stdout: '', stderr: 'saveconfig: disk full', exitCode: 1 } })
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, args: volsizeArgs('tank/newvol'), result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addStreamFixture({ command: PBC, result: { stderr: 'restore complete (512 MiB processed in 0.6s)    \n', exitCode: 0, bytesWritten: IMAGE_SIZE } })
+      await assert.rejects(runNewLunImageRestore(mock, deps(mock, configfsRoot), noop), (err: Error) => {
+        // cr3 review2 (4): Repair does not save a live-but-unsaved LUN, so it is not offered.
+        assert.match(err.message, /the image was restored in full and LUN 1 \('newvol'\) on .* is live, but saving the iSCSI configuration failed: .*disk full; it will not survive a restart of the target service until the configuration is saved: retry with any iSCSI change/)
+        assert.ok(!/Repair/.test(err.message), err.message)
+        assert.ok(!/removed/.test(err.message), err.message)
+        return true
+      })
+      const argv = mock.calls.map(c => `${c.command} ${c.args.join(' ')}`)
+      assert.ok(!argv.some(a => a.includes('luns delete')), 'the LUN stays mapped')
+      assert.ok(!argv.some(a => a.includes('/backstores/block delete')), 'the backstore stays')
+      assert.ok(!argv.some(a => a.startsWith(`${ZFS} destroy`)), 'the volume is never destroyed')
+    })
+  })
+
+  it('cr3 review2 (4): a size read-back that disagreed or failed is never called "in full", and rides the save-failure error', async () => {
+    for (const [volsize, said] of [
+      [{ stdout: `${IMAGE_SIZE - 4096}\n`, stderr: '', exitCode: 0 }, /is 536866816 bytes after the restore, not the image's 536870912/],
+      [{ stdout: '', stderr: 'cannot open', exitCode: 1 }, /could not re-read the size/],
+    ] as const) {
+      await withConfigfsRoot(async (configfsRoot) => {
+        const mock = new MockExecutor()
+        mock.addFixture({ command: TARGETCLI, args: ['saveconfig'], result: { stdout: '', stderr: 'saveconfig: disk full', exitCode: 1 } })
+        mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+        mock.addFixture({ command: ZFS, args: volsizeArgs('tank/newvol'), result: volsize })
+        mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+        mock.addStreamFixture({ command: PBC, result: { stderr: 'restore complete (512 MiB processed in 0.6s)    \n', exitCode: 0, bytesWritten: IMAGE_SIZE } })
+        await assert.rejects(runNewLunImageRestore(mock, deps(mock, configfsRoot), noop), (err: Error) => {
+          assert.ok(!/in full/.test(err.message), err.message)
+          assert.match(err.message, said)
+          assert.match(err.message, /saving the iSCSI configuration failed: .*disk full/)
+          return true
+        })
+      })
+    }
+  })
+
+  it('cr3 review2 (6): a cleanup that leaves something behind says so in ONE true sentence', async () => {
+    await withConfigfsRoot(async (configfsRoot) => {
+      const mock = new MockExecutor()
+      mock.addFixture({ command: TARGETCLI, args: ['/backstores/block', 'delete', 'newvol'], result: { stdout: '', stderr: 'backstore busy', exitCode: 1 } })
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addStreamFixture({ command: PBC, result: { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 } })
+      await assert.rejects(runNewLunImageRestore(mock, deps(mock, configfsRoot), noop), (err: Error) => {
+        assert.ok(!/nothing of the failed restore remains/.test(err.message), err.message)
+        assert.match(err.message, /ANAS removed LUN 1, volume tank\/newvol\. This was left behind and needs your hand: backstore 'newvol' could not be deleted \(.*backstore busy\)\./)
+        return true
+      })
+    })
+  })
+
+  it('cr3.backup (iSCSI review): a half LUN ANOTHER verb saved mid-stream is saved away after a clean undo; an unrelated save is left alone', async () => {
+    const enospc = (): MockExecutor => {
+      const mock = new MockExecutor()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addStreamFixture({ command: PBC, result: { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 } })
+      return mock
+    }
+    await withConfigfsRoot(async (configfsRoot) => {
+      // saveconfig.json holds THIS run's backstore (its name and the serial it minted).
+      const mock = enospc()
+      let refreshed = 0
+      await assert.rejects(
+        runNewLunImageRestore(mock, deps(mock, configfsRoot, {
+          refresh: async () => {
+            refreshed++
+            return targetDetail()
+          },
+          persistedBackstores: async () => [{ name: 'newvol', wwn: wwnOf(mock) }],
+        }), noop),
+        (err: Error) => {
+          assert.match(err.message, /the copy of it another iSCSI change had saved during the restore/)
+          assert.match(err.message, /nothing of the failed restore remains/)
+          return true
+        },
+      )
+      const tail = mock.calls.slice(-2).map(c => `${c.command} ${c.args.join(' ')}`)
+      assert.deepEqual(tail, [`${ZFS} destroy -- tank/newvol`, `${TARGETCLI} saveconfig`], 'the save comes after the whole undo')
+      assert.ok(refreshed >= 3, 'the target was re-proved under the lock before the save')
+
+      // A saved object of the same NAME but another serial is not this run's: no save.
+      const other = enospc()
+      await assert.rejects(runNewLunImageRestore(other, deps(other, configfsRoot, {
+        persistedBackstores: async () => [{ name: 'newvol', wwn: 'some-other-serial' }],
+      }), noop))
+      assert.ok(!other.calls.some(c => c.args.includes('saveconfig')))
+
+      // An unreadable saveconfig.json is said, never read as "not saved".
+      const blind = enospc()
+      await assert.rejects(runNewLunImageRestore(blind, deps(blind, configfsRoot, { persistedBackstores: async () => null }), noop), /could not be read to check whether another iSCSI change persisted/)
+      assert.ok(!blind.calls.some(c => c.args.includes('saveconfig')))
     })
   })
 

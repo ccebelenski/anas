@@ -6,11 +6,13 @@ import type { Refusal } from '../safety/guard.js'
 import type { CadenceGateDecision, TaskTrigger } from './backup-cadence.js'
 import type { TaskHelperResult, UnitRunResult } from './unit-run-status.js'
 import { createHash } from 'node:crypto'
-import { readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
+import { readdir, readFile, stat, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK, cadenceToOnCalendar, TASK_CANCELLED_EXIT_CODE } from '@anas/shared'
+import { z } from 'zod'
 import { JobCancelledError } from '../jobs/queue.js'
 import { decideCadenceRun, isTaskOverdue, overdueWindowMs } from './backup-cadence.js'
+import { writeFileAtomic } from './config-writer.js'
 import { deriveRunResult as deriveSystemdRunResult, parseSystemdTimestamp } from './systemd-status.js'
 import { listServiceUnits, parseMarkedJson, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
 import {
@@ -21,6 +23,7 @@ import {
   parseHelperResult,
   readOnce,
   readUnitJournal,
+  showReadFailed,
   showUnitProps,
   showUnitPropsStrict,
   TRIGGER_SLACK_MS,
@@ -53,6 +56,8 @@ import {
  */
 
 const SYSTEMCTL = '/usr/bin/systemctl'
+/** Just the `enabled` of a stored task's marked JSON (cr3 review: the rollback's prior enablement). */
+const PRIOR_ENABLED_SCHEMA = z.object({ enabled: z.boolean().default(true) })
 const SYSTEMD_ANALYZE = '/usr/bin/systemd-analyze'
 /** Trailing `=` of a marker token — trimmed for the skip warning's prose. */
 const MARKER_EQUALS_RE = /=$/
@@ -177,6 +182,60 @@ export async function readAllTaskUnits<T>(kind: TaskUnitKind, dir: string, schem
   return tasks
 }
 
+/** A unit file of a kind that is THERE but could not be read or parsed (cr3). */
+export interface UnreadableTaskUnit {
+  /** The task name the file name carries (`<prefix><name>.service`). */
+  name: string
+  reason: string
+}
+
+/**
+ * cr3 (INVENTED-STATE-H1): {@link readAllTaskUnits} without dropping anything
+ * silently. A unit file that exists and cannot be read (EACCES, EIO) or whose
+ * marked JSON does not parse is LISTED by name with its reason — the operator
+ * can see it and delete it (cr.41b's delete reads the unit as stored) — never
+ * left out as if the task did not exist. A unit DIRECTORY that cannot be
+ * listed (anything but ENOENT, which is an empty store) throws.
+ */
+export async function readAllTaskUnitsChecked<T>(
+  kind: TaskUnitKind,
+  dir: string,
+  schema: ZodType<T>,
+): Promise<{ tasks: T[], unreadable: UnreadableTaskUnit[] }> {
+  let files: string[]
+  try {
+    files = (await readdir(dir)).filter(f => f.startsWith(kind.prefix) && f.endsWith('.service'))
+  }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return { tasks: [], unreadable: [] }
+    throw new Error(`the ${kind.title.toLowerCase()} task units in ${dir} could not be listed (${errorWord(err)})`)
+  }
+  const tasks: T[] = []
+  const unreadable: UnreadableTaskUnit[] = []
+  for (const file of files.sort()) {
+    const name = file.slice(kind.prefix.length, -'.service'.length)
+    let content: string
+    try {
+      content = await readFile(join(dir, file), 'utf-8')
+    }
+    catch (err) {
+      unreadable.push({ name, reason: `its unit file ${file} could not be read (${errorWord(err)})` })
+      continue
+    }
+    const task = parseTaskUnit(kind, content, schema)
+    if (task)
+      tasks.push(task)
+    else
+      unreadable.push({ name, reason: `its unit file ${file} carries no valid ${kind.marker.replace(MARKER_EQUALS_RE, '')} JSON` })
+  }
+  return { tasks, unreadable }
+}
+
+function errorWord(err: unknown): string {
+  return (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err))
+}
+
 /** One task by name, or null if its service file is absent/invalid. */
 export async function readTaskUnit<T>(
   kind: TaskUnitKind,
@@ -203,16 +262,111 @@ export async function writeTaskUnitFiles(
   dir: string,
   task: { name: string, enabled: boolean },
   units: { service: string, timer: string },
+  /** Test seam (cr3 review): the atomic writer. Absent = {@link writeFileAtomic}. */
+  seams: { write?: (path: string, data: string) => Promise<void> } = {},
 ): Promise<void> {
-  await writeFile(join(dir, serviceUnitName(kind, task.name)), units.service, 'utf-8')
-  await writeFile(join(dir, timerUnitName(kind, task.name)), units.timer, 'utf-8')
-
-  await runSystemctl(executor, ['daemon-reload'])
+  const write = seams.write ?? (async (path: string, data: string) => writeFileAtomic(path, data, { mode: 0o644 }))
+  const servicePath = join(dir, serviceUnitName(kind, task.name))
+  const timerPath = join(dir, timerUnitName(kind, task.name))
   const timer = timerUnitName(kind, task.name)
-  if (task.enabled)
-    await runSystemctl(executor, ['enable', '--now', timer])
-  else
-    await runSystemctl(executor, ['disable', '--now', timer])
+  // cr3.backup L10: what was there BEFORE is read first — the two unit texts
+  // (null = no file) and whether the timer was ENABLED — so a failure after
+  // any act puts back exactly what this write changed. The units ARE the task
+  // store: a failed `daemon-reload` or enable/disable used to fail the job
+  // while the new task stayed stored, read back as saved.
+  const [priorService, priorTimer] = await Promise.all([readPrior(servicePath), readPrior(timerPath)])
+  // The prior ENABLEMENT is the stored task's own `enabled` (the unit's marked
+  // JSON) — the store's word, read with no extra systemd call; null when there
+  // was no prior unit or it does not parse (then the rollback leaves the
+  // enablement alone rather than guess).
+  const priorEnabled = priorService === null ? null : priorTaskEnabled(kind, priorService)
+  let enablementTouched = false
+  try {
+    // Atomic (temp + rename): a crash or a full disk never leaves a truncated
+    // unit. cr3 review (4): BOTH writes are inside the rollback — a failed
+    // timer write must not leave the new service beside the old timer.
+    await write(servicePath, units.service)
+    await write(timerPath, units.timer)
+    await runSystemctl(executor, ['daemon-reload'])
+    enablementTouched = true
+    if (task.enabled)
+      await runSystemctl(executor, ['enable', '--now', timer])
+    else
+      await runSystemctl(executor, ['disable', '--now', timer])
+  }
+  catch (err) {
+    // cr3 review (4): `enable --now` can ENABLE and then fail to START; the
+    // enablement is systemd state this write changed, so it goes back too —
+    // to what it was (a create had none: disabled) — FIRST, while the unit
+    // file it names is still there.
+    const enablementBack = enablementTouched
+      ? await restoreEnablement(executor, timer, priorTimer === null ? false : priorEnabled, task.enabled)
+      : true
+    const restored = await restorePrior([[servicePath, priorService], [timerPath, priorTimer]], write)
+    await runSystemctl(executor, ['daemon-reload']).catch(() => undefined)
+    if (restored && enablementBack && err instanceof Error) {
+      err.message = `${err.message} - the task's previous units were put back, so nothing was changed`
+    }
+    else if (err instanceof Error) {
+      err.message = `${err.message} - and the previous state could not all be put back; the task's unit files `
+        + `in ${dir} or its timer's enablement may hold the new configuration`
+    }
+    throw err
+  }
+}
+
+/** The stored task's `enabled` in a unit's marked JSON, or null when it does not say. */
+function priorTaskEnabled(kind: TaskUnitKind, serviceText: string): boolean | null {
+  const parsed = parseMarkedJson(serviceText, kind.marker, PRIOR_ENABLED_SCHEMA)
+  return parsed === null ? null : parsed.enabled
+}
+
+/** Put the timer's enablement back when this write may have changed it. True when nothing is left changed. */
+async function restoreEnablement(executor: CommandExecutor, timer: string, prior: boolean | null, attempted: boolean): Promise<boolean> {
+  // cr3 review2 (8): a prior enablement ANAS could not read (an unparseable
+  // prior unit) is never claimed unchanged — the enable/disable that ran may
+  // have changed it, and nothing here knows what to put back.
+  if (prior === null)
+    return false
+  if (prior === attempted)
+    return true
+  try {
+    await runSystemctl(executor, prior ? ['enable', '--now', timer] : ['disable', '--now', timer])
+    return true
+  }
+  catch {
+    return false
+  }
+}
+
+/** A unit file's text before a write, or null when there was none (ENOENT); other errors throw. */
+async function readPrior(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, 'utf-8')
+  }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return null
+    throw err
+  }
+}
+
+/** Put each file back as it was (rewrite it, or remove the one this write created). True when all went back. */
+async function restorePrior(files: [string, string | null][], write: (path: string, data: string) => Promise<void>): Promise<boolean> {
+  let ok = true
+  for (const [path, prior] of files) {
+    try {
+      if (prior === null)
+        await unlink(path)
+      else
+        await write(path, prior)
+    }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+        ok = false
+    }
+  }
+  return ok
 }
 
 /**
@@ -250,7 +404,21 @@ export async function removeTaskUnits(
   dir: string,
   name: string,
 ): Promise<void> {
-  await executor.exec(SYSTEMCTL, ['disable', '--now', timerUnitName(kind, name)])
+  const timer = timerUnitName(kind, name)
+  const disabled = await executor.exec(SYSTEMCTL, ['disable', '--now', timer])
+  // cr3.backup L10: a failed `disable --now` was ignored, and the files were
+  // removed under a timer that might still be armed. It may fail harmlessly
+  // (a unit file a hand already removed), so the ANSWER is asked: the timer
+  // must read inactive before anything is deleted; an active timer, or a state
+  // that cannot be read, refuses with nothing removed.
+  if (disabled.exitCode !== 0) {
+    const state = await executor.exec(SYSTEMCTL, ['show', '-p', 'ActiveState', '--value', timer]).catch(() => null)
+    const active = state === null || state.exitCode !== 0 ? null : state.stdout.trim()
+    if (active === null || active === 'active' || active === 'activating' || active === 'reloading') {
+      throw new Error(`could not stop ${timer} (${disabled.stderr.trim() || `systemctl disable exited with code ${disabled.exitCode}`})`
+        + `${active ? ` and it is still ${active}` : ' and its state could not be read'} - nothing was removed`)
+    }
+  }
   await Promise.all([
     unlinkQuiet(join(dir, serviceUnitName(kind, name))),
     unlinkQuiet(join(dir, timerUnitName(kind, name))),
@@ -700,6 +868,13 @@ export interface TaskStatusSubject extends ScheduledTask {
 }
 
 export interface TaskStatus {
+  /**
+   * cr3 (INVENTED-STATE-H1): `systemctl show` of the service could not be
+   * read at all (a running systemd always answers the asked properties, even
+   * for a unit it does not know), so the row's result is not a finding, it is
+   * a failed read. Absent when the read answered.
+   */
+  statusUnreadable?: true
   lastRunResult: TaskRunResult
   lastRunAt: string | null
   nextRunAt: string | null
@@ -753,7 +928,7 @@ export async function deriveTaskStatus(
   // ONE journal read per row, shared by the derivation's rungs and the
   // last-success lookup below (whichever needs it first pays for it).
   const readJournal = readOnce(() => readRecentJournal(kind, executor, task.name))
-  const { lastRunResult, lastRunAt, lastRunNote, nextRunAt, runActive } = await deriveUnitRunStatus(executor, {
+  const { lastRunResult, lastRunAt, lastRunNote, nextRunAt, runActive, serviceProps } = await deriveUnitRunStatus(executor, {
     serviceUnit: serviceUnitName(kind, task.name),
     timerUnit: timerUnitName(kind, task.name),
     enabled: task.enabled,
@@ -784,6 +959,7 @@ export async function deriveTaskStatus(
     lastSuccessAt,
     runActive,
     ...(lastRunNote ? { lastRunNote } : {}),
+    ...(showReadFailed(serviceProps) ? { statusUnreadable: true as const } : {}),
   }
 }
 
@@ -1285,28 +1461,58 @@ export function buildTaskWarnings(kind: TaskUnitKind, inputs: TaskWarningInput[]
 }
 
 /**
- * Collect a kind's dashboard warnings from its task store, fail-open. `readTasks`
- * is the store's own reader (each kind parses its own canonical JSON); every
- * status read after that is this module's. Mirrors how replication/mount
- * warnings are wired into GET /v1/status.
+ * Collect a kind's dashboard warnings from its task store. `readTasks` is the
+ * store's own reader (each kind parses its own canonical JSON); every status
+ * read after that is this module's. Mirrors how replication/mount warnings are
+ * wired into GET /v1/status.
+ *
+ * cr3 (INVENTED-STATE-H1): a read that FAILED THROWS, so the dashboard's
+ * `readDashboardSection` marks the section unavailable. It used to catch
+ * everything and return `[]` — a successful read of "no task needs
+ * attention" — and an unreadable unit directory showed as all clear. An
+ * unreadable unit DIRECTORY is that failure; a single unit whose JSON does not
+ * parse is not a read failure (a hand edit — the store skips it, as the list
+ * does), and a task whose status cannot be derived reads `unknown`, which the
+ * derivation already says per row.
  */
 export async function collectTaskWarnings(
   kind: TaskUnitKind,
   executor: CommandExecutor,
   dir: string,
-  readTasks: (dir: string) => Promise<TaskStatusSubject[]>,
+  readTasks: (dir: string) => Promise<TaskStatusSubject[] | { tasks: TaskStatusSubject[], unreadable: UnreadableTaskUnit[] }>,
+  /**
+   * cr3: the dashboard's partial-read callback (the pools branch's section
+   * reader passes it). With it, a section where SOME rows could not be read
+   * keeps its readable warnings and says what it could not see. Without it,
+   * any unread row fails the whole section (never "all clear").
+   */
+  incomplete?: (reason: string) => void,
 ): Promise<DashboardWarning[]> {
+  // An ABSENT unit directory is an empty store (nothing was ever written);
+  // any other failure to list it is a failed read.
   try {
-    const tasks = await readTasks(dir)
-    const inputs = await Promise.all(
-      tasks.map(async (task): Promise<TaskWarningInput> => {
-        const st = await deriveTaskStatus(kind, executor, task)
-        return { name: task.name, enabled: task.enabled, lastRunResult: st.lastRunResult, overdue: st.overdue }
-      }),
-    )
-    return buildTaskWarnings(kind, inputs)
+    await readdir(dir)
   }
-  catch {
-    return []
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+      throw new Error(`the ${kind.title.toLowerCase()} task units in ${dir} could not be listed (${err instanceof Error ? err.message : String(err)})`)
   }
+  const read = await readTasks(dir)
+  const tasks = Array.isArray(read) ? read : read.tasks
+  const unreadableUnits = Array.isArray(read) ? [] : read.unreadable
+  const statuses = await Promise.all(tasks.map(async task => ({ task, st: await deriveTaskStatus(kind, executor, task) })))
+  // cr3 (INVENTED-STATE-H1): a row whose status could not be read derives
+  // `unknown`, which warns about nothing — the section would read all clear.
+  const unreadRows = statuses.filter(r => r.st.statusUnreadable).map(r => r.task.name)
+  const unseen = [
+    ...unreadableUnits.map(u => `${kind.title} task '${u.name}': ${u.reason}`),
+    ...(unreadRows.length ? [`systemd could not be asked about ${kind.title.toLowerCase()} task${unreadRows.length === 1 ? '' : 's'} ${unreadRows.map(n => `'${n}'`).join(', ')}`] : []),
+  ]
+  const readable = statuses.filter(r => !r.st.statusUnreadable)
+  if (unseen.length && (readable.length === 0 || !incomplete))
+    throw new Error(unseen.join('; '))
+  if (unseen.length && incomplete)
+    incomplete(unseen.join('; '))
+  const inputs: TaskWarningInput[] = readable.map(({ task, st }) => ({ name: task.name, enabled: task.enabled, lastRunResult: st.lastRunResult, overdue: st.overdue }))
+  return buildTaskWarnings(kind, inputs)
 }

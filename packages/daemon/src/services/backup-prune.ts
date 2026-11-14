@@ -1,7 +1,7 @@
 import type { BackupPruneResult, BackupPruneSnapshot, BackupPruneVerdict, BackupRepo, BackupRetention, BackupTask } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import { hasRetentionKeeps } from '@anas/shared'
-import { buildBackupEnv, effectiveNamespace, firstErrorLine, PBC } from './backup-runner.js'
+import { buildBackupEnv, effectiveNamespace, firstErrorLine, PBC, pbcPositional } from './backup-runner.js'
 import { maskSecretValues } from './secret-argv.js'
 
 /**
@@ -121,7 +121,7 @@ export interface PruneArgsOptions {
  * json`. Only the keeps the task actually configured are emitted.
  */
 export function buildPruneArgs(opts: PruneArgsOptions): string[] {
-  const args: string[] = ['prune', pruneGroup(opts.backupId)]
+  const args: string[] = ['prune', pbcPositional(pruneGroup(opts.backupId), 'group')]
   if (opts.namespace)
     args.push('--ns', opts.namespace)
   for (const { key, flag } of KEEP_FLAGS) {

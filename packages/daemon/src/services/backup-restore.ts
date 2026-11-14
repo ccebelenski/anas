@@ -13,8 +13,8 @@ import { constants } from 'node:fs'
 import { stat, unlink } from 'node:fs/promises'
 import { buildCreateArgs } from '../routes/datasets.js'
 import { ensureAhrTargetOrdering } from './ahr-create.js'
-import { classifyPermissionFailure, PBC } from './backup-runner.js'
-import { backstorePath, createAndMapLun, createSparseImage, newSerial, runTargetcli, saveIscsiConfig, setIscsiTargetState, tpgPath, withIscsiLock, ZFS, zvolDataset } from './iscsi-mutate.js'
+import { classifyPermissionFailure, PBC, pbcPositional, withStateLeftBehind } from './backup-runner.js'
+import { createAndMapLun, createSparseImage, newSerial, runTargetcli, saveIscsiConfig, setIscsiTargetState, tpgPath, withIscsiLock, ZFS, zvolDataset } from './iscsi-mutate.js'
 import { maskSecretValues } from './secret-argv.js'
 
 /**
@@ -68,8 +68,15 @@ import { maskSecretValues } from './secret-argv.js'
 /** Splits a pbc stream into lines: its progress lines are CR-terminated (GT-59). */
 const LINE_SPLIT_RE = /[\r\n]+/
 
-/** targetcli's answer to a `delete` of a backstore that does not exist. */
-const NO_SUCH_OBJECT_RE = /no such object/i
+/**
+ * targetcli's answer to a `delete` of a backstore that does not exist. The
+ * parent form (`/backstores/<plugin> delete <name>`, cr3.backup) is proven by
+ * GT-42 to delete; its not-found wording is not captured, so the three
+ * spellings configshell/targetcli use for a missing child or path are all
+ * read as "nothing there" (unverified on the node — a wording outside them is
+ * reported as left behind, never as removed).
+ */
+const NO_SUCH_OBJECT_RE = /no such object|no storage object named|no such path/i
 
 /** `zfs get -Hp -o value volsize <dataset>` — the zvol target's exact size. */
 export function volsizeArgs(dataset: string): string[] {
@@ -90,7 +97,9 @@ export function imageRestoreArgs(
   namespace?: string,
   rate?: string,
 ): string[] {
-  const args = ['restore', snapshot, archive, '-']
+  // The `-` target is this builder's own constant (stdout, GT-39), not a value
+  // from anywhere: it is the one positional that legitimately IS a dash.
+  const args = ['restore', pbcPositional(snapshot, 'snapshot'), pbcPositional(archive, 'archive'), '-']
   if (namespace)
     args.push('--ns', namespace)
   if (rate)
@@ -641,6 +650,10 @@ export async function runImageRestore(
   let partial: string | null = null
   let bytesWritten = 0
   let duration: string | undefined
+  // cr3.backup M5: a failed restore's error carries a failed re-enable.
+  let failed = false
+  let failure: unknown
+  const stillDisabled: string[] = []
 
   // ---- 1. Re-check + disable: ONE locked section --------------------------
   // Under the lock so nothing else can mutate the LIO tree between the answer
@@ -776,6 +789,13 @@ export async function runImageRestore(
       )
     }
   }
+  catch (err) {
+    // cr3.backup M5: held, not swallowed — the `finally` below may add the one
+    // sentence the operator most needs (the target is still offline), and it
+    // rides THIS error, since a warnings list never reaches anyone on failure.
+    failed = true
+    failure = err
+  }
   finally {
     // A partial write is the ONE case that stays offline: serving half an image
     // is worse than serving nothing, and the operator's explicit re-enable is
@@ -794,7 +814,7 @@ export async function runImageRestore(
       catch (err) {
         // No `throw` in a `finally`: it would REPLACE the restore's own error,
         // which is always the more informative one. It is said loudly instead.
-        warnings.push(
+        stillDisabled.push(
           `THE TARGET IS STILL DISABLED: re-enabling ${target.iqn} failed `
           + `(${err instanceof Error ? err.message : String(err)}). No initiator can log in until you `
           + `enable it again from the iSCSI screen.`,
@@ -802,6 +822,9 @@ export async function runImageRestore(
       }
     }
   }
+  warnings.push(...stillDisabled)
+  if (failed)
+    throw withStateLeftBehind(failure, stillDisabled)
 
   const result: BackupImageRestoreResult = {
     snapshot: deps.snapshot,
@@ -884,6 +907,14 @@ export interface NewLunRestoreDeps {
    * waits its turn behind whatever took the key during the stream.
    */
   beforeUndo?: () => Promise<void>
+  /**
+   * cr3.backup (iSCSI review): the storage objects the SAVED LIO configuration
+   * holds right now (`saveconfig.json`), or null when it cannot be read — what
+   * a failed run's cleanup asks to learn whether another verb's `saveconfig`
+   * persisted this run's half-written LUN during the stream. Absent = not
+   * checked (the pre-cr3 behaviour).
+   */
+  persistedBackstores?: () => Promise<{ name: string, wwn: string | null }[] | null>
 }
 
 /**
@@ -955,6 +986,15 @@ export function newLunZvolCreateArgs(dataset: string, size: number): string[] {
  * live-then-save model (the add-LUN door has the same window, only milliseconds
  * wide), and the stateless principle wins: adding a persistent "restore in
  * flight" marker would be shadow state the health diff already makes unnecessary.
+ *
+ * cr3.backup R1 — CORRECTION, the paragraph above is true only when nothing else
+ * saves meanwhile. The stream runs with the iSCSI mutex released and EVERY other
+ * iSCSI verb ends in `saveconfig`, which persists the live tree with this
+ * half-written LUN in it. A failed run then re-saves after its undo (see
+ * removeNewLun); a CRASH in that window leaves the LUN persisted at the right
+ * size, `lun-not-persisted` silent, and the half image served after restart.
+ * Open: the options are in the cr3.backup report (the narrow fix needs the
+ * iSCSI area's create/map split and an unmapped-backstore hold and health row).
  */
 export async function runNewLunImageRestore(
   executor: CommandExecutor,
@@ -972,6 +1012,9 @@ export async function runNewLunImageRestore(
   let serial = ''
   // What this run has created so far — the cleanup's work list.
   const state = { backingCreated: false, backstoreTouched: false, mapped: false }
+  // cr3 review (8): set once the restore is complete and only the final save
+  // failed — then nothing is undone.
+  let keepWhatWasMade = false
 
   try {
     // ---- 0. The destination as it is NOW (cr.40) ---------------------------
@@ -1103,6 +1146,8 @@ export async function runNewLunImageRestore(
       warnings.push(`could not re-read the size of ${backing.path}: ${size.error}`)
     else if (size.size !== deps.imageSize)
       warnings.push(`${backing.path} is ${size.size} bytes after the restore, not the image's ${deps.imageSize}`)
+    // cr3 review2 (4): "in full" is said only when the size read back and agreed.
+    const sizeVerified = !('error' in size) && size.size === deps.imageSize
 
     // ---- 5. Only NOW is the LUN persisted -----------------------------------
     updateProgress('Saving the LIO configuration')
@@ -1113,20 +1158,33 @@ export async function runNewLunImageRestore(
       await withIscsiLock(async () => saveIscsiConfig(executor))
     }
     catch (err) {
+      // cr3 review (8): the restore is COMPLETE and verified; only the save
+      // failed, and a save can be retried. The LUN, its backstore and its
+      // volume are KEPT — the cleanup below must not throw a whole restored
+      // disk away over it.
+      keepWhatWasMade = true
+      // cr3 review2 (4): no "or run Repair" — Repair re-creates SAVED LUNs that
+      // are not live; a live, unsaved LUN is nothing it repairs. And the
+      // step-4 warnings ride this error, which would otherwise drop them.
+      const written = sizeVerified
+        ? 'the image was restored in full'
+        : `the image was written but its size could not be confirmed (${warnings.join('; ')})`
+      const others = sizeVerified && warnings.length ? ` Also: ${warnings.join('; ')}.` : ''
       throw new Error(
-        `the image was written in full and LUN ${index} ('${deps.name}') is live on ${target.iqn}, `
-        + `but persisting the LIO configuration failed `
-        + `(${err instanceof Error ? err.message : String(err)}) — the LUN will be gone after a `
-        + 'reboot until the configuration is saved from the iSCSI screen.',
+        `${written} and LUN ${index} ('${deps.name}') on ${target.iqn} is live, but saving the iSCSI configuration `
+        + `failed: ${err instanceof Error ? err.message : String(err)}; it will not survive a restart of the target `
+        + `service until the configuration is saved: retry with any iSCSI change.${others}`,
       )
     }
   }
   catch (err) {
+    if (keepWhatWasMade)
+      throw err
     const base = err instanceof Error ? err.message : String(err)
     // The undo unmaps the LUN from the target: under the target's key again.
     if (state.mapped)
       await deps.beforeUndo?.()
-    const cleanup = await removeNewLun(executor, deps, index, state)
+    const cleanup = await removeNewLun(executor, deps, index, serial, state)
     if (cleanup)
       throw new Error(`${base} ${cleanup}`)
     throw err
@@ -1165,6 +1223,7 @@ async function removeNewLun(
   executor: CommandExecutor,
   deps: NewLunRestoreDeps,
   index: number,
+  serial: string,
   state: { backingCreated: boolean, backstoreTouched: boolean, mapped: boolean },
 ): Promise<string> {
   if (!state.backingCreated && !state.backstoreTouched)
@@ -1188,7 +1247,11 @@ async function removeNewLun(
 
   if (state.backstoreTouched) {
     try {
-      await withIscsiLock(async () => runTargetcli(executor, [backstorePath(backing.plugin, deps.name), 'delete']))
+      // cr3.backup (iSCSI review): the PARENT form GT-42 proves
+      // (`backstores/fileio delete <name>`, exit 0 with a live session), the
+      // form every other delete in iscsi-mutate uses — not the object-level
+      // `/backstores/<plugin>/<name> delete`, which no capture proves.
+      await withIscsiLock(async () => runTargetcli(executor, [`/backstores/${backing.plugin}`, 'delete', deps.name]))
       removed.push(`backstore '${deps.name}'`)
     }
     catch (err) {
@@ -1224,9 +1287,46 @@ async function removeNewLun(
     }
   }
 
-  const tail = left.length
-    ? ` But this was left behind and needs your hand: ${left.join('; ')}`
-    : ''
-  return `The LUN and its backing were created for this restore seconds ago and are ANAS's to clean up: `
-    + `${removed.length ? `ANAS has removed ${removed.join(', ')}, so nothing of the failed restore remains` : 'nothing of it remains'}${tail}.`
+  // cr3.backup (iSCSI review): the stream ran with the iSCSI mutex released
+  // (by design — it lasts hours), and every other iSCSI verb ends in
+  // `saveconfig`, which persists the LIVE tree — this half-written LUN
+  // included. The undo above changes only the live tree, so a LUN another verb
+  // persisted mid-stream would come back at boot over a backing this cleanup
+  // just destroyed. The saved configuration is READ (the system's own record,
+  // not a marker): when it holds THIS run's backstore — its name AND the fresh
+  // serial this run minted — and the undo removed everything, the live tree is
+  // saved once more, under the lock, after the target's gates (LIO saveable)
+  // are re-proved. Otherwise nothing is saved, exactly as before: a save
+  // after a partial undo would persist that half state.
+  if (state.mapped && left.length === 0 && deps.persistedBackstores) {
+    const persisted = await deps.persistedBackstores().catch(() => null)
+    if (persisted === null) {
+      left.push(`the saved LIO configuration could not be read to check whether another iSCSI change persisted `
+        + `LUN '${deps.name}' during the restore - if it did, the LUN comes back at the next boot; check the `
+        + `iSCSI screen and save the configuration from there`)
+    }
+    else if (persisted.some(o => o.name === deps.name && o.wwn !== null && o.wwn === serial)) {
+      try {
+        await withIscsiLock(async () => {
+          await deps.refresh()
+          await saveIscsiConfig(executor)
+        })
+        removed.push(`the copy of it another iSCSI change had saved during the restore`)
+      }
+      catch (err) {
+        left.push(`another iSCSI change saved LUN '${deps.name}' during the restore and the configuration could not `
+          + `be saved again without it (${err instanceof Error ? err.message : String(err)}) - it comes back at the `
+          + `next boot until the configuration is saved from the iSCSI screen`)
+      }
+    }
+  }
+
+  // cr3 review2 (6): one true sentence per outcome.
+  if (!left.length) {
+    return `The LUN and its backing were created for this restore seconds ago and are ANAS's to clean up: `
+      + `ANAS has removed ${removed.join(', ')}, so nothing of the failed restore remains.`
+  }
+  return `The LUN and its backing were created for this restore seconds ago: `
+    + `${removed.length ? `ANAS removed ${removed.join(', ')}. ` : 'ANAS could not remove any of it. '}`
+    + `This was left behind and needs your hand: ${left.join('; ')}.`
 }

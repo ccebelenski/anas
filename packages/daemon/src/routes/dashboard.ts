@@ -170,7 +170,7 @@ export async function dashboardRoutes(
       // unavailable with the error's message as the reason — and never
       // answers [] for a read it could not make.
       readSection('mounts', [] as DashboardWarning[], exec => collectMountWarnings(exec, { fstabPath, storagePath, mdadmConfPath })),
-      readSection('backup', [] as DashboardWarning[], exec => collectBackupWarnings(exec, systemdDir)),
+      readSection('backup', [] as DashboardWarning[], (exec, incomplete) => collectBackupWarnings(exec, systemdDir, incomplete)),
       // Cloud sync (rclone.2): failed/overdue enabled tasks → 'cloud' warnings,
       // the same rule and the same code backup's go through (task-units.ts with
       // the cloud descriptor). Healthy and disabled tasks contribute nothing.

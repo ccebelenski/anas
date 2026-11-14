@@ -111,6 +111,8 @@ export interface ConsistencyFacts {
    * true, every dataset is judged PVE-owned and every source derives `live`.
    */
   storagesUnavailable: boolean
+  /** Why PVE's storages could not be placed, when the read succeeded but a dir storage's dataset is unknown (pve-footprint). */
+  storagesUnavailableCause?: string
   /**
    * Boot facts per imported pool, for the system rule of the footprint
    * predicate. `null` (or omitted) means UNREADABLE — not "no system pool" —
@@ -146,7 +148,7 @@ export async function readConsistencyFacts(
   // toward hands-off through the whole-pool fallback, exactly like the
   // footprint service does.
   const systemFacts = pve.systemFactsUnavailable ? null : pve.systemFacts
-  return { mounts, ahrPools, ahrUnreadable, pveStorages: pve.storagesByPool, storagesUnavailable: pve.storagesUnavailable, systemFacts }
+  return { mounts, ahrPools, ahrUnreadable, pveStorages: pve.storagesByPool, storagesUnavailable: pve.storagesUnavailable, ...(pve.storagesUnavailableCause !== undefined && { storagesUnavailableCause: pve.storagesUnavailableCause }), systemFacts }
 }
 
 /** The two facts that say which filesystem a path lives on (the mount table, the AHR pools). */
@@ -309,7 +311,7 @@ export function deriveConsistency(
   // including the descendant scan, asks through here and never re-states the
   // rule.
   const ownershipOf = (dataset: string) =>
-    ownershipWithFallback(facts.pveStorages, facts.systemFacts ?? null, dataset, facts.storagesUnavailable)
+    ownershipWithFallback(facts.pveStorages, facts.systemFacts ?? null, dataset, facts.storagesUnavailable, facts.storagesUnavailableCause)
 
   // A source that is ALREADY inside somebody's `.zfs/snapshot/<s>` tree is a
   // frozen, read-only view: there is nothing to make consistent, and snapshotting

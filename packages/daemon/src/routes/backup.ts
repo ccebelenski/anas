@@ -22,20 +22,23 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { LockClaim } from '../jobs/locks.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { PbsStorageDef } from '../parsers/pve-storage.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { Gate, GuardPass, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { ConsistencyFacts } from '../services/backup-consistency.js'
 import type { BackupReposPaths } from '../services/backup-repos.js'
-import type { SelectionFacts } from '../services/backup-restore-files.js'
+import type { PathKindProbe, SelectionFacts } from '../services/backup-restore-files.js'
 import type { TargetObject } from '../services/iscsi-guard.js'
 import type { BackingRefusal, ResolvedAhrPool, ResolvedBacking } from '../services/iscsi-mutate.js'
 import type { IscsiPaths, IscsiReadContext } from '../services/iscsi.js'
 import type { SourceClaims } from '../services/source-claims.js'
 import type { UnitTaskObject } from '../services/task-units.js'
 import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
   BackupBrowseRequest,
+  BackupGroupPath,
   BackupName,
   BackupNestedPreviewRequest,
   BackupPrunePreviewRequest,
@@ -43,6 +46,8 @@ import {
   BackupRepoTestRequest,
   BackupRestoreRequest,
   BackupRunRequest,
+  backupTaskFieldProblems,
+  backupTaskProblems,
   BackupTaskRequest,
   classifyArchiveFile,
   composeGroupId,
@@ -52,13 +57,15 @@ import {
   groupOfSnapshotId,
   hasRetentionKeeps,
   lunBackupId,
+  parseSnapshotId,
   UpsertBackupRepoRequest,
 } from '@anas/shared'
 import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
 import { READ_JOB_OPERATIONS, readJobCancel } from '../jobs/read-jobs.js'
 import { readFindmntTable } from '../parsers/findmnt.js'
-import { readPbsStorages, readPveTerritoryClaims } from '../parsers/pve-storage.js'
+import { LIO_SAVECONFIG_PATH, parseLioSaveconfig } from '../parsers/lio-saveconfig.js'
+import { readPbsStorages, readPbsStoragesChecked as readPbsStoragesCheckedAt, readPveTerritoryClaims } from '../parsers/pve-storage.js'
 import { directFromClientRefusal, TASK_RUNNER_USER } from '../runner-poll.js'
 import { guardCheck, guardConfirm, guarded, GuardReads, GuardRefusalError, iscsiTargetClaim, reverify, sendRefusal, sourcePathsMoved, taskClaim, unheldClaimsRefusal, zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
@@ -88,7 +95,7 @@ import {
   bareArchiveName,
   estimateSpace,
   parentDirectory,
-  pathKind,
+  probePathKind,
   readSelectionFacts,
   restoreTerritoryRefusal,
   runFileRestore,
@@ -115,6 +122,7 @@ import {
   runBackup,
   tcpReachable,
 } from '../services/backup-runner.js'
+import { destroyTaskZfsTransients, listTaskZfsTransients } from '../services/backup-snapshots.js'
 import {
   BACKUP_UNIT_KIND,
   clearCancelledRunFailedState,
@@ -122,7 +130,9 @@ import {
   DISABLED_HISTORY_NOTE,
   effectiveSchedule,
   gateRun,
+  mergeBackupTaskUpdate,
   readAllTasks,
+  readAllTasksChecked,
   readRecentJournal,
   readRunActive,
   readTask,
@@ -154,10 +164,44 @@ import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from '../services/iscsi.js'
 import { normalizeMountpointPath } from '../services/mounts.js'
 import { imageArchiveScan, NESTED_SCAN_PREVIEW_TIMEOUT_S, scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
-import { pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
-import { readSourceGuardFacts, unmountedMountFor } from '../services/source-guard.js'
+import { datasetSourceClaims, pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
+import { notThereClause, readSourceGuardFacts, unmountedMountFor, unreadableFactsRefusal } from '../services/source-guard.js'
 import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision, taskRunInFlight } from '../services/task-units.js'
 import { requireIdentity } from './identity.js'
+
+/**
+ * cr3.backup: why `task`'s archive homes do NOT belong to a restore of
+ * `snapshot` from `repo` in `namespace` (the request's effective one), or null
+ * when they do — the same repository, the same effective namespace (the
+ * task's own, else its repository's), and the snapshot's group `host/<backupId>`.
+ */
+function taskHomeMismatch(
+  task: BackupTask,
+  taskNamespace: string | undefined,
+  repo: string,
+  namespace: string | undefined,
+  snapshot: string,
+): string | null {
+  const group = groupOfSnapshotId(snapshot)
+  const taskGroup = composeGroupId('host', task.backupId)
+  if (task.repository !== repo)
+    return `it is not from backup task '${task.name}' (that task writes repository '${task.repository}', not '${repo}')`
+  if ((taskNamespace ?? '') !== (namespace ?? ''))
+    return `it is not from backup task '${task.name}' (that task writes namespace '${taskNamespace ?? '(root)'}', not '${namespace ?? '(root)'}')`
+  if (group !== taskGroup)
+    return `it is not from backup task '${task.name}' (that task writes the group ${taskGroup}, this snapshot is in ${group ?? 'no group'})`
+  return null
+}
+
+/** cr3.backup: a route helper has already sent its answer. */
+const REPLIED = Symbol('replied')
+
+/**
+ * cr3.backup: storage.cfg could not be read, so a `pve:<id>` repository is
+ * unresolvable — thrown by the resolution (jobs fail with it; routes answer
+ * 503 through resolveAtRoute), never read as "no such repository".
+ */
+class PveStoragesUnreadableError extends Error {}
 
 /**
  * PBS file backup routes (Epic 16) — the repositories registry (CAS corosync
@@ -315,13 +359,32 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
    * `credentialsSet` reflecting whether the `.pw` file exists. Read-only; the
    * secret itself is NEVER read here (only at exec/test time). FAIL-OPEN.
    */
-  async function pveRepoResponses(): Promise<BackupRepoResponse[]> {
-    const defs = await readPbsStorages(paths.pveStorageCfg)
-    return Promise.all(defs.map(async (def): Promise<BackupRepoResponse> => ({
+  /**
+   * cr3.backup (handed by pools): PVE's PBS storages as ONE read that can say
+   * "unreadable". `readPbsStorages` answers `[]` on a read or parse failure, so
+   * a `pve:<id>` reference read "no such repository" when storage.cfg simply
+   * could not be read. The parser's checked reader tells an unreadable or
+   * unparseable file from an absent one. Every pve:<id> resolution in this
+   * file asks through here.
+   */
+  async function readPbsStoragesChecked(): Promise<{ defs: PbsStorageDef[] } | { unreadable: string }> {
+    const read = await readPbsStoragesCheckedAt(paths.pveStorageCfg)
+    return 'unreadable' in read
+      ? { unreadable: `could not read PVE's PBS storages (${read.unreadable}), so a pve:<storage-id> repository cannot be resolved` }
+      : read
+  }
+
+  async function pveRepoResponses(): Promise<{ repos: BackupRepoResponse[], unavailable?: string }> {
+    const read = await readPbsStoragesChecked()
+    if ('unreadable' in read)
+      return { repos: [], unavailable: read.unreadable }
+    const defs = read.defs
+    const repos = await Promise.all(defs.map(async (def): Promise<BackupRepoResponse> => ({
       ...pbsDefToRepo(def),
       credentialsSet: await pveSecretSet(paths.pvePrivStorageDir, def.id),
       source: 'pve',
     })))
+    return { repos }
   }
 
   /**
@@ -335,7 +398,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   ): Promise<{ repo: BackupRepo, secret: string | null } | null> {
     if (isPveRepoName(name)) {
       const id = pveStorageId(name)
-      const def = (await readPbsStorages(paths.pveStorageCfg)).find(d => d.id === id)
+      // cr3.backup: an unreadable storage.cfg is never "no such repository".
+      const read = await readPbsStoragesChecked()
+      if ('unreadable' in read)
+        throw new PveStoragesUnreadableError(read.unreadable)
+      const def = read.defs.find(d => d.id === id)
       if (!def)
         return null
       return { repo: pbsDefToRepo(def), secret: await readPveSecret(paths.pvePrivStorageDir, id) }
@@ -344,6 +411,32 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     if (!found)
       return null
     return { repo: found, secret: await readRepoSecret(paths.credsDir, name) }
+  }
+
+  /**
+   * cr3.backup: {@link resolveRepoAndSecret} for a ROUTE. A read that FAILED —
+   * PVE's storages (L11's sibling, handed by pools) or a stored secret file
+   * that exists and cannot be read (L11) — answers 503 with its sentence,
+   * never the 404 "not found" or 400 "no secret stored" a missing one gets.
+   * Returns {@link REPLIED} when it has answered.
+   */
+  async function resolveAtRoute(
+    name: string,
+    reply: FastifyReply,
+  ): Promise<{ repo: BackupRepo, secret: string | null } | null | typeof REPLIED> {
+    try {
+      return await resolveRepoAndSecret(name)
+    }
+    catch (err) {
+      reply.code(503)
+      reply.send({
+        error: {
+          code: 'UNAVAILABLE',
+          message: `Repository '${name}': ${err instanceof Error ? err.message : String(err)} - nothing was done`,
+        },
+      })
+      return REPLIED
+    }
   }
 
   /**
@@ -374,7 +467,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       Promise.all(reg.repos.map(toRepoResponse)),
       pveRepoResponses(),
     ])
-    return { data: { version: reg.version, repos: [...registered, ...pve] } }
+    // cr3.backup: an unreadable storage.cfg is SAID (additive `pveUnavailable`),
+    // never shown as "no PVE-defined repositories".
+    return { data: { version: reg.version, repos: [...registered, ...pve.repos], ...(pve.unavailable ? { pveUnavailable: pve.unavailable } : {}) } }
   })
 
   // --- POST /backup/repos — register (CAS) ----------------------------------
@@ -468,6 +563,29 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return CONFLICT(current.version)
     }
     const existing = current.repos.find(r => r.name === name)
+    // cr3.backup (panel L7): the stored secret belongs to ONE identity — a
+    // password of a user, or the secret of a token. A blank secret keeps the
+    // stored one, so an edit that changes the auth type, the token id or the
+    // username without a new secret would store the old value under another
+    // identity (a password sent as a token secret, one token's secret sent as
+    // another's). Refused, before anything is written.
+    // cr3.backup R3 (coordinator ruling): the same holds for WHERE it is sent —
+    // a host or port change with no secret would send the stored one to the
+    // new server on the next run or Test, exactly what the Test door refuses.
+    if (existing && !repo.secret) {
+      const changed = repoEndpointChange(existing, repo) ?? repoIdentityChange(existing, repo)
+      if (changed) {
+        reply.code(400)
+        return {
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: `Changing ${changed} of repository '${name}' needs the new `
+              + `${repo.authType === 'token' ? 'token secret' : 'password'}: the stored secret belongs to the `
+              + 'previous server and identity and is not kept for another.',
+          },
+        }
+      }
+    }
 
     // Advisory (NOT a block): changing a repo's auth style while tasks reference
     // it can strand them on the server's group-owner coupling (a group created
@@ -599,7 +717,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     let repo: BackupRepo
     let secret: string | null
     if (!req.host && req.name) {
-      const resolved = await resolveRepoAndSecret(req.name)
+      const resolved = await resolveAtRoute(req.name, reply)
+      if (resolved === REPLIED)
+        return reply
       if (!resolved) {
         reply.code(404)
         return { error: { code: 'NOT_FOUND', message: `Repository '${req.name}' not found` } }
@@ -634,11 +754,34 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       // promise, and exactly what the save path then honours. Test has to make
       // the same promise, or it fails auth on a repo that saves and runs fine.
       // The fallback is keyed on the NAME while the rest of the config comes
-      // from the request, so a repo whose host/datastore/token-id were edited is
-      // tested as it would actually be SAVED: the new fields, the stored secret.
+      // from the request, so a repo whose datastore, namespace or fingerprint
+      // was edited is tested as it would actually be SAVED: the new fields, the
+      // stored secret (cr3: a moved host, port or identity is refused below).
       secret = req.secret ?? null
       if (!secret && req.name) {
-        const resolved = await resolveRepoAndSecret(req.name)
+        const resolvedAt = await resolveAtRoute(req.name, reply)
+        if (resolvedAt === REPLIED)
+          return reply
+        const resolved = resolvedAt
+        // cr3.backup (backup review, other doors): the stored secret goes only
+        // to the server and identity it was stored for. A request that names a
+        // repository but points at another host or port, or another auth type
+        // or identity, would otherwise hand that secret to whatever answers
+        // there (a Sys.Modify caller could aim it anywhere). Refused, with the
+        // field that differs; entering the secret tests the new settings.
+        if (resolved) {
+          const moved = repoEndpointChange(resolved.repo, repo) ?? repoIdentityChange(resolved.repo, repo)
+          if (moved) {
+            reply.code(400)
+            return {
+              error: {
+                code: 'VALIDATION_ERROR',
+                message: `This test changes ${moved} of repository '${req.name}', so the stored secret is not used `
+                  + '(it is sent only to the server and identity it was saved for) - enter the secret to test the new settings.',
+              },
+            }
+          }
+        }
         secret = resolved?.secret ?? null
       }
     }
@@ -727,7 +870,8 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
    */
   function toTaskView(task: BackupTask, repos: BackupRepo[]): BackupTaskView {
     const eff = effectiveTaskKind(task)
-    const view: BackupTaskView = { ...task, legacyImgArchives: eff.legacyImgArchives }
+    const problems = backupTaskProblems(task)
+    const view: BackupTaskView = { ...task, legacyImgArchives: eff.legacyImgArchives, ...(problems.length ? { problems } : {}) }
     const datastore = datastoreOf(task, repos)
     if (datastore)
       view.datastore = datastore
@@ -777,9 +921,19 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid schedule '${expression}': ${schedule.error}` } })
       return false
     }
-    const known = isPveRepoName(task.repository)
-      ? (await readPbsStorages(paths.pveStorageCfg)).some(d => pveRepoName(d.id) === task.repository)
-      : (await readBackupRepos(paths)).repos.some(r => r.name === task.repository)
+    let known: boolean
+    if (isPveRepoName(task.repository)) {
+      const read = await readPbsStoragesChecked()
+      if ('unreadable' in read) {
+        reply.code(503)
+        reply.send({ error: { code: 'UNAVAILABLE', message: `Repository '${task.repository}': ${read.unreadable} - nothing was saved` } })
+        return false
+      }
+      known = read.defs.some(d => pveRepoName(d.id) === task.repository)
+    }
+    else {
+      known = (await readBackupRepos(paths)).repos.some(r => r.name === task.repository)
+    }
     if (!known) {
       reply.code(400)
       reply.send({ error: { code: 'VALIDATION_ERROR', message: `Repository '${task.repository}' is not registered` } })
@@ -843,11 +997,37 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
    * false on a collision.
    */
   async function guardGroupUnique(task: BackupTask, reply: FastifyReply, previous?: BackupTask | null): Promise<boolean> {
-    const [all, reg, pbs] = await Promise.all([
-      readAllTasks(systemdDir),
+    const [checked, reg, pbsRead] = await Promise.all([
+      readAllTasksChecked(systemdDir),
       readBackupRepos(paths),
-      readPbsStorages(paths.pveStorageCfg),
+      readPbsStoragesChecked(),
     ])
+    // cr3 review2 (7): a task whose unit could not be read or parsed may write
+    // this very group — uniqueness cannot be judged, so the save is refused
+    // (fail closed), naming it, rather than judged over a list that silently
+    // lacks it.
+    if (checked.unreadable.length) {
+      reply.code(503)
+      reply.send({
+        error: {
+          code: 'UNAVAILABLE',
+          message: `The backup group's uniqueness cannot be checked: ${checked.unreadable.map(u => `backup task '${u.name}' - ${u.reason}`).join('; ')}. `
+            + 'Nothing was saved; fix or delete that unit first.',
+        },
+      })
+      return false
+    }
+    const all = checked.tasks
+    // cr3.backup: without PVE's storages a pve:<id> task's namespace is unknown,
+    // and a group collision could pass unseen — refuse rather than guess. The
+    // group key carries the repository, so only a pve:<id> task (now or before
+    // the edit) can collide through an unknown namespace.
+    if ('unreadable' in pbsRead && (isPveRepoName(task.repository) || (previous && isPveRepoName(previous.repository)))) {
+      reply.code(503)
+      reply.send({ error: { code: 'UNAVAILABLE', message: `${pbsRead.unreadable}, so the backup group's uniqueness cannot be checked - nothing was saved` } })
+      return false
+    }
+    const pbs = 'defs' in pbsRead ? pbsRead.defs : []
     const nsByRepo = new Map<string, string | undefined>(reg.repos.map(r => [r.name, r.namespace]))
     for (const def of pbs)
       nsByRepo.set(pveRepoName(def.id), def.namespace)
@@ -870,18 +1050,28 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
 
   // --- GET /backup/tasks — grid (LOCAL-ONLY status) -------------------------
   server.get('/backup/tasks', async () => {
-    const [tasks, reg] = await Promise.all([readAllTasks(systemdDir), readBackupRepos(paths)])
+    // cr3 (INVENTED-STATE-H1): a unit file that could not be read or parsed is
+    // LISTED by name (additive `unreadableTasks`), never dropped as if the
+    // task did not exist.
+    const [checked, reg] = await Promise.all([readAllTasksChecked(systemdDir), readBackupRepos(paths)])
+    const tasks = checked.tasks
     // Merge tier-1 PVE repos so a task targeting `pve:<id>` still joins its datastore.
     const joinRepos = await reposForJoin(reg.repos)
     const data = await Promise.all(
       tasks.map(async (task): Promise<BackupTaskEntry> => {
-        const st = await deriveTaskStatus(executor, task)
+        const [st, revision] = await Promise.all([
+          deriveTaskStatus(executor, task),
+          // cr3.backup: the revision the update guard binds, for the lost-update
+          // check (`?expectedRevision=`). An unreadable unit leaves it absent.
+          readUnitTexts(systemdDir, task.name).then(u => serviceUnitRevision(u.unit), () => undefined),
+        ])
         // rclone.3 human-pass finding 2 (backup parity): while the run actually
         // executes, the running DIRECT job's progress text rides on the row —
         // same rule, same helper, as the Cloud Sync grid.
         // rclone.5: the same lookup hands over the job's id (Cancel run's target).
         const entry: BackupTaskEntry = {
           task: toTaskView(task, joinRepos),
+          ...(revision ? { revision } : {}),
           lastRunResult: st.lastRunResult,
           lastRunAt: st.lastRunAt,
           nextRunAt: st.nextRunAt,
@@ -907,7 +1097,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         return entry
       }),
     )
-    return { data }
+    return { data, ...(checked.unreadable.length ? { unreadableTasks: checked.unreadable } : {}) }
   })
 
   // --- POST /backup/tasks/preview-nested — the wizard's boundary scan -------
@@ -1099,6 +1289,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       : undefined
     const detail: BackupTaskDetail = {
       task: toTaskView(task, joinRepos),
+      revision: serviceUnitRevision(units.unit),
       lastRunResult: st.lastRunResult,
       lastRunAt: st.lastRunAt,
       nextRunAt: st.nextRunAt,
@@ -1197,7 +1388,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         unbound: () => `Could not read backup task '${name}' — refusing`,
       },
       gates: [async () => backupTaskActiveRunGate(name)],
-      locks: async () => [taskClaim('backup', name, 'exclusive')],
+      // cr3.backup L9: plus the datasets the task's leftover transients sit
+      // on, shared — the claims the run's own sweep destroys them under.
+      locks: async () => {
+        const leftovers = await listTaskZfsTransients(executor, name)
+        const datasets = [...new Set((leftovers ?? []).map(l => l.dataset))]
+        return [taskClaim('backup', name, 'exclusive'), ...(datasets.length ? await datasetSourceClaims(executor, datasets) : [])]
+      },
     }
   }
 
@@ -1220,6 +1417,12 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid backup task: ${bodyParsed.error.issues[0]?.message}` } }
     }
     const task = bodyParsed.data
+    // cr3 (review 8b, review2 3): a task pbc would refuse on every run is not created.
+    const createProblems = backupTaskFieldProblems(task)
+    if (createProblems.length) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid backup task: ${createProblems[0]!.message}` } }
+    }
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -1251,7 +1454,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   })
 
   // --- PUT /backup/tasks/:name — update / enable / disable ------------------
-  server.put<{ Params: { name: string } }>('/backup/tasks/:name', async (request, reply) => {
+  server.put<{ Params: { name: string }, Querystring: { expectedRevision?: string } }>('/backup/tasks/:name', async (request, reply) => {
     const nameParsed = BackupName.safeParse(request.params.name)
     if (!nameParsed.success) {
       reply.code(400)
@@ -1259,15 +1462,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     }
     const name = nameParsed.data
 
-    const bodyParsed = BackupTaskRequest.safeParse(request.body ?? {})
-    if (!bodyParsed.success) {
+    const rawBody = request.body ?? {}
+    if (typeof rawBody !== 'object' || Array.isArray(rawBody)) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid backup task: ${bodyParsed.error.issues[0]?.message}` } }
-    }
-    const task = bodyParsed.data
-    if (task.name !== name) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Task name in body ('${task.name}') does not match URL ('${name}')` } }
+      return { error: { code: 'VALIDATION_ERROR', message: 'Invalid backup task: the body must be a JSON object' } }
     }
 
     const identity = requireIdentity(request, reply)
@@ -1283,6 +1481,48 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const pre = await guardCheck(spec)
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
+
+    // cr3.backup (backup-panel M4, lost update): a client that read the task
+    // can bind its edit to THAT read — the revision the list and the detail
+    // return. A different stored unit means someone else saved meanwhile.
+    // Absent = today's behaviour (bound at the route only).
+    const expectedRevision = request.query.expectedRevision
+    if (expectedRevision !== undefined && expectedRevision !== serviceUnitRevision(pre.object.unit)) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'STATE_CHANGED',
+          message: `Backup task '${name}' was changed since you opened it - nothing was saved; reload it and edit again`,
+        },
+      }
+    }
+
+    // cr3.backup M4: a PUT keeps what the body omits and clears what it sends
+    // as null (EPICS §2 dialog contract) — the body is laid over the stored
+    // task read above, and the MERGED task is parsed once, so the update can
+    // never write a task the create door would refuse.
+    const bodyParsed = BackupTaskRequest.safeParse(mergeBackupTaskUpdate(pre.object.task, rawBody))
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid backup task: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const task = bodyParsed.data
+    if (task.name !== name) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Task name in body ('${task.name}') does not match URL ('${name}')` } }
+    }
+    // cr3 review2 (2)(3): a field pbc would refuse binds only the update that
+    // CHANGES it — the owner can always disable (or otherwise edit) a task
+    // ANAS shows; its standing problems ride the answer.
+    const storedTask = pre.object.task
+    const changed = (field: 'backupId' | 'archives' | 'namespace'): boolean =>
+      JSON.stringify(task[field] ?? null) !== JSON.stringify(storedTask[field] ?? null)
+    const updateProblems = backupTaskFieldProblems(task)
+    const blocking = updateProblems.find(p => changed(p.field))
+    if (blocking) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid backup task: ${blocking.message}` } }
+    }
     if (!(await guardTask(task, reply)))
       return reply
     if (!(await guardGroupUnique(task, reply, pre.object.task)))
@@ -1298,7 +1538,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       { locks: pre.locks },
     )
     reply.code(202)
-    return { job }
+    return { job, ...(updateProblems.length ? { problems: updateProblems.map(p => p.message) } : {}) }
   })
 
   // --- DELETE /backup/tasks/:name — remove the units (PBS data untouched) ---
@@ -1326,9 +1566,17 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const job = jobQueue.submit(
       'backup.task.remove',
       { ...identity, params: { task: name } },
-      guarded(spec, pre, async () => {
+      guarded(spec, pre, async (_now, ctx) => {
         await removeTaskUnits(executor, systemdDir, name)
-        return { removed: name }
+        // cr3.backup L9: no run of this task comes again, so nothing else
+        // would ever sweep its transients (a run sweeps only where its
+        // archives sit now). Destroyed here, under the dataset claims taken
+        // above; a listing that failed is said, never read as "none".
+        const leftovers = await listTaskZfsTransients(executor, name)
+        const warnings = leftovers === null
+          ? [`the node's ZFS snapshots could not be listed, so transient snapshots this task may have left (anas-backup-${name}-*) were not checked`]
+          : await destroyTaskZfsTransients(executor, leftovers, ctx.updateProgress)
+        return { removed: name, ...(warnings.length ? { warnings } : {}) }
       }),
       { locks: pre.locks },
     )
@@ -1639,7 +1887,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       }
     }
 
-    const resolved = await resolveRepoAndSecret(repository)
+    const resolved = await resolveAtRoute(repository, reply)
+    if (resolved === REPLIED)
+      return reply
     if (!resolved) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Repository '${repository}' not found` } }
@@ -1657,9 +1907,15 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       }
     }
 
-    // Effective namespace: the request's, else the stored task's, else the
-    // repo's own — the same fallback the run path uses.
-    const namespace = req.namespace ?? stored?.namespace ?? repo.namespace
+    // Effective namespace. cr3.backup (panel M3): the preview and the PUT read
+    // the field alike. A PRESENT string is authoritative — the panel sends the
+    // effective value, `''` meaning the datastore root. OMITTED or `null` is
+    // the task's namespace cleared, as the PUT reads an omitted or null
+    // namespace, so the effective one is the repo's own (as a saved task with
+    // none runs) — never the stored value the save is about to drop.
+    const namespace = typeof req.namespace === 'string'
+      ? req.namespace
+      : repo.namespace
     const outcome = await runPrune(executor, {
       repo,
       secret,
@@ -1706,7 +1962,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     reply: FastifyReply,
     namespaceOverride?: string,
   ): Promise<{ repo: BackupRepo, secret: string, namespace?: string } | null> {
-    const resolved = await resolveRepoAndSecret(reference)
+    const resolved = await resolveAtRoute(reference, reply)
+    if (resolved === REPLIED)
+      return null
     if (!resolved) {
       reply.code(404)
       reply.send({ error: { code: 'NOT_FOUND', message: `Repository '${reference}' not found` } })
@@ -1729,6 +1987,55 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // storage often carries one) — the same fallback every other path uses.
     const namespace = namespaceOverride ?? repo.namespace
     return { repo, secret, ...(namespace ? { namespace } : {}) }
+  }
+
+  /**
+   * cr3 review2 (1): {@link readDepsFor} for a READ or RESTORE request, with
+   * ONE meaning of its namespace per task. A request that NAMES a task takes
+   * the namespace from the stored task — a stored `''` is the datastore root,
+   * an absent one the repository's own (exactly where that task runs and
+   * prunes) — and a body `ns` that names a different namespace is refused (an
+   * empty `ns` never disagrees: it was the "not given" spelling). A request
+   * with no task keeps today's meaning: an empty `ns` is the repository's.
+   */
+  async function readDepsForRequest(
+    reference: string,
+    reply: FastifyReply,
+    bodyNs: string | undefined,
+    taskName: string | undefined,
+  ): Promise<{ repo: BackupRepo, secret: string, namespace?: string } | null> {
+    const given = bodyNs?.trim() || undefined
+    if (!taskName)
+      return readDepsFor(reference, reply, given)
+    const task = await readTask(systemdDir, taskName)
+    if (!task) {
+      reply.code(404)
+      reply.send({ error: { code: 'NOT_FOUND', message: `Backup task '${taskName}' not found` } })
+      return null
+    }
+    // The repository's own faults (unknown: 404; no credential: 400) answer
+    // first, as at every other door.
+    const deps = await readDepsFor(reference, reply, task.namespace)
+    if (!deps)
+      return null
+    if (task.repository !== reference) {
+      reply.code(400)
+      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Backup task '${taskName}' writes repository '${task.repository}', not '${reference}'` } })
+      return null
+    }
+    const effective = deps.namespace ?? ''
+    if (given !== undefined && given !== effective) {
+      reply.code(400)
+      reply.send({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: `Backup task '${taskName}' writes ${effective ? `namespace '${effective}'` : 'the datastore root'}, `
+            + `not namespace '${given}' - send the task's namespace, or no namespace`,
+        },
+      })
+      return null
+    }
+    return deps
   }
 
   /**
@@ -1806,6 +2113,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           ...(deps.namespace ? { namespace: deps.namespace } : {}),
           group,
           snapshots: outcome.data,
+          ...(outcome.warnings ? { warnings: outcome.warnings } : {}),
         }
       : {
           verdict: outcome.verdict,
@@ -1825,7 +2133,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   // endpoint returns — one picker, one parser, two doors.
   server.get<{
     Params: { name: string }
-    Querystring: { ns?: string, group?: string }
+    Querystring: { ns?: string, group?: string, task?: string }
   }>('/backup/repos/:name/groups', async (request, reply) => {
     const refParsed = BackupRepoRef.safeParse(request.params.name)
     if (!refParsed.success) {
@@ -1835,8 +2143,25 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const reference = refParsed.data
     const requestedNs = request.query.ns?.trim() || undefined
     const requestedGroup = request.query.group?.trim() || undefined
+    // cr3.backup H1: the group becomes a pbc POSITIONAL, and pbc reads a
+    // dash-led token as an option (`--repository=` sent the stored secret to
+    // a host the caller chose). Validated by the shared schema before anything
+    // reads the secret.
+    if (requestedGroup !== undefined) {
+      const groupParsed = BackupGroupPath.safeParse(requestedGroup)
+      if (!groupParsed.success) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Invalid group: ${groupParsed.error.issues[0]?.message}` } }
+      }
+    }
 
-    const deps = await readDepsFor(reference, reply, requestedNs)
+    // cr3 review2 (1): `?task=` (additive) names the task the group belongs to.
+    const requestedTask = request.query.task?.trim() || undefined
+    if (requestedTask !== undefined && !BackupName.safeParse(requestedTask).success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: 'Invalid task name' } }
+    }
+    const deps = await readDepsForRequest(reference, reply, requestedNs, requestedTask)
     if (!deps)
       return
 
@@ -1848,14 +2173,14 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     if (requestedGroup) {
       const outcome = await listSnapshots(executor, deps, requestedGroup)
       const data: BackupGroupList = outcome.ok
-        ? { verdict: 'ok', ...base, groups: [], group: requestedGroup, snapshots: outcome.data }
+        ? { verdict: 'ok', ...base, groups: [], group: requestedGroup, snapshots: outcome.data, ...(outcome.warnings ? { warnings: outcome.warnings } : {}) }
         : { verdict: outcome.verdict, detail: outcome.detail, ...base, groups: [], group: requestedGroup, snapshots: [] }
       return { data }
     }
 
     const outcome = await listGroups(executor, deps)
     const data: BackupGroupList = outcome.ok
-      ? { verdict: 'ok', ...base, groups: outcome.data }
+      ? { verdict: 'ok', ...base, groups: outcome.data, ...(outcome.warnings ? { warnings: outcome.warnings } : {}) }
       : { verdict: outcome.verdict, detail: outcome.detail, ...base, groups: [] }
     return { data }
   })
@@ -1881,7 +2206,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     if (!identity)
       return
 
-    const deps = await readDepsFor(req.repo, reply, req.ns?.trim() || undefined)
+    const deps = await readDepsForRequest(req.repo, reply, req.ns, req.task)
     if (!deps)
       return
 
@@ -2082,7 +2407,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // no stored credential) with its own 4xx. A PBS-side outcome comes back as a
     // VERDICT, which a picker renders as a message — but a restore cannot
     // proceed on one, so here it becomes a refusal that quotes it.
-    const deps = await readDepsFor(req.repo, reply, req.ns?.trim() || undefined)
+    const deps = await readDepsForRequest(req.repo, reply, req.ns, req.task)
     if (!deps)
       return reply
     const group = snapshotGroup(req.snapshot)
@@ -2191,6 +2516,16 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // choice the operator is allowed to make, and the warnings say exactly what
     // it costs.
     const otherLuns = target.luns.filter(l => l.index !== lun.index).length
+    // cr3.backup (backup-panel second review): the daemon takes no task here —
+    // the LUN is named explicitly and signed by serial — but a block task's
+    // group IS its LUN's identity (`lun-<serial>`, backup2.9). An image from
+    // ANOTHER LUN's group is a legitimate restore (a replacement disk) and a
+    // likely mistake; the confirm says which, so it is never silent.
+    const fromLun = parseSnapshotId(req.snapshot)?.backupId
+    const otherLunWarning = fromLun?.startsWith('lun-') && lun.serial && fromLun !== lunBackupId(lun.serial)
+      ? [`This image was backed up from ANOTHER LUN (${fromLun}); LUN ${lun.index} of ${target.iqn} is ${lunBackupId(lun.serial)}. `
+        + 'Restoring it here replaces this disk with that disk\'s contents.']
+      : []
     // ident.2 (audit #10): the code binds the LUN's SERIAL and the exact
     // snapshot + archive, never the index — a LUN re-created at the index, or
     // a different point in time picked inside the TTL, mints a new challenge.
@@ -2209,6 +2544,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       address: ['target', 'serial'],
       message: `Restoring ${req.archive} from ${req.snapshot} over LUN ${lun.index} of ${target.iqn}`,
       warnings: [
+        ...otherLunWarning,
         `This OVERWRITES ${lun.backingPath} completely — every byte currently on LUN ${lun.index} is replaced `
         + `by the ${imageSize} bytes in the backup, and there is no undo.`,
         `The WHOLE TARGET goes offline for the duration, not just this LUN: LIO's enable flag lives on the `
@@ -2429,6 +2765,25 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       }
     }
 
+    // cr3.backup (backup-panel): the daemon refuses a duplicate name itself -
+    // the panel cannot when its LUN inventory read fails. lunNameFreeGate sees
+    // MAPPED LUNs on every target; an UNMAPPED backstore of that name (any
+    // plugin) is in the live tree too, and a create over it would fail AFTER
+    // the backing was made - and the cleanup's delete-by-name would then
+    // remove THAT backstore, which this run never created. Both read the same
+    // guard read (route, job door, and again under the lock before the map);
+    // a read that fails refuses the restore (the target view's `unbound`).
+    const backstoreNameFreeGate: Gate<TargetObject> = async ({ state: st }) => {
+      const taken = st.ctx.live.backstores.find(b => b.name === newLun.name)
+      return taken
+        ? conflict({
+            reason: 'name-taken',
+            message: `A backstore named '${newLun.name}' already exists on this node (${taken.plugin}, not mapped as a LUN). `
+              + 'The name is the SCSI model string initiators see, so it has to be unique.',
+          })
+        : null
+    }
+
     const spec: GuardSpec<TargetObject> = {
       operation: 'backup.restore.image',
       // No revision: like an add, the restore is placed into whatever the
@@ -2443,7 +2798,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       }),
       // (2) target there and ANAS's, (3) the name free node-wide, (4) the
       // backing resolves onto ANAS storage — at the path that was confirmed.
-      gates: [saveableGate, foreignGate, lunNameFreeGate(newLun.name), backingGate, backingUnmovedGate],
+      gates: [saveableGate, foreignGate, lunNameFreeGate(newLun.name), backstoreNameFreeGate, backingGate, backingUnmovedGate],
       // §4.2: the target's key (the LUN set and the grants change) and the
       // keys the sibling verb that creates this backing takes — a zvol is a
       // dataset CREATE (its own key exclusive, every ancestor and the pool
@@ -2492,7 +2847,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // size is not an equality to prove here: the new backing is CREATED at
     // exactly that size. What it must be is KNOWN — a restore without the
     // manifest's number would be a LUN whose end nobody checked.
-    const deps = await readDepsFor(req.repo, reply, req.ns?.trim() || undefined)
+    const deps = await readDepsForRequest(req.repo, reply, req.ns, req.task)
     if (!deps)
       return reply
     const group = snapshotGroup(req.snapshot)
@@ -2560,8 +2915,17 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         + 'the original by its serial will see a different disk.',
         'The source LUN — the LUN this image was backed up from — is not touched: it stays online, keeps its '
         + 'serial, and no initiator has to log out.',
-        'If the restore fails part-way, ANAS removes the new LUN, its backstore and its backing — nothing of '
-        + 'the failed attempt is left behind, and the half-written state is never persisted.',
+        // cr3.backup R1: the old sentence ("the half-written state is never
+        // persisted") was false — the stream runs with the iSCSI lock released
+        // and any other iSCSI change saves the live LUN with it.
+        'If the restore fails part-way, ANAS removes the new LUN, its backstore and its backing. While the image '
+        + 'is being written the new LUN is live and its contents are incomplete: if the daemon or the node stops '
+        + 'before the restore ends and another iSCSI change saved the configuration meanwhile, the LUN comes back '
+        + 'looking complete - delete it and restore again.',
+        // cr3 review2 (5): the one failure that undoes nothing.
+        'If only saving the iSCSI configuration fails once the image is written, the LUN, its backstore and its '
+        + 'backing are kept and the job says so: the LUN is live but not saved, so retry the save with any iSCSI '
+        + 'change before the target service restarts.',
       ],
     })) {
       return reply
@@ -2647,6 +3011,21 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
             // taken again before a failed run's undo unmaps it.
             mapped: ctx.release,
             beforeUndo: ctx.reacquire,
+            // cr3.backup (iSCSI review): what saveconfig.json holds, for the
+            // failed run's cleanup to learn whether another verb's save
+            // persisted this half-written LUN while the lock was released.
+            // An ABSENT file has saved nothing (empty list); one that cannot
+            // be read or parsed is unknown (null), never "not there".
+            persistedBackstores: async () => {
+              let text: string
+              try {
+                text = await readFile(iscsiPaths.saveconfigPath ?? LIO_SAVECONFIG_PATH, 'utf8')
+              }
+              catch (err) {
+                return (err as NodeJS.ErrnoException).code === 'ENOENT' ? [] : null
+              }
+              return parseLioSaveconfig(text).storageObjects.map(o => ({ name: o.name, wwn: o.wwn }))
+            },
           },
           ctx.updateProgress,
         ).then((result) => {
@@ -2736,7 +3115,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       }
     }
 
-    const deps = await readDepsFor(req.repo, reply, req.ns?.trim() || undefined)
+    const deps = await readDepsForRequest(req.repo, reply, req.ns, req.task)
     if (!deps)
       return
 
@@ -2753,8 +3132,28 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const mode = req.target.mode
     let home = req.target.path
     if (!home && mode !== 'newLocation' && req.task) {
+      // cr3.backup (backup-panel second review): a task's archive home is the
+      // home of THAT TASK'S backups only — the request's repository, effective
+      // namespace and snapshot group must be exactly the task's. Before, any
+      // snapshot whose archive shared the NAME was restored into the task's
+      // live directory, with no confirm for a single file.
       const task = await readTask(systemdDir, req.task)
-      home = task?.archives.find(a => a.name === bareArchiveName(req.archive))?.path
+      const why = task
+        ? taskHomeMismatch(task, effectiveNamespace(task, deps.repo), req.repo, deps.namespace, req.snapshot)
+        : `there is no backup task '${req.task}'`
+      if (why) {
+        reply.code(400)
+        return {
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: `The original location of this snapshot is not known: ${why}. To restore it, choose a destination (target.path).`,
+          },
+        }
+      }
+      // cr3 review2 (9): the archive of this name AND kind — this door
+      // restores pxar archives only, so an image archive of the same name is
+      // never taken as a directory home.
+      home = task?.archives.find(a => a.name === bareArchiveName(req.archive) && effectiveArchiveKind(a) === 'pxar')?.path
     }
     if (!home) {
       reply.code(400)
@@ -2792,9 +3191,20 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
      * never share a fact.
      */
     const readDestination = (reads: GuardReads): RestoreDestination => {
-      // What is at the path: 'directory', another kind, or null (absent — or a
-      // probe that could not finish; the write test then asks again).
-      const kind = (): Promise<string | null> => reads.once('restore:kind', () => pathKind(executor, target))
+      // What is at the path: 'directory', another kind, or null when stat
+      // PROVED it absent. cr3.backup L8: a probe that could not answer (a
+      // timeout, ESTALE, EIO) is `unknown`, never absent — the kind gate
+      // refuses it rather than treating an existing directory as one this
+      // restore creates (confirm skipped, a failure's cleanup aimed at it).
+      const probe = (): Promise<PathKindProbe> => reads.once('restore:kind', () => probePathKind(executor, target))
+      const kind = async (): Promise<string | null> => {
+        const p = await probe()
+        return 'kind' in p ? p.kind : null
+      }
+      const kindUnknown = async (): Promise<string | null> => {
+        const p = await probe()
+        return 'unknown' in p ? p.unknown : null
+      }
       // In place is ALWAYS a merge; a newLocation merges only into a directory
       // that already exists — the shape that earns the confirm.
       const merge = async (): Promise<boolean> => mode === 'inPlace' || (await kind()) === 'directory'
@@ -2828,7 +3238,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       })
       // The filesystem the destination is on, as the lock keys name it.
       const claims = (): Promise<SourceClaims> => reads.once('restore:claims', () => pathSourceClaims(executor, [target], readAhrPools))
-      return { target, kind, merge, writeDir, selection, space, claims }
+      return { target, kind, kindUnknown, merge, writeDir, selection, space, claims }
     }
 
     // --- The gates: each one function, run by both doors ---------------------
@@ -2869,12 +3279,44 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       const refusal = heldByLunRefusal(`'${o.target}'`, 'Restoring files into', held)
       return { status: 409, code: 'CONFLICT', reason: refusal.reason, message: refusal.message }
     }
+    // (1c) cr3.backup M7: the backup2.11 source guard's failure model, on the
+    // WRITE side. A destination under a mount the system is configured to
+    // have and does not have right now (an fstab mount that did not come up,
+    // a ZFS dataset not mounted — key not loaded, canmount=noauto) is an empty
+    // directory on the PARENT filesystem: the restore would "complete" there
+    // and its files would vanish under the real mount when it arrives. The
+    // same facts and the same sentence the backup run refuses a source with.
+    const unmountedGate: Gate<RestoreDestination> = async (o, reads) => {
+      const facts = await reads.once('restore:guard-facts', () => readSourceGuardFacts(executor, fstabPath, [o.target]))
+      const unreadable = unreadableFactsRefusal(o.target, facts)
+      if (unreadable)
+        return { status: 503, code: 'UNAVAILABLE', message: `${unreadable}. Nothing was restored.` }
+      const mount = unmountedMountFor(o.target, facts)
+      if (!mount)
+        return null
+      return {
+        status: 409,
+        code: 'CONFLICT',
+        reason: 'destination-unmounted',
+        message: `'${o.target}' is on ${mount.mountpoint} (${mount.source}), which is ${notThereClause(mount)} - `
+          + 'a restore there would land on the filesystem underneath and be hidden when it mounts. Nothing was restored.',
+      }
+    }
     // (2) A newLocation into a path that exists and is NOT a directory: there
     // is nothing to merge into. (One that IS a directory is the operator's
     // choice — ruling 2026-08-29 — and earns the confirm below.)
     const kindGate: Gate<RestoreDestination> = async (o) => {
       if (mode !== 'newLocation')
         return null
+      const unknown = await o.kindUnknown()
+      if (unknown !== null) {
+        return {
+          status: 503,
+          code: 'UNAVAILABLE',
+          message: `ANAS could not tell whether '${o.target}' exists (${unknown}), so it cannot tell a new directory `
+            + 'from one to merge into - no restore was done',
+        }
+      }
       const kind = await o.kind()
       if (kind === null || kind === 'directory')
         return null
@@ -2924,7 +3366,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         revision: async o => restoreDestinationRevision(await o.kind(), (await o.claims()).claims),
         unbound: () => `Could not read ${what} — refusing a restore that cannot be bound to it`,
       },
-      gates: [territoryGate, heldGate, kindGate, selectionGate, writableGate, spaceGate],
+      gates: [territoryGate, heldGate, unmountedGate, kindGate, selectionGate, writableGate, spaceGate],
       locks: async o => (await o.claims()).claims,
     }
 
@@ -3082,8 +3524,10 @@ interface NewLunBacking {
  */
 interface RestoreDestination {
   target: string
-  /** `stat -c %F`: 'directory', another kind, or null (absent, or no answer). */
+  /** `stat -c %F`: 'directory', another kind, or null (PROVED absent; cr3 L8). */
   kind: () => Promise<string | null>
+  /** The probe's failure when it could not answer (cr3 L8), else null. */
+  kindUnknown: () => Promise<string | null>
   /** Does the restore MERGE into an existing directory (in place, or a newLocation that exists)? */
   merge: () => Promise<boolean>
   /** Where the write and space probes go: the target, or the parent a new directory is created in. */
@@ -3111,6 +3555,33 @@ function restoreDestinationRevision(kind: string | null, claims: LockClaim[]): s
  * id for token auth, a username for password auth). Returns an error message or
  * null when valid.
  */
+
+/**
+ * cr3.backup: which identity field an edit changes — the auth type, the token
+ * id or the username — or null. The stored secret belongs to that identity.
+ */
+function repoIdentityChange(
+  stored: { authType: string, tokenId?: string, username?: string },
+  next: { authType: string, tokenId?: string, username?: string },
+): string | null {
+  if (stored.authType !== next.authType)
+    return `the authentication type (${stored.authType} to ${next.authType})`
+  if (next.authType === 'token' && (stored.tokenId ?? '') !== (next.tokenId ?? ''))
+    return 'the token id'
+  if (next.authType === 'password' && (stored.username ?? '') !== (next.username ?? ''))
+    return 'the username'
+  return null
+}
+
+/** cr3.backup: whether a repo config points at another server (host or port), or null. */
+function repoEndpointChange(stored: { host: string, port: number }, next: { host: string, port: number }): string | null {
+  if (stored.host !== next.host)
+    return 'the host'
+  if (stored.port !== next.port)
+    return 'the port'
+  return null
+}
+
 function validateRepoAuth(repo: { authType: string, tokenId?: string, username?: string }): string | null {
   if (repo.authType === 'token' && !repo.tokenId)
     return 'Token auth requires a token id (user@realm!tokenname)'

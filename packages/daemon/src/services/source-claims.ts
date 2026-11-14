@@ -1,7 +1,6 @@
 import type { AhrPool } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { LockClaim } from '../jobs/locks.js'
-import { realpath } from 'node:fs/promises'
 import { posix } from 'node:path'
 import { zvolDatasetFromPath } from '@anas/shared'
 import { ahrPoolClaims, insideGuardDoor, LockClaimsUnreadableError, mountClaim, zfsDatasetClaims } from '../safety/guard.js'
@@ -9,6 +8,7 @@ import { readPoolGuid } from '../safety/stable-id.js'
 import { readFilesystemFacts, sourceFilesystemOf } from './backup-consistency.js'
 import { normalizeMountpointPath } from './mounts.js'
 import { normalizePath } from './nested-filesystems.js'
+import { boundedRealpathRun } from './source-guard.js'
 
 /**
  * The SHARED claims a data mover holds on its source for the run (story
@@ -133,9 +133,14 @@ export async function pathSourceClaims(
   if (paths.length === 0)
     return { claims: [], unlocked: [], unread: [], resolved: new Map() }
   const facts = await readFilesystemFacts(executor, readAhrPools)
+  // cr3.backup M3: resolved through the ONE bounded resolver the source guard
+  // uses (a child under `timeout -s KILL`), never node's in-process realpath —
+  // a source on a dead hard NFS mount answers "as written" in seconds instead
+  // of pinning a libuv thread for good.
+  const real = boundedSourceResolver(executor)
   const resolved = await Promise.all(paths.map(async (path) => {
-    const real = await realSourcePath(path)
-    return { path, real, fs: sourceFilesystemOf(real, facts) }
+    const realPath = await realSourcePath(path, real)
+    return { path, real: realPath, fs: sourceFilesystemOf(realPath, facts) }
   }))
   const realOf = new Map(resolved.map(r => [r.path, r.real]))
   const guids = await poolGuids(executor, resolved.flatMap(r => (r.fs?.kind === 'zfs' ? [r.fs.dataset] : [])))
@@ -196,9 +201,11 @@ export async function pathSourceClaims(
  * that cannot be resolved for another reason (a symlink loop, EACCES) is kept
  * as written — the mover cannot read through it either.
  *
- * `real` is node's realpath; a test hands its own.
+ * `real` resolves one path or rejects (ENOENT / ENOTDIR = a missing
+ * component, anything else = unresolvable); the run doors hand
+ * {@link boundedSourceResolver}, a test hands its own.
  */
-export async function realSourcePath(path: string, real: (p: string) => Promise<string> = realpath): Promise<string> {
+export async function realSourcePath(path: string, real: (p: string) => Promise<string>): Promise<string> {
   const text = normalizePath(path)
   if (zvolDatasetFromPath(text))
     return text
@@ -216,6 +223,29 @@ export async function realSourcePath(path: string, real: (p: string) => Promise<
       tail.push(posix.basename(head))
       head = posix.dirname(head)
     }
+  }
+}
+
+/**
+ * The resolver the run doors hand {@link realSourcePath} (cr3.backup M3): the
+ * guard's bounded `realpath -e` first (the same argv the source guard runs for
+ * the same path), and only when realpath itself said the path does not
+ * resolve, the bounded `realpath -m`, which resolves the longest existing
+ * ancestor and appends the missing tail — so the walk in realSourcePath never
+ * needs a second step. A path that did not answer in time is not asked again:
+ * it rejects, and realSourcePath keeps it as written.
+ */
+export function boundedSourceResolver(executor: CommandExecutor): (p: string) => Promise<string> {
+  return async (p) => {
+    const existing = await boundedRealpathRun(executor, p, 'existing')
+    if (existing.path !== undefined)
+      return existing.path
+    if (existing.answered) {
+      const missingOk = await boundedRealpathRun(executor, p, 'missingOk')
+      if (missingOk.path !== undefined)
+        return missingOk.path
+    }
+    throw new Error(`could not resolve ${p} in time`)
   }
 }
 

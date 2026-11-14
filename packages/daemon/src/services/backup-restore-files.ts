@@ -15,7 +15,7 @@ import { isPathWithin, restorePatternsFor } from '@anas/shared'
 import { readPveMountPathsStrict } from '../parsers/pve-storage.js'
 import { isHardlinkStat, statArchivePaths } from './backup-catalog.js'
 import { classifyBackupReadVerdict } from './backup-reads.js'
-import { buildBackupEnv, PBC } from './backup-runner.js'
+import { buildBackupEnv, PBC, pbcPositional } from './backup-runner.js'
 import { ownershipRefusal, pveManagedRefusal } from './pve-footprint.js'
 import { maskSecretValues } from './secret-argv.js'
 
@@ -470,7 +470,7 @@ export interface RestoreArgvSpec {
  * there is nothing to overwrite and nothing to allow (GT-15).
  */
 export function buildRestoreArgs(spec: RestoreArgvSpec): string[] {
-  const args = ['restore', spec.snapshot, spec.archive, spec.target]
+  const args = ['restore', pbcPositional(spec.snapshot, 'snapshot'), pbcPositional(spec.archive, 'archive'), pbcPositional(spec.target, 'restore target')]
   if (spec.namespace)
     args.push('--ns', spec.namespace)
   for (const pattern of spec.patterns)
@@ -522,18 +522,12 @@ type PathPresence = 'present' | 'absent' | 'unknown'
  * green-light a restore onto a mount that never answers.
  */
 async function pathPresence(executor: CommandExecutor, path: string): Promise<PathPresence> {
-  let r
-  try {
-    r = await executor.exec(TIMEOUT, [String(SPACE_PROBE_TIMEOUT_S), STAT, '-c', '%F', path])
-  }
-  catch {
-    return 'unknown'
-  }
-  if (r.exitCode === TIMEOUT_EXIT)
-    return 'unknown'
-  if (r.exitCode !== 0)
-    return 'absent'
-  return 'present'
+  // cr3.backup L8: the ONE probe (probePathKind) — `absent` only on stat's
+  // own ENOENT, so an ESTALE or EIO no longer reads as absent and walks up.
+  const probe = await probePathKind(executor, path)
+  if ('kind' in probe)
+    return 'present'
+  return 'absent' in probe ? 'absent' : 'unknown'
 }
 
 /**
@@ -1260,16 +1254,38 @@ export async function pathKind(
   executor: CommandExecutor,
   path: string,
 ): Promise<string | null> {
+  const probe = await probePathKind(executor, path)
+  return 'kind' in probe ? probe.kind : null
+}
+
+/** GNU stat's own sentence for a missing path, in the C locale the probe forces. */
+const STAT_ENOENT_RE = /No such file or directory/
+
+/** What {@link probePathKind} found: a kind, provably nothing, or no answer. */
+export type PathKindProbe = { kind: string } | { absent: true } | { unknown: string }
+
+/**
+ * cr3.backup L8: {@link pathKind} with "absent" and "could not tell" apart. A
+ * path is ABSENT only when `stat` itself answered with ENOENT (in `LC_ALL=C`,
+ * so the sentence is stat's own); a timeout (a dead mount), a killed probe,
+ * ESTALE, EIO or any other failure is UNKNOWN — and a caller that would treat
+ * absence as "this restore creates it" must not treat unknown that way.
+ */
+export async function probePathKind(executor: CommandExecutor, path: string): Promise<PathKindProbe> {
   let r
   try {
-    r = await executor.exec(TIMEOUT, [String(SPACE_PROBE_TIMEOUT_S), STAT, '-c', '%F', path])
+    r = await executor.exec(TIMEOUT, [String(SPACE_PROBE_TIMEOUT_S), STAT, '-c', '%F', '--', path], { env: { LC_ALL: 'C' } })
   }
-  catch {
-    return null
+  catch (err) {
+    return { unknown: err instanceof Error ? err.message : String(err) }
   }
-  if (r.exitCode !== 0)
-    return null
-  return r.stdout.trim() || null
+  if (r.exitCode === 0) {
+    const kind = r.stdout.trim()
+    return kind ? { kind } : { unknown: 'stat printed no file type' }
+  }
+  if (r.exitCode === 1 && STAT_ENOENT_RE.test(r.stderr))
+    return { absent: true }
+  return { unknown: r.stderr.trim() || `stat exited with code ${r.exitCode}` }
 }
 
 /** The parent directory of an absolute path (`/` is its own parent). */

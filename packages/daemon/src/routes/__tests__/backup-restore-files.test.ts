@@ -136,7 +136,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     // The newLocation directory must NOT exist yet (the restore creates it).
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', target],
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', target],
       result: { stdout: '', stderr: 'No such file or directory\n', exitCode: 1 },
     })
     // Plenty of room.
@@ -316,7 +316,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
       result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
     })
     const res = await post(body())
@@ -327,6 +327,25 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     assert.ok(err.warnings.some(w => /already exists/.test(w)), 'the confirm dialog renders the warnings, not the message')
     assert.ok(res.headers['x-anas-confirm-code'], 'a confirm code is issued')
     assert.equal(restoreRan(), false)
+  })
+
+  it('cr3.backup BACKUP-L8: a newLocation whose stat could not answer is refused 503 — never read as "absent, this restore creates it"', async () => {
+    const mock = mockOf(server)
+    mock.addFixture({
+      command: TIMEOUT,
+      args: shellArgs(),
+      result: { stdout: statBlock('/alpha.txt', 23, 'file', '644', '-rw-r--r--'), stderr: '', exitCode: 0 },
+    })
+    for (const result of [
+      { stdout: '', stderr: '', exitCode: 124 },
+      { stdout: '', stderr: 'stat: cannot statx: Stale file handle\n', exitCode: 1 },
+    ]) {
+      mock.prependFixture({ command: TIMEOUT, args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC], result })
+      const res = await post(body())
+      assert.equal(res.statusCode, 503, res.body)
+      assert.match((res.json() as { error: { message: string } }).error.message, /could not tell whether .* exists/)
+      assert.equal(restoreRan(), false)
+    }
   })
 
   it('a newLocation door without its path is refused at the boundary, and works with one', async () => {
@@ -399,6 +418,31 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     const call = mockOf(server).calls.find(c => c.command === PBC && c.args[0] === 'restore')!
     assert.ok(call.args.includes('--allow-existing-dirs'))
     assert.ok(call.args.includes('--overwrite'))
+  })
+
+  it('cr3.backup (backup-panel review): a task\'s archive home anchors an in-place restore ONLY of that task\'s own group', async () => {
+    // Another backup group's snapshot, same archive NAME as the task's: before
+    // this fix the task's live directory was taken as the home and the file
+    // restored into it with no confirm.
+    for (const [over, why] of [
+      [{ snapshot: 'host/other/2026-08-25T19:16:45Z' }, /not from backup task 'nightly'/],
+    ] as const) {
+      const res = await post(body({ target: { mode: 'inPlace' }, ...over }))
+      assert.equal(res.statusCode, 400, `${JSON.stringify(over)}: ${res.body}`)
+      const message = (res.json() as { error: { message: string } }).error.message
+      assert.match(message, /The original location of this snapshot is not known/)
+      assert.match(message, why)
+      assert.match(message, /choose a destination \(target\.path\)/)
+    }
+    // cr3 review2 (1): a request naming the task now reads in the TASK's
+    // namespace, so another namespace and an unknown task are refused at the
+    // door that reads the snapshot, before any home is looked up.
+    const otherNs = await post(body({ target: { mode: 'inPlace' }, ns: 'elsewhere' }))
+    assert.equal(otherNs.statusCode, 400, otherNs.body)
+    assert.match(otherNs.body, /Backup task 'nightly' writes namespace 'gtrestore', not namespace 'elsewhere'/)
+    const unknown = await post(body({ target: { mode: 'inPlace' }, task: 'no-such-task' }))
+    assert.equal(unknown.statusCode, 404, unknown.body)
+    assert.equal(restoreRan(), false)
   })
 
   it('an in-place restore of a TREE is confirm-gated, and nothing ran before the 409', async () => {
@@ -475,8 +519,8 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
-      result: { stdout: '', stderr: 'No such file', exitCode: 1 },
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
+      result: { stdout: '', stderr: 'stat: cannot statx: No such file or directory\n', exitCode: 1 },
     })
     mock.addFixture({
       command: PBC,
@@ -625,8 +669,8 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
-      result: { stdout: '', stderr: 'No such file', exitCode: 1 },
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
+      result: { stdout: '', stderr: 'stat: cannot statx: No such file or directory\n', exitCode: 1 },
     })
     const res = await post(body({ selections: ['/nope.txt'] }))
     assert.equal(res.statusCode, 400)
@@ -643,8 +687,8 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
-      result: { stdout: '', stderr: 'No such file', exitCode: 1 },
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
+      result: { stdout: '', stderr: 'stat: cannot statx: No such file or directory\n', exitCode: 1 },
     })
     // The probe name is random (review H7): match the touch by shape.
     mock.addFixture({
@@ -670,8 +714,8 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
-      result: { stdout: '', stderr: 'No such file', exitCode: 1 },
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
+      result: { stdout: '', stderr: 'stat: cannot statx: No such file or directory\n', exitCode: 1 },
     })
     mock.addFixture({
       command: TIMEOUT,
@@ -701,8 +745,8 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
-      result: { stdout: '', stderr: 'No such file', exitCode: 1 },
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
+      result: { stdout: '', stderr: 'stat: cannot statx: No such file or directory\n', exitCode: 1 },
     })
     mock.addFixture({
       command: PBC,
@@ -763,8 +807,8 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
-      result: { stdout: '', stderr: 'No such file', exitCode: 1 },
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
+      result: { stdout: '', stderr: 'stat: cannot statx: No such file or directory\n', exitCode: 1 },
     })
     mock.addFixture({
       command: TIMEOUT,
@@ -807,7 +851,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
       // The directory EXISTS — this is what makes the first post a gate.
       mock.addFixture({
         command: TIMEOUT,
-        args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
+        args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
         result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
       })
       // Confirmed leg: the write test and the space check land on the directory
@@ -860,7 +904,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
       })
       mock.addFixture({
         command: TIMEOUT,
-        args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
+        args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
         result: { stdout: 'regular file\n', stderr: '', exitCode: 0 },
       })
       const res = await post(newLocationBody())
@@ -882,7 +926,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
       // The new directory must NOT exist — parents are created by the client (GT-15).
       mock.addFixture({
         command: TIMEOUT,
-        args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
+        args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
         result: { stdout: '', stderr: 'No such file or directory\n', exitCode: 1 },
       })
       // Verification: the picked file is there after the restore.
@@ -934,8 +978,8 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
       })
       mock.addFixture({
         command: TIMEOUT,
-        args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
-        result: { stdout: '', stderr: 'No such file', exitCode: 1 },
+        args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
+        result: { stdout: '', stderr: 'stat: cannot statx: No such file or directory\n', exitCode: 1 },
       })
       // The check lands on the parent — the directory the new one will be created in.
       mock.addFixture({
@@ -963,8 +1007,8 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
-      result: { stdout: '', stderr: 'No such file', exitCode: 1 },
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
+      result: { stdout: '', stderr: 'stat: cannot statx: No such file or directory\n', exitCode: 1 },
     })
     mock.addFixture({
       command: TIMEOUT,
@@ -1002,8 +1046,8 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
-      result: { stdout: '', stderr: 'No such file', exitCode: 1 },
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
+      result: { stdout: '', stderr: 'stat: cannot statx: No such file or directory\n', exitCode: 1 },
     })
     mock.addFixture({
       command: TIMEOUT,
@@ -1129,8 +1173,13 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
         args: [String(CATALOG_PREFLIGHT_TIMEOUT_S), PBC, 'catalog', 'shell', SNAP, 'data.pxar', '--ns', 'other'],
         result: { stdout: treeStats(['/docs']), stderr: '', exitCode: 0 },
       })
-      const code = await mint(body({ selections: ['/docs'], target: { mode: 'inPlace' } }))
-      const res = await post(body({ ns: 'other', selections: ['/docs'], target: { mode: 'inPlace' } }), { 'x-anas-confirm': code })
+      // cr3.backup: the home is NAMED here — without a path, a snapshot from
+      // another namespace no longer borrows the task's home at all (400, the
+      // test above); with it, the binding still names the changed `ns`.
+      // cr3 review2 (1): no task named — a request naming the task now reads
+      // in the task's namespace and refuses another one outright (400).
+      const code = await mint(body({ task: undefined, selections: ['/docs'], target: { mode: 'inPlace', path: HOME } }))
+      const res = await post(body({ task: undefined, ns: 'other', selections: ['/docs'], target: { mode: 'inPlace', path: HOME } }), { 'x-anas-confirm': code })
       assertScopeChanged(res, 'ns')
     })
 
@@ -1213,7 +1262,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
       // Someone creates the directory while the restore waits.
       mockOf(server).prependFixture({
         command: TIMEOUT,
-        args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
+        args: ['10', '/usr/bin/stat', '-c', '%F', '--', NEWLOC],
         result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
       })
       blocker.release()

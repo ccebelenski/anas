@@ -104,16 +104,34 @@ export function execSystemctlShow(executor: CommandExecutor, unit: string, props
   return executor.exec(SYSTEMCTL, ['show', unit, '-p', props], { env: { ...SYSTEMCTL_SHOW_ENV } })
 }
 
-/** `systemctl show <unit> -p <props>` → a prop map (fail-open to {}). */
+/**
+ * cr3 (INVENTED-STATE-H1): the empty maps {@link showUnitProps} returned
+ * because the read FAILED — told apart from an answer that happened to carry
+ * nothing, without changing the fail-open shape every caller relies on.
+ */
+const FAILED_SHOW_READS = new WeakSet<Record<string, string>>()
+
+/** Did this prop map come from a `systemctl show` that could not answer? */
+export function showReadFailed(props: Record<string, string>): boolean {
+  return FAILED_SHOW_READS.has(props)
+}
+
+function failedShow(): Record<string, string> {
+  const empty: Record<string, string> = {}
+  FAILED_SHOW_READS.add(empty)
+  return empty
+}
+
+/** `systemctl show <unit> -p <props>` → a prop map (fail-open to {}; {@link showReadFailed} says which {} was a failure). */
 export async function showUnitProps(executor: CommandExecutor, unit: string, props: string): Promise<Record<string, string>> {
   try {
     const r = await execSystemctlShow(executor, unit, props)
     if (r.exitCode !== 0 && !r.stdout.trim())
-      return {}
+      return failedShow()
     return parseShow(r.stdout)
   }
   catch {
-    return {}
+    return failedShow()
   }
 }
 

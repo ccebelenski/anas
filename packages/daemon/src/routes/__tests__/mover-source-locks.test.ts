@@ -170,6 +170,12 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
   let ahrUuid = false
   /** `prlimit` answers success — the direct backup's pbc run completes. */
   let prlimitOk = false
+  /**
+   * cr3.backup M3: a source path is resolved by the bounded `timeout -s KILL 5
+   * realpath -e -- <path>` child, no longer in-process — what that child
+   * answers for a path a test planted a real symlink at.
+   */
+  let realpaths = new Map<string, string>()
   const saved: Record<string, string | undefined> = {}
 
   function setEnv(k: string, v: string): void {
@@ -260,6 +266,8 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
         return ok(AHR_VGS_WITH_UUID)
       if (command === PRLIMIT && prlimitOk)
         return ok('')
+      if (command === '/usr/bin/timeout' && args.includes('/usr/bin/realpath') && realpaths.has(args.at(-1) ?? ''))
+        return ok(`${realpaths.get(args.at(-1) ?? '')}\n`)
       return orig(command, args, opts)
     }
     await server.ready()
@@ -516,6 +524,7 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
         path: 'pve1/media',
         schedule: 'Tue *-*-* 02:00:00',
       }))
+      realpaths = new Map([[join(base, 'plain', 'link'), join(base, 'media')]])
       await serve('cloud.task.run', table)
       const res = await inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', payload: { direct: true }, runner: true })
       assert.equal(res.statusCode, 202, res.body)
@@ -533,6 +542,7 @@ describe('cr.33b — a data mover holds its source; a destroy, rename or rollbac
       assertRefusedByPve(job, DESTROY_RECURSIVE)
     }
     finally {
+      realpaths = new Map()
       await rm(base, { recursive: true, force: true })
     }
   })

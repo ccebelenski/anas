@@ -582,6 +582,13 @@ describe('backup routes (Epic 16)', () => {
     // The benign 1-second collision — the same shape a cadence skip takes: a
     // run that backed nothing up must not touch retention.
     mock.addFixture({ command: '/usr/bin/prlimit', args: RETAINED_BACKUP_ARGS, result: { stdout: '', stderr: 'Error: backup timestamp is older than last backup.', exitCode: 255 } })
+    // cr3.backup H2: the skip stands only when the group's newest snapshot is
+    // in this run's own second, which the runner asks PBS for.
+    mock.addFixture({
+      command: PBC_CMD,
+      args: ['snapshot', 'list', 'host/anas-pve', '--output-format', 'json'],
+      result: { stdout: JSON.stringify([{ 'backup-type': 'host', 'backup-id': 'anas-pve', 'backup-time': Math.floor(Date.now() / 1000) }]), stderr: '', exitCode: 0 },
+    })
     mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
     mock.calls.length = 0
     const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: RUNNER_HEADERS, payload: { direct: true } })
@@ -1138,6 +1145,9 @@ describe('backup routes (Epic 16)', () => {
     mock.addFixture({ command: ZFS_BIN, result: { stdout: '', stderr: '', exitCode: 0 } })
     // The boundary scan runs on the CONFIGURED path (the text, as the task says it).
     mock.addFixture({ command: '/usr/bin/timeout', args: walkArgs(linkPath, 60), result: { stdout: `66\t${linkPath}\n`, stderr: '', exitCode: 0 } })
+    // cr3.backup M3: the run door resolves the archive path through the bounded
+    // `realpath` child (no longer in-process): what it answers for the symlink.
+    mock.prependFixture({ command: '/usr/bin/timeout', args: ['-s', 'KILL', '5', '/usr/bin/realpath', '-e', '--', linkPath], result: { stdout: `${realDir}\n`, stderr: '', exitCode: 0 } })
 
     await createTaskPayload({ ...NESTED_TASK, name: 'snap-symlink', archives: [{ name: 'pool', path: linkPath, excludes: [] }] })
     mock.calls.length = 0

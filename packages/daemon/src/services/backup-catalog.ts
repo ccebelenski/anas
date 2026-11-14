@@ -7,7 +7,7 @@ import type { CommandExecutor, SpawnedChild } from '../executor/types.js'
 import type { BackupReadDeps } from './backup-reads.js'
 import { classifyArchiveFile, isBrowsableArchive } from '@anas/shared'
 import { classifyBackupReadVerdict } from './backup-reads.js'
-import { buildBackupEnv, PBC } from './backup-runner.js'
+import { buildBackupEnv, PBC, pbcPositional } from './backup-runner.js'
 import { maskSecretValues } from './secret-argv.js'
 
 /**
@@ -153,7 +153,7 @@ export function buildCatalogShellArgs(
   namespace?: string,
   timeoutSeconds: number = CATALOG_SHELL_TIMEOUT_S,
 ): { command: string, args: string[] } {
-  const args = [String(timeoutSeconds), PBC, 'catalog', 'shell', snapshot, archive]
+  const args = [String(timeoutSeconds), PBC, 'catalog', 'shell', pbcPositional(snapshot, 'snapshot'), pbcPositional(archive, 'archive')]
   if (namespace)
     args.push('--ns', namespace)
   return { command: TIMEOUT, args }

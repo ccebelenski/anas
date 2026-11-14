@@ -132,7 +132,9 @@ describe('POST /backup/repos/test — stored-secret fallback (#41)', () => {
     setEnv('ANAS_SYSTEMD_DIR', dir)
     setEnv('ANAS_STORAGE_CFG', join(dir, 'storage.cfg'))
     setEnv('ANAS_PVE_PRIV_STORAGE_DIR', join(dir, 'priv-storage'))
-    await writeFile(join(dir, 'storage.cfg'), PVE_STORAGE_CFG)
+    // cr3.backup: the stanza names the listener's port — the stored secret is
+    // now sent only to the server (host AND port) it was saved for.
+    await writeFile(join(dir, 'storage.cfg'), PVE_STORAGE_CFG.replace('\tcontent backup', `\tport ${port}\n\tcontent backup`))
     await mkdir(join(dir, 'priv-storage'), { recursive: true })
     await writeFile(join(dir, 'priv-storage', 'anastest-pw.pw'), `${PVE_SECRET}\n`)
 
@@ -215,13 +217,23 @@ describe('POST /backup/repos/test — stored-secret fallback (#41)', () => {
     assert.equal(probeEnvs[0].PBS_PASSWORD, STORED_SECRET)
   })
 
-  it('an EDITED field is what gets tested — with the stored secret', async () => {
+  it('an EDITED field is what gets tested — with the stored secret (a datastore edit)', async () => {
     // The reason the fallback is keyed on the name rather than answering the
     // whole request from the registry: Test must exercise what would be SAVED.
-    const data = await test(dialogBody({ datastore: 'store-edited', tokenId: 'root@pam!edited' }))
+    const data = await test(dialogBody({ datastore: 'store-edited' }))
     assert.equal(data.stage, 'ok')
-    assert.equal(probeEnvs[0].PBS_REPOSITORY, `root@pam!edited@${TEST_HOST}:${port}:store-edited`)
+    assert.equal(probeEnvs[0].PBS_REPOSITORY, `root@pam!anas@${TEST_HOST}:${port}:store-edited`)
     assert.equal(probeEnvs[0].PBS_PASSWORD, STORED_SECRET)
+  })
+
+  it('cr3.backup: the stored secret never goes to another host, port or identity — 400, no probe', async () => {
+    for (const edit of [{ host: '127.0.0.2' }, { port: port + 1 }, { tokenId: 'root@pam!edited' }, { authType: 'password', username: 'root@pam' }]) {
+      probeEnvs = []
+      const res = await server.inject({ method: 'POST', url: '/v1/backup/repos/test', headers: JSON_HEADERS, payload: dialogBody(edit) })
+      assert.equal(res.statusCode, 400, `${JSON.stringify(edit)}: ${res.body}`)
+      assert.match((res.json() as { error: { message: string } }).error.message, /stored secret is not used/)
+      assert.equal(probeEnvs.length, 0, 'nothing was sent anywhere')
+    }
   })
 
   it('a TYPED secret still wins over the stored one (rotation)', async () => {

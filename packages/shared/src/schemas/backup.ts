@@ -212,7 +212,12 @@ export type BackupPruneVerdict = z.infer<typeof BackupPruneVerdict>
  */
 export const BackupPrunePreviewRequest = z.object({
   repository: BackupRepoRef.optional(),
-  namespace: z.string().optional(),
+  /**
+   * A sent string is authoritative (`''` = the datastore root, as at every
+   * door). Omitted or `null` (cr3.backup, ADDITIVE) = the task's namespace
+   * cleared, so the repo's own is the effective one — as the PUT reads both.
+   */
+  namespace: z.string().nullable().optional(),
   backupId: z.string().min(1).optional(),
   retention: BackupRetention.optional(),
 })
@@ -284,8 +289,12 @@ export type BackupRepo = z.infer<typeof BackupRepo>
 export const BackupRepoResponse = BackupRepo.extend({
   /** Registry key OR `pve:<storage-id>` for a PVE-defined repository. */
   name: BackupRepoRef,
-  /** Whether a secret is stored for this repo (never the secret itself). */
-  credentialsSet: z.boolean(),
+  /**
+   * Whether a secret is stored for this repo (never the secret itself).
+   * cr3.backup L11 (ADDITIVE): `null` = unknown — the secret file exists but
+   * could not be read; never reported as "not set".
+   */
+  credentialsSet: z.boolean().nullable(),
   /** Tier: `anas` (registered) or `pve` (auto-discovered, hands-off). */
   source: BackupRepoSource.default('anas'),
 })
@@ -738,8 +747,8 @@ export type BackupExpandedArchive = z.infer<typeof BackupExpandedArchive>
 const ARCHIVE_NAME_ILLEGAL_RE = /[^\w-]/g
 /** Path separators in a derived suffix become `_`. */
 const PATH_SEPARATOR_RE = /\//g
-/** The characters an archive name can never carry (a derived name keeps dots). */
-const DERIVED_ARCHIVE_NAME_ILLEGAL_RE = /[^\w.-]/g
+/** A leading dash (pbc would read the archive spec as an option). */
+const LEADING_DASH_RE = /^-/
 
 /**
  * The deterministic child-archive name for a nested filesystem at
@@ -767,9 +776,10 @@ export function expandedArchiveName(name: string, relativePath: string): string 
 export function deriveArchiveName(path: string, taken: readonly string[] = []): string {
   const segments = path.replace(TRAILING_SLASHES_RE, '').split('/').filter(Boolean)
   // The same "replace what the charset cannot say" convention as
-  // `expandedArchiveName` — but the archive charset keeps dots, so only true
-  // illegal characters become `_`.
-  let base = (segments.at(-1) ?? '').replace(DERIVED_ARCHIVE_NAME_ILLEGAL_RE, '_')
+  // `expandedArchiveName`. cr3 review (8b): pbc's archive spec takes no DOT in
+  // the name (proven on pbc 4.1.0), so a dot becomes `_` too, and a leading
+  // dash is prefixed (backupTaskProblems refuses both at create).
+  let base = (segments.at(-1) ?? '').replace(ARCHIVE_NAME_ILLEGAL_RE, '_').replace(LEADING_DASH_RE, '_-')
   if (!base)
     base = 'root' // the path was `/` — take the filesystem's own name
   let name = base
@@ -1087,7 +1097,14 @@ export const BackupTask = z.object({
    * for a PVE-defined repository (tier 1). See {@link BackupRepoRef}.
    */
   repository: BackupRepoRef,
-  /** Optional PBS namespace (overrides / complements the repo's). */
+  /**
+   * Optional PBS namespace (overrides / complements the repo's). cr3 review
+   * (6), ONE meaning at every door: ABSENT = the repository's own namespace;
+   * `''` = the DATASTORE ROOT, explicitly (the run, the prune and the reads
+   * all emit no `--ns` for it; prune-preview reads a sent `''` the same way).
+   * A stored `''` is read as stored — never reinterpreted as absent. `null`
+   * on a PUT clears the field (absent).
+   */
   namespace: z.string().optional(),
   /** PBS group identity host/<backupId>. Defaults to the hostname in the UI. */
   backupId: z.string().min(1),
@@ -1132,6 +1149,63 @@ export const BackupTask = z.object({
 export type BackupTask = z.infer<typeof BackupTask>
 
 /**
+ * cr3 review (8b): the name characters pbc's `backup` takes in an archive spec
+ * (`<name>.pxar:<path>`): letters, digits, underscores and dashes — no dot
+ * (proven on pbc 4.1.0: `a.b.pxar:` is "'backupspec': value does not match
+ * the regex pattern") — and not a dash first (pbc would read it as an option).
+ */
+const PBC_ARCHIVE_SPEC_NAME_RE = /^\w[\w-]*$/
+
+/**
+ * cr3 review2 (3): PBS's namespace grammar, as the installed
+ * proxmox-backup-client 4.1.0 enforces it locally (no server contact):
+ * components in the safe-id charset separated by single `/`, at most 7 of
+ * them — `a/b/c/d/e/f/g` passes, an 8th is "namespace too deep, 7 >= max 7",
+ * and `bad ns`, `../x`, ` `, `/a`, `a//b`, `a/`, `a:b` are "'ns': value does
+ * not match the regex pattern". `''` is not a pbc value at all: ANAS reads it
+ * as the datastore root and emits no `--ns`.
+ */
+const PBS_NAMESPACE_RE = /^\w[\w.-]*(?:\/\w[\w.-]*){0,6}$/
+
+/** A namespace pbc takes, or `''` (the datastore root). */
+export function isPbsNamespace(value: string): boolean {
+  return value === '' || PBS_NAMESPACE_RE.test(value)
+}
+
+/** One field of a task that pbc would refuse on every run. */
+export interface BackupTaskProblem {
+  field: 'backupId' | 'archives' | 'namespace'
+  message: string
+}
+
+/**
+ * What in a task pbc would refuse on EVERY run: a backup-id outside PBS's
+ * safe-id charset, an archive name outside the archive-spec charset, a
+ * namespace outside the namespace grammar. One sentence each; empty when the
+ * task can run. The create door refuses any; the update door refuses only
+ * those whose FIELD the update changes (cr3 review2 (2): the owner can always
+ * disable or delete a task ANAS shows); a task stored before the rule loads,
+ * and its view carries them (`problems`).
+ */
+export function backupTaskFieldProblems(task: Pick<BackupTask, 'backupId' | 'archives' | 'namespace'>): BackupTaskProblem[] {
+  const problems: BackupTaskProblem[] = []
+  if (!isPbsSafeId(task.backupId))
+    problems.push({ field: 'backupId', message: `backup ID '${task.backupId}' is not a PBS id (letters, digits, dots, underscores and dashes, starting with a letter, digit or underscore) - every run would be refused` })
+  for (const a of task.archives) {
+    if (!PBC_ARCHIVE_SPEC_NAME_RE.test(a.name))
+      problems.push({ field: 'archives', message: `archive name '${a.name}' is not one proxmox-backup-client takes (letters, digits, underscores and dashes, not starting with a dash; no dots) - every run would be refused` })
+  }
+  if (task.namespace !== undefined && !isPbsNamespace(task.namespace))
+    problems.push({ field: 'namespace', message: `namespace '${task.namespace}' is not one PBS takes (up to 7 parts separated by '/', each letters, digits, dots, underscores and dashes, starting with a letter, digit or underscore) - every run would be refused` })
+  return problems
+}
+
+/** {@link backupTaskFieldProblems}, the sentences only. */
+export function backupTaskProblems(task: Pick<BackupTask, 'backupId' | 'archives' | 'namespace'>): string[] {
+  return backupTaskFieldProblems(task).map(p => p.message)
+}
+
+/**
  * Create/update request. The UI sends `changeDetectionMode` AND a legacy `mode`
  * alias — accept either (prefer changeDetectionMode). `limitNofile` is optional
  * (default 1024). Normalized to a BackupTask before use.
@@ -1156,6 +1230,10 @@ export const BackupTaskRequest = z.preprocess((raw) => {
     const o = { ...(raw as Record<string, unknown>) }
     if (o.changeDetectionMode === undefined && o.mode !== undefined)
       o.changeDetectionMode = o.mode
+    // cr3.backup: `null` is the explicit clear of the task's namespace (`''`
+    // is a value: the datastore root).
+    if (o.namespace === null)
+      delete o.namespace
     // backup2.9 — `null` kind is a clear (absent = derived), exactly as the
     // archive's `kind` normalises; `files` is KEPT — unlike `pxar`, it is not
     // redundant with absent: a stored `files` on a mixed task is what makes it
@@ -1201,6 +1279,9 @@ export const BackupTaskRequest = z.preprocess((raw) => {
   }
   return raw
 }, BackupTask.superRefine((task, ctx) => {
+  // cr3 review (8b) / review2 (2): what pbc would refuse on every run is NOT
+  // refused by this schema — the doors decide (backupTaskFieldProblems): the
+  // create refuses any, an update only what it changes.
   // backup2.9 — a BLOCK task is one LUN, spelled out at the TASK level. The
   // per-archive refusions already fired above (excludes and includeNested are
   // refused on an `img` archive); this is the shape the task itself must have.
@@ -1267,6 +1348,8 @@ export const BackupTaskView = BackupTask.extend({
    * at one block task per LUN; the stored data is untouched.
    */
   legacyImgArchives: z.boolean().optional(),
+  /** cr3 review (8b, ADDITIVE): what pbc would refuse on every run of a task stored before the rule ({@link backupTaskProblems}). */
+  problems: z.array(z.string()).optional(),
 })
 export type BackupTaskView = z.infer<typeof BackupTaskView>
 
@@ -1316,6 +1399,13 @@ export type BackupRunResult = z.infer<typeof BackupRunResult>
 /** A task grid entry: the task + its LOCAL-ONLY runtime status. */
 export const BackupTaskEntry = z.object({
   task: BackupTaskView,
+  /**
+   * cr3.backup (ADDITIVE): the sha256 of the task's service unit as stored —
+   * the revision the update guard binds. Sent back as
+   * `PUT /backup/tasks/:name?expectedRevision=` it refuses an edit made from
+   * a stale read (409 STATE_CHANGED). Absent when the unit could not be read.
+   */
+  revision: z.string().optional(),
   lastRunResult: BackupRunResult,
   lastRunAt: ISODateTime.nullable(),
   nextRunAt: ISODateTime.nullable(),
@@ -1355,6 +1445,8 @@ export type BackupRecentRun = z.infer<typeof BackupRecentRun>
 /** Task detail: the entry fields + the units as written + recent journald runs. */
 export const BackupTaskDetail = z.object({
   task: BackupTaskView,
+  /** cr3.backup (ADDITIVE): as on {@link BackupTaskEntry}. */
+  revision: z.string().optional(),
   lastRunResult: BackupRunResult,
   lastRunAt: ISODateTime.nullable(),
   nextRunAt: ISODateTime.nullable(),
@@ -1496,6 +1588,52 @@ export function composeGroupId(backupType: string, backupId: string): string {
 }
 
 /**
+ * PBS's own identifier charset (cr3.backup H1): a backup-id and an archive
+ * file name are both "safe ids" - a letter, digit or underscore first, then
+ * letters, digits, dots, underscores and dashes. Proven against the real
+ * proxmox-backup-client 4.1.0, which refuses every other shape LOCALLY,
+ * before it connects: `host/.a`, `host/-a`, `host/a b`, `host/a<b`,
+ * `host/a:b`, `host/a/b` are "unable to parse backup group path", and
+ * `.x.pxar`, `x<b>.pxar`, `x y.pxar` are "'archive-name': value does not
+ * match the regex pattern".
+ *
+ * The first character is load-bearing beyond PBS's own rule: pbc's argument
+ * parser reads ANY token starting with `-` as an option (a group positional
+ * `--repository=<user>@<attacker>:8007:x` overrides `PBS_REPOSITORY` and sends
+ * the stored secret to that host), and it has no `--` separator (proven: a
+ * `--` is consumed as the first positional VALUE), so the charset is what
+ * keeps a positional a positional.
+ */
+export const PBS_SAFE_ID_RE = /^\w[\w.-]*$/
+
+/** The backup types PBS knows (`other/foo` and `HOST/a` are refused by pbc locally). */
+export const PBS_BACKUP_TYPES = ['vm', 'ct', 'host'] as const
+
+/** `<type>/<id>` with each half in PBS's own charset. */
+const PBS_GROUP_PATH_RE = /^(?:vm|ct|host)\/\w[\w.-]*$/
+
+/** Is `value` a PBS backup type? */
+export function isPbsBackupType(value: string): boolean {
+  return (PBS_BACKUP_TYPES as readonly string[]).includes(value)
+}
+
+/** Is `value` a PBS safe id (a backup-id, an archive file name)? */
+export function isPbsSafeId(value: string): boolean {
+  return PBS_SAFE_ID_RE.test(value)
+}
+
+/**
+ * A group path as a request names it (`?group=` on the task-less listing):
+ * `<vm|ct|host>/<backup-id>`. Validated BEFORE it becomes a pbc positional.
+ */
+export const BackupGroupPath = z
+  .string()
+  .min(1)
+  .max(256)
+  .regex(PBS_GROUP_PATH_RE, 'a PBS group path <vm|ct|host>/<backup-id> (letters, digits, dots, underscores and dashes, not starting with a dot or a dash)')
+export type BackupGroupPath = z.infer<typeof BackupGroupPath>
+
+/**
  * One file of a snapshot, as `snapshot list` reports it (GT-3: OBJECTS here,
  * bare STRINGS in the group `list` — two shapes for the same word).
  */
@@ -1570,6 +1708,12 @@ export const BackupSnapshotList = z.object({
   group: z.string(),
   /** NEWEST FIRST — GT-2: the client's array is NOT sorted, the picker must be. */
   snapshots: z.array(BackupSnapshot),
+  /**
+   * cr3.backup (ADDITIVE): rows or files the PBS server returned that ANAS
+   * refused because a type, id or file name is outside PBS's own charset —
+   * one sentence each, never the refused text itself. Absent when none.
+   */
+  warnings: z.array(z.string()).optional(),
 })
 export type BackupSnapshotList = z.infer<typeof BackupSnapshotList>
 
@@ -1610,10 +1754,42 @@ export const BackupGroupList = z.object({
   group: z.string().optional(),
   /** Present (newest first) only for the `?group=` form. */
   snapshots: z.array(BackupSnapshot).optional(),
+  /** cr3.backup (ADDITIVE): refused server rows, as on {@link BackupSnapshotList}. */
+  warnings: z.array(z.string()).optional(),
 })
 export type BackupGroupList = z.infer<typeof BackupGroupList>
 
 // ---- Archive browse (`catalog shell` over a pipe) --------------------------
+
+/** An archive name as pbc takes it on the restore command line. */
+export const BackupArchiveName = z
+  .string()
+  .min(1)
+  .max(160)
+  // cr3.backup H1: PBS's own archive-name charset — a dash or dot first is
+  // refused by pbc (and a dash first would be read as an option).
+  .regex(PBS_SAFE_ID_RE, 'letters, digits, dots, underscores and dashes, starting with a letter, digit or underscore')
+export type BackupArchiveName = z.infer<typeof BackupArchiveName>
+
+/**
+ * A FULL snapshot path: `<type>/<id>/<RFC3339 time>`.
+ *
+ * The three-segment shape is enforced rather than assumed because a two-segment
+ * group path is NOT an error to pbc — it silently restores the latest snapshot
+ * (GT-57). "Restore the newest one" is a different operation from the one the
+ * operator picked in a dialog, and it must never happen by omission.
+ */
+export const BackupSnapshotPath = z
+  .string()
+  .min(1)
+  .max(256)
+  // cr3.backup H1: the type and id halves in PBS's own charset (pbc refuses
+  // any other type, and an id with a colon or a leading dot or dash, locally).
+  .regex(
+    /^(?:vm|ct|host)\/\w[\w.-]*\/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/,
+    'a full <type>/<id>/<RFC3339 time> path — a bare group silently restores the latest snapshot',
+  )
+export type BackupSnapshotPath = z.infer<typeof BackupSnapshotPath>
 
 /**
  * A path INSIDE a pxar archive. Absolute (the archive root is `/`), no `..`,
@@ -1700,12 +1876,22 @@ export type BackupBrowseEntry = z.infer<typeof BackupBrowseEntry>
 export const BackupBrowseRequest = z.object({
   /** Repository reference (a registered name or `pve:<storage-id>`). */
   repo: BackupRepoRef,
+  /**
+   * cr3 (ADDITIVE): the task whose snapshot this is. Named, the namespace is
+   * the TASK's (a stored `''` is the datastore root, absent is the
+   * repository's) and an `ns` that disagrees is refused; absent, `ns` keeps
+   * its meaning (empty = the repository's).
+   */
+  task: BackupName.optional(),
   /** Namespace; absent = the repo's own, else the datastore root. */
   ns: z.string().optional(),
-  /** The FULL `<type>/<id>/<RFC3339>` id — never a bare group path (GT-57). */
-  snapshot: z.string().min(1),
+  /**
+   * The FULL `<type>/<id>/<RFC3339>` id — never a bare group path (GT-57).
+   * cr3.backup H1: the shared validator, since it becomes a pbc positional.
+   */
+  snapshot: BackupSnapshotPath,
   /** The archive argument WITH its type suffix (`data.pxar`) — GT-16. */
-  archive: z.string().min(1),
+  archive: BackupArchiveName,
   /** The directory to list; defaults to the archive root. */
   path: ArchivePath.default('/'),
 })
@@ -1760,32 +1946,6 @@ export type BackupBrowseResult = z.infer<typeof BackupBrowseResult>
  * GT-56), so validating it here turns a 255 into a 400 with a sentence.
  */
 export const IMG_ARCHIVE_SUFFIX = '.img'
-
-/** An archive name as pbc takes it on the restore command line. */
-export const BackupArchiveName = z
-  .string()
-  .min(1)
-  .max(160)
-  .regex(/^[\w.-]+$/, 'letters, digits, dots, underscores and dashes')
-export type BackupArchiveName = z.infer<typeof BackupArchiveName>
-
-/**
- * A FULL snapshot path: `<type>/<id>/<RFC3339 time>`.
- *
- * The three-segment shape is enforced rather than assumed because a two-segment
- * group path is NOT an error to pbc — it silently restores the latest snapshot
- * (GT-57). "Restore the newest one" is a different operation from the one the
- * operator picked in a dialog, and it must never happen by omission.
- */
-export const BackupSnapshotPath = z
-  .string()
-  .min(1)
-  .max(256)
-  .regex(
-    /^[a-z]+\/[\w.:-]+\/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/,
-    'a full <type>/<id>/<RFC3339 time> path — a bare group silently restores the latest snapshot',
-  )
-export type BackupSnapshotPath = z.infer<typeof BackupSnapshotPath>
 
 // ---- Restore: the SELECTIVE FILE branch (story backup2.6) ------------------
 //
@@ -2067,6 +2227,8 @@ export const BackupImageRestoreRequest = z
   .object({
     kind: z.literal('image'),
     repo: BackupRepoRef,
+    /** cr3 (ADDITIVE): the task whose snapshot this is — its namespace wins, as on {@link BackupBrowseRequest}. */
+    task: BackupName.optional(),
     /** Namespace; absent falls back to the repository's own. */
     ns: z.string().max(256).optional(),
     snapshot: BackupSnapshotPath,

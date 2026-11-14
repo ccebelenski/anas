@@ -17,7 +17,7 @@ import type { ZvolSnapdevOptions } from './backup-zvol.js'
 import { lookup } from 'node:dns/promises'
 import { createConnection, isIP } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
-import { archiveSpecType, effectiveArchiveKind, effectiveIncludeNested } from '@anas/shared'
+import { archiveSpecType, effectiveArchiveKind, effectiveIncludeNested, hasControlChars } from '@anas/shared'
 import { readAhrPools } from './ahr-topology.js'
 import { deriveConsistency, isZvolConsistency, readConsistencyFacts } from './backup-consistency.js'
 import { planExpansion } from './backup-expansion.js'
@@ -35,7 +35,7 @@ import { withZvolSnapshotDevices } from './backup-zvol.js'
 import { nestedRunNotices, nestedRunWarnings, resolveNestedIncludes, scanArchives } from './nested-filesystems.js'
 import { maskSecretValues } from './secret-argv.js'
 import { formatTransientBackupSnapshot } from './snapshot-naming.js'
-import { notThereClause, readSourceGuardFacts, unmountedMountFor } from './source-guard.js'
+import { notThereClause, readSourceGuardFacts, unmountedMountFor, unreadableFactsRefusal } from './source-guard.js'
 
 /**
  * Backup RUNNER logic (Epic 16.7) — assembles the pbc environment + argv,
@@ -50,7 +50,10 @@ import { notThereClause, readSourceGuardFacts, unmountedMountFor } from './sourc
  *   - Every failure exits 255; the verbatim `Error:` string discriminates.
  *   - A rapid re-run collides on 1-second snapshot resolution with
  *     "backup timestamp is older than last backup." — that is BENIGN (too-soon),
- *     NOT a failure and NOT a dashboard warning.
+ *     NOT a failure and NOT a dashboard warning — but ONLY when the group's
+ *     newest snapshot is provably in this run's own second (cr3.backup H2):
+ *     PBS says the same words for a node clock that is behind the newest
+ *     snapshot by any amount, and that is a failure (see judgeTooSoon).
  */
 
 export const PBC = '/usr/bin/proxmox-backup-client'
@@ -99,6 +102,8 @@ const DURATION_RE = /^Duration:/
 const TOO_SOON_RE = /backup timestamp is older than last backup/i
 /** A backup GROUP is owned by one auth-id; a different auth-id is refused. */
 const OWNER_MISMATCH_RE = /backup owner check failed/i
+/** The `.mmmZ` tail of `toISOString()` (PBS renders whole seconds). */
+const ISO_MILLIS_TAIL_RE = /\.\d{3}Z$/
 /** Trailing whitespace on a pbc output line (they end with padding spaces). */
 const TRAILING_WS_RE = /\s+$/
 /** Leading `sha256:`/`sha256=` prefix stripped when normalizing a fingerprint. */
@@ -126,7 +131,35 @@ const CONNECT_ERR_RE = /client error \(Connect\)/i
  */
 export function buildRepoString(repo: BackupRepo): string {
   const authId = repo.authType === 'token' ? (repo.tokenId ?? '') : (repo.username ?? '')
-  return `${authId}@${repo.host}:${repo.port}:${repo.datastore}`
+  return `${authId}@${repoHostPart(repo.host)}:${repo.port}:${repo.datastore}`
+}
+
+/**
+ * The host as it goes into a repository string (cr3.backup M6): an IPv6
+ * literal is bracketed, because pbc reads `u@pbs@::1:8007:store` as an
+ * unparseable url (real pbc 4.1.0: "unable to parse repository url", no
+ * connection made) and connects with `u@pbs@[::1]:8007:store`. A host that
+ * arrives already bracketed is left as it is.
+ */
+export function repoHostPart(host: string): string {
+  return isIP(host) === 6 ? `[${host}]` : host
+}
+
+/**
+ * Every value that becomes a proxmox-backup-client POSITIONAL passes here
+ * (cr3.backup H1). pbc's parser reads any token starting with `-` as an option
+ * — `--repository=<user>@<host>:8007:x` in a positional slot sends the stored
+ * secret to that host — and it has NO `--` separator: proven on pbc 4.1.0, a
+ * `--` is taken as the first positional VALUE and shifts the rest
+ * (`restore -- <snap> <archive> <target>` reads `--` as the snapshot). So the
+ * guard is the value itself: never empty, never a leading dash, no control
+ * characters. Every caller validates with a shared schema first; this is the
+ * fail-closed backstop at the one place the argv is built.
+ */
+export function pbcPositional(value: string, what: string): string {
+  if (!value || value.startsWith('-') || hasControlChars(value))
+    throw new Error(`Refusing to pass the ${what} to proxmox-backup-client: it is empty, starts with a dash or carries a control character, so the client would read it as an option`)
+  return value
 }
 
 /**
@@ -195,7 +228,7 @@ export function buildBackupArgs(
   // (`<name>.img:<device-or-file>`). A regular file is a first-class `.img`
   // source: no loop device, no `losetup` (GT-34).
   for (const a of roots)
-    args.push(`${a.name}.${a.kind}:${a.path}`)
+    args.push(pbcPositional(`${a.name}.${a.kind}:${a.path}`, 'archive spec'))
   // `--exclude` is a per-INVOCATION flag (Epic 16's finding, unchanged here), so
   // the union is emitted once, deduplicated — a pattern repeated across two
   // expanded roots of the same archive is one flag, not two.
@@ -260,6 +293,24 @@ export function buildBackupArgs(
  */
 export function effectiveNamespace(task: BackupTask, repo: BackupRepo): string | undefined {
   return task.namespace ?? repo.namespace
+}
+
+/**
+ * `snapshot list [<group>] [--ns <ns>] --output-format json`.
+ *
+ * With a group it lists that group; without one it lists the whole namespace
+ * (GT-2: both forms return the SAME element shape, so ONE parser serves both).
+ * Lives here (re-exported by backup-reads) because the run's too-soon check
+ * (cr3.backup H2) asks the same question of the group it just backed up.
+ */
+export function buildSnapshotListArgs(group?: string, namespace?: string): string[] {
+  const args = ['snapshot', 'list']
+  if (group)
+    args.push(pbcPositional(group, 'group'))
+  if (namespace)
+    args.push('--ns', namespace)
+  args.push('--output-format', 'json')
+  return args
 }
 
 /**
@@ -473,6 +524,105 @@ export function classifyBackupResult(exitCode: number, stderr: string, secretVal
   return { kind: 'failure', detail: maskSecretValues(firstErrorLine(stderr), secretValues) }
 }
 
+// --- State a failed run leaves behind (cr3.backup M5) -----------------------
+
+/**
+ * Append the sentences that describe state a FAILED operation left behind (a
+ * transient snapshot it could not destroy, a `snapdev` it could not put back,
+ * an iSCSI target it could not re-enable) to the error that is about to
+ * propagate. Those sentences are pushed to a warnings list inside a `finally`
+ * that must not throw — and a warnings list only reaches anyone on success, so
+ * on the failure path they were discarded and the operator was told less than
+ * the system's real state. The error keeps its class (a cancellation stays a
+ * cancellation); only its message grows.
+ */
+export function withStateLeftBehind(err: unknown, sentences: readonly string[]): unknown {
+  if (!sentences.length)
+    return err
+  const tail = sentences.join(' ')
+  if (err instanceof Error) {
+    err.message = `${err.message} ${tail}`
+    return err
+  }
+  return new Error(`${String(err)} ${tail}`)
+}
+
+// --- The too-soon check (cr3.backup H2) -------------------------------------
+
+/**
+ * Seconds of slack either side of the second this run's pbc call STARTED. PBS
+ * stamps a snapshot at whole-second resolution from the client's clock, read
+ * once the client starts; a same-second collision therefore puts the group's
+ * newest snapshot at that second, give or take the second boundary.
+ */
+const TOO_SOON_SLACK_S = 1
+
+/** The newest `backup-time` (unix seconds) in a `snapshot list` answer, or null. */
+export function newestBackupTime(stdout: string): number | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stdout)
+  }
+  catch {
+    return null
+  }
+  if (!Array.isArray(parsed))
+    return null
+  let newest: number | null = null
+  for (const item of parsed) {
+    const t = item && typeof item === 'object' ? (item as Record<string, unknown>)['backup-time'] : undefined
+    if (typeof t === 'number' && Number.isFinite(t) && (newest === null || t > newest))
+      newest = Math.trunc(t)
+  }
+  return newest
+}
+
+function isoSeconds(unixSeconds: number): string {
+  return new Date(unixSeconds * 1000).toISOString().replace(ISO_MILLIS_TAIL_RE, 'Z')
+}
+
+/**
+ * Judge PBS's "backup timestamp is older than last backup" refusal. PBS says it
+ * whenever this run's backup time is NOT NEWER than the group's newest
+ * snapshot: a same-second re-run (benign, nothing new to back up yet) AND a
+ * node clock that is behind that snapshot by any amount (an RTC or NTP step
+ * back, a board swap) — where every run would otherwise read "skipped,
+ * success" and no backup would be taken until the clock passed it.
+ *
+ * Returns null when the newest snapshot falls inside this run's own pbc window
+ * (the collision), and otherwise the sentence the run fails with. A newest
+ * time that could not be read is a failure too: a refusal ANAS cannot prove
+ * benign is never reported as a success (fail closed). ASCII only — it becomes
+ * the run error and the notification body.
+ */
+export function judgeTooSoon(
+  group: string,
+  newest: number | null,
+  window: { startMs: number, endMs: number },
+  readProblem?: string,
+): string | null {
+  // cr3 review (5): bounded by this run's START second on BOTH sides. PBS
+  // stamps the snapshot from the client's clock as the client starts; a
+  // same-second collision puts the newest snapshot at that second (±1 for the
+  // boundary). The END of the window says only how long the refusal took — a
+  // slow PBS must not widen what counts as harmless.
+  const startSecond = Math.floor(window.startMs / 1000)
+  const from = startSecond - TOO_SOON_SLACK_S
+  const to = startSecond + TOO_SOON_SLACK_S
+  if (newest !== null && newest >= from && newest <= to)
+    return null
+  const runTime = isoSeconds(Math.floor(window.startMs / 1000))
+  if (newest === null) {
+    return `PBS refused this run's backup time (${runTime}) as not newer than the newest snapshot in ${group}, `
+      + `and ANAS could not read that snapshot's time to confirm a same-second re-run`
+      + `${readProblem ? ` (${readProblem})` : ''}. Counted as a failure: if the node clock moved backwards, `
+      + `no backup is taken until it passes the newest snapshot - check the node's time.`
+  }
+  return `PBS refused this run: its backup time (${runTime}) is not newer than the newest snapshot in ${group} `
+    + `(${isoSeconds(newest)}). The node clock is behind that snapshot, so no backup is taken until the clock `
+    + `passes it - check the node's time (timedatectl).`
+}
+
 // --- Run one backup ---------------------------------------------------------
 
 export interface BackupRunDeps {
@@ -521,6 +671,11 @@ export interface BackupRunDeps {
    * then finds the backup's child already gone and says the run is finishing.
    */
   onSpawn?: (child: SpawnedChild) => void
+  /**
+   * cr3.backup H2 test seam: the clock (epoch milliseconds) the too-soon check
+   * brackets the pbc call with. Absent = `Date.now`.
+   */
+  clock?: () => number
   /**
    * rclone.5 review (backup parity) — the pre-flight boundary check, called at
    * each one (before the source guard, before the transient snapshots, before
@@ -646,13 +801,20 @@ export async function runBackup(
   // the other archives to proceed splits the task. Every offending archive is
   // named in ONE error so a single fix round suffices.
   //
-  // Fail-open is the helper's own contract: an unreadable fstab or mount table
-  // yields no refusals, because a guard that cannot see the system must not
-  // claim a mount is missing.
+  // An unreadable MOUNT TABLE yields no refusals (the helper's own contract: a
+  // guard that cannot see the system must not claim a mount is missing). An
+  // fstab that exists and cannot be read refuses (cr3.backup): "nothing is
+  // configured" would be a guess, and a missing fact may only tighten.
   deps.checkCancel?.('the source guard')
   const guardFacts = await readSourceGuardFacts(executor, deps.fstabPath, task.archives.map(a => a.path))
   const refusals: string[] = []
   for (const archive of task.archives) {
+    // cr3.backup: an unreadable fstab tightens, never opens the guard.
+    const unreadable = unreadableFactsRefusal(archive.path, guardFacts)
+    if (unreadable) {
+      refusals.push(`archive '${archive.name}': ${unreadable}`)
+      continue
+    }
     const mount = unmountedMountFor(archive.path, guardFacts)
     if (mount)
       refusals.push(unmountedArchiveRefusal(archive.name, archive.path, mount))
@@ -734,6 +896,10 @@ export async function runBackup(
   const now = deps.now ?? new Date()
   const snapshotOptions = deps.snapshotOptions
   const taken: TakenSnapshot[] = []
+  // cr3.backup M5: what the snapshot branch's cleanup could not undo (a
+  // transient left, a snapdev not put back). Warnings on a good run; appended
+  // to the error on a failed one, which would otherwise drop them.
+  const leftBehind: string[] = []
   let expansion: BackupExpandedArchive[] = []
   // Definitely assigned by the time it is read: every branch below either sets
   // it or throws (the `finally` re-raises after destroying the snapshots).
@@ -742,14 +908,25 @@ export async function runBackup(
   // `prlimit -- cmd` EXECS the command in place (it sets the limit on itself
   // and then execvp's), so the pid `onSpawn` hands over IS pbc's — the cancel
   // hook's SIGINT reaches the client, not a wrapper (rclone.5).
-  const exec = async (args: string[]): Promise<{ exitCode: number, stderr: string }> =>
-    executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], {
-      env,
-      ...(deps.onSpawn ? { onSpawn: deps.onSpawn } : {}),
-      // cr.34: a data mover; it ends on its own or through its cancel hook.
-      timeoutMs: null,
-      longRunning: 'proxmox-backup-client backup: a data mover, hours for a large source; stopped by its cancel hook',
-    })
+  // cr3.backup H2: the window this run's pbc call was alive, for the too-soon
+  // check below (a same-second collision puts the newest snapshot inside it).
+  const clock = deps.clock ?? Date.now
+  const pbcWindow = { startMs: 0, endMs: 0 }
+  const exec = async (args: string[]): Promise<{ exitCode: number, stderr: string }> => {
+    pbcWindow.startMs = clock()
+    try {
+      return await executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], {
+        env,
+        ...(deps.onSpawn ? { onSpawn: deps.onSpawn } : {}),
+        // cr.34: a data mover; it ends on its own or through its cancel hook.
+        timeoutMs: null,
+        longRunning: 'proxmox-backup-client backup: a data mover, hours for a large source; stopped by its cancel hook',
+      })
+    }
+    finally {
+      pbcWindow.endMs = clock()
+    }
+  }
 
   if (!snapshotMode) {
     // The last boundary before anything runs (rclone.5 review).
@@ -778,6 +955,8 @@ export async function runBackup(
       warnings.push(...await sweepAhrTransients(executor, pool, task.name, now, updateProgress, snapshotOptions))
 
     const label = formatTransientBackupSnapshot(task.name, now)
+    let failed = false
+    let failure: unknown
     try {
       for (const dataset of zfsTargets) {
         updateProgress(`snapshotting ${dataset}@${label} (recursive)`)
@@ -836,13 +1015,20 @@ export async function runBackup(
           ? withTopLevelMounts(executor, ahrTargets, async () => exec(args), snapshotOptions)
           : exec(args)
 
-      r = await withZvolSnapshotDevices(executor, zvolSources, runPbc, warnings, updateProgress, deps.snapdevOptions)
+      r = await withZvolSnapshotDevices(executor, zvolSources, runPbc, leftBehind, updateProgress, deps.snapdevOptions)
+    }
+    catch (err) {
+      failed = true
+      failure = err
     }
     finally {
       // Success, failure or timeout alike. Destroy failures are warnings on an
       // otherwise-good run; they never turn a completed backup into a failed job.
-      warnings.push(...await destroyTransients(executor, taken, updateProgress, snapshotOptions))
+      leftBehind.push(...await destroyTransients(executor, taken, updateProgress, snapshotOptions))
     }
+    warnings.push(...leftBehind)
+    if (failed)
+      throw withStateLeftBehind(failure, leftBehind)
   }
 
   // cr.48f: the SUCCESS-path extraction is masked in ONE pass, against the very
@@ -866,7 +1052,28 @@ export async function runBackup(
       ? 'backup owner mismatch - this backup-id is owned by a different auth-id; '
       + 'switching a repo\'s auth style needs a server-side change-owner. '
       : ''
-    throw new Error(`${prefix}${outcome.detail}`)
+    throw withStateLeftBehind(new Error(`${prefix}${outcome.detail}`), leftBehind)
+  }
+  if (outcome.kind === 'too-soon') {
+    // cr3.backup H2: the refusal is benign only when it is provably the
+    // same-second collision. Ask PBS for the group's newest snapshot time — the
+    // one extra contact, made only on this path — and fail otherwise.
+    const group = `host/${task.backupId}`
+    let newest: number | null = null
+    let readProblem: string | undefined
+    try {
+      const listed = await executor.exec(PBC, buildSnapshotListArgs(group, namespace), { env })
+      if (listed.exitCode === 0)
+        newest = newestBackupTime(listed.stdout)
+      else
+        readProblem = maskSecretValues(firstErrorLine(listed.stderr), [secret])
+    }
+    catch (err) {
+      readProblem = maskSecretValues(err instanceof Error ? err.message : String(err), [secret])
+    }
+    const clockFailure = judgeTooSoon(group, newest, pbcWindow, readProblem)
+    if (clockFailure)
+      throw withStateLeftBehind(new Error(clockFailure), leftBehind)
   }
 
   const result: BackupRunResult = {

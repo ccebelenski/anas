@@ -970,6 +970,33 @@ describe('runImageRestore — failures', () => {
     assert.ok(result.warnings?.some(w => /THE TARGET IS STILL DISABLED/.test(w)), JSON.stringify(result.warnings))
   })
 
+  it('cr3.backup BACKUP-M5: a FAILED restore whose re-enable also fails says the target is still disabled in its error', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: TARGETCLI,
+      results: [
+        { stdout: '', stderr: '', exitCode: 0 },
+        { stdout: '', stderr: '', exitCode: 0 },
+        { stdout: '', stderr: 'targetcli: enable failed', exitCode: 1 },
+      ],
+    })
+    // pbc fails before a byte is written (auth): the error says "Nothing was
+    // written" and, before this fix, dropped the re-enable failure entirely.
+    mock.addStreamFixture({
+      command: PBC,
+      result: { stderr: 'Error: authentication failed - invalid credentials\n', exitCode: 255, bytesWritten: 0 },
+    })
+    const lun = zvolLun()
+    await assert.rejects(
+      runImageRestore(mock, deps(mock, lun, target([lun])), noop),
+      (err: Error) => {
+        assert.match(err.message, /Nothing was written/)
+        assert.match(err.message, /THE TARGET IS STILL DISABLED: re-enabling iqn\.2026-08\.nas\.anas:vmstore failed/)
+        return true
+      },
+    )
+  })
+
   it('a byte count that disagrees with the manifest is a warning, not a silent pass', async () => {
     const mock = successMock({ bytesWritten: IMAGE_SIZE - 4096 })
     const lun = zvolLun()

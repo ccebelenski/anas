@@ -903,7 +903,7 @@ describe('backup2.6 — local pre-flight probes', () => {
     // The target answers its existence probe (R2's walk), then the write lands.
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', '/gtbackup/data'],
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', '/gtbackup/data'],
       result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
     })
     mock.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -919,7 +919,7 @@ describe('backup2.6 — local pre-flight probes', () => {
     const mock = new MockExecutor()
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', '/t'],
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', '/t'],
       result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
     })
     // Mock accepts any touch path starting with the prefix
@@ -938,17 +938,17 @@ describe('backup2.6 — local pre-flight probes', () => {
     const mock = new MockExecutor()
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', '/gtbackup/deep/newdir'],
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', '/gtbackup/deep/newdir'],
       result: { stdout: '', stderr: 'No such file or directory\n', exitCode: 1 },
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', '/gtbackup/deep'],
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', '/gtbackup/deep'],
       result: { stdout: '', stderr: 'No such file or directory\n', exitCode: 1 },
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', '/gtbackup'],
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', '/gtbackup'],
       result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
     })
     const probeName = `.anas-restore-write-test-${process.pid}`
@@ -970,7 +970,7 @@ describe('backup2.6 — local pre-flight probes', () => {
     const mock = new MockExecutor()
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', '/mnt/pbs/deep/newdir'],
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', '/mnt/pbs/deep/newdir'],
       result: { stdout: '', stderr: '', exitCode: 124 },
     })
     const probeName = `.anas-restore-write-test-${process.pid}`
@@ -989,7 +989,7 @@ describe('backup2.6 — local pre-flight probes', () => {
     const mock = new MockExecutor()
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', '/x'],
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', '/x'],
       result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
     })
     mock.addFixture({
@@ -1007,7 +1007,7 @@ describe('backup2.6 — local pre-flight probes', () => {
     const mock = new MockExecutor()
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', '/dead'],
+      args: ['10', '/usr/bin/stat', '-c', '%F', '--', '/dead'],
       result: { stdout: '', stderr: '', exitCode: 124 },
     })
     mock.addFixture({
@@ -1043,7 +1043,7 @@ describe('backup2.6 — local pre-flight probes', () => {
     file.addFixture({ command: TIMEOUT, result: { stdout: 'regular file\n', stderr: '', exitCode: 0 } })
     assert.equal(await pathKind(file, '/t'), 'regular file')
     const no = new MockExecutor()
-    no.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: 'No such file', exitCode: 1 } })
+    no.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: 'stat: cannot statx: No such file or directory\n', exitCode: 1 } })
     assert.equal(await pathKind(no, '/t'), null)
     const dead = new MockExecutor()
     dead.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: '', exitCode: 124 } })

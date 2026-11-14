@@ -476,6 +476,51 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
 
   // --- (1)(2) LIO availability + the degraded-restore guard ----------------
 
+  describe('cr3 review2 (1): a named task\'s namespace at the two image doors', () => {
+    async function storeTask(name: string, namespace: string | undefined): Promise<void> {
+      const task = { name, repository: 'pbs-main', backupId: name, archives: [{ name: 'a', path: '/a', excludes: [] }], schedule: 'daily', enabled: true, ...(namespace === undefined ? {} : { namespace }) }
+      await writeFile(join(dir, `anas-backup-${name}.service`), `# X-ANAS-Task=${JSON.stringify(task)}\n[Service]\n`)
+      await writeFile(join(dir, `anas-backup-${name}.timer`), '[Timer]\n')
+    }
+    // [task, body ns, expected --ns of the snapshot read (null = the root) or 400]
+    const table: [string | undefined, string | undefined, string | null | 400][] = [
+      [undefined, 'gtrestore', 'gtrestore'],
+      [undefined, '', null], // no task: '' is "not given" = the repository's (none here) — unchanged
+      ['rooted', undefined, null],
+      ['rooted', '', null],
+      ['rooted', 'gtrestore', 400],
+      ['named', undefined, 'gtrestore'],
+      ['named', '', 'gtrestore'],
+      ['named', 'other', 400],
+    ]
+    for (const door of ['in place', 'new LUN'] as const) {
+      it(`${door}: door x (task named / not) x (ns absent / '' / value)`, async () => {
+        await serveAnas()
+        await storeTask('rooted', '')
+        await storeTask('named', 'gtrestore')
+        const mock = mockOf()
+        for (const [task, ns, want] of table) {
+          mock.calls.length = 0
+          const base = door === 'in place' ? body() : newLunBodyOf()
+          const { ns: _drop, ...rest } = base as Record<string, unknown>
+          const res = await restore({ ...rest, ...(task ? { task } : {}), ...(ns === undefined ? {} : { ns }) })
+          const label = `${door} task=${task ?? '-'} ns=${ns === undefined ? '-' : JSON.stringify(ns)}`
+          if (want === 400) {
+            assert.equal(res.statusCode, 400, `${label}: ${JSON.stringify(res.body)}`)
+            continue
+          }
+          const read = mock.calls.find(c => c.command === PBC && c.args[0] === 'snapshot')
+          assert.ok(read, `${label}: ${JSON.stringify(res.body)}`)
+          const i = read.args.indexOf('--ns')
+          assert.equal(i === -1 ? null : read.args[i + 1], want, label)
+        }
+      })
+    }
+    function newLunBodyOf(): Record<string, unknown> {
+      return body({ lun: undefined, target: { mode: 'newLun', targetIqn: ANAS_IQN, name: 'newvol', backing: { kind: 'zvol', pool: 'tank' } } })
+    }
+  })
+
   describe('LIO must be there, and not mid-degraded-restore', () => {
     it('no LIO stack → a guiding 409 naming the packages, nothing touched', async () => {
       await serve()
@@ -1142,6 +1187,29 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assertNothingDestructive()
     })
 
+    it('cr3.backup: an image from ANOTHER LUN\'s group says so in the confirm', async () => {
+      const other = 'host/lun-11111111-2222-3333-4444-555555555555/2026-08-25T19:28:38Z'
+      const snapshots = JSON.stringify([{
+        'backup-id': 'lun-11111111-2222-3333-4444-555555555555',
+        'backup-type': 'host',
+        'backup-time': 1787686118,
+        'files': [{ 'crypt-mode': 'none', 'filename': 'vol.img.fidx', 'size': IMAGE_SIZE }],
+      }])
+      await serveAnas({ snapshots })
+      const res = await restore(body({ snapshot: other }))
+      assert.equal(res.statusCode, 409)
+      const warnings = (res.body.error!.warnings ?? []).join(' | ')
+      assert.match(warnings, /This image was backed up from ANOTHER LUN \(lun-11111111-2222-3333-4444-555555555555\); LUN 0 of .* is lun-9bc6e907-6015-4267-be4f-5a0617cb3d71/)
+      assertNothingDestructive()
+    })
+
+    it('cr3.backup: a group that is not a LUN group (a hand-named id) carries no other-LUN line', async () => {
+      await serveAnas()
+      const own = await restore()
+      assert.equal(own.statusCode, 409)
+      assert.ok(!(own.body.error!.warnings ?? []).some(w => /ANOTHER LUN/.test(w)))
+    })
+
     it('the confirmed call runs the whole sequence and reports it', async () => {
       await serveAnas()
       const first = await restore()
@@ -1382,6 +1450,30 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         assertNothingDestructive()
       })
 
+      it('cr3.backup: an UNMAPPED backstore of that name is refused too — the daemon checks, not the panel', async () => {
+        // A backstore in the live tree that no target maps: lunNameFreeGate
+        // cannot see it, and a create over it would fail after the backing was
+        // made, with the cleanup's delete-by-name then removing it.
+        await serve({
+          manifest: anasManifest().replace('D core\n', [
+            'D core',
+            'D core/iblock_1',
+            'D core/iblock_1/newvol',
+            'F core/iblock_1/newvol/udev_path = /dev/zvol/tank/other',
+            'F core/iblock_1/newvol/enable = 1',
+            'D core/iblock_1/newvol/wwn',
+            'F core/iblock_1/newvol/wwn/product_id = newvol',
+            '',
+          ].join('\n')),
+          saveconfigText: anasSaveconfig(),
+        })
+        const res = await restore(newLunBody(targetWith({ name: 'newvol' })))
+        assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+        assert.equal(res.body.error!.reason, 'name-taken', JSON.stringify(res.body))
+        assert.match(res.body.error!.message, /backstore named 'newvol' already exists on this node \(iblock, not mapped as a LUN\)/)
+        assertNothingDestructive()
+      })
+
       it('a PVE guest volume is never ANAS\'s to create, even for a restore (pvepool.1)', async () => {
         // The naming rule is scoped to PVE's storage: with `tank` as the
         // configured pool of a zfspool storage, a zvol named like a guest disk
@@ -1435,6 +1527,8 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assert.match(warnings, /FRESH unit serial/)
       assert.match(warnings, /source LUN .* is not touched/)
       assert.match(warnings, /removes the new LUN, its backstore and its backing/)
+      // cr3 review2 (5): the keep-on-save-failure case is said too.
+      assert.match(warnings, /If only saving the iSCSI configuration fails once the image is written, the LUN, its backstore and its backing are kept/)
       assertNothingDestructive()
     })
 
@@ -1670,7 +1764,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       const restoreIdx = seq.indexOf(`${PBC} restore ${SNAP} vol.img - --ns gtrestore`)
       assert.deepEqual(seq.slice(restoreIdx + 1), [
         `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/luns delete lun1`,
-        `${TARGETCLI} /backstores/block/newvol delete`,
+        `${TARGETCLI} /backstores/block delete newvol`,
         `${ZFS} destroy -- tank/newvol`,
       ], seq.join(' | '))
       assert.ok(!seq.some(a => a.includes('saveconfig')), 'a failed restore must not save the LIO configuration')

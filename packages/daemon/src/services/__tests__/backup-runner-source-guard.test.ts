@@ -240,21 +240,20 @@ describe('backup source guard — the run\'s step 0 (backup2.11)', () => {
     assert.ok(!mock.calls.some(c => c.command === PRLIMIT), 'pbc was never invoked')
   })
 
-  it('FAIL OPEN: an unreadable mount table lets the run proceed', async () => {
+  it('cr3 review (2): an unreadable mount table REFUSES the run (was: fail open) — a missing fact only tightens', async () => {
     // findmnt answering nothing is the unreadable case (a live Linux system
-    // always has at least `/`). A guard that cannot see the system must not
-    // claim a mount is missing.
+    // always has at least `/`). The guard cannot tell an empty mountpoint from
+    // a mounted share, so the run is refused before pbc, naming the read.
     const mock = new Mock()
     mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: '', stderr: 'boom', exitCode: 1 } })
     mock.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: PRLIMIT, result: { stdout: '', stderr: PBC_OK, exitCode: 0 } })
-    const result = await run(mock, [{ name: 'pictures', path: '/mnt/pictures', excludes: [] }])
-    assert.equal(result.status, 'success')
-    assert.ok(mock.calls.some(c => c.command === PRLIMIT), 'pbc ran')
+    await assert.rejects(run(mock, [{ name: 'pictures', path: '/mnt/pictures', excludes: [] }]), /the mount table could not be read/)
+    assert.ok(!mock.calls.some(c => c.command === PRLIMIT), 'pbc never ran')
   })
 
-  it('FAIL OPEN: an unreadable fstab configures nothing, so nothing is refused', async () => {
+  it('FAIL OPEN: an ABSENT fstab configures nothing, so nothing is refused (an unreadable one refuses: cr3-backup.test.ts)', async () => {
     const mock = wire(NOTHING_MOUNTED)
     const result = await run(
       mock,

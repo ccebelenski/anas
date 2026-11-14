@@ -2,7 +2,7 @@ import type { BackupArchiveConsistency, BackupExpandedArchive, BackupPruneResult
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { BackupTrigger, CadenceGateDecision } from './backup-cadence.js'
-import type { RunActiveState, SuperviseRunOptions, TaskUnitKind } from './task-units.js'
+import type { RunActiveState, SuperviseRunOptions, TaskUnitKind, UnreadableTaskUnit } from './task-units.js'
 import type { TaskHelperResult } from './unit-run-status.js'
 import { BACKUP_SKIP_EXIT_CODE, BackupTask as BackupTaskSchema } from '@anas/shared'
 import { DISABLED_HISTORY_NOTE, parseSystemdTimestamp } from './systemd-status.js'
@@ -28,6 +28,7 @@ import {
   gateRun as gateRunGeneric,
   parseTaskUnit,
   readAllTaskUnits,
+  readAllTaskUnitsChecked,
   readLastSuccessAt as readLastSuccessAtGeneric,
   readRecentJournal as readRecentJournalGeneric,
   readRunActive as readRunActiveGeneric,
@@ -196,11 +197,90 @@ export function parseServiceUnit(content: string): BackupTask | null {
   return parseTaskUnit(BACKUP_UNIT_KIND, content, BackupTaskSchema)
 }
 
+// --- The update contract (cr3.backup M4) ----------------------------------
+
+/**
+ * The body of `PUT /backup/tasks/:name` laid over the STORED task, before the
+ * one parse (EPICS §2 dialog contract, cr3 rule): a key the body OMITS keeps
+ * the stored value, a key it sends as `null` is cleared (an optional field is
+ * gone; a defaulted one — `enabled`, `notify`, `changeDetectionMode`,
+ * `limitNofile` — takes its schema default), and every other key it sends
+ * stands as sent. Before this, the update parsed the body alone, so a body
+ * that left out `enabled` re-enabled a disabled task and one that left out
+ * `limitNofile`, `notify`, the mode or the retention reset or dropped them.
+ *
+ * TEMPORARY exceptions, {@link PUT_CLEARS_ON_OMIT}: the fields the RELEASED
+ * panel leaves out of its body to mean "none" still clear on omission, so this
+ * daemon is safe with that panel. The list is EMPTIED at merge, once the panel
+ * sends `null` for every field an edit clears (coordinator ruling, cr3 review).
+ *
+ * Two pairs are one choice each:
+ *   - `mode` is the legacy spelling of `changeDetectionMode`: it counts when
+ *     the body does not send `changeDetectionMode` itself.
+ *   - `schedule` and `cadence`: a body that sends a raw `schedule` and no
+ *     `cadence` key is choosing that schedule, so the stored cadence (which
+ *     would regenerate the expression over it) is not carried.
+ *
+ * A non-object body is returned as it is, for the parse to refuse.
+ */
+/**
+ * cr3 (TEMPORARY — EMPTIED AT MERGE when the panel sends `null` for every field
+ * an edit clears): the task fields an OMITTED key still CLEARS on
+ * `PUT /backup/tasks/:name`. Each is one the released panel (68-backup.js at
+ * main) leaves out of its body when the operator blanked it:
+ *   - `namespace`  — sent only when the field is non-blank;
+ *   - `retention`  — sent only when at least one keep is set (`hasKeeps`), so
+ *                    keeping it on omission would go on PRUNING after the
+ *                    operator cleared the policy.
+ * Every other field the released panel sends always (name, repository,
+ * backupId, archives — replaced whole —, mode/changeDetectionMode, notify,
+ * enabled, schedule or cadence), sends exactly when stored (kind, limitNofile,
+ * which no control can blank), or is a pair handled above (schedule/cadence).
+ */
+export const PUT_CLEARS_ON_OMIT = ['namespace', 'retention'] as const
+
+export function mergeBackupTaskUpdate(stored: BackupTask, body: unknown): unknown {
+  if (!body || typeof body !== 'object' || Array.isArray(body))
+    return body
+  const sent = body as Record<string, unknown>
+  const has = (key: string): boolean => Object.hasOwn(sent, key)
+  const merged: Record<string, unknown> = { ...stored }
+  for (const [key, value] of Object.entries(sent)) {
+    if (key === 'mode')
+      continue
+    if (value === null)
+      delete merged[key]
+    else
+      merged[key] = value
+  }
+  if (has('mode') && !has('changeDetectionMode')) {
+    if (sent.mode === null)
+      delete merged.changeDetectionMode
+    else
+      merged.changeDetectionMode = sent.mode
+  }
+  if (has('schedule') && !has('cadence'))
+    delete merged.cadence
+  for (const field of PUT_CLEARS_ON_OMIT) {
+    if (!has(field))
+      delete merged[field]
+  }
+  return merged
+}
+
 // --- Store: read ------------------------------------------------------------
 
 /** All valid tasks parsed from `anas-backup-*.service` files (invalid → skipped). */
 export async function readAllTasks(dir: string): Promise<BackupTask[]> {
   return readAllTaskUnits(BACKUP_UNIT_KIND, dir, BackupTaskSchema)
+}
+
+/**
+ * cr3 (INVENTED-STATE-H1): every task, plus every `anas-backup-*.service` that
+ * is there and could not be read or parsed — listed by name, never dropped.
+ */
+export async function readAllTasksChecked(dir: string): Promise<{ tasks: BackupTask[], unreadable: UnreadableTaskUnit[] }> {
+  return readAllTaskUnitsChecked(BACKUP_UNIT_KIND, dir, BackupTaskSchema)
 }
 
 /** One task by name, or null if its service file is absent/invalid. */
@@ -544,6 +624,8 @@ export function buildBackupWarnings(inputs: BackupWarningInput[]): DashboardWarn
 export async function collectBackupWarnings(
   executor: CommandExecutor,
   dir: string,
+  /** cr3: the dashboard section reader's partial-read callback (see collectTaskWarnings). */
+  incomplete?: (reason: string) => void,
 ): Promise<DashboardWarning[]> {
-  return collectTaskWarnings(BACKUP_UNIT_KIND, executor, dir, readAllTasks)
+  return collectTaskWarnings(BACKUP_UNIT_KIND, executor, dir, readAllTasksChecked, incomplete)
 }

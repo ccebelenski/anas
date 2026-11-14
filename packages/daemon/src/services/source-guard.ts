@@ -98,6 +98,14 @@ export interface SourceGuardFacts {
    * path below a live ZFS mount is not provably mounted and is refused.
    */
   zfsFactsUnavailable: boolean
+  /**
+   * cr3.backup (handed by the cloud builder): /etc/fstab exists but could not
+   * be read — the reason. Absent when it was read, or is simply not there.
+   * While set, whether a path is on a configured-but-unmounted mount is
+   * UNKNOWN, and {@link guardSourcePath} refuses (a missing fact may only
+   * tighten the guard, never open it).
+   */
+  fstabUnavailable?: string
 }
 
 /** One row of `zfs list -H -p -t filesystem -o name,mountpoint,canmount,mounted`. */
@@ -142,6 +150,8 @@ export function buildSourceGuardFacts(
   /** `zfs list` output; null = the read FAILED (not "no datasets"). */
   zfsText: string | null = '',
   realpaths: Map<string, string> = new Map(),
+  /** cr3.backup: why /etc/fstab could not be read (absent = it was, or it does not exist). */
+  fstabUnavailable?: string,
 ): SourceGuardFacts {
   const nodes = parseFindmnt(findmntText)
   const fstab: UnmountedMount[] = parseFstab(fstabText)
@@ -174,6 +184,7 @@ export function buildSourceGuardFacts(
     // without it EVERY path would look like it sits on an unmounted `/`.
     mountTableUnavailable: nodes.length === 0,
     zfsFactsUnavailable: zfsText === null,
+    ...(fstabUnavailable !== undefined ? { fstabUnavailable } : {}),
   }
 }
 
@@ -194,20 +205,53 @@ async function readZfsMountText(executor: CommandExecutor): Promise<string | nul
 }
 
 /**
- * `realpath -e` of one path, in a child bounded by `timeout` — resolving a
- * path stats every component, and a component on a dead NFS server would
- * hang the caller (the hang trap). Undefined when it does not resolve, does
- * not exist, or does not answer in time: the path is then judged as written.
+ * THE bounded path resolver (cr3.backup M3: the source guard and the lock
+ * derivation of the backup and cloud run doors resolve the same paths, and
+ * now through this one function). `realpath` runs in a child bounded by
+ * `timeout -s KILL` — resolving a path stats every component, and a component
+ * on a dead hard-mounted NFS server would otherwise hang the caller (the hang
+ * trap; node's in-process `fs.realpath` pins a libuv thread there, and four
+ * such sources exhaust the pool every other fs call in anasd shares).
+ *
+ * `existing` (`realpath -e`): every component must exist. `missingOk`
+ * (`realpath -m`): the existing components are resolved through their
+ * symlinks and a missing tail is appended as written (proven on a scratch
+ * tree: `link/missing/deeper` resolves to `real/missing/deeper`; a symlink
+ * loop comes back as written).
+ *
+ * `path` is the answer, or undefined; `answered` says whether realpath ITSELF
+ * gave the verdict (exit 0 or its own refusal) rather than being killed by the
+ * timeout or never starting — a caller that would ask again must not ask a
+ * path that just hung.
  */
-async function resolvePath(executor: CommandExecutor, path: string): Promise<string | undefined> {
+export async function boundedRealpathRun(
+  executor: CommandExecutor,
+  path: string,
+  mode: 'existing' | 'missingOk',
+): Promise<{ path: string | undefined, answered: boolean }> {
   try {
-    const r = await executor.exec(TIMEOUT, ['-s', 'KILL', REALPATH_TIMEOUT_S, REALPATH, '-e', '--', path])
+    const r = await executor.exec(TIMEOUT, ['-s', 'KILL', REALPATH_TIMEOUT_S, REALPATH, mode === 'existing' ? '-e' : '-m', '--', path])
     const out = r.stdout.trim()
-    return r.exitCode === 0 && out.startsWith('/') && !out.includes('\n') ? out : undefined
+    const ok = r.exitCode === 0 && out.startsWith('/') && !out.includes('\n')
+    return { path: ok ? out : undefined, answered: r.exitCode === 0 || r.exitCode === 1 }
   }
   catch {
-    return undefined
+    return { path: undefined, answered: false }
   }
+}
+
+/** {@link boundedRealpathRun}'s answer alone: undefined = judge the path as written. */
+export async function boundedRealpath(
+  executor: CommandExecutor,
+  path: string,
+  mode: 'existing' | 'missingOk' = 'existing',
+): Promise<string | undefined> {
+  return (await boundedRealpathRun(executor, path, mode)).path
+}
+
+/** The guard's own use: `realpath -e`, bounded. */
+async function resolvePath(executor: CommandExecutor, path: string): Promise<string | undefined> {
+  return boundedRealpath(executor, path, 'existing')
 }
 
 /**
@@ -221,11 +265,15 @@ export async function readSourceGuardFacts(
   paths: string[] = [],
 ): Promise<SourceGuardFacts> {
   let fstabText = ''
+  let fstabUnavailable: string | undefined
   try {
     fstabText = await readFile(fstabPath, 'utf-8')
   }
-  catch {
-    // Absent or unreadable fstab: nothing is configured as far as we can tell.
+  catch (err) {
+    // An ABSENT fstab configures nothing. Any other failure is an unreadable
+    // one (cr3.backup): it never becomes "nothing configured".
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+      fstabUnavailable = (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err))
   }
   const [findmntText, zfsText] = await Promise.all([readFindmnt(executor), readZfsMountText(executor)])
   const realpaths = new Map<string, string>()
@@ -234,7 +282,7 @@ export async function readSourceGuardFacts(
     if (real && real !== p)
       realpaths.set(p, real)
   }
-  return buildSourceGuardFacts(fstabText, findmntText, zfsText, realpaths)
+  return buildSourceGuardFacts(fstabText, findmntText, zfsText, realpaths, fstabUnavailable)
 }
 
 /**
@@ -388,8 +436,33 @@ export function notThereClause(mount: UnmountedMount): string {
  * refusal means (a 400 on a door, a thrown run failure inside a job).
  */
 export function guardSourcePath(path: string, facts: SourceGuardFacts): string | null {
+  // The cloud doors tighten on an unreadable fstab (handed by cloud); an
+  // unreadable MOUNT TABLE still passes here — that half is the cloud area's
+  // call (handed back), the backup doors refuse on it below.
+  const unreadable = unreadableFactsRefusal(path, { ...facts, mountTableUnavailable: false })
+  if (unreadable)
+    return unreadable
   const mount = unmountedMountFor(path, facts)
   return mount ? unmountedSourceRefusal(path, mount) : null
+}
+
+/**
+ * cr3.backup: the refusal for a path whose guard could not read one of its two
+ * facts — /etc/fstab (handed by cloud) or the kernel mount table (cr3 review)
+ * — or null when both were read. A guard that cannot see whether the path is
+ * on a configured-but-unmounted mount refuses; a missing fact may only
+ * tighten. Every door that judges a path with these facts asks it first: the
+ * cloud runner and preview (through {@link guardSourcePath}), the backup
+ * runner, the file-restore destination.
+ */
+export function unreadableFactsRefusal(path: string, facts: SourceGuardFacts): string | null {
+  const what = facts.fstabUnavailable !== undefined
+    ? `/etc/fstab could not be read (${facts.fstabUnavailable})`
+    : facts.mountTableUnavailable ? 'the mount table could not be read (findmnt)' : null
+  if (what === null)
+    return null
+  return `${path}: ${what}, so whether it is on a mount the system is configured to have and does not have `
+    + 'right now is unknown - refusing rather than reading an empty mountpoint'
 }
 
 /** {@link guardSourcePath} with its own fact read — the one-shot form. */

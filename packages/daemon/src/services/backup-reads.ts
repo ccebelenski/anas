@@ -10,9 +10,12 @@ import {
   classifyArchiveFile,
   composeGroupId,
   composeSnapshotId,
+  hasControlChars,
+  isPbsBackupType,
+  isPbsSafeId,
   snapshotTimeIso,
 } from '@anas/shared'
-import { buildBackupEnv, classifyPermissionFailure, firstErrorLine, PBC } from './backup-runner.js'
+import { buildBackupEnv, buildSnapshotListArgs, classifyPermissionFailure, firstErrorLine, PBC } from './backup-runner.js'
 import { maskSecretValues } from './secret-argv.js'
 
 /**
@@ -173,21 +176,8 @@ function rawClassifyBackupReadVerdict(
 
 // --- argv builders ----------------------------------------------------------
 
-/**
- * `snapshot list [<group>] [--ns <ns>] --output-format json`.
- *
- * With a group it lists that group; without one it lists the whole namespace
- * (GT-2: both forms return the SAME element shape, so ONE parser serves both).
- */
-export function buildSnapshotListArgs(group?: string, namespace?: string): string[] {
-  const args = ['snapshot', 'list']
-  if (group)
-    args.push(group)
-  if (namespace)
-    args.push('--ns', namespace)
-  args.push('--output-format', 'json')
-  return args
-}
+/** `snapshot list` argv — ONE builder, in backup-runner (the run's too-soon check uses it too). */
+export { buildSnapshotListArgs }
 
 /** `list [--ns <ns>] --output-format json` — the GROUP listing (GT-3 shape). */
 export function buildGroupListArgs(namespace?: string): string[] {
@@ -229,6 +219,36 @@ function asInt(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : undefined
 }
 
+/** The `crypt-mode` values PBS reports (anything else is dropped, not shown). */
+const CRYPT_MODES = new Set(['none', 'sign-only', 'encrypt'])
+
+/**
+ * cr3.backup (backup-panel M5 at the daemon end): a row from the PBS server
+ * enters the daemon only when its type, id and file names are in PBS's OWN
+ * charset ({@link isPbsSafeId}) — these strings reach the restore pickers'
+ * combos and come back as pbc positionals, so a server that sends anything
+ * else (markup, a dash-led id) is not believed. A refused row or file is
+ * dropped and SAID: one sentence per refusal into `refused`, naming the row by
+ * position and the field, never echoing the refused text.
+ */
+function rowIdentityRefusal(kind: string, index: number, backupType: string, backupId: string): string | null {
+  if (!isPbsBackupType(backupType))
+    return `PBS returned a ${kind} (row ${index + 1}) whose backup-type is not vm, ct or host; ANAS left it out`
+  if (!isPbsSafeId(backupId))
+    return `PBS returned a ${kind} (row ${index + 1}) whose backup-id is not a PBS id (letters, digits, dots, underscores and dashes); ANAS left it out`
+  return null
+}
+
+function fileRefusal(kind: string, index: number): string {
+  return `PBS returned a file in ${kind} row ${index + 1} whose name is not a PBS archive name; ANAS left that file out`
+}
+
+/** An owner (auth-id) shown nowhere as markup, but never a control character. */
+function cleanOwner(v: unknown): string | undefined {
+  const owner = asString(v)
+  return owner && !hasControlChars(owner) ? owner : undefined
+}
+
 /**
  * Map ONE `snapshot list` file object onto the shared shape, classifying it by
  * its filename suffix so the picker knows what it may offer (GT-16).
@@ -238,7 +258,7 @@ export function toSnapshotFile(raw: unknown): BackupSnapshotFile | null {
     return null
   const o = raw as Record<string, unknown>
   const filename = asString(o.filename)
-  if (!filename)
+  if (!filename || !isPbsSafeId(filename))
     return null
   const { kind, archive } = classifyArchiveFile(filename)
   const file: BackupSnapshotFile = { filename, kind }
@@ -248,7 +268,7 @@ export function toSnapshotFile(raw: unknown): BackupSnapshotFile | null {
   if (size !== undefined)
     file.size = size
   const cryptMode = asString(o['crypt-mode'])
-  if (cryptMode)
+  if (cryptMode && CRYPT_MODES.has(cryptMode))
     file.cryptMode = cryptMode
   return file
 }
@@ -262,7 +282,7 @@ export function toSnapshotFile(raw: unknown): BackupSnapshotFile | null {
  * Returns null when the output is not the expected JSON array — an exit-0 run
  * that produced something else is a fault, not an empty listing.
  */
-export function parseSnapshotList(stdout: string): BackupSnapshot[] | null {
+export function parseSnapshotList(stdout: string, refused: string[] = []): BackupSnapshot[] | null {
   let parsed: unknown
   try {
     parsed = JSON.parse(stdout)
@@ -273,7 +293,9 @@ export function parseSnapshotList(stdout: string): BackupSnapshot[] | null {
   if (!Array.isArray(parsed))
     return null
   const out: BackupSnapshot[] = []
-  for (const item of parsed as RawSnapshot[]) {
+  const items = parsed as RawSnapshot[]
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index]
     if (!item || typeof item !== 'object')
       continue
     const backupType = asString(item['backup-type'])
@@ -281,12 +303,19 @@ export function parseSnapshotList(stdout: string): BackupSnapshot[] | null {
     const backupTime = asInt(item['backup-time'])
     if (!backupType || !backupId || backupTime === undefined)
       continue
+    const refusal = rowIdentityRefusal('snapshot', index, backupType, backupId)
+    if (refusal) {
+      refused.push(refusal)
+      continue
+    }
     const files: BackupSnapshotFile[] = []
     if (Array.isArray(item.files)) {
       for (const f of item.files) {
         const file = toSnapshotFile(f)
         if (file)
           files.push(file)
+        else if (f && typeof f === 'object' && asString((f as Record<string, unknown>).filename))
+          refused.push(fileRefusal('snapshot', index))
       }
     }
     const snapshot: BackupSnapshot = {
@@ -300,7 +329,7 @@ export function parseSnapshotList(stdout: string): BackupSnapshot[] | null {
     const size = asInt(item.size)
     if (size !== undefined)
       snapshot.size = size
-    const owner = asString(item.owner)
+    const owner = cleanOwner(item.owner)
     if (owner)
       snapshot.owner = owner
     if (typeof item.protected === 'boolean')
@@ -321,7 +350,7 @@ export function parseSnapshotList(stdout: string): BackupSnapshot[] | null {
  *
  * Sorted newest-last-backup first; a group with no `last-backup` sorts last.
  */
-export function parseGroupList(stdout: string): BackupGroup[] | null {
+export function parseGroupList(stdout: string, refused: string[] = []): BackupGroup[] | null {
   let parsed: unknown
   try {
     parsed = JSON.parse(stdout)
@@ -332,19 +361,30 @@ export function parseGroupList(stdout: string): BackupGroup[] | null {
   if (!Array.isArray(parsed))
     return null
   const out: BackupGroup[] = []
-  for (const item of parsed as RawGroup[]) {
+  const items = parsed as RawGroup[]
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index]
     if (!item || typeof item !== 'object')
       continue
     const backupType = asString(item['backup-type'])
     const backupId = asString(item['backup-id'])
     if (!backupType || !backupId)
       continue
+    const refusal = rowIdentityRefusal('group', index, backupType, backupId)
+    if (refusal) {
+      refused.push(refusal)
+      continue
+    }
     const files: BackupSnapshotFile[] = []
     if (Array.isArray(item.files)) {
       for (const f of item.files) {
         const filename = asString(f)
         if (!filename)
           continue
+        if (!isPbsSafeId(filename)) {
+          refused.push(fileRefusal('group', index))
+          continue
+        }
         const { kind, archive } = classifyArchiveFile(filename)
         const file: BackupSnapshotFile = { filename, kind }
         if (archive)
@@ -366,7 +406,7 @@ export function parseGroupList(stdout: string): BackupGroup[] | null {
       group.lastBackup = last
       group.lastBackupIso = snapshotTimeIso(last)
     }
-    const owner = asString(item.owner)
+    const owner = cleanOwner(item.owner)
     if (owner)
       group.owner = owner
     out.push(group)
@@ -386,7 +426,7 @@ export interface BackupReadDeps {
 
 /** A read that produced data, or a verdict explaining why it did not. */
 export type BackupReadOutcome<T>
-  = | { ok: true, data: T }
+  = | { ok: true, data: T, warnings?: string[] }
     | { ok: false, verdict: BackupReadVerdict, detail: string }
 
 /**
@@ -429,7 +469,8 @@ export async function listSnapshots(
   const out = await runRead(executor, deps, buildSnapshotListArgs(group, deps.namespace))
   if (!out.ok)
     return out
-  const snapshots = parseSnapshotList(out.data)
+  const refused: string[] = []
+  const snapshots = parseSnapshotList(out.data, refused)
   if (!snapshots) {
     return {
       ok: false,
@@ -437,7 +478,7 @@ export async function listSnapshots(
       detail: 'proxmox-backup-client exited 0 but did not return the expected JSON snapshot list',
     }
   }
-  return { ok: true, data: snapshots }
+  return { ok: true, data: snapshots, ...(refused.length ? { warnings: refused } : {}) }
 }
 
 /** List the GROUPS of a namespace — the task-less entry point. */
@@ -448,7 +489,8 @@ export async function listGroups(
   const out = await runRead(executor, deps, buildGroupListArgs(deps.namespace))
   if (!out.ok)
     return out
-  const groups = parseGroupList(out.data)
+  const refused: string[] = []
+  const groups = parseGroupList(out.data, refused)
   if (!groups) {
     return {
       ok: false,
@@ -456,5 +498,5 @@ export async function listGroups(
       detail: 'proxmox-backup-client exited 0 but did not return the expected JSON group list',
     }
   }
-  return { ok: true, data: groups }
+  return { ok: true, data: groups, ...(refused.length ? { warnings: refused } : {}) }
 }

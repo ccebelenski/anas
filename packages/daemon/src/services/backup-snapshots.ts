@@ -290,6 +290,105 @@ export async function sweepZfsTransients(
   return warnings
 }
 
+// ---------------------------------------------------------------------------
+//  The deleted task's leftovers (cr3.backup L9)
+// ---------------------------------------------------------------------------
+
+/** `zfs list` of every snapshot on the node (names only, machine-parsable). */
+export const ZFS_ALL_SNAPSHOTS_ARGS = ['list', '-t', 'snapshot', '-H', '-o', 'name'] as const
+
+/**
+ * cr3.backup L9: a run sweeps its stale transients only on the datasets its
+ * archives sit on NOW, so a task that is DELETED (no run ever comes again) or
+ * whose archive path moved to another dataset leaves its recursive transients
+ * behind, pinning space for good. This is the node-wide listing of one task's
+ * ZFS transients, read at the task's deletion: every snapshot on the node
+ * whose label parses as THIS task's (the run sweep's own scoping rule —
+ * `parse`), reduced to the shallowest dataset of each label (a recursive
+ * destroy there takes the children's copies with it, as it was taken).
+ * Null when the listing failed: an unreadable answer is never "none left".
+ */
+export async function listTaskZfsTransients(
+  executor: CommandExecutor,
+  task: string,
+  parse: (name: string) => ParsedTransientBackupSnapshot | null = parseTransientBackupSnapshot,
+): Promise<{ dataset: string, label: string }[] | null> {
+  let stdout: string
+  try {
+    const r = await executor.exec(ZFS, [...ZFS_ALL_SNAPSHOTS_ARGS])
+    if (r.exitCode !== 0)
+      return null
+    stdout = r.stdout
+  }
+  catch {
+    return null
+  }
+  const found: { dataset: string, label: string }[] = []
+  for (const line of stdout.split('\n')) {
+    const full = line.trim()
+    const at = full.indexOf('@')
+    if (at <= 0)
+      continue
+    const label = full.slice(at + 1)
+    if (parse(label)?.task === task)
+      found.push({ dataset: full.slice(0, at), label })
+  }
+  const has = new Set(found.map(f => `${f.dataset}@${f.label}`))
+  return found.filter((f) => {
+    for (let parent = f.dataset; parent.includes('/');) {
+      parent = parent.slice(0, parent.lastIndexOf('/'))
+      if (has.has(`${parent}@${f.label}`))
+        return false
+    }
+    return true
+  })
+}
+
+/** Destroy the leftovers {@link listTaskZfsTransients} found (recursive); each failure is a warning. */
+export async function destroyTaskZfsTransients(
+  executor: CommandExecutor,
+  leftovers: { dataset: string, label: string }[],
+  updateProgress: (message: string) => void = noop,
+): Promise<string[]> {
+  const warnings: string[] = []
+  for (const { dataset, label } of leftovers) {
+    try {
+      updateProgress(`destroying transient snapshot ${zfsSnapshotFullName(dataset, label)} the deleted task left`)
+      await destroyZfsSnapshot(executor, { dataset, name: label, recursive: true })
+    }
+    catch (err) {
+      const full = zfsSnapshotFullName(dataset, label)
+      warnings.push(`transient snapshot ${full} of the deleted task could not be destroyed: ${errText(err)} - ${await whatHolds(executor, full)}`)
+    }
+  }
+  return warnings
+}
+
+/**
+ * cr3 review (7): what keeps a snapshot from being destroyed — its user holds
+ * (`zfs holds`) and the clones it is the origin of — so the sentence never
+ * calls "safe to destroy by hand" a snapshot something still holds. A read
+ * that fails says so.
+ */
+async function whatHolds(executor: CommandExecutor, snapshot: string): Promise<string> {
+  const [holds, clones] = await Promise.all([
+    executor.exec(ZFS, ['holds', '-H', '-r', '--', snapshot]).catch(() => null),
+    executor.exec(ZFS, ['get', '-H', '-o', 'value', 'clones', '--', snapshot]).catch(() => null),
+  ])
+  if (!holds || holds.exitCode !== 0 || !clones || clones.exitCode !== 0)
+    return 'ANAS could not read what holds it (zfs holds / clones); check before destroying it by hand'
+  const tags = [...new Set(holds.stdout.split('\n').map(l => l.split('\t')[1]?.trim()).filter((t): t is string => !!t))]
+  const cloneList = clones.stdout.trim()
+  const origins = cloneList && cloneList !== '-' ? cloneList.split(',').map(c => c.trim()).filter(Boolean) : []
+  const parts = [
+    ...(tags.length ? [`it is held by the hold tag${tags.length === 1 ? '' : 's'} ${tags.map(t => `'${t}'`).join(', ')} (zfs release)`] : []),
+    ...(origins.length ? [`it is the origin of clone${origins.length === 1 ? '' : 's'} ${origins.join(', ')} (promote or destroy the clone first)`] : []),
+  ]
+  return parts.length
+    ? `${parts.join('; ')} - release what holds it before destroying it`
+    : 'nothing holds it (no hold, no clone), so it is safe to destroy by hand'
+}
+
 /** Sweep this task's stale AHR transients under `@snapshots`. Fails open. */
 export async function sweepAhrTransients(
   executor: CommandExecutor,
