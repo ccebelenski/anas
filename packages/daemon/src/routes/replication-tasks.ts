@@ -7,12 +7,15 @@ import type { TargetNamesResolver } from '../services/replication-units.js'
 import type { UnitTaskObject } from '../services/task-units.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { ReplicationTask, ReplicationTaskName } from '@anas/shared'
+import { ReplicationTask, ReplicationTaskFields, ReplicationTaskName } from '@anas/shared'
 import { currentLane } from '../executor/deadline.js'
+import { parseTreeList } from '../parsers/zfs-tree.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { guardCheck, guarded, sendRefusal, taskClaim } from '../safety/guard.js'
-import { loadPveFootprint } from '../services/pve-footprint.js'
-import { guardReplicationTarget } from '../services/replication-target.js'
+import { loadPveFootprint, ownershipRefusal, pveDescendantsUnlistedMessage } from '../services/pve-footprint.js'
+import { guardReplicationTarget, memoisePoolExists } from '../services/replication-target.js'
+import { ownedMessage } from '../services/replication-tree-gate.js'
+import { treePlacementRefusals, treeTargetName, treeTargetNameRefusals } from '../services/replication-tree.js'
 import {
   collectTaskStatuses,
   readTask,
@@ -25,10 +28,27 @@ import {
 } from '../services/replication-units.js'
 import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision } from '../services/task-units.js'
 import { isRunActive, showUnitPropsStrict } from '../services/unit-run-status.js'
+import { isAtOrUnder, sweepSet, zfsTreeListArgs } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
 const ZPOOL = '/usr/sbin/zpool'
+const ZFS = '/usr/sbin/zfs'
 const SYSTEMCTL = '/usr/bin/systemctl'
+
+/**
+ * A `zfs list -H` tree listing as names, or null when a line is one `zfs -H`
+ * would not print (parsers/zfs-tree.ts). The caller has already judged the
+ * EXIT CODE; a listing that does not parse is a read that did not answer, and
+ * never "nothing there".
+ */
+function parseTreeOrNull(stdout: string): string[] | null {
+  try {
+    return parseTreeList(stdout)
+  }
+  catch {
+    return null
+  }
+}
 
 /**
  * Recurring replication TASKS (Epic 5.5.3). The store IS the systemd units
@@ -119,7 +139,7 @@ export async function replicationTaskRoutes(
    * and recurring task now call the SAME guard, which resolves the location
    * first and asks the machine the target actually lives on.
    */
-  async function guardTask(task: ReplicationTask, reply: FastifyReply): Promise<boolean> {
+  async function guardTask(task: ReplicationTask, reply: FastifyReply, priorExclude: string[] = []): Promise<boolean> {
     const schedule = await validateSchedule(executor, task.schedule)
     if (!schedule.ok) {
       reply.code(400)
@@ -145,15 +165,163 @@ export async function replicationTaskRoutes(
       reply.send({ error: { code: 'VALIDATION_ERROR', message: guard.message } })
       return false
     }
+    // rrep.2 (R10, R5a–c at the task's door): a RECURSIVE task asks the
+    // tree's questions too. A task without `recursive` answers exactly what it
+    // answered before and issues exactly the commands it issued (R0).
+    if (task.recursive === true)
+      return guardRecursiveTask(task, sourceFull, targetFull, guard.placement, priorExclude, reply)
     return true
+  }
+
+  /**
+   * The create/update gates a RECURSIVE task must pass, in order, first
+   * failure answering (rrep.2, R10/R5a–c). They are the DIALOG's fast
+   * feedback, not the gate: the run re-reads and re-asks everything on every
+   * fire (services/replication-tree-gate.ts, ruling (j)). Deliberately NOT
+   * asked here — a task may be created before its source has a recursive
+   * snapshot: snapshots (R4), keys (R5f), `written` (R5g) and divergence
+   * (R5e).
+   *
+   *   1. the source DATASET exists (the pool check above only proves the pool);
+   *   2. every exclude exists in the source tree, unless the STORED task
+   *      already carried it (the schedule's rule: a child destroyed after the
+   *      task was saved must not turn an unrelated edit into a 400);
+   *   3. R5a — no swept dataset (the source itself included) is PVE-owned, on
+   *      a footprint loaded fresh for this request;
+   *   4. R5b (names) and R5c (placement), through the planner's own two rules;
+   *   5. R5b's local half — every swept dataset's target name passes the ONE
+   *      target guard (the root pair was judged above).
+   *
+   * `priorExclude` is the stored list on a PUT and empty at create.
+   */
+  async function guardRecursiveTask(
+    task: ReplicationTask,
+    sourceFull: string,
+    targetFull: string,
+    placement: { isRemote: boolean },
+    priorExclude: string[],
+    reply: FastifyReply,
+  ): Promise<boolean> {
+    const refuse = (message: string): false => {
+      reply.code(400)
+      reply.send({ error: { code: 'VALIDATION_ERROR', message } })
+      return false
+    }
+
+    const sourceTree = await readRecursiveSourceTree(task.source.pool, sourceFull, reply)
+    if (sourceTree === null)
+      return false
+
+    const exclude = task.exclude ?? []
+    for (const name of exclude) {
+      if (!priorExclude.includes(name) && !sourceTree.includes(name))
+        return refuse(`Exclude '${name}' does not exist under '${sourceFull}'`)
+    }
+
+    const sweep = sweepSet({ target: { kind: 'zfs', dataset: sourceFull }, recursive: true, exclude }, sourceTree)
+
+    // R5a, on a footprint loaded fresh for THIS request (never a cached one:
+    // the ownership verdict is the config's of this moment). The root itself
+    // is judged beside the sweep — `ownedDescendant` walks strict descendants.
+    const pve = await pveFootprint()
+    const rootOwned = pve.ownershipOf(sourceFull)
+    if (rootOwned) {
+      reply.send(sendRefusal(reply, ownershipRefusal(rootOwned, ownedMessage(sourceFull, { name: sourceFull, ownership: rootOwned }))))
+      return false
+    }
+    const ownedHit = pve.ownedDescendant(sweep, sourceFull)
+    if (ownedHit) {
+      reply.send(sendRefusal(reply, ownershipRefusal(ownedHit.ownership, ownedMessage(sourceFull, ownedHit))))
+      return false
+    }
+
+    // R5b names + R5c placement: the planner's own two rules, so the task's
+    // door and the run's door can never drift apart. First refusal answers.
+    const localTarget = !placement.isRemote
+    const ruleRefusals = [
+      ...treeTargetNameRefusals(sourceFull, targetFull, sweep),
+      // Only a LIVE exclude excuses a local target inside the source tree —
+      // the run's rule (replication-tree-gate.ts). A stored entry that is
+      // gone excludes nothing, and a task saved on its strength would be
+      // refused by every run (review of the rrep.2 fold).
+      ...treePlacementRefusals({ sourceRoot: sourceFull, targetRoot: targetFull, exclude: exclude.filter(name => sourceTree.includes(name)), localTarget }),
+    ]
+    if (ruleRefusals.length > 0)
+      return refuse(ruleRefusals[0])
+
+    // R5b's LOCAL half: every swept dataset's TARGET name passes the same
+    // guard the root pair did (the root pair itself is skipped — already
+    // judged above). A remote target skips this: its storage.cfg is neither
+    // readable nor ours. The fresh footprint is handed to the guard, so this
+    // pass adds no second load, and (fold P2) the target pool's existence is
+    // asked once for the pass, not once per swept dataset.
+    if (localTarget) {
+      const guardDeps = memoisePoolExists({ transport, poolExists, pveFootprint, pveFootprintPreloaded: pve })
+      for (const dataset of sweep) {
+        if (dataset === sourceFull)
+          continue
+        const guard = await guardReplicationTarget(guardDeps, {
+          target: task.target,
+          sourceFull: dataset,
+          targetFull: treeTargetName(sourceFull, targetFull, dataset),
+        })
+        if (!guard.ok)
+          return refuse(guard.message)
+      }
+    }
+    return true
+  }
+
+  /**
+   * The source DATASET's tree, or a refusal (rrep.2 gate 1). A read that did
+   * not answer — a non-zero exit, a line the parser refuses, a listing that
+   * does not start with the dataset (a `-r` listing starts at its operand) —
+   * is never taken as "absent". Which refusal it is comes from the POOL's own
+   * listing, never from stderr text: an unreadable pool listing means the read
+   * failed (`pveDescendantsUnlistedMessage`); a readable one that lacks the
+   * dataset's row means the dataset does not exist. The pool listing then
+   * carries the tree, filtered to the source.
+   */
+  async function readRecursiveSourceTree(pool: string, sourceFull: string, reply: FastifyReply): Promise<string[] | null> {
+    const refuse = (message: string): null => {
+      reply.code(400)
+      reply.send({ error: { code: 'VALIDATION_ERROR', message } })
+      return null
+    }
+    const unlisted = (): null => refuse(pveDescendantsUnlistedMessage('replication task', sourceFull))
+
+    const read = await executor.exec(ZFS, zfsTreeListArgs(sourceFull)).catch(() => null)
+    if (read !== null && read.exitCode === 0) {
+      const rows = parseTreeOrNull(read.stdout)
+      if (rows !== null && rows[0] === sourceFull)
+        return rows
+    }
+
+    const poolRead = await executor.exec(ZFS, zfsTreeListArgs(pool)).catch(() => null)
+    if (poolRead === null || poolRead.exitCode !== 0)
+      return unlisted()
+    const rows = parseTreeOrNull(poolRead.stdout)
+    // The listing must be the pool's own (its first row is the pool): an
+    // exit 0 that does not start with the pool did not answer the question.
+    if (rows === null || rows[0] !== pool)
+      return unlisted()
+    if (!rows.includes(sourceFull))
+      return refuse(`Source dataset '${sourceFull}' does not exist`)
+    return rows.filter(name => isAtOrUnder(name, sourceFull))
   }
 
   /**
    * A task's DATA IDENTITY: what it reads and where it writes. Rendered as one
    * comparable string so an edit can be checked against the stored task without
    * caring about key order or an absent-vs-'local' location.
+   *
+   * rrep.2 (R10): whether the task takes the whole TREE is part of that
+   * identity — a single-dataset send and a recursive send of the same root
+   * write a different set of datasets — so toggling `recursive` needs
+   * `?retarget=true` like a moved source or target. The exclude LIST is not:
+   * which children a run skips is policy, and an edit may change it freely.
    */
-  function endpoints(task: ReplicationTask): { source: string, target: string } {
+  function endpoints(task: ReplicationTask): { source: string, target: string, recursive: boolean } {
     const loc = task.target.location
     const where = loc && loc.kind !== 'local' ? `${loc.kind}:${loc.name ?? ''}` : 'local'
     const sourceRel = task.source.dataset || ''
@@ -164,6 +332,7 @@ export async function replicationTaskRoutes(
     return {
       source: sourceRel ? `${task.source.pool}/${sourceRel}` : task.source.pool,
       target: `${where}:${task.target.pool}${targetRel ? `/${targetRel}` : ''}`,
+      recursive: task.recursive === true,
     }
   }
 
@@ -350,7 +519,11 @@ export async function replicationTaskRoutes(
     }
     const name = nameParsed.data
 
-    const bodyParsed = ReplicationTask.safeParse(request.body ?? {})
+    // rrep.2 fold D1: the body's FIELD SHAPES only. The cross-field rules
+    // (R3's pairing, R10's "exclude requires recursive" and the exclude shape)
+    // judge the MERGED task below, once — a body that omits `recursive` is
+    // not a non-recursive body, it is "keep the stored value".
+    const bodyParsed = ReplicationTaskFields.safeParse(request.body ?? {})
     if (!bodyParsed.success) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid replication task: ${bodyParsed.error.issues[0]?.message}` } }
@@ -377,15 +550,48 @@ export async function replicationTaskRoutes(
       return sendRefusal(reply, pre.refusal)
     const stored = pre.object.task
 
+    // rrep.2 R10: a PUT that OMITS `recursive` keeps the stored value, and one
+    // that omits `exclude` keeps the stored list while the result is recursive.
+    // A PRESENT key stands — `false` and `[]` included. The schedule dialog's
+    // contract, stated for the same reason (routes/schedules.ts): an older
+    // client rebuilds the body without a key it does not know, and a full
+    // replace would silently strip it.
+    //
+    // WHERE the merge happens (fold D1): the body was parsed above for field
+    // SHAPES only; the stored values fill the OMITTED keys here; the merged
+    // task is then parsed ONCE by the strict schema, before the retarget
+    // guard, which must compare the task that would actually be written. So
+    // the merge can never produce a task the create door would have refused,
+    // a body sending only `exclude` keeps the stored recursion, and the
+    // version-skew case answers with R3's own sentence instead of a silently
+    // flipped field — an older client that knows nothing of `recursive`
+    // sends `snapshotFirst: true` (or omits it and gets the default), which
+    // merged with a stored recursive task is exactly R3's forbidden pair (R12).
+    const rawBody = request.body as Record<string, unknown> | null | undefined
+    const sent = (key: 'recursive' | 'exclude'): boolean => rawBody !== null && typeof rawBody === 'object' && Object.hasOwn(rawBody, key)
+    const recursive = sent('recursive') ? task.recursive === true : stored.recursive === true
+    const exclude = sent('exclude') ? task.exclude : recursive ? stored.exclude : undefined
+    const mergedParse = ReplicationTask.safeParse({
+      ...task,
+      ...(sent('recursive') || stored.recursive === undefined ? {} : { recursive: stored.recursive }),
+      ...(exclude === undefined ? {} : { exclude }),
+    })
+    if (!mergedParse.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid replication task: ${mergedParse.error.issues[0]?.message}` } }
+    }
+    const merged = mergedParse.data
+
     // Retarget guard: compare against the STORED task, not against what the
     // client believes it loaded (cr.41: an unparseable unit now reads not-found
     // — an edit cannot be bound to bytes the guard could not read).
     if (request.query.retarget !== 'true') {
       const was = endpoints(stored)
-      const now = endpoints(task)
+      const now = endpoints(merged)
       const moved = [
         ...(was.source !== now.source ? [`source ${was.source} → ${now.source}`] : []),
         ...(was.target !== now.target ? [`target ${was.target} → ${now.target}`] : []),
+        ...(was.recursive !== now.recursive ? [`recursive ${was.recursive ? 'on' : 'off'} → ${now.recursive ? 'on' : 'off'}`] : []),
       ]
       if (moved.length) {
         reply.code(400)
@@ -399,7 +605,7 @@ export async function replicationTaskRoutes(
       }
     }
 
-    if (!(await guardTask(task, reply)))
+    if (!(await guardTask(merged, reply, stored.exclude)))
       return reply
 
     const job = jobQueue.submit(
@@ -407,7 +613,7 @@ export async function replicationTaskRoutes(
       { ...identity, params: { task: name } },
       guarded(spec, pre, async () => {
         // Rewrite both units and re-sync the timer to `enabled` (toggle support).
-        await writeTaskUnits(executor, systemdDir, task)
+        await writeTaskUnits(executor, systemdDir, merged)
         return { updated: name }
       }),
       { locks: pre.locks },

@@ -372,6 +372,50 @@ describe('nf.3 D11 — readLocalHoldsChecked and describeHolds (the forced-rollb
       `held by a replication no task names (an interactive replicate, or a removed task): ${TAG_A}`,
     ])
   })
+
+  // rrep.2 (#84, R7): a recursive task's holds on EVERY dataset it sent are
+  // placed under the ROOT's one tag (the route derives it from the root's
+  // target name), so a CHILD's snapshot is held under a tag that names the
+  // root — and `describeHolds` maps the TAG to the task, not the dataset. A
+  // child's hold therefore names the task with no change to the code; this
+  // pins that.
+  it('rrep.2: a child snapshot held under a stored recursive task\'s root tag names the task', async () => {
+    const tree: ReplicationTask = {
+      name: 'nightly-tree',
+      source: { pool: 'tank', dataset: 'media' },
+      target: { pool: 'backup', dataset: 'media-a' },
+      schedule: 'daily',
+      snapshotFirst: false,
+      enabled: true,
+      notify: 'on-failure',
+      recursive: true,
+      exclude: ['tank/media/skip'],
+    }
+    await writeFile(join(dir, 'anas-repl-nightly-tree.service'), renderServiceUnit(tree), 'utf-8')
+    // TAG_A is the root chain's tag (target `backup/media-a`); the snapshot
+    // it is on belongs to a child (`tank/media/a`), which the arguments do
+    // not have to name — the tag is what describeHolds resolves.
+    assert.deepEqual(await describeHolds([TAG_A], dir), [`held by replication task 'nightly-tree': ${TAG_A}`])
+  })
+
+  // rrep.2 fold D2: a task stored with `target.dataset: ''` (the schema's
+  // "default") replicates to `<pool>/<source rel>` — the runner drops the
+  // empty string — so its run holds under THAT name's tag. describeHolds used
+  // to derive the tag from `backup/` and named no task.
+  it('fold D2: a hold placed by the run of a task stored with target dataset \'\' is named by the task', async () => {
+    const t: ReplicationTask = {
+      name: 'nightly-default',
+      source: { pool: 'tank', dataset: 'media' },
+      target: { pool: 'backup', dataset: '' },
+      schedule: 'daily',
+      snapshotFirst: true,
+      enabled: true,
+      notify: 'on-failure',
+    }
+    await writeFile(join(dir, 'anas-repl-nightly-default.service'), renderServiceUnit(t), 'utf-8')
+    const runTag = replicationHoldTag(undefined, 'backup/media')
+    assert.deepEqual(await describeHolds([runTag], dir), [`held by replication task 'nightly-default': ${runTag}`])
+  })
 })
 
 /**

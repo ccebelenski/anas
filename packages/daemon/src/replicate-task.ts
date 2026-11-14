@@ -30,6 +30,17 @@ export interface RunnerOptions {
   locationName?: string
   snapshotFirst: boolean
   /**
+   * rrep.2 (#84, R10): replicate the source's whole tree. Absent = the
+   * single-dataset path (R0) — the endpoint treats an absent `recursive` as
+   * "not recursive", and so does the body below.
+   */
+  recursive?: boolean
+  /**
+   * The child datasets a recursive run skips, in the stored order. Valid only
+   * with `recursive` (the parser refuses a list without it).
+   */
+  exclude?: string[]
+  /**
    * 9.4: the task's notification mode, forwarded verbatim to the endpoint that
    * actually notifies. Absent = the endpoint's own default ('on-failure') — the
    * runner has no opinion and never substitutes one.
@@ -44,9 +55,11 @@ export interface RunnerOptions {
  */
 export function parseRunnerArgs(argv: string[]): RunnerOptions {
   const opts: Partial<RunnerOptions> & { snapshotFirst: boolean } = { snapshotFirst: false, socket: defaultSocket() }
+  const exclude: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]
-    const takesValue = flag !== '--snapshot-first'
+    // The value-less flags: the parser must not consume the NEXT word as one.
+    const takesValue = flag !== '--snapshot-first' && flag !== '--recursive'
     const value = takesValue ? argv[++i] : undefined
     if (takesValue && value === undefined)
       throw new Error(`Missing value for ${flag}`)
@@ -68,6 +81,10 @@ export function parseRunnerArgs(argv: string[]): RunnerOptions {
       opts.socket = value
     else if (flag === '--snapshot-first')
       opts.snapshotFirst = true
+    else if (flag === '--recursive')
+      opts.recursive = true
+    else if (flag === '--exclude')
+      exclude.push(value!)
     else
       throw new Error(`Unknown argument: ${flag}`)
   }
@@ -79,6 +96,15 @@ export function parseRunnerArgs(argv: string[]): RunnerOptions {
     throw new Error('Missing required --target-pool')
   if (opts.locationKind && opts.locationKind !== 'local' && !opts.locationName)
     throw new Error(`Missing --location-name for --location-kind ${opts.locationKind}`)
+  // rrep.2 R10: the recursion pair must agree — an exclude list with no
+  // recursive run would be silently dropped by the endpoint (R12's failure
+  // mode), and snapshot-first under recursion is R3's refusal. Both are
+  // authors' mistakes in a unit file, so they fail loudly here rather than
+  // becoming a request the endpoint has to refuse.
+  if (exclude.length > 0 && opts.recursive !== true)
+    throw new Error('--exclude needs --recursive')
+  if (opts.recursive === true && opts.snapshotFirst)
+    throw new Error('--recursive cannot be combined with --snapshot-first')
   return {
     pool: opts.pool,
     dataset: opts.dataset,
@@ -87,6 +113,8 @@ export function parseRunnerArgs(argv: string[]): RunnerOptions {
     ...(opts.locationKind !== undefined ? { locationKind: opts.locationKind } : {}),
     ...(opts.locationName !== undefined ? { locationName: opts.locationName } : {}),
     ...(opts.notify !== undefined ? { notify: opts.notify } : {}),
+    ...(opts.recursive !== undefined ? { recursive: opts.recursive } : {}),
+    ...(exclude.length > 0 ? { exclude } : {}),
     snapshotFirst: opts.snapshotFirst,
     socket: opts.socket ?? defaultSocket(),
   }
@@ -109,6 +137,11 @@ export function replicatePath(pool: string, dataset: string): string {
  * (written before the flag existed) produces.
  */
 export function replicateBody(opts: RunnerOptions): Record<string, unknown> {
+  // R0: a runner invocation without `--recursive` builds the body it always
+  // built, key for key. With it, the body says so explicitly and carries
+  // `snapshotFirst: false`: R3 makes the pair mutually exclusive, and the task
+  // store already refuses the combination — the body states the pair rather
+  // than leaving the endpoint to infer it from an absent snapshot-first.
   return {
     ...(opts.notify !== undefined ? { notify: opts.notify } : {}),
     target: {
@@ -120,7 +153,8 @@ export function replicateBody(opts: RunnerOptions): Record<string, unknown> {
         ? { location: { kind: opts.locationKind, ...(opts.locationName ? { name: opts.locationName } : {}) } }
         : {}),
     },
-    snapshotFirst: opts.snapshotFirst,
+    ...(opts.recursive === true ? { recursive: true, snapshotFirst: false } : { snapshotFirst: opts.snapshotFirst }),
+    ...(opts.exclude !== undefined ? { exclude: opts.exclude } : {}),
   }
 }
 

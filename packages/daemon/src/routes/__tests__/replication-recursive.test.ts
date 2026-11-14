@@ -308,6 +308,26 @@ describe('recursive replication run (rrep.1b): the captured before-state', () =>
       for (const bad of ['destroy', 'rollback', '-F', '-R', '-w', '-p', '-I'])
         assert.ok(!call.args.includes(bad), `${bad} in ${JSON.stringify(call)}`)
     }
+    // Every exclude names a live dataset: the note is absent, not empty.
+    assert.ok(!('excludeMissing' in (job!.result as object)))
+  })
+
+  // rrep.2 fold E1 (ruled): a stored task's exclude whose dataset was destroyed
+  // after the task was saved is INERT at the run, as for a snapshot schedule —
+  // it used to refuse every fire. The body is the one a stored task's runner
+  // sends (`--recursive --exclude <live> --exclude <gone>`).
+  it('fold E1: one live and one gone exclude — the run completes, skips the live one, notes the gone one', async () => {
+    arm(true)
+    const { res, job } = await run({ exclude: ['rpool/rrsrc/skipme', 'rpool/rrsrc/gone'] })
+    assert.equal(res.statusCode, 202, res.body)
+    assert.equal(job?.status, 'completed', JSON.stringify(job?.error))
+    const result = job!.result as { datasets: { dataset: string }[], excludeMissing?: string[], warnings?: string[] }
+    assert.deepEqual(result.datasets.map(d => d.dataset), PLANNED)
+    assert.ok(!mock.pipelineCalls.some(p => p.args1.some(a => a.startsWith('rpool/rrsrc/skipme'))), 'the live exclude is not sent')
+    assert.deepEqual(result.excludeMissing, ['rpool/rrsrc/gone'])
+    // A NOTE, never a warning: the only warning is late's planner sentence.
+    assert.equal(result.warnings?.length, 1)
+    assert.ok(!result.warnings!.some(w => w.includes('gone')))
   })
 
   it('REMOTE: every recv is `ssh ... zfs recv`, the send stays local', async () => {
@@ -549,6 +569,70 @@ describe('recursive replication run (rrep.1b): the captured before-state', () =>
     assert.equal(res.statusCode, 400)
     assert.equal(res.json().error.message, `'rpool/rrsrc/enc' is encrypted and its key is not loaded — load it or exclude the dataset`)
     assert.equal(mock.pipelineCalls.length, 0)
+  })
+
+  // rrep.2 fold N1 (ruled): a recursive run refused AT THE ROUTE notifies like
+  // a failed run — a nightly task's runner meets these refusals before any job
+  // exists, and they used to send nothing whatever the notify mode. The HTTP
+  // answer is unchanged.
+  for (const mode of ['on-failure', 'always'] as const) {
+    it(`fold N1: a gate refusal at the route sends ONE error notification (notify: ${mode}), the answer unchanged`, async () => {
+      arm(true)
+      mock.prependFixture({ command: ZFS, args: zfsTreeGetArgs(SOURCE, ['keystatus']), result: ok(fixture('src-keystatus-unloaded.txt')) })
+      const { res } = await run({ notify: mode })
+      assert.equal(res.statusCode, 400)
+      const message = `'rpool/rrsrc/enc' is encrypted and its key is not loaded — load it or exclude the dataset`
+      assert.equal(res.json().error.message, message)
+      const sent = notifications(mock)
+      assert.equal(sent.length, 1)
+      assert.equal(sent[0].severity, 'error')
+      assert.match(sent[0].title, /^replication rpool\/rrsrc -> datapool\/rrdst FAILED$/)
+      assert.match(sent[0].body, /^Source: {6}rpool\/rrsrc$/m)
+      assert.match(sent[0].body, /^Target: {6}datapool\/rrdst$/m)
+      assert.ok(sent[0].body.includes(message))
+    })
+  }
+
+  it('fold N1: a read refusal and a named-snapshot refusal at the route notify too', async () => {
+    arm(true)
+    mock.prependFixture({ command: ZFS, args: zfsTreeSnapshotsArgs(SOURCE), result: { stdout: '', stderr: 'I/O error', exitCode: 1 } })
+    const read = await run({ notify: 'on-failure' })
+    assert.equal(read.res.statusCode, 400)
+    assert.equal(read.res.json().error.message, `Could not list the snapshots under '${SOURCE}' — refusing the recursive replication`)
+    assert.equal(notifications(mock).length, 1)
+
+    const named = await run({ snapshot: S2, notify: 'always' })
+    assert.equal(named.res.statusCode, 400)
+    assert.match(named.res.json().error.message, /cannot be combined with a named snapshot/)
+    assert.equal(notifications(mock).length, 2)
+    assert.ok(notifications(mock)[1].body.includes('cannot be combined with a named snapshot'))
+  })
+
+  // Review of the rrep.2 fold: the two refusals BEFORE the placement is known
+  // sent nothing. RULE: every way a recursive run is refused at the route
+  // notifies — a destroyed source and an exported target pool most of all.
+  it('fold N1: a missing source and a refused root target guard notify too', async () => {
+    arm(true)
+    mock.prependFixture({ command: ZPOOL, args: ['list', '-j'], result: ok(zpoolListJson(['rpool'])) })
+    const noPool = await run({ notify: 'on-failure' })
+    assert.equal(noPool.res.statusCode, 400)
+    assert.match(noPool.res.json().error.message, /Target pool 'datapool' does not exist/)
+    assert.equal(notifications(mock).length, 1)
+    assert.equal(notifications(mock)[0].severity, 'error')
+    assert.ok(notifications(mock)[0].body.includes('datapool/rrdst'), notifications(mock)[0].body)
+    assert.equal(mock.pipelineCalls.length, 0)
+  })
+
+  it('fold N1: an ownership refusal (409) notifies with the same sentence it answers', async () => {
+    const cfg = join(dir, 'storage.cfg')
+    await writeFile(cfg, 'zfspool: local-zfs\n\tpool rpool/rrsrc/a\n\tcontent images,rootdir\n\n', 'utf8')
+    setEnv('ANAS_STORAGE_CFG', cfg)
+    arm(true)
+    const { res } = await run({ notify: 'on-failure' })
+    assert.equal(res.statusCode, 409)
+    const sent = notifications(mock)
+    assert.equal(sent.length, 1)
+    assert.ok(sent[0].body.includes(res.json().error.message))
   })
 
   // ---------------------------------------------------------------------------

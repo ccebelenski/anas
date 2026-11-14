@@ -120,7 +120,9 @@ function relativePath(fullName: string): string {
  */
 function resolveTarget(sourceFull: string, sourcePool: string, target: { pool: string, dataset?: string }): string {
   const sourceRel = relativePath(sourceFull)
-  const targetRel = target.dataset ?? (sourceRel || sourcePool)
+  // rrep.2 fold D2: '' is the schema's "default" (ReplicationTarget.dataset),
+  // the same instruction as absent — never the pool root `<pool>/`.
+  const targetRel = target.dataset || (sourceRel || sourcePool)
   return `${target.pool}/${targetRel}`
 }
 
@@ -578,33 +580,56 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     if (!identity)
       return
 
-    // 1. R4: one snapshot name across the tree — the root's newest, chosen by
-    //    the planner. A named snapshot is a single-dataset concept.
-    if (snapshot !== undefined) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: 'Recursive replication sends the newest snapshot of the source across the tree — it cannot be combined with a named snapshot' } }
-    }
-
-    // 2. The source exists, and the ROOT target pair passes today's guard
+    // 1. The source exists, and the ROOT target pair passes today's guard
     //    (location resolution, target pool exists, PVE ownership of the root,
     //    onto-itself).
-    if (!(await datasetExists(poolName, source))) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Dataset '${source}' not found` } }
-    }
+    // rrep.2 fold N1 (ruled): a refusal AT THE ROUTE is a failed run to the
+    // operator — a nightly task's runner meets it before any job exists, so
+    // it notifies exactly as the job's catch does (the request's mode
+    // decides, through notifyReplicationRun), then answers as before. That
+    // covers the two refusals below too: a source that was destroyed, and a
+    // root target guard that refuses (a deregistered remote, an exported
+    // target pool) are the commonest ways a nightly task stops working, and
+    // they come before the placement is known — the notification then names
+    // the location as the request gave it.
     const targetRoot = resolveTarget(source, poolName, target)
+    const requestedRemote = target.location !== undefined && target.location.kind !== 'local'
+    let notify: ReplicationNotifyContext = {
+      source,
+      target: targetRoot,
+      ...(requestedRemote && target.location ? { location: target.location } : {}),
+      notify: notifyMode,
+    }
+    const notifyRefusal = (message: string): Promise<void> =>
+      notifyReplicationRun(executor, { ...notify, error: message })
+
+    if (!(await datasetExists(poolName, source))) {
+      const message = `Dataset '${source}' not found`
+      await notifyRefusal(message)
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message } }
+    }
     const guard = await guardReplicationTarget(guardDeps, { target, sourceFull: source, targetFull: targetRoot })
     if (!guard.ok) {
+      await notifyRefusal(guard.message)
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: guard.message } }
     }
     const loc = guard.placement
-
-    const notify: ReplicationNotifyContext = {
+    notify = {
       source,
       target: targetRoot,
       ...(loc.isRemote && target.location ? { location: target.location } : {}),
       notify: notifyMode,
+    }
+
+    // 2. R4: one snapshot name across the tree — the root's newest, chosen by
+    //    the planner. A named snapshot is a single-dataset concept.
+    if (snapshot !== undefined) {
+      const message = 'Recursive replication sends the newest snapshot of the source across the tree — it cannot be combined with a named snapshot'
+      await notifyRefusal(message)
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message } }
     }
 
     // 3. Every fact first, then every gate, on ONE fresh footprint. A read that
@@ -612,12 +637,15 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     const pve = await deps.pveFootprint()
     const read = await readTreeFacts({ executor, transport }, { sourceRoot: source, targetRoot, exclude, placement: loc })
     if (!read.ok) {
+      await notifyRefusal(read.message)
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: read.message } }
     }
     const gate = await gateTreeRun({ pve, guard: guardDeps }, { facts: read.facts, target })
-    if (!gate.ok)
+    if (!gate.ok) {
+      await notifyRefusal(gate.refusals.map(r => r.message).join('; '))
       return refuseTreeGate(reply, gate.refusals)
+    }
 
     // 4. R9: a shared claim on EVERY swept dataset (the run reads them all),
     //    plus today's EXCLUSIVE claim on a LOCAL target root (the recv writes
@@ -835,6 +863,10 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             upToDate: plan.upToDate,
             skipped: plan.skipped.map(s => s.dataset),
             targetOnly: plan.targetOnly,
+            // Fold E1: exclude entries the source no longer holds are inert —
+            // listed as a NOTE (never a warning, no notification change), and
+            // only when there is one.
+            ...(gateNow.excludeMissing.length > 0 ? { excludeMissing: gateNow.excludeMissing } : {}),
             bytesEstimated,
             ...(warnings.length ? { warnings } : {}),
           }

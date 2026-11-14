@@ -553,6 +553,7 @@ export {
   ReplicationRemote,
   ReplicationTarget,
   ReplicationTask,
+  ReplicationTaskFields,
   ReplicationTaskName,
   ReplicationTaskStatus,
   TestRemoteRequest,

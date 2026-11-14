@@ -105,6 +105,15 @@ export function runnerArgs(task: ReplicationTask): string[] {
   // runner a flag it cannot parse).
   if (task.notify === 'always')
     args.push('--notify', task.notify)
+  // rrep.2 (#84, R10): the recursion fields ride the flag list LAST, so a task
+  // without them keeps the argv (and the ExecStart) it had before the fields
+  // existed, in the same order (R0). `--exclude` repeats, one per entry, in the
+  // stored order — the runner forwards the list to the endpoint verbatim.
+  if (task.recursive === true) {
+    args.push('--recursive')
+    for (const name of task.exclude ?? [])
+      args.push('--exclude', name)
+  }
   return args
 }
 
@@ -351,10 +360,16 @@ export async function removeTaskUnits(
 /**
  * The full ZFS names a task's source and target resolve to (mirrors the
  *  stage-1 endpoint's target resolution).
+ *
+ * An EMPTY target dataset is the same instruction as an absent one ("the
+ * source's own relative path" — the schema says '' is the default, and the
+ * runner and `endpoints()` already drop it). rrep.2 fold D2: this used `??`,
+ * so a task stored with `''` was guarded, lag-derived and hold-named against
+ * `<pool>/` while its run replicated to `<pool>/<source rel>`.
  */
 export function resolveTaskDatasets(task: ReplicationTask): { sourceFull: string, targetFull: string } {
   const sourceFull = task.source.dataset ? `${task.source.pool}/${task.source.dataset}` : task.source.pool
-  const targetRel = task.target.dataset ?? (task.source.dataset || task.source.pool)
+  const targetRel = task.target.dataset || (task.source.dataset || task.source.pool)
   return { sourceFull, targetFull: `${task.target.pool}/${targetRel}` }
 }
 

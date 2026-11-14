@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
+import { parseRunnerArgs } from '../../replicate-task.js'
 import {
   buildReplicationWarnings,
   collectTaskStatuses,
@@ -16,6 +17,7 @@ import {
   renderServiceUnit,
   renderTimerUnit,
   replicationStampPath,
+  runnerArgs,
   serviceUnitName,
   timerUnitName,
   validateSchedule,
@@ -57,6 +59,15 @@ function makeTask(over: Partial<ReplicationTask> = {}): ReplicationTask {
     ...over,
   }
 }
+
+/**
+ * The exact unit text the PRE-rrep.2 renderer produced for `makeTask()` — a
+ * frozen capture, not retyped by hand (rrep.2 R0: adding the recursion fields
+ * must leave a task without `recursive` rendering byte-identically). If this
+ * ever changes, a stored task's unit would be rewritten by an edit that names
+ * no field.
+ */
+const PRE_RREP2_UNIT = '[Unit]\nDescription=ANAS replication task nightly-media\n# X-ANAS-Task={"name":"nightly-media","source":{"pool":"testpool","dataset":"media"},"target":{"pool":"backup","dataset":"media"},"schedule":"daily","snapshotFirst":true,"enabled":true,"notify":"on-failure"}\n\n[Service]\nType=oneshot\nExecStart=/usr/bin/node /opt/anas/packages/daemon/dist/replicate-task.js --pool testpool --dataset media --target-pool backup --target-dataset media --snapshot-first\n'
 
 describe('replication units (Epic 5.5.3 — units are the store)', () => {
   // --- round-trip: generate → parse → deep-equal ---------------------------
@@ -126,6 +137,62 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
     assert.match(unit, /--pool testpool --dataset "" --target-pool backup(\n|$)/)
     assert.doesNotMatch(unit, /--target-dataset/)
     assert.doesNotMatch(unit, /--snapshot-first/)
+  })
+
+  // --- rrep.2 (#84, R10): the recursion fields ride the ExecStart -----------
+
+  it('rrep.2 R0: a task without `recursive` renders the exact pre-rrep.2 unit text', () => {
+    assert.equal(renderServiceUnit(makeTask()), PRE_RREP2_UNIT)
+  })
+
+  it('rrep.2: runnerArgs emits --recursive then one --exclude per entry, in stored order', () => {
+    assert.deepEqual(
+      runnerArgs(makeTask({ recursive: true, snapshotFirst: false, exclude: ['testpool/media/skipme', 'testpool/media/a/deep'] })),
+      [
+        '--pool',
+        'testpool',
+        '--dataset',
+        'media',
+        '--target-pool',
+        'backup',
+        '--target-dataset',
+        'media',
+        '--recursive',
+        '--exclude',
+        'testpool/media/skipme',
+        '--exclude',
+        'testpool/media/a/deep',
+      ],
+    )
+    // A recursive task with no excludes: the flag alone, nothing after it.
+    assert.equal(runnerArgs(makeTask({ recursive: true, snapshotFirst: false })).at(-1), '--recursive')
+    // `recursive: false` is not `recursive`: R0's flag is only for true.
+    assert.deepEqual(runnerArgs(makeTask({ recursive: false, exclude: [] })), runnerArgs(makeTask()))
+  })
+
+  it('rrep.2: a recursive task with two excludes round-trips — task JSON and ExecStart argv alike', () => {
+    const task = makeTask({ recursive: true, snapshotFirst: false, exclude: ['testpool/media/skipme', 'testpool/media/a/deep'] })
+    const unit = renderServiceUnit(task)
+
+    // The X-ANAS-Task JSON is the store's source of truth.
+    assert.deepEqual(parseServiceUnit(unit), task)
+
+    // ExecStart is what systemd runs: strip `node <script>` and hand the rest
+    // to the runner's own parser. A DatasetPath carries no space or systemd
+    // metacharacter, so quoteExecArg leaves each exclude bare and the plain
+    // word split is the argv systemd would pass.
+    const execLine = unit.split('\n').find(line => line.startsWith('ExecStart='))
+    assert.ok(execLine, 'the unit has no ExecStart')
+    const words = execLine.slice('ExecStart='.length).split(' ')
+    assert.equal(words[0], '/usr/bin/node')
+    const opts = parseRunnerArgs(words.slice(2))
+    assert.equal(opts.recursive, true)
+    assert.deepEqual(opts.exclude, task.exclude)
+    assert.equal(opts.snapshotFirst, false)
+    assert.equal(opts.pool, 'testpool')
+    assert.equal(opts.dataset, 'media')
+    assert.equal(opts.targetPool, 'backup')
+    assert.equal(opts.targetDataset, 'media')
   })
 
   it('parseServiceUnit returns null for a file without the marker', () => {

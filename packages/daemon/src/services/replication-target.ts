@@ -86,6 +86,30 @@ export interface TargetGuardDeps {
   pveFootprintPreloaded?: PveFootprint
 }
 
+/**
+ * The guard deps for ONE gate pass over many target names (rrep.2 fold P2):
+ * `poolExists` is asked at most once per pool name for the lifetime of the
+ * returned deps, so a recursive pass over a tree of N datasets reads
+ * `zpool list` once, not N times. The ANSWER is shared, failure included —
+ * a read that said "no" (or threw) refuses every dataset of the pass, as it
+ * refused the first (fail-closed). Make a fresh one per pass: a memo kept
+ * across requests would be a cached fact.
+ */
+export function memoisePoolExists(deps: TargetGuardDeps): TargetGuardDeps {
+  const asked = new Map<string, Promise<boolean>>()
+  return {
+    ...deps,
+    poolExists: (pool: string) => {
+      let answer = asked.get(pool)
+      if (answer === undefined) {
+        answer = deps.poolExists(pool)
+        asked.set(pool, answer)
+      }
+      return answer
+    },
+  }
+}
+
 export interface TargetGuardInput {
   target: ReplicationTarget
   /** The full source dataset name (always local). */

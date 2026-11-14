@@ -225,8 +225,14 @@ export type ReplicationTaskName = z.infer<typeof ReplicationTaskName>
  * rules refuse). So: rules are added to the base ONCE (ReplicationTask's
  * `superRefine`), and the lenient variant extends the bare base and stays
  * rule-free, exactly as when it extended a plain object.
+ *
+ * Exported for the task UPDATE door (rrep.2 fold D1): a PUT body is first
+ * parsed for field SHAPES only with this base, the stored `recursive` /
+ * `exclude` are merged in for the keys the body omitted, and only the merged
+ * task is judged by the strict {@link ReplicationTask} — the cross-field rules
+ * never judge a body that is missing the stored half of a pair.
  */
-const ReplicationTaskFields = z.object({
+export const ReplicationTaskFields = z.object({
   name: ReplicationTaskName,
   /** Source dataset, pool-rooted ('' dataset = the pool root). */
   source: z.object({ pool: PoolName, dataset: ReplicationDataset }),

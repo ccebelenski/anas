@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { parseTreeList, parseTreeProps, parseTreeSnapshots } from '../../parsers/zfs-tree.js'
-import { planTreeReplication } from '../replication-tree.js'
+import { planTreeReplication, treePlacementRefusals, treeTargetNameRefusals } from '../replication-tree.js'
 import { isAtOrUnder } from '../zfs-snapshot.js'
 
 /**
@@ -403,5 +403,55 @@ describe('a resumed run: copies that already hold S are up to date, the rest con
       targetProps: new Map([['backup', { written: '0' }]]),
     })
     assert.deepEqual(plan, { ok: true, snapshot: S2, datasets: [], skipped: [], targetOnly: [], upToDate: ['tank'] })
+  })
+})
+
+// rrep.2: rules 4 and 5 are callable alone — the task's create/update gate
+// (routes/replication-tasks.ts) asks the same two questions the run does, so
+// these two functions are the ONE statement of each. The planner's own tests
+// above are untouched and still prove planTreeReplication returns what it did.
+describe('rule 4 alone: treeTargetNameRefusals (R5b names)', () => {
+  it('legal target names pass, in any number, and return no sentence', () => {
+    assert.deepEqual(treeTargetNameRefusals('tank', 'backup', ['tank', 'tank/a', 'tank/a/deep']), [])
+  })
+
+  it('a target name longer than ZFS allows (255) refuses, naming the source dataset and the name', () => {
+    const longRoot = `b${'b'.repeat(254)}`
+    const expected = `'tank/x' cannot be replicated: its target name '${longRoot}/x' is longer than ZFS allows (255) or contains characters ANAS does not pass to a remote command`
+    assert.deepEqual(treeTargetNameRefusals('tank', longRoot, ['tank', 'tank/x']), [expected])
+  })
+
+  it('a target name outside DatasetPath refuses the same sentence', () => {
+    assert.deepEqual(treeTargetNameRefusals('tank', 'back up', ['tank/x']), [
+      `'tank/x' cannot be replicated: its target name 'back up/x' is longer than ZFS allows (255) or contains characters ANAS does not pass to a remote command`,
+    ])
+  })
+})
+
+describe('rule 5 alone: treePlacementRefusals (R5c placement)', () => {
+  it('a remote target is never judged for placement', () => {
+    assert.deepEqual(treePlacementRefusals({ sourceRoot: 'tank', targetRoot: 'tank/copy', exclude: [], localTarget: false }), [])
+  })
+
+  it('equal roots and a target inside the source refuse; an excluded container is the operator\'s answer', () => {
+    assert.deepEqual(treePlacementRefusals({ sourceRoot: 'tank', targetRoot: 'tank', exclude: [], localTarget: true }), [
+      `The target 'tank' is inside the source tree 'tank' — a recursive replication would copy its own replica; choose a target outside it, or exclude the dataset that contains it`,
+    ])
+    assert.deepEqual(treePlacementRefusals({ sourceRoot: 'tank', targetRoot: 'tank/copy', exclude: [], localTarget: true }), [
+      `The target 'tank/copy' is inside the source tree 'tank' — a recursive replication would copy its own replica; choose a target outside it, or exclude the dataset that contains it`,
+    ])
+    assert.deepEqual(
+      treePlacementRefusals({ sourceRoot: 'tank', targetRoot: 'tank/copy', exclude: ['tank/copy'], localTarget: true }),
+      [],
+    )
+    // An exclude that is merely a SIBLING of the target does not answer it.
+    assert.equal(treePlacementRefusals({ sourceRoot: 'tank', targetRoot: 'tank/copy', exclude: ['tank/other'], localTarget: true }).length, 1)
+  })
+
+  it('a source inside the target tree refuses, and unrelated roots pass', () => {
+    assert.deepEqual(treePlacementRefusals({ sourceRoot: 'tank/media', targetRoot: 'tank', exclude: [], localTarget: true }), [
+      `The source 'tank/media' is inside the target tree 'tank'`,
+    ])
+    assert.deepEqual(treePlacementRefusals({ sourceRoot: 'tank', targetRoot: 'backup', exclude: [], localTarget: true }), [])
   })
 })

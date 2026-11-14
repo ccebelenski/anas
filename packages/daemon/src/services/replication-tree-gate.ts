@@ -4,15 +4,19 @@ import type { TargetGuardDeps } from './replication-target.js'
 import type { TreeFacts, TreePlan } from './replication-tree.js'
 import { excludeShapeIssue, SnapshotName } from '@anas/shared'
 import { pveRecursiveRefusalMessage } from './pve-footprint.js'
-import { guardReplicationTarget } from './replication-target.js'
+import { guardReplicationTarget, memoisePoolExists } from './replication-target.js'
 import { planTreeReplication, treeTargetName } from './replication-tree.js'
 import { sweepSet } from './zfs-snapshot.js'
 
 /**
  * The gates AROUND the recursive planner (rrep.1b, #84, R5):
  *
- *  a. the request's excludes — the shared shape rule, then existence in the
- *     source tree (a schema never reads ZFS);
+ *  a. the request's excludes — the shared shape rule refuses; an entry
+ *     that is not in the source tree is INERT (rrep.2 fold E1, ruled:
+ *     parallel construction with a snapshot schedule's runner — the dataset
+ *     is not there, so nothing unintended can be replicated; a typo is
+ *     caught where the list is entered, at the task door) and is reported
+ *     back as `excludeMissing`, a note, never a refusal;
  *  b. R5a — no swept dataset is PVE-owned, on a footprint the CALLER loaded
  *     fresh (nothing here loads its own: the route and the job each load one
  *     and pass it in, ruling (j));
@@ -40,8 +44,20 @@ export interface TreeGateRefusal {
   ownership?: PveOwnership
 }
 
+/** A passed gate: the plan, the sweep the route locks, and the inert excludes. */
+export interface TreeGatePass {
+  ok: true
+  plan: Extract<TreePlan, { ok: true }>
+  sweep: string[]
+  /**
+   * The exclude entries the source tree does not hold (fold E1): inert, in
+   * the request's order; `[]` when every entry names a live dataset.
+   */
+  excludeMissing: string[]
+}
+
 export type TreeGateResult
-  = | { ok: true, plan: Extract<TreePlan, { ok: true }>, sweep: string[] }
+  = | TreeGatePass
     | { ok: false, refusals: TreeGateRefusal[] }
 
 export interface TreeGateDeps {
@@ -51,8 +67,12 @@ export interface TreeGateDeps {
   guard: TargetGuardDeps
 }
 
-/** R5a's sentence, stated once: the ownership reason plus the two ways out. */
-function ownedMessage(sourceRoot: string, hit: { name: string, ownership: PveOwnership }): string {
+/**
+ * R5a's sentence, stated once: the ownership reason plus the two ways out.
+ * Exported for the TASK's create/update gate (rrep.2), which refuses an
+ * owned sweep member with the very sentence the run refuses it with.
+ */
+export function ownedMessage(sourceRoot: string, hit: { name: string, ownership: PveOwnership }): string {
   return `${pveRecursiveRefusalMessage('Recursive replication', sourceRoot, hit)} — exclude it, or replicate a dataset below it`
 }
 
@@ -77,19 +97,15 @@ export async function gateTreeRun(
   const sourceRoot = facts.sourceRoot
   const refusals: TreeGateRefusal[] = []
 
-  // a. The request's excludes: the shared shape rule first (a list with a
-  //    non-child entry is malformed, and its other entries are not judged
-  //    against a tree it does not belong to), then existence.
+  // a. The request's excludes: the shared shape rule refuses (a list with a
+  //    non-child entry is malformed). An entry the source tree does not hold
+  //    is INERT (fold E1): the sweep below already ignores it, and the run
+  //    reports it as a note. Existence is the task door's question, asked
+  //    where the list is entered ("unless already stored", R10).
   const shape = excludeShapeIssue(sourceRoot, true, facts.exclude, 'replication')
-  if (shape) {
+  if (shape)
     refusals.push({ message: shape })
-  }
-  else {
-    for (const name of facts.exclude) {
-      if (!facts.sourceTree.includes(name))
-        refusals.push({ message: `Exclude '${name}' does not exist under '${sourceRoot}'` })
-    }
-  }
+  const excludeMissing = shape ? [] : facts.exclude.filter(name => !facts.sourceTree.includes(name))
 
   // b. R5a: PVE owns nothing this run would write. The root itself is checked
   //    beside the sweep (ownedDescendant only walks strict descendants).
@@ -105,7 +121,13 @@ export async function gateTreeRun(
     return { ok: false, refusals }
 
   // c. The planner decides everything else; its own refusals pass through.
-  const plan = planTreeReplication(facts)
+  // The planner sees only the LIVE excludes. A vanished entry is inert for the
+  // sweep either way, but placement (rule 5) EXCUSES a local target that sits
+  // under an excluded dataset: an exclude that no longer exists must not
+  // excuse a target inside the source tree (found while folding E1 — such a
+  // run reached the first receive and failed there).
+  const liveExclude = facts.exclude.filter(name => !excludeMissing.includes(name))
+  const plan = planTreeReplication(liveExclude.length === facts.exclude.length ? facts : { ...facts, exclude: liveExclude })
   if (!plan.ok)
     return { ok: false, refusals: plan.refusals.map(message => ({ message })) }
 
@@ -135,7 +157,9 @@ export async function gateTreeRun(
   //    or held, so they are not judged. The footprint the caller loaded is
   //    handed to the guard, so this pass adds no second load.
   if (facts.localTarget) {
-    const guardDeps: TargetGuardDeps = { ...deps.guard, pveFootprintPreloaded: deps.pve }
+    // Fold P2: the target pool's existence is asked ONCE for this pass,
+    // not once per touched dataset.
+    const guardDeps: TargetGuardDeps = memoisePoolExists({ ...deps.guard, pveFootprintPreloaded: deps.pve })
     const touched = [
       ...plan.datasets.map(d => ({ sourceFull: d.dataset, targetFull: d.target })),
       ...plan.upToDate.map(dataset => ({
@@ -152,5 +176,5 @@ export async function gateTreeRun(
       return { ok: false, refusals }
   }
 
-  return { ok: true, plan, sweep }
+  return { ok: true, plan, sweep, excludeMissing }
 }

@@ -146,6 +146,34 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     assert.equal(data.targetDiverged, false)
   })
 
+  // rrep.2 fold D2: `target.dataset: ''` is the schema's "default" — the same
+  // instruction as absent, so it resolves to `testpool2/share1` (which holds
+  // the common base → incremental), never to the pool root `testpool2/`
+  // (which reads as absent → a full send into a name `zfs recv` refuses).
+  it('plan → an EMPTY target dataset resolves like an absent one (<pool>/<source rel>)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = mockOf(server)
+    mock.clearFixtures()
+    mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool', 'testpool2']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2', 'testpool2/share1']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }, { name: 'repl-next', txg: 200 }]), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool2/share1'), result: { stdout: snapshotListJson('testpool2/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '-i', '@repl-base', '--', 'testpool/share1@repl-next'], result: { stdout: INCR_DRYRUN, stderr: '', exitCode: 0 } })
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/share1/replicate/plan',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ target: { pool: 'testpool2', dataset: '' } }),
+    })
+    assert.equal(res.statusCode, 200, res.body)
+    const { data } = res.json() as { data: ReplicatePlan }
+    assert.equal(data.mode, 'incremental')
+    assert.equal(data.baseSnapshot, 'repl-base')
+    assert.equal(data.targetExists, true)
+  })
+
   // --- ⚠ plan: a transient backup snapshot is NEVER an incremental base ----
   //
   // backup2.3's flagged risk, in situ. A snapshot-consistent backup run takes

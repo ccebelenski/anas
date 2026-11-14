@@ -120,10 +120,37 @@ describe('the fixture run through the gates', () => {
     ])
   })
 
-  it('the local target guard runs once per PLANNED dataset', async () => {
-    const { result, spy } = await gate(fixtureFacts())
+  // rrep.2 fold P2: the guard still runs once per PLANNED dataset (counted by
+  // its naming check, which only the per-dataset guard asks), but the target
+  // POOL's existence is asked ONCE per pass. This test used to pin the pool
+  // check at 6 — one per dataset — which is what the fold removes.
+  it('the local target guard runs once per PLANNED dataset; the pool is asked once (fold P2)', async () => {
+    let guardRuns = 0
+    const base = footprint()
+    const counted = { ...base, claimedByPve: (d: string) => {
+      guardRuns++
+      return base.claimedByPve(d)
+    } } as unknown as PveFootprint
+    const { result, spy } = await gate(fixtureFacts(), counted)
     assert.equal(result.ok, true)
-    assert.equal(spy.calls(), 6)
+    assert.equal(guardRuns, 6)
+    assert.equal(spy.calls(), 1)
+  })
+
+  it('fold P2: a pool read that says no is asked once and refuses the pass (fail-closed)', async () => {
+    let asked = 0
+    const pve = footprint()
+    const result = await gateTreeRun({
+      pve,
+      guard: { transport: {} as Transport, poolExists: async () => {
+        asked++
+        return false
+      }, pveFootprint: async () => pve },
+    }, { facts: fixtureFacts(), target: TARGET_REQ })
+    assert.equal(result.ok, false)
+    assert.equal(asked, 1)
+    if (!result.ok)
+      assert.ok(result.refusals.every(r => r.message === 'Target pool \'datapool\' does not exist'))
   })
 })
 
@@ -136,9 +163,53 @@ describe('gate a: the request\'s excludes', () => {
     assert.equal(spy.calls(), 0)
   })
 
-  it('an entry that does not exist in the source tree is its own sentence', async () => {
+  // rrep.2 fold E1 (ruled): an entry the source tree does not hold is INERT
+  // at the run, as it is for a snapshot schedule — it used to refuse the run
+  // ("Exclude '<name>' does not exist under '<root>'"), so a stored task whose excluded
+  // child was destroyed failed on every fire. It is reported, never refused.
+  it('fold E1: an entry that does not exist in the source tree is inert and reported in excludeMissing', async () => {
     const { result } = await gate(fixtureFacts({ exclude: ['rpool/rrsrc/ghost'] }))
-    assert.deepEqual(result, { ok: false, refusals: [{ message: `Exclude 'rpool/rrsrc/ghost' does not exist under '${SOURCE}'` }] })
+    assert.equal(result.ok, true, JSON.stringify(result))
+    if (!result.ok)
+      return
+    assert.deepEqual(result.excludeMissing, ['rpool/rrsrc/ghost'])
+    assert.deepEqual(result.plan, planTreeReplication(fixtureFacts({ exclude: ['rpool/rrsrc/ghost'] })))
+  })
+
+  // Found while folding E1: placement EXCUSES a local target under an excluded
+  // dataset. RULE: only an exclude that exists can excuse it — a vanished one
+  // excludes nothing, so the target is inside the tree being copied.
+  it('a vanished exclude does not excuse a local target inside the source tree', async () => {
+    const inside = { sourceTree: fixtureFacts().sourceTree, localTarget: true }
+    const gone = await gate(fixtureFacts({ ...inside, targetRoot: 'rpool/rrsrc/bk/copy', targetTree: [], targetSnaps: new Map(), targetProps: new Map(), exclude: ['rpool/rrsrc/bk'] }))
+    assert.equal(gone.result.ok, false)
+    if (!gone.result.ok)
+      assert.match(gone.result.refusals.map(r => r.message).join('; '), /The target 'rpool\/rrsrc\/bk\/copy' is inside the source tree 'rpool\/rrsrc'/)
+    // The live exclude still excuses it (the proven row: a copy under skipme).
+    const live = await gate(fixtureFacts({ ...inside, targetRoot: 'rpool/rrsrc/skipme/copy', targetTree: [], targetSnaps: new Map(), targetProps: new Map(), exclude: ['rpool/rrsrc/skipme'] }))
+    const placement = live.result.ok ? [] : live.result.refusals.map(r => r.message).filter(m => m.includes('inside the source tree'))
+    assert.deepEqual(placement, [])
+  })
+
+  it('fold E1: one live and one gone entry — the live one is excluded, only the gone one is reported', async () => {
+    const { result } = await gate(fixtureFacts({ exclude: ['rpool/rrsrc/skipme', 'rpool/rrsrc/ghost'] }))
+    assert.equal(result.ok, true, JSON.stringify(result))
+    if (!result.ok)
+      return
+    assert.ok(!result.sweep.includes('rpool/rrsrc/skipme'))
+    assert.deepEqual(result.excludeMissing, ['rpool/rrsrc/ghost'])
+  })
+
+  it('fold E1: every entry live → excludeMissing is empty', async () => {
+    const { result } = await gate(fixtureFacts())
+    assert.equal(result.ok, true)
+    if (result.ok)
+      assert.deepEqual(result.excludeMissing, [])
+  })
+
+  it('fold E1: the SHAPE rule still refuses, and a malformed list reports nothing missing', async () => {
+    const { result } = await gate(fixtureFacts({ exclude: ['rpool/rrsrc/ghost', 'rpool/other'] }))
+    assert.deepEqual(result, { ok: false, refusals: [{ message: `Exclude 'rpool/other' is not a child dataset of '${SOURCE}'` }] })
   })
 })
 

@@ -104,6 +104,52 @@ export function treeTargetName(sourceRoot: string, targetRoot: string, dataset: 
 }
 
 /**
+ * R5b's NAME half (rrep.2: the planner's rule 4, callable alone so the task's
+ * create/update gate asks the same question the run does): every dataset's
+ * target name must be a legal dataset a remote `zfs recv` will accept — 255
+ * bytes at most, and a `DatasetPath`. Pure over the names given; the caller
+ * decides WHICH datasets this run reasons about (the planner drops the skipped
+ * subtrees first: a dataset rule 7 skips produces no entry, no plan and no
+ * refusal). Returns one refusal sentence per offending dataset, in the order
+ * given; `[]` means every name fits.
+ */
+export function treeTargetNameRefusals(sourceRoot: string, targetRoot: string, datasets: string[]): string[] {
+  const refusals: string[] = []
+  for (const dataset of datasets) {
+    const t = treeTargetName(sourceRoot, targetRoot, dataset)
+    if (t.length > 255 || !DatasetPath.safeParse(t).success)
+      refusals.push(`'${dataset}' cannot be replicated: its target name '${t}' is longer than ZFS allows (255) or contains characters ANAS does not pass to a remote command`)
+  }
+  return refusals
+}
+
+/**
+ * R5c — PLACEMENT (rrep.2: the planner's rule 5, callable alone for the task
+ * gate). Local targets only (a remote node cannot be "inside" this node's
+ * source tree). Equal roots are the FIRST sentence here too — the existing
+ * same-dataset target guard keeps refusing the create. A target the operator
+ * EXCLUDED is their explicit answer to the self-copy problem, so an excluded
+ * container does not refuse. At most ONE sentence (the two cases are exclusive
+ * in practice: a target strictly inside the source is not also a container of
+ * it, and equal roots take the first branch).
+ */
+export function treePlacementRefusals(input: {
+  sourceRoot: string
+  targetRoot: string
+  exclude: string[]
+  localTarget: boolean
+}): string[] {
+  const { sourceRoot, targetRoot, exclude, localTarget } = input
+  if (!localTarget)
+    return []
+  if (isAtOrUnder(targetRoot, sourceRoot) && !exclude.some(ex => isAtOrUnder(targetRoot, ex)))
+    return [`The target '${targetRoot}' is inside the source tree '${sourceRoot}' — a recursive replication would copy its own replica; choose a target outside it, or exclude the dataset that contains it`]
+  if (isAtOrUnder(sourceRoot, targetRoot))
+    return [`The source '${sourceRoot}' is inside the target tree '${targetRoot}'`]
+  return []
+}
+
+/**
  * The per-dataset plan for a recursive replication, or EVERY reason the run
  * cannot happen (rules 3–8 collected in one pass, so the operator fixes them
  * once; rules 1–2 return at once — without the root or without S there is no
@@ -158,26 +204,13 @@ export function planTreeReplication(facts: TreeFacts): TreePlan {
   const invisible = (dataset: string): boolean => skipSubtrees.some(sk => isAtOrUnder(dataset, sk))
 
   // 4. R5b (name half): every target name must be a legal dataset the remote
-  //    `zfs recv` will accept.
-  for (const dataset of sweep) {
-    if (invisible(dataset))
-      continue
-    const t = targetName(dataset)
-    if (t.length > 255 || !DatasetPath.safeParse(t).success)
-      refusals.push(`'${dataset}' cannot be replicated: its target name '${t}' is longer than ZFS allows (255) or contains characters ANAS does not pass to a remote command`)
-  }
+  //    `zfs recv` will accept — {@link treeTargetNameRefusals}, the same
+  //    function the task gate asks (rrep.2).
+  refusals.push(...treeTargetNameRefusals(sourceRoot, targetRoot, sweep.filter(dataset => !invisible(dataset))))
 
-  // 5. R5c: placement, local targets only (a remote node cannot be "inside"
-  //    this node's source tree). Equal roots are the FIRST sentence here too
-  //    — the existing same-dataset target guard keeps refusing the create.
-  //    A target the operator EXCLUDED is their explicit answer to the
-  //    self-copy problem, so an excluded container does not refuse.
-  if (localTarget) {
-    if (isAtOrUnder(targetRoot, sourceRoot) && !exclude.some(ex => isAtOrUnder(targetRoot, ex)))
-      refusals.push(`The target '${targetRoot}' is inside the source tree '${sourceRoot}' — a recursive replication would copy its own replica; choose a target outside it, or exclude the dataset that contains it`)
-    else if (isAtOrUnder(sourceRoot, targetRoot))
-      refusals.push(`The source '${sourceRoot}' is inside the target tree '${targetRoot}'`)
-  }
+  // 5. R5c: placement — {@link treePlacementRefusals}, shared with the task
+  //    gate (rrep.2).
+  refusals.push(...treePlacementRefusals({ sourceRoot, targetRoot, exclude, localTarget }))
 
   // 6. R5f: a swept, not-skipped dataset must be unencrypted or have its key
   //    loaded; a missing keystatus ROW is the unreadable refusal, not "-".

@@ -77,6 +77,69 @@ describe('replicate-task runner (Epic 5.5.3)', () => {
     )
   })
 
+  // --- rrep.2 (#84, R10): --recursive and a repeating --exclude -------------
+
+  it('parses --recursive and a repeated --exclude, in the order given', () => {
+    const opts = parseRunnerArgs([
+      '--pool',
+      'p',
+      '--dataset',
+      'd',
+      '--target-pool',
+      'backup',
+      '--recursive',
+      '--exclude',
+      'p/d/skip',
+      '--exclude',
+      'p/d/a/deep',
+    ])
+    assert.equal(opts.recursive, true)
+    assert.deepEqual(opts.exclude, ['p/d/skip', 'p/d/a/deep'])
+    assert.equal(opts.snapshotFirst, false)
+    // A recursive run with no excludes carries no list at all.
+    assert.equal(parseRunnerArgs(['--pool', 'p', '--dataset', 'd', '--target-pool', 'b', '--recursive']).exclude, undefined)
+  })
+
+  it('without --recursive neither field appears (R0: an old unit parses as before)', () => {
+    const opts = parseRunnerArgs(['--pool', 'p', '--dataset', 'd', '--target-pool', 'backup'])
+    assert.equal(opts.recursive, undefined)
+    assert.equal(opts.exclude, undefined)
+    assert.ok(!('recursive' in opts))
+    assert.ok(!('exclude' in opts))
+  })
+
+  it('refuses --exclude without --recursive, and the R3 pair, by name', () => {
+    assert.throws(
+      () => parseRunnerArgs(['--pool', 'p', '--dataset', 'd', '--target-pool', 'b', '--exclude', 'p/d/skip']),
+      /--exclude needs --recursive/,
+    )
+    assert.throws(
+      () => parseRunnerArgs(['--pool', 'p', '--dataset', 'd', '--target-pool', 'b', '--recursive', '--snapshot-first']),
+      /--recursive cannot be combined with --snapshot-first/,
+    )
+    // Unknown flags still throw, and a valueless --exclude is a missing value.
+    assert.throws(() => parseRunnerArgs(['--pool', 'p', '--dataset', 'd', '--target-pool', 'b', '--bogus', 'x']), /Unknown argument: --bogus/)
+    assert.throws(() => parseRunnerArgs(['--pool', 'p', '--dataset', 'd', '--target-pool', 'b', '--recursive', '--exclude']), /Missing value for --exclude/)
+  })
+
+  it('replicateBody: recursive carries recursive + snapshotFirst:false + the list; absent carries neither', () => {
+    assert.deepEqual(
+      replicateBody({ pool: 'p', dataset: 'd', targetPool: 'backup', recursive: true, exclude: ['p/d/skip'], snapshotFirst: false, socket: 's' }),
+      { target: { pool: 'backup' }, recursive: true, snapshotFirst: false, exclude: ['p/d/skip'] },
+    )
+    // No excludes set → no exclude key at all (the endpoint's schema keeps it
+    // absent, R0's "absent stays absent").
+    assert.deepEqual(
+      replicateBody({ pool: 'p', dataset: 'd', targetPool: 'backup', recursive: true, snapshotFirst: true, socket: 's' }),
+      { target: { pool: 'backup' }, recursive: true, snapshotFirst: false },
+    )
+    // R0: the non-recursive body is the one the runner always built.
+    assert.deepEqual(
+      replicateBody({ pool: 'p', dataset: 'd', targetPool: 'backup', snapshotFirst: true, socket: 's' }),
+      { target: { pool: 'backup' }, snapshotFirst: true },
+    )
+  })
+
   // --- 9.4: the notification mode is carried through, never invented --------
 
   it('parses --notify and forwards it verbatim in the body', () => {
