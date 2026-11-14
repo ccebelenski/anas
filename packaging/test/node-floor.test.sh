@@ -38,7 +38,7 @@ ok()   { printf '  ok   %s\n' "$1"; PASS=$((PASS + 1)); }
 bad()  { printf '  FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); }
 check(){ if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d -p "${ANAS_TEST_TMPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" .scratch.XXXXXX)"
 trap 'rm -rf "${WORK}"' EXIT
 
 # Fakes: ss reports nothing listening; systemctl says nothing is active.

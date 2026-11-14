@@ -87,13 +87,16 @@ const FORBIDDEN = 'Permission check failed (/, Sys.Audit): anas-none@pve does no
   assert('403: the gateway\'s sentence is shown, encoded', added[0] && added[0].html.includes(htmlEncode(FORBIDDEN)))
   assert('403: logged to the console', warnings.some(w => w.includes('403')))
 }
+// cr3.core CORE-L6 changed these two: only the gateway's ANAS_NOT_INSTALLED
+// code is "not installed"; any other failure is "could not be reached" with
+// the error's own sentence (cr3-core.harness.mjs pins the rest).
 {
   const { added } = await render(failure(0, 'network error'))
-  assert('network failure: the not-installed panel, as before', added[0] && added[0].cls.includes('anas-view-notinstalled'))
+  assert('network failure: the unreachable panel, not the install hint (CORE-L6)', added[0] && added[0].cls.includes('anas-view-unreachable'))
 }
 {
   const { added } = await render(failure(502, 'ANAS gateway not ready (no proxy key)'))
-  assert('502: the not-installed panel, as before', added[0] && added[0].cls.includes('anas-view-notinstalled'))
+  assert('502 without ANAS_NOT_INSTALLED: the unreachable panel, not the install hint (CORE-L6)', added[0] && added[0].cls.includes('anas-view-unreachable'))
 }
 {
   const { added } = await render(() => Promise.resolve({ version: '0.4.4' }))

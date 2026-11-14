@@ -11,7 +11,7 @@ import { CommandTimeoutError, runInLane } from './executor/deadline.js'
 import { MockExecutor } from './executor/mock.js'
 import { ProdExecutor } from './executor/prod.js'
 import { mockFixtures } from './fixtures/loader.js'
-import { JobForbiddenError, readRequestAuthority, runAsRequest } from './jobs/authority.js'
+import { decodeRequestUser, JobForbiddenError, readRequestAuthority, runAsRequest } from './jobs/authority.js'
 import { JobQueue } from './jobs/queue.js'
 import { btrfsUsageArgs } from './parsers/btrfs-usage.js'
 import { LSBLK_ARGS } from './parsers/lsblk.js'
@@ -82,6 +82,51 @@ export const PATH_PARAM_MAX = 3 * 4096
 /** A partition device path in the mock world: by-id `-partN`, `sdXN`, or an nvme `…nNpN`. */
 const MOCK_PARTITION_RE = /(?:-part\d+|\/[sv]d[a-z]+\d+|n\d+p\d+)$/
 
+/**
+ * The "a list could not be read" errors the datasets routes throw
+ * (`DatasetListUnreadableError`, `SnapshotListUnreadableError`, cr3.datasets),
+ * recognised by name so the server does not import the route.
+ */
+const UNREADABLE_LIST_ERRORS: ReadonlySet<string> = new Set(['DatasetListUnreadableError', 'SnapshotListUnreadableError'])
+
+function isUnreadableListError(error: unknown): error is Error {
+  return error instanceof Error && UNREADABLE_LIST_ERRORS.has(error.name)
+}
+
+/** `a` is exactly `b`, element by element (a mock seed's low-priority match). */
+function sameArgs(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i])
+}
+
+/**
+ * `lsblk -Jbno NAME,DISC-GRAN` for the dev mock: the seeded lsblk tree's
+ * device names, each with a discard granularity of 0 (the mock disks do not
+ * discard). An unparseable seed yields an empty device list.
+ */
+function mockDiscardGranularity(lsblkJson: string): { stdout: string, stderr: string, exitCode: number } {
+  interface Dev { name?: unknown, children?: Dev[] }
+  const map = (d: Dev): Record<string, unknown> => ({
+    'name': d.name,
+    'disc-gran': 0,
+    ...(Array.isArray(d.children) ? { children: d.children.map(map) } : {}),
+  })
+  let devices: Dev[] = []
+  try {
+    const parsed = JSON.parse(lsblkJson) as { blockdevices?: Dev[] }
+    devices = Array.isArray(parsed.blockdevices) ? parsed.blockdevices : []
+  }
+  catch {
+    devices = []
+  }
+  return { stdout: `${JSON.stringify({ blockdevices: devices.map(map) })}\n`, stderr: '', exitCode: 0 }
+}
+
+/** The request's headers with an encoded user id decoded in place (CORE-M3). */
+function decodedHeaders<T extends Record<string, string | string[] | undefined>>(headers: T): T {
+  decodeRequestUser(headers)
+  return headers
+}
+
 export function createServer(opts?: ServerOptions) {
   const server = Fastify({
     logger: opts?.logger ?? true,
@@ -119,7 +164,10 @@ export function createServer(opts?: ServerOptions) {
   // callback form as the lane so it rides the whole lifecycle. `submit` asks
   // this store, never the submitter object a route builds, so no code an HTTP
   // request reaches can submit as the daemon's own work (jobs/authority.ts).
-  server.addHook('onRequest', (request, _reply, done) => runAsRequest(readRequestAuthority(request.headers), done))
+  // CORE-M3: a user id the gateway sent percent-encoded is decoded first, so
+  // every reader below (the authority store, requireIdentity, the audit line)
+  // sees the real UTF-8 name.
+  server.addHook('onRequest', (request, _reply, done) => runAsRequest(readRequestAuthority(decodedHeaders(request.headers)), done))
 
   server.addHook('onRequest', async (request, reply) => {
     if (!MUTATING_METHODS.has(request.method))
@@ -177,6 +225,16 @@ export function createServer(opts?: ServerOptions) {
     }
     if (error instanceof AhrTopologyUnreadableError) {
       request.log.warn(`AHR topology unreadable on ${request.method} ${request.url}: ${error.message}`)
+      return reply.code(503).send({
+        error: { code: 'UNAVAILABLE', message: error.message },
+      })
+    }
+    // cr3 (handed by cr3.datasets): a dataset or snapshot list that could not
+    // be READ is the same fact as an unreadable topology: 503 UNAVAILABLE with
+    // its sentence, never a bare 500 and never an empty list. Matched by the
+    // error's name, so this file needs no import from the route that throws.
+    if (isUnreadableListError(error)) {
+      request.log.warn(`${error.name} on ${request.method} ${request.url}: ${error.message}`)
       return reply.code(503).send({
         error: { code: 'UNAVAILABLE', message: error.message },
       })
@@ -391,6 +449,16 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['version'], result: { stdout: 'zfs-2.3.1-1\nzfs-kmod-2.3.1-1\n', stderr: '', exitCode: 0 } })
     // Pool root mountpoint + mounted flag (story 3.27 — the grid's Mount column).
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint,mounted'], result: { stdout: 'testpool\t/testpool\tyes\n', stderr: '', exitCode: 0 } })
+    // cr3 (handed by the area builders): the reads this wave adds, so the dev
+    // `--mock` server keeps answering them. The two-column mountpoint read
+    // (parsers/pve-storage.ts) and the discard-granularity read (routes/pools.ts
+    // LSBLK_DISCARD_ARGS), the latter derived from the seeded lsblk disks: the
+    // mock disks report no discard support. Registered as `argsMatch`, which
+    // ranks BELOW exact args: a test that seeds its own answer for the same
+    // command after createServer still wins (an exact-args seed here shadowed
+    // eight tests' own fixtures).
+    mock.addFixture({ command: '/usr/sbin/zfs', argsMatch: a => sameArgs(a, ['list', '-H', '-o', 'name,mountpoint']), result: { stdout: 'testpool\t/testpool\ntestpool/media\t/testpool/media\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/lsblk', argsMatch: a => sameArgs(a, ['-Jbno', 'NAME,DISC-GRAN']), result: mockDiscardGranularity(mockFixtures.lsblk().stdout) })
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-j', 'all', '--', 'testpool/media'], result: mockFixtures.zfsGetMedia() })
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-j', 'all', '--', 'testpool'], result: mockFixtures.zfsGetAll() })
     // cr.12: the route reads moved to `get -j all -- <name>`; the access
@@ -713,6 +781,12 @@ export function createServer(opts?: ServerOptions) {
     // exact `filesystem usage` fixture above still wins. realpath resolves the
     // /dev/md/<name> symlink for the check-wait; perl is the PVE notifier.
     mock.addFixture({ command: '/usr/bin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // cr3 (handed): `realpath -e -- <mountpoint>` (the wave's mountpoint checks)
+    // resolves the two seeded mountpoints to themselves, ahead of the
+    // catch-all below that answers every other realpath with the md device.
+    // argsMatch, like the two reads above, so a test's own exact answer wins.
+    for (const mp of ['/testpool/media', '/mnt/anas-ahr/ahr0'])
+      mock.addFixture({ command: '/usr/bin/realpath', argsMatch: a => sameArgs(a, ['-e', '--', mp]), result: { stdout: `${mp}\n`, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/realpath', result: { stdout: '/dev/md127\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
 

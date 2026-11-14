@@ -34,7 +34,7 @@ check(){ if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 # lines AFTER the interesting ones — a long listing, which is what exposes the
 # issue-#21 SIGPIPE race (a reader that stops early kills the writer mid-write).
 setup_env() {
-  WORK="$(mktemp -d)"
+  WORK="$(mktemp -d -p "${ANAS_TEST_TMPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" .scratch.XXXXXX)"
   ENV_FILE="${WORK}/anas.env"
   FAKE_SS="${WORK}/ss"
   FAKE_SYSTEMCTL="${WORK}/systemctl"

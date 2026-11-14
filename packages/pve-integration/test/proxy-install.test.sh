@@ -24,6 +24,23 @@ PKG="$(cd "${HERE}/.." && pwd)"
 INSTALL="${PKG}/install.sh"
 UNINSTALL="${PKG}/uninstall.sh"
 
+# Never reach the real system tools (cr3.core): install.sh / uninstall.sh call
+# `systemctl reset-failed pveproxy` directly on their perl -c failure paths
+# (only the restart/reload goes through PVEPROXY_*_CMD), and a test run on a
+# workstation turned that into a desktop authentication prompt. Recording stubs
+# go FIRST on PATH for the whole file; STUB_LOG holds what was asked.
+STUB_BIN="$(mktemp -d -p "${ANAS_TEST_TMPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" .scratch.XXXXXX)"
+STUB_LOG="${STUB_BIN}/calls.log"
+for _tool in systemctl apt apt-get dpkg update-initramfs pveproxy service udevadm; do
+  printf '#!/bin/sh\necho "%s $*" >> "%s"\nexit 0\n' "${_tool}" "${STUB_LOG}" > "${STUB_BIN}/${_tool}"
+  chmod +x "${STUB_BIN}/${_tool}"
+done
+export PATH="${STUB_BIN}:${PATH}"
+# The scripts' own temp files land in the scratch too, never in /tmp.
+export TMPDIR="${STUB_BIN}"
+trap 'rm -rf "${STUB_BIN}"' EXIT
+[ "$(command -v systemctl)" = "${STUB_BIN}/systemctl" ] || { echo "FATAL: systemctl stub not first on PATH" >&2; exit 1; }
+
 PASS=0
 FAIL=0
 ok()   { printf '  ok   %s\n' "$1"; PASS=$((PASS + 1)); }
@@ -106,7 +123,7 @@ EOF
 # is exactly what makes the two splices additive in either order.
 splice_as_sibling() {
   local pm="$1" bf="$2" out
-  out="$(mktemp)"
+  out="$(mktemp -p "${ANAS_TEST_TMPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" .scratch.XXXXXX)"
   awk -v bf="${bf}" '
     { print }
     !sib_done && /handle_api2_request\(\$reqstate, \$auth, \$method, \$path\)/ { sib_seen = 1 }
@@ -158,7 +175,7 @@ EOF
 
 # Build a scratch environment; echoes the workdir. Sets globals used by callers.
 setup_env() {
-  WORK="$(mktemp -d)"
+  WORK="$(mktemp -d -p "${ANAS_TEST_TMPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" .scratch.XXXXXX)"
   PVE_PM="${WORK}/AnyEvent.pm"
   PRISTINE="${WORK}/AnyEvent.pristine.pm"
   PERL_DIR="${WORK}/anas-perl"
@@ -574,6 +591,27 @@ check "uninstall removed the stale backup" "[ ! -f '${PVE_PM}.anas-orig' ]"
 check "module restored byte-pristine by excision (not by restore)" "cmp -s '${PVE_PM}' '${PRISTINE}'"
 check "stale contents never reached the module" \
   "! grep -qF 'STALE-MUST-NOT-BE-USED' '${PVE_PM}'"
+rm -rf "${WORK}"
+
+echo "== cr3.core: the uninstall's pveproxy restart is its LAST act (a web shell it kills leaves nothing undone) =="
+setup_env
+make_anyevent "${PVE_PM}"
+cp "${PVE_PM}" "${PRISTINE}"
+PERL_BIN_OVERRIDE="" run_install >/dev/null 2>&1
+printf 'package PVE::APIServer::AnyEvent; # stale\n1;\n' > "${PVE_PM}.anas-orig"
+# The restart command records what is still on disk at the moment it runs.
+LEFT="${WORK}/left-at-restart"
+PVE_TPL="${TPL}" PVE_JS_DIR="${JS_DIR}" APT_HOOK="${HOOK_DIR}/hook" \
+PVE_HTTP_SERVER_PM="${PVE_PM}" ANAS_PERL_DIR="${PERL_DIR}" \
+PVEPROXY_RESTART_CMD="for f in '${PERL_DIR}/AnasProxy.pm' '${PVE_PM}.anas-orig' '${JS_DIR}/anas.js' '${HOOK_DIR}/hook'; do [ -e \"\$f\" ] && echo \"\$f\"; done > '${LEFT}'; grep -c anas.js '${TPL}' >> '${LEFT}' || true" \
+PERL_BIN=perl \
+  bash "${UNINSTALL}" >"${WORK}/uninstall.log" 2>&1; rc=$?
+check "uninstall exits 0" "[ ${rc} -eq 0 ]"
+check "the restart ran" "[ -f '${LEFT}' ]"
+check "at the restart, no ANAS file is left (AnasProxy.pm, .anas-orig, anas.js, apt hook) and the script line is gone" \
+  "[ \"\$(cat '${LEFT}')\" = 0 ]"
+check "the restart line is the last thing the uninstall reports before its final line" \
+  "[ \"\$(tail -n 2 '${WORK}/uninstall.log' | head -n 1)\" = 'anas: pveproxy restarted (proxy hook removed)' ]"
 rm -rf "${WORK}"
 
 echo

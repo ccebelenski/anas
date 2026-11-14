@@ -711,8 +711,7 @@
     }
 
     function confirmBodyHtml(opts, err, depth) {
-        return confirmIntroFor(opts, err, depth)
-            + ANAS.warningsHtml((err.body && err.body.error && err.body.error.warnings) || []);
+        return confirmIntroFor(opts, err, depth) + ANAS.warningsHtml(confirmWarnings(err));
     }
 
     // Read the bound fields of THIS window (win.down, never a global query —
@@ -781,6 +780,9 @@
     function confirmWindow(opts, err, depth) {
         // The request the window currently holds a code for.
         var state = { vals: boundValues(opts), err: err };
+        // Set by OK: every other way the window closes (Cancel, the close
+        // tool, Esc) is the operator answering No (onCancel, cr3).
+        var answered = false;
         var items = [{
             xtype: 'component',
             itemId: 'anasConfirmBody',
@@ -837,12 +839,18 @@
                     if (btn && btn.disabled) { return; }
                     var extraOut = (typeof opts.mapConfirm === 'function')
                         ? (opts.mapConfirm(win) || {}) : {};
+                    answered = true;
                     win.close();
                     ANAS.runJob(withReprompt(
                         buildRetry(boundRequest(opts, state.vals), state.err, extraOut),
                         withBoundValues(opts, state.vals), depth));
                 },
             }],
+            listeners: {
+                close: function () {
+                    if (!answered) { declined(opts); }
+                },
+            },
         });
         for (var j = 0; j < bound.length; j++) {
             var cmp = win.down('#' + bound[j].itemId);
@@ -870,6 +878,11 @@
     // Bound options (`confirmBind` on an extraItems entry, cr.44) ride the
     // FIRST request at their defaults and re-challenge in the window; see
     // "Bound options" above.
+    //
+    // `onCancel()` (optional, cr3): called exactly once when the operator
+    // answers No to the prompt or a re-prompt (No, Cancel, the window's close
+    // tool, Esc); no request is sent then. It is never called for a job that
+    // ran or was refused.
     ANAS.confirmAndRun = function (opts) {
         var vals = boundValues(opts);
         var base = boundRequest(opts, vals);
@@ -907,16 +920,57 @@
         return retry;
     }
 
+    // The 409's own sentence (`error.message`), or '' when it carries none.
+    function confirmMessage(err) {
+        var msg = err && err.body && err.body.error && err.body.error.message;
+        return (typeof msg === 'string') ? msg : '';
+    }
+
+    // The 409's warnings, without one that only repeats its headline (shown
+    // above them since cr3.core).
+    function confirmWarnings(err) {
+        var warnings = (err && err.body && err.body.error && err.body.error.warnings) || [];
+        var msg = confirmMessage(err);
+        var out = [];
+        for (var i = 0; i < warnings.length; i++) {
+            if (!msg || String(warnings[i]) !== msg) { out.push(warnings[i]); }
+        }
+        return out;
+    }
+
     // The first prompt leads with the caller's intro; a re-prompt leads with
     // the daemon's own sentence (it says what changed), then the warnings.
     // `confirmHeadline: true` makes the FIRST prompt lead with the daemon's
     // sentence too — the 409's headline, verbatim, in bold — for a flow whose
     // every word the daemon owns (the recursive permissions apply).
+    //
+    // Every other first prompt carries the headline too (cr3.core, EPICS §3
+    // "Confirm dialog carries the 409's headline"): before it the dialog showed
+    // the intro and the warnings and never `error.message`, so a headline such
+    // as the AHR expansion's "This plan adds no usable capacity: ..." reached
+    // the wizard but not the dialog that executes it. It goes under the intro,
+    // in bold, unless the intro already says it word for word.
     function confirmIntroFor(opts, err, depth) {
-        var msg = err && err.body && err.body.error && err.body.error.message;
+        var msg = confirmMessage(err);
         if (depth > 0 && msg) { return ANAS.enc(msg); }
         if (opts.confirmHeadline && msg) { return '<b>' + ANAS.enc(msg) + '</b>'; }
-        return opts.confirmIntro || ANAS.t('This operation requires confirmation:');
+        var intro = opts.confirmIntro || ANAS.t('This operation requires confirmation:');
+        if (!msg || intro.indexOf(ANAS.enc(msg)) >= 0) { return intro; }
+        return intro + '<div class="anas-confirm-headline" style="margin:6px 0;"><b>'
+            + ANAS.enc(msg) + '</b></div>';
+    }
+
+    // The operator answered No (any answer but Yes/OK, on the first prompt or
+    // a re-prompt): the caller's optional `onCancel()` is told, once, and no
+    // request is sent (cr3, additive). Never called when the job runs or is
+    // rejected: those go to onComplete / onFailed / onLost / onCancelled.
+    function declined(opts) {
+        if (typeof opts.onCancel !== 'function') { return; }
+        try {
+            opts.onCancel();
+        } catch (e) {
+            ANAS.warn('onCancel failed: ' + ANAS.errText(e));
+        }
     }
 
     function promptConfirm(opts, err, depth) {
@@ -925,12 +979,13 @@
                 confirmWindow(opts, err, depth);
                 return;
             }
-            var warnings = (err.body && err.body.error && err.body.error.warnings) || [];
-            var msg = confirmIntroFor(opts, err, depth) + ANAS.warningsHtml(warnings);
+            var msg = confirmIntroFor(opts, err, depth) + ANAS.warningsHtml(confirmWarnings(err));
             Ext.Msg.confirm(ANAS.t(opts.confirmTitle || 'Confirm'), msg, function (btn) {
                 if (btn === 'yes') {
                     ANAS.runJob(withReprompt(buildRetry(boundRequest(opts, boundValues(opts)), err), opts, depth));
+                    return;
                 }
+                declined(opts);
             });
         } catch (e) {
             ANAS.warn('confirm dialog failed: ' + ANAS.errText(e));

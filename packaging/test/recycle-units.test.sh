@@ -27,11 +27,13 @@ RELEASE="${PKG}/make-release.sh"
 
 PASS=0
 FAIL=0
-check(){ if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
+# stdin from /dev/null (cr3 review 3): a check that reads stdin hung when the
+# suite ran with stdin an open socket.
+check(){ if eval "$2" >/dev/null 2>&1 </dev/null; then ok "$1"; else bad "$1"; fi; }
 ok()   { echo "  ok   $1"; PASS=$((PASS + 1)); }
 bad()  { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
 
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d -p "${ANAS_TEST_TMPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" .scratch.XXXXXX)"
 trap 'rm -rf "${WORK}"' EXIT
 
 SYSTEMD_DIR="${WORK}/systemd"
@@ -68,7 +70,7 @@ echo "== 2. systemd-analyze verify (when available) =="
 # the /opt/anas path; anything else naming the unit is printed and fails.
 if command -v systemd-analyze >/dev/null 2>&1; then
   for u in anas-recycle.timer anas-recycle.service; do
-    out="$(systemd-analyze verify "${SYSTEMD_SRC}/${u}" 2>&1 | grep -F "${u}" | grep -v 'recycle-purge.js' | grep -v 'Command /usr/bin/node is not executable' || true)"
+    out="$(systemd-analyze verify "${SYSTEMD_SRC}/${u}" 2>&1 </dev/null | grep -F "${u}" | grep -v 'recycle-purge.js' | grep -v 'Command /usr/bin/node is not executable' || true)"
     check "${u} verifies (modulo dev-host noise)" "[ -z \"\$(printf '%s' \"\${out}\")\" ]"
     [ -n "${out}" ] && printf '       verify said: %s\n' "${out}"
   done
@@ -84,8 +86,11 @@ check "preflight requires the timer" "grep -qF 'release_need \"systemd/\${RECYCL
 check "preflight requires the runner in app/dist" "grep -qF 'release_need app/packages/daemon/dist/recycle-purge.js' '${INSTALL}'"
 check "install_units installs both unit files" "grep -qF 'for u in \"\${RECYCLE_SERVICE}\" \"\${RECYCLE_TIMER}\"' '${INSTALL}'"
 check "the timer is enabled --now at install" "grep -qF 'systemctl enable --now anas-recycle.timer' '${INSTALL}'"
-check "rollback disables and removes the pair" \
-  "grep -qF 'systemctl disable --now anas-recycle.timer' '${INSTALL}' && grep -qF 'rm -f \"\${SYSTEMD_DIR}/\${RECYCLE_TIMER}\" \"\${SYSTEMD_DIR}/\${RECYCLE_SERVICE}\"' '${INSTALL}'"
+# cr3 review 2: the rollback removes what THIS run created (note_if_created as
+# each unit is written) and restores what it changed; the removal itself is
+# proven dynamically in install-rollback.test.sh.
+check "rollback disables the timer and removes the pair it created" \
+  "grep -qF 'systemctl disable --now anas-recycle.timer' '${INSTALL}' && grep -A1 'for u in \"\${RECYCLE_SERVICE}\" \"\${RECYCLE_TIMER}\"' '${INSTALL}' | grep -qF 'note_if_created \"\${SYSTEMD_DIR}/\${u}\"'"
 
 check "install_units lands the service beside the ANAS units" \
   "ANAS_INSTALL_LIB_ONLY=1 SYSTEMD_DIR='${SYSTEMD_DIR}' PREFIX=/opt/anas bash -c 'source \"\$0\"; install_units' '${INSTALL}' && test -f '${SYSTEMD_DIR}/anas-recycle.service'"

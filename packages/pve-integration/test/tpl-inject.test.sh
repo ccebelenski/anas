@@ -15,6 +15,23 @@
 #
 set -uo pipefail
 
+# Never reach the real system tools (cr3.core): install.sh / uninstall.sh call
+# `systemctl reset-failed pveproxy` directly on their perl -c failure paths
+# (only the restart/reload goes through PVEPROXY_*_CMD), and a test run on a
+# workstation turned that into a desktop authentication prompt. Recording stubs
+# go FIRST on PATH for the whole file; STUB_LOG holds what was asked.
+STUB_BIN="$(mktemp -d -p "${ANAS_TEST_TMPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" .scratch.XXXXXX)"
+STUB_LOG="${STUB_BIN}/calls.log"
+for _tool in systemctl apt apt-get dpkg update-initramfs pveproxy service udevadm; do
+  printf '#!/bin/sh\necho "%s $*" >> "%s"\nexit 0\n' "${_tool}" "${STUB_LOG}" > "${STUB_BIN}/${_tool}"
+  chmod +x "${STUB_BIN}/${_tool}"
+done
+export PATH="${STUB_BIN}:${PATH}"
+# The scripts' own temp files land in the scratch too, never in /tmp.
+export TMPDIR="${STUB_BIN}"
+trap 'rm -rf "${STUB_BIN}"' EXIT
+[ "$(command -v systemctl)" = "${STUB_BIN}/systemctl" ] || { echo "FATAL: systemctl stub not first on PATH" >&2; exit 1; }
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG="$(cd "${HERE}/.." && pwd)"
 INSTALL="${PKG}/install.sh"
@@ -67,7 +84,7 @@ make_src() {
 }
 
 setup_env() {
-  WORK="$(mktemp -d)"
+  WORK="$(mktemp -d -p "${ANAS_TEST_TMPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" .scratch.XXXXXX)"
   PVE_PM="${WORK}/AnyEvent.pm"
   PERL_DIR="${WORK}/anas-perl"
   TPL="${WORK}/index.html.tpl"

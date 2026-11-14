@@ -3,10 +3,14 @@
  *
  * Before rendering, every view probes the gateway health endpoint. On a 403
  * (PVE does not grant the user Sys.Audit on /, cr.27) we render a privilege
- * panel; on any other failure (connection refused / gateway down / node has
- * no ANAS), we render a friendly install-hint panel instead — we cannot auto-install like Ceph (we don't ship
- * through PVE's packaging), so the hint shows the release-tarball path: copy
- * the tarball to the node and run ./install.sh (what the panel below prints).
+ * panel. Only when the gateway SAYS the node has no ANAS (its
+ * ANAS_NOT_INSTALLED code: the peer's :8006 answered without the /anas hook)
+ * do we render the install-hint panel — we cannot auto-install like Ceph (we
+ * don't ship through PVE's packaging), so the hint shows the release-tarball
+ * path. Every other failure (an expired ticket, a peer that is down or whose
+ * certificate is not trusted, a timeout, a daemon that is not running) is NOT
+ * "not installed" (cr3.core CORE-L6): the panel says ANAS on that node could
+ * not be reached and shows the error's own sentence.
  */
 (function () {
     'use strict';
@@ -72,6 +76,41 @@
         return {
             xtype: 'panel',
             cls: 'anas-view anas-view-noprivilege',
+            bodyPadding: 20,
+            border: false,
+            scrollable: true,
+            html: html,
+        };
+    };
+
+    // A panel config for a health probe that failed for any reason other than
+    // "not installed" or "no privilege" (CORE-L6): an expired ticket (401), an
+    // unreachable or untrusted peer (502 NODE_UNREACHABLE), a timeout (504), a
+    // gateway or daemon that is not running. ANAS may well be installed there,
+    // so this never sends the operator to install it; it states what failed in
+    // the gateway's own words.
+    ANAS.unreachablePanel = function (node, err) {
+        var enc = ANAS.enc;
+        var status = err && typeof err.status === 'number' ? err.status : 0;
+        var code = err && err.body && err.body.error && typeof err.body.error.code === 'string'
+            ? err.body.error.code : '';
+        var message = (err && err.message) ? String(err.message) : ANAS.t('No answer.');
+        var detail = status > 0 ? 'HTTP ' + status + (code ? ' ' + code : '') : ANAS.t('no HTTP answer');
+        var html = ''
+            + '<div style="max-width:640px;margin:0 auto;">'
+            + '<h2><i class="fa fa-exclamation-triangle"></i> '
+            + enc(ANAS.t('ANAS on node "' + node + '" could not be reached')) + '</h2>'
+            + '<p>' + enc(message) + '</p>'
+            + '<p style="opacity:0.75;">' + enc(detail) + '</p>'
+            + '<p>' + enc(ANAS.t(
+                'Reload the page to try again. If your session has expired, log in to '
+                + 'Proxmox again.',
+            )) + '</p>'
+            + '</div>';
+
+        return {
+            xtype: 'panel',
+            cls: 'anas-view anas-view-unreachable',
             bodyPadding: 20,
             border: false,
             scrollable: true,
@@ -215,8 +254,13 @@
                             if (err && err.status === 403) {
                                 ANAS.warn('health probe refused (403): ' + ANAS.errText(err));
                                 panel.add(ANAS.noPrivilegePanel(node, err.message));
-                            } else {
+                            } else if (err && err.body && err.body.error
+                                && err.body.error.code === 'ANAS_NOT_INSTALLED') {
                                 panel.add(ANAS.notInstalledPanel(node));
+                            } else {
+                                // CORE-L6: not "not installed" — say what failed.
+                                ANAS.warn('health probe failed: ' + ANAS.errText(err));
+                                panel.add(ANAS.unreachablePanel(node, err));
                             }
                         } catch (e) {
                             ANAS.warn('not-installed render failed: ' + ANAS.errText(e));

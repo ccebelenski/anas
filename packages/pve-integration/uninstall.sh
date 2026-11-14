@@ -110,6 +110,8 @@ excise_our_hook_to() {
 }
 
 SCRIPT_SRC="/pve2/js/anas.js"
+# Set when the proxy hook was excised: pveproxy is restarted at the very end.
+need_restart=0
 
 # 1. Remove our line from the template — and only our line. We match on the
 #    anas.js source *path* as a substring so the whole tag line is removed
@@ -182,12 +184,10 @@ if [ -f "${PVE_HTTP_SERVER_PM}" ] && grep -qF "${ANAS_HOOK_MARKER}" "${PVE_HTTP_
     adopt_file "${candidate}" "${PVE_HTTP_SERVER_PM}"
     rm -f "${candidate}"
     echo "anas: ${removal_desc}"
-    if restart_pveproxy; then
-      echo "anas: pveproxy restarted (proxy hook removed)"
-    else
-      echo "anas: WARNING: pveproxy restart failed" >&2
-      systemctl reset-failed pveproxy >/dev/null 2>&1 || true
-    fi
+    # The restart is the LAST act of this script (cr3.core): it can kill a
+    # shell running inside pveproxy's cgroup (the PVE web shell,
+    # integration.r1), so every file is removed before it.
+    need_restart=1
   fi
 else
   echo "anas: no ANAS proxy hook in ${PVE_HTTP_SERVER_PM} (nothing to restore)"
@@ -204,6 +204,17 @@ if [ -f "${ANAS_PROXY_PM}" ]; then
   rm -f "${ANAS_PROXY_PM}"
   echo "anas: removed ${ANAS_PROXY_PM}"
   rmdir "${ANAS_PERL_DIR}" 2>/dev/null || true
+fi
+
+# 6. Restart pveproxy so its workers drop the excised hook — the last act, after
+#    every file above is gone (a web shell this kills has nothing left undone).
+if [ "${need_restart}" -eq 1 ]; then
+  if restart_pveproxy; then
+    echo "anas: pveproxy restarted (proxy hook removed)"
+  else
+    echo "anas: WARNING: pveproxy restart failed" >&2
+    systemctl reset-failed pveproxy >/dev/null 2>&1 || true
+  fi
 fi
 
 echo "anas: PVE UI integration uninstalled."

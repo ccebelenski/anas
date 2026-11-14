@@ -41,6 +41,13 @@ export interface GatewayConfig {
    */
   membersPath: string
   /**
+   * pmxcfs's per-node directory (`/etc/pve/nodes`). A peer that serves the
+   * custom certificate held there for it (`<node>/pveproxy-ssl.pem`, ACME or
+   * uploaded) is trusted for the forward as well as a cluster-CA chain
+   * (CORE-M1). Optional: absent means the default.
+   */
+  pveNodesDir?: string
+  /**
    * Test overrides for the timeout ladder (cr.35, proxy.ts). Production always
    * runs at the proxy's defaults — 20 s to the local anasd socket, 5 s to
    * connect to a peer and 25 s for its answer; the overrides exist so each
@@ -67,5 +74,6 @@ export function loadConfig(
     authProvider: env.ANAS_AUTH_PROVIDER,
     clusterCa: env.ANAS_CLUSTER_CA ?? '/etc/pve/pve-root-ca.pem',
     membersPath: env.ANAS_MEMBERS_PATH ?? '/etc/pve/.members',
+    pveNodesDir: env.ANAS_PVE_NODES_DIR ?? '/etc/pve/nodes',
   }
 }

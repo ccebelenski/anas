@@ -1,10 +1,16 @@
 import type { FsBrowseResult } from '@anas/shared'
+import type { FastifyBaseLogger } from 'fastify'
+import type { MockExecutor } from '../../executor/mock.js'
+import type { CommandExecutor } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { runAsDaemon, runAsRequest } from '../../jobs/authority.js'
 import { createServer } from '../../server.js'
+import { sharePathProbeArgs } from '../../services/share-path.js'
+import { readerPathGate } from '../fs.js'
 
 /** An operator (Sys.Modify): the unbounded browse every picker dialog uses. */
 const MODIFY = { 'x-anas-user': 'root@pam', 'x-anas-privileges': 'Sys.Audit,Sys.Modify' }
@@ -311,5 +317,127 @@ describe('fs browse is bounded for a reader (cr.62, review L11)', () => {
     assert.equal(res.statusCode, 200)
     assert.deepEqual(res.data!.dirs, ['keys'])
     assert.deepEqual(res.data!.files, ['id_ed25519'])
+  })
+})
+
+describe('cr3 fs browse: a path that does not answer, and the reader bound as one exported rule', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-fs-cr3-'))
+  })
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('a path whose bounded stat times out (a dead hard NFS mount) is 503 UNAVAILABLE, before anything in process touches it', async () => {
+    server = createServer({ mock: true, logger: false })
+    await server.ready()
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    const dead = join(dir, 'dead-mount')
+    await mkdir(dead)
+    await writeFile(join(dead, 'would-be-listed'), 'x')
+    // `timeout` killed the stat: exit 124 (the capture services/share-path.ts pins).
+    mock.prependFixture({ command: '/usr/bin/timeout', args: sharePathProbeArgs(dead), result: { stdout: '', stderr: '', exitCode: 124 } })
+    for (const headers of [MODIFY, AUDIT]) {
+      const res = await browse(server!, dead, headers, true)
+      assert.equal(res.statusCode, 503)
+      assert.equal(res.error!.code, 'UNAVAILABLE')
+      assert.match(res.error!.message, /is not answering/)
+      assert.equal(res.data, undefined, 'nothing is listed')
+    }
+  })
+
+  it('a path whose probe answers goes on to the listing as before', async () => {
+    server = createServer({ mock: true, logger: false })
+    await server.ready()
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    await mkdir(join(dir, 'child'))
+    mock.prependFixture({ command: '/usr/bin/timeout', args: sharePathProbeArgs(dir), result: { stdout: '6969\n', stderr: '', exitCode: 0 } })
+    const res = await browse(server!, dir)
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(res.data!.dirs, ['child'])
+  })
+
+  /** A fake executor whose bounded `stat` probe answers `exitCode` for every path (or per path). */
+  function probeExecutor(exitCode: number | ((path: string) => number), order?: string[]): CommandExecutor {
+    return {
+      exec: async (cmd: string, args: string[]) => {
+        const path = String(args.at(-1))
+        order?.push(`exec ${cmd} ${path}`)
+        const code = typeof exitCode === 'function' ? exitCode(path) : exitCode
+        return { stdout: code === 0 ? '6969\n' : '', stderr: '', exitCode: code }
+      },
+    } as unknown as CommandExecutor
+  }
+
+  it('readerPathGate: null for Sys.Modify and for the daemon\'s own work; a reader only inside a root that is not /', async () => {
+    const log = { warn: () => {} } as unknown as FastifyBaseLogger
+    const roots = { executor: probeExecutor(0), managedRoots: async () => [join(dir, 'share'), '/'] }
+    await mkdir(join(dir, 'share', 'in'), { recursive: true })
+    const reader = { user: 'audit@pve', privileges: ['Sys.Audit'] as const, problem: null }
+    const modifier = { user: 'root@pam', privileges: ['Sys.Audit', 'Sys.Modify'] as const, problem: null }
+    assert.equal(await runAsRequest(modifier, () => readerPathGate('/etc/pve/priv', roots, log)), null)
+    assert.equal(await runAsDaemon(() => readerPathGate('/etc/pve/priv', roots, log)), null)
+    assert.equal(await runAsRequest(reader, () => readerPathGate(join(dir, 'share', 'in'), roots, log)), null)
+    const refused = await runAsRequest(reader, () => readerPathGate('/etc/pve/priv', roots, log))
+    assert.equal(refused?.status, 403)
+    assert.equal(refused?.error.code, 'FORBIDDEN')
+    assert.match(refused!.error.message, /Sys\.Modify/)
+    assert.match(refused!.error.message, /\/etc\/pve\/priv is outside them/)
+    // A path given un-normalised is judged (and named) normalised.
+    const sneaky = await runAsRequest(reader, () => readerPathGate(`${join(dir, 'share')}/../secret/`, roots, log))
+    assert.equal(sneaky?.error.code, 'FORBIDDEN')
+    assert.match(sneaky!.error.message, new RegExp(`${join(dir, 'secret').replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')} is outside them`))
+  })
+
+  it('cr3 review 2: readerPathGate probes FIRST — a path that does not answer is 503 before the bound reads a root or the path', async () => {
+    const log = { warn: () => {} } as unknown as FastifyBaseLogger
+    const order: string[] = []
+    const answering = (exitCode: number) => probeExecutor(exitCode, order)
+    const reader = { user: 'audit@pve', privileges: ['Sys.Audit'] as const, problem: null }
+    const roots = async () => {
+      order.push('roots')
+      return [join(dir, 'share')]
+    }
+    // Dead: 503, and the bound (the managed roots, the in-process realpath) is never reached.
+    const dead = await runAsRequest(reader, () => readerPathGate('/mnt/dead/x', { executor: answering(124), managedRoots: roots }, log))
+    assert.equal(dead?.status, 503)
+    assert.equal(dead?.error.code, 'UNAVAILABLE')
+    assert.deepEqual(order, ['exec /usr/bin/timeout /mnt/dead/x'])
+    // Answering: the probe, THEN the bound.
+    order.length = 0
+    const outside = await runAsRequest(reader, () => readerPathGate('/etc/pve/priv', { executor: answering(0), managedRoots: roots }, log))
+    assert.equal(outside?.status, 403)
+    assert.deepEqual(order, ['exec /usr/bin/timeout /etc/pve/priv', 'roots', `exec /usr/bin/timeout ${join(dir, 'share')}`])
+    // Sys.Modify still gets the probe (a dead mount pins a thread for anyone).
+    order.length = 0
+    const modifier = { user: 'root@pam', privileges: ['Sys.Audit', 'Sys.Modify'] as const, problem: null }
+    assert.equal((await runAsRequest(modifier, () => readerPathGate('/mnt/dead/x', { executor: answering(124), managedRoots: roots }, log)))?.status, 503)
+  })
+
+  it('cr3 review 3: every managed root goes through the bounded probe; a root that does not answer is skipped, never resolved in process', async () => {
+    const warnings: string[] = []
+    const log = { warn: (m: string) => warnings.push(m) } as unknown as FastifyBaseLogger
+    const reader = { user: 'audit@pve', privileges: ['Sys.Audit'] as const, problem: null }
+    const dead = join(dir, 'dead-share')
+    const live = join(dir, 'live-share')
+    await mkdir(join(live, 'in'), { recursive: true })
+    const order: string[] = []
+    const ex = probeExecutor(p => (p === dead || p.startsWith(`${dead}/`) ? 124 : 0), order)
+    const opts = { executor: ex, managedRoots: async () => [dead, live] }
+    // Inside the live root: allowed, and both roots were probed (the dead one skipped and logged).
+    assert.equal(await runAsRequest(reader, () => readerPathGate(join(live, 'in'), opts, log)), null)
+    assert.ok(order.includes(`exec /usr/bin/timeout ${dead}`) && order.includes(`exec /usr/bin/timeout ${live}`))
+    assert.ok(warnings.some(w => w.includes(`managed root ${dead} is not answering`)))
+    // A path the dead root would have covered is outside the bound for this request (the
+    // path itself answers here; the root does not).
+    const ex2 = probeExecutor(p => (p === dead ? 124 : 0))
+    const refused = await runAsRequest(reader, () => readerPathGate(join(dead, 'sub'), { executor: ex2, managedRoots: async () => [dead] }, log))
+    assert.equal(refused?.status, 403)
   })
 })

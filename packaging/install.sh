@@ -12,7 +12,11 @@
 # idempotent. A re-run is a clean in-place upgrade (backup -> install -> drop
 # backup on success), never a duplicate unit or a double <script> line.
 #
-set -euo pipefail
+# -E (errtrace, CORE-L4): the ERR trap phase1_install arms must also fire for a
+# command that fails INSIDE a function it calls (install_units, write_env_file,
+# health_check's callees); without it bash exits there under -e and the
+# rollback never runs, leaving a half-installed node.
+set -Eeuo pipefail
 
 # --- Paths / config ---------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -269,7 +273,7 @@ resolve_port() {
 # AnasProxy.pm. Fresh each install from the resolved port (the file is ours).
 write_env_file() {
   local port="$1"
-  install -d -m 0755 "$(dirname "${ANAS_ENV_FILE}")"
+  ensure_dir "$(dirname "${ANAS_ENV_FILE}")"
   cat > "${ANAS_ENV_FILE}" <<EOF
 # ANAS gateway configuration — managed by install.sh (issue #2). KEY=VALUE.
 # Loopback port the anas gateway binds and pveproxy forwards /anas requests to.
@@ -277,6 +281,8 @@ write_env_file() {
 ANAS_PORT=${port}
 EOF
   chmod 0644 "${ANAS_ENV_FILE}"
+  # Flushed: an EnvironmentFile cut short by a power loss is a dead gateway.
+  sync -f -- "${ANAS_ENV_FILE}"
   info "wrote ${ANAS_ENV_FILE} (ANAS_PORT=${port})"
 }
 
@@ -548,6 +554,10 @@ phase0_preflight() {
     info "existing ANAS gateway is listening on :${HEALTH_PORT} — it will be stopped and upgraded"
   fi
 
+  # Every path phase 1 writes outside the prefix is a file, a link to one, or
+  # absent (cr3 review 2): a dangling link or a directory is refused here.
+  preflight_owned_paths
+
   # Abort if any hard failure. Nothing has been mutated up to this point.
   if [ "${#FATAL[@]}" -gt 0 ]; then
     echo >&2
@@ -684,20 +694,39 @@ phase0b_install_deps() {
 # the step not having happened (idempotent).
 SERVICES_STOPPED=0
 BACKUP_PATH=""
-PREFIX_INSTALLED=0
-HOOK_INSTALLED=0
-ENV_FILE_FRESH=0        # set iff we CREATED ${ANAS_ENV_FILE} (removed on rollback)
-ISCSI_DROPIN_FRESH=0    # set iff we CREATED the iSCSI ordering drop-in (removed on rollback)
-CACHE_HOOK_INSTALLED=0  # set iff we CREATED the AHR cache-event hook (removed on rollback)
-CACHE_RULE_INSTALLED=0  # set iff we CREATED the AHR cache udev rule (removed on rollback)
+PREFIX_INSTALLED=0      # set before the copy into a PREFIX this run made (removed on rollback)
+CACHE_HOOK_INSTALLED=0  # the cache hook was absent: the rollback reloads udev's rules
+CACHE_RULE_INSTALLED=0  # the cache udev rule was absent: the rollback reloads udev's rules
 UNITS_INSTALLED=0
 SERVICES_STARTED=0
 UI_INSTALLED=0
 INSTALL_DONE=0
 
+# What this run is about to overwrite OUTSIDE ${PREFIX}, read before the first
+# act so a failed upgrade's rollback puts back exactly what was there (CORE-M2):
+# before it, the rollback disabled anasd/anas/the recycle timer and never
+# enabled them again (the restored install ran until the next reboot, then
+# never started), re-installed the unit files from the NEW release, and left
+# an env file --port had overwritten. Contents are held in memory (small text
+# files), so nothing is written to the node to remember them.
+declare -A PRIOR_FILE_CONTENT=()
+declare -A PRIOR_FILE_MODE=()
+declare -A PRIOR_FILE_OWNER=()   # uid:gid of the file (through a symlink)
+declare -A PRIOR_LINK=()         # the path was a symlink: its target, as written
+declare -A PRIOR_LINK_REAL=()    # ... and the file it resolved to
+declare -A PRIOR_FILE_ACL=()     # the file's extended POSIX ACL (getfacl), when it had one
+declare -A PRIOR_FILE_MTIME=()   # the file's mtime (seconds.nanoseconds), put back with its bytes
+declare -A PRIOR_ABSENT=()       # nothing was at the path when the save ran
+CREATED_DIRS=()                  # directories THIS run created (removed on rollback, only if empty)
+CREATED_PATHS=()                 # files THIS run created where nothing was (appended as each is installed)
+RESTORE_FAILED=()                # paths the rollback could not put back
+PRIOR_ENABLED=()        # units enabled before this run, enabled again on rollback
+PRIOR_TIMER_ACTIVE=0    # the recycle timer was running before this run
+UI_WAS_PRESENT=0        # the PVE UI integration was installed before this run
+ROLLBACK_SHELL_PID=""   # the shell that armed the ERR trap: the only one that rolls back
+
 # mdadm --monitor PROGRAM hook (AHR md events -> journald). Overridable for tests.
 HOOK_DEST="${HOOK_DEST:-/usr/local/bin/anas-md-event}"
-
 # AHR read-cache removal hook + its udev rule (ahrcache.1 slice 2, AHR §13).
 # The rule is INERT until a pool actually has a cache: nothing on a node carries
 # a `<pool>-cacheN` GPT partition name until POST /v1/ahr/<pool>/cache writes
@@ -707,7 +736,315 @@ CACHE_HOOK_DEST="${CACHE_HOOK_DEST:-/usr/local/bin/anas-cache-event}"
 UDEV_RULES_DIR="${UDEV_RULES_DIR:-/etc/udev/rules.d}"
 CACHE_RULE_DEST="${CACHE_RULE_DEST:-${UDEV_RULES_DIR}/99-anas-cache.rules}"
 
+# The ANAS-owned files outside PREFIX that phase 1 overwrites (CORE-M2): the
+# units and the iSCSI drop-in, the env file, the two hooks and the udev rule,
+# and the notification templates.
+prior_state_files() {
+  local tpl
+  printf '%s\n' \
+    "${SYSTEMD_DIR}/anasd.service" \
+    "${SYSTEMD_DIR}/anas.service" \
+    "${SYSTEMD_DIR}/${RECYCLE_TIMER}" \
+    "${SYSTEMD_DIR}/${RECYCLE_SERVICE}" \
+    "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}" \
+    "${ANAS_ENV_FILE}" \
+    "${HOOK_DEST}" \
+    "${CACHE_HOOK_DEST}" \
+    "${CACHE_RULE_DEST}"
+  for tpl in "${NOTIFY_TEMPLATES[@]}"; do
+    printf '%s\n' "${PVE_TEMPLATE_DIR:-/usr/share/pve-manager/templates/default}/${tpl}"
+  done
+}
+
+# Read, before phase 1's first act, what a rollback must restore (CORE-M2):
+# each file's bytes, mode, owner and (when it has one) POSIX ACL, which units
+# are enabled, whether the recycle timer runs, whether the PVE UI integration
+# is in place. Read-only.
+#
+# A path that is a SYMLINK (an env file an operator keeps elsewhere, a unit
+# linked in from another tree) is remembered as the link, the file it resolves
+# to, and that file's bytes, mode and owner (`stat -L`: a symlink's own mode is
+# always 777). The preflight has already refused a dangling link and anything
+# that is neither a file nor a link (preflight_owned_paths).
+#
+# A read that fails STOPS the install here, before phase 1's first act, with a
+# sentence naming the file (cr3 review 2): `$(cat f; printf x)` swallowed a
+# failed cat and saved empty content, which the rollback then wrote over the
+# file.
+save_prior_state() {
+  local f content mode owner acl u
+  while IFS= read -r f; do
+    if [ ! -e "${f}" ] && [ ! -L "${f}" ]; then
+      PRIOR_ABSENT["${f}"]=1
+      continue
+    fi
+    if [ -L "${f}" ]; then
+      if ! PRIOR_LINK["${f}"]="$(readlink -- "${f}")" || ! PRIOR_LINK_REAL["${f}"]="$(readlink -f -- "${f}")"; then
+        err "cannot read the symlink ${f} — the node was NOT modified"
+        exit 1
+      fi
+    fi
+    if [ -f "${f}" ]; then
+      # The trailing x keeps the file's own trailing newlines through $( ).
+      if ! content="$(cat -- "${f}" && printf x)" \
+         || ! mode="$(stat -L -c '%a' -- "${f}")" \
+         || ! owner="$(stat -L -c '%u:%g' -- "${f}")" \
+         || ! PRIOR_FILE_MTIME["${f}"]="$(stat -L -c '%.9Y' -- "${f}")"; then
+        err "cannot read ${f} (a rollback could not put it back) — the node was NOT modified"
+        exit 1
+      fi
+      PRIOR_FILE_CONTENT["${f}"]="${content%x}"
+      PRIOR_FILE_MODE["${f}"]="${mode}"
+      PRIOR_FILE_OWNER["${f}"]="${owner}"
+      # An extended ACL (anything beyond the mode): `--skip-base` prints
+      # nothing for a file that has none. Carried across a temp+rename restore.
+      if command -v getfacl >/dev/null 2>&1; then
+        acl="$(getfacl --skip-base --absolute-names -p -- "${f}" 2>/dev/null || true)"
+        if [ -n "${acl}" ]; then
+          PRIOR_FILE_ACL["${f}"]="$(getfacl --omit-header --absolute-names -p -- "${f}")"
+        fi
+      fi
+    fi
+  done < <(prior_state_files)
+  for u in anasd.service anas.service "${RECYCLE_TIMER}"; do
+    if systemctl is-enabled --quiet "${u}" 2>/dev/null; then
+      PRIOR_ENABLED+=("${u}")
+    fi
+  done
+  if systemctl is-active --quiet "${RECYCLE_TIMER}" 2>/dev/null; then
+    PRIOR_TIMER_ACTIVE=1
+  fi
+  if [ -f "${PVE_JS_DIR:-/usr/share/pve-manager/js}/anas.js" ]; then
+    UI_WAS_PRESENT=1
+  fi
+}
+
+# The preflight half of the saved set (cr3 review 2), read-only: every path
+# phase 1 writes outside the prefix must be absent, a regular file, or a
+# symlink to an existing regular file. A dangling link would have phase 1
+# create its target (which the rollback cannot know to remove), and a
+# directory where a hook belongs would get the hook dropped inside it. Both
+# are refused here, before anything is written, naming the path. A temp file
+# an earlier, killed rollback left beside one of them holds that run's only
+# copy of an old file: it is named (never deleted).
+preflight_owned_paths() {
+  local f target left
+  while IFS= read -r f; do
+    if [ -L "${f}" ]; then
+      target="$(readlink -- "${f}" 2>/dev/null || true)"
+      if [ ! -e "${f}" ]; then
+        FATAL+=("${f} is a symlink to ${target:-an unreadable target}, which does not exist: ANAS would create that file through the link. Remove the link or create its target, then re-run.")
+      elif [ ! -f "${f}" ]; then
+        FATAL+=("${f} is a symlink to ${target}, which is not a regular file. ANAS installs a file there; move it aside, then re-run.")
+      fi
+    elif [ -d "${f}" ]; then
+      FATAL+=("${f} is a directory. ANAS installs a file there; move the directory aside, then re-run.")
+    elif [ -e "${f}" ] && [ ! -f "${f}" ]; then
+      FATAL+=("${f} is not a regular file. ANAS installs a file there; move it aside, then re-run.")
+    fi
+    for left in "$(dirname -- "${f}")/.$(basename -- "${f}").anas-restore."*; do
+      [ -e "${left}" ] || continue
+      warn "${left} was left by an earlier ANAS installation that did not finish its rollback; it may hold the only copy of an old ${f}. It is left in place: compare it with ${f} and remove it when done."
+    done
+  done < <(prior_state_files)
+}
+
+# Phase 1 is about to write `$1` (cr3 reviews 2 and 3). When nothing is there,
+# this run CREATES it, and the rollback removes it: decided from what the run
+# did, never from "absent at save, present now". Something that APPEARED there
+# since the save (absent then, present now) is another process's file: phase 1
+# stops here, before writing over it, and rolls back.
+note_if_created() {
+  if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+    CREATED_PATHS+=("$1")
+    return 0
+  fi
+  if [ -n "${PRIOR_ABSENT[$1]+set}" ]; then
+    err "$1 appeared while ANAS was installing (it was not there when the installation began); another process wrote it, so ANAS stops here rather than write over it."
+    return 1
+  fi
+}
+
+# Create directory `$1` (mode `$2`, default 0755) only when it is absent, and
+# remember every directory this creates, so the rollback removes those (only if
+# empty) and never touches a directory that was there: `install -d -m` re-modes
+# an existing directory (cr3 review 3: 0750 became 0755, a read-only 0555 one
+# writable).
+ensure_dir() {
+  local d="$1" mode="${2:-0755}" missing=() p
+  [ -d "${d}" ] && return 0
+  p="${d}"
+  while [ ! -d "${p}" ]; do
+    missing=("${p}" "${missing[@]}")
+    p="$(dirname -- "${p}")"
+  done
+  for p in "${missing[@]}"; do
+    mkdir -m "${mode}" -- "${p}"
+    CREATED_DIRS+=("${p}")
+  done
+}
+
+# Put the saved mtime of record `$2` back on `$1` when it differs (a restored
+# file reads as never touched; best effort: a failure here changes nothing else).
+restore_mtime() {
+  [ -n "${PRIOR_FILE_MTIME[$2]+set}" ] || return 0
+  [ "$(stat -L -c '%.9Y' -- "$1" 2>/dev/null)" = "${PRIOR_FILE_MTIME[$2]}" ] && return 0
+  touch -m -d "@${PRIOR_FILE_MTIME[$2]}" -- "$1" 2>/dev/null || true
+}
+
+# Does regular file `$1` hold exactly bytes `$2`, mode `$3`, owner `$4`?
+file_matches() {
+  [ -f "$1" ] || return 1
+  [ "$(stat -L -c '%a' -- "$1")" = "$3" ] || return 1
+  [ "$(stat -L -c '%u:%g' -- "$1")" = "$4" ] || return 1
+  cmp -s -- "$1" <(printf '%s' "$2")
+}
+
+# Put the saved bytes of `$1` (the saved-set path `$2` names the record) back
+# into the file `$1`.
+#
+# The complete old bytes go to a temp file in the same directory first, flushed.
+# Then:
+#   - in place (`$3` = inplace: a file phase 1 writes in place, the units and
+#     the env file): the temp's bytes are copied INTO the existing file, so its
+#     inode, hard links, ACLs and xattrs stay; then mode and owner;
+#   - otherwise (a file phase 1 replaced with a new inode): the temp gets the
+#     mode, owner and saved ACL and is renamed over the file.
+# A temp that holds the complete old bytes is KEPT when a later step fails,
+# and its path is part of the not-restored record: it may be the only copy.
+restore_file() {
+  local f="$1" key="$2" how="$3" dir tmp
+  dir="$(dirname -- "${f}")"
+  [ -d "${dir}" ] || mkdir -p -- "${dir}" 2>/dev/null || { RESTORE_FAILED+=("${f}"); return 1; }
+  if ! tmp="$(mktemp -- "${dir}/.$(basename -- "${f}").anas-restore.XXXXXX" 2>/dev/null)"; then
+    RESTORE_FAILED+=("${f}")
+    return 1
+  fi
+  if ! { printf '%s' "${PRIOR_FILE_CONTENT[${key}]}" > "${tmp}" && sync -f -- "${tmp}"; } 2>/dev/null; then
+    rm -f -- "${tmp:?}"
+    RESTORE_FAILED+=("${f}")
+    return 1
+  fi
+  if [ "${how}" = inplace ] && [ -f "${f}" ]; then
+    if cat -- "${tmp}" > "${f}" && sync -f -- "${f}" \
+       && chmod "${PRIOR_FILE_MODE[${key}]}" -- "${f}" && chown "${PRIOR_FILE_OWNER[${key}]}" -- "${f}"; then
+      rm -f -- "${tmp:?}"
+      restore_mtime "${f}" "${key}"
+      return 0
+    fi
+  elif chmod "${PRIOR_FILE_MODE[${key}]}" -- "${tmp}" && chown "${PRIOR_FILE_OWNER[${key}]}" -- "${tmp}" \
+     && { [ -z "${PRIOR_FILE_ACL[${key}]+set}" ] || setfacl --set-file=- -- "${tmp}" <<<"${PRIOR_FILE_ACL[${key}]}"; } \
+     && mv -f -T -- "${tmp}" "${f}"; then
+    restore_mtime "${f}" "${key}"
+    return 0
+  fi
+  RESTORE_FAILED+=("${f} (its old bytes are in ${tmp})")
+  return 1
+}
+
+# Point `$1` at `$2` again, atomically: a link made under a unique temp name
+# in the same directory (mktemp: never a fixed name another file could have),
+# renamed over it.
+restore_link() {
+  local f="$1" tmp
+  tmp="$(mktemp -- "$(dirname -- "${f}")/.$(basename -- "${f}").anas-link.XXXXXX" 2>/dev/null)" || return 1
+  if ln -sfn -- "$2" "${tmp}" 2>/dev/null && mv -f -T -- "${tmp}" "${f}"; then
+    return 0
+  fi
+  rm -f -- "${tmp:?}"
+  return 1
+}
+
+# The saved-set paths phase 1 writes IN PLACE (`sed >`, `cat >`); every other
+# one it replaces with a new inode (`install`).
+written_in_place() {
+  case "$1" in
+    "${SYSTEMD_DIR}/anasd.service" | "${SYSTEMD_DIR}/anas.service" \
+    | "${SYSTEMD_DIR}/${RECYCLE_TIMER}" | "${SYSTEMD_DIR}/${RECYCLE_SERVICE}" \
+    | "${ANAS_ENV_FILE}") return 0 ;;
+  esac
+  return 1
+}
+
+# Put back every saved path that phase 1 changed, and only those:
+#   - a path that was a SYMLINK:
+#       * still that same link (the env file is written through it): the file
+#         behind it gets its old bytes, mode and owner back, in place, if they
+#         differ;
+#       * replaced by a file (GNU `install` replaces a link — the hooks, the
+#         udev rule, the templates, the iSCSI drop-in): re-creating the link IS
+#         the whole restore; the file behind it is not written (it may be
+#         another package's, updated meanwhile);
+#       * re-pointed elsewhere by someone else meanwhile: THEIR link is left
+#         alone, and the link — and the file it pointed to, if this run wrote
+#         through the link and its bytes are not the saved ones — are named
+#         as not restored (cr3 review 3);
+#   - a path that was a regular file gets its old bytes, mode and owner back
+#     if, and only if, any of them differ: an untouched file is not rewritten;
+#     in place for the files phase 1 writes in place, by temp+rename (with
+#     its ACL) for the ones it replaces (restore_file).
+# A path that could not be put back is recorded in RESTORE_FAILED.
+restore_prior_files() {
+  local f real how
+  while IFS= read -r f; do
+    how=replace
+    if written_in_place "${f}"; then how=inplace; fi
+    if [ -n "${PRIOR_LINK[${f}]+set}" ]; then
+      real="${PRIOR_LINK_REAL[${f}]}"
+      if [ -L "${f}" ] && [ "$(readlink -- "${f}")" = "${PRIOR_LINK[${f}]}" ]; then
+        if [ -n "${PRIOR_FILE_CONTENT[${f}]+set}" ]; then
+          if file_matches "${real}" "${PRIOR_FILE_CONTENT[${f}]}" "${PRIOR_FILE_MODE[${f}]}" "${PRIOR_FILE_OWNER[${f}]}"; then
+            restore_mtime "${real}" "${f}"
+          else
+            restore_file "${real}" "${f}" inplace
+          fi
+        fi
+      elif [ -L "${f}" ]; then
+        RESTORE_FAILED+=("${f} (re-pointed by another process to $(readlink -- "${f}") while ANAS was installing; left as it is)")
+        if [ "${how}" = inplace ] && [ -n "${PRIOR_FILE_CONTENT[${f}]+set}" ] \
+           && ! file_matches "${real}" "${PRIOR_FILE_CONTENT[${f}]}" "${PRIOR_FILE_MODE[${f}]}" "${PRIOR_FILE_OWNER[${f}]}"; then
+          RESTORE_FAILED+=("${real} (this installation wrote it through ${f}; not restored)")
+        fi
+      else
+        restore_link "${f}" "${PRIOR_LINK[${f}]}" || RESTORE_FAILED+=("${f}")
+      fi
+      continue
+    fi
+    if [ -n "${PRIOR_FILE_CONTENT[${f}]+set}" ]; then
+      if [ ! -L "${f}" ] && file_matches "${f}" "${PRIOR_FILE_CONTENT[${f}]}" "${PRIOR_FILE_MODE[${f}]}" "${PRIOR_FILE_OWNER[${f}]}"; then
+        restore_mtime "${f}" "${f}"
+        continue
+      fi
+      [ -L "${f}" ] && how=replace
+      restore_file "${f}" "${f}" "${how}"
+    fi
+  done < <(prior_state_files)
+}
+
+# Remove what this run created where nothing was (CREATED_PATHS): a regular
+# file or a link, never anything else; then the directories it created
+# (CREATED_DIRS, deepest first), each only if empty.
+remove_created_paths() {
+  local f i
+  for f in "${CREATED_PATHS[@]}"; do
+    if [ -f "${f}" ] || [ -L "${f}" ]; then
+      rm -f -- "${f:?}" || RESTORE_FAILED+=("${f}")
+    fi
+  done
+}
+remove_created_dirs() {
+  local i
+  for ((i = ${#CREATED_DIRS[@]} - 1; i >= 0; i--)); do
+    rmdir -- "${CREATED_DIRS[i]:?}" >/dev/null 2>&1 || true
+  done
+}
+
 rollback() {
+  # An ERR inside a command substitution or other subshell (errtrace carries the
+  # trap there) must not run a second, partial rollback in that copy of the
+  # shell: it fails the subshell, and the installer itself rolls back once.
+  [ "${BASHPID}" = "${ROLLBACK_SHELL_PID}" ] || exit 1
+  trap - ERR
   set +e
   echo >&2
   err "installation failed — rolling back..."
@@ -720,56 +1057,78 @@ rollback() {
   fi
 
   if [ "${UNITS_INSTALLED}" -eq 1 ] || [ "${SERVICES_STARTED}" -eq 1 ]; then
-    info "removing systemd units"
+    info "stopping the new units"
     systemctl disable --now anasd anas >/dev/null 2>&1 || true
-    rm -f "${SYSTEMD_DIR}/anasd.service" "${SYSTEMD_DIR}/anas.service"
     systemctl disable --now anas-recycle.timer >/dev/null 2>&1 || true
-    rm -f "${SYSTEMD_DIR}/${RECYCLE_TIMER}" "${SYSTEMD_DIR}/${RECYCLE_SERVICE}"
-    systemctl daemon-reload >/dev/null 2>&1 || true
   fi
 
-  if [ "${HOOK_INSTALLED}" -eq 1 ]; then
-    info "removing md-event hook"
-    rm -f "${HOOK_DEST}"
+  # Every file this run CREATED where nothing was (units, hooks, the udev rule,
+  # the drop-in, the env file, templates) is removed; every file it CHANGED is
+  # put back, only if it differs, through a temp file (restore_prior_files).
+  if [ "${#CREATED_PATHS[@]}" -gt 0 ]; then
+    info "removing the files this run created"
+    remove_created_paths
   fi
-
+  restore_prior_files
   if [ "${CACHE_HOOK_INSTALLED}" -eq 1 ] || [ "${CACHE_RULE_INSTALLED}" -eq 1 ]; then
-    info "removing AHR cache-event hook"
-    [ "${CACHE_HOOK_INSTALLED}" -eq 1 ] && rm -f "${CACHE_HOOK_DEST}"
-    [ "${CACHE_RULE_INSTALLED}" -eq 1 ] && rm -f "${CACHE_RULE_DEST}"
     udevadm control --reload-rules >/dev/null 2>&1 || true
   fi
-
-  # Only a drop-in THIS run created is withdrawn; an upgrade over an existing
-  # one leaves it in place (the restore path below re-installs it anyway).
-  if [ "${ISCSI_DROPIN_FRESH}" -eq 1 ]; then
-    info "removing iSCSI ordering drop-in"
-    rm -f "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}"
-    rmdir "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}" >/dev/null 2>&1 || true
-  fi
-
-  if [ "${ENV_FILE_FRESH}" -eq 1 ]; then
-    info "removing freshly-written ${ANAS_ENV_FILE}"
-    rm -f "${ANAS_ENV_FILE}"
-  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
 
   if [ "${PREFIX_INSTALLED}" -eq 1 ]; then
     info "removing freshly-installed ${PREFIX}"
-    rm -rf "${PREFIX}"
+    rm -rf -- "${PREFIX:?}"
   fi
 
   if [ -n "${BACKUP_PATH}" ] && [ -d "${BACKUP_PATH}" ]; then
     info "restoring previous install from backup"
     rm -rf "${PREFIX}"
-    mv "${BACKUP_PATH}" "${PREFIX}" || true
-    # Re-establish units pointing at the restored copy and bring it back up.
-    install_units >/dev/null 2>&1 || true
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    mv "${BACKUP_PATH}" "${PREFIX}" || RESTORE_FAILED+=("${PREFIX} (the previous install is still at ${BACKUP_PATH})")
+  fi
+
+  # Only the directories this run created, only if empty, after everything
+  # that could have been inside them is gone (the prefix's parent too) (cr3
+  # review 3: never one that was there, however empty).
+  remove_created_dirs
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  # Enabled again exactly where they were enabled before (CORE-M2: the restored
+  # install used to run until the next reboot and then never start), and the
+  # services this run stopped are started again; a service that was not running
+  # before is left as it was.
+  local u
+  for u in "${PRIOR_ENABLED[@]}"; do
+    systemctl enable "${u}" >/dev/null 2>&1 || true
+  done
+  if [ "${SERVICES_STOPPED}" -eq 1 ]; then
+    info "restarting the previous anasd/anas"
     systemctl restart anasd anas >/dev/null 2>&1 || true
+  fi
+  if [ "${PRIOR_TIMER_ACTIVE}" -eq 1 ]; then
+    systemctl start "${RECYCLE_TIMER}" >/dev/null 2>&1 || true
+  fi
+
+  # The UI integration this run's revert removed was there before it: the
+  # restored install's own integration installer puts it back.
+  if [ "${UI_INSTALLED}" -eq 1 ] && [ "${UI_WAS_PRESENT}" -eq 1 ] \
+     && [ -x "${PREFIX}/packages/pve-integration/install.sh" ]; then
+    info "re-applying the previous PVE UI integration"
+    PVE_TPL="${PVE_TPL:-}" PVE_JS_DIR="${PVE_JS_DIR:-}" APT_HOOK="${APT_HOOK:-}" \
+      "${PREFIX}/packages/pve-integration/install.sh" >/dev/null 2>&1 || true
   fi
 
   echo >&2
-  err "installation failed — rolled back (node unchanged)."
+  if [ "${#RESTORE_FAILED[@]}" -gt 0 ]; then
+    # Never "node unchanged" when something could not be put back (cr3 review 2).
+    err "installation failed — rolled back, but these paths could not be restored:"
+    local p
+    for p in "${RESTORE_FAILED[@]}"; do
+      printf '  - %s\n' "${p}" >&2
+    done
+    err "they hold what this installation wrote; restore them by hand."
+  else
+    err "installation failed — rolled back (node unchanged)."
+  fi
   exit 1
 }
 
@@ -780,12 +1139,17 @@ rollback() {
 install_units() {
   local u
   for u in anasd anas; do
+    note_if_created "${SYSTEMD_DIR}/${u}.service"
     sed "s#/opt/anas#${PREFIX}#g" "${UNIT_SRC}/${u}.service" > "${SYSTEMD_DIR}/${u}.service"
     chmod 0644 "${SYSTEMD_DIR}/${u}.service"
+    # Flushed: XFS can leave a zero-length file after a power loss otherwise.
+    sync -f -- "${SYSTEMD_DIR}/${u}.service"
   done
   for u in "${RECYCLE_SERVICE}" "${RECYCLE_TIMER}"; do
+    note_if_created "${SYSTEMD_DIR}/${u}"
     sed "s#/opt/anas#${PREFIX}#g" "${UNIT_SRC}/${u}" > "${SYSTEMD_DIR}/${u}"
     chmod 0644 "${SYSTEMD_DIR}/${u}"
+    sync -f -- "${SYSTEMD_DIR}/${u}"
   done
   install_iscsi_dropin
 }
@@ -805,8 +1169,8 @@ install_units() {
 # for a not-yet-present unit is inert, not an error. daemon-reload is the
 # caller's job (Phase 1 does one for the ANAS units anyway, and it covers this).
 install_iscsi_dropin() {
-  [ -e "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}" ] || ISCSI_DROPIN_FRESH=1
-  install -d -m 0755 "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}"
+  note_if_created "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}"
+  ensure_dir "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}"
   install -m 0644 "${UNIT_SRC}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}" \
     "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}"
 }
@@ -852,6 +1216,10 @@ sweep_stale_tpl_backup() {
 }
 
 phase1_install() {
+  # Read what a rollback must restore BEFORE the trap arms and before the
+  # first act (CORE-M2).
+  save_prior_state
+  ROLLBACK_SHELL_PID="${BASHPID}"
   trap rollback ERR
   log "Installing ANAS to ${PREFIX} ..."
 
@@ -869,14 +1237,16 @@ phase1_install() {
 
   # 2. Copy app/ -> PREFIX.
   info "copying application files"
-  mkdir -p "$(dirname "${PREFIX}")"
+  ensure_dir "$(dirname "${PREFIX}")"
+  # Set BEFORE the copy (cr3 review 3): PREFIX was absent or moved to the
+  # backup, so whatever is there after a part-way copy is this run's.
+  PREFIX_INSTALLED=1
   cp -a "${APP_SRC}" "${PREFIX}"
   # The tarball and this copy preserve the build host's uid/gid; everything
   # under the prefix is read or executed by root (services, the apt hook) and
   # must be root's. On an upgrade this also repairs an older install. Modes
   # are untouched — only ownership.
   chown -R root:root "${PREFIX}"
-  PREFIX_INSTALLED=1
   # app/VERSION ships in the tarball since 10.10 and rides along in the copy;
   # fall back to the release-root copy so older tarball layouts still stamp it.
   if [ ! -f "${PREFIX}/VERSION" ] && [ -f "${SCRIPT_DIR}/VERSION" ]; then
@@ -890,7 +1260,7 @@ phase1_install() {
   # wires a PROGRAM line in mdadm.conf at pool-create time. Idempotent
   # overwrite on upgrade; a fresh install's rollback removes it.
   info "installing md-event hook -> ${HOOK_DEST}"
-  [ -e "${HOOK_DEST}" ] || HOOK_INSTALLED=1
+  note_if_created "${HOOK_DEST}"
   install -m 0755 "${SCRIPT_DIR}/anas-md-event.sh" "${HOOK_DEST}"
 
   # 2b2. Install the AHR read-cache removal hook and its udev rule (ahrcache.1
@@ -901,9 +1271,11 @@ phase1_install() {
   # never match it — those stay mdadm's business.
   info "installing AHR cache-event hook -> ${CACHE_HOOK_DEST}"
   [ -e "${CACHE_HOOK_DEST}" ] || CACHE_HOOK_INSTALLED=1
+  note_if_created "${CACHE_HOOK_DEST}"
   install -m 0755 "${SCRIPT_DIR}/anas-cache-event.sh" "${CACHE_HOOK_DEST}"
-  install -d "${UDEV_RULES_DIR}"
+  ensure_dir "${UDEV_RULES_DIR}"
   [ -e "${CACHE_RULE_DEST}" ] || CACHE_RULE_INSTALLED=1
+  note_if_created "${CACHE_RULE_DEST}"
   install -m 0644 "${SCRIPT_DIR}/anas-cache.rules" "${CACHE_RULE_DEST}"
   # udev reads its rules from disk on the next reload; a failure here is not
   # fatal (the rule is live after the next boot either way, and the boot rung
@@ -920,8 +1292,9 @@ phase1_install() {
   PVE_TEMPLATE_DIR="${PVE_TEMPLATE_DIR:-/usr/share/pve-manager/templates/default}"
   if [ -d "$(dirname "${PVE_TEMPLATE_DIR}")" ]; then
     info "installing PVE notification templates -> ${PVE_TEMPLATE_DIR}"
-    install -d "${PVE_TEMPLATE_DIR}"
+    ensure_dir "${PVE_TEMPLATE_DIR}"
     for tpl in "${NOTIFY_TEMPLATES[@]}"; do
+      note_if_created "${PVE_TEMPLATE_DIR}/${tpl}"
       install -m 0644 "${SCRIPT_DIR}/templates/${tpl}" "${PVE_TEMPLATE_DIR}/"
     done
   fi
@@ -930,7 +1303,7 @@ phase1_install() {
   # starts, so anas.service's EnvironmentFile and AnasProxy.pm both read the
   # resolved port. Track whether we created it so rollback removes only a file
   # we introduced (an upgrade's pre-existing file is left in place).
-  [ -e "${ANAS_ENV_FILE}" ] || ENV_FILE_FRESH=1
+  note_if_created "${ANAS_ENV_FILE}"
   write_env_file "${RESOLVED_PORT}"
 
   # 3. Install units, enable, (re)start. install_units also lays down the iSCSI
@@ -961,11 +1334,17 @@ phase1_install() {
   local tpl="${PVE_TPL:-/usr/share/pve-manager/index.html.tpl}"
   sweep_stale_tpl_backup
   info "installing PVE UI integration"
-  "${PREFIX}/packages/pve-integration/install.sh"
+  # Set BEFORE the call (cr3 review): an integration installer that fails half
+  # way has already changed the template, the JS or the proxy hook, and the
+  # rollback reverts that partial work with the integration uninstaller.
   UI_INSTALLED=1
+  "${PREFIX}/packages/pve-integration/install.sh"
   local js_dir="${PVE_JS_DIR:-/usr/share/pve-manager/js}"
-  [ -f "${js_dir}/anas.js" ] || { err "UI verify: ${js_dir}/anas.js missing"; return 1; }
-  grep -qF '/pve2/js/anas.js' "${tpl}" || { err "UI verify: script line not present in ${tpl}"; return 1; }
+  # `false`, never `return 1` (cr3 review): bash puts the CALLER's ERR trap
+  # back when a function returns, so a `return 1` here left phase 1 with no
+  # rollback at all; a failing command inside the body fires the trap.
+  [ -f "${js_dir}/anas.js" ] || { err "UI verify: ${js_dir}/anas.js missing"; false; }
+  grep -qF '/pve2/js/anas.js' "${tpl}" || { err "UI verify: script line not present in ${tpl}"; false; }
   info "UI integration verified"
 
   INSTALL_DONE=1

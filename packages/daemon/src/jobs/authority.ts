@@ -1,7 +1,7 @@
 import type { Privilege } from '@anas/shared'
 import type { JobSubmitter } from './queue.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { forbiddenMessage, privilegeSatisfied, RequestHeaders } from '@anas/shared'
+import { decodeUserHeader, forbiddenMessage, hasControlChars, privilegeSatisfied, RequestHeaders, USER_ENCODING_HEADER, USER_ENCODING_PERCENT_UTF8 } from '@anas/shared'
 import { isReadOnlyOperation } from './read-jobs.js'
 
 /**
@@ -55,6 +55,36 @@ const storage = new AsyncLocalStorage<RequestAuthority | null>()
 
 /** Longest header excerpt a refusal line quotes. */
 const QUOTE_MAX = 80
+
+/**
+ * Decode an `x-anas-user` the gateway sent percent-encoded (CORE-M3: a header
+ * value is latin1, a PVE user id is UTF-8), IN PLACE, before anything reads
+ * the header: the identity check, the backstop, the audit line. A marker
+ * naming another encoding, or a value that does not decode, removes the user
+ * header, and the request is then refused as one that names no user (fail
+ * closed). The marker itself is removed so nothing decodes twice.
+ *
+ * Either way, encoded or sent plain (a root socket client, the runners), a
+ * user id carrying a control character or line separator (a TAB, a NEL,
+ * `%0A`, `%00`: the shared single-line rule) is removed the same way: no
+ * legitimate id holds one, and it would land in a job's `createdBy` and the
+ * audit record (cr3 reviews). So is an empty or whitespace-only id: it names
+ * nobody, and it was a 200 with user "" (cr3 review 3).
+ */
+export function decodeRequestUser(headers: Record<string, string | string[] | undefined>): void {
+  const marker = headers[USER_ENCODING_HEADER]
+  let value = headers['x-anas-user']
+  if (marker !== undefined) {
+    delete headers[USER_ENCODING_HEADER]
+    value = marker === USER_ENCODING_PERCENT_UTF8 && typeof value === 'string'
+      ? decodeUserHeader(value)
+      : undefined
+  }
+  if (typeof value !== 'string' || value.trim() === '' || hasControlChars(value))
+    delete headers['x-anas-user']
+  else
+    headers['x-anas-user'] = value
+}
 
 /** Read a request's authority from its headers, with the shared RequestHeaders rule. */
 export function readRequestAuthority(headers: Record<string, string | string[] | undefined>): RequestAuthority {

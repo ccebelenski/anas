@@ -121,6 +121,104 @@ sweep_stale_tpl_backup() {
   fi
 }
 
+# The mdadm.conf PROGRAM line that points mdadm --monitor at ANAS's md-event
+# hook (CORE-L7). The daemon writes `PROGRAM <hook>` when an AHR pool is
+# created and retires it when the last AHR pool is destroyed; an uninstall that
+# deletes the hook while an AHR pool survives used to leave the line pointing
+# at a binary that no longer exists, so every md event of the surviving arrays
+# exec'd nothing. The ARRAY pins stay: they name the arrays on assembly and are
+# useful without ANAS.
+#
+# WHICH LINES (cr3 review 3): every line the DAEMON reads as a PROGRAM line
+# naming exactly our hook (parsers/mdadm-conf.ts parseLine + removeProgram):
+# the keyword case-insensitive and abbreviable to three or more letters
+# (`PROGRAM`, `program`, `PROG`, `pro`), any spacing, anything after the path
+# once a blank separates it (a trailing `# comment`, the `\r` of a CRLF file).
+# Never a line that starts with a blank (a continuation the daemon does not
+# read), a `#` line, a longer path (`...anas-md-event-old`), or a foreign one.
+#
+# HOW (the file assembles arrays at boot): read byte for byte (C locale,
+# `grep -a`: a Latin-1 comment or a NUL is a byte like any other); grep's 0 and
+# 1 are its only successes; the lines are removed by NUMBER with GNU sed
+# (which keeps a missing final newline missing); the result must have exactly
+# the original's line count minus the removed lines and exactly its size minus
+# their bytes, or nothing is renamed; the new file is written in the TARGET's
+# directory (a symlinked mdadm.conf stays a link), carries the target's mode
+# and owner, is flushed (`sync -f`) and renamed over the target. Any failure
+# leaves mdadm.conf exactly as it was and says so; the running monitor is
+# restarted only when the file changed.
+MDADM_CONF="${MDADM_CONF:-/etc/mdadm/mdadm.conf}"
+# Write `$1` minus the line numbers in `$3` (k lines, `$4` bytes) to the temp
+# file `$2` and check it: 0 only when the result is exactly the original's
+# line count minus k and its size minus the removed bytes.
+md_conf_filtered() {
+  local src="$1" tmp="$2" k="$4" bytes="$5" in_lines in_size out_lines out_size
+  # shellcheck disable=SC2086
+  LC_ALL=C sed $3 -- "${src}" > "${tmp}" || return 1
+  in_lines="$(LC_ALL=C grep -a -c '' -- "${src}" || true)"
+  out_lines="$(LC_ALL=C grep -a -c '' -- "${tmp}" || true)"
+  in_size="$(stat -c %s -- "${src}")" || return 1
+  out_size="$(stat -c %s -- "${tmp}")" || return 1
+  [ -n "${in_lines}" ] && [ -n "${out_lines}" ] || return 1
+  [ "${out_lines}" -eq $((in_lines - k)) ] && [ "${out_size}" -eq $((in_size - bytes)) ]
+}
+
+retire_md_program_hook() {
+  local hook="$1" target dir tmp re lines n rc=0 k=0 removed_bytes=0 sed_expr=""
+  [ -e "${MDADM_CONF}" ] || [ -L "${MDADM_CONF}" ] || return 0
+  if ! target="$(readlink -f -- "${MDADM_CONF}")" || [ ! -f "${target}" ]; then
+    warn "${MDADM_CONF} does not resolve to a regular file; ANAS's monitor hook line (PROGRAM ${hook}) was not looked for. Remove it by hand if it is there."
+    return 0
+  fi
+  # The hook path as a literal inside the ERE.
+  re="^[Pp][Rr][Oo]([Gg]([Rr]([Aa]([Mm])?)?)?)?[[:space:]]+$(printf '%s' "${hook}" | LC_ALL=C sed 's/[][\\.*^$+?(){}|]/\\&/g')([[:space:]].*)?$"
+  lines="$(LC_ALL=C grep -a -n -E -- "${re}" "${target}")" || rc=$?
+  if [ "${rc}" -eq 1 ]; then
+    return 0
+  fi
+  if [ "${rc}" -ne 0 ]; then
+    warn "could not read ${target} (grep exited ${rc}); ANAS's monitor hook line (PROGRAM ${hook}) was left in place. Remove it by hand."
+    return 0
+  fi
+  while IFS=: read -r n _; do
+    sed_expr="${sed_expr} -e ${n}d"
+    k=$((k + 1))
+    removed_bytes=$((removed_bytes + $(LC_ALL=C sed -n "${n}p" -- "${target}" | wc -c)))
+  done <<<"${lines}"
+  dir="$(dirname -- "${target}")"
+  if ! tmp="$(mktemp -- "${dir}/.$(basename -- "${target}").anas.XXXXXX")"; then
+    warn "could not create a temporary file in ${dir}; ANAS's monitor hook line (PROGRAM ${hook}) was left in ${target}. Remove it by hand."
+    return 0
+  fi
+  if md_conf_filtered "${target}" "${tmp}" "${sed_expr}" "${k}" "${removed_bytes}" \
+     && chmod --reference="${target}" -- "${tmp}" \
+     && chown --reference="${target}" -- "${tmp}" \
+     && sync -f -- "${tmp}" \
+     && mv -f -T -- "${tmp}" "${target}"; then
+    systemctl try-restart mdmonitor.service >/dev/null 2>&1 || true
+    info "removed ANAS's monitor hook line (PROGRAM ${hook}) from ${MDADM_CONF}; mdadm's own event handling (MAILADDR) applies to the arrays that remain"
+    return 0
+  fi
+  rm -f -- "${tmp:?}"
+  warn "could not rewrite ${target} safely; it was left exactly as it was, and ANAS's monitor hook line (PROGRAM ${hook}) is still in it. Remove that line by hand."
+  return 0
+}
+
+# AHR read caches that survive the uninstall (CORE-L7): the recovery from a
+# lost cache device (`lvconvert --uncache`, AHR §13) is anasd's, triggered by
+# the udev rule this uninstall removes. Without ANAS, a cache device that
+# disappears makes every read on that pool fail until the operator uncaches it
+# by hand. The slices are found by the GPT partition name ANAS wrote
+# (`<pool>-cacheN`), the same name the rule matched. Read-only; says nothing
+# when there are none or lsblk cannot tell.
+warn_surviving_ahr_caches() {
+  local labels
+  labels="$(lsblk -nro PARTLABEL 2>/dev/null | grep -E -- '-cache[0-9]+$' || true)"
+  [ -n "${labels}" ] || return 0
+  warn "AHR read-cache slice(s) remain on this node: $(printf '%s' "${labels}" | tr '\n' ' ')"
+  warn "ANAS recovered a pool automatically when its cache device disappeared; without ANAS, a lost cache device makes every read on that pool fail until you run 'lvconvert --uncache <vg>/<lv>' by hand."
+}
+
 usage() {
   cat <<EOF
 ANAS uninstaller
@@ -161,15 +259,15 @@ log "Uninstalling ANAS (prefix: ${PREFIX})..."
 info "stopping and disabling services"
 systemctl disable --now anasd anas >/dev/null 2>&1 || true
 
-# 2. Revert the PVE UI integration if its uninstaller is still present.
-if [ -x "${PREFIX}/packages/pve-integration/uninstall.sh" ]; then
-  info "reverting PVE UI integration"
-  "${PREFIX}/packages/pve-integration/uninstall.sh" || true
-else
-  info "pve-integration uninstaller not found (skipping)"
-fi
-# 2a. The stale index.html.tpl copy an older install took (review L5).
-sweep_stale_tpl_backup
+# ORDER (cr3.core): the PVE UI integration is reverted LAST, just before the
+# prefix that holds its uninstaller is removed. Its uninstaller restarts
+# pveproxy, and a hard restart kills a shell that runs inside pveproxy's
+# cgroup — the PVE web shell (integration.r1). Run from there, the uninstall
+# used to die at that step with every unit, schedule timer, hook, template and
+# the env file still in place: the schedule timers went on firing runners
+# under ${PREFIX}. Everything that does not need pveproxy is now removed first;
+# a web-shell run that dies at the restart leaves only ${PREFIX} behind, and a
+# re-run removes it.
 
 # 3. Remove the systemd unit files and reload.
 removed_unit=0
@@ -219,10 +317,12 @@ fi
 
 systemctl daemon-reload >/dev/null 2>&1 || true
 
-# 3c. Remove the mdadm md-event hook installed by install.sh. (Any PROGRAM
-# line in mdadm.conf is the daemon's surgical edit, reverted at pool teardown —
-# not touched here.)
+# 3c. Remove the mdadm md-event hook installed by install.sh, and the PROGRAM
+# line that points mdadm --monitor at it when an AHR pool outlives the
+# uninstall (CORE-L7; the daemon retires it itself when the last AHR pool is
+# destroyed). The ARRAY pins are not touched.
 HOOK_DEST="${HOOK_DEST:-/usr/local/bin/anas-md-event}"
+retire_md_program_hook "${HOOK_DEST}"
 if [ -f "${HOOK_DEST}" ]; then
   rm -f "${HOOK_DEST}"
   info "removed md-event hook ${HOOK_DEST}"
@@ -249,6 +349,7 @@ fi
 if [ "${removed_cache_udev}" -eq 1 ]; then
   udevadm control --reload-rules >/dev/null 2>&1 || true
   info "removed AHR cache-event hook ${CACHE_HOOK_DEST} and ${CACHE_RULE_DEST}"
+  warn_surviving_ahr_caches
 fi
 
 # 3d. Remove the ANAS notification templates install.sh drops into pve-manager's
@@ -286,7 +387,18 @@ fi
 # credentials. Deleting it would be an owner's move, not a guest's; a reinstall
 # picks the store straight back up.
 
-# 4. Remove the install prefix.
+# 5. Revert the PVE UI integration if its uninstaller is still present — LAST
+# before the prefix (see ORDER above): it may restart pveproxy.
+if [ -x "${PREFIX}/packages/pve-integration/uninstall.sh" ]; then
+  info "reverting PVE UI integration (pveproxy restarts: a PVE web shell running this closes here; re-run the uninstall to remove ${PREFIX} if it does)"
+  "${PREFIX}/packages/pve-integration/uninstall.sh" || true
+else
+  info "pve-integration uninstaller not found (skipping)"
+fi
+# 5a. The stale index.html.tpl copy an older install took (review L5).
+sweep_stale_tpl_backup
+
+# 6. Remove the install prefix.
 if [ -d "${PREFIX}" ]; then
   info "removing ${PREFIX}"
   rm -rf "${PREFIX}"

@@ -415,11 +415,17 @@ describe('cr.34r executor contracts callers rely on', () => {
     assert.equal(teed.stdout, 'secret\n')
   })
 
-  it('stdin: left OPEN when not given on the buffered path (execFile\'s contract), /dev/null on the tee path', async () => {
+  it('stdin: /dev/null when not given, on both exec paths (cr3.core: a prompting tool fails at once, never waits for the deadline)', async () => {
     const exec = fastExecutor()
-    // An open pipe nobody writes: `cat` waits until `timeout` ends it (124).
+    // Before cr3.core the buffered path left an open pipe nobody wrote, and
+    // `cat` waited until `timeout` ended it (124). `ignore` is /dev/null:
+    // `cat` reads EOF at once.
     const buffered = await exec.exec(SH, ['-c', '/usr/bin/timeout 0.3 cat; echo rc=$?'])
-    assert.equal(buffered.stdout, 'rc=124\n')
+    assert.equal(buffered.stdout, 'rc=0\n')
+    // A tool that asks a question reads EOF and gives up at once.
+    const prompt = await exec.exec(SH, ['-c', 'printf "Password: " >&2; if read -r pw; then echo got; else echo eof; exit 3; fi'])
+    assert.equal(prompt.stdout, 'eof\n')
+    assert.equal(prompt.exitCode, 3)
     // `ignore` is /dev/null: `cat` reads EOF at once.
     const teed = await exec.exec(SH, ['-c', '/usr/bin/timeout 0.3 cat; echo rc=$?'], { onStderr: () => {} })
     assert.equal(teed.stdout, 'rc=0\n')

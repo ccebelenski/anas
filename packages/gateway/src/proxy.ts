@@ -1,9 +1,13 @@
 import type { FastifyReply, FastifyRequest } from 'fastify'
+import type { TLSSocket } from 'node:tls'
 import type { AuthUser } from './auth/index.js'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, X509Certificate } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
-import { Agent as HttpsAgent, request as httpsRequest } from 'node:https'
+import { request as httpsRequest } from 'node:https'
+import { join } from 'node:path'
+import { connect as tlsConnect } from 'node:tls'
+import { encodeUserHeader, USER_ENCODING_HEADER, USER_ENCODING_PERCENT_UTF8, userHeaderNeedsEncoding } from '@anas/shared'
 
 /** Response headers passed straight back to the browser (the 409 confirm contract). */
 const PASSTHROUGH_RESPONSE_HEADERS = [
@@ -165,12 +169,25 @@ export async function proxyToLocalSocket(
 
   if (opts.user) {
     // The full PVE user id, realm included (cr.27: `alice@pve` is not the
-    // local `alice`); the uid only for a `@pam` user, -1 otherwise.
-    headers['x-anas-user'] = opts.user.name
+    // local `alice`); the uid only for a `@pam` user, -1 otherwise. A header
+    // value is latin1, a PVE user id is UTF-8: an id that is not plain ASCII
+    // goes percent-encoded with the marker the daemon decodes (CORE-M3); an
+    // id that cannot be encoded is not sent, and the daemon refuses the
+    // request rather than act for a name it cannot read.
+    if (userHeaderNeedsEncoding(opts.user.name)) {
+      const encoded = encodeUserHeader(opts.user.name)
+      if (encoded !== undefined) {
+        headers['x-anas-user'] = encoded
+        headers[USER_ENCODING_HEADER] = USER_ENCODING_PERCENT_UTF8
+      }
+    }
+    else {
+      headers['x-anas-user'] = opts.user.name
+    }
     headers['x-anas-user-uid'] = String(opts.user.uid)
     // What PVE granted on `/`, as pveproxy signed it (WAVE2-DESIGN A3.1: the
-    // daemon's job-queue backstop, cr.28, reads it; an absent header means a
-    // root socket client).
+    // daemon's job-queue backstop, cr.28, reads it; a request without it is
+    // refused, cr.28: there is no "absent means trusted").
     headers[PRIVILEGES_HEADER] = opts.user.privileges.join(',')
   }
 
@@ -254,6 +271,9 @@ export async function proxyToLocalSocket(
   }
 }
 
+/** pmxcfs's per-node directory (`/etc/pve/nodes/<node>/`). */
+export const DEFAULT_PVE_NODES_DIR = '/etc/pve/nodes'
+
 let cachedCaPath: string | undefined
 let cachedCa: string | Buffer | undefined
 
@@ -297,7 +317,9 @@ function loadClusterCa(request: FastifyRequest, caPath: string): string | Buffer
  * user and signs a fresh hand-off with its own key (cr.27: a gateway believes
  * only its local pveproxy's assertion; nothing from this hop is trusted), and
  * PVE's `CSRFPreventionToken` header with it when the browser sent one. The
- * TLS hop is verified against the cluster CA (fail-closed if it is unreadable).
+ * TLS hop is verified against the cluster CA (fail-closed if it is unreadable)
+ * or, for a node serving a custom/ACME certificate, against the exact
+ * certificate pmxcfs holds for it (CORE-M1, `connectVerifiedPeer`).
  * Connection failure → 502 NODE_UNREACHABLE — including a connect that never
  * COMPLETES (a firewalled/black-holed peer whose SYN is dropped): Node's
  * request `timeout` also fires while the connect is still pending, and there
@@ -332,10 +354,117 @@ export function resolveNodeAddress(node: string, membersPath: string): string | 
   }
 }
 
+/** The first PEM certificate block of a bundle (the leaf of a full chain). */
+const FIRST_PEM_CERT_RE = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/
+
+/**
+ * The file pmxcfs holds for a node's custom (pveproxy) certificate, relative
+ * to the cluster's `nodes/` directory: what that node's pveproxy serves in
+ * place of the cluster-CA-signed `pve-ssl.pem` when the operator uploaded one
+ * or ACME ordered one (cr3.core CORE-M1).
+ */
+export const PEER_CUSTOM_CERT_FILE = 'pveproxy-ssl.pem'
+
+/**
+ * The SHA-256 fingerprint (Node's `AB:CD:...` spelling, the one
+ * `getPeerCertificate().fingerprint256` uses) of the first certificate in a
+ * PEM bundle, or undefined when the text holds no parseable certificate.
+ */
+export function pemLeafFingerprint(pem: string): string | undefined {
+  const block = FIRST_PEM_CERT_RE.exec(pem)
+  if (!block)
+    return undefined
+  try {
+    return new X509Certificate(block[0]).fingerprint256
+  }
+  catch {
+    return undefined
+  }
+}
+
+/**
+ * The fingerprint of the custom certificate pmxcfs holds for `node`
+ * (`<nodesDir>/<node>/pveproxy-ssl.pem`), read fresh on every forward (ACME
+ * renews it). Any miss (no custom certificate, unreadable, not a certificate)
+ * is undefined: the hop then accepts only a cluster-CA chain, exactly as before.
+ */
+export function readPeerCertPin(nodesDir: string, node: string): string | undefined {
+  if (node === '.' || node === '..' || node.includes('/'))
+    return undefined
+  try {
+    return pemLeafFingerprint(readFileSync(join(nodesDir, node, PEER_CUSTOM_CERT_FILE), 'utf8'))
+  }
+  catch {
+    return undefined
+  }
+}
+
+/**
+ * Open the TLS session to a peer and decide whether it is that node BEFORE a
+ * byte of the request (the operator's PVEAuthCookie) is written (CORE-M1).
+ *
+ * A peer is accepted when EITHER
+ *   - its chain verifies against the cluster CA and its certificate names the
+ *     node (Node's own chain + identity check: the only rule before cr3), or
+ *   - the certificate it presented is exactly (SHA-256) the one pmxcfs holds
+ *     for that node in `pveproxy-ssl.pem`: the certificate a node with a custom
+ *     or ACME certificate serves, and the fingerprint PVE's own cross-node
+ *     proxy compares against.
+ * Anything else is refused with the verifier's reason. The socket is opened
+ * with `rejectUnauthorized: false` only so the second rule can be applied; the
+ * caller writes nothing until this promise resolves.
+ */
+function connectVerifiedPeer(opts: {
+  address: string
+  port: number
+  node: string
+  ca: string | Buffer
+  pin: string | undefined
+  timeoutMs: number
+}): Promise<TLSSocket> {
+  return new Promise<TLSSocket>((resolve, reject) => {
+    const socket = tlsConnect({
+      host: opts.address,
+      port: opts.port,
+      // TLS SNI + cert-identity check uses the node NAME (PVE certs carry it
+      // in the SAN), while we connect to the resolved IP.
+      servername: opts.node,
+      ca: opts.ca,
+      rejectUnauthorized: false,
+    })
+    // The CONNECT budget covers TCP and TLS (cr.35): a down-but-not-refused
+    // peer never answers the SYN, and its expiry is a plain error
+    // (NODE_UNREACHABLE).
+    const timer = setTimeout(() => {
+      socket.destroy(new Error(`connection attempt to ${opts.node} timed out after ${opts.timeoutMs}ms`))
+    }, opts.timeoutMs)
+    socket.once('error', (err) => {
+      clearTimeout(timer)
+      reject(err)
+    })
+    socket.once('secureConnect', () => {
+      clearTimeout(timer)
+      if (socket.authorized) {
+        resolve(socket)
+        return
+      }
+      const presented = socket.getPeerCertificate()?.fingerprint256
+      if (opts.pin !== undefined && presented === opts.pin) {
+        resolve(socket)
+        return
+      }
+      const reason = String(socket.authorizationError ?? 'certificate not verified')
+      const err = new Error(`its certificate is not trusted (${reason}): it neither chains to the cluster CA for '${opts.node}' nor is the certificate the cluster holds for that node (${PEER_CUSTOM_CERT_FILE})`)
+      socket.destroy()
+      reject(err)
+    })
+  })
+}
+
 export async function forwardToNode(
   request: FastifyRequest,
   reply: FastifyReply,
-  opts: { node: string, pvePort: number, clusterCa: string, membersPath: string, connectTimeoutMs?: number, responseTimeoutMs?: number },
+  opts: { node: string, pvePort: number, clusterCa: string, membersPath: string, pveNodesDir?: string, connectTimeoutMs?: number, responseTimeoutMs?: number },
 ): Promise<void> {
   // Overridable for tests (the real budgets are 5 s and 25 s waits);
   // production always runs at FORWARD_CONNECT_TIMEOUT_MS / FORWARD_RESPONSE_TIMEOUT_MS.
@@ -393,15 +522,27 @@ export async function forwardToNode(
     headers['content-length'] = String(body.length)
 
   try {
+    // TCP + TLS + the peer's identity, inside the connect budget; nothing is
+    // written to the peer until it is proven to be the node (CORE-M1).
+    const socket = await connectVerifiedPeer({
+      address,
+      port: opts.pvePort,
+      node: opts.node,
+      ca,
+      pin: readPeerCertPin(opts.pveNodesDir ?? DEFAULT_PVE_NODES_DIR, opts.node),
+      timeoutMs: connectTimeoutMs,
+    })
     const result = await new Promise<UpstreamResult>((resolve, reject) => {
-      // Started at the TLS handshake (below); declared here for the response handler.
+      // Two timers, two meanings (cr.35). The connect budget (TCP + TLS) ended
+      // above. The RESPONSE budget starts now that the TLS session is up: a
+      // peer that CONNECTED and then never answered is reachable; the
+      // operation is what is slow or hung (GATEWAY_TIMEOUT). It is longer than
+      // the peer's own 20 s socket budget, so a peer whose anasd hangs answers
+      // its own 504 (naming itself) before this one fires.
       let responseTimer: NodeJS.Timeout | undefined
       const req = httpsRequest(
         {
           host: address,
-          // TLS SNI + cert-identity check uses the node NAME (PVE certs carry it
-          // in the SAN), while we connect to the resolved IP. Verified against
-          // the cluster CA below.
           servername: opts.node,
           port: opts.pvePort,
           method: request.method,
@@ -409,7 +550,8 @@ export async function forwardToNode(
           // pveproxy routes this to that node's gateway.
           path: `${ANAS_PROXY_PREFIX}${request.url}`,
           headers,
-          agent: new HttpsAgent({ ca }),
+          // The verified session above, never a fresh unverified one.
+          createConnection: () => socket,
         },
         (res) => {
           const chunks: Buffer[] = []
@@ -424,30 +566,12 @@ export async function forwardToNode(
           })
         },
       )
-      // Two timers, two meanings (cr.35). The CONNECT budget covers TCP and
-      // TLS: a down-but-not-refused peer (firewall drop, partition) never
-      // answers the SYN, and "the node is reachable" may only be claimed once a
-      // connection was made — so its expiry is a plain error, NODE_UNREACHABLE.
-      // The RESPONSE budget starts when the TLS session is up: a peer that
-      // CONNECTED and then never answered is reachable; the operation is what
-      // is slow or hung (GATEWAY_TIMEOUT). It is longer than the peer's own
-      // 20 s socket budget, so a peer whose anasd hangs answers its own 504
-      // (naming itself) before this one fires.
-      const connectTimer = setTimeout(() => {
-        req.destroy(new Error(`connection attempt to ${opts.node} timed out after ${connectTimeoutMs}ms`))
-      }, connectTimeoutMs)
-      req.on('socket', (s) => {
-        s.once('secureConnect', () => {
-          clearTimeout(connectTimer)
-          responseTimer = setTimeout(() => {
-            const err = new Error(`connection to ${opts.node} timed out after ${responseTimeoutMs}ms`) as NodeJS.ErrnoException
-            err.code = 'ANAS_FORWARD_TIMEOUT'
-            req.destroy(err)
-          }, responseTimeoutMs)
-        })
-      })
+      responseTimer = setTimeout(() => {
+        const err = new Error(`connection to ${opts.node} timed out after ${responseTimeoutMs}ms`) as NodeJS.ErrnoException
+        err.code = 'ANAS_FORWARD_TIMEOUT'
+        req.destroy(err)
+      }, responseTimeoutMs)
       req.on('error', (err) => {
-        clearTimeout(connectTimer)
         clearTimeout(responseTimer)
         reject(err)
       })

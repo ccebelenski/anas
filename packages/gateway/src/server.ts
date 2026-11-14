@@ -180,6 +180,7 @@ export function createServer(opts: ServerOptions = {}) {
       pvePort: config.pvePort,
       clusterCa: config.clusterCa,
       membersPath: config.membersPath,
+      ...(config.pveNodesDir !== undefined ? { pveNodesDir: config.pveNodesDir } : {}),
       ...(config.forwardConnectTimeoutMs !== undefined ? { connectTimeoutMs: config.forwardConnectTimeoutMs } : {}),
       ...(config.forwardResponseTimeoutMs !== undefined ? { responseTimeoutMs: config.forwardResponseTimeoutMs } : {}),
     })

@@ -225,36 +225,47 @@ cp -a "${PRUNE_TMP}/node_modules" "${APP}/node_modules"
 NM_SIZE="$(du -sh "${APP}/node_modules" | awk '{print $1}')"
 log "Pruned node_modules: ${NM_SIZE}"
 
-# --- 5. Smoke test: daemon + gateway must BOOT on the pruned node_modules ---
-log "Smoke-testing daemon and gateway boot (pruned node_modules only)..."
+# --- 5. Smoke test: daemon + gateway must LOAD on the pruned node_modules ---
+log "Smoke-testing daemon module graph and gateway boot (pruned node_modules only)..."
 SMOKE_SOCK="$(mktemp -u /tmp/anas-smoke.XXXXXX.sock)"
 SMOKE_PORT=31743
 smoke_fail=0
 
-# Daemon: boots and creates its unix socket.
+# Daemon: every module its entry point imports must load (CORE-L10). The
+# daemon is NOT started: a real boot runs the AHR boot scan, the iSCSI
+# quarantine and the self-heal reconcile, and on a build host that is a PVE
+# node (as root) those would act on the node beside its live anasd. `--mock`
+# is no way out either: its fixtures are not part of the release tree. So the
+# check imports exactly what dist/index.js imports (read from the file, so a
+# new import is covered without editing this list): module resolution over the
+# whole graph, no boot work. Both import forms count, `import { x } from
+# './a.js'` and the side-effect `import './b.js'` (cr3 review), and index.js
+# itself is parsed with `node --check` (its own syntax, which importing the
+# others never reads).
 DAEMON_LOG="$(mktemp)"
-ANASD_SOCKET="${SMOKE_SOCK}" node "${APP}/packages/daemon/dist/index.js" >"${DAEMON_LOG}" 2>&1 &
-DAEMON_PID=$!
-for _ in $(seq 1 30); do
-  [ -S "${SMOKE_SOCK}" ] && break
-  kill -0 "${DAEMON_PID}" 2>/dev/null || break
-  sleep 0.2
-done
-if grep -qiE "MODULE_NOT_FOUND|Cannot find (module|package)" "${DAEMON_LOG}"; then
-  err "daemon smoke test: module resolution failure"
+DAEMON_DIST="${APP}/packages/daemon/dist"
+mapfile -t DAEMON_IMPORTS < <(grep -oE "(from|import) '\./[^']+'" "${DAEMON_DIST}/index.js" | sed -E "s/^(from|import) '\.\/([^']+)'$/\2/" | sort -u)
+if ! node --check "${DAEMON_DIST}/index.js" >"${DAEMON_LOG}" 2>&1; then
+  err "daemon smoke test: ${DAEMON_DIST}/index.js does not parse"
   cat "${DAEMON_LOG}" >&2
   smoke_fail=1
-elif kill -0 "${DAEMON_PID}" 2>/dev/null && [ -S "${SMOKE_SOCK}" ]; then
-  log "  daemon booted (socket ${SMOKE_SOCK} created)"
+elif [ "${#DAEMON_IMPORTS[@]}" -eq 0 ]; then
+  err "daemon smoke test: found no imports in ${DAEMON_DIST}/index.js"
+  smoke_fail=1
+elif node --input-type=module -e '
+    const [dist, ...mods] = process.argv.slice(1)
+    for (const m of mods) await import(`${dist}/${m}`)
+  ' "${DAEMON_DIST}" "${DAEMON_IMPORTS[@]}" >"${DAEMON_LOG}" 2>&1; then
+  log "  daemon module graph loads (${#DAEMON_IMPORTS[@]} entry imports; the daemon was not started)"
 else
-  err "daemon smoke test: process did not stay up / no socket"
+  err "daemon smoke test: the module graph does not load"
   cat "${DAEMON_LOG}" >&2
   smoke_fail=1
 fi
 
 # Gateway: boots and listens. Use the dev auth provider and no PVE certs so it
 # serves plain HTTP on a throwaway port — we only assert it does not crash on a
-# missing module. It talks to the daemon socket above.
+# missing module. No daemon is running (see above): the gateway boots without one.
 # ANAS_ALLOW_INSECURE_DEV_AUTH=1: the startup guard aborts dev auth on a real PVE
 # node (when /etc/pve/authkey.pub exists). Building a release ON a PVE node is a
 # legitimate case, and this is a throwaway localhost boot torn down seconds later
@@ -280,10 +291,9 @@ else
   smoke_fail=1
 fi
 
-# Tear down smoke processes.
-kill "${GATEWAY_PID}" "${DAEMON_PID}" 2>/dev/null || true
+# Tear down the smoke gateway.
+kill "${GATEWAY_PID}" 2>/dev/null || true
 wait "${GATEWAY_PID}" 2>/dev/null || true
-wait "${DAEMON_PID}" 2>/dev/null || true
 rm -f "${SMOKE_SOCK}" "${DAEMON_LOG}" "${GATEWAY_LOG}"
 
 if [ "${smoke_fail}" -ne 0 ]; then

@@ -8,6 +8,7 @@ import { currentRequestAuthority } from '../jobs/authority.js'
 import { parseExports } from '../parsers/exports.js'
 import { readZfsMountpoints } from '../parsers/pve-storage.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
+import { probeSharePath, probeSharePaths } from '../services/share-path.js'
 
 // GET /v1/fs/browse?path=<abs> — read-only directory listing for the UI's
 // directory picker and gentle path validation (Epic 16.9). It lists, it never
@@ -44,8 +45,12 @@ import { parseSmbConf } from '../parsers/smb-conf.js'
 const MAX_DIRS = 500
 
 export interface FsRouteOptions {
-  /** For `zfs list` (the dataset mountpoints); without one, no dataset roots. */
-  executor?: CommandExecutor
+  /**
+   * REQUIRED (cr3 review 3): the bounded probe of the path and of every
+   * managed root runs through it (readerPathGate), and `zfs list` (the dataset
+   * mountpoints). A caller that could omit it got the bound without the probe.
+   */
+  executor: CommandExecutor
   /** smb.conf location (default /etc/samba/smb.conf). */
   smbConfPath?: string
   /** /etc/exports location (default /etc/exports). */
@@ -90,17 +95,103 @@ async function readManagedRoots(opts: FsRouteOptions, log: FastifyBaseLogger): P
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
       log.warn(`fs.browse: ${exportsFile} unreadable — no NFS export roots (${err instanceof Error ? err.message : String(err)})`)
   }
-  if (opts.executor) {
-    const zfs = await readZfsMountpoints(opts.executor)
-    if (zfs === null)
-      log.warn('fs.browse: zfs list unreadable — no dataset roots')
-    else
-      roots.push(...zfs.map(z => z.mountpoint))
-  }
+  const zfs = await readZfsMountpoints(opts.executor)
+  if (zfs === null)
+    log.warn('fs.browse: zfs list unreadable — no dataset roots')
+  else
+    roots.push(...zfs.map(z => z.mountpoint))
   return roots
 }
 
-export async function fsRoutes(server: FastifyInstance, opts: FsRouteOptions = {}) {
+/** Why a path is refused to the current requester (the 403's body). */
+export interface ReaderPathRefusal {
+  code: 'FORBIDDEN'
+  message: string
+}
+
+/**
+ * The reader bound (cr.62). Null when the current request may see `path`: it
+ * holds Sys.Modify, or it is the daemon's own work (no request), or `path`
+ * (its REAL path) lies inside a managed root that is not `/`. Otherwise the
+ * refusal, already logged. It resolves the real path IN PROCESS, so it is only
+ * ever reached through {@link readerPathGate}, after the bounded probe.
+ */
+async function readerPathRefusal(path: string, opts: FsRouteOptions, log: FastifyBaseLogger): Promise<ReaderPathRefusal | null> {
+  // `null` authority is the daemon's own work (no HTTP request), never a client.
+  const authority = currentRequestAuthority()
+  const mayModify = authority === null
+    || (authority.privileges !== null && privilegeSatisfied(authority.privileges, 'Sys.Modify'))
+  if (mayModify)
+    return null
+  const normal = resolve(path)
+  const real = await realOrNearest(normal)
+  const listed = opts.managedRoots ? await opts.managedRoots() : await readManagedRoots(opts, log)
+  const candidates = [...new Set(listed.filter(r => r.startsWith('/')).map(r => resolve(r)).filter(r => r !== '/'))]
+  // Every root goes through the same bounded probe as the path before this
+  // process resolves it (cr3 review 3): a share root under a dead NFS mount
+  // pinned a libuv pool thread on every reader browse. A root that does not
+  // answer is skipped for this request (a missing fact only tightens the
+  // bound) and logged; it is never awaited in process.
+  const probes = await probeSharePaths(opts.executor, candidates)
+  const answering = candidates.filter((r) => {
+    const probe = probes.get(r)
+    if (probe?.state !== 'not-answering')
+      return true
+    log.warn(`fs.browse: managed root ${r} is not answering (${probe.detail ?? 'no detail'}) — not a root for this request`)
+    return false
+  })
+  const roots = await Promise.all(answering.map(realOrNearest))
+  if (roots.some(r => r !== '/' && isPathWithin(r, real)))
+    return null
+  const user = authority?.user ?? 'this user'
+  log.warn(`[authz] fs.browse refused: ${user} (no Sys.Modify) asked for ${normal}${real === normal ? '' : ` (${real})`}, outside every share, export and dataset mountpoint`)
+  return {
+    code: 'FORBIDDEN',
+    message: `${forbiddenMessage(user, 'Sys.Modify')} Without it, browsing is limited to the node's shares, exports and dataset mountpoints, and ${normal} is outside them.`,
+  }
+}
+
+/** A gate's refusal: the HTTP status and the ANAS error envelope's body. */
+export interface ReaderPathGateRefusal {
+  status: 403 | 503
+  error: { code: 'FORBIDDEN' | 'UNAVAILABLE', message: string }
+}
+
+/**
+ * The ONE door every route that lists a path as root goes through (cr3 review
+ * 2): `/fs/browse` itself, and the cloud preview's inline local source (which
+ * calls this instead of injecting a request at `/v1/fs/browse`). In this
+ * order, so no caller can get it wrong:
+ *
+ *  1. the bounded probe (services/share-path.ts: a child `stat` under 2 s,
+ *     then KILL) before anything in THIS process touches the path: a path
+ *     under a dead hard NFS mount never returns from a stat, and in process it
+ *     pinned a libuv pool thread for good. Such a path is 503 UNAVAILABLE
+ *     "not answering" (all a reader learns is that it does not answer).
+ *     The executor is required: there is no gate without the probe;
+ *  2. the reader bound (cr.62): 403 FORBIDDEN naming Sys.Modify outside the
+ *     managed roots.
+ *
+ * Null when the path may be listed. `path` is normalised here.
+ */
+export async function readerPathGate(path: string, opts: FsRouteOptions, log: FastifyBaseLogger): Promise<ReaderPathGateRefusal | null> {
+  const normal = resolve(path)
+  const probe = await probeSharePath(opts.executor, normal)
+  if (probe.state === 'not-answering') {
+    log.warn(`fs.browse: ${normal} is not answering (${probe.detail ?? 'no detail'})`)
+    return {
+      status: 503,
+      error: {
+        code: 'UNAVAILABLE',
+        message: `${normal} is not answering (${probe.detail ?? 'the stat did not return'}): a network mount whose server is gone does this. Nothing under it can be listed until it answers.`,
+      },
+    }
+  }
+  const refusal = await readerPathRefusal(normal, opts, log)
+  return refusal ? { status: 403, error: refusal } : null
+}
+
+export async function fsRoutes(server: FastifyInstance, opts: FsRouteOptions) {
   server.get<{
     Querystring: { path?: string, files?: string }
   }>('/fs/browse', async (request, reply) => {
@@ -119,28 +210,11 @@ export async function fsRoutes(server: FastifyInstance, opts: FsRouteOptions = {
     // games survive: the caller sees exactly what was inspected.
     const path = resolve(parsed.data)
 
-    // cr.62 (review L11): a reader browses only inside the managed roots.
-    // `null` authority is the daemon's own work (no HTTP request), never a client.
-    const authority = currentRequestAuthority()
-    const mayModify = authority === null
-      || (authority.privileges !== null && privilegeSatisfied(authority.privileges, 'Sys.Modify'))
-    if (!mayModify) {
-      const real = await realOrNearest(path)
-      const listed = opts.managedRoots ? await opts.managedRoots() : await readManagedRoots(opts, request.log)
-      const roots = await Promise.all(
-        listed.filter(r => r.startsWith('/')).map(r => resolve(r)).filter(r => r !== '/').map(realOrNearest),
-      )
-      if (!roots.some(r => r !== '/' && isPathWithin(r, real))) {
-        const user = authority?.user ?? 'this user'
-        request.log.warn(`[authz] fs.browse refused: ${user} (no Sys.Modify) asked for ${path}${real === path ? '' : ` (${real})`}, outside every share, export and dataset mountpoint`)
-        return reply.status(403).send({
-          error: {
-            code: 'FORBIDDEN',
-            message: `${forbiddenMessage(user, 'Sys.Modify')} Without it, browsing is limited to the node's shares, exports and dataset mountpoints, and ${path} is outside them.`,
-          },
-        })
-      }
-    }
+    // The bounded probe, then the reader bound (readerPathGate: one door,
+    // one order, shared with every other route that lists a path as root).
+    const refused = await readerPathGate(path, opts, request.log)
+    if (refused)
+      return reply.status(refused.status).send({ error: refused.error })
 
     // stat (not lstat) so a symlink to a directory reports 'dir' and lists.
     let type: FsEntryType

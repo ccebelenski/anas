@@ -33,7 +33,7 @@ check() {
   fi
 }
 
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d -p "${ANAS_TEST_TMPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" .scratch.XXXXXX)"
 trap 'rm -rf "${TMP}"' EXIT
 
 # --- shims: capture logger/perl argv, one line each -------------------------

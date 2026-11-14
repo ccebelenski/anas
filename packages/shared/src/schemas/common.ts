@@ -3,29 +3,44 @@ import { z } from 'zod'
 // --- Reusable validators ---
 
 /**
- * True if `s` contains any ASCII control character (C0 range 0x00–0x1F, or DEL
- * 0x7F) — NUL, TAB, newline, carriage return, etc. Space (0x20) and every
- * printable character are allowed. Implemented as a char-code scan (not a
- * control-character regex) so it stays lint-clean and unambiguous.
+ * True if `s` contains a control character or a Unicode line separator:
+ *
+ *  - C0 (0x00–0x1F) and DEL (0x7F): NUL, TAB, newline, carriage return, ...;
+ *  - C1 (0x80–0x9F), which holds NEL (U+0085, a line break to Python's
+ *    `splitlines`, and so to rtslib/targetcli) and no printable character;
+ *  - LINE SEPARATOR (U+2028) and PARAGRAPH SEPARATOR (U+2029): line
+ *    terminators to every JavaScript regex (`.` stops at them, `^`/`$` with
+ *    the m flag match at them), so a value carrying one reads back from a
+ *    config file as two lines in ANAS's own parsers (cr3.core).
+ *
+ * Space (0x20) and every other printable character are allowed, including
+ * non-ASCII text and non-ASCII spaces (a Japanese comment's U+3000, a pasted
+ * U+00A0): they end no line in any reader ANAS writes for. A reader that
+ * SPLITS a value on whitespace (a list entry, an option token) needs its own,
+ * wider rule. Implemented as a char-code scan (not a control-character regex)
+ * so it stays lint-clean and unambiguous.
  *
  * Security: control characters are the vehicle for config/command injection
  * across ANAS — a newline forges an extra /etc/fstab, smb.conf, or /etc/exports
  * line (or an extra systemd `ExecStart=` directive) and a NUL truncates. We
  * reject them at the schema boundary while preserving every legitimate printable
- * character (spaces in paths/comments, `.`/`:`/`-` in ZFS names, etc.).
+ * character (spaces in paths/comments, `.`/`:`/`-` in ZFS names, etc.). Every
+ * config writer's own gate (smb.conf, /etc/exports, rclone.conf, unit files)
+ * asks this same function, so the rule is one rule.
  */
 export function hasControlChars(s: string): boolean {
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i)
-    if (c <= 0x1F || c === 0x7F)
+    if (c <= 0x1F || (c >= 0x7F && c <= 0x9F) || c === 0x2028 || c === 0x2029)
       return true
   }
   return false
 }
 
 /**
- * A single-line string: any printable text WITHOUT control characters (no
- * newline/CR/TAB/NUL). Used for values written verbatim into line-based config
+ * A single-line string: any printable text WITHOUT control characters or line
+ * separators ({@link hasControlChars}: no newline/CR/TAB/NUL, no C1/NEL, no
+ * U+2028/U+2029). Used for values written verbatim into line-based config
  * files (smb.conf parameters, /etc/exports specs & options, fstab spec) where a
  * control character would break out of its field/line. Spaces and printable
  * punctuation are preserved.
@@ -232,8 +247,9 @@ export const NewShareName = ShareName.superRefine((name, ctx) => {
 })
 
 /**
- * Absolute filesystem path, no traversal. Rejects control characters (newline,
- * CR, TAB, NUL, …) so a path can never break out of its line/field when written
+ * Absolute filesystem path, no traversal. Rejects control characters and line
+ * separators ({@link hasControlChars}: newline, CR, TAB, NUL, C1/NEL,
+ * U+2028/U+2029, ...) so a path can never break out of its line/field when written
  * into /etc/fstab, smb.conf, or /etc/exports. Spaces and printable punctuation
  * are preserved — a path like `/mnt/My Data` is legitimate (exports.ts
  * double-quotes whitespace paths).
@@ -280,6 +296,58 @@ export const DiskId = z.string().min(1).regex(/^[\w.-]+$/, 'Invalid disk by-id i
  */
 export const NotifyMode = z.enum(['always', 'on-failure'])
 export type NotifyMode = z.infer<typeof NotifyMode>
+
+// --- The user id on the gateway -> anasd hop (cr3.core CORE-M3) ---
+
+/**
+ * A PVE user id is UTF-8 (`用户@pve`), but an HTTP header value is latin1:
+ * Node refuses to send a character above U+00FF (ERR_INVALID_CHAR), which
+ * turned every request of such a user into a 502 "anasd unavailable". The
+ * gateway therefore sends a user id that is not plain printable ASCII (or that
+ * holds a `%`) percent-encoded as UTF-8 and says so in this header; the daemon
+ * decodes it before anything reads `x-anas-user`. A plain ASCII id goes as it
+ * always did, with no marker, so the systemd runners, the udev script and a
+ * root socket client keep sending what they send today.
+ */
+export const USER_ENCODING_HEADER = 'x-anas-user-encoding'
+/** The one encoding {@link USER_ENCODING_HEADER} names. */
+export const USER_ENCODING_PERCENT_UTF8 = 'percent-utf8'
+
+/** True when `userid` cannot travel as a raw header value unambiguously. */
+export function userHeaderNeedsEncoding(userid: string): boolean {
+  for (let i = 0; i < userid.length; i++) {
+    const c = userid.charCodeAt(i)
+    if (c < 0x21 || c > 0x7E || c === 0x25)
+      return true
+  }
+  return false
+}
+
+/**
+ * The `x-anas-user` value for `userid`, percent-encoded as UTF-8; undefined
+ * when the string is not well-formed Unicode (a lone surrogate), which a user
+ * id decoded from a signed assertion never is: the caller then sends no user,
+ * which the daemon refuses (fail closed).
+ */
+export function encodeUserHeader(userid: string): string | undefined {
+  try {
+    return encodeURIComponent(userid)
+  }
+  catch {
+    return undefined
+  }
+}
+
+/** The user id an encoded `x-anas-user` carries; undefined when malformed. */
+export function decodeUserHeader(value: string): string | undefined {
+  try {
+    const decoded = decodeURIComponent(value)
+    return decoded.length > 0 ? decoded : undefined
+  }
+  catch {
+    return undefined
+  }
+}
 
 // --- Shared formatting ---
 

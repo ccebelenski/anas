@@ -40,7 +40,7 @@ ok()   { printf '  ok   %s\n' "$1"; PASS=$((PASS + 1)); }
 bad()  { printf '  FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); }
 check(){ if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
 
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d -p "${ANAS_TEST_TMPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" .scratch.XXXXXX)"
 trap 'rm -rf "${WORK}"' EXIT
 
 echo "== 1. make-release.sh: tar bakes in root ownership =="
@@ -63,8 +63,12 @@ if [ "${GT_OWN}" = "0/0" ]; then
 else
   bad "the archive records uid/gid 0 for every entry (got '${GT_OWN}')"
 fi
+# The listing is captured first and matched after (cr3 review): `tar | grep -q`
+# under pipefail lets grep exit on its first hit and tar die of SIGPIPE, which
+# pipefail reports as a failure — the check failed about one run in six.
+GT_LIST="$(tar tvzf "${WORK}/rel.tar.gz" --numeric-owner)"
 check "and modes survive the ownership rewrite" \
-  "tar tvzf '${WORK}/rel.tar.gz' --numeric-owner | grep -qE '^-rw-r--r--'"
+  "grep -qE '^-rw-r--r--' <<<\"\${GT_LIST}\""
 
 echo "== 2. install.sh: chown root:root after the copy =="
 check "chown -R root:root \${PREFIX} present" \
@@ -100,6 +104,13 @@ printf '%s | entries=%s\n' "\$*" "\$n" >> "${WORK}/chown.log"
 exit 0
 EOF
 chmod +x "${FAKEBIN}/systemctl" "${FAKEBIN}/curl" "${FAKEBIN}/udevadm" "${FAKEBIN}/chown"
+# Every other system tool the installer could reach is a recording stub too
+# (cr3 review: the health-failure path calls journalctl), and the run below
+# refuses to start unless systemctl resolves to the stub.
+for _tool in journalctl apt apt-get dpkg update-initramfs pveproxy service mdadm; do
+  printf '#!/bin/sh\necho "%s $*" >> "%s"\nexit 0\n' "${_tool}" "${WORK}/stub-calls.log" > "${FAKEBIN}/${_tool}"
+  chmod +x "${FAKEBIN}/${_tool}"
+done
 
 # Lay out a complete release the way make-release.sh does, plus a
 # pve-integration/install.sh stub that performs the two effects phase1
@@ -142,10 +153,11 @@ CACHE_RULE_DEST="${WORK}/udev-rules/99-anas-cache.rules" \
 PVE_TEMPLATE_DIR="${WORK}/pve-templates" \
 PVE_TPL="${PVE_TPL}" \
 PVE_JS_DIR="${WORK}/pve-js" \
+MDADM_CONF="${WORK}/mdadm.conf" \
 ANAS_INSTALL_LIB_ONLY=1 \
 PATH="${FAKEBIN}:${PATH}" \
-  bash -c 'source "$0"; RESOLVED_PORT=3000; HEALTH_PORT=3000; phase1_install' \
-  "${REL}/install.sh" >"${PHASE1_LOG}" 2>&1 || rc=$?
+  bash -c '[ "$(command -v systemctl)" = "$1/systemctl" ] || { echo "systemctl stub not first on PATH" >&2; exit 99; }; set --; source "$0"; RESOLVED_PORT=3000; HEALTH_PORT=3000; phase1_install' \
+  "${REL}/install.sh" "${FAKEBIN}" >"${PHASE1_LOG}" 2>&1 || rc=$?
 
 check "phase1_install completes successfully" "[ ${rc} -eq 0 ]"
 check "chown was called exactly once" "[ \"\$(wc -l < '${WORK}/chown.log' 2>/dev/null || echo 0)\" = '1' ]"

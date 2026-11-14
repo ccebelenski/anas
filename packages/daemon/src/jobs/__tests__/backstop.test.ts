@@ -12,7 +12,7 @@ import { forbiddenMessage } from '@anas/shared'
 import { requireIdentity } from '../../routes/identity.js'
 import { identityHeaders, socketRequester, TASK_RUNNER_USER } from '../../runner-poll.js'
 import { createServer } from '../../server.js'
-import { CANCEL_OPERATION, readRequestAuthority, requiredPrivilege, runAsDaemon, runAsRequest } from '../authority.js'
+import { CANCEL_OPERATION, decodeRequestUser, readRequestAuthority, requiredPrivilege, runAsDaemon, runAsRequest } from '../authority.js'
 import { JobQueue } from '../queue.js'
 import { READ_JOB_OPERATIONS } from '../read-jobs.js'
 
@@ -101,6 +101,71 @@ describe('cr.28 the rule (jobs/authority.ts requiredPrivilege)', () => {
     const garbage = readRequestAuthority(headers('Sys.Modify, Sys.Audit'))
     assert.equal(garbage.privileges, null)
     assert.match(garbage.problem!, /"Sys.Modify, Sys.Audit" is not a privilege list/)
+  })
+})
+
+describe('cr3 CORE-M3: a user id the gateway sent percent-encoded', () => {
+  it('decodeRequestUser decodes the marked header in place and drops the marker; a bad value or unknown marker drops the user (fail closed)', () => {
+    const ok: Record<string, string | undefined> = { 'x-anas-user': '%E7%94%A8%E6%88%B7%40pve', 'x-anas-user-encoding': 'percent-utf8' }
+    decodeRequestUser(ok)
+    assert.deepEqual(ok, { 'x-anas-user': '用户@pve' })
+    const raw: Record<string, string | undefined> = { 'x-anas-user': '50%off@pve' }
+    decodeRequestUser(raw)
+    assert.equal(raw['x-anas-user'], '50%off@pve', 'no marker: the header is read as sent (runners, udev, root clients)')
+    const bad: Record<string, string | undefined> = { 'x-anas-user': '%E7%94', 'x-anas-user-encoding': 'percent-utf8' }
+    decodeRequestUser(bad)
+    assert.equal(bad['x-anas-user'], undefined)
+    // cr3 review: a decoded control character or line separator is refused too.
+    for (const bad of ['alice%0A@pve', 'alice%00@pve', 'alice%E2%80%A8@pve', 'alice%C2%85@pve']) {
+      const h: Record<string, string | undefined> = { 'x-anas-user': bad, 'x-anas-user-encoding': 'percent-utf8' }
+      decodeRequestUser(h)
+      assert.equal(h['x-anas-user'], undefined, bad)
+    }
+    // cr3 review 2: a PLAIN (unencoded) id with a control character is refused the same way.
+    for (const bad of ['alice\t@pve', 'alice\u0085@pve', 'alice\u007F@pve']) {
+      const h: Record<string, string | undefined> = { 'x-anas-user': bad }
+      decodeRequestUser(h)
+      assert.equal(h['x-anas-user'], undefined, JSON.stringify(bad))
+    }
+    const plainOk: Record<string, string | undefined> = { 'x-anas-user': 'system:task-runner' }
+    decodeRequestUser(plainOk)
+    assert.equal(plainOk['x-anas-user'], 'system:task-runner', 'a plain id without control characters is untouched')
+    const other: Record<string, string | undefined> = { 'x-anas-user': 'alice@pve', 'x-anas-user-encoding': 'base64' }
+    decodeRequestUser(other)
+    assert.equal(other['x-anas-user'], undefined)
+  })
+
+  it('the daemon (createServer) sees the decoded name at the identity and the backstop; an undecodable one is a 401', async () => {
+    const lines: string[] = []
+    const server = createServer({ mock: true, logger: { level: 'warn', stream: { write: (l: string) => lines.push(String(JSON.parse(l).msg)) } } })
+    let seen: string | undefined
+    let seenAuthority: string | undefined
+    server.post('/test/who', async (request, reply) => {
+      const identity = requireIdentity(request, reply)
+      if (!identity)
+        return reply
+      seen = identity.user
+      seenAuthority = readRequestAuthority(request.headers).user
+      return { ok: true }
+    })
+    const h = { ...headers('Sys.Audit,Sys.Modify', '%E7%94%A8%E6%88%B7%40pve'), 'x-anas-user-encoding': 'percent-utf8' }
+    const res = await server.inject({ method: 'POST', url: '/test/who', headers: h })
+    assert.equal(res.statusCode, 200, res.body)
+    assert.equal(seen, '用户@pve')
+    assert.equal(seenAuthority, '用户@pve')
+    const badRes = await server.inject({ method: 'POST', url: '/test/who', headers: { ...headers('Sys.Audit,Sys.Modify', '%ZZ'), 'x-anas-user-encoding': 'percent-utf8' } })
+    assert.equal(badRes.statusCode, 401)
+    const nlRes = await server.inject({ method: 'POST', url: '/test/who', headers: { ...headers('Sys.Audit,Sys.Modify', 'root%0Aforged%40pam'), 'x-anas-user-encoding': 'percent-utf8' } })
+    assert.equal(nlRes.statusCode, 401, 'a decoded newline never reaches createdBy or the audit line')
+    // A plain header with a TAB, over the real request path (Node accepts a TAB in a header value).
+    const tabRes = await server.inject({ method: 'POST', url: '/test/who', headers: headers('Sys.Audit,Sys.Modify', 'root\t@pam') })
+    assert.equal(tabRes.statusCode, 401, 'a plain TAB never reaches createdBy or the audit line')
+    // cr3 review 3: an empty or whitespace-only plain id names nobody.
+    for (const blank of ['', ' ', '   ']) {
+      const res = await server.inject({ method: 'POST', url: '/test/who', headers: headers('Sys.Audit,Sys.Modify', blank) })
+      assert.equal(res.statusCode, 401, JSON.stringify(blank))
+    }
+    await server.close()
   })
 })
 

@@ -255,6 +255,10 @@ export class JobQueue {
   readonly watchSlots: number
   /** The lock FIFO's counter: submissions and re-acquires draw from it. */
   private seq = 0
+  /** A {@link drain} pass is running (CORE-L5: never re-entered). */
+  private draining = false
+  /** A drain was asked for while a pass ran: run another pass when it ends. */
+  private drainAgain = false
 
   constructor(opts?: {
     concurrency?: number
@@ -605,11 +609,41 @@ export class JobQueue {
    *
    * A job that does not start holds no slot. When a lock is what stops it,
    * its progress line names the job in its way.
+   *
+   * Never re-entered (cr3.core CORE-L5): a job body runs synchronously from
+   * here up to its first await, and a body that releases its locks, submits,
+   * or throws before that await asks for a drain from INSIDE this loop. That
+   * nested drain used to start the next waiting job, and this loop then
+   * started the same job again from its stale list. A drain asked for while
+   * one runs is now remembered and run once this pass ends, and a record whose
+   * state changed under the pass (started, cancelled) is skipped.
    */
   private drain(): void {
+    if (this.draining) {
+      this.drainAgain = true
+      return
+    }
+    this.draining = true
+    try {
+      do {
+        this.drainAgain = false
+        this.drainPass()
+      } while (this.drainAgain)
+    }
+    finally {
+      this.draining = false
+    }
+  }
+
+  /** One pass of {@link drain} over the FIFO as it stood when the pass began. */
+  private drainPass(): void {
     /** The claims of earlier jobs still queued: a later job may not overtake them. */
     const ahead: LockWait[] = []
     for (const record of this.lockFifo()) {
+      // A body started earlier in this pass may have changed this record
+      // (cancelled it, or started it through a path that does not drain).
+      if (!this.isWaitingForLocks(record))
+        continue
       const wait = this.lockWait(record, ahead)
       // A running job re-acquiring its locks (cr.38) kept its slot: only the
       // locks decide when it goes on.
@@ -661,11 +695,16 @@ export class JobQueue {
   private lockFifo(): JobRecord[] {
     const waiting: JobRecord[] = []
     for (const record of this.jobs.values()) {
-      if ((record.job.status === 'queued' && !record.control) || record.lockState === 'reacquiring')
+      if (this.isWaitingForLocks(record))
         waiting.push(record)
     }
     waiting.sort((a, b) => a.waitSeq - b.waitSeq)
     return waiting
+  }
+
+  /** A queued job (not a control job) or a running job re-acquiring its locks. */
+  private isWaitingForLocks(record: JobRecord): boolean {
+    return (record.job.status === 'queued' && !record.control) || record.lockState === 'reacquiring'
   }
 
   /**

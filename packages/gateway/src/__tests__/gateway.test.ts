@@ -4,7 +4,7 @@ import type { AuthProvider, AuthResult } from '../auth/index.js'
 import type { GatewayConfig } from '../config.js'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
 import { createServer as createTcpServer } from 'node:net'
@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { VERSION } from '@anas/shared'
-import { classifyUpstreamResponse, FORWARD_CONNECT_TIMEOUT_MS, FORWARD_RESPONSE_TIMEOUT_MS, LOCAL_SOCKET_TIMEOUT_MS, resolveNodeAddress } from '../proxy.js'
+import { classifyUpstreamResponse, FORWARD_CONNECT_TIMEOUT_MS, FORWARD_RESPONSE_TIMEOUT_MS, LOCAL_SOCKET_TIMEOUT_MS, pemLeafFingerprint, readPeerCertPin, resolveNodeAddress } from '../proxy.js'
 import { createServer } from '../server.js'
 
 const NODE = 'testnode'
@@ -184,6 +184,33 @@ describe('local proxy → anasd socket', () => {
 
     await server.close()
   })
+
+  // cr3 CORE-M3: a header value is latin1, a PVE user id is UTF-8. Before the
+  // fix `用户@pve` threw ERR_INVALID_CHAR on the local hop (502 "anasd
+  // unavailable" on every view) and `jörg@pve` went out as one latin1 byte.
+  for (const [name, wire, marker] of [
+    ['用户@pve', '%E7%94%A8%E6%88%B7%40pve', 'percent-utf8'],
+    ['jörg@pve', 'j%C3%B6rg%40pve', 'percent-utf8'],
+    ['50%off@pve', '50%25off%40pve', 'percent-utf8'],
+    ['alice@pve', 'alice@pve', undefined],
+  ] as const) {
+    it(`CORE-M3: the user id ${JSON.stringify(name)} reaches the socket as ${JSON.stringify(wire)}${marker ? ' with the encoding marker' : ', raw, with no marker'}`, async () => {
+      const server = createServer({
+        config: baseConfig({ anasdSocket: socketPath }),
+        authProvider: {
+          name: 'accept-utf8',
+          authenticate: async () => ({ ok: true, user: { name, uid: -1, privileges: ['Sys.Audit', 'Sys.Modify'] } }),
+        },
+        logger: false,
+      })
+      received = { headers: {} }
+      const res = await server.inject({ method: 'GET', url: '/api/nodes/testnode/v1/pools', headers: { cookie: 'PVEAuthCookie=x' } })
+      assert.equal(res.statusCode, 200, res.body)
+      assert.equal(received.headers['x-anas-user'], wire)
+      assert.equal(received.headers['x-anas-user-encoding'], marker)
+      await server.close()
+    })
+  }
 
   it('preserves a URL-encoded path segment (%2F) so daemon :path routes match', async () => {
     // NFS exports are keyed by their URL-encoded mountpoint (/shares/nfs/:path).
@@ -766,6 +793,120 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
     assert.deepEqual(res.json(), { data: 'slow but fine' })
     await server.close()
     await new Promise<void>(resolve => peer.close(() => resolve()))
+  })
+})
+
+describe('cr3 CORE-M1: a peer serving its custom (pveproxy-ssl.pem / ACME) certificate', () => {
+  // The cluster CA signs every node's pve-ssl.pem; a node with a custom or ACME
+  // certificate serves pveproxy-ssl.pem instead, signed by someone else. Before
+  // CORE-M1 the forward trusted the cluster CA alone, so such a peer was a 502
+  // NODE_UNREACHABLE ("ANAS is not installed" in the panel). It is now trusted
+  // when the certificate it presents is EXACTLY the one pmxcfs holds for it,
+  // and still refused for any other certificate, before a byte is sent.
+  let dir: string
+  let nodesDir: string
+  let clusterCaPath: string
+  let leafKey: Buffer
+  let acmeLeaf: Buffer
+  let acmeChain: Buffer
+  let otherLeaf: Buffer
+
+  function openssl(...args: string[]): void {
+    execFileSync('openssl', args, { stdio: 'ignore' })
+  }
+
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), 'anas-peer-pin-'))
+    nodesDir = join(dir, 'nodes')
+    const p = (f: string) => join(dir, f)
+    // The cluster CA (signs nothing the peer serves here).
+    openssl('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-keyout', p('cluster.key'), '-out', p('cluster.pem'), '-subj', '/CN=Proxmox Virtual Environment/OU=cluster')
+    clusterCaPath = p('cluster.pem')
+    // A public ACME CA and the peer's ACME leaf (SAN = the node name).
+    openssl('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-keyout', p('acme.key'), '-out', p('acme.pem'), '-subj', '/CN=Public ACME CA')
+    openssl('req', '-newkey', 'rsa:2048', '-nodes', '-keyout', p('leaf.key'), '-out', p('leaf.csr'), '-subj', '/CN=peer1')
+    writeFileSync(p('san.ext'), 'subjectAltName=DNS:peer1\n')
+    openssl('x509', '-req', '-in', p('leaf.csr'), '-CA', p('acme.pem'), '-CAkey', p('acme.key'), '-CAcreateserial', '-days', '1', '-extfile', p('san.ext'), '-out', p('leaf.pem'))
+    // A second leaf for the same name from the same CA: not the one pmxcfs holds.
+    openssl('x509', '-req', '-in', p('leaf.csr'), '-CA', p('acme.pem'), '-CAkey', p('acme.key'), '-CAcreateserial', '-days', '2', '-extfile', p('san.ext'), '-out', p('other.pem'))
+    leafKey = readFileSync(p('leaf.key'))
+    acmeLeaf = readFileSync(p('leaf.pem'))
+    otherLeaf = readFileSync(p('other.pem'))
+    // pveproxy-ssl.pem as ACME writes it: the leaf, then the chain.
+    acmeChain = Buffer.concat([acmeLeaf, readFileSync(p('acme.pem'))])
+  })
+
+  after(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  function writePin(content: Buffer | undefined): void {
+    rmSync(nodesDir, { recursive: true, force: true })
+    if (content !== undefined) {
+      mkdirSync(join(nodesDir, 'peer1'), { recursive: true })
+      writeFileSync(join(nodesDir, 'peer1', 'pveproxy-ssl.pem'), content)
+    }
+  }
+
+  async function forwardTo(served: Buffer): Promise<{ status: number, body: { error?: { code: string, message: string } }, peerSawRequest: boolean }> {
+    let peerSawRequest = false
+    const peer = createHttpsServer({ cert: served, key: leafKey }, (_req, res) => {
+      peerSawRequest = true
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ data: 'from peer1' }))
+    })
+    await new Promise<void>(resolve => peer.listen(0, '127.0.0.1', resolve))
+    const peerPort = (peer.address() as AddressInfo).port
+    const server = createServer({
+      config: baseConfig({ clusterCa: clusterCaPath, pvePort: peerPort, pveNodesDir: nodesDir }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({ method: 'GET', url: '/api/nodes/peer1/v1/pools', headers: { cookie: 'PVEAuthCookie=secret' } })
+    await server.close()
+    await new Promise<void>(resolve => peer.close(() => resolve()))
+    return { status: res.statusCode, body: res.json(), peerSawRequest }
+  }
+
+  it('the exact certificate pmxcfs holds for the node (full chain file) is trusted: 200', async () => {
+    writePin(acmeChain)
+    const r = await forwardTo(acmeLeaf)
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.deepEqual(r.body, { data: 'from peer1' })
+  })
+
+  it('no custom certificate held for the node: refused as before, and the cookie never left', async () => {
+    writePin(undefined)
+    const r = await forwardTo(acmeLeaf)
+    assert.equal(r.status, 502)
+    assert.equal(r.body.error?.code, 'NODE_UNREACHABLE')
+    assert.match(r.body.error?.message ?? '', /not trusted/)
+    assert.equal(r.peerSawRequest, false)
+  })
+
+  it('a DIFFERENT certificate for the same name from the same CA is refused before a byte is sent', async () => {
+    writePin(acmeChain)
+    const r = await forwardTo(otherLeaf)
+    assert.equal(r.status, 502)
+    assert.equal(r.body.error?.code, 'NODE_UNREACHABLE')
+    assert.equal(r.peerSawRequest, false)
+  })
+
+  it('a pin file that holds no certificate trusts nothing extra', async () => {
+    writePin(Buffer.from('not a certificate\n'))
+    const r = await forwardTo(acmeLeaf)
+    assert.equal(r.status, 502)
+    assert.equal(r.peerSawRequest, false)
+  })
+
+  it('pemLeafFingerprint reads the FIRST certificate of a bundle; readPeerCertPin refuses a path-shaped node', () => {
+    assert.equal(pemLeafFingerprint(acmeChain.toString('utf8')), pemLeafFingerprint(acmeLeaf.toString('utf8')))
+    assert.notEqual(pemLeafFingerprint(acmeLeaf.toString('utf8')), pemLeafFingerprint(otherLeaf.toString('utf8')))
+    assert.equal(pemLeafFingerprint('garbage'), undefined)
+    writePin(acmeChain)
+    assert.ok(readPeerCertPin(nodesDir, 'peer1'))
+    assert.equal(readPeerCertPin(nodesDir, '..'), undefined)
+    assert.equal(readPeerCertPin(nodesDir, 'nosuch'), undefined)
   })
 })
 

@@ -28,7 +28,7 @@ check() {
   fi
 }
 
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d -p "${ANAS_TEST_TMPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" .scratch.XXXXXX)"
 trap 'rm -rf "${WORK}"' EXIT
 TPL="${WORK}/index.html.tpl"
 

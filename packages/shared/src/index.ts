@@ -311,8 +311,10 @@ export {
 export {
   AbsolutePath,
   DatasetPath,
+  decodeUserHeader,
   DevicePath,
   DiskId,
+  encodeUserHeader,
   excludeShapeIssue,
   fmtBytes,
   hasControlChars,
@@ -333,6 +335,9 @@ export {
   ShareName,
   SingleLine,
   SnapshotName,
+  USER_ENCODING_HEADER,
+  USER_ENCODING_PERCENT_UTF8,
+  userHeaderNeedsEncoding,
   UUID,
 } from './schemas/common.js'
 export type { ExcludeOwner } from './schemas/common.js'

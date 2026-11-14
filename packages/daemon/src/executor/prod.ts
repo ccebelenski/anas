@@ -390,8 +390,7 @@ export class ProdExecutor implements CommandExecutor {
    * Run a command and collect its output.
    *
    * Without `onStderr` both streams are buffered, each up to `maxBuffer`
-   * (default 10 MiB) — `execFile`'s contract: stdin is an open pipe (written
-   * and closed only when `stdin` is given), over the cap the child's group
+   * (default 10 MiB) — `execFile`'s contract, over the cap the child's group
    * gets SIGTERM (then the deadline's escalation, cr.34r) and the call
    * rejects with `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` once the group is gone.
    *
@@ -400,8 +399,14 @@ export class ProdExecutor implements CommandExecutor {
    * {@link STDERR_TAIL_CHARS} characters only, decoded multi-byte-safely, so a
    * multi-day run's stats log never accumulates in the daemon (execFile could
    * not do this: it buffers both streams up to `maxBuffer` with no opt-out).
-   * stdin is `ignore` unless given; over the stdout cap the child's group
-   * gets SIGKILL.
+   * Over the stdout cap the child's group gets SIGKILL.
+   *
+   * stdin, on both paths (cr3.core): a pipe written and closed when `stdin`
+   * is given; otherwise `ignore` (/dev/null), so a tool that would prompt
+   * (`mount.cifs` with no password, a confirmation question) reads EOF and
+   * fails at once instead of waiting on a pipe nobody writes until the
+   * deadline. Before it the buffered path left stdin an open pipe (execFile's
+   * contract) and only the tee path used /dev/null.
    *
    * Both: spawn failures reject (ENOENT/EACCES), a non-zero exit resolves
    * (never throws), exit codes pass through exactly (`timeout`'s 124 is
@@ -420,7 +425,7 @@ export class ProdExecutor implements CommandExecutor {
         // `/proc/self/fd/3` in the child resolves to whatever the caller
         // opened. The caller owns the fd — the executor never closes it.
         stdio: [
-          tee && opts?.stdin === undefined ? 'ignore' : 'pipe',
+          opts?.stdin === undefined ? 'ignore' : 'pipe',
           'pipe',
           'pipe',
           ...(opts?.inheritedFds ?? []),
