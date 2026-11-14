@@ -194,7 +194,7 @@ run_uninstall() {
 }
 
 # =============================================================================
-echo "== 1. happy path: ships module, splices hook, takes no backup, restarts =="
+echo "== 1. happy path: ships module, splices hook, takes no backup, reloads (never restarts) =="
 setup_env
 make_anyevent "${PVE_PM}"
 cp "${PVE_PM}" "${PRISTINE}"
@@ -204,7 +204,13 @@ check "AnasProxy.pm installed" "[ -f '${PERL_DIR}/AnasProxy.pm' ]"
 check "hook marker spliced in" "grep -qF '${MARKER}' '${PVE_PM}'"
 check "no whole-file backup captured (review H2)" "[ ! -f '${PVE_PM}.anas-orig' ]"
 check "patched module compiles" "perl -c '${PVE_PM}' >/dev/null 2>&1"
-check "pveproxy restart invoked" "[ -f '${RESTART_MARK}' ]"
+# integration.r1: a new splice RELOADS pveproxy. A hard restart kills an apt run
+# started from a PVE web shell (it lives in pveproxy's cgroup) and every hook
+# queued behind ours.
+check "pveproxy reload invoked on a new splice" "[ -f '${RELOAD_MARK}' ]"
+check "no hard restart on a new splice (integration.r1)" "[ ! -f '${RESTART_MARK}' ]"
+check "install log says reloaded" "grep -q 'pveproxy reloaded (proxy hook live)' '${WORK}/install.log'"
+check "the installer holds no hard restart of pveproxy at all" "! grep -vE '^[[:space:]]*#' '${INSTALL}' | grep -qE 'systemctl +restart +pveproxy'"
 check "AnasProxy require path points at ANAS_PERL_DIR" \
   "grep -qF \"require '${PERL_DIR}/AnasProxy.pm'\" '${PVE_PM}'"
 rm -rf "${WORK}"
@@ -214,7 +220,7 @@ setup_env
 make_anyevent "${PVE_PM}"
 PERL_BIN_OVERRIDE="" run_install >/dev/null 2>&1
 count1="$(grep -cF "${MARKER}" "${PVE_PM}")"
-rm -f "${RESTART_MARK}"
+rm -f "${RESTART_MARK}" "${RELOAD_MARK}"
 PERL_BIN_OVERRIDE="" run_install; rc=$?
 count2="$(grep -cF "${MARKER}" "${PVE_PM}")"
 check "second install exits 0" "[ ${rc} -eq 0 ]"
@@ -289,6 +295,7 @@ check "install exits non-zero" "[ ${rc} -ne 0 ]"
 check "live module NOT patched (still pristine)" "cmp -s '${PVE_PM}' '${PRISTINE}'"
 check "no hook marker in live module" "! grep -qF '${MARKER}' '${PVE_PM}'"
 check "pveproxy NOT restarted" "[ ! -f '${RESTART_MARK}' ]"
+check "pveproxy NOT reloaded either (integration.r1: the installer reloads, so this is the live check)" "[ ! -f '${RELOAD_MARK}' ]"
 check "error mentions perl -c" "grep -qi 'perl -c' '${WORK}/install.log'"
 rm -rf "${WORK}"
 
@@ -297,7 +304,7 @@ setup_env
 make_anyevent "${PVE_PM}"
 cp "${PVE_PM}" "${PRISTINE}"
 PERL_BIN_OVERRIDE="" run_install >/dev/null 2>&1
-rm -f "${RESTART_MARK}"
+rm -f "${RESTART_MARK}" "${RELOAD_MARK}"
 run_uninstall; rc=$?
 check "uninstall exits 0" "[ ${rc} -eq 0 ]"
 check "module restored byte-pristine" "cmp -s '${PVE_PM}' '${PRISTINE}'"
@@ -357,7 +364,7 @@ make_anyevent_with_adock "${PVE_PM}"
 make_tpl_with_adock "${TPL}"
 cp "${PVE_PM}" "${PRISTINE}"     # 'pristine' here = sibling-only state
 PERL_BIN_OVERRIDE="" run_install >/dev/null 2>&1
-rm -f "${RESTART_MARK}"
+rm -f "${RESTART_MARK}" "${RELOAD_MARK}"
 run_uninstall; rc=$?
 check "uninstall exits 0" "[ ${rc} -eq 0 ]"
 check "ANAS hook gone" "! grep -qF '${MARKER}' '${PVE_PM}'"
@@ -387,12 +394,13 @@ check "exactly one ANAS block" "[ \"\$(grep -cF '${MARKER}' '${PVE_PM}')\" = '1'
 check "exactly one foreign block" "[ \"\$(grep -cF '${ADOCK_MARKER}' '${PVE_PM}')\" = '1' ]"
 check "dual-spliced module compiles (reverse order)" "perl -c '${PVE_PM}' >/dev/null 2>&1"
 # A re-run of our installer over the dual state stays a no-op.
-rm -f "${RESTART_MARK}"
+rm -f "${RESTART_MARK}" "${RELOAD_MARK}"
 PERL_BIN_OVERRIDE="" run_install; rc=$?
 check "ANAS re-install over the dual state exits 0" "[ ${rc} -eq 0 ]"
 check "still exactly one ANAS block" "[ \"\$(grep -cF '${MARKER}' '${PVE_PM}')\" = '1' ]"
 check "still exactly one foreign block" "[ \"\$(grep -cF '${ADOCK_MARKER}' '${PVE_PM}')\" = '1' ]"
 check "no restart on the idempotent re-run" "[ ! -f '${RESTART_MARK}' ]"
+check "no reload on the idempotent re-run (integration.r1)" "[ ! -f '${RELOAD_MARK}' ]"
 rm -rf "${WORK}"
 
 echo "== 10. ANAS FIRST then sibling: uninstall must not use a stale backup =="
@@ -427,7 +435,7 @@ setup_env
 make_anyevent_with_adock "${PVE_PM}"
 PERL_BIN_OVERRIDE="" run_install >/dev/null 2>&1
 cp "${PVE_PM}" "${PRISTINE}"     # the live dual-hook state, which must survive
-rm -f "${RESTART_MARK}"
+rm -f "${RESTART_MARK}" "${RELOAD_MARK}"
 FAKE_PERL="${WORK}/fake-perl"
 cat > "${FAKE_PERL}" <<'EOF'
 #!/usr/bin/env bash

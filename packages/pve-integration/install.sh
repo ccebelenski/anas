@@ -101,12 +101,10 @@ PVE_HTTP_SERVER_PM_ORIG="${PVE_HTTP_SERVER_PM}.anas-orig"
 ANAS_HOOK_MARKER='# >>> ANAS proxy hook'
 # Source of the ANAS-owned proxy module, shipped alongside this installer.
 PROXY_SRC="${SCRIPT_DIR}/perl/AnasProxy.pm"
-# Command that (re)starts pveproxy after a perl-c-verified patch. Overridable so
-# the installer tests never touch the real service manager; default is the real
-# systemctl sequence.
-PVEPROXY_RESTART_CMD="${PVEPROXY_RESTART_CMD:-}"
-# Command that reloads pveproxy when only AnasProxy.pm changed (cr.27, F12).
-# Overridable for the installer tests; default is the real systemctl call.
+# Command that reloads pveproxy — after a perl-c-verified splice (integration.r1)
+# and when only AnasProxy.pm changed (cr.27, F12). This installer never hard-
+# restarts pveproxy. Overridable so the installer tests never touch the real
+# service manager; default is the real systemctl call.
 PVEPROXY_RELOAD_CMD="${PVEPROXY_RELOAD_CMD:-}"
 
 # The exact <script> source path we inject; the grep presence-check keys on it.
@@ -117,19 +115,9 @@ SCRIPT_SRC="/pve2/js/anas.js"
 # content hash is known, as: …src="/pve2/js/anas.js?v=<hash>"… (story 13.15).
 SCRIPT_TAG=""
 
-# (Re)start pveproxy so a freshly-patched AnyEvent.pm (new dispatch + a fresh
-# require of AnasProxy.pm) takes effect. reset-failed first so a prior failed
-# state can't block the restart. Returns non-zero if the restart fails.
-restart_pveproxy() {
-  if [ -n "${PVEPROXY_RESTART_CMD}" ]; then
-    eval "${PVEPROXY_RESTART_CMD}"
-    return $?
-  fi
-  systemctl reset-failed pveproxy >/dev/null 2>&1 || true
-  systemctl restart pveproxy
-}
-
-# Reload pveproxy so its workers drop a cached AnasProxy.pm (cr.27, F12). The
+# Reload pveproxy: after a new splice its master re-execs and loads the patched
+# AnyEvent.pm (integration.r1), and its workers drop a cached AnasProxy.pm
+# (cr.27, F12). The
 # hook `require`s the module once per worker and a worker lives for 1000
 # requests (pveproxy.pm:102), so on an idle node an old module could serve for
 # days; since cr.27 an old module sends no X-Anas-Auth and the new gateway
@@ -307,10 +295,19 @@ install_anas_proxy() {
   rm -f "${patched}"
   echo "anas: spliced ANAS proxy hook into ${PVE_HTTP_SERVER_PM}"
 
-  if restart_pveproxy; then
-    echo "anas: pveproxy restarted (proxy hook live)"
+  # integration.r1: RELOAD, never a hard restart. This installer also runs as
+  # apt's DPkg::Post-Invoke hook, and an apt run started from a PVE web shell
+  # lives in pveproxy's own cgroup: `systemctl restart pveproxy` kills that
+  # shell, apt with it, and every hook queued behind ours (reproduced on the
+  # stunt node: the shell died with SIGTERM between ReapplyStart and
+  # ReapplyResult). A reload is a HUP — pveproxy's master re-execs and loads
+  # the patched module, as pve-manager's own postinst does on upgrade — and
+  # nothing in the cgroup is killed. reload-or-restart still starts a stopped
+  # pveproxy.
+  if reload_pveproxy; then
+    echo "anas: pveproxy reloaded (proxy hook live)"
   else
-    echo "anas: WARNING: pveproxy restart failed after patch; the patched module is valid and will load on the next restart" >&2
+    echo "anas: WARNING: pveproxy reload failed after patch; the patched module is valid and will load on the next reload — run 'systemctl reload pveproxy'" >&2
     systemctl reset-failed pveproxy >/dev/null 2>&1 || true
   fi
   return 0
