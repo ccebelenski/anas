@@ -1,0 +1,8 @@
+rpool/rrsrc
+rpool/rrsrc/a
+rpool/rrsrc/a/deep
+rpool/rrsrc/enc
+rpool/rrsrc/late
+rpool/rrsrc/new
+rpool/rrsrc/skipme
+rpool/rrsrc/vol

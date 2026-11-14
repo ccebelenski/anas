@@ -1,0 +1,6 @@
+rpool/rrsrc@anas-daily-2026-11-14_01.00.00--1d	anas-repl-0123456789ab	Sat Nov 14 01:05 2026
+rpool/rrsrc/a@anas-daily-2026-11-14_01.00.00--1d	anas-repl-0123456789ab	Sat Nov 14 01:05 2026
+rpool/rrsrc/a/deep@anas-daily-2026-11-14_01.00.00--1d	anas-repl-0123456789ab	Sat Nov 14 01:05 2026
+rpool/rrsrc/enc@anas-daily-2026-11-14_01.00.00--1d	anas-repl-0123456789ab	Sat Nov 14 01:05 2026
+rpool/rrsrc/new@anas-daily-2026-11-14_01.00.00--1d	anas-repl-0123456789ab	Sat Nov 14 01:05 2026
+rpool/rrsrc/vol@anas-daily-2026-11-14_01.00.00--1d	anas-repl-0123456789ab	Sat Nov 14 01:05 2026

@@ -1,0 +1,1 @@
+cannot open 'rpool/rrsrc@nosuchsnap': dataset does not exist

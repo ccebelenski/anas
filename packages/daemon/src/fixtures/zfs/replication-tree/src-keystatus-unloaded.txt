@@ -1,0 +1,16 @@
+rpool/rrsrc	keystatus	-
+rpool/rrsrc	encryptionroot	-
+rpool/rrsrc/a	keystatus	-
+rpool/rrsrc/a	encryptionroot	-
+rpool/rrsrc/a/deep	keystatus	-
+rpool/rrsrc/a/deep	encryptionroot	-
+rpool/rrsrc/enc	keystatus	unavailable
+rpool/rrsrc/enc	encryptionroot	rpool/rrsrc/enc
+rpool/rrsrc/late	keystatus	-
+rpool/rrsrc/late	encryptionroot	-
+rpool/rrsrc/new	keystatus	-
+rpool/rrsrc/new	encryptionroot	-
+rpool/rrsrc/skipme	keystatus	-
+rpool/rrsrc/skipme	encryptionroot	-
+rpool/rrsrc/vol	keystatus	-
+rpool/rrsrc/vol	encryptionroot	-

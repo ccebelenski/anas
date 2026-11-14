@@ -1,0 +1,12 @@
+datapool/rrdst	written	0
+datapool/rrdst	readonly	on
+datapool/rrdst/a	written	0
+datapool/rrdst/a	readonly	on
+datapool/rrdst/a/deep	written	0
+datapool/rrdst/a/deep	readonly	on
+datapool/rrdst/enc	written	0
+datapool/rrdst/enc	readonly	on
+datapool/rrdst/targetonly	written	24576
+datapool/rrdst/targetonly	readonly	on
+datapool/rrdst/vol	written	0
+datapool/rrdst/vol	readonly	on

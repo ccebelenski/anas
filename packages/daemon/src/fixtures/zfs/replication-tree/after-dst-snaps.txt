@@ -1,0 +1,11 @@
+datapool/rrdst@anas-daily-2026-11-13_01.00.00--1d	Sat Nov 14  1:04 2026
+datapool/rrdst@local-only	Sat Nov 14  1:05 2026
+datapool/rrdst@anas-daily-2026-11-14_01.00.00--1d	Sat Nov 14  1:04 2026
+datapool/rrdst/a@anas-daily-2026-11-13_01.00.00--1d	Sat Nov 14  1:04 2026
+datapool/rrdst/a@anas-daily-2026-11-14_01.00.00--1d	Sat Nov 14  1:04 2026
+datapool/rrdst/a/deep@anas-daily-2026-11-13_01.00.00--1d	Sat Nov 14  1:04 2026
+datapool/rrdst/a/deep@anas-daily-2026-11-14_01.00.00--1d	Sat Nov 14  1:04 2026
+datapool/rrdst/enc@anas-daily-2026-11-13_01.00.00--1d	Sat Nov 14  1:04 2026
+datapool/rrdst/new@anas-daily-2026-11-14_01.00.00--1d	Sat Nov 14  1:04 2026
+datapool/rrdst/vol@anas-daily-2026-11-13_01.00.00--1d	Sat Nov 14  1:04 2026
+datapool/rrdst/vol@anas-daily-2026-11-14_01.00.00--1d	Sat Nov 14  1:04 2026
