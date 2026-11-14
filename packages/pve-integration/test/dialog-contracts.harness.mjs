@@ -16544,6 +16544,307 @@ jobs.length = 0
 await confirmBindChecks()
 ok('bind: nothing warned', warnings.length === 0, warnings.join(' | '))
 
+// snaptime.2 — the Cadence label helper (ANAS.schedules.cadenceText) and the
+// grid cell it feeds (ANAS.schedules.renderCadence), over the REAL source.
+async function snaptimeLabelChecks() {
+  const A = loadSources(['69-schedules-common.js', '69-snapshots.js'], {})
+  const ct = A.schedules.cadenceText
+  ok('snaptime(label): helper exported on ANAS', typeof ct === 'function')
+  if (typeof ct !== 'function') { return }
+  // No field set: the bare bucket word, exactly as the cell read before.
+  // Any field set: the cadence's full form, defaults (00:00 / Mon / 1st /
+  // January) filled in; monthly 31 reads systemd's own 'on the last day'.
+  const cases = [
+    ['no field, frequently', { cadence: 'frequently' }, 'frequently'],
+    ['no field, hourly', { cadence: 'hourly' }, 'hourly'],
+    ['no field, daily', { cadence: 'daily' }, 'daily'],
+    ['no field, weekly', { cadence: 'weekly' }, 'weekly'],
+    ['no field, monthly', { cadence: 'monthly' }, 'monthly'],
+    ['no field, yearly', { cadence: 'yearly' }, 'yearly'],
+    ['no cadence word', { time: '01:00' }, ''],
+    ['daily 01:00', { cadence: 'daily', time: '01:00' }, 'daily 01:00'],
+    ['weekly Thu 01:30', { cadence: 'weekly', weekday: 'Thu', time: '01:30' }, 'weekly Thu 01:30'],
+    ['weekly weekday only -> 00:00', { cadence: 'weekly', weekday: 'Thu' }, 'weekly Thu 00:00'],
+    ['weekly time only -> Mon', { cadence: 'weekly', time: '01:00' }, 'weekly Mon 01:00'],
+    ['monthly day 1 -> 1st', { cadence: 'monthly', dayOfMonth: 1 }, 'monthly on the 1st 00:00'],
+    ['monthly day 2 -> 2nd', { cadence: 'monthly', dayOfMonth: 2 }, 'monthly on the 2nd 00:00'],
+    ['monthly day 3 -> 3rd', { cadence: 'monthly', dayOfMonth: 3 }, 'monthly on the 3rd 00:00'],
+    ['monthly day 4 -> 4th', { cadence: 'monthly', dayOfMonth: 4 }, 'monthly on the 4th 00:00'],
+    ['monthly day 11 -> 11th', { cadence: 'monthly', dayOfMonth: 11 }, 'monthly on the 11th 00:00'],
+    ['monthly day 12 -> 12th', { cadence: 'monthly', dayOfMonth: 12 }, 'monthly on the 12th 00:00'],
+    ['monthly day 13 -> 13th', { cadence: 'monthly', dayOfMonth: 13 }, 'monthly on the 13th 00:00'],
+    ['monthly day 21 -> 21st', { cadence: 'monthly', dayOfMonth: 21 }, 'monthly on the 21st 00:00'],
+    ['monthly day 22 -> 22nd', { cadence: 'monthly', dayOfMonth: 22 }, 'monthly on the 22nd 00:00'],
+    ['monthly day 23 -> 23rd', { cadence: 'monthly', dayOfMonth: 23 }, 'monthly on the 23rd 00:00'],
+    ['monthly 15th 01:00', { cadence: 'monthly', dayOfMonth: 15, time: '01:00' }, 'monthly on the 15th 01:00'],
+    ['monthly day 31 -> last day', { cadence: 'monthly', dayOfMonth: 31, time: '01:00' }, 'monthly on the last day 01:00'],
+    ['yearly 17 June 01:00', { cadence: 'yearly', dayOfMonth: 17, month: 6, time: '01:00' }, 'yearly on 17 June 01:00'],
+    // Review of snaptime.2: the label printed "31 April" and "30 February".
+    // RULE: a day the month does not always have reads as when it fires.
+    ['yearly February 29 -> last day', { cadence: 'yearly', dayOfMonth: 29, month: 2 }, 'yearly on the last day of February 00:00'],
+    ['yearly February 30 -> last day', { cadence: 'yearly', dayOfMonth: 30, month: 2 }, 'yearly on the last day of February 00:00'],
+    ['yearly April 31 -> last day', { cadence: 'yearly', dayOfMonth: 31, month: 4, time: '01:30' }, 'yearly on the last day of April 01:30'],
+    ['yearly February 28 is a real date', { cadence: 'yearly', dayOfMonth: 28, month: 2 }, 'yearly on 28 February 00:00'],
+    ['yearly January 31 is a real date', { cadence: 'yearly', dayOfMonth: 31 }, 'yearly on 31 January 00:00'],
+    ['yearly month only -> 1st', { cadence: 'yearly', month: 12 }, 'yearly on 1 December 00:00'],
+    ['yearly day only -> January', { cadence: 'yearly', dayOfMonth: 17 }, 'yearly on 17 January 00:00'],
+    ['yearly time only -> 1 January', { cadence: 'yearly', time: '23:15' }, 'yearly on 1 January 23:15'],
+    // The sub-hourly buckets have no fields to show; a stray one is ignored.
+    ['frequently ignores a stray time', { cadence: 'frequently', time: '01:00' }, 'frequently'],
+    ['hourly ignores a stray time', { cadence: 'hourly', time: '01:00' }, 'hourly'],
+  ]
+  for (const [label, sched, want] of cases) {
+    eq(`snaptime(label): ${label}`, ct(sched), want)
+  }
+  // The grid cell: the helper's text, and the shorter-month shift sentence
+  // as the tip wherever the day is one the month may lack. Monthly 31 needs
+  // no tip — its text already reads 'on the last day'.
+  const rc = A.schedules.renderCadence
+  const WARN_TIP = 'title="In a shorter month it fires on the last day"'
+  const PLAIN_TIP = 'title="a snapshot is taken into this period bucket"'
+  function cell(cad, fields) {
+    return rc(cad, {}, { get: k => fields[k] })
+  }
+  const cDaily = cell('daily', { time: '01:00' })
+  ok('snaptime(cell): daily shows the time', cDaily.includes(PLAIN_TIP) && cDaily.includes('>daily 01:00<'), cDaily)
+  const cNoRec = rc('weekly', {}, null)
+  ok('snaptime(cell): no record reads the bare bucket word',
+    cNoRec.includes(PLAIN_TIP) && cNoRec.includes('>weekly<'), cNoRec)
+  const cEmpty = rc('', {}, null)
+  ok('snaptime(cell): empty renders the muted dash', cEmpty.includes('&mdash;'), cEmpty)
+  const cM29 = cell('monthly', { dayOfMonth: 29, time: '01:30' })
+  ok('snaptime(cell): monthly 29 warns in the tip',
+    cM29.includes(WARN_TIP) && cM29.includes('>monthly on the 29th 01:30<'), cM29)
+  const cM30 = cell('monthly', { dayOfMonth: 30 })
+  ok('snaptime(cell): monthly 30 warns in the tip', cM30.includes(WARN_TIP), cM30)
+  const cM31 = cell('monthly', { dayOfMonth: 31 })
+  ok('snaptime(cell): monthly 31 needs no tip (text says last day)',
+    cM31.includes(PLAIN_TIP) && !cM31.includes(WARN_TIP), cM31)
+  const cY229 = cell('yearly', { dayOfMonth: 29, month: 2 })
+  ok('snaptime(cell): yearly 29 February warns (leap years are not every year)',
+    cY229.includes(WARN_TIP), cY229)
+  const cY631 = cell('yearly', { dayOfMonth: 31, month: 6 })
+  ok('snaptime(cell): yearly 31 June warns (June has 30 days)', cY631.includes(WARN_TIP), cY631)
+  const cY630 = cell('yearly', { dayOfMonth: 30, month: 6 })
+  ok('snaptime(cell): yearly 30 June never shifts', !cY630.includes(WARN_TIP), cY630)
+  const cY131 = cell('yearly', { dayOfMonth: 31, month: 1 })
+  ok('snaptime(cell): yearly 31 January never shifts', !cY131.includes(WARN_TIP), cY131)
+}
+
+warnings.length = 0
+created.windows.length = 0
+jobs.length = 0
+await snaptimeLabelChecks()
+ok('snaptime: nothing warned', warnings.length === 0, warnings.join(' | '))
+
+// snaptime.2 — the schedule dialog's fire controls and the exact submit
+// body, driven through the REAL dialog (openDialog + the Save button's
+// handler), the way the other dialog groups drive theirs.
+async function snaptimeDialogChecks() {
+  const A = loadSources(['69-schedules-common.js', '69-snapshots.js'], {
+    'GET /pools': { data: [{ name: 'tank' }] },
+    'GET /ahr': { data: [] },
+    'GET /pools/tank/datasets': { data: [{ name: 'tank/media' }] },
+    'GET /schedules': { data: [] },
+  })
+  const grid = makeComponent({ xtype: 'gridpanel', store: { fields: ['id'] }, destroyed: false })
+  async function openDialog(existing) {
+    created.windows.length = 0
+    A.schedules.openDialog('n1', grid, existing)
+    await settle(10)
+    return openWindow()
+  }
+  function save(dlg) {
+    const btn = findCmp(dlg, 'anas-btn-sched-submit')
+    ok('snaptime(dlg): dialog has Save', !!btn)
+    if (btn) { btn.handler() }
+    return jobs[jobs.length - 1]
+  }
+  // ONLY the fire keys of a body, as an object — what belongs, compared
+  // whole; what must not belong is asserted by its absence from here.
+  function fireKeys(body) {
+    const out = {}
+    for (const k of ['time', 'weekday', 'dayOfMonth', 'month']) {
+      if (body && Object.prototype.hasOwnProperty.call(body, k)) { out[k] = body[k] }
+    }
+    return out
+  }
+
+  // --- Create daily at 01:30: the body carries `time` and nothing else. ----
+  const wkExisting = {
+    id: 'wk', name: 'wk', target: { kind: 'zfs', dataset: 'tank/media' },
+    cadence: 'weekly', weekday: 'Thu', time: '01:30',
+    retention: { daily: 7 }, notify: 'on-failure', enabled: false,
+  }
+  const dDaily = await openDialog(null)
+  ok('snaptime(dlg): Create opens daily', !!dDaily && dDaily.down('#cadence').getValue() === 'daily')
+  dDaily.down('#name').setValue('daily proof')
+  dDaily.down('#id').setValue('daily-proof')
+  dDaily.down('#fireTime').setValue('01:30')
+  jobs.length = 0
+  const jDaily = save(dDaily)
+  eq('snaptime(body): daily 01:30 sends time only', fireKeys(jDaily && jDaily.body), { time: '01:30' })
+  ok('snaptime(body): the daily create is a POST /schedules',
+    !!jDaily && jDaily.method === 'post' && jDaily.path === '/schedules')
+
+  // --- Create yearly 17 June 01:30: time, dayOfMonth, month, no weekday. ---
+  const dYearly = await openDialog(null)
+  dYearly.down('#name').setValue('yearly proof')
+  dYearly.down('#id').setValue('yearly-proof')
+  dYearly.down('#cadence').setValue('yearly')
+  dYearly.down('#fireDay').setValue(17)
+  dYearly.down('#fireMonth').setValue(6)
+  dYearly.down('#fireTime').setValue('01:30')
+  jobs.length = 0
+  const jYearly = save(dYearly)
+  eq('snaptime(body): yearly 17 June 01:30 sends time + dayOfMonth + month',
+    fireKeys(jYearly && jYearly.body), { time: '01:30', dayOfMonth: 17, month: 6 })
+  ok('snaptime(body): dayOfMonth and month stay NUMBERS',
+    typeof jYearly.body.dayOfMonth === 'number' && typeof jYearly.body.month === 'number',
+    JSON.stringify(fireKeys(jYearly.body)))
+
+  // --- Edit a stored weekly Thu 01:30, saved unchanged: the body equals the
+  // stored values, and the controls opened holding them. ----
+  const dWk = await openDialog(wkExisting)
+  ok('snaptime(dlg): edit opens on the stored cadence',
+    !!dWk && dWk.down('#cadence').getValue() === 'weekly')
+  eq('snaptime(dlg): the weekly edit holds the stored fire values',
+    { time: dWk.down('#fireTime').getValue(), weekday: dWk.down('#fireWeekday').getValue() },
+    { time: '01:30', weekday: 'Thu' })
+  jobs.length = 0
+  const jWk = save(dWk)
+  eq('snaptime(body): weekly Thu 01:30 saved unchanged', fireKeys(jWk && jWk.body),
+    { time: '01:30', weekday: 'Thu' })
+  ok('snaptime(body): the weekly edit is a PUT to the schedule',
+    !!jWk && jWk.method === 'put' && jWk.path === '/schedules/wk')
+
+  // --- That same weekly schedule switched to hourly: NO fire keys at all
+  // (the cadence refuses them; an absent key keeps the stored value gone
+  // only as far as the daemon's cadence rules allow — we send none). ----
+  const dHourly = await openDialog(wkExisting)
+  dHourly.down('#cadence').setValue('hourly')
+  jobs.length = 0
+  const jHourly = save(dHourly)
+  eq('snaptime(body): weekly -> hourly sends no fire keys', fireKeys(jHourly && jHourly.body), {})
+  ok('snaptime(body): hourly never claims a time',
+    !('time' in (jHourly && jHourly.body)), JSON.stringify(jHourly && jHourly.body))
+
+  // --- A stored schedule with NO fire fields, saved unchanged: the dialog
+  // sends the defaults. Fine — the daemon stores a default as absence. ----
+  const dPlain = await openDialog({
+    id: 'plain', name: 'plain', target: { kind: 'zfs', dataset: 'tank' },
+    cadence: 'daily', retention: { daily: 7 }, notify: 'on-failure', enabled: true,
+  })
+  jobs.length = 0
+  const jPlain = save(dPlain)
+  eq('snaptime(body): field-less daily saved unchanged sends 00:00',
+    fireKeys(jPlain && jPlain.body), { time: '00:00' })
+
+  // --- Create monthly day 30: dayOfMonth is a number, no month key. ----
+  const dMonthly = await openDialog(null)
+  dMonthly.down('#name').setValue('monthly proof')
+  dMonthly.down('#id').setValue('monthly-proof')
+  dMonthly.down('#cadence').setValue('monthly')
+  dMonthly.down('#fireDay').setValue(30)
+  dMonthly.down('#fireTime').setValue('01:30')
+  jobs.length = 0
+  const jMonthly = save(dMonthly)
+  eq('snaptime(body): monthly 30 at 01:30 sends time + dayOfMonth',
+    fireKeys(jMonthly && jMonthly.body), { time: '01:30', dayOfMonth: 30 })
+
+  // --- An invalid time blocks the submit with the dialog's invalid-input
+  // alert and sends NOTHING. ----
+  const dBadTime = await openDialog(null)
+  dBadTime.down('#name').setValue('bad time')
+  dBadTime.down('#id').setValue('bad-time')
+  dBadTime.down('#fireTime').setValue('25:00')
+  jobs.length = 0
+  const warnedAt = warnings.length
+  save(dBadTime)
+  ok('snaptime(alert): 25:00 raises the invalid-input alert',
+    warnings.length > warnedAt && /alert: Invalid input: A 24-hour time/.test(warnings[warnedAt] || ''),
+    warnings.slice(warnedAt).join(' | '))
+  ok('snaptime(alert): the bad time sends no job', jobs.length === 0, JSON.stringify(jobs))
+  warnings.length = warnedAt
+
+  // --- A day beyond 1-31 blocks the same way. ----
+  const dBadDay = await openDialog(null)
+  dBadDay.down('#name').setValue('bad day')
+  dBadDay.down('#id').setValue('bad-day')
+  dBadDay.down('#cadence').setValue('monthly')
+  dBadDay.down('#fireDay').setValue(40)
+  jobs.length = 0
+  const warnedAt2 = warnings.length
+  save(dBadDay)
+  ok('snaptime(alert): day 40 raises the invalid-input alert',
+    warnings.length > warnedAt2 && /alert: Invalid input: Pick a day/.test(warnings[warnedAt2] || ''),
+    warnings.slice(warnedAt2).join(' | '))
+  ok('snaptime(alert): the bad day sends no job', jobs.length === 0, JSON.stringify(jobs))
+  warnings.length = warnedAt2
+
+  // --- Visibility: each control shows only where the cadence allows it. ----
+  function vis(dlg) {
+    const f = {}
+    for (const k of ['fireTime', 'fireWeekday', 'fireMonth', 'fireDay']) {
+      f[k] = !dlg.down('#' + k).hidden
+    }
+    return f
+  }
+  const dVisDaily = await openDialog(null)
+  eq('snaptime(vis): daily shows only the time', vis(dVisDaily),
+    { fireTime: true, fireWeekday: false, fireMonth: false, fireDay: false })
+  dVisDaily.down('#cadence').setValue('weekly')
+  eq('snaptime(vis): weekly adds the weekday', vis(dVisDaily),
+    { fireTime: true, fireWeekday: true, fireMonth: false, fireDay: false })
+  dVisDaily.down('#cadence').setValue('monthly')
+  eq('snaptime(vis): monthly shows the day, not the weekday or month', vis(dVisDaily),
+    { fireTime: true, fireWeekday: false, fireMonth: false, fireDay: true })
+  dVisDaily.down('#cadence').setValue('yearly')
+  eq('snaptime(vis): yearly shows month and day', vis(dVisDaily),
+    { fireTime: true, fireWeekday: false, fireMonth: true, fireDay: true })
+  dVisDaily.down('#cadence').setValue('hourly')
+  eq('snaptime(vis): hourly hides all four', vis(dVisDaily),
+    { fireTime: false, fireWeekday: false, fireMonth: false, fireDay: false })
+  const hint = dVisDaily.down('#fireHint')
+  ok('snaptime(hint): hourly hides the hint too', hint.hidden && hint.html === '', String(hint.html))
+
+  // --- The hint line: the clock sentence with any time field; the shift
+  // sentence added where the day may be lacking. ----
+  const dHint = await openDialog(null)
+  function hintText() { return String(dHint.down('#fireHint').html || '') }
+  dHint.down('#cadence').setValue('daily')
+  ok('snaptime(hint): daily carries the node-local / UTC sentence',
+    !dHint.down('#fireHint').hidden
+    && hintText().includes('Node local time. Snapshot names carry the UTC date and time.'), hintText())
+  dHint.down('#cadence').setValue('monthly')
+  ok('snaptime(hint): monthly day 1 says nothing about shorter months',
+    !hintText().includes('In a shorter month'), hintText())
+  dHint.down('#fireDay').setValue(29)
+  ok('snaptime(hint): monthly day 29 adds the shift sentence',
+    hintText().includes('In a shorter month it fires on the last day.'), hintText())
+  dHint.down('#fireDay').setValue(31)
+  ok('snaptime(hint): monthly day 31 warns too (the dialog shows a bare 31)',
+    hintText().includes('In a shorter month'), hintText())
+  dHint.down('#cadence').setValue('yearly')
+  dHint.down('#fireMonth').setValue(2)
+  dHint.down('#fireDay').setValue(29)
+  ok('snaptime(hint): yearly 29 February warns (leap years are not every year)',
+    hintText().includes('In a shorter month'), hintText())
+  dHint.down('#fireMonth').setValue(7)
+  ok('snaptime(hint): yearly 29 July is quiet (July has 31 days)',
+    !hintText().includes('In a shorter month'), hintText())
+  dHint.down('#fireMonth').setValue(6)
+  dHint.down('#fireDay').setValue(31)
+  ok('snaptime(hint): yearly 31 June warns (June has 30)',
+    hintText().includes('In a shorter month'), hintText())
+}
+
+warnings.length = 0
+created.windows.length = 0
+jobs.length = 0
+await snaptimeDialogChecks()
+ok('snaptime(dialog): nothing warned', warnings.length === 0, warnings.join(' | '))
+
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)
   for (const f of failures) { console.error(`  • ${f}`) }

@@ -227,13 +227,178 @@
         return tag + '<span style="font-family:monospace;font-size:0.92em;">' + enc(path) + '</span>' + rec2;
     }
 
-    // Cadence: the bucket a fired snapshot is taken into ("daily", "hourly", …).
-    function renderCadence(v) {
+    // ---- Fire schedule text (snaptime.1, snaptime.2) ------------------------
+    //
+    // The four fields a snapshot schedule may carry on top of its bucket:
+    // time, weekday, dayOfMonth, month (shared schedules.ts). Allowed by
+    // cadence: time on daily/weekly/monthly/yearly; weekday weekly;
+    // dayOfMonth monthly AND yearly; month yearly. ABSENT means the default —
+    // 00:00, Mon, the 1st, January — because the daemon stores a value equal
+    // to its default as ABSENCE, so a missing field is never missing
+    // information. The weekday abbreviation is systemd's, the full name is
+    // what the dialog offers.
+    var FIRE_DEFAULTS = { time: '00:00', weekday: 'Mon', dayOfMonth: 1, month: 1 };
+    var WEEKDAYS = [
+        { abbr: 'Mon', full: 'Monday' },
+        { abbr: 'Tue', full: 'Tuesday' },
+        { abbr: 'Wed', full: 'Wednesday' },
+        { abbr: 'Thu', full: 'Thursday' },
+        { abbr: 'Fri', full: 'Friday' },
+        { abbr: 'Sat', full: 'Saturday' },
+        { abbr: 'Sun', full: 'Sunday' }
+    ];
+    var MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
+        'July', 'August', 'September', 'October', 'November', 'December'];
+    // The cadences that fire at a chosen time (everything but the two
+    // sub-hourly buckets). An array, not a map: the bucket word must be found
+    // IN it — a bare map would answer true for 'toString'.
+    var FIRE_CADENCES = ['daily', 'weekly', 'monthly', 'yearly'];
+    // The dialog's time field checks this too (same shape as the daemon's).
+    var FIRE_TIME_RE = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+
+    function cadenceHasTime(cad) {
+        return FIRE_CADENCES.indexOf('' + cad) >= 0;
+    }
+
+    // The field as text / as a number, or its default when ABSENT (null,
+    // undefined, empty string). Any other value passes through as-is — the
+    // daemon's schema is the authority on what a stored schedule can hold.
+    function fireStr(v, dflt) {
+        return (v === null || v === undefined || v === '') ? dflt : ('' + v);
+    }
+
+    function fireNum(v, dflt) {
+        if (v === null || v === undefined || v === '') {
+            return dflt;
+        }
+        var n = Number(v);
+        return isNaN(n) ? dflt : n;
+    }
+
+    // Does the schedule carry ANY fire field? (No field set is what every
+    // schedule created before snaptime.1 reads back as — the cell then shows
+    // the bare bucket word, exactly as it did before.)
+    function fireSet(sched) {
+        var s = sched || {};
+        return (s.time !== null && s.time !== undefined && s.time !== '')
+            || (s.weekday !== null && s.weekday !== undefined && s.weekday !== '')
+            || (s.dayOfMonth !== null && s.dayOfMonth !== undefined && s.dayOfMonth !== '')
+            || (s.month !== null && s.month !== undefined && s.month !== '');
+    }
+
+    // English ordinal day: 1st, 2nd, 3rd, 4th, 11th-13th, 21st-23rd, 31st.
+    // The teens take 'th'; otherwise the last digit picks the suffix.
+    function dayOrdinal(n) {
+        var teens = n % 100;
+        if (teens >= 11 && teens <= 13) {
+            return n + t('th');
+        }
+        if (n % 10 === 1) {
+            return n + t('st');
+        }
+        if (n % 10 === 2) {
+            return n + t('nd');
+        }
+        if (n % 10 === 3) {
+            return n + t('rd');
+        }
+        return n + t('th');
+    }
+
+    // The Cadence text for a schedule — the grid cell, the detail row, and
+    // the contract harness all read it from here. No fire field set: the
+    // bucket word exactly as the grid always read it. Once any field is set,
+    // the cadence's full form with the defaults filled in:
+    //   daily 01:00 · weekly Thu 01:00 · monthly on the 15th 01:00
+    //   yearly on 17 June 01:00
+    // Monthly day 31 reads systemd's own form — 'on the last day' — since
+    // every month has one.
+    function cadenceText(sched) {
+        var s = sched || {};
+        var cad = '' + (s.cadence == null ? '' : s.cadence);
+        if (!cad) {
+            return '';
+        }
+        var word = t(cad);
+        if (!fireSet(s) || !cadenceHasTime(cad)) {
+            return word;
+        }
+        var time = fireStr(s.time, FIRE_DEFAULTS.time);
+        if (cad === 'daily') {
+            return word + ' ' + time;
+        }
+        if (cad === 'weekly') {
+            return word + ' ' + t(fireStr(s.weekday, FIRE_DEFAULTS.weekday)) + ' ' + time;
+        }
+        if (cad === 'monthly') {
+            var day = fireNum(s.dayOfMonth, FIRE_DEFAULTS.dayOfMonth);
+            var when = day >= 31 ? t('on the last day') : t('on the') + ' ' + dayOrdinal(day);
+            return word + ' ' + when + ' ' + time;
+        }
+        var mon = fireNum(s.month, FIRE_DEFAULTS.month);
+        var monName = MONTHS[mon - 1];
+        var yday = fireNum(s.dayOfMonth, FIRE_DEFAULTS.dayOfMonth);
+        // A day the month does not always have (31 April, 29 February) fires
+        // on that month's last day: the label says when it fires, never a date
+        // that does not exist (review of snaptime.2).
+        if (yday > minDaysInMonth(mon)) {
+            return word + ' ' + t('on the last day of') + ' ' + (monName ? t(monName) : mon) + ' ' + time;
+        }
+        return word + ' ' + t('on') + ' ' + yday
+            + ' ' + (monName ? t(monName) : mon) + ' ' + time;
+    }
+
+    // The fewest days a month (1-12) can have: February may skip the 29th
+    // (leap years are not every year), the four 30-day months never have a
+    // 31st. A day beyond this is one the month may lack, and systemd then
+    // fires on that month's last day (snaptime.1, proven on the node). We
+    // never compute the shift — we only say it.
+    function minDaysInMonth(m) {
+        if (m === 2) {
+            return 28;
+        }
+        if (m === 4 || m === 6 || m === 9 || m === 11) {
+            return 30;
+        }
+        return 31;
+    }
+
+    // True when the chosen day is one the month may lack. Monthly: the 29th
+    // and 30th (the 31st only where `show31` — the grid cell already reads
+    // 'on the last day' for it, the dialog shows a bare 31 and must warn).
+    // Yearly: any day past the month's shortest length (February 29, June 31).
+    function fireDayMayBeAbsent(cad, dayOfMonth, month, show31) {
+        var day = fireNum(dayOfMonth, 0);
+        if (cad === 'monthly') {
+            return day === 29 || day === 30 || (show31 === true && day === 31);
+        }
+        if (cad === 'yearly') {
+            return day > minDaysInMonth(fireNum(month, FIRE_DEFAULTS.month));
+        }
+        return false;
+    }
+
+    // Cadence: the bucket a fired snapshot is taken into ("daily", "hourly",
+    // and so on), with the fire fields the schedule carries spelled out
+    // (snaptime.2).
+    // A day the month may lack carries the shift sentence as the cell tip.
+    function renderCadence(v, meta, rec) {
         var s = '' + (v == null ? '' : v);
         if (!s) {
             return muted('&mdash;');
         }
-        return '<span title="' + enc(t('a snapshot is taken into this period bucket')) + '">' + enc(s) + '</span>';
+        var sched = { cadence: s };
+        if (rec) {
+            sched.time = rec.get('time');
+            sched.weekday = rec.get('weekday');
+            sched.dayOfMonth = rec.get('dayOfMonth');
+            sched.month = rec.get('month');
+        }
+        var tip = t('a snapshot is taken into this period bucket');
+        if (fireDayMayBeAbsent(s, sched.dayOfMonth, sched.month, false)) {
+            tip = t('In a shorter month it fires on the last day');
+        }
+        return '<span title="' + enc(tip) + '">' + enc(cadenceText(sched)) + '</span>';
     }
 
     function renderRetention(v, meta, rec) {
@@ -416,6 +581,12 @@
             targetKind: target.kind || 'zfs',
             targetPath: target.kind === 'ahr' ? target.pool : target.dataset,
             cadence: sched.cadence,
+            // The fire fields pass through untouched (absent stays absent) —
+            // the Cadence cell fills the defaults, snaptime.2.
+            time: sched.time,
+            weekday: sched.weekday,
+            dayOfMonth: sched.dayOfMonth,
+            month: sched.month,
             retention: sched.retention || {},
             recursive: !!sched.recursive,
             exclude: (sched.exclude || []).slice(),
@@ -447,6 +618,11 @@
     // The delete door, exposed for poll-selection.harness.mjs (cr.46) — it
     // must go through runJob, and that is only provable from the call site.
     ANAS.schedules.deleteSchedule = deleteSchedule;
+    // The Cadence label helper and the cell it feeds, exposed for the dialog
+    // contract harness (snaptime.2: the whole table of cadence texts, and the
+    // shorter-month cell tip).
+    ANAS.schedules.cadenceText = cadenceText;
+    ANAS.schedules.renderCadence = renderCadence;
 
     // ---- Selection + toolbar state -----------------------------------------
 
@@ -849,6 +1025,29 @@
                     : t('New Snapshot Schedule'),
                 modal: true,
                 width: 540,
+                // snaptime.2: with the fire controls, Recursive and its Exclude
+                // picker all shown, the form is taller than a 720px browser
+                // window and the Save button fell below it (the exclude
+                // browser proof could not click it). The window stops short of
+                // the viewport; the form (scrollable) takes the overflow and
+                // the button bar stays docked in view.
+                maxHeight: Math.max(360, ((Ext.Element && Ext.Element.getViewportHeight)
+                    ? Ext.Element.getViewportHeight() : 720) - 40),
+                // The window is centred when it opens SHORT (Recursive off);
+                // ticking Recursive grows it downward from that spot, so it is
+                // moved back up whenever its bottom edge would leave the view.
+                listeners: {
+                    resize: function (w) {
+                        if (!(Ext.Element && Ext.Element.getViewportHeight) || !w.getY || !w.setY) {
+                            return;
+                        }
+                        var vh = Ext.Element.getViewportHeight();
+                        var over = w.getY() + w.getHeight() - (vh - 10);
+                        if (over > 0) {
+                            w.setY(Math.max(0, w.getY() - over));
+                        }
+                    }
+                },
                 resizable: false,
                 layout: 'fit',
                 items: [{
@@ -948,6 +1147,85 @@
                             value: defaultAhrPool
                         },
                         cadenceComboCfg(sched.cadence || 'daily'),
+                        // snaptime.2: WHEN the schedule fires. Each control
+                        // shows only for the cadences that allow it (shared
+                        // schedules.ts); applyFireVis re-reads that whenever
+                        // the cadence changes. Values fill from the stored
+                        // schedule, defaults where absent — the daemon stores
+                        // a default as absence, so absent is not missing.
+                        {
+                            xtype: 'textfield',
+                            itemId: 'fireTime',
+                            cls: 'anas-fld-sched-time',
+                            fieldLabel: t('At'),
+                            width: 260,
+                            anchor: null,
+                            allowBlank: false,
+                            regex: FIRE_TIME_RE,
+                            regexText: t('A 24-hour time, HH:MM.'),
+                            value: fireStr(sched.time, FIRE_DEFAULTS.time),
+                            hidden: !cadenceHasTime(sched.cadence || 'daily')
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'fireWeekday',
+                            cls: 'anas-fld-sched-weekday',
+                            fieldLabel: t('On'),
+                            store: Ext.create('Ext.data.Store', { fields: ['abbr', 'label'], data: WEEKDAYS.map(function (d) {
+                                return { abbr: d.abbr, label: t(d.full) };
+                            }) }),
+                            valueField: 'abbr',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            width: 260,
+                            anchor: null,
+                            value: fireStr(sched.weekday, FIRE_DEFAULTS.weekday),
+                            hidden: (sched.cadence || 'daily') !== 'weekly'
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'fireMonth',
+                            cls: 'anas-fld-sched-month',
+                            fieldLabel: t('In'),
+                            store: Ext.create('Ext.data.Store', { fields: ['num', 'label'], data: MONTHS.map(function (name, i) {
+                                return { num: i + 1, label: t(name) };
+                            }) }),
+                            valueField: 'num',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            width: 260,
+                            anchor: null,
+                            value: fireNum(sched.month, FIRE_DEFAULTS.month),
+                            hidden: (sched.cadence || 'daily') !== 'yearly'
+                        },
+                        {
+                            xtype: 'numberfield',
+                            itemId: 'fireDay',
+                            cls: 'anas-fld-sched-day',
+                            fieldLabel: t('On day'),
+                            minValue: 1,
+                            maxValue: 31,
+                            step: 1,
+                            allowDecimals: false,
+                            allowBlank: false,
+                            width: 260,
+                            anchor: null,
+                            value: fireNum(sched.dayOfMonth, FIRE_DEFAULTS.dayOfMonth),
+                            hidden: !((sched.cadence || 'daily') === 'monthly'
+                                || (sched.cadence || 'daily') === 'yearly')
+                        },
+                        {
+                            xtype: 'component',
+                            itemId: 'fireHint',
+                            cls: 'anas-fld-sched-firehint',
+                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
+                            hidden: true,
+                            html: ''
+                        },
                         {
                             xtype: 'checkboxfield',
                             itemId: 'recursive',
@@ -1072,7 +1350,14 @@
 
         var setVis = function (sel, vis) {
             var f = win.down(sel);
-            if (f) { f.setHidden(!vis); }
+            if (f) {
+                f.setHidden(!vis);
+                // A hidden control must not block Save: ExtJS validates hidden
+                // fields (only disabled ones are skipped), so an emptied `At`
+                // hidden by switching to hourly would stop the submit with no
+                // visible error (review of snaptime.2).
+                if (f.setDisabled) { f.setDisabled(!vis); }
+            }
         };
 
         // snapx.1: the Exclude picker shows for a recursive ZFS schedule only.
@@ -1090,6 +1375,36 @@
             setVis('#recursive', zfs);
             setVis('#ahrPool', !zfs);
             applyExcludeVis();
+        };
+
+        // snaptime.2: which fire controls the chosen cadence allows, and the
+        // hint line under them. The clock sentence shows whenever the time
+        // field shows (we fire in node-local time; snapshot names are UTC).
+        // The shift sentence is added when the day is one the month may lack
+        // — monthly 29/30/31 (the dialog shows a bare number, so unlike the
+        // grid cell the 31st warns too), yearly judged against the month
+        // picked. The dialog never computes the shift; systemd performs it.
+        var applyFireVis = function (cad) {
+            cad = cad || valOf(win, '#cadence') || 'daily';
+            var showTime = cadenceHasTime(cad);
+            var showDay = cad === 'monthly' || cad === 'yearly';
+            setVis('#fireTime', showTime);
+            setVis('#fireWeekday', cad === 'weekly');
+            setVis('#fireMonth', cad === 'yearly');
+            setVis('#fireDay', showDay);
+            var hint = win.down('#fireHint');
+            if (hint) {
+                var html = '';
+                if (showTime) {
+                    html = enc(t('Node local time. Snapshot names carry the UTC date and time.'));
+                    if (showDay && fireDayMayBeAbsent(cad,
+                        valOf(win, '#fireDay'), valOf(win, '#fireMonth'), true)) {
+                        html += enc(t(' In a shorter month it fires on the last day.'));
+                    }
+                }
+                hint.setHidden(html === '');
+                hint.setHtml(html);
+            }
         };
 
         // snapx.1: the Exclude picker's options are the strict descendants of
@@ -1186,6 +1501,12 @@
             win.down('#zfsPool').on('change', function (f) { loadZfsDatasets(f.getValue(), undefined); });
             win.down('#zfsDataset').on('change', function () { refreshExclude(); });
             win.down('#recursive').on('change', function () { applyExcludeVis(); });
+            // snaptime.2: the cadence decides which fire fields exist; the
+            // day and the month decide whether the hint gains the shift
+            // sentence.
+            win.down('#cadence').on('change', function (f) { applyFireVis(f.getValue()); });
+            win.down('#fireDay').on('change', function () { applyFireVis(); });
+            win.down('#fireMonth').on('change', function () { applyFireVis(); });
             // Preset → fill the advanced fields; expand advanced only for Custom.
             win.down('#preset').on('change', function (f) {
                 var val = f.getValue();
@@ -1245,6 +1566,7 @@
                     + 'be moved to another pool — reload the view, or cancel.'));
         }
         applyKind(startKind);
+        applyFireVis();
         if (startKind === 'zfs') {
             loadZfsDatasets(defaultZfsPool,
                 isEdit && target.kind === 'zfs' ? relOfFull(target.dataset, defaultZfsPool) : undefined);
@@ -1303,16 +1625,64 @@
             target = { kind: 'zfs', dataset: rel ? (zfsPool + '/' + rel) : zfsPool };
         }
 
+        // snaptime.2: read the fire fields the chosen cadence allows. The
+        // form already marks a bad time or day red in the browser; this is
+        // the same rule as the dialog's usual invalid-input alert, checked
+        // before anything is sent.
+        var cad = valOf(win, '#cadence') || 'daily';
+        var fireTime = '';
+        var fireWeekday = '';
+        var fireDay = 0;
+        var fireMonth = 0;
+        if (cadenceHasTime(cad)) {
+            fireTime = ('' + (valOf(win, '#fireTime') || '')).trim();
+            if (!FIRE_TIME_RE.test(fireTime)) {
+                ANAS.alertMsg('Invalid input', t('A 24-hour time, HH:MM.'));
+                return;
+            }
+        }
+        if (cad === 'weekly') {
+            fireWeekday = fireStr(valOf(win, '#fireWeekday'), FIRE_DEFAULTS.weekday);
+        }
+        if (cad === 'monthly' || cad === 'yearly') {
+            fireDay = fireNum(valOf(win, '#fireDay'), 0);
+            if (!(fireDay >= 1 && fireDay <= 31)) {
+                ANAS.alertMsg('Invalid input', t('Pick a day of the month from 1 to 31.'));
+                return;
+            }
+        }
+        if (cad === 'yearly') {
+            fireMonth = fireNum(valOf(win, '#fireMonth'), FIRE_DEFAULTS.month);
+        }
+
         var retention = retentionFromFields(win);
         var body = {
             id: id,
             name: name,
             target: target,
-            cadence: valOf(win, '#cadence') || 'daily',
+            cadence: cad,
             retention: retention,
             notify: ANAS.notifyMode.of(valOf(win, '#notifyMode'), 'on-failure'),
             enabled: !!valOf(win, '#enabled')
         };
+        // snaptime.2: EXACTLY the keys this cadence allows and none of the
+        // others (a fire field on a cadence that refuses it is a 400), and
+        // always every one of them — the value shown, default included. The
+        // daemon stores a value equal to its default as absence, so sending
+        // 00:00 / Mon / the 1st / January is exactly how a save says "this
+        // field is back at its default". Numbers stay numbers.
+        if (cadenceHasTime(cad)) {
+            body.time = fireTime;
+        }
+        if (cad === 'weekly') {
+            body.weekday = fireWeekday;
+        }
+        if (cad === 'monthly' || cad === 'yearly') {
+            body.dayOfMonth = fireDay;
+        }
+        if (cad === 'yearly') {
+            body.month = fireMonth;
+        }
         if (kind === 'zfs' && valOf(win, '#recursive')) {
             body.recursive = true;
             // The key is ALWAYS sent on a recursive ZFS schedule (`[]` when
@@ -1411,7 +1781,13 @@
         var name = rec.get('name') || id;
         var raw = rec.get('raw') || {};
         var next = !rec.get('enabled');
-        // Round-trip the full schedule with only `enabled` changed.
+        // Round-trip the full schedule with only `enabled` changed. The
+        // fire fields (snaptime.2) are deliberately NOT part of this body:
+        // on PUT an ABSENT key keeps the stored value, and a toggle never
+        // changes the cadence, so whatever schedule.time / weekday /
+        // dayOfMonth / month the schedule has survives untouched — and a
+        // field the daemon stored as absence (its default) must not be
+        // re-sent here just to have it stored as absence again.
         var body = {
             id: id,
             name: raw.name || name,
@@ -1602,7 +1978,7 @@
             + kv(t('Schedule'), mono(s.name || s.id || ''))
             + kv(t('Identifier'), mono(s.id || ''))
             + kv(t('Target'), targetText)
-            + kv(t('Cadence'), enc('' + (s.cadence || '')))
+            + kv(t('Cadence'), enc(cadenceText(s)))
             + kv(t('Retention'), '<span style="font-family:monospace;font-size:0.9em;">'
                 + enc(retentionSummary(s.retention) || '—') + '</span>')
             + kv(t('Notifications'), ANAS.notifyMode.rowHtml(notifyOf(s), t('fire'), 'anas-snapshot'))
@@ -1705,6 +2081,7 @@
         var store = Ext.create('Ext.data.Store', {
             fields: [
                 'id', 'name', 'targetKind', 'targetPath', 'cadence', 'notify',
+                'time', 'weekday', 'dayOfMonth', 'month',
                 'lastRunResult', 'lastRunAt', 'nextRunAt', 'lastRunNote',
                 { name: 'retention', type: 'auto' },
                 { name: 'recursive', type: 'auto' },
@@ -1851,7 +2228,9 @@
                         {
                             text: t('Cadence'),
                             dataIndex: 'cadence',
-                            width: 100,
+                            // The longest cell text is `monthly on the last
+                            // day 01:00` — the bucket word alone no longer fits.
+                            width: 200,
                             renderer: renderCadence
                         },
                         {
