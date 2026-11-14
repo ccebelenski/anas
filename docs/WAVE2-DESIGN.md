@@ -371,10 +371,10 @@ index lists `GET /v1/iscsi/targets/:iqn/luns/:lun`, which no route registers (al
 | `POST` | `/v1/cloud/remotes` | Sys.Modify | `cloud.ts:340` |  |
 | `PUT` | `/v1/cloud/remotes/:name` | Sys.Modify | `cloud.ts:390` |  |
 | `DELETE` | `/v1/cloud/remotes/:name` | Sys.Modify | `cloud.ts:485` |  |
-| `POST` | `/v1/cloud/remotes/test` | Sys.Audit | `cloud.ts:672` | read job (operator ruling 2026-10-17) — diagnosis; runs rclone with caller-supplied or stored secrets |
+| `POST` | `/v1/cloud/remotes/test` | Sys.Audit | `cloud.ts:672` | read job (operator ruling 2026-10-17) — diagnosis; runs rclone with caller-supplied or stored secrets. True now (2026-11-14): the gateway still admits it on Sys.Audit, and the daemon answers 403 without Sys.Modify for an unsaved (`remote`) Test, which runs as the non-read job `cloud.remote.test`; Sys.Audit tests saved remotes by name |
 | `GET` | `/v1/cloud/tasks` | Sys.Audit | `cloud.ts:667` |  |
 | `POST` | `/v1/cloud/tasks` | Sys.Modify | `cloud.ts:698` |  |
-| `POST` | `/v1/cloud/tasks/preview` | Sys.Audit | `cloud.ts:963` | read job (operator ruling 2026-10-17) — rclone dry run against the remote (outbound, stored secrets) |
+| `POST` | `/v1/cloud/tasks/preview` | Sys.Audit | `cloud.ts:963` | read job (operator ruling 2026-10-17) — rclone dry run against the remote (outbound, stored secrets). True now (2026-11-14): the gateway still admits it on Sys.Audit, and the daemon answers 403 without Sys.Modify for an inline (unsaved) task, which runs as the non-read job `cloud.task.preview`; Sys.Audit previews saved tasks by name |
 | `GET` | `/v1/cloud/tasks/:name` | Sys.Audit | `cloud.ts:803` |  |
 | `PUT` | `/v1/cloud/tasks/:name` | Sys.Modify | `cloud.ts:852` |  |
 | `DELETE` | `/v1/cloud/tasks/:name` | Sys.Modify | `cloud.ts:893` |  |

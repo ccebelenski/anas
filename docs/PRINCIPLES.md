@@ -26,7 +26,7 @@ anasd does not accept arbitrary commands. It accepts structured operations with 
 
 ## 6. Shared schemas, validated at every boundary
 
-Request and response types are defined once (Zod) and shared between anas and anasd. Validation happens at both boundaries — the anas gateway validates incoming user input, anasd validates before execution. This is defense in depth, not redundancy.
+Request and response types are defined once (Zod) and shared between anas and anasd. ~~Validation happens at both boundaries — the anas gateway validates incoming user input, anasd validates before execution. This is defense in depth, not redundancy.~~ **Corrected (operator ruling, 2026-11-14):** anasd is the schema boundary: it validates every request against the shared schemas before execution. The anas gateway authenticates the caller, checks the PVE privilege and forwards the request body unparsed.
 
 ## 7. Lightweight by design
 
