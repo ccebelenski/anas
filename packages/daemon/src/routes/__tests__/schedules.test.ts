@@ -768,6 +768,152 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     })
   })
 
+  // --- The fire fields on a schedule (story snaptime.1, #83) ----------------
+  describe('time, weekday and day of month (snaptime.1)', () => {
+    async function stored(id: string) {
+      return parseServiceUnit(await readFile(join(dir, `anas-snap-${id}.service`), 'utf-8'))
+    }
+    async function timer(id: string) {
+      return readFile(join(dir, `anas-snap-${id}.timer`), 'utf-8')
+    }
+    function put(id: string, payload: unknown) {
+      return server.inject({ method: 'PUT', url: `/v1/schedules/${id}`, headers: JSON_HEADERS, payload: JSON.stringify(payload) })
+    }
+    async function createDone(payload: unknown) {
+      const created = await create(payload)
+      assert.equal(created.statusCode, 202, created.body)
+      const done = await waitForJob(server, created.json().job.id)
+      assert.equal(done.status, 'completed', JSON.stringify(done.error))
+    }
+
+    it('a create with the fields stores AND returns them; GET omits them when unset', async () => {
+      await createDone({ ...SCHEDULE, id: 'timed', time: '01:30' })
+      assert.equal((await stored('timed'))?.time, '01:30')
+      assert.match(await timer('timed'), /OnCalendar=\*-\*-\* 01:30:00/)
+      const one = await server.inject({ method: 'GET', url: '/v1/schedules/timed' })
+      assert.equal(one.json().data.schedule.time, '01:30')
+
+      await createDone({ ...SCHEDULE, id: 'plain' })
+      const plain = await server.inject({ method: 'GET', url: '/v1/schedules/plain' })
+      const schedule = plain.json().data.schedule as Record<string, unknown>
+      assert.equal('time' in schedule, false)
+      assert.equal('weekday' in schedule, false)
+      assert.equal('dayOfMonth' in schedule, false)
+    })
+
+    it('a PUT with NO fire-field keys keeps the stored time (the exclude contract)', async () => {
+      await createDone({ ...SCHEDULE, id: 'timed', time: '01:30' })
+      const res = await put('timed', { ...SCHEDULE, id: 'timed', enabled: false })
+      assert.equal(res.statusCode, 202, res.body)
+      assert.equal((await waitForJob(server, res.json().job.id)).status, 'completed')
+      assert.equal((await stored('timed'))?.time, '01:30', 'absent key keeps the stored time')
+    })
+
+    it('a PUT with time:null clears it and the timer goes back to the shortcut word', async () => {
+      await createDone({ ...SCHEDULE, id: 'timed', time: '01:30' })
+      assert.match(await timer('timed'), /OnCalendar=\*-\*-\* 01:30:00/)
+      const res = await put('timed', { ...SCHEDULE, id: 'timed', time: null })
+      assert.equal(res.statusCode, 202, res.body)
+      assert.equal((await waitForJob(server, res.json().job.id)).status, 'completed')
+      const after = await stored('timed')
+      assert.equal(after?.time, undefined, 'a cleared field is stored as absence')
+      assert.doesNotMatch(await readFile(join(dir, 'anas-snap-timed.service'), 'utf-8'), /"time"/)
+      assert.match(await timer('timed'), /OnCalendar=daily\n/)
+      const one = await server.inject({ method: 'GET', url: '/v1/schedules/timed' })
+      assert.equal('time' in one.json().data.schedule, false)
+    })
+
+    it('weekly → daily keeps the time, drops the weekday silently (2xx)', async () => {
+      await createDone({ ...SCHEDULE, id: 'wk', cadence: 'weekly', retention: { weekly: 4 }, time: '02:00', weekday: 'Thu' })
+      assert.match(await timer('wk'), /OnCalendar=Thu \*-\*-\* 02:00:00/)
+      const res = await put('wk', { ...SCHEDULE, id: 'wk', cadence: 'daily', retention: { daily: 7 } })
+      assert.equal(res.statusCode, 202, res.body)
+      assert.equal((await waitForJob(server, res.json().job.id)).status, 'completed')
+      const after = await stored('wk')
+      assert.equal(after?.time, '02:00', 'the time the new cadence allows is kept')
+      assert.equal(after?.weekday, undefined, 'the weekday the new cadence refuses is dropped silently')
+      assert.match(await timer('wk'), /OnCalendar=\*-\*-\* 02:00:00/)
+    })
+
+    it('daily → hourly drops the time and the timer is the hourly shortcut', async () => {
+      await createDone({ ...SCHEDULE, id: 'tod', time: '02:00' })
+      const res = await put('tod', { ...SCHEDULE, id: 'tod', cadence: 'hourly', retention: { hourly: 24 } })
+      assert.equal(res.statusCode, 202, res.body)
+      assert.equal((await waitForJob(server, res.json().job.id)).status, 'completed')
+      assert.equal((await stored('tod'))?.time, undefined)
+      assert.match(await timer('tod'), /OnCalendar=hourly\n/)
+    })
+
+    it('a monthly 29 is accepted, and its timer carries the day PLUS February last day', async () => {
+      await createDone({ ...SCHEDULE, id: 'mon', cadence: 'monthly', retention: { monthly: 12 }, dayOfMonth: 29, time: '02:00' })
+      assert.equal((await stored('mon'))?.dayOfMonth, 29)
+      const lines = (await timer('mon')).split('\n').filter(line => line.startsWith('OnCalendar='))
+      assert.deepEqual(lines, ['OnCalendar=*-*-29 02:00:00', 'OnCalendar=*-02~01 02:00:00'])
+    })
+
+    it('a PUT with dayOfMonth 32 is a 400', async () => {
+      await createDone({ ...SCHEDULE, id: 'mon', cadence: 'monthly', retention: { monthly: 12 } })
+      const res = await put('mon', { ...SCHEDULE, id: 'mon', cadence: 'monthly', retention: { monthly: 12 }, dayOfMonth: 32 })
+      assert.equal(res.statusCode, 400, res.body)
+      assert.match(res.json().error.message, /31/)
+      assert.equal((await stored('mon'))?.dayOfMonth, undefined, 'the refused value was never stored')
+    })
+
+    it('monthly → yearly keeps the stored dayOfMonth (and the time)', async () => {
+      await createDone({ ...SCHEDULE, id: 'may', cadence: 'monthly', retention: { monthly: 12 }, dayOfMonth: 15, time: '02:00' })
+      const res = await put('may', { ...SCHEDULE, id: 'may', cadence: 'yearly', retention: { yearly: 2 } })
+      assert.equal(res.statusCode, 202, res.body)
+      assert.equal((await waitForJob(server, res.json().job.id)).status, 'completed')
+      const after = await stored('may')
+      assert.equal(after?.dayOfMonth, 15, 'dayOfMonth is a yearly field too, so it is kept')
+      assert.equal(after?.time, '02:00')
+      assert.match(await timer('may'), /OnCalendar=\*-01-15 02:00:00/)
+    })
+
+    it('yearly → monthly keeps the day, drops the month silently (2xx)', async () => {
+      await createDone({ ...SCHEDULE, id: 'yr', cadence: 'yearly', retention: { yearly: 2 }, month: 6, dayOfMonth: 17, time: '01:30' })
+      assert.match(await timer('yr'), /OnCalendar=\*-06-17 01:30:00/)
+      const res = await put('yr', { ...SCHEDULE, id: 'yr', cadence: 'monthly', retention: { monthly: 12 } })
+      assert.equal(res.statusCode, 202, res.body)
+      assert.equal((await waitForJob(server, res.json().job.id)).status, 'completed')
+      const after = await stored('yr')
+      assert.equal(after?.dayOfMonth, 17, 'the day the new cadence allows is kept')
+      assert.equal(after?.month, undefined, 'the month monthly refuses is dropped silently')
+      assert.match(await timer('yr'), /OnCalendar=\*-\*-17 01:30:00/)
+    })
+
+    it('yearly → daily drops the month and the day, keeps the time', async () => {
+      await createDone({ ...SCHEDULE, id: 'yd', cadence: 'yearly', retention: { yearly: 2 }, month: 6, dayOfMonth: 17, time: '01:30' })
+      const res = await put('yd', { ...SCHEDULE, id: 'yd', cadence: 'daily', retention: { daily: 7 } })
+      assert.equal(res.statusCode, 202, res.body)
+      assert.equal((await waitForJob(server, res.json().job.id)).status, 'completed')
+      const after = await stored('yd')
+      assert.equal(after?.month, undefined)
+      assert.equal(after?.dayOfMonth, undefined)
+      assert.equal(after?.time, '01:30')
+      assert.match(await timer('yd'), /OnCalendar=\*-\*-\* 01:30:00/)
+    })
+
+    it('a PUT with month:null clears it and the day stays', async () => {
+      await createDone({ ...SCHEDULE, id: 'ym', cadence: 'yearly', retention: { yearly: 2 }, month: 6, dayOfMonth: 17, time: '01:30' })
+      const res = await put('ym', { ...SCHEDULE, id: 'ym', cadence: 'yearly', retention: { yearly: 2 }, month: null })
+      assert.equal(res.statusCode, 202, res.body)
+      assert.equal((await waitForJob(server, res.json().job.id)).status, 'completed')
+      const after = await stored('ym')
+      assert.equal(after?.month, undefined, 'a cleared field is stored as absence')
+      assert.equal(after?.dayOfMonth, 17)
+      assert.doesNotMatch(await readFile(join(dir, 'anas-snap-ym.service'), 'utf-8'), /"month"/)
+      assert.match(await timer('ym'), /OnCalendar=\*-01-17 01:30:00/)
+    })
+
+    it('a create with weekday on a daily schedule is a 400', async () => {
+      const res = await create({ ...SCHEDULE, weekday: 'Thu' })
+      assert.equal(res.statusCode, 400, res.body)
+      assert.match(res.json().error.message, /Weekday applies to a weekly schedule only/)
+      assert.deepEqual(await readdir(dir), [])
+    })
+  })
+
   // --- Exclude datasets from a recursive schedule (story snapx.1, #71) -----
   describe('exclude on a recursive schedule (snapx.1)', () => {
     const TREE = 'testpool/x\ntestpool/x/data\ntestpool/x/data/vm-100-disk-0\ntestpool/x/media\ntestpool/x/media/raw\n'

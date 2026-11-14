@@ -1,8 +1,8 @@
-import type { DashboardWarning, SnapshotCadence, SnapshotSchedule, SnapshotScheduleDetail, SnapshotScheduleStatus } from '@anas/shared'
+import type { DashboardWarning, SnapshotCadence, SnapshotFireShape, SnapshotSchedule, SnapshotScheduleDetail, SnapshotScheduleStatus } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { SnapshotSchedule as SnapshotScheduleSchema } from '@anas/shared'
+import { SNAPSHOT_FIRE_DEFAULTS, SnapshotDayOfMonth, snapshotFireShapeIssues, SnapshotMonth, SnapshotSchedule as SnapshotScheduleSchema, TaskTimeOfDay, TaskWeekday } from '@anas/shared'
 import { DISABLED_HISTORY_NOTE } from './systemd-status.js'
 // The unit-store plumbing (marker parse, dir listing, unlink/systemctl) is the
 // ONE shared copy in systemd-unit-store.ts — snapshot was its second hand-copy.
@@ -96,16 +96,147 @@ const CADENCE_ONCALENDAR: Record<SnapshotCadence, string> = {
   yearly: 'yearly', //     *-01-01 00:00:00
 }
 
-export function cadenceToOnCalendar(cadence: SnapshotCadence): string {
+/**
+ * The one calendar fact ANAS holds: the length of each month in a common year
+ * (index 0 = January, 11 = December). Its ONLY job is choosing between the two
+ * spellings of a day that a month may lack — `*-MM-DD` when the month always
+ * has the day, `*-MM~01` (that month's last day) when it may not. February's 28
+ * is why the 29th is always the last-day form, leap years included. No date is
+ * ever computed here (no `Date`, no arithmetic on a calendar): systemd is the
+ * calendar, and these twelve numbers are all the code needs to pick its form.
+ */
+const MONTH_LENGTHS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
+/** A day or month as the two-digit `OnCalendar=` field (`1` → `01`). */
+function twoDigit(value: number): string {
+  return String(value).padStart(2, '0')
+}
+
+/**
+ * The `OnCalendar=` lines a MONTHLY schedule gets (story snaptime.1, #83): one
+ * line for a day every month has, two for a day February lacks, and the
+ * last-day form alone for the 31st. Each was checked with `systemd-analyze
+ * calendar` on the test node (2026-11-13, systemd 257):
+ *
+ *   day 1-28  `*-*-DD HH:MM:00`
+ *   day 29-30 `*-*-DD HH:MM:00` AND `*-02~01 HH:MM:00` (February's last day)
+ *   day 31    `*-*~01 HH:MM:00` (the last day of EVERY month)
+ *
+ * `*-*-31` is never written: systemd SKIPS a month that lacks the day, so asked
+ * in November it would next elapse on 31 December. `*-*~01` does what the field
+ * means — a month shorter than the day fires on its last day.
+ */
+function monthlyOnCalendar(dayOfMonth: number, time: string): string[] {
+  const day = twoDigit(dayOfMonth)
+  if (dayOfMonth >= 31)
+    return [`*-*~01 ${time}:00`]
+  const line = `*-*-${day} ${time}:00`
+  // 29 and 30 exist in every month but February, whose last day is a second
+  // expression: on a leap year's 29 February the two lines name the same
+  // instant and its timer fires once.
+  return dayOfMonth >= 29 ? [line, `*-02~01 ${time}:00`] : [line]
+}
+
+/**
+ * The `OnCalendar=` expression a YEARLY schedule gets (story snaptime.1, #83):
+ * `*-MM-DD HH:MM:00` when that month always has the day, and that month's
+ * last-day form `*-MM~01 HH:MM:00` when it may not (29-31 February, 31 in a
+ * 30-day month) — checked with `systemd-analyze calendar` on the test node
+ * (2026-11-13): `*-06-17` normalises to itself and `*-04~01` elapses 30 April.
+ */
+function yearlyOnCalendar(month: number, dayOfMonth: number, time: string): string {
+  const mm = twoDigit(month)
+  if (dayOfMonth <= MONTH_LENGTHS[month - 1])
+    return `*-${mm}-${twoDigit(dayOfMonth)} ${time}:00`
+  return `*-${mm}~01 ${time}:00`
+}
+
+/** The four fire fields with their schema fences — the generator's last gate re-asks each one. */
+const FIRE_FIELD_FENCES = {
+  time: TaskTimeOfDay,
+  weekday: TaskWeekday,
+  dayOfMonth: SnapshotDayOfMonth,
+  month: SnapshotMonth,
+} as const
+type FireFieldName = keyof typeof FIRE_FIELD_FENCES
+const FIRE_FIELD_NAMES = Object.keys(FIRE_FIELD_FENCES) as FireFieldName[]
+
+/**
+ * The fire fields that actually move the schedule off its default instant:
+ * set, valid, and not equal to the default (a `null` clear and an explicit
+ * `00:00` / `Mon` / 1 / January are all the schedule that has no field).
+ *
+ * THE RENDERER IS A HARD BOUNDARY (cr.51; review of snaptime.1): every value
+ * that would reach an `OnCalendar=` line is parsed HERE by the same schema
+ * fence the API boundaries hold, so a corrupt in-memory schedule — a string
+ * where a number belongs, a newline, `NaN`, 1.5, day 0, month 13, `99:99` —
+ * throws before anything is rendered. Nothing but `HH:MM`, a weekday
+ * abbreviation and two bounded integers can come out of this function.
+ */
+function effectiveFireFields(schedule: SnapshotFireShape): { time?: string, weekday?: string, dayOfMonth?: number, month?: number } {
+  const out: Record<string, string | number> = {}
+  for (const field of FIRE_FIELD_NAMES) {
+    const value = schedule[field]
+    if (value == null)
+      continue
+    const parsed = FIRE_FIELD_FENCES[field].safeParse(value)
+    if (!parsed.success)
+      throw new Error(`Snapshot schedule cannot fire: invalid ${field}`)
+    if (parsed.data !== SNAPSHOT_FIRE_DEFAULTS[field])
+      out[field] = parsed.data
+  }
+  return out
+}
+
+/**
+ * The `OnCalendar=` LINES a schedule's timer gets — the ONE generator for both
+ * the shortcut words and the field-bearing forms (story snaptime.1, #83). One
+ * element for every schedule but a monthly one whose day is the 29th or 30th,
+ * which carries two (the day, and February's last day).
+ *
+ * A schedule with NONE of `time`/`weekday`/`dayOfMonth`/`month` set renders
+ * today's shortcut word BYTE-IDENTICALLY, so an upgrade rewrites no existing
+ * timer. With any of them set, the long form is spelled with absent parts at
+ * their defaults (time `00:00`, weekday `Mon`, day 1, month January) — every
+ * expression below was checked with `systemd-analyze calendar` on the test node
+ * (2026-11-13), and each normalises to itself:
+ *
+ *   daily    `*-*-* HH:MM:00`        weekly   `<Day> *-*-* HH:MM:00`
+ *   monthly  see {@link monthlyOnCalendar}
+ *   yearly   `*-MM-DD HH:MM:00`, or `*-MM~01 HH:MM:00` for a day the month lacks
+ *
+ * Fail loud on anything the writer must never hand systemd (the cr.51r
+ * argument below): a cadence outside the enum, or a field the cadence refuses
+ * — a corrupt in-memory schedule. `OnCalendar=undefined` would write a timer
+ * systemd rejects at every daemon-reload, silently never firing; the writer
+ * refuses BEFORE the first write instead.
+ */
+export function cadenceToOnCalendar(schedule: SnapshotFireShape): string[] {
+  const { cadence } = schedule
   const expr: string | undefined = CADENCE_ONCALENDAR[cadence]
-  // Fail loud on a cadence outside the enum (cr.51r): the schema fences it at
-  // the boundary, so reaching here with one means a corrupt in-memory
-  // schedule — and rendering `OnCalendar=undefined` would write a timer
-  // systemd rejects at every daemon-reload, silently never firing. The writer
-  // refuses BEFORE the first write instead.
   if (expr === undefined)
     throw new Error(`Unknown snapshot cadence: ${String(cadence)}`)
-  return expr
+  const issues = snapshotFireShapeIssues(schedule)
+  if (issues.length > 0)
+    throw new Error(`Snapshot schedule cannot fire: ${issues[0].message}`)
+  // Validate, and drop what equals its default: a schedule whose fields all
+  // sit at their defaults IS the shortcut word's schedule, byte for byte.
+  const fire = effectiveFireFields(schedule)
+  // frequently/hourly carry no time of day (the shape check above refused any
+  // field they had), so they always keep their shortcut word.
+  if (Object.keys(fire).length === 0 || cadence === 'frequently' || cadence === 'hourly')
+    return [expr]
+  const time = fire.time ?? SNAPSHOT_FIRE_DEFAULTS.time
+  switch (cadence) {
+    case 'daily':
+      return [`*-*-* ${time}:00`]
+    case 'weekly':
+      return [`${fire.weekday ?? SNAPSHOT_FIRE_DEFAULTS.weekday} *-*-* ${time}:00`]
+    case 'monthly':
+      return monthlyOnCalendar(fire.dayOfMonth ?? SNAPSHOT_FIRE_DEFAULTS.dayOfMonth, time)
+    case 'yearly':
+      return [yearlyOnCalendar(fire.month ?? SNAPSHOT_FIRE_DEFAULTS.month, fire.dayOfMonth ?? SNAPSHOT_FIRE_DEFAULTS.dayOfMonth, time)]
+  }
 }
 
 // --- Runner argv -------------------------------------------------------------
@@ -118,6 +249,30 @@ export function runnerArgs(schedule: SnapshotSchedule): string[] {
 // --- Unit rendering ----------------------------------------------------------
 
 /**
+ * Drop every CLEARED fire field (`null`) from a schedule bound for the store
+ * (story snaptime.1, #83). A PUT clears a stored
+ * `time`/`weekday`/`dayOfMonth`/`month` by sending `null`; the store holds
+ * ABSENCE, never a null, so a stored
+ * schedule parses back to a shape indistinguishable from one saved before the
+ * field existed. Applied by {@link renderServiceUnit} — the one place the
+ * stored JSON is made — so both the mutation and every reader get it.
+ */
+function withoutClearedFireFields(schedule: SnapshotSchedule): SnapshotSchedule {
+  const { time, weekday, dayOfMonth, month, ...rest } = schedule
+  // A cleared field (`null`) and a field at its default are both stored as
+  // ABSENCE: the same schedule has one stored form, so a dialog saved
+  // unchanged rewrites neither unit.
+  const set = <T>(value: T | null | undefined, fallback: T): value is T => value != null && value !== fallback
+  return {
+    ...rest,
+    ...(set(time, SNAPSHOT_FIRE_DEFAULTS.time) ? { time } : {}),
+    ...(set(weekday, SNAPSHOT_FIRE_DEFAULTS.weekday) ? { weekday } : {}),
+    ...(set(dayOfMonth, SNAPSHOT_FIRE_DEFAULTS.dayOfMonth) ? { dayOfMonth } : {}),
+    ...(set(month, SNAPSHOT_FIRE_DEFAULTS.month) ? { month } : {}),
+  }
+}
+
+/**
  * Render the `.service` unit. The `X-ANAS-Schedule=` comment embeds the canonical
  * schedule JSON (single line) — the ONLY thing the parser reads back. ExecStart
  * is for systemd to actually run; it is never parsed by us. `Environment=TZ=UTC`
@@ -128,17 +283,24 @@ export function runnerArgs(schedule: SnapshotSchedule): string[] {
  * repeated sections, so a newline there forges a directive — the C1 proof ran
  * `ExecStartPre=` as root); `id` lands in ExecStart via {@link quoteExecArg}.
  * The marker JSON is safe by construction (`JSON.stringify` escapes every
- * control character onto its one line), and `cadence` is a closed enum mapped
- * to fixed calendar strings — no free text reaches `OnCalendar=`.
+ * control character onto its one line). `cadence` is a closed enum mapped to
+ * fixed calendar strings, and the fire fields (snaptime.1) are validated by
+ * the shared schema at both boundaries and refused for control characters by
+ * {@link cadenceToOnCalendar} — no free text reaches `OnCalendar=`.
  */
 export function renderServiceUnit(schedule: SnapshotSchedule): string {
   refuseControlChars(schedule.name, 'schedule name')
   const execStart = [RUNNER_NODE, RUNNER_SCRIPT, ...runnerArgs(schedule).map(quoteExecArg)].join(' ')
+  // A `null` fire field is a PUT's CLEAR instruction, never a stored value
+  // (snaptime.1): dropped here, the ONE place the stored JSON is made, so a
+  // schedule and every API reply that reads it back carry the field ABSENT —
+  // exactly what a schedule saved before the field existed carries.
+  const normalized = withoutClearedFireFields(schedule)
   // An EMPTY exclude list is the plain `-r` and is stored as no list at all, so
   // a recursive schedule saved by a UI that always sends the key (`[]` when
   // none) keeps a unit byte-identical to one that never had the field.
-  const { exclude, ...withoutExclude } = schedule
-  const stored = exclude && exclude.length > 0 ? schedule : withoutExclude
+  const { exclude, ...withoutExclude } = normalized
+  const stored = exclude && exclude.length > 0 ? normalized : withoutExclude
   return [
     '[Unit]',
     `Description=ANAS snapshot schedule ${schedule.name}`,
@@ -152,7 +314,13 @@ export function renderServiceUnit(schedule: SnapshotSchedule): string {
   ].join('\n')
 }
 
-/** Render the `.timer` unit for a schedule's cadence (same name refusal — cr.51). */
+/**
+ * Render the `.timer` unit for a schedule's cadence (same name refusal —
+ * cr.51). One `OnCalendar=` directive per generated line, in the generator's
+ * order: a monthly 29th or 30th carries two (the day, and February's last day),
+ * everything else one, so a schedule written before the day existed keeps a
+ * timer byte-identical to today's.
+ */
 export function renderTimerUnit(schedule: SnapshotSchedule): string {
   refuseControlChars(schedule.name, 'schedule name')
   return [
@@ -160,7 +328,7 @@ export function renderTimerUnit(schedule: SnapshotSchedule): string {
     `Description=ANAS snapshot timer ${schedule.name}`,
     '',
     '[Timer]',
-    `OnCalendar=${cadenceToOnCalendar(schedule.cadence)}`,
+    ...cadenceToOnCalendar(schedule).map(line => `OnCalendar=${line}`),
     'Persistent=true',
     '',
     '[Install]',

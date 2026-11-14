@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { DatasetPath, ISODateTime, NotifyMode, PoolName, SingleLine } from './common.js'
+import { TaskTimeOfDay, TaskWeekday } from './task-cadence.js'
 import { ScanFunction } from './zfs.js'
 
 // ============================================================================
@@ -93,6 +94,73 @@ export const ScheduleId = z
   .regex(/^[a-z0-9][\w.-]*$/i, 'Must start alphanumeric and contain only letters, digits, and . _ -')
 export type ScheduleId = z.infer<typeof ScheduleId>
 
+/** A snapshot schedule's day of the month (snaptime.1): 1 to 31; a shorter month fires on its last day. */
+export const SnapshotDayOfMonth = z.number().int().min(1).max(31)
+/** A yearly snapshot schedule's month (snaptime.1): 1 = January to 12 = December. */
+export const SnapshotMonth = z.number().int().min(1).max(12)
+
+/**
+ * What an ABSENT fire field means (snaptime.1) — where every schedule fired
+ * before the fields existed. A field set to its default is the same schedule
+ * as one without it, so the store drops it (a dialog saved unchanged rewrites
+ * no timer) and the generator keeps the shortcut word.
+ */
+export const SNAPSHOT_FIRE_DEFAULTS = { time: '00:00', weekday: 'Mon', dayOfMonth: 1, month: 1 } as const
+
+/**
+ * One rule broken by a schedule's fire shape (story snaptime.1, #83).
+ */
+export interface SnapshotFireShapeIssue {
+  path: 'time' | 'weekday' | 'dayOfMonth' | 'month'
+  message: string
+}
+
+/** The fields {@link snapshotFireShapeIssues} reads — the schedule, or a request preview of one. */
+export interface SnapshotFireShape {
+  cadence: SnapshotCadence
+  time?: string | null
+  weekday?: string | null
+  dayOfMonth?: number | null
+  month?: number | null
+}
+
+/**
+ * Why a schedule's fire shape is impossible — or no reasons (story snaptime.1,
+ * #83). The four fire fields are ADDITIVE: a schedule stored without them is
+ * the schedule it always was, firing at midnight, on Monday, on the 1st. What
+ * each cadence may carry:
+ *
+ *   - `time`       daily, weekly, monthly, yearly (refused on frequently/hourly,
+ *                  which fire on their own interval, not at a time of day);
+ *   - `weekday`    weekly only;
+ *   - `dayOfMonth` monthly and yearly (a yearly fire landed on a date);
+ *   - `month`      yearly only.
+ *
+ * Stated ONCE here so both boundaries hold it — the request body and the
+ * stored unit JSON (the pattern the exclude rules use in the schema below). A `null`
+ * field is a PUT's CLEAR instruction, not a set value, so it never trips a
+ * rule: `{cadence: 'daily', time: null}` is a legal clear on any cadence.
+ */
+export function snapshotFireShapeIssues(schedule: SnapshotFireShape): SnapshotFireShapeIssue[] {
+  const issues: SnapshotFireShapeIssue[] = []
+  const { cadence } = schedule
+  if (schedule.time != null && (cadence === 'frequently' || cadence === 'hourly')) {
+    issues.push({
+      path: 'time',
+      message: cadence === 'hourly'
+        ? 'An hourly schedule has no time of day — it fires every hour'
+        : 'A schedule that fires every 15 minutes has no time of day',
+    })
+  }
+  if (schedule.weekday != null && cadence !== 'weekly')
+    issues.push({ path: 'weekday', message: 'Weekday applies to a weekly schedule only' })
+  if (schedule.dayOfMonth != null && cadence !== 'monthly' && cadence !== 'yearly')
+    issues.push({ path: 'dayOfMonth', message: 'Day of the month applies to a monthly or yearly schedule only' })
+  if (schedule.month != null && cadence !== 'yearly')
+    issues.push({ path: 'month', message: 'Month applies to a yearly schedule only' })
+  return issues
+}
+
 /**
  * A snapshot schedule: take a snapshot of `target` on `cadence`, keeping it per
  * `retention`. The uniform record the Schedules screen edits — identical for a
@@ -112,6 +180,34 @@ export const SnapshotSchedule = z.object({
   target: SnapshotTarget,
   /** How often a snapshot is taken (placeholder descriptor — see SnapshotCadence). */
   cadence: SnapshotCadence,
+  /**
+   * Story snaptime.1 (#83): the time of day the fire lands, on the cadences
+   * that can carry one — `HH:MM`, the shared {@link TaskTimeOfDay} backup and
+   * cloud tasks use, in the NODE's local time (the timer carries no zone, as
+   * every ANAS timer). Absent = 00:00, where every schedule fired before the
+   * field existed, so an upgrade rewrites no unit. `null` exists ONLY so a PUT
+   * can clear a stored value; the unit writer drops it before storing.
+   */
+  time: TaskTimeOfDay.nullable().optional(),
+  /**
+   * Story snaptime.1 (#83): the weekday a weekly fire lands on, in systemd's
+   * own spelling ({@link TaskWeekday}). Weekly only; absent = Mon. `null`
+   * clears, like {@link time}.
+   */
+  weekday: TaskWeekday.nullable().optional(),
+  /**
+   * Story snaptime.1 (#83): the day of the month a monthly or yearly fire lands
+   * on, 1 to 31. Absent = the 1st. A month SHORTER than the day fires on that
+   * month's last day instead of being skipped (systemd's own last-day form —
+   * the generator spells it; nothing is computed here). `null` clears, like
+   * {@link time}.
+   */
+  dayOfMonth: SnapshotDayOfMonth.nullable().optional(),
+  /**
+   * Story snaptime.1 (#83): the month a yearly fire lands in, 1 to 12. Yearly
+   * only; absent = January. `null` clears, like {@link time}.
+   */
+  month: SnapshotMonth.nullable().optional(),
   retention: RetentionPolicy,
   /** ZFS: `zfs snapshot -r` (recurse into children). AHR: n/a (whole @data). */
   recursive: z.boolean().optional(),
@@ -139,6 +235,7 @@ export const SnapshotSchedule = z.object({
    */
   notify: NotifyMode.default('on-failure'),
 }).superRefine((s, ctx) => {
+  snapshotFireShapeIssues(s).forEach(i => ctx.addIssue({ code: 'custom', path: [i.path], message: i.message }))
   // snapx.1: the exclude list's shape rules, stated once so both boundaries
   // (the request body and the stored unit JSON) hold them. Whether each entry
   // EXISTS is the daemon route's question (it reads the live tree).

@@ -1,6 +1,6 @@
-import type { SnapshotCadence, SnapshotSchedule } from '@anas/shared'
+import type { SnapshotCadence, SnapshotFireShape, SnapshotSchedule } from '@anas/shared'
 import assert from 'node:assert/strict'
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -28,6 +28,20 @@ import { withStampDir } from './stamp-dir.js'
 
 const SYSTEMCTL = '/usr/bin/systemctl'
 
+/**
+ * What each cadence renders with NONE of the fire fields set — today's strings,
+ * unchanged by snaptime.1. The first test below pins every one; the
+ * byte-identical-timer test reads the same map rather than restating it.
+ */
+const NO_FIELD_ONCALENDAR: Record<SnapshotCadence, string> = {
+  frequently: '*:0/15',
+  hourly: 'hourly',
+  daily: 'daily',
+  weekly: 'weekly',
+  monthly: 'monthly',
+  yearly: 'yearly',
+}
+
 function makeSchedule(over: Partial<SnapshotSchedule> = {}): SnapshotSchedule {
   return {
     id: 'nightly-tank-media',
@@ -44,16 +58,8 @@ function makeSchedule(over: Partial<SnapshotSchedule> = {}): SnapshotSchedule {
 
 describe('snapshot schedule units — cadence → OnCalendar (systemd 257 verified)', () => {
   it('maps every bucket to a valid systemd calendar expression', () => {
-    const expected: Record<SnapshotCadence, string> = {
-      frequently: '*:0/15',
-      hourly: 'hourly',
-      daily: 'daily',
-      weekly: 'weekly',
-      monthly: 'monthly',
-      yearly: 'yearly',
-    }
-    for (const [cadence, oncal] of Object.entries(expected))
-      assert.equal(cadenceToOnCalendar(cadence as SnapshotCadence), oncal)
+    for (const [cadence, oncal] of Object.entries(NO_FIELD_ONCALENDAR))
+      assert.deepEqual(cadenceToOnCalendar({ cadence: cadence as SnapshotCadence }), [oncal])
   })
 
   it('the timer unit carries the translated OnCalendar and Persistent=true', () => {
@@ -61,6 +67,178 @@ describe('snapshot schedule units — cadence → OnCalendar (systemd 257 verifi
     assert.match(timer, /OnCalendar=weekly/)
     assert.match(timer, /Persistent=true/)
     assert.match(timer, /WantedBy=timers\.target/)
+  })
+})
+
+describe('snapshot schedule units — the fire fields in OnCalendar (snaptime.1)', () => {
+  it('renders the long form, each expression checked with systemd-analyze calendar on the node', () => {
+    const rows: { schedule: SnapshotFireShape, expected: string[] }[] = [
+      { schedule: { cadence: 'daily', time: '01:30' }, expected: ['*-*-* 01:30:00'] },
+      { schedule: { cadence: 'weekly', weekday: 'Thu', time: '01:30' }, expected: ['Thu *-*-* 01:30:00'] },
+      { schedule: { cadence: 'monthly', dayOfMonth: 15, time: '01:30' }, expected: ['*-*-15 01:30:00'] },
+      { schedule: { cadence: 'yearly', time: '01:30' }, expected: ['*-01-01 01:30:00'] },
+    ]
+    for (const row of rows)
+      assert.deepEqual(cadenceToOnCalendar(row.schedule), row.expected, JSON.stringify(row.schedule))
+  })
+
+  it('monthly day: 1-28 one line, 29 and 30 two (February last day), 31 the last-day form alone', () => {
+    const rows: { schedule: SnapshotFireShape, expected: string[], why: string }[] = [
+      { schedule: { cadence: 'monthly', dayOfMonth: 28, time: '01:30' }, expected: ['*-*-28 01:30:00'], why: 'every month has a 28th' },
+      {
+        schedule: { cadence: 'monthly', dayOfMonth: 29, time: '01:30' },
+        expected: ['*-*-29 01:30:00', '*-02~01 01:30:00'],
+        why: 'February 2027 has no 29th; its last day is the second line',
+      },
+      {
+        schedule: { cadence: 'monthly', dayOfMonth: 30, time: '01:30' },
+        expected: ['*-*-30 01:30:00', '*-02~01 01:30:00'],
+        why: 'February has no 30th either',
+      },
+      {
+        schedule: { cadence: 'monthly', dayOfMonth: 31, time: '01:30' },
+        expected: ['*-*~01 01:30:00'],
+        why: '*-*~01 is the last day of every month; *-*-31 would skip short months',
+      },
+    ]
+    for (const row of rows)
+      assert.deepEqual(cadenceToOnCalendar(row.schedule), row.expected, `${JSON.stringify(row.schedule)}: ${row.why}`)
+  })
+
+  it('yearly month and day: a day the month always has is spelled out, otherwise its last day', () => {
+    const rows: { schedule: SnapshotFireShape, expected: string[], why: string }[] = [
+      { schedule: { cadence: 'yearly', month: 6, dayOfMonth: 17, time: '01:30' }, expected: ['*-06-17 01:30:00'], why: 'June 17' },
+      { schedule: { cadence: 'yearly', month: 6, dayOfMonth: 30, time: '01:30' }, expected: ['*-06-30 01:30:00'], why: 'June has a 30th' },
+      { schedule: { cadence: 'yearly', month: 4, dayOfMonth: 31, time: '01:30' }, expected: ['*-04~01 01:30:00'], why: 'April has no 31st; fires on the 30th' },
+      { schedule: { cadence: 'yearly', month: 2, dayOfMonth: 29, time: '01:30' }, expected: ['*-02~01 01:30:00'], why: 'February 29 is always the last day, leap years included' },
+    ]
+    for (const row of rows)
+      assert.deepEqual(cadenceToOnCalendar(row.schedule), row.expected, `${JSON.stringify(row.schedule)}: ${row.why}`)
+  })
+
+  it('absent parts take their defaults (time 00:00, weekday Mon, day 1, month January), two-digit fields', () => {
+    assert.deepEqual(cadenceToOnCalendar({ cadence: 'weekly', weekday: 'Wed' }), ['Wed *-*-* 00:00:00'])
+    assert.deepEqual(cadenceToOnCalendar({ cadence: 'monthly', dayOfMonth: 28 }), ['*-*-28 00:00:00'])
+    assert.deepEqual(cadenceToOnCalendar({ cadence: 'monthly', dayOfMonth: 1, time: '03:00' }), ['*-*-01 03:00:00'])
+    assert.deepEqual(cadenceToOnCalendar({ cadence: 'monthly', dayOfMonth: 5 }), ['*-*-05 00:00:00'])
+    assert.deepEqual(cadenceToOnCalendar({ cadence: 'daily', time: '23:59' }), ['*-*-* 23:59:00'])
+    assert.deepEqual(cadenceToOnCalendar({ cadence: 'yearly' }), ['yearly'])
+    // `month` alone is a fire field: it takes the long form with the day at 1.
+    assert.deepEqual(cadenceToOnCalendar({ cadence: 'yearly', month: 6 }), ['*-06-01 00:00:00'])
+  })
+
+  // Review of snaptime.1 (constructed): `dayOfMonth: '1\nExecStart=/bin/x'` in
+  // memory rendered a forged directive line, and NaN / 1.5 / -1 / 0 / 13 /
+  // '99:99' / 'Xyz' reached the timer file. RULE: every value bound for an
+  // `OnCalendar=` line passes the schema's own fence inside the generator.
+  it('the generator is a hard boundary: a corrupt fire field throws, whatever its type', () => {
+    const corrupt: Record<string, unknown>[] = [
+      { cadence: 'monthly', dayOfMonth: '1\nExecStart=/bin/x' },
+      { cadence: 'monthly', dayOfMonth: Number.NaN },
+      { cadence: 'monthly', dayOfMonth: 1.5 },
+      { cadence: 'monthly', dayOfMonth: -1 },
+      { cadence: 'monthly', dayOfMonth: 0 },
+      { cadence: 'monthly', dayOfMonth: 32 },
+      { cadence: 'yearly', month: 13 },
+      { cadence: 'yearly', month: 0 },
+      { cadence: 'yearly', month: '6\r' },
+      { cadence: 'daily', time: '99:99' },
+      { cadence: 'daily', time: '01:30\r' },
+      { cadence: 'weekly', weekday: 'Xyz' },
+      { cadence: 'weekly', weekday: 'Mon\nOnCalendar=*:*' },
+    ]
+    for (const c of corrupt) {
+      assert.throws(() => cadenceToOnCalendar(c as never), /Snapshot schedule cannot fire: invalid/, JSON.stringify(c))
+      assert.throws(() => renderTimerUnit(makeSchedule(c as never)), /Snapshot schedule cannot fire: invalid/, JSON.stringify(c))
+    }
+  })
+
+  // Review of snaptime.1: a dialog that sends its pickers' visible defaults
+  // must not rewrite a shortcut timer into an equivalent long form.
+  it('a field at its default is the schedule without the field: shortcut word, and stored as absence', () => {
+    assert.deepEqual(cadenceToOnCalendar({ cadence: 'monthly', dayOfMonth: 1 }), ['monthly'])
+    assert.deepEqual(cadenceToOnCalendar({ cadence: 'weekly', weekday: 'Mon', time: '00:00' }), ['weekly'])
+    assert.deepEqual(cadenceToOnCalendar({ cadence: 'yearly', month: 1, dayOfMonth: 1, time: '00:00' }), ['yearly'])
+    assert.deepEqual(cadenceToOnCalendar({ cadence: 'daily', time: '00:00' }), ['daily'])
+    const plain = makeSchedule({ cadence: 'yearly' })
+    const defaults = makeSchedule({ cadence: 'yearly', month: 1, dayOfMonth: 1, time: '00:00' })
+    assert.equal(renderServiceUnit(defaults), renderServiceUnit(plain))
+    assert.equal(renderTimerUnit(defaults), renderTimerUnit(plain))
+    // One non-default part keeps the others at their defaults in the line, and only itself in the store.
+    assert.match(renderServiceUnit(makeSchedule({ cadence: 'yearly', month: 1, dayOfMonth: 17 })), /"dayOfMonth":17/)
+    assert.doesNotMatch(renderServiceUnit(makeSchedule({ cadence: 'yearly', month: 1, dayOfMonth: 17 })), /"month"/)
+  })
+
+  it('a monthly 30 timer has exactly two OnCalendar lines in order, and one Persistent=true', () => {
+    const timer = renderTimerUnit(makeSchedule({ cadence: 'monthly', dayOfMonth: 30, time: '02:15' }))
+    const lines = timer.split('\n').filter(line => line.startsWith('OnCalendar='))
+    assert.deepEqual(lines, ['OnCalendar=*-*-30 02:15:00', 'OnCalendar=*-02~01 02:15:00'])
+    assert.equal(timer.split('Persistent=true').length - 1, 1)
+  })
+
+  it('a schedule WITHOUT the fields renders today\'s timer byte-identically', () => {
+    // No existing test carried the full timer text; the OnCalendar token is
+    // lifted from the pinned map above (never retyped), the frame is the
+    // renderer's fixed [Timer] block — so a drift in either half fails here.
+    for (const cadence of Object.keys(NO_FIELD_ONCALENDAR) as SnapshotCadence[]) {
+      const schedule = makeSchedule({ cadence })
+      assert.equal(renderTimerUnit(schedule), [
+        '[Unit]',
+        `Description=ANAS snapshot timer ${schedule.name}`,
+        '',
+        '[Timer]',
+        `OnCalendar=${NO_FIELD_ONCALENDAR[cadence]}`,
+        'Persistent=true',
+        '',
+        '[Install]',
+        'WantedBy=timers.target',
+        '',
+      ].join('\n'))
+    }
+  })
+
+  it('render then parse round-trips the four fields through X-ANAS-Schedule', () => {
+    for (const schedule of [
+      makeSchedule({ cadence: 'daily', time: '01:30' }),
+      makeSchedule({ cadence: 'weekly', weekday: 'Thu', time: '01:30' }),
+      makeSchedule({ cadence: 'monthly', dayOfMonth: 31, time: '01:30' }),
+      makeSchedule({ cadence: 'yearly', month: 6, dayOfMonth: 17, time: '23:59' }),
+      makeSchedule({ cadence: 'yearly', time: '23:59' }),
+    ]) {
+      const parsed = parseServiceUnit(renderServiceUnit(schedule))
+      assert.deepEqual(parsed, schedule)
+      // The street-level check the deep equal can hide: the MONTH came back.
+      assert.equal(parsed?.month, schedule.month)
+    }
+  })
+
+  it('a CLEARED field (null) is stored as absence, never as null', () => {
+    // A PUT clearing `time` hands the writer `time: null`; the stored JSON holds
+    // no key at all and the timer is back to the shortcut word.
+    const cleared = makeSchedule({ cadence: 'hourly', time: null })
+    const unit = renderServiceUnit(cleared)
+    assert.doesNotMatch(unit, /"time"/)
+    assert.equal(parseServiceUnit(unit)?.time, undefined)
+    assert.match(renderTimerUnit(cleared), /OnCalendar=hourly/)
+  })
+
+  it('fail loud: a field the cadence refuses throws before any write', () => {
+    assert.throws(
+      () => cadenceToOnCalendar({ cadence: 'hourly', time: '01:30' }),
+      /An hourly schedule has no time of day — it fires every hour/,
+    )
+    assert.throws(
+      () => cadenceToOnCalendar({ cadence: 'daily', weekday: 'Mon' }),
+      /Weekday applies to a weekly schedule only/,
+    )
+    assert.throws(
+      () => cadenceToOnCalendar({ cadence: 'weekly', dayOfMonth: 15 }),
+      /Day of the month applies to a monthly or yearly schedule only/,
+    )
+    // A control character in a field never reaches the unit line (cr.51).
+    assert.throws(() => cadenceToOnCalendar({ cadence: 'daily', time: '01:30\nRestart=always' }), /invalid time/)
+    // An unknown cadence still throws first, before any field rule.
+    assert.throws(() => cadenceToOnCalendar({ cadence: 'bogus' as SnapshotCadence, time: '01:30' }), /Unknown snapshot cadence/)
   })
 })
 
@@ -132,6 +310,21 @@ describe('snapshot schedule units — CRUD lifecycle (temp dir + mocked systemct
     const cmds = mock.calls.map(c => c.args.join(' '))
     assert.ok(cmds.includes('daemon-reload'))
     assert.ok(cmds.includes(`enable --now ${timerUnitName(schedule.id)}`))
+  })
+
+  // snaptime.1: an EDIT of the fire time must never fire a snapshot. The store
+  // does `daemon-reload` then `enable --now`; ground truth on the node
+  // (2026-11-13) says that leaves an active timer running and moves its next
+  // elapse, while a RESTART would fire a past-due time at once. Pinned on argv.
+  it('snaptime.1: an edit of `time` on an enabled schedule reloads and enables — never restarts or stops', async () => {
+    const edited = makeSchedule({ cadence: 'daily', time: '01:30' })
+    await writeScheduleUnits(mock, dir, edited)
+    assert.deepEqual(mock.calls.map(c => c.args.join(' ')), [
+      'daemon-reload',
+      `enable --now ${timerUnitName(edited.id)}`,
+    ])
+    assert.ok(!mock.calls.some(c => c.args.includes('restart') || c.args.includes('stop')))
+    assert.match(await readFile(join(dir, timerUnitName(edited.id)), 'utf-8'), /OnCalendar=\*-\*-\* 01:30:00/)
   })
 
   it('writeScheduleUnits with enabled=false disables the timer', async () => {

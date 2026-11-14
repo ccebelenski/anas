@@ -1,11 +1,11 @@
-import type { AhrPool, SnapshotScheduleRunResult, SnapshotSchedule as SnapshotScheduleT, SnapshotTarget } from '@anas/shared'
+import type { AhrPool, SnapshotCadence, SnapshotScheduleRunResult, SnapshotSchedule as SnapshotScheduleT, SnapshotTarget } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { LockClaim } from '../jobs/locks.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { UnitTaskObject } from '../services/task-units.js'
-import { PRUNED_NAMES_PER_DATASET, ScheduleId, SnapshotSchedule } from '@anas/shared'
+import { PRUNED_NAMES_PER_DATASET, ScheduleId, snapshotFireShapeIssues, SnapshotSchedule } from '@anas/shared'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { guardCheck, guarded, scheduleClaim, sendRefusal } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
@@ -31,6 +31,52 @@ import { requireIdentity } from './identity.js'
 
 const ZFS = '/usr/sbin/zfs'
 const ZPOOL = '/usr/sbin/zpool'
+
+/** The four optional fire fields (snaptime.1, #83), in the order a PUT inherits them. */
+type FireField = 'time' | 'weekday' | 'dayOfMonth' | 'month'
+
+/** A representative value per field, for asking the shared shape helper whether a cadence allows it. */
+const FIRE_FIELD_PROBE: Record<FireField, { time?: string, weekday?: string, dayOfMonth?: number, month?: number }> = {
+  time: { time: '00:00' },
+  weekday: { weekday: 'Mon' },
+  dayOfMonth: { dayOfMonth: 1 },
+  month: { month: 1 },
+}
+
+/** Does this cadence accept this fire field at all? — the schema's one answer, reused. */
+function fireFieldAllowed(cadence: SnapshotCadence, field: FireField): boolean {
+  return snapshotFireShapeIssues({ cadence, ...FIRE_FIELD_PROBE[field] }).length === 0
+}
+
+/**
+ * The PUT's fire-field contract (snaptime.1, #83) — the `exclude` rule beside
+ * it in the handler, for the four fields:
+ *
+ *   - key ABSENT from the body: keep the STORED value where the new cadence
+ *     still allows the field; drop it silently where it does not, so a
+ *     weekly-to-daily edit never fails on a stored weekday. A cadence CHANGE
+ *     drops exactly what the new cadence refuses: monthly-to-yearly keeps the
+ *     day (`dayOfMonth` is a yearly field too), yearly-to-monthly keeps the day
+ *     and drops the month, yearly-to-daily drops both and keeps the time;
+ *   - key PRESENT: the body's value stands — a value is validated as on
+ *     create (the schema), a `null` CLEARS the stored field, which the unit
+ *     writer turns into absence.
+ */
+function mergeFireFields(
+  schedule: SnapshotScheduleT,
+  stored: SnapshotScheduleT,
+  body: Record<string, unknown>,
+): SnapshotScheduleT {
+  const keep = (field: FireField): boolean =>
+    !Object.hasOwn(body, field) && stored[field] != null && fireFieldAllowed(schedule.cadence, field)
+  return {
+    ...schedule,
+    ...(keep('time') && stored.time != null ? { time: stored.time } : {}),
+    ...(keep('weekday') && stored.weekday != null ? { weekday: stored.weekday } : {}),
+    ...(keep('dayOfMonth') && stored.dayOfMonth != null ? { dayOfMonth: stored.dayOfMonth } : {}),
+    ...(keep('month') && stored.month != null ? { month: stored.month } : {}),
+  }
+}
 
 /**
  * Uniform snapshot SCHEDULES (Epic 17.3/17.4). The store IS the systemd units
@@ -558,6 +604,10 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     const excludeAbsent = !body || typeof body !== 'object' || !Object.hasOwn(body, 'exclude')
     if (excludeAbsent && schedule.recursive === true && schedule.target.kind === 'zfs' && stored.exclude?.length)
       schedule = { ...schedule, exclude: stored.exclude }
+    // snaptime.1 (#83): the fire fields follow the same contract just above —
+    // an absent key keeps the stored value where the NEW cadence allows the
+    // field and drops it silently where it does not; a present `null` clears.
+    schedule = mergeFireFields(schedule, stored, body && typeof body === 'object' ? body as Record<string, unknown> : {})
 
     if (!(await guardTarget(schedule.target, schedule.recursive === true, reply, schedule.exclude, stored.exclude)))
       return reply

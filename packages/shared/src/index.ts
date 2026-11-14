@@ -580,7 +580,11 @@ export {
   ScrubRunning,
   ScrubTarget,
   ScrubToggleRequest,
+  SNAPSHOT_FIRE_DEFAULTS,
   SnapshotCadence,
+  SnapshotDayOfMonth,
+  snapshotFireShapeIssues,
+  SnapshotMonth,
   SnapshotSchedule,
   SnapshotScheduleDetail,
   SnapshotScheduleRunDataset,
@@ -589,6 +593,7 @@ export {
   SnapshotSource,
   SnapshotTarget,
 } from './schemas/schedules.js'
+export type { SnapshotFireShape, SnapshotFireShapeIssue } from './schemas/schedules.js'
 
 // Self-heal repair engine schemas (story selfheal.5) + the repair job
 // (selfheal.6) + the parity rewrite (selfheal.10)
