@@ -99,17 +99,59 @@ export const SSH_LIVENESS_OPTIONS: readonly string[] = Object.freeze([
 ])
 
 /**
+ * A word the remote shell splits on nothing: ASCII letters, digits and
+ * `_ @ % + = : , . / -`. JS `\w` is ASCII-only (`[A-Za-z0-9_]`) without the `u`
+ * flag, which this regex does not carry — say it here so nobody adds `u`.
+ */
+const SHELL_PLAIN_WORD_RE = /^[\w@%+=:,./-]+$/
+
+const SINGLE_QUOTE_RE = /'/g
+
+/** An embedded single quote as a shell needs it: close the quote, escape one, reopen. */
+const SHELL_ESCAPED_QUOTE = `'\\''`
+
+/**
+ * One word for the REMOTE login shell (repl.r1).
+ *
+ * ssh does not pass an argv to the remote: it joins the words after the
+ * destination with single spaces and hands that ONE string to the remote
+ * user's shell, which splits it again. A plain word can go through unchanged;
+ * any other word (a space, an empty string, anything outside the plain set)
+ * must be single-quoted so the shell reads it as the one word ANAS meant,
+ * whatever characters a later ZFS starts accepting in a name. An embedded
+ * single quote is written `'\''` (close, escaped quote, reopen).
+ *
+ * What was run (review of repl.r1: sh, bash, csh, tcsh on the dev box): every
+ * character ZFS accepts in a name round-trips byte for byte in all four. csh
+ * and tcsh do NOT keep `!` or a raw newline literal inside single quotes
+ * (history expansion; "Unmatched"), so this quoting is not a general-purpose
+ * one for a csh login shell — ZFS refuses both characters in a name, and no
+ * word ANAS sends can carry them.
+ *
+ * The empty string becomes `''`, never nothing: a dropped word would shift
+ * every operand after it onto the wrong one.
+ */
+export function remoteShellWord(word: string): string {
+  if (SHELL_PLAIN_WORD_RE.test(word))
+    return word
+  return `'${word.replace(SINGLE_QUOTE_RE, SHELL_ESCAPED_QUOTE)}'`
+}
+
+/**
  * The exact ssh argv for a resolved location + remote command (argv[0] is the
  * ssh binary; callers split for exec/pipeline). Pure — the unit tests assert it.
+ * The remote words are quoted for the remote shell ({@link remoteShellWord});
+ * every plain word is unchanged, so today's commands are byte-identical.
  */
 export function buildSshArgv(resolved: ResolvedLocation, remoteCmd: string[]): string[] {
+  const words = remoteCmd.map(remoteShellWord)
   // `--` ends ssh OPTION parsing (C1, review 2026-10-14): a hostile user/host
   // (e.g. `-oProxyCommand=<cmd>`) can then never be read as an ssh flag —
   // `ssh [options] -- destination command`. ssh-keyscan does the same
   // (services/replication-remotes.ts); the shared schemas additionally narrow
   // user/host on every write path.
   if (resolved.kind === 'peer')
-    return [SSH, '-o', 'BatchMode=yes', ...SSH_LIVENESS_OPTIONS, '--', `root@${resolved.host}`, ...remoteCmd]
+    return [SSH, '-o', 'BatchMode=yes', ...SSH_LIVENESS_OPTIONS, '--', `root@${resolved.host}`, ...words]
   return [
     SSH,
     '-o',
@@ -125,7 +167,7 @@ export function buildSshArgv(resolved: ResolvedLocation, remoteCmd: string[]): s
     'StrictHostKeyChecking=yes',
     '--',
     `${resolved.user}@${resolved.host}`,
-    ...remoteCmd,
+    ...words,
   ]
 }
 

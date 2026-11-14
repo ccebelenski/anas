@@ -32,8 +32,21 @@ export const REPLICATION_HOLD_TAG_PREFIX = 'anas-repl-'
 
 const HASH_LEN = 12
 
-/** `zfs hold` stderr when this tag already pins the snapshot. */
-const TAG_EXISTS_RE = /tag already exists/i
+/**
+ * `zfs hold` stderr when this tag already pins the snapshot, as OpenZFS 2.4
+ * writes it — `cannot hold snapshot '<snap>': tag already exists on this
+ * dataset`. Group 1 is the snapshot the message NAMES, which repl.r1 showed is
+ * not always the snapshot that was asked for: a name with a space split by the
+ * remote shell acts on the part before the space.
+ */
+const TAG_EXISTS_RE = /cannot hold snapshot '(.*)': tag already exists/i
+
+/**
+ * ssh's exit status for its OWN failures (could not connect, lost the peer):
+ * an answer that arrives with it is the transport's, never zfs's, whatever
+ * the stderr carries (review of repl.r1).
+ */
+const SSH_OWN_FAILURE = 255
 
 /** The location half of the chain identity — `local` or `<kind>:<name>`. */
 function locationKey(location: ReplicationLocation | undefined): string {
@@ -195,7 +208,7 @@ export async function settleReplicationHolds(deps: HoldDeps, input: SettleHoldsI
   // 1) The own holds — new base, both sides. cr.21: `--` before the hold-tag
   //    and snapshot operands (both derived).
   const srcHold = await executor.exec('/usr/sbin/zfs', ['hold', '--', tag, srcSnapFull])
-  const srcHeld = srcHold.exitCode === 0 || alreadyHeld(srcHold.stderr)
+  const srcHeld = srcHold.exitCode === 0 || (srcHold.exitCode !== SSH_OWN_FAILURE && alreadyHeld(srcHold.stderr, srcSnapFull))
   if (!srcHeld) {
     warnings.push(`Could not place ${tag} hold on ${srcSnapFull}: ${failText(srcHold)}`)
     warnings.push(`Kept every hold on ${source.dataset}: its new base is not held, so the previous base stays pinned`)
@@ -203,7 +216,7 @@ export async function settleReplicationHolds(deps: HoldDeps, input: SettleHoldsI
   const tgtHold = remote
     ? await transport.remoteHold(remote, tgtSnapFull, tag)
     : await executor.exec('/usr/sbin/zfs', ['hold', '--', tag, tgtSnapFull])
-  const tgtHeld = tgtHold.exitCode === 0 || alreadyHeld(tgtHold.stderr)
+  const tgtHeld = tgtHold.exitCode === 0 || (tgtHold.exitCode !== SSH_OWN_FAILURE && alreadyHeld(tgtHold.stderr, tgtSnapFull))
   if (!tgtHeld) {
     warnings.push(`Could not place ${tag} hold on ${tgtSnapFull}: ${failText(tgtHold)}`)
     warnings.push(`Kept every hold on ${target.dataset}: its new base is not held, so the previous base stays pinned`)
@@ -261,9 +274,27 @@ function releasableTargetTags(tags: string[], name: string, snapName: string, ta
   return out
 }
 
-/** `zfs hold` of a tag already present answers EEXIST — the hold is there. */
-function alreadyHeld(stderr: string): boolean {
-  return TAG_EXISTS_RE.test(stderr)
+/**
+ * Did `zfs hold` answer "this tag already pins the snapshot I was ASKED about"?
+ *
+ * The snapshot named in the message must be exactly the one we asked to hold.
+ * repl.r1: a snap name with a space handed to a remote shell unquoted split
+ * there, and the hold of `p/ds@nightly 2` answered `cannot hold snapshot
+ * 'p/ds@nightly': tag already exists on this dataset` plus `'2' is not a
+ * snapshot`, exit 1 — the spaced snapshot was NOT held, and reading that as
+ * held let the settle release the chain's tag from the snapshot that was. A
+ * tag-exists line about any OTHER snapshot is therefore not an answer about
+ * ours. Other lines on stderr (an ssh notice) do not change the answer: were
+ * they to, a chatty ssh would stop every release and old bases would stay
+ * pinned for good.
+ */
+function alreadyHeld(stderr: string, snapshot: string): boolean {
+  for (const line of stderr.split('\n')) {
+    const m = TAG_EXISTS_RE.exec(line.trim())
+    if (m !== null && m[1] === snapshot)
+      return true
+  }
+  return false
 }
 
 async function releaseLocal(executor: CommandExecutor, tag: string, full: string, warnings: string[]): Promise<void> {

@@ -373,3 +373,134 @@ describe('nf.3 D11 — readLocalHoldsChecked and describeHolds (the forced-rollb
     ])
   })
 })
+
+/**
+ * repl.r1 — "already held" means the snapshot we asked about.
+ *
+ * Ground truth (two real nodes, OpenZFS 2.4): the hold of `datapool/spc@nightly
+ * 2` split by the remote shell at the space answers the tag-exists line for
+ * `datapool/spc@nightly` PLUS `'2' is not a snapshot`, exit 1 — the spaced
+ * snapshot is not held. Reading that stderr as "held" released the chain's tag
+ * from the snapshot that was actually held.
+ */
+describe('repl.r1 — alreadyHeld means the snapshot asked about', () => {
+  const DS = 'datapool/spc'
+  const TGTP = 'backup/spc'
+  const SPACED = 'nightly 2'
+  const SPACED_FULL = `${DS}@${SPACED}`
+  const CAPTURED_SPLIT = `cannot hold snapshot '${DS}@nightly': tag already exists on this dataset\n'2' is not a snapshot`
+
+  it('a split spaced snapshot is NOT held: nothing is released on that side and the run warns', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({ command: ZFS, args: ['hold', '--', TAG_A, SPACED_FULL], result: { stdout: '', stderr: CAPTURED_SPLIT, exitCode: 1 } })
+    okZfs(mock)
+    const warnings = await settleReplicationHolds({ executor: mock, transport: NO_TRANSPORT }, {
+      tag: TAG_A,
+      snapName: SPACED,
+      baseSnapshot: 'nightly',
+      source: { dataset: DS, snapshotNames: ['nightly', SPACED] },
+      target: { dataset: TGTP, snapshotNames: [SPACED] },
+      releaseLegacyOnSource: true,
+    })
+    const holds = mock.calls.filter(c => c.command === ZFS && c.args[0] === 'hold')
+    assert.deepEqual(holds.map(c => c.args[3]).filter(a => a.startsWith(`${DS}@`)), [SPACED_FULL], 'the source hold was asked for the ONE spaced snapshot')
+    assert.deepEqual(warnings.length, 2)
+    assert.match(warnings[0] as string, /Could not place .* hold on datapool\/spc@nightly 2/)
+    assert.ok(warnings.some(w => /Kept every hold on datapool\/spc:/.test(w)))
+    assert.deepEqual(verbs(mock, 'release'), [], 'a side whose own hold did not succeed releases NOTHING')
+  })
+
+  it('a tag-exists line naming a DIFFERENT snapshot is not held, even alone on stderr', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: ZFS,
+      args: ['hold', '--', TAG_A, SPACED_FULL],
+      result: { stdout: '', stderr: `cannot hold snapshot '${DS}@nightly': tag already exists on this dataset`, exitCode: 1 },
+    })
+    okZfs(mock)
+    const warnings = await settleReplicationHolds({ executor: mock, transport: NO_TRANSPORT }, {
+      tag: TAG_A,
+      snapName: SPACED,
+      baseSnapshot: 'nightly',
+      source: { dataset: DS, snapshotNames: ['nightly', SPACED] },
+      target: { dataset: TGTP, snapshotNames: [SPACED] },
+      releaseLegacyOnSource: true,
+    })
+    assert.ok(warnings.some(w => /Could not place .* hold on datapool\/spc@nightly 2/.test(w)))
+    assert.deepEqual(verbs(mock, 'release'), [], 'the snapshot named in the line was never what we asked to hold')
+  })
+
+  it('the genuine case — the same snapshot named, nothing else on stderr — is held as today', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: ZFS,
+      args: ['hold', '--', TAG_A, SPACED_FULL],
+      result: { stdout: '', stderr: `cannot hold snapshot '${SPACED_FULL}': tag already exists on this dataset`, exitCode: 1 },
+    })
+    holdsFixture(mock, [`${DS}@nightly`, SPACED_FULL], { [`${DS}@nightly`]: [TAG_A] })
+    okZfs(mock)
+    const warnings = await settleReplicationHolds({ executor: mock, transport: NO_TRANSPORT }, {
+      tag: TAG_A,
+      snapName: SPACED,
+      baseSnapshot: 'nightly',
+      source: { dataset: DS, snapshotNames: ['nightly', SPACED] },
+      target: { dataset: TGTP, snapshotNames: [SPACED] },
+      releaseLegacyOnSource: true,
+    })
+    assert.deepEqual(warnings, [])
+    assert.deepEqual(verbs(mock, 'release'), [`${TAG_A} ${DS}@nightly`], 'only the older snapshot loses this chain\'s tag')
+  })
+
+  // Review of repl.r1: exit 255 is ssh's own failure. RULE: an answer that
+  // arrives with it is the transport's, never zfs's, whatever stderr carries.
+  it('exit 255 is never "already held", even with the right tag-exists line on stderr', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: ZFS,
+      args: ['hold', '--', TAG_A, SPACED_FULL],
+      result: { stdout: '', stderr: `cannot hold snapshot '${SPACED_FULL}': tag already exists on this dataset`, exitCode: 255 },
+    })
+    holdsFixture(mock, [`${DS}@nightly`, SPACED_FULL], { [`${DS}@nightly`]: [TAG_A] })
+    okZfs(mock)
+    const warnings = await settleReplicationHolds({ executor: mock, transport: NO_TRANSPORT }, {
+      tag: TAG_A,
+      snapName: SPACED,
+      baseSnapshot: 'nightly',
+      source: { dataset: DS, snapshotNames: ['nightly', SPACED] },
+      target: { dataset: TGTP, snapshotNames: [SPACED] },
+      releaseLegacyOnSource: true,
+    })
+    assert.ok(warnings.some(w => w.includes('Could not place')), JSON.stringify(warnings))
+    assert.deepEqual(verbs(mock, 'release').filter(v => v.includes(DS)), [], 'nothing comes off the source side')
+  })
+
+  it('the target side reads its own snapshot name too (the call site passes the full target name)', async () => {
+    const mock = new MockExecutor()
+    okZfs(mock)
+    holdsFixture(mock, [`${DS}@nightly`, SPACED_FULL], {})
+    const remoteCalls: string[] = []
+    const transport = {
+      remoteHold: async (_r: ResolvedLocation, snap: string, tag: string) => {
+        remoteCalls.push(`hold ${tag} ${snap}`)
+        // The split stderr of a spaced name, answered on the TARGET side.
+        return { stdout: '', stderr: `cannot hold snapshot '${TGTP}@nightly': tag already exists on this dataset\n'2' is not a snapshot`, exitCode: 1 }
+      },
+      remoteRelease: async (_r: ResolvedLocation, snap: string, tag: string) => {
+        remoteCalls.push(`release ${tag} ${snap}`)
+        return { stdout: '', stderr: '', exitCode: 0 }
+      },
+      remoteHeldTags: async () => [TAG_A, LEGACY_REPLICATION_HOLD_TAG],
+    } as unknown as Transport
+    const warnings = await settleReplicationHolds({ executor: mock, transport }, {
+      tag: TAG_A,
+      snapName: SPACED,
+      baseSnapshot: 'nightly',
+      source: { dataset: DS, snapshotNames: ['nightly', SPACED] },
+      target: { dataset: TGTP, snapshotNames: ['nightly', SPACED] },
+      remote: {} as ResolvedLocation,
+      releaseLegacyOnSource: true,
+    })
+    assert.deepEqual(remoteCalls, [`hold ${TAG_A} ${TGTP}@${SPACED}`], 'the unheld target releases nothing over the transport')
+    assert.ok(warnings.some(w => /Kept every hold on backup\/spc:/.test(w)))
+  })
+})

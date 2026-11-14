@@ -1,13 +1,14 @@
 import type { RemotesPaths } from '../replication-remotes.js'
 import type { ResolvedLocation, TransportConfig } from '../replication-transport.js'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { writeRemotes } from '../replication-remotes.js'
-import { buildSshArgv, createTransport, readMembers } from '../replication-transport.js'
+import { buildSshArgv, createTransport, readMembers, remoteShellWord } from '../replication-transport.js'
 
 const SSH = '/usr/bin/ssh'
 
@@ -181,5 +182,165 @@ describe('replication transport (Epic 5.5.2 — remote SSH)', () => {
     })
     const t = createTransport(mock, config)
     assert.deepEqual(await t.remoteSnapshotNames(resolved, 'backup/media'), ['s1', 's2'])
+  })
+})
+
+/**
+ * repl.r1 — the remote words reach the remote zfs as the words ANAS meant.
+ * ssh joins the words after the destination with spaces and the remote login
+ * shell splits them again, so every word is quoted before it goes on the argv.
+ */
+describe('repl.r1 — remote shell quoting', () => {
+  it('remoteShellWord leaves every plain word unchanged, punctuation included', () => {
+    const plain = [
+      'zfs',
+      'hold',
+      '--',
+      '-H',
+      '-o',
+      'name,creation',
+      'readonly=on',
+      'pool/ds@anas-daily-2026-11-13_01.00.00--1d',
+      'datapool/spc@nightly',
+      'true',
+      '--version',
+      'abcXYZ019',
+      '_',
+      '@',
+      '%',
+      '+',
+      '=',
+      ':',
+      ',',
+      '.',
+      '/',
+      '-',
+    ]
+    for (const w of plain)
+      assert.equal(remoteShellWord(w), w, `plain word ${JSON.stringify(w)} is unchanged`)
+  })
+
+  it('remoteShellWord quotes anything outside the plain set', () => {
+    assert.equal(remoteShellWord('a b'), `'a b'`)
+    assert.equal(remoteShellWord(' x'), `' x'`, 'a leading space keeps its space inside quotes')
+    assert.equal(remoteShellWord('x '), `'x '`, 'a trailing space keeps its space inside quotes')
+    assert.equal(remoteShellWord('it\'s'), `'it'\\''s'`, 'an embedded quote closes, escapes, reopens')
+    assert.equal(remoteShellWord(''), `''`, 'the empty string is two quotes, never nothing')
+    assert.equal(remoteShellWord('$(id)'), `'$(id)'`)
+    assert.equal(remoteShellWord('a;b'), `'a;b'`)
+    assert.equal(remoteShellWord('*'), `'*'`)
+  })
+
+  it('buildSshArgv quotes a spaced hold snapshot for a peer and for a remote', () => {
+    const peer: ResolvedLocation = { kind: 'peer', host: 'node2' }
+    const remote: ResolvedLocation = {
+      kind: 'remote',
+      host: '10.0.0.9',
+      port: 2222,
+      user: 'admin',
+      keyPath: '/etc/pve/priv/anas/replication_key',
+      knownHostsFile: '/etc/pve/priv/anas/known_hosts',
+    }
+    const cmd = ['zfs', 'hold', '--', 'anas-repl-0123456789ab', 'datapool/spc@nightly 2']
+    const peerArgv = buildSshArgv(peer, cmd)
+    assert.deepEqual(peerArgv.slice(-5), [
+      'zfs',
+      'hold',
+      '--',
+      'anas-repl-0123456789ab',
+      `'datapool/spc@nightly 2'`,
+    ])
+    assert.equal(peerArgv.at(-1), `'datapool/spc@nightly 2'`, 'the snapshot is ONE word')
+    const remoteArgv = buildSshArgv(remote, cmd)
+    assert.deepEqual(remoteArgv.slice(-5), peerArgv.slice(-5))
+    assert.equal(remoteArgv[remoteArgv.indexOf('--') + 1], 'admin@10.0.0.9')
+  })
+
+  it('the quoted words survive a real /bin/sh as exactly the original words', () => {
+    const words = [
+      'datapool/spc@nightly 2',
+      'x ',
+      ' x',
+      '-leading-dash',
+      'it\'s',
+      'a\tb',
+      'a\nb',
+      '$(id)',
+      'a;b',
+      '*',
+      '',
+      'plain',
+      '--',
+      'pool/ds@anas-daily-2026-11-13_01.00.00--1d',
+    ]
+    const out = execFileSync('/bin/sh', ['-c', `printf '%s\\0' ${words.map(remoteShellWord).join(' ')}`], { encoding: 'utf8' })
+    // The format's \0 terminates every printed word and the last one: the
+    // split's trailing empty string is that final NUL, not a word.
+    assert.deepEqual(out.split('\0').slice(0, -1), words)
+  })
+
+  // The monkey on the keyboard (operator, 2026-11-14): the table above holds
+  // the shapes somebody thought of. Random words — spaces, quotes, shell
+  // syntax, control characters, non-ASCII — go through a real /bin/sh and must
+  // come back byte for byte. Seeded: a failure prints the seed and the batch.
+  it('random words survive a real /bin/sh byte for byte (seeded)', () => {
+    const seed = 0x5EED_2026
+    let state = seed
+    const next = (): number => {
+      // mulberry32
+      state = (state + 0x6D2B79F5) | 0
+      let t = Math.imul(state ^ (state >>> 15), 1 | state)
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+    const pool = [
+      ...'abcXYZ019_@%+=:,./-',
+      ' ',
+      ' ',
+      '\t',
+      '\n',
+      '\r',
+      '\'',
+      '\'',
+      '"',
+      '`',
+      '$',
+      '\\',
+      ';',
+      '&',
+      '|',
+      '<',
+      '>',
+      '(',
+      ')',
+      '{',
+      '}',
+      '[',
+      ']',
+      '*',
+      '?',
+      '~',
+      '!',
+      '#',
+      '^',
+      '\u0001',
+      '\u001B',
+      '\u007F',
+      '\u00E9',
+      '\u2028',
+      '\u{1F600}',
+    ]
+    const word = (): string => {
+      const len = Math.floor(next() * 12)
+      let w = ''
+      for (let i = 0; i < len; i++)
+        w += pool[Math.floor(next() * pool.length)]
+      return w
+    }
+    for (let batch = 0; batch < 60; batch++) {
+      const words = Array.from({ length: 50 }, word)
+      const out = execFileSync('/bin/sh', ['-c', `printf '%s\\0' ${words.map(remoteShellWord).join(' ')}`], { encoding: 'utf8' })
+      assert.deepEqual(out.split('\0').slice(0, -1), words, `seed ${seed}, batch ${batch}`)
+    }
   })
 })
